@@ -3,167 +3,152 @@
 #include <string.h>
 #include <ctype.h>
 
-// Token types
 typedef enum {
+    TOKEN_EOF,
     TOKEN_INT,
-    TOKEN_STRING,
     TOKEN_IDENTIFIER,
     TOKEN_ASSIGN,
+    TOKEN_SEMICOLON,
     TOKEN_PLUS,
     TOKEN_MINUS,
     TOKEN_STAR,
     TOKEN_SLASH,
-    TOKEN_LPAREN,
-    TOKEN_RPAREN,
-    TOKEN_SEMICOLON,
-    TOKEN_EOF
+    TOKEN_LOOP
 } TokenType;
 
-// Token structure
 typedef struct {
     TokenType type;
-    char* value;
+    union {
+        int value;
+        char identifier;
+    };
 } Token;
 
-// Lexer
-Token* lex(char* source) {
-    // Tokenize the source code
-    // Example implementation (tokenizes only integers and operators)
+typedef struct ASTNode {
+    TokenType type;
+    struct ASTNode* left;
+    struct ASTNode* right;
+    int value;
+    char identifier;
+    struct ASTNode* expression;
+    struct ASTNode* body;
+} ASTNode;
 
+typedef struct {
+    int value;
+} Variable;
+
+Variable variables[26];
+
+// Tokenization logic
+Token* lex(const char* source) {
     int length = strlen(source);
     Token* tokens = (Token*)malloc((length + 1) * sizeof(Token));
     int tokenCount = 0;
 
     int i = 0;
     while (i < length) {
-        if (isdigit(source[i])) {
-            int j = i;
-            while (isdigit(source[j]))
-                j++;
-
-            char* value = (char*)malloc((j - i + 1) * sizeof(char));
-            strncpy(value, source + i, j - i);
-            value[j - i] = '\0';
-
-            Token token;
-            token.type = TOKEN_INT;
-            token.value = value;
-
-            tokens[tokenCount] = token;
-            tokenCount++;
-
-            i = j;
-        } else if (source[i] == '+') {
-            Token token;
-            token.type = TOKEN_PLUS;
-            token.value = "+";
-
-            tokens[tokenCount] = token;
-            tokenCount++;
-
-            i++;
-        } else if (source[i] == '-') {
-            Token token;
-            token.type = TOKEN_MINUS;
-            token.value = "-";
-
-            tokens[tokenCount] = token;
-            tokenCount++;
-
-            i++;
-        } else if (source[i] == '*') {
-            Token token;
-            token.type = TOKEN_STAR;
-            token.value = "*";
-
-            tokens[tokenCount] = token;
-            tokenCount++;
-
-            i++;
-        } else if (source[i] == '/') {
-            Token token;
-            token.type = TOKEN_SLASH;
-            token.value = "/";
-
-            tokens[tokenCount] = token;
-            tokenCount++;
-
-            i++;
-        } else {
-            // Skip unrecognized characters
-            i++;
+        if (source[i] == ' ') {
+            i++; // Skip whitespace
+            continue;
         }
+
+        Token token;
+        if (isdigit(source[i])) {
+            token.type = TOKEN_INT;
+            token.value = atoi(source + i);
+            while (isdigit(source[i]))
+                i++; // Consume digits
+        } else if (isalpha(source[i])) {
+            token.type = TOKEN_IDENTIFIER;
+            token.identifier = source[i];
+            i++; // Consume identifier
+        } else {
+            switch (source[i]) {
+                case '=':
+                    token.type = TOKEN_ASSIGN;
+                    break;
+                case ';':
+                    token.type = TOKEN_SEMICOLON;
+                    break;
+                case '+':
+                    token.type = TOKEN_PLUS;
+                    break;
+                case '-':
+                    token.type = TOKEN_MINUS;
+                    break;
+                case '*':
+                    token.type = TOKEN_STAR;
+                    break;
+                case '/':
+                    token.type = TOKEN_SLASH;
+                    break;
+                case 'l':
+                    if (strncmp(source + i, "loop", 4) == 0) {
+                        token.type = TOKEN_LOOP;
+                        i += 3; // Consume "loop"
+                    } else {
+                        printf("Error: Unexpected token at position %d\n", i);
+                        exit(1);
+                    }
+                    break;
+                default:
+                    printf("Error: Unexpected token at position %d\n", i);
+                    exit(1);
+            }
+            i++; // Consume operator or delimiter
+        }
+
+        tokens[tokenCount++] = token;
     }
 
+    // Add EOF token
     Token eofToken;
     eofToken.type = TOKEN_EOF;
-    eofToken.value = "";
-
     tokens[tokenCount] = eofToken;
-    tokenCount++;
 
     return tokens;
 }
 
-// Parser
-typedef struct ASTNode {
-    TokenType type;
-    char* value;
-    struct ASTNode* left;
-    struct ASTNode* right;
-} ASTNode;
-
 ASTNode* parseExpression(Token** tokens);
 
 ASTNode* parseFactor(Token** tokens) {
-    if ((*tokens)->type == TOKEN_INT) {
-        Token* token = *tokens;
-        (*tokens)++;
-        
-        ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
-        node->type = TOKEN_INT;
-        node->value = token->value;
-        node->left = NULL;
-        node->right = NULL;
+    Token* currentToken = *tokens;
 
-        return node;
-    }
-    else if ((*tokens)->type == TOKEN_LPAREN) {
-        (*tokens)++; // Consume '('
-        
-        ASTNode* node = parseExpression(tokens);
-        
-        if ((*tokens)->type != TOKEN_RPAREN) {
-            printf("Error: Expected ')' after expression\n");
-            exit(1);
-        }
-        
-        (*tokens)++; // Consume ')'
-        
-        return node;
-    }
-    else {
-        printf("Error: Invalid expression\n");
+    if (currentToken->type == TOKEN_INT) {
+        ASTNode* factor = (ASTNode*)malloc(sizeof(ASTNode));
+        factor->type = currentToken->type;
+        factor->value = currentToken->value;
+        (*tokens)++;
+        return factor;
+    } else if (currentToken->type == TOKEN_IDENTIFIER) {
+        ASTNode* factor = (ASTNode*)malloc(sizeof(ASTNode));
+        factor->type = currentToken->type;
+        factor->identifier = currentToken->identifier;
+        (*tokens)++;
+        return factor;
+    } else {
+        printf("Error: Unexpected token\n");
         exit(1);
     }
 }
 
 ASTNode* parseTerm(Token** tokens) {
     ASTNode* factor = parseFactor(tokens);
+    Token* currentToken = *tokens;
 
-    while ((*tokens)->type == TOKEN_STAR || (*tokens)->type == TOKEN_SLASH) {
-        TokenType operatorType = (*tokens)->type;
-        (*tokens)++;
+    while (currentToken->type == TOKEN_STAR || currentToken->type == TOKEN_SLASH) {
+        (*tokens)++; // Consume operator
 
         ASTNode* nextFactor = parseFactor(tokens);
 
-        ASTNode* newNode = (ASTNode*)malloc(sizeof(ASTNode));
-        newNode->type = operatorType;
-        newNode->value = NULL;
-        newNode->left = factor;
-        newNode->right = nextFactor;
+        ASTNode* term = (ASTNode*)malloc(sizeof(ASTNode));
+        term->type = currentToken->type;
+        term->left = factor;
+        term->right = nextFactor;
 
-        factor = newNode;
+        factor = term;
+        currentToken = *tokens;
     }
 
     return factor;
@@ -171,33 +156,82 @@ ASTNode* parseTerm(Token** tokens) {
 
 ASTNode* parseExpression(Token** tokens) {
     ASTNode* term = parseTerm(tokens);
+    Token* currentToken = *tokens;
 
-    while ((*tokens)->type == TOKEN_PLUS || (*tokens)->type == TOKEN_MINUS) {
-        TokenType operatorType = (*tokens)->type;
-        (*tokens)++;
+    while (currentToken->type == TOKEN_PLUS || currentToken->type == TOKEN_MINUS) {
+        (*tokens)++; // Consume operator
 
         ASTNode* nextTerm = parseTerm(tokens);
 
-        ASTNode* newNode = (ASTNode*)malloc(sizeof(ASTNode));
-        newNode->type = operatorType;
-        newNode->value = NULL;
-        newNode->left = term;
-        newNode->right = nextTerm;
+        ASTNode* expression = (ASTNode*)malloc(sizeof(ASTNode));
+        expression->type = currentToken->type;
+        expression->left = term;
+        expression->right = nextTerm;
 
-        term = newNode;
+        term = expression;
+        currentToken = *tokens;
     }
 
     return term;
 }
 
-ASTNode* parse(Token** tokens) {
-    return parseExpression(tokens);
+ASTNode* parseAssignment(Token** tokens) {
+    Token* currentToken = *tokens;
+
+    if (currentToken->type == TOKEN_IDENTIFIER) {
+        (*tokens)++; // Consume identifier
+
+        if ((*tokens)->type == TOKEN_ASSIGN) {
+            (*tokens)++; // Consume assignment operator
+
+            ASTNode* expression = parseExpression(tokens);
+
+            ASTNode* assignment = (ASTNode*)malloc(sizeof(ASTNode));
+            assignment->type = TOKEN_ASSIGN;
+            assignment->left = (ASTNode*)malloc(sizeof(ASTNode));
+            assignment->left->type = TOKEN_IDENTIFIER;
+            assignment->left->identifier = currentToken->identifier;
+            assignment->right = expression;
+
+            return assignment;
+        }
+    }
+
+    printf("Error: Invalid assignment\n");
+    exit(1);
 }
 
-// Interpreter
+ASTNode* parseLoop(Token** tokens) {
+    Token* currentToken = *tokens;
+
+    if (currentToken->type == TOKEN_LOOP) {
+        (*tokens)++; // Consume loop keyword
+
+        ASTNode* startValue = parseExpression(tokens);
+        ASTNode* endValue = parseExpression(tokens);
+        ASTNode* increment = parseExpression(tokens);
+        ASTNode* body = parseExpression(tokens);
+
+        ASTNode* loopNode = (ASTNode*)malloc(sizeof(ASTNode));
+        loopNode->type = TOKEN_LOOP;
+        loopNode->left = startValue;
+        loopNode->right = endValue;
+        loopNode->expression = increment;
+        loopNode->body = body;
+
+        return loopNode;
+    }
+
+    printf("Error: Invalid loop\n");
+    exit(1);
+}
+
 int evaluate(ASTNode* node) {
     if (node->type == TOKEN_INT) {
-        return atoi(node->value);
+        return node->value;
+    } else if (node->type == TOKEN_IDENTIFIER) {
+        int index = node->identifier - 'A';
+        return variables[index].value;
     } else if (node->type == TOKEN_PLUS) {
         return evaluate(node->left) + evaluate(node->right);
     } else if (node->type == TOKEN_MINUS) {
@@ -206,44 +240,66 @@ int evaluate(ASTNode* node) {
         return evaluate(node->left) * evaluate(node->right);
     } else if (node->type == TOKEN_SLASH) {
         return evaluate(node->left) / evaluate(node->right);
+    } else if (node->type == TOKEN_LOOP) {
+        int startValue = evaluate(node->left);
+        int endValue = evaluate(node->right);
+        int increment = evaluate(node->expression);
+
+        int result = 0;
+        for (int i = startValue; i <= endValue; i += increment) {
+            variables[node->identifier - 'A'].value = i;
+            result += evaluate(node->body);
+        }
+
+        return result;
+    }
+
+    printf("Error: Invalid expression\n");
+    exit(1);
+}
+
+void execute(ASTNode* node) {
+    if (node->type == TOKEN_ASSIGN) {
+        int index = node->left->identifier - 'A';
+        variables[index].value = evaluate(node->right);
+    } else if (node->type == TOKEN_LOOP) {
+        int index = node->left->identifier - 'A';
+
+        int startValue = evaluate(node->left);
+        int endValue = evaluate(node->right);
+        int increment = evaluate(node->expression);
+
+        for (int i = startValue; i <= endValue; i += increment) {
+            variables[index].value = i;
+            execute(node->body);
+        }
     } else {
-        // Error: Unsupported node type
-        return 0;
+        printf("%d\n", evaluate(node));
     }
-}
-
-void freeTokens(Token* tokens) {
-    for (int i = 0; tokens[i].type != TOKEN_EOF; i++) {
-        free(tokens[i].value);
-    }
-    free(tokens);
-}
-
-void freeAST(ASTNode* node) {
-    if (node == NULL) {
-        return;
-    }
-
-    freeAST(node->left);
-    freeAST(node->right);
-    free(node);
-}
-
-void interpret(char* source) {
-    Token* tokens = lex(source);
-    ASTNode* ast = parse(&tokens);
-    int result = evaluate(ast);
-
-    printf("Result: %d\n", result);
-
-    freeTokens(tokens);
-    freeAST(ast);
 }
 
 int main() {
-    char source[] = "10 + 5 * 2";
+    const char* source = "A = 10; B = 5; loop A 1 B 1 A = A - 1;";
 
-    interpret(source);
+
+    Token* tokens = lex(source);
+
+    Token* currentToken = tokens;
+    while (currentToken->type != TOKEN_EOF) {
+        ASTNode* node;
+        if (currentToken->type == TOKEN_ASSIGN) {
+            node = parseAssignment(&currentToken);
+        } else if (currentToken->type == TOKEN_LOOP) {
+            node = parseLoop(&currentToken);
+        } else {
+            node = parseExpression(&currentToken);
+        }
+
+        execute(node);
+        currentToken++; // Consume semicolon
+    }
+
+    free(tokens);
 
     return 0;
 }
