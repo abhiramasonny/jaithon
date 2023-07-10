@@ -72,12 +72,19 @@ void advance() {
     if (*input >= '0' && *input <= '9') {
         int isFloat = 0;
         char *start = input;
+
+        // Check for negative sign
+        if (*start == '-') {
+            start++;
+        }
+
         while (*input && ((*input >= '0' && *input <= '9') || *input == '.')) {
             if (*input == '.') {
                 isFloat = 1;
             }
             input++;
         }
+        
         if (isFloat) {
             currentToken.type = TOKEN_FLOAT;
             currentToken.value = strtod(start, NULL);
@@ -172,6 +179,9 @@ double factor() {
         double value = currentToken.value;
         eat(currentToken.type);
         return value;
+    } else if (currentToken.type == TOKEN_MINUS) {
+        eat(TOKEN_MINUS);
+        return -factor();
     } else if (currentToken.type == TOKEN_IDENTIFIER) {
         char identifier[256];
         strcpy(identifier, currentToken.identifier);
@@ -254,12 +264,13 @@ void statement() {
 // Parse a program: multiple statements
 void program() {
     while (currentToken.type != TOKEN_EOF) {
-       statement();
+        statement();
     }
 }
 
 int main() {
-    char code[] = "var x = 2.2\n print x*3.14";
+    char code[] = "var x = -1\n print x*3.14";
+
     lexer(code);
     program();
     return 0;
