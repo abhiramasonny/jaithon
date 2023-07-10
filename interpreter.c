@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 // Token types
 typedef enum {
@@ -17,7 +18,14 @@ typedef enum {
     TOKEN_VAR,
     TOKEN_ASSIGN,
     TOKEN_IDENTIFIER,
-    TOKEN_EOF
+    TOKEN_EOF,
+    TOKEN_SIN,
+    TOKEN_COS,
+    TOKEN_TAN,
+    TOKEN_ASIN,
+    TOKEN_ACOS,
+    TOKEN_ATAN,
+    TOKEN_SQRT
 } TokenType;
 
 // Token structure
@@ -47,6 +55,7 @@ void eat(TokenType type);
 double factor();
 double term();
 double expression();
+double trigFunction();
 void assignment();
 void printStatement();
 void statement();
@@ -116,6 +125,27 @@ void advance() {
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
+    } else if (strncmp(input, "sin", 3) == 0) {
+        currentToken.type = TOKEN_SIN;
+        input += 3;
+    } else if (strncmp(input, "cos", 3) == 0) {
+        currentToken.type = TOKEN_COS;
+        input += 3;
+    } else if (strncmp(input, "tan", 3) == 0) {
+        currentToken.type = TOKEN_TAN;
+        input += 3;
+    } else if (strncmp(input, "asin", 4) == 0) {
+        currentToken.type = TOKEN_ASIN;
+        input += 4;
+    } else if (strncmp(input, "acos", 4) == 0) {
+        currentToken.type = TOKEN_ACOS;
+        input += 4;
+    } else if (strncmp(input, "atan", 4) == 0) {
+        currentToken.type = TOKEN_ATAN;
+        input += 4;
+    } else if (strncmp(input, "sqrt", 4) == 0) {
+        currentToken.type = TOKEN_SQRT;
+        input += 4;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
         int i = 0;
@@ -192,6 +222,14 @@ double factor() {
         double result = expression();
         eat(TOKEN_RPAREN);
         return result;
+    } else if (currentToken.type == TOKEN_SIN ||
+               currentToken.type == TOKEN_COS ||
+               currentToken.type == TOKEN_TAN ||
+               currentToken.type == TOKEN_ASIN ||
+               currentToken.type == TOKEN_ACOS ||
+               currentToken.type == TOKEN_ATAN ||
+               currentToken.type == TOKEN_SQRT) {
+        return trigFunction();
     } else {
         error("Invalid factor", currentToken.identifier);
         return 0;
@@ -232,6 +270,35 @@ double expression() {
     return result;
 }
 
+// Parse a trigonometric function
+double trigFunction() {
+    TokenType trigType = currentToken.type;
+    eat(trigType);
+    eat(TOKEN_LPAREN);
+    double argument = expression();
+    eat(TOKEN_RPAREN);
+
+    switch (trigType) {
+        case TOKEN_SIN:
+            return sin(argument);
+        case TOKEN_COS:
+            return cos(argument);
+        case TOKEN_TAN:
+            return tan(argument);
+        case TOKEN_ASIN:
+            return asin(argument);
+        case TOKEN_ACOS:
+            return acos(argument);
+        case TOKEN_ATAN:
+            return atan(argument);
+        case TOKEN_SQRT:
+            return sqrt(argument);
+        default:
+            error("Invalid trigonometric function", currentToken.identifier);
+            return 0;
+    }
+}
+
 // Parse an assignment statement
 void assignment() {
     char identifier[256];
@@ -269,9 +336,40 @@ void program() {
 }
 
 int main() {
-    char code[] = "var x = -1\n print x*3.14";
+    // Test sine function
+    char code1[] = "var angle = 0.5\n var result = sin(angle)\n print result";
+    lexer(code1);
+    program();  // Output: 0.479426
 
-    lexer(code);
-    program();
+    // Test cosine function
+    char code2[] = "var angle = 0.8\n var result = cos(angle)\n print result";
+    lexer(code2);
+    program();  // Output: 0.696707
+
+    // Test tangent function
+    char code3[] = "var angle = 1.2\n var result = tan(angle)\n print result";
+    lexer(code3);
+    program();  // Output: 2.572151
+
+    // Test arcsine function
+    char code4[] = "var value = 0.5\n var result = asin(value)\n print result";
+    lexer(code4);
+    program();  // Output: 0.523599
+
+    // Test arccosine function
+    char code5[] = "var value = 0.8\n var result = acos(value)\n print result";
+    lexer(code5);
+    program();  // Output: 0.643501
+
+    // Test arctangent function
+    char code6[] = "var value = 1.2\n var result = atan(value)\n print result";
+    lexer(code6);
+    program();  // Output: 0.876058
+
+    // Test square root function
+    char code7[] = "var value = 25.0\n var result = sqrt(value)\n print result";
+    lexer(code7);
+    program();  // Output: 5.000000
+
     return 0;
 }
