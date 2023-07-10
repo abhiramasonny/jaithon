@@ -1,12 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <ctype.h>
 
 // Token types
 typedef enum {
     TOKEN_INT,
+    TOKEN_FLOAT,
     TOKEN_PLUS,
     TOKEN_MINUS,
     TOKEN_MULTIPLY,
@@ -17,18 +17,13 @@ typedef enum {
     TOKEN_VAR,
     TOKEN_ASSIGN,
     TOKEN_IDENTIFIER,
-    TOKEN_EOF,
-    TOKEN_OR,
-    TOKEN_AND,
-    TOKEN_NOT,
-    TOKEN_LT,
-    TOKEN_GT
+    TOKEN_EOF
 } TokenType;
 
 // Token structure
 typedef struct {
     TokenType type;
-    int value;
+    double value;
     char identifier[256];
 } Token;
 
@@ -39,7 +34,7 @@ char *input;
 // Symbol table for variables
 typedef struct {
     char name[256];
-    int value;
+    double value;
 } Variable;
 
 Variable variables[256];
@@ -49,13 +44,9 @@ int numVariables = 0;
 void advance();
 void error(const char *message, const char *errorToken);
 void eat(TokenType type);
-int factor();
-int term();
-int expression();
-bool comparison();
-bool logicalOr();
-bool logicalAnd();
-bool logicalNot();
+double factor();
+double term();
+double expression();
 void assignment();
 void printStatement();
 void statement();
@@ -79,8 +70,21 @@ void advance() {
     }
 
     if (*input >= '0' && *input <= '9') {
-        currentToken.type = TOKEN_INT;
-        currentToken.value = strtol(input, &input, 10);
+        int isFloat = 0;
+        char *start = input;
+        while (*input && ((*input >= '0' && *input <= '9') || *input == '.')) {
+            if (*input == '.') {
+                isFloat = 1;
+            }
+            input++;
+        }
+        if (isFloat) {
+            currentToken.type = TOKEN_FLOAT;
+            currentToken.value = strtod(start, NULL);
+        } else {
+            currentToken.type = TOKEN_INT;
+            currentToken.value = strtol(start, NULL, 10);
+        }
     } else if (*input == '+') {
         currentToken.type = TOKEN_PLUS;
         input++;
@@ -105,21 +109,6 @@ void advance() {
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
-    } else if (strncmp(input, "or", 2) == 0) {
-        currentToken.type = TOKEN_OR;
-        input += 2;
-    } else if (strncmp(input, "and", 3) == 0) {
-        currentToken.type = TOKEN_AND;
-        input += 3;
-    } else if (strncmp(input, "not", 3) == 0) {
-        currentToken.type = TOKEN_NOT;
-        input += 3;
-    } else if (strncmp(input, "<", 1) == 0) {
-        currentToken.type = TOKEN_LT;
-        input++;
-    } else if (strncmp(input, ">", 1) == 0) {
-        currentToken.type = TOKEN_GT;
-        input++;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
         int i = 0;
@@ -154,7 +143,7 @@ void eat(TokenType type) {
 }
 
 // Get the value of a variable
-int getVariableValue(const char *name) {
+double getVariableValue(const char *name) {
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
             return variables[i].value;
@@ -165,7 +154,7 @@ int getVariableValue(const char *name) {
 }
 
 // Set the value of a variable
-void setVariableValue(const char *name, int value) {
+void setVariableValue(const char *name, double value) {
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
             variables[i].value = value;
@@ -178,10 +167,10 @@ void setVariableValue(const char *name, int value) {
 }
 
 // Parse a factor: a number, variable, or expression within parentheses
-int factor() {
-    if (currentToken.type == TOKEN_INT) {
-        int value = currentToken.value;
-        eat(TOKEN_INT);
+double factor() {
+    if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
+        double value = currentToken.value;
+        eat(currentToken.type);
         return value;
     } else if (currentToken.type == TOKEN_IDENTIFIER) {
         char identifier[256];
@@ -190,12 +179,9 @@ int factor() {
         return getVariableValue(identifier);
     } else if (currentToken.type == TOKEN_LPAREN) {
         eat(TOKEN_LPAREN);
-        int result = expression();
+        double result = expression();
         eat(TOKEN_RPAREN);
         return result;
-    } else if (currentToken.type == TOKEN_NOT) {
-        eat(TOKEN_NOT);
-        return logicalNot();
     } else {
         error("Invalid factor", currentToken.identifier);
         return 0;
@@ -203,8 +189,8 @@ int factor() {
 }
 
 // Parse a term: multiplication or division of factors
-int term() {
-    int result = factor();
+double term() {
+    double result = factor();
 
     while (currentToken.type == TOKEN_MULTIPLY || currentToken.type == TOKEN_DIVIDE) {
         if (currentToken.type == TOKEN_MULTIPLY) {
@@ -220,8 +206,8 @@ int term() {
 }
 
 // Parse an expression: addition or subtraction of terms
-int expression() {
-    int result = term();
+double expression() {
+    double result = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS) {
         if (currentToken.type == TOKEN_PLUS) {
@@ -236,67 +222,21 @@ int expression() {
     return result;
 }
 
-// Parse a comparison expression
-bool comparison() {
-    int left = expression();
-    TokenType comparisonType = currentToken.type;
-    if (comparisonType == TOKEN_LT || comparisonType == TOKEN_GT) {
-        eat(comparisonType);
-        int right = expression();
-        if (comparisonType == TOKEN_LT) {
-            return left < right;
-        } else if (comparisonType == TOKEN_GT) {
-            return left > right;
-        }
-    }
-    return false;
-}
-
-// Parse a logical OR expression
-bool logicalOr() {
-    bool result = comparison();
-    while (currentToken.type == TOKEN_OR) {
-        eat(TOKEN_OR);
-        result = result || comparison();
-    }
-    return result;
-}
-
-// Parse a logical AND expression
-bool logicalAnd() {
-    bool result = logicalOr();
-    while (currentToken.type == TOKEN_AND) {
-        eat(TOKEN_AND);
-        result = result && logicalOr();
-    }
-    return result;
-}
-
-// Parse a logical NOT expression
-bool logicalNot() {
-    if (currentToken.type == TOKEN_NOT) {
-        eat(TOKEN_NOT);
-        return !logicalNot();
-    } else {
-        return logicalAnd();
-    }
-}
-
 // Parse an assignment statement
 void assignment() {
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_ASSIGN);
-    int value = expression();
+    double value = expression();
     setVariableValue(identifier, value);
 }
 
 // Parse a print statement
 void printStatement() {
     eat(TOKEN_PRINT);
-    int value = expression();
-    printf("%d\n", value);
+    double value = expression();
+    printf("%lf\n", value);
 }
 
 // Parse a statement: assignment or print statement
@@ -314,12 +254,12 @@ void statement() {
 // Parse a program: multiple statements
 void program() {
     while (currentToken.type != TOKEN_EOF) {
-        statement();
+       statement();
     }
 }
 
 int main() {
-    char code[] = "";
+    char code[] = "var x = 2.2\n print x*3.14";
     lexer(code);
     program();
     return 0;
