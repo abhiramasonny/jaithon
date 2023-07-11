@@ -25,7 +25,11 @@ typedef enum {
     TOKEN_ASIN,
     TOKEN_ACOS,
     TOKEN_ATAN,
-    TOKEN_SQRT
+    TOKEN_SQRT,
+    TOKEN_ARRAY,
+    TOKEN_COMMA,
+    TOKEN_LBRACKET,
+    TOKEN_RBRACKET
 } TokenType;
 
 // Token structure
@@ -48,6 +52,16 @@ typedef struct {
 Variable variables[256];
 int numVariables = 0;
 
+// Array structure
+typedef struct {
+    char name[256];
+    int size;
+    double elements[256];
+} Array;
+
+Array arrays[256];
+int numArrays = 0;
+
 // Function declarations
 void advance();
 void error(const char *message, const char *errorToken);
@@ -60,6 +74,7 @@ void assignment();
 void printStatement();
 void statement();
 void program();
+void array();
 
 // Lexer: Converts input string to tokens
 void lexer(char *code) {
@@ -119,12 +134,24 @@ void advance() {
     } else if (*input == ')') {
         currentToken.type = TOKEN_RPAREN;
         input++;
+    } else if (*input == ',') {
+        currentToken.type = TOKEN_COMMA;
+        input++;
+    } else if (*input == '[') {
+        currentToken.type = TOKEN_LBRACKET;
+        input++;
+    } else if (*input == ']') {
+        currentToken.type = TOKEN_RBRACKET;
+        input++;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
+    } else if (strncmp(input, "array", 5) == 0){
+        currentToken.type = TOKEN_ARRAY;
+        input += 5;
     } else if (strncmp(input, "sin", 3) == 0) {
         currentToken.type = TOKEN_SIN;
         input += 3;
@@ -209,19 +236,36 @@ double factor() {
         double value = currentToken.value;
         eat(currentToken.type);
         return value;
-    } else if (currentToken.type == TOKEN_MINUS) {
-        eat(TOKEN_MINUS);
-        return -factor();
     } else if (currentToken.type == TOKEN_IDENTIFIER) {
         char identifier[256];
         strcpy(identifier, currentToken.identifier);
         eat(TOKEN_IDENTIFIER);
+
+        if (currentToken.type == TOKEN_LBRACKET) {
+            eat(TOKEN_LBRACKET);
+            int index = (int)expression();
+            eat(TOKEN_RBRACKET);
+
+            // Find the array and return the element at the given index
+            for (int i = 0; i < numArrays; i++) {
+                if (strcmp(identifier, arrays[i].name) == 0) {
+                    if (index >= 0 && index < arrays[i].size) {
+                        return arrays[i].elements[index];
+                    } else {
+                        error("Array index out of bounds", identifier);
+                    }
+                }
+            }
+            error("Array not found", identifier);
+            return 0;
+        }
+
         return getVariableValue(identifier);
     } else if (currentToken.type == TOKEN_LPAREN) {
         eat(TOKEN_LPAREN);
-        double result = expression();
+        double value = expression();
         eat(TOKEN_RPAREN);
-        return result;
+        return value;
     } else if (currentToken.type == TOKEN_SIN ||
                currentToken.type == TOKEN_COS ||
                currentToken.type == TOKEN_TAN ||
@@ -230,76 +274,81 @@ double factor() {
                currentToken.type == TOKEN_ATAN ||
                currentToken.type == TOKEN_SQRT) {
         return trigFunction();
-    } else {
-        error("Invalid factor", currentToken.identifier);
-        return 0;
     }
+
+    error("Invalid factor", currentToken.identifier);
+    return 0;
 }
 
 // Parse a term: multiplication or division of factors
 double term() {
-    double result = factor();
+    double value = factor();
 
     while (currentToken.type == TOKEN_MULTIPLY || currentToken.type == TOKEN_DIVIDE) {
         if (currentToken.type == TOKEN_MULTIPLY) {
             eat(TOKEN_MULTIPLY);
-            result *= factor();
+            value *= factor();
         } else if (currentToken.type == TOKEN_DIVIDE) {
             eat(TOKEN_DIVIDE);
-            result /= factor();
+            double divisor = factor();
+            if (divisor == 0) {
+                error("Division by zero", "");
+            }
+            value /= divisor;
         }
     }
 
-    return result;
+    return value;
 }
 
 // Parse an expression: addition or subtraction of terms
 double expression() {
-    double result = term();
+    double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
-            result += term();
+            value += term();
         } else if (currentToken.type == TOKEN_MINUS) {
             eat(TOKEN_MINUS);
-            result -= term();
+            value -= term();
         }
     }
 
-    return result;
+    return value;
 }
 
-// Parse a trigonometric function
+// Parse a trigonometric function: sin, cos, tan, asin, acos, atan, sqrt
 double trigFunction() {
-    TokenType trigType = currentToken.type;
-    eat(trigType);
+    TokenType functionType = currentToken.type;
+    eat(functionType);
     eat(TOKEN_LPAREN);
-    double argument = expression();
+    double value = expression();
     eat(TOKEN_RPAREN);
 
-    switch (trigType) {
+    switch (functionType) {
         case TOKEN_SIN:
-            return sin(argument);
+            return sin(value);
         case TOKEN_COS:
-            return cos(argument);
+            return cos(value);
         case TOKEN_TAN:
-            return tan(argument);
+            return tan(value);
         case TOKEN_ASIN:
-            return asin(argument);
+            return asin(value);
         case TOKEN_ACOS:
-            return acos(argument);
+            return acos(value);
         case TOKEN_ATAN:
-            return atan(argument);
+            return atan(value);
         case TOKEN_SQRT:
-            return sqrt(argument);
+            return sqrt(value);
         default:
-            error("Invalid trigonometric function", currentToken.identifier);
-            return 0;
+            error("Invalid trigonometric function", "");
     }
+
+    return 0;
 }
 
-// Parse an assignment statement
+// Handle variable assignment
 void assignment() {
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
@@ -309,14 +358,14 @@ void assignment() {
     setVariableValue(identifier, value);
 }
 
-// Parse a print statement
+// Handle print statement
 void printStatement() {
     eat(TOKEN_PRINT);
     double value = expression();
-    printf("%lf\n", value);
+    printf("%f\n", value);
 }
 
-// Parse a statement: assignment or print statement
+// Handle statements: variable assignment or print statement
 void statement() {
     if (currentToken.type == TOKEN_VAR) {
         eat(TOKEN_VAR);
@@ -328,14 +377,40 @@ void statement() {
     }
 }
 
-// Parse a program: multiple statements
+// Parse the program
 void program() {
     while (currentToken.type != TOKEN_EOF) {
-        statement();
+        if (currentToken.type == TOKEN_ARRAY) {
+            array();
+        } else {
+            statement();
+        }
     }
 }
 
+// Parse an array declaration
+void array() {
+    eat(TOKEN_ARRAY);
+    char arrayName[256];
+    strcpy(arrayName, currentToken.identifier);
+    eat(TOKEN_IDENTIFIER);
+    eat(TOKEN_ASSIGN);
+    eat(TOKEN_LBRACKET);
+    int size = (int)expression();
+    eat(TOKEN_RBRACKET);
+
+    // Store the array and its size
+    strcpy(arrays[numArrays].name, arrayName);
+    arrays[numArrays].size = size;
+    numArrays++;
+}
+
 int main() {
+    // Test array declaration and access
+    char code[] = "array e = [5]";
+    lexer(code);
+    program();  // Output: 2.000000
+
     // Test sine function
     char code1[] = "var angle = 0.5\n var result = sin(angle)\n print result";
     lexer(code1);
