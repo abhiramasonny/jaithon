@@ -4,9 +4,15 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 ## Features
 
-- Array Declarations: Define arrays and specify their sizes.
-- Array Access: Access elements of an array using square brackets.
-- Array Modification: Add elements to an array at specific positions.
+- Variable Assignment: You can assign values to variables using the var keyword, e.g., var x = 5.
+- Array Declaration: You can init arrays using the array keyword, e.g., array arr = [1].
+- Array Element Modification: You can modify elements of an array using the dot notation, e.g., arr.add(0, 4).
+- Print Statement: You can use the print keyword to print values to the console, e.g., print x.
+- Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
+- Parentheses: You can use parentheses to group expressions and control operator precedence.
+- Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt.
+- Comments: You can add comments using the # symbol. Commented lines are displayed in green.
+
 
 ## How it Works
 
