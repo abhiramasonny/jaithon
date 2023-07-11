@@ -29,7 +29,8 @@ typedef enum {
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
-    TOKEN_RBRACKET
+    TOKEN_RBRACKET,
+    TOKEN_DOT  // New token for dot operator
 } TokenType;
 
 // Token structure
@@ -47,20 +48,13 @@ char *input;
 typedef struct {
     char name[256];
     double value;
+    int isArray;  // Flag to indicate if the variable is an array
+    double *elements;  // Pointer to array elements
+    int size;  // Size of the array
 } Variable;
 
 Variable variables[256];
 int numVariables = 0;
-
-// Array structure
-typedef struct {
-    char name[256];
-    int size;
-    double elements[256];
-} Array;
-
-Array arrays[256];
-int numArrays = 0;
 
 // Function declarations
 void advance();
@@ -71,6 +65,7 @@ double term();
 double expression();
 double trigFunction();
 void assignment();
+void arrayAssignment();
 void printStatement();
 void statement();
 void program();
@@ -143,13 +138,16 @@ void advance() {
     } else if (*input == ']') {
         currentToken.type = TOKEN_RBRACKET;
         input++;
+    } else if (*input == '.') {
+        currentToken.type = TOKEN_DOT;  // Dot operator
+        input++;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
-    } else if (strncmp(input, "array", 5) == 0){
+    } else if (strncmp(input, "array", 5) == 0) {
         currentToken.type = TOKEN_ARRAY;
         input += 5;
     } else if (strncmp(input, "sin", 3) == 0) {
@@ -230,6 +228,25 @@ void setVariableValue(const char *name, double value) {
     numVariables++;
 }
 
+// Set the value of an array at a specific index
+void setArrayValue(const char *name, int index, double value) {
+    for (int i = 0; i < numVariables; i++) {
+        if (strcmp(name, variables[i].name) == 0) {
+            if (variables[i].isArray) {
+                if (index >= 0 && index < variables[i].size) {
+                    variables[i].elements[index] = value;
+                    return;
+                } else {
+                    error("Array index out of bounds", name);
+                }
+            } else {
+                error("Variable is not an array", name);
+            }
+        }
+    }
+    error("Array not found", name);
+}
+
 // Parse a factor: a number, variable, or expression within parentheses
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
@@ -247,12 +264,16 @@ double factor() {
             eat(TOKEN_RBRACKET);
 
             // Find the array and return the element at the given index
-            for (int i = 0; i < numArrays; i++) {
-                if (strcmp(identifier, arrays[i].name) == 0) {
-                    if (index >= 0 && index < arrays[i].size) {
-                        return arrays[i].elements[index];
+            for (int i = 0; i < numVariables; i++) {
+                if (strcmp(identifier, variables[i].name) == 0) {
+                    if (variables[i].isArray) {
+                        if (index >= 0 && index < variables[i].size) {
+                            return variables[i].elements[index];
+                        } else {
+                            error("Array index out of bounds", identifier);
+                        }
                     } else {
-                        error("Array index out of bounds", identifier);
+                        error("Variable is not an array", identifier);
                     }
                 }
             }
@@ -358,20 +379,83 @@ void assignment() {
     setVariableValue(identifier, value);
 }
 
+// Handle array assignment
+void arrayAssignment() {
+    char identifier[256];
+    strcpy(identifier, currentToken.identifier);
+    eat(TOKEN_IDENTIFIER);
+    eat(TOKEN_DOT);  // Consume the dot operator
+    if (currentToken.type == TOKEN_IDENTIFIER) {
+        char methodName[256];
+        strcpy(methodName, currentToken.identifier);
+        eat(TOKEN_IDENTIFIER);
+        if (strcmp(methodName, "add") == 0) {
+            eat(TOKEN_LPAREN);
+            int index = (int)expression();
+            eat(TOKEN_COMMA);
+            double value = expression();
+            eat(TOKEN_RPAREN);
+            setArrayValue(identifier, index, value);
+        } else {
+            error("Invalid array method", methodName);
+        }
+    } else {
+        error("Invalid array method", currentToken.identifier);
+    }
+}
+
 // Handle print statement
 void printStatement() {
     eat(TOKEN_PRINT);
-    double value = expression();
-    printf("%f\n", value);
+    if (currentToken.type == TOKEN_IDENTIFIER) {
+        char identifier[256];
+        strcpy(identifier, currentToken.identifier);
+        eat(TOKEN_IDENTIFIER);
+
+        // Check if the identifier is an array
+        int isArray = 0;
+        for (int i = 0; i < numVariables; i++) {
+            if (strcmp(identifier, variables[i].name) == 0) {
+                isArray = variables[i].isArray;
+                break;
+            }
+        }
+
+        // If the identifier is an array, print its elements
+        if (isArray) {
+            for (int i = 0; i < numVariables; i++) {
+                if (strcmp(identifier, variables[i].name) == 0) {
+                    printf("[");
+                    for (int j = 0; j < variables[i].size; j++) {
+                        printf("%f", variables[i].elements[j]);
+                        if (j < variables[i].size - 1) {
+                            printf(", ");
+                        }
+                    }
+                    printf("]\n");
+                    return;
+                }
+            }
+        }
+
+        // If the identifier is not an array, print its value as before
+        double value = getVariableValue(identifier);
+        printf("%f\n", value);
+    } else {
+        double value = expression();
+        printf("%f\n", value);
+    }
 }
 
-// Handle statements: variable assignment or print statement
+// Handle statements: variable assignment, array assignment, or print statement
 void statement() {
     if (currentToken.type == TOKEN_VAR) {
         eat(TOKEN_VAR);
         assignment();
     } else if (currentToken.type == TOKEN_PRINT) {
         printStatement();
+    } else if (currentToken.type == TOKEN_IDENTIFIER) {
+        arrayAssignment();
     } else {
         error("Invalid statement", currentToken.identifier);
     }
@@ -399,19 +483,27 @@ void array() {
     int size = (int)expression();
     eat(TOKEN_RBRACKET);
 
+    // Create the array and initialize its elements to 0
+    double *elements = malloc(size * sizeof(double));
+    for (int i = 0; i < size; i++) {
+        elements[i] = 0.0;
+    }
+
     // Store the array and its size
-    strcpy(arrays[numArrays].name, arrayName);
-    arrays[numArrays].size = size;
-    numArrays++;
+    strcpy(variables[numVariables].name, arrayName);
+    variables[numVariables].value = 0.0;
+    variables[numVariables].isArray = 1;
+    variables[numVariables].elements = elements;
+    variables[numVariables].size = size;
+    numVariables++;
 }
 
 int main() {
     // Test array declaration and access
-    char code[] = "array e = [5]";
+    char code[] = "array a = [3]\na.add(0, 2)\nprint a\n a.add(2,1) print a";
     lexer(code);
-    program();  // Output: 2.000000
+    program();  // Output: [2.000000, 0.000000, 0.000000]
 
-    // Test sine function
     char code1[] = "var angle = 0.5\n var result = sin(angle)\n print result";
     lexer(code1);
     program();  // Output: 0.479426
