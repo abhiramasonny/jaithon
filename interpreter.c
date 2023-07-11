@@ -63,6 +63,7 @@ double trigFunction();
 void assignment();
 void arrayAssignment();
 void arrayDeletion();
+void sortArray(double *array, int size);
 void arraySort(const char *name);
 void printStatement();
 void statement();
