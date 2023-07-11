@@ -40,7 +40,7 @@ To use the array compiler/interpreter, follow these steps:
 ## Syntex Highlighting
 
 This is a really cool feature and takes like 3 seconds to do so dont be lazy and follow the steps
-```bash
+```sh
 cd tmp
 cp -r jai ~/.vscode/extensions
 cd ~/.vscode/extensions
