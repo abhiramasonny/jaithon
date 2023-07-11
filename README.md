@@ -38,7 +38,7 @@ To use the array compiler/interpreter, follow these steps:
 
 ## Examples
 
-Here are some examples of code that can be compiled/interpreted using this array compiler/interpreter:
+Here are some examples of code that can be compiled/interpreted using this interpreter:
 
 ```c
 array a = [3]
