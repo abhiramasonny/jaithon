@@ -497,46 +497,46 @@ void array() {
     variables[numVariables].size = size;
     numVariables++;
 }
-
 int main() {
-    // Test array declaration and access
-    char code[] = "array a = [3]\na.add(0, 2)\nprint a\n a.add(2,1) print a";
+    // Open the file
+    FILE *file = fopen("jaithon.jai", "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error opening file\n");
+        return 1;
+    }
+
+    // Determine the file size
+    fseek(file, 0, SEEK_END);
+    long fileSize = ftell(file);
+    rewind(file);
+
+    // Allocate memory to store the file content
+    char *code = malloc(fileSize + 1);
+    if (code == NULL) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return 1;
+    }
+
+    // Read the file content into the code buffer
+    size_t bytesRead = fread(code, 1, fileSize, file);
+    if (bytesRead < fileSize) {
+        fprintf(stderr, "Error reading file\n");
+        fclose(file);
+        free(code);
+        return 1;
+    }
+    code[fileSize] = '\0';  // Null-terminate the code string
+
+    // Close the file
+    fclose(file);
+
+    // Process the code
     lexer(code);
-    program();  // Output: [2.000000, 0.000000, 0.000000]
+    program();
 
-    char code1[] = "var angle = 0.5\n var result = sin(angle)\n print result";
-    lexer(code1);
-    program();  // Output: 0.479426
-
-    // Test cosine function
-    char code2[] = "var angle = 0.8\n var result = cos(angle)\n print result";
-    lexer(code2);
-    program();  // Output: 0.696707
-
-    // Test tangent function
-    char code3[] = "var angle = 1.2\n var result = tan(angle)\n print result";
-    lexer(code3);
-    program();  // Output: 2.572151
-
-    // Test arcsine function
-    char code4[] = "var value = 0.5\n var result = asin(value)\n print result";
-    lexer(code4);
-    program();  // Output: 0.523599
-
-    // Test arccosine function
-    char code5[] = "var value = 0.8\n var result = acos(value)\n print result";
-    lexer(code5);
-    program();  // Output: 0.643501
-
-    // Test arctangent function
-    char code6[] = "var value = 1.2\n var result = atan(value)\n print result";
-    lexer(code6);
-    program();  // Output: 0.876058
-
-    // Test square root function
-    char code7[] = "var value = 25.0\n var result = sqrt(value)\n print result";
-    lexer(code7);
-    program();  // Output: 5.000000
+    // Free allocated memory
+    free(code);
 
     return 0;
 }

@@ -32,7 +32,7 @@ The compiler/interpreter follows the following workflow:
 
 To use the array compiler/interpreter, follow these steps:
 
-1. Provide the code to be compiled/interpreted, including array declarations, variable assignments, and print statements.
+1. Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
 2. Execute the compiler/interpreter.
 3. The output will be displayed, showing the results of any print statements or errors encountered during execution.
 
