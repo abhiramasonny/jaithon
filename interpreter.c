@@ -62,7 +62,8 @@ double expression();
 double trigFunction();
 void assignment();
 void arrayAssignment();
-void arrayDeletion(); 
+void arrayDeletion();
+void arraySort(const char *name);
 void printStatement();
 void statement();
 void program();
@@ -77,7 +78,7 @@ void advance() {
     while (isspace(*input)) {
         input++;
     }
-    if (*input == '#') {  
+    if (*input == '#') {
         while (*input && *input != '\n') {
             input++;
         }
@@ -103,7 +104,7 @@ void advance() {
             }
             input++;
         }
-        
+
         if (isFloat) {
             currentToken.type = TOKEN_FLOAT;
             currentToken.value = strtod(start, NULL);
@@ -265,6 +266,34 @@ void deleteArrayValue(const char *name, int index) {
     error("Array not found", name);
 }
 
+void sortArray(double *array, int size) {
+    for (int i = 1; i < size; i++) {
+        double key = array[i];
+        int j = i - 1;
+
+        while (j >= 0 && array[j] > key) {
+            array[j + 1] = array[j];
+            j = j - 1;
+        }
+
+        array[j + 1] = key;
+    }
+}
+
+void arraySort(const char *name) {
+    for (int i = 0; i < numVariables; i++) {
+        if (strcmp(name, variables[i].name) == 0) {
+            if (variables[i].isArray) {
+                sortArray(variables[i].elements, variables[i].size);
+                return;
+            } else {
+                error("Variable is not an array", name);
+            }
+        }
+    }
+    error("Array not found", name);
+}
+
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
         double value = currentToken.value;
@@ -354,7 +383,6 @@ double expression() {
     return value;
 }
 
-//sin, cos, tan, asin, acos, atan, sqrt
 double trigFunction() {
     TokenType functionType = currentToken.type;
     eat(functionType);
@@ -397,7 +425,7 @@ void arrayAssignment() {
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
-    eat(TOKEN_DOT);  
+    eat(TOKEN_DOT);
     if (currentToken.type == TOKEN_IDENTIFIER) {
         char methodName[256];
         strcpy(methodName, currentToken.identifier);
@@ -413,7 +441,11 @@ void arrayAssignment() {
             eat(TOKEN_LPAREN);
             int index = (int)expression();
             eat(TOKEN_RPAREN);
-            deleteArrayValue(identifier, index); 
+            deleteArrayValue(identifier, index);
+        } else if (strcmp(methodName, "sort") == 0) {
+            eat(TOKEN_LPAREN);
+            eat(TOKEN_RPAREN);
+            arraySort(identifier);
         } else {
             error("Invalid array method", methodName);
         }
