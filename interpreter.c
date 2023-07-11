@@ -4,7 +4,7 @@
 #include <ctype.h>
 #include <math.h>
 
-// Token types
+// Tokens
 typedef enum {
     TOKEN_INT,
     TOKEN_FLOAT,
@@ -30,33 +30,31 @@ typedef enum {
     TOKEN_COMMA,
     TOKEN_LBRACKET,
     TOKEN_RBRACKET,
-    TOKEN_DOT  // New token for dot operator
+    TOKEN_DOT
 } TokenType;
 
-// Token structure
 typedef struct {
     TokenType type;
     double value;
     char identifier[256];
 } Token;
 
-// Global variables
+
 Token currentToken;
 char *input;
 
-// Symbol table for variables
+// Symbol table
 typedef struct {
     char name[256];
     double value;
-    int isArray;  // Flag to indicate if the variable is an array
-    double *elements;  // Pointer to array elements
-    int size;  // Size of the array
+    int isArray;
+    double *elements;
+    int size;
 } Variable;
 
 Variable variables[256];
 int numVariables = 0;
 
-// Function declarations
 void advance();
 void error(const char *message, const char *errorToken);
 void eat(TokenType type);
@@ -66,23 +64,28 @@ double expression();
 double trigFunction();
 void assignment();
 void arrayAssignment();
+void arrayDeletion(); // Function for array deletion
 void printStatement();
 void statement();
 void program();
 void array();
 
-// Lexer: Converts input string to tokens
 void lexer(char *code) {
     input = code;
     advance();
 }
 
-// Advance to the next token
 void advance() {
     while (isspace(*input)) {
         input++;
     }
-
+    if (*input == '#') {  // comment logic
+        while (*input && *input != '\n') {
+            input++;
+        }
+        advance();  // Recursively call advance
+        return;
+    }
     if (*input == '\0') {
         currentToken.type = TOKEN_EOF;
         return;
@@ -92,7 +95,6 @@ void advance() {
         int isFloat = 0;
         char *start = input;
 
-        // Check for negative sign
         if (*start == '-') {
             start++;
         }
@@ -139,7 +141,7 @@ void advance() {
         currentToken.type = TOKEN_RBRACKET;
         input++;
     } else if (*input == '.') {
-        currentToken.type = TOKEN_DOT;  // Dot operator
+        currentToken.type = TOKEN_DOT;
         input++;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
@@ -187,13 +189,12 @@ void advance() {
     }
 }
 
-// Report an error
 void error(const char *message, const char *errorToken) {
     fprintf(stderr, "Error: %s. Found: %s\n", message, errorToken);
     exit(1);
 }
 
-// Ensure the current token matches the expected type and advance to the next token
+
 void eat(TokenType type) {
     if (currentToken.type == type) {
         advance();
@@ -204,7 +205,7 @@ void eat(TokenType type) {
     }
 }
 
-// Get the value of a variable
+
 double getVariableValue(const char *name) {
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
@@ -215,7 +216,7 @@ double getVariableValue(const char *name) {
     return 0;
 }
 
-// Set the value of a variable
+
 void setVariableValue(const char *name, double value) {
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
@@ -228,7 +229,7 @@ void setVariableValue(const char *name, double value) {
     numVariables++;
 }
 
-// Set the value of an array at a specific index
+
 void setArrayValue(const char *name, int index, double value) {
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
@@ -247,7 +248,25 @@ void setArrayValue(const char *name, int index, double value) {
     error("Array not found", name);
 }
 
-// Parse a factor: a number, variable, or expression within parentheses
+
+void deleteArrayValue(const char *name, int index) {
+    for (int i = 0; i < numVariables; i++) {
+        if (strcmp(name, variables[i].name) == 0) {
+            if (variables[i].isArray) {
+                if (index >= 0 && index < variables[i].size) {
+                    variables[i].elements[index] = 0.0;
+                    return;
+                } else {
+                    error("Array index out of bounds", name);
+                }
+            } else {
+                error("Variable is not an array", name);
+            }
+        }
+    }
+    error("Array not found", name);
+}
+
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
         double value = currentToken.value;
@@ -263,7 +282,6 @@ double factor() {
             int index = (int)expression();
             eat(TOKEN_RBRACKET);
 
-            // Find the array and return the element at the given index
             for (int i = 0; i < numVariables; i++) {
                 if (strcmp(identifier, variables[i].name) == 0) {
                     if (variables[i].isArray) {
@@ -301,7 +319,7 @@ double factor() {
     return 0;
 }
 
-// Parse a term: multiplication or division of factors
+
 double term() {
     double value = factor();
 
@@ -322,7 +340,6 @@ double term() {
     return value;
 }
 
-// Parse an expression: addition or subtraction of terms
 double expression() {
     double value = term();
 
@@ -339,7 +356,7 @@ double expression() {
     return value;
 }
 
-// Parse a trigonometric function: sin, cos, tan, asin, acos, atan, sqrt
+//sin, cos, tan, asin, acos, atan, sqrt
 double trigFunction() {
     TokenType functionType = currentToken.type;
     eat(functionType);
@@ -369,7 +386,6 @@ double trigFunction() {
     return 0;
 }
 
-// Handle variable assignment
 void assignment() {
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
@@ -379,12 +395,11 @@ void assignment() {
     setVariableValue(identifier, value);
 }
 
-// Handle array assignment
 void arrayAssignment() {
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
-    eat(TOKEN_DOT);  // Consume the dot operator
+    eat(TOKEN_DOT);  
     if (currentToken.type == TOKEN_IDENTIFIER) {
         char methodName[256];
         strcpy(methodName, currentToken.identifier);
@@ -396,6 +411,11 @@ void arrayAssignment() {
             double value = expression();
             eat(TOKEN_RPAREN);
             setArrayValue(identifier, index, value);
+        } else if (strcmp(methodName, "del") == 0) {
+            eat(TOKEN_LPAREN);
+            int index = (int)expression();
+            eat(TOKEN_RPAREN);
+            deleteArrayValue(identifier, index); // Delete array value
         } else {
             error("Invalid array method", methodName);
         }
@@ -404,7 +424,6 @@ void arrayAssignment() {
     }
 }
 
-// Handle print statement
 void printStatement() {
     eat(TOKEN_PRINT);
     if (currentToken.type == TOKEN_IDENTIFIER) {
@@ -412,7 +431,6 @@ void printStatement() {
         strcpy(identifier, currentToken.identifier);
         eat(TOKEN_IDENTIFIER);
 
-        // Check if the identifier is an array
         int isArray = 0;
         for (int i = 0; i < numVariables; i++) {
             if (strcmp(identifier, variables[i].name) == 0) {
@@ -420,8 +438,6 @@ void printStatement() {
                 break;
             }
         }
-
-        // If the identifier is an array, print its elements
         if (isArray) {
             for (int i = 0; i < numVariables; i++) {
                 if (strcmp(identifier, variables[i].name) == 0) {
@@ -447,7 +463,6 @@ void printStatement() {
     }
 }
 
-// Handle statements: variable assignment, array assignment, or print statement
 void statement() {
     if (currentToken.type == TOKEN_VAR) {
         eat(TOKEN_VAR);
@@ -461,7 +476,6 @@ void statement() {
     }
 }
 
-// Parse the program
 void program() {
     while (currentToken.type != TOKEN_EOF) {
         if (currentToken.type == TOKEN_ARRAY) {
@@ -472,7 +486,6 @@ void program() {
     }
 }
 
-// Parse an array declaration
 void array() {
     eat(TOKEN_ARRAY);
     char arrayName[256];
@@ -497,20 +510,18 @@ void array() {
     variables[numVariables].size = size;
     numVariables++;
 }
+
 int main() {
-    // Open the file
     FILE *file = fopen("jaithon.jai", "r");
     if (file == NULL) {
         fprintf(stderr, "Error opening file\n");
         return 1;
     }
 
-    // Determine the file size
     fseek(file, 0, SEEK_END);
     long fileSize = ftell(file);
     rewind(file);
 
-    // Allocate memory to store the file content
     char *code = malloc(fileSize + 1);
     if (code == NULL) {
         fprintf(stderr, "Memory allocation failed\n");
@@ -518,7 +529,6 @@ int main() {
         return 1;
     }
 
-    // Read the file content into the code buffer
     size_t bytesRead = fread(code, 1, fileSize, file);
     if (bytesRead < fileSize) {
         fprintf(stderr, "Error reading file\n");
@@ -526,16 +536,13 @@ int main() {
         free(code);
         return 1;
     }
-    code[fileSize] = '\0';  // Null-terminate the code string
+    code[fileSize] = '\0';
 
-    // Close the file
     fclose(file);
 
-    // Process the code
     lexer(code);
     program();
 
-    // Free allocated memory
     free(code);
 
     return 0;
