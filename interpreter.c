@@ -4,7 +4,6 @@
 #include <ctype.h>
 #include <math.h>
 
-// Tokens
 typedef enum {
     TOKEN_INT,
     TOKEN_FLOAT,
@@ -43,7 +42,6 @@ typedef struct {
 Token currentToken;
 char *input;
 
-// Symbol table
 typedef struct {
     char name[256];
     double value;
@@ -64,7 +62,7 @@ double expression();
 double trigFunction();
 void assignment();
 void arrayAssignment();
-void arrayDeletion(); // Function for array deletion
+void arrayDeletion(); 
 void printStatement();
 void statement();
 void program();
@@ -79,11 +77,11 @@ void advance() {
     while (isspace(*input)) {
         input++;
     }
-    if (*input == '#') {  // comment logic
+    if (*input == '#') {  
         while (*input && *input != '\n') {
             input++;
         }
-        advance();  // Recursively call advance
+        advance();
         return;
     }
     if (*input == '\0') {
@@ -415,7 +413,7 @@ void arrayAssignment() {
             eat(TOKEN_LPAREN);
             int index = (int)expression();
             eat(TOKEN_RPAREN);
-            deleteArrayValue(identifier, index); // Delete array value
+            deleteArrayValue(identifier, index); 
         } else {
             error("Invalid array method", methodName);
         }
@@ -454,7 +452,6 @@ void printStatement() {
             }
         }
 
-        // If the identifier is not an array, print its value as before
         double value = getVariableValue(identifier);
         printf("%f\n", value);
     } else {
@@ -496,13 +493,11 @@ void array() {
     int size = (int)expression();
     eat(TOKEN_RBRACKET);
 
-    // Create the array and initialize its elements to 0
     double *elements = malloc(size * sizeof(double));
     for (int i = 0; i < size; i++) {
         elements[i] = 0.0;
     }
 
-    // Store the array and its size
     strcpy(variables[numVariables].name, arrayName);
     variables[numVariables].value = 0.0;
     variables[numVariables].isArray = 1;

@@ -41,3 +41,8 @@ print result
 var value = 64.0
 var result = sqrt(value)
 print result
+
+var num = 11
+var dum = 12
+var ndum = num + dum
+print ndum

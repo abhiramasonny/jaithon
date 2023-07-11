@@ -1,0 +1,25 @@
+{
+  "name": "jai",
+  "displayName": "jai",
+  "description": "jaithon",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [{
+      "id": "jaithon",
+      "aliases": ["jaithon", "jaithon"],
+      "extensions": [".jai"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "jaithon",
+      "scopeName": "source.jai",
+      "path": "./syntaxes/jaithon.tmLanguage.json"
+    }]
+  }
+}
