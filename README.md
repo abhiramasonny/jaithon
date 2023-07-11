@@ -36,6 +36,17 @@ To use the array compiler/interpreter, follow these steps:
 2. Execute the compiler/interpreter.
 3. The output will be displayed, showing the results of any print statements or errors encountered during execution.
 
+
+## Syntex Highlighting
+
+This is a really cool feature and takes like 3 seconds to do so dont be lazy and follow the steps
+```bash
+cd tmp
+cp -r jai ~/.vscode/extensions
+cd ~/.vscode/extensions
+ls
+```
+The last 2 lines are only to verify that it went correctly (you dont need to do them)
 ## Examples
 
 Here are some examples of code that can be compiled/interpreted using this interpreter:
