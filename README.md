@@ -33,7 +33,7 @@ The compiler/interpreter follows the following workflow:
 12. **All Tokens Processed**: If all tokens have been processed, go to step 14.
 13. **Parse Variable Assignment**: If the identifier is not an array, parse the variable assignment statement.
 14. **Stop**: End the execution of the compiler/interpreter.
-![FlowChart](Flowchart.jpeg)
+![FlowChart](Flowchart.png)
 ## Usage
 
 To use the array compiler/interpreter, follow these steps:
