@@ -2,6 +2,7 @@
 array a = [3]
 a.add(0, 2)
 print a
+
 a.add(2, 1)
 print a
 a.sort()
