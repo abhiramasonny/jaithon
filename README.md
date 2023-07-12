@@ -38,19 +38,17 @@ The compiler/interpreter follows the following workflow:
 
 To use the array compiler/interpreter, follow these steps:
 1. cd into project directory 
-2. run 
+2. 
 ```sh 
 gcc -o interpreter interpreter.c 
 ```
-to compile the c file containing the main function for interpreting programs with an array data structure 
 
-3. run 
-```
+3.
+``` sh
 ./interpreter
 ```
-to run the executable
-
-4. Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
+4. OPTIONAL: Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
+the jaithon.jai file is the file that the interpreter reads from. It by default has test cases.
 5. Execute the compiler/interpreter.
 6. The output will be displayed, showing the results of any print statements or errors encountered during execution.
 
