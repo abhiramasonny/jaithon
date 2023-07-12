@@ -43,10 +43,7 @@ To use the array compiler/interpreter, follow these steps:
 gcc -o interpreter interpreter.c 
 ```
 
-3.
-``` bash
-./interpreter
-```
+3. ``` ./interpreter ```
 4. OPTIONAL: Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
 the jaithon.jai file is the file that the interpreter reads from. It by default has test cases.
 5. Execute the compiler/interpreter.
