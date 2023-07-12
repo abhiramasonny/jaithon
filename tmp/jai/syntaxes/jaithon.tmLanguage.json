@@ -23,7 +23,7 @@
 		"patterns": [
 		  {
 			"name": "keyword.control.jaithon",
-			"match": "\\b(var|array|print)\\b"
+			"match": "\\b(int|array|print)\\b"
 		  }
 		]
 	  },

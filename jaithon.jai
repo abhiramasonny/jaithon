@@ -8,42 +8,42 @@ a.sort()
 print a
 
 #sin test
-var angle = 0.5
-var result = sin(angle)
+int angle = 0.5
+int result = sin(angle)
 print result
 
 #cos test
-var angle = 0.8
-var result = cos(angle)
+int angle = 0.8
+int result = cos(angle)
 print result
 
 #tan test
-var angle = 1.2
-var result = tan(angle)
+int angle = 1.2
+int result = tan(angle)
 print result
 
 #asin test
-var value = 0.5
-var result = asin(value)
+int value = 0.5
+int result = asin(value)
 print result
 
 #acos test
-var value = 0.8
-var result = acos(value)
+int value = 0.8
+int result = acos(value)
 print result
 
 #atan test
-var value = 1.2
-var result = atan(value)
+int value = 1.2
+int result = atan(value)
 print result
 
 #sqrt test
-var value = 64.0
-var result = sqrt(value)
+int value = 64.0
+int result = sqrt(value)
 print result
 
 #math opperator tests
-var num = 11
-var dum = 12
-var ndum = num + dum
+int num = 11
+int dum = 12
+int ndum = num + dum
 print ndum

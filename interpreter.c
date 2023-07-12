@@ -145,7 +145,7 @@ void advance() {
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
-    } else if (strncmp(input, "var", 3) == 0) {
+    } else if (strncmp(input, "int", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
     } else if (strncmp(input, "array", 5) == 0) {
