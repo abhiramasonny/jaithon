@@ -64,7 +64,6 @@ void assignment();
 void arrayAssignment();
 void arrayDeletion();
 void arraySort(const char *name);
-void sortArray(double *array, int size);
 void printStatement();
 void statement();
 void program();

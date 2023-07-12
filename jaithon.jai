@@ -1,15 +1,11 @@
-#array tests
+#array test
 array a = [3]
 a.add(0, 2)
 print a
-
 a.add(2, 1)
 print a
 a.sort()
 print a
-
-
-
 #sin test
 var angle = 0.5
 var result = sin(angle)
