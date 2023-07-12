@@ -190,9 +190,20 @@ void advance() {
 
 void error(const char *message, const char *errorToken) {
     fprintf(stderr, "Error: %s. Found: %s\n", message, errorToken);
-    exit(1);
-}
 
+    // Optionally, you can print the line and position of the error
+    int line = 1;
+    int position = 1;
+    for (const char *c = input; c < errorToken; c++) {
+        if (*c == '\n') {
+            line++;
+            position = 1;
+        } else {
+            position++;
+        }
+    }
+    fprintf(stderr, "Error occurred at Line %d, Position %d\n", line, position);
+}
 
 void eat(TokenType type) {
     if (currentToken.type == type) {
