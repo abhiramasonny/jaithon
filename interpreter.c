@@ -29,7 +29,8 @@ typedef enum {
     TOKEN_COMMA,
     TOKEN_LBRACKET,
     TOKEN_RBRACKET,
-    TOKEN_DOT
+    TOKEN_DOT,
+    TOKEN_INPUT
 } TokenType;
 
 typedef struct {
@@ -37,7 +38,6 @@ typedef struct {
     double value;
     char identifier[256];
 } Token;
-
 
 Token currentToken;
 char *input;
@@ -65,6 +65,7 @@ void arrayAssignment();
 void arrayDeletion();
 void arraySort(const char *name);
 void printStatement();
+void inputStatement();
 void statement();
 void program();
 void array();
@@ -172,6 +173,9 @@ void advance() {
     } else if (strncmp(input, "sqrt", 4) == 0) {
         currentToken.type = TOKEN_SQRT;
         input += 4;
+    } else if (strncmp(input, "input", 5) == 0) {
+        currentToken.type = TOKEN_INPUT;
+        input += 5;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
         int i = 0;
@@ -215,7 +219,6 @@ void eat(TokenType type) {
     }
 }
 
-
 double getVariableValue(const char *name) {
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
@@ -225,7 +228,6 @@ double getVariableValue(const char *name) {
     error("Variable not found", name);
     return 0;
 }
-
 
 void setVariableValue(const char *name, double value) {
     for (int i = 0; i < numVariables; i++) {
@@ -238,7 +240,6 @@ void setVariableValue(const char *name, double value) {
     variables[numVariables].value = value;
     numVariables++;
 }
-
 
 void setArrayValue(const char *name, int index, double value) {
     for (int i = 0; i < numVariables; i++) {
@@ -257,7 +258,6 @@ void setArrayValue(const char *name, int index, double value) {
     }
     error("Array not found", name);
 }
-
 
 void deleteArrayValue(const char *name, int index) {
     for (int i = 0; i < numVariables; i++) {
@@ -356,7 +356,6 @@ double factor() {
     error("Invalid factor", currentToken.identifier);
     return 0;
 }
-
 
 double term() {
     double value = factor();
@@ -503,12 +502,25 @@ void printStatement() {
     }
 }
 
+void inputStatement() {
+    eat(TOKEN_INPUT);
+    char identifier[256];
+    strcpy(identifier, currentToken.identifier);
+    eat(TOKEN_IDENTIFIER);
+    printf("Enter a value for %s: ", identifier);
+    double value;
+    scanf("%lf", &value);
+    setVariableValue(identifier, value);
+}
+
 void statement() {
     if (currentToken.type == TOKEN_VAR) {
         eat(TOKEN_VAR);
         assignment();
     } else if (currentToken.type == TOKEN_PRINT) {
         printStatement();
+    } else if (currentToken.type == TOKEN_INPUT) {
+        inputStatement();
     } else if (currentToken.type == TOKEN_IDENTIFIER) {
         arrayAssignment();
     } else {

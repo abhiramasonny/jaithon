@@ -47,3 +47,6 @@ int num = 11
 int dum = 12
 int ndum = num + dum
 print ndum
+
+input x
+print x
