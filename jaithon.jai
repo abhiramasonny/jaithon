@@ -1,4 +1,5 @@
 #array test
+
 array a = [3]
 a.add(0, 2)
 print a
@@ -50,3 +51,4 @@ print ndum
 
 input x
 print x
+print time()

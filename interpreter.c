@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <time.h>
 
 typedef enum {
     TOKEN_INT,
@@ -30,7 +31,8 @@ typedef enum {
     TOKEN_LBRACKET,
     TOKEN_RBRACKET,
     TOKEN_DOT,
-    TOKEN_INPUT
+    TOKEN_INPUT,
+    TOKEN_TIME
 } TokenType;
 
 typedef struct {
@@ -176,6 +178,9 @@ void advance() {
     } else if (strncmp(input, "input", 5) == 0) {
         currentToken.type = TOKEN_INPUT;
         input += 5;
+    } else if (strncmp(input, "time", 4) == 0) {
+        currentToken.type = TOKEN_TIME;
+        input += 4;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
         int i = 0;
@@ -305,6 +310,18 @@ void arraySort(const char *name) {
     error("Array not found", name);
 }
 
+double getTimeInSeconds() {
+    time_t currentTime = time(NULL);
+    return difftime(currentTime, 0);
+}
+
+double timeFunction() {
+    eat(TOKEN_TIME);
+    eat(TOKEN_LPAREN);
+    eat(TOKEN_RPAREN);
+    return getTimeInSeconds();
+}
+
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
         double value = currentToken.value;
@@ -351,6 +368,8 @@ double factor() {
                currentToken.type == TOKEN_ATAN ||
                currentToken.type == TOKEN_SQRT) {
         return trigFunction();
+    } else if (currentToken.type == TOKEN_TIME) {
+        return timeFunction();
     }
 
     error("Invalid factor", currentToken.identifier);
