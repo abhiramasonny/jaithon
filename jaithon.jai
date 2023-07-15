@@ -51,4 +51,5 @@ print ndum
 
 input x
 print x
-print time()
+var hii = time()
+print hii
