@@ -59,10 +59,10 @@ This is a really cool feature and takes like 3 seconds to do so dont be lazy and
 ```sh
 cd tmp
 cp -r jai ~/.vscode/extensions
-cd ~/.vscode/extensions
-ls
 ```
-The last 2 lines are only to verify that it went correctly (you dont need to do them)
+**Reload**
+Note: this is for mac
+if you have windows just figure it out lol
 ## Examples
 
 Here are some examples of code that can be compiled/interpreted using this interpreter:
