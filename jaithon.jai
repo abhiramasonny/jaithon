@@ -12,7 +12,6 @@ print a
 var angle = 0.5
 var result = sin(angle)
 print result
-
 #cos test
 var angle = 0.8
 var result = cos(angle)
