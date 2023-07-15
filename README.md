@@ -11,6 +11,8 @@ This is a simple compiler/interpreter that supports array declarations and opera
 - Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
 - Parentheses: You can use parentheses to group expressions and control operator precedence.
 - Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt.
+- Detecting User input: You can detect user input using the input *variable name* syntax. **Note:** This can only detect Int/Float values. strings are not supported.
+- Time: You can access the users internal Clock by using the following syntax: var t = time(). This displayes the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
 
 
