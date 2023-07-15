@@ -582,8 +582,10 @@ void array() {
 
 int main() {
     char str[20];
+    printf("Enter the file name to interpret: ");
     scanf("%[^\n]%*c", str);
-    printf("%s", str);
+    char extension[5] = ".jai";
+    strcat(str,extension);
     FILE *file = fopen(str, "r");
     if (file == NULL) {
         fprintf(stderr, "Error opening file\n");
