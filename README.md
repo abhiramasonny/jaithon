@@ -55,7 +55,7 @@ the jaithon.jai file is the file that the interpreter reads from. It by default 
 
 ## Syntex Highlighting
 
-This is a really cool feature and takes like 3 seconds to do so dont be lazy and follow the steps 
+This is a really cool feature and takes like 3 seconds to do so dont be lazy and follow the steps.
 *Only if you have VS-Code as your IDE*
 ```sh
 cd tmp
