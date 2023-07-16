@@ -407,10 +407,10 @@ double expression() {
             value -= term();
         } else if (currentToken.type == TOKEN_GREATER_THAN) {
             eat(TOKEN_GREATER_THAN);
-            value = (value > term()) ? 1.0 : 0.0; // Set the value based on the result of the comparison
+            value = (value > term()) ? 1.0 : 0.0;
         } else if (currentToken.type == TOKEN_LESS_THAN) {
             eat(TOKEN_LESS_THAN);
-            value = (value < term()) ? 1.0 : 0.0; // Set the value based on the result of the comparison
+            value = (value < term()) ? 1.0 : 0.0;
         }
     }
 

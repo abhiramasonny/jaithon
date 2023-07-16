@@ -1,13 +1,15 @@
 #comparrisions test
-var lessthan = 1<3
-var greatorthan = 1>3
+var nums = 1
+var lessthan = nums<3
+var greatorthan = nums>3
 print lessthan
 print greatorthan
 #array test
-array a = [3]
-a.add(0, 2)
+array a = [5]
 print a
-a.add(2, 1)
+a.add(0, 120.012)
+a.add(2, 3)
+a.add(4,120.013)
 print a
 a.sort()
 print a
@@ -52,7 +54,7 @@ var dum = 12
 var ndum = num + dum
 print ndum
 
-input x
-print x
+#input x
+#print x
 var hii = time()
 print hii
