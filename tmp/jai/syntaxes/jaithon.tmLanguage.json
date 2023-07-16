@@ -15,7 +15,13 @@
 		"include": "#trigFunctions"
 	  },
 	  {
+		"include": "#timeFunction"
+	  },
+	  {
 		"include": "#operators"
+	  },
+	  {
+		"include": "#integers"
 	  }
 	],
 	"repository": {
@@ -46,6 +52,17 @@
 		  }
 		]
 	  },
+	  "timeFunction": {
+		"patterns": [
+		  {
+			"name": "support.function.time.jaithon",
+			"match": "\\btime\\s*\\(\\s*\\)\\b",
+			"settings": {
+			  "foreground": "#008000"
+			}
+		  }
+		]
+	  },
 	  "operators": {
 		"patterns": [
 		  {
@@ -56,6 +73,10 @@
 			}
 		  }
 		]
+	  },
+	  "integers": {
+		"name": "constant.numeric.jaithon",
+		"match": "\\b\\d+\\b"
 	  }
 	},
 	"scopeName": "source.jai"
