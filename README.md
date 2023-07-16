@@ -9,10 +9,11 @@ This is a simple compiler/interpreter that supports array declarations and opera
 - Array Element Modification: You can modify elements of an array using the dot notation, e.g., arr.add(0, 4).
 - Print Statement: You can use the print keyword to print values to the console, e.g., print x.
 - Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
+- Comparrisions: you can preform comparrisions by using the > and < symbols, e.g., var a = 1>4: the output would be a = 0 because that statement is false.
 - Parentheses: You can use parentheses to group expressions and control operator precedence.
 - Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt.
 - Detecting User input: You can detect user input using the input *variable name* syntax. **Note:** This can only detect Int/Float values. strings are not supported.
-- Time: You can access the users internal Clock by using the following syntax: var t = time(). This saves the time as an integer.
+- Time: You can access the users internal Clock by using the time keyword. e.g., var t = time(). This saves the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
 
 

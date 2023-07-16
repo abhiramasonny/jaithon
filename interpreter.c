@@ -417,7 +417,7 @@ double expression() {
     return value;
 }
 
-
+//sin cos tan asin acos atan sqrt... is sqrt a trig function lmao
 double trigFunction() {
     TokenType functionType = currentToken.type;
     eat(functionType);
