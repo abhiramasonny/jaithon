@@ -1,5 +1,9 @@
+#comparrisions test
+var lessthan = 1<3
+var greatorthan = 1>3
+print lessthan
+print greatorthan
 #array test
-
 array a = [3]
 a.add(0, 2)
 print a

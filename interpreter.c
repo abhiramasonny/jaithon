@@ -32,7 +32,9 @@ typedef enum {
     TOKEN_RBRACKET,
     TOKEN_DOT,
     TOKEN_INPUT,
-    TOKEN_TIME
+    TOKEN_TIME,
+    TOKEN_GREATER_THAN,
+    TOKEN_LESS_THAN     
 } TokenType;
 
 typedef struct {
@@ -51,7 +53,7 @@ typedef struct {
     double *elements;
     int size;
 } Variable;
-int LineNum = 1;
+
 Variable variables[256];
 int numVariables = 0;
 
@@ -145,6 +147,12 @@ void advance() {
     } else if (*input == '.') {
         currentToken.type = TOKEN_DOT;
         input++;
+    } else if (*input == '>') {
+        currentToken.type = TOKEN_GREATER_THAN;
+        input++;
+    } else if (*input == '<') {
+        currentToken.type = TOKEN_LESS_THAN;
+        input++;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
@@ -203,6 +211,7 @@ void error(const char *message, const char *errorToken) {
 
 void eat(TokenType type) {
     if (currentToken.type == type) {
+
         advance();
     } else {
         char tokenName[256];
@@ -359,6 +368,7 @@ double factor() {
     } else if (currentToken.type == TOKEN_TIME) {
         return timeFunction();
     }
+    
 
     error("Invalid factor", currentToken.identifier);
     return 0;
@@ -387,18 +397,26 @@ double term() {
 double expression() {
     double value = term();
 
-    while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS) {
+    while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
         } else if (currentToken.type == TOKEN_MINUS) {
             eat(TOKEN_MINUS);
             value -= term();
+        } else if (currentToken.type == TOKEN_GREATER_THAN) {
+            eat(TOKEN_GREATER_THAN);
+            value = (value > term()) ? 1.0 : 0.0; // Set the value based on the result of the comparison
+        } else if (currentToken.type == TOKEN_LESS_THAN) {
+            eat(TOKEN_LESS_THAN);
+            value = (value < term()) ? 1.0 : 0.0; // Set the value based on the result of the comparison
         }
     }
 
     return value;
 }
+
 
 double trigFunction() {
     TokenType functionType = currentToken.type;
