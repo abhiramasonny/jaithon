@@ -4,7 +4,10 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#define MAX_IMPORTED_FILES 256
 
+char importedFiles[MAX_IMPORTED_FILES][256];
+int numImportedFiles = 0;
 typedef enum {
     TOKEN_INT,
     TOKEN_FLOAT,
@@ -33,6 +36,7 @@ typedef enum {
     TOKEN_DOT,
     TOKEN_INPUT,
     TOKEN_TIME,
+    TOKEN_IMPORT,
     TOKEN_GREATER_THAN,
     TOKEN_LESS_THAN     
 } TokenType;
@@ -73,10 +77,17 @@ void inputStatement();
 void statement();
 void program();
 void array();
+void importFile(const char *filename);
+void skipToEndOfInput();
 
 void lexer(char *code) {
     input = code;
     advance();
+}
+void skipToEndOfInput() {
+    while (currentToken.type != TOKEN_EOF) {
+        advance();
+    }
 }
 
 void advance() {
@@ -186,6 +197,9 @@ void advance() {
     } else if (strncmp(input, "input", 5) == 0) {
         currentToken.type = TOKEN_INPUT;
         input += 5;
+    } else if (strncmp(input, "import", 6) == 0) {
+        currentToken.type = TOKEN_IMPORT;
+        input += 6;
     } else if (strncmp(input, "time", 4) == 0) {
         currentToken.type = TOKEN_TIME;
         input += 4;
@@ -219,6 +233,49 @@ void eat(TokenType type) {
         error("Unexpected token", tokenName);
         exit(1);
     }
+}
+void importFile(const char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error opening file: %s\n", filename);
+        exit(1);
+    }
+
+    fseek(file, 0, SEEK_END);
+    long fileSize = ftell(file);
+    rewind(file);
+
+    char *importedCode = malloc(fileSize + 1);
+    if (importedCode == NULL) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        exit(1);
+    }
+
+    size_t bytesRead = fread(importedCode, 1, fileSize, file);
+    if (bytesRead < fileSize) {
+        fprintf(stderr, "Error reading file: %s\n", filename);
+        fclose(file);
+        free(importedCode);
+        exit(1);
+    }
+    importedCode[fileSize] = '\0';
+
+    fclose(file);
+
+    // Save the current input and lexer state
+    char *tempInput = input;
+    Token tempCurrentToken = currentToken;
+
+    // Process the imported code
+    lexer(importedCode);
+    program();
+
+    // Restore the original input and lexer state
+    input = tempInput;
+    currentToken = tempCurrentToken;
+
+    free(importedCode);
 }
 
 double getVariableValue(const char *name) {
@@ -557,11 +614,29 @@ void program() {
     while (currentToken.type != TOKEN_EOF) {
         if (currentToken.type == TOKEN_ARRAY) {
             array();
+        } else if (currentToken.type == TOKEN_IMPORT) {
+            eat(TOKEN_IMPORT);
+            char filename[256];
+            strcpy(filename, currentToken.identifier);
+            char extension[5] = ".jai";
+            strcat(filename, extension);
+            eat(TOKEN_IDENTIFIER);
+
+            // Clear the variable count and imported file count for a fresh start
+            numVariables = 0;
+            numImportedFiles = 0;
+
+            importFile(filename);
+            // After processing the imported file, consume tokens until TOKEN_EOF
+            while (currentToken.type != TOKEN_EOF) {
+                advance();
+            }
         } else {
             statement();
         }
     }
 }
+
 
 void array() {
     eat(TOKEN_ARRAY);

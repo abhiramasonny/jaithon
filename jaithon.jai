@@ -56,7 +56,4 @@ var dum = 12
 var ndum = num + dum
 print ndum
 
-input x
-print x
-var thetime = time()
-print thetime
+import calculator.jai
