@@ -1,5 +1,4 @@
 #NOTE THIS IS A TESTS FILE.
-
 #comparrisions test
 var nums = 1
 var lessthan = nums<3
@@ -44,12 +43,15 @@ print result
 var value = 1.2
 var result = atan(value)
 print result
-
+#import test
+import calculator
+#input test
+input x
+print x
 #sqrt test
 var value = 64.0
 var result = sqrt(value)
 print result
-
 #math opperator tests
 var num = 11
 var dum = 12

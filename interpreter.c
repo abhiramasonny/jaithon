@@ -621,16 +621,12 @@ void program() {
             char extension[5] = ".jai";
             strcat(filename, extension);
             eat(TOKEN_IDENTIFIER);
-
-            // Clear the variable count and imported file count for a fresh start
             numVariables = 0;
             numImportedFiles = 0;
 
             importFile(filename);
-            // After processing the imported file, consume tokens until TOKEN_EOF
-            while (currentToken.type != TOKEN_EOF) {
-                advance();
-            }
+            
+
         } else {
             statement();
         }
