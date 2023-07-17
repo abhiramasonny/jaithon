@@ -40,20 +40,20 @@ The compiler/interpreter follows the following workflow:
 ## Usage
 
 To use the array compiler/interpreter, follow these steps:
-1. cd into project directory 
-2. 
 ```bash 
+git clone https://github.com/abhiramasonny/jaithon
+cd jaithon
 gcc -o interpreter interpreter.c 
 ./interpreter
 ```
-4. type this as follow up to *Enter file name to interpret*
+Then type this as follow up to *Enter file name to interpret*
 ```
 jaithon
 ```
 
 4. OPTIONAL: Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
 the jaithon.jai file is the file that the interpreter reads from. It by default has test cases.
-5. Execute the compiler/interpreter.
+5. Execute the compiler/interpreter with *filename* **in this case jaithon** as input.
 6. The output will be displayed, showing the results of any print statements or errors encountered during execution.
 
 
