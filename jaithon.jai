@@ -1,3 +1,5 @@
+#NOTE THIS IS A TESTS FILE.
+
 #comparrisions test
 var nums = 1
 var lessthan = nums<3
@@ -54,7 +56,7 @@ var dum = 12
 var ndum = num + dum
 print ndum
 
-#input x
-#print x
-var hii = time()
-print hii
+input x
+print x
+var thetime = time()
+print thetime
