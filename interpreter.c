@@ -588,7 +588,7 @@ void array() {
 
 int main() {
     char str[20];
-    printf("Enter the file name to interpret: ");
+    printf("Enter file name to interpret e.g., jaithon: ");
     scanf("%[^\n]%*c", str);
     char extension[5] = ".jai";
     strcat(str,extension);
