@@ -55,5 +55,3 @@ var num = 11
 var dum = 12
 var ndum = num + dum
 print ndum
-
-import calculator.jai
