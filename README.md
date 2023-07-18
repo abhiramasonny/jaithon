@@ -23,26 +23,31 @@ This is a simple compiler/interpreter that supports array declarations and opera
 *yes you cant do a helloworld in this language*
 
 
-## How it Works
-
-The compiler/interpreter follows the following workflow:
-
+# Flowchart: JAI Programming Language Interpreter
 
 1. **Read Input Code**: Read the code to be compiled/interpreted.
 2. **Initialize Token List**: Initialize the list of tokens by converting the input code into individual tokens.
 3. **Initialize Variables and Arrays**: Set up variables and arrays to store values during execution.
 4. **Start Parsing Program**: Begin parsing the program by checking if there are remaining tokens.
 5. **Are Tokens Remaining?**: If there are remaining tokens, proceed to the next step. Otherwise, go to step 14.
-6. **Current Token is an Array Declaration**: If the current token is an array declaration, parse it and store the array's name and size.
-7. **Parse Array Declaration**: Parse the array declaration statement.
-8. **Current Token is an Identifier**: If the current token is an identifier, check if it corresponds to an array declaration.
-9. **Check Identifier is an Array**: If the identifier is an array, proceed to parse the statement related to array access or modification. Otherwise, go to step 10
-10. **Parse Statement**: Parse the variable assignment or print statement.
-11. **Loop through Tokens**: Continue looping through the remaining tokens in the program.
-12. **All Tokens Processed**: If all tokens have been processed, go to step 14.
-13. **Parse Variable Assignment**: If the identifier is not an array, parse the variable assignment statement.
-14. **Stop**: End the execution of the compiler/interpreter.
-![FlowChart](Flowchart.png)
+    6. **Current Token is an Array Declaration**: If the current token is an array declaration, parse it and store the array's name and size.
+        7. **Parse Array Declaration**: Parse the array declaration statement.
+    8. **Current Token is an Identifier**: If the current token is an identifier, check if it corresponds to an array declaration or a variable assignment.
+        9. **Check Identifier is an Array**: If the identifier is an array, proceed to parse the statement related to array access or modification. Otherwise, go to step 10.
+            10. **Parse Variable Assignment**: Parse the variable assignment statement.
+    11. **Current Token is a Print Statement**: If the current token is a print statement, parse it and print the corresponding value.
+        12. **Parse Print Statement**: Parse the print statement and print the variable or expression value.
+    13. **Current Token is an Input Statement**: If the current token is an input statement, parse it and read user input.
+        14. **Parse Input Statement**: Parse the input statement and read the user's input value.
+    15. **Current Token is a Trigonometric Function**: If the current token is a trigonometric function, parse it and compute the corresponding value.
+        16. **Parse Trigonometric Function**: Parse the trigonometric function and compute its value.
+    17. **Current Token is a Time Function**: If the current token is a time function, parse it and compute the corresponding value.
+        18. **Parse Time Function**: Parse the time function and compute its value.
+19. **Loop through Tokens**: Continue looping through the remaining tokens in the program.
+20. **All Tokens Processed**: If all tokens have been processed, go to step 22.
+21. **Error Handling**: Handle errors during parsing, such as encountering invalid tokens or accessing undefined variables/arrays.
+22. **Stop**: End the execution of the compiler/interpreter.
+
 ## Usage
 
 To use the array compiler/interpreter, follow these steps:
