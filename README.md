@@ -27,27 +27,26 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 1. **Read Input Code**: Read the code to be compiled/interpreted.
 2. **Initialize Token List**: Convert the input code into tokens.
-3. **Initialize Variables and Arrays**: Set up storage for values.
+3. **Initialize Variables and Arrays**: Initialize storage for values.
 4. **Start Parsing Program**: Begin parsing the program.
-5. **Are Tokens Remaining?**: Proceed if tokens exist, otherwise GOTO STEP 22.
-6. **Array Declaration**: Parse and store array details. GOTO STEP 8.
+5. **Are Tokens Remaining Loop:**: Loop while tokens exist, otherwise GOTO 22.
+6. **If Array Declaration**: Parse and store array details.
 7. **Parse Array Declaration**: Read array size and elements.
-8. **Identifier Check**: Handle variable assignment and print statements. GOTO STEP 11.
-9. **Check Array**: Parse array access or variable assignment. GOTO STEP 10.
-10. **Parse Variable Assignment**: Assign variable a value. GOTO STEP 19.
-11. **Print Statement**: Parse and display variable/expression value. GOTO STEP 13.
+8. **Identifier Check**: Handle variable assignment and print statements.
+9. **If Array**: Parse array access or variable assignment.
+10. **Parse Variable Assignment**: Assign variable a value.
+11. **If Print Statement**: Parse and display variable/expression value.
 12. **Parse Print Statement**: Evaluate and print.
-13. **Input Statement**: Parse and read user input. GOTO STEP 15.
+13. **If Input Statement**: Parse and read user input.
 14. **Parse Input Statement**: Read and store user's input value.
-15. **Trigonometric Function**: Parse and compute trigonometric value. GOTO STEP 17.
+15. **If Trigonometric Function**: Parse and compute trigonometric value. GOTO 17.
 16. **Parse Trigonometric Function**: Calculate the trigonometric value.
-17. **Time Function**: Parse and compute time-related value. GOTO STEP 18.
+17. **If Time Function**: Parse and compute time-related value. GOTO 18.
 18. **Parse Time Function**: Calculate the time-related value.
-19. **Loop through Tokens**: Continue processing remaining tokens. GOTO STEP 5.
+19. **End of loop**: Continue processing remaining tokens. GOTO 5 (Loop back).
 20. **All Tokens Processed**: Execution complete, proceed to the end.
 21. **Error Handling**: Handle parsing errors or undefined variables/arrays.
 22. **Stop**: End the interpreter's execution.
-
 
 ## Usage
 
