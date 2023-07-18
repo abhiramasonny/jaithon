@@ -44,10 +44,10 @@ var value = 1.2
 var result = atan(value)
 print result
 #import test
-import calculator
+#import calculator
 #input test
-input x
-print x
+#input x
+#print x
 #sqrt test
 var value = 64.0
 var result = sqrt(value)
@@ -57,3 +57,4 @@ var num = 11
 var dum = 12
 var ndum = num + dum
 print ndum
+if(1>1)

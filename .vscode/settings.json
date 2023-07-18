@@ -17,6 +17,7 @@
         "tuple": "c",
         "type_traits": "c",
         "vector": "c",
-        "time.h": "c"
+        "time.h": "c",
+        "sstream": "c"
     }
 }
