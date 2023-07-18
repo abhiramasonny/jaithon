@@ -66,7 +66,8 @@ cd tmp
 cp -r jai ~/.vscode/extensions
 ```
 **Reload VS-Code**
-Note: this is for mac/linux
+Note: this is for mac/linux.
+<br>
 dont own a windows laptop so havent tested on there.
 ## Examples
 
