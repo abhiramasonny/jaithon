@@ -1,6 +1,16 @@
-# Jaithon
+### Jaithon
 
 This is a simple compiler/interpreter that supports array declarations and operations. It can parse and execute code containing array declarations, variable assignments, and print statements.
+
+# Description
+
+**JAITHON**: *A Child-Friendly Introduction to Coding*
+
+JAITHON is a programming language carefully tailored for teaching young children the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. By providing a beginner-friendly environment, JAITHON removes the intimidation barrier associated with traditional programming languages, making it accessible to children with little to no prior coding experience.
+
+**Solving the Intimidation Barrier**
+
+The primary problem JAITHON addresses is the apprehension often felt by young learners when approaching programming. By offering straightforward and visually appealing syntax, JAITHON empowers children to express their creativity through code without feeling overwhelmed. This approach fosters a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age.
 
 ## Features
 
