@@ -66,8 +66,8 @@ cd tmp
 cp -r jai ~/.vscode/extensions
 ```
 **Reload VS-Code**
-Note: this is for mac
-if you have windows just figure it out lol
+Note: this is for mac/linux
+dont own a windows laptop so havent tested on there.
 ## Examples
 
 Here are some examples of code that can be compiled/interpreted using this interpreter:
