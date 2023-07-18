@@ -4,13 +4,13 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 ### Description
 
-**JAITHON**: *A Child-Friendly Introduction to Coding*
+**JAITHON**: *An Age-Friendly Introduction to Coding*
 
-JAITHON is a programming language carefully tailored for teaching young children the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. By providing a beginner-friendly environment, JAITHON removes the intimidation barrier associated with traditional programming languages, making it accessible to children with little to no prior coding experience.
+JAITHON is a programming language carefully put together for teaching children and adults the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. The JAI programming Language is perfect for anyone regradless of age. By providing a beginner-friendly environment, The JAITHON Language removes the tech-savvy knowledge needed with traditional programming languages, making it accessible to people with little to no prior coding experience.
 
-**Solving the Intimidation Barrier**
+**Crossing the age barrier**
 
-The primary problem JAITHON addresses is the apprehension often felt by young learners when approaching programming. By offering straightforward and visually appealing syntax, JAITHON empowers children to express their creativity through code without feeling overwhelmed. This approach fosters a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age.
+The primary problem JAITHON addresses is the apprehension often felt by young learners when approaching programming. By offering straightforward and visually appealing syntax, JAITHON enables children to express their creativity through code without feeling overwhelmed. This approach fosters a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does.
 
 ## Features
 
