@@ -39,9 +39,9 @@ This is a simple compiler/interpreter that supports array declarations and opera
 12. **Parse Print Statement**: Evaluate and print.
 13. **If Input Statement**: Parse and read user input.
 14. **Parse Input Statement**: Read and store user's input value.
-15. **If Trigonometric Function**: Parse and compute trigonometric value. GOTO 17.
+15. **If Trigonometric Function**: Parse and compute trigonometric value.
 16. **Parse Trigonometric Function**: Calculate the trigonometric value.
-17. **If Time Function**: Parse and compute time-related value. GOTO 18.
+17. **If Time Function**: Parse and compute time-related value.
 18. **Parse Time Function**: Calculate the time-related value.
 19. **End of loop**: Continue processing remaining tokens. GOTO 5 (Loop back).
 20. **All Tokens Processed**: Execution complete, proceed to the end.
