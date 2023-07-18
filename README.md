@@ -26,27 +26,28 @@ This is a simple compiler/interpreter that supports array declarations and opera
 # Flowchart: JAI Programming Language Interpreter
 
 1. **Read Input Code**: Read the code to be compiled/interpreted.
-2. **Initialize Token List**: Initialize the list of tokens by converting the input code into individual tokens.
-3. **Initialize Variables and Arrays**: Set up variables and arrays to store values during execution.
-4. **Start Parsing Program**: Begin parsing the program by checking if there are remaining tokens.
-5. **Are Tokens Remaining?**: If there are remaining tokens, proceed to the next step. Otherwise, go to step 14.
-6. **Current Token is an Array Declaration**: If the current token is an array declaration, parse it and store the array's name and size.
-7. **Parse Array Declaration**: Parse the array declaration statement.
-8. **Current Token is an Identifier**: If the current token is an identifier, check if it corresponds to an array declaration or a variable assignment.
-9. **Check Identifier is an Array**: If the identifier is an array, proceed to parse the statement related to array access or modification. Otherwise, go to step 10.
-10. **Parse Variable Assignment**: Parse the variable assignment statement.
-11. **Current Token is a Print Statement**: If the current token is a print statement, parse it and print the corresponding value.
-12. **Parse Print Statement**: Parse the print statement and print the variable or expression value.
-13. **Current Token is an Input Statement**: If the current token is an input statement, parse it and read user input.
-14. **Parse Input Statement**: Parse the input statement and read the user's input value.
-15. **Current Token is a Trigonometric Function**: If the current token is a trigonometric function, parse it and compute the corresponding value.
-16. **Parse Trigonometric Function**: Parse the trigonometric function and compute its value.
-17. **Current Token is a Time Function**: If the current token is a time function, parse it and compute the corresponding value.
-18. **Parse Time Function**: Parse the time function and compute its value.
-19. **Loop through Tokens**: Continue looping through the remaining tokens in the program.
-20. **All Tokens Processed**: If all tokens have been processed, go to step 22.
-21. **Error Handling**: Handle errors during parsing, such as encountering invalid tokens or accessing undefined variables/arrays.
-22. **Stop**: End the execution of the compiler/interpreter.
+2. **Initialize Token List**: Convert the input code into tokens.
+3. **Initialize Variables and Arrays**: Set up storage for values.
+4. **Start Parsing Program**: Begin parsing the program.
+5. **Are Tokens Remaining?**: Proceed if tokens exist, otherwise GOTO STEP 22.
+6. **Array Declaration**: Parse and store array details. GOTO STEP 8.
+7. **Parse Array Declaration**: Read array size and elements.
+8. **Identifier Check**: Handle variable assignment and print statements. GOTO STEP 11.
+9. **Check Array**: Parse array access or variable assignment. GOTO STEP 10.
+10. **Parse Variable Assignment**: Assign variable a value. GOTO STEP 19.
+11. **Print Statement**: Parse and display variable/expression value. GOTO STEP 13.
+12. **Parse Print Statement**: Evaluate and print.
+13. **Input Statement**: Parse and read user input. GOTO STEP 15.
+14. **Parse Input Statement**: Read and store user's input value.
+15. **Trigonometric Function**: Parse and compute trigonometric value. GOTO STEP 17.
+16. **Parse Trigonometric Function**: Calculate the trigonometric value.
+17. **Time Function**: Parse and compute time-related value. GOTO STEP 18.
+18. **Parse Time Function**: Calculate the time-related value.
+19. **Loop through Tokens**: Continue processing remaining tokens. GOTO STEP 5.
+20. **All Tokens Processed**: Execution complete, proceed to the end.
+21. **Error Handling**: Handle parsing errors or undefined variables/arrays.
+22. **Stop**: End the interpreter's execution.
+
 
 ## Usage
 
