@@ -1,12 +1,12 @@
 # Jaithon
 
-This is a simple compiler/interpreter that supports array declarations and operations. It can parse and execute code containing array declarations, variable assignments, and print statements.
+This is a simple compiler/interpreter that supports array declarations and operations. It can parse and execute code containing array declarations, variable assignments, and print statements. The objective behind this interpreter is to provide a fun and easy way to get introduced to programming.
 
 ### Description
 
 **JAITHON**: *An Age-Friendly Introduction to Coding*
 
-JAITHON is a programming language carefully put together for teaching children and adults the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. The JAI programming Language is perfect for anyone regradless of age. By providing a beginner-friendly environment, The JAITHON Language removes the tech-savvy knowledge needed with traditional programming languages, making it accessible to people with little to no prior coding experience.
+JAITHON is a programming language carefully put together for teaching children and adults the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. The JAI programming Language is perfect for anyone regradless of age. By providing a beginner-friendly environment, The JAITHON Language removes the tech-savvy knowledge needed with traditional programming languages, making it accessible to people with little to no prior coding experience. The inteded use of my language is to help the transition to Python. JAITHON will help you get from complete beginner, to having somewhat knowledge of python syntax.
 
 **Crossing the age barrier**
 
