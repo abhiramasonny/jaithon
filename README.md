@@ -15,6 +15,8 @@ This is a simple compiler/interpreter that supports array declarations and opera
 - Detecting User input: You can detect user input. Syntax: *input variable_name*
 - Time: You can access the users internal Clock by using the time keyword. Syntax: *var t = time()* This saves the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
+<br>
+
 **Note:** Strings arnt supported in any part of this language yet, including the print statement. 
 *yes you cant do a helloworld in this language*
 
