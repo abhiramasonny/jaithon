@@ -57,4 +57,3 @@ var num = 11
 var dum = 12
 var ndum = num + dum
 print ndum
-if(1>1)
