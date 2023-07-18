@@ -17,7 +17,7 @@ This is a simple compiler/interpreter that supports array declarations and opera
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
 <br>
 
-**Note:** Strings arnt supported in any part of this language yet, including the print statement. 
+**Note:** Strings are not supported in any part of this language yet, including the print statement. 
 *yes you cant do a helloworld in this language*
 
 
