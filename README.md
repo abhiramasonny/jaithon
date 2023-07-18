@@ -4,17 +4,19 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 ## Features
 
-- Variable Assignment: You can assign values to variables using the var keyword, e.g., var x = 5.
-- Array Declaration: You can init arrays using the array keyword, e.g., array arr = [1].
-- Array Element Modification: You can modify elements of an array using the dot notation, e.g., arr.add(0, 4).
-- Print Statement: You can use the print keyword to print values to the console, e.g., print x.
+- Variable Assignment: You can assign values to variables using the var keyword. Syntax: *var x = 5*
+- Array Declaration: You can init arrays using the array keyword. Syntax: *array arr = [1]*
+- Array Element Modification: You can modify elements of an array using the dot notation. Syntax: *arr.add(0, 4).*
+- Print Statement: You can use the print keyword to print values to the console. Syntax: *print x*
 - Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
-- Comparrisions: you can preform comparrisions by using the > and < symbols, e.g., var a = 1>4: the output would be a = 0 because that statement is false.
-- Parentheses: You can use parentheses to group expressions and control operator precedence.
-- Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt.
-- Detecting User input: You can detect user input using the input *variable name* syntax. **Note:** This can only detect Int/Float values. strings are not supported.
-- Time: You can access the users internal Clock by using the time keyword. e.g., var t = time(). This saves the time as an integer.
+- Comparrisions: you can preform comparrisions by using the > and < symbols. Syntax: *var a = 1>4* >> the output would be a = 0 because that statement is false.
+- Parentheses: You can use parentheses to group expressions and control operator precedence. *PEMDAS*
+- Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt. Syntax: *sin(3)* *sin(x)*
+- Detecting User input: You can detect user input. Syntax: *input variable_name*
+- Time: You can access the users internal Clock by using the time keyword. Syntax: *var t = time()* This saves the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
+**Note:** Strings arnt supported in any part of this language yet, including the print statement. 
+*yes you cant do a helloworld in this language*
 
 
 ## How it Works
