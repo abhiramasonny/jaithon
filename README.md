@@ -106,7 +106,8 @@ print x
 # Output: 5.000000
 ```
 ## Info
-For more info go to the html page located at 
+For more info *and to appreaciate my hard webdev work* go to the html page located at 
 ```
 HTML/index.html
 ```
+or contact me at abhirama.sonny@gmail.com.
