@@ -105,3 +105,8 @@ var x = 5
 print x
 # Output: 5.000000
 ```
+## Info
+For more info go to the html page located at 
+```
+HTML/index.html
+```
