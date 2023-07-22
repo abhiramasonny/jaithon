@@ -108,6 +108,6 @@ print x
 ## Info
 For more info *and to appreaciate my hard webdev work* go to the html page located at 
 ```
-HTML/index.html
+https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html
 ```
 or contact me at abhirama.sonny@gmail.com.
