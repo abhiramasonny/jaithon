@@ -19,5 +19,9 @@
         "vector": "c",
         "time.h": "c",
         "sstream": "c"
-    }
+    },
+    "cSpell.words": [
+        "trigfunc",
+        "trigfunction"
+    ]
 }
