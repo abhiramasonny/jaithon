@@ -1,4 +1,8 @@
 input firstnum 
 input secnum
-if firstnum>secnum do print firstnum 
-if secnum>firstnum do print secnum
+input thirdnum
+var largenum = 0
+if firstnum>secnum do var largenum = firstnum
+if secnum>firstnum do var largenum = secnum
+if largenum<thirdnum do var largenum = thirdnum
+print largenum
