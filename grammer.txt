@@ -94,3 +94,11 @@ Example:
 -   import calculator
 -   import file1
 -   import test40
+
+If statement --> if/do keyword
+Syntax: if condition do statement
+This code executes the statement if and only if the condition is not equal to 0.
+Example:
+-   if 1<3 do print 1
+-   if 3>1 do print 1
+-   if lessthan do var x = 5
