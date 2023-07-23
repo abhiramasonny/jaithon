@@ -50,6 +50,7 @@ print result
 #input test
 input x
 print x
+
 #sqrt test
 var value = 64.0
 var result = sqrt(value)
