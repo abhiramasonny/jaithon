@@ -38,7 +38,9 @@ typedef enum {
     TOKEN_TIME,
     TOKEN_IMPORT,
     TOKEN_GREATER_THAN,
-    TOKEN_LESS_THAN     
+    TOKEN_LESS_THAN,
+    TOKEN_IF,
+    TOKEN_DO     
 } TokenType;
 
 typedef struct {
@@ -164,6 +166,12 @@ void advance() {
     } else if (*input == '<') {
         currentToken.type = TOKEN_LESS_THAN;
         input++;
+    } else if (strncmp(input, "if", 2) == 0) {
+        currentToken.type = TOKEN_IF;
+        input += 2;
+    } else if (strncmp(input, "do", 2) == 0) {
+        currentToken.type = TOKEN_DO;
+        input += 2;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
@@ -232,6 +240,20 @@ void eat(TokenType type) {
         snprintf(tokenName, sizeof(tokenName), "%d", currentToken.type);
         error("Unexpected token", tokenName);
         exit(1);
+    }
+}
+void ifStatement() {
+    eat(TOKEN_IF);
+    double conditionValue = expression();
+    eat(TOKEN_DO);
+    if (conditionValue != 0) { // Treat any non-zero value as true
+        statement();
+    } else{
+        while (*input && *input != '\n') {
+            input++;
+        }
+        advance();
+        return;
     }
 }
 void importFile(const char *filename) {
@@ -596,7 +618,9 @@ void inputStatement() {
 }
 
 void statement() {
-    if (currentToken.type == TOKEN_VAR) {
+    if (currentToken.type == TOKEN_IF) {
+        ifStatement();
+    } else if (currentToken.type == TOKEN_VAR) {
         eat(TOKEN_VAR);
         assignment();
     } else if (currentToken.type == TOKEN_PRINT) {

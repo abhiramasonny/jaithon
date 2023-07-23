@@ -3,6 +3,7 @@
 var nums = 1
 var lessthan = nums<3 #output should be 1
 var greatorthan = nums>3 # output should be 0
+if 1>3 do print 1
 print lessthan
 print greatorthan
 #array test
