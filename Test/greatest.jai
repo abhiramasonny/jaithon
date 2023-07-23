@@ -1,4 +1,4 @@
 input firstnum 
 input secnum
-var a = firstnum>secnum
-print a
+if firstnum>secnum do print firstnum 
+if secnum>firstnum do print secnum
