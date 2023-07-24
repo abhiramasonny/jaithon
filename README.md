@@ -6,7 +6,7 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 **JAITHON**: *An Age-Friendly Introduction to Coding*
 
-JAITHON is a programming language carefully put together for teaching children and adults the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. The JAI programming Language is perfect for anyone regradless of age. By providing a beginner-friendly environment, The JAITHON Language removes the tech-savvy knowledge needed with traditional programming languages, making it accessible to people with little to no prior coding experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from complete beginner, to having somewhat knowledge of python syntax.
+JAITHON is a programming language carefully put together for teaching children and adults the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. The JAI programming Language is perfect for anyone regardless of age. By providing a beginner-friendly environment, The JAITHON Language removes the tech-savvy knowledge needed with traditional programming languages, making it accessible to people with little to no prior coding experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from complete beginner, to having somewhat knowledge of python syntax.
 
 **Crossing the age barrier**
 
@@ -19,7 +19,7 @@ The primary problem JAITHON addresses is the apprehension often felt by young le
 - Array Element Modification: You can modify elements of an array using the dot notation. Syntax: *arr.add(0, 4).*
 - Print Statement: You can use the print keyword to print values to the console. Syntax: *print x*
 - Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
-- Comparrisions: you can preform comparrisions by using the > and < symbols. Syntax: *var a = 1>4* >> the output would be a = 0 because that statement is false.
+- Comparisons: you can preform comparisons by using the > and < symbols. Syntax: *var a = 1>4* >> the output would be a = 0 because that statement is false.
 - Parentheses: You can use parentheses to group expressions and control operator precedence. *PEMDAS*
 - Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt. Syntax: *sin(3)* *sin(x)*
 - Detecting User input: You can detect user input. Syntax: *input variable_name*
@@ -81,7 +81,7 @@ the jaithon.jai file is the file that the interpreter reads from. It by default 
 
 ## Syntex Highlighting
 
-This is a really cool feature and takes like 3 seconds to do so dont be lazy and follow the steps.
+This is a really cool feature and takes like 3 seconds to do so don't be lazy and follow the steps.
 *Only if you have VS-Code as your IDE*
 ```sh
 cd tmp
@@ -98,7 +98,7 @@ Here are some examples of code that can be compiled/interpreted using this inter
 ```python
 array a = [3]
 print a
-# Output: [0.000000, 0.000000, 0.000000] as there are 3 spots in memory initilized to 0.
+# Output: [0.000000, 0.000000, 0.000000] as there are 3 spots in memory initialized to 0.
 a.add(0, 2)
 print a
 # Output: [2.000000, 0.000000, 0.000000] as the 0th term is set to 2
