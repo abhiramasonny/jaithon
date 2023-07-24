@@ -91,7 +91,7 @@ void skipToEndOfInput() {
         advance();
     }
 }
-
+int lines = 0;
 void advance() {
     while (isspace(*input)) {
         input++;
@@ -236,6 +236,7 @@ void eat(TokenType type) {
     if (currentToken.type == type) {
 
         advance();
+        
     } else {
         char tokenName[256];
         snprintf(tokenName, sizeof(tokenName), "%d", currentToken.type);
