@@ -14,6 +14,26 @@ JAITHON is a programming language carefully put together for teaching children a
 
 The primary problem JAITHON addresses is the apprehension often felt by young learners when approaching programming. By offering straightforward and visually appealing syntax, JAITHON enables children to express their creativity through code without feeling overwhelmed. This approach fosters a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does.
 
+## Usage
+
+To use the array compiler/interpreter, follow these steps:
+```bash 
+git clone https://github.com/abhiramasonny/jaithon
+cd jaithon
+make
+./interpreter
+```
+Then type this as follow up to *Enter file name to interpret*
+```
+jaithon
+```
+
+4. OPTIONAL: Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
+the jaithon.jai file is the file that the interpreter reads from. It by default has test cases.
+5. Execute the compiler/interpreter with *filename* **in this case jaithon** as input.
+6. The output will be displayed, showing the results of any print statements or errors encountered during execution.
+
+
 ## Features
 
 - Variable Assignment: You can assign values to variables using the var keyword. Syntax: *var x = 5*
@@ -42,7 +62,7 @@ Documentation/grammer.txt
 *yes you cant do a helloworld in this language*
 
 
-# Flowchart: JAI Programming Language Interpreter
+## Flowchart: JAI Programming Language Interpreter
 
 1. **Read Input Code**: Read the code to be compiled/interpreted.
 2. **Initialize Token List**: Convert the input code into tokens.
@@ -67,27 +87,7 @@ Documentation/grammer.txt
 21. **Error Handling**: Handle parsing errors or undefined variables/arrays.
 22. **Stop**: End the interpreter's execution.
 
-## Usage
-
-To use the array compiler/interpreter, follow these steps:
-```bash 
-git clone https://github.com/abhiramasonny/jaithon
-cd jaithon
-make
-./interpreter
-```
-Then type this as follow up to *Enter file name to interpret*
-```
-jaithon
-```
-
-4. OPTIONAL: Write the code to be compiled/interpreted, including array declarations, variable assignments, and print statements to the file called jaithon.jai.
-the jaithon.jai file is the file that the interpreter reads from. It by default has test cases.
-5. Execute the compiler/interpreter with *filename* **in this case jaithon** as input.
-6. The output will be displayed, showing the results of any print statements or errors encountered during execution.
-
-
-## Syntex Highlighting
+## Syntax Highlighting
 
 This is a really cool feature and takes like 3 seconds to do so don't be lazy and follow the steps.
 *Only if you have VS-Code as your IDE*
@@ -99,6 +99,7 @@ cp -r jai ~/.vscode/extensions
 Note: this is for mac/linux.
 <br>
 dont own a windows laptop so havent tested on there.
+
 ## Examples
 
 Here are some examples of code that can be compiled/interpreted using this interpreter:
@@ -114,8 +115,9 @@ var x = 5
 print x
 # Output: 5.000000
 ```
+
 ## Info
-For more info *and to appreaciate my hard webdev work* go to the html page located at 
+For more info *and to appreciate my hard webdev work* go to the html page located at 
 ```
 https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html
 ```
