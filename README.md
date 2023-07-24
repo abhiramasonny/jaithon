@@ -31,7 +31,6 @@ The primary problem JAITHON addresses is the apprehension often felt by young le
 **Note:** Strings are not supported in any part of this language yet, including the print statement. 
 <br>
 <br>
-<br>
 **You can find more documentation at** 
 ```
 Documentation/grammer.txt
