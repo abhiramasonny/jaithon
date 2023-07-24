@@ -73,7 +73,7 @@ To use the array compiler/interpreter, follow these steps:
 ```bash 
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
-gcc -o interpreter interpreter.c 
+make
 ./interpreter
 ```
 Then type this as follow up to *Enter file name to interpret*
