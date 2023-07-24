@@ -262,6 +262,9 @@ void ifStatement() {
     eat(TOKEN_THEN);
     eat(TOKEN_DO);
     if (conditionValue != 0) { // Treat any non-zero value as true
+        if(debug){
+            printf("\033[1;32mRunning if statement loop.\033[0m\n");
+        }
         statement();
     } else{
         skipToEnd();

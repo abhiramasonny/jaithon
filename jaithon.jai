@@ -2,10 +2,10 @@
 #comparrisions test
 var nums = 1
 var lessthan = nums<3 #output should be 1
-var greatorthan = nums>3 # output should be 0
-if lessthan then do print 1
 print lessthan
+var greatorthan = nums>3 # output should be 0
 print greatorthan
+if lessthan then do print 1
 #array test
 array a = [5]
 print a
