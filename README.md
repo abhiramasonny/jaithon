@@ -1,5 +1,5 @@
 # Jaithon
-
+***We suffer so that you don't***
 This is a simple compiler/interpreter that supports array declarations and operations. It can parse and execute code containing array declarations, variable assignments, print statements, import statements, input statements, time functions, and much more. The objective behind this interpreter is to provide a fun and easy way to get introduced to programming.
 
 ### Description
