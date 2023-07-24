@@ -90,7 +90,7 @@ the jaithon.jai file is the file that the interpreter reads from. It by default 
 This is a really cool feature and takes like 3 seconds to do so don't be lazy and follow the steps.
 *Only if you have VS-Code as your IDE*
 ```sh
-cd tmp
+cd vscodeext
 cp -r jai ~/.vscode/extensions
 ```
 **Reload VS-Code**
