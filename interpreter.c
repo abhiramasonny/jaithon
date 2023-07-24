@@ -229,6 +229,7 @@ void advance() {
 
 void error(const char *message, const char *errorToken) {
     fprintf(stderr, "Error: %s. Found: %s\n", message, errorToken);
+    exit(1);
 }
 
 void eat(TokenType type) {
