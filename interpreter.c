@@ -4,8 +4,9 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#include <stdbool.h>
 #define MAX_IMPORTED_FILES 256
-
+bool debug = true;
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 typedef enum {
@@ -313,6 +314,9 @@ double getVariableValue(const char *name) {
 }
 
 void setVariableValue(const char *name, double value) {
+    if(debug==true){
+        printf("\033[1;31mSetting variable %s to\033[0m \033[1;34m%f\033[0m\n", name, value);
+    }
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
             variables[i].value = value;
