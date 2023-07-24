@@ -41,7 +41,8 @@ typedef enum {
     TOKEN_GREATER_THAN,
     TOKEN_LESS_THAN,
     TOKEN_IF,
-    TOKEN_DO     
+    TOKEN_DO,
+    TOKEN_THEN     
 } TokenType;
 
 typedef struct {
@@ -173,6 +174,9 @@ void advance() {
     } else if (strncmp(input, "do", 2) == 0) {
         currentToken.type = TOKEN_DO;
         input += 2;
+    } else if (strncmp(input, "then", 4) == 0) {
+        currentToken.type = TOKEN_THEN;
+        input += 4;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
@@ -248,6 +252,7 @@ void eat(TokenType type) {
 void ifStatement() {
     eat(TOKEN_IF);
     double conditionValue = expression();
+    eat(TOKEN_THEN);
     eat(TOKEN_DO);
     if (conditionValue != 0) { // Treat any non-zero value as true
         statement();

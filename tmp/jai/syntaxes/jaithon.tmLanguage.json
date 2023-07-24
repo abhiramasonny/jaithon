@@ -29,7 +29,7 @@
 		"patterns": [
 		  {
 			"name": "keyword.control.jaithon",
-			"match": "\\b(if|do|import|input|var|array|print|time)\\b"
+			"match": "\\b(if|then|do|import|input|var|array|print|time)\\b"
 		  }
 		]
 	  },
