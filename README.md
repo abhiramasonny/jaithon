@@ -29,8 +29,11 @@ The primary problem JAITHON addresses is the apprehension often felt by young le
 <br>
 
 **Note:** Strings are not supported in any part of this language yet, including the print statement. 
-
-# You can find more documentation at Documentation/grammer.txt
+<br>
+**You can find more documentation at** 
+```
+Documentation/grammer.txt
+```
 <br>
 
 *yes you cant do a helloworld in this language*
