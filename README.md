@@ -25,10 +25,11 @@ The primary problem JAITHON addresses is the apprehension often felt by young le
 - Detecting User input: You can detect user input. Syntax: *input variable_name*
 - Time: You can access the users internal Clock by using the time keyword. Syntax: *var t = time()* This saves the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
-- If loops: You can do if loops by using the if/do keywords. Syntax: *if 1>4 do print 1*
+- If loops: You can do if loops by using the if/then/do keywords. Syntax: *if 1>4 then do print 1*
 <br>
 
 **Note:** Strings are not supported in any part of this language yet, including the print statement. 
+**You can find more documentation at Documentation/grammer.txt**
 <br>
 
 *yes you cant do a helloworld in this language*
