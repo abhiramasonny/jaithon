@@ -249,6 +249,13 @@ void eat(TokenType type) {
         exit(1);
     }
 }
+void skipToEnd(){
+    while (*input && *input != '\n') {
+            input++;
+    }
+    advance();
+    return;
+}
 void ifStatement() {
     eat(TOKEN_IF);
     double conditionValue = expression();
@@ -257,11 +264,7 @@ void ifStatement() {
     if (conditionValue != 0) { // Treat any non-zero value as true
         statement();
     } else{
-        while (*input && *input != '\n') {
-            input++;
-        }
-        advance();
-        return;
+        skipToEnd();
     }
 }
 void importFile(const char *filename) {
