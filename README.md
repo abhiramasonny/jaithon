@@ -55,7 +55,7 @@ the jaithon.jai file is the file that the interpreter reads from. It by default 
 <br>
 **You can find more documentation at** 
 ```
-Documentation/grammer.txt
+Documentation/grammar.txt
 ```
 <br>
 
@@ -92,17 +92,20 @@ Documentation/grammer.txt
 This is a really cool feature and takes like 3 seconds to do so don't be lazy and follow the steps.
 *Only if you have VS-Code as your IDE*
 ```sh
-cd vscodeext
+cd Extensions
 cp -r jai ~/.vscode/extensions
 ```
 **Reload VS-Code**
 Note: this is for mac/linux.
 <br>
-dont own a windows laptop so havent tested on there.
+Hasn't been tested on windows
 
 ## Examples
 
-Examples are located in the Test directory. There is also documentation of the syntax located at **Documentation/grammer.txt**
+Examples are located in the Test directory. There is also documentation of the syntax located at
+```
+Documentation/grammar.txt
+```
 
 ## Info
 For more info *and to appreciate my hard webdev work* go to the html page located at 
