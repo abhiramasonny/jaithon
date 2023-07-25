@@ -46,7 +46,7 @@ typedef enum {
     TOKEN_NOT,
     TOKEN_IF,
     TOKEN_DO,
-    TOKEN_THEN   
+    TOKEN_THEN
 } TokenType;
 
 typedef struct {
@@ -173,6 +173,9 @@ void advance() {
     } else if (*input == '<') {
         currentToken.type = TOKEN_LESS_THAN;
         input++;
+    } else if (*input == '=') {
+        currentToken.type = TOKEN_ASSIGN;
+        input++;
     } else if (strncmp(input, "if", 2) == 0) {
         currentToken.type = TOKEN_IF;
         input += 2;
@@ -241,11 +244,12 @@ void advance() {
             input++;
         }
         currentToken.identifier[i] = '\0';
-    } else if (*input == '=') {
-        currentToken.type = TOKEN_ASSIGN;
-        input++;
     } else {
         error("Invalid token", input);
+    }
+
+    if(debug == true){
+        printf("\033[1;35mParsing%u\033[0m\n", currentToken.type);
     }
 }
 
