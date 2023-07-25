@@ -6,13 +6,13 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 ### Description
 
-**JAITHON**: *An Age-Friendly Introduction to Coding*
+**JAITHON**: *A Simple Introduction to Math and Programming*
 
-JAITHON is a programming language carefully put together for teaching children and adults the fundamentals of coding. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. The JAI programming Language is perfect for anyone regardless of age. By providing a beginner-friendly environment, The JAITHON Language removes the tech-savvy knowledge needed with traditional programming languages, making it accessible to people with little to no prior coding experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from complete beginner, to having somewhat knowledge of python syntax.
+JAITHON is a programming language put together for the purpose of teaching children and/or adults the basics of programming. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. Jaithon's syntax is so simple, that its basically like reading/writing english. All you need is a 1st grade education (Just know english...) to be able to enjoy my language. By providing a beginner-friendly environment, Jaithon removes the tech-savvy knowledge needed with 'normal'/highlevel programming languages, making it accessible to people with little or no prior programming experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from complete beginner, to having a basic grasp of python syntax.
 
 **Crossing the age barrier**
 
-The primary problem JAITHON addresses is the apprehension often felt by young learners when approaching programming. By offering straightforward and visually appealing syntax, JAITHON enables children to express their creativity through code without feeling overwhelmed. This approach fosters a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does.
+The primary problem JAITHON addresses is the stress often felt by young learners when approaching programming. As a quote from Munna Bhai mbbs, *"Bhai, tension nahin lene ka bhai!"*, meaning drop the tension. By offering straightforward and visually appealing syntax, JAITHON enables children to effectively *Drop the tension*. This approach cultivates a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does. Ive got proof for that as well. Star the GH repo and ill tell it to you :DD.
 
 ## Usage
 
