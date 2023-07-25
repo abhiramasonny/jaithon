@@ -150,3 +150,12 @@ Example:
 -   var value = math.quad(1,2,1)
 -   var value = math.quad(a,1,2)
 -   var value = math.quad(a,b,c)
+
+Pythagorean Theorem --> pyth function
+Syntax: var variable_name = math.pyth(a,b)
+This code takes in 2 value as input, and returns the solved value for the hypotenuse.
+Return type: Returns to a variable the solved value for C.
+Example:
+-   var value = math.pyth(3,4)
+-   var value = math.pyth(a,4)
+-   var value = math.pyth(a,b)
