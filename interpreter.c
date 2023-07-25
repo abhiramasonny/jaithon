@@ -98,7 +98,7 @@ void skipToEndOfInput() {
         advance();
     }
 }
-int lines = 0;
+
 void advance() {
     while (isspace(*input)) {
         input++;
@@ -246,10 +246,6 @@ void advance() {
         currentToken.identifier[i] = '\0';
     } else {
         error("Invalid token", input);
-    }
-
-    if(debug == true){
-        printf("\033[1;35mParsing%u\033[0m\n", currentToken.type);
     }
 }
 
