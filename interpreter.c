@@ -32,6 +32,7 @@ typedef enum {
     TOKEN_SQRT,
     TOKEN_QUADRATIC,
     TOKEN_MATH,
+    TOKEN_PYTHAGOREAN,
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
@@ -216,6 +217,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "math", 4) == 0) {
         currentToken.type = TOKEN_MATH;
+        input += 4;
+    } else if (strncmp(input, "pyth", 4) == 0) {
+        currentToken.type = TOKEN_PYTHAGOREAN;
         input += 4;
     } else if (strncmp(input, "input", 5) == 0) {
         currentToken.type = TOKEN_INPUT;
@@ -455,6 +459,17 @@ double quadFunction() {
         return 1;
     }
 }
+double pythagoreanTheorem() {
+    double a, b, c;
+    eat(TOKEN_PYTHAGOREAN);
+    eat(TOKEN_LPAREN);
+    a = expression();
+    eat(TOKEN_COMMA);
+    b = expression();
+    eat(TOKEN_RPAREN);
+    c = sqrt(a*a+b*b);
+    return c;
+}
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
         double value = currentToken.value;
@@ -502,14 +517,16 @@ double factor() {
         if (currentToken.type == TOKEN_QUADRATIC){
             return quadFunction();
         } else if (currentToken.type == TOKEN_SIN ||
-               currentToken.type == TOKEN_COS ||
-               currentToken.type == TOKEN_TAN ||
-               currentToken.type == TOKEN_ASIN ||
-               currentToken.type == TOKEN_ACOS ||
-               currentToken.type == TOKEN_ATAN ||
-               currentToken.type == TOKEN_SQRT) {
-        return trigFunction();
-    } 
+                   currentToken.type == TOKEN_COS ||
+                   currentToken.type == TOKEN_TAN ||
+                   currentToken.type == TOKEN_ASIN||
+                   currentToken.type == TOKEN_ACOS||
+                   currentToken.type == TOKEN_ATAN||
+                   currentToken.type == TOKEN_SQRT) {
+            return trigFunction();
+        } else if(currentToken.type == TOKEN_PYTHAGOREAN){
+            return pythagoreanTheorem();
+        }
     }
     
 
