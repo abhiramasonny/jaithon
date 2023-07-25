@@ -102,19 +102,7 @@ dont own a windows laptop so havent tested on there.
 
 ## Examples
 
-Here are some examples of code that can be compiled/interpreted using this interpreter:
-
-```python
-array a = [3]
-print a
-# Output: [0.000000, 0.000000, 0.000000] as there are 3 spots in memory initialized to 0.
-a.add(0, 2)
-print a
-# Output: [2.000000, 0.000000, 0.000000] as the 0th term is set to 2
-var x = 5
-print x
-# Output: 5.000000
-```
+Examples are located in the Test directory. There is also documentation of the syntax located at **Documentation/grammer.txt**
 
 ## Info
 For more info *and to appreciate my hard webdev work* go to the html page located at 
