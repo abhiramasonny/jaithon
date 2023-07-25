@@ -40,6 +40,7 @@ typedef enum {
     TOKEN_IMPORT,
     TOKEN_GREATER_THAN,
     TOKEN_LESS_THAN,
+    TOKEN_NOT,
     TOKEN_IF,
     TOKEN_DO,
     TOKEN_THEN     
@@ -216,6 +217,9 @@ void advance() {
     } else if (strncmp(input, "time", 4) == 0) {
         currentToken.type = TOKEN_TIME;
         input += 4;
+    } else if (strncmp(input, "not", 3) == 0) {
+        currentToken.type = TOKEN_NOT;
+        input += 3;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
         int i = 0;
@@ -494,7 +498,7 @@ double expression() {
     double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
-           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN) {
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_NOT) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
@@ -507,6 +511,13 @@ double expression() {
         } else if (currentToken.type == TOKEN_LESS_THAN) {
             eat(TOKEN_LESS_THAN);
             value = (value < term()) ? 1.0 : 0.0;
+        } else if (currentToken.type == TOKEN_NOT) {
+            eat(TOKEN_NOT);
+            if(value==1){
+                value = 0.0;
+            } else{
+                value = 1.0;
+            }
         }
     }
 
