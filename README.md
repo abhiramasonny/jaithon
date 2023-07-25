@@ -50,11 +50,11 @@ jaithon
 - If loops: You can do if loops by using the if/then/do keywords. Syntax: *if 1>4 then do print 1*
 - Not: You can do not operations by using the not keyword. Syntax: *var a = 1 not*
 - Quadratic function: You can solve quadratic functions using the inbuilt math function. Syntax: *var q = math.quad(1,2,1)*
+- The rest of the functions/keywords/things are located in the documentation.
 
-...
 
-<br>
 For more documentation, visit
+
 ```
 Documentation/grammar.txt
 ```
