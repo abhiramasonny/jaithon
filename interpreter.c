@@ -447,7 +447,7 @@ double quadFunction() {
         root1 = root2 = -b / (2 * a);
         return root1;
     } else {
-        error("Imaginary nums not supported. ", "");
+        error("Imaginary nums not supported", "");
         return 1;
     }
 }
