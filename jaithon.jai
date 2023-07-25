@@ -6,6 +6,7 @@ print lessthan
 var greatorthan = nums>3 # output should be 0
 print greatorthan
 if lessthan then do print 1
+
 #array test
 array a = [5]
 print a
@@ -22,6 +23,7 @@ print a
 var angle = 0.5
 var result = math.sin(angle)
 print result
+
 #cos test
 var angle = 0.8
 var result = math.cos(angle)
@@ -56,16 +58,16 @@ print result
 var value = 64.0
 var result = math.sqrt(value)
 print result
+
 #math opperator tests
 var num = 11
 var dum = 12
 var ndum = num + dum
 print ndum
 
+#time test
 var t = time()
 print t
-
-#import calculator
 
 #not test
 var c = 1
