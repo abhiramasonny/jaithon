@@ -15,24 +15,32 @@ Example:
 -   print x
 -   print 2
 -   print array_1
+Math --> math Category
+Syntax: math.mathfunction(inputs)
+Returns various mathematical functions based off inputs provided by user such as trigfunction, quadFunction, etc...
+Return Type: whatever the specific function returns.
+Example:
+-   var a = math.sin(0.5)
+-   var a = math.tan(0.3)
+-   var a = math.quad(1,2,1)
 
 Trigonometric Functions --> specific_trigfunction function
-Syntax: var variable_name = trigfunc(degree)
+Syntax: var variable_name = math.trigfunc(degree)
 These functions take an angle (in degrees), and return their corresponding sine, cosine, tangent, asin, acos or atan values.
 Return type: Returns to a variable a specific trigfunction applied on a variable or constant.
 Example:
--   var value = sin(3)
--   var value = cos(angle)
--   var value = asin(4)
+-   var value = math.sin(3)
+-   var value = math.cos(angle)
+-   var value = math.asin(4)
 
 Square root --> sqrt function
-Syntax: var variable_name = sqrt(value)
+Syntax: var variable_name = math.sqrt(value)
 This code takes in a value as input, and returns the square root of that function
 Return type: Returns to a variable a square root applied on a variable or constant.
 Example:
--   var value = sqrt(4)
--   var value = sqrt(nums)
--   var value = sqrt(2)
+-   var value = math.sqrt(4)
+-   var value = math.sqrt(nums)
+-   var value = math.sqrt(2)
 
 Arrays init --> array keyword
 Syntax: array array_name = [array_size]
@@ -135,10 +143,10 @@ Example:
 -   if lessthan not then do var x = 5
 
 Quadratic Function --> quad function
-Syntax: var variable_name = quad(a,b,c)
-This code takes in 3 value as input, and returns the solved roots for them using the quadratic formula.
+Syntax: var variable_name = math.quad(a,b,c)
+This code takes in 3 value as input, and returns the solved roots for them using the quadratic formula. Under the math Category.
 Return type: Returns to a variable the solved quadFunction on variables or constants.
 Example:
--   var value = quad(1,2,1)
--   var value = quad(a,1,2)
--   var value = quad(a,b,c)
+-   var value = math.quad(1,2,1)
+-   var value = math.quad(a,1,2)
+-   var value = math.quad(a,b,c)
