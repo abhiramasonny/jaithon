@@ -316,15 +316,12 @@ void importFile(const char *filename) {
 
     fclose(file);
 
-    // Save the current input and lexer state
     char *tempInput = input;
     Token tempCurrentToken = currentToken;
 
-    // Process the imported code
     lexer(importedCode);
     program();
 
-    // Restore the original input and lexer state
     input = tempInput;
     currentToken = tempCurrentToken;
 
