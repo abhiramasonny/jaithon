@@ -31,6 +31,7 @@ typedef enum {
     TOKEN_ATAN,
     TOKEN_SQRT,
     TOKEN_QUADRATIC,
+    TOKEN_MATH,
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
@@ -44,7 +45,7 @@ typedef enum {
     TOKEN_NOT,
     TOKEN_IF,
     TOKEN_DO,
-    TOKEN_THEN     
+    TOKEN_THEN   
 } TokenType;
 
 typedef struct {
@@ -212,6 +213,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "quad", 4) == 0) {
         currentToken.type = TOKEN_QUADRATIC;
+        input += 4;
+    } else if (strncmp(input, "math", 4) == 0) {
+        currentToken.type = TOKEN_MATH;
         input += 4;
     } else if (strncmp(input, "input", 5) == 0) {
         currentToken.type = TOKEN_INPUT;
@@ -489,7 +493,15 @@ double factor() {
         double value = expression();
         eat(TOKEN_RPAREN);
         return value;
-    } else if (currentToken.type == TOKEN_SIN ||
+    } else if (currentToken.type == TOKEN_TIME) {
+        return timeFunction();
+    }
+    else if (currentToken.type == TOKEN_MATH) {
+        eat(TOKEN_MATH);
+        eat(TOKEN_DOT);
+        if (currentToken.type == TOKEN_QUADRATIC){
+            return quadFunction();
+        } else if (currentToken.type == TOKEN_SIN ||
                currentToken.type == TOKEN_COS ||
                currentToken.type == TOKEN_TAN ||
                currentToken.type == TOKEN_ASIN ||
@@ -497,11 +509,7 @@ double factor() {
                currentToken.type == TOKEN_ATAN ||
                currentToken.type == TOKEN_SQRT) {
         return trigFunction();
-    } else if (currentToken.type == TOKEN_TIME) {
-        return timeFunction();
-    }
-    else if (currentToken.type == TOKEN_QUADRATIC) {
-        return quadFunction();
+    } 
     }
     
 
