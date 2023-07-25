@@ -31,7 +31,8 @@ jaithon
 4. Create a new file with the .jai extension, then write code in the JAI language.
 5. Execute the compiler/interpreter with *filename* as input.
 6. The output will be displayed, showing the results of any print statements or errors encountered during execution.
-
+7. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
+8. If you do this, you will need to run **make** again, to recompile the binary.
 
 ## Features
 
