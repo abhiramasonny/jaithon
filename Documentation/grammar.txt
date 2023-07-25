@@ -17,7 +17,7 @@ Example:
 -   print array_1
 
 Trigonometric Functions --> specific_trigfunction function
-Syntax: var trig = trigfunc(degree)
+Syntax: var variable_name = trigfunc(degree)
 These functions take an angle (in degrees), and return their corresponding sine, cosine, tangent, asin, acos or atan values.
 Return type: Returns to a variable a specific trigfunction applied on a variable or constant.
 Example:
@@ -26,7 +26,7 @@ Example:
 -   var value = asin(4)
 
 Square root --> sqrt function
-Syntax: var a = sqrt(value)
+Syntax: var variable_name = sqrt(value)
 This code takes in a value as input, and returns the square root of that function
 Return type: Returns to a variable a square root applied on a variable or constant.
 Example:
@@ -133,3 +133,12 @@ Example:
 -   if 1<3 then do print 1
 -   if 3>1 then do print 1
 -   if lessthan not then do var x = 5
+
+Quadratic Function --> quad function
+Syntax: var variable_name = quad(a,b,c)
+This code takes in 3 value as input, and returns the solved roots for them using the quadratic formula.
+Return type: Returns to a variable the solved quadFunction on variables or constants.
+Example:
+-   var value = quad(1,2,1)
+-   var value = quad(a,1,2)
+-   var value = quad(a,b,c)
