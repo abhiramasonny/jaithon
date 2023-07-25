@@ -72,6 +72,8 @@ var c = 1
 var c = c not
 print c
 
-#quadratic test
+#math test
 var q = math.quad(1,2,1)
 print q
+var p = math.pyth(3,4)
+print p
