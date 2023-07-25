@@ -49,8 +49,8 @@ print result
 
 #import calculator
 #input test
-input x
-print x
+#input x
+#print x
 
 #sqrt test
 var value = 64.0
@@ -65,4 +65,7 @@ print ndum
 var t = time()
 print t
 
-import calculator
+#import calculator
+var c = 1
+var c = c not
+print c
