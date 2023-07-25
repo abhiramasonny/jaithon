@@ -12,7 +12,7 @@ JAITHON is a programming language put together for the purpose of teaching child
 
 **Crossing the age barrier**
 
-The primary problem JAITHON addresses is the stress often felt by young learners when approaching programming. As a quote from Munna Bhai mbbs, *"Bhai, tension nahin lene ka bhai!"*, meaning drop the tension. By offering straightforward and visually appealing syntax, JAITHON enables children to effectively *Drop the tension*. This approach cultivates a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does. Ive got proof for that as well. Star the GH repo and ill tell it to you :DD.
+The primary problem JAITHON addresses is the stress often felt by young learners when approaching programming. As a quote from Munna Bhai MBBS, *"Bhai, tension nahin lene ka bhai!"*, meaning leave the tension behind. By offering straightforward and visually appealing syntax, JAITHON enables children to effectively *leave the tension behind*. This approach cultivates a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does. Ive got proof for that as well. Star the GH repo and ill tell it to you :DD.
 
 ## Usage
 
