@@ -4,9 +4,14 @@
         "helloworld",
         "jaithon",
         "largenum",
+        "lessthan",
+        "mathfunction",
+        "nums",
         "RPAREN",
         "secnum",
         "thirdnum",
+        "trigfunc",
+        "trigfunction",
         "webdev"
     ],
     "files.associations": {

@@ -42,22 +42,27 @@ jaithon
 - Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
 - Comparisons: you can preform comparisons by using the > and < symbols. Syntax: *var a = 1>4* >> the output would be a = 0 because that statement is false.
 - Parentheses: You can use parentheses to group expressions and control operator precedence. *PEMDAS*
-- Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt. Syntax: *sin(3)* *sin(x)*
+- Trigonometric Functions: You can use trigonometric functions such as sin, cos, tan, asin, acos, atan, sqrt. Syntax: *math.sin(3)* *math.sin(x)*
 - Detecting User input: You can detect user input. Syntax: *input variable_name*
 - Time: You can access the users internal Clock by using the time keyword. Syntax: *var t = time()* This saves the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
 - If loops: You can do if loops by using the if/then/do keywords. Syntax: *if 1>4 then do print 1*
 - Not: You can do not operations by using the not keyword. Syntax: *var a = 1 not*
-- Quadratic function: You can solve quadratic functions using the inbuilt math function. Syntax: *var q = quad(1,2,1)*
+- Quadratic function: You can solve quadratic functions using the inbuilt math function. Syntax: *var q = math.quad(1,2,1)*
+
+...
+
+<br>
+For more documentation, visit
+```
+Documentation/grammar.txt
+```
 <br>
 
 **Note:** Strings are not supported in any part of this language yet, including the print statement. 
 <br>
 <br>
-**You can find more complete documentation at** 
-```
-Documentation/grammar.txt
-```
+
 <br>
 
 *yes you cant do a helloworld in this language*
