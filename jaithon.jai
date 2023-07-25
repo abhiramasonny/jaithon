@@ -20,31 +20,31 @@ print a
 
 #sin test
 var angle = 0.5
-var result = sin(angle)
+var result = math.sin(angle)
 print result
 #cos test
 var angle = 0.8
-var result = cos(angle)
+var result = math.cos(angle)
 print result
 
 #tan test
 var angle = 1.2
-var result = tan(angle)
+var result = math.tan(angle)
 print result
 
 #asin test
 var value = 0.5
-var result = asin(value)
+var result = math.asin(value)
 print result
 
 #acos test
 var value = 0.8
-var result = acos(value)
+var result = math.acos(value)
 print result
 
 #atan test
 var value = 1.2
-var result = atan(value)
+var result = math.atan(value)
 print result
 
 #import calculator
@@ -54,7 +54,7 @@ print result
 
 #sqrt test
 var value = 64.0
-var result = sqrt(value)
+var result = math.sqrt(value)
 print result
 #math opperator tests
 var num = 11
@@ -73,5 +73,5 @@ var c = c not
 print c
 
 #quadratic test
-var q = quad(1,2,1)
+var q = math.quad(1,2,1)
 print q
