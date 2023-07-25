@@ -6,7 +6,7 @@
 #include <time.h>
 #include <stdbool.h>
 #define MAX_IMPORTED_FILES 256
-bool debug = false;
+#define debug true
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 typedef enum {
