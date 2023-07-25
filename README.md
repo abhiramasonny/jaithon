@@ -47,12 +47,14 @@ jaithon
 - Time: You can access the users internal Clock by using the time keyword. Syntax: *var t = time()* This saves the time as an integer.
 - Comments: You can add comments using the # symbol. Commented lines are displayed in green.
 - If loops: You can do if loops by using the if/then/do keywords. Syntax: *if 1>4 then do print 1*
+- Not: You can do not operations by using the not keyword. Syntax: *var a = 1 not*
+- Quadratic function: You can solve quadratic functions using the inbuilt math function. Syntax: *var q = quad(1,2,1)*
 <br>
 
 **Note:** Strings are not supported in any part of this language yet, including the print statement. 
 <br>
 <br>
-**You can find more documentation at** 
+**You can find more complete documentation at** 
 ```
 Documentation/grammar.txt
 ```
