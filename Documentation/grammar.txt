@@ -15,6 +15,7 @@ Example:
 -   print x
 -   print 2
 -   print array_1
+
 Math --> math Category
 Syntax: math.mathfunction(inputs)
 Returns various mathematical functions based off inputs provided by user such as trigfunction, quadFunction, etc...
