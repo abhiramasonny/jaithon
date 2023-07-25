@@ -1,9 +1,9 @@
 #NOTE THIS IS A TESTS FILE.
 #comparrisions test
 var nums = 1
-var lessthan = nums<3 #output should be 1
+var lessthan = nums<3
 print lessthan
-var greatorthan = nums>3 # output should be 0
+var greatorthan = nums>3
 print greatorthan
 if lessthan then do print 1
 
