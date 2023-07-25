@@ -438,7 +438,11 @@ double quadFunction() {
     if (discriminant > 0) {
         root1 = (-b + sqrt(discriminant)) / (2 * a);
         root2 = (-b - sqrt(discriminant)) / (2 * a);
-        return root1;
+        if (root1>root2){
+            return root1;
+        } else {
+            return root2;
+        }
     } else if (discriminant == 0) {
         root1 = root2 = -b / (2 * a);
         return root1;
