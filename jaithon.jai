@@ -66,6 +66,12 @@ var t = time()
 print t
 
 #import calculator
+
+#not test
 var c = 1
 var c = c not
 print c
+
+#quadratic test
+var q = quad(1,2,1)
+print q
