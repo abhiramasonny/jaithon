@@ -6,7 +6,7 @@
 #include <time.h>
 #include <stdbool.h>
 #define MAX_IMPORTED_FILES 256
-bool debug = true;
+bool debug = false;
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 typedef enum {
@@ -30,6 +30,7 @@ typedef enum {
     TOKEN_ACOS,
     TOKEN_ATAN,
     TOKEN_SQRT,
+    TOKEN_QUADRATIC,
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
@@ -84,6 +85,7 @@ void program();
 void array();
 void importFile(const char *filename);
 void skipToEndOfInput();
+double quadFunction();
 
 void lexer(char *code) {
     input = code;
@@ -207,6 +209,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "sqrt", 4) == 0) {
         currentToken.type = TOKEN_SQRT;
+        input += 4;
+    } else if (strncmp(input, "quad", 4) == 0) {
+        currentToken.type = TOKEN_QUADRATIC;
         input += 4;
     } else if (strncmp(input, "input", 5) == 0) {
         currentToken.type = TOKEN_INPUT;
@@ -419,6 +424,29 @@ double timeFunction() {
     return getTimeInSeconds();
 }
 
+double quadFunction() {
+    double a, b, c, discriminant, root1, root2;
+    eat(TOKEN_QUADRATIC);
+    eat(TOKEN_LPAREN);
+    a = expression();
+    eat(TOKEN_COMMA);
+    b = expression();
+    eat(TOKEN_COMMA);
+    c = expression();
+    eat(TOKEN_RPAREN);
+    discriminant = b * b - 4 * a * c;
+    if (discriminant > 0) {
+        root1 = (-b + sqrt(discriminant)) / (2 * a);
+        root2 = (-b - sqrt(discriminant)) / (2 * a);
+        return root1;
+    } else if (discriminant == 0) {
+        root1 = root2 = -b / (2 * a);
+        return root1;
+    } else {
+        error("Imaginary nums not supported. ", "");
+        return 1;
+    }
+}
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
         double value = currentToken.value;
@@ -467,6 +495,9 @@ double factor() {
         return trigFunction();
     } else if (currentToken.type == TOKEN_TIME) {
         return timeFunction();
+    }
+    else if (currentToken.type == TOKEN_QUADRATIC) {
+        return quadFunction();
     }
     
 
