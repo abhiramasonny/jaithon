@@ -60,14 +60,7 @@ For more documentation, visit
 Documentation/grammar.txt
 ```
 <br>
-
-<br>
-<br>
-
-<br>
-
-*yes you cant do a helloworld in this language*
-
+Even though strings work, the input statement only works with variables.
 
 ## Flowchart: JAI Programming Language Interpreter
 
