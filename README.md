@@ -20,6 +20,7 @@ To use the array compiler/interpreter on UNIX, follow these steps:
 ```bash 
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
+chmod +x start.sh
 ./start.sh
 ```
 **You must have gcc and Make installed otherwise the script wont work.**
@@ -32,7 +33,7 @@ jaithon
 5. Execute the compiler/interpreter with *filename* as input.
 6. The programs output will be displayed.
 7. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
-8. If you do this, you will need to run **make** again, to recompile the binary.
+8. If you do this, you will need to run **./start.sh** again, to recompile the binary.
 
 ## Features
 
