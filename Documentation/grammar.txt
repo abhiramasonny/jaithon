@@ -7,6 +7,15 @@ Example:
 -   var y = x
 -   var z = y + x
 
+Strings --> var keyword 
+Syntax: var variable_name Identifier "string"
+This code saves a variable_name in memory with the value of a string
+Return type: No return type
+Example: 
+-   var x = "helloworld"
+-   var y = "jaithon"
+-   var z = "JAITHONNN"
+
 Print Statement --> print keyword
 Syntax: print value
 This statement prints out the specified values to console.
