@@ -37,6 +37,7 @@ jaithon
 ## Features
 
 - Variable Assignment: You can assign values to variables using the var keyword. Syntax: *var x = 5*
+- String: You can do strings by doing same as variable but with Quotes. Sytnax: *var hi = "hello world"*
 - Array Declaration: You can init arrays using the array keyword. Syntax: *array arr = [1]*
 - Array Element Modification: You can modify elements of an array using the dot notation. Syntax: *arr.add(0, 4).*
 - Print Statement: You can use the print keyword to print values to the console. Syntax: *print x*
@@ -60,7 +61,6 @@ Documentation/grammar.txt
 ```
 <br>
 
-**Note:** Strings are not supported in any part of this language yet, including the print statement. 
 <br>
 <br>
 
