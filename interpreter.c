@@ -101,9 +101,12 @@ void skipToEndOfInput() {
         advance();
     }
 }
-
+int lines = 1;
 void advance() {
     while (isspace(*input)) {
+        if (*input == '\n') {
+            lines++;
+        }
         input++;
     }
     if (*input == '#') {
