@@ -6,7 +6,7 @@
 #include <time.h>
 #include <stdbool.h>
 #define MAX_IMPORTED_FILES 256
-#define debug true
+#define debug false
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 typedef enum {
@@ -304,7 +304,9 @@ void ifStatement() {
     }
 }
 void setStringValue(const char *name, const char *value) {
-     printf("\033[1;31mSetting String %s to\033[0m \033[1;34m%s\033[0m\n", name, value);
+    if(debug){
+        printf("\033[1;31mSetting String %s to\033[0m \033[1;34m%s\033[0m\n", name, value);
+    }
     for (int i = 0; i < numVariables; i++) {
         if (strcmp(name, variables[i].name) == 0) {
             strcpy(variables[i].stringValue, value);
