@@ -46,13 +46,15 @@ typedef enum {
     TOKEN_NOT,
     TOKEN_IF,
     TOKEN_DO,
-    TOKEN_THEN
+    TOKEN_THEN,
+    TOKEN_STRING,
 } TokenType;
 
 typedef struct {
     TokenType type;
     double value;
     char identifier[256];
+    char string[256];
 } Token;
 
 Token currentToken;
@@ -61,6 +63,7 @@ char *input;
 typedef struct {
     char name[256];
     double value;
+    char stringValue[256]; 
     int isArray;
     double *elements;
     int size;
@@ -244,6 +247,16 @@ void advance() {
             input++;
         }
         currentToken.identifier[i] = '\0';
+    } else if (*input == '\"') {
+        input++;
+        currentToken.type = TOKEN_STRING;
+        int i = 0;
+        while (*input && *input != '\"') {
+            currentToken.string[i++] = *input;
+            input++;
+        }
+        currentToken.string[i] = '\0';
+        input++;
     } else {
         error("Invalid token", input);
     }
@@ -287,6 +300,29 @@ void ifStatement() {
         skipToEnd();
     }
 }
+void setStringValue(const char *name, const char *value) {
+     printf("\033[1;31mSetting String %s to\033[0m \033[1;34m%s\033[0m\n", name, value);
+    for (int i = 0; i < numVariables; i++) {
+        if (strcmp(name, variables[i].name) == 0) {
+            strcpy(variables[i].stringValue, value);
+            return;
+        }
+    }
+    strcpy(variables[numVariables].name, name);
+    strcpy(variables[numVariables].stringValue, value);
+    numVariables++;
+}
+
+const char* getStringValue(const char *name) {
+    for (int i = 0; i < numVariables; i++) {
+        if (strcmp(name, variables[i].name) == 0) {
+            return variables[i].stringValue;
+        }
+    }
+    error("Variable not found", name);
+    return 0;
+}
+
 void importFile(const char *filename) {
     FILE *file = fopen(filename, "r");
     if (file == NULL) {
@@ -616,9 +652,15 @@ void assignment() {
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_ASSIGN);
-    double value = expression();
-    setVariableValue(identifier, value);
+    if (currentToken.type == TOKEN_STRING) {
+        setStringValue(identifier, currentToken.string);
+        eat(TOKEN_STRING);
+    } else {
+        double value = expression();
+        setVariableValue(identifier, value);
+    }
 }
+
 
 void arrayAssignment() {
     char identifier[256];
@@ -659,7 +701,17 @@ void printStatement() {
         char identifier[256];
         strcpy(identifier, currentToken.identifier);
         eat(TOKEN_IDENTIFIER);
-
+        int isString = 0;
+        for (int i = 0; i < numVariables; i++) {
+            if (strcmp(identifier, variables[i].name) == 0) {
+                isString = strlen(variables[i].stringValue) > 0;
+                break;
+            }
+        }
+        if (isString) {
+            printf("%s\n", getStringValue(identifier));
+            return;
+        } 
         int isArray = 0;
         for (int i = 0; i < numVariables; i++) {
             if (strcmp(identifier, variables[i].name) == 0) {
@@ -682,7 +734,6 @@ void printStatement() {
                 }
             }
         }
-
         double value = getVariableValue(identifier);
         printf("%f\n", value);
     } else {
