@@ -16,12 +16,13 @@ The primary problem JAITHON addresses is the stress often felt by young learners
 
 ## Usage
 
-To use the array compiler/interpreter, follow these steps:
+To use the array compiler/interpreter on UNIX, follow these steps:
 ```bash 
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
 ./start.sh
 ```
+**You must have gcc and Make installed otherwise the script wont work.**
 Then type this as follow up to *Enter file name to interpret*
 ```
 jaithon
