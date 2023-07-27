@@ -169,3 +169,12 @@ Example:
 -   var value = math.pyth(3,4)
 -   var value = math.pyth(a,4)
 -   var value = math.pyth(a,b)
+
+Binary Conversion --> bin function
+Syntax: var variable_name = math.bin(n)
+This code takes in a value as input, and returns the binary version of that value.
+Return type: Returns to a variable the binary of n.
+Example:
+-   var value = math.bin(3)
+-   var value = math.bin(a)
+-   var value = math.bin(-100.5)
