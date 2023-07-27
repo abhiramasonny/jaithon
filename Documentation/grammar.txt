@@ -14,7 +14,7 @@ Return type: No return type
 Example: 
 -   var x = "helloworld"
 -   var y = "jaithon"
--   var z = "JAITHONNN"
+-   var z = "JAITHON"
 
 Print Statement --> print keyword
 Syntax: print value
