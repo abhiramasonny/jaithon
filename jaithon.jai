@@ -98,3 +98,8 @@ var nice = "Are Not Equal"
 if dd not then do print nice
 var o = value1 or value2
 print o
+
+var x = 1
+var xy = 1
+var xyz = x xor xy
+print xyz

@@ -57,6 +57,7 @@ typedef enum {
     TOKEN_AND,
     TOKEN_OR,
     TOKEN_NOT,
+    TOKEN_XOR,
 } TokenType;
 
 typedef struct {
@@ -284,6 +285,9 @@ void advance() {
         input += 3;
     } else if (strncmp(input, "and", 3) == 0) {
         currentToken.type = TOKEN_AND;
+        input += 3;
+    } else if (strncmp(input, "xor", 3)== 0){
+        currentToken.type = TOKEN_XOR;
         input += 3;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
@@ -746,7 +750,7 @@ double expression() {
     double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
-           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND || currentToken.type == TOKEN_OR) {
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND || currentToken.type == TOKEN_OR || currentToken.type == TOKEN_XOR) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
@@ -792,6 +796,14 @@ double expression() {
                 value = 1.0;
             } else{
                 value = 0.0;
+            }
+        } else if(currentToken.type == TOKEN_XOR) {
+            eat(TOKEN_XOR);
+            double value2 = term();
+            if(value && value2 || !(value && value2)){
+                value = 0;
+            } else if (value || value2){
+                value = 1;
             }
         }
     }
