@@ -10,6 +10,7 @@
 
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
+int lines = 1;
 
 typedef enum {
     TOKEN_EOF,
@@ -122,19 +123,20 @@ void lexer(char *code) {
     input = code;
     advance();
 }
+
 void skipToEndOfInput() {
     while (currentToken.type != TOKEN_EOF) {
         advance();
     }
 }
-int lines = 1;
+
 void advance() {
     while (isspace(*input)) {
         if (*input == '\n') {
             lines++;
         }
         input++;
-    }
+    } 
     if (*input == '#') {
         while (*input && *input != '\n') {
             input++;
@@ -151,10 +153,7 @@ void advance() {
         int isFloat = 0;
         char *start = input;
 
-        if (*start == '-') {
-            start++;
-        }
-
+        if (*start == '-') {start++;}
         while (*input && ((*input >= '0' && *input <= '9') || *input == '.')) {
             if (*input == '.') {
                 isFloat = 1;
@@ -316,9 +315,8 @@ void error(const char *message, const char *errorToken) {
 
 void eat(TokenType type) {
     if (currentToken.type == type) {
-
         advance();
-        
+
     } else {
         char tokenName[256];
         snprintf(tokenName, sizeof(tokenName), "%d", currentToken.type);
@@ -326,6 +324,7 @@ void eat(TokenType type) {
         exit(1);
     }
 }
+
 void skipToEnd(){
     while (*input && *input != '\n') {
             input++;
@@ -333,12 +332,13 @@ void skipToEnd(){
     advance();
     return;
 }
+
 void ifStatement() {
     eat(TOKEN_IF);
     double conditionValue = expression();
     eat(TOKEN_THEN);
     eat(TOKEN_DO);
-    if (conditionValue != 0) { // Treat any non-zero value as true
+    if (conditionValue != 0) {  //Remember, 0 is false cus im too lazy to code in actuall boolean logic
         if(debug){
             printf("\033[1;32mRunning if statement loop.\033[0m\n");
         }
@@ -347,6 +347,7 @@ void ifStatement() {
         skipToEnd();
     }
 }
+
 void setStringValue(const char *name, const char *value) {
     if(debug){
         printf("\033[1;31mSetting String %s to\033[0m \033[1;34m%s\033[0m\n", name, value);
@@ -397,8 +398,8 @@ void importFile(const char *filename) {
         free(importedCode);
         exit(1);
     }
-    importedCode[fileSize] = '\0';
 
+    importedCode[fileSize] = '\0';
     fclose(file);
 
     char *tempInput = input;
@@ -541,6 +542,7 @@ double quadFunction() {
         return 1;
     }
 }
+
 double pythagoreanTheorem() {
     double a, b, c;
     eat(TOKEN_PYTHAGOREAN);
@@ -552,6 +554,7 @@ double pythagoreanTheorem() {
     c = sqrt(a*a+b*b);
     return c;
 }
+
 double decimalToBinary(double n) {
     int isNegative = 0;
     if (n < 0) {
@@ -584,15 +587,6 @@ double decimalToBinary(double n) {
 
     double result = binaryIntegerPart + binaryFractionalPart;
     return isNegative ? -result : result;
-}
-
-double binaryConversion(){
-    double n;
-    eat(TOKEN_LPAREN);
-    n=(double)expression();
-    eat(TOKEN_RPAREN);
-    double ans = decimalToBinary(n);
-    return ans;
 }
 
 double binaryToTen(double n) {
@@ -642,6 +636,15 @@ double binaryAdd(){
     dec2 = binaryToTen(b2);
     double n = dec1+dec2;
     return decimalToBinary(n);
+}
+
+double binaryConversion(){
+    double n;
+    eat(TOKEN_LPAREN);
+    n=(double)expression();
+    eat(TOKEN_RPAREN);
+    double ans = decimalToBinary(n);
+    return ans;
 }
 
 double factor() {
@@ -796,7 +799,7 @@ double expression() {
     return value;
 }
 
-//cos sin tan asin acos atan sqrt... is sqrt a trig function lmao
+//cos sin tan asin acos atan sqrt. Started out as trig, and now is basically one args math.
 double trigFunction() {
     TokenType functionType = currentToken.type;
     eat(functionType);
@@ -839,7 +842,6 @@ void assignment() {
         setVariableValue(identifier, value);
     }
 }
-
 
 void arrayAssignment() {
     char identifier[256];
