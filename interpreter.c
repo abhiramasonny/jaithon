@@ -273,7 +273,7 @@ void advance() {
         currentToken.string[i] = '\0';
         input++;
     } else {
-        error("Invalid token", input);
+        error("This token is not yet supported. Invalid Token", input);
     }
 }
 
