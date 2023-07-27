@@ -79,6 +79,9 @@ var q = math.quad(1,2,1)
 print q
 var p = math.pyth(3,4)
 print p
+var b = math.bin(10)
+print b
+
 var jaithon = "jaithon"
 print jaithon
 var hello = "Hello World"

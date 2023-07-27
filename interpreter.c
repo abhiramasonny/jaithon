@@ -33,6 +33,7 @@ typedef enum {
     TOKEN_QUADRATIC,
     TOKEN_MATH,
     TOKEN_PYTHAGOREAN,
+    TOKEN_BINARY,
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
@@ -196,6 +197,9 @@ void advance() {
         input += 5;
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
+        input += 3;
+    } else if (strncmp(input, "bin", 3) == 0) {
+        currentToken.type = TOKEN_BINARY;
         input += 3;
     } else if (strncmp(input, "array", 5) == 0) {
         currentToken.type = TOKEN_ARRAY;
@@ -508,6 +512,50 @@ double pythagoreanTheorem() {
     c = sqrt(a*a+b*b);
     return c;
 }
+double decimalToBinary(double n) {
+    int isNegative = 0;
+    if (n < 0) {
+        isNegative = 1;
+        n = -n;
+    }
+
+    int integerPart = (int)n;
+    double fractionalPart = n - integerPart;
+
+    long long binaryIntegerPart = 0;
+    int i = 0;
+    while (integerPart > 0) {
+        binaryIntegerPart += (integerPart % 2) * pow(10, i);
+        integerPart /= 2;
+        ++i;
+    }
+
+    double binaryFractionalPart = 0;
+    i = -1;
+    while (fractionalPart > 0 && i > -6) {
+        fractionalPart *= 2;
+        int bit = (int)fractionalPart;
+        if (bit == 1) {
+            fractionalPart -= bit;
+            binaryFractionalPart += pow(10, i);
+        }
+        --i;
+    }
+
+    double result = binaryIntegerPart + binaryFractionalPart;
+    return isNegative ? -result : result;
+}
+
+double binary(){
+    double n;
+    eat(TOKEN_BINARY);
+    eat(TOKEN_LPAREN);
+    n=(double)expression();
+    eat(TOKEN_RPAREN);
+    double ans = decimalToBinary(n);
+    return ans;
+}
+
 double factor() {
     if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_FLOAT) {
         double value = currentToken.value;
@@ -564,6 +612,8 @@ double factor() {
             return trigFunction();
         } else if(currentToken.type == TOKEN_PYTHAGOREAN){
             return pythagoreanTheorem();
+        } else if(currentToken.type == TOKEN_BINARY){
+            return binary();
         }
     }
     
