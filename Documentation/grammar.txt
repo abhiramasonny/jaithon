@@ -125,7 +125,7 @@ Example:
 -   import file1
 -   import test40
 
-Not --> Not keyword
+Not --> not keyword
 Syntax: term not
 This code assumes 1s are true, and 0s are false. It returns the logical inversive of the statement.
 Return type: Opposite of statement
@@ -133,6 +133,15 @@ Example:
 -   var a = c not
 -   var a = 1 not
 -   var a = 0 not
+
+And --> and keyword
+Syntax: term and term
+This code assumes 1s are true, and 0s are false. It returns the logical and of the statement.
+Return type: and of statements
+Example:
+-   var a = c and a
+-   var a = 1 and 1
+-   var a = 0 and 0
 
 Comparisons --> >,< keywords
 Syntax: term comparison term
