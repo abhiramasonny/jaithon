@@ -86,3 +86,8 @@ var jaithon = "jaithon"
 print jaithon
 var hello = "Hello World"
 print hello
+
+var value1 = 1
+var value2 = 1
+var d = value1 and value2
+print d

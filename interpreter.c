@@ -49,6 +49,7 @@ typedef enum {
     TOKEN_DO,
     TOKEN_THEN,
     TOKEN_STRING,
+    TOKEN_AND,
 } TokenType;
 
 typedef struct {
@@ -245,6 +246,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "not", 3) == 0) {
         currentToken.type = TOKEN_NOT;
+        input += 3;
+    } else if (strncmp(input, "and", 3) == 0) {
+        currentToken.type = TOKEN_AND;
         input += 3;
     } else if (isalpha(*input)) {
         currentToken.type = TOKEN_IDENTIFIER;
@@ -646,7 +650,7 @@ double expression() {
     double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
-           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_NOT) {
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
@@ -665,6 +669,14 @@ double expression() {
                 value = 0.0;
             } else{
                 value = 1.0;
+            }
+        } else if (currentToken.type == TOKEN_AND) {
+            eat(TOKEN_AND);
+            double value2 = term();
+            if(value&&value2){
+                value = 1.0;
+            } else{
+                value = 0.0;
             }
         }
     }
