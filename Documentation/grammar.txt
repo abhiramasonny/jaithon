@@ -186,4 +186,13 @@ Return type: Returns to a variable the binary of n.
 Example:
 -   var value = math.bin.conv(3)
 -   var value = math.bin.conv(a)
--   var value = math.bin.conv(-100.5)
+-   var value = math.bin.conv(-100.2)
+
+Binary Addition --> bin.badd function
+Syntax: var variable_name = math.bin.badd(b1,b2)
+This code takes in 2 values as input, and returns the addition of those values.
+Return type: Returns to a variable the binary addition of b1 and b2.
+Example:
+-   var value = math.bin.badd(1010,1)
+-   var value = math.bin.badd(111,a)
+-   var value = math.bin.badd(-11.1, 101)
