@@ -79,8 +79,10 @@ var q = math.quad(1,2,1)
 print q
 var p = math.pyth(3,4)
 print p
-var b = math.bin(10)
+var b = math.bin.conv(10)
 print b
+var bb = math.bin.badd(10,10)
+print bb
 
 var jaithon = "jaithon"
 print jaithon
