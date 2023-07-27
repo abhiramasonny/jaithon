@@ -7,9 +7,12 @@
 #include <stdbool.h>
 #define MAX_IMPORTED_FILES 256
 #define debug false
+
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
+
 typedef enum {
+    TOKEN_EOF,
     TOKEN_INT,
     TOKEN_FLOAT,
     TOKEN_PLUS,
@@ -20,9 +23,10 @@ typedef enum {
     TOKEN_RPAREN,
     TOKEN_PRINT,
     TOKEN_VAR,
+    TOKEN_STRING,
     TOKEN_ASSIGN,
     TOKEN_IDENTIFIER,
-    TOKEN_EOF,
+    TOKEN_MATH,
     TOKEN_SIN,
     TOKEN_COS,
     TOKEN_TAN,
@@ -31,10 +35,10 @@ typedef enum {
     TOKEN_ATAN,
     TOKEN_SQRT,
     TOKEN_QUADRATIC,
-    TOKEN_MATH,
     TOKEN_PYTHAGOREAN,
     TOKEN_BINARY,
     TOKEN_CONV,
+    TOKEN_BADD,
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
@@ -45,15 +49,13 @@ typedef enum {
     TOKEN_IMPORT,
     TOKEN_GREATER_THAN,
     TOKEN_LESS_THAN,
-    TOKEN_NOT,
-    TOKEN_IF,
-    TOKEN_DO,
-    TOKEN_THEN,
-    TOKEN_STRING,
-    TOKEN_AND,
     TOKEN_EQ,
+    TOKEN_IF,
+    TOKEN_THEN,
+    TOKEN_DO,
+    TOKEN_AND,
     TOKEN_OR,
-    TOKEN_BADD,
+    TOKEN_NOT,
 } TokenType;
 
 typedef struct {
@@ -97,6 +99,24 @@ void array();
 void importFile(const char *filename);
 void skipToEndOfInput();
 double quadFunction();
+void skipToEnd();
+void ifStatement();
+void setStringValue(const char *name, const char *value);
+const char* getStringValue(const char *name);
+double getVariableValue(const char *name);
+void setVariableValue(const char *name, double value);
+void setArrayValue(const char *name, int index, double value);
+void deleteArrayValue(const char *name, int index);
+void sortArray(double *array, int size);
+void arraySort(const char *name);
+double getTimeInSeconds();
+double timeFunction();
+double quadFunction();
+double pythagoreanTheorem();
+double decimalToBinary(double n);
+double binaryConversion();
+double binaryToTen(double n);
+double binaryAdd();
 
 void lexer(char *code) {
     input = code;
@@ -574,6 +594,7 @@ double binaryConversion(){
     double ans = decimalToBinary(n);
     return ans;
 }
+
 double binaryToTen(double n) {
     int isNegative = 0;
     if (n < 0) {
