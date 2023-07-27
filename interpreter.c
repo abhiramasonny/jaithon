@@ -1031,10 +1031,10 @@ int main() {
         free(code);
         return 1;
     }
+
     code[fileSize] = '\0';
-
     fclose(file);
-
+    
     lexer(code);
     program();
 
