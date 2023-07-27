@@ -50,6 +50,7 @@ typedef enum {
     TOKEN_THEN,
     TOKEN_STRING,
     TOKEN_AND,
+    TOKEN_EQ
 } TokenType;
 
 typedef struct {
@@ -193,6 +194,9 @@ void advance() {
     } else if (strncmp(input, "then", 4) == 0) {
         currentToken.type = TOKEN_THEN;
         input += 4;
+    } else if (strncmp(input, "eq", 2) == 0) {
+        currentToken.type = TOKEN_EQ;
+        input += 2;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
@@ -650,7 +654,7 @@ double expression() {
     double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
-           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND) {
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
@@ -660,6 +664,9 @@ double expression() {
         } else if (currentToken.type == TOKEN_GREATER_THAN) {
             eat(TOKEN_GREATER_THAN);
             value = (value > term()) ? 1.0 : 0.0;
+        } else if (currentToken.type == TOKEN_EQ) {
+            eat(TOKEN_EQ);
+            value = (value = term()) ? 1.0 : 0.0;
         } else if (currentToken.type == TOKEN_LESS_THAN) {
             eat(TOKEN_LESS_THAN);
             value = (value < term()) ? 1.0 : 0.0;
