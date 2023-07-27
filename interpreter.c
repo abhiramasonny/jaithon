@@ -842,7 +842,7 @@ void assignment() {
         setVariableValue(identifier, value);
     }
 }
- 
+
 void arrayAssignment() {
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
