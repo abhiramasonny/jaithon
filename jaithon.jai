@@ -88,6 +88,8 @@ var hello = "Hello World"
 print hello
 
 var value1 = 1
-var value2 = 1
+var value2 = 0
 var d = value1 and value2
 print d
+var dd = value1 eq value2
+print dd
