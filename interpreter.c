@@ -875,7 +875,7 @@ void arrayAssignment() {
         error("Invalid array method", currentToken.identifier);
     }
 }
-
+ 
 void printStatement() {
     eat(TOKEN_PRINT);
     if (currentToken.type == TOKEN_IDENTIFIER) {
