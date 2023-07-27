@@ -34,6 +34,7 @@ typedef enum {
     TOKEN_MATH,
     TOKEN_PYTHAGOREAN,
     TOKEN_BINARY,
+    TOKEN_CONV,
     TOKEN_ARRAY,
     TOKEN_COMMA,
     TOKEN_LBRACKET,
@@ -52,6 +53,7 @@ typedef enum {
     TOKEN_AND,
     TOKEN_EQ,
     TOKEN_OR,
+    TOKEN_BADD,
 } TokenType;
 
 typedef struct {
@@ -210,6 +212,9 @@ void advance() {
     } else if (strncmp(input, "bin", 3) == 0) {
         currentToken.type = TOKEN_BINARY;
         input += 3;
+    } else if (strncmp(input, "badd", 4) == 0) {
+        currentToken.type = TOKEN_BADD;
+        input += 4;
     } else if (strncmp(input, "array", 5) == 0) {
         currentToken.type = TOKEN_ARRAY;
         input += 5;
@@ -239,6 +244,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "math", 4) == 0) {
         currentToken.type = TOKEN_MATH;
+        input += 4;
+    } else if (strncmp(input, "conv", 4) == 0) {
+        currentToken.type = TOKEN_CONV;
         input += 4;
     } else if (strncmp(input, "pyth", 4) == 0) {
         currentToken.type = TOKEN_PYTHAGOREAN;
@@ -558,14 +566,61 @@ double decimalToBinary(double n) {
     return isNegative ? -result : result;
 }
 
-double binary(){
+double binaryConversion(){
     double n;
-    eat(TOKEN_BINARY);
     eat(TOKEN_LPAREN);
     n=(double)expression();
     eat(TOKEN_RPAREN);
     double ans = decimalToBinary(n);
     return ans;
+}
+double binaryToTen(double n) {
+    int isNegative = 0;
+    if (n < 0) {
+        isNegative = 1;
+        n = -n;
+    }
+
+    long long integerPart = (long long)n;
+    double fractionalPart = n - integerPart;
+
+    double decimalIntegerPart = 0;
+    int i = 0;
+    while (integerPart > 0) {
+        if (integerPart % 10 == 1) {
+            decimalIntegerPart += pow(2, i);
+        }
+        integerPart /= 10;
+        ++i;
+    }
+
+    double decimalFractionalPart = 0;
+    i = -1;
+    while (fractionalPart > 0 && i > -6) {
+        double bit = fractionalPart * 10;
+        if (bit >= 1) {
+            fractionalPart = bit - (int)bit;
+            decimalFractionalPart += pow(2, i);
+        } else {
+            fractionalPart = bit;
+        }
+        --i;
+    }
+
+    double result = decimalIntegerPart + decimalFractionalPart;
+    return isNegative ? -result : result;
+}
+double binaryAdd(){
+    double b1, b2, dec1, dec2, ans;
+    eat(TOKEN_LPAREN);
+    b1=(double)expression();
+    eat(TOKEN_COMMA);
+    b2=(double)expression();
+    eat(TOKEN_RPAREN);
+    dec1 = binaryToTen(b1);
+    dec2 = binaryToTen(b2);
+    double n = dec1+dec2;
+    return decimalToBinary(n);
 }
 
 double factor() {
@@ -625,7 +680,16 @@ double factor() {
         } else if(currentToken.type == TOKEN_PYTHAGOREAN){
             return pythagoreanTheorem();
         } else if(currentToken.type == TOKEN_BINARY){
-            return binary();
+            eat(TOKEN_BINARY);
+            eat(TOKEN_DOT);
+            if(currentToken.type == TOKEN_CONV){
+                eat(TOKEN_CONV);
+                return binaryConversion();
+            } else if(currentToken.type == TOKEN_BADD){
+                eat(TOKEN_BADD);
+                return binaryAdd();
+
+            }
         }
     }
     
