@@ -50,7 +50,8 @@ typedef enum {
     TOKEN_THEN,
     TOKEN_STRING,
     TOKEN_AND,
-    TOKEN_EQ
+    TOKEN_EQ,
+    TOKEN_OR,
 } TokenType;
 
 typedef struct {
@@ -196,6 +197,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "eq", 2) == 0) {
         currentToken.type = TOKEN_EQ;
+        input += 2;
+    } else if (strncmp(input, "or", 2) == 0) {
+        currentToken.type = TOKEN_OR;
         input += 2;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
@@ -654,7 +658,7 @@ double expression() {
     double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
-           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND) {
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND || currentToken.type == TOKEN_OR) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
@@ -666,7 +670,11 @@ double expression() {
             value = (value > term()) ? 1.0 : 0.0;
         } else if (currentToken.type == TOKEN_EQ) {
             eat(TOKEN_EQ);
-            value = (value = term()) ? 1.0 : 0.0;
+            if(value == term()){
+                value = 1;
+            } else {
+                value = 0;
+            }
         } else if (currentToken.type == TOKEN_LESS_THAN) {
             eat(TOKEN_LESS_THAN);
             value = (value < term()) ? 1.0 : 0.0;
@@ -685,6 +693,14 @@ double expression() {
             eat(TOKEN_AND);
             double value2 = term();
             if(value&&value2){
+                value = 1.0;
+            } else{
+                value = 0.0;
+            }
+        } else if (currentToken.type == TOKEN_OR) {
+            eat(TOKEN_OR);
+            double value2 = term();
+            if(value||value2){
                 value = 1.0;
             } else{
                 value = 0.0;
