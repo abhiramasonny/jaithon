@@ -1,4 +1,4 @@
-#NOTE THIS IS A TESTS FILE. ALL FEATURES MIGHT NOT BE INCLUDED
+#NOTE THIS IS A TESTS FILE.
 #comparrisions test
 var nums = 1
 var lessthan = nums<3
@@ -48,6 +48,11 @@ print result
 var value = 1.2
 var result = math.atan(value)
 print result
+
+#import calculator
+#input test
+#input x
+#print x
 
 #sqrt test
 var value = 64.0
