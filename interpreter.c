@@ -674,8 +674,12 @@ double expression() {
             eat(TOKEN_NOT);
             if(value==1){
                 value = 0.0;
-            } else{
+            } else if(value == 0){
                 value = 1.0;
+            } else{
+                char str[257];
+                sprintf(str, "%f", value);
+                error("The not keyword is a boolean operation supporting 1s and 0s", str);
             }
         } else if (currentToken.type == TOKEN_AND) {
             eat(TOKEN_AND);
