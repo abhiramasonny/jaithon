@@ -49,11 +49,6 @@ var value = 1.2
 var result = math.atan(value)
 print result
 
-#import calculator
-#input test
-#input x
-#print x
-
 #sqrt test
 var value = 64.0
 var result = math.sqrt(value)
