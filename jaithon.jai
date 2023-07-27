@@ -99,7 +99,7 @@ var dd = value1 eq value2
 
 print dd
 
-var nice = "Is equal"
-if value1 eq value2 then do print nice
+var nice = "Are Not Equal"
+if dd not then do print nice
 var o = value1 or value2
 print o
