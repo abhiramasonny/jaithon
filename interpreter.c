@@ -37,6 +37,7 @@ typedef enum {
     TOKEN_SQRT,
     TOKEN_QUADRATIC,
     TOKEN_PYTHAGOREAN,
+    TOKEN_FACTORIAL,
     TOKEN_BINARY,
     TOKEN_CONV,
     TOKEN_BADD,
@@ -119,6 +120,7 @@ double decimalToBinary(double n);
 double binaryConversion();
 double binaryToTen(double n);
 double binaryAdd();
+int factorial(int n);
 
 void lexer(char *code) {
     input = code;
@@ -207,6 +209,9 @@ void advance() {
         input++;
     } else if (*input == '=') {
         currentToken.type = TOKEN_ASSIGN;
+        input++;
+    } else if (*input == '!') {
+        currentToken.type = TOKEN_FACTORIAL;
         input++;
     } else if (strncmp(input, "if", 2) == 0) {
         currentToken.type = TOKEN_IF;
@@ -547,6 +552,14 @@ double quadFunction() {
     }
 }
 
+int factorial(int n) {
+    int fact = 1;
+    for(int i = 1; i <= n; i++) {
+        fact *= i;
+    }
+    return fact;
+}
+
 double pythagoreanTheorem() {
     double a, b, c;
     eat(TOKEN_PYTHAGOREAN);
@@ -750,7 +763,9 @@ double expression() {
     double value = term();
 
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
-           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN || currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND || currentToken.type == TOKEN_OR || currentToken.type == TOKEN_XOR) {
+           currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN ||
+           currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND || 
+           currentToken.type == TOKEN_OR || currentToken.type == TOKEN_XOR || currentToken.type == TOKEN_FACTORIAL) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
@@ -770,6 +785,9 @@ double expression() {
         } else if (currentToken.type == TOKEN_LESS_THAN) {
             eat(TOKEN_LESS_THAN);
             value = (value < term()) ? 1.0 : 0.0;
+        } else if (currentToken.type == TOKEN_FACTORIAL) {
+            eat(TOKEN_FACTORIAL);
+            value = factorial(value);
         } else if (currentToken.type == TOKEN_NOT) {
             eat(TOKEN_NOT);
             if(value==1){
