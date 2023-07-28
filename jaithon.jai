@@ -107,3 +107,6 @@ print xyz
 var fac = 5
 var fac = fac!
 print fac
+
+var exp = 5 ^ 3
+print exp
