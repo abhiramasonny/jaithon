@@ -32,6 +32,17 @@
         "tuple": "c",
         "type_traits": "c",
         "vector": "c",
-        "stdbool.h": "c"
+        "stdbool.h": "c",
+        "__hash_table": "c",
+        "__mutex_base": "c",
+        "__string": "c",
+        "__undef_macros": "c",
+        "algorithm": "c",
+        "cmath": "c",
+        "istream": "c",
+        "streambuf": "c",
+        "string": "c",
+        "string_view": "c",
+        "complex": "c"
     }
 }

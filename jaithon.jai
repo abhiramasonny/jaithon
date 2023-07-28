@@ -103,3 +103,7 @@ var x = 1
 var xy = 1
 var xyz = x xor xy
 print xyz
+
+var fac = 5
+var fac = fac!
+print fac
