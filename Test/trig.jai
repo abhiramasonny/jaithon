@@ -1,7 +1,6 @@
 var hypo = 0
 var adg = 0
-input degrees
-var radian = degrees * 3.1415/180
+input d
 input opposite
-var hypo = opposite / math.sin(radian)
+var hypo = opposite / math.sin(d, deg)
 print hypo

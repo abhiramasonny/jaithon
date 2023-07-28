@@ -36,6 +36,7 @@ typedef enum {
     TOKEN_ACOS,
     TOKEN_ATAN,
     TOKEN_SQRT,
+    TOKEN_DEGREES,
     TOKEN_QUADRATIC,
     TOKEN_PYTHAGOREAN,
     TOKEN_FACTORIAL,
@@ -241,6 +242,9 @@ void advance() {
         input += 5;
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
+        input += 3;
+    } else if (strncmp(input, "deg", 3) == 0) {
+        currentToken.type = TOKEN_DEGREES;
         input += 3;
     } else if (strncmp(input, "bin", 3) == 0) {
         currentToken.type = TOKEN_BINARY;
@@ -889,7 +893,17 @@ double argsMath() {
     TokenType functionType = currentToken.type;
     eat(functionType);
     eat(TOKEN_LPAREN);
+
     double value = expression();
+    if (currentToken.type != TOKEN_RPAREN && functionType != TOKEN_SQRT){
+        eat(TOKEN_COMMA);
+        if (currentToken.type == TOKEN_DEGREES){
+            value *= 3.1415926535/180;
+            eat(TOKEN_DEGREES);
+        } else{
+            error("Invalid trig setting, Either degrees or radians.", "");
+        }
+    }
     eat(TOKEN_RPAREN);
 
     switch (functionType) {
