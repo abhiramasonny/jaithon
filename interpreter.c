@@ -5,6 +5,7 @@
 #include <math.h>
 #include <time.h>
 #include <stdbool.h>
+#include <sys/time.h>
 #define MAX_IMPORTED_FILES 256
 #define debug false
 
@@ -1035,6 +1036,8 @@ int main() {
     char str[20];
     printf("Enter file name to interpret e.g., jaithon: ");
     scanf("%[^\n]%*c", str);
+    struct timeval stop, start;
+    gettimeofday(&start, NULL);
     char extension[5] = ".jai";
     strcat(str,extension);
     FILE *file = fopen(str, "r");
@@ -1069,6 +1072,9 @@ int main() {
     program();
 
     free(code);
-
+    gettimeofday(&stop, NULL);
+    if(debug){
+        printf("\033[1;31mTook %lu us\033[0m\n", (stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec);
+    }
     return 0;
 }
