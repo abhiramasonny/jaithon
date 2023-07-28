@@ -21,7 +21,7 @@ print a
 
 #sin test
 var angle = 0.5
-var result = math.sin(angle)
+var result = math.sin(angle, deg)
 print result
 
 #cos test
