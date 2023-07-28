@@ -110,3 +110,5 @@ print fac
 
 var exp = 5 ^ 3
 print exp
+var tt = math.root(3,125)
+print tt

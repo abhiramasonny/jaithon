@@ -40,6 +40,7 @@ typedef enum {
     TOKEN_PYTHAGOREAN,
     TOKEN_FACTORIAL,
     TOKEN_EXP,
+    TOKEN_ROOT,
     TOKEN_BINARY,
     TOKEN_CONV,
     TOKEN_BADD,
@@ -124,6 +125,7 @@ double binaryToTen(double n);
 double binaryAdd();
 int factorial(int n);
 double expon(double base, double p);
+double nthRoot();
 
 void lexer(char *code) {
     input = code;
@@ -245,6 +247,9 @@ void advance() {
         input += 3;
     } else if (strncmp(input, "badd", 4) == 0) {
         currentToken.type = TOKEN_BADD;
+        input += 4;
+    } else if (strncmp(input, "root", 4) == 0) {
+        currentToken.type = TOKEN_ROOT;
         input += 4;
     } else if (strncmp(input, "array", 5) == 0) {
         currentToken.type = TOKEN_ARRAY;
@@ -573,6 +578,35 @@ double expon(double base, double p) {
     return pow(base, p);
 }
 
+double nthRoot(){
+    eat(TOKEN_ROOT);
+    eat(TOKEN_LPAREN);
+    double n = expression();
+    eat(TOKEN_COMMA);
+    double value = expression();
+    eat(TOKEN_RPAREN);
+    if(value < 0 || n <= 0) {
+        return NAN;
+    }
+    if(n == 2){
+        return sqrt(value);
+    }
+    
+    double x = 1;
+    double eps = 0.001; 
+
+    while(1) {
+        double diff = value - pow(x, n);
+        if(fabs(diff) <= eps) {
+            break;
+        }
+
+        x = x + diff / (n * pow(x, n - 1));
+    }
+
+    return x;
+}
+
 double pythagoreanTheorem() {
     double a, b, c;
     eat(TOKEN_PYTHAGOREAN);
@@ -734,6 +768,8 @@ double factor() {
             return argsMath();
         } else if(currentToken.type == TOKEN_PYTHAGOREAN){
             return pythagoreanTheorem();
+        } else if(currentToken.type == TOKEN_ROOT){
+            return nthRoot();
         } else if(currentToken.type == TOKEN_BINARY){
             eat(TOKEN_BINARY);
             eat(TOKEN_DOT);
