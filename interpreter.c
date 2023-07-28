@@ -90,7 +90,7 @@ void eat(TokenType type);
 double factor();
 double term();
 double expression();
-double trigFunction();
+double argsMath();
 void assignment();
 void arrayAssignment();
 void arrayDeletion();
@@ -718,7 +718,7 @@ double factor() {
                    currentToken.type == TOKEN_ACOS||
                    currentToken.type == TOKEN_ATAN||
                    currentToken.type == TOKEN_SQRT) {
-            return trigFunction();
+            return argsMath();
         } else if(currentToken.type == TOKEN_PYTHAGOREAN){
             return pythagoreanTheorem();
         } else if(currentToken.type == TOKEN_BINARY){
@@ -831,7 +831,7 @@ double expression() {
 }
 
 //cos sin tan asin acos atan sqrt. Started out as trig, and now is basically one args math.
-double trigFunction() {
+double argsMath() {
     TokenType functionType = currentToken.type;
     eat(functionType);
     eat(TOKEN_LPAREN);
