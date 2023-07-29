@@ -127,6 +127,11 @@ double binaryAdd();
 int factorial(int n);
 double expon(double base, double p);
 double nthRoot();
+/* ---to code---
+double slopForm(); 
+bool isPrimeNumber(long long num);
+double distanceFormula();
+*/
 
 void lexer(char *code) {
     input = code;
