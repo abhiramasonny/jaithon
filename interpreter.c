@@ -64,6 +64,8 @@ typedef enum {
     TOKEN_NOT,
     TOKEN_XOR,
     TOKEN_DIST,
+    TOKEN_WHILE,
+    TOKEN_DONE,
 } TokenType;
 
 typedef struct {
@@ -75,7 +77,7 @@ typedef struct {
 
 Token currentToken;
 char *input;
-
+char *orgInput;
 typedef struct {
     char name[256];
     double value;
@@ -129,10 +131,6 @@ int factorial(int n);
 double expon(double base, double p);
 double nthRoot();
 double distance(double ax, double ay, double bx, double by);
-/* ---to code---
-double slopForm(); 
-bool isPrimeNumber(long long num);
-*/
 
 void lexer(char *code) {
     input = code;
@@ -243,11 +241,17 @@ void advance() {
     } else if (strncmp(input, "or", 2) == 0) {
         currentToken.type = TOKEN_OR;
         input += 2;
+    } else if (strncmp(input, "while", 5) == 0) {
+        currentToken.type = TOKEN_WHILE;
+        input += 5;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
+        input += 3;
+    } else if (strncmp(input, "dun", 3) == 0) {
+        currentToken.type = TOKEN_DONE;
         input += 3;
     } else if (strncmp(input, "deg", 3) == 0) {
         currentToken.type = TOKEN_DEGREES;
@@ -379,6 +383,26 @@ void ifStatement() {
     } else{
         skipToEnd();
     }
+}
+
+void whileStatement() {
+    char *start = input;
+    Token startToken = currentToken;
+    eat(TOKEN_WHILE);
+    double conditionValue = expression();
+    eat(TOKEN_DO);
+    if (conditionValue != 0) {
+        if(debug){
+            printf("\033[1;32mRunning while loop.\033[0m\n");
+        }
+        while(currentToken.type != TOKEN_DONE){
+            statement();
+        }
+        input = start;
+        currentToken = startToken;
+        whileStatement();
+    }
+    skipToEnd();
 }
 
 void setStringValue(const char *name, const char *value) {
@@ -1070,6 +1094,8 @@ void statement() {
         inputStatement();
     } else if (currentToken.type == TOKEN_IDENTIFIER) {
         arrayAssignment();
+    } else if (currentToken.type == TOKEN_WHILE) {
+        whileStatement();
     } else {
         error("Invalid statement", currentToken.identifier);
     }
