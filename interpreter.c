@@ -63,6 +63,7 @@ typedef enum {
     TOKEN_OR,
     TOKEN_NOT,
     TOKEN_XOR,
+    TOKEN_DIST,
 } TokenType;
 
 typedef struct {
@@ -127,10 +128,10 @@ double binaryAdd();
 int factorial(int n);
 double expon(double base, double p);
 double nthRoot();
+double distance(double ax, double ay, double bx, double by);
 /* ---to code---
 double slopForm(); 
 bool isPrimeNumber(long long num);
-double distanceFormula();
 */
 
 void lexer(char *code) {
@@ -256,6 +257,9 @@ void advance() {
         input += 3;
     } else if (strncmp(input, "badd", 4) == 0) {
         currentToken.type = TOKEN_BADD;
+        input += 4;
+    } else if (strncmp(input, "dist", 4) == 0) {
+        currentToken.type = TOKEN_DIST;
         input += 4;
     } else if (strncmp(input, "root", 4) == 0) {
         currentToken.type = TOKEN_ROOT;
@@ -616,6 +620,10 @@ double nthRoot(){
     return x;
 }
 
+double distance(double ax, double ay, double bx, double by){
+     return sqrtf((double)((bx-ax)*(bx-ax)+(by-ay)*(by-ay)));
+}
+
 double pythagoreanTheorem() {
     double a, b, c;
     eat(TOKEN_PYTHAGOREAN);
@@ -779,6 +787,18 @@ double factor() {
             return pythagoreanTheorem();
         } else if(currentToken.type == TOKEN_ROOT){
             return nthRoot();
+        } else if (currentToken.type == TOKEN_DIST){
+            eat(TOKEN_DIST);
+            eat(TOKEN_LPAREN);
+            double ax = expression();
+            eat(TOKEN_COMMA);
+            double ay = expression();
+            eat(TOKEN_COMMA);
+            double bx = expression();
+            eat(TOKEN_COMMA);
+            double by = expression();
+            eat(TOKEN_RPAREN);
+            return distance(ax, ay, bx, by);
         } else if(currentToken.type == TOKEN_BINARY){
             eat(TOKEN_BINARY);
             eat(TOKEN_DOT);
