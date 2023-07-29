@@ -48,6 +48,11 @@
         "string_view": "c",
         "complex": "c",
         "time.h": "c",
-        "math.h": "c"
-    }
+        "math.h": "c",
+        "__split_buffer": "c",
+        "functional": "c",
+        "iterator": "c",
+        "unordered_map": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
 }

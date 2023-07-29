@@ -91,7 +91,6 @@ var d = value1 and value2
 print d
 
 var dd = value1 eq value2
-
 print dd
 
 var nice = "Are Not Equal"
@@ -112,3 +111,10 @@ var exp = 5 ^ 3
 print exp
 var tt = math.root(3,125)
 print tt
+
+var ax = 4
+var bx = 2
+var ay = 6
+var by = 9
+var value = math.dist(ax,ay,bx,by)
+print value
