@@ -111,6 +111,7 @@ void skipToEndOfInput();
 double quadFunction();
 void skipToEnd();
 void ifStatement();
+void whileStatement();
 void setStringValue(const char *name, const char *value);
 const char* getStringValue(const char *name);
 double getVariableValue(const char *name);
