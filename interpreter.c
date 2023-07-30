@@ -250,7 +250,7 @@ void advance() {
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
-    } else if (strncmp(input, "dun", 3) == 0) {
+    } else if (strncmp(input, "loop", 3) == 0) {
         currentToken.type = TOKEN_DONE;
         input += 3;
     } else if (strncmp(input, "deg", 3) == 0) {
