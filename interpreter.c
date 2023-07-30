@@ -66,6 +66,7 @@ typedef enum {
     TOKEN_DIST,
     TOKEN_WHILE,
     TOKEN_DONE,
+    TOKEN_BREAK,
 } TokenType;
 
 typedef struct {
@@ -244,6 +245,9 @@ void advance() {
         input += 2;
     } else if (strncmp(input, "while", 5) == 0) {
         currentToken.type = TOKEN_WHILE;
+        input += 5;
+    } else if (strncmp(input, "break", 5) == 0) {
+        currentToken.type = TOKEN_BREAK;
         input += 5;
     } else if (strncmp(input, "print", 5) == 0) {
         currentToken.type = TOKEN_PRINT;
@@ -1097,6 +1101,8 @@ void statement() {
         arrayAssignment();
     } else if (currentToken.type == TOKEN_WHILE) {
         whileStatement();
+    } else if (currentToken.type == TOKEN_BREAK) {
+        exit(1);
     } else {
         error("Invalid statement", currentToken.identifier);
     }
