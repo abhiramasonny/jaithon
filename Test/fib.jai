@@ -1,8 +1,7 @@
 var n1 = 0
 var n2 = 1
 var count = 0
-var msg = "Enter how many terms: "
-print msg 
+
 input nterms
 
 while count < nterms do
