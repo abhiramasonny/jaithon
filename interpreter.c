@@ -1169,7 +1169,7 @@ int main() {
     if(debug){
         printf("====================YOU ARE IN DEBUG MODE====================\n");
     }
-    char str[20];
+    char str[256];
     printf("Enter file name to interpret e.g., jaithon: ");
     scanf("%[^\n]%*c", str);
     struct timeval stop, start;
