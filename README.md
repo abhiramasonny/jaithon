@@ -6,7 +6,6 @@
 
 [YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt)
 </div>
-<div align="center" style="display:grid;place-items:center;">
 
 ***We suffer so that you don't***
 <br>
