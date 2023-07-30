@@ -118,3 +118,9 @@ var ay = 6
 var by = 9
 var value = math.dist(ax,ay,bx,by)
 print value
+
+var b = 10
+while b > 1 do
+print b 
+var b = b - 1
+loop
