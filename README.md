@@ -1,6 +1,6 @@
 <div align="center" style="display:grid;place-items:center;">
 <p>
-    <a href="https://www.youtube.com/watch?v=4CcsI82OGq0" target="_blank"><img width="100" src="Imgs/logo.png" alt="V logo"></a>
+    <a href="https://www.youtube.com/watch?v=4CcsI82OGq0" target="_blank"><img width="150" src="Imgs/logo.png" alt="V logo"></a>
 </p>
 <h1>JAITHON</h1>
 
