@@ -1,3 +1,12 @@
+Exponents --> ^ operator
+Syntax: base ^ power
+This code takes 2 values as input, and returs the base ^ power of the numbers
+Return type: Returns to a variable the rounded form of float.
+Example:
+-   var value = 3^3
+-   var value = 10.4^2
+-   var value = 100^0.5
+
 Variables --> var keyword  
 Syntax: var variable_name Identifier value
 This code saves a variable_name in memory with the value of value
@@ -196,3 +205,59 @@ Example:
 -   var value = math.bin.badd(1010,1)
 -   var value = math.bin.badd(111,a)
 -   var value = math.bin.badd(-11.1, 101)
+
+Rounding --> round function
+Syntax: var variable_name = math.round(float)
+This code takes in a float as input, and returns the rounded value of that value.
+Return type: Returns to a variable.
+Example:
+-   var value = math.round(103.43)
+-   var value = math.round(a)
+-   var value = math.round(a^2)
+
+Distance --> dist function
+Syntax: var variable_name = math.dist(ax,ay,bx,by)
+This code takes in 4 floats as input, and returns the distance of the 2 coordinates points..
+Return type: Returns to a variable.
+Example:
+-   var value = math.dist(1,2,4,6)
+-   var value = math.dist(100,a,10,b)
+-   var value = math.dist(a,a,b,b)
+
+Root --> root function
+Syntax: var variable_name = math.round(n,value)
+This code takes in 2 values as input, and returns the nthRoot of the value
+Return type: Returns to a variable.
+Example:
+-   var value = math.round(3,125)
+-   var value = math.round(a,125)
+-   var value = math.round(a,b)
+
+
+While --> while keyword
+Syntax: 
+while condition do
+statement1
+statement2
+...
+loop
+
+This is the syntax of a while loop in my language. The while loop does the statements until the condition is 0.
+Return type: No Return Type.
+Examples:
+    Example 1:
+        var b = 10
+        while b > 1 do
+            print b 
+            var b = b - 1
+        loop
+    Example 2:
+        while count < nterms do
+            print n1
+            var nth = n1 + n2
+            var n1 = n2
+            var n2 = nth
+            var count = count + 1
+        loop
+
+
