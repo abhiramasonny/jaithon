@@ -67,6 +67,7 @@ typedef enum {
     TOKEN_WHILE,
     TOKEN_DONE,
     TOKEN_BREAK,
+    TOKEN_ROUND,
 } TokenType;
 
 typedef struct {
@@ -309,6 +310,9 @@ void advance() {
     } else if (strncmp(input, "pyth", 4) == 0) {
         currentToken.type = TOKEN_PYTHAGOREAN;
         input += 4;
+    } else if (strncmp(input, "round", 5) == 0) {
+        currentToken.type = TOKEN_ROUND;
+        input += 5;
     } else if (strncmp(input, "input", 5) == 0) {
         currentToken.type = TOKEN_INPUT;
         input += 5;
@@ -828,6 +832,12 @@ double factor() {
             double by = expression();
             eat(TOKEN_RPAREN);
             return distance(ax, ay, bx, by);
+        } else if (currentToken.type == TOKEN_ROUND){
+            eat(TOKEN_ROUND);
+            eat(TOKEN_LPAREN);
+            double thingToRound = expression();
+            eat(TOKEN_RPAREN);
+            return round(thingToRound);
         } else if(currentToken.type == TOKEN_BINARY){
             eat(TOKEN_BINARY);
             eat(TOKEN_DOT);

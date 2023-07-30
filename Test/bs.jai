@@ -7,6 +7,7 @@ var win = "HAHAHA I won!! Your number is: "
 while low<high do
     var mid = low + high
     var mid = mid / 2
+    var mid = math.round(mid)
     print mid
     input HigherorLower
     if HigherorLower eq 1 then do var low = mid + 1

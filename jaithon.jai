@@ -119,6 +119,10 @@ var by = 9
 var value = math.dist(ax,ay,bx,by)
 print value
 
+var thing = 140.532
+var thing = math.round(thing)
+print thing
+
 var b = 10
 while b > 1 do
 print b 
