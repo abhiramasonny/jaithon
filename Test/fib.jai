@@ -5,11 +5,10 @@ var count = 0
 input nterms
 
 while count < nterms do
-print n1
-
-var nth = n1 + n2
-var n1 = n2
-var n2 = nth
-var count = count + 1
+    print n1
+    var nth = n1 + n2
+    var n1 = n2
+    var n2 = nth
+    var count = count + 1
 loop
 
