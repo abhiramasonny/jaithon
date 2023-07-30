@@ -68,7 +68,6 @@ typedef enum {
     TOKEN_DONE,
     TOKEN_BREAK,
     TOKEN_ROUND,
-    TOKEN_REMOVEVAR,
 } TokenType;
 
 typedef struct {
@@ -256,9 +255,6 @@ void advance() {
         input += 5;
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
-        input += 3;
-    } else if (strncmp(input, "rmv", 3) == 0) {
-        currentToken.type = TOKEN_REMOVEVAR;
         input += 3;
     } else if (strncmp(input, "loop", 3) == 0) {
         currentToken.type = TOKEN_DONE;
@@ -508,22 +504,6 @@ void setVariableValue(const char *name, double value) {
     variables[numVariables].value = value;
     numVariables++;
 }
-void removeVariable(const char *name) {
-    if(debug==true){
-        printf("\033[1;31mRemoving variable %s\033[0m\n", name);
-    }
-    for (int i = 0; i < numVariables; i++) {
-        if (strcmp(name, variables[i].name) == 0) {
-            // Move all elements down in the array to fill the gap
-            for (int j = i; j < numVariables-1; j++) {
-                variables[j] = variables[j + 1];
-            }
-            numVariables--;
-            return;
-        }
-    }
-}
-
 
 void setArrayValue(const char *name, int index, double value) {
     for (int i = 0; i < numVariables; i++) {
@@ -822,15 +802,6 @@ double factor() {
         return value;
     } else if (currentToken.type == TOKEN_TIME) {
         return timeFunction();
-    } else if (currentToken.type == TOKEN_REMOVEVAR){
-        eat(TOKEN_REMOVEVAR);
-        eat(TOKEN_LPAREN);
-        char identifier[256];
-        strcpy(identifier, currentToken.identifier);
-        eat(TOKEN_IDENTIFIER);
-        eat(TOKEN_RPAREN);
-        removeVariable(identifier);
-        return 1;
     }
     else if (currentToken.type == TOKEN_MATH) {
         eat(TOKEN_MATH);
