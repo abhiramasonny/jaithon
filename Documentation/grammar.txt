@@ -1,7 +1,16 @@
+Mathematical operators --> +, -, *, /
+Syntax: value1 operator value2
+This code applies the specified operator to the value1 and value2.
+Return type: Returns a Mathematical operation applied to variables/constants
+Example:
+-   var a = 2+1
+-   var b = a-4
+-   var c = b/a
+
 Exponents --> ^ operator
 Syntax: base ^ power
-This code takes 2 values as input, and returs the base ^ power of the numbers
-Return type: Returns to a variable the rounded form of float.
+This code takes 2 values as input, and return the base ^ power of the numbers
+Return type: Returns to a variable.
 Example:
 -   var value = 3^3
 -   var value = 10.4^2
@@ -28,7 +37,7 @@ Example:
 Print Statement --> print keyword
 Syntax: print value
 This statement prints out the specified values to console.
-Return type: Returns a value printed to console
+Return type: Returns a value.
 Example:
 -   print x
 -   print 2
@@ -46,7 +55,7 @@ Example:
 Trigonometric Functions --> specific_trigfunction function
 Syntax: var variable_name = math.trigfunc(degree)
 These functions take an angle (in degrees), and return their corresponding sine, cosine, tangent, asin, acos or atan values.
-Return type: Returns to a variable a specific trigfunction applied on a variable or constant.
+Return type: Returns to a variable.
 Example:
 -   var value = math.sin(3)
 -   var value = math.cos(angle)
@@ -55,7 +64,7 @@ Example:
 Square root --> sqrt function
 Syntax: var variable_name = math.sqrt(value)
 This code takes in a value as input, and returns the square root of that function
-Return type: Returns to a variable a square root applied on a variable or constant.
+Return type: Returns to a variable.
 Example:
 -   var value = math.sqrt(4)
 -   var value = math.sqrt(nums)
@@ -101,20 +110,11 @@ Example:
 User Input --> input keyword
 Syntax: input variable_name
 This code prompts the user to enter a value for the variable_name. The variable_name does not need to be defined previously.
-Return type: Returns user input to a specific variable
+Return type: Returns to a variable.
 Example:
 -   input x
 -   input y
 -   input z
-
-Mathematical operators --> +, -, *, /
-Syntax: value1 operator value2
-This code applies the specified operator to the value1 and value2.
-Return type: Returns a Mathematical operation applied to variables/constants
-Example:
--   var a = 2+1
--   var b = a-4
--   var c = b/a
 
 Time --> time keyword
 Syntax: var variable_name = time()
@@ -137,7 +137,7 @@ Example:
 Not --> not keyword
 Syntax: term not
 This code assumes 1s are true, and 0s are false. It returns the logical inversive of the statement.
-Return type: Opposite of statement
+Return type: No return type
 Example:
 -   var a = c not
 -   var a = 1 not
@@ -146,7 +146,7 @@ Example:
 And --> and keyword
 Syntax: term and term
 This code assumes 1s are true, and 0s are false. It returns the logical and of the statement.
-Return type: and of statements
+Return type: No return type
 Example:
 -   var a = c and a
 -   var a = 1 and 1
@@ -155,7 +155,7 @@ Example:
 Comparisons --> >,< keywords
 Syntax: term comparison term
 This code compares the 2 terms
-Return type: Opposite of statement
+Return type: No return type
 Example:
 -   var a = 2>1
 -   var a = b>c
@@ -173,7 +173,7 @@ Example:
 Quadratic Function --> quad function
 Syntax: var variable_name = math.quad(a,b,c)
 This code takes in 3 value as input, and returns the solved roots for them using the quadratic formula. Under the math Category.
-Return type: Returns to a variable the solved quadFunction on variables or constants.
+Return type: Returns to a variable.
 Example:
 -   var value = math.quad(1,2,1)
 -   var value = math.quad(a,1,2)
@@ -182,7 +182,7 @@ Example:
 Pythagorean Theorem --> pyth function
 Syntax: var variable_name = math.pyth(a,b)
 This code takes in 2 value as input, and returns the solved value for the hypotenuse.
-Return type: Returns to a variable the solved value for C.
+Return type: Returns to a variable.
 Example:
 -   var value = math.pyth(3,4)
 -   var value = math.pyth(a,4)
@@ -191,7 +191,7 @@ Example:
 Binary Conversion --> bin.conv function
 Syntax: var variable_name = math.bin.conv(n)
 This code takes in a value as input, and returns the binary version of that value.
-Return type: Returns to a variable the binary of n.
+Return type: Returns to a variable.
 Example:
 -   var value = math.bin.conv(3)
 -   var value = math.bin.conv(a)
@@ -200,7 +200,7 @@ Example:
 Binary Addition --> bin.badd function
 Syntax: var variable_name = math.bin.badd(b1,b2)
 This code takes in 2 values as input, and returns the addition of those values.
-Return type: Returns to a variable the binary addition of b1 and b2.
+Return type: Returns to a variable.
 Example:
 -   var value = math.bin.badd(1010,1)
 -   var value = math.bin.badd(111,a)
@@ -243,7 +243,7 @@ statement2
 loop
 
 This is the syntax of a while loop in my language. The while loop does the statements until the condition is 0.
-Return type: No Return Type.
+Return type: No return type.
 Examples:
     Example 1:
         var b = 10
