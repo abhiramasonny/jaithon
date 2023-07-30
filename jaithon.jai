@@ -125,6 +125,6 @@ print thing
 
 var b = 10
 while b > 1 do
-print b 
-var b = b - 1
+    print b 
+    var b = b - 1
 loop
