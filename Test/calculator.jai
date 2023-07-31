@@ -2,8 +2,8 @@ var mul = "*"
 var div = "/"
 var add = "+"
 var minus = "-"
-input opperator, string
 input num1
+input opperator, string
 input num2
 var nmul = num1 * num2
 var nadd = num1 + num2

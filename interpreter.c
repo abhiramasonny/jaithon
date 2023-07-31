@@ -1130,7 +1130,7 @@ void varInputStatement() {
         eat(TOKEN_COMMA);
         eat(TOKEN_IDENTIFIER);
         printf("Enter a value for %s: ", identifier);
-        scanf("%255[^\n]", userInput);
+        scanf("%s", userInput);
         setStringValue(identifier, userInput);
     } else{
         printf("Enter a value for %s: ", identifier);
