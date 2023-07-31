@@ -131,7 +131,11 @@ var b = 10
 #    print b 
 #    var b = b - 1
 #loop
-input h, string
-print h
-var h2 = "*"
-if compare h, h2 then do print h
+#input h, string
+#print h
+#var h2 = "*"
+#if compare h, h2 then do print h
+
+var a = 101
+var b = a % 2
+print b
