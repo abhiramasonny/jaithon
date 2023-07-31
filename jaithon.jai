@@ -131,3 +131,5 @@ var b = 10
 #    print b 
 #    var b = b - 1
 #loop
+input h, string
+print h

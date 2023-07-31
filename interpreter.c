@@ -105,7 +105,7 @@ void arrayAssignment();
 void arrayDeletion();
 void arraySort(const char *name);
 void printStatement();
-void inputStatement();
+void varInputStatement();
 void statement();
 void program();
 void array();
@@ -1120,15 +1120,25 @@ void printStatement() {
     }
 }
 
-void inputStatement() {
+void varInputStatement() {
     eat(TOKEN_INPUT);
     char identifier[256];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
-    printf("Enter a value for %s: ", identifier);
-    double value;
-    scanf("%lf", &value);
-    setVariableValue(identifier, value);
+    if(currentToken.type == TOKEN_COMMA){
+        char userInput[256];
+        eat(TOKEN_COMMA);
+        eat(TOKEN_IDENTIFIER);
+        printf("Enter a value for %s: ", identifier);
+        fgets(userInput, sizeof(userInput), stdin);
+        printf("%s", userInput);
+        setStringValue(identifier, userInput);
+    } else{
+        printf("Enter a value for %s: ", identifier);
+        double value;
+        scanf("%lf", &value);
+        setVariableValue(identifier, value);
+    }
 }
 
 void statement() {
@@ -1140,7 +1150,7 @@ void statement() {
     } else if (currentToken.type == TOKEN_PRINT) {
         printStatement();
     } else if (currentToken.type == TOKEN_INPUT) {
-        inputStatement();
+        varInputStatement();
     } else if (currentToken.type == TOKEN_IDENTIFIER) {
         arrayAssignment();
     } else if (currentToken.type == TOKEN_WHILE) {
