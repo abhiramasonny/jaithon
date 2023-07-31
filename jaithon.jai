@@ -122,9 +122,12 @@ print value
 var thing = 140.532
 var thing = math.round(thing)
 print thing
-
+var s1 = "hii"
+var s2 = "hi"
+var s3 = compare s1, s2
+print s3
 var b = 10
-while b > 1 do
-    print b 
-    var b = b - 1
-loop
+#while b > 1 do
+#    print b 
+#    var b = b - 1
+#loop
