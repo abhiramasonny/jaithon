@@ -133,3 +133,5 @@ var b = 10
 #loop
 input h, string
 print h
+var h2 = "*"
+if compare h, h2 then do print h
