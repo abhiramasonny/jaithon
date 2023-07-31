@@ -68,6 +68,7 @@ typedef enum {
     TOKEN_DONE,
     TOKEN_BREAK,
     TOKEN_ROUND,
+    TOKEN_COMP,
 } TokenType;
 
 typedef struct {
@@ -256,9 +257,12 @@ void advance() {
     } else if (strncmp(input, "var", 3) == 0) {
         currentToken.type = TOKEN_VAR;
         input += 3;
-    } else if (strncmp(input, "loop", 3) == 0) {
+    } else if (strncmp(input, "loop", 4) == 0) {
         currentToken.type = TOKEN_DONE;
-        input += 3;
+        input += 4;
+    } else if (strncmp(input, "compare", 7) == 0) {
+        currentToken.type = TOKEN_COMP;
+        input += 7;
     } else if (strncmp(input, "deg", 3) == 0) {
         currentToken.type = TOKEN_DEGREES;
         input += 3;
@@ -436,6 +440,21 @@ const char* getStringValue(const char *name) {
         }
     }
     error("Variable not found", name);
+    return 0;
+}
+
+int areEqual(const char *str1, const char *str2) {
+    while(*str1 && *str2) {
+        if(*str1 != *str2)
+            return 0;
+        str1++;
+        str2++;
+    }
+    
+    // If both strings have reached the end, they are equal.
+    if(*str1 == '\0' && *str2 == '\0')
+        return 1;
+        
     return 0;
 }
 
@@ -802,6 +821,21 @@ double factor() {
         return value;
     } else if (currentToken.type == TOKEN_TIME) {
         return timeFunction();
+    } else if (currentToken.type == TOKEN_COMP){
+            eat(TOKEN_COMP);
+            char identifier[256];
+            strcpy(identifier, currentToken.identifier);
+            eat(TOKEN_IDENTIFIER);
+            eat(TOKEN_COMMA);
+            char identifier1[256];
+            strcpy(identifier1, currentToken.identifier);
+            eat(TOKEN_IDENTIFIER);
+            int compare = strcmp(getStringValue(identifier), getStringValue(identifier1));
+            if(compare == 0){
+                return 1;
+            } else{
+                return 0;
+            }
     }
     else if (currentToken.type == TOKEN_MATH) {
         eat(TOKEN_MATH);
