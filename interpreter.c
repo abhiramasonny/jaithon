@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #define MAX_IMPORTED_FILES 256
-#define debug true
+#define debug false
 
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
