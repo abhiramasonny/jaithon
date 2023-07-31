@@ -69,6 +69,7 @@ typedef enum {
     TOKEN_BREAK,
     TOKEN_ROUND,
     TOKEN_COMP,
+    TOKEN_MOD,
 } TokenType;
 
 typedef struct {
@@ -196,6 +197,9 @@ void advance() {
         input++;
     } else if (*input == '/') {
         currentToken.type = TOKEN_DIVIDE;
+        input++;
+    } else if (*input == '%') {
+        currentToken.type = TOKEN_MOD;
         input++;
     } else if (*input == '(') {
         currentToken.type = TOKEN_LPAREN;
@@ -917,13 +921,17 @@ double expression() {
     while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS ||
            currentToken.type == TOKEN_GREATER_THAN || currentToken.type == TOKEN_LESS_THAN ||
            currentToken.type == TOKEN_EQ || currentToken.type == TOKEN_NOT || currentToken.type == TOKEN_AND || 
-           currentToken.type == TOKEN_OR || currentToken.type == TOKEN_XOR || currentToken.type == TOKEN_FACTORIAL || currentToken.type == TOKEN_EXP) {
+           currentToken.type == TOKEN_OR || currentToken.type == TOKEN_XOR || currentToken.type == TOKEN_FACTORIAL || 
+           currentToken.type == TOKEN_EXP || currentToken.type == TOKEN_MOD) {
         if (currentToken.type == TOKEN_PLUS) {
             eat(TOKEN_PLUS);
             value += term();
         } else if (currentToken.type == TOKEN_MINUS) {
             eat(TOKEN_MINUS);
             value -= term();
+        } else if (currentToken.type == TOKEN_MOD) {
+            eat(TOKEN_MOD);
+            value = (int)value % (int)term();
         } else if (currentToken.type == TOKEN_GREATER_THAN) {
             eat(TOKEN_GREATER_THAN);
             value = (value > term()) ? 1.0 : 0.0;
