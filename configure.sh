@@ -1,0 +1,1 @@
+echo -n 'export PATH=~$1:$PATH' >> ~/.zshrc
