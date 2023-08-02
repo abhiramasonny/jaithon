@@ -43,6 +43,18 @@ jaithon
 7. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
 8. If you do this, you will need to run **./start.sh** again, to recompile the binary.
 
+### Path
+
+The way you create the jaithon path, is that you run ./configure.sh **Folder where this code is stored**
+
+For example; ./configure.sh Users/abhiramasonny/developer/C/jaithon
+
+Then you can open any terminal window and use the interpreter command to interpret any jaithon code in your computer.
+For example...
+```bash
+interpreter
+```
+in any directory would work.
 ## Features
 
 - Variable Assignment: You can assign values to variables using the var keyword. Syntax: *var x = 5*
