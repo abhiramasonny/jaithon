@@ -46,6 +46,7 @@ Or you can run
 ```bash
 ./interpreter filename
 ```
+
 </details>
 
 ### Writing code
@@ -96,10 +97,10 @@ For more documentation, visit
 Documentation/grammar.txt
 ```
 
-**NOTE** Jaithon is actually Faster then its counterpart Python! Here are the reasults from the tests I ran.
+**NOTE** Jaithon is actually Faster then its counterpart Python! Here are the results from the tests I ran.
 <a href="Imgs/JaithonResult.png" target="_blank"><img src="Imgs/JaithonResult.png" alt="Jaithon Speed Result"></a>
 <a href="Imgs/PythonResult.png" target="_blank"><img src="Imgs/PythonResult.png" alt="Python Speed Result"></a>
-Please Note, the 0.05 user time in python is not 'user' input. It can not be avoided. You can try the speed command on your UNIX running computer with
+Please Note, the 0.05 user time in python is not 'user' input. It can not be avoided. You can try the time command on your UNIX running computer with
 
 ```bash
 time ./interpreter filename
