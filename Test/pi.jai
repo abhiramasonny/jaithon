@@ -1,7 +1,7 @@
 var t = 0
 var cp = 0
-
-while 1 do
+var i = 0
+while i<100 do
     var x = math.rand.uniform()
     var y = math.rand.uniform()
     var t = t + 1
@@ -10,4 +10,5 @@ while 1 do
     if d eq 1 then do var cp = cp + 1
     var pi = 4 * cp / t
     print pi
+    var i = i + 1
 loop

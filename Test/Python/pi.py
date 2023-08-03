@@ -2,8 +2,8 @@ import random
 
 total_points = 0
 circle_points = 0
-
-while True:
+i = 0
+while i<100:
     x = random.uniform(-1, 1)
     y = random.uniform(-1, 1)
     
@@ -16,3 +16,4 @@ while True:
     pi_estimate = 4 * circle_points / total_points
     
     print(pi_estimate)
+    i+=1
