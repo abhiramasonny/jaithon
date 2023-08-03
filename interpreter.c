@@ -71,6 +71,7 @@ typedef enum {
     TOKEN_COMP,
     TOKEN_MOD,
     TOKEN_RAND,
+    TOKEN_UNIFORM,
 } TokenType;
 
 typedef struct {
@@ -286,6 +287,9 @@ void advance() {
     } else if (strncmp(input, "rand", 4) == 0) {
         currentToken.type = TOKEN_RAND;
         input += 4;
+    } else if (strncmp(input, "uniform", 7) == 0) {
+        currentToken.type = TOKEN_UNIFORM;
+        input += 7;
     } else if (strncmp(input, "array", 5) == 0) {
         currentToken.type = TOKEN_ARRAY;
         input += 5;
@@ -881,11 +885,26 @@ double factor() {
             eat(TOKEN_RPAREN);
             return round(thingToRound);
         } else if (currentToken.type == TOKEN_RAND){
-            srand(time(NULL));
             eat(TOKEN_RAND);
-            eat(TOKEN_LPAREN);
-            eat(TOKEN_RPAREN);
-            return rand();
+            if (currentToken.type == TOKEN_LPAREN ){
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                unsigned int seed = tv.tv_sec * 1000000 + tv.tv_usec / 1000000 + lines;
+                srand(seed);
+                eat(TOKEN_LPAREN);
+                eat(TOKEN_RPAREN);
+                return rand();
+            } else if (currentToken.type == TOKEN_DOT){
+                eat(TOKEN_DOT);
+                eat(TOKEN_UNIFORM);
+                eat(TOKEN_LPAREN);
+                eat(TOKEN_RPAREN);
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                unsigned int seed = tv.tv_sec * 1000000 + tv.tv_usec / 1000000 + lines;
+                srand(seed);
+                return ((double)rand() / (double)RAND_MAX);
+            }
         } else if(currentToken.type == TOKEN_BINARY){
             eat(TOKEN_BINARY);
             eat(TOKEN_DOT);
