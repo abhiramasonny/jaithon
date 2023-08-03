@@ -18,19 +18,21 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 JAITHON is a programming language put together for the purpose of teaching children and/or adults the basics of programming. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts quickly and enjoyably. Jaithon's syntax is so simple, that it's basically like reading/writing English. All you need is a 1st-grade education (Just know English...) to be able to enjoy my language. By providing a beginner-friendly environment, Jaithon removes the tech-savvy knowledge needed with standerd/high-level programming languages, making it accessible to people with little or no prior programming experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from a beginner to a basic grasp of Python syntax.
 
-**Crossing the age barrier**
+**Crossing the age barrier**:
 
 The primary problem JAITHON addresses is the stress often felt by young learners when approaching programming. As a quote from Munna Bhai MBBS, *"Bhai, tension nahin lene ka bhai!"*, meaning leave the tension behind. By offering straightforward and visually appealing syntax, JAITHON enables children to effectively *leave the tension behind*. This approach cultivates a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does. Ive got proof for that as well. Star the GH repo and ill tell it to you :DD.
 
 ## Usage
 
 To use the array compiler/interpreter on UNIX, follow these steps:
-```bash 
+
+```bash
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
 chmod +x start.sh
 ./start.sh
 ```
+
 **You must have gcc and Make installed otherwise the script wont work.**
 Then type this as follow up to *Enter file name to interpret*
 
@@ -38,7 +40,8 @@ Then type this as follow up to *Enter file name to interpret*
 jaithon
 ```
 
-Or you can run 
+Or you can run
+
 ```bash
 ./interpreter filename
 ```
@@ -57,10 +60,13 @@ For example; ./configure.sh Users/abhiramasonny/developer/C/jaithon
 
 Then you can open any terminal window and use the interpreter command to interpret any jaithon code in your computer.
 For example...
+
 ```bash
 interpreter
 ```
+
 in any directory would work.
+
 ## Features
 
 - Variable Assignment: You can assign values to variables using the var keyword. Syntax: *var x = 5*
@@ -80,7 +86,6 @@ in any directory would work.
 - Quadratic function: You can solve quadratic functions using the inbuilt math function. Syntax: *var q = math.quad(1,2,1)*
 - The rest of the functions/keywords/things are located in the documentation.
 
-
 For more documentation, visit
 
 ```
@@ -95,6 +100,7 @@ Please Note, the 0.05 user time in python is not 'user' input. It can not be avo
 ```bash
 time ./interpreter filename
 ```
+
 <br>
 
 ## Flowchart: JAI Programming Language Interpreter
@@ -126,10 +132,12 @@ time ./interpreter filename
 
 This is a really cool feature and takes like 3 seconds to do so don't be lazy and follow the steps.
 *Only if you have VS-Code as your IDE*
+
 ```sh
 cd Extensions
 cp -r jai ~/.vscode/extensions
 ```
+
 **Reload VS-Code**
 Note: this is for mac/linux.
 <br>
@@ -138,24 +146,29 @@ Hasn't been tested on windows
 ## Examples
 
 Examples are located in the Test directory. There is also documentation of the syntax located at
+
 ```
 Documentation/grammar.txt
 ```
 
 ## Info
-For more info *and to appreciate my hard webdev work* go to the html page located at 
+
+For more info *and to appreciate my hard webdev work* go to the html page located at
+
 ```
 https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html
 ```
 
 or the youtube video
+
 ```
 https://www.youtube.com/watch?v=4CcsI82OGq0
 ```
-or contact me at abhirama.sonny@gmail.com.
 
+or contact me at <abhirama.sonny@gmail.com>.
 
 ## Credits
+
 - Me
 - Myself
 - I
