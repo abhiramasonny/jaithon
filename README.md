@@ -4,7 +4,7 @@
 </p>
 <h1>JAITHON</h1>
 
-[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Website](https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html)[Abhirama Sonny](https://abhiramasonny.github.io/)
+[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Website](https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html) | [Abhirama Sonny](https://abhiramasonny.github.io/)
 </div>
 
 ***We suffer so that you don't***
