@@ -70,6 +70,7 @@ typedef enum {
     TOKEN_ROUND,
     TOKEN_COMP,
     TOKEN_MOD,
+    TOKEN_RAND,
 } TokenType;
 
 typedef struct {
@@ -281,6 +282,9 @@ void advance() {
         input += 4;
     } else if (strncmp(input, "root", 4) == 0) {
         currentToken.type = TOKEN_ROOT;
+        input += 4;
+    } else if (strncmp(input, "rand", 4) == 0) {
+        currentToken.type = TOKEN_RAND;
         input += 4;
     } else if (strncmp(input, "array", 5) == 0) {
         currentToken.type = TOKEN_ARRAY;
@@ -876,6 +880,12 @@ double factor() {
             double thingToRound = expression();
             eat(TOKEN_RPAREN);
             return round(thingToRound);
+        } else if (currentToken.type == TOKEN_RAND){
+            srand(time(NULL));
+            eat(TOKEN_RAND);
+            eat(TOKEN_LPAREN);
+            eat(TOKEN_RPAREN);
+            return rand();
         } else if(currentToken.type == TOKEN_BINARY){
             eat(TOKEN_BINARY);
             eat(TOKEN_DOT);
