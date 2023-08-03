@@ -4,7 +4,7 @@
 </p>
 <h1>JAITHON</h1>
 
-[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt)
+[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Website](https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html)[Abhirama Sonny](https://abhiramasonny.github.io/)
 </div>
 
 ***We suffer so that you don't***
@@ -16,7 +16,7 @@ This is a simple compiler/interpreter that supports array declarations and opera
 
 **JAITHON**: *A Simple Introduction to Math and Programming*
 
-JAITHON is a programming language put together for the purpose of teaching children and/or adults the basics of programming. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts easily and enjoyably. Jaithon's syntax is so simple, that its basically like reading/writing english. All you need is a 1st grade education (Just know english...) to be able to enjoy my language. By providing a beginner-friendly environment, Jaithon removes the tech-savvy knowledge needed with 'normal'/highlevel programming languages, making it accessible to people with little or no prior programming experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from complete beginner, to having a basic grasp of python syntax.
+JAITHON is a programming language put together for the purpose of teaching children and/or adults the basics of programming. Its simplicity and intuitive syntax make it an ideal choice for young learners, allowing them to grasp programming concepts quickly and enjoyably. Jaithon's syntax is so simple, that it's basically like reading/writing English. All you need is a 1st-grade education (Just know English...) to be able to enjoy my language. By providing a beginner-friendly environment, Jaithon removes the tech-savvy knowledge needed with standerd/high-level programming languages, making it accessible to people with little or no prior programming experience. The intended use of my language is to help the transition to Python. JAITHON will help you get from a beginner to a basic grasp of Python syntax.
 
 **Crossing the age barrier**
 
