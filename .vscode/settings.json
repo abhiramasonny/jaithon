@@ -52,7 +52,8 @@
         "__split_buffer": "c",
         "functional": "c",
         "iterator": "c",
-        "unordered_map": "c"
+        "unordered_map": "c",
+        "sstream": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

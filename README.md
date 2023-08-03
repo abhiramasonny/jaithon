@@ -33,8 +33,14 @@ chmod +x start.sh
 ```
 **You must have gcc and Make installed otherwise the script wont work.**
 Then type this as follow up to *Enter file name to interpret*
+
 ```
 jaithon
+```
+
+Or you can run 
+```bash
+./interpreter filename
 ```
 
 4. Create a new file with the .jai extension, then write code in the JAI language.
@@ -80,8 +86,16 @@ For more documentation, visit
 ```
 Documentation/grammar.txt
 ```
+
+**NOTE** Jaithon is actually Faster then its counterpart Python! Here are the reasults from the tests I ran.
+<a href="Imgs/JaithonResult.png" target="_blank"><img src="Imgs/JaithonResult.png" alt="Jaithon Speed Result"></a>
+<a href="Imgs/PythonResult.png" target="_blank"><img src="Imgs/PythonResult.png" alt="Python Speed Result"></a>
+Please Note, the 0.05 user time in python is not 'user' input. It can not be avoided. You can try the speed command on your UNIX running computer with
+
+```bash
+time ./interpreter filename
+```
 <br>
-Even though strings work, the input statement only works with variables.
 
 ## Flowchart: JAI Programming Language Interpreter
 
