@@ -46,13 +46,15 @@ Or you can run
 ```bash
 ./interpreter filename
 ```
-
-4. Create a new file with the .jai extension, then write code in the JAI language.
-5. Execute the compiler/interpreter with *filename* as input.
-6. The programs output will be displayed.
-7. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
-8. If you do this, you will need to run **./start.sh** again, to recompile the binary.
 </details>
+
+### Writing code
+
+1. Create a new file with the .jai extension, then write code in the JAI language.
+2. Execute the compiler/interpreter with *filename* as input.
+3. The programs output will be displayed.
+4. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
+5. If you do this, you will need to run **./start.sh** again, to recompile the binary.
 
 ### Path
 
