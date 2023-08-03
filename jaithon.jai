@@ -139,3 +139,6 @@ var b = 10
 var a = 101
 var b = a % 2
 print b
+var r = math.rand()
+var r  = r % 100
+print r
