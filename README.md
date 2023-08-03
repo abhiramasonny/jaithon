@@ -25,7 +25,7 @@ The primary problem JAITHON addresses is the stress often felt by young learners
 ## Usage
 
 To use the array compiler/interpreter on UNIX, follow these steps:
-
+<details><summary><b>Show instructions</b></summary>
 ```bash
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
@@ -51,6 +51,7 @@ Or you can run
 6. The programs output will be displayed.
 7. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
 8. If you do this, you will need to run **./start.sh** again, to recompile the binary.
+</details>
 
 ### Path
 
