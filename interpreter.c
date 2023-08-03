@@ -1262,18 +1262,18 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error opening file\n");
             return 1;
         }
-    
+
         fseek(file, 0, SEEK_END);
         long fileSize = ftell(file);
         rewind(file);
-    
+
         char *code = malloc(fileSize + 1);
         if (code == NULL) {
             fprintf(stderr, "Memory allocation failed\n");
             fclose(file);
             return 1;
         }
-    
+
         size_t bytesRead = fread(code, 1, fileSize, file);
         if (bytesRead < fileSize) {
             fprintf(stderr, "Error reading file\n");
@@ -1281,10 +1281,10 @@ int main(int argc, char *argv[]) {
             free(code);
             return 1;
         }
-    
+
         code[fileSize] = '\0';
         fclose(file);
-        
+
         lexer(code);
         program();
     
