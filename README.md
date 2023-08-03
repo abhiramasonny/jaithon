@@ -26,6 +26,7 @@ The primary problem JAITHON addresses is the stress often felt by young learners
 
 To use the array compiler/interpreter on UNIX, follow these steps:
 <details style="color: darkred;"><summary><b>Show instructions</b></summary>
+
 ```bash
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
