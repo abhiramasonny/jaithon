@@ -6,7 +6,7 @@
 #include <time.h>
 #include <stdbool.h>
 #include <sys/time.h>
-#define MAX_IMPORTED_FILES 8192
+#define MAX_IMPORTED_FILES 2048
 #define debug false
 
 char importedFiles[MAX_IMPORTED_FILES][256];
@@ -77,17 +77,17 @@ typedef enum {
 typedef struct {
     TokenType type;
     double value;
-    char identifier[8192];
-    char string[8192];
+    char identifier[0];
+    char string[0];
 } Token;
 
 Token currentToken;
 char *input;
 char *orgInput;
 typedef struct {
-    char name[8192];
+    char name[2048];
     double value;
-    char stringValue[8192]; 
+    char stringValue[2048]; 
     int isArray;
     double *elements;
     int size;
@@ -835,11 +835,11 @@ double factor() {
         return timeFunction();
     } else if (currentToken.type == TOKEN_COMP){
             eat(TOKEN_COMP);
-            char identifier[8192];
+            char identifier[2048];
             strcpy(identifier, currentToken.identifier);
             eat(TOKEN_IDENTIFIER);
             eat(TOKEN_COMMA);
-            char identifier1[8192];
+            char identifier1[2048];
             strcpy(identifier1, currentToken.identifier);
             eat(TOKEN_IDENTIFIER);
             int compare = strcmp(getStringValue(identifier), getStringValue(identifier1));
@@ -989,7 +989,7 @@ double expression() {
             } else if(value == 0){
                 value = 1.0;
             } else{
-                char str[8192];
+                char str[2048];
                 sprintf(str, "%f", value);
                 error("The not keyword is a boolean operation supporting 1s and 0s", str);
             }
@@ -1064,7 +1064,7 @@ double argsMath() {
 }
 
 void assignment() {
-    char identifier[8192];
+    char identifier[2048];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_ASSIGN);
@@ -1078,7 +1078,7 @@ void assignment() {
 }
 
 void arrayAssignment() {
-    char identifier[8192];
+    char identifier[2048];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_DOT);
@@ -1113,7 +1113,7 @@ void arrayAssignment() {
 void printStatement() {
     eat(TOKEN_PRINT);
     if (currentToken.type == TOKEN_IDENTIFIER) {
-        char identifier[8192];
+        char identifier[2048];
         strcpy(identifier, currentToken.identifier);
         eat(TOKEN_IDENTIFIER);
         int isString = 0;
@@ -1159,11 +1159,11 @@ void printStatement() {
 
 void varInputStatement() {
     eat(TOKEN_INPUT);
-    char identifier[8192];
+    char identifier[2048];
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     if(currentToken.type == TOKEN_COMMA){
-        char userInput[8192];
+        char userInput[2048];
         eat(TOKEN_COMMA);
         eat(TOKEN_IDENTIFIER);
         printf("Enter a value for %s: ", identifier);
@@ -1204,7 +1204,7 @@ void program() {
             array();
         } else if (currentToken.type == TOKEN_IMPORT) {
             eat(TOKEN_IMPORT);
-            char filename[8192];
+            char filename[2048];
             strcpy(filename, currentToken.identifier);
             char extension[4] = ".jai";
             strcat(filename, extension);
@@ -1224,7 +1224,7 @@ void program() {
 
 void array() {
     eat(TOKEN_ARRAY);
-    char arrayName[8192];
+    char arrayName[2048];
     strcpy(arrayName, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_ASSIGN);
