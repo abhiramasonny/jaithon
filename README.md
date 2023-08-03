@@ -51,7 +51,7 @@ Or you can run
 ### Writing code
 
 1. Create a new file with the .jai extension, then write code in the JAI language.
-2. Execute the compiler/interpreter with *filename* as input.
+2. Execute the compiler/interpreter with *filename* as input/argument.
 3. The programs output will be displayed.
 4. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
 5. If you do this, you will need to run **./start.sh** again, to recompile the binary.
