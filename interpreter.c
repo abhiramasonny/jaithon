@@ -83,7 +83,6 @@ typedef struct {
 
 Token currentToken;
 char *input;
-char *orgInput;
 typedef struct {
     char name[2048];
     double value;
