@@ -53,7 +53,8 @@
         "functional": "c",
         "iterator": "c",
         "unordered_map": "c",
-        "sstream": "c"
+        "sstream": "c",
+        "__config": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

@@ -3,7 +3,7 @@ import random
 total_points = 0
 circle_points = 0
 i = 0
-while i<100:
+while i<10000000000:
     x = random.uniform(-1, 1)
     y = random.uniform(-1, 1)
     
