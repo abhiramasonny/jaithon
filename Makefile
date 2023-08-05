@@ -2,7 +2,7 @@ TARGET = interpreter
 
 CC = gcc
 
-SOURCES = interpreter.c
+SOURCES = src/interpreter.c
 
 all: $(TARGET)
 $(TARGET): $(SOURCES)
