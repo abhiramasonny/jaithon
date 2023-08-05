@@ -59,9 +59,9 @@ Or you can run
 
 ### Path
 
-The way you create the jaithon path, is that you run ./configure.sh **Folder where this code is stored**
+The way you create the jaithon path, is that you run ./path.sh **Folder where this code is stored**
 
-For example; ./configure.sh Users/abhiramasonny/developer/C/jaithon
+For example; ./path.sh Users/abhiramasonny/developer/C/jaithon
 
 Then you can open any terminal window and use the interpreter command to interpret any jaithon code in your computer.
 For example...
