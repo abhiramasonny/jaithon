@@ -15,5 +15,5 @@ while i<10000000000:
 
     pi_estimate = 4 * circle_points / total_points
     
-    print(pi_estimate)
+    print(f"{pi_estimate}, with {total_points}")
     i+=1
