@@ -1339,7 +1339,7 @@ int main(int argc, char *argv[]) {
     free(code);
     gettimeofday(&stop, NULL);
     if(debug){
-        printf("\033[1;31mTook %f seconds\033[0m\n", ((stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec)*0.0001);
+        printf("\033[1;31mTook %f seconds\033[0m\n", ((stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec)*0.000001);
     }
     return 0;
 }
