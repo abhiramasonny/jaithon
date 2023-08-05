@@ -119,6 +119,7 @@ void ifStatement();
 void whileStatement();
 void setStringValue(const char *name, const char *value);
 const char* getStringValue(const char *name);
+int areEqual(const char *str1, const char *str2);
 double getVariableValue(const char *name);
 void setVariableValue(const char *name, double value);
 void setArrayValue(const char *name, int index, double value);
