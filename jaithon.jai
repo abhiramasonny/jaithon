@@ -142,3 +142,5 @@ print b
 var r = math.rand()
 var r  = r % 100
 print r
+var tes = "test.txt"
+write tes, hi

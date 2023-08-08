@@ -72,6 +72,7 @@ typedef enum {
     TOKEN_MOD,
     TOKEN_RAND,
     TOKEN_UNIFORM,
+    TOKEN_WRITE,
 } TokenType;
 
 typedef struct {
@@ -138,6 +139,7 @@ int factorial(int n);
 double expon(double base, double p);
 double nthRoot();
 double distance(double ax, double ay, double bx, double by);
+void writeToFile();
 
 void lexer(char *code) {
     input = code;
@@ -251,6 +253,9 @@ void advance() {
     } else if (strncmp(input, "or", 2) == 0) {
         currentToken.type = TOKEN_OR;
         input += 2;
+    } else if (strncmp(input, "write", 5) == 0) {
+        currentToken.type = TOKEN_WRITE;
+        input += 5;
     } else if (strncmp(input, "while", 5) == 0) {
         currentToken.type = TOKEN_WHILE;
         input += 5;
@@ -509,6 +514,30 @@ void importFile(const char *filename) {
     currentToken = tempCurrentToken;
 
     free(importedCode);
+}
+
+void writeToFile() {
+    eat(TOKEN_WRITE);
+    char strname[2048];
+    strcpy(strname, currentToken.identifier);
+    eat(TOKEN_IDENTIFIER);
+    eat(TOKEN_COMMA);
+    char content[2048];
+    strcpy(content, currentToken.identifier);
+    eat(TOKEN_IDENTIFIER);
+    const char *filename = getStringValue(strname);
+    FILE *file = fopen(filename, "w");
+    
+    if (file == NULL) {
+        printf("Error opening file for writing.\n");
+        return;
+    }
+    
+    fprintf(file, "%s", content);
+    fclose(file);
+    if (debug){
+        printf("\033[1;31mWriting %s to file\033[0m \033[1;34m%s\033[0m\n", content, filename);
+    }
 }
 
 double getVariableValue(const char *name) {
@@ -1193,6 +1222,8 @@ void statement() {
         whileStatement();
     } else if (currentToken.type == TOKEN_BREAK) {
         exit(1);
+    } else if (currentToken.type == TOKEN_WRITE){
+        writeToFile();
     } else {
         error("Invalid statement", currentToken.identifier);
     }
