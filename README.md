@@ -30,8 +30,8 @@ To use the array compiler/interpreter on UNIX, follow these steps:
 ```bash
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
-chmod +x start.sh
-./start.sh
+make
+./interpreter
 ```
 
 **You must have gcc and Make installed otherwise the script wont work.**
@@ -59,7 +59,13 @@ Or you can run
 
 ### Path
 
-The way you create the jaithon path, is that you run ./path.sh **Folder where this code is stored**
+The way you create the jaithon path, is that you run 
+``` bash
+cd config
+./path.sh #Folder where this code is stored as an argument
+cd .. #if you want to get out of config
+```
+
 
 For example; ./path.sh Users/abhiramasonny/developer/C/jaithon
 
@@ -174,8 +180,7 @@ or contact me at <abhirama.sonny@gmail.com>.
 
 ## Credits
 
-- Me
-- Myself
-- I
+- Abhirama
+- Sonny
 <br>
 :DD

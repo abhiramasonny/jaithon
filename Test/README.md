@@ -12,7 +12,7 @@ Then put Test/filename as input for the filename to interpret.
 <br>
 For example:
 ```shell
-Test/greatest
+Test/Jaithon/greatest
 ```
 This would execute the greatest application.
 

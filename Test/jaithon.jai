@@ -142,7 +142,7 @@ print b
 var r = math.rand()
 var r  = r % 100
 print r
-var test = "test.txt"
+var test = "Test/test.txt"
 write test, hello
 var abc = read test
 print abc
