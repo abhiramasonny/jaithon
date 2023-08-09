@@ -1,6 +1,6 @@
 #!/bin/bash
 
-directory="Test"
+directory="Test/Jaithon"
 
 for full_filename in "$directory"/*
 do

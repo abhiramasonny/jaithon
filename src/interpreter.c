@@ -1329,7 +1329,7 @@ int main(int argc, char *argv[]) {
     }
     if(argc < 2) {
         char str[256];
-        printf("Enter file name to interpret e.g., jaithon: ");
+        printf("Enter file name to interpret e.g., Test/jaithon: ");
         scanf("%[^\n]%*c", str);
         struct timeval stop, start;
         gettimeofday(&start, NULL);
