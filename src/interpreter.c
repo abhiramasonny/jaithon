@@ -523,14 +523,15 @@ void importFile(const char *filename) {
 
 void writeToFile() {
     eat(TOKEN_WRITE);
-    char strname[2048];
-    strcpy(strname, currentToken.identifier);
+    char strName[2048];
+    strcpy(strName, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_COMMA);
-    char content[2048];
-    strcpy(content, currentToken.identifier);
+    char contentVarName[2048];
+    strcpy(contentVarName, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
-    const char *filename = getStringValue(strname);
+    const char *filename = getStringValue(strName);
+    const char *content = getStringValue(contentVarName);
     FILE *file = fopen(filename, "w");
     
     if (file == NULL) {
