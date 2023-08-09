@@ -142,7 +142,7 @@ print b
 var r = math.rand()
 var r  = r % 100
 print r
-var tes = "test.txt"
-write tes, hello
+var test = "test.txt"
+write test, hello
 var abc = read tes
 print abc
