@@ -73,6 +73,7 @@ typedef enum {
     TOKEN_RAND,
     TOKEN_UNIFORM,
     TOKEN_WRITE,
+    TOKEN_READ,
 } TokenType;
 
 typedef struct {
@@ -140,6 +141,7 @@ double expon(double base, double p);
 double nthRoot();
 double distance(double ax, double ay, double bx, double by);
 void writeToFile();
+char* readFromFile();
 
 void lexer(char *code) {
     input = code;
@@ -256,6 +258,9 @@ void advance() {
     } else if (strncmp(input, "write", 5) == 0) {
         currentToken.type = TOKEN_WRITE;
         input += 5;
+    }  else if (strncmp(input, "read", 4) == 0) {
+        currentToken.type = TOKEN_READ;
+        input += 4;
     } else if (strncmp(input, "while", 5) == 0) {
         currentToken.type = TOKEN_WHILE;
         input += 5;
@@ -539,6 +544,43 @@ void writeToFile() {
         printf("\033[1;31mWriting %s to file\033[0m \033[1;34m%s\033[0m\n", content, filename);
     }
 }
+
+char* readFromFile() {
+    eat(TOKEN_READ);
+    char strname[2048];
+    strcpy(strname, currentToken.identifier);
+    eat(TOKEN_IDENTIFIER);
+    const char *filename = getStringValue(strname);
+    FILE* file = fopen(filename, "r");
+    if (file == NULL) {
+        perror("Error opening file");
+        return NULL;
+    }
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char* content = (char*)malloc(file_size + 1);
+    if (content == NULL) {
+        fclose(file);
+        perror("Memory allocation error");
+        return NULL;
+    }
+
+    size_t bytes_read = fread(content, 1, file_size, file);
+    if (bytes_read != file_size) {
+        fclose(file);
+        free(content);
+        perror("Error reading file");
+        return NULL;
+    }
+
+    content[file_size] = '\0';
+
+    fclose(file);
+    return content;
+}
+
 
 double getVariableValue(const char *name) {
     for (int i = 0; i < numVariables; i++) {
@@ -1097,10 +1139,14 @@ void assignment() {
     strcpy(identifier, currentToken.identifier);
     eat(TOKEN_IDENTIFIER);
     eat(TOKEN_ASSIGN);
+    
     if (currentToken.type == TOKEN_STRING) {
         setStringValue(identifier, currentToken.string);
         eat(TOKEN_STRING);
-    } else {
+    } else if(currentToken.type == TOKEN_READ){
+        char *value = readFromFile();
+        setStringValue(identifier, value);
+    }else {
         double value = expression();
         setVariableValue(identifier, value);
     }
