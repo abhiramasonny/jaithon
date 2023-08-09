@@ -144,5 +144,5 @@ var r  = r % 100
 print r
 var test = "test.txt"
 write test, hello
-var abc = read tes
+var abc = read test
 print abc
