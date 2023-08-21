@@ -13,6 +13,7 @@ char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 int lines = 1;
 
+// Big list of tokens
 typedef enum {
     TOKEN_EOF,
     TOKEN_INT,
@@ -97,6 +98,7 @@ typedef struct {
 Variable variables[2048];
 int numVariables = 0;
 
+//predefined functions defenition
 void advance();
 void error(const char *message, const char *errorToken);
 void eat(TokenType type);
@@ -154,6 +156,7 @@ void skipToEndOfInput() {
     }
 }
 
+//Syntax defenition, parsing input data to tokens
 void advance() {
     while (isspace(*input)) {
         if (*input == '\n') {
@@ -385,6 +388,7 @@ void error(const char *message, const char *errorToken) {
     exit(1);
 }
 
+//poping current token, and advancing forward
 void eat(TokenType type) {
     if (currentToken.type == type) {
         advance();
