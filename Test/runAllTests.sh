@@ -15,7 +15,7 @@ do
       directory_filename="$directory/$filename"
 
       echo "$filename"
-      ./start.sh "$directory_filename"
+      ./interpreter "$directory_filename"
     fi
   fi
 done
