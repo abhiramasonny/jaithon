@@ -62,7 +62,7 @@ Or you can run
 The way you create the jaithon path, is that you run 
 ``` bash
 cd config
-./path.sh #Folder where this code is stored as an argument
+./path.sh .. #Folder where this code is stored as an argument
 cd .. #if you want to get out of config
 ```
 
