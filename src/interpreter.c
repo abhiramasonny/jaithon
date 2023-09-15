@@ -10,6 +10,8 @@
 #define debug true
 #define MAX_FILENAME_LEN 256
 #define FILE_EXTENSION ".jai"
+#define MAX_FILENAME_LEN 256
+#define FILE_EXTENSION ".jai"
 
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
@@ -1364,25 +1366,8 @@ void executeFile(const char *filename) {
     free(code);
 }
 
-void shellMode() {
-    char code[MAX_FILENAME_LEN];
-    printf("SHELL MODE!!! Type 'exit' to quit.\n");
-    while (1) {
-        printf("> ");
-        if (fgets(code, sizeof(code), stdin) == NULL) {
-            break;  // EOF or smthn
-        }
-        
-        if (strncmp(code, "exit", 4) == 0) {
-            break;
-        }
-        
-        lexer(code);
-        program();
-    }
-}
-
 int main(int argc, char *argv[]) {
+    char filename[MAX_FILENAME_LEN];
     struct timeval stop, start;
     
     if (debug) {
@@ -1392,18 +1377,18 @@ int main(int argc, char *argv[]) {
     gettimeofday(&start, NULL);
 
     if (argc < 2) {
-        shellMode();
+        printf("Enter file name to interpret e.g., Test/jaithon: ");
+        scanf("%255[^\n]%*c", filename);
     } else {
-        char filename[MAX_FILENAME_LEN];
         strncpy(filename, argv[1], sizeof(filename) - 1);
         filename[sizeof(filename) - 1] = '\0';
-
-        if (!strstr(filename, FILE_EXTENSION)) {
-            strncat(filename, FILE_EXTENSION, sizeof(filename) - strlen(filename) - 1);
-        }
-
-        executeFile(filename);
     }
+
+    if (!strstr(filename, FILE_EXTENSION)) {
+        strncat(filename, FILE_EXTENSION, sizeof(filename) - strlen(filename) - 1);
+    }
+
+    executeFile(filename);
 
     gettimeofday(&stop, NULL);
 
