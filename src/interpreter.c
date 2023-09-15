@@ -8,6 +8,8 @@
 #include <sys/time.h>
 #define MAX_IMPORTED_FILES 2048
 #define debug true
+#define MAX_FILENAME_LEN 256
+#define FILE_EXTENSION ".jai"
 
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
@@ -1327,70 +1329,11 @@ void array() {
     numVariables++;
 }
 
-int main(int argc, char *argv[]) {
-    if(debug){
-        printf("====================YOU ARE IN DEBUG MODE====================\n");
-    }
-    if(argc < 2) {
-        char str[256];
-        printf("Enter file name to interpret e.g., Test/jaithon: ");
-        scanf("%[^\n]%*c", str);
-        struct timeval stop, start;
-        gettimeofday(&start, NULL);
-        char extension[5] = ".jai";
-        strcat(str,extension);
-        FILE *file = fopen(str, "r");
-        if (file == NULL) {
-            fprintf(stderr, "Error opening file\n");
-            return 1;
-        }
-
-        fseek(file, 0, SEEK_END);
-        long fileSize = ftell(file);
-        rewind(file);
-
-        char *code = malloc(fileSize + 1);
-        if (code == NULL) {
-            fprintf(stderr, "Memory allocation failed\n");
-            fclose(file);
-            return 1;
-        }
-
-        size_t bytesRead = fread(code, 1, fileSize, file);
-        if (bytesRead < fileSize) {
-            fprintf(stderr, "Error reading file\n");
-            fclose(file);
-            free(code);
-            return 1;
-        }
-
-        code[fileSize] = '\0';
-        fclose(file);
-
-        lexer(code);
-        program();
-    
-        free(code);
-        gettimeofday(&stop, NULL);
-        if(debug){
-            printf("\033[1;31mTook %lu us\033[0m\n", (stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec);
-        }
-        return 0;
-    }
-    
-    char str[256];
-    strncpy(str, argv[1], sizeof(str));
-    str[sizeof(str) - 1] = '\0';  // Ensure null-termination
-
-    struct timeval stop, start;
-    gettimeofday(&start, NULL);
-    char extension[5] = ".jai";
-    strncat(str, extension, sizeof(str) - strlen(str) - 1);
-    
-    FILE *file = fopen(str, "r");
+void executeFile(const char *filename) {
+    FILE *file = fopen(filename, "r");
     if (file == NULL) {
-        fprintf(stderr, "Error opening file\n");
-        return 1;
+        fprintf(stderr, "err opening\n");
+        exit(1);
     }
 
     fseek(file, 0, SEEK_END);
@@ -1399,29 +1342,58 @@ int main(int argc, char *argv[]) {
 
     char *code = malloc(fileSize + 1);
     if (code == NULL) {
-        fprintf(stderr, "Memory allocation failed\n");
+        fprintf(stderr, "mem allocation err\n");
         fclose(file);
-        return 1;
+        exit(1);
     }
 
     size_t bytesRead = fread(code, 1, fileSize, file);
     if (bytesRead < fileSize) {
-        fprintf(stderr, "Error reading file\n");
+        fprintf(stderr, "err reading\n");
         fclose(file);
         free(code);
-        return 1;
+        exit(1);
     }
 
     code[fileSize] = '\0';
     fclose(file);
-    
+
     lexer(code);
     program();
-
+    
     free(code);
-    gettimeofday(&stop, NULL);
-    if(debug){
-        printf("\033[1;31mTook %f seconds\033[0m\n", ((stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec)*0.000001);
+}
+
+int main(int argc, char *argv[]) {
+    char filename[MAX_FILENAME_LEN];
+    struct timeval stop, start;
+    
+    if (debug) {
+        printf("====================YOU ARE IN DEBUG MODE====================\n");
     }
+
+    gettimeofday(&start, NULL);
+
+    if (argc < 2) {
+        printf("Enter file name to interpret e.g., Test/jaithon: ");
+        scanf("%255[^\n]%*c", filename);
+    } else {
+        strncpy(filename, argv[1], sizeof(filename) - 1);
+        filename[sizeof(filename) - 1] = '\0';
+    }
+
+    if (!strstr(filename, FILE_EXTENSION)) {
+        strncat(filename, FILE_EXTENSION, sizeof(filename) - strlen(filename) - 1);
+    }
+
+    executeFile(filename);
+
+    gettimeofday(&stop, NULL);
+
+    if (debug) {
+        double elapsed = ((stop.tv_sec - start.tv_sec) * 1000000.0 + stop.tv_usec - start.tv_usec) * 0.000001;
+        printf("\033[1;31mTook %f seconds\033[0m\n", elapsed);
+    }
+    
     return 0;
 }
