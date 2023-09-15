@@ -6,14 +6,17 @@
 #include <time.h>
 #include <stdbool.h>
 #include <sys/time.h>
+#include <unistd.h>
+
 #define MAX_IMPORTED_FILES 2048
-#define debug true
 #define MAX_FILENAME_LEN 256
 #define FILE_EXTENSION ".jai"
 
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 int lines = 1;
+bool debug = false;
+
 
 // Big list of tokens
 typedef enum {
@@ -1381,28 +1384,44 @@ void shellMode() {
         program();
     }
 }
-
 int main(int argc, char *argv[]) {
     struct timeval stop, start;
-    
+    int opt;
+    char filename[MAX_FILENAME_LEN] = {0};
+
+    while ((opt = getopt(argc, argv, "ds")) != -1) {
+        switch (opt) {
+            case 'd':
+                debug = 1;
+                break;
+            case 's':
+                shellMode();
+                return 0;
+            default:
+                fprintf(stderr, "Usage: %s [-d] [-s] [filename]\n", argv[0]);
+                return 1;
+        }
+    }
+
     if (debug) {
         printf("====================YOU ARE IN DEBUG MODE====================\n");
     }
 
     gettimeofday(&start, NULL);
 
-    if (argc < 2) {
-        shellMode();
-    } else {
-        char filename[MAX_FILENAME_LEN];
-        strncpy(filename, argv[1], sizeof(filename) - 1);
+    if (optind < argc) {
+        strncpy(filename, argv[optind], sizeof(filename) - 1);
         filename[sizeof(filename) - 1] = '\0';
+    }
 
+    if (strlen(filename) > 0) {
         if (!strstr(filename, FILE_EXTENSION)) {
             strncat(filename, FILE_EXTENSION, sizeof(filename) - strlen(filename) - 1);
         }
 
         executeFile(filename);
+    } else {
+        shellMode();
     }
 
     gettimeofday(&stop, NULL);
@@ -1411,6 +1430,6 @@ int main(int argc, char *argv[]) {
         double elapsed = ((stop.tv_sec - start.tv_sec) * 1000000.0 + stop.tv_usec - start.tv_usec) * 0.000001;
         printf("\033[1;31mTook %f seconds\033[0m\n", elapsed);
     }
-    
+
     return 0;
 }
