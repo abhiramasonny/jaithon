@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <getopt.h>
 
 #define MAX_IMPORTED_FILES 2048
 #define MAX_FILENAME_LEN 256
@@ -16,7 +17,7 @@ char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 int lines = 1;
 bool debug = false;
-
+int auto_extension = 1;
 
 // Big list of tokens
 typedef enum {
@@ -1384,21 +1385,62 @@ void shellMode() {
         program();
     }
 }
+
+void displayVersion() {
+    FILE *file = fopen("config/version.txt", "r");
+    if (!file) {
+        fprintf(stderr, "Error: Unable to open version file.\n");
+        return;
+    }
+
+    char line[32];
+    while (fgets(line, sizeof(line), file)) {
+        printf("%s", line);
+    }
+
+    fclose(file);
+}
+
+void displayHelp() {
+    printf("Usage: %s [options] [filename]\n", "YourProgramName");
+    printf("\nOptions:\n");
+    printf("  -d               Turn debug mode on\n");
+    printf("  -s               Enter shell mode\n");
+    printf("  -v, --version    Program Version\n");
+    printf("  -h, --help       You are seeking Help!\n");
+    printf("  --no-extension   Do not append .jai extension to filename\n");
+}
+
 int main(int argc, char *argv[]) {
     struct timeval stop, start;
     int opt;
-    char filename[MAX_FILENAME_LEN] = {0};
 
-    while ((opt = getopt(argc, argv, "ds")) != -1) {
+    static struct option long_options[] = {
+        {"version", no_argument, 0, 'v'},
+        {"help", no_argument, 0, 'h'},
+        {"no-extension", no_argument, 0, 1000},
+    };
+
+    int long_index = 0;
+    while ((opt = getopt_long(argc, argv, "dsvh", long_options, &long_index)) != -1) {
         switch (opt) {
             case 'd':
-                debug = 1;
+                debug = true;
                 break;
             case 's':
                 shellMode();
                 return 0;
+            case 'v':
+                displayVersion();
+                return 0;
+            case 'h':
+                displayHelp();
+                return 0;
+            case 1000:
+                auto_extension = 0;
+                break;
             default:
-                fprintf(stderr, "Usage: %s [-d] [-s] [filename]\n", argv[0]);
+                displayHelp();
                 return 1;
         }
     }
@@ -1409,13 +1451,14 @@ int main(int argc, char *argv[]) {
 
     gettimeofday(&start, NULL);
 
+    char filename[MAX_FILENAME_LEN] = {0};
     if (optind < argc) {
         strncpy(filename, argv[optind], sizeof(filename) - 1);
         filename[sizeof(filename) - 1] = '\0';
     }
 
     if (strlen(filename) > 0) {
-        if (!strstr(filename, FILE_EXTENSION)) {
+        if (auto_extension && !strstr(filename, FILE_EXTENSION)) {
             strncat(filename, FILE_EXTENSION, sizeof(filename) - strlen(filename) - 1);
         }
 
