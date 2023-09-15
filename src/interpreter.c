@@ -967,7 +967,7 @@ double factor() {
             if (currentToken.type == TOKEN_LPAREN ){
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
-                unsigned int seed = (tv.tv_sec * 1000000 + tv.tv_usec / 1000000 )*lines;
+                unsigned int seed = (int)((tv.tv_sec * 1000000 + tv.tv_usec / 1000000 )/lines + cos(lines));
                 srand(seed);
                 eat(TOKEN_LPAREN);
                 eat(TOKEN_RPAREN);
@@ -979,7 +979,7 @@ double factor() {
                 eat(TOKEN_RPAREN);
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
-                unsigned int seed = (tv.tv_sec * 1000000 + tv.tv_usec / 1000000)*lines;
+                unsigned int seed = (int)((tv.tv_sec * 1000000 + tv.tv_usec / 1000000 )/lines + cos(lines));
                 srand(seed);
                 return ((double)rand() / (double)RAND_MAX);
             }
