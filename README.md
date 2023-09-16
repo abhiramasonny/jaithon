@@ -25,58 +25,38 @@ The primary problem JAITHON addresses is the stress often felt by young learners
 ## Usage
 
 To use the array compiler/interpreter on UNIX, follow these steps:
-<details style="color: darkred;"><summary><b>Show instructions</b></summary>
 
 ```bash
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
-make
-./interpreter
+make #for updates
+./interpreter Test/jaithon
 ```
 
 **You must have gcc and Make installed otherwise the script wont work.**
-Then type this as follow up to *Enter file name to interpret*
-
-```
-jaithon
-```
 
 Or you can run
 
 ```bash
-./interpreter filename
+./interpreter
 ```
 
-</details>
+<br>
+for a shell.
+
+<br>
+There are a lot more options you can access by doing
+
+```bash
+./interpreter -h
+```
 
 ### Writing code
 
 1. Create a new file with the .jai extension, then write code in the JAI language.
 2. Execute the compiler/interpreter with *filename* as input/argument.
 3. The programs output will be displayed.
-4. In the top of the interpreter.c file, there is a variable called debug. Turning that off gives the full intended user experience.
-5. If you do this, you will need to run **make** again, to recompile the binary.
 
-### Path
-
-The way you create the jaithon path, is that you run 
-``` bash
-cd config
-./path.sh .. #Folder where this code is stored as an argument
-cd .. #if you want to get out of config
-```
-
-
-For example; ./path.sh Users/abhiramasonny/developer/C/jaithon
-
-Then you can open any terminal window and use the interpreter command to interpret any jaithon code in your computer.
-For example...
-
-```bash
-interpreter
-```
-
-in any directory would work.
 
 ## Features
 
@@ -99,7 +79,7 @@ in any directory would work.
 
 For more documentation, visit
 
-```
+```shell
 Documentation/grammar.txt
 ```
 
@@ -150,7 +130,7 @@ cp -r jai ~/.vscode/extensions
 ```
 
 **Reload VS-Code**
-Note: this is for mac/linux.
+Note: this is for Mac/linux.
 <br>
 Hasn't been tested on windows
 
@@ -158,7 +138,7 @@ Hasn't been tested on windows
 
 Examples are located in the Test directory. There is also documentation of the syntax located at
 
-```
+```shell
 Documentation/grammar.txt
 ```
 
