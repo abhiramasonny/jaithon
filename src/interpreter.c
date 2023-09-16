@@ -1243,7 +1243,12 @@ void printStatement() {
             }
         }
         double value = getVariableValue(identifier);
+        int int_value = (int)value;
+        if (int_value == value){
+            printf("%d\n", int_value);
+        }else{
         printf("%f\n", value);
+        }
     } else {
         double value = expression();
         printf("%f\n", value);
