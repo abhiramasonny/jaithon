@@ -1405,7 +1405,7 @@ void displayVersion() {
 }
 
 void displayHelp() {
-    printf("Usage: %s [options] [filename]\n", "YourProgramName");
+    printf("Usage: %s [options] [filename]\n", "JAITHON");
     printf("\nOptions:\n");
     printf("  -d               Turn debug mode on\n");
     printf("  -s               Enter shell mode\n");
