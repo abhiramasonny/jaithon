@@ -82,6 +82,7 @@ For more documentation, visit
 ```shell
 Documentation/grammar.txt
 ```
+<a href="Imgs/Shell.png" target="_blank"><img src="Imgs/Shell.png" alt="Jaithon Shell"></a>
 
 **NOTE** Jaithon is actually Faster then its counterpart Python! Here are the results from the tests I ran.
 <a href="Imgs/JaithonResult.png" target="_blank"><img src="Imgs/JaithonResult.png" alt="Jaithon Speed Result"></a>
