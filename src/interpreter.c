@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <stdlib.h>
 
 #define MAX_IMPORTED_FILES 2048
 #define MAX_FILENAME_LEN 256
@@ -86,6 +87,7 @@ typedef enum {
     TOKEN_UNIFORM,
     TOKEN_WRITE,
     TOKEN_READ,
+    TOKEN_SYSTEM,
 } TokenType;
 
 typedef struct {
@@ -269,6 +271,9 @@ void advance() {
     } else if (strncmp(input, "or", 2) == 0) {
         currentToken.type = TOKEN_OR;
         input += 2;
+    } else if (strncmp(input, "system", 6) == 0) {
+        currentToken.type = TOKEN_SYSTEM;
+        input += 6;
     } else if (strncmp(input, "write", 5) == 0) {
         currentToken.type = TOKEN_WRITE;
         input += 5;
@@ -1297,7 +1302,15 @@ void statement() {
         }
     } else if (currentToken.type == TOKEN_WRITE){
         writeToFile();
-    } else {
+    } else if (currentToken.type == TOKEN_SYSTEM){
+        eat(TOKEN_SYSTEM);
+        char cmd[2048];
+        strcpy(cmd, currentToken.identifier);
+        eat(TOKEN_IDENTIFIER);
+        system(cmd);
+    }
+        
+        else {
         error("Invalid statement", currentToken.identifier);
     }
 }
