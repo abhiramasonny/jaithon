@@ -45,6 +45,7 @@ Or you can run
 for a shell.
 
 ![Shell](Imgs/Shell.png)  
+
 <br>
 There are a lot more options you can access by doing
 
