@@ -706,8 +706,6 @@ double getTimeInSeconds() {
 
 double timeFunction() {
     eat(TOKEN_TIME);
-    eat(TOKEN_LPAREN);
-    eat(TOKEN_RPAREN);
     return getTimeInSeconds();
 }
 
