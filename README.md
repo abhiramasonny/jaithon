@@ -10,7 +10,7 @@
 ***We suffer so that you don't***
 <br>
 <br>
-This is a simple compiler/interpreter that supports array declarations and operations. It can parse and execute code containing array declarations, variable assignments, print statements, import statements, input statements, time functions, and much more. The objective behind this interpreter is to provide a fun and easy way to get introduced to programming.
+This is a simple compiler/interpreter that supports operations. It can parse and execute code containing variable assignments, print statements, import statements, input statements, time functions, and much more. The objective behind this interpreter is to provide a fun and easy way to get introduced to programming.
 
 ### Description
 
@@ -24,7 +24,7 @@ The primary problem JAITHON addresses is the stress often felt by young learners
 
 ## Usage
 
-To use the array compiler/interpreter on UNIX, follow these steps:
+To use the compiler/interpreter on UNIX, follow these steps:
 
 ```bash
 git clone https://github.com/abhiramasonny/jaithon
@@ -63,8 +63,6 @@ There are a lot more options you can access by doing
 
 - Variable Assignment: You can assign values to variables using the var keyword. Syntax: *var x = 5*
 - String: You can do strings by doing same as variable but with Quotes. Sytnax: *var hi = "hello world"*
-- Array Declaration: You can init arrays using the array keyword. Syntax: *array arr = [1]*
-- Array Element Modification: You can modify elements of an array using the dot notation. Syntax: *arr.add(0, 4).*
 - Print Statement: You can use the print keyword to print values to the console. Syntax: *print x*
 - Mathematical Expressions: You can perform arithmetic operations (+, -, *, /) on numbers.
 - Comparisons: you can preform comparisons by using the > and < symbols. Syntax: *var a = 1>4* >> the output would be a = 0 because that statement is false.
@@ -99,13 +97,8 @@ time ./jaithon filename
 
 1. **Read Input Code**: Read the code to be compiled/interpreted.
 2. **Initialize Token List**: Convert the input code into tokens.
-3. **Initialize Variables and Arrays**: Initialize storage for values.
 4. **Start Parsing Program**: Begin parsing the program.
 5. **Are Tokens Remaining Loop:**: Loop while tokens exist, otherwise GOTO 22.
-6. **If Array Declaration**: Parse and store array details.
-7. **Parse Array Declaration**: Read array size and elements.
-8. **Identifier Check**: Handle variable assignment and print statements.
-9. **If Array**: Parse array access or variable assignment.
 10. **Parse Variable Assignment**: Assign variable a value.
 11. **If Print Statement**: Parse and display variable/expression value.
 12. **Parse Print Statement**: Evaluate and print.
@@ -117,7 +110,7 @@ time ./jaithon filename
 18. **Parse Time Function**: Calculate the time-related value.
 19. **End of loop**: Continue processing remaining tokens. GOTO 5 (Loop back).
 20. **All Tokens Processed**: Execution complete, proceed to the end.
-21. **Error Handling**: Handle parsing errors or undefined variables/arrays.
+21. **Error Handling**: Handle parsing errors or undefined variables.
 22. **Stop**: End the interpreter's execution.
 
 ## Syntax Highlighting
