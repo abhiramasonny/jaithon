@@ -44,7 +44,7 @@ Or you can run
 <br>
 for a shell.
 
-<a href="Imgs/Shell.png" target="_blank"><img src="Imgs/Shell.png" alt="Jaithon Shell"></a>
+<img src="Imgs/Shell.png" alt="Jaithon Shell">
 
 <br>
 There are a lot more options you can access by doing
