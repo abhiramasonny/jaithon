@@ -61,7 +61,7 @@ var ndum = num + dum
 print ndum
 
 #time test
-var t = time()
+var t = time
 print t
 
 #not test
