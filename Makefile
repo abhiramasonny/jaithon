@@ -1,4 +1,4 @@
-TARGET = interpreter
+TARGET = jaithon
 
 CC = gcc
 CFLAGS = -Wall

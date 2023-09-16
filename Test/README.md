@@ -5,7 +5,7 @@ This directory contains test applications to run with my programming language
 ## Usage
 To use these applications made with Jaithon, run the interpreter with
 ```shell
-./interpreter
+./jaithon
 ```
 <br>
 Then put Test/filename as input for the filename to interpret.

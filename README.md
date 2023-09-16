@@ -30,7 +30,7 @@ To use the array compiler/interpreter on UNIX, follow these steps:
 git clone https://github.com/abhiramasonny/jaithon
 cd jaithon
 make #for updates
-./interpreter Test/jaithon
+./jaithon Test/jaithon
 ```
 
 **You must have gcc and Make installed otherwise the script wont work.**
@@ -38,7 +38,7 @@ make #for updates
 Or you can run
 
 ```bash
-./interpreter
+./jaithon
 ```
 
 <br>
@@ -49,7 +49,7 @@ for a shell.
 There are a lot more options you can access by doing
 
 ```bash
-./interpreter -h
+./jaithon -h
 ```
 
 ### Writing code
@@ -89,8 +89,8 @@ Documentation/grammar.txt
 <a href="Imgs/PythonResult.png" target="_blank"><img src="Imgs/PythonResult.png" alt="Python Speed Result"></a>
 Please Note, the 0.05 user time in python is not 'user' input. It can not be avoided. You can try the time command on your UNIX running computer with
 
-```bash
-time ./interpreter filename
+```sh
+time ./jaithon filename
 ```
 
 <br>

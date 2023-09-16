@@ -23,8 +23,8 @@ int numImportedFiles = 0;
 int lines = 1;
 bool debug = false;
 int auto_extension = 1;
-int log_enabled = 0;
-int shell_mode = 0;
+bool log_enabled = false;
+bool shell_mode = false;
 
 // Big list of tokens
 typedef enum {
@@ -406,7 +406,7 @@ void advance() {
 
 void error(const char *message, const char *errorToken) {
     fprintf(stderr, "Error: %s. Found: %s\n", message, errorToken);
-    if(shell_mode == 0){
+    if(shell_mode == false){
         exit(1);
     }
 }
@@ -419,7 +419,7 @@ void eat(TokenType type) {
         char tokenName[256];
         snprintf(tokenName, sizeof(tokenName), "%d", currentToken.type);
         error("Unexpected token", tokenName);
-        if(shell_mode == 0){
+        if(shell_mode == false){
             exit(1);
         }
     }
@@ -1299,7 +1299,7 @@ void statement() {
     } else if (currentToken.type == TOKEN_WHILE) {
         whileStatement();
     } else if (currentToken.type == TOKEN_BREAK) {
-        if(shell_mode == 0){
+        if(shell_mode == false){
             exit(1);
         }
     } else if (currentToken.type == TOKEN_WRITE){
@@ -1312,7 +1312,7 @@ void statement() {
         system(cmd);
     }
         
-        else {
+    else {
         error("Invalid statement", currentToken.identifier);
     }
 }
@@ -1401,7 +1401,7 @@ void executeFile(const char *filename) {
 
 void shellMode() {
     char *input;
-    shell_mode = 1;
+    shell_mode = true;
     printf("SHELL MODE!!!. Type 'exit' to quit.\n");
     while (1) {
         input = readline("> ");
@@ -1500,7 +1500,7 @@ int main(int argc, char *argv[]) {
                 displayHelp();
                 return 0;
             case 'l':
-                log_enabled = 1;
+                log_enabled = true;
                 writeLog("Logging enabled.");
                 break;
             case 1000: // --no-extension
