@@ -25,6 +25,7 @@ bool debug = false;
 int auto_extension = 1;
 int log_enabled = 0;
 int shell_mode = 0;
+
 // Big list of tokens
 typedef enum {
     TOKEN_EOF,
