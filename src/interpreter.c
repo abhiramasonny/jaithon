@@ -8,6 +8,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #define MAX_IMPORTED_FILES 2048
 #define MAX_FILENAME_LEN 256
@@ -861,7 +863,7 @@ double binaryToTen(double n) {
 }
 
 double binaryAdd(){
-    double b1, b2, dec1, dec2, ans;
+    double b1, b2, dec1, dec2;
     eat(TOKEN_LPAREN);
     b1=(double)expression();
     eat(TOKEN_COMMA);
@@ -1101,7 +1103,7 @@ double expression() {
         } else if(currentToken.type == TOKEN_XOR) {
             eat(TOKEN_XOR);
             double value2 = term();
-            if(value && value2 || !(value && value2)){
+            if((value && value2) || !(value && value2)){
                 value = 0;
             } else if (value || value2){
                 value = 1;
@@ -1383,26 +1385,28 @@ void executeFile(const char *filename) {
 }
 
 void shellMode() {
-    char code[MAX_FILENAME_LEN];
+    char *input;
     shell_mode = 1;
-    printf("SHELL MODE!!! Type 'exit' to quit.\n");
+    printf("SHELL MODE!!!. Type 'exit' to quit.\n");
     while (1) {
-        printf("> ");
-        if (fgets(code, sizeof(code), stdin) == NULL) {
-            break;  // EOF or smthn
+        input = readline("> ");
+        if (!input) {
+            break;
         }
         
-        if (strncmp(code, "exit", 4) == 0) {
+        if (strcmp(input, "exit") == 0) {
+            free(input);
             break;
-        } 
-        else if (strncmp(code, "quit()", 4) == 0) {
-            break;
-        } 
-        else if (strncmp(code, "quit", 4) == 0) {
-            break;
-        } 
-        lexer(code);
+        }
+
+        if (input && *input) {
+            add_history(input);
+        }
+        
+        lexer(input);
         program();
+
+        free(input);
     }
 }
 
