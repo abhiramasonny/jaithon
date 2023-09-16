@@ -12,12 +12,15 @@
 #define MAX_IMPORTED_FILES 2048
 #define MAX_FILENAME_LEN 256
 #define FILE_EXTENSION ".jai"
+#define LOG_FILE "config/log.txt"
+#define VERSION_FILE "config/version.txt"
 
 char importedFiles[MAX_IMPORTED_FILES][256];
 int numImportedFiles = 0;
 int lines = 1;
 bool debug = false;
 int auto_extension = 1;
+int log_enabled = 0;
 
 // Big list of tokens
 typedef enum {
@@ -1387,7 +1390,7 @@ void shellMode() {
 }
 
 void displayVersion() {
-    FILE *file = fopen("config/version.txt", "r");
+    FILE *file = fopen(VERSION_FILE, "r");
     if (!file) {
         fprintf(stderr, "Error: Unable to open version file.\n");
         return;
@@ -1411,6 +1414,28 @@ void displayHelp() {
     printf("  --no-extension   Do not append .jai extension to filename\n");
 }
 
+void writeLog(const char *message) {
+    if (!log_enabled) {
+        return;
+    }
+
+    FILE *file = fopen(LOG_FILE, "a");
+    if (file) {
+        time_t current_time = time(NULL);
+        char *time_str = ctime(&current_time);
+        
+        size_t len = strlen(time_str);
+        if (len > 0 && time_str[len - 1] == '\n') {
+            time_str[len - 1] = '\0';
+        }
+
+        fprintf(file, "[%s] %s\n", time_str, message);
+        fclose(file);
+    } else {
+        fprintf(stderr, "Failed to write to log file.\n");
+    }
+}
+
 int main(int argc, char *argv[]) {
     struct timeval stop, start;
     int opt;
@@ -1419,13 +1444,15 @@ int main(int argc, char *argv[]) {
         {"version", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
         {"no-extension", no_argument, 0, 1000},
+        {"log", no_argument, 0, 'l'},
+        {0, 0, 0, 0}
     };
 
     int long_index = 0;
-    while ((opt = getopt_long(argc, argv, "dsvh", long_options, &long_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dsvhlp", long_options, &long_index)) != -1) {
         switch (opt) {
             case 'd':
-                debug = true;
+                debug = 1;
                 break;
             case 's':
                 shellMode();
@@ -1436,7 +1463,11 @@ int main(int argc, char *argv[]) {
             case 'h':
                 displayHelp();
                 return 0;
-            case 1000:
+            case 'l':
+                log_enabled = 1;
+                writeLog("Logging enabled.");
+                break;
+            case 1000: // --no-extension
                 auto_extension = 0;
                 break;
             default:
@@ -1447,9 +1478,11 @@ int main(int argc, char *argv[]) {
 
     if (debug) {
         printf("====================YOU ARE IN DEBUG MODE====================\n");
+        writeLog("Debug mode activated.");
     }
 
     gettimeofday(&start, NULL);
+    writeLog("Program execution started.");
 
     char filename[MAX_FILENAME_LEN] = {0};
     if (optind < argc) {
@@ -1461,9 +1494,10 @@ int main(int argc, char *argv[]) {
         if (auto_extension && !strstr(filename, FILE_EXTENSION)) {
             strncat(filename, FILE_EXTENSION, sizeof(filename) - strlen(filename) - 1);
         }
-
+        writeLog("Executing provided file.");
         executeFile(filename);
     } else {
+        writeLog("Entering shell mode.");
         shellMode();
     }
 
@@ -1472,7 +1506,11 @@ int main(int argc, char *argv[]) {
     if (debug) {
         double elapsed = ((stop.tv_sec - start.tv_sec) * 1000000.0 + stop.tv_usec - start.tv_usec) * 0.000001;
         printf("\033[1;31mTook %f seconds\033[0m\n", elapsed);
+        char log_message[100];
+        snprintf(log_message, sizeof(log_message), "Execution took %f seconds.", elapsed);
+        writeLog(log_message);
     }
 
+    writeLog("Program execution completed.");
     return 0;
 }
