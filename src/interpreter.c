@@ -21,7 +21,7 @@ int lines = 1;
 bool debug = false;
 int auto_extension = 1;
 int log_enabled = 0;
-
+int shell_mode = 0;
 // Big list of tokens
 typedef enum {
     TOKEN_EOF,
@@ -394,7 +394,9 @@ void advance() {
 
 void error(const char *message, const char *errorToken) {
     fprintf(stderr, "Error: %s. Found: %s\n", message, errorToken);
-    exit(1);
+    if(shell_mode == 0){
+        exit(1);
+    }
 }
 
 //poping current token, and advancing forward
@@ -406,7 +408,9 @@ void eat(TokenType type) {
         char tokenName[256];
         snprintf(tokenName, sizeof(tokenName), "%d", currentToken.type);
         error("Unexpected token", tokenName);
-        exit(1);
+        if(shell_mode == 0){
+            exit(1);
+        }
     }
 }
 
@@ -1281,7 +1285,9 @@ void statement() {
     } else if (currentToken.type == TOKEN_WHILE) {
         whileStatement();
     } else if (currentToken.type == TOKEN_BREAK) {
-        exit(1);
+        if(shell_mode == 0){
+            exit(1);
+        }
     } else if (currentToken.type == TOKEN_WRITE){
         writeToFile();
     } else {
@@ -1373,6 +1379,7 @@ void executeFile(const char *filename) {
 
 void shellMode() {
     char code[MAX_FILENAME_LEN];
+    shell_mode = 1;
     printf("SHELL MODE!!! Type 'exit' to quit.\n");
     while (1) {
         printf("> ");
@@ -1382,8 +1389,13 @@ void shellMode() {
         
         if (strncmp(code, "exit", 4) == 0) {
             break;
-        }
-        
+        } 
+        else if (strncmp(code, "quit()", 4) == 0) {
+            break;
+        } 
+        else if (strncmp(code, "quit", 4) == 0) {
+            break;
+        } 
         lexer(code);
         program();
     }
