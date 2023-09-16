@@ -59,10 +59,7 @@ typedef enum {
     TOKEN_BINARY,
     TOKEN_CONV,
     TOKEN_BADD,
-    TOKEN_ARRAY,
     TOKEN_COMMA,
-    TOKEN_LBRACKET,
-    TOKEN_RBRACKET,
     TOKEN_DOT,
     TOKEN_INPUT,
     TOKEN_TIME,
@@ -104,9 +101,6 @@ typedef struct {
     char name[2048];
     double value;
     char stringValue[2048]; 
-    int isArray;
-    double *elements;
-    int size;
 } Variable;
 
 Variable variables[2048];
@@ -129,10 +123,6 @@ void writeToFile();
 char* readFromFile();
 double getVariableValue(const char *name);
 void setVariableValue(const char *name, double value);
-void setArrayValue(const char *name, int index, double value);
-void deleteArrayValue(const char *name, int index);
-void sortArray(double *array, int size);
-void arraySort(const char *name);
 double getTimeInSeconds();
 double timeFunction();
 double quadFunction();
@@ -150,19 +140,16 @@ double term();
 double expression();
 double argsMath();
 void assignment();
-void arrayAssignment();
-void arrayDeletion();
-void arraySort(const char *name);
 void printStatement();
 void varInputStatement();
 void statement();
 void program();
-void array();
 void executeFile(const char *filename);
 void shellMode();
 void displayVersion();
 void displayHelp();
 void writeLog(const char *message);
+
 
 void lexer(char *code) {
     input = code;
@@ -236,12 +223,6 @@ void advance() {
         input++;
     } else if (*input == ',') {
         currentToken.type = TOKEN_COMMA;
-        input++;
-    } else if (*input == '[') {
-        currentToken.type = TOKEN_LBRACKET;
-        input++;
-    } else if (*input == ']') {
-        currentToken.type = TOKEN_RBRACKET;
         input++;
     } else if (*input == '.') {
         currentToken.type = TOKEN_DOT;
@@ -324,9 +305,6 @@ void advance() {
     } else if (strncmp(input, "uniform", 7) == 0) {
         currentToken.type = TOKEN_UNIFORM;
         input += 7;
-    } else if (strncmp(input, "array", 5) == 0) {
-        currentToken.type = TOKEN_ARRAY;
-        input += 5;
     } else if (strncmp(input, "sin", 3) == 0) {
         currentToken.type = TOKEN_SIN;
         input += 3;
@@ -635,70 +613,6 @@ void setVariableValue(const char *name, double value) {
     numVariables++;
 }
 
-void setArrayValue(const char *name, int index, double value) {
-    for (int i = 0; i < numVariables; i++) {
-        if (strcmp(name, variables[i].name) == 0) {
-            if (variables[i].isArray) {
-                if (index >= 0 && index < variables[i].size) {
-                    variables[i].elements[index] = value;
-                    return;
-                } else {
-                    error("Array index out of bounds", name);
-                }
-            } else {
-                error("Variable is not an array", name);
-            }
-        }
-    }
-    error("Array not found", name);
-}
-
-void deleteArrayValue(const char *name, int index) {
-    for (int i = 0; i < numVariables; i++) {
-        if (strcmp(name, variables[i].name) == 0) {
-            if (variables[i].isArray) {
-                if (index >= 0 && index < variables[i].size) {
-                    variables[i].elements[index] = 0.0;
-                    return;
-                } else {
-                    error("Array index out of bounds", name);
-                }
-            } else {
-                error("Variable is not an array", name);
-            }
-        }
-    }
-    error("Array not found", name);
-}
-
-void sortArray(double *array, int size) {
-    for (int i = 1; i < size; i++) {
-        double key = array[i];
-        int j = i - 1;
-
-        while (j >= 0 && array[j] > key) {
-            array[j + 1] = array[j];
-            j = j - 1;
-        }
-
-        array[j + 1] = key;
-    }
-}
-
-void arraySort(const char *name) {
-    for (int i = 0; i < numVariables; i++) {
-        if (strcmp(name, variables[i].name) == 0) {
-            if (variables[i].isArray) {
-                sortArray(variables[i].elements, variables[i].size);
-                return;
-            } else {
-                error("Variable is not an array", name);
-            }
-        }
-    }
-    error("Array not found", name);
-}
-
 double getTimeInSeconds() {
     time_t currentTime = time(NULL);
     return difftime(currentTime, 0);
@@ -899,29 +813,6 @@ double factor() {
         char identifier[256];
         strcpy(identifier, currentToken.identifier);
         eat(TOKEN_IDENTIFIER);
-
-        if (currentToken.type == TOKEN_LBRACKET) {
-            eat(TOKEN_LBRACKET);
-            int index = (int)expression();
-            eat(TOKEN_RBRACKET);
-
-            for (int i = 0; i < numVariables; i++) {
-                if (strcmp(identifier, variables[i].name) == 0) {
-                    if (variables[i].isArray) {
-                        if (index >= 0 && index < variables[i].size) {
-                            return variables[i].elements[index];
-                        } else {
-                            error("Array index out of bounds", identifier);
-                        }
-                    } else {
-                        error("Variable is not an array", identifier);
-                    }
-                }
-            }
-            error("Array not found", identifier);
-            return 0;
-        }
-
         return getVariableValue(identifier);
     } else if (currentToken.type == TOKEN_LPAREN) {
         eat(TOKEN_LPAREN);
@@ -1177,39 +1068,6 @@ void assignment() {
     }
 }
 
-void arrayAssignment() {
-    char identifier[2048];
-    strcpy(identifier, currentToken.identifier);
-    eat(TOKEN_IDENTIFIER);
-    eat(TOKEN_DOT);
-    if (currentToken.type == TOKEN_IDENTIFIER) {
-        char methodName[256];
-        strcpy(methodName, currentToken.identifier);
-        eat(TOKEN_IDENTIFIER);
-        if (strcmp(methodName, "add") == 0) {
-            eat(TOKEN_LPAREN);
-            int index = (int)expression();
-            eat(TOKEN_COMMA);
-            double value = expression();
-            eat(TOKEN_RPAREN);
-            setArrayValue(identifier, index, value);
-        } else if (strcmp(methodName, "del") == 0) {
-            eat(TOKEN_LPAREN);
-            int index = (int)expression();
-            eat(TOKEN_RPAREN);
-            deleteArrayValue(identifier, index);
-        } else if (strcmp(methodName, "sort") == 0) {
-            eat(TOKEN_LPAREN);
-            eat(TOKEN_RPAREN);
-            arraySort(identifier);
-        } else {
-            error("Invalid array method", methodName);
-        }
-    } else {
-        error("Invalid array method", currentToken.identifier);
-    }
-}
- 
 void printStatement() {
     eat(TOKEN_PRINT);
     if (currentToken.type == TOKEN_IDENTIFIER) {
@@ -1227,28 +1085,6 @@ void printStatement() {
             printf("%s\n", getStringValue(identifier));
             return;
         } 
-        int isArray = 0;
-        for (int i = 0; i < numVariables; i++) {
-            if (strcmp(identifier, variables[i].name) == 0) {
-                isArray = variables[i].isArray;
-                break;
-            }
-        }
-        if (isArray) {
-            for (int i = 0; i < numVariables; i++) {
-                if (strcmp(identifier, variables[i].name) == 0) {
-                    printf("[");
-                    for (int j = 0; j < variables[i].size; j++) {
-                        printf("%f", variables[i].elements[j]);
-                        if (j < variables[i].size - 1) {
-                            printf(", ");
-                        }
-                    }
-                    printf("]\n");
-                    return;
-                }
-            }
-        }
         double value = getVariableValue(identifier);
         int int_value = (int)value;
         if (int_value == value){
@@ -1292,8 +1128,6 @@ void statement() {
         printStatement();
     } else if (currentToken.type == TOKEN_INPUT) {
         varInputStatement();
-    } else if (currentToken.type == TOKEN_IDENTIFIER) {
-        arrayAssignment();
     } else if (currentToken.type == TOKEN_WHILE) {
         whileStatement();
     } else if (currentToken.type == TOKEN_BREAK) {
@@ -1317,9 +1151,7 @@ void statement() {
 
 void program() {
     while (currentToken.type != TOKEN_EOF) {
-        if (currentToken.type == TOKEN_ARRAY) {
-            array();
-        } else if (currentToken.type == TOKEN_IMPORT) {
+        if (currentToken.type == TOKEN_IMPORT) {
             eat(TOKEN_IMPORT);
             char filename[2048];
             strcpy(filename, currentToken.identifier);
@@ -1336,30 +1168,6 @@ void program() {
             statement();
         }
     }
-}
-
-
-void array() {
-    eat(TOKEN_ARRAY);
-    char arrayName[2048];
-    strcpy(arrayName, currentToken.identifier);
-    eat(TOKEN_IDENTIFIER);
-    eat(TOKEN_ASSIGN);
-    eat(TOKEN_LBRACKET);
-    int size = (int)expression();
-    eat(TOKEN_RBRACKET);
-
-    double *elements = malloc(size * sizeof(double));
-    for (int i = 0; i < size; i++) {
-        elements[i] = 0.0;
-    }
-
-    strcpy(variables[numVariables].name, arrayName);
-    variables[numVariables].value = 0.0;
-    variables[numVariables].isArray = 1;
-    variables[numVariables].elements = elements;
-    variables[numVariables].size = size;
-    numVariables++;
 }
 
 void executeFile(const char *filename) {

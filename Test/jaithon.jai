@@ -7,18 +7,6 @@ var greatorthan = nums>3
 print greatorthan
 if lessthan then do print 1
 
-#array test
-array a = [5]
-print a
-a.add(0, 120.012)
-a.add(2, 3)
-a.add(4,120.013)
-print a
-a.del(4)
-print a
-a.sort()
-print a
-
 #sin test
 var angle = 0.5
 var result = math.sin(angle, deg)
