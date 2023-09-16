@@ -44,8 +44,7 @@ Or you can run
 <br>
 for a shell.
 
-<img src="Imgs/Shell.png" alt="Jaithon Shell">
-
+![Shell](Imgs/Shell.png)  
 <br>
 There are a lot more options you can access by doing
 
