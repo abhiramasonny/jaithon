@@ -112,10 +112,39 @@ typedef struct {
 Variable variables[2048];
 int numVariables = 0;
 
-//predefined functions defenition
+//predefined functions
+void lexer(char *code);
+void skipToEndOfInput();
 void advance();
 void error(const char *message, const char *errorToken);
 void eat(TokenType type);
+void skipToEnd();
+void ifStatement();
+void whileStatement();
+void setStringValue(const char *name, const char *value);
+const char* getStringValue(const char *name);
+int areEqual(const char *str1, const char *str2);
+void importFile(const char *filename);
+void writeToFile();
+char* readFromFile();
+double getVariableValue(const char *name);
+void setVariableValue(const char *name, double value);
+void setArrayValue(const char *name, int index, double value);
+void deleteArrayValue(const char *name, int index);
+void sortArray(double *array, int size);
+void arraySort(const char *name);
+double getTimeInSeconds();
+double timeFunction();
+double quadFunction();
+int factorial(int n);
+double expon(double base, double p);
+double nthRoot();
+double distance(double ax, double ay, double bx, double by);
+double pythagoreanTheorem();
+double decimalToBinary(double n);
+double binaryToTen(double n);
+double binaryAdd();
+double binaryConversion();
 double factor();
 double term();
 double expression();
@@ -129,35 +158,11 @@ void varInputStatement();
 void statement();
 void program();
 void array();
-void importFile(const char *filename);
-void skipToEndOfInput();
-double quadFunction();
-void skipToEnd();
-void ifStatement();
-void whileStatement();
-void setStringValue(const char *name, const char *value);
-const char* getStringValue(const char *name);
-int areEqual(const char *str1, const char *str2);
-double getVariableValue(const char *name);
-void setVariableValue(const char *name, double value);
-void setArrayValue(const char *name, int index, double value);
-void deleteArrayValue(const char *name, int index);
-void sortArray(double *array, int size);
-void arraySort(const char *name);
-double getTimeInSeconds();
-double timeFunction();
-double quadFunction();
-double pythagoreanTheorem();
-double decimalToBinary(double n);
-double binaryConversion();
-double binaryToTen(double n);
-double binaryAdd();
-int factorial(int n);
-double expon(double base, double p);
-double nthRoot();
-double distance(double ax, double ay, double bx, double by);
-void writeToFile();
-char* readFromFile();
+void executeFile(const char *filename);
+void shellMode();
+void displayVersion();
+void displayHelp();
+void writeLog(const char *message);
 
 void lexer(char *code) {
     input = code;
@@ -170,7 +175,6 @@ void skipToEndOfInput() {
     }
 }
 
-//Syntax defenition, parsing input data to tokens
 void advance() {
     while (isspace(*input)) {
         if (*input == '\n') {
@@ -407,7 +411,6 @@ void error(const char *message, const char *errorToken) {
     }
 }
 
-//poping current token, and advancing forward
 void eat(TokenType type) {
     if (currentToken.type == type) {
         advance();
@@ -606,7 +609,6 @@ char* readFromFile() {
     fclose(file);
     return content;
 }
-
 
 double getVariableValue(const char *name) {
     for (int i = 0; i < numVariables; i++) {
@@ -1120,7 +1122,6 @@ double expression() {
     return value;
 }
 
-//cos sin tan asin acos atan sqrt. Started out as trig, and now is basically one args math.
 double argsMath() {
     TokenType functionType = currentToken.type;
     eat(functionType);
