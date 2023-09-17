@@ -244,8 +244,13 @@ void advance() {
         currentToken.type = TOKEN_LESS_THAN;
         input++;
     } else if (*input == '=') {
-        currentToken.type = TOKEN_ASSIGN;
-        input++;
+        if (input[1] == '=') {
+            currentToken.type = TOKEN_EQ;
+            input += 2;
+        } else{
+            currentToken.type = TOKEN_ASSIGN;
+            input++;
+        }
     } else if (*input == '!') {
         currentToken.type = TOKEN_FACTORIAL;
         input++;
@@ -261,9 +266,6 @@ void advance() {
     } else if ((strncmp(input, "then", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_THEN;
         input += 4;
-    } else if ((strncmp(input, "eq", 2) == 0)) {
-        currentToken.type = TOKEN_EQ;
-        input += 2;
     } else if ((strncmp(input, "or", 2) == 0)) {
         currentToken.type = TOKEN_OR;
         input += 2;

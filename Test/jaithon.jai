@@ -78,7 +78,7 @@ var d = value1 and value2
 
 print d
 
-var dd = value1 eq value2
+var dd = value1 == value2
 print dd
 
 var nice = "Are Not Equal"
