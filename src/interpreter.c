@@ -244,13 +244,8 @@ void advance() {
         currentToken.type = TOKEN_LESS_THAN;
         input++;
     } else if (*input == '=') {
-        if (input[1] == '=') {
-            currentToken.type = TOKEN_EQ;
-            input += 2;
-        } else{
-            currentToken.type = TOKEN_ASSIGN;
-            input++;
-        }
+        currentToken.type = TOKEN_ASSIGN;
+        input++;
     } else if (*input == '!') {
         currentToken.type = TOKEN_FACTORIAL;
         input++;
@@ -266,6 +261,9 @@ void advance() {
     } else if ((strncmp(input, "then", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_THEN;
         input += 4;
+    } else if ((strncmp(input, "eq", 2) == 0)) {
+        currentToken.type = TOKEN_EQ;
+        input += 2;
     } else if ((strncmp(input, "or", 2) == 0)) {
         currentToken.type = TOKEN_OR;
         input += 2;
@@ -290,7 +288,7 @@ void advance() {
     } else if ((strncmp(input, "var", 3) == 0)&& isDelimiter(input[3])) {
         currentToken.type = TOKEN_VAR;
         input += 3;
-    } else if ((strncmp(input, "loop", 4) == 0)&& isDelimiter(input[4])) {
+    } else if ((strncmp(input, "loop", 4) == 0)) {
         currentToken.type = TOKEN_DONE;
         input += 4;
     } else if ((strncmp(input, "compare", 7) == 0) && isDelimiter(input[7])){
