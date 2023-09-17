@@ -109,6 +109,7 @@ int numVariables = 0;
 //predefined functions
 void lexer(char *code);
 void skipToEndOfInput();
+int isDelimiter(char c);
 void advance();
 void error(const char *message, const char *errorToken);
 void eat(TokenType type);
@@ -160,6 +161,15 @@ void skipToEndOfInput() {
     while (currentToken.type != TOKEN_EOF) {
         advance();
     }
+}
+int isDelimiter(char c) {
+    const char validDelimiters[] = " \t\n(),+-*/%<>=!^.#";
+    for (int i = 0; validDelimiters[i]; i++) {
+        if (c == validDelimiters[i]) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void advance() {
@@ -242,22 +252,22 @@ void advance() {
     } else if (*input == '^') {
         currentToken.type = TOKEN_EXP;
         input++;
-    } else if (strncmp(input, "if", 2) == 0) {
+    } else if ((strncmp(input, "if", 2) == 0) && isDelimiter(input[2])) {
         currentToken.type = TOKEN_IF;
         input += 2;
-    } else if (strncmp(input, "do", 2) == 0) {
+    } else if ((strncmp(input, "do", 2) == 0) && isDelimiter(input[2])) {
         currentToken.type = TOKEN_DO;
         input += 2;
-    } else if (strncmp(input, "then", 4) == 0) {
+    } else if ((strncmp(input, "then", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_THEN;
         input += 4;
-    } else if (strncmp(input, "eq", 2) == 0) {
+    } else if ((strncmp(input, "eq", 2) == 0)) {
         currentToken.type = TOKEN_EQ;
         input += 2;
-    } else if (strncmp(input, "or", 2) == 0) {
+    } else if ((strncmp(input, "or", 2) == 0)) {
         currentToken.type = TOKEN_OR;
         input += 2;
-    } else if (strncmp(input, "system", 6) == 0) {
+    } else if ((strncmp(input, "system", 6) == 0) && isDelimiter(input[6])) {
         currentToken.type = TOKEN_SYSTEM;
         input += 6;
     } else if (strncmp(input, "write", 5) == 0) {
@@ -269,85 +279,85 @@ void advance() {
     } else if (strncmp(input, "while", 5) == 0) {
         currentToken.type = TOKEN_WHILE;
         input += 5;
-    } else if (strncmp(input, "break", 5) == 0) {
+    } else if ((strncmp(input, "break", 5) == 0) && isDelimiter(input[5])) {
         currentToken.type = TOKEN_BREAK;
         input += 5;
-    } else if (strncmp(input, "print", 5) == 0) {
+    } else if ((strncmp(input, "print", 5) == 0) && isDelimiter(input[5])) {
         currentToken.type = TOKEN_PRINT;
         input += 5;
-    } else if (strncmp(input, "var", 3) == 0) {
+    } else if ((strncmp(input, "var", 3) == 0)&& isDelimiter(input[3])) {
         currentToken.type = TOKEN_VAR;
         input += 3;
-    } else if (strncmp(input, "loop", 4) == 0) {
+    } else if ((strncmp(input, "loop", 4) == 0)&& isDelimiter(input[4])) {
         currentToken.type = TOKEN_DONE;
         input += 4;
-    } else if (strncmp(input, "compare", 7) == 0) {
+    } else if ((strncmp(input, "compare", 7) == 0) && isDelimiter(input[7])){
         currentToken.type = TOKEN_COMP;
         input += 7;
-    } else if (strncmp(input, "deg", 3) == 0) {
+    } else if ((strncmp(input, "deg", 3) == 0) && isDelimiter(input[3])){
         currentToken.type = TOKEN_DEGREES;
         input += 3;
-    } else if (strncmp(input, "bin", 3) == 0) {
+    } else if ((strncmp(input, "bin", 3) == 0) && isDelimiter(input[3])) {
         currentToken.type = TOKEN_BINARY;
         input += 3;
-    } else if (strncmp(input, "badd", 4) == 0) {
+    } else if ((strncmp(input, "badd", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_BADD;
         input += 4;
-    } else if (strncmp(input, "dist", 4) == 0) {
+    } else if ((strncmp(input, "dist", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_DIST;
         input += 4;
-    } else if (strncmp(input, "root", 4) == 0) {
+    } else if ((strncmp(input, "root", 4) == 0) && isDelimiter(input[4])){
         currentToken.type = TOKEN_ROOT;
         input += 4;
-    } else if (strncmp(input, "rand", 4) == 0) {
+    } else if ((strncmp(input, "rand", 4) == 0) && isDelimiter(input[4])){
         currentToken.type = TOKEN_RAND;
         input += 4;
-    } else if (strncmp(input, "uniform", 7) == 0) {
+    } else if ((strncmp(input, "uniform", 7) == 0) && isDelimiter(input[7])){
         currentToken.type = TOKEN_UNIFORM;
         input += 7;
-    } else if (strncmp(input, "sin", 3) == 0) {
+    } else if ((strncmp(input, "sin", 3) == 0)&& isDelimiter(input[3])) {
         currentToken.type = TOKEN_SIN;
         input += 3;
-    } else if (strncmp(input, "cos", 3) == 0) {
+    } else if ((strncmp(input, "cos", 3) == 0)&& isDelimiter(input[3])) {
         currentToken.type = TOKEN_COS;
         input += 3;
-    } else if (strncmp(input, "tan", 3) == 0) {
+    } else if ((strncmp(input, "tan", 3) == 0)&& isDelimiter(input[3])) {
         currentToken.type = TOKEN_TAN;
         input += 3;
-    } else if (strncmp(input, "asin", 4) == 0) {
+    } else if ((strncmp(input, "asin", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_ASIN;
         input += 4;
-    } else if (strncmp(input, "acos", 4) == 0) {
+    } else if ((strncmp(input, "acos", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_ACOS;
         input += 4;
-    } else if (strncmp(input, "atan", 4) == 0) {
+    } else if ((strncmp(input, "atan", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_ATAN;
         input += 4;
-    } else if (strncmp(input, "sqrt", 4) == 0) {
+    } else if ((strncmp(input, "sqrt", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_SQRT;
         input += 4;
-    } else if (strncmp(input, "quad", 4) == 0) {
+    } else if ((strncmp(input, "quad", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_QUADRATIC;
         input += 4;
-    } else if (strncmp(input, "math", 4) == 0) {
+    } else if ((strncmp(input, "math", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_MATH;
         input += 4;
-    } else if (strncmp(input, "conv", 4) == 0) {
+    } else if ((strncmp(input, "conv", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_CONV;
         input += 4;
-    } else if (strncmp(input, "pyth", 4) == 0) {
+    } else if ((strncmp(input, "pyth", 4) == 0) && isDelimiter(input[4])) {
         currentToken.type = TOKEN_PYTHAGOREAN;
         input += 4;
-    } else if (strncmp(input, "round", 5) == 0) {
+    } else if ((strncmp(input, "round", 5) == 0) && isDelimiter(input[5])) {
         currentToken.type = TOKEN_ROUND;
         input += 5;
-    } else if (strncmp(input, "input", 5) == 0) {
+    } else if ((strncmp(input, "input", 5) == 0)  && isDelimiter(input[5]) ){
         currentToken.type = TOKEN_INPUT;
         input += 5;
-    } else if (strncmp(input, "import", 6) == 0) {
+    } else if ((strncmp(input, "import", 6) == 0)  && isDelimiter(input[6]) ){
         currentToken.type = TOKEN_IMPORT;
         input += 6;
-    } else if (strncmp(input, "time", 4) == 0) {
+    } else if ((strncmp(input, "time", 4) == 0)  && isDelimiter(input[4])){
         currentToken.type = TOKEN_TIME;
         input += 4;
     } else if (strncmp(input, "not", 3) == 0) {

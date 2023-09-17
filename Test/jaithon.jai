@@ -134,3 +134,6 @@ var test = "Test/test.txt"
 write test, hello
 var abc = read test
 print abc
+
+var degrees = 10
+print degrees
