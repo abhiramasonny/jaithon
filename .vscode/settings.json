@@ -55,7 +55,9 @@
         "unordered_map": "c",
         "sstream": "c",
         "__config": "c",
-        "readline.h": "c"
+        "readline.h": "c",
+        "history.h": "c",
+        "ostream": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

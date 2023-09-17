@@ -397,6 +397,9 @@ void error(const char *message, const char *errorToken) {
     if(shell_mode == false){
         exit(1);
     }
+    if(log_enabled == 1){
+        writeLog(message);
+    }
 }
 
 void eat(TokenType type) {
