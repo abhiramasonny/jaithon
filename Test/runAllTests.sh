@@ -15,7 +15,7 @@ do
       directory_filename="$directory/$filename"
 
       echo "$filename"
-      ./interpreter "$directory_filename"
+      ./jaithon "$directory_filename"
     fi
   fi
 done
