@@ -91,8 +91,8 @@ typedef enum {
 typedef struct {
     TokenType type;
     double value;
-    char identifier[0];
-    char string[0];
+    char identifier[256];
+    char string[256];
 } Token;
 
 Token currentToken;
