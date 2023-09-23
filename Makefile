@@ -9,7 +9,7 @@ SOURCES = src/interpreter.c
 all: $(TARGET)
 
 $(TARGET): $(SOURCES)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LIBS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LIBS) -lm
 
 # Clean the build
 clean:
