@@ -25,7 +25,7 @@ The primary problem JAITHON addresses is the stress often felt by young learners
 ## Usage
 
 SHELL MODE CURRENTLY AVALIBLE AT 
-`https://drnbx98g.usw3.devtunnels.ms:8080/`
+`https://6vlgvljc.usw3.devtunnels.ms:8080/`
 
 To use the compiler/interpreter on UNIX, follow these steps:
 
