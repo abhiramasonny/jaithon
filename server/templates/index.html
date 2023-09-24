@@ -3,25 +3,26 @@
 <head>
     <meta charset="UTF-8">
     <title>Jaithon Terminal</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
         body {
             font-family: 'Courier New', Courier, monospace;
-            background-color: #0a0a0a;
-            color: #b3e5fc;
+            background-color: #0a0a0a;  /*Black background */
+            color: #b3e5fc;  /* lBlue text */
             padding: 20px;
         }
 
         h1, h2 {
-            color: #4caf50; 
-            border-bottom: 2px solid #4caf50;
+            color: #4caf50;  /* green text for headings */
+            border-bottom: 2px solid #4caf50;  /* Green border */
             padding-bottom: 10px;
             margin-bottom: 20px;
         }
 
         form {
-            background-color: #212121;
+            background-color: #212121;  /* Dark Grey form background */
             padding: 20px;
-            border-radius: 5px;
+            border-radius: 5px;  /* Rounded edges */
         }
 
         label {
@@ -30,33 +31,33 @@
 
         textarea {
             width: 100%;
-            background-color: #121212; 
-            color: #b3e5fc;  
-            border: 1px solid #4caf50; 
-            border-radius: 5px;
+            background-color: #121212;  /* Darker Grey textarea background */
+            color: #b3e5fc;  /* Light Blue text */
+            border: 1px solid #4caf50;  /* Green border */
+            border-radius: 5px;  /* Rounded edges */
             padding: 10px;
             font-family: 'Courier New', Courier, monospace;
         }
 
         input[type="submit"] {
-            background-color: #4caf50;
-            color: #0a0a0a;
+            background-color: #4caf50;  /* Green background */
+            color: #0a0a0a;  /* Deep Black text */
             padding: 10px 20px;
             border: none;
-            border-radius: 5px;
+            border-radius: 5px;  /* Rounded edges */
             cursor: pointer;
             transition: background-color 0.3s;
         }
 
         input[type="submit"]:hover {
-            background-color: #388e3c;
+            background-color: #388e3c;  /* Darker Green on hover */
         }
 
         pre {
-            background-color: #121212;
+            background-color: #121212;  /* Darker Grey background */
             padding: 20px;
-            border-radius: 5px;
-            color: #b3e5fc; 
+            border-radius: 5px;  /* Rounded edges */
+            color: #b3e5fc;  /* Light Blue text */
         }
 
     </style>
@@ -66,6 +67,7 @@
             if(savedCode) {
                 document.getElementById('input_code').value = savedCode;
             }
+
             document.getElementById('codeForm').addEventListener('submit', function() {
                 const code = document.getElementById('input_code').value;
                 localStorage.setItem('jaithonCode', code);
