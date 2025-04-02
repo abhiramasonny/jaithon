@@ -4,7 +4,7 @@
 </p>
 <h1>JAITHON</h1>
 
-[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Working Shell](https://drnbx98g.usw3.devtunnels.ms:8080/) | [Abhirama Sonny](https://abhiramasonny.github.io/)
+[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Working Shell](https://drnbx98g.usw3.devtunnels.ms:8080/) | [Abhirama Sonny](https://abhiramasonny.com/)
 </div>
 
 ***We suffer so that you don't***
@@ -138,22 +138,6 @@ Examples are located in the Test directory. There is also documentation of the s
 ```shell
 Documentation/grammar.txt
 ```
-
-## Info
-
-For more info *and to appreciate my hard webdev work* go to the html page located at
-
-```
-https://abhiramasonny.github.io/Projects/JAITHON%20website/index.html
-```
-
-or the youtube video
-
-```
-https://www.youtube.com/watch?v=4CcsI82OGq0
-```
-
-or contact me at <abhirama.sonny@gmail.com>.
 
 ## Credits
 
