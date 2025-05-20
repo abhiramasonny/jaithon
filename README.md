@@ -4,7 +4,7 @@
 </p>
 <h1>JAITHON</h1>
 
-[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Working Shell](https://drnbx98g.usw3.devtunnels.ms:8080/) | [Abhirama Sonny](https://abhiramasonny.com/)
+[YT Video](https://www.youtube.com/watch?v=4CcsI82OGq0) | [Docs](https://github.com/abhiramasonny/jaithon/blob/main/Documentation/grammar.txt) | [Abhirama Sonny](https://abhiramasonny.com/)
 </div>
 
 ***We suffer so that you don't***
@@ -20,12 +20,9 @@ JAITHON is a programming language put together for the purpose of teaching child
 
 **Crossing the age barrier**:
 
-The primary problem JAITHON addresses is the stress often felt by young learners when approaching programming. As a quote from Munna Bhai MBBS, *"Bhai, tension nahin lene ka bhai!"*, meaning leave the tension behind. By offering straightforward and visually appealing syntax, JAITHON enables children to effectively *leave the tension behind*. This approach cultivates a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. Our syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does. Ive got proof for that as well. Star the GH repo and ill tell it to you :DD.
+The primary problem JAITHON addresses is the stress often felt by young learners when approaching programming. As a quote from Munna Bhai MBBS, *"Bhai, tension nahin lene ka bhai!"*, meaning leave the tension behind. By offering straightforward and visually appealing syntax, JAITHON enables children to effectively *leave the tension behind*. This approach cultivates a positive learning experience, encouraging children to explore and develop problem-solving skills, logical thinking, and computational creativity from an early age. The syntax is structured in such a way, that anyone who reads it will be able to tell you what the program does.
 
 ## Usage
-
-SHELL MODE CURRENTLY AVALIBLE AT 
-`https://6vlgvljc.usw3.devtunnels.ms:8080/`
 
 To use the compiler/interpreter on UNIX, follow these steps:
 
