@@ -14,10 +14,11 @@ Complete documentation for the JAITHON programming language.
 6. [Functions](#functions)
 7. [Classes and Objects](#classes-and-objects)
 8. [Namespaces](#namespaces)
-9. [Standard Library](#standard-library)
-10. [Built-in Functions](#built-in-functions)
-11. [Input/Output](#inputoutput)
-12. [Modules](#modules)
+9. [Arrays](#arrays)
+10. [Standard Library](#standard-library)
+11. [Built-in Functions](#built-in-functions)
+12. [Input/Output](#inputoutput)
+13. [Modules](#modules)
 
 ---
 
@@ -74,7 +75,7 @@ print x    # Outputs: 6
 |------|-------------|---------|
 | Number | Integers and floats (supports scientific notation) | `42`, `3.14`, `-7`, `1e6`, `2.2e-16` |
 | String | Text in quotes | `"hello"` |
-| Boolean | `true` or `false` | `true`, `false` |
+| Boolean | `true` or `false` (printed as `1`/`0`) | `true`, `false` |
 | Null | No value | `null` |
 | Function | User-defined function | `func add(a,b) ... end` |
 | Array | Dynamic list of values | `[1, 2, 3]`, `[]` |
@@ -272,7 +273,7 @@ The standard library (`lib/std.jai`) is written in Jaithon and loaded automatica
 
 ### GUI (Metal on macOS)
 
-The GUI module (`import lib/modules/gui/window`) exposes a `Window` class and helpers backed by native Metal code (macOS/Apple Silicon only).
+The GUI module (`import lib/modules/gui/window`) exposes a `Window` class and helpers backed by native Metal code (macOS/Apple Silicon only). Drawing primitives are implemented in Jai atop a native pixel buffer; only the bare hardware hooks are native.
 
 | Item | Description |
 |------|-------------|
@@ -282,8 +283,15 @@ The GUI module (`import lib/modules/gui/window`) exposes a `Window` class and he
 | `putPixel(x, y, color)` | Write a pixel into the backbuffer |
 | `clear(color)` | Clear backbuffer |
 | `fillRect`, `drawRect`, `drawLine`, `drawCircle`, `fillCircle` | Drawing primitives |
-| `update()` | Present backbuffer (vsync) |
+| `display()` / `update()` | Request + present backbuffer (vsync) |
+| `present()` | Convenience: `display` + `update` |
 | `getDeltaTime()` / `getFPS()` / `getTime()` | Timing utilities |
+| `poll()` | Pump events |
+| `mousePos()` | `[x, y]` array of mouse position |
+| `mouseDown(button)` | `true/false` for button 0/1/2 |
+| `keyDown(keycode)` | `true/false` for a key code |
+
+Keyboard helpers live in `lib/modules/gui/keyboard.jai` with macOS keycode constants plus `keyboardTick(win)` which returns an array of keys newly pressed since the last tick.
 
 ### Math Utilities
 
@@ -348,10 +356,13 @@ These are implemented in C for performance:
 |----------|-------------|
 | `time()` | Current time (seconds since epoch) |
 | `rand()` | Random number 0.0 to 1.0 |
-| `len(s)` | String length |
+| `len(x)` | Length (arrays or strings) |
 | `str(x)` | Convert to string |
 | `num(s)` | Convert to number |
 | `type(x)` | String name of the value's type |
+| `_charAt(s, i)` | Character at index |
+| `_substr(s, start, count)` | Substring |
+| `_concat(a, b)` | Concatenate strings |
 
 ### Cons Cells (Data Structures)
 
@@ -428,7 +439,9 @@ The standard library aggregates modules under `lib/modules/` via `lib/std.jai`. 
 - `constants` (PI, E, etc.)
 - `core` (wrappers for native helpers: `len`, `str`, `num`, `type`, math delegates)
 - `math`, `list`, `array`, `string`, `random`
-- `stack`, `queue`, `vector`, `linkedlist`, `btree`, `hashmap`
+- `ds/array`, `ds/stack`, `ds/queue`, `ds/vector`, `ds/linkedlist`, `ds/btree`, `ds/hashmap`
+- `gui/window`, `gui/keyboard` (Metal-only GUI + input)
+- `io`
 
 Imports are parsed in an isolated module namespace; exported values/functions are then injected into the caller unless a name already exists (caller definitions win). Errors report the module path and line number, and a call stack is printed for easier debugging.
 
@@ -545,6 +558,8 @@ print matrix[1][1]    # 5
 | `_get(arr, i)` | Get element | `_get(arr, 0)` |
 | `_set(arr, i, val)` | Set element | `_set(arr, 0, 99)` |
 
+Idiomatic helpers live in `lib/modules/ds/array.jai` and mirror the above with friendlier names (`arrayLen`, `arrayPush`, `arrayPop`, `arrayGet`, `arraySet`, etc.).
+
 ---
 
 ## Classes and Objects
@@ -588,6 +603,8 @@ obj.field1 = newValue
 obj.method()
 var result = obj.method()
 ```
+
+When a method signature's first parameter is named `self`, calling via `obj.method()` automatically supplies `self` for you.
 
 ### Inheritance
 
