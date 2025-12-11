@@ -1,16 +1,26 @@
 TARGET = jaithon
 
 CC = gcc
-CFLAGS = -Wall
-LIBS = -lreadline
+CFLAGS = -Wall -Wextra
+LIBS = -lreadline -lm
 
-SOURCES = src/interpreter.c
+SRC_DIR = src
+
+SOURCES = $(SRC_DIR)/cli/main.c \
+          $(SRC_DIR)/core/runtime.c \
+          $(SRC_DIR)/lang/lexer.c \
+          $(SRC_DIR)/lang/parser.c
+
+HEADERS = $(SRC_DIR)/core/runtime.h \
+          $(SRC_DIR)/lang/lexer.h \
+          $(SRC_DIR)/lang/parser.h
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LIBS) -lm
+$(TARGET): $(SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LIBS)
 
-# Clean the build
 clean:
 	rm -f $(TARGET)
+
+.PHONY: all clean
