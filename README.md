@@ -10,18 +10,7 @@
 
 ## About
 
-JAITHON is a simple programming language designed to teach programming fundamentals. Its English-like syntax makes it accessible to beginners, while its **heavily bootstrapped** standard library demonstrates language implementation concepts.
-
-**Key Features:**
-- Simple, English-like syntax
-- **Heavily bootstrapped** - most functionality written in Jaithon itself
-- Only primitive operations (sin, cos, sqrt, exp, log) are in C
-- Arrays, strings, math functions all implemented in Jaithon
-- Object-Oriented Programming (Classes, Inheritance)
-- Namespaces for code organization
-- File I/O support
-- User-defined functions with recursion
-- Interactive shell mode
+Jaithon combines Java and Python.
 
 ---
 
