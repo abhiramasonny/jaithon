@@ -2,12 +2,13 @@ TARGET = jaithon
 
 CC = gcc
 CFLAGS = -Wall -Wextra
-LIBS = -lreadline -lm
+LIBS = -lreadline -lm -framework Cocoa
 
 SRC_DIR = src
 
 SOURCES = $(SRC_DIR)/cli/main.c \
           $(SRC_DIR)/core/runtime.c \
+          $(SRC_DIR)/core/gui.m \
           $(SRC_DIR)/lang/lexer.c \
           $(SRC_DIR)/lang/parser.c
 

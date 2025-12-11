@@ -199,6 +199,7 @@ int main(int argc, char* argv[]) {
     }
     
     initRuntime();
+    registerGuiFunctions();
     registerBuiltinKeywords();
     initParser();
     
