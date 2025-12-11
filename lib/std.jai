@@ -4,17 +4,17 @@
 # auto-loaded on startup.
 # ============================================================================
 
-import lib/modules/constants
-import lib/modules/core
-import lib/modules/math
-import lib/modules/list
-import lib/modules/array
-import lib/modules/string
-import lib/modules/random
-import lib/modules/stack
-import lib/modules/queue
-import lib/modules/vector
-import lib/modules/linkedlist
-import lib/modules/btree
-import lib/modules/hashmap
-import lib/modules/io
+import lib/modules/core/constants
+import lib/modules/core/core
+import lib/modules/core/math
+import lib/modules/ds/list
+import lib/modules/ds/array
+import lib/modules/core/string
+import lib/modules/core/random
+import lib/modules/ds/stack
+import lib/modules/ds/queue
+import lib/modules/ds/vector
+import lib/modules/ds/linkedlist
+import lib/modules/ds/btree
+import lib/modules/ds/hashmap
+import lib/modules/core/io

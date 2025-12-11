@@ -237,4 +237,6 @@ JaiClass* findClass(const char* name);
 
 void runtimeError(const char* format, ...);
 
+void registerGuiFunctions(void);
+
 #endif
