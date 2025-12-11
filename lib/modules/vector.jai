@@ -29,7 +29,7 @@ class Vector
     end
     
     func pop(self)
-        if _alen(self.data) eq 0
+        if _alen(self.data) == 0
             return null
         end
         return _pop(self.data)

@@ -12,7 +12,7 @@ class HashMap
     end
     
     func isEmpty(self)
-        return self.size() eq 0
+        return self.size() == 0
     end
     
     func set(self, key, value)
@@ -45,7 +45,7 @@ class HashMap
         var newEntries = []
         var i = 0
         while i < _alen(self.entries)
-            if not (i eq idx)
+            if not (i == idx)
                 _push(newEntries, _get(self.entries, i))
             end
             i = i + 1
@@ -78,7 +78,7 @@ end
 func mapFind(entries, key)
     var i = 0
     while i < _alen(entries)
-        if _get(_get(entries, i), 0) eq key
+        if _get(_get(entries, i), 0) == key
             return i
         end
         i = i + 1

@@ -6,7 +6,7 @@ import lib/modules/string
 func findIndex(arr, value)
     var i = 0
     while i < _alen(arr)
-        if _get(arr, i) eq value
+        if _get(arr, i) == value
             return i
         end
         i = i + 1
@@ -18,7 +18,7 @@ func getNeighbors(graph, node)
     var i = 0
     while i < _alen(graph)
         var pair = _get(graph, i)   #[name, neighbors]
-        if _get(pair, 0) eq node
+        if _get(pair, 0) == node
             return _get(pair, 1)
         end
         i = i + 1
@@ -32,7 +32,7 @@ func reconstruct(visited, parents, start, goal)
     var building = true
     while building
         _push(path, cur)
-        if cur eq start
+        if cur == start
             building = false
         else
             var idx = findIndex(visited, cur)
@@ -65,7 +65,7 @@ func bfs(graph, start, goal)
     while not q.isEmpty()
         var node = q.dequeue()
         print "Visiting " + node
-        if node eq goal
+        if node == goal
             print "found goal"
             path = reconstruct(visited, parents, start, goal)
             found = true

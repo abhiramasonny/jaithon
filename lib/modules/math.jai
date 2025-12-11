@@ -72,7 +72,7 @@ func lerp(a, b, t)
 end
 
 func pow(base, exponent)
-    if exponent eq 0
+    if exponent == 0
         return 1
     end
     if exponent < 0
@@ -96,7 +96,7 @@ func pow3(x)
 end
 
 func cbrt(x)
-    if x eq 0
+    if x == 0
         return 0
     end
     var guess = x / 3
@@ -145,11 +145,11 @@ func radToDeg(rad)
 end
 
 func isEven(n)
-    return n % 2 eq 0
+    return n % 2 == 0
 end
 
 func isOdd(n)
-    return n % 2 eq 1 or n % 2 eq -1
+    return n % 2 == 1 or n % 2 == -1
 end
 
 func isPositive(n)
@@ -161,11 +161,11 @@ func isNegative(n)
 end
 
 func isZero(n)
-    return n eq 0
+    return n == 0
 end
 
 func isInteger(n)
-    return n eq floor(n)
+    return n == floor(n)
 end
 
 func gcd(a, b)
@@ -187,15 +187,15 @@ func isPrime(n)
     if n < 2
         return false
     end
-    if n eq 2
+    if n == 2
         return true
     end
-    if n % 2 eq 0
+    if n % 2 == 0
         return false
     end
     var i = 3
     while i * i <= n
-        if n % i eq 0
+        if n % i == 0
             return false
         end
         i = i + 2

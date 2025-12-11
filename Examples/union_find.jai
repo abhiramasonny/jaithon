@@ -19,7 +19,7 @@ class uf
     
     func find(self, x)
         var p = self.parent.get(x)
-        if p eq x
+        if p == x
             return x
         end
         var root = self.find(p)
@@ -30,7 +30,7 @@ class uf
     func union(self, a, b)
         var ra = self.find(a)
         var rb = self.find(b)
-        if ra eq rb
+        if ra == rb
             return
         end
         
@@ -49,7 +49,7 @@ class uf
     end
     
     func connected(self, a, b)
-        return self.find(a) eq self.find(b)
+        return self.find(a) == self.find(b)
     end
 end
 

@@ -19,11 +19,11 @@ class LinkedList
     
     func append(self, data)
         var node = new Node(data)
-        if self.head eq 0
+        if self.head == 0
             self.head = node
         else
             var current = self.head
-            while current.next eq 0 eq 0
+            while current.next == 0 == 0
                 current = current.next
             end
             current.next = node
@@ -55,7 +55,7 @@ class LinkedList
     func show(self)
         print "LinkedList contents:"
         var current = self.head
-        while not (current eq 0)
+        while not (current == 0)
             print current.data
             current = current.next
         end

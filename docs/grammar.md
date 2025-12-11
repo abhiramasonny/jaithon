@@ -12,10 +12,12 @@ Complete documentation for the JAITHON programming language.
 4. [Operators](#operators)
 5. [Control Flow](#control-flow)
 6. [Functions](#functions)
-7. [Standard Library](#standard-library)
-8. [Built-in Functions](#built-in-functions)
-9. [Input/Output](#inputoutput)
-10. [Modules](#modules)
+7. [Classes and Objects](#classes-and-objects)
+8. [Namespaces](#namespaces)
+9. [Standard Library](#standard-library)
+10. [Built-in Functions](#built-in-functions)
+11. [Input/Output](#inputoutput)
+12. [Modules](#modules)
 
 ---
 
@@ -277,6 +279,19 @@ The standard library (`lib/std.jai`) is written in Jaithon and loaded automatica
 | `isOdd(n)` | Is odd? | `isOdd(7)` → `true` |
 | `between(v, lo, hi)` | v in (lo, hi)? | `between(5, 0, 10)` → `true` |
 | `inRange(v, lo, hi)` | v in [lo, hi]? | `inRange(5, 0, 10)` → `true` |
+
+### File I/O (io module)
+
+The `io` module provides functions for reading and writing files.
+
+| Function | Description | Example |
+|----------|-------------|---------|
+| `io.readFile(path)` | Read entire file content | `var content = io.readFile("data.txt")` |
+| `io.writeFile(path, content)` | Write content to file | `io.writeFile("log.txt", "Error")` |
+| `io.open(path, mode)` | Open file ("r", "w", "a") | `var f = io.open("test.txt", "r")` |
+| `io.close(file)` | Close file handle | `io.close(f)` |
+| `io.read(file)` | Read from handle | `var s = io.read(f)` |
+| `io.write(file, content)` | Write to handle | `io.write(f, "hello")` |
 
 ---
 
@@ -573,6 +588,45 @@ end
 var d = new Dog("Buddy", "Golden Retriever")
 d.speak()    # Buddy barks!
 ```
+
+---
+
+## Namespaces
+
+Namespaces allow you to group variables and functions under a named scope. This helps organize code and avoid naming conflicts.
+
+### Definition
+
+Use the `namespace` keyword:
+
+```
+namespace Math
+    var PI = 3.14159
+    
+    func area(r)
+        return PI * r * r
+    end
+end
+```
+
+### Accessing Members
+
+Use dot notation to access variables and functions inside a namespace:
+
+```
+print Math.PI
+print Math.area(10)
+```
+
+### Modifying Variables
+
+You can modify variables inside a namespace:
+
+```
+Math.PI = 3.14
+```
+
+Functions inside the namespace can also modify namespace variables, and the changes persist.
 
 ---
 

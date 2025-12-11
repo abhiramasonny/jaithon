@@ -8,7 +8,7 @@ while i<nums
     var t = t + 1
     var d = x^2 + y^2
     if d < 1 then do var cp = cp + 1
-    if d eq 1 then do var cp = cp + 1
+    if d == 1 then do var cp = cp + 1
     var pi = 4 * cp / t
     print pi
     var i = i + 1

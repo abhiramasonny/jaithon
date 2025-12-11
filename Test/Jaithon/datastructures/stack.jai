@@ -13,7 +13,7 @@ class Stack
     end
     
     func pop(self)
-        if self.size eq 0
+        if self.size == 0
             print "Stack is empty!"
             return 0
         end
@@ -22,14 +22,14 @@ class Stack
     end
     
     func peek(self)
-        if self.size eq 0
+        if self.size == 0
             return 0
         end
         return _get(self.items, self.size - 1)
     end
     
     func isEmpty(self)
-        return self.size eq 0
+        return self.size == 0
     end
     
     func show(self)

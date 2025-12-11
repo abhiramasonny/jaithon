@@ -1,4 +1,4 @@
-# Jaithon Array - Dynamic array utilities (using native arrays)
+#array
 
 func arrayNew(size)
     return _array(size)
@@ -55,7 +55,7 @@ func arraySum(arr)
 end
 
 func arrayMax(arr)
-    if _alen(arr) eq 0
+    if _alen(arr) == 0
         return 0
     end
     var m = arr[0]
@@ -70,7 +70,7 @@ func arrayMax(arr)
 end
 
 func arrayMin(arr)
-    if _alen(arr) eq 0
+    if _alen(arr) == 0
         return 0
     end
     var m = arr[0]
@@ -97,7 +97,7 @@ end
 func arrayContains(arr, val)
     var i = 0
     while i < _alen(arr)
-        if arr[i] eq val
+        if arr[i] == val
             return true
         end
         i = i + 1
@@ -108,7 +108,7 @@ end
 func arrayIndexOf(arr, val)
     var i = 0
     while i < _alen(arr)
-        if arr[i] eq val
+        if arr[i] == val
             return i
         end
         i = i + 1

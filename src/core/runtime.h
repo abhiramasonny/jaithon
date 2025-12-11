@@ -22,7 +22,9 @@ typedef enum {
     VAL_NATIVE_FUNC,
     VAL_CELL,
     VAL_ARRAY,
-    VAL_OBJECT
+    VAL_OBJECT,
+    VAL_FILE,
+    VAL_NAMESPACE
 } ValueType;
 
 typedef struct Value Value;
@@ -31,6 +33,8 @@ typedef struct JaiCell JaiCell;
 typedef struct JaiArray JaiArray;
 typedef struct JaiObject JaiObject;
 typedef struct JaiClass JaiClass;
+typedef struct JaiNamespace JaiNamespace;
+typedef struct Variable Variable;
 typedef struct Module Module;
 typedef Value (*NativeFunc)(Value* args, int argc);
 
@@ -42,6 +46,7 @@ struct JaiFunction {
     bool isVariadic;
     char* body;
     Module* module;
+    JaiNamespace* namespace;
 };
 
 struct JaiCell {
@@ -76,6 +81,16 @@ struct JaiClass {
     JaiFunction* constructor;
 };
 
+struct JaiNamespace {
+    char name[MAX_NAME_LEN];
+    Variable* variables;
+    int varCount;
+    int varCapacity;
+    JaiFunction** functions;
+    int funcCount;
+    int funcCapacity;
+};
+
 struct Value {
     ValueType type;
     union {
@@ -87,13 +102,15 @@ struct Value {
         JaiCell* cell;
         JaiArray* array;
         JaiObject* object;
+        FILE* file;
+        JaiNamespace* namespace;
     } as;
 };
 
-typedef struct {
+struct Variable {
     char name[MAX_NAME_LEN];
     Value value;
-} Variable;
+};
 
 struct Module {
     char name[MAX_NAME_LEN];
@@ -179,6 +196,8 @@ Value makeNativeFunc(NativeFunc f);
 Value makeCell(void);
 Value makeArray(int initialCapacity);
 Value makeObject(JaiClass* class);
+Value makeFile(FILE* f);
+Value makeNamespace(const char* name);
 
 void initRuntime(void);
 void freeRuntime(void);

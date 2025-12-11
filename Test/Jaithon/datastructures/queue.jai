@@ -15,7 +15,7 @@ class Queue
     end
     
     func dequeue(self)
-        if self.front eq self.rear
+        if self.front == self.rear
             print "Queue is empty!"
             return 0
         end
@@ -25,7 +25,7 @@ class Queue
     end
     
     func peek(self)
-        if self.front eq self.rear
+        if self.front == self.rear
             return 0
         end
         return _get(self.items, self.front)
@@ -36,7 +36,7 @@ class Queue
     end
     
     func isEmpty(self)
-        return self.front eq self.rear
+        return self.front == self.rear
     end
     
     func show(self)

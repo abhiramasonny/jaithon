@@ -19,7 +19,7 @@ func normalize(text)
                 ch = charAt("abcdefghijklmnopqrstuvwxyz", idx)
             end
         end
-        if isAlpha(ch) or ch eq " "
+        if isAlpha(ch) or ch == " "
             out = concat(out, ch)
         else
             out = concat(out, " ")
@@ -34,7 +34,7 @@ func splitWords(text)
     var start = 0
     var i = 0
     while i < len(text)
-        if charAt(text, i) eq " "
+        if charAt(text, i) == " "
             if i > start
                 _push(words, substr(text, start, i - start))
             end
@@ -54,7 +54,7 @@ func countWords(words)
     while i < _alen(words)
         var w = _get(words, i)
         var cur = counts.get(w)
-        if cur eq null
+        if cur == null
             counts.set(w, 1)
         else
             counts.set(w, cur + 1)

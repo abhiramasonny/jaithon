@@ -227,7 +227,87 @@ Value parsePrimary(Lexer* lex) {
                 strcpy(fieldName, lex->currentToken.strValue);
                 lexerNext(lex);
                 
-                if (result.type == VAL_OBJECT) {
+                if (result.type == VAL_NAMESPACE) {
+                    JaiNamespace* ns = result.as.namespace;
+                    if (lexerCheck(lex, TK_LPAREN)) {
+                         JaiFunction* func = NULL;
+                         for(int i=0; i<ns->funcCount; i++) {
+                            if(strcmp(ns->functions[i]->name, fieldName) == 0) {
+                                func = ns->functions[i];
+                                break;
+                            }
+                         }
+                         if (!func) {
+                             for(int i=0; i<ns->varCount; i++) {
+                                if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                                    if (ns->variables[i].value.type == VAL_FUNCTION) {
+                                        func = ns->variables[i].value.as.function;
+                                    }
+                                    break;
+                                }
+                             }
+                         }
+                         if (!func) {
+                             runtimeError("Namespace '%s' has no function '%s'", ns->name, fieldName);
+                             return makeNull();
+                         }
+                         lexerNext(lex);
+                         Value args[MAX_CALL_ARGS];
+                         int argc = 0;
+                         if (!lexerCheck(lex, TK_RPAREN)) {
+                            do {
+                                args[argc++] = parseExpression(lex);
+                            } while (lexerMatch(lex, TK_COMMA));
+                         }
+                         lexerExpect(lex, TK_RPAREN);
+                         result = callValue(makeFunction(func), args, argc);
+                    }
+                    else if (lexerCheck(lex, TK_EQUALS)) {
+                        lexerNext(lex);
+                        Value val = parseExpression(lex);
+                        bool found = false;
+                        for(int i=0; i<ns->varCount; i++) {
+                            if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                                ns->variables[i].value = val;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            if (ns->varCount >= ns->varCapacity) {
+                                ns->varCapacity *= 2;
+                                ns->variables = realloc(ns->variables, sizeof(Variable) * ns->varCapacity);
+                            }
+                            strcpy(ns->variables[ns->varCount].name, fieldName);
+                            ns->variables[ns->varCount].value = val;
+                            ns->varCount++;
+                        }
+                        return val;
+                    }
+                    else {
+                        bool found = false;
+                        for(int i=0; i<ns->varCount; i++) {
+                            if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                                result = ns->variables[i].value;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            for(int i=0; i<ns->funcCount; i++) {
+                                if(strcmp(ns->functions[i]->name, fieldName) == 0) {
+                                    result = makeFunction(ns->functions[i]);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!found) {
+                            runtimeError("Namespace '%s' has no member '%s'", ns->name, fieldName);
+                            return makeNull();
+                        }
+                    }
+                } else if (result.type == VAL_OBJECT) {
                     if (lexerCheck(lex, TK_LPAREN)) {
                         JaiFunction* method = objectGetMethod(result.as.object, fieldName);
                         if (!method) {
@@ -382,6 +462,60 @@ static Value handleDot(Lexer* lex, Value left) {
     strcpy(fieldName, lex->currentToken.strValue);
     lexerNext(lex);
 
+    if (left.type == VAL_NAMESPACE) {
+        JaiNamespace* ns = left.as.namespace;
+        
+        if (lexerCheck(lex, TK_LPAREN)) {
+             JaiFunction* func = NULL;
+             for(int i=0; i<ns->funcCount; i++) {
+                if(strcmp(ns->functions[i]->name, fieldName) == 0) {
+                    func = ns->functions[i];
+                    break;
+                }
+             }
+             if (!func) {
+                 for(int i=0; i<ns->varCount; i++) {
+                    if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                        if (ns->variables[i].value.type == VAL_FUNCTION) {
+                            func = ns->variables[i].value.as.function;
+                        }
+                        break;
+                    }
+                 }
+             }
+             
+             if (!func) {
+                 runtimeError("Namespace '%s' has no function '%s'", ns->name, fieldName);
+                 return makeNull();
+             }
+             
+             lexerNext(lex);
+             Value args[MAX_CALL_ARGS];
+             int argc = 0;
+             if (!lexerCheck(lex, TK_RPAREN)) {
+                do {
+                    args[argc++] = parseExpression(lex);
+                } while (lexerMatch(lex, TK_COMMA));
+             }
+             lexerExpect(lex, TK_RPAREN);
+             return callValue(makeFunction(func), args, argc);
+        }
+        
+        for(int i=0; i<ns->varCount; i++) {
+            if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                return ns->variables[i].value;
+            }
+        }
+        for(int i=0; i<ns->funcCount; i++) {
+            if(strcmp(ns->functions[i]->name, fieldName) == 0) {
+                return makeFunction(ns->functions[i]);
+            }
+        }
+        
+        runtimeError("Namespace '%s' has no member '%s'", ns->name, fieldName);
+        return makeNull();
+    }
+
     if (lexerCheck(lex, TK_LPAREN)) {
         lexerNext(lex);
         Value args[MAX_CALL_ARGS];
@@ -474,6 +608,18 @@ static Value handleEq(Lexer* lex, Value left) {
     }
 }
 
+static Value handleNe(Lexer* lex, Value left) {
+    Value right = parseExpressionPrec(lex, 5);
+    if (left.type != right.type) return makeBool(true);
+    switch (left.type) {
+        case VAL_NUMBER: return makeBool(left.as.number != right.as.number);
+        case VAL_BOOL: return makeBool(left.as.boolean != right.as.boolean);
+        case VAL_STRING: return makeBool(strcmp(left.as.string, right.as.string) != 0);
+        case VAL_NULL: return makeBool(false);
+        default: return makeBool(true);
+    }
+}
+
 static Value handleAnd(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 4);
     if (!toBool(left)) return makeBool(false);
@@ -515,9 +661,6 @@ static Value stmtVar(Lexer* lex) {
 
 static Value stmtPrint(Lexer* lex) {
     lexerExpect(lex, getKW_PRINT());
-    if (runtime.debug) {
-        printf("DEBUG print expr starts with token %s\n", tokenKindName(lex->currentToken.kind));
-    }
     Value val = parseExpression(lex);
     
     switch (val.type) {
@@ -849,6 +992,7 @@ static Value stmtClass(Lexer* lex) {
             strncpy(body, bodyStart, bodyLen);
             body[bodyLen] = '\0';
             
+            
             JaiFunction* method = defineFunction(methodName, params, paramCount, false, body);
             classAddMethod(cls, methodName, method);
             
@@ -870,6 +1014,63 @@ static Value stmtClass(Lexer* lex) {
         printf("Defined class %s with %d fields, %d methods\n", 
                className, cls->fieldCount, cls->methodCount);
     }
+    
+    return makeNull();
+}
+
+static Value stmtNamespace(Lexer* lex) {
+    lexerExpect(lex, getKW_NAMESPACE());
+    
+    if (!lexerCheck(lex, TK_IDENTIFIER)) {
+        runtimeError("Expected namespace name");
+        return makeNull();
+    }
+    
+    char nsName[MAX_NAME_LEN];
+    strcpy(nsName, lex->currentToken.strValue);
+    lexerNext(lex);
+    
+    skipNewlines(lex);
+    
+    Value nsVal = makeNamespace(nsName);
+    JaiNamespace* ns = nsVal.as.namespace;
+    
+    Module* caller = runtime.currentModule;
+    Module* tempMod = createModule(nsName, caller->path);
+    runtime.currentModule = tempMod;
+    
+    while (!lexerCheck(lex, getKW_END()) && !lexerCheck(lex, TK_EOF)) {
+        parseStatement(lex);
+        skipNewlines(lex);
+    }
+    
+    lexerExpect(lex, getKW_END());
+    
+    ns->varCount = tempMod->varCount;
+    if (ns->varCount > ns->varCapacity) {
+        ns->varCapacity = ns->varCount;
+        ns->variables = realloc(ns->variables, sizeof(Variable) * ns->varCapacity);
+    }
+    
+    for(int i=0; i<tempMod->varCount; i++) {
+        ns->variables[i] = tempMod->variables[i];
+        tempMod->variables[i].value = makeNull();
+    }
+    
+    ns->funcCount = tempMod->funcCount;
+    if (ns->funcCount > ns->funcCapacity) {
+        ns->funcCapacity = ns->funcCount;
+        ns->functions = realloc(ns->functions, sizeof(JaiFunction*) * ns->funcCapacity);
+    }
+    
+    for(int i=0; i<tempMod->funcCount; i++) {
+        ns->functions[i] = tempMod->functions[i];
+        ns->functions[i]->namespace = ns;
+        tempMod->functions[i] = NULL;
+    }
+    
+    runtime.currentModule = caller;
+    setVariable(nsName, nsVal);
     
     return makeNull();
 }
@@ -942,13 +1143,14 @@ static Value stmtImport(Lexer* lex) {
     code[size] = '\0';
     fclose(f);
     
+
+
     Module* caller = runtime.currentModule;
     Module* newMod = createModule(modulePath, path);
     runtime.currentModule = newMod;
     
     Lexer modLex;
     lexerInit(&modLex, code);
-    lexerNext(&modLex);
     parseProgram(&modLex);
     
     free(code);
@@ -1037,10 +1239,6 @@ Value parseStatement(Lexer* lex) {
         return makeNull();
     }
     
-    if (runtime.debug) {
-        printf("DEBUG statement token: %s (line %d)\n", tokenKindName(lex->currentToken.kind), lex->currentToken.line);
-    }
-    
     int kind = lex->currentToken.kind;
     StatementHandler handler = findStatement(kind);
     
@@ -1066,6 +1264,89 @@ Value parseStatement(Lexer* lex) {
                     strcpy(fieldName, lex->currentToken.strValue);
                     lexerNext(lex);
                     
+                    if (result.type == VAL_NAMESPACE) {
+                        JaiNamespace* ns = result.as.namespace;
+                        if (lexerCheck(lex, TK_LPAREN)) {
+                             JaiFunction* func = NULL;
+                             for(int i=0; i<ns->funcCount; i++) {
+                                if(strcmp(ns->functions[i]->name, fieldName) == 0) {
+                                    func = ns->functions[i];
+                                    break;
+                                }
+                             }
+                             if (!func) {
+                                 for(int i=0; i<ns->varCount; i++) {
+                                    if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                                        if (ns->variables[i].value.type == VAL_FUNCTION) {
+                                            func = ns->variables[i].value.as.function;
+                                        }
+                                        break;
+                                    }
+                                 }
+                             }
+                             if (!func) {
+                                 runtimeError("Namespace '%s' has no function '%s'", ns->name, fieldName);
+                                 return makeNull();
+                             }
+                             lexerNext(lex);
+                             Value args[MAX_CALL_ARGS];
+                             int argc = 0;
+                             if (!lexerCheck(lex, TK_RPAREN)) {
+                                do {
+                                    args[argc++] = parseExpression(lex);
+                                } while (lexerMatch(lex, TK_COMMA));
+                             }
+                             lexerExpect(lex, TK_RPAREN);
+                             result = callValue(makeFunction(func), args, argc);
+                        }
+                        else if (lexerCheck(lex, TK_EQUALS)) {
+                            lexerNext(lex);
+                            Value val = parseExpression(lex);
+                            bool found = false;
+                            for(int i=0; i<ns->varCount; i++) {
+                                if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                                    ns->variables[i].value = val;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                if (ns->varCount >= ns->varCapacity) {
+                                    ns->varCapacity *= 2;
+                                    ns->variables = realloc(ns->variables, sizeof(Variable) * ns->varCapacity);
+                                }
+                                strcpy(ns->variables[ns->varCount].name, fieldName);
+                                ns->variables[ns->varCount].value = val;
+                                ns->varCount++;
+                            }
+                            return val;
+                        }
+                        else {
+                            bool found = false;
+                            for(int i=0; i<ns->varCount; i++) {
+                                if(strcmp(ns->variables[i].name, fieldName) == 0) {
+                                    result = ns->variables[i].value;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                for(int i=0; i<ns->funcCount; i++) {
+                                    if(strcmp(ns->functions[i]->name, fieldName) == 0) {
+                                        result = makeFunction(ns->functions[i]);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!found) {
+                                runtimeError("Namespace '%s' has no member '%s'", ns->name, fieldName);
+                                return makeNull();
+                            }
+                        }
+                        continue;
+                    }
+
                     if (result.type != VAL_OBJECT) {
                         runtimeError("Cannot access field '%s' of non-object", fieldName);
                         return makeNull();
@@ -1190,6 +1471,17 @@ Value callValue(Value callee, Value* args, int argc) {
         Module* funcMod = createModule("__call__", "");
         runtime.currentModule = funcMod;
         
+        if (f->namespace) {
+            for (int i = 0; i < f->namespace->varCount; i++) {
+                setVariable(f->namespace->variables[i].name, f->namespace->variables[i].value);
+            }
+            for (int i = 0; i < f->namespace->funcCount; i++) {
+                if (!hasVariable(f->namespace->functions[i]->name)) {
+                    setVariable(f->namespace->functions[i]->name, makeFunction(f->namespace->functions[i]));
+                }
+            }
+        }
+        
         if (f->isVariadic) {
             int regularParams = f->paramCount - 1;
             for (int i = 0; i < regularParams; i++) {
@@ -1215,6 +1507,17 @@ Value callValue(Value callee, Value* args, int argc) {
         if (hasReturn) {
             result = returnValue;
             hasReturn = false;
+        }
+        
+        if (f->namespace) {
+            for (int i = 0; i < f->namespace->varCount; i++) {
+                for (int j = 0; j < funcMod->varCount; j++) {
+                    if (strcmp(funcMod->variables[j].name, f->namespace->variables[i].name) == 0) {
+                        f->namespace->variables[i].value = funcMod->variables[j].value;
+                        break;
+                    }
+                }
+            }
         }
         
         runtime.currentModule = oldMod;
@@ -1310,6 +1613,7 @@ static Value nativeType(Value* args, int argc) {
         case VAL_FUNCTION: return makeString("function");
         case VAL_NATIVE_FUNC: return makeString("native");
         case VAL_CELL: return makeString("cell");
+        case VAL_FILE: return makeString("file");
         default: return makeString("null");
     }
 }
@@ -1438,6 +1742,71 @@ static Value nativeAlen(Value* args, int argc) {
     return makeNumber(arrayLen(args[0].as.array));
 }
 
+static Value nativeFopen(Value* args, int argc) {
+    if (argc < 2) return makeNull();
+    if (args[0].type != VAL_STRING || args[1].type != VAL_STRING) return makeNull();
+    FILE* f = fopen(args[0].as.string, args[1].as.string);
+    if (!f) return makeNull();
+    return makeFile(f);
+}
+
+static Value nativeFclose(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_FILE) return makeNull();
+    if (args[0].as.file) {
+        fclose(args[0].as.file);
+        args[0].as.file = NULL;
+    }
+    return makeNull();
+}
+
+static Value nativeFread(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_FILE) return makeString("");
+    FILE* f = args[0].as.file;
+    if (!f) return makeString("");
+    
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    char* buffer = malloc(length + 1);
+    if (!buffer) return makeString("");
+    
+    size_t read = fread(buffer, 1, length, f);
+    buffer[read] = '\0';
+    
+    Value v = makeString(buffer);
+    free(buffer);
+    return v;
+}
+
+static Value nativeFwrite(Value* args, int argc) {
+    if (argc < 2 || args[0].type != VAL_FILE || args[1].type != VAL_STRING) return makeNumber(0);
+    FILE* f = args[0].as.file;
+    if (!f) return makeNumber(0);
+    
+    int written = fprintf(f, "%s", args[1].as.string);
+    return makeNumber(written);
+}
+
+static Value nativeInput(Value* args, int argc) {
+    if (argc > 0 && args[0].type == VAL_STRING) {
+        printf("%s", args[0].as.string);
+    }
+    
+    char buf[1024];
+    if (fgets(buf, sizeof(buf), stdin)) {
+        buf[strcspn(buf, "\n")] = 0;
+        return makeString(buf);
+    }
+    return makeString("");
+}
+
+static Value nativeSystem(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_STRING) return makeNumber(-1);
+    int ret = system(args[0].as.string);
+    return makeNumber(ret);
+}
+
 void initParser(void) {
     statementCount = 0;
     infixCount = 0;
@@ -1454,6 +1823,7 @@ void initParser(void) {
     registerStatement(getKW_BREAK(), stmtBreak);
     registerStatement(getKW_SYSTEM(), stmtSystem);
     registerStatement(getKW_CLASS(), stmtClass);
+    registerStatement(getKW_NAMESPACE(), stmtNamespace);
     
     registerInfix(TK_PLUS, 6, handleAdd);
     registerInfix(TK_MINUS, 6, handleSub);
@@ -1467,7 +1837,8 @@ void initParser(void) {
     registerInfix(TK_LT, 5, handleLt);
     registerInfix(TK_GE, 5, handleGe);
     registerInfix(TK_LE, 5, handleLe);
-    registerInfix(getKW_EQ(), 4, handleEq);
+    registerInfix(TK_EQ_EQ, 4, handleEq);
+    registerInfix(TK_NE, 4, handleNe);
     registerInfix(getKW_AND(), 3, handleAnd);
     registerInfix(getKW_OR(), 2, handleOr);
     
@@ -1500,4 +1871,11 @@ void initParser(void) {
     setVariable("_get", makeNativeFunc(nativeGet));
     setVariable("_set", makeNativeFunc(nativeSet));
     setVariable("_alen", makeNativeFunc(nativeAlen));
+
+    setVariable("_fopen", makeNativeFunc(nativeFopen));
+    setVariable("_fclose", makeNativeFunc(nativeFclose));
+    setVariable("_fread", makeNativeFunc(nativeFread));
+    setVariable("_fwrite", makeNativeFunc(nativeFwrite));
+    setVariable("_input", makeNativeFunc(nativeInput));
+    setVariable("_system", makeNativeFunc(nativeSystem));
 }

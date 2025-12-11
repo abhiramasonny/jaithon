@@ -19,7 +19,7 @@ func average(*nums)
 end
 
 func max(*values)
-    if _alen(values) eq 0
+    if _alen(values) == 0
         return 0
     end
     var m = values[0]
@@ -34,7 +34,7 @@ func max(*values)
 end
 
 func min(*values)
-    if _alen(values) eq 0
+    if _alen(values) == 0
         return 0
     end
     var m = values[0]
