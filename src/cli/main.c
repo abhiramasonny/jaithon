@@ -1,6 +1,7 @@
 #include "../core/runtime.h"
 #include "../lang/lexer.h"
 #include "../lang/parser.h"
+#include "../vm/bytecode.h"
 #include <getopt.h>
 #include <readline/readline.h>
 #include <readline/history.h>
@@ -9,7 +10,7 @@
 #include <unistd.h>
 #include <mach-o/dyld.h>
 
-#define VERSION "2.0.0"
+#define VERSION "2.1.0"
 
 static char execDir[1024] = {0};
 
@@ -202,6 +203,7 @@ int main(int argc, char* argv[]) {
     registerGuiFunctions();
     registerBuiltinKeywords();
     initParser();
+    cacheInit(execDir);
     
     setbuf(stdout, NULL);
     
@@ -265,6 +267,7 @@ int main(int argc, char* argv[]) {
         printf("\n==================== Execution time: %.4fs ====================\n", elapsed);
     }
     
+    cacheFree();
     freeRuntime();
     return 0;
 }

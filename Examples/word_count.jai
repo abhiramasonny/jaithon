@@ -1,7 +1,7 @@
 #frequency counter using hashmap
 
-import lib/modules/hashmap
-import lib/modules/string
+import lib/modules/ds/hashmap
+import lib/modules/core/string
 
 func isAlpha(c)
     return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")

@@ -379,3 +379,34 @@ int getKW_NEW(void) { return KW_NEW; }
 int getKW_EXTENDS(void) { return KW_EXTENDS; }
 int getKW_SELF(void) { return KW_SELF; }
 int getKW_NAMESPACE(void) { return KW_NAMESPACE; }
+
+int tokenizeSource(const char* source, Token** outTokens) {
+    Lexer lex;
+    lexerInit(&lex, source);
+    
+    int capacity = 256;
+    Token* tokens = malloc(sizeof(Token) * capacity);
+    int count = 0;
+    
+    tokens[count++] = lex.currentToken;
+    
+    if (lex.currentToken.kind == TK_EOF) {
+        *outTokens = tokens;
+        return count;
+    }
+    
+    while (true) {
+        Token t = lexerNext(&lex);
+        
+        if (count >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, sizeof(Token) * capacity);
+        }
+        tokens[count++] = t;
+        
+        if (t.kind == TK_EOF) break;
+    }
+    
+    *outTokens = tokens;
+    return count;
+}

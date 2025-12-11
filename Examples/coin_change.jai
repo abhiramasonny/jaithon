@@ -1,6 +1,6 @@
 #dynamic programming
 
-import lib/modules/core
+import lib/modules/core/core
 
 func countWays(amount, coins)
     var dp = []

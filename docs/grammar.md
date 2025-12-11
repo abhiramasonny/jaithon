@@ -244,7 +244,7 @@ end
 
 ## Standard Library
 
-The standard library (`lib/std.jai`) is written in Jaithon and loaded automatically. It pulls in modular files from `lib/modules/` (constants, core, math, list, array, string, random, queue, stack). You can also import a specific module directly (e.g. `import lib/modules/array`).
+The standard library (`lib/std.jai`) is written in Jaithon and loaded automatically. It pulls in modular files from `lib/modules/` (constants, core, math, list, array, string, random, stack, queue, vector, hashmap, etc.). You can also import a specific module directly (e.g. `import lib/modules/array`).
 
 ### Data Structures
 
@@ -254,6 +254,36 @@ The standard library (`lib/std.jai`) is written in Jaithon and loaded automatica
 | Arrays    | `arrayNew`, `arrayLen`, `arrayGet`, `arraySet`, `arrayPush`, `arrayPop`, `arrayRange`, `arrayCopy`, `arrayMap`, `arrayFilter`, `arrayReduce` | Dynamic arrays backed by the native array runtime. |
 | Stack     | `stack()` constructor with methods `push`, `pop`, `peek`, `isEmpty`, `size` | LIFO stack implemented on top of arrays. |
 | Queue     | `queue()` constructor with methods `enqueue`, `dequeue`, `peek`, `isEmpty`, `size` | FIFO queue implemented on top of arrays. |
+| Vector    | `vector()` constructor with methods `len`, `get`, `set`, `push`, `pop`, `clear`, `toArray` | Dynamic sequence convenience wrapper over arrays. |
+
+### String Helpers (stdlib)
+
+| Function | Description | Example |
+|----------|-------------|---------|
+| `repeat(s, n)` | Repeat string | `repeat("ha", 3)` → `"hahaha"` |
+| `startsWith(s, prefix)` | Prefix check | `startsWith("hello", "he")` → `true` |
+| `endsWith(s, suffix)` | Suffix check | `endsWith("hello", "lo")` → `true` |
+| `contains_str(s, sub)` | Substring search | `contains_str("abracadabra", "cada")` → `true` |
+| `indexOf(s, sub)` | First index (or -1) | `indexOf("hello", "l")` → `2` |
+| `replace(s, old, repl)` | Replace all occurrences | `replace("foo bar foo", "foo", "baz")` → `"baz bar baz"` |
+| `reverse_str(s)` | Reverse string | `reverse_str("abc")` → `"cba"` |
+| `trim(s)` | Trim whitespace | `trim("  hi  ")` → `"hi"` |
+| `upper(s)` / `lower(s)` | Case conversion (ASCII) | `upper("hi")` → `"HI"` |
+
+### GUI (Metal on macOS)
+
+The GUI module (`import lib/modules/gui/window`) exposes a `Window` class and helpers backed by native Metal code (macOS/Apple Silicon only).
+
+| Item | Description |
+|------|-------------|
+| `rgb(r, g, b)` | Compose 24-bit color |
+| `Window` fields | `width`, `height`, `targetFPS` |
+| `Window.init(w, h, title)` / `initWithFPS(...)` | Create a window |
+| `putPixel(x, y, color)` | Write a pixel into the backbuffer |
+| `clear(color)` | Clear backbuffer |
+| `fillRect`, `drawRect`, `drawLine`, `drawCircle`, `fillCircle` | Drawing primitives |
+| `update()` | Present backbuffer (vsync) |
+| `getDeltaTime()` / `getFPS()` / `getTime()` | Timing utilities |
 
 ### Math Utilities
 

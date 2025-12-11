@@ -91,5 +91,7 @@ int getKW_NEW(void);
 int getKW_EXTENDS(void);
 int getKW_SELF(void);
 int getKW_NAMESPACE(void);
+\
+int tokenizeSource(const char* source, Token** outTokens);
 
 #endif

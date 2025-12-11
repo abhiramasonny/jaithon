@@ -7,9 +7,9 @@
 #   load <path>    - read from file
 #   exit           - quit
 
-import lib/modules/hashmap
-import lib/modules/vector
-import lib/modules/string
+import lib/modules/ds/hashmap
+import lib/modules/ds/vector
+import lib/modules/core/string
 
 func prompt()
     print "todo> "

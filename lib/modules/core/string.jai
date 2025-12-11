@@ -56,6 +56,42 @@ func indexOf(s, sub)
     return 0 - 1
 end
 
+func upper(s)
+    var lower = "abcdefghijklmnopqrstuvwxyz"
+    var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var result = ""
+    var i = 0
+    while i < len(s)
+        var c = charAt(s, i)
+        var idx = indexOf(lower, c)
+        if idx >= 0
+            result = concat(result, charAt(upper, idx))
+        else
+            result = concat(result, c)
+        end
+        i = i + 1
+    end
+    return result
+end
+
+func lower(s)
+    var lower = "abcdefghijklmnopqrstuvwxyz"
+    var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var result = ""
+    var i = 0
+    while i < len(s)
+        var c = charAt(s, i)
+        var idx = indexOf(upper, c)
+        if idx >= 0
+            result = concat(result, charAt(lower, idx))
+        else
+            result = concat(result, c)
+        end
+        i = i + 1
+    end
+    return result
+end
+
 func replace(s, old, replacement)
     var result = ""
     var i = 0

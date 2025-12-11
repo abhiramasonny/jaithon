@@ -1,10 +1,107 @@
 #include "parser.h"
 #include <time.h>
 #include <sys/time.h>
+#include <ctype.h>
+#include <strings.h>
+#include "../vm/vm.h"
+#include "../vm/compiler.h"
+#include "../vm/bytecode.h"
 
 #define MAX_STATEMENTS 64
 #define MAX_INFIXES 64
-#define MAX_CALL_ARGS 256
+#define MAX_CALL_ARGS 64
+
+#define MAX_COMPILED_FUNCS 256
+typedef struct {
+    char name[MAX_NAME_LEN];
+    int paramCount;
+    bool isVariadic;
+    uint64_t bodyHash;
+    CompiledFunc* compiled;
+} CompiledFuncEntry;
+
+static CompiledFuncEntry compiledFuncs[MAX_COMPILED_FUNCS];
+static int compiledFuncCount = 0;
+
+static uint64_t hashFunctionSignature(const JaiFunction* f) {
+    uint64_t h = hashSource(f->body ? f->body : "");
+    h ^= (uint64_t)f->paramCount + 0x9e3779b97f4a7c15ULL;
+    if (f->isVariadic) {
+        h ^= 0xfeedfacecafebeefULL;
+    }
+    for (int i = 0; i < f->paramCount; i++) {
+        const char* p = f->params[i];
+        while (p && *p) {
+            h ^= (uint8_t)(*p++);
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+static CompiledFunc* getCompiledFunc(JaiFunction* f) {
+    if (!f || !f->body) return NULL;
+    
+    static bool checkedEnv = false;
+    static bool enableVMCompile = false; //default off for correctness
+    if (!checkedEnv) {
+        const char* env = getenv("JAITHON_DISABLE_VM");
+        if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+            enableVMCompile = false;
+        }
+        const char* envOn = getenv("JAITHON_ENABLE_VM");
+        if (envOn && (strcmp(envOn, "1") == 0 || strcasecmp(envOn, "true") == 0)) {
+            enableVMCompile = true;
+        }
+        checkedEnv = true;
+    }
+    if (!enableVMCompile) return NULL;
+    
+    uint64_t hash = hashFunctionSignature(f);
+    
+    for (int i = 0; i < compiledFuncCount; i++) {
+        if (strcmp(compiledFuncs[i].name, f->name) == 0 &&
+            compiledFuncs[i].paramCount == f->paramCount &&
+            compiledFuncs[i].isVariadic == f->isVariadic &&
+            compiledFuncs[i].bodyHash == hash) {
+            return compiledFuncs[i].compiled;
+        }
+    }
+    
+    Token* tokens = NULL;
+    int tokenCount = tokenizeSource(f->body, &tokens);
+    if (!tokens || tokenCount == 0) {
+        if (tokens) free(tokens);
+        return NULL;
+    }
+    
+    CompiledFunc* compiled = compileFunction(f, tokens, tokenCount);
+    free(tokens);
+    
+    if (!compiled) {
+        return NULL;//fallback
+    }
+    
+    compiled->arity = f->paramCount;
+    compiled->isVariadic = f->isVariadic;
+    if (f->paramCount > 0) {
+        compiled->paramNames = malloc(sizeof(char*) * f->paramCount);
+        for (int i = 0; i < f->paramCount; i++) {
+            compiled->paramNames[i] = strdup(f->params[i]);
+        }
+    }
+    
+    if (compiledFuncCount < MAX_COMPILED_FUNCS) {
+        strncpy(compiledFuncs[compiledFuncCount].name, f->name, MAX_NAME_LEN - 1);
+        compiledFuncs[compiledFuncCount].paramCount = f->paramCount;
+        compiledFuncs[compiledFuncCount].isVariadic = f->isVariadic;
+        compiledFuncs[compiledFuncCount].bodyHash = hash;
+        compiledFuncs[compiledFuncCount].compiled = compiled;
+        compiledFuncCount++;
+    }
+    
+    return compiled;
+}
 
 static StatementEntry statements[MAX_STATEMENTS];
 static int statementCount = 0;
@@ -79,6 +176,34 @@ static bool toBool(Value v) {
     }
 }
 
+static bool methodExpectsSelf(JaiFunction* m) {
+    return m && m->paramCount > 0 && strcmp(m->params[0], "self") == 0;
+}
+
+static Value stubGuiMousePos(Value* args, int argc) {
+    (void)args; (void)argc;
+    Value arr = makeArray(2);
+    arrayPush(arr.as.array, makeNumber(0));
+    arrayPush(arr.as.array, makeNumber(0));
+    arr.as.array->length = 2;
+    return arr;
+}
+
+static Value stubGuiMouseDown(Value* args, int argc) {
+    (void)args; (void)argc;
+    return makeBool(false);
+}
+
+static Value stubGuiKeyDown(Value* args, int argc) {
+    (void)args; (void)argc;
+    return makeBool(false);
+}
+
+static Value stubGuiPoll(Value* args, int argc) {
+    (void)args; (void)argc;
+    return makeNull();
+}
+
 Value parsePrimary(Lexer* lex) {
     Token t = lex->currentToken;
     
@@ -130,6 +255,7 @@ Value parsePrimary(Lexer* lex) {
             Value args[MAX_CALL_ARGS];
             args[0] = obj;
             int argc = 1;
+            bool userPassedArgs = false;
             
             if (!lexerCheck(lex, TK_RPAREN)) {
                 do {
@@ -138,12 +264,16 @@ Value parsePrimary(Lexer* lex) {
                         return makeNull();
                     }
                     args[argc++] = parseExpression(lex);
+                    userPassedArgs = true;
                 } while (lexerMatch(lex, TK_COMMA));
             }
             lexerExpect(lex, TK_RPAREN);
             
             if (cls->constructor) {
-                callValue(makeFunction(cls->constructor), args, argc);
+                if (cls->constructor->paramCount == argc ||
+                    (!userPassedArgs && cls->constructor->paramCount == 1)) {
+                    callValue(makeFunction(cls->constructor), args, argc);
+                }
             }
         }
         
@@ -316,8 +446,10 @@ Value parsePrimary(Lexer* lex) {
                         }
                         lexerNext(lex);
                         Value args[MAX_CALL_ARGS];
-                        args[0] = result;
-                        int argc = 1;
+                        int argc = 0;
+                        if (methodExpectsSelf(method)) {
+                            args[argc++] = result;
+                        }
                         if (!lexerCheck(lex, TK_RPAREN)) {
                             do {
                                 if (argc >= MAX_CALL_ARGS) {
@@ -521,7 +653,19 @@ static Value handleDot(Lexer* lex, Value left) {
         Value args[MAX_CALL_ARGS];
         int argc = 0;
 
-        args[argc++] = left;
+        if (left.type != VAL_OBJECT) {
+            runtimeError("Cannot call method on non-object");
+            return makeNull();
+        }
+        JaiFunction* method = objectGetMethod(left.as.object, fieldName);
+        if (!method) {
+            runtimeError("Object has no method: %s", fieldName);
+            return makeNull();
+        }
+
+        if (methodExpectsSelf(method)) {
+            args[argc++] = left;
+        }
         if (!lexerCheck(lex, TK_RPAREN)) {
             do {
                 if (argc >= MAX_CALL_ARGS) {
@@ -533,15 +677,6 @@ static Value handleDot(Lexer* lex, Value left) {
         }
         lexerExpect(lex, TK_RPAREN);
         
-        if (left.type != VAL_OBJECT) {
-            runtimeError("Cannot call method on non-object");
-            return makeNull();
-        }
-        JaiFunction* method = objectGetMethod(left.as.object, fieldName);
-        if (!method) {
-            runtimeError("Object has no method: %s", fieldName);
-            return makeNull();
-        }
         return callValue(makeFunction(method), args, argc);
     }
 
@@ -677,7 +812,7 @@ static Value stmtPrint(Lexer* lex) {
             printf("%s\n", val.as.string);
             break;
         case VAL_BOOL:
-            printf("%s\n", val.as.boolean ? "true" : "false");
+            printf("%d\n", val.as.boolean ? 1 : 0);
             break;
         case VAL_NULL:
             printf("null\n");
@@ -753,51 +888,84 @@ static Value stmtIf(Lexer* lex) {
     return result;
 }
 
-static Value stmtWhile(Lexer* lex) {
-    const char* loopStart = lex->current;
-    Token startToken = lex->currentToken;
-    int startLine = lex->line;
-    
+static Value stmtWhileVM(Lexer* lex) { //whileloop optmized
     lexerExpect(lex, getKW_WHILE());
     
-    for (;;) {
-        Value cond = parseExpression(lex);
-        
-        lexerMatch(lex, getKW_DO());
-        skipNewlines(lex);
-        
-        if (!toBool(cond)) {
-            int depth = 1;
-            while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
-                if (lex->currentToken.kind == getKW_WHILE() || 
-                    lex->currentToken.kind == getKW_IF() ||
-                    lex->currentToken.kind == getKW_FUNC()) {
-                    depth++;
-                }
-                if (lex->currentToken.kind == getKW_END()) {
-                    depth--;
-                    if (depth == 0) break;
-                }
-                lexerNext(lex);
-            }
-            lexerExpect(lex, getKW_END());
-            break;
-        }
-        
-        while (!lexerCheck(lex, getKW_END()) && !lexerCheck(lex, TK_EOF)) {
-            parseStatement(lex);
-            skipNewlines(lex);
-            if (hasReturn) return returnValue;
-        }
-        
-        lex->current = loopStart;
-        lex->line = startLine;
-        lex->currentToken = startToken;
-        lex->hasPeek = false;
+    const char* condStart = lex->start;
+    
+    int parenDepth = 0;
+    while (!lexerCheck(lex, TK_EOF)) {
+        int kind = lex->currentToken.kind;
+        if (kind == getKW_DO() && parenDepth == 0) break;
+        if (kind == TK_NEWLINE && parenDepth == 0) break;
+        if (kind == TK_LPAREN) parenDepth++;
+        if (kind == TK_RPAREN) parenDepth--;
         lexerNext(lex);
     }
+    const char* condEnd = lex->start;
     
-    return makeNull();
+    lexerMatch(lex, getKW_DO());
+    skipNewlines(lex);
+    
+    const char* bodyStart = lex->start;
+    int depth = 1;
+    while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
+        int kind = lex->currentToken.kind;
+        if (kind == getKW_WHILE() || kind == getKW_IF() || kind == getKW_FUNC() || kind == getKW_CLASS()) {
+            depth++;
+        }
+        if (kind == getKW_END()) {
+            depth--;
+            if (depth == 0) break;
+        }
+        lexerNext(lex);
+    }
+    const char* bodyEnd = lex->start;
+    
+    int bodyLen = (int)(bodyEnd - bodyStart);
+    char* bodySrc = malloc(bodyLen + 1);
+    memcpy(bodySrc, bodyStart, bodyLen);
+    bodySrc[bodyLen] = '\0';
+    
+    int condLen = (int)(condEnd - condStart);
+    char* condSrc = malloc(condLen + 1);
+    memcpy(condSrc, condStart, condLen);
+    condSrc[condLen] = '\0';
+    
+    Value result = makeNull();
+    int iterations = 0;
+    const int MAX_ITERATIONS = 100000000;
+    
+    while (iterations++ < MAX_ITERATIONS) {
+        Lexer condLex;
+        lexerInit(&condLex, condSrc);
+        Value cond = parseExpression(&condLex);
+        
+        if (!toBool(cond)) break;
+        
+        Lexer bodyLex;
+        lexerInit(&bodyLex, bodySrc);
+        while (!lexerCheck(&bodyLex, TK_EOF)) {
+            result = parseStatement(&bodyLex);
+            skipNewlines(&bodyLex);
+            if (hasReturn) {
+                result = returnValue;
+                break;
+            }
+        }
+        
+        if (hasReturn) break;
+    }
+    
+    free(bodySrc);
+    free(condSrc);
+    
+    lexerExpect(lex, getKW_END());
+    return result;
+}
+
+static Value stmtWhile(Lexer* lex) {
+    return stmtWhileVM(lex);
 }
 
 static Value stmtFunc(Lexer* lex) {
@@ -1360,8 +1528,10 @@ Value parseStatement(Lexer* lex) {
                         }
                         lexerNext(lex);
                         Value args[MAX_CALL_ARGS];
-                        args[0] = result;
-                        int argc = 1;
+                        int argc = 0;
+                        if (methodExpectsSelf(method)) {
+                            args[argc++] = result;
+                        }
                         if (!lexerCheck(lex, TK_RPAREN)) {
                             do {
                                 args[argc++] = parseExpression(lex);
@@ -1445,8 +1615,18 @@ Value parseProgram(Lexer* lex) {
 }
 
 Value callValue(Value callee, Value* args, int argc) {
+    static int callDepth = 0;
+    callDepth++;
+    if (callDepth > MAX_CALL_STACK) {
+        callDepth--;
+        runtimeError("Call stack overflow");
+        return makeNull();
+    }
+
     if (callee.type == VAL_NATIVE_FUNC) {
-        return callee.as.nativeFunc(args, argc);
+        Value r = callee.as.nativeFunc(args, argc);
+        callDepth--;
+        return r;
     }
     
     if (callee.type == VAL_FUNCTION) {
@@ -1460,77 +1640,107 @@ Value callValue(Value callee, Value* args, int argc) {
             int minArgs = f->paramCount - 1;
             if (argc < minArgs) {
                 runtimeError("Expected at least %d arguments, got %d", minArgs, argc);
+                callDepth--;
                 return makeNull();
             }
         } else if (argc != f->paramCount) {
             runtimeError("Expected %d arguments, got %d", f->paramCount, argc);
+            callDepth--;
             return makeNull();
         }
         
-        Module* oldMod = runtime.currentModule;
-        Module* funcMod = createModule("__call__", "");
-        runtime.currentModule = funcMod;
-        
-        if (f->namespace) {
-            for (int i = 0; i < f->namespace->varCount; i++) {
-                setVariable(f->namespace->variables[i].name, f->namespace->variables[i].value);
-            }
-            for (int i = 0; i < f->namespace->funcCount; i++) {
-                if (!hasVariable(f->namespace->functions[i]->name)) {
-                    setVariable(f->namespace->functions[i]->name, makeFunction(f->namespace->functions[i]));
-                }
-            }
+    Module* oldMod = runtime.currentModule;
+    
+    CompiledFunc* compiled = getCompiledFunc(f);
+    if (compiled) {
+        VM* vm = malloc(sizeof(VM));
+        vmInit(vm);
+        runtime.currentModule = oldMod;
+        for (int i = 0; i < compiled->arity && i < argc; i++) {
+            vmPush(vm, args[i]);
         }
-        
-        if (f->isVariadic) {
-            int regularParams = f->paramCount - 1;
-            for (int i = 0; i < regularParams; i++) {
-                setVariable(f->params[i], args[i]);
-            }
-            Value variadicArray = makeArray(argc - regularParams);
-            for (int i = regularParams; i < argc; i++) {
-                arrayPush(variadicArray.as.array, args[i]);
-            }
-            setVariable(f->params[regularParams], variadicArray);
-        } else {
-            for (int i = 0; i < argc; i++) {
-                setVariable(f->params[i], args[i]);
-            }
-        }
-        
-        Lexer bodyLex;
-        lexerInit(&bodyLex, f->body);
-        
-        hasReturn = false;
-        Value result = parseProgram(&bodyLex);
-        
-        if (hasReturn) {
-            result = returnValue;
-            hasReturn = false;
-        }
-        
-        if (f->namespace) {
-            for (int i = 0; i < f->namespace->varCount; i++) {
-                for (int j = 0; j < funcMod->varCount; j++) {
-                    if (strcmp(funcMod->variables[j].name, f->namespace->variables[i].name) == 0) {
-                        f->namespace->variables[i].value = funcMod->variables[j].value;
-                        break;
-                    }
-                }
-            }
-        }
+        InterpretResult vmResult = vmRun(vm, compiled);
+        Value result = vmResult == INTERPRET_OK ? vm->result : makeNull();
+        vmFree(vm);
+        free(vm);
         
         runtime.currentModule = oldMod;
-        runtime.moduleCount--;
+        if (runtime.callStackSize > 0) runtime.callStackSize--;
+        callDepth--;
         
-        if (runtime.callStackSize > 0) {
-            runtime.callStackSize--;
+        if (vmResult != INTERPRET_OK) {
+            goto INTERPRET_FALLBACK;
         }
-        
         return result;
     }
     
+INTERPRET_FALLBACK: ;
+    Module* funcMod = createModule("__call__", "");
+    runtime.currentModule = funcMod;
+    
+    if (f->namespace) {
+        for (int i = 0; i < f->namespace->varCount; i++) {
+            setVariable(f->namespace->variables[i].name, f->namespace->variables[i].value);
+        }
+        for (int i = 0; i < f->namespace->funcCount; i++) {
+            if (!hasVariable(f->namespace->functions[i]->name)) {
+                setVariable(f->namespace->functions[i]->name, makeFunction(f->namespace->functions[i]));
+            }
+        }
+    }
+    
+    if (f->isVariadic) {
+        int regularParams = f->paramCount - 1;
+        for (int i = 0; i < regularParams; i++) {
+            setVariable(f->params[i], args[i]);
+        }
+        Value variadicArray = makeArray(argc - regularParams);
+        for (int i = regularParams; i < argc; i++) {
+            arrayPush(variadicArray.as.array, args[i]);
+        }
+        setVariable(f->params[regularParams], variadicArray);
+    } else {
+        for (int i = 0; i < argc; i++) {
+            setVariable(f->params[i], args[i]);
+        }
+    }
+    
+    hasReturn = false;
+    Value result = makeNull();
+    
+    Lexer bodyLex;
+    lexerInit(&bodyLex, f->body);
+    result = parseProgram(&bodyLex);
+    
+    if (hasReturn) {
+        result = returnValue;
+        hasReturn = false;
+    }
+    
+    if (f->namespace) {
+        for (int i = 0; i < f->namespace->varCount; i++) {
+            for (int j = 0; j < funcMod->varCount; j++) {
+                if (strcmp(funcMod->variables[j].name, f->namespace->variables[i].name) == 0) {
+                    f->namespace->variables[i].value = funcMod->variables[j].value;
+                    break;
+                }
+            }
+        }
+    }
+    
+    runtime.currentModule = oldMod;
+    runtime.moduleCount--;
+    
+    if (runtime.callStackSize > 0) {
+        runtime.callStackSize--;
+    }
+    
+    callDepth--;
+    return result;
+}
+    
     runtimeError("Cannot call non-function value");
+    callDepth--;
     return makeNull();
 }
 
@@ -1589,7 +1799,7 @@ static Value nativeStr(Value* args, int argc) {
     char buf[256];
     switch (args[0].type) {
         case VAL_NUMBER: snprintf(buf, sizeof(buf), "%g", args[0].as.number); break;
-        case VAL_BOOL: strcpy(buf, args[0].as.boolean ? "true" : "false"); break;
+        case VAL_BOOL: snprintf(buf, sizeof(buf), "%d", args[0].as.boolean ? 1 : 0); break;
         case VAL_STRING: return args[0];
         default: strcpy(buf, "null");
     }
@@ -1614,6 +1824,9 @@ static Value nativeType(Value* args, int argc) {
         case VAL_NATIVE_FUNC: return makeString("native");
         case VAL_CELL: return makeString("cell");
         case VAL_FILE: return makeString("file");
+        case VAL_ARRAY: return makeString("array");
+        case VAL_OBJECT: return makeString("object");
+        case VAL_NAMESPACE: return makeString("namespace");
         default: return makeString("null");
     }
 }
@@ -1844,6 +2057,13 @@ void initParser(void) {
     
     srand(time(NULL));
     
+    if (!hasVariable("gui_mouse_pos")) {
+        setVariable("gui_mouse_pos", makeNativeFunc(stubGuiMousePos));
+        setVariable("gui_mouse_down", makeNativeFunc(stubGuiMouseDown));
+        setVariable("gui_key_down", makeNativeFunc(stubGuiKeyDown));
+        setVariable("gui_poll", makeNativeFunc(stubGuiPoll));
+    }
+    
     setVariable("_sin", makeNativeFunc(nativeSin));
     setVariable("_cos", makeNativeFunc(nativeCos));
     setVariable("_tan", makeNativeFunc(nativeTan));
@@ -1867,6 +2087,7 @@ void initParser(void) {
     
     setVariable("_array", makeNativeFunc(nativeArray));
     setVariable("_push", makeNativeFunc(nativePush));
+    setVariable("_apush", makeNativeFunc(nativePush));
     setVariable("_pop", makeNativeFunc(nativePop));
     setVariable("_get", makeNativeFunc(nativeGet));
     setVariable("_set", makeNativeFunc(nativeSet));

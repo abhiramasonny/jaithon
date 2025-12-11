@@ -463,6 +463,20 @@ int arrayLen(JaiArray* arr) {
 }
 
 JaiClass* defineClass(const char* name, JaiClass* parent) {
+    JaiClass* existing = findClass(name);
+    if (existing) {
+        if (parent && !existing->parent) {
+            existing->parent = parent;
+            for (int i = 0; i < parent->fieldCount; i++) {
+                classAddField(existing, parent->fieldNames[i]);
+            }
+            for (int i = 0; i < parent->methodCount; i++) {
+                classAddMethod(existing, parent->methodNames[i], parent->methods[i]);
+            }
+        }
+        return existing;
+    }
+    
     if (runtime.classCount >= runtime.classCapacity) {
         runtime.classCapacity *= GROWTH_FACTOR;
         runtime.classes = realloc(runtime.classes, sizeof(JaiClass*) * runtime.classCapacity);
