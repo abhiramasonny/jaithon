@@ -364,8 +364,8 @@ jaithon/
 │       └── parser.c/.h    # Parser and execution
 ├── lib/                   # Standard library (bootstrapped)
 │   └── std.jai           # Written in Jaithon itself
-├── Documentation/         # Language documentation
-├── Test/                  # Example programs
+├── docs/         # Language documentation
+├── test/                  # Example programs
 │   ├── Jaithon/          # Jaithon test files
 │   └── Python/           # Equivalent Python files
 ├── Extensions/            # VS Code syntax highlighting
@@ -400,7 +400,7 @@ See `Test/Jaithon/` for example programs:
 
 ## Documentation
 
-Full language reference: [`Documentation/grammar.md`](Documentation/grammar.md)
+Full language reference: [`docs/grammar.md`](docs/grammar.md)
 
 ---
 
