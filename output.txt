@@ -1,0 +1,717 @@
+==================== DEBUG MODE ====================
+DEBUG statement token: import (line 7)
+DEBUG statement token: var (line 3)
+Set PI = 3.14159
+DEBUG statement token: var (line 4)
+Set E = 2.71828
+DEBUG statement token: var (line 5)
+Set TAU = 6.28319
+DEBUG statement token: var (line 6)
+Set PHI = 1.61803
+DEBUG statement token: var (line 7)
+Set SQRT2 = 1.41421
+DEBUG statement token: var (line 8)
+Set LN2 = 0.693147
+DEBUG statement token: var (line 9)
+Set LN10 = 2.30259
+DEBUG statement token: var (line 10)
+Set INFINITY = 1e+308
+DEBUG statement token: var (line 11)
+Set EPSILON = 2.22045e-16
+DEBUG statement token: import (line 8)
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 3)
+Defined function len with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 7)
+Defined function str with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 11)
+Defined function num with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 15)
+Defined function type with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 19)
+Defined function time with 0 params
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 23)
+Defined function rand with 0 params
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 27)
+Defined function sin with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 31)
+Defined function cos with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 35)
+Defined function tan with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 39)
+Defined function sqrt with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 43)
+Defined function log with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 47)
+Defined function exp with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 51)
+Defined function charAt with 2 params
+  Param 0: s
+  Param 1: idx
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 55)
+Defined function substr with 3 params
+  Param 0: s
+  Param 1: start
+  Param 2: count
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 59)
+Defined function concat with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG statement token: import (line 9)
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 3)
+Defined function abs with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 10)
+Defined function floor with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 20)
+Defined function ceil with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 28)
+Defined function round with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 35)
+Defined function trunc with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 42)
+Defined function sign with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 52)
+Defined function max with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 59)
+Defined function min with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 66)
+Defined function clamp with 3 params
+  Param 0: val
+  Param 1: lo
+  Param 2: hi
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 70)
+Defined function lerp with 3 params
+  Param 0: a
+  Param 1: b
+  Param 2: t
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 74)
+Defined function pow with 2 params
+  Param 0: base
+  Param 1: exponent
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 90)
+Defined function pow2 with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 94)
+Defined function pow3 with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 98)
+Defined function cbrt with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 111)
+Defined function hypot with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 115)
+Defined function sec with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 119)
+Defined function csc with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 123)
+Defined function cot with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 127)
+Defined function sinh with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 131)
+Defined function cosh with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 135)
+Defined function tanh with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 139)
+Defined function degToRad with 1 params
+  Param 0: deg
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 143)
+Defined function radToDeg with 1 params
+  Param 0: rad
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 147)
+Defined function isEven with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 151)
+Defined function isOdd with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 155)
+Defined function isPositive with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 159)
+Defined function isNegative with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 163)
+Defined function isZero with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 167)
+Defined function isInteger with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 171)
+Defined function gcd with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 182)
+Defined function lcm with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 186)
+Defined function isPrime with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 206)
+Defined function fact with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 219)
+Defined function nPr with 2 params
+  Param 0: n
+  Param 1: r
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 223)
+Defined function nCr with 2 params
+  Param 0: n
+  Param 1: r
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 227)
+Defined function fib with 1 params
+  Param 0: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 243)
+Defined function avg with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 247)
+Defined function geometricMean with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 251)
+Defined function harmonicMean with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG statement token: import (line 10)
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 3)
+Defined function cons with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 7)
+Defined function car with 1 params
+  Param 0: pair
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 11)
+Defined function cdr with 1 params
+  Param 0: pair
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 15)
+Defined function setCar with 2 params
+  Param 0: pair
+  Param 1: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 19)
+Defined function setCdr with 2 params
+  Param 0: pair
+  Param 1: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 23)
+Defined function isPair with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 28)
+Defined function list with 0 params
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 32)
+Defined function isEmpty with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 36)
+Defined function isNull with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 40)
+Defined function notNull with 1 params
+  Param 0: x
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 47)
+Defined function head with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 51)
+Defined function tail with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 55)
+Defined function prepend with 2 params
+  Param 0: elem
+  Param 1: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 59)
+Defined function listLen with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 69)
+Defined function listGet with 2 params
+  Param 0: lst
+  Param 1: idx
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 85)
+Defined function listSet with 3 params
+  Param 0: lst
+  Param 1: idx
+  Param 2: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 102)
+Defined function append with 2 params
+  Param 0: lst
+  Param 1: elem
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 114)
+Defined function last with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 125)
+Defined function reverse with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 136)
+Defined function map with 2 params
+  Param 0: lst
+  Param 1: f
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 143)
+Defined function filter with 2 params
+  Param 0: lst
+  Param 1: pred
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 153)
+Defined function foldl with 3 params
+  Param 0: lst
+  Param 1: init
+  Param 2: f
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 163)
+Defined function contains with 2 params
+  Param 0: lst
+  Param 1: elem
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 174)
+Defined function listConcat with 2 params
+  Param 0: lst1
+  Param 1: lst2
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 181)
+Defined function take with 2 params
+  Param 0: lst
+  Param 1: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 191)
+Defined function drop with 2 params
+  Param 0: lst
+  Param 1: n
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 201)
+Defined function range with 2 params
+  Param 0: start
+  Param 1: stop
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 208)
+Defined function _add with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 212)
+Defined function _mul with 2 params
+  Param 0: a
+  Param 1: b
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 216)
+Defined function sum with 1 params
+  Param 0: lst
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 220)
+Defined function product with 1 params
+  Param 0: lst
+DEBUG statement token: import (line 11)
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 3)
+Defined function arrayNew with 1 params
+  Param 0: size
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 7)
+Defined function arrayLen with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 11)
+Defined function arrayGet with 2 params
+  Param 0: arr
+  Param 1: idx
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 15)
+Defined function arraySet with 3 params
+  Param 0: arr
+  Param 1: idx
+  Param 2: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 19)
+Defined function arrayPush with 2 params
+  Param 0: arr
+  Param 1: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 23)
+Defined function arrayPop with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 27)
+Defined function arrayFill with 2 params
+  Param 0: size
+  Param 1: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 37)
+Defined function arrayRange with 2 params
+  Param 0: start
+  Param 1: stop
+DEBUG: lookupKeywError in lib/modules/string (lib/modules/string.jai:1): Undefined variable: s
+ord('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 47)
+Defined function arraySum with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 57)
+Defined function arrayMax with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 72)
+Defined function arrayMin with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 87)
+Defined function arrayReverse with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 97)
+Defined function arrayContains with 2 params
+  Param 0: arr
+  Param 1: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 108)
+Defined function arrayIndexOf with 2 params
+  Param 0: arr
+  Param 1: val
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 119)
+Defined function arrayCopy with 1 params
+  Param 0: arr
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 129)
+Defined function arraySlice with 3 params
+  Param 0: arr
+  Param 1: start
+  Param 2: stop
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 139)
+Defined function arrayConcat with 2 params
+  Param 0: arr1
+  Param 1: arr2
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 149)
+Defined function arrayMap with 2 params
+  Param 0: arr
+  Param 1: f
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 159)
+Defined function arrayFilter with 2 params
+  Param 0: arr
+  Param 1: pred
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 171)
+Defined function arrayReduce with 3 params
+  Param 0: arr
+  Param 1: init
+  Param 2: f
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: func (line 181)
+Defined function arrayForEach with 2 params
+  Param 0: arr
+  Param 1: f
+DEBUG statement token: import (line 12)
+DEBUG: lookupKeyword('func') count=29
+DEBUG: found func at 8, type 108
+DEBUG: scanIdentifier found func keyword 108
+DEBUG statement token: identifier (line 1)

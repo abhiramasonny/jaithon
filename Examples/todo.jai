@@ -90,14 +90,14 @@ class Todo
             print status + " #" + str(t.id) + " " + t.text
             i = i + 1
         end
-        if _alen(keys) eq 0
+        if _alen(keys) == 0
             print "(no tasks)"
         end
     end
     
     func markDone(self, id)
         var t = self.tasks.get(num(id))
-        if t eq null
+        if t == null
             print "No such id"
             return
         end
@@ -120,13 +120,13 @@ func main()
         prompt()
         var line = readLine()
         line = trimLine(line)
-        if len(line) eq 0
+        if len(line) == 0
 
         else
-            if line eq "exit"
+            if line == "exit"
                 return
             else
-                if line eq "list"
+                if line == "list"
                     todo.list()
                 else
                     if startsWith(line, "add ")

@@ -202,6 +202,8 @@ int main(int argc, char* argv[]) {
     registerBuiltinKeywords();
     initParser();
     
+    setbuf(stdout, NULL);
+    
     int opt;
     while ((opt = getopt_long(argc, argv, "dsvhN", longOpts, NULL)) != -1) {
         switch (opt) {

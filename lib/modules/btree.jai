@@ -1,4 +1,4 @@
-# Jaithon Binary Search Tree (numbers)
+#bin tree
 
 class BNode
     var value
@@ -23,22 +23,22 @@ class BST
     end
     
     func minVal(self)
-        if self.root eq null
+        if self.root == null
             return null
         end
         var cur = self.root
-        while not (cur.left eq null)
+        while not (cur.left == null)
             cur = cur.left
         end
         return cur.value
     end
     
     func maxVal(self)
-        if self.root eq null
+        if self.root == null
             return null
         end
         var cur = self.root
-        while not (cur.right eq null)
+        while not (cur.right == null)
             cur = cur.right
         end
         return cur.value
@@ -52,7 +52,7 @@ class BST
 end
 
 func bstInsert(node, val)
-    if node eq null
+    if node == null
         var n = new BNode()
         n.value = val
         n.left = null
@@ -68,10 +68,10 @@ func bstInsert(node, val)
 end
 
 func bstContains(node, val)
-    if node eq null
+    if node == null
         return false
     end
-    if val eq node.value
+    if val == node.value
         return true
     end
     if val < node.value
@@ -81,7 +81,7 @@ func bstContains(node, val)
 end
 
 func bstInorder(node, out)
-    if node eq null
+    if node == null
         return
     end
     bstInorder(node.left, out)

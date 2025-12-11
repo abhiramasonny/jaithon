@@ -25,6 +25,8 @@ typedef enum {
     TK_DOT,
     TK_COLON,
     TK_EQUALS,
+    TK_EQ_EQ,
+    TK_NE,
     TK_GT,
     TK_LT,
     TK_GE,
@@ -78,7 +80,6 @@ int getKW_AND(void);
 int getKW_OR(void);
 int getKW_NOT(void);
 int getKW_XOR(void);
-int getKW_EQ(void);
 int getKW_TRUE(void);
 int getKW_FALSE(void);
 int getKW_NULL(void);
@@ -89,5 +90,6 @@ int getKW_CLASS(void);
 int getKW_NEW(void);
 int getKW_EXTENDS(void);
 int getKW_SELF(void);
+int getKW_NAMESPACE(void);
 
 #endif

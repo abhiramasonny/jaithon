@@ -20,14 +20,14 @@ func startsWith(s, prefix)
     if len(prefix) > len(s)
         return false
     end
-    return substr(s, 0, len(prefix)) eq prefix
+    return substr(s, 0, len(prefix)) == prefix
 end
 
 func endsWith(s, suffix)
     if len(suffix) > len(s)
         return false
     end
-    return substr(s, len(s) - len(suffix), len(suffix)) eq suffix
+    return substr(s, len(s) - len(suffix), len(suffix)) == suffix
 end
 
 func contains_str(s, sub)
@@ -35,7 +35,7 @@ func contains_str(s, sub)
     var subLen = len(sub)
     var sLen = len(s)
     while i <= sLen - subLen
-        if substr(s, i, subLen) eq sub
+        if substr(s, i, subLen) == sub
             return true
         end
         i = i + 1
@@ -48,7 +48,7 @@ func indexOf(s, sub)
     var subLen = len(sub)
     var sLen = len(s)
     while i <= sLen - subLen
-        if substr(s, i, subLen) eq sub
+        if substr(s, i, subLen) == sub
             return i
         end
         i = i + 1
@@ -63,7 +63,7 @@ func replace(s, old, replacement)
     var oldLen = len(old)
     while i < sLen
         if i <= sLen - oldLen
-            if substr(s, i, oldLen) eq old
+            if substr(s, i, oldLen) == old
                 result = concat(result, replacement)
                 i = i + oldLen
             else
@@ -89,7 +89,7 @@ func reverse_str(s)
 end
 
 func isDigit(c)
-    return c eq "0" or c eq "1" or c eq "2" or c eq "3" or c eq "4" or c eq "5" or c eq "6" or c eq "7" or c eq "8" or c eq "9"
+    return c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9"
 end
 
 func isLetter(c)
@@ -98,7 +98,7 @@ func isLetter(c)
 end
 
 func isSpace(c)
-    return c eq " " or c eq "\t" or c eq "\n"
+    return c == " " or c == "\t" or c == "\n"
 end
 
 func trim(s)

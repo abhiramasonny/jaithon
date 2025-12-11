@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include <ctype.h>
+#include <stdio.h>
 
 static bool isAtEnd(Lexer* lex) {
     return *lex->current == '\0';
@@ -189,9 +190,19 @@ static Token scanToken(Lexer* lex) {
         case '/': return makeToken(lex, TK_SLASH);
         case '%': return makeToken(lex, TK_PERCENT);
         case '^': return makeToken(lex, TK_CARET);
-        case '!': return makeToken(lex, TK_BANG);
-        case '=': return makeToken(lex, TK_EQUALS);
-        case '>': 
+        case '!': 
+            if (peek(lex) == '=') {
+                advance(lex);
+                return makeToken(lex, TK_NE);
+            }
+            return makeToken(lex, TK_BANG);
+        case '=': 
+            if (peek(lex) == '=') {
+                advance(lex);
+                return makeToken(lex, TK_EQ_EQ);
+            }
+            return makeToken(lex, TK_EQUALS);
+        case '>':  
             if (peek(lex) == '=') {
                 advance(lex);
                 return makeToken(lex, TK_GE);
@@ -282,6 +293,8 @@ const char* tokenKindName(int kind) {
         case TK_DOT: return ".";
         case TK_COLON: return ":";
         case TK_EQUALS: return "=";
+        case TK_EQ_EQ: return "==";
+        case TK_NE: return "!=";
         case TK_GT: return ">";
         case TK_LT: return "<";
         case TK_NEWLINE: return "newline";
@@ -299,10 +312,11 @@ const char* tokenKindName(int kind) {
 
 static int KW_VAR, KW_PRINT, KW_IF, KW_THEN, KW_ELSE, KW_DO, KW_WHILE, KW_LOOP;
 static int KW_FUNC, KW_RETURN, KW_END, KW_IMPORT, KW_FROM, KW_AS;
-static int KW_AND, KW_OR, KW_NOT, KW_XOR, KW_EQ;
+static int KW_AND, KW_OR, KW_NOT, KW_XOR;
 static int KW_TRUE, KW_FALSE, KW_NULL;
 static int KW_INPUT, KW_BREAK, KW_SYSTEM;
 static int KW_CLASS, KW_NEW, KW_EXTENDS, KW_SELF;
+static int KW_NAMESPACE;
 
 void registerBuiltinKeywords(void) {
     KW_VAR = registerKeyword("var");
@@ -323,7 +337,6 @@ void registerBuiltinKeywords(void) {
     KW_OR = registerKeyword("or");
     KW_NOT = registerKeyword("not");
     KW_XOR = registerKeyword("xor");
-    KW_EQ = registerKeyword("eq");
     KW_TRUE = registerKeyword("true");
     KW_FALSE = registerKeyword("false");
     KW_NULL = registerKeyword("null");
@@ -334,6 +347,7 @@ void registerBuiltinKeywords(void) {
     KW_NEW = registerKeyword("new");
     KW_EXTENDS = registerKeyword("extends");
     KW_SELF = registerKeyword("self");
+    KW_NAMESPACE = registerKeyword("namespace");
 }
 
 int getKW_VAR(void) { return KW_VAR; }
@@ -354,7 +368,6 @@ int getKW_AND(void) { return KW_AND; }
 int getKW_OR(void) { return KW_OR; }
 int getKW_NOT(void) { return KW_NOT; }
 int getKW_XOR(void) { return KW_XOR; }
-int getKW_EQ(void) { return KW_EQ; }
 int getKW_TRUE(void) { return KW_TRUE; }
 int getKW_FALSE(void) { return KW_FALSE; }
 int getKW_NULL(void) { return KW_NULL; }
@@ -365,3 +378,4 @@ int getKW_CLASS(void) { return KW_CLASS; }
 int getKW_NEW(void) { return KW_NEW; }
 int getKW_EXTENDS(void) { return KW_EXTENDS; }
 int getKW_SELF(void) { return KW_SELF; }
+int getKW_NAMESPACE(void) { return KW_NAMESPACE; }

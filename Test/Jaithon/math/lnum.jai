@@ -6,7 +6,7 @@ while N > 0
         largest = num
     end
     N = N - 1
-    if N eq 0
+    if N == 0
         print largest
         break
     end

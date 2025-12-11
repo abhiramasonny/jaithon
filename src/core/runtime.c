@@ -86,6 +86,13 @@ Value makeObject(JaiClass* class) {
     return v;
 }
 
+Value makeFile(FILE* f) {
+    Value v;
+    v.type = VAL_FILE;
+    v.as.file = f;
+    return v;
+}
+
 void initRuntime(void) {
     memset(&runtime, 0, sizeof(Runtime));
     
@@ -126,11 +133,36 @@ static void freeFunction(JaiFunction* f) {
     free(f);
 }
 
+static void freeNamespace(JaiNamespace* ns) {
+    if (!ns) return;
+    for (int i = 0; i < ns->varCount; i++) {
+        if (ns->variables[i].value.type == VAL_STRING && ns->variables[i].value.as.string) {
+            free(ns->variables[i].value.as.string);
+        } else if (ns->variables[i].value.type == VAL_FILE && ns->variables[i].value.as.file) {
+            fclose(ns->variables[i].value.as.file);
+        } else if (ns->variables[i].value.type == VAL_NAMESPACE && ns->variables[i].value.as.namespace) {
+            freeNamespace(ns->variables[i].value.as.namespace);
+        }
+    }
+    if (ns->variables) free(ns->variables);
+    
+    for (int i = 0; i < ns->funcCount; i++) {
+        freeFunction(ns->functions[i]);
+    }
+    if (ns->functions) free(ns->functions);
+    
+    free(ns);
+}
+
 static void freeModule(Module* m) {
     if (!m) return;
     for (int j = 0; j < m->varCount; j++) {
         if (m->variables[j].value.type == VAL_STRING && m->variables[j].value.as.string) {
             free(m->variables[j].value.as.string);
+        } else if (m->variables[j].value.type == VAL_FILE && m->variables[j].value.as.file) {
+            fclose(m->variables[j].value.as.file);
+        } else if (m->variables[j].value.type == VAL_NAMESPACE && m->variables[j].value.as.namespace) {
+            freeNamespace(m->variables[j].value.as.namespace);
         }
     }
     if (m->variables) free(m->variables);
@@ -565,4 +597,21 @@ void runtimeError(const char* format, ...) {
     if (!runtime.shellMode) {
         exit(1);
     }
+}
+
+Value makeNamespace(const char* name) {
+    JaiNamespace* ns = malloc(sizeof(JaiNamespace));
+    strncpy(ns->name, name, MAX_NAME_LEN - 1);
+    ns->name[MAX_NAME_LEN - 1] = '\0';
+    ns->varCapacity = INITIAL_CAPACITY;
+    ns->variables = malloc(sizeof(Variable) * ns->varCapacity);
+    ns->varCount = 0;
+    ns->funcCapacity = INITIAL_CAPACITY;
+    ns->functions = malloc(sizeof(JaiFunction*) * ns->funcCapacity);
+    ns->funcCount = 0;
+    
+    Value v;
+    v.type = VAL_NAMESPACE;
+    v.as.namespace = ns;
+    return v;
 }

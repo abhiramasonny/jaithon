@@ -5,10 +5,10 @@ import lib/modules/hashmap
 import lib/modules/vector
 
 func addNode(graph, indegree, node)
-    if graph.get(node) eq null
+    if graph.get(node) == null
         graph.set(node, vector())
     end
-    if indegree.get(node) eq null
+    if indegree.get(node) == null
         indegree.set(node, 0)
     end
 end
@@ -18,7 +18,7 @@ func addEdge(graph, indegree, src, dst)
     addNode(graph, indegree, dst)
     graph.get(src).push(dst)
     var cur = indegree.get(dst)
-    if cur eq null
+    if cur == null
         cur = 0
     end
     indegree.set(dst, cur + 1)
@@ -31,10 +31,10 @@ func topoSort(graph, indegree)
     while i < _alen(keys)
         var k = _get(keys, i)
         var deg = indegree.get(k)
-        if deg eq null
+        if deg == null
             deg = 0
         end
-        if deg eq 0
+        if deg == 0
             q.enqueue(k)
         end
         i = i + 1
@@ -46,17 +46,17 @@ func topoSort(graph, indegree)
         _push(order, node)
         
         var neighbors = graph.get(node)
-        if not (neighbors eq null)
+        if not (neighbors == null)
             var j = 0
             while j < neighbors.len()
                 var nb = neighbors.get(j)
                 var d = indegree.get(nb)
-                if d eq null
+                if d == null
                     d = 0
                 end
                 var newDeg = d - 1
                 indegree.set(nb, newDeg)
-                if newDeg eq 0
+                if newDeg == 0
                     q.enqueue(nb)
                 end
                 j = j + 1

@@ -21,7 +21,7 @@ func setCdr(pair, val)
 end
 
 func isPair(x)
-    return type(x) eq "cell"
+    return type(x) == "cell"
 end
 
 #list ops
@@ -30,15 +30,15 @@ func list()
 end
 
 func isEmpty(lst)
-    return lst eq null
+    return lst == null
 end
 
 func isNull(x)
-    return x eq null
+    return x == null
 end
 
 func notNull(x)
-    if x eq null
+    if x == null
         return false
     end
     return true
@@ -70,13 +70,13 @@ func listGet(lst, idx)
     var current = lst
     var i = 0
     while i < idx
-        if current eq null
+        if current == null
             return null
         end
         current = _cdr(current)
         i = i + 1
     end
-    if current eq null
+    if current == null
         return null
     end
     return _car(current)
@@ -86,13 +86,13 @@ func listSet(lst, idx, val)
     var current = lst
     var i = 0
     while i < idx
-        if current eq null
+        if current == null
             return null
         end
         current = _cdr(current)
         i = i + 1
     end
-    if current eq null
+    if current == null
         return null
     end
     _setcar(current, val)
@@ -100,7 +100,7 @@ func listSet(lst, idx, val)
 end
 
 func append(lst, elem)
-    if lst eq null
+    if lst == null
         return _cell(elem, null)
     end
     var current = lst
@@ -112,7 +112,7 @@ func append(lst, elem)
 end
 
 func last(lst)
-    if lst eq null
+    if lst == null
         return null
     end
     var current = lst
@@ -134,14 +134,14 @@ end
 
 #functions
 func map(lst, f)
-    if lst eq null
+    if lst == null
         return null
     end
     return _cell(f(_car(lst)), map(_cdr(lst), f))
 end
 
 func filter(lst, pred)
-    if lst eq null
+    if lst == null
         return null
     end
     if pred(_car(lst))
@@ -163,7 +163,7 @@ end
 func contains(lst, elem)
     var current = lst
     while notNull(current)
-        if _car(current) eq elem
+        if _car(current) == elem
             return true
         end
         current = _cdr(current)
@@ -172,7 +172,7 @@ func contains(lst, elem)
 end
 
 func listConcat(lst1, lst2)
-    if lst1 eq null
+    if lst1 == null
         return lst2
     end
     return _cell(_car(lst1), listConcat(_cdr(lst1), lst2))
@@ -182,7 +182,7 @@ func take(lst, n)
     if n < 1
         return null
     end
-    if lst eq null
+    if lst == null
         return null
     end
     return _cell(_car(lst), take(_cdr(lst), n - 1))
@@ -192,7 +192,7 @@ func drop(lst, n)
     if n < 1
         return lst
     end
-    if lst eq null
+    if lst == null
         return null
     end
     return drop(_cdr(lst), n - 1)

@@ -23,7 +23,7 @@ func pushFront(self, val)
     node.next = self.head
     node.prev = null
     var h = self.head
-    if not (h eq null)
+    if not (h == null)
         h.prev = node
     else
         self.tail = node
@@ -39,7 +39,7 @@ func pushBack(self, val)
     node.next = null
     node.prev = self.tail
     var t = self.tail
-    if not (t eq null)
+    if not (t == null)
         t.next = node
     else
         self.head = node
@@ -50,13 +50,13 @@ func pushBack(self, val)
     end
     
     func popFront(self)
-        if self.head eq null
+        if self.head == null
             return null
         end
         var h = self.head
         var val = h.value
         self.head = h.next
-        if self.head eq null
+        if self.head == null
             self.tail = null
         else
             var newHead = self.head
@@ -67,13 +67,13 @@ func pushBack(self, val)
     end
     
     func popBack(self)
-        if self.tail eq null
+        if self.tail == null
             return null
         end
         var t = self.tail
         var val = t.value
         self.tail = t.prev
-        if self.tail eq null
+        if self.tail == null
             self.head = null
         else
             var newTail = self.tail
@@ -84,7 +84,7 @@ func pushBack(self, val)
     end
     
     func isEmpty(self)
-        return self.size eq 0
+        return self.size == 0
     end
     
     func len(self)
@@ -92,14 +92,14 @@ func pushBack(self, val)
     end
     
     func peekFront(self)
-        if self.head eq null
+        if self.head == null
             return null
         end
         return self.head.value
     end
     
     func peekBack(self)
-        if self.tail eq null
+        if self.tail == null
             return null
         end
         return self.tail.value
@@ -107,7 +107,7 @@ func pushBack(self, val)
     
     func forEach(self, f)
         var cur = self.head
-        while not (cur eq null)
+        while not (cur == null)
             f(cur.value)
             cur = cur.next
         end

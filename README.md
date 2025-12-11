@@ -17,6 +17,9 @@ JAITHON is a simple programming language designed to teach programming fundament
 - **Heavily bootstrapped** - most functionality written in Jaithon itself
 - Only primitive operations (sin, cos, sqrt, exp, log) are in C
 - Arrays, strings, math functions all implemented in Jaithon
+- Object-Oriented Programming (Classes, Inheritance)
+- Namespaces for code organization
+- File I/O support
 - User-defined functions with recursion
 - Interactive shell mode
 
