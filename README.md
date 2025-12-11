@@ -1,16 +1,14 @@
 # JAITHON
 
-**A beginner-friendly programming language with bootstrapping support**
+**A beginner-friendly, mostly-bootstrapped programming language**
 
-[Documentation](Documentation/grammar.md) • [Author](https://abhiramasonny.com/)
-
-</div>
+[Documentation](docs/grammar.md) • [Author](https://abhiramasonny.com/)
 
 ---
 
 ## About
 
-Jaithon combines Java and Python.
+Jaithon combines Java-like classes with Python-like syntax, while keeping most of the standard library and many features bootstrapped in Jai itself.
 
 ---
 
@@ -34,7 +32,7 @@ make
 
 ```bash
 # Run a file
-./jaithon Test/Jaithon/fib
+./jaithon test/checks/variables.jai
 
 # Enter interactive shell
 ./jaithon
@@ -56,157 +54,16 @@ make
 
 ---
 
-## Language Features
+## Language Features (at a glance)
 
-### Variables
+- Clear syntax: variables, math, logic, if/else, while, functions (including variadic), namespaces.
+- Arrays with literals, indexing, and helpers (`_alen`, `_push`, `_pop`) plus higher-level `lib/modules/ds/array`.
+- Classes/objects with inheritance; methods auto-receive `self` when called via dot.
+- Modules/imports; system command execution via `system "cmd"`.
+- Bootstrapped stdlib: math/string helpers, random, data structures (stack/queue/vector/linkedlist/hashmap/btree), file I/O.
+- GUI module (Metal on macOS): windows, drawing primitives, timing, mouse/keyboard input, and keycode helpers.
 
-```
-var x = 5
-var name = "hello"
-var flag = true
-```
-
-### Printing
-
-```
-print x
-print 2 + 3
-print "Hello, World!"
-```
-
-### User Input
-
-```
-input age
-print age
-```
-
-### Math Operations
-
-| Operation | Syntax | Example |
-|-----------|--------|---------|
-| Basic Math | `+`, `-`, `*`, `/`, `%` | `var a = 2 + 3` |
-| Exponents | `^` | `var b = 2^3` |
-| Factorial | `!` | `var c = 5!` |
-| Comparison | `>`, `<`, `eq` | `var d = 5 > 3` |
-
-### Control Flow
-
-```
-# If statement
-if x > 5
-    print x
-end
-
-# If-else
-if x > 10
-    print "big"
-else
-    print "small"
-end
-
-# While loop
-var i = 0
-while i < 10
-    print i
-    i = i + 1
-end
-```
-
-### Functions
-
-```
-# Define a function
-func add(a, b)
-    return a + b
-end
-
-# Call the function
-print add(3, 4)
-
-# Variadic function
-func sum(*args)
-    var total = 0
-    var i = 0
-    while i < _alen(args)
-        total = total + args[i]
-        i = i + 1
-    end
-    return total
-end
-
-print sum(1, 2, 3, 4, 5)    # 15
-```
-
-### Arrays
-
-```
-# Array literal
-var arr = [1, 2, 3, 4, 5]
-
-# Indexing
-print arr[0]        # 1
-arr[2] = 99         # modify
-
-# Array functions
-_push(arr, 6)       # add to end
-var x = _pop(arr)   # remove from end
-print _alen(arr)    # length
-```
-
-### Classes and Objects
-
-```
-class Point
-    var x
-    var y
-    
-    func init(self, x, y)
-        self.x = x
-        self.y = y
-    end
-    
-    func distance(self)
-        return _sqrt(self.x^2 + self.y^2)
-    end
-end
-
-var p = new Point(3, 4)
-print p.distance()    # 5
-```
-
-### Inheritance
-
-```
-class Animal
-    var name
-    func speak(self)
-        print "..."
-    end
-end
-
-class Dog extends Animal
-    func speak(self)
-        print self.name + " barks!"
-    end
-end
-```
-
-### Imports
-
-```
-# Import another .jai file
-import calculator
-```
-
-### Logic Operations
-
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `and` | Logical AND | `a and b` |
-| `or` | Logical OR | `a or b` |
-| `not` | Logical NOT | `not a` |
-| `eq` | Equality | `x eq 5` |
+See `docs/grammar.md` for the full language reference and API details.
 
 ---
 
