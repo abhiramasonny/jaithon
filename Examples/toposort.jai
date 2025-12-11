@@ -1,8 +1,8 @@
 #topological sort using kahns
 
-import lib/modules/queue
-import lib/modules/hashmap
-import lib/modules/vector
+import lib/modules/ds/queue
+import lib/modules/ds/hashmap
+import lib/modules/ds/vector
 
 func addNode(graph, indegree, node)
     if graph.get(node) == null

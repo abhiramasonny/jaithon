@@ -1,6 +1,6 @@
 #dsu
 
-import lib/modules/vector
+import lib/modules/ds/vector
 
 class uf
     var parent

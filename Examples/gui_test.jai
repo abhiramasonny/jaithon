@@ -3,24 +3,43 @@ import lib/modules/gui/window
 func main()
     var width = 400
     var height = 300
-    var win = new Window(width, height, "Jaithon GUI Test")
+    var win = new Window(width, height, "Jaithon GPU Test")
     
     var x = 0
     var y = 100
-    var dx = 5
+    var speed = 200
+    var direction = 1
+    var frameCount = 0
     
-    while win.update()
-        win.clear(rgb(50, 50, 50))
+    while true
+        win.poll()
+        var dt = win.getDeltaTime()
         
-        win.fillRect(x, y, 50, 50, rgb(255, 0, 0))
+        win.clear(rgb(30, 30, 40))
         
-        win.drawRect(10, 10, 100, 50, rgb(0, 255, 0))
-        win.drawLine(0, 0, width, height, rgb(0, 0, 255))
-        win.drawCircle(200, 150, 50, rgb(255, 255, 0))
+        win.fillRect(x, y, 50, 50, rgb(255, 100, 100))
         
-        x = x + dx
-        if x > width - 50 or x < 0
-            dx = 0 - dx
+        
+        x = x + (speed * dt * direction)
+        
+        if x > width - 50
+            x = width - 50
+            direction = 0 - 1
+        end
+        if x < 0
+            x = 0
+            direction = 1
+        end
+        
+        frameCount = frameCount + 1
+        if frameCount == 60
+            print("FPS: " + win.getFPS())
+            frameCount = 0
+        end
+        
+        win.display()
+        if not win.update()
+            break
         end
     end
 end

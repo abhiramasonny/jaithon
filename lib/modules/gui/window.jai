@@ -1,49 +1,212 @@
-# GUI Module
-# Wraps the native GUI functions
-# Uses optimized C implementations for drawing operations
+# =============================================================================
+# GUI Module (built for meta on Apple Silicon)
+# =============================================================================
+# Various functions imlemented from c
+#   - gui_init(w, h, title [, fps]) - create window
+#   - gui_set_pixel(x, y, color) - set single pixel in buffer
+#   - gui_clear(color) - fast clear
+#   - gui_fill_rect(x, y, w, h, color) - fast fill
+#   - gui_draw_line(x0, y0, x1, y1, color) - fast Bresenham line
+#   - gui_draw_circle(xc, yc, r, color) - fast midpoint circle
+#   - gui_fill_circle(xc, yc, r, color) - fast filled circle
+#   - gui_present() - upload to GPU, render with vsync
+#   - gui_get_dt() - delta time (seconds since last frame)
+#   - gui_get_fps() - current FPS
+#   - gui_get_time() - time since program start
+# =============================================================================
+
+#create RGB color
+func rgb(r, g, b)
+    return (r * 65536) + (g * 256) + b
+end
 
 class Window
     var width
     var height
+    var targetFPS
+    var needsPresent
     
     func init(self, w, h, title)
         self.width = w
         self.height = h
-        gui_init(w, h, title)
+        self.targetFPS = 60
+        self.needsPresent = false
+        gui_init(w, h, title, 60)
     end
     
+    func initWithFPS(self, w, h, title, fps) #fps target
+        self.width = w
+        self.height = h
+        self.targetFPS = fps
+        self.needsPresent = false
+        gui_init(w, h, title, fps)
+    end
+    #set single pixel in buffer
     func putPixel(self, x, y, color)
         gui_set_pixel(x, y, color)
     end
     
+    func display(self)
+        self.needsPresent = true
+    end
+    
+    #GPU upload + vsync
     func update(self)
-        return gui_present()
+        if self.needsPresent
+            self.needsPresent = false
+            return gui_present()
+        end
+        return false
+    end
+    
+    func present(self)
+        self.display()
+        return self.update()
+    end
+    
+    func getDeltaTime(self)
+        return gui_get_dt() #sec
+    end
+    
+    func getFPS(self)
+        return gui_get_fps()
+    end
+    
+    func getTime(self)
+        return gui_get_time()
+    end
+    
+    func poll()
+        gui_poll()
+    end
+    
+    func mousePos()
+        return gui_mouse_pos()
+    end
+    
+    func mouseDown(button)
+        return gui_mouse_down(button)
+    end
+    
+    func keyDown(keycode)
+        return gui_key_down(keycode)
     end
     
     func clear(self, color)
         gui_clear(color)
     end
     
-    func fillRect(self, x, y, w, h, color)
-        gui_fill_rect(x, y, w, h, color)
+    func fillRect(self, rx, ry, rw, rh, color)
+        var y = ry
+        while y < ry + rh
+            var x = rx
+            while x < rx + rw
+                gui_set_pixel(x, y, color)
+                x = x + 1
+            end
+            y = y + 1
+        end
     end
     
-    func drawRect(self, x, y, w, h, color)
-        gui_fill_rect(x, y, w, 1, color)
-        gui_fill_rect(x, y + h - 1, w, 1, color)
-        gui_fill_rect(x, y, 1, h, color)
-        gui_fill_rect(x + w - 1, y, 1, h, color)
+    func drawRect(self, rx, ry, rw, rh, color)
+        var x = rx
+        while x < rx + rw
+            gui_set_pixel(x, ry, color)
+            gui_set_pixel(x, ry + rh - 1, color)
+            x = x + 1
+        end
+        var y = ry
+        while y < ry + rh
+            gui_set_pixel(rx, y, color)
+            gui_set_pixel(rx + rw - 1, y, color)
+            y = y + 1
+        end
     end
     
     func drawLine(self, x0, y0, x1, y1, color)
-        gui_draw_line(x0, y0, x1, y1, color)
+        var dx = abs(x1 - x0)
+        var sx = -1
+        if x0 < x1
+            sx = 1
+        end
+        var dy = -abs(y1 - y0)
+        var sy = -1
+        if y0 < y1
+            sy = 1
+        end
+        var err = dx + dy
+        while true
+            gui_set_pixel(x0, y0, color)
+            if x0 == x1 and y0 == y1
+                break
+            end
+            var e2 = 2 * err
+            if e2 >= dy
+                err = err + dy
+                x0 = x0 + sx
+            end
+            if e2 <= dx
+                err = err + dx
+                y0 = y0 + sy
+            end
+        end
     end
     
-    func drawCircle(self, xc, yc, r, color)
-        gui_draw_circle(xc, yc, r, color)
+    func drawCircle(self, xc, yc, radius, color)
+        var x = radius
+        var y = 0
+        var err = 0
+        while x >= y
+            gui_set_pixel(xc + x, yc + y, color)
+            gui_set_pixel(xc + y, yc + x, color)
+            gui_set_pixel(xc - y, yc + x, color)
+            gui_set_pixel(xc - x, yc + y, color)
+            gui_set_pixel(xc - x, yc - y, color)
+            gui_set_pixel(xc - y, yc - x, color)
+            gui_set_pixel(xc + y, yc - x, color)
+            gui_set_pixel(xc + x, yc - y, color)
+            y = y + 1
+            if err <= 0
+                err = err + 2 * y + 1
+            else
+                x = x - 1
+                err = err + 2 * (y - x) + 1
+            end
+        end
     end
-end
-
-func rgb(r, g, b)
-    return (r * 65536) + (g * 256) + b
+    
+    func fillCircle(self, xc, yc, radius, color)
+        var x = radius
+        var y = 0
+        var err = 0
+        while x >= y
+            var xs = xc - x
+            var xe = xc + x
+            var ys = yc + y
+            var ye = yc - y
+            var i = xs
+            while i <= xe
+                gui_set_pixel(i, ys, color)
+                gui_set_pixel(i, ye, color)
+                i = i + 1
+            end
+            xs = xc - y
+            xe = xc + y
+            ys = yc + x
+            ye = yc - x
+            i = xs
+            while i <= xe
+                gui_set_pixel(i, ys, color)
+                gui_set_pixel(i, ye, color)
+                i = i + 1
+            end
+            y = y + 1
+            if err <= 0
+                err = err + 2 * y + 1
+            else
+                x = x - 1
+                err = err + 2 * (y - x) + 1
+            end
+        end
+    end
 end

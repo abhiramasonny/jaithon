@@ -1,8 +1,8 @@
 #inserts random numbers and prints sorted order
 
-import lib/modules/btree
-import lib/modules/random
-import lib/modules/array
+import lib/modules/ds/btree
+import lib/modules/core/random
+import lib/modules/ds/array
 
 func main()
     var tree = bst()

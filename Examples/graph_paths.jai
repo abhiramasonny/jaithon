@@ -1,7 +1,7 @@
 #shortest path in an unweighted graph using BFS
 
-import lib/modules/queue
-import lib/modules/string
+import lib/modules/ds/queue
+import lib/modules/core/string
 
 func findIndex(arr, value)
     var i = 0
