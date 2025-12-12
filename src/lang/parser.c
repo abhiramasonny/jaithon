@@ -23,6 +23,17 @@ typedef struct {
 static CompiledFuncEntry compiledFuncs[MAX_COMPILED_FUNCS];
 static int compiledFuncCount = 0;
 
+#define MAX_FAILED_FUNCS 256
+typedef struct {
+    char name[MAX_NAME_LEN];
+    int paramCount;
+    bool isVariadic;
+    uint64_t bodyHash;
+} FailedFuncEntry;
+
+static FailedFuncEntry failedFuncs[MAX_FAILED_FUNCS];
+static int failedFuncCount = 0;
+
 static uint64_t hashFunctionSignature(const JaiFunction* f) {
     uint64_t h = hashSource(f->body ? f->body : "");
     h ^= (uint64_t)f->paramCount + 0x9e3779b97f4a7c15ULL;
@@ -43,7 +54,7 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
     if (!f || !f->body) return NULL;
     
     static bool checkedEnv = false;
-    static bool enableVMCompile = false; //default off for correctness
+    static bool enableVMCompile = true;
     if (!checkedEnv) {
         const char* env = getenv("JAITHON_DISABLE_VM");
         if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
@@ -58,6 +69,15 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
     if (!enableVMCompile) return NULL;
     
     uint64_t hash = hashFunctionSignature(f);
+
+    for (int i = 0; i < failedFuncCount; i++) {
+        if (strcmp(failedFuncs[i].name, f->name) == 0 &&
+            failedFuncs[i].paramCount == f->paramCount &&
+            failedFuncs[i].isVariadic == f->isVariadic &&
+            failedFuncs[i].bodyHash == hash) {
+            return NULL;
+        }
+    }
     
     for (int i = 0; i < compiledFuncCount; i++) {
         if (strcmp(compiledFuncs[i].name, f->name) == 0 &&
@@ -79,6 +99,13 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
     free(tokens);
     
     if (!compiled) {
+        if (failedFuncCount < MAX_FAILED_FUNCS) {
+            strncpy(failedFuncs[failedFuncCount].name, f->name, MAX_NAME_LEN - 1);
+            failedFuncs[failedFuncCount].paramCount = f->paramCount;
+            failedFuncs[failedFuncCount].isVariadic = f->isVariadic;
+            failedFuncs[failedFuncCount].bodyHash = hash;
+            failedFuncCount++;
+        }
         return NULL;//fallback
     }
     
@@ -1298,7 +1325,14 @@ static Value stmtImport(Lexer* lex) {
     
     FILE* f = fopen(path, "r");
     if (!f) {
-        runtimeError("Cannot open module: %s", path);
+        const char* libroot = getenv("JAITHON_LIB");
+        if (libroot) {
+            snprintf(path, sizeof(path), "%s/%s.jai", libroot, modulePath);
+            f = fopen(path, "r");
+        }
+    }
+    if (!f) {
+        runtimeError("Cannot open module: %s.jai", modulePath);
         return makeNull();
     }
     

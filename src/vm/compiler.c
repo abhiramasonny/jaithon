@@ -115,7 +115,8 @@ void compileError(Compiler* compiler, const char* message, int line) {
     if (compiler->panicMode) return;
     compiler->panicMode = true;
     compiler->hadError = true;
-    fprintf(stderr, "[line %d] Compile Error: %s\n", line, message);
+    (void)message;
+    (void)line;
 }
 
 static bool isAtEnd(Token* tokens, int* pos, int end) {
@@ -250,6 +251,36 @@ static bool compilePrimary(Compiler* compiler, Token* tokens, int* pos, int end)
             return false;
         }
         emitBytes(compiler, OP_NEW_ARRAY, count, line);
+        return true;
+    }
+
+    if (t.kind == getKW_NEW()) {
+        if (!check(tokens, *pos, TK_IDENTIFIER)) {
+            compileError(compiler, "Expected class name after 'new'", line);
+            return false;
+        }
+        char className[MAX_NAME_LEN];
+        strcpy(className, tokens[*pos].strValue);
+        advance(tokens, pos);
+
+        int argc = 0;
+        if (match(tokens, pos, TK_LPAREN)) {
+            if (!check(tokens, *pos, TK_RPAREN)) {
+                do {
+                    if (!compileExpr(compiler, tokens, pos, end)) return false;
+                    argc++;
+                } while (match(tokens, pos, TK_COMMA));
+            }
+            if (!match(tokens, pos, TK_RPAREN)) {
+                compileError(compiler, "Expected ')' after constructor args", line);
+                return false;
+            }
+        }
+
+        int nameIdx = chunkAddConstant(currentChunk(compiler), makeString(className));
+        emitByte(compiler, OP_NEW_OBJECT, line);
+        emitByte(compiler, (uint8_t)nameIdx, line);
+        emitByte(compiler, (uint8_t)argc, line);
         return true;
     }
     
@@ -570,6 +601,34 @@ static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int e
         return true;
     }
     
+    if (check(tokens, *pos, TK_DOT)) {
+        // obj.field = expr
+        int slotObj = resolveLocal(compiler, name.strValue);
+        if (slotObj != -1) {
+            emitBytes(compiler, OP_GET_LOCAL, slotObj, line);
+        } else {
+            int constIdx = chunkAddConstant(currentChunk(compiler), makeString(name.strValue));
+            emitBytes(compiler, OP_GET_GLOBAL, constIdx, line);
+        }
+        advance(tokens, pos); // consume '.'
+        if (!check(tokens, *pos, TK_IDENTIFIER)) {
+            compileError(compiler, "Expected field name", line);
+            return false;
+        }
+        char fieldName[MAX_NAME_LEN];
+        strcpy(fieldName, tokens[*pos].strValue);
+        advance(tokens, pos);
+        if (!match(tokens, pos, TK_EQUALS)) {
+            compileError(compiler, "Expected '='", line);
+            return false;
+        }
+        if (!compileExpr(compiler, tokens, pos, end)) return false;
+        int nameIdx = chunkAddConstant(currentChunk(compiler), makeString(fieldName));
+        emitBytes(compiler, OP_SET_FIELD, nameIdx, line);
+        emitByte(compiler, OP_POP, line);
+        return true;
+    }
+
     if (!match(tokens, pos, TK_EQUALS)) {
         (*pos)--;
         if (!compileExpr(compiler, tokens, pos, end)) return false;
@@ -637,10 +696,9 @@ CompiledFunc* compileFunction(const JaiFunction* func, Token* tokens, int tokenC
     const char* fname = func ? func->name : "<main>";
     compilerInit(&compiler, fname);
     
-    for (int i = 0; i < tokenCount; i++) { //need to fix
+    for (int i = 0; i < tokenCount; i++) {
         int k = tokens[i].kind;
-        if (k == getKW_NEW() || k == getKW_CLASS() || k == getKW_NAMESPACE() ||
-            k == getKW_IMPORT() || k == getKW_SELF()) {
+        if (k == getKW_CLASS() || k == getKW_NAMESPACE() || k == getKW_IMPORT()) {
             return NULL;
         }
     }
