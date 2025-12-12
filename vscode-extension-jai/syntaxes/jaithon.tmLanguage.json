@@ -1,0 +1,35 @@
+{
+  "scopeName": "source.jai",
+  "name": "Jaithon",
+  "patterns": [
+    { "name": "comment.line.number-sign.jai", "match": "#.*$" },
+    { "name": "string.quoted.double.jai", "begin": "\"", "end": "\"", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.jai" }] },
+    {
+      "name": "keyword.control.jai",
+      "match": "\\b(if|else|while|break|return|func|class|extends|namespace|import|new|var|input|print|system|end|then|do|and|or|not|true|false|null)\\b"
+    },
+    {
+      "name": "support.function.builtin.jai",
+      "match": "\\b(_sin|_cos|_tan|_sqrt|_log|_exp|_time|_rand|_len|_str|_num|_type|_cell|_car|_cdr|_setcar|_setcdr|_charAt|_substr|_concat|_push|_pop|_alen|_get|_set|rgb|gui_init|gui_set_pixel|gui_clear|gui_fill_rect|gui_draw_line|gui_draw_circle|gui_fill_circle|gui_present|gui_get_dt|gui_get_fps|gui_get_time|gui_poll|gui_mouse_pos|gui_mouse_down|gui_key_down)\\b"
+    },
+    {
+      "name": "support.constant.gui.key.jai",
+      "match": "\\bKEY_[A-Z0-9_]+\\b"
+    },
+    {
+      "name": "storage.type.class.jai",
+      "match": "\\bclass\\b"
+    },
+    {
+      "name": "variable.language.self.jai",
+      "match": "\\bself\\b"
+    },
+    {
+      "name": "constant.numeric.jai",
+      "match": "\\b((\\d+\\.\\d+)|(\\d+))(e[+-]?\\d+)?\\b"
+    },
+    { "name": "keyword.operator.jai", "match": "(\\+|\\-|\\*|\\/|%|\\^|!|==|=|>=|<=|>|<)" }
+  ],
+  "repository": {},
+  "fileTypes": [".jai"]
+}

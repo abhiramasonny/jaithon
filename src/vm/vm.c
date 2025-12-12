@@ -476,6 +476,35 @@ InterpretResult vmExecute(VM* vm) {
                 vmPush(vm, makeNumber(arr.as.array->length));
                 break;
             }
+
+            case OP_NEW_OBJECT: {
+                Value classNameVal = readConstant(frame);
+                uint8_t argCount = readByte(frame);
+                if (classNameVal.type != VAL_STRING) {
+                    fprintf(stderr, "VM Error: Class name must be string\n");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                JaiClass* cls = findClass(classNameVal.as.string);
+                if (!cls) {
+                    fprintf(stderr, "VM Error: Class not found: %s\n", classNameVal.as.string);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                Value obj = makeObject(cls);
+
+                Value args[256];
+                args[0] = obj;
+                for (int i = argCount - 1; i >= 0; i--) {
+                    args[i + 1] = vmPop(vm);
+                }
+
+                if (cls->constructor) {
+                    extern Value callValue(Value callee, Value* args, int argc);
+                    callValue(makeFunction(cls->constructor), args, argCount + 1);
+                }
+
+                vmPush(vm, obj);
+                break;
+            }
             
             case OP_GET_FIELD: {
                 Value nameVal = readConstant(frame);

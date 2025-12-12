@@ -15,10 +15,21 @@
 static char execDir[1024] = {0};
 
 static void loadStdLib(void) {
+    const char* envLib = getenv("JAITHON_LIB");
     char stdPath[1024];
-    snprintf(stdPath, sizeof(stdPath), "%s/lib/std.jai", execDir);
+    if (envLib) {
+        snprintf(stdPath, sizeof(stdPath), "%s/lib/std.jai", envLib);
+    } else {
+        snprintf(stdPath, sizeof(stdPath), "%s/lib/std.jai", execDir);
+    }
     
     FILE* f = fopen(stdPath, "r");
+    if (!f) {
+        if (envLib) {
+            snprintf(stdPath, sizeof(stdPath), "%s/lib/std.jai", envLib);
+            f = fopen(stdPath, "r");
+        }
+    }
     if (!f) {
         snprintf(stdPath, sizeof(stdPath), "lib/std.jai");
         f = fopen(stdPath, "r");

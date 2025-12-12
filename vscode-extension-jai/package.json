@@ -1,0 +1,28 @@
+{
+  "name": "jaithon",
+  "displayName": "Jaithon",
+  "description": "Language support for the Jaithon programming language",
+  "version": "0.0.1",
+  "publisher": "jaithon",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:jaithon"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "jaithon",
+        "aliases": ["Jaithon", "jai"],
+        "extensions": [".jai"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jaithon",
+        "scopeName": "source.jai",
+        "path": "./syntaxes/jaithon.tmLanguage.json"
+      }
+    ]
+  }
+}
