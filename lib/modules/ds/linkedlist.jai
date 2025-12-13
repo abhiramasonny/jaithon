@@ -10,13 +10,13 @@ class LinkedList
     var head
     var tail
     var size
-    
+
     func init(self)
         self.head = null
         self.tail = null
         self.size = 0
     end
-    
+
 func pushFront(self, val)
     var node = new ListNode()
     node.value = val
@@ -32,7 +32,7 @@ func pushFront(self, val)
     self.size = self.size + 1
         return self
     end
-    
+
 func pushBack(self, val)
     var node = new ListNode()
     node.value = val
@@ -48,7 +48,7 @@ func pushBack(self, val)
     self.size = self.size + 1
         return self
     end
-    
+
     func popFront(self)
         if self.head == null
             return null
@@ -65,7 +65,7 @@ func pushBack(self, val)
         self.size = self.size - 1
         return val
     end
-    
+
     func popBack(self)
         if self.tail == null
             return null
@@ -82,29 +82,29 @@ func pushBack(self, val)
         self.size = self.size - 1
         return val
     end
-    
+
     func isEmpty(self)
         return self.size == 0
     end
-    
+
     func len(self)
         return self.size
     end
-    
+
     func peekFront(self)
         if self.head == null
             return null
         end
         return self.head.value
     end
-    
+
     func peekBack(self)
         if self.tail == null
             return null
         end
         return self.tail.value
     end
-    
+
     func forEach(self, f)
         var cur = self.head
         while not (cur == null)

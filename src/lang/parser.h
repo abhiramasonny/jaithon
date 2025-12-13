@@ -29,6 +29,13 @@ Value parsePrimary(Lexer* lex);
 
 Value callValue(Value callee, Value* args, int argc);
 
+
+bool toBool(Value v);
+double toNumber(Value v);
+
+
+void printCompilationStats(void);
+
 void initParser(void);
 
 #endif

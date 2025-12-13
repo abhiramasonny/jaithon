@@ -1,6 +1,8 @@
 #include "vm.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include <stdlib.h>
 
 void chunkInit(Chunk* chunk) {
     chunk->count = 0;
@@ -111,15 +113,81 @@ static inline Value readConstant(CallFrame* frame) {
     return frame->function->chunk.constants[readByte(frame)];
 }
 
+static inline double toNumberVM(Value v) {
+    switch (v.type) {
+        case VAL_NUMBER: return v.as.number;
+        case VAL_DOUBLE: return v.as.f64;
+        case VAL_FLOAT: return v.as.f32;
+        case VAL_INT: return v.as.i32;
+        case VAL_LONG: return (double)v.as.i64;
+        case VAL_SHORT: return v.as.i16;
+        case VAL_BYTE: return v.as.i8;
+        case VAL_CHAR: return (unsigned char)v.as.ch;
+        case VAL_BOOL: return v.as.boolean ? 1.0 : 0.0;
+        case VAL_STRING: return v.as.string ? strtod(v.as.string, NULL) : 0.0;
+        default: return 0.0;
+    }
+}
+
+
+static inline int toIntVM(Value v) {
+    switch (v.type) {
+        case VAL_NUMBER: return (int)v.as.number;
+        case VAL_DOUBLE: return (int)v.as.f64;
+        case VAL_FLOAT: return (int)v.as.f32;
+        case VAL_INT: return v.as.i32;
+        case VAL_LONG: return (int)v.as.i64;
+        case VAL_SHORT: return v.as.i16;
+        case VAL_BYTE: return v.as.i8;
+        case VAL_CHAR: return (unsigned char)v.as.ch;
+        case VAL_BOOL: return v.as.boolean ? 1 : 0;
+        case VAL_STRING: return v.as.string ? (int)strtol(v.as.string, NULL, 10) : 0;
+        default: return 0;
+    }
+}
+
+static inline bool isNumericVM(Value v) {
+    return v.type == VAL_NUMBER || v.type == VAL_DOUBLE || v.type == VAL_FLOAT ||
+           v.type == VAL_INT || v.type == VAL_LONG || v.type == VAL_SHORT ||
+           v.type == VAL_BYTE || v.type == VAL_CHAR;
+}
+
+static inline bool toBoolVM(Value v) {
+    switch (v.type) {
+        case VAL_BOOL: return v.as.boolean;
+        case VAL_NULL: return false;
+        case VAL_STRING: return v.as.string && strlen(v.as.string) > 0;
+        default: return toNumberVM(v) != 0;
+    }
+}
+
+static char* toStringVM(Value v) {
+    char buf[256];
+    switch (v.type) {
+        case VAL_STRING: return v.as.string ? strdup(v.as.string) : strdup("");
+        case VAL_CHAR: snprintf(buf, sizeof(buf), "%c", v.as.ch); break;
+        case VAL_NUMBER: snprintf(buf, sizeof(buf), "%g", v.as.number); break;
+        case VAL_DOUBLE: snprintf(buf, sizeof(buf), "%g", v.as.f64); break;
+        case VAL_FLOAT: snprintf(buf, sizeof(buf), "%g", v.as.f32); break;
+        case VAL_INT: snprintf(buf, sizeof(buf), "%d", v.as.i32); break;
+        case VAL_LONG: snprintf(buf, sizeof(buf), "%lld", (long long)v.as.i64); break;
+        case VAL_SHORT: snprintf(buf, sizeof(buf), "%d", v.as.i16); break;
+        case VAL_BYTE: snprintf(buf, sizeof(buf), "%d", v.as.i8); break;
+        case VAL_BOOL: snprintf(buf, sizeof(buf), "%s", v.as.boolean ? "true" : "false"); break;
+        default: snprintf(buf, sizeof(buf), "null"); break;
+    }
+    return strdup(buf);
+}
+
 #define BINARY_OP(vm, op) \
     do { \
         Value b = vmPop(vm); \
         Value a = vmPop(vm); \
-        if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) { \
+        if (!isNumericVM(a) || !isNumericVM(b)) { \
             fprintf(stderr, "VM Error: Operands must be numbers\n"); \
             return INTERPRET_RUNTIME_ERROR; \
         } \
-        vmPush(vm, makeNumber(a.as.number op b.as.number)); \
+        vmPush(vm, makeDouble(toNumberVM(a) op toNumberVM(b))); \
     } while (0)
 
 InterpretResult vmExecute(VM* vm) {
@@ -192,15 +260,19 @@ InterpretResult vmExecute(VM* vm) {
             case OP_ADD: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type == VAL_NUMBER && b.type == VAL_NUMBER) {
-                    vmPush(vm, makeNumber(a.as.number + b.as.number));
-                } else if (a.type == VAL_STRING && b.type == VAL_STRING) {
-                    size_t len = strlen(a.as.string) + strlen(b.as.string) + 1;
+                if (a.type == VAL_STRING || b.type == VAL_STRING || a.type == VAL_CHAR || b.type == VAL_CHAR) {
+                    char* sa = toStringVM(a);
+                    char* sb = toStringVM(b);
+                    size_t len = strlen(sa) + strlen(sb) + 1;
                     char* result = malloc(len);
-                    strcpy(result, a.as.string);
-                    strcat(result, b.as.string);
+                    memcpy(result, sa, strlen(sa));
+                    memcpy(result + strlen(sa), sb, strlen(sb) + 1);
                     vmPush(vm, makeString(result));
+                    free(sa);
+                    free(sb);
                     free(result);
+                } else if (isNumericVM(a) && isNumericVM(b)) {
+                    vmPush(vm, makeDouble(toNumberVM(a) + toNumberVM(b)));
                 } else {
                     fprintf(stderr, "VM Error: Cannot add these types\n");
                     return INTERPRET_RUNTIME_ERROR;
@@ -215,32 +287,32 @@ InterpretResult vmExecute(VM* vm) {
             case OP_MOD: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) {
+                if (!isNumericVM(a) || !isNumericVM(b)) {
                     fprintf(stderr, "VM Error: Operands must be numbers\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeNumber(fmod(a.as.number, b.as.number)));
+                vmPush(vm, makeDouble(fmod(toNumberVM(a), toNumberVM(b))));
                 break;
             }
             
             case OP_POW: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) {
+                if (!isNumericVM(a) || !isNumericVM(b)) {
                     fprintf(stderr, "VM Error: Operands must be numbers\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeNumber(pow(a.as.number, b.as.number)));
+                vmPush(vm, makeDouble(pow(toNumberVM(a), toNumberVM(b))));
                 break;
             }
             
             case OP_NEG: {
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER) {
+                if (!isNumericVM(a)) {
                     fprintf(stderr, "VM Error: Operand must be number\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeNumber(-a.as.number));
+                vmPush(vm, makeDouble(-toNumberVM(a)));
                 break;
             }
             
@@ -248,10 +320,10 @@ InterpretResult vmExecute(VM* vm) {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
                 bool eq = false;
-                if (a.type != b.type) {
+                if (isNumericVM(a) && isNumericVM(b)) {
+                    eq = toNumberVM(a) == toNumberVM(b);
+                } else if (a.type != b.type) {
                     eq = false;
-                } else if (a.type == VAL_NUMBER) {
-                    eq = a.as.number == b.as.number;
                 } else if (a.type == VAL_BOOL) {
                     eq = a.as.boolean == b.as.boolean;
                 } else if (a.type == VAL_NULL) {
@@ -267,10 +339,10 @@ InterpretResult vmExecute(VM* vm) {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
                 bool eq = false;
-                if (a.type != b.type) {
+                if (isNumericVM(a) && isNumericVM(b)) {
+                    eq = toNumberVM(a) == toNumberVM(b);
+                } else if (a.type != b.type) {
                     eq = false;
-                } else if (a.type == VAL_NUMBER) {
-                    eq = a.as.number == b.as.number;
                 } else if (a.type == VAL_BOOL) {
                     eq = a.as.boolean == b.as.boolean;
                 } else if (a.type == VAL_NULL) {
@@ -285,71 +357,64 @@ InterpretResult vmExecute(VM* vm) {
             case OP_LT: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) {
+                if (!isNumericVM(a) || !isNumericVM(b)) {
                     fprintf(stderr, "VM Error: Operands must be numbers\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(a.as.number < b.as.number));
+                vmPush(vm, makeBool(toNumberVM(a) < toNumberVM(b)));
                 break;
             }
             
             case OP_LE: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) {
+                if (!isNumericVM(a) || !isNumericVM(b)) {
                     fprintf(stderr, "VM Error: Operands must be numbers\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(a.as.number <= b.as.number));
+                vmPush(vm, makeBool(toNumberVM(a) <= toNumberVM(b)));
                 break;
             }
             
             case OP_GT: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) {
+                if (!isNumericVM(a) || !isNumericVM(b)) {
                     fprintf(stderr, "VM Error: Operands must be numbers\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(a.as.number > b.as.number));
+                vmPush(vm, makeBool(toNumberVM(a) > toNumberVM(b)));
                 break;
             }
             
             case OP_GE: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (a.type != VAL_NUMBER || b.type != VAL_NUMBER) {
+                if (!isNumericVM(a) || !isNumericVM(b)) {
                     fprintf(stderr, "VM Error: Operands must be numbers\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(a.as.number >= b.as.number));
+                vmPush(vm, makeBool(toNumberVM(a) >= toNumberVM(b)));
                 break;
             }
             
             case OP_NOT: {
                 Value a = vmPop(vm);
-                bool isFalsy = (a.type == VAL_NULL) ||
-                               (a.type == VAL_BOOL && !a.as.boolean) ||
-                               (a.type == VAL_NUMBER && a.as.number == 0);
-                vmPush(vm, makeBool(isFalsy));
+                vmPush(vm, makeBool(!toBoolVM(a)));
                 break;
             }
             
             case OP_AND: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                bool aTrue = !(a.type == VAL_NULL || (a.type == VAL_BOOL && !a.as.boolean));
-                bool bTrue = !(b.type == VAL_NULL || (b.type == VAL_BOOL && !b.as.boolean));
-                vmPush(vm, makeBool(aTrue && bTrue));
+                vmPush(vm, makeBool(toBoolVM(a) && toBoolVM(b)));
                 break;
             }
             
             case OP_OR: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                bool aTrue = !(a.type == VAL_NULL || (a.type == VAL_BOOL && !a.as.boolean));
-                bool bTrue = !(b.type == VAL_NULL || (b.type == VAL_BOOL && !b.as.boolean));
-                vmPush(vm, makeBool(aTrue || bTrue));
+                vmPush(vm, makeBool(toBoolVM(a) || toBoolVM(b)));
                 break;
             }
             
@@ -362,10 +427,7 @@ InterpretResult vmExecute(VM* vm) {
             case OP_JUMP_IF_FALSE: {
                 uint16_t offset = readShort(frame);
                 Value condition = vmPeek(vm, 0);
-                bool isFalsy = (condition.type == VAL_NULL) ||
-                               (condition.type == VAL_BOOL && !condition.as.boolean) ||
-                               (condition.type == VAL_NUMBER && condition.as.number == 0);
-                if (isFalsy) {
+                if (!toBoolVM(condition)) {
                     frame->ip += offset;
                 }
                 break;
@@ -418,11 +480,11 @@ InterpretResult vmExecute(VM* vm) {
             case OP_NEW_ARRAY: {
                 uint8_t size = readByte(frame);
                 Value arr = makeArray(size);
+                arr.as.array->length = size;  
                 for (int i = size - 1; i >= 0; i--) {
                     Value val = vmPop(vm);
-                    arraySet(arr.as.array, i, val);
+                    arr.as.array->items[i] = val;  
                 }
-                arr.as.array->length = size;
                 vmPush(vm, arr);
                 break;
             }
@@ -431,14 +493,19 @@ InterpretResult vmExecute(VM* vm) {
                 Value index = vmPop(vm);
                 Value arr = vmPop(vm);
                 if (arr.type != VAL_ARRAY) {
-                    fprintf(stderr, "VM Error: Cannot index non-array\n");
+                    double val = 0;
+                    if (isNumericVM(arr)) {
+                        val = toNumberVM(arr);
+                    }
+                    const char* fname = (frame && frame->function) ? frame->function->name : "<unknown>";
+                    fprintf(stderr, "VM Error: Cannot index non-array (type=%d, value=%g) in %s\n", arr.type, val, fname);
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                if (index.type != VAL_NUMBER) {
+                if (!isNumericVM(index)) {
                     fprintf(stderr, "VM Error: Array index must be number\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, arrayGet(arr.as.array, (int)index.as.number));
+                vmPush(vm, arrayGet(arr.as.array, toIntVM(index)));
                 break;
             }
             
@@ -447,10 +514,15 @@ InterpretResult vmExecute(VM* vm) {
                 Value index = vmPop(vm);
                 Value arr = vmPop(vm);
                 if (arr.type != VAL_ARRAY) {
-                    fprintf(stderr, "VM Error: Cannot index non-array\n");
+                    double val = 0;
+                    if (isNumericVM(arr)) {
+                        val = toNumberVM(arr);
+                    }
+                    const char* fname = (frame && frame->function) ? frame->function->name : "<unknown>";
+                    fprintf(stderr, "VM Error: Cannot index non-array (type=%d, value=%g) in %s\n", arr.type, val, fname);
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                arraySet(arr.as.array, (int)index.as.number, value);
+                arraySet(arr.as.array, toIntVM(index), value);
                 vmPush(vm, value);
                 break;
             }
@@ -497,9 +569,15 @@ InterpretResult vmExecute(VM* vm) {
                     args[i + 1] = vmPop(vm);
                 }
 
+                
                 if (cls->constructor) {
-                    extern Value callValue(Value callee, Value* args, int argc);
-                    callValue(makeFunction(cls->constructor), args, argCount + 1);
+                    int totalArgs = argCount + 1;  
+                    bool shouldCall = (cls->constructor->paramCount == totalArgs) ||
+                                      (argCount == 0 && cls->constructor->paramCount == 1);
+                    if (shouldCall) {
+                        extern Value callValue(Value callee, Value* args, int argc);
+                        callValue(makeFunction(cls->constructor), args, totalArgs);
+                    }
                 }
 
                 vmPush(vm, obj);
@@ -539,6 +617,7 @@ InterpretResult vmExecute(VM* vm) {
                 Value nameVal = readConstant(frame);
                 uint8_t argCount = readByte(frame);
                 
+                
                 Value obj = vmPeek(vm, argCount);
                 
                 if (obj.type == VAL_OBJECT) {
@@ -549,11 +628,12 @@ InterpretResult vmExecute(VM* vm) {
                     }
                     
                     Value args[256];
-                    args[0] = obj;
-                    for (int i = argCount - 1; i >= 0; i--) {
-                        args[argCount - i] = vmPop(vm);
+                    args[0] = obj;  
+                    
+                    for (int i = argCount; i > 0; i--) {
+                        args[i] = vmPop(vm);
                     }
-                    vmPop(vm);
+                    vmPop(vm);  
                     
                     extern Value callValue(Value callee, Value* args, int argc);
                     Value result = callValue(makeFunction(method), args, argCount + 1);

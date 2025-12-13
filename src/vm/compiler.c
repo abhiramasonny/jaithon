@@ -40,7 +40,7 @@ void emitConstant(Compiler* compiler, Value value, int line) {
 
 int emitJump(Compiler* compiler, uint8_t instruction, int line) {
     emitByte(compiler, instruction, line);
-    emitByte(compiler, 0xff, line);//placeholder for jmp
+    emitByte(compiler, 0xff, line);
     emitByte(compiler, 0xff, line);
     return currentChunk(compiler)->count - 2;
 }
@@ -83,7 +83,7 @@ int resolveLocal(Compiler* compiler, const char* name) {
             return i;
         }
     }
-    return -1; //global
+    return -1; 
 }
 
 void addLocal(Compiler* compiler, const char* name) {
@@ -103,7 +103,7 @@ void beginScope(Compiler* compiler) {
 
 void endScope(Compiler* compiler) {
     compiler->scopeDepth--;
-    //what ra sudeep ima pop u with my gang
+    
     while (compiler->localCount > 0 &&
            compiler->locals[compiler->localCount - 1].depth > compiler->scopeDepth) {
         emitByte(compiler, OP_POP, 0);
@@ -115,8 +115,20 @@ void compileError(Compiler* compiler, const char* message, int line) {
     if (compiler->panicMode) return;
     compiler->panicMode = true;
     compiler->hadError = true;
-    (void)message;
-    (void)line;
+    
+    static bool compileDebug = false;
+    static bool checkedDebug = false;
+    if (!checkedDebug) {
+        const char* env = getenv("JAITHON_COMPILE_DEBUG");
+        if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+            compileDebug = true;
+        }
+        checkedDebug = true;
+    }
+    if (compileDebug) {
+        fprintf(stderr, "[COMPILE_ERROR] %s at line %d in function '%s'\n", 
+                message, line, compiler->function->name);
+    }
 }
 
 static bool isAtEnd(Token* tokens, int* pos, int end) {
@@ -153,24 +165,29 @@ static bool compileUnary(Compiler* compiler, Token* tokens, int* pos, int end);
 static bool compileBinary(Compiler* compiler, Token* tokens, int* pos, int end, int minPrec);
 
 static int getPrecedence(int tokenKind) {
+    
+    
+    if (tokenKind == getKW_OR()) return 4;
+    if (tokenKind == getKW_AND()) return 5;
+    
     switch (tokenKind) {
         case TK_EQ_EQ:
         case TK_NE:
-            return 3;
+            return 9;
         case TK_LT:
         case TK_GT:
         case TK_LE:
         case TK_GE:
-            return 4;
+            return 10;
         case TK_PLUS:
         case TK_MINUS:
-            return 5;
+            return 12;
         case TK_STAR:
         case TK_SLASH:
         case TK_PERCENT:
-            return 6;
+            return 13;
         case TK_CARET:
-            return 7;
+            return 14;  
         default:
             return 0;
     }
@@ -586,7 +603,7 @@ static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int e
             emitBytes(compiler, OP_GET_GLOBAL, constIdx, line);
         }
         
-        advance(tokens, pos);  // [
+        advance(tokens, pos);  
         if (!compileExpr(compiler, tokens, pos, end)) return false;
         if (!match(tokens, pos, TK_RBRACKET)) {
             compileError(compiler, "Expected ']'", line);
@@ -602,7 +619,7 @@ static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int e
     }
     
     if (check(tokens, *pos, TK_DOT)) {
-        // obj.field = expr
+        
         int slotObj = resolveLocal(compiler, name.strValue);
         if (slotObj != -1) {
             emitBytes(compiler, OP_GET_LOCAL, slotObj, line);
@@ -610,7 +627,7 @@ static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int e
             int constIdx = chunkAddConstant(currentChunk(compiler), makeString(name.strValue));
             emitBytes(compiler, OP_GET_GLOBAL, constIdx, line);
         }
-        advance(tokens, pos); // consume '.'
+        advance(tokens, pos); 
         if (!check(tokens, *pos, TK_IDENTIFIER)) {
             compileError(compiler, "Expected field name", line);
             return false;
@@ -681,7 +698,7 @@ bool compileStmts(Compiler* compiler, Token* tokens, int* pos, int end) {
         return compileBreak(compiler, tokens, pos, end);
     }
     
-    if (t.kind == TK_IDENTIFIER) {
+    if (t.kind == TK_IDENTIFIER || t.kind == getKW_SELF()) {
         return compileAssignment(compiler, tokens, pos, end);
     }
     

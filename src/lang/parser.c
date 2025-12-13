@@ -6,6 +6,7 @@
 #include "../vm/vm.h"
 #include "../vm/compiler.h"
 #include "../vm/bytecode.h"
+#include "../core/parallel.h"
 
 #define MAX_STATEMENTS 64
 #define MAX_INFIXES 64
@@ -22,6 +23,30 @@ typedef struct {
 
 static CompiledFuncEntry compiledFuncs[MAX_COMPILED_FUNCS];
 static int compiledFuncCount = 0;
+
+
+static int statsVMCalls = 0;
+static int statsInterpretCalls = 0;
+static int statsCacheHits = 0;
+static int statsDiskCacheHits = 0;
+static int statsDiskCacheSaves = 0;
+static bool statsEnabled = false;
+
+void printCompilationStats(void) {
+    if (!statsEnabled) return;
+    int total = statsVMCalls + statsInterpretCalls;
+    if (total == 0) return;
+    fprintf(stderr, "\n=== Jaithon Compilation Stats ===\n");
+    fprintf(stderr, "VM bytecode executions:    %d (%.1f%%)\n", statsVMCalls, 
+            total > 0 ? 100.0 * statsVMCalls / total : 0.0);
+    fprintf(stderr, "Interpreted executions:    %d (%.1f%%)\n", statsInterpretCalls,
+            total > 0 ? 100.0 * statsInterpretCalls / total : 0.0);
+    fprintf(stderr, "Memory cache hits:         %d\n", statsCacheHits);
+    fprintf(stderr, "Disk cache hits (.jaic):   %d\n", statsDiskCacheHits);
+    fprintf(stderr, "Disk cache saves:          %d\n", statsDiskCacheSaves);
+    fprintf(stderr, "Functions compiled:        %d\n", compiledFuncCount);
+    fprintf(stderr, "=================================\n");
+}
 
 #define MAX_FAILED_FUNCS 256
 typedef struct {
@@ -64,6 +89,10 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
         if (envOn && (strcmp(envOn, "1") == 0 || strcasecmp(envOn, "true") == 0)) {
             enableVMCompile = true;
         }
+        const char* envStats = getenv("JAITHON_STATS");
+        if (envStats && (strcmp(envStats, "1") == 0 || strcasecmp(envStats, "true") == 0)) {
+            statsEnabled = true;
+        }
         checkedEnv = true;
     }
     if (!enableVMCompile) return NULL;
@@ -79,26 +108,75 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
         }
     }
     
+    
     for (int i = 0; i < compiledFuncCount; i++) {
         if (strcmp(compiledFuncs[i].name, f->name) == 0 &&
             compiledFuncs[i].paramCount == f->paramCount &&
             compiledFuncs[i].isVariadic == f->isVariadic &&
             compiledFuncs[i].bodyHash == hash) {
+            statsCacheHits++;
             return compiledFuncs[i].compiled;
         }
     }
     
-    Token* tokens = NULL;
-    int tokenCount = tokenizeSource(f->body, &tokens);
-    if (!tokens || tokenCount == 0) {
-        if (tokens) free(tokens);
-        return NULL;
+    
+    static bool diskCacheEnabled = true;
+    static bool checkedDiskCache = false;
+    if (!checkedDiskCache) {
+        const char* env = getenv("JAITHON_NO_DISK_CACHE");
+        if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+            diskCacheEnabled = false;
+        }
+        checkedDiskCache = true;
     }
     
-    CompiledFunc* compiled = compileFunction(f, tokens, tokenCount);
-    free(tokens);
+    CompiledFunc* compiled = NULL;
+    bool loadedFromDisk = false;
+    
+    if (diskCacheEnabled && runtime.currentSourceFile[0] != '\0') {
+        compiled = cacheLoad(f->name, runtime.currentSourceFile, f->body);
+        if (compiled) {
+            loadedFromDisk = true;
+            statsDiskCacheHits++;
+            
+            compiled->arity = f->paramCount;
+            compiled->isVariadic = f->isVariadic;
+            if (f->paramCount > 0 && !compiled->paramNames) {
+                compiled->paramNames = malloc(sizeof(char*) * f->paramCount);
+                for (int i = 0; i < f->paramCount; i++) {
+                    compiled->paramNames[i] = strdup(f->params[i]);
+                }
+            }
+        }
+    }
+    
     
     if (!compiled) {
+        Token* tokens = NULL;
+        int tokenCount = tokenizeSource(f->body, &tokens);
+        if (!tokens || tokenCount == 0) {
+            if (tokens) free(tokens);
+            return NULL;
+        }
+        
+        compiled = compileFunction(f, tokens, tokenCount);
+        free(tokens);
+    }
+    
+    if (!compiled) {
+        static bool compileDebug = false;
+        static bool checkedDebug = false;
+        if (!checkedDebug) {
+            const char* env = getenv("JAITHON_COMPILE_DEBUG");
+            if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+                compileDebug = true;
+            }
+            checkedDebug = true;
+        }
+        if (compileDebug) {
+            fprintf(stderr, "[COMPILE_DEBUG] Failed to compile: %s (params=%d, variadic=%d)\n", 
+                    f->name, f->paramCount, f->isVariadic);
+        }
         if (failedFuncCount < MAX_FAILED_FUNCS) {
             strncpy(failedFuncs[failedFuncCount].name, f->name, MAX_NAME_LEN - 1);
             failedFuncs[failedFuncCount].paramCount = f->paramCount;
@@ -106,17 +184,27 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
             failedFuncs[failedFuncCount].bodyHash = hash;
             failedFuncCount++;
         }
-        return NULL;//fallback
+        return NULL;
     }
     
-    compiled->arity = f->paramCount;
-    compiled->isVariadic = f->isVariadic;
-    if (f->paramCount > 0) {
-        compiled->paramNames = malloc(sizeof(char*) * f->paramCount);
-        for (int i = 0; i < f->paramCount; i++) {
-            compiled->paramNames[i] = strdup(f->params[i]);
+    if (!loadedFromDisk) {
+        compiled->arity = f->paramCount;
+        compiled->isVariadic = f->isVariadic;
+        if (f->paramCount > 0) {
+            compiled->paramNames = malloc(sizeof(char*) * f->paramCount);
+            for (int i = 0; i < f->paramCount; i++) {
+                compiled->paramNames[i] = strdup(f->params[i]);
+            }
+        }
+        
+        
+        if (diskCacheEnabled && runtime.currentSourceFile[0] != '\0') {
+            if (cacheSave(f->name, runtime.currentSourceFile, compiled, f->body)) {
+                statsDiskCacheSaves++;
+            }
         }
     }
+    
     
     if (compiledFuncCount < MAX_COMPILED_FUNCS) {
         strncpy(compiledFuncs[compiledFuncCount].name, f->name, MAX_NAME_LEN - 1);
@@ -138,6 +226,9 @@ static int infixCount = 0;
 
 static Value returnValue;
 static bool hasReturn = false;
+
+static Value convertToTypeName(Value v, const char* typeName);
+static Value defaultValueForType(const char* typeName);
 
 void registerStatement(int keyword, StatementHandler handler) {
     if (statementCount >= MAX_STATEMENTS) {
@@ -184,23 +275,237 @@ static void skipNewlines(Lexer* lex) {
     }
 }
 
-static double toNumber(Value v) {
+static bool isAccessModifier(int kind) {
+    return kind == getKW_PUBLIC() || kind == getKW_PRIVATE() || kind == getKW_PROTECTED();
+}
+
+static bool isModifierToken(int kind) {
+    return isAccessModifier(kind) || kind == getKW_STATIC();
+}
+
+static bool isTypeToken(int kind) {
+    return kind == TK_IDENTIFIER ||
+           kind == getKW_VAR() ||
+           kind == getKW_VOID() ||
+           kind == getKW_INT() ||
+           kind == getKW_DOUBLE() ||
+           kind == getKW_FLOAT() ||
+           kind == getKW_STRING() ||
+           kind == getKW_CHAR() ||
+           kind == getKW_LONG() ||
+           kind == getKW_SHORT() ||
+           kind == getKW_BYTE() ||
+           kind == getKW_BOOL();
+}
+
+static bool startsWithJavaStyleDecl(Lexer* lex) {
+    Lexer look = *lex;
+    bool sawModifier = false;
+    
+    while (isModifierToken(look.currentToken.kind)) {
+        sawModifier = true;
+        lexerNext(&look);
+    }
+    
+    if (!isTypeToken(look.currentToken.kind)) return false;
+    if (!sawModifier && look.currentToken.kind == getKW_VAR()) return false;
+    
+    lexerNext(&look);
+    return lexerCheck(&look, TK_IDENTIFIER);
+}
+
+static bool startsWithJavaStyleFuncDecl(Lexer* lex) {
+    Lexer look = *lex;
+    while (isModifierToken(look.currentToken.kind)) {
+        lexerNext(&look);
+    }
+    if (!isTypeToken(look.currentToken.kind)) return false;
+    lexerNext(&look);
+    if (!lexerCheck(&look, TK_IDENTIFIER)) return false;
+    lexerNext(&look);
+    return lexerCheck(&look, TK_LPAREN);
+}
+
+static JaiNamespace* resolveNamespaceTarget(const char* name) {
+    if (hasVariable(name)) {
+        Value existing = getVariable(name);
+        if (existing.type != VAL_NAMESPACE) {
+            runtimeError("'%s' is not a namespace", name);
+            return NULL;
+        }
+        return existing.as.namespace;
+    }
+    Value nsVal = makeNamespace(name);
+    setVariable(name, nsVal);
+    return nsVal.as.namespace;
+}
+
+static void namespaceSetVariable(JaiNamespace* ns, const char* name, Value val, const char* typeName) {
+    for (int i = 0; i < ns->varCount; i++) {
+        if (strcmp(ns->variables[i].name, name) == 0) {
+            if (typeName && typeName[0] != '\0') {
+                strncpy(ns->variables[i].declaredType, typeName, MAX_NAME_LEN - 1);
+                ns->variables[i].declaredType[MAX_NAME_LEN - 1] = '\0';
+            }
+            if (ns->variables[i].declaredType[0] != '\0') {
+                ns->variables[i].value = convertToTypeName(val, ns->variables[i].declaredType);
+            } else {
+                ns->variables[i].value = val;
+            }
+            return;
+        }
+    }
+    
+    if (ns->varCount >= ns->varCapacity) {
+        int oldCap = ns->varCapacity;
+        ns->varCapacity *= GROWTH_FACTOR;
+        ns->variables = realloc(ns->variables, sizeof(Variable) * ns->varCapacity);
+        for (int i = oldCap; i < ns->varCapacity; i++) {
+            ns->variables[i].name[0] = '\0';
+            ns->variables[i].declaredType[0] = '\0';
+            ns->variables[i].value = makeNull();
+        }
+    }
+    strncpy(ns->variables[ns->varCount].name, name, MAX_NAME_LEN - 1);
+    ns->variables[ns->varCount].name[MAX_NAME_LEN - 1] = '\0';
+    ns->variables[ns->varCount].declaredType[0] = '\0';
+    if (typeName) {
+        strncpy(ns->variables[ns->varCount].declaredType, typeName, MAX_NAME_LEN - 1);
+        ns->variables[ns->varCount].declaredType[MAX_NAME_LEN - 1] = '\0';
+    }
+    if (ns->variables[ns->varCount].declaredType[0] != '\0') {
+        ns->variables[ns->varCount].value = convertToTypeName(val, ns->variables[ns->varCount].declaredType);
+    } else {
+        ns->variables[ns->varCount].value = val;
+    }
+    ns->varCount++;
+}
+
+static void namespaceAddFunction(JaiNamespace* ns, JaiFunction* f) {
+    if (!ns || !f) return;
+    if (ns->funcCount >= ns->funcCapacity) {
+        ns->funcCapacity *= 2;
+        ns->functions = realloc(ns->functions, sizeof(JaiFunction*) * ns->funcCapacity);
+    }
+    ns->functions[ns->funcCount++] = f;
+    f->namespace = ns;
+}
+
+double toNumber(Value v) {
     switch (v.type) {
         case VAL_NUMBER: return v.as.number;
+        case VAL_DOUBLE: return v.as.f64;
+        case VAL_FLOAT: return v.as.f32;
+        case VAL_INT: return v.as.i32;
+        case VAL_LONG: return (double)v.as.i64;
+        case VAL_SHORT: return v.as.i16;
+        case VAL_BYTE: return v.as.i8;
+        case VAL_CHAR: return (unsigned char)v.as.ch;
         case VAL_BOOL: return v.as.boolean ? 1.0 : 0.0;
-        case VAL_STRING: return strlen(v.as.string) > 0 ? 1.0 : 0.0;
+        case VAL_STRING: return v.as.string ? strtod(v.as.string, NULL) : 0.0;
         default: return 0.0;
     }
 }
 
-static bool toBool(Value v) {
+bool toBool(Value v) {
     switch (v.type) {
         case VAL_NUMBER: return v.as.number != 0;
+        case VAL_DOUBLE: return v.as.f64 != 0;
+        case VAL_FLOAT: return v.as.f32 != 0;
+        case VAL_INT: return v.as.i32 != 0;
+        case VAL_LONG: return v.as.i64 != 0;
+        case VAL_SHORT: return v.as.i16 != 0;
+        case VAL_BYTE: return v.as.i8 != 0;
+        case VAL_CHAR: return v.as.ch != 0;
         case VAL_BOOL: return v.as.boolean;
         case VAL_STRING: return strlen(v.as.string) > 0;
         case VAL_NULL: return false;
         default: return true;
     }
+}
+
+static bool isNumericValueType(ValueType t) {
+    return t == VAL_NUMBER || t == VAL_DOUBLE || t == VAL_FLOAT || t == VAL_INT ||
+           t == VAL_LONG || t == VAL_SHORT || t == VAL_BYTE || t == VAL_CHAR;
+}
+
+static char* valueToString(Value v) {
+    char buf[256];
+    switch (v.type) {
+        case VAL_STRING:
+            return v.as.string ? strdup(v.as.string) : strdup("");
+        case VAL_CHAR:
+            snprintf(buf, sizeof(buf), "%c", v.as.ch);
+            break;
+        case VAL_NUMBER:
+            snprintf(buf, sizeof(buf), "%g", v.as.number);
+            break;
+        case VAL_DOUBLE:
+            snprintf(buf, sizeof(buf), "%g", v.as.f64);
+            break;
+        case VAL_FLOAT:
+            snprintf(buf, sizeof(buf), "%g", v.as.f32);
+            break;
+        case VAL_INT:
+            snprintf(buf, sizeof(buf), "%d", v.as.i32);
+            break;
+        case VAL_LONG:
+            snprintf(buf, sizeof(buf), "%lld", (long long)v.as.i64);
+            break;
+        case VAL_SHORT:
+            snprintf(buf, sizeof(buf), "%d", v.as.i16);
+            break;
+        case VAL_BYTE:
+            snprintf(buf, sizeof(buf), "%d", v.as.i8);
+            break;
+        case VAL_BOOL:
+            snprintf(buf, sizeof(buf), "%s", v.as.boolean ? "true" : "false");
+            break;
+        default:
+            snprintf(buf, sizeof(buf), "null");
+            break;
+    }
+    return strdup(buf);
+}
+
+static Value convertToTypeName(Value v, const char* typeName) {
+    if (!typeName || typeName[0] == '\0' || strcasecmp(typeName, "var") == 0) {
+        return v;
+    }
+    if (strcasecmp(typeName, "int") == 0) return makeInt((int32_t)toNumber(v));
+    if (strcasecmp(typeName, "long") == 0 || strcasecmp(typeName, "long long") == 0) return makeLong((int64_t)toNumber(v));
+    if (strcasecmp(typeName, "short") == 0) return makeShort((int16_t)toNumber(v));
+    if (strcasecmp(typeName, "byte") == 0) return makeByte((int8_t)toNumber(v));
+    if (strcasecmp(typeName, "float") == 0) return makeFloat((float)toNumber(v));
+    if (strcasecmp(typeName, "double") == 0 || strcasecmp(typeName, "number") == 0) return makeDouble(toNumber(v));
+    if (strcasecmp(typeName, "char") == 0) {
+        if (v.type == VAL_STRING && v.as.string && strlen(v.as.string) > 0) {
+            return makeChar(v.as.string[0]);
+        }
+        return makeChar((char)(int)toNumber(v));
+    }
+    if (strcasecmp(typeName, "bool") == 0) return makeBool(toBool(v));
+    if (strcasecmp(typeName, "string") == 0) {
+        if (v.type == VAL_STRING) return v;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%g", toNumber(v));
+        return makeString(buf);
+    }
+    return v;
+}
+
+static Value defaultValueForType(const char* typeName) {
+    if (!typeName || typeName[0] == '\0' || strcasecmp(typeName, "var") == 0) return makeNull();
+    if (strcasecmp(typeName, "int") == 0) return makeInt(0);
+    if (strcasecmp(typeName, "long") == 0 || strcasecmp(typeName, "long long") == 0) return makeLong(0);
+    if (strcasecmp(typeName, "short") == 0) return makeShort(0);
+    if (strcasecmp(typeName, "byte") == 0) return makeByte(0);
+    if (strcasecmp(typeName, "float") == 0) return makeFloat(0.0f);
+    if (strcasecmp(typeName, "double") == 0 || strcasecmp(typeName, "number") == 0) return makeDouble(0.0);
+    if (strcasecmp(typeName, "char") == 0) return makeChar('\0');
+    if (strcasecmp(typeName, "bool") == 0) return makeBool(false);
+    if (strcasecmp(typeName, "string") == 0) return makeString("");
+    return makeNull();
 }
 
 static bool methodExpectsSelf(JaiFunction* m) {
@@ -568,23 +873,22 @@ Value parseExpression(Lexer* lex) {
 
 static Value handleAdd(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 7);
-    if (left.type == VAL_STRING || right.type == VAL_STRING) {
-        char buf[MAX_NAME_LEN * 2];
-        if (left.type == VAL_STRING) {
-            strcpy(buf, left.as.string);
-        } else {
-            snprintf(buf, sizeof(buf), "%g", left.as.number);
-        }
-        if (right.type == VAL_STRING) {
-            strcat(buf, right.as.string);
-        } else {
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "%g", right.as.number);
-            strcat(buf, tmp);
-        }
-        return makeString(buf);
+    if (left.type == VAL_STRING || right.type == VAL_STRING ||
+        left.type == VAL_CHAR || right.type == VAL_CHAR) {
+        char* lstr = valueToString(left);
+        char* rstr = valueToString(right);
+        size_t len = strlen(lstr) + strlen(rstr);
+        char* buf = malloc(len + 1);
+        memcpy(buf, lstr, strlen(lstr));
+        memcpy(buf + strlen(lstr), rstr, strlen(rstr) + 1);
+        Value v;
+        v.type = VAL_STRING;
+        v.as.string = buf;
+        free(lstr);
+        free(rstr);
+        return v;
     }
-    return makeNumber(toNumber(left) + toNumber(right));
+    return makeDouble(toNumber(left) + toNumber(right));
 }
 
 static Value handleSub(Lexer* lex, Value left) {
@@ -760,9 +1064,19 @@ static Value handleLe(Lexer* lex, Value left) {
 
 static Value handleEq(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 5);
+    if (isNumericValueType(left.type) && isNumericValueType(right.type)) {
+        return makeBool(toNumber(left) == toNumber(right));
+    }
     if (left.type != right.type) return makeBool(false);
     switch (left.type) {
         case VAL_NUMBER: return makeBool(left.as.number == right.as.number);
+        case VAL_DOUBLE: return makeBool(left.as.f64 == right.as.f64);
+        case VAL_FLOAT: return makeBool(left.as.f32 == right.as.f32);
+        case VAL_INT: return makeBool(left.as.i32 == right.as.i32);
+        case VAL_LONG: return makeBool(left.as.i64 == right.as.i64);
+        case VAL_SHORT: return makeBool(left.as.i16 == right.as.i16);
+        case VAL_BYTE: return makeBool(left.as.i8 == right.as.i8);
+        case VAL_CHAR: return makeBool(left.as.ch == right.as.ch);
         case VAL_BOOL: return makeBool(left.as.boolean == right.as.boolean);
         case VAL_STRING: return makeBool(strcmp(left.as.string, right.as.string) == 0);
         case VAL_NULL: return makeBool(true);
@@ -772,9 +1086,19 @@ static Value handleEq(Lexer* lex, Value left) {
 
 static Value handleNe(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 5);
+    if (isNumericValueType(left.type) && isNumericValueType(right.type)) {
+        return makeBool(toNumber(left) != toNumber(right));
+    }
     if (left.type != right.type) return makeBool(true);
     switch (left.type) {
         case VAL_NUMBER: return makeBool(left.as.number != right.as.number);
+        case VAL_DOUBLE: return makeBool(left.as.f64 != right.as.f64);
+        case VAL_FLOAT: return makeBool(left.as.f32 != right.as.f32);
+        case VAL_INT: return makeBool(left.as.i32 != right.as.i32);
+        case VAL_LONG: return makeBool(left.as.i64 != right.as.i64);
+        case VAL_SHORT: return makeBool(left.as.i16 != right.as.i16);
+        case VAL_BYTE: return makeBool(left.as.i8 != right.as.i8);
+        case VAL_CHAR: return makeBool(left.as.ch != right.as.ch);
         case VAL_BOOL: return makeBool(left.as.boolean != right.as.boolean);
         case VAL_STRING: return makeBool(strcmp(left.as.string, right.as.string) != 0);
         case VAL_NULL: return makeBool(false);
@@ -805,17 +1129,42 @@ static Value stmtVar(Lexer* lex) {
     strcpy(name, lex->currentToken.strValue);
     lexerNext(lex);
     
-    lexerExpect(lex, TK_EQUALS);
+    JaiNamespace* targetNs = NULL;
+    if (lexerMatch(lex, getKW_IN())) {
+        if (!lexerCheck(lex, TK_IDENTIFIER)) {
+            runtimeError("Expected namespace name after 'in'");
+            return makeNull();
+        }
+        targetNs = resolveNamespaceTarget(lex->currentToken.strValue);
+        lexerNext(lex);
+    }
     
-    Value val = parseExpression(lex);
-    setVariable(name, val);
+    Value val = makeNull();
+    if (lexerMatch(lex, TK_EQUALS)) {
+        val = parseExpression(lex);
+    }
+    
+    if (targetNs) {
+        namespaceSetVariable(targetNs, name, val, "");
+    } else {
+        setVariable(name, val);
+    }
     
     if (runtime.debug) {
         printf("Set %s = ", name);
-        if (val.type == VAL_NUMBER) printf("%g\n", val.as.number);
-        else if (val.type == VAL_STRING) printf("\"%s\"\n", val.as.string);
-        else if (val.type == VAL_BOOL) printf("%s\n", val.as.boolean ? "true" : "false");
-        else printf("null\n");
+        switch (val.type) {
+            case VAL_NUMBER: printf("%g\n", val.as.number); break;
+            case VAL_DOUBLE: printf("%g\n", val.as.f64); break;
+            case VAL_FLOAT: printf("%g\n", val.as.f32); break;
+            case VAL_INT: printf("%d\n", val.as.i32); break;
+            case VAL_LONG: printf("%lld\n", (long long)val.as.i64); break;
+            case VAL_SHORT: printf("%d\n", val.as.i16); break;
+            case VAL_BYTE: printf("%d\n", val.as.i8); break;
+            case VAL_CHAR: printf("%c\n", val.as.ch); break;
+            case VAL_STRING: printf("\"%s\"\n", val.as.string); break;
+            case VAL_BOOL: printf("%s\n", val.as.boolean ? "true" : "false"); break;
+            default: printf("null\n"); break;
+        }
     }
     
     return val;
@@ -835,6 +1184,33 @@ static Value stmtPrint(Lexer* lex) {
             }
             break;
         }
+        case VAL_DOUBLE: {
+            double n = val.as.f64;
+            if (n == (int)n) printf("%d\n", (int)n);
+            else printf("%g\n", n);
+            break;
+        }
+        case VAL_FLOAT: {
+            double n = val.as.f32;
+            if (n == (int)n) printf("%d\n", (int)n);
+            else printf("%g\n", n);
+            break;
+        }
+        case VAL_INT:
+            printf("%d\n", val.as.i32);
+            break;
+        case VAL_LONG:
+            printf("%lld\n", (long long)val.as.i64);
+            break;
+        case VAL_SHORT:
+            printf("%d\n", val.as.i16);
+            break;
+        case VAL_BYTE:
+            printf("%d\n", val.as.i8);
+            break;
+        case VAL_CHAR:
+            printf("%c\n", val.as.ch);
+            break;
         case VAL_STRING:
             printf("%s\n", val.as.string);
             break;
@@ -861,7 +1237,7 @@ static Value stmtIf(Lexer* lex) {
     lexerExpect(lex, getKW_IF());
     Value cond = parseExpression(lex);
     
-    lexerMatch(lex, getKW_THEN()); //not required (should prolly remove ltr)
+    lexerMatch(lex, getKW_THEN()); 
     lexerMatch(lex, getKW_DO());
     skipNewlines(lex);
     
@@ -915,8 +1291,10 @@ static Value stmtIf(Lexer* lex) {
     return result;
 }
 
-static Value stmtWhileVM(Lexer* lex) { //whileloop optmized
+static Value stmtWhileVM(Lexer* lex) {
+    
     lexerExpect(lex, getKW_WHILE());
+    
     
     const char* condStart = lex->start;
     
@@ -934,6 +1312,7 @@ static Value stmtWhileVM(Lexer* lex) { //whileloop optmized
     lexerMatch(lex, getKW_DO());
     skipNewlines(lex);
     
+    
     const char* bodyStart = lex->start;
     int depth = 1;
     while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
@@ -949,6 +1328,7 @@ static Value stmtWhileVM(Lexer* lex) { //whileloop optmized
     }
     const char* bodyEnd = lex->start;
     
+    
     int bodyLen = (int)(bodyEnd - bodyStart);
     char* bodySrc = malloc(bodyLen + 1);
     memcpy(bodySrc, bodyStart, bodyLen);
@@ -959,30 +1339,12 @@ static Value stmtWhileVM(Lexer* lex) { //whileloop optmized
     memcpy(condSrc, condStart, condLen);
     condSrc[condLen] = '\0';
     
-    Value result = makeNull();
-    int iterations = 0;
-    const int MAX_ITERATIONS = 100000000;
     
-    while (iterations++ < MAX_ITERATIONS) {
-        Lexer condLex;
-        lexerInit(&condLex, condSrc);
-        Value cond = parseExpression(&condLex);
-        
-        if (!toBool(cond)) break;
-        
-        Lexer bodyLex;
-        lexerInit(&bodyLex, bodySrc);
-        while (!lexerCheck(&bodyLex, TK_EOF)) {
-            result = parseStatement(&bodyLex);
-            skipNewlines(&bodyLex);
-            if (hasReturn) {
-                result = returnValue;
-                break;
-            }
-        }
-        
-        if (hasReturn) break;
-    }
+    
+    
+    
+    
+    Value result = executeWhileLoop(condSrc, bodySrc);
     
     free(bodySrc);
     free(condSrc);
@@ -993,6 +1355,181 @@ static Value stmtWhileVM(Lexer* lex) { //whileloop optmized
 
 static Value stmtWhile(Lexer* lex) {
     return stmtWhileVM(lex);
+}
+
+static Value stmtJavaStyleDecl(Lexer* lex) {
+    
+    while (isModifierToken(lex->currentToken.kind)) {
+        lexerNext(lex);
+    }
+    
+    if (!isTypeToken(lex->currentToken.kind)) {
+        runtimeError("Expected type or 'var' after modifiers");
+        return makeNull();
+    }
+    
+    char returnType[MAX_NAME_LEN];
+    strncpy(returnType, lex->currentToken.strValue, MAX_NAME_LEN - 1);
+    returnType[MAX_NAME_LEN - 1] = '\0';
+    lexerNext(lex);
+    
+    if (!lexerCheck(lex, TK_IDENTIFIER)) {
+        runtimeError("Expected name after type");
+        return makeNull();
+    }
+    
+    char name[MAX_NAME_LEN];
+    strncpy(name, lex->currentToken.strValue, MAX_NAME_LEN - 1);
+    name[MAX_NAME_LEN - 1] = '\0';
+    lexerNext(lex);
+    
+    JaiNamespace* targetNs = NULL;
+    if (lexerMatch(lex, getKW_IN())) {
+        if (!lexerCheck(lex, TK_IDENTIFIER)) {
+            runtimeError("Expected namespace name after 'in'");
+            return makeNull();
+        }
+        targetNs = resolveNamespaceTarget(lex->currentToken.strValue);
+        lexerNext(lex);
+    }
+    
+    if (!lexerCheck(lex, TK_LPAREN)) {
+        Value val = defaultValueForType(returnType);
+        if (lexerMatch(lex, TK_EQUALS)) {
+            val = parseExpression(lex);
+        }
+        val = convertToTypeName(val, returnType);
+        
+        if (targetNs) {
+            namespaceSetVariable(targetNs, name, val, returnType);
+        } else {
+            setTypedVariable(name, val, returnType);
+        }
+        return val;
+    }
+    
+    lexerExpect(lex, TK_LPAREN);
+    
+    int paramCapacity = 8;
+    char** params = malloc(sizeof(char*) * paramCapacity);
+    char** paramTypes = malloc(sizeof(char*) * paramCapacity);
+    int paramCount = 0;
+    bool isVariadic = false;
+    
+    if (!lexerCheck(lex, TK_RPAREN)) {
+        do {
+            if (lexerMatch(lex, TK_STAR)) {
+                isVariadic = true;
+            }
+            if (!isTypeToken(lex->currentToken.kind)) {
+                runtimeError("Expected parameter type");
+                for (int i = 0; i < paramCount; i++) {
+                    free(params[i]);
+                    free(paramTypes[i]);
+                }
+                free(params);
+                free(paramTypes);
+                return makeNull();
+            }
+            
+            char typeName[MAX_NAME_LEN];
+            strncpy(typeName, lex->currentToken.strValue, MAX_NAME_LEN - 1);
+            typeName[MAX_NAME_LEN - 1] = '\0';
+            lexerNext(lex);
+            
+            if (!lexerCheck(lex, TK_IDENTIFIER)) {
+                runtimeError("Expected parameter name");
+                for (int i = 0; i < paramCount; i++) {
+                    free(params[i]);
+                    free(paramTypes[i]);
+                }
+                free(params);
+                free(paramTypes);
+                return makeNull();
+            }
+            if (paramCount >= paramCapacity) {
+                paramCapacity *= 2;
+                params = realloc(params, sizeof(char*) * paramCapacity);
+                paramTypes = realloc(paramTypes, sizeof(char*) * paramCapacity);
+            }
+            params[paramCount] = strdup(lex->currentToken.strValue);
+            paramTypes[paramCount] = strdup(typeName);
+            paramCount++;
+            lexerNext(lex);
+        } while (lexerMatch(lex, TK_COMMA));
+    }
+    lexerExpect(lex, TK_RPAREN);
+    
+    if (!targetNs && lexerMatch(lex, getKW_IN())) {
+        if (!lexerCheck(lex, TK_IDENTIFIER)) {
+            runtimeError("Expected namespace name after 'in'");
+            for (int i = 0; i < paramCount; i++) {
+                free(params[i]);
+                free(paramTypes[i]);
+            }
+            free(params);
+            free(paramTypes);
+            return makeNull();
+        }
+        targetNs = resolveNamespaceTarget(lex->currentToken.strValue);
+        lexerNext(lex);
+    }
+    
+    skipNewlines(lex);
+    
+    const char* bodyStart = lex->start;
+    const char* bodyEnd = NULL;
+    int depth = 1;
+    while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
+        if (lexerCheck(lex, getKW_END())) {
+            depth--;
+        } else if (lexerCheck(lex, getKW_IF()) || lexerCheck(lex, getKW_WHILE()) || lexerCheck(lex, getKW_FUNC()) || startsWithJavaStyleFuncDecl(lex)) {
+            depth++;
+        }
+        if (depth > 0) lexerNext(lex);
+    }
+    bodyEnd = lex->start;
+    
+    int bodyLen = (int)(bodyEnd - bodyStart);
+    char* body = malloc(bodyLen + 1);
+    strncpy(body, bodyStart, bodyLen);
+    body[bodyLen] = '\0';
+    
+    Module* owner = runtime.currentModule;
+    JaiFunction* f = defineFunction(name, params, paramCount, isVariadic, body);
+    if (f) {
+        strncpy(f->returnType, returnType, MAX_NAME_LEN - 1);
+        f->returnType[MAX_NAME_LEN - 1] = '\0';
+        f->paramTypes = paramTypes;
+    } else {
+        for (int i = 0; i < paramCount; i++) {
+            free(paramTypes[i]);
+        }
+        free(paramTypes);
+    }
+    
+    if (f && targetNs) {
+        namespaceAddFunction(targetNs, f);
+        namespaceSetVariable(targetNs, name, makeFunction(f), returnType);
+        if (owner) {
+            for (int i = 0; i < owner->funcCount; i++) {
+                if (owner->functions[i] == f) {
+                    owner->functions[i] = owner->functions[owner->funcCount - 1];
+                    owner->functions[owner->funcCount - 1] = NULL;
+                    owner->funcCount--;
+                    break;
+                }
+            }
+        }
+    }
+    
+    for (int i = 0; i < paramCount; i++) free(params[i]);
+    free(params);
+    free(body);
+    
+    lexerExpect(lex, getKW_END());
+    
+    return makeFunction(f);
 }
 
 static Value stmtFunc(Lexer* lex) {
@@ -1070,18 +1607,7 @@ static Value stmtFunc(Lexer* lex) {
     return makeFunction(f);
 }
 
-// class ClassName [extends ParentClass]
-//     var field1
-//     var field2
-//     
-//     func init(self, args)
-//         self.field1 = value
-//     end
-//     
-//     func method(self, args)
-//         ...
-//     end
-// end
+
 static Value stmtClass(Lexer* lex) {
     lexerExpect(lex, getKW_CLASS());
     
@@ -1282,10 +1808,15 @@ static Value stmtReturn(Lexer* lex) {
     return returnValue;
 }
 
+static bool isNameToken(Lexer* lex) {
+    int k = lex->currentToken.kind;
+    return k == TK_IDENTIFIER || k >= TK_KEYWORD;
+}
+
 static Value stmtImport(Lexer* lex) {
     lexerExpect(lex, getKW_IMPORT());
     
-    if (!lexerCheck(lex, TK_IDENTIFIER)) {
+    if (!isNameToken(lex)) {
         runtimeError("Expected module name");
         return makeNull();
     }
@@ -1311,7 +1842,7 @@ static Value stmtImport(Lexer* lex) {
         
         lexerNext(lex);
         if (!lexerMatch(lex, TK_SLASH)) break;
-        if (!lexerCheck(lex, TK_IDENTIFIER)) {
+        if (!isNameToken(lex)) {
             runtimeError("Expected module name after '/'");
             return makeNull();
         }
@@ -1374,6 +1905,7 @@ static Value stmtImport(Lexer* lex) {
     
     for (int i = 0; i < newMod->funcCount; i++) {
         JaiFunction* f = newMod->functions[i];
+        if (!f) continue;
         if (!hasVariable(f->name)) {
             setVariable(f->name, makeFunction(f));
         }
@@ -1439,6 +1971,10 @@ Value parseStatement(Lexer* lex) {
     
     if (lexerCheck(lex, TK_EOF)) {
         return makeNull();
+    }
+
+    if (startsWithJavaStyleDecl(lex)) {
+        return stmtJavaStyleDecl(lex);
     }
     
     int kind = lex->currentToken.kind;
@@ -1687,6 +2223,7 @@ Value callValue(Value callee, Value* args, int argc) {
     
     CompiledFunc* compiled = getCompiledFunc(f);
     if (compiled) {
+        statsVMCalls++;
         VM* vm = malloc(sizeof(VM));
         vmInit(vm);
         runtime.currentModule = oldMod;
@@ -1703,12 +2240,14 @@ Value callValue(Value callee, Value* args, int argc) {
         callDepth--;
         
         if (vmResult != INTERPRET_OK) {
+            statsVMCalls--;  
             goto INTERPRET_FALLBACK;
         }
         return result;
     }
     
 INTERPRET_FALLBACK: ;
+    statsInterpretCalls++;
     Module* funcMod = createModule("__call__", "");
     runtime.currentModule = funcMod;
     
@@ -1726,16 +2265,18 @@ INTERPRET_FALLBACK: ;
     if (f->isVariadic) {
         int regularParams = f->paramCount - 1;
         for (int i = 0; i < regularParams; i++) {
-            setVariable(f->params[i], args[i]);
+            const char* tname = (f->paramTypes && f->paramTypes[i]) ? f->paramTypes[i] : "";
+            setTypedVariable(f->params[i], args[i], tname);
         }
         Value variadicArray = makeArray(argc - regularParams);
         for (int i = regularParams; i < argc; i++) {
             arrayPush(variadicArray.as.array, args[i]);
         }
-        setVariable(f->params[regularParams], variadicArray);
+        setTypedVariable(f->params[regularParams], variadicArray, "var");
     } else {
         for (int i = 0; i < argc; i++) {
-            setVariable(f->params[i], args[i]);
+            const char* tname = (f->paramTypes && f->paramTypes[i]) ? f->paramTypes[i] : "";
+            setTypedVariable(f->params[i], args[i], tname);
         }
     }
     
@@ -1833,6 +2374,13 @@ static Value nativeStr(Value* args, int argc) {
     char buf[256];
     switch (args[0].type) {
         case VAL_NUMBER: snprintf(buf, sizeof(buf), "%g", args[0].as.number); break;
+        case VAL_DOUBLE: snprintf(buf, sizeof(buf), "%g", args[0].as.f64); break;
+        case VAL_FLOAT: snprintf(buf, sizeof(buf), "%g", args[0].as.f32); break;
+        case VAL_INT: snprintf(buf, sizeof(buf), "%d", args[0].as.i32); break;
+        case VAL_LONG: snprintf(buf, sizeof(buf), "%lld", (long long)args[0].as.i64); break;
+        case VAL_SHORT: snprintf(buf, sizeof(buf), "%d", args[0].as.i16); break;
+        case VAL_BYTE: snprintf(buf, sizeof(buf), "%d", args[0].as.i8); break;
+        case VAL_CHAR: snprintf(buf, sizeof(buf), "%c", args[0].as.ch); break;
         case VAL_BOOL: snprintf(buf, sizeof(buf), "%d", args[0].as.boolean ? 1 : 0); break;
         case VAL_STRING: return args[0];
         default: strcpy(buf, "null");
@@ -1848,10 +2396,79 @@ static Value nativeNum(Value* args, int argc) {
     return makeNumber(toNumber(args[0]));
 }
 
+
+static Value nativeInt(Value* args, int argc) {
+    if (argc < 1) return makeInt(0);
+    if (args[0].type == VAL_STRING) {
+        return makeInt((int32_t)strtol(args[0].as.string, NULL, 10));
+    }
+    return makeInt((int32_t)toNumber(args[0]));
+}
+
+static Value nativeFloat(Value* args, int argc) {
+    if (argc < 1) return makeFloat(0.0f);
+    if (args[0].type == VAL_STRING) {
+        return makeFloat((float)strtod(args[0].as.string, NULL));
+    }
+    return makeFloat((float)toNumber(args[0]));
+}
+
+static Value nativeDouble(Value* args, int argc) {
+    if (argc < 1) return makeDouble(0.0);
+    if (args[0].type == VAL_STRING) {
+        return makeDouble(strtod(args[0].as.string, NULL));
+    }
+    return makeDouble(toNumber(args[0]));
+}
+
+static Value nativeBoolCast(Value* args, int argc) {
+    if (argc < 1) return makeBool(false);
+    return makeBool(toBool(args[0]));
+}
+
+static Value nativeCharCast(Value* args, int argc) {
+    if (argc < 1) return makeChar('\0');
+    if (args[0].type == VAL_STRING && args[0].as.string && strlen(args[0].as.string) > 0) {
+        return makeChar(args[0].as.string[0]);
+    }
+    return makeChar((char)(int)toNumber(args[0]));
+}
+
+static Value nativeLong(Value* args, int argc) {
+    if (argc < 1) return makeLong(0);
+    if (args[0].type == VAL_STRING) {
+        return makeLong((int64_t)strtoll(args[0].as.string, NULL, 10));
+    }
+    return makeLong((int64_t)toNumber(args[0]));
+}
+
+static Value nativeShort(Value* args, int argc) {
+    if (argc < 1) return makeShort(0);
+    if (args[0].type == VAL_STRING) {
+        return makeShort((int16_t)strtol(args[0].as.string, NULL, 10));
+    }
+    return makeShort((int16_t)toNumber(args[0]));
+}
+
+static Value nativeByteCast(Value* args, int argc) {
+    if (argc < 1) return makeByte(0);
+    if (args[0].type == VAL_STRING) {
+        return makeByte((int8_t)strtol(args[0].as.string, NULL, 10));
+    }
+    return makeByte((int8_t)toNumber(args[0]));
+}
+
 static Value nativeType(Value* args, int argc) {
     if (argc < 1) return makeString("null");
     switch (args[0].type) {
         case VAL_NUMBER: return makeString("number");
+        case VAL_DOUBLE: return makeString("double");
+        case VAL_FLOAT: return makeString("float");
+        case VAL_INT: return makeString("int");
+        case VAL_LONG: return makeString("long");
+        case VAL_SHORT: return makeString("short");
+        case VAL_BYTE: return makeString("byte");
+        case VAL_CHAR: return makeString("char");
         case VAL_STRING: return makeString("string");
         case VAL_BOOL: return makeString("bool");
         case VAL_FUNCTION: return makeString("function");
@@ -2071,6 +2688,10 @@ void initParser(void) {
     registerStatement(getKW_SYSTEM(), stmtSystem);
     registerStatement(getKW_CLASS(), stmtClass);
     registerStatement(getKW_NAMESPACE(), stmtNamespace);
+    registerStatement(getKW_PUBLIC(), stmtJavaStyleDecl);
+    registerStatement(getKW_PRIVATE(), stmtJavaStyleDecl);
+    registerStatement(getKW_PROTECTED(), stmtJavaStyleDecl);
+    registerStatement(getKW_STATIC(), stmtJavaStyleDecl);
     
     registerInfix(TK_PLUS, 6, handleAdd);
     registerInfix(TK_MINUS, 6, handleSub);
@@ -2096,6 +2717,7 @@ void initParser(void) {
         setVariable("gui_mouse_down", makeNativeFunc(stubGuiMouseDown));
         setVariable("gui_key_down", makeNativeFunc(stubGuiKeyDown));
         setVariable("gui_poll", makeNativeFunc(stubGuiPoll));
+        setVariable("gui_get_keys", makeNativeFunc(stubGuiPoll)); 
     }
     
     setVariable("_sin", makeNativeFunc(nativeSin));
@@ -2109,6 +2731,14 @@ void initParser(void) {
     setVariable("_len", makeNativeFunc(nativeLen));
     setVariable("_str", makeNativeFunc(nativeStr));
     setVariable("_num", makeNativeFunc(nativeNum));
+    setVariable("_int", makeNativeFunc(nativeInt));
+    setVariable("_float", makeNativeFunc(nativeFloat));
+    setVariable("_double", makeNativeFunc(nativeDouble));
+    setVariable("_bool", makeNativeFunc(nativeBoolCast));
+    setVariable("_char", makeNativeFunc(nativeCharCast));
+    setVariable("_long", makeNativeFunc(nativeLong));
+    setVariable("_short", makeNativeFunc(nativeShort));
+    setVariable("_byte", makeNativeFunc(nativeByteCast));
     setVariable("_type", makeNativeFunc(nativeType));
     setVariable("_cell", makeNativeFunc(nativeCell));
     setVariable("_car", makeNativeFunc(nativeCar));

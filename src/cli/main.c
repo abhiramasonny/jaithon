@@ -1,4 +1,5 @@
 #include "../core/runtime.h"
+#include "../core/parallel.h"
 #include "../lang/lexer.h"
 #include "../lang/parser.h"
 #include "../vm/bytecode.h"
@@ -10,7 +11,7 @@
 #include <unistd.h>
 #include <mach-o/dyld.h>
 
-#define VERSION "2.1.0"
+#define VERSION "2.2.0"
 
 static char execDir[1024] = {0};
 
@@ -65,6 +66,20 @@ static void runFile(const char* path) {
         fprintf(stderr, "Error: Cannot open file: %s\n", path);
         exit(1);
     }
+    
+    
+    char absPath[1024];
+    if (path[0] == '/') {
+        strncpy(absPath, path, sizeof(absPath) - 1);
+    } else {
+        char cwd[512];
+        if (getcwd(cwd, sizeof(cwd))) {
+            snprintf(absPath, sizeof(absPath), "%s/%s", cwd, path);
+        } else {
+            strncpy(absPath, path, sizeof(absPath) - 1);
+        }
+    }
+    strncpy(runtime.currentSourceFile, absPath, sizeof(runtime.currentSourceFile) - 1);
     
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
@@ -183,7 +198,13 @@ static void showHelp(const char* prog) {
     printf("  -s, --shell      Start interactive shell\n");
     printf("  -v, --version    Show version\n");
     printf("  -h, --help       Show this help\n");
-    printf("  --no-extension   Don't auto-append .jai extension\n\n");
+    printf("  --no-extension   Don't auto-append .jai extension\n");
+    printf("  --serial         Disable parallel execution\n");
+    printf("  --no-gpu         Disable GPU acceleration\n");
+    printf("  --threads=N      Set max threads (default: auto)\n\n");
+    printf("Parallelization:\n");
+    printf("  Jaithon automatically parallelizes loops when safe.\n");
+    printf("  Uses multi-threading, SIMD, and GPU (Metal) when available.\n\n");
     printf("If no file is given, starts interactive shell.\n");
 }
 
@@ -192,6 +213,9 @@ int main(int argc, char* argv[]) {
     bool autoExt = true;
     bool forceShell = false;
     bool noStdLib = false;
+    int maxThreads = 0;
+    bool serialMode = false;
+    bool noGpu = false;
     
     static struct option longOpts[] = {
         {"debug", no_argument, 0, 'd'},
@@ -200,6 +224,9 @@ int main(int argc, char* argv[]) {
         {"help", no_argument, 0, 'h'},
         {"no-extension", no_argument, 0, 'n'},
         {"no-stdlib", no_argument, 0, 'N'},
+        {"serial", no_argument, 0, 'S'},
+        {"no-gpu", no_argument, 0, 'G'},
+        {"threads", required_argument, 0, 'T'},
         {0, 0, 0, 0}
     };
     
@@ -211,6 +238,7 @@ int main(int argc, char* argv[]) {
     }
     
     initRuntime();
+    parallelInit();  
     registerGuiFunctions();
     registerBuiltinKeywords();
     initParser();
@@ -227,15 +255,26 @@ int main(int argc, char* argv[]) {
             case 's':
                 forceShell = true;
                 break;
+            case 'S':
+                serialMode = true;
+                break;
+            case 'G':
+                noGpu = true;
+                break;
+            case 'T':
+                maxThreads = atoi(optarg);
+                break;
             case 'N':
                 noStdLib = true;
                 break;
             case 'v':
                 showVersion();
+                parallelShutdown();
                 freeRuntime();
                 return 0;
             case 'h':
                 showHelp(argv[0]);
+                parallelShutdown();
                 freeRuntime();
                 return 0;
             case 'n':
@@ -243,13 +282,28 @@ int main(int argc, char* argv[]) {
                 break;
             default:
                 showHelp(argv[0]);
+                parallelShutdown();
                 freeRuntime();
                 return 1;
         }
     }
     
+    
+    if (serialMode) {
+        parallelSetMode(PAR_MODE_SERIAL);
+    }
+    if (noGpu) {
+        parallelEnableGPU(false);
+    }
+    if (maxThreads > 0) {
+        parallelSetMaxThreads(maxThreads);
+    }
+    
     if (runtime.debug) {
         printf("==================== DEBUG MODE ====================\n");
+        printf("Parallel mode: %s\n", serialMode ? "serial" : "auto");
+        printf("GPU acceleration: %s\n", noGpu ? "disabled" : "enabled");
+        printf("Max threads: %d\n", maxThreads > 0 ? maxThreads : parallelConfig.maxThreads);
     }
     
     if (!noStdLib) {
@@ -278,6 +332,8 @@ int main(int argc, char* argv[]) {
         printf("\n==================== Execution time: %.4fs ====================\n", elapsed);
     }
     
+    printCompilationStats();
+    parallelShutdown();
     cacheFree();
     freeRuntime();
     return 0;

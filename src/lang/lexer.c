@@ -317,6 +317,8 @@ static int KW_TRUE, KW_FALSE, KW_NULL;
 static int KW_INPUT, KW_BREAK, KW_SYSTEM;
 static int KW_CLASS, KW_NEW, KW_EXTENDS, KW_SELF;
 static int KW_NAMESPACE;
+static int KW_PUBLIC, KW_PRIVATE, KW_PROTECTED, KW_STATIC, KW_IN, KW_VOID;
+static int KW_INT, KW_DOUBLE, KW_FLOAT, KW_STRING, KW_CHAR, KW_LONG, KW_SHORT, KW_BYTE, KW_BOOL;
 
 void registerBuiltinKeywords(void) {
     KW_VAR = registerKeyword("var");
@@ -348,6 +350,21 @@ void registerBuiltinKeywords(void) {
     KW_EXTENDS = registerKeyword("extends");
     KW_SELF = registerKeyword("self");
     KW_NAMESPACE = registerKeyword("namespace");
+    KW_PUBLIC = registerKeyword("public");
+    KW_PRIVATE = registerKeyword("private");
+    KW_PROTECTED = registerKeyword("protected");
+    KW_STATIC = registerKeyword("static");
+    KW_IN = registerKeyword("in");
+    KW_VOID = registerKeyword("void");
+    KW_INT = registerKeyword("int");
+    KW_DOUBLE = registerKeyword("double");
+    KW_FLOAT = registerKeyword("float");
+    KW_STRING = registerKeyword("string");
+    KW_CHAR = registerKeyword("char");
+    KW_LONG = registerKeyword("long");
+    KW_SHORT = registerKeyword("short");
+    KW_BYTE = registerKeyword("byte");
+    KW_BOOL = registerKeyword("bool");
 }
 
 int getKW_VAR(void) { return KW_VAR; }
@@ -379,6 +396,21 @@ int getKW_NEW(void) { return KW_NEW; }
 int getKW_EXTENDS(void) { return KW_EXTENDS; }
 int getKW_SELF(void) { return KW_SELF; }
 int getKW_NAMESPACE(void) { return KW_NAMESPACE; }
+int getKW_PUBLIC(void) { return KW_PUBLIC; }
+int getKW_PRIVATE(void) { return KW_PRIVATE; }
+int getKW_PROTECTED(void) { return KW_PROTECTED; }
+int getKW_STATIC(void) { return KW_STATIC; }
+int getKW_IN(void) { return KW_IN; }
+int getKW_VOID(void) { return KW_VOID; }
+int getKW_INT(void) { return KW_INT; }
+int getKW_DOUBLE(void) { return KW_DOUBLE; }
+int getKW_FLOAT(void) { return KW_FLOAT; }
+int getKW_STRING(void) { return KW_STRING; }
+int getKW_CHAR(void) { return KW_CHAR; }
+int getKW_LONG(void) { return KW_LONG; }
+int getKW_SHORT(void) { return KW_SHORT; }
+int getKW_BYTE(void) { return KW_BYTE; }
+int getKW_BOOL(void) { return KW_BOOL; }
 
 int tokenizeSource(const char* source, Token** outTokens) {
     Lexer lex;

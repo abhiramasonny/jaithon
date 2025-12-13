@@ -2,19 +2,19 @@
 
 class HashMap
     var entries
-    
+
     func init(self)
         self.entries = []
     end
-    
+
     func size(self)
         return _alen(self.entries)
     end
-    
+
     func isEmpty(self)
         return self.size() == 0
     end
-    
+
     func set(self, key, value)
         var idx = mapFind(self.entries, key)
         if idx >= 0
@@ -24,7 +24,7 @@ class HashMap
         end
         return value
     end
-    
+
     func get(self, key)
         var idx = mapFind(self.entries, key)
         if idx >= 0
@@ -32,11 +32,11 @@ class HashMap
         end
         return null
     end
-    
+
     func has(self, key)
         return mapFind(self.entries, key) >= 0
     end
-    
+
     func delete(self, key)
         var idx = mapFind(self.entries, key)
         if idx < 0
@@ -53,7 +53,7 @@ class HashMap
         self.entries = newEntries
         return true
     end
-    
+
     func keys(self)
         var out = []
         var i = 0
@@ -63,7 +63,7 @@ class HashMap
         end
         return out
     end
-    
+
     func values(self)
         var out = []
         var i = 0
