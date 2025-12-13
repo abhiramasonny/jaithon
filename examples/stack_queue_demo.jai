@@ -1,5 +1,5 @@
-import lib/modules/ds/stack
-import lib/modules/ds/queue
+import ds/stack
+import ds/queue
 
 func main()
     print "Stack demo:"

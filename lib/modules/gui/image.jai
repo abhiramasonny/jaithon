@@ -1,5 +1,5 @@
-import lib/modules/gui/window
-import lib/modules/ds/array
+import gui/window
+import ds/array
 
 func loadPNG(path)
     return gui_load_png(path)

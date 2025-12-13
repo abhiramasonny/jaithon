@@ -101,8 +101,8 @@ static uint64_t gLastFrameTime = 0;
 static double gDeltaTime = 0.0;
 static double gFPS = 0.0;
 static mach_timebase_info_data_t gTimebaseInfo;
-static double gTargetFrameTime = 1.0 / 60.0;
-static int gTargetFPS = 60;
+static double gTargetFrameTime = 0.0;  // 0 means uncapped
+static int gTargetFPS = 0;
 
 
 static bool isNumeric(Value v) {
@@ -142,6 +142,8 @@ Value native_gui_init(Value* args, int argc) {
     gHeight = (int)toNum(args[1]);
     char* title = args[2].as.string;
     
+    gTargetFPS = 0;
+    gTargetFrameTime = 0.0;
     if (argc >= 4 && isNumeric(args[3])) {
         gTargetFPS = (int)toNum(args[3]);
         if (gTargetFPS > 0) {
@@ -224,7 +226,7 @@ Value native_gui_init(Value* args, int argc) {
         gMetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         gMetalLayer.framebufferOnly = YES;
         gMetalLayer.drawableSize = CGSizeMake(gWidth, gHeight);
-        gMetalLayer.displaySyncEnabled = YES; 
+        gMetalLayer.displaySyncEnabled = NO;
         
         [gWindow setContentView:gView];
         [gWindow makeKeyAndOrderFront:nil];
@@ -456,9 +458,11 @@ Value native_gui_present(Value* args, int argc) {
         uint64_t elapsed = currentTime - gLastFrameTime;
         double elapsedSeconds = (double)elapsed * gTimebaseInfo.numer / gTimebaseInfo.denom / 1e9;
         
-        if (elapsedSeconds < gTargetFrameTime) {
+        if (gTargetFrameTime > 0 && elapsedSeconds < gTargetFrameTime) {
             double sleepTime = gTargetFrameTime - elapsedSeconds;
-            usleep((useconds_t)(sleepTime * 1e6));
+            if (sleepTime > 0) {
+                usleep((useconds_t)(sleepTime * 1e6));
+            }
             
             currentTime = mach_absolute_time();
             elapsed = currentTime - gLastFrameTime;

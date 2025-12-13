@@ -8,7 +8,9 @@
 
 
 #define JAIC_MAGIC "JAIC"
-#define JAIC_VERSION 1
+#define JAIC_VERSION 3
+#define JAIC_BUNDLE_MAGIC "JAIB"
+#define JAIC_BUNDLE_VERSION 4
 
 typedef enum {
     CONST_NULL = 0,
@@ -32,6 +34,12 @@ typedef struct {
     char cacheDir[1024];
 } BytecodeCache;
 
+typedef struct {
+    JaiFunction* func;
+    CompiledFunc* compiled;
+    uint64_t bodyHash;
+} BundleEntry;
+
 extern BytecodeCache gBytecodeCache;
 
 void cacheInit(const char* baseDir);
@@ -48,5 +56,8 @@ CompiledFunc* deserializeFunc(uint8_t* data, size_t size);
 
 bool cacheIsValid(const char* sourceFile, uint64_t cachedHash);
 bool ensureCacheDir(const char* baseDir);
+
+bool saveJaicBundle(const char* bundlePath, BundleEntry* entries, int count, const char* entryName, uint64_t sourceHash);
+bool loadJaicBundle(const char* bundlePath, Module* module, char* entryOut, size_t entryOutSize, uint64_t* sourceHashOut);
 
 #endif

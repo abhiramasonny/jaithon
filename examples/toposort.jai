@@ -1,7 +1,7 @@
 
-import lib/modules/ds/queue
-import lib/modules/ds/hashmap
-import lib/modules/ds/vector
+import ds/queue
+import ds/hashmap
+import ds/vector
 
 func addNode(graph, indegree, node)
     if graph.get(node) == null

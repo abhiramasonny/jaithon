@@ -1,8 +1,10 @@
 #include "runtime.h"
 #include <stdarg.h>
 #include <strings.h>
+#include "../lang/parser.h"
 
 Runtime runtime;
+char gExecDir[1024] = {0};
 
 Value makeNumber(double n) {
     Value v;
@@ -145,6 +147,7 @@ Value makeFile(FILE* f) {
 
 void initRuntime(void) {
     memset(&runtime, 0, sizeof(Runtime));
+    gExecDir[0] = '\0';
     
     runtime.moduleCapacity = INITIAL_CAPACITY;
     runtime.modules = malloc(sizeof(Module*) * runtime.moduleCapacity);
@@ -166,11 +169,17 @@ void initRuntime(void) {
     runtime.currentModule = NULL;
     runtime.debug = false;
     runtime.shellMode = false;
+    runtime.compileOnly = false;
     runtime.lineNumber = 1;
     runtime.callStackSize = 0;
     
     Module* main = createModule("__main__", "");
     runtime.currentModule = main;
+}
+
+void setExecDir(const char* dir) {
+    if (!dir) return;
+    strncpy(gExecDir, dir, sizeof(gExecDir) - 1);
 }
 
 static void freeFunction(JaiFunction* f) {
@@ -537,6 +546,35 @@ bool hasVariable(const char* name) {
     return false;
 }
 
+bool deleteVariable(const char* name) {
+    Module* m = runtime.currentModule;
+    if (m) {
+        for (int i = 0; i < m->varCount; i++) {
+            if (strcmp(m->variables[i].name, name) == 0) {
+                for (int j = i + 1; j < m->varCount; j++) {
+                    m->variables[j - 1] = m->variables[j];
+                }
+                m->varCount--;
+                return true;
+            }
+        }
+    }
+    
+    if (runtime.moduleCount > 1) {
+        Module* global = runtime.modules[0];
+        for (int i = 0; i < global->varCount; i++) {
+            if (strcmp(global->variables[i].name, name) == 0) {
+                for (int j = i + 1; j < global->varCount; j++) {
+                    global->variables[j - 1] = global->variables[j];
+                }
+                global->varCount--;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 JaiFunction* defineFunction(const char* name, char** params, int paramCount, bool isVariadic, const char* body) {
     Module* m = runtime.currentModule;
     if (!m) {
@@ -563,9 +601,15 @@ JaiFunction* defineFunction(const char* name, char** params, int paramCount, boo
     f->body = strdup(body);
     f->module = m;
     f->namespace = NULL;
+    f->bodyHash = 0;
+    f->hasBodyHash = false;
     strncpy(f->returnType, "var", MAX_NAME_LEN - 1);
     f->returnType[MAX_NAME_LEN - 1] = '\0';
     f->freed = false;
+    
+    uint64_t h = functionBodyHash(f);
+    f->bodyHash = h;
+    f->hasBodyHash = true;
     
     setVariable(name, makeFunction(f));
     
@@ -618,6 +662,17 @@ Value arrayPop(JaiArray* arr) {
         return makeNull();
     }
     return arr->items[--arr->length];
+}
+
+void arrayDelete(JaiArray* arr, int index) {
+    if (index < 0 || index >= arr->length) {
+        runtimeError("Array index out of bounds: %d", index);
+        return;
+    }
+    for (int i = index + 1; i < arr->length; i++) {
+        arr->items[i - 1] = arr->items[i];
+    }
+    arr->length--;
 }
 
 int arrayLen(JaiArray* arr) {

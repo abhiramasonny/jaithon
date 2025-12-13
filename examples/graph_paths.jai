@@ -1,5 +1,5 @@
-import lib/modules/ds/queue
-import lib/modules/core/string
+import ds/queue
+import core/string
 
 public int findIndex(var arr, var value)
     int i = 0

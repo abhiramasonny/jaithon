@@ -1,5 +1,5 @@
-import lib/modules/ds/array
-import lib/modules/gui/window
+import ds/array
+import gui/window
 
 func newCanvas(w, h)
     var pixels = arrayFill(w * h, 0)

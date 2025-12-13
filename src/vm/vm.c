@@ -195,6 +195,16 @@ InterpretResult vmExecute(VM* vm) {
     
     vm->running = true;
     
+    static bool traceVM = false;
+    static bool traceChecked = false;
+    if (!traceChecked) {
+        const char* env = getenv("JAITHON_TRACE_VM");
+        if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+            traceVM = true;
+        }
+        traceChecked = true;
+    }
+    
     while (vm->running) {
         #ifdef DEBUG_TRACE
         printf("          ");
@@ -206,6 +216,9 @@ InterpretResult vmExecute(VM* vm) {
         #endif
         
         uint8_t instruction = readByte(frame);
+        if (traceVM) {
+            fprintf(stderr, "[VM] op=%d sp=%ld\n", instruction, (long)(vm->stackTop - vm->stack));
+        }
         
         switch (instruction) {
             case OP_CONST: {
@@ -254,6 +267,19 @@ InterpretResult vmExecute(VM* vm) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 setVariable(nameVal.as.string, vmPeek(vm, 0));
+                break;
+            }
+
+            case OP_DEL_GLOBAL: {
+                Value nameVal = readConstant(frame);
+                if (nameVal.type != VAL_STRING) {
+                    fprintf(stderr, "VM Error: Global name must be string\n");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                if (!deleteVariable(nameVal.as.string)) {
+                    fprintf(stderr, "VM Error: Name '%s' not found for deletion\n", nameVal.as.string);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 break;
             }
             
@@ -548,6 +574,21 @@ InterpretResult vmExecute(VM* vm) {
                 vmPush(vm, makeNumber(arr.as.array->length));
                 break;
             }
+            
+            case OP_ARRAY_DEL: {
+                Value index = vmPop(vm);
+                Value arr = vmPop(vm);
+                if (arr.type != VAL_ARRAY) {
+                    fprintf(stderr, "VM Error: Cannot delete index of non-array\n");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                if (!isNumericVM(index)) {
+                    fprintf(stderr, "VM Error: Array index must be number for delete\n");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                arrayDelete(arr.as.array, toIntVM(index));
+                break;
+            }
 
             case OP_NEW_OBJECT: {
                 Value classNameVal = readConstant(frame);
@@ -591,6 +632,29 @@ InterpretResult vmExecute(VM* vm) {
                 if (obj.type == VAL_OBJECT) {
                     Value field = objectGetField(obj.as.object, nameVal.as.string);
                     vmPush(vm, field);
+                } else if (obj.type == VAL_NAMESPACE) {
+                    JaiNamespace* ns = obj.as.namespace;
+                    bool found = false;
+                    for (int i = 0; i < ns->varCount; i++) {
+                        if (strcmp(ns->variables[i].name, nameVal.as.string) == 0) {
+                            vmPush(vm, ns->variables[i].value);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        for (int i = 0; i < ns->funcCount; i++) {
+                            if (strcmp(ns->functions[i]->name, nameVal.as.string) == 0) {
+                                vmPush(vm, makeFunction(ns->functions[i]));
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found) {
+                        fprintf(stderr, "VM Error: Namespace has no member '%s'\n", nameVal.as.string);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
                 } else {
                     fprintf(stderr, "VM Error: Cannot get field of non-object\n");
                     return INTERPRET_RUNTIME_ERROR;
@@ -637,6 +701,37 @@ InterpretResult vmExecute(VM* vm) {
                     
                     extern Value callValue(Value callee, Value* args, int argc);
                     Value result = callValue(makeFunction(method), args, argCount + 1);
+                    vmPush(vm, result);
+                } else if (obj.type == VAL_NAMESPACE) {
+                    JaiNamespace* ns = obj.as.namespace;
+                    JaiFunction* func = NULL;
+                    for (int i = 0; i < ns->funcCount; i++) {
+                        if (strcmp(ns->functions[i]->name, nameVal.as.string) == 0) {
+                            func = ns->functions[i];
+                            break;
+                        }
+                    }
+                    if (!func) {
+                        for (int i = 0; i < ns->varCount; i++) {
+                            if (strcmp(ns->variables[i].name, nameVal.as.string) == 0 &&
+                                ns->variables[i].value.type == VAL_FUNCTION) {
+                                func = ns->variables[i].value.as.function;
+                                break;
+                            }
+                        }
+                    }
+                    if (!func) {
+                        fprintf(stderr, "VM Error: Namespace has no function '%s'\n", nameVal.as.string);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    
+                    Value args[256];
+                    for (int i = argCount - 1; i >= 0; i--) {
+                        args[i] = vmPop(vm);
+                    }
+                    vmPop(vm); 
+                    extern Value callValue(Value callee, Value* args, int argc);
+                    Value result = callValue(makeFunction(func), args, argCount);
                     vmPush(vm, result);
                 } else {
                     fprintf(stderr, "VM Error: Cannot call method on non-object\n");

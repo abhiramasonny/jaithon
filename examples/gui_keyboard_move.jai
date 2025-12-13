@@ -1,6 +1,6 @@
-import lib/modules/gui/window
-import lib/modules/gui/keyboard
-import lib/modules/ds/array
+import gui/window
+import gui/keyboard
+import ds/array
 
 public static void main()
     var win = new Window()

@@ -56,6 +56,8 @@ struct JaiFunction {
     char* body;
     Module* module;
     JaiNamespace* namespace;
+    uint64_t bodyHash;
+    bool hasBodyHash;
     char returnType[MAX_NAME_LEN];
     bool freed;
 };
@@ -200,6 +202,7 @@ typedef struct {
     int classCapacity;
     bool debug;
     bool shellMode;
+    bool compileOnly;
     int lineNumber;
     char callStack[MAX_CALL_STACK][MAX_NAME_LEN];
     int callStackSize;
@@ -207,6 +210,7 @@ typedef struct {
 } Runtime;
 
 extern Runtime runtime;
+extern char gExecDir[1024];
 
 Value makeNumber(double n);
 Value makeDouble(double n);
@@ -228,6 +232,7 @@ Value makeFile(FILE* f);
 Value makeNamespace(const char* name);
 
 void initRuntime(void);
+void setExecDir(const char* dir);
 void freeRuntime(void);
 
 void subscribe(const char* eventName, EventHandler handler);
@@ -245,6 +250,7 @@ void setVariable(const char* name, Value value);
 void setTypedVariable(const char* name, Value value, const char* typeName);
 Value getVariable(const char* name);
 bool hasVariable(const char* name);
+bool deleteVariable(const char* name);
 
 JaiFunction* defineFunction(const char* name, char** params, int paramCount, bool isVariadic, const char* body);
 JaiFunction* findFunction(const char* name);
@@ -254,6 +260,7 @@ void arrayPush(JaiArray* arr, Value val);
 Value arrayGet(JaiArray* arr, int index);
 void arraySet(JaiArray* arr, int index, Value val);
 Value arrayPop(JaiArray* arr);
+void arrayDelete(JaiArray* arr, int index);
 int arrayLen(JaiArray* arr);
 
 JaiClass* defineClass(const char* name, JaiClass* parent);

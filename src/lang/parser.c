@@ -7,6 +7,8 @@
 #include "../vm/compiler.h"
 #include "../vm/bytecode.h"
 #include "../core/parallel.h"
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define MAX_STATEMENTS 64
 #define MAX_INFIXES 64
@@ -59,7 +61,10 @@ typedef struct {
 static FailedFuncEntry failedFuncs[MAX_FAILED_FUNCS];
 static int failedFuncCount = 0;
 
-static uint64_t hashFunctionSignature(const JaiFunction* f) {
+uint64_t functionBodyHash(const JaiFunction* f) {
+    if (!f) return 0;
+    if (f->hasBodyHash) return f->bodyHash;
+    
     uint64_t h = hashSource(f->body ? f->body : "");
     h ^= (uint64_t)f->paramCount + 0x9e3779b97f4a7c15ULL;
     if (f->isVariadic) {
@@ -72,11 +77,15 @@ static uint64_t hashFunctionSignature(const JaiFunction* f) {
             h *= 1099511628211ULL;
         }
     }
+    
+    JaiFunction* mutable = (JaiFunction*)f;
+    mutable->bodyHash = h;
+    mutable->hasBodyHash = true;
     return h;
 }
 
-static CompiledFunc* getCompiledFunc(JaiFunction* f) {
-    if (!f || !f->body) return NULL;
+CompiledFunc* getCompiledFunc(JaiFunction* f) {
+    if (!f) return NULL;
     
     static bool checkedEnv = false;
     static bool enableVMCompile = true;
@@ -97,7 +106,7 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
     }
     if (!enableVMCompile) return NULL;
     
-    uint64_t hash = hashFunctionSignature(f);
+    uint64_t hash = functionBodyHash(f);
 
     for (int i = 0; i < failedFuncCount; i++) {
         if (strcmp(failedFuncs[i].name, f->name) == 0 &&
@@ -117,6 +126,10 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
             statsCacheHits++;
             return compiledFuncs[i].compiled;
         }
+    }
+    
+    if (!f->body) {
+        return NULL;
     }
     
     
@@ -154,6 +167,21 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
     if (!compiled) {
         Token* tokens = NULL;
         int tokenCount = tokenizeSource(f->body, &tokens);
+        static bool tokenDebug = false;
+        static bool tokenChecked = false;
+        if (!tokenChecked) {
+            const char* env = getenv("JAITHON_TOKEN_DEBUG");
+            if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+                tokenDebug = true;
+            }
+            tokenChecked = true;
+        }
+        if (tokenDebug) {
+            fprintf(stderr, "[TOKEN_DEBUG] function %s tokenCount=%d\n", f->name, tokenCount);
+            for (int i = 0; i < tokenCount; i++) {
+                fprintf(stderr, "  %d: kind=%d line=%d text=%s\n", i, tokens[i].kind, tokens[i].line, tokens[i].strValue);
+            }
+        }
         if (!tokens || tokenCount == 0) {
             if (tokens) free(tokens);
             return NULL;
@@ -218,6 +246,44 @@ static CompiledFunc* getCompiledFunc(JaiFunction* f) {
     return compiled;
 }
 
+bool registerCompiledFunction(JaiFunction* f, CompiledFunc* compiled, uint64_t bodyHash) {
+    if (!f || !compiled) return false;
+    
+    f->bodyHash = bodyHash;
+    f->hasBodyHash = true;
+    
+    for (int i = 0; i < compiledFuncCount; i++) {
+        if (strcmp(compiledFuncs[i].name, f->name) == 0 &&
+            compiledFuncs[i].paramCount == f->paramCount &&
+            compiledFuncs[i].isVariadic == f->isVariadic) {
+            compiledFuncs[i].compiled = compiled;
+            compiledFuncs[i].bodyHash = bodyHash;
+            return true;
+        }
+    }
+    
+    if (compiledFuncCount >= MAX_COMPILED_FUNCS) {
+        return false;
+    }
+    
+    compiled->arity = f->paramCount;
+    compiled->isVariadic = f->isVariadic;
+    if (f->paramCount > 0 && !compiled->paramNames) {
+        compiled->paramNames = malloc(sizeof(char*) * f->paramCount);
+        for (int i = 0; i < f->paramCount; i++) {
+            compiled->paramNames[i] = strdup(f->params[i]);
+        }
+    }
+    
+    strncpy(compiledFuncs[compiledFuncCount].name, f->name, MAX_NAME_LEN - 1);
+    compiledFuncs[compiledFuncCount].paramCount = f->paramCount;
+    compiledFuncs[compiledFuncCount].isVariadic = f->isVariadic;
+    compiledFuncs[compiledFuncCount].bodyHash = bodyHash;
+    compiledFuncs[compiledFuncCount].compiled = compiled;
+    compiledFuncCount++;
+    return true;
+}
+
 static StatementEntry statements[MAX_STATEMENTS];
 static int statementCount = 0;
 
@@ -226,9 +292,43 @@ static int infixCount = 0;
 
 static Value returnValue;
 static bool hasReturn = false;
+static bool eagerCompile = true;
+static bool eagerStrict = false;
+static bool eagerInit = false;
 
+static bool startsWithJavaStyleDecl(Lexer* lex);
 static Value convertToTypeName(Value v, const char* typeName);
 static Value defaultValueForType(const char* typeName);
+
+static bool isDefinitionStart(Lexer* lex) {
+    int k = lex->currentToken.kind;
+    if (k == getKW_VAR()) return true;
+    if (startsWithJavaStyleDecl(lex)) return true;
+    if (k == getKW_FUNC() || k == getKW_CLASS() || k == getKW_NAMESPACE() || k == getKW_IMPORT()) return true;
+    if (k == getKW_PUBLIC() || k == getKW_PRIVATE() || k == getKW_PROTECTED() || k == getKW_STATIC()) return true;
+    return false;
+}
+
+static void skipStatementNoExec(Lexer* lex) {
+    int depth = 0;
+    while (!lexerCheck(lex, TK_EOF)) {
+        int k = lex->currentToken.kind;
+        if (k == getKW_IF() || k == getKW_WHILE()) {
+            depth++;
+        } else if (k == getKW_END()) {
+            if (depth == 0) {
+                lexerNext(lex);
+                break;
+            }
+            depth = depth > 0 ? depth - 1 : 0;
+        }
+        if (k == TK_NEWLINE && depth == 0) {
+            lexerNext(lex);
+            break;
+        }
+        lexerNext(lex);
+    }
+}
 
 void registerStatement(int keyword, StatementHandler handler) {
     if (statementCount >= MAX_STATEMENTS) {
@@ -284,8 +384,7 @@ static bool isModifierToken(int kind) {
 }
 
 static bool isTypeToken(int kind) {
-    return kind == TK_IDENTIFIER ||
-           kind == getKW_VAR() ||
+    return kind == getKW_VAR() ||
            kind == getKW_VOID() ||
            kind == getKW_INT() ||
            kind == getKW_DOUBLE() ||
@@ -1813,6 +1912,180 @@ static bool isNameToken(Lexer* lex) {
     return k == TK_IDENTIFIER || k >= TK_KEYWORD;
 }
 
+static bool pathExists(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool findModuleRecursive(const char* base, const char* targetFile, char* out, size_t outSize, int depth) {
+    if (depth > 4) return false;
+    DIR* dir = opendir(base);
+    if (!dir) return false;
+    struct dirent* ent;
+    bool found = false;
+    while (!found && (ent = readdir(dir))) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char candidate[1024];
+        snprintf(candidate, sizeof(candidate), "%s/%s", base, ent->d_name);
+        struct stat st;
+        if (stat(candidate, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found = findModuleRecursive(candidate, targetFile, out, outSize, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            if (strcmp(ent->d_name, targetFile) == 0) {
+                strncpy(out, candidate, outSize - 1);
+                out[outSize - 1] = '\0';
+                found = true;
+            }
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+static bool resolveModulePath(const char* modulePath, char* outPath, size_t outSize) {
+    static bool importDebug = false;
+    static bool importDebugChecked = false;
+    if (!importDebugChecked) {
+        const char* env = getenv("JAITHON_IMPORT_DEBUG");
+        if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+            importDebug = true;
+        }
+        importDebugChecked = true;
+    }
+    if (importDebug) {
+        fprintf(stderr, "[IMPORT] resolving %s (execDir=%s)\n", modulePath, gExecDir);
+    }
+    const char* envLib = getenv("JAITHON_LIB");
+    const char* envBase = (envLib && strlen(envLib) > 0) ? envLib : "";
+    const char* execBase = strlen(gExecDir) > 0 ? gExecDir : "";
+    const char* bases[] = {
+        "",
+        envBase,
+        execBase,
+        "lib/modules",
+        "/usr/local/share/jaithon",
+        "/usr/local/lib/jaithon",
+        "/Library/Jaithon",
+        "/opt/homebrew/share/jaithon",
+        NULL
+    };
+    
+    char targetFile[512];
+    snprintf(targetFile, sizeof(targetFile), "%s.jai", modulePath);
+    char targetShort[512];
+    const char* lastSlash = strrchr(modulePath, '/');
+    const char* tail = lastSlash ? lastSlash + 1 : modulePath;
+    snprintf(targetShort, sizeof(targetShort), "%s.jai", tail);
+    bool hasSlash = strchr(modulePath, '/') != NULL;
+    
+    for (int i = 0; bases[i]; i++) {
+        const char* base = bases[i];
+        if (!base) continue;
+        bool baseEmpty = strlen(base) == 0;
+        const char* altBase = base;
+        char altBuf[1024];
+        if (!baseEmpty && base[0] != '/' && strlen(gExecDir) > 0) {
+            snprintf(altBuf, sizeof(altBuf), "%s/%s", gExecDir, base);
+            altBase = altBuf;
+        }
+        if (importDebug) {
+            fprintf(stderr, "[IMPORT] base='%s' alt='%s' module='%s'\n", base, altBase, modulePath);
+        }
+        
+        if (hasSlash) {
+            if (baseEmpty) {
+                if (snprintf(outPath, outSize, "%s.jai", modulePath) < (int)outSize && pathExists(outPath)) {
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/index.jai", modulePath) < (int)outSize && pathExists(outPath)) {
+                    return true;
+                }
+            } else {
+                if (snprintf(outPath, outSize, "%s/%s.jai", base, modulePath) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/%s/index.jai", base, modulePath) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/%s.jai", altBase, modulePath) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/%s/index.jai", altBase, modulePath) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+            }
+        } else {
+            if (baseEmpty) {
+                if (snprintf(outPath, outSize, "%s", targetFile) < (int)outSize && pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/index.jai", modulePath) < (int)outSize && pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (findModuleRecursive(".", targetFile, outPath, outSize, 0)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+            } else {
+                if (snprintf(outPath, outSize, "%s/%s", base, targetFile) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/%s/index.jai", base, modulePath) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (findModuleRecursive(base, targetFile, outPath, outSize, 0)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/%s", altBase, targetFile) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (snprintf(outPath, outSize, "%s/%s/index.jai", altBase, modulePath) < (int)outSize &&
+                    pathExists(outPath)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+                if (findModuleRecursive(altBase, targetFile, outPath, outSize, 0)) {
+                    if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+                    return true;
+                }
+            }
+        }
+    }
+    if (strlen(gExecDir) > 0) {
+        char start[1024];
+        snprintf(start, sizeof(start), "%s/lib/modules", gExecDir);
+        if (findModuleRecursive(start, hasSlash ? targetShort : targetFile, outPath, outSize, 0)) {
+            if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+            return true;
+        }
+        if (findModuleRecursive(gExecDir, hasSlash ? targetShort : targetFile, outPath, outSize, 0)) {
+            if (importDebug) fprintf(stderr, "[IMPORT] %s -> %s\n", modulePath, outPath);
+            return true;
+        }
+    }
+    if (importDebug) fprintf(stderr, "[IMPORT] %s -> not found\n", modulePath);
+    
+    return false;
+}
+
 static Value stmtImport(Lexer* lex) {
     lexerExpect(lex, getKW_IMPORT());
     
@@ -1849,21 +2122,13 @@ static Value stmtImport(Lexer* lex) {
     }
     
     char path[1024];
-    if (snprintf(path, sizeof(path), "%s.jai", modulePath) >= (int)sizeof(path)) {
-        runtimeError("Module path too long");
+    if (!resolveModulePath(modulePath, path, sizeof(path))) {
+        runtimeError("Cannot open module: %s.jai", modulePath);
         return makeNull();
     }
-    
     FILE* f = fopen(path, "r");
     if (!f) {
-        const char* libroot = getenv("JAITHON_LIB");
-        if (libroot) {
-            snprintf(path, sizeof(path), "%s/%s.jai", libroot, modulePath);
-            f = fopen(path, "r");
-        }
-    }
-    if (!f) {
-        runtimeError("Cannot open module: %s.jai", modulePath);
+        runtimeError("Cannot open module: %s", path);
         return makeNull();
     }
     
@@ -1885,6 +2150,9 @@ static Value stmtImport(Lexer* lex) {
     Lexer modLex;
     lexerInit(&modLex, code);
     parseProgram(&modLex);
+    if (eagerCompileEnabled()) {
+        compileModuleFunctions(newMod, eagerCompileStrict());
+    }
     
     free(code);
     
@@ -1966,10 +2234,98 @@ static Value stmtSystem(Lexer* lex) {
     return makeNumber(ret);
 }
 
+bool eagerCompileEnabled(void) {
+    if (!eagerInit) {
+        const char* envOff = getenv("JAITHON_NO_EAGER");
+        const char* envOn = getenv("JAITHON_EAGER");
+        const char* envStrict = getenv("JAITHON_EAGER_STRICT");
+        if (envOff && (strcmp(envOff, "1") == 0 || strcasecmp(envOff, "true") == 0)) {
+            eagerCompile = false;
+        }
+        if (envOn && (strcmp(envOn, "1") == 0 || strcasecmp(envOn, "true") == 0)) {
+            eagerCompile = true;
+        }
+        if (envStrict && (strcmp(envStrict, "1") == 0 || strcasecmp(envStrict, "true") == 0)) {
+            eagerStrict = true;
+        }
+        eagerInit = true;
+    }
+    return eagerCompile;
+}
+
+bool eagerCompileStrict(void) {
+    eagerCompileEnabled();
+    return eagerStrict;
+}
+
+bool compileModuleFunctions(Module* mod, bool strict) {
+    if (!mod) return true;
+    static bool eagerDebug = false;
+    static bool debugInit = false;
+    if (!debugInit) {
+        const char* env = getenv("JAITHON_EAGER_DEBUG");
+        if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) {
+            eagerDebug = true;
+        }
+        debugInit = true;
+    }
+    for (int i = 0; i < mod->funcCount; i++) {
+        JaiFunction* f = mod->functions[i];
+        if (!f || !f->body) continue;
+        CompiledFunc* c = getCompiledFunc(f);
+        if (!c) {
+            if (strict) {
+                runtimeError("Failed to compile '%s' in module '%s'", f->name, mod->name);
+                return false;
+            }
+            if (eagerDebug) {
+                fprintf(stderr, "[EAGER] fallback to interpreter: %s\n", f->name);
+            }
+        } else if (eagerDebug) {
+            fprintf(stderr, "[EAGER] compiled: %s\n", f->name);
+        }
+    }
+    return true;
+}
+
+static Value stmtDel(Lexer* lex) {
+    lexerExpect(lex, getKW_DEL());
+    if (!lexerCheck(lex, TK_IDENTIFIER)) {
+        runtimeError("Expected identifier after 'del'");
+        return makeNull();
+    }
+    char name[MAX_NAME_LEN];
+    strcpy(name, lex->currentToken.strValue);
+    lexerNext(lex);
+    
+    if (lexerMatch(lex, TK_LBRACKET)) {
+        Value index = parseExpression(lex);
+        lexerExpect(lex, TK_RBRACKET);
+        
+        Value arr = getVariable(name);
+        if (arr.type != VAL_ARRAY) {
+            runtimeError("Cannot delete index of non-array '%s'", name);
+            return makeNull();
+        }
+        arrayDelete(arr.as.array, (int)toNumber(index));
+        return makeNull();
+    }
+    
+    if (!deleteVariable(name)) {
+        runtimeError("Name '%s' not found for deletion", name);
+    }
+    return makeNull();
+}
+
 Value parseStatement(Lexer* lex) {
     skipNewlines(lex);
     
     if (lexerCheck(lex, TK_EOF)) {
+        return makeNull();
+    }
+
+    if (runtime.compileOnly && !isDefinitionStart(lex)) {
+        skipStatementNoExec(lex);
         return makeNull();
     }
 
@@ -2686,6 +3042,7 @@ void initParser(void) {
     registerStatement(getKW_INPUT(), stmtInput);
     registerStatement(getKW_BREAK(), stmtBreak);
     registerStatement(getKW_SYSTEM(), stmtSystem);
+    registerStatement(getKW_DEL(), stmtDel);
     registerStatement(getKW_CLASS(), stmtClass);
     registerStatement(getKW_NAMESPACE(), stmtNamespace);
     registerStatement(getKW_PUBLIC(), stmtJavaStyleDecl);

@@ -1,4 +1,4 @@
-import lib/modules/gui/window
+import gui/window
 
 public static void main()
     int width = 400

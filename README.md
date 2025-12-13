@@ -28,6 +28,12 @@ cd jaithon
 make
 ```
 
+### macOS install to system paths
+
+```bash
+./scripts/install_macos.sh   # copies jaithon to /usr/local/bin and libs to /usr/local/share/jaithon
+```
+
 ### Running Programs
 
 ```bash
@@ -40,6 +46,10 @@ make
 # View options
 ./jaithon -h
 ```
+
+### Module search paths
+
+Imports are resolved from the current directory, `$JAITHON_LIB`, the Jaithon install dir, and common macOS prefixes (`/usr/local/share/jaithon`, `/usr/local/lib/jaithon`, `/Library/Jaithon`, `/opt/homebrew/share/jaithon`).
 
 ### Command Line Options
 

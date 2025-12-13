@@ -1,7 +1,7 @@
 
-import lib/modules/ds/hashmap
-import lib/modules/ds/vector
-import lib/modules/core/string
+import ds/hashmap
+import ds/vector
+import core/string
 
 func prompt()
     print "todo> "

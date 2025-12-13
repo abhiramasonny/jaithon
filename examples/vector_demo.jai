@@ -1,4 +1,4 @@
-import lib/modules/ds/vector
+import ds/vector
 
 func main()
     var v = vector()

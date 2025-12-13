@@ -25,7 +25,7 @@
 # 4
 # -1
 
-import lib/modules/ds/array
+import ds/array
 
 func doubleVal(x)
     return x * 2
