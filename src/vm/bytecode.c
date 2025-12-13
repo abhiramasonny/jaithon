@@ -115,7 +115,7 @@ static void writeString(uint8_t** ptr, const char* str) {
     *ptr += len;
 }
 
-//read helpers
+
 static uint8_t readU8(uint8_t** ptr) {
     return *(*ptr)++;
 }

@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include <stdarg.h>
+#include <strings.h>
 
 Runtime runtime;
 
@@ -7,6 +8,55 @@ Value makeNumber(double n) {
     Value v;
     v.type = VAL_NUMBER;
     v.as.number = n;
+    return v;
+}
+
+Value makeDouble(double n) {
+    Value v;
+    v.type = VAL_DOUBLE;
+    v.as.f64 = n;
+    return v;
+}
+
+Value makeFloat(float f) {
+    Value v;
+    v.type = VAL_FLOAT;
+    v.as.f32 = f;
+    return v;
+}
+
+Value makeInt(int32_t i) {
+    Value v;
+    v.type = VAL_INT;
+    v.as.i32 = i;
+    return v;
+}
+
+Value makeLong(int64_t i) {
+    Value v;
+    v.type = VAL_LONG;
+    v.as.i64 = i;
+    return v;
+}
+
+Value makeShort(int16_t i) {
+    Value v;
+    v.type = VAL_SHORT;
+    v.as.i16 = i;
+    return v;
+}
+
+Value makeByte(int8_t i) {
+    Value v;
+    v.type = VAL_BYTE;
+    v.as.i8 = i;
+    return v;
+}
+
+Value makeChar(char c) {
+    Value v;
+    v.type = VAL_CHAR;
+    v.as.ch = c;
     return v;
 }
 
@@ -44,14 +94,14 @@ Value makeNativeFunc(NativeFunc f) {
     return v;
 }
 
-//cons cell (pair)
+
 Value makeCell(void) {
     Value v;
     v.type = VAL_CELL;
     v.as.cell = malloc(sizeof(JaiCell));
     v.as.cell->car = malloc(sizeof(Value));
     v.as.cell->cdr = malloc(sizeof(Value));
-    *v.as.cell->car = makeNull(); //car and cdr initialized to null
+    *v.as.cell->car = makeNull(); 
     *v.as.cell->cdr = makeNull();
     return v;
 }
@@ -76,7 +126,7 @@ Value makeObject(JaiClass* class) {
     v.as.object->fields = malloc(sizeof(Value) * v.as.object->fieldCapacity);
     v.as.object->fieldNames = malloc(sizeof(char*) * v.as.object->fieldCapacity);
     
-    if (class) { //default from class
+    if (class) { 
         for (int i = 0; i < class->fieldCount; i++) {
             v.as.object->fieldNames[i] = strdup(class->fieldNames[i]);
             v.as.object->fields[i] = makeNull();
@@ -125,16 +175,24 @@ void initRuntime(void) {
 
 static void freeFunction(JaiFunction* f) {
     if (!f) return;
+    if (f->freed) return;
+    f->freed = true;
     if (f->body) free(f->body);
     for (int i = 0; i < f->paramCount; i++) {
         if (f->params[i]) free(f->params[i]);
+        if (f->paramTypes && f->paramTypes[i]) {
+            free(f->paramTypes[i]);
+        }
     }
+    if (f->paramTypes) free(f->paramTypes);
     if (f->params) free(f->params);
     free(f);
 }
 
 static void freeNamespace(JaiNamespace* ns) {
     if (!ns) return;
+    if (ns->freed) return;
+    ns->freed = true;
     for (int i = 0; i < ns->varCount; i++) {
         if (ns->variables[i].value.type == VAL_STRING && ns->variables[i].value.as.string) {
             free(ns->variables[i].value.as.string);
@@ -174,36 +232,7 @@ static void freeModule(Module* m) {
 }
 
 void freeRuntime(void) {
-    for (int i = 0; i < runtime.moduleCount; i++) {
-        freeModule(runtime.modules[i]);
-    }
-    if (runtime.modules) free(runtime.modules);
     
-    for (int i = 0; i < runtime.classCount; i++) {
-        JaiClass* c = runtime.classes[i];
-        if (c) {
-            for (int j = 0; j < c->fieldCount; j++) {
-                if (c->fieldNames[j]) free(c->fieldNames[j]);
-            }
-            if (c->fieldNames) free(c->fieldNames);
-            for (int j = 0; j < c->methodCount; j++) {
-                if (c->methodNames[j]) free(c->methodNames[j]);
-            }
-            if (c->methodNames) free(c->methodNames);
-            if (c->methods) free(c->methods);
-            free(c);
-        }
-    }
-    if (runtime.classes) free(runtime.classes);
-    
-    if (runtime.keywords.entries) free(runtime.keywords.entries);
-    
-    for (int i = 0; i < runtime.eventBus.subCount; i++) {
-        if (runtime.eventBus.subscriptions[i].handlers) {
-            free(runtime.eventBus.subscriptions[i].handlers);
-        }
-    }
-    if (runtime.eventBus.subscriptions) free(runtime.eventBus.subscriptions);
 }
 
 static Subscription* findSubscription(const char* eventName) {
@@ -292,6 +321,10 @@ Module* createModule(const char* name, const char* path) {
     strncpy(m->path, path, MAX_NAME_LEN - 1);
     m->varCapacity = INITIAL_CAPACITY;
     m->variables = malloc(sizeof(Variable) * m->varCapacity);
+    for (int i = 0; i < m->varCapacity; i++) {
+        m->variables[i].name[0] = '\0';
+        m->variables[i].declaredType[0] = '\0';
+    }
     m->varCount = 0;
     m->funcCapacity = INITIAL_CAPACITY;
     m->functions = malloc(sizeof(JaiFunction*) * m->funcCapacity);
@@ -309,6 +342,74 @@ Module* findModule(const char* name) {
     return NULL;
 }
 
+static double valueToNumber(Value v) {
+    switch (v.type) {
+        case VAL_NUMBER: return v.as.number;
+        case VAL_DOUBLE: return v.as.f64;
+        case VAL_FLOAT: return v.as.f32;
+        case VAL_INT: return (double)v.as.i32;
+        case VAL_LONG: return (double)v.as.i64;
+        case VAL_SHORT: return (double)v.as.i16;
+        case VAL_BYTE: return (double)v.as.i8;
+        case VAL_CHAR: return (double)v.as.ch;
+        case VAL_BOOL: return v.as.boolean ? 1.0 : 0.0;
+        case VAL_STRING: return v.as.string ? strtod(v.as.string, NULL) : 0.0;
+        default: return 0.0;
+    }
+}
+
+static bool valueToBool(Value v) {
+    switch (v.type) {
+        case VAL_BOOL: return v.as.boolean;
+        case VAL_STRING: return v.as.string && strlen(v.as.string) > 0;
+        case VAL_NULL: return false;
+        case VAL_ARRAY: return v.as.array && v.as.array->length > 0;
+        default: return valueToNumber(v) != 0;
+    }
+}
+
+static Value convertToType(Value v, const char* typeName) {
+    if (!typeName || typeName[0] == '\0' || strcasecmp(typeName, "var") == 0) {
+        return v;
+    }
+    
+    if (strcasecmp(typeName, "int") == 0) {
+        return makeInt((int32_t)valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "long") == 0 || strcasecmp(typeName, "long long") == 0) {
+        return makeLong((int64_t)valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "short") == 0) {
+        return makeShort((int16_t)valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "byte") == 0) {
+        return makeByte((int8_t)valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "float") == 0) {
+        return makeFloat((float)valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "double") == 0 || strcasecmp(typeName, "number") == 0) {
+        return makeDouble(valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "char") == 0) {
+        if (v.type == VAL_STRING && v.as.string && strlen(v.as.string) > 0) {
+            return makeChar(v.as.string[0]);
+        }
+        return makeChar((char)(int)valueToNumber(v));
+    }
+    if (strcasecmp(typeName, "bool") == 0) {
+        return makeBool(valueToBool(v));
+    }
+    if (strcasecmp(typeName, "string") == 0) {
+        if (v.type == VAL_STRING) return v;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%g", valueToNumber(v));
+        return makeString(buf);
+    }
+    
+    return v;
+}
+
 void setVariable(const char* name, Value value) {
     Module* m = runtime.currentModule;
     if (!m) {
@@ -318,19 +419,74 @@ void setVariable(const char* name, Value value) {
     
     for (int i = 0; i < m->varCount; i++) {
         if (strcmp(m->variables[i].name, name) == 0) {
-            m->variables[i].value = value;
+            const char* targetType = m->variables[i].declaredType;
+            if (targetType[0] != '\0') {
+                m->variables[i].value = convertToType(value, targetType);
+            } else {
+                m->variables[i].value = value;
+            }
             return;
         }
     }
     
     if (m->varCount >= m->varCapacity) {
+        int oldCap = m->varCapacity;
         m->varCapacity *= GROWTH_FACTOR;
         m->variables = realloc(m->variables, sizeof(Variable) * m->varCapacity);
+        for (int i = oldCap; i < m->varCapacity; i++) {
+            m->variables[i].name[0] = '\0';
+            m->variables[i].declaredType[0] = '\0';
+            m->variables[i].value = makeNull();
+        }
     }
     
     Variable* var = &m->variables[m->varCount++];
     strncpy(var->name, name, MAX_NAME_LEN - 1);
+    var->name[MAX_NAME_LEN - 1] = '\0';
+    var->declaredType[0] = '\0';
     var->value = value;
+}
+
+void setTypedVariable(const char* name, Value value, const char* typeName) {
+    Module* m = runtime.currentModule;
+    if (!m) {
+        runtimeError("No current module");
+        return;
+    }
+    
+    for (int i = 0; i < m->varCount; i++) {
+        if (strcmp(m->variables[i].name, name) == 0) {
+            if (m->variables[i].declaredType[0] == '\0' && typeName) {
+                strncpy(m->variables[i].declaredType, typeName, MAX_NAME_LEN - 1);
+                m->variables[i].declaredType[MAX_NAME_LEN - 1] = '\0';
+            }
+            const char* targetType = m->variables[i].declaredType;
+            m->variables[i].value = convertToType(value, targetType);
+            return;
+        }
+    }
+    
+    if (m->varCount >= m->varCapacity) {
+        int oldCap = m->varCapacity;
+        m->varCapacity *= GROWTH_FACTOR;
+        m->variables = realloc(m->variables, sizeof(Variable) * m->varCapacity);
+        for (int i = oldCap; i < m->varCapacity; i++) {
+            m->variables[i].name[0] = '\0';
+            m->variables[i].declaredType[0] = '\0';
+            m->variables[i].value = makeNull();
+        }
+    }
+    
+    Variable* var = &m->variables[m->varCount++];
+    strncpy(var->name, name, MAX_NAME_LEN - 1);
+    var->name[MAX_NAME_LEN - 1] = '\0';
+    var->declaredType[0] = '\0';
+    if (typeName) {
+        strncpy(var->declaredType, typeName, MAX_NAME_LEN - 1);
+        var->declaredType[MAX_NAME_LEN - 1] = '\0';
+    }
+    const char* targetType = var->declaredType[0] ? var->declaredType : typeName;
+    var->value = convertToType(value, targetType);
 }
 
 Value getVariable(const char* name) {
@@ -399,12 +555,17 @@ JaiFunction* defineFunction(const char* name, char** params, int paramCount, boo
     f->paramCount = paramCount;
     f->paramCapacity = paramCount > 0 ? paramCount : INITIAL_CAPACITY;
     f->params = malloc(sizeof(char*) * f->paramCapacity);
+    f->paramTypes = NULL;
     f->isVariadic = isVariadic;
     for (int i = 0; i < paramCount; i++) {
         f->params[i] = strdup(params[i]);
     }
     f->body = strdup(body);
     f->module = m;
+    f->namespace = NULL;
+    strncpy(f->returnType, "var", MAX_NAME_LEN - 1);
+    f->returnType[MAX_NAME_LEN - 1] = '\0';
+    f->freed = false;
     
     setVariable(name, makeFunction(f));
     
@@ -416,6 +577,7 @@ JaiFunction* findFunction(const char* name) {
     if (!m) return NULL;
     
     for (int i = 0; i < m->funcCount; i++) {
+        if (!m->functions[i]) continue;
         if (strcmp(m->functions[i]->name, name) == 0) {
             return m->functions[i];
         }
@@ -623,6 +785,7 @@ Value makeNamespace(const char* name) {
     ns->funcCapacity = INITIAL_CAPACITY;
     ns->functions = malloc(sizeof(JaiFunction*) * ns->funcCapacity);
     ns->funcCount = 0;
+    ns->freed = false;
     
     Value v;
     v.type = VAL_NAMESPACE;

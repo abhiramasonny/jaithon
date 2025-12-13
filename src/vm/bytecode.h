@@ -6,31 +6,6 @@
 #include <stdbool.h>
 #include <time.h>
 
-// ============================================================================
-// .jaic Cache File Format
-// Header:
-//   Magic: "JAIC" (4 bytes)
-//   Version: uint16_t
-//   Source hash: uint64_t (for invalidation)
-//   Timestamp: int64_t (source file mtime)
-//   Num functions: uint32_t
-//
-// For each function:
-//   Name length: uint16_t
-//   Name: char[name_length]
-//   Arity: uint8_t
-//   Is variadic: uint8_t
-//   Num params: uint8_t
-//   For each param:
-//     Param name length: uint16_t
-//     Param name: char[length]
-//   Code length: uint32_t
-//   Code: uint8_t[code_length]
-//   Num constants: uint32_t
-//   For each constant:
-//     Type: uint8_t
-//     Value data (varies by type)
-// ============================================================================
 
 #define JAIC_MAGIC "JAIC"
 #define JAIC_VERSION 1

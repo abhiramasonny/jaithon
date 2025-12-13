@@ -1,1 +1,4 @@
+# Bytecode cache
 __jaicache__/
+*.jaic
+.DS_Store

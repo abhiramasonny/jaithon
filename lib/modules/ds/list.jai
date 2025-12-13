@@ -24,7 +24,6 @@ func isPair(x)
     return type(x) == "cell"
 end
 
-#list ops
 func list()
     return null
 end
@@ -132,7 +131,6 @@ func reverse(lst)
     return result
 end
 
-#functions
 func map(lst, f)
     if lst == null
         return null

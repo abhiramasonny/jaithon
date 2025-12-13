@@ -235,15 +235,15 @@ cp -r Extensions/jai ~/.vscode/extensions
 
 ## Examples
 
-See `Test/Jaithon/` for example programs:
+Great starting points live in `examples/`:
 
 | File | Description |
 |------|-------------|
-| `add.jai` | Basic addition |
-| `fib.jai` | Fibonacci sequence |
-| `calculator.jai` | Simple calculator |
-| `trig.jai` | Trigonometry |
-| `pi.jai` | Pi calculation |
+| `graph_paths.jai` | DFS/BFS path tracing |
+| `gui_snake.jai` | Simple GUI game built with the Metal module |
+| `todo.jai` | Minimal CLI task list showcasing arrays and functions |
+| `vector_demo.jai` | Dynamic vector operations |
+| `stack_queue_demo.jai` | Stack and queue utilities in one file |
 
 ---
 

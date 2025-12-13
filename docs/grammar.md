@@ -67,6 +67,36 @@ x = x + 1
 print x    # Outputs: 6
 ```
 
+### Java-style declarations (Java + Python hybrid)
+
+You can also declare variables and functions using a Java-like signature with explicit return/field types. Use `var` as the type when you want Python-style dynamic typing, and optionally place the declaration inside a namespace with `in <namespace>` (it will be created if missing).
+
+```
+int counter = 0
+long total = 0
+float ratio
+double piApprox = 3.14
+string name = "Abhi"
+char initial = "A"
+bool isReady = true
+byte small = 1
+short mid = 1000
+var cache in services = loadCache()
+
+public static void main in core()
+    print "hello"
+end
+
+private var add in math(int a, int b)
+    return a + b
+end
+
+# Larger types can be layered in modules:
+# BigInt can be bootstrapped from these primitives.
+```
+
+`public`, `private`, `protected`, and `static` are accepted for readability; they are not enforced at runtime yet but keep your code close to Java signatures.
+
 ---
 
 ## Data Types
@@ -773,4 +803,135 @@ print fact(6)               # 720
 print gcd(48, 18)           # 6
 print clamp(25, 0, 10)      # 10
 print isEven(42)            # true
+
+---
+
+## Quick Standard Library Guide
+
+### Math & Number Utilities
+- `max/min`, `max3/min3`, `clamp`, `sign`
+- Powers and roots: `pow`, `pow2`, `pow3`, `sqrt`, `cbrt`, `hypot`
+- Number theory: `gcd`, `lcm`, `isPrime`, `nextPrime`, `prevPrime`
+- Combinatorics: `fact`, `nPr`, `nCr`
+- Randomness: `rand`, `randInt(lo, hi)`, `randFloat(lo, hi)`, `randBool()`, `randChoice(arr)`, `shuffle(arr)`
+- Angles: `degToRad`, `radToDeg`
+
+### Strings
+- Basics: `len`, `charAt`, `substr`, `concat`, `repeat`
+- Queries: `startsWith`, `endsWith`, `contains_str`, `indexOf`
+- Case helpers: `upper`, `lower`
+- Replace/trim: `replace(hay, needle, repl)`, `trim`
+
+### Arrays (bootstrapped in `lib/modules/ds/array`)
+- Creation: `arrayFill(n, v)`, `arrayRange(start, stop)`
+- Accessors: `arrayLen`, `arrayGet`, `arraySet`
+- Bulk ops: `arrayConcat`, `arrayCopy`, `arraySlice`, `arrayReverse`
+- Higher order: `arrayMap(arr, f)`, `arrayFilter(arr, pred)`, `arrayReduce(arr, init, f)`
+- Queries: `arrayContains`, `arrayIndexOf`, `arrayMax`, `arrayMin`, `arraySum`
+
+### Data Structures
+- `Stack`, `Queue`, `Vector`, `LinkedList`, `BST`, `HashMap` (all defined in Jai; inspect `lib/modules/ds/` for methods).
+
+### Files & IO
+- `open(path, mode)`, `read(handle)`, `write(handle, data)`, `close(handle)`
+- Helpers: `readFile(path)`, `writeFile(path, data)`
+
+---
+
+## Namespaces and Modules Patterns
+
+- **Java-style declarations**:  
+  `public double area in Circle(double r)` declares a function inside namespace `Circle`. The namespace is created on demand.
+- **Block namespaces**:  
+  ```
+  namespace Metrics
+      var scale = 2
+      func mult(x) return x * scale end
+  end
+  ```
+- **Imports**: `import lib/modules/ds/array` brings helpers into the current module. Caller-defined symbols win if names collide.
+- **Stateful namespaces**: Keep namespace state in module-level variables and expose setters/getters to avoid accidental shadowing.
+
+---
+
+## Classes & Objects: Tips
+
+- Constructors are plain methods named `init(self, ...)` and are called automatically by `new`.
+- Methods always receive `self` when invoked with dot notation: `obj.method(1, 2)`.
+- Inheritance: `class Dog extends Animal` copies fields/methods; override by re-declaring the method.
+- Namespaced classes: you can declare `class Foo in Bar` using Java-style syntax if you want class names under a namespace.
+
+Example with composition and override:
+```
+class Animal
+    var name
+    func init(self, n) self.name = n end
+    func sound(self) return "..." end
+end
+
+class Dog extends Animal
+    func sound(self) return self.name + " barks" end
+end
+
+var d = new Dog("Rex")
+print d.sound()
+```
+
+---
+
+## Control Flow Edge Cases
+
+- `and` / `or` are short-circuiting. Only evaluate the right-hand side if needed.
+- `break` exits the nearest loop; nested loops require an outer condition to stop both.
+- Factorial `!` binds tightly: `2 * 3!` is `2 * (3!)`.
+
+---
+
+## Parallel & GPU (overview)
+
+- CLI flag `--threads=N` caps worker threads (auto-detect by default).
+- Parallel library entrypoints live in `lib/modules/parallel/*` (vectorized loops, reductions). When enabled, bytecode is analyzed and parallelized where safe; debug output reports how many loops were parallelized.
+- GPU path (Metal on macOS) is enabled by default for GUI and some parallel ops; disable with `--no-gpu`.
+
+---
+
+## GUI Quickstart (Metal)
+
+Minimal window:
+```
+import lib/modules/gui/window
+
+func main()
+    var win = new Window()
+    win.init(400, 300, "Hello")
+    while true
+        win.poll()
+        win.clear(rgb(30, 30, 40))
+        win.fillRect(180, 130, 40, 40, rgb(80, 200, 255))
+        win.display()
+        if not win.update() break end
+    end
+end
+
+main()
+```
+Keyboard helpers live in `lib/modules/gui/keyboard`; call `keyboardTick(win)` each frame to get newly-pressed keys.
+
+---
+
+## Testing & CLI Workflow
+
+- Run a file: `./jaithon path/to/file.jai`
+- Debug mode: `./jaithon -d file.jai` (prints symbol binds and timing).
+- REPL: `./jaithon`
+- Headless stdlib only: `./jaithon --no-stdlib` if you want a minimal environment.
+- Test suite samples live in `test/checks/`; add a file there and run it directly. Expected outputs are documented in comments at the top of each test.
+
+---
+
+## Troubleshooting
+
+- `VM Error: Cannot index non-array` usually means you indexed a non-array value; check you didn't shadow your array variable with a number.
+- Namespaces: prefer the Java-style `in Namespace` declarations if you need to call functions as `Namespace.fn()` without warnings.
+- GUI: if nothing draws, ensure `win.display()` is called before `win.update()` and that the loop calls `win.poll()` each frame.
 ```

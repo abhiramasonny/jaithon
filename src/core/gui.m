@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <ImageIO/ImageIO.h>
 #include "runtime.h"
 #include <mach/mach_time.h>
 
@@ -58,6 +59,14 @@ fragment float4 fragmentShader(VertexOut in [[stage_in]],
 }
 - (BOOL)wantsUpdateLayer { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)canBecomeKeyView { return YES; }
+- (void)keyDown:(NSEvent *)event {
+    
+    (void)event;
+}
+- (void)keyUp:(NSEvent *)event {
+    (void)event;
+}
 @end
 
 @interface JaiWindowDelegate : NSObject <NSWindowDelegate>
@@ -83,6 +92,7 @@ static int gWidth = 0;
 static int gHeight = 0;
 static bool gWindowOpen = false;
 static bool gKeyState[256] = {0};
+static bool gKeyHit[256] = {0}; 
 static bool gMouseState[3] = {0};
 static int gMouseX = 0;
 static int gMouseY = 0;
@@ -94,23 +104,46 @@ static mach_timebase_info_data_t gTimebaseInfo;
 static double gTargetFrameTime = 1.0 / 60.0;
 static int gTargetFPS = 60;
 
+
+static bool isNumeric(Value v) {
+    return v.type == VAL_NUMBER || v.type == VAL_DOUBLE || v.type == VAL_FLOAT ||
+           v.type == VAL_INT || v.type == VAL_LONG || v.type == VAL_SHORT ||
+           v.type == VAL_BYTE || v.type == VAL_CHAR;
+}
+
+
+static double toNum(Value v) {
+    switch (v.type) {
+        case VAL_NUMBER: return v.as.number;
+        case VAL_DOUBLE: return v.as.f64;
+        case VAL_FLOAT: return (double)v.as.f32;
+        case VAL_INT: return (double)v.as.i32;
+        case VAL_LONG: return (double)v.as.i64;
+        case VAL_SHORT: return (double)v.as.i16;
+        case VAL_BYTE: return (double)v.as.i8;
+        case VAL_CHAR: return (double)(unsigned char)v.as.ch;
+        case VAL_BOOL: return v.as.boolean ? 1.0 : 0.0;
+        default: return 0.0;
+    }
+}
+
 Value native_gui_init(Value* args, int argc) {
     if (argc < 3) {
         runtimeError("gui_init expects at least 3 arguments: width, height, title [, targetFPS]");
         return makeNull();
     }
     
-    if (args[0].type != VAL_NUMBER || args[1].type != VAL_NUMBER || args[2].type != VAL_STRING) {
+    if (!isNumeric(args[0]) || !isNumeric(args[1]) || args[2].type != VAL_STRING) {
         runtimeError("gui_init arguments must be (number, number, string)");
         return makeNull();
     }
     
-    gWidth = (int)args[0].as.number;
-    gHeight = (int)args[1].as.number;
+    gWidth = (int)toNum(args[0]);
+    gHeight = (int)toNum(args[1]);
     char* title = args[2].as.string;
     
-    if (argc >= 4 && args[3].type == VAL_NUMBER) {
-        gTargetFPS = (int)args[3].as.number;
+    if (argc >= 4 && isNumeric(args[3])) {
+        gTargetFPS = (int)toNum(args[3]);
         if (gTargetFPS > 0) {
             gTargetFrameTime = 1.0 / gTargetFPS;
         }
@@ -167,6 +200,7 @@ Value native_gui_init(Value* args, int argc) {
         
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp finishLaunching];
         
         NSRect frame = NSMakeRect(0, 0, gWidth, gHeight);
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
@@ -190,10 +224,11 @@ Value native_gui_init(Value* args, int argc) {
         gMetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         gMetalLayer.framebufferOnly = YES;
         gMetalLayer.drawableSize = CGSizeMake(gWidth, gHeight);
-        gMetalLayer.displaySyncEnabled = YES; //vsync
+        gMetalLayer.displaySyncEnabled = YES; 
         
         [gWindow setContentView:gView];
         [gWindow makeKeyAndOrderFront:nil];
+        [gWindow makeFirstResponder:gView];  
         [NSApp activateIgnoringOtherApps:YES];
         
         gWindowOpen = true;
@@ -212,9 +247,9 @@ Value native_gui_set_pixel(Value* args, int argc) {
         return makeBool(false);
     }
     
-    int x = (int)args[0].as.number;
-    int y = (int)args[1].as.number;
-    uint32_t color = (uint32_t)args[2].as.number;
+    int x = (int)toNum(args[0]);
+    int y = (int)toNum(args[1]);
+    uint32_t color = (uint32_t)toNum(args[2]);
     
     if (x < 0 || x >= gWidth || y < 0 || y >= gHeight) {
         return makeBool(false);
@@ -243,12 +278,12 @@ Value native_gui_clear(Value* args, int argc) {
         return makeBool(false);
     }
     
-    uint32_t color = (uint32_t)args[0].as.number;
+    uint32_t color = (uint32_t)toNum(args[0]);
     int r = (color >> 16) & 0xFF;
     int g = (color >> 8) & 0xFF;
     int b = (color) & 0xFF;
     
-    uint32_t pixel = (255 << 24) | (b << 16) | (g << 8) | r;//abgr
+    uint32_t pixel = (255 << 24) | (b << 16) | (g << 8) | r;
     uint32_t* buf32 = (uint32_t*)gPixelBuffer;
     int total = gWidth * gHeight;
     
@@ -269,11 +304,11 @@ Value native_gui_fill_rect(Value* args, int argc) {
         return makeBool(false);
     }
     
-    int rx = (int)args[0].as.number;
-    int ry = (int)args[1].as.number;
-    int rw = (int)args[2].as.number;
-    int rh = (int)args[3].as.number;
-    uint32_t color = (uint32_t)args[4].as.number;
+    int rx = (int)toNum(args[0]);
+    int ry = (int)toNum(args[1]);
+    int rw = (int)toNum(args[2]);
+    int rh = (int)toNum(args[3]);
+    uint32_t color = (uint32_t)toNum(args[4]);
     
     int r = (color >> 16) & 0xFF;
     int g = (color >> 8) & 0xFF;
@@ -298,50 +333,81 @@ Value native_gui_fill_rect(Value* args, int argc) {
 }
 
 static void pollEvents(void) {
-    NSEvent* event = nil;
-    while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                        untilDate:[NSDate distantPast]
-                                           inMode:NSDefaultRunLoopMode
-                                          dequeue:YES])) {
-        switch ([event type]) {
-            case NSEventTypeKeyDown:
-                if ([event keyCode] < 256) gKeyState[[event keyCode]] = true;
-                break;
-            case NSEventTypeKeyUp:
-                if ([event keyCode] < 256) gKeyState[[event keyCode]] = false;
-                break;
-            case NSEventTypeLeftMouseDown:
-                gMouseState[0] = true; break;
-            case NSEventTypeLeftMouseUp:
-                gMouseState[0] = false; break;
-            case NSEventTypeRightMouseDown:
-                gMouseState[1] = true; break;
-            case NSEventTypeRightMouseUp:
-                gMouseState[1] = false; break;
-            case NSEventTypeOtherMouseDown:
-                gMouseState[2] = true; break;
-            case NSEventTypeOtherMouseUp:
-                gMouseState[2] = false; break;
-            case NSEventTypeMouseMoved:
-            case NSEventTypeLeftMouseDragged:
-            case NSEventTypeRightMouseDragged:
-            case NSEventTypeOtherMouseDragged: {
-                NSPoint p = [event locationInWindow];
-                if (gView) {
-                    p = [gView convertPoint:p fromView:nil];
-                }
-                gMouseX = (int)p.x;
-                gMouseY = gHeight - (int)p.y - 1;
-                if (gMouseX < 0) gMouseX = 0;
-                if (gMouseY < 0) gMouseY = 0;
-                if (gMouseX >= gWidth) gMouseX = gWidth - 1;
-                if (gMouseY >= gHeight) gMouseY = gHeight - 1;
-                break;
-            }
-            default:
-                break;
+    
+    memset(gKeyHit, 0, sizeof(gKeyHit));
+    
+    @autoreleasepool {
+        
+        if (gWindow && ![gWindow isKeyWindow]) {
+            [gWindow makeKeyWindow];
         }
-        [NSApp sendEvent:event];
+        if (gView && [gWindow firstResponder] != gView) {
+            [gWindow makeFirstResponder:gView];
+        }
+        
+        NSEvent* event = nil;
+        while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                            untilDate:[NSDate distantPast]
+                                               inMode:NSDefaultRunLoopMode
+                                              dequeue:YES])) {
+            switch ([event type]) {
+                case NSEventTypeKeyDown:
+                    
+                    if ([event keyCode] < 256) {
+                        gKeyState[[event keyCode]] = true;
+                        gKeyHit[[event keyCode]] = true;
+                    }
+                    break;
+                case NSEventTypeKeyUp:
+                    if ([event keyCode] < 256) gKeyState[[event keyCode]] = false;
+                    break;
+                case NSEventTypeFlagsChanged: {
+                    
+                    NSUInteger flags = [event modifierFlags];
+                    gKeyState[56] = (flags & NSEventModifierFlagShift) != 0;    
+                    gKeyState[60] = (flags & NSEventModifierFlagShift) != 0;    
+                    gKeyState[59] = (flags & NSEventModifierFlagControl) != 0;  
+                    gKeyState[62] = (flags & NSEventModifierFlagControl) != 0;  
+                    gKeyState[58] = (flags & NSEventModifierFlagOption) != 0;   
+                    gKeyState[61] = (flags & NSEventModifierFlagOption) != 0;   
+                    gKeyState[55] = (flags & NSEventModifierFlagCommand) != 0;  
+                    gKeyState[54] = (flags & NSEventModifierFlagCommand) != 0;  
+                    break;
+                }
+                case NSEventTypeLeftMouseDown:
+                    gMouseState[0] = true; break;
+                case NSEventTypeLeftMouseUp:
+                    gMouseState[0] = false; break;
+                case NSEventTypeRightMouseDown:
+                    gMouseState[1] = true; break;
+                case NSEventTypeRightMouseUp:
+                    gMouseState[1] = false; break;
+                case NSEventTypeOtherMouseDown:
+                    gMouseState[2] = true; break;
+                case NSEventTypeOtherMouseUp:
+                    gMouseState[2] = false; break;
+                case NSEventTypeMouseMoved:
+                case NSEventTypeLeftMouseDragged:
+                case NSEventTypeRightMouseDragged:
+                case NSEventTypeOtherMouseDragged: {
+                    NSPoint p = [event locationInWindow];
+                    if (gView) {
+                        p = [gView convertPoint:p fromView:nil];
+                    }
+                    gMouseX = (int)p.x;
+                    gMouseY = gHeight - (int)p.y - 1;
+                    if (gMouseX < 0) gMouseX = 0;
+                    if (gMouseY < 0) gMouseY = 0;
+                    if (gMouseX >= gWidth) gMouseX = gWidth - 1;
+                    if (gMouseY >= gHeight) gMouseY = gHeight - 1;
+                    break;
+                }
+                default:
+                    break;
+            }
+            [NSApp sendEvent:event];
+        }
+        [NSApp updateWindows];
     }
 }
 
@@ -380,14 +446,7 @@ Value native_gui_present(Value* args, int argc) {
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];
         
-        NSEvent* event;
-        while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                           untilDate:[NSDate distantPast]
-                                              inMode:NSDefaultRunLoopMode
-                                             dequeue:YES])) {
-            [NSApp sendEvent:event];
-            [NSApp updateWindows];
-        }
+        pollEvents();
         
         if (![gWindow isVisible]) {
             gWindowOpen = false;
@@ -424,11 +483,11 @@ Value native_gui_draw_line(Value* args, int argc) {
         return makeBool(false);
     }
     
-    int x0 = (int)args[0].as.number;
-    int y0 = (int)args[1].as.number;
-    int x1 = (int)args[2].as.number;
-    int y1 = (int)args[3].as.number;
-    uint32_t color = (uint32_t)args[4].as.number;
+    int x0 = (int)toNum(args[0]);
+    int y0 = (int)toNum(args[1]);
+    int x1 = (int)toNum(args[2]);
+    int y1 = (int)toNum(args[3]);
+    uint32_t color = (uint32_t)toNum(args[4]);
     
     int r = (color >> 16) & 0xFF;
     int g = (color >> 8) & 0xFF;
@@ -479,10 +538,10 @@ Value native_gui_draw_circle(Value* args, int argc) {
         return makeBool(false);
     }
     
-    int xc = (int)args[0].as.number;
-    int yc = (int)args[1].as.number;
-    int radius = (int)args[2].as.number;
-    uint32_t color = (uint32_t)args[3].as.number;
+    int xc = (int)toNum(args[0]);
+    int yc = (int)toNum(args[1]);
+    int radius = (int)toNum(args[2]);
+    uint32_t color = (uint32_t)toNum(args[3]);
     
     int r = (color >> 16) & 0xFF;
     int g = (color >> 8) & 0xFF;
@@ -526,10 +585,10 @@ Value native_gui_fill_circle(Value* args, int argc) {
         return makeBool(false);
     }
     
-    int xc = (int)args[0].as.number;
-    int yc = (int)args[1].as.number;
-    int radius = (int)args[2].as.number;
-    uint32_t color = (uint32_t)args[3].as.number;
+    int xc = (int)toNum(args[0]);
+    int yc = (int)toNum(args[1]);
+    int radius = (int)toNum(args[2]);
+    uint32_t color = (uint32_t)toNum(args[3]);
     
     int r = (color >> 16) & 0xFF;
     int g = (color >> 8) & 0xFF;
@@ -601,17 +660,131 @@ Value native_gui_mouse_pos(Value* args, int argc) {
 }
 
 Value native_gui_mouse_down(Value* args, int argc) {
-    if (argc < 1 || args[0].type != VAL_NUMBER) return makeBool(false);
-    int b = (int)args[0].as.number;
+    if (argc < 1 || !isNumeric(args[0])) return makeBool(false);
+    int b = (int)toNum(args[0]);
     if (b < 0 || b > 2) return makeBool(false);
     return makeBool(gMouseState[b]);
 }
 
 Value native_gui_key_down(Value* args, int argc) {
-    if (argc < 1 || args[0].type != VAL_NUMBER) return makeBool(false);
-    int code = (int)args[0].as.number;
+    if (argc < 1 || !isNumeric(args[0])) return makeBool(false);
+    int code = (int)toNum(args[0]);
     if (code < 0 || code >= 256) return makeBool(false);
-    return makeBool(gKeyState[code]);
+    
+    return makeBool(gKeyState[code] || gKeyHit[code]);
+}
+
+Value native_gui_get_keys(Value* args, int argc) {
+    (void)args; (void)argc;
+    Value arr = makeArray(0);
+    for (int i = 0; i < 256; i++) {
+        if (gKeyState[i] || gKeyHit[i]) {
+            arrayPush(arr.as.array, makeNumber(i));
+        }
+    }
+    return arr;
+}
+
+Value native_gui_load_png(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_STRING) return makeNull();
+    
+    NSString* path = [NSString stringWithUTF8String:args[0].as.string];
+    if (!path) return makeNull();
+    
+    NSData* data = [NSData dataWithContentsOfFile:path];
+    if (!data) return makeNull();
+    
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!source) return makeNull();
+    
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!image) return makeNull();
+    
+    size_t width = CGImageGetWidth(image);
+    size_t height = CGImageGetHeight(image);
+    size_t bytesPerPixel = 4;
+    size_t bytesPerRow = bytesPerPixel * width;
+    size_t totalBytes = bytesPerRow * height;
+    
+    unsigned char* raw = malloc(totalBytes);
+    if (!raw) {
+        CGImageRelease(image);
+        return makeNull();
+    }
+    
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(raw, width, height, 8, bytesPerRow, colorSpace, kCGImageAlphaPremultipliedLast);
+    if (!context) {
+        free(raw);
+        CGImageRelease(image);
+        CGColorSpaceRelease(colorSpace);
+        return makeNull();
+    }
+    
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextRelease(context);
+    CGColorSpaceRelease(colorSpace);
+    CGImageRelease(image);
+    
+    
+    Value pixels = makeArray((int)(width * height));
+    pixels.as.array->length = 0;
+    
+    for (size_t i = 0; i < width * height; i++) {
+        unsigned char* px = raw + (i * 4);
+        int color = (px[0] << 16) | (px[1] << 8) | px[2]; 
+        arrayPush(pixels.as.array, makeInt(color));
+    }
+    
+    free(raw);
+    
+    Value result = makeArray(3);  
+    arrayPush(result.as.array, makeInt((int)width));
+    arrayPush(result.as.array, makeInt((int)height));
+    arrayPush(result.as.array, pixels);
+    result.as.array->length = 3;
+    return result;
+}
+
+
+Value native_gui_blit(Value* args, int argc) {
+    if (argc < 5) {
+        runtimeError("gui_blit expects 5 args: x, y, w, h, pixels");
+        return makeBool(false);
+    }
+    if (!gPixelBuffer || !gWindowOpen) return makeBool(false);
+    
+    int ox = (int)toNum(args[0]);
+    int oy = (int)toNum(args[1]);
+    int w = (int)toNum(args[2]);
+    int h = (int)toNum(args[3]);
+    if (args[4].type != VAL_ARRAY || w <= 0 || h <= 0) return makeBool(false);
+    
+    JaiArray* arr = args[4].as.array;
+    int expected = w * h;
+    if (arr->length < expected) return makeBool(false);
+    
+    uint32_t* dst = (uint32_t*)gPixelBuffer;
+    
+    for (int y = 0; y < h; y++) {
+        int dy = oy + y;
+        if (dy < 0 || dy >= gHeight) continue;
+        int dstRow = dy * gWidth;
+        int srcRow = y * w;
+        for (int x = 0; x < w; x++) {
+            int dx = ox + x;
+            if (dx < 0 || dx >= gWidth) continue;
+            Value v = arr->items[srcRow + x];
+            uint32_t rgb = (uint32_t)toNum(v);
+            uint32_t r = (rgb >> 16) & 0xFF;
+            uint32_t g = (rgb >> 8) & 0xFF;
+            uint32_t b = rgb & 0xFF;
+            dst[dstRow + dx] = (255 << 24) | (b << 16) | (g << 8) | r;
+        }
+    }
+    
+    return makeBool(true);
 }
 
 void registerGuiFunctions(void) {
@@ -632,4 +805,7 @@ void registerGuiFunctions(void) {
     setVariable("gui_mouse_pos", makeNativeFunc(native_gui_mouse_pos));
     setVariable("gui_mouse_down", makeNativeFunc(native_gui_mouse_down));
     setVariable("gui_key_down", makeNativeFunc(native_gui_key_down));
+    setVariable("gui_get_keys", makeNativeFunc(native_gui_get_keys));
+    setVariable("gui_load_png", makeNativeFunc(native_gui_load_png));
+    setVariable("gui_blit", makeNativeFunc(native_gui_blit));
 }

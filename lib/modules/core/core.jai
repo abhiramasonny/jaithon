@@ -12,6 +12,38 @@ func num(x)
     return _num(x)
 end
 
+func toInt(x)
+    return _int(x)
+end
+
+func toFloat(x)
+    return _float(x)
+end
+
+func toDouble(x)
+    return _double(x)
+end
+
+func toBool(x)
+    return _bool(x)
+end
+
+func toChar(x)
+    return _char(x)
+end
+
+func toLong(x)
+    return _long(x)
+end
+
+func toShort(x)
+    return _short(x)
+end
+
+func toByte(x)
+    return _byte(x)
+end
+
 func type(x)
     return _type(x)
 end

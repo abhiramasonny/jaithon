@@ -8,20 +8,20 @@ end
 
 class BST
     var root
-    
+
     func init(self)
         self.root = null
     end
-    
+
     func insert(self, val)
         self.root = bstInsert(self.root, val)
         return self
     end
-    
+
     func contains(self, val)
         return bstContains(self.root, val)
     end
-    
+
     func minVal(self)
         if self.root == null
             return null
@@ -32,7 +32,7 @@ class BST
         end
         return cur.value
     end
-    
+
     func maxVal(self)
         if self.root == null
             return null
@@ -43,7 +43,7 @@ class BST
         end
         return cur.value
     end
-    
+
     func toArray(self)
         var out = []
         bstInorder(self.root, out)

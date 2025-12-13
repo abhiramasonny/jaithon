@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
+#include <stdint.h>
 
 #define INITIAL_CAPACITY 64
 #define GROWTH_FACTOR 2
@@ -14,7 +15,14 @@
 #define MAX_CALL_STACK 256
 
 typedef enum {
-    VAL_NUMBER,
+    VAL_NUMBER,   
+    VAL_DOUBLE,
+    VAL_FLOAT,
+    VAL_INT,
+    VAL_LONG,
+    VAL_SHORT,
+    VAL_BYTE,
+    VAL_CHAR,
     VAL_STRING,
     VAL_BOOL,
     VAL_NULL,
@@ -41,19 +49,22 @@ typedef Value (*NativeFunc)(Value* args, int argc);
 struct JaiFunction {
     char name[MAX_NAME_LEN];
     char** params;
+    char** paramTypes;
     int paramCount;
     int paramCapacity;
     bool isVariadic;
     char* body;
     Module* module;
     JaiNamespace* namespace;
+    char returnType[MAX_NAME_LEN];
+    bool freed;
 };
 
 struct JaiCell {
-    Value* car;  //first
-    Value* cdr;  //rest
+    Value* car;  
+    Value* cdr;  
 };
-//dynamic
+
 struct JaiArray {
     Value* items;
     int length;
@@ -89,12 +100,20 @@ struct JaiNamespace {
     JaiFunction** functions;
     int funcCount;
     int funcCapacity;
+    bool freed;
 };
 
 struct Value {
     ValueType type;
     union {
-        double number;
+        double number;   
+        double f64;
+        float f32;
+        int64_t i64;
+        int32_t i32;
+        int16_t i16;
+        int8_t i8;
+        char ch;
         char* string;
         bool boolean;
         JaiFunction* function;
@@ -109,6 +128,7 @@ struct Value {
 
 struct Variable {
     char name[MAX_NAME_LEN];
+    char declaredType[MAX_NAME_LEN];
     Value value;
 };
 
@@ -183,11 +203,19 @@ typedef struct {
     int lineNumber;
     char callStack[MAX_CALL_STACK][MAX_NAME_LEN];
     int callStackSize;
+    char currentSourceFile[1024];  
 } Runtime;
 
 extern Runtime runtime;
 
 Value makeNumber(double n);
+Value makeDouble(double n);
+Value makeFloat(float f);
+Value makeInt(int32_t i);
+Value makeLong(int64_t i);
+Value makeShort(int16_t i);
+Value makeByte(int8_t i);
+Value makeChar(char c);
 Value makeString(const char* s);
 Value makeBool(bool b);
 Value makeNull(void);
@@ -214,6 +242,7 @@ Module* findModule(const char* name);
 Module* loadModule(const char* path);
 
 void setVariable(const char* name, Value value);
+void setTypedVariable(const char* name, Value value, const char* typeName);
 Value getVariable(const char* name);
 bool hasVariable(const char* name);
 

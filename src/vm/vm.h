@@ -5,12 +5,12 @@
 #include <stdint.h>
 
 typedef enum {
-    //stack operations
+    
     OP_CONST,
     OP_POP,
     OP_DUP,
     
-    //var
+    
     OP_GET_LOCAL,
     OP_SET_LOCAL,
     OP_GET_GLOBAL,
@@ -36,8 +36,8 @@ typedef enum {
     OP_OR,
     
     OP_JUMP,
-    OP_JUMP_IF_FALSE,   //if top of stack is false
-    OP_LOOP,            //jump backwards
+    OP_JUMP_IF_FALSE,   
+    OP_LOOP,            
     
     OP_CALL,
     OP_RETURN,

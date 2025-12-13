@@ -91,6 +91,21 @@ int getKW_NEW(void);
 int getKW_EXTENDS(void);
 int getKW_SELF(void);
 int getKW_NAMESPACE(void);
+int getKW_PUBLIC(void);
+int getKW_PRIVATE(void);
+int getKW_PROTECTED(void);
+int getKW_STATIC(void);
+int getKW_IN(void);
+int getKW_VOID(void);
+int getKW_INT(void);
+int getKW_DOUBLE(void);
+int getKW_FLOAT(void);
+int getKW_STRING(void);
+int getKW_CHAR(void);
+int getKW_LONG(void);
+int getKW_SHORT(void);
+int getKW_BYTE(void);
+int getKW_BOOL(void);
 \
 int tokenizeSource(const char* source, Token** outTokens);
 

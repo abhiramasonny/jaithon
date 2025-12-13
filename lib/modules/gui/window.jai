@@ -25,7 +25,7 @@ class Window
     var height
     var targetFPS
     var needsPresent
-    
+
     func init(self, w, h, title)
         self.width = w
         self.height = h
@@ -33,24 +33,22 @@ class Window
         self.needsPresent = false
         gui_init(w, h, title, 60)
     end
-    
-    func initWithFPS(self, w, h, title, fps) #fps target
+
+    func initWithFPS(self, w, h, title, fps)
         self.width = w
         self.height = h
         self.targetFPS = fps
         self.needsPresent = false
         gui_init(w, h, title, fps)
     end
-    #set single pixel in buffer
     func putPixel(self, x, y, color)
         gui_set_pixel(x, y, color)
     end
-    
+
     func display(self)
         self.needsPresent = true
     end
-    
-    #GPU upload + vsync
+
     func update(self)
         if self.needsPresent
             self.needsPresent = false
@@ -58,44 +56,48 @@ class Window
         end
         return false
     end
-    
+
     func present(self)
         self.display()
         return self.update()
     end
-    
+
     func getDeltaTime(self)
-        return gui_get_dt() #sec
+        return gui_get_dt()
     end
-    
+
     func getFPS(self)
         return gui_get_fps()
     end
-    
+
     func getTime(self)
         return gui_get_time()
     end
-    
-    func poll()
+
+    func poll(self)
         gui_poll()
     end
-    
-    func mousePos()
+
+    func mousePos(self)
         return gui_mouse_pos()
     end
-    
-    func mouseDown(button)
+
+    func mouseDown(self, button)
         return gui_mouse_down(button)
     end
-    
-    func keyDown(keycode)
+
+    func keyDown(self, keycode)
         return gui_key_down(keycode)
     end
-    
+
+    func getKeys(self)
+        return gui_get_keys()
+    end
+
     func clear(self, color)
         gui_clear(color)
     end
-    
+
     func fillRect(self, rx, ry, rw, rh, color)
         var y = ry
         while y < ry + rh
@@ -107,7 +109,7 @@ class Window
             y = y + 1
         end
     end
-    
+
     func drawRect(self, rx, ry, rw, rh, color)
         var x = rx
         while x < rx + rw
@@ -122,7 +124,7 @@ class Window
             y = y + 1
         end
     end
-    
+
     func drawLine(self, x0, y0, x1, y1, color)
         var dx = abs(x1 - x0)
         var sx = -1
@@ -151,7 +153,7 @@ class Window
             end
         end
     end
-    
+
     func drawCircle(self, xc, yc, radius, color)
         var x = radius
         var y = 0
@@ -174,7 +176,7 @@ class Window
             end
         end
     end
-    
+
     func fillCircle(self, xc, yc, radius, color)
         var x = radius
         var y = 0
@@ -209,4 +211,16 @@ class Window
             end
         end
     end
+end
+
+func mousePos()
+    return gui_mouse_pos()
+end
+
+func mouseDown(button)
+    return gui_mouse_down(button)
+end
+
+func keyDown(keycode)
+    return gui_key_down(keycode)
 end

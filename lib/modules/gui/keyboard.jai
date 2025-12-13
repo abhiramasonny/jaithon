@@ -1,7 +1,6 @@
 import lib/modules/gui/window
 import lib/modules/ds/array
 
-#mac codes
 var KEY_W = 13
 var KEY_A = 0
 var KEY_S = 1
@@ -16,7 +15,7 @@ var KEY_ENTER = 52
 var KEY_RETURN = 36
 var KEY_TAB = 48
 var KEY_BACKSPACE = 51
-var KEY_DELETE = 117#fwd
+var KEY_DELETE = 117
 var KEY_HOME = 115
 var KEY_END = 119
 var KEY_PAGE_UP = 116
@@ -72,7 +71,7 @@ var KEY_SHIFT_LEFT = 56
 var KEY_SHIFT_RIGHT = 60
 var KEY_CTRL_LEFT = 59
 var KEY_CTRL_RIGHT = 62
-var KEY_ALT_LEFT = 58 #option
+var KEY_ALT_LEFT = 58
 var KEY_ALT_RIGHT = 61
 var KEY_CMD_LEFT = 55
 var KEY_CMD_RIGHT = 54
@@ -91,29 +90,43 @@ var KEY_F10 = 109
 var KEY_F11 = 103
 var KEY_F12 = 111
 
-var _prevKeys = arrayFill(256, 0)
+func newKeyState()
+    var keys = []
+    var i = 0
+    while i < 256
+        arrayPush(keys, 0)
+        i = i + 1
+    end
+    return keys
+end
+
+var _prevKeys = newKeyState()
 
 func keyboardReset()
-    _prevKeys = arrayFill(256, 0)
+    _prevKeys = newKeyState()
 end
 
 func keyboardTick(win)
     if arrayLen(_prevKeys) == 0
         keyboardReset()
     end
+
     var pressed = []
-    var code = 0
-    while code < 256
-        var down = win.keyDown(code)
-        if down and _prevKeys[code] == 0
-            arrayPush(pressed, code)
+    var currentKeys = win.getKeys()
+    var nextKeys = newKeyState()
+    var i = 0
+
+    while i < arrayLen(currentKeys)
+        var code = currentKeys[i]
+        if code >= 0 and code < arrayLen(_prevKeys)
+            if _prevKeys[code] == 0
+                arrayPush(pressed, code)
+            end
+            nextKeys[code] = 1
         end
-        if down
-            _prevKeys[code] = 1
-        else
-            _prevKeys[code] = 0
-        end
-        code = code + 1
+        i = i + 1
     end
+
+    _prevKeys = nextKeys
     return pressed
 end
