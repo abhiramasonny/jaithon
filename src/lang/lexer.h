@@ -106,6 +106,7 @@ int getKW_LONG(void);
 int getKW_SHORT(void);
 int getKW_BYTE(void);
 int getKW_BOOL(void);
+int getKW_DEL(void);
 \
 int tokenizeSource(const char* source, Token** outTokens);
 

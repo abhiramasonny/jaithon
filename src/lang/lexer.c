@@ -319,6 +319,7 @@ static int KW_CLASS, KW_NEW, KW_EXTENDS, KW_SELF;
 static int KW_NAMESPACE;
 static int KW_PUBLIC, KW_PRIVATE, KW_PROTECTED, KW_STATIC, KW_IN, KW_VOID;
 static int KW_INT, KW_DOUBLE, KW_FLOAT, KW_STRING, KW_CHAR, KW_LONG, KW_SHORT, KW_BYTE, KW_BOOL;
+static int KW_DEL;
 
 void registerBuiltinKeywords(void) {
     KW_VAR = registerKeyword("var");
@@ -365,6 +366,7 @@ void registerBuiltinKeywords(void) {
     KW_SHORT = registerKeyword("short");
     KW_BYTE = registerKeyword("byte");
     KW_BOOL = registerKeyword("bool");
+    KW_DEL = registerKeyword("del");
 }
 
 int getKW_VAR(void) { return KW_VAR; }
@@ -411,6 +413,7 @@ int getKW_LONG(void) { return KW_LONG; }
 int getKW_SHORT(void) { return KW_SHORT; }
 int getKW_BYTE(void) { return KW_BYTE; }
 int getKW_BOOL(void) { return KW_BOOL; }
+int getKW_DEL(void) { return KW_DEL; }
 
 int tokenizeSource(const char* source, Token** outTokens) {
     Lexer lex;

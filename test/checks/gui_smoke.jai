@@ -1,7 +1,7 @@
 # Test: GUI module smoke (headless)
 # Expected output: 1, 1, 1
 
-import lib/modules/gui/window
+import gui/window
 
 print rgb(0, 0, 0) == 0
 print rgb(255, 0, 0) == 255 * 65536

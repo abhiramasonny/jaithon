@@ -99,15 +99,7 @@ class Window
     end
 
     func fillRect(self, rx, ry, rw, rh, color)
-        var y = ry
-        while y < ry + rh
-            var x = rx
-            while x < rx + rw
-                gui_set_pixel(x, y, color)
-                x = x + 1
-            end
-            y = y + 1
-        end
+        gui_fill_rect(rx, ry, rw, rh, color)
     end
 
     func drawRect(self, rx, ry, rw, rh, color)
@@ -155,61 +147,11 @@ class Window
     end
 
     func drawCircle(self, xc, yc, radius, color)
-        var x = radius
-        var y = 0
-        var err = 0
-        while x >= y
-            gui_set_pixel(xc + x, yc + y, color)
-            gui_set_pixel(xc + y, yc + x, color)
-            gui_set_pixel(xc - y, yc + x, color)
-            gui_set_pixel(xc - x, yc + y, color)
-            gui_set_pixel(xc - x, yc - y, color)
-            gui_set_pixel(xc - y, yc - x, color)
-            gui_set_pixel(xc + y, yc - x, color)
-            gui_set_pixel(xc + x, yc - y, color)
-            y = y + 1
-            if err <= 0
-                err = err + 2 * y + 1
-            else
-                x = x - 1
-                err = err + 2 * (y - x) + 1
-            end
-        end
+        gui_draw_circle(xc, yc, radius, color)
     end
 
     func fillCircle(self, xc, yc, radius, color)
-        var x = radius
-        var y = 0
-        var err = 0
-        while x >= y
-            var xs = xc - x
-            var xe = xc + x
-            var ys = yc + y
-            var ye = yc - y
-            var i = xs
-            while i <= xe
-                gui_set_pixel(i, ys, color)
-                gui_set_pixel(i, ye, color)
-                i = i + 1
-            end
-            xs = xc - y
-            xe = xc + y
-            ys = yc + x
-            ye = yc - x
-            i = xs
-            while i <= xe
-                gui_set_pixel(i, ys, color)
-                gui_set_pixel(i, ye, color)
-                i = i + 1
-            end
-            y = y + 1
-            if err <= 0
-                err = err + 2 * y + 1
-            else
-                x = x - 1
-                err = err + 2 * (y - x) + 1
-            end
-        end
+        gui_fill_circle(xc, yc, radius, color)
     end
 end
 

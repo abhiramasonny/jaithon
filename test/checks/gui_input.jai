@@ -1,7 +1,7 @@
 # Test: GUI input helpers (headless)
 # Expected output: 2, 0, 0, 0, 0
 
-import lib/modules/gui/window
+import gui/window
 
 var pos = mousePos()
 print _alen(pos)

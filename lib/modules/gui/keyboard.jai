@@ -1,5 +1,5 @@
-import lib/modules/gui/window
-import lib/modules/ds/array
+import gui/window
+import ds/array
 
 var KEY_W = 13
 var KEY_A = 0

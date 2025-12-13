@@ -275,7 +275,7 @@ end
 
 ## Standard Library
 
-The standard library (`lib/std.jai`) is written in Jaithon and loaded automatically. It pulls in modular files from `lib/modules/` (constants, core, math, list, array, string, random, stack, queue, vector, hashmap, etc.). You can also import a specific module directly (e.g. `import lib/modules/array`).
+The standard library (`lib/std.jai`) is written in Jaithon and loaded automatically. It pulls in modular files from `lib/modules/` (constants, core, math, list, array, string, random, stack, queue, vector, hashmap, etc.). You can import a specific module directly with its short name (e.g. `import array`, `import core/core`, `import gui/window`); the loader resolves names into `lib/modules/**.jai` or `**/index.jai` recursively.
 
 ### Data Structures
 
@@ -303,7 +303,7 @@ The standard library (`lib/std.jai`) is written in Jaithon and loaded automatica
 
 ### GUI (Metal on macOS)
 
-The GUI module (`import lib/modules/gui/window`) exposes a `Window` class and helpers backed by native Metal code (macOS/Apple Silicon only). Drawing primitives are implemented in Jai atop a native pixel buffer; only the bare hardware hooks are native.
+The GUI module (`import gui/window`) exposes a `Window` class and helpers backed by native Metal code (macOS/Apple Silicon only). Drawing primitives are implemented in Jai atop a native pixel buffer; only the bare hardware hooks are native.
 
 | Item | Description |
 |------|-------------|
@@ -460,7 +460,7 @@ Import another `.jai` file. Use `/` to navigate subdirectories (relative to the 
 
 ```
 import calculator           # loads calculator.jai
-import lib/modules/math     # loads lib/modules/math.jai
+import math     # loads math module from lib/modules recursively
 ```
 All imports are resolved from the process working directory; they are not relative to the importing file.
 
@@ -500,6 +500,7 @@ statement   = varDecl
             | importStmt
             | inputStmt
             | breakStmt
+            | delStmt
             | systemStmt
             | assignment
             | funcCall ;
@@ -517,6 +518,7 @@ importStmt  = "import" modulePath ;
 modulePath  = IDENTIFIER { "/" IDENTIFIER } ;
 inputStmt   = "input" IDENTIFIER ;
 breakStmt   = "break" ;
+delStmt     = "del" IDENTIFIER [ "[" expression "]" ] ;
 systemStmt  = "system" STRING ;
 assignment  = IDENTIFIER "=" expression ;
 funcCall    = IDENTIFIER "(" [ args ] ")" ;
@@ -849,7 +851,7 @@ print isEven(42)            # true
       func mult(x) return x * scale end
   end
   ```
-- **Imports**: `import lib/modules/ds/array` brings helpers into the current module. Caller-defined symbols win if names collide.
+- **Imports**: `import ds/array` brings helpers into the current module. Caller-defined symbols win if names collide.
 - **Stateful namespaces**: Keep namespace state in module-level variables and expose setters/getters to avoid accidental shadowing.
 
 ---
@@ -883,6 +885,7 @@ print d.sound()
 
 - `and` / `or` are short-circuiting. Only evaluate the right-hand side if needed.
 - `break` exits the nearest loop; nested loops require an outer condition to stop both.
+- `del x` removes a binding like Python; `del arr[i]` deletes the element and shifts the list left, erroring on out-of-bounds.
 - Factorial `!` binds tightly: `2 * 3!` is `2 * (3!)`.
 
 ---
@@ -899,7 +902,7 @@ print d.sound()
 
 Minimal window:
 ```
-import lib/modules/gui/window
+import gui/window
 
 func main()
     var win = new Window()

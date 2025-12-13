@@ -1,5 +1,5 @@
 
-import lib/modules/core/wrappers
+import core/wrappers
 
 public static void log in Demo(string label, var value)
     print label + ": " + str(value)

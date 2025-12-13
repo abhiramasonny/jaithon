@@ -2,13 +2,86 @@
   "name": "jaithon",
   "displayName": "Jaithon",
   "description": "Language support for the Jaithon programming language",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "jaithon",
   "engines": { "vscode": "^1.60.0" },
   "categories": ["Programming Languages"],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:jaithon"],
+  "activationEvents": [
+    "onLanguage:jaithon",
+    "onCommand:jaithon.runFile",
+    "onCommand:jaithon.runFileDebug",
+    "onCommand:jaithon.runSelection",
+    "onCommand:jaithon.repl",
+    "onCommand:jaithon.runTestFile",
+    "onCommand:jaithon.runTestSuite"
+  ],
   "contributes": {
+    "commands": [
+      { "command": "jaithon.runFile", "title": "Jaithon: Run File" },
+      { "command": "jaithon.runFileDebug", "title": "Jaithon: Run File (Debug)" },
+      { "command": "jaithon.runSelection", "title": "Jaithon: Run Selection" },
+      { "command": "jaithon.repl", "title": "Jaithon: Start REPL" },
+      { "command": "jaithon.runTestFile", "title": "Jaithon: Run Test (Current File)" },
+      { "command": "jaithon.runTestSuite", "title": "Jaithon: Run Test Suite" }
+    ],
+    "menus": {
+      "editor/title/run": [
+        { "command": "jaithon.runFile", "when": "resourceLangId == jaithon", "group": "navigation" },
+        { "command": "jaithon.runFileDebug", "when": "resourceLangId == jaithon", "group": "navigation" }
+      ],
+      "explorer/context": [
+        { "command": "jaithon.runFile", "when": "resourceExtname == .jai", "group": "navigation" },
+        { "command": "jaithon.runFileDebug", "when": "resourceExtname == .jai", "group": "navigation" }
+      ]
+    },
+    "keybindings": [
+      { "command": "jaithon.runFile", "key": "ctrl+enter", "when": "editorLangId == jaithon" },
+      { "command": "jaithon.runFile", "key": "cmd+enter", "when": "editorLangId == jaithon" }
+    ],
+    "configuration": {
+      "title": "Jaithon",
+      "properties": {
+        "jaithon.interpreterPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/jaithon",
+          "description": "Path to the Jaithon interpreter (binary)."
+        },
+        "jaithon.defaultArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Arguments passed to Jaithon for run commands."
+        },
+        "jaithon.moduleGlobs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["lib/modules/**/*.jai", "modules/**/*.jai"],
+          "description": "Glob patterns used for module import completion."
+        },
+        "jaithon.indexGlobs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["lib/std.jai", "lib/modules/**/*.jai", "modules/**/*.jai"],
+          "description": "Glob patterns indexed for symbol completion/definition."
+        },
+        "jaithon.excludeGlob": {
+          "type": "string",
+          "default": "**/{node_modules,__pycache__,build,out,__jaicache__,assets,docs,vscode-extension-jai}/**",
+          "description": "Exclude glob used for indexing and module discovery."
+        },
+        "jaithon.useTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run commands in an integrated terminal (recommended)."
+        },
+        "jaithon.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable used to run test_runner.py."
+        }
+      }
+    },
     "languages": [
       {
         "id": "jaithon",

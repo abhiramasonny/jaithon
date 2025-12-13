@@ -404,9 +404,11 @@ bool compileExpr(Compiler* compiler, Token* tokens, int* pos, int end) {
 }
 
 static bool compileBinary(Compiler* compiler, Token* tokens, int* pos, int end, int minPrec) {
+    skipNewlinesTokens(tokens, pos, end);
     if (!compilePrimary(compiler, tokens, pos, end)) return false;
     
     while (!isAtEnd(tokens, pos, end)) {
+        skipNewlinesTokens(tokens, pos, end);
         int prec = getPrecedence(tokens[*pos].kind);
         if (prec < minPrec) break;
         
@@ -438,12 +440,19 @@ static bool compileBinary(Compiler* compiler, Token* tokens, int* pos, int end, 
 }
 
 static bool compileVarDecl(Compiler* compiler, Token* tokens, int* pos, int end) {
+    skipNewlinesTokens(tokens, pos, end);
     if (!check(tokens, *pos, TK_IDENTIFIER)) {
+        const char* dbg = getenv("JAITHON_COMPILE_DEBUG");
+        if (dbg && (strcmp(dbg, "1") == 0 || strcasecmp(dbg, "true") == 0)) {
+            fprintf(stderr, "[COMPILE_DEBUG] Expected identifier, got kind=%d text=%s at line %d\n",
+                    tokens[*pos].kind, tokens[*pos].strValue, tokens[*pos].line);
+        }
         compileError(compiler, "Expected variable name", tokens[*pos].line);
         return false;
     }
     
     Token name = advance(tokens, pos);
+    int slot = compiler->localCount;
     
     if (match(tokens, pos, TK_EQUALS)) {
         if (!compileExpr(compiler, tokens, pos, end)) return false;
@@ -452,7 +461,62 @@ static bool compileVarDecl(Compiler* compiler, Token* tokens, int* pos, int end)
     }
 
     addLocal(compiler, name.strValue);
+    emitBytes(compiler, OP_SET_LOCAL, slot, name.line);
     
+    return true;
+}
+
+static bool isModifierTokenC(int kind) {
+    return kind == getKW_PUBLIC() || kind == getKW_PRIVATE() || kind == getKW_PROTECTED() || kind == getKW_STATIC();
+}
+
+static bool isTypeTokenC(int kind) {
+    return kind == getKW_VAR() ||
+           kind == getKW_VOID() ||
+           kind == getKW_INT() ||
+           kind == getKW_DOUBLE() ||
+           kind == getKW_FLOAT() ||
+           kind == getKW_STRING() ||
+           kind == getKW_CHAR() ||
+           kind == getKW_LONG() ||
+           kind == getKW_SHORT() ||
+           kind == getKW_BYTE() ||
+           kind == getKW_BOOL();
+}
+
+static bool compileTypedDecl(Compiler* compiler, Token* tokens, int* pos, int end) {
+    Token t = advance(tokens, pos);
+    while (isModifierTokenC(t.kind)) {
+        if (isAtEnd(tokens, pos, end)) return true;
+        t = advance(tokens, pos);
+    }
+    
+    if (!isTypeTokenC(t.kind)) {
+        compileError(compiler, "Expected type in declaration", t.line);
+        return false;
+    }
+    
+    skipNewlinesTokens(tokens, pos, end);
+    if (!check(tokens, *pos, TK_IDENTIFIER)) {
+        const char* dbg = getenv("JAITHON_COMPILE_DEBUG");
+        if (dbg && (strcmp(dbg, "1") == 0 || strcasecmp(dbg, "true") == 0)) {
+            fprintf(stderr, "[COMPILE_DEBUG] Expected identifier (typed), got kind=%d text=%s at line %d\n",
+                    tokens[*pos].kind, tokens[*pos].strValue, tokens[*pos].line);
+        }
+        compileError(compiler, "Expected variable name", tokens[*pos].line);
+        return false;
+    }
+    Token name = advance(tokens, pos);
+    int slot = compiler->localCount;
+    
+    if (match(tokens, pos, TK_EQUALS)) {
+        if (!compileExpr(compiler, tokens, pos, end)) return false;
+    } else {
+        emitConstant(compiler, makeNull(), name.line);
+    }
+    
+    addLocal(compiler, name.strValue);
+    emitBytes(compiler, OP_SET_LOCAL, slot, name.line);
     return true;
 }
 
@@ -590,6 +654,43 @@ static bool compileBreak(Compiler* compiler, Token* tokens, int* pos, int end) {
     return true;
 }
 
+static bool compileDel(Compiler* compiler, Token* tokens, int* pos, int end) {
+    int line = tokens[*pos - 1].line;
+    if (!check(tokens, *pos, TK_IDENTIFIER)) {
+        compileError(compiler, "Expected identifier after 'del'", line);
+        return false;
+    }
+    Token name = advance(tokens, pos);
+    int localSlot = resolveLocal(compiler, name.strValue);
+    
+    if (match(tokens, pos, TK_LBRACKET)) {
+        if (localSlot != -1) {
+            emitBytes(compiler, OP_GET_LOCAL, localSlot, line);
+        } else {
+            int constIdx = chunkAddConstant(currentChunk(compiler), makeString(name.strValue));
+            emitBytes(compiler, OP_GET_GLOBAL, constIdx, line);
+        }
+        if (!compileExpr(compiler, tokens, pos, end)) return false;
+        if (!match(tokens, pos, TK_RBRACKET)) {
+            compileError(compiler, "Expected ']'", line);
+            return false;
+        }
+        emitByte(compiler, OP_ARRAY_DEL, line);
+        return true;
+    }
+    
+    if (localSlot != -1) {
+        emitConstant(compiler, makeNull(), line);
+        emitBytes(compiler, OP_SET_LOCAL, localSlot, line);
+        emitByte(compiler, OP_POP, line);
+        return true;
+    }
+    
+    int constIdx = chunkAddConstant(currentChunk(compiler), makeString(name.strValue));
+    emitBytes(compiler, OP_DEL_GLOBAL, constIdx, line);
+    return true;
+}
+
 static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int end) {
     Token name = tokens[*pos - 1];
     int line = name.line;
@@ -611,6 +712,7 @@ static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int e
         }
         if (!match(tokens, pos, TK_EQUALS)) {
             emitByte(compiler, OP_ARRAY_GET, line);
+            emitByte(compiler, OP_POP, line);
             return true;
         }
         if (!compileExpr(compiler, tokens, pos, end)) return false;
@@ -635,9 +737,32 @@ static bool compileAssignment(Compiler* compiler, Token* tokens, int* pos, int e
         char fieldName[MAX_NAME_LEN];
         strcpy(fieldName, tokens[*pos].strValue);
         advance(tokens, pos);
+        
+        if (check(tokens, *pos, TK_LPAREN)) {
+            advance(tokens, pos);
+            int argc = 0;
+            if (!check(tokens, *pos, TK_RPAREN)) {
+                do {
+                    if (!compileExpr(compiler, tokens, pos, end)) return false;
+                    argc++;
+                } while (match(tokens, pos, TK_COMMA));
+            }
+            if (!match(tokens, pos, TK_RPAREN)) {
+                compileError(compiler, "Expected ')' after method args", line);
+                return false;
+            }
+            int nameIdx = chunkAddConstant(currentChunk(compiler), makeString(fieldName));
+            emitBytes(compiler, OP_CALL_METHOD, nameIdx, line);
+            emitByte(compiler, argc, line);
+            emitByte(compiler, OP_POP, line);
+            return true;
+        }
+        
         if (!match(tokens, pos, TK_EQUALS)) {
-            compileError(compiler, "Expected '='", line);
-            return false;
+            int nameIdx = chunkAddConstant(currentChunk(compiler), makeString(fieldName));
+            emitBytes(compiler, OP_GET_FIELD, nameIdx, line);
+            emitByte(compiler, OP_POP, line);
+            return true;
         }
         if (!compileExpr(compiler, tokens, pos, end)) return false;
         int nameIdx = chunkAddConstant(currentChunk(compiler), makeString(fieldName));
@@ -678,6 +803,11 @@ bool compileStmts(Compiler* compiler, Token* tokens, int* pos, int end) {
         return compileVarDecl(compiler, tokens, pos, end);
     }
     
+    if (isModifierTokenC(t.kind) || isTypeTokenC(t.kind)) {
+        (*pos)--;  
+        return compileTypedDecl(compiler, tokens, pos, end);
+    }
+    
     if (t.kind == getKW_PRINT()) {
         return compilePrint(compiler, tokens, pos, end);
     }
@@ -696,6 +826,10 @@ bool compileStmts(Compiler* compiler, Token* tokens, int* pos, int end) {
     
     if (t.kind == getKW_BREAK()) {
         return compileBreak(compiler, tokens, pos, end);
+    }
+
+    if (t.kind == getKW_DEL()) {
+        return compileDel(compiler, tokens, pos, end);
     }
     
     if (t.kind == TK_IDENTIFIER || t.kind == getKW_SELF()) {

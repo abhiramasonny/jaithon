@@ -1,5 +1,5 @@
 
-import lib/modules/ds/vector
+import ds/vector
 
 class uf
     var parent

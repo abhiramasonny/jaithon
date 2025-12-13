@@ -1,22 +1,16 @@
-import lib/modules/ds/hashmap
-import lib/modules/core/string
+import ds/hashmap
+import core/string
 
-public bool isAlpha(char c)
-    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+public bool isAlpha(string c)
+    return indexOf("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0
 end
 
 public string normalize(string text)
+    string lowerText = lower(text)
     string out = ""
     int i = 0
-    while i < len(text)
-        char ch = charAt(text, i)
-        if ch >= "A" and ch <= "Z"
-            string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            int idx = indexOf(upper, ch)
-            if idx >= 0
-                ch = charAt("abcdefghijklmnopqrstuvwxyz", idx)
-            end
-        end
+    while i < len(lowerText)
+        string ch = charAt(lowerText, i)
         if isAlpha(ch) or ch == " "
             out = concat(out, ch)
         else
@@ -74,7 +68,7 @@ public void showCounts(var counts)
 end
 
 public static void main()
-    string text = "To be, or not to be, that is the question: Whether 'tis nobler in the mind to suffer The slings and arrows of outrageous fortune"
+    string text = "Test! This is a sample text, with: punctuation. This text is for testing, testing word-count. Word-count should count words correctly; words, words, words. Now let's see how well it works? Does it count words correctly?"
     string clean = normalize(text)
     var words = splitWords(clean)
     var counts = countWords(words)

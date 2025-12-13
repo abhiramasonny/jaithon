@@ -3,6 +3,7 @@
 
 #include "../core/runtime.h"
 #include "lexer.h"
+#include "../vm/vm.h"
 
 typedef Value (*StatementHandler)(Lexer* lex);
 typedef Value (*ExprHandler)(Lexer* lex, Value left);
@@ -37,5 +38,12 @@ double toNumber(Value v);
 void printCompilationStats(void);
 
 void initParser(void);
+
+uint64_t functionBodyHash(const JaiFunction* f);
+bool registerCompiledFunction(JaiFunction* f, CompiledFunc* compiled, uint64_t bodyHash);
+CompiledFunc* getCompiledFunc(JaiFunction* f);
+bool compileModuleFunctions(Module* mod, bool strict);
+bool eagerCompileEnabled(void);
+bool eagerCompileStrict(void);
 
 #endif

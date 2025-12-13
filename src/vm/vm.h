@@ -15,6 +15,7 @@ typedef enum {
     OP_SET_LOCAL,
     OP_GET_GLOBAL,
     OP_SET_GLOBAL,
+    OP_DEL_GLOBAL,
     
     OP_ADD,
     OP_SUB,
@@ -47,6 +48,7 @@ typedef enum {
     OP_ARRAY_SET,    
     OP_ARRAY_PUSH,  
     OP_ARRAY_LEN,    
+    OP_ARRAY_DEL,    
     
     OP_NEW_OBJECT,   
     OP_GET_FIELD,    

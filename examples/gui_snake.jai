@@ -1,7 +1,7 @@
-import lib/modules/gui/window
-import lib/modules/gui/keyboard
-import lib/modules/core/core
-import lib/modules/ds/array
+import gui/window
+import gui/keyboard
+import core/core
+import ds/array
 
 func clamp(val, lo, hi)
     if val < lo

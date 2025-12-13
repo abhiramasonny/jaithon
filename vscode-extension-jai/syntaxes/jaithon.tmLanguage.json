@@ -3,32 +3,84 @@
   "name": "Jaithon",
   "patterns": [
     { "name": "comment.line.number-sign.jai", "match": "#.*$" },
-    { "name": "string.quoted.double.jai", "begin": "\"", "end": "\"", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.jai" }] },
+    {
+      "name": "string.quoted.double.jai",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.jai" }]
+    },
+    {
+      "name": "meta.import.jai",
+      "match": "^\\s*(import)\\s+([A-Za-z0-9_./-]+)\\s*$",
+      "captures": {
+        "1": { "name": "keyword.control.import.jai" },
+        "2": { "name": "string.unquoted.module.jai" }
+      }
+    },
+    {
+      "name": "meta.function.definition.jai",
+      "match": "^\\s*(func)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": { "name": "storage.type.function.jai" },
+        "2": { "name": "entity.name.function.jai" }
+      }
+    },
+    {
+      "name": "meta.class.definition.jai",
+      "match": "^\\s*(class)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b(\\s+(extends)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+      "captures": {
+        "1": { "name": "storage.type.class.jai" },
+        "2": { "name": "entity.name.type.class.jai" },
+        "4": { "name": "keyword.control.inheritance.jai" },
+        "5": { "name": "entity.name.type.class.jai" }
+      }
+    },
+    {
+      "name": "meta.namespace.definition.jai",
+      "match": "^\\s*(namespace)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": { "name": "storage.type.namespace.jai" },
+        "2": { "name": "entity.name.namespace.jai" }
+      }
+    },
+    {
+      "name": "meta.variable.declaration.jai",
+      "match": "\\b(var)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": { "name": "storage.type.variable.jai" },
+        "2": { "name": "variable.other.definition.jai" }
+      }
+    },
     {
       "name": "keyword.control.jai",
-      "match": "\\b(if|else|while|break|return|func|class|extends|namespace|import|new|var|input|print|system|end|then|do|and|or|not|true|false|null)\\b"
+      "match": "\\b(if|else|while|for|break|continue|return|func|class|extends|namespace|import|new|var|then|do|end)\\b"
     },
     {
-      "name": "support.function.builtin.jai",
-      "match": "\\b(_sin|_cos|_tan|_sqrt|_log|_exp|_time|_rand|_len|_str|_num|_type|_cell|_car|_cdr|_setcar|_setcdr|_charAt|_substr|_concat|_push|_pop|_alen|_get|_set|rgb|gui_init|gui_set_pixel|gui_clear|gui_fill_rect|gui_draw_line|gui_draw_circle|gui_fill_circle|gui_present|gui_get_dt|gui_get_fps|gui_get_time|gui_poll|gui_mouse_pos|gui_mouse_down|gui_key_down)\\b"
+      "name": "constant.language.jai",
+      "match": "\\b(true|false|null)\\b"
+    },
+    { "name": "keyword.operator.logical.jai", "match": "\\b(and|or|not)\\b" },
+    { "name": "variable.language.self.jai", "match": "\\bself\\b" },
+    { "name": "support.constant.gui.key.jai", "match": "\\bKEY_[A-Z0-9_]+\\b" },
+    { "name": "constant.numeric.hex.jai", "match": "\\b0x[0-9a-fA-F]+\\b" },
+    { "name": "constant.numeric.jai", "match": "\\b((\\d+\\.\\d+)|(\\d+))(e[+-]?\\d+)?\\b" },
+    {
+      "name": "meta.new.jai",
+      "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.new.jai" },
+        "2": { "name": "entity.name.type.class.jai" }
+      }
     },
     {
-      "name": "support.constant.gui.key.jai",
-      "match": "\\bKEY_[A-Z0-9_]+\\b"
+      "name": "meta.function-call.jai",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": { "1": { "name": "entity.name.function.call.jai" } }
     },
     {
-      "name": "storage.type.class.jai",
-      "match": "\\bclass\\b"
-    },
-    {
-      "name": "variable.language.self.jai",
-      "match": "\\bself\\b"
-    },
-    {
-      "name": "constant.numeric.jai",
-      "match": "\\b((\\d+\\.\\d+)|(\\d+))(e[+-]?\\d+)?\\b"
-    },
-    { "name": "keyword.operator.jai", "match": "(\\+|\\-|\\*|\\/|%|\\^|!|==|=|>=|<=|>|<)" }
+      "name": "keyword.operator.jai",
+      "match": "(\\+|\\-|\\*|\\/|%|\\^|!=|==|=|>=|<=|>|<|\\.|,|:)"
+    }
   ],
   "repository": {},
   "fileTypes": [".jai"]

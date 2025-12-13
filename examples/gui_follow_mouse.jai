@@ -1,5 +1,5 @@
 
-import lib/modules/gui/window
+import gui/window
 
 public static void main()
     var w = new Window()

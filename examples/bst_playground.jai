@@ -1,7 +1,7 @@
 
-import lib/modules/ds/btree
-import lib/modules/core/random
-import lib/modules/ds/array
+import ds/btree
+import core/random
+import ds/array
 
 func main()
     var tree = bst()

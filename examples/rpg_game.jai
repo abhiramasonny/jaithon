@@ -1,6 +1,6 @@
-import lib/modules/ds/hashmap
-import lib/modules/core/string
-import lib/modules/core/core
+import ds/hashmap
+import core/string
+import core/core
 
 namespace UI
     func clear()

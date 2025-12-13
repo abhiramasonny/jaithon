@@ -1,5 +1,5 @@
 
-import lib/modules/core/wrappers
+import core/wrappers
 
 public static void main()
     int a = 10

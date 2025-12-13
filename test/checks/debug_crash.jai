@@ -1,5 +1,5 @@
 
-import lib/modules/ds/array
+import ds/array
 
 func main()
     print "Testing arrayPush with array..."

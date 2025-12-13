@@ -7,7 +7,7 @@
 # again
 # 1
 
-import lib/modules/core/io
+import core/io
 
 var path = "/tmp/jaithon_io_test.txt"
 

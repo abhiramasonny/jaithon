@@ -1,5 +1,5 @@
 
-import lib/modules/core/core
+import core/core
 
 func countWays(amount, coins)
     var dp = []

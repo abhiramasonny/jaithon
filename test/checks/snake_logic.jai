@@ -1,5 +1,5 @@
-import lib/modules/gui/keyboard
-import lib/modules/ds/array
+import gui/keyboard
+import ds/array
 
 class MockWindow
     var keys
