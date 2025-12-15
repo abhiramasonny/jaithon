@@ -1,6 +1,6 @@
 # JAITHON
 
-** Java + Python as a programming language**
+**Java + Python as a programming language**
 
 [Documentation](docs/grammar.md)
 
