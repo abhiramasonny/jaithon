@@ -14,7 +14,7 @@ typedef struct {
 
 typedef struct {
     int loopStart;
-    int breakJumps[64];
+    int breakJumps[256];
     int breakCount;
 } LoopInfo;
 

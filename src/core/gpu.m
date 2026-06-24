@@ -320,6 +320,45 @@ kernel void dotProduct(device const float* a [[buffer(0)]],
         partialSums[blockIdx] = shared[0];
     }
 }
+
+// C[M*N] = A[M*K] * B[K*N], row-major. One thread per output element.
+kernel void matmul(device const float* A [[buffer(0)]],
+                   device const float* B [[buffer(1)]],
+                   device float* C [[buffer(2)]],
+                   constant uint& M [[buffer(3)]],
+                   constant uint& K [[buffer(4)]],
+                   constant uint& N [[buffer(5)]],
+                   uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= M || col >= N) return;
+    float sum = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        sum += A[row * K + k] * B[k * N + col];
+    }
+    C[row * N + col] = sum;
+}
+
+// Batched: per-batch A[b][M*K] * B[b][K*N] -> C[b][M*N]. gid.z = batch index.
+kernel void matmulBatched(device const float* A [[buffer(0)]],
+                          device const float* B [[buffer(1)]],
+                          device float* C [[buffer(2)]],
+                          constant uint& M [[buffer(3)]],
+                          constant uint& K [[buffer(4)]],
+                          constant uint& N [[buffer(5)]],
+                          uint3 gid [[thread_position_in_grid]]) {
+    uint b = gid.z;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= M || col >= N) return;
+    const device float* Ab = A + (ulong)b * M * K;
+    const device float* Bb = B + (ulong)b * K * N;
+    float sum = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        sum += Ab[row * K + k] * Bb[k * N + col];
+    }
+    C[(ulong)b * M * N + row * N + col] = sum;
+}
 )";
 
 
@@ -698,8 +737,110 @@ Value gpuExecuteLoop(int64_t start, int64_t end, const char* bodySrc,
             
             return makeNumber(sum);
         }
-        
-        
+
+
         return makeNull();
     }
+}
+
+/* --- Dense matmul: C[M*N] = A[M*K] * B[K*N], row-major. CPU fallback below threshold. --- */
+
+static Value cpuMatmul(const double* A, const double* B, int M, int K, int N) {
+    Value out = makeArray(M * N);
+    for (int r = 0; r < M; r++) {
+        for (int c = 0; c < N; c++) {
+            double sum = 0.0;
+            for (int k = 0; k < K; k++) sum += A[r * K + k] * B[k * N + c];
+            arrayPush(out.as.array, makeNumber(sum));
+        }
+    }
+    return out;
+}
+
+static Value runMatmul(NSString* kernelName, const double* A, const double* B,
+                       int batch, int M, int K, int N) {
+    @autoreleasepool {
+        NSError* error = nil;
+        id<MTLFunction> fn = [library newFunctionWithName:kernelName];
+        if (!fn) return makeNull();
+        id<MTLComputePipelineState> pipeline =
+            [metalDevice newComputePipelineStateWithFunction:fn error:&error];
+        if (!pipeline) return makeNull();
+
+        size_t aN = (size_t)batch * M * K;
+        size_t bN = (size_t)batch * K * N;
+        size_t cN = (size_t)batch * M * N;
+
+        float* af = (float*)malloc(aN * sizeof(float));
+        float* bf = (float*)malloc(bN * sizeof(float));
+        for (size_t i = 0; i < aN; i++) af[i] = (float)A[i];
+        for (size_t i = 0; i < bN; i++) bf[i] = (float)B[i];
+
+        id<MTLBuffer> aBuf = [metalDevice newBufferWithBytes:af length:aN * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bBuf = [metalDevice newBufferWithBytes:bf length:bN * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cBuf = [metalDevice newBufferWithLength:cN * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        uint32_t mv = (uint32_t)M, kv = (uint32_t)K, nv = (uint32_t)N;
+        id<MTLBuffer> mBuf = [metalDevice newBufferWithBytes:&mv length:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kBuf = [metalDevice newBufferWithBytes:&kv length:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> nBuf = [metalDevice newBufferWithBytes:&nv length:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:aBuf offset:0 atIndex:0];
+        [enc setBuffer:bBuf offset:0 atIndex:1];
+        [enc setBuffer:cBuf offset:0 atIndex:2];
+        [enc setBuffer:mBuf offset:0 atIndex:3];
+        [enc setBuffer:kBuf offset:0 atIndex:4];
+        [enc setBuffer:nBuf offset:0 atIndex:5];
+
+        MTLSize grid = MTLSizeMake(N, M, batch);
+        NSUInteger tgw = pipeline.threadExecutionWidth;
+        NSUInteger tgh = pipeline.maxTotalThreadsPerThreadgroup / tgw;
+        if (tgh < 1) tgh = 1;
+        MTLSize tg = MTLSizeMake(tgw, tgh, 1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        Value out = makeArray((int)cN);
+        float* cd = (float*)[cBuf contents];
+        for (size_t i = 0; i < cN; i++) arrayPush(out.as.array, makeNumber(cd[i]));
+
+        free(af);
+        free(bf);
+        return out;
+    }
+}
+
+Value gpuMatmul(const double* A, const double* B, int M, int K, int N) {
+    long work = (long)M * N * K;
+    if (!gpuIsAvailable() || work < 100000) return cpuMatmul(A, B, M, K, N);
+    Value r = runMatmul(@"matmul", A, B, 1, M, K, N);
+    if (r.type == VAL_NULL) return cpuMatmul(A, B, M, K, N);
+    return r;
+}
+
+static Value cpuMatmulBatched(const double* A, const double* B, int batch, int M, int K, int N) {
+    Value out = makeArray(batch * M * N);
+    for (int b = 0; b < batch; b++) {
+        Value sub = cpuMatmul(A + (size_t)b * M * K, B + (size_t)b * K * N, M, K, N);
+        for (int i = 0; i < M * N; i++) arrayPush(out.as.array, arrayGet(sub.as.array, i));
+    }
+    return out;
+}
+
+Value gpuMatmulBatched(const double* A, const double* B, int batch, int M, int K, int N) {
+    long work = (long)batch * M * N * K;
+    if (!gpuIsAvailable() || work < 100000) return cpuMatmulBatched(A, B, batch, M, K, N);
+    Value r = runMatmul(@"matmulBatched", A, B, batch, M, K, N);
+    if (r.type == VAL_NULL) return cpuMatmulBatched(A, B, batch, M, K, N);
+    return r;
 }

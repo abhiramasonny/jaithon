@@ -251,3 +251,146 @@ end
 func harmonicMean(a, b)
     return 2 * a * b / (a + b)
 end
+
+func log2(x)
+    return _log(x) / LN2
+end
+
+func log10(x)
+    return _log(x) / LN10
+end
+
+func logBase(x, base)
+    return _log(x) / _log(base)
+end
+
+func atan(x)
+    if x < 0
+        return 0 - atan(0 - x)
+    end
+    if x > 1
+        return PI / 2 - atan(1 / x)
+    end
+    var result = 0
+    var term = x
+    var xsq = x * x
+    var i = 0
+    while i < 20
+        if i % 2 == 0
+            result = result + term / (2 * i + 1)
+        else
+            result = result - term / (2 * i + 1)
+        end
+        term = term * xsq
+        i = i + 1
+    end
+    return result
+end
+
+func atan2(y, x)
+    if x > 0
+        return atan(y / x)
+    end
+    if x < 0
+        if y >= 0
+            return atan(y / x) + PI
+        end
+        return atan(y / x) - PI
+    end
+    if y > 0
+        return PI / 2
+    end
+    if y < 0
+        return 0 - PI / 2
+    end
+    return 0
+end
+
+func asin(x)
+    if x < -1 or x > 1
+        raise "asin: domain error"
+    end
+    if x == 1
+        return PI / 2
+    end
+    if x == -1
+        return 0 - PI / 2
+    end
+    return atan(x / sqrt(1 - x * x))
+end
+
+func acos(x)
+    if x < -1 or x > 1
+        raise "acos: domain error"
+    end
+    return PI / 2 - asin(x)
+end
+
+func sumArray(arr)
+    var total = 0
+    var i = 0
+    while i < _alen(arr)
+        total = total + arr[i]
+        i = i + 1
+    end
+    return total
+end
+
+func productArray(arr)
+    var total = 1
+    var i = 0
+    while i < _alen(arr)
+        total = total * arr[i]
+        i = i + 1
+    end
+    return total
+end
+
+func mean(arr)
+    if _alen(arr) == 0
+        return 0
+    end
+    return sumArray(arr) / _alen(arr)
+end
+
+func variance(arr)
+    var m = mean(arr)
+    var total = 0
+    var i = 0
+    while i < _alen(arr)
+        var diff = arr[i] - m
+        total = total + diff * diff
+        i = i + 1
+    end
+    return total / _alen(arr)
+end
+
+func stddev(arr)
+    return sqrt(variance(arr))
+end
+
+func median(arr)
+    var sorted = arrayCopy(arr)
+    sort(sorted)
+    var n = _alen(sorted)
+    if n % 2 == 1
+        return sorted[_int(n / 2)]
+    end
+    return (sorted[_int(n / 2) - 1] + sorted[_int(n / 2)]) / 2
+end
+
+func mode(arr)
+    var freq = frequencies(arr)
+    var keys = _dict_keys(freq)
+    var bestKey = keys[0]
+    var bestCount = freq[keys[0]]
+    var i = 1
+    while i < _alen(keys)
+        if freq[keys[i]] > bestCount
+            bestCount = freq[keys[i]]
+            bestKey = keys[i]
+        end
+        i = i + 1
+    end
+    return _num(bestKey)
+end

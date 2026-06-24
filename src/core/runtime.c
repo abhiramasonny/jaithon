@@ -5,6 +5,11 @@
 
 Runtime runtime;
 char gExecDir[1024] = {0};
+ErrorHandler gErrorHandler = {.active = false};
+
+/* TLS worker-thread state */
+_Thread_local bool tls_isWorkerThread = false;
+_Thread_local Module* tls_execModule = NULL;
 
 Value makeNumber(double n) {
     Value v;
@@ -342,6 +347,33 @@ Module* createModule(const char* name, const char* path) {
     return m;
 }
 
+Module* createLocalModule(void) {
+    Module* m = malloc(sizeof(Module));
+    strncpy(m->name, "__local__", MAX_NAME_LEN - 1);
+    m->name[MAX_NAME_LEN - 1] = '\0';
+    m->path[0] = '\0';
+    m->varCapacity = INITIAL_CAPACITY;
+    m->variables = malloc(sizeof(Variable) * m->varCapacity);
+    for (int i = 0; i < m->varCapacity; i++) {
+        m->variables[i].name[0] = '\0';
+        m->variables[i].declaredType[0] = '\0';
+        m->variables[i].value = makeNull();
+    }
+    m->varCount = 0;
+    m->funcCapacity = 0;
+    m->functions = NULL;
+    m->funcCount = 0;
+    m->loaded = true;
+    return m;
+}
+
+void freeLocalModule(Module* m) {
+    if (!m) return;
+    if (m->variables) free(m->variables);
+    if (m->functions) free(m->functions);
+    free(m);
+}
+
 Module* findModule(const char* name) {
     for (int i = 0; i < runtime.moduleCount; i++) {
         if (strcmp(runtime.modules[i]->name, name) == 0) {
@@ -420,7 +452,7 @@ static Value convertToType(Value v, const char* typeName) {
 }
 
 void setVariable(const char* name, Value value) {
-    Module* m = runtime.currentModule;
+    Module* m = (tls_isWorkerThread && tls_execModule) ? tls_execModule : runtime.currentModule;
     if (!m) {
         runtimeError("No current module");
         return;
@@ -457,7 +489,7 @@ void setVariable(const char* name, Value value) {
 }
 
 void setTypedVariable(const char* name, Value value, const char* typeName) {
-    Module* m = runtime.currentModule;
+    Module* m = (tls_isWorkerThread && tls_execModule) ? tls_execModule : runtime.currentModule;
     if (!m) {
         runtimeError("No current module");
         return;
@@ -499,7 +531,7 @@ void setTypedVariable(const char* name, Value value, const char* typeName) {
 }
 
 Value getVariable(const char* name) {
-    Module* m = runtime.currentModule;
+    Module* m = (tls_isWorkerThread && tls_execModule) ? tls_execModule : runtime.currentModule;
     if (!m) {
         runtimeError("No current module");
         return makeNull();
@@ -525,7 +557,7 @@ Value getVariable(const char* name) {
 }
 
 bool hasVariable(const char* name) {
-    Module* m = runtime.currentModule;
+    Module* m = (tls_isWorkerThread && tls_execModule) ? tls_execModule : runtime.currentModule;
     if (!m) return false;
     
     for (int i = 0; i < m->varCount; i++) {
@@ -547,7 +579,7 @@ bool hasVariable(const char* name) {
 }
 
 bool deleteVariable(const char* name) {
-    Module* m = runtime.currentModule;
+    Module* m = (tls_isWorkerThread && tls_execModule) ? tls_execModule : runtime.currentModule;
     if (m) {
         for (int i = 0; i < m->varCount; i++) {
             if (strcmp(m->variables[i].name, name) == 0) {
@@ -650,9 +682,6 @@ void arraySet(JaiArray* arr, int index, Value val) {
         runtimeError("Array index out of bounds: %d", index);
         return;
     }
-    if (arr->items[index].type == VAL_STRING && arr->items[index].as.string) {
-        free(arr->items[index].as.string);
-    }
     arr->items[index] = val;
 }
 
@@ -736,7 +765,7 @@ void classAddMethod(JaiClass* class, const char* name, JaiFunction* method) {
     for (int i = 0; i < class->methodCount; i++) {
         if (strcmp(class->methodNames[i], name) == 0) {
             class->methods[i] = method;
-            if (strcmp(name, "__init__") == 0 || strcmp(name, "init") == 0) {
+            if (strcmp(name, "__init__") == 0 || strcmp(name, "init") == 0 || strcmp(name, "new") == 0) {
                 class->constructor = method;
             }
             return;
@@ -751,7 +780,7 @@ void classAddMethod(JaiClass* class, const char* name, JaiFunction* method) {
     class->methodNames[class->methodCount] = strdup(name);
     class->methods[class->methodCount++] = method;
     
-    if (strcmp(name, "__init__") == 0 || strcmp(name, "init") == 0) {
+    if (strcmp(name, "__init__") == 0 || strcmp(name, "init") == 0 || strcmp(name, "new") == 0) {
         class->constructor = method;
     }
 }
@@ -808,23 +837,48 @@ JaiClass* findClass(const char* name) {
     return NULL;
 }
 
+char* valueToString(Value v) {
+    char buf[256];
+    switch (v.type) {
+        case VAL_STRING: return v.as.string ? strdup(v.as.string) : strdup("");
+        case VAL_CHAR:   snprintf(buf, sizeof(buf), "%c",  v.as.ch);         break;
+        case VAL_NUMBER: snprintf(buf, sizeof(buf), "%g",  v.as.number);     break;
+        case VAL_DOUBLE: snprintf(buf, sizeof(buf), "%g",  v.as.f64);        break;
+        case VAL_FLOAT:  snprintf(buf, sizeof(buf), "%g",  v.as.f32);        break;
+        case VAL_INT:    snprintf(buf, sizeof(buf), "%d",  v.as.i32);        break;
+        case VAL_LONG:   snprintf(buf, sizeof(buf), "%lld",(long long)v.as.i64); break;
+        case VAL_SHORT:  snprintf(buf, sizeof(buf), "%d",  v.as.i16);        break;
+        case VAL_BYTE:   snprintf(buf, sizeof(buf), "%d",  v.as.i8);         break;
+        case VAL_BOOL:   snprintf(buf, sizeof(buf), "%s",  v.as.boolean ? "true" : "false"); break;
+        default:         snprintf(buf, sizeof(buf), "null");                  break;
+    }
+    return strdup(buf);
+}
+
 void runtimeError(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    if (gErrorHandler.active) {
+        vsnprintf(gErrorHandler.message, sizeof(gErrorHandler.message), format, args);
+        va_end(args);
+        longjmp(gErrorHandler.buf, 1);
+    }
+
     const char* modName = runtime.currentModule ? runtime.currentModule->name : "<no-module>";
     const char* modPath = runtime.currentModule ? runtime.currentModule->path : "";
     fprintf(stderr, "Error in %s (%s:%d): ", modName, modPath, runtime.lineNumber);
-    va_list args;
-    va_start(args, format);
     vfprintf(stderr, format, args);
     va_end(args);
     fprintf(stderr, "\n");
-    
+
     if (runtime.callStackSize > 0) {
         fprintf(stderr, "Call stack:\n");
         for (int i = runtime.callStackSize - 1; i >= 0; i--) {
             fprintf(stderr, "  at %s\n", runtime.callStack[i]);
         }
     }
-    
+
     if (!runtime.shellMode) {
         exit(1);
     }

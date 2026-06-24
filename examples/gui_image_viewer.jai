@@ -21,6 +21,8 @@ public static void main()
         if not win.update()
             break
         end
+
+        
     end
 end
 

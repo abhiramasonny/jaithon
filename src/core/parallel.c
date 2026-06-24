@@ -455,41 +455,54 @@ static bool detectIteratorIncrement(const char* bodySrc, const char* iterVar,
                                     int64_t* step) {
     char pattern1[MAX_NAME_LEN * 2 + 10];
     char pattern2[MAX_NAME_LEN * 2 + 10];
-    
-    
+
     snprintf(pattern1, sizeof(pattern1), "%s = %s +", iterVar, iterVar);
     snprintf(pattern2, sizeof(pattern2), "%s=%s+", iterVar, iterVar);
-    
+
     const char* found = strstr(bodySrc, pattern1);
-    if (!found) found = strstr(bodySrc, pattern2);
-    
+    const char* pat = pattern1;
+    if (!found) { found = strstr(bodySrc, pattern2); pat = pattern2; }
+
     if (found) {
-        
-        const char* p = found + strlen(iterVar) * 2 + 3;
+        const char* p = found + strlen(pat);
         while (*p && !isdigit((unsigned char)*p) && *p != '-') p++;
         if (*p) {
             *step = strtoll(p, NULL, 10);
             if (*step == 0) *step = 1;
+            /* verify all occurrences have the same step */
+            const char* scan = found + 1;
+            while (scan) {
+                const char* next = strstr(scan, pattern1);
+                if (!next) next = strstr(scan, pattern2);
+                if (!next) break;
+                const char* p2 = next + strlen(pat);
+                while (*p2 && !isdigit((unsigned char)*p2) && *p2 != '-') p2++;
+                if (*p2) {
+                    int64_t step2 = strtoll(p2, NULL, 10);
+                    if (step2 != *step) return false;
+                }
+                scan = next + 1;
+            }
             return true;
         }
     }
-    
-    
+
     snprintf(pattern1, sizeof(pattern1), "%s = %s -", iterVar, iterVar);
     snprintf(pattern2, sizeof(pattern2), "%s=%s-", iterVar, iterVar);
-    
+
     found = strstr(bodySrc, pattern1);
-    if (!found) found = strstr(bodySrc, pattern2);
-    
+    pat = pattern1;
+    if (!found) { found = strstr(bodySrc, pattern2); pat = pattern2; }
+
     if (found) {
-        const char* p = found + strlen(iterVar) * 2 + 3;
+        const char* p = found + strlen(pat);
         while (*p && !isdigit((unsigned char)*p)) p++;
         if (*p) {
             *step = -strtoll(p, NULL, 10);
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -771,11 +784,15 @@ Value executeRangeLoop(int64_t start, int64_t end, int64_t step,
             break;
     }
     
-    
+
     Value result = makeNull();
     for (int64_t i = start; i < end; i += step) {
         setVariable(iteratorVar, makeNumber((double)i));
-        
+
+        parserSetHasBreak(false);
+        bool savedContinue = parserGetHasContinue();
+        parserSetHasContinue(false);
+
         Lexer bodyLex;
         lexerInit(&bodyLex, bodySrc);
         while (!lexerCheck(&bodyLex, TK_EOF)) {
@@ -783,9 +800,13 @@ Value executeRangeLoop(int64_t start, int64_t end, int64_t step,
             while (lexerCheck(&bodyLex, TK_NEWLINE)) {
                 lexerNext(&bodyLex);
             }
+            if (parserGetHasBreak() || parserGetHasContinue() || parserGetHasReturn()) break;
         }
+
+        parserSetHasContinue(savedContinue);
+        if (parserGetHasBreak() || parserGetHasReturn()) break;
     }
-    
+
     return result;
 }
 
@@ -814,7 +835,9 @@ Value executeWhileLoop(const char* condSrc, const char* bodySrc) {
         
         if (step > 0 && start < end) {
             Value result = executeRangeLoop(start, end, step, iterVar, bodySrc);
-            setVariable(iterVar, makeNumber((double)end));
+            if (!parserGetHasBreak()) {
+                setVariable(iterVar, makeNumber((double)end));
+            }
             return result;
         }
     }
@@ -823,14 +846,18 @@ Value executeWhileLoop(const char* condSrc, const char* bodySrc) {
     Value result = makeNull();
     int iterations = 0;
     const int MAX_ITERATIONS = 100000000;
-    
+
     while (iterations++ < MAX_ITERATIONS) {
         Lexer condLex;
         lexerInit(&condLex, condSrc);
         Value cond = parseExpression(&condLex);
-        
+
         if (!toBool(cond)) break;
-        
+
+        parserSetHasBreak(false);
+        bool savedContinue = parserGetHasContinue();
+        parserSetHasContinue(false);
+
         Lexer bodyLex;
         lexerInit(&bodyLex, bodySrc);
         while (!lexerCheck(&bodyLex, TK_EOF)) {
@@ -838,10 +865,56 @@ Value executeWhileLoop(const char* condSrc, const char* bodySrc) {
             while (lexerCheck(&bodyLex, TK_NEWLINE)) {
                 lexerNext(&bodyLex);
             }
+            if (parserGetHasBreak() || parserGetHasContinue() || parserGetHasReturn()) break;
         }
+
+        parserSetHasContinue(savedContinue);
+        if (parserGetHasBreak() || parserGetHasReturn()) break;
     }
-    
+
     return result;
+}
+
+/* Classify a '+' reduction body so we only use a fast (closed-form / parallel)
+ * path when the operand is provably the loop iterator. Anything else
+ * (constants, strings, arbitrary expressions) returns 0 -> serial, which is
+ * always correct. Returns: 0 unsupported, 1 = rv = rv + iter, 2 = rv = rv +
+ * (iter % const) with *modOut set. */
+static int classifyReduction(const char* bodySrc, const char* rv,
+                             const char* iter, char op, int* modOut) {
+    if (op != '+') return 0;
+    size_t rvlen = strlen(rv);
+    size_t itlen = strlen(iter);
+    const char* p = bodySrc;
+    while ((p = strstr(p, rv)) != NULL) {
+        const char* q = p + rvlen;
+        if (p != bodySrc && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) { p = q; continue; }
+        if (isalnum((unsigned char)*q) || *q == '_') { p = q; continue; }
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q != '=') { p = q; continue; }
+        q++;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (strncmp(q, rv, rvlen) != 0) { p = q; continue; }
+        q += rvlen;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q != '+') return 0;          /* rv = rv <non-+> ... -> serial */
+        q++;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q == '(') { q++; while (*q && isspace((unsigned char)*q)) q++; }
+        if (strncmp(q, iter, itlen) != 0 || isalnum((unsigned char)q[itlen]) || q[itlen] == '_')
+            return 0;                     /* operand is not the iterator -> serial */
+        const char* r = q + itlen;
+        while (*r && isspace((unsigned char)*r)) r++;
+        if (*r == '%') {
+            r++;
+            while (*r && isspace((unsigned char)*r)) r++;
+            int c = atoi(r);
+            if (c > 0) { *modOut = c; return 2; }
+            return 0;
+        }
+        return 1;                          /* rv = rv + iter */
+    }
+    return 0;
 }
 
 Value executeSmartReduction(int64_t start, int64_t end,
@@ -895,116 +968,64 @@ Value executeSmartReduction(int64_t start, int64_t end,
     
     
     
-    bool canOptimize = false;
-    bool hasModulo = strstr(bodySrc, "%") != NULL;
-    int moduloConst = 7; 
-    
-    
-    if (hasModulo) {
-        const char* modPos = strstr(bodySrc, "%");
-        if (modPos) {
-            modPos++;
-            while (*modPos && isspace((unsigned char)*modPos)) modPos++;
-            int val = atoi(modPos);
-            if (val > 0) {
-                moduloConst = val;
-                canOptimize = true;
-            }
-        }
-    }
-    
-    
-    bool isSimpleSum = !hasModulo && reductionOp == '+';
-    if (isSimpleSum) {
-        
-        
-        
-        
-        double n = (double)(end - start);  
-        double first = (double)start;       
-        double last = (double)(end - 1);    
-        double sum = n * (first + last) / 2.0;
-        
+    int modConst = 0;
+    int rclass = classifyReduction(bodySrc, reductionVar, iteratorVar, reductionOp, &modConst);
+
+    /* rv = rv + iter  ->  closed-form arithmetic series (correct only because
+       the operand is verified to be the iterator) */
+    if (rclass == 1) {
+        double n = (double)(end - start);
+        double sum = n * ((double)start + (double)(end - 1)) / 2.0;
         double finalResult = initAccum + sum;
         setVariable(reductionVar, makeNumber(finalResult));
         setVariable(iteratorVar, makeNumber((double)end));
         return makeNumber(finalResult);
     }
-    
-    if (!canOptimize) {
-        
-        for (int64_t i = start; i < end; i++) {
-            setVariable(iteratorVar, makeNumber((double)i));
-            
-            Lexer bodyLex;
-            lexerInit(&bodyLex, bodySrc);
-            while (!lexerCheck(&bodyLex, TK_EOF)) {
-                parseStatement(&bodyLex);
-                while (lexerCheck(&bodyLex, TK_NEWLINE)) {
-                    lexerNext(&bodyLex);
-                }
+
+    /* rv = rv + (iter % modConst)  ->  parallel reduction */
+    if (rclass == 2) {
+        __block double* partialResults = calloc(numThreads, sizeof(double));
+        __block int capturedModuloConst = modConst;
+        for (int t = 0; t < numThreads; t++) partialResults[t] = 0.0;
+
+        int64_t chunkSize = count / numThreads;
+        dispatch_group_t group = dispatch_group_create();
+        for (int t = 0; t < numThreads; t++) {
+            int64_t threadStart = start + t * chunkSize;
+            int64_t threadEnd = (t == numThreads - 1) ? end : threadStart + chunkSize;
+            int threadId = t;
+            dispatch_group_async(group, workerQueue, ^{
+                double localAccum = 0.0;
+                for (int64_t i = threadStart; i < threadEnd; i++)
+                    localAccum += fmod((double)i, (double)capturedModuloConst);
+                partialResults[threadId] = localAccum;
+            });
+        }
+        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+        dispatch_release(group);
+
+        double finalResult = initAccum;
+        for (int t = 0; t < numThreads; t++) finalResult += partialResults[t];
+        free(partialResults);
+        setVariable(reductionVar, makeNumber(finalResult));
+        setVariable(iteratorVar, makeNumber((double)end));
+        return makeNumber(finalResult);
+    }
+
+    /* Unsupported pattern (constants, strings, arbitrary expressions) ->
+       always-correct serial execution. */
+    for (int64_t i = start; i < end; i++) {
+        setVariable(iteratorVar, makeNumber((double)i));
+        Lexer bodyLex;
+        lexerInit(&bodyLex, bodySrc);
+        while (!lexerCheck(&bodyLex, TK_EOF)) {
+            parseStatement(&bodyLex);
+            while (lexerCheck(&bodyLex, TK_NEWLINE)) {
+                lexerNext(&bodyLex);
             }
         }
-        return getVariable(reductionVar);
     }
-    
-    __block double* partialResults = calloc(numThreads, sizeof(double));
-    __block int capturedModuloConst = moduloConst;
-    
-    
-    double identity = (reductionOp == '*') ? 1.0 : 0.0;
-    for (int t = 0; t < numThreads; t++) {
-        partialResults[t] = identity;
-    }
-    
-    int64_t chunkSize = count / numThreads;
-    
-    dispatch_group_t group = dispatch_group_create();
-    
-    for (int t = 0; t < numThreads; t++) {
-        int64_t threadStart = start + t * chunkSize;
-        int64_t threadEnd = (t == numThreads - 1) ? end : threadStart + chunkSize;
-        int threadId = t;
-        
-        dispatch_group_async(group, workerQueue, ^{
-            double localAccum = identity;
-            
-            for (int64_t i = threadStart; i < threadEnd; i++) {
-                
-                double val = fmod((double)i, (double)capturedModuloConst);
-                
-                switch (reductionOp) {
-                    case '+': localAccum += val; break;
-                    case '*': localAccum *= val; break;
-                    case '-': localAccum -= val; break;
-                    default: break;
-                }
-            }
-            
-            partialResults[threadId] = localAccum;
-        });
-    }
-    
-    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-    dispatch_release(group);
-    
-    
-    double finalResult = initAccum;
-    for (int t = 0; t < numThreads; t++) {
-        switch (reductionOp) {
-            case '+': finalResult += partialResults[t]; break;
-            case '*': finalResult *= partialResults[t]; break;
-            case '-': finalResult += partialResults[t]; break;
-            default: break;
-        }
-    }
-    
-    free(partialResults);
-    
-    setVariable(reductionVar, makeNumber(finalResult));
-    setVariable(iteratorVar, makeNumber((double)end));
-    
-    return makeNumber(finalResult);
+    return getVariable(reductionVar);
 }
 
 Value executeParallelStatements(const char** statements, int count) {
@@ -1460,25 +1481,149 @@ int estimateOptimalThreads(int64_t workSize, double workPerItem) {
 void printAnalysisResult(const AnalysisResult* result) {
     printf("[Analysis] Variables: %d, Side effects: %d\n",
            result->varCount, result->effectCount);
-    
+
     if (result->hasIterator) {
         printf("[Analysis] Iterator: %s, Est. iterations: %lld\n",
                result->iteratorVar, result->estimatedIterations);
     }
-    
+
     if (result->hasReduction) {
         printf("[Analysis] Reduction: %s %c= ...\n",
                result->reductionVar, result->reductionOp);
     }
-    
+
     printf("[Analysis] Dependencies: data=%d, control=%d, order=%d\n",
            result->hasDataDependencies,
            result->hasControlDependencies,
            result->hasOrderDependentEffects);
-    
+
     printf("[Analysis] Can: parallelize=%d, vectorize=%d, GPU=%d\n",
            result->canParallelize, result->canVectorize, result->canUseGPU);
-    
+
     const char* backendNames[] = {"SERIAL", "SIMD", "PARALLEL", "GPU", "HYBRID"};
     printf("[Analysis] Recommended: %s\n", backendNames[result->recommendedBackend]);
+}
+
+/* Population eval is no longer a dedicated C builtin — it is bootstrapped in
+ * Jaithon (lib/modules/core/parallel.jai: peval_pop) on top of the general
+ * _pmap below. */
+
+/* --- General parallel map: _pmap(array, fn) -> array of fn(elem) --- */
+
+typedef struct {
+    JaiArray* in;
+    JaiArray* out;
+    int start;
+    int end;
+    Value fn;
+} MapThreadArgs;
+
+static void* mapThread(void* arg) {
+    MapThreadArgs* t = (MapThreadArgs*)arg;
+    Module* mod = createLocalModule();
+    tls_isWorkerThread = true;
+    tls_execModule = mod;
+    for (int i = t->start; i < t->end; i++) {
+        Value elem = arrayGet(t->in, i);
+        Value callArgs[1] = { elem };
+        Value r = callValue(t->fn, callArgs, 1);
+        arraySet(t->out, i, r);
+    }
+    freeLocalModule(mod);
+    tls_execModule = NULL;
+    tls_isWorkerThread = false;
+    return NULL;
+}
+
+static int clampThreads(int n) {
+    int nThreads = getAvailableCores();
+    if (nThreads > n) nThreads = n;
+    if (nThreads > PAR_MAX_THREADS) nThreads = PAR_MAX_THREADS;
+    if (nThreads < 1) nThreads = 1;
+    return nThreads;
+}
+
+Value nativeParallelMap(Value* args, int argc) {
+    if (argc < 2 || args[0].type != VAL_ARRAY) return makeNull();
+    JaiArray* in = args[0].as.array;
+    Value fn = args[1];
+    int n = in->length;
+    Value outV = makeArray(n > 0 ? n : 1);
+    for (int i = 0; i < n; i++) arrayPush(outV.as.array, makeNull());
+    if (n == 0) return outV;
+    JaiArray* out = outV.as.array;
+
+    int nThreads = clampThreads(n);
+    if (nThreads == 1) {
+        for (int i = 0; i < n; i++) {
+            Value elem = arrayGet(in, i);
+            arraySet(out, i, callValue(fn, &elem, 1));
+        }
+        return outV;
+    }
+
+    pthread_t threads[PAR_MAX_THREADS];
+    MapThreadArgs targs[PAR_MAX_THREADS];
+    int base = n / nThreads, rem = n % nThreads, off = 0;
+    for (int t = 0; t < nThreads; t++) {
+        targs[t].in = in; targs[t].out = out; targs[t].fn = fn;
+        targs[t].start = off;
+        targs[t].end = off + base + (t < rem ? 1 : 0);
+        off = targs[t].end;
+        pthread_create(&threads[t], NULL, mapThread, &targs[t]);
+    }
+    for (int t = 0; t < nThreads; t++) pthread_join(threads[t], NULL);
+    return outV;
+}
+
+/* --- General parallel for: _pfor(n, fn) calls fn(i) for i in [0,n) --- */
+
+typedef struct {
+    Value fn;
+    int start;
+    int end;
+} ForThreadArgs;
+
+static void* forThread(void* arg) {
+    ForThreadArgs* t = (ForThreadArgs*)arg;
+    Module* mod = createLocalModule();
+    tls_isWorkerThread = true;
+    tls_execModule = mod;
+    for (int i = t->start; i < t->end; i++) {
+        Value idx = makeNumber(i);
+        callValue(t->fn, &idx, 1);
+    }
+    freeLocalModule(mod);
+    tls_execModule = NULL;
+    tls_isWorkerThread = false;
+    return NULL;
+}
+
+Value nativeParallelFor(Value* args, int argc) {
+    if (argc < 2) return makeNull();
+    int n = (int)toNumber(args[0]);
+    Value fn = args[1];
+    if (n <= 0) return makeNull();
+
+    int nThreads = clampThreads(n);
+    if (nThreads == 1) {
+        for (int i = 0; i < n; i++) {
+            Value idx = makeNumber(i);
+            callValue(fn, &idx, 1);
+        }
+        return makeNull();
+    }
+
+    pthread_t threads[PAR_MAX_THREADS];
+    ForThreadArgs targs[PAR_MAX_THREADS];
+    int base = n / nThreads, rem = n % nThreads, off = 0;
+    for (int t = 0; t < nThreads; t++) {
+        targs[t].fn = fn;
+        targs[t].start = off;
+        targs[t].end = off + base + (t < rem ? 1 : 0);
+        off = targs[t].end;
+        pthread_create(&threads[t], NULL, forThread, &targs[t]);
+    }
+    for (int t = 0; t < nThreads; t++) pthread_join(threads[t], NULL);
+    return makeNull();
 }

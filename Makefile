@@ -30,7 +30,13 @@ all: $(TARGET)
 $(TARGET): $(SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LIBS)
 
+test: $(TARGET)
+	python3 scripts/test_runner.py
+
+install: $(TARGET)
+	cp $(TARGET) /usr/local/bin/$(TARGET)
+
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all clean
+.PHONY: all clean test install

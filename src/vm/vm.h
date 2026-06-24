@@ -55,8 +55,9 @@ typedef enum {
     OP_SET_FIELD,    
     OP_CALL_METHOD,  
     
-    OP_PRINT,           
-    OP_HALT,            
+    OP_PRINT,
+    OP_HALT,
+    OP_CONST_W,
 } OpCode;
 
 typedef struct {

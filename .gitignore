@@ -1,4 +1,9 @@
+# Compiled binary
+jaithon
+
 # Bytecode cache
 __jaicache__/
 *.jaic
+
+# macOS
 .DS_Store

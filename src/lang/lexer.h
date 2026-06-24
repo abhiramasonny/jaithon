@@ -32,6 +32,12 @@ typedef enum {
     TK_GE,
     TK_LE,
     TK_NEWLINE,
+    TK_FSTRING,
+    TK_PLUS_ASSIGN,
+    TK_MINUS_ASSIGN,
+    TK_STAR_ASSIGN,
+    TK_SLASH_ASSIGN,
+    TK_PERCENT_ASSIGN,
     TK_KEYWORD = 100
 } TokenKind;
 
@@ -107,7 +113,13 @@ int getKW_SHORT(void);
 int getKW_BYTE(void);
 int getKW_BOOL(void);
 int getKW_DEL(void);
-\
+int getKW_FOR(void);
+int getKW_TRY(void);
+int getKW_EXCEPT(void);
+int getKW_FINALLY(void);
+int getKW_RAISE(void);
+int getKW_CONTINUE(void);
+
 int tokenizeSource(const char* source, Token** outTokens);
 
 #endif
