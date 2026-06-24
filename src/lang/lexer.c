@@ -140,6 +140,41 @@ static Token scanString(Lexer* lex) {
     return makeStringToken(lex, buf);
 }
 
+static Token scanFString(Lexer* lex) {
+    char buf[MAX_NAME_LEN * 4];
+    int i = 0;
+    int capacity = MAX_NAME_LEN * 4 - 1;
+
+    while (peek(lex) != '"' && !isAtEnd(lex)) {
+        if (peek(lex) == '\n') lex->line++;
+        if (peek(lex) == '\\' && peekNext(lex) != '\0') {
+            advance(lex);
+            switch (peek(lex)) {
+                case 'n': if (i < capacity) buf[i++] = '\n'; break;
+                case 't': if (i < capacity) buf[i++] = '\t'; break;
+                case '\\': if (i < capacity) buf[i++] = '\\'; break;
+                case '"': if (i < capacity) buf[i++] = '"'; break;
+                case '{': if (i < capacity) buf[i++] = '{'; break;
+                case '}': if (i < capacity) buf[i++] = '}'; break;
+                default: if (i < capacity) buf[i++] = peek(lex);
+            }
+            advance(lex);
+        } else {
+            if (i < capacity) buf[i++] = peek(lex);
+            advance(lex);
+        }
+    }
+
+    if (isAtEnd(lex)) return errorToken(lex, "Unterminated f-string");
+    advance(lex);
+    buf[i] = '\0';
+
+    Token t = makeToken(lex, TK_FSTRING);
+    strncpy(t.strValue, buf, MAX_NAME_LEN - 1);
+    t.strValue[MAX_NAME_LEN - 1] = '\0';
+    return t;
+}
+
 static Token scanIdentifier(Lexer* lex) {
     while (isalnum(peek(lex)) || peek(lex) == '_') {
         advance(lex);
@@ -172,6 +207,10 @@ static Token scanToken(Lexer* lex) {
     char c = advance(lex);
     
     if (isdigit(c)) return scanNumber(lex);
+    if (c == 'f' && peek(lex) == '"') {
+        advance(lex);
+        return scanFString(lex);
+    }
     if (isalpha(c) || c == '_') return scanIdentifier(lex);
     
     switch (c) {
@@ -184,11 +223,21 @@ static Token scanToken(Lexer* lex) {
         case ',': return makeToken(lex, TK_COMMA);
         case '.': return makeToken(lex, TK_DOT);
         case ':': return makeToken(lex, TK_COLON);
-        case '+': return makeToken(lex, TK_PLUS);
-        case '-': return makeToken(lex, TK_MINUS);
-        case '*': return makeToken(lex, TK_STAR);
-        case '/': return makeToken(lex, TK_SLASH);
-        case '%': return makeToken(lex, TK_PERCENT);
+        case '+':
+            if (peek(lex) == '=') { advance(lex); return makeToken(lex, TK_PLUS_ASSIGN); }
+            return makeToken(lex, TK_PLUS);
+        case '-':
+            if (peek(lex) == '=') { advance(lex); return makeToken(lex, TK_MINUS_ASSIGN); }
+            return makeToken(lex, TK_MINUS);
+        case '*':
+            if (peek(lex) == '=') { advance(lex); return makeToken(lex, TK_STAR_ASSIGN); }
+            return makeToken(lex, TK_STAR);
+        case '/':
+            if (peek(lex) == '=') { advance(lex); return makeToken(lex, TK_SLASH_ASSIGN); }
+            return makeToken(lex, TK_SLASH);
+        case '%':
+            if (peek(lex) == '=') { advance(lex); return makeToken(lex, TK_PERCENT_ASSIGN); }
+            return makeToken(lex, TK_PERCENT);
         case '^': return makeToken(lex, TK_CARET);
         case '!': 
             if (peek(lex) == '=') {
@@ -320,6 +369,7 @@ static int KW_NAMESPACE;
 static int KW_PUBLIC, KW_PRIVATE, KW_PROTECTED, KW_STATIC, KW_IN, KW_VOID;
 static int KW_INT, KW_DOUBLE, KW_FLOAT, KW_STRING, KW_CHAR, KW_LONG, KW_SHORT, KW_BYTE, KW_BOOL;
 static int KW_DEL;
+static int KW_FOR, KW_TRY, KW_EXCEPT, KW_FINALLY, KW_RAISE, KW_CONTINUE;
 
 void registerBuiltinKeywords(void) {
     KW_VAR = registerKeyword("var");
@@ -367,6 +417,12 @@ void registerBuiltinKeywords(void) {
     KW_BYTE = registerKeyword("byte");
     KW_BOOL = registerKeyword("bool");
     KW_DEL = registerKeyword("del");
+    KW_FOR = registerKeyword("for");
+    KW_TRY = registerKeyword("try");
+    KW_EXCEPT = registerKeyword("except");
+    KW_FINALLY = registerKeyword("finally");
+    KW_RAISE = registerKeyword("raise");
+    KW_CONTINUE = registerKeyword("continue");
 }
 
 int getKW_VAR(void) { return KW_VAR; }
@@ -414,6 +470,12 @@ int getKW_SHORT(void) { return KW_SHORT; }
 int getKW_BYTE(void) { return KW_BYTE; }
 int getKW_BOOL(void) { return KW_BOOL; }
 int getKW_DEL(void) { return KW_DEL; }
+int getKW_FOR(void) { return KW_FOR; }
+int getKW_TRY(void) { return KW_TRY; }
+int getKW_EXCEPT(void) { return KW_EXCEPT; }
+int getKW_FINALLY(void) { return KW_FINALLY; }
+int getKW_RAISE(void) { return KW_RAISE; }
+int getKW_CONTINUE(void) { return KW_CONTINUE; }
 
 int tokenizeSource(const char* source, Token** outTokens) {
     Lexer lex;

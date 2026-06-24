@@ -221,6 +221,8 @@ Value gpuExecuteReduction(const double* data, int n, char op);
 Value gpuExecuteMap(const double* input, int n, const char* operation);
 Value gpuExecuteLoop(int64_t start, int64_t end, const char* bodySrc,
                     const AnalysisResult* analysis);
+Value gpuMatmul(const double* A, const double* B, int M, int K, int N);
+Value gpuMatmulBatched(const double* A, const double* B, int batch, int M, int K, int N);
 #endif
 
 
@@ -242,5 +244,9 @@ bool simdIsAvailable(void);
 
 
 void printAnalysisResult(const AnalysisResult* result);
+
+
+Value nativeParallelMap(Value* args, int argc);
+Value nativeParallelFor(Value* args, int argc);
 
 #endif 

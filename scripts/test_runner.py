@@ -140,8 +140,8 @@ def main():
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
     
     script_dir = Path(__file__).parent
-    workspace = script_dir
-    
+    workspace = script_dir.parent
+
     jaithon = workspace / "jaithon"
     if not jaithon.exists():
         print(f"{RED}Error: jaithon binary not found at {jaithon}{RESET}")

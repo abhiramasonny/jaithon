@@ -290,11 +290,26 @@ static int statementCount = 0;
 static InfixEntry infixes[MAX_INFIXES];
 static int infixCount = 0;
 
-static Value returnValue;
-static bool hasReturn = false;
+static _Thread_local Value returnValue;
+static _Thread_local bool hasReturn = false;
+static _Thread_local bool hasBreak = false;
+static _Thread_local bool hasContinue = false;
 static bool eagerCompile = true;
 static bool eagerStrict = false;
 static bool eagerInit = false;
+
+static bool isBlockOpener(int kind) {
+    return kind == getKW_IF() || kind == getKW_WHILE() || kind == getKW_FUNC() ||
+           kind == getKW_CLASS() || kind == getKW_NAMESPACE() || kind == getKW_LOOP() ||
+           kind == getKW_FOR() || kind == getKW_TRY();
+}
+
+bool parserGetHasBreak(void) { return hasBreak; }
+void parserSetHasBreak(bool v) { hasBreak = v; }
+bool parserGetHasContinue(void) { return hasContinue; }
+void parserSetHasContinue(bool v) { hasContinue = v; }
+bool parserGetHasReturn(void) { return hasReturn; }
+void parserSetHasReturn(bool v) { hasReturn = v; }
 
 static bool startsWithJavaStyleDecl(Lexer* lex);
 static Value convertToTypeName(Value v, const char* typeName);
@@ -313,7 +328,7 @@ static void skipStatementNoExec(Lexer* lex) {
     int depth = 0;
     while (!lexerCheck(lex, TK_EOF)) {
         int k = lex->currentToken.kind;
-        if (k == getKW_IF() || k == getKW_WHILE()) {
+        if (isBlockOpener(k)) {
             depth++;
         } else if (k == getKW_END()) {
             if (depth == 0) {
@@ -528,44 +543,7 @@ static bool isNumericValueType(ValueType t) {
            t == VAL_LONG || t == VAL_SHORT || t == VAL_BYTE || t == VAL_CHAR;
 }
 
-static char* valueToString(Value v) {
-    char buf[256];
-    switch (v.type) {
-        case VAL_STRING:
-            return v.as.string ? strdup(v.as.string) : strdup("");
-        case VAL_CHAR:
-            snprintf(buf, sizeof(buf), "%c", v.as.ch);
-            break;
-        case VAL_NUMBER:
-            snprintf(buf, sizeof(buf), "%g", v.as.number);
-            break;
-        case VAL_DOUBLE:
-            snprintf(buf, sizeof(buf), "%g", v.as.f64);
-            break;
-        case VAL_FLOAT:
-            snprintf(buf, sizeof(buf), "%g", v.as.f32);
-            break;
-        case VAL_INT:
-            snprintf(buf, sizeof(buf), "%d", v.as.i32);
-            break;
-        case VAL_LONG:
-            snprintf(buf, sizeof(buf), "%lld", (long long)v.as.i64);
-            break;
-        case VAL_SHORT:
-            snprintf(buf, sizeof(buf), "%d", v.as.i16);
-            break;
-        case VAL_BYTE:
-            snprintf(buf, sizeof(buf), "%d", v.as.i8);
-            break;
-        case VAL_BOOL:
-            snprintf(buf, sizeof(buf), "%s", v.as.boolean ? "true" : "false");
-            break;
-        default:
-            snprintf(buf, sizeof(buf), "null");
-            break;
-    }
-    return strdup(buf);
-}
+/* valueToString is defined in runtime.c and declared in runtime.h */
 
 static Value convertToTypeName(Value v, const char* typeName) {
     if (!typeName || typeName[0] == '\0' || strcasecmp(typeName, "var") == 0) {
@@ -646,6 +624,75 @@ Value parsePrimary(Lexer* lex) {
     if (t.kind == TK_STRING) {
         lexerNext(lex);
         return makeString(t.strValue);
+    }
+
+    if (t.kind == TK_FSTRING) {
+        lexerNext(lex);
+        const char* tmpl = t.strValue;
+        int tlen = (int)strlen(tmpl);
+        char result[MAX_NAME_LEN * 8];
+        int ri = 0;
+        int capacity = (int)sizeof(result) - 1;
+
+        for (int i = 0; i < tlen && ri < capacity; ) {
+            if (tmpl[i] == '{' && i + 1 < tlen && tmpl[i+1] != '{') {
+                int start = i + 1;
+                int end = start;
+                int bdepth = 1;
+                while (end < tlen && bdepth > 0) {
+                    if (tmpl[end] == '{') bdepth++;
+                    else if (tmpl[end] == '}') bdepth--;
+                    if (bdepth > 0) end++;
+                }
+                char exprBuf[MAX_NAME_LEN];
+                int elen = end - start;
+                if (elen >= MAX_NAME_LEN) elen = MAX_NAME_LEN - 1;
+                strncpy(exprBuf, tmpl + start, elen);
+                exprBuf[elen] = '\0';
+                Lexer exprLex;
+                lexerInit(&exprLex, exprBuf);
+                Value val = parseExpression(&exprLex);
+                char* vstr = valueToString(val);
+                int vlen = (int)strlen(vstr);
+                if (ri + vlen <= capacity) { memcpy(result + ri, vstr, vlen); ri += vlen; }
+                free(vstr);
+                i = end + 1;
+            } else if (tmpl[i] == '{' && i + 1 < tlen && tmpl[i+1] == '{') {
+                result[ri++] = '{'; i += 2;
+            } else if (tmpl[i] == '}' && i + 1 < tlen && tmpl[i+1] == '}') {
+                result[ri++] = '}'; i += 2;
+            } else {
+                result[ri++] = tmpl[i++];
+            }
+        }
+        result[ri] = '\0';
+        return makeString(result);
+    }
+
+    if (t.kind == TK_LBRACE) {
+        lexerNext(lex);
+        skipNewlines(lex);
+        Value dict = makeObject(NULL);
+        if (!lexerCheck(lex, TK_RBRACE)) {
+            do {
+                skipNewlines(lex);
+                Value key = parseExpression(lex);
+                if (lexerMatch(lex, TK_COLON)) {
+                    Value val = parseExpression(lex);
+                    char* ks = valueToString(key);
+                    objectSetField(dict.as.object, ks, val);
+                    free(ks);
+                } else {
+                    char* ks = valueToString(key);
+                    objectSetField(dict.as.object, ks, makeNull());
+                    free(ks);
+                }
+                skipNewlines(lex);
+            } while (lexerMatch(lex, TK_COMMA));
+            skipNewlines(lex);
+        }
+        lexerExpect(lex, TK_RBRACE);
+        return dict;
     }
     
     if (t.kind == getKW_TRUE()) {
@@ -759,12 +806,22 @@ Value parsePrimary(Lexer* lex) {
                         arraySet(result.as.array, (int)toNumber(index), val);
                         return val;
                     }
-                    runtimeError("Cannot assign to index of non-array");
+                    if (result.type == VAL_OBJECT) {
+                        char* ks = valueToString(index);
+                        objectSetField(result.as.object, ks, val);
+                        free(ks);
+                        return val;
+                    }
+                    runtimeError("Cannot assign to index of non-array/dict");
                     return makeNull();
                 }
-                
+
                 if (result.type == VAL_ARRAY) {
                     result = arrayGet(result.as.array, (int)toNumber(index));
+                } else if (result.type == VAL_OBJECT) {
+                    char* ks = valueToString(index);
+                    result = objectGetField(result.as.object, ks);
+                    free(ks);
                 } else if (result.type == VAL_STRING) {
                     int idx = (int)toNumber(index);
                     const char* s = result.as.string;
@@ -1143,21 +1200,29 @@ static Value handleFactorial(Lexer* lex, Value left) {
 
 static Value handleGt(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 6);
+    if (left.type == VAL_STRING && right.type == VAL_STRING)
+        return makeBool(strcmp(left.as.string, right.as.string) > 0);
     return makeBool(toNumber(left) > toNumber(right));
 }
 
 static Value handleLt(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 6);
+    if (left.type == VAL_STRING && right.type == VAL_STRING)
+        return makeBool(strcmp(left.as.string, right.as.string) < 0);
     return makeBool(toNumber(left) < toNumber(right));
 }
 
 static Value handleGe(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 6);
+    if (left.type == VAL_STRING && right.type == VAL_STRING)
+        return makeBool(strcmp(left.as.string, right.as.string) >= 0);
     return makeBool(toNumber(left) >= toNumber(right));
 }
 
 static Value handleLe(Lexer* lex, Value left) {
     Value right = parseExpressionPrec(lex, 6);
+    if (left.type == VAL_STRING && right.type == VAL_STRING)
+        return makeBool(strcmp(left.as.string, right.as.string) <= 0);
     return makeBool(toNumber(left) <= toNumber(right));
 }
 
@@ -1335,68 +1400,92 @@ static Value stmtPrint(Lexer* lex) {
 static Value stmtIf(Lexer* lex) {
     lexerExpect(lex, getKW_IF());
     Value cond = parseExpression(lex);
-    
-    lexerMatch(lex, getKW_THEN()); 
+
+    lexerMatch(lex, getKW_THEN());
     lexerMatch(lex, getKW_DO());
     skipNewlines(lex);
-    
+
     Value result = makeNull();
-    
+    bool handledEnd = false;
+
     if (toBool(cond)) {
         while (!lexerCheck(lex, getKW_END()) && !lexerCheck(lex, getKW_ELSE()) && !lexerCheck(lex, TK_EOF)) {
             result = parseStatement(lex);
             skipNewlines(lex);
-            if (hasReturn) break;
+            if (hasReturn || hasBreak || hasContinue) break;
         }
         if (lexerMatch(lex, getKW_ELSE())) {
             skipNewlines(lex);
-            int depth = 1;
-            while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
-                int kind = lex->currentToken.kind;
-                if (kind == getKW_IF() || kind == getKW_WHILE() || kind == getKW_FUNC()) {
-                    depth++;
+            /* TRUE branch already taken: skip the else / else-if chain entirely */
+            if (lexerCheck(lex, getKW_IF())) {
+                /* else-if chain: depth starts at 0, `if` opener brings it to 1,
+                   the chain's single `end` drops it to 0 → break */
+                int depth = 0;
+                bool prevWasElse = false;
+                while (!lexerCheck(lex, TK_EOF)) {
+                    int kind = lex->currentToken.kind;
+                    if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+                    if (kind == getKW_END()) {
+                        depth--;
+                        if (depth == 0) break;
+                    }
+                    prevWasElse = (kind == getKW_ELSE());
+                    lexerNext(lex);
                 }
-                if (kind == getKW_END()) {
-                    depth--;
+                lexerExpect(lex, getKW_END());
+                handledEnd = true;
+            } else {
+                int depth = 1;
+                bool prevWasElse = false;
+                while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
+                    int kind = lex->currentToken.kind;
+                    if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+                    if (kind == getKW_END()) depth--;
+                    prevWasElse = (kind == getKW_ELSE());
+                    if (depth > 0) lexerNext(lex);
                 }
-                if (depth > 0) lexerNext(lex);
             }
         }
     } else {
         int depth = 1;
+        bool prevWasElse = false;
         while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
             int kind = lex->currentToken.kind;
-            if (kind == getKW_IF() || kind == getKW_WHILE() || kind == getKW_FUNC()) {
-                depth++;
-            }
+            if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+            prevWasElse = (kind == getKW_ELSE());
             if (kind == getKW_END()) {
                 depth--;
+                if (depth == 0) break;
             }
             if (depth == 1 && kind == getKW_ELSE()) {
                 lexerNext(lex);
                 skipNewlines(lex);
+                if (lexerCheck(lex, getKW_IF())) {
+                    result = stmtIf(lex);
+                    handledEnd = true;
+                    break;
+                }
                 while (!lexerCheck(lex, getKW_END()) && !lexerCheck(lex, TK_EOF)) {
                     result = parseStatement(lex);
                     skipNewlines(lex);
-                    if (hasReturn) break;
+                    if (hasReturn || hasBreak || hasContinue) break;
                 }
                 break;
             }
             if (depth > 0) lexerNext(lex);
         }
     }
-    
-    lexerExpect(lex, getKW_END());
+
+    if (!handledEnd) {
+        lexerExpect(lex, getKW_END());
+    }
     return result;
 }
 
 static Value stmtWhileVM(Lexer* lex) {
-    
     lexerExpect(lex, getKW_WHILE());
-    
-    
+
     const char* condStart = lex->start;
-    
     int parenDepth = 0;
     while (!lexerCheck(lex, TK_EOF)) {
         int kind = lex->currentToken.kind;
@@ -1407,48 +1496,42 @@ static Value stmtWhileVM(Lexer* lex) {
         lexerNext(lex);
     }
     const char* condEnd = lex->start;
-    
+
     lexerMatch(lex, getKW_DO());
     skipNewlines(lex);
-    
-    
+
     const char* bodyStart = lex->start;
     int depth = 1;
+    bool prevWasElse = false;
     while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
         int kind = lex->currentToken.kind;
-        if (kind == getKW_WHILE() || kind == getKW_IF() || kind == getKW_FUNC() || kind == getKW_CLASS()) {
-            depth++;
-        }
+        if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
         if (kind == getKW_END()) {
             depth--;
             if (depth == 0) break;
         }
+        prevWasElse = (kind == getKW_ELSE());
         lexerNext(lex);
     }
     const char* bodyEnd = lex->start;
-    
-    
+
     int bodyLen = (int)(bodyEnd - bodyStart);
     char* bodySrc = malloc(bodyLen + 1);
     memcpy(bodySrc, bodyStart, bodyLen);
     bodySrc[bodyLen] = '\0';
-    
+
     int condLen = (int)(condEnd - condStart);
     char* condSrc = malloc(condLen + 1);
     memcpy(condSrc, condStart, condLen);
     condSrc[condLen] = '\0';
-    
-    
-    
-    
-    
-    
+
+    lexerExpect(lex, getKW_END());
+
     Value result = executeWhileLoop(condSrc, bodySrc);
-    
+    hasBreak = false;
+
     free(bodySrc);
     free(condSrc);
-    
-    lexerExpect(lex, getKW_END());
     return result;
 }
 
@@ -1634,7 +1717,7 @@ static Value stmtJavaStyleDecl(Lexer* lex) {
 static Value stmtFunc(Lexer* lex) {
     lexerExpect(lex, getKW_FUNC());
     
-    if (!lexerCheck(lex, TK_IDENTIFIER)) {
+    if (lex->currentToken.kind != TK_IDENTIFIER && lex->currentToken.kind < TK_KEYWORD) {
         runtimeError("Expected function name");
         return makeNull();
     }
@@ -1674,23 +1757,21 @@ static Value stmtFunc(Lexer* lex) {
     const char* bodyStart = lex->start;
     const char* bodyEnd = NULL;
     int depth = 1;
+    bool prevWasElse = false;
     while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
         int kind = lex->currentToken.kind;
-        if (kind == getKW_FUNC() || kind == getKW_IF() || kind == getKW_WHILE()) {
-            depth++;
-        }
-        if (kind == getKW_END()) {
-            depth--;
-        }
+        if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+        if (kind == getKW_END()) depth--;
+        prevWasElse = (kind == getKW_ELSE());
         if (depth > 0) lexerNext(lex);
     }
     bodyEnd = lex->start;
-    
+
     int bodyLen = (int)(bodyEnd - bodyStart);
     char* body = malloc(bodyLen + 1);
     strncpy(body, bodyStart, bodyLen);
     body[bodyLen] = '\0';
-    
+
     JaiFunction* f = defineFunction(name, params, paramCount, isVariadic, body);
     
     for (int i = 0; i < paramCount; i++) free(params[i]);
@@ -1755,7 +1836,7 @@ static Value stmtClass(Lexer* lex) {
         if (lexerCheck(lex, getKW_FUNC())) {
             lexerNext(lex);
             
-            if (!lexerCheck(lex, TK_IDENTIFIER)) {
+            if (lex->currentToken.kind != TK_IDENTIFIER && lex->currentToken.kind < TK_KEYWORD) {
                 runtimeError("Expected method name");
                 return makeNull();
             }
@@ -1795,18 +1876,16 @@ static Value stmtClass(Lexer* lex) {
             const char* bodyStart = lex->start;
             const char* bodyEnd = NULL;
             int depth = 1;
+            bool prevWasElse = false;
             while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
                 int kind = lex->currentToken.kind;
-                if (kind == getKW_FUNC() || kind == getKW_IF() || kind == getKW_WHILE() || kind == getKW_CLASS()) {
-                    depth++;
-                }
-                if (kind == getKW_END()) {
-                    depth--;
-                }
+                if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+                if (kind == getKW_END()) depth--;
+                prevWasElse = (kind == getKW_ELSE());
                 if (depth > 0) lexerNext(lex);
             }
             bodyEnd = lex->start;
-            
+
             int bodyLen = (int)(bodyEnd - bodyStart);
             char* body = malloc(bodyLen + 1);
             strncpy(body, bodyStart, bodyLen);
@@ -2212,9 +2291,251 @@ static Value stmtInput(Lexer* lex) {
 
 static Value stmtBreak(Lexer* lex) {
     lexerExpect(lex, getKW_BREAK());
-    if (!runtime.shellMode) {
-        exit(0);
+    hasBreak = true;
+    return makeNull();
+}
+
+static Value stmtContinue(Lexer* lex) {
+    lexerExpect(lex, getKW_CONTINUE());
+    hasContinue = true;
+    return makeNull();
+}
+
+static Value stmtFor(Lexer* lex) {
+    lexerExpect(lex, getKW_FOR());
+
+    if (!lexerCheck(lex, TK_IDENTIFIER)) {
+        runtimeError("Expected iterator variable after 'for'");
+        return makeNull();
     }
+    char iterName[MAX_NAME_LEN];
+    strcpy(iterName, lex->currentToken.strValue);
+    lexerNext(lex);
+
+    if (!lexerMatch(lex, getKW_IN())) {
+        runtimeError("Expected 'in' after iterator variable");
+        return makeNull();
+    }
+
+    Value iterable = parseExpression(lex);
+
+    lexerMatch(lex, getKW_DO());
+    skipNewlines(lex);
+
+    const char* bodyStart = lex->start;
+    int depth = 1;
+    bool prevWasElse = false;
+    while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
+        int kind = lex->currentToken.kind;
+        if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+        if (kind == getKW_END()) {
+            depth--;
+            if (depth == 0) break;
+        }
+        prevWasElse = (kind == getKW_ELSE());
+        lexerNext(lex);
+    }
+    const char* bodyEnd = lex->start;
+
+    int bodyLen = (int)(bodyEnd - bodyStart);
+    char* bodySrc = malloc(bodyLen + 1);
+    memcpy(bodySrc, bodyStart, bodyLen);
+    bodySrc[bodyLen] = '\0';
+
+    lexerExpect(lex, getKW_END());
+
+    Value result = makeNull();
+
+    if (iterable.type == VAL_ARRAY) {
+        JaiArray* arr = iterable.as.array;
+        for (int i = 0; i < arr->length; i++) {
+            setVariable(iterName, arr->items[i]);
+            bool savedBreak = hasBreak;
+            hasBreak = false;
+            hasContinue = false;
+
+            Lexer bodyLex;
+            lexerInit(&bodyLex, bodySrc);
+            while (!lexerCheck(&bodyLex, TK_EOF)) {
+                result = parseStatement(&bodyLex);
+                while (lexerCheck(&bodyLex, TK_NEWLINE)) lexerNext(&bodyLex);
+                if (hasReturn || hasBreak || hasContinue) break;
+            }
+
+            hasContinue = false;
+            bool doBreak = hasBreak;
+            hasBreak = savedBreak;
+            if (doBreak || hasReturn) break;
+        }
+    } else if (iterable.type == VAL_STRING) {
+        const char* s = iterable.as.string;
+        int slen = (int)strlen(s);
+        for (int i = 0; i < slen; i++) {
+            char ch[2] = {s[i], '\0'};
+            setVariable(iterName, makeString(ch));
+            bool savedBreak = hasBreak;
+            hasBreak = false;
+            hasContinue = false;
+
+            Lexer bodyLex;
+            lexerInit(&bodyLex, bodySrc);
+            while (!lexerCheck(&bodyLex, TK_EOF)) {
+                result = parseStatement(&bodyLex);
+                while (lexerCheck(&bodyLex, TK_NEWLINE)) lexerNext(&bodyLex);
+                if (hasReturn || hasBreak || hasContinue) break;
+            }
+
+            hasContinue = false;
+            bool doBreak = hasBreak;
+            hasBreak = savedBreak;
+            if (doBreak || hasReturn) break;
+        }
+    } else {
+        runtimeError("'for in' requires array or string iterable");
+    }
+
+    free(bodySrc);
+    return result;
+}
+
+static Value stmtTry(Lexer* lex) {
+    lexerExpect(lex, getKW_TRY());
+    skipNewlines(lex);
+
+    const char* tryStart = lex->start;
+    int depth = 0;
+    bool prevWasElse = false;
+    while (!lexerCheck(lex, TK_EOF)) {
+        int kind = lex->currentToken.kind;
+        if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+        if (kind == getKW_END()) {
+            if (depth == 0) break;
+            depth--;
+        }
+        if (depth == 0 && (kind == getKW_EXCEPT() || kind == getKW_FINALLY())) break;
+        prevWasElse = (kind == getKW_ELSE());
+        lexerNext(lex);
+    }
+    const char* tryEnd = lex->start;
+
+    int tryLen = (int)(tryEnd - tryStart);
+    char* trySrc = malloc(tryLen + 1);
+    memcpy(trySrc, tryStart, tryLen);
+    trySrc[tryLen] = '\0';
+
+    char errVarName[MAX_NAME_LEN];
+    strcpy(errVarName, "__exception__");
+    char* exceptSrc = NULL;
+    char* finallySrc = NULL;
+
+    if (lexerMatch(lex, getKW_EXCEPT())) {
+        if (lexerCheck(lex, TK_IDENTIFIER)) {
+            strcpy(errVarName, lex->currentToken.strValue);
+            lexerNext(lex);
+        }
+        lexerMatch(lex, getKW_DO());
+        skipNewlines(lex);
+
+        const char* exceptStart = lex->start;
+        depth = 0;
+        prevWasElse = false;
+        while (!lexerCheck(lex, TK_EOF)) {
+            int kind = lex->currentToken.kind;
+            if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+            if (kind == getKW_END()) {
+                if (depth == 0) break;
+                depth--;
+            }
+            if (depth == 0 && kind == getKW_FINALLY()) break;
+            prevWasElse = (kind == getKW_ELSE());
+            lexerNext(lex);
+        }
+        const char* exceptEnd = lex->start;
+
+        int exceptLen = (int)(exceptEnd - exceptStart);
+        exceptSrc = malloc(exceptLen + 1);
+        memcpy(exceptSrc, exceptStart, exceptLen);
+        exceptSrc[exceptLen] = '\0';
+    }
+
+    if (lexerMatch(lex, getKW_FINALLY())) {
+        lexerMatch(lex, getKW_DO());
+        skipNewlines(lex);
+
+        const char* finallyStart = lex->start;
+        depth = 1;
+        prevWasElse = false;
+        while (depth > 0 && !lexerCheck(lex, TK_EOF)) {
+            int kind = lex->currentToken.kind;
+            if (isBlockOpener(kind) && !(kind == getKW_IF() && prevWasElse)) depth++;
+            if (kind == getKW_END()) {
+                depth--;
+                if (depth == 0) break;
+            }
+            prevWasElse = (kind == getKW_ELSE());
+            lexerNext(lex);
+        }
+        const char* finallyEnd = lex->start;
+
+        int finallyLen = (int)(finallyEnd - finallyStart);
+        finallySrc = malloc(finallyLen + 1);
+        memcpy(finallySrc, finallyStart, finallyLen);
+        finallySrc[finallyLen] = '\0';
+    }
+
+    lexerExpect(lex, getKW_END());
+
+    Value result = makeNull();
+    ErrorHandler savedHandler = gErrorHandler;
+    gErrorHandler.active = true;
+
+    if (setjmp(gErrorHandler.buf) == 0) {
+        Lexer tryLex;
+        lexerInit(&tryLex, trySrc);
+        while (!lexerCheck(&tryLex, TK_EOF)) {
+            result = parseStatement(&tryLex);
+            while (lexerCheck(&tryLex, TK_NEWLINE)) lexerNext(&tryLex);
+            if (hasReturn) break;
+        }
+    } else {
+        if (exceptSrc) {
+            setVariable(errVarName, makeString(gErrorHandler.message));
+            gErrorHandler = savedHandler;
+            Lexer exceptLex;
+            lexerInit(&exceptLex, exceptSrc);
+            while (!lexerCheck(&exceptLex, TK_EOF)) {
+                result = parseStatement(&exceptLex);
+                while (lexerCheck(&exceptLex, TK_NEWLINE)) lexerNext(&exceptLex);
+                if (hasReturn) break;
+            }
+        } else {
+            gErrorHandler = savedHandler;
+        }
+    }
+
+    gErrorHandler = savedHandler;
+
+    if (finallySrc) {
+        Lexer finallyLex;
+        lexerInit(&finallyLex, finallySrc);
+        while (!lexerCheck(&finallyLex, TK_EOF)) {
+            parseStatement(&finallyLex);
+            while (lexerCheck(&finallyLex, TK_NEWLINE)) lexerNext(&finallyLex);
+        }
+    }
+
+    free(trySrc);
+    if (exceptSrc) free(exceptSrc);
+    if (finallySrc) free(finallySrc);
+    return result;
+}
+
+static Value stmtRaise(Lexer* lex) {
+    lexerExpect(lex, getKW_RAISE());
+    Value msg = parseExpression(lex);
+    char* msgStr = valueToString(msg);
+    runtimeError("%s", msgStr);
+    free(msgStr);
     return makeNull();
 }
 
@@ -2472,24 +2793,57 @@ Value parseStatement(Lexer* lex) {
                         objectSetField(result.as.object, fieldName, val);
                         return val;
                     }
+                    else if (lexerCheck(lex, TK_PLUS_ASSIGN) || lexerCheck(lex, TK_MINUS_ASSIGN) ||
+                             lexerCheck(lex, TK_STAR_ASSIGN) || lexerCheck(lex, TK_SLASH_ASSIGN) ||
+                             lexerCheck(lex, TK_PERCENT_ASSIGN)) {
+                        int op = lex->currentToken.kind;
+                        lexerNext(lex);
+                        Value rhs = parseExpression(lex);
+                        Value lhs = objectGetField(result.as.object, fieldName);
+                        Value val;
+                        double l = toNumber(lhs), r = toNumber(rhs);
+                        if (op == TK_PLUS_ASSIGN) {
+                            if (lhs.type == VAL_STRING) {
+                                char* ls = valueToString(lhs);
+                                char* rs = valueToString(rhs);
+                                char buf[MAX_NAME_LEN * 4];
+                                snprintf(buf, sizeof(buf), "%s%s", ls, rs);
+                                free(ls); free(rs);
+                                val = makeString(buf);
+                            } else { val = makeNumber(l + r); }
+                        } else if (op == TK_MINUS_ASSIGN) { val = makeNumber(l - r); }
+                        else if (op == TK_STAR_ASSIGN)  { val = makeNumber(l * r); }
+                        else if (op == TK_SLASH_ASSIGN) { val = r != 0 ? makeNumber(l / r) : makeNull(); }
+                        else { val = makeNumber(fmod(l, r)); }
+                        objectSetField(result.as.object, fieldName, val);
+                        return val;
+                    }
                     else {
                         result = objectGetField(result.as.object, fieldName);
                     }
                 } else if (lexerMatch(lex, TK_LBRACKET)) {
                     Value index = parseExpression(lex);
                     lexerExpect(lex, TK_RBRACKET);
-                    
+
                     if (lexerCheck(lex, TK_EQUALS)) {
                         lexerNext(lex);
                         Value val = parseExpression(lex);
                         if (result.type == VAL_ARRAY) {
                             arraySet(result.as.array, (int)toNumber(index), val);
+                        } else if (result.type == VAL_OBJECT) {
+                            char* ks = valueToString(index);
+                            objectSetField(result.as.object, ks, val);
+                            free(ks);
                         }
                         return val;
                     }
-                    
+
                     if (result.type == VAL_ARRAY) {
                         result = arrayGet(result.as.array, (int)toNumber(index));
+                    } else if (result.type == VAL_OBJECT) {
+                        char* ks = valueToString(index);
+                        result = objectGetField(result.as.object, ks);
+                        free(ks);
                     }
                 }
             }
@@ -2502,7 +2856,33 @@ Value parseStatement(Lexer* lex) {
             setVariable(name, val);
             return val;
         }
-        
+
+        if (lexerCheck(lex, TK_PLUS_ASSIGN) || lexerCheck(lex, TK_MINUS_ASSIGN) ||
+            lexerCheck(lex, TK_STAR_ASSIGN) || lexerCheck(lex, TK_SLASH_ASSIGN) ||
+            lexerCheck(lex, TK_PERCENT_ASSIGN)) {
+            int op = lex->currentToken.kind;
+            lexerNext(lex);
+            Value rhs = parseExpression(lex);
+            Value lhs = getVariable(name);
+            Value val;
+            double l = toNumber(lhs), r = toNumber(rhs);
+            if (op == TK_PLUS_ASSIGN) {
+                if (lhs.type == VAL_STRING) {
+                    char* ls = valueToString(lhs);
+                    char* rs = valueToString(rhs);
+                    char buf[MAX_NAME_LEN * 4];
+                    snprintf(buf, sizeof(buf), "%s%s", ls, rs);
+                    free(ls); free(rs);
+                    val = makeString(buf);
+                } else { val = makeNumber(l + r); }
+            } else if (op == TK_MINUS_ASSIGN) { val = makeNumber(l - r); }
+            else if (op == TK_STAR_ASSIGN)  { val = makeNumber(l * r); }
+            else if (op == TK_SLASH_ASSIGN) { val = r != 0 ? makeNumber(l / r) : makeNull(); }
+            else { val = makeNumber(fmod(l, r)); }
+            setVariable(name, val);
+            return val;
+        }
+
         if (lexerCheck(lex, TK_LPAREN)) {
             lexerNext(lex);
             Value args[MAX_CALL_ARGS];
@@ -2541,7 +2921,7 @@ Value parseProgram(Lexer* lex) {
 }
 
 Value callValue(Value callee, Value* args, int argc) {
-    static int callDepth = 0;
+    static _Thread_local int callDepth = 0;
     callDepth++;
     if (callDepth > MAX_CALL_STACK) {
         callDepth--;
@@ -2554,14 +2934,15 @@ Value callValue(Value callee, Value* args, int argc) {
         callDepth--;
         return r;
     }
-    
+
     if (callee.type == VAL_FUNCTION) {
         JaiFunction* f = callee.as.function;
-        
-        if (runtime.callStackSize < MAX_CALL_STACK) {
+        bool inWorker = tls_isWorkerThread;
+
+        if (!inWorker && runtime.callStackSize < MAX_CALL_STACK) {
             strncpy(runtime.callStack[runtime.callStackSize++], f->name, MAX_NAME_LEN - 1);
         }
-        
+
         if (f->isVariadic) {
             int minArgs = f->paramCount - 1;
             if (argc < minArgs) {
@@ -2574,10 +2955,10 @@ Value callValue(Value callee, Value* args, int argc) {
             callDepth--;
             return makeNull();
         }
-        
-    Module* oldMod = runtime.currentModule;
-    
-    CompiledFunc* compiled = getCompiledFunc(f);
+
+    Module* oldMod = inWorker ? tls_execModule : runtime.currentModule;
+
+    CompiledFunc* compiled = !inWorker ? getCompiledFunc(f) : NULL;
     if (compiled) {
         statsVMCalls++;
         VM* vm = malloc(sizeof(VM));
@@ -2590,23 +2971,29 @@ Value callValue(Value callee, Value* args, int argc) {
         Value result = vmResult == INTERPRET_OK ? vm->result : makeNull();
         vmFree(vm);
         free(vm);
-        
+
         runtime.currentModule = oldMod;
         if (runtime.callStackSize > 0) runtime.callStackSize--;
         callDepth--;
-        
+
         if (vmResult != INTERPRET_OK) {
-            statsVMCalls--;  
+            statsVMCalls--;
             goto INTERPRET_FALLBACK;
         }
         return result;
     }
-    
+
 INTERPRET_FALLBACK: ;
     statsInterpretCalls++;
-    Module* funcMod = createModule("__call__", "");
-    runtime.currentModule = funcMod;
-    
+    Module* funcMod;
+    if (inWorker) {
+        funcMod = createLocalModule();
+        tls_execModule = funcMod;
+    } else {
+        funcMod = createModule("__call__", "");
+        runtime.currentModule = funcMod;
+    }
+
     if (f->namespace) {
         for (int i = 0; i < f->namespace->varCount; i++) {
             setVariable(f->namespace->variables[i].name, f->namespace->variables[i].value);
@@ -2617,7 +3004,7 @@ INTERPRET_FALLBACK: ;
             }
         }
     }
-    
+
     if (f->isVariadic) {
         int regularParams = f->paramCount - 1;
         for (int i = 0; i < regularParams; i++) {
@@ -2635,19 +3022,19 @@ INTERPRET_FALLBACK: ;
             setTypedVariable(f->params[i], args[i], tname);
         }
     }
-    
+
     hasReturn = false;
     Value result = makeNull();
-    
+
     Lexer bodyLex;
     lexerInit(&bodyLex, f->body);
     result = parseProgram(&bodyLex);
-    
+
     if (hasReturn) {
         result = returnValue;
         hasReturn = false;
     }
-    
+
     if (f->namespace) {
         for (int i = 0; i < f->namespace->varCount; i++) {
             for (int j = 0; j < funcMod->varCount; j++) {
@@ -2658,14 +3045,18 @@ INTERPRET_FALLBACK: ;
             }
         }
     }
-    
-    runtime.currentModule = oldMod;
-    runtime.moduleCount--;
-    
-    if (runtime.callStackSize > 0) {
-        runtime.callStackSize--;
+
+    if (inWorker) {
+        freeLocalModule(funcMod);
+        tls_execModule = oldMod;
+    } else {
+        runtime.currentModule = oldMod;
+        runtime.moduleCount--;
+        if (runtime.callStackSize > 0) {
+            runtime.callStackSize--;
+        }
     }
-    
+
     callDepth--;
     return result;
 }
@@ -2712,17 +3103,72 @@ static Value nativeTime(Value* args, int argc) {
     return makeNumber(tv.tv_sec + tv.tv_usec / 1000000.0);
 }
 
+static _Thread_local unsigned int tls_randSeed = 0;
+
 static Value nativeRand(Value* args, int argc) {
     (void)args; (void)argc;
-    return makeNumber((double)rand() / RAND_MAX);
+    if (tls_randSeed == 0) {
+        tls_randSeed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    }
+    return makeNumber((double)rand_r(&tls_randSeed) / RAND_MAX);
 }
 
 static Value nativeLen(Value* args, int argc) {
     if (argc < 1) return makeNumber(0);
-    if (args[0].type == VAL_STRING) {
-        return makeNumber(strlen(args[0].as.string));
-    }
+    if (args[0].type == VAL_STRING) return makeNumber(strlen(args[0].as.string));
+    if (args[0].type == VAL_ARRAY) return makeNumber(args[0].as.array->length);
+    if (args[0].type == VAL_OBJECT) return makeNumber(args[0].as.object->fieldCount);
     return makeNumber(0);
+}
+
+static Value nativeDictKeys(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_OBJECT) return makeArray(0);
+    JaiObject* obj = args[0].as.object;
+    Value arr = makeArray(obj->fieldCount);
+    for (int i = 0; i < obj->fieldCount; i++) {
+        arrayPush(arr.as.array, makeString(obj->fieldNames[i]));
+    }
+    return arr;
+}
+
+static Value nativeDictValues(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_OBJECT) return makeArray(0);
+    JaiObject* obj = args[0].as.object;
+    Value arr = makeArray(obj->fieldCount);
+    for (int i = 0; i < obj->fieldCount; i++) {
+        arrayPush(arr.as.array, obj->fields[i]);
+    }
+    return arr;
+}
+
+static Value nativeDictHas(Value* args, int argc) {
+    if (argc < 2 || args[0].type != VAL_OBJECT || args[1].type != VAL_STRING) return makeBool(false);
+    JaiObject* obj = args[0].as.object;
+    for (int i = 0; i < obj->fieldCount; i++) {
+        if (strcmp(obj->fieldNames[i], args[1].as.string) == 0) return makeBool(true);
+    }
+    return makeBool(false);
+}
+
+static Value nativeDictDel(Value* args, int argc) {
+    if (argc < 2 || args[0].type != VAL_OBJECT || args[1].type != VAL_STRING) return makeBool(false);
+    JaiObject* obj = args[0].as.object;
+    for (int i = 0; i < obj->fieldCount; i++) {
+        if (strcmp(obj->fieldNames[i], args[1].as.string) == 0) {
+            free(obj->fieldNames[i]);
+            for (int j = i + 1; j < obj->fieldCount; j++) {
+                obj->fieldNames[j-1] = obj->fieldNames[j];
+                obj->fields[j-1] = obj->fields[j];
+            }
+            obj->fieldCount--;
+            return makeBool(true);
+        }
+    }
+    return makeBool(false);
+}
+
+static Value nativeDictNew(Value* args, int argc) {
+    return makeObject(NULL);
 }
 
 static Value nativeStr(Value* args, int argc) {
@@ -2906,13 +3352,27 @@ static Value nativeSubstr(Value* args, int argc) {
 
 static Value nativeConcat(Value* args, int argc) {
     if (argc < 2) return makeString("");
-    char buf[4096] = "";
+    /* dynamically sized — no fixed cap (was a 4096-byte buffer that
+       silently truncated large concatenations, e.g. saved weight files) */
+    size_t total = 0;
     for (int i = 0; i < argc; i++) {
-        if (args[i].type == VAL_STRING) {
-            strncat(buf, args[i].as.string, sizeof(buf) - strlen(buf) - 1);
+        if (args[i].type == VAL_STRING && args[i].as.string)
+            total += strlen(args[i].as.string);
+    }
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return makeString("");
+    size_t pos = 0;
+    for (int i = 0; i < argc; i++) {
+        if (args[i].type == VAL_STRING && args[i].as.string) {
+            size_t l = strlen(args[i].as.string);
+            memcpy(buf + pos, args[i].as.string, l);
+            pos += l;
         }
     }
-    return makeString(buf);
+    buf[pos] = '\0';
+    Value v = makeString(buf);
+    free(buf);
+    return v;
 }
 
 static Value nativeArray(Value* args, int argc) {
@@ -2960,6 +3420,110 @@ static Value nativeAlen(Value* args, int argc) {
         return makeNumber(0);
     }
     return makeNumber(arrayLen(args[0].as.array));
+}
+
+/* --- Fixed-size memory buffer primitive (bootstrap foundation for arrays) --- */
+static Value nativeBuf(Value* args, int argc) {
+    int n = (argc >= 1) ? (int)toNumber(args[0]) : 0;
+    if (n < 0) n = 0;
+    Value v = makeArray(n > 0 ? n : 1);
+    for (int i = 0; i < n; i++) arrayPush(v.as.array, makeNull());
+    return v;
+}
+
+static Value nativeBget(Value* args, int argc) {
+    if (argc < 2 || args[0].type != VAL_ARRAY) {
+        runtimeError("_bget requires (buf, index)");
+        return makeNull();
+    }
+    return arrayGet(args[0].as.array, (int)toNumber(args[1]));
+}
+
+static Value nativeBset(Value* args, int argc) {
+    if (argc < 3 || args[0].type != VAL_ARRAY) {
+        runtimeError("_bset requires (buf, index, value)");
+        return makeNull();
+    }
+    arraySet(args[0].as.array, (int)toNumber(args[1]), args[2]);
+    return args[2];
+}
+
+static Value nativeBlen(Value* args, int argc) {
+    if (argc < 1 || args[0].type != VAL_ARRAY) return makeNumber(0);
+    return makeNumber(arrayLen(args[0].as.array));
+}
+
+/* --- char <-> code primitives --- */
+static Value nativeOrd(Value* args, int argc) {
+    if (argc < 1) return makeNumber(0);
+    if (args[0].type == VAL_STRING && args[0].as.string && args[0].as.string[0])
+        return makeNumber((unsigned char)args[0].as.string[0]);
+    if (args[0].type == VAL_CHAR) return makeNumber((unsigned char)args[0].as.ch);
+    return makeNumber(0);
+}
+
+static Value nativeChr(Value* args, int argc) {
+    if (argc < 1) return makeString("");
+    char buf[2] = { (char)(int)toNumber(args[0]), '\0' };
+    return makeString(buf);
+}
+
+/* --- GPU matmul builtins --- */
+static double* arrayToDoubles(JaiArray* a, int* outN) {
+    int n = arrayLen(a);
+    double* d = (double*)malloc((n > 0 ? n : 1) * sizeof(double));
+    for (int i = 0; i < n; i++) d[i] = toNumber(arrayGet(a, i));
+    *outN = n;
+    return d;
+}
+
+static Value nativeGpuMatmul(Value* args, int argc) {
+    if (argc < 5 || args[0].type != VAL_ARRAY || args[1].type != VAL_ARRAY) {
+        runtimeError("_gpu_matmul requires (aFlat, bFlat, M, K, N)");
+        return makeNull();
+    }
+    int M = (int)toNumber(args[2]);
+    int K = (int)toNumber(args[3]);
+    int N = (int)toNumber(args[4]);
+    int an, bn;
+    double* A = arrayToDoubles(args[0].as.array, &an);
+    double* B = arrayToDoubles(args[1].as.array, &bn);
+    Value r = makeNull();
+    if (M > 0 && K > 0 && N > 0 && an >= M * K && bn >= K * N) {
+        r = gpuMatmul(A, B, M, K, N);
+    } else {
+        runtimeError("_gpu_matmul dimension mismatch");
+    }
+    free(A); free(B);
+    return r;
+}
+
+static Value nativeGpuMatmulBatched(Value* args, int argc) {
+    if (argc < 6 || args[0].type != VAL_ARRAY || args[1].type != VAL_ARRAY) {
+        runtimeError("_gpu_matmul_batched requires (aFlat, bFlat, batch, M, K, N)");
+        return makeNull();
+    }
+    int batch = (int)toNumber(args[2]);
+    int M = (int)toNumber(args[3]);
+    int K = (int)toNumber(args[4]);
+    int N = (int)toNumber(args[5]);
+    int an, bn;
+    double* A = arrayToDoubles(args[0].as.array, &an);
+    double* B = arrayToDoubles(args[1].as.array, &bn);
+    Value r = makeNull();
+    if (batch > 0 && M > 0 && K > 0 && N > 0 &&
+        an >= batch * M * K && bn >= batch * K * N) {
+        r = gpuMatmulBatched(A, B, batch, M, K, N);
+    } else {
+        runtimeError("_gpu_matmul_batched dimension mismatch");
+    }
+    free(A); free(B);
+    return r;
+}
+
+static Value nativeGpuAvailable(Value* args, int argc) {
+    (void)args; (void)argc;
+    return makeBool(gpuIsAvailable());
 }
 
 static Value nativeFopen(Value* args, int argc) {
@@ -3041,6 +3605,10 @@ void initParser(void) {
     registerStatement(getKW_IMPORT(), stmtImport);
     registerStatement(getKW_INPUT(), stmtInput);
     registerStatement(getKW_BREAK(), stmtBreak);
+    registerStatement(getKW_CONTINUE(), stmtContinue);
+    registerStatement(getKW_FOR(), stmtFor);
+    registerStatement(getKW_TRY(), stmtTry);
+    registerStatement(getKW_RAISE(), stmtRaise);
     registerStatement(getKW_SYSTEM(), stmtSystem);
     registerStatement(getKW_DEL(), stmtDel);
     registerStatement(getKW_CLASS(), stmtClass);
@@ -3085,6 +3653,11 @@ void initParser(void) {
     setVariable("_exp", makeNativeFunc(nativeExp));
     setVariable("_time", makeNativeFunc(nativeTime));
     setVariable("_rand", makeNativeFunc(nativeRand));
+    setVariable("_pmap", makeNativeFunc(nativeParallelMap));
+    setVariable("_pfor", makeNativeFunc(nativeParallelFor));
+    setVariable("_gpu_matmul", makeNativeFunc(nativeGpuMatmul));
+    setVariable("_gpu_matmul_batched", makeNativeFunc(nativeGpuMatmulBatched));
+    setVariable("_gpu_available", makeNativeFunc(nativeGpuAvailable));
     setVariable("_len", makeNativeFunc(nativeLen));
     setVariable("_str", makeNativeFunc(nativeStr));
     setVariable("_num", makeNativeFunc(nativeNum));
@@ -3114,10 +3687,23 @@ void initParser(void) {
     setVariable("_set", makeNativeFunc(nativeSet));
     setVariable("_alen", makeNativeFunc(nativeAlen));
 
+    setVariable("_buf", makeNativeFunc(nativeBuf));
+    setVariable("_bget", makeNativeFunc(nativeBget));
+    setVariable("_bset", makeNativeFunc(nativeBset));
+    setVariable("_blen", makeNativeFunc(nativeBlen));
+    setVariable("_ord", makeNativeFunc(nativeOrd));
+    setVariable("_chr", makeNativeFunc(nativeChr));
+
     setVariable("_fopen", makeNativeFunc(nativeFopen));
     setVariable("_fclose", makeNativeFunc(nativeFclose));
     setVariable("_fread", makeNativeFunc(nativeFread));
     setVariable("_fwrite", makeNativeFunc(nativeFwrite));
     setVariable("_input", makeNativeFunc(nativeInput));
     setVariable("_system", makeNativeFunc(nativeSystem));
+
+    setVariable("_dict_keys", makeNativeFunc(nativeDictKeys));
+    setVariable("_dict_values", makeNativeFunc(nativeDictValues));
+    setVariable("_dict_has", makeNativeFunc(nativeDictHas));
+    setVariable("_dict_del", makeNativeFunc(nativeDictDel));
+    setVariable("_dict", makeNativeFunc(nativeDictNew));
 }

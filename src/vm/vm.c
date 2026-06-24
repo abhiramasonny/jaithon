@@ -226,6 +226,14 @@ InterpretResult vmExecute(VM* vm) {
                 vmPush(vm, constant);
                 break;
             }
+
+            case OP_CONST_W: {
+                uint8_t hi = readByte(frame);
+                uint8_t lo = readByte(frame);
+                int idx = (hi << 8) | lo;
+                vmPush(vm, frame->function->chunk.constants[idx]);
+                break;
+            }
             
             case OP_POP: {
                 vmPop(vm);
@@ -383,44 +391,56 @@ InterpretResult vmExecute(VM* vm) {
             case OP_LT: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (!isNumericVM(a) || !isNumericVM(b)) {
-                    fprintf(stderr, "VM Error: Operands must be numbers\n");
+                if (a.type == VAL_STRING && b.type == VAL_STRING) {
+                    vmPush(vm, makeBool(strcmp(a.as.string, b.as.string) < 0));
+                } else if (isNumericVM(a) && isNumericVM(b)) {
+                    vmPush(vm, makeBool(toNumberVM(a) < toNumberVM(b)));
+                } else {
+                    fprintf(stderr, "VM Error: Operands must be numbers or strings\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(toNumberVM(a) < toNumberVM(b)));
                 break;
             }
-            
+
             case OP_LE: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (!isNumericVM(a) || !isNumericVM(b)) {
-                    fprintf(stderr, "VM Error: Operands must be numbers\n");
+                if (a.type == VAL_STRING && b.type == VAL_STRING) {
+                    vmPush(vm, makeBool(strcmp(a.as.string, b.as.string) <= 0));
+                } else if (isNumericVM(a) && isNumericVM(b)) {
+                    vmPush(vm, makeBool(toNumberVM(a) <= toNumberVM(b)));
+                } else {
+                    fprintf(stderr, "VM Error: Operands must be numbers or strings\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(toNumberVM(a) <= toNumberVM(b)));
                 break;
             }
-            
+
             case OP_GT: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (!isNumericVM(a) || !isNumericVM(b)) {
-                    fprintf(stderr, "VM Error: Operands must be numbers\n");
+                if (a.type == VAL_STRING && b.type == VAL_STRING) {
+                    vmPush(vm, makeBool(strcmp(a.as.string, b.as.string) > 0));
+                } else if (isNumericVM(a) && isNumericVM(b)) {
+                    vmPush(vm, makeBool(toNumberVM(a) > toNumberVM(b)));
+                } else {
+                    fprintf(stderr, "VM Error: Operands must be numbers or strings\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(toNumberVM(a) > toNumberVM(b)));
                 break;
             }
-            
+
             case OP_GE: {
                 Value b = vmPop(vm);
                 Value a = vmPop(vm);
-                if (!isNumericVM(a) || !isNumericVM(b)) {
-                    fprintf(stderr, "VM Error: Operands must be numbers\n");
+                if (a.type == VAL_STRING && b.type == VAL_STRING) {
+                    vmPush(vm, makeBool(strcmp(a.as.string, b.as.string) >= 0));
+                } else if (isNumericVM(a) && isNumericVM(b)) {
+                    vmPush(vm, makeBool(toNumberVM(a) >= toNumberVM(b)));
+                } else {
+                    fprintf(stderr, "VM Error: Operands must be numbers or strings\n");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                vmPush(vm, makeBool(toNumberVM(a) >= toNumberVM(b)));
                 break;
             }
             
@@ -518,11 +538,16 @@ InterpretResult vmExecute(VM* vm) {
             case OP_ARRAY_GET: {
                 Value index = vmPop(vm);
                 Value arr = vmPop(vm);
+                if (arr.type == VAL_OBJECT) {
+                    char* ks = valueToString(index);
+                    Value v = objectGetField(arr.as.object, ks);
+                    free(ks);
+                    vmPush(vm, v);
+                    break;
+                }
                 if (arr.type != VAL_ARRAY) {
                     double val = 0;
-                    if (isNumericVM(arr)) {
-                        val = toNumberVM(arr);
-                    }
+                    if (isNumericVM(arr)) val = toNumberVM(arr);
                     const char* fname = (frame && frame->function) ? frame->function->name : "<unknown>";
                     fprintf(stderr, "VM Error: Cannot index non-array (type=%d, value=%g) in %s\n", arr.type, val, fname);
                     return INTERPRET_RUNTIME_ERROR;
@@ -534,16 +559,21 @@ InterpretResult vmExecute(VM* vm) {
                 vmPush(vm, arrayGet(arr.as.array, toIntVM(index)));
                 break;
             }
-            
+
             case OP_ARRAY_SET: {
                 Value value = vmPop(vm);
                 Value index = vmPop(vm);
                 Value arr = vmPop(vm);
+                if (arr.type == VAL_OBJECT) {
+                    char* ks = valueToString(index);
+                    objectSetField(arr.as.object, ks, value);
+                    free(ks);
+                    vmPush(vm, value);
+                    break;
+                }
                 if (arr.type != VAL_ARRAY) {
                     double val = 0;
-                    if (isNumericVM(arr)) {
-                        val = toNumberVM(arr);
-                    }
+                    if (isNumericVM(arr)) val = toNumberVM(arr);
                     const char* fname = (frame && frame->function) ? frame->function->name : "<unknown>";
                     fprintf(stderr, "VM Error: Cannot index non-array (type=%d, value=%g) in %s\n", arr.type, val, fname);
                     return INTERPRET_RUNTIME_ERROR;

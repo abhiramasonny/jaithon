@@ -34,6 +34,13 @@ Value callValue(Value callee, Value* args, int argc);
 bool toBool(Value v);
 double toNumber(Value v);
 
+bool parserGetHasBreak(void);
+void parserSetHasBreak(bool v);
+bool parserGetHasContinue(void);
+void parserSetHasContinue(bool v);
+bool parserGetHasReturn(void);
+void parserSetHasReturn(bool v);
+
 
 void printCompilationStats(void);
 

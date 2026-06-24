@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <stdint.h>
+#include <setjmp.h>
 
 #define INITIAL_CAPACITY 64
 #define GROWTH_FACTOR 2
@@ -209,8 +210,23 @@ typedef struct {
     char currentSourceFile[1024];  
 } Runtime;
 
+typedef struct {
+    jmp_buf buf;
+    char message[512];
+    bool active;
+} ErrorHandler;
+
+extern ErrorHandler gErrorHandler;
 extern Runtime runtime;
 extern char gExecDir[1024];
+
+/* Thread-local state for parallel eval workers */
+extern _Thread_local bool tls_isWorkerThread;
+extern _Thread_local Module* tls_execModule;
+
+/* Local module: not registered in runtime.modules, safe for threads */
+Module* createLocalModule(void);
+void freeLocalModule(Module* m);
 
 Value makeNumber(double n);
 Value makeDouble(double n);
@@ -271,6 +287,7 @@ void objectSetField(JaiObject* obj, const char* name, Value value);
 JaiFunction* objectGetMethod(JaiObject* obj, const char* name);
 JaiClass* findClass(const char* name);
 
+char* valueToString(Value v);
 void runtimeError(const char* format, ...);
 
 void registerGuiFunctions(void);

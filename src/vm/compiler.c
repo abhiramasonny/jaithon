@@ -31,11 +31,17 @@ void emitBytes(Compiler* compiler, uint8_t byte1, uint8_t byte2, int line) {
 
 void emitConstant(Compiler* compiler, Value value, int line) {
     int idx = chunkAddConstant(currentChunk(compiler), value);
-    if (idx > 255) {
-        compileError(compiler, "Too many constants in one chunk", line);
+    if (idx > 65535) {
+        compileError(compiler, "Too many constants in one chunk (max 65536)", line);
         return;
     }
-    emitBytes(compiler, OP_CONST, (uint8_t)idx, line);
+    if (idx <= 255) {
+        emitBytes(compiler, OP_CONST, (uint8_t)idx, line);
+    } else {
+        emitByte(compiler, OP_CONST_W, line);
+        emitByte(compiler, (uint8_t)((idx >> 8) & 0xff), line);
+        emitByte(compiler, (uint8_t)(idx & 0xff), line);
+    }
 }
 
 int emitJump(Compiler* compiler, uint8_t instruction, int line) {
@@ -72,8 +78,7 @@ void emitLoop(Compiler* compiler, int loopStart, int line) {
 }
 
 void emitReturn(Compiler* compiler, int line) {
-    emitByte(compiler, OP_CONST, line);
-    emitByte(compiler, chunkAddConstant(currentChunk(compiler), makeNull()), line);
+    emitConstant(compiler, makeNull(), line);
     emitByte(compiler, OP_RETURN, line);
 }
 
@@ -645,7 +650,7 @@ static bool compileBreak(Compiler* compiler, Token* tokens, int* pos, int end) {
     }
     
     LoopInfo* loop = &compiler->loops[compiler->loopDepth - 1];
-    if (loop->breakCount >= 64) {
+    if (loop->breakCount >= 256) {
         compileError(compiler, "Too many breaks in loop", line);
         return false;
     }
