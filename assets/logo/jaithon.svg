@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1000" height="1000" viewBox="0 0 1000 1000"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Jaithon J logo</title>
+  <desc id="desc">A minimal geometric J with a cream-to-warm-orange dual-color gradient.</desc>
+
+  <defs>
+    <linearGradient id="jaithonGradient" x1="0.23" y1="0.08" x2="0.79" y2="0.95">
+      <stop offset="0%" stop-color="#fff4d8"/>
+      <stop offset="48%" stop-color="#f4c57e"/>
+      <stop offset="100%" stop-color="#e48745"/>
+    </linearGradient>
+
+  </defs>
+
+
+
+  <!-- The whole mark is one deliberately simple geometric path. -->
+  <path
+    d="M 350 170
+       H 690
+       V 635
+       C 690 820 586 910 428 910
+       C 261 910 165 818 165 652
+       V 610
+       H 310
+       V 650
+       C 310 735 351 780 427 780
+       C 509 780 545 724 545 630
+       V 315
+       H 350
+       Z"
+    fill="url(#jaithonGradient)"/>
+</svg>
