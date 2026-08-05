@@ -1,0 +1,102 @@
+{
+  "function": {
+    "prefix": "fn",
+    "body": ["fn ${1:name}(${2:params}) -> ${3:void} {", "\t$0", "}"],
+    "description": "Function declaration"
+  },
+  "public function": {
+    "prefix": "pfn",
+    "body": [
+      "#: ${4:One-line summary.}",
+      "pub fn ${1:name}(${2:params}) -> ${3:void} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Documented public function"
+  },
+  "class": {
+    "prefix": "class",
+    "body": [
+      "#: ${2:One-line summary.}",
+      "pub class ${1:Name} {",
+      "\tvar ${3:field}: ${4:int}",
+      "",
+      "\tfn init(self, ${3:field}: ${4:int}) {",
+      "\t\tself.${3:field} = ${3:field}",
+      "\t}",
+      "$0",
+      "}"
+    ],
+    "description": "Class with a constructor"
+  },
+  "trait": {
+    "prefix": "trait",
+    "body": ["pub trait ${1:Name} {", "\tfn ${2:method}(self) -> ${3:void}", "$0", "}"],
+    "description": "Trait declaration"
+  },
+  "enum": {
+    "prefix": "enum",
+    "body": ["pub enum ${1:Name} {", "\t${2:Variant},", "$0", "}"],
+    "description": "Enum declaration"
+  },
+  "if": {
+    "prefix": "if",
+    "body": ["if ${1:condition} {", "\t$0", "}"],
+    "description": "if statement"
+  },
+  "if else": {
+    "prefix": "ife",
+    "body": ["if ${1:condition} {", "\t$2", "} else {", "\t$0", "}"],
+    "description": "if / else"
+  },
+  "for range": {
+    "prefix": "for",
+    "body": ["for ${1:i} in ${2:0}..${3:n} {", "\t$0", "}"],
+    "description": "for over a range"
+  },
+  "for each": {
+    "prefix": "fore",
+    "body": ["for ${1:item} in ${2:items} {", "\t$0", "}"],
+    "description": "for over an iterable"
+  },
+  "while": {
+    "prefix": "while",
+    "body": ["while ${1:condition} {", "\t$0", "}"],
+    "description": "while loop"
+  },
+  "match": {
+    "prefix": "match",
+    "body": ["match ${1:value} {", "\t${2:pattern} => ${3:result},", "\t_ => $0,", "}"],
+    "description": "match expression"
+  },
+  "try": {
+    "prefix": "try",
+    "body": ["try {", "\t$1", "} catch ${2:e}: ${3:Error} {", "\t$0", "}"],
+    "description": "try / catch"
+  },
+  "defer": {
+    "prefix": "defer",
+    "body": ["defer { $0 }"],
+    "description": "defer block"
+  },
+  "test": {
+    "prefix": "test",
+    "body": [
+      "fn test_${1:name}() -> void {",
+      "\tassert_eq(${2:actual}, ${3:expected})",
+      "$0",
+      "}"
+    ],
+    "description": "Test function"
+  },
+  "main": {
+    "prefix": "main",
+    "body": ["fn main() -> int {", "\t$0", "\treturn 0", "}"],
+    "description": "Entry point"
+  },
+  "doc comment": {
+    "prefix": "doc",
+    "body": ["#: ${1:One-line summary.}", "#:", "#: ${2:Details.}"],
+    "description": "Doc comment"
+  }
+}
