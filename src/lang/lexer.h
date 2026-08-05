@@ -1,125 +1,61 @@
-#ifndef LEXER_H
-#define LEXER_H
+/* lexer.h — tokenizer.
+ *
+ * The lexer runs to completion up front and produces a token array. This keeps
+ * the parser's lookahead trivial, makes error recovery cheap, and lets the
+ * formatter reuse the same token stream with trivia attached.
+ */
+#ifndef JAI_LEXER_H
+#define JAI_LEXER_H
 
-#include "../core/runtime.h"
-
-typedef enum {
-    TK_EOF = 0,
-    TK_NUMBER,
-    TK_STRING,
-    TK_IDENTIFIER,
-    TK_PLUS,
-    TK_MINUS,
-    TK_STAR,
-    TK_SLASH,
-    TK_PERCENT,
-    TK_CARET,
-    TK_BANG,
-    TK_LPAREN,
-    TK_RPAREN,
-    TK_LBRACKET,
-    TK_RBRACKET,
-    TK_LBRACE,
-    TK_RBRACE,
-    TK_COMMA,
-    TK_DOT,
-    TK_COLON,
-    TK_EQUALS,
-    TK_EQ_EQ,
-    TK_NE,
-    TK_GT,
-    TK_LT,
-    TK_GE,
-    TK_LE,
-    TK_NEWLINE,
-    TK_FSTRING,
-    TK_PLUS_ASSIGN,
-    TK_MINUS_ASSIGN,
-    TK_STAR_ASSIGN,
-    TK_SLASH_ASSIGN,
-    TK_PERCENT_ASSIGN,
-    TK_KEYWORD = 100
-} TokenKind;
+#include "token.h"
 
 typedef struct {
-    int kind;
-    double numValue;
-    char strValue[MAX_NAME_LEN];
-    int line;
-} Token;
+    const char *source;
+    size_t      length;
+    int         fileId;
 
-typedef struct {
-    const char* source;
-    const char* current;
-    const char* start;
-    int line;
-    Token currentToken;
-    Token peekToken;
-    bool hasPeek;
+    size_t      pos;
+    int         line;
+
+    JAI_VEC(Token)  tokens;
+    /* Cooked text of string literals, indexed by Token.v.strIndex.
+     * Owned by the lexer; jaiLexerTakeStrings transfers ownership. */
+    JAI_VEC(char *) strings;
+    /* Allocated size of strings.data[i], parallel to it. A cooked literal may
+     * contain an embedded NUL (`"\0"`), so strlen is not the size that was
+     * handed out and freeing by strlen+1 misreports oldSize to the
+     * allocator. */
+    JAI_VEC(size_t) stringSizes;
+
+    /* Bracket nesting stack: tracks whether a '{' opened a block or an
+     * expression, which decides whether newlines are significant. */
+    JAI_VEC(uint8_t) brackets;
+    /* Depth of f-string interpolation currently being lexed. */
+    int         interpDepth;
+
+    bool        hadError;
 } Lexer;
 
-void lexerInit(Lexer* lex, const char* source);
-Token lexerNext(Lexer* lex);
-Token lexerPeek(Lexer* lex);
-void lexerExpect(Lexer* lex, int kind);
-bool lexerMatch(Lexer* lex, int kind);
-bool lexerCheck(Lexer* lex, int kind);
-const char* tokenKindName(int kind);
+void jaiLexerInit(Lexer *lex, const char *source, size_t length, int fileId);
+void jaiLexerFree(Lexer *lex);
 
-void registerBuiltinKeywords(void);
+/* Tokenize the whole input. Returns false if any lexical error was reported
+ * (errors go to gDiags; lexing continues so the parser still sees a stream
+ * terminated by TOK_EOF). */
+bool jaiLexerRun(Lexer *lex);
 
-int getKW_VAR(void);
-int getKW_PRINT(void);
-int getKW_IF(void);
-int getKW_THEN(void);
-int getKW_ELSE(void);
-int getKW_DO(void);
-int getKW_WHILE(void);
-int getKW_LOOP(void);
-int getKW_FUNC(void);
-int getKW_RETURN(void);
-int getKW_END(void);
-int getKW_IMPORT(void);
-int getKW_FROM(void);
-int getKW_AS(void);
-int getKW_AND(void);
-int getKW_OR(void);
-int getKW_NOT(void);
-int getKW_XOR(void);
-int getKW_TRUE(void);
-int getKW_FALSE(void);
-int getKW_NULL(void);
-int getKW_INPUT(void);
-int getKW_BREAK(void);
-int getKW_SYSTEM(void);
-int getKW_CLASS(void);
-int getKW_NEW(void);
-int getKW_EXTENDS(void);
-int getKW_SELF(void);
-int getKW_NAMESPACE(void);
-int getKW_PUBLIC(void);
-int getKW_PRIVATE(void);
-int getKW_PROTECTED(void);
-int getKW_STATIC(void);
-int getKW_IN(void);
-int getKW_VOID(void);
-int getKW_INT(void);
-int getKW_DOUBLE(void);
-int getKW_FLOAT(void);
-int getKW_STRING(void);
-int getKW_CHAR(void);
-int getKW_LONG(void);
-int getKW_SHORT(void);
-int getKW_BYTE(void);
-int getKW_BOOL(void);
-int getKW_DEL(void);
-int getKW_FOR(void);
-int getKW_TRY(void);
-int getKW_EXCEPT(void);
-int getKW_FINALLY(void);
-int getKW_RAISE(void);
-int getKW_CONTINUE(void);
+/* Cooked text of a string-literal token, NUL-terminated. */
+const char *jaiTokenStringValue(const Lexer *lex, const Token *tok, size_t *outLen);
+/* Raw source text of any token (points into the source buffer). */
+const char *jaiTokenText(const Lexer *lex, const Token *tok, size_t *outLen);
+/* Span for diagnostics. */
+JaiSpan     jaiTokenSpan(const Lexer *lex, const Token *tok);
 
-int tokenizeSource(const char* source, Token** outTokens);
+/* Transfer the cooked-string arena to the caller (the parser keeps it alive
+ * for as long as the AST references it). */
+char      **jaiLexerTakeStrings(Lexer *lex, int *outCount);
 
-#endif
+/* Diagnostic helper used by tools: dump the token stream. */
+void jaiLexerDump(FILE *out, const Lexer *lex);
+
+#endif /* JAI_LEXER_H */
