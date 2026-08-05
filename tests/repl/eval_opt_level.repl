@@ -1,0 +1,5 @@
+# args: -O0 --eval=':disasm 1+2'
+# The optimisation level on the command line configures the evaluator behind
+# --eval, not just the one behind `repl`: at -O0 the two operands are still
+# there to be added at run time, where the default folds them to a 3.
+print("stdin was read")

@@ -1,0 +1,5 @@
+# args: --strict
+fn f(x) { return x }
+:reset
+fn g(y) { return y }
+print("done")

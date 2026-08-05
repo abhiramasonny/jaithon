@@ -1,0 +1,9 @@
+:type 1 + 2
+:type 1.5
+:type "hi"
+:type true
+:type null
+:type [1, 2, 3]
+:type ({"a": 1})
+let n = 7
+:type n

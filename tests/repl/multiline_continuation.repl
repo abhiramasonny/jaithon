@@ -1,0 +1,25 @@
+fn f() {
+  return 7
+}
+print(f())
+fn g() {
+
+  return 3
+
+}
+print(g())
+let total = 1 +
+  2
+print(total)
+let nested = [[1,
+2], [3]]
+print(nested)
+let text = """a
+b"""
+print(text)
+#* one
+two *#
+print("comment survived")
+let n = 2
+print(f"""x
+{n}""")

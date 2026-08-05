@@ -1,0 +1,5 @@
+# args: --eval=let=5
+# An input a diagnostic stopped never ran, and --eval says so with the same
+# status the piped prompt gives it. `let=5` rather than `let = 5` only because
+# the flag list is split like a command line and this one needs no quoting.
+print("stdin was read")

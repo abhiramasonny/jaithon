@@ -1,0 +1,15 @@
+meta-commands:
+  :help            this message
+  :quit            leave the REPL (Ctrl-D does the same)
+  :clear           clear the screen
+  :vars            list the bindings of this session
+  :type EXPR       evaluate EXPR and print the type of the result
+  :ast EXPR        print the syntax tree of EXPR without running it
+  :disasm EXPR     print the bytecode EXPR compiles to, without running it
+  :time EXPR       evaluate EXPR and report how long it took
+  :load PATH       run a file in this session
+  :reset           forget every binding and start over
+  :cancel          throw away the input being typed at the `...` prompt
+
+EXPR may be any statement. A line that does not start with `:` is
+Jaithon: bindings persist, and a bare expression prints its value.

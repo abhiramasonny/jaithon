@@ -1,0 +1,14 @@
+error[E0400]: parameter `x` has no type annotation
+  --> <repl:1>:1:6
+   |
+ 1 | fn f(x) { return x }
+   |      ^
+   |
+help: --strict requires every parameter to be annotated
+error[E0400]: parameter `y` has no type annotation
+  --> <repl:2>:1:6
+   |
+ 1 | fn g(y) { return y }
+   |      ^
+   |
+help: --strict requires every parameter to be annotated

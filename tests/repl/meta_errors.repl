@@ -1,0 +1,8 @@
+:bogus
+:type
+:ast
+:disasm
+:time
+:load
+:load no_such_file.jai
+:type 1 +

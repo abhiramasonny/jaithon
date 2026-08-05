@@ -1,0 +1,7 @@
+# args: --eval=nope
+# A name nothing bound is a deferred global at the prompt, so this compiles and
+# then fails where it runs: stdout stays empty and the traceback is the one the
+# prompt prints. The status is 1, which is the status `printf 'nope\n' |
+# jaithon repl` ends with: --eval shares the REPL's evaluator, so it has to
+# share the REPL's verdict on what it evaluated.
+print("stdin was read")

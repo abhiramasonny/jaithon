@@ -1,0 +1,4 @@
+print("before quit")
+fn h() {
+:quit
+print("after quit")

@@ -1,0 +1,5 @@
+# A diagnostic that stopped an input before it ran is a failure too, even
+# though the session went on to finish the file.
+print("before")
+let = 5
+print("after")

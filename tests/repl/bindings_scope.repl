@@ -1,0 +1,17 @@
+let x = 1
+let x = 2
+print(x)
+fn peek() -> int {
+    return later
+}
+let later = 40
+print(peek() + x)
+if true {
+    let inner = 5
+    print(inner)
+}
+print(inner)
+print("still going")
+let len = 3
+print(len)
+print(x + len)

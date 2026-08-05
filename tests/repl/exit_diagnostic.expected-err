@@ -1,0 +1,5 @@
+error[E0110]: expected a pattern, found `=`
+  --> <repl:2>:1:5
+   |
+ 1 | let = 5
+   |     ^

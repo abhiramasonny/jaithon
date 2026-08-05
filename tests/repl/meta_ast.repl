@@ -1,0 +1,4 @@
+:ast 1 + 2
+:ast print("this must not run")
+:ast let never_bound = 1
+:vars

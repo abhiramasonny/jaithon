@@ -1,0 +1,16 @@
+== __repl__ ==
+; 9 bytes, 0 constants, 0 caches
+0000     1  OP_INT                 1
+0003     |  OP_INT                 2
+0006     |  OP_ADD
+0007     |  OP_POP
+0008     |  OP_RETURN_NULL
+
+== __repl__ ==
+; 14 bytes, 2 constants, 1 cache
+0000     1  OP_GET_GLOBAL          0 c0               ; "print"  cache 0
+0006     |  OP_CONST               1                  ; "this must not run"
+0010     |  OP_CALL                1                  ; 1 arg
+0012     |  OP_POP
+0013     |  OP_RETURN_NULL
+

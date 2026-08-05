@@ -1,0 +1,12 @@
+{"a": 1}
+{1, 2}
+:type {"a": 1}
+let d = {
+"k": 9,
+}
+print(d["k"])
+{ print("still a block") }
+{
+let inner = 5
+print(inner)
+}

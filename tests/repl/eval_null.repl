@@ -1,0 +1,4 @@
+# args: --eval='print("ok")'
+# A null result is the absence of a result and prints nothing, at the prompt
+# and here alike: the only output is print's own, never a trailing `null`.
+print("stdin was read")

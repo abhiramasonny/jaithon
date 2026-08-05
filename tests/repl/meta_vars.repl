@@ -1,0 +1,7 @@
+:vars
+let greeting = "hi"
+var count = 41
+fn double(n: int) -> int {
+    return n * 2
+}
+:vars

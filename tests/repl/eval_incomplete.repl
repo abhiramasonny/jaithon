@@ -1,0 +1,4 @@
+# args: --eval=1+
+# There is no continuation prompt to ask for the rest of it, so an input that
+# is not a whole statement is refused rather than waited on.
+print("stdin was read")

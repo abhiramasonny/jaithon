@@ -1,0 +1,8 @@
+error: unknown meta-command `:bogus`; :help lists them all
+error: :type expects an expression
+error: :ast expects an expression
+error: :disasm expects an expression
+error: :time expects an expression
+error: :load expects a path
+error: cannot read no_such_file.jai
+error: :type: the expression is incomplete

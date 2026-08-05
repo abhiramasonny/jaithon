@@ -1,0 +1,9 @@
+# A session where every input ran: the process must exit 0. A warning is not a
+# failure, and neither is an exception the program itself caught.
+let n = 1 + 2
+n
+fn twice(x: int) -> int { return x + x
+  print("unreachable") }
+try { throw ValueError("handled") } catch e { print("caught " + str(e)) }
+print(twice(n))
+:quit

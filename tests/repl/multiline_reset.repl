@@ -1,0 +1,5 @@
+let kept = 1
+fn h() {
+:reset
+:vars
+print("back")

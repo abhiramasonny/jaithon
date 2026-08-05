@@ -1,0 +1,23 @@
+42
+ValueError: expected a positive number, got -1
+ParseError: not a number: abc
+caught as IOError: no such file: /nope
+lookup problem: bad index
+lookup problem: bad key
+handled: inner failure
+finally ran
+normal
+finally ran
+caught
+body
+defer 2
+defer 1
+7
+cleanup B
+cleanup A
+after defers: failing
+IndexError caught
+KeyError caught
+DivisionByZeroError caught
+AssertionError: arithmetic is broken
+done

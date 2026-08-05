@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<repl>", line 1, in __repl__
+    print(g.v)
+NameError: undefined name 'g'
+error[E0402]: unknown type `Ghost`
+  --> <repl:5>:1:12
+   |
+ 1 | let stale: Ghost = 1
+   |            ^^^^^

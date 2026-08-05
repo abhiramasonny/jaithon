@@ -1,0 +1,7 @@
+:cancel
+fn h() {
+:cancel
+print("back")
+let total = 1 +
+
+print("recovered")
