@@ -1,9 +1,29 @@
-# Compiled binary
-jaithon
+# Build output
+/jaithon
+/jaithon-dbg
+/build/
+*.o
+*.d
+*.dSYM/
+
+# Benchmark and example output
+*.ppm
 
 # Bytecode cache
 __jaicache__/
 *.jaic
 
-# macOS
+# Generated documentation
+/docs/api/
+
+# Benchmark baselines are committed; local scratch runs are not
+/tests/bench/*.local.json
+
+# Editor and OS noise
 .DS_Store
+*.swp
+.vscode/ipch/
+compile_commands.json
+.cache/
+build-*/
+jaithon-*
