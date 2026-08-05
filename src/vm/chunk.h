@@ -1,0 +1,279 @@
+/* chunk.h — bytecode chunks and the opcode enumeration.
+ *
+ * Normative reference: spec/BYTECODE.md. The order of OpCode here defines the
+ * on-disk format; append new opcodes at the end and bump JAI_COMPILER_VERSION.
+ */
+#ifndef JAI_CHUNK_H
+#define JAI_CHUNK_H
+
+#include "../common/common.h"
+#include "table.h"
+#include "value.h"
+
+typedef enum {
+    /* --- constants and stack (spec §3.1) --- */
+    OP_NOP,
+    OP_CONST,            /* u24 K */
+    OP_NULL,
+    OP_TRUE,
+    OP_FALSE,
+    OP_INT,              /* i16 */
+    OP_POP,
+    OP_POPN,             /* u8 */
+    OP_DUP,
+    OP_DUP2,
+    OP_SWAP,
+    OP_ROT3,
+
+    /* --- variables (spec §3.2) --- */
+    OP_GET_LOCAL,        /* u16 S */
+    OP_SET_LOCAL,        /* u16 S */
+    OP_GET_UPVALUE,      /* u8 U */
+    OP_SET_UPVALUE,      /* u8 U */
+    OP_CLOSE_UPVALUE,
+    OP_GET_GLOBAL,       /* u24 K, u16 C */
+    OP_SET_GLOBAL,       /* u24 K, u16 C */
+    OP_DEF_GLOBAL,       /* u24 K */
+    OP_GET_MODULE,       /* u24 K(module), u24 K(member) */
+
+    /* --- arithmetic and logic (spec §3.3) --- */
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW,
+    OP_ADD_WRAP, OP_SUB_WRAP, OP_MUL_WRAP,
+    OP_NEG, OP_POS,
+    OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_BNOT,
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
+    OP_IS, OP_IS_NOT, OP_IN, OP_NOT_IN,
+    OP_NOT,
+    OP_CONCAT,
+
+    /* fused forms emitted by the peephole pass */
+    OP_ADD_INT_CONST,        /* u16 S, i16 */
+    OP_INC_LOCAL,            /* u16 S, i8  */
+    OP_CMP_LOCAL_CONST_LT,   /* u16 S, i16 */
+    OP_GET_LOCAL2,           /* u16 S, u16 S */
+    OP_ADD_LOCALS,           /* u16 S, u16 S */
+
+    /* --- control flow (spec §3.4) --- */
+    OP_JUMP,                 /* i16 J */
+    OP_JUMP_IF_FALSE,        /* i16 J */
+    OP_JUMP_IF_TRUE,         /* i16 J */
+    OP_JUMP_IF_FALSE_KEEP,   /* i16 J */
+    OP_JUMP_IF_TRUE_KEEP,    /* i16 J */
+    OP_JUMP_IF_NULL,         /* i16 J */
+    OP_LOOP,                 /* i16 J (backward) */
+    OP_GET_ITER,
+    OP_FOR_ITER,             /* i16 J */
+
+    /* --- calls (spec §3.5) --- */
+    OP_CALL,                 /* u8 A */
+    OP_CALL_KW,              /* u8 A, u24 K */
+    OP_CALL_SPREAD,          /* u8 A */
+    OP_INVOKE,               /* u24 K, u8 A, u16 C */
+    OP_SUPER_INVOKE,         /* u24 K, u8 A */
+    OP_TAIL_CALL,            /* u8 A */
+    OP_RETURN,
+    OP_RETURN_NULL,
+    OP_CLOSURE,              /* u24 K, then upvalueCount * (u8 isLocal, u16 index) */
+
+    /* --- data structures (spec §3.6) --- */
+    OP_BUILD_LIST,           /* u16 */
+    OP_BUILD_DICT,           /* u16 */
+    OP_BUILD_SET,            /* u16 */
+    OP_BUILD_TUPLE,          /* u16 */
+    OP_BUILD_RANGE,          /* u8 inclusive */
+    OP_LIST_APPEND,          /* u16 depth */
+    OP_DICT_INSERT,          /* u16 depth */
+    OP_SET_ADD,              /* u16 depth */
+    OP_GET_INDEX,
+    OP_SET_INDEX,
+    OP_GET_SLICE,            /* u8 flags */
+    OP_SET_SLICE,            /* u8 flags */
+    OP_UNPACK,               /* u8 count, u8 restIndex (255 = no rest) */
+
+    /* --- objects and classes (spec §3.7) --- */
+    OP_CLASS,                /* u24 K */
+    OP_INHERIT,
+    OP_IMPL_TRAIT,           /* u24 K */
+    OP_METHOD,               /* u24 K, u8 fnFlags, u8 visibility */
+    OP_FIELD_DEF,            /* u24 K, u8: 0-1 visibility, 2 static, 3 let */
+    OP_GET_FIELD,            /* u24 K, u16 C */
+    OP_SET_FIELD,            /* u24 K, u16 C */
+    OP_GET_SUPER,            /* u24 K */
+    OP_NEW,                  /* u24 K, u8 A */
+    OP_ENUM_NEW,             /* u24 K, u8 tag, u8 A */
+    OP_ENUM_TAG,
+    OP_ENUM_FIELD,           /* u8 */
+    OP_IS_INSTANCE,          /* u24 K */
+
+    /* --- exceptions and defer (spec §3.8) --- */
+    OP_THROW,
+    OP_RERAISE,
+    OP_PUSH_HANDLER,         /* i16 J, u24 K */
+    OP_POP_HANDLER,
+    OP_PUSH_FINALLY,         /* i16 J */
+    OP_END_FINALLY,
+    OP_PUSH_DEFER,           /* u24 K */
+    OP_RUN_DEFERS,
+    OP_MATCH_EXC,            /* u24 K */
+    OP_GET_EXC,
+
+    /* --- pattern matching (spec §3.9) --- */
+    OP_MATCH_CONST,          /* u24 K, i16 J */
+    OP_MATCH_RANGE,          /* u24 K, u24 K, u8 inclusive, i16 J */
+    OP_MATCH_TYPE,           /* u24 K, i16 J */
+    OP_MATCH_SEQ,            /* u8 count, u8 restFlag, i16 J */
+    OP_MATCH_FIELDS,         /* u24 K, i16 J */
+    OP_BIND,                 /* u16 S */
+
+    /* --- modules and misc (spec §3.10) --- */
+    OP_IMPORT,               /* u24 K */
+    OP_IMPORT_FROM,          /* u24 K */
+    OP_EXPORT,               /* u24 K */
+    OP_ASSERT_FAIL,          /* u24 K */
+    OP_TYPE_GUARD,           /* u24 K */
+    OP_HALT,
+
+    /* --- fused forms appended after compiler version 13 (spec §3.3) ---
+     *
+     * Appended here rather than beside the older fused forms because the
+     * enumeration order is the on-disk encoding: inserting one in the middle
+     * renumbers every opcode above it and silently misreads every cached
+     * .jaic. Each of these replaces a pair the VM was measured executing
+     * millions of times per benchmark run. */
+    OP_GET_FIELD_LOCAL,      /* u16 S, u24 K, u16 C */
+    OP_FOR_ITER_BIND,        /* i16 J, u16 S */
+    OP_JUMP_IF_CMP_FALSE,    /* u8 cmp (an OP_EQ..OP_GE byte), i16 J */
+
+    /* --- string interpolation (spec §3.6) --- */
+    OP_FORMAT,               /* u8 N, u24 litmask, u24 K("str"), u16 C */
+
+    /* --- fused form appended after compiler version 15 (spec §3.3) ---
+     *
+     * `while i < N` and `if n < 2` are a loop guard and a base case, which is
+     * to say the two most frequently executed conditionals there are, and both
+     * lowered to three instructions: push the local, push the constant,
+     * compare-and-branch. This is all three. The constant is a pool index
+     * rather than an immediate so that a guard against a large literal — the
+     * case OP_CMP_LOCAL_CONST_LT's i16 cannot reach — fuses too. */
+    OP_JUMP_IF_CMP_LOCAL_K,  /* u8 cmp (an OP_EQ..OP_GE byte), u16 S, u24 K, i16 J */
+
+    /* --- numeric widening, appended after compiler version 17 (spec §3.3) ---
+     *
+     * Converts the int on top of the stack to a float. The checker emits it
+     * wherever §2.2's int-to-float widening applies and both types are known,
+     * so that statically typed code pays a conversion and not the type test
+     * the `any` path in the arithmetic opcodes pays. */
+    OP_TO_FLOAT,
+
+    OP_COUNT
+} OpCode;
+
+/* Length in bytes of the operands following `op` (not counting the opcode
+ * byte). OP_CLOSURE is variable-length; callers must special-case it. */
+int  jaiOpOperandSize(OpCode op);
+const char *jaiOpName(OpCode op);
+/* Net stack effect, or INT32_MIN when it depends on operands. */
+int  jaiOpStackEffect(OpCode op);
+/* Byte offset of the u16 inline-cache operand inside `op`'s operand run, or -1
+ * when it has none. One definition, because two used to exist — the verifier's
+ * and the .jaic reader's — and adding OP_GET_FIELD_LOCAL to one and not the
+ * other silently gave every deserialised chunk too few cache slots, which
+ * costs no correctness and all of the performance. */
+int  jaiOpCacheOperand(OpCode op);
+
+/* ------------------------------------------------------------------ */
+/* Line tables (spec §5)                                                */
+/*                                                                      */
+/* Despite the name these hold source *spans*, not line numbers, and    */
+/* they are not compressed: one flat 12-byte entry per covered range.   */
+/* A span is what jaiChunkSpanAt hands the diagnostic printer, which is */
+/* how a caret lands under one expression rather than a whole line.     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t offset;   /* first code offset covered */
+    uint32_t span;     /* source span start (byte offset in the source file) */
+    uint32_t spanEnd;
+} LineEntry;
+
+/* ------------------------------------------------------------------ */
+/* Inline caches                                                        */
+/*                                                                      */
+/* Allocated per chunk and indexed by a u16 operand baked into the      */
+/* instruction, so a cache lookup is one array index with no hashing.   */
+/* The code generator hands out slots with jaiChunkAddCache.            */
+/* ------------------------------------------------------------------ */
+
+typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
+
+#define JAI_IC_WAYS 4
+
+typedef struct {
+    uint8_t  state;
+    uint8_t  count;
+    uint32_t shapeId[JAI_IC_WAYS];   /* ObjClass.shapeId or ObjModule.version */
+    uint32_t payload[JAI_IC_WAYS];   /* field slot or global table index */
+    Value    cached[JAI_IC_WAYS];    /* bound method for INVOKE sites */
+} InlineCache;
+
+typedef struct {
+    uint8_t   *code;
+    int        count;
+    int        capacity;
+
+    ValueArray constants;
+
+    LineEntry *lines;      /* parallel run-length table, sorted by offset */
+    int        lineCount;
+    int        lineCapacity;
+
+    InlineCache *caches;
+    int          cacheCount;
+    int          cacheCapacity;
+
+    /* Constant-pool dedup index: hash of a constant -> its pool index. Built
+     * lazily by jaiChunkAddConstant once the pool outgrows a linear scan, so
+     * NULL means "not built yet", never "empty". Owned by the chunk and freed
+     * by jaiChunkFree. Not serialised (it is derived from `constants`) and not
+     * traced by the GC (every key and value is an int). */
+    JaiTable  *constIndex;
+
+    int        sourceFileId;
+} Chunk;
+
+void jaiChunkInit(Chunk *chunk, int sourceFileId);
+/* Reserve a fresh inline-cache slot; returns its index (fits in u16). */
+uint16_t jaiChunkAddCache(Chunk *chunk);
+void jaiChunkFree(Chunk *chunk);
+
+void jaiChunkWrite(Chunk *chunk, uint8_t byte, uint32_t spanStart, uint32_t spanEnd);
+void jaiChunkWriteU16(Chunk *chunk, uint16_t v, uint32_t s, uint32_t e);
+void jaiChunkWriteU24(Chunk *chunk, uint32_t v, uint32_t s, uint32_t e);
+void jaiChunkWriteI16(Chunk *chunk, int16_t v, uint32_t s, uint32_t e);
+void jaiChunkPatchU16(Chunk *chunk, int offset, uint16_t v);
+void jaiChunkPatchI16(Chunk *chunk, int offset, int16_t v);
+
+/* Appends `v` and returns its index, deduplicating equal constants. */
+uint32_t jaiChunkAddConstant(Chunk *chunk, Value v);
+/* Source span covering the instruction at `codeOffset`. */
+void     jaiChunkSpanAt(const Chunk *chunk, int codeOffset, uint32_t *start,
+                        uint32_t *end);
+
+JAI_INLINE uint16_t jaiReadU16(const uint8_t *p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+JAI_INLINE uint32_t jaiReadU24(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
+JAI_INLINE int16_t jaiReadI16(const uint8_t *p) {
+    return (int16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+/* ------------------------------------------------------------------ */
+/* Disassembly                                                          */
+/* ------------------------------------------------------------------ */
+
+void jaiDisassembleChunk(FILE *out, const Chunk *chunk, const char *name);
+int  jaiDisassembleInstruction(FILE *out, const Chunk *chunk, int offset);
+
+#endif /* JAI_CHUNK_H */
