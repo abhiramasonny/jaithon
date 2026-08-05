@@ -6,9 +6,7 @@
 
 **The best parts of Java merged with python**
 
-[Language Reference](spec/LANGUAGE.md) &nbsp;•&nbsp;
-[Bytecode Spec](spec/BYTECODE.md) &nbsp;•&nbsp;
-[Style Guide](spec/STYLE.md)
+[Language Guide](LANGUAGE.md)
 
 </div>
 
@@ -115,8 +113,7 @@ let squares = [x ** 2 for x in 0..10 if x % 2 == 0]
 let first_ten = iter(source).map(parse).filter(is_valid).take(10).collect()
 ```
 
-The complete reference sheet is in [`spec/LANGUAGE.md`](spec/LANGUAGE.md), and the grammar is
-in its §15.
+A tour of the whole language is in [`LANGUAGE.md`](LANGUAGE.md).
 
 ---
 
