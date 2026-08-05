@@ -1,0 +1,4 @@
+# args: --eval='"abc".upper()'
+# The value is echoed the way the prompt echoes it, which is repr and not str:
+# a string comes back quoted.
+print("stdin was read")

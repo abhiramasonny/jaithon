@@ -1,0 +1,66 @@
+42
+1000000
+255
+493
+10
+3.5
+1000.0
+0.025
+true
+false
+null
+hello
+single quotes
+raw\nnot-a-newline
+escapes: 	| \ " ✓
+triple
+line
+Jaithon 3
+100
+7
+2.0
+10
+4
+21
+3.5
+3
+-4
+1
+2
+1024
+512
+8
+14
+6
+-6
+256
+16
+true
+true
+false
+true
+true
+true
+true
+false
+false
+true
+false
+-1
+5
+big
+concat
+ababab
+HELLO
+hello
+pad
+["a", "b", "c"]
+x,y,z
+5
+e
+el
+o
+true
+3 + 4 = 7
+0.750
+{literal braces}

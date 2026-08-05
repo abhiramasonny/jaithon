@@ -1,0 +1,6 @@
+# args: --eval=$'fn h(x) { return x*3 }\nh(4)'
+# A shell hands --eval whatever was between the quotes, newlines included, and
+# the REPL's door takes one line: the argument is fed a line at a time, so this
+# is the same session as typing the two lines at the prompt. Fed whole it was
+# one input, and the second line was `unexpected `h` after the statement`.
+print("stdin was read")

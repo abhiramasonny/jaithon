@@ -1,0 +1,5 @@
+warning[W0102]: unreachable code: the previous statement always transfers control
+  --> <repl:3>:2:3
+   |
+ 2 |   print("unreachable") }
+   |   ^^^^^^^^^^^^^^^^^^^^

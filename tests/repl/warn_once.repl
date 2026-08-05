@@ -1,0 +1,7 @@
+# The REPL reads a line as a trial parse and then again for real, so a warning
+# that reaches the diagnostic bag from a trial is printed twice — three times
+# for a line starting with `{`, which is tried as a block and as an expression.
+# Every parser warning is suppressed during a trial, so each of these is
+# reported exactly once, the way `jaithon run` reports it.
+let x = 2 ^ 3
+{4 ^ 5, 9}

@@ -1,0 +1,7 @@
+error[E0001]: unterminated string literal at end of line
+  --> <repl:1>:1:19
+   |
+ 1 | let s = """a""" + "oops
+   |                   ^^^^^
+   |
+help: use a triple-quoted string to span lines

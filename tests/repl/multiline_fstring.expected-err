@@ -1,0 +1,7 @@
+error[E0008]: unterminated f-string interpolation at end of file
+  --> <repl:10>:2:1
+   |
+ 2 | 
+   | ^
+   |
+help: close it with `}` and the string's quote

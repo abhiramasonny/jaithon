@@ -1,0 +1,3 @@
+let long_ascii = "abcdefghij" * 8
+let long_utf8 = "héllo wörld " * 8
+:vars

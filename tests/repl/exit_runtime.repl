@@ -1,0 +1,6 @@
+# An exception nothing caught is a failure of the session, and the next input
+# still runs: the status says what happened, it does not end anything.
+print("before")
+nosuchname
+print("after")
+:quit

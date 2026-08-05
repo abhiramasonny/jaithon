@@ -1,0 +1,7 @@
+:load bindings_module.jai
+let t: Tag = Tag("loaded")
+print(t.label)
+fn label_of(tag: Tag) -> str {
+    return shout(tag.label)
+}
+print(label_of(t))

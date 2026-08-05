@@ -1,0 +1,4 @@
+:load loaded_module.jai
+loaded_value
+loaded_double(loaded_value)
+:vars

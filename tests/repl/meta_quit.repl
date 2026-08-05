@@ -1,0 +1,3 @@
+print("before quit")
+:quit
+print("after quit")

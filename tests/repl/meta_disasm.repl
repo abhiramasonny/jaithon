@@ -1,0 +1,3 @@
+# args: -O0
+:disasm 1 + 2
+:disasm print("this must not run")

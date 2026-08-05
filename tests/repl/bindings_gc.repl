@@ -1,0 +1,21 @@
+# args: --gc-stress
+class Node {
+    pub var v: int
+
+    fn init(self, v: int) {
+        self.v = v
+    }
+}
+let kept = Node(11)
+let names = ["a", "b", "c"]
+var total = 0
+for i in 0..200 {
+    total = total + Node(i).v
+}
+print(total)
+print(kept.v)
+print(names)
+fn make(v: int) -> Node {
+    return Node(v)
+}
+print(make(5).v)

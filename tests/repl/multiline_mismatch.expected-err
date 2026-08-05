@@ -1,0 +1,4 @@
+error: `}` at line 1, column 20 does not close the `[` opened at line 1
+error: `]` at line 1, column 9 closes nothing
+error: `)` at line 4, column 1 does not close the `[` opened at line 1
+error: `]` at line 1, column 3 does not close the `(` opened at line 1

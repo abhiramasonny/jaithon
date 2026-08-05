@@ -1,0 +1,13 @@
+error[E0110]: expected a pattern, found `=`
+  --> <repl:1>:1:5
+   |
+ 1 | let = = =
+   |     ^
+error[E0107]: expected `)` to close this argument list, found `2`
+  --> <repl:3>:1:6
+   |
+ 1 | print(1 2)
+   |      ^ unclosed argument list opened here
+   |         - `2` reached before the `)`
+   |
+help: add the matching `)`

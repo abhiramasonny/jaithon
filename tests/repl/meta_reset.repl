@@ -1,0 +1,7 @@
+# args: -O0
+let kept = 1
+:vars
+:disasm 1 + 2
+:reset
+:vars
+:disasm 1 + 2

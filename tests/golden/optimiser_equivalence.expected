@@ -1,0 +1,47 @@
+42
+40
+42
+true
+false
+42
+true
+4.0
+2.5
+0.5
+2.5
+unsupported operand types for '-': 'str' and 'int'
+ab
+[1, 2]
+unsupported operand types for '+': 'str' and 'int'
+'<' is not supported between 'list' and 'int'
+1
+2
+1
+2
+1
+1
+2
+'<' is not supported between 'list' and 'int'
+'<' is not supported between 'str' and 'int'
+2
+1
+1
+2
+operand of 'not' must be bool, not 'int'; there is no truthiness in Jaithon
+1
+36
+0
+24
+360
+3
+7
+42
+0
+10
+20
+2
+20
+100
+200
+7
+done

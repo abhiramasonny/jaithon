@@ -1,0 +1,15 @@
+grow: container changed size during iteration
+shrink: container changed size during iteration
+churn: container was modified during iteration
+store: container was modified during iteration
+slice: container was modified during iteration
+sort: container was modified during iteration
+reverse: container was modified during iteration
+clear: container changed size during iteration
+dict grow: container changed size during iteration
+dict store: container was modified during iteration
+set grow: container changed size during iteration
+copied: [2, 4, 6]
+filtered: [1, 3]
+after: [1, 3, 5]
+immutable: 12

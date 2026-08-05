@@ -1,0 +1,16 @@
+(program
+  (expr_stmt
+    (binary op=+
+      (int_lit 1)
+      (int_lit 2))))
+(program
+  (expr_stmt
+    (call
+      (ident name=print)
+      (arg
+        (str_lit "this must not run")))))
+(program
+  (var_decl kind=VD_LET
+    (pat_bind name=never_bound)
+    (int_lit 1)))
+  (no bindings yet)

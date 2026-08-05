@@ -1,0 +1,19 @@
+let a = [1,
+:vars
+:help
+:type 1
+:load nothing.jai
+:clear
+:ast 1
+:disasm 1
+:time 1
+2]
+print(a)
+let b = 1 +
+:vars
+2
+print(b)
+let xs = [1, 2, 3, 4]
+let s = xs[1
+:3]
+print(s)

@@ -1,0 +1,43 @@
+class Point {
+    pub var x: int
+    pub var y: int
+
+    fn init(self, x: int, y: int) {
+        self.x = x
+        self.y = y
+    }
+}
+fn shift(p: Point, dx: int) -> Point {
+    return Point(p.x + dx, p.y)
+}
+let moved: Point = shift(Point(1, 2), 10)
+print(moved.x)
+enum Suit {
+    Hearts,
+    Spades
+}
+fn describe(s: Suit) -> str {
+    return f"suit {s}"
+}
+print(describe(Suit.Spades))
+trait Shape {
+    pub fn area(self) -> float
+}
+class Square: Shape {
+    pub var side: float
+
+    fn init(self, side: float) {
+        self.side = side
+    }
+
+    pub fn area(self) -> float {
+        return self.side * self.side
+    }
+}
+fn measure(s: Shape) -> float {
+    return s.area()
+}
+print(measure(Square(3.0)))
+from bindings_module import Tag
+let t: Tag = Tag("done")
+print(t.label)

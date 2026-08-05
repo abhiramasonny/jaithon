@@ -1,0 +1,4 @@
+# args: --eval=1+2
+# --eval evaluates one input and exits, so nothing below is ever read: the
+# line that follows would print if the REPL got as far as stdin.
+print("stdin was read")

@@ -1,0 +1,9 @@
+error: `:vars` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:help` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:type` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:load` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:clear` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:ast` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:disasm` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:time` is not available while an input is being typed; finish it, or `:cancel` to abandon it
+error: `:vars` is not available while an input is being typed; finish it, or `:cancel` to abandon it

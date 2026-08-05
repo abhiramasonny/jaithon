@@ -1,0 +1,18 @@
+let n = 5
+let s = f"""a {n}
+b"""
+print(s)
+let t = f"""x {n +
+1} y"""
+print(t)
+let u = f'''q {n}
+r'''
+print(u)
+let v = rf"""p {n}
+w"""
+print(v)
+let broken = f"z {n
+print("after a one-line f-string that cannot be continued")
+let plain = """A
+B"""
+print(plain)

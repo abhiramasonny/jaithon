@@ -1,0 +1,37 @@
+let greeting = "hello"
+var count = 1
+count = count + 41
+print(count)
+fn double(n: int) -> int {
+    return n * 2
+}
+print(double(count))
+class Counter {
+    pub var n: int
+
+    fn init(self, n: int) {
+        self.n = n
+    }
+
+    pub fn bump(self) {
+        self.n = self.n + 1
+    }
+}
+let c = Counter(7)
+c.bump()
+c.bump()
+print(c.n)
+greeting
+import std.math
+print(math.floor(2.7))
+from bindings_module import shout
+print(shout(greeting))
+fn describe() -> str {
+    return f"{greeting} {count}"
+}
+print(describe())
+fn add_one() {
+    count = count + 1
+}
+add_one()
+print(count)

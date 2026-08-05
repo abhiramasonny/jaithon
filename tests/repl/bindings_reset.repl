@@ -1,0 +1,22 @@
+class Ghost {
+    pub var v: int
+
+    fn init(self) {
+        self.v = 1
+    }
+}
+let g = Ghost()
+print(g.v)
+:reset
+print(g.v)
+let stale: Ghost = 1
+print("reset done")
+class Ghost {
+    pub var v: int
+
+    fn init(self) {
+        self.v = 2
+    }
+}
+let fresh: Ghost = Ghost()
+print(fresh.v)
