@@ -1,0 +1,145 @@
+{
+  "name": "jaithon",
+  "displayName": "Jaithon",
+  "description": "Language support for Jaithon 3: syntax highlighting, diagnostics, formatting, and run commands.",
+  "version": "3.0.0",
+  "publisher": "jaithon",
+  "icon": "icon.png",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCustomEditor:jaithon.jaicViewer",
+    "onLanguage:jaithon"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "jaithon",
+        "aliases": [
+          "Jaithon"
+        ],
+        "extensions": [
+          ".jai"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./file-icon.png",
+          "dark": "./file-icon.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jaithon",
+        "scopeName": "source.jaithon",
+        "path": "./syntaxes/jaithon.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "jaithon.run",
+        "title": "Jaithon: Run File",
+        "icon": "$(play)"
+      },
+      {
+        "command": "jaithon.check",
+        "title": "Jaithon: Check File"
+      },
+      {
+        "command": "jaithon.test",
+        "title": "Jaithon: Run Tests"
+      },
+      {
+        "command": "jaithon.repl",
+        "title": "Jaithon: Start REPL"
+      },
+      {
+        "command": "jaithon.disasm",
+        "title": "Jaithon: Show Bytecode"
+      },
+      {
+        "command": "jaithon.ast",
+        "title": "Jaithon: Show AST"
+      },
+      {
+        "command": "jaithon.disasmImage",
+        "title": "Jaithon: Disassemble .jaic Image"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "jaithon.run",
+          "when": "resourceLangId == jaithon",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "jaithon.disasmImage",
+          "when": "resourceExtname == .jaic",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "jaithon.run",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorLangId == jaithon"
+      }
+    ],
+    "configuration": {
+      "title": "Jaithon",
+      "properties": {
+        "jaithon.path": {
+          "type": "string",
+          "default": "jaithon",
+          "description": "Path to the jaithon executable."
+        },
+        "jaithon.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run 'jaithon check' on save and show diagnostics inline."
+        },
+        "jaithon.formatOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run 'jaithon fmt' on save. The formatter is canonical and has no options."
+        },
+        "jaithon.strict": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pass --strict when checking: unannotated parameters become errors."
+        }
+      }
+    },
+    "snippets": [
+      {
+        "language": "jaithon",
+        "path": "./snippets.json"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "jaithon.jaicViewer",
+        "displayName": "Jaithon Bytecode",
+        "selector": [
+          {
+            "filenamePattern": "*.jaic"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
+  }
+}
