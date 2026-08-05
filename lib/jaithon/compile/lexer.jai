@@ -1,0 +1,1849 @@
+#: The Jaithon tokenizer: source text in, `list[Token]` out.
+#:
+#: This is the self-hosted half of the front end described in spec §11. It is
+#: the mirror of `src/lang/lexer.c` and must agree with it token for token:
+#: `make bootstrap` lexes and parses every file under `lib/` and `tests/` with
+#: both front ends and diffs the result.
+#:
+#: The whole input is tokenized up front. Lexical errors are reported into a
+#: `DiagnosticBag` and recovered from locally, so the parser always receives a
+#: well-formed stream terminated by exactly one `TokenKind.Eof`.
+#:
+#: ```
+#: let tokens = Lexer("x = 1").tokenize()
+#: tokens.len()                    # 4: `x`, `=`, `1`, end of file
+#: tokens[0].kind == TokenKind.Ident      # true
+#: tokens[2].value                 # 1
+#: ```
+#:
+#: Positions. `jaithon.ast.Span` holds **byte** offsets, because that is what the C
+#: front end records and what `--emit=ast` prints. The scanner itself walks
+#: Unicode scalars, so `Lexer` keeps a table mapping each scalar index to its
+#: byte offset and converts once, when a span is built. Source arrives here
+#: already decoded, so the invalid-UTF-8 diagnostic (`E0006`) belongs to
+#: whoever read the file, not to this module.
+from jaithon.ast import Span
+from std.str import StringBuilder
+
+#: Stable diagnostic codes, spelled as in `src/common/diag.h` (spec §13).
+#:
+#: The lexer raises the `E00xx` group; the parser raises the `E01xx` group and
+#: imports these from here so that both halves of the front end name an error
+#: exactly once.
+pub class Code {
+    pub static let E0001_UNTERMINATED_STRING: str = "E0001"
+    pub static let E0002_UNTERMINATED_COMMENT: str = "E0002"
+    pub static let E0003_INVALID_CHARACTER: str = "E0003"
+    pub static let E0004_INVALID_ESCAPE: str = "E0004"
+    pub static let E0005_INVALID_NUMBER: str = "E0005"
+    pub static let E0008_UNTERMINATED_INTERPOLATION: str = "E0008"
+    pub static let E0009_NESTED_INTERPOLATION_TOO_DEEP: str = "E0009"
+    pub static let E0100_UNEXPECTED_TOKEN: str = "E0100"
+    pub static let E0101_EXPECTED_TOKEN: str = "E0101"
+    pub static let E0102_EXPECTED_EXPRESSION: str = "E0102"
+    pub static let E0103_EXPECTED_STATEMENT: str = "E0103"
+    pub static let E0104_EXPECTED_BLOCK: str = "E0104"
+    pub static let E0105_EXPECTED_TYPE: str = "E0105"
+    pub static let E0106_EXPECTED_IDENTIFIER: str = "E0106"
+    pub static let E0107_UNCLOSED_DELIMITER: str = "E0107"
+    pub static let E0108_TRAILING_TOKENS: str = "E0108"
+    pub static let E0109_INVALID_ASSIGN_TARGET: str = "E0109"
+    pub static let E0110_INVALID_PATTERN: str = "E0110"
+    pub static let E0111_DUPLICATE_PARAMETER: str = "E0111"
+    pub static let E0112_PARAM_AFTER_VARIADIC: str = "E0112"
+    pub static let E0113_DEFAULT_BEFORE_REQUIRED: str = "E0113"
+    pub static let E0114_RESERVED_IDENTIFIER: str = "E0114"
+    pub static let E0115_LABEL_NOT_ON_LOOP: str = "E0115"
+    pub static let E0304_MISSING_INITIALIZER: str = "E0304"
+    pub static let E0804_INVALID_MODULE_PATH: str = "E0804"
+    pub static let W0105_DEPRECATED: str = "W0105"
+}
+
+#: How deep f-string interpolations may nest before `E0009`.
+pub const MAX_INTERPOLATION_DEPTH: int = 8
+
+#: Bit flags carried by `Token.flags`, mirroring `TOKF_*` in `src/lang/token.h`.
+pub class TokenFlags {
+    #: The token is the first one on its line.
+    pub static let AFTER_NEWLINE: int = 1
+    #: The literal contained a backslash escape that was cooked away.
+    pub static let HAS_ESCAPE: int = 2
+    #: The literal was written `r"..."`.
+    pub static let RAW_STRING: int = 4
+    #: The literal was written with three quotes.
+    pub static let TRIPLE_STRING: int = 8
+    #: An `Int` holding 9223372036854775808, the magnitude of the smallest
+    #: `int`. It is only accepted directly behind a prefix `-` and its value is
+    #: already negated, so the parser swallows that `-` instead of emitting a
+    #: negation that could not be performed.
+    pub static let NEG_MAGNITUDE: int = 16
+}
+
+# Bracket-stack markers. Everything except `_BRK_BRACE_BLOCK` suppresses
+# newlines: those brackets opened an expression, and an expression may span
+# lines freely (§1.3). An interpolation pushes `_BRK_INTERP` or-ed with the
+# flavour bits of the string it belongs to, so the `}` that closes it knows how
+# to resume scanning the tail. Keeping that on the bracket stack is what lets a
+# nested f-string inside an interpolation be lexed by the same loop, with no
+# recursion and no second stack.
+const _BRK_PAREN = 1
+const _BRK_BRACKET = 2
+const _BRK_BRACE_BLOCK = 3
+const _BRK_BRACE_EXPR = 4
+const _BRK_INTERP = 8
+const _BRK_F_SINGLE = 1
+const _BRK_F_TRIPLE = 2
+const _BRK_F_RAW = 4
+
+#: How loudly a diagnostic speaks.
+pub enum Severity { Error, Warning, Note, Help }
+
+#: One diagnostic: a stable code, a message, and the span it underlines.
+#:
+#: `label`, `with_help` and `with_note` return the diagnostic, so the extra
+#: detail reads as one expression at the site that raised it.
+pub class Diagnostic {
+    #: The stable code, for example `"E0005"`.
+    pub let code: str
+    #: Error or warning.
+    pub let severity: Severity
+    #: The one-line message, lowercase and without a trailing period.
+    pub let message: str
+    #: The span the caret underlines, or null for a whole-file diagnostic.
+    pub let span: Span?
+    #: Secondary underlines, as `(span, label)` pairs; the label may be null.
+    pub var labels: list[tuple[Span, str?]]
+    #: The `help:` line, when there is a concrete fix to suggest.
+    pub var help: str?
+    #: The `note:` line, when background is needed.
+    pub var note: str?
+
+    #: Record one diagnostic; `related` becomes an unlabelled secondary span.
+    pub fn init(
+        self,
+        code: str,
+        severity: Severity,
+        message: str,
+        span: Span?,
+        help: str? = null,
+        related: Span? = null
+    ) {
+        self.code = code
+        self.severity = severity
+        self.message = message
+        self.span = span
+        self.labels = []
+        self.help = help
+        self.note = null
+        if related != null { self.labels.push((related, null)) }
+    }
+
+    #: Underline `span` as well, with `text` beside it.
+    pub fn label(self, span: Span, text: str?) -> Diagnostic {
+        self.labels.push((span, text))
+        return self
+    }
+
+    #: Attach the `help:` line.
+    pub fn with_help(self, text: str) -> Diagnostic {
+        self.help = text
+        return self
+    }
+
+    #: Attach the `note:` line.
+    pub fn with_note(self, text: str) -> Diagnostic {
+        self.note = text
+        return self
+    }
+
+    #: Report whether this diagnostic stops compilation.
+    pub fn is_error(self) -> bool {
+        return self.severity == Severity.Error
+    }
+
+    fn __str__(self) -> str {
+        let label = match self.severity {
+            Severity.Error => "error",
+            Severity.Warning => "warning",
+            Severity.Note => "note",
+            Severity.Help => "help",
+        }
+        return f"{label}[{self.code}]: {self.message}"
+    }
+}
+
+#: Everything reported while compiling one file.
+#:
+#: The lexer and the parser share one bag, so a file's diagnostics come out in
+#: source order regardless of which half produced them.
+pub class DiagnosticBag {
+    #: The diagnostics recorded so far, in the order they were raised.
+    pub var items: list[Diagnostic]
+    #: How many errors were raised, including any past `max_errors`.
+    pub var error_count: int
+    #: How many warnings were raised.
+    pub var warning_count: int
+    #: Stop recording after this many errors; counting continues.
+    pub var max_errors: int
+
+    #: Create an empty bag that stops recording after `max_errors` errors.
+    pub fn init(self, max_errors: int = 25) {
+        if max_errors < 1 { throw ValueError(f"max_errors must be positive, got {max_errors}") }
+        self.items = []
+        self.error_count = 0
+        self.warning_count = 0
+        self.max_errors = max_errors
+    }
+
+    #: Record an error and return it so the caller can attach labels.
+    pub fn error(
+        self,
+        code: str,
+        span: Span?,
+        message: str,
+        help: str? = null,
+        note: str? = null
+    ) -> Diagnostic {
+        let diag = Diagnostic(code, Severity.Error, message, span, help)
+        diag.note = note
+        self.error_count += 1
+        if self.items.len() < self.max_errors { self.items.push(diag) }
+        return diag
+    }
+
+    #: Record a warning and return it.
+    pub fn warn(
+        self,
+        code: str,
+        span: Span?,
+        message: str,
+        help: str? = null,
+        note: str? = null
+    ) -> Diagnostic {
+        let diag = Diagnostic(code, Severity.Warning, message, span, help)
+        diag.note = note
+        self.warning_count += 1
+        self.items.push(diag)
+        return diag
+    }
+
+    #: Report whether any error was raised.
+    pub fn has_errors(self) -> bool {
+        return self.error_count > 0
+    }
+}
+
+#: Every token kind, in the order of `src/lang/token.h`.
+pub enum TokenKind {
+    Eof,
+    Error,
+    Newline,
+
+    Int,
+    Float,
+    Str,
+    FStringStart,
+    FStringMid,
+    FStringEnd,
+    Ident,
+    Label,
+
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+    Comma,
+    Dot,
+    DotDot,
+    DotDotEq,
+    Ellipsis,
+    Colon,
+    Semicolon,
+    Arrow,
+    FatArrow,
+    At,
+    Question,
+    QuestionDot,
+    QuestionQuestion,
+    Underscore,
+
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    SlashSlash,
+    Percent,
+    StarStar,
+    PlusPercent,
+    MinusPercent,
+    StarPercent,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    Eq,
+    EqEq,
+    BangEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    SlashSlashEq,
+    PercentEq,
+    StarStarEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
+
+    KwAnd,
+    KwAs,
+    KwAssert,
+    KwBreak,
+    KwCase,
+    KwCatch,
+    KwClass,
+    KwConst,
+    KwContinue,
+    KwDefer,
+    KwElif,
+    KwElse,
+    KwEnum,
+    KwExport,
+    KwExtends,
+    KwFalse,
+    KwFinally,
+    KwFor,
+    KwFn,
+    KwFrom,
+    KwIf,
+    KwImpl,
+    KwImport,
+    KwIn,
+    KwIs,
+    KwLet,
+    KwLoop,
+    KwMatch,
+    KwModule,
+    KwMut,
+    KwNot,
+    KwNull,
+    KwOr,
+    KwProt,
+    KwPub,
+    KwReturn,
+    KwSelf,
+    KwStatic,
+    KwSuper,
+    KwThrow,
+    KwTrait,
+    KwTrue,
+    KwTry,
+    KwType,
+    KwVar,
+    KwWhile,
+    KwYield,
+}
+
+let _KEYWORDS: dict[str, TokenKind] = {
+    "and": TokenKind.KwAnd,
+    "as": TokenKind.KwAs,
+    "assert": TokenKind.KwAssert,
+    "break": TokenKind.KwBreak,
+    "case": TokenKind.KwCase,
+    "catch": TokenKind.KwCatch,
+    "class": TokenKind.KwClass,
+    "const": TokenKind.KwConst,
+    "continue": TokenKind.KwContinue,
+    "defer": TokenKind.KwDefer,
+    "elif": TokenKind.KwElif,
+    "else": TokenKind.KwElse,
+    "enum": TokenKind.KwEnum,
+    "export": TokenKind.KwExport,
+    "extends": TokenKind.KwExtends,
+    "false": TokenKind.KwFalse,
+    "finally": TokenKind.KwFinally,
+    "for": TokenKind.KwFor,
+    "fn": TokenKind.KwFn,
+    "from": TokenKind.KwFrom,
+    "if": TokenKind.KwIf,
+    "impl": TokenKind.KwImpl,
+    "import": TokenKind.KwImport,
+    "in": TokenKind.KwIn,
+    "is": TokenKind.KwIs,
+    "let": TokenKind.KwLet,
+    "loop": TokenKind.KwLoop,
+    "match": TokenKind.KwMatch,
+    "module": TokenKind.KwModule,
+    "mut": TokenKind.KwMut,
+    "not": TokenKind.KwNot,
+    "null": TokenKind.KwNull,
+    "or": TokenKind.KwOr,
+    "prot": TokenKind.KwProt,
+    "pub": TokenKind.KwPub,
+    "return": TokenKind.KwReturn,
+    "self": TokenKind.KwSelf,
+    "static": TokenKind.KwStatic,
+    "super": TokenKind.KwSuper,
+    "throw": TokenKind.KwThrow,
+    "trait": TokenKind.KwTrait,
+    "true": TokenKind.KwTrue,
+    "try": TokenKind.KwTry,
+    "type": TokenKind.KwType,
+    "var": TokenKind.KwVar,
+    "while": TokenKind.KwWhile,
+    "yield": TokenKind.KwYield,
+}
+
+#: Return the keyword kind spelled `text`, or `TokenKind.Ident`.
+#:
+#: ```
+#: keyword_lookup("fn") == TokenKind.KwFn      # true
+#: keyword_lookup("fns") == TokenKind.Ident    # true
+#: ```
+pub fn keyword_lookup(text: str) -> TokenKind {
+    return _KEYWORDS.get(text, TokenKind.Ident)
+}
+
+#: Return how `kind` is written in source, or a placeholder for the kinds whose
+#: text varies. These strings land verbatim in diagnostics.
+#:
+#: ```
+#: kind_text(TokenKind.StarStar)    # "**"
+#: kind_text(TokenKind.Ident)       # "<identifier>"
+#: ```
+pub fn kind_text(kind: TokenKind) -> str {
+    return match kind {
+        TokenKind.Eof => "<end of file>",
+        TokenKind.Error => "<error>",
+        TokenKind.Newline => "<newline>",
+        TokenKind.Int => "<integer literal>",
+        TokenKind.Float => "<float literal>",
+        TokenKind.Str => "<string literal>",
+        TokenKind.FStringStart => "<f-string>",
+        TokenKind.FStringMid => "<f-string part>",
+        TokenKind.FStringEnd => "<f-string end>",
+        TokenKind.Ident => "<identifier>",
+        TokenKind.Label => "<label>",
+        TokenKind.LParen => "(",
+        TokenKind.RParen => ")",
+        TokenKind.LBracket => "[",
+        TokenKind.RBracket => "]",
+        TokenKind.LBrace => "{",
+        TokenKind.RBrace => "}",
+        TokenKind.Comma => ",",
+        TokenKind.Dot => ".",
+        TokenKind.DotDot => "..",
+        TokenKind.DotDotEq => "..=",
+        TokenKind.Ellipsis => "...",
+        TokenKind.Colon => ":",
+        TokenKind.Semicolon => ";",
+        TokenKind.Arrow => "->",
+        TokenKind.FatArrow => "=>",
+        TokenKind.At => "@",
+        TokenKind.Question => "?",
+        TokenKind.QuestionDot => "?.",
+        TokenKind.QuestionQuestion => "??",
+        TokenKind.Underscore => "_",
+        TokenKind.Plus => "+",
+        TokenKind.Minus => "-",
+        TokenKind.Star => "*",
+        TokenKind.Slash => "/",
+        TokenKind.SlashSlash => "//",
+        TokenKind.Percent => "%",
+        TokenKind.StarStar => "**",
+        TokenKind.PlusPercent => "+%",
+        TokenKind.MinusPercent => "-%",
+        TokenKind.StarPercent => "*%",
+        TokenKind.Amp => "&",
+        TokenKind.Pipe => "|",
+        TokenKind.Caret => "^",
+        TokenKind.Tilde => "~",
+        TokenKind.Shl => "<<",
+        TokenKind.Shr => ">>",
+        TokenKind.Eq => "=",
+        TokenKind.EqEq => "==",
+        TokenKind.BangEq => "!=",
+        TokenKind.Lt => "<",
+        TokenKind.Le => "<=",
+        TokenKind.Gt => ">",
+        TokenKind.Ge => ">=",
+        TokenKind.PlusEq => "+=",
+        TokenKind.MinusEq => "-=",
+        TokenKind.StarEq => "*=",
+        TokenKind.SlashEq => "/=",
+        TokenKind.SlashSlashEq => "//=",
+        TokenKind.PercentEq => "%=",
+        TokenKind.StarStarEq => "**=",
+        TokenKind.AmpEq => "&=",
+        TokenKind.PipeEq => "|=",
+        TokenKind.CaretEq => "^=",
+        TokenKind.ShlEq => "<<=",
+        TokenKind.ShrEq => ">>=",
+        TokenKind.KwAnd => "and",
+        TokenKind.KwAs => "as",
+        TokenKind.KwAssert => "assert",
+        TokenKind.KwBreak => "break",
+        TokenKind.KwCase => "case",
+        TokenKind.KwCatch => "catch",
+        TokenKind.KwClass => "class",
+        TokenKind.KwConst => "const",
+        TokenKind.KwContinue => "continue",
+        TokenKind.KwDefer => "defer",
+        TokenKind.KwElif => "elif",
+        TokenKind.KwElse => "else",
+        TokenKind.KwEnum => "enum",
+        TokenKind.KwExport => "export",
+        TokenKind.KwExtends => "extends",
+        TokenKind.KwFalse => "false",
+        TokenKind.KwFinally => "finally",
+        TokenKind.KwFor => "for",
+        TokenKind.KwFn => "fn",
+        TokenKind.KwFrom => "from",
+        TokenKind.KwIf => "if",
+        TokenKind.KwImpl => "impl",
+        TokenKind.KwImport => "import",
+        TokenKind.KwIn => "in",
+        TokenKind.KwIs => "is",
+        TokenKind.KwLet => "let",
+        TokenKind.KwLoop => "loop",
+        TokenKind.KwMatch => "match",
+        TokenKind.KwModule => "module",
+        TokenKind.KwMut => "mut",
+        TokenKind.KwNot => "not",
+        TokenKind.KwNull => "null",
+        TokenKind.KwOr => "or",
+        TokenKind.KwProt => "prot",
+        TokenKind.KwPub => "pub",
+        TokenKind.KwReturn => "return",
+        TokenKind.KwSelf => "self",
+        TokenKind.KwStatic => "static",
+        TokenKind.KwSuper => "super",
+        TokenKind.KwThrow => "throw",
+        TokenKind.KwTrait => "trait",
+        TokenKind.KwTrue => "true",
+        TokenKind.KwTry => "try",
+        TokenKind.KwType => "type",
+        TokenKind.KwVar => "var",
+        TokenKind.KwWhile => "while",
+        TokenKind.KwYield => "yield",
+    }
+}
+
+#: One token: what it is, where it is, and what it means.
+#:
+#: `text` is the source text the token covers, verbatim. `value` is the cooked
+#: value — an `int` for `Int`, a `float` for `Float`, the unescaped contents for
+#: the four string kinds, and null for everything else, whose meaning is already
+#: in `kind`.
+pub class Token {
+    #: What kind of token this is.
+    pub let kind: TokenKind
+    #: The byte range the token covers.
+    pub let span: Span
+    #: The source text the token covers, verbatim.
+    pub let text: str
+    #: The cooked value, or null when the kind carries no value.
+    pub let value: any
+    #: `TokenFlags` bits.
+    pub let flags: int
+
+    #: Record one token; only the lexer builds these.
+    pub fn init(self, kind: TokenKind, span: Span, text: str, value: any = null, flags: int = 0) {
+        self.kind = kind
+        self.span = span
+        self.text = text
+        self.value = value
+        self.flags = flags
+    }
+
+    #: Report whether `flag`, one of the `TokenFlags` bits, is set.
+    pub fn has_flag(self, flag: int) -> bool {
+        return self.flags & flag != 0
+    }
+
+    #: The cooked text of a string token; the source text of anything else.
+    pub fn string_value(self) -> str {
+        if isinstance(self.value, str) { return self.value }
+        return self.text
+    }
+
+    fn __str__(self) -> str {
+        return f"Token({kind_text(self.kind)}, {self.span.start}..{self.span.end})"
+    }
+}
+
+# Where a string chunk stopped: at its closing quote, at a `{` that opens an
+# interpolation, or at an error.
+enum _ChunkStop { Closed, Interp, Broken }
+
+# The four bits that describe how a string literal was written.
+class _StrFlavor {
+    pub let quote: str
+    pub let triple: bool
+    pub let raw: bool
+    pub let interp: bool
+
+    pub fn init(self, quote: str, triple: bool, raw: bool, interp: bool) {
+        self.quote = quote
+        self.triple = triple
+        self.raw = raw
+        self.interp = interp
+    }
+
+    pub fn closer(self) -> str {
+        if self.triple { return self.quote + self.quote + self.quote }
+        return self.quote
+    }
+}
+
+#: The tokenizer.
+#:
+#: Construct one per source file and call `tokenize`. The lexer keeps the token
+#: list, so a second call re-scans from scratch and replaces it.
+pub class Lexer {
+    #: The source text, exactly as handed to `init`.
+    pub let source: str
+    #: The file id every `Span` this lexer produces refers to.
+    pub let file_id: int
+    #: Where diagnostics go; shared with the parser.
+    pub var diagnostics: DiagnosticBag
+    #: True once a lexical error has been reported.
+    pub var had_error: bool
+
+    let chars: list[str]
+    let offsets: list[int]
+    let length: int
+    var tokens: list[Token]
+    var pos: int
+    var line: int
+    var brackets: list[int]
+    var interp_depth: int
+    var at_line_start: bool
+
+    #: Prepare to tokenize `source`.
+    pub fn init(self, source: str, file_id: int = 0, diagnostics: DiagnosticBag? = null) {
+        self.source = source
+        self.file_id = file_id
+        self.diagnostics = diagnostics ?? DiagnosticBag()
+        self.had_error = false
+        self.chars = [character for character in source]
+        var byte_offset = 0
+        var offsets: list[int] = []
+        for character in self.chars {
+            offsets.push(byte_offset)
+            byte_offset += _utf8_length(ord(character))
+        }
+        offsets.push(byte_offset)
+        self.offsets = offsets
+        self.length = self.chars.len()
+        self.tokens = []
+        self.pos = 0
+        self.line = 1
+        self.brackets = []
+        self.interp_depth = 0
+        self.at_line_start = true
+    }
+
+    #: Scan the whole source and return its tokens, ending with one `Eof`.
+    #:
+    #: ```
+    #: let tokens = Lexer("f(1)\n").tokenize()
+    #: [token.text for token in tokens]     # ["f", "(", "1", ")", "\n", ""]
+    #: ```
+    pub fn tokenize(self) -> list[Token] {
+        self.tokens = []
+        self.brackets = []
+        self.interp_depth = 0
+        self.had_error = false
+        self.pos = 0
+        self.line = 1
+        self.at_line_start = true
+        # A leading byte-order mark is not source text.
+        if self.length > 0 and self.chars[0] == "\u{FEFF}" { self.pos = 1 }
+
+        while self.pos < self.length { self._scan_token() }
+
+        # An interpolation still open at end of file means the f-string never
+        # closed. Each one gets an empty `FStringEnd` so that the parser sees a
+        # balanced sequence rather than a truncated one.
+        if self.interp_depth > 0 {
+            self._error(
+                Code.E0008_UNTERMINATED_INTERPOLATION,
+                self.length,
+                self.length,
+                "unterminated f-string interpolation at end of file",
+                help: "close it with `}` and the string's quote"
+            )
+            while self.brackets.len() > 0 {
+                let marker = self.brackets.pop()
+                if marker >= _BRK_INTERP {
+                    self._push_empty_string(TokenKind.FStringEnd, self.length)
+                }
+            }
+            self.interp_depth = 0
+        }
+
+        self._push(TokenKind.Eof, self.length, self.length)
+        return self.tokens
+    }
+
+    #: The source text between two byte offsets, as `Span` records them.
+    pub fn text_of(self, span: Span) -> str {
+        return self.source[self._scalar_index(span.start):self._scalar_index(span.end)]
+    }
+
+    # --- cursor ----------------------------------------------------------
+    fn _at(self, index: int) -> str {
+        if index < 0 or index >= self.length { return "" }
+        return self.chars[index]
+    }
+
+    fn _peek(self) -> str {
+        return self._at(self.pos)
+    }
+
+    fn _peek_at(self, offset: int) -> str {
+        return self._at(self.pos + offset)
+    }
+
+    fn _eat(self, character: str) -> bool {
+        if self._peek() != character { return false }
+        self.pos += 1
+        return true
+    }
+
+    fn _span(self, start: int, end: int) -> Span {
+        return Span(self.file_id, self.offsets[start], self.offsets[end])
+    }
+
+    # Byte offsets only ever land on scalar boundaries, so a binary search over
+    # the offset table is exact.
+    fn _scalar_index(self, byte_offset: int) -> int {
+        var low = 0
+        var high = self.offsets.len() - 1
+        while low < high {
+            let middle = (low + high) // 2
+            if self.offsets[middle] < byte_offset { low = middle + 1 } else { high = middle }
+        }
+        return low
+    }
+
+    fn _error(
+        self,
+        code: str,
+        start: int,
+        end: int,
+        message: str,
+        help: str? = null,
+        note: str? = null
+    ) -> Diagnostic {
+        self.had_error = true
+        return self.diagnostics.error(code, self._span(start, end), message, help: help, note: note)
+    }
+
+    fn _last_kind(self) -> TokenKind {
+        if self.tokens.len() == 0 { return TokenKind.Eof }
+        return self.tokens[self.tokens.len() - 1].kind
+    }
+
+    fn _push(
+        self,
+        kind: TokenKind,
+        start: int,
+        end: int,
+        value: any = null,
+        flags: int = 0
+    ) -> void {
+        var all_flags = flags
+        if self.at_line_start { all_flags = all_flags | TokenFlags.AFTER_NEWLINE }
+        self.tokens.push(
+            Token(kind, self._span(start, end), self.source[start:end], value, all_flags)
+        )
+        self.at_line_start = false
+    }
+
+    # --- newlines (§1.3) -------------------------------------------------
+    fn _bracket_top(self) -> int {
+        if self.brackets.len() == 0 { return 0 }
+        return self.brackets[self.brackets.len() - 1]
+    }
+
+    fn _bracket_top_is_interp(self) -> bool {
+        return self.brackets.len() > 0 and self._bracket_top() >= _BRK_INTERP
+    }
+
+    fn _bracket_top_is_expression(self) -> bool {
+        return self.brackets.len() > 0 and self._bracket_top() != _BRK_BRACE_BLOCK
+    }
+
+    fn _handle_newline(self) -> void {
+        let start = self.pos
+        self.pos += 1
+        self.line += 1
+        let last = self._last_kind()
+        let significant = self.tokens.len() > 0 and
+            not self._bracket_top_is_expression() and
+            last != TokenKind.Newline and
+            not _is_continuation(last)
+        if significant { self._push(TokenKind.Newline, start, start + 1) }
+        self.at_line_start = true
+    }
+
+    # Decide whether a `{` opens a block or an expression. Ambiguity resolves to
+    # BLOCK: mistaking a block for an expression swallows the newlines that
+    # separate its statements, whereas the reverse only leaves NEWLINE tokens
+    # inside a literal, which the parser skips. So only an unmistakable
+    # expression position opens an expression.
+    fn _brace_opens_expression(self) -> bool {
+        let previous = self._last_kind()
+        if _is_operator(previous) { return true }
+        if previous == TokenKind.LBrace {
+            # `{{` — inherit from the brace we are already inside.
+            return self._bracket_top_is_expression()
+        }
+        # `?` is deliberately absent, for the same reason it is absent from
+        # `_is_continuation`: it is the optional-type suffix far more often than
+        # anything else, so `fn f() -> int? { ... }` would otherwise open the
+        # function body as an expression brace and swallow the newlines that
+        # separate its statements. Jaithon spells the conditional `if`, so no
+        # `{` ever follows a `?` in expression position.
+        return match previous {
+            TokenKind.Comma | TokenKind.Colon | TokenKind.LParen | TokenKind.LBracket => true,
+            TokenKind.QuestionQuestion => true,
+            TokenKind.KwReturn | TokenKind.KwThrow | TokenKind.KwYield => true,
+            TokenKind.KwIn | TokenKind.KwIs | TokenKind.KwAnd | TokenKind.KwOr => true,
+            TokenKind.KwNot | TokenKind.FStringStart | TokenKind.FStringMid => true,
+            _ => false,
+        }
+    }
+
+    # --- comments --------------------------------------------------------
+    fn _skip_comment(self) -> void {
+        let start = self.pos
+        if self._peek_at(1) != "*" {
+            while self.pos < self.length and self._peek() != "\n" { self.pos += 1 }
+            return
+        }
+
+        self.pos += 2
+        var depth = 1
+        while self.pos < self.length {
+            if self._peek() == "#" and self._peek_at(1) == "*" {
+                depth += 1
+                self.pos += 2
+                continue
+            }
+            if self._peek() == "*" and self._peek_at(1) == "#" {
+                self.pos += 2
+                depth -= 1
+                if depth == 0 { return }
+                continue
+            }
+            if self._peek() == "\n" { self.line += 1 }
+            self.pos += 1
+        }
+
+        let diag = self._error(
+            Code.E0002_UNTERMINATED_COMMENT,
+            start,
+            start + 2,
+            "unterminated block comment",
+            help: "close it with `*#`"
+        )
+        if depth > 1 { diag.with_note(f"{depth} nested `#*` comments are still open") }
+    }
+
+    # --- numbers (§1.6) --------------------------------------------------
+
+    # Consume a run of base-`base` digits with `_` separators, returning the
+    # digits alone. Separators may not lead, trail, or double up.
+    fn _scan_digits(self, base: int) -> tuple[bool, str] {
+        let digits = StringBuilder()
+        var previous_underscore = false
+        var any = false
+        loop {
+            let character = self._peek()
+            if character == "_" {
+                if not any or previous_underscore {
+                    var message = "numeric literal may not start with `_`"
+                    if previous_underscore { message = "repeated `_` in numeric literal" }
+                    self._error(
+                        Code.E0005_INVALID_NUMBER,
+                        self.pos,
+                        self.pos + 1,
+                        message,
+                        help: "digit separators must sit between digits"
+                    )
+                    while self._peek() == "_" or _digit_in_base(self._peek(), base) {
+                        self.pos += 1
+                    }
+                    return (false, digits.build())
+                }
+                previous_underscore = true
+                self.pos += 1
+                continue
+            }
+            if not _digit_in_base(character, base) { break }
+            digits.push(character)
+            any = true
+            previous_underscore = false
+            self.pos += 1
+        }
+        if previous_underscore {
+            self._error(
+                Code.E0005_INVALID_NUMBER,
+                self.pos - 1,
+                self.pos,
+                "numeric literal may not end with `_`",
+                help: "digit separators must sit between digits"
+            )
+            return (false, digits.build())
+        }
+        return (true, digits.build())
+    }
+
+    fn _scan_number(self) -> void {
+        let start = self.pos
+        var base = 10
+        var is_float = false
+        var ok = true
+        var text = ""
+
+        let prefix = self._peek_at(1)
+        if self._peek() == "0" and _base_of(prefix) > 0 {
+            base = _base_of(prefix)
+            self.pos += 2
+            let (digits_ok, digits) = self._scan_digits(base)
+            ok = digits_ok
+            text = digits
+            if ok and digits.len() == 0 {
+                ok = false
+                self._error(
+                    Code.E0005_INVALID_NUMBER,
+                    start,
+                    self.pos,
+                    f"missing digits after `0{prefix}`",
+                    help: f"write at least one base-{base} digit"
+                )
+            }
+        } else {
+            let (digits_ok, digits) = self._scan_digits(10)
+            ok = digits_ok
+            text = digits
+
+            # A `.` belongs to the number only when a digit follows it, so
+            # `0..10` is INT DOTDOT INT and `1.foo` is INT DOT IDENT.
+            if ok and self._peek() == "." and _is_digit(self._peek_at(1)) {
+                is_float = true
+                self.pos += 1
+                let (fraction_ok, fraction) = self._scan_digits(10)
+                ok = fraction_ok
+                text = text + "." + fraction
+            }
+            if ok and (self._peek() == "e" or self._peek() == "E") {
+                let sign = self._peek_at(1)
+                let digit_offset = sign == "+" or sign == "-" ? 2 : 1
+                if _is_digit(self._peek_at(digit_offset)) {
+                    is_float = true
+                    self.pos += digit_offset
+                    let (exponent_ok, exponent) = self._scan_digits(10)
+                    ok = exponent_ok
+                    text = text + "e" + (digit_offset == 2 ? sign : "") + exponent
+                }
+            }
+        }
+
+        if ok { ok = self._reject_number_suffix(base, start) }
+
+        if is_float {
+            let value = ok ? float(text) : 0.0
+            self._push(TokenKind.Float, start, self.pos, value)
+            return
+        }
+        # A literal that does not fit was already reported; it lexes as 0 so that
+        # the parser still sees a well-formed token stream.
+        var value = 0
+        var flags = 0
+        if ok {
+            value = self._parse_int_text(text, base, start) ?? 0
+            # Only 9223372036854775808 lands on the smallest `int`, whatever the
+            # base, so this recognises the sign-and-magnitude pair for the
+            # parser without re-reading the digits.
+            if value == _INT_MIN and self._is_negated_literal() {
+                flags = TokenFlags.NEG_MAGNITUDE
+            }
+        }
+        self._push(TokenKind.Int, start, self.pos, value, flags)
+    }
+
+    # Decimal literals are signed and must fit in `int`, the one exception being
+    # the magnitude of the smallest `int` under a prefix `-`. Hex, octal and
+    # binary literals are bit patterns, so the whole unsigned range is accepted
+    # and reinterpreted two's complement — which is what the wrapping operators
+    # below produce.
+    fn _parse_int_text(self, digits: str, base: int, start: int) -> int? {
+        var first = 0
+        while first < digits.len() and digits[first] == "0" { first += 1 }
+        let significant = digits[first:digits.len()]
+        if significant.len() == 0 { return 0 }
+
+        if not _fits_in_int(significant, base, self._is_negated_literal()) {
+            self._error(
+                Code.E0005_INVALID_NUMBER,
+                start,
+                self.pos,
+                "integer literal does not fit in `int`",
+                note: f"`int` is 64-bit signed: {_INT_MIN} to {_INT_MAX}"
+            )
+            return null
+        }
+        var value = 0
+        for character in significant {
+            value = value *% base +% _hex_value(character)
+        }
+        return value
+    }
+
+    # One past the largest `int` only exists as the operand of a prefix `-`,
+    # where the pair spells the smallest `int`. Deciding this from the preceding
+    # token rather than from whitespace is what keeps `a -1` a subtraction (`a`
+    # ends an operand) and `- x` a negation: the magnitude is admitted only
+    # where a literal could start. A second `-` in front disqualifies it —
+    # `--9223372036854775808` asks for a value that is not an `int`.
+    fn _is_negated_literal(self) -> bool {
+        let count = self.tokens.len()
+        if count == 0 or self.tokens[count - 1].kind != TokenKind.Minus { return false }
+        if count == 1 { return true }
+        let before = self.tokens[count - 2].kind
+        return before != TokenKind.Minus and not _ends_operand(before)
+    }
+
+    # A letter or digit glued to the end of a literal is never valid: there are
+    # no literal suffixes, so `2f` and `0b102` are typos, not two tokens.
+    fn _reject_number_suffix(self, base: int, start: int) -> bool {
+        let character = self._peek()
+        if character == "" { return true }
+        if not _is_ident_start(character) and not _is_digit(character) and ord(character) < 0x80 {
+            return true
+        }
+
+        let bad = self.pos
+        while self.pos < self.length and (_is_ident_cont(self._peek()) or ord(self._peek()) >= 0x80) {
+            self.pos += 1
+        }
+        var help = "Jaithon has no literal suffixes; separate the number from the name"
+        if _is_digit(character) { help = f"`{character}` is not a base-{base} digit" }
+        let diag = self._error(
+            Code.E0005_INVALID_NUMBER,
+            start,
+            self.pos,
+            "invalid suffix on numeric literal",
+            help: help
+        )
+        diag.label(self._span(bad, self.pos), "not part of a number")
+        return false
+    }
+
+    # --- strings (§1.6, §1.7) --------------------------------------------
+    fn _flush(self, out: StringBuilder, from_index: int, to_index: int) -> void {
+        if to_index > from_index { out.push(self.source[from_index:to_index]) }
+    }
+
+    # Consume one escape sequence with the cursor on the backslash. Returns
+    # false when the escape was rejected; the backslash is always consumed, so
+    # the caller still makes progress.
+    fn _scan_escape(self, out: StringBuilder) -> bool {
+        let escape_start = self.pos
+        self.pos += 1
+        if self.pos >= self.length { return false }
+        let character = self.chars[self.pos]
+        self.pos += 1
+
+        if character == "x" { return self._scan_hex_escape(out, escape_start) }
+        if character == "u" { return self._scan_unicode_escape(out, escape_start) }
+        # Membership, not the cooked string's length: `\0` cooks to a string
+        # whose only scalar is NUL, and asking for its length is asking the
+        # wrong question — an escape is known because it is in the table.
+        if character in _SIMPLE_ESCAPES {
+            out.push(_SIMPLE_ESCAPES[character])
+            return true
+        }
+        self._error(
+            Code.E0004_INVALID_ESCAPE,
+            escape_start,
+            self.pos,
+            f"unknown escape sequence `\\{character}`",
+            help: "valid escapes are \\n \\t \\r \\\\ \\\" \\' \\0 \\xNN \\u{...}"
+        )
+        out.push(character)  # recover as if the backslash were absent
+        return false
+    }
+
+    fn _scan_hex_escape(self, out: StringBuilder, escape_start: int) -> bool {
+        var value = 0
+        for _digit_index in 0..2 {
+            let digit = _hex_value(self._peek())
+            if digit < 0 {
+                self._error(
+                    Code.E0004_INVALID_ESCAPE,
+                    escape_start,
+                    self.pos,
+                    "`\\x` needs exactly two hex digits",
+                    help: "for example `\\x1b`"
+                )
+                return false
+            }
+            value = value * 16 + digit
+            self.pos += 1
+        }
+        out.push(chr(value))  # \xNN names a scalar, encoded as UTF-8
+        return true
+    }
+
+    fn _scan_unicode_escape(self, out: StringBuilder, escape_start: int) -> bool {
+        if self._peek() != "{" {
+            self._error(
+                Code.E0004_INVALID_ESCAPE,
+                escape_start,
+                self.pos,
+                "`\\u` must be followed by `{...}`",
+                help: "for example `\\u{1F600}`"
+            )
+            return false
+        }
+        self.pos += 1
+        var value = 0
+        var digits = 0
+        while _hex_value(self._peek()) >= 0 {
+            if digits < 6 { value = value * 16 + _hex_value(self._peek()) }
+            digits += 1
+            self.pos += 1
+        }
+        let closed = self._eat("}")
+        if digits == 0 or digits > 6 or not closed {
+            self._error(
+                Code.E0004_INVALID_ESCAPE,
+                escape_start,
+                self.pos,
+                "malformed `\\u{...}` escape",
+                help: "write one to six hex digits inside the braces"
+            )
+            return false
+        }
+        if value > 0x10FFFF or value >= 0xD800 and value <= 0xDFFF {
+            self._error(
+                Code.E0004_INVALID_ESCAPE,
+                escape_start,
+                self.pos,
+                f"U+{value:04X} is not a Unicode scalar value",
+                note: "scalars are U+0000..U+D7FF and U+E000..U+10FFFF"
+            )
+            return false
+        }
+        out.push(chr(value))
+        return true
+    }
+
+    # Cook characters up to the closing delimiter or, in an f-string, up to the
+    # `{` that opens an interpolation, which is consumed.
+    fn _scan_string_chunk(
+        self,
+        flavor: _StrFlavor,
+        out: StringBuilder,
+        open_start: int
+    ) -> tuple[_ChunkStop, bool] {
+        var saw_escape = false
+        var run_start = self.pos
+        loop {
+            if self.pos >= self.length {
+                self._flush(out, run_start, self.pos)
+                self._error(
+                    _unterminated_code(flavor),
+                    open_start,
+                    self.pos,
+                    f"unterminated {_string_noun(flavor)}",
+                    help: f"add a closing {flavor.closer()}"
+                )
+                return (_ChunkStop.Broken, saw_escape)
+            }
+
+            let character = self.chars[self.pos]
+
+            if character == flavor.quote {
+                if not flavor.triple {
+                    self._flush(out, run_start, self.pos)
+                    self.pos += 1
+                    return (_ChunkStop.Closed, saw_escape)
+                }
+                if self._peek_at(1) == flavor.quote and self._peek_at(2) == flavor.quote {
+                    self._flush(out, run_start, self.pos)
+                    self.pos += 3
+                    return (_ChunkStop.Closed, saw_escape)
+                }
+                self.pos += 1
+                continue
+            }
+
+            if character == "\r" and self._peek_at(1) == "\n" {
+                self._flush(out, run_start, self.pos)  # §1.1: the \r of a CRLF is dropped
+                self.pos += 1
+                run_start = self.pos
+                continue
+            }
+
+            if character == "\n" {
+                if not flavor.triple {
+                    # Leave the newline for the main loop so that the next line
+                    # still lexes as statements.
+                    self._flush(out, run_start, self.pos)
+                    self._error(
+                        _unterminated_code(flavor),
+                        open_start,
+                        self.pos,
+                        f"unterminated {_string_noun(flavor)} at end of line",
+                        help: "use a triple-quoted string to span lines"
+                    )
+                    return (_ChunkStop.Broken, saw_escape)
+                }
+                self.pos += 1
+                self.line += 1
+                continue
+            }
+
+            if character == "\\" {
+                if flavor.raw {
+                    self.pos += 1  # raw strings keep the backslash
+                    continue
+                }
+                self._flush(out, run_start, self.pos)
+                if self._scan_escape(out) { saw_escape = true }
+                run_start = self.pos
+                continue
+            }
+
+            if flavor.interp and (character == "{" or character == "}") {
+                self._flush(out, run_start, self.pos)
+                if self._peek_at(1) == character {
+                    out.push(character)
+                    self.pos += 2
+                    run_start = self.pos
+                    continue
+                }
+                if character == "{" {
+                    self.pos += 1
+                    return (_ChunkStop.Interp, saw_escape)
+                }
+                self._error(
+                    Code.E0003_INVALID_CHARACTER,
+                    self.pos,
+                    self.pos + 1,
+                    "single `}` in f-string text",
+                    help: "write `}}` for a literal brace"
+                )
+                out.push("}")
+                self.pos += 1
+                run_start = self.pos
+                continue
+            }
+
+            self.pos += 1
+        }
+    }
+
+    fn _open_interpolation(self, flavor: _StrFlavor) -> void {
+        if self.interp_depth >= MAX_INTERPOLATION_DEPTH {
+            self._error(
+                Code.E0009_NESTED_INTERPOLATION_TOO_DEEP,
+                self.pos - 1,
+                self.pos,
+                "f-string interpolation nested more than " + f"{MAX_INTERPOLATION_DEPTH} deep",
+                help: "compute the value into a binding before formatting it"
+            )
+        }
+        self.interp_depth += 1
+        var marker = _BRK_INTERP
+        if flavor.quote == "'" { marker = marker | _BRK_F_SINGLE }
+        if flavor.triple { marker = marker | _BRK_F_TRIPLE }
+        if flavor.raw { marker = marker | _BRK_F_RAW }
+        self.brackets.push(marker)
+    }
+
+    fn _push_empty_string(self, kind: TokenKind, at: int) -> void {
+        self._push(kind, at, at, "")
+    }
+
+    # Scan the tail of an f-string after the `}` that closed an interpolation.
+    fn _resume_fstring(self, flavor: _StrFlavor, token_start: int) -> void {
+        let out = StringBuilder()
+        let (stop, saw_escape) = self._scan_string_chunk(flavor, out, token_start)
+        # A broken chunk still ends the f-string, so the parser sees a balanced
+        # START ... END sequence and can keep going.
+        let kind = stop == _ChunkStop.Interp ? TokenKind.FStringMid : TokenKind.FStringEnd
+        self._push(kind, token_start, self.pos, out.build(), _string_flags(flavor, saw_escape))
+        if stop == _ChunkStop.Interp { self._open_interpolation(flavor) }
+    }
+
+    # The cursor sits on the opening quote; `token_start` is the start of the
+    # token, which for a prefixed literal is the `r` or `f`.
+    fn _scan_string_literal(self, token_start: int, raw: bool, interp: bool) -> void {
+        let quote = self.chars[self.pos]
+        let triple = self._peek_at(1) == quote and self._peek_at(2) == quote
+        let flavor = _StrFlavor(quote, triple, raw, interp)
+        self.pos += triple ? 3 : 1
+
+        let out = StringBuilder()
+        let (stop, saw_escape) = self._scan_string_chunk(flavor, out, token_start)
+        let flags = _string_flags(flavor, saw_escape)
+        if not interp {
+            self._push(TokenKind.Str, token_start, self.pos, out.build(), flags)
+            return
+        }
+
+        self._push(TokenKind.FStringStart, token_start, self.pos, out.build(), flags)
+        if stop == _ChunkStop.Interp {
+            self._open_interpolation(flavor)
+        } else {
+            self._push_empty_string(TokenKind.FStringEnd, self.pos)
+        }
+    }
+
+    # A `:` at the top level of an interpolation introduces a format spec
+    # (§1.7). The spec is data, not Jaithon source — `.2f` would not lex as a
+    # number — so it is captured whole as one string token for `std.fmt`.
+    fn _scan_format_spec(self) -> void {
+        let start = self.pos
+        var depth = 0
+        while self.pos < self.length {
+            let character = self.chars[self.pos]
+            if character == "\n" { break }  # unterminated; reported at the `}`
+            if character == "{" {
+                depth += 1
+            } elif character == "}" {
+                if depth == 0 { break }
+                depth -= 1
+            }
+            self.pos += 1
+        }
+        self._push(TokenKind.Str, start, self.pos, self.source[start:self.pos])
+    }
+
+    # --- identifiers and labels ------------------------------------------
+    fn _ident_run_end(self, start: int) -> int {
+        var index = start
+        while index < self.length {
+            let character = self.chars[index]
+            let code = ord(character)
+            if code < 0x80 {
+                if not _is_ident_cont(character) { break }
+            } elif not _is_unicode_ident(code) {
+                break
+            }
+            index += 1
+        }
+        return index
+    }
+
+    fn _scan_identifier(self) -> void {
+        let start = self.pos
+        self.pos = self._ident_run_end(start)
+        let text = self.source[start:self.pos]
+
+        # String prefixes `r`, `f` and their combination, only when the quote is
+        # adjacent, so `r "x"` stays an identifier followed by a string.
+        if text.len() <= 2 and (self._peek() == "\"" or self._peek() == "'") {
+            var raw = false
+            var interp = false
+            var is_prefix = true
+            for character in text {
+                if character == "r" and not raw {
+                    raw = true
+                } elif character == "f" and not interp {
+                    interp = true
+                } else {
+                    is_prefix = false
+                    break
+                }
+            }
+            if is_prefix and (raw or interp) {
+                self._scan_string_literal(start, raw, interp)
+                return
+            }
+        }
+
+        # `__foo__` is reserved for the implementation (§1.4), but rejecting it
+        # is the parser's call: the standard library declares such names.
+        var kind = keyword_lookup(text)
+        if kind == TokenKind.Ident and text == "_" { kind = TokenKind.Underscore }
+        self._push(kind, start, self.pos)
+    }
+
+    # The tokens a statement can begin after; the one position where a label may
+    # be declared.
+    fn _at_statement_start(self) -> bool {
+        return match self._last_kind() {
+            TokenKind.Eof | TokenKind.Newline | TokenKind.Semicolon => true,
+            TokenKind.LBrace | TokenKind.RBrace => true,
+            _ => false,
+        }
+    }
+
+    # `'name` is a loop label and `'text'` is a string, and the grammar is what
+    # tells them apart: a label is only ever declared as `'name:` at the start of
+    # a statement, or used right after `break` or `continue`. Everything else
+    # that starts with a quote is a string — including `'single quotes'`, whose
+    # first word would otherwise read as a label.
+    fn _scan_quote_or_label(self) -> void {
+        let start = self.pos
+        let after = start + 1
+        let first = self._at(after)
+        var ident_start = false
+        if first.len() > 0 {
+            let code = ord(first)
+            ident_start = code < 0x80 ? _is_ident_start(first) : _is_unicode_ident(code)
+        }
+
+        if ident_start {
+            let end = self._ident_run_end(after)
+            let closed_by_quote = self._at(end) == "'"
+            var probe = end
+            while self._at(probe) == " " or self._at(probe) == "\t" { probe += 1 }
+            let declaration = self._at(probe) == ":" and self._at_statement_start()
+            let usage = self._last_kind() == TokenKind.KwBreak or
+                self._last_kind() == TokenKind.KwContinue
+            if not closed_by_quote and (declaration or usage) {
+                self.pos = end
+                self._push(TokenKind.Label, start, end)
+                return
+            }
+        }
+
+        self._scan_string_literal(start, false, false)
+    }
+
+    # --- punctuation and operators ---------------------------------------
+
+    # Pop only on a match: a stray closer is the parser's problem (E0107), and
+    # popping blindly would corrupt the newline state of every enclosing
+    # bracket.
+    fn _pop_bracket(self, expected: int) -> void {
+        if self.brackets.len() > 0 and self._bracket_top() == expected {
+            self.brackets.pop()
+        }
+    }
+
+    fn _pop_brace_bracket(self) -> void {
+        let top = self._bracket_top()
+        if self.brackets.len() > 0 and (top == _BRK_BRACE_BLOCK or top == _BRK_BRACE_EXPR) {
+            self.brackets.pop()
+        }
+    }
+
+    fn _close_brace(self, start: int) -> void {
+        if self._bracket_top_is_interp() {
+            # Closes an interpolation: no token, the f-string tail resumes.
+            # `f"{}"` has to be caught here — it produces the same token shape as
+            # an f-string with no interpolation at all, so the parser could never
+            # tell the two apart.
+            let last = self._last_kind()
+            if last == TokenKind.FStringStart or last == TokenKind.FStringMid {
+                self._error(
+                    Code.E0102_EXPECTED_EXPRESSION,
+                    start,
+                    self.pos,
+                    "empty interpolation in f-string",
+                    help: "write `{{}}` for literal braces"
+                )
+            }
+            let marker = self.brackets.pop()
+            if self.interp_depth > 0 { self.interp_depth -= 1 }
+            self._resume_fstring(_flavor_from_marker(marker), start)
+            return
+        }
+        # §1.3: a NEWLINE immediately before `}` is discarded.
+        if self.tokens.len() > 0 and self._last_kind() == TokenKind.Newline {
+            self.tokens.pop()
+        }
+        self._pop_brace_bracket()
+        self._push(TokenKind.RBrace, start, self.pos)
+    }
+
+    fn _scan_punct(self) -> void {
+        let start = self.pos
+        let character = self.chars[self.pos]
+        self.pos += 1
+
+        if character == "}" {
+            self._close_brace(start)
+            return
+        }
+        if character == ":" {
+            self._push(TokenKind.Colon, start, self.pos)
+            if self._bracket_top_is_interp() { self._scan_format_spec() }
+            return
+        }
+        if character == "!" {
+            if self._eat("=") {
+                self._push(TokenKind.BangEq, start, self.pos)
+                return
+            }
+            self._error(
+                Code.E0003_INVALID_CHARACTER,
+                start,
+                self.pos,
+                "unexpected character `!`",
+                help: "Jaithon spells logical negation `not` and inequality `!=`"
+            )
+            return
+        }
+
+        let kind = self._punct_kind(character)
+        if kind == null {
+            let code = ord(character)
+            var message = f"unexpected character `{character}`"
+            if code < 0x20 or code == 0x7F {
+                message = f"unexpected control character U+{code:04X}"
+            }
+            self._error(Code.E0003_INVALID_CHARACTER, start, self.pos, message)
+            return
+        }
+        self._push(kind, start, self.pos)
+    }
+
+    # Everything whose kind is decided by the characters alone. `}`, `:` and `!`
+    # are handled by the caller because they do more than emit a token.
+    fn _punct_kind(self, character: str) -> TokenKind? {
+        if character == "(" {
+            self.brackets.push(_BRK_PAREN)
+            return TokenKind.LParen
+        }
+        if character == "[" {
+            self.brackets.push(_BRK_BRACKET)
+            return TokenKind.LBracket
+        }
+        if character == "{" {
+            self.brackets.push(self._brace_opens_expression() ? _BRK_BRACE_EXPR : _BRK_BRACE_BLOCK)
+            return TokenKind.LBrace
+        }
+        if character == ")" {
+            self._pop_bracket(_BRK_PAREN)
+            return TokenKind.RParen
+        }
+        if character == "]" {
+            self._pop_bracket(_BRK_BRACKET)
+            return TokenKind.RBracket
+        }
+        if character == "," { return TokenKind.Comma }
+        if character == ";" { return TokenKind.Semicolon }
+        if character == "@" { return TokenKind.At }
+        if character == "~" { return TokenKind.Tilde }
+        if character == "." {
+            if not self._eat(".") { return TokenKind.Dot }
+            if self._eat(".") { return TokenKind.Ellipsis }
+            if self._eat("=") { return TokenKind.DotDotEq }
+            return TokenKind.DotDot
+        }
+        if character == "+" {
+            if self._eat("=") { return TokenKind.PlusEq }
+            if self._eat("%") { return TokenKind.PlusPercent }
+            return TokenKind.Plus
+        }
+        if character == "-" {
+            if self._eat(">") { return TokenKind.Arrow }
+            if self._eat("=") { return TokenKind.MinusEq }
+            if self._eat("%") { return TokenKind.MinusPercent }
+            return TokenKind.Minus
+        }
+        if character == "*" {
+            if self._eat("*") { return self._eat("=") ? TokenKind.StarStarEq : TokenKind.StarStar }
+            if self._eat("=") { return TokenKind.StarEq }
+            if self._eat("%") { return TokenKind.StarPercent }
+            return TokenKind.Star
+        }
+        if character == "/" {
+            if self._eat("/") {
+                return self._eat("=") ? TokenKind.SlashSlashEq : TokenKind.SlashSlash
+            }
+            if self._eat("=") { return TokenKind.SlashEq }
+            return TokenKind.Slash
+        }
+        if character == "%" { return self._eat("=") ? TokenKind.PercentEq : TokenKind.Percent }
+        if character == "&" { return self._eat("=") ? TokenKind.AmpEq : TokenKind.Amp }
+        if character == "|" { return self._eat("=") ? TokenKind.PipeEq : TokenKind.Pipe }
+        if character == "^" { return self._eat("=") ? TokenKind.CaretEq : TokenKind.Caret }
+        if character == "<" {
+            if self._eat("<") { return self._eat("=") ? TokenKind.ShlEq : TokenKind.Shl }
+            return self._eat("=") ? TokenKind.Le : TokenKind.Lt
+        }
+        if character == ">" {
+            if self._eat(">") { return self._eat("=") ? TokenKind.ShrEq : TokenKind.Shr }
+            return self._eat("=") ? TokenKind.Ge : TokenKind.Gt
+        }
+        if character == "=" {
+            if self._eat("=") { return TokenKind.EqEq }
+            if self._eat(">") { return TokenKind.FatArrow }
+            return TokenKind.Eq
+        }
+        if character == "?" {
+            if self._eat("?") { return TokenKind.QuestionQuestion }
+            if self._eat(".") { return TokenKind.QuestionDot }
+            return TokenKind.Question
+        }
+        return null
+    }
+
+    fn _line_continuation(self) -> void {
+        let start = self.pos
+        var next = start + 1
+        if self._at(next) == "\r" { next += 1 }
+        if self._at(next) == "\n" {
+            self.pos = next + 1
+            self.line += 1
+            return
+        }
+        self.pos += 1
+        self._error(
+            Code.E0003_INVALID_CHARACTER,
+            start,
+            self.pos,
+            "stray `\\` outside a string literal",
+            help: "a backslash continues a line only at end of line"
+        )
+    }
+
+    # --- the main loop ---------------------------------------------------
+    fn _scan_token(self) -> void {
+        let character = self.chars[self.pos]
+
+        if character == " " or
+            character == "\t" or
+            character == "\r" or
+            character == "\u{B}" or
+            character == "\u{C}" {
+            self.pos += 1  # §1.1: a lone \r is discarded, the \n terminates
+            return
+        }
+        if character == "\n" {
+            self._handle_newline()
+            return
+        }
+        if character == "#" {
+            self._skip_comment()
+            return
+        }
+        if character == "\\" {
+            self._line_continuation()
+            return
+        }
+
+        let code = ord(character)
+        if code >= 0x80 {
+            if _is_unicode_space(code) {
+                self.pos += 1
+                return
+            }
+            if not _is_unicode_ident(code) {
+                self._error(
+                    Code.E0003_INVALID_CHARACTER,
+                    self.pos,
+                    self.pos + 1,
+                    f"unexpected character U+{code:04X}",
+                    help: "only ASCII punctuation is meaningful outside " + "strings and comments"
+                )
+                self.pos += 1
+                return
+            }
+            self._scan_identifier()
+            return
+        }
+
+        if _is_digit(character) {
+            self._scan_number()
+            return
+        }
+        if _is_ident_start(character) {
+            self._scan_identifier()
+            return
+        }
+        if character == "\"" {
+            self._scan_string_literal(self.pos, false, false)
+            return
+        }
+        if character == "'" {
+            self._scan_quote_or_label()
+            return
+        }
+        self._scan_punct()
+    }
+}
+
+const _INT_MAX = 0x7FFFFFFFFFFFFFFF
+const _INT_MIN = (-9223372036854775808)
+
+let _SIMPLE_ESCAPES: dict[str, str] = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "\\": "\\",
+    "\"": "\"",
+    "'": "'",
+    "0": "\0",
+}
+
+fn _is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn _is_alpha(character: str) -> bool {
+    return character >= "a" and character <= "z" or character >= "A" and character <= "Z"
+}
+
+fn _is_ident_start(character: str) -> bool {
+    return _is_alpha(character) or character == "_"
+}
+
+fn _is_ident_cont(character: str) -> bool {
+    return _is_ident_start(character) or _is_digit(character)
+}
+
+fn _hex_value(character: str) -> int {
+    if _is_digit(character) { return ord(character) - ord("0") }
+    if character >= "a" and character <= "f" { return ord(character) - ord("a") + 10 }
+    if character >= "A" and character <= "F" { return ord(character) - ord("A") + 10 }
+    return -1
+}
+
+fn _digit_in_base(character: str, base: int) -> bool {
+    let value = _hex_value(character)
+    return value >= 0 and value < base
+}
+
+fn _base_of(prefix: str) -> int {
+    if prefix == "x" or prefix == "X" { return 16 }
+    if prefix == "o" or prefix == "O" { return 8 }
+    if prefix == "b" or prefix == "B" { return 2 }
+    return 0
+}
+
+# Whether `digits`, with leading zeros already stripped, denotes a value the
+# 64-bit `int` can hold.
+fn _fits_in_int(digits: str, base: int, negated: bool) -> bool {
+    let count = digits.len()
+    if base == 16 { return count <= 16 }
+    if base == 8 { return count < 22 or count == 22 and digits[0] <= "1" }
+    if base == 2 { return count <= 64 }
+    if count < 19 { return true }
+    if count > 19 { return false }
+    # Same length, so a lexicographic comparison is a numeric one.
+    if digits <= "9223372036854775807" { return true }
+    return negated and digits == "9223372036854775808"
+}
+
+fn _utf8_length(code: int) -> int {
+    if code < 0x80 { return 1 }
+    if code < 0x800 { return 2 }
+    if code < 0x10000 { return 3 }
+    return 4
+}
+
+# Non-ASCII scalars that behave as separators rather than letters. Source is not
+# allowed to smuggle these into identifiers, where they would be invisible.
+fn _is_unicode_space(code: int) -> bool {
+    if code == 0x00A0 or code == 0x1680 or code == 0x3000 or code == 0xFEFF { return true }
+    if code >= 0x2000 and code <= 0x200D { return true }
+    return code == 0x2028 or code == 0x2029 or code == 0x202F or code == 0x205F
+}
+
+# Pragmatic approximation of XID_Start/XID_Continue (§1.4): any scalar >= 0x80 is
+# an identifier character unless it is space-like or lives in the General
+# Punctuation block. Real XID tables are ten kilobytes of data and buy nothing
+# the compiler needs; this accepts a superset that is stable across Unicode
+# versions and still rejects the confusable spaces and the smart quotes that
+# people paste in by accident.
+fn _is_unicode_ident(code: int) -> bool {
+    if code < 0x80 { return false }
+    if _is_unicode_space(code) { return false }
+    if code >= 0x2000 and code <= 0x206F { return false }
+    if code >= 0xFFF9 and code <= 0xFFFB { return false }
+    return true
+}
+
+# Every operator token, `Plus` through `ShrEq` in token.h order.
+fn _is_operator(kind: TokenKind) -> bool {
+    return match kind {
+        TokenKind.Plus | TokenKind.Minus | TokenKind.Star | TokenKind.Slash => true,
+        TokenKind.SlashSlash | TokenKind.Percent | TokenKind.StarStar => true,
+        TokenKind.PlusPercent | TokenKind.MinusPercent | TokenKind.StarPercent => true,
+        TokenKind.Amp | TokenKind.Pipe | TokenKind.Caret | TokenKind.Tilde => true,
+        TokenKind.Shl | TokenKind.Shr | TokenKind.Eq | TokenKind.EqEq => true,
+        TokenKind.BangEq | TokenKind.Lt | TokenKind.Le | TokenKind.Gt | TokenKind.Ge => true,
+        TokenKind.PlusEq | TokenKind.MinusEq | TokenKind.StarEq | TokenKind.SlashEq => true,
+        TokenKind.SlashSlashEq | TokenKind.PercentEq | TokenKind.StarStarEq => true,
+        TokenKind.AmpEq | TokenKind.PipeEq | TokenKind.CaretEq => true,
+        TokenKind.ShlEq | TokenKind.ShrEq => true,
+        _ => false,
+    }
+}
+
+# Tokens after which a line break cannot end a statement. This is the list in
+# §1.3 plus the wrapping operators, `..`, `..=`, and `{`. Suppressing the newline
+# directly after `{` costs nothing for a block — the grammar already allows
+# `"{" { NEWLINE }` — and it keeps multi-line dict and set literals working even
+# when the brace was classified as a block. `?` is deliberately absent: a
+# declaration such as `let x: int?` ends a statement with it.
+fn _is_continuation(kind: TokenKind) -> bool {
+    if _is_operator(kind) { return true }
+    return match kind {
+        TokenKind.Comma | TokenKind.Dot | TokenKind.DotDot | TokenKind.DotDotEq => true,
+        TokenKind.Colon | TokenKind.Arrow | TokenKind.FatArrow => true,
+        TokenKind.LParen | TokenKind.LBracket | TokenKind.LBrace => true,
+        TokenKind.QuestionDot | TokenKind.QuestionQuestion => true,
+        TokenKind.KwAnd | TokenKind.KwOr | TokenKind.KwNot => true,
+        TokenKind.FStringStart | TokenKind.FStringMid => true,
+        _ => false,
+    }
+}
+
+# Whether a token can be the end of an operand. Used to tell a prefix `-` from a
+# subtraction.
+fn _ends_operand(kind: TokenKind) -> bool {
+    return match kind {
+        TokenKind.Ident | TokenKind.Int | TokenKind.Float | TokenKind.Str => true,
+        TokenKind.FStringEnd | TokenKind.Label | TokenKind.Underscore => true,
+        TokenKind.RParen | TokenKind.RBracket | TokenKind.RBrace => true,
+        TokenKind.KwTrue | TokenKind.KwFalse | TokenKind.KwNull => true,
+        TokenKind.KwSelf | TokenKind.KwSuper => true,
+        _ => false,
+    }
+}
+
+fn _flavor_from_marker(marker: int) -> _StrFlavor {
+    let quote = marker & _BRK_F_SINGLE != 0 ? "'" : "\""
+    return _StrFlavor(quote, marker & _BRK_F_TRIPLE != 0, marker & _BRK_F_RAW != 0, true)
+}
+
+fn _string_flags(flavor: _StrFlavor, saw_escape: bool) -> int {
+    var flags = 0
+    if saw_escape { flags = flags | TokenFlags.HAS_ESCAPE }
+    if flavor.raw { flags = flags | TokenFlags.RAW_STRING }
+    if flavor.triple { flags = flags | TokenFlags.TRIPLE_STRING }
+    return flags
+}
+
+fn _unterminated_code(flavor: _StrFlavor) -> str {
+    if flavor.interp { return Code.E0008_UNTERMINATED_INTERPOLATION }
+    return Code.E0001_UNTERMINATED_STRING
+}
+
+fn _string_noun(flavor: _StrFlavor) -> str {
+    return flavor.interp ? "f-string" : "string literal"
+}
