@@ -236,43 +236,71 @@ pub class VerifyResult {
     }
 }
 
-#: Compile `path` with both front ends and compare the bytecode.
+#: Compile the file at `path` with both front ends and compare the bytecode.
 #:
 #: The comparison walks the function records exactly as `jaiCompareFunctions`
 #: does and ignores what the spec calls debug-only: names, line tables and
 #: parameter names never fail a build.
 #:
-#: **This cannot run yet, and answers a `VerifyResult` saying so.** It needs the
-#: C front end's bytecode as a `.jaic` image and there is no primitive that
-#: hands one over: `__prim__.compile(source, path)` answers an `ObjClosure`
-#: (`nReflectCompile`, `src/runtime/builtins_io.c`), not an image, so the
-#: obvious call fails inside `_byte_list` with `AttributeError: 'fn' object has
-#: no method 'len'`. Reporting that as an outcome rather than raising it is the
-#: honest shape until the primitive exists.
+#: `--bootstrap-verify` drives the same comparison from C, over a whole
+#: directory. This is the Jaithon-side driver, and the two must agree because
+#: they are two implementations of one specification.
+pub fn verify(path: str, opt_level: int = 2) -> VerifyResult {
+    return verify_source(read_text(path), path, opt_level)
+}
+
+#: Compare both front ends on `text` without touching the file system.
 #:
-#: `make bootstrap` does not go through here. `--bootstrap-verify` calls
-#: `compile_source` for the self-hosted side and does the comparison in C, which
-#: is why this has been dead without anything noticing.
-pub fn verify(path: str) -> VerifyResult {
-    let text = read_text(path)
-    let built = compile_source(text, path)
+#: `opt_level` reaches both sides. It has to: a comparison run at `-O0` that
+#: compiled the reference at `-O2` is not a bug in either front end but reads as
+#: one in every line of the report, and it costs the only tool that can separate
+#: an emitter divergence from an optimiser divergence.
+#:
+#: **The operands are mirrored against `--bootstrap-verify`.** Here `ours` is
+#: the self-hosted side and `theirs` is C, so a message reads
+#: `frame size differs: 5 vs 4` where the C driver writes `4 vs 5` for the same
+#: file. Both are correct and each names its own side first; reading one report
+#: with the other's convention in mind inverts every divergence in it.
+#:
+#: ```
+#: verify_source("let answer = 42\n", "<doc>").agreed      # true
+#: verify_source("let x = y\n", "<doc>").agreed            # false, E0200
+#: ```
+pub fn verify_source(text: str, path: str, opt_level: int = 2) -> VerifyResult {
+    let built = compile_source(text, path, false, 0, opt_level)
     if not built.ok() {
         let why = built.report()
         return VerifyResult(path, false, f"the self-hosted front end rejected the file:\n{why}")
     }
-    let ours = built.body
-    if ours == null {
+    if built.body == null {
         return VerifyResult(path, false, "the self-hosted front end emitted no body")
     }
 
-    let reference = _reference_module(text, path, built.hash)
+    # Both sides go through the container, because that round trip is not the
+    # identity: `write_module` appends a record's own name and its parameter
+    # names to the constant pool (§5), so a record read back has entries the
+    # same record in memory does not. Comparing across the boundary reports a
+    # pool-size difference on every named function with a pool — a fact about
+    # the serialiser, not about either front end. `--bootstrap-verify` learned
+    # this the same way and says so in `roundTrip` (src/cli/main.c).
+    let mine = read_module(built.image, built.hash)
+    if mine == null {
+        return VerifyResult(
+            path,
+            false,
+            "the self-hosted front end's own image does not read back, so " +
+                "there is nothing to compare with"
+        )
+    }
+    let ours = mine.body
+
+    let reference = _reference_module(text, path, built.hash, opt_level)
     if reference == null {
         return VerifyResult(
             path,
             false,
-            "the C front end's bytecode cannot be reached from Jaithon: " +
-                "`__prim__.compile` answers a closure, not a `.jaic` image. " +
-                "Run `jaithon --bootstrap-verify` instead."
+            "the C front end's image for this source did not read back, so " +
+                "there is nothing to compare against"
         )
     }
 
@@ -287,11 +315,11 @@ pub fn verify(path: str) -> VerifyResult {
     )
 }
 
-# The C front end's own image for this source, or null when there is no way to
-# ask for one. Isolated so that `verify` reads as the comparison it is, and so
-# that the day a primitive appears this is the only line that changes.
-fn _reference_module(text: str, path: str, hash: int) -> Module? {
-    let produced = __prim__.compile(text, path)
+# The C front end's own image for this source, or null when it did not read
+# back. `__prim__.compile_image` is the primitive whose absence kept `verify`
+# dead: `__prim__.compile` answers a closure, and a closure is not an image.
+fn _reference_module(text: str, path: str, hash: int, opt_level: int) -> Module? {
+    let produced = __prim__.compile_image(text, path, opt_level)
     if produced is not bytes { return null }
     return read_module(_byte_list(produced), hash)
 }
