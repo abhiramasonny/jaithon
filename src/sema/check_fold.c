@@ -382,8 +382,43 @@ ConstValue jaiConstEval(Checker *c, AstNode *node) {
     }
 }
 
+/* A folded value in the one spelling both front ends must produce for it.
+ * Integers in decimal, floats through the `%.17g` the constant pool uses,
+ * strings quoted with the three escapes a dump line cannot carry raw, and the
+ * two singletons by name. */
+static void renderConst(ConstValue v, char *out, size_t outSize) {
+    switch (v.kind) {
+    case CONST_INT:   snprintf(out, outSize, "%lld", (long long)v.as.i); break;
+    case CONST_FLOAT: snprintf(out, outSize, "%.17g", v.as.f);           break;
+    case CONST_BOOL:  snprintf(out, outSize, v.as.b ? "true" : "false"); break;
+    case CONST_NULL:  snprintf(out, outSize, "null");                    break;
+    case CONST_STR: {
+        size_t at = 0;
+        if (outSize > 1) out[at++] = '"';
+        for (size_t i = 0; i < v.as.s.length && at + 3 < outSize; i++) {
+            char ch = v.as.s.chars[i];
+            if (ch == '\\' || ch == '"') { out[at++] = '\\'; out[at++] = ch; }
+            else if (ch == '\n')         { out[at++] = '\\'; out[at++] = 'n'; }
+            else                         { out[at++] = ch; }
+        }
+        if (at + 1 < outSize) out[at++] = '"';
+        out[at < outSize ? at : outSize - 1] = '\0';
+        break;
+    }
+    case CONST_NONE:  snprintf(out, outSize, "<none>");                  break;
+    }
+}
+
 void jaiConstReplace(AstContext *ast, AstNode *node, ConstValue v) {
     if (ast == NULL || node == NULL || v.kind == CONST_NONE) return;
+
+    /* Before the rewrite: the node's own kind is half the record. That `2 + 3`
+     * folded says more than that some node is now `5`. */
+    if (jaiSemaDumpActive()) {
+        char rendered[512];
+        renderConst(v, rendered, sizeof rendered);
+        jaiSemaDumpFold(node->span, node->kind, rendered);
+    }
 
     JaiSpan span = node->span;
     memset(&node->as, 0, sizeof node->as);

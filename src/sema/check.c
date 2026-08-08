@@ -897,6 +897,10 @@ static void wrapInCast(Checker *c, AstNode *node, JaiType *to, bool widen) {
                        : jaiArenaMemdup(&c->ast->arena, rendered, strlen(rendered));
     target->resolved = to;
 
+    if (jaiSemaDumpActive()) {
+        jaiSemaDumpCast(node->span, inner->kind, inner->type, to, widen);
+    }
+
     node->kind = AST_CAST;
     memset(&node->as, 0, sizeof node->as);
     node->as.cast.operand = inner;
@@ -1219,5 +1223,9 @@ bool jaiCheckProgram(Checker *c, AstNode *program) {
     program->type = gTypes.tVoid;
 
     jaiChkNarrowRestore(0);
+    /* After everything, not during: folding rewrites nodes and a cast replaces
+     * one in place, so a type recorded as it was assigned can be a type the
+     * finished tree does not hold. */
+    jaiSemaDumpTypes(program);
     return c->errorCount == 0;
 }

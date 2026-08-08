@@ -30,6 +30,7 @@
 #include "../lang/parser.h"
 #include "../native/native.h"
 #include "../sema/modsig.h"
+#include "../sema/semadump.h"
 #include "../vm/chunk.h"
 #include "../vm/serialize.h"
 
@@ -116,6 +117,7 @@ void jaiCliPrintUsage(FILE *out) {
         "      --json                 machine-readable output where supported\n"
         "      --color=auto|always|never\n"
         "      --out PATH             write the output to PATH\n"
+        "      --dump-sema PATH       write the checker's per-node decisions\n"
         "\n"
         "Every option that takes a value accepts both `--name value` and\n"
         "`--name=value`, here and in fmt, test, doc and bench alike.\n"
@@ -345,6 +347,12 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         if (value == NULL) value = takeValue(argc, argv, i, "--out");
         if (value == NULL) return false;
         out->output = value;
+        return true;
+    }
+    if (optionIs(arg, "--dump-sema", &value)) {
+        if (value == NULL) value = takeValue(argc, argv, i, "--dump-sema");
+        if (value == NULL) return false;
+        out->dumpSema = value;
         return true;
     }
 
@@ -1426,6 +1434,22 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
 
 int jaiCliDispatch(const JaiCliOptions *opts) {
     if (opts == NULL) return 1;
+
+    /* Only `check` writes a dump. Accepting the flag elsewhere and quietly
+     * writing nothing would let a comparison "pass" because one side never
+     * produced a file to compare. */
+    if (opts->dumpSema != NULL) {
+        if (opts->command != CMD_CHECK) {
+            JaiDiag *d = jaiDiagError(JAI_OK, JAI_SPAN_NONE,
+                                      "--dump-sema is only implemented for "
+                                      "`check`, not `%s`",
+                                      commandName(opts->command));
+            jaiDiagAddHelp(d, "run `jaithon check --dump-sema PATH FILE`");
+            (void)cliFlush();
+            return 1;
+        }
+        jaiSemaDumpArm(opts->dumpSema);
+    }
 
     if (opts->run.selfHosted && !commandHonoursFrontEnd(opts->command)) {
         JaiDiag *d = jaiDiagError(JAI_OK, JAI_SPAN_NONE,
