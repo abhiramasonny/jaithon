@@ -29,6 +29,7 @@
 #include "../native/native.h"
 #include "../sema/check.h"
 #include "../sema/resolve.h"
+#include "../sema/semadump.h"
 #include "../vm/serialize.h"
 
 #define JAI_MODULE_EXT   ".jai"
@@ -1650,11 +1651,23 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     ObjModule *module = jaiModuleNew(nameStr, pathStr);
     jaiPushRoot(OBJ_VAL(module));
 
+    /* The dump belongs to the file the user named. Imports run through the
+     * same checker, so beginning here rather than inside the front end is what
+     * stops each of them overwriting the entry file's decisions. */
+    jaiSemaDumpBegin(entry);
+
     /* Emit as well: `check` promises "compile and type-check" (spec §8.5), and
      * codegen is where the bytecode verifier runs. Checking without it would
      * pass files that cannot actually be loaded. The body is discarded. */
     bool ok = frontEnd(module, fileId, &sOptions.codegen, true, NULL, false);
     jaiPopRoots(3);
+
+    if (!jaiSemaDumpEnd()) {
+        (void)jaiDiagError(JAI_OK, JAI_SPAN_NONE,
+                           "cannot write the sema dump for `%s`", entry);
+        (void)jaiDiagFlush(&gDiags, stderr);
+        return 1;
+    }
 
     if (sOptions.verbose && ok) {
         fprintf(stderr, "jaithon: %s is clean\n", entry);
