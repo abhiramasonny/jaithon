@@ -5,6 +5,7 @@
 #   make test       build + run the full test suite
 #   make bench      build + run benchmarks
 #   make bootstrap  differential check of the C and self-hosted front ends
+#   make sema-diff  FILE=x.jai — what the checker decided about one file
 #   make install    install to $(PREFIX)
 #   make clean      remove build artifacts
 
@@ -235,7 +236,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench bootstrap install uninstall \
+.PHONY: all debug release test verify-test bench bootstrap sema-diff install uninstall \
         clean distclean fmt fmt-check check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -307,6 +308,24 @@ bench: $(TARGET)
 bootstrap: $(TARGET)
 	@./$(TARGET) --bootstrap-verify lib tests
 
+# What the two checkers decided about one file:
+#
+#   make sema-diff FILE=lib/std/str.jai
+#
+# `bootstrap` answers in bytecode, which is the wrong vocabulary for a type
+# bug: it reports the first byte that differs, and the decision that was wrong
+# is somewhere upstream of it. This reports the decisions.
+#
+# The self-hosted side has no checker yet, and `--front=jai` does not implement
+# `check` either, so today this summarises the C side alone: how many types,
+# folds and guards the self-hosted checker has to reproduce for that file. When
+# both sides can produce a dump, pass both to scripts/sema_diff.jai and it
+# compares them.
+sema-diff: $(TARGET)
+	@test -n "$(FILE)" || { echo "usage: make sema-diff FILE=path.jai"; exit 2; }
+	@./$(TARGET) check --dump-sema $(BUILD)/sema.c.txt $(FILE)
+	@./$(TARGET) run scripts/sema_diff.jai $(BUILD)/sema.c.txt
+
 check: $(TARGET)
 	@./$(TARGET) check lib tests examples
 
@@ -354,4 +373,4 @@ distclean: clean
 	@echo "  CLEAN   removed every build tree, binary and generated artefact"
 
 help:
-	@echo "targets: all debug release test bench bootstrap check fmt install clean"
+	@echo "targets: all debug release test bench bootstrap sema-diff check fmt install clean"
