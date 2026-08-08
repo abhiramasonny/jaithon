@@ -90,6 +90,13 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
                               const char *path, ObjModule *module,
                               const CodegenOptions *opts);
 
+/* The module name a path carries: its basename with `.jai` removed, or
+ * `__main__` when nothing is left. The self-hosted front end has its own copy
+ * of this rule in `module_name_for` (lib/jaithon/compile/mod.jai) and the two
+ * must agree: --bootstrap-verify compiles one file with both front ends and
+ * the name is a constant in the record's pool. */
+void jaiModuleNameFor(const char *path, char *out, size_t outSize);
+
 /* Compile a source string with the *self-hosted* front end (lib/jaithon/compile)
  * and load the .jaic image it returns into `module`. This runs the VM:
  * `jaithon.compile` is imported and called, so the C front end has to have compiled

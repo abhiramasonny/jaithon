@@ -1510,6 +1510,70 @@ static bool nReflectCompile(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* __prim__.compile_image(source, path, opt_level, release) -> bytes
+ *
+ * The C front end's serialised .jaic for `source`. __prim__.compile above
+ * answers an ObjClosure, so the bytes themselves were unreachable from Jaithon
+ * and compile.mod.verify() — a differential check written against an image it
+ * had no way to obtain — has been dead since it was written.
+ *
+ * The module is fresh rather than the caller's. An image is a whole module's
+ * record, and compiling into the caller's module would both pollute it and
+ * write the caller's name into the container, so the one thing the image is
+ * for — being compared against another front end's image of the same file —
+ * would fail on a difference neither front end caused. */
+static bool nReflectCompileImage(int argc, Value *args, Value *out) {
+    ObjString *source;
+    if (!jaiArgString(args[0], 1, "compile_image", &source)) return false;
+    ObjString *path;
+    if (!jaiArgString(args[1], 2, "compile_image", &path)) return false;
+
+    int64_t optLevel = 2;
+    if (argc >= 3 && !IS_NULL(args[2])) {
+        if (!jaiArgInt(args[2], 3, "compile_image", &optLevel)) return false;
+    }
+    bool release = false;
+    if (argc >= 4 && !IS_NULL(args[3])) {
+        if (!jaiArgBool(args[3], 4, "compile_image", &release)) return false;
+    }
+
+    char name[256];
+    jaiModuleNameFor(path->chars, name, sizeof name);
+
+    ObjModule *module = jaiModuleNew(jaiStringInternC(name), path);
+    jaiGCPushRoot(OBJ_VAL(module));
+
+    CodegenOptions opts = jaiCodegenDefaults();
+    opts.optLevel = (int)optLevel;
+    opts.stripAsserts = release;
+
+    ObjFunction *body = jaiCompileSource(source->chars, source->length,
+                                         path->chars, module, &opts);
+    if (body == NULL) {
+        jaiGCPopRoots(1);
+        if (!vm.hasException) (void)throwCompileError("compile_image");
+        return false;
+    }
+    body->module = module;
+    jaiGCPushRoot(OBJ_VAL(body));
+
+    uint64_t hash = jaiSourceHash(source->chars, source->length);
+    uint32_t flags = release ? JAIC_FLAG_RELEASE : JAIC_FLAG_DEBUG;
+    size_t size = 0;
+    uint8_t *image = jaiSerializeModule(module, body, hash, flags, &size);
+    jaiGCPopRoots(2);
+
+    if (image == NULL) {
+        return jaiThrow(vm.cRuntimeError, "compile_image(): the module "
+                                          "compiled but would not serialise");
+    }
+
+    ObjBytes *bytes = jaiBytesNew(image, size);
+    (void)jaiRealloc(image, size, 0);
+    *out = OBJ_VAL(bytes);
+    return true;
+}
+
 /* An expression is evaluated by binding it to a module-level name and reading
  * that name back: the module body is the only thing the code generator emits,
  * and a body discards the value of an expression statement. The binding is
@@ -1718,6 +1782,7 @@ static bool nReflectBuildId(int argc, Value *args, Value *out) {
 void jaiRegisterReflectPrimitives(void) {
     jaiDefineNative("__prim__.jaic_build_id", nReflectBuildId,   0, 0);
     jaiDefineNative("__prim__.compile",     nReflectCompile,     1, 2);
+    jaiDefineNative("__prim__.compile_image", nReflectCompileImage, 2, 4);
     jaiDefineNative("__prim__.eval",        nReflectEval,        1, 1);
     jaiDefineNative("__prim__.exec",        nReflectExec,        1, 2);
     jaiDefineNative("__prim__.parse_ast",   nReflectParseAst,    1, 2);
