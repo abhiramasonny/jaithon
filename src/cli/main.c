@@ -600,13 +600,6 @@ static bool collectAllInputs(const JaiCliOptions *opts, PathList *out,
 /* Compiling one file with the C front end                              */
 /* ------------------------------------------------------------------ */
 
-static void moduleNameFor(const char *path, char *out, size_t outSize) {
-    jaiPathBasename(out, outSize, path);
-    size_t len = strlen(out);
-    if (len > 4 && strcmp(out + len - 4, ".jai") == 0) out[len - 4] = '\0';
-    if (out[0] == '\0') snprintf(out, outSize, "__main__");
-}
-
 /* jaiCompileSource takes a const buffer, so it registers its own copy with the
  * diagnostic engine. Should a front end ever hand this exact buffer to
  * jaiSourceAdd instead, freeing it here would leave the registry dangling — so
@@ -635,7 +628,7 @@ static ObjFunction *compileFile(const char *path, const CodegenOptions *codegen,
 
     char name[256];
     char absolute[JAI_MAX_PATH];
-    moduleNameFor(path, name, sizeof name);
+    jaiModuleNameFor(path, name, sizeof name);
     if (!jaiPathAbsolute(absolute, sizeof absolute, path)) {
         snprintf(absolute, sizeof absolute, "%s", path);
     }
@@ -1251,7 +1244,7 @@ static VerifyOutcome verifyOne(const char *path, const CodegenOptions *codegen) 
 
     char name[256];
     char absolute[JAI_MAX_PATH];
-    moduleNameFor(path, name, sizeof name);
+    jaiModuleNameFor(path, name, sizeof name);
     if (!jaiPathAbsolute(absolute, sizeof absolute, path)) {
         snprintf(absolute, sizeof absolute, "%s", path);
     }

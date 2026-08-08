@@ -1397,6 +1397,21 @@ static void fileStem(char *out, size_t outSize, const char *path) {
     }
 }
 
+/* The module name a *path* carries, which is `fileStem` plus the fallback an
+ * import chain does not want: a path with nothing left after the extension is
+ * stripped names the main module, not the empty module.
+ *
+ * Shared rather than static because three callers need the same answer and had
+ * been spelling it out separately — the CLI, the self-hosted bridge, and
+ * __prim__.compile_image. A fourth copy lives in `module_name_for`
+ * (lib/jaithon/compile/mod.jai) and must agree with this one, because
+ * --bootstrap-verify compiles the same file with both front ends and the name
+ * is a constant in the record's pool. */
+void jaiModuleNameFor(const char *path, char *out, size_t outSize) {
+    fileStem(out, outSize, path);
+    if (out[0] == '\0') snprintf(out, outSize, "__main__");
+}
+
 static void freeOwned(char *s) {
     if (s != NULL) (void)jaiRealloc(s, strlen(s) + 1, 0);
 }
