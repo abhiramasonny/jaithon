@@ -511,14 +511,22 @@ const char *jaiObjTypeName(ObjType t);
 /* ------------------------------------------------------------------ */
 
 /* jaiValueHash with the one case that dominates real dictionaries — a string
- * key — settled inline. A string carries its hash from the moment it is built,
- * so this is a field read, against an out-of-line call that maintains the
+ * key — settled inline, against an out-of-line call that maintains the
  * recursion guard and switches twice. Everything else defers, so there is
- * exactly one line here to keep in step with valueHashInner. */
+ * exactly one line here to keep in step with valueHashInner.
+ *
+ * It must go through jaiStringHash and not read `->hash`. The field is lazy:
+ * jaiStringSeal leaves it at zero for any run-time string past
+ * JAI_INTERN_MAX, and zero means "not computed yet". Reading it raw filed
+ * every such key under hash 0, and the first later call that did force the
+ * hash rewrote the field on the key the table was already holding — so the
+ * entry became unreachable through the very object keys() hands back, and
+ * `for k in d.keys() { k in d }` could be false. That is the line this comment
+ * used to claim did not need to exist. */
 JAI_INLINE uint64_t jaiValueHashFast(Value v, bool *ok) {
     if (IS_STRING(v)) {
         *ok = true;
-        return AS_STRING(v)->hash;
+        return jaiStringHash(AS_STRING(v));
     }
     return jaiValueHash(v, ok);
 }

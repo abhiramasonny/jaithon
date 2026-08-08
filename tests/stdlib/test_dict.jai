@@ -108,3 +108,46 @@ fn test_with_default_never_raises() -> void {
     assert_eq(counts.get("a"), 1)
     assert_eq(counts.get("absent"), 0)
 }
+
+#: A run-time string longer than `JAI_INTERN_MAX` (32 bytes, src/vm/object.c)
+#: is not interned and `jaiStringSeal` leaves its hash unset, because a string
+#: that never becomes a key should not pay to be hashed. Zero means "not
+#: computed yet", and `jaiValueHashFast` read the field raw instead of going
+#: through `jaiStringHash`, so such a key was filed under hash 0. The first
+#: later call that did force the hash — an intern probe, another table, an
+#: equality test — rewrote the field on the key the dict was already holding,
+#: and the entry became unreachable through the very object `keys()` hands back.
+#:
+#: Long keys are not exotic: `f"{a} {b} {c}"` over any real data clears 32 bytes
+#: at once.
+fn test_a_long_key_survives_being_hashed_after_it_was_stored() -> void {
+    let long_key = "0 AST_COMPREHENSION some padding text"
+    assert_true(long_key.len() > 32, "the key has to be past the intern limit")
+
+    let entries: dict[str, int] = {}
+    entries[long_key] = 1
+
+    # Forcing the hash after the insert is what used to move the key.
+    let equal_copy = "0 AST_COMPREHENSION" + " some padding text"
+    assert_true(equal_copy in entries)
+
+    for key in entries.keys() {
+        assert_true(key in entries, "a dict must contain the key it just handed out")
+        assert_eq(entries[key], 1)
+    }
+}
+
+fn test_long_keys_do_not_all_collide() -> void {
+    # Every un-interned string hashing to 0 also meant every long key landed in
+    # one bucket, so a dict of them probed linearly. Correctness first, but the
+    # count is the thing that made it visible.
+    let entries: dict[str, int] = {}
+    for index in range(500) {
+        entries[f"a fairly long key that passes the intern limit {index}"] = index
+    }
+    assert_eq(entries.len(), 500)
+    for key in entries.keys() {
+        assert_true(key in entries)
+    }
+    assert_eq(entries["a fairly long key that passes the intern limit 499"], 499)
+}
