@@ -2723,14 +2723,24 @@ static Obj *classSpecInstantiate(Value spec) {
     }
 }
 
+#ifdef JAI_OPCODE_STATS
+uint64_t jaiOpCounts[OP_COUNT];
+#endif
+
 /* ------------------------------------------------------------------ */
 /* The interpreter loop                                                 */
 /* ------------------------------------------------------------------ */
 
 #if JAI_COMPUTED_GOTO
 #  define VM_CASE(name)  L_##name
-#  define VM_NEXT()      do { DISPATCH_TRACE(); instStart = ip;                \
+#  ifdef JAI_OPCODE_STATS
+#    define VM_NEXT()      do { DISPATCH_TRACE(); instStart = ip;                \
+                                jaiOpCounts[*ip]++;                              \
+                                goto *jaiDispatchTable[*ip++]; } while (0)
+#  else
+#    define VM_NEXT()      do { DISPATCH_TRACE(); instStart = ip;                \
                               goto *jaiDispatchTable[*ip++]; } while (0)
+#  endif
 /* The trailing `;` lets the case labels that follow live in a plain block;
  * labels have function scope, so the nesting costs nothing. */
 #  define VM_DISPATCH()  VM_NEXT();
@@ -5430,6 +5440,17 @@ void jaiVMPrintStats(FILE *out) {
     uint64_t lookups = vm.icHits + vm.icMisses;
     double hitRate = lookups > 0 ? (100.0 * (double)vm.icHits / (double)lookups)
                                  : 0.0;
+#ifdef JAI_OPCODE_STATS
+    {
+        uint64_t tot = 0;
+        for (int i = 0; i < OP_COUNT; i++) tot += jaiOpCounts[i];
+        for (int i = 0; i < OP_COUNT; i++)
+            if (jaiOpCounts[i] > tot / 200)
+                fprintf(out, "op %3d %-24s %10" PRIu64 "  %5.2f%%\n", i,
+                        jaiOpName((OpCode)i), jaiOpCounts[i],
+                        100.0 * (double)jaiOpCounts[i] / (double)tot);
+    }
+#endif
     fprintf(out, "vm: %" PRIu64 " instructions, %" PRIu64 " calls, %" PRIu64
                  " allocations\n",
             vm.instructionCount, vm.callCount, vm.allocCount);

@@ -74,7 +74,23 @@ static inline uint64_t jaiStringHash(ObjString *s) {
     if (s->hash == 0) s->hash = jaiHashBytes(s->chars, s->length);
     return s->hash;
 }
-bool       jaiStringEquals(const ObjString *a, const ObjString *b);
+/* The tail of jaiStringEquals: two strings that are neither identical nor both
+ * interned, so the answer needs their bytes. */
+bool       jaiStringEqualsSlow(const ObjString *a, const ObjString *b);
+
+/* Inline because the callers are linear scans over parameter and field names
+ * (vm.c bindCallArgs, jaiClassFieldInfo) that run tens of millions of times in
+ * a compile, and for interned names every one of those iterations answers from
+ * the two cheap tests below. Out of line, `jaiStringEquals` was the second
+ * hottest function in the whole program by sample count -- almost entirely the
+ * cost of calling it, not of anything it did. */
+static inline bool jaiStringEquals(const ObjString *a, const ObjString *b) {
+    if (a == b) return true;
+    if (a == NULL || b == NULL) return false;
+    /* Two distinct interned strings are never equal, by construction. */
+    if (JAI_STR_INTERNED(a) && JAI_STR_INTERNED(b)) return false;
+    return jaiStringEqualsSlow(a, b);
+}
 
 /* ------------------------------------------------------------------ */
 /* Bytes                                                                */

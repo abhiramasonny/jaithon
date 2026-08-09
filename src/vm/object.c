@@ -520,11 +520,7 @@ uint32_t jaiStringScalarCount(ObjString *s) {
     return s->scalars;
 }
 
-bool jaiStringEquals(const ObjString *a, const ObjString *b) {
-    if (a == b) return true;
-    if (a == NULL || b == NULL) return false;
-    /* Two distinct interned strings are never equal, by construction. */
-    if (JAI_STR_INTERNED(a) && JAI_STR_INTERNED(b)) return false;
+bool jaiStringEqualsSlow(const ObjString *a, const ObjString *b) {
     if (a->length != b->length) return false;
     if (jaiStringHash((ObjString *)a) != jaiStringHash((ObjString *)b))
         return false;
