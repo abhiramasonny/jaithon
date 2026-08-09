@@ -927,9 +927,10 @@ class Workspace {
         const semaOut = path.join(os.tmpdir(), `jaithon-sema-${process.pid}-${Workspace.tick++}.txt`);
 
         const [astResult, semaResult] = await Promise.all([
-            tool.run(['ast', '--json', '--color=never', ...include, snapshot.path],
+            tool.run(['ast', '--json', '--color=never', ...tool.C_FRONT_END, ...include, snapshot.path],
                      { cwd: snapshot.dir, document, token }),
-            tool.run(['check', '--color=never', '--dump-sema', semaOut, ...include, snapshot.path],
+            tool.run(['check', '--color=never', ...tool.C_FRONT_END,
+                      '--dump-sema', semaOut, ...include, snapshot.path],
                      { cwd: snapshot.dir, document, token }),
         ]);
 

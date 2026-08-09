@@ -241,7 +241,7 @@ class Checker {
         this.running.set(key, source);
 
         const snapshot = tool.snapshot(document);
-        const args = ['check'];
+        const args = ['check', ...tool.C_FRONT_END];
         if (tool.config().get('strict')) args.push('--strict');
         args.push('--color=never');
         if (snapshot.mirrored) args.push('--no-cache', ...tool.includeArgs(document, snapshot.dir));
