@@ -596,6 +596,8 @@ static uint32_t cacheFlagsFor(const CodegenOptions *opts) {
     uint32_t flags = 0;
     if (opts->debugInfo) flags |= JAIC_FLAG_DEBUG;
     if (opts->stripAsserts) flags |= JAIC_FLAG_RELEASE;
+    /* So the two front ends cannot read each other's entries. */
+    if (sOptions.selfHosted) flags |= JAIC_FLAG_SELFHOSTED;
     return flags;
 }
 
@@ -1251,9 +1253,17 @@ ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
 
 /* The --front=jai counterpart of loadModuleBody: same source registration, same
  * contract (a body, or NULL with the reason in gDiags), but the bytecode
- * arrives as a .jaic image from lib/jaithon/compile. The cache is neither consulted
- * nor written: a __jaicache__ entry records no front end, and one compiler
- * reading the other's cache is exactly the mix-up this flag exists to expose. */
+ * arrives as a .jaic image from lib/jaithon/compile.
+ *
+ * The cache is consulted and written, exactly as loadModuleBody does. It used
+ * not to be, because a __jaicache__ entry recorded no front end and one
+ * compiler reading the other's would be the mix-up this flag exists to expose.
+ * JAIC_FLAG_SELFHOSTED now records the producer, so an entry written by the
+ * other front end is an ordinary cache miss rather than a hazard.
+ *
+ * This is what makes the warm path measurable at all: a warm run deserialises a
+ * .jaic and never reaches a front end, so it costs the same whichever compiler
+ * filled the cache -- but only if the self-hosted path is allowed to fill it. */
 static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
     size_t length = 0;
     char *text = jaiReadFile(path, &length);
@@ -1274,8 +1284,26 @@ static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
         return NULL;
     }
 
-    return jaiSelfHostedCompileInto(file->source, length, path, module, hash,
-                                    options()->codegen.optLevel);
+    const JaiRunOptions *opts = options();
+    uint32_t flags = cacheFlagsFor(&opts->codegen);
+
+    if (opts->useCache && cacheFlagsMatch(path, flags)) {
+        ObjFunction *cached = jaiCacheLoad(path, module, hash);
+        if (cached != NULL) return cached;
+        /* Stale, corrupt, or from the other front end: compile it. */
+    }
+
+    ObjFunction *body = jaiSelfHostedCompileInto(file->source, length, path,
+                                                 module, hash,
+                                                 opts->codegen.optLevel);
+    if (body == NULL) return NULL;
+
+    if (opts->writeCache) {
+        jaiPushRoot(OBJ_VAL(body));
+        (void)jaiCacheStore(path, module, body, hash, flags);   /* best effort */
+        jaiPopRoot();
+    }
+    return body;
 }
 
 int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,

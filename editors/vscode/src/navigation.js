@@ -18,6 +18,7 @@ const SYMBOL_KIND = {
     parameter: vscode.SymbolKind.Variable,
     self: vscode.SymbolKind.Variable,
     typealias: vscode.SymbolKind.TypeParameter,
+    typeParameter: vscode.SymbolKind.TypeParameter,
     module: vscode.SymbolKind.Module,
     import: vscode.SymbolKind.Module,
 };
