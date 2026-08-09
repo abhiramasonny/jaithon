@@ -499,6 +499,38 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
     }
 }
 
+# Resolve `body` with `owner`'s type names in scope, then put the scope back.
+#
+# The C's `jaiChkForeignBegin` / `jaiChkForeignEnd`. A signature read out of
+# another module names types that module declares, and those names mean nothing
+# here — `fn verify_source(...) -> VerifyResult` resolved in this file's scope
+# gives `fn(...) -> any`, and the `any` then spreads to every call, every
+# binding that holds a result, and every member read off one. That was 75 of
+# the 137 decisions in `tests/lang/test_bootstrap_verify.jai` alone.
+#
+# Each of the owner's declarations is bound to its qualified nominal type, so a
+# name resolves to the same type the import pass gives it and the two agree.
+fn _in_foreign_scope(c: Ctx, owner: ModuleSig?, body: fn() -> Type?) -> Type? {
+    if owner is null { return body() }
+    let mark = c.type_name_mark()
+    for entry in owner.types {
+        c.push_type_name(
+            entry.name,
+            named(c.universe, _decl_kind(entry.decl), owner.qualify(entry.name))
+        )
+    }
+    let answer = body()
+    c.type_name_restore(mark)
+    return answer
+}
+
+# Which nominal kind a declaration node introduces.
+fn _decl_kind(decl: Node) -> TyKind {
+    if decl.kind == NodeKind.TraitDecl { return TyKind.Trait }
+    if decl.kind == NodeKind.EnumDecl { return TyKind.Enum }
+    return TyKind.Class
+}
+
 # The type a declaration read out of another module's signature denotes.
 #
 # A nominal type from another module is interned under its QUALIFIED name —
@@ -510,11 +542,15 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
 # the same spelling.
 fn _signature_type(c: Ctx, decl: Node, owner: ModuleSig?) -> Type? {
     match decl.kind {
-        NodeKind.FnDecl => { return signature_of(c, decl, false) }
+        NodeKind.FnDecl => { return _in_foreign_scope(c, owner, || signature_of(c, decl, false)) }
+        # In the owner's scope: the signature's annotations name that
+        # module's types, not this one's.
         NodeKind.ClassDecl => { return named(c.universe, TyKind.Class, _qualified(decl, owner)) }
         NodeKind.TraitDecl => { return named(c.universe, TyKind.Trait, _qualified(decl, owner)) }
         NodeKind.EnumDecl => { return named(c.universe, TyKind.Enum, _qualified(decl, owner)) }
-        NodeKind.TypeDecl => { return resolve_ast_type(c, decl.type_field("aliased")) }
+        NodeKind.TypeDecl => {
+            return _in_foreign_scope(c, owner, || resolve_ast_type(c, decl.type_field("aliased")))
+        }
         _ => { return null }
     }
 }
