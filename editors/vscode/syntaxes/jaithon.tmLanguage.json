@@ -457,7 +457,13 @@
         { "name": "storage.type.jaithon", "match": "\\b(let|var|const|type)\\b" },
         { "name": "keyword.other.assert.jaithon", "match": "\\b(assert)\\b" },
         { "name": "variable.language.self.jaithon", "match": "\\b(self|super)\\b" },
-        { "name": "keyword.operator.logical.jaithon", "match": "\\b(and|or|not|is|in)\\b" }
+        {
+          "comment": "These are keywords to the lexer (TOK_KW_AND and friends), not punctuation, and they read as keywords. `keyword.operator.expression` is the scope themes reserve for a word that acts as an operator — bare `keyword.operator` is where a theme puts `+` and `==`, which is why these came out the same colour as the surrounding text.",
+          "name": "keyword.operator.expression.logical.jaithon",
+          "match": "\\b(and|or|not)\\b"
+        },
+        { "name": "keyword.operator.expression.is.jaithon", "match": "\\bis\\b" },
+        { "name": "keyword.operator.expression.in.jaithon", "match": "\\bin\\b" }
       ]
     },
 

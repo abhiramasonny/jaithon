@@ -198,8 +198,7 @@ pub class Parser {
 
         let ok = not self.trial_failed and not self.had_error
         let error_tok = self.trial_error_tok
-        let ran_out = self.trial_failed and
-            self._token_at(error_tok).kind == TokenKind.Eof
+        let ran_out = self.trial_failed and self._token_at(error_tok).kind == TokenKind.Eof
         self.trial_active = false
 
         self.current = mark_current
@@ -1336,8 +1335,7 @@ pub class Parser {
             # trial and then again for real, so a warning that reached the bag
             # from a trial is rendered twice — three times for a line opening
             # with `{`, which is tried both ways.
-            if not self.trial_active and
-                _is_numeric_literal(left) and _is_numeric_literal(right) {
+            if not self.trial_active and _is_numeric_literal(left) and _is_numeric_literal(right) {
                 self.diagnostics.warn(
                     Code.W0105_DEPRECATED,
                     op_span,

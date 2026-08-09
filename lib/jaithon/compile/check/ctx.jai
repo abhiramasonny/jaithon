@@ -227,8 +227,6 @@ pub class Ctx {
         self.symbol_types[id(symbol)] = ty
     }
 
-
-
     #: Register a declaration, by name and by declaring node. `visible` is
     #: `DeclEntry.visible`: everything an imported module declares is registered
     #: so annotations can mention siblings, but only what this file imported may

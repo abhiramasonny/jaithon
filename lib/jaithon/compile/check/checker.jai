@@ -388,14 +388,15 @@ pub fn check_program(
     bag: DiagnosticBag,
     fold_constants: bool = true,
     path: str = "",
+    outer_type_names: list[tuple[str, Type]] = [],
+    strict: bool = false
+) -> Ctx {
     # Names bound before anything in `program` is looked at. A file needs none:
     # it declares everything it can name. A prompt input needs the classes the
     # inputs before it declared, which are in no registry this compilation can
     # reach.
-    outer_type_names: list[tuple[str, Type]] = [],
+
     # `--strict`: an unannotated parameter is an error (E0400).
-    strict: bool = false
-) -> Ctx {
     let c = Ctx(universe, bag, resolution)
     c.fold_constants = fold_constants
     c.strict = strict
@@ -824,4 +825,3 @@ fn _signature_pass(c: Ctx, node: any) -> void {
         for key in node.keys() { _signature_pass(c, node[key]) }
     }
 }
-

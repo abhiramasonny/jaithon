@@ -18,15 +18,15 @@ from jaithon.compile.parser import Parser
 #: input that only trails an operator, but inside a bracket or a literal a
 #: blank line is content, and a pasted block that contains one has to survive.
 pub enum OpenKind {
-    None
+    None,
     #: `(`, `[` or `{` is still waiting for its closer.
-    Bracket
+    Bracket,
     #: A triple-quoted string runs past the last line.
-    String
+    String,
     #: A `#*` block comment has no `*#` yet.
-    Comment
+    Comment,
     #: The last line ends on something that binds on.
-    Operator
+    Operator,
 }
 
 #: The verdict on one buffer: run it, keep reading, or reject it now.
@@ -63,11 +63,11 @@ pub class Scan {
     #: to be changed together.
     pub fn open_ordinal(self) -> int {
         return match self.open {
-            OpenKind.None => 0
-            OpenKind.Bracket => 1
-            OpenKind.String => 2
-            OpenKind.Comment => 3
-            OpenKind.Operator => 4
+            OpenKind.None => 0,
+            OpenKind.Bracket => 1,
+            OpenKind.String => 2,
+            OpenKind.Comment => 3,
+            OpenKind.Operator => 4,
         }
     }
 }
@@ -207,8 +207,7 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
 fn _is_triple_quote_at(text: _Text, offset: int) -> bool {
     var index = text.index_of_byte(offset)
     let length = text.chars.len()
-    while index < length and
-        (text.chars[index] == "r" or text.chars[index] == "f") {
+    while index < length and (text.chars[index] == "r" or text.chars[index] == "f") {
         index += 1
     }
     if index + 2 >= length { return false }
@@ -258,7 +257,7 @@ fn _unterminated_literal_continues(
         last = diagnostic
     }
 
-    if last is null {                       # block comments only
+    if last is null {  # block comments only
         out.open = OpenKind.Comment
         out.opener = "#"
         let first = bag.items[0].span

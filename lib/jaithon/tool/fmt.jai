@@ -32,7 +32,9 @@
 #: format_source("if a{f( 1,2 )}\n", "demo.jai")    # "if a { f(1, 2) }\n"
 #: ```
 from jaithon.ast import DeclKind, Node, NodeKind, TypeExpr, TypeKind, Visibility
-from jaithon.ast import from_json, op_text, to_source, walk
+from jaithon.ast import op_text, to_source, walk
+from jaithon.compile.lexer import DiagnosticBag, Severity
+from jaithon.compile.parser import parse
 from std.io import Path, print_err, read_file, write_file
 from std.str import StringBuilder, repeat
 from .args import Arguments
@@ -191,18 +193,28 @@ pub fn scan_comments(source: str) -> list[Comment] {
 
 #: Parse `source` into a `jaithon.ast` tree, or raise `ParseError`.
 #:
-#: The tree comes from the front end the compiler itself runs, through the
-#: specified JSON encoding of §12 — the same bytes `jaithon --emit=ast` prints.
-#: That is what keeps the formatter rewriting the program the compiler sees
-#: rather than a second reading of it. The message carries the first diagnostic
-#: the front end produced, with its stable code and the path, so a caller can
-#: report it without knowing anything about `jaithon.compile`.
+#: The tree comes from the front end the compiler itself runs, so the formatter
+#: rewrites the program the compiler sees rather than a second reading of it.
+#: It used to arrive through `__prim__.parse_ast`, which parsed with the C front
+#: end and handed the tree over as the §12 JSON encoding; with the C front end
+#: gone the parser answers `Node` directly and the round trip is not needed.
+#:
+#: The message carries the first diagnostic the front end produced, with its
+#: stable code and the path, so a caller can report it without knowing anything
+#: about `jaithon.compile`.
 pub fn parse_module(source: str, path: str) -> Node {
-    try {
-        return from_json(__prim__.parse_ast(source, path))
-    } catch error: ParseError {
-        throw ParseError(f"{path}: {error.message}")
+    let bag = DiagnosticBag()
+    let program = parse(source, 0, bag)
+    if program is not null { return program }
+
+    var first = f"{path}: cannot parse"
+    for diagnostic in bag.items {
+        if diagnostic.severity == Severity.Error {
+            first = f"{path}: {diagnostic.code}: {diagnostic.message}"
+            break
+        }
     }
+    throw ParseError(first)
 }
 
 #: Pin every literal in `program` to the text it was written as, in place.

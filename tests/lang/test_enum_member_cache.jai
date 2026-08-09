@@ -16,10 +16,15 @@
 from std.test import assert_eq
 
 enum Color { Red, Green, Blue }
+
 enum Fruit { Red, Green, Yellow }
+
 enum Mood { Red, Green, Calm }
+
 enum Sign { Red, Green, Stop }
+
 enum Team { Red, Green, Blue }
+
 enum Card { Red, Green, Heart }
 
 #: One read site, deliberately shared by every enum above.
@@ -54,20 +59,20 @@ fn test_a_direct_site_is_unaffected() -> void {
 }
 
 enum Shape {
-    Circle(r: int)
-    Dot
+    Circle(r: int),
+    Dot,
 
     pub fn describe(self) -> str {
         return match self {
-            Shape.Circle(r) => f"circle {r}"
-            Shape.Dot => "dot"
+            Shape.Circle(r) => f"circle {r}",
+            Shape.Dot => "dot",
         }
     }
 }
 
 enum Blob {
-    Circle(r: int)
-    Dot
+    Circle(r: int),
+    Dot,
 
     pub fn describe(self) -> str {
         return "blob"
