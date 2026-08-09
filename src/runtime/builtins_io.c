@@ -757,6 +757,33 @@ static bool nOsArgv(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* __prim__.module_path() -> list[str]
+ *
+ * The directories an import resolves against, exactly as this binary resolves
+ * them: JAITHON_PATH, whatever -I added, and the library directories derived
+ * from the executable's own location. `vm.modulePath` already mirrors all of
+ * that for reflection (src/runtime/module.c:152).
+ *
+ * The self-hosted front end needs it to resolve an import the same way the C
+ * front end does. Without it, it was reduced to guessing from the importing
+ * file's ancestors — which cannot find `lib` from `tests/lang`, and which no
+ * heuristic fixes in general, because the answer depends on where the binary
+ * was installed rather than on where the source sits. Two front ends that
+ * disagree about where a module lives disagree about everything downstream of
+ * it. */
+static bool nModulePath(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    ObjList *result = jaiListNew(vm.modulePath.count);
+    jaiGCPushRoot(OBJ_VAL(result));
+    for (int i = 0; i < vm.modulePath.count; i++) {
+        jaiListPush(result, OBJ_VAL(vm.modulePath.data[i]));
+    }
+    jaiGCPopRoot();
+    *out = OBJ_VAL(result);
+    return true;
+}
+
 static bool nOsExit(int argc, Value *args, Value *out) {
     (void)out;
     int64_t code = 0;
@@ -1321,6 +1348,7 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
 void jaiRegisterOSPrimitives(void) {
     jaiDefineNative("__prim__.os_env",      nOsEnv,      0, 2);
     jaiDefineNative("__prim__.os_argv",     nOsArgv,     0, 0);
+    jaiDefineNative("__prim__.module_path", nModulePath,   0, 0);
     jaiDefineNative("__prim__.os_exit",     nOsExit,     0, 1);
     jaiDefineNative("__prim__.os_cwd",      nOsCwd,      0, 0);
     jaiDefineNative("__prim__.os_chdir",    nOsChdir,    1, 1);
