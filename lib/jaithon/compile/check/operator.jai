@@ -30,9 +30,9 @@
 #: unary_result(u, OpKind.Not, u.t_bool) == u.t_bool             # true
 #: ```
 from jaithon.ast import OpKind
-from jaithon.compile.check.kinds import JOIN_MAX_MEMBERS, MAX_DECL_DEPTH, TyKind
+from jaithon.compile.check.kinds import MAX_DECL_DEPTH, TyKind
+from jaithon.compile.check.relate import join as join_types
 from jaithon.compile.check.ty import MemberInfo, Type, TypeDecl
-from jaithon.compile.check.union import union_of
 from jaithon.compile.check.universe import Universe, list_of
 
 #: The dunder that implements `op` for a user type (spec §7.1).
@@ -69,19 +69,17 @@ pub fn arith_dunder(op: OpKind) -> str? {
 #: A null operand is read as `any`: it is one the checker could not work out,
 #: and a diagnostic for it has already been reported somewhere else.
 #:
-#: `join` is the element join that `list + list` needs, and it is a parameter
-#: because `relate.jai` does not exist yet — the C calls `jaiTypeJoin`, whose
-#: subtype half is a file of its own. The default is `jaiTypeJoin` minus that
-#: half, so the two disagree on exactly the inputs that half decides: whenever
-#: one element is a subtype of the other, `jaiTypeJoin` answers the wider one
-#: and this default keeps both in a union. That is more than the nominal case
-#: it is easiest to picture — `list[Derived] + list[Base]` is `list[Base]` in
-#: the C and `list[Base | Derived]` here — because the subtype relation also
-#: reaches a generic parameter, which accepts anything (`list[int] + list[T]`
-#: is `list[T]` there and `list[int | T]` here), a container whose element is
-#: `any` (`list[list[str]] + list[list[any]]`), and tuples and function types,
-#: which it compares position by position. Everywhere else the two agree, and
-#: passing the real join once there is one removes the disagreement outright.
+#: `join` is the element join that `list + list` needs, and it defaults to
+#: `relate.join` — the port of `jaiTypeJoin`, which is the function the C calls
+#: here. So `list[Derived] + list[Base]` is `list[Base]`, and
+#: `list[int] + list[str]` is `list[int | str]`: a pair where one element
+#: contains the other collapses to the wider one, and a pair where neither does
+#: keeps both.
+#:
+#: It stays a parameter rather than a plain call because the element type is
+#: the one thing this table takes from elsewhere instead of deciding, and
+#: naming it in the signature is what keeps that visible; `predicate.jai` takes
+#: it for the same reason.
 #:
 #: ```
 #: let u = Universe()
@@ -95,7 +93,7 @@ pub fn binary_result(
     op: OpKind,
     left: Type?,
     right: Type?,
-    join: fn(Universe, Type?, Type?) -> Type = _union_join
+    join: fn(Universe, Type?, Type?) -> Type = join_types
 ) -> Type? {
     # The C resolves an alias off each operand first. That step is not ported
     # because nothing in either front end constructs an alias type, so it is
@@ -318,21 +316,4 @@ fn _find_member(d: TypeDecl?, name: str, depth: int) -> MemberInfo? {
 # which is not a signal this file has.
 fn _element(t: Type) -> Type? {
     return if t.arg_count() > 0 { t.args[0] } else { null }
-}
-
-# The default `join`: `jaiTypeJoin` with its two subtype tests left out,
-# because the relation they need is `relate.jai` and this port has not reached
-# it. Everything else is the C's, including the cap — a least upper bound that
-# keeps growing is worse than no answer, since it slows every later comparison
-# and prints a type nobody can read.
-fn _union_join(u: Universe, a: Type?, b: Type?) -> Type {
-    if a == null { return b ?? u.t_any }
-    if b == null { return a }
-
-    let members: list[Type?] = [a, b]
-    let joined = union_of(u, members)
-    if joined.kind == TyKind.Union and joined.arg_count() > JOIN_MAX_MEMBERS {
-        return u.t_any
-    }
-    return joined
 }

@@ -280,15 +280,52 @@ fn test_never_and_any_answer_before_the_cap_does() -> void {
 }
 
 fn test_the_join_is_a_seam_and_only_a_tuple_reaches_it() -> void {
-    # `relate.jai` owns the real `jaiTypeJoin`; until it exists the default
-    # here is that function without its subtype half, and a caller with a
-    # better one passes it in. Only the tuple arms consult it at all.
+    # `relate.jai` owns the real `jaiTypeJoin` and is what the default here
+    # resolves to; the parameter stays so a caller that has already computed a
+    # better answer can pass it. Only the tuple arms consult it at all.
     let u = Universe()
     let pair = tuple_of(u, [u.t_int, u.t_str])
     assert_true(is_iterable(u, pair, _sentinel_join) == u.t_bool)
     assert_true(is_indexable(u, pair, _sentinel_join) == (u.t_int, u.t_bool))
     assert_true(is_iterable(u, list_of(u, u.t_int), _sentinel_join) == u.t_int)
     assert_true(is_indexable(u, u.t_str, _sentinel_join) == (u.t_int, u.t_str))
+}
+
+fn test_the_default_join_is_the_real_one_and_not_a_union_of_everything() -> void {
+    # The seam's default has to be `relate.join`, not `jaiTypeJoin` minus its
+    # subtype half. The two answer differently for exactly one shape of member
+    # pair — one member a subtype of the other without being a member of it —
+    # and a tuple is where that shape reaches a loop variable: the C binds
+    # `for s in (a_circle, a_shape)` to `Shape`, and a placeholder join binds
+    # it to `Circle | Shape`, which is not a `Shape` and loses every inherited
+    # member the body can name.
+    let u = Universe()
+    let shape_decl = TypeDecl("Shape", Span.none())
+    let circle_decl = TypeDecl("Circle", Span.none())
+    circle_decl.superclass = shape_decl
+    let shape = named(u, TyKind.Class, "Shape", shape_decl)
+    let circle = named(u, TyKind.Class, "Circle", circle_decl)
+
+    let pair = tuple_of(u, [circle, shape])
+    assert_true(is_iterable(u, pair) == shape)
+    assert_true(is_indexable(u, pair) == (u.t_int, shape))
+    # In the other order too: the fold is not commutative by construction, and
+    # `jaiTypeJoin` reaches the answer through a different one of its two
+    # subtype tests each way round.
+    let flipped = tuple_of(u, [shape, circle])
+    assert_true(is_iterable(u, flipped) == shape)
+
+    # The erased and dynamic pairs the same half decides, which a union of
+    # members would also get wrong.
+    let param = generic_param(u, "T")
+    assert_true(is_iterable(u, tuple_of(u, [u.t_int, param])) == param)
+    let maybe = optional_of(u, u.t_int)
+    assert_true(is_iterable(u, tuple_of(u, [u.t_int, maybe])) == maybe)
+    # And a sibling pair still keeps both, because neither contains the other.
+    let square_decl = TypeDecl("Square", Span.none())
+    square_decl.superclass = shape_decl
+    let square = named(u, TyKind.Class, "Square", square_decl)
+    assert_eq(render(is_iterable(u, tuple_of(u, [circle, square]))), "Circle | Square")
 }
 
 fn test_the_containers_index_as_the_c_says_they_do() -> void {

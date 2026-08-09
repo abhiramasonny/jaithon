@@ -140,13 +140,21 @@ fn test_list_concatenation_joins_the_element_types() -> void {
     assert_eq(render(binary_result(u, OpKind.Add, ints, strs)), "list[int | str]")
     # A list and a non-list is not concatenation.
     assert_true(binary_result(u, OpKind.Add, ints, u.t_int) == null)
+
+    # The default is `relate.join`, so two elements where one contains the
+    # other collapse to the wider one instead of staying in a union.
+    let base = TypeDecl("Base", Span.none())
+    let derived = TypeDecl("Derived", Span.none())
+    derived.superclass = base
+    let bases = list_of(u, named(u, TyKind.Class, "Base", base))
+    let deriveds = list_of(u, named(u, TyKind.Class, "Derived", derived))
+    assert_true(binary_result(u, OpKind.Add, deriveds, bases) == bases)
 }
 
 fn test_list_concatenation_uses_the_join_it_is_given() -> void {
-    # The seam for `relate.jai`: with a real join in hand a class and its
-    # ancestor collapse to the ancestor instead of becoming a union. This
-    # stand-in always answers the right-hand element, which is enough to show
-    # the argument is what decides.
+    # The default is the real join, and this pins that it really is only a
+    # default: the stand-in below always answers the right-hand element, which
+    # is enough to show the argument is what decides.
     let u = Universe()
     let joined = binary_result(
         u,
@@ -495,8 +503,9 @@ fn test_the_two_tables_do_not_answer_each_others_codes() -> void {
     }
 }
 
-# Stands in for `relate.jai`'s join: it always answers the right-hand type, the
-# way a real join answers the ancestor of a class and its subclass.
+# A join that is not the default: it always answers the right-hand type, which
+# no real join does, so a result matching it can only have come through the
+# parameter.
 fn _join_to_the_right(u: Universe, a: Type?, b: Type?) -> Type {
     return (b ?? a) ?? u.t_any
 }
