@@ -1255,8 +1255,14 @@ pub class Emitter {
             NodeKind.MatchExpr => { self._match(node, true) }
             NodeKind.Cast => {
                 self._expr(node.child("operand"))
-                let target = node.type_field("target")
-                self._op_k(Op.TypeGuard, self._type_guard_const(target), span)
+                if node.flag("widen") {
+                    # An int the checker proved is an int, on its way into a
+                    # float: one conversion, no test (spec §2.2).
+                    self._op(Op.ToFloat, span)
+                } else {
+                    let target = node.type_field("target")
+                    self._op_k(Op.TypeGuard, self._type_guard_const(target), span)
+                }
             }
             NodeKind.ThrowExpr => {
                 self._expr(node.child("operand"))

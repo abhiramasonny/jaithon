@@ -26,6 +26,9 @@ from jaithon.compile.emit import Const, ConstTag, FuncProto, emit, op_name
 from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
 from jaithon.compile.jaic import disassemble_instruction, float_bits, read_module
 from jaithon.compile.jaic import source_hash, write_module
+from jaithon.compile.check.checker import check_program
+from jaithon.compile.check.expr import Ctx
+from jaithon.compile.check.universe import Universe
 from jaithon.compile.lexer import DiagnosticBag
 from jaithon.compile.opt import optimize
 from jaithon.compile.parser import parse
@@ -49,6 +52,8 @@ pub class Compiled {
     pub var resolution: Resolution?
     #: The module body's function record, or null when nothing was emitted.
     pub var body: FuncProto?
+    #: What the checker decided, or null when it did not run.
+    pub var types: Ctx?
     #: The container description, or null.
     pub var mod: Module?
     #: The serialised `.jaic` bytes; empty on failure.
@@ -62,6 +67,7 @@ pub class Compiled {
         self.program = null
         self.resolution = null
         self.body = null
+        self.types = null
         self.mod = null
         self.image = []
     }
@@ -110,6 +116,14 @@ pub fn compile_source(
 
     let resolution = resolve(program, bag)
     result.resolution = resolution
+
+    # The checker rewrites the tree it is handed: it folds constant expressions
+    # in place and wraps a value in a `Cast` wherever a runtime guard or an
+    # `int -> float` widening is needed. The emitter turns those into
+    # `OP_TYPE_GUARD` and `OP_TO_FLOAT`, which is where about half the bytecode
+    # the two front ends disagree about comes from.
+    let checked = check_program(Universe(), program, resolution, bag, opt_level > 0, false, path)
+    result.types = checked
 
     # The emitter is handed the optimiser rather than importing it: the passes
     # read `jaithon.compile.emit`, so the module that runs them cannot be

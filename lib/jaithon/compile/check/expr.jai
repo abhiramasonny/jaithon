@@ -1098,6 +1098,13 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
 
     let inner = Node(node.kind, node.fields, node.span)
     c.set_type(inner, c.type_of(node))
+    # The resolver keys symbols on node identity, and the operand is a *new*
+    # node — the original's identity is about to become the cast. Without
+    # re-binding, an identifier that gets wrapped loses its symbol and the
+    # emitter reports it undefined: wrapping `total` in a guard turned
+    # `return total` into `NameError: undefined name 'total'`. The C has no
+    # equivalent step because its symbol lives on the node it copies.
+    c.resolution.bind(inner, c.resolution.symbol_of(node))
 
     # Recorded against the *operand's* kind and carrying both sides, which is
     # what the C's jaiSemaDumpCast does: it is called from inside wrapInCast
@@ -1111,9 +1118,14 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
         c.dump.push(Record(node.span.start, node.span.end, kind_name(inner.kind), field, rendered))
     }
 
+    # `widen` goes on the node, not into a side table beside it. The emitter is
+    # what reads it, and it is the whole difference between `OP_TO_FLOAT` and
+    # `OP_TYPE_GUARD` — a flag the emitter cannot see is a conversion it cannot
+    # emit. `Ctx.mark_widen_cast` is kept in step for anything still asking the
+    # context rather than the tree.
     let cast = Node(
         NodeKind.Cast,
-        {"operand": inner, "target": TypeExpr.named(render(to))},
+        {"operand": inner, "target": TypeExpr.named(render(to)), "widen": widen},
         node.span
     )
     node.kind = cast.kind

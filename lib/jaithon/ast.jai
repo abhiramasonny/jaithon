@@ -696,7 +696,15 @@ fn _build_schemas() -> list[list[tuple[str, str]]] {
         [("cond", "node"), ("thenBranch", "node"), ("elseBranch", "node")]
     )
     define([NodeKind.Match, NodeKind.MatchExpr], [("subject", "node"), ("arms", "arm[]")])
-    define([NodeKind.Cast], [("operand", "node"), ("target", "type")])
+    # `widen` marks §2.2's int-to-float conversion, as it does on the C's
+    # `AST_CAST` (src/lang/ast.h:277). It is the one field here the C does not
+    # serialise — neither its text dump nor its JSON emits it — so a node read
+    # back from the C carries the default, which is correct: only a checker
+    # inserts a cast, and a C-produced tree has already had its casts turned
+    # into bytecode. The emitter needs it because it is the whole difference
+    # between `OP_TO_FLOAT` and `OP_TYPE_GUARD`, and without it the self-hosted
+    # front end cannot emit either correctly.
+    define([NodeKind.Cast], [("operand", "node"), ("target", "type"), ("widen", "bool")])
     define([NodeKind.Yield, NodeKind.Await, NodeKind.ThrowExpr], [("operand", "node")])
     define([NodeKind.Block, NodeKind.Program], [("stmts", "nodes")])
     define([NodeKind.ExprStmt], [("expr", "node")])
