@@ -31,11 +31,32 @@ WARNINGS    := -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
 STD         := -std=c11
 BASE_CFLAGS := $(STD) $(WARNINGS) -Isrc -I$(BUILD_ROOT) -MMD -MP -fno-common
 
-RELEASE_CFLAGS := -O2 -DNDEBUG -fno-strict-aliasing
+# -flto because the interpreter's hot helpers live in other translation units:
+# getPropertyInto, bindCallArgs and jaiStringEquals are all called from runLoop
+# in vm.c and defined elsewhere. Measured interleaved, LTO is worth 4.0% on
+# `check lib/std`, and it costs 6s of build time (2s -> 8s).
+#
+# It also makes hand-inlining unnecessary: with LTO on, forcing jaiStringEquals
+# out of line with __attribute__((noinline)) measures 0.0% difference, because
+# LTO inlines it across the TU boundary anyway.
+RELEASE_CFLAGS := -O2 -DNDEBUG -fno-strict-aliasing -flto
 DEBUG_CFLAGS   := -O0 -g3 -DJAI_DEBUG -fno-omit-frame-pointer
 
 LDFLAGS  :=
 LIBS     := -lm -lpthread
+
+# Append-only hooks for one-off flags. Setting CFLAGS or LDFLAGS on the command
+# line REPLACES them, and makefile `+=` cannot append to a command-line
+# variable, so `make LDFLAGS=-flto` silently drops the readline probe's
+# `-L/opt/homebrew/opt/readline/lib` and the link then fails on
+# _rl_replace_line. Use these instead:
+#
+#   make EXTRA_CFLAGS=-flto EXTRA_LDFLAGS=-flto
+#
+# They are part of CC_ID and LINK_ID below, so changing them invalidates the
+# build tree exactly as changing the real flags would.
+EXTRA_CFLAGS  ?=
+EXTRA_LDFLAGS ?=
 
 ifeq ($(UNAME_S),Darwin)
   LIBS   += -framework Cocoa -framework Metal -framework QuartzCore \
@@ -135,6 +156,9 @@ else
   CFLAGS     := $(BASE_CFLAGS) $(RELEASE_CFLAGS)
   BUILD      := $(BUILD_ROOT)/release
   BUILD_NAME := release
+  # Matches the -flto in RELEASE_CFLAGS; the link needs it too, and a debug
+  # link with -flto over non-LTO objects would only cost time.
+  LDFLAGS    += -flto
 endif
 
 SRCS_C  := $(wildcard src/common/*.c) \
@@ -218,8 +242,8 @@ $(BUILD)/src/vm/serialize.o: $(BUILD_ID_H)
 # the right trade: no binary is honest, and the wrong binary is the bug.
 LINK_STAMP := $(BUILD_ROOT)/.link-id
 CC_STAMP   := $(BUILD)/.cc-id
-LINK_ID    := $(BUILD_NAME) | $(CC) | $(LDFLAGS) | $(LIBS)
-CC_ID      := $(CC) | $(CFLAGS)
+LINK_ID    := $(BUILD_NAME) | $(CC) | $(LDFLAGS) | $(EXTRA_LDFLAGS) | $(LIBS)
+CC_ID      := $(CC) | $(CFLAGS) | $(EXTRA_CFLAGS)
 
 # Those checks throw away build products, so they stay out of goals that do not
 # build anything themselves. An empty goal list means the default goal, which
@@ -268,19 +292,19 @@ $(CC_STAMP):
 # old identity recorded, so the next make retries instead of believing it.
 $(TARGET): $(OBJS)
 	@echo "  LINK    $@ ($(BUILD_NAME))"
-	@$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
+	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) -o $@ $(OBJS) $(LIBS)
 	@mkdir -p $(dir $(LINK_STAMP))
 	@printf '%s' '$(LINK_ID)' >$(LINK_STAMP)
 
 $(BUILD)/%.o: %.c | $(CC_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -c $< -o $@
+	@$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: %.m | $(CC_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  OBJC    $<"
-	@$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
+	@$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -fobjc-arc -c $< -o $@
 
 -include $(DEPS)
 
