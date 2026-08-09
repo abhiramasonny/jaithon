@@ -32,6 +32,11 @@ pub const MAX_RECURSION: int = 200
 # argument count in one byte.
 const _MAX_ARGS = 255
 
+# The two readings a prompt line has, and the verdict that it has neither yet.
+const _REPL_AS_STATEMENT = 0
+const _REPL_AS_EXPRESSION = 1
+const _REPL_NEED_MORE = 2
+
 #: The parser.
 #:
 #: Construct one over a `Lexer` and call `parse_program`. The parser executes
@@ -51,6 +56,17 @@ pub class Parser {
     var expr_depth: int
     var yield_count: int
 
+    # Trial parsing, used only by `parse_repl_line`. A trial reads the line one
+    # way, records whether that reading failed and on which token, and is then
+    # undone. The token matters more than the failure: a diagnostic that fired
+    # on `Eof` means the input stopped early and the next line can finish it,
+    # while one that fired on a real token means the input is wrong and no
+    # later line can undo it. Diagnostics are swallowed while a trial runs —
+    # the reading that wins reports its own.
+    var trial_active: bool
+    var trial_failed: bool
+    var trial_error_tok: int
+
     #: Tokenize `lexer` and prepare to parse the tokens it produced.
     pub fn init(self, lexer: Lexer) {
         self.lexer = lexer
@@ -61,6 +77,9 @@ pub class Parser {
         self.panic_mode = false
         self.expr_depth = 0
         self.yield_count = 0
+        self.trial_active = false
+        self.trial_failed = false
+        self.trial_error_tok = 0
         self._skip_error_tokens()
     }
 
@@ -107,6 +126,121 @@ pub class Parser {
         }
         if self.had_error { return null }
         return expr
+    }
+
+    # --- the REPL line ---------------------------------------------------
+
+    #: Read one prompt input, choosing between the two readings a prompt has.
+    #:
+    #: Answers `(node, incomplete)`. `incomplete` says the input stopped early
+    #: and a later line can finish it, so the prompt should keep reading; the
+    #: node is null then. A null node with `incomplete` false is a line that
+    #: was rejected, and the reason is in the bag.
+    #:
+    #: ```
+    #: Parser(Lexer("1 + 1\n")).parse_repl_line()[1]     # false
+    #: Parser(Lexer("1 +\n")).parse_repl_line()[1]       # true
+    #: ```
+    pub fn parse_repl_line(self) -> tuple[Node?, bool] {
+        self.yield_count = 0
+        self._skip_error_tokens()
+        self._skip_newlines()
+        if self._check(TokenKind.Eof) { return (null, false) }
+
+        let reading = self._choose_repl_reading()
+        if reading == _REPL_NEED_MORE { return (null, true) }
+        if reading == _REPL_AS_EXPRESSION {
+            return (self._read_repl_expression(), false)
+        }
+        return (self._read_repl_statement(), false)
+    }
+
+    # Decided by parsing, because a count of open brackets cannot tell an input
+    # that stopped early from one the parser rejected: it says "incomplete" for
+    # both, and a line with a syntax error then holds the prompt open and
+    # swallows every line typed after it.
+    fn _choose_repl_reading(self) -> int {
+        let (statement_ok, statement_ran_out, statement_tok) = self._repl_trial(false)
+        if statement_ok { return _REPL_AS_STATEMENT }
+        if statement_ran_out { return _REPL_NEED_MORE }
+        if not self._check(TokenKind.LBrace) { return _REPL_AS_STATEMENT }
+
+        let (expression_ok, expression_ran_out, expression_tok) = self._repl_trial(true)
+        if expression_ok { return _REPL_AS_EXPRESSION }
+        if expression_ran_out { return _REPL_NEED_MORE }
+
+        # Neither reading works, so the line is wrong either way. Report the one
+        # that got further, which is the one it was more nearly written as; a
+        # tie goes to the block, so the prompt says what a file would say.
+        if expression_tok > statement_tok { return _REPL_AS_EXPRESSION }
+        return _REPL_AS_STATEMENT
+    }
+
+    # Read the line one way, learn how that ended, and undo all of it. Answers
+    # `(ok, ran_out, error_tok)`, where `error_tok` doubles as how far the
+    # reading got. Nodes a trial allocated are simply dropped.
+    fn _repl_trial(self, as_expression: bool) -> tuple[bool, bool, int] {
+        let mark_current = self.current
+        let mark_expr_depth = self.expr_depth
+        let mark_yield_count = self.yield_count
+        let mark_had_error = self.had_error
+        let mark_panic_mode = self.panic_mode
+
+        self.trial_active = true
+        self.trial_failed = false
+        self.trial_error_tok = self.current
+
+        if as_expression {
+            self._read_repl_expression()
+        } else {
+            self._read_repl_statement()
+        }
+
+        let ok = not self.trial_failed and not self.had_error
+        let error_tok = self.trial_error_tok
+        let ran_out = self.trial_failed and
+            self._token_at(error_tok).kind == TokenKind.Eof
+        self.trial_active = false
+
+        self.current = mark_current
+        self.expr_depth = mark_expr_depth
+        self.yield_count = mark_yield_count
+        self.had_error = mark_had_error
+        self.panic_mode = mark_panic_mode
+        return (ok, ran_out, error_tok)
+    }
+
+    # The reading a file gives the line, and the one nearly every line gets.
+    fn _read_repl_statement(self) -> Node? {
+        let node = self._parse_declaration()
+        if self.panic_mode { self._synchronize() }
+        self._skip_newlines()
+        self._expect_repl_end()
+        if self.had_error { return null }
+        return node
+    }
+
+    # The reading only the prompt has. A statement opening with `{` is a block,
+    # so in a file `{"a": 1}` is a block whose first statement is a string, and
+    # it has to stay one; at the prompt a dict or a set literal would otherwise
+    # be the one kind of value that cannot be typed.
+    fn _read_repl_expression(self) -> Node? {
+        let start_index = self.current
+        let expr = self._parse_expression()
+        if self.panic_mode { self._synchronize() }
+        self._skip_newlines()
+        self._expect_repl_end()
+        if self.had_error { return null }
+        return _node(NodeKind.ExprStmt, self._span_since(start_index), {"expr": expr})
+    }
+
+    # Nothing may follow a prompt line but newlines.
+    fn _expect_repl_end(self) -> void {
+        if self._check(TokenKind.Eof) or self.had_error { return }
+        self._error_at_cur(
+            Code.E0108_TRAILING_TOKENS,
+            f"unexpected {self._describe(self._peek())} after the statement"
+        )
     }
 
     # --- token access ----------------------------------------------------
@@ -209,7 +343,17 @@ pub class Parser {
         if self.panic_mode { return null }
         self.panic_mode = true
         self.had_error = true
+        if self.trial_active { return self._trial_note_error() }
         return self.diagnostics.error(code, span, message, help: help, note: note)
+    }
+
+    # Remember the first diagnostic of a trial and swallow it.
+    fn _trial_note_error(self) -> Diagnostic? {
+        if not self.trial_failed {
+            self.trial_failed = true
+            self.trial_error_tok = self.current
+        }
+        return null
     }
 
     fn _error_at_cur(self, code: str, message: str, help: str? = null) -> Diagnostic? {
@@ -228,6 +372,7 @@ pub class Parser {
     ) -> Diagnostic? {
         if self.panic_mode { return null }
         self.had_error = true
+        if self.trial_active { return self._trial_note_error() }
         return self.diagnostics.error(code, span, message, help: help)
     }
 
@@ -1174,7 +1319,14 @@ pub class Parser {
             self._advance()
             let right = self._parse_bit_and()
             # Two numeric literals around `^` is almost always a Jaithon 2 power.
-            if _is_numeric_literal(left) and _is_numeric_literal(right) {
+            #
+            # Suppressed during a trial for the reason a trial's errors are: the
+            # reading that wins reports its own. The REPL reads every line as a
+            # trial and then again for real, so a warning that reached the bag
+            # from a trial is rendered twice — three times for a line opening
+            # with `{`, which is tried both ways.
+            if not self.trial_active and
+                _is_numeric_literal(left) and _is_numeric_literal(right) {
                 self.diagnostics.warn(
                     Code.W0105_DEPRECATED,
                     op_span,
