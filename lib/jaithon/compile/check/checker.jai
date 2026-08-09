@@ -9,7 +9,7 @@ from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.dump import Record
 from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
 from jaithon.compile.check.modsig import absolute, default_search_path, dirname
-from jaithon.compile.check.expr import Ctx
+from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.render import render
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type, TypeDecl

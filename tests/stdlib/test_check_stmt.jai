@@ -21,11 +21,11 @@
 from std.test import assert_eq, assert_false, assert_true
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind
 from jaithon.ast import catch_clause, comp_clause, match_arm, param
-from jaithon.compile.check.expr import Ctx, E0400_TYPE_MISMATCH, E0401_CONDITION_NOT_BOOL
+from jaithon.compile.check.ctx import Ctx, E0411_INT_FLOAT_MIX
+from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, E0401_CONDITION_NOT_BOOL
 from jaithon.compile.check.expr import E0405_NOT_ITERABLE, E0406_BAD_OPERAND_TYPES
-from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER, E0411_INT_FLOAT_MIX
-from jaithon.compile.check.expr import E0701_PRIVATE_ACCESS, VIS_PRIVATE, VIS_PUBLIC
-from jaithon.compile.check.expr import W0102_UNREACHABLE_CODE, expr
+from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER, E0701_PRIVATE_ACCESS, VIS_PRIVATE
+from jaithon.compile.check.expr import VIS_PUBLIC, W0102_UNREACHABLE_CODE, expr
 from jaithon.compile.check.fold import const_eval
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.render import render

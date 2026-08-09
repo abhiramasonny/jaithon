@@ -31,7 +31,8 @@ from jaithon.compile.check.decl import check_body, check_decl, check_var_decl
 from jaithon.compile.check.decl import declared_return_type, function_type, install
 from jaithon.compile.check.decl import is_init_method, layout_decl, push_generics, push_self
 from jaithon.compile.check.decl import register_decl, signature_of
-from jaithon.compile.check.expr import Ctx, E0400_TYPE_MISMATCH, VIS_PRIVATE, VIS_PUBLIC
+from jaithon.compile.check.ctx import Ctx
+from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, VIS_PRIVATE, VIS_PUBLIC
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.nominal import find_field, find_member
 from jaithon.compile.check.render import render
