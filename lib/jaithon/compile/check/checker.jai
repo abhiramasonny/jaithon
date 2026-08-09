@@ -495,7 +495,7 @@ pub fn check_program(
     _register_all(c, program)
     # `path` is the file being checked, and an import resolves relative to the
     # directory holding it before it resolves against the search path.
-    let loader = SigLoader(_search_roots(path))
+    let loader = _loader_for(_search_roots(path))
     c.sig_loader = loader
     c.source_dir = _dir_of(path)
     _import_pass(c, program, loader, _dir_of(path))
@@ -520,6 +520,39 @@ pub fn check_program(
     c.set_type(program, universe.t_void)
     if collect_dump { _dump_types(c, program) }
     return c
+}
+
+#: Signature loaders already built, keyed by the search path they serve.
+#:
+#: A signature is a pure function of the file it came from, so parsing one
+#: twice is waste. Every `compile_source` built its own loader, so a run over
+#: the whole tree re-parsed each module's entire import closure once per
+#: importing file: `--bootstrap-verify` went 25s -> 50s the moment the checker
+#: started following imports, and back to 19s with this. The C keeps the same
+#: table process-global (`sSigs`, src/sema/modsig.c).
+#:
+#: Keyed by search path rather than shared outright, because a loader hands out
+#: file ids and spans carry them — two differently configured loaders must not
+#: trade signatures and leave a span pointing at the wrong file.
+#:
+#: This caches signatures. It never caches types: a shared `Universe` would make
+#: one file's compilation depend on what an earlier one interned, which is the
+#: cross-file contamination the C has and this front end does not.
+var _loaders: dict[str, SigLoader] = {}
+
+#: Forget every cached loader, for a caller that changed a file on disk and
+#: wants the next compilation to see it.
+pub fn clear_signature_cache() -> void {
+    _loaders = {}
+}
+
+# The loader for this search path, built once.
+fn _loader_for(roots: list[str]) -> SigLoader {
+    let key = "|".join(roots)
+    if key in _loaders { return _loaders[key] }
+    let built = SigLoader(roots)
+    _loaders[key] = built
+    return built
 }
 
 # The directory holding `path`, which is where a relative import resolves from.
@@ -662,7 +695,7 @@ pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null)
     if tree is null { return }
 
     let c = Ctx(Universe(), bag)
-    let loader = SigLoader(_search_roots(path))
+    let loader = _loader_for(_search_roots(path))
     var visited: set[str] = set()
     var stack: list[str] = [absolute(path)]
     var names: list[str] = [_stem_of(path)]
