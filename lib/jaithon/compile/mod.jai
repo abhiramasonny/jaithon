@@ -22,7 +22,7 @@
 #:
 #: The file system is reached through `__prim__.io_open/read/write/flush/close`,
 #: and byte strings through `__prim__.bytes_new`.
-from jaithon.ast import Node, NodeKind
+from jaithon.ast import Node, NodeKind, to_json, to_sexp
 from jaithon.compile.emit import ConstTag, FuncProto, emit, op_name
 from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
 from jaithon.compile.jaic import disassemble_instruction
@@ -336,6 +336,28 @@ fn _drop_prompt_noise(bag: DiagnosticBag) -> void {
 # Every input of one session compiles as this module, so a traceback names the
 # prompt rather than the file the input happened to be labelled with.
 const _REPL_MODULE_NAME = "__repl__"
+
+#: The syntax tree of `text`, as `jaithon ast` prints it.
+#:
+#: `json` picks the §12 JSON encoding over the s-expression form. Raises
+#: `ParseError` when the source does not parse, because a dump of a tree that
+#: does not exist would be an empty file rather than an error.
+pub fn dump_ast(text: str, file_id: int = 0, json: bool = false) -> str {
+    let bag = DiagnosticBag()
+    let program = parse(text, file_id, bag)
+    if program is null {
+        var first = "cannot parse"
+        for diagnostic in bag.items {
+            if diagnostic.severity == Severity.Error {
+                first = f"{diagnostic.code}: {diagnostic.message}"
+                break
+            }
+        }
+        throw ParseError(first)
+    }
+    if json { return to_json(program) }
+    return to_sexp(program)
+}
 
 #: Check the imports reachable from `path` for a cycle.
 #:
