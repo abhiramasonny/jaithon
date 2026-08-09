@@ -112,22 +112,37 @@ function enclosingCall(text, offset) {
 
 function dottedModules(document, fromFile) {
     const out = new Map();
-    const visit = (root, dir, prefix, depth) => {
-        if (depth > 3) return;
+    // Symlinked library directories are followed, so the walk is keyed by real
+    // path: a link that points at one of its own ancestors must not loop.
+    const seen = new Set();
+
+    const visit = (dir, prefix, depth) => {
+        if (depth > 4) return;
+        let real;
+        try { real = fs.realpathSync(dir); } catch { return; }
+        if (seen.has(real)) return;
+        seen.add(real);
+
         let entries;
         try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
         for (const entry of entries) {
             if (entry.name.startsWith('.') || entry.name === '__jaicache__') continue;
-            if (entry.isDirectory()) {
-                visit(root, path.join(dir, entry.name), `${prefix}${entry.name}.`, depth + 1);
+            const full = path.join(dir, entry.name);
+
+            let isDirectory = entry.isDirectory();
+            if (entry.isSymbolicLink()) {
+                try { isDirectory = fs.statSync(full).isDirectory(); } catch { continue; }
+            }
+            if (isDirectory) {
+                visit(full, `${prefix}${entry.name}.`, depth + 1);
             } else if (entry.name.endsWith('.jai')) {
                 const base = entry.name.slice(0, -4);
                 const dotted = base === 'mod' ? prefix.replace(/\.$/, '') : `${prefix}${base}`;
-                if (dotted && !out.has(dotted)) out.set(dotted, path.join(dir, entry.name));
+                if (dotted && !out.has(dotted)) out.set(dotted, full);
             }
         }
     };
-    for (const dir of tool.searchPath(document, path.dirname(fromFile))) visit(dir, dir, '', 0);
+    for (const dir of tool.searchPath(document, path.dirname(fromFile))) visit(dir, '', 0);
     return out;
 }
 
@@ -274,10 +289,7 @@ function scopeCompletions(analysis, offset) {
         depth = Math.min(depth + 1, 8);
     }
 
-    // Inside a method, `self.` is how you reach a field; offer the members too.
     const enclosing = analysis.enclosing(offset);
-    const container = enclosing && enclosing.container !== null
-        ? analysis.symbols[enclosing.container] : null;
 
     // Directly inside a class body, the useful thing to write next is usually
     // one of the methods that gives the class its behaviour under an operator.
@@ -292,9 +304,9 @@ function scopeCompletions(analysis, offset) {
         }
     }
 
-    if (container) {
-        const owner = container;
-        for (const member of analysis.membersOf(owner)) {
+    // Inside a method, `self.` is how you reach a field; offer those too.
+    if (enclosing && enclosing.container !== null) {
+        for (const member of analysis.membersOf(analysis.symbols[enclosing.container])) {
             if (seen.has(`self.${member.name}`)) continue;
             seen.add(`self.${member.name}`);
             const item = itemFor(member, '3');
