@@ -1345,6 +1345,15 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     # to a closure over nothing and printed nothing at all.
     let scope = c.resolution.scope_of(node)
     if scope is not null { c.resolution.set_scope(inner, scope) }
+    # `Resolution` keys four tables on node identity, and the operand has to
+    # carry all four or the emitter reads a default and silently emits a
+    # different program. Two of them were found the hard way — a missing symbol
+    # gave `NameError: undefined name`, a missing scope gave a closure over
+    # nothing — so the other two are handled here rather than waiting for a
+    # third silent miscompile to surface.
+    let base = c.resolution.capture_base_of(node)
+    if base != -1 { c.resolution.set_capture_base(inner, base) }
+    if c.resolution.is_type_args(node) { c.resolution.set_type_args(inner) }
 
     # Recorded against the *operand's* kind and carrying both sides, which is
     # what the C's jaiSemaDumpCast does: it is called from inside wrapInCast
