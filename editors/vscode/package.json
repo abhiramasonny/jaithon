@@ -65,6 +65,7 @@
           "type": ["entity.name.type", "entity.name.type.jaithon"],
           "typeParameter": ["entity.name.type.parameter"],
           "enumMember": ["variable.other.enummember", "constant.other.enum"],
+          "variable.readonly": ["variable.other.constant", "constant.other"],
           "property": ["variable.other.property", "variable.other.property.jaithon"],
           "parameter": ["variable.parameter", "variable.parameter.jaithon"],
           "method": ["entity.name.function.member", "entity.name.function.member.jaithon"],
