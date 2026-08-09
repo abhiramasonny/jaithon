@@ -1021,7 +1021,43 @@ class Workspace {
         return current;
     }
 
+    /**
+     * The one member of that name declared anywhere this file can see.
+     *
+     * Used only when the receiver's type is unknown, which it always is while
+     * the compiler exposes no type information. Answering from the name alone
+     * is a guess, so it is only made when the workspace offers exactly one
+     * candidate — a wrong jump is worse than none.
+     */
+    async memberByName(analysis, name, token) {
+        const found = [];
+        const consider = (other, symbol) => {
+            for (const owner of other.symbols) {
+                if (owner.members === undefined) continue;
+                const member = other.memberNamed(owner, name);
+                if (member) found.push({ analysis: other, symbol: member });
+            }
+            void symbol;
+        };
+
+        consider(analysis);
+        if (found.length === 1) return found[0];
+        if (found.length > 1) return null;
+
+        for (const record of analysis.imports) {
+            if (token?.isCancellationRequested) return null;
+            const file = this.moduleFile(record.path, analysis.fsPath);
+            if (!file) continue;
+            const other = await this.analyze(file, token);
+            if (other) consider(other);
+            if (found.length > 1) return null;
+        }
+        return found.length === 1 ? found[0] : null;
+    }
+
     async memberDefinition(analysis, ref, token) {
+        if (!ref.receiver) return this.memberByName(analysis, ref.name, token);
+
         const moduleName = moduleOfType(ref.receiver);
         if (moduleName) {
             const file = this.moduleFile(moduleName, analysis.fsPath);
