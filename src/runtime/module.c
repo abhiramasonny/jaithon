@@ -711,6 +711,21 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
         body = jaiSelfHostedCompileInto(file->source, length, path, module,
                                         hash, opts->codegen.optLevel);
         if (body == NULL) return NULL;
+        /* The self-hosted front end is handed a path, not a module name, so it
+         * names the module body from the file's stem: `b` where the C front end
+         * uses the registered name `sub.b`. Only the importer knows the
+         * qualified name, so it is applied here.
+         *
+         * This is not cosmetic. The name is serialised into the cache entry,
+         * and a cached module whose name has lost its package cannot resolve
+         * its own imports when loaded back -- a warm `--front=jai` run failed
+         * where a cold one passed. `--bootstrap-verify` cannot see it either:
+         * compare_functions checks arity, flags, frame size, code and
+         * constants, but not the function's name. */
+        if (module->name != NULL) {
+            body->name = module->name;
+            body->qualifiedName = module->name;
+        }
     } else if (!frontEnd(module, fileId, &opts->codegen, true, &body, false) ||
                body == NULL) {
         return NULL;

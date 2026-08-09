@@ -58,14 +58,28 @@ binary garbage.
 
 ## Installing
 
-The extension has no dependencies and no build step.
-
 ```bash
-ln -s "$PWD/editors/vscode" ~/.vscode/extensions/jaithon
+editors/vscode/install.sh
 ```
 
-Then reload VS Code. For the desktop app's other flavours, use
-`~/.vscode-insiders/extensions` or `~/.vscode-server/extensions`.
+Then reload the window. `EDITOR_CLI=cursor editors/vscode/install.sh` installs
+it elsewhere.
+
+Symlinking the folder into `~/.vscode/extensions` does **not** work, however
+much it looks like it should. The registry in `extensions.json` is
+authoritative: a folder that is not listed there is logged as
+
+```
+Marked extension as removed jaithon.jaithon-3.1.0
+```
+
+and never scanned, never activated, and absent from `code --list-extensions` —
+with nothing shown in the UI to say so. The script packages a `.vsix` and
+installs it through the CLI, which is what writes that entry.
+
+The install is therefore a copy. Run the script again after changing anything
+here. To iterate without reinstalling, open this folder in VS Code and press F5
+(Extension Development Host), which runs the source in place.
 
 ## Settings
 
