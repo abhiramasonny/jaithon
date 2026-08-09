@@ -706,7 +706,25 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
     }
 
     if (IS_ENUM(receiver)) {
-        if (enumMember(AS_ENUM(receiver), name, out)) return true;
+        if (enumMember(AS_ENUM(receiver), name, out)) {
+            /* Safe to memoise: a variant's unit value and ctor are created
+             * once and kept on the variant, the methods table is filled only
+             * while the enum is being defined, and any addition bumps shapeId.
+             * The GC marks ic->cached (gc.c:201), so this is a strong
+             * reference and cannot dangle. */
+            if (ic != NULL && ic->state != IC_MEGA) {
+                if (ic->count < JAI_IC_WAYS) {
+                    ic->shapeId[ic->count] = AS_ENUM(receiver)->shapeId;
+                    ic->payload[ic->count] = 0;
+                    ic->cached[ic->count] = *out;
+                    ic->count++;
+                    ic->state = (ic->count == 1) ? IC_MONO : IC_POLY;
+                } else {
+                    ic->state = IC_MEGA;
+                }
+            }
+            return true;
+        }
         if (!raise) return false;
         return jaiThrow(vm.cAttributeError, "enum '%s' has no variant '%s'",
                         AS_ENUM(receiver)->name != NULL
@@ -4613,6 +4631,10 @@ static JaiRunResult runLoop(int baseFrameCount) {
             jaiTableSet(&AS_TRAIT(owner)->defaults, OBJ_VAL(name), method);
         } else if (IS_ENUM(owner)) {
             jaiTableSet(&AS_ENUM(owner)->methods, OBJ_VAL(name), method);
+            /* A member cache keyed on the old id can no longer be reached, so
+             * anything memoised before this method existed is stale by
+             * construction. Only runs while the enum is being defined. */
+            AS_ENUM(owner)->shapeId = jaiFreshShapeId();
         } else {
             THROW(vm.cTypeError,
                   "METHOD expected a class, trait, or enum under the closure");
@@ -4655,6 +4677,22 @@ static JaiRunResult runLoop(int baseFrameCount) {
             vm.icMisses++;
         }
 
+        if (IS_ENUM(receiver)) {
+            InlineCache *ic = cacheAt(frameChunk(frame), cacheIdx);
+            if (ic != NULL && ic->state != IC_EMPTY) {
+                ObjEnum *en = AS_ENUM(receiver);
+                for (int w = 0; w < ic->count; w++) {
+                    /* Shape ids are unique across classes and enums alike, so
+                     * an instance way can never answer here by accident. */
+                    if (ic->shapeId[w] != en->shapeId) continue;
+                    vm.icHits++;
+                    stackTop[-1] = ic->cached[w];
+                    VM_NEXT();
+                }
+            }
+            vm.icMisses++;
+        }
+
         SAVE_STATE();
         ObjString *name = AS_STRING(constants[nameIdx]);
         Value result;
@@ -4686,6 +4724,22 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     if (ic->payload[w] >= instance->fieldCount) break;
                     vm.icHits++;
                     PUSH(instance->fields[ic->payload[w]]);
+                    VM_NEXT();
+                }
+            }
+            vm.icMisses++;
+        }
+
+        if (IS_ENUM(receiver)) {
+            InlineCache *ic = cacheAt(frameChunk(frame), cacheIdx);
+            if (ic != NULL && ic->state != IC_EMPTY) {
+                ObjEnum *en = AS_ENUM(receiver);
+                for (int w = 0; w < ic->count; w++) {
+                    /* Shape ids are unique across classes and enums alike, so
+                     * an instance way can never answer here by accident. */
+                    if (ic->shapeId[w] != en->shapeId) continue;
+                    vm.icHits++;
+                    PUSH(ic->cached[w]);
                     VM_NEXT();
                 }
             }

@@ -1036,6 +1036,12 @@ ObjBound *jaiBoundNew(Value receiver, Value method) {
  * and are never reused. */
 static uint32_t nextShapeId = 1;
 
+uint32_t jaiFreshShapeId(void) {
+    uint32_t id = nextShapeId++;
+    if (nextShapeId == 0) nextShapeId = 1;   /* 0 is reserved */
+    return id;
+}
+
 /* The dunder cache mirrors these method names into fixed ObjClass fields so
  * that operator dispatch never touches a hash table. */
 typedef struct {
@@ -1345,6 +1351,7 @@ ObjEnum *jaiEnumNew(ObjString *name) {
     e->variants = NULL;
     e->variantCount = 0;
     jaiTableInit(&e->methods);
+    e->shapeId = jaiFreshShapeId();
     return e;
 }
 
