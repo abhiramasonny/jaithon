@@ -173,99 +173,15 @@ static void defineHelper(ObjModule *module, const char *name, JaiNativeFn fn) {
 
 /* A class survives to the next line as a value like any other binding, but an
  * annotation is not a value: `fn make() -> Point` asks the checker for a type
- * named `Point`, and the declaration that could answer went away with the AST
- * of the line that introduced it. The runtime has the same problem with the
- * prelude's classes and solves it through the resolver's built-in registry,
- * which outlives any one Resolver (src/runtime/builtins.c); a session's own
- * declarations belong in the same place.
+ * named `Point`, and the declaration that could answer went away with the tree
+ * of the line that introduced it.
  *
- * Only names this session declared are registered, so `class len` at the
- * prompt shadows the built-in as a value — the module's globals are searched
- * first — without rewriting what `len` means to every later line. */
-static bool isSessionType(const Symbol *sym) {
-    for (int i = 0; i < gRepl.types.count; i++) {
-        if (gRepl.types.data[i] == sym) return true;
-    }
-    return false;
-}
+ * That list used to live here, in the C resolver's built-in registry. It now
+ * lives in the `ReplSession` the front end keeps (lib/jaithon/compile/mod.jai),
+ * because the registry is part of `src/sema` and the session is not. Forgetting
+ * it is `:reset`, and `jaiFrontEndReplForget` is the whole of what that takes.
+ */
 
-static void registerSessionType(const char *name, SymbolKind kind, TypeKind named) {
-    if (name == NULL || name[0] == '\0') return;
-
-    Symbol *existing = jaiResolverFindBuiltin(name);
-    if (existing != NULL && !isSessionType(existing)) return;   /* a real built-in */
-
-    Symbol *sym = jaiResolverRegisterBuiltin(name, gTypes.tAny);
-    if (sym == NULL) return;
-    sym->kind = kind;
-    /* An interned type borrows the string it is named by, and types are
-     * interned by name, so this is usually the very object the checker made
-     * for the declaration a moment ago — named by the parser's copy, in the
-     * AST arena this input is about to free. Nothing else re-points it, and
-     * the code generator reads that name back to build a type guard, so a
-     * later line would guard against whatever those bytes had become. The
-     * registry owns `sym->name`, which outlives the session. */
-    sym->type = jaiTypeNamed(named, sym->name, NULL);
-    sym->type->name = sym->name;
-    if (existing == NULL) JAI_VEC_PUSH(Symbol *, &gRepl.types, sym);
-}
-
-/* `from m import Point` binds a name to a class as much as `class Point` does,
- * and the checker has already been to m for the declaration behind it. */
-static void registerImportedType(const AstImportItem *item) {
-    if (item == NULL || item->symbol == NULL) return;
-    const AstNode *decl = item->symbol->importedDecl;
-    if (decl == NULL) return;   /* not a declaration m makes, or m is unreadable */
-
-    const char *name = item->alias != NULL ? item->alias : item->name;
-    switch (decl->kind) {
-    case AST_CLASS_DECL: registerSessionType(name, SYM_CLASS, TY_CLASS); break;
-    case AST_TRAIT_DECL: registerSessionType(name, SYM_TRAIT, TY_TRAIT); break;
-    case AST_ENUM_DECL:  registerSessionType(name, SYM_ENUM,  TY_ENUM);  break;
-    default: break;
-    }
-}
-
-/* Record the type names one input introduces. Only the top level counts: a
- * class inside a function is that call's, not the session's. */
-static void registerDeclaredTypes(const AstNode *program) {
-    if (program == NULL) return;
-    for (int i = 0; i < program->as.block.count; i++) {
-        const AstNode *stmt = program->as.block.stmts[i];
-        if (stmt == NULL) continue;
-        switch (stmt->kind) {
-        case AST_CLASS_DECL:
-            registerSessionType(stmt->as.classDecl.name, SYM_CLASS, TY_CLASS);
-            break;
-        case AST_TRAIT_DECL:
-            registerSessionType(stmt->as.traitDecl.name, SYM_TRAIT, TY_TRAIT);
-            break;
-        case AST_ENUM_DECL:
-            registerSessionType(stmt->as.enumDecl.name, SYM_ENUM, TY_ENUM);
-            break;
-        case AST_FROM_IMPORT:
-            for (int j = 0; j < stmt->as.fromImport.itemCount; j++) {
-                registerImportedType(&stmt->as.fromImport.items[j]);
-            }
-            break;
-        default:
-            break;
-        }
-    }
-}
-
-/* :reset forgets these too. The registry has no remove — a Symbol may already
- * be referenced by a type interned against it — so the name goes back to
- * standing for nothing the checker will accept in a type position, which is
- * what it was before the session declared it. */
-static void forgetSessionTypes(void) {
-    for (int i = 0; i < gRepl.types.count; i++) {
-        gRepl.types.data[i]->kind = SYM_BUILTIN;
-        gRepl.types.data[i]->type = gTypes.tAny;
-    }
-    /* The symbols stay on the list: they are still this session's to reuse if
-     * the same name is declared again. */
-}
 
 /* ------------------------------------------------------------------ */
 /* The persistent module                                                */
@@ -306,7 +222,7 @@ static void replReset(void) {
         if (vm.mainModule == gRepl.module) vm.mainModule = NULL;
         gRepl.module = NULL;
     }
-    forgetSessionTypes();
+    jaiFrontEndReplForget();
     gRepl.pending.count = 0;
 
     /* :reset forgets the bindings, not the session: replInit installs the
@@ -387,30 +303,6 @@ static void replReportUnclosed(void) {
 /* Compiling and running one input                                      */
 /* ------------------------------------------------------------------ */
 
-/* Rewrite `expr` into `helper(expr)` so the value of a bare expression reaches
- * a native that can print it. Only ever applied to a top-level expression
- * statement, which is the one place a discarded value is interesting. */
-static void wrapExpression(AstContext *ast, AstNode *stmt, const char *helper) {
-    AstNode *expr = stmt->as.exprStmt.expr;
-    if (expr == NULL) return;
-
-    AstNode *callee = jaiAstNew(ast, AST_IDENT, expr->span);
-    callee->as.ident.name = helper;
-
-    AstArg *arg = JAI_ARENA_NEW(&ast->arena, AstArg);
-    arg->name = NULL;
-    arg->value = expr;
-    arg->isSpread = false;
-    arg->span = expr->span;
-
-    AstNode *call = jaiAstNew(ast, AST_CALL, expr->span);
-    call->as.call.callee = callee;
-    call->as.call.args = arg;
-    call->as.call.argCount = 1;
-
-    stmt->as.exprStmt.expr = call;
-}
-
 static AstNode *programOf(AstContext *ast, AstNode *stmt) {
     AstNode *program = jaiAstNew(ast, AST_PROGRAM, stmt->span);
     AstNode **stmts = jaiAstNodeArray(ast, 1);
@@ -432,6 +324,31 @@ static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
     }
 }
 
+/* Print the C front end's syntax tree for one input. The last thing the prompt
+ * asks of `src/lang`: `jaiAstPrint`'s s-expression form has golden tests and no
+ * self-hosted equivalent yet. */
+static void replPrintCTree(const char *source, size_t length, int fileId) {
+    AstContext ast;
+    Lexer lex;
+    Parser parser;
+    jaiAstContextInit(&ast);
+    jaiLexerInit(&lex, source, length, fileId);
+    bool lexOk = jaiLexerRun(&lex);
+    jaiParserInit(&parser, &lex, &ast);
+
+    AstNode *program = NULL;
+    if (lexOk) {
+        bool incomplete = false;
+        AstNode *stmt = jaiParseREPLLine(&parser, &incomplete);
+        if (stmt != NULL) program = programOf(&ast, stmt);
+    }
+
+    (void)replFlushDiags();
+    if (program != NULL) jaiAstPrint(stdout, program, 0);
+    jaiLexerFree(&lex);
+    jaiAstContextFree(&ast);
+}
+
 /* Compile one complete input against the persistent module and act on it.
  * Diagnostics and uncaught exceptions are reported here; the session always
  * continues afterwards. */
@@ -443,86 +360,52 @@ static void replExecute(const char *source, size_t length, ReplAction action,
      * compiled chunks refer to it by file id for tracebacks. */
     char *owned = jaiMemdup(source, length);
     int fileId = jaiSourceAdd(label, owned, length);
-
-    AstContext ast;
-    Lexer lex;
-    Parser parser;
-    jaiAstContextInit(&ast);
-    jaiLexerInit(&lex, owned, length, fileId);
-    bool lexOk = jaiLexerRun(&lex);
-    jaiParserInit(&parser, &lex, &ast);
-
-    AstNode *program = NULL;
-    if (!lexOk) {
-        /* Leave `program` NULL; the bag is rendered below. */
-    } else if (wholeFile) {
-        program = jaiParseProgram(&parser);
-    } else {
-        bool incomplete = false;
-        AstNode *stmt = jaiParseREPLLine(&parser, &incomplete);
-        if (stmt != NULL) {
-            if (stmt->kind == AST_EXPR_STMT && action == REPL_EXEC) {
-                wrapExpression(&ast, stmt, "__repl_echo__");
-            } else if (stmt->kind == AST_EXPR_STMT && action == REPL_TYPE) {
-                wrapExpression(&ast, stmt, "__repl_type__");
-            } else if (action == REPL_TYPE) {
-                replError(":type expects an expression");
-                stmt = NULL;
-            }
-            program = stmt != NULL ? programOf(&ast, stmt) : NULL;
-        }
-    }
-
-    if (program == NULL) {
-        (void)replFlushDiags();
-        jaiLexerFree(&lex);
-        jaiAstContextFree(&ast);
-        return;
-    }
+    /* The front end stamps this id into every span it reports and into the line
+     * table, so a diagnostic can name a column and a traceback a line. */
+    gRepl.module->sourceFileId = fileId;
 
     if (action == REPL_AST) {
-        (void)replFlushDiags();
-        jaiAstPrint(stdout, program, 0);
-        jaiLexerFree(&lex);
-        jaiAstContextFree(&ast);
+        replPrintCTree(owned, length, fileId);
         return;
     }
 
-    Resolver resolver;
-    jaiResolverInit(&resolver, &ast);
-    resolver.module = gRepl.module;
-    resolver.replMode = true;          /* names from earlier lines are globals */
+    JaiReplCompileOptions opts;
+    opts.path      = label;
+    opts.fileId    = fileId;
+    opts.optLevel  = gRepl.codegen.optLevel;
+    opts.wholeFile = wholeFile;
+    /* `:disasm` compiles an input and never runs it, so what it declares is
+     * not the session's. */
+    opts.record    = action != REPL_DISASM;
+    /* `from m import T` at the prompt looks where the prompt was started, the
+     * way the C resolver did. The label names no directory of its own. */
+    char cwd[JAI_MAX_PATH];
+    opts.sourceDir = getcwd(cwd, sizeof cwd) != NULL ? cwd : "";
+    opts.strict    = gRepl.strict;
+    opts.echo      = action == REPL_EXEC ? "__repl_echo__"
+                   : action == REPL_TYPE ? "__repl_type__"
+                                         : NULL;
 
-    Checker checker;
-    jaiCheckerInit(&checker, &resolver, &ast);
-    checker.strict = gRepl.strict;
-    checker.foldConstants = gRepl.codegen.optLevel > 0;
+    bool wasExpression = false;
+    ObjFunction *body = jaiFrontEndReplCompile(owned, length, &opts,
+                                               gRepl.module, &wasExpression);
 
-    bool ok = jaiResolveProgram(&resolver, program);
-    if (ok) ok = jaiCheckProgram(&checker, program);
-
-    ObjFunction *body = NULL;
-    if (ok) {
-        body = jaiCompileProgram(program, gRepl.module, &gRepl.codegen);
-        /* The generator reports through the bag, so a non-NULL body still has
-         * to be checked before anything runs it. */
-        if (body != NULL && jaiDiagHasErrors(&gDiags)) body = NULL;
-        if (body != NULL) jaiPushRoot(OBJ_VAL(body));
+    /* `:type` is the one action that needs a value, and a statement has none.
+     * Asked after the compile because only the front end knows which of the two
+     * readings the line got. */
+    if (action == REPL_TYPE && !wholeFile && !wasExpression) {
+        jaiDiagReset(&gDiags);
+        replError(":type expects an expression");
+        return;
     }
-    (void)replFlushDiags();   /* warnings print; errors have already dropped body */
 
-    /* Before the arena goes: the module body about to run defines these names,
-     * and the next input has to be able to name them as types. :disasm never
-     * runs what it compiled, so it declares nothing. */
-    if (body != NULL && action != REPL_DISASM) registerDeclaredTypes(program);
-
-    jaiCheckerFree(&checker);
-    jaiResolverFree(&resolver);
-    jaiLexerFree(&lex);
-    jaiAstContextFree(&ast);
-
+    if (replFlushDiags()) return;   /* an input with an error never runs */
+    /* No body and no diagnostic is an input with nothing in it -- a comment, a
+     * blank line -- which is not a failure. Everything that *is* one reports
+     * before getting here, and replFlushDiags has already noted it. */
     if (body == NULL) return;
 
+    jaiPushRoot(OBJ_VAL(body));
     if (action == REPL_DISASM) {
         disassembleTree(stdout, body, 0);
     } else {

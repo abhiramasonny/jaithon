@@ -17,7 +17,7 @@
  *     is the same either way.
  */
 
-#include <stdlib.h>   /* getenv */
+#include <stdlib.h>
 
 #include "runtime.h"
 #include "boot/seed.h"

@@ -389,16 +389,27 @@ pub class Parser {
         return false
     }
 
-    # Report E0107 with a label on the delimiter that was never closed.
+    # Report E0107 against the delimiter that was never closed rather than the
+    # token the parser gave up on: that token is usually end of file, whose line
+    # is empty, so a caret there underlines nothing and the arrow sends the
+    # reader to the bottom of the file instead of to the place the fix belongs.
+    # Where the parser stopped is still shown, as the secondary. `jaiPUnclosed`.
     fn _unclosed(self, open_index: int, close_text: str, what: str) -> void {
+        let found = self._describe(self._peek())
+        let open_span = self._token_at(open_index).span
         let diag = self._error_at(
-            self._cur_span(),
+            open_span,
             Code.E0107_UNCLOSED_DELIMITER,
-            f"expected `{close_text}` to close this {what}, " +
-                f"found {self._describe(self._peek())}"
+            f"expected `{close_text}` to close this {what}, found {found}"
         )
         if diag != null {
-            diag.label(self._token_at(open_index).span, f"unclosed {what} opened here")
+            diag.label(open_span, f"unclosed {what} opened here")
+            # End of file has no line of its own to underline, and the message
+            # already names it; anything else is worth pointing at.
+            if not self._check(TokenKind.Eof) {
+                diag.label(self._cur_span(), f"{found} reached before the `{close_text}`")
+            }
+            diag.help = f"add the matching `{close_text}`"
         }
     }
 

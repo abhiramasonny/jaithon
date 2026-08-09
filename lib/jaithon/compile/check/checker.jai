@@ -395,10 +395,13 @@ pub fn check_program(
     # it declares everything it can name. A prompt input needs the classes the
     # inputs before it declared, which are in no registry this compilation can
     # reach.
-    outer_type_names: list[tuple[str, Type]] = []
+    outer_type_names: list[tuple[str, Type]] = [],
+    # `--strict`: an unannotated parameter is an error (E0400).
+    strict: bool = false
 ) -> Ctx {
     let c = Ctx(universe, bag, resolution)
     c.fold_constants = fold_constants
+    c.strict = strict
     if collect_dump { c.dump = [] }
     install(c)
     for (name, ty) in outer_type_names { c.push_type_name(name, ty) }

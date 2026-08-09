@@ -1,5 +1,5 @@
 == __repl__ ==
-; 9 bytes, 0 constants, 0 caches
+; 9 bytes, 1 constant, 0 caches
 0000     1  OP_INT                 1
 0003     |  OP_INT                 2
 0006     |  OP_ADD

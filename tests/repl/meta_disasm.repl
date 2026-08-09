@@ -1,3 +1,7 @@
 # args: -O0
+# The constant pool holds one entry more than the code references: the
+# prompt compiles through the same .jaic container every module does, and
+# the container stores a function's name in its pool. It was absent while
+# the prompt compiled straight to an ObjFunction and never serialised.
 :disasm 1 + 2
 :disasm print("this must not run")
