@@ -1054,7 +1054,7 @@ static ObjBytes *bytesFromByteList(ObjList *list, const char *path) {
 }
 
 static ObjBytes *selfHostedImage(const char *source, size_t length,
-                                 const char *path, int optLevel) {
+                                 const char *path, int optLevel, int fileId) {
     ObjModule *compiler = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
     if (compiler == NULL) {
         jaiClearException();
@@ -1087,16 +1087,24 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      * side at -O2 and turned the comparison into C-at-O0 against Jaithon-at-O2.
      * That is not a bug in either front end but it reads as one in every line
      * of the report, and it costs the only tool that can separate an emitter
-     * divergence from an optimiser divergence. The other two are passed
-     * explicitly at the values the defaults already had, because a positional
-     * call cannot skip them. */
+     * divergence from an optimiser divergence.
+     *
+     * `fileId` carries information too. It was a hardcoded zero on the
+     * reasoning that nothing read it; something does. Every span the
+     * self-hosted front end emits records it, the line table is made of spans,
+     * and a disassembler resolves a span back to a line through the source
+     * registered under that id. With zero, a `--front=jai` build disassembled
+     * with no line numbers and its tracebacks could not name a line —
+     * invisible to `--bootstrap-verify`, which excludes the line table from
+     * the comparison by design (spec §11). Every caller therefore has to have
+     * registered its source and set `module->sourceFileId` first. */
     Value args[5];
     args[0] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[0]);
     args[1] = OBJ_VAL(jaiStringInternC(path));
     jaiPushRoot(args[1]);
     args[2] = BOOL_VAL(false);         /* release  */
-    args[3] = INT_VAL(0);              /* fileId   */
+    args[3] = INT_VAL(fileId);         /* fileId   */
     args[4] = INT_VAL(optLevel);
 
     Value produced = NULL_VAL;
@@ -1216,7 +1224,8 @@ static const char *jaicRejectionReason(const uint8_t *data, size_t size,
 ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
                                       const char *path, ObjModule *module,
                                       uint64_t hash, int optLevel) {
-    ObjBytes *image = selfHostedImage(source, length, path, optLevel);
+    ObjBytes *image = selfHostedImage(source, length, path, optLevel,
+                                      module != NULL ? module->sourceFileId : 0);
     if (image == NULL) return NULL;
 
     /* The image stays rooted across the diagnostic: rendering one allocates,
