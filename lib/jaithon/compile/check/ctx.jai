@@ -1,9 +1,7 @@
 #: The checker's shared state, and the default callbacks it starts with.
 from jaithon.ast import Node, NodeKind, OpKind, Span, TypeExpr
 from jaithon.ast import TypeKind as SynKind
-from jaithon.ast import kind_name
 from jaithon.compile.check.assign import assignable, widen_target
-from jaithon.compile.check.dump import Record
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.predicate import is_optional
 from jaithon.compile.check.relate import narrow
@@ -65,8 +63,6 @@ pub class Ctx {
     pub var fold_constants: bool
     #: `const` name to the initialiser it folded to, as `fold.jai` takes it.
     pub var consts: dict[str, Node]
-    #: The sema-dump records, when one is being collected.
-    pub var dump: list[Record]?
     #: How far each declaration has got through layout, keyed by `id(decl)`:
     #: absent or 0 for unstarted, 1 for in progress, 2 for laid out. Layout has
     #: to be idempotent, and a declaration reached again while in progress is
@@ -167,7 +163,6 @@ pub class Ctx {
         self.strict = false
         self.fold_constants = true
         self.consts = {}
-        self.dump = null
         self.layout_status = {}
         self.node_types = {}
         self.symbol_types = {}
@@ -966,15 +961,6 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     let base = c.resolution.capture_base_of(node)
     if base != -1 { c.resolution.set_capture_base(inner, base) }
     if c.resolution.is_type_args(node) { c.resolution.set_type_args(inner) }
-
-    # Recorded against the *operand's* kind and carrying both sides, as the C's
-    # jaiSemaDumpCast does; anything else is a `make sema-diff` difference.
-    if c.dump is not null and node.span.is_known() {
-        let field = if widen { "widen" } else { "guard" }
-        let source = c.type_of(inner)
-        let rendered = f"{render(source)}->{render(to)}"
-        c.dump.push(Record(node.span.start, node.span.end, kind_name(inner.kind), field, rendered))
-    }
 
     # `widen` goes on the node, not only into the side table: the emitter reads
     # it to choose between `OP_TO_FLOAT` and `OP_TYPE_GUARD`.

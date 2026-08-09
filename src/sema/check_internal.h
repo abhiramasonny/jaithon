@@ -22,7 +22,6 @@
 #define JAI_CHECK_INTERNAL_H
 
 #include "check.h"
-#include "semadump.h"
 
 typedef struct {
     TypeDecl *decl;

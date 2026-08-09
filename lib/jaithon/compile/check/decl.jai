@@ -1246,8 +1246,8 @@ fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
     }
 
     let literal = Node(NodeKind.NullLit, null, init.span)
-    let _kept = const_replace(c.universe, literal, folded, c.dump)
-    let _inlined = const_replace(c.universe, init, folded, c.dump)
+    let _kept = const_replace(c.universe, literal, folded)
+    let _inlined = const_replace(c.universe, init, folded)
     if symbol is not null { c.consts[symbol.name] = literal }
 }
 

@@ -5,7 +5,7 @@
 #: the checker computes assumes identity is a comparison rather than a walk.
 #:
 #: The union expectations are the ones measured out of the C with
-#: `jaithon check --dump-sema`, so they pin normalisation against the front end
+#: the C checker's own dump, so they pin normalisation against the front end
 #: this one has to agree with.
 from std.test import assert_eq, assert_false, assert_true
 from jaithon.compile.check.kinds import TyKind

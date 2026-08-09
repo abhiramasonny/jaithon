@@ -30,7 +30,6 @@
 #include "../lang/parser.h"
 #include "../native/native.h"
 #include "../sema/modsig.h"
-#include "../sema/semadump.h"
 #include "../vm/chunk.h"
 #include "../vm/serialize.h"
 
@@ -120,12 +119,10 @@ void jaiCliPrintUsage(FILE *out) {
         "      --json                 machine-readable output where supported\n"
         "      --color=auto|always|never\n"
         "      --out PATH             write the output to PATH\n"
-        "      --dump-sema PATH       write the checker's per-node decisions\n"
         "\n"
         "Every option that takes a value accepts both `--name value` and\n"
         "`--name=value`, here and in fmt, test, doc and bench alike.\n"
         "  -I PATH                    add PATH to the module search path\n"
-        "      --bootstrap-verify     diff the C and self-hosted front ends\n"
         "  --                         end options; the rest goes to the script\n",
         out);
 }
@@ -173,13 +170,13 @@ static bool commandFromName(const char *name, JaiCommand *out) {
     return false;
 }
 
-/* The two commands that are spelled as options are not in the table, because
- * `jaithon eval` and `jaithon bootstrap-verify` are not things to type. */
+/* `--eval` is spelled as an option rather than a command, because
+ * `jaithon eval` is not a thing to type. */
 static const char *commandName(JaiCommand command) {
     for (size_t i = 0; i < sizeof kCommands / sizeof kCommands[0]; i++) {
         if (kCommands[i].command == command) return kCommands[i].name;
     }
-    return command == CMD_EVAL ? "--eval" : "--bootstrap-verify";
+    return command == CMD_EVAL ? "--eval" : "?";
 }
 
 /* Match `--name` or `--name=VALUE`. *outValue is NULL for the bare form. */
@@ -265,11 +262,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         st->forced = CMD_VERSION;
         return true;
     }
-    if (strcmp(arg, "--bootstrap-verify") == 0) {
-        out->command = CMD_BOOTSTRAP_VERIFY;
-        st->haveCommand = true;
-        return true;
-    }
 
     if (arg[0] == '-' && arg[1] == 'O' && arg[2] != '\0' && arg[3] == '\0' &&
         arg[2] >= '0' && arg[2] <= '3') {
@@ -350,12 +342,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         if (value == NULL) value = takeValue(argc, argv, i, "--out");
         if (value == NULL) return false;
         out->output = value;
-        return true;
-    }
-    if (optionIs(arg, "--dump-sema", &value)) {
-        if (value == NULL) value = takeValue(argc, argv, i, "--dump-sema");
-        if (value == NULL) return false;
-        out->dumpSema = value;
         return true;
     }
 
@@ -1195,215 +1181,6 @@ static int runJaithonTool(const JaiCliOptions *opts, const char *tool) {
 }
 
 /* ------------------------------------------------------------------ */
-/* --bootstrap-verify                                                   */
-/* ------------------------------------------------------------------ */
-
-/* The self-hosted front end is reached through jaiSelfHostedCompileInto, the
- * same bridge `--front=jai` runs on. Deliberately the same: a bootstrap run
- * then exercises the path a user takes, and neither can rot without the other
- * noticing. What comes back is a module body comparable opcode for opcode
- * against what src/codegen produced, or NULL with the reason already stated. */
-static ObjFunction *compileSelfHosted(const char *path, const char *source,
-                                      size_t length, ObjModule *into,
-                                      uint64_t hash, int optLevel) {
-    ObjFunction *body = jaiSelfHostedCompileInto(source, length, path, into,
-                                                 hash, optLevel);
-    if (body == NULL) (void)cliFlush();
-    return body;
-}
-
-/* Spec §11 compares *serialised* function records, and only one of the two
- * sides had been through the container: the self-hosted body arrives as a
- * .jaic, the C body never left memory. That round trip is not the identity.
- * writeFunction appends a record's own name and its parameter names to the
- * constant pool (§5), so a record read back has entries the same record in
- * memory does not, and comparing across the boundary reported a pool-size
- * difference on every named function with a pool — a fact about serialize.c,
- * not about either front end. Both sides go through the same door.
- *
- * Returns NULL only when the C front end's own output will not round-trip,
- * which is a serialize.c bug worth failing on rather than routing around. */
-static ObjFunction *roundTrip(ObjModule *module, ObjFunction *body,
-                              uint64_t hash) {
-    size_t size = 0;
-    uint8_t *image = jaiSerializeModule(module, body, hash, JAIC_FLAG_DEBUG,
-                                        &size);
-    if (image == NULL) return NULL;
-
-    ObjModule *fresh = jaiModuleNew(module->name, module->path);
-    jaiPushRoot(OBJ_VAL(fresh));
-    fresh->sourceFileId = module->sourceFileId;
-    ObjFunction *reread = jaiDeserializeModule(image, size, fresh, hash);
-    jaiPopRoot();
-
-    (void)jaiRealloc(image, size, 0);
-    return reread;
-}
-
-/* What one file's comparison produced. `VERIFY_UNCOMPARABLE` is not a pass:
- * tests/errors holds files the C front end is *supposed* to reject, and a file
- * the reference will not compile yields no bytecode to compare against. Those
- * were being counted as divergences, which pinned `make bootstrap` at 31
- * failures it could never fix and hid the real number underneath them. They
- * are reported and counted on their own line instead. */
-typedef enum {
-    VERIFY_SAME,
-    VERIFY_DIFFERENT,
-    VERIFY_UNCOMPARABLE,
-} VerifyOutcome;
-
-static VerifyOutcome verifyOne(const char *path, const CodegenOptions *codegen) {
-    size_t length = 0;
-    char *source = jaiReadFile(path, &length);
-    if (source == NULL) {
-        cliError("cannot read %s", path);
-        (void)cliFlush();
-        return VERIFY_DIFFERENT;
-    }
-    uint64_t hash = jaiSourceHash(source, length);
-
-    ObjModule *cModule = NULL;
-    ObjFunction *cBody = compileFile(path, codegen, &cModule);
-    if (cBody == NULL) {
-        printf("skip %s\n       the C front end rejects this file, so there is "
-               "no bytecode to compare against\n", path);
-        JAI_FREE_ARRAY(char, source, length + 1);
-        return VERIFY_UNCOMPARABLE;
-    }
-
-    char name[256];
-    char absolute[JAI_MAX_PATH];
-    jaiModuleNameFor(path, name, sizeof name);
-    if (!jaiPathAbsolute(absolute, sizeof absolute, path)) {
-        snprintf(absolute, sizeof absolute, "%s", path);
-    }
-    ObjModule *jModule = jaiModuleNew(jaiStringInternC(name),
-                                      jaiStringInternC(absolute));
-    /* The C side above registered this file; reuse its id rather than leaving
-     * the self-hosted module at zero. A span carrying an id `jaiSourceGet` does
-     * not know reads as *unknown*, and an unknown span silently costs whatever
-     * depends on it — the assert message falls back to its bare form, which is
-     * a constant-pool difference this very comparison then reports. */
-    jModule->sourceFileId = cModule != NULL ? cModule->sourceFileId : 0;
-    jaiPushRoot(OBJ_VAL(jModule));
-
-    VerifyOutcome status = VERIFY_SAME;
-    ObjFunction *cReread = roundTrip(cModule, cBody, hash);
-    if (cReread == NULL) {
-        cliError("%s: the C front end's own .jaic image does not round-trip; "
-                 "there is nothing to compare against", path);
-        (void)cliFlush();
-        jaiPopRoot();      /* jModule */
-        jaiPopRoots(2);    /* cModule, cBody */
-        JAI_FREE_ARRAY(char, source, length + 1);
-        return VERIFY_DIFFERENT;
-    }
-    jaiPushRoot(OBJ_VAL(cReread));
-
-    /* Both sides at the same level, or the report blames the front ends for
-     * the flag: see the note in selfHostedImage. */
-    ObjFunction *jBody = compileSelfHosted(absolute, source, length, jModule,
-                                           hash, codegen->optLevel);
-    if (jBody == NULL) {
-        status = VERIFY_DIFFERENT;
-    } else {
-        jaiPushRoot(OBJ_VAL(jBody));
-        char difference[512];
-        if (jaiCompareFunctions(cReread, jBody, difference, sizeof difference)) {
-            printf("ok   %s\n", path);
-        } else {
-            printf("DIFF %s\n       %s\n", path, difference);
-            status = VERIFY_DIFFERENT;
-        }
-        jaiPopRoot();
-    }
-
-    jaiPopRoot();          /* cReread */
-    jaiPopRoot();          /* jModule */
-    jaiPopRoots(2);        /* cModule, cBody */
-    JAI_FREE_ARRAY(char, source, length + 1);
-    return status;
-}
-
-/* A differential check that compared nothing must not report success: `make
- * bootstrap` is the only thing standing between "the two front ends agree" and
- * "nobody has ever run the second one", and a green line it did not earn is
- * worse than no check at all. Every early exit below is a failure, including
- * the one where the path list came out empty. */
-static int cmdBootstrapVerify(const JaiCliOptions *opts) {
-    ObjModule *compiler = jaiImportModule("jaithon.compile", NULL);
-    if (compiler == NULL) {
-        jaiClearException();
-        JaiDiag *d = jaiDiagError(E0800_MODULE_NOT_FOUND, JAI_SPAN_NONE,
-                                  "--bootstrap-verify needs the self-hosted "
-                                  "front end in `jaithon.compile`");
-        jaiDiagAddHelp(d, "install the standard library, or point JAITHON_PATH "
-                          "at the directory that contains `std`");
-        (void)cliFlush();
-        return 1;
-    }
-    jaiPushRoot(OBJ_VAL(compiler));
-
-    Value entry;
-    if (!jaiModuleGet(compiler, jaiStringInternC("compile_source"), &entry)) {
-        (void)jaiDiagError(E0802_NOT_EXPORTED, JAI_SPAN_NONE,
-                           "`jaithon.compile` does not export "
-                           "`compile_source(source, path)`");
-        (void)cliFlush();
-        jaiPopRoot();
-        return 1;
-    }
-    /* Looked up only to fail here, before a single file is compiled, rather
-     * than once per file inside jaiSelfHostedCompile. */
-    (void)entry;
-
-    PathList files;
-    if (!collectAllInputs(opts, &files, ".")) {
-        (void)cliFlush();
-        pathListFree(&files);
-        jaiPopRoot();
-        return 1;
-    }
-    if (files.count == 0) {
-        JaiDiag *d = jaiDiagError(E0800_MODULE_NOT_FOUND, JAI_SPAN_NONE,
-                                  "--bootstrap-verify found no .jai files to "
-                                  "compare the two front ends on");
-        jaiDiagAddHelp(d, "name a file or a directory that contains one");
-        (void)cliFlush();
-        pathListFree(&files);
-        jaiPopRoot();
-        return 1;
-    }
-
-    int differing = 0, skipped = 0;
-    for (int i = 0; i < files.count; i++) {
-        switch (verifyOne(files.data[i], &opts->run.codegen)) {
-        case VERIFY_DIFFERENT:   differing++; break;
-        case VERIFY_UNCOMPARABLE: skipped++;  break;
-        case VERIFY_SAME:                     break;
-        }
-    }
-    int compared = files.count - skipped;
-    printf("%d file%s checked, %d compared, %d differing, %d not comparable\n",
-           files.count, files.count == 1 ? "" : "s", compared, differing,
-           skipped);
-
-    pathListFree(&files);
-    jaiPopRoot();
-    /* Comparing nothing is a failure however few files diverged: see the
-     * comment above cmdBootstrapVerify. */
-    if (compared == 0) {
-        JaiDiag *d = jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
-                                  "--bootstrap-verify compared no files: the C "
-                                  "front end rejected every input");
-        jaiDiagAddHelp(d, "name a file the reference front end accepts");
-        (void)cliFlush();
-        return 1;
-    }
-    return differing == 0 ? 0 : 1;
-}
-
-/* ------------------------------------------------------------------ */
 /* Dispatch                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -1431,17 +1208,14 @@ static bool preludeDisabled(const JaiCliOptions *opts) {
 
 /* --front=jai chooses which compiler produces the bytecode, so a command that
  * cannot honour it has to say so. Only `run` goes through jaiRunFile, which is
- * where the bridge to lib/jaithon/compile lives; --bootstrap-verify uses both front
- * ends by definition and is not affected by the flag either way. Quietly using
- * the C front end for the rest would mean the output of `jaithon --front=jai
- * build x.jai` was not what its command line says it is. */
+ * where the bridge to lib/jaithon/compile lives. Quietly using the C front end
+ * for the rest would mean the output of `jaithon --front=jai build x.jai` was
+ * not what its command line says it is. */
 static bool commandHonoursFrontEnd(JaiCommand command) {
     switch (command) {
     case CMD_RUN:
-    case CMD_BOOTSTRAP_VERIFY:
-    /* `check` runs the self-hosted front end over the entry file so that the
-     * two checkers can be compared on a file rather than on bytecode, which is
-     * what `make sema-diff` needs to have two sides at all. */
+    /* `check` runs the self-hosted front end over the entry file, which is what
+     * makes it a check of the compiler that will actually build the file. */
     case CMD_CHECK:
     /* Neither compiles anything, so the flag is vacuous rather than ignored. */
     case CMD_VERSION:
@@ -1479,29 +1253,12 @@ int jaiCliDispatch(const JaiCliOptions *opts) {
 
     gSelfHosted = opts->run.selfHosted;
 
-    /* Only `check` writes a dump. Accepting the flag elsewhere and quietly
-     * writing nothing would let a comparison "pass" because one side never
-     * produced a file to compare. */
-    if (opts->dumpSema != NULL) {
-        if (opts->command != CMD_CHECK) {
-            JaiDiag *d = jaiDiagError(JAI_OK, JAI_SPAN_NONE,
-                                      "--dump-sema is only implemented for "
-                                      "`check`, not `%s`",
-                                      commandName(opts->command));
-            jaiDiagAddHelp(d, "run `jaithon check --dump-sema PATH FILE`");
-            (void)cliFlush();
-            return 1;
-        }
-        jaiSemaDumpArm(opts->dumpSema);
-    }
-
     if (opts->run.selfHosted && !commandHonoursFrontEnd(opts->command)) {
         JaiDiag *d = jaiDiagError(JAI_OK, JAI_SPAN_NONE,
                                   "--front=jai is not implemented for `%s`; "
                                   "only `run` uses the self-hosted front end",
                                   commandName(opts->command));
-        jaiDiagAddHelp(d, "drop --front=jai to use the C front end, or run "
-                          "`make bootstrap` to compare the two");
+        jaiDiagAddHelp(d, "drop --front=jai to use the C front end");
         (void)cliFlush();
         return 1;
     }
@@ -1528,7 +1285,6 @@ int jaiCliDispatch(const JaiCliOptions *opts) {
     case CMD_TOKENS:  return cmdParseOnly(opts, true);
     case CMD_VERSION: jaiCliPrintVersion(stdout); return 0;
     case CMD_HELP:    jaiCliPrintUsage(stdout);   return 0;
-    case CMD_BOOTSTRAP_VERIFY: return cmdBootstrapVerify(opts);
     }
 
     cliError("unimplemented command");

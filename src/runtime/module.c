@@ -31,7 +31,6 @@
 #include "../native/native.h"
 #include "../sema/check.h"
 #include "../sema/resolve.h"
-#include "../sema/semadump.h"
 #include "../vm/serialize.h"
 
 #define JAI_MODULE_EXT   ".jai"
@@ -741,10 +740,10 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
          *
          * This is not cosmetic. The name is serialised into the cache entry,
          * and a cached module whose name has lost its package cannot resolve
-         * its own imports when loaded back -- a warm `--front=jai` run failed
-         * where a cold one passed. `--bootstrap-verify` cannot see it either:
-         * compare_functions checks arity, flags, frame size, code and
-         * constants, but not the function's name. */
+         * its own imports when loaded back -- a warm run failed where a cold
+         * one passed. The differential oracle could not see it either: it
+         * compared arity, flags, frame size, code and constants, but never the
+         * function's name. */
         if (module->name != NULL) {
             body->name = module->name;
             body->qualifiedName = module->name;
@@ -1162,22 +1161,17 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      *
      * The trailing three are `compile_source`'s defaulted parameters
      * (release, fileId, optLevel). Only the last carries information, and it
-     * has to: `--bootstrap-verify -O0` compiles the C side at the level it was
-     * given, so a bridge that always took the default left the self-hosted
-     * side at -O2 and turned the comparison into C-at-O0 against Jaithon-at-O2.
-     * That is not a bug in either front end but it reads as one in every line
-     * of the report, and it costs the only tool that can separate an emitter
-     * divergence from an optimiser divergence.
+     * has to: a bridge that always took the default compiled at -O2 whatever
+     * the caller asked for, so `-O0` was accepted and ignored.
      *
      * `fileId` carries information too. It was a hardcoded zero on the
      * reasoning that nothing read it; something does. Every span the
      * self-hosted front end emits records it, the line table is made of spans,
      * and a disassembler resolves a span back to a line through the source
      * registered under that id. With zero, a `--front=jai` build disassembled
-     * with no line numbers and its tracebacks could not name a line —
-     * invisible to `--bootstrap-verify`, which excludes the line table from
-     * the comparison by design (spec §11). Every caller therefore has to have
-     * registered its source and set `module->sourceFileId` first. */
+     * with no line numbers and its tracebacks could not name a line. Every
+     * caller therefore has to have registered its source and set
+     * `module->sourceFileId` first. */
     Value args[5];
     args[0] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[0]);
@@ -1522,12 +1516,11 @@ static void fileStem(char *out, size_t outSize, const char *path) {
  * import chain does not want: a path with nothing left after the extension is
  * stripped names the main module, not the empty module.
  *
- * Shared rather than static because three callers need the same answer and had
- * been spelling it out separately — the CLI, the self-hosted bridge, and
- * __prim__.compile_image. A fourth copy lives in `module_name_for`
- * (lib/jaithon/compile/mod.jai) and must agree with this one, because
- * --bootstrap-verify compiles the same file with both front ends and the name
- * is a constant in the record's pool. */
+ * Shared rather than static because the CLI and the self-hosted bridge need the
+ * same answer and had been spelling it out separately. A third copy lives in
+ * `module_name_for` (lib/jaithon/compile/mod.jai) and must agree with this one:
+ * the name is a constant in the record's pool, and a cached module whose name
+ * has lost its package cannot resolve its own imports. */
 void jaiModuleNameFor(const char *path, char *out, size_t outSize) {
     fileStem(out, outSize, path);
     if (out[0] == '\0') snprintf(out, outSize, "__main__");
@@ -1776,11 +1769,6 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     module->sourceFileId = fileId;
     jaiPushRoot(OBJ_VAL(module));
 
-    /* The dump belongs to the file the user named. Imports run through the
-     * same checker, so beginning here rather than inside the front end is what
-     * stops each of them overwriting the entry file's decisions. */
-    jaiSemaDumpBegin(entry);
-
     bool ok;
     if (sOptions.selfHosted) {
         /* `--front=jai check` runs the self-hosted front end over the entry
@@ -1810,13 +1798,6 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
         ok = frontEnd(module, fileId, &sOptions.codegen, true, NULL, false);
     }
     jaiPopRoots(3);
-
-    if (!jaiSemaDumpEnd()) {
-        (void)jaiDiagError(JAI_OK, JAI_SPAN_NONE,
-                           "cannot write the sema dump for `%s`", entry);
-        (void)jaiDiagFlush(&gDiags, stderr);
-        return 1;
-    }
 
     if (sOptions.verbose && ok) {
         fprintf(stderr, "jaithon: %s is clean\n", entry);

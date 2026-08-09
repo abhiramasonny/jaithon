@@ -1,7 +1,7 @@
 #: Every file in `tests/errors` must be rejected by the self-hosted front end,
 #: with the same code the C front end reports.
 #:
-#: `--bootstrap-verify` cannot see this. It compares bytecode, and a file the C
+#: The retired differential oracle could not see this. It compared bytecode, and a file the C
 #: rejects produces none — those 36 files are reported as "not comparable" and
 #: contribute nothing. So the whole diagnostic surface of the self-hosted front
 #: end was unmeasured: it could have accepted every one of them and the

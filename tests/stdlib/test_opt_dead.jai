@@ -9,7 +9,7 @@
 #: own. Above `--O0` the peephole calls `mark_unreachable` as well, so a test
 #: that only looked at `--O2` would keep passing with this file stubbed out.
 #: Every expectation below was read back from `jaithon disasm -O0` and from
-#: `--bootstrap-verify`, so an assertion that stops holding is a divergence
+#: the retired differential oracle, so an assertion that stops holding is a divergence
 #: from the C front end rather than a change of taste.
 #:
 #: Three things are asserted, because the pass has three ways to be wrong: the

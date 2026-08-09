@@ -1,11 +1,11 @@
 #!/bin/sh
 # Compare the .jaic image each front end produces for the same source.
 #
-# `--bootstrap-verify` compares FuncProtos: arity, flags, frame size, captures,
-# defaults, the code stream and the constant pool. It never opens the serialised
-# container, so it reports `ok, 0 differing` for a file whose images differ --
-# which is exactly what it did while the self-hosted front end was emitting a
-# shorter line table than the C for the same source.
+# The retired differential oracle compared FuncProtos: arity, flags, frame size,
+# captures, defaults, the code stream and the constant pool. It never opened the
+# serialised container, so it reported `ok, 0 differing` for a file whose images
+# differ -- which is exactly what it did while the self-hosted front end was
+# emitting a shorter line table than the C for the same source.
 #
 # This is a DIAGNOSTIC, not a spec gate, and the distinction cost a wrong
 # conclusion once. Phase 8's fixpoint gate is `stage1.jaic == stage2.jaic` --
@@ -13,8 +13,8 @@
 # image equality was never required by the spec.
 #
 # It earns its place anyway: it is what found the self-hosted front end emitting
-# a shorter line table than the C for identical source, a real bug that
-# `--bootstrap-verify` reported as `ok`.
+# a shorter line table than the C for identical source, a real bug the oracle
+# reported as `ok`.
 #
 # One difference here is EXPECTED and not a defect: serialize.c:439 writes
 # `module->exports`, which is empty at `build` time under the C front end

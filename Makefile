@@ -4,8 +4,7 @@
 #   make debug      -O0 -g, assertions, GC stress available
 #   make test       build + run the full test suite
 #   make bench      build + run benchmarks
-#   make bootstrap  differential check of the C and self-hosted front ends
-#   make sema-diff  FILE=x.jai — what the checker decided about one file
+#   make fixpoint-check  compile each source twice and compare the images
 #   make install    install to $(PREFIX)
 #   make clean      remove build artifacts
 
@@ -272,7 +271,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench bootstrap sema-diff install uninstall \
+.PHONY: all debug release test verify-test bench install uninstall \
         clean distclean fmt fmt-check check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -340,22 +339,6 @@ verify-test: $(BUILD)/verify_chunk
 
 bench: $(TARGET)
 	@./scripts/run_bench.sh
-
-bootstrap: $(TARGET)
-	@./$(TARGET) --bootstrap-verify lib tests
-
-# What the two checkers decided about one file:
-#
-#   make sema-diff FILE=lib/std/str.jai
-#
-# `bootstrap` answers in bytecode, which is the wrong vocabulary for a type
-# bug: it reports the first byte that differs, and the decision that was wrong
-# is somewhere upstream of it. This reports the decisions.
-#
-# The self-hosted side has no checker yet, so until Phase 2 lands every C
-# decision shows up as missing on the Jaithon side. That is the correct reading
-# and not a fault in the tool: the mismatch count is how much of the checker is
-# still to write, and it should fall to zero.
 #: Regenerate boot/seed.c from the images the front end currently needs.
 #:
 #: Runs the compiler once to populate __jaicache__, embeds what it finds, then
@@ -379,26 +362,20 @@ reseed: $(TARGET)
 	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory fixpoint-check
 
-#: Compile each source twice with the self-hosted front end and compare. This is
-#: the precondition for Phase 8's fixpoint gate: an image that is not
-#: reproducible run to run can never satisfy `stage1.jaic == stage2.jaic`.
+#: Compile each source twice with the self-hosted front end and compare. With
+#: the differential oracle retired this is the gate that says the front end is
+#: deterministic: an image that is not reproducible run to run can never
+#: satisfy `stage1.jaic == stage2.jaic`.
 .PHONY: fixpoint-check
 fixpoint-check: $(TARGET)
 	@scripts/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
 
-#: Byte-compare the .jaic each front end produces. --bootstrap-verify compares
-#: FuncProtos and never opens the container, so it can report `ok` for a file
-#: whose images differ; Phase 8's fixpoint gate is byte for byte, so this is the
-#: meter that actually covers it.
+#: Byte-compare the .jaic each front end produces. A diagnostic, not a gate:
+#: it exists because the retired oracle compared FuncProtos and never opened
+#: the container, so it could report `ok` for a file whose images differed.
 .PHONY: image-parity
 image-parity: $(TARGET)
 	@scripts/image_parity.sh $(if $(PATHS),$(PATHS),lib/std)
-
-sema-diff: $(TARGET)
-	@test -n "$(FILE)" || { echo "usage: make sema-diff FILE=path.jai"; exit 2; }
-	@./$(TARGET) check --dump-sema $(BUILD)/sema.c.txt $(FILE)
-	@./$(TARGET) --front=jai check --dump-sema $(BUILD)/sema.jai.txt $(FILE) 2>/dev/null
-	@./$(TARGET) run scripts/sema_diff.jai $(BUILD)/sema.c.txt $(BUILD)/sema.jai.txt
 
 check: $(TARGET)
 	@./$(TARGET) check lib tests examples
@@ -447,4 +424,4 @@ distclean: clean
 	@echo "  CLEAN   removed every build tree, binary and generated artefact"
 
 help:
-	@echo "targets: all debug release test bench bootstrap sema-diff check fmt install clean"
+	@echo "targets: all debug release test bench fixpoint-check reseed check fmt install clean"

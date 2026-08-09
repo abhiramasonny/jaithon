@@ -1,9 +1,9 @@
 #: `jaithon.compile.check.render` — the canonical text of a type.
 #:
 #: Every expected string here was measured by running
-#: `jaithon check --dump-sema` over a probe file and reading what the C
+#: the C checker over a probe file and reading what it
 #: actually emitted, not by reading `src/sema/types.c` and believing it. The
-#: sema dump compares these strings across the two front ends, so each case
+#: retired sema dump compared these strings across the two front ends, so each case
 #: that disagrees is a false divergence on every program that mentions the
 #: type.
 #:
