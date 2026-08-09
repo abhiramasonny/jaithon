@@ -169,6 +169,8 @@ typedef enum {
 } JaiDiagCode;
 
 const char *jaiDiagCodeString(JaiDiagCode code);   /* "E0301" */
+/* The inverse: "E0301" back to the code, or JAI_OK when the text is not one. */
+JaiDiagCode jaiDiagCodeFromString(const char *text);
 bool        jaiDiagCodeIsWarning(JaiDiagCode code);
 
 /* ------------------------------------------------------------------ */

@@ -21,6 +21,7 @@
 
 #include "runtime.h"
 #include "boot/seed.h"
+#include "frontend.h"
 #include "methods.h"
 
 #include "../codegen/codegen.h"
@@ -1103,32 +1104,6 @@ static bool instanceField(Value v, const char *name, Value *out) {
     return true;
 }
 
-/* `Compiled.report()` renders the front end's own diagnostics. Printing them is
- * the whole point of the exercise: without them a rejected file says only that
- * the self-hosted compiler said no. */
-static void printSelfHostedDiagnostics(Value compiled) {
-    if (!IS_INSTANCE(compiled)) return;
-    ObjInstance *inst = AS_INSTANCE(compiled);
-
-    Value method;
-    if (!jaiTableGetInterned(&inst->klass->methods, jaiStringInternC("report"),
-                             &method)) {
-        return;
-    }
-
-    jaiPushRoot(compiled);
-    Value bound = OBJ_VAL(jaiBoundNew(compiled, method));
-    jaiPushRoot(bound);
-    Value text = NULL_VAL;
-    bool ok = jaiCallValue(bound, 0, NULL, &text);
-    jaiPopRoots(2);
-
-    if (!ok) { jaiClearException(); return; }
-    if (IS_STRING(text) && AS_STRING(text)->length > 0) {
-        fprintf(stderr, "%s\n", AS_STRING(text)->chars);
-    }
-}
-
 /* `Compiled.image` is a list of byte-sized ints (spec/BYTECODE.md §7 as seen
  * from Jaithon, which has no writable bytes type). */
 static ObjBytes *bytesFromByteList(ObjList *list, const char *path) {
@@ -1238,10 +1213,15 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
         image = AS_BYTES(produced);
     } else if (instanceField(produced, "image", &field) && IS_LIST(field)) {
         if (AS_LIST(field)->count == 0) {
-            printSelfHostedDiagnostics(produced);
-            (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
-                               "%s: the self-hosted front end emitted no .jaic "
-                               "image", path);
+            /* The front end's own diagnostics say why, in the bag the driver
+             * flushes, rendered the same way the C's are. E0902 is only for
+             * the case where it produced neither an image nor a reason, which
+             * is a bug in the front end rather than in the file. */
+            if (!jaiFrontEndTransferDiagnostics(produced)) {
+                (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
+                                   "%s: the self-hosted front end emitted "
+                                   "neither an image nor a diagnostic", path);
+            }
         } else {
             image = bytesFromByteList(AS_LIST(field), path);
         }
@@ -1789,6 +1769,11 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     ObjString *pathStr = jaiStringIntern(absolute, strlen(absolute));
     jaiPushRoot(OBJ_VAL(pathStr));
     ObjModule *module = jaiModuleNew(nameStr, pathStr);
+    /* The self-hosted front end is handed this id and stamps it into every span
+     * it reports, so a diagnostic can be pointed back at the text. Without it
+     * the spans name file 0 and every diagnostic renders with no source line
+     * and no caret. */
+    module->sourceFileId = fileId;
     jaiPushRoot(OBJ_VAL(module));
 
     /* The dump belongs to the file the user named. Imports run through the
