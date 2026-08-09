@@ -68,6 +68,11 @@ JaiRunOptions jaiRunDefaults(void) {
     o.codegen    = jaiCodegenDefaults();
     o.useCache   = true;
     o.writeCache = true;
+    /* Still the C front end by default. Flipping this is Phase 9 step 1 and is
+     * blocked on a reentrancy bug: a module loaded as an IMPORT that itself
+     * imports another module fails under the self-hosted front end, because
+     * compiling it re-enters a compiler that is already running. The same file
+     * compiles fine as the entry file. See the phase 7 plan. */
     o.selfHosted = false;
     o.checkOnly  = false;
     o.verbose    = false;

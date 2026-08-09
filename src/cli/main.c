@@ -1459,8 +1459,14 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
     case CMD_DOC:
     case CMD_BENCH:
         return true;
+    /* The REPL and `eval` compile a snippet through the same module machinery,
+     * so they follow the flag like `run` does. */
     case CMD_REPL:
     case CMD_EVAL:
+        return true;
+    /* These two print the C front end's own tree and token stream. There is
+     * nothing for the flag to select until the self-hosted side can print the
+     * same, so they stay on C and say so rather than pretending. */
     case CMD_AST:
     case CMD_TOKENS:
         return false;
