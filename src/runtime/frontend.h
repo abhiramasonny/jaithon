@@ -77,6 +77,8 @@ typedef struct {
     const char *echo;       /* native a bare expression's value goes to, or NULL */
     bool        wholeFile;  /* read as a file rather than as one prompt line */
     bool        record;     /* let what it declares outlive the input */
+    const char *sourceDir;  /* where `from m import T` starts looking */
+    bool        strict;     /* --strict: every parameter must be annotated */
 } JaiReplCompileOptions;
 
 ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,

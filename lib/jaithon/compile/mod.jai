@@ -240,7 +240,14 @@ pub fn compile_repl(
     whole_file: bool = false,
     # `:disasm` compiles an input and never runs it, so what it declares is not
     # the session's.
-    record: bool = true
+    record: bool = true,
+    # The directory imports resolve against. A prompt input's path is a label
+    # like `<repl:4>`, which names no directory, so `from m import T` finds
+    # nothing and `T` is not a type the next line can name. The label stays the
+    # label -- it is what diagnostics and tracebacks say -- and this is only
+    # where the search starts.
+    source_dir: str = "",
+    strict: bool = false
 ) -> Compiled {
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
@@ -268,9 +275,10 @@ pub fn compile_repl(
     result.resolution = resolution
 
     let universe = Universe()
+    let search_from = if source_dir == "" { path } else { f"{source_dir}/{path}" }
     let checked = check_program(
-        universe, program, resolution, bag, opt_level > 0, false, path,
-        session.type_names(universe)
+        universe, program, resolution, bag, opt_level > 0, false, search_from,
+        session.type_names(universe), strict
     )
     result.types = checked
 

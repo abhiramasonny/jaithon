@@ -208,7 +208,7 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
         return NULL;
     }
 
-    Value args[8];
+    Value args[10];
     args[0] = sSession;
     args[1] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[1]);
@@ -220,11 +220,15 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
     jaiPushRoot(args[5]);
     args[6] = BOOL_VAL(opts->wholeFile);
     args[7] = BOOL_VAL(opts->record);
+    args[8] = OBJ_VAL(jaiStringInternC(opts->sourceDir != NULL ? opts->sourceDir
+                                                               : ""));
+    jaiPushRoot(args[8]);
+    args[9] = BOOL_VAL(opts->strict);
 
     Value produced = NULL_VAL;
-    bool called = jaiFrontEndInvoke(JAI_FRONT_END_MODULE, "compile_repl", 8,
+    bool called = jaiFrontEndInvoke(JAI_FRONT_END_MODULE, "compile_repl", 10,
                                     args, &produced);
-    jaiPopRoots(3);
+    jaiPopRoots(4);
     if (!called || !IS_INSTANCE(produced)) return NULL;
 
     jaiPushRoot(produced);
@@ -233,12 +237,10 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
     }
 
     /* Diagnostics first: an input can be rejected with an image already empty,
-     * and the report is the whole of what the prompt has to say about it. */
-    Value text = NULL_VAL;
-    if (jaiFrontEndCall0(produced, "report", &text) && IS_STRING(text) &&
-        AS_STRING(text)->length > 0) {
-        fprintf(stderr, "%s\n", AS_STRING(text)->chars);
-    }
+     * and they are the whole of what the prompt has to say about it. Into the
+     * bag rather than onto stderr, so the driver renders them the way it
+     * renders everything else. */
+    (void)jaiFrontEndTransferDiagnostics(produced);
 
     ObjBytes *image = imageBytes(produced);
     if (image == NULL) { jaiPopRoot(); return NULL; }
