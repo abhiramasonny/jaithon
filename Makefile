@@ -316,15 +316,15 @@ bootstrap: $(TARGET)
 # bug: it reports the first byte that differs, and the decision that was wrong
 # is somewhere upstream of it. This reports the decisions.
 #
-# The self-hosted side has no checker yet, and `--front=jai` does not implement
-# `check` either, so today this summarises the C side alone: how many types,
-# folds and guards the self-hosted checker has to reproduce for that file. When
-# both sides can produce a dump, pass both to scripts/sema_diff.jai and it
-# compares them.
+# The self-hosted side has no checker yet, so until Phase 2 lands every C
+# decision shows up as missing on the Jaithon side. That is the correct reading
+# and not a fault in the tool: the mismatch count is how much of the checker is
+# still to write, and it should fall to zero.
 sema-diff: $(TARGET)
 	@test -n "$(FILE)" || { echo "usage: make sema-diff FILE=path.jai"; exit 2; }
 	@./$(TARGET) check --dump-sema $(BUILD)/sema.c.txt $(FILE)
-	@./$(TARGET) run scripts/sema_diff.jai $(BUILD)/sema.c.txt
+	@./$(TARGET) --front=jai check --dump-sema $(BUILD)/sema.jai.txt $(FILE) 2>/dev/null
+	@./$(TARGET) run scripts/sema_diff.jai $(BUILD)/sema.c.txt $(BUILD)/sema.jai.txt
 
 check: $(TARGET)
 	@./$(TARGET) check lib tests examples

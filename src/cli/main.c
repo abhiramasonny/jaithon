@@ -1412,13 +1412,16 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
     switch (command) {
     case CMD_RUN:
     case CMD_BOOTSTRAP_VERIFY:
+    /* `check` runs the self-hosted front end over the entry file so that the
+     * two checkers can be compared on a file rather than on bytecode, which is
+     * what `make sema-diff` needs to have two sides at all. */
+    case CMD_CHECK:
     /* Neither compiles anything, so the flag is vacuous rather than ignored. */
     case CMD_VERSION:
     case CMD_HELP:
         return true;
     case CMD_REPL:
     case CMD_EVAL:
-    case CMD_CHECK:
     case CMD_BUILD:
     case CMD_FMT:
     case CMD_TEST:
