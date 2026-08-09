@@ -51,6 +51,15 @@
 static JaiRunOptions sOptions;
 static bool          sOptionsSet;
 
+/* True while the self-hosted front end is itself being imported.
+ *
+ * The front end is a set of Jaithon modules, so compiling them with the
+ * self-hosted front end would need the self-hosted front end: importing
+ * `jaithon.compile` under --front=jai recurses without this. Inside the window
+ * the C front end compiles whatever the compiler's own closure needs -- which
+ * is precisely the job the seed takes over once C is gone. */
+static bool          sLoadingFrontEnd;
+
 JaiRunOptions jaiRunDefaults(void) {
     JaiRunOptions o;
     memset(&o, 0, sizeof o);
@@ -598,6 +607,11 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
  * option instead of the producer stamped those C-compiled imports as
  * self-hosted, which is exactly the cross-contamination the flag exists to
  * prevent. */
+/* Whether THIS compilation goes through the self-hosted front end. */
+static bool selfHosting(void) {
+    return sOptions.selfHosted && !sLoadingFrontEnd;
+}
+
 static uint32_t cacheFlagsFor(const CodegenOptions *opts, bool selfHosted) {
     uint32_t flags = 0;
     if (opts->debugInfo) flags |= JAIC_FLAG_DEBUG;
@@ -653,7 +667,7 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
     }
 
     const JaiRunOptions *opts = options();
-    uint32_t flags = cacheFlagsFor(&opts->codegen, false);
+    uint32_t flags = cacheFlagsFor(&opts->codegen, selfHosting());
 
     if (opts->useCache && cacheFlagsMatch(path, flags)) {
         ObjFunction *cached = jaiCacheLoad(path, module, hash);
@@ -662,8 +676,12 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
     }
 
     ObjFunction *body = NULL;
-    if (!frontEnd(module, fileId, &opts->codegen, true, &body, false) ||
-        body == NULL) {
+    if (selfHosting()) {
+        body = jaiSelfHostedCompileInto(file->source, length, path, module,
+                                        hash, opts->codegen.optLevel);
+        if (body == NULL) return NULL;
+    } else if (!frontEnd(module, fileId, &opts->codegen, true, &body, false) ||
+               body == NULL) {
         return NULL;
     }
 
@@ -1062,7 +1080,12 @@ static ObjBytes *bytesFromByteList(ObjList *list, const char *path) {
 
 static ObjBytes *selfHostedImage(const char *source, size_t length,
                                  const char *path, int optLevel, int fileId) {
+    /* The compiler's own closure is compiled by C (later, served by the seed):
+     * compiling it with itself is the recursion this guard exists to stop. */
+    bool wasLoading = sLoadingFrontEnd;
+    sLoadingFrontEnd = true;
     ObjModule *compiler = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    sLoadingFrontEnd = wasLoading;
     if (compiler == NULL) {
         jaiClearException();
         JaiDiag *d = jaiDiagError(E0800_MODULE_NOT_FOUND, JAI_SPAN_NONE,
