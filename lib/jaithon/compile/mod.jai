@@ -5,13 +5,14 @@
 #: out in source order whichever stage raised them, and hands back everything
 #: each stage produced instead of printing anything itself.
 #:
-#: `compare_functions` is the other half of `make bootstrap`: it walks two
-#: function records in the order `jaiCompareFunctions` walks them — arity, flags,
-#: frame size, captures, defaults, code, constants, exception table — and reports
-#: the first divergence. Two implementations of one specification are only worth
-#: having if they are checked against each other. `--bootstrap-verify` runs the C
-#: side of that comparison; `verify` is the Jaithon-side driver and **cannot run
-#: today**, see its own doc comment.
+#: `compile_repl` is the same pipeline with the three differences a prompt
+#: needs: one line read two ways, a resolver that defers unknown globals, and a
+#: `ReplSession` carrying the type names earlier inputs declared.
+#:
+#: This file used to hold the other half of a differential oracle —
+#: `compare_functions`, `verify`, `verify_source` — which compiled a file with
+#: both front ends and compared the records field by field. It was retired with
+#: the rest of that mechanism once there was only one front end left to compare.
 #:
 #: ```
 #: let built = compile_source("let answer = 42\n", "<doc>")
@@ -22,9 +23,9 @@
 #: The file system is reached through `__prim__.io_open/read/write/flush/close`,
 #: and byte strings through `__prim__.bytes_new`.
 from jaithon.ast import Node, NodeKind
-from jaithon.compile.emit import Const, ConstTag, FuncProto, emit, op_name
+from jaithon.compile.emit import ConstTag, FuncProto, emit, op_name
 from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
-from jaithon.compile.jaic import disassemble_instruction, float_bits, read_module
+from jaithon.compile.jaic import disassemble_instruction
 from jaithon.compile.jaic import source_hash, write_module
 from jaithon.compile.check.checker import check_import_cycles, check_program
 from jaithon.compile.check.ctx import Ctx
@@ -128,7 +129,7 @@ pub fn compile_source(
     # `int -> float` widening is needed. The emitter turns those into
     # `OP_TYPE_GUARD` and `OP_TO_FLOAT`, which is where about half the bytecode
     # the two front ends disagree about comes from.
-    let checked = check_program(Universe(), program, resolution, bag, opt_level > 0, false, path)
+    let checked = check_program(Universe(), program, resolution, bag, opt_level > 0, path)
     result.types = checked
 
     # The emitter is handed the optimiser rather than importing it: the passes
@@ -277,7 +278,7 @@ pub fn compile_repl(
     let universe = Universe()
     let search_from = if source_dir == "" { path } else { f"{source_dir}/{path}" }
     let checked = check_program(
-        universe, program, resolution, bag, opt_level > 0, false, search_from,
+        universe, program, resolution, bag, opt_level > 0, search_from,
         session.type_names(universe), strict
     )
     result.types = checked
@@ -368,8 +369,8 @@ pub fn import_cycles(path: str, bag: DiagnosticBag? = null) -> DiagnosticBag {
 #: `compile_source` is handed a path and not a module name, so it applies the
 #: rule the C driver applies in `moduleNameFor` (src/cli/main.c): the basename
 #: with `.jai` removed, or `__main__` when nothing is left. The two have to
-#: agree, because `--bootstrap-verify` compiles the same file both ways and the
-#: name is a constant in the record's pool.
+#: agree, because the name is a constant in the record's pool and a cached
+#: module whose name has lost its package cannot resolve its own exports.
 #:
 #: ```
 #: module_name_for("lib/std/list.jai")    # "list"
@@ -426,334 +427,6 @@ pub fn write_bytes(path: str, data: list[int]) -> void {
     __prim__.io_write(handle, __prim__.bytes_new(data))
     __prim__.io_flush(handle)
     __prim__.io_close(handle)
-}
-
-#: What a differential check found.
-pub class VerifyResult {
-    #: The file that was checked.
-    pub let path: str
-    #: True when the two front ends agree.
-    pub let agreed: bool
-    #: The first divergence, or the reason the check could not run.
-    pub let message: str?
-    #: This front end's disassembly, when there is something to compare.
-    pub let ours: str?
-    #: The C front end's disassembly.
-    pub let theirs: str?
-
-    #: Record an outcome.
-    pub fn init(
-        self,
-        path: str,
-        agreed: bool,
-        message: str? = null,
-        ours: str? = null,
-        theirs: str? = null
-    ) {
-        self.path = path
-        self.agreed = agreed
-        self.message = message
-        self.ours = ours
-        self.theirs = theirs
-    }
-
-    fn __str__(self) -> str {
-        if self.agreed { return f"ok  {self.path}" }
-        let reason = self.message ?? "?"
-        var lines: list[str] = [f"DIVERGED  {self.path}", f"  {reason}"]
-        if self.ours != null {
-            lines.push("--- self-hosted front end ---")
-            lines.push(self.ours)
-        }
-        if self.theirs != null {
-            lines.push("--- C front end ---")
-            lines.push(self.theirs)
-        }
-        return "\n".join(lines)
-    }
-}
-
-#: Compile the file at `path` with both front ends and compare the bytecode.
-#:
-#: The comparison walks the function records exactly as `jaiCompareFunctions`
-#: does and ignores what the spec calls debug-only: names, line tables and
-#: parameter names never fail a build.
-#:
-#: `--bootstrap-verify` drives the same comparison from C, over a whole
-#: directory. This is the Jaithon-side driver, and the two must agree because
-#: they are two implementations of one specification.
-pub fn verify(path: str, opt_level: int = 2) -> VerifyResult {
-    return verify_source(read_text(path), path, opt_level)
-}
-
-#: Compare both front ends on `text` without touching the file system.
-#:
-#: `opt_level` reaches both sides. It has to: a comparison run at `-O0` that
-#: compiled the reference at `-O2` is not a bug in either front end but reads as
-#: one in every line of the report, and it costs the only tool that can separate
-#: an emitter divergence from an optimiser divergence.
-#:
-#: **The operands are mirrored against `--bootstrap-verify`.** Here `ours` is
-#: the self-hosted side and `theirs` is C, so a message reads
-#: `frame size differs: 5 vs 4` where the C driver writes `4 vs 5` for the same
-#: file. Both are correct and each names its own side first; reading one report
-#: with the other's convention in mind inverts every divergence in it.
-#:
-#: ```
-#: verify_source("let answer = 42\n", "<doc>").agreed      # true
-#: verify_source("let x = y\n", "<doc>").agreed            # false, E0200
-#: ```
-pub fn verify_source(text: str, path: str, opt_level: int = 2) -> VerifyResult {
-    let built = compile_source(text, path, false, 0, opt_level)
-    if not built.ok() {
-        let why = built.report()
-        return VerifyResult(path, false, f"the self-hosted front end rejected the file:\n{why}")
-    }
-    if built.body == null {
-        return VerifyResult(path, false, "the self-hosted front end emitted no body")
-    }
-
-    # Both sides go through the container, because that round trip is not the
-    # identity: `write_module` appends a record's own name and its parameter
-    # names to the constant pool (§5), so a record read back has entries the
-    # same record in memory does not. Comparing across the boundary reports a
-    # pool-size difference on every named function with a pool — a fact about
-    # the serialiser, not about either front end. `--bootstrap-verify` learned
-    # this the same way and says so in `roundTrip` (src/cli/main.c).
-    let mine = read_module(built.image, built.hash)
-    if mine == null {
-        return VerifyResult(
-            path,
-            false,
-            "the self-hosted front end's own image does not read back, so " +
-                "there is nothing to compare with"
-        )
-    }
-    let ours = mine.body
-
-    let reference = _reference_module(text, path, built.hash, opt_level)
-    if reference == null {
-        return VerifyResult(
-            path,
-            false,
-            "the C front end's image for this source did not read back, so " +
-                "there is nothing to compare against"
-        )
-    }
-
-    let difference = compare_functions(ours, reference.body, "module body")
-    if difference == null { return VerifyResult(path, true) }
-    return VerifyResult(
-        path,
-        false,
-        difference,
-        disassemble(ours, "self-hosted"),
-        disassemble(reference.body, "C")
-    )
-}
-
-# The C front end's own image for this source, or null when it did not read
-# back. `__prim__.compile_image` is the primitive whose absence kept `verify`
-# dead: `__prim__.compile` answers a closure, and a closure is not an image.
-fn _reference_module(text: str, path: str, hash: int, opt_level: int) -> Module? {
-    let produced = __prim__.compile_image(text, path, opt_level)
-    if produced is not bytes { return null }
-    return read_module(_byte_list(produced), hash)
-}
-
-#: Compare two function records, returning the first difference or null.
-#:
-#: `scope` names the record in the message: nested functions extend it, so a
-#: divergence deep in a class reads as
-#: `module body > constant 4 (Account) > constant 1 (deposit)`.
-pub fn compare_functions(ours: FuncProto, theirs: FuncProto, scope: str) -> str? {
-    if ours.arity != theirs.arity {
-        return f"{scope}: arity differs: {ours.arity} vs {theirs.arity}"
-    }
-    if ours.flags != theirs.flags {
-        return f"{scope}: flags differ: {ours.flags} vs {theirs.flags}"
-    }
-    if ours.max_slots != theirs.max_slots {
-        return f"{scope}: frame size differs: {ours.max_slots} vs {theirs.max_slots}"
-    }
-    if ours.upvalue_count != theirs.upvalue_count {
-        return f"{scope}: capture count differs: {ours.upvalue_count} vs " +
-            f"{theirs.upvalue_count}"
-    }
-    if ours.default_offsets.len() != theirs.default_offsets.len() {
-        return f"{scope}: default count differs: {ours.default_offsets.len()} vs " +
-            f"{theirs.default_offsets.len()}"
-    }
-    for (index, offset) in ours.default_offsets.enumerate() {
-        if offset != theirs.default_offsets[index] {
-            return f"{scope}: default thunk {index} starts at {offset} vs " +
-                f"{theirs.default_offsets[index]}"
-        }
-    }
-
-    let code = _compare_code(ours, theirs, scope)
-    if code != null { return code }
-
-    if ours.chunk.constants.len() != theirs.chunk.constants.len() {
-        return f"{scope}: constant count differs: {ours.chunk.constants.len()} vs " +
-            f"{theirs.chunk.constants.len()}"
-    }
-    for (index, value) in ours.chunk.constants.enumerate() {
-        let difference = _compare_constant(value, theirs.chunk.constants[index], scope, index)
-        if difference != null { return difference }
-    }
-
-    if ours.chunk.exceptions.len() != theirs.chunk.exceptions.len() {
-        return f"{scope}: exception table differs: {ours.chunk.exceptions.len()} vs " +
-            f"{theirs.chunk.exceptions.len()} entries"
-    }
-    for (index, entry) in ours.chunk.exceptions.enumerate() {
-        let other = theirs.chunk.exceptions[index]
-        if entry.start != other.start or
-            entry.end != other.end or
-            entry.handler != other.handler or
-            entry.type_const != other.type_const {
-            return f"{scope}: exception entry {index} differs: " +
-                f"[{entry.start},{entry.end})->{entry.handler} " +
-                f"type {entry.type_const} vs [{other.start},{other.end})->" +
-                f"{other.handler} type {other.type_const}"
-        }
-    }
-    return null
-}
-
-fn _compare_code(ours: FuncProto, theirs: FuncProto, scope: str) -> str? {
-    let mine = ours.chunk.code
-    let other = theirs.chunk.code
-    let common = min(mine.len(), other.len())
-    var index = 0
-    while index < common and mine[index] == other[index] { index += 1 }
-
-    if index == common {
-        if mine.len() == other.len() { return null }
-        return f"{scope}: code length differs: {mine.len()} vs {other.len()} bytes, " +
-            f"identical up to offset {index}"
-    }
-
-    let at = _instruction_start(ours, index)
-    let name_ours = _op_at(ours, at)
-    let name_theirs = _op_at(theirs, at)
-    if name_ours != name_theirs {
-        return f"{scope}: code differs at offset {at}: {name_ours} vs {name_theirs}"
-    }
-    return f"{scope}: code differs at offset {at}: {name_ours} operand byte " +
-        f"{index - at - 1} is {mine[index]} vs {other[index]}"
-}
-
-# Start of the instruction containing byte `target`, by decoding from zero.
-fn _instruction_start(proto: FuncProto, target: int) -> int {
-    var offset = 0
-    while offset < proto.chunk.code.len() {
-        let step = disassemble_instruction(proto.chunk, offset)
-        if step[1] <= offset { return target }
-        if target < step[1] { return offset }
-        offset = step[1]
-    }
-    return target
-}
-
-fn _op_at(proto: FuncProto, offset: int) -> str {
-    if offset < 0 or offset >= proto.chunk.code.len() { return "<end of code>" }
-    return op_name(proto.chunk.code[offset])
-}
-
-fn _compare_constant(ours: Const, theirs: Const, scope: str, index: int) -> str? {
-    if ours.tag != theirs.tag {
-        return f"{scope}: constant {index} is {ours.tag} here and {theirs.tag} there"
-    }
-    match ours.tag {
-        ConstTag.Func => {
-            let name = ours.value.name ?? "anonymous"
-            return compare_functions(ours.value, theirs.value, f"{scope} > constant {index} ({name})")
-        }
-        ConstTag.ClassSpec => { return _compare_class(ours.value, theirs.value, scope, index) }
-        ConstTag.Tuple => {
-            if ours.value.len() != theirs.value.len() {
-                return f"{scope}: constant {index} differs: tuple of " +
-                    f"{ours.value.len()} vs {theirs.value.len()}"
-            }
-            for (position, item) in ours.value.enumerate() {
-                let difference = _compare_constant(
-                    item,
-                    theirs.value[position],
-                    f"{scope} > constant {index}",
-                    position
-                )
-                if difference != null { return difference }
-            }
-            return null
-        }
-        ConstTag.Float => {
-            # Bit equality, so that -0.0 and 0.0 count as a divergence and two
-            # NaNs with the same payload do not.
-            if float_equal(ours.value, theirs.value) { return null }
-            return f"{scope}: constant {index} differs: {ours.value} vs {theirs.value}"
-        }
-        _ => {
-            if ours.value == theirs.value { return null }
-            return f"{scope}: constant {index} differs: {repr(ours.value)} vs " + f"{repr(theirs.value)}"
-        }
-    }
-}
-
-fn _compare_class(ours: any, theirs: any, scope: str, index: int) -> str? {
-    if ours.name != theirs.name {
-        return f"{scope}: constant {index} names class {ours.name} vs {theirs.name}"
-    }
-    if ours.super_name != theirs.super_name {
-        return f"{scope}: class {ours.name} extends {ours.super_name} vs " + f"{theirs.super_name}"
-    }
-    if ours.fields.len() != theirs.fields.len() {
-        return f"{scope}: class {ours.name} has {ours.fields.len()} vs " +
-            f"{theirs.fields.len()} fields"
-    }
-    for (position, field) in ours.fields.enumerate() {
-        let other = theirs.fields[position]
-        if field.name != other.name or
-            field.visibility != other.visibility or
-            field.is_static != other.is_static {
-            return f"{scope}: class {ours.name} field {position} differs: " +
-                f"{field.name} vs {other.name}"
-        }
-    }
-    if ours.methods.len() != theirs.methods.len() {
-        return f"{scope}: class {ours.name} has {ours.methods.len()} vs " +
-            f"{theirs.methods.len()} methods"
-    }
-    for (position, method) in ours.methods.enumerate() {
-        let other = theirs.methods[position]
-        if method.name != other.name or
-            method.flags != other.flags or
-            method.func_index != other.func_index {
-            return f"{scope}: class {ours.name} method {position} differs: " +
-                f"{method.name} vs {other.name}"
-        }
-    }
-    return null
-}
-
-#: True when two floats have the same IEEE-754 bit pattern.
-#:
-#: Not `==`: that says `-0.0 == 0.0` and that no NaN equals itself, and a
-#: constant pool needs neither.
-#:
-#: ```
-#: float_equal(0.0, -0.0)      # false
-#: float_equal(1.5, 1.5)       # true
-#: ```
-pub fn float_equal(left: float, right: float) -> bool {
-    return float_bits(left) == float_bits(right)
-}
-
-fn _byte_list(data: any) -> list[int] {
-    var out: list[int] = []
-    for index in range(data.len()) { out.push(data[index]) }
-    return out
 }
 
 # Every global the emitter marked with OP_EXPORT is part of the module's

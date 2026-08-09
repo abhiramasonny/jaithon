@@ -1,7 +1,7 @@
 #: Union normalisation: what makes `A | B` and `B | A` the same type.
 #:
 #: A union is interned by its member list, so member order is identity-affecting:
-#: it is the order `render` prints, which is the string `make sema-diff` compares
+#: it is the order `render` prints, which is the string the sema diff compared
 #: against the C. Every step below is a port of `jaiTypeUnion`, not a choice.
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type

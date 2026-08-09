@@ -3,14 +3,12 @@
 #: The parts of `src/sema/check.c` the rest of this directory leaves to it:
 #: annotation to semantic type, the type-name scope that resolves against, and
 #: the program-level passes that run before anything is checked.
-from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind, kind_name
+from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
-from jaithon.compile.check.dump import Record
 from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
 from jaithon.compile.check.modsig import absolute, default_search_path, dirname
 from jaithon.compile.check.ctx import Ctx
-from jaithon.compile.check.render import render
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
@@ -116,7 +114,7 @@ pub fn lookup_type_name(c: Ctx, name: str?) -> Type? {
 
     # An imported name the loader could not follow. Reporting E0402 here broke
     # every `from std.core import Iterable` — 80 of the 198 files
-    # `--bootstrap-verify` walks.
+    # the differential oracle used to walk.
     if name in c.imported_names { return c.universe.t_any }
 
     return _builtin_class(c.universe, name)
@@ -216,7 +214,7 @@ fn _generic_arity(d: TypeDecl?) -> int {
 #: `Ctx`, which is the C's `AstType.resolved` field.
 #:
 #: Generics are erased: `Box[int]` checks its arity and then stands for the bare
-#: `Box`, because the C never builds an instantiation and `make sema-diff` would
+#: `Box`, because the C never built an instantiation and the sema diff would
 #: report the difference on every generic annotation.
 pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
     if t == null { return c.universe.t_any }
@@ -389,7 +387,6 @@ pub fn check_program(
     resolution: Resolution,
     bag: DiagnosticBag,
     fold_constants: bool = true,
-    collect_dump: bool = false,
     path: str = "",
     # Names bound before anything in `program` is looked at. A file needs none:
     # it declares everything it can name. A prompt input needs the classes the
@@ -402,7 +399,6 @@ pub fn check_program(
     let c = Ctx(universe, bag, resolution)
     c.fold_constants = fold_constants
     c.strict = strict
-    if collect_dump { c.dump = [] }
     install(c)
     for (name, ty) in outer_type_names { c.push_type_name(name, ty) }
     if program == null { return c }
@@ -424,16 +420,15 @@ pub fn check_program(
     _signature_pass(c, program)
     c.check_block(c, program)
     # The C ends `jaiCheckProgram` the same way, and void is null, which is why
-    # a sema dump records the program itself as `null`.
+    # the program itself has no type of its own.
     c.set_type(program, universe.t_void)
-    if collect_dump { _dump_types(c, program) }
     return c
 }
 
 #: Signature loaders already built, keyed by the search path they serve.
 #:
 #: A loader per `compile_source` re-parsed every module's import closure once
-#: per importing file: `--bootstrap-verify` 50s against 19s. Keyed rather than
+#: per importing file: 50s against 19s over the stdlib. Keyed rather than
 #: shared because a loader hands out file ids and spans carry them. Signatures
 #: only: a shared `Universe` would leak one file's interning into the next.
 var _loaders: dict[str, SigLoader] = {}
@@ -830,23 +825,3 @@ fn _signature_pass(c: Ctx, node: any) -> void {
     }
 }
 
-# Every node's final type, recorded after checking rather than as each type is
-# assigned: folding rewrites nodes and a cast replaces one in place. The C's
-# `jaiSemaDumpTypes` does the same walk.
-fn _dump_types(c: Ctx, node: any) -> void {
-    if node is Node {
-        let ty = c.type_of(node)
-        if ty != null and c.dump != null {
-            c.dump.push(
-                Record(node.span.start, node.span.end, kind_name(node.kind), "type", render(ty))
-            )
-        }
-        for key in node.fields.keys() { _dump_types(c, node.fields[key]) }
-    } elif node is list {
-        for item in node { _dump_types(c, item) }
-    } elif node is dict {
-        # A call argument, a parameter, a match arm: these carry nodes without
-        # being nodes, so a walk over Node and list alone skips them.
-        for key in node.keys() { _dump_types(c, node[key]) }
-    }
-}

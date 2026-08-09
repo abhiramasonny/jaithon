@@ -36,7 +36,7 @@
 #: assumes a comparison rather than a walk. Build types through `Universe`, not
 #: through `Type` directly.
 #:
-#: **The rendered string is a wire format.** `make sema-diff` compares rendered
+#: **The rendered string is a wire format.** The retired sema diff compared rendered
 #: types between the two front ends, so the union sort order — and therefore
 #: `kinds.ORDINAL` — decides whether a program diffs clean.
 

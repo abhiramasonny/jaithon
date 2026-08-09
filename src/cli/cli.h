@@ -19,7 +19,6 @@ typedef enum {
     CMD_VERSION,
     CMD_HELP,
     CMD_EVAL,       /* --eval EXPR: one input, then exit */
-    CMD_BOOTSTRAP_VERIFY,
 } JaiCommand;
 
 typedef struct {
@@ -28,10 +27,6 @@ typedef struct {
     int          inputCount;
     const char  *output;
     const char  *eval;          /* the expression --eval was given */
-    /* --dump-sema PATH: write the checker's per-node decisions to PATH. The
-     * self-hosted front end is being written against the C checker, and a
-     * bytecode offset cannot say which type was wrong; this can. */
-    const char  *dumpSema;
 
     JaiRunOptions run;
 

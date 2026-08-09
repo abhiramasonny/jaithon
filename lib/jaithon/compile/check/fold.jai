@@ -13,9 +13,8 @@
 #: A Jaithon `Ident` holds a name and no symbol, so a `const`'s folded
 #: initialiser arrives as the `consts` dict, keyed by name, rather than through
 #: the C's `symbol->constValue`. Without it `const K = 8` inlines nowhere.
-from jaithon.ast import Node, NodeKind, OpKind, Span, kind_name, op_text
+from jaithon.ast import Node, NodeKind, OpKind, Span, op_text
 from jaithon.compile.check.assign import assignable
-from jaithon.compile.check.dump import Record
 from jaithon.compile.check.kinds import MAX_DECL_DEPTH
 from jaithon.compile.check.ty import Type
 from jaithon.compile.check.universe import Universe
@@ -146,21 +145,9 @@ pub fn const_eval(
 pub fn const_replace(
     u: Universe,
     node: Node,
-    value: ConstValue,
-    dump: list[Record]? = null
+    value: ConstValue
 ) -> Type? {
     if value.is_none() { return null }
-
-    if dump is not null and node.span.is_known() {
-        let at = Record(
-            node.span.start,
-            node.span.end,
-            kind_name(node.kind),
-            "fold",
-            render_const(value)
-        )
-        dump.push(at)
-    }
 
     match value.kind {
         ConstKind.Int => {
@@ -198,15 +185,14 @@ pub fn try_fold(
     node: Node,
     checked: Type? = null,
     bag: DiagnosticBag? = null,
-    consts: dict[str, Node] = {},
-    dump: list[Record]? = null
+    consts: dict[str, Node] = {}
 ) -> (bool, Type?) {
     if not _is_foldable(node.kind) { return (false, checked) }
 
     let value = const_eval(node, bag, consts)
     if value.is_none() { return (false, checked) }
 
-    let literal = const_replace(u, node, value, dump)
+    let literal = const_replace(u, node, value)
     if checked is not null {
         let (accepted, guard) = assignable(u, literal, checked)
         if accepted and not guard { return (true, checked) }
@@ -217,7 +203,7 @@ pub fn try_fold(
 #: A folded value in the one spelling both front ends must produce for it.
 #:
 #: Integers in decimal, floats through the `%.17g` the constant pool uses. A
-#: `fold` record in a sema dump holds this and is compared byte for byte.
+#: The retired sema dump held this and compared it byte for byte.
 pub fn render_const(value: ConstValue) -> str {
     match value.kind {
         ConstKind.Int => { return f"{value.as_int()}" }

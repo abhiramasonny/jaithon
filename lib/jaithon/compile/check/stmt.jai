@@ -812,8 +812,8 @@ fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
     # the synthetic literal produces a `fold` record of its own at the
     # initialiser's span before the initialiser produces the second.
     let literal = Node.null_lit().with_span(init.span)
-    c.set_type(literal, const_replace(c.universe, literal, v, c.dump))
-    c.set_type(init, const_replace(c.universe, init, v, c.dump))
+    c.set_type(literal, const_replace(c.universe, literal, v))
+    c.set_type(init, const_replace(c.universe, init, v))
     if symbol is not null { c.consts[symbol.name] = literal }
 }
 

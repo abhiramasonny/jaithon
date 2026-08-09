@@ -351,7 +351,7 @@ fn _check_ident(c: Ctx, node: Node) -> Type {
     if c.fold_constants and symbol.mutability == DeclKind.Const and symbol.name in c.consts {
         let folded = const_eval(node, null, c.consts)
         if not folded.is_none() {
-            let literal = const_replace(u, node, folded, c.dump)
+            let literal = const_replace(u, node, folded)
             c.set_type(node, c.symbol_type(symbol) ?? literal)
             return c.type_of(node) ?? u.t_any
         }
@@ -1709,7 +1709,7 @@ pub fn expr(c: Ctx, node: Node?) -> Type {
 
     c.set_type(node, t ?? u.t_any)
     if c.fold_constants {
-        let (_folded, after) = try_fold(u, node, c.type_of(node), null, c.consts, c.dump)
+        let (_folded, after) = try_fold(u, node, c.type_of(node), null, c.consts)
         c.set_type(node, after)
     }
     return c.type_of(node) ?? u.t_any

@@ -1,7 +1,7 @@
 #: `jaithon.compile.check.kinds` — the semantic type kinds and their ordinals.
 #:
 #: The ordinal is not a detail. Union members are sorted by it, the sort decides
-#: the rendered union string, and the rendered string is what `make sema-diff`
+#: the rendered union string, and the rendered string is what the sema diff
 #: compares between the two front ends. These tests pin the order against
 #: `src/sema/types.h` so a reordering fails here rather than as an unexplained
 #: divergence on an unrelated file.

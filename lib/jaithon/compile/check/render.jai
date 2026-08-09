@@ -1,6 +1,6 @@
 #: The canonical text of a type.
 #:
-#: `make sema-diff` compares this output against the C front end, so a single
+#: The retired sema diff compared this output against the C front end, so a single
 #: character of disagreement is a false divergence on every program that
 #: mentions the type. Ported line for line from `renderType`, `renderFn` and
 #: `renderUnion` in `src/sema/types.c`.

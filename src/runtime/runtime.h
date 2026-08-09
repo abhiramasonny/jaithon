@@ -104,8 +104,8 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
 /* The module name a path carries: its basename with `.jai` removed, or
  * `__main__` when nothing is left. The self-hosted front end has its own copy
  * of this rule in `module_name_for` (lib/jaithon/compile/mod.jai) and the two
- * must agree: --bootstrap-verify compiles one file with both front ends and
- * the name is a constant in the record's pool. */
+ * must agree: the name is a constant in the record's pool, and a cached module
+ * whose name has lost its package cannot resolve its own imports. */
 void jaiModuleNameFor(const char *path, char *out, size_t outSize);
 
 /* Compile a source string with the *self-hosted* front end (lib/jaithon/compile)

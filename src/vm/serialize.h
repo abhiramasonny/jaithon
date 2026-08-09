@@ -56,10 +56,5 @@ uint64_t jaiSourceHash(const char *source, size_t length);
  * Only serialize.c sees the generated header that defines it. */
 uint32_t jaiBuildId(void);
 
-/* Byte-for-byte comparison of two serialised functions, ignoring debug-only
- * fields. Used by --bootstrap-verify. Writes a human-readable explanation of
- * the first difference into `diff`. */
-bool jaiCompareFunctions(const ObjFunction *a, const ObjFunction *b,
-                         char *diff, size_t diffSize);
 
 #endif /* JAI_SERIALIZE_H */

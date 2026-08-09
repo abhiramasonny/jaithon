@@ -12,12 +12,11 @@
 #: literal knows less than the annotation it replaced a subexpression of.
 #:
 #: The expected values in this file are not guesses. Every one of them was taken
-#: from a `--dump-sema` run of the C checker over the same expression, which is
-#: the contract `make sema-diff` enforces.
+#: from a run of the C checker over the same expression, which is
+#: the contract the retired sema diff enforced.
 from std.math import INT_MAX, INT_MIN
 from std.test import assert_eq, assert_false, assert_throws, assert_true
 from jaithon.ast import Node, NodeKind, OpKind, Span, TypeExpr, kind_name, op_name
-from jaithon.compile.check.dump import Record
 from jaithon.compile.check.fold import ConstKind, ConstValue
 from jaithon.compile.check.fold import const_eval, const_replace, render_const, try_fold
 from jaithon.compile.check.ty import Type
@@ -540,7 +539,7 @@ fn test_a_fold_with_no_checked_type_answers_the_literals_own() -> void {
 }
 
 # ------------------------------------------------------------------
-# Rendering and the sema dump
+# Rendering
 # ------------------------------------------------------------------
 fn test_a_folded_value_renders_the_way_the_c_renders_it() -> void {
     assert_eq(render_const(ConstValue.of_int(5)), "5")
@@ -567,31 +566,6 @@ fn test_a_string_renders_quoted_with_the_three_escapes_a_dump_line_needs() -> vo
     assert_eq(render_const(ConstValue.of_str("a\\b")), "\"a\\\\b\"")
     # A tab is not one of the three: the C passes it through and so does this.
     assert_eq(render_const(ConstValue.of_str("a\tb")), "\"a\tb\"")
-}
-
-fn test_a_fold_records_the_node_kind_it_replaced() -> void {
-    # Taken before the rewrite, because that `2 + 3` folded says more than that
-    # some node is now `5`.
-    let u = Universe()
-    var records: list[Record] = []
-    let node = Node.binary(OpKind.Add, Node.int_lit(2), Node.int_lit(3)).with_span(Span(0, 4, 9))
-    try_fold(u, node, dump: records)
-
-    assert_eq(records.len(), 1)
-    assert_eq(records[0].span_start, 4)
-    assert_eq(records[0].span_end, 9)
-    assert_eq(records[0].kind, "AST_BINARY")
-    assert_eq(records[0].field, "fold")
-    assert_eq(records[0].value, "5")
-}
-
-fn test_a_synthesised_node_records_nothing() -> void {
-    # It has no counterpart in the other front end's tree, so a record for it
-    # would report a mismatch that means nothing.
-    let u = Universe()
-    var records: list[Record] = []
-    try_fold(u, _sum(), dump: records)
-    assert_eq(records.len(), 0)
 }
 
 # ------------------------------------------------------------------
