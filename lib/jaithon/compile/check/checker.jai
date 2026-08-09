@@ -73,32 +73,37 @@ fn _builtin_scalar(u: Universe, name: str?) -> Type? {
 }
 
 #: Classes the runtime provides that no source file declares.
+#:
+#: Exactly `kBuiltinClasses` in `src/sema/check.c`, in its order. Not a list of
+#: plausible exception names: a first draft here guessed twenty-five and was
+#: wrong in both directions, carrying `Exception`, `NotImplementedError`,
+#: `TimeoutError` and `UnicodeError` that the C does not know, and spelling the
+#: divide-by-zero one `ZeroDivisionError` where the C says
+#: `DivisionByZeroError`. Every wrong entry is a name that answers `any` here
+#: and a type there, and every extra one is a name this front end accepts and
+#: the C rejects.
 pub let BUILTIN_CLASSES: list[str] = [
     "Error",
-    "Exception",
-    "TypeError",
-    "ValueError",
+    "AssertionError",
+    "ArithmeticError",
+    "DivisionByZeroError",
+    "OverflowError",
+    "LookupError",
     "IndexError",
     "KeyError",
-    "AttributeError",
     "NameError",
-    "ZeroDivisionError",
-    "OverflowError",
-    "RuntimeError",
-    "NotImplementedError",
-    "AssertionError",
-    "StopIteration",
+    "TypeError",
+    "ValueError",
     "ParseError",
-    "ImportError",
+    "AttributeError",
     "IOError",
     "FileNotFoundError",
     "PermissionError",
     "OSError",
-    "TimeoutError",
-    "LookupError",
-    "ArithmeticError",
+    "RuntimeError",
     "RecursionError",
-    "UnicodeError",
+    "StopIteration",
+    "ImportError",
 ]
 
 fn _builtin_class(u: Universe, name: str?) -> Type? {
@@ -294,8 +299,45 @@ pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
 pub fn install(c: Ctx) -> void {
     c.resolve_ast_type = resolve_ast_type
     c.lookup_type_name = lookup_type_name
+    c.is_module = _is_module
+    c.module_member = _module_member
     stmt_mod.install(c)
     decl_mod.install(c)
+}
+
+# True when `node` names an imported module rather than a value.
+fn _is_module(c: Ctx, node: Node?) -> bool {
+    if node is null or node.kind != NodeKind.Ident { return false }
+    let ty = c.symbol_type(c.resolution.symbol_of(node))
+    return ty is not null and ty.kind == TyKind.Module
+}
+
+#: What `m.name` denotes after `import m`.
+#:
+#: The import pass gave `m` a `Module` type carrying the dotted name, and the
+#: signature loader still holds that module's declarations, so the member's
+#: type is the declaration's type — the same answer `from m import name` would
+#: have produced. Without this every qualified call reads `any`, which was the
+#: rest of `num.jai` and `os.jai` once the plain imports were bound.
+fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
+    let u = c.universe
+    if node is null { return (u.t_any, null) }
+    let module_type = c.symbol_type(c.resolution.symbol_of(node))
+    if module_type is null or module_type.kind != TyKind.Module { return (u.t_any, null) }
+
+    let dotted = module_type.name
+    let loader = c.sig_loader
+    if dotted is null or loader is null { return (u.t_any, null) }
+
+    let sig = loader.load(dotted, c.source_dir)
+    if sig is null { return (u.t_any, null) }
+
+    let found = loader.find(sig, name)
+    let decl = found[0]
+    if decl is null { return (u.t_any, null) }
+
+    let ty = _signature_type(c, decl)
+    return (ty ?? u.t_any, decl)
 }
 
 #: Register every class, trait and enum this file declares.
@@ -346,6 +388,8 @@ pub fn check_program(
     # `path` is the file being checked, and an import resolves relative to the
     # directory holding it before it resolves against the search path.
     let loader = SigLoader(_search_roots(path, default_search_path()))
+    c.sig_loader = loader
+    c.source_dir = _dir_of(path)
     _import_pass(c, program, loader, _dir_of(path))
     _alias_pass(c, program)
     for declared in c.all_decls() { layout_decl(c, declared) }
