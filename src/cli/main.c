@@ -653,10 +653,18 @@ static ObjFunction *compileFile(const char *path, const CodegenOptions *codegen,
      * would be a lie on two of the commands most likely to be pointed at it. */
     ObjFunction *body;
     if (gSelfHosted) {
-        body = jaiSelfHostedCompileInto(source, length, absolute, module,
-                                        jaiSourceHash(source, length),
-                                        codegen->optLevel);
-        releaseSource(source, length, module);
+        /* Register before compiling. `jaiCompileSource` does this on the C
+         * path and the bridge does not, so without it the module keeps file id
+         * zero and every span the self-hosted front end emits points at a file
+         * nothing registered — a build with no line numbers. */
+        uint64_t hash = jaiSourceHash(source, length);
+        int fileId = jaiSourceAdd(absolute, source, length); /* takes source */
+        module->sourceFileId = fileId;
+        const JaiSourceFile *registered = jaiSourceGet(fileId);
+        body = jaiSelfHostedCompileInto(
+            registered != NULL ? registered->source : source,
+            registered != NULL ? registered->length : length,
+            absolute, module, hash, codegen->optLevel);
     } else {
         body = jaiCompileSource(source, length, absolute, module, codegen);
         releaseSource(source, length, module);
@@ -1271,6 +1279,12 @@ static VerifyOutcome verifyOne(const char *path, const CodegenOptions *codegen) 
     }
     ObjModule *jModule = jaiModuleNew(jaiStringInternC(name),
                                       jaiStringInternC(absolute));
+    /* The C side above registered this file; reuse its id rather than leaving
+     * the self-hosted module at zero. A span carrying an id `jaiSourceGet` does
+     * not know reads as *unknown*, and an unknown span silently costs whatever
+     * depends on it — the assert message falls back to its bare form, which is
+     * a constant-pool difference this very comparison then reports. */
+    jModule->sourceFileId = cModule != NULL ? cModule->sourceFileId : 0;
     jaiPushRoot(OBJ_VAL(jModule));
 
     VerifyOutcome status = VERIFY_SAME;
