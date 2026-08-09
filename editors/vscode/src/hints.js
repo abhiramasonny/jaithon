@@ -378,16 +378,31 @@ function semanticTokenProvider(workspace) {
                              encodeModifiers(modifiers));
             };
 
+            // What each imported name really is, resolved once per file rather
+            // than once per use: there are far fewer imports than references.
+            const imported = new Map();
+            for (const symbol of analysis.symbols) {
+                if (symbol.kind !== 'import' || imported.has(symbol.name)) continue;
+                const followed = await workspace.follow(analysis, symbol, token);
+                if (followed && followed.symbol !== symbol) {
+                    imported.set(symbol.name, SYMBOL_TOKEN[followed.symbol.kind] || 'variable');
+                }
+            }
+            if (token?.isCancellationRequested) return null;
+
             const emissions = [];
             for (const symbol of analysis.symbols) {
                 if (symbol.end <= symbol.start) continue;
+                const type = symbol.kind === 'import'
+                    ? imported.get(symbol.name) || SYMBOL_TOKEN[symbol.kind]
+                    : SYMBOL_TOKEN[symbol.kind];
                 emissions.push({
                     start: symbol.start, end: symbol.end,
-                    type: SYMBOL_TOKEN[symbol.kind], modifiers: modifiersOf(symbol, true),
+                    type, modifiers: modifiersOf(symbol, true),
                 });
             }
             for (const ref of analysis.refs) {
-                const classified = classify(analysis, ref);
+                const classified = classify(analysis, ref, imported);
                 if (classified) emissions.push({ start: ref.start, end: ref.end, ...classified });
             }
 
