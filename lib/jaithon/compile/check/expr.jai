@@ -278,6 +278,13 @@ pub class Ctx {
     var decls_by_node: dict[int, TypeDecl]
     # id(TypeExpr) -> the semantic type it resolved to; the C's AstType.resolved.
     var resolved_types: dict[int, Type]
+    #: The signature loader, so a qualified member can be resolved against the
+    #: module it came from. Installed by `checker.check_program`; null when
+    #: nothing set one, in which case `m.f` answers `any`.
+    pub var sig_loader: any?
+    #: The directory of the file being checked, which is where an import
+    #: resolves from.
+    pub var source_dir: str
     var narrow_symbols: list[Symbol]
     var narrow_saved: list[Type]
     var type_names: list[tuple[str, Type]]
@@ -381,6 +388,8 @@ pub class Ctx {
         self.decls_by_name = {}
         self.decls_by_node = {}
         self.resolved_types = {}
+        self.sig_loader = null
+        self.source_dir = ""
         self.narrow_symbols = []
         self.narrow_saved = []
         self.type_names = []
