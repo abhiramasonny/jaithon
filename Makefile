@@ -200,7 +200,14 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # The generated header is rewritten only when the value actually changes, so an
 # unrelated rebuild does not cascade: serialize.c is the only translation unit
 # that includes it.
-ALL_SRCS := $(SRCS_C) $(SRCS_M) $(wildcard src/*/*.h)
+# boot/seed.c is excluded on purpose. ALL_SRCS feeds SRC_FINGERPRINT, which
+# becomes JAI_BUILD_ID, which every .jaic records and demands back. The seed is
+# generated data rather than compiler logic -- it changes what the compiler
+# STARTS with, never what it does with a given source -- so including it made
+# the seed part of its own identity: reseeding changed seed.c, which changed the
+# fingerprint, which changed the build id stamped into the next seed's images.
+# That loop cannot converge, and a three-stage fixpoint over it never holds.
+ALL_SRCS := $(filter-out boot/seed.c,$(SRCS_C)) $(SRCS_M) $(wildcard src/*/*.h)
 SRC_FINGERPRINT := $(shell cat $(ALL_SRCS) 2>/dev/null | shasum -a 256 | cut -c1-8)
 # At BUILD_ROOT, not $(BUILD): the fingerprint does not depend on build type,
 # and BASE_CFLAGS is expanded before $(BUILD) is narrowed to debug/release.
@@ -359,7 +366,7 @@ bootstrap: $(TARGET)
 reseed: $(TARGET)
 	@echo "  SEED    populating __jaicache__"
 	@find lib -name '__jaicache__' -type d -exec rm -rf {} + 2>/dev/null || true
-	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai check lib/std >/dev/null 2>&1 || true
+	@JAITHON_PATH=$(CURDIR)/lib JAITHON_NO_SEED=1 ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
 	@python3 scripts/gen_seed.py lib boot/seed.c
 	@$(MAKE) --no-print-directory
 	@$(MAKE) --no-print-directory fixpoint-check

@@ -68,7 +68,8 @@ function hoverProvider(workspace) {
                     const chain = builtins.exceptionChain(name);
                     markdown.appendMarkdown(fence(`class ${name}`));
                     if (chain.length > 1) markdown.appendMarkdown(`\n\n${chain.join(' → ')}`);
-                    markdown.appendMarkdown('\n\n---\n\nRegistered by the runtime. Fields: `message`, `traceback`.');
+                    const members = builtins.exceptionMembers().map((m) => `\`${m}\``).join(', ');
+                    markdown.appendMarkdown(`\n\n---\n\nRegistered by the runtime. Members: ${members}.`);
                     return new vscode.Hover(markdown, analysis.offsets.range(hit.start, hit.end));
                 }
             }
@@ -289,7 +290,16 @@ function modifiersOf(symbol, declaration) {
  * the import graph on every repaint; the fallbacks below cover what is missed.
  */
 function classify(analysis, ref) {
-    if (ref.kind === 'module-path') return null;
+    if (ref.kind === 'module-path') return { type: 'namespace', modifiers: [] };
+
+    // A named argument labels a parameter, and reads best as one.
+    if (ref.kind === 'argument') return { type: 'parameter', modifiers: [] };
+
+    if (ref.kind === 'variant') {
+        const owner = analysis.lookup(ref.owner, analysis.moduleScope);
+        const member = owner && analysis.memberNamed(owner, ref.name);
+        return { type: 'enumMember', modifiers: member ? modifiersOf(member, false) : [] };
+    }
 
     if (ref.kind === 'member') {
         const owner = analysis.lookup(baseTypeName(ref.receiver) || '', analysis.moduleScope);

@@ -8,6 +8,7 @@
 
 const vscode = require('vscode');
 const tool = require('./src/tool');
+const builtins = require('./src/builtins');
 const { Checker } = require('./src/diagnostics');
 const { Workspace } = require('./src/analysis');
 const navigation = require('./src/navigation');
@@ -156,6 +157,7 @@ function registerCommands(context) {
 
     command('jaithon.restart', async () => {
         workspace.invalidateAll();
+        await builtins.refresh(tool, output);
         for (const document of vscode.workspace.textDocuments) {
             if (document.languageId === 'jaithon') checker.schedule(document, 0);
         }
@@ -245,6 +247,7 @@ function activate(context) {
             if (!event.affectsConfiguration('jaithon')) return;
             tool.resetBinaryWarning();
             workspace.invalidateAll();
+            builtins.refresh(tool, output);
             for (const document of vscode.workspace.textDocuments) {
                 if (document.languageId === 'jaithon') checker.schedule(document, 0);
             }
@@ -263,6 +266,10 @@ function activate(context) {
 
     vscode.workspace.textDocuments.forEach((document) => checker.schedule(document, 0));
     updateStatus(vscode.window.activeTextEditor?.document);
+
+    // Ask the compiler which methods its primitive types actually answer to.
+    // Until it replies the bundled tables stand in, so nothing waits on this.
+    builtins.refresh(tool, output);
 }
 
 function deactivate() {

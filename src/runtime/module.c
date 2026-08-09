@@ -608,6 +608,16 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
  * option instead of the producer stamped those C-compiled imports as
  * self-hosted, which is exactly the cross-contamination the flag exists to
  * prevent. */
+/* `make reseed` sets this. The seed must not serve the compilation that
+ * produces its own replacement: with the seed answering, the front end never
+ * compiles its own closure from source, so nothing lands in __jaicache__ and
+ * the next seed is built from whatever little remains. Measured, the seed went
+ * 39 modules -> 10 in one generation that way, and would have reached zero. */
+static bool seedDisabled(void) {
+    const char *flag = getenv("JAITHON_NO_SEED");
+    return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
+}
+
 /* Whether THIS compilation goes through the self-hosted front end. */
 static bool selfHosting(void) {
     return sOptions.selfHosted && !sLoadingFrontEnd;
@@ -681,7 +691,7 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
      * a tree whose sources have moved past the seed recompiles rather than
      * running stale bytecode, because jaiDeserializeModule checks the source
      * hash. */
-    if (sLoadingFrontEnd && module->name != NULL) {
+    if (sLoadingFrontEnd && module->name != NULL && !seedDisabled()) {
         const JaiSeedEntry *seeded = jaiSeedFind(module->name->chars);
         if (seeded != NULL) {
             ObjFunction *fromSeed = jaiDeserializeModule(seeded->image,
