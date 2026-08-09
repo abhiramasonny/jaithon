@@ -273,7 +273,7 @@ class FileAnalysis {
             }
 
             case 'AST_FN_DECL': case 'AST_LAMBDA': case 'AST_ANON_FN': {
-                const at = node.name ? locateName(this.text, start, this.span(node.body).start || end, node.name) : null;
+                const at = node.name ? this.findName(start, this.span(node.body).start || end, node.name) : null;
                 const fnScope = this.pushScope(scopeId, start, end, 'function');
                 // A function declared inside a class, trait or enum is a method,
                 // and belongs to that type's member scope rather than to the one
@@ -322,7 +322,7 @@ class FileAnalysis {
             case 'AST_CLASS_DECL': case 'AST_TRAIT_DECL': case 'AST_ENUM_DECL': {
                 const kind = node.kind === 'AST_CLASS_DECL' ? 'class'
                            : node.kind === 'AST_TRAIT_DECL' ? 'trait' : 'enum';
-                const at = locateName(this.text, start, end, node.name);
+                const at = this.findName(start, end, node.name);
                 // Type parameters are visible throughout the declaration, so
                 // they need a lexical scope wrapping it; the member scope, which
                 // `self.x` reaches and a bare name does not, sits inside that.
@@ -347,7 +347,7 @@ class FileAnalysis {
 
                 for (const field of node.fields || []) {
                     const fspan = this.span(field);
-                    const nameAt = locateName(this.text, fspan.start, fspan.end, field.name);
+                    const nameAt = this.findName(fspan.start, fspan.end, field.name);
                     this.addSymbol({
                         name: field.name, kind: 'field',
                         start: nameAt ? nameAt.start : fspan.start, end: nameAt ? nameAt.end : fspan.start,
@@ -366,7 +366,10 @@ class FileAnalysis {
                 for (const variant of node.variants || []) {
                     const vspan = this.span(variant);
                     const params = (variant.params || []).map(renderParam).join(', ');
-                    this.addSymbol({
+                    // A variant's payload names are its own, not the enum's:
+                    // they get a scope so that `Enum.` does not offer them.
+                    const payload = this.pushScope(outer, vspan.start, vspan.end, 'variant', false);
+                    const variantSymbol = this.addSymbol({
                         name: variant.name, kind: 'variant',
                         start: vspan.start, end: vspan.start + Buffer.byteLength(variant.name, 'utf8'),
                         fullStart: vspan.start, fullEnd: vspan.end,
@@ -374,8 +377,22 @@ class FileAnalysis {
                         doc: this.docAbove(vspan.start),
                         scope: members, container: symbol.index,
                         params: variant.params || [],
+                        members: payload,
                     });
-                    for (const param of variant.params || []) recurse(param.type, outer, symbol.index);
+                    this.scopes[payload].owner = variantSymbol.index;
+
+                    for (const param of variant.params || []) {
+                        const pspan = this.span(param);
+                        this.addSymbol({
+                            name: param.name, kind: 'field',
+                            start: pspan.start, end: pspan.start + Buffer.byteLength(param.name, 'utf8'),
+                            fullStart: pspan.start, fullEnd: pspan.end,
+                            detail: renderParam(param), doc: null,
+                            scope: payload, container: variantSymbol.index,
+                            declaredType: renderType(param.type),
+                        });
+                        recurse(param.type, outer, symbol.index);
+                    }
                 }
 
                 recurse(node.superclass, outer, container);
@@ -388,17 +405,21 @@ class FileAnalysis {
             }
 
             case 'AST_TYPE_DECL': {
-                const at = locateName(this.text, start, end, node.name);
-                this.addSymbol({
+                const at = this.findName(start, end, node.name);
+                // `type Comparator[T] = fn(T, T) -> int` binds T over the alias.
+                const aliasScope = (node.generics || []).length
+                    ? this.pushScope(scopeId, start, end, 'generics') : scopeId;
+                const alias = this.addSymbol({
                     name: node.name, kind: 'typealias',
                     start: at ? at.start : start, end: at ? at.end : start,
                     fullStart: start, fullEnd: end,
-                    detail: `type ${node.name} = ${renderType(node.aliased) || '…'}`,
+                    detail: `type ${node.name}${renderGenerics(node.generics)} = ${renderType(node.aliased) || '…'}`,
                     doc: this.docAbove(start),
                     scope: scopeId, container: container ?? null,
                     visibility: VISIBILITY[node.visibility] || null,
                 });
-                return recurse(node.aliased);
+                this.declareGenerics(node.generics, aliasScope, alias.index);
+                return recurse(node.aliased, aliasScope);
             }
 
             case 'AST_VAR_DECL': {
@@ -484,8 +505,8 @@ class FileAnalysis {
                     if (clause.name) {
                         const anchor = clause.types && clause.types.length
                             ? this.span(clause.types[0]).start : bodySpan.start;
-                        const at = locateName(this.text, Math.max(0, anchor - 64), anchor, clause.name)
-                                || locateName(this.text, Math.max(0, bodySpan.start - 64), bodySpan.start, clause.name);
+                        const at = this.findName(Math.max(0, anchor - 64), anchor, clause.name)
+                                || this.findName(Math.max(0, bodySpan.start - 64), bodySpan.start, clause.name);
                         this.addSymbol({
                             name: clause.name, kind: 'variable',
                             start: at ? at.start : bodySpan.start, end: at ? at.end : bodySpan.start,
@@ -503,7 +524,7 @@ class FileAnalysis {
 
             case 'AST_IMPORT': {
                 const bound = node.alias || node.path.split('.').filter(Boolean).pop();
-                const at = locateName(this.text, start, end, bound);
+                const at = this.findName(start, end, bound);
                 const symbol = this.addSymbol({
                     name: bound, kind: 'module',
                     start: at ? at.start : start, end: at ? at.end : start,
@@ -522,7 +543,7 @@ class FileAnalysis {
                 for (const item of node.items || []) {
                     const ispan = this.span(item);
                     const bound = item.alias || item.name;
-                    const at = item.alias ? locateName(this.text, ispan.start, ispan.end + 32, item.alias) : null;
+                    const at = item.alias ? this.findName(ispan.start, ispan.end + 32, item.alias) : null;
                     const symbol = this.addSymbol({
                         name: bound, kind: 'import',
                         start: at ? at.start : ispan.start,
@@ -546,6 +567,19 @@ class FileAnalysis {
                 }
             }
         }
+    }
+
+    /**
+     * Locate a declared name inside a byte range, in byte offsets.
+     *
+     * Spans from the compiler are byte offsets and `this.text` is a JS string,
+     * so the two only agree while a file stays ASCII. One em dash in a doc
+     * comment shifts every later span, and a name searched for in the wrong
+     * window is simply not found.
+     */
+    findName(fromByte, toByte, name) {
+        const at = locateName(this.text, this.offsets.char(fromByte), this.offsets.char(toByte), name);
+        return at ? { start: this.offsets.byte(at.start), end: this.offsets.byte(at.end) } : null;
     }
 
     declareGenerics(generics, scopeId, container) {
@@ -604,6 +638,18 @@ class FileAnalysis {
                         scope: scopeFor(start), node: child,
                     });
                     break;
+                case 'AST_CALL':
+                    // `greet(name: "Ada")` — the label is not a node of its own,
+                    // but it starts the argument's span.
+                    for (const arg of child.args || []) {
+                        if (!arg.name || !arg.span) continue;
+                        this.refs.push({
+                            name: arg.name, kind: 'argument', scope: scopeFor(arg.span.start),
+                            start: arg.span.start,
+                            end: arg.span.start + Buffer.byteLength(arg.name, 'utf8'),
+                        });
+                    }
+                    break;
                 case 'AST_MEMBER': case 'AST_OPT_MEMBER': {
                     const objectSpan = this.span(child.object);
                     const nameLength = Buffer.byteLength(child.name || '', 'utf8');
@@ -623,15 +669,27 @@ class FileAnalysis {
                         });
                     }
                     break;
-                case 'AST_PAT_ENUM': case 'AST_PAT_CLASS':
-                    if (child.typeName) {
-                        this.refs.push({
-                            name: child.typeName,
-                            start, end: start + Buffer.byteLength(child.typeName, 'utf8'),
-                            kind: 'type', scope: scopeFor(start), node: child,
-                        });
+                case 'AST_PAT_ENUM': case 'AST_PAT_CLASS': {
+                    if (!child.typeName) break;
+                    const typeLength = Buffer.byteLength(child.typeName, 'utf8');
+                    this.refs.push({
+                        name: child.typeName,
+                        start, end: start + typeLength,
+                        kind: 'type', scope: scopeFor(start), node: child,
+                    });
+                    // `Token.Plus => …` names the variant as well as the enum.
+                    if (child.variantName) {
+                        const at = this.findName(start + typeLength, end, child.variantName);
+                        if (at) {
+                            this.refs.push({
+                                name: child.variantName, start: at.start, end: at.end,
+                                kind: 'variant', owner: child.typeName,
+                                scope: scopeFor(start), node: child,
+                            });
+                        }
                     }
                     break;
+                }
                 default:
                     break;
             }
@@ -871,6 +929,15 @@ class Workspace {
 
         if (ref.kind === 'member') {
             return this.memberDefinition(analysis, ref, token);
+        }
+
+        // A variant in a pattern names its enum explicitly, so there is nothing
+        // to infer: `Token.Plus` is `Plus` on `Token`.
+        if (ref.kind === 'variant') {
+            const owner = await this.typeSymbol(analysis, ref.owner, token);
+            if (!owner) return null;
+            const member = owner.analysis.memberNamed(owner.symbol, ref.name);
+            return member ? { analysis: owner.analysis, symbol: member } : null;
         }
 
         const local = analysis.lookup(ref.name, ref.scope);
