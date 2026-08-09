@@ -336,7 +336,7 @@ fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
     let decl = found[0]
     if decl is null { return (u.t_any, null) }
 
-    let ty = _signature_type(c, decl)
+    let ty = _signature_type(c, decl, found[1])
     return (ty ?? u.t_any, decl)
 }
 
@@ -482,12 +482,15 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
     let found = loader.find(sig, remote)
     let decl = found[0]
     if decl is null { return }
+    # `find` answers the module that really declares the name, which under a
+    # re-export is not the one that was imported from.
+    let owner = found[1]
 
     # The declaring module's own name scope, not this one's: a signature is
     # resolved where it was written, so a type it mentions means what it meant
     # there. Anything this file cannot see falls back to `any`, which is what
     # the C does for a foreign name too.
-    let ty = _signature_type(c, decl)
+    let ty = _signature_type(c, decl, owner)
     if ty is null { return }
 
     let symbol = c.resolution.symbol_of(item)
@@ -497,15 +500,30 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
 }
 
 # The type a declaration read out of another module's signature denotes.
-fn _signature_type(c: Ctx, decl: Node) -> Type? {
+#
+# A nominal type from another module is interned under its QUALIFIED name —
+# `std.str.StringBuilder`, not `StringBuilder`. That is what keeps two modules
+# each declaring a `Node` from being one type, and a `Window` declared here
+# from being `std.gui.Window`. Interning imported classes under their bare name
+# was every disagreement in `json.jai` and `os.jai` once imports were bound:
+# the C says `std.io.File` and this said `File`, which is a different type with
+# the same spelling.
+fn _signature_type(c: Ctx, decl: Node, owner: ModuleSig?) -> Type? {
     match decl.kind {
         NodeKind.FnDecl => { return signature_of(c, decl, false) }
-        NodeKind.ClassDecl => { return named(c.universe, TyKind.Class, decl.opt_text("name")) }
-        NodeKind.TraitDecl => { return named(c.universe, TyKind.Trait, decl.opt_text("name")) }
-        NodeKind.EnumDecl => { return named(c.universe, TyKind.Enum, decl.opt_text("name")) }
+        NodeKind.ClassDecl => { return named(c.universe, TyKind.Class, _qualified(decl, owner)) }
+        NodeKind.TraitDecl => { return named(c.universe, TyKind.Trait, _qualified(decl, owner)) }
+        NodeKind.EnumDecl => { return named(c.universe, TyKind.Enum, _qualified(decl, owner)) }
         NodeKind.TypeDecl => { return resolve_ast_type(c, decl.type_field("aliased")) }
         _ => { return null }
     }
+}
+
+# The name a declaration answers to, qualified by the module it came from.
+fn _qualified(decl: Node, owner: ModuleSig?) -> str? {
+    let name = decl.opt_text("name")
+    if name is null or owner is null { return name }
+    return owner.qualify(name)
 }
 
 # Bind every `type X = ...` alias before anything resolves an annotation.
