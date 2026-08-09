@@ -1,56 +1,15 @@
-#: The sema dump: what one checker decided, in a form the other can be diffed
-#: against.
-#:
-#: `--bootstrap-verify` answers in bytecode, which is the wrong vocabulary for a
-#: type bug. It reports the first byte that differs, and the decision that was
-#: wrong is somewhere upstream of it: `OP_TYPE_GUARD vs OP_CALL` does not say
-#: which type was wrong, and a type inferred correctly but not yet used by any
-#: emission produces no bytes at all and so no signal. This module reads and
-#: writes the decisions themselves.
-#:
-#: The C writer is `src/sema/semadump.c` and the format is normative between
-#: them:
-#:
-#: ```text
-#: # jaithon sema dump v1
-#: # file lib/std/str.jai
-#: 120 128 AST_BINARY fold 5
-#: 150 161 AST_IDENT guard any->int
-#: 150 161 AST_IDENT type any
-#: ```
-#:
-#: A record is `start end kind field value`, where `start` and `end` are byte
-#: offsets into the source and `value` is the rest of the line, spaces
-#: included — `dict[str, list[int]]` is one value and not three.
-#:
-#: Records are keyed on span rather than on a node index because two
-#: independently written front ends do not allocate AST nodes in the same
-#: order. They do parse the same text into nodes covering the same byte ranges.
-#:
-#: Records are sorted before they are written, so one program always produces
-#: one file: a format whose order follows whichever order a checker happened to
-#: visit nodes in cannot be compared against a second implementation at all.
-#:
-#: ```
-#: let dump = parse_dump("# jaithon sema dump v1\n# file a.jai\n1 2 AST_IDENT type int\n")
-#: dump.source_path                      # "a.jai"
-#: dump.records.len()                    # 1
-#: dump.records[0].value                 # "int"
-#: ```
+#: What one checker decided, in a form the other can be diffed against. The C
+#: writer is `src/sema/semadump.c` and the format is normative between them. A
+#: record is `start end kind field value`, the span in BYTE offsets and `value`
+#: the rest of the line, spaces included. Records are keyed on span, not node
+#: index: two independently written front ends do not number AST nodes alike.
 from std.algo.sort import natural_order, sort_by
 from std.str import to_int
 
-#: The format version this module reads and writes.
-#:
-#: Must equal `JAI_SEMADUMP_VERSION` in `src/sema/semadump.h`. A dump with any
-#: other version is rejected rather than guessed at.
+#: Format version. Must equal `JAI_SEMADUMP_VERSION` in `src/sema/semadump.h`.
 pub const VERSION: int = 1
 
-#: The four fields a record can carry.
-#:
-#: `type` is the node's final type, `fold` the literal a constant expression
-#: folded to, `guard` a runtime check inserted at an `any -> T` boundary, and
-#: `widen` an `int -> float` conversion.
+#: The four fields: `type`, `fold`, `guard` (`any->T`), `widen` (`int->float`).
 pub let FIELDS: list[str] = ["fold", "guard", "type", "widen"]
 
 let _HEADER_VERSION: str = "# jaithon sema dump v"
@@ -79,14 +38,6 @@ pub class Record {
     }
 
     #: What identifies this decision, without saying what was decided.
-    #:
-    #: Two dumps are compared on this: same node, same question, so the values
-    #: are answers to one question and a difference between them means
-    #: something.
-    #:
-    #: ```
-    #: Record(1, 2, "AST_IDENT", "type", "int").key()   # "1 2 AST_IDENT type"
-    #: ```
     pub fn key(self) -> str {
         return f"{self.span_start} {self.span_end} {self.kind} {self.field}"
     }
@@ -115,11 +66,8 @@ pub class Dump {
     }
 }
 
-#: One decision the two checkers did not agree on.
-#:
-#: `ours` and `theirs` are null when that side had no record for this key at
-#: all, which is the shape of most mismatches while a checker is still being
-#: written: it has not made the decision yet.
+#: One decision the two checkers did not agree on. `ours` and `theirs` are null
+#: when that side had no record for this key at all.
 pub class Mismatch {
     pub let span_start: int
     pub let span_end: int
@@ -153,7 +101,6 @@ pub class Mismatch {
     }
 }
 
-#: The order records are written in: span, then kind, then field, then value.
 fn _order(a: Record, b: Record) -> int {
     if a.span_start != b.span_start { return natural_order(a.span_start, b.span_start) }
     if a.span_end != b.span_end { return natural_order(a.span_end, b.span_end) }
@@ -162,15 +109,8 @@ fn _order(a: Record, b: Record) -> int {
     return natural_order(a.value, b.value)
 }
 
-#: Read a dump.
-#:
-#: Raises `ValueError` on anything it does not understand, naming the line. A
-#: reader that skips what it cannot parse turns a format mismatch into a silent
-#: pass, which is the one outcome a differential tool must not have.
-#:
-#: ```
-#: parse_dump("# jaithon sema dump v1\n# file a.jai\n").records.len()    # 0
-#: ```
+#: Read a dump. Raises `ValueError` on anything it does not understand, naming
+#: the line. Skipping bad input would turn a format mismatch into a silent pass.
 pub fn parse_dump(text: str) -> Dump {
     let lines = text.split("\n")
     if lines.len() < 2 {
@@ -209,9 +149,7 @@ pub fn parse_dump(text: str) -> Dump {
     return Dump(source_path, records)
 }
 
-#: Write a dump, sorted, with the header the reader demands.
-#:
-#: The inverse of `parse_dump` for any dump `parse_dump` produced.
+#: Write a dump, sorted, so one program always produces one file.
 pub fn render_dump(dump: Dump) -> str {
     var lines: list[str] = [f"{_HEADER_VERSION}{VERSION}", f"{_HEADER_FILE}{dump.source_path}"]
     for record in sort_by(dump.records, _order) {
@@ -220,11 +158,8 @@ pub fn render_dump(dump: Dump) -> str {
     return "\n".join(lines) + "\n"
 }
 
-#: Every decision the two dumps do not agree on, in dump order.
-#:
-#: `ours` is the self-hosted side and `theirs` the C one, matching the operand
-#: order `compile.mod.verify` reports in and the opposite of the one
-#: `--bootstrap-verify` reports in.
+#: Every decision the two dumps do not agree on, in dump order. `ours` is the
+#: self-hosted side, `theirs` the C one — the opposite of `--bootstrap-verify`.
 pub fn diff_dumps(ours: Dump, theirs: Dump) -> list[Mismatch] {
     var mine: dict[str, str] = {}
     var other: dict[str, str] = {}

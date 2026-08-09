@@ -1,40 +1,10 @@
 #: The intern table, the primitive singletons, and the type constructors.
-#:
-#: This is where the port earns back a property the C gets for free. In the C
-#: every type lives in one arena and structural equality *is* pointer equality,
-#: so `a == b` is a machine word compare and the checker leans on it everywhere.
-#: Jaithon has no arena, so identity has to be constructed: every type goes
-#: through `Universe.intern`, which returns the existing object whenever one
-#: with the same key already exists. Skip the table and two structurally equal
-#: types become two objects, every relation over them degrades from a compare
-#: into a tree walk, and the checker's hottest path is the one that suffers.
-#:
-#: The key is `(kind, name, args, ret, fn_flags)` — exactly the C's
-#: `typeHash`/`typeMatches` pair. `decl` is deliberately **not** part of it: a
-#: named type is identified by kind and name so that a forward reference and
-#: the declaration that eventually arrives land on the same object, and the
-#: declaration is attached afterwards.
-#:
-#: `Universe` is an object rather than the C's global `gTypes`, matching
-#: `Resolution`'s idiom in `resolve.jai`. That makes the checker testable, and
-#: it deletes the C's lifetime hazard outright: there is no `jaiTypesFree` to
-#: invalidate every type the process still holds, and no lazy `ensureInit` to
-#: forget to call.
-#:
-#: ```
-#: let u = Universe()
-#: u.t_int == u.t_int                       # true
-#: list_of(u, u.t_int) == list_of(u, u.t_int)   # true, same object
-#: u.t_void == u.t_null                     # true, void is a spelling of null
-#: ```
 from jaithon.compile.check.kinds import TyKind, ordinal
 from jaithon.compile.check.ty import Type, TypeDecl
 
 #: Every type in one compilation, and the table that keeps them unique.
 pub class Universe {
-    #: Interned types in creation order; the enumeration point for tooling.
     var _all: list[Type]
-    #: Intern key to type.
     var _table: dict[str, Type]
 
     pub let t_any: Type
@@ -46,13 +16,10 @@ pub class Universe {
     pub let t_str: Type
     pub let t_bytes: Type
     pub let t_range: Type
-    #: `void` is not a tenth type. It is `null` under the name a return
-    #: position uses, which is why a sema dump records the program's own type
-    #: as `null` while a function renders `-> void`.
+    #: `void` is `null` under the name a return position uses; dumps say `null`.
     pub let t_void: Type
 
-    #: Build a universe with its primitives interned in the C's declaration
-    #: order, so their uids are 0 through 8.
+    #: Primitives are interned in the C's declaration order, so uids are 0 to 8.
     pub fn init(self) {
         self._all = []
         self._table = {}
@@ -68,12 +35,8 @@ pub class Universe {
         self.t_void = self.t_null
     }
 
-    #: The type with this key, creating it only if there is not one already.
-    #:
-    #: `decl` is applied to the answer whichever branch is taken, because a
-    #: named type interned before its declaration was visible has to pick the
-    #: declaration up when it arrives. That back-patch is the whole reason
-    #: `decl` is the one mutable field on `Type`.
+    #: The type with this key, or the existing one. `decl` is outside the key,
+    #: so a forward reference and its later declaration land on one object.
     pub fn intern(
         self,
         kind: TyKind,
@@ -83,8 +46,6 @@ pub class Universe {
         fn_flags: int = 0,
         decl: TypeDecl? = null
     ) -> Type {
-        # Every part is adopted first, so the key below is built from uids that
-        # actually identify something. See `_adopt`.
         var owned: list[Type] = []
         for argument in args { owned.push(self._adopt(argument)) }
         let owned_ret = if ret == null { null } else { self._adopt(ret) }
@@ -102,14 +63,8 @@ pub class Universe {
     }
 
     #: This universe's equivalent of `t`, interning it if it is a stranger.
-    #:
-    #: A `Type` built directly rather than through `intern` carries `uid == -1`,
-    #: and the intern key is made of uids — so two strangers of different shape
-    #: hashed to one key and the second silently became the first. That is not
-    #: a hypothetical: `list[list[str]]` came back rendering `list[set[bool]]`.
-    #: Adopting is the fix rather than rejecting, because a stranger reaches
-    #: here legitimately — a binding handed to `substitute`, a type built in a
-    #: test — and the right answer is the interned twin, not an error.
+    #: The key is made of uids and a hand-built `Type` has `uid == -1`, so
+    #: unadopted they collide: `list[list[str]]` rendered `list[set[bool]]`.
     fn _adopt(self, t: Type) -> Type {
         if t.uid >= 0 { return t }
         return self.intern(t.kind, t.name, t.args, t.ret, t.fn_flags, t.decl)
@@ -126,8 +81,6 @@ pub class Universe {
     }
 }
 
-# Args and ret are already interned, so their uids are stable identities and a
-# key built from them means exactly what the C's pointer comparison means.
 fn _intern_key(kind: TyKind, name: str?, args: list[Type], ret: Type?, fn_flags: int) -> str {
     var parts: list[str] = [f"{ordinal(kind)}", name ?? ""]
     for argument in args {
@@ -158,22 +111,13 @@ pub fn tuple_of(u: Universe, members: list[Type]) -> Type {
     return u.intern(TyKind.Tuple, null, members)
 }
 
-#: `fn(params) -> returns`.
-#:
-#: A return type that was never written means `any` (spec §6), and it is
-#: defaulted here rather than left null so that `fn(int)` and
-#: `fn(int) -> any` are one interned type. Leaving it null made them two
-#: objects that render identically, which is exactly the confusion the intern
-#: table exists to prevent.
+#: `fn(params) -> returns`. An unwritten return means `any` (spec §6) and is
+#: defaulted here, so `fn(int)` and `fn(int) -> any` are one interned type.
 pub fn fn_of(u: Universe, params: list[Type], returns: Type?, fn_flags: int = 0) -> Type {
     return u.intern(TyKind.Fn, null, params, returns ?? u.t_any, fn_flags)
 }
 
-#: A class, trait or enum type, by name.
-#:
-#: A named type with no name has no identity to intern on, and answers `any`.
-#: The caller has already reported whatever went wrong upstream, so inventing
-#: an anonymous type here would only turn one diagnostic into several.
+#: A class, trait or enum type by name; a nameless one answers `any`.
 pub fn named(u: Universe, kind: TyKind, name: str?, decl: TypeDecl? = null) -> Type {
     if name == null { return u.t_any }
     return u.intern(kind, name, [], null, 0, decl)

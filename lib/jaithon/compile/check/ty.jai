@@ -1,62 +1,30 @@
-#: The semantic type, and the declaration data a nominal type carries.
-#:
-#: Data only. Every relation over these — assignability, join, narrowing,
-#: rendering — lives in its own file, so this one can be imported from anywhere
-#: in `jaithon.compile.check` without a cycle.
-#:
-#: `Type` deliberately defines **no `__eq__` and no `__hash__`**. Two types are
-#: the same type when they are the same object, which is what the intern table
-#: in `universe.jai` exists to guarantee; the C gets the same property free from
-#: an arena. Defining structural equality here would make `a == b` quietly walk
-#: two trees, and every assignability check in the checker is a comparison, so
-#: the walk would land on the hottest path there is.
-#:
-#: It defines no `__str__` either. Rendering is `render.jai`, whose output is a
-#: byte-exact contract with the C, and a second rendering path is exactly how
-#: that contract gets lost.
+#: The semantic type, and the declaration data a nominal type carries. Data
+#: only, so this file imports from anywhere in `jaithon.compile.check` without
+#: a cycle. `Type` defines no `__eq__`, `__hash__` or `__str__`: type identity
+#: is object identity via the intern table in `universe.jai`, and rendering is
+#: `render.jai`, byte-exact against the C.
 from jaithon.ast import Node, Span
 from jaithon.compile.check.kinds import TyKind, ordinal
 
-#: One semantic type.
-#:
-#: Built only by `Universe.intern`, never directly: a `Type` that did not come
-#: from the intern table compares unequal to its own twin and breaks every
-#: relation that assumes identity.
-#:
-#: `args` and `ret` mean different things per kind, exactly as in the C:
-#:
-#: - `List`, `Set` — `args[0]` is the element
-#: - `Dict` — `args[0]` is the key, `args[1]` the value
-#: - `Tuple`, `Union` — `args` are the members
-#: - `Fn` — `args` are the parameters, `ret` the return type
-#: - `Class`, `Trait`, `Enum`, `GenericParam` — `name`, and `args` when generic
+#: One semantic type, built only by `Universe.intern`: a `Type` from anywhere
+#: else compares unequal to its twin and breaks every relation. `args` is the
+#: element for `List`/`Set`, key then value for `Dict`, `Tuple`/`Union` members,
+#: a `Fn`'s parameters with `ret` its return, or a generic's arguments.
 pub class Type {
-    #: What this type is.
     pub let kind: TyKind
     #: `ordinal(kind)`, cached because the union sort reads it per comparison.
     pub let ord: int
-    #: The identifier of a named type, null otherwise.
     pub let name: str?
-    #: Element, key/value, members or parameters, depending on `kind`.
     pub let args: list[Type]
-    #: A function's return type. Null means the function had none written.
     pub let ret: Type?
     #: `FN_VARIADIC` and `FN_KWREST`, or zero.
     pub let fn_flags: int
-    #: Position in the universe's intern order. Stable within one compilation
-    #: and useful only for debugging; identity is the object, not this.
     pub let uid: int
 
-    #: The declaration this named type resolves to, once one is visible.
-    #:
-    #: The one mutable field, and it has to be. A named type is interned by
-    #: kind and name so that a forward reference and the eventual declaration
-    #: land on the same object; the declaration is therefore attached after the
-    #: type already exists. `decl` is for that reason **not** part of the
-    #: intern key.
+    #: The declaration this named type resolves to. Named types intern by kind
+    #: and name, so `decl` is attached after interning and is not in the key.
     pub var decl: TypeDecl?
 
-    #: Intern a type. Call `Universe.intern`, not this.
     pub fn init(
         self,
         kind: TyKind,
@@ -77,27 +45,22 @@ pub class Type {
         self.decl = decl
     }
 
-    #: How many arguments this type carries.
     pub fn arg_count(self) -> int {
         return self.args.len()
     }
 
-    #: True when this type is of `kind`.
     pub fn is_kind(self, kind: TyKind) -> bool {
         return self.kind == kind
     }
 
-    #: True when this type takes part in a nominal hierarchy.
     pub fn is_named(self) -> bool {
         return self.kind == TyKind.Class or self.kind == TyKind.Trait or self.kind == TyKind.Enum
     }
 
-    #: True when the function this describes collects extra positionals.
     pub fn is_variadic(self) -> bool {
         return self.fn_flags & 1 != 0
     }
 
-    #: True when the function this describes collects keyword arguments.
     pub fn has_kwrest(self) -> bool {
         return self.fn_flags & 2 != 0
     }
@@ -168,44 +131,29 @@ pub class MemberInfo {
     }
 }
 
-#: What a class, trait or enum declaration says about itself.
-#:
-#: Lives here rather than beside the checker because the nominal relations are
-#: its primary consumer, and putting it there would make this file and that one
-#: mutually dependent — which is exactly what the C does, with `types.c`
-#: reaching into `check.h`.
+#: What a class, trait or enum declaration says about itself. It lives here and
+#: not beside the checker, which would make the two files mutually dependent.
 pub class TypeDecl {
     pub let name: str
     pub let span: Span
-    #: The declaration node, or null for a type known only by name.
     pub var node: Node?
-    #: The interned type this declares.
     pub var ty: Type?
-    #: The module this was read out of, or null when the file being checked
-    #: declares it. A `check.modsig.ModuleSig`, held as `any` because `ty.jai`
-    #: is imported from everywhere in this package and `modsig` imports the
-    #: parser: naming the class here would close a cycle for a field that only
-    #: `checker.jai` ever reads.
-    #:
-    #: `TypeDecl.origin` in `src/sema/check.h`, and it means the same thing:
-    #: every annotation inside this declaration is written in *that* module's
-    #: namespace, so laying it out has to happen with that scope installed.
+    #: The module this was read out of, null when the checked file declares it.
+    #: Held as `any` because naming `check.modsig.ModuleSig` closes an import
+    #: cycle. `TypeDecl.origin` in `src/sema/check.h`: annotations inside are
+    #: in that module's namespace, so laying it out needs that scope installed.
     pub var origin: any?
     pub var superclass: TypeDecl?
     pub var traits: list[TypeDecl]
     #: Parallel to `traits`: the arguments each was written with, so a
-    #: requirement can be substituted before it is compared against what
-    #: implements it. Empty for a non-generic trait.
+    #: requirement is substituted before comparison. Empty if non-generic.
     pub var trait_bindings: list[list[Type]]
 
-    #: Traits named in the header whose declaration this compilation unit
-    #: cannot see — they arrived through the prelude or an import as a runtime
-    #: object. Only the name is known, so a class implements one of these
-    #: exactly when it named it, and the requirements are enforced at run time.
+    #: Traits named in the header whose declaration this unit cannot see: a
+    #: class implements one by naming it, and requirements hold at run time.
     pub var opaque_traits: list[str]
-    #: The superclass named in the header when its declaration is not visible
-    #: either. Without it a subclass of an imported class looks like a class
-    #: with no parent and every inherited member reads as undefined.
+    #: Likewise for the superclass. Without it a subclass of an imported class
+    #: looks parentless and every inherited member reads as undefined.
     pub var opaque_super: str?
 
     pub var fields: list[FieldInfo]
@@ -214,7 +162,6 @@ pub class TypeDecl {
     pub var is_trait: bool
     pub var is_enum: bool
     pub var is_abstract: bool
-    #: How many variants an enum declares; zero otherwise.
     pub var variant_count: int
 
     pub fn init(self, name: str, span: Span, node: Node? = null) {
@@ -236,7 +183,6 @@ pub class TypeDecl {
         self.variant_count = 0
     }
 
-    #: The field called `name`, or null.
     pub fn find_field(self, name: str) -> FieldInfo? {
         for field in self.fields {
             if field.name == name { return field }
@@ -244,7 +190,6 @@ pub class TypeDecl {
         return null
     }
 
-    #: The member called `name`, or null.
     pub fn find_member(self, name: str) -> MemberInfo? {
         for member in self.members {
             if member.name == name { return member }
