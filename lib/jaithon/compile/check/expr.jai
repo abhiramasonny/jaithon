@@ -291,6 +291,10 @@ pub class Ctx {
     # `id(TypeDecl)` of everything in `decl_order`, so registering twice is a
     # lookup rather than a scan of the list.
     var decl_seen: set[int]
+    # `id(TypeDecl)` to the name it answers to here, when an import renamed it.
+    # `DeclEntry.alias` in the C, and it is only ever an entry that differs from
+    # `TypeDecl.name`.
+    var decl_aliases: dict[int, str]
     # id(Symbol) -> the declaration node another module holds for it. The C's
     # `Symbol.importedDecl`; a Jaithon `Symbol` has no such field.
     var imported_decls: dict[int, Node]
@@ -419,6 +423,7 @@ pub class Ctx {
         self.decls_by_node = {}
         self.decl_order = []
         self.decl_seen = set()
+        self.decl_aliases = {}
         self.imported_decls = {}
         self.resolved_types = {}
         self.sig_loader = null
@@ -503,7 +508,10 @@ pub class Ctx {
         let name = binding ?? decl.name
         # A name this file already declares wins: the resolver has its own word
         # for a genuine clash (E0302) and this is not the place for a second.
-        if visible and name not in self.decls_by_name { self.decls_by_name[name] = decl }
+        if visible and name not in self.decls_by_name {
+            self.decls_by_name[name] = decl
+            if name != decl.name { self.decl_aliases[id(decl)] = name }
+        }
         let node = decl.node
         if node is not null and id(node) not in self.decls_by_node {
             self.decls_by_node[id(node)] = decl
@@ -533,6 +541,20 @@ pub class Ctx {
     #: and the caller's loop has to see the entries that appear behind it.
     pub fn all_decls(self) -> list[TypeDecl] {
         return self.decl_order
+    }
+
+    #: The name `t` is bound to in this file, or null when nothing binds it.
+    #:
+    #: `jaiTypeDeclBindingName`, and it exists for one caller: a runtime type
+    #: guard names a class the way the *module's globals* name it, which is the
+    #: bare name for a class declared here and the alias for one imported as
+    #: something else — never the qualified name the type is interned under.
+    pub fn binding_name(self, t: Type?) -> str? {
+        if t is null or not t.is_named() { return null }
+        for declared in self.decl_order {
+            if declared.ty == t { return self.decl_aliases.get(id(declared), declared.name) }
+        }
+        return null
     }
 
     #: Every enum declaration a bare name reaches here, by that name.
@@ -1230,8 +1252,11 @@ fn _mentions_generic_param(t: Type?) -> bool {
 #:
 #: A class, trait or enum answers its *bare* binding name rather than the
 #: qualified one it is interned under, because the VM resolves this operand
-#: against the module's globals and the binding there is the bare name.
-pub fn runtime_type_name(t: Type?) -> str? {
+#: against the module's globals and the binding there is the bare name — or the
+#: alias it was imported under, which is why `c` is asked before the name is
+#: taken apart. `jaiTypeDeclBindingName` reads the registry the same way and
+#: falls back to the last dotted component for a type no entry holds.
+pub fn runtime_type_name(c: Ctx?, t: Type?) -> str? {
     if t is null { return "any" }
     match t.kind {
         TyKind.Any => { return "any" }
@@ -1255,13 +1280,18 @@ pub fn runtime_type_name(t: Type?) -> str? {
         # caller emits a tuple of the members' names instead; `_guard_target`
         # below builds the shape that carries that.
         TyKind.Union => { return null }
-        _ => { return _binding_name(t) }
+        _ => { return _binding_name(c, t) }
     }
 }
 
-# The bare name a nominal type is bound to here, dropping the module
-# qualification it is interned under.
-fn _binding_name(t: Type) -> str {
+# The name a nominal type answers to in the file being checked: what the
+# registry says it is bound as, and otherwise the qualified name's last
+# component.
+fn _binding_name(c: Ctx?, t: Type) -> str {
+    if c is not null {
+        let bound = c.binding_name(t)
+        if bound is not null { return bound }
+    }
     let name = t.name
     if name is null { return "any" }
     let cut = name.rfind(".")
@@ -1280,15 +1310,15 @@ pub const MAX_UNION_GUARD: int = 32
 # A plain name for anything with a single runtime type; a `Union` type
 # expression holding one name per member when the target is a union, which the
 # emitter turns into the tuple constant the C emits.
-fn _guard_target(to: Type) -> TypeExpr {
-    let name = runtime_type_name(to)
+fn _guard_target(c: Ctx, to: Type) -> TypeExpr {
+    let name = runtime_type_name(c, to)
     if name is not null { return TypeExpr.named(name) }
     if to.arg_count() > MAX_UNION_GUARD { return TypeExpr.named("any") }
 
     var members: list[TypeExpr] = []
     for member in to.args {
         # Unions are flattened, so a member is never itself a union.
-        members.push(TypeExpr.named(runtime_type_name(member) ?? "any"))
+        members.push(TypeExpr.named(runtime_type_name(c, member) ?? "any"))
     }
     return TypeExpr(SynKind.Union, null, members)
 }
@@ -1327,7 +1357,7 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     # context rather than the tree.
     let cast = Node(
         NodeKind.Cast,
-        {"operand": inner, "target": _guard_target(to), "widen": widen},
+        {"operand": inner, "target": _guard_target(c, to), "widen": widen},
         node.span
     )
     node.kind = cast.kind
