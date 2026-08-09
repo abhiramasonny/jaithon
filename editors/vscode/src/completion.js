@@ -79,11 +79,18 @@ function chainStart(line, end) {
     return index;
 }
 
-/** The open paren of the call the cursor sits inside, with its argument index. */
+/**
+ * The open paren of the call the cursor sits inside, with its argument index.
+ * Bounded, because a cursor that is inside no call at all would otherwise scan
+ * the whole file on every keystroke.
+ */
+const CALL_SCAN_LIMIT = 8192;
+
 function enclosingCall(text, offset) {
     let depth = 0;
     let commas = 0;
-    for (let index = offset - 1; index >= 0; index--) {
+    const stop = Math.max(0, offset - CALL_SCAN_LIMIT);
+    for (let index = offset - 1; index >= stop; index--) {
         const ch = text[index];
         if (ch === ')' || ch === ']' || ch === '}') { depth++; continue; }
         if (ch === '(' && depth === 0) return { open: index, argument: commas };
@@ -269,8 +276,24 @@ function scopeCompletions(analysis, offset) {
 
     // Inside a method, `self.` is how you reach a field; offer the members too.
     const enclosing = analysis.enclosing(offset);
-    if (enclosing && enclosing.container !== null) {
-        const owner = analysis.symbols[enclosing.container];
+    const container = enclosing && enclosing.container !== null
+        ? analysis.symbols[enclosing.container] : null;
+
+    // Directly inside a class body, the useful thing to write next is usually
+    // one of the methods that gives the class its behaviour under an operator.
+    if (enclosing && enclosing.members !== undefined) {
+        for (const name of builtins.DUNDERS) {
+            if (analysis.memberNamed(enclosing, name)) continue;
+            const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Method);
+            item.detail = 'operator method';
+            item.insertText = new vscode.SnippetString(`fn ${name}(self${name === '__init__' ? ', $1' : ''}) {\n    $0\n}`);
+            item.sortText = `4${name}`;
+            out.push(item);
+        }
+    }
+
+    if (container) {
+        const owner = container;
         for (const member of analysis.membersOf(owner)) {
             if (seen.has(`self.${member.name}`)) continue;
             seen.add(`self.${member.name}`);

@@ -12,9 +12,9 @@
     { "include": "#keywords" },
     { "include": "#constants" },
     { "include": "#lambda" },
-    { "include": "#calls" },
     { "include": "#named-arguments" },
     { "include": "#types" },
+    { "include": "#calls" },
     { "include": "#operators" },
     { "include": "#punctuation" },
     { "include": "#identifiers" }
@@ -265,13 +265,24 @@
           ]
         },
         {
-          "match": "\\b(let|var|const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
+          "comment": "let/var/const, and the class fields written the same way.",
+          "begin": "\\b(let|var|const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "end": "(?=[=,;)\\]}]|$)",
+          "beginCaptures": {
             "1": { "name": "storage.type.jaithon" },
             "2": { "name": "variable.other.declaration.jaithon" }
-          }
+          },
+          "patterns": [{ "include": "#declared-type" }]
         }
       ]
+    },
+
+    "declared-type": {
+      "comment": "The colon that introduces a type, never the one in a dict entry, a named argument or a loop label.",
+      "begin": "(:)(?=\\s*(?:\\.\\.\\.)?\\s*[A-Za-z_(\\[])",
+      "end": "(?=[,)\\]}={]|$)",
+      "beginCaptures": { "1": { "name": "punctuation.separator.annotation.jaithon" } },
+      "patterns": [{ "include": "#type-expression" }]
     },
 
     "generic-parameters": {
@@ -298,37 +309,43 @@
           "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[:,)])",
           "captures": { "1": { "name": "variable.parameter.jaithon" } }
         },
-        { "include": "#annotations" },
+        { "include": "#declared-type" },
         { "include": "#strings" },
         { "include": "#numbers" },
         { "include": "#constants" },
         { "include": "#operators" },
-        { "include": "#punctuation" }
+        { "include": "#punctuation" },
+        { "include": "#identifiers" }
       ]
     },
 
     "annotations": {
-      "patterns": [
-        {
-          "comment": "The return type of a function.",
-          "begin": "(->)",
-          "end": "(?=[{,)\\]]|$)",
-          "beginCaptures": { "1": { "name": "keyword.operator.arrow.jaithon" } },
-          "patterns": [{ "include": "#type-expression" }]
-        },
-        {
-          "comment": "A declared type, which is always introduced by a colon.",
-          "begin": "(?<=[A-Za-z0-9_\\]])\\s*(:)(?=\\s*(?:\\.\\.\\.)?\\s*[A-Za-z_(])",
-          "end": "(?=[,)\\]}={\\n]|$)",
-          "beginCaptures": { "1": { "name": "punctuation.separator.annotation.jaithon" } },
-          "patterns": [{ "include": "#type-expression" }]
-        }
-      ]
+      "comment": "A return type, which is the one annotation that needs no enclosing context to recognise. Generic brackets nest, so `]` only ends it at the top level.",
+      "begin": "(->)",
+      "end": "(?=[{,)\\]=]|$)",
+      "beginCaptures": { "1": { "name": "keyword.operator.arrow.jaithon" } },
+      "patterns": [{ "include": "#type-expression" }]
     },
 
     "type-expression": {
       "patterns": [
         { "include": "#comments" },
+        {
+          "comment": "Nested so that the comma in `dict[str, int]` does not end the annotation.",
+          "begin": "\\[",
+          "end": "\\]",
+          "beginCaptures": { "0": { "name": "punctuation.definition.generic.begin.jaithon" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.generic.end.jaithon" } },
+          "patterns": [{ "include": "#type-expression" }]
+        },
+        {
+          "comment": "The parameter list of a `fn` type, for the same reason.",
+          "begin": "\\(",
+          "end": "\\)",
+          "beginCaptures": { "0": { "name": "punctuation.section.parens.jaithon" } },
+          "endCaptures": { "0": { "name": "punctuation.section.parens.jaithon" } },
+          "patterns": [{ "include": "#type-expression" }]
+        },
         { "name": "support.type.primitive.jaithon", "match": "\\b(int|float|bool|str|bytes|any|void|never|list|dict|set|tuple|range)\\b" },
         { "name": "storage.type.function.jaithon", "match": "\\bfn\\b" },
         { "name": "support.class.error.jaithon", "match": "\\b(Error|AssertionError|ArithmeticError|DivisionByZeroError|OverflowError|LookupError|IndexError|KeyError|NameError|TypeError|ValueError|ParseError|AttributeError|IOError|FileNotFoundError|PermissionError|OSError|RuntimeError|RecursionError|StopIteration|ImportError)\\b" },
@@ -361,7 +378,7 @@
         { "name": "constant.language.boolean.jaithon", "match": "\\b(true|false)\\b" },
         { "name": "constant.language.null.jaithon", "match": "\\bnull\\b" },
         { "name": "variable.language.wildcard.jaithon", "match": "\\b_\\b" },
-        { "name": "variable.other.constant.jaithon", "match": "\\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\\b" }
+        { "name": "variable.other.constant.jaithon", "match": "\\b[A-Z][A-Z0-9_]{2,}\\b" }
       ]
     },
 
@@ -408,7 +425,8 @@
           }
         },
         {
-          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[\\[(])",
+          "comment": "Only a paren makes a call; a bracket is an index.",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
           "captures": { "1": { "name": "entity.name.function.call.jaithon" } }
         }
       ]
@@ -432,16 +450,18 @@
     },
 
     "operators": {
+      "comment": "Longest first: a bare `=` would otherwise take the head of `=>`.",
       "patterns": [
-        { "name": "keyword.operator.assignment.jaithon", "match": "(\\*\\*=|//=|<<=|>>=|[+\\-*/%&|^]=|=)(?!=)" },
-        { "name": "keyword.operator.comparison.jaithon", "match": "(==|!=|<=|>=|<|>)" },
+        { "name": "keyword.operator.arrow.jaithon", "match": "(->|=>)" },
+        { "name": "keyword.operator.spread.jaithon", "match": "\\.\\.\\." },
+        { "name": "keyword.operator.range.jaithon", "match": "(\\.\\.=|\\.\\.)" },
+        { "name": "keyword.operator.coalesce.jaithon", "match": "(\\?\\?|\\?\\.)" },
+        { "name": "keyword.operator.comparison.jaithon", "match": "(==|!=|<=|>=)" },
+        { "name": "keyword.operator.assignment.jaithon", "match": "(\\*\\*=|//=|<<=|>>=|[+\\-*/%&|^]=|=)(?![=>])" },
         { "name": "keyword.operator.arithmetic.jaithon", "match": "(\\*\\*|//|[+\\-*/%@])" },
         { "name": "keyword.operator.bitwise.jaithon", "match": "(<<|>>|[&|^~])" },
-        { "name": "keyword.operator.range.jaithon", "match": "(\\.\\.=|\\.\\.)" },
-        { "name": "keyword.operator.arrow.jaithon", "match": "(->|=>)" },
-        { "name": "keyword.operator.coalesce.jaithon", "match": "(\\?\\?|\\?\\.)" },
-        { "name": "keyword.operator.optional.jaithon", "match": "\\?" },
-        { "name": "keyword.operator.spread.jaithon", "match": "\\.\\.\\." }
+        { "name": "keyword.operator.comparison.jaithon", "match": "[<>]" },
+        { "name": "keyword.operator.optional.jaithon", "match": "\\?" }
       ]
     },
 

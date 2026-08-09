@@ -51,6 +51,11 @@ function binary(document) {
 
 let missingBinaryReported = false;
 
+/** After the path setting changes, the complaint is worth making again. */
+function resetBinaryWarning() {
+    missingBinaryReported = false;
+}
+
 function reportMissingBinary(document) {
     if (missingBinaryReported) return;
     missingBinaryReported = true;
@@ -260,7 +265,7 @@ async function version(document) {
 }
 
 module.exports = {
-    config, workspaceDir, binary, run, reportMissingBinary,
+    config, workspaceDir, binary, run, resetBinaryWarning,
     searchPath, includeArgs, resolveModule,
     snapshot, cleanup, version,
 };

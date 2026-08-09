@@ -980,8 +980,4 @@ class Workspace {
     }
 }
 
-module.exports = {
-    Workspace, FileAnalysis, Offsets,
-    renderType, signatureOf, walk, locateName,
-    baseTypeName, splitTypeName, moduleOfType, escapeRegExp,
-};
+module.exports = { Workspace, walk, baseTypeName, moduleOfType };
