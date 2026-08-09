@@ -579,7 +579,16 @@ pub class Chunk {
         let offset = self.here()
         if span != null and span.is_known() {
             let rows = self.lines.len()
-            if rows == 0 or self.lines[rows - 1].span_start != span.start {
+            # Both ends, not just the start. The C's recordSpan (src/vm/chunk.c)
+            # collapses a run only when `span` and `spanEnd` both match, so two
+            # consecutive instructions sharing a start but ending at different
+            # points are two rows there and were one row here -- which is why
+            # the self-hosted image carried a shorter line table than the C's
+            # for the same source.
+            let same = rows > 0 and
+                self.lines[rows - 1].span_start == span.start and
+                self.lines[rows - 1].span_end == span.end
+            if not same {
                 self.lines.push(LineEntry(offset, span.start, span.end))
             }
         }
@@ -1139,23 +1148,23 @@ pub class Emitter {
             let symbol = self.resolution.symbol_of(pattern)
             if symbol == null or symbol.kind == SymbolKind.Global {
                 let name = if symbol == null { pattern.text("name") } else { symbol.name }
-                self._op_k(Op.DefGlobal, self._string(name), pattern.span)
+                self._op_k(Op.DefGlobal, self._string(name), span)
             } elif symbol.kind == SymbolKind.Upvalue {
-                self._op_u8(Op.SetUpvalue, symbol.slot, pattern.span)
-                self._op(Op.Pop, pattern.span)
+                self._op_u8(Op.SetUpvalue, symbol.slot, span)
+                self._op(Op.Pop, span)
             } else {
-                self._op_u16(Op.Bind, symbol.slot, pattern.span)
+                self._op_u16(Op.Bind, symbol.slot, span)
             }
         } elif kind == NodeKind.PatTuple or kind == NodeKind.PatList {
             let elements = pattern.child_list("elems")
             let rest = pattern.number("restIndex")
-            self._chunk().write_op(Op.Unpack, pattern.span)
+            self._chunk().write_op(Op.Unpack, span)
             self._chunk().write_byte(elements.len())
             self._chunk().write_byte(if rest < 0 { 255 } else { rest })
             self._adjust(elements.len() - 1)
             # UNPACK pushes right to left, so element 0 is on top and binding in
             # source order consumes them in the order they were written.
-            for element in elements { self._bind_pattern(element, pattern.span) }
+            for element in elements { self._bind_pattern(element, span) }
         } else {
             self._unsupported(pattern.span, "this pattern in a binding position")
             self._op(Op.Pop, span)
