@@ -17,7 +17,6 @@
 #include "runtime.h"
 
 #include "../sema/resolve.h"
-#include "../sema/types.h"
 #include "../vm/gc.h"
 
 /* ------------------------------------------------------------------ */
