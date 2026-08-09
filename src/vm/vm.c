@@ -938,24 +938,13 @@ static bool evalDefaultThunk(ObjClosure *closure, uint32_t codeOffset,
 
 /* Turn `argc` positional arguments sitting above the callee slot into a fully
  * populated frame window. Returns false with an exception pending. */
-static bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) {
+/* Everything the fast path in bindCallArgs below could not handle: a wrong
+ * argument count, a variadic tail, a default to evaluate, a keyword-rest dict.
+ * Out of line on purpose — it is large, mostly diagnostics, and inlining it
+ * was what stopped clang inlining the fast path with it. */
+static bool bindCallArgsSlow(ObjClosure *closure, int argc, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     int arity = (int)fn->arity;
-
-    /* Fixed arity, fully applied — every call in a hot loop. Nothing below
-     * applies: the arity checks cannot fire, there is no variadic tail to
-     * pack, no default to evaluate and no keyword-rest dict to make, so all
-     * that is left is clearing the frame's window. */
-    if (JAI_LIKELY(argc == arity && fn->defaultCount == 0 &&
-                   (fn->flags & (FN_VARIADIC | FN_KWREST)) == 0)) {
-        int window = (int)fn->maxSlots > 1 + arity ? (int)fn->maxSlots : 1 + arity;
-        if (!ensureRoom(slotBase, window + JAI_FRAME_SLACK)) return false;
-        /* The collector scans the whole window as soon as stackTop is above
-         * it, so no slot may be left holding whatever the last frame did. */
-        for (int i = 1 + argc; i < window; i++) slotBase[i] = NULL_VAL;
-        vm.stackTop = slotBase + window;
-        return true;
-    }
 
     bool variadic = (fn->flags & FN_VARIADIC) != 0;
     int required = arity - (int)fn->defaultCount;
@@ -1019,6 +1008,32 @@ static bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) {
     }
     vm.stackTop = slotBase + window;
     return true;
+}
+
+/* Fixed arity, fully applied — every call in a hot loop. Nothing the slow path
+ * does applies: the arity checks cannot fire, there is no variadic tail to
+ * pack, no default to evaluate and no keyword-rest dict to make, so all that is
+ * left is clearing the frame's window.
+ *
+ * Inline because this runs 49.8M times in one `check lib/std` and the work it
+ * does is a branch and ~3.6 stores. As one function with the slow path it was
+ * too big for clang to inline and showed up in the profile as its own symbol,
+ * paying call overhead per call to do almost nothing. */
+static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) {
+    ObjFunction *fn = closure->fn;
+    int arity = (int)fn->arity;
+
+    if (JAI_LIKELY(argc == arity && fn->defaultCount == 0 &&
+                   (fn->flags & (FN_VARIADIC | FN_KWREST)) == 0)) {
+        int window = (int)fn->maxSlots > 1 + arity ? (int)fn->maxSlots : 1 + arity;
+        if (!ensureRoom(slotBase, window + JAI_FRAME_SLACK)) return false;
+        /* The collector scans the whole window as soon as stackTop is above
+         * it, so no slot may be left holding whatever the last frame did. */
+        for (int i = 1 + argc; i < window; i++) slotBase[i] = NULL_VAL;
+        vm.stackTop = slotBase + window;
+        return true;
+    }
+    return bindCallArgsSlow(closure, argc, slotBase);
 }
 
 static bool callClosure(ObjClosure *closure, int argc) {
