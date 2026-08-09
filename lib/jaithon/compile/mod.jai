@@ -208,7 +208,7 @@ fn _wrap_echo(stmt: Node, helper: str) -> Node {
         NodeKind.Call,
         {
             "callee": Node(NodeKind.Ident, {"name": helper}, span),
-            "args": [{"name": null, "value": expr, "isSpread": false, "span": span}]
+            "args": [{"name": null, "value": expr, "isSpread": false, "span": span}],
         },
         span
     )
@@ -239,17 +239,18 @@ pub fn compile_repl(
     opt_level: int = 2,
     echo: str = "",
     whole_file: bool = false,
+    record: bool = true,
+    source_dir: str = "",
+    strict: bool = false
+) -> Compiled {
     # `:disasm` compiles an input and never runs it, so what it declares is not
     # the session's.
-    record: bool = true,
+
     # The directory imports resolve against. A prompt input's path is a label
     # like `<repl:4>`, which names no directory, so `from m import T` finds
     # nothing and `T` is not a type the next line can name. The label stays the
     # label -- it is what diagnostics and tracebacks say -- and this is only
     # where the search starts.
-    source_dir: str = "",
-    strict: bool = false
-) -> Compiled {
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
 
@@ -278,8 +279,14 @@ pub fn compile_repl(
     let universe = Universe()
     let search_from = if source_dir == "" { path } else { f"{source_dir}/{path}" }
     let checked = check_program(
-        universe, program, resolution, bag, opt_level > 0, search_from,
-        session.type_names(universe), strict
+        universe,
+        program,
+        resolution,
+        bag,
+        opt_level > 0,
+        search_from,
+        session.type_names(universe),
+        strict
     )
     result.types = checked
 

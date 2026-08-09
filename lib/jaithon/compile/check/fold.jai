@@ -142,11 +142,7 @@ pub fn const_eval(
 #: The node keeps its span; its kind and whole field set are replaced. Answers
 #: null, changing nothing, for `none`. The `dump` record is appended *before*
 #: the rewrite because the node's own kind is half of it.
-pub fn const_replace(
-    u: Universe,
-    node: Node,
-    value: ConstValue
-) -> Type? {
+pub fn const_replace(u: Universe, node: Node, value: ConstValue) -> Type? {
     if value.is_none() { return null }
 
     match value.kind {
