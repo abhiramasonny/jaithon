@@ -83,16 +83,36 @@ pub class Universe {
         fn_flags: int = 0,
         decl: TypeDecl? = null
     ) -> Type {
-        let key = _intern_key(kind, name, args, ret, fn_flags)
+        # Every part is adopted first, so the key below is built from uids that
+        # actually identify something. See `_adopt`.
+        var owned: list[Type] = []
+        for argument in args { owned.push(self._adopt(argument)) }
+        let owned_ret = if ret == null { null } else { self._adopt(ret) }
+
+        let key = _intern_key(kind, name, owned, owned_ret, fn_flags)
         if key in self._table {
             let found = self._table[key]
             if decl != null { found.decl = decl }
             return found
         }
-        let built = Type(kind, name, args, ret, fn_flags, self._all.len(), decl)
+        let built = Type(kind, name, owned, owned_ret, fn_flags, self._all.len(), decl)
         self._table[key] = built
         self._all.push(built)
         return built
+    }
+
+    #: This universe's equivalent of `t`, interning it if it is a stranger.
+    #:
+    #: A `Type` built directly rather than through `intern` carries `uid == -1`,
+    #: and the intern key is made of uids — so two strangers of different shape
+    #: hashed to one key and the second silently became the first. That is not
+    #: a hypothetical: `list[list[str]]` came back rendering `list[set[bool]]`.
+    #: Adopting is the fix rather than rejecting, because a stranger reaches
+    #: here legitimately — a binding handed to `substitute`, a type built in a
+    #: test — and the right answer is the interned twin, not an error.
+    fn _adopt(self, t: Type) -> Type {
+        if t.uid >= 0 { return t }
+        return self.intern(t.kind, t.name, t.args, t.ret, t.fn_flags, t.decl)
     }
 
     #: Every interned type, in creation order.
@@ -140,21 +160,28 @@ pub fn tuple_of(u: Universe, members: list[Type]) -> Type {
 
 #: `fn(params) -> returns`.
 #:
-#: A null `returns` is kept null rather than defaulted: it means no return type
-#: was written, which renders `-> any`, and that is not the same as a written
-#: `-> void`.
+#: A return type that was never written means `any` (spec §6), and it is
+#: defaulted here rather than left null so that `fn(int)` and
+#: `fn(int) -> any` are one interned type. Leaving it null made them two
+#: objects that render identically, which is exactly the confusion the intern
+#: table exists to prevent.
 pub fn fn_of(u: Universe, params: list[Type], returns: Type?, fn_flags: int = 0) -> Type {
-    return u.intern(TyKind.Fn, null, params, returns, fn_flags)
+    return u.intern(TyKind.Fn, null, params, returns ?? u.t_any, fn_flags)
 }
 
 #: A class, trait or enum type, by name.
+#:
+#: A named type with no name has no identity to intern on, and answers `any`.
+#: The caller has already reported whatever went wrong upstream, so inventing
+#: an anonymous type here would only turn one diagnostic into several.
 pub fn named(u: Universe, kind: TyKind, name: str?, decl: TypeDecl? = null) -> Type {
+    if name == null { return u.t_any }
     return u.intern(kind, name, [], null, 0, decl)
 }
 
 #: `T` inside a generic declaration.
 pub fn generic_param(u: Universe, name: str?) -> Type {
-    return u.intern(TyKind.GenericParam, name)
+    return named(u, TyKind.GenericParam, name)
 }
 
 #: A generic instantiation such as `Box[int]`.

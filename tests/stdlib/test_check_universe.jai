@@ -152,6 +152,42 @@ fn test_containers_already_in_ordinal_order_are_left_alone() -> void {
     assert_eq(render(union_of(u, members)), "list[int] | dict[str, int] | set[int]")
 }
 
+fn test_a_type_the_universe_never_interned_is_adopted() -> void {
+    # The intern key is built from uids, and a Type built directly rather than
+    # through `intern` carries uid -1. Two such strangers of different shape
+    # therefore hashed to one key and the second silently became the first:
+    # `list[list[str]]` came back rendering `list[set[bool]]`. Adopting them
+    # into the universe first is what makes the key identify something.
+    let u = Universe()
+    let stranger_a = Type(TyKind.Set, null, [Type(TyKind.Bool)])
+    let stranger_b = Type(TyKind.List, null, [Type(TyKind.Str)])
+    let wrapped_a = list_of(u, stranger_a)
+    let wrapped_b = list_of(u, stranger_b)
+
+    assert_eq(render(wrapped_a), "list[set[bool]]")
+    assert_eq(render(wrapped_b), "list[list[str]]")
+    assert_false(wrapped_a == wrapped_b)
+    # And an adopted stranger is the same object as its interned twin.
+    assert_true(wrapped_b == list_of(u, list_of(u, u.t_str)))
+}
+
+fn test_a_function_with_no_written_return_is_the_any_returning_one() -> void {
+    # `jaiTypeFn` defaults a null return to `any` (spec §6), so the two
+    # spellings are one interned type. Left null they were two objects that
+    # rendered identically, which is the confusion interning exists to stop.
+    let u = Universe()
+    assert_true(fn_of(u, [u.t_int], null) == fn_of(u, [u.t_int], u.t_any))
+    assert_eq(render(fn_of(u, [u.t_int], null)), "fn(int) -> any")
+}
+
+fn test_a_named_type_with_no_name_is_any() -> void {
+    # A named type without a name has no identity to intern on, and whatever
+    # went wrong was already reported upstream.
+    let u = Universe()
+    assert_true(named(u, TyKind.Class, null) == u.t_any)
+    assert_true(generic_param(u, null) == u.t_any)
+}
+
 fn test_compare_is_a_total_order_on_the_primitives() -> void {
     let u = Universe()
     assert_true(compare_types(u.t_bool, u.t_int) < 0)
