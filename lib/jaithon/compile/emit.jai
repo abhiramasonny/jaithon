@@ -6,32 +6,12 @@
 #: position of the variant in this enum. Operand widths come from the same
 #: table and are re-exported so that a disassembler needs nothing else.
 #:
-#: The lowering rules the rest of the compiler relies on, in one place:
-#:
-#: - Values are pushed and popped; *bindings* live in frame slots and are
-#:   written with `SET_LOCAL`/`BIND`, never by leaving them on the stack. A
-#:   statement therefore has a net stack effect of zero and an expression of
-#:   exactly one.
-#: - A module-level binding is a global: `DEF_GLOBAL`. Anything else is a slot.
-#: - Every pattern opcode (`MATCH_CONST`, `MATCH_TYPE`, `MATCH_SEQ`,
-#:   `MATCH_FIELDS`, `MATCH_RANGE`) is a *test* that leaves the subject alone
-#:   and jumps on mismatch. Destructuring is then ordinary `GET_INDEX`,
-#:   `GET_FIELD`, `ENUM_FIELD` and `GET_SLICE`, so one lowering serves every
-#:   pattern position.
-#: - `FIELD_DEF k, visibility` reads the field's default from `peek(0)` and the
-#:   class from `peek(1)`; the emitter pushes `null` when a field has no
-#:   default and pops afterwards.
-#: - A class spec constant carries every method, so `CLASS k` builds a complete
-#:   class. A method that captures upvalues cannot be expressed that way, so it
-#:   is additionally attached with `CLOSURE` + `METHOD`.
-#: - `try` registers one handler covering the guarded region; the handler
-#:   dispatches over the clauses with `MATCH_EXC` and ends in `RERAISE`, so an
-#:   unmatched exception keeps unwinding.
-#:
-#: ```
-#: op_name(opcode(Op.GetLocal))        # "OP_GET_LOCAL"
-#: op_operand_bytes(opcode(Op.Const))  # 3
-#: ```
+#: Values are pushed and popped; *bindings* live in frame slots, so a statement
+#: has a net stack effect of zero and an expression exactly one. A module-level
+#: binding is a global; anything else is a slot. Every pattern opcode is a
+#: *test* that leaves the subject alone and jumps on mismatch, so ordinary
+#: `GET_INDEX`, `GET_FIELD`, `ENUM_FIELD` and `GET_SLICE` do the destructuring
+#: in every pattern position.
 from jaithon.ast import CompKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind
 from jaithon.ast import Visibility
 from jaithon.ast import is_statement
@@ -51,8 +31,7 @@ pub const FN_SETTER: int = 128
 #: Largest constant index a `u24` operand can hold.
 pub const MAX_CONSTANTS: int = 16777216
 
-#: `kind` of the class-spec constant `OP_CLASS` reads, as the VM's
-#: `classSpecInstantiate` decodes it.
+#: `kind` of the class-spec constant `OP_CLASS` reads (`classSpecInstantiate`).
 pub const SPEC_CLASS: int = 0
 pub const SPEC_TRAIT: int = 1
 pub const SPEC_ENUM: int = 2
@@ -192,11 +171,9 @@ pub enum Op {
     JumpIfCmpFalse,
     # String interpolation (spec §3.6), appended after compiler version 14.
     Format,
-    # Fused form appended after compiler version 15: a local compared against a
-    # pool constant and branched on, which is `while i < N` in one dispatch.
+    # Fused form appended after compiler version 15.
     JumpIfCmpLocalK,
-    # Numeric widening (spec §2.2), appended after compiler version 17: the int
-    # on top of the stack becomes a float.
+    # Numeric widening (spec §2.2), appended after compiler version 17.
     ToFloat,
 }
 
@@ -220,8 +197,7 @@ class OpSpec {
 
 # Operand byte counts and stack effects, from the JAI_OPCODES table in
 # src/vm/chunk.c. OP_CLOSURE is the one variable-length instruction and is
-# recorded as -1 operand bytes; an effect that depends on the operands is
-# STACK_EFFECT_VARIABLE and the emitter adjusts the depth itself.
+# recorded as -1 operand bytes.
 let _OPS: list[OpSpec] = [
     OpSpec(Op.Nop, "OP_NOP", 0, 0),
     OpSpec(Op.Const, "OP_CONST", 3, 1),
@@ -372,11 +348,6 @@ pub fn opcode(op: Op) -> int {
 
 #: The `OP_`-prefixed name of the opcode byte `code`, as the C disassembler
 #: prints it.
-#:
-#: ```
-#: op_name(0)                       # "OP_NOP"
-#: op_name(opcode(Op.Return))       # "OP_RETURN"
-#: ```
 pub fn op_name(code: int) -> str {
     if code < 0 or code >= _OPS.len() { return "OP_UNKNOWN" }
     return _OPS[code].name
@@ -391,11 +362,6 @@ pub fn op_operand_bytes(code: int) -> int {
 
 #: Net change `code` makes to the operand stack, or `STACK_EFFECT_VARIABLE`
 #: when it depends on the operands.
-#:
-#: ```
-#: op_stack_effect(opcode(Op.Const))    # 1
-#: op_stack_effect(opcode(Op.Pop))      # -1
-#: ```
 pub fn op_stack_effect(code: int) -> int {
     if code < 0 or code >= _OPS.len() { return STACK_EFFECT_VARIABLE }
     return _OPS[code].effect
@@ -410,17 +376,13 @@ pub fn op_count() -> int {
 pub enum ConstTag { Null, Bool, Int, Float, Str, Bytes, Func, ClassSpec, Tuple, Type }
 
 #: One constant-pool entry: a tag and the payload that tag implies.
-#:
-#: `int` and `float` are distinct constants even when numerically equal, which
-#: is why the pool never compares values numerically.
 pub class Const {
     #: Which of the ten payload shapes this is.
     pub let tag: ConstTag
     #: `bool`, `int`, `float`, `str`, `list[int]` of bytes, `FuncProto`,
-    #: `ClassSpec`, `list[Const]` for a tuple, or a type name.
-    #:
-    #: Mutable because a class spec read back from a file names its own pool by
-    #: index, and those indices become strings only once the pool is complete.
+    #: `ClassSpec`, `list[Const]` for a tuple, or a type name. Mutable because a
+    #: class spec read back from a file names its own pool by index, and those
+    #: indices become strings only once the pool is complete.
     pub var value: any
 
     #: Wrap `value` with its tag.
@@ -467,8 +429,7 @@ pub class ExceptionEntry {
     }
 }
 
-#: The code, constants, line table, exception table and inline-cache count of
-#: one function.
+#: One function's code, constants, line table, exception table and cache count.
 pub class Chunk {
     #: Instruction bytes.
     pub var code: list[int]
@@ -483,8 +444,7 @@ pub class Chunk {
     #: Operand-stack depth at the cursor. Temporaries live in frame slots, so
     #: this counts only values genuinely in flight.
     pub var depth: int
-    #: High-water mark of `depth`, which is how many slots above the locals the
-    #: frame window has to reserve (`max_slots = max_slot + max_depth`).
+    #: High-water mark of `depth` (`max_slots = max_slot + max_depth`).
     pub var max_depth: int
 
     var const_index: dict[str, int]
@@ -508,8 +468,7 @@ pub class Chunk {
         if self.depth > self.max_depth { self.max_depth = self.depth }
     }
 
-    #: Re-synchronise the tracked depth at a merge point, such as a patched
-    #: label, where the value cannot be derived from the instructions emitted.
+    #: Re-synchronise the tracked depth at a merge point, such as a patched label.
     pub fn set_depth(self, value: int) -> void {
         self.depth = value
         if value > self.max_depth { self.max_depth = value }
@@ -542,10 +501,8 @@ pub class Chunk {
         self.code.push(value >> 16 & 0xFF)
     }
 
-    #: Append a little-endian `i16`.
-    #:
-    #: Raises `ValueError` when `value` does not fit, which is how an
-    #: over-long jump is caught before it silently wraps.
+    #: Append a little-endian `i16`. Raises `ValueError` when `value` does not
+    #: fit, which is how an over-long jump is caught before it silently wraps.
     pub fn write_i16(self, value: int) -> void {
         if value < -32768 or value > 32767 {
             throw ValueError(f"i16 operand out of range: {value}")
@@ -569,22 +526,16 @@ pub class Chunk {
 
     #: Write the opcode byte for `op`, opening a new line-table row when the
     #: source span differs from the previous instruction's, and applying the
-    #: opcode's fixed stack effect. Returns its offset.
-    #:
-    #: Every instruction in the chunk goes through here, which is what keeps
-    #: `depth` honest without the emitter having to remember: only the
-    #: `STACK_EFFECT_VARIABLE` opcodes, whose net change the operands decide,
-    #: are left to their caller.
+    #: opcode's fixed stack effect. Returns its offset. Every instruction goes
+    #: through here; only the `STACK_EFFECT_VARIABLE` opcodes are left for the
+    #: caller to adjust.
     pub fn write_op(self, op: Op, span: Span?) -> int {
         let offset = self.here()
         if span != null and span.is_known() {
             let rows = self.lines.len()
-            # Both ends, not just the start. The C's recordSpan (src/vm/chunk.c)
-            # collapses a run only when `span` and `spanEnd` both match, so two
-            # consecutive instructions sharing a start but ending at different
-            # points are two rows there and were one row here -- which is why
-            # the self-hosted image carried a shorter line table than the C's
-            # for the same source.
+            # Both ends, not just the start: the C's recordSpan (src/vm/chunk.c)
+            # collapses a run only when `span` and `spanEnd` both match, and
+            # keying on the start alone made the line table come out shorter.
             let same = rows > 0 and
                 self.lines[rows - 1].span_start == span.start and
                 self.lines[rows - 1].span_end == span.end
@@ -600,12 +551,9 @@ pub class Chunk {
     }
 
     #: Add `value` to the pool and return its index, reusing an equal entry.
-    #:
-    #: Functions and class specs are never shared: each one is a distinct
-    #: object even when it looks the same. `constDedupable` in `src/vm/chunk.c`
-    #: draws the same line, and a tuple is on the sharing side of it — every
-    #: union type guard emits one, and a class with two `T?` fields emits the
-    #: same `("T", "null")` at each of them.
+    #: Functions and class specs are never shared, which is the line
+    #: `constDedupable` in `src/vm/chunk.c` draws; a tuple is on the sharing
+    #: side of it.
     pub fn add_constant(self, value: Const) -> int {
         let key = _const_key(value)
         if key != null {
@@ -641,10 +589,9 @@ fn _const_key(value: Const) -> str? {
         ConstTag.Type => { return f"t{value.value}" }
         ConstTag.Bytes => { return f"y{value.value}" }
         ConstTag.Tuple => {
-            # Structural, and null the moment a member has no key of its own:
-            # `constEqual` compares a tuple's items exactly and falls back to
-            # object identity for a function, so a tuple holding one is shared
-            # only with itself — which is what refusing to key it achieves.
+            # Null the moment a member has no key of its own: `constEqual` falls
+            # back to object identity for a function, so a tuple holding one is
+            # shared only with itself.
             var parts: list[str] = []
             for item in value.value {
                 let key = _const_key(item)
@@ -766,9 +713,8 @@ class LoopFrame {
     pub let continue_target: int
     #: Lowest slot to close when an iteration ends, or -1. See `_close_iteration`.
     pub let capture_base: int
-    #: Operand-stack depth `continue` and `break` must unwind to. They differ:
-    #: a `for` leaves its iterator pushed across the body, so `continue` keeps
-    #: it and `break` drops it.
+    #: Operand-stack depth `continue` and `break` unwind to. A `for` leaves its
+    #: iterator pushed across the body, so `continue` keeps it and `break` drops it.
     pub let continue_depth: int
     pub let break_depth: int
     pub var breaks: list[int]
@@ -797,31 +743,28 @@ class FnCtx {
     #: `return` leaves all of them at once and closes at this.
     pub var close_base: int
     #: Watermark, not a stack: the lowest base of any block or loop *opened*
-    #: since it was last reset. `_try` resets it around the guarded region to
-    #: learn what the unwind path has to close, since an exception skips every
-    #: block close inside that region.
+    #: since it was last reset. `_try` resets it around the guarded region,
+    #: since an exception skips every block close inside that region.
     pub var deep_close_base: int
     #: Next free temporary slot, handed out above the resolver's peak. A
-    #: temporary lives in the frame window, not on the operand stack, which is
-    #: what lets a pattern test fail without unwinding a variable number of
-    #: partially destructured values.
+    #: temporary lives in the frame window, not on the operand stack, so a
+    #: pattern test can fail without unwinding partially destructured values.
     pub var next_temp: int
     #: High-water mark of `next_temp`; the frame reserves this many slots
     #: before the operand stack starts.
     pub var max_slot: int
     #: The `finally` blocks open around the cursor, innermost last. An explicit
-    #: `return`, `break` or `continue` leaving them has to run each one, so it
-    #: inlines a copy; the exception path uses the exception table instead.
+    #: `return`, `break` or `continue` leaving them inlines a copy of each; the
+    #: exception path uses the exception table instead.
     pub var finallys: list[Node]
     #: Number of loop frames open when each `finally` was entered, so that a
     #: `break` knows which of them it is leaving.
     pub var finally_loop_depth: list[int]
-    #: Above zero inside a `try` body, a `catch` body, a `finally` body or a
-    #: deferred block. A `return` there still has work to do in this frame, so
-    #: it may not reuse it: see `_can_tail_call`.
+    #: Above zero inside a `try`, `catch`, `finally` or deferred block. A
+    #: `return` there may not reuse the frame: see `_can_tail_call`.
     pub var protect_depth: int
     #: True once this frame has registered a `defer`. Set where PUSH_DEFER is
-    #: emitted, so a `return` above the `defer` sees false exactly as the VM
+    #: emitted, so a `return` above the `defer` sees false, exactly as the VM
     #: would find no defer registered yet.
     pub var has_defer: bool
 
@@ -841,9 +784,8 @@ class FnCtx {
 
 #: Lower a resolved program to a `FuncProto` for the module body.
 #:
-#: Run `jaithon.compile.resolve` first and hand the `Resolution` it produced to the
-#: constructor: the emitter reads the symbols, slots and capture lists that
-#: pass left behind and looks nothing up itself.
+#: Run `jaithon.compile.resolve` first: the emitter reads the symbols, slots and
+#: capture lists that pass left behind and looks nothing up itself.
 pub class Emitter {
     #: The resolver's output: symbols by node identity, and function scopes.
     pub let resolution: Resolution
@@ -853,24 +795,18 @@ pub class Emitter {
     pub let strip_asserts: bool
     #: The `--O` level handed to `optimize`: 0 disables passes 3-7 (spec §8).
     pub let opt_level: int
-    #: The optimiser run over every function this emitter finishes. Defaults to
-    #: doing nothing; see `_no_optimize` for why it is a parameter at all.
+    #: The optimiser run over every function this emitter finishes; see
+    #: `_no_optimize` for why it is a parameter.
     pub let optimize: fn(FuncProto, int) -> void
 
     #: The file's source text, so an assert can bake in its condition. Null
-    #: when the caller did not supply it, in which case the message is the bare
-    #: `"assertion failed"` — which is what the C falls back to as well.
+    #: falls back to the bare `"assertion failed"`, as the C does.
     pub var source: str?
-    #: Enum declarations this file imported, by the name they are bound to
-    #: here. An enum pattern needs the variant's tag, and the tag is the
-    #: declaration's variant order — which for an imported enum lives in
-    #: another file. The C reads it out of the checker's registry
-    #: (`jaiTypeDeclFind` in `src/codegen/codegen_pattern.c`); this port has no
-    #: registry the emitter can reach, so the checker hands the enums over.
-    #:
-    #: Without them `match kind { TyKind.Fn => ... }` compiles to the fallback
-    #: form — `MATCH_TYPE "TyKind.Fn"` alone, with no `ENUM_TAG`/`MATCH_CONST`
-    #: pair — which runs correctly and is not the program the C emits.
+    #: Enum declarations this file imported, by the name they are bound to here.
+    #: An enum pattern needs the variant's tag, which is the declaration's
+    #: variant order and for an imported enum lives in another file. The C reads
+    #: it out of the checker's registry (`jaiTypeDeclFind` in
+    #: `src/codegen/codegen_pattern.c`); here the checker hands the enums over.
     pub var imported_enums: dict[str, Node]
     var stack: list[FnCtx]
     var enums: dict[str, Node]
@@ -897,19 +833,17 @@ pub class Emitter {
 
     #: Lower `program` and return the module body's function record.
     pub fn compile_program(self, program: Node, module_name: str? = null) -> FuncProto {
-        # The module body carries the module's own name, which is what a
-        # traceback prints for a frame that is not inside any function.
+        # The module body carries the module's own name, which a traceback
+        # prints for a frame that is not inside any function.
         let proto = FuncProto(module_name ?? "__main__", 0, 0)
-        # An enum pattern needs the variant order, which only the declaration
-        # has, and a `match` may come before it. Imported enums go in first so
-        # that a name this file also declares wins, which is the order the C's
-        # registry has them in.
+        # Imported enums go in first so that a name this file also declares
+        # wins, which is the order the C's registry has them in.
         for name in self.imported_enums.keys() { self.enums[name] = self.imported_enums[name] }
         self._index_enums(program.child_list("stmts"))
         self.stack.push(FnCtx(proto, self.resolution.slot_count(program)))
-        # Top-level `fn` declarations are bound ahead of the top-level
-        # statements, which is what STYLE §8's "private helpers last" ordering
-        # requires: a statement may call a function declared below it.
+        # Top-level `fn` declarations are bound ahead of the other statements,
+        # which STYLE §8's "private helpers last" ordering requires: a statement
+        # may call a function declared below it.
         let stmts = program.child_list("stmts")
         for statement in stmts {
             if statement.kind == NodeKind.FnDecl { self._stmt(statement) }
@@ -923,13 +857,10 @@ pub class Emitter {
         return proto
     }
 
-    # The frame window is the locals (the resolver's peak plus every temporary
-    # handed out above it) followed by the operand stack, so its size is the
-    # sum of the two high-water marks. Pops the frame it finished.
-    #
-    # This is where `jaiCgFinishFunction` (src/codegen/codegen.c) calls
-    # `jaiOptimize`: every function is optimised as it is finished, not just the
-    # module body, and the frame size the passes read has to be final first.
+    # The frame window is the locals followed by the operand stack, so its size
+    # is the sum of the two high-water marks. This is where
+    # `jaiCgFinishFunction` (src/codegen/codegen.c) calls `jaiOptimize`: every
+    # function as it is finished, and only once its frame size is final.
     fn _finish(self) -> void {
         let ctx = self._ctx()
         ctx.proto.max_slots = ctx.max_slot + ctx.proto.chunk.max_depth
@@ -947,9 +878,6 @@ pub class Emitter {
         }
     }
 
-    # ---------------------------------------------------------------- #
-    # Instruction helpers                                               #
-    # ---------------------------------------------------------------- #
     fn _chunk(self) -> Chunk { return self.stack[self.stack.len() - 1].proto.chunk }
 
     fn _ctx(self) -> FnCtx { return self.stack[self.stack.len() - 1] }
@@ -973,8 +901,6 @@ pub class Emitter {
         self._chunk().write_u24(index)
     }
 
-    # A constant index plus a fresh inline-cache slot: GET_GLOBAL, GET_FIELD
-    # and their setters all carry one.
     fn _op_cached(self, op: Op, index: int, span: Span) -> void {
         self._chunk().write_op(op, span)
         self._chunk().write_u24(index)
@@ -985,15 +911,13 @@ pub class Emitter {
         return self._chunk().add_constant(Const(ConstTag.Str, text))
     }
 
-    # ---- operand-stack depth ---------------------------------------- #
     fn _depth(self) -> int { return self._chunk().depth }
 
     fn _adjust(self, delta: int) -> void { self._chunk().adjust(delta) }
 
     fn _set_depth(self, value: int) -> void { self._chunk().set_depth(value) }
 
-    # Discard `count` values. POPN carries a u8, so a deeper unwind is several
-    # instructions; a single value is POP, which is one byte shorter.
+    # Discard `count` values. POPN carries a u8; a single value is POP.
     fn _pop_n(self, count: int, span: Span) -> void {
         var left = count
         while left > 0 {
@@ -1008,10 +932,7 @@ pub class Emitter {
         }
     }
 
-    # ---- frame temporaries ------------------------------------------ #
-
-    # A slot above the resolver's peak, for a value a pattern test or a
-    # destructuring has to keep across a branch.
+    # A slot above the resolver's peak, for a value a test keeps across a branch.
     fn _alloc_temp(self) -> int {
         let ctx = self._ctx()
         let slot = ctx.next_temp
@@ -1052,9 +973,8 @@ pub class Emitter {
         return operand
     }
 
-    # A jump offset is measured from the end of its instruction. That is the
-    # byte after the operand for every jump but PUSH_HANDLER, whose i16 comes
-    # before a u24, so that one patches with an explicit base.
+    # A jump offset is measured from the end of its instruction: the byte after
+    # the operand for every jump but PUSH_HANDLER, whose i16 comes before a u24.
     fn _patch(self, operand: int) -> void {
         self._patch_from(operand, operand + 2)
     }
@@ -1081,16 +1001,12 @@ pub class Emitter {
         )
     }
 
-    # ---------------------------------------------------------------- #
-    # Loads and stores                                                  #
-    # ---------------------------------------------------------------- #
     fn _load_name(self, node: Node, name: str) -> void {
         self._load_symbol(self.resolution.symbol_of(node), name, node.span)
     }
 
     fn _load_symbol(self, symbol: Symbol?, name: str, span: Span) -> void {
-        # A missing symbol is the recovery path: fall back to a late-bound
-        # global, which is also what the REPL wants.
+        # A missing symbol is the recovery path: a late-bound global, as in a REPL.
         if symbol == null {
             self._op_cached(Op.GetGlobal, self._string(name), span)
             return
@@ -1127,8 +1043,7 @@ pub class Emitter {
             self._op_u8(Op.SetUpvalue, if symbol.slot < 0 { 0 } else { symbol.slot }, span)
             self._op(Op.Pop, span)
         } else {
-            # A field: the value is already on top and SET_FIELD wants
-            # (object, value).
+            # A field: SET_FIELD wants (object, value) and the value is on top.
             self._op_u16(Op.GetLocal, 0, span)
             self._op(Op.Swap, span)
             self._op_cached(Op.SetField, self._string(symbol.name), span)
@@ -1162,8 +1077,7 @@ pub class Emitter {
             self._chunk().write_byte(elements.len())
             self._chunk().write_byte(if rest < 0 { 255 } else { rest })
             self._adjust(elements.len() - 1)
-            # UNPACK pushes right to left, so element 0 is on top and binding in
-            # source order consumes them in the order they were written.
+            # UNPACK pushes right to left, so element 0 is on top.
             for element in elements { self._bind_pattern(element, span) }
         } else {
             self._unsupported(pattern.span, "this pattern in a binding position")
@@ -1171,9 +1085,6 @@ pub class Emitter {
         }
     }
 
-    # ---------------------------------------------------------------- #
-    # Expressions                                                       #
-    # ---------------------------------------------------------------- #
     fn _each_expr(self, nodes: list[Node]) -> void {
         for node in nodes { self._expr(node) }
     }
@@ -1201,10 +1112,8 @@ pub class Emitter {
             NodeKind.FString => { self._fstring(node) }
             NodeKind.Ident => { self._load_name(node, node.text("name")) }
             # Slot 0 is the receiver of the frame this code runs in. Inside a
-            # nested function there is none, and the resolver has bound the
-            # node to the enclosing method's captured `self` instead. Bare
-            # `super` only reaches here after a resolver error; slot 0 keeps
-            # the chunk well formed.
+            # nested function there is none, and the resolver has bound the node
+            # to the enclosing method's captured `self` instead.
             NodeKind.Self | NodeKind.Super => {
                 let captured = self.resolution.symbol_of(node)
                 if captured == null {
@@ -1264,9 +1173,8 @@ pub class Emitter {
             NodeKind.Call => { self._call(node) }
             NodeKind.Index => {
                 self._expr(node.child("object"))
-                # Generics are erased (spec §6.1): `Box[int]` *is* `Box`, and
-                # the type arguments were never resolved as values, so there is
-                # nothing to evaluate and nothing to subscript.
+                # Generics are erased (spec §6.1): `Box[int]` *is* `Box`, so
+                # there is nothing to evaluate and nothing to subscript.
                 if not self.resolution.is_type_args(node) {
                     self._expr(node.child("index"))
                     self._op(Op.GetIndex, span)
@@ -1305,8 +1213,8 @@ pub class Emitter {
             NodeKind.Cast => {
                 self._expr(node.child("operand"))
                 if node.flag("widen") {
-                    # An int the checker proved is an int, on its way into a
-                    # float: one conversion, no test (spec §2.2).
+                    # An int the checker proved is an int: one conversion, no
+                    # test (spec §2.2).
                     self._op(Op.ToFloat, span)
                 } else {
                     let target = node.type_field("target")
@@ -1334,13 +1242,10 @@ pub class Emitter {
     }
 
     # One FORMAT joins the whole f-string: the parts go on the stack in order
-    # and the result replaces them, so interpolating an integer costs one
-    # allocation rather than a `str` lookup, a call and a CONCAT per hole. It is
-    # never a runtime eval (spec §1.7).
-    #
-    # The literal mask records which parts came from the source text rather than
-    # a hole, because a program that rebinds the global `str` still gets its own
-    # function called on the holes and only on the holes.
+    # and the result replaces them. It is never a runtime eval (spec §1.7). The
+    # literal mask records which parts came from the source text, because a
+    # program that rebinds the global `str` still gets its own function called
+    # on the holes and only on the holes.
     fn _fstring(self, node: Node) -> void {
         let span = node.span
         let parts = node.child_list("parts")
@@ -1398,8 +1303,7 @@ pub class Emitter {
     }
 
     # `a < b <= c` evaluates `b` once: it is stashed in a temporary between the
-    # two comparisons rather than duplicated on the stack, which keeps the depth
-    # at every short-circuit edge equal to "one bool".
+    # two comparisons, which keeps every short-circuit edge at one bool deep.
     fn _chain(self, node: Node) -> void {
         let span = node.span
         let operands = node.child_list("operands")
@@ -1456,10 +1360,8 @@ pub class Emitter {
         return flags
     }
 
-    # `tail` selects TAIL_CALL for the plain positional case, which reuses this
-    # frame instead of pushing a new one. It also suppresses the INVOKE fusion:
-    # INVOKE has no tail form, so `return obj.m()` loads the method and calls it
-    # rather than fusing.
+    # `tail` selects TAIL_CALL for the plain positional case. It also suppresses
+    # the INVOKE fusion, because INVOKE has no tail form.
     fn _call(self, node: Node, tail: bool = false) -> void {
         let span = node.span
         let callee = node.require("callee")
@@ -1478,8 +1380,7 @@ pub class Emitter {
             }
         }
 
-        # `super(a)` and `super.m(a)` fuse into SUPER_INVOKE; the receiver is
-        # always slot 0.
+        # `super(a)` and `super.m(a)` fuse into SUPER_INVOKE, receiver in slot 0.
         if callee.kind == NodeKind.Super {
             self._super_call(node, "init", positional, span)
             return
@@ -1490,8 +1391,7 @@ pub class Emitter {
         }
 
         # `obj.m(a)` fuses into INVOKE, which carries the method cache. An
-        # `Enum.Variant(a)` needs nothing of its own: the variant is a static
-        # member of the enum, so the ordinary member invoke reaches it.
+        # `Enum.Variant(a)` is a static member, so this reaches it too.
         if callee.kind == NodeKind.Member and keywords.len() == 0 and spread == null and not tail {
             self._expr(callee.require("object"))
             self._each_expr(positional)
@@ -1500,8 +1400,7 @@ pub class Emitter {
         }
 
         # `a?.m(x)` yields null *without calling* when `a` is null (spec §4.2),
-        # so the guard has to skip the arguments and the call too, not just the
-        # member load.
+        # so the guard skips the arguments and the call, not just the load.
         var opt_skip = -1
         var is_tail = tail
         if callee.kind == NodeKind.OptMember {
@@ -1517,8 +1416,8 @@ pub class Emitter {
         self._each_expr(positional)
         if spread != null {
             self._expr(spread)
-            # The operand counts every stack slot the call consumes, the splat
-            # list included (BYTECODE.md §3.5).
+            # The operand counts every slot the call consumes, the splat list
+            # included (BYTECODE.md §3.5).
             self._op_u8(Op.CallSpread, positional.len() + 1, span)
             self._adjust(-(positional.len() + 1))
             if opt_skip >= 0 { self._patch(opt_skip) }
@@ -1566,8 +1465,7 @@ pub class Emitter {
     }
 
     # A block in expression position yields its final expression statement. The
-    # exit close comes after the value is on the stack: the value itself may be
-    # a closure over one of the block's bindings.
+    # exit close comes after the value: it may be a closure over a block binding.
     fn _block_expr(self, node: Node) -> void {
         let close_at = self.resolution.capture_base_of(node)
         let saved = self._enter_close_scope(close_at)
@@ -1592,13 +1490,10 @@ pub class Emitter {
             self._expr(last.child("expr"))
             return
         }
-        # `if` and `match` in statement position parse as If / Match, but at the
-        # end of a block being read for its value they *are* that value, and the
-        # checker types them so. Emitting them as statements and pushing null is
-        # what made
-        #     => { let d = n * 2  if gate { d } else { null } }
-        # evaluate to null on every path. An `if` with no `else` is left alone:
-        # it has no value on the path not taken, so the block still yields null.
+        # `if` and `match` at the end of a block being read for its value *are*
+        # that value. Emitting them as statements and pushing null made every
+        # such block evaluate to null on every path. An `if` with no `else` is
+        # left alone: it has no value on the path not taken.
         if last.kind == NodeKind.Match or
             last.kind == NodeKind.If and last.child("elseBranch") != null {
             self._branch_value(last, last.span)
@@ -1609,9 +1504,8 @@ pub class Emitter {
     }
 
     # One arm of a conditional, emitted for its value. A branch is not always an
-    # expression node: a block yields its tail, and an `elif` chain the parser
-    # built in statement position arrives as `If`. `match` is here for the same
-    # reason.
+    # expression node: a block yields its tail, and an `elif` chain built in
+    # statement position arrives as `If`.
     fn _branch_value(self, branch: Node?, span: Span) -> void {
         if branch == null {
             self._op(Op.Null, span)
@@ -1641,8 +1535,7 @@ pub class Emitter {
         self._expr(branch)
     }
 
-    # `[e for x in xs if c]` builds the accumulator first; the element lands
-    # `clauses + 1` slots above it, which is what LIST_APPEND's depth counts.
+    # The accumulator is built first; the element lands `clauses + 1` above it.
     fn _comprehension(self, node: Node) -> void {
         let span = node.span
         let clauses = node.records("clauses")
@@ -1681,8 +1574,7 @@ pub class Emitter {
             skips.push(failures)
         }
 
-        # The operand is the accumulator's peek index: one iterator per
-        # enclosing clause sits between it and the pushed element.
+        # The accumulator's peek index, below one iterator per clause.
         if kind == CompKind.Dict {
             self._expr(node.child("keyExpr"))
             self._expr(node.child("element"))
@@ -1706,9 +1598,6 @@ pub class Emitter {
         }
     }
 
-    # ---------------------------------------------------------------- #
-    # Functions and classes                                             #
-    # ---------------------------------------------------------------- #
     fn _closure(self, node: Node, name: str?, extra_flags: int) -> int {
         let index = self._function_constant(node, name, extra_flags)
         self._emit_closure(node, index)
@@ -1758,16 +1647,14 @@ pub class Emitter {
             }
         }
 
-        # A lambda has no name of its own and still gets one: `setFunctionNames`
-        # in src/codegen/codegen.c calls it `<anonymous>`, a traceback prints
-        # that, and the name is a pool constant (§5), so leaving it null makes
-        # the two front ends disagree about the pool as well as the traceback.
+        # A lambda still gets a name: `setFunctionNames` in
+        # src/codegen/codegen.c calls it `<anonymous>`, and the name is a pool
+        # constant (§5), so leaving it null diverges from the C in the pool too.
         let proto = FuncProto((name ?? node.opt_text("name")) ?? "<anonymous>", arity, flags)
         proto.upvalue_count = if scope == null { 0 } else { scope.upvalues.len() }
         proto.param_names = names
 
-        # The frame has to hold slot 0 and every parameter even when the
-        # resolver never saw the body.
+        # The frame holds slot 0 and every parameter even with no body resolved.
         var locals = self.resolution.slot_count(node)
         if locals < node.records("params").len() + 1 {
             locals = node.records("params").len() + 1
@@ -1794,13 +1681,11 @@ pub class Emitter {
         return self._chunk().add_constant(Const(ConstTag.Func, proto))
     }
 
-    # Default-value thunks (spec §5 `defaultOffsets`).
-    #
-    # Offset 0 is `JUMP body` whenever there is at least one, then one
-    # self-contained thunk per defaulted parameter in declaration order, each
-    # leaving its value on the stack and ending in RETURN. They cannot fall
-    # through into one another: a keyword call may leave a hole anywhere in the
-    # list (`f(a, c: 3)` defaults only `b`), so the VM runs each on its own.
+    # Default-value thunks (spec §5 `defaultOffsets`): offset 0 is `JUMP body`,
+    # then one self-contained thunk per defaulted parameter in declaration
+    # order, each ending in RETURN. They cannot fall through into one another:
+    # a keyword call may leave a hole anywhere in the list (`f(a, c: 3)`
+    # defaults only `b`), so the VM runs each on its own.
     fn _default_thunks(self, proto: FuncProto, defaults: list[Node], node: Node) -> void {
         if defaults.len() == 0 { return }
         let to_body = self._emit_jump(Op.Jump, node.span)
@@ -1809,8 +1694,7 @@ pub class Emitter {
             let depth = self._depth()
             self._expr(default_value)
             self._op(Op.Return, default_value.span)
-            # A thunk is entered directly, never fallen into, so its stack
-            # effect is not part of the body's.
+            # A thunk is entered directly, so its stack effect is not the body's.
             self._set_depth(depth)
         }
         self._patch(to_body)
@@ -1833,9 +1717,7 @@ pub class Emitter {
     #     (INT kind, STR name, STR|NULL superName, BOOL isAbstract,
     #      TUPLE required, TUPLE variants)
     # `required` holds a trait's (name, arity) pairs flattened and `variants` an
-    # enum's (name, TUPLE fieldNames) pairs. Everything else a class needs
-    # arrives through FIELD_DEF, METHOD and IMPL_TRAIT, because a field default
-    # and a capturing method are code, not data.
+    # enum's (name, TUPLE fieldNames) pairs.
     fn _class_spec(
         self,
         kind: int,
@@ -1888,9 +1770,8 @@ pub class Emitter {
             self._chunk().write_byte(bits)
         }
 
-        # A static field belongs to the class, so its initialiser runs once,
-        # here, with the class still on the stack. An instance field's default
-        # is re-evaluated per instance and so belongs to the constructor.
+        # A static initialiser runs once, here, with the class still on the
+        # stack; an instance field's default belongs to the constructor.
         for field in fields {
             if not field["isStatic"] or field["defaultValue"] == null { continue }
             let field_span: Span = field["span"]
@@ -1929,7 +1810,7 @@ pub class Emitter {
         }
 
         if needs_init {
-            # No declared `init` but a field has a default: a bare one whose
+            # No declared `init` but a field has a default: synthesise one whose
             # only body is the default prologue.
             let synthetic = Node(NodeKind.FnDecl, {"name": "init"}, span)
             let index = self._function_constant(synthetic, "init", FN_METHOD, fields)
@@ -1985,8 +1866,8 @@ pub class Emitter {
         let span = node.span
         let name = node.text("name")
 
-        # A required method carries no body, so it cannot be a METHOD: it
-        # travels in the spec constant as a (name, arity) pair.
+        # A required method has no body, so it cannot be a METHOD: it travels in
+        # the spec constant as a (name, arity) pair.
         var required: list[Const] = []
         for method in node.child_list("methods") {
             if method.child("body") != null { continue }
@@ -2004,8 +1885,8 @@ pub class Emitter {
         self._define(node, name, span)
     }
 
-    # Bind a freshly built value on the stack to the declaration's own name and
-    # mark it exported when the declaration is public.
+    # Bind the value on the stack to the declaration's own name, and export it
+    # when the declaration is public.
     fn _define(self, node: Node, name: str?, span: Span) -> void {
         let symbol = self.resolution.symbol_of(node)
         self._store_symbol(symbol, name ?? "_", span, true)
@@ -2014,9 +1895,6 @@ pub class Emitter {
         }
     }
 
-    # ---------------------------------------------------------------- #
-    # Statements                                                        #
-    # ---------------------------------------------------------------- #
     fn _stmt(self, node: Node?) -> void {
         if node == null { return }
         let span = node.span
@@ -2029,11 +1907,9 @@ pub class Emitter {
                 self._expr(node.child("init"))
                 let pattern = node.child("pattern")
                 self._bind_pattern(pattern, span)
-                # `emitVarDecl` asks two questions and neither of them is what
-                # scope the declaration is in: a `pub let` written inside a
-                # function body is a mistake, and the C exports it anyway. A
-                # destructuring pattern exports nothing, because there is no
-                # one name for the export to carry.
+                # A `pub let` written inside a function body is a mistake and
+                # the C exports it anyway. A destructuring pattern exports
+                # nothing: there is no one name for the export to carry.
                 let symbol = self.resolution.symbol_of(node)
                 if symbol != null and
                     symbol.visibility == Visibility.Public and
@@ -2044,8 +1920,8 @@ pub class Emitter {
             }
             NodeKind.Assign => { self._assign(node) }
             # The block's bindings die here and the next sibling block gets
-            # their slots, so anything a closure captured by reference has to be
-            # detached on the way out (spec §5.2).
+            # their slots, so a closure's captures are detached on the way out
+            # (spec §5.2).
             NodeKind.Block => {
                 let close_at = self.resolution.capture_base_of(node)
                 let saved = self._enter_close_scope(close_at)
@@ -2102,9 +1978,8 @@ pub class Emitter {
                     self._run_defers(span)
                     self._op(Op.ReturnNull, span)
                 } elif self._can_tail_call(value) {
-                    # No close: a tail call has no finally chain and no defers
-                    # to run — `_can_tail_call` rules both out — and TAIL_CALL
-                    # closes the whole frame before it reuses the window.
+                    # No close: `_can_tail_call` rules out a finally chain and
+                    # defers, and TAIL_CALL closes the frame before reusing it.
                     self._call(value, true)
                     # TAIL_CALL reuses the frame for a closure callee; a native
                     # one leaves its result behind, so RETURN is still needed.
@@ -2124,18 +1999,17 @@ pub class Emitter {
             NodeKind.Try => { self._try(node) }
             NodeKind.Defer => {
                 # The deferred block runs on this frame, so it needs no capture
-                # list: its GET_LOCALs address the slots it was compiled with,
-                # and its frame window is the parent's.
+                # list: its GET_LOCALs address the parent's slots.
                 let parent = self._ctx()
                 # `defer` is the name the VM recognises a thunk by
-                # (jaiFunctionIsDeferThunk), which is what keeps it out of the
-                # "defer requires a callable" check and out of slot coalescing.
+                # (jaiFunctionIsDeferThunk), which keeps it out of the "defer
+                # requires a callable" check and out of slot coalescing.
                 let proto = FuncProto("defer", 0, 0)
                 proto.upvalue_count = parent.proto.upvalue_count
                 self.stack.push(FnCtx(proto, parent.next_temp))
                 self._ctx().max_slot = parent.max_slot
-                # Never tail-call out of a deferred block: it runs on a frame
-                # that is already being torn down.
+                # Never tail-call out of a deferred block: its frame is already
+                # being torn down.
                 self._ctx().protect_depth = 1
                 self._stmt(node.child("body"))
                 self._op(Op.ReturnNull, span)
@@ -2169,12 +2043,10 @@ pub class Emitter {
                     if name != null { self._op_k(Op.Export, self._string(name), span) }
                 }
             }
-            # An alias is erased wherever it is *used* (spec §2.3): a type is
-            # not a value. Its declaration is not free, though — `from M import
-            # Alias` is resolved against M's globals and export set at run
-            # time, so a public alias needs a binding there or the import fails
-            # with E0802. The binding is null because nothing may read it; only
-            # the export mark matters.
+            # An alias is erased wherever it is *used* (spec §2.3), but `from M
+            # import Alias` is resolved against M's globals and export set at
+            # run time, so a public alias still needs a binding there or the
+            # import fails with E0802. It is null; only the export mark matters.
             NodeKind.TypeDecl => {
                 if node.visibility() == Visibility.Public {
                     let index = self._string(node.text("name"))
@@ -2208,11 +2080,9 @@ pub class Emitter {
             }
             self._store_symbol(self.resolution.symbol_of(target), target.text("name"), span, false)
         } elif target.kind == NodeKind.Member {
-            # The field name is interned before the object is emitted, not at
-            # the SET_FIELD that uses it. Both loads read the same entry, so a
-            # `p.chunk.a = v` would otherwise put `chunk` in the pool first
-            # here and `a` first in the C — same instructions, different u24
-            # operands, and `make bootstrap` reports it as a divergence.
+            # Intern the field name before emitting the object: otherwise
+            # `p.chunk.a = v` pools `chunk` first here and `a` first in the C,
+            # which `make bootstrap` reports as a divergence.
             let field = self._string(target.text("name"))
             self._expr(target.child("object"))
             if compound {
@@ -2249,8 +2119,7 @@ pub class Emitter {
         }
     }
 
-    # `while` and `loop`; the caller emits the backward branch straight after,
-    # so the iteration-ending close belongs here at the bottom of the body.
+    # `while` and `loop`: the iteration-ending close belongs at the body's end.
     fn _body_of_loop(
         self,
         node: Node,
@@ -2281,8 +2150,7 @@ pub class Emitter {
     }
 
     # The statements of a loop body, without the block's own exit close: every
-    # path out of the body ends an iteration and closes at the loop's base,
-    # which is never higher than the body's.
+    # path out closes at the loop's base, never higher than the body's.
     fn _loop_body(self, body: Node?) -> void {
         if body == null { return }
         if body.kind != NodeKind.Block {
@@ -2300,26 +2168,22 @@ pub class Emitter {
 
     # Detach every open upvalue at or above `base`, so the closures already made
     # over those slots keep their values while the slots are handed to whatever
-    # is declared next (spec §5.2, §6). A scope is named by its lowest slot:
-    # locals live in a slot window, and everything at or above it is the scope.
-    #
-    # -1 emits nothing, which is the common case: an ordinary loop variable or
-    # block binding stays a plain slot and costs no instruction.
+    # is declared next (spec §5.2, §6). A scope is named by its lowest slot. -1
+    # emits nothing, which is the common case.
     fn _close_scope(self, base: int, span: Span) -> void {
         if base < 0 { return }
         self._op_u16(Op.CloseUpvalue, base, span)
     }
 
-    # Per-iteration bindings (spec §5.2). The resolver hands over the lowest
-    # slot a closure captures by reference inside the loop; closing at it
-    # detaches this iteration's open upvalues from the frame, so the next
-    # iteration's OP_CLOSURE allocates fresh cells.
+    # Per-iteration bindings (spec §5.2): closing at the lowest slot a closure
+    # captures by reference inside the loop makes the next iteration's
+    # OP_CLOSURE allocate fresh cells.
     fn _close_iteration(self, base: int, span: Span) -> void {
         self._close_scope(base, span)
     }
 
-    # Record a scope's base on the frame and return the previous `close_base`,
-    # which the caller restores when the scope ends.
+    # Record a scope's base and return the previous `close_base`, which the
+    # caller restores when the scope ends.
     fn _enter_close_scope(self, base: int) -> int {
         let ctx = self._ctx()
         let saved = ctx.close_base
@@ -2332,8 +2196,7 @@ pub class Emitter {
         return saved
     }
 
-    # `return` leaves every block and every iteration of this frame at once, so
-    # one close at the lowest of their bases covers the lot.
+    # `return` leaves every block and iteration at once: close at the lowest base.
     fn _return_close_base(self) -> int {
         var base = self._ctx().close_base
         let loops = self._close_base_through(0)
@@ -2342,8 +2205,7 @@ pub class Emitter {
     }
 
     # Inline copies of every `finally` entered inside the loop at `index`,
-    # innermost first. The exception path uses the exception table instead; only
-    # the explicit break/continue/return edges need the duplication.
+    # innermost first. Only the explicit break/continue/return edges need them.
     fn _finally_chain_for_loop(self, index: int) -> void {
         let ctx = self._ctx()
         var position = ctx.finallys.len() - 1
@@ -2355,9 +2217,8 @@ pub class Emitter {
 
     # A call in tail position reuses the frame, but only when nothing in this
     # frame still has to run afterwards: defers, an enclosing `try`/`finally`
-    # and generator frames all rule it out. `super` calls are excluded because
-    # SUPER_INVOKE has no tail form, and spread and keyword arguments because
-    # CALL_SPREAD and CALL_KW have none either.
+    # and generators all rule it out. `super`, spread and keyword calls are out
+    # because SUPER_INVOKE, CALL_SPREAD and CALL_KW have no tail form.
     fn _can_tail_call(self, value: Node) -> bool {
         if value.kind != NodeKind.Call { return false }
         let ctx = self._ctx()
@@ -2378,10 +2239,8 @@ pub class Emitter {
         return true
     }
 
-    # RUN_DEFERS before the frame is unwound. OP_RETURN runs this frame's
-    # defers itself, so the instruction is not what makes them run; it is what
-    # makes them run *here*, before an enclosing `finally` copy or the frame
-    # teardown, which is the order spec §3.8 describes.
+    # OP_RETURN runs this frame's defers itself; RUN_DEFERS is what makes them
+    # run *here*, before an enclosing `finally` copy (the order of spec §3.8).
     fn _run_defers(self, span: Span) -> void {
         if self._ctx().has_defer { self._op(Op.RunDefers, span) }
     }
@@ -2395,8 +2254,7 @@ pub class Emitter {
         }
     }
 
-    # Leaving several loop levels at once ends an iteration of each, and one
-    # close at the lowest base covers the lot: it closes that slot and above.
+    # One close at the lowest base covers every loop level left at once.
     fn _close_base_through(self, target: int) -> int {
         let loops = self._ctx().loops
         var base = -1
@@ -2443,13 +2301,11 @@ pub class Emitter {
         let frame = loops[index]
         self._finally_chain_for_loop(index)
         let saved = self._depth()
-        # Leaving an inner loop leaves its iterator, and every temporary an
-        # enclosing expression pushed, on the stack; they go here.
+        # The inner loop's iterator and any enclosing temporaries go here.
         var want = frame.continue_depth
         if node.kind == NodeKind.Break { want = frame.break_depth }
         self._pop_n(saved - want, node.span)
-        # A closure made in this iteration must not go on aliasing the slot,
-        # whether the jump ends the loop or only the iteration.
+        # A closure made in this iteration must not go on aliasing the slot.
         self._close_iteration(self._close_base_through(index), node.span)
         if node.kind == NodeKind.Break {
             frame.breaks.push(self._emit_jump(Op.Jump, node.span))
@@ -2461,8 +2317,7 @@ pub class Emitter {
     }
 
     # `PUSH_HANDLER` carries the branch offset *and* a type constant, so its
-    # jump site ends after both operands — that is where the VM resolves it
-    # from, and `_patch_from` is given that base.
+    # jump site ends after both operands, which is the base `_patch_from` gets.
     fn _push_handler(self, type_const: int, span: Span) -> int {
         self._chunk().write_op(Op.PushHandler, span)
         let operand = self._chunk().here()
@@ -2471,18 +2326,12 @@ pub class Emitter {
         return operand
     }
 
-    # The constant a `catch T` or an `as T` guard matches on. It is the
-    # runtime type *name*, a plain STR: the container's tag-9 TYPE descriptor
-    # has no value representation in this runtime and the reader refuses it,
-    # so writing one would make every image unloadable.
-    #: The constant a type guard checks against.
-    #:
-    #: A string for a single runtime type. A **tuple** of names for a union,
-    #: which is what `jaiCgTypeGuardConst` (`src/codegen/codegen.c`) emits:
-    #: `runtimeTypeName` has no single answer for a union, so the guard carries
-    #: one name per member and the VM tests them in turn. Emitting a string
-    #: there instead put a `str` in the pool where the C puts a `tuple`, which
-    #: `make bootstrap` reported as a constant of the wrong type outright.
+    # The constant a `catch T` or an `as T` guard matches on: the runtime type
+    # *name* as a plain STR, because the tag-9 TYPE descriptor has no value
+    # representation here and the reader refuses it. A union carries a tuple of
+    # names, as `jaiCgTypeGuardConst` (`src/codegen/codegen.c`) emits; a str
+    # there put the wrong constant type in the pool and `make bootstrap` caught
+    # it.
     fn _type_guard_const(self, caught: TypeExpr?) -> int {
         if caught is not null and caught.kind == TypeKind.Union {
             var names: list[Const] = []
@@ -2501,17 +2350,12 @@ pub class Emitter {
         let catches = node.records("catches")
         let base = self._depth()
 
-        # An exception-table handler is entered with every temporary of the
-        # frame already discarded, which is only right when the `try` sits at
-        # depth 0. Inside a `for` the iterator is a live temporary and dropping
-        # it would leave the loop reading garbage, so there the handler is
-        # registered with PUSH_HANDLER, which records the stack top to restore.
-        #
-        # A `finally` forces the same choice for a different reason: it
-        # registers a catch-all dynamic handler, and the unwinder tries dynamic
-        # handlers before the table, so a table-based catch clause would never
-        # be reached. Pushing the catch dispatcher on top of the finally
-        # restores the order the language asks for — catch first, finally after.
+        # A table handler is entered with every temporary of the frame already
+        # discarded, which is only right when the `try` sits at depth 0. Inside
+        # a `for` the live iterator forces PUSH_HANDLER, which records the stack
+        # top to restore. A `finally` forces it too: it registers a catch-all
+        # dynamic handler, and the unwinder tries dynamic handlers before the
+        # table, so a table-based catch clause would never be reached.
         let dynamic = catches.len() > 0 and (base > 0 or finally_block != null)
 
         var finally_entry = -1
@@ -2527,8 +2371,7 @@ pub class Emitter {
 
         # An exception skips every block close inside the guarded region: the
         # unwinder jumps straight to a handler in this same frame, and the catch
-        # binding and the handler's own locals are then handed the slots the
-        # body's bindings held. The watermark reports what the region opened.
+        # binding is then handed the slots the body's bindings held.
         let saved_deep = ctx.deep_close_base
         ctx.deep_close_base = -1
 
@@ -2585,20 +2428,18 @@ pub class Emitter {
             self._patch_all(done)
             self._patch(finally_entry)
 
-            # One catch-all entry spanning the body *and* the catch handlers
-            # routes every propagating exception here; it is registered after
-            # the typed entries so the VM's first-match scan still prefers them.
+            # One catch-all entry spanning the body *and* the catch handlers,
+            # registered after the typed entries so the VM's first-match scan
+            # still prefers them.
             self._chunk().exceptions.push(
                 ExceptionEntry(guarded_start, catches_end, self._chunk().here(), CATCH_ALL)
             )
             # The entry covers the handlers too, so the close is the whole
-            # region's. On the normal edge it is a no-op: those scopes closed
-            # themselves on the way out.
+            # region's. On the normal edge it is a no-op.
             self._close_scope(ctx.deep_close_base, span)
 
-            # Both the normal edge above and the unwinder land here.
-            # END_FINALLY resumes the unwind when one is pending and otherwise
-            # falls through.
+            # Both the normal edge above and the unwinder land here. END_FINALLY
+            # resumes a pending unwind and otherwise falls through.
             ctx.protect_depth += 1
             self._stmt(finally_block)
             ctx.protect_depth -= 1
@@ -2608,8 +2449,7 @@ pub class Emitter {
             self._patch_all(done)
         }
 
-        # Fold the region back into the enclosing watermark: an outer `try` has
-        # to close what this one opened as well.
+        # An outer `try` has to close what this one opened as well.
         if saved_deep >= 0 and (ctx.deep_close_base < 0 or saved_deep < ctx.deep_close_base) {
             ctx.deep_close_base = saved_deep
         }
@@ -2635,7 +2475,6 @@ pub class Emitter {
             }
             entries.push(hits)
         }
-        # No clause claimed it: the exception keeps going up.
         self._op(Op.Reraise, span)
 
         for (index, handler) in catches.enumerate() {
@@ -2678,15 +2517,9 @@ pub class Emitter {
         self._op(Op.Pop, span)
     }
 
-    # ---------------------------------------------------------------- #
-    # Pattern matching                                                  #
-    # ---------------------------------------------------------------- #
-
-    # The subject is bound to a temporary and every test re-reads it from
-    # there. Keeping it in a slot rather than on the stack is what makes the
-    # miss invariant hold: a test that fails has pushed exactly one value — the
-    # candidate it just read — whatever the shape of the pattern, so one POP
-    # unwinds any failure.
+    # The subject is bound to a temporary and every test re-reads it from there.
+    # That is what makes the miss invariant hold: a failing test has pushed
+    # exactly one value, whatever the pattern's shape, so one POP unwinds it.
     fn _match(self, node: Node, as_expression: bool) -> void {
         let span = node.span
         let base = self._depth()
@@ -2737,8 +2570,8 @@ pub class Emitter {
 
         self._set_depth(base)
         if as_expression {
-            # The checker proves exhaustiveness; this is the belt-and-braces
-            # path for `any` subjects, and it keeps the join depth honest.
+            # The checker proves exhaustiveness; this covers `any` subjects and
+            # keeps the join depth honest.
             self._op_k(Op.AssertFail, self._string("no match arm matched"), span)
             self._op(Op.Null, span)
         }
@@ -2797,8 +2630,7 @@ pub class Emitter {
         }
     }
 
-    # A sub-pattern applied to the value on top of the stack: parked in a
-    # temporary so that every test addresses a slot.
+    # A sub-pattern on the value on top: parked so every test addresses a slot.
     fn _sub_pattern(self, sub: Node?, misses: list[int], span: Span) -> void {
         if sub == null or sub.kind == NodeKind.PatWildcard {
             self._op(Op.Pop, span)
@@ -2841,8 +2673,7 @@ pub class Emitter {
         }
     }
 
-    # Each alternative jumps to the arm body on success; only the last one's
-    # failures escape to the enclosing pattern.
+    # Only the last alternative's failures escape to the enclosing pattern.
     fn _test_or(self, pattern: Node, slot: int, misses: list[int]) -> void {
         let alternatives = pattern.child_list("elems")
         if alternatives.len() == 0 { return }
@@ -2875,8 +2706,7 @@ pub class Emitter {
         let fixed = if has_rest { count - 1 } else { count }
         let tail = if has_rest { count - rest - 1 } else { 0 }
 
-        # With a rest element the count is the number of fixed elements the
-        # subject must have at least; without one it is the exact length.
+        # With a rest the count is a minimum; without one it is the exact length.
         self._get_local(slot, span)
         self._chunk().write_op(Op.MatchSeq, span)
         self._chunk().write_byte(if fixed > 255 { 255 } else { fixed })
@@ -2918,9 +2748,8 @@ pub class Emitter {
         self._chunk().write_op(Op.MatchType, span)
         if tag < 0 {
             # The enum was declared in another module, so its tag numbering is
-            # not visible here. MATCH_TYPE resolves its name against the running
-            # module (BYTECODE.md §3.9); a dotted `Enum.Variant` asks it to
-            # check the tag too, which is exactly what is missing.
+            # not visible here. MATCH_TYPE resolves the name against the running
+            # module (BYTECODE.md §3.9); a dotted `Enum.Variant` checks the tag.
             self._chunk().write_u24(self._string(f"{owner ?? "?"}.{variant ?? "?"}"))
         } else {
             self._chunk().write_u24(self._string(owner ?? "any"))
@@ -2961,9 +2790,8 @@ pub class Emitter {
         self._op(Op.Pop, span)
         if sub_patterns.len() == 0 { return }
 
-        # MATCH_FIELDS destructures in one step: its constant is a tuple of
-        # field names, it peeks the object, and on success pushes one value per
-        # name.
+        # MATCH_FIELDS destructures in one step: its constant is a tuple of field
+        # names, it peeks the object, and on success pushes one value per name.
         var names: list[Const] = []
         for index in range(sub_patterns.len()) {
             names.push(Const(ConstTag.Str, _field_name(pattern, index)))
@@ -2974,8 +2802,7 @@ pub class Emitter {
         misses.push(self._reserve_jump())
         self._adjust(sub_patterns.len())  # the success path pushes one per field
 
-        # Fields come off the stack last-first; park them in temporaries so the
-        # sub-patterns can be compiled in declaration order.
+        # Fields come off last-first; park them so sub-patterns compile in order.
         var temps: list[int] = []
         for _index in range(sub_patterns.len()) { temps.push(0) }
         var index = sub_patterns.len() - 1
@@ -2992,11 +2819,9 @@ pub class Emitter {
         self._free_temps(sub_patterns.len())
     }
 
-    # The declaration order of `Enum.Variant`, which is the tag ENUM_TAG
-    # pushes, or -1 when the enum was declared in another module and its tag
-    # numbering is not visible here. -1 is not an error: `_test_enum` falls back
-    # to a dotted `Enum.Variant` MATCH_TYPE, which resolves the name against the
-    # running module and checks the tag there.
+    # The declaration order of `Enum.Variant`, which is the tag ENUM_TAG pushes,
+    # or -1 when the enum was declared in another module. -1 is not an error:
+    # `_test_enum` falls back to a dotted `Enum.Variant` MATCH_TYPE.
     fn _variant_tag(self, pattern: Node) -> int {
         let name = pattern.opt_text("variantName")
         let owner = pattern.opt_text("typeName")
@@ -3010,8 +2835,7 @@ pub class Emitter {
     }
 }
 
-# A binding that does not live in this frame: a module global, and every class,
-# trait and enum, which are always bound at module scope.
+# Not a binding of this frame: a global, and every class, trait and enum.
 fn _symbol_is_global_like(symbol: Symbol) -> bool {
     let kind = symbol.kind
     return not (kind == SymbolKind.Local or kind == SymbolKind.Param or kind == SymbolKind.Upvalue or kind == SymbolKind.Field)
@@ -3045,35 +2869,24 @@ fn _last_segment(path: str?) -> str? {
     return parts[parts.len() - 1]
 }
 
-#: How much of a condition's source text an assert message carries.
-#:
-#: The C writes into a 256-byte buffer and reserves 32 of them for the prefix
-#: and the terminator, so a longer condition is cut at 224 characters
+#: How much of a condition's source text an assert message carries. The C writes
+#: into a 256-byte buffer and reserves 32 for the prefix and the terminator
 #: (`assertMessage`, src/codegen/codegen_stmt.c).
 const _ASSERT_TEXT_MAX: int = 224
 
-# The message baked into `OP_ASSERT_FAIL`: an explicit string literal when
-# there is one, otherwise the condition's own source text.
-#
-# Falling back to a bare `"assertion failed"` costs the reader the thing they
-# most want to see — which condition — and it is a constant-pool divergence
-# besides, because the C bakes the text in.
+# The message baked into `OP_ASSERT_FAIL`: an explicit string literal when there
+# is one, otherwise the condition's own source text, which the C bakes in too.
 fn _assert_message(node: Node, source: str?) -> str {
     let message = node.child("message")
     if message != null and message.kind == NodeKind.StrLit { return message.text("chars") }
 
     let cond = node.child("cond")
     if source != null and cond != null and cond.span.is_known() {
-        # A span is a BYTE offset, as it is in the C, and a Jaithon string
-        # slices by scalar. The two agree only until the file contains a
-        # multi-byte character — one `—` in a doc comment above the assert is
-        # enough — after which slicing the string cuts in the wrong place and
-        # bakes a truncated condition into the message. Take the bytes.
-        #
-        # Byte by byte, because `bytes` does not slice: `raw[start:stop]` reads
-        # as if it did and raises `TypeError` at run time, which the emitter
-        # then reported as "the self-hosted front end raised while compiling
-        # this file" on every file whose asserts sit below a non-ASCII comment.
+        # A span is a BYTE offset, as it is in the C, and a Jaithon string slices
+        # by scalar, so slicing the string cuts in the wrong place as soon as the
+        # file holds a multi-byte character. Take the bytes — one at a time,
+        # because `bytes` does not slice: `raw[start:stop]` reads as if it did
+        # and raises `TypeError` at run time.
         let raw = __prim__.str_encode(source)
         let start = cond.span.start
         var stop = cond.span.end
@@ -3092,11 +2905,8 @@ fn _assert_message(node: Node, source: str?) -> str {
 }
 
 # `bytes` as text, dropping the last scalar when the cut landed inside one.
-#
-# The C truncates at a byte and does not care: its constant is bytes with a
-# length, and an assert message cut mid-character prints as mojibake. A Jaithon
-# `str` is scalars, and `str_decode` refuses invalid UTF-8 outright, so the
-# only faithful answer available is the longest valid prefix.
+# `str_decode` refuses invalid UTF-8 outright, so the longest valid prefix is the
+# only faithful answer; the C truncates at a byte and prints mojibake.
 fn _decoded(raw: list[int]) -> str {
     var length = raw.len()
     while length > 0 {
@@ -3150,13 +2960,9 @@ fn _binary_op(op: OpKind) -> Op {
 #: The record comes back even when a diagnostic was reported, so that a caller
 #: can disassemble what was produced while reporting what was not.
 #:
-#: `module_name` names the body itself, which is the frame a traceback shows
-#: for code outside any function; it defaults to `__main__`, exactly as
-#: `src/codegen/codegen.c` does for a compilation with no module attached.
-#:
-#: `optimize` is the pass pipeline to run over each finished function, and
-#: `opt_level` the `--O` level to run it at. Left out, nothing is optimised;
-#: `jaithon.compile.compile_source` passes `jaithon.compile.opt.optimize`.
+#: `module_name` names the body itself and defaults to `__main__`, as
+#: `src/codegen/codegen.c` does. `optimize` is the pass pipeline to run over
+#: each finished function; left out, nothing is optimised.
 pub fn emit(
     program: Node,
     resolution: Resolution,
@@ -3175,11 +2981,9 @@ pub fn emit(
 }
 
 # The optimiser the emitter runs by default, which is none at all.
-#
-# `jaithon.compile.opt` cannot be imported from this module: its passes read
-# this module's `Chunk`, `FuncProto` and `Op`, and Jaithon rejects a circular
-# import (E0801). Handing the driver in is what lets it run at exactly the point
-# `jaiCgFinishFunction` (src/codegen/codegen.c) calls `jaiOptimize` — once per
-# function as codegen finishes it, which is not the same thing as once over the
-# module body at the end, because slot coalescing is not idempotent.
+# `jaithon.compile.opt` cannot be imported from this module: its passes read this
+# module's `Chunk`, `FuncProto` and `Op`, and Jaithon rejects a circular import
+# (E0801). Handing the driver in runs it where `jaiCgFinishFunction`
+# (src/codegen/codegen.c) calls `jaiOptimize` — once per function, which is not
+# once over the module body, because slot coalescing is not idempotent.
 fn _no_optimize(proto: FuncProto, level: int) -> void { }

@@ -1,24 +1,8 @@
 #: The checker: what turns a resolved tree into a typed one.
 #:
-#: A port of the parts of `src/sema/check.c` the other files in this directory
-#: leave to it — the bridge from a written annotation to a semantic type, the
-#: type-name scope that bridge resolves against, and the program-level passes
-#: that register declarations before anything is checked. Everything else in
-#: `check.c` already lives beside the code that needs it: `require_assignable`
-#: and the cast insertion in `expr.jai`, narrowing in `stmt.jai`, layout in
-#: `decl.jai`.
-#:
-#: This file is what closes the `Ctx` seam. `expr.jai` declares thirteen
-#: callbacks with harmless defaults; `stmt.install` and `decl.install` supply
-#: nine of them and `install` here supplies the rest, so a `Ctx` built by
-#: `check_program` has no silent no-op left in it.
-#:
-#: **`resolve_ast_type` is the one that matters.** Until it is installed every
-#: written annotation answers `any`, and an `any` on both sides of an
-#: assignment needs neither a runtime guard nor a widening — so a checker
-#: without it emits none of the `OP_TYPE_GUARD` and `OP_TO_FLOAT` that account
-#: for roughly half the bytecode the two front ends disagree about. It is the
-#: difference between a checker that runs and a checker that does anything.
+#: The parts of `src/sema/check.c` the rest of this directory leaves to it:
+#: annotation to semantic type, the type-name scope that resolves against, and
+#: the program-level passes that run before anything is checked.
 from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind, kind_name
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
@@ -47,23 +31,13 @@ pub const E0407_GENERIC_ARITY: str = "E0407"
 #: The imports reachable from this file close a loop.
 pub const E0801_CIRCULAR_IMPORT: str = "E0801"
 
-#: How deep the cycle walk follows imports before giving up.
-#:
-#: The C bounds nothing here — its graph is a real graph with a colour per
-#: node, so the walk terminates on its own. This one bounds the *recursion*,
-#: because a Jaithon stack overflow in the checker would report as a crash
-#: rather than as the answer "no cycle found within reach".
+#: How deep the cycle walk follows imports before giving up. The C needs no
+#: bound; this keeps a stack overflow here from reporting as a crash.
 const MAX_IMPORT_DEPTH: int = 256
 
-#: The names that are types without anything declaring them.
-#:
-#: `void` is deliberately absent as a distinct entry: it resolves to `null`,
-#: because the two are one type and `void` is only the spelling a return
-#: position uses.
-#:
-#: The bare container names are the fully dynamic form of the generic — `list`
-#: is `list[any]`. `tuple` is not: its arity is part of the type, so "a tuple of
-#: any shape" is not in the lattice at all and `any` is the honest answer.
+#: The names that are types without anything declaring them. `void` resolves to
+#: `null` because the two are one type; bare `list` is `list[any]`, but a
+#: tuple's arity is part of its type, so bare `tuple` is `any`.
 fn _builtin_scalar(u: Universe, name: str?) -> Type? {
     if name == null { return null }
     match name {
@@ -85,16 +59,9 @@ fn _builtin_scalar(u: Universe, name: str?) -> Type? {
     }
 }
 
-#: Classes the runtime provides that no source file declares.
-#:
-#: Exactly `kBuiltinClasses` in `src/sema/check.c`, in its order. Not a list of
-#: plausible exception names: a first draft here guessed twenty-five and was
-#: wrong in both directions, carrying `Exception`, `NotImplementedError`,
-#: `TimeoutError` and `UnicodeError` that the C does not know, and spelling the
-#: divide-by-zero one `ZeroDivisionError` where the C says
-#: `DivisionByZeroError`. Every wrong entry is a name that answers `any` here
-#: and a type there, and every extra one is a name this front end accepts and
-#: the C rejects.
+#: Classes the runtime provides that no source file declares. Exactly
+#: `kBuiltinClasses` in `src/sema/check.c`, in its order: a wrong entry answers
+#: `any` here and a type there, an extra one is a name the C rejects.
 pub let BUILTIN_CLASSES: list[str] = [
     "Error",
     "AssertionError",
@@ -125,17 +92,10 @@ fn _builtin_class(u: Universe, name: str?) -> Type? {
     return null
 }
 
-#: The type a bare name means here, or null when nothing names one.
-#:
-#: Innermost binding wins: a generic parameter shadows a class of the same
-#: name, which shadows a module-level alias. That stack is `Ctx.type_names`,
-#: pushed by `decl.push_generics` and `decl.push_self`.
-#:
-#: Inside a foreign scope the whole tail of the search changes, because the
-#: question changes: a name written in another module's source means one of
-#: *that* module's declarations, never one of this file's, and a name this file
-#: cannot see is not a mistake it may report. `jaiChkLookupTypeName` splits the
-#: same way.
+#: The type a bare name means here, or null when nothing names one. Innermost
+#: binding wins: a generic parameter shadows a class, which shadows an alias.
+#: Inside a foreign scope a name means one of *that* module's declarations, and
+#: one this file cannot see is not a mistake it may report.
 pub fn lookup_type_name(c: Ctx, name: str?) -> Type? {
     if name == null { return null }
 
@@ -148,35 +108,23 @@ pub fn lookup_type_name(c: Ctx, name: str?) -> Type? {
     if c.foreign_origin is not null {
         let foreign = _lookup_foreign_type_name(c, name)
         if foreign is not null { return foreign }
-        # Never null: an unresolvable name in a foreign signature is a name
-        # this file cannot see, not a mistake it may report.
         return _builtin_class(c.universe, name) ?? c.universe.t_any
     }
 
     let declared = c.decl_named(name)
     if declared != null and declared.ty != null { return declared.ty }
 
-    # A name this file imported that names no declaration the loader could
-    # follow: one the module defines at run time, or one whose module is not on
-    # the search path. It is a real name, not a typo, and gradual typing
-    # already has a word for a type whose shape is unknown. Reporting E0402
-    # here would make every `from std.core import Iterable` unusable in an
-    # annotation — which is exactly what it did, on 80 of the 198 files
+    # An imported name the loader could not follow. Reporting E0402 here broke
+    # every `from std.core import Iterable` — 80 of the 198 files
     # `--bootstrap-verify` walks.
     if name in c.imported_names { return c.universe.t_any }
 
     return _builtin_class(c.universe, name)
 }
 
-# A name written in another module's source. It means what it means *there*:
-# one of that module's own declarations, or one it imported in turn — followed
-# through, because otherwise `fn draw(w: Window)` in `std.gui.canvas` would
-# check nothing and the difference between a local call and a call one module
-# away would be exactly the thing this is here to remove.
-#
 # `lookupForeignTypeName` in `src/sema/check.c`. What it finds is registered
-# *invisible*: this file did not import it, so it may not be named here — it is
-# registered only so that the module that did import it can.
+# *invisible*: this file did not import it, so only the module that did may
+# name it.
 fn _lookup_foreign_type_name(c: Ctx, name: str) -> Type? {
     let origin = c.foreign_origin
     for entry in c.all_decls() {
@@ -195,15 +143,14 @@ fn _lookup_foreign_type_name(c: Ctx, name: str) -> Type? {
 }
 
 # Whether two `ModuleSig?` values are the same module. `is` is a type test in
-# Jaithon, not an identity one, and `ModuleSig` defines no `__eq__`, so `==`
-# would be identity — but only for two non-null operands.
+# Jaithon, not an identity one, and `ModuleSig` defines no `__eq__`.
 fn _same_module(left: any?, right: any?) -> bool {
     if left is null or right is null { return left is null and right is null }
     return id(left) == id(right)
 }
 
-# `list`, `set`, `dict` and `tuple` written with arguments. Answers whether it
-# handled the name at all, so a user generic falls through to the erasure path.
+# `list`, `set`, `dict` and `tuple` written with arguments. False when it did
+# not handle the name, so a user generic falls through to erasure.
 fn _builtin_generic(c: Ctx, t: TypeExpr) -> (bool, Type) {
     let name = t.name
     var want = -1
@@ -255,7 +202,6 @@ fn _builtin_generic(c: Ctx, t: TypeExpr) -> (bool, Type) {
     return (true, tuple_of(c.universe, members))
 }
 
-# How many type parameters a declaration takes.
 fn _generic_arity(d: TypeDecl?) -> int {
     if d == null { return 0 }
     let node = d.node
@@ -266,22 +212,12 @@ fn _generic_arity(d: TypeDecl?) -> int {
     return 0
 }
 
-#: The semantic type a written annotation means.
+#: The semantic type a written annotation means. Memoised per `TypeExpr` in
+#: `Ctx`, which is the C's `AstType.resolved` field.
 #:
-#: The bridge between `jaithon.ast.TypeExpr` — how a type was *written*, seven
-#: syntactic shapes — and `check.ty.Type`, what it *is*. Every guard and every
-#: widening the checker inserts starts here, because both are decided by
-#: comparing a value's type against an annotation's, and without this the
-#: annotation side is always `any`.
-#:
-#: Results are memoised per `TypeExpr` in `Ctx`, which is the C's
-#: `AstType.resolved` field; a Jaithon `TypeExpr` has no such field, so the
-#: cache is a side table like every other annotation this port carries.
-#:
-#: **Generics are erased.** `Box[int]` checks its arity and then stands for the
-#: bare `Box`. Resolving it to an instantiation instead would be defensible in
-#: isolation and wrong here: the C never builds one, so `make sema-diff` would
-#: report `Box[int]` against `Box` on every generic annotation in the tree.
+#: Generics are erased: `Box[int]` checks its arity and then stands for the bare
+#: `Box`, because the C never builds an instantiation and `make sema-diff` would
+#: report the difference on every generic annotation.
 pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
     if t == null { return c.universe.t_any }
 
@@ -304,8 +240,7 @@ pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
             if handled[0] {
                 result = handled[1]
             } else {
-                # The arguments are resolved for their own diagnostics even
-                # though erasure throws them away.
+                # Resolved for their own diagnostics; erasure throws them away.
                 for argument in t.args { let _ = resolve_ast_type(c, argument) }
                 let base = lookup_type_name(c, t.name)
                 if base == null {
@@ -352,11 +287,8 @@ pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
 }
 
 #: Install what only this file can supply, then let `stmt` and `decl` install
-#: theirs.
-#:
-#: Order matters only in that all three must run before anything is checked; a
-#: `Ctx` with any callback still at its default answers `any` where it should
-#: answer a type, and an `any` on both sides of an assignment needs no guard.
+#: theirs. All three must run before anything is checked: a callback still at
+#: its default answers `any` where it should answer a type.
 pub fn install(c: Ctx) -> void {
     c.resolve_ast_type = resolve_ast_type
     c.lookup_type_name = lookup_type_name
@@ -364,14 +296,12 @@ pub fn install(c: Ctx) -> void {
     c.module_member = _module_member
     stmt_mod.install(c)
     decl_mod.install(c)
-    # After `decl.install`, because it wraps what that installed: laying a
-    # declaration out resolves every annotation in its body, and one read out
-    # of another module has to resolve them there. `jaiChkLayoutDecl` opens
-    # with the same `jaiChkForeignBegin(c, entry->decl->origin, ...)`.
+    # After `decl.install`, because it wraps it: laying out a foreign
+    # declaration resolves its annotations in its own module. `jaiChkLayoutDecl`
+    # opens with the same `jaiChkForeignBegin`.
     c.layout_decl = _layout_in_origin
 }
 
-# `decl.layout_decl`, with the declaration's own module installed around it.
 fn _layout_in_origin(c: Ctx, declared: TypeDecl?) -> void {
     if declared is null { return }
     let saved = c.enter_foreign(declared.origin)
@@ -379,20 +309,15 @@ fn _layout_in_origin(c: Ctx, declared: TypeDecl?) -> void {
     c.leave_foreign(saved)
 }
 
-# True when `node` names an imported module rather than a value.
 fn _is_module(c: Ctx, node: Node?) -> bool {
     if node is null or node.kind != NodeKind.Ident { return false }
     let ty = c.symbol_type(c.resolution.symbol_of(node))
     return ty is not null and ty.kind == TyKind.Module
 }
 
-#: What `m.name` denotes after `import m`.
-#:
-#: The import pass gave `m` a `Module` type carrying the dotted name, and the
-#: signature loader still holds that module's declarations, so the member's
-#: type is the declaration's type — the same answer `from m import name` would
-#: have produced. Without this every qualified call reads `any`, which was the
-#: rest of `num.jai` and `os.jai` once the plain imports were bound.
+#: What `m.name` denotes after `import m`: the type of the declaration the
+#: signature loader holds, the same answer `from m import name` gives. Without
+#: it every qualified call reads `any`.
 fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
     let u = c.universe
     if node is null { return (u.t_any, null) }
@@ -408,8 +333,7 @@ fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
 
     let found = loader.find(sig, name)
     let decl = found[0]
-    # Defined at run time, or private: `any` is the honest answer and the one
-    # every imported name used to get.
+    # Defined at run time, or private: `any` is the honest answer.
     if decl is null { return (u.t_any, null) }
 
     match decl.kind {
@@ -421,10 +345,8 @@ fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
     }
 }
 
-# `m.Thing` after `import m`: the registered foreign declaration, laid out, so
-# that `m.Thing(...)` constructs and `m.Thing.member` resolves. Registration
-# happened when the import was seen; a declaration reached any other way has
-# none and is `any`.
+# `m.Thing` after `import m`. Registration happened when the import was seen; a
+# declaration reached any other way has none and is `any`.
 fn _module_type_member(c: Ctx, decl: Node) -> Type {
     let registered = c.decl_for_node(decl)
     if registered is null { return c.universe.t_any }
@@ -432,13 +354,8 @@ fn _module_type_member(c: Ctx, decl: Node) -> Type {
     return registered.ty ?? c.universe.t_any
 }
 
-# The `Fn` type of a declaration read out of `origin`, resolved there.
-#
-# `jaiChkForeignFunctionType`. Without the scope, `fn verify_source(...) ->
-# VerifyResult` resolved in this file's scope gives `fn(...) -> any`, and the
-# `any` then spreads to every call, every binding that holds a result, and
-# every member read off one — 75 of the 137 decisions in
-# `tests/lang/test_bootstrap_verify.jai` alone.
+# `jaiChkForeignFunctionType`: the `Fn` type of a declaration read out of
+# `origin`, resolved there. Without the scope every foreign annotation is `any`.
 fn _foreign_function_type(c: Ctx, origin: ModuleSig?, fn_node: Node) -> Type {
     let saved = c.enter_foreign(origin)
     let signature = signature_of(c, fn_node, false)
@@ -446,10 +363,8 @@ fn _foreign_function_type(c: Ctx, origin: ModuleSig?, fn_node: Node) -> Type {
     return signature
 }
 
-#: Register every class, trait and enum this file declares.
-#:
-#: Before anything is checked, because a declaration may mention a sibling
-#: declared later in the file and that sibling has to mean the sibling.
+#: Register every class, trait and enum this file declares, before anything is
+#: checked: a declaration may mention a sibling declared later in the file.
 fn _register_all(c: Ctx, node: any) -> void {
     if node is Node {
         if node.kind == NodeKind.ClassDecl or
@@ -465,16 +380,9 @@ fn _register_all(c: Ctx, node: any) -> void {
 
 #: Type-check a resolved program, and answer the context that holds the result.
 #:
-#: The passes are the C's, in the C's order. Registration first, so a name
-#: declared anywhere in the file is visible everywhere in it. Then layout, in
-#: full rather than on demand: half the questions the checker asks about a type
-#: — is it iterable, does it implement that trait, is it callable — are asked
-#: in code with no declaration in hand to lay out first, and a laid-out
-#: declaration answers them all while an empty one silently answers "no". Then
-#: the body.
-#: `collect_dump` turns on the record of every decision, which is what
-#: `--dump-sema` writes and `make sema-diff` compares against the C. It costs a
-#: list append per typed node, so it is off unless asked for.
+#: The passes are the C's, in the C's order: registration, layout in full rather
+#: than on demand, then the body. An unlaid declaration silently answers "no" to
+#: half the questions the checker asks about a type.
 pub fn check_program(
     universe: Universe,
     program: Node?,
@@ -490,24 +398,15 @@ pub fn check_program(
     install(c)
     if program == null { return c }
 
-    # This file's own declarations first, so that a name it declares always
-    # wins over one it imports, and only then what the imports bring in.
+    # This file's own declarations first, so they win over imported ones.
     _register_all(c, program)
-    # `path` is the file being checked, and an import resolves relative to the
-    # directory holding it before it resolves against the search path.
     let loader = _loader_for(_search_roots(path))
     c.sig_loader = loader
     c.source_dir = _dir_of(path)
     _import_pass(c, program, loader, _dir_of(path))
     _alias_pass(c, program)
-    # Everything registered, imported declarations included. Laying those out
-    # on demand does not work: `Iter` is assignable to `Iterator` only if its
-    # trait list says so, and half the questions the checker asks about a type
-    # are asked in code with no declaration in hand to lay out first.
-    #
     # The loop re-reads the length because a layout can discover a type in a
-    # third module and register it, which is why `all_decls` hands back the
-    # live list rather than a copy.
+    # third module and register it; `all_decls` hands back the live list.
     var at = 0
     while at < c.all_decls().len() {
         c.layout_decl(c, c.all_decls()[at])
@@ -515,8 +414,8 @@ pub fn check_program(
     }
     _signature_pass(c, program)
     c.check_block(c, program)
-    # The C ends jaiCheckProgram with `program->type = gTypes.tVoid`, and void
-    # is null, which is why a sema dump records the program itself as `null`.
+    # The C ends `jaiCheckProgram` the same way, and void is null, which is why
+    # a sema dump records the program itself as `null`.
     c.set_type(program, universe.t_void)
     if collect_dump { _dump_types(c, program) }
     return c
@@ -524,29 +423,17 @@ pub fn check_program(
 
 #: Signature loaders already built, keyed by the search path they serve.
 #:
-#: A signature is a pure function of the file it came from, so parsing one
-#: twice is waste. Every `compile_source` built its own loader, so a run over
-#: the whole tree re-parsed each module's entire import closure once per
-#: importing file: `--bootstrap-verify` went 25s -> 50s the moment the checker
-#: started following imports, and back to 19s with this. The C keeps the same
-#: table process-global (`sSigs`, src/sema/modsig.c).
-#:
-#: Keyed by search path rather than shared outright, because a loader hands out
-#: file ids and spans carry them — two differently configured loaders must not
-#: trade signatures and leave a span pointing at the wrong file.
-#:
-#: This caches signatures. It never caches types: a shared `Universe` would make
-#: one file's compilation depend on what an earlier one interned, which is the
-#: cross-file contamination the C has and this front end does not.
+#: A loader per `compile_source` re-parsed every module's import closure once
+#: per importing file: `--bootstrap-verify` 50s against 19s. Keyed rather than
+#: shared because a loader hands out file ids and spans carry them. Signatures
+#: only: a shared `Universe` would leak one file's interning into the next.
 var _loaders: dict[str, SigLoader] = {}
 
-#: Forget every cached loader, for a caller that changed a file on disk and
-#: wants the next compilation to see it.
+#: Forget every cached loader, so the next compilation re-reads from disk.
 pub fn clear_signature_cache() -> void {
     _loaders = {}
 }
 
-# The loader for this search path, built once.
 fn _loader_for(roots: list[str]) -> SigLoader {
     let key = "|".join(roots)
     if key in _loaders { return _loaders[key] }
@@ -555,7 +442,6 @@ fn _loader_for(roots: list[str]) -> SigLoader {
     return built
 }
 
-# The directory holding `path`, which is where a relative import resolves from.
 fn _dir_of(path: str) -> str {
     let cut = path.rfind("/")
     if cut < 0 { return "" }
@@ -563,23 +449,11 @@ fn _dir_of(path: str) -> str {
 }
 
 # Where to look for an imported module, given the file doing the importing.
-#
-# A dotted name resolves against a *root*, not against the importing file's own
-# directory: `std.math` imported from `lib/std/random.jai` is `lib/std/math.jai`,
-# which is found by searching `lib` and not `lib/std`.
-#
-# `__prim__.module_path()` is the answer to that, and it is the whole reason the
-# primitive exists: it hands over the directories this binary actually resolves
-# an import against — `JAITHON_PATH`, the ones derived from the executable's
-# own location, the fixed system ones and anything `-I` added — so the two
-# front ends agree about where a module lives instead of one of them guessing
-# from the source path. `default_search_path` reconstructs a subset of that
-# list and is the fallback for a build where the primitive is missing.
-#
-# The importing file's own ancestors come first all the same. That is not the
-# runtime's rule and it is not there to find `std`: it is there so that a file
-# under `tests/` can import a sibling package by a plain dotted name, which the
-# fixtures do and which the C's `-I` handles for it.
+# A dotted name resolves against a *root*, not the importing file's directory:
+# `std.math` from `lib/std/random.jai` is `lib/std/math.jai`, found by searching
+# `lib` and not `lib/std`. `__prim__.module_path()` hands over the directories
+# this binary really resolves against. The file's own ancestors come first all
+# the same, so a file under `tests/` can import a sibling by plain dotted name.
 fn _search_roots(path: str) -> list[str] {
     var roots: list[str] = []
     var dir = _dir_of(path)
@@ -591,8 +465,6 @@ fn _search_roots(path: str) -> list[str] {
     return roots
 }
 
-# The directories this binary resolves imports against, or as much of them as
-# can be reconstructed when the primitive is not there.
 fn _runtime_module_path() -> list[str] {
     try {
         let given = __prim__.module_path()
@@ -604,25 +476,14 @@ fn _runtime_module_path() -> list[str] {
             if out.len() > 0 { return out }
         }
     } catch _missing: Error {
-        # A binary without the primitive: reconstruct what can be seen.
+        # A binary without the primitive falls through to the reconstruction.
     }
     return default_search_path()
 }
 
-# Give every imported name the type the module it came from declares.
-#
-# The C's `visitImports` and `bindImportedName`. Without it every name another
-# module exports is `any` here, which erases the type of every call through it
-# and, in a standard library where files import each other constantly, is by
-# far the largest single source of disagreement: measured against the C, it was
-# 173 of `num.jai`'s 192 remaining, 163 of `json.jai`'s 179 and 140 of
-# `test.jai`'s 169.
-#
-# Only the *signature* is read — `modsig` parses the other file and takes its
-# declarations without checking its body, exactly as the C does. A module that
-# cannot be found is not an error here: the resolver already reported an
-# unresolvable import, and a second diagnostic about the same line helps
-# nobody.
+# Give every imported name the type its module declares. The C's `visitImports`
+# and `bindImportedName`. Only the *signature* is read. A module that cannot be
+# found is not an error here: the resolver already reported the bad import.
 fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
     if node is Node {
         if node.kind == NodeKind.Import {
@@ -665,30 +526,12 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
     }
 }
 
-# ------------------------------------------------------------------
-# Import cycles
-# ------------------------------------------------------------------
-
-#: Report `E0801` into `bag` when the imports reachable from `path` close a
-#: cycle.
+#: Report `E0801` when the imports reachable from `path` close a cycle.
 #:
 #: `checkImportCycles` in `src/runtime/module.c`, over the signature loader's
-#: graph instead of a second one built for the purpose. The two are the same
-#: graph: a `ModuleSig` is a parsed file, and `ModuleSig.imports` is exactly
-#: the edge list `collectImports` builds.
-#:
-#: **Deliberately not part of `check_program`.** A cycle is a property of a
-#: *program*, not of a translation unit, and the C draws the line in the same
-#: place: `jaiCheckFile` runs this before the front end and `jaiCompileSource`
-#: never runs it at all. Folding it into the front end would make the
-#: self-hosted compiler reject two files the C compiles happily — which is
-#: exactly what `--bootstrap-verify` then reported, and correctly.
-#:
-#: Nothing about a module two steps away is reported. A module that cannot be
-#: found contributes no edge — E0800 is the importer's diagnostic, at import
-#: time — and a module that does not parse contributes an empty one, because a
-#: file with a syntax error has no reliable import list and will report its own
-#: E01xx when something actually compiles it.
+#: graph. Deliberately not part of `check_program`: a cycle is a property of a
+#: program, not a translation unit, and folding it in made the self-hosted
+#: compiler reject two files the C compiles.
 pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null) -> void {
     if path == "" { return }
     let tree = program ?? _parse_quietly(path)
@@ -712,9 +555,8 @@ pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null)
     )
 }
 
-# The entry file, parsed for its import list alone. No bag is passed, so
-# whatever the parse has to say dies with the call: a syntax error in the file
-# being scanned belongs to its own compilation.
+# The entry file, parsed for its import list alone. No bag is passed: a syntax
+# error in the file being scanned belongs to its own compilation.
 fn _parse_quietly(path: str) -> Node? {
     let text = _read_text(path)
     if text is null { return null }
@@ -734,9 +576,7 @@ fn _read_text(path: str) -> str? {
     }
 }
 
-# The imports the entry file writes. Its own tree is already parsed, so there
-# is nothing to load: only a module reached *through* an import needs a
-# signature.
+# The imports the entry file writes; its own tree is already parsed.
 fn _own_imports(program: Node) -> list[SigImport] {
     var edges: list[SigImport] = []
     for node in program.child_list("stmts") {
@@ -747,8 +587,7 @@ fn _own_imports(program: Node) -> list[SigImport] {
     return edges
 }
 
-# Depth-first over `edges`, answering false once a cycle has been reported: one
-# E0801 says everything the rest of the walk would repeat.
+# Depth-first; false once a cycle is reported, since one E0801 says it all.
 fn _walk_imports(
     c: Ctx,
     loader: SigLoader,
@@ -799,8 +638,7 @@ fn _walk_imports(
     return true
 }
 
-# "a -> b -> a", starting at the first appearance of the module that is being
-# imported again, so the cycle itself is what the reader gets.
+# "a -> b -> a", from the first appearance of the module imported again.
 fn _report_cycle(
     c: Ctx,
     names: list[str],
@@ -826,7 +664,6 @@ fn _report_cycle(
     )
 }
 
-# The name a file answers to in a cycle report: its basename without `.jai`.
 fn _stem_of(path: str) -> str {
     var base = path
     let cut = base.rfind("/")
@@ -835,18 +672,14 @@ fn _stem_of(path: str) -> str {
     return if base == "" { path } else { base }
 }
 
-# The last component of a dotted module name: what `import std.gui` binds.
 fn _tail_of(dotted: str) -> str {
     let cut = dotted.rfind(".")
     if cut < 0 { return dotted }
     return dotted[cut + 1:]
 }
 
-# Load a module's signature and register every type it declares.
-#
-# `loadSigFor`. Registration covers the whole module and not only the names
-# this file asked for, because a declaration it *did* ask for can mention a
-# sibling in an annotation and that sibling has to mean the sibling.
+# `loadSigFor`: load a module's signature and register every type it declares.
+# The whole module, because a name this file asked for can mention a sibling.
 fn _load_sig_for(c: Ctx, loader: SigLoader, dotted: str, from_dir: str) -> ModuleSig? {
     let sig = loader.load(dotted, from_dir)
     if sig is null { return null }
@@ -858,15 +691,9 @@ fn _register_module_types(c: Ctx, sig: ModuleSig) -> void {
     for entry in sig.types { let _ = _register_foreign(c, sig, entry.decl, null, false) }
 }
 
-# Register one class, trait or enum read out of `origin`.
-#
-# `registerForeign`. The type is interned under its QUALIFIED name —
-# `std.str.StringBuilder`, not `StringBuilder` — which is what keeps two
-# modules that each declare a `Node` from being one type, and a `Window`
-# declared here from being `std.gui.Window`. Interning imported classes under
-# their bare name was every disagreement in `json.jai` and `os.jai` once
-# imports were bound: the C says `std.io.File` and this said `File`, which is a
-# different type with the same spelling.
+# Register one class, trait or enum read out of `origin`. `registerForeign`.
+# The type is interned under its QUALIFIED name — `std.str.StringBuilder`, not
+# `StringBuilder` — so two modules that each declare a `Node` stay two types.
 fn _register_foreign(
     c: Ctx,
     origin: ModuleSig?,
@@ -886,9 +713,8 @@ fn _register_foreign(
     if name is null { return null }
     let binding = alias ?? name
 
-    # Already registered, perhaps invisibly by `_register_module_types`: an
-    # import that names it makes the same entry reachable rather than making a
-    # second one, so the two spellings stay one type.
+    # Already registered, perhaps invisibly by `_register_module_types`: reuse
+    # that entry rather than make a second, so both spellings stay one type.
     let existing = c.decl_for_node(node)
     if existing is not null {
         if visible { c.register_decl(existing, true, binding) }
@@ -907,10 +733,7 @@ fn _register_foreign(
 }
 
 # One `name` or `name as local` out of a `from ... import` list.
-#
-# `bindImportedName`. A name the module does not declare — one its body defines
-# at run time, or one this loader cannot follow — is left exactly as it was:
-# `any`, which is what every imported name used to be.
+# `bindImportedName`. A name the module does not declare is left as `any`.
 fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any]) -> void {
     let remote: any? = item.get("name", null)
     if remote is not str { return }
@@ -920,8 +743,7 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
     let found = loader.find(sig, remote)
     let decl = found[0]
     if decl is null { return }
-    # `find` answers the module that really declares the name, which under a
-    # re-export is not the one that was imported from.
+    # Under a re-export, `find` answers the module that really declares it.
     let owner = found[1]
     if not _same_module(owner, sig) { _register_module_types(c, owner) }
 
@@ -953,18 +775,10 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
     }
 }
 
-# Bind every `type X = ...` alias before anything resolves an annotation.
-#
-# The C's `visitAlias`. An alias is a name that stands for a type without
-# declaring one, so it is in neither the declaration registry nor the builtin
-# tables, and `lookup_type_name` would answer null and report E0402 on every
-# use. Measured on `lib/std/list.jai`, that was all 108 remaining
-# disagreements: `Less[T]` and `Rng` read as `any`, which erased the signature
-# of every function taking one, which erased the type of every call through it.
-#
-# A generic alias binds its own parameters while its target is resolved, so
-# `type Less[T] = fn(T, T) -> bool` resolves to `fn(T, T) -> bool` with `T` a
-# generic parameter, and erasure at the use site then does the rest.
+# Bind every `type X = ...` alias before anything resolves an annotation. The
+# C's `visitAlias`. An alias is in neither the declaration registry nor the
+# builtin tables, so without this `lookup_type_name` reports E0402 on every use
+# — all 108 remaining disagreements on `lib/std/list.jai`.
 fn _alias_pass(c: Ctx, node: any) -> void {
     if node is Node {
         if node.kind == NodeKind.TypeDecl {
@@ -988,15 +802,9 @@ fn _alias_pass(c: Ctx, node: any) -> void {
     }
 }
 
-# Give every function its signature before any body is checked.
-#
-# The C's `visitSignature`. Without it a function called above its own
-# declaration answers `any`, because the symbol only acquires a type when
-# `check_decl` reaches the declaration — and a file is checked top to bottom
-# while calls do not respect that order. Measured against the C on
-# `lib/std/math.jai`, this was every remaining disagreement: `fn(int) -> int`
-# and `fn(list[float]) -> float` read as `any` at the call site, which then
-# lost the return type, which then lost the guard on the value it returned.
+# Give every function its signature before any body is checked. The C's
+# `visitSignature`. Without it a function called above its own declaration
+# answers `any`: a file is checked top to bottom and calls do not follow that.
 fn _signature_pass(c: Ctx, node: any) -> void {
     if node is Node {
         if node.kind == NodeKind.FnDecl {
@@ -1014,9 +822,8 @@ fn _signature_pass(c: Ctx, node: any) -> void {
 }
 
 # Every node's final type, recorded after checking rather than as each type is
-# assigned. Folding rewrites nodes and a cast replaces one in place, so a type
-# recorded when it was assigned can be a type the finished tree does not hold.
-# The C does the same walk, in `jaiSemaDumpTypes`.
+# assigned: folding rewrites nodes and a cast replaces one in place. The C's
+# `jaiSemaDumpTypes` does the same walk.
 fn _dump_types(c: Ctx, node: any) -> void {
     if node is Node {
         let ty = c.type_of(node)
@@ -1029,12 +836,8 @@ fn _dump_types(c: Ctx, node: any) -> void {
     } elif node is list {
         for item in node { _dump_types(c, item) }
     } elif node is dict {
-        # A sub-structure record — a call argument, a parameter, a match arm.
-        # These carry nodes without being nodes, so a walk that follows only
-        # Node and list skips every expression passed as an argument. That is
-        # not a small corner: it hid five of the basic fixture's decisions, and
-        # every one of them was a decision the checker had already made
-        # correctly.
+        # A call argument, a parameter, a match arm: these carry nodes without
+        # being nodes, so a walk over Node and list alone skips them.
         for key in node.keys() { _dump_types(c, node[key]) }
     }
 }
