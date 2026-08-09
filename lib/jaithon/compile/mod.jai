@@ -27,7 +27,7 @@ from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
 from jaithon.compile.jaic import disassemble_instruction, float_bits, read_module
 from jaithon.compile.jaic import source_hash, write_module
 from jaithon.compile.check.checker import check_import_cycles, check_program
-from jaithon.compile.check.expr import Ctx
+from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.universe import Universe
 from jaithon.compile.lexer import DiagnosticBag
 from jaithon.compile.opt import optimize

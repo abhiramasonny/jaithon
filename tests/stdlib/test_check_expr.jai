@@ -15,18 +15,18 @@
 from std.test import assert_eq, assert_false, assert_true
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeExpr
 from jaithon.ast import arg, comp_clause, param
-from jaithon.compile.check.expr import Ctx, E0400_TYPE_MISMATCH, E0401_CONDITION_NOT_BOOL
+from jaithon.compile.check.ctx import Ctx, subject_of
+from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, E0401_CONDITION_NOT_BOOL
 from jaithon.compile.check.expr import E0403_NOT_CALLABLE, E0404_NOT_INDEXABLE
 from jaithon.compile.check.expr import E0405_NOT_ITERABLE, E0406_BAD_OPERAND_TYPES
 from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER, E0602_BAD_CALL_ARITY
 from jaithon.compile.check.expr import E0603_UNKNOWN_KEYWORD_ARG, E0604_DUPLICATE_ARGUMENT
 from jaithon.compile.check.expr import E0605_POSITIONAL_AFTER_KEYWORD, E0701_PRIVATE_ACCESS
 from jaithon.compile.check.expr import E0710_ABSTRACT_INSTANTIATION, VIS_PRIVATE, VIS_PROTECTED
-from jaithon.compile.check.expr import VIS_PUBLIC, W0102_UNREACHABLE_CODE
-from jaithon.compile.check.expr import condition, expr, find_init_decl, is_arithmetic
-from jaithon.compile.check.expr import iterable_element, member, self_skip_of, slice
-from jaithon.compile.check.expr import subject_of, value, visibility_word, visible_from
-from jaithon.compile.check.expr import widens_operands
+from jaithon.compile.check.expr import VIS_PUBLIC, W0102_UNREACHABLE_CODE, condition, expr
+from jaithon.compile.check.expr import find_init_decl, is_arithmetic, iterable_element, member
+from jaithon.compile.check.expr import self_skip_of, slice, value, visibility_word
+from jaithon.compile.check.expr import visible_from, widens_operands
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.render import render
 from jaithon.compile.check.ty import FieldInfo, MemberInfo, Type, TypeDecl
@@ -282,7 +282,7 @@ fn test_arithmetic_widens_an_int_operand_against_a_float_one() -> void {
     # The conversion goes into the tree, so the VM performs one conversion
     # rather than a type test on every evaluation.
     assert_true(n.kind == NodeKind.Cast)
-    assert_true(c.is_widen_cast(n))
+    assert_true(n.flag("widen"))
 }
 
 fn test_the_wrapping_and_bitwise_operators_do_not_widen() -> void {

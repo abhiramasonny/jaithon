@@ -22,7 +22,8 @@
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, TypeKind, Visibility
 from jaithon.ast import always_diverges, preorder
 from jaithon.compile.check.assign import is_subtype
-from jaithon.compile.check.expr import Ctx, E0400_TYPE_MISMATCH, VIS_PRIVATE, VIS_PROTECTED
+from jaithon.compile.check.ctx import Ctx
+from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, VIS_PRIVATE, VIS_PROTECTED
 from jaithon.compile.check.expr import VIS_PUBLIC, find_init_decl, self_skip_of, value
 from jaithon.compile.check.fold import const_eval, const_replace
 from jaithon.compile.check.kinds import FN_KWREST, FN_VARIADIC, MAX_DECL_DEPTH, TyKind

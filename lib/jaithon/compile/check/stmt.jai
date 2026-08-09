@@ -34,13 +34,13 @@
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, TypeKind
 from jaithon.ast import always_diverges, is_declaration, is_expression, is_pattern, op_text
 from jaithon.compile.check.assign import assignable
-from jaithon.compile.check.expr import Ctx, E0400_TYPE_MISMATCH, E0404_NOT_INDEXABLE
+from jaithon.compile.check.ctx import Ctx, E0411_INT_FLOAT_MIX, subject_of
+from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, E0404_NOT_INDEXABLE
 from jaithon.compile.check.expr import E0406_BAD_OPERAND_TYPES, E0410_UNKNOWN_MEMBER
-from jaithon.compile.check.expr import E0411_INT_FLOAT_MIX, E0701_PRIVATE_ACCESS
-from jaithon.compile.check.expr import W0102_UNREACHABLE_CODE, condition, expr
-from jaithon.compile.check.expr import iterable_element, self_skip_of, slice, static_target_decl
-from jaithon.compile.check.expr import subject_of, suggest_member, value, visibility_word
-from jaithon.compile.check.expr import visible_from, widens_operands
+from jaithon.compile.check.expr import E0701_PRIVATE_ACCESS, W0102_UNREACHABLE_CODE, condition
+from jaithon.compile.check.expr import expr, iterable_element, self_skip_of, slice
+from jaithon.compile.check.expr import static_target_decl, suggest_member, value
+from jaithon.compile.check.expr import visibility_word, visible_from, widens_operands
 from jaithon.compile.check.fold import ConstKind, ConstValue, const_eval, const_replace
 from jaithon.compile.check.kinds import MAX_DECL_DEPTH, TyKind
 from jaithon.compile.check.nominal import find_accessor, find_member, owner_of_field

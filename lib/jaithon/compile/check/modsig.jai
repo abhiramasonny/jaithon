@@ -1,9 +1,8 @@
 #: An imported module's signatures, for the checker: `src/sema/modsig.c`.
 #:
 #: Modules resolve at run time (spec §8), so cross-module calls reach the front
-#: end unchecked. `SigLoader` parses a module's source for its signatures alone:
-#: no body is checked and no diagnostic escapes. A `.jaic` is no substitute — a
-#: warm cache is exactly the state in which no AST exists.
+#: end unchecked. `SigLoader` parses a module's source for signatures alone; no
+#: body is checked. A `.jaic` cannot serve: a warm cache means no AST exists.
 from jaithon.ast import Node, NodeKind, Span
 from jaithon.compile.parser import parse
 
@@ -47,8 +46,7 @@ pub class SigReexport {
 }
 
 #: One module a module imports. `ImportEdge` in `src/runtime/module.c`: a plain
-#: `import m` binds no name, so it is in neither `decls` nor `reexports` while
-#: still being an edge that can close a cycle.
+#: `import m` binds no name, so only this records the edge that can close a cycle.
 pub class SigImport {
     #: The dotted module name, as written.
     pub let dotted: str
@@ -80,9 +78,7 @@ pub class ModuleSig {
     pub let reexports: list[SigReexport]
     #: Every module this one imports, in source order.
     pub let imports: list[SigImport]
-    #: Modules re-exported wholesale by a `from ... import *`. At most one today,
-    #: only as a file's last statement — the newline after `*` is eaten as a line
-    #: continuation. A lexer bug rather than a rule, so this stays a list.
+    #: Modules re-exported wholesale by a `from ... import *`.
     pub let wildcards: list[str]
 
     pub fn init(self, path: str, dotted: str, file_id: int) {
@@ -98,8 +94,7 @@ pub class ModuleSig {
     }
 
     #: `"std.gui.Window"`: the name an imported type is interned under, so two
-    #: modules declaring a `Node` are two types. Leading dots are dropped — they
-    #: are the importer's point of view and say nothing about identity.
+    #: modules' `Node`s differ. Leading dots say nothing about identity: dropped.
     pub fn qualify(self, name: str) -> str {
         var index = 0
         while index < self.dotted.len() and self.dotted[index] == "." { index += 1 }
@@ -109,8 +104,7 @@ pub class ModuleSig {
     }
 }
 
-#: Every module signature one checker loaded, and the search path it used. An
-#: object rather than the C's file-static vector, which every tree points into.
+#: Every module signature one checker loaded, not the C's file-static vector.
 pub class SigLoader {
     #: `jaiResolveModulePath`'s `sUserDirs` and `sLibDirs`, concatenated.
     pub let search: list[str]
@@ -118,12 +112,10 @@ pub class SigLoader {
     var _cache: dict[str, ModuleSig]
     var _by_file: dict[int, ModuleSig]
     var _next_file_id: int
-    # Paths on the current re-export walk. The C hangs a `visiting` flag on each
-    # signature instead, which would cost `ModuleSig` its data-only shape.
+    # Paths on the current re-export walk, kept here so `ModuleSig` stays data.
     var _visiting: list[str]
 
-    #: Build a loader searching `search`. `first_file_id` leaves 0 to the file
-    #: being checked.
+    #: Build a loader. `first_file_id` leaves 0 to the file being checked.
     pub fn init(self, search: list[str] = [], first_file_id: int = 1) {
         self.search = search
         self._cache = {}
@@ -133,9 +125,8 @@ pub class SigLoader {
     }
 
     #: Load, or return the cached, signature of the module `dotted` names, from
-    #: the directory `from_dir` of the file that wrote the import. Null, silently,
-    #: when it cannot be found or read. A file that does not parse still gets a
-    #: cached empty signature, so it is not re-parsed once per import.
+    #: the directory of the file that wrote the import. Null, silently, when it
+    #: cannot be found. A file that fails to parse is still cached, empty.
     pub fn load(self, dotted: str, from_dir: str = "") -> ModuleSig? {
         if dotted == "" { return null }
         let resolved = resolve_module_path(dotted, from_dir, self.search)
@@ -148,8 +139,7 @@ pub class SigLoader {
         let sig = ModuleSig(resolved, dotted, self._next_file_id)
         self._next_file_id += 1
 
-        # No bag: a syntax error two modules away must not surface as a
-        # diagnostic of the file being checked.
+        # No bag: a syntax error two modules away must not reach the checked file.
         let program = parse(text, sig.file_id)
         sig.program = program
         if program != null and program.kind == NodeKind.Program {
@@ -162,8 +152,7 @@ pub class SigLoader {
     }
 
     #: The declaration `name` denotes in `sig`, and the module that declares it —
-    #: its annotations must be read in that module's namespace, not the
-    #: re-exporter's. Hand-written re-exports are followed before wildcards.
+    #: its annotations are read in that namespace, not the re-exporter's.
     pub fn find(self, sig: ModuleSig, name: str) -> tuple[Node?, ModuleSig] {
         let found = self._find_in(sig, name, MAX_REEXPORT_DEPTH)
         let owner = found[1]
@@ -172,8 +161,7 @@ pub class SigLoader {
     }
 
     #: The signature parsed from `file_id`, or null when that file is not one.
-    #: Spans carry their file, so a declaration reached indirectly traces back to
-    #: the module its annotations must be read in.
+    #: Spans carry their file, so an indirectly reached declaration traces back.
     pub fn for_file(self, file_id: int) -> ModuleSig? {
         if file_id in self._by_file { return self._by_file[file_id] }
         return null
@@ -215,9 +203,8 @@ pub class SigLoader {
 }
 
 #: Split a dotted module name into its leading dots and a relative path.
-#: `splitModuleName` in src/runtime/module.c. Anything that is not
-#: `'.'* ident ('.' ident)*` — `..` and path separators included — is refused, so
-#: a name out of source text cannot reach outside a search directory.
+#: `splitModuleName` in src/runtime/module.c. `..` and path separators are
+#: refused, so a name out of source text cannot escape a search directory.
 pub fn split_module_name(dotted: str) -> tuple[int, str]? {
     if dotted == "" { return null }
     var dots = 0
@@ -234,9 +221,8 @@ pub fn split_module_name(dotted: str) -> tuple[int, str]? {
     return (dots, "/".join(parts))
 }
 
-#: Resolve `dotted` to a file, the way the runtime's importer would.
-#: `jaiResolveModulePath` in src/runtime/module.c, minus its reporting: in each
-#: directory `<dir>/std/gui.jai` wins over the package `<dir>/std/gui/mod.jai`.
+#: Resolve `dotted` to a file the way `jaiResolveModulePath` does, minus its
+#: reporting: `<dir>/std/gui.jai` wins over the package `<dir>/std/gui/mod.jai`.
 pub fn resolve_module_path(dotted: str, from_dir: str = "", search: list[str] = []) -> str? {
     let split = split_module_name(dotted)
     if split is null { return null }
@@ -260,9 +246,8 @@ pub fn resolve_module_path(dotted: str, from_dir: str = "", search: list[str] = 
     return null
 }
 
-#: The search path `jaiModulePathInit` would build. `exec_dir` has to be supplied
-#: — the interpreter's own path is not reachable from Jaithon — or `./lib` in a
-#: build tree is missed.
+#: The search path `jaiModulePathInit` would build. `exec_dir` must be supplied,
+#: since Jaithon cannot reach the interpreter's path, or `./lib` is missed.
 pub fn default_search_path(exec_dir: str? = null) -> list[str] {
     var dirs: list[str] = []
 
@@ -373,8 +358,7 @@ fn _is_name_char(character: str) -> bool {
 }
 
 # `jaiPathJoin`, `jaiPathDirname` and `jaiPathAbsolute` from src/common/memory.c,
-# rewritten rather than taken from `std.io.Path`: the search rule is the
-# runtime's rule only if it composes paths the same way, and `Path` does not.
+# not `std.io.Path`: the search rule holds only if paths compose the same way.
 fn _join(left: str, right: str) -> str {
     let head = if right.starts_with("/") { "" } else { left }
     var raw = head
@@ -405,8 +389,7 @@ fn _dirname(path: str) -> str {
 }
 
 #: As much of `jaiPathAbsolute` as there is a primitive for: `.` and `..` folded
-#: away lexically, no symlink resolution. Public because anything comparing a
-#: path to a `ModuleSig.path` must normalise it the same way.
+#: lexically, no symlinks. Public so callers normalise `ModuleSig.path` alike.
 pub fn absolute(path: str) -> str {
     return _absolute(path)
 }
