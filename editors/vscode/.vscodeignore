@@ -1,0 +1,7 @@
+# Everything the extension needs is checked in and there is no build step, so
+# this only has to keep packaging artefacts and editor droppings out.
+.vscode/**
+.vscodeignore
+**/.DS_Store
+**/*.vsix
+node_modules/**
