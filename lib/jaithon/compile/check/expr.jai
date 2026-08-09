@@ -1337,6 +1337,14 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     # `return total` into `NameError: undefined name 'total'`. The C has no
     # equivalent step because its symbol lives on the node it copies.
     c.resolution.bind(inner, c.resolution.symbol_of(node))
+    # And the function scope, for the same reason. `Resolution` keys a scope on
+    # node identity too, and a wrapped lambda that loses its scope loses its
+    # capture list with it — `emit` reads `scope.upvalues` for the closure's
+    # upvalue count and answers 0. That is not a wrong number, it is a wrong
+    # program: `fn f() -> fn() -> int { var a = 7; return || a * 2 }` compiled
+    # to a closure over nothing and printed nothing at all.
+    let scope = c.resolution.scope_of(node)
+    if scope is not null { c.resolution.set_scope(inner, scope) }
 
     # Recorded against the *operand's* kind and carrying both sides, which is
     # what the C's jaiSemaDumpCast does: it is called from inside wrapInCast
