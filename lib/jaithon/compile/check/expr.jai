@@ -70,6 +70,7 @@
 #: render(expr(c, Node.str_lit("hi")))    # "str"
 #: ```
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeExpr
+from jaithon.ast import kind_name
 from jaithon.ast import is_statement, op_is_comparison, op_text
 from jaithon.compile.check.assign import assignable, widen_target
 from jaithon.compile.check.dump import Record
@@ -275,6 +276,8 @@ pub class Ctx {
     var widen_casts: dict[int, bool]
     var decls_by_name: dict[str, TypeDecl]
     var decls_by_node: dict[int, TypeDecl]
+    # id(TypeExpr) -> the semantic type it resolved to; the C's AstType.resolved.
+    var resolved_types: dict[int, Type]
     var narrow_symbols: list[Symbol]
     var narrow_saved: list[Type]
     var type_names: list[tuple[str, Type]]
@@ -377,6 +380,7 @@ pub class Ctx {
         self.widen_casts = {}
         self.decls_by_name = {}
         self.decls_by_node = {}
+        self.resolved_types = {}
         self.narrow_symbols = []
         self.narrow_saved = []
         self.type_names = []
@@ -457,6 +461,35 @@ pub class Ctx {
     pub fn decl_named(self, name: str?) -> TypeDecl? {
         if name is null { return null }
         return self.decls_by_name.get(name, null)
+    }
+
+    #: Every registered declaration, in registration order.
+    #:
+    #: `checker.jai` lays all of them out before checking anything: half the
+    #: questions the checker asks about a type — is it iterable, does it
+    #: implement that trait, is it callable — are asked in code with no
+    #: declaration in hand to lay out on demand, and an empty declaration
+    #: silently answers "no" to all of them.
+    pub fn all_decls(self) -> list[TypeDecl] {
+        var out: list[TypeDecl] = []
+        for name in self.decls_by_name.keys() { out.push(self.decls_by_name[name]) }
+        return out
+    }
+
+    #: The type a written annotation resolved to, if it has been resolved.
+    #:
+    #: The C caches this on `AstType.resolved`. A Jaithon `TypeExpr` has no
+    #: such field, so like every other annotation this port carries it lives
+    #: beside the tree instead.
+    pub fn resolved_type(self, t: TypeExpr?) -> Type? {
+        if t is null { return null }
+        return self.resolved_types.get(id(t), null)
+    }
+
+    #: Remember what `t` resolved to.
+    pub fn set_resolved_type(self, t: TypeExpr?, ty: Type?) -> void {
+        if t is null or ty is null { return }
+        self.resolved_types[id(t)] = ty
     }
 
     #: The registered declaration `node` declares.
@@ -1057,9 +1090,16 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     let inner = Node(node.kind, node.fields, node.span)
     c.set_type(inner, c.type_of(node))
 
+    # Recorded against the *operand's* kind and carrying both sides, which is
+    # what the C's jaiSemaDumpCast does: it is called from inside wrapInCast
+    # with `inner->kind` and `inner->type`, before the outer node becomes the
+    # cast. Recording `AST_CAST` and the target alone reads as a different
+    # decision at the same span, and `make sema-diff` reports it as one.
     if c.dump is not null and node.span.is_known() {
         let field = if widen { "widen" } else { "guard" }
-        c.dump.push(Record(node.span.start, node.span.end, "AST_CAST", field, render(to)))
+        let source = c.type_of(inner)
+        let rendered = f"{render(source)}->{render(to)}"
+        c.dump.push(Record(node.span.start, node.span.end, kind_name(inner.kind), field, rendered))
     }
 
     let cast = Node(
