@@ -35,9 +35,6 @@
 #include "../runtime/frontend.h"
 
 #include "../codegen/codegen.h"
-#include "../lang/ast.h"
-#include "../lang/lexer.h"
-#include "../lang/parser.h"
 #include "../vm/chunk.h"
 
 #define REPL_PROMPT      ">>> "
@@ -299,16 +296,6 @@ static void replReportUnclosed(void) {
 
 /* ------------------------------------------------------------------ */
 /* Compiling and running one input                                      */
-/* ------------------------------------------------------------------ */
-
-static AstNode *programOf(AstContext *ast, AstNode *stmt) {
-    AstNode *program = jaiAstNew(ast, AST_PROGRAM, stmt->span);
-    AstNode **stmts = jaiAstNodeArray(ast, 1);
-    stmts[0] = stmt;
-    program->as.block.stmts = stmts;
-    program->as.block.count = 1;
-    return program;
-}
 
 /* Nested functions live in the enclosing chunk's constant pool. */
 static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
@@ -322,29 +309,18 @@ static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
     }
 }
 
-/* Print the C front end's syntax tree for one input. The last thing the prompt
- * asks of `src/lang`: `jaiAstPrint`'s s-expression form has golden tests and no
- * self-hosted equivalent yet. */
-static void replPrintCTree(const char *source, size_t length, int fileId) {
-    AstContext ast;
-    Lexer lex;
-    Parser parser;
-    jaiAstContextInit(&ast);
-    jaiLexerInit(&lex, source, length, fileId);
-    bool lexOk = jaiLexerRun(&lex);
-    jaiParserInit(&parser, &lex, &ast);
-
-    AstNode *program = NULL;
-    if (lexOk) {
-        bool incomplete = false;
-        AstNode *stmt = jaiParseREPLLine(&parser, &incomplete);
-        if (stmt != NULL) program = programOf(&ast, stmt);
-    }
-
+/* Print the syntax tree for one input, the way `jaithon ast` prints it. */
+static void replPrintTree(const char *source, size_t length, int fileId) {
+    ObjString *dump = jaiFrontEndAstText(source, length, "<repl>", fileId, false);
     (void)replFlushDiags();
-    if (program != NULL) jaiAstPrint(stdout, program, 0);
-    jaiLexerFree(&lex);
-    jaiAstContextFree(&ast);
+    if (dump == NULL) {
+        /* The front end threw on an input the prompt already decided was
+         * whole, so the tree is the thing that does not exist. */
+        jaiClearException();
+        return;
+    }
+    fwrite(dump->chars, 1, dump->length, stdout);
+    fputc('\n', stdout);
 }
 
 /* Compile one complete input against the persistent module and act on it.
@@ -363,7 +339,7 @@ static void replExecute(const char *source, size_t length, ReplAction action,
     gRepl.module->sourceFileId = fileId;
 
     if (action == REPL_AST) {
-        replPrintCTree(owned, length, fileId);
+        replPrintTree(owned, length, fileId);
         return;
     }
 

@@ -359,3 +359,40 @@ bool jaiFrontEndTransferDiagnostics(Value compiled) {
     jaiPopRoot();
     return list->count > 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Dumps                                                                */
+/* ------------------------------------------------------------------ */
+
+/* `jaithon ast` and `jaithon tokens` used to run the C lexer and parser and
+ * print from the C tree. Both now ask the front end, which is the only one
+ * left: a dump of a tree the compiler does not build would describe a program
+ * nothing runs. */
+static ObjString *dumpText(const char *module, const char *entry,
+                           const char *source, size_t length, int fileId,
+                           bool wantsJson) {
+    Value args[3];
+    args[0] = OBJ_VAL(jaiStringNew(source, length));
+    jaiPushRoot(args[0]);
+    args[1] = INT_VAL(fileId);
+    args[2] = BOOL_VAL(wantsJson);
+
+    Value produced = NULL_VAL;
+    bool called = jaiFrontEndInvoke(module, entry, wantsJson ? 3 : 2, args,
+                                    &produced);
+    jaiPopRoot();
+    if (!called || !IS_STRING(produced)) return NULL;
+    return AS_STRING(produced);
+}
+
+ObjString *jaiFrontEndAstText(const char *source, size_t length,
+                              const char *path, int fileId, bool json) {
+    (void)path;
+    return dumpText(JAI_FRONT_END_MODULE, "dump_ast", source, length, fileId,
+                    json);
+}
+
+ObjString *jaiFrontEndTokenText(const char *source, size_t length, int fileId) {
+    return dumpText("jaithon.compile.lexer", "dump_tokens", source, length,
+                    fileId, false);
+}

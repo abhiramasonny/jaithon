@@ -413,6 +413,133 @@ let _KEYWORDS: dict[str, TokenKind] = {
 pub fn keyword_lookup(text: str) -> TokenKind {
     return _KEYWORDS.get(text, TokenKind.Ident)
 }
+#: The C name of each kind, as `jaiTokenKindName` in `src/lang/token.c` spells
+#: it. `jaithon tokens` prints these, and the spelling is not derivable from the
+#: variant: `Str` is `TOK_STRING`, not `TOK_STR`.
+let _KIND_NAMES: dict[TokenKind, str] = {
+    TokenKind.Eof: "TOK_EOF",
+    TokenKind.Error: "TOK_ERROR",
+    TokenKind.Newline: "TOK_NEWLINE",
+    TokenKind.Int: "TOK_INT",
+    TokenKind.Float: "TOK_FLOAT",
+    TokenKind.Str: "TOK_STRING",
+    TokenKind.FStringStart: "TOK_FSTRING_START",
+    TokenKind.FStringMid: "TOK_FSTRING_MID",
+    TokenKind.FStringEnd: "TOK_FSTRING_END",
+    TokenKind.Ident: "TOK_IDENT",
+    TokenKind.Label: "TOK_LABEL",
+    TokenKind.LParen: "TOK_LPAREN",
+    TokenKind.RParen: "TOK_RPAREN",
+    TokenKind.LBracket: "TOK_LBRACKET",
+    TokenKind.RBracket: "TOK_RBRACKET",
+    TokenKind.LBrace: "TOK_LBRACE",
+    TokenKind.RBrace: "TOK_RBRACE",
+    TokenKind.Comma: "TOK_COMMA",
+    TokenKind.Dot: "TOK_DOT",
+    TokenKind.DotDot: "TOK_DOTDOT",
+    TokenKind.DotDotEq: "TOK_DOTDOT_EQ",
+    TokenKind.Ellipsis: "TOK_ELLIPSIS",
+    TokenKind.Colon: "TOK_COLON",
+    TokenKind.Semicolon: "TOK_SEMICOLON",
+    TokenKind.Arrow: "TOK_ARROW",
+    TokenKind.FatArrow: "TOK_FAT_ARROW",
+    TokenKind.At: "TOK_AT",
+    TokenKind.Question: "TOK_QUESTION",
+    TokenKind.QuestionDot: "TOK_QUESTION_DOT",
+    TokenKind.QuestionQuestion: "TOK_QUESTION_QUESTION",
+    TokenKind.Underscore: "TOK_UNDERSCORE",
+    TokenKind.Plus: "TOK_PLUS",
+    TokenKind.Minus: "TOK_MINUS",
+    TokenKind.Star: "TOK_STAR",
+    TokenKind.Slash: "TOK_SLASH",
+    TokenKind.SlashSlash: "TOK_SLASH_SLASH",
+    TokenKind.Percent: "TOK_PERCENT",
+    TokenKind.StarStar: "TOK_STAR_STAR",
+    TokenKind.PlusPercent: "TOK_PLUS_PERCENT",
+    TokenKind.MinusPercent: "TOK_MINUS_PERCENT",
+    TokenKind.StarPercent: "TOK_STAR_PERCENT",
+    TokenKind.Amp: "TOK_AMP",
+    TokenKind.Pipe: "TOK_PIPE",
+    TokenKind.Caret: "TOK_CARET",
+    TokenKind.Tilde: "TOK_TILDE",
+    TokenKind.Shl: "TOK_SHL",
+    TokenKind.Shr: "TOK_SHR",
+    TokenKind.Eq: "TOK_EQ",
+    TokenKind.EqEq: "TOK_EQ_EQ",
+    TokenKind.BangEq: "TOK_BANG_EQ",
+    TokenKind.Lt: "TOK_LT",
+    TokenKind.Le: "TOK_LE",
+    TokenKind.Gt: "TOK_GT",
+    TokenKind.Ge: "TOK_GE",
+    TokenKind.PlusEq: "TOK_PLUS_EQ",
+    TokenKind.MinusEq: "TOK_MINUS_EQ",
+    TokenKind.StarEq: "TOK_STAR_EQ",
+    TokenKind.SlashEq: "TOK_SLASH_EQ",
+    TokenKind.SlashSlashEq: "TOK_SLASH_SLASH_EQ",
+    TokenKind.PercentEq: "TOK_PERCENT_EQ",
+    TokenKind.StarStarEq: "TOK_STAR_STAR_EQ",
+    TokenKind.AmpEq: "TOK_AMP_EQ",
+    TokenKind.PipeEq: "TOK_PIPE_EQ",
+    TokenKind.CaretEq: "TOK_CARET_EQ",
+    TokenKind.ShlEq: "TOK_SHL_EQ",
+    TokenKind.ShrEq: "TOK_SHR_EQ",
+    TokenKind.KwAnd: "TOK_KW_AND",
+    TokenKind.KwAs: "TOK_KW_AS",
+    TokenKind.KwAssert: "TOK_KW_ASSERT",
+    TokenKind.KwBreak: "TOK_KW_BREAK",
+    TokenKind.KwCase: "TOK_KW_CASE",
+    TokenKind.KwCatch: "TOK_KW_CATCH",
+    TokenKind.KwClass: "TOK_KW_CLASS",
+    TokenKind.KwConst: "TOK_KW_CONST",
+    TokenKind.KwContinue: "TOK_KW_CONTINUE",
+    TokenKind.KwDefer: "TOK_KW_DEFER",
+    TokenKind.KwElif: "TOK_KW_ELIF",
+    TokenKind.KwElse: "TOK_KW_ELSE",
+    TokenKind.KwEnum: "TOK_KW_ENUM",
+    TokenKind.KwExport: "TOK_KW_EXPORT",
+    TokenKind.KwExtends: "TOK_KW_EXTENDS",
+    TokenKind.KwFalse: "TOK_KW_FALSE",
+    TokenKind.KwFinally: "TOK_KW_FINALLY",
+    TokenKind.KwFor: "TOK_KW_FOR",
+    TokenKind.KwFn: "TOK_KW_FN",
+    TokenKind.KwFrom: "TOK_KW_FROM",
+    TokenKind.KwIf: "TOK_KW_IF",
+    TokenKind.KwImpl: "TOK_KW_IMPL",
+    TokenKind.KwImport: "TOK_KW_IMPORT",
+    TokenKind.KwIn: "TOK_KW_IN",
+    TokenKind.KwIs: "TOK_KW_IS",
+    TokenKind.KwLet: "TOK_KW_LET",
+    TokenKind.KwLoop: "TOK_KW_LOOP",
+    TokenKind.KwMatch: "TOK_KW_MATCH",
+    TokenKind.KwModule: "TOK_KW_MODULE",
+    TokenKind.KwMut: "TOK_KW_MUT",
+    TokenKind.KwNot: "TOK_KW_NOT",
+    TokenKind.KwNull: "TOK_KW_NULL",
+    TokenKind.KwOr: "TOK_KW_OR",
+    TokenKind.KwProt: "TOK_KW_PROT",
+    TokenKind.KwPub: "TOK_KW_PUB",
+    TokenKind.KwReturn: "TOK_KW_RETURN",
+    TokenKind.KwSelf: "TOK_KW_SELF",
+    TokenKind.KwStatic: "TOK_KW_STATIC",
+    TokenKind.KwSuper: "TOK_KW_SUPER",
+    TokenKind.KwThrow: "TOK_KW_THROW",
+    TokenKind.KwTrait: "TOK_KW_TRAIT",
+    TokenKind.KwTrue: "TOK_KW_TRUE",
+    TokenKind.KwTry: "TOK_KW_TRY",
+    TokenKind.KwType: "TOK_KW_TYPE",
+    TokenKind.KwVar: "TOK_KW_VAR",
+    TokenKind.KwWhile: "TOK_KW_WHILE",
+    TokenKind.KwYield: "TOK_KW_YIELD",
+}
+
+#: The name `jaithon tokens` prints for `kind`.
+#:
+#: ```
+#: kind_name(TokenKind.KwLet)     # "TOK_KW_LET"
+#: ```
+pub fn kind_name(kind: TokenKind) -> str {
+    return _KIND_NAMES.get(kind, "TOK_INVALID")
+}
 
 #: Return how `kind` is written in source, or a placeholder for the kinds whose
 #: text varies. These strings land verbatim in diagnostics.
@@ -1857,4 +1984,73 @@ fn _unterminated_code(flavor: _StrFlavor) -> str {
 
 fn _string_noun(flavor: _StrFlavor) -> str {
     return flavor.interp ? "f-string" : "string literal"
+}
+
+#: The token stream of `source`, in the format `jaithon tokens` prints.
+#:
+#: One line per token: index, kind name, line:column, then the text it was
+#: written as. A token with no text of its own prints the kind's display form,
+#: so end of file reads as `<end of file>` rather than as nothing.
+#:
+#: ```
+#: dump_tokens("x\n").split("\n")[0].contains("TOK_IDENT")     # true
+#: ```
+pub fn dump_tokens(source: str, file_id: int = 0) -> str {
+    let lexer = Lexer(source, file_id, DiagnosticBag())
+    let tokens = lexer.tokenize()
+
+    # Tokens are in source order, so one cursor walk computes every position;
+    # columns count scalars, not bytes (spec 1.1).
+    let chars = [character for character in source]
+    var offsets: list[int] = []
+    var byte_offset = 0
+    for character in chars {
+        offsets.push(byte_offset)
+        byte_offset += _dump_utf8_length(ord(character))
+    }
+    offsets.push(byte_offset)
+
+    let out = StringBuilder()
+    var index = 0
+    var at = 0
+    var line = 1
+    var column = 1
+    for token in tokens {
+        while at < chars.len() and offsets[at] < token.span.start {
+            if chars[at] == "\n" {
+                line += 1
+                column = 1
+            } else {
+                column += 1
+            }
+            at += 1
+        }
+
+        out.push(f"{index:>5}  {kind_name(token.kind):<22} {line:>4}:{column:<4} ")
+        if token.text.len() == 0 {
+            out.push(kind_text(token.kind))
+        } else {
+            for character in token.text {
+                if character == "\n" {
+                    out.push("\\n")
+                } elif character == "\t" {
+                    out.push("\\t")
+                } elif character == "\r" {
+                    out.push("\\r")
+                } else {
+                    out.push(character)
+                }
+            }
+        }
+        out.push("\n")
+        index += 1
+    }
+    return out.build()
+}
+
+fn _dump_utf8_length(code_point: int) -> int {
+    if code_point < 0x80 { return 1 }
+    if code_point < 0x800 { return 2 }
+    if code_point < 0x10000 { return 3 }
+    return 4
 }

@@ -24,6 +24,8 @@
 
 #include "cli.h"
 
+#include "../runtime/frontend.h"
+
 #include "../codegen/codegen.h"
 #include "../lang/ast.h"
 #include "../lang/lexer.h"
@@ -1044,31 +1046,33 @@ static int cmdParseOnly(const JaiCliOptions *opts, bool tokensOnly) {
         int fileId = jaiSourceAdd(path, source, length);
 
         if (tokensOnly) {
-            Lexer lex;
-            jaiLexerInit(&lex, source, length, fileId);
-            if (!jaiLexerRun(&lex)) status = 1;
-            if (files.count > 1) fprintf(out, "; %s\n", path);
-            jaiLexerDump(out, &lex);
-            jaiLexerFree(&lex);
+            ObjString *dump = jaiFrontEndTokenText(source, length, fileId);
+            if (dump == NULL) {
+                status = 1;
+            } else {
+                if (files.count > 1) fprintf(out, "; %s\n", path);
+                fwrite(dump->chars, 1, dump->length, out);
+            }
             if (cliFlush()) status = 1;
             continue;
         }
 
-        AstContext ast;
-        Lexer lex;
-        jaiAstContextInit(&ast);
-        AstNode *program = jaiParseSource(&ast, &lex, source, length, fileId);
-        if (cliFlush() || program == NULL) {
+        ObjString *dump = jaiFrontEndAstText(source, length, path, fileId,
+                                             opts->jsonOutput);
+        if (dump == NULL) {
+            /* The front end threw: it said why, and there is no tree to print. */
+            jaiClearException();
             status = 1;
-        } else if (opts->jsonOutput) {
-            jaiAstToJson(out, program);
-            fputc('\n', out);
         } else {
-            if (files.count > 1) fprintf(out, "; %s\n", path);
-            jaiAstPrint(out, program, 0);
+            if (!opts->jsonOutput && files.count > 1) {
+                fprintf(out, "; %s\n", path);
+            }
+            fwrite(dump->chars, 1, dump->length, out);
+            /* Both forms end in a newline, as `jaiAstPrint` and `jaiAstToJson`
+             * did: a dump that runs into the next one is not readable. */
+            fputc('\n', out);
         }
-        jaiLexerFree(&lex);
-        jaiAstContextFree(&ast);
+        if (cliFlush()) status = 1;
     }
 
     pathListFree(&files);
@@ -1238,12 +1242,11 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
     case CMD_REPL:
     case CMD_EVAL:
         return true;
-    /* These two print the C front end's own tree and token stream. There is
-     * nothing for the flag to select until the self-hosted side can print the
-     * same, so they stay on C and say so rather than pretending. */
+    /* Both print what the front end read, and the self-hosted printer is now
+     * the one that prints it. */
     case CMD_AST:
     case CMD_TOKENS:
-        return false;
+        return true;
     }
     return false;
 }

@@ -93,6 +93,20 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
  * printing that was a real loss of quality that no gate caught. */
 bool jaiFrontEndTransferDiagnostics(Value compiled);
 
+/* ------------------------------------------------------------------ */
+/* Dumps                                                                */
+/* ------------------------------------------------------------------ */
+
+/* What `jaithon ast`, `jaithon ast --json` and `jaithon tokens` print for
+ * `source`, as the front end renders it. NULL when the front end could not be
+ * reached or refused the input; the reason is in gDiags or was thrown.
+ *
+ * The returned string is a Jaithon object and is only guaranteed live until the
+ * next allocation, so callers write it out and drop it. */
+ObjString *jaiFrontEndAstText(const char *source, size_t length,
+                              const char *path, int fileId, bool json);
+ObjString *jaiFrontEndTokenText(const char *source, size_t length, int fileId);
+
 /* Forget every declaration the session recorded, for `:reset`. */
 void jaiFrontEndReplForget(void);
 
