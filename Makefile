@@ -320,6 +320,14 @@ bootstrap: $(TARGET)
 # decision shows up as missing on the Jaithon side. That is the correct reading
 # and not a fault in the tool: the mismatch count is how much of the checker is
 # still to write, and it should fall to zero.
+#: Byte-compare the .jaic each front end produces. --bootstrap-verify compares
+#: FuncProtos and never opens the container, so it can report `ok` for a file
+#: whose images differ; Phase 8's fixpoint gate is byte for byte, so this is the
+#: meter that actually covers it.
+.PHONY: image-parity
+image-parity: $(TARGET)
+	@scripts/image_parity.sh $(if $(PATHS),$(PATHS),lib/std)
+
 sema-diff: $(TARGET)
 	@test -n "$(FILE)" || { echo "usage: make sema-diff FILE=path.jai"; exit 2; }
 	@./$(TARGET) check --dump-sema $(BUILD)/sema.c.txt $(FILE)
