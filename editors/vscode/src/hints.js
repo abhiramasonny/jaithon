@@ -286,10 +286,23 @@ function modifiersOf(symbol, declaration) {
 }
 
 /**
- * Resolve without touching other files. A cross-file answer would mean parsing
- * the import graph on every repaint; the fallbacks below cover what is missed.
+ * The checker types a member access with the type of what it yields, so a
+ * function type is how you tell `canvas.clear(…)` from `game.food` without
+ * resolving anything.
  */
-function classify(analysis, ref) {
+function memberToken(analysis, ref) {
+    const span = ref.node?.span;
+    const accessed = span ? analysis.typeAt(span.start, span.end) : null;
+    return accessed && accessed.trim().startsWith('fn(') ? 'method' : 'property';
+}
+
+/**
+ * Resolve within this file. Names that come from another module are resolved
+ * once per file by the caller and handed in as `imported`, because an import
+ * that names a class must not be painted as a variable — two types written
+ * side by side would come out two different colours.
+ */
+function classify(analysis, ref, imported) {
     // An import line reads as one thing, so the name being imported is coloured
     // like the path it comes from rather than guessed at.
     if (ref.kind === 'module-path' || ref.kind === 'imported') {
@@ -309,15 +322,22 @@ function classify(analysis, ref) {
         const owner = analysis.lookup(baseTypeName(ref.receiver) || '', analysis.moduleScope);
         const member = owner && analysis.memberNamed(owner, ref.name);
         if (member) return { type: SYMBOL_TOKEN[member.kind], modifiers: modifiersOf(member, false) };
-        if (moduleOfType(ref.receiver)) return { type: 'variable', modifiers: [] };
         if (builtins.methodsFor(ref.receiver).includes(ref.name)) {
             return { type: 'method', modifiers: ['defaultLibrary'] };
         }
-        return { type: 'property', modifiers: [] };
+        if (moduleOfType(ref.receiver)) return { type: memberToken(analysis, ref), modifiers: [] };
+        return { type: memberToken(analysis, ref), modifiers: [] };
     }
 
     const symbol = analysis.lookup(ref.name, ref.scope);
     if (symbol) {
+        // An import stands for a declaration elsewhere; paint it as whatever
+        // that declaration is, not as the local binding that names it.
+        if (symbol.kind === 'import') {
+            const resolved = imported?.get(symbol.name);
+            if (resolved) return { type: resolved, modifiers: [] };
+            return { type: ref.kind === 'type' ? 'class' : 'variable', modifiers: [] };
+        }
         const type = SYMBOL_TOKEN[symbol.kind];
         return type ? { type, modifiers: modifiersOf(symbol, false) } : null;
     }
