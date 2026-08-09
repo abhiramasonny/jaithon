@@ -12,7 +12,6 @@
     { "include": "#keywords" },
     { "include": "#constants" },
     { "include": "#lambda" },
-    { "include": "#named-arguments" },
     { "include": "#types" },
     { "include": "#calls" },
     { "include": "#operators" },
@@ -199,14 +198,30 @@
     "declarations": {
       "patterns": [
         {
-          "comment": "fn name[T](params) -> Type",
+          "comment": "fn name[T](params) -> Type. Runs to the body, so a generic function's parameters are scoped the same way a plain one's are.",
           "begin": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "end": "(?<=[)\\]])|(?=[{\\n])",
+          "end": "(?=[{\\n])",
           "beginCaptures": {
             "1": { "name": "storage.type.function.jaithon" },
             "2": { "name": "entity.name.function.jaithon" }
           },
-          "patterns": [{ "include": "#parameter-list" }, { "include": "#generic-parameters" }]
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#generic-parameters" },
+            { "include": "#parameter-list" },
+            { "include": "#annotations" }
+          ]
+        },
+        {
+          "comment": "An anonymous `fn(...)`, whose parameters are parameters too.",
+          "begin": "\\b(fn)\\s*(?=\\()",
+          "end": "(?=[{\\n])",
+          "beginCaptures": { "1": { "name": "storage.type.function.jaithon" } },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#parameter-list" },
+            { "include": "#annotations" }
+          ]
         },
         {
           "comment": "class Name[T] extends Base: Trait, Trait",
@@ -306,16 +321,49 @@
         { "name": "keyword.operator.variadic.jaithon", "match": "\\.\\.\\." },
         { "name": "variable.language.self.jaithon", "match": "\\bself\\b" },
         {
+          "comment": "Ahead of the parameter-name rule: `f(flag: bool = false)` ends in a literal, not in another parameter.",
+          "include": "#constants"
+        },
+        {
           "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[:,)])",
           "captures": { "1": { "name": "variable.parameter.jaithon" } }
         },
         { "include": "#declared-type" },
+        {
+          "comment": "A default value is an arbitrary expression. Its brackets have to nest, or the `)` of a call inside one closes the parameter list.",
+          "include": "#group"
+        },
+        { "include": "#lambda" },
         { "include": "#strings" },
         { "include": "#numbers" },
         { "include": "#constants" },
         { "include": "#operators" },
+        { "include": "#calls" },
         { "include": "#punctuation" },
         { "include": "#identifiers" }
+      ]
+    },
+
+    "group": {
+      "patterns": [
+        {
+          "begin": "\\(",
+          "end": "\\)",
+          "captures": { "0": { "name": "punctuation.section.parens.jaithon" } },
+          "patterns": [{ "include": "$self" }]
+        },
+        {
+          "begin": "\\[",
+          "end": "\\]",
+          "captures": { "0": { "name": "punctuation.section.brackets.jaithon" } },
+          "patterns": [{ "include": "$self" }]
+        },
+        {
+          "begin": "\\{",
+          "end": "\\}",
+          "captures": { "0": { "name": "punctuation.section.braces.jaithon" } },
+          "patterns": [{ "include": "$self" }]
+        }
       ]
     },
 
@@ -346,7 +394,11 @@
           "endCaptures": { "0": { "name": "punctuation.section.parens.jaithon" } },
           "patterns": [{ "include": "#type-expression" }]
         },
-        { "name": "support.type.primitive.jaithon", "match": "\\b(int|float|bool|str|bytes|any|void|never|list|dict|set|tuple|range)\\b" },
+        {
+          "comment": "`null` is a type here, and reads as one beside the primitives it is unioned with.",
+          "name": "support.type.primitive.jaithon",
+          "match": "\\b(int|float|bool|str|bytes|any|void|never|null|list|dict|set|tuple|range)\\b"
+        },
         { "name": "storage.type.function.jaithon", "match": "\\bfn\\b" },
         { "name": "support.class.error.jaithon", "match": "\\b(Error|AssertionError|ArithmeticError|DivisionByZeroError|OverflowError|LookupError|IndexError|KeyError|NameError|TypeError|ValueError|ParseError|AttributeError|IOError|FileNotFoundError|PermissionError|OSError|RuntimeError|RecursionError|StopIteration|ImportError)\\b" },
         { "name": "entity.name.type.jaithon", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" },
@@ -366,7 +418,14 @@
         { "name": "keyword.control.exception.jaithon", "match": "\\b(try|catch|finally)\\b" },
         { "name": "keyword.control.import.jaithon", "match": "\\b(import|from|as|export|module)\\b" },
         { "name": "storage.modifier.jaithon", "match": "\\b(pub|prot|static|mut|impl|extends)\\b" },
-        { "name": "storage.type.jaithon", "match": "\\b(fn|let|var|const|class|trait|enum|type)\\b" },
+        {
+          "comment": "One scope per keyword, matching what the declaration rules above capture: `fn` must not change colour just because the function is anonymous.",
+          "name": "storage.type.function.jaithon",
+          "match": "\\bfn\\b"
+        },
+        { "name": "storage.type.class.jaithon", "match": "\\b(class|trait)\\b" },
+        { "name": "storage.type.enum.jaithon", "match": "\\benum\\b" },
+        { "name": "storage.type.jaithon", "match": "\\b(let|var|const|type)\\b" },
         { "name": "keyword.other.assert.jaithon", "match": "\\b(assert)\\b" },
         { "name": "variable.language.self.jaithon", "match": "\\b(self|super)\\b" },
         { "name": "keyword.operator.logical.jaithon", "match": "\\b(and|or|not|is|in)\\b" }
@@ -430,15 +489,6 @@
           "captures": { "1": { "name": "entity.name.function.call.jaithon" } }
         }
       ]
-    },
-
-    "named-arguments": {
-      "comment": "greet(name: \"Ada\") — the label is not a type annotation.",
-      "match": "(?<=[(,])\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(:)(?!:)",
-      "captures": {
-        "1": { "name": "variable.parameter.named.jaithon" },
-        "2": { "name": "punctuation.separator.jaithon" }
-      }
     },
 
     "types": {

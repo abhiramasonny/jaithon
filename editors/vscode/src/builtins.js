@@ -61,8 +61,16 @@ const FUNCTIONS = {
     bytes: { signature: 'bytes(values = []) -> bytes', doc: 'Build a byte string.' },
 };
 
-/** Methods on primitive receivers, from `candidatesFor` in builtins.c. */
-const METHODS = {
+/**
+ * Methods on primitive receivers.
+ *
+ * Only a fallback: `refresh` replaces these by asking the running VM what each
+ * type actually answers to. The tables in builtins.c that this mirrors are the
+ * names `dir` *probes*, not the ones that exist — `list` lists thirteen methods
+ * here that no build implements — so the live answer is the correct one and
+ * this is what is used until it arrives.
+ */
+const FALLBACK_METHODS = {
     str: ['at', 'capitalize', 'center', 'chars', 'code_at', 'contains', 'count',
           'encode', 'ends_with', 'find', 'format', 'index', 'is_alnum', 'is_alpha',
           'is_digit', 'is_empty', 'is_lower', 'is_space', 'is_upper', 'iter', 'join',
@@ -123,8 +131,57 @@ const EXCEPTIONS = {
     ImportError: 'Error',
 };
 
-/** Every exception carries these; see addErrorFields. */
-const EXCEPTION_MEMBERS = ['message', 'traceback', 'traceback_string'];
+/** Every exception carries these; see addErrorFields. Also replaced by `refresh`. */
+const FALLBACK_EXCEPTION_MEMBERS = ['message', 'traceback', 'traceback_string'];
+
+// What the editor actually consults. Starts as the tables above and is replaced
+// wholesale the first time the compiler answers.
+let METHODS = { ...FALLBACK_METHODS };
+let EXCEPTION_MEMBERS = [...FALLBACK_EXCEPTION_MEMBERS];
+let live = false;
+
+/**
+ * Ask the VM which methods each primitive receiver answers to.
+ *
+ * `dir` probes the real dispatch table, so this is the only account of the
+ * builtin surface that cannot drift: a method the build does not implement
+ * stops being offered the moment you rebuild. One process, about 6 ms.
+ */
+const PROBE = '{"int": dir(0), "float": dir(0.0), "str": dir(""), "list": dir([]), '
+    + '"dict": dir({}), "set": dir(set()), "tuple": dir((1, 2)), "range": dir(0..1), '
+    + '"bytes": dir(bytes()), "Iterator": dir([].iter()), "Error": dir(Error(""))}';
+
+async function refresh(tool, output) {
+    const result = await tool.run(['--eval', PROBE], {});
+    if (result.spawnFailed || result.code !== 0) return false;
+
+    let parsed;
+    try {
+        parsed = JSON.parse(result.stdout.trim());
+    } catch {
+        output?.appendLine('could not read the builtin method tables; using the bundled copy');
+        return false;
+    }
+    if (!parsed || typeof parsed !== 'object') return false;
+
+    const next = { ...FALLBACK_METHODS };
+    for (const [type, names] of Object.entries(parsed)) {
+        if (!Array.isArray(names) || !names.every((n) => typeof n === 'string')) continue;
+        if (type === 'Error') {
+            EXCEPTION_MEMBERS = names.filter((name) => !name.startsWith('__') && name !== 'init');
+            continue;
+        }
+        next[type] = names;
+    }
+    METHODS = next;
+    live = true;
+    return true;
+}
+
+/** True once the tables came from the compiler rather than from this file. */
+function isLive() {
+    return live;
+}
 
 /** Traits std.prelude re-exports into every module. */
 const PRELUDE_TRAITS = [
@@ -145,11 +202,14 @@ const DUNDERS = [
 function methodsFor(type) {
     if (!type) return [];
     const text = type.trim().replace(/\?+$/, '');
-    const base = text.split('[')[0];
+    const base = text.split('[')[0].split('.').pop();
     if (METHODS[base]) return METHODS[base];
     if (EXCEPTIONS[base] !== undefined) return EXCEPTION_MEMBERS;
-    if (text.startsWith('fn(')) return [];
     return [];
+}
+
+function exceptionMembers() {
+    return EXCEPTION_MEMBERS;
 }
 
 /** The namespace the runtime's primitive operations live under. */
@@ -171,7 +231,7 @@ function exceptionChain(name) {
 }
 
 module.exports = {
-    KEYWORDS, PRIMITIVE_TYPES, FUNCTIONS, METHODS, EXCEPTIONS,
-    EXCEPTION_MEMBERS, PRELUDE_TRAITS, DUNDERS, PRIMITIVE_NAMESPACE,
-    methodsFor, isException, exceptionChain,
+    KEYWORDS, PRIMITIVE_TYPES, FUNCTIONS, EXCEPTIONS,
+    PRELUDE_TRAITS, DUNDERS, PRIMITIVE_NAMESPACE,
+    methodsFor, isException, exceptionChain, exceptionMembers, refresh, isLive,
 };
