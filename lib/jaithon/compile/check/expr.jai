@@ -1457,10 +1457,21 @@ fn _check_ident(c: Ctx, node: Node) -> Type {
     }
 
     # Classes and enums may be referenced before their layout pass ran.
+    #
+    # The kind test is on the *resolved type* and not only on the symbol,
+    # because the symbol kind is not enough. The C reaches a builtin exception
+    # through the runtime's own symbol registration — `ValueError` arrives
+    # already carrying its type — and this front end has no such registration,
+    # so a name the resolver called `Builtin` or `Global` would answer `any`
+    # where the C answers `ValueError`. Measured against the C on lib/std,
+    # that one gap was every remaining disagreement in tuple.jai and most of
+    # func.jai's. Locals and parameters stay excluded, so a binding that
+    # shadows a class name is still the binding.
     if c.symbol_type(symbol) is null and symbol.kind != SymbolKind.Local {
         if symbol.kind != SymbolKind.Param {
             let named = c.lookup_type_name(c, symbol.name)
-            if named is not null and _is_type_symbol(symbol.kind) {
+            let nominal = named is not null and named.is_named()
+            if named is not null and (_is_type_symbol(symbol.kind) or nominal) {
                 c.set_symbol_type(symbol, named)
             }
         }

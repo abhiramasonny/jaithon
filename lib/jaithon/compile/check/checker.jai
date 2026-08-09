@@ -364,5 +364,13 @@ fn _dump_types(c: Ctx, node: any) -> void {
         for key in node.fields.keys() { _dump_types(c, node.fields[key]) }
     } elif node is list {
         for item in node { _dump_types(c, item) }
+    } elif node is dict {
+        # A sub-structure record — a call argument, a parameter, a match arm.
+        # These carry nodes without being nodes, so a walk that follows only
+        # Node and list skips every expression passed as an argument. That is
+        # not a small corner: it hid five of the basic fixture's decisions, and
+        # every one of them was a decision the checker had already made
+        # correctly.
+        for key in node.keys() { _dump_types(c, node[key]) }
     }
 }
