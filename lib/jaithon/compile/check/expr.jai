@@ -40,6 +40,12 @@
 #: | `m.f` after `import m` | `any` | `Ctx.is_module` / `Ctx.module_member` |
 #: | a written type annotation | `any` | `Ctx.resolve_ast_type` |
 #: | a class laid out on demand | never laid out | `Ctx.layout_decl` |
+#: | a declaration inside a block | unchecked | `Ctx.check_decl`, from `check_decl.c` |
+#:
+#: The last row is the one callback nothing in this file reaches. It is declared
+#: here because `Ctx` is where the seam lives, and `stmt.jai` — which does reach
+#: it, for the `class` and `fn` a block may contain — must not have to grow a
+#: second context object to hold one field.
 #:
 #: Two further gaps are the AST's rather than a callback's, and neither can be
 #: closed from here:
@@ -234,6 +240,17 @@ pub class Ctx {
     #: The class whose body is being checked, for `self`, `super` and
     #: visibility.
     pub var current_class: TypeDecl?
+    #: What the function whose body is being checked was declared to return,
+    #: or null outside every body.
+    #:
+    #: The C's `Checker.currentReturnType`. `stmt.jai` saves it, sets it and
+    #: restores it around each body, and checks every `return` against it.
+    pub var current_return_type: Type?
+    #: `--strict`: an unannotated parameter is an error.
+    #:
+    #: The C's `Checker.strict`, and false by default for the same reason — the
+    #: driver turns it on, nothing here does.
+    pub var strict: bool
     #: Whether a folded operator node is replaced by its literal. The C's
     #: `c->foldConstants`, and true for the same reason: the compiler folds.
     pub var fold_constants: bool
@@ -241,6 +258,17 @@ pub class Ctx {
     pub var consts: dict[str, Node]
     #: The sema-dump records, when one is being collected.
     pub var dump: list[Record]?
+    #: How far each declaration has got through layout, keyed by `id(decl)`:
+    #: absent or 0 for unstarted, 1 for in progress, 2 for laid out.
+    #:
+    #: `DeclEntry.status` in `src/sema/check.c`, which `check_decl.c` reads for
+    #: two things: to make layout idempotent, and to recognise a cycle — a
+    #: declaration reached again while it is still being laid out is `E0706`. A
+    #: Jaithon `TypeDecl` has no such field and `DeclEntry` is not ported, so
+    #: the status lives here beside the registry it belongs to. Empty by
+    #: default, which reads as "nothing has been laid out yet"; `decl.jai` is
+    #: the only writer.
+    pub var layout_status: dict[int, int]
 
     var node_types: dict[int, Type]
     var symbol_types: dict[int, Type]
@@ -249,6 +277,7 @@ pub class Ctx {
     var decls_by_node: dict[int, TypeDecl]
     var narrow_symbols: list[Symbol]
     var narrow_saved: list[Type]
+    var type_names: list[tuple[str, Type]]
 
     #: Check that `source` fits `target`, converting or guarding where it must.
     #:
@@ -292,6 +321,13 @@ pub class Ctx {
     #:
     #: `jaiChkStmt`. **The default does nothing.**
     pub var check_stmt: fn(Ctx, Node?) -> void
+    #: Check a declaration that appeared in a block.
+    #:
+    #: `jaiChkDecl`, which `check_decl.c` owns. **The default does nothing**, so
+    #: a nested `class` or `fn` keeps the names the resolver bound and gets no
+    #: layout and no body check. Nothing in this file reaches it; `stmt.jai`
+    #: does, for the declarations a block may contain.
+    pub var check_decl: fn(Ctx, Node?) -> void
     #: Check the body of a lambda or an anonymous function.
     #:
     #: `jaiChkFunction`. **The default does nothing**; the signature is still
@@ -330,9 +366,12 @@ pub class Ctx {
         self.bag = bag ?? DiagnosticBag()
         self.resolution = resolution ?? Resolution()
         self.current_class = null
+        self.current_return_type = null
+        self.strict = false
         self.fold_constants = true
         self.consts = {}
         self.dump = null
+        self.layout_status = {}
         self.node_types = {}
         self.symbol_types = {}
         self.widen_casts = {}
@@ -340,6 +379,7 @@ pub class Ctx {
         self.decls_by_node = {}
         self.narrow_symbols = []
         self.narrow_saved = []
+        self.type_names = []
         self.require_assignable = _default_require_assignable
         self.apply_context = _default_apply_context
         self.widen_to_float = _default_widen_to_float
@@ -349,6 +389,7 @@ pub class Ctx {
         self.check_pattern = _default_check_pattern
         self.check_block = _default_check_block
         self.check_stmt = _default_check_stmt
+        self.check_decl = _default_check_decl
         self.check_function = _default_check_function
         self.function_type = _default_function_type
         self.match_expr = _default_match_expr
@@ -436,6 +477,50 @@ pub class Ctx {
         return self.decl_for_node(symbol.decl)
     }
 
+    #: Where the type-name scope stack stands, so a declaration can unwind to
+    #: here.
+    #:
+    #: `jaiChkTypeNameMark`. The stack holds the names that denote a type only
+    #: inside the declaration that introduced them — a generic parameter, and
+    #: `Self` — and is consulted before the registry, so an innermost binding
+    #: wins.
+    pub fn type_name_mark(self) -> int {
+        return self.type_names.len()
+    }
+
+    #: Bind `name` to `ty` until the enclosing declaration ends.
+    #:
+    #: `jaiChkPushTypeName`. A null name or type is dropped: the C pushes the
+    #: entry and no lookup can ever match it, which is the same thing.
+    pub fn push_type_name(self, name: str?, ty: Type?) -> void {
+        if name is null or ty is null { return }
+        self.type_names.push((name, ty))
+    }
+
+    #: Drop every binding pushed since `mark`.
+    #:
+    #: `jaiChkTypeNameRestore`, down to its tolerance of a mark outside the
+    #: stack, which it ignores rather than reporting.
+    pub fn type_name_restore(self, mark: int) -> void {
+        if mark < 0 or mark > self.type_names.len() { return }
+        while self.type_names.len() > mark { let _dropped = self.type_names.pop() }
+    }
+
+    #: The type `name` denotes in the innermost scope that binds it, or null.
+    #:
+    #: The first half of `jaiChkLookupTypeName`, which `_default_lookup_type_name`
+    #: consults before the declaration registry.
+    pub fn scoped_type_name(self, name: str?) -> Type? {
+        if name is null { return null }
+        var at = self.type_names.len() - 1
+        while at >= 0 {
+            let (bound, ty) = self.type_names[at]
+            if bound == name { return ty }
+            at -= 1
+        }
+        return null
+    }
+
     #: Report an error, and hand it back so the caller can decorate it.
     pub fn error(self, code: str, span: Span, message: str) -> Diagnostic {
         return self.bag.error(code, span, message)
@@ -487,6 +572,17 @@ pub class Ctx {
             if saved == symbol { return self.narrow_saved[position] }
         }
         return self.symbol_type(symbol)
+    }
+
+    #: End the fact a store to `symbol` invalidated.
+    #:
+    #: `jaiChkNarrowInvalidate`. What the binding holds after the store is
+    #: whatever its declaration admits, so the narrowed view is dropped. The
+    #: save stack is deliberately left alone: the enclosing `narrow_restore`
+    #: still has to unwind in order.
+    pub fn narrow_invalidate(self, symbol: Symbol?) -> void {
+        let declared = self.declared_type(symbol)
+        if declared is not null { self.set_symbol_type(symbol, declared) }
     }
 
     #: What `cond` proves, on the edge `negate` names.
@@ -761,9 +857,12 @@ fn _default_resolve_ast_type(c: Ctx, written: TypeExpr?) -> Type? {
     return null
 }
 
-# The registry alone. `checker.jai` adds the scalars, the aliases in scope and
-# the generic parameters of the enclosing declaration.
+# The type-name scope stack, then the registry — the first two of the four
+# things `jaiChkLookupTypeName` consults. `checker.jai` adds the remaining two:
+# the builtin scalars, and a name read out of another module's namespace.
 fn _default_lookup_type_name(c: Ctx, name: str?) -> Type? {
+    let scoped = c.scoped_type_name(name)
+    if scoped is not null { return scoped }
     let decl = c.decl_named(name)
     if decl is null { return null }
     return decl.ty
@@ -779,6 +878,9 @@ fn _default_check_block(c: Ctx, node: Node?) -> void {
 }
 
 fn _default_check_stmt(c: Ctx, node: Node?) -> void {
+}
+
+fn _default_check_decl(c: Ctx, node: Node?) -> void {
 }
 
 fn _default_check_function(c: Ctx, node: Node?) -> void {
