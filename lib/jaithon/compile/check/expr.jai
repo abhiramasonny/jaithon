@@ -234,7 +234,13 @@ pub class Ctx {
     #: The intern table every answer is built from.
     pub let universe: Universe
     #: Where diagnostics go.
-    pub let bag: DiagnosticBag
+    #:
+    #: A `var` because a foreign scope swaps a scratch bag in and throws it
+    #: away: whatever is wrong with another module is that module's own
+    #: compilation to report, and a signature read out of it must not be able
+    #: to raise a diagnostic against this file. `jaiChkForeignBegin` does the
+    #: same to `gDiags`.
+    pub var bag: DiagnosticBag
     #: What the resolver decided: symbols, and which brackets held type
     #: arguments.
     pub let resolution: Resolution
@@ -277,12 +283,35 @@ pub class Ctx {
     var widen_casts: dict[int, bool]
     var decls_by_name: dict[str, TypeDecl]
     var decls_by_node: dict[int, TypeDecl]
+    # Every registered declaration in registration order, this file's and the
+    # ones read out of imported modules. `gJaiCheck.decls` in the C, which is a
+    # vector rather than a map for exactly the reason it matters here: layout
+    # walks it by index and a layout may append to it.
+    var decl_order: list[TypeDecl]
+    # `id(TypeDecl)` of everything in `decl_order`, so registering twice is a
+    # lookup rather than a scan of the list.
+    var decl_seen: set[int]
+    # id(Symbol) -> the declaration node another module holds for it. The C's
+    # `Symbol.importedDecl`; a Jaithon `Symbol` has no such field.
+    var imported_decls: dict[int, Node]
     # id(TypeExpr) -> the semantic type it resolved to; the C's AstType.resolved.
     var resolved_types: dict[int, Type]
     #: The signature loader, so a qualified member can be resolved against the
     #: module it came from. Installed by `checker.check_program`; null when
     #: nothing set one, in which case `m.f` answers `any`.
     pub var sig_loader: any?
+    #: The module whose namespace names currently resolve in, or null for this
+    #: file's own. `gJaiCheck.foreignOrigin`; a `check.modsig.ModuleSig`, held
+    #: as `any` for the reason `ty.TypeDecl.origin` gives.
+    pub var foreign_origin: any?
+    #: Every name an import bound in this file.
+    #:
+    #: A name in here that denotes no declaration this checker could load is
+    #: `any` rather than E0402. The C reaches the same answer through the
+    #: resolver's scope — `s->decl->kind == AST_FROM_IMPORT` — which a Jaithon
+    #: `Resolution` cannot be asked, since it maps nodes to symbols and not
+    #: names to symbols.
+    pub var imported_names: set[str]
     #: The directory of the file being checked, which is where an import
     #: resolves from.
     pub var source_dir: str
@@ -388,8 +417,13 @@ pub class Ctx {
         self.widen_casts = {}
         self.decls_by_name = {}
         self.decls_by_node = {}
+        self.decl_order = []
+        self.decl_seen = set()
+        self.imported_decls = {}
         self.resolved_types = {}
         self.sig_loader = null
+        self.foreign_origin = null
+        self.imported_names = set()
         self.source_dir = ""
         self.narrow_symbols = []
         self.narrow_saved = []
@@ -457,17 +491,30 @@ pub class Ctx {
         return self.widen_casts.get(id(node), false)
     }
 
-    #: Register a laid-out declaration, by name and by declaring node.
+    #: Register a declaration, by name and by declaring node.
     #:
-    #: `gJaiCheck.decls` in the C, minus the import machinery: this holds what
-    #: `jaiTypeDeclFind` and `jaiChkDeclForNode` answer from.
-    pub fn register_decl(self, decl: TypeDecl) -> void {
-        self.decls_by_name[decl.name] = decl
+    #: `gJaiCheck.decls` in the C. `visible` is `DeclEntry.visible`: a
+    #: declaration read out of an imported module is registered whether or not
+    #: this file named it, because one that *was* named can mention a sibling
+    #: in an annotation and the sibling has to mean the sibling — but only what
+    #: this file imported may be reached by a bare name here. `binding` is
+    #: `DeclEntry.alias`, the name it answers to in this file.
+    pub fn register_decl(self, decl: TypeDecl, visible: bool = true, binding: str? = null) -> void {
+        let name = binding ?? decl.name
+        # A name this file already declares wins: the resolver has its own word
+        # for a genuine clash (E0302) and this is not the place for a second.
+        if visible and name not in self.decls_by_name { self.decls_by_name[name] = decl }
         let node = decl.node
-        if node is not null { self.decls_by_node[id(node)] = decl }
+        if node is not null and id(node) not in self.decls_by_node {
+            self.decls_by_node[id(node)] = decl
+        }
+        if id(decl) not in self.decl_seen {
+            self.decl_seen.add(id(decl))
+            self.decl_order.push(decl)
+        }
     }
 
-    #: The registered declaration called `name`.
+    #: The registered declaration `name` reaches in this file.
     pub fn decl_named(self, name: str?) -> TypeDecl? {
         if name is null { return null }
         return self.decls_by_name.get(name, null)
@@ -480,10 +527,76 @@ pub class Ctx {
     #: implement that trait, is it callable — are asked in code with no
     #: declaration in hand to lay out on demand, and an empty declaration
     #: silently answers "no" to all of them.
+    #:
+    #: The list itself is handed back rather than a copy, because laying a
+    #: declaration out can discover a type in a third module and register it,
+    #: and the caller's loop has to see the entries that appear behind it.
     pub fn all_decls(self) -> list[TypeDecl] {
-        var out: list[TypeDecl] = []
-        for name in self.decls_by_name.keys() { out.push(self.decls_by_name[name]) }
+        return self.decl_order
+    }
+
+    #: Every enum declaration a bare name reaches here, by that name.
+    #:
+    #: The emitter needs it and has no registry of its own: an enum pattern's
+    #: tag is the variant's position in the declaration, and for an imported
+    #: enum that declaration is in another file. The C's codegen reads the same
+    #: answer straight out of `jaiTypeDeclFind`.
+    pub fn enum_decls(self) -> dict[str, Node] {
+        var out: dict[str, Node] = {}
+        for name in self.decls_by_name.keys() {
+            let declared = self.decls_by_name[name]
+            let node = declared.node
+            if declared.is_enum and node is not null { out[name] = node }
+        }
         return out
+    }
+
+    #: Record that `symbol` is bound to a declaration in another module.
+    pub fn set_imported_decl(self, symbol: Symbol?, decl: Node?) -> void {
+        if symbol is null or decl is null { return }
+        self.imported_decls[id(symbol)] = decl
+    }
+
+    #: The declaration another module holds for `symbol`, or null.
+    pub fn imported_decl(self, symbol: Symbol?) -> Node? {
+        if symbol is null { return null }
+        return self.imported_decls.get(id(symbol), null)
+    }
+
+    #: Resolve names in `origin`'s namespace until `leave_foreign` puts it back.
+    #:
+    #: `jaiChkForeignBegin` with `quiet` always true, which is the only way the
+    #: C ever calls it. Two things change together and must: the scope names
+    #: resolve in, and where a diagnostic goes. A signature read out of another
+    #: module mentions that module's types, and a name it can see that this
+    #: file cannot is not a mistake this file may report — so the bag is
+    #: swapped for a scratch one and everything written to it is dropped.
+    #:
+    #: Entering a null origin is a no-op with a real saved state, so a caller
+    #: that does not know whether its declaration is foreign can wrap
+    #: unconditionally.
+    pub fn enter_foreign(self, origin: any?) -> tuple[any?, DiagnosticBag] {
+        let saved = (self.foreign_origin, self.bag)
+        self.foreign_origin = origin
+        if origin is not null { self.bag = DiagnosticBag() }
+        return saved
+    }
+
+    #: Undo `enter_foreign`, discarding whatever the foreign scope reported.
+    pub fn leave_foreign(self, saved: tuple[any?, DiagnosticBag]) -> void {
+        self.foreign_origin = saved[0]
+        self.bag = saved[1]
+    }
+
+    #: The module `node` was parsed from, or null for one written in this file.
+    #:
+    #: `jaiChkOriginOfNode`, and by the same route: every span carries the file
+    #: it came from, and the loader knows which module each file it parsed is.
+    pub fn origin_of_node(self, node: Node?) -> any? {
+        if node is null { return null }
+        let loader = self.sig_loader
+        if loader is null { return null }
+        return loader.for_file(node.span.file)
     }
 
     #: The type a written annotation resolved to, if it has been resolved.
@@ -517,6 +630,20 @@ pub class Ctx {
     pub fn ident_type_decl(self, symbol: Symbol?) -> TypeDecl? {
         if symbol is null { return null }
         if _is_type_symbol(symbol.kind) { return self.decl_named(symbol.name) }
+        # An imported binding keeps the kind the resolver gave it — it occupies
+        # a local or a global slot and the emitter has to go on believing that
+        # — so what it names is reached through the declaration attached to the
+        # symbol instead. That is what makes `StringBuilder()` construct rather
+        # than call something of unknown type.
+        let imported = self.imported_decl(symbol)
+        if imported is not null {
+            if imported.kind == NodeKind.ClassDecl or
+                imported.kind == NodeKind.TraitDecl or
+                imported.kind == NodeKind.EnumDecl {
+                return self.decl_for_node(imported)
+            }
+            return null
+        }
         return self.decl_for_node(symbol.decl)
     }
 
@@ -2349,11 +2476,18 @@ fn _binding_word(kind: SymbolKind) -> str {
 # the declaration's back-link, which the resolver writes wherever a `fn` is
 # bound to a name, says which binding actually names the function.
 #
-# The C also follows `Symbol.importedDecl`, so that a call across a module
-# boundary binds against the real signature. A Jaithon `Symbol` has no such
-# field, so `from m import f` is checked against `f`'s type alone.
+# `Symbol.importedDecl` is followed first, so that a call across a module
+# boundary binds against the real parameter list rather than against the `Fn`
+# type alone. The difference is not cosmetic: a `Fn` type carries arity and
+# nothing else, so every default argument reads as required — `parse(text, 0)`
+# was E0602 against `fn(str, int, DiagnosticBag) -> Node?` — and a keyword
+# argument has no name to be checked against, which is what E0603 needs.
 fn _denoted_function_decl(c: Ctx, symbol: Symbol?) -> Node? {
     if symbol is null { return null }
+    let imported = c.imported_decl(symbol)
+    if imported is not null {
+        return if imported.kind == NodeKind.FnDecl { imported } else { null }
+    }
     let decl = symbol.decl
     if decl is null or decl.kind != NodeKind.FnDecl { return null }
     return if c.resolution.symbol_of(decl) == symbol { decl } else { null }
@@ -2474,16 +2608,18 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
 
     # Resolved once, up front, because a declaration in another module has to be
     # read in *its* namespace and the loop below reports this file's errors in
-    # this file's. The C swaps the origin for that; `resolve_ast_type` does not
-    # take one yet, so an imported annotation naming an imported type is `any`.
+    # this file's. `int` and `list[str]` mean the same thing everywhere; a name
+    # that module imported and this one did not is `any`.
     var param_types: list[Type] = []
     if declared and param_count <= MAX_ARGS {
+        let saved = c.enter_foreign(c.origin_of_node(decl_node))
         for parameter in params {
             let written = _param_type(parameter)
             var resolved: Type? = u.t_any
             if written is not null { resolved = c.resolve_ast_type(c, written) }
             param_types.push(resolved ?? u.t_any)
         }
+        c.leave_foreign(saved)
     }
 
     if declared and param_count <= MAX_ARGS {

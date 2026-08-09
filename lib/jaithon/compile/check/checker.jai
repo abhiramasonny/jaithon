@@ -19,11 +19,12 @@
 #: without it emits none of the `OP_TYPE_GUARD` and `OP_TO_FLOAT` that account
 #: for roughly half the bytecode the two front ends disagree about. It is the
 #: difference between a checker that runs and a checker that does anything.
-from jaithon.ast import Node, NodeKind, TypeExpr, TypeKind, kind_name
+from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind, kind_name
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.dump import Record
-from jaithon.compile.check.modsig import ModuleSig, SigLoader, default_search_path
+from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
+from jaithon.compile.check.modsig import absolute, default_search_path, dirname
 from jaithon.compile.check.expr import Ctx
 from jaithon.compile.check.render import render
 from jaithon.compile.check.kinds import TyKind
@@ -32,6 +33,7 @@ from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, list_of
 from jaithon.compile.check.universe import named, set_of, tuple_of
 from jaithon.compile.lexer import DiagnosticBag
+from jaithon.compile.parser import parse
 from jaithon.compile.resolve import Resolution
 import jaithon.compile.check.decl as decl_mod
 import jaithon.compile.check.stmt as stmt_mod
@@ -41,6 +43,17 @@ pub const E0402_UNKNOWN_TYPE: str = "E0402"
 
 #: A generic was written with the wrong number of arguments.
 pub const E0407_GENERIC_ARITY: str = "E0407"
+
+#: The imports reachable from this file close a loop.
+pub const E0801_CIRCULAR_IMPORT: str = "E0801"
+
+#: How deep the cycle walk follows imports before giving up.
+#:
+#: The C bounds nothing here — its graph is a real graph with a colour per
+#: node, so the walk terminates on its own. This one bounds the *recursion*,
+#: because a Jaithon stack overflow in the checker would report as a crash
+#: rather than as the answer "no cycle found within reach".
+const MAX_IMPORT_DEPTH: int = 256
 
 #: The names that are types without anything declaring them.
 #:
@@ -117,6 +130,12 @@ fn _builtin_class(u: Universe, name: str?) -> Type? {
 #: Innermost binding wins: a generic parameter shadows a class of the same
 #: name, which shadows a module-level alias. That stack is `Ctx.type_names`,
 #: pushed by `decl.push_generics` and `decl.push_self`.
+#:
+#: Inside a foreign scope the whole tail of the search changes, because the
+#: question changes: a name written in another module's source means one of
+#: *that* module's declarations, never one of this file's, and a name this file
+#: cannot see is not a mistake it may report. `jaiChkLookupTypeName` splits the
+#: same way.
 pub fn lookup_type_name(c: Ctx, name: str?) -> Type? {
     if name == null { return null }
 
@@ -126,19 +145,61 @@ pub fn lookup_type_name(c: Ctx, name: str?) -> Type? {
     let scalar = _builtin_scalar(c.universe, name)
     if scalar != null { return scalar }
 
+    if c.foreign_origin is not null {
+        let foreign = _lookup_foreign_type_name(c, name)
+        if foreign is not null { return foreign }
+        # Never null: an unresolvable name in a foreign signature is a name
+        # this file cannot see, not a mistake it may report.
+        return _builtin_class(c.universe, name) ?? c.universe.t_any
+    }
+
     let declared = c.decl_named(name)
     if declared != null and declared.ty != null { return declared.ty }
 
-    # The C has one more branch here and this port cannot reach it: it asks the
-    # resolver for the symbol `name` binds and takes the type off it, which is
-    # how an imported class or a runtime-registered builtin resolves. Jaithon's
-    # `Resolution` binds symbols to *nodes* (`symbol_of`) and exposes no
-    # lookup by bare name, so there is nothing to ask. The consequence is that
-    # an imported type used in an annotation falls through to the builtin-class
-    # table and then to null, and the caller reports E0402 where the C
-    # silently answers `any`. Phase 5 owns the module graph and is where the
-    # lookup that closes this belongs.
+    # A name this file imported that names no declaration the loader could
+    # follow: one the module defines at run time, or one whose module is not on
+    # the search path. It is a real name, not a typo, and gradual typing
+    # already has a word for a type whose shape is unknown. Reporting E0402
+    # here would make every `from std.core import Iterable` unusable in an
+    # annotation — which is exactly what it did, on 80 of the 198 files
+    # `--bootstrap-verify` walks.
+    if name in c.imported_names { return c.universe.t_any }
+
     return _builtin_class(c.universe, name)
+}
+
+# A name written in another module's source. It means what it means *there*:
+# one of that module's own declarations, or one it imported in turn — followed
+# through, because otherwise `fn draw(w: Window)` in `std.gui.canvas` would
+# check nothing and the difference between a local call and a call one module
+# away would be exactly the thing this is here to remove.
+#
+# `lookupForeignTypeName` in `src/sema/check.c`. What it finds is registered
+# *invisible*: this file did not import it, so it may not be named here — it is
+# registered only so that the module that did import it can.
+fn _lookup_foreign_type_name(c: Ctx, name: str) -> Type? {
+    let origin = c.foreign_origin
+    for entry in c.all_decls() {
+        if not _same_module(entry.origin, origin) { continue }
+        if entry.name == name { return entry.ty }
+    }
+
+    let loader = c.sig_loader
+    if loader is null or origin is null { return null }
+    let found = loader.find(origin, name)
+    let decl = found[0]
+    if decl is null { return null }
+    let registered = _register_foreign(c, found[1], decl, null, false)
+    if registered is null { return null }
+    return registered.ty
+}
+
+# Whether two `ModuleSig?` values are the same module. `is` is a type test in
+# Jaithon, not an identity one, and `ModuleSig` defines no `__eq__`, so `==`
+# would be identity — but only for two non-null operands.
+fn _same_module(left: any?, right: any?) -> bool {
+    if left is null or right is null { return left is null and right is null }
+    return id(left) == id(right)
 }
 
 # `list`, `set`, `dict` and `tuple` written with arguments. Answers whether it
@@ -303,6 +364,19 @@ pub fn install(c: Ctx) -> void {
     c.module_member = _module_member
     stmt_mod.install(c)
     decl_mod.install(c)
+    # After `decl.install`, because it wraps what that installed: laying a
+    # declaration out resolves every annotation in its body, and one read out
+    # of another module has to resolve them there. `jaiChkLayoutDecl` opens
+    # with the same `jaiChkForeignBegin(c, entry->decl->origin, ...)`.
+    c.layout_decl = _layout_in_origin
+}
+
+# `decl.layout_decl`, with the declaration's own module installed around it.
+fn _layout_in_origin(c: Ctx, declared: TypeDecl?) -> void {
+    if declared is null { return }
+    let saved = c.enter_foreign(declared.origin)
+    layout_decl(c, declared)
+    c.leave_foreign(saved)
 }
 
 # True when `node` names an imported module rather than a value.
@@ -334,10 +408,42 @@ fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
 
     let found = loader.find(sig, name)
     let decl = found[0]
+    # Defined at run time, or private: `any` is the honest answer and the one
+    # every imported name used to get.
     if decl is null { return (u.t_any, null) }
 
-    let ty = _signature_type(c, decl, found[1])
-    return (ty ?? u.t_any, decl)
+    match decl.kind {
+        NodeKind.FnDecl => { return (_foreign_function_type(c, found[1], decl), decl) }
+        NodeKind.ClassDecl => { return (_module_type_member(c, decl), decl) }
+        NodeKind.TraitDecl => { return (_module_type_member(c, decl), decl) }
+        NodeKind.EnumDecl => { return (_module_type_member(c, decl), decl) }
+        _ => { return (u.t_any, null) }
+    }
+}
+
+# `m.Thing` after `import m`: the registered foreign declaration, laid out, so
+# that `m.Thing(...)` constructs and `m.Thing.member` resolves. Registration
+# happened when the import was seen; a declaration reached any other way has
+# none and is `any`.
+fn _module_type_member(c: Ctx, decl: Node) -> Type {
+    let registered = c.decl_for_node(decl)
+    if registered is null { return c.universe.t_any }
+    c.layout_decl(c, registered)
+    return registered.ty ?? c.universe.t_any
+}
+
+# The `Fn` type of a declaration read out of `origin`, resolved there.
+#
+# `jaiChkForeignFunctionType`. Without the scope, `fn verify_source(...) ->
+# VerifyResult` resolved in this file's scope gives `fn(...) -> any`, and the
+# `any` then spreads to every call, every binding that holds a result, and
+# every member read off one — 75 of the 137 decisions in
+# `tests/lang/test_bootstrap_verify.jai` alone.
+fn _foreign_function_type(c: Ctx, origin: ModuleSig?, fn_node: Node) -> Type {
+    let saved = c.enter_foreign(origin)
+    let signature = signature_of(c, fn_node, false)
+    c.leave_foreign(saved)
+    return signature
 }
 
 #: Register every class, trait and enum this file declares.
@@ -384,15 +490,29 @@ pub fn check_program(
     install(c)
     if program == null { return c }
 
+    # This file's own declarations first, so that a name it declares always
+    # wins over one it imports, and only then what the imports bring in.
     _register_all(c, program)
     # `path` is the file being checked, and an import resolves relative to the
     # directory holding it before it resolves against the search path.
-    let loader = SigLoader(_search_roots(path, default_search_path()))
+    let loader = SigLoader(_search_roots(path))
     c.sig_loader = loader
     c.source_dir = _dir_of(path)
     _import_pass(c, program, loader, _dir_of(path))
     _alias_pass(c, program)
-    for declared in c.all_decls() { layout_decl(c, declared) }
+    # Everything registered, imported declarations included. Laying those out
+    # on demand does not work: `Iter` is assignable to `Iterator` only if its
+    # trait list says so, and half the questions the checker asks about a type
+    # are asked in code with no declaration in hand to lay out first.
+    #
+    # The loop re-reads the length because a layout can discover a type in a
+    # third module and register it, which is why `all_decls` hands back the
+    # live list rather than a copy.
+    var at = 0
+    while at < c.all_decls().len() {
+        c.layout_decl(c, c.all_decls()[at])
+        at += 1
+    }
     _signature_pass(c, program)
     c.check_block(c, program)
     # The C ends jaiCheckProgram with `program->type = gTypes.tVoid`, and void
@@ -413,21 +533,47 @@ fn _dir_of(path: str) -> str {
 #
 # A dotted name resolves against a *root*, not against the importing file's own
 # directory: `std.math` imported from `lib/std/random.jai` is `lib/std/math.jai`,
-# which is found by searching `lib` and not `lib/std`. The C gets its roots from
-# the executable's location and `JAITHON_PATH`; neither is reachable from here
-# — `os_argv()[0]` is the script, not the interpreter — so every ancestor of the
-# importing file is offered instead, nearest first. That finds `lib` from
-# `lib/std/random.jai` without knowing anything about the install layout, and a
-# root that holds no matching module simply does not answer.
-fn _search_roots(path: str, base: list[str]) -> list[str] {
+# which is found by searching `lib` and not `lib/std`.
+#
+# `__prim__.module_path()` is the answer to that, and it is the whole reason the
+# primitive exists: it hands over the directories this binary actually resolves
+# an import against — `JAITHON_PATH`, the ones derived from the executable's
+# own location, the fixed system ones and anything `-I` added — so the two
+# front ends agree about where a module lives instead of one of them guessing
+# from the source path. `default_search_path` reconstructs a subset of that
+# list and is the fallback for a build where the primitive is missing.
+#
+# The importing file's own ancestors come first all the same. That is not the
+# runtime's rule and it is not there to find `std`: it is there so that a file
+# under `tests/` can import a sibling package by a plain dotted name, which the
+# fixtures do and which the C's `-I` handles for it.
+fn _search_roots(path: str) -> list[str] {
     var roots: list[str] = []
     var dir = _dir_of(path)
     while dir != "" {
         roots.push(dir)
         dir = _dir_of(dir)
     }
-    for entry in base { roots.push(entry) }
+    for entry in _runtime_module_path() { roots.push(entry) }
     return roots
+}
+
+# The directories this binary resolves imports against, or as much of them as
+# can be reconstructed when the primitive is not there.
+fn _runtime_module_path() -> list[str] {
+    try {
+        let given = __prim__.module_path()
+        if given is list {
+            var out: list[str] = []
+            for entry in given {
+                if entry is str { out.push(entry) }
+            }
+            if out.len() > 0 { return out }
+        }
+    } catch _missing: Error {
+        # A binary without the primitive: reconstruct what can be seen.
+    }
+    return default_search_path()
 }
 
 # Give every imported name the type the module it came from declares.
@@ -449,7 +595,8 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
         if node.kind == NodeKind.Import {
             let dotted = node.opt_text("path")
             if dotted is not null {
-                let sig = loader.load(dotted, from_dir)
+                c.imported_names.add(node.opt_text("alias") ?? _tail_of(dotted))
+                let sig = _load_sig_for(c, loader, dotted, from_dir)
                 if sig is not null {
                     let symbol = c.resolution.symbol_of(node)
                     if symbol is not null and c.symbol_type(symbol) is null {
@@ -458,11 +605,22 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
                 }
             }
         } elif node.kind == NodeKind.FromImport {
-            let dotted = node.opt_text("path")
-            if dotted is not null {
-                let sig = loader.load(dotted, from_dir)
-                if sig is not null {
-                    for item in node.records("items") { _bind_imported(c, loader, sig, item) }
+            # `from m import *` binds no symbols here at all — the resolver
+            # defers every unknown name to the run time — so there is nothing
+            # to attach.
+            if not node.flag("isWildcard") {
+                for item in node.records("items") {
+                    let remote: any? = item.get("name", null)
+                    if remote is not str { continue }
+                    let alias: any? = item.get("alias", null)
+                    c.imported_names.add(if alias is str { alias } else { remote })
+                }
+                let dotted = node.opt_text("path")
+                if dotted is not null {
+                    let sig = _load_sig_for(c, loader, dotted, from_dir)
+                    if sig is not null {
+                        for item in node.records("items") { _bind_imported(c, loader, sig, item) }
+                    }
                 }
             }
         }
@@ -474,10 +632,257 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
     }
 }
 
+# ------------------------------------------------------------------
+# Import cycles
+# ------------------------------------------------------------------
+
+#: Report `E0801` into `bag` when the imports reachable from `path` close a
+#: cycle.
+#:
+#: `checkImportCycles` in `src/runtime/module.c`, over the signature loader's
+#: graph instead of a second one built for the purpose. The two are the same
+#: graph: a `ModuleSig` is a parsed file, and `ModuleSig.imports` is exactly
+#: the edge list `collectImports` builds.
+#:
+#: **Deliberately not part of `check_program`.** A cycle is a property of a
+#: *program*, not of a translation unit, and the C draws the line in the same
+#: place: `jaiCheckFile` runs this before the front end and `jaiCompileSource`
+#: never runs it at all. Folding it into the front end would make the
+#: self-hosted compiler reject two files the C compiles happily — which is
+#: exactly what `--bootstrap-verify` then reported, and correctly.
+#:
+#: Nothing about a module two steps away is reported. A module that cannot be
+#: found contributes no edge — E0800 is the importer's diagnostic, at import
+#: time — and a module that does not parse contributes an empty one, because a
+#: file with a syntax error has no reliable import list and will report its own
+#: E01xx when something actually compiles it.
+pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null) -> void {
+    if path == "" { return }
+    let tree = program ?? _parse_quietly(path)
+    if tree is null { return }
+
+    let c = Ctx(Universe(), bag)
+    let loader = SigLoader(_search_roots(path))
+    var visited: set[str] = set()
+    var stack: list[str] = [absolute(path)]
+    var names: list[str] = [_stem_of(path)]
+    var entered: list[Span] = [Span.none()]
+    let _complete = _walk_imports(
+        c,
+        loader,
+        _own_imports(tree),
+        _dir_of(path),
+        stack,
+        names,
+        entered,
+        visited
+    )
+}
+
+# The entry file, parsed for its import list alone. No bag is passed, so
+# whatever the parse has to say dies with the call: a syntax error in the file
+# being scanned belongs to its own compilation.
+fn _parse_quietly(path: str) -> Node? {
+    let text = _read_text(path)
+    if text is null { return null }
+    let tree = parse(text, 0)
+    if tree is null or tree.kind != NodeKind.Program { return null }
+    return tree
+}
+
+fn _read_text(path: str) -> str? {
+    try {
+        let handle = __prim__.io_open(path, "rb")
+        let raw = __prim__.io_read(handle, -1)
+        __prim__.io_close(handle)
+        return __prim__.str_decode(raw)
+    } catch _failure: Error {
+        return null
+    }
+}
+
+# The imports the entry file writes. Its own tree is already parsed, so there
+# is nothing to load: only a module reached *through* an import needs a
+# signature.
+fn _own_imports(program: Node) -> list[SigImport] {
+    var edges: list[SigImport] = []
+    for node in program.child_list("stmts") {
+        if node.kind != NodeKind.Import and node.kind != NodeKind.FromImport { continue }
+        let dotted = node.opt_text("path")
+        if dotted is not null { edges.push(SigImport(dotted, node.span)) }
+    }
+    return edges
+}
+
+# Depth-first over `edges`, answering false once a cycle has been reported: one
+# E0801 says everything the rest of the walk would repeat.
+fn _walk_imports(
+    c: Ctx,
+    loader: SigLoader,
+    edges: list[SigImport],
+    from_dir: str,
+    stack: list[str],
+    names: list[str],
+    entered: list[Span],
+    visited: set[str]
+) -> bool {
+    if stack.len() >= MAX_IMPORT_DEPTH { return true }
+    for edge in edges {
+        let sig = loader.load(edge.dotted, from_dir)
+        if sig is null { continue }
+        if sig.path in visited { continue }
+
+        var at = -1
+        for (index, entry) in stack.enumerate() {
+            if entry == sig.path {
+                at = index
+                break
+            }
+        }
+        if at >= 0 {
+            _report_cycle(c, names, entered, at, edge)
+            return false
+        }
+
+        stack.push(sig.path)
+        names.push(_stem_of(sig.path))
+        entered.push(edge.span)
+        let complete = _walk_imports(
+            c,
+            loader,
+            sig.imports,
+            dirname(sig.path),
+            stack,
+            names,
+            entered,
+            visited
+        )
+        let _left = stack.pop()
+        let _unnamed = names.pop()
+        let _edge = entered.pop()
+        if not complete { return false }
+        visited.add(sig.path)
+    }
+    return true
+}
+
+# "a -> b -> a", starting at the first appearance of the module that is being
+# imported again, so the cycle itself is what the reader gets.
+fn _report_cycle(
+    c: Ctx,
+    names: list[str],
+    entered: list[Span],
+    at: int,
+    closing: SigImport
+) -> void {
+    var chain: list[str] = []
+    var index = at
+    while index < names.len() {
+        chain.push(names[index])
+        index += 1
+    }
+    chain.push(names[at])
+
+    let d = c.error(E0801_CIRCULAR_IMPORT, closing.span, f"circular import: {" -> ".join(chain)}")
+    d.label(closing.span, "this import closes the cycle")
+    # The edge that entered the cycle, so both ends of it are on screen.
+    if at + 1 < entered.len() { d.label(entered[at + 1], "the cycle starts here") }
+    d.with_help(
+        "move the shared declarations into a module every step of the cycle " +
+            "can import, or move the import inside the function that needs it"
+    )
+}
+
+# The name a file answers to in a cycle report: its basename without `.jai`.
+fn _stem_of(path: str) -> str {
+    var base = path
+    let cut = base.rfind("/")
+    if cut >= 0 { base = base[cut + 1:] }
+    if base.ends_with(MODULE_EXT) { base = base[:base.len() - MODULE_EXT.len()] }
+    return if base == "" { path } else { base }
+}
+
+# The last component of a dotted module name: what `import std.gui` binds.
+fn _tail_of(dotted: str) -> str {
+    let cut = dotted.rfind(".")
+    if cut < 0 { return dotted }
+    return dotted[cut + 1:]
+}
+
+# Load a module's signature and register every type it declares.
+#
+# `loadSigFor`. Registration covers the whole module and not only the names
+# this file asked for, because a declaration it *did* ask for can mention a
+# sibling in an annotation and that sibling has to mean the sibling.
+fn _load_sig_for(c: Ctx, loader: SigLoader, dotted: str, from_dir: str) -> ModuleSig? {
+    let sig = loader.load(dotted, from_dir)
+    if sig is null { return null }
+    _register_module_types(c, sig)
+    return sig
+}
+
+fn _register_module_types(c: Ctx, sig: ModuleSig) -> void {
+    for entry in sig.types { let _ = _register_foreign(c, sig, entry.decl, null, false) }
+}
+
+# Register one class, trait or enum read out of `origin`.
+#
+# `registerForeign`. The type is interned under its QUALIFIED name —
+# `std.str.StringBuilder`, not `StringBuilder` — which is what keeps two
+# modules that each declare a `Node` from being one type, and a `Window`
+# declared here from being `std.gui.Window`. Interning imported classes under
+# their bare name was every disagreement in `json.jai` and `os.jai` once
+# imports were bound: the C says `std.io.File` and this said `File`, which is a
+# different type with the same spelling.
+fn _register_foreign(
+    c: Ctx,
+    origin: ModuleSig?,
+    node: Node,
+    alias: str?,
+    visible: bool
+) -> TypeDecl? {
+    var kind = TyKind.Class
+    match node.kind {
+        NodeKind.ClassDecl => { kind = TyKind.Class }
+        NodeKind.TraitDecl => { kind = TyKind.Trait }
+        NodeKind.EnumDecl => { kind = TyKind.Enum }
+        _ => { return null }
+    }
+
+    let name = node.opt_text("name")
+    if name is null { return null }
+    let binding = alias ?? name
+
+    # Already registered, perhaps invisibly by `_register_module_types`: an
+    # import that names it makes the same entry reachable rather than making a
+    # second one, so the two spellings stay one type.
+    let existing = c.decl_for_node(node)
+    if existing is not null {
+        if visible { c.register_decl(existing, true, binding) }
+        return existing
+    }
+
+    let declared = TypeDecl(name, node.span, node)
+    declared.origin = origin
+    declared.is_trait = node.kind == NodeKind.TraitDecl
+    declared.is_enum = node.kind == NodeKind.EnumDecl
+    declared.is_abstract = node.kind == NodeKind.ClassDecl and node.flag("isAbstract")
+    let qualified = if origin is null { name } else { origin.qualify(name) }
+    declared.ty = named(c.universe, kind, qualified, declared)
+    c.register_decl(declared, visible, binding)
+    return declared
+}
+
 # One `name` or `name as local` out of a `from ... import` list.
+#
+# `bindImportedName`. A name the module does not declare — one its body defines
+# at run time, or one this loader cannot follow — is left exactly as it was:
+# `any`, which is what every imported name used to be.
 fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any]) -> void {
-    let remote = if "name" in item { item["name"] } else { null }
+    let remote: any? = item.get("name", null)
     if remote is not str { return }
+    let written: any? = item.get("alias", null)
+    let alias: str? = if written is str { written } else { null }
 
     let found = loader.find(sig, remote)
     let decl = found[0]
@@ -485,81 +890,34 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
     # `find` answers the module that really declares the name, which under a
     # re-export is not the one that was imported from.
     let owner = found[1]
-
-    # The declaring module's own name scope, not this one's: a signature is
-    # resolved where it was written, so a type it mentions means what it meant
-    # there. Anything this file cannot see falls back to `any`, which is what
-    # the C does for a foreign name too.
-    let ty = _signature_type(c, decl, owner)
-    if ty is null { return }
+    if not _same_module(owner, sig) { _register_module_types(c, owner) }
 
     let symbol = c.resolution.symbol_of(item)
-    if symbol is not null and c.symbol_type(symbol) is null {
-        c.set_symbol_type(symbol, ty)
-    }
-}
-
-# Resolve `body` with `owner`'s type names in scope, then put the scope back.
-#
-# The C's `jaiChkForeignBegin` / `jaiChkForeignEnd`. A signature read out of
-# another module names types that module declares, and those names mean nothing
-# here — `fn verify_source(...) -> VerifyResult` resolved in this file's scope
-# gives `fn(...) -> any`, and the `any` then spreads to every call, every
-# binding that holds a result, and every member read off one. That was 75 of
-# the 137 decisions in `tests/lang/test_bootstrap_verify.jai` alone.
-#
-# Each of the owner's declarations is bound to its qualified nominal type, so a
-# name resolves to the same type the import pass gives it and the two agree.
-fn _in_foreign_scope(c: Ctx, owner: ModuleSig?, body: fn() -> Type?) -> Type? {
-    if owner is null { return body() }
-    let mark = c.type_name_mark()
-    for entry in owner.types {
-        c.push_type_name(
-            entry.name,
-            named(c.universe, _decl_kind(entry.decl), owner.qualify(entry.name))
-        )
-    }
-    let answer = body()
-    c.type_name_restore(mark)
-    return answer
-}
-
-# Which nominal kind a declaration node introduces.
-fn _decl_kind(decl: Node) -> TyKind {
-    if decl.kind == NodeKind.TraitDecl { return TyKind.Trait }
-    if decl.kind == NodeKind.EnumDecl { return TyKind.Enum }
-    return TyKind.Class
-}
-
-# The type a declaration read out of another module's signature denotes.
-#
-# A nominal type from another module is interned under its QUALIFIED name —
-# `std.str.StringBuilder`, not `StringBuilder`. That is what keeps two modules
-# each declaring a `Node` from being one type, and a `Window` declared here
-# from being `std.gui.Window`. Interning imported classes under their bare name
-# was every disagreement in `json.jai` and `os.jai` once imports were bound:
-# the C says `std.io.File` and this said `File`, which is a different type with
-# the same spelling.
-fn _signature_type(c: Ctx, decl: Node, owner: ModuleSig?) -> Type? {
     match decl.kind {
-        NodeKind.FnDecl => { return _in_foreign_scope(c, owner, || signature_of(c, decl, false)) }
-        # In the owner's scope: the signature's annotations name that
-        # module's types, not this one's.
-        NodeKind.ClassDecl => { return named(c.universe, TyKind.Class, _qualified(decl, owner)) }
-        NodeKind.TraitDecl => { return named(c.universe, TyKind.Trait, _qualified(decl, owner)) }
-        NodeKind.EnumDecl => { return named(c.universe, TyKind.Enum, _qualified(decl, owner)) }
-        NodeKind.TypeDecl => {
-            return _in_foreign_scope(c, owner, || resolve_ast_type(c, decl.type_field("aliased")))
+        NodeKind.FnDecl => {
+            c.set_imported_decl(symbol, decl)
+            if c.symbol_type(symbol) is null {
+                c.set_symbol_type(symbol, _foreign_function_type(c, owner, decl))
+            }
         }
-        _ => { return null }
+        NodeKind.TypeDecl => {
+            let saved = c.enter_foreign(owner)
+            let mark = c.type_name_mark()
+            push_generics(c, decl.records("generics"))
+            let target = resolve_ast_type(c, decl.type_field("aliased")) ?? c.universe.t_any
+            c.type_name_restore(mark)
+            c.leave_foreign(saved)
+            # Pushed before this file's own aliases, so a local one still wins.
+            c.push_type_name(alias ?? remote, target)
+            if c.symbol_type(symbol) is null { c.set_symbol_type(symbol, target) }
+        }
+        _ => {
+            let registered = _register_foreign(c, owner, decl, alias, true)
+            if registered is null { return }
+            c.set_imported_decl(symbol, decl)
+            if c.symbol_type(symbol) is null { c.set_symbol_type(symbol, registered.ty) }
+        }
     }
-}
-
-# The name a declaration answers to, qualified by the module it came from.
-fn _qualified(decl: Node, owner: ModuleSig?) -> str? {
-    let name = decl.opt_text("name")
-    if name is null or owner is null { return name }
-    return owner.qualify(name)
 }
 
 # Bind every `type X = ...` alias before anything resolves an annotation.

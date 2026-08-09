@@ -26,7 +26,7 @@ from jaithon.compile.emit import Const, ConstTag, FuncProto, emit, op_name
 from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
 from jaithon.compile.jaic import disassemble_instruction, float_bits, read_module
 from jaithon.compile.jaic import source_hash, write_module
-from jaithon.compile.check.checker import check_program
+from jaithon.compile.check.checker import check_import_cycles, check_program
 from jaithon.compile.check.expr import Ctx
 from jaithon.compile.check.universe import Universe
 from jaithon.compile.lexer import DiagnosticBag
@@ -136,7 +136,8 @@ pub fn compile_source(
         module_name_for(path),
         opt_level,
         optimize,
-        text
+        text,
+        checked.enum_decls()
     )
     result.body = body
     if not result.ok() { return result }
@@ -147,6 +148,40 @@ pub fn compile_source(
     result.mod = mod
     result.image = write_module(mod)
     return result
+}
+
+#: Check the imports reachable from `path` for a cycle.
+#:
+#: A whole-program question, and separate from `compile_source` for that
+#: reason: a module in a cycle compiles perfectly well on its own, and it is
+#: only the graph the files form together that is wrong. The C splits it the
+#: same way — `jaiCheckFile` runs `checkImportCycles` before it calls the front
+#: end, and the compile path never runs it — so a `check` runs both and a
+#: `build` runs only the second.
+#:
+#: The answer is the bag it reported into, so a caller with diagnostics of its
+#: own can pass one in and keep everything in source order.
+#:
+#: A path that cannot be read is not an error here: a missing module is E0800
+#: at import time and a missing entry file is the driver's to complain about.
+#:
+#: ```
+#: let dir = __prim__.os_env("TMPDIR") ?? "/tmp"
+#: for (name, body) in [("x", "from .jaithon_cycle_y import b\n"),
+#:                      ("y", "from .jaithon_cycle_x import a\n")] {
+#:     let handle = __prim__.io_open(f"{dir}/jaithon_cycle_{name}.jai", "wb")
+#:     __prim__.io_write(handle, body)
+#:     __prim__.io_close(handle)
+#: }
+#: let found = import_cycles(f"{dir}/jaithon_cycle_x.jai")
+#: found.has_errors()                                  # true
+#: found.items[0].code                                 # "E0801"
+#: import_cycles("no/such/entry.jai").has_errors()     # false
+#: ```
+pub fn import_cycles(path: str, bag: DiagnosticBag? = null) -> DiagnosticBag {
+    let into = bag ?? DiagnosticBag()
+    check_import_cycles(into, path)
+    return into
 }
 
 #: The name the module body carries, derived from `path`.
