@@ -22,10 +22,13 @@
 #: a comparison rather than a walk.
 #:
 #: So is `join`, for a duller reason: a tuple answers the join of its members,
-#: the C calls `jaiTypeJoin` for that, and `jaiTypeJoin`'s subtype half is
-#: `relate.jai`, which this port has not reached. The default is that function
-#: with the subtype half left out, and `operator.jai` carries the same seam for
-#: the same reason. Pass the real join once there is one.
+#: and the C calls `jaiTypeJoin` for that. The default is `relate.join`, which
+#: is that function — so `(Circle, Shape)` iterates as `Shape`, the way the C's
+#: checker binds it, rather than as `Circle | Shape`. It stays a parameter
+#: rather than a plain call because the element type is the one thing these two
+#: take from elsewhere instead of deciding, and naming it in the signature is
+#: what keeps that visible; `operator.jai` carries the same seam for the same
+#: reason.
 #:
 #: The member lookups are `nominal.find_member` rather than a walk of their own.
 #: That is the port of `declFindMember`, cap and order and all, and the three
@@ -51,10 +54,10 @@
 #: is_optional(u.t_any)       # true
 #: is_callable(u.t_str)       # false
 #: ```
-from jaithon.compile.check.kinds import JOIN_MAX_MEMBERS, TyKind
+from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.nominal import find_member
+from jaithon.compile.check.relate import join as join_types
 from jaithon.compile.check.ty import Type
-from jaithon.compile.check.union import union_of
 from jaithon.compile.check.universe import Universe
 
 #: Is `t` `int` or `float`?
@@ -169,7 +172,7 @@ pub fn is_callable(t: Type?) -> bool {
 pub fn is_iterable(
     u: Universe,
     t: Type?,
-    join: fn(Universe, Type?, Type?) -> Type = _union_join
+    join: fn(Universe, Type?, Type?) -> Type = join_types
 ) -> Type? {
     if t is null { return null }
     match t.kind {
@@ -220,7 +223,7 @@ pub fn is_iterable(
 pub fn is_indexable(
     u: Universe,
     t: Type?,
-    join: fn(Universe, Type?, Type?) -> Type = _union_join
+    join: fn(Universe, Type?, Type?) -> Type = join_types
 ) -> (Type, Type)? {
     if t is null { return null }
     match t.kind {
@@ -244,42 +247,17 @@ pub fn is_indexable(
 #
 # Folded rather than collapsed into one `union_of` so that the cap inside the
 # join fires where the C's fires, per step and not once at the end.
+#
+# The seed is what makes the join's early arms load-bearing here rather than a
+# shortcut. A join that hands an operand straight back is not building a least
+# upper bound and must not be able to widen one: every fold starts at `never`,
+# so a join without a `Never` arm — or without the subtype test that stands in
+# for one — would take a tuple whose single member is an already-interned
+# nine-member union through `union_of`, trip the cap on the union it was merely
+# carrying, and answer `any` on the very first step, where the C answers with
+# the union itself.
 fn _join_all(u: Universe, members: list[Type], join: fn(Universe, Type?, Type?) -> Type) -> Type {
     var result: Type = u.t_never
     for member in members { result = join(u, result, member) }
     return result
-}
-
-# The default `join`: `jaiTypeJoin` with its two subtype tests left out, because
-# the relation they need is `relate.jai` and this port has not reached it. They
-# disagree on exactly one shape of input — two types where one is a subtype of
-# the other but neither is a member of the other, so `(Dog, Animal)` joins to
-# `Animal` there and to `Animal | Dog` here. `(int, int)` and `(int, int?)` are
-# not such inputs: deduplication and flattening already collapse them.
-#
-# Everything else is the C's, including the cap: a least upper bound that keeps
-# growing is worse than no answer, since it slows every later comparison and
-# prints a type nobody can read.
-#
-# The three early answers matter as much as the cap does, and they have to come
-# first the way the C's do. A join that hands an operand straight back is not
-# building a least upper bound and must not be able to widen one: `_join_all`
-# seeds every fold with `never`, so without the `Never` arm a tuple whose member
-# is an already-interned nine-member union would go through `union_of`, trip the
-# cap on the union it was merely carrying, and answer `any` on the first step —
-# where the C answers with the union itself.
-fn _union_join(u: Universe, a: Type?, b: Type?) -> Type {
-    if a is null { return b ?? u.t_any }
-    if b is null { return a }
-    if a == b { return a }
-    if a.kind == TyKind.Never { return b }
-    if b.kind == TyKind.Never { return a }
-    if a.kind == TyKind.Any or b.kind == TyKind.Any { return u.t_any }
-
-    let members: list[Type?] = [a, b]
-    let joined = union_of(u, members)
-    if joined.kind == TyKind.Union and joined.arg_count() > JOIN_MAX_MEMBERS {
-        return u.t_any
-    }
-    return joined
 }
