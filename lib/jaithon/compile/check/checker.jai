@@ -20,7 +20,7 @@
 #: for roughly half the bytecode the two front ends disagree about. It is the
 #: difference between a checker that runs and a checker that does anything.
 from jaithon.ast import Node, NodeKind, TypeExpr, TypeKind, kind_name
-from jaithon.compile.check.decl import layout_decl, register_decl
+from jaithon.compile.check.decl import layout_decl, register_decl, signature_of
 from jaithon.compile.check.dump import Record
 from jaithon.compile.check.expr import Ctx
 from jaithon.compile.check.render import render
@@ -341,12 +341,38 @@ pub fn check_program(
 
     _register_all(c, program)
     for declared in c.all_decls() { layout_decl(c, declared) }
+    _signature_pass(c, program)
     c.check_block(c, program)
     # The C ends jaiCheckProgram with `program->type = gTypes.tVoid`, and void
     # is null, which is why a sema dump records the program itself as `null`.
     c.set_type(program, universe.t_void)
     if collect_dump { _dump_types(c, program) }
     return c
+}
+
+# Give every function its signature before any body is checked.
+#
+# The C's `visitSignature`. Without it a function called above its own
+# declaration answers `any`, because the symbol only acquires a type when
+# `check_decl` reaches the declaration — and a file is checked top to bottom
+# while calls do not respect that order. Measured against the C on
+# `lib/std/math.jai`, this was every remaining disagreement: `fn(int) -> int`
+# and `fn(list[float]) -> float` read as `any` at the call site, which then
+# lost the return type, which then lost the guard on the value it returned.
+fn _signature_pass(c: Ctx, node: any) -> void {
+    if node is Node {
+        if node.kind == NodeKind.FnDecl {
+            let symbol = c.resolution.symbol_of(node)
+            if symbol is not null and c.symbol_type(symbol) is null {
+                c.set_symbol_type(symbol, signature_of(c, node, false))
+            }
+        }
+        for key in node.fields.keys() { _signature_pass(c, node.fields[key]) }
+    } elif node is list {
+        for item in node { _signature_pass(c, item) }
+    } elif node is dict {
+        for key in node.keys() { _signature_pass(c, node[key]) }
+    }
 }
 
 # Every node's final type, recorded after checking rather than as each type is
