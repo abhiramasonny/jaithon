@@ -592,12 +592,17 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
 /* Cache handshake                                                      */
 /* ------------------------------------------------------------------ */
 
-static uint32_t cacheFlagsFor(const CodegenOptions *opts) {
+/* `selfHosted` is who actually compiled this image, NOT whether --front=jai was
+ * passed. Only the entry file goes through the self-hosted front end today;
+ * every import is compiled by C (loadModuleBody). Deriving the flag from the
+ * option instead of the producer stamped those C-compiled imports as
+ * self-hosted, which is exactly the cross-contamination the flag exists to
+ * prevent. */
+static uint32_t cacheFlagsFor(const CodegenOptions *opts, bool selfHosted) {
     uint32_t flags = 0;
     if (opts->debugInfo) flags |= JAIC_FLAG_DEBUG;
     if (opts->stripAsserts) flags |= JAIC_FLAG_RELEASE;
-    /* So the two front ends cannot read each other's entries. */
-    if (sOptions.selfHosted) flags |= JAIC_FLAG_SELFHOSTED;
+    if (selfHosted) flags |= JAIC_FLAG_SELFHOSTED;
     return flags;
 }
 
@@ -648,7 +653,7 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
     }
 
     const JaiRunOptions *opts = options();
-    uint32_t flags = cacheFlagsFor(&opts->codegen);
+    uint32_t flags = cacheFlagsFor(&opts->codegen, false);
 
     if (opts->useCache && cacheFlagsMatch(path, flags)) {
         ObjFunction *cached = jaiCacheLoad(path, module, hash);
@@ -1285,7 +1290,7 @@ static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
     }
 
     const JaiRunOptions *opts = options();
-    uint32_t flags = cacheFlagsFor(&opts->codegen);
+    uint32_t flags = cacheFlagsFor(&opts->codegen, true);
 
     if (opts->useCache && cacheFlagsMatch(path, flags)) {
         ObjFunction *cached = jaiCacheLoad(path, module, hash);

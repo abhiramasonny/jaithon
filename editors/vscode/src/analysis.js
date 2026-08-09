@@ -790,7 +790,7 @@ class Workspace {
         const cached = this.cache.get(fsPath);
         if (cached && cached.key === key) return cached.analysis;
 
-        const pendingKey = `${fsPath} ${key}`;
+        const pendingKey = `${fsPath} ${key}`;
         if (this.inflight.has(pendingKey)) return this.inflight.get(pendingKey);
 
         const job = this.run(fsPath, document, token).then((analysis) => {
