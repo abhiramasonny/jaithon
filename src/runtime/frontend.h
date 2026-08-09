@@ -83,6 +83,14 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
                                     const JaiReplCompileOptions *opts,
                                     ObjModule *module, bool *outWasExpression);
 
+/* Rebuild the front end's own diagnostics as JaiDiag in `gDiags`, so the
+ * driver renders them exactly as it renders the C's -- with the source
+ * excerpt, the caret and the help. True when there were any.
+ *
+ * `Compiled.report()` is the alternative and it is a flat line per diagnostic;
+ * printing that was a real loss of quality that no gate caught. */
+bool jaiFrontEndTransferDiagnostics(Value compiled);
+
 /* Forget every declaration the session recorded, for `:reset`. */
 void jaiFrontEndReplForget(void);
 

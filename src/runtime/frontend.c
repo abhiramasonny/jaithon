@@ -260,3 +260,100 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
     jaiPopRoots(2);
     return body;
 }
+
+/* ------------------------------------------------------------------ */
+/* Diagnostics                                                          */
+/* ------------------------------------------------------------------ */
+
+/* The front end reports into a Jaithon `DiagnosticBag`, and rendering one as
+ * text is all `Compiled.report` can do: a flat line per diagnostic, with no
+ * source excerpt, no caret and no help.
+ *
+ * That is not what a diagnostic is supposed to look like, and printing it that
+ * way is what the driver did between the day the self-hosted front end became
+ * the default and the day this was written. `tests/errors` never noticed --
+ * it greps the output for the code and nothing else -- and only the REPL
+ * goldens, which pin the rendered form, ever failed.
+ *
+ * So the diagnostics are rebuilt as `JaiDiag` and put in the bag the driver
+ * already flushes. `jaiDiagRender` then produces the same output for both
+ * front ends, which is the only way the two can be told apart by what they
+ * accept rather than by how they complain. */
+
+static JaiSpan spanFrom(Value v) {
+    JaiSpan span = JAI_SPAN_NONE;
+    if (!IS_INSTANCE(v)) return span;
+
+    Value file, start, end;
+    if (!jaiFrontEndField(v, "file", &file) || !IS_INT(file)) return span;
+    if (!jaiFrontEndField(v, "start", &start) || !IS_INT(start)) return span;
+    if (!jaiFrontEndField(v, "end", &end) || !IS_INT(end)) return span;
+
+    span.file  = (int32_t)AS_INT(file);
+    span.start = (uint32_t)AS_INT(start);
+    span.end   = (uint32_t)AS_INT(end);
+    return span;
+}
+
+static const char *stringOrNull(Value v) {
+    return IS_STRING(v) ? AS_STRING(v)->chars : NULL;
+}
+
+static void transferOne(Value diagnostic) {
+    Value codeValue, messageValue;
+    if (!jaiFrontEndField(diagnostic, "code", &codeValue)) return;
+    if (!jaiFrontEndField(diagnostic, "message", &messageValue)) return;
+
+    const char *codeText = stringOrNull(codeValue);
+    const char *message = stringOrNull(messageValue);
+    if (message == NULL) return;
+
+    JaiDiagCode code = jaiDiagCodeFromString(codeText);
+    JaiSpan primary = JAI_SPAN_NONE;
+    Value spanValue;
+    if (jaiFrontEndField(diagnostic, "span", &spanValue)) {
+        primary = spanFrom(spanValue);
+    }
+
+    /* Severity comes off the code rather than the record's own field: the
+     * letter and the numeric range say the same thing here, and reading a
+     * Jaithon enum from C costs a call. */
+    JaiDiag *d = (codeText != NULL && codeText[0] == 'W')
+                     ? jaiDiagWarn(code, primary, "%s", message)
+                     : jaiDiagError(code, primary, "%s", message);
+    if (d == NULL) return;   /* the bag is full, or warnings are suppressed */
+
+    Value labels;
+    if (jaiFrontEndField(diagnostic, "labels", &labels) && IS_LIST(labels)) {
+        ObjList *list = AS_LIST(labels);
+        for (int i = 0; i < list->count; i++) {
+            if (!IS_TUPLE(list->items[i])) continue;
+            ObjTuple *pair = AS_TUPLE(list->items[i]);
+            if (pair->count < 2) continue;
+            const char *text = stringOrNull(pair->items[1]);
+            jaiDiagAddLabel(d, spanFrom(pair->items[0]), "%s",
+                            text != NULL ? text : "");
+        }
+    }
+
+    Value help, note;
+    if (jaiFrontEndField(diagnostic, "help", &help) && IS_STRING(help)) {
+        jaiDiagAddHelp(d, "%s", AS_STRING(help)->chars);
+    }
+    if (jaiFrontEndField(diagnostic, "note", &note) && IS_STRING(note)) {
+        jaiDiagAddNote(d, "%s", AS_STRING(note)->chars);
+    }
+}
+
+bool jaiFrontEndTransferDiagnostics(Value compiled) {
+    Value bag;
+    if (!jaiFrontEndField(compiled, "diagnostics", &bag)) return false;
+    Value items;
+    if (!jaiFrontEndField(bag, "items", &items) || !IS_LIST(items)) return false;
+
+    ObjList *list = AS_LIST(items);
+    jaiPushRoot(items);
+    for (int i = 0; i < list->count; i++) transferOne(list->items[i]);
+    jaiPopRoot();
+    return list->count > 0;
+}

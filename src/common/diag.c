@@ -175,6 +175,26 @@ const char *jaiDiagCodeString(JaiDiagCode code) {
     return b;
 }
 
+/* "E0402" or "W0101" back to the code it names, or JAI_OK.
+ *
+ * The inverse of jaiDiagCodeString, and arithmetic for the same reason that is:
+ * an error code *is* its enum value and a warning code is its offset from
+ * JAI_WARNING_BASE. No table to keep in step.
+ *
+ * Needed because the self-hosted front end spells codes as strings -- Jaithon
+ * has no C enum to share -- and its diagnostics have to become JaiDiag before
+ * anything can render them properly. */
+JaiDiagCode jaiDiagCodeFromString(const char *text) {
+    if (text == NULL || (text[0] != 'E' && text[0] != 'W')) return JAI_OK;
+    int value = 0;
+    for (const char *p = text + 1; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') return JAI_OK;
+        value = value * 10 + (*p - '0');
+    }
+    if (text[0] == 'W') return (JaiDiagCode)(JAI_WARNING_BASE + value - 100);
+    return (JaiDiagCode)value;
+}
+
 /* ------------------------------------------------------------------ */
 /* "did you mean" suggestions                                          */
 /* ------------------------------------------------------------------ */
