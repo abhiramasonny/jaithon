@@ -48,6 +48,9 @@ static int          gIncludeCount;
 static int          gArgSlots;        /* capacity of inputs[] and scriptArgv[] */
 static ColorMode    gColorMode = COLOR_AUTO;
 static bool         gStrict;
+/* --front=jai, for the compile paths that are handed codegen options rather
+ * than the whole invocation. */
+static bool         gSelfHosted;
 
 /* ------------------------------------------------------------------ */
 /* Diagnostics for command-line problems                                */
@@ -645,9 +648,19 @@ static ObjFunction *compileFile(const char *path, const CodegenOptions *codegen,
                                      jaiStringInternC(absolute));
     jaiPushRoot(OBJ_VAL(module));
 
-    ObjFunction *body = jaiCompileSource(source, length, absolute, module,
-                                         codegen);
-    releaseSource(source, length, module);
+    /* Which front end. `--front=jai` has to reach every command that compiles,
+     * or `build` and `disasm` would quietly keep using the C one and the flag
+     * would be a lie on two of the commands most likely to be pointed at it. */
+    ObjFunction *body;
+    if (gSelfHosted) {
+        body = jaiSelfHostedCompileInto(source, length, absolute, module,
+                                        jaiSourceHash(source, length),
+                                        codegen->optLevel);
+        releaseSource(source, length, module);
+    } else {
+        body = jaiCompileSource(source, length, absolute, module, codegen);
+        releaseSource(source, length, module);
+    }
 
     bool hadErrors = cliFlush();
     if (body == NULL || hadErrors) {
@@ -1420,14 +1433,16 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
     case CMD_VERSION:
     case CMD_HELP:
         return true;
+    /* Both compile, and both now go through the front end the flag names. */
+    case CMD_BUILD:
+    case CMD_DISASM:
+        return true;
     case CMD_REPL:
     case CMD_EVAL:
-    case CMD_BUILD:
     case CMD_FMT:
     case CMD_TEST:
     case CMD_DOC:
     case CMD_BENCH:
-    case CMD_DISASM:
     case CMD_AST:
     case CMD_TOKENS:
         return false;
@@ -1437,6 +1452,8 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
 
 int jaiCliDispatch(const JaiCliOptions *opts) {
     if (opts == NULL) return 1;
+
+    gSelfHosted = opts->run.selfHosted;
 
     /* Only `check` writes a dump. Accepting the flag elsewhere and quietly
      * writing nothing would let a comparison "pass" because one side never
