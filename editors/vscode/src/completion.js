@@ -26,6 +26,7 @@ const ITEM_KIND = {
     parameter: vscode.CompletionItemKind.Variable,
     self: vscode.CompletionItemKind.Variable,
     typealias: vscode.CompletionItemKind.TypeParameter,
+    typeParameter: vscode.CompletionItemKind.TypeParameter,
     module: vscode.CompletionItemKind.Module,
     import: vscode.CompletionItemKind.Reference,
 };

@@ -19,6 +19,13 @@
 typedef enum {
     JAIC_FLAG_DEBUG   = 1 << 0,
     JAIC_FLAG_RELEASE = 1 << 1,
+    /* Which front end produced this image. A __jaicache__ entry used to record
+     * no front end at all, so the two compilers could not share a cache
+     * directory and --front=jai had to bypass the cache entirely. With the bit
+     * stored, an entry written by one is an ordinary cache miss for the other,
+     * and both can use the cache. It becomes vestigial when only one front end
+     * is left, but harmless: the bit is simply always set. */
+    JAIC_FLAG_SELFHOSTED = 1 << 2,
 } JaicFlags;
 
 /* Serialise a compiled module. Returns a heap buffer (jaiRealloc) or NULL. */

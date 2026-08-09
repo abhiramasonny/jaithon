@@ -152,6 +152,9 @@ function methodsFor(type) {
     return [];
 }
 
+/** The namespace the runtime's primitive operations live under. */
+const PRIMITIVE_NAMESPACE = '__prim__';
+
 function isException(name) {
     return Object.prototype.hasOwnProperty.call(EXCEPTIONS, name);
 }
@@ -169,6 +172,6 @@ function exceptionChain(name) {
 
 module.exports = {
     KEYWORDS, PRIMITIVE_TYPES, FUNCTIONS, METHODS, EXCEPTIONS,
-    EXCEPTION_MEMBERS, PRELUDE_TRAITS, DUNDERS,
+    EXCEPTION_MEMBERS, PRELUDE_TRAITS, DUNDERS, PRIMITIVE_NAMESPACE,
     methodsFor, isException, exceptionChain,
 };

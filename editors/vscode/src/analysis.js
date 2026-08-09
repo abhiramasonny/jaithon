@@ -154,11 +154,15 @@ function renderParam(param) {
     return text;
 }
 
+function renderGenerics(generics) {
+    if (!generics || !generics.length) return '';
+    return `[${generics.map((g) => (g.bound ? `${g.name}: ${renderType(g.bound)}` : g.name)).join(', ')}]`;
+}
+
 function signatureOf(fn) {
     const params = (fn.params || []).filter((p) => p.name !== 'self').map(renderParam).join(', ');
     const ret = renderType(fn.returnType);
-    const generics = (fn.generics || []).length ? `[${fn.generics.join(', ')}]` : '';
-    return `fn ${fn.name || ''}${generics}(${params})${ret ? ` -> ${ret}` : ''}`;
+    return `fn ${fn.name || ''}${renderGenerics(fn.generics)}(${params})${ret ? ` -> ${ret}` : ''}`;
 }
 
 const VISIBILITY = {
@@ -244,7 +248,16 @@ class FileAnalysis {
             for (const item of node) this.declare(item, scopeId, container);
             return;
         }
-        if (!node || typeof node !== 'object' || typeof node.kind !== 'string') return;
+        if (!node || typeof node !== 'object') return;
+        if (typeof node.kind !== 'string') {
+            // Call arguments, match arms, dict entries: wrappers around nodes
+            // that carry no kind of their own but hold declarations all the same.
+            for (const key of Object.keys(node)) {
+                if (key === 'span') continue;
+                this.declare(node[key], scopeId, container);
+            }
+            return;
+        }
 
         const { start, end } = this.span(node);
         const recurse = (child, id, owner) => this.declare(child, id === undefined ? scopeId : id,
@@ -262,18 +275,23 @@ class FileAnalysis {
             case 'AST_FN_DECL': case 'AST_LAMBDA': case 'AST_ANON_FN': {
                 const at = node.name ? locateName(this.text, start, this.span(node.body).start || end, node.name) : null;
                 const fnScope = this.pushScope(scopeId, start, end, 'function');
+                // A function declared inside a class, trait or enum is a method,
+                // and belongs to that type's member scope rather than to the one
+                // it was written in.
+                const owner = container === undefined || container === null
+                    ? null : this.symbols[container];
+                const isMethod = Boolean(owner && owner.members !== undefined);
+
                 let symbol = null;
                 if (node.name) {
                     symbol = this.addSymbol({
                         name: node.name,
-                        kind: container && this.symbols[container]?.members !== undefined ? 'method' : 'function',
+                        kind: isMethod ? 'method' : 'function',
                         start: at ? at.start : start, end: at ? at.end : start,
                         fullStart: start, fullEnd: end,
                         detail: signatureOf(node),
                         doc: this.docAbove(start),
-                        scope: container !== undefined && container !== null && this.symbols[container]?.members !== undefined
-                            ? this.symbols[container].members
-                            : scopeId,
+                        scope: isMethod ? owner.members : scopeId,
                         container: container ?? null,
                         visibility: VISIBILITY[node.visibility] || null,
                         static: Boolean(node.isStatic),
@@ -283,6 +301,7 @@ class FileAnalysis {
                     });
                 }
                 this.scopes[fnScope].owner = symbol ? symbol.index : null;
+                this.declareGenerics(node.generics, fnScope, symbol ? symbol.index : (container ?? null));
 
                 for (const param of node.params || []) {
                     const pspan = this.span(param);
@@ -304,12 +323,17 @@ class FileAnalysis {
                 const kind = node.kind === 'AST_CLASS_DECL' ? 'class'
                            : node.kind === 'AST_TRAIT_DECL' ? 'trait' : 'enum';
                 const at = locateName(this.text, start, end, node.name);
-                const members = this.pushScope(scopeId, start, end, kind, false);
+                // Type parameters are visible throughout the declaration, so
+                // they need a lexical scope wrapping it; the member scope, which
+                // `self.x` reaches and a bare name does not, sits inside that.
+                const outer = (node.generics || []).length
+                    ? this.pushScope(scopeId, start, end, 'generics') : scopeId;
+                const members = this.pushScope(outer, start, end, kind, false);
                 const symbol = this.addSymbol({
                     name: node.name, kind,
                     start: at ? at.start : start, end: at ? at.end : start,
                     fullStart: start, fullEnd: end,
-                    detail: `${kind} ${node.name}${(node.generics || []).length ? `[${node.generics.join(', ')}]` : ''}`,
+                    detail: `${kind} ${node.name}${renderGenerics(node.generics)}`,
                     doc: this.docAbove(start),
                     scope: scopeId, container: container ?? null,
                     visibility: VISIBILITY[node.visibility] || null,
@@ -319,6 +343,7 @@ class FileAnalysis {
                     traits: (node.traits || []).map(renderType),
                 });
                 this.scopes[members].owner = symbol.index;
+                this.declareGenerics(node.generics, outer, symbol.index);
 
                 for (const field of node.fields || []) {
                     const fspan = this.span(field);
@@ -334,8 +359,8 @@ class FileAnalysis {
                         static: Boolean(field.isStatic),
                         declaredType: renderType(field.type),
                     });
-                    recurse(field.type, scopeId, symbol.index);
-                    recurse(field.defaultValue, scopeId, symbol.index);
+                    recurse(field.type, outer, symbol.index);
+                    recurse(field.defaultValue, outer, symbol.index);
                 }
 
                 for (const variant of node.variants || []) {
@@ -350,16 +375,16 @@ class FileAnalysis {
                         scope: members, container: symbol.index,
                         params: variant.params || [],
                     });
-                    for (const param of variant.params || []) recurse(param.type, scopeId, symbol.index);
+                    for (const param of variant.params || []) recurse(param.type, outer, symbol.index);
                 }
 
-                recurse(node.superclass, scopeId, container);
-                recurse(node.traits, scopeId, container);
-                recurse(node.supers, scopeId, container);
+                recurse(node.superclass, outer, container);
+                recurse(node.traits, outer, container);
+                recurse(node.supers, outer, container);
                 for (const accessor of [...(node.getters || []), ...(node.setters || [])]) {
-                    recurse(accessor, scopeId, symbol.index);
+                    recurse(accessor, outer, symbol.index);
                 }
-                return recurse(node.methods, scopeId, symbol.index);
+                return recurse(node.methods, outer, symbol.index);
             }
 
             case 'AST_TYPE_DECL': {
@@ -520,6 +545,20 @@ class FileAnalysis {
                     recurse(node[key]);
                 }
             }
+        }
+    }
+
+    declareGenerics(generics, scopeId, container) {
+        for (const generic of generics || []) {
+            const gspan = this.span(generic);
+            this.addSymbol({
+                name: generic.name, kind: 'typeParameter',
+                start: gspan.start, end: gspan.end,
+                fullStart: gspan.start, fullEnd: gspan.end,
+                detail: generic.bound ? `${generic.name}: ${renderType(generic.bound)}` : generic.name,
+                doc: null, scope: scopeId, container,
+            });
+            this.declare(generic.bound, scopeId, container);
         }
     }
 

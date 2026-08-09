@@ -265,6 +265,7 @@ const SYMBOL_TOKEN = {
     variable: 'variable',
     parameter: 'parameter',
     typealias: 'type',
+    typeParameter: 'typeParameter',
     module: 'namespace',
     import: 'variable',
     self: 'parameter',
@@ -303,6 +304,7 @@ function classify(analysis, ref) {
         const type = SYMBOL_TOKEN[symbol.kind];
         return type ? { type, modifiers: modifiersOf(symbol, false) } : null;
     }
+    if (ref.name === builtins.PRIMITIVE_NAMESPACE) return { type: 'namespace', modifiers: ['defaultLibrary'] };
     if (builtins.FUNCTIONS[ref.name]) return { type: 'function', modifiers: ['defaultLibrary'] };
     if (builtins.isException(ref.name)) return { type: 'class', modifiers: ['defaultLibrary'] };
     if (builtins.PRELUDE_TRAITS.includes(ref.name)) return { type: 'interface', modifiers: ['defaultLibrary'] };
