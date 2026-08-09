@@ -31,10 +31,10 @@ from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type
 from jaithon.compile.check.universe import Universe, named
-from jaithon.compile.lexer import DiagnosticBag, Lexer
+from jaithon.compile.lexer import Diagnostic, DiagnosticBag, Lexer, Severity
 from jaithon.compile.opt import optimize
 from jaithon.compile.parser import Parser, parse
-from jaithon.compile.resolve import Resolution, resolve
+from jaithon.compile.resolve import Resolution, SemaCode, resolve
 
 #: Everything one compilation produced.
 #:
@@ -60,6 +60,9 @@ pub class Compiled {
     pub var mod: Module?
     #: The serialised `.jaic` bytes; empty on failure.
     pub var image: list[int]
+    #: True when a prompt input read as a single expression, which is what
+    #: `:type` requires and `compile_source` never asks about.
+    pub var repl_expression: bool
 
     #: Create an empty result for `path`.
     pub fn init(self, path: str, hash: int, diagnostics: DiagnosticBag) {
@@ -72,6 +75,7 @@ pub class Compiled {
         self.types = null
         self.mod = null
         self.image = []
+        self.repl_expression = false
     }
 
     #: True when no stage reported an error.
@@ -169,15 +173,14 @@ pub class ReplSession {
     #: Forget every declaration, for `:reset`.
     pub fn reset(self) -> void { self.types = {} }
 
-    #: Record the type names one input introduces. Only the top level counts:
-    #: a class inside a function is that call's, not the session's.
-    pub fn record(self, program: Node?) -> void {
-        if program is null { return }
-        for stmt in program.child_list("stmts") {
-            let kind = _declared_type_kind(stmt.kind)
-            if kind is null { continue }
-            let name = stmt.opt_text("name")
-            if name is null { continue }
+    #: Record the type names one input introduces.
+    #:
+    #: Read off the checker rather than the tree, because `from m import Point`
+    #: binds a name to a class as surely as `class Point` does and the tree
+    #: alone cannot say which -- only the checker has been to `m`. The C driver
+    #: had a second walk (`registerImportedType`) for exactly that case.
+    pub fn record(self, checked: Ctx) -> void {
+        for (name, kind) in checked.declared_kinds().items() {
             self.types[name] = kind
         }
     }
@@ -191,13 +194,6 @@ pub class ReplSession {
         }
         return out
     }
-}
-
-fn _declared_type_kind(kind: NodeKind) -> TyKind? {
-    if kind == NodeKind.ClassDecl { return TyKind.Class }
-    if kind == NodeKind.TraitDecl { return TyKind.Trait }
-    if kind == NodeKind.EnumDecl { return TyKind.Enum }
-    return null
 }
 
 #: Rewrite `stmt` into `helper(expr)` so a bare expression's value reaches a
@@ -241,7 +237,10 @@ pub fn compile_repl(
     file_id: int = 0,
     opt_level: int = 2,
     echo: str = "",
-    whole_file: bool = false
+    whole_file: bool = false,
+    # `:disasm` compiles an input and never runs it, so what it declares is not
+    # the session's.
+    record: bool = true
 ) -> Compiled {
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
@@ -255,7 +254,8 @@ pub fn compile_repl(
         let (stmt, _) = parser.parse_repl_line()
         if not lexer.had_error and stmt is not null {
             var top = stmt
-            if top.kind == NodeKind.ExprStmt and echo != "" {
+            result.repl_expression = top.kind == NodeKind.ExprStmt
+            if result.repl_expression and echo != "" {
                 top = _wrap_echo(top, echo)
             }
             program = Node(NodeKind.Program, {"stmts": [top]}, top.span)
@@ -286,14 +286,35 @@ pub fn compile_repl(
         checked.enum_decls()
     )
     result.body = body
+    _drop_prompt_noise(bag)
     if not result.ok() { return result }
 
     let mod = Module(path, result.hash, body, FLAG_DEBUG)
     for name in _exported_names(body) { mod.exports.push(name) }
     result.mod = mod
     result.image = write_module(mod)
-    session.record(program)
+    if record { session.record(checked) }
     return result
+}
+
+# Two warnings make sense for a file and not for a prompt: at a prompt every
+# binding is unused until the next line uses it, and every import is there to
+# be used interactively. The C driver dropped the same two on the way out of
+# `replFlushDiags`; they are dropped here instead, because the prompt now sees
+# diagnostics only as the string `Compiled.report` renders.
+fn _drop_prompt_noise(bag: DiagnosticBag) -> void {
+    var kept: list[Diagnostic] = []
+    var warnings = 0
+    for diagnostic in bag.items {
+        if diagnostic.code == SemaCode.W0100_UNUSED_IMPORT or
+            diagnostic.code == SemaCode.W0101_UNUSED_BINDING {
+            continue
+        }
+        if diagnostic.severity == Severity.Warning { warnings += 1 }
+        kept.push(diagnostic)
+    }
+    bag.items = kept
+    bag.warning_count = warnings
 }
 
 # Every input of one session compiles as this module, so a traceback names the

@@ -282,6 +282,27 @@ pub class Ctx {
     #: Every enum declaration a bare name reaches here, by that name.
     #: The emitter needs it: an enum pattern's tag is the variant's position in
     #: the declaration, which for an imported enum is in another file.
+    #: Every type name this compilation knows and what each was declared as --
+    #: the file's own declarations and the imported ones alike.
+    #:
+    #: The prompt carries these from one input to the next. It cannot read the
+    #: tree for them: `from m import Point` binds a name to a class as surely
+    #: as `class Point` does, and only the checker has been to `m`.
+    pub fn declared_kinds(self) -> dict[str, TyKind] {
+        var out: dict[str, TyKind] = {}
+        for name in self.decls_by_name.keys() {
+            let declared = self.decls_by_name[name]
+            var kind = TyKind.Class
+            if declared.is_enum {
+                kind = TyKind.Enum
+            } elif declared.is_trait {
+                kind = TyKind.Trait
+            }
+            out[name] = kind
+        }
+        return out
+    }
+
     pub fn enum_decls(self) -> dict[str, Node] {
         var out: dict[str, Node] = {}
         for name in self.decls_by_name.keys() {
