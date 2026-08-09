@@ -29,7 +29,7 @@ UNAME_S     := $(shell uname -s)
 WARNINGS    := -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
                -Wpointer-arith -Wcast-align -Wwrite-strings -Wno-unused-parameter
 STD         := -std=c11
-BASE_CFLAGS := $(STD) $(WARNINGS) -Isrc -I$(BUILD_ROOT) -MMD -MP -fno-common
+BASE_CFLAGS := $(STD) $(WARNINGS) -I. -Isrc -I$(BUILD_ROOT) -MMD -MP -fno-common
 
 # -flto because the interpreter's hot helpers live in other translation units:
 # getPropertyInto, bindCallArgs and jaiStringEquals are all called from runLoop
@@ -161,7 +161,12 @@ else
   LDFLAGS    += -flto
 endif
 
-SRCS_C  := $(wildcard src/common/*.c) \
+# boot/seed.c is generated (scripts/gen_seed.py, `make reseed`) and holds the
+# .jaic images the self-hosted front end needs before it can compile anything.
+# A wildcard rather than a literal so a tree without a seed still builds -- that
+# build simply needs a working front end on disk to start.
+SRCS_C  := $(wildcard boot/*.c) \
+           $(wildcard src/common/*.c) \
            $(wildcard src/lang/*.c) \
            $(wildcard src/sema/*.c) \
            $(wildcard src/codegen/*.c) \
@@ -344,6 +349,21 @@ bootstrap: $(TARGET)
 # decision shows up as missing on the Jaithon side. That is the correct reading
 # and not a fault in the tool: the mismatch count is how much of the checker is
 # still to write, and it should fall to zero.
+#: Regenerate boot/seed.c from the images the front end currently needs.
+#:
+#: Runs the compiler once to populate __jaicache__, embeds what it finds, then
+#: rebuilds and checks the fixpoint still holds. Writing a seed without that
+#: check would let a broken compiler seed the next one, which is the one
+#: failure a bootstrap cannot recover from on its own.
+.PHONY: reseed
+reseed: $(TARGET)
+	@echo "  SEED    populating __jaicache__"
+	@find lib -name '__jaicache__' -type d -exec rm -rf {} + 2>/dev/null || true
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai check lib/std >/dev/null 2>&1 || true
+	@python3 scripts/gen_seed.py lib boot/seed.c
+	@$(MAKE) --no-print-directory
+	@$(MAKE) --no-print-directory fixpoint-check
+
 #: Compile each source twice with the self-hosted front end and compare. This is
 #: the precondition for Phase 8's fixpoint gate: an image that is not
 #: reproducible run to run can never satisfy `stage1.jaic == stage2.jaic`.

@@ -20,6 +20,7 @@
 #include <stdlib.h>   /* getenv */
 
 #include "runtime.h"
+#include "boot/seed.h"
 #include "methods.h"
 
 #include "../codegen/codegen.h"
@@ -673,6 +674,21 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
         ObjFunction *cached = jaiCacheLoad(path, module, hash);
         if (cached != NULL) return cached;
         /* Stale, corrupt, or from another compiler: recompile silently. */
+    }
+
+    /* Inside the bootstrap window the compiler's own closure has no compiler to
+     * call, so it comes from the seed. A miss falls through to the front end:
+     * a tree whose sources have moved past the seed recompiles rather than
+     * running stale bytecode, because jaiDeserializeModule checks the source
+     * hash. */
+    if (sLoadingFrontEnd && module->name != NULL) {
+        const JaiSeedEntry *seeded = jaiSeedFind(module->name->chars);
+        if (seeded != NULL) {
+            ObjFunction *fromSeed = jaiDeserializeModule(seeded->image,
+                                                         seeded->length,
+                                                         module, hash);
+            if (fromSeed != NULL) return fromSeed;
+        }
     }
 
     ObjFunction *body = NULL;
