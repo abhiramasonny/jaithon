@@ -20,7 +20,8 @@
 #: for roughly half the bytecode the two front ends disagree about. It is the
 #: difference between a checker that runs and a checker that does anything.
 from jaithon.ast import Node, NodeKind, TypeExpr, TypeKind, kind_name
-from jaithon.compile.check.decl import layout_decl, register_decl, signature_of
+from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
+from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.dump import Record
 from jaithon.compile.check.expr import Ctx
 from jaithon.compile.check.render import render
@@ -340,6 +341,7 @@ pub fn check_program(
     if program == null { return c }
 
     _register_all(c, program)
+    _alias_pass(c, program)
     for declared in c.all_decls() { layout_decl(c, declared) }
     _signature_pass(c, program)
     c.check_block(c, program)
@@ -348,6 +350,41 @@ pub fn check_program(
     c.set_type(program, universe.t_void)
     if collect_dump { _dump_types(c, program) }
     return c
+}
+
+# Bind every `type X = ...` alias before anything resolves an annotation.
+#
+# The C's `visitAlias`. An alias is a name that stands for a type without
+# declaring one, so it is in neither the declaration registry nor the builtin
+# tables, and `lookup_type_name` would answer null and report E0402 on every
+# use. Measured on `lib/std/list.jai`, that was all 108 remaining
+# disagreements: `Less[T]` and `Rng` read as `any`, which erased the signature
+# of every function taking one, which erased the type of every call through it.
+#
+# A generic alias binds its own parameters while its target is resolved, so
+# `type Less[T] = fn(T, T) -> bool` resolves to `fn(T, T) -> bool` with `T` a
+# generic parameter, and erasure at the use site then does the rest.
+fn _alias_pass(c: Ctx, node: any) -> void {
+    if node is Node {
+        if node.kind == NodeKind.TypeDecl {
+            let name = node.opt_text("name")
+            if name is not null {
+                let mark = c.type_name_mark()
+                push_generics(c, node.records("generics"))
+                let target = resolve_ast_type(c, node.type_field("aliased"))
+                c.type_name_restore(mark)
+                if target is not null {
+                    c.push_type_name(name, target)
+                    c.set_symbol_type(c.resolution.symbol_of(node), target)
+                }
+            }
+        }
+        for key in node.fields.keys() { _alias_pass(c, node.fields[key]) }
+    } elif node is list {
+        for item in node { _alias_pass(c, item) }
+    } elif node is dict {
+        for key in node.keys() { _alias_pass(c, node[key]) }
+    }
 }
 
 # Give every function its signature before any body is checked.
