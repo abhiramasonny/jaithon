@@ -1091,6 +1091,52 @@ fn _mentions_generic_param(t: Type?) -> bool {
 # `wrapInCast` in src/sema/check.c. The node becomes the cast and the original
 # is copied into a fresh node that becomes the cast's operand, so no caller has
 # to hand over the slot that points at the node.
+#: The name a runtime type guard checks against.
+#:
+#: `runtimeTypeName` in `src/codegen/codegen.c`. NOT the rendered type: a guard
+#: is a runtime test, and the run time has erased every type argument, so
+#: `list[int]` guards as `list`. Emitting the rendered form instead put
+#: `"list[int]"` in the constant pool where the C puts `"list"`, which
+#: `make bootstrap` reported as a differing constant on every guarded container
+#: in the tree.
+#:
+#: A class, trait or enum answers its *bare* binding name rather than the
+#: qualified one it is interned under, because the VM resolves this operand
+#: against the module's globals and the binding there is the bare name.
+pub fn runtime_type_name(t: Type?) -> str {
+    if t is null { return "any" }
+    match t.kind {
+        TyKind.Any => { return "any" }
+        TyKind.Never => { return "any" }
+        TyKind.GenericParam => { return "any" }
+        TyKind.Alias => { return "any" }
+        TyKind.Null => { return "null" }
+        TyKind.Bool => { return "bool" }
+        TyKind.Int => { return "int" }
+        TyKind.Float => { return "float" }
+        TyKind.Str => { return "str" }
+        TyKind.Bytes => { return "bytes" }
+        TyKind.List => { return "list" }
+        TyKind.Dict => { return "dict" }
+        TyKind.Set => { return "set" }
+        TyKind.Tuple => { return "tuple" }
+        TyKind.Range => { return "range" }
+        TyKind.Fn => { return "fn" }
+        TyKind.Module => { return "module" }
+        _ => { return _binding_name(t) }
+    }
+}
+
+# The bare name a nominal type is bound to here, dropping the module
+# qualification it is interned under.
+fn _binding_name(t: Type) -> str {
+    let name = t.name
+    if name is null { return "any" }
+    let cut = name.rfind(".")
+    if cut < 0 { return name }
+    return name[cut + 1:]
+}
+
 fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     if node is null or to is null or node.kind == NodeKind.Cast { return }
     # Erased: a guard would look up a class named `T`.
@@ -1125,7 +1171,7 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     # context rather than the tree.
     let cast = Node(
         NodeKind.Cast,
-        {"operand": inner, "target": TypeExpr.named(render(to)), "widen": widen},
+        {"operand": inner, "target": TypeExpr.named(runtime_type_name(to)), "widen": widen},
         node.span
     )
     node.kind = cast.kind
