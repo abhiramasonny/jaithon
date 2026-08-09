@@ -592,8 +592,11 @@ pub class Chunk {
 
     #: Add `value` to the pool and return its index, reusing an equal entry.
     #:
-    #: Functions, class specs and tuples are never shared: each one is a
-    #: distinct object even when it looks the same.
+    #: Functions and class specs are never shared: each one is a distinct
+    #: object even when it looks the same. `constDedupable` in `src/vm/chunk.c`
+    #: draws the same line, and a tuple is on the sharing side of it — every
+    #: union type guard emits one, and a class with two `T?` fields emits the
+    #: same `("T", "null")` at each of them.
     pub fn add_constant(self, value: Const) -> int {
         let key = _const_key(value)
         if key != null {
@@ -627,6 +630,22 @@ fn _const_key(value: Const) -> str? {
         ConstTag.Float => { return f"f{repr(value.value)}" }
         ConstTag.Str => { return f"s{value.value}" }
         ConstTag.Type => { return f"t{value.value}" }
+        ConstTag.Bytes => { return f"y{value.value}" }
+        ConstTag.Tuple => {
+            # Structural, and null the moment a member has no key of its own:
+            # `constEqual` compares a tuple's items exactly and falls back to
+            # object identity for a function, so a tuple holding one is shared
+            # only with itself — which is what refusing to key it achieves.
+            var parts: list[str] = []
+            for item in value.value {
+                let key = _const_key(item)
+                if key is null { return null }
+                # Length-prefixed, so that `("a", "b")` and `("ab",)` cannot
+                # land on one entry: a member's key is arbitrary text.
+                parts.push(f"{key.len()}:{key}")
+            }
+            return "p" + "".join(parts)
+        }
         _ => { return null }
     }
 }
@@ -833,6 +852,17 @@ pub class Emitter {
     #: when the caller did not supply it, in which case the message is the bare
     #: `"assertion failed"` — which is what the C falls back to as well.
     pub var source: str?
+    #: Enum declarations this file imported, by the name they are bound to
+    #: here. An enum pattern needs the variant's tag, and the tag is the
+    #: declaration's variant order — which for an imported enum lives in
+    #: another file. The C reads it out of the checker's registry
+    #: (`jaiTypeDeclFind` in `src/codegen/codegen_pattern.c`); this port has no
+    #: registry the emitter can reach, so the checker hands the enums over.
+    #:
+    #: Without them `match kind { TyKind.Fn => ... }` compiles to the fallback
+    #: form — `MATCH_TYPE "TyKind.Fn"` alone, with no `ENUM_TAG`/`MATCH_CONST`
+    #: pair — which runs correctly and is not the program the C emits.
+    pub var imported_enums: dict[str, Node]
     var stack: list[FnCtx]
     var enums: dict[str, Node]
 
@@ -851,6 +881,7 @@ pub class Emitter {
         self.opt_level = opt_level
         self.optimize = optimize
         self.source = null
+        self.imported_enums = {}
         self.stack = []
         self.enums = {}
     }
@@ -861,7 +892,10 @@ pub class Emitter {
         # traceback prints for a frame that is not inside any function.
         let proto = FuncProto(module_name ?? "__main__", 0, 0)
         # An enum pattern needs the variant order, which only the declaration
-        # has, and a `match` may come before it.
+        # has, and a `match` may come before it. Imported enums go in first so
+        # that a name this file also declares wins, which is the order the C's
+        # registry has them in.
+        for name in self.imported_enums.keys() { self.enums[name] = self.imported_enums[name] }
         self._index_enums(program.child_list("stmts"))
         self.stack.push(FnCtx(proto, self.resolution.slot_count(program)))
         # Top-level `fn` declarations are bound ahead of the top-level
@@ -3086,10 +3120,12 @@ pub fn emit(
     module_name: str? = null,
     opt_level: int = 2,
     optimize: fn(FuncProto, int) -> void = _no_optimize,
-    source: str? = null
+    source: str? = null,
+    imported_enums: dict[str, Node] = {}
 ) -> FuncProto {
     let emitter = Emitter(resolution, bag, strip_asserts, opt_level, optimize)
     emitter.source = source
+    emitter.imported_enums = imported_enums
     return emitter.compile_program(program, module_name)
 }
 

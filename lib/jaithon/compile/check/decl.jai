@@ -56,8 +56,6 @@
 #:
 #: | form | today |
 #: |---|---|
-#: | `jaiChkForeignBegin` / `jaiChkForeignEnd` | not ported: a `TypeDecl` has no module of origin, so a declaration read from another module is laid out as if local and its diagnostics are **reported rather than suppressed** |
-#: | `DeclEntry.alias` and `DeclEntry.visible` | not ported: `Ctx.register_decl` keys on the declared name alone, so an aliased or hidden import is not modelled |
 #: | a method body, a field default's statements | `Ctx.check_block`, whose default does nothing until `stmt.jai` lands |
 #: | a `let` pattern's bindings | `Ctx.check_pattern`, whose default does nothing |
 #: | every written annotation | `Ctx.resolve_ast_type`, whose default answers null — so a superclass and a trait both read as *opaque by name*, which is the C's answer for a type it cannot resolve |
@@ -870,7 +868,14 @@ fn _resolve_decl_reference(
         return (null, null)
     }
 
-    layout_decl(c, target)
+    # Through `Ctx`, not the function below directly: a superclass or trait
+    # named here can live in another module, and laying it out has to install
+    # *its* namespace. Calling straight through kept whatever scope this layout
+    # was already in, so `Iterator`'s `peekable(self) -> Peekable[T]` — reached
+    # from a class in `std.io` that implements it — resolved `Peekable` in
+    # `std.io`, which does not import it, and reported E0402 against a file
+    # that never wrote the name.
+    c.layout_decl(c, target)
     return (target, null)
 }
 
@@ -1325,7 +1330,7 @@ fn _check_class_body(c: Ctx, node: Node) -> void {
     # never registered against this node, so it answers null and is skipped.
     let d = c.decl_for_node(node)
     if d is null { return }
-    layout_decl(c, d)
+    c.layout_decl(c, d)
 
     let mark = c.type_name_mark()
     push_generics(c, node.records("generics"))
@@ -1363,7 +1368,7 @@ fn _check_class_body(c: Ctx, node: Node) -> void {
 fn _check_trait_body(c: Ctx, node: Node) -> void {
     let d = c.decl_for_node(node)
     if d is null { return }
-    layout_decl(c, d)
+    c.layout_decl(c, d)
 
     let mark = c.type_name_mark()
     push_generics(c, node.records("generics"))
@@ -1383,7 +1388,7 @@ fn _check_trait_body(c: Ctx, node: Node) -> void {
 fn _check_enum_body(c: Ctx, node: Node) -> void {
     let d = c.decl_for_node(node)
     if d is null { return }
-    layout_decl(c, d)
+    c.layout_decl(c, d)
 
     let mark = c.type_name_mark()
     push_generics(c, node.records("generics"))

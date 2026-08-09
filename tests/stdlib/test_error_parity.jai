@@ -10,22 +10,16 @@
 #: The expected code is the one the file's own first line names, which is what
 #: the C is held to as well (`scripts/run_tests.sh`, the diagnostics layer).
 from std.test import assert_eq, assert_true
-from jaithon.compile.mod import compile_source, read_text
+from jaithon.compile.mod import compile_source, import_cycles, read_text
 from std.io import Path
 
 #: Files the self-hosted front end does not yet reject, and why.
 #:
-#: All three need the module graph: a circular import is only visible once
-#: imports are followed, and a keyword argument checked across a module
-#: boundary needs the callee's signature. Phase 5 owns that, and this list is
-#: how the gap stays visible rather than becoming a quietly weaker test — a
-#: file that starts being rejected fails here until it is removed from the
-#: list.
-pub let NOT_YET_REJECTED: list[str] = [
-    "circular_import_a.jai",
-    "circular_import_b.jai",
-    "cross_module_keyword.jai",
-]
+#: Empty, and it stays a list rather than being deleted: the two entries it
+#: held were the module graph's, and this is where the next gap gets recorded.
+#: A file named here that starts being rejected fails the test until it is
+#: removed, so the list cannot rot into a quietly weaker check.
+pub let NOT_YET_REJECTED: list[str] = []
 
 fn _expected_code(source: str) -> str {
     let first = source.split("\n")[0]
@@ -34,7 +28,16 @@ fn _expected_code(source: str) -> str {
     return first[at:at + 5]
 }
 
+#: The first error `jaithon check` would report for `path`.
+#:
+#: The import graph first and the front end second, which is the order
+#: `jaiCheckFile` runs them in and the reason it runs them in that order: every
+#: name a module in a cycle should have exported is missing, so the E0200 storm
+#: that follows a cycle is a consequence rather than a second problem.
 fn _first_error(path: str) -> str? {
+    for diagnostic in import_cycles(path).items {
+        if diagnostic.is_error() { return diagnostic.code }
+    }
     let built = compile_source(read_text(path), path)
     if built.ok() { return null }
     for diagnostic in built.diagnostics.items {

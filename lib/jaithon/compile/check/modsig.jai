@@ -54,7 +54,7 @@
 #: effect by construction. And `jaiModuleSigFreeAll` has no counterpart: a
 #: `SigLoader` and everything it parsed are garbage once the checker that owns
 #: them is.
-from jaithon.ast import Node, NodeKind
+from jaithon.ast import Node, NodeKind, Span
 from jaithon.compile.parser import parse
 
 #: The extension a module's own file carries: `std.gui` is `std/gui.jai`.
@@ -105,6 +105,25 @@ pub class SigReexport {
     }
 }
 
+#: One module a module imports, and where it says so.
+#:
+#: `ImportEdge` in `src/runtime/module.c`, and it exists for the same one
+#: reason: a cycle is a property of the import *graph*, and neither `decls` nor
+#: `reexports` is that graph — a plain `import m` brings in no name and is
+#: absent from both, while still being an edge that can close a loop.
+pub class SigImport {
+    #: The dotted module name, as written.
+    pub let dotted: str
+    #: The import statement, for the diagnostic that names the cycle.
+    pub let span: Span
+
+    #: Record an edge to `dotted` written at `span`.
+    pub fn init(self, dotted: str, span: Span) {
+        self.dotted = dotted
+        self.span = span
+    }
+}
+
 #: One module's signatures: what it declares, and what it passes along.
 #:
 #: Data only, like `ty.jai`'s `Type`. `SigLoader` fills it in and owns the
@@ -130,6 +149,8 @@ pub class ModuleSig {
     pub let types: list[SigDecl]
     #: Names re-exported by a `from ... import ...` at the top level.
     pub let reexports: list[SigReexport]
+    #: Every module this one imports, in source order.
+    pub let imports: list[SigImport]
     #: Modules re-exported wholesale by a `from ... import *`.
     #:
     #: At most one today, and only as a file's last statement: the newline after
@@ -146,6 +167,7 @@ pub class ModuleSig {
         self.decls = []
         self.types = []
         self.reexports = []
+        self.imports = []
         self.wildcards = []
     }
 
@@ -445,10 +467,17 @@ fn _collect(sig: ModuleSig, stmts: list[Node]) -> void {
             NodeKind.TraitDecl => { _add_decl(sig, node.opt_text("name"), node, true) }
             NodeKind.EnumDecl => { _add_decl(sig, node.opt_text("name"), node, true) }
             NodeKind.TypeDecl => { _add_decl(sig, node.opt_text("name"), node, false) }
+            NodeKind.Import => { _add_edge(sig, node) }
             NodeKind.FromImport => { _add_import(sig, node) }
             _ => { }
         }
     }
+}
+
+fn _add_edge(sig: ModuleSig, node: Node) -> void {
+    let source = node.opt_text("path")
+    if source is null { return }
+    sig.imports.push(SigImport(source, node.span))
 }
 
 fn _add_decl(sig: ModuleSig, name: str?, decl: Node, is_type: bool) -> void {
@@ -461,6 +490,7 @@ fn _add_decl(sig: ModuleSig, name: str?, decl: Node, is_type: bool) -> void {
 fn _add_import(sig: ModuleSig, node: Node) -> void {
     let source = node.opt_text("path")
     if source is null { return }
+    sig.imports.push(SigImport(source, node.span))
     if node.flag("isWildcard") {
         sig.wildcards.push(source)
         return
@@ -568,11 +598,40 @@ fn _dirname(path: str) -> str {
     return path[:length]
 }
 
-# As much of `jaiPathAbsolute` as there is a primitive for: absolute against the
-# working directory, with `.` and `..` folded away. `realpath` would also
-# collapse symbolic links and would fail on a path that does not exist; this
-# does neither, so it is used only on a candidate that was just found to be a
-# file, or on a search directory where a stale entry costs nothing.
+#: As much of `jaiPathAbsolute` as there is a primitive for.
+#:
+#: Absolute against the working directory, with `.` and `..` folded away.
+#: `realpath` would also collapse symbolic links and would fail on a path that
+#: does not exist; this does neither, so it is used only on a candidate that
+#: was just found to be a file, or on a search directory where a stale entry
+#: costs nothing.
+#:
+#: Public because a `ModuleSig.path` is normalised this way and anything that
+#: compares a path against one — the cycle walk, whose root is the file being
+#: checked rather than a module — has to normalise it the same way or the two
+#: spellings of one file are two nodes.
+#:
+#: ```
+#: absolute("/a/b/../c")     # "/a/c"
+#: absolute("/a/./b/")       # "/a/b"
+#: ```
+pub fn absolute(path: str) -> str {
+    return _absolute(path)
+}
+
+#: The path without its last component, `.` when there is none.
+#:
+#: `jaiPathDirname`. Public for the same reason `absolute` is: a walk over
+#: module paths resolves each file's imports from the directory holding it.
+#:
+#: ```
+#: dirname("/a/b/c.jai")     # "/a/b"
+#: dirname("c.jai")          # "."
+#: ```
+pub fn dirname(path: str) -> str {
+    return _dirname(path)
+}
+
 fn _absolute(path: str) -> str {
     let rooted = if path.starts_with("/") { path } else { _join(__prim__.os_cwd(), path) }
     var parts: list[str] = []

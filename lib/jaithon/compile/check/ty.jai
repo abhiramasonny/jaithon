@@ -181,6 +181,16 @@ pub class TypeDecl {
     pub var node: Node?
     #: The interned type this declares.
     pub var ty: Type?
+    #: The module this was read out of, or null when the file being checked
+    #: declares it. A `check.modsig.ModuleSig`, held as `any` because `ty.jai`
+    #: is imported from everywhere in this package and `modsig` imports the
+    #: parser: naming the class here would close a cycle for a field that only
+    #: `checker.jai` ever reads.
+    #:
+    #: `TypeDecl.origin` in `src/sema/check.h`, and it means the same thing:
+    #: every annotation inside this declaration is written in *that* module's
+    #: namespace, so laying it out has to happen with that scope installed.
+    pub var origin: any?
     pub var superclass: TypeDecl?
     pub var traits: list[TypeDecl]
     #: Parallel to `traits`: the arguments each was written with, so a
@@ -212,6 +222,7 @@ pub class TypeDecl {
         self.span = span
         self.node = node
         self.ty = null
+        self.origin = null
         self.superclass = null
         self.traits = []
         self.trait_bindings = []
