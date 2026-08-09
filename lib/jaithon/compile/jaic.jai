@@ -824,8 +824,8 @@ fn _read_constant(reader: Reader, depth: int) -> Const? {
     return null
 }
 
-# Names inside a class spec are pool indices, and the pool is still being read
-# when the spec arrives, so they are parked as `#index` placeholders until
+#: Names inside a class spec are pool indices, and the pool is still being read
+#: when the spec arrives, so they are parked as `#index` placeholders until
 # `_link_class_specs` runs over the finished pool.
 fn _read_class_spec(reader: Reader) -> ClassSpec? {
     let name_index = reader.u32()
