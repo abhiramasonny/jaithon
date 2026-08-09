@@ -23,6 +23,7 @@ from jaithon.ast import Node, NodeKind, TypeExpr, TypeKind, kind_name
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.dump import Record
+from jaithon.compile.check.modsig import ModuleSig, SigLoader, default_search_path
 from jaithon.compile.check.expr import Ctx
 from jaithon.compile.check.render import render
 from jaithon.compile.check.kinds import TyKind
@@ -332,7 +333,8 @@ pub fn check_program(
     resolution: Resolution,
     bag: DiagnosticBag,
     fold_constants: bool = true,
-    collect_dump: bool = false
+    collect_dump: bool = false,
+    path: str = ""
 ) -> Ctx {
     let c = Ctx(universe, bag, resolution)
     c.fold_constants = fold_constants
@@ -341,6 +343,10 @@ pub fn check_program(
     if program == null { return c }
 
     _register_all(c, program)
+    # `path` is the file being checked, and an import resolves relative to the
+    # directory holding it before it resolves against the search path.
+    let loader = SigLoader(_search_roots(path, default_search_path()))
+    _import_pass(c, program, loader, _dir_of(path))
     _alias_pass(c, program)
     for declared in c.all_decls() { layout_decl(c, declared) }
     _signature_pass(c, program)
@@ -350,6 +356,112 @@ pub fn check_program(
     c.set_type(program, universe.t_void)
     if collect_dump { _dump_types(c, program) }
     return c
+}
+
+# The directory holding `path`, which is where a relative import resolves from.
+fn _dir_of(path: str) -> str {
+    let cut = path.rfind("/")
+    if cut < 0 { return "" }
+    return path[:cut]
+}
+
+# Where to look for an imported module, given the file doing the importing.
+#
+# A dotted name resolves against a *root*, not against the importing file's own
+# directory: `std.math` imported from `lib/std/random.jai` is `lib/std/math.jai`,
+# which is found by searching `lib` and not `lib/std`. The C gets its roots from
+# the executable's location and `JAITHON_PATH`; neither is reachable from here
+# — `os_argv()[0]` is the script, not the interpreter — so every ancestor of the
+# importing file is offered instead, nearest first. That finds `lib` from
+# `lib/std/random.jai` without knowing anything about the install layout, and a
+# root that holds no matching module simply does not answer.
+fn _search_roots(path: str, base: list[str]) -> list[str] {
+    var roots: list[str] = []
+    var dir = _dir_of(path)
+    while dir != "" {
+        roots.push(dir)
+        dir = _dir_of(dir)
+    }
+    for entry in base { roots.push(entry) }
+    return roots
+}
+
+# Give every imported name the type the module it came from declares.
+#
+# The C's `visitImports` and `bindImportedName`. Without it every name another
+# module exports is `any` here, which erases the type of every call through it
+# and, in a standard library where files import each other constantly, is by
+# far the largest single source of disagreement: measured against the C, it was
+# 173 of `num.jai`'s 192 remaining, 163 of `json.jai`'s 179 and 140 of
+# `test.jai`'s 169.
+#
+# Only the *signature* is read — `modsig` parses the other file and takes its
+# declarations without checking its body, exactly as the C does. A module that
+# cannot be found is not an error here: the resolver already reported an
+# unresolvable import, and a second diagnostic about the same line helps
+# nobody.
+fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
+    if node is Node {
+        if node.kind == NodeKind.Import {
+            let dotted = node.opt_text("path")
+            if dotted is not null {
+                let sig = loader.load(dotted, from_dir)
+                if sig is not null {
+                    let symbol = c.resolution.symbol_of(node)
+                    if symbol is not null and c.symbol_type(symbol) is null {
+                        c.set_symbol_type(symbol, named(c.universe, TyKind.Module, dotted))
+                    }
+                }
+            }
+        } elif node.kind == NodeKind.FromImport {
+            let dotted = node.opt_text("path")
+            if dotted is not null {
+                let sig = loader.load(dotted, from_dir)
+                if sig is not null {
+                    for item in node.records("items") { _bind_imported(c, loader, sig, item) }
+                }
+            }
+        }
+        for key in node.fields.keys() { _import_pass(c, node.fields[key], loader, from_dir) }
+    } elif node is list {
+        for item in node { _import_pass(c, item, loader, from_dir) }
+    } elif node is dict {
+        for key in node.keys() { _import_pass(c, node[key], loader, from_dir) }
+    }
+}
+
+# One `name` or `name as local` out of a `from ... import` list.
+fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any]) -> void {
+    let remote = if "name" in item { item["name"] } else { null }
+    if remote is not str { return }
+
+    let found = loader.find(sig, remote)
+    let decl = found[0]
+    if decl is null { return }
+
+    # The declaring module's own name scope, not this one's: a signature is
+    # resolved where it was written, so a type it mentions means what it meant
+    # there. Anything this file cannot see falls back to `any`, which is what
+    # the C does for a foreign name too.
+    let ty = _signature_type(c, decl)
+    if ty is null { return }
+
+    let symbol = c.resolution.symbol_of(item)
+    if symbol is not null and c.symbol_type(symbol) is null {
+        c.set_symbol_type(symbol, ty)
+    }
+}
+
+# The type a declaration read out of another module's signature denotes.
+fn _signature_type(c: Ctx, decl: Node) -> Type? {
+    match decl.kind {
+        NodeKind.FnDecl => { return signature_of(c, decl, false) }
+        NodeKind.ClassDecl => { return named(c.universe, TyKind.Class, decl.opt_text("name")) }
+        NodeKind.TraitDecl => { return named(c.universe, TyKind.Trait, decl.opt_text("name")) }
+        NodeKind.EnumDecl => { return named(c.universe, TyKind.Enum, decl.opt_text("name")) }
+        NodeKind.TypeDecl => { return resolve_ast_type(c, decl.type_field("aliased")) }
+        _ => { return null }
+    }
 }
 
 # Bind every `type X = ...` alias before anything resolves an annotation.
