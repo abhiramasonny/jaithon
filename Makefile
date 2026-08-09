@@ -320,6 +320,13 @@ bootstrap: $(TARGET)
 # decision shows up as missing on the Jaithon side. That is the correct reading
 # and not a fault in the tool: the mismatch count is how much of the checker is
 # still to write, and it should fall to zero.
+#: Compile each source twice with the self-hosted front end and compare. This is
+#: the precondition for Phase 8's fixpoint gate: an image that is not
+#: reproducible run to run can never satisfy `stage1.jaic == stage2.jaic`.
+.PHONY: fixpoint-check
+fixpoint-check: $(TARGET)
+	@scripts/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
+
 #: Byte-compare the .jaic each front end produces. --bootstrap-verify compares
 #: FuncProtos and never opens the container, so it can report `ok` for a file
 #: whose images differ; Phase 8's fixpoint gate is byte for byte, so this is the
