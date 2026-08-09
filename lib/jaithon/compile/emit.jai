@@ -3059,16 +3059,45 @@ fn _assert_message(node: Node, source: str?) -> str {
         # slices by scalar. The two agree only until the file contains a
         # multi-byte character — one `—` in a doc comment above the assert is
         # enough — after which slicing the string cuts in the wrong place and
-        # bakes a truncated condition into the message. Slice the bytes.
+        # bakes a truncated condition into the message. Take the bytes.
+        #
+        # Byte by byte, because `bytes` does not slice: `raw[start:stop]` reads
+        # as if it did and raises `TypeError` at run time, which the emitter
+        # then reported as "the self-hosted front end raised while compiling
+        # this file" on every file whose asserts sit below a non-ASCII comment.
         let raw = __prim__.str_encode(source)
         let start = cond.span.start
         var stop = cond.span.end
         if stop > start and stop <= raw.len() {
             if stop - start > _ASSERT_TEXT_MAX { stop = start + _ASSERT_TEXT_MAX }
-            return f"assertion failed: {__prim__.str_decode(raw[start:stop])}"
+            var taken: list[int] = []
+            var at = start
+            while at < stop {
+                taken.push(raw[at])
+                at += 1
+            }
+            return f"assertion failed: {_decoded(taken)}"
         }
     }
     return "assertion failed"
+}
+
+# `bytes` as text, dropping the last scalar when the cut landed inside one.
+#
+# The C truncates at a byte and does not care: its constant is bytes with a
+# length, and an assert message cut mid-character prints as mojibake. A Jaithon
+# `str` is scalars, and `str_decode` refuses invalid UTF-8 outright, so the
+# only faithful answer available is the longest valid prefix.
+fn _decoded(raw: list[int]) -> str {
+    var length = raw.len()
+    while length > 0 {
+        try {
+            return __prim__.str_decode(__prim__.bytes_new(raw[:length]))
+        } catch _invalid: ValueError {
+            length -= 1
+        }
+    }
+    return ""
 }
 
 fn _unary_op(op: OpKind) -> Op {
