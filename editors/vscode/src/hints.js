@@ -296,14 +296,20 @@ function modifiersOf(symbol, declaration) {
 }
 
 /**
+ * Method or property.
+ *
  * The checker types a member access with the type of what it yields, so a
- * function type is how you tell `canvas.clear(…)` from `game.food` without
- * resolving anything.
+ * function type settles it. When no type information is available — the
+ * compiler currently offers none — fall back to whether the access is being
+ * called, which is what the reader is going by anyway.
  */
 function memberToken(analysis, ref) {
     const span = ref.node?.span;
     const accessed = span ? analysis.typeAt(span.start, span.end) : null;
-    return accessed && accessed.trim().startsWith('fn(') ? 'method' : 'property';
+    if (accessed) return accessed.trim().startsWith('fn(') ? 'method' : 'property';
+
+    const after = analysis.text.slice(analysis.offsets.char(ref.end)).match(/^[ \t]*\(/);
+    return after ? 'method' : 'property';
 }
 
 /**
