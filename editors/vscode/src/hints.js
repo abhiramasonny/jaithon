@@ -224,13 +224,16 @@ function codeLensProvider(workspace) {
             if (!analysis) return lens;
             const symbol = analysis.symbols[lens.jaithon.index];
             const uses = await referencesTo(workspace, analysis, symbol, token);
-            lens.command = {
-                title: uses.length === 1 ? '1 reference' : `${uses.length} references`,
-                command: uses.length ? 'editor.action.showReferences' : '',
-                arguments: [lens.jaithon.uri, lens.jaithon.range.start,
-                            uses.map((use) => new vscode.Location(
-                                use.analysis.uri, use.analysis.offsets.range(use.start, use.end)))],
-            };
+            const title = uses.length === 1 ? '1 reference' : `${uses.length} references`;
+            lens.command = uses.length === 0
+                ? { title, command: '' }
+                : {
+                    title,
+                    command: 'editor.action.showReferences',
+                    arguments: [lens.jaithon.uri, lens.jaithon.range.start,
+                                uses.map((use) => new vscode.Location(
+                                    use.analysis.uri, use.analysis.offsets.range(use.start, use.end)))],
+                };
             return lens;
         },
     };

@@ -552,4 +552,4 @@ function register(context, workspace) {
     );
 }
 
-module.exports = { register, contextAt, byteOffsetAt, referencesTo, symbolKind, SYMBOL_KIND };
+module.exports = { register, contextAt, byteOffsetAt, referencesTo };

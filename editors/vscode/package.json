@@ -58,17 +58,23 @@
       {
         "language": "jaithon",
         "scopes": {
-          "namespace": ["entity.name.namespace.jaithon"],
-          "class": ["entity.name.type.class.jaithon"],
-          "enum": ["entity.name.type.enum.jaithon"],
-          "interface": ["support.class.trait.jaithon"],
-          "type": ["entity.name.type.jaithon"],
-          "enumMember": ["variable.other.enummember.jaithon"],
-          "property": ["variable.other.property.jaithon"],
-          "parameter": ["variable.parameter.jaithon"],
-          "method": ["entity.name.function.member.jaithon"],
-          "function": ["entity.name.function.jaithon"],
-          "*.defaultLibrary": ["support.function.builtin.jaithon"]
+          "namespace": ["entity.name.namespace", "entity.name.namespace.jaithon"],
+          "class": ["entity.name.type.class", "entity.name.type.class.jaithon"],
+          "enum": ["entity.name.type.enum", "entity.name.type.enum.jaithon"],
+          "interface": ["entity.name.type.interface", "support.class.trait.jaithon"],
+          "type": ["entity.name.type", "entity.name.type.jaithon"],
+          "typeParameter": ["entity.name.type.parameter"],
+          "enumMember": ["variable.other.enummember", "constant.other.enum"],
+          "property": ["variable.other.property", "variable.other.property.jaithon"],
+          "parameter": ["variable.parameter", "variable.parameter.jaithon"],
+          "method": ["entity.name.function.member", "entity.name.function.member.jaithon"],
+          "function": ["entity.name.function", "entity.name.function.jaithon"],
+          "function.defaultLibrary": ["support.function.builtin", "support.function.builtin.jaithon"],
+          "method.defaultLibrary": ["support.function.builtin", "support.function.builtin.jaithon"],
+          "class.defaultLibrary": ["support.class", "support.class.error.jaithon"],
+          "interface.defaultLibrary": ["support.class", "support.class.trait.jaithon"],
+          "type.defaultLibrary": ["support.type", "support.type.primitive.jaithon"],
+          "namespace.defaultLibrary": ["support.other.namespace", "support.function.primitive.jaithon"]
         }
       }
     ],

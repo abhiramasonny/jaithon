@@ -243,6 +243,7 @@ function activate(context) {
 
         vscode.workspace.onDidChangeConfiguration((event) => {
             if (!event.affectsConfiguration('jaithon')) return;
+            tool.resetBinaryWarning();
             workspace.invalidateAll();
             for (const document of vscode.workspace.textDocuments) {
                 if (document.languageId === 'jaithon') checker.schedule(document, 0);
