@@ -8,67 +8,128 @@
     { "include": "#strings" },
     { "include": "#numbers" },
     { "include": "#declarations" },
+    { "include": "#annotations" },
     { "include": "#keywords" },
-    { "include": "#types" },
     { "include": "#constants" },
+    { "include": "#lambda" },
+    { "include": "#calls" },
+    { "include": "#named-arguments" },
+    { "include": "#types" },
     { "include": "#operators" },
     { "include": "#punctuation" },
-    { "include": "#calls" },
     { "include": "#identifiers" }
   ],
   "repository": {
+
     "comments": {
       "patterns": [
         {
           "name": "comment.block.documentation.jaithon",
-          "match": "#:.*$",
-          "captures": { "0": { "name": "comment.block.documentation.jaithon" } }
+          "begin": "#:",
+          "end": "$",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jaithon" } }
         },
         {
           "name": "comment.block.jaithon",
           "begin": "#\\*",
           "end": "\\*#",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.jaithon" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.jaithon" } },
           "patterns": [{ "include": "#comments" }]
         },
-        { "name": "comment.line.number-sign.jaithon", "match": "#.*$" }
+        {
+          "name": "comment.line.number-sign.jaithon",
+          "begin": "#",
+          "end": "$",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jaithon" } }
+        }
       ]
     },
 
     "strings": {
       "patterns": [
+        { "include": "#triple-strings" },
+        { "include": "#fstrings" },
+        { "include": "#raw-strings" },
+        { "include": "#plain-strings" },
+        { "include": "#labels" }
+      ]
+    },
+
+    "triple-strings": {
+      "patterns": [
         {
           "name": "string.quoted.triple.jaithon",
-          "begin": "\"\"\"",
+          "begin": "(?:\\b(rf|fr|f))?\"\"\"",
           "end": "\"\"\"",
-          "patterns": [{ "include": "#escapes" }]
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } },
+          "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
         },
         {
           "name": "string.quoted.triple.jaithon",
-          "begin": "'''",
+          "begin": "(?:\\b(rf|fr|f))?'''",
           "end": "'''",
-          "patterns": [{ "include": "#escapes" }]
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } },
+          "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
+        },
+        {
+          "name": "string.quoted.triple.raw.jaithon",
+          "begin": "\\br\"\"\"",
+          "end": "\"\"\""
+        },
+        {
+          "name": "string.quoted.triple.raw.jaithon",
+          "begin": "\\br'''",
+          "end": "'''"
+        }
+      ]
+    },
+
+    "fstrings": {
+      "patterns": [
+        {
+          "name": "string.interpolated.jaithon",
+          "begin": "\\b(rf|fr)\"",
+          "end": "\"",
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } },
+          "patterns": [{ "include": "#interpolation" }]
         },
         {
           "name": "string.interpolated.jaithon",
-          "begin": "\\bf\"",
+          "begin": "\\b(f)\"",
           "end": "\"",
-          "patterns": [
-            { "include": "#escapes" },
-            {
-              "name": "meta.embedded.jaithon",
-              "begin": "\\{",
-              "end": "\\}",
-              "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.jaithon" } },
-              "endCaptures": { "0": { "name": "punctuation.section.embedded.end.jaithon" } },
-              "patterns": [{ "include": "$self" }]
-            }
-          ]
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } },
+          "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
         },
         {
-          "name": "string.quoted.other.raw.jaithon",
-          "begin": "\\br\"",
-          "end": "\""
+          "name": "string.interpolated.jaithon",
+          "begin": "\\b(f)'",
+          "end": "'",
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } },
+          "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
+        }
+      ]
+    },
+
+    "raw-strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.raw.jaithon",
+          "begin": "\\b(r)\"",
+          "end": "\"",
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } }
         },
+        {
+          "name": "string.quoted.single.raw.jaithon",
+          "begin": "\\b(r)'",
+          "end": "'",
+          "beginCaptures": { "1": { "name": "storage.type.string.jaithon" } }
+        }
+      ]
+    },
+
+    "plain-strings": {
+      "patterns": [
         {
           "name": "string.quoted.double.jaithon",
           "begin": "\"",
@@ -76,32 +137,61 @@
           "patterns": [{ "include": "#escapes" }]
         },
         {
+          "comment": "A single quote opens a string unless it opens a label.",
           "name": "string.quoted.single.jaithon",
           "begin": "'(?![A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_']))",
           "end": "'",
           "patterns": [{ "include": "#escapes" }]
+        }
+      ]
+    },
+
+    "labels": {
+      "name": "entity.name.label.jaithon",
+      "match": "'[A-Za-z_][A-Za-z0-9_]*"
+    },
+
+    "interpolation": {
+      "comment": "An f-string hole holds an expression and an optional format spec.",
+      "name": "meta.embedded.expression.jaithon",
+      "begin": "\\{",
+      "end": "\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.jaithon" } },
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.jaithon" } },
+      "patterns": [
+        {
+          "name": "constant.other.format-spec.jaithon",
+          "match": "(:)([^{}\"']*)(?=\\})",
+          "captures": {
+            "1": { "name": "punctuation.separator.format-spec.jaithon" },
+            "2": { "name": "constant.other.format-spec.jaithon" }
+          }
         },
-        { "name": "entity.name.label.jaithon", "match": "'[A-Za-z_][A-Za-z0-9_]*" }
+        { "include": "$self" }
       ]
     },
 
     "escapes": {
       "patterns": [
-        { "name": "constant.character.escape.jaithon",
-          "match": "\\\\(?:[ntr0\\\\\"']|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]{1,6}\\})" },
-        { "name": "invalid.illegal.escape.jaithon", "match": "\\\\." }
+        {
+          "name": "constant.character.escape.jaithon",
+          "match": "\\\\(?:[ntr0\\\\\"']|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]{1,6}\\})"
+        },
+        { "name": "invalid.illegal.unknown-escape.jaithon", "match": "\\\\." }
       ]
     },
 
     "numbers": {
       "patterns": [
-        { "name": "constant.numeric.hex.jaithon", "match": "\\b0[xX][0-9A-Fa-f_]+\\b" },
-        { "name": "constant.numeric.octal.jaithon", "match": "\\b0[oO][0-7_]+\\b" },
-        { "name": "constant.numeric.binary.jaithon", "match": "\\b0[bB][01_]+\\b" },
-        { "name": "constant.numeric.float.jaithon",
-          "match": "\\b[0-9][0-9_]*(?:\\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9_]+)\\b" },
-        { "name": "constant.numeric.float.jaithon",
-          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*\\b" },
+        { "name": "constant.numeric.hex.jaithon", "match": "\\b0[xX][0-9A-Fa-f](?:[0-9A-Fa-f_]*[0-9A-Fa-f])?\\b" },
+        { "name": "constant.numeric.octal.jaithon", "match": "\\b0[oO][0-7](?:[0-7_]*[0-7])?\\b" },
+        { "name": "constant.numeric.binary.jaithon", "match": "\\b0[bB][01](?:[01_]*[01])?\\b" },
+        {
+          "comment": "A '.' joins the number only when a digit follows, so `0..10` is a range.",
+          "name": "constant.numeric.float.jaithon",
+          "match": "\\b[0-9][0-9_]*(?:\\.[0-9][0-9_]*)?[eE][+-]?[0-9][0-9_]*\\b"
+        },
+        { "name": "constant.numeric.float.jaithon", "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*\\b" },
         { "name": "constant.numeric.integer.jaithon", "match": "\\b[0-9][0-9_]*\\b" }
       ]
     },
@@ -109,32 +199,70 @@
     "declarations": {
       "patterns": [
         {
-          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
+          "comment": "fn name[T](params) -> Type",
+          "begin": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "end": "(?<=[)\\]])|(?=[{\\n])",
+          "beginCaptures": {
             "1": { "name": "storage.type.function.jaithon" },
             "2": { "name": "entity.name.function.jaithon" }
-          }
+          },
+          "patterns": [{ "include": "#parameter-list" }, { "include": "#generic-parameters" }]
         },
         {
-          "match": "\\b(class|trait|enum|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
+          "comment": "class Name[T] extends Base: Trait, Trait",
+          "begin": "\\b(class|trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "end": "(?=[{\\n])",
+          "beginCaptures": {
             "1": { "name": "storage.type.class.jaithon" },
-            "2": { "name": "entity.name.type.jaithon" }
-          }
+            "2": { "name": "entity.name.type.class.jaithon" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "name": "storage.modifier.jaithon", "match": "\\b(extends)\\b" },
+            { "name": "punctuation.separator.jaithon", "match": "[:,]" },
+            {
+              "name": "entity.other.inherited-class.jaithon",
+              "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+            },
+            { "include": "#generic-parameters" }
+          ]
         },
         {
-          "match": "\\b(extends)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
-            "1": { "name": "storage.modifier.jaithon" },
-            "2": { "name": "entity.other.inherited-class.jaithon" }
+            "1": { "name": "storage.type.enum.jaithon" },
+            "2": { "name": "entity.name.type.enum.jaithon" }
           }
         },
         {
-          "match": "\\b(import|from)\\s+((?:\\.)*[A-Za-z_][A-Za-z0-9_.]*)",
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.jaithon" },
+            "2": { "name": "entity.name.type.alias.jaithon" }
+          }
+        },
+        {
+          "match": "\\b(module)\\s+((?:[A-Za-z_][A-Za-z0-9_]*)(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)",
           "captures": {
             "1": { "name": "keyword.control.import.jaithon" },
             "2": { "name": "entity.name.namespace.jaithon" }
           }
+        },
+        {
+          "comment": "import a.b.c as d / from .a.b import x, y",
+          "begin": "\\b(import|from)\\s+",
+          "end": "(?=$)",
+          "beginCaptures": { "1": { "name": "keyword.control.import.jaithon" } },
+          "patterns": [
+            { "include": "#comments" },
+            { "name": "keyword.control.import.jaithon", "match": "\\b(import|as)\\b" },
+            { "name": "keyword.operator.wildcard.jaithon", "match": "\\*" },
+            {
+              "name": "entity.name.namespace.jaithon",
+              "match": "(?:\\.)*[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+            },
+            { "name": "punctuation.separator.jaithon", "match": "," }
+          ]
         },
         {
           "match": "\\b(let|var|const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
@@ -146,55 +274,174 @@
       ]
     },
 
-    "keywords": {
+    "generic-parameters": {
+      "begin": "\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "punctuation.definition.generic.begin.jaithon" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.generic.end.jaithon" } },
       "patterns": [
-        { "name": "keyword.control.conditional.jaithon",
-          "match": "\\b(if|elif|else|match|case)\\b" },
-        { "name": "keyword.control.loop.jaithon",
-          "match": "\\b(while|for|loop|in|break|continue)\\b" },
-        { "name": "keyword.control.flow.jaithon",
-          "match": "\\b(return|yield|throw|defer)\\b" },
-        { "name": "keyword.control.exception.jaithon",
-          "match": "\\b(try|catch|finally)\\b" },
-        { "name": "keyword.control.import.jaithon",
-          "match": "\\b(import|from|as|export|module)\\b" },
-        { "name": "storage.modifier.jaithon",
-          "match": "\\b(pub|prot|static|mut|impl)\\b" },
-        { "name": "storage.type.jaithon",
-          "match": "\\b(fn|let|var|const|class|trait|enum|type)\\b" },
-        { "name": "keyword.other.jaithon", "match": "\\b(assert|get|set|where|operator)\\b" },
-        { "name": "variable.language.jaithon", "match": "\\b(self|super)\\b" },
-        { "name": "keyword.operator.logical.jaithon", "match": "\\b(and|or|not|is|in)\\b" }
+        { "name": "punctuation.separator.jaithon", "match": "," },
+        { "include": "#type-expression" }
       ]
     },
 
-    "types": {
+    "parameter-list": {
+      "begin": "\\(",
+      "end": "\\)",
+      "beginCaptures": { "0": { "name": "punctuation.definition.parameters.begin.jaithon" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.parameters.end.jaithon" } },
       "patterns": [
-        { "name": "support.type.primitive.jaithon",
-          "match": "\\b(int|float|bool|str|bytes|any|void|never|list|dict|set|tuple|range|fn)\\b(?=\\s*[\\[\\)\\],:=?|>\\n])" },
-        { "name": "support.class.error.jaithon",
-          "match": "\\b(Error|AssertionError|ArithmeticError|DivisionByZeroError|OverflowError|LookupError|IndexError|KeyError|NameError|TypeError|ValueError|ParseError|AttributeError|IOError|FileNotFoundError|PermissionError|OSError|RuntimeError|RecursionError|StopIteration|ImportError)\\b" },
-        { "name": "entity.name.type.jaithon", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+        { "include": "#comments" },
+        { "name": "keyword.operator.variadic.jaithon", "match": "\\.\\.\\." },
+        { "name": "variable.language.self.jaithon", "match": "\\bself\\b" },
+        {
+          "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[:,)])",
+          "captures": { "1": { "name": "variable.parameter.jaithon" } }
+        },
+        { "include": "#annotations" },
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#constants" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "annotations": {
+      "patterns": [
+        {
+          "comment": "The return type of a function.",
+          "begin": "(->)",
+          "end": "(?=[{,)\\]]|$)",
+          "beginCaptures": { "1": { "name": "keyword.operator.arrow.jaithon" } },
+          "patterns": [{ "include": "#type-expression" }]
+        },
+        {
+          "comment": "A declared type, which is always introduced by a colon.",
+          "begin": "(?<=[A-Za-z0-9_\\]])\\s*(:)(?=\\s*(?:\\.\\.\\.)?\\s*[A-Za-z_(])",
+          "end": "(?=[,)\\]}={\\n]|$)",
+          "beginCaptures": { "1": { "name": "punctuation.separator.annotation.jaithon" } },
+          "patterns": [{ "include": "#type-expression" }]
+        }
+      ]
+    },
+
+    "type-expression": {
+      "patterns": [
+        { "include": "#comments" },
+        { "name": "support.type.primitive.jaithon", "match": "\\b(int|float|bool|str|bytes|any|void|never|list|dict|set|tuple|range)\\b" },
+        { "name": "storage.type.function.jaithon", "match": "\\bfn\\b" },
+        { "name": "support.class.error.jaithon", "match": "\\b(Error|AssertionError|ArithmeticError|DivisionByZeroError|OverflowError|LookupError|IndexError|KeyError|NameError|TypeError|ValueError|ParseError|AttributeError|IOError|FileNotFoundError|PermissionError|OSError|RuntimeError|RecursionError|StopIteration|ImportError)\\b" },
+        { "name": "entity.name.type.jaithon", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" },
+        { "name": "keyword.operator.optional.jaithon", "match": "\\?" },
+        { "name": "keyword.operator.type.jaithon", "match": "[|&]" },
+        { "name": "keyword.operator.arrow.jaithon", "match": "->" },
+        { "name": "punctuation.definition.generic.jaithon", "match": "[\\[\\]]" },
+        { "name": "punctuation.separator.jaithon", "match": "[,()]" }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.conditional.jaithon", "match": "\\b(if|elif|else|match|case)\\b" },
+        { "name": "keyword.control.loop.jaithon", "match": "\\b(while|for|loop|break|continue)\\b" },
+        { "name": "keyword.control.flow.jaithon", "match": "\\b(return|yield|throw|defer)\\b" },
+        { "name": "keyword.control.exception.jaithon", "match": "\\b(try|catch|finally)\\b" },
+        { "name": "keyword.control.import.jaithon", "match": "\\b(import|from|as|export|module)\\b" },
+        { "name": "storage.modifier.jaithon", "match": "\\b(pub|prot|static|mut|impl|extends)\\b" },
+        { "name": "storage.type.jaithon", "match": "\\b(fn|let|var|const|class|trait|enum|type)\\b" },
+        { "name": "keyword.other.assert.jaithon", "match": "\\b(assert)\\b" },
+        { "name": "variable.language.self.jaithon", "match": "\\b(self|super)\\b" },
+        { "name": "keyword.operator.logical.jaithon", "match": "\\b(and|or|not|is|in)\\b" }
       ]
     },
 
     "constants": {
       "patterns": [
-        { "name": "constant.language.jaithon", "match": "\\b(true|false|null)\\b" },
-        { "name": "variable.other.constant.jaithon", "match": "\\b[A-Z][A-Z0-9_]{2,}\\b" }
+        { "name": "constant.language.boolean.jaithon", "match": "\\b(true|false)\\b" },
+        { "name": "constant.language.null.jaithon", "match": "\\bnull\\b" },
+        { "name": "variable.language.wildcard.jaithon", "match": "\\b_\\b" },
+        { "name": "variable.other.constant.jaithon", "match": "\\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\\b" }
+      ]
+    },
+
+    "lambda": {
+      "comment": "|x, y| body — only where a bitwise or cannot appear.",
+      "begin": "(?<=[=(\\[,{]|=>|\\breturn|\\byield)\\s*(\\|)(?![|=])",
+      "end": "(\\|)",
+      "beginCaptures": { "1": { "name": "punctuation.definition.lambda.begin.jaithon" } },
+      "endCaptures": { "1": { "name": "punctuation.definition.lambda.end.jaithon" } },
+      "patterns": [
+        { "name": "variable.parameter.jaithon", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" },
+        { "name": "punctuation.separator.jaithon", "match": "," },
+        { "include": "#annotations" }
+      ]
+    },
+
+    "calls": {
+      "patterns": [
+        { "name": "support.function.primitive.jaithon", "match": "\\b__prim__(?:\\.[a-z_0-9]+)*\\b" },
+        {
+          "name": "support.function.builtin.jaithon",
+          "match": "\\b(print|input|len|range|type_of|repr|str|int|float|bool|id|hash|abs|min|max|sum|sorted|reversed|enumerate|zip|map|filter|any|all|chr|ord|isinstance|callable|dir|assert_eq|exit|list|dict|set|tuple|bytes)\\b(?=\\s*\\()"
+        },
+        {
+          "comment": "A dunder is the implementation's, not yours.",
+          "match": "(\\.)?\\b(__[a-z_0-9]+__)\\b",
+          "captures": {
+            "1": { "name": "punctuation.accessor.jaithon" },
+            "2": { "name": "support.function.magic.jaithon" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.jaithon" },
+            "2": { "name": "entity.name.function.member.jaithon" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.jaithon" },
+            "2": { "name": "variable.other.property.jaithon" }
+          }
+        },
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[\\[(])",
+          "captures": { "1": { "name": "entity.name.function.call.jaithon" } }
+        }
+      ]
+    },
+
+    "named-arguments": {
+      "comment": "greet(name: \"Ada\") — the label is not a type annotation.",
+      "match": "(?<=[(,])\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(:)(?!:)",
+      "captures": {
+        "1": { "name": "variable.parameter.named.jaithon" },
+        "2": { "name": "punctuation.separator.jaithon" }
+      }
+    },
+
+    "types": {
+      "patterns": [
+        { "name": "support.class.error.jaithon", "match": "\\b(Error|AssertionError|ArithmeticError|DivisionByZeroError|OverflowError|LookupError|IndexError|KeyError|NameError|TypeError|ValueError|ParseError|AttributeError|IOError|FileNotFoundError|PermissionError|OSError|RuntimeError|RecursionError|StopIteration|ImportError)\\b" },
+        { "name": "support.class.trait.jaithon", "match": "\\b(Iterable|Iterator|Comparable|Hashable|Printable|Cloneable|Default|Container|Ordering)\\b" },
+        { "name": "entity.name.type.jaithon", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
       ]
     },
 
     "operators": {
       "patterns": [
-        { "name": "keyword.operator.assignment.jaithon",
-          "match": "(\\*\\*=|//=|<<=|>>=|[+\\-*/%&|^]=|=)" },
+        { "name": "keyword.operator.assignment.jaithon", "match": "(\\*\\*=|//=|<<=|>>=|[+\\-*/%&|^]=|=)(?!=)" },
         { "name": "keyword.operator.comparison.jaithon", "match": "(==|!=|<=|>=|<|>)" },
-        { "name": "keyword.operator.arithmetic.jaithon",
-          "match": "(\\*\\*|//|[+\\-*/%@]%?)" },
+        { "name": "keyword.operator.arithmetic.jaithon", "match": "(\\*\\*|//|[+\\-*/%@])" },
         { "name": "keyword.operator.bitwise.jaithon", "match": "(<<|>>|[&|^~])" },
         { "name": "keyword.operator.range.jaithon", "match": "(\\.\\.=|\\.\\.)" },
-        { "name": "keyword.operator.other.jaithon", "match": "(\\?\\?|\\?\\.|->|=>|\\?|\\.\\.\\.)" }
+        { "name": "keyword.operator.arrow.jaithon", "match": "(->|=>)" },
+        { "name": "keyword.operator.coalesce.jaithon", "match": "(\\?\\?|\\?\\.)" },
+        { "name": "keyword.operator.optional.jaithon", "match": "\\?" },
+        { "name": "keyword.operator.spread.jaithon", "match": "\\.\\.\\." }
       ]
     },
 
@@ -202,24 +449,9 @@
       "patterns": [
         { "name": "punctuation.separator.jaithon", "match": "[,:;]" },
         { "name": "punctuation.accessor.jaithon", "match": "\\." },
-        { "name": "punctuation.section.brackets.jaithon", "match": "[\\[\\]{}()]" }
-      ]
-    },
-
-    "calls": {
-      "patterns": [
-        {
-          "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
-          "captures": { "1": { "name": "entity.name.function.call.jaithon" } }
-        },
-        {
-          "match": "\\b(__prim__)\\b",
-          "captures": { "1": { "name": "support.function.builtin.jaithon" } }
-        },
-        {
-          "name": "support.function.builtin.jaithon",
-          "match": "\\b(print|input|len|range|type|repr|str|int|float|bool|id|hash|abs|min|max|sum|sorted|reversed|enumerate|zip|map|filter|any|all|chr|ord|isinstance|callable|dir|exit)\\b(?=\\s*\\()"
-        }
+        { "name": "punctuation.section.brackets.jaithon", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.parens.jaithon", "match": "[()]" },
+        { "name": "punctuation.section.braces.jaithon", "match": "[{}]" }
       ]
     },
 

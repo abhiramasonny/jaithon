@@ -14,12 +14,27 @@
     ],
     "description": "Documented public function"
   },
+  "method": {
+    "prefix": "method",
+    "body": ["pub fn ${1:name}(self${2:, }) -> ${3:void} {", "\t$0", "}"],
+    "description": "Method taking self"
+  },
+  "static method": {
+    "prefix": "sfn",
+    "body": ["pub static fn ${1:name}(${2:params}) -> ${3:void} {", "\t$0", "}"],
+    "description": "Static method"
+  },
+  "lambda": {
+    "prefix": "lam",
+    "body": ["|${1:x}| ${0:x}"],
+    "description": "Lambda"
+  },
   "class": {
     "prefix": "class",
     "body": [
       "#: ${2:One-line summary.}",
       "pub class ${1:Name} {",
-      "\tvar ${3:field}: ${4:int}",
+      "\tpub var ${3:field}: ${4:int}",
       "",
       "\tfn init(self, ${3:field}: ${4:int}) {",
       "\t\tself.${3:field} = ${3:field}",
@@ -29,15 +44,43 @@
     ],
     "description": "Class with a constructor"
   },
+  "subclass": {
+    "prefix": "extends",
+    "body": [
+      "pub class ${1:Name} extends ${2:Base} {",
+      "\tfn init(self${3:, }) {",
+      "\t\tsuper($4)",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Class extending another"
+  },
   "trait": {
     "prefix": "trait",
     "body": ["pub trait ${1:Name} {", "\tfn ${2:method}(self) -> ${3:void}", "$0", "}"],
     "description": "Trait declaration"
   },
+  "implement trait": {
+    "prefix": "impl",
+    "body": [
+      "pub class ${1:Name}: ${2:Trait} {",
+      "\tfn ${3:method}(self) -> ${4:void} {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Class implementing a trait"
+  },
   "enum": {
     "prefix": "enum",
     "body": ["pub enum ${1:Name} {", "\t${2:Variant},", "$0", "}"],
     "description": "Enum declaration"
+  },
+  "enum with payload": {
+    "prefix": "enump",
+    "body": ["pub enum ${1:Name} {", "\t${2:Variant}(${3:value}: ${4:int}),", "$0", "}"],
+    "description": "Enum whose variants carry data"
   },
   "if": {
     "prefix": "if",
@@ -49,6 +92,11 @@
     "body": ["if ${1:condition} {", "\t$2", "} else {", "\t$0", "}"],
     "description": "if / else"
   },
+  "if expression": {
+    "prefix": "ifx",
+    "body": ["if ${1:condition} { ${2:a} } else { ${0:b} }"],
+    "description": "if in expression position"
+  },
   "for range": {
     "prefix": "for",
     "body": ["for ${1:i} in ${2:0}..${3:n} {", "\t$0", "}"],
@@ -59,25 +107,88 @@
     "body": ["for ${1:item} in ${2:items} {", "\t$0", "}"],
     "description": "for over an iterable"
   },
+  "for enumerate": {
+    "prefix": "fori",
+    "body": ["for (${1:index}, ${2:value}) in ${3:items}.enumerate() {", "\t$0", "}"],
+    "description": "for with an index"
+  },
   "while": {
     "prefix": "while",
     "body": ["while ${1:condition} {", "\t$0", "}"],
     "description": "while loop"
+  },
+  "loop": {
+    "prefix": "loop",
+    "body": ["loop {", "\tif ${1:done} { break }", "\t$0", "}"],
+    "description": "loop until break"
+  },
+  "labelled loop": {
+    "prefix": "label",
+    "body": ["'${1:outer}: for ${2:row} in ${3:0}..${4:n} {", "\t$0", "}"],
+    "description": "Labelled loop"
   },
   "match": {
     "prefix": "match",
     "body": ["match ${1:value} {", "\t${2:pattern} => ${3:result},", "\t_ => $0,", "}"],
     "description": "match expression"
   },
+  "match enum": {
+    "prefix": "matche",
+    "body": [
+      "match ${1:value} {",
+      "\t${2:Enum}.${3:Variant}(${4:payload}) => $5,",
+      "\t_ => $0,",
+      "}"
+    ],
+    "description": "match over an enum with payloads"
+  },
   "try": {
     "prefix": "try",
     "body": ["try {", "\t$1", "} catch ${2:e}: ${3:Error} {", "\t$0", "}"],
     "description": "try / catch"
   },
+  "try finally": {
+    "prefix": "tryf",
+    "body": [
+      "try {",
+      "\t$1",
+      "} catch ${2:e}: ${3:Error} {",
+      "\t$4",
+      "} finally {",
+      "\t$0",
+      "}"
+    ],
+    "description": "try / catch / finally"
+  },
+  "throw": {
+    "prefix": "throw",
+    "body": ["throw ${1:ValueError}(f\"${0:message}\")"],
+    "description": "Throw an exception"
+  },
   "defer": {
     "prefix": "defer",
     "body": ["defer { $0 }"],
     "description": "defer block"
+  },
+  "list comprehension": {
+    "prefix": "comp",
+    "body": ["[${1:x} for ${1:x} in ${2:items}${3: if ${4:condition}}]"],
+    "description": "List comprehension"
+  },
+  "dict comprehension": {
+    "prefix": "compd",
+    "body": ["{${1:k}: ${2:v} for ${1:k} in ${3:items}}"],
+    "description": "Dict comprehension"
+  },
+  "import": {
+    "prefix": "import",
+    "body": ["import ${0:std.math}"],
+    "description": "Import a module"
+  },
+  "from import": {
+    "prefix": "fromimport",
+    "body": ["from ${1:std.math} import ${0:sqrt}"],
+    "description": "Import names from a module"
   },
   "test": {
     "prefix": "test",
@@ -98,5 +209,10 @@
     "prefix": "doc",
     "body": ["#: ${1:One-line summary.}", "#:", "#: ${2:Details.}"],
     "description": "Doc comment"
+  },
+  "region": {
+    "prefix": "region",
+    "body": ["# region ${1:name}", "$0", "# endregion"],
+    "description": "Foldable region"
   }
 }
