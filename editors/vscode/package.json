@@ -1,8 +1,8 @@
 {
   "name": "jaithon",
   "displayName": "Jaithon",
-  "description": "Language support for Jaithon 3: syntax highlighting, diagnostics, formatting, and run commands.",
-  "version": "3.0.0",
+  "description": "Language support for Jaithon 3: live diagnostics, go to definition, find references, rename, hover types, completion, inlay hints and the canonical formatter — all driven by the real compiler.",
+  "version": "3.1.0",
   "publisher": "jaithon",
   "icon": "icon.png",
   "license": "MIT",
@@ -14,11 +14,22 @@
     "Formatters",
     "Linters"
   ],
+  "keywords": [
+    "jaithon",
+    "jai"
+  ],
   "main": "./extension.js",
   "activationEvents": [
+    "onLanguage:jaithon",
     "onCustomEditor:jaithon.jaicViewer",
-    "onLanguage:jaithon"
+    "workspaceContains:**/*.jai"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "The extension runs the `jaithon` compiler from the workspace to analyse code."
+    }
+  },
   "contributes": {
     "languages": [
       {
@@ -43,35 +54,87 @@
         "path": "./syntaxes/jaithon.tmLanguage.json"
       }
     ],
+    "semanticTokenScopes": [
+      {
+        "language": "jaithon",
+        "scopes": {
+          "namespace": ["entity.name.namespace.jaithon"],
+          "class": ["entity.name.type.class.jaithon"],
+          "enum": ["entity.name.type.enum.jaithon"],
+          "interface": ["support.class.trait.jaithon"],
+          "type": ["entity.name.type.jaithon"],
+          "enumMember": ["variable.other.enummember.jaithon"],
+          "property": ["variable.other.property.jaithon"],
+          "parameter": ["variable.parameter.jaithon"],
+          "method": ["entity.name.function.member.jaithon"],
+          "function": ["entity.name.function.jaithon"],
+          "*.defaultLibrary": ["support.function.builtin.jaithon"]
+        }
+      }
+    ],
     "commands": [
       {
         "command": "jaithon.run",
-        "title": "Jaithon: Run File",
+        "title": "Run File",
+        "category": "Jaithon",
         "icon": "$(play)"
       },
       {
         "command": "jaithon.check",
-        "title": "Jaithon: Check File"
+        "title": "Check File",
+        "category": "Jaithon"
+      },
+      {
+        "command": "jaithon.checkWorkspace",
+        "title": "Check Workspace",
+        "category": "Jaithon"
       },
       {
         "command": "jaithon.test",
-        "title": "Jaithon: Run Tests"
+        "title": "Run Tests",
+        "category": "Jaithon",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "jaithon.testFile",
+        "title": "Run Tests in File",
+        "category": "Jaithon"
+      },
+      {
+        "command": "jaithon.bench",
+        "title": "Run Benchmarks",
+        "category": "Jaithon"
       },
       {
         "command": "jaithon.repl",
-        "title": "Jaithon: Start REPL"
+        "title": "Start REPL",
+        "category": "Jaithon"
       },
       {
         "command": "jaithon.disasm",
-        "title": "Jaithon: Show Bytecode"
+        "title": "Show Bytecode",
+        "category": "Jaithon"
       },
       {
         "command": "jaithon.ast",
-        "title": "Jaithon: Show AST"
+        "title": "Show Syntax Tree",
+        "category": "Jaithon"
+      },
+      {
+        "command": "jaithon.tokens",
+        "title": "Show Token Stream",
+        "category": "Jaithon"
       },
       {
         "command": "jaithon.disasmImage",
-        "title": "Jaithon: Disassemble .jaic Image"
+        "title": "Disassemble .jaic Image",
+        "category": "Jaithon"
+      },
+      {
+        "command": "jaithon.restart",
+        "title": "Reload Analysis",
+        "category": "Jaithon",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -79,7 +142,24 @@
         {
           "command": "jaithon.run",
           "when": "resourceLangId == jaithon",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "jaithon.testFile",
+          "when": "resourceLangId == jaithon",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "jaithon.run",
+          "when": "resourceLangId == jaithon",
+          "group": "jaithon@1"
+        },
+        {
+          "command": "jaithon.disasm",
+          "when": "resourceLangId == jaithon",
+          "group": "jaithon@2"
         }
       ],
       "explorer/context": [
@@ -87,6 +167,21 @@
           "command": "jaithon.disasmImage",
           "when": "resourceExtname == .jaic",
           "group": "navigation"
+        },
+        {
+          "command": "jaithon.run",
+          "when": "resourceExtname == .jai",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "jaithon.testFile",
+          "when": "resourceLangId == jaithon"
+        },
+        {
+          "command": "jaithon.disasmImage",
+          "when": "resourceExtname == .jaic"
         }
       ]
     },
@@ -95,7 +190,13 @@
         "command": "jaithon.run",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "editorLangId == jaithon"
+        "when": "editorLangId == jaithon && editorTextFocus"
+      },
+      {
+        "command": "jaithon.test",
+        "key": "ctrl+shift+t",
+        "mac": "cmd+shift+t",
+        "when": "editorLangId == jaithon && editorTextFocus"
       }
     ],
     "configuration": {
@@ -104,22 +205,63 @@
         "jaithon.path": {
           "type": "string",
           "default": "jaithon",
-          "description": "Path to the jaithon executable."
+          "markdownDescription": "Path to the `jaithon` executable. `${workspaceFolder}` and `~` are expanded. When left at the default, a `jaithon` binary in the workspace root wins over one on `PATH`, so working on the compiler tests the compiler you just built.",
+          "scope": "machine-overridable"
+        },
+        "jaithon.checkOnType": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report problems while you type, not only on save."
         },
         "jaithon.checkOnSave": {
           "type": "boolean",
           "default": true,
-          "description": "Run 'jaithon check' on save and show diagnostics inline."
+          "description": "Report problems on save."
         },
-        "jaithon.formatOnSave": {
-          "type": "boolean",
-          "default": false,
-          "description": "Run 'jaithon fmt' on save. The formatter is canonical and has no options."
+        "jaithon.checkDelay": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Milliseconds of quiet typing before the checker runs."
         },
         "jaithon.strict": {
           "type": "boolean",
           "default": false,
-          "description": "Pass --strict when checking: unannotated parameters become errors."
+          "markdownDescription": "Pass `--strict` when checking: an unannotated parameter becomes an error."
+        },
+        "jaithon.includePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra module search directories, passed as `-I`. Relative entries resolve against the workspace root."
+        },
+        "jaithon.excludeGlob": {
+          "type": "string",
+          "default": "**/{__jaicache__,node_modules,build,.git}/**",
+          "description": "Files excluded from workspace-wide search, rename and symbol lookup."
+        },
+        "jaithon.inlayHints.types": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the checker's inferred type after a `let`, `var` or unannotated parameter."
+        },
+        "jaithon.inlayHints.parameterNames": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show parameter names in front of literal arguments at call sites."
+        },
+        "jaithon.codeLens.run": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show a Run lens above `main`, and a test lens above every `test_` function."
+        },
+        "jaithon.codeLens.references": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a reference count above every declaration. Off by default: it searches the workspace."
         }
       }
     },
@@ -139,6 +281,66 @@
           }
         ],
         "priority": "default"
+      }
+    ],
+    "configurationDefaults": {
+      "[jaithon]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.rulers": [
+          100
+        ],
+        "editor.semanticHighlighting.enabled": true,
+        "editor.wordBasedSuggestions": "off",
+        "editor.suggestSelection": "first",
+        "files.trimTrailingWhitespace": true,
+        "files.insertFinalNewline": true
+      }
+    },
+    "problemMatchers": [
+      {
+        "name": "jaithon",
+        "owner": "jaithon",
+        "source": "jaithon",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": [
+          {
+            "regexp": "^(error|warning)(?:\\[([EW]\\d+)\\])?:\\s+(.*)$",
+            "severity": 1,
+            "code": 2,
+            "message": 3
+          },
+          {
+            "regexp": "^\\s*-->\\s+(.*?):(\\d+):(\\d+)\\s*$",
+            "file": 1,
+            "line": 2,
+            "column": 3
+          }
+        ]
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "jaithon",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The jaithon subcommand to run, for example `check` or `test`."
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra arguments."
+          }
+        }
       }
     ]
   }

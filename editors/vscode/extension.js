@@ -1,126 +1,50 @@
 // Jaithon VS Code extension.
 //
-// Deliberately thin: the compiler already produces precise, positioned
-// diagnostics and a canonical formatter, so the extension's whole job is to
-// shell out to `jaithon` and translate its output. There is no reimplemented
-// parser here to drift out of sync with the real one.
+// There is no reimplemented parser here, and no language server either. The
+// compiler already produces positioned diagnostics, a canonical formatter, a
+// JSON syntax tree and a dump of every type the checker inferred, so the whole
+// job is to run it and index what it says. Everything the editor offers is one
+// of those four answers turned into a VS Code provider; see src/analysis.js.
 
 const vscode = require('vscode');
-const { execFile } = require('child_process');
-const path = require('path');
-
-/** Diagnostic lines look like:  path:line:col: error[E0301]: message */
-const DIAG_RE = /^(.*?):(\d+):(\d+):\s+(error|warning)\[([EW]\d{4})\]:\s+(.*)$/;
+const tool = require('./src/tool');
+const { Checker } = require('./src/diagnostics');
+const { Workspace } = require('./src/analysis');
+const navigation = require('./src/navigation');
+const completion = require('./src/completion');
+const hints = require('./src/hints');
+const actions = require('./src/actions');
+const jaic = require('./src/jaic');
 
 let diagnostics;
 let output;
+let checker;
+let workspace;
+let status;
 
-function config() {
-    return vscode.workspace.getConfiguration('jaithon');
-}
-
-function workspaceDir(document) {
-    if (document) {
-        const folder = vscode.workspace.getWorkspaceFolder(document.uri);
-        if (folder) return folder.uri.fsPath;
-        return path.dirname(document.uri.fsPath);
+function activeDocument({ quiet } = {}) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== 'jaithon') {
+        if (!quiet) vscode.window.showWarningMessage('Jaithon: no Jaithon file is active.');
+        return null;
     }
-    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
-}
-
-// Resolve the interpreter. The setting wins, with ${workspaceFolder} expanded
-// because VS Code does not substitute variables in arbitrary string settings.
-// Otherwise prefer a binary built in the workspace over one on PATH, so working
-// on the compiler tests the compiler you just built.
-function binary(document) {
-    const root = workspaceDir(document);
-    const configured = config().get('path');
-
-    if (configured && configured !== 'jaithon') {
-        return configured.replace(/\$\{workspaceFolder\}/g, root);
-    }
-    const local = path.join(root, 'jaithon');
-    try {
-        require('fs').accessSync(local, require('fs').constants.X_OK);
-        return local;
-    } catch {
-        return 'jaithon';
-    }
-}
-
-function runJaithon(args, cwd, document) {
-    return new Promise((resolve) => {
-        execFile(binary(document), args, { cwd, maxBuffer: 16 * 1024 * 1024 },
-            (error, stdout, stderr) => {
-                resolve({
-                    code: error && typeof error.code === 'number' ? error.code : 0,
-                    stdout,
-                    stderr,
-                    spawnFailed: Boolean(error && error.code === 'ENOENT'),
-                });
-            });
-    });
-}
-
-function reportMissingBinary() {
-    vscode.window.showErrorMessage(
-        `Jaithon: '${binary()}' not found. Build it with 'make', or set ` +
-        `"jaithon.path" in settings.`);
-}
-
-async function checkDocument(document) {
-    if (document.languageId !== 'jaithon') return;
-
-    const args = ['check'];
-    if (config().get('strict')) args.push('--strict');
-    args.push('--color=never', document.uri.fsPath);
-
-    const result = await runJaithon(args, workspaceDir(document), document);
-    if (result.spawnFailed) return;
-
-    const byFile = new Map();
-    for (const line of (result.stderr + result.stdout).split('\n')) {
-        const match = DIAG_RE.exec(line.trim());
-        if (!match) continue;
-
-        const [, file, lineNo, colNo, severity, code, message] = match;
-        const position = new vscode.Position(Number(lineNo) - 1, Number(colNo) - 1);
-        // The compiler reports a start position; extend to the end of the word
-        // so the squiggle is visible rather than a zero-width caret.
-        const range = document.getWordRangeAtPosition(position)
-            || new vscode.Range(position, position.translate(0, 1));
-
-        const diagnostic = new vscode.Diagnostic(
-            range,
-            message,
-            severity === 'error'
-                ? vscode.DiagnosticSeverity.Error
-                : vscode.DiagnosticSeverity.Warning);
-        diagnostic.code = code;
-        diagnostic.source = 'jaithon';
-
-        const key = path.resolve(workspaceDir(document), file);
-        if (!byFile.has(key)) byFile.set(key, []);
-        byFile.get(key).push(diagnostic);
-    }
-
-    diagnostics.set(document.uri, byFile.get(document.uri.fsPath) || []);
+    return editor.document;
 }
 
 function terminal() {
-    const existing = vscode.window.terminals.find((t) => t.name === 'Jaithon');
-    return existing || vscode.window.createTerminal('Jaithon');
+    return vscode.window.terminals.find((item) => item.name === 'Jaithon')
+        || vscode.window.createTerminal('Jaithon');
 }
 
 function runInTerminal(args, document) {
     const term = terminal();
     term.show(true);
-    term.sendText(`"${binary(document)}" ${args.join(' ')}`);
+    term.sendText(`"${tool.binary(document)}" ${args.join(' ')}`);
 }
 
-async function showInPanel(title, args, cwd, language, document) {
-    const result = await runJaithon(args, cwd, document);
-    if (result.spawnFailed) return reportMissingBinary();
+async function showInPanel(args, cwd, language, document) {
+    const result = await tool.run(args, { cwd, document });
+    if (result.spawnFailed) return;
     const doc = await vscode.workspace.openTextDocument({
         content: result.stdout || result.stderr,
         language: language || 'plaintext',
@@ -128,182 +52,220 @@ async function showInPanel(title, args, cwd, language, document) {
     await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
 }
 
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+function updateStatus(document) {
+    if (!status) return;
+    if (!document || document.languageId !== 'jaithon') { status.hide(); return; }
+
+    const found = diagnostics.get(document.uri) || [];
+    const errors = found.filter((item) => item.severity === vscode.DiagnosticSeverity.Error).length;
+    const warnings = found.length - errors;
+
+    status.text = errors ? `$(error) ${errors}` : warnings ? `$(warning) ${warnings}` : '$(check) Jaithon';
+    status.tooltip = errors || warnings
+        ? `Jaithon: ${errors} error(s), ${warnings} warning(s)`
+        : 'Jaithon: no problems found';
+    status.command = 'workbench.actions.view.problems';
+    status.show();
+}
 
 // ---------------------------------------------------------------------------
-// .jaic viewer
+
+function registerCommands(context) {
+    const command = (name, handler) =>
+        context.subscriptions.push(vscode.commands.registerCommand(name, handler));
+
+    command('jaithon.run', async (uri) => {
+        const document = uri
+            ? await vscode.workspace.openTextDocument(uri)
+            : activeDocument();
+        if (!document) return;
+        await document.save();
+        runInTerminal(['run', `"${document.uri.fsPath}"`], document);
+    });
+
+    command('jaithon.check', async () => {
+        const document = activeDocument();
+        if (!document) return;
+        const found = await checker.check(document);
+        vscode.window.showInformationMessage(
+            found.length === 0 ? 'Jaithon: no problems found.'
+                               : `Jaithon: ${found.length} problem(s).`);
+    });
+
+    command('jaithon.checkWorkspace', async () => {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        if (!folder) return;
+        runInTerminal(['check', `"${folder.uri.fsPath}"`]);
+    });
+
+    command('jaithon.test', () => {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        runInTerminal(['test', folder ? `"${folder.uri.fsPath}"` : '']);
+    });
+
+    command('jaithon.testFile', async (uri) => {
+        const document = uri ? await vscode.workspace.openTextDocument(uri) : activeDocument();
+        if (!document) return;
+        await document.save();
+        runInTerminal(['test', `"${document.uri.fsPath}"`], document);
+    });
+
+    command('jaithon.bench', () => {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        runInTerminal(['bench', folder ? `"${folder.uri.fsPath}"` : '']);
+    });
+
+    command('jaithon.repl', () => runInTerminal(['repl']));
+
+    command('jaithon.disasm', async () => {
+        const document = activeDocument();
+        if (!document) return;
+        await document.save();
+        await showInPanel(['disasm', document.uri.fsPath],
+                          tool.workspaceDir(document), undefined, document);
+    });
+
+    command('jaithon.ast', async () => {
+        const document = activeDocument();
+        if (!document) return;
+        await document.save();
+        await showInPanel(['ast', '--json', document.uri.fsPath],
+                          tool.workspaceDir(document), 'json', document);
+    });
+
+    command('jaithon.tokens', async () => {
+        const document = activeDocument();
+        if (!document) return;
+        await document.save();
+        await showInPanel(['tokens', document.uri.fsPath],
+                          tool.workspaceDir(document), undefined, document);
+    });
+
+    command('jaithon.disasmImage', async (uri) => {
+        const target = uri || vscode.window.activeTextEditor?.document.uri;
+        if (!target) {
+            vscode.window.showWarningMessage('Jaithon: no .jaic file selected.');
+            return;
+        }
+        await vscode.commands.executeCommand('vscode.openWith', target, 'jaithon.jaicViewer');
+    });
+
+    command('jaithon.restart', async () => {
+        workspace.invalidateAll();
+        for (const document of vscode.workspace.textDocuments) {
+            if (document.languageId === 'jaithon') checker.schedule(document, 0);
+        }
+        const found = await tool.version();
+        vscode.window.showInformationMessage(
+            found ? `Jaithon: reloaded (compiler ${found}).` : 'Jaithon: reloaded.');
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
 //
-// A .jaic is a bytecode image, so opening one normally shows binary garbage.
-// This registers a read-only custom editor that renders `jaithon disasm` output
-// instead — the header fields, then the disassembly of every function in the
-// image. Read-only because an image is generated: editing one is meaningless,
-// and the source it names is what you actually want to change.
+// Every one of these is a thing you would otherwise type; declaring them means
+// Ctrl+Shift+B builds, and the problem matcher puts the compiler's own output
+// in the Problems panel with the same spans the editor shows inline.
 // ---------------------------------------------------------------------------
 
-class JaicDocument {
-    constructor(uri) { this.uri = uri; }
-    dispose() {}
-}
+const TASKS = [
+    { command: 'check', args: ['.'], group: vscode.TaskGroup.Build, name: 'check' },
+    { command: 'test', args: [], group: vscode.TaskGroup.Test, name: 'test' },
+    { command: 'fmt', args: ['--check', '.'], group: undefined, name: 'fmt --check' },
+    { command: 'bench', args: [], group: undefined, name: 'bench' },
+];
 
-function registerJaicViewer(context) {
-    return vscode.window.registerCustomEditorProvider(
-        'jaithon.jaicViewer',
-        {
-            openCustomDocument(uri) { return new JaicDocument(uri); },
-
-            async resolveCustomEditor(document, panel) {
-                panel.webview.options = { enableScripts: false };
-
-                const dir = path.dirname(document.uri.fsPath);
-                const result = await runJaithon(['disasm', document.uri.fsPath], dir);
-
-                let body;
-                if (result.spawnFailed) {
-                    body = `jaithon not found.\n\n`
-                         + `Set "jaithon.path", or build it with 'make'.`;
-                } else {
-                    // disasm writes the listing to stdout and any complaint to
-                    // stderr; show both, since a version mismatch is reported
-                    // on stderr but the header still prints.
-                    body = (result.stdout || '') + (result.stderr || '');
-                    if (!body.trim()) body = '(empty image)';
-                }
-                panel.webview.html = renderListing(document.uri.fsPath, body);
-            },
-        },
-        { webviewOptions: { retainContextWhenHidden: true }, supportsMultipleEditorsPerDocument: true },
-    );
-}
-
-function escapeHtml(text) {
-    return text.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
-}
-
-function renderListing(fsPath, text) {
-    // Colour the three things worth picking out at a glance: the `;` header and
-    // comment lines, the `== name ==` function banners, and opcode mnemonics.
-    const highlighted = escapeHtml(text)
-        .replace(/^(==.*==)$/gm, '<span class="fn">$1</span>')
-        .replace(/^(;.*)$/gm, '<span class="cmt">$1</span>')
-        .replace(/\b(OP_[A-Z0-9_]+)\b/g, '<span class="op">$1</span>');
-
-    return `<!DOCTYPE html><html><head><meta charset="utf-8">
-<style>
-  body { font-family: var(--vscode-editor-font-family, monospace);
-         font-size: var(--vscode-editor-font-size, 12px);
-         color: var(--vscode-editor-foreground);
-         background: var(--vscode-editor-background);
-         padding: 12px; }
-  h1 { font-size: 1.1em; font-weight: 600; margin: 0 0 4px; }
-  .sub { opacity: 0.6; margin-bottom: 14px; font-size: 0.9em; }
-  pre { margin: 0; white-space: pre; overflow-x: auto; line-height: 1.45; }
-  .cmt { color: var(--vscode-descriptionForeground, #888); }
-  .fn  { color: var(--vscode-symbolIcon-functionForeground, #b180d7); font-weight: 600; }
-  .op  { color: var(--vscode-symbolIcon-keywordForeground, #569cd6); }
-</style></head><body>
-<h1>${escapeHtml(path.basename(fsPath))}</h1>
-<div class="sub">Jaithon bytecode image &middot; read-only</div>
-<pre>${highlighted}</pre>
-</body></html>`;
+function taskProvider() {
+    const build = (definition) => {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        const task = new vscode.Task(
+            { type: 'jaithon', command: definition.command, args: definition.args },
+            folder || vscode.TaskScope.Workspace,
+            definition.name || definition.command,
+            'jaithon',
+            new vscode.ShellExecution(tool.binary(), [definition.command, ...(definition.args || [])]),
+            '$jaithon');
+        if (definition.group) task.group = definition.group;
+        return task;
+    };
+    return {
+        provideTasks: () => TASKS.map(build),
+        resolveTask: (task) => (task.definition.command ? build(task.definition) : undefined),
+    };
 }
 
 function activate(context) {
     diagnostics = vscode.languages.createDiagnosticCollection('jaithon');
     output = vscode.window.createOutputChannel('Jaithon');
-    context.subscriptions.push(diagnostics, output);
+    checker = new Checker(diagnostics);
+    workspace = new Workspace(output);
+    status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+    context.subscriptions.push(diagnostics, output, checker, workspace, status);
 
-    const currentFile = () => {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document.languageId !== 'jaithon') {
-            vscode.window.showWarningMessage('Jaithon: no Jaithon file is active.');
-            return null;
-        }
-        return editor.document;
-    };
+    registerCommands(context);
+    jaic.register(context);
+    navigation.register(context, workspace);
+    completion.register(context, workspace);
+    hints.register(context, workspace);
+    actions.register(context, workspace);
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('jaithon.run', async () => {
-            const doc = currentFile();
-            if (!doc) return;
-            await doc.save();
-            runInTerminal(['run', `"${doc.uri.fsPath}"`], doc);
-        }),
-
-        vscode.commands.registerCommand('jaithon.check', async () => {
-            const doc = currentFile();
-            if (!doc) return;
-            await doc.save();
-            await checkDocument(doc);
-            const found = diagnostics.get(doc.uri) || [];
-            vscode.window.showInformationMessage(
-                found.length === 0 ? 'Jaithon: no problems found.'
-                                   : `Jaithon: ${found.length} problem(s).`);
-        }),
-
-        vscode.commands.registerCommand('jaithon.test', () => {
-            const folder = vscode.workspace.workspaceFolders?.[0];
-            runInTerminal(['test', folder ? `"${folder.uri.fsPath}"` : '']);
-        }),
-
-        vscode.commands.registerCommand('jaithon.repl', () => runInTerminal(['repl'])),
-
-        vscode.commands.registerCommand('jaithon.disasm', async () => {
-            const doc = currentFile();
-            if (!doc) return;
-            await doc.save();
-            await showInPanel('bytecode', ['disasm', doc.uri.fsPath], workspaceDir(doc),
-                              undefined, doc);
-        }),
-
-        vscode.commands.registerCommand('jaithon.ast', async () => {
-            const doc = currentFile();
-            if (!doc) return;
-            await doc.save();
-            await showInPanel('ast', ['ast', '--json', doc.uri.fsPath], workspaceDir(doc),
-                              'json', doc);
-        }),
+        vscode.tasks.registerTaskProvider('jaithon', taskProvider()),
     );
 
-    // The formatter is canonical, so wiring it as the document formatter needs
-    // no options plumbing at all.
-    context.subscriptions.push(registerJaicViewer(context));
-
     context.subscriptions.push(
-        vscode.commands.registerCommand('jaithon.disasmImage', async (uri) => {
-            const target = uri || vscode.window.activeTextEditor?.document.uri;
-            if (!target) {
-                vscode.window.showWarningMessage('Jaithon: no .jaic file selected.');
-                return;
+        checker.onDidCheck(() => updateStatus(vscode.window.activeTextEditor?.document)),
+
+        vscode.workspace.onDidChangeTextDocument((event) => {
+            if (event.document.languageId !== 'jaithon') return;
+            workspace.invalidate(event.document.uri.fsPath);
+            if (tool.config().get('checkOnType') !== false) checker.schedule(event.document);
+        }),
+
+        vscode.workspace.onDidSaveTextDocument(async (document) => {
+            if (document.languageId !== 'jaithon') return;
+            workspace.invalidate(document.uri.fsPath);
+            if (tool.config().get('checkOnSave') !== false) checker.schedule(document, 0);
+        }),
+
+        vscode.workspace.onDidOpenTextDocument((document) => checker.schedule(document, 0)),
+        vscode.workspace.onDidCloseTextDocument((document) => {
+            checker.forget(document);
+            workspace.invalidate(document.uri.fsPath);
+        }),
+
+        vscode.window.onDidChangeActiveTextEditor((editor) => updateStatus(editor?.document)),
+
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (!event.affectsConfiguration('jaithon')) return;
+            workspace.invalidateAll();
+            for (const document of vscode.workspace.textDocuments) {
+                if (document.languageId === 'jaithon') checker.schedule(document, 0);
             }
-            await vscode.commands.executeCommand(
-                'vscode.openWith', target, 'jaithon.jaicViewer');
-        }));
-
-    context.subscriptions.push(
-        vscode.languages.registerDocumentFormattingEditProvider('jaithon', {
-            async provideDocumentFormattingEdits(document) {
-                const result = await runJaithon(['fmt', '--stdout', document.uri.fsPath],
-                                                workspaceDir(document), document);
-                if (result.spawnFailed || result.code !== 0 || !result.stdout) return [];
-                const whole = new vscode.Range(
-                    document.positionAt(0),
-                    document.positionAt(document.getText().length));
-                return [vscode.TextEdit.replace(whole, result.stdout)];
-            },
-        }));
-
-    context.subscriptions.push(
-        vscode.workspace.onDidSaveTextDocument((doc) => {
-            if (config().get('checkOnSave')) checkDocument(doc);
         }),
-        vscode.workspace.onDidOpenTextDocument(checkDocument),
-        vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.delete(doc.uri)),
     );
 
-    vscode.workspace.textDocuments.forEach(checkDocument);
+    // Files changed outside the editor — a rebuild, a branch switch — invalidate
+    // the index, since a definition may now live somewhere else.
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*.jai');
+    context.subscriptions.push(
+        watcher,
+        watcher.onDidChange((uri) => workspace.invalidate(uri.fsPath)),
+        watcher.onDidCreate((uri) => workspace.invalidate(uri.fsPath)),
+        watcher.onDidDelete((uri) => workspace.invalidate(uri.fsPath)),
+    );
+
+    vscode.workspace.textDocuments.forEach((document) => checker.schedule(document, 0));
+    updateStatus(vscode.window.activeTextEditor?.document);
 }
 
 function deactivate() {
-    if (diagnostics) diagnostics.dispose();
+    tool.cleanup();
 }
 
 module.exports = { activate, deactivate };
