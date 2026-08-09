@@ -32,6 +32,8 @@
 
 #include "cli.h"
 
+#include "../runtime/frontend.h"
+
 #include "../codegen/codegen.h"
 #include "../lang/ast.h"
 #include "../lang/lexer.h"
@@ -321,237 +323,22 @@ static void replReset(void) {
 /* Deciding whether more input is needed                                */
 /* ------------------------------------------------------------------ */
 
-/* What is holding the input open. The distinction matters at the continuation
- * prompt: a blank line abandons an input that only trails an operator, but
- * inside a bracket or a literal a blank line is content, and a pasted block
- * that happens to contain one has to survive. */
-typedef enum {
-    REPL_OPEN_NONE,
-    REPL_OPEN_BRACKET,    /* `(`, `[` or `{` is still waiting for its closer */
-    REPL_OPEN_STRING,     /* a triple-quoted string runs past the last line  */
-    REPL_OPEN_COMMENT,    /* a `#*` block comment has no `*#` yet            */
-    REPL_OPEN_OPERATOR,   /* the last line ends on something that binds on   */
-} ReplOpenKind;
-
-/* The verdict on one buffer: run it, keep reading, or reject it now. */
-typedef struct {
-    bool         incomplete;
-    bool         mismatched;   /* a closer nothing opened: more input cannot help */
-    ReplOpenKind open;
-    char         opener;       /* the bracket still open, or wrongly closed */
-    int          openerLine;
-    char         closer;       /* the offending closer, when mismatched */
-    int          closerLine;
-    int          closerCol;
-} ReplScan;
-
-/* One entry of the bracket stack. The line is derived on demand: computing it
- * for every opener would walk the buffer once per bracket. */
-typedef struct {
-    char     opener;
-    uint32_t offset;
-} ReplBracket;
-
-/* 1-based line and column of a byte offset in the accumulated input. Columns
- * count scalars, not bytes, so a line with text above U+007F before the
- * bracket still points at the right place. */
-static void positionAt(const char *source, size_t length, uint32_t offset,
-                       int *outLine, int *outCol) {
-    int line = 1;
-    int col = 1;
-    for (size_t i = 0; i < length && i < offset; i++) {
-        if (source[i] == '\n') {
-            line++;
-            col = 1;
-        } else if (((unsigned char)source[i] & 0xC0) != 0x80) {
-            col++;
-        }
-    }
-    *outLine = line;
-    *outCol = col;
-}
-
-static char closerFor(char opener) {
-    return opener == '(' ? ')' : opener == '[' ? ']' : '}';
-}
-
-/* Walk the token stream with a stack of the brackets that are still open. A
- * single depth counter cannot do this job: `{"a": [1}` is balanced by depth
- * alone yet never returns to zero, and clamping a stray closer at zero lets it
- * cancel a legitimate opener later in the same input. Either way the REPL
- * would sit waiting for a line that can never arrive. */
-static void scanBrackets(const Lexer *lex, const char *source, size_t length,
-                         ReplScan *out) {
-    JAI_VEC(ReplBracket) stack;
-    JAI_VEC_INIT(&stack);
-
-    for (int i = 0; i < lex->tokens.count; i++) {
-        const Token *t = &lex->tokens.data[i];
-        char opener = '\0';
-        char closer = '\0';
-        switch ((TokenKind)t->kind) {
-        case TOK_LPAREN:   opener = '('; break;
-        case TOK_LBRACKET: opener = '['; break;
-        case TOK_LBRACE:   opener = '{'; break;
-        case TOK_RPAREN:   closer = ')'; break;
-        case TOK_RBRACKET: closer = ']'; break;
-        case TOK_RBRACE:   closer = '}'; break;
-        default: continue;    /* f-string interpolation braces are not tokens */
-        }
-
-        if (opener != '\0') {
-            ReplBracket entry;
-            entry.opener = opener;
-            entry.offset = t->start;
-            JAI_VEC_PUSH(ReplBracket, &stack, entry);
-            continue;
-        }
-
-        if (stack.count == 0 || closerFor(JAI_VEC_LAST(&stack).opener) != closer) {
-            out->mismatched = true;
-            out->closer = closer;
-            positionAt(source, length, t->start, &out->closerLine, &out->closerCol);
-            if (stack.count > 0) {
-                int col;
-                out->opener = JAI_VEC_LAST(&stack).opener;
-                positionAt(source, length, JAI_VEC_LAST(&stack).offset,
-                           &out->openerLine, &col);
-            }
-            JAI_VEC_FREE(ReplBracket, &stack);
-            return;
-        }
-        stack.count--;
-    }
-
-    if (stack.count > 0) {
-        /* Name the outermost one: that is the construct the input set out to
-         * write, and the one the user is being asked to finish. */
-        int col;
-        out->incomplete = true;
-        out->open = REPL_OPEN_BRACKET;
-        out->opener = stack.data[0].opener;
-        positionAt(source, length, stack.data[0].offset, &out->openerLine, &col);
-    }
-    JAI_VEC_FREE(ReplBracket, &stack);
-}
-
-/* True when the quote at `offset`, past any `r`/`f` prefix, is tripled. */
-static bool isTripleQuoteAt(const char *source, size_t length, uint32_t offset) {
-    size_t i = offset;
-    while (i < length && (source[i] == 'r' || source[i] == 'f')) i++;
-    if (i + 2 >= length) return false;
-    char c = source[i];
-    return (c == '"' || c == '\'') && source[i + 1] == c && source[i + 2] == c;
-}
-
-/* Where the f-string the lexer is still inside was opened, or -1.
+/* Whether the buffer is a whole input is a question about syntax, so the front
+ * end answers it. Nothing is registered and no diagnostic escapes: a line
+ * still being typed must not reach the source table, and the compile that
+ * follows a complete input produces the real diagnostics with real spans.
  *
- * An f-string diagnostic is raised where the lexer noticed the trouble, not at
- * the quote that started the literal: `f"""a {n}` reports at the byte after the
- * interpolation, and an interpolation still open at end of input reports at the
- * end of the buffer. Neither offset says whether the literal was triple-quoted,
- * so the opener has to come from the token stream, where every f-string leaves a
- * TOK_FSTRING_START at its first byte. The last one is the one still open: the
- * lexer only stops mid-literal at the end of the input. */
-static long openFStringOffset(const Lexer *lex) {
-    long offset = -1;
-    for (int i = 0; i < lex->tokens.count; i++) {
-        if (lex->tokens.data[i].kind == TOK_FSTRING_START) {
-            offset = (long)lex->tokens.data[i].start;
-        }
-    }
-    return offset;
-}
-
-/* An unterminated literal only means "keep typing" when a later line could
- * still finish it: a block comment, or a triple-quoted string that is still
- * open where the input stops. The decision is made on the span of the literal
- * the lexer complained about rather than on the whole buffer, so a complete
- * `"""..."""` earlier in the input cannot make a broken one-line string look
- * like the start of a long one. */
-static bool unterminatedLiteralContinues(const Lexer *lex, const char *source,
-                                         size_t length, ReplScan *out) {
-    if (gDiags.diags.count == 0) return false;
-
-    const JaiDiag *last = NULL;
-    for (int i = 0; i < gDiags.diags.count; i++) {
-        const JaiDiag *d = &gDiags.diags.data[i];
-        if (d->code == E0002_UNTERMINATED_COMMENT) continue;
-        if (d->code != E0001_UNTERMINATED_STRING &&
-            d->code != E0008_UNTERMINATED_INTERPOLATION) return false;
-        last = d;
-    }
-
-    int col;
-    if (last == NULL) {                       /* block comments only */
-        out->open = REPL_OPEN_COMMENT;
-        out->opener = '#';
-        positionAt(source, length, gDiags.diags.data[0].primary.start,
-                   &out->openerLine, &col);
-        return true;
-    }
-
-    uint32_t opener = last->primary.start;
-    if (last->code == E0008_UNTERMINATED_INTERPOLATION) {
-        long found = openFStringOffset(lex);
-        if (found < 0) return false;
-        opener = (uint32_t)found;
-    } else {
-        /* The literal has to reach the end of the input; one that the lexer
-         * recovered from at an earlier newline is a plain error. The buffer
-         * always ends in the newline the loop appended, which the span stops
-         * short of. An f-string needs no such test: the lexer leaves a
-         * triple-quoted one open only when it runs out of input. */
-        if ((size_t)last->primary.end + 1 < length) return false;
-    }
-    if (!isTripleQuoteAt(source, length, opener)) return false;
-
-    out->open = REPL_OPEN_STRING;
-    out->opener = '"';
-    positionAt(source, length, opener, &out->openerLine, &col);
-    return true;
-}
-
-/* Decide what to do with the buffer. This runs on a throwaway lexer with no
- * registered source file, so a line the user is still typing never adds
- * anything to the source registry, and its diagnostics are dropped: the real
- * pass below produces them again with proper spans. */
-static void replScan(const char *source, size_t length, ReplScan *out) {
-    AstContext ast;
-    Lexer lex;
-    Parser parser;
-
-    memset(out, 0, sizeof *out);
-    jaiAstContextInit(&ast);
-    jaiLexerInit(&lex, source, length, -1);
-    bool lexOk = jaiLexerRun(&lex);
-
-    if (lexOk) {
-        scanBrackets(&lex, source, length, out);
-        if (!out->incomplete && !out->mismatched) {
-            /* Brackets balance, so the only thing left that can hold the input
-             * open is a line ending on a token the next one continues. */
-            bool incomplete = false;
-            jaiParserInit(&parser, &lex, &ast);
-            (void)jaiParseREPLLine(&parser, &incomplete);
-            if (incomplete) {
-                out->incomplete = true;
-                out->open = REPL_OPEN_OPERATOR;
-            }
-        }
-    } else if (unterminatedLiteralContinues(&lex, source, length, out)) {
-        out->incomplete = true;
-    }
-
-    jaiDiagReset(&gDiags);
-    jaiLexerFree(&lex);
-    jaiAstContextFree(&ast);
+ * A front end that cannot be reached leaves the verdict zeroed, which reads as
+ * "complete" -- the compile below then says why, which beats a prompt hanging
+ * on a line nothing can finish. */
+static void replScan(const char *source, size_t length, JaiReplScan *out) {
+    (void)jaiFrontEndReplScan(source, length, out);
 }
 
 /* A closer that matches nothing is reported here rather than left to the
  * compiler: the parser's own "needs more input" test sees the same unbalanced
  * count and would ask for a line that cannot fix it. */
-static void replReportMismatch(const ReplScan *scan) {
+static void replReportMismatch(const JaiReplScan *scan) {
     if (scan->opener != '\0') {
         replError("`%c` at line %d, column %d does not close the `%c` opened at line %d",
                   scan->closer, scan->closerLine, scan->closerCol,
@@ -565,7 +352,7 @@ static void replReportMismatch(const ReplScan *scan) {
 /* Ask the same question about the input being typed. Only the rare paths need
  * it, abandoning a line and end of input, so lexing the buffer again there is
  * cheaper than carrying the last verdict around. */
-static bool scanPending(ReplScan *out) {
+static bool scanPending(JaiReplScan *out) {
     if (gRepl.pending.count == 0) return false;
     replScan((const char *)gRepl.pending.data, gRepl.pending.count, out);
     return true;
@@ -575,18 +362,18 @@ static bool scanPending(ReplScan *out) {
  * is how a piped session loses its last function whole, so name what was left
  * open. */
 static void replReportUnclosed(void) {
-    ReplScan scan;
+    JaiReplScan scan;
     if (!scanPending(&scan)) return;
     switch (scan.open) {
-    case REPL_OPEN_BRACKET:
+    case JAI_REPL_OPEN_BRACKET:
         replError("unexpected end of input: `%c` opened at line %d is never closed",
                   scan.opener, scan.openerLine);
         break;
-    case REPL_OPEN_STRING:
+    case JAI_REPL_OPEN_STRING:
         replError("unexpected end of input: the triple-quoted string opened at "
                   "line %d is never closed", scan.openerLine);
         break;
-    case REPL_OPEN_COMMENT:
+    case JAI_REPL_OPEN_COMMENT:
         replError("unexpected end of input: the block comment opened at line %d "
                   "is never closed", scan.openerLine);
         break;
@@ -847,7 +634,7 @@ static void metaExpression(const char *command, const char *text,
         return;
     }
     size_t length = strlen(text);
-    ReplScan scan;
+    JaiReplScan scan;
     replScan(text, length, &scan);
     if (scan.mismatched) {
         replReportMismatch(&scan);
@@ -946,9 +733,9 @@ static const char *metaCommandNamed(const char *trimmed) {
  * comment a blank line is part of what is being typed, and a pasted block that
  * contains one has to arrive intact. */
 static bool blankLineAbandons(void) {
-    ReplScan scan;
+    JaiReplScan scan;
     if (!scanPending(&scan)) return false;
-    return scan.incomplete && scan.open == REPL_OPEN_OPERATOR;
+    return scan.incomplete && scan.open == JAI_REPL_OPEN_OPERATOR;
 }
 
 bool jaiReplFeed(const char *line, bool *outIncomplete) {
@@ -990,7 +777,7 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
 
     const char *source = (const char *)gRepl.pending.data;
     size_t length = gRepl.pending.count;
-    ReplScan scan;
+    JaiReplScan scan;
     replScan(source, length, &scan);
 
     if (scan.mismatched) {

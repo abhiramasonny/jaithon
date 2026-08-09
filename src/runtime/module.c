@@ -929,6 +929,14 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
     return module;
 }
 
+ObjModule *jaiImportFrontEndModule(const char *dottedName) {
+    bool wasLoading = sLoadingFrontEnd;
+    sLoadingFrontEnd = true;
+    ObjModule *module = jaiImportModule(dottedName, NULL);
+    sLoadingFrontEnd = wasLoading;
+    return module;
+}
+
 /* ------------------------------------------------------------------ */
 /* Prelude                                                              */
 /* ------------------------------------------------------------------ */
