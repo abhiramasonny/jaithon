@@ -32,7 +32,8 @@
 #: op_name(opcode(Op.GetLocal))        # "OP_GET_LOCAL"
 #: op_operand_bytes(opcode(Op.Const))  # 3
 #: ```
-from jaithon.ast import CompKind, Node, NodeKind, OpKind, Span, TypeExpr, Visibility
+from jaithon.ast import CompKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind
+from jaithon.ast import Visibility
 from jaithon.ast import is_statement
 from jaithon.compile.lexer import DiagnosticBag
 from jaithon.compile.resolve import Resolution, SemaCode, Symbol, SymbolKind
@@ -2419,7 +2420,22 @@ pub class Emitter {
     # runtime type *name*, a plain STR: the container's tag-9 TYPE descriptor
     # has no value representation in this runtime and the reader refuses it,
     # so writing one would make every image unloadable.
+    #: The constant a type guard checks against.
+    #:
+    #: A string for a single runtime type. A **tuple** of names for a union,
+    #: which is what `jaiCgTypeGuardConst` (`src/codegen/codegen.c`) emits:
+    #: `runtimeTypeName` has no single answer for a union, so the guard carries
+    #: one name per member and the VM tests them in turn. Emitting a string
+    #: there instead put a `str` in the pool where the C puts a `tuple`, which
+    #: `make bootstrap` reported as a constant of the wrong type outright.
     fn _type_guard_const(self, caught: TypeExpr?) -> int {
+        if caught is not null and caught.kind == TypeKind.Union {
+            var names: list[Const] = []
+            for member in caught.args {
+                names.push(Const(ConstTag.Str, member.name ?? "any"))
+            }
+            return self._chunk().add_constant(Const(ConstTag.Tuple, names))
+        }
         return self._string(caught?.name ?? "any")
     }
 

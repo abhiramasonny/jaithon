@@ -70,6 +70,7 @@
 #: render(expr(c, Node.str_lit("hi")))    # "str"
 #: ```
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeExpr
+from jaithon.ast import TypeKind as SynKind
 from jaithon.ast import kind_name
 from jaithon.ast import is_statement, op_is_comparison, op_text
 from jaithon.compile.check.assign import assignable, widen_target
@@ -1103,7 +1104,7 @@ fn _mentions_generic_param(t: Type?) -> bool {
 #: A class, trait or enum answers its *bare* binding name rather than the
 #: qualified one it is interned under, because the VM resolves this operand
 #: against the module's globals and the binding there is the bare name.
-pub fn runtime_type_name(t: Type?) -> str {
+pub fn runtime_type_name(t: Type?) -> str? {
     if t is null { return "any" }
     match t.kind {
         TyKind.Any => { return "any" }
@@ -1123,6 +1124,10 @@ pub fn runtime_type_name(t: Type?) -> str {
         TyKind.Range => { return "range" }
         TyKind.Fn => { return "fn" }
         TyKind.Module => { return "module" }
+        # A union has no single runtime name. The C answers NULL here and its
+        # caller emits a tuple of the members' names instead; `_guard_target`
+        # below builds the shape that carries that.
+        TyKind.Union => { return null }
         _ => { return _binding_name(t) }
     }
 }
@@ -1135,6 +1140,30 @@ fn _binding_name(t: Type) -> str {
     let cut = name.rfind(".")
     if cut < 0 { return name }
     return name[cut + 1:]
+}
+
+#: A union wider than this guards as `any`.
+#:
+#: Dropping members would turn the check into a wrong rejection, and no
+#: hand-written union comes near it. `MAX_UNION_GUARD` in `src/codegen/codegen.c`.
+pub const MAX_UNION_GUARD: int = 32
+
+# What a cast records as the thing to check against.
+#
+# A plain name for anything with a single runtime type; a `Union` type
+# expression holding one name per member when the target is a union, which the
+# emitter turns into the tuple constant the C emits.
+fn _guard_target(to: Type) -> TypeExpr {
+    let name = runtime_type_name(to)
+    if name is not null { return TypeExpr.named(name) }
+    if to.arg_count() > MAX_UNION_GUARD { return TypeExpr.named("any") }
+
+    var members: list[TypeExpr] = []
+    for member in to.args {
+        # Unions are flattened, so a member is never itself a union.
+        members.push(TypeExpr.named(runtime_type_name(member) ?? "any"))
+    }
+    return TypeExpr(SynKind.Union, null, members)
 }
 
 fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
@@ -1171,7 +1200,7 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     # context rather than the tree.
     let cast = Node(
         NodeKind.Cast,
-        {"operand": inner, "target": TypeExpr.named(runtime_type_name(to)), "widen": widen},
+        {"operand": inner, "target": _guard_target(to), "widen": widen},
         node.span
     )
     node.kind = cast.kind
