@@ -786,6 +786,17 @@ pub class Lexer {
         return self.brackets.len() > 0 and self._bracket_top() != _BRK_BRACE_BLOCK
     }
 
+    # `import *` is the one place a `*` ends a statement rather than continuing
+    # an expression. Without this the newline after it is swallowed as an
+    # operator continuation and the next line's `from` is read as the right
+    # operand, so two consecutive `from x import *` lines do not parse.
+    fn _ends_wildcard_import(self) -> bool {
+        let count = self.tokens.len()
+        if count < 2 { return false }
+        return self.tokens[count - 1].kind == TokenKind.Star and
+            self.tokens[count - 2].kind == TokenKind.KwImport
+    }
+
     fn _handle_newline(self) -> void {
         let start = self.pos
         self.pos += 1
@@ -794,7 +805,7 @@ pub class Lexer {
         let significant = self.tokens.len() > 0 and
             not self._bracket_top_is_expression() and
             last != TokenKind.Newline and
-            not _is_continuation(last)
+            (self._ends_wildcard_import() or not _is_continuation(last))
         if significant { self._push(TokenKind.Newline, start, start + 1) }
         self.at_line_start = true
     }

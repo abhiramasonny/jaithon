@@ -138,6 +138,19 @@ static TokenKind lastKind(const Lexer *lex) {
     return (TokenKind)lex->tokens.data[lex->tokens.count - 1].kind;
 }
 
+/* `import *` is the one place a `*` ends a statement rather than continuing an
+ * expression. Without this, the newline after it is swallowed as an operator
+ * continuation and the next line's `from` is read as the right operand:
+ * two consecutive `from x import *` lines would not parse. */
+static bool endsWildcardImport(const Lexer *lex) {
+    if (lex->tokens.count < 2) return false;
+    if ((TokenKind)lex->tokens.data[lex->tokens.count - 1].kind != TOK_STAR) {
+        return false;
+    }
+    return (TokenKind)lex->tokens.data[lex->tokens.count - 2].kind ==
+           TOK_KW_IMPORT;
+}
+
 static Token *pushToken(Scan *s, TokenKind kind, size_t start, size_t end) {
     Lexer *lex = s->lex;
     Token t;
@@ -258,7 +271,8 @@ static void handleNewline(Scan *s) {
     bool significant = lex->tokens.count > 0 &&
                        !bracketTopIsExpression(lex) &&
                        lastKind(lex) != TOK_NEWLINE &&
-                       !isContinuationToken(lastKind(lex));
+                       (endsWildcardImport(lex) ||
+                        !isContinuationToken(lastKind(lex)));
     if (significant) pushToken(s, TOK_NEWLINE, start, start + 1);
     s->atLineStart = true;
 }
