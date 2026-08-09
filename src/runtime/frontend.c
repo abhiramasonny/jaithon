@@ -3,6 +3,9 @@
 #include <string.h>
 
 #include "runtime.h"
+#include "../common/diag.h"
+#include "../vm/gc.h"
+#include "../vm/serialize.h"
 
 #define JAI_REPL_MODULE "jaithon.compile.repl"
 
@@ -126,4 +129,134 @@ bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out) {
         return false;
     }
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* The prompt's compile path                                            */
+/* ------------------------------------------------------------------ */
+
+#define JAI_FRONT_END_MODULE "jaithon.compile"
+
+/* `Compiled.image` is a list of byte-sized ints: Jaithon has no writable bytes
+ * type, so the front end returns the container that way. */
+static ObjBytes *imageBytes(Value compiled) {
+    Value field;
+    if (!jaiFrontEndField(compiled, "image", &field) || !IS_LIST(field)) {
+        return NULL;
+    }
+    ObjList *list = AS_LIST(field);
+    if (list->count == 0) return NULL;
+
+    int count = list->count;
+    uint8_t *raw = JAI_ALLOC(uint8_t, count);
+    for (int i = 0; i < count; i++) {
+        Value item = list->items[i];
+        if (!IS_INT(item)) {
+            JAI_FREE_ARRAY(uint8_t, raw, count);
+            return NULL;
+        }
+        raw[i] = (uint8_t)(AS_INT(item) & 0xFF);
+    }
+    ObjBytes *bytes = jaiBytesNew(raw, count);
+    JAI_FREE_ARRAY(uint8_t, raw, count);
+    return bytes;
+}
+
+/* The session object, made once and held for the process. A prompt is one
+ * conversation; nothing about it is per-input. */
+static Value sSession = NULL_VAL;
+static bool  sSessionTried;
+
+static bool sessionReady(void) {
+    if (!IS_NULL(sSession)) return true;
+    if (sSessionTried) return false;
+    sSessionTried = true;
+
+    ObjModule *owner = jaiImportFrontEndModule(JAI_FRONT_END_MODULE);
+    if (owner == NULL) { jaiClearException(); return false; }
+    jaiPushRoot(OBJ_VAL(owner));
+
+    Value klass;
+    bool got = jaiModuleGet(owner, jaiStringInternC("ReplSession"), &klass);
+    jaiPopRoot();
+    if (!got) return false;
+
+    Value made = NULL_VAL;
+    if (!jaiCallValue(klass, 0, NULL, &made)) {
+        jaiClearException();
+        return false;
+    }
+    sSession = made;
+    jaiGCAddPermanentRoot(sSession);
+    return true;
+}
+
+void jaiFrontEndReplForget(void) {
+    if (IS_NULL(sSession)) return;
+    Value ignored = NULL_VAL;
+    (void)jaiFrontEndCall0(sSession, "reset", &ignored);
+}
+
+ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
+                                    const JaiReplCompileOptions *opts,
+                                    ObjModule *module, bool *outWasExpression) {
+    if (outWasExpression != NULL) *outWasExpression = false;
+    if (!sessionReady()) {
+        (void)jaiDiagError(E0800_MODULE_NOT_FOUND, JAI_SPAN_NONE,
+                           "the prompt needs the self-hosted front end in `%s`, "
+                           "which could not be imported", JAI_FRONT_END_MODULE);
+        return NULL;
+    }
+
+    Value args[8];
+    args[0] = sSession;
+    args[1] = OBJ_VAL(jaiStringNew(source, length));
+    jaiPushRoot(args[1]);
+    args[2] = OBJ_VAL(jaiStringInternC(opts->path));
+    jaiPushRoot(args[2]);
+    args[3] = INT_VAL(opts->fileId);
+    args[4] = INT_VAL(opts->optLevel);
+    args[5] = OBJ_VAL(jaiStringInternC(opts->echo != NULL ? opts->echo : ""));
+    jaiPushRoot(args[5]);
+    args[6] = BOOL_VAL(opts->wholeFile);
+    args[7] = BOOL_VAL(opts->record);
+
+    Value produced = NULL_VAL;
+    bool called = jaiFrontEndInvoke(JAI_FRONT_END_MODULE, "compile_repl", 8,
+                                    args, &produced);
+    jaiPopRoots(3);
+    if (!called || !IS_INSTANCE(produced)) return NULL;
+
+    jaiPushRoot(produced);
+    if (outWasExpression != NULL) {
+        *outWasExpression = boolField(produced, "repl_expression");
+    }
+
+    /* Diagnostics first: an input can be rejected with an image already empty,
+     * and the report is the whole of what the prompt has to say about it. */
+    Value text = NULL_VAL;
+    if (jaiFrontEndCall0(produced, "report", &text) && IS_STRING(text) &&
+        AS_STRING(text)->length > 0) {
+        fprintf(stderr, "%s\n", AS_STRING(text)->chars);
+    }
+
+    ObjBytes *image = imageBytes(produced);
+    if (image == NULL) { jaiPopRoot(); return NULL; }
+    jaiPushRoot(OBJ_VAL(image));
+
+    Value hash;
+    uint64_t expected = 0;
+    if (jaiFrontEndField(produced, "hash", &hash) && IS_INT(hash)) {
+        expected = (uint64_t)AS_INT(hash);
+    }
+
+    ObjFunction *body = jaiDeserializeModule(image->data, image->length, module,
+                                             expected);
+    if (body == NULL) {
+        (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
+                           "%s: the prompt's front end produced a .jaic image "
+                           "this build cannot load", opts->path);
+    }
+    jaiPopRoots(2);
+    return body;
 }

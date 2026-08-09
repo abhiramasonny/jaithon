@@ -59,4 +59,31 @@ typedef struct {
  * nothing can finish. */
 bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out);
 
+/* Compile one prompt input into `module`.
+ *
+ * The session -- the type names earlier inputs declared -- lives on the Jaithon
+ * side and is held for the process, so a class declared on one line is
+ * nameable in an annotation on the next.
+ *
+ * `echo` names the native a bare expression's value is handed to, or NULL to
+ * discard it. `wholeFile` reads the input as a file rather than as one prompt
+ * line, which is what `:load` wants.
+ *
+ * NULL when the input was rejected; its diagnostics have been printed. */
+typedef struct {
+    const char *path;       /* the label the input is registered under */
+    int         fileId;
+    int         optLevel;
+    const char *echo;       /* native a bare expression's value goes to, or NULL */
+    bool        wholeFile;  /* read as a file rather than as one prompt line */
+    bool        record;     /* let what it declares outlive the input */
+} JaiReplCompileOptions;
+
+ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
+                                    const JaiReplCompileOptions *opts,
+                                    ObjModule *module, bool *outWasExpression);
+
+/* Forget every declaration the session recorded, for `:reset`. */
+void jaiFrontEndReplForget(void);
+
 #endif /* JAI_RUNTIME_FRONTEND_H */
