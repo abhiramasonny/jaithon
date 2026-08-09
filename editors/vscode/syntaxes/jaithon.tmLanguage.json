@@ -213,6 +213,20 @@
           ]
         },
         {
+          "comment": "`pub get value() -> int`. Neither word is a keyword to the lexer, so the whole accessor shape is what identifies them.",
+          "begin": "\\b(get|set)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "end": "(?=[{\\n])",
+          "beginCaptures": {
+            "1": { "name": "storage.modifier.accessor.jaithon" },
+            "2": { "name": "entity.name.function.accessor.jaithon" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#parameter-list" },
+            { "include": "#annotations" }
+          ]
+        },
+        {
           "comment": "An anonymous `fn(...)`, whose parameters are parameters too.",
           "begin": "\\b(fn)\\s*(?=\\()",
           "end": "(?=[{\\n])",

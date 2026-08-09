@@ -48,7 +48,10 @@ cursor, folds and decorations survive.
 
 **Semantic highlighting.** The TextMate grammar colours by shape; semantic
 tokens then recolour by what the compiler decided each name actually is, so a
-class and a variable spelled alike stop looking alike.
+class and a variable spelled alike stop looking alike. Across `lib/`,
+`examples/` and `tests/`, 107,664 of 107,666 identifiers outside strings and
+comments carry a semantic token — a name is coloured by what it *is*, not by
+what it looks like, essentially everywhere.
 
 **`.jaic` viewer.** Opening a bytecode image renders `jaithon disasm` instead of
 binary garbage.
@@ -123,7 +126,33 @@ cannot come from the tree is read off the line directly.
 whenever the language grows. Two things are worth knowing:
 
 - The keyword list mirrors `TOK_KW_*` in `src/lang/token.h`.
-- `src/builtins.js` mirrors `src/runtime/builtins.c` (methods on primitive
-  receivers), `builtins_core.c` (free functions) and `errors.c` (the exception
-  hierarchy). Nothing depends on these being exhaustive; a name that has drifted
-  simply stops being offered.
+- A keyword must get **one** scope everywhere. `fn` used to be
+  `storage.type.function` when it named a function and `storage.type` when it
+  did not, which is what "the highlighting is inconsistent" looks like from the
+  outside. `editors/vscode/syntaxes` has no context-dependent keyword scopes
+  left, and nothing in the tree relies on one.
+
+Where a scope genuinely cannot be decided from the text — a name that is a
+parameter here and a property there — leave it alone and let semantic tokens
+answer. Guessing is what produces the flicker.
+
+## Where the builtin names come from
+
+Everything written in `.jai` is read from the source: hovering `math.sqrt`
+shows the `#:` comment above it in `lib/std/math.jai`, because the analyser
+indexes doc comments from the syntax tree. Nothing about the standard library
+is baked into this extension.
+
+The exception is the surface implemented in C — `print`, `len`, `list.map`,
+`ValueError` — which no `.jai` file declares and which therefore has no `#:`
+comment to read. For those:
+
+- **Names** come from the compiler at run time. `src/builtins.js` asks it
+  `dir(0)`, `dir("")`, `dir([])` and so on in a single 6 ms process, which
+  probes the real dispatch tables. That is not a convenience: the static tables
+  in `src/runtime/builtins.c` list the names `dir` *tries*, and thirteen of the
+  forty-six it lists for `list` are not implemented in any build. Completion
+  offered all thirteen before this asked.
+- **Prose** is the short table in `src/builtins.js`, because nothing in the
+  tree carries it. It is used only until the compiler answers, and only for
+  names the compiler itself implements.

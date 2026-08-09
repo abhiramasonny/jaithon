@@ -305,9 +305,13 @@ class FileAnalysis {
 
                 for (const param of node.params || []) {
                     const pspan = this.span(param);
+                    // A variadic's span opens on the `...`, so the name has to
+                    // be found rather than assumed to sit at the front.
+                    const nameAt = this.findName(pspan.start, pspan.end, param.name)
+                        || { start: pspan.start, end: pspan.start + Buffer.byteLength(param.name, 'utf8') };
                     this.addSymbol({
                         name: param.name, kind: param.name === 'self' ? 'self' : 'parameter',
-                        start: pspan.start, end: pspan.start + Buffer.byteLength(param.name, 'utf8'),
+                        start: nameAt.start, end: nameAt.end,
                         fullStart: pspan.start, fullEnd: pspan.end,
                         detail: renderParam(param), doc: null,
                         scope: fnScope, container: symbol ? symbol.index : (container ?? null),
@@ -524,7 +528,16 @@ class FileAnalysis {
 
             case 'AST_IMPORT': {
                 const bound = node.alias || node.path.split('.').filter(Boolean).pop();
-                const at = this.findName(start, end, bound);
+                // `import std.math as math` binds the name after `as`, not the
+                // identical last component of the path before it.
+                let searchFrom = start;
+                if (node.alias) {
+                    const marker = this.text.indexOf(' as ', this.offsets.char(start));
+                    if (marker >= 0 && marker < this.offsets.char(end)) {
+                        searchFrom = this.offsets.byte(marker);
+                    }
+                }
+                const at = this.findName(searchFrom, end, bound);
                 const symbol = this.addSymbol({
                     name: bound, kind: 'module',
                     start: at ? at.start : start, end: at ? at.end : start,
@@ -552,8 +565,22 @@ class FileAnalysis {
                         detail: `from ${node.path} import ${item.name}${item.alias ? ` as ${item.alias}` : ''}`,
                         doc: null, scope: scopeId, container: container ?? null,
                         modulePath: node.path, importedName: item.name,
+                        aliased: Boolean(item.alias),
                     });
                     record.items.push(symbol.index);
+
+                    // With an alias, the name on the left is a use of the other
+                    // module's declaration and the name on the right is this
+                    // module's own. Only the left one moves when that
+                    // declaration is renamed.
+                    if (item.alias) {
+                        this.refs.push({
+                            name: item.name, kind: 'imported', modulePath: node.path,
+                            start: ispan.start,
+                            end: ispan.start + Buffer.byteLength(item.name, 'utf8'),
+                            scope: scopeId,
+                        });
+                    }
                 }
                 this.imports.push(record);
                 this.addModulePathRef(node.path, start, end, scopeId);
@@ -638,6 +665,21 @@ class FileAnalysis {
                         scope: scopeFor(start), node: child,
                     });
                     break;
+                case 'AST_EXPORT': {
+                    // `export { a, b }` holds bare names, so a rename that skips
+                    // them silently breaks the module's surface.
+                    let cursor = start;
+                    for (const name of child.names || []) {
+                        const at = this.findName(cursor, end, name);
+                        if (!at) continue;
+                        cursor = at.end;
+                        this.refs.push({
+                            name, kind: 'value', start: at.start, end: at.end,
+                            scope: scopeFor(at.start), node: child,
+                        });
+                    }
+                    break;
+                }
                 case 'AST_CALL':
                     // `greet(name: "Ada")` — the label is not a node of its own,
                     // but it starts the argument's span.
@@ -929,6 +971,13 @@ class Workspace {
 
         if (ref.kind === 'member') {
             return this.memberDefinition(analysis, ref, token);
+        }
+
+        if (ref.kind === 'imported') {
+            const file = this.moduleFile(ref.modulePath, analysis.fsPath);
+            const other = file ? await this.analyze(file, token) : null;
+            const found = other && other.lookup(ref.name, other.moduleScope);
+            return found ? { analysis: other, symbol: found } : null;
         }
 
         // A variant in a pattern names its enum explicitly, so there is nothing

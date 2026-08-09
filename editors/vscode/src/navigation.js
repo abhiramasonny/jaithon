@@ -142,7 +142,16 @@ function implementationProvider(workspace) {
  * one parse.
  */
 async function referencesTo(workspace, home, symbol, token) {
-    const scoped = ['variable', 'parameter', 'self'].includes(symbol.kind);
+    // An alias is this module's own name for something. Its uses are uses of
+    // the alias, and they stay put when the thing it names is renamed.
+    if (symbol.kind === 'import' && symbol.aliased) {
+        return home.refs
+            .filter((ref) => ref.name === symbol.name && ref.kind === 'value'
+                && home.lookup(ref.name, ref.scope)?.index === symbol.index)
+            .map((ref) => ({ analysis: home, start: ref.start, end: ref.end }));
+    }
+
+    const scoped = ['variable', 'parameter', 'self', 'typeParameter'].includes(symbol.kind);
     const files = scoped
         ? [home.fsPath]
         : await workspace.candidates(symbol.name, token);
@@ -155,15 +164,20 @@ async function referencesTo(workspace, home, symbol, token) {
 
         for (const ref of analysis.refs) {
             if (ref.name !== symbol.name) continue;
+            // `bench_main` in `import main as bench_main` resolves through to
+            // `main`, but writing the new name there would break the import.
+            const bound = ref.kind === 'value' ? analysis.lookup(ref.name, ref.scope) : null;
+            if (bound && bound.aliased && bound.index !== symbol.index) continue;
+
             const found = await workspace.definitionOf(analysis, ref, token);
             if (!found) continue;
             if (found.analysis.fsPath !== home.fsPath || found.symbol.index !== symbol.index) continue;
             out.push({ analysis, start: ref.start, end: ref.end });
         }
         for (const other of analysis.symbols) {
-            // An `import` of the name is a use of it too, and renaming has to
-            // reach it.
-            if (other.kind !== 'import' || other.name !== symbol.name) continue;
+            // A plain `import` of the name is a use of it too. An aliased one
+            // carries a reference of its own for the name it imports.
+            if (other.kind !== 'import' || other.aliased || other.name !== symbol.name) continue;
             const followed = await workspace.follow(analysis, other, token);
             if (followed && followed.analysis.fsPath === home.fsPath
                 && followed.symbol.index === symbol.index) {
@@ -194,6 +208,18 @@ function referenceProvider(workspace) {
     };
 }
 
+/**
+ * What renaming here should actually move. Everything follows an import
+ * through to the declaration it names, except an alias: `bench_main` is this
+ * module's own name, and renaming it must not touch the module it came from.
+ */
+function renameTarget(analysis, hit) {
+    if (hit.symbol) return { analysis, symbol: hit.symbol };
+    if (hit.ref?.kind !== 'value') return null;
+    const bound = analysis.lookup(hit.ref.name, hit.ref.scope);
+    return bound && bound.aliased ? { analysis, symbol: bound } : null;
+}
+
 function renameProvider(workspace) {
     return {
         async prepareRename(document, position, token) {
@@ -203,9 +229,8 @@ function renameProvider(workspace) {
 
             if (hit.ref?.kind === 'module-path') throw new Error('A module path is a file name; rename the file instead.');
 
-            const resolved = hit.symbol
-                ? { analysis, symbol: hit.symbol }
-                : await workspace.definitionOf(analysis, hit.ref, token);
+            const resolved = renameTarget(analysis, hit)
+                || await workspace.definitionOf(analysis, hit.ref, token);
             if (!resolved) throw new Error('That name is not declared in this workspace.');
             if (builtins.FUNCTIONS[resolved.symbol.name] || builtins.isException(resolved.symbol.name)) {
                 throw new Error(`\`${resolved.symbol.name}\` is defined by the runtime and cannot be renamed.`);
@@ -225,9 +250,8 @@ function renameProvider(workspace) {
 
             const context = await contextAt(workspace, document, position, token);
             if (!context || !context.hit) return null;
-            const resolved = context.hit.symbol
-                ? { analysis: context.analysis, symbol: context.hit.symbol }
-                : await workspace.definitionOf(context.analysis, context.hit.ref, token);
+            const resolved = renameTarget(context.analysis, context.hit)
+                || await workspace.definitionOf(context.analysis, context.hit.ref, token);
             if (!resolved) return null;
 
             const edit = new vscode.WorkspaceEdit();

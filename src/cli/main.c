@@ -1451,12 +1451,16 @@ static bool commandHonoursFrontEnd(JaiCommand command) {
     case CMD_BUILD:
     case CMD_DISASM:
         return true;
-    case CMD_REPL:
-    case CMD_EVAL:
+    /* These dispatch to Jaithon programs (jaithon.tool.*) rather than compiling
+     * anything themselves, and their imports now route through the front end
+     * the flag names. */
     case CMD_FMT:
     case CMD_TEST:
     case CMD_DOC:
     case CMD_BENCH:
+        return true;
+    case CMD_REPL:
+    case CMD_EVAL:
     case CMD_AST:
     case CMD_TOKENS:
         return false;
