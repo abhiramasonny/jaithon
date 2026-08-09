@@ -38,8 +38,6 @@
 #include "../lang/ast.h"
 #include "../lang/lexer.h"
 #include "../lang/parser.h"
-#include "../sema/check.h"
-#include "../sema/resolve.h"
 #include "../vm/chunk.h"
 
 #define REPL_PROMPT      ">>> "
