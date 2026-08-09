@@ -414,6 +414,11 @@ struct ObjEnum {
     EnumVariant *variants;
     uint16_t     variantCount;
     JaiTable     methods;
+    /* Inline-cache key, from the same counter ObjClass.shapeId uses so that an
+     * enum way and a class way in one cache can never collide. Monotonic, so a
+     * freed enum whose address gets reused cannot be mistaken for the original
+     * -- which is what makes caching members by identity safe at all. */
+    uint32_t     shapeId;
 };
 
 struct ObjEnumVal {
@@ -438,6 +443,8 @@ struct ObjEnumCtor {
 };
 
 ObjEnum     *jaiEnumNew(ObjString *name);
+/* A fresh shape id, for invalidating caches that memoised an enum's members. */
+uint32_t     jaiFreshShapeId(void);
 ObjEnumVal  *jaiEnumValNew(ObjEnum *e, uint16_t tag, const Value *payload, int count);
 ObjEnumCtor *jaiEnumCtorNew(ObjEnum *e, uint16_t tag);
 
