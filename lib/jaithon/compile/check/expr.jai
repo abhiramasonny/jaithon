@@ -84,6 +84,7 @@ from jaithon.compile.check.operator import binary_result, unary_result
 from jaithon.compile.check.predicate import is_callable, is_indexable, is_iterable, is_optional
 from jaithon.compile.check.relate import join, narrow
 from jaithon.compile.check.render import render
+from jaithon.compile.check.substitute import mentions_generic_param, substitute
 from jaithon.compile.check.ty import MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, list_of, set_of, tuple_of
@@ -2360,7 +2361,13 @@ fn _lookup_member(
             )
             if owner is not null { d.label(owner.span, "declared here") }
         }
-        return (found.ty ?? u.t_any, found.node)
+        # A trait's default method is written in terms of `Self`, and reaching
+        # it through a concrete receiver means `Self` is that receiver. The C
+        # substitutes here, so a `fn() -> Self` inherited by `Cents` is
+        # `fn() -> Cents`; leaving it unsubstituted made the call answer `Self`
+        # and then guard `Self -> Cents`, a runtime check for something already
+        # known.
+        return (_substitute_self(c, found.ty, decl) ?? u.t_any, found.node)
     }
 
     # A parent this unit cannot see may well declare the member. Saying "no
@@ -2394,6 +2401,21 @@ fn _lookup_member(
 #:
 #: `?.` narrows `null` off the receiver before the lookup and puts it back on the
 #: result, so `a?.b` on an `A?` is a `B?`; a plain `.` on an optional is E0400.
+# `Self` inside an inherited signature, bound to the type that inherited it.
+fn _substitute_self(c: Ctx, ty: Type?, decl: TypeDecl?) -> Type? {
+    if ty is null or decl is null { return ty }
+    let concrete = decl.ty
+    # Not inside the trait itself: there `Self` is still the open parameter it
+    # was declared as, and the C leaves it that way. Substituting there turned
+    # `fn(int) -> Self` into `fn(int) -> Scalable` — the trait standing in for
+    # its own implementers.
+    if concrete is null or decl.is_trait { return ty }
+    if not mentions_generic_param(ty) { return ty }
+    # Spelled out rather than imported: `decl.jai` owns `SELF_NAME` and imports
+    # this file for `Ctx`, so taking it from there would close a cycle.
+    return substitute(c.universe, ty, {"Self": concrete})
+}
+
 pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
     let u = c.universe
     let object = node.child("object")
