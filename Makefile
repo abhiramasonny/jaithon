@@ -369,6 +369,14 @@ reseed: $(TARGET)
 	@JAITHON_PATH=$(CURDIR)/lib JAITHON_NO_SEED=1 ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
 	@python3 scripts/gen_seed.py lib boot/seed.c
 	@$(MAKE) --no-print-directory
+# The rebuild above embeds the new seed, which changes JAI_BUILD_ID, which
+# invalidates every .jaic just written -- so reseeding used to hand back a tree
+# with a cold cache. That is not a correctness problem and it is an expensive
+# one: `tests/repl/bindings_gc.repl` runs under --gc-stress, where a collection
+# happens per allocation, and compiling std from source under it takes eight
+# minutes (measured, twice). Warming here costs a second and removes the cliff.
+	@echo "  SEED    warming __jaicache__"
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory fixpoint-check
 
 #: Compile each source twice with the self-hosted front end and compare. This is

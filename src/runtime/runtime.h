@@ -85,6 +85,17 @@ bool       jaiResolveModulePathQuiet(const char *dottedName, const char *fromDir
  * pending exception on failure. */
 ObjModule *jaiImportModule(const char *dottedName, const char *fromDir);
 
+/* Import a module that is part of the front end itself.
+ *
+ * The seed is only consulted inside the bootstrap window, because outside it a
+ * seeded image would shadow a source the tree has moved past. A module the
+ * driver needs *in order to* compile belongs inside that window, and this puts
+ * it there. The cost of getting it wrong is not correctness but time: without
+ * the window the module is compiled from source on a cold cache, and under
+ * `--gc-stress` -- where every allocation collects a heap that now holds the
+ * whole compiler -- that turns a 0.6s compile into minutes. */
+ObjModule *jaiImportFrontEndModule(const char *dottedName);
+
 /* Compile a source string into a module body without running it. */
 ObjFunction *jaiCompileSource(const char *source, size_t length,
                               const char *path, ObjModule *module,
