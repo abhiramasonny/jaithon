@@ -60,6 +60,8 @@ static bool          sOptionsSet;
  * the C front end compiles whatever the compiler's own closure needs -- which
  * is precisely the job the seed takes over once C is gone. */
 static bool          sLoadingFrontEnd;
+/* Set once the front end has been pulled in; see loadModuleBody. */
+static bool          sFrontEndWarmed;
 
 JaiRunOptions jaiRunDefaults(void) {
     JaiRunOptions o;
@@ -68,12 +70,10 @@ JaiRunOptions jaiRunDefaults(void) {
     o.codegen    = jaiCodegenDefaults();
     o.useCache   = true;
     o.writeCache = true;
-    /* Still C by default. The cache-order bug that blocked this is fixed, and
-     * the golden `modules` tests now pass warm under --front=jai, but two
-     * failures remain when the default flips: the REPL golden
-     * `bindings_persist` loses one line, and `jaithon test`. Both need a
-     * working repro before the flip lands. */
-    o.selfHosted = false;
+    /* The self-hosted front end is the default. `--front=c` stays while the C
+     * front end exists, so a regression is bisectable rather than only
+     * observable. */
+    o.selfHosted = true;
     o.checkOnly  = false;
     o.verbose    = false;
     return o;
@@ -662,7 +662,29 @@ static bool cacheFlagsMatch(const char *sourcePath, uint32_t flags) {
  * registered before the cache is consulted because a cache-loaded chunk carries
  * byte offsets into it: without the registration a traceback through a cached
  * module would have no text to quote. */
+#define JAI_SELF_HOSTED_MODULE "jaithon.compile"
+
 static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
+    /* Load the front end once, before any module body runs.
+     *
+     * Without this the first thing needing a compile can be an `import`
+     * executed from inside a module body that was itself served from cache,
+     * and the compiler gets loaded there -- inside a running body. That is why
+     * a warm run failed where a cold one passed: compiling the entry file cold
+     * pulls the front end in first, and a cache hit skips that.
+     *
+     * It lives here rather than in jaiRunFile because `repl` and `check` are
+     * separate entry points that never call it, and the REPL golden
+     * `bindings_persist` lost a line for exactly that reason. Every module load
+     * goes through here, so one flag covers all of them. */
+    if (sOptions.selfHosted && !sLoadingFrontEnd && !sFrontEndWarmed) {
+        sFrontEndWarmed = true;
+        sLoadingFrontEnd = true;
+        (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+        sLoadingFrontEnd = false;
+        jaiClearException();
+    }
+
     size_t length = 0;
     char *text = jaiReadFile(path, &length);
     if (text == NULL) {
@@ -1062,7 +1084,6 @@ static void reportTiming(double load, double run, double total) {
  * end: a compiler that quietly substitutes a different compiler is worse than
  * one that refuses, because the output looks like a passing test. */
 
-#define JAI_SELF_HOSTED_MODULE "jaithon.compile"
 #define JAI_SELF_HOSTED_ENTRY  "compile_source"
 
 static bool instanceField(Value v, const char *name, Value *out) {
@@ -1407,22 +1428,6 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
     }
 
     double started = jaiClockMonotonic();
-
-    /* Load the front end once, before any module body runs.
-     *
-     * Without this the first thing that needs a compile might be an `import`
-     * executed from inside a module body that was itself served from cache --
-     * and loading the compiler there means loading it inside a running body.
-     * That is why a warm run failed where a cold one passed: compiling the
-     * entry file cold pulls the front end in first, and a cache hit skips that.
-     * Doing it up front makes the two orders identical. */
-    if (sOptions.selfHosted) {
-        bool wasLoading = sLoadingFrontEnd;
-        sLoadingFrontEnd = true;
-        (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
-        sLoadingFrontEnd = wasLoading;
-        jaiClearException();
-    }
 
     ObjList *args = installArgv(absolute, argc, argv);
     if (!preludeDisabled()) (void)jaiLoadPrelude();
