@@ -1408,6 +1408,22 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
 
     double started = jaiClockMonotonic();
 
+    /* Load the front end once, before any module body runs.
+     *
+     * Without this the first thing that needs a compile might be an `import`
+     * executed from inside a module body that was itself served from cache --
+     * and loading the compiler there means loading it inside a running body.
+     * That is why a warm run failed where a cold one passed: compiling the
+     * entry file cold pulls the front end in first, and a cache hit skips that.
+     * Doing it up front makes the two orders identical. */
+    if (sOptions.selfHosted) {
+        bool wasLoading = sLoadingFrontEnd;
+        sLoadingFrontEnd = true;
+        (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+        sLoadingFrontEnd = wasLoading;
+        jaiClearException();
+    }
+
     ObjList *args = installArgv(absolute, argc, argv);
     if (!preludeDisabled()) (void)jaiLoadPrelude();
 
