@@ -489,6 +489,11 @@ static bool accessPermitted(const ObjClass *owner, Visibility vis) {
 
 /* The class a field was declared on, for the visibility test above. Walks up
  * from `klass` to the topmost class that still declares the slot. */
+/* Callers must gate this on the field being non-public. It walks the whole
+ * superclass chain running a linear field scan at every level, and
+ * accessPermitted discards it for VIS_PUBLIC -- but C evaluates arguments
+ * before the call, so writing it as an argument paid for it on every public
+ * field read. That was ~11% of a compile in getPropertyInto. */
 static const ObjClass *fieldOwner(ObjClass *klass, ObjString *name) {
     const ObjClass *owner = klass;
     for (ObjClass *k = klass; k != NULL; k = k->superclass) {
@@ -606,6 +611,9 @@ static bool moduleMember(ObjModule *m, ObjString *name, Value *out,
 static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
                             bool raise, InlineCache *ic) {
     if (name == NULL) return false;
+#ifdef JAI_PROP_STATS
+    { extern uint64_t jaiPropRecv[]; jaiPropRecv[IS_OBJ(receiver) ? 8 + (int)AS_OBJ(receiver)->type : (int)receiver.type]++; }
+#endif
 
     if (IS_INSTANCE(receiver)) {
         ObjInstance *inst = AS_INSTANCE(receiver);
@@ -622,7 +630,8 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
 
         const FieldInfo *info = jaiClassFieldInfo(klass, name);
         if (info != NULL) {
-            if (!accessPermitted(fieldOwner(klass, name), info->visibility)) {
+            if (info->visibility != VIS_PUBLIC &&
+                !accessPermitted(fieldOwner(klass, name), info->visibility)) {
                 if (!raise) return false;
                 return jaiThrow(vm.cAttributeError,
                                 "field '%s' of class '%s' is private",
@@ -767,7 +776,8 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
                                 ? klass->name->chars : "instance",
                             name->chars);
         }
-        if (!accessPermitted(fieldOwner(klass, name), info->visibility)) {
+        if (info->visibility != VIS_PUBLIC &&
+                !accessPermitted(fieldOwner(klass, name), info->visibility)) {
             return jaiThrow(vm.cAttributeError,
                             "field '%s' of class '%s' is private", name->chars,
                             klass->name != NULL ? klass->name->chars : "?");
@@ -2725,6 +2735,10 @@ static Obj *classSpecInstantiate(Value spec) {
 
 #ifdef JAI_OPCODE_STATS
 uint64_t jaiOpCounts[OP_COUNT];
+#endif
+
+#ifdef JAI_PROP_STATS
+uint64_t jaiPropRecv[32];
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5450,6 +5464,11 @@ void jaiVMPrintStats(FILE *out) {
                         jaiOpName((OpCode)i), jaiOpCounts[i],
                         100.0 * (double)jaiOpCounts[i] / (double)tot);
     }
+#endif
+#ifdef JAI_PROP_STATS
+    for (int i = 0; i < 32; i++)
+        if (jaiPropRecv[i] > 0)
+            fprintf(out, "getProperty recv type %d: %" PRIu64 "\n", i, jaiPropRecv[i]);
 #endif
     fprintf(out, "vm: %" PRIu64 " instructions, %" PRIu64 " calls, %" PRIu64
                  " allocations\n",
