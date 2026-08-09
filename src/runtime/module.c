@@ -1656,10 +1656,34 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
      * stops each of them overwriting the entry file's decisions. */
     jaiSemaDumpBegin(entry);
 
-    /* Emit as well: `check` promises "compile and type-check" (spec §8.5), and
-     * codegen is where the bytecode verifier runs. Checking without it would
-     * pass files that cannot actually be loaded. The body is discarded. */
-    bool ok = frontEnd(module, fileId, &sOptions.codegen, true, NULL, false);
+    bool ok;
+    if (sOptions.selfHosted) {
+        /* `--front=jai check` runs the self-hosted front end over the entry
+         * file and reports what it says, which is the only way to compare the
+         * two checkers on a file rather than on a chunk of bytecode. It is a
+         * weaker `check` than the C one until the self-hosted side has a
+         * checker of its own: what it verifies today is that the file lexes,
+         * parses, resolves and emits. That is stated rather than hidden,
+         * because a `check` that passes without checking is worse than one
+         * that refuses. */
+        const JaiSourceFile *entryFile = jaiSourceGet(fileId);
+        ObjFunction *body = entryFile == NULL
+                              ? NULL
+                              : jaiSelfHostedCompileInto(entryFile->source,
+                                                         entryFile->length,
+                                                         absolute, module,
+                                                         jaiSourceHash(entryFile->source,
+                                                                       entryFile->length),
+                                                         sOptions.codegen.optLevel);
+        ok = body != NULL && !jaiDiagHasErrors(&gDiags);
+        (void)jaiDiagFlush(&gDiags, stderr);
+    } else {
+        /* Emit as well: `check` promises "compile and type-check" (spec §8.5),
+         * and codegen is where the bytecode verifier runs. Checking without it
+         * would pass files that cannot actually be loaded. The body is
+         * discarded. */
+        ok = frontEnd(module, fileId, &sOptions.codegen, true, NULL, false);
+    }
     jaiPopRoots(3);
 
     if (!jaiSemaDumpEnd()) {
