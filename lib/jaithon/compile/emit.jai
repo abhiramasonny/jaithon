@@ -2018,11 +2018,18 @@ pub class Emitter {
             }
             NodeKind.VarDecl => {
                 self._expr(node.child("init"))
-                self._bind_pattern(node.child("pattern"), span)
+                let pattern = node.child("pattern")
+                self._bind_pattern(pattern, span)
+                # `emitVarDecl` asks two questions and neither of them is what
+                # scope the declaration is in: a `pub let` written inside a
+                # function body is a mistake, and the C exports it anyway. A
+                # destructuring pattern exports nothing, because there is no
+                # one name for the export to carry.
                 let symbol = self.resolution.symbol_of(node)
                 if symbol != null and
-                    symbol.kind == SymbolKind.Global and
-                    symbol.visibility == Visibility.Public {
+                    symbol.visibility == Visibility.Public and
+                    pattern != null and
+                    pattern.kind == NodeKind.PatBind {
                     self._op_k(Op.Export, self._string(symbol.name), span)
                 }
             }
