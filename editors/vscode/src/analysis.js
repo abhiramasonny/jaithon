@@ -995,17 +995,30 @@ class Workspace {
         return this.follow(analysis, local, token);
     }
 
-    /** An `import`ed name stands for a declaration in another file. */
+    /**
+     * An `import`ed name stands for a declaration in another file — and that
+     * file may itself be re-exporting it, as `std.collections` does, so the
+     * hop repeats until it lands on something that is not an import.
+     */
     async follow(analysis, symbol, token) {
-        if (symbol.kind !== 'import') return { analysis, symbol };
+        let current = { analysis, symbol };
+        const seen = new Set();
 
-        const file = this.moduleFile(symbol.modulePath, analysis.fsPath);
-        if (!file) return { analysis, symbol };
-        const other = await this.analyze(file, token);
-        if (!other) return { analysis, symbol };
+        while (current.symbol.kind === 'import') {
+            const key = `${current.analysis.fsPath}:${current.symbol.index}`;
+            if (seen.has(key)) break;
+            seen.add(key);
 
-        const target = other.lookup(symbol.importedName, other.moduleScope);
-        return target ? { analysis: other, symbol: target } : { analysis, symbol };
+            const file = this.moduleFile(current.symbol.modulePath, current.analysis.fsPath);
+            if (!file) break;
+            const other = await this.analyze(file, token);
+            if (!other) break;
+
+            const target = other.lookup(current.symbol.importedName, other.moduleScope);
+            if (!target) break;
+            current = { analysis: other, symbol: target };
+        }
+        return current;
     }
 
     async memberDefinition(analysis, ref, token) {

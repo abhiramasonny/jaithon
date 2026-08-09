@@ -109,7 +109,7 @@ function inlayHintProvider(workspace) {
                     if (symbol.declaredType) continue;
                     if (!['variable', 'parameter'].includes(symbol.kind)) continue;
                     const type = symbol.type;
-                    if (!type || type === 'any' || type.startsWith('module ')) continue;
+                    if (!worthHinting(type)) continue;
 
                     const hint = new vscode.InlayHint(
                         analysis.offsets.position(symbol.end), `: ${type}`,
@@ -150,6 +150,16 @@ function inlayHintProvider(workspace) {
             return hints;
         },
     };
+}
+
+/**
+ * A hint has to be worth the room it takes. `any` says nothing, and a type
+ * still carrying an unbound parameter — `list[T]` where no `T` is in scope —
+ * is the checker showing its working rather than an answer.
+ */
+function worthHinting(type) {
+    if (!type || type === 'any' || type.startsWith('module ')) return false;
+    return !/(^|[^A-Za-z0-9_])[A-Z][0-9]?([^A-Za-z0-9_]|$)/.test(type);
 }
 
 function isLiteral(node) {

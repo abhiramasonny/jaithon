@@ -390,12 +390,18 @@ pub fn check_program(
     bag: DiagnosticBag,
     fold_constants: bool = true,
     collect_dump: bool = false,
-    path: str = ""
+    path: str = "",
+    # Names bound before anything in `program` is looked at. A file needs none:
+    # it declares everything it can name. A prompt input needs the classes the
+    # inputs before it declared, which are in no registry this compilation can
+    # reach.
+    outer_type_names: list[tuple[str, Type]] = []
 ) -> Ctx {
     let c = Ctx(universe, bag, resolution)
     c.fold_constants = fold_constants
     if collect_dump { c.dump = [] }
     install(c)
+    for (name, ty) in outer_type_names { c.push_type_name(name, ty) }
     if program == null { return c }
 
     # This file's own declarations first, so they win over imported ones.
