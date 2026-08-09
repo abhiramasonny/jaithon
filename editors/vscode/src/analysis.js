@@ -95,8 +95,6 @@ class Offsets {
 // Small helpers over the tree
 // ---------------------------------------------------------------------------
 
-const IDENT_CHAR = /[A-Za-z0-9_]/;
-
 function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -673,8 +671,13 @@ class FileAnalysis {
 // Cross-file
 // ---------------------------------------------------------------------------
 
-/** `list[int]`, `Point?`, `fn() -> Point` and friends down to a bare name. */
-function baseTypeName(type) {
+/**
+ * Reduce a checker type to the name it is really about: `list[int]` to `list`,
+ * `Point?` to `Point`, `fn() -> Point` to `Point`. A type from another module
+ * is qualified — `helpers.Box` — and the qualifier is kept separately, because
+ * it says which file to look in.
+ */
+function splitTypeName(type) {
     if (!type) return null;
     let text = type.trim();
     if (text.startsWith('module ')) return null;
@@ -683,7 +686,14 @@ function baseTypeName(type) {
     text = text.replace(/\?+$/, '');
     const bracket = text.indexOf('[');
     if (bracket >= 0) text = text.slice(0, bracket);
-    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(text) ? text : null;
+    if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(text)) return null;
+
+    const parts = text.split('.');
+    return { name: parts.pop(), qualifier: parts.join('.') || null };
+}
+
+function baseTypeName(type) {
+    return splitTypeName(type)?.name || null;
 }
 
 function moduleOfType(type) {
@@ -871,8 +881,19 @@ class Workspace {
 
     /** The class, trait or enum a checker type string names. */
     async typeSymbol(analysis, type, token) {
-        const name = baseTypeName(type);
-        if (!name) return null;
+        const split = splitTypeName(type);
+        if (!split) return null;
+        const { name, qualifier } = split;
+
+        // A qualified type says which module declared it, so go straight there.
+        if (qualifier) {
+            const bound = analysis.lookup(qualifier.split('.')[0], analysis.moduleScope);
+            const modulePath = bound?.modulePath || qualifier;
+            const file = this.moduleFile(modulePath, analysis.fsPath);
+            const other = file ? await this.analyze(file, token) : null;
+            const found = other && other.lookup(name, other.moduleScope);
+            if (found && found.members !== undefined) return { analysis: other, symbol: found };
+        }
 
         const local = analysis.lookup(name, analysis.moduleScope);
         if (local) {
@@ -880,7 +901,6 @@ class Workspace {
             if (followed && followed.symbol.members !== undefined) return followed;
         }
         for (const record of analysis.imports) {
-            if (record.symbol === null) continue;
             const file = this.moduleFile(record.path, analysis.fsPath);
             if (!file) continue;
             const other = await this.analyze(file, token);
@@ -923,6 +943,6 @@ class Workspace {
 
 module.exports = {
     Workspace, FileAnalysis, Offsets,
-    renderType, signatureOf, walk, locateName, baseTypeName, moduleOfType, escapeRegExp,
-    IDENT_CHAR,
+    renderType, signatureOf, walk, locateName,
+    baseTypeName, splitTypeName, moduleOfType, escapeRegExp,
 };
