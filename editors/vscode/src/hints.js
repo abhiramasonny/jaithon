@@ -290,7 +290,11 @@ function modifiersOf(symbol, declaration) {
  * the import graph on every repaint; the fallbacks below cover what is missed.
  */
 function classify(analysis, ref) {
-    if (ref.kind === 'module-path') return { type: 'namespace', modifiers: [] };
+    // An import line reads as one thing, so the name being imported is coloured
+    // like the path it comes from rather than guessed at.
+    if (ref.kind === 'module-path' || ref.kind === 'imported') {
+        return { type: 'namespace', modifiers: [] };
+    }
 
     // A named argument labels a parameter, and reads best as one.
     if (ref.kind === 'argument') return { type: 'parameter', modifiers: [] };
