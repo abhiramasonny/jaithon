@@ -128,7 +128,16 @@ pub fn compile_source(
     # The emitter is handed the optimiser rather than importing it: the passes
     # read `jaithon.compile.emit`, so the module that runs them cannot be
     # imported from there. See `_no_optimize` in that file.
-    let body = emit(program, resolution, bag, release, module_name_for(path), opt_level, optimize)
+    let body = emit(
+        program,
+        resolution,
+        bag,
+        release,
+        module_name_for(path),
+        opt_level,
+        optimize,
+        text
+    )
     result.body = body
     if not result.ok() { return result }
 

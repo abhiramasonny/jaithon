@@ -829,6 +829,10 @@ pub class Emitter {
     #: doing nothing; see `_no_optimize` for why it is a parameter at all.
     pub let optimize: fn(FuncProto, int) -> void
 
+    #: The file's source text, so an assert can bake in its condition. Null
+    #: when the caller did not supply it, in which case the message is the bare
+    #: `"assertion failed"` — which is what the C falls back to as well.
+    pub var source: str?
     var stack: list[FnCtx]
     var enums: dict[str, Node]
 
@@ -846,6 +850,7 @@ pub class Emitter {
         self.strip_asserts = strip_asserts
         self.opt_level = opt_level
         self.optimize = optimize
+        self.source = null
         self.stack = []
         self.enums = {}
     }
@@ -2093,7 +2098,7 @@ pub class Emitter {
                 if self.strip_asserts { return }
                 self._expr(node.child("cond"))
                 let ok = self._emit_jump(Op.JumpIfTrue, span)
-                self._op_k(Op.AssertFail, self._string(_assert_message(node)), span)
+                self._op_k(Op.AssertFail, self._string(_assert_message(node, self.source)), span)
                 self._patch(ok)
             }
             NodeKind.FnDecl => {
@@ -2990,9 +2995,38 @@ fn _last_segment(path: str?) -> str? {
     return parts[parts.len() - 1]
 }
 
-fn _assert_message(node: Node) -> str {
+#: How much of a condition's source text an assert message carries.
+#:
+#: The C writes into a 256-byte buffer and reserves 32 of them for the prefix
+#: and the terminator, so a longer condition is cut at 224 characters
+#: (`assertMessage`, src/codegen/codegen_stmt.c).
+const _ASSERT_TEXT_MAX: int = 224
+
+# The message baked into `OP_ASSERT_FAIL`: an explicit string literal when
+# there is one, otherwise the condition's own source text.
+#
+# Falling back to a bare `"assertion failed"` costs the reader the thing they
+# most want to see — which condition — and it is a constant-pool divergence
+# besides, because the C bakes the text in.
+fn _assert_message(node: Node, source: str?) -> str {
     let message = node.child("message")
     if message != null and message.kind == NodeKind.StrLit { return message.text("chars") }
+
+    let cond = node.child("cond")
+    if source != null and cond != null and cond.span.is_known() {
+        # A span is a BYTE offset, as it is in the C, and a Jaithon string
+        # slices by scalar. The two agree only until the file contains a
+        # multi-byte character — one `—` in a doc comment above the assert is
+        # enough — after which slicing the string cuts in the wrong place and
+        # bakes a truncated condition into the message. Slice the bytes.
+        let raw = __prim__.str_encode(source)
+        let start = cond.span.start
+        var stop = cond.span.end
+        if stop > start and stop <= raw.len() {
+            if stop - start > _ASSERT_TEXT_MAX { stop = start + _ASSERT_TEXT_MAX }
+            return f"assertion failed: {__prim__.str_decode(raw[start:stop])}"
+        }
+    }
     return "assertion failed"
 }
 
@@ -3051,9 +3085,11 @@ pub fn emit(
     strip_asserts: bool = false,
     module_name: str? = null,
     opt_level: int = 2,
-    optimize: fn(FuncProto, int) -> void = _no_optimize
+    optimize: fn(FuncProto, int) -> void = _no_optimize,
+    source: str? = null
 ) -> FuncProto {
     let emitter = Emitter(resolution, bag, strip_asserts, opt_level, optimize)
+    emitter.source = source
     return emitter.compile_program(program, module_name)
 }
 
