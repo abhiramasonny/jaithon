@@ -249,6 +249,7 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_THREW  (UINT32_MAX - 2u)
 #define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
 #define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
+#define FIXUP_EXIT   (UINT32_MAX - 100u) /* minus the loop-exit index */
 
 #define JIT_MAX_DEOPT 64
 
@@ -312,6 +313,17 @@ typedef struct {
      * stack stays in registers either way -- that is where the arithmetic is. */
     bool      spilled;
     unsigned  localsFrameOffset;
+    /* On-stack replacement: the locals ARE the interpreter's frame slots,
+     * reached through a pointer handed to the entry. Nothing is copied either
+     * way, which is also what makes a deopt cheap here -- the slots are
+     * already what the interpreter expects, so only the operand stack needs
+     * rebuilding. */
+    bool      osr;
+    uint32_t  osrTop;
+    uint32_t  osrEnd;
+    int       exitStub[8];       /* one per distinct offset jumped out to */
+    uint32_t  exitOffset[8];
+    unsigned  exitCount;
     /* A body that reads an upvalue needs the closure itself, which is not any
      * slot: for a method slot 0 is the receiver, not the callee. It arrives as
      * one extra argument and takes the register just past the locals. */
@@ -364,7 +376,12 @@ static void emit(Emit *e, uint32_t word) {
 
 /* Registers the operand stack starts after: none of them, once locals live in
  * the frame. */
+/* x19 carries the slots pointer in OSR mode, so the operand stack starts one
+ * register later. */
+#define JIT_SLOTS_REG (JIT_FIRST_SAVED)
+
 static unsigned regBase(const Emit *e) {
+    if (e->osr) return 1u;
     return e->spilled ? 0u : e->locals;
 }
 
@@ -381,12 +398,29 @@ static unsigned localFrameOff(const Emit *e, unsigned slot) {
  * `scratch`. Only the payload moves: a local's kind is fixed for the whole
  * function, so the tag never needs storing. */
 static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
+    if (e->osr) {
+        emit(e, jaiA64LdrX(scratch, JIT_SLOTS_REG, slot * 16u + 8u));
+        return scratch;
+    }
     if (!e->spilled) return localReg(e, slot);
     emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot)));
     return scratch;
 }
 
 static void localOut(Emit *e, unsigned slot, unsigned src) {
+    if (e->osr) {
+        /* Tag as well as payload: writing straight through is what lets a
+         * deopt here cost nothing. The kind is fixed for the compile. */
+        SlotKind k = e->localKind[slot];
+        unsigned tag = k == SLOT_INT   ? VAL_INT
+                     : k == SLOT_FLOAT ? VAL_FLOAT
+                     : k == SLOT_BOOL  ? VAL_BOOL
+                                       : VAL_OBJ;
+        emit(e, jaiA64MovzX(JIT_SCRATCH_D, tag, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, slot * 16u));
+        emit(e, jaiA64StrX(src, JIT_SLOTS_REG, slot * 16u + 8u));
+        return;
+    }
     if (!e->spilled) {
         if (src != localReg(e, slot)) emit(e, jaiA64MovX(localReg(e, slot), src));
         return;
@@ -396,6 +430,11 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
 
 /* Slots the body may name at all. */
 static bool localInRange(Emit *e, unsigned slot) {
+    if (e->osr) {
+        if (slot >= e->locals) return false;
+        if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
+        return true;
+    }
     if (slot < e->base || slot >= e->base + e->locals) return false;
     if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
     return true;
@@ -403,6 +442,7 @@ static bool localInRange(Emit *e, unsigned slot) {
 
 /* Slots whose value this call can be looked at, for type feedback. */
 static bool localObserved(Emit *e, unsigned slot) {
+    if (e->osr) return slot < e->locals;
     if (slot < e->base || slot > e->arity) return false;
     if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
     return true;
@@ -553,9 +593,24 @@ static void emitEpilogue(Emit *e, unsigned bailed) {
 /* The body                                                            */
 /* ------------------------------------------------------------------ */
 
+/* In OSR mode a jump out of the compiled range leaves the loop: it becomes a
+ * stub that reports the offset the interpreter should carry on from. */
+static uint32_t exitTargetFor(Emit *e, uint32_t target) {
+    for (unsigned i = 0; i < e->exitCount; i++) {
+        if (e->exitOffset[i] == target) return FIXUP_EXIT - i;
+    }
+    if (e->exitCount >= 8) { e->whyNot = "too many ways out of the loop"; e->failed = true; return FIXUP_EXIT; }
+    e->exitOffset[e->exitCount] = target;
+    return FIXUP_EXIT - e->exitCount++;
+}
+
 static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    if (e->osr && targetOffset < UINT32_MAX - 64u &&
+        (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
+        targetOffset = exitTargetFor(e, targetOffset);
+    }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = targetOffset;
     e->fixups[e->fixupCount].conditional  = conditional;
@@ -805,7 +860,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
     const uint8_t *code = fn->chunk.code;
     int count = fn->chunk.count;
 
-    for (int off = 0; off < count && !e->failed;) {
+    int start = e->osr ? (int)e->osrTop : 0;
+    int stop  = e->osr ? (int)e->osrEnd : count;
+    for (int off = start; off < stop && !e->failed;) {
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = (int)stackSignature(e);
         uint8_t op = code[off];
@@ -1538,6 +1595,63 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_MOD: {
+            /* Floor remainder, the same rule as the fused form but with the
+             * divisor in a register, so zero and -1 both have to be checked. */
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            if (e->stack[e->depth - 2] != SLOT_INT) return false;
+            unsigned ry = pushReg(e) - 1, rx = pushReg(e) - 2;
+
+            emit(e, jaiA64SubsXImm(31, ry, 0));
+            branchOnDeopt(e, JAI_A64_EQ);
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, ry, 1));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+            branchOnDeopt(e, JAI_A64_EQ);
+
+            emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, ry));
+            emit(e, jaiA64MsubX(JIT_SCRATCH_C, JIT_SCRATCH_B, ry, rx));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64BCond(JAI_A64_EQ, 5));
+            emit(e, jaiA64EorX(JIT_SCRATCH_D, JIT_SCRATCH_C, ry));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+            emit(e, jaiA64BCond(JAI_A64_GE, 2));
+            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, ry));
+
+            unsigned dm1, dm2;
+            if (!popValue(e, &dm1, NULL)) return false;
+            if (!popValue(e, &dm2, NULL)) return false;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
+            off += 1;
+            break;
+        }
+
+        case OP_MOD_INT_CONST: {
+            /* `<int k>; MOD` fused: floor remainder by a constant. k cannot be
+             * zero -- fusion only happens when it is known non-zero -- and -1
+             * goes back to the interpreter so INT64_MIN %% -1 stays its
+             * problem. */
+            int16_t imm = jaiReadI16(code + off + 1);
+            if (imm == 0 || imm == -1) return false;
+            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_INT) return false;
+            unsigned rx = pushReg(e) - 1;
+
+            emitConst64(e, JIT_SCRATCH_A, imm);
+            emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, JIT_SCRATCH_A));
+            emit(e, jaiA64MsubX(JIT_SCRATCH_C, JIT_SCRATCH_B, JIT_SCRATCH_A, rx));
+            /* r += k when r is nonzero and its sign differs from k's. */
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64BCond(JAI_A64_EQ, 5));
+            emit(e, jaiA64EorX(JIT_SCRATCH_D, JIT_SCRATCH_C, JIT_SCRATCH_A));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+            emit(e, jaiA64BCond(JAI_A64_GE, 2));
+            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_A));
+            emit(e, jaiA64MovX(rx, JIT_SCRATCH_C));
+            off += 3;
+            break;
+        }
+
         case OP_FLOORDIV: {
             unsigned rb, ra;
             SlotKind kb, ka;
@@ -2133,7 +2247,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         e.deopt[k].stub = (int)e.count;
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
 
-        for (unsigned i = 0; i < e.locals; i++) {
+        for (unsigned i = 0; i < (e.osr ? 0u : e.locals); i++) {
             unsigned slot = e.base + i;
             SlotKind kind = e.localKind[slot];
             unsigned tag = kind == SLOT_INT   ? VAL_INT
@@ -2245,6 +2359,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             target = e.bailBlock;
         } else if (f->targetOffset == FIXUP_THREW) {
             target = e.exceptionExit;
+        } else if (f->targetOffset <= FIXUP_EXIT &&
+                   f->targetOffset > FIXUP_EXIT - 8u) {
+            target = e.exitStub[FIXUP_EXIT - f->targetOffset];
+            if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
         } else if (f->targetOffset <= FIXUP_DEOPT &&
                    f->targetOffset > FIXUP_DEOPT - JIT_MAX_DEOPT) {
             target = e.deopt[FIXUP_DEOPT - f->targetOffset].stub;
@@ -2350,6 +2468,245 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     }
     fn->jitFunc = entry;
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* On-stack replacement                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Returns the bytecode offset the interpreter should continue from. */
+typedef int64_t (*OsrFn)(Value *slots);
+
+/* The OP_LOOP that jumps back to `top`, and so the end of the loop. Gives up
+ * on OP_CLOSURE, whose length depends on its operands. */
+static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
+    for (int off = (int)top; off < c->count;) {
+        uint8_t op = c->code[off];
+        if (op == OP_CLOSURE) return 0;
+        int len = 1 + jaiOpOperandSize((OpCode)op);
+        if (len <= 0) return 0;
+        if (op == OP_LOOP) {
+            int16_t jump = jaiReadI16(c->code + off + 1);
+            if ((uint32_t)((int32_t)(off + 3) + jump) == top) {
+                return (uint32_t)(off + 3);
+            }
+        }
+        off += len;
+    }
+    return 0;
+}
+
+static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
+    ObjFunction *fn = closure->fn;
+    uint32_t end = findLoopEnd(&fn->chunk, top);
+    if (end == 0 || end <= top) return false;
+    if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > 16) return false;
+
+    JaiCodeArena *arena = jaiJitArena();
+    if (arena == NULL) return false;
+
+    int *map = JAI_ALLOC(int, fn->chunk.count + 1);
+    int *depths = JAI_ALLOC(int, fn->chunk.count + 1);
+    for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
+
+    static Emit e;
+    memset(&e, 0, sizeof e);
+    e.osr = true;
+    e.osrTop = top;
+    e.osrEnd = end;
+    e.base = 0;
+    e.locals = (unsigned)fn->maxSlots;
+    e.limitLiteral = -1;
+    e.bailBlock = -1;
+    e.exceptionExit = -1;
+    e.callsOut = true;
+    e.observed = slots;
+    e.offsetToInst = map;
+    e.offsetToDepth = depths;
+    e.savedCount = JIT_MAX_SAVED;
+
+    /* Each slot takes the kind it holds right now. The entry re-checks them on
+     * every later entry, so this is a specialisation, not an assumption. */
+    for (unsigned i = 0; i < e.locals; i++) {
+        Value v = slots[i];
+        e.localTyped[i] = true;
+        if (IS_INT(v))        e.localKind[i] = SLOT_INT;
+        else if (IS_FLOAT(v)) e.localKind[i] = SLOT_FLOAT;
+        else if (IS_BOOL(v))  e.localKind[i] = SLOT_BOOL;
+        else if (IS_LIST(v))  e.localKind[i] = SLOT_LIST;
+        else if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != NULL) {
+            e.localKind[i]  = SLOT_INST;
+            e.localClass[i] = AS_INSTANCE(v)->klass;
+            e.localShape[i] = AS_INSTANCE(v)->klass->shapeId;
+        } else {
+            e.localKind[i] = SLOT_OPAQUE;
+        }
+    }
+
+    unsigned frame = 16u + 8u * JIT_MAX_SAVED + (unsigned)sizeof(JitCallDesc);
+    e.descOffset = 16u + 8u * JIT_MAX_SAVED;
+    e.frameBytes = (frame + 15u) & ~15u;
+
+    emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
+    emitSaveRestore(&e, true);
+    emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
+
+    if (!compileBody(&e, closure) || e.failed) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
+                    e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
+
+    /* Falling off the end of the compiled range is the loop exiting there. */
+    if (e.exitCount >= 8) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+
+    e.bailBlock = (int)e.count;
+    emitConst64(&e, 0, (int64_t)-1);          /* -1: could not continue */
+    emitEpilogue(&e, 0);
+    e.exceptionExit = (int)e.count;
+    emitConst64(&e, 0, (int64_t)-2);          /* -2: an exception is pending */
+    emitEpilogue(&e, 0);
+
+    for (unsigned i = 0; i < 3; i++) {
+        if (!e.overflowUsed[i]) { e.overflowStub[i] = -1; continue; }
+        e.overflowStub[i] = (int)e.count;
+        emit(&e, jaiA64MovzX(0, i, 0));
+        emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitThrowOverflow);
+        emit(&e, jaiA64Blr(JIT_SCRATCH_A));
+        emitConst64(&e, 0, (int64_t)-2);
+        emitEpilogue(&e, 0);
+    }
+
+    for (unsigned i = 0; i < e.exitCount; i++) {
+        e.exitStub[i] = (int)e.count;
+        emitConst64(&e, 0, (int64_t)e.exitOffset[i]);
+        emitEpilogue(&e, 0);
+    }
+
+    for (unsigned k = 0; k < e.deoptCount; k++) {
+        e.deopt[k].stub = (int)e.count;
+        emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
+        unsigned valueSeen = 0;
+        for (unsigned i = 0; i < e.deopt[k].depth; i++) {
+            SlotKind kind = e.deopt[k].kinds[i];
+            unsigned at = (unsigned)offsetof(JitDeoptRecord, stack) +
+                          i * (unsigned)sizeof(Value);
+            if (kind == SLOT_CLASS || kind == SLOT_SELF) {
+                uintptr_t pv = kind == SLOT_CLASS
+                                   ? (uintptr_t)e.deopt[k].classes[i]
+                                   : (uintptr_t)closure;
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emitConst64(&e, JIT_SCRATCH_B, (int64_t)pv);
+                emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                continue;
+            }
+            unsigned tag = kind == SLOT_INT   ? VAL_INT
+                         : kind == SLOT_FLOAT ? VAL_FLOAT
+                         : kind == SLOT_BOOL  ? VAL_BOOL
+                                              : VAL_OBJ;
+            unsigned reg = JIT_FIRST_SAVED + regBase(&e) + valueSeen;
+            valueSeen++;
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+            emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+            emit(&e, jaiA64StrX(reg, JIT_SCRATCH_A, at + 8));
+        }
+        emit(&e, jaiA64MovzX(JIT_SCRATCH_B, e.deopt[k].depth, 0));
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, nstack)));
+        emitConst64(&e, 0, (int64_t)e.deopt[k].ip);
+        emitEpilogue(&e, 0);
+    }
+
+    if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+
+    for (unsigned i = 0; i < e.fixupCount; i++) {
+        const Fixup *f = &e.fixups[i];
+        int target;
+        if (f->targetOffset == FIXUP_BAIL) target = e.bailBlock;
+        else if (f->targetOffset == FIXUP_THREW) target = e.exceptionExit;
+        else if (f->targetOffset <= FIXUP_EXIT && f->targetOffset > FIXUP_EXIT - 8u)
+            target = e.exitStub[FIXUP_EXIT - f->targetOffset];
+        else if (f->targetOffset <= FIXUP_DEOPT &&
+                 f->targetOffset > FIXUP_DEOPT - JIT_MAX_DEOPT)
+            target = e.deopt[FIXUP_DEOPT - f->targetOffset].stub;
+        else if (f->targetOffset <= FIXUP_OVF && f->targetOffset >= FIXUP_OVF - 2u)
+            target = e.overflowStub[FIXUP_OVF - f->targetOffset];
+        else {
+            if (f->targetOffset > (uint32_t)fn->chunk.count) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+            target = map[f->targetOffset];
+            if (target < 0 ||
+                (f->depth >= 0 && depths[f->targetOffset] != f->depth)) {
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
+        }
+        if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+        int rel = target - f->instIndex;
+        uint32_t word = e.code[f->instIndex];
+        if ((word & 0xfc000000u) == 0x94000000u) e.code[f->instIndex] = jaiA64Bl(rel);
+        else if (f->conditional) e.code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
+        else e.code[f->instIndex] = jaiA64B(rel);
+    }
+    jitFree(map, depths, fn->chunk.count + 1);
+
+    if (!jaiCodeArenaUnseal(arena)) return false;
+    while ((arena->used & 7u) != 0) {
+        uint32_t pad = jaiA64Nop();
+        if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) return false;
+    }
+    uint8_t *entry = jaiCodeArenaWrite(arena, e.code, e.count * sizeof e.code[0]);
+    if (entry == NULL) return false;
+    if (!jaiCodeArenaSeal(arena)) return false;
+
+    fn->osrCode = entry;
+    fn->osrTop = top;
+    fn->jitModuleVersion = fn->module != NULL ? fn->module->version : 0;
+    fn->osrSlots = (uint8_t)e.locals;
+    for (unsigned i = 0; i < e.locals; i++) fn->osrKinds[i] = (uint8_t)e.localKind[i];
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] osr %s at %u: %u instructions\n",
+                fn->name ? fn->name->chars : "<anon>", top, e.count);
+    }
+    return true;
+}
+
+int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
+    ObjFunction *fn = closure->fn;
+    CallFrame *frame = &vm.frames[vm.frameCount - 1];
+
+    if (fn->osrCode == NULL) {
+        if (fn->osrRefused) return 0;
+        fn->osrRefused = true;
+        if (!compileOsr(closure, top, frame->slots)) return 0;
+        fn->osrRefused = false;
+    }
+    if (fn->osrTop != top) return 0;
+    if (fn->module == NULL || fn->module->version != fn->jitModuleVersion) return 0;
+
+    /* Every slot must still hold what it held when this was compiled. */
+    for (unsigned i = 0; i < fn->osrSlots; i++) {
+        Value v = frame->slots[i];
+        switch ((SlotKind)fn->osrKinds[i]) {
+        case SLOT_INT:   if (!IS_INT(v))   return 0; break;
+        case SLOT_FLOAT: if (!IS_FLOAT(v)) return 0; break;
+        case SLOT_BOOL:  if (!IS_BOOL(v))  return 0; break;
+        case SLOT_LIST:  if (!IS_LIST(v))  return 0; break;
+        case SLOT_INST:  if (!IS_INSTANCE(v)) return 0; break;
+        default: break;   /* opaque: never read */
+        }
+    }
+
+    gDeopt.nstack = 0;
+    int64_t at = ((OsrFn)(uintptr_t)fn->osrCode)(frame->slots);
+    if (at == -1) return 0;
+    if (at == -2) return 2;              /* an exception is pending */
+    for (int64_t i = 0; i < gDeopt.nstack; i++) *vm.stackTop++ = gDeopt.stack[i];
+    *resumeAt = (uint32_t)at;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */

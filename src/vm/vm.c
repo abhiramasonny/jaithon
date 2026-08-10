@@ -2312,8 +2312,11 @@ static bool safepoint(void) {
         jaiInterrupted = 0;
         if (vm.frameCount > 0) {
             CallFrame *top = &vm.frames[vm.frameCount - 1];
-            jaiJitSample(top->closure,
-                         (uint32_t)(top->ip - top->closure->fn->chunk.code));
+            if (!jaiJitSample(top->closure,
+                              (uint32_t)(top->ip -
+                                         top->closure->fn->chunk.code))) {
+                return false;   /* the compiled loop raised */
+            }
         }
     }
     /* Only 1 is Ctrl-C. A tick that arrived while compiled code was running
