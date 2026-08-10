@@ -21,6 +21,7 @@
 #include <signal.h>
 
 #include "vm.h"
+#include "jit.h"
 
 #include "gc.h"
 #include "object.h"
@@ -1039,6 +1040,18 @@ static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) 
 static bool callClosure(ObjClosure *closure, int argc) {
     Value *slotBase = vm.stackTop - argc - 1;
     if (!bindCallArgs(closure, argc, slotBase)) return false;
+
+    /* The compiled tier gets first refusal. It declines for everything today,
+     * and the interpreter below runs the function exactly as it always has --
+     * which is the point: the counter and the threshold are exercised by the
+     * whole suite before any machine code exists. */
+    ObjFunction *fn = closure->fn;
+    if (fn->entryCount < JAI_JIT_THRESHOLD) {
+        fn->entryCount++;
+    } else if (jaiJitEnabled() && jaiJitEnter(closure, slotBase)) {
+        return true;
+    }
+
     if (!pushFrame(closure, slotBase)) return false;
     return true;
 }
