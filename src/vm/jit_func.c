@@ -1487,6 +1487,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_TRUE:
+        case OP_FALSE: {
+            /* A bool is a payload of 1 or 0 in a register, the same as any
+             * other value here. Their absence declined `queens` and `sieve`
+             * outright -- `return false` and a list of flags are not exotic. */
+            if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+            emitConst64(e, pushReg(e) - 1, op == OP_TRUE ? 1 : 0);
+            off += 1;
+            break;
+        }
+
         case OP_SET_LOCAL: {
             /* Assigns without popping: the value stays as the statement's
              * result, which is what the interpreter does. */
