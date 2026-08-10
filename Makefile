@@ -206,7 +206,27 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # the seed part of its own identity: reseeding changed seed.c, which changed the
 # fingerprint, which changed the build id stamped into the next seed's images.
 # That loop cannot converge, and a three-stage fixpoint over it never holds.
-ALL_SRCS := $(filter-out boot/seed.c,$(SRCS_C)) $(SRCS_M) $(wildcard src/*/*.h)
+#
+# Narrowed to the VM and the container reader. The id answers one question --
+# can this binary load this bytecode -- and that is a fact about the opcode set,
+# the object model and the .jaic format, not about the CLI, the runtime's
+# builtins or a front end.
+#
+# It used to hash all of src/, which was the safe default while a C front end
+# could recompile anything the seed failed to serve. Deleting that front end
+# removes the fallback: a src/ change would invalidate every seeded image and
+# leave nothing able to rebuild them, so the compiler could not be changed at
+# all. Too narrow is a stale cache after a VM change; too wide is a compiler
+# that cannot be edited. The boundary belongs where the format does.
+#
+# boot/seed.c is excluded for a different reason and would be even if it lived
+# here: it is generated data rather than logic -- it changes what the compiler
+# STARTS with, never what it does with a given source -- so including it made
+# the seed part of its own identity. Reseeding changed seed.c, which changed the
+# fingerprint, which changed the id stamped into the next seed's images. That
+# loop cannot converge and a fixpoint over it never holds.
+ALL_SRCS := $(filter-out boot/seed.c,$(wildcard src/vm/*.c)) \
+            $(wildcard src/vm/*.h) $(wildcard src/common/*.h)
 SRC_FINGERPRINT := $(shell cat $(ALL_SRCS) 2>/dev/null | shasum -a 256 | cut -c1-8)
 # At BUILD_ROOT, not $(BUILD): the fingerprint does not depend on build type,
 # and BASE_CFLAGS is expanded before $(BUILD) is narrowed to debug/release.
