@@ -950,6 +950,7 @@ ObjFunction *jaiFunctionNew(void) {
     fn->flags = 0;
     fn->entryCount = 0;
     fn->jitCode = NULL;
+    fn->jitKind = 0;
     fn->maxSlots = 0;
     fn->upvalueCount = 0;
     fn->paramNames = NULL;
