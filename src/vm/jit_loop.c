@@ -94,8 +94,13 @@ static int emitConst(uint32_t *w, int n, unsigned reg, uint64_t value) {
     return n;
 }
 
-/* 0 = the loop ran to completion, 1 = it bailed. */
-typedef int (*JaiCompiledLoop)(Value *slots);
+/* 0 = the loop ran to completion, 1 = it bailed.
+ *
+ * `limit` is a parameter rather than baked into the code so that one emitted
+ * body serves both loop heads: the counted head passes the constant it matched,
+ * and the range head will pass the iterator's limit, which is only known at
+ * entry. */
+typedef int (*JaiCompiledLoop)(Value *slots, int64_t limit);
 
 /* x1 holds the accumulator and x2 the counter for the whole loop. That
  * residency, not the removal of dispatch, is where the win is. */
@@ -109,6 +114,13 @@ static void *compileLoop(const LoopShape *shape) {
     uint32_t w[64];
     int n = 0;
 
+    /* x1 arrives holding the limit and is about to be reused for the
+     * accumulator, so stash it first. Doing this after the loads produced a
+     * loop that compared the accumulator against itself and answered
+     * 29963580 instead of 149999997 -- wrong, not crashed, which is why the
+     * check is the interpreter's answer and not that it ran. */
+    w[n++] = jaiA64MovX(3, 1);
+
     /* Both locals must already be ints; the body assumes it throughout. */
     w[n++] = jaiA64LdrW(5, 0, accTag);
     w[n++] = jaiA64SubsXImm(31, 5, VAL_INT);
@@ -117,9 +129,8 @@ static void *compileLoop(const LoopShape *shape) {
     w[n++] = jaiA64SubsXImm(31, 5, VAL_INT);
     int toBailNoWrite2 = n++;
 
-    w[n++] = jaiA64LdrX(1, 0, accInt);
     w[n++] = jaiA64LdrX(2, 0, iInt);
-    n = emitConst(w, n, 3, (uint64_t)shape->limit);
+    w[n++] = jaiA64LdrX(1, 0, accInt);
     n = emitConst(w, n, 4, (uint64_t)shape->divisor);
 
     int top = n;
@@ -172,11 +183,13 @@ bool jaiJitEnterLoop(ObjClosure *closure, uint32_t targetOffset) {
         fn->jitLoop = code;
         fn->jitLoopExit = shape.exitOffset;
         fn->jitLoopTop = targetOffset;
+        fn->jitLoopLimit = shape.limit;
     }
     if (fn->jitLoopTop != targetOffset) return false;
 
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
-    int status = ((JaiCompiledLoop)(uintptr_t)fn->jitLoop)(frame->slots);
+    int status = ((JaiCompiledLoop)(uintptr_t)fn->jitLoop)(frame->slots,
+                                                          fn->jitLoopLimit);
 
     /* Both outcomes hand control back to the interpreter and only `ip` differs:
      * past the loop when it finished, at the loop's own top when it bailed,
