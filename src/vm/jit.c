@@ -184,7 +184,13 @@ void jaiJitStartSampling(void) {
      * which is right, since it has no hot loop to find. */
     struct itimerval it;
     it.it_interval.tv_sec = 0;
-    it.it_interval.tv_usec = 1000;   /* 1kHz */
+    /* 4kHz, not 1. A tick only counts when it lands with the ip on a back
+     * edge, so the wait before a loop is compiled is always longer than the
+     * rate; raising the rate shortens it directly. Two binaries interleaved:
+     * 484ms against 492ms across the suite, all of it loop_sum going 48.6ms to
+     * 40.8ms. 10kHz was worse again at 486 -- the signal itself starts to cost
+     * more than the earlier compile saves, so this is a peak and not a slope. */
+    it.it_interval.tv_usec = 250;
     it.it_value = it.it_interval;
     (void)setitimer(ITIMER_PROF, &it, NULL);
 }
