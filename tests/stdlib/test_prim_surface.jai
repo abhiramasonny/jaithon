@@ -51,13 +51,15 @@ let SPECIFIED = [
     "thread_spawn", "thread_join", "thread_detach", "cpu_count",
     # the collector
     "gc_collect", "gc_stats", "gc_disable", "gc_enable",
+    # the zlib stream a PNG holds
+    "deflate", "adler32", "crc32",
     # the front end
     "compile", "eval", "exec", "globals",
     "jaic_build_id",
 ]
 
 #: The families Appendix C writes as `x_*` rather than listing.
-let WILDCARDS = ["f64_", "bytes_", "mutex_", "cond_", "atomic_", "gpu_", "gui_"]
+let WILDCARDS = ["f64_", "bytes_", "mutex_", "cond_", "atomic_", "gpu_", "gui_", "canvas_"]
 
 #: `time_sleep` is the same native as `sleep` under a second name, kept only
 #: because `lib/std/time.jai` still calls it. It is the one name the runtime

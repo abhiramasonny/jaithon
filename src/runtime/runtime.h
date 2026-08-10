@@ -45,6 +45,8 @@ void jaiRegisterListPrimitives(void);
 void jaiRegisterDictPrimitives(void);
 void jaiRegisterIOPrimitives(void);
 void jaiRegisterOSPrimitives(void);
+void jaiRegisterCanvasPrimitives(void);  /* __prim__.canvas_*                   */
+void jaiRegisterCompressPrimitives(void); /* __prim__.deflate, crc32, adler32   */
 void jaiRegisterTimePrimitives(void);
 void jaiRegisterRandomPrimitives(void);
 void jaiRegisterThreadPrimitives(void);
