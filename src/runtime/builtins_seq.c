@@ -31,6 +31,8 @@
 
 #include "../vm/gc.h"
 
+#include <string.h>
+
 /* ------------------------------------------------------------------ */
 /* Receivers and arguments                                              */
 /* ------------------------------------------------------------------ */
@@ -46,21 +48,33 @@ bool jaiSeqReceiverError(const char *fnName, const char *expected, Value got) {
                     expected, jaiTypeNameStatic(got));
 }
 
-static bool selfTuple(Value *args, const char *fnName, ObjTuple **out) {
-    if (!IS_TUPLE(args[0])) return jaiSeqReceiverError(fnName, "tuple", args[0]);
-    *out = AS_TUPLE(args[0]);
+static inline bool selfTuple(Value *args, const char *fnName,
+                             ObjTuple **out) {
+    const Value self = args[0];
+    if (!IS_TUPLE(self))
+        return jaiSeqReceiverError(fnName, "tuple", self);
+
+    *out = AS_TUPLE(self);
     return true;
 }
 
-static bool selfRange(Value *args, const char *fnName, ObjRange **out) {
-    if (!IS_RANGE(args[0])) return jaiSeqReceiverError(fnName, "range", args[0]);
-    *out = AS_RANGE(args[0]);
+static inline bool selfRange(Value *args, const char *fnName,
+                             ObjRange **out) {
+    const Value self = args[0];
+    if (!IS_RANGE(self))
+        return jaiSeqReceiverError(fnName, "range", self);
+
+    *out = AS_RANGE(self);
     return true;
 }
 
-static bool selfIter(Value *args, const char *fnName, ObjIter **out) {
-    if (!IS_ITER(args[0])) return jaiSeqReceiverError(fnName, "iterator", args[0]);
-    *out = AS_ITER(args[0]);
+static inline bool selfIter(Value *args, const char *fnName,
+                            ObjIter **out) {
+    const Value self = args[0];
+    if (!IS_ITER(self))
+        return jaiSeqReceiverError(fnName, "iterator", self);
+
+    *out = AS_ITER(self);
     return true;
 }
 
@@ -91,18 +105,19 @@ bool jaiSeqEqualsChecked(Value a, Value b, bool *equal) {
 
 /* Hashing fails only for the mutable containers and for the composites that
  * may contain one — or for an instance with no (or a raising) __hash__. */
-static bool hashMayFail(Value v) {
+static inline bool hashMayFail(Value v) {
     if (!IS_OBJ(v)) return false;
+
     switch (OBJ_TYPE(v)) {
-    case OBJ_LIST:
-    case OBJ_DICT:
-    case OBJ_SET:
-    case OBJ_TUPLE:
-    case OBJ_ENUM_VAL:
-    case OBJ_INSTANCE:
-        return true;
-    default:
-        return false;
+        case OBJ_LIST:
+        case OBJ_DICT:
+        case OBJ_SET:
+        case OBJ_TUPLE:
+        case OBJ_ENUM_VAL:
+        case OBJ_INSTANCE:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -134,25 +149,42 @@ bool jaiSeqHashableKey(Value key, const char *fnName, const char *role) {
 ObjList *jaiSeqCollectIterable(Value v) {
     Value iterVal;
     if (!jaiGetIter(v, &iterVal)) return NULL;
+
     if (!IS_ITER(iterVal)) {
-        jaiThrow(vm.cTypeError, "'%s' object is not iterable", jaiTypeNameStatic(v));
+        jaiThrow(vm.cTypeError, "'%s' object is not iterable",
+                 jaiTypeNameStatic(v));
         return NULL;
     }
 
     jaiGCPushRoot(iterVal);
-    ObjList *out = jaiListNew(0);
-    jaiGCPushRoot(OBJ_VAL(out));
+    ObjIter *const it = AS_ITER(iterVal);
+
+    /* Reserve when the source has a cheap, stable size. This changes only
+     * allocation behavior; iteration still goes through the canonical iterator. */
+    int capacity = 0;
+    if (IS_TUPLE(v)) {
+        const uint32_t n = AS_TUPLE(v)->count;
+        if (n <= INT32_MAX) capacity = (int)n;
+    } else if (IS_RANGE(v)) {
+        const int64_t n = jaiRangeLength(AS_RANGE(v));
+        if (n >= 0 && n <= INT32_MAX) capacity = (int)n;
+    }
+
+    ObjList *result = jaiListNew(capacity);
+    jaiGCPushRoot(OBJ_VAL(result));
 
     Value item;
-    while (jaiIterNext(AS_ITER(iterVal), &item)) {
+    while (jaiIterNext(it, &item)) {
         jaiGCPushRoot(item);
-        jaiListPush(out, item);
+        jaiListPush(result, item);
         jaiGCPopRoot();
-        if (vm.hasException) break;
-    }
-    jaiGCPopRoots(2);
 
-    return vm.hasException ? NULL : out;
+        if (vm.hasException)
+            break;
+    }
+
+    jaiGCPopRoots(2);
+    return vm.hasException ? NULL : result;
 }
 
 /* `xs.iter()` is the explicit spelling of what `for x in xs` does implicitly;
@@ -167,14 +199,37 @@ bool jaiSeqValueIter(int argc, Value *args, Value *out) {
 /* ------------------------------------------------------------------ */
 
 bool jaiSeqBindFrom(const JaiSeqMethod *table, int count, Value receiver,
-                     ObjString *name, Value *out) {
-    for (int i = 0; i < count; i++) {
-        if (name->length != table[i].length) continue;
-        if (memcmp(name->chars, table[i].name, table[i].length) != 0) continue;
-        *out = jaiBindNative(receiver, table[i].name, table[i].fn,
-                             table[i].minArity, table[i].maxArity, table[i].params);
+                    ObjString *name, Value *out) {
+    const uint32_t length = name->length;
+    if (length == 0) return false;
+
+    const char *const chars = name->chars;
+    const unsigned char first = (unsigned char)chars[0];
+    const unsigned char last = (unsigned char)chars[length - 1];
+
+    for (int i = 0; i < count; ++i) {
+        const JaiSeqMethod *const method = table + i;
+
+        if ((uint32_t)method->length != length)
+            continue;
+
+        if ((unsigned char)method->name[0] != first)
+            continue;
+
+        if (length > 1 &&
+            (unsigned char)method->name[length - 1] != last)
+            continue;
+
+        if (length > 2 &&
+            memcmp(chars + 1, method->name + 1, length - 2) != 0)
+            continue;
+
+        *out = jaiBindNative(receiver, method->name, method->fn,
+                             method->minArity, method->maxArity,
+                             method->params);
         return true;
     }
+
     return false;
 }
 
@@ -202,61 +257,92 @@ static bool tupleGet(int argc, Value *args, Value *out) {
 
 static bool tupleContains(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjTuple *self;
     if (!selfTuple(args, "tuple.contains", &self)) return false;
 
-    for (uint32_t i = 0; i < self->count; i++) {
+    const uint32_t count = self->count;
+    const Value *const items = self->items;
+    const Value needle = args[1];
+
+    for (uint32_t i = 0; i < count; ++i) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
+        if (!jaiSeqEqualsChecked(items[i], needle, &same))
+            return false;
+
         if (same) {
             *out = BOOL_VAL(true);
             return true;
         }
     }
+
     *out = BOOL_VAL(false);
     return true;
 }
 
 static bool tupleIndex(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjTuple *self;
     if (!selfTuple(args, "tuple.index", &self)) return false;
 
-    for (uint32_t i = 0; i < self->count; i++) {
+    const uint32_t count = self->count;
+    const Value *const items = self->items;
+    const Value needle = args[1];
+
+    for (uint32_t i = 0; i < count; ++i) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
+        if (!jaiSeqEqualsChecked(items[i], needle, &same))
+            return false;
+
         if (same) {
             *out = INT_VAL((int64_t)i);
             return true;
         }
     }
+
     return jaiThrow(vm.cValueError, "tuple.index(): value not in tuple");
 }
 
 static bool tupleCount(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjTuple *self;
     if (!selfTuple(args, "tuple.count", &self)) return false;
 
+    const uint32_t count = self->count;
+    const Value *const items = self->items;
+    const Value needle = args[1];
     int64_t total = 0;
-    for (uint32_t i = 0; i < self->count; i++) {
+
+    for (uint32_t i = 0; i < count; ++i) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
-        if (same) total++;
+        if (!jaiSeqEqualsChecked(items[i], needle, &same))
+            return false;
+
+        total += same;
     }
+
     *out = INT_VAL(total);
     return true;
 }
 
 static bool tupleToList(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjTuple *self;
     if (!selfTuple(args, "tuple.to_list", &self)) return false;
 
-    ObjList *result = jaiListNew((int)self->count);
-    for (uint32_t i = 0; i < self->count && result->count < result->capacity; i++) {
-        result->items[result->count++] = self->items[i];
+    const uint32_t count = self->count;
+    ObjList *result = jaiListNew((int)count);
+
+    if (count != 0) {
+        JAI_ASSERT(result->capacity >= (int)count,
+                   "jaiListNew did not reserve requested capacity");
+        memcpy(result->items, self->items, (size_t)count * sizeof(Value));
+        result->count = (int)count;
     }
+
     *out = OBJ_VAL(result);
     return true;
 }
@@ -268,8 +354,9 @@ static bool tupleToList(int argc, Value *args, Value *out) {
 /* The last value a range yields. Only called when the length is nonzero, and
  * computed in unsigned arithmetic because start + (n-1)*step is exact but its
  * intermediates need not be. */
-static int64_t rangeLast(ObjRange *r, int64_t length) {
-    uint64_t offset = (uint64_t)(length - 1) * (uint64_t)r->step;
+static inline int64_t rangeLast(ObjRange *r, int64_t length) {
+    const uint64_t offset =
+        (uint64_t)(length - 1) * (uint64_t)r->step;
     return (int64_t)((uint64_t)r->start + offset);
 }
 
@@ -285,48 +372,74 @@ static bool rangeLen(int argc, Value *args, Value *out) {
  * error, so `x in r` stays usable on a heterogeneous value. */
 static bool rangeContains(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjRange *self;
     if (!selfRange(args, "range.contains", &self)) return false;
 
-    int64_t length = jaiRangeLength(self);
-    if (!IS_INT(args[1]) || length == 0) {
+    if (!IS_INT(args[1])) {
         *out = BOOL_VAL(false);
         return true;
     }
 
-    int64_t v = AS_INT(args[1]);
-    int64_t last = rangeLast(self, length);
-    bool within = (self->step > 0) ? (v >= self->start && v <= last)
-                                   : (v <= self->start && v >= last);
-    if (within) {
-        /* The offset from the start is exact for any member, and the unsigned
-         * difference is well defined even when the span exceeds INT64_MAX. */
-        uint64_t offset = (uint64_t)v - (uint64_t)self->start;
-        uint64_t stride = (self->step > 0) ? (uint64_t)self->step
-                                           : 0u - (uint64_t)self->step;
+    const int64_t length = jaiRangeLength(self);
+    if (length == 0) {
+        *out = BOOL_VAL(false);
+        return true;
+    }
+
+    const int64_t value = AS_INT(args[1]);
+    const int64_t start = self->start;
+    const int64_t step = self->step;
+    const int64_t last = rangeLast(self, length);
+
+    bool within =
+        step > 0 ? (value >= start && value <= last)
+                 : (value <= start && value >= last);
+
+    if (within && step != 1 && step != -1) {
+        const uint64_t offset = (uint64_t)value - (uint64_t)start;
+        const uint64_t stride =
+            step > 0 ? (uint64_t)step : 0u - (uint64_t)step;
+
         within = (offset % stride) == 0;
     }
+
     *out = BOOL_VAL(within);
     return true;
 }
 
 static bool rangeToList(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjRange *self;
     if (!selfRange(args, "range.to_list", &self)) return false;
 
-    int64_t length = jaiRangeLength(self);
+    const int64_t length = jaiRangeLength(self);
     if (length > INT32_MAX) {
         return jaiThrow(vm.cValueError,
                         "range.to_list(): %lld elements is more than a list can hold",
                         (long long)length);
     }
 
-    ObjList *result = jaiListNew((int)length);
-    for (int64_t i = 0; i < length; i++) {
-        result->items[result->count++] =
-            INT_VAL((int64_t)((uint64_t)self->start + (uint64_t)i * (uint64_t)self->step));
+    const int count = (int)length;
+    ObjList *result = jaiListNew(count);
+
+    if (count != 0) {
+        JAI_ASSERT(result->capacity >= count,
+                   "jaiListNew did not reserve requested capacity");
+
+        Value *const items = result->items;
+        uint64_t value = (uint64_t)self->start;
+        const uint64_t step = (uint64_t)self->step;
+
+        for (int i = 0; i < count; ++i) {
+            items[i] = INT_VAL((int64_t)value);
+            value += step;
+        }
+
+        result->count = count;
     }
+
     *out = OBJ_VAL(result);
     return true;
 }
@@ -409,27 +522,43 @@ static bool iterNextMethod(int argc, Value *args, Value *out) {
  * elements, fewer if the source ends first. */
 static bool iterTake(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjIter *self;
     if (!selfIter(args, "iter.take", &self)) return false;
+
     int64_t n;
     if (!jaiArgInt(args[1], 1, "iter.take", &n)) return false;
+
     if (n < 0) {
-        return jaiThrow(vm.cValueError, "iter.take(): count must be non-negative, got %lld",
+        return jaiThrow(vm.cValueError,
+                        "iter.take(): count must be non-negative, got %lld",
                         (long long)n);
     }
 
-    ObjList *result = jaiListNew(0);
+    /* Reserve modest requests exactly; do not let a huge take() against a
+     * short/lazy iterator cause a huge speculative allocation. */
+    const int capacity = n <= 256 ? (int)n : 0;
+    ObjList *result = jaiListNew(capacity);
     jaiGCPushRoot(OBJ_VAL(result));
-    for (int64_t i = 0; i < n; i++) {
+
+    for (int64_t i = 0; i < n; ++i) {
         Value item;
-        if (!jaiIterNext(self, &item)) break;
+        if (!jaiIterNext(self, &item))
+            break;
+
         jaiGCPushRoot(item);
         jaiListPush(result, item);
         jaiGCPopRoot();
-        if (vm.hasException) break;
+
+        if (vm.hasException)
+            break;
     }
+
     jaiGCPopRoot();
-    if (vm.hasException) return false;
+
+    if (vm.hasException)
+        return false;
+
     *out = OBJ_VAL(result);
     return true;
 }
@@ -437,40 +566,56 @@ static bool iterTake(int argc, Value *args, Value *out) {
 /* drop advances the iterator and hands it back, so it can be chained. */
 static bool iterDrop(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjIter *self;
     if (!selfIter(args, "iter.drop", &self)) return false;
+
     int64_t n;
     if (!jaiArgInt(args[1], 1, "iter.drop", &n)) return false;
+
     if (n < 0) {
-        return jaiThrow(vm.cValueError, "iter.drop(): count must be non-negative, got %lld",
+        return jaiThrow(vm.cValueError,
+                        "iter.drop(): count must be non-negative, got %lld",
                         (long long)n);
     }
 
-    for (int64_t i = 0; i < n; i++) {
+    while (n-- > 0) {
         Value ignored;
-        if (!jaiIterNext(self, &ignored)) break;
+        if (!jaiIterNext(self, &ignored))
+            break;
     }
-    if (vm.hasException) return false;
+
+    if (vm.hasException)
+        return false;
+
     *out = args[0];
     return true;
 }
 
 static bool iterCollect(int argc, Value *args, Value *out) {
     (void)argc;
+
     ObjIter *self;
     if (!selfIter(args, "iter.collect", &self)) return false;
 
     ObjList *result = jaiListNew(0);
     jaiGCPushRoot(OBJ_VAL(result));
+
     Value item;
     while (jaiIterNext(self, &item)) {
         jaiGCPushRoot(item);
         jaiListPush(result, item);
         jaiGCPopRoot();
-        if (vm.hasException) break;
+
+        if (vm.hasException)
+            break;
     }
+
     jaiGCPopRoot();
-    if (vm.hasException) return false;
+
+    if (vm.hasException)
+        return false;
+
     *out = OBJ_VAL(result);
     return true;
 }
