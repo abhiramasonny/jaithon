@@ -204,26 +204,36 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # fingerprint, which changed the build id stamped into the next seed's images.
 # That loop cannot converge, and a three-stage fixpoint over it never holds.
 #
-# Narrowed to the VM and the container reader. The id answers one question --
-# can this binary load this bytecode -- and that is a fact about the opcode set,
-# the object model and the .jaic format, not about the CLI, the runtime's
-# builtins or a front end.
+# Narrowed again, to the files that define the BYTECODE CONTRACT rather than to
+# the VM as a whole. The id answers exactly one question -- can this binary load
+# this bytecode -- and that is a fact about the opcode set, the object model and
+# the .jaic format. It is not a fact about how the interpreter executes an
+# opcode.
 #
-# It used to hash all of src/, which was the safe default while a C front end
-# could recompile anything the seed failed to serve. Deleting that front end
-# removes the fallback: a src/ change would invalidate every seeded image and
-# leave nothing able to rebuild them, so the compiler could not be changed at
-# all. Too narrow is a stale cache after a VM change; too wide is a compiler
-# that cannot be edited. The boundary belongs where the format does.
+# Hashing all of src/vm made the VM unmodifiable. Editing vm.c changed the id,
+# which invalidated every seeded image, and regenerating the seed needs a
+# working compiler, which needs the seed: a loop with no way in. Every
+# optimisation to the interpreter loop -- which is most VM work -- hit it.
 #
-# boot/seed.c is excluded for a different reason and would be even if it lived
-# here: it is generated data rather than logic -- it changes what the compiler
-# STARTS with, never what it does with a given source -- so including it made
-# the seed part of its own identity. Reseeding changed seed.c, which changed the
-# fingerprint, which changed the id stamped into the next seed's images. That
-# loop cannot converge and a fixpoint over it never holds.
-ALL_SRCS := $(filter-out boot/seed.c,$(wildcard src/vm/*.c)) \
-            $(wildcard src/vm/*.h) $(wildcard src/common/*.h)
+# So vm.c, gc.c, table.c and the rest are deliberately NOT here: changing how an
+# opcode is executed cannot make existing bytecode unloadable. Changing what
+# opcodes exist can, and chunk.h is where that is written down.
+#
+# THE DISCIPLINE THIS BUYS AND WHAT IT COSTS: a change to what an opcode *means*
+# without changing the opcode table is invisible to this fingerprint, and would
+# let a stale seed and a stale cache run against new semantics. That is a real
+# hole and the reason to bump JAIC_VERSION by hand when you redefine an
+# instruction. Adding, removing or renumbering one is caught automatically,
+# because it edits chunk.h.
+#
+# boot/seed.c is excluded for a different reason and would be even if it were a
+# contract file: it is generated data rather than logic -- it changes what the
+# compiler STARTS with, never what it does with a given source -- so including
+# it made the seed part of its own identity. Reseeding changed seed.c, which
+# changed the fingerprint, which changed the id stamped into the next seed's
+# images. That loop cannot converge and a fixpoint over it never holds.
+ALL_SRCS := src/vm/chunk.h src/vm/serialize.h src/vm/serialize.c \
+            src/vm/object.h src/vm/value.h
 SRC_FINGERPRINT := $(shell cat $(ALL_SRCS) 2>/dev/null | shasum -a 256 | cut -c1-8)
 # At BUILD_ROOT, not $(BUILD): the fingerprint does not depend on build type,
 # and BASE_CFLAGS is expanded before $(BUILD) is narrowed to debug/release.
