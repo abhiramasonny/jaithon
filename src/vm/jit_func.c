@@ -4181,6 +4181,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     fn->osrCode = entry;
     fn->osrTop = top;
+    fn->osrHot = true;
+    fn->osrDeclines = 0;
     fn->jitModuleVersion = fn->module != NULL ? fn->module->version : 0;
     fn->osrSlots = (uint8_t)e.locals;
     for (unsigned i = 0; i < e.locals; i++) fn->osrKinds[i] = (uint8_t)e.localKind[i];
