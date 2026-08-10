@@ -288,6 +288,7 @@ typedef enum {
     SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
     SLOT_CLASS,   /* a class resolved at compile time; only ever a callee */
     SLOT_FUNC,    /* a global function resolved at compile time, likewise */
+    SLOT_NATIVE,  /* a builtin resolved at compile time, likewise */
     SLOT_ITER,    /* an ObjIter this body built, held raw. Its index stays in
                    * memory rather than a register, which costs a load and a
                    * store an iteration and makes a deopt need nothing: the
@@ -311,7 +312,8 @@ typedef enum {
 #define JIT_FSCRATCH_B 1u
 
 static bool holdsRegister(SlotKind k) {
-    return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC;
+    return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC &&
+           k != SLOT_NATIVE;
 }
 
 /* Two targets are not bytecode offsets at all. */
@@ -960,6 +962,26 @@ static ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
     if (!IS_CLOSURE(bound)) return NULL;
     *out = bound;
     return AS_CLOSURE(bound)->fn;
+}
+
+/* A builtin, resolved the way the interpreter resolves one: the module first,
+ * and `vm.builtins` only when the module has no such name. A module-level
+ * binding of the same name is therefore never mistaken for the builtin, and if
+ * one appears later the module's version retires this compiled form. */
+static ObjNative *globalNative(ObjClosure *closure, uint32_t nameIdx,
+                               Value *out) {
+    ObjFunction *fn = closure->fn;
+    if (fn->module == NULL || vm.builtins == NULL) return NULL;
+    if (nameIdx >= (uint32_t)fn->chunk.constants.count) return NULL;
+    Value name = fn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(name)) return NULL;
+    Value shadow;
+    if (jaiModuleGet(fn->module, AS_STRING(name), &shadow)) return NULL;
+    Value bound;
+    if (!jaiModuleGet(vm.builtins, AS_STRING(name), &bound)) return NULL;
+    if (!IS_NATIVE(bound)) return NULL;
+    *out = bound;
+    return AS_NATIVE(bound);
 }
 
 static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
@@ -1834,6 +1856,45 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)AS_OBJ(k));
             } else {
+                return false;
+            }
+            off += 4;
+            break;
+        }
+
+        case OP_TYPE_GUARD: {
+            /* A declared boundary -- a parameter or a return type. The kind is
+             * already known here, so the guard is either nothing at all or the
+             * int-to-float widening the interpreter does at the same place
+             * (spec 2.2). Anything the kinds cannot settle is declined rather
+             * than guessed: `evalA` in spectral is a one-line function whose
+             * whole body was refused for want of this. */
+            uint32_t idx = jaiReadU24(code + off + 1);
+            if (idx >= (uint32_t)fn->chunk.constants.count) return false;
+            Value t = fn->chunk.constants.data[idx];
+            if (!IS_STRING(t)) return false;
+            if (e->depth == 0) return false;
+            const char *tn = AS_STRING(t)->chars;
+            SlotKind k = e->stack[e->depth - 1];
+            if (strcmp(tn, "float") == 0) {
+                if (k == SLOT_INT) {
+                    unsigned r = pushReg(e) - 1;
+                    emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, r));
+                    emit(e, jaiA64FmovXD(r, JIT_FSCRATCH_A));
+                    e->stack[e->depth - 1]      = SLOT_FLOAT;
+                    e->stackShape[e->depth - 1] = 0;
+                    e->stackClass[e->depth - 1] = NULL;
+                    e->stackSeen[e->depth - 1]  = NULL_VAL;
+                    e->stackLocal[e->depth - 1] = -1;
+                } else if (k != SLOT_FLOAT) {
+                    e->whyNot = "a type guard the kinds cannot settle";
+                    return false;
+                }
+            } else if ((strcmp(tn, "int") == 0 && k == SLOT_INT) ||
+                       (strcmp(tn, "bool") == 0 && k == SLOT_BOOL)) {
+                /* Already what the boundary asks for. */
+            } else {
+                e->whyNot = "a type guard the kinds cannot settle";
                 return false;
             }
             off += 4;
@@ -2845,12 +2906,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value gv;
             ObjFunction *gfn = globalFunction(closure, nameIdx, &gv);
             if (gfn == NULL || gfn->jitFunc == NULL) {
-                e->whyNot = "callee is not a compiled global function";
-                return false;
+                Value nv;
+                ObjNative *nat = globalNative(closure, nameIdx, &nv);
+                if (nat == NULL) {
+                    e->whyNot = "callee is not a compiled global function";
+                    return false;
+                }
+                if (e->depth >= JIT_MAX_SAVED) return false;
+                e->stackShape[e->depth] = 0;
+                e->stackClass[e->depth] = (ObjClass *)(void *)AS_OBJ(nv);
+                e->stackSeen[e->depth]  = nv;
+                e->stackLocal[e->depth] = -1;
+                e->stack[e->depth++]    = SLOT_NATIVE;
+                off += 6;
+                break;
             }
             if (e->depth >= JIT_MAX_SAVED) return false;
             e->stackShape[e->depth] = 0;
-            e->stackClass[e->depth] = NULL;
+            /* The stub that writes a deopt record materialises a callee from
+             * here, so it has to be the object and not NULL. */
+            e->stackClass[e->depth] = (ObjClass *)(void *)AS_OBJ(gv);
             e->stackSeen[e->depth]  = gv;
             e->stackLocal[e->depth] = -1;
             e->stack[e->depth++]    = SLOT_FUNC;
@@ -2869,6 +2944,45 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth >= argc + 1u &&
                 e->stack[e->depth - argc - 1] == SLOT_FUNC) {
                 if (!emitGlobalCall(e, argc, (uint32_t)(off + 2))) return false;
+                off += 2;
+                break;
+            }
+            if (e->depth >= argc + 1u &&
+                e->stack[e->depth - argc - 1] == SLOT_NATIVE) {
+                /* `float(i)` and `int(x)` are one instruction each, so they are
+                 * emitted rather than called. They are what `spectral` and
+                 * `matrix_mul` have in their inner loops, and the whole body
+                 * was declined for want of them. Every other builtin still
+                 * declines: a call needs a result kind, and only these have one
+                 * that is known without running anything. */
+                if (argc != 1) { e->whyNot = "builtin arity"; return false; }
+                Value cv = e->stackSeen[e->depth - 2];
+                ObjNative *nat = IS_NATIVE(cv) ? AS_NATIVE(cv) : NULL;
+                const char *nm = nat != NULL && nat->name != NULL
+                                     ? nat->name->chars : "";
+                SlotKind ak = e->stack[e->depth - 1];
+                unsigned ar = pushReg(e) - 1;
+                bool toFloat = strcmp(nm, "float") == 0;
+                bool toInt   = strcmp(nm, "int") == 0;
+                if (toFloat && ak == SLOT_INT) {
+                    emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
+                    emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                } else if (toInt && ak == SLOT_FLOAT) {
+                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ar));
+                    emit(e, jaiA64FcvtzsXD(ar, JIT_FSCRATCH_A));
+                } else if (!((toFloat && ak == SLOT_FLOAT) ||
+                             (toInt && ak == SLOT_INT))) {
+                    e->whyNot = "a builtin with no known result kind";
+                    return false;
+                }
+                /* The result stays in the argument's register. Dropping the
+                 * callee entry, which holds none, leaves it on top. */
+                e->stack[e->depth - 2]      = toFloat ? SLOT_FLOAT : SLOT_INT;
+                e->stackShape[e->depth - 2] = 0;
+                e->stackClass[e->depth - 2] = NULL;
+                e->stackSeen[e->depth - 2]  = NULL_VAL;
+                e->stackLocal[e->depth - 2] = -1;
+                e->depth--;
                 off += 2;
                 break;
             }
@@ -3380,9 +3494,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             SlotKind kind = e.deopt[k].kinds[i];
             unsigned at = (unsigned)offsetof(JitDeoptRecord, stack) +
                           i * (unsigned)sizeof(Value);
-            if (kind == SLOT_CLASS || kind == SLOT_SELF) {
+            if (kind == SLOT_CLASS || kind == SLOT_SELF ||
+                kind == SLOT_FUNC || kind == SLOT_NATIVE) {
                 /* Neither holds a register; both are compile-time constants. */
-                uintptr_t p = kind == SLOT_CLASS
+                uintptr_t p = kind != SLOT_SELF
                                   ? (uintptr_t)e.deopt[k].classes[i]
                                   : (uintptr_t)closure;
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
@@ -3908,8 +4023,9 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             SlotKind kind = e.deopt[k].kinds[i];
             unsigned at = (unsigned)offsetof(JitDeoptRecord, stack) +
                           i * (unsigned)sizeof(Value);
-            if (kind == SLOT_CLASS || kind == SLOT_SELF) {
-                uintptr_t pv = kind == SLOT_CLASS
+            if (kind == SLOT_CLASS || kind == SLOT_SELF ||
+                kind == SLOT_FUNC || kind == SLOT_NATIVE) {
+                uintptr_t pv = kind != SLOT_SELF
                                    ? (uintptr_t)e.deopt[k].classes[i]
                                    : (uintptr_t)closure;
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
