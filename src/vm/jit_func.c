@@ -2476,6 +2476,64 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned ridx = e->depth - argc - 1;
             SlotKind rk = e->stack[ridx];
 
+            if (rk == SLOT_LIST && argc == 1 &&
+                nameIdx < (uint32_t)fn->chunk.constants.count &&
+                IS_STRING(fn->chunk.constants.data[nameIdx]) &&
+                strcmp(AS_STRING(fn->chunk.constants.data[nameIdx])->chars,
+                       "push") == 0) {
+                /* Appending to a list is a bounds check and two stores, and
+                 * going through a descriptor and a native for it costs far
+                 * more than the work. `list_ops` pushes a million elements and
+                 * spent all of it on the call. Growing is left to the
+                 * interpreter: a full list deopts to this instruction, which
+                 * has written nothing yet. */
+                SlotKind vk = e->stack[e->depth - 1];
+                unsigned vtag = vk == SLOT_INT   ? VAL_INT
+                              : vk == SLOT_FLOAT ? VAL_FLOAT
+                              : vk == SLOT_BOOL  ? VAL_BOOL
+                              : (vk == SLOT_INST || vk == SLOT_LIST ||
+                                 vk == SLOT_OBJ)  ? VAL_OBJ
+                                                  : 0xffffffffu;
+                if (vtag == 0xffffffffu) {
+                    e->whyNot = "pushing a kind the tier cannot store";
+                    return false;
+                }
+                unsigned rVal  = pushReg(e) - 1;
+                unsigned rList = pushReg(e) - 2;
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                                   (unsigned)offsetof(ObjList, count)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, rList,
+                                   (unsigned)offsetof(ObjList, capacity)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_GE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
+                                   (unsigned)offsetof(ObjList, items)));
+                emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_SCRATCH_A, 4));
+                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                   JIT_SCRATCH_D));
+                emit(e, jaiA64MovzX(JIT_SCRATCH_D, vtag, 0));
+                emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+                emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                                   (unsigned)offsetof(ObjList, count)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                                   (unsigned)offsetof(ObjList, version)));
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+                emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                                   (unsigned)offsetof(ObjList, version)));
+                e->wroteHeap = true;
+
+                /* push returns the list, which is the receiver entry already
+                 * sitting under the argument. */
+                unsigned drop;
+                if (!popValue(e, &drop, NULL)) return false;
+                off += 7;
+                break;
+            }
+
             if (rk == SLOT_INST) {
                 /* A method whose whole body is one arithmetic expression over
                  * its receiver and arguments is worth putting inline: the call
