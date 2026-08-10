@@ -233,6 +233,8 @@ struct ObjFunction {
     void       *jitCode;
     /* Which calling convention `jitCode` uses; see jit.c. */
     uint8_t     jitKind;
+    /* Sampling ticks that landed in this function, saturating once hot. */
+    uint16_t    tickCount;
     /* Code offsets of the default-value thunks, indexed from arity-defaultCount. */
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */

@@ -2,8 +2,11 @@
 
 #include "vm.h"
 
+#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/mman.h>
 
 #if defined(__APPLE__)
@@ -177,4 +180,55 @@ bool jaiCodeArenaSeal(JaiCodeArena *arena) {
 void jaiCodeArenaFree(JaiCodeArena *arena) {
     if (arena->code != NULL) munmap(arena->code, arena->capacity);
     memset(arena, 0, sizeof *arena);
+}
+
+/* ------------------------------------------------------------------ */
+/* Sampling                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Set by the timer, read by the interpreter's safepoint. `2` rather than `1`
+ * so the existing `sInterrupted` test fires without a new branch: 1 stays
+ * Ctrl-C and throws, 2 is a tick. */
+extern volatile sig_atomic_t jaiInterrupted;
+
+static void onTick(int signum) {
+    (void)signum;
+    /* Nothing but the flag. A signal handler that touched VM state or
+     * allocated would be a reentrancy bug that reproduces once a month. */
+    if (jaiInterrupted == 0) jaiInterrupted = 2;
+}
+
+void jaiJitStartSampling(void) {
+    static bool started;
+    if (started || !jaiJitEnabled()) return;
+    started = true;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = onTick;
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGPROF, &sa, NULL) != 0) return;
+
+    /* ITIMER_PROF counts CPU time, so a process blocked on IO is not sampled --
+     * which is right, since it has no hot loop to find. */
+    struct itimerval it;
+    it.it_interval.tv_sec = 0;
+    it.it_interval.tv_usec = 1000;   /* 1kHz */
+    it.it_value = it.it_interval;
+    (void)setitimer(ITIMER_PROF, &it, NULL);
+}
+
+/* Ticks seen in one function. A loop that is hot collects them; a function that
+ * merely runs once does not. */
+#define JAI_JIT_HOT_TICKS 20
+
+void jaiJitSample(ObjClosure *closure, uint32_t offset) {
+    ObjFunction *fn = closure->fn;
+    if (fn->tickCount < JAI_JIT_HOT_TICKS) {
+        fn->tickCount++;
+        if (fn->tickCount == JAI_JIT_HOT_TICKS && getenv("JAI_JIT_TRACE")) {
+            fprintf(stderr, "[jit] hot: %s at offset %u\n",
+                    fn->name ? fn->name->chars : "<anon>", offset);
+        }
+    }
 }

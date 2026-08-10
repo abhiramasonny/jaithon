@@ -22,6 +22,7 @@
 #include "runtime.h"
 #include "boot/seed.h"
 #include "frontend.h"
+#include "../vm/jit.h"
 #include "methods.h"
 
 #include "../common/diag.h"
@@ -846,6 +847,7 @@ static bool runModuleBody(ObjModule *module, ObjFunction *body) {
 }
 
 ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
+    jaiJitStartSampling();
     if (vm.builtins == NULL) JAI_PANIC("jaiImportModule before jaiVMInit");
     ensurePathReady();
 
