@@ -419,7 +419,6 @@ typedef struct {
     bool      dynamicLocal[JIT_MAX_SLOTS + 1];
     bool      needDynamic[JIT_MAX_SLOTS + 1];   /* found during this attempt */
     bool      pendingRange;
-    bool      genericIter;
     bool      rangeInclusive;
     unsigned  iterSlot;
     uint32_t  iterExit;
@@ -2437,12 +2436,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 unsigned rdrop;
                 if (!popValue(e, &rdrop, NULL)) return false;
-                if (!pushValue3(e, SLOT_ITER, 0, NULL, sample, -1)) return false;
+                /* Shape 1 marks an iterator the runtime has to step; a
+                 * range is 0 and gets the inline path. It rides on the stack
+                 * entry rather than on the Emit because a function can build
+                 * both -- nbody's `advance` runs two range loops and then a
+                 * list loop, and one flag for the whole compile made the path
+                 * a FOR_ITER_BIND took depend on what came before it. */
+                if (!pushValue3(e, SLOT_ITER, 1, NULL, sample, -1)) return false;
                 emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                    e->descOffset +
                                        (unsigned)offsetof(JitCallDesc, result) + 8));
                 e->wroteHeap = true;
-                e->genericIter = true;
                 off += 1;
                 break;
             }
@@ -2481,7 +2485,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!localInRange(e, fslot)) return false;
                 unsigned rIt = pushReg(e) - 1;
 
-                if (e->genericIter) {
+                if (e->stackShape[e->depth - 1] != 0) {
                     /* A list iterator: ask the runtime for each element and
                      * take the kind from the one it is holding now. */
                     Value sample = e->stackSeen[e->depth - 1];
