@@ -83,7 +83,7 @@ pub fn flags_for(release: bool, opt_level: int) -> int {
     if level < 0 { level = 0 }
     if level > 3 { level = 3 }
     let base = if release { FLAG_RELEASE } else { FLAG_DEBUG }
-    return base | ((level << FLAG_OPT_SHIFT) & FLAG_OPT_MASK)
+    return base | level << FLAG_OPT_SHIFT & FLAG_OPT_MASK
 }
 
 #: The `nameIndex` that means "this record has no name".
