@@ -272,6 +272,11 @@ uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xca000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+/* ldrb w<rd>, [x<rn>, #imm12] -- one unsigned byte, zero-extended. */
+uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset) {
+    return 0x39400000u | ((offset & 0xfffu) << 10) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x8a000000u | (rm << 16) | (rn << 5) | rd;
 }

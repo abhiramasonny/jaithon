@@ -82,6 +82,9 @@ ObjString *jaiStringTake(char *chars, size_t length);
 ObjString *jaiStringConcat(ObjString *a, ObjString *b);
 /* The shared one-byte ASCII string. NULL for c >= 128. */
 ObjString *jaiStringChar(unsigned char c);
+/* The 128 one-byte strings, addressable as an array so compiled code can index
+ * it directly. An entry is NULL until first asked for. */
+ObjString **jaiAsciiCharTable(void);
 void       jaiMarkAsciiChars(void);
 /* Concatenates `count` byte runs into one string, sized exactly, under the
  * same run-time interning policy jaiStringNew applies. The runs must stay

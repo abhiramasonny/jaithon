@@ -59,9 +59,6 @@ JAI_INLINE JAI_UNUSED bool keyIsUsable(Value key) {
 static void clearEntries(JaiEntry *entries, int capacity) {
     for (int i = 0; i < capacity; i++) {
         entries[i].key = NULL_VAL;
-        entries[i].value = NULL_VAL;
-        entries[i].hash = 0;
-        entries[i].order = -1;
     }
 }
 
@@ -105,7 +102,7 @@ static int capacityFor(int64_t liveEntries) {
 static JaiEntry *findEmptySlot(JaiEntry *entries, int capacity, uint64_t hash) {
     uint32_t mask = (uint32_t)capacity - 1;
     uint32_t index = (uint32_t)(hash & (uint64_t)mask);
-    while (!entryIsEmpty(&entries[index])) index = (index + 1) & mask;
+    while (!IS_NULL(entries[index].key)) index = (index + 1) & mask;
     return &entries[index];
 }
 
@@ -123,7 +120,6 @@ static void adjustCapacity(JaiTable *t, int capacity) {
         int32_t slot = t->order[i];
         if (slot < 0) continue;
         JaiEntry *src = &t->entries[slot];
-        if (!entryIsLive(src)) continue;   /* tombstones die here */
         JaiEntry *dest = findEmptySlot(entries, capacity, src->hash);
         dest->key = src->key;
         dest->value = src->value;
@@ -160,7 +156,8 @@ static void adjustCapacity(JaiTable *t, int capacity) {
  * free after a rehash, so the O(capacity) walk is still amortised to O(1). */
 static void ensureRoom(JaiTable *t, Value key, Value value) {
     int64_t used = (int64_t)t->count + t->tombstones + 1;
-    if (used * TABLE_LOAD_DEN <= (int64_t)t->capacity * TABLE_LOAD_NUM) return;
+    int64_t limit = t->capacity - t->capacity / TABLE_LOAD_DEN;
+    if (used <= limit) return;
 
     int capacity = t->capacity;
     if ((int64_t)(t->count + 1) * 2 > (int64_t)capacity) {
@@ -182,8 +179,53 @@ static bool keyMatches(const JaiEntry *e, Value key, uint64_t hash) {
     /* Identity first: it never calls user code, and it settles the interned
      * string and primitive cases that dominate. Only then the general path,
      * which may run __eq__. */
-    if (jaiValuesIdentical(e->key, key)) return true;
-    return jaiValuesEqual(e->key, key);
+    Value stored = e->key;
+    if (jaiValueType(stored) == jaiValueType(key)) {
+        switch (jaiValueType(key)) {
+            case VAL_NULL: return true;
+            case VAL_BOOL: return AS_BOOL(stored) == AS_BOOL(key);
+            case VAL_INT:  return AS_INT(stored) == AS_INT(key);
+            case VAL_OBJ: {
+                Obj *a = AS_OBJ(stored);
+                Obj *b = AS_OBJ(key);
+                if (a == b) return true;
+                /* Strings dominate user dictionaries. Settle them here from
+                 * their headers instead of entering the recursive, user-code-
+                 * aware general equality dispatcher. */
+                if (a->type == OBJ_STRING && b->type == OBJ_STRING) {
+                    return jaiStringEquals((ObjString *)a, (ObjString *)b);
+                }
+                break;
+            }
+            /* Bit identity matters for NaNs and signed zero, so leave this
+             * uncommon identity case to the canonical implementation. Normal
+             * float equality still stays entirely on this fast path. */
+            case VAL_FLOAT:
+                return AS_FLOAT(stored) == AS_FLOAT(key) ||
+                       jaiValuesIdentical(stored, key);
+        }
+    }
+    return jaiValuesEqual(stored, key);
+}
+
+/* Lookup-only probing. Unlike findEntry this need not remember the first
+ * tombstone, removing a dependency and branch from every successful get and
+ * from the overwhelmingly common miss that reaches a never-used slot. */
+static JaiEntry *findExisting(JaiEntry *entries, int capacity,
+                              Value key, uint64_t hash) {
+    uint32_t mask = (uint32_t)capacity - 1;
+    uint32_t index = (uint32_t)(hash & (uint64_t)mask);
+
+    for (;;) {
+        JaiEntry *e = &entries[index];
+        Value stored = e->key;
+        if (IS_NULL(stored)) return NULL;
+        if (!(IS_OBJ(stored) && AS_OBJ(stored) == NULL) &&
+            keyMatches(e, key, hash)) {
+            return e;
+        }
+        index = (index + 1) & mask;
+    }
 }
 
 /* Returns the entry holding `key`, or the slot it should be inserted into —
@@ -196,8 +238,9 @@ static JaiEntry *findEntry(JaiEntry *entries, int capacity, Value key, uint64_t 
 
     for (;;) {
         JaiEntry *e = &entries[index];
-        if (entryIsEmpty(e)) return tombstone != NULL ? tombstone : e;
-        if (entryIsTombstone(e)) {
+        Value stored = e->key;
+        if (IS_NULL(stored)) return tombstone != NULL ? tombstone : e;
+        if (IS_OBJ(stored) && AS_OBJ(stored) == NULL) {
             if (tombstone == NULL) tombstone = e;
         } else if (keyMatches(e, key, hash)) {
             return e;
@@ -216,12 +259,26 @@ static JaiEntry *findEntryInterned(JaiEntry *entries, int capacity, ObjString *k
 
     for (;;) {
         JaiEntry *e = &entries[index];
-        if (entryIsEmpty(e)) return tombstone != NULL ? tombstone : e;
-        if (entryIsTombstone(e)) {
+        if (IS_NULL(e->key)) return tombstone != NULL ? tombstone : e;
+        Obj *stored = AS_OBJ(e->key);
+        if (stored == NULL) {
             if (tombstone == NULL) tombstone = e;
-        } else if (IS_OBJ(e->key) && AS_OBJ(e->key) == (Obj *)key) {
+        } else if (stored == (Obj *)key) {
             return e;
         }
+        index = (index + 1) & mask;
+    }
+}
+
+static JaiEntry *findExistingInterned(JaiEntry *entries, int capacity,
+                                      ObjString *key) {
+    uint32_t mask = (uint32_t)capacity - 1;
+    uint32_t index = (uint32_t)(key->hash & (uint64_t)mask);
+
+    for (;;) {
+        JaiEntry *e = &entries[index];
+        if (IS_NULL(e->key)) return NULL;
+        if (AS_OBJ(e->key) == (Obj *)key) return e;
         index = (index + 1) & mask;
     }
 }
@@ -231,9 +288,12 @@ static JaiEntry *findEntryInterned(JaiEntry *entries, int capacity, ObjString *k
 /* ------------------------------------------------------------------ */
 
 static bool insertAt(JaiTable *t, JaiEntry *e, Value key, uint64_t hash, Value value) {
-    bool isNew = !entryIsLive(e);
+    Value oldKey = e->key;
+    bool wasEmpty = IS_NULL(oldKey);
+    bool wasTombstone = IS_OBJ(oldKey) && AS_OBJ(oldKey) == NULL;
+    bool isNew = wasEmpty || wasTombstone;
     if (isNew) {
-        if (entryIsTombstone(e)) t->tombstones--;
+        if (wasTombstone) t->tombstones--;
         t->count++;
         e->key = key;
         e->hash = hash;
@@ -263,6 +323,17 @@ static void removeEntry(JaiTable *t, JaiEntry *e) {
  * jaiTableSet and by jaiTableAddAll, which must not re-hash (that could
  * re-enter a user __hash__). */
 static bool tableSetHashed(JaiTable *t, Value key, uint64_t hash, Value value) {
+    /* At the resize boundary, first check whether this is only an update. A
+     * full-table rehash for an assignment that consumes no slot is both wasted
+     * work and a particularly nasty latency spike. New inserts still take the
+     * original one-probe path until the boundary is reached. */
+    int64_t used = (int64_t)t->count + t->tombstones + 1;
+    int64_t limit = t->capacity - t->capacity / TABLE_LOAD_DEN;
+    if (used > limit &&
+        t->count != 0) {
+        JaiEntry *existing = findExisting(t->entries, t->capacity, key, hash);
+        if (existing != NULL) return insertAt(t, existing, key, hash, value);
+    }
     ensureRoom(t, key, value);
     return insertAt(t, findEntry(t->entries, t->capacity, key, hash), key, hash, value);
 }
@@ -302,8 +373,8 @@ bool jaiTableGet(JaiTable *t, Value key, Value *out) {
     if (!ok) return false;
     if (t->count == 0) return false;
 
-    JaiEntry *e = findEntry(t->entries, t->capacity, key, hash);
-    if (!entryIsLive(e)) return false;
+    JaiEntry *e = findExisting(t->entries, t->capacity, key, hash);
+    if (e == NULL) return false;
     if (out != NULL) *out = e->value;
     return true;
 }
@@ -323,12 +394,12 @@ bool jaiTableSetHashed(JaiTable *t, Value key, uint64_t hash, Value value) {
 
 bool jaiTableDelete(JaiTable *t, Value key) {
     bool ok = true;
-    uint64_t hash = jaiValueHash(key, &ok);
+    uint64_t hash = jaiValueHashFast(key, &ok);
     if (!ok) return false;
     if (t->count == 0) return false;
 
-    JaiEntry *e = findEntry(t->entries, t->capacity, key, hash);
-    if (!entryIsLive(e)) return false;
+    JaiEntry *e = findExisting(t->entries, t->capacity, key, hash);
+    if (e == NULL) return false;
     removeEntry(t, e);
     return true;
 }
@@ -347,6 +418,10 @@ void jaiTableAddAll(const JaiTable *from, JaiTable *to) {
     /* Size the destination once so the copy loop does not allocate. */
     int needed = capacityFor((int64_t)to->count + from->count);
     if (needed > to->capacity) adjustCapacity(to, needed);
+    else if ((int64_t)to->count + from->count + to->tombstones >
+             to->capacity - to->capacity / TABLE_LOAD_DEN) {
+        adjustCapacity(to, to->capacity);
+    }
 
     /* In the source's insertion order, so a merged dict reads as the two
      * written end to end. */
@@ -355,7 +430,8 @@ void jaiTableAddAll(const JaiTable *from, JaiTable *to) {
         if (slot < 0) continue;
         const JaiEntry *e = &from->entries[slot];
         if (!entryIsLive(e)) continue;
-        tableSetHashed(to, e->key, e->hash, e->value);
+        insertAt(to, findEntry(to->entries, to->capacity, e->key, e->hash),
+                 e->key, e->hash, e->value);
     }
 }
 
@@ -363,8 +439,8 @@ bool jaiTableGetInterned(JaiTable *t, ObjString *key, Value *out) {
     JAI_ASSERT(key != NULL, "interned key must not be NULL");
     if (t->count == 0) return false;
 
-    JaiEntry *e = findEntryInterned(t->entries, t->capacity, key);
-    if (!entryIsLive(e)) return false;
+    JaiEntry *e = findExistingInterned(t->entries, t->capacity, key);
+    if (e == NULL) return false;
     if (out != NULL) *out = e->value;
     return true;
 }
@@ -372,6 +448,13 @@ bool jaiTableGetInterned(JaiTable *t, ObjString *key, Value *out) {
 bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
     JAI_ASSERT(key != NULL, "interned key must not be NULL");
     Value k = OBJ_VAL(key);
+    int64_t used = (int64_t)t->count + t->tombstones + 1;
+    int64_t limit = t->capacity - t->capacity / TABLE_LOAD_DEN;
+    if (used > limit &&
+        t->count != 0) {
+        JaiEntry *existing = findExistingInterned(t->entries, t->capacity, key);
+        if (existing != NULL) return insertAt(t, existing, k, key->hash, value);
+    }
     ensureRoom(t, k, value);
     JaiEntry *e = findEntryInterned(t->entries, t->capacity, key);
     return insertAt(t, e, k, key->hash, value);
@@ -379,12 +462,12 @@ bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
 
 int jaiTableFindIndex(JaiTable *t, Value key) {
     bool ok = true;
-    uint64_t hash = jaiValueHash(key, &ok);
+    uint64_t hash = jaiValueHashFast(key, &ok);
     if (!ok) return -1;
     if (t->count == 0) return -1;
 
-    JaiEntry *e = findEntry(t->entries, t->capacity, key, hash);
-    if (!entryIsLive(e)) return -1;
+    JaiEntry *e = findExisting(t->entries, t->capacity, key, hash);
+    if (e == NULL) return -1;
     /* Stable until the next mutation, which the caller detects via version. */
     return (int)(e - t->entries);
 }
@@ -399,7 +482,6 @@ bool jaiTableNext(const JaiTable *t, int *i, Value *outKey, Value *outValue) {
         int32_t slot = t->order[index];
         if (slot < 0) continue;
         const JaiEntry *e = &t->entries[slot];
-        if (!entryIsLive(e)) continue;
         if (outKey != NULL) *outKey = e->key;
         if (outValue != NULL) *outValue = e->value;
         *i = index + 1;
