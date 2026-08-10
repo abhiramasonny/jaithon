@@ -148,6 +148,44 @@ typedef int (*JaiCompiledLoop)(Value *slots, int64_t limit);
 
 /* x1 holds the accumulator and x2 the counter for the whole loop. That
  * residency, not the removal of dispatch, is where the win is. */
+
+/* The multiply-shift reciprocal for a constant divisor (Hacker's Delight 10-4).
+ *
+ * sdiv is not fully pipelined on this core: its throughput, not its latency,
+ * is what puts loop_sum at 4.4 cycles an iteration against C++'s 2.2, and C++
+ * gets there with exactly this reciprocal. An earlier attempt at it measured
+ * SLOWER and was reverted -- but that was best-of-3 timing, and loop_sum turns
+ * out to swing 59-71ms run to run, so the earlier number said nothing.
+ *
+ * The quotient sequence is verified against exact integer arithmetic over 1380
+ * divisor/value pairs including INT64_MIN and INT64_MAX before it was written
+ * here, because a reciprocal that is wrong for one input in 2^64 is a bug
+ * nothing would ever reproduce. */
+static bool magicDivide(int64_t d, int64_t *magic, unsigned *shift) {
+    if (d < 2) return false;          /* 0, 1 and negatives keep sdiv */
+
+    const uint64_t two63 = (uint64_t)1 << 63;
+    uint64_t ad = (uint64_t)d;
+    uint64_t anc = two63 - 1 - two63 % ad;
+    unsigned p = 63;
+    uint64_t q1 = two63 / anc, r1 = two63 % anc;
+    uint64_t q2 = two63 / ad,  r2 = two63 % ad;
+    uint64_t delta;
+
+    do {
+        p++;
+        q1 *= 2; r1 *= 2;
+        if (r1 >= anc) { q1++; r1 -= anc; }
+        q2 *= 2; r2 *= 2;
+        if (r2 >= ad) { q2++; r2 -= ad; }
+        delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+
+    *magic = (int64_t)(q2 + 1);
+    *shift = p - 64;
+    return true;
+}
+
 static void *compileLoop(const LoopShape *shape) {
     JaiCodeArena *arena = jaiJitArena();
     /* Unseal rather than decline: the function tier shares this arena and
@@ -158,7 +196,7 @@ static void *compileLoop(const LoopShape *shape) {
     unsigned accInt = shape->accSlot * 16 + 8, accTag = shape->accSlot * 16;
     unsigned iInt   = shape->iSlot * 16 + 8,   iTag   = shape->iSlot * 16;
 
-    uint32_t w[64];
+    uint32_t w[96];
     int n = 0;
 
     /* x1 arrives holding the limit and is about to be reused for the
@@ -180,10 +218,25 @@ static void *compileLoop(const LoopShape *shape) {
     w[n++] = jaiA64LdrX(1, 0, accInt);
     n = emitConst(w, n, 4, (uint64_t)shape->divisor);
 
+    int64_t  magic = 0;
+    unsigned magicShift = 0;
+    bool useMagic = magicDivide(shape->divisor, &magic, &magicShift);
+    if (useMagic) n = emitConst(w, n, 7, (uint64_t)magic);
+
     int top = n;
     w[n++] = jaiA64SubsX(31, 2, 3);        /* cmp i, limit */
     int toDone = n++;
-    w[n++] = jaiA64SdivX(5, 2, 4);
+    if (useMagic) {
+        /* q = i * M >> 64, corrected for a magic that came out negative, then
+         * shifted and rounded toward zero by adding back its own sign bit. */
+        w[n++] = jaiA64SmulhX(5, 2, 7);
+        if (magic < 0) w[n++] = jaiA64AddX(5, 5, 2);
+        if (magicShift != 0) w[n++] = jaiA64AsrX(5, 5, magicShift);
+        w[n++] = jaiA64LsrX(6, 5, 63);
+        w[n++] = jaiA64AddX(5, 5, 6);
+    } else {
+        w[n++] = jaiA64SdivX(5, 2, 4);
+    }
     w[n++] = jaiA64MsubX(5, 5, 4, 2);      /* x5 = i % d */
     w[n++] = jaiA64AddsX(6, 1, 5);
     int toBailWrite = n++;
@@ -216,6 +269,10 @@ static void *compileLoop(const LoopShape *shape) {
 
     uint8_t *entry = jaiCodeArenaWrite(arena, w, (size_t)n * sizeof w[0]);
     if (entry == NULL) return NULL;
+    if (getenv("JAI_JIT_TRACE")) {
+        fprintf(stderr, "[jit] loop entry %p (mod 64 = %u)\n", (void *)entry,
+                (unsigned)((uintptr_t)entry & 63u));
+    }
     if (!jaiCodeArenaSeal(arena)) return NULL;
     return entry;
 }
