@@ -3316,12 +3316,21 @@ static bool seedLocals(Emit *e, Value *slotBase) {
             e->localKind[i] = SLOT_LIST;
         } else if (IS_OBJ(v)) {
             e->localKind[i] = SLOT_OBJ;
+        } else if (IS_BOOL(v)) {
+            e->localKind[i] = SLOT_BOOL;
+        } else if (IS_NULL(v)) {
+            /* A null argument -- a defaulted parameter, mostly. Nothing can be
+             * done with it, but a body that never reads it compiles, and the
+             * entry guard needs no check because an opaque slot is never read.
+             * Refusing outright stopped every stdlib function with a defaulted
+             * parameter, which is most of them. */
+            e->localKind[i] = SLOT_OPAQUE;
         } else if (i == 0) {
             /* A plain function's slot 0 is the closure being called. Nothing
              * can be done with it, but the body has no reason to read it. */
             e->localKind[i] = SLOT_OPAQUE;
         } else {
-            e->whyNot = "a parameter is not an int, a float or an instance";
+            e->whyNot = "a parameter of a kind the tier has no register for";
             return false;
         }
         e->localTyped[i] = true;
