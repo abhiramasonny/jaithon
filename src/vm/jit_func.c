@@ -97,8 +97,8 @@ static uintptr_t stackLimit(void) {
  * local and every live stack entry, so a body with a dozen guards spends more
  * on its cold paths than on its hot one. `merge` needed 512 and did not say
  * so, which is what the diagnostics were for. */
-#define JIT_MAX_INSTS 4096u
-#define JIT_MAX_FIXUPS 2048u
+#define JIT_MAX_INSTS 20000u
+#define JIT_MAX_FIXUPS 6000u
 #define JIT_SCRATCH_A    9u
 #define JIT_SCRATCH_B   10u
 #define JIT_SCRATCH_C   11u
@@ -288,6 +288,7 @@ typedef enum {
                    * iterator on the stack is always current. */
     SLOT_BOOL,    /* 0 or 1 in a register; a Value's boolean member is its low
                    * byte, so the same word serves both */
+    SLOT_NULL,    /* a function with no value to return; never in a register */
     SLOT_OBJ,     /* some heap object, raw, of a type this tier does not model.
                    * It can be read, passed, stored and rooted -- nothing else.
                    * A closure held in a variable is the common case. */
@@ -315,7 +316,7 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
 #define FIXUP_EXIT   (UINT32_MAX - 100u) /* minus the loop-exit index */
 
-#define JIT_MAX_DEOPT 64
+#define JIT_MAX_DEOPT 160
 
 typedef struct {
     int      instIndex;    /* which emitted instruction to patch */
@@ -404,6 +405,13 @@ typedef struct {
      * The compile is retried with this set when that is what went wrong. */
     bool      noInline;
     bool      inlined;
+    /* A local whose kind is not the same on every path into some point. It
+     * lives in the frame with its tag and every read of it guards, which is
+     * what lets two paths disagree. The compiler reuses one slot for the
+     * induction variables of loops that do not overlap, so this is not exotic:
+     * it is nbody's advance. */
+    bool      dynamicLocal[JIT_MAX_SLOTS + 1];
+    bool      needDynamic[JIT_MAX_SLOTS + 1];   /* found during this attempt */
     bool      pendingRange;
     bool      genericIter;
     bool      rangeInclusive;
@@ -491,8 +499,21 @@ static unsigned localReg(const Emit *e, unsigned slot) {
     return JIT_FIRST_SAVED + (slot - e->base);
 }
 
+/* Sixteen bytes each, not eight: the tag travels with the value so a local
+ * whose kind varies can be read behind a guard. */
 static unsigned localFrameOff(const Emit *e, unsigned slot) {
-    return e->localsFrameOffset + (slot - e->base) * 8u;
+    return e->localsFrameOffset + (slot - e->base) * 16u;
+}
+
+static void branchOnDeopt(Emit *e, unsigned cond);
+
+static unsigned localTagFor(const Emit *e, unsigned slot) {
+    SlotKind k = e->localKind[slot];
+    return k == SLOT_INT    ? VAL_INT
+         : k == SLOT_FLOAT  ? VAL_FLOAT
+         : k == SLOT_BOOL   ? VAL_BOOL
+         : k == SLOT_OPAQUE ? VAL_NULL
+                            : VAL_OBJ;
 }
 
 /* A register holding `slot`'s value. In register mode that is the local's own
@@ -506,7 +527,15 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         return scratch;
     }
     if (!e->spilled) return localReg(e, slot);
-    emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot)));
+    if (e->dynamicLocal[slot]) {
+        /* Two paths reached here disagreeing about this slot, so what it holds
+         * is a runtime fact: check it against what this read was compiled for
+         * and hand the instruction back otherwise. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, localFrameOff(e, slot)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, localTagFor(e, slot)));
+        branchOnDeopt(e, JAI_A64_NE);
+    }
+    emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
     return scratch;
 }
 
@@ -545,7 +574,9 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
         if (src != localReg(e, slot)) emit(e, jaiA64MovX(localReg(e, slot), src));
         return;
     }
-    emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot)));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_D, localTagFor(e, slot), 0));
+    emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
+    emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot) + 8));
 }
 
 /* Slots the body may name at all. */
@@ -1922,10 +1953,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_RETURN_NULL: {
-            /* Only an initializer, which yields the object it initialised --
-             * that is what makes `Point(1, 2)` an expression. A plain function
-             * returning null has no int64 to hand back. */
-            if ((fn->flags & FN_INIT) == 0) return false;
+            if ((fn->flags & FN_INIT) == 0) {
+                /* A function with nothing to return. No register carries the
+                 * answer; the entry point builds a null from the kind alone. */
+                if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
+                e->sawReturn  = true;
+                e->returnKind = SLOT_NULL;
+                emit(e, jaiA64MovzX(0, 0, 0));
+                emitEpilogue(e, 0);
+                off += 1;
+                break;
+            }
+            /* An initializer yields the object it initialised, which is what
+             * makes `Point(1, 2)` an expression. */
             if (!localInRange(e, 0) || e->localKind[0] != SLOT_INST) return false;
             e->usesSlot0 = true;
             if (e->sawReturn && e->returnKind != SLOT_INST) return false;
@@ -2782,7 +2822,20 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
         e->localTyped[slot] = true;
         return true;
     }
-    return e->localKind[slot] == kind && e->localShape[slot] == shape;
+    if (e->localKind[slot] == kind && e->localShape[slot] == shape) return true;
+
+    /* Two kinds for one slot. Rather than give the function up, note that this
+     * slot has to carry its tag and let the caller compile again with that
+     * decided from the start -- every read of it then guards, so the two
+     * kinds stop being a contradiction. */
+    if (!e->dynamicLocal[slot]) {
+        e->needDynamic[slot] = true;
+        return false;
+    }
+    e->localKind[slot]  = kind;
+    e->localShape[slot] = shape;
+    e->localClass[slot] = klass;
+    return true;
 }
 
 static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
@@ -2818,9 +2871,33 @@ static bool eligible(ObjFunction *fn) {
     return true;
 }
 
+static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
+                            const bool *dynamic, bool *needDynamic);
+
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (!eligible(fn)) return false;
+
+    /* Up to a few attempts: each one may discover another slot that two paths
+     * disagree about, and the next begins knowing it. */
+    bool dynamic[JIT_MAX_SLOTS + 1];
+    bool need[JIT_MAX_SLOTS + 1];
+    memset(dynamic, 0, sizeof dynamic);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        memset(need, 0, sizeof need);
+        if (compileFuncOnce(closure, slotBase, dynamic, need)) return true;
+        bool grew = false;
+        for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+            if (need[i] && !dynamic[i]) { dynamic[i] = true; grew = true; }
+        }
+        if (!grew) return false;
+    }
+    return false;
+}
+
+static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
+                            const bool *dynamic, bool *needDynamic) {
+    ObjFunction *fn = closure->fn;
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] considering %s\n",
@@ -2840,6 +2917,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * anything. */
     static Emit e;
     memset(&e, 0, sizeof e);
+    memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
     e.arity        = fn->arity;
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
@@ -2852,6 +2930,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * afterwards, with every instruction index shifted by the same amount. */
     static Emit body;
     memset(&body, 0, sizeof body);
+    memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
     body.arity        = fn->arity;
     /* The measuring pass runs with slot 0 available, purely to find out
      * whether the body reads it; the real pass then drops it if not. */
@@ -2880,6 +2959,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     body.frameBytes = 16 + 8 * JIT_MAX_SAVED + 8;   /* 16-aligned below */
     body.frameBytes = (body.frameBytes + 15u) & ~15u;
     if (!compileBody(&body, closure)) {
+        memcpy(needDynamic, body.needDynamic, sizeof body.needDynamic);
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
                     fn->name ? fn->name->chars : "<anon>",
@@ -2911,6 +2991,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 
     unsigned extra = e.usesUpvalues ? 1u : 0u;
     unsigned saved = e.locals + extra + body.maxValue;
+    for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+        /* A tag only has somewhere to live in the frame. */
+        if (e.dynamicLocal[i]) { saved = JIT_MAX_SAVED + 1; break; }
+    }
     if (saved > JIT_MAX_SAVED) {
         /* Too many to keep in registers, so the locals go to the frame and the
          * operand stack keeps the registers. Only the operand stack has to fit
@@ -2937,8 +3021,8 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     unsigned frame = 16u + 8u * saved;
     if (e.spilled) {
         e.localsFrameOffset = frame;
-        frame += 8u * e.locals;
-        frame = (frame + 7u) & ~7u;
+        frame += 16u * e.locals;
+        frame = (frame + 15u) & ~15u;
     }
     if (e.callsOut) {
         e.descOffset = frame;
@@ -3048,8 +3132,12 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
             } else if (e.spilled) {
+                /* Tag included: for a dynamic local the compile-time kind is
+                 * not what it holds. */
+                emit(&e, jaiA64LdrW(JIT_SCRATCH_C, 31, localFrameOff(&e, slot)));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_C, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64LdrX(JIT_SCRATCH_C, 31,
-                                    localFrameOff(&e, slot)));
+                                    localFrameOff(&e, slot) + 8));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, at + 8));
             } else {
                 emit(&e, jaiA64StrX(JIT_FIRST_SAVED + i, JIT_SCRATCH_A, at + 8));
@@ -3585,6 +3673,11 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         else {
             if (f->targetOffset > (uint32_t)fn->chunk.count) { jitFree(map, depths, fn->chunk.count + 1); return false; }
             target = map[f->targetOffset];
+            if (target < 0 && getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] %s stopped: a branch to %u, which is "
+                                "not an instruction this compiled\n",
+                        fn->name ? fn->name->chars : "<anon>", f->targetOffset);
+            }
             if (target < 0 ||
                 (f->depth >= 0 && depths[f->targetOffset] != f->depth)) {
                 jitFree(map, depths, fn->chunk.count + 1);
@@ -3800,6 +3893,9 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         break;
     case SLOT_BOOL:
         slotBase[0] = BOOL_VAL(r.value != 0);
+        break;
+    case SLOT_NULL:
+        slotBase[0] = NULL_VAL;
         break;
     default:
         return JAI_JIT_DECLINED;
