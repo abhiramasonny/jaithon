@@ -84,6 +84,50 @@ static bool matchLoop(const Chunk *c, uint32_t at, LoopShape *out) {
     return true;
 }
 
+/* The same body behind a `for i in 0..n` head.
+ *
+ *     OP_FOR_ITER_BIND +jump, slot   5 bytes (i16 jump, u16 slot)
+ *     OP_GET_LOCAL2                  5
+ *     OP_MOD_INT_CONST               3
+ *     OP_ADD_BIND                    3
+ *     OP_LOOP                        3      = 19
+ *
+ * The body is byte-for-byte what the counted head already compiles, so this is
+ * a second entry guard rather than a second code generator. What differs is
+ * that the limit is a runtime property of the iterator, and that the iterator's
+ * position has to be written back. */
+static bool matchRangeLoop(const Chunk *c, uint32_t at, LoopShape *out) {
+    const uint8_t *p = c->code;
+    if (at + 19 > (uint32_t)c->count) return false;
+    if (p[at] != OP_FOR_ITER_BIND) return false;
+
+    int16_t jump = (int16_t)((uint16_t)p[at + 1] | ((uint16_t)p[at + 2] << 8));
+    out->iSlot = (unsigned)p[at + 3] | ((unsigned)p[at + 4] << 8);
+
+    uint32_t q = at + 5;
+    if (p[q] != OP_GET_LOCAL2) return false;
+    out->accSlot = (unsigned)p[q + 1] | ((unsigned)p[q + 2] << 8);
+    if (((unsigned)p[q + 3] | ((unsigned)p[q + 4] << 8)) != out->iSlot) return false;
+
+    q += 5;
+    if (p[q] != OP_MOD_INT_CONST) return false;
+    int16_t divisor = (int16_t)((uint16_t)p[q + 1] | ((uint16_t)p[q + 2] << 8));
+    if (divisor <= 0) return false;
+    out->divisor = divisor;
+
+    q += 3;
+    if (p[q] != OP_ADD_BIND) return false;
+    if (((unsigned)p[q + 1] | ((unsigned)p[q + 2] << 8)) != out->accSlot) return false;
+
+    q += 3;
+    if (p[q] != OP_LOOP) return false;
+    if (q + 3 != at + 19) return false;
+
+    out->limit = 0;   /* runtime: read from the iterator at entry */
+    out->exitOffset = (uint32_t)((int32_t)at + 5 + jump);
+    return true;
+}
+
 /* movz/movk, skipping halfwords that are already zero. */
 static int emitConst(uint32_t *w, int n, unsigned reg, uint64_t value) {
     w[n++] = jaiA64MovzX(reg, (unsigned)(value & 0xffff), 0);
@@ -177,19 +221,58 @@ bool jaiJitEnterLoop(ObjClosure *closure, uint32_t targetOffset) {
     ObjFunction *fn = closure->fn;
     if (fn->jitLoop == NULL) {
         LoopShape shape;
-        if (!matchLoop(&fn->chunk, targetOffset, &shape)) return false;
+        uint8_t kind = 0;
+        if (matchLoop(&fn->chunk, targetOffset, &shape)) {
+            kind = 0;
+        } else if (matchRangeLoop(&fn->chunk, targetOffset, &shape)) {
+            kind = 1;
+        } else {
+            return false;
+        }
         void *code = compileLoop(&shape);
         if (code == NULL) return false;
         fn->jitLoop = code;
         fn->jitLoopExit = shape.exitOffset;
         fn->jitLoopTop = targetOffset;
         fn->jitLoopLimit = shape.limit;
+        fn->jitLoopKind = kind;
     }
     if (fn->jitLoopTop != targetOffset) return false;
 
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
-    int status = ((JaiCompiledLoop)(uintptr_t)fn->jitLoop)(frame->slots,
-                                                          fn->jitLoopLimit);
+    int64_t limit = fn->jitLoopLimit;
+    ObjIter *iter = NULL;
+    unsigned iSlot = 0;
+
+    if (fn->jitLoopKind == 1) {
+        /* The iterator is what OP_FOR_ITER_BIND peeks. Everything about it is a
+         * runtime fact, so it is guarded here rather than at compile time: only
+         * a range from zero in unit steps makes the yielded value equal the
+         * index, which is what lets the counted body run unchanged. */
+        Value it = vm.stackTop[-1];
+        if (!IS_ITER(it)) return false;
+        iter = AS_ITER(it);
+        if (iter->kind != ITER_RANGE || !IS_RANGE(iter->source)) return false;
+        ObjRange *r = AS_RANGE(iter->source);
+        if (r->start != 0 || r->step != 1) return false;
+
+        limit = iter->limit;
+        iSlot = (unsigned)((fn->chunk.code[targetOffset + 3]) |
+                           (fn->chunk.code[targetOffset + 4] << 8));
+        /* The body reads the loop variable from its slot, so seed it. */
+        frame->slots[iSlot] = INT_VAL(iter->index);
+    }
+
+    int status = ((JaiCompiledLoop)(uintptr_t)fn->jitLoop)(frame->slots, limit);
+
+    if (iter != NULL) {
+        /* Ran to completion: the iterator is exhausted, and the slot it leaves
+         * holding `limit` is dead -- the `for` binding is loop-scoped, and a
+         * later loop reusing the slot binds it before reading.
+         * Bailed at i: that iteration never finished, so it must be yielded
+         * again. */
+        iter->index = (status == 0) ? limit : AS_INT(frame->slots[iSlot]);
+    }
 
     /* Both outcomes hand control back to the interpreter and only `ip` differs:
      * past the loop when it finished, at the loop's own top when it bailed,
