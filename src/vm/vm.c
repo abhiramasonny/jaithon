@@ -112,7 +112,7 @@ static InlineCache *cacheAt(Chunk *chunk, uint16_t index) {
 #define IC_BUILTIN_TAG 0x80000000u
 
 static uint32_t builtinShapeTag(Value v) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_INT:   return IC_BUILTIN_TAG | 1u;
     case VAL_FLOAT: return IC_BUILTIN_TAG | 2u;
     case VAL_OBJ:   break;
@@ -169,7 +169,7 @@ static const char *callableName(Value v) {
 /* Short rendering for diagnostics. Deliberately does not call __str__: an
  * error message must never be able to raise a second exception. */
 static void describeValue(Value v, char *buf, size_t size) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_NULL:  snprintf(buf, size, "null"); return;
     case VAL_BOOL:  snprintf(buf, size, "%s", AS_BOOL(v) ? "true" : "false"); return;
     case VAL_INT:   snprintf(buf, size, "%" PRId64, AS_INT(v)); return;

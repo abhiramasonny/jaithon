@@ -355,7 +355,7 @@ void jaiMethodTablesInit(void) {
 typedef bool (*MethodLookup)(Value, ObjString *, Value *);
 
 static MethodLookup lookupFor(Value receiver) {
-    switch (receiver.type) {
+    switch (jaiValueType(receiver)) {
     case VAL_INT:   return jaiIntMethod;
     case VAL_FLOAT: return jaiFloatMethod;
     case VAL_NULL:
@@ -472,7 +472,7 @@ static const char *const kIterMethodNames[] = {
 
 static const char *const *candidatesFor(Value receiver, int *count) {
     *count = 0;
-    switch (receiver.type) {
+    switch (jaiValueType(receiver)) {
     case VAL_INT:   NAME_TABLE(kIntMethodNames);
     case VAL_FLOAT: NAME_TABLE(kFloatMethodNames);
     case VAL_NULL:
