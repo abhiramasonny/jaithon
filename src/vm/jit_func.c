@@ -2764,6 +2764,60 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_SET_INDEX: {
+            /* list[i] = v, the write half of OP_GET_INDEX and normalised the
+             * same way. Every guard runs before the store, so a deopt here
+             * still resumes at an instruction that has not happened yet.
+             * Sixteen refusals across the benchmarks came from its absence --
+             * `queens` could not compile the function that does the work. */
+            if (e->depth < 3) return false;
+            if (e->stack[e->depth - 3] != SLOT_LIST) return false;
+            if (e->stack[e->depth - 2] != SLOT_INT) return false;
+            SlotKind vk = e->stack[e->depth - 1];
+            unsigned vtag = vk == SLOT_INT   ? VAL_INT
+                          : vk == SLOT_FLOAT ? VAL_FLOAT
+                          : vk == SLOT_BOOL  ? VAL_BOOL
+                          : (vk == SLOT_INST || vk == SLOT_LIST ||
+                             vk == SLOT_OBJ)  ? VAL_OBJ
+                                              : 0xffffffffu;
+            if (vtag == 0xffffffffu) return false;
+            unsigned rVal = pushReg(e) - 1;
+            unsigned rIdx = pushReg(e) - 2;
+            unsigned rList = pushReg(e) - 3;
+
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, count)));
+            emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+            emit(e, jaiA64BCond(JAI_A64_GE, 2));
+            emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A));
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+            branchOnDeopt(e, JAI_A64_HS);
+
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
+                               (unsigned)offsetof(ObjList, items)));
+            emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_SCRATCH_B, 4));
+            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            emit(e, jaiA64MovzX(JIT_SCRATCH_A, vtag, 0));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+            /* jaiListTouch: the count has not changed, so only the version
+             * tells an iterator that the list moved under it. */
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, version)));
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, version)));
+            e->wroteHeap = true;
+
+            unsigned d1, d2, d3;
+            if (!popValue(e, &d1, NULL)) return false;
+            if (!popValue(e, &d2, NULL)) return false;
+            if (!popValue(e, &d3, NULL)) return false;
+            off += 1;
+            break;
+        }
+
         case OP_GET_GLOBAL: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             if (globalIsSelf(closure, nameIdx)) {
