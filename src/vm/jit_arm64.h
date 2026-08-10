@@ -41,6 +41,14 @@ uint32_t jaiA64BCond(unsigned cond, int32_t instructions);
 uint32_t jaiA64B(int32_t instructions);
 /* subs Xd, Xn, Xm -- with rd = 31 this is a register-register `cmp` */
 uint32_t jaiA64SubsX(unsigned rd, unsigned rn, unsigned rm);
+/* smulh Xd, Xn, Xm -- high 64 bits of the signed 128-bit product */
+uint32_t jaiA64SmulhX(unsigned rd, unsigned rn, unsigned rm);
+/* asr Xd, Xn, #shift -- arithmetic, 0..63 */
+uint32_t jaiA64AsrX(unsigned rd, unsigned rn, unsigned shift);
+/* lsr Xd, Xn, #shift -- logical, 0..63 */
+uint32_t jaiA64LsrX(unsigned rd, unsigned rn, unsigned shift);
+/* add Xd, Xn, Xm */
+uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm);
 /* ret */
 uint32_t jaiA64Ret(void);
 
