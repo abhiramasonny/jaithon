@@ -266,6 +266,13 @@ struct ObjFunction {
     uint8_t     osrAttempts;
     uint8_t     jitAttempts;
     bool        osrRefused;
+    /* The back edge enters the compiled loop directly. An entry that keeps
+     * declining -- the slots are not the kinds it was compiled for -- would
+     * otherwise pay a call per iteration for nothing, which cost `sieve` 20%.
+     * After a few in a row the back edge stops trying and the timer tick is
+     * the only way back in. */
+    bool        osrHot;
+    uint8_t     osrDeclines;
     /* Set once the tier has looked at this function and refused it. Without it
      * every call past the threshold pays a call into jaiJitEnter to be told no
      * again -- 2.6% of `check lib/std`, on a workload the tier does not help at
