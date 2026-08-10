@@ -76,9 +76,46 @@ uint32_t jaiA64Nop(void);
 /* ret */
 uint32_t jaiA64Ret(void);
 
+/* The double-precision arithmetic. Doubles live in d0-d31, a register file the
+ * integer instructions cannot reach, so a value has to be moved across
+ * explicitly -- and there are two ways to move it, one that reinterprets the
+ * bits and one that converts the number. They are named apart below because
+ * substituting one for the other is silent: both produce a double. */
+
+/* fadd Dd, Dn, Dm */
+uint32_t jaiA64FaddD(unsigned rd, unsigned rn, unsigned rm);
+/* fsub Dd, Dn, Dm */
+uint32_t jaiA64FsubD(unsigned rd, unsigned rn, unsigned rm);
+/* fmul Dd, Dn, Dm */
+uint32_t jaiA64FmulD(unsigned rd, unsigned rn, unsigned rm);
+/* fdiv Dd, Dn, Dm */
+uint32_t jaiA64FdivD(unsigned rd, unsigned rn, unsigned rm);
+/* fneg Dd, Dn -- flips the sign bit, so it is exact on zero and nan too */
+uint32_t jaiA64FnegD(unsigned rd, unsigned rn);
+/* fsqrt Dd, Dn -- correctly rounded, unlike the reciprocal-estimate forms */
+uint32_t jaiA64FsqrtD(unsigned rd, unsigned rn);
+/* fcmp Dn, Dm -- flags only, no destination; b.mi is less-than and b.gt is
+ * greater-than, the pair that stays false when either operand is a nan */
+uint32_t jaiA64FcmpD(unsigned rn, unsigned rm);
+/* fmov Dd, Dn -- register to register */
+uint32_t jaiA64FmovDD(unsigned rd, unsigned rn);
+/* fmov Dd, Xn -- the general register's 64 bits, reinterpreted; NOT a convert */
+uint32_t jaiA64FmovDX(unsigned rd, unsigned rn);
+/* fmov Xd, Dn -- the fp register's 64 bits, reinterpreted; NOT a convert */
+uint32_t jaiA64FmovXD(unsigned rd, unsigned rn);
+/* scvtf Dd, Xn -- signed int64 to double; this one is the real conversion */
+uint32_t jaiA64ScvtfDX(unsigned rd, unsigned rn);
+/* fcvtzs Xd, Dn -- double to signed int64, rounding toward zero */
+uint32_t jaiA64FcvtzsXD(unsigned rd, unsigned rn);
+/* ldr Dt, [Xn, #offset] -- byte offset, must be 8-aligned, 0..32760 */
+uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset);
+/* str Dt, [Xn, #offset] -- same constraints */
+uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
+
 /* Condition codes, named for the ones this uses. */
 #define JAI_A64_EQ 0u
 #define JAI_A64_NE 1u
+#define JAI_A64_MI 4u   /* negative -- after fcmp this is the less-than arm */
 #define JAI_A64_VS 6u   /* overflow set */
 #define JAI_A64_LT 11u
 #define JAI_A64_GE 10u
