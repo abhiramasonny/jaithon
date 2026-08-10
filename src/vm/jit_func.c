@@ -180,6 +180,12 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     }
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
     frame->ip = fn->chunk.code + gDeopt.ip;
+    if (getenv("JAI_JIT_RECON")) {
+        fprintf(stderr, "[deopt] %s ip=%lld base=%lld nlocals=%lld nstack=%lld\n",
+                fn->name ? fn->name->chars : "<anon>", (long long)gDeopt.ip,
+                (long long)gDeopt.base, (long long)gDeopt.nlocals,
+                (long long)gDeopt.nstack);
+    }
     return true;
 }
 
@@ -2530,9 +2536,28 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
                               JAI_A64_GE,
                               (int)stackSignatureAt(e, e->depth - 1));
+                /* A range yields `start + index * step`, not the index --
+                 * see jaiIterNext's ITER_RANGE case. The index is always
+                 * zero-based, so using it as the value is only right for
+                 * `0..n` in unit steps. `for j in i + 1..n` counted from zero
+                 * instead of from i+1, which is a plausible wrong answer
+                 * rather than a crash: nested loops summed the wrong pairs.
+                 * The limit register is dead after the compare, so it carries
+                 * the index across to the increment. */
+                emit(e, jaiA64MovX(JIT_SCRATCH_B, JIT_SCRATCH_A));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
+                                   (unsigned)offsetof(ObjIter, source) + 8));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C,
+                                   (unsigned)offsetof(ObjRange, step)));
+                emit(e, jaiA64MulX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                   JIT_SCRATCH_D));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C,
+                                   (unsigned)offsetof(ObjRange, start)));
+                emit(e, jaiA64AddX(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                   JIT_SCRATCH_A));
                 localOut(e, fslot, JIT_SCRATCH_A);
-                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
-                emit(e, jaiA64StrX(JIT_SCRATCH_A, rIt,
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
+                emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
                                    (unsigned)offsetof(ObjIter, index)));
                 off += 5;
                 break;
@@ -3061,7 +3086,20 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     unsigned realArgs = e.usesUpvalues ? argCount - 1u : argCount;
     for (unsigned i = 0; i < realArgs; i++) {
         if (e.spilled) {
-            emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, e.base + i)));
+            /* A spilled local is a whole Value: tag first, payload eight bytes
+             * on. Writing the payload at the tag's offset instead leaves the
+             * payload word untouched, so the first read of an argument gets
+             * whatever the frame happened to hold -- which is a small integer
+             * often enough that it reads as a pointer and the crash lands
+             * somewhere else entirely. */
+            /* From the measuring pass: `e`'s own kinds are seeded after this
+             * point, so reading them here would take whatever the struct was
+             * zeroed to. */
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_D,
+                                 localTagFor(&body, e.base + i), 0));
+            emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31,
+                                localFrameOff(&e, e.base + i)));
+            emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, e.base + i) + 8));
         } else {
             emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
         }
@@ -3076,8 +3114,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     for (unsigned i = realArgs; i < e.locals; i++) {
         if (e.spilled) {
             emit(&e, jaiA64MovzX(JIT_SCRATCH_C, 0, 0));
-            emit(&e, jaiA64StrX(JIT_SCRATCH_C, 31,
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_D, VAL_NULL, 0));
+            emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31,
                                 localFrameOff(&e, e.base + i)));
+            emit(&e, jaiA64StrX(JIT_SCRATCH_C, 31,
+                                localFrameOff(&e, e.base + i) + 8));
         } else {
             emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
         }
