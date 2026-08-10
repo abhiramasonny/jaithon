@@ -224,6 +224,10 @@ struct ObjFunction {
     uint16_t    paramCount;
     ExceptionEntry *exceptions;
     uint16_t    exceptionCount;
+    /* Entries so far, saturating at JAI_JIT_THRESHOLD. The compiled tier reads
+     * it to decide when a function is worth compiling; it costs one increment
+     * on the call path and stops counting once hot. */
+    uint16_t    entryCount;
     /* Code offsets of the default-value thunks, indexed from arity-defaultCount. */
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */
