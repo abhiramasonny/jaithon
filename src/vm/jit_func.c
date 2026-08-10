@@ -991,8 +991,15 @@ static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
 static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
                                uint32_t shape, ObjClass *klass, Value seen);
 
-static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
-                           unsigned nargs, void *helper) {
+/* `ownStatus` means the caller decodes the helper's return itself, so the
+ * built-in "nonzero means raised" test is not emitted. Only the iterator step
+ * wants that: it answers 0 yielded, 1 exhausted, 2 raised, and the default test
+ * sends `exhausted` to the throw stub -- which reports an error the interpreter
+ * then cannot find, and the run dies on "internal error: failed operation
+ * raised nothing". The hand-written EQ/GT tests at the call site were dead code
+ * until now, because control never reached them with a nonzero status. */
+static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
+                                 unsigned nargs, void *helper, bool ownStatus) {
     if (nargs > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
     if (!e->callsOut) { e->whyNot = "callsOut off"; return false; }
 
@@ -1059,6 +1066,8 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)helper);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
 
+    if (ownStatus) return true;
+
     /* Nonzero means the callee raised; the interpreter owns it from here. */
     emit(e, jaiA64SubsXImm(31, 0, 0));
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
@@ -1069,6 +1078,11 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     e->fixupCount++;
     emit(e, jaiA64BCond(JAI_A64_NE, 0));
     return true;
+}
+
+static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
+                           unsigned nargs, void *helper) {
+    return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false);
 }
 
 /* A call to a global function that has itself compiled. Its return kind types
@@ -2474,8 +2488,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         esh = ecl->shapeId;
                     } else { e->whyNot = "element kind unknown"; return false; }
 
-                    if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
-                                        (void *)&jitIterStep)) {
+                    if (!emitDescriptorStatus(e, NULL_VAL, e->depth - 1, 1,
+                                              (void *)&jitIterStep, true)) {
                         return false;
                     }
                     /* 1 is exhausted, anything higher is a raise. */
