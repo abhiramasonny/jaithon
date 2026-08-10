@@ -565,6 +565,18 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
  * compiles its own closure from source, so nothing lands in __jaicache__ and
  * the next seed is built from whatever little remains. Measured, the seed went
  * 39 modules -> 10 in one generation that way, and would have reached zero. */
+/* JAITHON_TRACE_LOAD=1 reports where each module body came from.
+ *
+ * Where a module comes from is not observable from Jaithon, and it has to be:
+ * the seed serves the compiler even when its source has moved, so an edit to
+ * the compiler can be silently ignored, and every measurement taken after it
+ * describes a compiler that was never built. That happened, and it invalidated
+ * a day of conclusions about a fusion rule that may well have been correct. */
+static bool traceLoads(void) {
+    const char *flag = getenv("JAITHON_TRACE_LOAD");
+    return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
+}
+
 static bool seedDisabled(void) {
     const char *flag = getenv("JAITHON_NO_SEED");
     return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
@@ -674,7 +686,10 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
 
     if (opts->useCache && cacheFlagsMatch(path, flags)) {
         ObjFunction *cached = jaiCacheLoad(path, module, hash);
-        if (cached != NULL) return cached;
+        if (cached != NULL) {
+            if (traceLoads()) fprintf(stderr, "load cache   %s\n", path);
+            return cached;
+        }
         /* Stale, corrupt, or from another compiler: recompile silently. */
     }
 
@@ -689,7 +704,10 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
             ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
                                                        seeded->length,
                                                        module, hash);
-            if (fromSeed != NULL) return fromSeed;
+            if (fromSeed != NULL) {
+                if (traceLoads()) fprintf(stderr, "load seed    %s\n", path);
+                return fromSeed;
+            }
         }
     }
 
@@ -1333,7 +1351,10 @@ static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
 
     if (opts->useCache && cacheFlagsMatch(path, flags)) {
         ObjFunction *cached = jaiCacheLoad(path, module, hash);
-        if (cached != NULL) return cached;
+        if (cached != NULL) {
+            if (traceLoads()) fprintf(stderr, "load cache   %s\n", path);
+            return cached;
+        }
         /* Stale, corrupt, or from the other front end: compile it. */
     }
 
