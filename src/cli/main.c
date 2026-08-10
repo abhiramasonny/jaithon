@@ -24,6 +24,8 @@
 
 #include "cli.h"
 
+#include "../vm/verify.h"
+
 #include "../runtime/frontend.h"
 
 #include "../codegen/codegen.h"
