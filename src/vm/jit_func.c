@@ -330,6 +330,13 @@ typedef struct {
     bool      osr;
     uint32_t  osrTop;
     uint32_t  osrEnd;
+    /* A `for i in a..b` loop, compiled as a counted one. The iterator object
+     * stays on the interpreter's stack untouched; only its index rides in a
+     * register, and every way out writes it back so the interpreter can carry
+     * on from wherever this stopped. */
+    bool      hasIter;
+    unsigned  iterSlot;
+    uint32_t  iterExit;
     int       exitStub[8];       /* one per distinct offset jumped out to */
     uint32_t  exitOffset[8];
     unsigned  exitCount;
@@ -391,9 +398,12 @@ static void emit(Emit *e, uint32_t word) {
 /* x19 carries the slots pointer in OSR mode, so the operand stack starts one
  * register later. */
 #define JIT_SLOTS_REG (JIT_FIRST_SAVED)
+#define JIT_ITER_REG  (JIT_FIRST_SAVED + 1u)   /* the ObjIter itself */
+#define JIT_IDX_REG   (JIT_FIRST_SAVED + 2u)
+#define JIT_LIM_REG   (JIT_FIRST_SAVED + 3u)
 
 static unsigned regBase(const Emit *e) {
-    if (e->osr) return 1u;
+    if (e->osr) return e->hasIter ? 4u : 1u;
     return e->spilled ? 0u : e->locals;
 }
 
@@ -1764,6 +1774,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 ObjFunction *mfn = AS_CLOSURE(method)->fn;
                 if (mfn->jitFunc == NULL) return false;   /* kind unknown yet */
                 SlotKind rkind = (SlotKind)mfn->jitReturnKind;
+                uint32_t rshape = mfn->jitReturnShape;
+                ObjClass *rrcls = NULL;
+                if (rkind == SLOT_INST) {
+                    if (rshape == 0) return false;
+                    if (!jaiClassForShape(rshape, &rrcls) || rrcls == NULL) {
+                        return false;
+                    }
+                }
                 if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
                     rkind != SLOT_BOOL && rkind != SLOT_INST &&
                     rkind != SLOT_LIST) {
@@ -1778,7 +1796,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     unsigned r;
                     if (!popValue(e, &r, NULL)) return false;
                 }
-                if (!pushValue(e, rkind, 0, NULL)) return false;
+                if (!pushValue(e, rkind, rshape, rrcls)) return false;
 
                 unsigned rat = e->descOffset +
                                (unsigned)offsetof(JitCallDesc, result);
@@ -1790,6 +1808,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
                 branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
                 emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+                if (rkind == SLOT_INST) {
+                    /* "an object" is not "an object of this class", and a
+                     * method entered with another specialisation runs
+                     * interpreted and may return either. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
+                                       (unsigned)offsetof(ObjInstance, klass)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                       (unsigned)offsetof(ObjClass, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+                }
 
                 e->wroteHeap = true;
                 off += 7;
@@ -1848,6 +1878,28 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->wroteHeap = true;
             off += 7;
             if (!isLen) off += 1;      /* the OP_POP this consumed */
+            break;
+        }
+
+        case OP_FOR_ITER_BIND: {
+            /* Only as the head of the loop being compiled, and only for a
+             * range from zero in unit steps -- that is what makes the yielded
+             * value the index itself. Everything else about the iterator is a
+             * runtime fact, checked at the entry. */
+            if (!e->osr || !e->hasIter) return false;
+            if ((uint32_t)off != e->osrTop) return false;
+            int16_t  jump = jaiReadI16(code + off + 1);
+            unsigned slot = jaiReadU16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (!adoptLocalKind(e, slot, SLOT_INT, 0, NULL)) return false;
+            e->iterSlot = slot;
+            e->iterExit = (uint32_t)((int32_t)(off + 5) + jump);
+
+            emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
+            branchTo(e, e->iterExit, true, JAI_A64_GE);
+            localOut(e, slot, JIT_IDX_REG);
+            emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
+            off += 5;
             break;
         }
 
@@ -2563,6 +2615,18 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         fn->jitParamShape[i] = e.localShape[i + e.base];
     }
     fn->jitReturnKind = (uint8_t)e.returnKind;
+    fn->jitReturnShape = e.returnShape;
+    if (e.returnKind == SLOT_INST && e.returnShape != 0) {
+        ObjClass *rc = NULL;
+        for (unsigned i = 0; i < e.base + e.locals; i++) {
+            if (e.localClass[i] != NULL &&
+                e.localClass[i]->shapeId == e.returnShape) {
+                rc = e.localClass[i];
+                break;
+            }
+        }
+        jaiClassRememberShape(rc);
+    }
     fn->jitArgBase    = (uint8_t)e.base;
     fn->jitArgCount   = (uint8_t)argCount;
 
@@ -2581,6 +2645,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 
 /* Returns the bytecode offset the interpreter should continue from. */
 typedef int64_t (*OsrFn)(Value *slots);
+typedef int64_t (*OsrFnIter)(Value *slots, ObjIter *iter);
 
 /* The OP_LOOP that jumps back to `top`, and so the end of the loop. Gives up
  * on OP_CLOSURE, whose length depends on its operands. */
@@ -2601,7 +2666,8 @@ static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
     return 0;
 }
 
-static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
+static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
+                       bool hasIter) {
     ObjFunction *fn = closure->fn;
     uint32_t end = findLoopEnd(&fn->chunk, top);
     if (end == 0 || end <= top) return false;
@@ -2617,6 +2683,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
     static Emit e;
     memset(&e, 0, sizeof e);
     e.osr = true;
+    e.hasIter = hasIter;
     e.osrTop = top;
     e.osrEnd = end;
     e.base = 0;
@@ -2644,7 +2711,10 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
             e.localClass[i] = AS_INSTANCE(v)->klass;
             e.localShape[i] = AS_INSTANCE(v)->klass->shapeId;
         } else {
+            /* Nothing recognisable in it yet -- a slot the loop assigns before
+             * it reads. It takes its kind from the first thing bound to it. */
             e.localKind[i] = SLOT_OPAQUE;
+            e.localTyped[i] = false;
         }
     }
 
@@ -2655,6 +2725,13 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
     emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
     emitSaveRestore(&e, true);
     emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
+    if (hasIter) {
+        emit(&e, jaiA64MovX(JIT_ITER_REG, 1));
+        emit(&e, jaiA64LdrX(JIT_IDX_REG, JIT_ITER_REG,
+                            (unsigned)offsetof(ObjIter, index)));
+        emit(&e, jaiA64LdrX(JIT_LIM_REG, JIT_ITER_REG,
+                            (unsigned)offsetof(ObjIter, limit)));
+    }
 
     if (!compileBody(&e, closure) || e.failed) {
         if (getenv("JAI_JIT_WHY")) {
@@ -2668,16 +2745,27 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
     /* Falling off the end of the compiled range is the loop exiting there. */
     if (e.exitCount >= 8) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
+#define OSR_SYNC_ITER()                                                        \
+    do {                                                                       \
+        if (hasIter) {                                                         \
+            emit(&e, jaiA64StrX(JIT_IDX_REG, JIT_ITER_REG,                     \
+                                (unsigned)offsetof(ObjIter, index)));          \
+        }                                                                      \
+    } while (0)
+
     e.bailBlock = (int)e.count;
+    OSR_SYNC_ITER();
     emitConst64(&e, 0, (int64_t)-1);          /* -1: could not continue */
     emitEpilogue(&e, 0);
     e.exceptionExit = (int)e.count;
+    OSR_SYNC_ITER();
     emitConst64(&e, 0, (int64_t)-2);          /* -2: an exception is pending */
     emitEpilogue(&e, 0);
 
     for (unsigned i = 0; i < 3; i++) {
         if (!e.overflowUsed[i]) { e.overflowStub[i] = -1; continue; }
         e.overflowStub[i] = (int)e.count;
+        OSR_SYNC_ITER();
         emit(&e, jaiA64MovzX(0, i, 0));
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitThrowOverflow);
         emit(&e, jaiA64Blr(JIT_SCRATCH_A));
@@ -2687,12 +2775,21 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
 
     for (unsigned i = 0; i < e.exitCount; i++) {
         e.exitStub[i] = (int)e.count;
+        OSR_SYNC_ITER();
+        /* Leaving by the iterator's own exit means it is exhausted, and the
+         * interpreter drops it there; any other way out leaves it in place. */
+        emitConst64(&e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&gDeopt.base);
+        emitConst64(&e, JIT_SCRATCH_B,
+                    (e.hasIter && e.exitOffset[i] == e.iterExit) ? 1 : 0);
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
         emitConst64(&e, 0, (int64_t)e.exitOffset[i]);
         emitEpilogue(&e, 0);
     }
 
     for (unsigned k = 0; k < e.deoptCount; k++) {
         e.deopt[k].stub = (int)e.count;
+        OSR_SYNC_ITER();
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
         unsigned valueSeen = 0;
         for (unsigned i = 0; i < e.deopt[k].depth; i++) {
@@ -2738,9 +2835,13 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
         emit(&e, jaiA64MovzX(JIT_SCRATCH_B, e.deopt[k].depth, 0));
         emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
                             (unsigned)offsetof(JitDeoptRecord, nstack)));
+        emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, base)));
         emitConst64(&e, 0, (int64_t)e.deopt[k].ip);
         emitEpilogue(&e, 0);
     }
+#undef OSR_SYNC_ITER
 
     if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
@@ -2799,10 +2900,26 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     ObjFunction *fn = closure->fn;
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
 
+    /* A for-loop head keeps its iterator on the stack. Only a range from zero
+     * in unit steps is taken, because that is what makes the yielded value the
+     * index and lets the body run against a plain counter. */
+    bool hasIter = top < (uint32_t)fn->chunk.count &&
+                   fn->chunk.code[top] == OP_FOR_ITER_BIND;
+    ObjIter *iter = NULL;
+    if (hasIter) {
+        if (vm.stackTop <= frame->slots) return 0;
+        Value it = vm.stackTop[-1];
+        if (!IS_ITER(it)) return 0;
+        iter = AS_ITER(it);
+        if (iter->kind != ITER_RANGE || !IS_RANGE(iter->source)) return 0;
+        ObjRange *r = AS_RANGE(iter->source);
+        if (r->start != 0 || r->step != 1) return 0;
+    }
+
     if (fn->osrCode == NULL) {
         if (fn->osrRefused) return 0;
         fn->osrRefused = true;
-        if (!compileOsr(closure, top, frame->slots)) return 0;
+        if (!compileOsr(closure, top, frame->slots, hasIter)) return 0;
         fn->osrRefused = false;
     }
     if (fn->osrTop != top) return 0;
@@ -2822,9 +2939,11 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     }
 
     gDeopt.nstack = 0;
-    int64_t at = ((OsrFn)(uintptr_t)fn->osrCode)(frame->slots);
+    gDeopt.base = 0;
+    int64_t at = ((OsrFnIter)(uintptr_t)fn->osrCode)(frame->slots, iter);
     if (at == -1) return 0;
     if (at == -2) return 2;              /* an exception is pending */
+    if (gDeopt.base != 0) vm.stackTop--;   /* the exhausted iterator */
     for (int64_t i = 0; i < gDeopt.nstack; i++) *vm.stackTop++ = gDeopt.stack[i];
     *resumeAt = (uint32_t)at;
     return 1;

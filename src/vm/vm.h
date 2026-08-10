@@ -117,6 +117,8 @@ JaiRunResult jaiVMRunModule(ObjModule *module, ObjFunction *body);
 
 /* Call any callable from C (natives, the REPL, dunder dispatch). Returns false
  * with the pending exception set on error. */
+void jaiClassRememberShape(ObjClass *c);
+bool jaiClassForShape(uint32_t shape, ObjClass **out);
 bool jaiClassFindMethod(ObjClass *klass, ObjString *name, Value *out);
 bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);

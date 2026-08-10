@@ -246,6 +246,7 @@ struct ObjFunction {
     uint8_t     jitParamKind[4];
     uint32_t    jitParamShape[4];
     uint8_t     jitReturnKind;
+    uint32_t    jitReturnShape;   /* class shape when the kind is an instance */
     uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */
     uint8_t     jitArgCount;
     /* On-stack replacement: a compiled loop entered from the interpreter, with

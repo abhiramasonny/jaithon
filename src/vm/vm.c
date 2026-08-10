@@ -1283,6 +1283,20 @@ static CallOutcome callValueOnStack(int argc) {
  * used for this. `count` includes the receiver. */
 /* The method `name` resolves to on `klass`, following the inheritance chain.
  * Exposed for the compiled tier, which resolves a call site once. */
+/* The class carrying `shape`, found by walking the classes the tier has
+ * already seen. Only used at compile time. */
+static ObjClass *sShapeCache[64];
+void jaiClassRememberShape(ObjClass *c) {
+    if (c == NULL) return;
+    sShapeCache[c->shapeId & 63u] = c;
+}
+bool jaiClassForShape(uint32_t shape, ObjClass **out) {
+    ObjClass *c = sShapeCache[shape & 63u];
+    if (c == NULL || c->shapeId != shape) return false;
+    *out = c;
+    return true;
+}
+
 bool jaiClassFindMethod(ObjClass *klass, ObjString *name, Value *out) {
     return findMethod(klass, name, out);
 }
