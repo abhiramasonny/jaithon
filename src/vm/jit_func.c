@@ -1756,6 +1756,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             SlotKind rk = e->stack[ridx];
 
             if (rk == SLOT_INST) {
+                /* Not inside an OSR loop. A float-returning method call there
+                 * produces a wrong answer -- 2250880.0 where the interpreter
+                 * says 6000000.0 -- and at a larger trip count the same shape
+                 * does not terminate. An int-returning one is fine, and so is
+                 * the same call compiled by the function tier, so the fault is
+                 * in how an out-call result is carried across the OSR loop
+                 * rather than in the call itself. Off until that is found:
+                 * a wrong answer is not worth the milliseconds. */
+                if (e->osr) {
+                    e->whyNot = "method call inside an OSR loop (known bug)";
+                    return false;
+                }
+
                 /* A method on an instance. The class is fixed here, so the
                  * method is resolved now; what it returns is not knowable, so
                  * the tag that comes back is checked and a surprise deopts to
