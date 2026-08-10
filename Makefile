@@ -378,7 +378,7 @@ reseed: $(TARGET)
 # whatever it imports, so collecting the whole tree embeds a set that varies run
 # to run. Measured, 44 modules and then 47 across two reseeds of an unchanged
 # tree. What is embedded has to be exactly what the step above set out to build.
-	@python3 scripts/gen_seed.py lib boot/seed.c lib/jaithon
+	@python3 scripts/gen_seed.py lib boot/seed.c lib
 	@$(MAKE) --no-print-directory
 # The rebuild above embeds the new seed, which changes JAI_BUILD_ID, which
 # invalidates every .jaic just written -- so reseeding used to hand back a tree
@@ -389,6 +389,15 @@ reseed: $(TARGET)
 	@echo "  SEED    warming __jaicache__"
 	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory fixpoint-check
+	@$(MAKE) --no-print-directory seed-check
+
+#: The seed alone must bootstrap the compiler: wipe every cache, compile with
+#: the installed library excluded, and check that the same run fails with the
+#: seed disabled. Without the negative half it cannot tell "the seed works"
+#: from "the seed was never needed".
+.PHONY: seed-check
+seed-check: $(TARGET)
+	@scripts/seed_check.sh
 
 #: Compile each source twice with the self-hosted front end and compare. With
 #: the differential oracle retired this is the gate that says the front end is

@@ -48,7 +48,30 @@ def module_name_for(jaic_path, root):
     if not parts or not parts[-1].endswith(".jaic"):
         return None
     parts[-1] = parts[-1][: -len(".jaic")]
+
+    # `mod.jai` is a package's body, not a module inside it: the directory
+    # `lib/jaithon/compile` is imported as `jaithon.compile`, and that is the
+    # name the importer looks the seed up under. Keying it `jaithon.compile.mod`
+    # left every package in the seed unreachable.
+    if parts[-1] == "mod" and len(parts) > 1:
+        parts.pop()
+
     return ".".join(parts)
+
+
+def source_path_for(jaic_path, root):
+    """`<root>/jaithon/compile/opt/__jaicache__/chunk.jaic` -> `jaithon/compile/opt/chunk.jai`.
+
+    The seed is keyed on this rather than on the module name, because the name
+    an importer gives a module is not always the dotted one: a relative import
+    (`from .chunk import ...`) names it `chunk`, and a seed keyed on names is
+    unreachable for every module reached that way.
+    """
+    rel = os.path.relpath(jaic_path, root)
+    parts = rel.split(os.sep)
+    parts.remove("__jaicache__")
+    parts[-1] = parts[-1][: -len(".jaic")] + ".jai"
+    return "/".join(parts)
 
 
 def collect(root, subtrees):
@@ -65,7 +88,7 @@ def collect(root, subtrees):
                 if module is None:
                     continue
                 with open(path, "rb") as f:
-                    found[module] = f.read()
+                    found[source_path_for(path, root)] = f.read()
     return dict(sorted(found.items()))
 
 
@@ -124,13 +147,22 @@ def main():
         f.write("};\n\n")
 
         f.write(
-            "const JaiSeedEntry *jaiSeedFind(const char *module) {\n"
-            "    if (module == NULL) return NULL;\n"
+            "/* The caller has an absolute path and the table holds paths\n"
+            " * relative to the library root, so a key matches when it is a\n"
+            " * trailing path component run of the argument. Anchoring on the\n"
+            " * separator is what stops `list.jai` from matching\n"
+            " * `mylist.jai`. */\n"
+            "const JaiSeedEntry *jaiSeedFind(const char *sourcePath) {\n"
+            "    if (sourcePath == NULL) return NULL;\n"
+            "    size_t pathLen = strlen(sourcePath);\n"
             "    for (size_t i = 0; i < sizeof kEntries / sizeof kEntries[0];\n"
             "         i++) {\n"
-            "        if (strcmp(kEntries[i].module, module) == 0) {\n"
-            "            return &kEntries[i];\n"
-            "        }\n"
+            "        size_t keyLen = strlen(kEntries[i].module);\n"
+            "        if (keyLen > pathLen) continue;\n"
+            "        const char *tail = sourcePath + (pathLen - keyLen);\n"
+            "        if (strcmp(tail, kEntries[i].module) != 0) continue;\n"
+            "        if (tail != sourcePath && tail[-1] != '/') continue;\n"
+            "        return &kEntries[i];\n"
             "    }\n"
             "    return NULL;\n"
             "}\n\n"
