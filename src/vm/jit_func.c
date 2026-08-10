@@ -2060,12 +2060,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned argc = code[off + 1];
             if (!isClassCallee(e, argc)) { e->whyNot = "tail callee not a class"; return false; }
             if (!emitCallOut(e, argc)) return false;
+            /* Which class came back, not just that an object did: a caller
+             * binding this result to a local cannot compile without it. */
+            uint32_t tshape = e->depth > 0 ? e->stackShape[e->depth - 1] : 0;
             unsigned r;
             SlotKind k;
             if (!popValue(e, &r, &k)) return false;
             if (e->sawReturn && e->returnKind != k) return false;
             e->sawReturn  = true;
             e->returnKind = k;
+            e->returnShape = tshape;
             emit(e, jaiA64MovX(0, r));
             emitEpilogue(e, 0);
             off += 2;
@@ -2077,6 +2081,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_RETURN: {
+            uint32_t rsh = e->depth > 0 ? e->stackShape[e->depth - 1] : 0;
             unsigned r;
             SlotKind k;
             if (!popValue(e, &r, &k)) return false;
@@ -2085,6 +2090,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->sawReturn && e->returnKind != k) return false;
             e->sawReturn = true;
             e->returnKind = k;
+            e->returnShape = rsh;
             emit(e, jaiA64MovX(0, r));
             emitEpilogue(e, 0);
             off += 1;
