@@ -399,7 +399,8 @@ static bool nIntConv(int argc, Value *args, Value *out) {
             return true;
         case PARSE_RANGE:
             return jaiThrow(vm.cOverflowError,
-                            "int() literal out of range: '%s'", text->chars);
+                            "int() literal out of range: '%.*s'",
+                            (int)text->length, text->chars);
         case PARSE_BAD:
             break;
         }
@@ -434,12 +435,14 @@ static bool nIntConv(int argc, Value *args, Value *out) {
             return true;
         case PARSE_RANGE:
             return jaiThrow(vm.cOverflowError,
-                            "int() literal out of range: '%s'", text->chars);
+                            "int() literal out of range: '%.*s'",
+                            (int)text->length, text->chars);
         case PARSE_BAD:
             break;
         }
         return jaiThrow(vm.cValueError,
-                        "invalid literal for int() with base 10: '%s'", text->chars);
+                        "invalid literal for int() with base 10: '%.*s'",
+                        (int)text->length, text->chars);
     }
     return jaiBuiltinArgTypeError(1, "int", "int, float, bool or str", v);
 }

@@ -34,6 +34,11 @@ struct ObjString {
      * terminator was overwritten by a later append into the same buffer is
      * flagged, and jaiStringCStr is the only safe way to get a C string. */
     char    *chars;
+    /* The buffer these bytes live in, or NULL when the string owns them.
+     * Several strings share one buffer while a concatenation chain grows: an
+     * append only ever writes past every existing string's end, so no string's
+     * bytes ever change under it. */
+    struct ObjStrBuf *owner;
 };
 
 /* Bytes to allocate for a string of `length` characters: the header, then the
@@ -42,6 +47,21 @@ struct ObjString {
 #define JAI_STRING_ALLOC(length) (sizeof(ObjString) + (size_t)(length) + 1)
 
 #define JAI_STR_INTERNED(s)      ((s)->obj.subFlag)
+/* True when a later append overwrote the NUL that used to sit at this string's
+ * end. The bytes are still correct for `length`; only C-string use is unsafe. */
+#define JAI_STR_UNTERMINATED(s)  ((s)->obj.subFlag2)
+
+/* A growable byte buffer shared by a chain of concatenation results. */
+typedef struct ObjStrBuf {
+    Obj      obj;
+    uint32_t capacity;   /* bytes in `data`, excluding the NUL slot */
+    uint32_t used;       /* bytes written; data[used] is the live NUL */
+    char     data[];
+} ObjStrBuf;
+
+/* A NUL-terminated view of `s`, copying only when a later append overwrote the
+ * terminator. Use this anywhere a bare `char *` is handed to printf or str*. */
+const char *jaiStringCStr(ObjString *s);
 
 /* Interning: every string literal and identifier the compiler or the
  * deserialiser produces goes through the intern table, so that for interned

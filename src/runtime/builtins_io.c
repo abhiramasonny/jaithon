@@ -74,10 +74,40 @@ static bool throwErrno2(int err, const char *what, const char *from,
 /* A path crossing into libc must be NUL-terminated, so a str holding a NUL is
  * not the path the caller thinks it is. Rejecting it keeps the error message
  * and the syscall talking about the same file. */
+/* A NUL-terminated pointer for a syscall.
+ *
+ * A string can be a view into a shared append buffer, in which case the byte
+ * after it belongs to a later concatenation rather than being a terminator --
+ * and `dir + "/" + name` is exactly how paths get built. Costs nothing for an
+ * ordinary string; copies only for a view that a later append ran past. Pass
+ * the same `tmp` to ioPathDone when the call is finished. */
+static const char *ioPathCStr(ObjString *path, char **tmp) {
+    *tmp = NULL;
+    if (!JAI_STR_UNTERMINATED(path)) return path->chars;
+    char *copy = (char *)malloc((size_t)path->length + 1);
+    if (copy == NULL) return path->chars;   /* nothing better to do */
+    memcpy(copy, path->chars, path->length);
+    copy[path->length] = '\0';
+    *tmp = copy;
+    return copy;
+}
+
+static void ioPathDone(char *tmp) { free(tmp); }
+
+static int mkdirAt(ObjString *path) {
+    char *tmp = NULL;
+    int rc = mkdir(ioPathCStr(path, &tmp), 0777);
+    ioPathDone(tmp);
+    return rc;
+}
+
 static bool checkPath(ObjString *path, const char *fnName) {
     if (path->length == 0)
         return jaiThrow(vm.cValueError, "%s(): the path is empty", fnName);
-    if (strlen(path->chars) != path->length)
+    /* Bounded by the length rather than by a terminator: a string may be a
+     * view into a shared append buffer, in which case the byte after it
+     * belongs to a later concatenation and strlen would run on past. */
+    if (memchr(path->chars, '\0', path->length) != NULL)
         return jaiThrow(vm.cValueError, "%s(): the path contains a NUL byte",
                         fnName);
     return true;
@@ -263,7 +293,9 @@ static bool nIoOpen(int argc, Value *args, Value *out) {
                         "r w a rb wb ab r+ w+ a+", mode);
 
     errno = 0;
-    FILE *handle = fopen(path->chars, mode);
+    char *pathTmp = NULL;
+    FILE *handle = fopen(ioPathCStr(path, &pathTmp), mode);
+    ioPathDone(pathTmp);
     if (handle == NULL)
         return throwErrno(errno != 0 ? errno : EIO, "cannot open", path->chars);
 
@@ -641,7 +673,8 @@ static bool checkVariableName(ObjString *name) {
     if (name->length == 0)
         return jaiThrow(vm.cValueError,
                         "os_env(): the variable name must not be empty");
-    if (strlen(name->chars) != name->length || strchr(name->chars, '=') != NULL)
+    if (memchr(name->chars, '\0', name->length) != NULL ||
+        memchr(name->chars, '=', name->length) != NULL)
         return jaiThrow(vm.cValueError,
                         "os_env(): the variable name may not contain '=' or a NUL byte");
     return true;
@@ -706,7 +739,7 @@ static bool nOsEnv(int argc, Value *args, Value *out) {
     } else {
         ObjString *value;
         if (!jaiArgString(args[1], 2, "os_env", &value)) return false;
-        if (strlen(value->chars) != value->length)
+        if (memchr(value->chars, '\0', value->length) != NULL)
             return jaiThrow(vm.cValueError,
                             "os_env(): the value contains a NUL byte");
         if (setenv(name->chars, value->chars, 1) != 0)
@@ -883,7 +916,7 @@ static bool nIoMkdir(int argc, Value *args, Value *out) {
         if (!jaiMakeDirs(path->chars))
             return throwErrno(errno != 0 ? errno : EIO, "cannot create",
                               path->chars);
-    } else if (mkdir(path->chars, 0777) != 0) {
+    } else if (mkdirAt(path) != 0) {
         return throwErrno(errno != 0 ? errno : EIO, "cannot create", path->chars);
     }
     *out = NULL_VAL;
@@ -899,7 +932,11 @@ static bool nIoRemove(int argc, Value *args, Value *out) {
     if (!checkPath(path, "io_remove")) return false;
 
     errno = 0;
-    if (remove(path->chars) != 0)
+    char *rmTmp = NULL;
+    const char *rmPath = ioPathCStr(path, &rmTmp);
+    int rmRc = remove(rmPath);
+    ioPathDone(rmTmp);
+    if (rmRc != 0)
         return throwErrno(errno != 0 ? errno : EIO, "cannot remove", path->chars);
     *out = NULL_VAL;
     return true;
@@ -913,7 +950,13 @@ static bool nIoRename(int argc, Value *args, Value *out) {
     if (!checkPath(from, "io_rename") || !checkPath(to, "io_rename")) return false;
 
     errno = 0;
-    if (rename(from->chars, to->chars) != 0)
+    char *fromTmp = NULL, *toTmp = NULL;
+    const char *fromP = ioPathCStr(from, &fromTmp);
+    const char *toP = ioPathCStr(to, &toTmp);
+    int mvRc = rename(fromP, toP);
+    ioPathDone(fromTmp);
+    ioPathDone(toTmp);
+    if (mvRc != 0)
         return throwErrno2(errno != 0 ? errno : EIO, "cannot rename",
                            from->chars, to->chars);
     *out = NULL_VAL;
@@ -938,7 +981,11 @@ static bool nIoStat(int argc, Value *args, Value *out) {
         return false;
 
     struct stat info;
-    if ((follow ? stat(path->chars, &info) : lstat(path->chars, &info)) != 0) {
+    char *stTmp = NULL;
+    const char *stPath = ioPathCStr(path, &stTmp);
+    int stRc = follow ? stat(stPath, &info) : lstat(stPath, &info);
+    ioPathDone(stTmp);
+    if (stRc != 0) {
         /* Only "nothing there" is an answer; a broken lookup is still an error. */
         if (errno == ENOENT || errno == ENOTDIR) { *out = NULL_VAL; return true; }
         return throwErrno(errno, "cannot stat", path->chars);
@@ -1029,7 +1076,7 @@ static void cstrVecFree(CStrVec *v) {
  * where there is no length to carry, so it is refused here rather than
  * half-honoured. */
 static bool checkExecText(ObjString *s, const char *what) {
-    if (strlen(s->chars) != s->length)
+    if (memchr(s->chars, '\0', s->length) != NULL)
         return jaiThrow(vm.cValueError, "os_spawn(): %s contains a NUL byte", what);
     return true;
 }

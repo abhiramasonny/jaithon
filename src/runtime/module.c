@@ -1043,7 +1043,8 @@ bool jaiLoadPrelude(void) {
     while (jaiTableNext(&prelude->exports, &slot, &key, &unused)) {
         if (!IS_STRING(key)) continue;
         ObjString *exported = AS_STRING(key);
-        if (strchr(exported->chars, '.') != NULL) continue;   /* not a plain name */
+        /* Length-bounded: a string can be a view into a shared buffer. */
+        if (memchr(exported->chars, '.', exported->length) != NULL) continue;
 
         Value value;
         if (!jaiModuleGet(prelude, exported, &value)) continue;   /* already builtin */

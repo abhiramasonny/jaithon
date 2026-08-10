@@ -341,10 +341,12 @@ static void transferOne(Value diagnostic) {
 
     Value help, note;
     if (jaiFrontEndField(diagnostic, "help", &help) && IS_STRING(help)) {
-        jaiDiagAddHelp(d, "%s", AS_STRING(help)->chars);
+        jaiDiagAddHelp(d, "%.*s", (int)AS_STRING(help)->length,
+                       AS_STRING(help)->chars);
     }
     if (jaiFrontEndField(diagnostic, "note", &note) && IS_STRING(note)) {
-        jaiDiagAddNote(d, "%s", AS_STRING(note)->chars);
+        jaiDiagAddNote(d, "%.*s", (int)AS_STRING(note)->length,
+                       AS_STRING(note)->chars);
     }
 }
 
