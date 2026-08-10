@@ -240,6 +240,14 @@ struct ObjFunction {
      * built. Compiled code resolved this function's own name once; if any
      * global has moved since, the compiled form is retired. */
     uint32_t    jitModuleVersion;
+    /* What the compiled form was specialised to: the kind of each parameter,
+     * the class shape where that kind is an instance, and the kind it returns.
+     * The entry guard re-checks every one on every call. */
+    uint8_t     jitParamKind[4];
+    uint32_t    jitParamShape[4];
+    uint8_t     jitReturnKind;
+    uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */
+    uint8_t     jitArgCount;
     /* Set once the tier has looked at this function and refused it. Without it
      * every call past the threshold pays a call into jaiJitEnter to be told no
      * again -- 2.6% of `check lib/std`, on a workload the tier does not help at

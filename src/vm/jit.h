@@ -50,7 +50,7 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
 
 /* The whole-function tier (jit_func.c). Compile returns false for anything it
  * does not speak; enter obeys the same boundary contract as jaiJitEnter. */
-bool jaiJitCompileFunc(ObjClosure *closure);
+bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
 bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
