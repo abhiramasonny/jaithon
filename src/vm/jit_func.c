@@ -872,6 +872,51 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_ADD_INT_CONST: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int16_t  imm  = jaiReadI16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            emitConst64(e, JIT_SCRATCH_A, imm);
+            emit(e, jaiA64AddsX(pushReg(e) - 1, localReg(e, slot),
+                                JIT_SCRATCH_A));
+            branchOnOverflow(e, 0u, JAI_A64_VS);
+            off += 5;
+            break;
+        }
+
+        case OP_SUB_BIND: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            if (!localInRange(e, slot)) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            unsigned rb, ra;
+            SlotKind kb, ka;
+            if (!popValue(e, &rb, &kb)) return false;
+            if (!popValue(e, &ra, &ka)) return false;
+            if (ka != kb) return false;
+            if (!adoptLocalKind(e, slot, ka, 0, NULL)) {
+                e->whyNot = "a local was given two different kinds";
+                return false;
+            }
+            unsigned rd = localReg(e, slot);
+            if (ka == SLOT_FLOAT) {
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+                emit(e, jaiA64FsubD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
+                                    JIT_FSCRATCH_B));
+                emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
+            } else if (ka == SLOT_INT) {
+                emit(e, jaiA64SubsXReg(rd, ra, rb));
+                branchOnOverflow(e, 1u, JAI_A64_VS);
+            } else {
+                return false;
+            }
+            off += 3;
+            break;
+        }
+
         case OP_BIND: {
             unsigned slot = jaiReadU16(code + off + 1);
             if (!localInRange(e, slot)) return false;
@@ -1522,9 +1567,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value elem = sl->items[0];
             SlotKind kind;
             unsigned tag;
+            ObjClass *elemClass = NULL;
+            uint32_t  elemShape = 0;
             if (IS_INT(elem))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(elem)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
-            else return false;
+            else if (IS_INSTANCE(elem) && AS_INSTANCE(elem)->klass != NULL) {
+                /* A list of instances, all of one shape -- which the per-read
+                 * tag check cannot confirm on its own, so the class is checked
+                 * too. A list holding two shapes deoptimises on the second. */
+                kind = SLOT_INST;
+                tag = VAL_OBJ;
+                elemClass = AS_INSTANCE(elem)->klass;
+                elemShape = elemClass->shapeId;
+            } else return false;
 
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
                                (unsigned)offsetof(ObjList, count)));
@@ -1542,11 +1597,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
+            if (kind == SLOT_INST) {
+                /* The tag says "an object", not "an object of this class". */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(ObjInstance, klass)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(ObjClass, shapeId)));
+                emitConst64(e, JIT_SCRATCH_A, (int64_t)elemShape);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                branchOnDeopt(e, JAI_A64_NE);
+            }
 
             unsigned d1, d2;
             if (!popValue(e, &d1, NULL)) return false;
             if (!popValue(e, &d2, NULL)) return false;
-            if (!pushValue(e, kind, 0, NULL)) return false;
+            if (!pushValue(e, kind, elemShape, elemClass)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 8));
             off += 1;
             break;
