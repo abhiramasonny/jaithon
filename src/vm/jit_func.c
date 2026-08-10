@@ -166,6 +166,20 @@ typedef struct {
 
 static JitDeoptRecord gDeopt;
 
+/* Cached, because this sits on the deopt path and a deopt is not rare -- a
+ * guard that misses once per loop iteration reaches this every time. getenv
+ * walks the whole environment, so leaving it uncached made every measurement a
+ * function of how many variables happened to be exported: sort_merge moved
+ * 70ms to 100ms on shell padding alone. Same idiom as jaiJitEnabled. */
+static bool jitReconTrace(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAI_JIT_RECON");
+        cached = (v != NULL && v[0] != '\0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (gDeopt.ip < 0 || gDeopt.ip >= fn->chunk.count) return false;
@@ -180,7 +194,7 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     }
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
     frame->ip = fn->chunk.code + gDeopt.ip;
-    if (getenv("JAI_JIT_RECON")) {
+    if (jitReconTrace()) {
         fprintf(stderr, "[deopt] %s ip=%lld base=%lld nlocals=%lld nstack=%lld\n",
                 fn->name ? fn->name->chars : "<anon>", (long long)gDeopt.ip,
                 (long long)gDeopt.base, (long long)gDeopt.nlocals,
