@@ -1066,6 +1066,15 @@ static CallOutcome callClosure(ObjClosure *closure, int argc) {
         /* An exception from a call the compiled body made: the effects up to
          * it already happened, so this is not a decline. */
         if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
+        if (outcome == JAI_JIT_DEOPT) {
+            /* A guard failed part-way in. The interpreter takes over from that
+             * exact instruction, holding what the compiled body held, so the
+             * work already done is neither lost nor repeated. */
+            if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
+            if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+            if (!jaiJitApplyDeopt(closure, slotBase)) return CALL_ERROR;
+            return CALL_FRAME;
+        }
     }
 
     if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
@@ -4261,6 +4270,17 @@ static JaiRunResult runLoop(int baseFrameCount) {
             if (tfn->jitFunc != NULL) {
                 JaiJitOutcome outcome = jaiJitEnterFunc(target, tailBase);
                 if (outcome == JAI_JIT_ERROR) goto vmThrow;
+                if (outcome == JAI_JIT_DEOPT) {
+                    /* Push a real frame rather than reusing this one: the
+                     * callee is resuming part-way through its own body. The
+                     * OP_RETURN the compiler puts after a tail call then
+                     * returns its result, which is what a tail call means. */
+                    if (!bindCallArgs(target, argc, tailBase)) goto vmThrow;
+                    if (!pushFrame(target, tailBase)) goto vmThrow;
+                    if (!jaiJitApplyDeopt(target, tailBase)) goto vmThrow;
+                    LOAD_STATE();
+                    VM_NEXT();
+                }
                 if (outcome == JAI_JIT_DONE) {
                     retval = tailBase[0];
                     stackTop = vm.stackTop;   /* opReturn saves this back */

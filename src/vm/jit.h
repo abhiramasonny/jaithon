@@ -56,7 +56,20 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
  * interpreter should run the call. ERROR means the compiled code called out,
  * the callee raised, and the effects up to that point already happened -- so
  * running the call again would repeat them. */
-typedef enum { JAI_JIT_DECLINED, JAI_JIT_DONE, JAI_JIT_ERROR } JaiJitOutcome;
+typedef enum {
+    JAI_JIT_DECLINED,
+    JAI_JIT_DONE,
+    JAI_JIT_ERROR,
+    /* The compiled body met a value that was not the kind it was compiled for.
+     * Unlike DECLINED this cannot re-run the call: the body may already have
+     * written something. The interpreter takes over from the exact bytecode
+     * offset instead, with the locals and operand stack the compiled code was
+     * holding. Call jaiJitApplyDeopt once a frame exists. */
+    JAI_JIT_DEOPT
+} JaiJitOutcome;
+
+/* Populate the freshly pushed frame from the deopt record. */
+bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
