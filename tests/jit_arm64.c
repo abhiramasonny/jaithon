@@ -560,6 +560,23 @@ int main(void) {
                              jaiA64CsetX(0, JAI_A64_HS), jaiA64Ret() };
       check("hs allows in range", runWith(w, 5, cell), 0); }
 
+    /* eor, and the sign-difference test built on it */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
+                             jaiA64EorX(0, 1, 2), jaiA64Ret() };
+      check("eor", runWith(w, 4, cell), 0xf0 ^ 0x3c); }
+    { /* -3 and 5 differ in sign, so the eor is negative */
+      const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64SubsXReg(1, 31, 1),
+                             jaiA64MovzX(2, 5, 0),
+                             jaiA64EorX(3, 1, 2),
+                             jaiA64SubsXImm(31, 3, 0),
+                             jaiA64CsetX(0, JAI_A64_LT), jaiA64Ret() };
+      check("eor sign differs", runWith(w, 7, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64MovzX(2, 5, 0),
+                             jaiA64EorX(3, 1, 2),
+                             jaiA64SubsXImm(31, 3, 0),
+                             jaiA64CsetX(0, JAI_A64_LT), jaiA64Ret() };
+      check("eor sign same", runWith(w, 6, cell), 0); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;
