@@ -13,10 +13,12 @@
  *   - integers only, and every operand is an int by construction: the entry
  *     guard checks the arguments, and the only values the body can make are
  *     results of int arithmetic or of a call to this same function
- *   - no allocation, no stores, no globals but this function's own name.
- *     A body that cannot write anything is a body whose partial execution is
- *     invisible, which is what lets a bail simply throw the work away and
- *     re-run the call interpreted
+ *   - no allocation, and no globals but this function's own name
+ *   - a store to an instance field is allowed, but only where no bail can
+ *     follow it. A bail throws the compiled work away and lets the interpreter
+ *     run the call from the top, and that is sound exactly while partial
+ *     execution is invisible; a store that had already happened would be
+ *     applied twice
  *   - self-recursion only. A general call would need a compiled callee and an
  *     agreed convention between them; that comes later
  *
@@ -152,6 +154,11 @@ typedef struct {
      * slot: for a method slot 0 is the receiver, not the callee. It arrives as
      * one extra argument and takes the register just past the locals. */
     bool      usesUpvalues;
+    /* Set once the body has written to the heap. After that a bail is no
+     * longer free: re-running the call interpreted would apply the write a
+     * second time. See branchOnCondition. */
+    bool      wroteHeap;
+    bool      bailAfterWrite;
     bool      hasSelfCall;
     unsigned  locals;      /* slots base..base+locals-1 live in registers */
     unsigned  frameBytes;
@@ -305,6 +312,11 @@ static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
  * it is patched with the rest. */
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    /* A bail discards the compiled work and hands the call back to the
+     * interpreter, which runs it from the top. That is only sound while the
+     * body has written nothing. Recorded rather than refused here so the
+     * decision is made once, after the whole body is known. */
+    if (e->wroteHeap) e->bailAfterWrite = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
     e->fixups[e->fixupCount].conditional  = true;
@@ -633,6 +645,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                 kv == SLOT_INT ? VAL_INT : VAL_FLOAT, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
             emit(e, jaiA64StrX(rv, rr, base + 8));
+            e->wroteHeap = true;
             off += 6;
             break;
         }
@@ -1012,6 +1025,21 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     uint8_t *entry = jaiCodeArenaWrite(arena, e.code, e.count * sizeof e.code[0]);
     if (entry == NULL) return false;
     if (!jaiCodeArenaSeal(arena)) return false;
+
+    /* The tier's whole bail protocol rests on partial execution being
+     * invisible. Field writes ended that: a body that stores to an instance
+     * and then bails would have the store applied again by the interpreted
+     * re-run. Nothing in the suite hits this -- an initializer's writes come
+     * after its last guard -- but "hard to construct" is not the standard a
+     * compiled tier gets to work to. */
+    if (e.bailAfterWrite) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s declined: a bail follows a heap write\n",
+                    fn->name ? fn->name->chars : "<anon>");
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
 
     if (e.assumedIntReturn && e.returnKind != SLOT_INT) {
         /* A self-call before the first return had to guess, and guessed
