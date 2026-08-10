@@ -665,8 +665,8 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
      * a tree whose sources have moved past the seed recompiles rather than
      * running stale bytecode, because jaiDeserializeModule checks the source
      * hash. */
-    if (sLoadingFrontEnd && module->name != NULL && !seedDisabled()) {
-        const JaiSeedEntry *seeded = jaiSeedFind(module->name->chars);
+    if (sLoadingFrontEnd && !seedDisabled()) {
+        const JaiSeedEntry *seeded = jaiSeedFind(path);
         if (seeded != NULL) {
             ObjFunction *fromSeed = jaiDeserializeModule(seeded->image,
                                                          seeded->length,

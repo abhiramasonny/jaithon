@@ -20,13 +20,13 @@
 from jaithon.compile.mod import build_file
 from std.io import Path
 
-#: The tree whose modules the seed carries: the compiler, and nothing else.
+#: The tree whose modules the seed carries.
 #:
-#: The seed exists for what is needed *before* the front end can compile
-#: anything. Everything else is reached after it is loaded, through the ordinary
-#: cache. Seeding the whole of `lib` also works and costs 9MB of binary for
-#: modules the bootstrap window never asks for.
-pub let SEED_ROOT: str = "lib/jaithon"
+#: All of `lib`, not only `lib/jaithon`. The compiler imports std modules while
+#: it is itself loading -- `std.json` among them -- and those imports happen
+#: inside the bootstrap window, where the compiler does not exist yet. No "the
+#: compiler is ready now" flag can help: they are needed *during* its load.
+pub let SEED_ROOT: str = "lib"
 
 fn cache_path_for(source: str) -> str {
     let path = Path(source)
