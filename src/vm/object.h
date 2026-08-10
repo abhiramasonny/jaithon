@@ -210,6 +210,16 @@ typedef struct {
     uint32_t typeConst;   /* constant index of the caught class, or UINT32_MAX for catch-all */
 } ExceptionEntry;
 
+#define JAI_OSR_MAX 4
+
+/* A compiled loop: where it starts, and what each slot must hold to enter. */
+typedef struct {
+    uint8_t  *code;
+    uint32_t  top;
+    uint8_t   slots;
+    uint8_t   kinds[40];   /* what each slot must hold on entry */
+} JaiOsrForm;
+
 struct ObjFunction {
     Obj         obj;
     ObjString  *name;
@@ -255,10 +265,12 @@ struct ObjFunction {
     /* On-stack replacement: a compiled loop entered from the interpreter, with
      * the interpreter's own slots as its locals. This is what reaches a loop
      * in a function that runs once -- `main`, mostly. */
-    uint8_t    *osrCode;
-    uint32_t    osrTop;        /* bytecode offset of the loop head */
-    uint8_t     osrKinds[40];  /* what each slot must hold on entry */
-    uint8_t     osrSlots;
+    /* One form per loop head, not one per function. `main` in `sieve` has
+     * four loops and only the first ever compiled, because a second offset met
+     * `osrTop != top` and was refused: the loop that does the sieving was
+     * interpreted for the life of the program. */
+    JaiOsrForm  osrForms[JAI_OSR_MAX];
+    uint8_t     osrCount;
     /* Attempts so far. One look is not enough: a body can only use a callee's
      * return kind once that callee has itself compiled, and which of them have
      * depends on when the sampler happened to fire. Refusing forever on the

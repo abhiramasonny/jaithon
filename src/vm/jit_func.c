@@ -4316,13 +4316,16 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     if (entry == NULL) return false;
     if (!jaiCodeArenaSeal(arena)) return false;
 
-    fn->osrCode = entry;
-    fn->osrTop = top;
+    if (fn->osrCount >= JAI_OSR_MAX) return false;
+    JaiOsrForm *form = &fn->osrForms[fn->osrCount];
+    form->code  = entry;
+    form->top   = top;
+    form->slots = (uint8_t)e.locals;
+    for (unsigned i = 0; i < e.locals; i++) form->kinds[i] = (uint8_t)e.localKind[i];
+    fn->osrCount++;
     fn->osrHot = true;
     fn->osrDeclines = 0;
     fn->jitModuleVersion = fn->module != NULL ? fn->module->version : 0;
-    fn->osrSlots = (uint8_t)e.locals;
-    for (unsigned i = 0; i < e.locals; i++) fn->osrKinds[i] = (uint8_t)e.localKind[i];
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u: %u instructions\n",
                 fn->name ? fn->name->chars : "<anon>", top, e.count);
@@ -4352,23 +4355,27 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         if (r->step != 1) return 0;
     }
 
-    if (fn->osrCode == NULL) {
-        if (fn->osrRefused) return 0;
+    JaiOsrForm *form = NULL;
+    for (unsigned i = 0; i < fn->osrCount; i++) {
+        if (fn->osrForms[i].top == top) { form = &fn->osrForms[i]; break; }
+    }
+    if (form == NULL) {
+        if (fn->osrRefused || fn->osrCount >= JAI_OSR_MAX) return 0;
         if (!compileOsr(closure, top, frame->slots, hasIter, false) &&
             !compileOsr(closure, top, frame->slots, hasIter, true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
-            if (++fn->osrAttempts >= 5) fn->osrRefused = true;
+            if (++fn->osrAttempts >= 5 * JAI_OSR_MAX) fn->osrRefused = true;
             return 0;
         }
+        form = &fn->osrForms[fn->osrCount - 1];
     }
-    if (fn->osrTop != top) return 0;
     if (fn->module == NULL || fn->module->version != fn->jitModuleVersion) return 0;
 
     /* Every slot must still hold what it held when this was compiled. */
-    for (unsigned i = 0; i < fn->osrSlots; i++) {
+    for (unsigned i = 0; i < form->slots; i++) {
         Value v = frame->slots[i];
-        switch ((SlotKind)fn->osrKinds[i]) {
+        switch ((SlotKind)form->kinds[i]) {
         case SLOT_INT:   if (!IS_INT(v))   return 0; break;
         case SLOT_FLOAT: if (!IS_FLOAT(v)) return 0; break;
         case SLOT_BOOL:  if (!IS_BOOL(v))  return 0; break;
@@ -4380,7 +4387,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     gDeopt.nstack = 0;
     gDeopt.base = 0;
-    int64_t at = ((OsrFnIter)(uintptr_t)fn->osrCode)(frame->slots, iter);
+    int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
     if (at == -1) return 0;
     if (at == -2) return 2;              /* an exception is pending */
     if (gDeopt.base != 0) vm.stackTop--;   /* the exhausted iterator */

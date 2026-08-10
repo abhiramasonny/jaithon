@@ -2376,7 +2376,11 @@ static bool safepoint(void) {
         ObjFunction *f = top->closure->fn;
         if (f->osrHot) {
             uint32_t at = (uint32_t)(top->ip - f->chunk.code);
-            if (at == f->osrTop) {
+            bool compiled = false;
+            for (unsigned i = 0; i < f->osrCount; i++) {
+                if (f->osrForms[i].top == at) { compiled = true; break; }
+            }
+            if (compiled) {
                 uint32_t resumeAt = 0;
                 int outcome = jaiJitEnterOsr(top->closure, at, &resumeAt);
                 if (outcome == 2) return false;
