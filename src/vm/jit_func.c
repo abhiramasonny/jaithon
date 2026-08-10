@@ -3349,6 +3349,34 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             e.code[f->instIndex] = jaiA64B(rel);
         }
     }
+    /* JAI_JIT_DUMP=<function> writes that function's words to
+     * jit_<function>.bin and prints the bytecode-offset-to-instruction map, so
+     * generated code can be read back:
+     *
+     *     llvm-mc --disassemble --triple=aarch64
+     *
+     * on the file's bytes. Reading the code is how the register plan gets
+     * checked at all -- three of the bugs in this tier were found no other
+     * way, and none of them were visible in the emitter's own bookkeeping. */
+    {
+        const char *dump = getenv("JAI_JIT_DUMP");
+        if (dump != NULL && fn->name != NULL &&
+            strcmp(dump, fn->name->chars) == 0) {
+            char path[256];
+            snprintf(path, sizeof path, "jit_%s.bin", fn->name->chars);
+            FILE *fp = fopen(path, "wb");
+            if (fp != NULL) {
+                fwrite(e.code, sizeof e.code[0], e.count, fp);
+                fclose(fp);
+                fprintf(stderr, "[jit] %u words to %s\n", e.count, path);
+                for (unsigned i = 0; i <= (unsigned)fn->chunk.count; i++) {
+                    if (map[i] >= 0) {
+                        fprintf(stderr, "[jit] bc %u is inst %d\n", i, map[i]);
+                    }
+                }
+            }
+        }
+    }
     jitFree(map, depths, fn->chunk.count + 1);
 
     /* A `bl` at instruction i must reach instruction 0 of this function, so
