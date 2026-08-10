@@ -64,6 +64,10 @@ void jaiJitStartSampling(void);
  * being tight. */
 void jaiJitSample(ObjClosure *closure, uint32_t offset);
 
+/* Enter a compiled loop at `targetOffset`, compiling it first if this is the
+ * first hot tick to land there. See jit_loop.c for the contract on `ip`. */
+bool jaiJitEnterLoop(ObjClosure *closure, uint32_t targetOffset);
+
 /* Whether the tier is enabled at all. JAITHON_NO_JIT=1 turns it off, so a
  * measurement can be taken against the interpreter without rebuilding. */
 bool jaiJitEnabled(void);
@@ -99,5 +103,10 @@ uint8_t *jaiCodeArenaWrite(JaiCodeArena *arena, const void *bytes, size_t length
 /* Flip to read-execute and invalidate the instruction cache. */
 bool jaiCodeArenaSeal(JaiCodeArena *arena);
 void jaiCodeArenaFree(JaiCodeArena *arena);
+
+/* The one arena compiled code lives in. Never freed: a compiled function is
+ * reachable for the life of the process, and reclaiming code while a frame
+ * might return into it is a problem this tier does not have yet. */
+JaiCodeArena *jaiJitArena(void);
 
 #endif /* JAI_VM_JIT_H */
