@@ -1053,9 +1053,19 @@ static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) 
  * frame is on top and that happened to be the right one. */
 static CallOutcome callClosure(ObjClosure *closure, int argc) {
     Value *slotBase = vm.stackTop - argc - 1;
-    if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
-
     ObjFunction *fn = closure->fn;
+
+    /* Ahead of bindCallArgs on purpose. Compiled code never reads the VM
+     * stack, so clearing a frame window it will not look at, and growing the
+     * stack for slots it will not use, is pure cost -- and on a small hot
+     * function called from an interpreted loop that entry cost was most of
+     * what the tier had to give. */
+    if (fn->jitFunc != NULL && argc == (int)fn->arity &&
+        jaiJitEnterFunc(closure, slotBase)) {
+        return CALL_DONE;
+    }
+
+    if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
     if (fn->entryCount < JAI_JIT_THRESHOLD) {
         fn->entryCount++;
     } else if (!fn->jitRefused && jaiJitEnabled() &&
@@ -2844,6 +2854,14 @@ uint64_t jaiPropRecv[32];
         vm.stackTop = stackTop;                                                \
     } while (0)
 
+/* After a call that completed without pushing a frame, the frame, its ip, its
+ * slots and its constants are all exactly as they were -- the frame array and
+ * the value stack are both fixed-capacity, so neither can have moved. Only the
+ * stack top changed. LOAD_STATE's six loads, one of them a three-deep chase to
+ * the constant pool, buy nothing there, and every native call was paying
+ * them. instStart needs no restoring because VM_NEXT sets it. */
+#define LOAD_STACK_ONLY()  (stackTop = vm.stackTop)
+
 #define LOAD_STATE()                                                           \
     do {                                                                       \
         frame = &vm.frames[vm.frameCount - 1];                                 \
@@ -3970,11 +3988,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
          * Anything else -- natives, bound methods, classes, functions without a
          * closure -- takes the general path unchanged. */
         Value callee = vm.stackTop[-argc - 1];
-        if (JAI_LIKELY(IS_CLOSURE(callee))) {
-            if (callClosure(AS_CLOSURE(callee), argc) == CALL_ERROR) goto vmThrow;
-        } else if (callValueOnStack(argc) == CALL_ERROR) {
-            goto vmThrow;
-        }
+        CallOutcome outcome = JAI_LIKELY(IS_CLOSURE(callee))
+                                  ? callClosure(AS_CLOSURE(callee), argc)
+                                  : callValueOnStack(argc);
+        if (outcome == CALL_ERROR) goto vmThrow;
+        if (outcome == CALL_DONE) { LOAD_STACK_ONLY(); VM_NEXT(); }
         LOAD_STATE();
         VM_NEXT();
     }

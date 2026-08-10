@@ -50,10 +50,13 @@
 /* Run-time state shared with compiled code                             */
 /* ------------------------------------------------------------------ */
 
-/* Set to 1 by compiled code that could not finish. Read once per outer call.
- * Not thread-local: the VM is single-threaded, and a second thread running
- * compiled code would have a great deal more than this to sort out. */
-static int64_t sBailed;
+/* Compiled code returns two words: the value in x0 and whether it gave up in
+ * x1. AAPCS64 returns a 16-byte struct of integers in exactly that pair, so
+ * the flag costs no memory traffic at all -- it used to be a global, which was
+ * a store and a load on every single call. A recursive call propagates it:
+ * a callee that bailed sends its caller straight to its own bail block, so the
+ * whole recursion unwinds at once instead of computing on with a junk value. */
+typedef struct { int64_t value; int64_t bailed; } JitResult;
 
 /* The lowest stack address compiled code may use, computed from the thread's
  * real bounds rather than from wherever the compile happened to run. Deriving
@@ -119,7 +122,6 @@ typedef struct {
     unsigned  savedCount;
 
     int       limitLiteral;  /* instruction index of the stack-limit word */
-    int       bailLiteral;   /* instruction index of the &sBailed word */
     int       bailBlock;     /* instruction index of the bail sequence */
 
     bool      failed;
@@ -207,7 +209,8 @@ static void emitSaveRestore(Emit *e, bool save) {
     }
 }
 
-static void emitEpilogue(Emit *e) {
+static void emitEpilogue(Emit *e, unsigned bailed) {
+    emit(e, jaiA64MovzX(1, bailed, 0));
     emitSaveRestore(e, false);
     emit(e, jaiA64LdpPost(29, 30, 31, (int32_t)e->frameBytes));
     emit(e, jaiA64Ret());
@@ -428,6 +431,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * locals and the recursion would never terminate. */
             branchTo(e, FIXUP_ENTRY, false, 0);
             e->code[e->count - 1] = jaiA64Bl(0);
+            /* x1 carries the callee's verdict; a bail there is a bail here. */
+            emit(e, jaiA64SubsXImm(31, 1, 0));
+            branchOnCondition(e, JAI_A64_NE);
 
             e->depth      -= argc + 1;
             e->valueDepth -= argc;
@@ -441,7 +447,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned r;
             if (!popValue(e, &r)) return false;
             emit(e, jaiA64MovX(0, r));
-            emitEpilogue(e);
+            emitEpilogue(e, 0);
             off += 1;
             break;
         }
@@ -499,7 +505,6 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
     e.limitLiteral = -1;
-    e.bailLiteral  = -1;
     e.bailBlock    = -1;
 
     /* The prologue cannot be emitted first: its save set depends on how deep
@@ -561,12 +566,8 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     /* The bail block: say so, return anything, and let the caller throw the
      * whole computation away. */
     e.bailBlock = (int)e.count;
-    int bailLoad = (int)e.count;
-    emit(&e, jaiA64LdrLit(JIT_SCRATCH_A, 0));         /* patched below */
-    emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 1, 0));
-    emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
     emit(&e, jaiA64MovzX(0, 0, 0));
-    emitEpilogue(&e);
+    emitEpilogue(&e, 1);
 
     /* Literal pool, 8-byte aligned so the 64-bit loads are aligned. */
     if ((e.count & 1u) != 0) emit(&e, jaiA64Nop());
@@ -575,16 +576,11 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     if (limit == 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
     emit(&e, (uint32_t)(uint64_t)limit);
     emit(&e, (uint32_t)((uint64_t)limit >> 32));
-    e.bailLiteral = (int)e.count;
-    uintptr_t bailAddr = (uintptr_t)&sBailed;
-    emit(&e, (uint32_t)(uint64_t)bailAddr);
-    emit(&e, (uint32_t)((uint64_t)bailAddr >> 32));
 
     if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
     /* Patch the two literal loads and the guard branch. */
     e.code[guardLoad] = jaiA64LdrLit(JIT_SCRATCH_A, e.limitLiteral - guardLoad);
-    e.code[bailLoad]  = jaiA64LdrLit(JIT_SCRATCH_A, e.bailLiteral - bailLoad);
     e.code[guardBranch] =
         jaiA64BCond(JAI_A64_LO, e.bailBlock - (int)guardBranch);
 
@@ -655,10 +651,10 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
 /* Entry from the interpreter                                          */
 /* ------------------------------------------------------------------ */
 
-typedef int64_t (*Fn1)(int64_t);
-typedef int64_t (*Fn2)(int64_t, int64_t);
-typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
-typedef int64_t (*Fn4)(int64_t, int64_t, int64_t, int64_t);
+typedef JitResult (*Fn1)(int64_t);
+typedef JitResult (*Fn2)(int64_t, int64_t);
+typedef JitResult (*Fn3)(int64_t, int64_t, int64_t);
+typedef JitResult (*Fn4)(int64_t, int64_t, int64_t, int64_t);
 
 bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
@@ -682,17 +678,16 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         a[i] = AS_INT(v);
     }
 
-    sBailed = 0;
-    int64_t result;
+    JitResult r;
     switch (arity) {
-    case 1: result = ((Fn1)(uintptr_t)fn->jitFunc)(a[0]); break;
-    case 2: result = ((Fn2)(uintptr_t)fn->jitFunc)(a[0], a[1]); break;
-    case 3: result = ((Fn3)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2]); break;
-    case 4: result = ((Fn4)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2], a[3]); break;
+    case 1: r = ((Fn1)(uintptr_t)fn->jitFunc)(a[0]); break;
+    case 2: r = ((Fn2)(uintptr_t)fn->jitFunc)(a[0], a[1]); break;
+    case 3: r = ((Fn3)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2]); break;
+    case 4: r = ((Fn4)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2], a[3]); break;
     default: return false;
     }
 
-    if (sBailed) {
+    if (r.bailed) {
         /* Overflow or a stack that ran low. Nothing was written -- the body
          * cannot write -- so handing the call back to the interpreter is
          * enough, and it will raise the error with a traceback. Refusing the
@@ -703,7 +698,7 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         return false;
     }
 
-    slotBase[0] = INT_VAL(result);
+    slotBase[0] = INT_VAL(r.value);
     vm.stackTop = slotBase + 1;
     return true;
 }
