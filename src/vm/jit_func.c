@@ -385,6 +385,10 @@ typedef struct {
      * register, and every way out writes it back so the interpreter can carry
      * on from wherever this stopped. */
     bool      hasIter;
+    /* Locals in registers rather than written through to the slots on every
+     * access. The entry already checks every slot's kind before calling, so
+     * the prologue only has to load payloads; every exit writes them back. */
+    bool      osrRegLocals;
     bool      pendingRange;
     bool      genericIter;
     bool      rangeInclusive;
@@ -455,12 +459,19 @@ static void emit(Emit *e, uint32_t word) {
 #define JIT_IDX_REG   (JIT_FIRST_SAVED + 2u)
 #define JIT_LIM_REG   (JIT_FIRST_SAVED + 3u)
 
+/* Registers OSR keeps for itself: the slots pointer, and for a range loop the
+ * iterator, its index and its limit. */
+static unsigned osrReserved(const Emit *e) { return e->hasIter ? 4u : 1u; }
+
 static unsigned regBase(const Emit *e) {
-    if (e->osr) return e->hasIter ? 4u : 1u;
+    if (e->osr) {
+        return osrReserved(e) + (e->osrRegLocals ? e->locals : 0u);
+    }
     return e->spilled ? 0u : e->locals;
 }
 
 static unsigned localReg(const Emit *e, unsigned slot) {
+    if (e->osr) return JIT_FIRST_SAVED + osrReserved(e) + slot;
     return JIT_FIRST_SAVED + (slot - e->base);
 }
 
@@ -473,6 +484,7 @@ static unsigned localFrameOff(const Emit *e, unsigned slot) {
  * `scratch`. Only the payload moves: a local's kind is fixed for the whole
  * function, so the tag never needs storing. */
 static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
+    if (e->osr && e->osrRegLocals) return localReg(e, slot);
     if (e->osr) {
         emit(e, jaiA64LdrX(scratch, JIT_SLOTS_REG, slot * 16u + 8u));
         return scratch;
@@ -490,11 +502,16 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
  * float add landed in x21 and the induction variable became a bit pattern, so
  * the loop finished early or never finished, depending on the value. */
 static unsigned localDest(const Emit *e, unsigned slot) {
+    if (e->osr && e->osrRegLocals) return localReg(e, slot);
     if (e->osr || e->spilled) return JIT_SCRATCH_C;
     return localReg(e, slot);
 }
 
 static void localOut(Emit *e, unsigned slot, unsigned src) {
+    if (e->osr && e->osrRegLocals) {
+        if (src != localReg(e, slot)) emit(e, jaiA64MovX(localReg(e, slot), src));
+        return;
+    }
     if (e->osr) {
         /* Tag as well as payload: writing straight through is what lets a
          * deopt here cost nothing. The kind is fixed for the compile. */
@@ -3057,6 +3074,30 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.offsetToInst = map;
     e.offsetToDepth = depths;
     e.savedCount = JIT_MAX_SAVED;
+    /* Registers if they fit, memory otherwise. The reserved four (or one) plus
+     * the locals plus the deepest expression must all sit inside the ten
+     * callee-saved registers; a first pass measures the last of those. */
+    {
+        static Emit probe;
+        memset(&probe, 0, sizeof probe);
+        probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
+        probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
+        probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
+        probe.offsetToInst = map; probe.offsetToDepth = depths;
+        probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
+        for (unsigned i = 0; i < e.locals; i++) {
+            probe.localKind[i]  = e.localKind[i];
+            probe.localShape[i] = e.localShape[i];
+            probe.localClass[i] = e.localClass[i];
+            probe.localTyped[i] = e.localTyped[i];
+            probe.localSeen[i]  = e.localSeen[i];
+        }
+        if (compileBody(&probe, closure) && !probe.failed &&
+            osrReserved(&e) + e.locals + probe.maxValue <= JIT_MAX_SAVED) {
+            e.osrRegLocals = true;
+        }
+        for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
+    }
 
     /* Each slot takes the kind it holds right now. The entry re-checks them on
      * every later entry, so this is a specialisation, not an assumption. */
@@ -3088,6 +3129,13 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
     emitSaveRestore(&e, true);
     emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
+    if (e.osrRegLocals) {
+        /* Payloads only: the entry has already checked every slot's kind, so
+         * there is nothing left to guard here. */
+        for (unsigned i = 0; i < e.locals; i++) {
+            emit(&e, jaiA64LdrX(localReg(&e, i), JIT_SLOTS_REG, i * 16u + 8u));
+        }
+    }
     if (hasIter) {
         emit(&e, jaiA64MovX(JIT_ITER_REG, 1));
         emit(&e, jaiA64LdrX(JIT_IDX_REG, JIT_ITER_REG,
@@ -3108,11 +3156,29 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     /* Falling off the end of the compiled range is the loop exiting there. */
     if (e.exitCount >= 8) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
+/* Every way out writes back what the loop was holding: the iterator's index,
+ * and the locals if they were living in registers. Miss one and the
+ * interpreter carries on from stale values. */
 #define OSR_SYNC_ITER()                                                        \
     do {                                                                       \
         if (hasIter) {                                                         \
             emit(&e, jaiA64StrX(JIT_IDX_REG, JIT_ITER_REG,                     \
                                 (unsigned)offsetof(ObjIter, index)));          \
+        }                                                                      \
+        if (e.osrRegLocals) {                                                  \
+            for (unsigned li = 0; li < e.locals; li++) {                       \
+                SlotKind lk = e.localKind[li];                                 \
+                unsigned lt = lk == SLOT_INT   ? VAL_INT                       \
+                            : lk == SLOT_FLOAT ? VAL_FLOAT                     \
+                            : lk == SLOT_BOOL  ? VAL_BOOL                      \
+                            : lk == SLOT_OPAQUE ? VAL_NULL                     \
+                                               : VAL_OBJ;                      \
+                if (lt == VAL_NULL) continue;                                  \
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_D, lt, 0));                   \
+                emit(&e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, li * 16u));  \
+                emit(&e, jaiA64StrX(localReg(&e, li), JIT_SLOTS_REG,           \
+                                    li * 16u + 8u));                           \
+            }                                                                  \
         }                                                                      \
     } while (0)
 
