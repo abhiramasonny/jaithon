@@ -65,6 +65,27 @@ pub const FLAG_DEBUG: int = 1
 #: Header flag: built with `--release`, so assertions were stripped.
 pub const FLAG_RELEASE: int = 2
 
+#: Where the optimisation level lives in the container flags, matching
+#: `JAIC_FLAG_OPT_SHIFT` and `JAIC_FLAG_OPT_MASK` in `src/vm/serialize.h`.
+#:
+#: The C driver's `cacheFlagsFor` folds the level into the flags and then
+#: demands the stored flags equal what it expects, so an image written without
+#: these bits is never accepted as a cache entry. It is still loadable as a
+#: seed, which is why the gap hid: every module this front end compiled was
+#: written to __jaicache__, rejected on the next run, and served from the seed
+#: instead -- so an edit to the compiler never took effect.
+pub const FLAG_OPT_SHIFT: int = 3
+pub const FLAG_OPT_MASK: int = 3 << 3
+
+#: `flags` for a build at `opt_level`, as the C loader expects them.
+pub fn flags_for(release: bool, opt_level: int) -> int {
+    var level = opt_level
+    if level < 0 { level = 0 }
+    if level > 3 { level = 3 }
+    let base = if release { FLAG_RELEASE } else { FLAG_DEBUG }
+    return base | ((level << FLAG_OPT_SHIFT) & FLAG_OPT_MASK)
+}
+
 #: The `nameIndex` that means "this record has no name".
 pub const NO_NAME: int = 4294967295
 
