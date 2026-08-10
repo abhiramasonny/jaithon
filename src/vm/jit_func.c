@@ -80,8 +80,8 @@ static uintptr_t stackLimit(void) {
 /* Register plan                                                        */
 /* ------------------------------------------------------------------ */
 
-#define JIT_FIRST_SAVED 19u   /* x19..x27 are callee-saved and ours */
-#define JIT_MAX_SAVED    9u
+#define JIT_FIRST_SAVED 19u   /* x19..x28 are callee-saved and ours */
+#define JIT_MAX_SAVED   10u
 #define JIT_MAX_ARITY    4u   /* arguments arrive in x0..x3 */
 #define JIT_MAX_INSTS  512u
 #define JIT_SCRATCH_A    9u
@@ -128,6 +128,16 @@ typedef struct {
     SlotKind  stack[JIT_MAX_SAVED];
     uint32_t  stackShape[JIT_MAX_SAVED];  /* class shapeId for SLOT_INST */
     ObjClass *stackClass[JIT_MAX_SAVED];
+    Value     stackSeen[JIT_MAX_SAVED];   /* the live value, for field feedback */
+    int       stackLocal[JIT_MAX_SAVED];  /* which local it was copied from, or -1 */
+
+    /* Fields this body has already stored, and with what kind. A read of one
+     * of them needs no tag check: nothing can have changed it, because the
+     * body cannot call. That matters more than it sounds -- `self.n = self.n +
+     * 1; return self.n` is the commonest shape there is, and without this the
+     * trailing read is a bail after a write, which the tier refuses. */
+    struct { int local; uint16_t field; SlotKind kind; } known[16];
+    unsigned  knownCount;
     SlotKind  localKind[JIT_MAX_SAVED + 1];
     uint32_t  localShape[JIT_MAX_SAVED + 1];
     ObjClass *localClass[JIT_MAX_SAVED + 1];
@@ -203,7 +213,8 @@ static unsigned pushReg(const Emit *e) {
            e->valueDepth;
 }
 
-static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
+static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
+                       Value seen, int fromLocal) {
     if (e->depth >= JIT_MAX_SAVED) return false;
     if (e->locals + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
         JIT_MAX_SAVED) {
@@ -211,10 +222,45 @@ static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
     }
     e->stackShape[e->depth] = shape;
     e->stackClass[e->depth] = klass;
+    e->stackSeen[e->depth]  = seen;
+    e->stackLocal[e->depth] = fromLocal;
     e->stack[e->depth++] = kind;
     e->valueDepth++;
     if (e->valueDepth > e->maxValue) e->maxValue = e->valueDepth;
     return true;
+}
+
+static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
+    return pushValue3(e, kind, shape, klass, NULL_VAL, -1);
+}
+
+/* The kind a field is known to hold, or SLOT_SELF for "not known". */
+static SlotKind knownFieldKind(const Emit *e, int local, uint16_t field) {
+    if (local < 0) return SLOT_SELF;
+    for (unsigned i = 0; i < e->knownCount; i++) {
+        if (e->known[i].local == local && e->known[i].field == field) {
+            return e->known[i].kind;
+        }
+    }
+    return SLOT_SELF;
+}
+
+/* Record a store, and drop what any other receiver claimed about the same
+ * field: two locals can name the same object, so a store through one has to
+ * retire the other's knowledge. */
+static void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) {
+    unsigned out = 0;
+    for (unsigned i = 0; i < e->knownCount; i++) {
+        if (e->known[i].field == field) continue;
+        e->known[out++] = e->known[i];
+    }
+    e->knownCount = out;
+    if (local < 0) return;
+    if (e->knownCount >= 16) return;
+    e->known[e->knownCount].local = local;
+    e->known[e->knownCount].field = field;
+    e->known[e->knownCount].kind  = kind;
+    e->knownCount++;
 }
 
 static bool pushSelf(Emit *e) {
@@ -370,7 +416,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!localInRange(e, slot)) return false;
             if (e->localKind[slot] == SLOT_OPAQUE) return false;
             if (slot == 0) e->usesSlot0 = true;
-            if (!pushValue(e, e->localKind[slot], e->localShape[slot], e->localClass[slot])) return false;
+            if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
+                            e->localClass[slot],
+                            localObserved(e, slot) ? e->observed[slot]
+                                                   : NULL_VAL,
+                            (int)slot)) {
+                return false;
+            }
             emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
             off += 3;
             break;
@@ -581,12 +633,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned base = (unsigned)offsetof(ObjInstance, fields) +
                             (unsigned)info->slot * (unsigned)sizeof(Value);
-            /* The tag is checked every time. A field is not typed by the
-             * runtime, so a later int where a float was seen must bail rather
-             * than be read as one. */
-            emit(e, jaiA64LdrW(JIT_SCRATCH_A, localReg(e, slot), base));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
-            branchOnCondition(e, JAI_A64_NE);
+            /* The tag is checked every time, unless this body wrote the field
+             * itself. A field is not typed by the runtime, so a later int
+             * where a float was seen must bail rather than be read as one. */
+            SlotKind already = knownFieldKind(e, (int)slot, info->slot);
+            if (already != SLOT_SELF) {
+                kind = already;
+            } else {
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, localReg(e, slot), base));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
+                branchOnCondition(e, JAI_A64_NE);
+            }
 
             if (!pushValue(e, kind, 0, NULL)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, localReg(e, slot), base + 8));
@@ -602,7 +659,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!localInRange(e, slot)) return false;
                 if (e->localKind[slot] == SLOT_OPAQUE) return false;
                 if (slot == 0) e->usesSlot0 = true;
-                if (!pushValue(e, e->localKind[slot], e->localShape[slot], e->localClass[slot])) {
+                if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
+                                e->localClass[slot],
+                                localObserved(e, slot) ? e->observed[slot]
+                                                       : NULL_VAL,
+                                (int)slot)) {
                     return false;
                 }
                 emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
@@ -619,6 +680,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * any guess a silently wrong field offset. */
             if (e->depth < 2) return false;
             ObjClass *klass = e->stackClass[e->depth - 2];
+            int recvLocal = e->stackLocal[e->depth - 2];
 
             unsigned rv, rr;
             SlotKind kv, kr;
@@ -645,6 +707,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                 kv == SLOT_INT ? VAL_INT : VAL_FLOAT, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
             emit(e, jaiA64StrX(rv, rr, base + 8));
+            recordFieldStore(e, recvLocal, info->slot, kv);
             e->wroteHeap = true;
             off += 6;
             break;
@@ -700,6 +763,53 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!pushValue(e, kind, 0, NULL)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
             off += 2;
+            break;
+        }
+
+        case OP_GET_FIELD: {
+            /* Same as OP_GET_FIELD_LOCAL, but the receiver arrives on the
+             * operand stack -- which is what a compound assignment emits,
+             * since it pushes the receiver twice. */
+            uint32_t nameIdx = jaiReadU24(code + off + 1);
+            if (e->depth == 0) return false;
+            ObjClass *klass = e->stackClass[e->depth - 1];
+            Value seen = e->stackSeen[e->depth - 1];
+            int fromLocal = e->stackLocal[e->depth - 1];
+
+            unsigned rr;
+            SlotKind kr;
+            if (!popValue(e, &rr, &kr)) return false;
+            if (kr != SLOT_INST || klass == NULL) return false;
+            if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+            Value nameVal = fn->chunk.constants.data[nameIdx];
+            if (!IS_STRING(nameVal)) return false;
+
+            const FieldInfo *info = jaiClassFieldInfo(klass, AS_STRING(nameVal));
+            if (info == NULL || info->isStatic) return false;
+            if (!IS_INSTANCE(seen)) return false;
+            ObjInstance *inst = AS_INSTANCE(seen);
+            if (info->slot >= inst->fieldCount) return false;
+            Value fieldVal = inst->fields[info->slot];
+
+            SlotKind kind;
+            unsigned tag;
+            if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
+            else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            else return false;
+
+            unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
+                             (unsigned)info->slot * (unsigned)sizeof(Value);
+            SlotKind already = knownFieldKind(e, fromLocal, info->slot);
+            if (already != SLOT_SELF) {
+                kind = already;
+            } else {
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr, fbase));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
+                branchOnCondition(e, JAI_A64_NE);
+            }
+            if (!pushValue(e, kind, 0, NULL)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
+            off += 6;
             break;
         }
 
@@ -821,7 +931,10 @@ static void jitFree(int *map, int *depths, int count) {
 
 static bool eligible(ObjFunction *fn) {
     const char *why = NULL;
-    if (fn->arity == 0 || fn->arity > JIT_MAX_ARITY) why = "arity";
+    /* Arity 0 is allowed: a method whose only parameter is the receiver has
+     * arity 0, and getters are the commonest shape there is. A plain function
+     * with no arguments reaches here too and declines on its opcodes. */
+    if (fn->arity > JIT_MAX_ARITY) why = "arity";
     else if (fn->maxSlots < 1 || (unsigned)fn->maxSlots - 1 > JIT_MAX_SAVED) why = "maxSlots";
     else if (fn->defaultCount != 0) why = "defaults";
     else if (fn->flags & (FN_VARIADIC | FN_KWREST)) why = "flags";
@@ -1072,6 +1185,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 /* Entry from the interpreter                                          */
 /* ------------------------------------------------------------------ */
 
+typedef JitResult (*Fn0)(void);
 typedef JitResult (*Fn1)(int64_t);
 typedef JitResult (*Fn2)(int64_t, int64_t);
 typedef JitResult (*Fn3)(int64_t, int64_t, int64_t);
@@ -1137,6 +1251,7 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
 
     JitResult r;
     switch (arity) {
+    case 0: r = ((Fn0)(uintptr_t)fn->jitFunc)(); break;
     case 1: r = ((Fn1)(uintptr_t)fn->jitFunc)(a[0]); break;
     case 2: r = ((Fn2)(uintptr_t)fn->jitFunc)(a[0], a[1]); break;
     case 3: r = ((Fn3)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2]); break;
