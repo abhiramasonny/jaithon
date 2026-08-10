@@ -38,6 +38,7 @@
 #include "jit.h"
 
 #include "jit_arm64.h"
+#include "gc.h"
 #include "vm.h"
 
 #include <stdio.h>
@@ -76,6 +77,7 @@ static uintptr_t stackLimit(void) {
     return (uintptr_t)top - size + (256u * 1024u);
 }
 
+
 /* ------------------------------------------------------------------ */
 /* Register plan                                                        */
 /* ------------------------------------------------------------------ */
@@ -87,6 +89,40 @@ static uintptr_t stackLimit(void) {
 #define JIT_SCRATCH_A    9u
 #define JIT_SCRATCH_B   10u
 
+/* ------------------------------------------------------------------ */
+/* Calling out of compiled code                                         */
+/* ------------------------------------------------------------------ */
+
+#define JIT_MAX_ARGS_OUT 4
+
+/* Built on the compiled frame and handed to the helper below. Values first, so
+ * every field is 8-aligned and the emitted stores can use the scaled forms. */
+typedef struct {
+    Value   callee;
+    Value   args[JIT_MAX_ARGS_OUT];
+    Value   roots[JIT_MAX_SAVED];
+    Value   result;
+    int64_t argc;
+    int64_t nroots;
+} JitCallDesc;
+
+/* The one thing compiled code cannot do for itself.
+ *
+ * `roots` is why this is a C helper rather than an emitted sequence: the callee
+ * can allocate, and an allocation can collect, and every instance this body is
+ * holding lives in a callee-saved register the collector has never heard of.
+ * Pushing them as temporary roots is three lines here and a page of emission
+ * otherwise. The pointers in the registers stay valid across it because the
+ * collector does not move objects -- only reachability was ever in question.
+ *
+ * Returns 0 on success and 1 with an exception pending. */
+static int jitCallOut(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
+    jaiGCPopRoots((int)d->nroots);
+    return ok ? 0 : 1;
+}
+
 /* One entry of the compile-time operand stack. A `self` entry is the callee of
  * a recursive call: it names this function and occupies no register, which is
  * why register numbers are derived from the count of value entries below an
@@ -97,7 +133,8 @@ typedef enum {
     SLOT_INST,    /* ObjInstance *, raw, of a class fixed at compile time */
     SLOT_SELF,    /* this function, as a callee; occupies no register */
     SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
-    SLOT_CLOSURE  /* the running closure, for reaching its upvalues */
+    SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
+    SLOT_CLASS    /* a class resolved at compile time; only ever a callee */
 } SlotKind;
 
 /* Floats live in X registers and visit d0/d1 only for the arithmetic itself.
@@ -108,11 +145,14 @@ typedef enum {
 #define JIT_FSCRATCH_A 0u
 #define JIT_FSCRATCH_B 1u
 
-static bool holdsRegister(SlotKind k) { return k != SLOT_SELF; }
+static bool holdsRegister(SlotKind k) {
+    return k != SLOT_SELF && k != SLOT_CLASS;
+}
 
 /* Two targets are not bytecode offsets at all. */
 #define FIXUP_BAIL   UINT32_MAX
 #define FIXUP_ENTRY  (UINT32_MAX - 1u)
+#define FIXUP_THREW  (UINT32_MAX - 2u)
 
 typedef struct {
     int      instIndex;    /* which emitted instruction to patch */
@@ -169,6 +209,11 @@ typedef struct {
      * second time. See branchOnCondition. */
     bool      wroteHeap;
     bool      bailAfterWrite;
+    bool      callsOut;      /* the body reaches out to another function */
+    const char *whyNot;
+    uint8_t     lastOp;
+    unsigned  descOffset;    /* JitCallDesc within the compiled frame */
+    int       exceptionExit; /* instruction index of the "callee threw" exit */
     bool      hasSelfCall;
     unsigned  locals;      /* slots base..base+locals-1 live in registers */
     unsigned  frameBytes;
@@ -388,6 +433,18 @@ static bool negatedCondition(uint8_t cmp, unsigned *out) {
 }
 
 /* Does this OP_GET_GLOBAL name the function being compiled? */
+/* The class a global names, or NULL when it names something else. */
+static ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
+    ObjFunction *fn = closure->fn;
+    if (fn->module == NULL) return NULL;
+    if (nameIdx >= (uint32_t)fn->chunk.constants.count) return NULL;
+    Value name = fn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(name)) return NULL;
+    Value bound;
+    if (!jaiModuleGet(fn->module, AS_STRING(name), &bound)) return NULL;
+    return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
+}
+
 static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
     ObjFunction *fn = closure->fn;
     if (fn->module == NULL) return false;
@@ -400,6 +457,107 @@ static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
     return IS_CLOSURE(bound) && AS_CLOSURE(bound)->fn == fn;
 }
 
+/* A callee that is not this function: only a class, whose result is an
+ * instance of a shape known here. Anything else would need a guard on a return
+ * value nothing can predict. */
+static bool isClassCallee(const Emit *e, unsigned argc) {
+    return e->depth >= argc + 1u &&
+           e->stack[e->depth - argc - 1] == SLOT_CLASS;
+}
+
+static bool emitCallOut(Emit *e, unsigned argc) {
+    if (argc > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
+    if (!e->callsOut) { e->whyNot = "callsOut off"; return false; }
+    ObjClass *cls = e->stackClass[e->depth - argc - 1];
+    if (cls == NULL) { e->whyNot = "callee class"; return false; }
+
+                unsigned d = e->descOffset;
+    /* The callee. */
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+    emit(e, jaiA64StrW(JIT_SCRATCH_A, 31,
+               d + (unsigned)offsetof(JitCallDesc, callee)));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)cls);
+    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+               d + (unsigned)offsetof(JitCallDesc, callee) + 8));
+
+    /* The arguments, in the registers just below the top. */
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned idx = e->depth - argc + i;
+        SlotKind k = e->stack[idx];
+        unsigned tag = k == SLOT_INT   ? VAL_INT
+             : k == SLOT_FLOAT ? VAL_FLOAT
+                               : VAL_OBJ;
+        if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_INST) {
+    return false;
+        }
+        unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
+              i * (unsigned)sizeof(Value);
+        unsigned reg = JIT_FIRST_SAVED + e->locals +
+               (e->usesUpvalues ? 1u : 0u) +
+               (idx - (e->depth - e->valueDepth));
+        emit(e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+        emit(e, jaiA64StrX(reg, 31, at + 8));
+    }
+
+    /* Everything this body is holding that the collector must see:
+     * the callee can allocate. */
+    unsigned nroots = 0;
+    for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
+        if (e->localKind[slot] != SLOT_INST) continue;
+        if (nroots >= JIT_MAX_SAVED) return false;
+        unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
+              nroots * (unsigned)sizeof(Value);
+        emit(e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+        emit(e, jaiA64StrX(localReg(e, slot), 31, at + 8));
+        nroots++;
+    }
+
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, argc, 0));
+    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+               d + (unsigned)offsetof(JitCallDesc, argc)));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, nroots, 0));
+    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+               d + (unsigned)offsetof(JitCallDesc, nroots)));
+
+    emit(e, jaiA64AddXImm(0, 31, d));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitCallOut);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+
+    /* Nonzero means the callee raised; the interpreter owns the
+     * exception from here and must not re-run this call. */
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+
+    /* The arguments hold registers; the callee does not -- a class is baked
+     * into the sequence above -- so it comes off the model by hand. */
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) { e->whyNot = "call argument"; return false; }
+    }
+    if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_CLASS) {
+        e->whyNot = "callee was not where it should be";
+        return false;
+    }
+    e->depth--;
+    if (!pushValue(e, SLOT_INST, cls->shapeId, cls)) return false;
+    emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+               d + (unsigned)offsetof(JitCallDesc, result) + 8));
+    /* A call is an effect: no bail may follow it, for the same
+     * reason no bail may follow a store. */
+    /* A call is an effect: no bail may follow it, for the same reason no bail
+     * may follow a store. */
+    e->wroteHeap = true;
+    return true;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -409,6 +567,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = (int)stackSignature(e);
         uint8_t op = code[off];
+        e->lastOp = op;
 
         switch (op) {
         case OP_GET_LOCAL: {
@@ -815,14 +974,35 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_GET_GLOBAL: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
-            if (!globalIsSelf(closure, nameIdx)) return false;
-            if (!pushSelf(e)) return false;
+            if (globalIsSelf(closure, nameIdx)) {
+                if (!pushSelf(e)) return false;
+                off += 6;
+                break;
+            }
+            /* A class, resolved now and pinned by the module version check at
+             * entry: rebinding the name retires the compiled form. It occupies
+             * no register -- it is baked into the call sequence. */
+            ObjClass *cls = globalClass(closure, nameIdx);
+            if (cls == NULL) return false;
+            if (e->depth >= JIT_MAX_SAVED) return false;
+            e->stackShape[e->depth] = cls->shapeId;
+            e->stackClass[e->depth] = cls;
+            e->stackSeen[e->depth]  = NULL_VAL;
+            e->stackLocal[e->depth] = -1;
+            e->stack[e->depth++]    = SLOT_CLASS;
             off += 6;
             break;
         }
 
         case OP_CALL: {
             unsigned argc = code[off + 1];
+
+            if (isClassCallee(e, argc)) {
+                if (!emitCallOut(e, argc)) return false;
+                off += 2;
+                break;
+            }
+
             if (argc != e->arity) return false;
             /* Recorded, not rejected here: the measuring pass always runs
              * with slot 0 available, so testing the base in this pass aborted
@@ -858,6 +1038,28 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!pushValue(e, e->returnKind, e->returnShape, NULL)) return false;
             emit(e, jaiA64MovX(pushReg(e) - 1, 0));
             off += 2;
+            break;
+        }
+
+        case OP_TAIL_CALL: {
+            /* `return C(...)` compiles to this. The call is made exactly as
+             * OP_CALL makes it and its result is returned. */
+            unsigned argc = code[off + 1];
+            if (!isClassCallee(e, argc)) { e->whyNot = "tail callee not a class"; return false; }
+            if (!emitCallOut(e, argc)) return false;
+            unsigned r;
+            SlotKind k;
+            if (!popValue(e, &r, &k)) return false;
+            if (e->sawReturn && e->returnKind != k) return false;
+            e->sawReturn  = true;
+            e->returnKind = k;
+            emit(e, jaiA64MovX(0, r));
+            emitEpilogue(e, 0);
+            off += 2;
+            /* The compiler emits OP_RETURN after a tail call and the
+             * interpreter never reaches it, because the tail call returned.
+             * Walking into it would try to pop from an empty stack. */
+            if (off < count && code[off] == OP_RETURN) off += 1;
             break;
         }
 
@@ -956,6 +1158,11 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (!eligible(fn)) return false;
 
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] considering %s\n",
+                fn->name ? fn->name->chars : "<anon>");
+    }
+
     JaiCodeArena *arena = jaiJitArena();
     if (arena == NULL) return false;
 
@@ -984,6 +1191,8 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     body.base         = 0;
     body.locals       = (unsigned)fn->maxSlots;
     body.usesUpvalues = fn->upvalueCount > 0;
+    body.callsOut     = true;      /* the measuring pass may emit one */
+    body.descOffset   = 16u;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
     if (!seedLocals(&body, slotBase)) {
@@ -997,7 +1206,15 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     body.savedCount = JIT_MAX_SAVED;
     body.frameBytes = 16 + 8 * JIT_MAX_SAVED + 8;   /* 16-aligned below */
     body.frameBytes = (body.frameBytes + 15u) & ~15u;
-    if (!compileBody(&body, closure)) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (!compileBody(&body, closure)) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
+                    fn->name ? fn->name->chars : "<anon>",
+                    body.whyNot ? body.whyNot : jaiOpName((OpCode)body.lastOp));
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
 
     /* A self-call cannot reproduce slot 0: no register holds the callee. A
      * body that both recurses and reads slot 0 is not compiled. */
@@ -1018,7 +1235,13 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     if (saved > JIT_MAX_SAVED) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
     e.savedCount = saved;
-    e.frameBytes = (16u + 8u * saved + 15u) & ~15u;
+    e.callsOut   = body.callsOut;
+    unsigned frame = 16u + 8u * saved;
+    if (e.callsOut) {
+        e.descOffset = frame;
+        frame += (unsigned)sizeof(JitCallDesc);
+    }
+    e.frameBytes = (frame + 15u) & ~15u;
 
     /* Prologue. */
     emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
@@ -1060,7 +1283,13 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         jitFree(map, depths, fn->chunk.count + 1);
         return false;
     }
-    if (!compileBody(&e, closure)) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (!compileBody(&e, closure) && getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] %s stopped: %s\n", fn->name ? fn->name->chars : "<anon>",
+                e.whyNot ? e.whyNot : "an unsupported operand form");
+    }
+    if (e.failed || e.whyNot != NULL)
+        { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (false) { jitFree(map, depths, fn->chunk.count + 1); return false; }
     if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
     (void)prologue;
 
@@ -1069,6 +1298,12 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     e.bailBlock = (int)e.count;
     emit(&e, jaiA64MovzX(0, 0, 0));
     emitEpilogue(&e, 1);
+
+    /* The callee raised. The interpreter owns the exception and must not run
+     * this call again, so this is a third answer, not a bail. */
+    e.exceptionExit = (int)e.count;
+    emit(&e, jaiA64MovzX(0, 0, 0));
+    emitEpilogue(&e, 2);
 
     /* Literal pool, 8-byte aligned so the 64-bit loads are aligned. */
     if ((e.count & 1u) != 0) emit(&e, jaiA64Nop());
@@ -1091,6 +1326,8 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         int target;
         if (f->targetOffset == FIXUP_BAIL) {
             target = e.bailBlock;
+        } else if (f->targetOffset == FIXUP_THREW) {
+            target = e.exceptionExit;
         } else if (f->targetOffset == FIXUP_ENTRY) {
             target = 0;
         } else {
@@ -1145,6 +1382,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * re-run. Nothing in the suite hits this -- an initializer's writes come
      * after its last guard -- but "hard to construct" is not the standard a
      * compiled tier gets to work to. */
+    if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] %s stopped: %s\n",
+                fn->name ? fn->name->chars : "<anon>", e.whyNot);
+    }
     if (e.bailAfterWrite) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s declined: a bail follows a heap write\n",
@@ -1191,9 +1432,9 @@ typedef JitResult (*Fn2)(int64_t, int64_t);
 typedef JitResult (*Fn3)(int64_t, int64_t, int64_t);
 typedef JitResult (*Fn4)(int64_t, int64_t, int64_t, int64_t);
 
-bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
+JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
-    if (fn->jitFunc == NULL) return false;
+    if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
 
     /* Compiled code reads the global that names this function exactly once,
      * at compile time, and then calls it directly. Rebinding the name has to
@@ -1202,7 +1443,7 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
      * write in the module retires the compiled form -- and conservative is the
      * safe direction. */
     if (fn->module == NULL || fn->module->version != fn->jitModuleVersion) {
-        return false;
+        return JAI_JIT_DECLINED;
     }
 
     unsigned arity = fn->jitArgCount;
@@ -1211,11 +1452,11 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         Value v = slotBase[fn->jitArgBase + i];
         switch ((SlotKind)fn->jitParamKind[i]) {
         case SLOT_INT:
-            if (!IS_INT(v)) return false;
+            if (!IS_INT(v)) return JAI_JIT_DECLINED;
             a[i] = AS_INT(v);
             break;
         case SLOT_FLOAT: {
-            if (!IS_FLOAT(v)) return false;
+            if (!IS_FLOAT(v)) return JAI_JIT_DECLINED;
             double d = AS_FLOAT(v);
             memcpy(&a[i], &d, sizeof a[i]);
             break;
@@ -1226,11 +1467,11 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
              * raw pointer, which is safe only because the body cannot
              * allocate -- no collection can run while it does -- and the
              * argument slots keep the instance reachable meanwhile. */
-            if (!IS_INSTANCE(v)) return false;
+            if (!IS_INSTANCE(v)) return JAI_JIT_DECLINED;
             ObjInstance *inst = AS_INSTANCE(v);
             if (inst->klass == NULL ||
                 inst->klass->shapeId != fn->jitParamShape[i]) {
-                return false;
+                return JAI_JIT_DECLINED;
             }
             a[i] = (int64_t)(uintptr_t)inst;
             break;
@@ -1245,7 +1486,7 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
             a[i] = (int64_t)(uintptr_t)closure;
             break;
         default:
-            return false;
+            return JAI_JIT_DECLINED;
         }
     }
 
@@ -1256,9 +1497,10 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     case 2: r = ((Fn2)(uintptr_t)fn->jitFunc)(a[0], a[1]); break;
     case 3: r = ((Fn3)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2]); break;
     case 4: r = ((Fn4)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2], a[3]); break;
-    default: return false;
+    default: return JAI_JIT_DECLINED;
     }
 
+    if (r.bailed == 2) return JAI_JIT_ERROR;
     if (r.bailed) {
         /* Overflow or a stack that ran low. Nothing was written -- the body
          * cannot write -- so handing the call back to the interpreter is
@@ -1267,7 +1509,7 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
          * every call only to bail again. */
         fn->jitRefused = true;
         fn->jitFunc = NULL;
-        return false;
+        return JAI_JIT_DECLINED;
     }
 
     switch ((SlotKind)fn->jitReturnKind) {
@@ -1284,10 +1526,10 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         slotBase[0] = OBJ_VAL((Obj *)(uintptr_t)r.value);
         break;
     default:
-        return false;
+        return JAI_JIT_DECLINED;
     }
     vm.stackTop = slotBase + 1;
-    return true;
+    return JAI_JIT_DONE;
 }
 
 #else
@@ -1295,8 +1537,8 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return false;
 }
-bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
-    (void)closure; (void)slotBase; return false;
+JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
+    (void)closure; (void)slotBase; return JAI_JIT_DECLINED;
 }
 
 #endif
