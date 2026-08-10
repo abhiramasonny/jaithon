@@ -237,3 +237,9 @@ uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset) {
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset) {
     return 0xfd000000u | ((offset / 8u) << 10) | (rn << 5) | rt;
 }
+
+/* str Wt, [Xn, #offset] -- 4-aligned, 0..16380. The counterpart to jaiA64LdrW:
+ * a Value's tag is 32 bits, so writing one takes this and a 64-bit store. */
+uint32_t jaiA64StrW(unsigned rt, unsigned rn, unsigned offset) {
+    return 0xb9000000u | ((offset / 4u) << 10) | (rn << 5) | rt;
+}
