@@ -65,8 +65,18 @@ PY
 # The build type belongs in the table itself: these rows get pasted into the
 # ROADMAP, and a number without its build type is not a measurement.
 printf '%s%s build, best of %s%s\n' "$DIM" "$BUILD_KIND" "$RUNS" "$RESET"
-printf '%s%-22s %10s %10s %10s   %s%s\n' "$BOLD" "benchmark" "jaithon" "python3" "speedup" "result" "$RESET"
-printf '%s\n' "──────────────────────────────────────────────────────────────────────"
+# C++ and Java are optional columns: a benchmark only gets one where a port
+# exists, and the whole column disappears when the toolchain is absent. They are
+# a *scale* rather than a target -- C++ is roughly what the machine can do and
+# Java is what a mature JIT does with the same program, so they say whether a
+# gap is worth chasing or is already near the floor.
+HAVE_CXX=0; command -v c++ >/dev/null 2>&1 && HAVE_CXX=1
+HAVE_JAVA=0; command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1 && HAVE_JAVA=1
+BENCH_BUILD="$(mktemp -d)"
+trap 'rm -rf "$BENCH_BUILD"' EXIT
+
+printf '%s%-22s %10s %10s %10s %10s %10s   %s%s\n' "$BOLD" "benchmark" "jaithon" "python3" "c++" "java" "speedup" "result" "$RESET"
+printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
 
 shopt -s nullglob
 total_j=0; total_p=0
@@ -83,6 +93,29 @@ for src in "$ROOT"/tests/bench/*.jai; do
     jms=$(best_ms "$JAITHON" run "$src")
     total_j=$((total_j + jms))
 
+    # C++ and Java, when this benchmark has a port and the toolchain exists.
+    # Compiled once outside the timed runs: the table is about how fast the
+    # program runs, not how fast it builds.
+    cms="—"; cpp="${src%.jai}.cpp"
+    if [[ $HAVE_CXX -eq 1 && -f "$cpp" ]]; then
+        if c++ -O2 -std=c++17 -o "$BENCH_BUILD/$name" "$cpp" 2>/dev/null; then
+            cout="$("$BENCH_BUILD/$name" 2>&1)"
+            [[ "$cout" != "$jout" ]] && cms="MISMATCH" || cms="$(best_ms "$BENCH_BUILD/$name")ms"
+        fi
+    fi
+
+    jms_java="—"
+    # Java classes are CamelCase: loop_sum -> LoopSum.
+    cls="$(python3 -c "import sys; print(''.join(w.capitalize() for w in sys.argv[1].split('_')))" "$name")"
+    jsrc="$ROOT/tests/bench/$cls.java"
+    if [[ $HAVE_JAVA -eq 1 && -f "$jsrc" ]]; then
+        if javac -d "$BENCH_BUILD/classes" "$jsrc" 2>/dev/null; then
+            javaout="$(java -cp "$BENCH_BUILD/classes" "$cls" 2>&1)"
+            [[ "$javaout" != "$jout" ]] && jms_java="MISMATCH" \
+                || jms_java="$(best_ms java -cp "$BENCH_BUILD/classes" "$cls")ms"
+        fi
+    fi
+
     if [[ -f "$py" ]]; then
         pout="$(python3 "$py" 2>&1)"
         pms=$(best_ms python3 "$py")
@@ -93,14 +126,16 @@ for src in "$ROOT"/tests/bench/*.jai; do
             verdict="${GREEN}ok${RESET}"
         fi
         speed=$(python3 -c "print(f'{$pms/max($jms,1):.2f}x')")
-        printf '%-22s %9sms %9sms %10s   %b\n' "$name" "$jms" "$pms" "$speed" "$verdict"
+        printf '%-22s %9sms %9sms %10s %10s %10s   %b\n' \
+            "$name" "$jms" "$pms" "$cms" "$jms_java" "$speed" "$verdict"
     else
-        printf '%-22s %9sms %10s %10s   %s\n' "$name" "$jms" "—" "—" "${DIM}no python peer${RESET}"
+        printf '%-22s %9sms %10s %10s %10s %10s   %s\n' \
+            "$name" "$jms" "—" "$cms" "$jms_java" "—" "${DIM}no python peer${RESET}"
     fi
 done
 
-printf '%s\n' "──────────────────────────────────────────────────────────────────────"
+printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
 if [[ $total_p -gt 0 ]]; then
-    printf '%stotal%s %*s %8sms %9sms %10s\n' "$BOLD" "$RESET" 16 "" "$total_j" "$total_p" \
+    printf '%stotal%s %*s %8sms %9sms %10s %10s %10s\n' "$BOLD" "$RESET" 16 "" "$total_j" "$total_p" "" "" \
         "$(python3 -c "print(f'{$total_p/max($total_j,1):.2f}x')")"
 fi
