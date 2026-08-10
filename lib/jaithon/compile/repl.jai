@@ -79,12 +79,12 @@ fn _utf8_length(code_point: int) -> int {
     return 4
 }
 
-# The buffer indexed both ways at once.
-#
-# Every span the lexer produces is a pair of *byte* offsets, while a `str` is
-# indexed by scalar. Mixing the two silently works on ASCII and puts the caret
-# in the wrong place on anything else, so the conversion happens here and
-# nowhere else. The lexer builds the same two lists for the same reason.
+#: The buffer indexed both ways at once.
+#:
+#: Every span the lexer produces is a pair of *byte* offsets, while a `str` is
+#: indexed by scalar. Mixing the two silently works on ASCII and puts the caret
+#: in the wrong place on anything else, so the conversion happens here and
+#: nowhere else. The lexer builds the same two lists for the same reason.
 class _Text {
     pub let chars: list[str]
     #: Byte offset of each character, plus the total length at the end.
@@ -157,11 +157,11 @@ fn _closer_text(kind: TokenKind) -> str? {
     return null
 }
 
-# Walk the token stream with a stack of the brackets still open. A single depth
-# counter cannot do this job: `{"a": [1}` is balanced by depth alone yet never
-# returns to zero, and clamping a stray closer at zero lets it cancel a real
-# opener later in the same input. Either way the prompt would sit waiting for a
-# line that can never arrive.
+#: Walk the token stream with a stack of the brackets still open. A single depth
+#: counter cannot do this job: `{"a": [1}` is balanced by depth alone yet never
+#: returns to zero, and clamping a stray closer at zero lets it cancel a real
+#: opener later in the same input. Either way the prompt would sit waiting for a
+#: line that can never arrive.
 fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
     var stack: list[tuple[str, int]] = []
 
@@ -203,7 +203,7 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
     }
 }
 
-# True when the quote at byte `offset`, past any `r`/`f` prefix, is tripled.
+#: True when the quote at byte `offset`, past any `r`/`f` prefix, is tripled.
 fn _is_triple_quote_at(text: _Text, offset: int) -> bool {
     var index = text.index_of_byte(offset)
     let length = text.chars.len()
@@ -216,15 +216,15 @@ fn _is_triple_quote_at(text: _Text, offset: int) -> bool {
     return text.chars[index + 1] == quote and text.chars[index + 2] == quote
 }
 
-# Where the f-string the lexer is still inside was opened, or -1.
-#
-# An f-string diagnostic is raised where the lexer noticed the trouble, not at
-# the quote that started the literal: `f"""a {n}` reports at the byte after the
-# interpolation, and an interpolation still open at end of input reports at the
-# end of the buffer. Neither offset says whether the literal was triple-quoted,
-# so the opener has to come from the token stream, where every f-string leaves
-# an `FStringStart` at its first byte. The last one is the one still open: the
-# lexer only stops mid-literal at the end of the input.
+#: Where the f-string the lexer is still inside was opened, or -1.
+#:
+#: An f-string diagnostic is raised where the lexer noticed the trouble, not at
+#: the quote that started the literal: `f"""a {n}` reports at the byte after the
+#: interpolation, and an interpolation still open at end of input reports at the
+#: end of the buffer. Neither offset says whether the literal was triple-quoted,
+#: so the opener has to come from the token stream, where every f-string leaves
+#: an `FStringStart` at its first byte. The last one is the one still open: the
+#: lexer only stops mid-literal at the end of the input.
 fn _open_fstring_offset(tokens: list[Token]) -> int {
     var offset = -1
     for token in tokens {
@@ -233,12 +233,12 @@ fn _open_fstring_offset(tokens: list[Token]) -> int {
     return offset
 }
 
-# An unterminated literal only means "keep typing" when a later line could
-# still finish it: a block comment, or a triple-quoted string still open where
-# the input stops. The decision is made on the span of the literal the lexer
-# complained about rather than on the whole buffer, so a complete `"""..."""`
-# earlier in the input cannot make a broken one-line string look like the start
-# of a long one.
+#: An unterminated literal only means "keep typing" when a later line could
+#: still finish it: a block comment, or a triple-quoted string still open where
+#: the input stops. The decision is made on the span of the literal the lexer
+#: complained about rather than on the whole buffer, so a complete `"""..."""`
+#: earlier in the input cannot make a broken one-line string look like the start
+#: of a long one.
 fn _unterminated_literal_continues(
     bag: DiagnosticBag,
     tokens: list[Token],
