@@ -94,7 +94,15 @@ void jaiFreeObject(Obj *obj) {
          * holds only weak references and is purged by the sweep, so there is
          * nothing to unlink here. */
         ObjString *s = (ObjString *)obj;
-        (void)jaiRealloc(obj, JAI_STRING_ALLOC(s->length), 0);
+        /* A slice carries no bytes of its own; the buffer is swept separately
+         * once nothing views it. */
+        (void)jaiRealloc(obj, s->owner != NULL ? sizeof(ObjString)
+                                               : JAI_STRING_ALLOC(s->length), 0);
+        return;
+    }
+    case OBJ_STRBUF: {
+        ObjStrBuf *b = (ObjStrBuf *)obj;
+        (void)jaiRealloc(obj, sizeof(ObjStrBuf) + b->capacity + 1, 0);
         return;
     }
     case OBJ_BYTES: {
@@ -232,6 +240,7 @@ void jaiFreeObject(Obj *obj) {
 const char *jaiObjTypeName(ObjType t) {
     switch (t) {
     case OBJ_STRING:    return "str";
+    case OBJ_STRBUF:    return "str";   /* never user-visible */
     case OBJ_BYTES:     return "bytes";
     case OBJ_LIST:      return "list";
     case OBJ_DICT:      return "dict";
@@ -311,6 +320,8 @@ static ObjString *allocString(size_t length) {
     ObjString *s = (ObjString *)jaiAllocateObjectRaw(JAI_STRING_ALLOC(length),
                                                      OBJ_STRING);
     s->chars = (char *)(s + 1);
+    s->owner = NULL;
+    JAI_STR_UNTERMINATED(s) = false;
     s->length = (uint32_t)length;
     s->scalars = UINT32_MAX;       /* not yet computed */
     s->cursorScalar = 0;           /* zero/zero is always a valid memo */
@@ -463,6 +474,45 @@ ObjString *jaiStringTake(char *chars, size_t length) {
     return s;
 }
 
+/* Growing a string by copying the whole accumulation each time makes the
+ * ordinary `text = text + piece` loop quadratic: forty thousand steps over a
+ * 280KB result move 5.6GB. These three give that loop spare capacity to grow
+ * into, so it moves each byte once. */
+static ObjStrBuf *strBufNew(size_t capacity) {
+    ObjStrBuf *b = (ObjStrBuf *)jaiAllocateObjectRaw(
+        sizeof(ObjStrBuf) + capacity + 1, OBJ_STRBUF);
+    b->capacity = (uint32_t)capacity;
+    b->used = 0;
+    b->data[0] = '\0';
+    return b;
+}
+
+/* A view of the first `length` bytes of `buf`. Header only: the bytes belong to
+ * the buffer, which the collector keeps alive through `owner`. */
+static ObjString *strSliceOver(ObjStrBuf *buf, size_t length) {
+    ObjString *s = (ObjString *)jaiAllocateObjectRaw(sizeof(ObjString),
+                                                     OBJ_STRING);
+    s->chars = buf->data;
+    s->owner = buf;
+    s->length = (uint32_t)length;
+    s->scalars = UINT32_MAX;
+    s->cursorScalar = 0;
+    s->cursorByte = 0;
+    s->hash = 0;
+    JAI_STR_INTERNED(s) = false;
+    JAI_STR_UNTERMINATED(s) = false;
+    return s;
+}
+
+const char *jaiStringCStr(ObjString *s) {
+    if (!JAI_STR_UNTERMINATED(s)) return s->chars;
+    /* Somebody appended past this view, so the byte after it is no longer a
+     * NUL. The bytes up to `length` are still exactly right, so a fresh copy
+     * of them is a correct C string. */
+    ObjString *copy = jaiStringNew(s->chars, s->length);
+    return copy != NULL ? copy->chars : "";
+}
+
 ObjString *jaiStringConcat(ObjString *a, ObjString *b) {
     size_t length = (size_t)a->length + (size_t)b->length;
     if (length > UINT32_MAX) {
@@ -483,6 +533,38 @@ ObjString *jaiStringConcat(ObjString *a, ObjString *b) {
 
     jaiGCPushRoot(OBJ_VAL(a));
     jaiGCPushRoot(OBJ_VAL(b));
+
+    /* `a` is the newest view of its buffer and there is room: write `b` after
+     * it. Every older view ends before this point and is untouched. */
+    ObjStrBuf *buf = a->owner;
+    if (buf != NULL && buf->used == a->length && buf->capacity >= length) {
+        memcpy(buf->data + a->length, b->chars, b->length);
+        buf->used = (uint32_t)length;
+        buf->data[length] = '\0';
+        /* `a`'s terminator was the byte just overwritten. */
+        JAI_STR_UNTERMINATED(a) = true;
+        ObjString *grown = strSliceOver(buf, length);
+        jaiGCPopRoots(2);
+        return grown;
+    }
+
+    /* No buffer, or somebody else already appended to it. Start one with room
+     * to double, so a growing chain stops copying after this. */
+    {
+        size_t want = length * 2 < 64 ? 64 : length * 2;
+        ObjStrBuf *fresh = strBufNew(want);
+        if (fresh != NULL) {
+            jaiGCPushRoot(OBJ_VAL(fresh));
+            memcpy(fresh->data, a->chars, a->length);
+            memcpy(fresh->data + a->length, b->chars, b->length);
+            fresh->used = (uint32_t)length;
+            fresh->data[length] = '\0';
+            ObjString *made = strSliceOver(fresh, length);
+            jaiGCPopRoots(3);
+            return made;
+        }
+    }
+
     ObjString *s = allocString(length);
     memcpy(s->chars, a->chars, a->length);
     memcpy(s->chars + a->length, b->chars, b->length);

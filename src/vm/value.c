@@ -120,6 +120,7 @@ const char *jaiTypeNameStatic(Value v) {
 
     switch (OBJ_TYPE(v)) {
         case OBJ_STRING:   return "str";
+        case OBJ_STRBUF:   return "str";   /* never reaches a Value */
         case OBJ_BYTES:    return "bytes";
         case OBJ_LIST:     return "list";
         case OBJ_DICT:     return "dict";
@@ -951,6 +952,7 @@ static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser) {
     }
 
     switch (OBJ_TYPE(v)) {
+        case OBJ_STRBUF: break;   /* never reaches a Value */
         case OBJ_STRING: {
             ObjString *str = AS_STRING(v);
             if (repr) emitQuotedString(s, str->chars, str->length);

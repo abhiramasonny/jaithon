@@ -139,7 +139,15 @@ void jaiGCMarkObject(Obj *obj) {
     /* Leaf types own no references, so blackening them would do nothing and
      * they never enter the gray stack. */
     switch (obj->type) {
-    case OBJ_STRING:
+    case OBJ_STRING: {
+        /* Leaf, except that a slice keeps its buffer alive. The buffer is
+         * itself a leaf, so marking it here rather than graying this string
+         * costs one call and keeps every string off the gray stack. */
+        ObjString *s = (ObjString *)obj;
+        if (s->owner != NULL) jaiGCMarkObject((Obj *)s->owner);
+        return;
+    }
+    case OBJ_STRBUF:
     case OBJ_BYTES:
     case OBJ_RANGE:
         return;
@@ -277,6 +285,7 @@ static void blackenEnum(ObjEnum *e) {
 static void blackenObject(Obj *obj) {
     switch (obj->type) {
     case OBJ_STRING:
+    case OBJ_STRBUF:
     case OBJ_BYTES:
     case OBJ_RANGE:
         break;

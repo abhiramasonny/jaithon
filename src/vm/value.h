@@ -95,6 +95,8 @@ typedef enum {
     OBJ_FUNCTION, OBJ_CLOSURE, OBJ_UPVALUE, OBJ_NATIVE, OBJ_BOUND,
     OBJ_CLASS, OBJ_TRAIT, OBJ_INSTANCE, OBJ_MODULE, OBJ_ENUM, OBJ_ENUM_VAL,
     OBJ_ITER, OBJ_FILE, OBJ_ENUM_CTOR,
+    /* Appended, never inserted: the numbering is written into images. */
+    OBJ_STRBUF,
     /* No OBJ_GENERIC: generics are erased at run time (spec §6.1), so no heap
      * object ever carries one. */
     OBJ_TYPE_COUNT
@@ -109,6 +111,10 @@ struct Obj {
      * whether the string is in the intern table; that moves the flexible
      * character array eight bytes earlier on every string in the heap. */
     bool     subFlag;
+    /* The third padding byte, which was going spare. ObjString uses it for
+     * whether a later append into the same buffer overwrote this string's NUL
+     * terminator; see jaiStringCStr. */
+    bool     subFlag2;
     Obj     *next;        /* intrusive list of every heap object */
 };
 
