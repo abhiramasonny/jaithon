@@ -567,6 +567,11 @@ int main(void) {
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64AndX(0, 1, 2), jaiA64Ret() };
       check("and", runWith(w, 4, cell), 0xf0 & 0x3c); }
+    { /* the cell holds 0x0123456789abcdef; byte 0 is little-endian lowest */
+      const uint32_t w[] = { jaiA64LdrByte(0, 0, 0), jaiA64Ret() };
+      check("ldrb", runWith(w, 2, cell), cell[0] & 0xffu); }
+    { const uint32_t w[] = { jaiA64LdrByte(0, 0, 1), jaiA64Ret() };
+      check("ldrb offset", runWith(w, 2, cell), (cell[0] >> 8) & 0xffu); }
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64OrrX(0, 1, 2), jaiA64Ret() };
       check("orr", runWith(w, 4, cell), 0xf0 | 0x3c); }

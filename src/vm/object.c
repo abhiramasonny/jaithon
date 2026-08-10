@@ -399,6 +399,8 @@ void jaiMarkAsciiChars(void) {
     }
 }
 
+ObjString **jaiAsciiCharTable(void) { return sAsciiChar; }
+
 ObjString *jaiStringChar(unsigned char c) {
     if (c >= 128) return NULL;
     if (sAsciiChar[c] == NULL) {

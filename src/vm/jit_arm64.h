@@ -81,6 +81,7 @@ uint32_t jaiA64MovnX(unsigned rd, unsigned imm16);
 uint32_t jaiA64Nop(void);
 /* eor Xd, Xn, Xm */
 uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm);
+uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset);
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64LslvX(unsigned rd, unsigned rn, unsigned rm);

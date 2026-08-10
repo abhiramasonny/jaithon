@@ -2959,6 +2959,68 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_GET_INDEX: {
+            /* `s[i]` on a string. Every guard is a load and a compare, and the
+             * result is a table lookup rather than an allocation, because the
+             * 128 one-byte strings are made once and shared. Without this the
+             * whole loop around a character scan declines, which is why
+             * `str_search` ran interpreted end to end -- and a scanner reading
+             * one byte at a time is the shape of every lexer. */
+            if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_INT &&
+                e->stack[e->depth - 2] == SLOT_OBJ &&
+                IS_STRING(e->stackSeen[e->depth - 2])) {
+                unsigned rIdx = pushReg(e) - 1, rStr = pushReg(e) - 2;
+
+                /* Really a string, and not something else this object slot
+                 * happened to hold when the loop was compiled. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rStr,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                /* ASCII only: one scalar is one byte, so indexing is indexing.
+                 * `scalars` is UINT32_MAX until something asks, so the first
+                 * time through deopts and the interpreter fills it in. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rStr,
+                                   (unsigned)offsetof(ObjString, length)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, rStr,
+                                   (unsigned)offsetof(ObjString, scalars)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                /* jaiNormalizeIndex, then one unsigned compare for both ends. */
+                emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+                emit(e, jaiA64BCond(JAI_A64_GE, 2));
+                emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+                branchOnDeopt(e, JAI_A64_HS);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rStr,
+                                   (unsigned)offsetof(ObjString, chars)));
+                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+                emitConst64(e, JIT_SCRATCH_B, 128);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_HS);
+
+                /* The shared one-byte string. NULL until first asked for, so a
+                 * character this program has not seen deopts once. */
+                emitConst64(e, JIT_SCRATCH_C,
+                            (int64_t)(uintptr_t)jaiAsciiCharTable());
+                emit(e, jaiA64LslX(JIT_SCRATCH_B, JIT_SCRATCH_A, 3));
+                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+
+                unsigned d1, d2;
+                if (!popValue(e, &d1, NULL)) return false;
+                if (!popValue(e, &d2, NULL)) return false;
+                if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
+                emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
+                off += 1;
+                break;
+            }
             /* list[i], with the index normalised the way jaiNormalizeIndex
              * does it and one unsigned compare covering both ends. Anything
              * out of range, or an element that is not the kind seen at compile
