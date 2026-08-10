@@ -20,7 +20,7 @@ fn seed_board(h: int, w: int, seed: int) -> list[list[int]] {
         row.push(0)
         for _c in 0..w {
             s = (s * 1103515245 + 12345) % 2147483648
-            let bits = (s // 65536) % 100
+            let bits = s // 65536 % 100
             var alive = 0
             if bits < 35 { alive = 1 }
             row.push(alive)

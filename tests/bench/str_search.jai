@@ -23,13 +23,21 @@ fn count_occurrences(text: str, needle: str) -> int {
 }
 
 fn main() -> int {
-    let chunks = ["abcdbadc", "bcadcbda", "cdabacbd", "dacbdabc",
-                  "abdcadbc", "bdacbcad", "cabdbdca", "dbcaabcd"]
+    let chunks = [
+        "abcdbadc",
+        "bcadcbda",
+        "cdabacbd",
+        "dacbdabc",
+        "abdcadbc",
+        "bdacbcad",
+        "cabdbdca",
+        "dbcaabcd",
+    ]
     var parts = []
     var seed = 7
     for _i in 0..25_000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
-        parts.push(chunks[(seed // 65536) % 8])
+        parts.push(chunks[seed // 65536 % 8])
     }
     let text = "".join(parts)
 
