@@ -1821,6 +1821,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 memcpy(&bits, &d, sizeof bits);
                 if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, bits);
+            } else if (IS_BOOL(k)) {
+                if (!pushValue3(e, SLOT_BOOL, 0, NULL, k, -1)) return false;
+                emitConst64(e, pushReg(e) - 1, AS_BOOL(k) ? 1 : 0);
+            } else if (IS_STRING(k)) {
+                /* A pointer to the constant pool's own string. Safe to hold
+                 * raw for the same reason the resolved globals above are: the
+                 * pool belongs to the chunk, the chunk to the function, and
+                 * the caller is holding the closure for the whole call. A
+                 * string constant was the commonest reason this tier declined
+                 * a body -- thirty refusals across the benchmark suite. */
+                if (!pushValue3(e, SLOT_OBJ, 0, NULL, k, -1)) return false;
+                emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)AS_OBJ(k));
             } else {
                 return false;
             }
