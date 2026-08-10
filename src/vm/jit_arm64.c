@@ -58,6 +58,24 @@ uint32_t jaiA64SubsX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xeb000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+uint32_t jaiA64SmulhX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x9b407c00u | (rm << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64AsrX(unsigned rd, unsigned rn, unsigned shift) {
+    /* SBFM Xd, Xn, #shift, #63 */
+    return 0x9340fc00u | (shift << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64LsrX(unsigned rd, unsigned rn, unsigned shift) {
+    /* UBFM Xd, Xn, #shift, #63 */
+    return 0xd340fc00u | (shift << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x8b000000u | (rm << 16) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64Ret(void) {
     return 0xd65f03c0u;
 }

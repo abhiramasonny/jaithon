@@ -114,6 +114,33 @@ int main(void) {
                              jaiA64Ret() };
       check("cmp/b.lt taken", runWith(w, 7, cell), 7); }
 
+    /* smulh: high half of 2^62 * 4 == 2^64, so the high word is 1 */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x4000, 3),      /* x1 = 1<<62 */
+                             jaiA64MovzX(2, 4, 0),
+                             jaiA64SmulhX(0, 1, 2),
+                             jaiA64Ret() };
+      check("smulh high half", runWith(w, 4, cell), 1); }
+
+    /* asr keeps the sign: -16 >> 2 == -4 */
+    { const uint32_t w[] = { jaiA64MovzX(1, 16, 0),
+                             jaiA64SubsX(1, 31, 1),          /* x1 = 0 - 16 */
+                             jaiA64AsrX(0, 1, 2),
+                             jaiA64Ret() };
+      check("asr signed", runWith(w, 4, cell), -4); }
+
+    /* lsr does not: -1 >>> 63 == 1, which is the sign-bit trick the magic
+     * division correction uses */
+    { const uint32_t w[] = { jaiA64MovzX(1, 1, 0),
+                             jaiA64SubsX(1, 31, 1),          /* x1 = -1 */
+                             jaiA64LsrX(0, 1, 63),
+                             jaiA64Ret() };
+      check("lsr sign bit", runWith(w, 4, cell), 1); }
+
+    /* add register */
+    { const uint32_t w[] = { jaiA64MovzX(1, 40, 0), jaiA64MovzX(2, 2, 0),
+                             jaiA64AddX(0, 1, 2), jaiA64Ret() };
+      check("add reg", runWith(w, 4, cell), 42); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;
