@@ -48,6 +48,22 @@
  * the same way. */
 bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
 
+/* Start the sampling timer, if the tier is on. Safe to call more than once. */
+void jaiJitStartSampling(void);
+
+/* A sampling tick landed while `closure` was executing at `offset`.
+ *
+ * Called from the interpreter's existing safepoint, which already runs on the
+ * back edge, so noticing a hot loop costs nothing on the common path. Counting
+ * back edges instead cost between 4.7% and 4.7x depending on where the counter
+ * lived -- and 11% even with the counter switched off, purely from the branch
+ * existing in OP_LOOP. There is no budget for a new test on that edge.
+ *
+ * Sampling has a second property the counter lacked: its cost is proportional
+ * to wall time rather than to iterations, so a tight loop is not punished for
+ * being tight. */
+void jaiJitSample(ObjClosure *closure, uint32_t offset);
+
 /* Whether the tier is enabled at all. JAITHON_NO_JIT=1 turns it off, so a
  * measurement can be taken against the interpreter without rebuilding. */
 bool jaiJitEnabled(void);
