@@ -47,6 +47,8 @@ uint32_t jaiA64SubsX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64SmulhX(unsigned rd, unsigned rn, unsigned rm);
 /* asr Xd, Xn, #shift -- arithmetic, 0..63 */
 uint32_t jaiA64AsrX(unsigned rd, unsigned rn, unsigned shift);
+/* lsl Xd, Xn, #shift -- 0..63 */
+uint32_t jaiA64LslX(unsigned rd, unsigned rn, unsigned shift);
 /* lsr Xd, Xn, #shift -- logical, 0..63 */
 uint32_t jaiA64LsrX(unsigned rd, unsigned rn, unsigned shift);
 /* add Xd, Xn, Xm */
@@ -126,6 +128,7 @@ uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
 #define JAI_A64_LT 11u
 #define JAI_A64_GE 10u
 #define JAI_A64_LO  3u   /* unsigned lower -- the stack-limit test */
+#define JAI_A64_HS  2u   /* unsigned higher or same; one test for both ends of a range */
 #define JAI_A64_LS  9u   /* unsigned lower or same; float <= after fcmp */
 #define JAI_A64_LE 13u
 #define JAI_A64_GT 12u

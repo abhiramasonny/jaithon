@@ -533,6 +533,33 @@ int main(void) {
                              jaiA64CsetX(0, JAI_A64_GE), jaiA64Ret() };
       check("cset clears high bits", runWith(w, 6, cell), 0); }
 
+    /* lsl scales an index to a Value offset */
+    { const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64LslX(0, 1, 4),
+                             jaiA64Ret() };
+      check("lsl 4", runWith(w, 3, cell), 48); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 1, 0), jaiA64LslX(0, 1, 63),
+                             jaiA64Ret() };
+      check("lsl 63", runWith(w, 3, cell), (int64_t)((uint64_t)1 << 63)); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 5, 0), jaiA64LslX(0, 1, 0),
+                             jaiA64Ret() };
+      check("lsl 0", runWith(w, 3, cell), 5); }
+
+    /* HS after a compare catches a negative index and one past the end with a
+     * single unsigned test, which is the whole point of using it. */
+    { const uint32_t w[] = { jaiA64MovnX(1, 0),          /* x1 = -1     */
+                             jaiA64MovzX(2, 10, 0),      /* count = 10  */
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_HS), jaiA64Ret() };
+      check("hs catches negative", runWith(w, 5, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 10, 0), jaiA64MovzX(2, 10, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_HS), jaiA64Ret() };
+      check("hs catches past end", runWith(w, 5, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 9, 0), jaiA64MovzX(2, 10, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_HS), jaiA64Ret() };
+      check("hs allows in range", runWith(w, 5, cell), 0); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;
