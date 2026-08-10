@@ -174,9 +174,16 @@ void jaiJitStartSampling(void) {
     (void)setitimer(ITIMER_PROF, &it, NULL);
 }
 
-/* Ticks seen in one function. A loop that is hot collects them; a function that
- * merely runs once does not. */
-#define JAI_JIT_HOT_TICKS 20
+/* Ticks seen in one function before its loop is compiled.
+ *
+ * Three, not twenty. At 1kHz twenty ticks looked like 20ms of warmup and cost
+ * 150: `loop_sum` went from 211ms to 61ms on this constant alone, because the
+ * interpreter runs the loop for the whole warmup and that loop is the entire
+ * program. Sampling is cheap and compiling is cheap, so the threshold only
+ * needs to be high enough to avoid compiling a loop that runs briefly.
+ *
+ * A function that merely runs once will not collect three ticks. */
+#define JAI_JIT_HOT_TICKS 3
 
 void jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
