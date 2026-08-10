@@ -1608,6 +1608,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64AddsX(rd, ra, rb));
                 branchOnOverflow(e, 0u, JAI_A64_VS);
             } else {
+                e->whyNot = "add-bind of a kind that is neither int nor float";
                 return false;
             }
             localOut(e, slot, rd);
