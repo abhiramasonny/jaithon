@@ -956,6 +956,7 @@ ObjFunction *jaiFunctionNew(void) {
     fn->jitLoopExit = 0;
     fn->jitLoopTop = 0;
     fn->jitLoopLimit = 0;
+    fn->jitLoopKind = 0;
     fn->maxSlots = 0;
     fn->upvalueCount = 0;
     fn->paramNames = NULL;
