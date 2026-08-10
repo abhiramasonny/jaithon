@@ -257,3 +257,11 @@ uint32_t jaiA64CsetX(unsigned rd, unsigned cond) {
     unsigned inv = cond ^ 1u;
     return 0x9a9f07e0u | (inv << 12) | rd;
 }
+
+/* lsl Xd, Xn, #shift -- UBFM Xd, Xn, #(-shift mod 64), #(63-shift). Scaling an
+ * index to a Value offset is a shift by four. */
+uint32_t jaiA64LslX(unsigned rd, unsigned rn, unsigned shift) {
+    unsigned immr = (64u - shift) & 63u;
+    unsigned imms = 63u - shift;
+    return 0xd3400000u | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+}

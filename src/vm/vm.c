@@ -1274,6 +1274,16 @@ static CallOutcome callValueOnStack(int argc) {
     return invokeCallable(callee, argc);
 }
 
+/* Call a built-in method with the receiver already in args[0], which is where
+ * one wants it. Exposed for the compiled tier: going through jaiCallValue
+ * would mean building an ObjBound per call, and `xs.len()` in a loop cannot
+ * afford an allocation to ask a question. */
+bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
+                                 int count, Value *out) {
+    if (!IS_NATIVE(native)) return false;
+    return callNativeAt(AS_NATIVE(native), argsWithReceiver, count, out);
+}
+
 bool jaiCallValue(Value callee, int argc, Value *args, Value *out) {
     if (argc < 0) argc = 0;
     if (!ensureStack(argc + 2)) return false;

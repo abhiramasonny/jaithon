@@ -39,6 +39,9 @@
 
 #include "jit_arm64.h"
 #include "gc.h"
+/* For jaiBuiltinMethod: resolving `xs.len()` to its native happens at compile
+ * time, so the tier has to ask the runtime what a name means. */
+#include "runtime/runtime.h"
 #include "vm.h"
 
 #include <stdio.h>
@@ -84,10 +87,17 @@ static uintptr_t stackLimit(void) {
 
 #define JIT_FIRST_SAVED 19u   /* x19..x28 are callee-saved and ours */
 #define JIT_MAX_SAVED   10u
+/* How many slots the compile-time model can describe. Not the register budget:
+ * a function may declare a wide frame and touch very little of it, and the
+ * measuring pass has to walk the whole body to find that out. Only the second
+ * pass is held to JIT_MAX_SAVED. */
+#define JIT_MAX_SLOTS   64u
 #define JIT_MAX_ARITY    4u   /* arguments arrive in x0..x3 */
 #define JIT_MAX_INSTS  512u
 #define JIT_SCRATCH_A    9u
 #define JIT_SCRATCH_B   10u
+#define JIT_SCRATCH_C   11u
+#define JIT_SCRATCH_D   12u
 
 /* ------------------------------------------------------------------ */
 /* Calling out of compiled code                                         */
@@ -145,7 +155,7 @@ typedef struct {
     int64_t base;      /* first local slot the record covers */
     int64_t nlocals;
     int64_t nstack;
-    Value   locals[JIT_MAX_SAVED + 1];
+    Value   locals[JIT_MAX_SLOTS + 1];
     Value   stack[JIT_MAX_SAVED + 1];
 } JitDeoptRecord;
 
@@ -168,6 +178,17 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     return true;
 }
 
+/* Invoke a built-in method: the receiver is args[0], which is exactly where
+ * callNativeAt wants it, so no bound wrapper is made. Roots as jitCallOut
+ * does, because push and its kin allocate. */
+static int jitInvokeNative(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    bool ok = jaiInvokeNativeWithReceiver(d->callee, d->args, (int)d->argc,
+                                          &d->result);
+    jaiGCPopRoots((int)d->nroots);
+    return ok ? 0 : 1;
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -187,8 +208,10 @@ typedef enum {
     SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
     SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
     SLOT_CLASS,   /* a class resolved at compile time; only ever a callee */
-    SLOT_BOOL     /* 0 or 1 in a register; a Value's boolean member is its low
+    SLOT_BOOL,    /* 0 or 1 in a register; a Value's boolean member is its low
                    * byte, so the same word serves both */
+    SLOT_LIST     /* ObjList *, raw. Safe for the same reason an instance is:
+                   * nothing moves, and a call spills it as a root first */
 } SlotKind;
 
 /* Floats live in X registers and visit d0/d1 only for the arithmetic itself.
@@ -236,10 +259,10 @@ typedef struct {
      * trailing read is a bail after a write, which the tier refuses. */
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
-    SlotKind  localKind[JIT_MAX_SAVED + 1];
-    uint32_t  localShape[JIT_MAX_SAVED + 1];
-    ObjClass *localClass[JIT_MAX_SAVED + 1];
-    bool      localTyped[JIT_MAX_SAVED + 1];   /* parameter, or already bound */
+    SlotKind  localKind[JIT_MAX_SLOTS + 1];
+    uint32_t  localShape[JIT_MAX_SLOTS + 1];
+    ObjClass *localClass[JIT_MAX_SLOTS + 1];
+    bool      localTyped[JIT_MAX_SLOTS + 1];   /* parameter, or already bound */
     Value    *observed;      /* the live arguments, for field-type feedback */
     bool      assumedIntReturn;
     unsigned  depth;       /* entries on the operand stack */
@@ -259,6 +282,13 @@ typedef struct {
      * plain function -- it costs nothing. */
     unsigned  base;        /* first slot held in a register: 0 or 1 */
     bool      usesSlot0;
+    /* The highest slot the body actually names. maxSlots is the frame window
+     * the interpreter reserves, which is routinely larger -- and every slot
+     * costs one of the ten callee-saved registers here. */
+    unsigned  maxSlotUsed;
+    /* The first pass exists to find maxValue and maxSlotUsed, so it must not
+     * stop at a budget computed from a slot count it is still discovering. */
+    bool      measuring;
     /* A body that reads an upvalue needs the closure itself, which is not any
      * slot: for a method slot 0 is the receiver, not the callee. It arrives as
      * one extra argument and takes the register just past the locals. */
@@ -314,13 +344,17 @@ static unsigned localReg(const Emit *e, unsigned slot) {
 }
 
 /* Slots the body may name at all. */
-static bool localInRange(const Emit *e, unsigned slot) {
-    return slot >= e->base && slot < e->base + e->locals;
+static bool localInRange(Emit *e, unsigned slot) {
+    if (slot < e->base || slot >= e->base + e->locals) return false;
+    if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
+    return true;
 }
 
 /* Slots whose value this call can be looked at, for type feedback. */
-static bool localObserved(const Emit *e, unsigned slot) {
-    return slot >= e->base && slot <= e->arity;
+static bool localObserved(Emit *e, unsigned slot) {
+    if (slot < e->base || slot > e->arity) return false;
+    if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
+    return true;
 }
 
 /* The register a new value entry would occupy. */
@@ -335,9 +369,14 @@ static unsigned pushReg(const Emit *e) {
 
 static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
                        Value seen, int fromLocal) {
-    if (e->depth >= JIT_MAX_SAVED) return false;
-    if (e->locals + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
-        JIT_MAX_SAVED) {
+    if (e->depth >= JIT_MAX_SAVED) {
+        e->whyNot = "the operand stack is deeper than the model allows";
+        return false;
+    }
+    if (!e->measuring &&
+        e->locals + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
+            JIT_MAX_SAVED) {
+        e->whyNot = "more live values than there are callee-saved registers";
         return false;
     }
     e->stackShape[e->depth] = shape;
@@ -602,68 +641,75 @@ static bool isClassCallee(const Emit *e, unsigned argc) {
            e->stack[e->depth - argc - 1] == SLOT_CLASS;
 }
 
-static bool emitCallOut(Emit *e, unsigned argc) {
-    if (argc > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
+static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
+                           uint32_t shape, ObjClass *klass);
+
+static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
+                           unsigned nargs, void *helper) {
+    if (nargs > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
     if (!e->callsOut) { e->whyNot = "callsOut off"; return false; }
-    ObjClass *cls = e->stackClass[e->depth - argc - 1];
-    if (cls == NULL) { e->whyNot = "callee class"; return false; }
 
-                unsigned d = e->descOffset;
-    /* The callee. */
-    emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+    unsigned d = e->descOffset;
+
+    /* The callee, as a whole Value. */
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, (unsigned)calleeVal.type, 0));
     emit(e, jaiA64StrW(JIT_SCRATCH_A, 31,
-               d + (unsigned)offsetof(JitCallDesc, callee)));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)cls);
+                       d + (unsigned)offsetof(JitCallDesc, callee)));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)calleeVal.as.obj);
     emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-               d + (unsigned)offsetof(JitCallDesc, callee) + 8));
+                       d + (unsigned)offsetof(JitCallDesc, callee) + 8));
 
-    /* The arguments, in the registers just below the top. */
-    for (unsigned i = 0; i < argc; i++) {
-        unsigned idx = e->depth - argc + i;
+    /* The arguments, which for an invoke begin with the receiver. */
+    for (unsigned i = 0; i < nargs; i++) {
+        unsigned idx = first + i;
         SlotKind k = e->stack[idx];
-        unsigned tag = k == SLOT_INT   ? VAL_INT
-             : k == SLOT_FLOAT ? VAL_FLOAT
-                               : VAL_OBJ;
-        if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_INST) {
-    return false;
+        if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
+            k != SLOT_INST && k != SLOT_LIST) {
+            e->whyNot = "an argument kind this call cannot pass";
+            return false;
         }
+        unsigned tag = k == SLOT_INT   ? VAL_INT
+                     : k == SLOT_FLOAT ? VAL_FLOAT
+                     : k == SLOT_BOOL  ? VAL_BOOL
+                                       : VAL_OBJ;
         unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
-              i * (unsigned)sizeof(Value);
+                      i * (unsigned)sizeof(Value);
         unsigned reg = JIT_FIRST_SAVED + e->locals +
-               (e->usesUpvalues ? 1u : 0u) +
-               (idx - (e->depth - e->valueDepth));
+                       (e->usesUpvalues ? 1u : 0u) +
+                       (idx - (e->depth - e->valueDepth));
         emit(e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(reg, 31, at + 8));
     }
 
-    /* Everything this body is holding that the collector must see:
-     * the callee can allocate. */
+    /* Everything this body is holding that the collector must see. */
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
-        if (e->localKind[slot] != SLOT_INST) continue;
-        if (nroots >= JIT_MAX_SAVED) return false;
+        if (e->localKind[slot] != SLOT_INST &&
+            e->localKind[slot] != SLOT_LIST) {
+            continue;
+        }
+        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
-              nroots * (unsigned)sizeof(Value);
+                      nroots * (unsigned)sizeof(Value);
         emit(e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(localReg(e, slot), 31, at + 8));
         nroots++;
     }
 
-    emit(e, jaiA64MovzX(JIT_SCRATCH_A, argc, 0));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, nargs, 0));
     emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-               d + (unsigned)offsetof(JitCallDesc, argc)));
+                       d + (unsigned)offsetof(JitCallDesc, argc)));
     emit(e, jaiA64MovzX(JIT_SCRATCH_A, nroots, 0));
     emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-               d + (unsigned)offsetof(JitCallDesc, nroots)));
+                       d + (unsigned)offsetof(JitCallDesc, nroots)));
 
     emit(e, jaiA64AddXImm(0, 31, d));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitCallOut);
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)helper);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
 
-    /* Nonzero means the callee raised; the interpreter owns the
-     * exception from here and must not re-run this call. */
+    /* Nonzero means the callee raised; the interpreter owns it from here. */
     emit(e, jaiA64SubsXImm(31, 0, 0));
     if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
@@ -672,9 +718,18 @@ static bool emitCallOut(Emit *e, unsigned argc) {
     e->fixups[e->fixupCount].depth        = -1;
     e->fixupCount++;
     emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    return true;
+}
 
-    /* The arguments hold registers; the callee does not -- a class is baked
-     * into the sequence above -- so it comes off the model by hand. */
+static bool emitCallOut(Emit *e, unsigned argc) {
+    ObjClass *cls = e->stackClass[e->depth - argc - 1];
+    if (cls == NULL) { e->whyNot = "callee class"; return false; }
+
+    if (!emitDescriptor(e, OBJ_VAL((Obj *)cls), e->depth - argc, argc,
+                        (void *)&jitCallOut)) {
+        return false;
+    }
+
     for (unsigned i = 0; i < argc; i++) {
         unsigned r;
         if (!popValue(e, &r, NULL)) { e->whyNot = "call argument"; return false; }
@@ -684,19 +739,15 @@ static bool emitCallOut(Emit *e, unsigned argc) {
         return false;
     }
     e->depth--;
+
     if (!pushValue(e, SLOT_INST, cls->shapeId, cls)) return false;
     emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-               d + (unsigned)offsetof(JitCallDesc, result) + 8));
-    /* A call is an effect: no bail may follow it, for the same
-     * reason no bail may follow a store. */
+                       e->descOffset + (unsigned)offsetof(JitCallDesc, result) + 8));
     /* A call is an effect: no bail may follow it, for the same reason no bail
      * may follow a store. */
     e->wroteHeap = true;
     return true;
 }
-
-static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
-                           uint32_t shape, ObjClass *klass);
 
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
@@ -769,6 +820,38 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64AddsX(pushReg(e) - 1, localReg(e, a), localReg(e, b)));
             branchOnOverflow(e, 0u, JAI_A64_VS);
             off += 5;
+            break;
+        }
+
+        case OP_ADD_BIND: {
+            /* `ADD; BIND a` fused. Floats go through the same fmov pair the
+             * plain add uses; ints keep the overflow check. */
+            unsigned slot = jaiReadU16(code + off + 1);
+            if (!localInRange(e, slot)) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            unsigned rb, ra;
+            SlotKind kb, ka;
+            if (!popValue(e, &rb, &kb)) return false;
+            if (!popValue(e, &ra, &ka)) return false;
+            if (ka != kb) return false;
+            if (!adoptLocalKind(e, slot, ka, 0, NULL)) {
+                e->whyNot = "a local was given two different kinds";
+                return false;
+            }
+            unsigned rd = localReg(e, slot);
+            if (ka == SLOT_FLOAT) {
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+                emit(e, jaiA64FaddD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
+                                    JIT_FSCRATCH_B));
+                emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
+            } else if (ka == SLOT_INT) {
+                emit(e, jaiA64AddsX(rd, ra, rb));
+                branchOnOverflow(e, 0u, JAI_A64_VS);
+            } else {
+                return false;
+            }
+            off += 3;
             break;
         }
 
@@ -1272,6 +1355,107 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_INVOKE: {
+            uint32_t nameIdx = jaiReadU24(code + off + 1);
+            unsigned argc    = code[off + 4];
+            if (argc > JIT_MAX_ARGS_OUT - 1) return false;
+            if (!e->callsOut) return false;
+            if (e->depth < argc + 1) return false;
+
+            unsigned ridx = e->depth - argc - 1;
+            SlotKind rk = e->stack[ridx];
+            if (rk != SLOT_LIST) return false;       /* lists only, for now */
+            Value seen = e->stackSeen[ridx];
+            if (!IS_LIST(seen)) return false;
+            if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+            Value nameVal = fn->chunk.constants.data[nameIdx];
+            if (!IS_STRING(nameVal)) return false;
+
+            /* Resolve now; the module version check at the entry pins it. */
+            Value bound;
+            if (!jaiBuiltinMethod(seen, AS_STRING(nameVal), &bound)) return false;
+            Value nativeVal = IS_BOUND(bound) ? AS_BOUND(bound)->method : bound;
+            if (!IS_NATIVE(nativeVal)) return false;
+
+            /* What comes back. `len` is an int; anything whose result is
+             * dropped on the next instruction needs no kind at all. Nothing
+             * else, because a call's result cannot be guarded -- the call
+             * already happened, so a wrong guess has nowhere to go. */
+            const char *mname = AS_STRING(nameVal)->chars;
+            bool discarded = (off + 7 < count && code[off + 7] == OP_POP);
+            bool isLen = strcmp(mname, "len") == 0 && argc == 0;
+            if (!isLen && !discarded) return false;
+
+            if (!emitDescriptor(e, nativeVal, ridx, argc + 1,
+                                (void *)&jitInvokeNative)) {
+                return false;
+            }
+
+            for (unsigned i = 0; i <= argc; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            if (isLen) {
+                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                                   e->descOffset +
+                                       (unsigned)offsetof(JitCallDesc, result) + 8));
+            }
+            e->wroteHeap = true;
+            off += 7;
+            if (!isLen) off += 1;      /* the OP_POP this consumed */
+            break;
+        }
+
+        case OP_GET_INDEX: {
+            /* list[i], with the index normalised the way jaiNormalizeIndex
+             * does it and one unsigned compare covering both ends. Anything
+             * out of range, or an element that is not the kind seen at compile
+             * time, goes back to the interpreter -- which raises the IndexError
+             * or re-reads the element, whichever it is. Reading an element has
+             * no effect, so resuming at this instruction is sound. */
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 2] != SLOT_LIST) return false;
+            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            unsigned rIdx = pushReg(e) - 1, rList = pushReg(e) - 2;
+
+            Value seenList = e->stackSeen[e->depth - 2];
+            if (!IS_LIST(seenList)) return false;
+            ObjList *sl = AS_LIST(seenList);
+            if (sl->count <= 0) return false;
+            Value elem = sl->items[0];
+            SlotKind kind;
+            unsigned tag;
+            if (IS_INT(elem))        { kind = SLOT_INT;   tag = VAL_INT; }
+            else if (IS_FLOAT(elem)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            else return false;
+
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, count)));
+            emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+            emit(e, jaiA64BCond(JAI_A64_GE, 2));
+            emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A));
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+            branchOnDeopt(e, JAI_A64_HS);
+
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
+                               (unsigned)offsetof(ObjList, items)));
+            emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_SCRATCH_B, 4));
+            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            unsigned d1, d2;
+            if (!popValue(e, &d1, NULL)) return false;
+            if (!popValue(e, &d2, NULL)) return false;
+            if (!pushValue(e, kind, 0, NULL)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 8));
+            off += 1;
+            break;
+        }
+
         case OP_GET_GLOBAL: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             if (globalIsSelf(closure, nameIdx)) {
@@ -1416,6 +1600,8 @@ static bool seedLocals(Emit *e, Value *slotBase) {
             e->localKind[i]  = SLOT_INST;
             e->localClass[i] = AS_INSTANCE(v)->klass;
             e->localShape[i] = AS_INSTANCE(v)->klass->shapeId;
+        } else if (IS_LIST(v)) {
+            e->localKind[i] = SLOT_LIST;
         } else if (i == 0) {
             /* A plain function's slot 0 is the closure being called. Nothing
              * can be done with it, but the body has no reason to read it. */
@@ -1455,7 +1641,7 @@ static bool eligible(ObjFunction *fn) {
      * arity 0, and getters are the commonest shape there is. A plain function
      * with no arguments reaches here too and declines on its opcodes. */
     if (fn->arity > JIT_MAX_ARITY) why = "arity";
-    else if (fn->maxSlots < 1 || (unsigned)fn->maxSlots - 1 > JIT_MAX_SAVED) why = "maxSlots";
+    else if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > JIT_MAX_SLOTS) why = "maxSlots";
     else if (fn->defaultCount != 0) why = "defaults";
     else if (fn->flags & (FN_VARIADIC | FN_KWREST)) why = "flags";
 
@@ -1510,6 +1696,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     body.locals       = (unsigned)fn->maxSlots;
     body.usesUpvalues = fn->upvalueCount > 0;
     body.callsOut     = true;      /* the measuring pass may emit one */
+    body.measuring    = true;
     body.descOffset   = 16u;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
@@ -1546,7 +1733,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         return false;
     }
     e.base         = body.usesSlot0 ? 0u : 1u;
-    e.locals       = (unsigned)fn->maxSlots - e.base;
+    /* Only as far as the body reaches, never the whole window. */
+    unsigned highest = body.maxSlotUsed;
+    if (highest < fn->arity) highest = fn->arity;
+    e.locals       = highest + 1u - e.base;
     e.usesUpvalues = fn->upvalueCount > 0;
 
     unsigned argCount = fn->arity + 1u - e.base;
@@ -1640,7 +1830,8 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             SlotKind kind = e.localKind[slot];
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
-                         : kind == SLOT_INST  ? VAL_OBJ
+                         : kind == SLOT_BOOL  ? VAL_BOOL
+                         : (kind == SLOT_INST || kind == SLOT_LIST) ? VAL_OBJ
                                               : VAL_NULL;
             unsigned at = (unsigned)offsetof(JitDeoptRecord, locals) +
                           i * (unsigned)sizeof(Value);
@@ -1672,6 +1863,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             }
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
+                         : kind == SLOT_BOOL  ? VAL_BOOL
                                               : VAL_OBJ;
             unsigned reg = JIT_FIRST_SAVED + e.locals +
                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
@@ -1889,6 +2081,14 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
             a[i] = (int64_t)(uintptr_t)inst;
             break;
         }
+        case SLOT_LIST:
+            if (!IS_LIST(v)) return JAI_JIT_DECLINED;
+            a[i] = (int64_t)(uintptr_t)AS_LIST(v);
+            break;
+        case SLOT_BOOL:
+            if (!IS_BOOL(v)) return JAI_JIT_DECLINED;
+            a[i] = AS_BOOL(v) ? 1 : 0;
+            break;
         case SLOT_OPAQUE:
             a[i] = 0;   /* never read; see seedLocals */
             break;
@@ -1937,7 +2137,11 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         break;
     }
     case SLOT_INST:
+    case SLOT_LIST:
         slotBase[0] = OBJ_VAL((Obj *)(uintptr_t)r.value);
+        break;
+    case SLOT_BOOL:
+        slotBase[0] = BOOL_VAL(r.value != 0);
         break;
     default:
         return JAI_JIT_DECLINED;
