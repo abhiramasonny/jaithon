@@ -354,7 +354,8 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: $(TARGET) $(BUILD)/verify_chunk
+test: $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena
+	@$(BUILD)/jit_arena
 	@./scripts/run_tests.sh
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
@@ -369,6 +370,18 @@ $(BUILD)/verify_chunk: $(VERIFY_OBJS) tests/verify_chunk.c | $(CC_STAMP)
 # The verifier on its own, with its own report, for working on it.
 verify-test: $(BUILD)/verify_chunk
 	@$(BUILD)/verify_chunk
+
+# The code arena executes what it was written. C rather than .jai because
+# nothing in the language reaches it yet, and because the failure it guards --
+# a stale instruction cache on arm64 -- returns a plausible wrong number rather
+# than crashing.
+$(BUILD)/jit_arena: tests/jit_arena.c src/vm/jit.c | $(CC_STAMP)
+	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) -o $@ tests/jit_arena.c src/vm/jit.c
+
+.PHONY: jit-test
+jit-test: $(BUILD)/jit_arena
+	@$(BUILD)/jit_arena
 
 bench: $(TARGET)
 	@./scripts/run_bench.sh
