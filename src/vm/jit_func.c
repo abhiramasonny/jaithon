@@ -248,6 +248,20 @@ static int jitMakeIter(JitCallDesc *d) {
 }
 
 /* One step. 0 advanced with the item in `result`, 1 exhausted, 2 raised. */
+/* An f-string. The interpreter reads its parts straight off the operand stack;
+ * the descriptor's args array is contiguous in the same way, so the pieces go
+ * there and this is the whole of it. Only the builtin path -- the compiler
+ * checks at compile time that the module has not bound its own `str`, and the
+ * module version retires this form if one appears. */
+static int jitFormat(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    ObjString *formatted = jaiValueFormat(d->args, (int)d->argc);
+    jaiGCPopRoots((int)d->nroots);
+    if (formatted == NULL) return 1;
+    d->result = OBJ_VAL(formatted);
+    return 0;
+}
+
 static int jitIterStep(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     Value item;
@@ -1898,6 +1912,48 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
             off += 4;
+            break;
+        }
+
+        case OP_FORMAT: {
+            /* Ninety refusals across the benchmarks, the largest entry in the
+             * census by a wide margin: every f-string is one of these, and
+             * dict_ops, word_freq and string_build all build their keys with
+             * one. */
+            unsigned parts = code[off + 1];
+            if (parts == 0 || parts > JIT_MAX_ARGS_OUT) {
+                e->whyNot = "an f-string with more parts than the descriptor holds";
+                return false;
+            }
+            if (e->depth < parts) return false;
+            /* `str` bound in the module means every part goes through it
+             * instead, which is a call this does not make. */
+            {
+                ObjModule *fmod = closure->fn->module;
+                Value bound;
+                ObjString *sname = jaiStringIntern("str", 3);
+                if (fmod == NULL || sname == NULL ||
+                    jaiTableGetInterned(&fmod->globals, sname, &bound)) {
+                    e->whyNot = "the module binds its own str";
+                    return false;
+                }
+            }
+            if (!emitDescriptor(e, NULL_VAL, e->depth - parts, parts,
+                                (void *)&jitFormat)) {
+                return false;
+            }
+            for (unsigned i = 0; i < parts; i++) {
+                unsigned drop;
+                if (!popValue(e, &drop, NULL)) return false;
+            }
+            if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            /* count u8, litmask u24, name u24, cache u16 -- nine after the
+             * opcode. */
+            off += 10;
             break;
         }
 
