@@ -399,6 +399,11 @@ typedef struct {
      * access. The entry already checks every slot's kind before calling, so
      * the prologue only has to load payloads; every exit writes them back. */
     bool      osrRegLocals;
+    /* Inlining a method widens the live range of everything it reads, so a
+     * loop that fitted the registers as a call may not fit as an expression.
+     * The compile is retried with this set when that is what went wrong. */
+    bool      noInline;
+    bool      inlined;
     bool      pendingRange;
     bool      genericIter;
     bool      rangeInclusive;
@@ -1076,6 +1081,148 @@ static bool emitGlobalCall(Emit *e, unsigned argc, uint32_t after) {
     branchOnDeoptAt(e, JAI_A64_NE, after, true);
     emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
     e->wroteHeap = true;
+    return true;
+}
+
+/* Emit a method's body directly, when that body is one expression.
+ *
+ * Deliberately narrow: no jumps, no stores, no calls, only field reads of its
+ * own parameters and int or float arithmetic. Those restrictions are what make
+ * a second walker over the callee's bytecode safe to write -- with no branches
+ * there is no offset map to keep, and with no stores there is nothing to undo
+ * if a guard inside it deoptimises to the call site. */
+static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                         unsigned argc, int callOff) {
+    if (e->noInline) return false;
+    unsigned ridx = e->depth - argc - 1;
+    ObjClass *rcls = e->stackClass[ridx];
+    if (rcls == NULL) return false;
+    ObjFunction *cfn = closure->fn;
+    if (nameIdx >= (uint32_t)cfn->chunk.constants.count) return false;
+    Value mname = cfn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(mname)) return false;
+    Value method;
+    if (!jaiClassFindMethod(rcls, AS_STRING(mname), &method)) return false;
+    if (!IS_CLOSURE(method)) return false;
+    ObjFunction *mfn = AS_CLOSURE(method)->fn;
+    if (mfn->arity != argc || mfn->defaultCount != 0) return false;
+    if (mfn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
+    if (mfn->upvalueCount != 0) return false;
+    if (mfn->chunk.count > 96) return false;
+
+    /* The receiver and arguments, as the caller holds them. */
+    unsigned base = JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u);
+    unsigned inReg[JIT_MAX_ARGS_OUT + 1];
+    Value    inSeen[JIT_MAX_ARGS_OUT + 1];
+    ObjClass *inCls[JIT_MAX_ARGS_OUT + 1];
+    for (unsigned i = 0; i <= argc; i++) {
+        unsigned idx = ridx + i;
+        if (!holdsRegister(e->stack[idx])) return false;
+        inReg[i]  = base + (idx - (e->depth - e->valueDepth));
+        inSeen[i] = e->stackSeen[idx];
+        inCls[i]  = e->stackClass[idx];
+    }
+
+    /* A dry walk first: nothing is emitted until the whole body is known to
+     * be expressible, because a half-inlined body cannot be taken back. */
+    const uint8_t *c = mfn->chunk.code;
+    int n = mfn->chunk.count;
+    for (int pass = 0; pass < 2; pass++) {
+        int depth0 = (int)e->depth;
+        for (int o = 0; o < n;) {
+            uint8_t op = c[o];
+            if (op == OP_GET_FIELD_LOCAL) {
+                unsigned slot = jaiReadU16(c + o + 1);
+                uint32_t nidx = jaiReadU24(c + o + 3);
+                if (slot > argc) return false;
+                if (e->stack[ridx + slot] != SLOT_INST) return false;
+                if (nidx >= (uint32_t)mfn->chunk.constants.count) return false;
+                Value fname = mfn->chunk.constants.data[nidx];
+                if (!IS_STRING(fname)) return false;
+                const FieldInfo *fi =
+                    jaiClassFieldInfo(inCls[slot], AS_STRING(fname));
+                if (fi == NULL || fi->isStatic) return false;
+                if (!IS_INSTANCE(inSeen[slot])) return false;
+                ObjInstance *si = AS_INSTANCE(inSeen[slot]);
+                if (fi->slot >= si->fieldCount) return false;
+                Value fv = si->fields[fi->slot];
+                SlotKind fk; unsigned ftag;
+                if (IS_INT(fv))        { fk = SLOT_INT;   ftag = VAL_INT; }
+                else if (IS_FLOAT(fv)) { fk = SLOT_FLOAT; ftag = VAL_FLOAT; }
+                else return false;
+                unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
+                                 (unsigned)fi->slot * (unsigned)sizeof(Value);
+                if (pass == 1) {
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, inReg[slot], fbase));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ftag));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)callOff, false);
+                }
+                if (!pushValue(e, fk, 0, NULL)) return false;
+                if (pass == 1) {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, inReg[slot], fbase + 8));
+                }
+                o += 8;
+                continue;
+            }
+            if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
+                unsigned rb, ra; SlotKind kb, ka;
+                if (!popValue(e, &rb, &kb)) return false;
+                if (!popValue(e, &ra, &ka)) return false;
+                if (ka != kb) return false;
+                if (ka != SLOT_INT && ka != SLOT_FLOAT) return false;
+                if (!pushValue(e, ka, 0, NULL)) return false;
+                unsigned rd = pushReg(e) - 1;
+                if (pass == 1) {
+                    if (ka == SLOT_FLOAT) {
+                        emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+                        emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+                        emit(e, op == OP_ADD
+                                 ? jaiA64FaddD(JIT_FSCRATCH_A, JIT_FSCRATCH_A, JIT_FSCRATCH_B)
+                             : op == OP_SUB
+                                 ? jaiA64FsubD(JIT_FSCRATCH_A, JIT_FSCRATCH_A, JIT_FSCRATCH_B)
+                                 : jaiA64FmulD(JIT_FSCRATCH_A, JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+                        emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
+                    } else if (op == OP_MUL) {
+                        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
+                        emit(e, jaiA64MulX(rd, ra, rb));
+                        emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+                        branchOnOverflow(e, 2u, JAI_A64_NE);
+                    } else {
+                        emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
+                                             : jaiA64SubsXReg(rd, ra, rb));
+                        branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
+                    }
+                }
+                o += 1;
+                continue;
+            }
+            if (op == OP_RETURN) {
+                if ((int)e->depth != depth0 + 1) return false;
+                o += 1;
+                if (o != n) return false;
+                break;
+            }
+            return false;
+        }
+        if (pass == 0) {
+            /* Undo the model changes the dry walk made. */
+            while ((int)e->depth > depth0) {
+                unsigned r; if (!popValue(e, &r, NULL)) return false;
+            }
+        }
+    }
+
+    /* The result is on top; the receiver and arguments below it go away. */
+    unsigned rres;
+    SlotKind kres;
+    if (!popValue(e, &rres, &kres)) return false;
+    for (unsigned i = 0; i <= argc; i++) {
+        unsigned r; if (!popValue(e, &r, NULL)) return false;
+    }
+    if (!pushValue(e, kres, 0, NULL)) return false;
+    unsigned dst = pushReg(e) - 1;
+    if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    e->inlined = true;
     return true;
 }
 
@@ -2046,6 +2193,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             SlotKind rk = e->stack[ridx];
 
             if (rk == SLOT_INST) {
+                /* A method whose whole body is one arithmetic expression over
+                 * its receiver and arguments is worth putting inline: the call
+                 * around it costs more than the expression does. Vec2.dot is
+                 * four field reads, two multiplies and an add, reached through
+                 * a descriptor, a helper and a compiled entry. */
+                if (inlineMethod(e, closure, nameIdx, argc, off)) {
+                    off += 7;
+                    break;
+                }
+
                 /* A method on an instance. The class is fixed here, so the
                  * method is resolved now; what it returns is not knowable, so
                  * the tag that comes back is checked and a surprise deopts to
@@ -3172,7 +3329,7 @@ static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
 }
 
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
-                       bool hasIter) {
+                       bool hasIter, bool noInline) {
     ObjFunction *fn = closure->fn;
     if (!isInstructionStart(&fn->chunk, top)) return false;
     uint32_t end = findLoopEnd(&fn->chunk, top);
@@ -3200,6 +3357,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.bailBlock = -1;
     e.exceptionExit = -1;
     e.callsOut = true;
+    e.noInline = noInline;
     e.observed = slots;
     e.offsetToInst = map;
     e.offsetToDepth = depths;
@@ -3212,6 +3370,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         memset(&probe, 0, sizeof probe);
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
+        probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
         probe.offsetToInst = map; probe.offsetToDepth = depths;
         probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
@@ -3486,7 +3645,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     if (fn->osrCode == NULL) {
         if (fn->osrRefused) return 0;
-        if (!compileOsr(closure, top, frame->slots, hasIter)) {
+        if (!compileOsr(closure, top, frame->slots, hasIter, false) &&
+            !compileOsr(closure, top, frame->slots, hasIter, true)) {
+            /* Inlining widens live ranges; a loop that will not fit with it
+             * may fit without, and a compiled call beats no compile at all. */
             if (++fn->osrAttempts >= 5) fn->osrRefused = true;
             return 0;
         }
