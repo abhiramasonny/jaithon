@@ -252,6 +252,16 @@ static int jitIterStep(JitCallDesc *d) {
     return 0;
 }
 
+/* Allocate an instance of args[0]'s class, nothing more. The fields are stored
+ * by the compiled code that called this. */
+static int jitNewInstance(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
+    d->result = OBJ_VAL(inst);
+    jaiGCPopRoots((int)d->nroots);
+    return 0;
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -891,6 +901,46 @@ static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
 /* A callee that is not this function: only a class, whose result is an
  * instance of a shape known here. Anything else would need a guard on a return
  * value nothing can predict. */
+/* An initializer that does nothing but store its arguments into fields, in
+ * order: `GET_LOCAL2 0 k; SET_FIELD f` repeated, then RETURN_NULL. Anything
+ * else -- a default, a computed field, a call, a branch -- is not this, and
+ * goes the long way.
+ *
+ * Recognising it is what lets `Point(a, b)` become an allocation and two
+ * stores instead of a descriptor, jaiCallValue, invokeCallable's type switch
+ * and a compiled init. That machinery is most of the 35ns an allocation costs
+ * here, against 5ns for the same thing in C++. */
+static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
+    Value initv;
+    if (cls == NULL) return false;
+    if (!jaiClassFindMethod(cls, vm.strInit, &initv)) return false;
+    if (!IS_CLOSURE(initv)) return false;
+    ObjFunction *ifn = AS_CLOSURE(initv)->fn;
+    if (ifn->arity != argc || ifn->defaultCount != 0) return false;
+    if (ifn->flags & (FN_VARIADIC | FN_KWREST)) return false;
+    if (ifn->upvalueCount != 0) return false;
+
+    const uint8_t *c = ifn->chunk.code;
+    int n = ifn->chunk.count;
+    int off = 0;
+    for (unsigned i = 0; i < argc; i++) {
+        if (off + 5 > n || c[off] != OP_GET_LOCAL2) return false;
+        if (jaiReadU16(c + off + 1) != 0) return false;          /* self */
+        if (jaiReadU16(c + off + 3) != i + 1) return false;      /* arg i */
+        off += 5;
+        if (off + 6 > n || c[off] != OP_SET_FIELD) return false;
+        uint32_t nameIdx = jaiReadU24(c + off + 1);
+        if (nameIdx >= (uint32_t)ifn->chunk.constants.count) return false;
+        Value nm = ifn->chunk.constants.data[nameIdx];
+        if (!IS_STRING(nm)) return false;
+        const FieldInfo *fi = jaiClassFieldInfo(cls, AS_STRING(nm));
+        if (fi == NULL || fi->isStatic) return false;
+        slots[i] = fi->slot;
+        off += 6;
+    }
+    return off < n && c[off] == OP_RETURN_NULL;
+}
+
 static bool isClassCallee(const Emit *e, unsigned argc) {
     return e->depth >= argc + 1u &&
            e->stack[e->depth - argc - 1] == SLOT_CLASS;
@@ -1032,6 +1082,60 @@ static bool emitGlobalCall(Emit *e, unsigned argc, uint32_t after) {
 static bool emitCallOut(Emit *e, unsigned argc) {
     ObjClass *cls = e->stackClass[e->depth - argc - 1];
     if (cls == NULL) { e->whyNot = "callee class"; return false; }
+
+    uint16_t fslots[JIT_MAX_ARGS_OUT];
+    if (argc <= JIT_MAX_ARGS_OUT && simpleInitFields(cls, argc, fslots)) {
+        /* Allocate, then store the arguments into their fields here. */
+        unsigned first = e->depth - argc;
+        SlotKind kinds[JIT_MAX_ARGS_OUT];
+        unsigned regs[JIT_MAX_ARGS_OUT];
+        for (unsigned i = 0; i < argc; i++) {
+            kinds[i] = e->stack[first + i];
+            if (kinds[i] != SLOT_INT && kinds[i] != SLOT_FLOAT &&
+                kinds[i] != SLOT_BOOL && kinds[i] != SLOT_INST &&
+                kinds[i] != SLOT_LIST && kinds[i] != SLOT_OBJ) {
+                e->whyNot = "an argument kind a field cannot take";
+                return false;
+            }
+            regs[i] = JIT_FIRST_SAVED + regBase(e) +
+                      (e->usesUpvalues ? 1u : 0u) +
+                      (first + i - (e->depth - e->valueDepth));
+        }
+        if (!emitDescriptor(e, OBJ_VAL((Obj *)cls), first, 0,
+                            (void *)&jitNewInstance)) {
+            return false;
+        }
+        for (unsigned i = 0; i < argc; i++) {
+            unsigned r;
+            if (!popValue(e, &r, NULL)) return false;
+        }
+        if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_CLASS) return false;
+        e->depth--;
+        if (!pushValue(e, SLOT_INST, cls->shapeId, cls)) return false;
+        /* The result reuses the register the first argument was in, so the
+         * instance is held in a scratch until every field has been stored.
+         * Loading it into its final register first overwrote the argument it
+         * was about to store, and alloc_churn came back in 5ms with the wrong
+         * answer -- the same aliasing mistake this tier keeps making. */
+        unsigned rinst = pushReg(e) - 1;
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                           e->descOffset +
+                               (unsigned)offsetof(JitCallDesc, result) + 8));
+        for (unsigned i = 0; i < argc; i++) {
+            unsigned tag = kinds[i] == SLOT_INT   ? VAL_INT
+                         : kinds[i] == SLOT_FLOAT ? VAL_FLOAT
+                         : kinds[i] == SLOT_BOOL  ? VAL_BOOL
+                                                  : VAL_OBJ;
+            unsigned at = (unsigned)offsetof(ObjInstance, fields) +
+                          (unsigned)fslots[i] * (unsigned)sizeof(Value);
+            emit(e, jaiA64MovzX(JIT_SCRATCH_A, tag, 0));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));
+            emit(e, jaiA64StrX(regs[i], JIT_SCRATCH_C, at + 8));
+        }
+        emit(e, jaiA64MovX(rinst, JIT_SCRATCH_C));
+        e->wroteHeap = true;
+        return true;
+    }
 
     if (!emitDescriptor(e, OBJ_VAL((Obj *)cls), e->depth - argc, argc,
                         (void *)&jitCallOut)) {
