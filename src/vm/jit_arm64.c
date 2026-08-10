@@ -243,3 +243,9 @@ uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset) {
 uint32_t jaiA64StrW(unsigned rt, unsigned rn, unsigned offset) {
     return 0xb9000000u | ((offset / 4u) << 10) | (rn << 5) | rt;
 }
+
+/* blr Xn -- call through a register. The absolute address of a C helper does
+ * not fit bl's 26-bit displacement, and the arena can land anywhere. */
+uint32_t jaiA64Blr(unsigned rn) {
+    return 0xd63f0000u | (rn << 5);
+}

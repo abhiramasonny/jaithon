@@ -51,7 +51,13 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
 /* The whole-function tier (jit_func.c). Compile returns false for anything it
  * does not speak; enter obeys the same boundary contract as jaiJitEnter. */
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
-bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
+
+/* Three answers, not two. DECLINED means nothing was touched and the
+ * interpreter should run the call. ERROR means the compiled code called out,
+ * the callee raised, and the effects up to that point already happened -- so
+ * running the call again would repeat them. */
+typedef enum { JAI_JIT_DECLINED, JAI_JIT_DONE, JAI_JIT_ERROR } JaiJitOutcome;
+JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
 void jaiJitStartSampling(void);

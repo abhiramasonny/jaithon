@@ -1060,9 +1060,12 @@ static CallOutcome callClosure(ObjClosure *closure, int argc) {
      * stack for slots it will not use, is pure cost -- and on a small hot
      * function called from an interpreted loop that entry cost was most of
      * what the tier had to give. */
-    if (fn->jitFunc != NULL && argc == (int)fn->arity &&
-        jaiJitEnterFunc(closure, slotBase)) {
-        return CALL_DONE;
+    if (fn->jitFunc != NULL && argc == (int)fn->arity) {
+        JaiJitOutcome outcome = jaiJitEnterFunc(closure, slotBase);
+        if (outcome == JAI_JIT_DONE) return CALL_DONE;
+        /* An exception from a call the compiled body made: the effects up to
+         * it already happened, so this is not a decline. */
+        if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
     }
 
     if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;

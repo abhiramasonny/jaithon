@@ -124,12 +124,12 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     /* The whole-function tier first: it is the only one that makes a hot
      * function meaningfully faster, and it declines quickly for anything
      * outside the small language it speaks. */
-    if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase);
+    if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
 
     if (fn->jitCode == NULL) {
         if (jaiJitCompileFunc(closure, slotBase)) {
             fn->jitModuleVersion = fn->module->version;
-            return jaiJitEnterFunc(closure, slotBase);
+            return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
         }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {
             fn->jitRefused = true;

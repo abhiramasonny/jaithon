@@ -55,6 +55,8 @@ uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm);
 /* sub Xd, Xn, #imm12 */
 uint32_t jaiA64SubXImm(unsigned rd, unsigned rn, unsigned imm12);
+/* blr Xn -- call through a register, for an address bl cannot reach */
+uint32_t jaiA64Blr(unsigned rn);
 /* bl #offset -- offset in instructions, signed 26-bit */
 uint32_t jaiA64Bl(int32_t instructions);
 /* stp Xt1, Xt2, [Xn, #imm]!  (pre-index, writes back) */

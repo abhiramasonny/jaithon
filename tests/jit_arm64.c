@@ -482,6 +482,30 @@ int main(void) {
       check("str w low word", runWith(w, 4, scratch), (int64_t)0xffffffff0000002aull);
       check("str w kept high", (int64_t)((uint64_t)scratch[1] >> 32), (int64_t)0xffffffffu); }
 
+    /* blr through a register, to a callee placed after the return. x30 must be
+     * saved across it or the outer ret goes back into the callee. */
+    { const uint32_t w[] = {
+          /* 0 */ jaiA64StpPre(29, 30, 31, -16),
+          /* 1 */ jaiA64AddXImm(9, 0, 0),          /* x9 = arg pointer   */
+          /* 2 */ jaiA64LdrX(9, 9, 24),            /* x9 = cell[3] = fn  */
+          /* 3 */ jaiA64MovzX(0, 20, 0),
+          /* 4 */ jaiA64Blr(9),
+          /* 5 */ jaiA64LdpPost(29, 30, 31, 16),
+          /* 6 */ jaiA64Ret(),
+          /* 7 */ jaiA64AddXImm(0, 0, 22),         /* callee: x0 += 22   */
+          /* 8 */ jaiA64Ret() };
+      /* cell[3] is patched to the callee's address once the arena is known,
+       * so the call target is genuinely a runtime value. */
+      JaiCodeArena a;
+      if (!jaiCodeArenaInit(&a, 4096)) { fprintf(stderr, "mmap failed\n"); exit(1); }
+      uint8_t *base = jaiCodeArenaWrite(&a, w, sizeof w);
+      if (base == NULL) exit(1);
+      int64_t cell2[4] = { 0, 0, 0, 0 };
+      cell2[3] = (int64_t)(uintptr_t)(base + 7 * 4);
+      if (!jaiCodeArenaSeal(&a)) exit(1);
+      int64_t (*fn)(void *) = (int64_t (*)(void *))(uintptr_t)a.code;
+      check("blr", fn(cell2), 42); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;
