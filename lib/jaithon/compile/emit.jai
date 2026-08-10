@@ -175,6 +175,8 @@ pub enum Op {
     JumpIfCmpLocalK,
     # Numeric widening (spec §2.2), appended after compiler version 17.
     ToFloat,
+    # `<int k>; MOD` fused, appended after compiler version 18.
+    ModIntConst,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -327,6 +329,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.Format, "OP_FORMAT", 9, STACK_EFFECT_VARIABLE),
     OpSpec(Op.JumpIfCmpLocalK, "OP_JUMP_IF_CMP_LOCAL_K", 8, 0),
     OpSpec(Op.ToFloat, "OP_TO_FLOAT", 0, 0),
+    OpSpec(Op.ModIntConst, "OP_MOD_INT_CONST", 2, 0),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,

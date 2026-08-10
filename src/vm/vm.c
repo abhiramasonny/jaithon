@@ -2989,6 +2989,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_NOT]                = &&L_OP_NOT,
         [OP_CONCAT]             = &&L_OP_CONCAT,
         [OP_ADD_INT_CONST]      = &&L_OP_ADD_INT_CONST,
+        [OP_MOD_INT_CONST]      = &&L_OP_MOD_INT_CONST,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -3485,6 +3486,28 @@ static JaiRunResult runLoop(int baseFrameCount) {
      * opcode would have called — a float compares, a str concatenates, a class
      * gets its dunder, and the diagnostic on a real mismatch is the one the
      * user would have seen at -O0. */
+
+    VM_CASE(OP_MOD_INT_CONST): {
+        /* `<int k>; MOD` fused. The same floor-remainder rule as OP_MOD with an
+         * immediate divisor; k is known non-zero at fusion time, so only
+         * INT64_MIN % -1 has to reach the slow path. */
+        int16_t imm = READ_I16();
+        if (JAI_LIKELY(IS_INT(stackTop[-1]))) {
+            int64_t y = (int64_t)imm, x = AS_INT(stackTop[-1]);
+            if (JAI_LIKELY(!(x == INT64_MIN && y == -1))) {
+                int64_t r = x % y;
+                if (r != 0 && ((r < 0) != (y < 0))) r += y;
+                stackTop[-1] = INT_VAL(r);
+                VM_NEXT();
+            }
+        }
+        SAVE_STATE();
+        Value result;
+        if (!arithmetic(OP_MOD, stackTop[-1], INT_VAL(imm), &result)) goto vmThrow;
+        LOAD_STATE();
+        stackTop[-1] = result;
+        VM_NEXT();
+    }
 
     VM_CASE(OP_ADD_INT_CONST): {
         uint16_t slot = READ_U16();
