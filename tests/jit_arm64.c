@@ -141,6 +141,79 @@ int main(void) {
                              jaiA64AddX(0, 1, 2), jaiA64Ret() };
       check("add reg", runWith(w, 4, cell), 42); }
 
+    /* --- the function tier's encoders ------------------------------- */
+
+    /* sub immediate: 50 - 8 */
+    { const uint32_t w[] = { jaiA64MovzX(1, 50, 0), jaiA64SubXImm(0, 1, 8),
+                             jaiA64Ret() };
+      check("sub imm", runWith(w, 3, cell), 42); }
+
+    /* subs register produces the difference as well as the flags */
+    { const uint32_t w[] = { jaiA64MovzX(1, 50, 0), jaiA64MovzX(2, 8, 0),
+                             jaiA64SubsXReg(0, 1, 2), jaiA64Ret() };
+      check("subs reg", runWith(w, 4, cell), 42); }
+
+    /* subs sets V on signed overflow: INT64_MIN - 1. b.vs must be taken, so
+     * this returns 1 only if the overflow was actually detected. */
+    { const uint32_t w[] = {
+          /* 0 */ jaiA64MovzX(1, 0, 0),
+          /* 1 */ jaiA64MovkX(1, 0x8000u, 3),      /* x1 = INT64_MIN */
+          /* 2 */ jaiA64MovzX(2, 1, 0),
+          /* 3 */ jaiA64SubsXReg(3, 1, 2),
+          /* 4 */ jaiA64BCond(JAI_A64_VS, 3),      /* -> 7 */
+          /* 5 */ jaiA64MovzX(0, 0, 0),
+          /* 6 */ jaiA64Ret(),
+          /* 7 */ jaiA64MovzX(0, 1, 0),
+          /* 8 */ jaiA64Ret() };
+      check("subs overflow", runWith(w, 9, cell), 1); }
+
+    /* stp/ldp with writeback: save a pair below sp, clobber, restore. The
+     * value survives only if both the pre-index store and the post-index load
+     * moved sp by the same amount and back. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64MovzX(2, 9, 0),
+                             jaiA64StpPre(1, 2, 31, -16),
+                             jaiA64MovzX(1, 0, 0), jaiA64MovzX(2, 0, 0),
+                             jaiA64LdpPost(1, 2, 31, 16),
+                             jaiA64AddX(0, 1, 2), jaiA64Ret() };
+      check("stp pre / ldp post", runWith(w, 8, cell), 16); }
+
+    /* stp/ldp at a plain offset, base untouched: write two words into the
+     * caller's cell array and read one back. */
+    { int64_t scratch[4] = { 0, 0, 0, 0 };
+      const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64MovzX(2, 4, 0),
+                             jaiA64StpOff(1, 2, 0, 16),
+                             jaiA64LdpOff(3, 4, 0, 16),
+                             jaiA64AddX(0, 3, 4), jaiA64Ret() };
+      check("stp/ldp offset", runWith(w, 6, scratch), 7);
+      check("stp offset wrote", scratch[2], 3);
+      check("stp offset wrote 2", scratch[3], 4); }
+
+    /* bl and ret: call forward past a literal, have the callee add 1. x30 is
+     * clobbered by the bl, so the outer return needs it saved. */
+    { const uint32_t w[] = {
+          /* 0 */ jaiA64StpPre(29, 30, 31, -16),
+          /* 1 */ jaiA64MovzX(0, 41, 0),
+          /* 2 */ jaiA64Bl(4),                     /* -> 6 */
+          /* 3 */ jaiA64LdpPost(29, 30, 31, 16),
+          /* 4 */ jaiA64Ret(),
+          /* 5 */ jaiA64Ret(),                     /* unreached pad */
+          /* 6 */ jaiA64AddXImm(0, 0, 1),          /* callee */
+          /* 7 */ jaiA64Ret() };
+      check("bl forward", runWith(w, 8, cell), 42); }
+
+    /* ldr literal: the constant sits after the ret, four instructions on from
+     * the load, and is read as one 64-bit word. */
+    { const uint32_t w[] = { jaiA64LdrLit(0, 4), jaiA64Ret(), jaiA64Ret(),
+                             jaiA64Ret(), 0x0000002au, 0x00000000u };
+      check("ldr literal", runWith(w, 6, cell), 42); }
+
+    /* ldr literal reaches a full 64-bit value, not just the low word */
+    /* The literal sits at instruction 4, so its byte offset from a
+     * page-aligned arena is 16 and the 64-bit load is aligned. */
+    { const uint32_t w[] = { jaiA64LdrLit(0, 4), jaiA64Ret(), jaiA64Ret(),
+                             jaiA64Ret(), 0x00000000u, 0x00000001u };
+      check("ldr literal high", runWith(w, 6, cell), (int64_t)1 << 32); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;

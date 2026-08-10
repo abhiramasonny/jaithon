@@ -49,6 +49,26 @@ uint32_t jaiA64AsrX(unsigned rd, unsigned rn, unsigned shift);
 uint32_t jaiA64LsrX(unsigned rd, unsigned rn, unsigned shift);
 /* add Xd, Xn, Xm */
 uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm);
+/* subs Xd, Xn, Xm -- result AND flags; V set on signed overflow */
+uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm);
+/* sub Xd, Xn, #imm12 */
+uint32_t jaiA64SubXImm(unsigned rd, unsigned rn, unsigned imm12);
+/* bl #offset -- offset in instructions, signed 26-bit */
+uint32_t jaiA64Bl(int32_t instructions);
+/* stp Xt1, Xt2, [Xn, #imm]!  (pre-index, writes back) */
+uint32_t jaiA64StpPre(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+/* ldp Xt1, Xt2, [Xn], #imm   (post-index, writes back) */
+uint32_t jaiA64LdpPost(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+/* stp Xt1, Xt2, [Xn, #imm]   (signed offset) */
+uint32_t jaiA64StpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+/* ldp Xt1, Xt2, [Xn, #imm]   (signed offset) */
+uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+/* ldr Xt, <label> -- PC-relative literal load, offset in instructions */
+uint32_t jaiA64LdrLit(unsigned rt, int32_t instructions);
+/* movn Xd, #imm16 -- Xd = ~imm16 */
+uint32_t jaiA64MovnX(unsigned rd, unsigned imm16);
+/* nop */
+uint32_t jaiA64Nop(void);
 /* ret */
 uint32_t jaiA64Ret(void);
 
@@ -58,5 +78,8 @@ uint32_t jaiA64Ret(void);
 #define JAI_A64_VS 6u   /* overflow set */
 #define JAI_A64_LT 11u
 #define JAI_A64_GE 10u
+#define JAI_A64_LO  3u   /* unsigned lower -- the stack-limit test */
+#define JAI_A64_LE 13u
+#define JAI_A64_GT 12u
 
 #endif /* JAI_VM_JIT_ARM64_H */
