@@ -52,6 +52,9 @@ ObjString *jaiStringNew(const char *chars, size_t length);
 /* Takes ownership of a heap buffer allocated with jaiRealloc. */
 ObjString *jaiStringTake(char *chars, size_t length);
 ObjString *jaiStringConcat(ObjString *a, ObjString *b);
+/* The shared one-byte ASCII string. NULL for c >= 128. */
+ObjString *jaiStringChar(unsigned char c);
+void       jaiMarkAsciiChars(void);
 /* Concatenates `count` byte runs into one string, sized exactly, under the
  * same run-time interning policy jaiStringNew applies. The runs must stay
  * valid across a collection — allocating the result can trigger one. */
