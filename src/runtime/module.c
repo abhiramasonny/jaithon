@@ -668,9 +668,9 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
     if (sLoadingFrontEnd && !seedDisabled()) {
         const JaiSeedEntry *seeded = jaiSeedFind(path);
         if (seeded != NULL) {
-            ObjFunction *fromSeed = jaiDeserializeModule(seeded->image,
-                                                         seeded->length,
-                                                         module, hash);
+            ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
+                                                       seeded->length,
+                                                       module, hash);
             if (fromSeed != NULL) return fromSeed;
         }
     }
