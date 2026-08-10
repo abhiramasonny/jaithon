@@ -30,3 +30,6 @@ jaithon-*
 
 # JAI_JIT_DUMP artefacts
 jit_*.bin
+
+# Working notes
+spec/
