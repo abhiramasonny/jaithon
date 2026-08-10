@@ -607,7 +607,20 @@ static bool cacheFlagsMatch(const char *sourcePath, uint32_t flags) {
     if (memcmp(head, JAIC_MAGIC, 4) != 0) return false;
     uint16_t version = (uint16_t)((uint16_t)head[4] | (uint16_t)(head[5] << 8));
     uint16_t stored  = (uint16_t)((uint16_t)head[6] | (uint16_t)(head[7] << 8));
-    return version == JAIC_VERSION && stored == (uint16_t)flags;
+
+    /* JAIC_FLAG_SELFHOSTED records WHO produced the image, and that has no
+     * bearing on whether this binary can load it. Comparing it made every
+     * cached module miss inside the bootstrap window, where `selfHosting()` is
+     * false and the cached image says self-hosted -- so the seed was
+     * deserialised on every single run instead of the cache being used, and
+     * `jaithon run` on an empty program cost 20ms that vanished with
+     * JAITHON_NO_SEED=1.
+     *
+     * Debug and release still have to match: those change what the bytecode
+     * contains, not who wrote it. */
+    const uint16_t kLoadability = (uint16_t)~(uint16_t)JAIC_FLAG_SELFHOSTED;
+    return version == JAIC_VERSION &&
+           (stored & kLoadability) == ((uint16_t)flags & kLoadability);
 }
 
 /* Read `path`, then either deserialise its cache or compile it. The source is
