@@ -31,4 +31,36 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
  * measurement can be taken against the interpreter without rebuilding. */
 bool jaiJitEnabled(void);
 
+/* ------------------------------------------------------------------ */
+/* Executable memory                                                    */
+/* ------------------------------------------------------------------ */
+
+/* A page of code, written then sealed.
+ *
+ * arm64 will not let a page be writable and executable at once, so the arena is
+ * mapped RW, filled, and flipped to RX before anything jumps into it. Measured
+ * on this machine: an unsigned binary can do that with plain mmap and mprotect;
+ * neither MAP_JIT nor the allow-jit entitlement is needed, which is worth
+ * knowing because the alternative would have meant codesigning every build.
+ *
+ * The instruction cache must be invalidated after writing. On arm64 the data
+ * and instruction caches are not coherent, so code that was just stored is not
+ * necessarily what gets fetched -- this is the failure that looks like random
+ * corruption and is not reproducible under a debugger. */
+typedef struct {
+    uint8_t *code;      /* base of the mapping */
+    size_t   capacity;
+    size_t   used;
+    bool     sealed;    /* true once flipped to RX; writing after this is a bug */
+} JaiCodeArena;
+
+/* Reserve `capacity` bytes of writable memory. False when the map fails. */
+bool jaiCodeArenaInit(JaiCodeArena *arena, size_t capacity);
+/* Append `length` bytes, returning where they landed, or NULL when full or
+ * sealed. */
+uint8_t *jaiCodeArenaWrite(JaiCodeArena *arena, const void *bytes, size_t length);
+/* Flip to read-execute and invalidate the instruction cache. */
+bool jaiCodeArenaSeal(JaiCodeArena *arena);
+void jaiCodeArenaFree(JaiCodeArena *arena);
+
 #endif /* JAI_VM_JIT_H */
