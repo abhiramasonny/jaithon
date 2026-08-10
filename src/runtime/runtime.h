@@ -3,7 +3,18 @@
 #define JAI_RUNTIME_H
 
 #include "../vm/vm.h"
-#include "../codegen/codegen.h"
+
+/* What the front end is asked to produce. It lived in
+ * `src/codegen/codegen.h`, which is how four files outside the front end came
+ * to include a front-end header for one struct. */
+typedef struct {
+    int  optLevel;        /* 0 = none, 2 = default, 3 = + inlining */
+    bool debugInfo;       /* keep local names and full line tables */
+    bool stripAsserts;    /* --release */
+    bool emitTailCalls;
+} CodegenOptions;
+
+CodegenOptions jaiCodegenDefaults(void);
 
 /* ------------------------------------------------------------------ */
 /* Builtin registration                                                 */

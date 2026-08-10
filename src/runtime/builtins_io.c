@@ -36,9 +36,6 @@
 #include "handles.h"
 #include "methods.h"
 
-#include "../lang/ast.h"
-#include "../lang/lexer.h"
-#include "../lang/parser.h"
 #include "../native/native.h"
 #include "../vm/gc.h"
 #include "../vm/serialize.h"
@@ -1662,52 +1659,6 @@ static bool renderToString(RenderFn render, void *context, const char *fnName,
     return finishRead(&s, &buf, out);
 }
 
-static void renderAst(FILE *sink, void *context) {
-    jaiAstToJson(sink, (const AstNode *)context);
-}
-
-/* Parsing only: the JSON is the tree the parser produced, before any name has
- * been resolved, which is what jaithon.ast and the formatter consume. */
-static bool nReflectParseAst(int argc, Value *args, Value *out) {
-    ObjString *source;
-    if (!jaiArgString(args[0], 1, "parse_ast", &source)) return false;
-
-    const char *path = "<parse_ast>";
-    if (argc >= 2 && !IS_NULL(args[1])) {
-        ObjString *name;
-        if (!jaiArgString(args[1], 2, "parse_ast", &name)) return false;
-        if (name->length > 0) path = name->chars;
-    }
-
-    /* The source registry owns the text for as long as spans can refer to it,
-     * and the token stream points into the same copy. */
-    char *copy = JAI_ALLOC(char, source->length + 1);
-    memcpy(copy, source->chars, source->length);
-    copy[source->length] = '\0';
-    int fileId = jaiSourceAdd(path, copy, source->length);
-    JaiSourceFile *file = jaiSourceGet(fileId);
-    if (file == NULL)
-        return jaiThrow(vm.cRuntimeError, "parse_ast(): cannot register the source");
-
-    AstContext ast;
-    jaiAstContextInit(&ast);
-    Lexer lex;
-    AstNode *program = jaiParseSource(&ast, &lex, file->source, file->length,
-                                      fileId);
-
-    bool ok;
-    if (program == NULL) {
-        ok = throwCompileError("parse_ast");
-    } else {
-        ok = renderToString(renderAst, program, "parse_ast", out);
-    }
-
-    /* The AST points into the lexer's cooked strings, so the lexer outlives it
-     * and both are released here, after the JSON has been written. */
-    jaiLexerFree(&lex);
-    jaiAstContextFree(&ast);
-    return ok;
-}
 
 static bool nReflectGlobals(int argc, Value *args, Value *out) {
     (void)argc;
@@ -1748,7 +1699,6 @@ void jaiRegisterReflectPrimitives(void) {
     jaiDefineNative("__prim__.compile",     nReflectCompile,     1, 2);
     jaiDefineNative("__prim__.eval",        nReflectEval,        1, 1);
     jaiDefineNative("__prim__.exec",        nReflectExec,        1, 2);
-    jaiDefineNative("__prim__.parse_ast",   nReflectParseAst,    1, 2);
     jaiDefineNative("__prim__.globals",     nReflectGlobals,     0, 0);
 }
 

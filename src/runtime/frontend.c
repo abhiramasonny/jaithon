@@ -208,7 +208,7 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
         return NULL;
     }
 
-    Value args[10];
+    Value args[11];
     args[0] = sSession;
     args[1] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[1]);
@@ -224,9 +224,10 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
                                                                : ""));
     jaiPushRoot(args[8]);
     args[9] = BOOL_VAL(opts->strict);
+    args[10] = BOOL_VAL(opts->lateGlobals);
 
     Value produced = NULL_VAL;
-    bool called = jaiFrontEndInvoke(JAI_FRONT_END_MODULE, "compile_repl", 10,
+    bool called = jaiFrontEndInvoke(JAI_FRONT_END_MODULE, "compile_repl", 11,
                                     args, &produced);
     jaiPopRoots(4);
     if (!called || !IS_INSTANCE(produced)) return NULL;
@@ -348,8 +349,11 @@ static void transferOne(Value diagnostic) {
 }
 
 bool jaiFrontEndTransferDiagnostics(Value compiled) {
+    /* `Compiled` carries a bag; `import_cycles` answers one directly. Both are
+     * worth accepting, so that a caller does not have to know which shape the
+     * entry point it used happens to return. */
     Value bag;
-    if (!jaiFrontEndField(compiled, "diagnostics", &bag)) return false;
+    if (!jaiFrontEndField(compiled, "diagnostics", &bag)) bag = compiled;
     Value items;
     if (!jaiFrontEndField(bag, "items", &items) || !IS_LIST(items)) return false;
 

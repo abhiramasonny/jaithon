@@ -24,14 +24,18 @@
 #include "frontend.h"
 #include "methods.h"
 
-#include "../codegen/codegen.h"
 #include "../common/diag.h"
-#include "../lang/lexer.h"
-#include "../lang/parser.h"
 #include "../native/native.h"
-#include "../sema/check.h"
-#include "../sema/resolve.h"
 #include "../vm/serialize.h"
+
+CodegenOptions jaiCodegenDefaults(void) {
+    CodegenOptions opts;
+    opts.optLevel = 2;
+    opts.debugInfo = true;
+    opts.stripAsserts = false;
+    opts.emitTailCalls = true;
+    return opts;
+}
 
 #define JAI_MODULE_EXT   ".jai"
 #define JAI_PACKAGE_FILE "mod.jai"
@@ -503,89 +507,18 @@ static int registerSource(const char *path, const char *source, size_t length) {
     return jaiSourceAdd(path, jaiMemdup(source, length), length);
 }
 
-/* Lex, parse, resolve, check and — when `emit` — generate code for an already
- * registered source. Returns false when any diagnostic was an error; the bag is
- * flushed either way, so warnings from a successful compile are still shown. */
-/* `lateGlobals` compiles the text as a *fragment* of a module that is already
- * running: a name that module's body defined at run time lives in no symbol
- * table here, so it resolves to a late-bound global instead of E0200. Only
- * `__prim__.eval/exec/compile` want that; loading a module's own source keeps
- * the strict rule. */
-static bool frontEnd(ObjModule *module, int fileId, const CodegenOptions *opts,
-                     bool emit, ObjFunction **outBody, bool lateGlobals) {
-    if (outBody != NULL) *outBody = NULL;
-
-    JaiSourceFile *file = jaiSourceGet(fileId);
-    if (file == NULL || file->source == NULL) {
-        (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
-                           "source %d was never registered", fileId);
-        (void)jaiDiagFlush(&gDiags, stderr);
-        return false;
-    }
-    if (module != NULL) module->sourceFileId = fileId;
-
-    AstContext ast;
-    jaiAstContextInit(&ast);
-
-    Lexer lex;
-    AstNode *program = jaiParseSource(&ast, &lex, file->source, file->length,
-                                      fileId);
-    /* Every string the parser kept was copied into the AST arena, so the token
-     * stream and its cooked literals are dead the moment parsing ends. */
-    jaiLexerFree(&lex);
-
-    Resolver resolver;
-    Checker  checker;
-    bool haveResolver = false;
-    bool haveChecker = false;
-    ObjFunction *body = NULL;
-
-    if (program != NULL && !jaiDiagHasErrors(&gDiags)) {
-        jaiResolverInit(&resolver, &ast);
-        haveResolver = true;
-        resolver.module = module;
-        resolver.replMode = lateGlobals;
-
-        if (jaiResolveProgram(&resolver, program) && !jaiDiagHasErrors(&gDiags)) {
-            jaiCheckerInit(&checker, &resolver, &ast);
-            haveChecker = true;
-            checker.foldConstants = opts->optLevel > 0;
-
-            if (jaiCheckProgram(&checker, program) && !jaiDiagHasErrors(&gDiags) &&
-                emit) {
-                body = jaiCompileProgram(program, module, opts);
-                if (body != NULL && jaiDiagHasErrors(&gDiags)) body = NULL;
-                if (body == NULL && !jaiDiagHasErrors(&gDiags)) {
-                    (void)jaiDiagError(E0902_INTERNAL_ERROR, program->span,
-                                       "code generation produced no module body");
-                }
-            }
-        }
-    }
-
-    /* The teardown below frees arenas, which can hand memory back to the
-     * collector; the body is the only thing here that must survive it. */
-    if (body != NULL) jaiPushRoot(OBJ_VAL(body));
-    if (haveChecker) jaiCheckerFree(&checker);
-    if (haveResolver) jaiResolverFree(&resolver);
-    jaiAstContextFree(&ast);
-    if (body != NULL) jaiPopRoot();
-
-    /* A phase that fails without saying why would leave the caller reporting
-     * "module failed to load" and nothing else. */
-    if (program == NULL && !jaiDiagHasErrors(&gDiags)) {
-        (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
-                           "the parser produced no tree for `%s` and reported "
-                           "no error", file->path != NULL ? file->path : "?");
-    }
-
-    if (jaiDiagFlush(&gDiags, stderr)) return false;
-    if (program == NULL) return false;
-
-    if (outBody != NULL) *outBody = body;
-    return !emit || body != NULL;
-}
-
+/* Compile a source string into a module body.
+ *
+ * `__prim__.eval`, `exec` and `compile` reach this, and so does the CLI. It ran
+ * the C front end until that front end was deleted; it now asks the self-hosted
+ * one, which is the compiler every other path already used.
+ *
+ * A *fragment* is text compiled into a module that already exists -- one that
+ * finished loading, or the very module whose body is on the frame stack right
+ * now. A name that module's body defined at run time lives in no symbol table
+ * this compilation can see, so a fragment defers it rather than reporting
+ * E0200. A fresh module handed over by the CLI is neither, and keeps the strict
+ * rule. */
 ObjFunction *jaiCompileSource(const char *source, size_t length,
                               const char *path, ObjModule *module,
                               const CodegenOptions *opts) {
@@ -594,19 +527,26 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
     CodegenOptions defaults = jaiCodegenDefaults();
     if (opts == NULL) opts = &defaults;
 
-    int fileId = registerSource(path != NULL ? path : "<source>", source, length);
+    const char *label = path != NULL ? path : "<source>";
+    int fileId = registerSource(label, source, length);
+    if (module != NULL) module->sourceFileId = fileId;
 
-    /* A fragment is text compiled into a module that already exists: either one
-     * that finished loading, or the very module whose body is on the frame
-     * stack right now (`__prim__.exec` from `__main__`). A fresh module handed
-     * over by the CLI is neither, and keeps strict name resolution. */
     bool fragment = module != NULL &&
-                    (module->state == MOD_LOADED ||
-                     (vm.frameCount > 0 &&
-                      vm.frames[vm.frameCount - 1].module == module));
+                    (module->state == MOD_LOADED || vm.frameCount > 0);
 
-    ObjFunction *body = NULL;
-    if (!frontEnd(module, fileId, opts, true, &body, fragment)) return NULL;
+    JaiReplCompileOptions o;
+    o.path = label;
+    o.fileId = fileId;
+    o.optLevel = opts->optLevel;
+    o.echo = NULL;
+    o.wholeFile = true;
+    o.record = false;
+    o.sourceDir = NULL;
+    o.strict = false;
+    o.lateGlobals = fragment;
+
+    ObjFunction *body = jaiFrontEndReplCompile(source, length, &o, module, NULL);
+    (void)jaiDiagFlush(&gDiags, stderr);
     return body;
 }
 
@@ -755,9 +695,11 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
             body->name = module->name;
             body->qualifiedName = module->name;
         }
-    } else if (!frontEnd(module, fileId, &opts->codegen, true, &body, false) ||
-               body == NULL) {
-        return NULL;
+    } else {
+        /* One front end remains and the branch above is the one that runs it.
+         * Reaching here would mean `selfHosting()` said no outside the
+         * bootstrap window, which nothing does. */
+        JAI_PANIC("no front end for `%s`", path);
     }
 
     if (opts->writeCache) {
@@ -1466,50 +1408,6 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
 
 /* ------------------------------------------------------------------ */
 /* Static import graph                                                  */
-/* ------------------------------------------------------------------ */
-
-/* `check` compiles one file and runs nothing, so the MOD_LOADING marker that
- * makes a cycle visible to the importer is never set and E0801 would only ever
- * appear once the program was run. Spec §8 wants the cycle reported by the
- * front end too, so the graph is walked here instead.
- *
- * Only the import statements of each reachable file are wanted, but they come
- * from a real parse: hand-scanning the token stream would be a second, quietly
- * divergent grammar for the one construct that decides whether the program can
- * load at all. The edges are cached per file for the life of the process while
- * the depth-first colouring is not, so `check a.jai b.jai` parses each module
- * once and still reports the cycle against both files.
- *
- * Imports nested inside a block are skipped: they run when the enclosing
- * function is called, not while the module body loads, which is exactly the
- * workaround the help line offers. */
-
-typedef struct {
-    char   *name;     /* dotted path as written, for the rendered chain */
-    char   *path;     /* resolved absolute path, or NULL when unresolvable */
-    JaiSpan span;
-} ImportEdge;
-
-enum { IG_WHITE = 0, IG_GREY, IG_BLACK };
-
-typedef struct {
-    char       *path;       /* absolute; the identity of the node */
-    char       *name;       /* file stem, for the rendered chain */
-    ImportEdge *edges;
-    int         edgeCount;
-    int         edgeCap;    /* what the array was allocated with */
-    int         walk;       /* the walk `colour` was set by */
-    uint8_t     colour;
-} ImportGraphNode;
-
-typedef JAI_VEC(ImportEdge) ImportEdgeVec;
-
-static JAI_VEC(ImportGraphNode) sImportGraph;
-static JAI_VEC(int)             sWalkStack;   /* node indices, outermost first */
-static int                      sWalkId;
-
-/* The name a file is known by inside an import chain: its basename without the
- * extension, which is the last component of the dotted path that names it. */
 static void fileStem(char *out, size_t outSize, const char *path) {
     jaiPathBasename(out, outSize, path);
     size_t len = strlen(out);
@@ -1519,209 +1417,51 @@ static void fileStem(char *out, size_t outSize, const char *path) {
     }
 }
 
-/* The module name a *path* carries, which is `fileStem` plus the fallback an
- * import chain does not want: a path with nothing left after the extension is
+/* The module name a *path* carries: `fileStem` plus the fallback an import
+ * chain does not want -- a path with nothing left after the extension is
  * stripped names the main module, not the empty module.
  *
  * Shared rather than static because the CLI and the self-hosted bridge need the
- * same answer and had been spelling it out separately. A third copy lives in
- * `module_name_for` (lib/jaithon/compile/mod.jai) and must agree with this one:
- * the name is a constant in the record's pool, and a cached module whose name
- * has lost its package cannot resolve its own imports. */
+ * same answer. A second copy lives in `module_name_for`
+ * (lib/jaithon/compile/mod.jai) and must agree with this one: the name is a
+ * constant in the record's pool, and a cached module whose name has lost its
+ * package cannot resolve its own imports. */
 void jaiModuleNameFor(const char *path, char *out, size_t outSize) {
     fileStem(out, outSize, path);
     if (out[0] == '\0') snprintf(out, outSize, "__main__");
 }
 
-static void freeOwned(char *s) {
-    if (s != NULL) (void)jaiRealloc(s, strlen(s) + 1, 0);
-}
+/* ------------------------------------------------------------------ */
+/* Import cycles                                                        */
+/* ------------------------------------------------------------------ */
 
-static int graphFind(const char *path) {
-    for (int i = 0; i < sImportGraph.count; i++) {
-        if (strcmp(sImportGraph.data[i].path, path) == 0) return i;
-    }
-    return -1;
-}
-
-static void collectImports(ImportEdgeVec *out, AstNode **stmts, int count,
-                           const char *fromDir) {
-    for (int i = 0; i < count; i++) {
-        AstNode *n = stmts[i];
-        if (n == NULL) continue;
-        const char *dotted = NULL;
-        if (n->kind == AST_IMPORT)           dotted = n->as.import.path;
-        else if (n->kind == AST_FROM_IMPORT) dotted = n->as.fromImport.path;
-        if (dotted == NULL) continue;
-
-        ImportEdge edge;
-        edge.name = jaiStrdup(displayName(dotted));
-        edge.span = n->span;
-        char resolved[JAI_MAX_PATH];
-        edge.path = jaiResolveModulePath(dotted, fromDir, resolved, sizeof resolved)
-                        ? jaiStrdup(resolved)
-                        : NULL;
-        JAI_VEC_PUSH(ImportEdge, out, edge);
-    }
-}
-
-/* Parse `path` for its top-level imports and add the node. `fileId` is the
- * already-registered source when the caller has one, -1 to read the file.
- * Returns the node index, or -1 when the file cannot be read.
+/* A module in a cycle compiles perfectly well on its own; it is the graph the
+ * files form together that is wrong, so this is a whole-program question and
+ * separate from compiling any one file. `check` asks it before the front end,
+ * because every name a module in the cycle should have exported is missing and
+ * the E0200 storm that follows is a consequence rather than a second problem.
  *
- * Whatever the parse and the path search have to say belongs to the scanned
- * file's own compilation, not to the one being checked — a syntax error two
- * modules away must not be printed here, and a module that cannot be found is
- * the importer's E0800 at import time. The bag is swapped for a scratch one so
- * those findings can be dropped wholesale. */
-static int graphAdd(const char *path, int fileId) {
-    if (fileId < 0) {
-        size_t length = 0;
-        char *text = jaiReadFile(path, &length);
-        if (text == NULL) return -1;
-        fileId = jaiSourceAdd(path, text, length);   /* takes ownership */
-    }
-    JaiSourceFile *file = jaiSourceGet(fileId);
-    if (file == NULL || file->source == NULL) return -1;
-
-    char stem[JAI_MAX_PATH];
-    fileStem(stem, sizeof stem, path);
-    char dir[JAI_MAX_PATH];
-    jaiPathDirname(dir, sizeof dir, path);
-
-    ImportEdgeVec edges;
-    JAI_VEC_INIT(&edges);
-
-    JaiDiagBag live = gDiags;
-    jaiDiagInit(&gDiags);
-
-    AstContext ast;
-    jaiAstContextInit(&ast);
-    Lexer lex;
-    AstNode *program = jaiParseSource(&ast, &lex, file->source, file->length,
-                                      fileId);
-    jaiLexerFree(&lex);
-    /* A file that does not parse has no reliable import list; it will report
-     * its own E01xx when something actually compiles it. */
-    if (program != NULL && program->kind == AST_PROGRAM) {
-        collectImports(&edges, program->as.block.stmts, program->as.block.count,
-                       dir);
-    }
-    jaiAstContextFree(&ast);
-
-    jaiDiagFree(&gDiags);
-    gDiags = live;
-
-    ImportGraphNode node;
-    memset(&node, 0, sizeof node);
-    node.path = jaiStrdup(path);
-    node.name = jaiStrdup(stem[0] != '\0' ? stem : path);
-    node.edges = edges.data;
-    node.edgeCount = edges.count;
-    node.edgeCap = edges.capacity;
-    JAI_VEC_PUSH(ImportGraphNode, &sImportGraph, node);
-    return sImportGraph.count - 1;
-}
-
-/* "a -> b -> a", starting at the first appearance of the module that is being
- * imported again, so the cycle itself is what the user reads. */
-static void reportCheckCycle(int target, const ImportEdge *closing) {
-    int start = 0;
-    for (int i = 0; i < sWalkStack.count; i++) {
-        if (sWalkStack.data[i] == target) { start = i; break; }
-    }
-
-    JaiBuf chain;
-    jaiBufInit(&chain);
-    for (int i = start; i < sWalkStack.count; i++) {
-        jaiBufAppendStr(&chain, sImportGraph.data[sWalkStack.data[i]].name);
-        jaiBufAppendStr(&chain, " -> ");
-    }
-    jaiBufAppendStr(&chain, sImportGraph.data[target].name);
-    jaiBufPush(&chain, '\0');
-
-    JaiDiag *d = jaiDiagError(E0801_CIRCULAR_IMPORT, closing->span,
-                              "circular import: %s", (const char *)chain.data);
-    jaiDiagAddLabel(d, closing->span, "this import closes the cycle");
-
-    /* The edge that entered the cycle, so both ends of it are on screen. */
-    if (start + 1 < sWalkStack.count) {
-        const ImportGraphNode *first = &sImportGraph.data[sWalkStack.data[start]];
-        for (int i = 0; i < first->edgeCount; i++) {
-            if (first->edges[i].path != NULL &&
-                strcmp(first->edges[i].path,
-                       sImportGraph.data[sWalkStack.data[start + 1]].path) == 0) {
-                jaiDiagAddLabel(d, first->edges[i].span, "the cycle starts here");
-                break;
-            }
-        }
-    }
-    jaiDiagAddHelp(d, "move the shared declarations into a module every step of "
-                      "the cycle can import, or move the import inside the "
-                      "function that needs it");
-    jaiBufFree(&chain);
-}
-
-/* Returns false once a cycle has been reported: one E0801 says everything the
- * rest of the walk would repeat. */
-static bool graphVisit(int index) {
-    ImportGraphNode *node = &sImportGraph.data[index];
-    if (node->walk == sWalkId && node->colour == IG_BLACK) return true;
-    node->walk = sWalkId;
-    node->colour = IG_GREY;
-    JAI_VEC_PUSH(int, &sWalkStack, index);
-
-    /* The edge array is its own allocation, so it survives the reallocation of
-     * sImportGraph that graphAdd below can trigger; the node struct does not. */
-    ImportEdge *edges = node->edges;
-    int edgeCount = node->edgeCount;
-
-    bool ok = true;
-    for (int i = 0; ok && i < edgeCount; i++) {
-        if (edges[i].path == NULL) continue;   /* E0800 is the importer's to report */
-        int next = graphFind(edges[i].path);
-        if (next < 0) next = graphAdd(edges[i].path, -1);
-        if (next < 0) continue;
-
-        if (sImportGraph.data[next].walk == sWalkId &&
-            sImportGraph.data[next].colour == IG_GREY) {
-            reportCheckCycle(next, &edges[i]);
-            ok = false;
-            break;
-        }
-        ok = graphVisit(next);
-    }
-
-    sWalkStack.count--;
-    sImportGraph.data[index].colour = IG_BLACK;
-    return ok;
-}
-
-/* Reports E0801 into gDiags when the imports reachable from `path` close a
- * cycle. `fileId` is the entry file's already-registered source. */
+ * The C walked the graph itself, over trees the C parser built. The front end
+ * answers the same question -- `import_cycles` in lib/jaithon/compile/mod.jai --
+ * so the walk went with the parser that fed it. */
 static void checkImportCycles(const char *path, int fileId) {
-    int root = graphFind(path);
-    if (root < 0) root = graphAdd(path, fileId);
-    if (root < 0) return;
+    (void)fileId;
+    Value arg = OBJ_VAL(jaiStringInternC(path));
+    jaiPushRoot(arg);
+    Value produced = NULL_VAL;
+    bool asked = jaiFrontEndInvoke(JAI_SELF_HOSTED_MODULE, "import_cycles", 1,
+                                   &arg, &produced);
+    jaiPopRoot();
+    if (!asked) return;
 
-    sWalkId++;
-    (void)graphVisit(root);
+    jaiPushRoot(produced);
+    (void)jaiFrontEndTransferDiagnostics(produced);
+    jaiPopRoot();
 }
 
+/* Nothing to release: the graph the C built is gone and the front end owns
+ * whatever it allocates. Kept because the CLI calls it. */
 void jaiImportGraphFree(void) {
-    for (int i = 0; i < sImportGraph.count; i++) {
-        ImportGraphNode *n = &sImportGraph.data[i];
-        for (int j = 0; j < n->edgeCount; j++) {
-            freeOwned(n->edges[j].name);
-            freeOwned(n->edges[j].path);
-        }
-        JAI_FREE_ARRAY(ImportEdge, n->edges, n->edgeCap);
-        freeOwned(n->path);
-        freeOwned(n->name);
-    }
-    JAI_VEC_FREE(ImportGraphNode, &sImportGraph);
-    JAI_VEC_FREE(int, &sWalkStack);
-    sWalkId = 0;
 }
 
 int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
@@ -1777,33 +1517,20 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     jaiPushRoot(OBJ_VAL(module));
 
     bool ok;
-    if (sOptions.selfHosted) {
-        /* `--front=jai check` runs the self-hosted front end over the entry
-         * file and reports what it says, which is the only way to compare the
-         * two checkers on a file rather than on a chunk of bytecode. It is a
-         * weaker `check` than the C one until the self-hosted side has a
-         * checker of its own: what it verifies today is that the file lexes,
-         * parses, resolves and emits. That is stated rather than hidden,
-         * because a `check` that passes without checking is worse than one
-         * that refuses. */
-        const JaiSourceFile *entryFile = jaiSourceGet(fileId);
-        ObjFunction *body = entryFile == NULL
-                              ? NULL
-                              : jaiSelfHostedCompileInto(entryFile->source,
-                                                         entryFile->length,
-                                                         absolute, module,
-                                                         jaiSourceHash(entryFile->source,
-                                                                       entryFile->length),
-                                                         sOptions.codegen.optLevel);
-        ok = body != NULL && !jaiDiagHasErrors(&gDiags);
-        (void)jaiDiagFlush(&gDiags, stderr);
-    } else {
-        /* Emit as well: `check` promises "compile and type-check" (spec §8.5),
-         * and codegen is where the bytecode verifier runs. Checking without it
-         * would pass files that cannot actually be loaded. The body is
-         * discarded. */
-        ok = frontEnd(module, fileId, &sOptions.codegen, true, NULL, false);
-    }
+    /* `check` promises "compile and type-check" (spec 8.5), and codegen is
+     * where the bytecode verifier runs, so it emits too and drops the body.
+     * One front end, one branch. */
+    const JaiSourceFile *entryFile = jaiSourceGet(fileId);
+    ObjFunction *checked = entryFile == NULL
+                             ? NULL
+                             : jaiSelfHostedCompileInto(
+                                   entryFile->source, entryFile->length,
+                                   absolute, module,
+                                   jaiSourceHash(entryFile->source,
+                                                 entryFile->length),
+                                   sOptions.codegen.optLevel);
+    ok = checked != NULL && !jaiDiagHasErrors(&gDiags);
+    (void)jaiDiagFlush(&gDiags, stderr);
     jaiPopRoots(3);
 
     if (sOptions.verbose && ok) {
