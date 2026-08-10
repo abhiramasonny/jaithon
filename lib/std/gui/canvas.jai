@@ -139,6 +139,7 @@ pub class Canvas {
     var clip_top: int
     var clip_right: int
     var clip_bottom: int
+    var clip_stack: list[tuple[int, int, int, int]]
 
     #: Wrap `target` so it can be drawn into.
     #:
@@ -152,6 +153,7 @@ pub class Canvas {
         self.clip_top = 0
         self.clip_right = self.width - 1
         self.clip_bottom = self.height - 1
+        self.clip_stack = []
     }
 
     #: Restrict every later drawing call to this rectangle.
@@ -188,9 +190,10 @@ pub class Canvas {
     #: A straight store, not a composite: clearing with a translucent colour
     #: replaces what was there rather than tinting it.
     pub fn clear(self, color: int) -> void {
+        let count = self.clip_right - self.clip_left + 1
+        if count <= 0 { return }
         for row in self.clip_top..=self.clip_bottom {
-            let base = row * self.width
-            for column in self.clip_left..=self.clip_right { self.buffer[base + column] = color }
+            __prim__.canvas_fill_span(self.buffer, row * self.width + self.clip_left, count, color)
         }
     }
 
@@ -796,6 +799,641 @@ pub class Canvas {
         }
     }
 
+    #: Narrow the clip to the intersection of the current one and this
+    #: rectangle, remembering what it was.
+    #:
+    #: Unlike `set_clip`, which intersects with the whole canvas and can
+    #: therefore widen a clip already in force, this can only ever restrict.
+    #: Nesting is what a chart needs: an axis clips to its plot area, a series
+    #: clips again inside that, and neither has to know about the other.
+    #:
+    #: ```
+    #: let canvas = Canvas(Image(20, 20))
+    #: canvas.push_clip(0, 0, 10, 10)
+    #: canvas.push_clip(5, 5, 100, 100)
+    #: canvas.clip()          # (5, 5, 5, 5)
+    #: canvas.pop_clip()
+    #: canvas.clip()          # (0, 0, 10, 10)
+    #: ```
+    pub fn push_clip(self, x: int, y: int, width: int, height: int) -> void {
+        self.clip_stack.push((self.clip_left, self.clip_top, self.clip_right, self.clip_bottom))
+        self.clip_left = max(self.clip_left, x)
+        self.clip_top = max(self.clip_top, y)
+        self.clip_right = min(self.clip_right, x + width - 1)
+        self.clip_bottom = min(self.clip_bottom, y + height - 1)
+    }
+
+    #: Restore the clip rectangle in force before the matching `push_clip`.
+    #:
+    #: Raises `IndexError` when nothing was pushed, since an unbalanced pop is a
+    #: bug in the caller rather than something to paper over.
+    pub fn pop_clip(self) -> void {
+        if self.clip_stack.len() == 0 {
+            throw IndexError("pop_clip with no matching push_clip")
+        }
+        let (left, top, right, bottom) = self.clip_stack.pop()
+        self.clip_left = left
+        self.clip_top = top
+        self.clip_right = right
+        self.clip_bottom = bottom
+    }
+
+    #: Fill `path` with `color`, anti-aliased.
+    #:
+    #: Coverage is computed exactly across each row and sampled `SUBSAMPLES`
+    #: times down it, then one native call composites the whole row. Because the
+    #: whole path is resolved into a single coverage value per pixel before
+    #: anything is written, a shape that overlaps itself still writes each pixel
+    #: once — which is what lets a translucent stroke avoid the dark knots the
+    #: integer outline routines leave at their joins.
+    #:
+    #: ```
+    #: let image = Image(10, 10, 0xFF000000)
+    #: let canvas = Canvas(image)
+    #: let path = Path()
+    #: path.polygon([(1.0, 1.0), (9.0, 1.0), (9.0, 9.0), (1.0, 9.0)])
+    #: canvas.fill_path(path, rgb(255, 255, 255))
+    #: red_of(canvas.get_pixel(5, 5))      # 255
+    #: ```
+    pub fn fill_path(self, path: Path, color: int, winding: Winding = Winding.NonZero) -> void {
+        if color >> 24 & 0xFF == 0 { return }
+        # Almost everything a chart draws is an axis-aligned rectangle: every
+        # gridline, tick, spine, bar, background and legend panel. Their coverage
+        # is a product of two independent overlaps rather than something to
+        # sample, so they skip the scanline machinery entirely.
+        let box = _axis_aligned_rect(path)
+        if box != null {
+            let (left, top, right, bottom) = box
+            self._fill_axis_rect(left, top, right, bottom, color)
+            return
+        }
+        let edges = _edges_of(path)
+        if edges.len() == 0 { return }
+
+        var top = edges[0].y0
+        var bottom = edges[0].y1
+        var left = edges[0].x0
+        var right = edges[0].x0
+        for edge in edges {
+            top = min(top, edge.y0)
+            bottom = max(bottom, edge.y1)
+            left = min(left, min(edge.x0, edge.x1))
+            right = max(right, max(edge.x0, edge.x1))
+        }
+
+        let first_row = max(int(math.floor(top)), self.clip_top)
+        let last_row = min(int(math.ceil(bottom)), self.clip_bottom)
+        let first_column = max(int(math.floor(left)), self.clip_left)
+        let last_column = min(int(math.ceil(right)), self.clip_right)
+        if first_row > last_row or first_column > last_column { return }
+
+        let share = 255.0 / SUBSAMPLES.to_float()
+
+        # An active edge list. Testing every edge at every sub-scanline is
+        # quadratic in the shape's complexity, and a stroked series is thousands
+        # of edges over hundreds of rows -- millions of tests for a picture where
+        # only a handful of edges cross any given row. Sorting once by the top of
+        # each edge and carrying a window down the shape makes the work
+        # proportional to what actually crosses the scanline.
+        let ordered = edges.sorted(|edge| edge.y0)
+        var pending = 0
+        var active = []
+
+        for row in first_row..=last_row {
+            let row_bottom = (row + 1).to_float()
+            while pending < ordered.len() and ordered[pending].y0 < row_bottom {
+                active.push(ordered[pending])
+                pending += 1
+            }
+            if active.len() == 0 { continue }
+            let row_top = row.to_float()
+            active = [edge for edge in active if edge.y1 > row_top]
+            if active.len() == 0 { continue }
+
+            # Gather every sub-scanline first so the coverage buffer can be cut
+            # to the width this row actually needs. Sizing it to the whole shape
+            # instead would allocate a float per pixel of the bounding box on
+            # every row, which for a curve spanning the plot is most of the cost
+            # of the frame and nearly all of it wasted on empty space.
+            var samples = []
+            var row_left = 0.0
+            var row_right = 0.0
+            var found = false
+            for sample in 0..SUBSAMPLES {
+                let y = row_top + (sample.to_float() + 0.5) / SUBSAMPLES.to_float()
+                let hits = _crossings(active, y)
+                if hits.len() < 2 { continue }
+                let (low, _low_direction) = hits[0]
+                let (high, _high_direction) = hits[hits.len() - 1]
+                if not found {
+                    row_left = low
+                    row_right = high
+                    found = true
+                } else {
+                    row_left = min(row_left, low)
+                    row_right = max(row_right, high)
+                }
+                samples.push(hits)
+            }
+            if not found { continue }
+
+            let window_left = max(int(math.floor(row_left)), first_column)
+            let window_right = min(int(math.ceil(row_right)), last_column)
+            if window_left > window_right { continue }
+
+            # A row whose sub-scanlines each cover one interval -- a rectangle,
+            # a bar, a legend panel, a marker, the figure background -- has a
+            # solid middle with a fringe of at most one pixel on each side. The
+            # middle is written with a single native call, which is the
+            # difference between a chart that animates and one that does not.
+            var intervals = []
+            var single = true
+            for hits in samples {
+                let spans = _spans(hits, winding)
+                if spans.len() != 1 { single = false }
+                intervals.push(spans)
+            }
+
+            if single and intervals.len() == SUBSAMPLES {
+                if self._solid_row(row, intervals, window_left, window_right, color) { continue }
+            }
+
+            # A curve crosses one row in several places, so the row's extent is
+            # wide while the ink on it is a few pixels at each crossing. Working
+            # per cluster of overlapping spans keeps the per-pixel cost
+            # proportional to the ink rather than to the distance between the
+            # leftmost and rightmost crossing.
+            var flat = []
+            for spans in intervals {
+                for interval in spans { flat.push(interval) }
+            }
+            if flat.len() == 0 { continue }
+            let ordered_spans = flat.sorted(|interval| interval[0])
+
+            var clusters = []
+            let (opening, closing) = ordered_spans[0]
+            var cluster_start = opening
+            var cluster_end = closing
+            for index in 1..ordered_spans.len() {
+                let (start, end) = ordered_spans[index]
+                # Within a pixel counts as touching: two spans that close on the
+                # same pixel share its coverage and must be blended together.
+                if start <= cluster_end + 1.0 {
+                    cluster_end = max(cluster_end, end)
+                } else {
+                    clusters.push((cluster_start, cluster_end))
+                    cluster_start = start
+                    cluster_end = end
+                }
+            }
+            clusters.push((cluster_start, cluster_end))
+
+            for (start, end) in clusters {
+                let cluster_left = max(int(math.floor(start)), window_left)
+                let cluster_right = min(int(math.ceil(end)), window_right)
+                if cluster_left > cluster_right { continue }
+                let reach = cluster_right - cluster_left + 1
+                var coverage = [0.0 for _index in 0..reach]
+                var touched = false
+                for spans in intervals {
+                    for (low, high) in spans {
+                        if high < start or low > end { continue }
+                        let shifted_low = low - cluster_left.to_float()
+                        let shifted_high = high - cluster_left.to_float()
+                        if _add_span(coverage, shifted_low, shifted_high, reach, share) {
+                            touched = true
+                        }
+                    }
+                }
+                if touched { self._blend_coverage(row, cluster_left, coverage, color) }
+            }
+        }
+    }
+
+    #: Fill an axis-aligned rectangle with exact coverage on all four edges.
+    #:
+    #: Vertical coverage is how much of the row the rectangle spans and
+    #: horizontal coverage how much of the column, so a pixel's coverage is
+    #: simply their product. A run of whole rows with a whole interior needs one
+    #: native call each and no per-pixel work at all.
+    fn _fill_axis_rect(
+        self,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+        color: int
+    ) -> void {
+        let first_row = max(int(math.floor(top)), self.clip_top)
+        let last_row = min(int(math.ceil(bottom)) - 1, self.clip_bottom)
+        let first_column = max(int(math.floor(left)), self.clip_left)
+        let last_column = min(int(math.ceil(right)) - 1, self.clip_right)
+        if first_row > last_row or first_column > last_column { return }
+
+        # Horizontal coverage is the same on every row, so it is built once.
+        var columns = []
+        for column in first_column..=last_column {
+            let low = max(left, column.to_float())
+            let high = min(right, column.to_float() + 1.0)
+            columns.push(max(0.0, high - low))
+        }
+
+        let opaque = color >> 24 & 0xFF == 255
+        var solid = true
+        for share in columns {
+            if share < 0.999 { solid = false }
+        }
+
+        let base_offset = first_column
+        let count = last_column - first_column + 1
+        for row in first_row..=last_row {
+            let low = max(top, row.to_float())
+            let high = min(bottom, row.to_float() + 1.0)
+            let vertical = max(0.0, high - low)
+            if vertical <= 0.0 { continue }
+            let offset = row * self.width + base_offset
+            if solid and vertical >= 0.999 and opaque {
+                __prim__.canvas_fill_span(self.buffer, offset, count, color)
+                continue
+            }
+            var coverage = []
+            for share in columns {
+                coverage.push(min(255, max(0, int(share * vertical * 255.0 + 0.5))))
+            }
+            __prim__.canvas_blend_span(self.buffer, offset, coverage, color)
+        }
+    }
+
+    #: Fill a float-coordinate rectangle, anti-aliased on every edge.
+    #:
+    #: The shape a chart draws most, and cheap enough to be worth reaching
+    #: directly rather than through a `Path`. A particle cloud drawn as small
+    #: boxes is thousands of these a frame.
+    #:
+    #: ```
+    #: let canvas = Canvas(Image(8, 8))
+    #: canvas.fill_rect_aa(1.5, 1.5, 3.0, 3.0, rgb(255, 255, 255))
+    #: red_of(canvas.get_pixel(3, 3))      # 255
+    #: ```
+    pub fn fill_rect_aa(self, x: float, y: float, width: float, height: float, color: int) -> void {
+        if width <= 0.0 or height <= 0.0 { return }
+        if color >> 24 & 0xFF == 0 { return }
+        self._fill_axis_rect(x, y, x + width, y + height, color)
+    }
+
+    #: Fill a small convex polygon, anti-aliased.
+    #:
+    #: A convex shape crosses any scanline exactly twice, so its span is a
+    #: minimum and a maximum rather than something to sort and pair up. Skipping
+    #: the general machinery matters because the shape this is for — a particle
+    #: drawn as an oriented wedge — is drawn thousands of times a frame, and
+    #: there the per-shape setup is the whole cost.
+    #:
+    #: The polygon must be convex; a concave one comes out filled to its hull.
+    pub fn fill_convex(self, points: list[tuple[float, float]], color: int) -> void {
+        if points.len() < 3 { return }
+        if color >> 24 & 0xFF == 0 { return }
+        var flat = []
+        for (x, y) in points {
+            flat.push(x)
+            flat.push(y)
+        }
+        __prim__.canvas_fill_convex(
+            self.buffer,
+            self.width,
+            self.height,
+            flat,
+            color,
+            self.clip_left,
+            self.clip_top,
+            self.clip_right,
+            self.clip_bottom
+        )
+    }
+
+    #: Blit a pixel buffer into a rectangle, scaling by nearest neighbour.
+    #:
+    #: Nearest neighbour rather than a smooth filter because the usual source is
+    #: data — an occupancy grid, a heatmap — and interpolating would invent
+    #: values that were never measured.
+    #:
+    #: Raises `ValueError` when the buffer is smaller than the size it claims.
+    pub fn blit_pixels(
+        self,
+        pixels: list[int],
+        source_width: int,
+        source_height: int,
+        x: int,
+        y: int,
+        width: int,
+        height: int
+    ) -> void {
+        if source_width <= 0 or source_height <= 0 { return }
+        if pixels.len() < source_width * source_height {
+            throw ValueError(
+                f"a {source_width}x{source_height} buffer needs " +
+                    f"{source_width * source_height} pixels, got {pixels.len()}"
+            )
+        }
+        if width <= 0 or height <= 0 { return }
+
+        # Straight to the native blitter: building a row of pixels as a Jaithon
+        # list and handing that over costs a push per pixel, which for a full
+        # window is most of a frame spent copying an image that has not changed.
+        __prim__.canvas_blit_scaled(
+            self.buffer,
+            self.width,
+            pixels,
+            source_width,
+            source_height,
+            0,
+            0,
+            source_width,
+            source_height,
+            x,
+            y,
+            width,
+            height
+        )
+    }
+
+    #: Stroke `path` with `color`, anti-aliased.
+    #:
+    #: The outline is built as a single filled path — a quad per segment, a join
+    #: at every interior vertex, a cap at each end — and filled once with
+    #: non-zero winding. Overlaps between those pieces therefore cancel instead
+    #: of compositing twice, so a translucent stroke is evenly translucent all
+    #: the way along.
+    pub fn stroke_path(
+        self,
+        path: Path,
+        color: int,
+        width: float = 1.0,
+        cap: Cap = Cap.Butt,
+        join: Join = Join.Miter,
+        dash: list[float] = []
+    ) -> void {
+        if width <= 0.0 or color >> 24 & 0xFF == 0 { return }
+
+        # An opaque stroke can be laid down one segment at a time, because
+        # writing an opaque pixel twice is the same as writing it once. Each
+        # segment is then a convex quad and goes straight to the native filler,
+        # instead of the whole run becoming one large non-convex ring whose
+        # every scanline meets most of the path.
+        #
+        # A translucent one cannot: the overlaps at the joins would composite
+        # twice and show as dark knots, which is the bug the single-ring form
+        # exists to avoid.
+        if color >> 24 & 0xFF == 255 and dash.len() == 0 {
+            self._stroke_segments(path, color, width, cap, join)
+            return
+        }
+
+        let outline = Path()
+        for run in path.subpaths() {
+            for piece in _dashed(run, dash) {
+                _outline_run(outline, piece, width, cap, join)
+            }
+        }
+        self.fill_path(outline, color, Winding.NonZero)
+    }
+
+    #: Stroke each segment as its own quad, with a disc at every corner.
+    fn _stroke_segments(self, path: Path, color: int, width: float, cap: Cap, join: Join) -> void {
+        let half = width * 0.5
+        for run in path.subpaths() {
+            let count = run.len() // 2
+            if count < 2 { continue }
+            for segment in 0..count - 1 {
+                let x0 = run[segment * 2]
+                let y0 = run[segment * 2 + 1]
+                let x1 = run[(segment + 1) * 2]
+                let y1 = run[(segment + 1) * 2 + 1]
+                let length = math.hypot(x1 - x0, y1 - y0)
+                if length <= 0.0 { continue }
+                let nx = -(y1 - y0) / length * half
+                let ny = (x1 - x0) / length * half
+                var ax = x0
+                var ay = y0
+                var bx = x1
+                var by = y1
+                if cap == Cap.Square {
+                    let ex = (x1 - x0) / length * half
+                    let ey = (y1 - y0) / length * half
+                    if segment == 0 {
+                        ax -= ex
+                        ay -= ey
+                    }
+                    if segment == count - 2 {
+                        bx += ex
+                        by += ey
+                    }
+                }
+                let quad = [
+                    (ax + nx, ay + ny),
+                    (bx + nx, by + ny),
+                    (bx - nx, by - ny),
+                    (ax - nx, ay - ny),
+                ]
+                self.fill_convex(quad, color)
+            }
+            if join != Join.Bevel and count > 2 {
+                for vertex in 1..count - 1 {
+                    if _turns_visibly(run, vertex, half) {
+                        self._fill_disc(run[vertex * 2], run[vertex * 2 + 1], half, color)
+                    }
+                }
+            }
+            if cap == Cap.Round {
+                self._fill_disc(run[0], run[1], half, color)
+                self._fill_disc(run[(count - 1) * 2], run[(count - 1) * 2 + 1], half, color)
+            }
+        }
+    }
+
+    #: A filled disc, as a polygon fine enough for its size.
+    fn _fill_disc(self, x: float, y: float, radius: float, color: int) -> void {
+        if radius <= 0.0 { return }
+        let steps = max(6, min(24, int(radius * 4.0)))
+        var points = []
+        for index in 0..steps {
+            let angle = math.TAU * index.to_float() / steps.to_float()
+            points.push((x + radius * math.cos(angle), y + radius * math.sin(angle)))
+        }
+        self.fill_convex(points, color)
+    }
+
+    #: Draw `content` turned by `quarter_turns` anticlockwise about `(x, y)`.
+    #:
+    #: The glyph bitmaps are transposed rather than rotated, so only whole
+    #: quarter turns exist. One turn is what a conventional y-axis label wants.
+    #:
+    #: ```
+    #: let canvas = Canvas(Image(40, 40))
+    #: canvas.text_rotated(20, 30, "hi", rgb(255, 255, 255), 1)
+    #: canvas.text_width("hi")      # 11
+    #: ```
+    pub fn text_rotated(
+        self,
+        x: int,
+        y: int,
+        content: str,
+        color: int,
+        quarter_turns: int,
+        scale: int = 1
+    ) -> void {
+        let turns = (quarter_turns % 4 + 4) % 4
+        if turns == 0 {
+            self.text(x, y, content, color, scale)
+            return
+        }
+        var pen = 0
+        for character in content.chars() {
+            self._glyph_turned(x, y, pen, _glyph_index(character), color, scale, turns)
+            pen += (GLYPH_WIDTH + GLYPH_SPACING) * scale
+        }
+    }
+
+    #: One glyph, transposed into the turned frame.
+    fn _glyph_turned(
+        self,
+        origin_x: int,
+        origin_y: int,
+        advance: int,
+        index: int,
+        color: int,
+        scale: int,
+        turns: int
+    ) -> void {
+        let base = index * GLYPH_WIDTH
+        for column in 0..GLYPH_WIDTH {
+            let bits = _GLYPHS[base + column]
+            for row in 0..GLYPH_HEIGHT {
+                if bits >> row & 1 == 0 { continue }
+                let local_x = advance + column * scale
+                let local_y = row * scale
+                # Anticlockwise on screen, where y grows downward: one turn
+                # sends +x upward and +y rightward.
+                let (dx, dy) = match turns {
+                    1 => (local_y, -local_x),
+                    2 => (-local_x, -local_y),
+                    _ => (-local_y, local_x),
+                }
+                self._fill_cell(origin_x + dx, origin_y + dy, scale, color)
+            }
+        }
+    }
+
+    fn _fill_cell(self, x: int, y: int, scale: int, color: int) -> void {
+        if scale <= 1 {
+            self.put_pixel(x, y, color)
+            return
+        }
+        for row in 0..scale { self._span(x, x + scale - 1, y + row, color) }
+    }
+
+    #: Write a row whose interior every sub-scanline covers, or report that it
+    #: has none worth the special case.
+    #:
+    #: The fringe pixels either side still need real coverage, so they go
+    #: through the per-pixel path; only the solid middle is handed over whole.
+    fn _solid_row(
+        self,
+        row: int,
+        intervals: list[list[tuple[float, float]]],
+        window_left: int,
+        window_right: int,
+        color: int
+    ) -> bool {
+        let (first_start, first_end) = intervals[0][0]
+        var widest_start = first_start
+        var narrow_end = first_end
+        var narrow_start = first_start
+        var widest_end = first_end
+        for spans in intervals {
+            let (start, end) = spans[0]
+            widest_start = max(widest_start, start)
+            narrow_start = min(narrow_start, start)
+            narrow_end = min(narrow_end, end)
+            widest_end = max(widest_end, end)
+        }
+
+        let solid_from = max(int(math.ceil(widest_start)), window_left)
+        let solid_to = min(int(math.floor(narrow_end)) - 1, window_right)
+        # Below a handful of pixels the bookkeeping costs more than the loop it
+        # replaces, so a narrow run is left to the general path.
+        if solid_to - solid_from < 4 { return false }
+
+        let alpha = color >> 24 & 0xFF
+        if alpha == 255 {
+            __prim__.canvas_fill_span(
+                self.buffer,
+                row * self.width + solid_from,
+                solid_to - solid_from + 1,
+                color
+            )
+        } else {
+            let full = [255 for _index in solid_from..=solid_to]
+            __prim__.canvas_blend_span(self.buffer, row * self.width + solid_from, full, color)
+        }
+
+        self._fringe(
+            row,
+            max(int(math.floor(narrow_start)), window_left),
+            solid_from - 1,
+            intervals,
+            color
+        )
+        self._fringe(
+            row,
+            solid_to + 1,
+            min(int(math.ceil(widest_end)), window_right),
+            intervals,
+            color
+        )
+        return true
+    }
+
+    #: Composite the partially covered pixels at one end of a solid run.
+    fn _fringe(
+        self,
+        row: int,
+        from_column: int,
+        to_column: int,
+        intervals: list[list[tuple[float, float]]],
+        color: int
+    ) -> void {
+        if from_column > to_column { return }
+        let share = 255.0 / SUBSAMPLES.to_float()
+        var coverage = []
+        for column in from_column..=to_column {
+            var total = 0.0
+            for spans in intervals {
+                let (start, end) = spans[0]
+                let low = max(start, column.to_float())
+                let high = min(end, column.to_float() + 1.0)
+                if high > low { total += share * (high - low) }
+            }
+            coverage.push(min(255, max(0, int(total + 0.5))))
+        }
+        __prim__.canvas_blend_span(self.buffer, row * self.width + from_column, coverage, color)
+    }
+
+    #: Composite one row of coverage, trimming the fully transparent ends.
+    fn _blend_coverage(self, row: int, first: int, coverage: list[float], color: int) -> void {
+        var start = 0
+        while start < coverage.len() and coverage[start] < 0.5 { start += 1 }
+        if start >= coverage.len() { return }
+        var stop = coverage.len() - 1
+        while stop > start and coverage[stop] < 0.5 { stop -= 1 }
+
+        var bytes = []
+        for index in start..=stop {
+            bytes.push(min(255, max(0, int(coverage[index] + 0.5))))
+        }
+        __prim__.canvas_blend_span(self.buffer, row * self.width + first + start, bytes, color)
+    }
+
     fn _span(self, left: int, right: int, y: int, color: int) -> void {
         if y < self.clip_top or y > self.clip_bottom { return }
         let alpha = color >> 24 & 0xFF
@@ -804,13 +1442,15 @@ pub class Canvas {
         let stop = min(right, self.clip_right)
         if start > stop { return }
         let base = y * self.width
+        # Every filled primitive funnels through here, so this run is the one
+        # place worth handing to the native layer: a whole row of pixels per
+        # call instead of one interpreted store each.
         if alpha == 255 {
-            for column in start..=stop { self.buffer[base + column] = color }
+            __prim__.canvas_fill_span(self.buffer, base + start, stop - start + 1, color)
             return
         }
-        for column in start..=stop {
-            self.buffer[base + column] = blend(self.buffer[base + column], color)
-        }
+        let coverage = [255 for _column in start..=stop]
+        __prim__.canvas_blend_span(self.buffer, base + start, coverage, color)
     }
 
     # The eight reflections of one midpoint step, each written once so that a
@@ -973,4 +1613,579 @@ fn _glyph_index(character: str) -> int {
     let code = ord(character)
     if code < 32 or code > 126 { return ord("?") - 32 }
     return code - 32
+}
+
+#: How a filled path decides which side of an edge is inside.
+#:
+#: `NonZero` counts edge directions and fills wherever they do not cancel, so a
+#: self-crossing outline is solid. `EvenOdd` fills where a ray crosses an odd
+#: number of edges, which leaves a hole wherever the shape overlaps itself.
+pub enum Winding { NonZero, EvenOdd }
+
+#: How a stroke finishes at an open end.
+pub enum Cap { Butt, Round, Square }
+
+#: How two segments of a stroke meet.
+pub enum Join { Miter, Round, Bevel }
+
+#: Sub-scanlines sampled per output row when filling a path.
+#:
+#: Horizontal coverage is computed exactly, so only the vertical direction is
+#: sampled. Four rows put the remaining error below what the eye resolves on a
+#: chart while keeping the inner loop short.
+pub const SUBSAMPLES = 4
+
+#: Segments a curve is flattened into.
+pub const CURVE_STEPS = 16
+
+#: A sequence of straight and curved segments in float coordinates.
+#:
+#: Paths exist so a shape can be described once and then filled or stroked with
+#: anti-aliasing, which the integer primitives above cannot do. A path may hold
+#: several subpaths; `move_to` begins each one.
+#:
+#: ```
+#: let path = Path()
+#: path.move_to(0.0, 0.0)
+#: path.line_to(10.0, 0.0)
+#: path.line_to(10.0, 10.0)
+#: path.close()
+#: path.subpaths().len()      # 1
+#: ```
+pub class Path {
+    var runs: list[list[float]]
+    var current: list[float]
+
+    #: Create an empty path.
+    pub fn init(self) {
+        self.runs = []
+        self.current = []
+    }
+
+    #: Begin a new subpath at `(x, y)`.
+    pub fn move_to(self, x: float, y: float) -> Path {
+        self._flush()
+        self.current = [x, y]
+        return self
+    }
+
+    #: Extend the current subpath with a straight segment.
+    #:
+    #: Raises `ValueError` when no subpath has been started, since there is no
+    #: point to draw from.
+    pub fn line_to(self, x: float, y: float) -> Path {
+        if self.current.len() == 0 {
+            throw ValueError("line_to before move_to: the path has no current point")
+        }
+        self.current.push(x)
+        self.current.push(y)
+        return self
+    }
+
+    #: Extend the current subpath with a cubic Bezier, flattened as it is added.
+    pub fn cubic_to(
+        self,
+        cx0: float,
+        cy0: float,
+        cx1: float,
+        cy1: float,
+        x: float,
+        y: float
+    ) -> Path {
+        if self.current.len() == 0 {
+            throw ValueError("cubic_to before move_to: the path has no current point")
+        }
+        let x0 = self.current[self.current.len() - 2]
+        let y0 = self.current[self.current.len() - 1]
+        for step in 1..=CURVE_STEPS {
+            let t = step.to_float() / CURVE_STEPS.to_float()
+            let u = 1.0 - t
+            let a = u * u * u
+            let b = 3.0 * u * u * t
+            let c = 3.0 * u * t * t
+            let d = t * t * t
+            self.current.push(a * x0 + b * cx0 + c * cx1 + d * x)
+            self.current.push(a * y0 + b * cy0 + c * cy1 + d * y)
+        }
+        return self
+    }
+
+    #: Close the current subpath, joining its end back to its start.
+    pub fn close(self) -> Path {
+        if self.current.len() >= 4 {
+            self.current.push(self.current[0])
+            self.current.push(self.current[1])
+        }
+        self._flush()
+        return self
+    }
+
+    #: Add a whole subpath from a list of points, closing it.
+    pub fn polygon(self, points: list[tuple[float, float]]) -> Path {
+        if points.len() == 0 { return self }
+        let (first_x, first_y) = points[0]
+        let _started = self.move_to(first_x, first_y)
+        for index in 1..points.len() {
+            let (x, y) = points[index]
+            let _extended = self.line_to(x, y)
+        }
+        return self.close()
+    }
+
+    #: The subpaths, each a flat list of alternating x and y coordinates.
+    pub fn subpaths(self) -> list[list[float]] {
+        var out = [run for run in self.runs]
+        if self.current.len() >= 4 { out.push(self.current) }
+        return out
+    }
+
+    #: Report whether the path holds nothing drawable.
+    pub fn is_empty(self) -> bool {
+        return self.subpaths().len() == 0
+    }
+
+    fn _flush(self) -> void {
+        if self.current.len() >= 4 { self.runs.push(self.current) }
+        self.current = []
+    }
+
+    fn __str__(self) -> str {
+        return f"Path({self.subpaths().len()} subpaths)"
+    }
+}
+
+#: One edge of a flattened path, kept in the order the path walked it.
+class _Edge {
+    pub let x0: float
+    pub let y0: float
+    pub let x1: float
+    pub let y1: float
+    pub let direction: int
+
+    pub fn init(self, x0: float, y0: float, x1: float, y1: float) {
+        # Edges are stored top to bottom so a scanline test is one comparison,
+        # and the direction that was lost in the swap is kept for the winding
+        # count.
+        if y0 <= y1 {
+            self.x0 = x0
+            self.y0 = y0
+            self.x1 = x1
+            self.y1 = y1
+            self.direction = 1
+        } else {
+            self.x0 = x1
+            self.y0 = y1
+            self.x1 = x0
+            self.y1 = y0
+            self.direction = -1
+        }
+    }
+
+    #: Where this edge crosses the horizontal line at `y`.
+    pub fn crossing(self, y: float) -> float {
+        let span = self.y1 - self.y0
+        if span == 0.0 { return self.x0 }
+        return self.x0 + (y - self.y0) * (self.x1 - self.x0) / span
+    }
+}
+
+#: The rectangle a path describes, when it is exactly one axis-aligned box.
+#:
+#: Returned as `(left, top, right, bottom)` in device order, or null when the
+#: path is anything else.
+fn _axis_aligned_rect(path: Path) -> tuple[float, float, float, float]? {
+    let runs = path.subpaths()
+    if runs.len() != 1 { return null }
+    let run = runs[0]
+    let count = run.len() // 2
+    # Four corners, or five when `close` repeated the first.
+    if count != 4 and count != 5 { return null }
+    if count == 5 {
+        if run[0] != run[8] or run[1] != run[9] { return null }
+    }
+
+    var left = run[0]
+    var right = run[0]
+    var top = run[1]
+    var bottom = run[1]
+    for index in 0..4 {
+        left = min(left, run[index * 2])
+        right = max(right, run[index * 2])
+        top = min(top, run[index * 2 + 1])
+        bottom = max(bottom, run[index * 2 + 1])
+    }
+    # Every corner must sit on the box, and every edge must be axis aligned.
+    for index in 0..4 {
+        let x = run[index * 2]
+        let y = run[index * 2 + 1]
+        if x != left and x != right { return null }
+        if y != top and y != bottom { return null }
+        let next = (index + 1) % 4
+        let nx = run[next * 2]
+        let ny = run[next * 2 + 1]
+        if x != nx and y != ny { return null }
+    }
+    if right <= left or bottom <= top { return null }
+    return (left, top, right, bottom)
+}
+
+#: Every edge of every subpath, implicitly closed.
+#:
+#: A fill treats an open subpath as closed, which is what makes a polygon
+#: described by its corners alone come out solid.
+fn _edges_of(path: Path) -> list[_Edge] {
+    var edges = []
+    for run in path.subpaths() {
+        let count = run.len() // 2
+        if count < 2 { continue }
+        for index in 0..count {
+            let next = (index + 1) % count
+            let x0 = run[index * 2]
+            let y0 = run[index * 2 + 1]
+            let x1 = run[next * 2]
+            let y1 = run[next * 2 + 1]
+            # A horizontal edge contributes no crossing and would only divide by
+            # zero, so it is dropped rather than special-cased downstream.
+            if y0 != y1 { edges.push(_Edge(x0, y0, x1, y1)) }
+        }
+    }
+    return edges
+}
+
+#: Where the edges cross the line at `y`, sorted left to right.
+#:
+#: Each entry is the x position paired with the edge's direction, which the
+#: winding rule needs.
+fn _crossings(edges: list[_Edge], y: float) -> list[tuple[float, int]] {
+    var hits = []
+    for edge in edges {
+        # Half-open in y: a vertex shared by two edges is counted once, so
+        # abutting shapes neither double-cover nor leave a seam.
+        if y >= edge.y0 and y < edge.y1 { hits.push((edge.crossing(y), edge.direction)) }
+    }
+    hits.sort(|entry| entry[0])
+    return hits
+}
+
+#: The intervals a sub-scanline covers, in device x.
+#:
+#: Separating this from the accumulation is what lets a row notice that its
+#: interior is solid and hand a whole run to the native span writer instead of
+#: incrementing a coverage value per pixel.
+fn _spans(hits: list[tuple[float, int]], winding: Winding) -> list[tuple[float, float]] {
+    var out = []
+    var count = 0
+    for index in 0..hits.len() - 1 {
+        let (x, direction) = hits[index]
+        count += match winding {
+            Winding.NonZero => direction,
+            Winding.EvenOdd => 1,
+        }
+        let inside = match winding {
+            Winding.NonZero => count != 0,
+            Winding.EvenOdd => count % 2 != 0,
+        }
+        if not inside { continue }
+        let (next_x, _next_direction) = hits[index + 1]
+        if next_x > x { out.push((x, next_x)) }
+    }
+    return out
+}
+
+#: Add one sub-scanline's spans into `coverage`, returning whether any landed.
+fn _accumulate(
+    coverage: list[float],
+    hits: list[tuple[float, int]],
+    winding: Winding,
+    first_column: int,
+    span: int,
+    share: float
+) -> bool {
+    var touched = false
+    var count = 0
+    for index in 0..hits.len() - 1 {
+        let (x, direction) = hits[index]
+        count += match winding {
+            Winding.NonZero => direction,
+            Winding.EvenOdd => 1,
+        }
+        let inside = match winding {
+            Winding.NonZero => count != 0,
+            Winding.EvenOdd => count % 2 != 0,
+        }
+        if not inside { continue }
+        let (next_x, _next_direction) = hits[index + 1]
+        if _add_span(
+            coverage,
+            x - first_column.to_float(),
+            next_x - first_column.to_float(),
+            span,
+            share
+        ) {
+            touched = true
+        }
+    }
+    return touched
+}
+
+#: Add `share` of coverage over `[from, to)`, exactly at the fractional ends.
+#:
+#: The partial pixels at each end are what make the edge smooth: a span ending
+#: three tenths of the way into a pixel contributes three tenths of the share to
+#: it.
+fn _add_span(coverage: list[float], start: float, end: float, span: int, share: float) -> bool {
+    let left = max(start, 0.0)
+    let right = min(end, span.to_float())
+    if right <= left { return false }
+
+    let first = int(math.floor(left))
+    let last = int(math.ceil(right)) - 1
+    if first > last { return false }
+
+    for column in first..=last {
+        if column < 0 or column >= span { continue }
+        let low = max(left, column.to_float())
+        let high = min(right, column.to_float() + 1.0)
+        if high > low { coverage[column] += share * (high - low) }
+    }
+    return true
+}
+
+#: Split one subpath into the pieces a dash pattern leaves visible.
+#:
+#: An empty pattern returns the run unchanged, which is the solid case and the
+#: common one.
+fn _dashed(run: list[float], dash: list[float]) -> list[list[float]] {
+    if dash.len() == 0 { return [run] }
+    var total = 0.0
+    for length in dash { total += length }
+    if total <= 0.0 { return [run] }
+
+    var pieces = []
+    var current = []
+    var index = 0
+    var remaining = dash[0]
+    var on = true
+
+    let count = run.len() // 2
+    for segment in 0..count - 1 {
+        let x0 = run[segment * 2]
+        let y0 = run[segment * 2 + 1]
+        let x1 = run[(segment + 1) * 2]
+        let y1 = run[(segment + 1) * 2 + 1]
+        let length = math.hypot(x1 - x0, y1 - y0)
+        if length <= 0.0 { continue }
+        let ux = (x1 - x0) / length
+        let uy = (y1 - y0) / length
+
+        var travelled = 0.0
+        while travelled < length {
+            let step = min(length - travelled, remaining)
+            if on {
+                if current.len() == 0 {
+                    current.push(x0 + ux * travelled)
+                    current.push(y0 + uy * travelled)
+                }
+                current.push(x0 + ux * (travelled + step))
+                current.push(y0 + uy * (travelled + step))
+            }
+            travelled += step
+            remaining -= step
+            # Floating point will not land exactly on zero, and a pattern that
+            # never advanced would spin here for ever.
+            if remaining <= 1e-9 {
+                if on and current.len() >= 4 { pieces.push(current) }
+                if on { current = [] }
+                on = not on
+                index = (index + 1) % dash.len()
+                remaining = dash[index]
+            }
+        }
+    }
+    if current.len() >= 4 { pieces.push(current) }
+    return pieces
+}
+
+#: Add the outline of one stroked run into `outline`.
+#:
+#: The run becomes a single closed ring: out along one offset side and back
+#: along the other. That is half the edges of a quad per segment, and one
+#: subpath instead of hundreds, which is most of the cost of stroking a sampled
+#: curve. Sharp corners still get a disc, because a mitre there would either
+#: shoot off to infinity or leave a notch.
+fn _outline_run(outline: Path, run: list[float], width: float, cap: Cap, join: Join) -> void {
+    let half = width * 0.5
+    let count = run.len() // 2
+    if count < 2 { return }
+
+    var extended = [value for value in run]
+    if cap == Cap.Square {
+        _extend_ends(extended, half)
+    }
+
+    let left = _offset_side(extended, half)
+    let right = _offset_side(_reversed_run(extended), half)
+    if left.len() < 2 or right.len() < 2 { return }
+
+    var ring = [point for point in left]
+    for point in right { ring.push(point) }
+    _add_ring(outline, ring)
+
+    if join != Join.Bevel and count > 2 {
+        for vertex in 1..count - 1 {
+            # A join only has a wedge to fill when the path actually turns. A
+            # sampled curve turns by a fraction of a degree between samples, so
+            # this is rare and the ring covers the rest.
+            if _turns_visibly(extended, vertex, half) {
+                _add_disc(outline, extended[vertex * 2], extended[vertex * 2 + 1], half)
+            }
+        }
+    }
+    if cap == Cap.Round {
+        _add_disc(outline, extended[0], extended[1], half)
+        _add_disc(outline, extended[(count - 1) * 2], extended[(count - 1) * 2 + 1], half)
+    }
+}
+
+#: One side of a stroke, offset by `half` along each vertex's bisector.
+fn _offset_side(run: list[float], half: float) -> list[tuple[float, float]] {
+    let count = run.len() // 2
+    var out = []
+    for index in 0..count {
+        let (nx, ny) = _vertex_normal(run, index, count)
+        if nx == 0.0 and ny == 0.0 { continue }
+        out.push((run[index * 2] + nx * half, run[index * 2 + 1] + ny * half))
+    }
+    return out
+}
+
+#: The outward normal at a vertex: the segment's own at an end, the bisector of
+#: its two segments in the middle.
+#:
+#: The bisector is scaled so the offset side stays `half` from both segments,
+#: and clamped because that scale grows without bound as a corner tightens.
+fn _vertex_normal(run: list[float], index: int, count: int) -> tuple[float, float] {
+    var before_x = 0.0
+    var before_y = 0.0
+    var after_x = 0.0
+    var after_y = 0.0
+    if index > 0 {
+        (before_x, before_y) = _unit_normal(run, index - 1, index)
+    }
+    if index < count - 1 {
+        (after_x, after_y) = _unit_normal(run, index, index + 1)
+    }
+    if index == 0 { return (after_x, after_y) }
+    if index == count - 1 { return (before_x, before_y) }
+
+    var mx = before_x + after_x
+    var my = before_y + after_y
+    let length = math.hypot(mx, my)
+    if length < 1e-9 { return (after_x, after_y) }
+    mx = mx / length
+    my = my / length
+    let scale = min(4.0, 1.0 / max(1e-6, mx * after_x + my * after_y))
+    return (mx * scale, my * scale)
+}
+
+#: The unit normal of the segment between two vertices.
+fn _unit_normal(run: list[float], from_index: int, to_index: int) -> tuple[float, float] {
+    let dx = run[to_index * 2] - run[from_index * 2]
+    let dy = run[to_index * 2 + 1] - run[from_index * 2 + 1]
+    let length = math.hypot(dx, dy)
+    if length <= 0.0 { return (0.0, 0.0) }
+    return (-dy / length, dx / length)
+}
+
+#: The same run walked backwards, so the second side offsets the other way.
+fn _reversed_run(run: list[float]) -> list[float] {
+    var out = []
+    var index = run.len() // 2 - 1
+    while index >= 0 {
+        out.push(run[index * 2])
+        out.push(run[index * 2 + 1])
+        index -= 1
+    }
+    return out
+}
+
+#: Push the two ends outward by `half`, which is what a square cap is.
+fn _extend_ends(run: list[float], half: float) -> void {
+    let count = run.len() // 2
+    if count < 2 { return }
+    let (hx, hy) = _direction(run, 1, 0)
+    run[0] = run[0] + hx * half
+    run[1] = run[1] + hy * half
+    let (tx, ty) = _direction(run, count - 2, count - 1)
+    run[(count - 1) * 2] = run[(count - 1) * 2] + tx * half
+    run[(count - 1) * 2 + 1] = run[(count - 1) * 2 + 1] + ty * half
+}
+
+#: The unit direction from one vertex to another.
+fn _direction(run: list[float], from_index: int, to_index: int) -> tuple[float, float] {
+    let dx = run[to_index * 2] - run[from_index * 2]
+    let dy = run[to_index * 2 + 1] - run[from_index * 2 + 1]
+    let length = math.hypot(dx, dy)
+    if length <= 0.0 { return (0.0, 0.0) }
+    return (dx / length, dy / length)
+}
+
+#: Report whether the corner at `vertex` leaves a gap worth filling.
+#:
+#: The notch a bevelled join leaves is about `half * (1 - cos(turn / 2))` deep.
+#: Below a quarter of a pixel nothing is visible, so the disc is skipped.
+fn _turns_visibly(run: list[float], vertex: int, half: float) -> bool {
+    let ax = run[vertex * 2] - run[(vertex - 1) * 2]
+    let ay = run[vertex * 2 + 1] - run[(vertex - 1) * 2 + 1]
+    let bx = run[(vertex + 1) * 2] - run[vertex * 2]
+    let by = run[(vertex + 1) * 2 + 1] - run[vertex * 2 + 1]
+    let first = math.hypot(ax, ay)
+    let second = math.hypot(bx, by)
+    if first <= 0.0 or second <= 0.0 { return false }
+
+    let cosine = (ax * bx + ay * by) / (first * second)
+    let clamped = max(-1.0, min(1.0, cosine))
+    # cos(turn/2) from cos(turn), avoiding an arccos and a second cosine.
+    let half_cosine = math.sqrt(max(0.0, (1.0 + clamped) * 0.5))
+    return half * (1.0 - half_cosine) > 0.25
+}
+
+#: Append a filled disc, approximated by a polygon fine enough for its size.
+fn _add_disc(outline: Path, x: float, y: float, radius: float) -> void {
+    if radius <= 0.0 { return }
+    let steps = max(6, min(24, int(radius * 4.0)))
+    var points = []
+    for index in 0..steps {
+        let angle = math.TAU * index.to_float() / steps.to_float()
+        points.push((x + radius * math.cos(angle), y + radius * math.sin(angle)))
+    }
+    _add_ring(outline, points)
+}
+
+#: Append a ring, turned so every piece of a stroke winds the same way.
+#:
+#: Non-zero winding cancels where two rings of opposite orientation overlap. A
+#: stroke's quads take their orientation from the direction of their segment, so
+#: a curve that doubles back produces opposing quads and the overlap punches a
+#: hole in the line. Normalising the orientation here is what keeps a stroked
+#: path solid.
+fn _add_ring(outline: Path, points: list[tuple[float, float]]) -> void {
+    if points.len() < 3 { return }
+    var twice_area = 0.0
+    for index in 0..points.len() {
+        let (x0, y0) = points[index]
+        let (x1, y1) = points[(index + 1) % points.len()]
+        twice_area += x0 * y1 - x1 * y0
+    }
+    if twice_area < 0.0 {
+        var reversed = []
+        var index = points.len() - 1
+        while index >= 0 {
+            reversed.push(points[index])
+            index -= 1
+        }
+        let _ring = outline.polygon(reversed)
+        return
+    }
+    let _ring = outline.polygon(points)
 }
