@@ -9,7 +9,7 @@ fn popcount(value: int) -> int {
     var v = value
     var bits = 0
     while v != 0 {
-        v = v & (v - 1)
+        v = v & v - 1
         bits += 1
     }
     return bits
@@ -24,13 +24,13 @@ fn main() -> int {
     while i < 300_000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
         var v = seed ^ checksum
-        v = v ^ (v >> 7)
-        v = (v ^ (v << 3)) & mask
-        v = v ^ (v >> 11)
+        v = v ^ v >> 7
+        v = (v ^ v << 3) & mask
+        v = v ^ v >> 11
         let bits = popcount(v)
         ones += bits
-        checksum = (checksum + v + bits) & mask
-        checksum = ((checksum << 1) | (checksum >> 31)) & mask
+        checksum = checksum + v + bits & mask
+        checksum = (checksum << 1 | checksum >> 31) & mask
         i += 1
     }
     print(ones)
