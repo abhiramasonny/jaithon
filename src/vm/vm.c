@@ -1278,6 +1278,35 @@ static CallOutcome callValueOnStack(int argc) {
  * one wants it. Exposed for the compiled tier: going through jaiCallValue
  * would mean building an ObjBound per call, and `xs.len()` in a loop cannot
  * afford an allocation to ask a question. */
+/* Call a method with the receiver in slot 0, which is where a method's body
+ * expects `self`. jaiCallValue puts the callee there instead, so it cannot be
+ * used for this. `count` includes the receiver. */
+/* The method `name` resolves to on `klass`, following the inheritance chain.
+ * Exposed for the compiled tier, which resolves a call site once. */
+bool jaiClassFindMethod(ObjClass *klass, ObjString *name, Value *out) {
+    return findMethod(klass, name, out);
+}
+
+bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver, int count,
+                               Value *out) {
+    if (count < 1) return false;
+    if (!ensureStack(count + 1)) return false;
+
+    Value *base = vm.stackTop;
+    for (int i = 0; i < count; i++) *vm.stackTop++ = argsWithReceiver[i];
+
+    int frameBase = vm.frameCount;
+    CallOutcome outcome = invokeMethodOnStack(method, count - 1);
+    if (outcome == CALL_ERROR) { vm.stackTop = base; return false; }
+    if (outcome == CALL_FRAME && run(frameBase) != JAI_RUN_OK) {
+        vm.stackTop = base;
+        return false;
+    }
+    *out = *(--vm.stackTop);
+    vm.stackTop = base;
+    return true;
+}
+
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out) {
     if (!IS_NATIVE(native)) return false;

@@ -186,6 +186,15 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
 /* Invoke a built-in method: the receiver is args[0], which is exactly where
  * callNativeAt wants it, so no bound wrapper is made. Roots as jitCallOut
  * does, because push and its kin allocate. */
+/* A method on an instance: the receiver is args[0]. */
+static int jitInvokeMethod(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    bool ok = jaiCallMethodWithReceiver(d->callee, d->args, (int)d->argc,
+                                        &d->result);
+    jaiGCPopRoots((int)d->nroots);
+    return ok ? 0 : 1;
+}
+
 static int jitInvokeNative(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiInvokeNativeWithReceiver(d->callee, d->args, (int)d->argc,
@@ -350,6 +359,9 @@ typedef struct {
         unsigned valueDepth;
         SlotKind kinds[JIT_MAX_SAVED + 1];
         ObjClass *classes[JIT_MAX_SAVED + 1];
+        /* The topmost entry is the result of a call that already happened, so
+         * it lives in the descriptor rather than a register. */
+        bool     lastFromDesc;
         int      stub;
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
@@ -633,6 +645,32 @@ static bool jitDeoptStress(void) {
         cached = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
     }
     return cached != 0;
+}
+
+static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
+                            bool lastFromDesc) {
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    if (e->deoptCount >= JIT_MAX_DEOPT) {
+        e->whyNot = "too many guards to record";
+        e->failed = true;
+        return;
+    }
+    unsigned k = e->deoptCount++;
+    e->deopt[k].ip           = ip;
+    e->deopt[k].depth        = e->depth;
+    e->deopt[k].valueDepth   = e->valueDepth;
+    e->deopt[k].lastFromDesc = lastFromDesc;
+    for (unsigned i = 0; i < e->depth; i++) {
+        e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].classes[i] = e->stackClass[i];
+    }
+    bool always = jitDeoptStress();
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
+    e->fixups[e->fixupCount].conditional  = !always;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
 }
 
 static void branchOnDeopt(Emit *e, unsigned cond) {
@@ -1706,7 +1744,59 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned ridx = e->depth - argc - 1;
             SlotKind rk = e->stack[ridx];
-            if (rk != SLOT_LIST) return false;       /* lists only, for now */
+
+            if (rk == SLOT_INST) {
+                /* A method on an instance. The class is fixed here, so the
+                 * method is resolved now; what it returns is not knowable, so
+                 * the tag that comes back is checked and a surprise deopts to
+                 * the instruction AFTER the call -- the call has happened and
+                 * must not happen twice. */
+                ObjClass *rcls = e->stackClass[ridx];
+                if (rcls == NULL) return false;
+                if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+                Value mname = fn->chunk.constants.data[nameIdx];
+                if (!IS_STRING(mname)) return false;
+                Value method;
+                if (!jaiClassFindMethod(rcls, AS_STRING(mname), &method)) {
+                    return false;
+                }
+                if (!IS_CLOSURE(method)) return false;
+                ObjFunction *mfn = AS_CLOSURE(method)->fn;
+                if (mfn->jitFunc == NULL) return false;   /* kind unknown yet */
+                SlotKind rkind = (SlotKind)mfn->jitReturnKind;
+                if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
+                    rkind != SLOT_BOOL && rkind != SLOT_INST &&
+                    rkind != SLOT_LIST) {
+                    return false;
+                }
+
+                if (!emitDescriptor(e, method, ridx, argc + 1,
+                                    (void *)&jitInvokeMethod)) {
+                    return false;
+                }
+                for (unsigned i = 0; i <= argc; i++) {
+                    unsigned r;
+                    if (!popValue(e, &r, NULL)) return false;
+                }
+                if (!pushValue(e, rkind, 0, NULL)) return false;
+
+                unsigned rat = e->descOffset +
+                               (unsigned)offsetof(JitCallDesc, result);
+                unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
+                                 : rkind == SLOT_FLOAT ? VAL_FLOAT
+                                 : rkind == SLOT_BOOL  ? VAL_BOOL
+                                                       : VAL_OBJ;
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
+                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+                emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+
+                e->wroteHeap = true;
+                off += 7;
+                break;
+            }
+
+            if (rk != SLOT_LIST) return false;
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
@@ -2287,6 +2377,21 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
                 continue;
             }
+            bool fromDesc = e.deopt[k].lastFromDesc &&
+                            i + 1 == e.deopt[k].depth;
+            if (fromDesc) {
+                /* The result of a call that has already happened: it is in the
+                 * descriptor, not in a register, and its tag is whatever the
+                 * callee actually returned. */
+                unsigned rat = e.descOffset +
+                               (unsigned)offsetof(JitCallDesc, result);
+                emit(&e, jaiA64LdrW(JIT_SCRATCH_B, 31, rat));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emit(&e, jaiA64LdrX(JIT_SCRATCH_B, 31, rat + 8));
+                emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                valueSeen++;
+                continue;
+            }
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
@@ -2602,6 +2707,22 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots) {
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
                 emitConst64(&e, JIT_SCRATCH_B, (int64_t)pv);
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                continue;
+            }
+            if (e.deopt[k].lastFromDesc && i + 1 == e.deopt[k].depth) {
+                /* The result of a call that already happened lives in the
+                 * descriptor, with whatever tag the callee actually returned.
+                 * The function tier's stub knew this; this one did not, and
+                 * alloc_churn came back 982406343 instead of 550770565 under
+                 * deopt stress -- which is the entire reason that switch
+                 * exists. */
+                unsigned rat = e.descOffset +
+                               (unsigned)offsetof(JitCallDesc, result);
+                emit(&e, jaiA64LdrW(JIT_SCRATCH_B, 31, rat));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emit(&e, jaiA64LdrX(JIT_SCRATCH_B, 31, rat + 8));
+                emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                valueSeen++;
                 continue;
             }
             unsigned tag = kind == SLOT_INT   ? VAL_INT
