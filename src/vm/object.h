@@ -241,6 +241,9 @@ struct ObjFunction {
     void       *jitLoop;
     uint32_t    jitLoopExit;
     uint32_t    jitLoopTop;
+    /* The limit the compiled loop runs to. Held here rather than baked into the
+     * code so one emitted body can serve a counted head and a range head. */
+    int64_t     jitLoopLimit;
     /* Code offsets of the default-value thunks, indexed from arity-defaultCount. */
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */
