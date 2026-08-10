@@ -28,12 +28,7 @@
 
 #include "../runtime/frontend.h"
 
-#include "../codegen/codegen.h"
-#include "../lang/ast.h"
-#include "../lang/lexer.h"
-#include "../lang/parser.h"
 #include "../native/native.h"
-#include "../sema/modsig.h"
 #include "../vm/chunk.h"
 #include "../vm/serialize.h"
 
@@ -300,15 +295,25 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
     if (optionIs(arg, "--front", &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--front");
         if (value == NULL) return false;
-        if (strcmp(value, "c") == 0) {
-            out->run.selfHosted = false;
-        } else if (strcmp(value, "jai") == 0) {
+        /* `jai` is the only front end. `c` is still recognised so that a
+         * command line carrying it gets an answer rather than "unknown
+         * option": it named a compiler that no longer exists, and silently
+         * running the other one would be the one outcome worse than failing. */
+        if (strcmp(value, "jai") == 0) {
             out->run.selfHosted = true;
-        } else {
-            cliError("--front expects `c` or `jai`, got `%s`", value);
+            return true;
+        }
+        if (strcmp(value, "c") == 0) {
+            JaiDiag *d = jaiDiagError(JAI_OK, JAI_SPAN_NONE,
+                                      "--front=c names the C front end, which "
+                                      "no longer exists");
+            jaiDiagAddNote(d, "Jaithon compiles itself; `--front=jai` is the "
+                              "only front end and is the default");
+            (void)cliFlush();
             return false;
         }
-        return true;
+        cliError("--front expects `jai`, got `%s`", value);
+        return false;
     }
     if (optionIs(arg, "--emit", &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--emit");
@@ -1405,10 +1410,8 @@ int main(int argc, char **argv) {
 
     cliFreeOptions(&opts);
     jaiVMFree();
-    jaiTypesFree();
     /* After the type universe: an imported declaration's type is interned under
      * a name that lives in the signature's own arena. */
-    jaiModuleSigFreeAll();
     jaiDiagFree(&gDiags);
     jaiSourceFreeAll();
 

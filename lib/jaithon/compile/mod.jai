@@ -241,8 +241,13 @@ pub fn compile_repl(
     whole_file: bool = false,
     record: bool = true,
     source_dir: str = "",
-    strict: bool = false
+    strict: bool = false,
+    late_globals: bool = true
 ) -> Compiled {
+    # `late_globals`: a name an already-running module defined lives in no
+    # symbol table this compilation can see, so `__prim__.eval` and the prompt
+    # want it deferred to run time rather than E0200. Compiling a module's own
+    # source does not.
     # `:disasm` compiles an input and never runs it, so what it declares is not
     # the session's.
 
@@ -273,7 +278,7 @@ pub fn compile_repl(
     if program == null { return result }
     result.program = program
 
-    let resolution = resolve(program, bag, true)
+    let resolution = resolve(program, bag, late_globals)
     result.resolution = resolution
 
     let universe = Universe()

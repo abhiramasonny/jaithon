@@ -52,7 +52,7 @@ let SPECIFIED = [
     # the collector
     "gc_collect", "gc_stats", "gc_disable", "gc_enable",
     # the front end
-    "compile", "eval", "exec", "parse_ast", "globals",
+    "compile", "eval", "exec", "globals",
     "jaic_build_id",
 ]
 

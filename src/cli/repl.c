@@ -34,7 +34,6 @@
 
 #include "../runtime/frontend.h"
 
-#include "../codegen/codegen.h"
 #include "../vm/chunk.h"
 
 #define REPL_PROMPT      ">>> "
@@ -55,7 +54,6 @@ static struct {
     CodegenOptions codegen;
     /* The class, trait and enum names this session has declared, so that a
      * later line can use them as types. See "Types declared at the prompt". */
-    JAI_VEC(Symbol *) types;
     int            inputCount;  /* names the source files: <repl:1>, <repl:2> */
     bool           interactive;
     bool           strict;
@@ -356,6 +354,8 @@ static void replExecute(const char *source, size_t length, ReplAction action,
     char cwd[JAI_MAX_PATH];
     opts.sourceDir = getcwd(cwd, sizeof cwd) != NULL ? cwd : "";
     opts.strict    = gRepl.strict;
+    /* Every line is a fragment of a session that is already running. */
+    opts.lateGlobals = true;
     opts.echo      = action == REPL_EXEC ? "__repl_echo__"
                    : action == REPL_TYPE ? "__repl_type__"
                                          : NULL;
@@ -905,9 +905,6 @@ int jaiReplRun(const JaiCliOptions *opts) {
 #endif
 
     jaiBufFree(&gRepl.pending);
-    /* The Symbols themselves belong to the resolver's registry, which outlives
-     * the session on purpose; only the list of which ones were ours is here. */
-    JAI_VEC_FREE(Symbol *, &gRepl.types);
     gRepl.module = NULL;   /* vm.modules still owns it; freed with the VM */
 
     /* A session driven by a pipe or a file is a program that was run, and a

@@ -79,6 +79,7 @@ typedef struct {
     bool        record;     /* let what it declares outlive the input */
     const char *sourceDir;  /* where `from m import T` starts looking */
     bool        strict;     /* --strict: every parameter must be annotated */
+    bool        lateGlobals; /* a name a running module defined is deferred */
 } JaiReplCompileOptions;
 
 ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,

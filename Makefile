@@ -166,9 +166,6 @@ endif
 # build simply needs a working front end on disk to start.
 SRCS_C  := $(wildcard boot/*.c) \
            $(wildcard src/common/*.c) \
-           $(wildcard src/lang/*.c) \
-           $(wildcard src/sema/*.c) \
-           $(wildcard src/codegen/*.c) \
            $(wildcard src/vm/*.c) \
            $(wildcard src/runtime/*.c) \
            $(wildcard src/native/*.c) \
@@ -400,13 +397,6 @@ reseed: $(TARGET)
 .PHONY: fixpoint-check
 fixpoint-check: $(TARGET)
 	@scripts/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
-
-#: Byte-compare the .jaic each front end produces. A diagnostic, not a gate:
-#: it exists because the retired oracle compared FuncProtos and never opened
-#: the container, so it could report `ok` for a file whose images differed.
-.PHONY: image-parity
-image-parity: $(TARGET)
-	@scripts/image_parity.sh $(if $(PATHS),$(PATHS),lib/std)
 
 check: $(TARGET)
 	@./$(TARGET) check lib tests examples

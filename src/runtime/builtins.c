@@ -25,8 +25,6 @@
 #include "methods.h"
 #include "runtime.h"
 
-#include "../sema/resolve.h"
-#include "../sema/types.h"
 #include "../vm/gc.h"
 
 /* ------------------------------------------------------------------ */
@@ -61,30 +59,10 @@ bool jaiBuiltinIsCallable(Value v) {
  * "__prim__.f64_sqrt" therefore defines `f64_sqrt` in the `__prim__` module. */
 static ObjModule *namespaceFor(const char **name);
 
-/* A builtin that *is* a class, a trait or an enum has to be nameable as a type,
- * not merely as a value: `class P: Printable` and `x: Ordering` look the name up
- * in the type namespace, and SYM_BUILTIN is not something the checker accepts
- * there. Classifying by what the value actually is — which only the runtime can
- * see — is what makes the prelude's re-exports (spec §9) usable in annotations. */
-static void registerResolverBuiltin(const char *name, Value value) {
-    /* Types may not exist yet when the runtime registers early; TY_ANY keeps
-     * every builtin dynamically typed, which is what the checker expects of a
-     * name it cannot see a signature for. */
-    Symbol *sym = jaiResolverRegisterBuiltin(name, gTypes.tAny);
-    if (sym == NULL) return;
-
-    SymbolKind kind;
-    TypeKind   named;
-    if      (IS_CLASS(value)) { kind = SYM_CLASS; named = TY_CLASS; }
-    else if (IS_TRAIT(value)) { kind = SYM_TRAIT; named = TY_TRAIT; }
-    else if (IS_ENUM(value))  { kind = SYM_ENUM;  named = TY_ENUM;  }
-    else return;
-
-    sym->kind = kind;
-    /* The registry owns `sym->name`; the interned type borrows it, so it must
-     * not be the caller's buffer. */
-    sym->type = jaiTypeNamed(named, sym->name, NULL);
-}
+/* A builtin that *is* a class, a trait or an enum used to be registered with
+ * the C resolver, so that `class P: Printable` could name it in a type
+ * position. That registry was part of the C checker and went with it; the
+ * self-hosted checker learns the same names from the prelude it compiles. */
 
 static ObjModule *makeNamespace(ObjModule *parent, const char *name, size_t len) {
     ObjString *key = jaiStringIntern(name, len);
@@ -106,7 +84,6 @@ static ObjModule *makeNamespace(ObjModule *parent, const char *name, size_t len)
     jaiModuleSet(parent, key, OBJ_VAL(ns));
     jaiGCPopRoots(2);
 
-    if (parent == vm.builtins) registerResolverBuiltin(ns->name->chars, OBJ_VAL(ns));
     return ns;
 }
 
@@ -145,7 +122,6 @@ void jaiDefineGlobal(const char *name, Value value) {
     if (module == NULL || *member == '\0') return;
 
     defineIn(module, member, value);
-    if (module == vm.builtins) registerResolverBuiltin(member, value);
 }
 
 void jaiDefineNative(const char *name, JaiNativeFn fn, int minArity, int maxArity) {
@@ -158,7 +134,6 @@ void jaiDefineNative(const char *name, JaiNativeFn fn, int minArity, int maxArit
 
     ObjNative *native = jaiNativeNew(fn, member, minArity, maxArity, NULL);
     defineIn(module, member, OBJ_VAL(native));
-    if (module == vm.builtins) registerResolverBuiltin(member, OBJ_VAL(native));
 }
 
 /* ------------------------------------------------------------------ */
@@ -228,10 +203,6 @@ bool jaiArgCallable(Value v, int index, const char *fnName) {
 /* ------------------------------------------------------------------ */
 
 void jaiRegisterAllBuiltins(void) {
-    /* The resolver records a type for every builtin name, so the type universe
-     * has to exist first. jaiTypesInit is idempotent. */
-    jaiTypesInit();
-
     /* Error classes come first: every other native throws through them. The VM
      * may already have built them during jaiVMInit. */
     if (vm.cError == NULL) jaiRegisterErrorClasses();
