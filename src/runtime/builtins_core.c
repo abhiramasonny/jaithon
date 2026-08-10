@@ -408,7 +408,7 @@ static bool nIntConv(int argc, Value *args, Value *out) {
                         (long long)base, text->chars);
     }
 
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_INT:
         *out = v;
         return true;
@@ -447,7 +447,7 @@ static bool nIntConv(int argc, Value *args, Value *out) {
 static bool nFloatConv(int argc, Value *args, Value *out) {
     (void)argc;
     Value v = args[0];
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_FLOAT: *out = v; return true;
     case VAL_INT:   *out = FLOAT_VAL((double)AS_INT(v)); return true;
     case VAL_BOOL:  *out = FLOAT_VAL(AS_BOOL(v) ? 1.0 : 0.0); return true;
@@ -469,7 +469,7 @@ static bool nFloatConv(int argc, Value *args, Value *out) {
 static bool nBoolConv(int argc, Value *args, Value *out) {
     (void)argc;
     Value v = args[0];
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_BOOL:  *out = v; return true;
     case VAL_NULL:  *out = BOOL_VAL(false); return true;
     case VAL_INT:   *out = BOOL_VAL(AS_INT(v) != 0); return true;
@@ -491,7 +491,7 @@ static bool nBoolConv(int argc, Value *args, Value *out) {
 static bool nId(int argc, Value *args, Value *out) {
     (void)argc;
     Value v = args[0];
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_NULL:  *out = INT_VAL(0); return true;
     case VAL_BOOL:  *out = INT_VAL(AS_BOOL(v) ? 1 : 2); return true;
     case VAL_INT:   *out = INT_VAL(AS_INT(v)); return true;

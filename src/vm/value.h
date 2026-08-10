@@ -73,6 +73,14 @@ typedef struct {
 #define AS_FLOAT(v)       ((v).as.number)
 #define AS_OBJ(v)         ((v).as.obj)
 
+/* Which of the five kinds `v` is.
+ *
+ * A five-way branch on a value is a switch, and a switch needs something to
+ * switch on. Reading `.type` directly works only while a Value has a tag field;
+ * a NaN-boxed one does not, so every such switch goes through here instead and
+ * the representation stays behind the macros. */
+JAI_INLINE ValueType jaiValueType(Value v) { return v.type; }
+
 /* Numeric coercion helper: int or float -> double. Undefined for other types. */
 JAI_INLINE double jaiAsDouble(Value v) {
     return IS_INT(v) ? (double)AS_INT(v) : AS_FLOAT(v);

@@ -254,7 +254,7 @@ int jaiOpCacheOperand(OpCode op) {
 #define CONST_MAX_DEPTH  8            /* nested tuple recursion bound */
 
 static bool constDedupable(Value v) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_NULL:
     case VAL_BOOL:
     case VAL_INT:
@@ -272,8 +272,8 @@ static bool constDedupable(Value v) {
  * jaiValuesEqual: this must never conflate int with float, must keep -0.0
  * distinct from 0.0, and must never run user code (__eq__). */
 static bool constEqual(Value a, Value b, int depth) {
-    if (a.type != b.type) return false;
-    switch (a.type) {
+    if (jaiValueType(a) != jaiValueType(b)) return false;
+    switch (jaiValueType(a)) {
     case VAL_NULL:  return true;
     case VAL_BOOL:  return AS_BOOL(a) == AS_BOOL(b);
     case VAL_INT:   return AS_INT(a) == AS_INT(b);
@@ -314,7 +314,7 @@ static bool constEqual(Value a, Value b, int depth) {
 }
 
 static uint64_t constHash(Value v, int depth) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_NULL:  return 0x9e3779b97f4a7c15ull;
     case VAL_BOOL:  return AS_BOOL(v) ? 0x2545f4914f6cdd1dull : 0xff51afd7ed558ccdull;
     case VAL_INT:   return jaiHashU64((uint64_t)AS_INT(v)) ^ 1u;

@@ -245,7 +245,7 @@ static bool writeConstant(JaiBuf *b, PoolWriter *w, Value v, int depth);
 static bool writeConstant(JaiBuf *b, PoolWriter *w, Value v, int depth) {
     if (depth > JAIC_MAX_DEPTH) return false;
 
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_NULL:
         jaiBufPush(b, K_NULL);
         return true;

@@ -110,7 +110,7 @@ static const char *classNameOf(const ObjClass *k) {
 }
 
 const char *jaiTypeNameStatic(Value v) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
         case VAL_NULL:  return "null";
         case VAL_BOOL:  return "bool";
         case VAL_INT:   return "int";
@@ -279,7 +279,7 @@ static bool objectsEqual(Obj *ao, Obj *bo, Value a, Value b) {
 }
 
 static bool valuesEqualInner(Value a, Value b) {
-    if (a.type != b.type) {
+    if (jaiValueType(a) != jaiValueType(b)) {
         if (IS_NUMBER(a) && IS_NUMBER(b)) {
             /* The only cross-type equality: int vs float, compared exactly. */
             return IS_INT(a) ? intEqualsDouble(AS_INT(a), AS_FLOAT(b))
@@ -304,7 +304,7 @@ static bool valuesEqualInner(Value a, Value b) {
         return false;
     }
 
-    switch (a.type) {
+    switch (jaiValueType(a)) {
         case VAL_NULL:  return true;
         case VAL_BOOL:  return AS_BOOL(a) == AS_BOOL(b);
         case VAL_INT:   return AS_INT(a) == AS_INT(b);
@@ -330,8 +330,8 @@ bool jaiValuesEqual(Value a, Value b) {
 }
 
 bool jaiValuesIdentical(Value a, Value b) {
-    if (a.type != b.type) return false;
-    switch (a.type) {
+    if (jaiValueType(a) != jaiValueType(b)) return false;
+    switch (jaiValueType(a)) {
         case VAL_NULL:  return true;
         case VAL_BOOL:  return AS_BOOL(a) == AS_BOOL(b);
         case VAL_INT:   return AS_INT(a) == AS_INT(b);
@@ -418,7 +418,7 @@ static uint64_t hashInstance(ObjInstance *inst, bool *ok) {
 }
 
 static uint64_t valueHashInner(Value v, bool *ok) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
         /* `null` is not a valid key (spec §5.4). JaiEntry encodes an empty slot
          * as NULL_VAL, so allowing it would need a third slot state in every
          * table entry — and "is the key absent" and "is the key null" are the
@@ -937,7 +937,7 @@ static void renderRange(ValSink *s, ObjRange *r) {
 /* Returns false only when a user dunder raised; the exception is then pending
  * and whatever was emitted so far is discarded by the caller. */
 static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser) {
-    switch (v.type) {
+    switch (jaiValueType(v)) {
         case VAL_NULL: sinkStr(s, "null"); return true;
         case VAL_BOOL: sinkStr(s, AS_BOOL(v) ? "true" : "false"); return true;
         case VAL_INT:  sinkInt(s, AS_INT(v)); return true;
@@ -1019,7 +1019,7 @@ static ObjString *renderToString(Value v, bool repr) {
     /* A scalar's rendering is short, bounded, and identical under str and
      * repr, so it needs neither a growable buffer nor the root dance: going
      * straight to the string skips a malloc/free pair per f-string hole. */
-    switch (v.type) {
+    switch (jaiValueType(v)) {
     case VAL_INT: {
         char digits[JAI_INT_DIGITS];
         return jaiStringNew(digits, (size_t)writeInt64(digits, AS_INT(v)));
@@ -1093,7 +1093,7 @@ ObjString *jaiValueFormat(const Value *parts, int count) {
 
     for (int i = 0; i < count; i++) {
         Value v = parts[i];
-        switch (v.type) {
+        switch (jaiValueType(v)) {
         case VAL_NULL:
             runs[i] = "null";
             lens[i] = 4;
