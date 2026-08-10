@@ -25,6 +25,7 @@
 from jaithon.ast import Node, NodeKind, to_json, to_sexp
 from jaithon.compile.emit import ConstTag, FuncProto, emit, op_name
 from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
+from jaithon.compile.jaic import flags_for
 from jaithon.compile.jaic import disassemble_instruction
 from jaithon.compile.jaic import source_hash, write_module
 from jaithon.compile.check.checker import check_import_cycles, check_program
@@ -149,8 +150,7 @@ pub fn compile_source(
     result.body = body
     if not result.ok() { return result }
 
-    let flags = if release { FLAG_RELEASE } else { FLAG_DEBUG }
-    let mod = Module(path, result.hash, body, flags)
+    let mod = Module(path, result.hash, body, flags_for(release, opt_level))
     for name in _exported_names(body) { mod.exports.push(name) }
     result.mod = mod
     result.image = write_module(mod)

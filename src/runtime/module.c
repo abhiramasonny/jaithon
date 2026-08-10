@@ -577,6 +577,7 @@ static bool traceLoads(void) {
     return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
 }
 
+
 static bool seedDisabled(void) {
     const char *flag = getenv("JAITHON_NO_SEED");
     return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
