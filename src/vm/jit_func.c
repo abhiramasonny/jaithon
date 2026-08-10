@@ -134,6 +134,40 @@ static void jitThrowOverflow(int64_t which) {
                    "integer overflow in '%s'; use '%s' to wrap", ops[i], wrap[i]);
 }
 
+/* Where a deoptimising body leaves what it was holding.
+ *
+ * A global rather than a frame field: the compiled frame is gone by the time
+ * the C side looks, and one record is enough because only one compiled body
+ * can be deoptimising at a time -- the VM is single-threaded and the record is
+ * consumed before anything else runs. */
+typedef struct {
+    int64_t ip;        /* bytecode offset to resume at */
+    int64_t base;      /* first local slot the record covers */
+    int64_t nlocals;
+    int64_t nstack;
+    Value   locals[JIT_MAX_SAVED + 1];
+    Value   stack[JIT_MAX_SAVED + 1];
+} JitDeoptRecord;
+
+static JitDeoptRecord gDeopt;
+
+bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
+    ObjFunction *fn = closure->fn;
+    if (gDeopt.ip < 0 || gDeopt.ip >= fn->chunk.count) return false;
+
+    for (int64_t i = 0; i < gDeopt.nlocals; i++) {
+        slotBase[gDeopt.base + i] = gDeopt.locals[i];
+    }
+    /* The operand stack sits above the frame's window, which bindCallArgs has
+     * already set vm.stackTop to. */
+    for (int64_t i = 0; i < gDeopt.nstack; i++) {
+        *vm.stackTop++ = gDeopt.stack[i];
+    }
+    CallFrame *frame = &vm.frames[vm.frameCount - 1];
+    frame->ip = fn->chunk.code + gDeopt.ip;
+    return true;
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -172,6 +206,9 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_ENTRY  (UINT32_MAX - 1u)
 #define FIXUP_THREW  (UINT32_MAX - 2u)
 #define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
+#define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
+
+#define JIT_MAX_DEOPT 24
 
 typedef struct {
     int      instIndex;    /* which emitted instruction to patch */
@@ -235,6 +272,20 @@ typedef struct {
     int       exceptionExit; /* instruction index of the "callee threw" exit */
     bool      overflowUsed[3];
     int       overflowStub[3];
+
+    /* One per guard: the bytecode offset to resume at, and a snapshot of the
+     * compile-time model there. The stub that writes them is emitted after the
+     * body, so the hot path keeps a single not-taken branch. */
+    struct {
+        uint32_t ip;
+        unsigned depth;
+        unsigned valueDepth;
+        SlotKind kinds[JIT_MAX_SAVED + 1];
+        ObjClass *classes[JIT_MAX_SAVED + 1];
+        int      stub;
+    } deopt[JIT_MAX_DEOPT];
+    unsigned  deoptCount;
+    uint32_t  curOffset;
     bool      hasSelfCall;
     unsigned  locals;      /* slots base..base+locals-1 live in registers */
     unsigned  frameBytes;
@@ -420,14 +471,54 @@ static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
     emit(e, conditional ? jaiA64BCond(cond, 0) : jaiA64B(0));
 }
 
+/* A guard failed: hand this exact point to the interpreter.
+ *
+ * Not a bail. A bail re-runs the call from the top, which stops being sound
+ * the moment the body has written anything -- and the guards that matter are
+ * on field reads inside loops that write. This records where the interpreter
+ * should pick up and what it should be holding; the stub that writes it out is
+ * emitted after the body, so the hot path keeps one not-taken branch. */
+static bool jitDeoptStress(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DEOPT_STRESS");
+        cached = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static void branchOnDeopt(Emit *e, unsigned cond) {
+    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    if (e->deoptCount >= JIT_MAX_DEOPT) {
+        e->whyNot = "too many guards to record";
+        e->failed = true;
+        return;
+    }
+    unsigned k = e->deoptCount++;
+    e->deopt[k].ip         = e->curOffset;
+    e->deopt[k].depth      = e->depth;
+    e->deopt[k].valueDepth = e->valueDepth;
+    for (unsigned i = 0; i < e->depth; i++) {
+        e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].classes[i] = e->stackClass[i];
+    }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
+    /* JAITHON_JIT_DEOPT_STRESS makes every guard fail. Compiled code then
+     * deoptimises at the first one it meets, so the whole test suite becomes a
+     * test of the resume path -- which is otherwise reached only when a
+     * program changes a field's type, and almost none do. */
+    bool always = jitDeoptStress();
+    e->fixups[e->fixupCount].conditional  = !always;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
+}
+
 /* Branch to the bail block on `cond`. The block's index is not known yet, so
  * it is patched with the rest. */
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
-    /* A bail discards the compiled work and hands the call back to the
-     * interpreter, which runs it from the top. That is only sound while the
-     * body has written nothing. Recorded rather than refused here so the
-     * decision is made once, after the whole body is known. */
     if (e->wroteHeap) e->bailAfterWrite = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
@@ -605,6 +696,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         e->offsetToDepth[off] = (int)stackSignature(e);
         uint8_t op = code[off];
         e->lastOp = op;
+        e->curOffset = (uint32_t)off;
 
         switch (op) {
         case OP_GET_LOCAL: {
@@ -838,7 +930,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, localReg(e, slot), base));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
-                branchOnCondition(e, JAI_A64_NE);
+                branchOnDeopt(e, JAI_A64_NE);
             }
 
             if (!pushValue(e, kind, 0, NULL)) return false;
@@ -955,7 +1047,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             else return false;
 
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
-            branchOnCondition(e, JAI_A64_NE);
+            branchOnDeopt(e, JAI_A64_NE);
             if (!pushValue(e, kind, 0, NULL)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
             off += 2;
@@ -972,10 +1064,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value seen = e->stackSeen[e->depth - 1];
             int fromLocal = e->stackLocal[e->depth - 1];
 
-            unsigned rr;
-            SlotKind kr;
-            if (!popValue(e, &rr, &kr)) return false;
-            if (kr != SLOT_INST || klass == NULL) return false;
+            if (e->stack[e->depth - 1] != SLOT_INST || klass == NULL) return false;
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
@@ -995,14 +1084,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                              (unsigned)info->slot * (unsigned)sizeof(Value);
+            unsigned rr = JIT_FIRST_SAVED + e->locals +
+                          (e->usesUpvalues ? 1u : 0u) + e->valueDepth - 1;
             SlotKind already = knownFieldKind(e, fromLocal, info->slot);
             if (already != SLOT_SELF) {
                 kind = already;
             } else {
+                /* Guard BEFORE the receiver comes off the model: a deopt here
+                 * resumes at this instruction, and the interpreter's stack
+                 * still has the receiver on it. */
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr, fbase));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
-                branchOnCondition(e, JAI_A64_NE);
+                branchOnDeopt(e, JAI_A64_NE);
             }
+            unsigned popped;
+            SlotKind kr;
+            if (!popValue(e, &popped, &kr)) return false;
             if (!pushValue(e, kind, 0, NULL)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
             off += 6;
@@ -1348,6 +1445,76 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     emit(&e, jaiA64MovzX(0, 0, 0));
     emitEpilogue(&e, 2);
 
+    /* One stub per guard, out of line. Each writes the record the interpreter
+     * resumes from: the locals, the operand stack as it stood at that
+     * instruction, and the offset of the instruction itself. */
+    for (unsigned k = 0; k < e.deoptCount; k++) {
+        e.deopt[k].stub = (int)e.count;
+        emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
+
+        for (unsigned i = 0; i < e.locals; i++) {
+            unsigned slot = e.base + i;
+            SlotKind kind = e.localKind[slot];
+            unsigned tag = kind == SLOT_INT   ? VAL_INT
+                         : kind == SLOT_FLOAT ? VAL_FLOAT
+                         : kind == SLOT_INST  ? VAL_OBJ
+                                              : VAL_NULL;
+            unsigned at = (unsigned)offsetof(JitDeoptRecord, locals) +
+                          i * (unsigned)sizeof(Value);
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+            emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+            if (tag == VAL_NULL) {
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
+                emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+            } else {
+                emit(&e, jaiA64StrX(JIT_FIRST_SAVED + i, JIT_SCRATCH_A, at + 8));
+            }
+        }
+
+        unsigned valueSeen = 0;
+        for (unsigned i = 0; i < e.deopt[k].depth; i++) {
+            SlotKind kind = e.deopt[k].kinds[i];
+            unsigned at = (unsigned)offsetof(JitDeoptRecord, stack) +
+                          i * (unsigned)sizeof(Value);
+            if (kind == SLOT_CLASS || kind == SLOT_SELF) {
+                /* Neither holds a register; both are compile-time constants. */
+                uintptr_t p = kind == SLOT_CLASS
+                                  ? (uintptr_t)e.deopt[k].classes[i]
+                                  : (uintptr_t)closure;
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emitConst64(&e, JIT_SCRATCH_B, (int64_t)p);
+                emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                continue;
+            }
+            unsigned tag = kind == SLOT_INT   ? VAL_INT
+                         : kind == SLOT_FLOAT ? VAL_FLOAT
+                                              : VAL_OBJ;
+            unsigned reg = JIT_FIRST_SAVED + e.locals +
+                           (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            valueSeen++;
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+            emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+            emit(&e, jaiA64StrX(reg, JIT_SCRATCH_A, at + 8));
+        }
+
+        emitConst64(&e, JIT_SCRATCH_B, (int64_t)e.deopt[k].ip);
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, ip)));
+        emit(&e, jaiA64MovzX(JIT_SCRATCH_B, e.base, 0));
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, base)));
+        emit(&e, jaiA64MovzX(JIT_SCRATCH_B, e.locals, 0));
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, nlocals)));
+        emit(&e, jaiA64MovzX(JIT_SCRATCH_B, e.deopt[k].depth, 0));
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, nstack)));
+
+        emit(&e, jaiA64MovzX(0, 0, 0));
+        emitEpilogue(&e, 4);
+    }
+
     /* One throwing stub per operator, out of line: the hot path keeps the same
      * single not-taken b.vs it always had. */
     for (unsigned i = 0; i < 3; i++) {
@@ -1383,6 +1550,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             target = e.bailBlock;
         } else if (f->targetOffset == FIXUP_THREW) {
             target = e.exceptionExit;
+        } else if (f->targetOffset <= FIXUP_DEOPT &&
+                   f->targetOffset > FIXUP_DEOPT - JIT_MAX_DEOPT) {
+            target = e.deopt[FIXUP_DEOPT - f->targetOffset].stub;
+            if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
         } else if (f->targetOffset <= FIXUP_OVF &&
                    f->targetOffset >= FIXUP_OVF - 2u) {
             target = e.overflowStub[FIXUP_OVF - f->targetOffset];
@@ -1560,6 +1731,7 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     }
 
     if (r.bailed == 2) return JAI_JIT_ERROR;
+    if (r.bailed == 4) return JAI_JIT_DEOPT;
     if (r.bailed) {
         /* Overflow or a stack that ran low. Nothing was written -- the body
          * cannot write -- so handing the call back to the interpreter is
