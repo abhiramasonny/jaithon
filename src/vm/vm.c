@@ -2991,6 +2991,8 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_ADD_INT_CONST]      = &&L_OP_ADD_INT_CONST,
         [OP_MOD_INT_CONST]      = &&L_OP_MOD_INT_CONST,
         [OP_ADD_BIND]           = &&L_OP_ADD_BIND,
+        [OP_SUB_BIND]           = &&L_OP_SUB_BIND,
+        [OP_MUL_BIND]           = &&L_OP_MUL_BIND,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -3507,6 +3509,46 @@ static JaiRunResult runLoop(int baseFrameCount) {
         LOAD_STATE();
         DROP(2);
         slots[slot] = sum;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_SUB_BIND): {
+        uint16_t slot = READ_U16();
+        if (JAI_LIKELY(IS_INT(stackTop[-1]) && IS_INT(stackTop[-2]))) {
+            int64_t r;
+            if (JAI_LIKELY(!__builtin_sub_overflow(AS_INT(stackTop[-2]),
+                                                   AS_INT(stackTop[-1]), &r))) {
+                DROP(2);
+                slots[slot] = INT_VAL(r);
+                VM_NEXT();
+            }
+        }
+        SAVE_STATE();
+        Value out;
+        if (!arithmetic(OP_SUB, stackTop[-2], stackTop[-1], &out)) goto vmThrow;
+        LOAD_STATE();
+        DROP(2);
+        slots[slot] = out;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MUL_BIND): {
+        uint16_t slot = READ_U16();
+        if (JAI_LIKELY(IS_INT(stackTop[-1]) && IS_INT(stackTop[-2]))) {
+            int64_t r;
+            if (JAI_LIKELY(!__builtin_mul_overflow(AS_INT(stackTop[-2]),
+                                                   AS_INT(stackTop[-1]), &r))) {
+                DROP(2);
+                slots[slot] = INT_VAL(r);
+                VM_NEXT();
+            }
+        }
+        SAVE_STATE();
+        Value out;
+        if (!arithmetic(OP_MUL, stackTop[-2], stackTop[-1], &out)) goto vmThrow;
+        LOAD_STATE();
+        DROP(2);
+        slots[slot] = out;
         VM_NEXT();
     }
 

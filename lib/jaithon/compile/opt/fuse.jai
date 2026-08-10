@@ -264,13 +264,13 @@ fn _fuse_at(code: Code, index: int) -> bool {
     # ADD; BIND a  ->  ADD_BIND a. The pair's net stack effect is unchanged, so
     # neither operand's origin matters. It removes the push-then-pop between
     # them, which every accumulating `x += ...` performs.
-    if n >= 2 and
-        head.op == opcode(Op.Add) and
-        window_clean(code, w, 2) and
-        code.data[w[1]].op == opcode(Op.Bind) {
-        _make_imm16(head, opcode(Op.AddBind), slot_of(code.data[w[1]], 0))
-        kill(code, w[1])
-        return true
+    if n >= 2 and window_clean(code, w, 2) and code.data[w[1]].op == opcode(Op.Bind) {
+        let fused = _bind_fused_form(head.op)
+        if fused != null {
+            _make_imm16(head, fused, slot_of(code.data[w[1]], 0))
+            kill(code, w[1])
+            return true
+        }
     }
 
     # GET_LOCAL2 a, b; ADD  ->  ADD_LOCALS a, b. The operand pair is already the
@@ -346,6 +346,19 @@ fn _const_index_of(code: Code, instruction: Instr) -> int {
 
 # u16 slot, i16 immediate: the shape of ADD_INT_CONST and CMP_LOCAL_CONST_LT.
 # A bare i16 immediate: the shape of MOD_INT_CONST.
+# The fused `<binop>; BIND a` form of `op`, or null when there is none.
+#
+# Every opcode answered here carries a slot, so every one of them also has to
+# be listed in the coalescer's slot-operand table (`_build_slot_operands` in
+# chunk.jai). Leaving one out renumbers the readers of a slot and not the fused
+# writer, which is a miscompile three steps removed from its cause.
+fn _bind_fused_form(op: int) -> int? {
+    if op == opcode(Op.Add) { return opcode(Op.AddBind) }
+    if op == opcode(Op.Sub) { return opcode(Op.SubBind) }
+    if op == opcode(Op.Mul) { return opcode(Op.MulBind) }
+    return null
+}
+
 fn _make_imm16(instruction: Instr, op: int, immediate: int) -> void {
     set_instr(instruction, op, u16_bytes(immediate))
 }
