@@ -306,6 +306,12 @@ typedef struct {
     /* The first pass exists to find maxValue and maxSlotUsed, so it must not
      * stop at a budget computed from a slot count it is still discovering. */
     bool      measuring;
+    /* Locals live in the compiled frame instead of registers. A body with more
+     * live values than there are callee-saved registers would otherwise be
+     * declined outright, and nbody's `advance` wants nineteen. The operand
+     * stack stays in registers either way -- that is where the arithmetic is. */
+    bool      spilled;
+    unsigned  localsFrameOffset;
     /* A body that reads an upvalue needs the closure itself, which is not any
      * slot: for a method slot 0 is the receiver, not the callee. It arrives as
      * one extra argument and takes the register just past the locals. */
@@ -356,8 +362,36 @@ static void emit(Emit *e, uint32_t word) {
     e->code[e->count++] = word;
 }
 
+/* Registers the operand stack starts after: none of them, once locals live in
+ * the frame. */
+static unsigned regBase(const Emit *e) {
+    return e->spilled ? 0u : e->locals;
+}
+
 static unsigned localReg(const Emit *e, unsigned slot) {
     return JIT_FIRST_SAVED + (slot - e->base);
+}
+
+static unsigned localFrameOff(const Emit *e, unsigned slot) {
+    return e->localsFrameOffset + (slot - e->base) * 8u;
+}
+
+/* A register holding `slot`'s value. In register mode that is the local's own
+ * register and `scratch` goes unused; in memory mode the value is loaded into
+ * `scratch`. Only the payload moves: a local's kind is fixed for the whole
+ * function, so the tag never needs storing. */
+static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
+    if (!e->spilled) return localReg(e, slot);
+    emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot)));
+    return scratch;
+}
+
+static void localOut(Emit *e, unsigned slot, unsigned src) {
+    if (!e->spilled) {
+        if (src != localReg(e, slot)) emit(e, jaiA64MovX(localReg(e, slot), src));
+        return;
+    }
+    emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot)));
 }
 
 /* Slots the body may name at all. */
@@ -376,11 +410,11 @@ static bool localObserved(Emit *e, unsigned slot) {
 
 /* The register a new value entry would occupy. */
 static unsigned closureReg(const Emit *e) {
-    return JIT_FIRST_SAVED + e->locals;
+    return JIT_FIRST_SAVED + regBase(e);
 }
 
 static unsigned pushReg(const Emit *e) {
-    return JIT_FIRST_SAVED + e->locals + (e->usesUpvalues ? 1u : 0u) +
+    return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) +
            e->valueDepth;
 }
 
@@ -391,7 +425,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
         return false;
     }
     if (!e->measuring &&
-        e->locals + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
+        regBase(e) + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
             JIT_MAX_SAVED) {
         e->whyNot = "more live values than there are callee-saved registers";
         return false;
@@ -451,7 +485,7 @@ static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
     e->depth--;
     e->valueDepth--;
     if (kind != NULL) *kind = e->stack[e->depth];
-    *reg = JIT_FIRST_SAVED + e->locals + (e->usesUpvalues ? 1u : 0u) +
+    *reg = JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) +
            e->valueDepth;
     return true;
 }
@@ -691,7 +725,7 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                                        : VAL_OBJ;
         unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
                       i * (unsigned)sizeof(Value);
-        unsigned reg = JIT_FIRST_SAVED + e->locals +
+        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
                        (e->usesUpvalues ? 1u : 0u) +
                        (idx - (e->depth - e->valueDepth));
         emit(e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
@@ -711,7 +745,7 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                       nroots * (unsigned)sizeof(Value);
         emit(e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
-        emit(e, jaiA64StrX(localReg(e, slot), 31, at + 8));
+        emit(e, jaiA64StrX(localIn(e, slot, JIT_SCRATCH_C), 31, at + 8));
         nroots++;
     }
 
@@ -791,7 +825,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                             (int)slot)) {
                 return false;
             }
-            emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
+            {
+                unsigned dst = pushReg(e) - 1;
+                unsigned src = localIn(e, slot, dst);
+                if (src != dst) emit(e, jaiA64MovX(dst, src));
+            }
             off += 3;
             break;
         }
@@ -820,7 +858,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            emit(e, jaiA64MovX(localReg(e, slot), pushReg(e) - 1));
+            localOut(e, slot, pushReg(e) - 1);
             off += 3;
             break;
         }
@@ -829,13 +867,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned a = jaiReadU16(code + off + 1);
             unsigned b = jaiReadU16(code + off + 3);
             if (!localInRange(e, a) || !localInRange(e, b)) return false;
-            if (e->localKind[a] != SLOT_INT || e->localKind[b] != SLOT_INT) {
-                return false;
-            }
+            SlotKind ka2 = e->localKind[a];
+            if (ka2 != e->localKind[b]) return false;
+            if (ka2 != SLOT_INT && ka2 != SLOT_FLOAT) return false;
             if (a == 0 || b == 0) e->usesSlot0 = true;
-            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-            emit(e, jaiA64AddsX(pushReg(e) - 1, localReg(e, a), localReg(e, b)));
-            branchOnOverflow(e, 0u, JAI_A64_VS);
+            if (!pushValue(e, ka2, 0, NULL)) return false;
+            {
+                unsigned ra2 = localIn(e, a, JIT_SCRATCH_C);
+                unsigned rb2 = localIn(e, b, JIT_SCRATCH_D);
+                if (ka2 == SLOT_FLOAT) {
+                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra2));
+                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb2));
+                    emit(e, jaiA64FaddD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
+                                        JIT_FSCRATCH_B));
+                    emit(e, jaiA64FmovXD(pushReg(e) - 1, JIT_FSCRATCH_A));
+                } else {
+                    emit(e, jaiA64AddsX(pushReg(e) - 1, ra2, rb2));
+                    branchOnOverflow(e, 0u, JAI_A64_VS);
+                }
+            }
             off += 5;
             break;
         }
@@ -855,7 +905,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            unsigned rd = localReg(e, slot);
+            unsigned rd = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
             if (ka == SLOT_FLOAT) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -868,6 +918,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 return false;
             }
+            localOut(e, slot, rd);
             off += 3;
             break;
         }
@@ -880,10 +931,44 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (slot == 0) e->usesSlot0 = true;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             emitConst64(e, JIT_SCRATCH_A, imm);
-            emit(e, jaiA64AddsX(pushReg(e) - 1, localReg(e, slot),
+            emit(e, jaiA64AddsX(pushReg(e) - 1,
+                                localIn(e, slot, JIT_SCRATCH_C),
                                 JIT_SCRATCH_A));
             branchOnOverflow(e, 0u, JAI_A64_VS);
             off += 5;
+            break;
+        }
+
+        case OP_MUL_BIND: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            if (!localInRange(e, slot)) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            unsigned rb, ra;
+            SlotKind kb, ka;
+            if (!popValue(e, &rb, &kb)) return false;
+            if (!popValue(e, &ra, &ka)) return false;
+            if (ka != kb) return false;
+            if (!adoptLocalKind(e, slot, ka, 0, NULL)) {
+                e->whyNot = "a local was given two different kinds";
+                return false;
+            }
+            unsigned rd = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
+            if (ka == SLOT_FLOAT) {
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+                emit(e, jaiA64FmulD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
+                                    JIT_FSCRATCH_B));
+                emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
+            } else if (ka == SLOT_INT) {
+                emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
+                emit(e, jaiA64MulX(rd, ra, rb));
+                emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+                branchOnOverflow(e, 2u, JAI_A64_NE);
+            } else {
+                return false;
+            }
+            localOut(e, slot, rd);
+            off += 3;
             break;
         }
 
@@ -900,7 +985,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            unsigned rd = localReg(e, slot);
+            unsigned rd = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
             if (ka == SLOT_FLOAT) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -913,6 +998,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 return false;
             }
+            localOut(e, slot, rd);
             off += 3;
             break;
         }
@@ -930,7 +1016,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
-            emit(e, jaiA64MovX(localReg(e, slot), r));
+            localOut(e, slot, r);
             off += 3;
             break;
         }
@@ -942,8 +1028,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->localKind[slot] != SLOT_INT) return false;
             if (slot == 0) e->usesSlot0 = true;
             emitConst64(e, JIT_SCRATCH_A, imm);
-            emit(e, jaiA64AddsX(localReg(e, slot), localReg(e, slot),
-                                JIT_SCRATCH_A));
+            {
+                unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
+                unsigned dst = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
+                emit(e, jaiA64AddsX(dst, cur, JIT_SCRATCH_A));
+                localOut(e, slot, dst);
+            }
             branchOnOverflow(e, 0u, JAI_A64_VS);
             off += 4;
             break;
@@ -1192,7 +1282,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!IS_INT(k)) return false;
 
             emitConst64(e, JIT_SCRATCH_A, AS_INT(k));
-            emit(e, jaiA64SubsXReg(31, localReg(e, slot), JIT_SCRATCH_A));
+            emit(e, jaiA64SubsXReg(31, localIn(e, slot, JIT_SCRATCH_C),
+                                   JIT_SCRATCH_A));
             branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
             off += 9;
             break;
@@ -1235,17 +1326,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* The tag is checked every time, unless this body wrote the field
              * itself. A field is not typed by the runtime, so a later int
              * where a float was seen must bail rather than be read as one. */
+            unsigned recv = localIn(e, slot, JIT_SCRATCH_C);
             SlotKind already = knownFieldKind(e, (int)slot, info->slot);
             if (already != SLOT_SELF) {
                 kind = already;
             } else {
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, localReg(e, slot), base));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
                 branchOnDeopt(e, JAI_A64_NE);
             }
 
             if (!pushValue(e, kind, 0, NULL)) return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, localReg(e, slot), base + 8));
+            emit(e, jaiA64LdrX(pushReg(e) - 1, recv, base + 8));
             off += 8;
             break;
         }
@@ -1265,7 +1357,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                 (int)slot)) {
                     return false;
                 }
-                emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
+                {
+                    unsigned dst = pushReg(e) - 1;
+                    unsigned src = localIn(e, slot, dst);
+                    if (src != dst) emit(e, jaiA64MovX(dst, src));
+                }
             }
             off += 5;
             break;
@@ -1323,7 +1419,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->sawReturn  = true;
             e->returnKind = SLOT_INST;
             e->returnShape = e->localShape[0];
-            emit(e, jaiA64MovX(0, localReg(e, 0)));
+            {
+                unsigned src = localIn(e, 0, 0);
+                if (src != 0) emit(e, jaiA64MovX(0, src));
+            }
             emitEpilogue(e, 0);
             off += 1;
             break;
@@ -1395,7 +1494,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                              (unsigned)info->slot * (unsigned)sizeof(Value);
-            unsigned rr = JIT_FIRST_SAVED + e->locals +
+            unsigned rr = JIT_FIRST_SAVED + regBase(e) +
                           (e->usesUpvalues ? 1u : 0u) + e->valueDepth - 1;
             SlotKind already = knownFieldKind(e, fromLocal, info->slot);
             if (already != SLOT_SELF) {
@@ -1661,7 +1760,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
-            unsigned first = JIT_FIRST_SAVED + e->locals +
+            unsigned first = JIT_FIRST_SAVED + regBase(e) +
                              (e->usesUpvalues ? 1u : 0u) + e->valueDepth - argc;
             for (unsigned i = 0; i < argc; i++) {
                 emit(e, jaiA64MovX(i, first + i));
@@ -1911,9 +2010,18 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         e.whyNot = "more incoming arguments than argument registers";
     }
 
-    unsigned saved = e.locals + (e.usesUpvalues ? 1u : 0u) + body.maxValue;
+    unsigned extra = e.usesUpvalues ? 1u : 0u;
+    unsigned saved = e.locals + extra + body.maxValue;
     if (saved > JIT_MAX_SAVED) {
-        e.whyNot = "more live values than there are callee-saved registers";
+        /* Too many to keep in registers, so the locals go to the frame and the
+         * operand stack keeps the registers. Only the operand stack has to fit
+         * now, which is a far lower bar: it is expression depth, not the
+         * number of variables a function happens to declare. */
+        e.spilled = true;
+        saved = extra + body.maxValue;
+        if (saved > JIT_MAX_SAVED) {
+            e.whyNot = "the operand stack alone exceeds the registers";
+        }
     }
     if (e.whyNot != NULL) {
         if (getenv("JAI_JIT_WHY")) {
@@ -1928,6 +2036,11 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     e.savedCount = saved;
     e.callsOut   = body.callsOut;
     unsigned frame = 16u + 8u * saved;
+    if (e.spilled) {
+        e.localsFrameOffset = frame;
+        frame += 8u * e.locals;
+        frame = (frame + 7u) & ~7u;
+    }
     if (e.callsOut) {
         e.descOffset = frame;
         frame += (unsigned)sizeof(JitCallDesc);
@@ -1944,7 +2057,11 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * dereferenced whatever was there. */
     unsigned realArgs = e.usesUpvalues ? argCount - 1u : argCount;
     for (unsigned i = 0; i < realArgs; i++) {
-        emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
+        if (e.spilled) {
+            emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, e.base + i)));
+        } else {
+            emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
+        }
     }
     if (e.usesUpvalues) {
         emit(&e, jaiA64MovX(closureReg(&e), realArgs));
@@ -1954,7 +2071,13 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * belt and braces -- but a register holding the last call's value would be
      * a bug that only shows up under recursion. */
     for (unsigned i = realArgs; i < e.locals; i++) {
-        emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
+        if (e.spilled) {
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_C, 0, 0));
+            emit(&e, jaiA64StrX(JIT_SCRATCH_C, 31,
+                                localFrameOff(&e, e.base + i)));
+        } else {
+            emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
+        }
     }
     /* Stack guard: bail rather than run off the end of the thread's stack,
      * so that runaway recursion still becomes a RecursionError. */
@@ -2025,6 +2148,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             if (tag == VAL_NULL) {
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+            } else if (e.spilled) {
+                emit(&e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                                    localFrameOff(&e, slot)));
+                emit(&e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, at + 8));
             } else {
                 emit(&e, jaiA64StrX(JIT_FIRST_SAVED + i, JIT_SCRATCH_A, at + 8));
             }
@@ -2050,7 +2177,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
                                               : VAL_OBJ;
-            unsigned reg = JIT_FIRST_SAVED + e.locals +
+            unsigned reg = JIT_FIRST_SAVED + regBase(&e) +
                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
             valueSeen++;
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
