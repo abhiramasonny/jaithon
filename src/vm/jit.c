@@ -1,5 +1,7 @@
 #include "jit.h"
 
+#include "vm.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -17,13 +19,70 @@ bool jaiJitEnabled(void) {
     return cached != 0;
 }
 
-/* Always declines. The interpreter then runs the function, which is what makes
- * this safe to land: the counter and the threshold are exercised by the whole
- * test suite while the answer is still produced entirely by the interpreter. */
-bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
-    (void)closure;
-    (void)slotBase;
+/* The one arena every compiled function lives in. Never freed: a compiled
+ * function is reachable for the life of the process, and reclaiming code while
+ * a frame might return into it is a whole problem this tier does not have yet.
+ */
+static JaiCodeArena sArena;
+static bool sArenaReady;
+
+static bool arenaReady(void) {
+    if (!sArenaReady) {
+        if (!jaiCodeArenaInit(&sArena, 1u << 20)) return false;
+        sArenaReady = true;
+    }
+    return true;
+}
+
+/* The compiled tier's entire repertoire, for now: a body that is exactly
+ * `OP_RETURN_NULL`.
+ *
+ * Useless as an optimisation -- such a function is not hot and returning null
+ * is not slow. That is deliberate. It is the smallest thing that proves the
+ * hard part: that generated code can be entered from the interpreter, run, and
+ * returned from, leaving the stack exactly as OP_RETURN would. Everything after
+ * this widens the set of opcodes; nothing after this changes the mechanism. */
+static bool compileReturnNull(ObjFunction *fn) {
+    if (fn->chunk.count != 1 || fn->chunk.code[0] != OP_RETURN_NULL) return false;
+    if (!arenaReady() || sArena.sealed) return false;
+
+#if defined(__aarch64__) || defined(__arm64__)
+    /* mov w0, #0 ; ret -- the return value is carried by the C caller below,
+     * so the generated code only has to come back. */
+    const uint32_t code[] = { 0x52800000u, 0xd65f03c0u };
+#elif defined(__x86_64__)
+    /* xor eax, eax ; ret */
+    const uint8_t code[] = { 0x31, 0xc0, 0xc3 };
+#else
     return false;
+#endif
+
+    uint8_t *entry = jaiCodeArenaWrite(&sArena, code, sizeof code);
+    if (entry == NULL) return false;
+    /* Sealing the whole arena after one function is wasteful and temporary: a
+     * real tier writes many functions and seals in batches. It is correct,
+     * which is what this step is for. */
+    if (!jaiCodeArenaSeal(&sArena)) return false;
+    fn->jitCode = entry;
+    return true;
+}
+
+typedef int (*JaiCompiledFn)(void);
+
+bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
+    ObjFunction *fn = closure->fn;
+
+    if (fn->jitCode == NULL && !compileReturnNull(fn)) return false;
+
+    /* Entering and leaving generated code. Nothing is passed yet because the
+     * only compiled body ignores everything. */
+    (void)((JaiCompiledFn)fn->jitCode)();
+
+    /* The contract in jit.h: the call is complete, the frame was never pushed,
+     * and the result sits at slotBase[0]. */
+    slotBase[0] = NULL_VAL;
+    vm.stackTop = slotBase + 1;
+    return true;
 }
 
 /* ------------------------------------------------------------------ */

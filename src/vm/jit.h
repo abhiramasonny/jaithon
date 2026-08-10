@@ -22,9 +22,30 @@
 
 /* Called on entry to a Jaithon function once it has crossed the threshold.
  *
- * Returns false when there is no compiled form, which is always, today. A true
- * answer will mean the function ran to completion in compiled code and left its
- * result where the interpreter expects it. */
+ * THE BOUNDARY CONTRACT, which is the whole safety argument:
+ *
+ *   On false -- nothing has been touched. `vm.stackTop` and the frame stack are
+ *   exactly as they were, and the interpreter proceeds as if this was never
+ *   called. Declining must be free of side effects, because it is the path
+ *   every unsupported function takes.
+ *
+ *   On true -- the call is COMPLETE. The callee's frame was never pushed, the
+ *   arguments and callee slot are gone, and the single return value sits at
+ *   `slotBase[0]` with `vm.stackTop == slotBase + 1`. That is precisely the
+ *   state `OP_RETURN` leaves behind, so the caller cannot tell which tier ran.
+ *
+ * Why the frame is never pushed: a compiled region has no `CallFrame`, so a
+ * traceback taken inside it would show the caller's frame and nothing else.
+ * That is acceptable only because compiled regions cannot yet throw, call, or
+ * allocate. The moment one of those becomes possible, this contract needs a
+ * frame -- or a way to reconstruct one -- and that is the next hard problem
+ * rather than a detail.
+ *
+ * The interpreter caches `ip` and `stackTop` in locals across an instruction
+ * (`SAVE_STATE`/`LOAD_STATE` in vm.c). `callClosure` is called from a point
+ * where that state is already saved, so this runs against memory that is
+ * current -- but anything here that re-enters the VM has to save and restore it
+ * the same way. */
 bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
 
 /* Whether the tier is enabled at all. JAITHON_NO_JIT=1 turns it off, so a
