@@ -354,8 +354,9 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena
+test: $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arena
+	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
@@ -375,13 +376,19 @@ verify-test: $(BUILD)/verify_chunk
 # nothing in the language reaches it yet, and because the failure it guards --
 # a stale instruction cache on arm64 -- returns a plausible wrong number rather
 # than crashing.
-$(BUILD)/jit_arena: tests/jit_arena.c src/vm/jit.c | $(CC_STAMP)
+$(BUILD)/jit_arena: tests/jit_arena.c src/vm/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -o $@ tests/jit_arena.c src/vm/jit.c
+	@$(CC) $(CFLAGS) -o $@ tests/jit_arena.c src/vm/jit_arena.c
+
+# The arm64 encoders, each verified by executing the instruction it builds.
+$(BUILD)/jit_arm64: tests/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c | $(CC_STAMP)
+	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) -o $@ tests/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c
 
 .PHONY: jit-test
-jit-test: $(BUILD)/jit_arena
+jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arena
+	@$(BUILD)/jit_arm64
 
 bench: $(TARGET)
 	@./scripts/run_bench.sh
