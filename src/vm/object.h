@@ -228,6 +228,9 @@ struct ObjFunction {
      * it to decide when a function is worth compiling; it costs one increment
      * on the call path and stops counting once hot. */
     uint16_t    entryCount;
+    /* Entry point of this function's compiled form, or NULL. Owned by the JIT's
+     * arena, which outlives every function, so this is not freed here. */
+    void       *jitCode;
     /* Code offsets of the default-value thunks, indexed from arity-defaultCount. */
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */
