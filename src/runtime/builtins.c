@@ -211,6 +211,8 @@ void jaiRegisterAllBuiltins(void) {
     jaiRegisterCoreBuiltins();
 
     jaiRegisterMathPrimitives();
+    jaiRegisterCanvasPrimitives();
+    jaiRegisterCompressPrimitives();
     jaiRegisterStringPrimitives();
     jaiRegisterListPrimitives();
     jaiRegisterDictPrimitives();
