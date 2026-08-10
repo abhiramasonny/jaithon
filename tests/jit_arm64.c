@@ -363,10 +363,18 @@ int main(void) {
       check("fmov x->d is a bit move", dbits(d[0]), dbits(1.0));
       check("fmov x->d result is a number", dbits(d[1]), dbits(2.0)); }
 
-    /* scvtf on a negative, built with movn so no fp constant is involved */
+    /* scvtf on a negative, built with movn so no fp constant is involved,
+     * and then on a value with nothing in its low 32 bits. The source width
+     * is one bit of the encoding, and a 32-bit scvtf would read only the low
+     * half of x17 and answer 0.0 while still looking like a conversion. */
     { const uint32_t w[] = { jaiA64MovnX(1, 4), jaiA64ScvtfDX(0, 1),
                              jaiA64FmovXD(0, 0), jaiA64Ret() };
-      check("scvtf negative", runWith(w, 4, cell), dbits(-5.0)); }
+      check("scvtf negative", runWith(w, 4, cell), dbits(-5.0));
+      const uint32_t w2[] = { jaiA64MovzX(17, 1, 2),   /* x17 = 1 << 32 */
+                              jaiA64ScvtfDX(0, 17),
+                              jaiA64FmovXD(0, 0), jaiA64Ret() };
+      check("scvtf reads all 64 bits", runWith(w2, 4, cell),
+            dbits(4294967296.0)); }
 
     /* fcvtzs truncates toward zero rather than rounding to nearest, and it
      * truncates toward zero on negatives too -- which is the difference
