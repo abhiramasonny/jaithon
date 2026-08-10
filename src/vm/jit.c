@@ -132,7 +132,10 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
             return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
         }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {
-            fn->jitRefused = true;
+            /* Same reasoning as the loop tier: a body that calls something not
+             * yet compiled may compile perfectly well a moment later. */
+            if (++fn->jitAttempts >= 5) fn->jitRefused = true;
+            else fn->entryCount = 0;
             return false;
         }
     }
