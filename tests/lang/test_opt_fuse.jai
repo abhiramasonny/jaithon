@@ -218,14 +218,19 @@ fn test_subtraction_is_never_folded_into_an_increment() -> void {
     # INC_LOCAL's slow path adds, so folding `-=` into it would report
     # "unsupported operand types for '+'" for `y - 1` on a str. A fused form may
     # be a fast path and nothing else.
+    #
+    # `SUB; BIND` does fuse, into SUB_BIND, whose slow path subtracts. What must
+    # not happen is the *increment*, which is why this pins the opcode rather
+    # than merely counting fusions.
     let code = _op16(Op.GetLocal, 1) +
         _op16(Op.Int, 1) +
         _one(Op.Sub) +
         _op16(Op.Bind, 1) +
         _one(Op.ReturnNull)
     let proto = _proto(code)
-    assert_eq(superinstructions(proto), 0)
-    assert_eq(proto.chunk.code, code)
+    superinstructions(proto)
+    assert_true(not proto.chunk.code.contains(opcode(Op.IncLocal)))
+    assert_true(not proto.chunk.code.contains(opcode(Op.AddIntConst)))
 }
 
 fn test_a_field_read_off_a_local_keeps_its_name_and_cache() -> void {

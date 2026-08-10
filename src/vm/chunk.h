@@ -174,6 +174,8 @@ typedef enum {
      * The net stack effect matches the pair, so what produced either operand
      * does not matter. */
     OP_ADD_BIND,             /* u16 S */
+    OP_SUB_BIND,             /* u16 S */
+    OP_MUL_BIND,             /* u16 S */
 
     OP_COUNT
 } OpCode;
