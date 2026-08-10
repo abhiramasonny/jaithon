@@ -951,6 +951,7 @@ ObjFunction *jaiFunctionNew(void) {
     fn->entryCount = 0;
     fn->jitCode = NULL;
     fn->jitKind = 0;
+    fn->jitRefused = false;
     fn->tickCount = 0;
     fn->jitLoop = NULL;
     fn->jitLoopExit = 0;

@@ -122,7 +122,10 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
 
     if (fn->jitCode == NULL) {
-        if (!compileReturnNull(fn) && !compileAccessor(fn)) return false;
+        if (!compileReturnNull(fn) && !compileAccessor(fn)) {
+            fn->jitRefused = true;
+            return false;
+        }
     }
 
     if (fn->jitKind == 1) {
