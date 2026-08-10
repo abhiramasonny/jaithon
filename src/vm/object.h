@@ -240,6 +240,9 @@ struct ObjFunction {
      * built. Compiled code resolved this function's own name once; if any
      * global has moved since, the compiled form is retired. */
     uint32_t    jitModuleVersion;
+    /* A builtin resolved at compile time is pinned by the builtins module's
+     * own version, the same way a module global is pinned by its module's. */
+    uint32_t    jitBuiltinsVersion;
     /* What the compiled form was specialised to: the kind of each parameter,
      * the class shape where that kind is an instance, and the kind it returns.
      * The entry guard re-checks every one on every call. */
