@@ -3220,7 +3220,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if ((e.count & 1u) != 0) emit(&e, jaiA64Nop());
     e.limitLiteral = (int)e.count;
     uintptr_t limit = stackLimit();
-    if (limit == 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (limit == 0) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: no stack bound available\n",
+                    fn->name ? fn->name->chars : "<anon>");
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
     emit(&e, (uint32_t)(uint64_t)limit);
     emit(&e, (uint32_t)((uint64_t)limit >> 32));
 
@@ -3250,15 +3257,39 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         } else if (f->targetOffset <= FIXUP_EXIT &&
                    f->targetOffset > FIXUP_EXIT - 8u) {
             target = e.exitStub[FIXUP_EXIT - f->targetOffset];
-            if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+            if (target < 0) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: a stub it branches to "
+                                    "was never emitted\n",
+                            fn->name ? fn->name->chars : "<anon>");
+                }
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
         } else if (f->targetOffset <= FIXUP_DEOPT &&
                    f->targetOffset > FIXUP_DEOPT - JIT_MAX_DEOPT) {
             target = e.deopt[FIXUP_DEOPT - f->targetOffset].stub;
-            if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+            if (target < 0) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: a stub it branches to "
+                                    "was never emitted\n",
+                            fn->name ? fn->name->chars : "<anon>");
+                }
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
         } else if (f->targetOffset <= FIXUP_OVF &&
                    f->targetOffset >= FIXUP_OVF - 2u) {
             target = e.overflowStub[FIXUP_OVF - f->targetOffset];
-            if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+            if (target < 0) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: a stub it branches to "
+                                    "was never emitted\n",
+                            fn->name ? fn->name->chars : "<anon>");
+                }
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
         } else if (f->targetOffset == FIXUP_ENTRY) {
             target = 0;
         } else {
@@ -3278,6 +3309,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * checked here and the function is declined rather than
              * mis-compiled. */
             if (f->depth >= 0 && depths[f->targetOffset] != f->depth) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: offset %u is reached "
+                                    "with two different operand stacks\n",
+                            fn->name ? fn->name->chars : "<anon>",
+                            f->targetOffset);
+                }
                 jitFree(map, depths, fn->chunk.count + 1);
                 return false;
             }
