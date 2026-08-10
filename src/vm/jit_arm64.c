@@ -273,6 +273,11 @@ uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm) {
 }
 
 /* ldrb w<rd>, [x<rn>, #imm12] -- one unsigned byte, zero-extended. */
+/* csel x<rd>, x<rn>, x<rm>, <cond> -- rn when the condition holds, else rm. */
+uint32_t jaiA64CselX(unsigned rd, unsigned rn, unsigned rm, unsigned cond) {
+    return 0x9a800000u | (rm << 16) | ((cond & 0xfu) << 12) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset) {
     return 0x39400000u | ((offset & 0xfffu) << 10) | (rn << 5) | rd;
 }

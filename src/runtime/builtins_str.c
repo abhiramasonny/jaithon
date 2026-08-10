@@ -20,6 +20,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------ */
 /* Unicode: simple case mapping and classification                      */
@@ -35,26 +36,29 @@
 typedef struct { int32_t lo, hi; } CpRange;
 
 /* The range tables are sorted, so a miss costs log2(n) comparisons. */
-static bool inRanges(int32_t cp, const CpRange *ranges, size_t count) {
+static inline bool inRanges(int32_t cp, const CpRange *ranges, size_t count) {
     size_t lo = 0, hi = count;
+
     while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (cp < ranges[mid].lo)      hi = mid;
-        else if (cp > ranges[mid].hi) lo = mid + 1;
-        else return true;
+        const size_t mid = lo + ((hi - lo) >> 1);
+        if (cp < ranges[mid].lo)
+            hi = mid;
+        else if (cp > ranges[mid].hi)
+            lo = mid + 1;
+        else
+            return true;
     }
+
     return false;
 }
 
 /* Blocks laid out as (even = capital, odd = small) pairs, and the reverse. */
-static int32_t evenPair(int32_t c, bool up) {
-    if (up) return (c & 1) ? c - 1 : c;
-    return (c & 1) ? c : c + 1;
+static inline int32_t evenPair(int32_t c, bool up) {
+    return up ? ((c & 1) ? c - 1 : c) : ((c & 1) ? c : c + 1);
 }
 
-static int32_t oddPair(int32_t c, bool up) {
-    if (up) return (c & 1) ? c : c - 1;
-    return (c & 1) ? c + 1 : c;
+static inline int32_t oddPair(int32_t c, bool up) {
+    return up ? ((c & 1) ? c : c - 1) : ((c & 1) ? c + 1 : c);
 }
 
 static int32_t caseMap(int32_t c, bool up) {
@@ -125,13 +129,23 @@ static int32_t caseMap(int32_t c, bool up) {
     return c;
 }
 
-static int32_t upperCp(int32_t c) { return caseMap(c, true); }
-static int32_t lowerCp(int32_t c) { return caseMap(c, false); }
+static inline int32_t upperCp(int32_t c) {
+    return caseMap(c, true);
+}
+static inline int32_t lowerCp(int32_t c) {
+    return caseMap(c, false);
+}
 
 /* A scalar is cased when either mapping moves it. */
-static bool isCasedCp(int32_t c)  { return upperCp(c) != c || lowerCp(c) != c; }
-static bool isUpperCp(int32_t c)  { return lowerCp(c) != c; }
-static bool isLowerCp(int32_t c)  { return upperCp(c) != c; }
+static inline bool isCasedCp(int32_t c) {
+    return upperCp(c) != c || lowerCp(c) != c;
+}
+static inline bool isUpperCp(int32_t c) {
+    return lowerCp(c) != c;
+}
+static inline bool isLowerCp(int32_t c) {
+    return upperCp(c) != c;
+}
 
 static const CpRange kDigitRanges[] = {
     {0x0030, 0x0039}, {0x0660, 0x0669}, {0x06F0, 0x06F9}, {0x07C0, 0x07C9},
@@ -165,19 +179,27 @@ static const CpRange kSpaceRanges[] = {
     {0x202F, 0x202F}, {0x205F, 0x205F}, {0x3000, 0x3000},
 };
 
-static bool isDigitCp(int32_t c) {
-    if (c >= '0' && c <= '9') return true;
+static inline bool isDigitCp(int32_t c) {
+    if ((uint32_t)c < 0x80u)
+        return c >= '0' && c <= '9';
+
     return inRanges(c, kDigitRanges, JAI_COUNT_OF(kDigitRanges));
 }
 
-static bool isAlphaCp(int32_t c) {
-    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    if (isCasedCp(c)) return true;
+static inline bool isAlphaCp(int32_t c) {
+    if ((uint32_t)c < 0x80u)
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+
+    if (isCasedCp(c))
+        return true;
+
     return inRanges(c, kLetterRanges, JAI_COUNT_OF(kLetterRanges));
 }
 
-static bool isSpaceCp(int32_t c) {
-    if (c == ' ' || (c >= 0x09 && c <= 0x0D)) return true;
+static inline bool isSpaceCp(int32_t c) {
+    if ((uint32_t)c < 0x80u)
+        return c == ' ' || (c >= 0x09 && c <= 0x0D);
+
     return inRanges(c, kSpaceRanges, JAI_COUNT_OF(kSpaceRanges));
 }
 
@@ -187,51 +209,88 @@ static bool isSpaceCp(int32_t c) {
 
 /* True when scalar index and byte offset coincide, which lets every offset
  * conversion below become a no-op for ASCII text. */
-static bool isAscii(ObjString *s) {
+static inline bool isAscii(ObjString *s) {
     return (size_t)jaiStringScalarCount(s) == (size_t)s->length;
 }
 
 /* Byte offset of scalar `index`; clamped to the byte length when past the end. */
 size_t jaiStrByteOffsetOf(ObjString *s, size_t index) {
-    if (isAscii(s)) return index < s->length ? index : s->length;
-    return jaiUtf8Offset(s->chars, s->length, index);
+    const size_t length = (size_t)s->length;
+
+    if ((size_t)jaiStringScalarCount(s) == length)
+        return index < length ? index : length;
+
+    return jaiUtf8Offset(s->chars, length, index);
 }
 
 /* Scalar index of a byte offset that sits on a scalar boundary. */
-static size_t scalarIndexOf(ObjString *s, size_t offset) {
-    if (isAscii(s)) return offset;
+static inline size_t scalarIndexOf(ObjString *s, size_t offset) {
+    if ((size_t)jaiStringScalarCount(s) == (size_t)s->length)
+        return offset;
+
     return jaiUtf8Length(s->chars, offset);
 }
 
 /* Resolves an optional [start, end) scalar window: negatives count from the
  * end, out-of-range bounds clamp, and an inverted window comes back empty. */
-static void resolveWindow(ObjString *s, int64_t start, int64_t end,
-                          size_t *outStart, size_t *outEnd) {
-    int64_t n = (int64_t)jaiStringScalarCount(s);
-    if (start < 0) { start += n; if (start < 0) start = 0; }
+static inline void resolveWindow(ObjString *s, int64_t start, int64_t end,
+                                 size_t *outStart, size_t *outEnd) {
+    const size_t byteLength = (size_t)s->length;
+    const size_t scalarCount = (size_t)jaiStringScalarCount(s);
+    const int64_t n = (int64_t)scalarCount;
+
+    if (start < 0) {
+        start += n;
+        if (start < 0) start = 0;
+    }
     if (start > n) start = n;
-    if (end < 0)   { end += n;   if (end < 0)   end = 0; }
-    if (end > n)   end = n;
+
+    if (end < 0) {
+        end += n;
+        if (end < 0) end = 0;
+    }
+    if (end > n) end = n;
     if (end < start) end = start;
-    *outStart = jaiStrByteOffsetOf(s, (size_t)start);
-    *outEnd   = jaiStrByteOffsetOf(s, (size_t)end);
+
+    if (scalarCount == byteLength) {
+        *outStart = (size_t)start;
+        *outEnd = (size_t)end;
+        return;
+    }
+
+    *outStart = jaiUtf8Offset(s->chars, byteLength, (size_t)start);
+    *outEnd = jaiUtf8Offset(s->chars, byteLength, (size_t)end);
 }
 
 /* First occurrence of `needle` in `hay`, or NULL. memchr narrows the scan to
  * the candidate starts, which is what makes the naive loop acceptable. */
 const char *jaiStrFindBytes(const char *hay, size_t hayLen,
-                             const char *needle, size_t needleLen) {
+                            const char *needle, size_t needleLen) {
     if (needleLen == 0) return hay;
     if (needleLen > hayLen) return NULL;
+
+    if (needleLen == 1)
+        return (const char *)memchr(hay, (unsigned char)needle[0], hayLen);
+
+    const unsigned char first = (unsigned char)needle[0];
+    const unsigned char last = (unsigned char)needle[needleLen - 1];
     const char *p = hay;
     size_t remaining = hayLen - needleLen + 1;
-    while (remaining > 0) {
-        const char *hit = (const char *)memchr(p, needle[0], remaining);
+
+    while (remaining) {
+        const char *hit = (const char *)memchr(p, first, remaining);
         if (hit == NULL) return NULL;
-        if (memcmp(hit, needle, needleLen) == 0) return hit;
-        remaining -= (size_t)(hit - p) + 1;
-        p = hit + 1;
+
+        if ((unsigned char)hit[needleLen - 1] == last &&
+            (needleLen == 2 ||
+             memcmp(hit + 1, needle + 1, needleLen - 2) == 0))
+            return hit;
+
+        const size_t consumed = (size_t)(hit - p) + 1;
+        p += consumed;
+        remaining -= consumed;
     }
+
     return NULL;
 }
 
@@ -239,20 +298,50 @@ static const char *rfindBytes(const char *hay, size_t hayLen,
                               const char *needle, size_t needleLen) {
     if (needleLen == 0) return hay + hayLen;
     if (needleLen > hayLen) return NULL;
-    for (size_t i = hayLen - needleLen + 1; i > 0; i--) {
-        if (memcmp(hay + i - 1, needle, needleLen) == 0) return hay + i - 1;
+
+    if (needleLen == 1) {
+        const unsigned char target = (unsigned char)needle[0];
+        for (size_t i = hayLen; i != 0; --i) {
+            if ((unsigned char)hay[i - 1] == target)
+                return hay + i - 1;
+        }
+        return NULL;
     }
+
+    const unsigned char first = (unsigned char)needle[0];
+    const unsigned char last = (unsigned char)needle[needleLen - 1];
+    size_t i = hayLen - needleLen;
+
+    for (;;) {
+        const char *candidate = hay + i;
+
+        if ((unsigned char)candidate[0] == first &&
+            (unsigned char)candidate[needleLen - 1] == last &&
+            (needleLen == 2 ||
+             memcmp(candidate + 1, needle + 1, needleLen - 2) == 0))
+            return candidate;
+
+        if (i == 0) break;
+        --i;
+    }
+
     return NULL;
 }
 
-static bool cpInSet(int32_t cp, ObjString *set) {
+static inline bool cpInSet(int32_t cp, ObjString *set) {
+    if ((uint32_t)cp < 0x80u)
+        return memchr(set->chars, (unsigned char)cp, set->length) != NULL;
+
     const char *p = set->chars;
-    const char *end = p + set->length;
+    const char *const end = p + set->length;
+
     while (p < end) {
         int len = 1;
-        if (jaiUtf8Decode(p, end, &len) == cp) return true;
+        if (jaiUtf8Decode(p, end, &len) == cp)
+            return true;
         p += len;
     }
+
     return false;
 }
 
@@ -262,16 +351,22 @@ static bool cpInSet(int32_t cp, ObjString *set) {
 
 /* A bound native receives the receiver as args[0] and argc counts it, so every
  * body below reads its declared arguments from args[1] onwards. */
-static bool strReceiver(int argc, Value *args, const char *method,
-                        ObjString **out) {
-    if (argc >= 1 && args != NULL && IS_STRING(args[0])) {
-        *out = AS_STRING(args[0]);
-        return true;
+static inline bool strReceiver(int argc, Value *args, const char *method,
+                               ObjString **out) {
+    if (argc >= 1 && args != NULL) {
+        const Value self = args[0];
+        if (IS_STRING(self)) {
+            *out = AS_STRING(self);
+            return true;
+        }
+
+        return jaiThrow(vm.cTypeError,
+                        "str.%s() needs a str receiver, got %s",
+                        method, jaiTypeNameStatic(self));
     }
-    return jaiThrow(vm.cTypeError, "str.%s() needs a str receiver, got %s",
-                    method,
-                    (argc >= 1 && args != NULL) ? jaiTypeNameStatic(args[0])
-                                                : "nothing");
+
+    return jaiThrow(vm.cTypeError,
+                    "str.%s() needs a str receiver, got nothing", method);
 }
 
 /* Turns a finished buffer into a str Value, consuming the buffer either way. */
@@ -311,9 +406,14 @@ bool jaiStrOptInt(int argc, Value *args, int slot, const char *method,
 
 /* An absent or null argument yields NULL, which every caller reads as "use the
  * default character set". */
-static bool optStr(int argc, Value *args, int slot, const char *method,
-                   const char *what, ObjString **out) {
-    if (argc <= slot || IS_NULL(args[slot])) { *out = NULL; return true; }
+static inline bool optStr(int argc, Value *args, int slot,
+                          const char *method, const char *what,
+                          ObjString **out) {
+    if (argc <= slot || IS_NULL(args[slot])) {
+        *out = NULL;
+        return true;
+    }
+
     return jaiStrWantStr(args[slot], method, what, out);
 }
 
@@ -330,22 +430,72 @@ static bool strLen(int argc, Value *args, Value *out) {
 
 /* Shared body for upper/lower: `up` selects the mapping direction. */
 static bool mapCase(ObjString *s, bool up, Value *out) {
+    const size_t length = (size_t)s->length;
+
+    /* Pure ASCII is overwhelmingly common and case mapping cannot change its
+     * byte length, so write the result exactly once. */
+    bool ascii = true;
+    for (size_t i = 0; i < length; ++i) {
+        if ((unsigned char)s->chars[i] & 0x80u) {
+            ascii = false;
+            break;
+        }
+    }
+
+    if (ascii && length != 0) {
+        ObjString *result = jaiStringReserve(length);
+        if (result == NULL) return false;
+
+        for (size_t i = 0; i < length; ++i) {
+            unsigned char c = (unsigned char)s->chars[i];
+            if (up) {
+                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            } else {
+                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+            }
+            result->chars[i] = (char)c;
+        }
+
+        *out = OBJ_VAL(jaiStringSeal(result));
+        return true;
+    }
+
     JaiBuf buf;
     jaiBufInit(&buf);
+    jaiBufReserve(&buf, length + 1);
+
     const char *p = s->chars;
-    const char *end = p + s->length;
+    const char *const end = p + length;
+
     while (p < end) {
+        const unsigned char c = (unsigned char)*p;
+
+        if (c < 0x80u) {
+            char mapped = (char)c;
+            if (up) {
+                if (mapped >= 'a' && mapped <= 'z') mapped -= 32;
+            } else {
+                if (mapped >= 'A' && mapped <= 'Z') mapped += 32;
+            }
+            jaiBufPush(&buf, mapped);
+            ++p;
+            continue;
+        }
+
         int len = 1;
-        int32_t cp = jaiUtf8Decode(p, end, &len);
+        const int32_t cp = jaiUtf8Decode(p, end, &len);
+
         if (cp < 0) {
-            jaiBufAppend(&buf, p, (size_t)len);   /* invalid bytes pass through */
+            jaiBufAppend(&buf, p, (size_t)len);
         } else {
             char utf8[4];
-            int n = jaiUtf8Encode(caseMap(cp, up), utf8);
+            const int n = jaiUtf8Encode(caseMap(cp, up), utf8);
             if (n > 0) jaiBufAppend(&buf, utf8, (size_t)n);
         }
+
         p += len;
     }
+
     return jaiStrTakeBuf(&buf, out);
 }
 
@@ -367,26 +517,86 @@ static bool strTitle(int argc, Value *args, Value *out) {
     ObjString *s;
     if (!strReceiver(argc, args, "title", &s)) return false;
 
+    const size_t length = (size_t)s->length;
+    bool ascii = true;
+    for (size_t i = 0; i < length; ++i) {
+        if ((unsigned char)s->chars[i] & 0x80u) {
+            ascii = false;
+            break;
+        }
+    }
+
+    if (ascii && length != 0) {
+        ObjString *result = jaiStringReserve(length);
+        if (result == NULL) return false;
+
+        bool startOfWord = true;
+        for (size_t i = 0; i < length; ++i) {
+            unsigned char c = (unsigned char)s->chars[i];
+            const bool alpha =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+            const bool digit = c >= '0' && c <= '9';
+            const bool inWord = alpha || digit;
+
+            if (startOfWord && inWord) {
+                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            } else {
+                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+            }
+
+            result->chars[i] = (char)c;
+            startOfWord = !inWord;
+        }
+
+        *out = OBJ_VAL(jaiStringSeal(result));
+        return true;
+    }
+
     JaiBuf buf;
     jaiBufInit(&buf);
+    jaiBufReserve(&buf, length + 1);
+
     const char *p = s->chars;
-    const char *end = p + s->length;
+    const char *const end = p + length;
     bool startOfWord = true;
+
     while (p < end) {
+        if ((unsigned char)*p < 0x80u) {
+            unsigned char c = (unsigned char)*p++;
+            const bool alpha =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+            const bool digit = c >= '0' && c <= '9';
+            const bool inWord = alpha || digit;
+
+            if (startOfWord && inWord) {
+                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            } else {
+                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+            }
+
+            jaiBufPush(&buf, (char)c);
+            startOfWord = !inWord;
+            continue;
+        }
+
         int len = 1;
-        int32_t cp = jaiUtf8Decode(p, end, &len);
+        const int32_t cp = jaiUtf8Decode(p, end, &len);
+
         if (cp < 0) {
             jaiBufAppend(&buf, p, (size_t)len);
             startOfWord = true;
         } else {
-            bool inWord = isAlphaCp(cp) || isDigitCp(cp);
+            const bool inWord = isAlphaCp(cp) || isDigitCp(cp);
             char utf8[4];
-            int n = jaiUtf8Encode(caseMap(cp, startOfWord && inWord), utf8);
+            const int n =
+                jaiUtf8Encode(caseMap(cp, startOfWord && inWord), utf8);
             if (n > 0) jaiBufAppend(&buf, utf8, (size_t)n);
             startOfWord = !inWord;
         }
+
         p += len;
     }
+
     return jaiStrTakeBuf(&buf, out);
 }
 
@@ -394,24 +604,71 @@ static bool strCapitalize(int argc, Value *args, Value *out) {
     ObjString *s;
     if (!strReceiver(argc, args, "capitalize", &s)) return false;
 
+    const size_t length = (size_t)s->length;
+    bool ascii = true;
+    for (size_t i = 0; i < length; ++i) {
+        if ((unsigned char)s->chars[i] & 0x80u) {
+            ascii = false;
+            break;
+        }
+    }
+
+    if (ascii && length != 0) {
+        ObjString *result = jaiStringReserve(length);
+        if (result == NULL) return false;
+
+        for (size_t i = 0; i < length; ++i) {
+            unsigned char c = (unsigned char)s->chars[i];
+
+            if (i == 0) {
+                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            } else {
+                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+            }
+
+            result->chars[i] = (char)c;
+        }
+
+        *out = OBJ_VAL(jaiStringSeal(result));
+        return true;
+    }
+
     JaiBuf buf;
     jaiBufInit(&buf);
+    jaiBufReserve(&buf, length + 1);
+
     const char *p = s->chars;
-    const char *end = p + s->length;
+    const char *const end = p + length;
     bool first = true;
+
     while (p < end) {
+        if ((unsigned char)*p < 0x80u) {
+            unsigned char c = (unsigned char)*p++;
+            if (first) {
+                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            } else {
+                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+            }
+            jaiBufPush(&buf, (char)c);
+            first = false;
+            continue;
+        }
+
         int len = 1;
-        int32_t cp = jaiUtf8Decode(p, end, &len);
+        const int32_t cp = jaiUtf8Decode(p, end, &len);
+
         if (cp < 0) {
             jaiBufAppend(&buf, p, (size_t)len);
         } else {
             char utf8[4];
-            int n = jaiUtf8Encode(caseMap(cp, first), utf8);
+            const int n = jaiUtf8Encode(caseMap(cp, first), utf8);
             if (n > 0) jaiBufAppend(&buf, utf8, (size_t)n);
         }
+
         first = false;
         p += len;
     }
+
     return jaiStrTakeBuf(&buf, out);
 }
 
@@ -422,29 +679,64 @@ static bool stripSides(ObjString *s, ObjString *set, bool left, bool right,
     const char *end = s->chars + s->length;
 
     while (left && begin < end) {
+        const unsigned char c = (unsigned char)*begin;
+
+        if (c < 0x80u) {
+            const bool remove =
+                set != NULL
+                    ? memchr(set->chars, c, set->length) != NULL
+                    : (c == ' ' || (c >= 0x09 && c <= 0x0D));
+
+            if (!remove) break;
+            ++begin;
+            continue;
+        }
+
         int len = 1;
-        int32_t cp = jaiUtf8Decode(begin, end, &len);
-        if (cp < 0) break;
-        if (!(set == NULL ? isSpaceCp(cp) : cpInSet(cp, set))) break;
+        const int32_t cp = jaiUtf8Decode(begin, end, &len);
+        if (cp < 0 || !(set == NULL ? isSpaceCp(cp) : cpInSet(cp, set)))
+            break;
+
         begin += len;
     }
+
     while (right && end > begin) {
-        /* Walk back over the continuation bytes to the scalar's first byte. */
+        const unsigned char c = (unsigned char)end[-1];
+
+        if (c < 0x80u) {
+            const bool remove =
+                set != NULL
+                    ? memchr(set->chars, c, set->length) != NULL
+                    : (c == ' ' || (c >= 0x09 && c <= 0x0D));
+
+            if (!remove) break;
+            --end;
+            continue;
+        }
+
         const char *start = end - 1;
-        while (start > begin && ((unsigned char)*start & 0xC0u) == 0x80u) start--;
+        while (start > begin &&
+               ((unsigned char)*start & 0xC0u) == 0x80u)
+            --start;
+
         int len = 1;
-        int32_t cp = jaiUtf8Decode(start, end, &len);
-        if (cp < 0 || start + len != end) break;
-        if (!(set == NULL ? isSpaceCp(cp) : cpInSet(cp, set))) break;
+        const int32_t cp = jaiUtf8Decode(start, end, &len);
+
+        if (cp < 0 || start + len != end ||
+            !(set == NULL ? isSpaceCp(cp) : cpInSet(cp, set)))
+            break;
+
         end = start;
     }
 
     if (begin == s->chars && end == s->chars + s->length) {
-        *out = OBJ_VAL(s);          /* nothing to strip; strings are immutable */
+        *out = OBJ_VAL(s);
         return true;
     }
+
     ObjString *result = jaiStringNew(begin, (size_t)(end - begin));
     if (result == NULL) return false;
+
     *out = OBJ_VAL(result);
     return true;
 }
@@ -488,76 +780,133 @@ static bool splitWhitespace(ObjString *s, int64_t maxsplit, bool fromRight,
                             Value *out) {
     ObjList *list = jaiListNew(0);
     jaiGCPushRoot(OBJ_VAL(list));
+
     bool ok = true;
-    const char *base = s->chars;
-    const char *end = base + s->length;
+    const char *const base = s->chars;
+    const char *const end = base + s->length;
 
     if (!fromRight) {
         const char *p = base;
         int64_t splits = 0;
+
         while (ok) {
-            while (p < end) {                       /* skip separators */
+            while (p < end) {
+                const unsigned char c = (unsigned char)*p;
+
+                if (c < 0x80u) {
+                    if (!(c == ' ' || (c >= 0x09 && c <= 0x0D)))
+                        break;
+                    ++p;
+                    continue;
+                }
+
                 int len = 1;
-                int32_t cp = jaiUtf8Decode(p, end, &len);
-                if (cp < 0 || !isSpaceCp(cp)) break;
+                const int32_t cp = jaiUtf8Decode(p, end, &len);
+                if (cp < 0 || !isSpaceCp(cp))
+                    break;
                 p += len;
             }
+
             if (p >= end) break;
+
             if (maxsplit >= 0 && splits >= maxsplit) {
                 ok = pushSlice(list, p, (size_t)(end - p));
-                p = end;
                 break;
             }
-            const char *fieldStart = p;
+
+            const char *const fieldStart = p;
+
             while (p < end) {
+                const unsigned char c = (unsigned char)*p;
+
+                if (c < 0x80u) {
+                    if (c == ' ' || (c >= 0x09 && c <= 0x0D))
+                        break;
+                    ++p;
+                    continue;
+                }
+
                 int len = 1;
-                int32_t cp = jaiUtf8Decode(p, end, &len);
-                if (cp >= 0 && isSpaceCp(cp)) break;
+                const int32_t cp = jaiUtf8Decode(p, end, &len);
+                if (cp >= 0 && isSpaceCp(cp))
+                    break;
                 p += len;
             }
+
             ok = pushSlice(list, fieldStart, (size_t)(p - fieldStart));
-            splits++;
+            ++splits;
         }
     } else {
-        /* Collect right to left, then reverse: the remainder must end up first
-         * even though it is the last field discovered. */
         const char *p = end;
         int64_t splits = 0;
+
         while (ok) {
             while (p > base) {
+                const unsigned char c = (unsigned char)p[-1];
+
+                if (c < 0x80u) {
+                    if (!(c == ' ' || (c >= 0x09 && c <= 0x0D)))
+                        break;
+                    --p;
+                    continue;
+                }
+
                 const char *start = p - 1;
-                while (start > base && ((unsigned char)*start & 0xC0u) == 0x80u) start--;
+                while (start > base &&
+                       ((unsigned char)*start & 0xC0u) == 0x80u)
+                    --start;
+
                 int len = 1;
-                int32_t cp = jaiUtf8Decode(start, p, &len);
-                if (cp < 0 || !isSpaceCp(cp)) break;
+                const int32_t cp = jaiUtf8Decode(start, p, &len);
+                if (cp < 0 || !isSpaceCp(cp))
+                    break;
                 p = start;
             }
+
             if (p <= base) break;
+
             if (maxsplit >= 0 && splits >= maxsplit) {
                 ok = pushSlice(list, base, (size_t)(p - base));
-                p = base;
                 break;
             }
-            const char *fieldEnd = p;
+
+            const char *const fieldEnd = p;
+
             while (p > base) {
+                const unsigned char c = (unsigned char)p[-1];
+
+                if (c < 0x80u) {
+                    if (c == ' ' || (c >= 0x09 && c <= 0x0D))
+                        break;
+                    --p;
+                    continue;
+                }
+
                 const char *start = p - 1;
-                while (start > base && ((unsigned char)*start & 0xC0u) == 0x80u) start--;
+                while (start > base &&
+                       ((unsigned char)*start & 0xC0u) == 0x80u)
+                    --start;
+
                 int len = 1;
-                int32_t cp = jaiUtf8Decode(start, p, &len);
-                if (cp >= 0 && isSpaceCp(cp)) break;
+                const int32_t cp = jaiUtf8Decode(start, p, &len);
+                if (cp >= 0 && isSpaceCp(cp))
+                    break;
                 p = start;
             }
+
             ok = pushSlice(list, p, (size_t)(fieldEnd - p));
-            splits++;
+            ++splits;
         }
-        for (int i = 0, j = list->count - 1; i < j; i++, j--) {
-            Value tmp = list->items[i];
+
+        for (int i = 0, j = list->count - 1; i < j; ++i, --j) {
+            const Value tmp = list->items[i];
             list->items[i] = list->items[j];
             list->items[j] = tmp;
         }
     }
 
     jaiGCPopRoot();
+
     if (!ok) return false;
     *out = OBJ_VAL(list);
     return true;
@@ -634,15 +983,26 @@ static bool strRsplit(int argc, Value *args, Value *out) {
 
 /* Byte length of the line terminator starting at `p`, or 0. Recognises the
  * whole Unicode set so that text from any platform round-trips. */
-static size_t lineBreakAt(const char *p, const char *end) {
-    unsigned char c = (unsigned char)*p;
-    if (c == '\r') return (p + 1 < end && p[1] == '\n') ? 2u : 1u;
-    if (c == '\n' || c == 0x0B || c == 0x0C || (c >= 0x1C && c <= 0x1E)) return 1;
-    if (c == 0xC2 && p + 1 < end && (unsigned char)p[1] == 0x85) return 2;  /* U+0085 */
-    if (c == 0xE2 && p + 2 < end && (unsigned char)p[1] == 0x80 &&
-        ((unsigned char)p[2] == 0xA8 || (unsigned char)p[2] == 0xA9)) {
-        return 3;                                                           /* U+2028/9 */
-    }
+static inline size_t lineBreakAt(const char *p, const char *end) {
+    const unsigned char c = (unsigned char)*p;
+
+    if (c == '\r')
+        return (p + 1 < end && p[1] == '\n') ? 2u : 1u;
+
+    if (c == '\n' || c == 0x0B || c == 0x0C ||
+        (c >= 0x1C && c <= 0x1E))
+        return 1u;
+
+    if (c == 0xC2 && p + 1 < end &&
+        (unsigned char)p[1] == 0x85)
+        return 2u;
+
+    if (c == 0xE2 && p + 2 < end &&
+        (unsigned char)p[1] == 0x80 &&
+        ((unsigned char)p[2] == 0xA8 ||
+         (unsigned char)p[2] == 0xA9))
+        return 3u;
+
     return 0;
 }
 
@@ -681,54 +1041,76 @@ static bool strSplitlines(int argc, Value *args, Value *out) {
     return true;
 }
 
-static bool joinItem(JaiBuf *buf, Value item, int index) {
+static inline bool joinItem(JaiBuf *buf, Value item, int index) {
     if (!IS_STRING(item)) {
         return jaiThrow(vm.cTypeError,
                         "str.join(): item %d is a %s, but every item must be a str",
                         index, jaiTypeNameStatic(item));
     }
-    jaiBufAppend(buf, AS_STRING(item)->chars, AS_STRING(item)->length);
+
+    ObjString *const s = AS_STRING(item);
+    jaiBufAppend(buf, s->chars, s->length);
     return true;
 }
 
 /* A list or tuple can be measured before it is copied, so the result is one
  * exactly-sized allocation written once. Everything else has to go through a
  * growable buffer, because an iterator's length is not known until it ends. */
-static bool joinSized(ObjString *sep, const Value *items, int count, Value *out) {
+static bool joinSized(ObjString *sep, const Value *items, int count,
+                      Value *out) {
+    const size_t sepLength = (size_t)sep->length;
     size_t total = 0;
-    for (int i = 0; i < count; i++) {
-        if (!IS_STRING(items[i])) {
+
+    for (int i = 0; i < count; ++i) {
+        const Value itemValue = items[i];
+
+        if (!IS_STRING(itemValue)) {
             return jaiThrow(vm.cTypeError,
                             "str.join(): item %d is a %s, but every item must "
-                            "be a str", i, jaiTypeNameStatic(items[i]));
+                            "be a str",
+                            i, jaiTypeNameStatic(itemValue));
         }
-        if (i > 0) total += sep->length;
-        total += AS_STRING(items[i])->length;
-        if (total > UINT32_MAX) {
-            return jaiThrow(vm.cOverflowError, "joined string exceeds the "
-                            "maximum length");
+
+        ObjString *const item = AS_STRING(itemValue);
+
+        if (i > 0) {
+            if (sepLength > UINT32_MAX - total)
+                return jaiThrow(vm.cOverflowError,
+                                "joined string exceeds the maximum length");
+            total += sepLength;
         }
+
+        if ((size_t)item->length > UINT32_MAX - total)
+            return jaiThrow(vm.cOverflowError,
+                            "joined string exceeds the maximum length");
+
+        total += item->length;
     }
+
     if (total == 0) {
         *out = OBJ_VAL(jaiStringIntern("", 0));
         return true;
     }
 
-    /* `items` survives the allocation: the sequence is an argument, so it is
-     * rooted, and the collector does not move objects. */
-    ObjString *s = jaiStringReserve(total);
-    if (s == NULL) return false;
-    char *o = s->chars;
-    for (int i = 0; i < count; i++) {
-        if (i > 0 && sep->length > 0) {
-            memcpy(o, sep->chars, sep->length);
-            o += sep->length;
+    ObjString *result = jaiStringReserve(total);
+    if (result == NULL) return false;
+
+    char *p = result->chars;
+
+    for (int i = 0; i < count; ++i) {
+        if (i > 0 && sepLength != 0) {
+            memcpy(p, sep->chars, sepLength);
+            p += sepLength;
         }
-        ObjString *item = AS_STRING(items[i]);
-        memcpy(o, item->chars, item->length);
-        o += item->length;
+
+        ObjString *const item = AS_STRING(items[i]);
+        if (item->length != 0) {
+            memcpy(p, item->chars, item->length);
+            p += item->length;
+        }
     }
-    *out = OBJ_VAL(jaiStringSeal(s));
+
+    *out = OBJ_VAL(jaiStringSeal(result));
     return true;
 }
 
@@ -785,6 +1167,7 @@ static bool strReplace(int argc, Value *args, Value *out) {
 
     JaiBuf buf;
     jaiBufInit(&buf);
+    jaiBufReserve(&buf, (size_t)s->length + 1);
     int64_t done = 0;
 
     if (old->length == 0) {
@@ -795,7 +1178,8 @@ static bool strReplace(int argc, Value *args, Value *out) {
         done++;
         while (p < end && (limit < 0 || done < limit)) {
             int len = 1;
-            (void)jaiUtf8Decode(p, end, &len);
+            if ((unsigned char)*p >= 0x80u)
+                (void)jaiUtf8Decode(p, end, &len);
             jaiBufAppend(&buf, p, (size_t)len);
             p += len;
             if (p <= end) {
@@ -878,7 +1262,11 @@ static bool strCount(int argc, Value *args, Value *out) {
     resolveWindow(s, start, end, &from, &to);
     if (sub->length == 0) {
         /* The empty string sits at every scalar boundary in the window. */
-        size_t scalars = scalarIndexOf(s, to) - scalarIndexOf(s, from);
+        const size_t totalScalars = (size_t)jaiStringScalarCount(s);
+        const size_t scalars =
+            totalScalars == (size_t)s->length
+                ? to - from
+                : jaiUtf8Length(s->chars + from, to - from);
         *out = INT_VAL((int64_t)scalars + 1);
         return true;
     }
@@ -936,32 +1324,112 @@ typedef enum { CLASS_DIGIT, CLASS_ALPHA, CLASS_ALNUM, CLASS_SPACE,
 
 static bool classifyAll(ObjString *s, CharClass kind, Value *out) {
     const char *p = s->chars;
-    const char *end = p + s->length;
+    const char *const end = p + s->length;
+
+    if (p == end) {
+        *out = BOOL_VAL(false);
+        return true;
+    }
+
     bool sawCased = false;
-    bool result = p < end;
+    bool result = true;
 
     while (p < end) {
+        int32_t cp;
+
+        const unsigned char c = (unsigned char)*p;
+        if (c < 0x80u) {
+            cp = (int32_t)c;
+            ++p;
+
+            switch (kind) {
+                case CLASS_DIGIT:
+                    result = c >= '0' && c <= '9';
+                    break;
+
+                case CLASS_ALPHA:
+                    result = (c >= 'a' && c <= 'z') ||
+                             (c >= 'A' && c <= 'Z');
+                    break;
+
+                case CLASS_ALNUM:
+                    result = (c >= '0' && c <= '9') ||
+                             (c >= 'a' && c <= 'z') ||
+                             (c >= 'A' && c <= 'Z');
+                    break;
+
+                case CLASS_SPACE:
+                    result = c == ' ' || (c >= 0x09 && c <= 0x0D);
+                    break;
+
+                case CLASS_UPPER:
+                    if (c >= 'a' && c <= 'z') result = false;
+                    if ((c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z'))
+                        sawCased = true;
+                    break;
+
+                case CLASS_LOWER:
+                    if (c >= 'A' && c <= 'Z') result = false;
+                    if ((c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z'))
+                        sawCased = true;
+                    break;
+            }
+
+            if (!result) break;
+            continue;
+        }
+
         int len = 1;
-        int32_t cp = jaiUtf8Decode(p, end, &len);
+        cp = jaiUtf8Decode(p, end, &len);
         p += len;
-        if (cp < 0) { result = false; break; }
-        switch (kind) {
-        case CLASS_DIGIT: if (!isDigitCp(cp)) result = false; break;
-        case CLASS_ALPHA: if (!isAlphaCp(cp)) result = false; break;
-        case CLASS_ALNUM: if (!isAlphaCp(cp) && !isDigitCp(cp)) result = false; break;
-        case CLASS_SPACE: if (!isSpaceCp(cp)) result = false; break;
-        case CLASS_UPPER:
-            if (isLowerCp(cp)) result = false;
-            if (isCasedCp(cp)) sawCased = true;
-            break;
-        case CLASS_LOWER:
-            if (isUpperCp(cp)) result = false;
-            if (isCasedCp(cp)) sawCased = true;
+
+        if (cp < 0) {
+            result = false;
             break;
         }
+
+        switch (kind) {
+            case CLASS_DIGIT:
+                result = isDigitCp(cp);
+                break;
+
+            case CLASS_ALPHA:
+                result = isAlphaCp(cp);
+                break;
+
+            case CLASS_ALNUM:
+                result = isAlphaCp(cp) || isDigitCp(cp);
+                break;
+
+            case CLASS_SPACE:
+                result = isSpaceCp(cp);
+                break;
+
+            case CLASS_UPPER: {
+                const int32_t upper = upperCp(cp);
+                const int32_t lower = lowerCp(cp);
+                if (upper != cp) result = false;
+                if (upper != cp || lower != cp) sawCased = true;
+                break;
+            }
+
+            case CLASS_LOWER: {
+                const int32_t upper = upperCp(cp);
+                const int32_t lower = lowerCp(cp);
+                if (lower != cp) result = false;
+                if (upper != cp || lower != cp) sawCased = true;
+                break;
+            }
+        }
+
         if (!result) break;
     }
-    if (kind == CLASS_UPPER || kind == CLASS_LOWER) result = result && sawCased;
+
+    if (kind == CLASS_UPPER || kind == CLASS_LOWER)
+        result = result && sawCased;
+
     *out = BOOL_VAL(result);
     return true;
 }
@@ -1022,8 +1490,35 @@ static bool fillScalar(int argc, Value *args, int slot, const char *method,
     return true;
 }
 
+static inline char *writeRepeated(char *dst, const char *pattern,
+                                  size_t patternLen, size_t count) {
+    if (count == 0 || patternLen == 0)
+        return dst;
+
+    if (patternLen == 1) {
+        memset(dst, (unsigned char)pattern[0], count);
+        return dst + count;
+    }
+
+    const size_t total = patternLen * count;
+    memcpy(dst, pattern, patternLen);
+
+    size_t written = patternLen;
+    while (written < total) {
+        size_t chunk = written;
+        const size_t remaining = total - written;
+        if (chunk > remaining) chunk = remaining;
+
+        memcpy(dst + written, dst, chunk);
+        written += chunk;
+    }
+
+    return dst + total;
+}
+
 static void appendFill(JaiBuf *buf, const char *fill, int fillLen, int64_t n) {
-    for (int64_t i = 0; i < n; i++) jaiBufAppend(buf, fill, (size_t)fillLen);
+    for (int64_t i = 0; i < n; i++)
+        jaiBufAppend(buf, fill, (size_t)fillLen);
 }
 
 /* Shared body for pad_left/pad_right/center. `side` is -1, 1 or 0. */
@@ -1031,29 +1526,53 @@ static bool padCommon(int argc, Value *args, const char *method, int side,
                       Value *out) {
     ObjString *s;
     if (!strReceiver(argc, args, method, &s)) return false;
+
     int64_t width;
     if (!jaiStrWantInt(args[1], method, "the width", &width)) return false;
+
     const char *fill;
     int fillLen;
     if (!fillScalar(argc, args, 2, method, &fill, &fillLen)) return false;
 
-    int64_t scalars = (int64_t)jaiStringScalarCount(s);
-    if (width <= scalars) { *out = OBJ_VAL(s); return true; }
-    int64_t pad = width - scalars;
-    if ((uint64_t)pad * (uint64_t)fillLen + s->length > UINT32_MAX) {
-        return jaiThrow(vm.cOverflowError,
-                        "str.%s(): a width of %lld exceeds the maximum string "
-                        "length", method, (long long)width);
+    const int64_t scalars = (int64_t)jaiStringScalarCount(s);
+    if (width <= scalars) {
+        *out = OBJ_VAL(s);
+        return true;
     }
 
-    JaiBuf buf;
-    jaiBufInit(&buf);
-    /* An odd remainder goes to the right, so center() grows rightwards. */
-    int64_t left = (side < 0) ? pad : (side == 0 ? pad / 2 : 0);
-    appendFill(&buf, fill, fillLen, left);
-    jaiBufAppend(&buf, s->chars, s->length);
-    appendFill(&buf, fill, fillLen, pad - left);
-    return jaiStrTakeBuf(&buf, out);
+    const uint64_t pad = (uint64_t)(width - scalars);
+    const uint64_t available = (uint64_t)UINT32_MAX - s->length;
+
+    if (pad > available / (uint64_t)fillLen) {
+        return jaiThrow(vm.cOverflowError,
+                        "str.%s(): a width of %lld exceeds the maximum string "
+                        "length",
+                        method, (long long)width);
+    }
+
+    const size_t total =
+        (size_t)(pad * (uint64_t)fillLen) + (size_t)s->length;
+
+    ObjString *result = jaiStringReserve(total);
+    if (result == NULL) return false;
+
+    const size_t left =
+        side < 0 ? (size_t)pad :
+        side == 0 ? (size_t)(pad >> 1) : 0u;
+    const size_t right = (size_t)pad - left;
+
+    char *dst = result->chars;
+    dst = writeRepeated(dst, fill, (size_t)fillLen, left);
+
+    if (s->length != 0) {
+        memcpy(dst, s->chars, s->length);
+        dst += s->length;
+    }
+
+    (void)writeRepeated(dst, fill, (size_t)fillLen, right);
+
+    *out = OBJ_VAL(jaiStringSeal(result));
+    return true;
 }
 
 static bool strPadLeft(int argc, Value *args, Value *out) {
@@ -1071,25 +1590,33 @@ static bool strCenter(int argc, Value *args, Value *out) {
 static bool strRepeat(int argc, Value *args, Value *out) {
     ObjString *s;
     if (!strReceiver(argc, args, "repeat", &s)) return false;
+
     int64_t times;
-    if (!jaiStrWantInt(args[1], "repeat", "the repeat count", &times)) return false;
+    if (!jaiStrWantInt(args[1], "repeat", "the repeat count", &times))
+        return false;
+
     if (times <= 0 || s->length == 0) {
         ObjString *empty = jaiStringIntern("", 0);
         if (empty == NULL) return false;
         *out = OBJ_VAL(empty);
         return true;
     }
+
     if ((uint64_t)times > (uint64_t)UINT32_MAX / s->length) {
         return jaiThrow(vm.cOverflowError,
                         "str.repeat(): %lld copies exceed the maximum string "
-                        "length", (long long)times);
+                        "length",
+                        (long long)times);
     }
 
-    JaiBuf buf;
-    jaiBufInit(&buf);
-    jaiBufReserve(&buf, (size_t)times * s->length + 1);
-    for (int64_t i = 0; i < times; i++) jaiBufAppend(&buf, s->chars, s->length);
-    return jaiStrTakeBuf(&buf, out);
+    const size_t total = (size_t)times * s->length;
+    ObjString *result = jaiStringReserve(total);
+    if (result == NULL) return false;
+
+    (void)writeRepeated(result->chars, s->chars, s->length, (size_t)times);
+
+    *out = OBJ_VAL(jaiStringSeal(result));
+    return true;
 }
 
 static bool strChars(int argc, Value *args, Value *out) {
@@ -1103,7 +1630,8 @@ static bool strChars(int argc, Value *args, Value *out) {
     const char *end = p + s->length;
     while (ok && p < end) {
         int len = 1;
-        (void)jaiUtf8Decode(p, end, &len);
+        if ((unsigned char)*p >= 0x80u)
+            (void)jaiUtf8Decode(p, end, &len);
         ok = pushSlice(list, p, (size_t)len);
         p += len;
     }
@@ -1137,7 +1665,12 @@ static bool strCodePoints(int argc, Value *args, Value *out) {
     const char *end = p + s->length;
     while (p < end) {
         int len = 1;
-        int32_t cp = jaiUtf8Decode(p, end, &len);
+        int32_t cp;
+        if ((unsigned char)*p < 0x80u) {
+            cp = (unsigned char)*p;
+        } else {
+            cp = jaiUtf8Decode(p, end, &len);
+        }
         /* An invalid byte reports as its negated value so that the list stays
          * the same length as chars() and the damage stays locatable. */
         jaiListPush(list, INT_VAL(cp));
@@ -1169,14 +1702,23 @@ static bool strFormat(int argc, Value *args, Value *out) {
 
 typedef enum { PARSE_OK, PARSE_MALFORMED, PARSE_RANGE } ParseStatus;
 
-static bool isAsciiSpace(char c) {
-    return c == ' ' || (c >= 0x09 && c <= 0x0D);
+static inline bool isAsciiSpace(char c) {
+    const unsigned char u = (unsigned char)c;
+    return u == ' ' || (u >= 0x09u && u <= 0x0Du);
 }
 
 int jaiStrDigitValue(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+    const unsigned char u = (unsigned char)c;
+
+    if ((unsigned)(u - '0') <= 9u)
+        return (int)(u - '0');
+
+    if ((unsigned)(u - 'a') <= 25u)
+        return (int)(u - 'a') + 10;
+
+    if ((unsigned)(u - 'A') <= 25u)
+        return (int)(u - 'A') + 10;
+
     return -1;
 }
 
@@ -1185,44 +1727,70 @@ int jaiStrDigitValue(char c) {
 static ParseStatus parseIntText(const char *s, size_t len, int base,
                                 int64_t *out) {
     size_t i = 0, end = len;
-    while (i < end && isAsciiSpace(s[i])) i++;
-    while (end > i && isAsciiSpace(s[end - 1])) end--;
+
+    while (i < end && isAsciiSpace(s[i])) ++i;
+    while (end > i && isAsciiSpace(s[end - 1])) --end;
     if (i >= end) return PARSE_MALFORMED;
 
     bool negative = false;
-    if (s[i] == '+' || s[i] == '-') { negative = (s[i] == '-'); i++; }
+    if (s[i] == '+' || s[i] == '-') {
+        negative = s[i] == '-';
+        ++i;
+    }
 
     if (i + 1 < end && s[i] == '0') {
-        char marker = s[i + 1];
-        int implied = (marker == 'x' || marker == 'X') ? 16
-                    : (marker == 'o' || marker == 'O') ? 8
-                    : (marker == 'b' || marker == 'B') ? 2 : 0;
+        const char marker = s[i + 1];
+        const int implied =
+            (marker == 'x' || marker == 'X') ? 16 :
+            (marker == 'o' || marker == 'O') ? 8 :
+            (marker == 'b' || marker == 'B') ? 2 : 0;
+
         if (implied != 0 && (base == 0 || base == implied)) {
             base = implied;
             i += 2;
         }
     }
+
     if (base == 0) base = 10;
 
-    uint64_t limit = negative ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
+    const uint64_t limit =
+        negative ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
+    const uint64_t radix = (uint64_t)base;
+
+    /* One division/modulo per parse instead of one division per digit. */
+    const uint64_t cutoff = limit / radix;
+    const uint64_t cutlim = limit % radix;
+
     uint64_t value = 0;
     bool sawDigit = false;
     bool lastWasUnderscore = false;
 
-    for (; i < end; i++) {
-        if (s[i] == '_') {
-            if (!sawDigit || lastWasUnderscore) return PARSE_MALFORMED;
+    for (; i < end; ++i) {
+        const char c = s[i];
+
+        if (c == '_') {
+            if (!sawDigit || lastWasUnderscore)
+                return PARSE_MALFORMED;
+
             lastWasUnderscore = true;
             continue;
         }
-        int digit = jaiStrDigitValue(s[i]);
-        if (digit < 0 || digit >= base) return PARSE_MALFORMED;
-        if (value > (limit - (uint64_t)digit) / (uint64_t)base) return PARSE_RANGE;
-        value = value * (uint64_t)base + (uint64_t)digit;
+
+        const int digit = jaiStrDigitValue(c);
+        if (digit < 0 || digit >= base)
+            return PARSE_MALFORMED;
+
+        const uint64_t uDigit = (uint64_t)digit;
+        if (value > cutoff || (value == cutoff && uDigit > cutlim))
+            return PARSE_RANGE;
+
+        value = value * radix + uDigit;
         sawDigit = true;
         lastWasUnderscore = false;
     }
-    if (!sawDigit || lastWasUnderscore) return PARSE_MALFORMED;
+
+    if (!sawDigit || lastWasUnderscore)
+        return PARSE_MALFORMED;
 
     *out = negative ? (int64_t)(~value + 1u) : (int64_t)value;
     return PARSE_OK;
@@ -1232,30 +1800,50 @@ static ParseStatus parseIntText(const char *s, size_t len, int base,
  * the NUL that strtod needs. */
 static ParseStatus parseFloatText(const char *s, size_t len, double *out) {
     size_t i = 0, end = len;
-    while (i < end && isAsciiSpace(s[i])) i++;
-    while (end > i && isAsciiSpace(s[end - 1])) end--;
+
+    while (i < end && isAsciiSpace(s[i])) ++i;
+    while (end > i && isAsciiSpace(s[end - 1])) --end;
     if (i >= end) return PARSE_MALFORMED;
 
-    size_t span = end - i;
+    const char *const start = s + i;
+    const char *const finish = s + end;
+    const size_t span = end - i;
+
+    /* ObjString text is NUL-terminated. The overwhelmingly common case has no
+     * underscores, so let strtod read it directly without making a copy. */
+    if (memchr(start, '_', span) == NULL) {
+        char *stop = NULL;
+        const double value = strtod(start, &stop);
+
+        if (stop != finish)
+            return PARSE_MALFORMED;
+
+        *out = value;
+        return PARSE_OK;
+    }
+
     char stackBuf[64];
-    char *text = (span + 1 <= sizeof stackBuf) ? stackBuf
-                                               : JAI_ALLOC(char, span + 1);
+    char *text =
+        span + 1 <= sizeof stackBuf ? stackBuf : JAI_ALLOC(char, span + 1);
+
     size_t w = 0;
-    for (size_t k = i; k < end; k++) {
-        if (s[k] == '_') continue;
-        text[w++] = s[k];
+    for (const char *p = start; p < finish; ++p) {
+        if (*p != '_')
+            text[w++] = *p;
     }
     text[w] = '\0';
 
-    /* errno is deliberately not consulted: ERANGE on underflow leaves a
-     * denormal or zero and on overflow leaves +/-inf, and both are the value
-     * the text names. Only a partial parse is an error. */
     char *stop = NULL;
-    double value = strtod(text, &stop);
-    ParseStatus status = (w == 0 || stop != text + w) ? PARSE_MALFORMED : PARSE_OK;
+    const double value = strtod(text, &stop);
+    const ParseStatus status =
+        (w == 0 || stop != text + w) ? PARSE_MALFORMED : PARSE_OK;
 
-    if (text != stackBuf) JAI_FREE_ARRAY(char, text, span + 1);
-    if (status == PARSE_OK) *out = value;
+    if (text != stackBuf)
+        JAI_FREE_ARRAY(char, text, span + 1);
+
+    if (status == PARSE_OK)
+        *out = value;
+
     return status;
 }
 
@@ -1379,29 +1967,99 @@ static const JaiStrMethodEntry kStrMethods[] = {
     {"to_str",      strToStr,        1,  1, NULL},
 };
 static uint64_t gStrHashes[JAI_COUNT_OF(kStrMethods)];
+static uint8_t  gStrLengths[JAI_COUNT_OF(kStrMethods)];
 
-static JaiStrMethodTable gStrTable = {kStrMethods, JAI_COUNT_OF(kStrMethods),
-                                gStrHashes, false};
+/* 40-ish methods at a 64-slot capacity keeps probing short while staying tiny.
+ * Slots hold method-index + 1 so zero remains the empty marker. */
+#define STR_METHOD_INDEX_CAP 64u
+static uint16_t gStrSlots[STR_METHOD_INDEX_CAP];
+static bool     gStrIndexReady;
 
-bool jaiStrLookupMethod(JaiStrMethodTable *table, Value receiver, ObjString *name,
-                         Value *out) {
+static JaiStrMethodTable gStrTable = {
+    kStrMethods, JAI_COUNT_OF(kStrMethods), gStrHashes, false
+};
+
+static void initStrMethodIndex(void) {
+    if (gStrIndexReady) return;
+
+    for (size_t i = 0; i < gStrTable.count; ++i) {
+        const JaiStrMethodEntry *const e = gStrTable.entries + i;
+        const size_t length = strlen(e->name);
+        const uint64_t hash = jaiHashBytes(e->name, length);
+
+        gStrHashes[i] = hash;
+        gStrLengths[i] = (uint8_t)length;
+
+        uint32_t slot = (uint32_t)hash & (STR_METHOD_INDEX_CAP - 1u);
+        while (gStrSlots[slot] != 0)
+            slot = (slot + 1u) & (STR_METHOD_INDEX_CAP - 1u);
+
+        gStrSlots[slot] = (uint16_t)(i + 1);
+    }
+
+    gStrTable.ready = true;
+    gStrIndexReady = true;
+}
+
+bool jaiStrLookupMethod(JaiStrMethodTable *table, Value receiver,
+                        ObjString *name, Value *out) {
     if (name == NULL) return false;
+
+    if (table == &gStrTable) {
+        initStrMethodIndex();
+
+        uint32_t slot =
+            (uint32_t)name->hash & (STR_METHOD_INDEX_CAP - 1u);
+
+        for (;;) {
+            const uint16_t encoded = gStrSlots[slot];
+            if (encoded == 0)
+                return false;
+
+            const size_t i = (size_t)encoded - 1u;
+
+            if (gStrHashes[i] == name->hash &&
+                (size_t)gStrLengths[i] == (size_t)name->length) {
+                const JaiStrMethodEntry *const e = kStrMethods + i;
+                const size_t length = (size_t)gStrLengths[i];
+
+                if (length == 0 ||
+                    memcmp(e->name, name->chars, length) == 0) {
+                    *out = jaiBindNative(receiver, e->name, e->fn,
+                                         e->minArity, e->maxArity, e->params);
+                    return true;
+                }
+            }
+
+            slot = (slot + 1u) & (STR_METHOD_INDEX_CAP - 1u);
+        }
+    }
+
     if (!table->ready) {
-        for (size_t i = 0; i < table->count; i++) {
-            table->hashes[i] = jaiHashBytes(table->entries[i].name,
-                                            strlen(table->entries[i].name));
+        for (size_t i = 0; i < table->count; ++i) {
+            const char *const methodName = table->entries[i].name;
+            table->hashes[i] =
+                jaiHashBytes(methodName, strlen(methodName));
         }
         table->ready = true;
     }
-    for (size_t i = 0; i < table->count; i++) {
-        if (table->hashes[i] != name->hash) continue;
-        const JaiStrMethodEntry *e = &table->entries[i];
-        size_t len = strlen(e->name);
-        if (len != name->length || memcmp(e->name, name->chars, len) != 0) continue;
-        *out = jaiBindNative(receiver, e->name, e->fn, e->minArity, e->maxArity,
-                             e->params);
+
+    for (size_t i = 0; i < table->count; ++i) {
+        if (table->hashes[i] != name->hash)
+            continue;
+
+        const JaiStrMethodEntry *const e = table->entries + i;
+        const size_t length = strlen(e->name);
+
+        if (length != (size_t)name->length ||
+            (length != 0 && memcmp(e->name, name->chars, length) != 0))
+            continue;
+
+        *out = jaiBindNative(receiver, e->name, e->fn,
+                             e->minArity, e->maxArity, e->params);
         return true;
     }
+
     return false;
 }
 
@@ -1421,22 +2079,38 @@ static bool primStrLen(int argc, Value *args, Value *out) {
 }
 
 static bool primStrGet(int argc, Value *args, Value *out) {
+    (void)argc;
+
     ObjString *s;
     int64_t raw;
+
     if (!jaiArgString(args[0], 0, "str_get", &s)) return false;
     if (!jaiArgInt(args[1], 1, "str_get", &raw)) return false;
 
+    const uint32_t scalarCount = jaiStringScalarCount(s);
     int index;
-    if (!jaiNormalizeIndex(raw, (int)jaiStringScalarCount(s), &index)) {
+
+    if (!jaiNormalizeIndex(raw, (int)scalarCount, &index)) {
         return jaiThrow(vm.cIndexError,
                         "str_get(): index %lld is out of range for a string of "
-                        "%u characters", (long long)raw, jaiStringScalarCount(s));
+                        "%u characters",
+                        (long long)raw, scalarCount);
     }
-    size_t at = jaiStrByteOffsetOf(s, (size_t)index);
+
+    if (scalarCount == s->length) {
+        ObjString *scalar = jaiStringNew(s->chars + index, 1);
+        if (scalar == NULL) return false;
+        *out = OBJ_VAL(scalar);
+        return true;
+    }
+
+    const size_t at = jaiUtf8Offset(s->chars, s->length, (size_t)index);
     int len = 1;
     (void)jaiUtf8Decode(s->chars + at, s->chars + s->length, &len);
+
     ObjString *scalar = jaiStringNew(s->chars + at, (size_t)len);
     if (scalar == NULL) return false;
+
     *out = OBJ_VAL(scalar);
     return true;
 }
@@ -1479,6 +2153,11 @@ static bool primStrCmp(int argc, Value *args, Value *out) {
     ObjString *a, *b;
     if (!jaiArgString(args[0], 0, "str_cmp", &a)) return false;
     if (!jaiArgString(args[1], 1, "str_cmp", &b)) return false;
+    if (a == b) {
+        *out = INT_VAL(0);
+        return true;
+    }
+
     /* UTF-8 byte order is scalar order, so memcmp gives the code-point
      * ordering the language specifies without decoding anything. */
     size_t shared = a->length < b->length ? a->length : b->length;
@@ -1521,19 +2200,31 @@ static bool primStrFromCodepoint(int argc, Value *args, Value *out) {
 }
 
 static bool primStrToCodepoint(int argc, Value *args, Value *out) {
+    (void)argc;
+
     ObjString *s;
     if (!jaiArgString(args[0], 0, "str_to_codepoint", &s)) return false;
-    if (jaiStringScalarCount(s) != 1) {
+
+    if (s->length == 1 && (unsigned char)s->chars[0] < 0x80u) {
+        *out = INT_VAL((unsigned char)s->chars[0]);
+        return true;
+    }
+
+    const uint32_t count = jaiStringScalarCount(s);
+    if (count != 1) {
         return jaiThrow(vm.cValueError,
                         "str_to_codepoint(): expected exactly one character, got "
-                        "%u", jaiStringScalarCount(s));
+                        "%u",
+                        count);
     }
+
     int len = 1;
-    int32_t cp = jaiUtf8Decode(s->chars, s->chars + s->length, &len);
-    if (cp < 0) {
+    const int32_t cp = jaiUtf8Decode(s->chars, s->chars + s->length, &len);
+
+    if (cp < 0)
         return jaiThrow(vm.cValueError,
                         "str_to_codepoint(): the string is not valid UTF-8");
-    }
+
     *out = INT_VAL(cp);
     return true;
 }

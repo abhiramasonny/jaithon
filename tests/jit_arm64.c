@@ -570,6 +570,15 @@ int main(void) {
     { /* the cell holds 0x0123456789abcdef; byte 0 is little-endian lowest */
       const uint32_t w[] = { jaiA64LdrByte(0, 0, 0), jaiA64Ret() };
       check("ldrb", runWith(w, 2, cell), cell[0] & 0xffu); }
+    { /* 5 == 5, so the condition holds and the first source wins */
+      const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64MovzX(2, 9, 0),
+                             jaiA64MovzX(3, 5, 0), jaiA64SubsXImm(31, 3, 5),
+                             jaiA64CselX(0, 1, 2, JAI_A64_EQ), jaiA64Ret() };
+      check("csel taken", runWith(w, 6, cell), 7); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64MovzX(2, 9, 0),
+                             jaiA64MovzX(3, 5, 0), jaiA64SubsXImm(31, 3, 4),
+                             jaiA64CselX(0, 1, 2, JAI_A64_EQ), jaiA64Ret() };
+      check("csel not taken", runWith(w, 6, cell), 9); }
     { const uint32_t w[] = { jaiA64LdrByte(0, 0, 1), jaiA64Ret() };
       check("ldrb offset", runWith(w, 2, cell), (cell[0] >> 8) & 0xffu); }
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),

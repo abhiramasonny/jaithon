@@ -311,6 +311,13 @@ typedef enum {
     SLOT_INT,     /* int64 payload, in an X register */
     SLOT_FLOAT,   /* double, held as raw bits in an X register */
     SLOT_INST,    /* ObjInstance *, raw, of a class fixed at compile time */
+    /* An instance of a fixed class, or null, held as the pointer or as zero --
+     * which is how C would spell it, and makes `x == null` a compare against
+     * zero. `T?` is how this language writes optional, so refusing it stopped
+     * six hundred stdlib bodies. The one thing it costs is that the tag stops
+     * being a property of the kind: materialising one picks VAL_NULL or
+     * VAL_OBJ off the register at run time. */
+    SLOT_MAYBE_INST,
     SLOT_SELF,    /* this function, as a callee; occupies no register */
     SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
     SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
@@ -542,6 +549,25 @@ static unsigned localFrameOff(const Emit *e, unsigned slot) {
 
 static void branchOnDeopt(Emit *e, unsigned cond);
 
+/* Put the tag for `kind` in `tagReg`. Every kind but SLOT_MAYBE_INST has one
+ * fixed at compile time; that one reads it off the payload. */
+static void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
+                       unsigned tagReg, unsigned spare) {
+    if (kind != SLOT_MAYBE_INST) {
+        unsigned tag = kind == SLOT_INT    ? VAL_INT
+                     : kind == SLOT_FLOAT  ? VAL_FLOAT
+                     : kind == SLOT_BOOL   ? VAL_BOOL
+                     : kind == SLOT_OPAQUE ? VAL_NULL
+                                           : VAL_OBJ;
+        emit(e, jaiA64MovzX(tagReg, tag, 0));
+        return;
+    }
+    emit(e, jaiA64SubsXImm(31, payloadReg, 0));
+    emit(e, jaiA64MovzX(tagReg, VAL_OBJ, 0));
+    emit(e, jaiA64MovzX(spare, VAL_NULL, 0));
+    emit(e, jaiA64CselX(tagReg, spare, tagReg, JAI_A64_EQ));
+}
+
 static unsigned localTagFor(const Emit *e, unsigned slot) {
     SlotKind k = e->localKind[slot];
     return k == SLOT_INT    ? VAL_INT
@@ -602,11 +628,7 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
         /* Tag as well as payload: writing straight through is what lets a
          * deopt here cost nothing. The kind is fixed for the compile. */
         SlotKind k = e->localKind[slot];
-        unsigned tag = k == SLOT_INT   ? VAL_INT
-                     : k == SLOT_FLOAT ? VAL_FLOAT
-                     : k == SLOT_BOOL  ? VAL_BOOL
-                                       : VAL_OBJ;
-        emit(e, jaiA64MovzX(JIT_SCRATCH_D, tag, 0));
+        emitTagFor(e, k, src, JIT_SCRATCH_D, JIT_SCRATCH_C);
         emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, slot * 16u));
         emit(e, jaiA64StrX(src, JIT_SLOTS_REG, slot * 16u + 8u));
         return;
@@ -615,7 +637,7 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
         if (src != localReg(e, slot)) emit(e, jaiA64MovX(localReg(e, slot), src));
         return;
     }
-    emit(e, jaiA64MovzX(JIT_SCRATCH_D, localTagFor(e, slot), 0));
+    emitTagFor(e, e->localKind[slot], src, JIT_SCRATCH_D, JIT_SCRATCH_C);
     emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
     emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot) + 8));
 }
@@ -1412,7 +1434,8 @@ static bool emitCallOut(Emit *e, unsigned argc) {
             kinds[i] = e->stack[first + i];
             if (kinds[i] != SLOT_INT && kinds[i] != SLOT_FLOAT &&
                 kinds[i] != SLOT_BOOL && kinds[i] != SLOT_INST &&
-                kinds[i] != SLOT_LIST && kinds[i] != SLOT_OBJ) {
+                kinds[i] != SLOT_LIST && kinds[i] != SLOT_OBJ &&
+                kinds[i] != SLOT_MAYBE_INST) {
                 e->whyNot = "an argument kind a field cannot take";
                 return false;
             }
@@ -1441,13 +1464,11 @@ static bool emitCallOut(Emit *e, unsigned argc) {
                            e->descOffset +
                                (unsigned)offsetof(JitCallDesc, result) + 8));
         for (unsigned i = 0; i < argc; i++) {
-            unsigned tag = kinds[i] == SLOT_INT   ? VAL_INT
-                         : kinds[i] == SLOT_FLOAT ? VAL_FLOAT
-                         : kinds[i] == SLOT_BOOL  ? VAL_BOOL
-                                                  : VAL_OBJ;
             unsigned at = (unsigned)offsetof(ObjInstance, fields) +
                           (unsigned)fslots[i] * (unsigned)sizeof(Value);
-            emit(e, jaiA64MovzX(JIT_SCRATCH_A, tag, 0));
+            /* SCRATCH_C holds the instance, so the dynamic tag needs two
+             * other scratches. */
+            emitTagFor(e, kinds[i], regs[i], JIT_SCRATCH_A, JIT_SCRATCH_B);
             emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));
             emit(e, jaiA64StrX(regs[i], JIT_SCRATCH_C, at + 8));
         }
@@ -1770,7 +1791,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * good deal harder to notice. */
             if (e->depth < 2) return false;
             SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
-            if (ka != kb) return false;
+            /* `node == null` puts an instance beside a maybe-instance. Both
+             * are a pointer or zero in a register, so the compare is the same
+             * one; treat the pair as maybe-instance. */
+            if (ka != kb) {
+                bool mixable =
+                    (ka == SLOT_INST && kb == SLOT_MAYBE_INST) ||
+                    (ka == SLOT_MAYBE_INST && kb == SLOT_INST);
+                if (!mixable) return false;
+                ka = kb = SLOT_MAYBE_INST;
+            }
             if (!holdsRegister(ka)) return false;
             unsigned rb = pushReg(e) - 1, ra = pushReg(e) - 2;
             unsigned cond;
@@ -1787,7 +1817,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
                 emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
                 nanToDeopt(e);
-            } else if (ka == SLOT_INT) {
+            } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
             } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
@@ -1848,7 +1878,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             int16_t  jump = jaiReadI16(code + off + 2);
             if (e->depth < 2) return false;
             SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
-            if (ka != kb) return false;
+            /* `node == null` puts an instance beside a maybe-instance. Both
+             * are a pointer or zero in a register, so the compare is the same
+             * one; treat the pair as maybe-instance. */
+            if (ka != kb) {
+                bool mixable =
+                    (ka == SLOT_INST && kb == SLOT_MAYBE_INST) ||
+                    (ka == SLOT_MAYBE_INST && kb == SLOT_INST);
+                if (!mixable) return false;
+                ka = kb = SLOT_MAYBE_INST;
+            }
             if (!holdsRegister(ka)) return false;
             unsigned rb = pushReg(e) - 1, ra = pushReg(e) - 2;
             unsigned cond;
@@ -1870,7 +1909,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
                 emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
                 nanToDeopt(e);
-            } else if (ka == SLOT_INT) {
+            } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
             } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
@@ -1906,6 +1945,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_POP: {
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
+            off += 1;
+            break;
+        }
+
+        case OP_NULL: {
+            /* Zero, which is what a null instance is in a register. */
+            if (!pushValue(e, SLOT_MAYBE_INST, 0, NULL)) return false;
+            emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
             off += 1;
             break;
         }
@@ -2190,7 +2237,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned slot    = jaiReadU16(code + off + 1);
             uint32_t nameIdx = jaiReadU24(code + off + 3);
 
-            if (e->localKind[slot] != SLOT_INST) return false;
+            /* A maybe-instance reads like an instance once it is known not
+             * to be null. The program has usually just tested it -- `if node
+             * == null { return 0 }` -- but the tier does not track that, so
+             * the guard stands and costs one compare against zero. A null
+             * really arriving here deopts, and the interpreter raises the
+             * error it would have raised anyway. */
+            if (e->localKind[slot] != SLOT_INST &&
+                e->localKind[slot] != SLOT_MAYBE_INST) {
+                return false;
+            }
+            if (e->localClass[slot] == NULL) return false;
+            if (e->localKind[slot] == SLOT_MAYBE_INST) {
+                unsigned rcv = localIn(e, slot, JIT_SCRATCH_A);
+                emit(e, jaiA64SubsXImm(31, rcv, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
             if (slot == 0) e->usesSlot0 = true;
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
@@ -3867,6 +3929,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                                : VAL_OBJ;
             unsigned at = (unsigned)offsetof(JitDeoptRecord, locals) +
                           i * (unsigned)sizeof(Value);
+            if (kind == SLOT_MAYBE_INST && !e.spilled) {
+                unsigned pr = JIT_FIRST_SAVED + i;
+                emitTagFor(&e, kind, pr, JIT_SCRATCH_B, JIT_SCRATCH_C);
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emit(&e, jaiA64StrX(pr, JIT_SCRATCH_A, at + 8));
+                continue;
+            }
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
             if (tag == VAL_NULL) {
@@ -3914,6 +3983,15 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64LdrX(JIT_SCRATCH_B, 31, rat + 8));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                valueSeen++;
+                continue;
+            }
+            unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
+                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            if (kind == SLOT_MAYBE_INST) {
+                emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emit(&e, jaiA64StrX(reg0, JIT_SCRATCH_A, at + 8));
                 valueSeen++;
                 continue;
             }
@@ -4367,6 +4445,15 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                             : lk == SLOT_BOOL  ? VAL_BOOL                      \
                             : lk == SLOT_OPAQUE ? VAL_NULL                     \
                                                : VAL_OBJ;                      \
+                if (lk == SLOT_MAYBE_INST) {                                   \
+                    emitTagFor(&e, lk, localReg(&e, li), JIT_SCRATCH_D,        \
+                               JIT_SCRATCH_C);                                 \
+                    emit(&e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG,          \
+                                        li * 16u));                            \
+                    emit(&e, jaiA64StrX(localReg(&e, li), JIT_SLOTS_REG,       \
+                                        li * 16u + 8u));                       \
+                    continue;                                                  \
+                }                                                              \
                 if (lt == VAL_NULL) continue;                                  \
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_D, lt, 0));                   \
                 emit(&e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, li * 16u));  \
@@ -4443,6 +4530,15 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64LdrX(JIT_SCRATCH_B, 31, rat + 8));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                valueSeen++;
+                continue;
+            }
+            unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
+                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            if (kind == SLOT_MAYBE_INST) {
+                emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emit(&e, jaiA64StrX(reg0, JIT_SCRATCH_A, at + 8));
                 valueSeen++;
                 continue;
             }
