@@ -245,6 +245,23 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
+    # <int k>; MOD  ->  MOD_INT_CONST k, wherever the pair appears: the divisor
+    # is an immediate and no slot is involved, so this fires after a GET_LOCAL2
+    # as readily as after a GET_LOCAL. `loop_sum` computes `i % 7` every
+    # iteration, one of its eight dispatches.
+    #
+    # k == 0 is left alone: the fused form treats the divisor as known-good, and
+    # division by zero has to keep reporting itself from OP_MOD.
+    if n >= 2 and window_clean(code, w, 2) and
+        code.data[w[1]].op == opcode(Op.Mod) {
+        let divisor = _pushed_int(code, head)
+        if divisor != null and divisor != 0 and fits_i16(divisor) {
+            _make_imm16(head, opcode(Op.ModIntConst), divisor)
+            kill(code, w[1])
+            return true
+        }
+    }
+
     # GET_LOCAL2 a, b; ADD  ->  ADD_LOCALS a, b. The operand pair is already the
     # right shape, so only the opcode byte changes.
     if n >= 2 and
@@ -317,6 +334,11 @@ fn _const_index_of(code: Code, instruction: Instr) -> int {
 }
 
 # u16 slot, i16 immediate: the shape of ADD_INT_CONST and CMP_LOCAL_CONST_LT.
+# A bare i16 immediate: the shape of MOD_INT_CONST.
+fn _make_imm16(instruction: Instr, op: int, immediate: int) -> void {
+    set_instr(instruction, op, u16_bytes(immediate))
+}
+
 fn _make_slot_imm16(instruction: Instr, op: int, slot: int, immediate: int) -> void {
     set_instr(instruction, op, u16_bytes(slot) + u16_bytes(immediate))
 }

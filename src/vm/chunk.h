@@ -165,6 +165,11 @@ typedef enum {
      * the `any` path in the arithmetic opcodes pays. */
     OP_TO_FLOAT,
 
+    /* `<int k>; MOD` fused (§3.3): pops the dividend, pushes `x % k`. The
+     * modulus is an i16 immediate, so no slot operand is needed and the pair
+     * collapses wherever it appears rather than only after a local read. */
+    OP_MOD_INT_CONST,        /* i16 */
+
     OP_COUNT
 } OpCode;
 
