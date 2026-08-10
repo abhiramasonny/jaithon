@@ -191,14 +191,20 @@ void jaiJitStartSampling(void) {
 
 /* Ticks seen in one function before its loop is compiled.
  *
- * Three, not twenty. At 1kHz twenty ticks looked like 20ms of warmup and cost
- * 150: `loop_sum` went from 211ms to 61ms on this constant alone, because the
- * interpreter runs the loop for the whole warmup and that loop is the entire
- * program. Sampling is cheap and compiling is cheap, so the threshold only
- * needs to be high enough to avoid compiling a loop that runs briefly.
+ * One, and it was twenty once. At 1kHz twenty ticks looked like 20ms of warmup
+ * and cost 150, because the interpreter runs the loop for the whole of it and
+ * that loop is the entire program; three cost another 25 on the same argument.
+ * Two binaries, interleaved: 490ms against 515ms across the suite, nearly all
+ * of it loop_sum going 67.3ms to 48.1ms and alloc_churn 42.9 to 39.0.
  *
- * A function that merely runs once will not collect three ticks. */
-#define JAI_JIT_HOT_TICKS 3
+ * A tick is not a millisecond. It only counts when one arrives while the ip
+ * sits on a back edge, so the wait is always longer than the rate suggests --
+ * which is why lowering this kept paying long after it looked like it should
+ * have stopped.
+ *
+ * Compiling costs microseconds, so there is little to protect against by
+ * waiting; a function that runs once still collects no ticks at all. */
+#define JAI_JIT_HOT_TICKS 1
 
 bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
