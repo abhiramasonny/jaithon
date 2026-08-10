@@ -25,13 +25,21 @@ struct ObjString {
     uint64_t hash;
     /* `interned` lives in Obj.subFlag: a bool of its own here would be padded
      * out to eight bytes ahead of the flexible array. Use the accessor. */
-    char     chars[];     /* flexible array; always NUL-terminated */
+    /* A pointer, not a flexible array. For an ordinary string it addresses the
+     * bytes immediately after this header, which is the same layout the
+     * flexible array had plus one word. Making it a pointer is what lets a
+     * string address bytes it does not own -- a slice of a shared append
+     * buffer -- without changing any of the several hundred places that read
+     * `s->chars`. Ordinary strings are still NUL-terminated; a string whose
+     * terminator was overwritten by a later append into the same buffer is
+     * flagged, and jaiStringCStr is the only safe way to get a C string. */
+    char    *chars;
 };
 
-/* Bytes to allocate for a string of `length` characters. sizeof(ObjString) is
- * rounded up to the struct's alignment and so overshoots where `chars`
- * actually begins; using it wasted seven bytes on every string in the heap. */
-#define JAI_STRING_ALLOC(length) (offsetof(ObjString, chars) + (size_t)(length) + 1)
+/* Bytes to allocate for a string of `length` characters: the header, then the
+ * bytes, then a NUL. The header now ends on an eight-byte boundary, so the
+ * bytes start immediately after it with nothing wasted between. */
+#define JAI_STRING_ALLOC(length) (sizeof(ObjString) + (size_t)(length) + 1)
 
 #define JAI_STR_INTERNED(s)      ((s)->obj.subFlag)
 

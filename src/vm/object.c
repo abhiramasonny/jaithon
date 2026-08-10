@@ -310,6 +310,7 @@ static int64_t sliceCount(int64_t n, int64_t *pStart, int64_t *pStop,
 static ObjString *allocString(size_t length) {
     ObjString *s = (ObjString *)jaiAllocateObjectRaw(JAI_STRING_ALLOC(length),
                                                      OBJ_STRING);
+    s->chars = (char *)(s + 1);
     s->length = (uint32_t)length;
     s->scalars = UINT32_MAX;       /* not yet computed */
     s->cursorScalar = 0;           /* zero/zero is always a valid memo */
