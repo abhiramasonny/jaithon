@@ -1789,6 +1789,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 nanToDeopt(e);
             } else if (ka == SLOT_INT) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
+                       IS_STRING(e->stackSeen[e->depth - 2]) &&
+                       IS_STRING(e->stackSeen[e->depth - 1])) {
+                /* Two interned strings are equal exactly when they are the
+                 * same object -- that is what interning buys, and it is what
+                 * `text[i] == " "` is, since one-character strings are shared
+                 * singletons. Anything not interned, or not a string, deopts
+                 * and the interpreter compares properly. */
+                for (unsigned side = 0; side < 2; side++) {
+                    unsigned r = side == 0 ? ra : rb;
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, r,
+                                          (unsigned)offsetof(Obj, subFlag)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                    branchOnDeopt(e, JAI_A64_EQ);
+                }
+                emit(e, jaiA64SubsXReg(31, ra, rb));
             } else {
                 return false;
             }
@@ -1851,6 +1871,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
                 nanToDeopt(e);
             } else if (ka == SLOT_INT) {
+                emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
+                       IS_STRING(e->stackSeen[e->depth - 2]) &&
+                       IS_STRING(e->stackSeen[e->depth - 1])) {
+                /* Two interned strings are equal exactly when they are the
+                 * same object -- that is what interning buys, and it is what
+                 * `text[i] == " "` is, since one-character strings are shared
+                 * singletons. Anything not interned, or not a string, deopts
+                 * and the interpreter compares properly. */
+                for (unsigned side = 0; side < 2; side++) {
+                    unsigned r = side == 0 ? ra : rb;
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, r,
+                                          (unsigned)offsetof(Obj, subFlag)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                    branchOnDeopt(e, JAI_A64_EQ);
+                }
                 emit(e, jaiA64SubsXReg(31, ra, rb));
             } else {
                 return false;
@@ -3013,10 +3053,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
                 branchOnDeopt(e, JAI_A64_EQ);
 
+                /* Carry a sample so later instructions know this is a
+                 * string: the receiver serves, since only its type is read.
+                 * Without one the interned-equality path below cannot tell
+                 * what it is holding and declines. */
+                Value strSample = e->stackSeen[e->depth - 2];
                 unsigned d1, d2;
                 if (!popValue(e, &d1, NULL)) return false;
                 if (!popValue(e, &d2, NULL)) return false;
-                if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
+                if (!pushValue3(e, SLOT_OBJ, 0, NULL, strSample, -1)) {
+                    return false;
+                }
                 emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
                 off += 1;
                 break;
@@ -3808,11 +3855,16 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         for (unsigned i = 0; i < (e.osr ? 0u : e.locals); i++) {
             unsigned slot = e.base + i;
             SlotKind kind = e.localKind[slot];
-            unsigned tag = kind == SLOT_INT   ? VAL_INT
-                         : kind == SLOT_FLOAT ? VAL_FLOAT
-                         : kind == SLOT_BOOL  ? VAL_BOOL
-                         : (kind == SLOT_INST || kind == SLOT_LIST) ? VAL_OBJ
-                                              : VAL_NULL;
+            /* Only an opaque slot is null; everything else that is not a
+             * scalar is an object. Listing the object kinds instead meant a
+             * SLOT_OBJ local -- a string, a dict, a closure -- was written out
+             * as null on every deopt, which stayed invisible until a body
+             * holding one could compile and then deopt. */
+            unsigned tag = kind == SLOT_INT    ? VAL_INT
+                         : kind == SLOT_FLOAT  ? VAL_FLOAT
+                         : kind == SLOT_BOOL   ? VAL_BOOL
+                         : kind == SLOT_OPAQUE ? VAL_NULL
+                                               : VAL_OBJ;
             unsigned at = (unsigned)offsetof(JitDeoptRecord, locals) +
                           i * (unsigned)sizeof(Value);
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
