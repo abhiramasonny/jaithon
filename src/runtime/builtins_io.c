@@ -1623,41 +1623,6 @@ static bool nReflectExec(int argc, Value *args, Value *out) {
 /* Rendering a stream into a str                                        */
 /* ------------------------------------------------------------------ */
 
-/* The disassembler and the AST writer both render to a FILE*, and a native has
- * to answer with a str. tmpfile() is the only way to get a stream without
- * malloc/free, which this tree reserves for jaiRealloc. */
-typedef void (*RenderFn)(FILE *sink, void *context);
-
-static bool renderToString(RenderFn render, void *context, const char *fnName,
-                           Value *out) {
-    FILE *sink = tmpfile();
-    if (sink == NULL)
-        return jaiThrow(vm.cIOError, "%s(): cannot open a temporary stream: %s",
-                        fnName, strerror(errno));
-
-    render(sink, context);
-
-    Stream s;
-    s.handle = sink;
-    s.file = NULL;
-    s.name = "<temporary stream>";
-
-    JaiBuf buf;
-    jaiBufInit(&buf);
-    bool ok = fflush(sink) == 0 && !ferror(sink);
-    if (ok) {
-        rewind(sink);
-        ok = readAllInto(&s, &buf, "cannot read back");
-    } else {
-        int err = errno;
-        jaiBufFree(&buf);
-        (void)fclose(sink);
-        return throwErrno(err != 0 ? err : EIO, "cannot render into", s.name);
-    }
-    (void)fclose(sink);
-    if (!ok) return false;
-    return finishRead(&s, &buf, out);
-}
 
 
 static bool nReflectGlobals(int argc, Value *args, Value *out) {

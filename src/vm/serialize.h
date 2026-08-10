@@ -36,6 +36,13 @@ uint8_t *jaiSerializeModule(ObjModule *module, ObjFunction *body,
 /* Deserialise into `module`. Returns the module body function, or NULL if the
  * data is invalid, stale, or corrupt. Never partially mutates `module` on
  * failure. */
+/* The seed's images, which ship inside this binary and were produced by the
+ * previous one. Same reader, but the build id is not required to match: it is a
+ * cache key, and the seed is not a cache. Format compatibility is still checked
+ * through JAIC_VERSION and JAI_COMPILER_VERSION. */
+ObjFunction *jaiDeserializeSeed(const uint8_t *data, size_t size,
+                                ObjModule *module, uint64_t expectedHash);
+
 ObjFunction *jaiDeserializeModule(const uint8_t *data, size_t size,
                                   ObjModule *module, uint64_t expectedHash);
 
