@@ -18,12 +18,9 @@
 
 #include "../vm/gc.h"
 
-/* ------------------------------------------------------------------ */
-/* Small shared helpers                                                 */
-/* ------------------------------------------------------------------ */
+// Small shared helpers
 
-/* The dunder names are cached on the VM, but a native may run before
- * jaiVMInit has filled them in (the REPL creates a VM lazily). */
+// Get the dunder name for a method, caching it on the VM (the REPL creates a VM lazily).
 static ObjString *dunderName(ObjString *cached, const char *text) {
     return cached != NULL ? cached : jaiStringInternC(text);
 }
@@ -106,9 +103,7 @@ static bool requireHashable(Value v, const char *fnName) {
                     jaiTypeNameStatic(v));
 }
 
-/* ------------------------------------------------------------------ */
-/* Text to number                                                       */
-/* ------------------------------------------------------------------ */
+// Text to number
 
 typedef enum { PARSE_OK, PARSE_BAD, PARSE_RANGE } ParseResult;
 
@@ -212,9 +207,7 @@ static ParseResult parseFloatText(const char *s, size_t len, double *out) {
     return result;
 }
 
-/* ------------------------------------------------------------------ */
-/* Stable sort over an index permutation                                */
-/* ------------------------------------------------------------------ */
+// Stable sort over an index permutation
 
 /* Values stay inside GC-visible lists throughout; only integer indices live in
  * raw C memory, so a collection triggered by a user key function or __lt__
@@ -272,9 +265,7 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
     return ok ? result : NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Core builtins                                                        */
-/* ------------------------------------------------------------------ */
+// Core builtins
 
 static bool nPrint(int argc, Value *args, Value *out) {
     for (int i = 0; i < argc; i++) {
