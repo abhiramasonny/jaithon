@@ -231,6 +231,8 @@ struct ObjFunction {
     /* Entry point of this function's compiled form, or NULL. Owned by the JIT's
      * arena, which outlives every function, so this is not freed here. */
     void       *jitCode;
+    /* Which calling convention `jitCode` uses; see jit.c. */
+    uint8_t     jitKind;
     /* Code offsets of the default-value thunks, indexed from arity-defaultCount. */
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */

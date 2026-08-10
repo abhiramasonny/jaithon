@@ -64,23 +64,73 @@ static bool compileReturnNull(ObjFunction *fn) {
      * which is what this step is for. */
     if (!jaiCodeArenaSeal(&sArena)) return false;
     fn->jitCode = entry;
+    fn->jitKind = 0;   /* returns null; ignores its arguments */
+    return true;
+}
+
+/* `OP_GET_LOCAL k; OP_RETURN` -- an accessor, and the first compiled body that
+ * has to move data.
+ *
+ * It cannot fail: reading a slot throws nothing and overflows nothing, so this
+ * needs no deopt path and settles the calling convention while the hard part is
+ * still out of scope. The convention is the narrowest one that works: the slot
+ * base arrives in x0, the result is written to slotBase[0], and nothing is
+ * returned -- the caller already knows where to look.
+ *
+ * A Value is 16 bytes, so slot k sits at x0 + k*16 and moves in one ldp/stp
+ * pair. LDP's immediate is scaled by 8 and signed 7-bit, which caps k at 31;
+ * beyond that this declines rather than encoding a second form, because a
+ * 32-slot accessor is not the case worth the extra encoding. */
+static bool compileAccessor(ObjFunction *fn) {
+    const Chunk *c = &fn->chunk;
+    if (c->count != 4) return false;
+    if (c->code[0] != OP_GET_LOCAL || c->code[3] != OP_RETURN) return false;
+
+    unsigned slot = (unsigned)c->code[1] | ((unsigned)c->code[2] << 8);
+    if (slot == 0 || slot > 31) return false;   /* see the imm7 note above */
+    if (!arenaReady() || sArena.sealed) return false;
+
+#if defined(__aarch64__) || defined(__arm64__)
+    uint32_t imm7 = (uint32_t)(slot * 2);       /* (slot * 16) / 8 */
+    const uint32_t code[] = {
+        /* ldp x9, x10, [x0, #slot*16] */
+        0xa9400000u | (imm7 << 15) | (10u << 10) | (0u << 5) | 9u,
+        /* stp x9, x10, [x0]          */
+        0xa9000000u | (10u << 10) | (0u << 5) | 9u,
+        /* ret                        */
+        0xd65f03c0u,
+    };
+#else
+    return false;   /* no stencil for this architecture yet */
+#endif
+
+    uint8_t *entry = jaiCodeArenaWrite(&sArena, code, sizeof code);
+    if (entry == NULL) return false;
+    if (!jaiCodeArenaSeal(&sArena)) return false;
+    fn->jitCode = entry;
+    fn->jitKind = 1;   /* accessor: takes the slot base */
     return true;
 }
 
 typedef int (*JaiCompiledFn)(void);
+typedef void (*JaiCompiledAccessor)(Value *slotBase);
 
 bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
 
-    if (fn->jitCode == NULL && !compileReturnNull(fn)) return false;
+    if (fn->jitCode == NULL) {
+        if (!compileReturnNull(fn) && !compileAccessor(fn)) return false;
+    }
 
-    /* Entering and leaving generated code. Nothing is passed yet because the
-     * only compiled body ignores everything. */
-    (void)((JaiCompiledFn)fn->jitCode)();
+    if (fn->jitKind == 1) {
+        ((JaiCompiledAccessor)fn->jitCode)(slotBase);
+    } else {
+        (void)((JaiCompiledFn)fn->jitCode)();
+        slotBase[0] = NULL_VAL;
+    }
 
     /* The contract in jit.h: the call is complete, the frame was never pushed,
      * and the result sits at slotBase[0]. */
-    slotBase[0] = NULL_VAL;
     vm.stackTop = slotBase + 1;
     return true;
 }
