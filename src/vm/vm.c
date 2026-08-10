@@ -4105,7 +4105,10 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     }
                     vm.stackTop = slot;
                     *vm.stackTop++ = result;
-                    LOAD_STATE();
+                    /* A built-in method pushes no frame: `xs.push(v)` in a hot
+                     * loop reaches here, and LOAD_STATE's constant-pool chase
+                     * was the largest thing left in it. */
+                    LOAD_STACK_ONLY();
                     VM_NEXT();
                 }
             }
