@@ -233,6 +233,12 @@ struct ObjFunction {
     void       *jitCode;
     /* Which calling convention `jitCode` uses; see jit.c. */
     uint8_t     jitKind;
+    /* Set once the tier has looked at this function and refused it. Without it
+     * every call past the threshold pays a call into jaiJitEnter to be told no
+     * again -- 2.6% of `check lib/std`, on a workload the tier does not help at
+     * all. A decline has to be free after the first one, which is the same
+     * lesson the loop back edge taught. */
+    bool        jitRefused;
     /* Sampling ticks that landed in this function, saturating once hot. */
     uint16_t    tickCount;
     /* A compiled form of one loop in this function, plus the two bytecode

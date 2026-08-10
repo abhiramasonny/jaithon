@@ -1053,7 +1053,8 @@ static bool callClosure(ObjClosure *closure, int argc) {
     ObjFunction *fn = closure->fn;
     if (fn->entryCount < JAI_JIT_THRESHOLD) {
         fn->entryCount++;
-    } else if (jaiJitEnabled() && jaiJitEnter(closure, slotBase)) {
+    } else if (!fn->jitRefused && jaiJitEnabled() &&
+               jaiJitEnter(closure, slotBase)) {
         return true;
     }
 
