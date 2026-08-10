@@ -93,7 +93,12 @@ static uintptr_t stackLimit(void) {
  * pass is held to JIT_MAX_SAVED. */
 #define JIT_MAX_SLOTS   64u
 #define JIT_MAX_ARITY    4u   /* arguments arrive in x0..x3 */
-#define JIT_MAX_INSTS  512u
+/* Deopt stubs are the reason this is not small: each one writes out every
+ * local and every live stack entry, so a body with a dozen guards spends more
+ * on its cold paths than on its hot one. `merge` needed 512 and did not say
+ * so, which is what the diagnostics were for. */
+#define JIT_MAX_INSTS 4096u
+#define JIT_MAX_FIXUPS 2048u
 #define JIT_SCRATCH_A    9u
 #define JIT_SCRATCH_B   10u
 #define JIT_SCRATCH_C   11u
@@ -245,7 +250,7 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
 #define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
 
-#define JIT_MAX_DEOPT 24
+#define JIT_MAX_DEOPT 64
 
 typedef struct {
     int      instIndex;    /* which emitted instruction to patch */
@@ -281,7 +286,7 @@ typedef struct {
     unsigned  valueDepth;  /* of those, how many hold a register */
     unsigned  maxValue;    /* high-water mark, for the save set */
 
-    Fixup     fixups[JIT_MAX_INSTS];
+    Fixup     fixups[JIT_MAX_FIXUPS];
     unsigned  fixupCount;
 
     int      *offsetToInst;  /* bytecode offset -> instruction index, or -1 */
@@ -516,7 +521,7 @@ static void emitEpilogue(Emit *e, unsigned bailed) {
 
 static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
-    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = targetOffset;
     e->fixups[e->fixupCount].conditional  = conditional;
@@ -542,7 +547,7 @@ static bool jitDeoptStress(void) {
 }
 
 static void branchOnDeopt(Emit *e, unsigned cond) {
-    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     if (e->deoptCount >= JIT_MAX_DEOPT) {
         e->whyNot = "too many guards to record";
         e->failed = true;
@@ -578,7 +583,7 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
 static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
 static void branchOnCondition(Emit *e, unsigned cond) {
-    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     if (e->wroteHeap) e->bailAfterWrite = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
@@ -596,7 +601,7 @@ static void branchOnCondition(Emit *e, unsigned cond) {
  * multiply overflow was simply never detected -- 4 * 2^62 came back as 0
  * instead of raising, which is a wrong answer, not a crash. */
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
-    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     e->overflowUsed[which] = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
@@ -723,7 +728,7 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
 
     /* Nonzero means the callee raised; the interpreter owns it from here. */
     emit(e, jaiA64SubsXImm(31, 0, 0));
-    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return false; }
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
     e->fixups[e->fixupCount].conditional  = true;
@@ -1766,7 +1771,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 
 
-    Emit e;
+    /* Static, not automatic: at this size two of them would be a large stack
+     * frame, and compilation is not reentrant -- nothing it calls compiles
+     * anything. */
+    static Emit e;
     memset(&e, 0, sizeof e);
     e.arity        = fn->arity;
     e.offsetToInst  = map;
@@ -1778,7 +1786,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * the operand stack gets, which only the body knows. So the body goes into
      * the buffer at a fixed offset and the prologue is written in front of it
      * afterwards, with every instruction index shifted by the same amount. */
-    Emit body;
+    static Emit body;
     memset(&body, 0, sizeof body);
     body.arity        = fn->arity;
     /* The measuring pass runs with slot 0 available, purely to find out
@@ -1833,10 +1841,23 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     unsigned argCount = fn->arity + 1u - e.base;
     unsigned closureArg = argCount;
     if (e.usesUpvalues) argCount++;
-    if (argCount > JIT_MAX_ARITY) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (argCount > JIT_MAX_ARITY) {
+        e.whyNot = "more incoming arguments than argument registers";
+    }
 
     unsigned saved = e.locals + (e.usesUpvalues ? 1u : 0u) + body.maxValue;
-    if (saved > JIT_MAX_SAVED) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (saved > JIT_MAX_SAVED) {
+        e.whyNot = "more live values than there are callee-saved registers";
+    }
+    if (e.whyNot != NULL) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: %s (%u locals, %u stack)\n",
+                    fn->name ? fn->name->chars : "<anon>", e.whyNot, e.locals,
+                    body.maxValue);
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
 
     e.savedCount = saved;
     e.callsOut   = body.callsOut;
@@ -1893,8 +1914,15 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     }
     if (e.failed || e.whyNot != NULL)
         { jitFree(map, depths, fn->chunk.count + 1); return false; }
-    if (false) { jitFree(map, depths, fn->chunk.count + 1); return false; }
-    if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.failed) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: %s\n",
+                    fn->name ? fn->name->chars : "<anon>",
+                    e.whyNot ? e.whyNot : "the emitter ran out of room");
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
     (void)prologue;
 
     /* The bail block: say so, return anything, and let the caller throw the
@@ -2001,7 +2029,15 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     emit(&e, (uint32_t)(uint64_t)limit);
     emit(&e, (uint32_t)((uint64_t)limit >> 32));
 
-    if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.failed) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: %s\n",
+                    fn->name ? fn->name->chars : "<anon>",
+                    e.whyNot ? e.whyNot : "the emitter ran out of room");
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
 
     /* Patch the two literal loads and the guard branch. */
     e.code[guardLoad] = jaiA64LdrLit(JIT_SCRATCH_A, e.limitLiteral - guardLoad);
@@ -2092,6 +2128,11 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     }
 
     if (e.assumedIntReturn && e.returnKind != SLOT_INT) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: a self-call had to guess the "
+                            "return kind and guessed wrong\n",
+                    fn->name ? fn->name->chars : "<anon>");
+        }
         /* A self-call before the first return had to guess, and guessed
          * wrong. */
         return false;
