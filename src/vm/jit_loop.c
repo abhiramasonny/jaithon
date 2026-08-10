@@ -40,7 +40,7 @@ typedef struct {
 
 static bool matchLoop(const Chunk *c, uint32_t at, LoopShape *out) {
     const uint8_t *p = c->code;
-    if (at + 24 > (uint32_t)c->count) return false;
+    if (at + 27 > (uint32_t)c->count) return false;
 
     if (p[at] != OP_JUMP_IF_CMP_LOCAL_K || p[at + 1] != OP_LT) return false;
     out->iSlot = (unsigned)p[at + 2] | ((unsigned)p[at + 3] << 8);
@@ -70,7 +70,11 @@ static bool matchLoop(const Chunk *c, uint32_t at, LoopShape *out) {
 
     q += 4;
     if (p[q] != OP_LOOP) return false;
-    if (q + 3 != at + 24) return false;   /* the shape is exactly this long */
+    /* 9 + 5 + 3 + 3 + 4 + 3 = 27. The first instruction carries a u8 compare,
+     * a u16 slot, a u24 constant index and an i16 jump, which is eight operand
+     * bytes and not five -- getting that wrong is why this declined silently on
+     * every tick while the loop it was meant to match ran fifty million times. */
+    if (q + 3 != at + 27) return false;
 
     if (kIndex >= (uint32_t)c->constants.count) return false;
     Value k = c->constants.data[kIndex];

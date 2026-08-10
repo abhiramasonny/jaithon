@@ -2278,7 +2278,10 @@ static bool safepoint(void) {
                          (uint32_t)(top->ip - top->closure->fn->chunk.code));
         }
     }
-    if (JAI_UNLIKELY(jaiInterrupted)) {
+    /* Only 1 is Ctrl-C. A tick that arrived while compiled code was running
+     * leaves 2 here, and treating any non-zero value as an interrupt turned
+     * every long compiled loop into a spurious RuntimeError. */
+    if (JAI_UNLIKELY(jaiInterrupted == 1)) {
         jaiInterrupted = 0;
         return jaiThrow(vm.cRuntimeError, "interrupted");
     }
