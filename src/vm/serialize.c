@@ -39,6 +39,8 @@
 
 #include "serialize.h"
 
+#include "verify.h"
+
 #include <dirent.h>
 #include <limits.h>
 #include <sys/stat.h>

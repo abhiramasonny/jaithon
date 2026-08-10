@@ -49,6 +49,5 @@ void jaiOptimize(ObjFunction *fn, const CodegenOptions *opts);
 /* Verify that a chunk is well-formed: every jump lands on an instruction
  * boundary, the stack depth is consistent at every join point, and no opcode
  * reads past the end. Used by the test suite and after deserialisation. */
-bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize);
 
 #endif /* JAI_CODEGEN_H */
