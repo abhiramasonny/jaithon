@@ -506,6 +506,33 @@ int main(void) {
       int64_t (*fn)(void *) = (int64_t (*)(void *))(uintptr_t)a.code;
       check("blr", fn(cell2), 42); }
 
+    /* cset turns a comparison into 0 or 1 without branching. Both directions
+     * are checked: an inverted condition field would pass one and fail the
+     * other. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64MovzX(2, 9, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_LT), jaiA64Ret() };
+      check("cset lt true", runWith(w, 5, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 9, 0), jaiA64MovzX(2, 3, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_LT), jaiA64Ret() };
+      check("cset lt false", runWith(w, 5, cell), 0); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64MovzX(2, 7, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_EQ), jaiA64Ret() };
+      check("cset eq true", runWith(w, 5, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64MovzX(2, 8, 0),
+                             jaiA64CsetX(3, JAI_A64_NE),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_NE), jaiA64Ret() };
+      check("cset ne true", runWith(w, 6, cell), 1); }
+    /* cset writes a full 64-bit 0 or 1, not just a byte */
+    { const uint32_t w[] = { jaiA64MovnX(0, 0),
+                             jaiA64MovzX(1, 1, 0), jaiA64MovzX(2, 2, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CsetX(0, JAI_A64_GE), jaiA64Ret() };
+      check("cset clears high bits", runWith(w, 6, cell), 0); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;

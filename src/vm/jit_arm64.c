@@ -249,3 +249,11 @@ uint32_t jaiA64StrW(unsigned rt, unsigned rn, unsigned offset) {
 uint32_t jaiA64Blr(unsigned rn) {
     return 0xd63f0000u | (rn << 5);
 }
+
+/* cset Xd, <cond> -- 1 when the condition holds, 0 otherwise. Encoded as
+ * CSINC Xd, XZR, XZR with the condition inverted, which is the standard alias:
+ * a comparison's answer becomes a value without a branch. */
+uint32_t jaiA64CsetX(unsigned rd, unsigned cond) {
+    unsigned inv = cond ^ 1u;
+    return 0x9a9f07e0u | (inv << 12) | rd;
+}

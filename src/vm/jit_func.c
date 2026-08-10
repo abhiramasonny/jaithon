@@ -186,7 +186,9 @@ typedef enum {
     SLOT_SELF,    /* this function, as a callee; occupies no register */
     SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
     SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
-    SLOT_CLASS    /* a class resolved at compile time; only ever a callee */
+    SLOT_CLASS,   /* a class resolved at compile time; only ever a callee */
+    SLOT_BOOL     /* 0 or 1 in a register; a Value's boolean member is its low
+                   * byte, so the same word serves both */
 } SlotKind;
 
 /* Floats live in X registers and visit d0/d1 only for the arithmetic itself.
@@ -237,6 +239,7 @@ typedef struct {
     SlotKind  localKind[JIT_MAX_SAVED + 1];
     uint32_t  localShape[JIT_MAX_SAVED + 1];
     ObjClass *localClass[JIT_MAX_SAVED + 1];
+    bool      localTyped[JIT_MAX_SAVED + 1];   /* parameter, or already bound */
     Value    *observed;      /* the live arguments, for field-type feedback */
     bool      assumedIntReturn;
     unsigned  depth;       /* entries on the operand stack */
@@ -517,6 +520,12 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
 
 /* Branch to the bail block on `cond`. The block's index is not known yet, so
  * it is patched with the rest. */
+/* Comparing a NaN is a TypeError here, not false: the interpreter tests isnan
+ * before it compares, and falls through to the slow path that raises. fcmp
+ * reports unordered in V, so an unordered result goes back to the interpreter
+ * to raise exactly what it would have raised. */
+static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
+
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
     if (e->wroteHeap) e->bailAfterWrite = true;
@@ -686,6 +695,9 @@ static bool emitCallOut(Emit *e, unsigned argc) {
     return true;
 }
 
+static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
+                           uint32_t shape, ObjClass *klass);
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -734,10 +746,164 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* A local keeps one kind for the whole function. Two kinds would
              * mean the reads of it cannot be compiled to one instruction, and
              * the join check works on the operand stack, not on locals. */
-            if (e->localKind[slot] != e->stack[e->depth - 1]) return false;
-            if (e->localShape[slot] != e->stackShape[e->depth - 1]) return false;
+            if (!adoptLocalKind(e, slot, e->stack[e->depth - 1],
+                                e->stackShape[e->depth - 1],
+                                e->stackClass[e->depth - 1])) {
+                e->whyNot = "a local was given two different kinds";
+                return false;
+            }
             emit(e, jaiA64MovX(localReg(e, slot), pushReg(e) - 1));
             off += 3;
+            break;
+        }
+
+        case OP_ADD_LOCALS: {
+            unsigned a = jaiReadU16(code + off + 1);
+            unsigned b = jaiReadU16(code + off + 3);
+            if (!localInRange(e, a) || !localInRange(e, b)) return false;
+            if (e->localKind[a] != SLOT_INT || e->localKind[b] != SLOT_INT) {
+                return false;
+            }
+            if (a == 0 || b == 0) e->usesSlot0 = true;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            emit(e, jaiA64AddsX(pushReg(e) - 1, localReg(e, a), localReg(e, b)));
+            branchOnOverflow(e, 0u, JAI_A64_VS);
+            off += 5;
+            break;
+        }
+
+        case OP_BIND: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            if (!localInRange(e, slot)) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
+            if (!adoptLocalKind(e, slot, e->stack[e->depth - 1],
+                                e->stackShape[e->depth - 1],
+                                e->stackClass[e->depth - 1])) {
+                e->whyNot = "a local was given two different kinds";
+                return false;
+            }
+            unsigned r;
+            if (!popValue(e, &r, NULL)) return false;
+            emit(e, jaiA64MovX(localReg(e, slot), r));
+            off += 3;
+            break;
+        }
+
+        case OP_INC_LOCAL: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int8_t   imm  = (int8_t)code[off + 3];
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            emitConst64(e, JIT_SCRATCH_A, imm);
+            emit(e, jaiA64AddsX(localReg(e, slot), localReg(e, slot),
+                                JIT_SCRATCH_A));
+            branchOnOverflow(e, 0u, JAI_A64_VS);
+            off += 4;
+            break;
+        }
+
+        case OP_EQ: case OP_NE:
+        case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+            /* Read the operands without taking them off the model: a NaN sends
+             * this instruction back to the interpreter, whose stack still has
+             * them. Popping first left it two entries short, and the
+             * comparison it re-ran then read whatever was underneath -- the
+             * error came out one line late instead of not at all, which is a
+             * good deal harder to notice. */
+            if (e->depth < 2) return false;
+            SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
+            if (ka != kb) return false;
+            if (!holdsRegister(ka)) return false;
+            unsigned rb = pushReg(e) - 1, ra = pushReg(e) - 2;
+            unsigned cond;
+            switch (op) {
+            case OP_EQ: cond = JAI_A64_EQ; break;
+            case OP_NE: cond = JAI_A64_NE; break;
+            case OP_LT: cond = ka == SLOT_FLOAT ? JAI_A64_MI : JAI_A64_LT; break;
+            case OP_LE: cond = ka == SLOT_FLOAT ? JAI_A64_LS : JAI_A64_LE; break;
+            case OP_GT: cond = JAI_A64_GT; break;
+            default:    cond = ka == SLOT_FLOAT ? JAI_A64_GE : JAI_A64_GE; break;
+            }
+            if (ka == SLOT_FLOAT) {
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+                emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+                nanToDeopt(e);
+            } else if (ka == SLOT_INT) {
+                emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else {
+                return false;
+            }
+            unsigned dropA, dropB;
+            if (!popValue(e, &dropB, NULL)) return false;
+            if (!popValue(e, &dropA, NULL)) return false;
+            if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+            emit(e, jaiA64CsetX(pushReg(e) - 1, cond));
+            off += 1;
+            break;
+        }
+
+        case OP_JUMP_IF_FALSE:
+        case OP_JUMP_IF_TRUE:
+        case OP_JUMP_IF_FALSE_KEEP:
+        case OP_JUMP_IF_TRUE_KEEP: {
+            int16_t jump = jaiReadI16(code + off + 1);
+            bool keep = (op == OP_JUMP_IF_FALSE_KEEP ||
+                         op == OP_JUMP_IF_TRUE_KEEP);
+            bool wantTrue = (op == OP_JUMP_IF_TRUE ||
+                             op == OP_JUMP_IF_TRUE_KEEP);
+            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_BOOL) return false;
+            unsigned r = pushReg(e) - 1;
+            if (!keep) {
+                unsigned popped;
+                if (!popValue(e, &popped, NULL)) return false;
+            }
+            emit(e, jaiA64SubsXImm(31, r, 0));
+            branchTo(e, (uint32_t)((int32_t)(off + 3) + jump), true,
+                     wantTrue ? JAI_A64_NE : JAI_A64_EQ);
+            off += 3;
+            break;
+        }
+
+        case OP_JUMP_IF_CMP_FALSE: {
+            uint8_t  cmp  = code[off + 1];
+            int16_t  jump = jaiReadI16(code + off + 2);
+            if (e->depth < 2) return false;
+            SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
+            if (ka != kb) return false;
+            if (!holdsRegister(ka)) return false;
+            unsigned rb = pushReg(e) - 1, ra = pushReg(e) - 2;
+            unsigned cond;
+            if (!negatedCondition(cmp, &cond)) return false;
+            if (ka == SLOT_FLOAT) {
+                /* fcmp's answers for the ordered comparisons are not the
+                 * signed-integer ones: less-than is MI and less-or-equal is
+                 * LS, because an unordered result must come out false. */
+                switch (cmp) {
+                case OP_LT: cond = JAI_A64_GE; break;   /* not (a < b)  */
+                case OP_LE: cond = JAI_A64_GT; break;   /* not (a <= b) */
+                case OP_GT: cond = JAI_A64_LS; break;   /* not (a > b)  */
+                case OP_GE: cond = JAI_A64_MI; break;   /* not (a >= b) */
+                case OP_EQ: cond = JAI_A64_NE; break;
+                case OP_NE: cond = JAI_A64_EQ; break;
+                default: return false;
+                }
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+                emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+                nanToDeopt(e);
+            } else if (ka == SLOT_INT) {
+                emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else {
+                return false;
+            }
+            unsigned dropA2, dropB2;
+            if (!popValue(e, &dropB2, NULL)) return false;
+            if (!popValue(e, &dropA2, NULL)) return false;
+            branchTo(e, (uint32_t)((int32_t)(off + 4) + jump), true, cond);
+            off += 4;
             break;
         }
 
@@ -1235,9 +1401,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 static bool seedLocals(Emit *e, Value *slotBase) {
     e->observed = slotBase;
     for (unsigned i = 0; i < e->base + e->locals; i++) {
-        e->localKind[i]  = SLOT_INT;
-        e->localShape[i] = 0;
-        e->localClass[i] = NULL;
+        e->localKind[i]   = SLOT_INT;
+        e->localShape[i]  = 0;
+        e->localClass[i]  = NULL;
+        e->localTyped[i]  = false;
     }
     for (unsigned i = e->base; i <= e->arity; i++) {
         Value v = slotBase[i];
@@ -1257,8 +1424,24 @@ static bool seedLocals(Emit *e, Value *slotBase) {
             e->whyNot = "a parameter is not an int, a float or an instance";
             return false;
         }
+        e->localTyped[i] = true;
     }
     return true;
+}
+
+/* A local that is not a parameter takes the kind of the first thing bound to
+ * it; after that it must keep it, because every read of it was compiled to one
+ * instruction chosen from that kind. */
+static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
+                           uint32_t shape, ObjClass *klass) {
+    if (!e->localTyped[slot]) {
+        e->localKind[slot]  = kind;
+        e->localShape[slot] = shape;
+        e->localClass[slot] = klass;
+        e->localTyped[slot] = true;
+        return true;
+    }
+    return e->localKind[slot] == kind && e->localShape[slot] == shape;
 }
 
 static void jitFree(int *map, int *depths, int count) {
