@@ -77,6 +77,8 @@ uint32_t jaiA64SubsXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
 uint32_t jaiA64MovnX(unsigned rd, unsigned imm16);
 /* nop */
 uint32_t jaiA64Nop(void);
+/* cset Xd, <cond> -- 1 when the condition holds, else 0 */
+uint32_t jaiA64CsetX(unsigned rd, unsigned cond);
 /* ret */
 uint32_t jaiA64Ret(void);
 
@@ -124,6 +126,7 @@ uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
 #define JAI_A64_LT 11u
 #define JAI_A64_GE 10u
 #define JAI_A64_LO  3u   /* unsigned lower -- the stack-limit test */
+#define JAI_A64_LS  9u   /* unsigned lower or same; float <= after fcmp */
 #define JAI_A64_LE 13u
 #define JAI_A64_GT 12u
 
