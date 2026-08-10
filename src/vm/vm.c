@@ -2990,6 +2990,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_CONCAT]             = &&L_OP_CONCAT,
         [OP_ADD_INT_CONST]      = &&L_OP_ADD_INT_CONST,
         [OP_MOD_INT_CONST]      = &&L_OP_MOD_INT_CONST,
+        [OP_ADD_BIND]           = &&L_OP_ADD_BIND,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -3486,6 +3487,28 @@ static JaiRunResult runLoop(int baseFrameCount) {
      * opcode would have called — a float compares, a str concatenates, a class
      * gets its dunder, and the diagnostic on a real mismatch is the one the
      * user would have seen at -O0. */
+
+    VM_CASE(OP_ADD_BIND): {
+        /* `ADD; BIND a` fused: the int path stores straight into the slot,
+         * skipping the push-then-pop the pair performed. */
+        uint16_t slot = READ_U16();
+        if (JAI_LIKELY(IS_INT(stackTop[-1]) && IS_INT(stackTop[-2]))) {
+            int64_t r;
+            if (JAI_LIKELY(!__builtin_add_overflow(AS_INT(stackTop[-2]),
+                                                   AS_INT(stackTop[-1]), &r))) {
+                DROP(2);
+                slots[slot] = INT_VAL(r);
+                VM_NEXT();
+            }
+        }
+        SAVE_STATE();
+        Value sum;
+        if (!arithmetic(OP_ADD, stackTop[-2], stackTop[-1], &sum)) goto vmThrow;
+        LOAD_STATE();
+        DROP(2);
+        slots[slot] = sum;
+        VM_NEXT();
+    }
 
     VM_CASE(OP_MOD_INT_CONST): {
         /* `<int k>; MOD` fused. The same floor-remainder rule as OP_MOD with an

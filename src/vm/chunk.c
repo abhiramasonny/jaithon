@@ -173,7 +173,8 @@
     /* numeric widening appended after compiler version 17 (§3.3) */           \
     X(OP_TO_FLOAT,             0,  0)                                          \
     /* `<int k>; MOD` fused, appended after compiler version 18 (§3.3) */      \
-    X(OP_MOD_INT_CONST,        2,  0)
+    X(OP_MOD_INT_CONST,        2,  0)                                          \
+    X(OP_ADD_BIND,             2, -2)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

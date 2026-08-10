@@ -839,6 +839,11 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.IncLocal,
         Op.CmpLocalConstLt,
         Op.GetFieldLocal,
+        # Without this the coalescer renumbers every *reader* of a slot and
+        # leaves the fused writer pointing at the old one: `line` was stored to
+        # slot 4 while every read of it had moved to slot 3, which still held an
+        # int. A fused opcode that carries a slot has to be listed here.
+        Op.AddBind,
     ]
     for op in leading { table[opcode(op)] = [0] }
     table[opcode(Op.ForIterBind)] = [2]      # the slot follows the i16 jump
