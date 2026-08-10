@@ -94,7 +94,8 @@ typedef enum {
     SLOT_FLOAT,   /* double, held as raw bits in an X register */
     SLOT_INST,    /* ObjInstance *, raw, of a class fixed at compile time */
     SLOT_SELF,    /* this function, as a callee; occupies no register */
-    SLOT_OPAQUE   /* present in a register, but nothing may be done with it */
+    SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
+    SLOT_CLOSURE  /* the running closure, for reaching its upvalues */
 } SlotKind;
 
 /* Floats live in X registers and visit d0/d1 only for the arithmetic itself.
@@ -147,6 +148,10 @@ typedef struct {
      * plain function -- it costs nothing. */
     unsigned  base;        /* first slot held in a register: 0 or 1 */
     bool      usesSlot0;
+    /* A body that reads an upvalue needs the closure itself, which is not any
+     * slot: for a method slot 0 is the receiver, not the callee. It arrives as
+     * one extra argument and takes the register just past the locals. */
+    bool      usesUpvalues;
     bool      hasSelfCall;
     unsigned  locals;      /* slots base..base+locals-1 live in registers */
     unsigned  frameBytes;
@@ -182,13 +187,21 @@ static bool localObserved(const Emit *e, unsigned slot) {
 }
 
 /* The register a new value entry would occupy. */
+static unsigned closureReg(const Emit *e) {
+    return JIT_FIRST_SAVED + e->locals;
+}
+
 static unsigned pushReg(const Emit *e) {
-    return JIT_FIRST_SAVED + e->locals + e->valueDepth;
+    return JIT_FIRST_SAVED + e->locals + (e->usesUpvalues ? 1u : 0u) +
+           e->valueDepth;
 }
 
 static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
     if (e->depth >= JIT_MAX_SAVED) return false;
-    if (e->locals + e->valueDepth + 1 > JIT_MAX_SAVED) return false;
+    if (e->locals + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
+        JIT_MAX_SAVED) {
+        return false;
+    }
     e->stackShape[e->depth] = shape;
     e->stackClass[e->depth] = klass;
     e->stack[e->depth++] = kind;
@@ -209,7 +222,8 @@ static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
     e->depth--;
     e->valueDepth--;
     if (kind != NULL) *kind = e->stack[e->depth];
-    *reg = JIT_FIRST_SAVED + e->locals + e->valueDepth;
+    *reg = JIT_FIRST_SAVED + e->locals + (e->usesUpvalues ? 1u : 0u) +
+           e->valueDepth;
     return true;
 }
 
@@ -370,8 +384,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * the join check works on the operand stack, not on locals. */
             if (e->localKind[slot] != e->stack[e->depth - 1]) return false;
             if (e->localShape[slot] != e->stackShape[e->depth - 1]) return false;
-            emit(e, jaiA64MovX(localReg(e, slot),
-                               JIT_FIRST_SAVED + e->locals + e->valueDepth - 1));
+            emit(e, jaiA64MovX(localReg(e, slot), pushReg(e) - 1));
             off += 3;
             break;
         }
@@ -641,6 +654,42 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_GET_UPVALUE: {
+            unsigned index = code[off + 1];
+            if (index >= (unsigned)fn->upvalueCount) return false;
+            if (!e->usesUpvalues) return false;   /* decided before this pass */
+
+            /* closure->upvalues[index]->location, then the Value there. The
+             * upvalue may still be open, pointing into the VM stack, so the
+             * location is followed rather than assumed closed. */
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, closureReg(e),
+                               (unsigned)offsetof(ObjClosure, upvalues)));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A, index * 8u));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                               (unsigned)offsetof(ObjUpvalue, location)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+
+            /* An upvalue's type is whatever the capture put there, so it is
+             * read once here and checked on every entry into the loop. */
+            Value seen = NULL_VAL;
+            ObjClosure *cl = closure;
+            if (index < (unsigned)cl->upvalueCount && cl->upvalues[index] != NULL) {
+                seen = *cl->upvalues[index]->location;
+            }
+            SlotKind kind;
+            unsigned tag;
+            if (IS_INT(seen))        { kind = SLOT_INT;   tag = VAL_INT; }
+            else if (IS_FLOAT(seen)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            else return false;
+
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
+            branchOnCondition(e, JAI_A64_NE);
+            if (!pushValue(e, kind, 0, NULL)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            off += 2;
+            break;
+        }
+
         case OP_GET_GLOBAL: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             if (!globalIsSelf(closure, nameIdx)) return false;
@@ -663,7 +712,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
-            unsigned first = JIT_FIRST_SAVED + e->locals + e->valueDepth - argc;
+            unsigned first = JIT_FIRST_SAVED + e->locals +
+                             (e->usesUpvalues ? 1u : 0u) + e->valueDepth - argc;
             for (unsigned i = 0; i < argc; i++) {
                 emit(e, jaiA64MovX(i, first + i));
             }
@@ -762,7 +812,7 @@ static bool eligible(ObjFunction *fn) {
     else if (fn->maxSlots < 1 || (unsigned)fn->maxSlots - 1 > JIT_MAX_SAVED) why = "maxSlots";
     else if (fn->defaultCount != 0) why = "defaults";
     else if (fn->flags & (FN_VARIADIC | FN_KWREST)) why = "flags";
-    else if (fn->upvalueCount != 0) why = "upvalues";
+
     else if (fn->module == NULL) why = "no module";
     else if (fn->chunk.count <= 0) why = "empty";
     if (why != NULL) {
@@ -807,6 +857,7 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * whether the body reads it; the real pass then drops it if not. */
     body.base         = 0;
     body.locals       = (unsigned)fn->maxSlots;
+    body.usesUpvalues = fn->upvalueCount > 0;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
     if (!seedLocals(&body, slotBase)) {
@@ -828,13 +879,16 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         jitFree(map, depths, fn->chunk.count + 1);
         return false;
     }
-    e.base   = body.usesSlot0 ? 0u : 1u;
-    e.locals = (unsigned)fn->maxSlots - e.base;
+    e.base         = body.usesSlot0 ? 0u : 1u;
+    e.locals       = (unsigned)fn->maxSlots - e.base;
+    e.usesUpvalues = fn->upvalueCount > 0;
 
     unsigned argCount = fn->arity + 1u - e.base;
+    unsigned closureArg = argCount;
+    if (e.usesUpvalues) argCount++;
     if (argCount > JIT_MAX_ARITY) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
-    unsigned saved = e.locals + body.maxValue;
+    unsigned saved = e.locals + (e.usesUpvalues ? 1u : 0u) + body.maxValue;
     if (saved > JIT_MAX_SAVED) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
     e.savedCount = saved;
@@ -843,14 +897,23 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     /* Prologue. */
     emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
     emitSaveRestore(&e, true);
-    for (unsigned i = 0; i < argCount; i++) {
+    /* The real arguments land in the local registers in order; the closure,
+     * when there is one, is the last incoming register but lives just past the
+     * locals, where closureReg expects it. Placing it by argument index
+     * instead put it three registers low and the first upvalue read
+     * dereferenced whatever was there. */
+    unsigned realArgs = e.usesUpvalues ? argCount - 1u : argCount;
+    for (unsigned i = 0; i < realArgs; i++) {
         emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
+    }
+    if (e.usesUpvalues) {
+        emit(&e, jaiA64MovX(closureReg(&e), realArgs));
     }
     /* A local the interpreter would have left as NULL_VAL starts at zero here.
      * The checker guarantees definite assignment before any read, so this is
      * belt and braces -- but a register holding the last call's value would be
      * a bug that only shows up under recursion. */
-    for (unsigned i = argCount; i < e.locals; i++) {
+    for (unsigned i = realArgs; i < e.locals; i++) {
         emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
     }
     /* Stack guard: bail rather than run off the end of the thread's stack,
@@ -956,6 +1019,11 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         return false;
     }
     for (unsigned i = 0; i < argCount; i++) {
+        if (e.usesUpvalues && i == closureArg) {
+            fn->jitParamKind[i]  = (uint8_t)SLOT_CLOSURE;
+            fn->jitParamShape[i] = 0;
+            continue;
+        }
         fn->jitParamKind[i]  = (uint8_t)e.localKind[i + e.base];
         fn->jitParamShape[i] = e.localShape[i + e.base];
     }
@@ -1027,6 +1095,12 @@ bool jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         }
         case SLOT_OPAQUE:
             a[i] = 0;   /* never read; see seedLocals */
+            break;
+        case SLOT_CLOSURE:
+            /* Not a slot at all: the closure the interpreter is calling. Safe
+             * to hold raw for the same reason every other pointer here is --
+             * the body cannot allocate, and the caller holds this closure. */
+            a[i] = (int64_t)(uintptr_t)closure;
             break;
         default:
             return false;
