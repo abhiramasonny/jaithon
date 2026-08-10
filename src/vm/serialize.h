@@ -26,6 +26,16 @@ typedef enum {
      * and both can use the cache. It becomes vestigial when only one front end
      * is left, but harmless: the bit is simply always set. */
     JAIC_FLAG_SELFHOSTED = 1 << 2,
+
+    /* The -O level the chunks were optimised at, two bits.
+     *
+     * Part of the key because the levels produce different code: cold,
+     * `loop_sum` runs 1.37s at -O0 and 0.79s at -O2. Without it a warm cache
+     * written by one level was handed to another, so `-O0` silently ran
+     * optimised bytecode -- the flags claimed the image matched when the thing
+     * that determined the image was not among them. */
+    JAIC_FLAG_OPT_SHIFT = 3,
+    JAIC_FLAG_OPT_MASK  = 3u << 3,
 } JaicFlags;
 
 /* Serialise a compiled module. Returns a heap buffer (jaiRealloc) or NULL. */

@@ -580,6 +580,11 @@ static uint32_t cacheFlagsFor(const CodegenOptions *opts, bool selfHosted) {
     if (opts->debugInfo) flags |= JAIC_FLAG_DEBUG;
     if (opts->stripAsserts) flags |= JAIC_FLAG_RELEASE;
     if (selfHosted) flags |= JAIC_FLAG_SELFHOSTED;
+
+    int level = opts->optLevel;
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    flags |= ((uint32_t)level << JAIC_FLAG_OPT_SHIFT) & JAIC_FLAG_OPT_MASK;
     return flags;
 }
 
