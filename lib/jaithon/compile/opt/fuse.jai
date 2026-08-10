@@ -252,8 +252,7 @@ fn _fuse_at(code: Code, index: int) -> bool {
     #
     # k == 0 is left alone: the fused form treats the divisor as known-good, and
     # division by zero has to keep reporting itself from OP_MOD.
-    if n >= 2 and window_clean(code, w, 2) and
-        code.data[w[1]].op == opcode(Op.Mod) {
+    if n >= 2 and window_clean(code, w, 2) and code.data[w[1]].op == opcode(Op.Mod) {
         let divisor = _pushed_int(code, head)
         if divisor != null and divisor != 0 and fits_i16(divisor) {
             _make_imm16(head, opcode(Op.ModIntConst), divisor)
