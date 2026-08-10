@@ -116,6 +116,24 @@ typedef struct {
  * collector does not move objects -- only reachability was ever in question.
  *
  * Returns 0 on success and 1 with an exception pending. */
+/* Raise the overflow the interpreter would have raised.
+ *
+ * An overflow is not a reason to deoptimise: the interpreter's answer to it is
+ * to throw, and compiled code can throw the same thing. That matters more than
+ * it sounds -- a bail hands the call back to be run from the top, which is
+ * sound only while nothing has been written, so every arithmetic operation
+ * after a field store used to decline the whole function. Raising instead
+ * makes overflow an exception exit, which is sound after any amount of
+ * writing: the interpreter would have written exactly the same things before
+ * throwing. */
+static void jitThrowOverflow(int64_t which) {
+    static const char *ops[3]  = { "+",  "-",  "*"  };
+    static const char *wrap[3] = { "+%", "-%", "*%" };
+    int i = (which >= 0 && which < 3) ? (int)which : 0;
+    (void)jaiThrow(vm.cOverflowError,
+                   "integer overflow in '%s'; use '%s' to wrap", ops[i], wrap[i]);
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -153,6 +171,7 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_BAIL   UINT32_MAX
 #define FIXUP_ENTRY  (UINT32_MAX - 1u)
 #define FIXUP_THREW  (UINT32_MAX - 2u)
+#define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
 
 typedef struct {
     int      instIndex;    /* which emitted instruction to patch */
@@ -214,6 +233,8 @@ typedef struct {
     uint8_t     lastOp;
     unsigned  descOffset;    /* JitCallDesc within the compiled frame */
     int       exceptionExit; /* instruction index of the "callee threw" exit */
+    bool      overflowUsed[3];
+    int       overflowStub[3];
     bool      hasSelfCall;
     unsigned  locals;      /* slots base..base+locals-1 live in registers */
     unsigned  frameBytes;
@@ -416,7 +437,23 @@ static void branchOnCondition(Emit *e, unsigned cond) {
     emit(e, jaiA64BCond(cond, 0));
 }
 
-static void branchOnOverflow(Emit *e) { branchOnCondition(e, JAI_A64_VS); }
+/* Overflow goes to a per-operator stub that throws, not to the bail block.
+ *
+ * `cond` is not always VS. adds and subs set the overflow flag, but the
+ * multiply test is a comparison of the product's high half against the low
+ * half's replicated sign, so its answer is NE. Routing it through VS meant
+ * multiply overflow was simply never detected -- 4 * 2^62 came back as 0
+ * instead of raising, which is a wrong answer, not a crash. */
+static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
+    if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
+    e->overflowUsed[which] = true;
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(cond, 0));
+}
 
 /* The condition to branch on when the comparison is FALSE: the opcode jumps
  * over the taken side, `if (!taken) ip += offset`. */
@@ -690,7 +727,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
             emit(e, jaiA64MulX(rd, ra, rb));
             emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
-            branchOnCondition(e, JAI_A64_NE);
+            branchOnOverflow(e, 2u, JAI_A64_NE);
             off += 1;
             break;
         }
@@ -730,7 +767,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned rd = pushReg(e) - 1;
             emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
                                  : jaiA64SubsXReg(rd, ra, rb));
-            branchOnOverflow(e);
+            branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
             off += 1;
             break;
         }
@@ -1305,6 +1342,18 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     emit(&e, jaiA64MovzX(0, 0, 0));
     emitEpilogue(&e, 2);
 
+    /* One throwing stub per operator, out of line: the hot path keeps the same
+     * single not-taken b.vs it always had. */
+    for (unsigned i = 0; i < 3; i++) {
+        if (!e.overflowUsed[i]) { e.overflowStub[i] = -1; continue; }
+        e.overflowStub[i] = (int)e.count;
+        emit(&e, jaiA64MovzX(0, i, 0));
+        emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitThrowOverflow);
+        emit(&e, jaiA64Blr(JIT_SCRATCH_A));
+        emit(&e, jaiA64MovzX(0, 0, 0));
+        emitEpilogue(&e, 2);
+    }
+
     /* Literal pool, 8-byte aligned so the 64-bit loads are aligned. */
     if ((e.count & 1u) != 0) emit(&e, jaiA64Nop());
     e.limitLiteral = (int)e.count;
@@ -1328,6 +1377,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             target = e.bailBlock;
         } else if (f->targetOffset == FIXUP_THREW) {
             target = e.exceptionExit;
+        } else if (f->targetOffset <= FIXUP_OVF &&
+                   f->targetOffset >= FIXUP_OVF - 2u) {
+            target = e.overflowStub[FIXUP_OVF - f->targetOffset];
+            if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
         } else if (f->targetOffset == FIXUP_ENTRY) {
             target = 0;
         } else {
