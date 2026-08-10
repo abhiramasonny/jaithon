@@ -4,7 +4,8 @@
             "name": "Mac",
             "includePath": [
                 "${default}",
-                "${workspaceFolder}"
+                "${workspaceFolder}",
+                "${workspaceFolder}/build"
             ],
             "compilerPath": "/usr/bin/clang",
             "cppStandard": "c++14",
