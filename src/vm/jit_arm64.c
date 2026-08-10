@@ -265,3 +265,9 @@ uint32_t jaiA64LslX(unsigned rd, unsigned rn, unsigned shift) {
     unsigned imms = 63u - shift;
     return 0xd3400000u | (immr << 16) | (imms << 10) | (rn << 5) | rd;
 }
+
+/* eor Xd, Xn, Xm -- the sign test floor division needs: the remainder and the
+ * divisor have different signs exactly when their exclusive-or is negative. */
+uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0xca000000u | (rm << 16) | (rn << 5) | rd;
+}

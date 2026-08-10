@@ -79,6 +79,8 @@ uint32_t jaiA64SubsXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
 uint32_t jaiA64MovnX(unsigned rd, unsigned imm16);
 /* nop */
 uint32_t jaiA64Nop(void);
+/* eor Xd, Xn, Xm */
+uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm);
 /* cset Xd, <cond> -- 1 when the condition holds, else 0 */
 uint32_t jaiA64CsetX(unsigned rd, unsigned cond);
 /* ret */

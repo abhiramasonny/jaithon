@@ -189,6 +189,18 @@ static int jitInvokeNative(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
+/* Build a list from the descriptor's arguments. Allocating, so the roots go
+ * down first exactly as for a call. */
+static int jitBuildList(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    ObjList *list = jaiListNew((int)d->argc);
+    for (int64_t i = 0; i < d->argc; i++) list->items[i] = d->args[i];
+    list->count = (int)d->argc;
+    d->result = OBJ_VAL(list);
+    jaiGCPopRoots((int)d->nroots);
+    return 0;
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -1355,6 +1367,73 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_BUILD_LIST: {
+            unsigned n = jaiReadU16(code + off + 1);
+            if (n > JIT_MAX_ARGS_OUT) return false;
+            if (!e->callsOut) return false;
+            if (e->depth < n) return false;
+            if (!emitDescriptor(e, NULL_VAL, e->depth - n, n,
+                                (void *)&jitBuildList)) {
+                return false;
+            }
+            for (unsigned i = 0; i < n; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            if (!pushValue(e, SLOT_LIST, 0, NULL)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off += 3;
+            break;
+        }
+
+        case OP_FLOORDIV: {
+            unsigned rb, ra;
+            SlotKind kb, ka;
+            if (e->depth < 2) return false;
+            ka = e->stack[e->depth - 2]; kb = e->stack[e->depth - 1];
+            if (ka != SLOT_INT || kb != SLOT_INT) return false;
+            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
+
+            /* Zero, and -1 with it: the interpreter reports the
+             * division-by-zero, and INT64_MIN / -1 is the one quotient that
+             * does not fit. Both are rare enough that declining -1 outright
+             * costs nothing and removes the special case. */
+            emit(e, jaiA64SubsXImm(31, rb, 0));
+            branchOnDeopt(e, JAI_A64_EQ);
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, rb, 1));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+            branchOnDeopt(e, JAI_A64_EQ);
+
+            unsigned d1, d2;
+            if (!popValue(e, &d1, NULL)) return false;
+            if (!popValue(e, &d2, NULL)) return false;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            unsigned rq = pushReg(e) - 1;
+
+            /* The quotient lands in the register the dividend was in -- the
+             * push reuses it -- so the dividend is copied out first. Without
+             * that, msub read a value sdiv had already overwritten and 7 // 2
+             * came out 2. */
+            emit(e, jaiA64MovX(JIT_SCRATCH_C, ra));
+
+            /* Truncating quotient, then one down when the remainder is nonzero
+             * and its sign differs from the divisor's -- which is what makes
+             * this floor division rather than C's. */
+            emit(e, jaiA64SdivX(rq, JIT_SCRATCH_C, rb));
+            emit(e, jaiA64MsubX(JIT_SCRATCH_A, rq, rb, JIT_SCRATCH_C));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+            emit(e, jaiA64BCond(JAI_A64_EQ, 5));
+            emit(e, jaiA64EorX(JIT_SCRATCH_B, JIT_SCRATCH_A, rb));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+            emit(e, jaiA64BCond(JAI_A64_GE, 2));
+            emit(e, jaiA64SubXImm(rq, rq, 1));
+            off += 1;
+            break;
+        }
+
         case OP_INVOKE: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             unsigned argc    = code[off + 4];
@@ -1365,15 +1444,27 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned ridx = e->depth - argc - 1;
             SlotKind rk = e->stack[ridx];
             if (rk != SLOT_LIST) return false;       /* lists only, for now */
-            Value seen = e->stackSeen[ridx];
-            if (!IS_LIST(seen)) return false;
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
 
-            /* Resolve now; the module version check at the entry pins it. */
+            /* Which method a name means depends on the receiver's type, not on
+             * what it holds -- so when the receiver is a list this body built
+             * and there is no sample to look at, an empty one answers just as
+             * well. Rooted across the lookup because resolving allocates the
+             * bound wrapper; only the native is kept, and that outlives it. */
+            Value probe = e->stackSeen[ridx];
+            bool madeProbe = false;
+            if (!IS_LIST(probe)) {
+                ObjList *tmp = jaiListNew(0);
+                probe = OBJ_VAL(tmp);
+                jaiGCPushRoot(probe);
+                madeProbe = true;
+            }
             Value bound;
-            if (!jaiBuiltinMethod(seen, AS_STRING(nameVal), &bound)) return false;
+            bool found = jaiBuiltinMethod(probe, AS_STRING(nameVal), &bound);
+            if (madeProbe) jaiGCPopRoot();
+            if (!found) return false;
             Value nativeVal = IS_BOUND(bound) ? AS_BOUND(bound)->method : bound;
             if (!IS_NATIVE(nativeVal)) return false;
 
