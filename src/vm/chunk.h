@@ -170,6 +170,11 @@ typedef enum {
      * collapses wherever it appears rather than only after a local read. */
     OP_MOD_INT_CONST,        /* i16 */
 
+    /* `ADD; BIND a` fused (§3.3): pops both operands, adds, stores into slot a.
+     * The net stack effect matches the pair, so what produced either operand
+     * does not matter. */
+    OP_ADD_BIND,             /* u16 S */
+
     OP_COUNT
 } OpCode;
 
