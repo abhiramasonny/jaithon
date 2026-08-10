@@ -180,6 +180,14 @@ void jaiJitStartSampling(void) {
 
 void jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
+    if (fn->tickCount >= JAI_JIT_HOT_TICKS) {
+        /* Already hot. A tick landing on a loop top is the OSR entry point, and
+         * the only moment the interpreter's state matches what compiled code
+         * expects on entry: OP_LOOP sets ip to the loop's first instruction and
+         * *then* runs the safepoint. */
+        (void)jaiJitEnterLoop(closure, offset);
+        return;
+    }
     if (fn->tickCount < JAI_JIT_HOT_TICKS) {
         fn->tickCount++;
         if (fn->tickCount == JAI_JIT_HOT_TICKS && getenv("JAI_JIT_TRACE")) {

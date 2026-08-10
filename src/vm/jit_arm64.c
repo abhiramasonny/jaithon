@@ -50,6 +50,14 @@ uint32_t jaiA64BCond(unsigned cond, int32_t instructions) {
     return 0x54000000u | (imm19 << 5) | cond;
 }
 
+uint32_t jaiA64B(int32_t instructions) {
+    return 0x14000000u | ((uint32_t)instructions & 0x03ffffffu);
+}
+
+uint32_t jaiA64SubsX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0xeb000000u | (rm << 16) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64Ret(void) {
     return 0xd65f03c0u;
 }

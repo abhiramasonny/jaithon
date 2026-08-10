@@ -235,6 +235,12 @@ struct ObjFunction {
     uint8_t     jitKind;
     /* Sampling ticks that landed in this function, saturating once hot. */
     uint16_t    tickCount;
+    /* A compiled form of one loop in this function, plus the two bytecode
+     * offsets the tier hands back to the interpreter: where the loop exits and
+     * where it starts. Owned by the JIT arena, so not freed here. */
+    void       *jitLoop;
+    uint32_t    jitLoopExit;
+    uint32_t    jitLoopTop;
     /* Code offsets of the default-value thunks, indexed from arity-defaultCount. */
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */

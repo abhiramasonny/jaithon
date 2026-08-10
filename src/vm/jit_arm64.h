@@ -37,6 +37,10 @@ uint32_t jaiA64MovkX(unsigned rd, unsigned imm16, unsigned shift);
 uint32_t jaiA64MovX(unsigned rd, unsigned rn);
 /* b.<cond> #offset -- offset in instructions, signed 19-bit */
 uint32_t jaiA64BCond(unsigned cond, int32_t instructions);
+/* b #offset -- unconditional, offset in instructions, signed 26-bit */
+uint32_t jaiA64B(int32_t instructions);
+/* subs Xd, Xn, Xm -- with rd = 31 this is a register-register `cmp` */
+uint32_t jaiA64SubsX(unsigned rd, unsigned rn, unsigned rm);
 /* ret */
 uint32_t jaiA64Ret(void);
 

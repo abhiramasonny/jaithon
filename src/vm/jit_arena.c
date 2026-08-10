@@ -54,3 +54,13 @@ void jaiCodeArenaFree(JaiCodeArena *arena) {
     memset(arena, 0, sizeof *arena);
 }
 
+
+JaiCodeArena *jaiJitArena(void) {
+    static JaiCodeArena arena;
+    static bool tried;
+    if (!tried) {
+        tried = true;
+        if (!jaiCodeArenaInit(&arena, 1u << 20)) return NULL;
+    }
+    return arena.code != NULL ? &arena : NULL;
+}
