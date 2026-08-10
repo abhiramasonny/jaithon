@@ -429,6 +429,18 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
     return scratch;
 }
 
+/* Where an operation that writes a local should compute its result.
+ *
+ * Only register-resident locals can be written in place. In OSR mode the
+ * locals are the interpreter's slots and `localReg` names a register that is
+ * holding something else entirely -- the loop counter, as it turned out. A
+ * float add landed in x21 and the induction variable became a bit pattern, so
+ * the loop finished early or never finished, depending on the value. */
+static unsigned localDest(const Emit *e, unsigned slot) {
+    if (e->osr || e->spilled) return JIT_SCRATCH_C;
+    return localReg(e, slot);
+}
+
 static void localOut(Emit *e, unsigned slot, unsigned src) {
     if (e->osr) {
         /* Tag as well as payload: writing straight through is what lets a
@@ -1010,7 +1022,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            unsigned rd = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
+            unsigned rd = localDest(e, slot);
             if (ka == SLOT_FLOAT) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -1057,7 +1069,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            unsigned rd = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
+            unsigned rd = localDest(e, slot);
             if (ka == SLOT_FLOAT) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -1090,7 +1102,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            unsigned rd = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
+            unsigned rd = localDest(e, slot);
             if (ka == SLOT_FLOAT) {
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -1135,7 +1147,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emitConst64(e, JIT_SCRATCH_A, imm);
             {
                 unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
-                unsigned dst = e->spilled ? JIT_SCRATCH_C : localReg(e, slot);
+                unsigned dst = localDest(e, slot);
                 emit(e, jaiA64AddsX(dst, cur, JIT_SCRATCH_A));
                 localOut(e, slot, dst);
             }
@@ -1756,19 +1768,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             SlotKind rk = e->stack[ridx];
 
             if (rk == SLOT_INST) {
-                /* Not inside an OSR loop. A float-returning method call there
-                 * produces a wrong answer -- 2250880.0 where the interpreter
-                 * says 6000000.0 -- and at a larger trip count the same shape
-                 * does not terminate. An int-returning one is fine, and so is
-                 * the same call compiled by the function tier, so the fault is
-                 * in how an out-call result is carried across the OSR loop
-                 * rather than in the call itself. Off until that is found:
-                 * a wrong answer is not worth the milliseconds. */
-                if (e->osr) {
-                    e->whyNot = "method call inside an OSR loop (known bug)";
-                    return false;
-                }
-
                 /* A method on an instance. The class is fixed here, so the
                  * method is resolved now; what it returns is not knowable, so
                  * the tag that comes back is checked and a surprise deopts to
