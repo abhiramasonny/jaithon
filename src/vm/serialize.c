@@ -911,7 +911,23 @@ static ObjFunction *deserialize(const uint8_t *data, size_t size,
     if (curU32(&c) != JAI_COMPILER_VERSION) return NULL;
     uint32_t recordedBuildId = curU32(&c);
     if (!fromSeed && recordedBuildId != JAI_BUILD_ID) return NULL;
-    if (curU64(&c) != expectedHash) return NULL;
+    uint64_t recordedHash = curU64(&c);
+    /* The seed is allowed to be out of date with the source beside it. The
+     * cache is not.
+     *
+     * A cache entry whose source has changed must be rejected: it is an
+     * optimisation, and running it would run code the file no longer contains.
+     * The seed is not an optimisation -- it is the only compiler a fresh tree
+     * has, and it is asked for one precisely when the sources HAVE moved.
+     * Editing the compiler changes its own source hash, so a hash-strict seed
+     * refuses to load exactly when the compiler is being worked on, leaving
+     * nothing able to rebuild it. That loop is what made lib/jaithon
+     * unmodifiable.
+     *
+     * A one-generation-old compiler building the new sources is what
+     * bootstrapping means, and `make fixpoint-check` is what proves the
+     * generation it produces agrees with itself. */
+    if (!fromSeed && recordedHash != expectedHash) return NULL;
 
     uint16_t pathLen = curU16(&c);
     if (!curSkip(&c, pathLen)) return NULL;            /* srcPath */
