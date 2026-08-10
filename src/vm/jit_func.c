@@ -1157,6 +1157,7 @@ static bool seedLocals(Emit *e, Value *slotBase) {
              * can be done with it, but the body has no reason to read it. */
             e->localKind[i] = SLOT_OPAQUE;
         } else {
+            e->whyNot = "a parameter is not an int, a float or an instance";
             return false;
         }
     }
@@ -1233,6 +1234,11 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     body.offsetToInst = map;
     body.offsetToDepth = depths;
     if (!seedLocals(&body, slotBase)) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: %s\n",
+                    fn->name ? fn->name->chars : "<anon>",
+                    body.whyNot ? body.whyNot : "its arguments");
+        }
         jitFree(map, depths, fn->chunk.count + 1);
         return false;
     }

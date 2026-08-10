@@ -4249,6 +4249,32 @@ static JaiRunResult runLoop(int baseFrameCount) {
             AS_CLOSURE(callee)->fn->arity == argc &&
             !(fn->flags & FN_INIT)) {
             ObjClosure *target = AS_CLOSURE(callee);
+
+            /* A tail call reuses this frame instead of going through
+             * callClosure, so without this the compiled tier never saw the
+             * callee at all -- not even to count it as hot. `sort` tail-calls
+             * `merge`, which is the whole of that benchmark's inner loop, and
+             * it was invisible. The compiled form finishes the call outright,
+             * and finishing a tail call is returning from this frame. */
+            ObjFunction *tfn = target->fn;
+            Value *tailBase = vm.stackTop - argc - 1;
+            if (tfn->jitFunc != NULL) {
+                JaiJitOutcome outcome = jaiJitEnterFunc(target, tailBase);
+                if (outcome == JAI_JIT_ERROR) goto vmThrow;
+                if (outcome == JAI_JIT_DONE) {
+                    retval = tailBase[0];
+                    stackTop = vm.stackTop;   /* opReturn saves this back */
+                    goto opReturn;
+                }
+            } else if (tfn->entryCount < JAI_JIT_THRESHOLD) {
+                tfn->entryCount++;
+            } else if (!tfn->jitRefused && jaiJitEnabled() &&
+                       jaiJitEnter(target, tailBase)) {
+                retval = tailBase[0];
+                stackTop = vm.stackTop;
+                goto opReturn;
+            }
+
             if (FRAME_HAS_DEFERS(frame) && !runFrameDefers(frame)) goto vmThrow;
             if (vm.hasException) goto vmThrow;
             closeUpvalues(frame->slots);
