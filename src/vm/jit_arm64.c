@@ -135,3 +135,15 @@ uint32_t jaiA64MovnX(unsigned rd, unsigned imm16) {
 uint32_t jaiA64Nop(void) {
     return 0xd503201fu;
 }
+
+/* mul Xd, Xn, Xm -- MADD with the addend as xzr. The low 64 bits only; the
+ * overflow test needs smulh alongside it. */
+uint32_t jaiA64MulX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x9b007c00u | (rm << 16) | (rn << 5) | rd;
+}
+
+/* cmp Xn, Xm, asr #shift -- the shifted-register form of subs, used to test
+ * whether a product's high half is the sign extension of its low half. */
+uint32_t jaiA64SubsXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
+    return 0xeb800000u | (shift << 10) | (rm << 16) | (rn << 5) | rd;
+}

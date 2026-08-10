@@ -214,6 +214,33 @@ int main(void) {
                              jaiA64Ret(), 0x00000000u, 0x00000001u };
       check("ldr literal high", runWith(w, 6, cell), (int64_t)1 << 32); }
 
+    /* mul */
+    { const uint32_t w[] = { jaiA64MovzX(1, 6, 0), jaiA64MovzX(2, 7, 0),
+                             jaiA64MulX(0, 1, 2), jaiA64Ret() };
+      check("mul", runWith(w, 4, cell), 42); }
+
+    /* The signed-overflow test for a product: smulh gives the high half, and
+     * the product fits exactly when that equals the low half's sign bit
+     * replicated. 6 * 7 fits, so this reports 0. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 6, 0), jaiA64MovzX(2, 7, 0),
+                             jaiA64MulX(3, 1, 2), jaiA64SmulhX(4, 1, 2),
+                             jaiA64SubsXAsr(31, 4, 3, 63),
+                             jaiA64BCond(JAI_A64_NE, 3),
+                             jaiA64MovzX(0, 0, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret() };
+      check("mul fits", runWith(w, 10, cell), 0); }
+
+    /* 2^40 * 2^40 does not fit, so the same sequence reports 1. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 1, 0), jaiA64MovkX(1, 0x100u, 2),
+                             jaiA64MovzX(1, 0, 0), jaiA64MovkX(1, 0x100u, 2),
+                             jaiA64MovX(2, 1),
+                             jaiA64MulX(3, 1, 2), jaiA64SmulhX(4, 1, 2),
+                             jaiA64SubsXAsr(31, 4, 3, 63),
+                             jaiA64BCond(JAI_A64_NE, 3),
+                             jaiA64MovzX(0, 0, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret() };
+      check("mul overflows", runWith(w, 13, cell), 1); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;
