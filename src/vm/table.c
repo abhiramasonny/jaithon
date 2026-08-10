@@ -34,11 +34,11 @@ const Value JAI_TOMBSTONE = {VAL_OBJ, {.obj = NULL}};
 /* ------------------------------------------------------------------ */
 
 JAI_INLINE bool entryIsEmpty(const JaiEntry *e) {
-    return e->key.type == VAL_NULL;
+    return IS_NULL(e->key);
 }
 
 JAI_INLINE bool entryIsTombstone(const JaiEntry *e) {
-    return e->key.type == VAL_OBJ && e->key.as.obj == NULL;
+    return IS_OBJ(e->key) && AS_OBJ(e->key) == NULL;
 }
 
 JAI_INLINE bool entryIsLive(const JaiEntry *e) {
@@ -49,7 +49,7 @@ JAI_INLINE bool entryIsLive(const JaiEntry *e) {
  * slot and a NULL Obj* as a deleted one. `null` is therefore not a usable dict
  * or set key; the caller must reject it before reaching this layer. */
 JAI_INLINE JAI_UNUSED bool keyIsUsable(Value key) {
-    return !(key.type == VAL_NULL || (key.type == VAL_OBJ && key.as.obj == NULL));
+    return !(IS_NULL(key) || (IS_OBJ(key) && AS_OBJ(key) == NULL));
 }
 
 /* ------------------------------------------------------------------ */
@@ -219,7 +219,7 @@ static JaiEntry *findEntryInterned(JaiEntry *entries, int capacity, ObjString *k
         if (entryIsEmpty(e)) return tombstone != NULL ? tombstone : e;
         if (entryIsTombstone(e)) {
             if (tombstone == NULL) tombstone = e;
-        } else if (e->key.type == VAL_OBJ && e->key.as.obj == (Obj *)key) {
+        } else if (IS_OBJ(e->key) && AS_OBJ(e->key) == (Obj *)key) {
             return e;
         }
         index = (index + 1) & mask;
@@ -487,7 +487,7 @@ ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
         if (entryIsEmpty(e)) return NULL;
         if (!entryIsTombstone(e) && e->hash == hash) {
             JAI_ASSERT(IS_STRING(e->key), "intern table holds only strings");
-            ObjString *s = (ObjString *)e->key.as.obj;
+            ObjString *s = (ObjString *)AS_OBJ(e->key);
             if ((size_t)s->length == length &&
                 (length == 0 || memcmp(s->chars, chars, length) == 0)) {
                 return s;
