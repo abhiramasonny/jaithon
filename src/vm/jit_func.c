@@ -2834,6 +2834,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             uint32_t  elemShape = 0;
             if (IS_INT(elem))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(elem)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            else if (IS_LIST(elem)) {
+                /* A list of lists. `matrix_mul` is `b[k][j]` in its innermost
+                 * loop and could not compile the outer half of it. */
+                kind = SLOT_LIST;
+                tag = VAL_OBJ;
+            }
             else if (IS_INSTANCE(elem) && AS_INSTANCE(elem)->klass != NULL) {
                 /* A list of instances, all of one shape -- which the per-read
                  * tag check cannot confirm on its own, so the class is checked
