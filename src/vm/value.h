@@ -75,7 +75,7 @@ typedef struct {
 
 /* Numeric coercion helper: int or float -> double. Undefined for other types. */
 JAI_INLINE double jaiAsDouble(Value v) {
-    return v.type == VAL_INT ? (double)v.as.integer : v.as.number;
+    return IS_INT(v) ? (double)AS_INT(v) : AS_FLOAT(v);
 }
 
 /* ------------------------------------------------------------------ */

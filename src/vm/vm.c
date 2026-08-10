@@ -4108,7 +4108,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
             MethodInfo restricted;
             uint32_t recheck =
                 jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
-            if (ic != NULL && klass != NULL && slotZero.as.obj == receiver.as.obj &&
+            if (ic != NULL && klass != NULL && AS_OBJ(slotZero) == AS_OBJ(receiver) &&
                 ic->state != IC_MEGA) {
                 if (ic->count < JAI_IC_WAYS) {
                     ic->shapeId[ic->count] = klass->shapeId;
