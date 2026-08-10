@@ -684,12 +684,16 @@ static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
 /* Depth and the kind of every entry, in one word. Registers are assigned from
  * the depth and instructions are chosen from the kinds, so a join reached with
  * either one different is a join this tier cannot compile. */
-static uint32_t stackSignature(const Emit *e) {
-    uint32_t sig = e->depth & 0xfu;
-    for (unsigned i = 0; i < e->depth && i < 9; i++) {
+static uint32_t stackSignatureAt(const Emit *e, unsigned depth) {
+    uint32_t sig = depth & 0xfu;
+    for (unsigned i = 0; i < depth && i < 9; i++) {
         sig |= ((uint32_t)e->stack[i] & 3u) << (4 + 2 * i);
     }
     return sig;
+}
+
+static uint32_t stackSignature(const Emit *e) {
+    return stackSignatureAt(e, e->depth);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2477,7 +2481,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     /* 1 is exhausted, anything higher is a raise. */
                     emit(e, jaiA64SubsXImm(31, 0, 1));
                     branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
-                                  JAI_A64_EQ, (int)e->valueDepth - 1);
+                                  JAI_A64_EQ,
+                                  (int)stackSignatureAt(e, e->depth - 1));
                     emit(e, jaiA64SubsXImm(31, 0, 1));
                     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
                     e->fixups[e->fixupCount].instIndex    = (int)e->count;
@@ -2509,7 +2514,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* The exhausted arm drops the iterator, so the target is
                  * reached one entry shallower than this branch leaves from. */
                 branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
-                              JAI_A64_GE, (int)e->valueDepth - 1);
+                              JAI_A64_GE,
+                              (int)stackSignatureAt(e, e->depth - 1));
                 localOut(e, fslot, JIT_SCRATCH_A);
                 emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
                 emit(e, jaiA64StrX(JIT_SCRATCH_A, rIt,
