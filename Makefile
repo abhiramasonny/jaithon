@@ -349,8 +349,19 @@ bench: $(TARGET)
 reseed: $(TARGET)
 	@echo "  SEED    populating __jaicache__"
 	@find lib -name '__jaicache__' -type d -exec rm -rf {} + 2>/dev/null || true
-	@JAITHON_PATH=$(CURDIR)/lib JAITHON_NO_SEED=1 ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
-	@python3 scripts/gen_seed.py lib boot/seed.c
+# The seed is NOT disabled here. It used to be, so that the front end's own
+# closure was compiled from source rather than served by the seed being
+# replaced -- but that only worked because the C front end compiled it inside
+# the bootstrap window. With one front end the window has only the seed, so
+# disabling it leaves nothing that can compile anything. seed_touch.jai boots on
+# the previous seed and compiles the next one's sources explicitly, which is the
+# same guarantee by a route that does not need a second compiler.
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/seed_touch.jai >/dev/null 2>&1 || true
+# `lib/jaithon` and not `lib`: running the compiler writes cache entries for
+# whatever it imports, so collecting the whole tree embeds a set that varies run
+# to run. Measured, 44 modules and then 47 across two reseeds of an unchanged
+# tree. What is embedded has to be exactly what the step above set out to build.
+	@python3 scripts/gen_seed.py lib boot/seed.c lib/jaithon
 	@$(MAKE) --no-print-directory
 # The rebuild above embeds the new seed, which changes JAI_BUILD_ID, which
 # invalidates every .jaic just written -- so reseeding used to hand back a tree

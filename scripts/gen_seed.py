@@ -14,11 +14,18 @@ src/vm/serialize.c already reads .jaic, so loading one costs a memcpy and a
 deserialise.
 
 Usage:
-    scripts/gen_seed.py <cache-root> <output.c>
+    scripts/gen_seed.py <cache-root> <output.c> [subtree ...]
 
-`cache-root` is a tree containing __jaicache__ directories -- normally `lib`
-after a run that populated them. Every image found is embedded, keyed by the
-module name its path implies (lib/std/__jaicache__/list.jaic -> "std.list").
+`cache-root` is the tree module names are relative to -- normally `lib`, so
+that lib/std/__jaicache__/list.jaic is "std.list". The optional subtrees limit
+which caches are collected; without them the whole root is walked.
+
+The limit is not an optimisation. Running the compiler writes cache entries for
+whatever it happens to import, so a walk of the whole root embeds a set that
+varies from run to run: measured, 44 modules and then 47 across two reseeds of
+an unchanged tree. A seed that does not converge is the one failure a bootstrap
+cannot recover from on its own, so what gets embedded has to be exactly what
+the populate step set out to build, not whatever was found afterwards.
 """
 
 import os
@@ -44,20 +51,21 @@ def module_name_for(jaic_path, root):
     return ".".join(parts)
 
 
-def collect(root):
+def collect(root, subtrees):
     found = {}
-    for dirpath, _dirnames, filenames in os.walk(root):
-        if os.path.basename(dirpath) != "__jaicache__":
-            continue
-        for name in filenames:
-            if not name.endswith(".jaic"):
+    for subtree in subtrees:
+        for dirpath, _dirnames, filenames in os.walk(subtree):
+            if os.path.basename(dirpath) != "__jaicache__":
                 continue
-            path = os.path.join(dirpath, name)
-            module = module_name_for(path, root)
-            if module is None:
-                continue
-            with open(path, "rb") as f:
-                found[module] = f.read()
+            for name in filenames:
+                if not name.endswith(".jaic"):
+                    continue
+                path = os.path.join(dirpath, name)
+                module = module_name_for(path, root)
+                if module is None:
+                    continue
+                with open(path, "rb") as f:
+                    found[module] = f.read()
     return dict(sorted(found.items()))
 
 
@@ -70,12 +78,15 @@ def c_bytes(blob, indent="    "):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.stderr.write("usage: gen_seed.py <cache-root> <output.c>\n")
+    if len(sys.argv) < 3:
+        sys.stderr.write(
+            "usage: gen_seed.py <cache-root> <output.c> [subtree ...]\n"
+        )
         return 2
 
     root, out_path = sys.argv[1], sys.argv[2]
-    images = collect(root)
+    subtrees = sys.argv[3:] or [root]
+    images = collect(root, subtrees)
     if not images:
         sys.stderr.write(
             "gen_seed.py: no .jaic images under %r.\n"

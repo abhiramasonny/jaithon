@@ -233,10 +233,17 @@ void jaiModulePathInit(const char *execDir) {
         addLibDirRelative(execDir, "../share/jaithon");
     }
 
-    addLibDir("/usr/local/share/jaithon/lib");
-    addLibDir("/usr/local/share/jaithon");
-    addLibDir("/opt/homebrew/share/jaithon/lib");
-    addLibDir("/opt/homebrew/share/jaithon");
+    /* The installed library, which a machine with jaithon already on it always
+     * has. JAITHON_NO_DEFAULT_PATH exists so that a test can tell the tree it
+     * is testing apart from the one that is installed: without it, moving a
+     * source aside proves nothing, because the search quietly finds the
+     * installed copy and the run succeeds for the wrong reason. */
+    if (getenv("JAITHON_NO_DEFAULT_PATH") == NULL) {
+        addLibDir("/usr/local/share/jaithon/lib");
+        addLibDir("/usr/local/share/jaithon");
+        addLibDir("/opt/homebrew/share/jaithon/lib");
+        addLibDir("/opt/homebrew/share/jaithon");
+    }
 
     syncModulePathMirror();
 }

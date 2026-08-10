@@ -1,16 +1,63 @@
-# Compiling and running this populates __jaicache__ with every module the seed
-# has to carry. `make reseed` runs it with JAITHON_NO_SEED=1, so each import
-# below is compiled from source rather than served by the seed being replaced.
-#
-# `std.list` stands in for the stdlib: compiling it drags in the whole
-# self-hosted front end, which is what the seed is mostly made of. The REPL's
-# scanner is not on that path -- nothing compiles it unless a prompt asks a
-# question -- so it is named here. Leaving it out is not a build failure; it is
-# a cold `jaithon repl` compiling the scanner from source, which under
-# `--gc-stress` takes minutes.
-from std.list import partition
-import jaithon.compile.repl
+#: Compile every module the seed carries, writing each image into the
+#: `__jaicache__` beside its source. `make reseed` runs this, then embeds
+#: exactly what it built.
+#:
+#: It used to work by *importing* `std.list` and letting the importer populate
+#: the cache as a side effect. That relied on the C front end: inside the
+#: bootstrap window `src/runtime/module.c` compiled with C, so the front end's
+#: own closure was compiled even though the front end was not loaded yet. With
+#: one front end the window has only the seed, and a seed that serves a module
+#: means that module is never compiled from source -- so the next seed would be
+#: built from whatever little remained. Measured once, before that was
+#: understood: 39 modules to 10 in a single generation.
+#:
+#: So nothing here imports anything for its side effects. The front end is
+#: loaded from the *previous* seed and then compiles the next one's sources
+#: explicitly, which never enters the window. That is the whole of what
+#: self-hosting means, and it is what makes `make fixpoint-check` a real
+#: question: generation N's compiler builds generation N+1's images, and they
+#: have to come out byte for byte the same.
+from jaithon.compile.mod import build_file
+from std.io import Path
 
-fn main() {
-    print(1)
+#: The tree whose modules the seed carries: the compiler, and nothing else.
+#:
+#: The seed exists for what is needed *before* the front end can compile
+#: anything. Everything else is reached after it is loaded, through the ordinary
+#: cache. Seeding the whole of `lib` also works and costs 9MB of binary for
+#: modules the bootstrap window never asks for.
+pub let SEED_ROOT: str = "lib/jaithon"
+
+fn cache_path_for(source: str) -> str {
+    let path = Path(source)
+    let name = path.name()
+    let stem = name[0:name.len() - ".jai".len()]
+    return f"{path.parent()}/__jaicache__/{stem}.jaic"
+}
+
+fn main() -> int {
+    var built = 0
+    var refused = 0
+
+    for entry in Path(SEED_ROOT).walk() {
+        let source = f"{entry}"
+        if not source.ends_with(".jai") { continue }
+        # A cache directory holds images, not sources.
+        if source.contains("__jaicache__") { continue }
+
+        let out = cache_path_for(source)
+        Path(out).parent().mkdir(parents: true, exist_ok: true)
+        if build_file(source, out).ok() {
+            built += 1
+        } else {
+            # Not fatal on its own: a file the front end refuses is one the seed
+            # should not carry. `make reseed` checks the fixpoint afterwards,
+            # which is what turns a silent gap into a failure.
+            refused += 1
+            print(f"seed_touch: {source} did not compile")
+        }
+    }
+
+    print(f"seed_touch: {built} compiled, {refused} refused")
+    return if refused > 0 { 1 } else { 0 }
 }
