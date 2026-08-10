@@ -1042,24 +1042,29 @@ static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) 
     return bindCallArgsSlow(closure, argc, slotBase);
 }
 
-static bool callClosure(ObjClosure *closure, int argc) {
+/* CALL_FRAME when a frame was pushed and the interpreter must run it,
+ * CALL_DONE when the compiled tier finished the call outright.
+ *
+ * The distinction is not cosmetic. jaiCallValue runs the interpreter whenever
+ * it is told a frame was pushed, so reporting CALL_FRAME for a call the tier
+ * had already completed made it run the CALLER's frame a second time -- which
+ * is how `xs.map(|x| x * 2)` came back holding an int instead of a list. The
+ * interpreter's own OP_CALL never saw it, because LOAD_STATE reloads whatever
+ * frame is on top and that happened to be the right one. */
+static CallOutcome callClosure(ObjClosure *closure, int argc) {
     Value *slotBase = vm.stackTop - argc - 1;
-    if (!bindCallArgs(closure, argc, slotBase)) return false;
+    if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
 
-    /* The compiled tier gets first refusal. It declines for everything today,
-     * and the interpreter below runs the function exactly as it always has --
-     * which is the point: the counter and the threshold are exercised by the
-     * whole suite before any machine code exists. */
     ObjFunction *fn = closure->fn;
     if (fn->entryCount < JAI_JIT_THRESHOLD) {
         fn->entryCount++;
     } else if (!fn->jitRefused && jaiJitEnabled() &&
                jaiJitEnter(closure, slotBase)) {
-        return true;
+        return CALL_DONE;
     }
 
-    if (!pushFrame(closure, slotBase)) return false;
-    return true;
+    if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+    return CALL_FRAME;
 }
 
 /* `args` and `count` differ from the raw stack window for bound natives, whose
@@ -1107,13 +1112,13 @@ static CallOutcome invokeCallable(Value callable, int argc) {
 
     switch (OBJ_TYPE(callable)) {
     case OBJ_CLOSURE:
-        return callClosure(AS_CLOSURE(callable), argc) ? CALL_FRAME : CALL_ERROR;
+        return callClosure(AS_CLOSURE(callable), argc);
 
     case OBJ_FUNCTION: {
         /* A bare function reaching a call site has no upvalues by
          * construction; wrap it so the frame protocol stays uniform. */
         ObjClosure *closure = jaiClosureNew(AS_FUNCTION(callable));
-        return callClosure(closure, argc) ? CALL_FRAME : CALL_ERROR;
+        return callClosure(closure, argc);
     }
 
     case OBJ_NATIVE: {
@@ -3966,7 +3971,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
          * closure -- takes the general path unchanged. */
         Value callee = vm.stackTop[-argc - 1];
         if (JAI_LIKELY(IS_CLOSURE(callee))) {
-            if (!callClosure(AS_CLOSURE(callee), argc)) goto vmThrow;
+            if (callClosure(AS_CLOSURE(callee), argc) == CALL_ERROR) goto vmThrow;
         } else if (callValueOnStack(argc) == CALL_ERROR) {
             goto vmThrow;
         }

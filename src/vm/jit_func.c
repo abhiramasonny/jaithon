@@ -38,6 +38,8 @@
 #include "jit_arm64.h"
 #include "vm.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -93,6 +95,7 @@ typedef struct {
     int      instIndex;    /* which emitted instruction to patch */
     uint32_t targetOffset; /* bytecode offset, or FIXUP_BAIL / FIXUP_ENTRY */
     bool     conditional;  /* b.cond rather than b */
+    int      depth;        /* value-stack depth where the branch leaves from */
 } Fixup;
 
 typedef struct {
@@ -108,8 +111,10 @@ typedef struct {
     unsigned  fixupCount;
 
     int      *offsetToInst;  /* bytecode offset -> instruction index, or -1 */
+    int      *offsetToDepth; /* bytecode offset -> value-stack depth, or -1 */
 
     unsigned  arity;
+    unsigned  locals;      /* slots 1..locals live in registers */
     unsigned  frameBytes;
     unsigned  savedCount;
 
@@ -126,18 +131,20 @@ static void emit(Emit *e, uint32_t word) {
 }
 
 static unsigned localReg(const Emit *e, unsigned slot) {
-    /* Slot 0 is the callee; parameters are slots 1..arity. */
+    /* Slot 0 is the callee; parameters are slots 1..arity, and any further
+     * local the body declares continues from there. */
+    (void)e;
     return JIT_FIRST_SAVED + (slot - 1);
 }
 
 /* The register a new value entry would occupy. */
 static unsigned pushReg(const Emit *e) {
-    return JIT_FIRST_SAVED + e->arity + e->valueDepth;
+    return JIT_FIRST_SAVED + e->locals + e->valueDepth;
 }
 
 static bool pushValue(Emit *e) {
     if (e->depth >= JIT_MAX_SAVED) return false;
-    if (e->arity + e->valueDepth + 1 > JIT_MAX_SAVED) return false;
+    if (e->locals + e->valueDepth + 1 > JIT_MAX_SAVED) return false;
     e->stack[e->depth++] = SLOT_VALUE;
     e->valueDepth++;
     if (e->valueDepth > e->maxValue) e->maxValue = e->valueDepth;
@@ -155,7 +162,7 @@ static bool popValue(Emit *e, unsigned *reg) {
     if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_VALUE) return false;
     e->depth--;
     e->valueDepth--;
-    *reg = JIT_FIRST_SAVED + e->arity + e->valueDepth;
+    *reg = JIT_FIRST_SAVED + e->locals + e->valueDepth;
     return true;
 }
 
@@ -216,20 +223,24 @@ static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = targetOffset;
     e->fixups[e->fixupCount].conditional  = conditional;
+    e->fixups[e->fixupCount].depth        = (int)e->valueDepth;
     e->fixupCount++;
     emit(e, conditional ? jaiA64BCond(cond, 0) : jaiA64B(0));
 }
 
-/* `b.vs bail` after an arithmetic instruction. The bail block's index is not
- * known yet, so it is patched with the rest. */
-static void branchOnOverflow(Emit *e) {
+/* Branch to the bail block on `cond`. The block's index is not known yet, so
+ * it is patched with the rest. */
+static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_INSTS) { e->failed = true; return; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
     e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = -1;   /* bails do not join */
     e->fixupCount++;
-    emit(e, jaiA64BCond(JAI_A64_VS, 0));
+    emit(e, jaiA64BCond(cond, 0));
 }
+
+static void branchOnOverflow(Emit *e) { branchOnCondition(e, JAI_A64_VS); }
 
 /* The condition to branch on when the comparison is FALSE: the opcode jumps
  * over the taken side, `if (!taken) ip += offset`. */
@@ -264,13 +275,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
     int count = fn->chunk.count;
 
     for (int off = 0; off < count && !e->failed;) {
-        e->offsetToInst[off] = (int)e->count;
+        e->offsetToInst[off]  = (int)e->count;
+        e->offsetToDepth[off] = (int)e->valueDepth;
         uint8_t op = code[off];
 
         switch (op) {
         case OP_GET_LOCAL: {
             unsigned slot = jaiReadU16(code + off + 1);
-            if (slot < 1 || slot > e->arity) return false;
+            if (slot < 1 || slot > e->locals) return false;
             if (!pushValue(e)) return false;
             emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
             off += 3;
@@ -282,6 +294,75 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!pushValue(e)) return false;
             emitConst64(e, pushReg(e) - 1, k);
             off += 3;
+            break;
+        }
+
+        case OP_SET_LOCAL: {
+            /* Assigns without popping: the value stays as the statement's
+             * result, which is what the interpreter does. */
+            unsigned slot = jaiReadU16(code + off + 1);
+            if (slot < 1 || slot > e->locals) return false;
+            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_VALUE) return false;
+            emit(e, jaiA64MovX(localReg(e, slot),
+                               JIT_FIRST_SAVED + e->locals + e->valueDepth - 1));
+            off += 3;
+            break;
+        }
+
+        case OP_POP: {
+            unsigned r;
+            if (!popValue(e, &r)) return false;
+            off += 1;
+            break;
+        }
+
+        case OP_CONST: {
+            uint32_t idx = jaiReadU24(code + off + 1);
+            if (idx >= (uint32_t)fn->chunk.constants.count) return false;
+            Value k = fn->chunk.constants.data[idx];
+            if (!IS_INT(k)) return false;
+            if (!pushValue(e)) return false;
+            emitConst64(e, pushReg(e) - 1, AS_INT(k));
+            off += 4;
+            break;
+        }
+
+        case OP_JUMP: {
+            int16_t jump = jaiReadI16(code + off + 1);
+            branchTo(e, (uint32_t)((int32_t)(off + 3) + jump), false, 0);
+            off += 3;
+            break;
+        }
+
+        case OP_LOOP: {
+            /* The interpreter runs a safepoint on the back edge; compiled code
+             * cannot, so a compiled loop is not interruptible and does not get
+             * sampled. Both are acceptable only because this tier bails on any
+             * unbounded construct: the loop is over ints, cannot allocate, and
+             * the stack guard still catches runaway recursion. Ctrl-C during a
+             * long compiled loop waits for the loop, which is a real cost and
+             * the reason the trip count is not unbounded in practice. */
+            int16_t jump = jaiReadI16(code + off + 1);
+            branchTo(e, (uint32_t)((int32_t)(off + 3) + jump), false, 0);
+            off += 3;
+            break;
+        }
+
+        case OP_MUL: {
+            unsigned rb, ra;
+            if (!popValue(e, &rb)) return false;
+            if (!popValue(e, &ra)) return false;
+            if (!pushValue(e)) return false;
+            unsigned rd = pushReg(e) - 1;
+            /* The product overflows exactly when the high half is not the low
+             * half's sign bit replicated, so smulh and one shifted compare
+             * decide it. mul must come after smulh reads its inputs, since rd
+             * may be one of them. */
+            emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
+            emit(e, jaiA64MulX(rd, ra, rb));
+            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+            branchOnCondition(e, JAI_A64_NE);
+            off += 1;
             break;
         }
 
@@ -308,7 +389,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned cond;
             if (!negatedCondition(cmp, &cond)) return false;
-            if (slot < 1 || slot > e->arity) return false;
+            if (slot < 1 || slot > e->locals) return false;
             if (kIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value k = fn->chunk.constants.data[kIdx];
             if (!IS_INT(k)) return false;
@@ -336,7 +417,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
-            unsigned first = JIT_FIRST_SAVED + e->arity + e->valueDepth - argc;
+            unsigned first = JIT_FIRST_SAVED + e->locals + e->valueDepth - argc;
             for (unsigned i = 0; i < argc; i++) {
                 emit(e, jaiA64MovX(i, first + i));
             }
@@ -366,6 +447,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         default:
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] %s declined at %s\n",
+                        fn->name ? fn->name->chars : "<anon>",
+                        jaiOpName((OpCode)op));
+            }
             return false;   /* an opcode this tier does not speak */
         }
     }
@@ -376,8 +462,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 /* Assembly                                                             */
 /* ------------------------------------------------------------------ */
 
+static void jitFree(int *map, int *depths, int count) {
+    JAI_FREE_ARRAY(int, map, count);
+    JAI_FREE_ARRAY(int, depths, count);
+}
+
 static bool eligible(ObjFunction *fn) {
     if (fn->arity == 0 || fn->arity > JIT_MAX_ARITY) return false;
+    if (fn->maxSlots < 1 || (unsigned)fn->maxSlots - 1 > JIT_MAX_SAVED) return false;
     if (fn->defaultCount != 0) return false;
     if (fn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
     if (fn->upvalueCount != 0) return false;
@@ -394,12 +486,18 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     if (arena == NULL) return false;
 
     int *map = JAI_ALLOC(int, fn->chunk.count + 1);
-    for (int i = 0; i <= fn->chunk.count; i++) map[i] = -1;
+    int *depths = JAI_ALLOC(int, fn->chunk.count + 1);
+    for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
+
+    unsigned locals = (unsigned)fn->maxSlots - 1;
+    if (locals < fn->arity) locals = fn->arity;
 
     Emit e;
     memset(&e, 0, sizeof e);
     e.arity        = fn->arity;
-    e.offsetToInst = map;
+    e.locals       = locals;
+    e.offsetToInst  = map;
+    e.offsetToDepth = depths;
     e.limitLiteral = -1;
     e.bailLiteral  = -1;
     e.bailBlock    = -1;
@@ -411,7 +509,9 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     Emit body;
     memset(&body, 0, sizeof body);
     body.arity        = fn->arity;
+    body.locals       = locals;
     body.offsetToInst = map;
+    body.offsetToDepth = depths;
 
     /* A first pass with a provisional frame, only to learn maxValue. The
      * emitted words are thrown away: frameBytes appears in the epilogue, so
@@ -419,10 +519,10 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     body.savedCount = JIT_MAX_SAVED;
     body.frameBytes = 16 + 8 * JIT_MAX_SAVED + 8;   /* 16-aligned below */
     body.frameBytes = (body.frameBytes + 15u) & ~15u;
-    if (!compileBody(&body, closure)) { JAI_FREE_ARRAY(int, map, fn->chunk.count + 1); return false; }
+    if (!compileBody(&body, closure)) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
-    unsigned saved = fn->arity + body.maxValue;
-    if (saved > JIT_MAX_SAVED) { JAI_FREE_ARRAY(int, map, fn->chunk.count + 1); return false; }
+    unsigned saved = locals + body.maxValue;
+    if (saved > JIT_MAX_SAVED) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
     e.savedCount = saved;
     e.frameBytes = (16u + 8u * saved + 15u) & ~15u;
@@ -432,6 +532,13 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     emitSaveRestore(&e, true);
     for (unsigned i = 0; i < e.arity; i++) {
         emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
+    }
+    /* A local the interpreter would have left as NULL_VAL starts at zero here.
+     * The checker guarantees definite assignment before any read, so this is
+     * belt and braces -- but a register holding the last call's value would be
+     * a bug that only shows up under recursion. */
+    for (unsigned i = e.arity; i < e.locals; i++) {
+        emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
     }
     /* Stack guard: bail rather than run off the end of the thread's stack,
      * so that runaway recursion still becomes a RecursionError. */
@@ -444,10 +551,11 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
 
     unsigned prologue = e.count;
 
-    for (int i = 0; i <= fn->chunk.count; i++) map[i] = -1;
-    e.offsetToInst = map;
-    if (!compileBody(&e, closure)) { JAI_FREE_ARRAY(int, map, fn->chunk.count + 1); return false; }
-    if (e.failed) { JAI_FREE_ARRAY(int, map, fn->chunk.count + 1); return false; }
+    for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
+    e.offsetToInst  = map;
+    e.offsetToDepth = depths;
+    if (!compileBody(&e, closure)) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
     (void)prologue;
 
     /* The bail block: say so, return anything, and let the caller throw the
@@ -464,7 +572,7 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     if ((e.count & 1u) != 0) emit(&e, jaiA64Nop());
     e.limitLiteral = (int)e.count;
     uintptr_t limit = stackLimit();
-    if (limit == 0) { JAI_FREE_ARRAY(int, map, fn->chunk.count + 1); return false; }
+    if (limit == 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
     emit(&e, (uint32_t)(uint64_t)limit);
     emit(&e, (uint32_t)((uint64_t)limit >> 32));
     e.bailLiteral = (int)e.count;
@@ -472,7 +580,7 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     emit(&e, (uint32_t)(uint64_t)bailAddr);
     emit(&e, (uint32_t)((uint64_t)bailAddr >> 32));
 
-    if (e.failed) { JAI_FREE_ARRAY(int, map, fn->chunk.count + 1); return false; }
+    if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
     /* Patch the two literal loads and the guard branch. */
     e.code[guardLoad] = jaiA64LdrLit(JIT_SCRATCH_A, e.limitLiteral - guardLoad);
@@ -490,12 +598,22 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
             target = 0;
         } else {
             if (f->targetOffset > (uint32_t)fn->chunk.count) {
-                JAI_FREE_ARRAY(int, map, fn->chunk.count + 1);
+                jitFree(map, depths, fn->chunk.count + 1);
                 return false;
             }
             target = map[f->targetOffset];
             if (target < 0) {
-                JAI_FREE_ARRAY(int, map, fn->chunk.count + 1);
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
+            /* Registers are assigned from the operand-stack depth at each
+             * point, so a join reached at two different depths would read a
+             * value out of a register that holds something else. The walk
+             * through the bytecode is linear and cannot see that, so it is
+             * checked here and the function is declined rather than
+             * mis-compiled. */
+            if (f->depth >= 0 && depths[f->targetOffset] != f->depth) {
+                jitFree(map, depths, fn->chunk.count + 1);
                 return false;
             }
         }
@@ -509,7 +627,7 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
             e.code[f->instIndex] = jaiA64B(rel);
         }
     }
-    JAI_FREE_ARRAY(int, map, fn->chunk.count + 1);
+    jitFree(map, depths, fn->chunk.count + 1);
 
     /* A `bl` at instruction i must reach instruction 0 of this function, so
      * the recursive-call fixups above are relative to the function's own
@@ -524,6 +642,11 @@ bool jaiJitCompileFunc(ObjClosure *closure) {
     if (entry == NULL) return false;
     if (!jaiCodeArenaSeal(arena)) return false;
 
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] compiled %s  arity=%u locals=%u insts=%u\n",
+                fn->name ? fn->name->chars : "<anon>", e.arity, e.locals,
+                e.count);
+    }
     fn->jitFunc = entry;
     return true;
 }

@@ -150,7 +150,10 @@ typedef int (*JaiCompiledLoop)(Value *slots, int64_t limit);
  * residency, not the removal of dispatch, is where the win is. */
 static void *compileLoop(const LoopShape *shape) {
     JaiCodeArena *arena = jaiJitArena();
-    if (arena == NULL || arena->sealed) return NULL;
+    /* Unseal rather than decline: the function tier shares this arena and
+     * seals it after each compile, so a program whose first compiled thing is
+     * a function would have had every later loop refused. */
+    if (arena == NULL || !jaiCodeArenaUnseal(arena)) return NULL;
 
     unsigned accInt = shape->accSlot * 16 + 8, accTag = shape->accSlot * 16;
     unsigned iInt   = shape->iSlot * 16 + 8,   iTag   = shape->iSlot * 16;
