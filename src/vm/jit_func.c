@@ -215,6 +215,43 @@ static int jitBuildList(JitCallDesc *d) {
     return 0;
 }
 
+/* Build the range and its iterator in one step. args[0] is the start, args[1]
+ * the stop, args[2] whether it is inclusive. Allocating twice, so the roots go
+ * down first as for any other call out of compiled code. */
+static int jitMakeRangeIter(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    ObjRange *r = jaiRangeNew(AS_INT(d->args[0]), AS_INT(d->args[1]), 1,
+                              AS_INT(d->args[2]) != 0);
+    jaiGCPushRoot(OBJ_VAL(r));
+    ObjIter *it = jaiIterNew(ITER_RANGE, OBJ_VAL(r));
+    jaiGCPopRoot();
+    d->result = OBJ_VAL(it);
+    jaiGCPopRoots((int)d->nroots);
+    return 0;
+}
+
+/* Make an iterator over whatever args[0] is. */
+static int jitMakeIter(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    Value src = d->args[0];
+    IterKind k = IS_LIST(src) ? ITER_LIST : ITER_LIST;
+    ObjIter *it = jaiIterNew(k, src);
+    d->result = OBJ_VAL(it);
+    jaiGCPopRoots((int)d->nroots);
+    return IS_LIST(src) ? 0 : 1;
+}
+
+/* One step. 0 advanced with the item in `result`, 1 exhausted, 2 raised. */
+static int jitIterStep(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    Value item;
+    bool ok = jaiIterNext(AS_ITER(d->args[0]), &item);
+    jaiGCPopRoots((int)d->nroots);
+    if (!ok) return vm.hasException ? 2 : 1;
+    d->result = item;
+    return 0;
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -235,6 +272,10 @@ typedef enum {
     SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
     SLOT_CLASS,   /* a class resolved at compile time; only ever a callee */
     SLOT_FUNC,    /* a global function resolved at compile time, likewise */
+    SLOT_ITER,    /* an ObjIter this body built, held raw. Its index stays in
+                   * memory rather than a register, which costs a load and a
+                   * store an iteration and makes a deopt need nothing: the
+                   * iterator on the stack is always current. */
     SLOT_BOOL,    /* 0 or 1 in a register; a Value's boolean member is its low
                    * byte, so the same word serves both */
     SLOT_OBJ,     /* some heap object, raw, of a type this tier does not model.
@@ -294,6 +335,11 @@ typedef struct {
     uint32_t  localShape[JIT_MAX_SLOTS + 1];
     ObjClass *localClass[JIT_MAX_SLOTS + 1];
     bool      localTyped[JIT_MAX_SLOTS + 1];   /* parameter, or already bound */
+    /* A value of the kind this local holds, kept only so a field read on it
+     * has something to read the field's type off. A local bound from a list
+     * element has no argument to look at, which is why `bi` in nbody's
+     * advance could not have its fields read. */
+    Value     localSeen[JIT_MAX_SLOTS + 1];
     Value    *observed;      /* the live arguments, for field-type feedback */
     bool      assumedIntReturn;
     unsigned  depth;       /* entries on the operand stack */
@@ -339,6 +385,9 @@ typedef struct {
      * register, and every way out writes it back so the interpreter can carry
      * on from wherever this stopped. */
     bool      hasIter;
+    bool      pendingRange;
+    bool      genericIter;
+    bool      rangeInclusive;
     unsigned  iterSlot;
     uint32_t  iterExit;
     int       exitStub[8];       /* one per distinct offset jumped out to */
@@ -642,6 +691,9 @@ static uint32_t exitTargetFor(Emit *e, uint32_t target) {
     return FIXUP_EXIT - e->exitCount++;
 }
 
+static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
+                          int depthOverride);
+
 static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
@@ -828,6 +880,8 @@ static bool isClassCallee(const Emit *e, unsigned argc) {
 
 static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
                            uint32_t shape, ObjClass *klass);
+static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
+                               uint32_t shape, ObjClass *klass, Value seen);
 
 static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper) {
@@ -849,7 +903,8 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
         unsigned idx = first + i;
         SlotKind k = e->stack[idx];
         if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
-            k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ) {
+            k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER) {
             e->whyNot = "an argument kind this call cannot pass";
             return false;
         }
@@ -872,7 +927,8 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
         if (e->localKind[slot] != SLOT_INST &&
             e->localKind[slot] != SLOT_LIST &&
-            e->localKind[slot] != SLOT_OBJ) {
+            e->localKind[slot] != SLOT_OBJ &&
+            e->localKind[slot] != SLOT_ITER) {
             continue;
         }
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
@@ -1006,7 +1062,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                             e->localClass[slot],
                             localObserved(e, slot) ? e->observed[slot]
-                                                   : NULL_VAL,
+                                                   : e->localSeen[slot],
                             (int)slot)) {
                 return false;
             }
@@ -1193,9 +1249,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!localInRange(e, slot)) return false;
             if (slot == 0) e->usesSlot0 = true;
             if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
-            if (!adoptLocalKind(e, slot, e->stack[e->depth - 1],
-                                e->stackShape[e->depth - 1],
-                                e->stackClass[e->depth - 1])) {
+            if (!adoptLocalKindSeen(e, slot, e->stack[e->depth - 1],
+                                    e->stackShape[e->depth - 1],
+                                    e->stackClass[e->depth - 1],
+                                    e->stackSeen[e->depth - 1])) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
@@ -1339,7 +1396,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (idx >= (uint32_t)fn->chunk.constants.count) return false;
             Value k = fn->chunk.constants.data[idx];
             if (IS_INT(k)) {
-                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                if (!pushValue3(e, SLOT_INT, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, AS_INT(k));
             } else if (IS_FLOAT(k)) {
                 /* The bits, not the number: a float lives in an X register
@@ -1347,7 +1404,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 double d = AS_FLOAT(k);
                 int64_t bits;
                 memcpy(&bits, &d, sizeof bits);
-                if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
+                if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, bits);
             } else {
                 return false;
@@ -1478,7 +1535,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned slot    = jaiReadU16(code + off + 1);
             uint32_t nameIdx = jaiReadU24(code + off + 3);
 
-            if (!localObserved(e, slot)) return false;   /* see below */
             if (e->localKind[slot] != SLOT_INST) return false;
             if (slot == 0) e->usesSlot0 = true;
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
@@ -1494,7 +1550,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * than to a declaration. That is only possible for a parameter,
              * which is why the slot is capped at the arity above: a local
              * assigned further in has no value to look at yet. */
-            Value seen = e->observed[slot];
+            /* A parameter has its argument to look at; anything else has
+             * whatever was bound to it. */
+            Value seen = localObserved(e, slot) ? e->observed[slot]
+                                                : e->localSeen[slot];
             if (!IS_INSTANCE(seen)) return false;
             ObjInstance *inst = AS_INSTANCE(seen);
             if (info->slot >= inst->fieldCount) return false;
@@ -1538,7 +1597,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                                 e->localClass[slot],
                                 localObserved(e, slot) ? e->observed[slot]
-                                                       : NULL_VAL,
+                                                       : e->localSeen[slot],
                                 (int)slot)) {
                     return false;
                 }
@@ -1720,6 +1779,35 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
             e->wroteHeap = true;
             off += 3;
+            break;
+        }
+
+        case OP_POW: {
+            /* Only `** 0.5`, which is a square root. C says pow(x, 0.5) is
+             * sqrt(x) for every x >= +0, and differs only for -0.0, where pow
+             * gives +0.0 and sqrt gives -0.0. So a negative sign bit -- which
+             * is what tells -0.0 from +0.0 -- goes back to the interpreter. */
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 1] != SLOT_FLOAT) return false;
+            if (e->stack[e->depth - 2] != SLOT_FLOAT) return false;
+            Value expv = e->stackSeen[e->depth - 1];
+            if (!IS_FLOAT(expv) || AS_FLOAT(expv) != 0.5) {
+                e->whyNot = "an exponent other than 0.5";
+                return false;
+            }
+            unsigned rbase = pushReg(e) - 2;
+            emit(e, jaiA64LsrX(JIT_SCRATCH_A, rbase, 63));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            unsigned dp1, dp2;
+            if (!popValue(e, &dp1, NULL)) return false;
+            if (!popValue(e, &dp2, NULL)) return false;
+            if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
+            emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, rbase));
+            emit(e, jaiA64FsqrtD(JIT_FSCRATCH_A, JIT_FSCRATCH_A));
+            emit(e, jaiA64FmovXD(pushReg(e) - 1, JIT_FSCRATCH_A));
+            off += 1;
             break;
         }
 
@@ -1961,7 +2049,155 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_BUILD_RANGE: {
+            /* Deferred: the range is only worth building alongside its
+             * iterator, which the next instruction asks for. */
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            if (e->stack[e->depth - 2] != SLOT_INT) return false;
+            /* OP_BUILD_RANGE carries one operand byte, so the next opcode is
+             * two along. */
+            if (off + 2 >= count || code[off + 2] != OP_GET_ITER) {
+                e->whyNot = "a range that is not immediately iterated";
+                return false;
+            }
+            e->rangeInclusive = code[off + 1] != 0;
+            e->pendingRange = true;
+            off += 2;
+            break;
+        }
+
+        case OP_GET_ITER: {
+            if (!e->pendingRange) {
+                /* Not a range: iterate whatever it is, through the runtime. */
+                if (e->depth == 0) return false;
+                if (e->stack[e->depth - 1] != SLOT_LIST) {
+                    e->whyNot = "iterating something other than a list or range";
+                    return false;
+                }
+                if (!e->callsOut) return false;
+                /* Carry one element forward: the loop variable's kind comes
+                 * from it, and the iterator itself says nothing about what it
+                 * will yield. */
+                Value srcv = e->stackSeen[e->depth - 1];
+                Value sample = NULL_VAL;
+                if (IS_LIST(srcv) && AS_LIST(srcv)->count > 0) {
+                    sample = AS_LIST(srcv)->items[0];
+                }
+                if (IS_NULL(sample)) {
+                    e->whyNot = "iterating a list with nothing to look at";
+                    return false;
+                }
+                if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
+                                    (void *)&jitMakeIter)) {
+                    return false;
+                }
+                unsigned rdrop;
+                if (!popValue(e, &rdrop, NULL)) return false;
+                if (!pushValue3(e, SLOT_ITER, 0, NULL, sample, -1)) return false;
+                emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                                   e->descOffset +
+                                       (unsigned)offsetof(JitCallDesc, result) + 8));
+                e->wroteHeap = true;
+                e->genericIter = true;
+                off += 1;
+                break;
+            }
+            e->pendingRange = 0;
+            if (!e->callsOut) return false;
+            /* start, stop and the inclusive flag go in as arguments. */
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            emitConst64(e, pushReg(e) - 1, e->rangeInclusive ? 1 : 0);
+            if (!emitDescriptor(e, NULL_VAL, e->depth - 3, 3,
+                                (void *)&jitMakeRangeIter)) {
+                return false;
+            }
+            for (unsigned i = 0; i < 3; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            if (!pushValue(e, SLOT_ITER, 0, NULL)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off += 1;
+            break;
+        }
+
         case OP_FOR_ITER_BIND: {
+            /* A loop this body built the iterator for: the index lives in the
+             * iterator, so every iteration loads and stores it, and a deopt
+             * needs nothing -- what is on the stack is already current. */
+            if (!e->osr || !e->hasIter) {
+                if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER) {
+                    return false;
+                }
+                int16_t  fjump = jaiReadI16(code + off + 1);
+                unsigned fslot = jaiReadU16(code + off + 3);
+                if (!localInRange(e, fslot)) return false;
+                unsigned rIt = pushReg(e) - 1;
+
+                if (e->genericIter) {
+                    /* A list iterator: ask the runtime for each element and
+                     * take the kind from the one it is holding now. */
+                    Value sample = e->stackSeen[e->depth - 1];
+                    SlotKind ek; uint32_t esh = 0; ObjClass *ecl = NULL;
+                    if (IS_INT(sample))        ek = SLOT_INT;
+                    else if (IS_FLOAT(sample)) ek = SLOT_FLOAT;
+                    else if (IS_INSTANCE(sample) && AS_INSTANCE(sample)->klass) {
+                        ek = SLOT_INST;
+                        ecl = AS_INSTANCE(sample)->klass;
+                        esh = ecl->shapeId;
+                    } else { e->whyNot = "element kind unknown"; return false; }
+
+                    if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
+                                        (void *)&jitIterStep)) {
+                        return false;
+                    }
+                    /* 1 is exhausted, anything higher is a raise. */
+                    emit(e, jaiA64SubsXImm(31, 0, 1));
+                    branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                                  JAI_A64_EQ, (int)e->valueDepth - 1);
+                    emit(e, jaiA64SubsXImm(31, 0, 1));
+                    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+                    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+                    e->fixups[e->fixupCount].conditional  = true;
+                    e->fixups[e->fixupCount].depth        = -1;
+                    e->fixupCount++;
+                    emit(e, jaiA64BCond(JAI_A64_GT, 0));
+
+                    if (!adoptLocalKindSeen(e, fslot, ek, esh, ecl, sample)) {
+                        e->whyNot = "loop variable took two kinds";
+                        return false;
+                    }
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, 31,
+                                       e->descOffset +
+                                           (unsigned)offsetof(JitCallDesc, result) + 8));
+                    localOut(e, fslot, JIT_SCRATCH_A);
+                    e->wroteHeap = true;
+                    off += 5;
+                    break;
+                }
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rIt,
+                                   (unsigned)offsetof(ObjIter, index)));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIt,
+                                   (unsigned)offsetof(ObjIter, limit)));
+                if (!adoptLocalKind(e, fslot, SLOT_INT, 0, NULL)) return false;
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                /* The exhausted arm drops the iterator, so the target is
+                 * reached one entry shallower than this branch leaves from. */
+                branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                              JAI_A64_GE, (int)e->valueDepth - 1);
+                localOut(e, fslot, JIT_SCRATCH_A);
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+                emit(e, jaiA64StrX(JIT_SCRATCH_A, rIt,
+                                   (unsigned)offsetof(ObjIter, index)));
+                off += 5;
+                break;
+            }
             /* Only as the head of the loop being compiled, and only for a
              * range from zero in unit steps -- that is what makes the yielded
              * value the index itself. Everything else about the iterator is a
@@ -2047,7 +2283,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned d1, d2;
             if (!popValue(e, &d1, NULL)) return false;
             if (!popValue(e, &d2, NULL)) return false;
-            if (!pushValue(e, kind, elemShape, elemClass)) return false;
+            if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 8));
             off += 1;
             break;
@@ -2254,8 +2490,9 @@ static bool seedLocals(Emit *e, Value *slotBase) {
 /* A local that is not a parameter takes the kind of the first thing bound to
  * it; after that it must keep it, because every read of it was compiled to one
  * instruction chosen from that kind. */
-static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
-                           uint32_t shape, ObjClass *klass) {
+static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
+                               uint32_t shape, ObjClass *klass, Value seen) {
+    if (!IS_NULL(seen)) e->localSeen[slot] = seen;
     if (!e->localTyped[slot]) {
         e->localKind[slot]  = kind;
         e->localShape[slot] = shape;
@@ -2264,6 +2501,11 @@ static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
         return true;
     }
     return e->localKind[slot] == kind && e->localShape[slot] == shape;
+}
+
+static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
+                           uint32_t shape, ObjClass *klass) {
+    return adoptLocalKindSeen(e, slot, kind, shape, klass, NULL_VAL);
 }
 
 static void jitFree(int *map, int *depths, int count) {
@@ -3209,3 +3451,21 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
 }
 
 #endif
+
+/* A conditional branch whose target is reached with a different operand stack
+ * than the branch leaves from -- the exhausted arm of a for-loop, where the
+ * interpreter drops the iterator. */
+static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
+                          int depthOverride) {
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    if (e->osr && targetOffset < UINT32_MAX - 64u &&
+        (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
+        targetOffset = exitTargetFor(e, targetOffset);
+    }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = targetOffset;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = depthOverride;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(cond, 0));
+}
