@@ -271,3 +271,22 @@ uint32_t jaiA64LslX(unsigned rd, unsigned rn, unsigned shift) {
 uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xca000000u | (rm << 16) | (rn << 5) | rd;
 }
+
+uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x8a000000u | (rm << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0xaa000000u | (rm << 16) | (rn << 5) | rd;
+}
+
+/* Shift by a register. Both use only the low six bits of the amount, so a
+ * count of 64 or more wraps rather than saturating -- the callers guard for
+ * that before emitting these. */
+uint32_t jaiA64LslvX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x9ac02000u | (rm << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64AsrvX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x9ac02800u | (rm << 16) | (rn << 5) | rd;
+}

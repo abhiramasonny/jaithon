@@ -2025,6 +2025,49 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_BAND:
+        case OP_BOR:
+        case OP_BXOR:
+        case OP_SHL:
+        case OP_SHR: {
+            /* The rest of the integer instruction set. None of `& | ^` can
+             * fail, so they are three registers and one instruction.
+             *
+             * The shifts have two edges the hardware does not share: jaithon
+             * throws on a negative count and saturates at 64 or more, while
+             * arm64's LSLV and ASRV use the low six bits of the count and so
+             * wrap. Both edges are guarded and deopt, which is right twice
+             * over -- they are vanishingly rare, and the interpreter already
+             * has the exact rule. The guards precede the pops, so a deopt
+             * resumes at an instruction that has not happened. */
+            unsigned rb, ra;
+            SlotKind kb, ka;
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            if (e->stack[e->depth - 2] != SLOT_INT) return false;
+
+            if (op == OP_SHL || op == OP_SHR) {
+                unsigned rCount = pushReg(e) - 1;
+                emit(e, jaiA64SubsXImm(31, rCount, 0));
+                branchOnDeopt(e, JAI_A64_LT);            /* negative count */
+                emitConst64(e, JIT_SCRATCH_A, 64);
+                emit(e, jaiA64SubsXReg(31, rCount, JIT_SCRATCH_A));
+                branchOnDeopt(e, JAI_A64_GE);            /* 64 or more */
+            }
+
+            if (!popValue(e, &rb, &kb)) return false;
+            if (!popValue(e, &ra, &ka)) return false;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            unsigned rd = pushReg(e) - 1;
+            emit(e, op == OP_BAND ? jaiA64AndX(rd, ra, rb)
+                  : op == OP_BOR  ? jaiA64OrrX(rd, ra, rb)
+                  : op == OP_BXOR ? jaiA64EorX(rd, ra, rb)
+                  : op == OP_SHL  ? jaiA64LslvX(rd, ra, rb)
+                                  : jaiA64AsrvX(rd, ra, rb));
+            off += 1;
+            break;
+        }
+
         case OP_ADD:
         case OP_SUB:
         case OP_DIV: {
@@ -4338,6 +4381,29 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u: %u instructions\n",
                 fn->name ? fn->name->chars : "<anon>", top, e.count);
+    }
+    /* The same dump the whole-function tier has. A compiled loop is where most
+     * of the time goes, so it is the code most worth reading, and until now it
+     * was the only tier that could not be read at all. */
+    {
+        const char *dump = getenv("JAI_JIT_DUMP");
+        if (dump != NULL && fn->name != NULL &&
+            strcmp(dump, fn->name->chars) == 0) {
+            char path[256];
+            snprintf(path, sizeof path, "jit_osr_%s_%u.bin",
+                     fn->name->chars, top);
+            FILE *fp = fopen(path, "wb");
+            if (fp != NULL) {
+                fwrite(e.code, sizeof e.code[0], e.count, fp);
+                fclose(fp);
+                fprintf(stderr, "[jit] %u words to %s\n", e.count, path);
+                for (unsigned i = 0; i <= (unsigned)fn->chunk.count; i++) {
+                    if (map[i] >= 0) {
+                        fprintf(stderr, "[jit] bc %u is inst %d\n", i, map[i]);
+                    }
+                }
+            }
+        }
     }
     return true;
 }
