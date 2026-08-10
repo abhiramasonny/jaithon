@@ -564,6 +564,23 @@ int main(void) {
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64EorX(0, 1, 2), jaiA64Ret() };
       check("eor", runWith(w, 4, cell), 0xf0 ^ 0x3c); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
+                             jaiA64AndX(0, 1, 2), jaiA64Ret() };
+      check("and", runWith(w, 4, cell), 0xf0 & 0x3c); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
+                             jaiA64OrrX(0, 1, 2), jaiA64Ret() };
+      check("orr", runWith(w, 4, cell), 0xf0 | 0x3c); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x1234, 0), jaiA64MovzX(2, 5, 0),
+                             jaiA64LslvX(0, 1, 2), jaiA64Ret() };
+      check("lslv", runWith(w, 4, cell), 0x1234 << 5); }
+    { /* asrv is arithmetic: the sign comes down with it */
+      const uint32_t w[] = { jaiA64MovzX(1, 64, 0), jaiA64SubsXReg(1, 31, 1),
+                             jaiA64MovzX(2, 3, 0),
+                             jaiA64AsrvX(0, 1, 2), jaiA64Ret() };
+      check("asrv negative", runWith(w, 5, cell), (uint64_t)(int64_t)(-64 >> 3)); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x8000, 0), jaiA64MovzX(2, 7, 0),
+                             jaiA64AsrvX(0, 1, 2), jaiA64Ret() };
+      check("asrv", runWith(w, 4, cell), 0x8000 >> 7); }
     { /* -3 and 5 differ in sign, so the eor is negative */
       const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64SubsXReg(1, 31, 1),
                              jaiA64MovzX(2, 5, 0),
