@@ -643,27 +643,78 @@ static bool cacheFlagsMatch(const char *sourcePath, uint32_t flags) {
  * module would have no text to quote. */
 #define JAI_SELF_HOSTED_MODULE "jaithon.compile"
 
-static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
-    /* Load the front end once, before any module body runs.
-     *
-     * Without this the first thing needing a compile can be an `import`
-     * executed from inside a module body that was itself served from cache,
-     * and the compiler gets loaded there -- inside a running body. That is why
-     * a warm run failed where a cold one passed: compiling the entry file cold
-     * pulls the front end in first, and a cache hit skips that.
-     *
-     * It lives here rather than in jaiRunFile because `repl` and `check` are
-     * separate entry points that never call it, and the REPL golden
-     * `bindings_persist` lost a line for exactly that reason. Every module load
-     * goes through here, so one flag covers all of them. */
-    if (sOptions.selfHosted && !sLoadingFrontEnd && !sFrontEndWarmed) {
-        sFrontEndWarmed = true;
-        sLoadingFrontEnd = true;
-        (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
-        sLoadingFrontEnd = false;
-        jaiClearException();
-    }
+/* Pull the whole front end in, once, before any compile begins.
+ *
+ * This used to run at the top of every module load, so `jaithon run` on a
+ * fully cached program still deserialised 35 compiler modules out of the seed
+ * in order to compile nothing: 12ms of the 18ms an empty program cost.
+ *
+ * Warming it at the first compile instead is wrong in a way that only shows up
+ * when the entry file is cached and something it imports is not. The compiler
+ * imports std.math, std.str and std.json, so warming while one of those is
+ * itself mid-load finds it MOD_LOADING and reports a cycle -- the front end
+ * then fails, the failure is swallowed, and the import that triggered it dies
+ * with "module 'std.math' failed to load". A cold run passes, because there
+ * the entry misses first and the warm happens with nothing on the import
+ * stack.
+ *
+ * So the warm happens at the first module that is going to need compiling,
+ * BEFORE that module is published as MOD_LOADING -- see maybeWarmFor. Then
+ * the compiler's own imports find std.math untouched and load it normally. */
+static void warmFrontEnd(void) {
+    if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return;
+    sFrontEndWarmed = true;
+    sLoadingFrontEnd = true;
+    (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    sLoadingFrontEnd = false;
+    jaiClearException();
+}
 
+/* Warm the front end if loading `path` is about to need it.
+ *
+ * Two reasons to warm, and both are necessary.
+ *
+ * A cache miss means this module has to be compiled, so the compiler has to be
+ * here. The probe reads the cache entry's 8-byte header, not the module: a hit
+ * only means the flags are loadable, and the source hash can still reject it
+ * further in. That asymmetry is the safe direction -- a stale cache warms the
+ * compiler slightly early, where a missed warm is the cycle above.
+ *
+ * A module under lib/jaithon is one of the front end's own, and those must
+ * never be loaded through the ordinary door first. `jaithon fmt` imports
+ * jaithon.ast directly, so without this it got ast.jai from the cache and then
+ * the warm got compile/mod.jai from the seed -- two generations of the
+ * compiler in one process, which failed importing std.json. Warming here makes
+ * the whole front end arrive as one set, from one source, and the caller's
+ * re-check then finds the module already loaded.
+ *
+ * The test is the directory, not seed membership: the seed also carries
+ * std.math, std.str and std.json, which the compiler imports but user code
+ * owns just as much. Warming for those put the 12ms straight back, because
+ * std.core is among them and every program loads it. */
+static bool cacheFlagsMatch(const char *sourcePath, uint32_t flags);
+
+static bool maybeWarmFor(const char *path) {
+    if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return false;
+
+    /* The seed keys on the library-relative path ("jaithon/ast.jai"), which is
+     * the only reliable way to ask this question. Matching "/jaithon/" against
+     * the absolute path instead matched every file in the tree, because the
+     * repository directory is itself called jaithon -- so everything warmed
+     * and the 12ms came straight back. */
+    const JaiSeedEntry *seeded = seedDisabled() ? NULL : jaiSeedFind(path);
+    bool ownedByFrontEnd = seeded != NULL &&
+                           strncmp(seeded->module, "jaithon/", 8) == 0;
+    if (!ownedByFrontEnd) {
+        const JaiRunOptions *opts = options();
+        uint32_t flags = cacheFlagsFor(&opts->codegen, true);
+        if (opts->useCache && cacheFlagsMatch(path, flags)) return false;
+    }
+    warmFrontEnd();
+    return true;
+}
+
+static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
     size_t length = 0;
     char *text = jaiReadFile(path, &length);
     if (text == NULL) {
@@ -886,6 +937,30 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
                             "import of '%s' nests more than %d deep", name,
                             JAI_MAX_IMPORT_DEPTH);
         return NULL;
+    }
+
+    /* Before createModule: publishing this module as MOD_LOADING first would
+     * make the compiler's own import of it look like a cycle.
+     *
+     * Rooted, because warming loads the whole compiler and every allocation in
+     * it can collect. `pathKey` is interned but nothing else refers to it yet,
+     * so without this it is freed underneath createModule -- a segfault that
+     * appears only when the entry file is cached and an import is not. */
+    jaiPushRoot(OBJ_VAL(pathKey));
+    bool warmed = maybeWarmFor(path);
+    jaiPopRoot();
+
+    /* The warm can load this very module: `jaithon fmt` imports the compiler
+     * as ordinary user code, so the import that triggered the warm is often
+     * one the warm itself satisfies. The lookup above ran before it, so
+     * without re-checking here a second ObjModule is built for a path that
+     * already has one -- two copies of ast.jai, two NodeKind enums, and a dict
+     * built under one that cannot be read with the other. That surfaced as
+     * `KeyError: key <NodeKind> not found` from the formatter. */
+    if (warmed &&
+        jaiTableGetInterned(&vm.modules, pathKey, &existing) &&
+        IS_MODULE(existing) && AS_MODULE(existing)->state == MOD_LOADED) {
+        return AS_MODULE(existing);
     }
 
     if (module == NULL) module = createModule(name, pathKey);
@@ -1404,6 +1479,8 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
 
     ObjList *args = installArgv(absolute, argc, argv);
     if (!preludeDisabled()) (void)jaiLoadPrelude();
+
+    maybeWarmFor(absolute);
 
     ObjString *pathKey = jaiStringIntern(absolute, strlen(absolute));
     ObjModule *module = createModule("__main__", pathKey);
