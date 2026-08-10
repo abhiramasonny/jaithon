@@ -471,6 +471,17 @@ int main(void) {
       check("str d through a moved base", dbits(d[5]), dbits(7.5));
       check("str d left d[4] alone", dbits(d[4]), dbits(0.0)); }
 
+    /* str w writes exactly four bytes: the neighbouring word must survive, and
+     * a 64-bit store in its place would wipe it. */
+    { int64_t scratch[4] = { 0, -1, 0, 0 };
+      const uint32_t w[] = { jaiA64MovzX(1, 0x2a, 0),
+                             jaiA64StrW(1, 0, 8),
+                             jaiA64LdrX(0, 0, 8),
+                             jaiA64Ret() };
+      /* -1 with its low word replaced by 0x2a. */
+      check("str w low word", runWith(w, 4, scratch), (int64_t)0xffffffff0000002aull);
+      check("str w kept high", (int64_t)((uint64_t)scratch[1] >> 32), (int64_t)0xffffffffu); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;

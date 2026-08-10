@@ -19,6 +19,8 @@ uint32_t jaiA64LdrX(unsigned rt, unsigned rn, unsigned offset);
 uint32_t jaiA64StrX(unsigned rt, unsigned rn, unsigned offset);
 /* ldr Wt, [Xn, #offset] -- 4-aligned, 0..16380; reads a Value's 32-bit tag */
 uint32_t jaiA64LdrW(unsigned rt, unsigned rn, unsigned offset);
+/* str Wt, [Xn, #offset] -- 4-aligned, 0..16380; writes a Value's 32-bit tag */
+uint32_t jaiA64StrW(unsigned rt, unsigned rn, unsigned offset);
 /* add Xd, Xn, #imm12 */
 uint32_t jaiA64AddXImm(unsigned rd, unsigned rn, unsigned imm12);
 /* subs Xd, Xn, #imm12 -- with rd = 31 this is `cmp` */

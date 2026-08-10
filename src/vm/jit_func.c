@@ -124,6 +124,7 @@ typedef struct {
 
     SlotKind  stack[JIT_MAX_SAVED];
     uint32_t  stackShape[JIT_MAX_SAVED];  /* class shapeId for SLOT_INST */
+    ObjClass *stackClass[JIT_MAX_SAVED];
     SlotKind  localKind[JIT_MAX_SAVED + 1];
     uint32_t  localShape[JIT_MAX_SAVED + 1];
     ObjClass *localClass[JIT_MAX_SAVED + 1];
@@ -185,10 +186,11 @@ static unsigned pushReg(const Emit *e) {
     return JIT_FIRST_SAVED + e->locals + e->valueDepth;
 }
 
-static bool pushValue(Emit *e, SlotKind kind, uint32_t shape) {
+static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
     if (e->depth >= JIT_MAX_SAVED) return false;
     if (e->locals + e->valueDepth + 1 > JIT_MAX_SAVED) return false;
     e->stackShape[e->depth] = shape;
+    e->stackClass[e->depth] = klass;
     e->stack[e->depth++] = kind;
     e->valueDepth++;
     if (e->valueDepth > e->maxValue) e->maxValue = e->valueDepth;
@@ -342,7 +344,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!localInRange(e, slot)) return false;
             if (e->localKind[slot] == SLOT_OPAQUE) return false;
             if (slot == 0) e->usesSlot0 = true;
-            if (!pushValue(e, e->localKind[slot], e->localShape[slot])) return false;
+            if (!pushValue(e, e->localKind[slot], e->localShape[slot], e->localClass[slot])) return false;
             emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
             off += 3;
             break;
@@ -350,7 +352,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_INT: {
             int16_t k = jaiReadI16(code + off + 1);
-            if (!pushValue(e, SLOT_INT, 0)) return false;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             emitConst64(e, pushReg(e) - 1, k);
             off += 3;
             break;
@@ -386,7 +388,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (idx >= (uint32_t)fn->chunk.constants.count) return false;
             Value k = fn->chunk.constants.data[idx];
             if (IS_INT(k)) {
-                if (!pushValue(e, SLOT_INT, 0)) return false;
+                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
                 emitConst64(e, pushReg(e) - 1, AS_INT(k));
             } else if (IS_FLOAT(k)) {
                 /* The bits, not the number: a float lives in an X register
@@ -394,7 +396,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 double d = AS_FLOAT(k);
                 int64_t bits;
                 memcpy(&bits, &d, sizeof bits);
-                if (!pushValue(e, SLOT_FLOAT, 0)) return false;
+                if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
                 emitConst64(e, pushReg(e) - 1, bits);
             } else {
                 return false;
@@ -432,7 +434,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != kb) return false;
 
             if (ka == SLOT_FLOAT) {
-                if (!pushValue(e, SLOT_FLOAT, 0)) return false;
+                if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
                 unsigned rf = pushReg(e) - 1;
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -443,7 +445,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
             if (ka != SLOT_INT) return false;
-            if (!pushValue(e, SLOT_INT, 0)) return false;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
             /* The product overflows exactly when the high half is not the low
              * half's sign bit replicated, so smulh and one shifted compare
@@ -467,7 +469,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != kb) return false;   /* no implicit widening here */
 
             if (ka == SLOT_FLOAT) {
-                if (!pushValue(e, SLOT_FLOAT, 0)) return false;
+                if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
                 unsigned rd = pushReg(e) - 1;
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
                 emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
@@ -488,7 +490,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * truncation rule of its own, and getting either wrong would be a
              * wrong answer rather than a decline. */
             if (ka != SLOT_INT || op == OP_DIV) return false;
-            if (!pushValue(e, SLOT_INT, 0)) return false;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
             emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
                                  : jaiA64SubsXReg(rd, ra, rb));
@@ -561,9 +563,81 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnCondition(e, JAI_A64_NE);
 
-            if (!pushValue(e, kind, 0)) return false;
+            if (!pushValue(e, kind, 0, NULL)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, localReg(e, slot), base + 8));
             off += 8;
+            break;
+        }
+
+        case OP_GET_LOCAL2: {
+            unsigned a = jaiReadU16(code + off + 1);
+            unsigned b = jaiReadU16(code + off + 3);
+            for (unsigned k = 0; k < 2; k++) {
+                unsigned slot = k == 0 ? a : b;
+                if (!localInRange(e, slot)) return false;
+                if (e->localKind[slot] == SLOT_OPAQUE) return false;
+                if (slot == 0) e->usesSlot0 = true;
+                if (!pushValue(e, e->localKind[slot], e->localShape[slot], e->localClass[slot])) {
+                    return false;
+                }
+                emit(e, jaiA64MovX(pushReg(e) - 1, localReg(e, slot)));
+            }
+            off += 5;
+            break;
+        }
+
+        case OP_SET_FIELD: {
+            uint32_t nameIdx = jaiReadU24(code + off + 1);
+            /* The stack is receiver then value, and both are dropped. The
+             * receiver's class is read off its stack entry, not guessed from
+             * the locals: two instance locals of different classes would make
+             * any guess a silently wrong field offset. */
+            if (e->depth < 2) return false;
+            ObjClass *klass = e->stackClass[e->depth - 2];
+
+            unsigned rv, rr;
+            SlotKind kv, kr;
+            if (!popValue(e, &rv, &kv)) return false;
+            if (!popValue(e, &rr, &kr)) return false;
+            if (kr != SLOT_INST) return false;
+            /* Only a number goes in. Storing an object would put a pointer the
+             * collector has not seen into a field, and while this tier cannot
+             * allocate -- so nothing can move or be swept while it runs -- the
+             * value would still have to be one the caller already had rooted.
+             * Not worth the argument for what it buys. */
+            if (kv != SLOT_INT && kv != SLOT_FLOAT) return false;
+            if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+            Value nameVal = fn->chunk.constants.data[nameIdx];
+            if (!IS_STRING(nameVal)) return false;
+
+            if (klass == NULL) return false;
+            const FieldInfo *info = jaiClassFieldInfo(klass, AS_STRING(nameVal));
+            if (info == NULL || info->isStatic) return false;
+
+            unsigned base = (unsigned)offsetof(ObjInstance, fields) +
+                            (unsigned)info->slot * (unsigned)sizeof(Value);
+            emit(e, jaiA64MovzX(JIT_SCRATCH_A,
+                                kv == SLOT_INT ? VAL_INT : VAL_FLOAT, 0));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
+            emit(e, jaiA64StrX(rv, rr, base + 8));
+            off += 6;
+            break;
+        }
+
+        case OP_RETURN_NULL: {
+            /* Only an initializer, which yields the object it initialised --
+             * that is what makes `Point(1, 2)` an expression. A plain function
+             * returning null has no int64 to hand back. */
+            if ((fn->flags & FN_INIT) == 0) return false;
+            if (!localInRange(e, 0) || e->localKind[0] != SLOT_INST) return false;
+            e->usesSlot0 = true;
+            if (e->sawReturn && e->returnKind != SLOT_INST) return false;
+            e->sawReturn  = true;
+            e->returnKind = SLOT_INST;
+            e->returnShape = e->localShape[0];
+            emit(e, jaiA64MovX(0, localReg(e, 0)));
+            emitEpilogue(e, 0);
+            off += 1;
             break;
         }
 
@@ -608,7 +682,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             e->depth      -= argc + 1;
             e->valueDepth -= argc;
-            if (!pushValue(e, e->returnKind, e->returnShape)) return false;
+            if (!pushValue(e, e->returnKind, e->returnShape, NULL)) return false;
             emit(e, jaiA64MovX(pushReg(e) - 1, 0));
             off += 2;
             break;
@@ -687,7 +761,7 @@ static bool eligible(ObjFunction *fn) {
     if (fn->arity == 0 || fn->arity > JIT_MAX_ARITY) why = "arity";
     else if (fn->maxSlots < 1 || (unsigned)fn->maxSlots - 1 > JIT_MAX_SAVED) why = "maxSlots";
     else if (fn->defaultCount != 0) why = "defaults";
-    else if (fn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) why = "flags";
+    else if (fn->flags & (FN_VARIADIC | FN_KWREST)) why = "flags";
     else if (fn->upvalueCount != 0) why = "upvalues";
     else if (fn->module == NULL) why = "no module";
     else if (fn->chunk.count <= 0) why = "empty";
