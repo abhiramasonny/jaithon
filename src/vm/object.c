@@ -955,6 +955,8 @@ ObjFunction *jaiFunctionNew(void) {
     fn->jitFunc = NULL;
     fn->osrCode = NULL;
     fn->osrRefused = false;
+    fn->osrAttempts = 0;
+    fn->jitAttempts = 0;
     fn->osrSlots = 0;
     fn->jitModuleVersion = 0;
     fn->tickCount = 0;

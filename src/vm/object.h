@@ -256,6 +256,12 @@ struct ObjFunction {
     uint32_t    osrTop;        /* bytecode offset of the loop head */
     uint8_t     osrKinds[16];  /* what each slot must hold on entry */
     uint8_t     osrSlots;
+    /* Attempts so far. One look is not enough: a body can only use a callee's
+     * return kind once that callee has itself compiled, and which of them have
+     * depends on when the sampler happened to fire. Refusing forever on the
+     * first miss made compilation depend on tick timing. */
+    uint8_t     osrAttempts;
+    uint8_t     jitAttempts;
     bool        osrRefused;
     /* Set once the tier has looked at this function and refused it. Without it
      * every call past the threshold pays a call into jaiJitEnter to be told no

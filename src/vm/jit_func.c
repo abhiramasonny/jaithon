@@ -234,8 +234,12 @@ typedef enum {
     SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
     SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
     SLOT_CLASS,   /* a class resolved at compile time; only ever a callee */
+    SLOT_FUNC,    /* a global function resolved at compile time, likewise */
     SLOT_BOOL,    /* 0 or 1 in a register; a Value's boolean member is its low
                    * byte, so the same word serves both */
+    SLOT_OBJ,     /* some heap object, raw, of a type this tier does not model.
+                   * It can be read, passed, stored and rooted -- nothing else.
+                   * A closure held in a variable is the common case. */
     SLOT_LIST     /* ObjList *, raw. Safe for the same reason an instance is:
                    * nothing moves, and a call spills it as a root first */
 } SlotKind;
@@ -249,7 +253,7 @@ typedef enum {
 #define JIT_FSCRATCH_B 1u
 
 static bool holdsRegister(SlotKind k) {
-    return k != SLOT_SELF && k != SLOT_CLASS;
+    return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC;
 }
 
 /* Two targets are not bytecode offsets at all. */
@@ -787,6 +791,21 @@ static ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
 }
 
+/* The global function a name refers to, or NULL. */
+static ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
+                                   Value *out) {
+    ObjFunction *fn = closure->fn;
+    if (fn->module == NULL) return NULL;
+    if (nameIdx >= (uint32_t)fn->chunk.constants.count) return NULL;
+    Value name = fn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(name)) return NULL;
+    Value bound;
+    if (!jaiModuleGet(fn->module, AS_STRING(name), &bound)) return NULL;
+    if (!IS_CLOSURE(bound)) return NULL;
+    *out = bound;
+    return AS_CLOSURE(bound)->fn;
+}
+
 static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
     ObjFunction *fn = closure->fn;
     if (fn->module == NULL) return false;
@@ -830,7 +849,7 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
         unsigned idx = first + i;
         SlotKind k = e->stack[idx];
         if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
-            k != SLOT_INST && k != SLOT_LIST) {
+            k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ) {
             e->whyNot = "an argument kind this call cannot pass";
             return false;
         }
@@ -852,7 +871,8 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
         if (e->localKind[slot] != SLOT_INST &&
-            e->localKind[slot] != SLOT_LIST) {
+            e->localKind[slot] != SLOT_LIST &&
+            e->localKind[slot] != SLOT_OBJ) {
             continue;
         }
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
@@ -884,6 +904,54 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     e->fixups[e->fixupCount].depth        = -1;
     e->fixupCount++;
     emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    return true;
+}
+
+/* A call to a global function that has itself compiled. Its return kind types
+ * the result; the tag that actually comes back is checked, and a surprise
+ * deopts to the instruction after the call, since the call has happened. */
+static bool emitGlobalCall(Emit *e, unsigned argc, uint32_t after) {
+    unsigned cidx = e->depth - argc - 1;
+    Value cv = e->stackSeen[cidx];
+    if (!IS_CLOSURE(cv)) { e->whyNot = "callee vanished"; return false; }
+    ObjFunction *cfn = AS_CLOSURE(cv)->fn;
+    if (cfn->jitFunc == NULL) { e->whyNot = "callee no longer compiled"; return false; }
+    SlotKind rk = (SlotKind)cfn->jitReturnKind;
+    uint32_t rshape = cfn->jitReturnShape;
+    ObjClass *rcls = NULL;
+    if (rk == SLOT_INST) {
+        if (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL) {
+            e->whyNot = "callee's return class not on record";
+            return false;
+        }
+    }
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ) {
+        e->whyNot = "callee's return kind not usable";
+        return false;
+    }
+
+    if (!emitDescriptor(e, cv, e->depth - argc, argc, (void *)&jitCallOut)) {
+        return false;
+    }
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) return false;
+    }
+    if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_FUNC) return false;
+    e->depth--;
+    if (!pushValue(e, rk, rshape, rcls)) return false;
+
+    unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    unsigned wantTag = rk == SLOT_INT   ? VAL_INT
+                     : rk == SLOT_FLOAT ? VAL_FLOAT
+                     : rk == SLOT_BOOL  ? VAL_BOOL
+                                        : VAL_OBJ;
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
+    branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+    e->wroteHeap = true;
     return true;
 }
 
@@ -1996,13 +2064,31 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * entry: rebinding the name retires the compiled form. It occupies
              * no register -- it is baked into the call sequence. */
             ObjClass *cls = globalClass(closure, nameIdx);
-            if (cls == NULL) return false;
+            if (cls != NULL) {
+                if (e->depth >= JIT_MAX_SAVED) return false;
+                e->stackShape[e->depth] = cls->shapeId;
+                e->stackClass[e->depth] = cls;
+                e->stackSeen[e->depth]  = NULL_VAL;
+                e->stackLocal[e->depth] = -1;
+                e->stack[e->depth++]    = SLOT_CLASS;
+                off += 6;
+                break;
+            }
+            /* A plain function, resolved now and pinned by the same
+             * module-version check. Only one that has itself compiled, since
+             * its return kind is the only way to type the result. */
+            Value gv;
+            ObjFunction *gfn = globalFunction(closure, nameIdx, &gv);
+            if (gfn == NULL || gfn->jitFunc == NULL) {
+                e->whyNot = "callee is not a compiled global function";
+                return false;
+            }
             if (e->depth >= JIT_MAX_SAVED) return false;
-            e->stackShape[e->depth] = cls->shapeId;
-            e->stackClass[e->depth] = cls;
-            e->stackSeen[e->depth]  = NULL_VAL;
+            e->stackShape[e->depth] = 0;
+            e->stackClass[e->depth] = NULL;
+            e->stackSeen[e->depth]  = gv;
             e->stackLocal[e->depth] = -1;
-            e->stack[e->depth++]    = SLOT_CLASS;
+            e->stack[e->depth++]    = SLOT_FUNC;
             off += 6;
             break;
         }
@@ -2012,6 +2098,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             if (isClassCallee(e, argc)) {
                 if (!emitCallOut(e, argc)) return false;
+                off += 2;
+                break;
+            }
+            if (e->depth >= argc + 1u &&
+                e->stack[e->depth - argc - 1] == SLOT_FUNC) {
+                if (!emitGlobalCall(e, argc, (uint32_t)(off + 2))) return false;
                 off += 2;
                 break;
             }
@@ -2058,8 +2150,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* `return C(...)` compiles to this. The call is made exactly as
              * OP_CALL makes it and its result is returned. */
             unsigned argc = code[off + 1];
-            if (!isClassCallee(e, argc)) { e->whyNot = "tail callee not a class"; return false; }
-            if (!emitCallOut(e, argc)) return false;
+            if (isClassCallee(e, argc)) {
+                if (!emitCallOut(e, argc)) return false;
+            } else if (e->depth >= argc + 1u &&
+                       e->stack[e->depth - argc - 1] == SLOT_FUNC) {
+                if (!emitGlobalCall(e, argc, (uint32_t)(off + 2))) return false;
+            } else {
+                e->whyNot = "tail callee is neither a class nor a compiled function";
+                return false;
+            }
             /* Which class came back, not just that an object did: a caller
              * binding this result to a local cannot compile without it. */
             uint32_t tshape = e->depth > 0 ? e->stackShape[e->depth - 1] : 0;
@@ -2137,6 +2236,8 @@ static bool seedLocals(Emit *e, Value *slotBase) {
             e->localShape[i] = AS_INSTANCE(v)->klass->shapeId;
         } else if (IS_LIST(v)) {
             e->localKind[i] = SLOT_LIST;
+        } else if (IS_OBJ(v)) {
+            e->localKind[i] = SLOT_OBJ;
         } else if (i == 0) {
             /* A plain function's slot 0 is the closure being called. Nothing
              * can be done with it, but the body has no reason to read it. */
@@ -2728,6 +2829,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             e.localKind[i]  = SLOT_INST;
             e.localClass[i] = AS_INSTANCE(v)->klass;
             e.localShape[i] = AS_INSTANCE(v)->klass->shapeId;
+        } else if (IS_OBJ(v)) {
+            e.localKind[i] = SLOT_OBJ;
         } else {
             /* Nothing recognisable in it yet -- a slot the loop assigns before
              * it reads. It takes its kind from the first thing bound to it. */
@@ -2936,9 +3039,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     if (fn->osrCode == NULL) {
         if (fn->osrRefused) return 0;
-        fn->osrRefused = true;
-        if (!compileOsr(closure, top, frame->slots, hasIter)) return 0;
-        fn->osrRefused = false;
+        if (!compileOsr(closure, top, frame->slots, hasIter)) {
+            if (++fn->osrAttempts >= 5) fn->osrRefused = true;
+            return 0;
+        }
     }
     if (fn->osrTop != top) return 0;
     if (fn->module == NULL || fn->module->version != fn->jitModuleVersion) return 0;
@@ -3025,6 +3129,10 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
             if (!IS_LIST(v)) return JAI_JIT_DECLINED;
             a[i] = (int64_t)(uintptr_t)AS_LIST(v);
             break;
+        case SLOT_OBJ:
+            if (!IS_OBJ(v)) return JAI_JIT_DECLINED;
+            a[i] = (int64_t)(uintptr_t)AS_OBJ(v);
+            break;
         case SLOT_BOOL:
             if (!IS_BOOL(v)) return JAI_JIT_DECLINED;
             a[i] = AS_BOOL(v) ? 1 : 0;
@@ -3078,6 +3186,7 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     }
     case SLOT_INST:
     case SLOT_LIST:
+    case SLOT_OBJ:
         slotBase[0] = OBJ_VAL((Obj *)(uintptr_t)r.value);
         break;
     case SLOT_BOOL:
