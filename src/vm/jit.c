@@ -197,15 +197,24 @@ void jaiJitStartSampling(void) {
  * A function that merely runs once will not collect three ticks. */
 #define JAI_JIT_HOT_TICKS 3
 
-void jaiJitSample(ObjClosure *closure, uint32_t offset) {
+bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
     if (fn->tickCount >= JAI_JIT_HOT_TICKS) {
         /* Already hot. A tick landing on a loop top is the OSR entry point, and
          * the only moment the interpreter's state matches what compiled code
          * expects on entry: OP_LOOP sets ip to the loop's first instruction and
          * *then* runs the safepoint. */
-        (void)jaiJitEnterLoop(closure, offset);
-        return;
+        if (jaiJitEnterLoop(closure, offset)) return true;
+        /* The shape matcher covers one loop; this covers the rest, with the
+         * interpreter's own slots as the compiled body's locals. */
+        uint32_t resumeAt = 0;
+        int outcome = jaiJitEnterOsr(closure, offset, &resumeAt);
+        if (outcome == 2) return false;
+        if (outcome == 1) {
+            CallFrame *frame = &vm.frames[vm.frameCount - 1];
+            frame->ip = fn->chunk.code + resumeAt;
+        }
+        return true;
     }
     if (fn->tickCount < JAI_JIT_HOT_TICKS) {
         fn->tickCount++;
@@ -214,4 +223,5 @@ void jaiJitSample(ObjClosure *closure, uint32_t offset) {
                     fn->name ? fn->name->chars : "<anon>", offset);
         }
     }
+    return true;
 }

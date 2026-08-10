@@ -248,6 +248,14 @@ struct ObjFunction {
     uint8_t     jitReturnKind;
     uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */
     uint8_t     jitArgCount;
+    /* On-stack replacement: a compiled loop entered from the interpreter, with
+     * the interpreter's own slots as its locals. This is what reaches a loop
+     * in a function that runs once -- `main`, mostly. */
+    uint8_t    *osrCode;
+    uint32_t    osrTop;        /* bytecode offset of the loop head */
+    uint8_t     osrKinds[16];  /* what each slot must hold on entry */
+    uint8_t     osrSlots;
+    bool        osrRefused;
     /* Set once the tier has looked at this function and refused it. Without it
      * every call past the threshold pays a call into jaiJitEnter to be told no
      * again -- 2.6% of `check lib/std`, on a workload the tier does not help at

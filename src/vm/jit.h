@@ -70,6 +70,12 @@ typedef enum {
 
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
+
+/* Compile and enter the loop at `top` with the interpreter's own slots. On
+ * success `*resumeAt` is the bytecode offset the interpreter should continue
+ * from, and any operand-stack values the loop was holding have been pushed. */
+/* 0 declined, 1 resume at *resumeAt, 2 an exception is pending. */
+int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt);
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
@@ -86,7 +92,8 @@ void jaiJitStartSampling(void);
  * Sampling has a second property the counter lacked: its cost is proportional
  * to wall time rather than to iterations, so a tight loop is not punished for
  * being tight. */
-void jaiJitSample(ObjClosure *closure, uint32_t offset);
+/* False when the compiled loop left an exception pending. */
+bool jaiJitSample(ObjClosure *closure, uint32_t offset);
 
 /* Enter a compiled loop at `targetOffset`, compiling it first if this is the
  * first hot tick to land there. See jit_loop.c for the contract on `ip`. */
