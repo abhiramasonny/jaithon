@@ -2720,6 +2720,23 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             bool isLen = strcmp(mname, "len") == 0 && argc == 0;
             if (!isLen && !discarded) return false;
 
+            /* `xs.len()` on a list is one field. Going out through the
+             * descriptor for it meant a GC root push and pop, a bound-method
+             * resolve, an arity check and a native call, all to read a 32-bit
+             * count -- and `while i < xs.len()` is the ordinary loop in this
+             * language, so that was paid once per iteration. The receiver's
+             * kind is already known here, which is the whole guard needed. */
+            if (isLen && e->stack[ridx] == SLOT_LIST) {
+                unsigned rList = pushReg(e) - 1;
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                emit(e, jaiA64LdrW(pushReg(e) - 1, rList,
+                                   (unsigned)offsetof(ObjList, count)));
+                off += 7;
+                break;
+            }
+
             if (!emitDescriptor(e, nativeVal, ridx, argc + 1,
                                 (void *)&jitInvokeNative)) {
                 return false;
