@@ -117,6 +117,9 @@ JaiRunResult jaiVMRunModule(ObjModule *module, ObjFunction *body);
 
 /* Call any callable from C (natives, the REPL, dunder dispatch). Returns false
  * with the pending exception set on error. */
+bool jaiClassFindMethod(ObjClass *klass, ObjString *name, Value *out);
+bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
+                               int count, Value *out);
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out);
 bool jaiCallValue(Value callee, int argc, Value *args, Value *out);
