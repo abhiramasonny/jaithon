@@ -458,10 +458,11 @@ static void emit(Emit *e, uint32_t word) {
 #define JIT_ITER_REG  (JIT_FIRST_SAVED + 1u)   /* the ObjIter itself */
 #define JIT_IDX_REG   (JIT_FIRST_SAVED + 2u)
 #define JIT_LIM_REG   (JIT_FIRST_SAVED + 3u)
+#define JIT_START_REG (JIT_FIRST_SAVED + 4u)   /* the range's first value */
 
 /* Registers OSR keeps for itself: the slots pointer, and for a range loop the
  * iterator, its index and its limit. */
-static unsigned osrReserved(const Emit *e) { return e->hasIter ? 4u : 1u; }
+static unsigned osrReserved(const Emit *e) { return e->hasIter ? 5u : 1u; }
 
 static unsigned regBase(const Emit *e) {
     if (e->osr) {
@@ -2230,7 +2231,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
             branchTo(e, e->iterExit, true, JAI_A64_GE);
-            localOut(e, slot, JIT_IDX_REG);
+            /* The value is start + index, not the index: `for j in i + 1..n`
+             * is the inner loop of nbody's advance. */
+            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_START_REG, JIT_IDX_REG));
+            localOut(e, slot, JIT_SCRATCH_C);
             emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
             off += 5;
             break;
@@ -3049,7 +3053,9 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     ObjFunction *fn = closure->fn;
     uint32_t end = findLoopEnd(&fn->chunk, top);
     if (end == 0 || end <= top) return false;
-    if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > 16) return false;
+    /* The entry re-checks every slot, so this is the size of that record --
+     * nbody's advance declares nineteen. */
+    if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > 40) return false;
 
     JaiCodeArena *arena = jaiJitArena();
     if (arena == NULL) return false;
@@ -3142,6 +3148,13 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                             (unsigned)offsetof(ObjIter, index)));
         emit(&e, jaiA64LdrX(JIT_LIM_REG, JIT_ITER_REG,
                             (unsigned)offsetof(ObjIter, limit)));
+        /* A range yields start + index, so a loop that does not begin at zero
+         * needs its start too. ObjIter.source is a Value, so the object
+         * pointer sits eight bytes into it. */
+        emit(&e, jaiA64LdrX(JIT_START_REG, JIT_ITER_REG,
+                            (unsigned)offsetof(ObjIter, source) + 8));
+        emit(&e, jaiA64LdrX(JIT_START_REG, JIT_START_REG,
+                            (unsigned)offsetof(ObjRange, start)));
     }
 
     if (!compileBody(&e, closure) || e.failed) {
@@ -3342,7 +3355,9 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         iter = AS_ITER(it);
         if (iter->kind != ITER_RANGE || !IS_RANGE(iter->source)) return 0;
         ObjRange *r = AS_RANGE(iter->source);
-        if (r->start != 0 || r->step != 1) return 0;
+        /* Unit steps only -- that is what makes the yielded value start plus
+         * the index. The start itself is loaded at entry and need not be 0. */
+        if (r->step != 1) return 0;
     }
 
     if (fn->osrCode == NULL) {

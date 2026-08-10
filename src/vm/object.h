@@ -254,7 +254,7 @@ struct ObjFunction {
      * in a function that runs once -- `main`, mostly. */
     uint8_t    *osrCode;
     uint32_t    osrTop;        /* bytecode offset of the loop head */
-    uint8_t     osrKinds[16];  /* what each slot must hold on entry */
+    uint8_t     osrKinds[40];  /* what each slot must hold on entry */
     uint8_t     osrSlots;
     /* Attempts so far. One look is not enough: a body can only use a callee's
      * return kind once that callee has itself compiled, and which of them have
