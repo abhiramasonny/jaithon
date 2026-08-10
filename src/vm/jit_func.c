@@ -3031,6 +3031,25 @@ typedef int64_t (*OsrFnIter)(Value *slots, ObjIter *iter);
 
 /* The OP_LOOP that jumps back to `top`, and so the end of the loop. Gives up
  * on OP_CLOSURE, whose length depends on its operands. */
+/* Is `top` where an instruction actually starts?
+ *
+ * findLoopEnd walks from `top` itself, so if that offset is in the middle of
+ * an instruction the walk decodes operands as opcodes and can find a plausible
+ * OP_LOOP that is not one. nbody's advance was being compiled from offset 128,
+ * which is inside a GET_LOCAL2's operands. Walking from the start costs a scan
+ * once per compile and removes the question. */
+static bool isInstructionStart(const Chunk *c, uint32_t top) {
+    for (int off = 0; off < c->count;) {
+        if ((uint32_t)off == top) return true;
+        uint8_t op = c->code[off];
+        if (op == OP_CLOSURE) return false;   /* variable length */
+        int len = 1 + jaiOpOperandSize((OpCode)op);
+        if (len <= 0) return false;
+        off += len;
+    }
+    return false;
+}
+
 static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
     for (int off = (int)top; off < c->count;) {
         uint8_t op = c->code[off];
@@ -3051,6 +3070,7 @@ static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        bool hasIter) {
     ObjFunction *fn = closure->fn;
+    if (!isInstructionStart(&fn->chunk, top)) return false;
     uint32_t end = findLoopEnd(&fn->chunk, top);
     if (end == 0 || end <= top) return false;
     /* The entry re-checks every slot, so this is the size of that record --
