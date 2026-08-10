@@ -20,6 +20,7 @@
 
 #include <ctype.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "builtins.h"
 #include "methods.h"
@@ -33,20 +34,24 @@
 
 bool jaiBuiltinIsCallable(Value v) {
     if (!IS_OBJ(v)) return false;
+
     switch (OBJ_TYPE(v)) {
-    case OBJ_CLOSURE:
-    case OBJ_FUNCTION:
-    case OBJ_NATIVE:
-    case OBJ_BOUND:
-    case OBJ_CLASS:
-    case OBJ_ENUM_CTOR:
-        return true;
-    case OBJ_INSTANCE: {
-        ObjInstance *inst = AS_INSTANCE(v);
-        return inst->klass != NULL && !IS_NULL(inst->klass->dunderCall);
-    }
-    default:
-        return false;
+        case OBJ_CLOSURE:
+        case OBJ_FUNCTION:
+        case OBJ_NATIVE:
+        case OBJ_BOUND:
+        case OBJ_CLASS:
+        case OBJ_ENUM_CTOR:
+            return true;
+
+        case OBJ_INSTANCE: {
+            ObjInstance *const inst = AS_INSTANCE(v);
+            ObjClass *const klass = inst->klass;
+            return klass != NULL && !IS_NULL(klass->dunderCall);
+        }
+
+        default:
+            return false;
     }
 }
 
@@ -164,9 +169,15 @@ bool jaiArgFloat(Value v, int index, const char *fnName, double *out) {
 }
 
 bool jaiArgNumber(Value v, int index, const char *fnName, double *out) {
-    if (!IS_NUMBER(v)) return jaiBuiltinArgTypeError(index, fnName, "int or float", v);
-    *out = jaiAsDouble(v);
-    return true;
+    if (IS_FLOAT(v)) {
+        *out = AS_FLOAT(v);
+        return true;
+    }
+    if (IS_INT(v)) {
+        *out = (double)AS_INT(v);
+        return true;
+    }
+    return jaiBuiltinArgTypeError(index, fnName, "int or float", v);
 }
 
 bool jaiArgBool(Value v, int index, const char *fnName, bool *out) {
@@ -240,6 +251,7 @@ void jaiRegisterAllBuiltins(void) {
 typedef struct {
     JaiNativeFn fn;
     ObjNative  *native;
+    uint64_t    hash;
 } NativeCacheEntry;
 
 static NativeCacheEntry *gNativeCache;
@@ -250,14 +262,16 @@ static ObjModule        *gNativeAnchorModule;
 
 static const char kNativeAnchorName[] = "__natives__";
 
-static uint64_t hashNativeFn(JaiNativeFn fn) {
-    /* Hash the pointer's bytes: converting a function pointer to an integer is
-     * not portable, but reading its representation is. */
-    JaiNativeFn local = fn;
-    return jaiHashBytes(&local, sizeof local);
+static inline uint64_t hashNativeFn(JaiNativeFn fn) {
+    /* Hash the low representation bytes without a non-portable function-pointer
+     * cast. On normal 32/64-bit ABIs this compiles to a move + jaiHashU64(). */
+    uint64_t bits = 0;
+    const size_t n = sizeof fn < sizeof bits ? sizeof fn : sizeof bits;
+    memcpy(&bits, &fn, n);
+    return jaiHashU64(bits);
 }
 
-static void resetNativeCache(void) {
+static inline void resetNativeCache(void) {
     JAI_FREE_ARRAY(NativeCacheEntry, gNativeCache, gNativeCacheCap);
     gNativeCache = NULL;
     gNativeCacheCap = 0;
@@ -266,18 +280,23 @@ static void resetNativeCache(void) {
     gNativeAnchorModule = NULL;
 }
 
-static bool ensureNativeAnchor(void) {
-    if (gNativeAnchor != NULL && gNativeAnchorModule == vm.builtins) return true;
-    if (vm.builtins == NULL) return false;
+static inline bool ensureNativeAnchor(void) {
+    if (gNativeAnchor != NULL && gNativeAnchorModule == vm.builtins)
+        return true;
 
-    /* A different builtins module means a different heap: the cached natives
-     * belong to a VM that is gone. */
+    if (vm.builtins == NULL)
+        return false;
+
+    /* A different builtins module means a different heap. */
     resetNativeCache();
 
     ObjList *anchor = jaiListNew(0);
     jaiGCPushRoot(OBJ_VAL(anchor));
-    ObjString *key = jaiStringIntern(kNativeAnchorName, sizeof kNativeAnchorName - 1);
+
+    ObjString *key =
+        jaiStringIntern(kNativeAnchorName, sizeof kNativeAnchorName - 1);
     jaiGCPushRoot(OBJ_VAL(key));
+
     jaiModuleSet(vm.builtins, key, OBJ_VAL(anchor));
     jaiGCPopRoots(2);
 
@@ -286,63 +305,106 @@ static bool ensureNativeAnchor(void) {
     return true;
 }
 
-static ObjNative *nativeCacheFind(JaiNativeFn fn, const char *name) {
-    if (gNativeCacheCap == 0) return NULL;
-    uint64_t mask = (uint64_t)gNativeCacheCap - 1;
-    uint64_t i = hashNativeFn(fn) & mask;
+static inline ObjNative *nativeCacheFind(JaiNativeFn fn, const char *name,
+                                         uint64_t hash) {
+    const int capacity = gNativeCacheCap;
+    if (capacity == 0) return NULL;
+
+    const uint32_t mask = (uint32_t)capacity - 1u;
+    uint32_t i = (uint32_t)hash & mask;
+
     for (;;) {
-        NativeCacheEntry *entry = &gNativeCache[i];
-        if (entry->native == NULL) return NULL;
-        if (entry->fn == fn && strcmp(entry->native->name->chars, name) == 0)
-            return entry->native;
-        i = (i + 1) & mask;
+        NativeCacheEntry *const entry = gNativeCache + i;
+        ObjNative *const native = entry->native;
+
+        if (native == NULL)
+            return NULL;
+
+        if (entry->hash == hash && entry->fn == fn &&
+            strcmp(native->name->chars, name) == 0)
+            return native;
+
+        i = (i + 1u) & mask;
     }
 }
 
-static void nativeCacheInsertRaw(NativeCacheEntry *table, int capacity,
-                                 JaiNativeFn fn, ObjNative *native) {
-    uint64_t mask = (uint64_t)capacity - 1;
-    uint64_t i = hashNativeFn(fn) & mask;
-    while (table[i].native != NULL) i = (i + 1) & mask;
+static inline void nativeCacheInsertRaw(NativeCacheEntry *table, int capacity,
+                                        JaiNativeFn fn, ObjNative *native,
+                                        uint64_t hash) {
+    const uint32_t mask = (uint32_t)capacity - 1u;
+    uint32_t i = (uint32_t)hash & mask;
+
+    while (table[i].native != NULL)
+        i = (i + 1u) & mask;
+
     table[i].fn = fn;
     table[i].native = native;
+    table[i].hash = hash;
 }
 
-static void nativeCacheInsert(JaiNativeFn fn, ObjNative *native) {
-    if (gNativeCacheCount + 1 > gNativeCacheCap - gNativeCacheCap / 4) {
-        int newCap = gNativeCacheCap < 64 ? 64 : gNativeCacheCap * 2;
-        NativeCacheEntry *grown = JAI_ALLOC_ZEROED(NativeCacheEntry, newCap);
-        for (int i = 0; i < gNativeCacheCap; i++) {
-            if (gNativeCache[i].native == NULL) continue;
-            nativeCacheInsertRaw(grown, newCap, gNativeCache[i].fn,
-                                 gNativeCache[i].native);
+static void nativeCacheInsert(JaiNativeFn fn, ObjNative *native,
+                              uint64_t hash) {
+    int capacity = gNativeCacheCap;
+
+    if (gNativeCacheCount + 1 > capacity - capacity / 4) {
+        const int newCap = capacity < 64 ? 64 : capacity * 2;
+        NativeCacheEntry *grown =
+            JAI_ALLOC_ZEROED(NativeCacheEntry, newCap);
+
+        for (int i = 0; i < capacity; ++i) {
+            const NativeCacheEntry *const old = gNativeCache + i;
+            if (old->native == NULL) continue;
+
+            nativeCacheInsertRaw(grown, newCap, old->fn,
+                                 old->native, old->hash);
         }
-        JAI_FREE_ARRAY(NativeCacheEntry, gNativeCache, gNativeCacheCap);
+
+        JAI_FREE_ARRAY(NativeCacheEntry, gNativeCache, capacity);
         gNativeCache = grown;
         gNativeCacheCap = newCap;
+        capacity = newCap;
     }
-    nativeCacheInsertRaw(gNativeCache, gNativeCacheCap, fn, native);
-    gNativeCacheCount++;
+
+    nativeCacheInsertRaw(gNativeCache, capacity, fn, native, hash);
+    ++gNativeCacheCount;
 }
 
 Value jaiBindNative(Value receiver, const char *name, JaiNativeFn fn,
-                    int minArity, int maxArity, const char *const *paramNames) {
+                    int minArity, int maxArity,
+                    const char *const *paramNames) {
     ObjNative *native = NULL;
 
-    jaiGCPushRoot(receiver);
-    if (ensureNativeAnchor()) native = nativeCacheFind(fn, name);
-    if (native == NULL) {
-        native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
-        if (ensureNativeAnchor()) {
+    /* Primitive receivers cannot be collected, so avoid GC-root traffic on
+     * the int/float paths that dominate arithmetic method dispatch. */
+    const bool rootReceiver = IS_OBJ(receiver);
+    if (rootReceiver)
+        jaiGCPushRoot(receiver);
+
+    const bool anchored = ensureNativeAnchor();
+
+    if (anchored) {
+        const uint64_t hash = hashNativeFn(fn);
+        native = nativeCacheFind(fn, name, hash);
+
+        if (native == NULL) {
+            native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
+
             jaiGCPushRoot(OBJ_VAL(native));
             jaiListPush(gNativeAnchor, OBJ_VAL(native));
-            nativeCacheInsert(fn, native);
+            nativeCacheInsert(fn, native, hash);
             jaiGCPopRoot();
         }
+    } else {
+        native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
     }
-    jaiGCPopRoot();
 
-    return OBJ_VAL(jaiBoundNew(receiver, OBJ_VAL(native)));
+    /* Keep object receivers rooted through the allocation itself. */
+    ObjBound *bound = jaiBoundNew(receiver, OBJ_VAL(native));
+
+    if (rootReceiver)
+        jaiGCPopRoot();
+
+    return OBJ_VAL(bound);
 }
 
 void jaiMethodTablesInit(void) {
@@ -356,35 +418,84 @@ void jaiMethodTablesInit(void) {
 
 typedef bool (*MethodLookup)(Value, ObjString *, Value *);
 
-static MethodLookup lookupFor(Value receiver) {
+static inline MethodLookup lookupFor(Value receiver) {
     switch (jaiValueType(receiver)) {
-    case VAL_INT:   return jaiIntMethod;
-    case VAL_FLOAT: return jaiFloatMethod;
-    case VAL_NULL:
-    case VAL_BOOL:  return NULL;
-    case VAL_OBJ:   break;
+        case VAL_INT:   return jaiIntMethod;
+        case VAL_FLOAT: return jaiFloatMethod;
+        case VAL_NULL:
+        case VAL_BOOL:  return NULL;
+        case VAL_OBJ:   break;
     }
+
     switch (OBJ_TYPE(receiver)) {
-    case OBJ_STRING: return jaiStrMethod;
-    case OBJ_LIST:   return jaiListMethod;
-    case OBJ_DICT:   return jaiDictMethod;
-    case OBJ_SET:    return jaiSetMethod;
-    case OBJ_TUPLE:  return jaiTupleMethod;
-    case OBJ_RANGE:  return jaiRangeMethod;
-    case OBJ_BYTES:  return jaiBytesMethod;
-    case OBJ_FILE:   return jaiFileMethod;
-    case OBJ_MODULE: return jaiModuleMethod;
-    case OBJ_ITER:   return jaiIterMethod;
-    default:         return NULL;
+        case OBJ_STRING: return jaiStrMethod;
+        case OBJ_LIST:   return jaiListMethod;
+        case OBJ_DICT:   return jaiDictMethod;
+        case OBJ_SET:    return jaiSetMethod;
+        case OBJ_TUPLE:  return jaiTupleMethod;
+        case OBJ_RANGE:  return jaiRangeMethod;
+        case OBJ_BYTES:  return jaiBytesMethod;
+        case OBJ_FILE:   return jaiFileMethod;
+        case OBJ_MODULE: return jaiModuleMethod;
+        case OBJ_ITER:   return jaiIterMethod;
+        default:         return NULL;
     }
 }
 
 bool jaiBuiltinMethod(Value receiver, ObjString *name, Value *out) {
     if (name == NULL) return false;
-    MethodLookup lookup = lookupFor(receiver);
-    if (lookup != NULL && lookup(receiver, name, out)) return true;
-    /* `__format__` belongs to no single type: an f-string hole with a spec
-     * lowers to it whatever the hole holds, bool and null included. */
+
+    switch (jaiValueType(receiver)) {
+        case VAL_INT:
+            if (jaiIntMethod(receiver, name, out)) return true;
+            break;
+
+        case VAL_FLOAT:
+            if (jaiFloatMethod(receiver, name, out)) return true;
+            break;
+
+        case VAL_NULL:
+        case VAL_BOOL:
+            break;
+
+        case VAL_OBJ:
+            switch (OBJ_TYPE(receiver)) {
+                case OBJ_STRING:
+                    if (jaiStrMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_LIST:
+                    if (jaiListMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_DICT:
+                    if (jaiDictMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_SET:
+                    if (jaiSetMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_TUPLE:
+                    if (jaiTupleMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_RANGE:
+                    if (jaiRangeMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_BYTES:
+                    if (jaiBytesMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_FILE:
+                    if (jaiFileMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_MODULE:
+                    if (jaiModuleMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_ITER:
+                    if (jaiIterMethod(receiver, name, out)) return true;
+                    break;
+                default:
+                    break;
+            }
+            break;
+    }
+
     return jaiValueFormatMethod(receiver, name, out);
 }
 
