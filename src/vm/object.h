@@ -233,6 +233,13 @@ struct ObjFunction {
     void       *jitCode;
     /* Which calling convention `jitCode` uses; see jit.c. */
     uint8_t     jitKind;
+    /* Compiled whole-function form: a native routine taking int64 arguments
+     * and returning one, calling itself directly. See jit_func.c. */
+    uint8_t    *jitFunc;
+    /* The module's global-mutation counter as it stood when jitFunc was
+     * built. Compiled code resolved this function's own name once; if any
+     * global has moved since, the compiled form is retired. */
+    uint32_t    jitModuleVersion;
     /* Set once the tier has looked at this function and refused it. Without it
      * every call past the threshold pays a call into jaiJitEnter to be told no
      * again -- 2.6% of `check lib/std`, on a workload the tier does not help at

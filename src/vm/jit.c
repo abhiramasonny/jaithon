@@ -121,7 +121,16 @@ typedef void (*JaiCompiledAccessor)(Value *slotBase);
 bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
 
+    /* The whole-function tier first: it is the only one that makes a hot
+     * function meaningfully faster, and it declines quickly for anything
+     * outside the small language it speaks. */
+    if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase);
+
     if (fn->jitCode == NULL) {
+        if (jaiJitCompileFunc(closure)) {
+            fn->jitModuleVersion = fn->module->version;
+            return jaiJitEnterFunc(closure, slotBase);
+        }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {
             fn->jitRefused = true;
             return false;

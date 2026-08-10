@@ -49,6 +49,18 @@ bool jaiCodeArenaSeal(JaiCodeArena *arena) {
     return true;
 }
 
+/* Back to writable, so a second function can be compiled into the same arena.
+ * Without this the first seal froze the tier for the life of the process:
+ * every later compile found `sealed` and declined. */
+bool jaiCodeArenaUnseal(JaiCodeArena *arena) {
+    if (!arena->sealed) return true;
+    if (mprotect(arena->code, arena->capacity, PROT_READ | PROT_WRITE) != 0) {
+        return false;
+    }
+    arena->sealed = false;
+    return true;
+}
+
 void jaiCodeArenaFree(JaiCodeArena *arena) {
     if (arena->code != NULL) munmap(arena->code, arena->capacity);
     memset(arena, 0, sizeof *arena);
