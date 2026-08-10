@@ -1071,19 +1071,32 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
  * raised nothing". The hand-written EQ/GT tests at the call site were dead code
  * until now, because control never reached them with a nonzero status. */
 static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
-                                 unsigned nargs, void *helper, bool ownStatus) {
+                                 unsigned nargs, void *helper, bool ownStatus,
+                                 int calleeReg) {
     if (nargs > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
     if (!e->callsOut) { e->whyNot = "callsOut off"; return false; }
 
     unsigned d = e->descOffset;
 
-    /* The callee, as a whole Value. */
-    emit(e, jaiA64MovzX(JIT_SCRATCH_A, (unsigned)calleeVal.type, 0));
-    emit(e, jaiA64StrW(JIT_SCRATCH_A, 31,
-                       d + (unsigned)offsetof(JitCallDesc, callee)));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)calleeVal.as.obj);
-    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-                       d + (unsigned)offsetof(JitCallDesc, callee) + 8));
+    /* The callee, as a whole Value. From a register when the callee is only
+     * known at run time -- a closure held in a local. Baking the one that
+     * happened to be live at compile time would freeze its upvalues, and
+     * `closure_calls` builds a fresh closure over a different `step` on every
+     * outer iteration. */
+    if (calleeReg >= 0) {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31,
+                           d + (unsigned)offsetof(JitCallDesc, callee)));
+        emit(e, jaiA64StrX((unsigned)calleeReg, 31,
+                           d + (unsigned)offsetof(JitCallDesc, callee) + 8));
+    } else {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, (unsigned)calleeVal.type, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31,
+                           d + (unsigned)offsetof(JitCallDesc, callee)));
+        emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)calleeVal.as.obj);
+        emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+                           d + (unsigned)offsetof(JitCallDesc, callee) + 8));
+    }
 
     /* The arguments, which for an invoke begin with the receiver. */
     for (unsigned i = 0; i < nargs; i++) {
@@ -1178,7 +1191,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
 
 static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper) {
-    return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false);
+    return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
 }
 
 /* A call to a global function that has itself compiled. Its return kind types
@@ -2779,7 +2792,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     } else { e->whyNot = "element kind unknown"; return false; }
 
                     if (!emitDescriptorStatus(e, NULL_VAL, e->depth - 1, 1,
-                                              (void *)&jitIterStep, true)) {
+                                              (void *)&jitIterStep, true,
+                                              -1)) {
                         return false;
                     }
                     /* 1 is exhausted, anything higher is a raise. */
@@ -3104,6 +3118,70 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stackSeen[e->depth - 2]  = NULL_VAL;
                 e->stackLocal[e->depth - 2] = -1;
                 e->depth--;
+                off += 2;
+                break;
+            }
+
+            if (e->depth >= argc + 1u &&
+                e->stack[e->depth - argc - 1] == SLOT_OBJ) {
+                /* A closure held in a local -- `apply_n(f, ..)` doing
+                 * `acc = f(acc)`, which is the shape most library code takes.
+                 *
+                 * The guard is on the closure's FUNCTION, not on the closure.
+                 * `closure_calls` builds a fresh closure over a different
+                 * `step` every outer iteration, so guarding the closure itself
+                 * would deoptimise twenty times; all twenty share one
+                 * ObjFunction and differ only in an upvalue, so the function
+                 * pointer is monomorphic. The callee Value still comes from the
+                 * register, which is what keeps the upvalues right. */
+                unsigned cidx = e->depth - argc - 1;
+                Value cv = e->stackSeen[cidx];
+                if (!IS_CLOSURE(cv)) {
+                    e->whyNot = "an indirect callee that is not a closure";
+                    return false;
+                }
+                ObjFunction *cfn = AS_CLOSURE(cv)->fn;
+                if (cfn->jitFunc == NULL || cfn->arity != argc) {
+                    e->whyNot = "the closure this calls has not compiled";
+                    return false;
+                }
+                SlotKind rkind = (SlotKind)cfn->jitReturnKind;
+                if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
+                    rkind != SLOT_BOOL) {
+                    e->whyNot = "an indirect call whose result kind is not scalar";
+                    return false;
+                }
+                unsigned rCallee = JIT_FIRST_SAVED + regBase(e) +
+                                   (e->usesUpvalues ? 1u : 0u) +
+                                   (cidx - (e->depth - e->valueDepth));
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee,
+                                   (unsigned)offsetof(ObjClosure, fn)));
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                if (!emitDescriptorStatus(e, NULL_VAL, cidx + 1, argc,
+                                          (void *)&jitCallOut, false,
+                                          (int)rCallee)) {
+                    return false;
+                }
+                for (unsigned i = 0; i <= argc; i++) {
+                    unsigned r;
+                    if (!popValue(e, &r, NULL)) return false;
+                }
+                if (!pushValue(e, rkind, 0, NULL)) return false;
+
+                unsigned rat = e->descOffset +
+                               (unsigned)offsetof(JitCallDesc, result);
+                unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
+                                 : rkind == SLOT_FLOAT ? VAL_FLOAT
+                                                       : VAL_BOOL;
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
+                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 2), true);
+                emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+                e->wroteHeap = true;
                 off += 2;
                 break;
             }
