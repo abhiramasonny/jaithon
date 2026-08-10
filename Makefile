@@ -219,12 +219,18 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # opcode is executed cannot make existing bytecode unloadable. Changing what
 # opcodes exist can, and chunk.h is where that is written down.
 #
-# THE DISCIPLINE THIS BUYS AND WHAT IT COSTS: a change to what an opcode *means*
-# without changing the opcode table is invisible to this fingerprint, and would
-# let a stale seed and a stale cache run against new semantics. That is a real
-# hole and the reason to bump JAIC_VERSION by hand when you redefine an
-# instruction. Adding, removing or renumbering one is caught automatically,
-# because it edits chunk.h.
+# WHAT THIS ID DOES AND DOES NOT GATE. It gates __jaicache__ only. The seed is
+# loaded with `fromSeed` set, and serialize.c skips the build-id check on that
+# path, so a change here invalidates the dev cache and leaves the seed loadable.
+# That is what makes adding an opcode possible at all: a new instruction cannot
+# make existing bytecode unreadable, because existing bytecode does not use it,
+# and the seed has to keep working or there is no compiler left to reseed with.
+# Measured: appending to chunk.h moves the id and a wiped cache still boots.
+#
+# The hole is a change to what an existing opcode *means*. Nothing here catches
+# that -- not the id, since the seed ignores it, and not the fingerprint, if the
+# table itself is untouched. Bump JAIC_VERSION by hand when you redefine an
+# instruction; that is checked, and it is the only thing that is.
 #
 # boot/seed.c is excluded for a different reason and would be even if it were a
 # contract file: it is generated data rather than logic -- it changes what the
