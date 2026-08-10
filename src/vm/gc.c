@@ -423,6 +423,8 @@ static void markRoots(GCState *g) {
     for (ObjUpvalue *uv = vm.openUpvalues; uv != NULL; uv = uv->next)
         jaiGCMarkObject((Obj *)uv);
 
+    jaiMarkAsciiChars();
+
     markValues(vm.defers.data, vm.defers.count);
     markStrings(vm.modulePath.data, vm.modulePath.count);
 

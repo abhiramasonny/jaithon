@@ -368,7 +368,48 @@ static bool runtimeInternable(size_t length) {
            jaiInternTableCount() < JAI_INTERN_SOFT_CAP;
 }
 
+/* The 128 one-byte ASCII strings, made once and kept forever.
+ *
+ * `s[i]` builds a string, and before this it built a fresh one every time:
+ * allocate, hash the byte, probe the intern table, and give the collector
+ * another object to walk. `str_search` reads a million characters and
+ * `word_freq`'s scanner reads a quarter of a million, but so does every lexer,
+ * parser and text-munging loop ever written in this language -- the front end
+ * itself is one. Interning already made them one object; this makes them free.
+ *
+ * Held strongly here because the intern table's references are weak (see
+ * jaiTableRemoveWhite in gc.c), so nothing else would keep them alive. */
+static ObjString *sAsciiChar[128];
+
+void jaiMarkAsciiChars(void) {
+    for (unsigned i = 0; i < 128; i++) {
+        if (sAsciiChar[i] != NULL) jaiGCMarkObject((Obj *)sAsciiChar[i]);
+    }
+}
+
+ObjString *jaiStringChar(unsigned char c) {
+    if (c >= 128) return NULL;
+    if (sAsciiChar[c] == NULL) {
+        char one = (char)c;
+        /* Straight to the allocator and the intern table: going through
+         * jaiStringNew would come back here. */
+        uint64_t hash = jaiHashBytes(&one, 1);
+        ObjString *found = jaiInternTableFind(&one, 1, hash);
+        if (found == NULL) {
+            found = allocString(1);
+            found->chars[0] = one;
+            found->hash = hash;
+            internString(found);
+        }
+        sAsciiChar[c] = found;
+    }
+    return sAsciiChar[c];
+}
+
 ObjString *jaiStringNew(const char *chars, size_t length) {
+    if (length == 1 && (unsigned char)chars[0] < 128) {
+        return jaiStringChar((unsigned char)chars[0]);
+    }
     if (length > UINT32_MAX) {
         jaiThrow(vm.cValueError, "string of %zu bytes exceeds the maximum length",
                  length);
@@ -555,6 +596,15 @@ ObjString *jaiStringSlice(ObjString *s, int64_t start, int64_t stop,
     if (count <= 0) return jaiStringIntern("", 0);
 
     bool ascii = ((int64_t)s->length == n);
+
+    /* One ASCII character, which is what `s[i]` is. The general path below
+     * builds a scratch buffer and hands it to jaiStringTake, so every
+     * character read allocated. A lexer, a scanner, any loop over text does
+     * this once per byte; `str_search` does it a million times. */
+    if (ascii && step == 1 && count == 1) {
+        unsigned char c = (unsigned char)s->chars[start];
+        if (c < 128) return jaiStringChar(c);
+    }
 
     /* A forward slice is bounded by two byte offsets, and a scan finds them
      * without the whole table. That matters: `text[i]` is a forward slice of
