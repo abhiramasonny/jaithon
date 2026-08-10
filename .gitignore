@@ -27,3 +27,6 @@ compile_commands.json
 .cache/
 build-*/
 jaithon-*
+
+# JAI_JIT_DUMP artefacts
+jit_*.bin

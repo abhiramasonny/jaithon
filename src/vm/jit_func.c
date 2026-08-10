@@ -536,8 +536,14 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         /* Two paths reached here disagreeing about this slot, so what it holds
          * is a runtime fact: check it against what this read was compiled for
          * and hand the instruction back otherwise. */
-        emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, localFrameOff(e, slot)));
-        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, localTagFor(e, slot)));
+        /* Into `scratch`, not a fixed register: the caller has already
+         * given this one up -- it is where the payload is about to land --
+         * whereas JIT_SCRATCH_A may be holding an operand. `i + 1` on a
+         * dynamic slot loaded the tag over the constant and added VAL_INT
+         * instead, so `for j in i + 1..n` ran from i+2 and every nested loop
+         * was one iteration short. */
+        emit(e, jaiA64LdrW(scratch, 31, localFrameOff(e, slot)));
+        emit(e, jaiA64SubsXImm(31, scratch, localTagFor(e, slot)));
         branchOnDeopt(e, JAI_A64_NE);
     }
     emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
@@ -742,10 +748,35 @@ static void emitSaveRestore(Emit *e, bool save) {
     }
 }
 
+/* STP's pre-index immediate is a signed seven-bit field scaled by eight, so it
+ * reaches -512 and no further. Past that the stack pointer has to move on its
+ * own: the encoder truncates silently, so a 528-byte frame moved SP by 16 and
+ * every write meant for the frame landed in the caller's, which showed up as a
+ * failed stack check inside `jaiJitEnter` with nothing wrong at the crash site.
+ * nbody's `advance` is the first body big enough to want one -- twelve spilled
+ * locals and a call descriptor come to 528. */
+static void emitFrameEnter(Emit *e) {
+    if (e->frameBytes <= 512u) {
+        emit(e, jaiA64StpPre(29, 30, 31, -(int32_t)e->frameBytes));
+        return;
+    }
+    emit(e, jaiA64SubXImm(31, 31, e->frameBytes));
+    emit(e, jaiA64StpOff(29, 30, 31, 0));
+}
+
+static void emitFrameLeave(Emit *e) {
+    if (e->frameBytes <= 512u) {
+        emit(e, jaiA64LdpPost(29, 30, 31, (int32_t)e->frameBytes));
+        return;
+    }
+    emit(e, jaiA64LdpOff(29, 30, 31, 0));
+    emit(e, jaiA64AddXImm(31, 31, e->frameBytes));
+}
+
 static void emitEpilogue(Emit *e, unsigned bailed) {
     emit(e, jaiA64MovzX(1, bailed, 0));
     emitSaveRestore(e, false);
-    emit(e, jaiA64LdpPost(29, 30, 31, (int32_t)e->frameBytes));
+    emitFrameLeave(e);
     emit(e, jaiA64Ret());
 }
 
@@ -1060,6 +1091,30 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         nroots++;
     }
 
+    /* And what the operand stack is holding. Locals alone were enough only
+     * while nothing object-shaped stayed on the stack across a call -- but an
+     * iterator does exactly that: OP_GET_ITER pushes an ObjIter that lives in
+     * a register for the whole loop, and the call this descriptor belongs to
+     * may be the one that collects it. Visible only under --gc-stress, and
+     * only once a body with a loop like that could compile at all. */
+    for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
+        SlotKind k = e->stack[idx];
+        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER) {
+            continue;
+        }
+        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
+        unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
+                      nroots * (unsigned)sizeof(Value);
+        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
+                       (e->usesUpvalues ? 1u : 0u) +
+                       (idx - (e->depth - e->valueDepth));
+        emit(e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+        emit(e, jaiA64StrX(reg, 31, at + 8));
+        nroots++;
+    }
+
     emit(e, jaiA64MovzX(JIT_SCRATCH_A, nargs, 0));
     emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
                        d + (unsigned)offsetof(JitCallDesc, argc)));
@@ -1362,6 +1417,29 @@ static bool emitCallOut(Emit *e, unsigned argc) {
     return true;
 }
 
+/* An unconditional OP_LOOP or OP_JUMP does not fall through, so the instruction
+ * after it is reachable only by a branch. The linear walk would otherwise carry
+ * the preceding instruction's operand stack across that gap. Take the stack
+ * from a branch that targets this offset instead, accepting only a pure
+ * truncation: register entries are the top `valueDepth` of the stack, so
+ * popping from the top keeps `depth - valueDepth`, and with it every register
+ * index below the join. */
+static void reconcileAfterUncond(Emit *e, uint32_t off) {
+    for (unsigned i = 0; i < e->fixupCount; i++) {
+        if (e->fixups[i].targetOffset != off) continue;
+        int want = e->fixups[i].depth;
+        if (want < 0) continue;
+        unsigned d = (unsigned)want & 0xfu;
+        if (d > e->depth) continue;
+        if ((int)stackSignatureAt(e, d) != want) continue;
+        unsigned popped = e->depth - d;
+        if (popped > e->valueDepth) continue;
+        e->depth = d;
+        e->valueDepth -= popped;
+        return;
+    }
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -1369,7 +1447,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
     int start = e->osr ? (int)e->osrTop : 0;
     int stop  = e->osr ? (int)e->osrEnd : count;
+    bool afterUncond = false;
     for (int off = start; off < stop && !e->failed;) {
+        if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
+        afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = (int)stackSignature(e);
         uint8_t op = code[off];
@@ -3078,9 +3159,17 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         frame += (unsigned)sizeof(JitCallDesc);
     }
     e.frameBytes = (frame + 15u) & ~15u;
+    if (e.frameBytes > 4095u) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: frame of %u bytes\n",
+                    fn->name ? fn->name->chars : "<anon>", e.frameBytes);
+        }
+        jitFree(map, depths, fn->chunk.count + 1);
+        return false;
+    }
 
     /* Prologue. */
-    emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
+    emitFrameEnter(&e);
     emitSaveRestore(&e, true);
     /* The real arguments land in the local registers in order; the closure,
      * when there is one, is the last incoming register but lives just past the
@@ -3492,9 +3581,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     fn->jitArgCount   = (uint8_t)argCount;
 
     if (getenv("JAI_JIT_WHY")) {
-        fprintf(stderr, "[jit] compiled %s  arity=%u locals=%u insts=%u\n",
+        fprintf(stderr,
+                "[jit] compiled %s  arity=%u locals=%u insts=%u saved=%u "
+                "spill=%d fix=%u deopt=%u maxval=%u base=%u\n",
                 fn->name ? fn->name->chars : "<anon>", e.arity, e.locals,
-                e.count);
+                e.count, e.savedCount, (int)e.spilled, e.fixupCount,
+                e.deoptCount, body.maxValue, e.base);
     }
     fn->jitFunc = entry;
     return true;
@@ -3633,7 +3725,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.descOffset = 16u + 8u * JIT_MAX_SAVED;
     e.frameBytes = (frame + 15u) & ~15u;
 
-    emit(&e, jaiA64StpPre(29, 30, 31, -(int32_t)e.frameBytes));
+    emitFrameEnter(&e);
     emitSaveRestore(&e, true);
     emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
     if (e.osrRegLocals) {
