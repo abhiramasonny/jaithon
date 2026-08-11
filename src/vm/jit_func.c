@@ -323,6 +323,21 @@ static int jitNewInstance(JitCallDesc *d) {
     return 0;
 }
 
+static int jitGetSlice(JitCallDesc *d) {
+    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    uint8_t flags = (uint8_t)d->aux;
+    bool hasStart = (flags & 1) != 0, hasStop = (flags & 2) != 0,
+         hasStep = (flags & 4) != 0;
+    int at = 1;
+    Value startV = hasStart ? d->args[at++] : NULL_VAL;
+    Value stopV  = hasStop  ? d->args[at++] : NULL_VAL;
+    Value stepV  = hasStep  ? d->args[at++] : NULL_VAL;
+    bool ok = jaiSliceGet(d->args[0], startV, stopV, stepV,
+                          hasStart, hasStop, hasStep, &d->result);
+    jaiGCPopRoots((int)d->nroots);
+    return ok ? 0 : 1;
+}
+
 static int jitCallOut(JitCallDesc *d) {
     for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
@@ -1173,8 +1188,21 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
      * a register for the whole loop, and the call this descriptor belongs to
      * may be the one that collects it. Visible only under --gc-stress, and
      * only once a body with a loop like that could compile at all. */
-    for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
+    /* Count the register-holding entries from the bottom rather than assuming
+     * they are the top `valueDepth` of them. A class, a resolved function, a
+     * builtin and `self` occupy no register and can sit anywhere -- a callee
+     * pushed before its arguments puts one squarely in the middle, which is
+     * exactly what `join(f(a), f(b))` does. Subtracting valueDepth names the
+     * wrong register for everything above such an entry, and worse, starts the
+     * walk past entries that still need rooting. The deopt stub has always
+     * counted this way. */
+    unsigned seen = 0;
+    for (unsigned idx = 0; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
+        if (!holdsRegister(k)) continue;
+        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
+                       (e->usesUpvalues ? 1u : 0u) + seen;
+        seen++;
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             continue;
@@ -1182,9 +1210,6 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
                       nroots * (unsigned)sizeof(Value);
-        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
-                       (e->usesUpvalues ? 1u : 0u) +
-                       (idx - (e->depth - e->valueDepth));
         emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(reg, 31, at + 8));
@@ -3454,6 +3479,57 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &d2, NULL)) return false;
             if (!popValue(e, &d3, NULL)) return false;
             off += 1;
+            break;
+        }
+
+        case OP_GET_SLICE: {
+            /* `xs[a:b]` out to the runtime: the clamp arithmetic has three
+             * throwing exits and lives in one place, and the work itself is an
+             * O(n) copy against which the descriptor's stores are noise. */
+            unsigned flags = code[off + 1];
+            unsigned nops  = ((flags & 1u) != 0) + ((flags & 2u) != 0) +
+                             ((flags & 4u) != 0);
+            unsigned nargs = 1u + nops;
+            if (e->depth < nargs) return false;
+            unsigned cidx = e->depth - nargs;
+            if (e->stack[cidx] != SLOT_LIST) {
+                e->whyNot = "slicing a container this tier does not model";
+                return false;
+            }
+            Value cseen = e->stackSeen[cidx];
+
+            /* Guard the container, not the result: with its object type pinned
+             * the arm jaiSliceGet takes is settled, so the result's kind
+             * follows. Before the descriptor and before any pop, so a miss
+             * resumes here with everything still on the interpreter's stack. */
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - nargs,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            emit(e, jaiA64MovzX(JIT_SCRATCH_A, flags, 0));
+            emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, aux)));
+            if (!emitDescriptorStatus(e, NULL_VAL, cidx, nargs,
+                                      (void *)&jitGetSlice, false, -1)) {
+                return false;
+            }
+            for (unsigned i = 0; i < nargs; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            /* The container's own sample types the slice: a slice of a list of
+             * ints is a list of ints, and every element read re-checks its own
+             * tag, so this is a hint and not an assumption. */
+            if (!pushValue3(e, SLOT_LIST, 0, NULL, cseen, -1)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            /* Deliberately not e->wroteHeap: the only effect is a fresh object
+             * and an interpreted re-run would make another. Setting it would
+             * decline the next self-call, which is the shape `sort` has. */
+            off += 2;
             break;
         }
 
