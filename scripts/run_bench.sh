@@ -41,19 +41,28 @@ if [[ -t 1 ]]; then BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'
                     RED=$'\033[31m'; RESET=$'\033[0m'
 else BOLD=""; DIM=""; GREEN=""; RED=""; RESET=""; fi
 
-# Best-of-N wall time in milliseconds.
+# Best-of-N wall time in milliseconds, with the first run's stdout kept in the
+# global BENCH_OUT. Every port used to be run one extra, untimed time purely to
+# compare its output; at RUNS=1 that doubled the whole suite. The first timed run
+# already produced the answer, so it is captured rather than thrown away.
+BENCH_CAP="$(mktemp)"
+trap 'rm -f "$BENCH_CAP"' EXIT
 best_ms() {
     local best=999999999 i t
+    : > "$BENCH_CAP"
     for ((i = 0; i < RUNS; i++)); do
         # The redirect belongs to the *inner* command: `$(...) 2>/dev/null`
         # applies to the assignment, which writes nothing, so every timed run's
         # own output leaked into the table.
-        t=$(python3 - "$@" 2>/dev/null <<'PY'
-import subprocess, sys, time
+        t=$(BENCH_CAP="$BENCH_CAP" python3 - "$@" 2>/dev/null <<'PY'
+import os, subprocess, sys, time
 cmd = sys.argv[1:]
 start = time.perf_counter()
-subprocess.run(cmd, capture_output=True)
-sys.stdout.write(f"{(time.perf_counter() - start) * 1000:.1f}\n")
+done = subprocess.run(cmd, capture_output=True)
+elapsed = (time.perf_counter() - start) * 1000
+with open(os.environ["BENCH_CAP"], "wb") as f:
+    f.write(done.stdout + done.stderr)
+sys.stdout.write(f"{elapsed:.1f}\n")
 PY
 )
         t=${t%%.*}
@@ -87,6 +96,36 @@ HAVE_JAVA=0; command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1
 BENCH_BUILD="$(mktemp -d)"
 trap 'rm -rf "$BENCH_BUILD"' EXIT
 
+# Build every C++ and Java port up front, all at once. Compiling is most of the
+# wall clock -- an easy-level pass spends about 23 of its 28 seconds in `c++`
+# and `javac` and about 5 actually running benchmarks -- and it is the only part
+# that CAN be parallelised. The timed runs stay strictly sequential below: twenty
+# benchmarks competing for cores and cache would not be measuring the same thing
+# the table claims to report.
+build_all() {
+    local max
+    max=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+
+    # Every C++ port at once, streaming rather than in batches: xargs keeps all
+    # cores fed instead of stalling at a barrier every `max` files.
+    if [[ $HAVE_CXX -eq 1 ]]; then
+        for src in "$ROOT"/tests/bench/*.cpp; do
+            printf '%s\0%s\0' "$src" "$BENCH_BUILD/$(basename "$src" .cpp)"
+        done | xargs -0 -P "$max" -n 2 sh -c 'c++ -O2 -std=c++17 -o "$1" "$0" 2>/dev/null || true'
+    fi
+
+    # All Java ports in ONE javac. Twenty separate invocations paid JVM startup
+    # twenty times, which was most of the Java build cost; javac takes the whole
+    # list and compiles it in one process.
+    if [[ $HAVE_JAVA -eq 1 ]]; then
+        local jsrcs=("$ROOT"/tests/bench/*.java)
+        (( ${#jsrcs[@]} )) && javac -d "$BENCH_BUILD/classes" "${jsrcs[@]}" 2>/dev/null
+    fi
+}
+printf '%sbuilding ports...%s\r' "$DIM" "$RESET"
+build_all
+printf '                     \r'
+
 printf '%s%-22s %10s %10s %10s %10s %10s   %s%s\n' "$BOLD" "benchmark" "jaithon" "python3" "c++" "java" "speedup" "result" "$RESET"
 printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
 
@@ -109,28 +148,26 @@ for src in "$ROOT"/tests/bench/*.jai; do
     # Compiled once outside the timed runs: the table is about how fast the
     # program runs, not how fast it builds.
     cms="—"; cpp="${src%.jai}.cpp"
-    if [[ $HAVE_CXX -eq 1 && -f "$cpp" ]]; then
-        if c++ -O2 -std=c++17 -o "$BENCH_BUILD/$name" "$cpp" 2>/dev/null; then
-            cout="$("$BENCH_BUILD/$name" 2>&1)"
-            [[ "$cout" != "$jout" ]] && cms="MISMATCH" || cms="$(best_ms "$BENCH_BUILD/$name")ms"
-        fi
+    if [[ $HAVE_CXX -eq 1 && -f "$cpp" && -x "$BENCH_BUILD/$name" ]]; then
+        # Time it, then compare the output the timed run already produced.
+        # best_ms runs in a command substitution, so it cannot hand a variable
+        # back; the capture file outlives the subshell and does.
+        cms="$(best_ms "$BENCH_BUILD/$name")ms"
+        [[ "$(cat "$BENCH_CAP")" != "$jout" ]] && cms="MISMATCH"
     fi
 
     jms_java="—"
     # Java classes are CamelCase: loop_sum -> LoopSum.
     cls="$(python3 -c "import sys; print(''.join(w.capitalize() for w in sys.argv[1].split('_')))" "$name")"
     jsrc="$ROOT/tests/bench/$cls.java"
-    if [[ $HAVE_JAVA -eq 1 && -f "$jsrc" ]]; then
-        if javac -d "$BENCH_BUILD/classes" "$jsrc" 2>/dev/null; then
-            javaout="$(java -cp "$BENCH_BUILD/classes" "$cls" 2>&1)"
-            [[ "$javaout" != "$jout" ]] && jms_java="MISMATCH" \
-                || jms_java="$(best_ms java -cp "$BENCH_BUILD/classes" "$cls")ms"
-        fi
+    if [[ $HAVE_JAVA -eq 1 && -f "$jsrc" && -f "$BENCH_BUILD/classes/$cls.class" ]]; then
+        jms_java="$(best_ms java -cp "$BENCH_BUILD/classes" "$cls")ms"
+        [[ "$(cat "$BENCH_CAP")" != "$jout" ]] && jms_java="MISMATCH"
     fi
 
     if [[ -f "$py" ]]; then
-        pout="$(python3 "$py" 2>&1)"
         pms=$(best_ms python3 "$py")
+        pout="$(cat "$BENCH_CAP")"
         total_p=$((total_p + pms))
         if [[ "$jout" != "$pout" ]]; then
             verdict="${RED}MISMATCH${RESET}"

@@ -8,8 +8,10 @@
 from std.os import env_or
 
 let LEVEL = env_or("BENCH_LEVEL", "hard")
-let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
-let REPS = max(8 // SCALE, 1)
+# Work is exponential in the depth, so the level subtracts from it rather than
+# dividing: the repetition count stays at 8 so the shape is unchanged.
+let DEPTH_DROP = if LEVEL == "easy" { 4 } elif LEVEL == "medium" { 2 } else { 0 }
+let DEPTH = 18 - DEPTH_DROP
 
 class Node {
     pub var value: int
@@ -34,9 +36,9 @@ fn walk(node: Node?) -> int {
 }
 
 fn main() -> int {
-    let depth = 18
+    let depth = DEPTH
     var total = 0
-    for _rep in 0..REPS {
+    for _rep in 0..8 {
         let tree = build(depth, 1)
         total = (total + walk(tree)) % 1000000007
     }

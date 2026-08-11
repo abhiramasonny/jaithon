@@ -9,8 +9,10 @@ from std.os import env_or
 
 # The board is n^2 work, so the level shortens the run instead of shrinking it.
 let LEVEL = env_or("BENCH_LEVEL", "hard")
-let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
-let GENERATIONS = max(70 // SCALE, 1)
+# The grid is two-dimensional, so the level halves each side rather than
+# dividing the area: the generation count stays at 70.
+let DIM_DIV = if LEVEL == "easy" { 4 } elif LEVEL == "medium" { 2 } else { 1 }
+let SIZE = 500 // DIM_DIV
 
 fn zeros(n: int) -> list[int] {
     var row: list[int] = []
@@ -68,18 +70,18 @@ fn step(board: list[list[int]], h: int, w: int) -> list[list[int]] {
 }
 
 fn main() -> int {
-    let h = 500
-    let w = 500
+    let h = SIZE
+    let w = SIZE
 
     var board = seed_board(h, w, 7)
-    for _g in 0..GENERATIONS { board = step(board, h, w) }
+    for _g in 0..70 { board = step(board, h, w) }
 
     var live = 0
     for r in 1..h + 1 {
         let row = board[r]
         for c in 1..w + 1 { live += row[c] }
     }
-    print(GENERATIONS)
+    print(70)
     print(live)
     return 0
 }
