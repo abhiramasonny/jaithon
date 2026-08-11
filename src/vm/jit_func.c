@@ -439,6 +439,8 @@ typedef struct {
      * register, and every way out writes it back so the interpreter can carry
      * on from wherever this stopped. */
     bool      hasIter;
+    uint8_t   iterKind;   /* 1 a unit-step range, 2 a list */
+    Value     elemSample; /* a live element, for a list head */
     /* Locals in registers rather than written through to the slots on every
      * access. The entry already checks every slot's kind before calling, so
      * the prologue only has to load payloads; every exit writes them back. */
@@ -1190,19 +1192,8 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
      * a register for the whole loop, and the call this descriptor belongs to
      * may be the one that collects it. Visible only under --gc-stress, and
      * only once a body with a loop like that could compile at all. */
-    /* Count the register-holding entries from the bottom rather than assuming
-     * they are the top `valueDepth` of them. A class, a resolved function, a
-     * builtin and `self` occupy no register and can sit anywhere -- a callee
-     * pushed before its arguments puts one squarely in the middle -- so
-     * subtracting valueDepth named the wrong register for everything above it.
-     * The deopt stub already counts this way; now both do. */
-    unsigned seen = 0;
-    for (unsigned idx = 0; idx < e->depth; idx++) {
+    for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
-        if (!holdsRegister(k)) continue;
-        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
-                       (e->usesUpvalues ? 1u : 0u) + seen;
-        seen++;
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             continue;
@@ -1210,6 +1201,9 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
                       nroots * (unsigned)sizeof(Value);
+        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
+                       (e->usesUpvalues ? 1u : 0u) +
+                       (idx - (e->depth - e->valueDepth));
         emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(reg, 31, at + 8));
@@ -3125,6 +3119,92 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             int16_t  jump = jaiReadI16(code + off + 1);
             unsigned slot = jaiReadU16(code + off + 3);
             if (!localInRange(e, slot)) return false;
+
+            if (e->iterKind == 2) {
+                /* A list at the loop head. The reserved registers mean what
+                 * they do for a range except that JIT_START_REG holds the
+                 * ObjList rather than a first value. Without this a top-level
+                 * `for x in xs` was never even attempted -- the gate refused
+                 * anything that was not a range before compileOsr was called,
+                 * so not even a decline was recorded. */
+                Value sample = e->elemSample;
+                SlotKind ek;
+                unsigned etag;
+                uint32_t esh = 0;
+                ObjClass *ecl = NULL;
+                if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
+                else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
+                else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
+                /* Scalars only. An instance element crashes the compiler's
+                 * own `for line in chunk.lines` under --gc-stress and the
+                 * cause is not yet understood, so a list of instances declines
+                 * at the head and runs interpreted, exactly as before. */
+                else {
+                    e->whyNot = "list element kind unknown";
+                    return false;
+                }
+                if (!adoptLocalKindSeen(e, slot, ek, esh, ecl, sample)) {
+                    e->whyNot = "loop variable took two kinds";
+                    return false;
+                }
+                e->iterSlot = slot;
+                e->iterExit = (uint32_t)((int32_t)(off + 5) + jump);
+
+                /* Mutation first: a list that grew or shrank under the loop
+                 * must raise, and the version is the only thing that says so.
+                 * Nothing has happened yet, so this resumes at this very
+                 * instruction and the interpreter raises it properly. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_START_REG,
+                                   (unsigned)offsetof(ObjList, version)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_ITER_REG,
+                                   (unsigned)offsetof(ObjIter, version)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
+                branchTo(e, e->iterExit, true, JAI_A64_GE);
+
+                /* Reload items each time rather than hoisting: a reallocation
+                 * bumps the version so the guard above covers it, and one ldr
+                 * removes the question entirely. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
+                                   (unsigned)offsetof(ObjList, items)));
+                emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_IDX_REG, 4));
+                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                   JIT_SCRATCH_D));
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, etag));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                if (ek == SLOT_INST) {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                    /* VAL_OBJ is every heap object, not just an instance. A
+                     * list holding a string beside the instance the sample saw
+                     * passes the tag test, and reading `klass` off an ObjString
+                     * is a load one word past its header -- which is a live
+                     * pointer in several subtypes, so it does not fault, it
+                     * just answers wrongly. Check the type first. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(ObjInstance, klass)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(ObjClass, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)esh);
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                localOut(e, slot, JIT_SCRATCH_A);
+                emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
+                off += 5;
+                break;
+            }
+
             if (!adoptLocalKind(e, slot, SLOT_INT, 0, NULL)) return false;
             e->iterSlot = slot;
             e->iterExit = (uint32_t)((int32_t)(off + 5) + jump);
@@ -4441,7 +4521,8 @@ static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
 }
 
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
-                       bool hasIter, bool noInline) {
+                       uint8_t iterKind, Value elemSample, bool noInline) {
+    bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
     if (!isInstructionStart(&fn->chunk, top)) return false;
     uint32_t end = findLoopEnd(&fn->chunk, top);
@@ -4461,6 +4542,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     memset(&e, 0, sizeof e);
     e.osr = true;
     e.hasIter = hasIter;
+    e.iterKind = iterKind;
+    e.elemSample = elemSample;
     e.osrTop = top;
     e.osrEnd = end;
     e.base = 0;
@@ -4481,6 +4564,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         static Emit probe;
         memset(&probe, 0, sizeof probe);
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
+        probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
@@ -4548,8 +4632,11 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
          * pointer sits eight bytes into it. */
         emit(&e, jaiA64LdrX(JIT_START_REG, JIT_ITER_REG,
                             (unsigned)offsetof(ObjIter, source) + 8));
-        emit(&e, jaiA64LdrX(JIT_START_REG, JIT_START_REG,
-                            (unsigned)offsetof(ObjRange, start)));
+        if (iterKind == 1) {
+            emit(&e, jaiA64LdrX(JIT_START_REG, JIT_START_REG,
+                                (unsigned)offsetof(ObjRange, start)));
+        }
+        /* A list head leaves JIT_START_REG holding the ObjList itself. */
     }
 
     if (!compileBody(&e, closure) || e.failed) {
@@ -4750,14 +4837,16 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     form->code  = entry;
     form->top   = top;
     form->slots = (uint8_t)e.locals;
+    form->iterKind = iterKind;
     for (unsigned i = 0; i < e.locals; i++) form->kinds[i] = (uint8_t)e.localKind[i];
     fn->osrCount++;
     fn->osrHot = true;
     fn->osrDeclines = 0;
     fn->jitModuleVersion = fn->module != NULL ? fn->module->version : 0;
     if (getenv("JAI_JIT_WHY")) {
-        fprintf(stderr, "[jit] osr %s at %u: %u instructions\n",
-                fn->name ? fn->name->chars : "<anon>", top, e.count);
+        fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
+                fn->name ? fn->name->chars : "<anon>", top, e.count,
+                (unsigned)iterKind);
     }
     /* The same dump the whole-function tier has. A compiled loop is where most
      * of the time goes, so it is the code most worth reading, and until now it
@@ -4795,26 +4884,51 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     bool hasIter = top < (uint32_t)fn->chunk.count &&
                    fn->chunk.code[top] == OP_FOR_ITER_BIND;
     ObjIter *iter = NULL;
+    uint8_t iterKind = 0;
+    Value elemSample = NULL_VAL;
     if (hasIter) {
         if (vm.stackTop <= frame->slots) return 0;
         Value it = vm.stackTop[-1];
         if (!IS_ITER(it)) return 0;
         iter = AS_ITER(it);
-        if (iter->kind != ITER_RANGE || !IS_RANGE(iter->source)) return 0;
-        ObjRange *r = AS_RANGE(iter->source);
-        /* Unit steps only -- that is what makes the yielded value start plus
-         * the index. The start itself is loaded at entry and need not be 0. */
-        if (r->step != 1) return 0;
+        if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
+            /* Unit steps only -- that is what makes the yielded value start
+             * plus the index. The start need not be 0; it is loaded at entry. */
+            if (AS_RANGE(iter->source)->step != 1) return 0;
+            iterKind = 1;
+        } else if (iter->kind == ITER_LIST && IS_LIST(iter->source)) {
+            ObjList *src = AS_LIST(iter->source);
+            /* The element the loop is about to bind, taken from the list
+             * itself. Reading the loop variable's slot instead gives whatever
+             * the previous iteration left there -- nothing at all on the first
+             * entry -- and a kind guard built from that is aimed at the wrong
+             * type. That is what made the first attempt at this crash. */
+            int at = (int)iter->index;
+            if (at < 0 || at >= src->count) return 0;
+            elemSample = src->items[at];
+            iterKind = 2;
+        } else {
+            return 0;
+        }
     }
 
     JaiOsrForm *form = NULL;
     for (unsigned i = 0; i < fn->osrCount; i++) {
-        if (fn->osrForms[i].top == top) { form = &fn->osrForms[i]; break; }
+        /* The kind as well as the offset: a form compiled for a range head
+          * entered with a list iterator would read ObjRange::start out of an
+          * ObjList, and `for x in cond ? xs : 0..n` is enough to arrange it. */
+        if (fn->osrForms[i].top == top &&
+            fn->osrForms[i].iterKind == iterKind) {
+            form = &fn->osrForms[i];
+            break;
+        }
     }
     if (form == NULL) {
         if (fn->osrRefused || fn->osrCount >= JAI_OSR_MAX) return 0;
-        if (!compileOsr(closure, top, frame->slots, hasIter, false) &&
-            !compileOsr(closure, top, frame->slots, hasIter, true)) {
+        if (!compileOsr(closure, top, frame->slots, iterKind, elemSample,
+                        false) &&
+            !compileOsr(closure, top, frame->slots, iterKind, elemSample,
+                        true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
             if (++fn->osrAttempts >= 5 * JAI_OSR_MAX) fn->osrRefused = true;
