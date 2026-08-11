@@ -3012,7 +3012,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* A loop this body built the iterator for: the index lives in the
              * iterator, so every iteration loads and stores it, and a deopt
              * needs nothing -- what is on the stack is already current. */
-            if (!e->osr || !e->hasIter) {
+            /* Only the loop at the OSR entry point owns the reserved
+             * iterator registers. A FOR_ITER_BIND nested inside it built its
+             * own iterator and is an ordinary one -- refusing it stopped the
+             * outer loops of spectral, mandelbrot, matrix_mul and life from
+             * compiling at all, while their inner loops compiled fine. */
+            if (!e->osr || !e->hasIter || (uint32_t)off != e->osrTop) {
                 if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER) {
                     return false;
                 }
