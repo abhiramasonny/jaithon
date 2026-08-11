@@ -4,6 +4,13 @@
 #: nothing can strength-reduce away. `loop_sum` measures a counted loop with one
 #: array; this measures what happens when the address of every operand has to be
 #: computed from two of them.
+from std.os import env_or
+
+# The matrix is n^3 work, so each level halves the side rather than dividing it
+# by the whole scale.
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SHRINK = if LEVEL == "easy" { 4 } elif LEVEL == "medium" { 2 } else { 1 }
+
 fn make(n: int, seed: int) -> list[list[float]] {
     var m: list[list[float]] = []
     var s = seed
@@ -19,7 +26,7 @@ fn make(n: int, seed: int) -> list[list[float]] {
 }
 
 fn main() -> int {
-    let n = 320
+    let n = 320 // SHRINK
     let a = make(n, 12345)
     let b = make(n, 67890)
 

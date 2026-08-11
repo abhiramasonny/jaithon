@@ -5,9 +5,23 @@
 #include <string>
 #include <unordered_map>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+static const int64_t ITERS = 30000000 / SCALE;
+
 int main() {
     std::unordered_map<std::string, int64_t> counts;
-    for (int64_t i = 0; i < 30000000; i++) {
+    for (int64_t i = 0; i < ITERS; i++) {
         char buf[32];
         std::snprintf(buf, sizeof buf, "k%lld", (long long)(i % 10000));
         std::string key(buf);

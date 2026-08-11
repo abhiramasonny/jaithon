@@ -1,3 +1,9 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+STEPS = 500_000 // SCALE
+
 SOLAR_MASS = 39.47841760435743
 DAYS_PER_YEAR = 365.24
 
@@ -63,6 +69,6 @@ bodies = [
          0.000285885980666130812 * SOLAR_MASS),
 ]
 print(f"{energy(bodies):.9f}")
-for _step in range(500_000):
+for _step in range(STEPS):
     advance(bodies, 0.01)
 print(f"{energy(bodies):.9f}")

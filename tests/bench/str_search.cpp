@@ -6,6 +6,21 @@
 #include <cstdio>
 #include <string>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+// A repetition count around a fixed text: never below one pass.
+static const long REPS = (5 / SCALE) < 1 ? 1 : (5 / SCALE);
+
 static int64_t count_occurrences(const std::string &text, const std::string &needle) {
     int64_t n = (int64_t)text.size();
     int64_t m = (int64_t)needle.size();
@@ -34,7 +49,7 @@ int main() {
     }
 
     int64_t hits = 0;
-    for (int rep = 0; rep < 5; rep++) hits = count_occurrences(text, "abcd");
+    for (long rep = 0; rep < REPS; rep++) hits = count_occurrences(text, "abcd");
     std::printf("%lld\n", (long long)text.size());
     std::printf("%lld\n", (long long)hits);
     return 0;

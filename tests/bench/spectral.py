@@ -1,3 +1,11 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+# The matrix size stays; the repetitions around it are what the level shortens.
+REPS = max(1, 6 // SCALE)
+
+
 def evalA(i, j):
     s = i + j
     return 1.0 / float(s * (s + 1) // 2 + i + 1)
@@ -26,7 +34,7 @@ def timesAt(v, n):
 n = 550
 u = [1.0] * n
 v = []
-for _r in range(6):
+for _r in range(REPS):
     v = timesAt(timesA(u, n), n)
     u = timesAt(timesA(v, n), n)
 

@@ -4,6 +4,21 @@
 #include <cstdio>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+// The work is n^3, so halve n per level rather than dividing by SCALE.
+static const int DIM_DIV = SCALE == 16 ? 4 : (SCALE == 4 ? 2 : 1);
+
 static std::vector<std::vector<double>> make(int n, int64_t seed) {
     std::vector<std::vector<double>> m;
     int64_t s = seed;
@@ -19,7 +34,7 @@ static std::vector<std::vector<double>> make(int n, int64_t seed) {
 }
 
 int main() {
-    const int n = 320;
+    const int n = 320 / DIM_DIV;
     std::vector<std::vector<double>> a = make(n, 12345);
     std::vector<std::vector<double>> b = make(n, 67890);
 

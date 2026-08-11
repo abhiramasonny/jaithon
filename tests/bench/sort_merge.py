@@ -1,4 +1,9 @@
 import sys
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+N = 1_000_000 // SCALE
 
 sys.setrecursionlimit(100000)
 
@@ -32,7 +37,7 @@ def sort(values):
 
 data = []
 seed = 12345
-for _i in range(1_000_000):
+for _i in range(N):
     seed = (seed * 1103515245 + 12345) % 2147483648
     data.append(seed % 100000)
 ordered = sort(data)

@@ -5,6 +5,12 @@
 #: string, no dict — so a number here is arithmetic and the loops around it and
 #: nothing else. Every value is kept inside 32 bits, so the ports cannot differ
 #: by an overflow.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let ITERS = 1_000_000 // SCALE
+
 fn popcount(value: int) -> int {
     var v = value
     var bits = 0
@@ -21,7 +27,7 @@ fn main() -> int {
     var ones = 0
     var checksum = 0
     var i = 0
-    while i < 1_000_000 {
+    while i < ITERS {
         seed = (seed * 1103515245 + 12345) % 2147483648
         var v = seed ^ checksum
         v = v ^ v >> 7

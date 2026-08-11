@@ -1,5 +1,19 @@
 // Same program as matrix_mul.jai.
 public class MatrixMul {
+    // BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+    // medium a quarter, hard (the default, and anything unrecognised) all of it.
+    static long scale() {
+        String l = System.getenv("BENCH_LEVEL");
+        if ("easy".equals(l)) return 16;
+        if ("medium".equals(l)) return 4;
+        return 1;
+    }
+
+    static final long SCALE = scale();
+    // Work is n^3, so halve n per level rather than divide it.
+    static final long SIDE_DIV = SCALE == 16 ? 4L : SCALE == 4 ? 2L : 1L;
+    static final int N = (int) (320L / SIDE_DIV);
+
     static double[][] make(int n, long seed) {
         double[][] m = new double[n][n];
         long s = seed;
@@ -13,7 +27,7 @@ public class MatrixMul {
     }
 
     public static void main(String[] args) {
-        final int n = 320;
+        final int n = N;
         double[][] a = make(n, 12345L);
         double[][] b = make(n, 67890L);
 

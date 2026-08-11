@@ -1,3 +1,12 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+# Work is exponential in the depth, so the level subtracts from it instead of
+# dividing it: -2 is 4x less tree, -4 is 16x less.
+DEPTH_DROP = 4 if _LEVEL == "easy" else 2 if _LEVEL == "medium" else 0
+DEPTH = 18 - DEPTH_DROP
+
+
 class Node:
     __slots__ = ("value", "left", "right")
 
@@ -19,7 +28,7 @@ def walk(node):
     return node.value + walk(node.left) + walk(node.right)
 
 
-depth = 18
+depth = DEPTH
 total = 0
 for _rep in range(8):
     tree = build(depth, 1)

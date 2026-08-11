@@ -3,6 +3,12 @@
 #: Every instance here dies immediately, so the whole cost is allocation and
 #: the collections it provokes. `string_build` measures the same thing through
 #: strings; this isolates it from formatting.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let ITERS = 4_000_000 // SCALE
+
 class Point {
     pub var x: int
     pub var y: int
@@ -19,7 +25,7 @@ class Point {
 
 var total = 0
 var i = 0
-while i < 4_000_000 {
+while i < ITERS {
     let a = Point(i % 100, i % 37)
     let b = Point(i % 53, i % 11)
     total = (total + a.dot(b)) % 1000000007

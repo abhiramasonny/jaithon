@@ -5,6 +5,20 @@
 #include <cstdio>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+static const long STEPS = 500000 / SCALE;
+
 static const double SOLAR_MASS = 39.47841760435743;
 static const double DAYS_PER_YEAR = 365.24;
 
@@ -80,7 +94,7 @@ int main() {
         ),
     };
     std::printf("%.9f\n", energy(bodies));
-    for (int step = 0; step < 500000; step++) {
+    for (long step = 0; step < STEPS; step++) {
         advance(bodies, 0.01);
     }
     std::printf("%.9f\n", energy(bodies));

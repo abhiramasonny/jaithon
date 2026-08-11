@@ -1597,6 +1597,36 @@ static void reconcileAfterUncond(Emit *e, uint32_t off) {
     }
 }
 
+/* Fold one more `return` into what this function is known to return.
+ *
+ * `build` in binary_trees ends `return null` on one path and `return Node(..)`
+ * on the other, which is what an optional return type means, and demanding a
+ * single kind refused it outright. An instance joined with a maybe-instance is
+ * a maybe-instance; the shape survives only when both sides agree on it.
+ *
+ * This was written once before and reverted, because compiling `build` made the
+ * program eleven times slower. That was not the merge: `build` is the first body
+ * in the language to hold a freshly allocated object on the operand stack across
+ * an allocating self-call, and at the time a self-call rooted nothing and the
+ * operand-stack-to-register mapping in emitRootFill was wrong. Both are fixed,
+ * and the same merge now makes binary_trees faster than the interpreter. */
+static bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
+    if (!e->sawReturn) {
+        e->sawReturn = true; e->returnKind = k; e->returnShape = shape;
+        return true;
+    }
+    if (e->returnKind == k) {
+        if (e->returnShape != shape) e->returnShape = 0;
+        return true;
+    }
+    bool nullable = (e->returnKind == SLOT_INST && k == SLOT_MAYBE_INST) ||
+                    (e->returnKind == SLOT_MAYBE_INST && k == SLOT_INST);
+    if (!nullable) return false;
+    if (e->returnShape != shape) e->returnShape = 0;
+    e->returnKind = SLOT_MAYBE_INST;
+    return true;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -3908,10 +3938,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned r;
             SlotKind k;
             if (!popValue(e, &r, &k)) return false;
-            if (e->sawReturn && e->returnKind != k) return false;
-            e->sawReturn  = true;
-            e->returnKind = k;
-            e->returnShape = tshape;
+            if (!mergeReturnKind(e, k, tshape)) return false;
             emit(e, jaiA64MovX(0, r));
             emitEpilogue(e, 0);
             off += 2;
@@ -3941,10 +3968,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &r, &k)) return false;
             /* One return kind per function: the entry point rebuilds a Value
              * from it, and it cannot rebuild two. */
-            if (e->sawReturn && e->returnKind != k) return false;
-            e->sawReturn = true;
-            e->returnKind = k;
-            e->returnShape = rsh;
+            if (!mergeReturnKind(e, k, rsh)) return false;
             emit(e, jaiA64MovX(0, r));
             emitEpilogue(e, 0);
             off += 1;

@@ -4,8 +4,21 @@
 #include <cstdio>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+
 int main() {
-    const int64_t n = 10000000;
+    const int64_t n = 10000000 / SCALE;
     std::vector<bool> flags;
     for (int64_t i = 0; i <= n; i++) flags.push_back(true);
 

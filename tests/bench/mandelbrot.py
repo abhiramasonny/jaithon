@@ -1,5 +1,12 @@
-width = 3200
-height = 240
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+# Width and height are image dimensions: work is their product, so the level
+# halves each rather than dividing by 16 -- halving both is already 4x less.
+DIM_DIV = 4 if _LEVEL == "easy" else 2 if _LEVEL == "medium" else 1
+
+width = 3200 // DIM_DIV
+height = 240 // DIM_DIV
 limit = 100
 
 inside = 0

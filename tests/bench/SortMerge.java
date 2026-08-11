@@ -4,6 +4,18 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class SortMerge {
+    // BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+    // medium a quarter, hard (the default, and anything unrecognised) all of it.
+    static long scale() {
+        String l = System.getenv("BENCH_LEVEL");
+        if ("easy".equals(l)) return 16;
+        if ("medium".equals(l)) return 4;
+        return 1;
+    }
+
+    static final long SCALE = scale();
+    static final long N = 1000000L / SCALE;
+
     static List<Long> merge(List<Long> left, List<Long> right) {
         List<Long> out = new ArrayList<>();
         int i = 0;
@@ -39,7 +51,7 @@ public class SortMerge {
     public static void main(String[] args) {
         List<Long> data = new ArrayList<>();
         long seed = 12345;
-        for (int i = 0; i < 1000000; i++) {
+        for (long i = 0; i < N; i++) {
             seed = (seed * 1103515245L + 12345L) % 2147483648L;
             data.add(seed % 100000L);
         }

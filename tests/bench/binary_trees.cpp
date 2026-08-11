@@ -6,6 +6,21 @@
 #include <memory>
 #include <utility>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+// Work is exponential in the depth, so shorten it by subtracting.
+static const int64_t DEPTH_DROP = SCALE == 16 ? 4 : (SCALE == 4 ? 2 : 0);
+
 struct Node {
     int64_t value;
     std::unique_ptr<Node> left;
@@ -27,7 +42,7 @@ static int64_t walk(const Node *node) {
 }
 
 int main() {
-    const int64_t depth = 18;
+    const int64_t depth = 18 - DEPTH_DROP;
     int64_t total = 0;
     for (int rep = 0; rep < 8; rep++) {
         std::unique_ptr<Node> tree = build(depth, 1);

@@ -1,4 +1,10 @@
 import sys
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+# The board size stays; the repetitions around it are what the level shortens.
+REPS = max(1, 3 // SCALE)
 
 
 def safe(cols, row, col):
@@ -32,7 +38,7 @@ sys.setrecursionlimit(10000)
 n = 11
 cols = [0] * n
 total = 0
-for _rep in range(3):
+for _rep in range(REPS):
     total = place(cols, 0, n)
 print(n)
 print(total)

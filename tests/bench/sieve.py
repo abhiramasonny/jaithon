@@ -1,4 +1,9 @@
-n = 10_000_000
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+
+n = 10_000_000 // SCALE
 flags = []
 for _i in range(n + 1):
     flags.append(True)
