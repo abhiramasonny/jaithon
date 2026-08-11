@@ -5,7 +5,7 @@ import java.util.List;
 public class StringBuild {
     public static void main(String[] args) {
         List<String> parts = new ArrayList<>();
-        for (int i = 0; i < 200000; i++) {
+        for (int i = 0; i < 2000000; i++) {
             parts.add("item-" + i);
         }
         String joined = String.join(",", parts);

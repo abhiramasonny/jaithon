@@ -16,7 +16,7 @@ public class ClosureCalls {
 
     public static void main(String[] args) {
         long total = 0;
-        for (long k = 1; k <= 20L; k++) {
+        for (long k = 1; k <= 1000L; k++) {
             LongUnaryOperator bump = adder(k);
             total = (total + applyN(bump, 0, 100000L)) % 1000000007L;
         }

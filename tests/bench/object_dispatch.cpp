@@ -17,7 +17,7 @@ int main() {
     auto acc = std::make_unique<Vec2>(0.0, 0.0);
     auto step = std::make_unique<Vec2>(1.0, 2.0);
     double total = 0.0;
-    for (int i = 0; i < 1000000; i++) {
+    for (int i = 0; i < 10000000; i++) {
         acc = acc->add(*step);
         total += acc->dot(*step);
     }

@@ -23,7 +23,7 @@ def timesAt(v, n):
     return out
 
 
-n = 150
+n = 550
 u = [1.0] * n
 v = []
 for _r in range(6):

@@ -4,7 +4,4 @@ fn fib(n: int) -> int {
     return fib(n - 1) + fib(n - 2)
 }
 
-fn main() -> int {
-    print(fib(300))
-    return 0
-}
+print(fib(38))

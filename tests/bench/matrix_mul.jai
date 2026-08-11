@@ -19,7 +19,7 @@ fn make(n: int, seed: int) -> list[list[float]] {
 }
 
 fn main() -> int {
-    let n = 120
+    let n = 320
     let a = make(n, 12345)
     let b = make(n, 67890)
 

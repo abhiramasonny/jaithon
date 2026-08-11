@@ -21,7 +21,7 @@ fn main() -> int {
     var acc = Vec2(0.0, 0.0)
     let step = Vec2(1.0, 2.0)
     var total = 0.0
-    for _i in 0..1_000_000 {
+    for _i in 0..10_000_000 {
         acc = acc.add(step)
         total += acc.dot(step)
     }

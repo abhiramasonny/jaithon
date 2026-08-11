@@ -1,4 +1,4 @@
-n = 1_000_000
+n = 10_000_000
 flags = []
 for _i in range(n + 1):
     flags.append(True)

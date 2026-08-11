@@ -20,7 +20,7 @@ int main() {
     int64_t seed = 7;
     int64_t ones = 0;
     int64_t checksum = 0;
-    for (int64_t i = 0; i < 300000; i++) {
+    for (int64_t i = 0; i < 1000000; i++) {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         int64_t v = seed ^ checksum;
         v = v ^ (v >> 7);

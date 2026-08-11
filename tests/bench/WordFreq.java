@@ -6,7 +6,7 @@ public class WordFreq {
     public static void main(String[] args) {
         StringBuilder builder = new StringBuilder();
         long seed = 7;
-        for (int i = 0; i < 40000; i++) {
+        for (int i = 0; i < 200000; i++) {
             seed = (seed * 1103515245L + 12345L) % 2147483648L;
             builder.append("w").append(seed % 500L).append(" ");
         }

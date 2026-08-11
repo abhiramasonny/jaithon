@@ -36,7 +36,7 @@ fn sort(values: list[int]) -> list[int] {
 fn main() -> int {
     var data: list[int] = []
     var seed = 12345
-    for _i in 0..60_000 {
+    for _i in 0..1_000_000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
         data.push(seed % 100000)
     }

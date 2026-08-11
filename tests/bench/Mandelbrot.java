@@ -1,7 +1,7 @@
 // Same program as mandelbrot.jai.
 public class Mandelbrot {
     public static void main(String[] args) {
-        final int width = 320;
+        final int width = 3200;
         final int height = 240;
         final int limit = 100;
 

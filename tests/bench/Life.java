@@ -50,9 +50,9 @@ public class Life {
     }
 
     public static void main(String[] args) {
-        final int h = 100;
-        final int w = 100;
-        final int generations = 50;
+        final int h = 500;
+        final int w = 500;
+        final int generations = 70;
 
         long[][] board = seedBoard(h, w, 7L);
         for (int g = 0; g < generations; g++) board = step(board, h, w);

@@ -8,7 +8,7 @@
 int main() {
     std::string text;
     int64_t seed = 7;
-    for (int64_t i = 0; i < 40000; i++) {
+    for (int64_t i = 0; i < 200000; i++) {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         char buf[32];
         std::snprintf(buf, sizeof buf, "w%lld ", (long long)(seed % 500));

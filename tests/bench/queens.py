@@ -29,7 +29,7 @@ def place(cols, row, n):
 
 
 sys.setrecursionlimit(10000)
-n = 9
+n = 11
 cols = [0] * n
 total = 0
 for _rep in range(3):

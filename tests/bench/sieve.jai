@@ -4,7 +4,7 @@
 #: flat loops get, and every write is a bounds-checked store of a bool. Nothing
 #: else in the suite writes a list this hard.
 fn main() -> int {
-    let n = 1_000_000
+    let n = 10_000_000
     var flags: list[bool] = []
     for _i in 0..n + 1 { flags.push(true) }
 

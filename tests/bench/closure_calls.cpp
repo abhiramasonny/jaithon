@@ -19,7 +19,7 @@ static int64_t apply_n(const std::function<int64_t(int64_t)> &f, int64_t start, 
 
 int main() {
     int64_t total = 0;
-    for (int64_t k = 1; k <= 20; k++) {
+    for (int64_t k = 1; k <= 1000; k++) {
         auto bump = adder(k);
         total = (total + apply_n(bump, 0, 100000)) % 1000000007;
     }

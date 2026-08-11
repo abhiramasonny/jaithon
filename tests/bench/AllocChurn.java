@@ -8,7 +8,7 @@ public class AllocChurn {
 
     public static void main(String[] args) {
         long total = 0;
-        for (long i = 0; i < 400000L; i++) {
+        for (long i = 0; i < 4000000L; i++) {
             Point a = new Point(i % 100, i % 37);
             Point b = new Point(i % 53, i % 11);
             total = (total + a.dot(b)) % 1000000007L;

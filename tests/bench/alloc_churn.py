@@ -11,7 +11,7 @@ class Point:
 
 total = 0
 i = 0
-while i < 400_000:
+while i < 4_000_000:
     a = Point(i % 100, i % 37)
     b = Point(i % 53, i % 11)
     total = (total + a.dot(b)) % 1000000007

@@ -5,7 +5,7 @@ import java.util.List;
 public class ListOps {
     public static void main(String[] args) {
         List<Long> xs = new ArrayList<>();
-        for (long i = 0; i < 1000000L; i++) {
+        for (long i = 0; i < 10000000L; i++) {
             xs.add(i * 3);
         }
 

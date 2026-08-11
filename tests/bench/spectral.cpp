@@ -31,7 +31,7 @@ static std::vector<double> timesAt(const std::vector<double> &v, int n) {
 }
 
 int main() {
-    const int n = 150;
+    const int n = 550;
     std::vector<double> u((size_t)n, 1.0);
     std::vector<double> v;
     for (int r = 0; r < 6; r++) {

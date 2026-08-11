@@ -3,7 +3,7 @@
 #   make            release build -> ./jaithon
 #   make debug      -O0 -g, assertions, GC stress available
 #   make test       build + run the full test suite
-#   make bench      build + run benchmarks
+#   make bench      build + run benchmarks (LEVEL=easy|medium|hard, default hard)
 #   make fixpoint-check  compile each source twice and compare the images
 #   make install    install to $(PREFIX)
 #   make clean      remove build artifacts
@@ -391,7 +391,7 @@ jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arm64
 
 bench: $(TARGET)
-	@./scripts/run_bench.sh
+	@LEVEL="$(LEVEL)" ./scripts/run_bench.sh
 #: Regenerate boot/seed.c from the images the front end currently needs.
 #:
 #: Runs the compiler once to populate __jaicache__, embeds what it finds, then

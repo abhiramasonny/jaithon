@@ -1,5 +1,5 @@
 counts = {}
-for i in range(500_000):
+for i in range(30_000_000):
     key = f"k{i % 10_000}"
     counts[key] = counts.get(key, 0) + 1
 

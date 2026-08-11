@@ -7,7 +7,7 @@
 
 int main() {
     std::unordered_map<std::string, int64_t> counts;
-    for (int64_t i = 0; i < 500000; i++) {
+    for (int64_t i = 0; i < 30000000; i++) {
         char buf[32];
         std::snprintf(buf, sizeof buf, "k%lld", (long long)(i % 10000));
         std::string key(buf);

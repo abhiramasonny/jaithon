@@ -63,6 +63,6 @@ bodies = [
          0.000285885980666130812 * SOLAR_MASS),
 ]
 print(f"{energy(bodies):.9f}")
-for _step in range(100_000):
+for _step in range(500_000):
     advance(bodies, 0.01)
 print(f"{energy(bodies):.9f}")

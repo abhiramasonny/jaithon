@@ -29,7 +29,7 @@ fn timesAt(v: list[float], n: int) -> list[float] {
 }
 
 fn main() -> int {
-    let n = 150
+    let n = 550
     var u: list[float] = []
     for _i in 0..n { u.push(1.0) }
 

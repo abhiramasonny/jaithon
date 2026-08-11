@@ -6,7 +6,7 @@
 fn main() -> int {
     var text = ""
     var seed = 7
-    for _i in 0..40_000 {
+    for _i in 0..200_000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
         text = text + f"w{seed % 500} "
     }

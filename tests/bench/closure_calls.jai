@@ -19,7 +19,7 @@ fn apply_n(f: fn(int) -> int, start: int, times: int) -> int {
 fn main() -> int {
     var total = 0
     var k = 1
-    while k <= 20 {
+    while k <= 1000 {
         let bump = adder(k)
         total = (total + apply_n(bump, 0, 100_000)) % 1000000007
         k += 1

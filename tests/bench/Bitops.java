@@ -15,7 +15,7 @@ public class Bitops {
         long seed = 7;
         long ones = 0;
         long checksum = 0;
-        for (long i = 0; i < 300000L; i++) {
+        for (long i = 0; i < 1000000L; i++) {
             seed = (seed * 1103515245L + 12345L) % 2147483648L;
             long v = seed ^ checksum;
             v = v ^ (v >> 7);

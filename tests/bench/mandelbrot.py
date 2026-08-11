@@ -1,4 +1,4 @@
-width = 320
+width = 3200
 height = 240
 limit = 100
 

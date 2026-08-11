@@ -30,7 +30,7 @@ fn place(cols: list[int], row: int, n: int) -> int {
 }
 
 fn main() -> int {
-    let n = 9
+    let n = 11
     var cols: list[int] = []
     for _i in 0..n { cols.push(0) }
     var total = 0

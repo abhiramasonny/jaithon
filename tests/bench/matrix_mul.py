@@ -10,7 +10,7 @@ def make(n, seed):
     return m
 
 
-n = 120
+n = 320
 a = make(n, 12345)
 b = make(n, 67890)
 

@@ -61,9 +61,9 @@ fn step(board: list[list[int]], h: int, w: int) -> list[list[int]] {
 }
 
 fn main() -> int {
-    let h = 100
-    let w = 100
-    let generations = 50
+    let h = 500
+    let w = 500
+    let generations = 70
 
     var board = seed_board(h, w, 7)
     for _g in 0..generations { board = step(board, h, w) }

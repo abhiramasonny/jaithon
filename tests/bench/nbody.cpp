@@ -80,7 +80,7 @@ int main() {
         ),
     };
     std::printf("%.9f\n", energy(bodies));
-    for (int step = 0; step < 100000; step++) {
+    for (int step = 0; step < 500000; step++) {
         advance(bodies, 0.01);
     }
     std::printf("%.9f\n", energy(bodies));

@@ -61,9 +61,9 @@ static std::vector<std::vector<int64_t>> step(
 }
 
 int main() {
-    const int h = 100;
-    const int w = 100;
-    const int generations = 50;
+    const int h = 500;
+    const int w = 500;
+    const int generations = 70;
 
     std::vector<std::vector<int64_t>> board = seed_board(h, w, 7);
     for (int g = 0; g < generations; g++) board = step(board, h, w);

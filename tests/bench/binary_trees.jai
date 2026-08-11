@@ -28,7 +28,7 @@ fn walk(node: Node?) -> int {
 }
 
 fn main() -> int {
-    let depth = 16
+    let depth = 18
     var total = 0
     for _rep in 0..8 {
         let tree = build(depth, 1)

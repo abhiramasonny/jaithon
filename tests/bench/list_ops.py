@@ -1,5 +1,5 @@
 xs = []
-for i in range(1_000_000):
+for i in range(10_000_000):
     xs.append(i * 3)
 
 total = 0

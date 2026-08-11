@@ -21,7 +21,7 @@ public class BinaryTrees {
     }
 
     public static void main(String[] args) {
-        final int depth = 16;
+        final int depth = 18;
         long total = 0;
         for (int rep = 0; rep < 8; rep++) {
             Node tree = build(depth, 1);
