@@ -882,6 +882,41 @@ typedef struct {
      * this file expects it. */
     uint32_t  fpBorrow;
     uint8_t   fpBorrowReg[32];
+
+    /* Value entries whose own X register does not hold the value yet. Two
+     * flavours, one mechanism:
+     *
+     * kPend  -- the entry is an integer literal `OP_INT`/`OP_CONST` declined
+     *           to materialise, so a consumer that can spell it as an imm12
+     *           spends nothing on it at all. `n - 1` was `movz` plus `subs`
+     *           and is now `subs`.
+     * xBorrow -- the entry is a plain read of a register-resident local and
+     *           is held in THAT register rather than copied into its own.
+     *           The X twin of fpBorrow, read-only for the same reason, and
+     *           `fib(n - 1)` loses the `mov` that copied `n`.
+     *
+     * Both are settled -- put where the rest of this file expects them -- at
+     * the TOP of the next instruction unless that instruction is on
+     * deferSurvives' whitelist. The top of an instruction is the one place
+     * the settling code is unconditionally on the executed path; a guard is
+     * not, which is the lesson fpBorrow already paid for. It sits before
+     * `offsetToInst` records where the instruction starts, so a branch that
+     * lands here -- arriving with everything already in registers -- skips it.
+     *
+     * Nothing deferred may reach a deopt record: the stub writes entries out
+     * of valueXReg. deoptRecordAt and branchOnDeopt assert that, so a
+     * whitelist that is wrong costs a decline and not a wrong answer. */
+    uint32_t  kPend;
+    int64_t   kPendVal[32];
+    uint32_t  xBorrow;
+    uint8_t   xBorrowReg[32];
+    /* Offsets this walk carried a deferred entry into, for the same reason
+     * fpCarry exists: a BACKWARD branch to one of them would arrive with the
+     * value in its register while the instruction there reads the borrow.
+     * Forward branches are caught during the walk, where the fixup already
+     * exists; this catches the rest. */
+    uint32_t  deferCarry[64];
+    unsigned  deferCarryCount;
 } Emit;
 
 static void emit(Emit *e, uint32_t word) {
@@ -1089,7 +1124,25 @@ static unsigned localDest(const Emit *e, unsigned slot) {
     return localReg(e, slot);
 }
 
+/* A local's X register is about to be written, so no entry may still be
+ * borrowing it. Copying it out here is wrong for the reason deoptRecordAt
+ * gives -- the write can sit inside a span an earlier branch skips -- so this
+ * declines instead. It cannot fire from the whitelist as it stands: no opcode
+ * on it writes a local. */
+static void xHomeWritten(Emit *e, unsigned reg) {
+    if (e->xBorrow == 0 || reg == 0) return;
+    for (unsigned i = 0; i < 32u; i++) {
+        if ((e->xBorrow & (1u << i)) == 0) continue;
+        if (e->xBorrowReg[i] != reg) continue;
+        e->whyNot = "a local was written under a borrow of its register";
+        e->failed = true;
+        return;
+    }
+}
+
 static void localOut(Emit *e, unsigned slot, unsigned src) {
+    xHomeWritten(e, e->osr ? e->slotXReg[slot]
+                           : (e->spilled ? 0u : localReg(e, slot)));
     if (e->osr) {
         if (e->slotFpReg[slot] != 0) fpReleaseHome(e, e->slotFpReg[slot]);
         if (e->slotXReg[slot] != 0) {
@@ -1337,11 +1390,16 @@ static void fpSyncAll(Emit *e) {
 /* A d register holding entry `idx`, loaded from its X register if that is
  * where it still is. Leaves fpLive alone: after this the two copies agree, and
  * claiming the X one is stale when it is not would cost a sync for nothing. */
+static unsigned xHeldIn(Emit *e, unsigned idx);
+
 static unsigned fpOperand(Emit *e, unsigned idx) {
     if (e->fpBorrow & (1u << idx)) return e->fpBorrowReg[idx];
     unsigned d = fpRegAt(e, idx);
     if (!(e->fpLive & (1u << idx))) {
-        emit(e, jaiA64FmovDX(d, valueXReg(e, idx)));
+        /* xHeldIn, not valueXReg: a float entry that is a plain read of a
+         * local held in an X register is in THAT register, and reading its
+         * own would read whatever the bank last had. */
+        emit(e, jaiA64FmovDX(d, xHeldIn(e, idx)));
     }
     return d;
 }
@@ -1446,6 +1504,99 @@ static unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
     return e->slotFpReg[slot];
 }
 
+/* ------------------------------------------------------------------ */
+/* Deferred X entries: pending constants and borrowed locals            */
+/* ------------------------------------------------------------------ */
+
+static void emitConst64(Emit *e, unsigned rd, int64_t value);
+
+static bool anyDeferred(const Emit *e) {
+    return (e->kPend | e->xBorrow) != 0;
+}
+
+/* Put entry `idx` in its own register, so every other part of this file finds
+ * it where it expects to. Both forms are one instruction, and neither touches
+ * NZCV -- movz/movk and `orr xd, xzr, xs` -- so this is still safe between a
+ * compare and the branch that reads its flags. */
+static void settleEntry(Emit *e, unsigned idx) {
+    if (e->kPend & (1u << idx)) {
+        e->kPend &= ~(1u << idx);
+        emitConst64(e, valueXReg(e, idx), e->kPendVal[idx]);
+        return;
+    }
+    if (e->xBorrow & (1u << idx)) {
+        unsigned src = e->xBorrowReg[idx];
+        e->xBorrow &= ~(1u << idx);
+        emit(e, jaiA64MovX(valueXReg(e, idx), src));
+    }
+}
+
+static void settleAll(Emit *e) {
+    if (!anyDeferred(e)) return;
+    for (unsigned i = 0; i < 32u; i++) settleEntry(e, i);
+}
+
+/* The register entry `idx` may be READ from. A borrow answers with the local's
+ * own register and costs nothing; a pending constant has to be materialised
+ * first, which is exactly the instruction the deferral was trying to avoid --
+ * so an arm that can fold checks kPend before it asks. */
+static unsigned xHeldIn(Emit *e, unsigned idx) {
+    if (e->xBorrow & (1u << idx)) return e->xBorrowReg[idx];
+    if (e->kPend & (1u << idx)) settleEntry(e, idx);
+    return valueXReg(e, idx);
+}
+
+/* The X register a local permanently lives in, or 0 when it lives nowhere a
+ * stack entry could borrow: a spilled frame slot, or an OSR slot the register
+ * plan left in memory. */
+static unsigned localHomeX(const Emit *e, unsigned slot) {
+    if (e->osr) return e->slotXReg[slot];
+    if (e->spilled) return 0u;
+    return localReg(e, slot);
+}
+
+/* Entry `idx` is a read of an int-like local that lives in `reg`. */
+static void xBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
+    e->xBorrow |= 1u << idx;
+    e->xBorrowReg[idx] = (uint8_t)reg;
+}
+
+/* Entry `idx` is the integer `k`, not yet in any register. */
+static void kPendLocal(Emit *e, unsigned idx, int64_t k) {
+    e->kPend |= 1u << idx;
+    e->kPendVal[idx] = k;
+}
+
+/* The pending literal on top, when it fits the imm12 both `adds` and `subs`
+ * take. Reports it without consuming it: the caller folds only once it knows
+ * the rest of the shape allows it. */
+static bool pendingImm12(const Emit *e, unsigned idx, int64_t *out) {
+    if ((e->kPend & (1u << idx)) == 0) return false;
+    int64_t k = e->kPendVal[idx];
+    if (k < -4095 || k > 4095) return false;
+    *out = k;
+    return true;
+}
+
+/* `rn - k`, flags only, in one instruction. A negative `k` becomes `cmn`,
+ * which subtracts it just as exactly -- the same trick OP_INC_LOCAL uses for a
+ * negative step, and for the same reason: both forms set V for the operation
+ * actually performed. */
+static void emitCmpImm(Emit *e, unsigned rn, int64_t k) {
+    if (k >= 0) emit(e, jaiA64SubsXImm(31, rn, (unsigned)k));
+    else        emit(e, jaiA64AddsXImm(31, rn, (unsigned)(-k)));
+}
+
+/* `rd = rn + k` for OP_ADD, `rd = rn - k` for OP_SUB, with V set for the sum
+ * or difference that was actually asked for. */
+static void emitAddSubImm(Emit *e, unsigned rd, unsigned rn, int64_t k,
+                          bool subtract) {
+    bool down = subtract ? (k >= 0) : (k < 0);
+    unsigned m = (unsigned)(k >= 0 ? k : -k);
+    if (down) emit(e, jaiA64SubsXImm(rd, rn, m));
+    else      emit(e, jaiA64AddsXImm(rd, rn, m));
+}
+
 static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
                        Value seen, int fromLocal) {
     if (e->depth >= JIT_MAX_STACK) {
@@ -1470,6 +1621,8 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    e->kPend    &= ~(1u << e->valueDepth);
+    e->xBorrow  &= ~(1u << e->valueDepth);
     e->valueDepth++;
     /* An inlined body's entries are not in the caller's bank, so they do not
      * widen its save set -- which is the whole reason they fit. */
@@ -1529,15 +1682,26 @@ static bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->valueDepth--;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    e->kPend    &= ~(1u << e->valueDepth);
+    e->xBorrow  &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
     *reg = valueXReg(e, e->valueDepth);
     return true;
 }
 
+/* Pop, reporting the register the value is ACTUALLY in. For a borrowed entry
+ * that is the local's own register, which is what removes the copy: every arm
+ * that pops its operands and computes into `pushReg(e) - 1` reads one place
+ * and writes another, so it needs no change at all to be right. An arm that
+ * wrote back into a popped register would not -- there is none, and the
+ * whitelist is what keeps it that way. */
 static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
     if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
     fpSyncOne(e, e->valueDepth - 1);
-    return popValueRaw(e, reg, kind);
+    unsigned held = xHeldIn(e, e->valueDepth - 1);
+    if (!popValueRaw(e, reg, kind)) return false;
+    *reg = held;
+    return true;
 }
 
 /* Depth and the kind of every entry, in one word. Registers are assigned from
@@ -1675,9 +1839,11 @@ static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     /* A join has to agree about where every value is, so nothing crosses a
-     * branch in an FP register. fmov does not touch NZCV, so this is still
-     * safe after the compare that set the condition. */
+     * branch in an FP register, and nothing crosses one deferred either.
+     * Neither fmov nor mov nor movz touches NZCV, so this is still safe after
+     * the compare that set the condition. */
     fpSyncAll(e);
+    settleAll(e);
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
         (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
         targetOffset = exitTargetFor(e, targetOffset);
@@ -1806,6 +1972,16 @@ static bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
         e->failed = true;
         return false;
     }
+    /* And for exactly the same reason, nothing may still be a pending constant
+     * or be borrowing a local's X register. Settling here is wrong for the
+     * same reason it is wrong for a float borrow -- the guard may sit inside a
+     * span an earlier branch skips -- so this is the assertion that the
+     * whitelist held, and it declines rather than miscompiling if it did not. */
+    if (anyDeferred(e)) {
+        e->whyNot = "a deferred value reached a guard";
+        e->failed = true;
+        return false;
+    }
     if (e->deoptCount >= JIT_MAX_DEOPT) {
         e->whyNot = "too many guards to record";
         e->failed = true;
@@ -1852,6 +2028,11 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     if (e->fpBorrow != 0) {          /* see deoptRecordAt */
         e->whyNot = "a float borrow reached a guard";
+        e->failed = true;
+        return;
+    }
+    if (anyDeferred(e)) {            /* see deoptRecordAt */
+        e->whyNot = "a deferred value reached a guard";
         e->failed = true;
         return;
     }
@@ -3642,7 +3823,7 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
     if (idx >= e->depth || !holdsRegister(e->stack[idx])) return false;
     unsigned vi = valueIndexOf(e, idx);
     fpSyncOne(e, vi);
-    unsigned src = valueXReg(e, vi);
+    unsigned src = xHeldIn(e, vi);
     if (!pushValue3(e, e->stack[idx], e->stackShape[idx], e->stackClass[idx],
                     e->stackSeen[idx], -1)) {
         return false;
@@ -3776,6 +3957,53 @@ static bool fpBorrowSurvives(uint8_t op) {
     }
 }
 
+/* Opcodes a deferred X entry may live across.
+ *
+ * The same shape as fpBorrowSurvives and just as deliberately short: every one
+ * of these reads its operands through popValue or xHeldIn, computes into
+ * `pushReg(e) - 1`, and takes no deopt record with a deferred entry still on
+ * the model. Anything else settles at the top of the instruction. Two of them
+ * earn their place on their own: OP_INT and OP_CONST are what stands between
+ * `GET_LOCAL n` and the `SUB` that consumes it. */
+static bool deferSurvives(uint8_t op) {
+    switch (op) {
+    case OP_GET_LOCAL: case OP_GET_LOCAL2:
+    case OP_INT: case OP_CONST:
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
+    case OP_SHL: case OP_SHR:
+    case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+    case OP_EQ: case OP_NE:
+    case OP_JUMP_IF_CMP_FALSE:
+    case OP_BIND: case OP_SET_LOCAL:
+    case OP_POP:
+    case OP_RETURN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The opcodes that can spell an integer literal as an immediate, which is the
+ * whole reason OP_INT is ever allowed to push nothing. Kept in step with the
+ * arms below by hand, and harmless if it says yes too often: the consumer
+ * settles what it cannot fold. */
+static bool foldsIntLiteral(uint8_t op) {
+    switch (op) {
+    case OP_ADD: case OP_SUB:
+    case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+    case OP_EQ: case OP_NE:
+    case OP_JUMP_IF_CMP_FALSE:
+    /* Not because a shift takes an imm12 -- it does not -- but because the
+     * count already becomes part of the instruction when it is a literal in
+     * 0..63, so the register this used to fill was written and never read.
+     * bitops shifts by 7, 3, 11, 1 and 31 and paid a movz for each. */
+    case OP_SHL: case OP_SHR:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
                            int stop) {
     if (e->fpOff) return false;
@@ -3809,9 +4037,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         thisOff = off;
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
         afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
+        uint8_t op = code[off];
+        /* Settle any deferred entry BEFORE the offset map records where this
+         * instruction begins, so that a branch landing here -- which arrives
+         * with every entry already in its own register -- skips the settling
+         * and the fall-through pays for it. Both paths then agree, which is
+         * the whole requirement at a join.
+         *
+         * A join that the instruction is *allowed* to carry a deferral into is
+         * the one case that does not work, because the arm would read the
+         * borrow and the arriving path put the value elsewhere. Forward
+         * branches are known here; backward ones are checked at the end. */
+        if (anyDeferred(e)) {
+            bool joinsHere = false;
+            if (!e->inlining) {
+                for (unsigned f = 0; f < e->fixupCount && !joinsHere; f++) {
+                    joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
+                }
+            }
+            if (joinsHere || !deferSurvives(op) || e->deferCarryCount >= 64) {
+                settleAll(e);
+            } else {
+                e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
+            }
+        }
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = (int)stackSignature(e);
-        uint8_t op = code[off];
         e->lastOp = op;
         /* A borrow ends here unless the instruction is one of the few it is
          * allowed to live across. The top of an instruction is the one place
@@ -3857,6 +4108,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
             fpSyncOne(e, e->valueDepth - 1);
+            settleAll(e);   /* the caller reads the result out of valueXReg */
             break;
         }
 
@@ -3883,9 +4135,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     fpClaim(e, idx);
                 }
             } else {
-                unsigned dst = pushReg(e) - 1;
-                unsigned src = localIn(e, slot, dst);
-                if (src != dst) emit(e, jaiA64MovX(dst, src));
+                unsigned home = localHomeX(e, slot);
+                if (home != 0) {
+                    /* The copy this used to emit is the whole cost of reading
+                     * a local, and every one of them was a copy of a register
+                     * that is not going to change: only localOut writes a
+                     * local's home, and no opcode a borrow lives across does.
+                     * Six of them in `fib`. If nothing consumes it before an
+                     * instruction that cannot read a borrow, the settle at the
+                     * top of that instruction emits exactly the mov that used
+                     * to be here, so this never costs anything. */
+                    xBorrowLocal(e, e->valueDepth - 1, home);
+                } else {
+                    unsigned dst = pushReg(e) - 1;
+                    unsigned src = localIn(e, slot, dst);
+                    if (src != dst) emit(e, jaiA64MovX(dst, src));
+                }
             }
             off += 3;
             break;
@@ -3894,7 +4159,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_INT: {
             int16_t k = jaiReadI16(code + off + 1);
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-            emitConst64(e, pushReg(e) - 1, k);
+            /* Push nothing when the next instruction can say the literal as an
+             * immediate: `n - 1` is one `subs`, not a `movz` and a `subs`. The
+             * consumer settles it if the rest of its shape turns out not to
+             * allow the fold, so being wrong here costs the instruction it
+             * would have spent anyway. */
+            if (off + 3 < stop && foldsIntLiteral(code[off + 3]) &&
+                k >= -4095 && k <= 4095) {
+                kPendLocal(e, e->valueDepth - 1, k);
+            } else {
+                emitConst64(e, pushReg(e) - 1, k);
+            }
             off += 3;
             break;
         }
@@ -3931,7 +4206,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 (e->fpLive & (1u << (e->valueDepth - 1)))) {
                 localOutFp(e, slot, fpHeldIn(e, e->valueDepth - 1));
             } else {
-                localOut(e, slot, pushReg(e) - 1);
+                localOut(e, slot, xHeldIn(e, e->valueDepth - 1));
             }
             off += 3;
             break;
@@ -4252,7 +4527,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 ka = kb = SLOT_MAYBE_INST;
             }
             if (!holdsRegister(ka)) return false;
-            unsigned rb = pushReg(e) - 1, ra = pushReg(e) - 2;
+            /* Read through xHeldIn, not straight out of the bank: an operand
+             * that is a plain read of a local is still in the local's own
+             * register. See popValue. */
+            int64_t kcmp = 0;
+            bool foldCmp = ka == SLOT_INT &&
+                           pendingImm12(e, e->valueDepth - 1, &kcmp);
             unsigned cond;
             switch (op) {
             case OP_EQ: cond = JAI_A64_EQ; break;
@@ -4268,13 +4548,31 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * FP-resident entry out if it is ever taken. */
                 unsigned db = fpOperand(e, e->valueDepth - 1);
                 unsigned da = fpOperand(e, e->valueDepth - 2);
+                /* nanToDeopt records, so nothing may still be deferred. A
+                 * float local can be borrowed out of an X register in OSR
+                 * mode; settling costs a mov on a path that is about to
+                 * compare NaNs, and buys the compile. */
+                settleAll(e);
                 emit(e, jaiA64FcmpD(da, db));
                 nanToDeopt(e);
             } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
-                emit(e, jaiA64SubsXReg(31, ra, rb));
+                unsigned ra = xHeldIn(e, e->valueDepth - 2);
+                if (foldCmp) {
+                    e->kPend &= ~(1u << (e->valueDepth - 1));
+                    emitCmpImm(e, ra, kcmp);
+                } else {
+                    emit(e, jaiA64SubsXReg(31, ra,
+                                           xHeldIn(e, e->valueDepth - 1)));
+                }
             } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
                        IS_STRING(e->stackSeen[e->depth - 1])) {
+                /* This path guards, so nothing may still be deferred when it
+                 * does -- settled here, at the top of the path, which is where
+                 * the settling is unconditionally executed. */
+                settleAll(e);
+                unsigned rb = valueXReg(e, e->valueDepth - 1);
+                unsigned ra = valueXReg(e, e->valueDepth - 2);
                 /* Two interned strings are equal exactly when they are the
                  * same object -- that is what interning buys, and it is what
                  * `text[i] == " "` is, since one-character strings are shared
@@ -4345,7 +4643,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 ka = kb = SLOT_MAYBE_INST;
             }
             if (!holdsRegister(ka)) return false;
-            unsigned rb = pushReg(e) - 1, ra = pushReg(e) - 2;
+            /* See the OP_LT..OP_GE arm: operands are read through xHeldIn, a
+             * literal right-hand side becomes the compare's own immediate,
+             * and the paths that guard settle first. */
+            int64_t kcmp2 = 0;
+            bool foldCmp2 = ka == SLOT_INT &&
+                            pendingImm12(e, e->valueDepth - 1, &kcmp2);
             unsigned cond;
             if (!negatedCondition(cmp, &cond)) return false;
             if (ka == SLOT_FLOAT) {
@@ -4366,13 +4669,24 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * FP-resident entry out if it is ever taken. */
                 unsigned db = fpOperand(e, e->valueDepth - 1);
                 unsigned da = fpOperand(e, e->valueDepth - 2);
+                settleAll(e);          /* nanToDeopt records */
                 emit(e, jaiA64FcmpD(da, db));
                 nanToDeopt(e);
             } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
-                emit(e, jaiA64SubsXReg(31, ra, rb));
+                unsigned ra = xHeldIn(e, e->valueDepth - 2);
+                if (foldCmp2) {
+                    e->kPend &= ~(1u << (e->valueDepth - 1));
+                    emitCmpImm(e, ra, kcmp2);
+                } else {
+                    emit(e, jaiA64SubsXReg(31, ra,
+                                           xHeldIn(e, e->valueDepth - 1)));
+                }
             } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
                        IS_STRING(e->stackSeen[e->depth - 1])) {
+                settleAll(e);          /* this path guards */
+                unsigned rb = valueXReg(e, e->valueDepth - 1);
+                unsigned ra = valueXReg(e, e->valueDepth - 2);
                 /* Two interned strings are equal exactly when they are the
                  * same object -- that is what interning buys, and it is what
                  * `text[i] == " "` is, since one-character strings are shared
@@ -4403,6 +4717,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_POP: {
             unsigned r;
+            /* Nothing reads a value that is being thrown away, so a deferred
+             * entry is forgotten rather than settled. Without this, `a = b`
+             * paid at the POP the copy the borrow had just saved. */
+            if (e->depth > 0 && holdsRegister(e->stack[e->depth - 1]) &&
+                e->valueDepth > 0) {
+                unsigned idx = e->valueDepth - 1;
+                e->kPend   &= ~(1u << idx);
+                e->xBorrow &= ~(1u << idx);
+            }
             if (!popValue(e, &r, NULL)) return false;
             off += 1;
             break;
@@ -4422,7 +4745,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value k = fn->chunk.constants.data[idx];
             if (IS_INT(k)) {
                 if (!pushValue3(e, SLOT_INT, 0, NULL, k, -1)) return false;
-                emitConst64(e, pushReg(e) - 1, AS_INT(k));
+                int64_t kv = AS_INT(k);
+                if (off + 4 < stop && foldsIntLiteral(code[off + 4]) &&
+                    kv >= -4095 && kv <= 4095) {   /* see OP_INT */
+                    kPendLocal(e, e->valueDepth - 1, kv);
+                } else {
+                    emitConst64(e, pushReg(e) - 1, kv);
+                }
             } else if (IS_FLOAT(k)) {
                 /* The bits, not the number: a float lives in an X register
                  * exactly as it does in a Value's payload -- unless the value
@@ -4642,6 +4971,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 kcount >= 0 && kcount <= 63;
 
             if ((op == OP_SHL || op == OP_SHR) && !kcountUsable) {
+                /* The count reaches a register and a guard, so it has to be
+                 * in one. OP_INT may have deferred it on the strength of the
+                 * opcode alone -- a count of 100 is a literal this arm cannot
+                 * fold -- and this is where that is put right. */
+                settleAll(e);
+            }
+            if (op != OP_SHL && op != OP_SHR) settleAll(e);
+            if (kcountUsable) e->kPend &= ~(1u << (e->valueDepth - 1));
+
+            if ((op == OP_SHL || op == OP_SHR) && !kcountUsable) {
                 unsigned rCount = pushReg(e) - 1;
                 emit(e, jaiA64SubsXImm(31, rCount, 0));
                 branchOnDeopt(e, JAI_A64_LT);            /* negative count */
@@ -4701,6 +5040,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 1;
                 break;
             }
+            /* A literal right operand becomes the immediate `adds`/`subs`
+             * already takes, so it never reaches a register. Decided before
+             * the pops, which is where the entry index still names it. */
+            int64_t kimm = 0;
+            bool foldK = op != OP_DIV && e->depth >= 2 &&
+                         e->stack[e->depth - 1] == SLOT_INT &&
+                         e->stack[e->depth - 2] == SLOT_INT &&
+                         pendingImm12(e, e->valueDepth - 1, &kimm);
+            if (foldK) e->kPend &= ~(1u << (e->valueDepth - 1));
+
             if (!popValue(e, &rb, &kb)) return false;
             if (!popValue(e, &ra, &ka)) return false;
             if (ka != kb) return false;   /* no implicit widening here */
@@ -4711,8 +5060,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT || op == OP_DIV) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
-            emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
-                                 : jaiA64SubsXReg(rd, ra, rb));
+            if (foldK) emitAddSubImm(e, rd, ra, kimm, op == OP_SUB);
+            else emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
+                                      : jaiA64SubsXReg(rd, ra, rb));
             branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
             off += 1;
             break;
@@ -4734,9 +5084,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value k = fn->chunk.constants.data[kIdx];
             if (!IS_INT(k)) return false;
 
-            emitConst64(e, JIT_SCRATCH_A, AS_INT(k));
-            emit(e, jaiA64SubsXReg(31, localIn(e, slot, JIT_SCRATCH_C),
-                                   JIT_SCRATCH_A));
+            /* `while i < n` and `if n < 2` are the same instruction here, and
+             * the constant fits the compare's own imm12 far more often than
+             * not -- so it gets one instruction rather than a movz and a
+             * three-register subs. */
+            int64_t kv = AS_INT(k);
+            if (kv >= -4095 && kv <= 4095) {
+                emitCmpImm(e, localIn(e, slot, JIT_SCRATCH_C), kv);
+            } else {
+                emitConst64(e, JIT_SCRATCH_A, kv);
+                emit(e, jaiA64SubsXReg(31, localIn(e, slot, JIT_SCRATCH_C),
+                                       JIT_SCRATCH_A));
+            }
             branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
             off += 9;
             break;
@@ -4916,9 +5275,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         fpClaim(e, idx);
                     }
                 } else {
-                    unsigned dst = pushReg(e) - 1;
-                    unsigned src = localIn(e, slot, dst);
-                    if (src != dst) emit(e, jaiA64MovX(dst, src));
+                    unsigned home = localHomeX(e, slot);
+                    if (home != 0) {            /* see OP_GET_LOCAL */
+                        xBorrowLocal(e, e->valueDepth - 1, home);
+                    } else {
+                        unsigned dst = pushReg(e) - 1;
+                        unsigned src = localIn(e, slot, dst);
+                        if (src != dst) emit(e, jaiA64MovX(dst, src));
+                    }
                 }
             }
             off += 5;
@@ -7026,6 +7390,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
     }
     fpSyncAll(e);
+    settleAll(e);
     /* An inlined body's offsets are the callee's; matching them against the
      * caller's fixups compares two different numbering schemes. There is
      * nothing to check either way -- it has no branches. */
@@ -7049,6 +7414,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
             if (e->fixups[f].targetOffset != e->homeEarly[i]) continue;
             e->whyNot = "a branch lands on a bind whose local was written early";
+            return false;
+        }
+    }
+    /* And the same for a deferred X entry. Forward branches were settled
+     * during the walk; this is what catches a backward one -- a loop head that
+     * happens to sit between an OP_INT and the operator that consumes it.
+     * Nothing in the suite or in `check lib/std` reaches it, which is the
+     * point: it costs a decline rather than a register nothing wrote. */
+    for (unsigned i = 0; i < e->deferCarryCount; i++) {
+        for (unsigned f = 0; f < e->fixupCount; f++) {
+            if (e->fixups[f].targetOffset != e->deferCarry[i]) continue;
+            e->whyNot = "a branch lands where a value was deferred";
             return false;
         }
     }
@@ -8924,6 +9301,7 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
 static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
                           int depthOverride) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    settleAll(e);   /* see branchTo: a join agrees about where every value is */
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
         (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
         targetOffset = exitTargetFor(e, targetOffset);
