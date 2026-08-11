@@ -326,8 +326,28 @@ struct ObjFunction {
     /* Attempts so far. One look is not enough: a body can only use a callee's
      * return kind once that callee has itself compiled, and which of them have
      * depends on when the sampler happened to fire. Refusing forever on the
-     * first miss made compilation depend on tick timing. */
+     * first miss made compilation depend on tick timing.
+     *
+     * COUNTED PER LOOP HEAD, because a single counter is a starvation bug and
+     * not merely an imprecision. The budget was spent by whichever loop ran
+     * first, and `osrRefused` then refused every OTHER loop in the same body
+     * for the life of the program. `word_freq`'s main has a concatenation loop
+     * the tier cannot compile followed by the scan loop that is 64% of the
+     * benchmark; the concatenation loop burnt all twenty attempts before the
+     * scan loop had run once, so the scan loop was never offered to the
+     * compiler at all -- and, because a head that is never offered produces no
+     * decline, nothing reported it. `life` and `mandelbrot` lose three main
+     * loops and one respectively the same way.
+     *
+     * osrMissTop/osrMissAttempts is that budget split by head: same number of
+     * attempts per head as before, so a one-loop function behaves exactly as
+     * it did. osrRefused now means "every head this table can hold is spent",
+     * and osrAttempts stays as the whole-function backstop for a body with
+     * more uncompilable heads than the table has room for. */
     uint8_t     osrAttempts;
+    uint32_t    osrMissTop[JAI_OSR_MAX];
+    uint8_t     osrMissAttempts[JAI_OSR_MAX];
+    uint8_t     osrMissCount;
     uint8_t     jitAttempts;
     bool        osrRefused;
     /* The back edge enters the compiled loop directly. An entry that keeps
