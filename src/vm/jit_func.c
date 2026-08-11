@@ -543,7 +543,13 @@ typedef struct {
     /* Locals live in the compiled frame instead of registers. A body with more
      * live values than there are callee-saved registers would otherwise be
      * declined outright, and nbody's `advance` wants nineteen. The operand
-     * stack stays in registers either way -- that is where the arithmetic is. */
+     * stack stays in registers either way -- that is where the arithmetic is.
+     *
+     * This used to be the whole decision: one local over budget and every
+     * local went to the frame. It is now the flag that says the PER-SLOT plan
+     * in slotXReg/slotFpReg is in force -- the busiest slots keep a register
+     * and the rest live in the frame, exactly as the OSR tier does. A body
+     * that fits entirely leaves this false and its codegen is untouched. */
     bool      spilled;
     unsigned  localsFrameOffset;
     /* On-stack replacement: the locals ARE the interpreter's frame slots,
@@ -587,6 +593,13 @@ typedef struct {
     unsigned  xLocals;                       /* how many took an X register */
     unsigned  fpLocals;                      /* ...and how many a d register */
     uint32_t  slotUse[JIT_MAX_SLOTS + 1];    /* sites, weighted by loop depth */
+    /* The same again for the function tier, but counted in INSTRUCTIONS SAVED
+     * rather than in sites -- see noteSlotCost. A float read through the FP
+     * bank costs one `ldr d` from the frame and one `fmov d, x` from an X
+     * register, so an X register buys such a slot exactly nothing and a flat
+     * per-use count would hand it one anyway. Two banks, two ledgers. */
+    uint32_t  slotSaveX[JIT_MAX_SLOTS + 1];
+    uint32_t  slotSaveFp[JIT_MAX_SLOTS + 1];
     const uint8_t *loopDepth;                /* per bytecode offset */
     unsigned  loopDepthCount;
     unsigned  fpSaveOffset;                  /* where d8.. are preserved */
@@ -636,6 +649,9 @@ typedef struct {
     bool      needNullable[JIT_MAX_SLOTS + 1];
     bool      pendingRange;
     bool      rangeInclusive;
+    /* Where the deferred OP_BUILD_RANGE was, so a guard inside the header it
+     * folded into can resume at an offset the model still describes. */
+    uint32_t  rangeBuildIp;
     unsigned  iterSlot;
     uint32_t  iterExit;
     int       exitStub[8];       /* one per distinct offset jumped out to */
@@ -808,18 +824,69 @@ static unsigned osrReserved(const Emit *e) {
 
 static unsigned regBase(const Emit *e) {
     if (e->osr) return osrReserved(e) + e->xLocals;
-    return e->spilled ? 0u : e->locals;
+    return e->spilled ? e->xLocals : e->locals;
 }
 
 static unsigned localReg(const Emit *e, unsigned slot) {
-    if (e->osr) return e->slotXReg[slot];
+    if (e->osr || e->spilled) return e->slotXReg[slot];
     return JIT_FIRST_SAVED + (slot - e->base);
 }
 
 /* Sixteen bytes each, not eight: the tag travels with the value so a local
- * whose kind varies can be read behind a guard. */
+ * whose kind varies can be read behind a guard.
+ *
+ * Every slot keeps a frame home whether or not it also has a register: the
+ * dense layout is what makes this one multiply rather than a table, and the
+ * few wasted words cost nothing next to the 4095-byte frame limit. */
 static unsigned localFrameOff(const Emit *e, unsigned slot) {
     return e->localsFrameOffset + (slot - e->base) * 16u;
+}
+
+/* A frame home only has to carry a tag when something is going to READ that
+ * tag: a slot whose kind is fixed for the whole function has one the deopt
+ * stub can rebuild from the kind, so nothing does. That takes a spilled write
+ * from three instructions (materialise the tag, store it, store the payload)
+ * to one. Only a dynamic slot -- one two paths reached disagreeing about --
+ * has a tag that is a run-time fact, and only its reads check it. */
+static bool localTagInFrame(const Emit *e, unsigned slot) {
+    return e->dynamicLocal[slot];
+}
+
+/* What one access to `slot` would save, in emitted instructions, if the slot
+ * had a home in each bank rather than in the frame. Accumulated by the
+ * accessors themselves during the measuring pass, so the ranking is charged by
+ * what the code generator actually does rather than by a flat per-use
+ * constant, and weighted by how deeply nested the loop naming the site is: a
+ * site two loops deep is worth sixteen of one outside any loop.
+ *
+ * The numbers, against a frame home with no tag to store:
+ *
+ *   localIn      X home saves the `ldr x`;    an FP home replaces it with an
+ *                                             `fmov x, d`, so it saves 0.
+ *   localOut     X home saves the `str x`;    an FP home replaces it with an
+ *                                             `fmov d, x`, so it saves 0.
+ *   localInFp    an FP home is BORROWED, so the read disappears entirely and
+ *                it saves the `ldr d`; an X home turns it into `fmov d, x`
+ *                and saves 0.
+ *   localOutFp   both homes are one `fmov`, and so is the `str d` they
+ *                replace: 0 either way. What makes a float slot worth a
+ *                register is its reads.
+ *
+ * Zero-saving slots are not merely ranked last, they are excluded: a slot the
+ * loop never touches would otherwise take a register on a tie-break and pay a
+ * prologue write for a value nothing reads. */
+static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
+                         unsigned saveFp) {
+    if (!e->measuring || e->osr || e->inlining) return;
+    if (slot > JIT_MAX_SLOTS) return;
+    unsigned w = 1u;
+    if (e->loopDepth != NULL && e->curOffset < e->loopDepthCount) {
+        unsigned d = e->loopDepth[e->curOffset];
+        if (d > 6u) d = 6u;
+        w = 1u << (2u * d);
+    }
+    e->slotSaveX[slot]  += w * saveX;
+    e->slotSaveFp[slot] += w * saveFp;
 }
 
 static void branchOnDeopt(Emit *e, unsigned cond);
@@ -869,7 +936,13 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         emit(e, jaiA64LdrX(scratch, JIT_SLOTS_REG, slot * 16u + 8u));
         return scratch;
     }
+    noteSlotCost(e, slot, 1u, 0u);
     if (!e->spilled) return localReg(e, slot);
+    if (e->slotXReg[slot] != 0) return e->slotXReg[slot];
+    if (e->slotFpReg[slot] != 0) {
+        emit(e, jaiA64FmovXD(scratch, e->slotFpReg[slot]));
+        return scratch;
+    }
     if (e->dynamicLocal[slot]) {
         /* Two paths reached here disagreeing about this slot, so what it holds
          * is a runtime fact: check it against what this read was compiled for
@@ -899,7 +972,9 @@ static unsigned localDest(const Emit *e, unsigned slot) {
     if (e->osr) {
         return e->slotXReg[slot] != 0 ? e->slotXReg[slot] : JIT_SCRATCH_C;
     }
-    if (e->spilled) return JIT_SCRATCH_C;
+    if (e->spilled) {
+        return e->slotXReg[slot] != 0 ? e->slotXReg[slot] : JIT_SCRATCH_C;
+    }
     return localReg(e, slot);
 }
 
@@ -924,12 +999,24 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
         emit(e, jaiA64StrX(src, JIT_SLOTS_REG, slot * 16u + 8u));
         return;
     }
+    noteSlotCost(e, slot, 1u, 0u);
     if (!e->spilled) {
         if (src != localReg(e, slot)) emit(e, jaiA64MovX(localReg(e, slot), src));
         return;
     }
-    emitTagFor(e, e->localKind[slot], src, JIT_SCRATCH_D, JIT_SCRATCH_C);
-    emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
+    if (e->slotFpReg[slot] != 0) fpReleaseHome(e, e->slotFpReg[slot]);
+    if (e->slotXReg[slot] != 0) {
+        if (src != e->slotXReg[slot]) emit(e, jaiA64MovX(e->slotXReg[slot], src));
+        return;
+    }
+    if (e->slotFpReg[slot] != 0) {
+        emit(e, jaiA64FmovDX(e->slotFpReg[slot], src));
+        return;
+    }
+    if (localTagInFrame(e, slot)) {
+        emitTagFor(e, e->localKind[slot], src, JIT_SCRATCH_D, JIT_SCRATCH_C);
+        emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
+    }
     emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot) + 8));
 }
 
@@ -956,8 +1043,19 @@ static void localInFp(Emit *e, unsigned slot, unsigned dst) {
         emit(e, jaiA64LdrD(dst, JIT_SLOTS_REG, slot * 16u + 8u));
         return;
     }
+    noteSlotCost(e, slot, 0u, 1u);
     if (!e->spilled) {
         emit(e, jaiA64FmovDX(dst, localReg(e, slot)));
+        return;
+    }
+    if (e->slotFpReg[slot] != 0) {
+        if (dst != e->slotFpReg[slot]) {
+            emit(e, jaiA64FmovDD(dst, e->slotFpReg[slot]));
+        }
+        return;
+    }
+    if (e->slotXReg[slot] != 0) {
+        emit(e, jaiA64FmovDX(dst, e->slotXReg[slot]));
         return;
     }
     emit(e, jaiA64LdrD(dst, 31, localFrameOff(e, slot) + 8));
@@ -981,12 +1079,28 @@ static void localOutFp(Emit *e, unsigned slot, unsigned src) {
         emit(e, jaiA64StrD(src, JIT_SLOTS_REG, slot * 16u + 8u));
         return;
     }
+    /* No noteSlotCost: a float write is one instruction whichever home it has
+     * (`fmov d,d`, `fmov x,d` or `str d`), so it makes no case for a register.
+     * The reads are what pay. */
     if (!e->spilled) {
         emit(e, jaiA64FmovXD(localReg(e, slot), src));
         return;
     }
-    emit(e, jaiA64MovzX(JIT_SCRATCH_D, VAL_FLOAT, 0));
-    emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
+    if (e->slotFpReg[slot] != 0) {
+        fpReleaseHome(e, e->slotFpReg[slot]);
+        if (src != e->slotFpReg[slot]) {
+            emit(e, jaiA64FmovDD(e->slotFpReg[slot], src));
+        }
+        return;
+    }
+    if (e->slotXReg[slot] != 0) {
+        emit(e, jaiA64FmovXD(e->slotXReg[slot], src));
+        return;
+    }
+    if (localTagInFrame(e, slot)) {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_D, VAL_FLOAT, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
+    }
     emit(e, jaiA64StrD(src, 31, localFrameOff(e, slot) + 8));
 }
 
@@ -1438,6 +1552,30 @@ static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
      * already on the stack -- is describing a point this walk has not reached
      * and `instDepth` says nothing about it. */
     if (ip != e->curOffset) return true;
+    /* OP_BUILD_RANGE emits nothing: the range is deferred and folded into the
+     * OP_GET_ITER that must follow it, which builds the iterator straight from
+     * the two integers. So at this offset the model holds `start` and `stop`
+     * while the INTERPRETER holds the range object OP_BUILD_RANGE gave it, and
+     * a record taken here handed it two ints where it expected one range -- it
+     * resumed, executed OP_GET_ITER, and reported `'int' object is not
+     * iterable`. The answer is to resume one instruction EARLIER, at the
+     * OP_BUILD_RANGE the model still describes: nothing between the two has
+     * run, and re-executing it just builds the range the interpreter wants.
+     *
+     * Nothing reached this until a guard could be emitted inside the header
+     * itself, which the root fill for the iterator's own descriptor does as
+     * soon as one of the locals it roots is dynamic. It reproduces on a body
+     * with no spilling and no floats at all. */
+    if (e->pendingRange) {
+        *ipOut = e->rangeBuildIp;
+        *depthOut = e->instDepth;
+        unsigned nseen = 0;
+        for (unsigned i = 0; i < e->instDepth; i++) {
+            if (holdsRegister(e->stack[i])) nseen++;
+        }
+        *valueDepthOut = nseen;
+        return true;
+    }
     if (e->depth < e->instDepth) {
         e->whyNot = "a guard resumes an instruction whose operands it has "
                     "already consumed";
@@ -3426,7 +3564,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->localKind[slot] == SLOT_FLOAT && !e->dynamicLocal[slot] &&
                 fpWorthLoading(e, code, off + 3, stop)) {
                 unsigned idx = e->valueDepth - 1;
-                if (e->osr && e->slotFpReg[slot] != 0) {
+                if (e->slotFpReg[slot] != 0) {
                     fpBorrowLocal(e, idx, e->slotFpReg[slot]);
                 } else {
                     localInFp(e, slot, fpRegAt(e, idx));
@@ -3502,13 +3640,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* Either operand already in a d register of its own is read
                  * from there. `x2 + y2` was two fmovs and an add. */
                 unsigned da, db;
-                if (e->osr && e->slotFpReg[a] != 0) {
+                if (e->slotFpReg[a] != 0) {
                     da = e->slotFpReg[a];
                 } else {
                     localInFp(e, a, fpRegAt(e, idx));
                     da = fpRegAt(e, idx);
                 }
-                if (e->osr && e->slotFpReg[b] != 0) {
+                if (e->slotFpReg[b] != 0) {
                     db = e->slotFpReg[b];
                 } else {
                     localInFp(e, b, JIT_FP_BANK + JIT_MAX_SAVED);
@@ -4406,6 +4544,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_GET_LOCAL2: {
             unsigned a = jaiReadU16(code + off + 1);
             unsigned b = jaiReadU16(code + off + 3);
+            /* Reading the second local checks a tag when that slot is dynamic,
+             * and a guard may not be reached with a borrow live -- the stub
+             * writes float entries out of fpRegAt, and a borrowed one is not
+             * there. The first local therefore takes a copy rather than a
+             * borrow when the second one is going to guard. `dt * b.vx` in
+             * nbody's second loop is exactly this shape: `dt` is a float with
+             * a home and `b` is the loop variable, which took two kinds and so
+             * became dynamic. */
+            bool guardFollows = b <= JIT_MAX_SLOTS && e->dynamicLocal[b];
             for (unsigned k = 0; k < 2; k++) {
                 unsigned slot = k == 0 ? a : b;
                 if (!localInRange(e, slot)) return false;
@@ -4422,7 +4569,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     !e->dynamicLocal[slot] &&
                     fpWorthLoading(e, code, off + 5, stop)) {
                     unsigned idx = e->valueDepth - 1;
-                    if (e->osr && e->slotFpReg[slot] != 0) {
+                    if (e->slotFpReg[slot] != 0 && !(k == 0 && guardFollows)) {
                         fpBorrowLocal(e, idx, e->slotFpReg[slot]);
                     } else {
                         localInFp(e, slot, fpRegAt(e, idx));
@@ -5141,6 +5288,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             e->rangeInclusive = code[off + 1] != 0;
             e->pendingRange = true;
+            e->rangeBuildIp = (uint32_t)off;
             off += 2;
             break;
         }
@@ -5186,7 +5334,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 1;
                 break;
             }
-            e->pendingRange = 0;
             if (!e->callsOut) return false;
             /* start, stop and the inclusive flag go in as arguments. */
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
@@ -5204,6 +5351,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
             e->wroteHeap = true;
+            e->pendingRange = false;
             off += 1;
             break;
         }
@@ -6534,6 +6682,64 @@ static bool eligible(ObjFunction *fn) {
     return true;
 }
 
+/* Filled by loopDepthTable, which lives with the OSR entry below. */
+static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count);
+
+/* Which slots earn a register in a body that cannot keep all of them.
+ *
+ * `m` is the finished measuring pass, whose accessors charged each slot the
+ * instructions a home in each bank would have saved it (see noteSlotCost).
+ * Greedy, most saved first, across BOTH banks at once: an int slot read four
+ * times in the inner loop outranks a float slot read twice even though they
+ * would take registers from different pools, and taking them in one order
+ * keeps that comparison meaningful when only one pool runs out.
+ *
+ * Three exclusions, each of which cost something to learn:
+ *
+ *   - a slot with zero saving is not merely ranked last, it is skipped. A slot
+ *     the loop never touches would otherwise win a tie-break and pay a
+ *     prologue write for a value nothing ever reads.
+ *   - a dynamic slot keeps its frame home: its tag is a run-time fact and only
+ *     the frame has anywhere to put one.
+ *   - the X pool is what the operand stack did not want; the FP pool is all of
+ *     v8..v15, which nothing else in this tier names.
+ *
+ * A wrong guess costs an `fmov` and cannot cost a wrong answer: only fmov, ldr
+ * and str ever touch a home, so every home is a bit-exact 64-bit box whatever
+ * kind the slot turns out to hold. */
+static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
+    unsigned availFp = JIT_FP_MAX_SAVED;
+    unsigned top = e->base + e->locals;
+    if (top > JIT_MAX_SLOTS + 1u) top = JIT_MAX_SLOTS + 1u;
+    while (availX > 0 || availFp > 0) {
+        unsigned bestSlot = 0, bestGain = 0;
+        bool bestFp = false;
+        for (unsigned slot = e->base; slot < top; slot++) {
+            if (e->slotXReg[slot] != 0 || e->slotFpReg[slot] != 0) continue;
+            if (e->dynamicLocal[slot]) continue;
+            if (availFp > 0 && m->slotSaveFp[slot] > bestGain) {
+                bestGain = m->slotSaveFp[slot];
+                bestSlot = slot;
+                bestFp   = true;
+            }
+            if (availX > 0 && m->slotSaveX[slot] > bestGain) {
+                bestGain = m->slotSaveX[slot];
+                bestSlot = slot;
+                bestFp   = false;
+            }
+        }
+        if (bestGain == 0) break;
+        if (bestFp) {
+            e->slotFpReg[bestSlot] =
+                (uint8_t)(JIT_FP_FIRST_SAVED + e->fpLocals++);
+            availFp--;
+        } else {
+            e->slotXReg[bestSlot] = (uint8_t)(JIT_FIRST_SAVED + e->xLocals++);
+            availX--;
+        }
+    }
+}
+
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *dynamic, bool *needDynamic,
                             const bool *nullable, bool *needNullable,
@@ -6634,6 +6840,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.descOffset   = 16u;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
+    /* So the per-slot charges the accessors record are weighted by how deeply
+     * nested the site is. Without it every site in the function counts the
+     * same and `n`, read once to set the loop up, outranks nothing. */
+    body.loopDepth = loopDepthFor(&fn->chunk, &body.loopDepthCount);
     if (!seedLocals(&body, slotBase)) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
@@ -6685,18 +6895,24 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     unsigned extra = e.usesUpvalues ? 1u : 0u;
     unsigned saved = e.locals + extra + body.maxValue;
     for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
-        /* A tag only has somewhere to live in the frame. */
+        /* A tag only has somewhere to live in the frame. One dynamic slot used
+         * to send every local to the frame with it; now it sends only itself,
+         * because the plan below is per slot. */
         if (e.dynamicLocal[i]) { saved = JIT_MAX_SAVED + 1; break; }
     }
     if (saved > JIT_MAX_SAVED) {
-        /* Too many to keep in registers, so the locals go to the frame and the
-         * operand stack keeps the registers. Only the operand stack has to fit
-         * now, which is a far lower bar: it is expression depth, not the
-         * number of variables a function happens to declare. */
+        /* Too many to keep in registers, so the operand stack takes the
+         * registers first -- that is expression depth, not the number of
+         * variables a function happens to declare -- and whatever is left over
+         * goes to the slots that earn it. What does not earn one lives in the
+         * frame. */
         e.spilled = true;
         saved = extra + body.maxValue;
         if (saved > JIT_MAX_SAVED) {
             e.whyNot = "the operand stack alone exceeds the registers";
+        } else {
+            planSlotRegisters(&e, &body, JIT_MAX_SAVED - saved);
+            saved += e.xLocals;
         }
     }
     if (e.whyNot != NULL) {
@@ -6721,6 +6937,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         e.descOffset = frame;
         frame += (unsigned)sizeof(JitCallDesc);
     }
+    if (e.fpLocals > 0) {
+        /* v8..v15 are callee-saved in their low 64 bits, which is exactly a
+         * double, so str d / ldr d is the whole protocol -- but this tier is
+         * itself a callee, so the ones it takes have to be put back. */
+        e.fpSaveOffset = (frame + 7u) & ~7u;
+        frame = e.fpSaveOffset + 8u * e.fpLocals;
+    }
     e.frameBytes = (frame + 15u) & ~15u;
     if (e.frameBytes > 4095u) {
         if (getenv("JAI_JIT_WHY")) {
@@ -6734,6 +6957,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* Prologue. */
     emitFrameEnter(&e);
     emitSaveRestore(&e, true);
+    emitFpSaveRestore(&e, true);
     /* The real arguments land in the local registers in order; the closure,
      * when there is one, is the last incoming register but lives just past the
      * locals, where closureReg expects it. Placing it by argument index
@@ -6741,7 +6965,16 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * dereferenced whatever was there. */
     unsigned realArgs = e.usesUpvalues ? argCount - 1u : argCount;
     for (unsigned i = 0; i < realArgs; i++) {
-        if (e.spilled) {
+        unsigned slot = e.base + i;
+        if (!e.spilled) {
+            emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
+        } else if (e.slotXReg[slot] != 0) {
+            /* Arguments arrive in x0..x3 and homes start at x19, so no
+             * destination here can be a later argument's source. */
+            emit(&e, jaiA64MovX(e.slotXReg[slot], i));
+        } else if (e.slotFpReg[slot] != 0) {
+            emit(&e, jaiA64FmovDX(e.slotFpReg[slot], i));
+        } else {
             /* A spilled local is a whole Value: tag first, payload eight bytes
              * on. Writing the payload at the tag's offset instead leaves the
              * payload word untouched, so the first read of an argument gets
@@ -6751,13 +6984,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             /* From the measuring pass: `e`'s own kinds are seeded after this
              * point, so reading them here would take whatever the struct was
              * zeroed to. */
-            emit(&e, jaiA64MovzX(JIT_SCRATCH_D,
-                                 localTagFor(&body, e.base + i), 0));
-            emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31,
-                                localFrameOff(&e, e.base + i)));
-            emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, e.base + i) + 8));
-        } else {
-            emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
+            if (localTagInFrame(&e, slot)) {
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_D,
+                                     localTagFor(&body, slot), 0));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(&e, slot)));
+            }
+            emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, slot) + 8));
         }
     }
     if (e.usesUpvalues) {
@@ -6768,15 +7000,21 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * belt and braces -- but a register holding the last call's value would be
      * a bug that only shows up under recursion. */
     for (unsigned i = realArgs; i < e.locals; i++) {
-        if (e.spilled) {
-            emit(&e, jaiA64MovzX(JIT_SCRATCH_C, 0, 0));
-            emit(&e, jaiA64MovzX(JIT_SCRATCH_D, VAL_NULL, 0));
-            emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31,
-                                localFrameOff(&e, e.base + i)));
-            emit(&e, jaiA64StrX(JIT_SCRATCH_C, 31,
-                                localFrameOff(&e, e.base + i) + 8));
-        } else {
+        unsigned slot = e.base + i;
+        if (!e.spilled) {
             emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
+        } else if (e.slotXReg[slot] != 0) {
+            emit(&e, jaiA64MovzX(e.slotXReg[slot], 0, 0));
+        } else if (e.slotFpReg[slot] != 0) {
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_C, 0, 0));
+            emit(&e, jaiA64FmovDX(e.slotFpReg[slot], JIT_SCRATCH_C));
+        } else {
+            emit(&e, jaiA64MovzX(JIT_SCRATCH_C, 0, 0));
+            if (localTagInFrame(&e, slot)) {
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_D, VAL_NULL, 0));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(&e, slot)));
+            }
+            emit(&e, jaiA64StrX(JIT_SCRATCH_C, 31, localFrameOff(&e, slot) + 8));
         }
     }
     /* Stack guard: bail rather than run off the end of the thread's stack,
@@ -6853,29 +7091,56 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                                : VAL_OBJ;
             unsigned at = (unsigned)offsetof(JitDeoptRecord, locals) +
                           i * (unsigned)sizeof(Value);
-            if (kind == SLOT_MAYBE_INST && !e.spilled) {
-                unsigned pr = JIT_FIRST_SAVED + i;
-                emitTagFor(&e, kind, pr, JIT_SCRATCH_B, JIT_SCRATCH_C);
-                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
-                emit(&e, jaiA64StrX(pr, JIT_SCRATCH_A, at + 8));
-                continue;
-            }
-            emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
-            emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+
+            /* Nothing to read: the payload is a defined zero either way. */
             if (tag == VAL_NULL) {
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
-            } else if (e.spilled) {
-                /* Tag included: for a dynamic local the compile-time kind is
-                 * not what it holds. */
+                continue;
+            }
+
+            /* The record must describe every local correctly whichever of the
+             * three homes it came from, which is the one place a mistake in
+             * the register plan becomes a wrong answer rather than a crash.
+             * A dynamic slot is the only one whose tag is not a compile-time
+             * fact, and it is also the only one the plan never gives a
+             * register, so it is the only case that copies a tag through. */
+            if (e.spilled && e.slotXReg[slot] == 0 && e.slotFpReg[slot] == 0 &&
+                localTagInFrame(&e, slot)) {
                 emit(&e, jaiA64LdrW(JIT_SCRATCH_C, 31, localFrameOff(&e, slot)));
                 emit(&e, jaiA64StrW(JIT_SCRATCH_C, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64LdrX(JIT_SCRATCH_C, 31,
                                     localFrameOff(&e, slot) + 8));
                 emit(&e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, at + 8));
-            } else {
-                emit(&e, jaiA64StrX(JIT_FIRST_SAVED + i, JIT_SCRATCH_A, at + 8));
+                continue;
             }
+
+            unsigned pr;
+            if (!e.spilled) {
+                pr = JIT_FIRST_SAVED + i;
+            } else if (e.slotXReg[slot] != 0) {
+                pr = e.slotXReg[slot];
+            } else if (e.slotFpReg[slot] != 0) {
+                emit(&e, jaiA64FmovXD(JIT_SCRATCH_C, e.slotFpReg[slot]));
+                pr = JIT_SCRATCH_C;
+            } else {
+                emit(&e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                                    localFrameOff(&e, slot) + 8));
+                pr = JIT_SCRATCH_C;
+            }
+            if (kind == SLOT_MAYBE_INST) {
+                /* Not JIT_SCRATCH_C when C is holding the payload, which it is
+                 * whenever the slot came from the frame or an FP home. */
+                unsigned spare = pr == JIT_SCRATCH_C ? JIT_SCRATCH_D
+                                                     : JIT_SCRATCH_C;
+                emitTagFor(&e, kind, pr, JIT_SCRATCH_B, spare);
+            } else {
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+            }
+            emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+            emit(&e, jaiA64StrX(pr, JIT_SCRATCH_A, at + 8));
         }
 
         unsigned valueSeen = 0;
@@ -7209,10 +7474,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr,
                 "[jit] compiled %s  arity=%u locals=%u insts=%u saved=%u "
-                "spill=%d fix=%u deopt=%u maxval=%u base=%u\n",
+                "spill=%d xloc=%u fploc=%u fix=%u deopt=%u maxval=%u base=%u\n",
                 fn->name ? fn->name->chars : "<anon>", e.arity, e.locals,
-                e.count, e.savedCount, (int)e.spilled, e.fixupCount,
-                e.deoptCount, body.maxValue, e.base);
+                e.count, e.savedCount, (int)e.spilled, e.xLocals, e.fpLocals,
+                e.fixupCount, e.deoptCount, body.maxValue, e.base);
     }
     fn->jitFunc = entry;
     return true;
@@ -7359,6 +7624,13 @@ static unsigned loopDepthTable(const Chunk *c) {
         off += len;
     }
     return (unsigned)n;
+}
+
+/* The table, filled and handed back, so the function tier can ask for it
+ * without gLoopDepth being visible where it is declared. */
+static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
+    *count = loopDepthTable(c);
+    return gLoopDepth;
 }
 
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
