@@ -68,6 +68,30 @@ bool jaiSeqEqualsChecked(Value a, Value b, bool *equal);
 /* Dict keys and set elements must hash, and must not be `null`. */
 bool jaiSeqHashableKey(Value key, const char *fnName, const char *role);
 
+/* The answer for every key that cannot fail: a string, an int, a float, a
+ * bool, a class, a function. Only the mutable containers and the composites
+ * that may hold one need the real check, and only an instance can run user
+ * code to answer it.
+ *
+ * Inline here because it decides the question on every `d[k]` and `d.get(k)`,
+ * and jaiSeqHashableKey is a four-argument cross-translation-unit call that
+ * LTO did not fold: it was 2.5% of dict_ops purely as call overhead. */
+JAI_INLINE bool jaiSeqKeyCannotFail(Value key) {
+    if (!IS_OBJ(key)) return !IS_NULL(key);
+    switch (OBJ_TYPE(key)) {
+        case OBJ_LIST: case OBJ_DICT: case OBJ_SET:
+        case OBJ_TUPLE: case OBJ_ENUM_VAL: case OBJ_INSTANCE:
+            return false;
+        default:
+            return true;
+    }
+}
+
+/* jaiSeqHashableKey with the common answer settled without a call. */
+#define JAI_SEQ_KEY_OK(key, fnName, role)                                      \
+    (JAI_LIKELY(jaiSeqKeyCannotFail(key)) ||                                   \
+     jaiSeqHashableKey((key), (fnName), (role)))
+
 /* Drain any iterable into a fresh list. NULL with the exception pending on
  * failure. The result is unrooted: root it before allocating again. */
 ObjList *jaiSeqCollectIterable(Value v);

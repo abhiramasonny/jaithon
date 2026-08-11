@@ -3023,6 +3023,68 @@ uint64_t jaiPropRecv[32];
         constants = frame->closure->fn->chunk.constants.data;                  \
     } while (0)
 
+/* One step of the three iterator kinds that can neither allocate, call, nor
+ * throw: a range computes an int, and a list or a tuple reads a slot it has
+ * already bounds-checked. Those three are what `for i in 0..n` and
+ * `for x in xs` are in every interpreted loop in the language.
+ *
+ * Worth taking apart from jaiIterNext because of what the general path costs
+ * around it rather than in it: SAVE_STATE, a cross-translation-unit call, and
+ * LOAD_STATE's six reloads, one of them a three-deep chase through
+ * frame->closure->fn->chunk to the constant pool. None of that buys anything
+ * when the step cannot move the frame array or the value stack. A list whose
+ * version moved, and every other kind, still goes the long way -- that is what
+ * ITER_STEP_SLOW is for, and the fast path has written nothing by then. */
+typedef enum { ITER_STEP_DONE, ITER_STEP_VALUE, ITER_STEP_SLOW } IterStep;
+
+JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
+    const int64_t index = it->index;
+
+    switch (it->kind) {
+        case ITER_RANGE: {
+            if (index >= it->limit) return ITER_STEP_DONE;
+
+            ObjRange *const range = AS_RANGE(it->source);
+            uint64_t value;
+
+            if (range->step == 1) {
+                value = (uint64_t)range->start + (uint64_t)index;
+            } else if (range->step == -1) {
+                value = (uint64_t)range->start - (uint64_t)index;
+            } else {
+                value = (uint64_t)range->start +
+                        (uint64_t)index * (uint64_t)range->step;
+            }
+
+            *out = INT_VAL((int64_t)value);
+            it->index = index + 1;
+            return ITER_STEP_VALUE;
+        }
+
+        case ITER_LIST: {
+            ObjList *const list = AS_LIST(it->source);
+            /* A mutated list is an error jaiIterNext raises; leave it there. */
+            if (JAI_UNLIKELY(list->version != it->version))
+                return ITER_STEP_SLOW;
+            if (index >= it->limit) return ITER_STEP_DONE;
+
+            *out = list->items[index];
+            it->index = index + 1;
+            return ITER_STEP_VALUE;
+        }
+
+        case ITER_TUPLE:
+            if (index >= it->limit) return ITER_STEP_DONE;
+
+            *out = AS_TUPLE(it->source)->items[index];
+            it->index = index + 1;
+            return ITER_STEP_VALUE;
+
+        default:
+            return ITER_STEP_SLOW;
+    }
+}
+
 #define READ_BYTE()  (*ip++)
 #define READ_I8()    ((int8_t)*ip++)
 #define READ_U16()   (ip += 2, jaiReadU16(ip - 2))
@@ -4026,8 +4088,18 @@ static JaiRunResult runLoop(int baseFrameCount) {
             THROW(vm.cTypeError, "for-loop expected an iterator, not '%s'",
                   jaiTypeNameStatic(iterator));
         }
-        SAVE_STATE();
         Value item;
+        IterStep step = iterStepFast(AS_ITER(iterator), &item);
+        if (JAI_LIKELY(step == ITER_STEP_VALUE)) {
+            slots[slot] = item;
+            VM_NEXT();
+        }
+        if (step == ITER_STEP_DONE) {
+            DROP(1);
+            ip += offset;
+            VM_NEXT();
+        }
+        SAVE_STATE();
         bool advanced = jaiIterNext(AS_ITER(iterator), &item);
         if (!advanced && vm.hasException) goto vmThrow;
         LOAD_STATE();
@@ -4141,8 +4213,18 @@ static JaiRunResult runLoop(int baseFrameCount) {
             THROW(vm.cTypeError, "for-loop expected an iterator, not '%s'",
                   jaiTypeNameStatic(iterator));
         }
-        SAVE_STATE();
         Value item;
+        IterStep step = iterStepFast(AS_ITER(iterator), &item);
+        if (JAI_LIKELY(step == ITER_STEP_VALUE)) {
+            PUSH(item);
+            VM_NEXT();
+        }
+        if (step == ITER_STEP_DONE) {
+            DROP(1);
+            ip += offset;
+            VM_NEXT();
+        }
+        SAVE_STATE();
         bool advanced = jaiIterNext(AS_ITER(iterator), &item);
         if (!advanced && vm.hasException) goto vmThrow;
         LOAD_STATE();

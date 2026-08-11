@@ -653,11 +653,18 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
     if (total == 0) return jaiStringIntern("", 0);
 
     if (total <= JAI_INTERN_MAX) {
+        /* Byte at a time rather than memcpy per run. The runs an f-string
+         * produces are one to five bytes each -- `f"k{i}"` is a one-byte
+         * literal and four digits -- and at that length the call into
+         * _platform_memmove costs several times the copy. Two of them per
+         * f-string were 6.6% of tests/bench/dict_ops by sample count. */
         char buf[JAI_INTERN_MAX];
         size_t o = 0;
+
         for (int i = 0; i < count; i++) {
-            memcpy(buf + o, runs[i], lens[i]);
-            o += lens[i];
+            const char *const src = runs[i];
+            for (uint32_t j = 0, n = lens[i]; j < n; ++j)
+                buf[o++] = src[j];
         }
         return jaiStringNew(buf, total);
     }
