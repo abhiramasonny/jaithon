@@ -112,14 +112,36 @@ static uintptr_t stackLimit(void) {
 
 /* Built on the compiled frame and handed to the helper below. Values first, so
  * every field is 8-aligned and the emitted stores can use the scaled forms. */
-typedef struct {
+typedef struct JitCallDesc {
+    /* `link` and `nroots` come first so that `roots` sits at a fixed offset
+     * from the head of a chain the collector can walk. A descriptor whose
+     * `link` is non-NULL is on that chain. */
+    struct JitCallDesc *link;
+    int64_t nroots;
+    Value   roots[JIT_MAX_SAVED];
     Value   callee;
     Value   args[JIT_MAX_ARGS_OUT];
-    Value   roots[JIT_MAX_SAVED];
     Value   result;
     int64_t argc;
-    int64_t nroots;
 } JitCallDesc;
+
+/* Compiled frames whose roots the collector must see.
+ *
+ * A call through the descriptor hands its roots to a C helper, which pushes
+ * them. A *self*-call does not: it is a bare `bl` to the prologue, so whatever
+ * the caller holds in callee-saved registers is invisible to a collection that
+ * runs inside the callee. Today the tier refuses that shape -- a body that
+ * allocates and then self-calls declines with "a bail follows a heap write" --
+ * but any operation that allocates without setting that flag would reach it,
+ * `OP_GET_SLICE` in a recursive `sort` being the first. The emitted code links
+ * its descriptor on here before the `bl` and unlinks after. */
+static JitCallDesc *gJitFrames;
+
+void jaiJitMarkFrames(void) {
+    for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
+        for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
+    }
+}
 
 /* The one thing compiled code cannot do for itself.
  *
@@ -1115,6 +1137,59 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
  * then cannot find, and the run dies on "internal error: failed operation
  * raised nothing". The hand-written EQ/GT tests at the call site were dead code
  * until now, because control never reached them with a nonzero status. */
+/* Write every object this body is holding into the descriptor's root array.
+ *
+ * Shared by the descriptor path, where a C helper pushes them, and by the
+ * self-call path, where the emitted code links the descriptor onto the
+ * collector's frame chain instead -- a `bl` to the prologue pushes nothing. */
+static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
+    unsigned nroots = 0;
+    for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
+        if (e->localKind[slot] != SLOT_INST &&
+            e->localKind[slot] != SLOT_LIST &&
+            e->localKind[slot] != SLOT_OBJ &&
+            e->localKind[slot] != SLOT_ITER &&
+            e->localKind[slot] != SLOT_MAYBE_INST) {
+            continue;
+        }
+        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
+        unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
+                      nroots * (unsigned)sizeof(Value);
+        unsigned rslot = localIn(e, slot, JIT_SCRATCH_C);
+        emitTagFor(e, e->localKind[slot], rslot, JIT_SCRATCH_B, JIT_SCRATCH_A);
+        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+        emit(e, jaiA64StrX(rslot, 31, at + 8));
+        nroots++;
+    }
+
+    /* And what the operand stack is holding. Locals alone were enough only
+     * while nothing object-shaped stayed on the stack across a call -- but an
+     * iterator does exactly that: OP_GET_ITER pushes an ObjIter that lives in
+     * a register for the whole loop, and the call this descriptor belongs to
+     * may be the one that collects it. Visible only under --gc-stress, and
+     * only once a body with a loop like that could compile at all. */
+    for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
+        SlotKind k = e->stack[idx];
+        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            continue;
+        }
+        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
+        unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
+                      nroots * (unsigned)sizeof(Value);
+        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
+                       (e->usesUpvalues ? 1u : 0u) +
+                       (idx - (e->depth - e->valueDepth));
+        emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
+        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+        emit(e, jaiA64StrX(reg, 31, at + 8));
+        nroots++;
+    }
+
+    *nrootsOut = nroots;
+    return true;
+}
+
 static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
                                  unsigned nargs, void *helper, bool ownStatus,
                                  int calleeReg) {
@@ -1166,50 +1241,8 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         emit(e, jaiA64StrX(reg, 31, at + 8));
     }
 
-    /* Everything this body is holding that the collector must see. */
     unsigned nroots = 0;
-    for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
-        if (e->localKind[slot] != SLOT_INST &&
-            e->localKind[slot] != SLOT_LIST &&
-            e->localKind[slot] != SLOT_OBJ &&
-            e->localKind[slot] != SLOT_ITER &&
-            e->localKind[slot] != SLOT_MAYBE_INST) {
-            continue;
-        }
-        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
-        unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
-                      nroots * (unsigned)sizeof(Value);
-        unsigned rslot = localIn(e, slot, JIT_SCRATCH_C);
-        emitTagFor(e, e->localKind[slot], rslot, JIT_SCRATCH_B, JIT_SCRATCH_A);
-        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
-        emit(e, jaiA64StrX(rslot, 31, at + 8));
-        nroots++;
-    }
-
-    /* And what the operand stack is holding. Locals alone were enough only
-     * while nothing object-shaped stayed on the stack across a call -- but an
-     * iterator does exactly that: OP_GET_ITER pushes an ObjIter that lives in
-     * a register for the whole loop, and the call this descriptor belongs to
-     * may be the one that collects it. Visible only under --gc-stress, and
-     * only once a body with a loop like that could compile at all. */
-    for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
-        SlotKind k = e->stack[idx];
-        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
-            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
-            continue;
-        }
-        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
-        unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
-                      nroots * (unsigned)sizeof(Value);
-        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
-                       (e->usesUpvalues ? 1u : 0u) +
-                       (idx - (e->depth - e->valueDepth));
-        emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
-        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
-        emit(e, jaiA64StrX(reg, 31, at + 8));
-        nroots++;
-    }
-
+    if (!emitRootFill(e, d, &nroots)) return false;
     emit(e, jaiA64MovzX(JIT_SCRATCH_A, nargs, 0));
     emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
                        d + (unsigned)offsetof(JitCallDesc, argc)));

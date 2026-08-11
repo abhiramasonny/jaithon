@@ -71,6 +71,9 @@ typedef enum {
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
 
+/* Mark the roots of every compiled frame that has linked itself. */
+void jaiJitMarkFrames(void);
+
 /* Compile and enter the loop at `top` with the interpreter's own slots. On
  * success `*resumeAt` is the bytecode offset the interpreter should continue
  * from, and any operand-stack values the loop was holding have been pushed. */
