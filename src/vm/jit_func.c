@@ -1190,8 +1190,19 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
      * a register for the whole loop, and the call this descriptor belongs to
      * may be the one that collects it. Visible only under --gc-stress, and
      * only once a body with a loop like that could compile at all. */
-    for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
+    /* Count the register-holding entries from the bottom rather than assuming
+     * they are the top `valueDepth` of them. A class, a resolved function, a
+     * builtin and `self` occupy no register and can sit anywhere -- a callee
+     * pushed before its arguments puts one squarely in the middle -- so
+     * subtracting valueDepth named the wrong register for everything above it.
+     * The deopt stub already counts this way; now both do. */
+    unsigned seen = 0;
+    for (unsigned idx = 0; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
+        if (!holdsRegister(k)) continue;
+        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
+                       (e->usesUpvalues ? 1u : 0u) + seen;
+        seen++;
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             continue;
@@ -1199,9 +1210,6 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
                       nroots * (unsigned)sizeof(Value);
-        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
-                       (e->usesUpvalues ? 1u : 0u) +
-                       (idx - (e->depth - e->valueDepth));
         emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(reg, 31, at + 8));
