@@ -307,6 +307,13 @@ struct ObjFunction {
     uint32_t    jitReturnShape;   /* class shape when the kind is an instance */
     uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */
     uint8_t     jitArgCount;
+    /* The compiled whole-function form never stores to the heap, so running it
+     * again from the top is indistinguishable from not having run it. A caller
+     * that branched straight to its entry needs this: it cannot hand the
+     * interpreter a half-finished callee frame, so a nonzero verdict has to be
+     * answered by re-executing the whole call, and that is only sound when the
+     * abandoned attempt left nothing behind. */
+    bool        jitFuncNoWrite;
     /* On-stack replacement: a compiled loop entered from the interpreter, with
      * the interpreter's own slots as its locals. This is what reaches a loop
      * in a function that runs once -- `main`, mostly. */
