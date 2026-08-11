@@ -78,6 +78,14 @@ uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x8b000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+/* add Xd, Xn, Xm, lsl #shift -- the shifted-register form. A Value is sixteen
+ * bytes, so every element address is base + index*16, and folding the shift
+ * into the add is one instruction instead of two on a path that runs eight
+ * times per cell in `life`. */
+uint32_t jaiA64AddXLsl(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
+    return 0x8b000000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64Ret(void) {
     return 0xd65f03c0u;
 }
