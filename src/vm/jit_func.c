@@ -487,6 +487,9 @@ typedef struct {
      * access. The entry already checks every slot's kind before calling, so
      * the prologue only has to load payloads; every exit writes them back. */
     bool      osrRegLocals;
+    /* Where a range loop parks the ObjIter, since it holds no register for it.
+     * Written once in the prologue and read once in each exit stub. */
+    unsigned  iterFrameOffset;
     /* Inlining a method widens the live range of everything it reads, so a
      * loop that fitted the registers as a call may not fit as an expression.
      * The compile is retried with this set when that is what went wrong. */
@@ -581,14 +584,26 @@ static void emit(Emit *e, uint32_t word) {
 /* x19 carries the slots pointer in OSR mode, so the operand stack starts one
  * register later. */
 #define JIT_SLOTS_REG (JIT_FIRST_SAVED)
-#define JIT_ITER_REG  (JIT_FIRST_SAVED + 1u)   /* the ObjIter itself */
-#define JIT_IDX_REG   (JIT_FIRST_SAVED + 2u)
-#define JIT_LIM_REG   (JIT_FIRST_SAVED + 3u)
-#define JIT_START_REG (JIT_FIRST_SAVED + 4u)   /* the range's first value */
+#define JIT_IDX_REG   (JIT_FIRST_SAVED + 1u)
+#define JIT_LIM_REG   (JIT_FIRST_SAVED + 2u)
+#define JIT_START_REG (JIT_FIRST_SAVED + 3u)   /* the range's first value */
+#define JIT_ITER_REG  (JIT_FIRST_SAVED + 4u)   /* the ObjIter itself */
 
 /* Registers OSR keeps for itself: the slots pointer, and for a range loop the
- * iterator, its index and its limit. */
-static unsigned osrReserved(const Emit *e) { return e->hasIter ? 5u : 1u; }
+ * iterator, its index and its limit.
+ *
+ * A range loop does not keep the ObjIter in a register. Everything the head
+ * needs is read out of it once in the prologue -- index, limit, and the
+ * range's start -- and the only later use is writing the index back on the way
+ * out, which happens once per exit stub and never in the loop. So it lives in
+ * the frame instead, and the operand stack gets a sixth register. That is
+ * exactly the amount that was missing: every "more live values" decline in the
+ * benchmark suite wanted six and had five. JIT_ITER_REG is therefore the last
+ * of the reserved block, so dropping it leaves the rest contiguous. */
+static unsigned osrReserved(const Emit *e) {
+    if (!e->hasIter) return 1u;
+    return e->iterKind == 1 ? 4u : 5u;
+}
 
 static unsigned regBase(const Emit *e) {
     if (e->osr) {
@@ -5172,6 +5187,10 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     unsigned frame = 16u + 8u * JIT_MAX_SAVED + (unsigned)sizeof(JitCallDesc);
     e.descOffset = 16u + 8u * JIT_MAX_SAVED;
+    /* The ObjIter, for the heads that do not keep it in a register. Sixteen
+     * bytes so the frame stays 16-aligned without a second rounding. */
+    e.iterFrameOffset = (frame + 7u) & ~7u;   /* str/ldr scale the offset by 8 */
+    frame = e.iterFrameOffset + 16u;
     e.frameBytes = (frame + 15u) & ~15u;
 
     emitFrameEnter(&e);
@@ -5185,15 +5204,23 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
     if (hasIter) {
-        emit(&e, jaiA64MovX(JIT_ITER_REG, 1));
-        emit(&e, jaiA64LdrX(JIT_IDX_REG, JIT_ITER_REG,
+        /* x1 is the iterator on entry. A range head reads everything it wants
+         * out of it here and parks the pointer in the frame; a list head keeps
+         * it, because its version guard reads the iterator every iteration. */
+        unsigned rIter = iterKind == 1 ? 1u : JIT_ITER_REG;
+        if (iterKind == 1) {
+            emit(&e, jaiA64StrX(1, 31, e.iterFrameOffset));
+        } else {
+            emit(&e, jaiA64MovX(JIT_ITER_REG, 1));
+        }
+        emit(&e, jaiA64LdrX(JIT_IDX_REG, rIter,
                             (unsigned)offsetof(ObjIter, index)));
-        emit(&e, jaiA64LdrX(JIT_LIM_REG, JIT_ITER_REG,
+        emit(&e, jaiA64LdrX(JIT_LIM_REG, rIter,
                             (unsigned)offsetof(ObjIter, limit)));
         /* A range yields start + index, so a loop that does not begin at zero
          * needs its start too. ObjIter.source is a Value, so the object
          * pointer sits eight bytes into it. */
-        emit(&e, jaiA64LdrX(JIT_START_REG, JIT_ITER_REG,
+        emit(&e, jaiA64LdrX(JIT_START_REG, rIter,
                             (unsigned)offsetof(ObjIter, source) + 8));
         if (iterKind == 1) {
             emit(&e, jaiA64LdrX(JIT_START_REG, JIT_START_REG,
@@ -5220,7 +5247,16 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 #define OSR_SYNC_ITER()                                                        \
     do {                                                                       \
         if (hasIter) {                                                         \
-            emit(&e, jaiA64StrX(JIT_IDX_REG, JIT_ITER_REG,                     \
+            /* A range head left the iterator in the frame rather than in a    \
+             * register, so it comes back here. Every stub this expands into   \
+             * is a way out of the loop, so the load is off the hot path and   \
+             * JIT_SCRATCH_A is dead at the top of all of them. */             \
+            unsigned rIt = JIT_ITER_REG;                                       \
+            if (iterKind == 1) {                                               \
+                rIt = JIT_SCRATCH_A;                                           \
+                emit(&e, jaiA64LdrX(rIt, 31, e.iterFrameOffset));              \
+            }                                                                  \
+            emit(&e, jaiA64StrX(JIT_IDX_REG, rIt,                              \
                                 (unsigned)offsetof(ObjIter, index)));          \
         }                                                                      \
         if (e.osrRegLocals) {                                                  \
