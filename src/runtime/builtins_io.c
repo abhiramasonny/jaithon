@@ -1616,6 +1616,10 @@ static bool nReflectEval(int argc, Value *args, Value *out) {
     Value value = NULL_VAL;
     if (module != NULL) {
         (void)jaiModuleGet(module, slot, &value);
+        /* Deleting a name can take a class or a callable away, so compiled
+         * forms have to be retired. The table's own keyVersion covers the
+         * cached slot addresses and OP_FORMAT's negative cache; removeEntry
+         * bumps it, so there is nothing to do for those here. */
         if (jaiTableDelete(&module->globals, OBJ_VAL(slot))) module->version++;
     }
     *out = value;

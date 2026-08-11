@@ -3399,12 +3399,28 @@ static JaiRunResult runLoop(int baseFrameCount) {
         ObjModule *module = frame->module;
         InlineCache *ic = cacheAt(frameChunk(frame), cacheIdx);
 
-        if (ic != NULL && ic->state == IC_MONO && module != NULL &&
-            ic->shapeId[0] == module->version) {
+        /* Validated by IDENTITY, not by a version.
+         *
+         * Global names are interned -- the globals table itself probes by
+         * pointer (findEntryInterned) -- so the entry that holds this very
+         * ObjString IS this name's binding, whatever has happened to the table
+         * since the index was cached. That covers every way the index can go
+         * stale at once, with no counter to keep in step:
+         *   - a rehash moved things: the slot holds a different key, or none;
+         *   - the name was deleted: the key is JAI_TOMBSTONE, VAL_OBJ carrying
+         *     a NULL Obj*, which the old `!IS_NULL(entry->key)` test let
+         *     through and then returned NULL_VAL instead of raising NameError;
+         *   - the chunk is running against a module other than the one it was
+         *     cached against (pushFrame falls back to the caller's module for
+         *     a function that has none of its own).
+         * And, the point of it: assigning to a global that already exists
+         * changes JaiEntry::value and nothing else, so it can no longer miss. */
+        Value nameVal = constants[nameIdx];
+        if (ic != NULL && ic->state == IC_MONO && module != NULL) {
             int index = (int)ic->payload[0];
             if (index >= 0 && index < module->globals.capacity) {
                 JaiEntry *entry = &module->globals.entries[index];
-                if (!IS_NULL(entry->key)) {
+                if (IS_OBJ(entry->key) && AS_OBJ(entry->key) == AS_OBJ(nameVal)) {
                     vm.icHits++;
                     PUSH(entry->value);
                     VM_NEXT();
@@ -3412,7 +3428,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
             }
         }
 
-        ObjString *name = AS_STRING(constants[nameIdx]);
+        ObjString *name = AS_STRING(nameVal);
         if (module != NULL) {
             int index = jaiTableFindIndex(&module->globals, OBJ_VAL(name));
             if (index >= 0) {
@@ -3420,7 +3436,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 if (ic != NULL) {
                     ic->state = IC_MONO;
                     ic->count = 1;
-                    ic->shapeId[0] = module->version;
+                    ic->shapeId[0] = 0;   /* unused: the key check validates */
                     ic->payload[0] = (uint32_t)index;
                     ic->cached[0] = NULL_VAL;
                 }
@@ -4035,7 +4051,10 @@ static JaiRunResult runLoop(int baseFrameCount) {
      * parts and allocates once.
      *
      * The cache answers one question — is `str` still the builtin? — and is
-     * keyed on the module version, which every global definition bumps. */
+     * keyed on the globals table's KEY version, which moves when a name is
+     * added or removed and not when one is merely assigned to. That is exactly
+     * the fact being memoised, so a module-scope loop that writes globals no
+     * longer throws this cache away on every iteration. */
     VM_CASE(OP_FORMAT): {
         uint8_t  count    = READ_BYTE();
         uint32_t litmask  = READ_U24();
@@ -4046,7 +4065,9 @@ static JaiRunResult runLoop(int baseFrameCount) {
         InlineCache *ic = cacheAt(frameChunk(frame), cacheIdx);
         bool builtin;
         if (JAI_LIKELY(ic != NULL && ic->state == IC_MONO && module != NULL &&
-                       ic->shapeId[0] == module->version)) {
+                       ic->shapeId[0] == module->globals.keyVersion &&
+                       ic->payload[1] ==
+                           (uint32_t)((uintptr_t)module >> 4))) {
             builtin = ic->payload[0] != 0;
         } else {
             ObjString *name = AS_STRING(constants[nameIdx]);
@@ -4056,7 +4077,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
             if (ic != NULL && module != NULL) {
                 ic->state = IC_MONO;
                 ic->count = 1;
-                ic->shapeId[0] = module->version;
+                ic->shapeId[0] = module->globals.keyVersion;
+                /* A chunk whose function has no module of its own runs against
+                 * the caller's (pushFrame), so one cache slot can be reached
+                 * with two ObjModule*. keyVersion is small and dense, so pin
+                 * the module too -- no deref, so no rooting question. */
+                ic->payload[1] = (uint32_t)((uintptr_t)module >> 4);
                 ic->payload[0] = builtin ? 1u : 0u;
                 ic->cached[0] = NULL_VAL;
             }

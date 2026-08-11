@@ -128,7 +128,7 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
 
     if (fn->jitCode == NULL) {
         if (jaiJitCompileFunc(closure, slotBase)) {
-            fn->jitModuleVersion = fn->module->version;
+            fn->jitFuncModuleVersion = fn->module->version;
             return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
         }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {

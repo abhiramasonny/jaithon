@@ -162,6 +162,7 @@ static void adjustCapacity(JaiTable *t, int capacity) {
     t->count = count;
     t->tombstones = 0;
     ++t->version;
+    ++t->keyVersion;   /* every live entry just changed address */
 
     JAI_FREE_ARRAY(JaiEntry, oldEntries, oldCapacity);
     JAI_FREE_ARRAY(int32_t, oldOrder, oldCapacity);
@@ -341,6 +342,10 @@ static inline bool insertAt(JaiTable *t, JaiEntry *e, Value key,
         e->hash = hash;
         e->order = orderIndex;
         t->order[orderIndex] = (int32_t)(e - t->entries);
+        /* A new key. Nothing moved unless ensureRoom already rehashed, but the
+         * key SET changed, and OP_FORMAT's negative cache is a fact about the
+         * key set. See the comment on JaiTable::keyVersion. */
+        ++t->keyVersion;
     }
 
     e->value = value;
@@ -361,6 +366,7 @@ static inline void removeEntry(JaiTable *t, JaiEntry *e) {
     --t->count;
     ++t->tombstones;
     ++t->version;
+    ++t->keyVersion;   /* this address no longer holds this key */
 }
 
 /* Insert with an already-computed hash, comparing keys by value. Used by
@@ -402,6 +408,7 @@ void jaiTableInit(JaiTable *t) {
     t->tombstones = 0;
     t->capacity = 0;
     t->version = 0;
+    t->keyVersion = 0;
 }
 
 void jaiTableFree(JaiTable *t) {
@@ -462,6 +469,7 @@ void jaiTableClear(JaiTable *t) {
     t->count = 0;
     t->tombstones = 0;
     t->version++;
+    t->keyVersion++;
 }
 
 void jaiTableAddAll(const JaiTable *from, JaiTable *to) {
@@ -500,7 +508,17 @@ bool jaiTableGetInterned(JaiTable *t, ObjString *key, Value *out) {
     return true;
 }
 
-bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
+/* insertAt, reporting what the slot held first. `e->order < 0` is exactly the
+ * test insertAt uses for "not a live entry", so an empty slot and a tombstone
+ * both read back as absent. */
+static inline bool insertAtPrev(JaiTable *t, JaiEntry *e, Value key,
+                                uint64_t hash, Value value, Value *outPrev) {
+    if (outPrev != NULL) *outPrev = e->order < 0 ? NULL_VAL : e->value;
+    return insertAt(t, e, key, hash, value);
+}
+
+bool jaiTableSetInternedPrev(JaiTable *t, ObjString *key, Value value,
+                             Value *outPrev) {
     JAI_ASSERT(key != NULL, "interned key must not be NULL");
 
     const Value k = OBJ_VAL(key);
@@ -509,22 +527,31 @@ bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
 
     if (t->count + t->tombstones + 1 <=
         capacity - capacity / TABLE_LOAD_DEN) {
-        return insertAt(t,
-                        findEntryInterned(t->entries, capacity, key),
-                        k, hash, value);
+        return insertAtPrev(t,
+                            findEntryInterned(t->entries, capacity, key),
+                            k, hash, value, outPrev);
     }
 
     if (t->count != 0) {
         JaiEntry *const existing =
             findExistingInterned(t->entries, capacity, key);
         if (existing != NULL)
-            return insertAt(t, existing, k, hash, value);
+            return insertAtPrev(t, existing, k, hash, value, outPrev);
     }
 
     ensureRoom(t, k, value);
-    return insertAt(t,
-                    findEntryInterned(t->entries, t->capacity, key),
-                    k, hash, value);
+    return insertAtPrev(t,
+                        findEntryInterned(t->entries, t->capacity, key),
+                        k, hash, value, outPrev);
+}
+
+bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
+    return jaiTableSetInternedPrev(t, key, value, NULL);
+}
+
+JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key) {
+    if (t->count == 0) return NULL;
+    return findExistingInterned(t->entries, t->capacity, key);
 }
 
 int jaiTableFindIndex(JaiTable *t, Value key) {

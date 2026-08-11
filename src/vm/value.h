@@ -142,6 +142,28 @@ struct Obj {
 #define IS_ITER(v)        IS_OBJ_TYPE(v, OBJ_ITER)
 #define IS_FILE(v)        IS_OBJ_TYPE(v, OBJ_FILE)
 
+/* True when compiled code provably cannot have baked this value out of a
+ * module global: it is data, not something callable or a class. Enumerating
+ * the inert types rather than the live ones is deliberate -- a type nobody
+ * thought about answers false, which only costs an invalidation.
+ *
+ * TWO CALLERS, and they must stay in step. jaiModuleSet is one. The other is
+ * machine code: jit_func.c's OP_SET_GLOBAL emits a runtime test that skips the
+ * ObjModule::version bump, and that test recognises a STRICT SUBSET of this
+ * list (OBJ_INSTANCE and OBJ_LIST). Adding a type here is always safe; taking
+ * OBJ_INSTANCE or OBJ_LIST away is not, and has to change the emitter too. */
+JAI_INLINE bool jaiValueIsInertGlobal(Value v) {
+    if (!IS_OBJ(v)) return true;            /* null, bool, int, float */
+    switch (AS_OBJ(v)->type) {
+    case OBJ_STRING: case OBJ_BYTES:  case OBJ_LIST:  case OBJ_DICT:
+    case OBJ_SET:    case OBJ_TUPLE:  case OBJ_RANGE: case OBJ_INSTANCE:
+    case OBJ_ITER:   case OBJ_FILE:   case OBJ_STRBUF:
+        return true;
+    default:
+        return false;
+    }
+}
+
 #define AS_STRING(v)      ((ObjString *)AS_OBJ(v))
 #define AS_CSTRING(v)     (((ObjString *)AS_OBJ(v))->chars)
 #define AS_LIST(v)        ((ObjList *)AS_OBJ(v))
