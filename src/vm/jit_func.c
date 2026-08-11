@@ -1216,6 +1216,26 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
  * to raise exactly what it would have raised. */
 static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
+/* `jaiNormalizeIndex` and the bounds test in one, leaving the settled index in
+ * `rOut`. `rCount` must hold a zero-extended 32-bit count, which is what an
+ * `ldrw` of ObjList.count or ObjString.length gives, so one *unsigned* compare
+ * answers both ends: a negative index is a huge unsigned and fails the same
+ * test an index past the end does.
+ *
+ * That is four instructions on the path every real loop takes, against the
+ * seven the signed form needed -- and indexing was 42 of the 62 instructions in
+ * matrix_mul's innermost body, three of these back to back. `xs[-1]` is still
+ * exact; it just walks the three instructions the branch skips. */
+static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
+                                unsigned rOut) {
+    emit(e, jaiA64MovX(rOut, rIdx));
+    emit(e, jaiA64SubsXReg(31, rOut, rCount));
+    emit(e, jaiA64BCond(JAI_A64_LO, 4));
+    emit(e, jaiA64AddX(rOut, rOut, rCount));
+    emit(e, jaiA64SubsXReg(31, rOut, rCount));
+    branchOnDeopt(e, JAI_A64_HS);
+}
+
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     fpSyncAll(e);
@@ -2389,29 +2409,26 @@ static bool fpFastOp(uint8_t op) {
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
+    /* Reading an element writes only the entry it pushes and the four
+     * scratch X registers; it touches no v register and calls nothing. Until
+     * it was on this list an FP-resident accumulator was materialised the
+     * moment a subscript appeared, which is every loop that sums over an
+     * array -- `sum += ai[k] * b[k][j]` being the whole of matrix_mul. */
+    case OP_GET_INDEX:
         return true;
     default:
         return false;
     }
 }
 
-/* Whether it is worth loading a float local into the FP bank at all.
+/* The instructions that actually read a float operand out of the FP bank.
  *
- * `sum += a[i][k] * b[k][j]` reads `sum` and then does a great deal that is
- * not float arithmetic, so the bank entry is materialised again immediately:
- * `ldr d; fmov x` where `ldr x` would have done, and the extra cross-domain
- * hop lands on the loop-carried chain. matrix_mul lost 25% to exactly that
- * before this test existed. One opcode of lookahead is enough, because the
- * only way a bank entry survives is for the very next instruction to be one
- * that knows about it. */
-static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
-                           int stop) {
-    if (e->fpOff) return false;
-    if (next >= stop) return false;
-    /* A *consumer*, not merely another opcode on the list: `sum` in
-     * matrix_mul is followed by OP_GET_LOCAL2, which is on the list and yet
-     * has the whole of `a[i][k]` between it and any float operator. */
-    switch (code[next]) {
+ * This used to be the whole of `fpWorthLoading`, tested against the very next
+ * opcode on the reasoning that a bank entry only survives if its consumer is
+ * adjacent. That was true when OP_GET_INDEX materialised everything; it is not
+ * true now, and `fpWorthLoading` below walks to the consumer instead. */
+static bool fpConsumer(uint8_t op) {
+    switch (op) {
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
     case OP_BIND: case OP_SET_LOCAL:
@@ -2524,6 +2541,35 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
         branchOnOverflow(e, 0u, JAI_A64_VS);
     }
     return true;
+}
+
+/* Is a float operand worth putting in the FP bank rather than an X register?
+ *
+ * A *consumer* has to be reachable, not merely another opcode on the list.
+ * The original rule looked only at the very next instruction, which said no
+ * for `sum` in matrix_mul: it is followed by OP_GET_LOCAL2 and then the whole
+ * of `ai[k] * b[k][j]` before any float operator. That cost the loop its
+ * accumulator -- `str d` out, `ldr x` plus `fmov d, x` back in, twice a
+ * cross-register-file move on the loop-carried chain, which measured as
+ * `sum += 1.0` running at 15 cycles an iteration against 2 for `sum += 1`.
+ *
+ * So walk forward instead, through the instructions that leave an FP-resident
+ * entry where it is (`fpFastOp`, which is the same set the main loop uses to
+ * decide whether to sync), and answer on the first thing that is neither. The
+ * walk is bounded: none of those opcodes is variable length, so
+ * `jaiOpOperandSize` is enough and no Chunk is needed. */
+static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
+                           int stop) {
+    if (e->fpOff) return false;
+    for (unsigned step = 0; step < 24u && next < stop; step++) {
+        uint8_t op = code[next];
+        if (fpConsumer(op)) return true;
+        if (!fpFastOp(op)) return false;
+        int size = jaiOpOperandSize((OpCode)op);
+        if (size < 0) return false;
+        next += 1 + size;
+    }
+    return false;
 }
 
 static bool compileBody(Emit *e, ObjClosure *closure) {
@@ -3910,9 +3956,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
                                    (unsigned)offsetof(ObjList, items)));
-                emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_SCRATCH_A, 4));
-                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                   JIT_SCRATCH_D));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_A, 4));
                 emit(e, jaiA64MovzX(JIT_SCRATCH_D, vtag, 0));
                 emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
                 emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
@@ -4332,9 +4377,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * removes the question entirely. */
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
                                    (unsigned)offsetof(ObjList, items)));
-                emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_IDX_REG, 4));
-                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                   JIT_SCRATCH_D));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                      JIT_IDX_REG, 4));
 
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, etag));
@@ -4361,7 +4405,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     branchOnDeopt(e, JAI_A64_NE);
                 }
 
-                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                /* One byte for a bool: see the note in OP_GET_INDEX. `strb` is
+                 * what BOOL_VAL compiles to, so the rest of the payload word is
+                 * stale, and a SLOT_BOOL register must hold 0 or 1. */
+                if (ek == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                } else {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                }
                 localOut(e, slot, JIT_SCRATCH_A);
                 emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
                 off += 5;
@@ -4413,12 +4464,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchOnDeopt(e, JAI_A64_NE);
 
                 /* jaiNormalizeIndex, then one unsigned compare for both ends. */
-                emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
-                emit(e, jaiA64BCond(JAI_A64_GE, 2));
-                emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A));
-                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
-                branchOnDeopt(e, JAI_A64_HS);
+                emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B);
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, rStr,
                                    (unsigned)offsetof(ObjString, chars)));
@@ -4475,10 +4521,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             uint32_t  elemShape = 0;
             if (IS_INT(elem))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(elem)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            else if (IS_BOOL(elem))  { kind = SLOT_BOOL;  tag = VAL_BOOL; }
             else if (IS_LIST(elem)) {
                 /* A list of lists. `matrix_mul` is `b[k][j]` in its innermost
                  * loop and could not compile the outer half of it. */
                 kind = SLOT_LIST;
+                tag = VAL_OBJ;
+            }
+            else if (IS_STRING(elem)) {
+                /* A list of strings, held opaquely. Everything that then wants
+                 * to know it is a string -- the interned compare, `s[i]` --
+                 * checks OBJ_STRING for itself, which is the same contract a
+                 * SLOT_OBJ local has always had: the sample says what to
+                 * specialise for, the guard says whether it was right.
+                 * `str_search` builds its text out of `chunks[seed % 8]` and
+                 * declined that whole loop forty times over. */
+                kind = SLOT_OBJ;
                 tag = VAL_OBJ;
             }
             else if (IS_INSTANCE(elem) && AS_INSTANCE(elem)->klass != NULL) {
@@ -4493,17 +4551,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
                                (unsigned)offsetof(ObjList, count)));
-            emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
-            emit(e, jaiA64BCond(JAI_A64_GE, 2));
-            emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A));
-            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
-            branchOnDeopt(e, JAI_A64_HS);
+            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B);
 
             emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
                                (unsigned)offsetof(ObjList, items)));
-            emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_SCRATCH_B, 4));
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                  JIT_SCRATCH_B, 4));
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
@@ -4523,7 +4576,24 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &d1, NULL)) return false;
             if (!popValue(e, &d2, NULL)) return false;
             if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 8));
+            /* A bool's payload is one byte: `BOOL_VAL` compiles to `strb`, so
+             * the seven bytes above it are whatever the slot held before. An
+             * 8-byte load would put that in a register a SLOT_BOOL is required
+             * to hold 0 or 1 in, and `if xs[i]` is `cbnz` on the whole word. */
+            if (kind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_C, 8));
+            } else if (kind == SLOT_FLOAT &&
+                       fpWorthLoading(e, code, off + 1, stop)) {
+                /* Straight into the FP bank, for the same reason a float local
+                 * goes there: `ldr x` followed by `fmov d, x` puts a
+                 * cross-register-file move between the load and the multiply
+                 * that wants it, and `ai[k] * b[k][j]` had two of them. */
+                unsigned idx = e->valueDepth - 1;
+                emit(e, jaiA64LdrD(fpRegAt(e, idx), JIT_SCRATCH_C, 8));
+                fpClaim(e, idx);
+            } else {
+                emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 8));
+            }
             off += 1;
             break;
         }
@@ -4551,17 +4621,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
                                (unsigned)offsetof(ObjList, count)));
-            emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
-            emit(e, jaiA64BCond(JAI_A64_GE, 2));
-            emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A));
-            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
-            branchOnDeopt(e, JAI_A64_HS);
+            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B);
 
             emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
                                (unsigned)offsetof(ObjList, items)));
-            emit(e, jaiA64LslX(JIT_SCRATCH_D, JIT_SCRATCH_B, 4));
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                  JIT_SCRATCH_B, 4));
             emit(e, jaiA64MovzX(JIT_SCRATCH_A, vtag, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
             emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
