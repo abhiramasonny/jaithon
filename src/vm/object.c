@@ -1754,10 +1754,27 @@ bool jaiModuleGet(ObjModule *m, ObjString *name, Value *out) {
 void jaiModuleSet(ObjModule *m, ObjString *name, Value v) {
     jaiGCPushRoot(OBJ_VAL(m));
     jaiGCPushRoot(v);
-    (void)jaiTableSetInterned(&m->globals, name, v);
+    Value prev = NULL_VAL;
+    const bool added = jaiTableSetInternedPrev(&m->globals, name, v, &prev);
     jaiGCPopRoots(2);
-    /* Every mutation invalidates the global inline caches keyed on version. */
-    m->version++;
+
+    /* ObjModule::version retires compiled code, and compiled code resolves a
+     * global by VALUE exactly four ways -- globalClass, globalFunction,
+     * globalNative and globalIsSelf in jit_func.c -- each of which demands
+     * IS_CLASS, IS_CLOSURE or IS_NATIVE. Everything else it resolves by
+     * ADDRESS, re-loading the value behind a tag guard on every access, so an
+     * update to an inert value needs no invalidation at all.
+     *
+     * jaiValueIsInertGlobal is the test, and it is written the safe way round:
+     * it lists the types compiled code provably cannot bake and answers false
+     * for everything else, so a new ObjType falls into the conservative arm.
+     *
+     * The key set and the table layout are NOT tracked here -- JaiTable bumps
+     * keyVersion itself, so no writer can forget to. */
+    if (added || ((IS_OBJ(prev) || IS_OBJ(v)) &&
+                  (!jaiValueIsInertGlobal(prev) || !jaiValueIsInertGlobal(v)))) {
+        m->version++;
+    }
 }
 
 bool jaiModuleIsExported(ObjModule *m, ObjString *name) {

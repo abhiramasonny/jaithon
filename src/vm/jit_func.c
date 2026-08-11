@@ -521,6 +521,16 @@ typedef struct {
      * longer free: re-running the call interpreted would apply the write a
      * second time. See branchOnCondition. */
     bool      wroteHeap;
+    /* Module globals baked into this body. Every global this body touches
+     * lives in one table -- the defining module's -- so one guard covers all
+     * of them: `keyVersion` changes only when a live entry's ADDRESS or KEY
+     * could have changed (a new key, a rehash, a delete, a clear), which is
+     * exactly the condition that makes a baked JaiEntry* unusable.
+     * ObjModule::version, which the function tier's entry check uses, is
+     * neither necessary here (a value write moves no entry) nor sufficient
+     * (under jaiModuleSet's narrowed rule an inert write does not move it). */
+    JaiTable *globalsTable;
+    uint32_t  globalsKeyVersion;
     bool      bailAfterWrite;
     bool      callsOut;      /* the body reaches out to another function */
     const char *whyNot;
@@ -1095,6 +1105,104 @@ static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
     Value bound;
     if (!jaiModuleGet(fn->module, AS_STRING(name), &bound)) return false;
     return IS_CLOSURE(bound) && AS_CLOSURE(bound)->fn == fn;
+}
+
+/* ------------------------------------------------------------------ */
+/* Module globals                                                       */
+/* ------------------------------------------------------------------ */
+
+/* The storage for a module global, or NULL when the name has none here.
+ *
+ * A JaiEntry's address is stable for as long as the table does not rehash,
+ * delete or clear -- jaiTableSetInterned reaches ensureRoom only when it is
+ * about to insert a NEW key, so overwriting an existing global never moves
+ * anything. That is what makes a compiled load one `ldr` from a baked pointer
+ * rather than a probe. `JaiTable.keyVersion` counts every event that breaks
+ * it, and emitGlobalsGuard checks it. */
+static JaiEntry *globalSlot(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                            Value *out) {
+    ObjFunction *fn = closure->fn;
+    if (fn->module == NULL) return NULL;
+    if (nameIdx >= (uint32_t)fn->chunk.constants.count) return NULL;
+    Value name = fn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(name)) return NULL;
+    JaiTable *t = &fn->module->globals;
+    JaiEntry *slot = jaiTableFindEntryInterned(t, AS_STRING(name));
+    if (slot == NULL) return NULL;
+    /* The whole body reads one table, so one guard covers every slot. */
+    if (e->globalsTable == NULL) {
+        e->globalsTable = t;
+        e->globalsKeyVersion = t->keyVersion;
+    } else if (e->globalsTable != t) {
+        return NULL;
+    }
+    if (out != NULL) *out = slot->value;
+    return slot;
+}
+
+/* The table has not rehashed since this was compiled, so every baked slot
+ * address is still the live storage for the name it came from.
+ *
+ * Emitted before EVERY access rather than hoisted. Hoisting is sound only with
+ * a claim about control flow -- a call-out between a guard and a later access
+ * on a back edge would be unguarded -- and the cheap version of that claim is
+ * the kind of reasoning this file has been bitten by. Measured cost is in the
+ * plan; it is four instructions on a predictable branch. */
+static void emitGlobalsGuard(Emit *e) {
+    uint32_t at = e->globalsKeyVersion;
+    emitConst64(e, JIT_SCRATCH_D,
+                (int64_t)(uintptr_t)&e->globalsTable->keyVersion);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+    if (at <= 0xfffu) {
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, at));
+    } else {
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)at);
+        emit(e, jaiA64SubsX(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    }
+    branchOnDeopt(e, JAI_A64_NE);
+}
+
+/* `m->version` retires the caches that resolved a NAME to a heap object or to
+ * presence: the interpreter's global inline cache (which stores an entry
+ * index, so a value write cannot invalidate it), OP_FORMAT's "is `str` still
+ * the builtin", and this tier's own baked classes, closures and natives --
+ * every one of which required the bound value to BE a heap object.
+ *
+ * So a store that replaces a non-object with a non-object changes nothing any
+ * of them cached, and may skip the bump. That matters a great deal: the bump
+ * is what makes `total = total + 1` at module scope retire every compiled
+ * function in the module, measured at 6.0M declined entries and 19% of the
+ * running time on a Point-allocating loop. */
+static void emitVersionBump(Emit *e, ObjModule *m) {
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&m->version);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+    emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
+    emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+}
+
+/* The kind a global's live value has, or false when the tier has no kind for
+ * it. Read off the value the way a parameter is seeded. */
+static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
+    *shape = 0; *kls = NULL;
+    if (IS_INT(v))      { *k = SLOT_INT;   return true; }
+    if (IS_FLOAT(v))    { *k = SLOT_FLOAT; return true; }
+    if (IS_BOOL(v))     { *k = SLOT_BOOL;  return true; }
+    if (IS_LIST(v))     { *k = SLOT_LIST;  return true; }
+    if (IS_INSTANCE(v)) {
+        ObjInstance *inst = AS_INSTANCE(v);
+        if (inst->klass == NULL) return false;
+        *k = SLOT_INST; *kls = inst->klass; *shape = inst->klass->shapeId;
+        return true;
+    }
+    /* Anything else on the heap -- a dict, a string, a closure -- can be
+     * loaded, passed and stored, and nothing else. A class, a function and a
+     * native never reach here: OP_GET_GLOBAL resolves those to their own stack
+     * kinds above, which occupy no register. */
+    if (IS_OBJ(v) && AS_OBJ(v) != NULL && !IS_CLASS(v) && !IS_CLOSURE(v) &&
+        !IS_NATIVE(v)) {
+        *k = SLOT_OBJ; return true;
+    }
+    return false;
 }
 
 /* A callee that is not this function: only a class, whose result is an
@@ -3581,6 +3689,23 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_GET_GLOBAL: {
+            /* TWO WAYS OUT OF HERE, and they carry different obligations.
+             *
+             * BY VALUE: globalIsSelf, globalClass, globalFunction and
+             * globalNative resolve the binding at compile time and bake it in.
+             * Nothing re-checks it at run time, so ObjModule::version has to
+             * retire the whole form when such a binding could have changed --
+             * which is what jaiModuleSet's jaiValueIsInertGlobal test decides.
+             * Teach any of those four a further kind of value, or teach this
+             * arm to constant-fold an int out of `let ITERS = ..`, and
+             * jaiValueIsInertGlobal must stop calling that kind inert.
+             *
+             * BY ADDRESS: the value case below bakes the JaiEntry*, not the
+             * value, and re-loads it behind a tag guard -- plus an Obj.type
+             * guard and a class-shape guard where the kind needs one -- on
+             * EVERY access. It depends on the table's layout, guarded by
+             * JaiTable::keyVersion, and on nothing ObjModule::version
+             * protects. */
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             if (globalIsSelf(closure, nameIdx)) {
                 if (!pushSelf(e)) return false;
@@ -3610,7 +3735,73 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 Value nv;
                 ObjNative *nat = globalNative(closure, nameIdx, &nv);
                 if (nat == NULL) {
-                    e->whyNot = "callee is not a compiled global function";
+                    /* A global holding a plain value -- an int, a float, a
+                     * list, an instance. Its storage is a JaiEntry whose
+                     * address is fixed once the entry exists, so the load is
+                     * one `ldr` behind two guards: the table has not moved,
+                     * and the value still has the kind this was compiled for.
+                     *
+                     * Refusing this is what declined every loop that so much
+                     * as reads a module-level variable, which since the
+                     * benchmarks moved to module scope is most of them. */
+                    Value gvv = NULL_VAL;
+                    JaiEntry *gslot = globalSlot(e, closure, nameIdx, &gvv);
+                    SlotKind gk = SLOT_OPAQUE;
+                    uint32_t gshape = 0;
+                    ObjClass *gcls = NULL;
+                    if (gslot != NULL && globalKind(gvv, &gk, &gshape, &gcls)) {
+                        unsigned dst = pushReg(e);
+                        unsigned tag = gk == SLOT_INT   ? VAL_INT
+                                     : gk == SLOT_FLOAT ? VAL_FLOAT
+                                     : gk == SLOT_BOOL  ? VAL_BOOL
+                                                        : VAL_OBJ;
+                        /* Every guard runs against the model as it is BEFORE
+                         * the value is pushed, so a deopt here resumes at this
+                         * instruction with the operand stack the interpreter
+                         * expects. */
+                        emitGlobalsGuard(e);
+                        emitConst64(e, JIT_SCRATCH_D,
+                                    (int64_t)(uintptr_t)gslot);
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(JaiEntry, value)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
+                        branchOnDeopt(e, JAI_A64_NE);
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(JaiEntry, value) + 8u));
+                        if (gk == SLOT_INST || gk == SLOT_LIST) {
+                            /* VAL_OBJ is every heap object, so the tag alone
+                             * does not say this is an instance -- reading a
+                             * class pointer off an ObjString answers wrongly
+                             * rather than faulting. */
+                            emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                                  (unsigned)offsetof(Obj, type)));
+                            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B,
+                                                   gk == SLOT_INST ? OBJ_INSTANCE
+                                                                   : OBJ_LIST));
+                            branchOnDeopt(e, JAI_A64_NE);
+                        }
+                        if (gk == SLOT_INST) {
+                            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                               (unsigned)offsetof(ObjInstance, klass)));
+                            emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                               (unsigned)offsetof(ObjClass, shapeId)));
+                            emitConst64(e, JIT_SCRATCH_A, (int64_t)gshape);
+                            emit(e, jaiA64SubsX(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+                            branchOnDeopt(e, JAI_A64_NE);
+                        }
+                        if (!pushValue3(e, gk, gshape, gcls, gvv, -1)) return false;
+                        emit(e, jaiA64MovX(dst, JIT_SCRATCH_C));
+                        off += 6;
+                        break;
+                    }
+                    /* Distinguish the two, because the census reads these and
+                     * "a global of a kind the tier has no slot for" is a very
+                     * different backlog item from an uncompiled callee. */
+                    e->whyNot =
+                        (gslot != NULL && !IS_CLOSURE(gvv) &&
+                         !IS_CLASS(gvv) && !IS_NATIVE(gvv))
+                            ? "a global of a kind the tier has no slot for"
+                            : "callee is not a compiled global function";
                     return false;
                 }
                 if (e->depth >= JIT_MAX_SAVED) return false;
@@ -3630,6 +3821,96 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->stackSeen[e->depth]  = gv;
             e->stackLocal[e->depth] = -1;
             e->stack[e->depth++]    = SLOT_FUNC;
+            off += 6;
+            break;
+        }
+
+        case OP_SET_GLOBAL: {
+            /* Assigns without popping, exactly as the interpreter does: the
+             * value is the statement's result and an OP_POP follows. */
+            uint32_t nameIdx = jaiReadU24(code + off + 1);
+            Value gvv;
+            JaiEntry *gslot = globalSlot(e, closure, nameIdx, &gvv);
+            if (gslot == NULL) {
+                /* The interpreter raises NameError for a name with no binding;
+                 * there is nothing to store into and nothing to compile. */
+                e->whyNot = "a global with no storage to store into";
+                return false;
+            }
+            if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) {
+                e->whyNot = "nothing on the stack to store into a global";
+                return false;
+            }
+            SlotKind sk = e->stack[e->depth - 1];
+            if (sk != SLOT_INT && sk != SLOT_FLOAT && sk != SLOT_BOOL &&
+                sk != SLOT_LIST && sk != SLOT_INST && sk != SLOT_MAYBE_INST) {
+                /* SLOT_OBJ is deliberately NOT on this list. It means "some
+                 * heap object of a type this tier does not model", which
+                 * includes a closure -- the OP_CALL arm below calls one --
+                 * and storing a closure into a global rebinds a callee that a
+                 * compiled form, possibly this one a few instructions above,
+                 * has already baked BY VALUE. ObjModule::version retires that
+                 * form at its next ENTRY, not in the middle of a body, so it
+                 * would be a wrong answer rather than a decline. Every kind
+                 * left here is inert by jaiValueIsInertGlobal, which is what
+                 * makes the bump rule below sound. */
+                e->whyNot = "a global store of a kind that has no Value form";
+                return false;
+            }
+            emitGlobalsGuard(e);
+            {
+                unsigned src = pushReg(e) - 1;
+                emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
+                /* ObjModule::version only has to move when a write takes a
+                 * class, a closure or a native AWAY or puts one IN; see
+                 * jaiValueIsInertGlobal, whose C form is the authority. The
+                 * value going IN is provably inert here (SLOT_OBJ is refused
+                 * above), so only the value coming OUT can matter, and this
+                 * recognises a STRICT SUBSET of the inert types: not an object
+                 * at all, an ObjInstance, or an ObjList. Everything else
+                 * bumps, which is only ever conservative. Widening
+                 * jaiValueIsInertGlobal needs no change here; taking
+                 * OBJ_INSTANCE or OBJ_LIST out of it does. */
+                unsigned skip[3];
+                unsigned nskip = 0;
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, VAL_OBJ));
+                skip[nskip++] = e->count;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value) + 8u));
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_C, JIT_SCRATCH_B,
+                                      (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, OBJ_INSTANCE));
+                skip[nskip++] = e->count;
+                emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, OBJ_LIST));
+                skip[nskip++] = e->count;
+                emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+                emitVersionBump(e, closure->fn->module);
+                for (unsigned si = 0; si < nskip; si++) {
+                    unsigned at = skip[si];
+                    if (at < JIT_MAX_INSTS && e->count > at) {
+                        e->code[at] = jaiA64BCond(
+                            si == 0 ? JAI_A64_NE : JAI_A64_EQ,
+                            (int32_t)(e->count - at));
+                    }
+                }
+                /* No write barrier: the collector is a plain mark-sweep and
+                 * the module's globals are traced as a root at every
+                 * collection, so a raw store is all a store is. Nothing
+                 * between the two writes can allocate, so no collection can
+                 * see a tag and a payload that disagree. */
+                emitTagFor(e, sk, src, JIT_SCRATCH_B, JIT_SCRATCH_A);
+                emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value)));
+                emit(e, jaiA64StrX(src, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value) + 8u));
+            }
+            /* Re-running this call interpreted would apply the store twice, so
+             * from here a bail is no longer free. */
+            e->wroteHeap = true;
             off += 6;
             break;
         }
@@ -4753,12 +5034,33 @@ typedef int64_t (*OsrFnIter)(Value *slots, ObjIter *iter);
  * OP_LOOP that is not one. nbody's advance was being compiled from offset 128,
  * which is inside a GET_LOCAL2's operands. Walking from the start costs a scan
  * once per compile and removes the question. */
+/* Bytes of the instruction at `off`, or 0 when it cannot be decoded.
+ *
+ * OP_CLOSURE is the one variable-length instruction: a u24 constant index and
+ * then three bytes per upvalue, and the count is on the function that index
+ * names. Treating it as undecodable refused OSR for the WHOLE CHUNK -- both
+ * walks below start from offset 0 or scan forward -- so a module that declares
+ * a class or a function before its hot loop, which is every one of them, could
+ * never enter a compiled loop at module scope at all. Nothing reported it:
+ * compileOsr was not reached, so there was no decline to see. */
+static int instructionLength(const Chunk *c, int off) {
+    uint8_t op = c->code[off];
+    if (op != OP_CLOSURE) {
+        int size = jaiOpOperandSize((OpCode)op);
+        return size < 0 ? 0 : 1 + size;
+    }
+    if (off + 4 > c->count) return 0;
+    uint32_t index = jaiReadU24(c->code + off + 1);
+    if (index >= (uint32_t)c->constants.count) return 0;
+    Value fnv = c->constants.data[index];
+    if (!IS_FUNCTION(fnv)) return 0;
+    return 4 + 3 * (int)AS_FUNCTION(fnv)->upvalueCount;
+}
+
 static bool isInstructionStart(const Chunk *c, uint32_t top) {
     for (int off = 0; off < c->count;) {
         if ((uint32_t)off == top) return true;
-        uint8_t op = c->code[off];
-        if (op == OP_CLOSURE) return false;   /* variable length */
-        int len = 1 + jaiOpOperandSize((OpCode)op);
+        int len = instructionLength(c, off);
         if (len <= 0) return false;
         off += len;
     }
@@ -4768,8 +5070,7 @@ static bool isInstructionStart(const Chunk *c, uint32_t top) {
 static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
     for (int off = (int)top; off < c->count;) {
         uint8_t op = c->code[off];
-        if (op == OP_CLOSURE) return 0;
-        int len = 1 + jaiOpOperandSize((OpCode)op);
+        int len = instructionLength(c, off);
         if (len <= 0) return 0;
         if (op == OP_LOOP) {
             int16_t jump = jaiReadI16(c->code + off + 1);
@@ -5104,7 +5405,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     fn->osrCount++;
     fn->osrHot = true;
     fn->osrDeclines = 0;
-    fn->jitModuleVersion = fn->module != NULL ? fn->module->version : 0;
+    fn->jitOsrModuleVersion = fn->module != NULL ? fn->module->version : 0;
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
                 fn->name ? fn->name->chars : "<anon>", top, e.count,
@@ -5198,7 +5499,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         }
         form = &fn->osrForms[fn->osrCount - 1];
     }
-    if (fn->module == NULL || fn->module->version != fn->jitModuleVersion) return 0;
+    if (fn->module == NULL || fn->module->version != fn->jitOsrModuleVersion) return 0;
 
     /* Every slot must still hold what it held when this was compiled. */
     for (unsigned i = 0; i < form->slots; i++) {
@@ -5248,7 +5549,7 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
      * mutation, so one comparison covers it. It is conservative -- any global
      * write in the module retires the compiled form -- and conservative is the
      * safe direction. */
-    if (fn->module == NULL || fn->module->version != fn->jitModuleVersion) {
+    if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion) {
         return JAI_JIT_DECLINED;
     }
 

@@ -284,10 +284,17 @@ struct ObjFunction {
     /* Compiled whole-function form: a native routine taking int64 arguments
      * and returning one, calling itself directly. See jit_func.c. */
     uint8_t    *jitFunc;
-    /* The module's global-mutation counter as it stood when jitFunc was
-     * built. Compiled code resolved this function's own name once; if any
-     * global has moved since, the compiled form is retired. */
-    uint32_t    jitModuleVersion;
+    /* The module's global-mutation counter as it stood when each tier's form
+     * was built. Compiled code resolves a class, a closure or a native once;
+     * if any such binding may have moved since, that form is retired.
+     *
+     * ONE PER TIER, and that is load-bearing. A single field let compileOsr
+     * re-arm a whole-function form that a rebinding had already retired: the
+     * function tier's guard compares against whatever the OSR tier last
+     * stored, so compiling a loop resurrected stale baked callees. See
+     * tests/jit/rearm. */
+    uint32_t    jitFuncModuleVersion;
+    uint32_t    jitOsrModuleVersion;
     /* A builtin resolved at compile time is pinned by the builtins module's
      * own version, the same way a module global is pinned by its module's. */
     uint32_t    jitBuiltinsVersion;
@@ -581,7 +588,18 @@ struct ObjModule {
     ObjString   *path;         /* absolute filesystem path */
     JaiTable     globals;      /* ObjString* -> Value */
     JaiTable     exports;      /* ObjString* -> BOOL_VAL(true) */
-    uint32_t     version;      /* bumped on every global mutation; inline-cache key */
+    /* "Can compiled code still trust the bindings it baked in?"
+     *
+     * jit_func.c resolves a class, a closure or a native at compile time and
+     * calls it directly, so a rebinding has to retire the compiled form. This
+     * moves on any write that could change such a binding, and NOT on one that
+     * merely updates a global to another inert value -- see jaiModuleSet and
+     * jaiValueIsInertGlobal.
+     *
+     * A NEW READER MUST PICK THE RIGHT COUNTER. Anything memoising a global's
+     * VALUE, or a resolved callee, keys on this. Anything memoising a table
+     * slot's address or the absence of a name keys on globals.keyVersion. */
+    uint32_t     version;
     ModuleState  state;
     ObjClosure  *body;
     int          sourceFileId; /* JaiSourceFile.id for diagnostics */

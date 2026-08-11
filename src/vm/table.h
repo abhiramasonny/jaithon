@@ -31,6 +31,20 @@ typedef struct {
     int       tombstones;
     int       capacity;   /* always a power of two, or 0 */
     uint32_t  version;    /* bumped on every mutation; iterators snapshot it */
+    /* Bumped when the SET OF KEYS or the LAYOUT changes: a new key, a rehash,
+     * a delete, a clear. Not on a value write -- that is the write the
+     * compiled tier exists to make fast, and `version` already covers it.
+     *
+     * Two readers, and both need exactly this:
+     *   - jit_func.c bakes a JaiEntry* into compiled code. Only a rehash, a
+     *     delete or a clear can make that address stop being the storage for
+     *     the name it came from, and reading a slot whose array was freed is a
+     *     use of freed memory rather than a wrong answer.
+     *   - OP_FORMAT memoises "this module does not bind `str`". That is a fact
+     *     about the key set, so a new key has to move it too -- which is why
+     *     this counter is wider than the address question alone needs.
+     * Fits the padding after `version`; sizeof(JaiTable) is 40 either way. */
+    uint32_t  keyVersion;
 } JaiTable;
 
 /* A dedicated sentinel distinguishing "deleted" from "never used". */
@@ -56,9 +70,19 @@ void jaiTableAddAll(const JaiTable *from, JaiTable *to);
 /* Fast path for interned-string keys: pointer comparison, cached hash. */
 bool jaiTableGetInterned(JaiTable *t, ObjString *key, Value *out);
 bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value);
+/* Same, handing back what the key was bound to (NULL_VAL when it was absent).
+ * The entry is already in hand at the point the value is overwritten, so this
+ * costs nothing; a caller that looked the old value up itself would pay a
+ * second probe. jaiModuleSet needs it to tell a rebinding from an update. */
+bool jaiTableSetInternedPrev(JaiTable *t, ObjString *key, Value value,
+                             Value *outPrev);
 /* Index of the live entry for `key`, or -1. Stable until the next mutation;
  * used by the inline caches for globals. */
 int  jaiTableFindIndex(JaiTable *t, Value key);
+/* The live entry for an interned key, or NULL. The address is stable for as
+ * long as `keyVersion` does not change; see the comment on that field. Used by
+ * the JIT to bake a module global's storage into compiled code. */
+JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key);
 
 /* Iteration: start with i = 0, repeat while it returns true.
  *   int i = 0; Value k, v;
