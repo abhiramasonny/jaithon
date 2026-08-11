@@ -7,9 +7,11 @@
 #                     they feed jaiVerifyChunk malformed bytecode, which no
 #                     .jai source can express. Skipped when not built.
 #   2. golden       — a .jai file next to a .expected file; stdout must match
-#                     at every optimisation level, and under --gc-stress, since
-#                     a collection that frees something still live and a pass
-#                     that rewrites a jump wrongly both show up nowhere else
+#                     at every optimisation level, under --gc-stress, and under
+#                     JAITHON_JIT_DEOPT_STRESS=1, since a collection that frees
+#                     something still live, a pass that rewrites a jump wrongly
+#                     and a guard that hands the interpreter the wrong operand
+#                     stack all show up nowhere else
 #   3. unit         — tests/lang and tests/stdlib, run by `jaithon test`
 #                     (jaithon.tool.test): every top-level `test_` function
 #   4. diagnostics  — tests/errors/*.jai must FAIL with the code named on the
@@ -117,16 +119,23 @@ fi
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
-run_golden() {   # name, source, expected, extra jaithon flag ("" for none)
-    local name="$1" src="$2" expected="$3" flag="${4:-}"
-    local start actual status errout elapsed
+run_golden() {   # name, source, expected, extra jaithon flag ("" for none),
+                 # NAME=VALUE for the child's environment ("" for none)
+    local name="$1" src="$2" expected="$3" flag="${4:-}" envset="${5:-}"
+    local start actual status errout elapsed prefix
+    # Words rather than an array: macOS ships bash 3.2, where "${a[@]}" on an
+    # empty array is an unbound variable under `set -u` and every golden test
+    # fails with no command having run at all. Both halves are literals from
+    # this script, so splitting them is what is wanted.
+    prefix="env"
+    [[ -n "$envset" ]] && prefix="env $envset"
     start=$(now_ms)
     # Compare stdout only. Diagnostics and warnings go to stderr by design, so
     # merging the two here would make every test fail on unrelated noise.
     if [[ -n "$flag" ]]; then
-        actual="$("$JAITHON" run "$flag" "$src" 2>"/tmp/jai_test_err.$$")"
+        actual="$($prefix "$JAITHON" run "$flag" "$src" 2>"/tmp/jai_test_err.$$")"
     else
-        actual="$("$JAITHON" run "$src" 2>"/tmp/jai_test_err.$$")"
+        actual="$($prefix "$JAITHON" run "$src" 2>"/tmp/jai_test_err.$$")"
     fi
     status=$?
     errout="$(cat "/tmp/jai_test_err.$$")"; rm -f "/tmp/jai_test_err.$$"
@@ -151,6 +160,13 @@ for src in "$ROOT"/tests/golden/*.jai; do
     fi
     run_golden "$name" "$src" "$expected"
     [[ $GC_STRESS -eq 1 ]] && run_golden "$name (gc-stress)" "$src" "$expected" --gc-stress
+    # Every guard in compiled code fails at once, so each of these runs the
+    # deoptimisation path too -- the record a guard hands back, and the
+    # interpreter picking up from it. Nothing else reaches it: a guard fires in
+    # ordinary running only when a program changes a type under the compiler,
+    # and almost none do. It costs about 2% of this suite.
+    run_golden "$name (deopt-stress)" "$src" "$expected" "" \
+        JAITHON_JIT_DEOPT_STRESS=1
     # The optimisation level may change how long a program takes, never what it
     # prints. -O2 is the default the line above already covered.
     for level in -O0 -O1 -O3; do

@@ -597,6 +597,12 @@ typedef struct {
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
     uint32_t  curOffset;
+    /* The model as it stood at the start of `curOffset`, before any of that
+     * instruction's own pushes. A guard fires part-way through an instruction
+     * and the interpreter resumes at its start, so this is what it is holding
+     * there -- see deoptSite. */
+    unsigned  instDepth;
+    unsigned  instValueDepth;
     bool      hasSelfCall;
     unsigned  locals;      /* slots base..base+locals-1 live in registers */
     unsigned  frameBytes;
@@ -1135,22 +1141,55 @@ static bool jitDeoptStress(void) {
  * not happened as far as the interpreter is concerned, so it resumes at the
  * OP_CALL holding the callee and its arguments, and every entry the inlined
  * body has pushed above them -- its own locals and temporaries -- is not part
- * of the picture. */
-static void deoptSite(const Emit *e, uint32_t ip, uint32_t *ipOut,
+ * of the picture.
+ *
+ * And outside one it is still not the model's current state, because a guard
+ * sits PART-WAY THROUGH an instruction. `OP_GET_LOCAL2` pushes its operand and
+ * then guards that operand's tag, so by the time the guard is written the model
+ * is two entries deeper than the interpreter's stack is at that offset. The
+ * interpreter resumes at the instruction's start and pushes those entries
+ * itself; handing them to it as well leaves them stranded underneath, and a
+ * `for` whose iterator is two entries down reads the loop variable as its
+ * iterator. `instDepth` is the model at the instruction's start, which is
+ * exactly what the interpreter holds there.
+ *
+ * Only entries this instruction pushed can be dropped and they are the topmost
+ * ones, so every entry that remains keeps the register it was assigned. The
+ * other direction -- an instruction that has already popped an entry the
+ * interpreter still holds -- cannot be repaired by trimming and is refused. */
+static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
                       unsigned *depthOut, unsigned *valueDepthOut) {
-    if (!e->inlining) {
-        *ipOut = ip;
-        *depthOut = e->depth;
-        *valueDepthOut = e->valueDepth;
-        return;
+    if (e->inlining) {
+        *ipOut = e->inlIp;
+        *depthOut = e->inlDepth;
+        unsigned seen = 0;
+        for (unsigned i = 0; i < e->inlDepth; i++) {
+            if (holdsRegister(e->stack[i])) seen++;
+        }
+        *valueDepthOut = seen;
+        return true;
     }
-    *ipOut = e->inlIp;
-    *depthOut = e->inlDepth;
+    *ipOut = ip;
+    *depthOut = e->depth;
+    *valueDepthOut = e->valueDepth;
+    /* Only for a guard that resumes at the instruction being compiled. A guard
+     * that names a later offset -- the one after a call, where the result is
+     * already on the stack -- is describing a point this walk has not reached
+     * and `instDepth` says nothing about it. */
+    if (ip != e->curOffset) return true;
+    if (e->depth < e->instDepth) {
+        e->whyNot = "a guard resumes an instruction whose operands it has "
+                    "already consumed";
+        return false;
+    }
+    if (e->depth == e->instDepth) return true;
     unsigned seen = 0;
-    for (unsigned i = 0; i < e->inlDepth; i++) {
+    for (unsigned i = 0; i < e->instDepth; i++) {
         if (holdsRegister(e->stack[i])) seen++;
     }
+    *depthOut = e->instDepth;
     *valueDepthOut = seen;
+    return true;
 }
 
 static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
@@ -1162,8 +1201,18 @@ static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
         return;
     }
     unsigned k = e->deoptCount++;
-    deoptSite(e, ip, &e->deopt[k].ip, &e->deopt[k].depth,
-              &e->deopt[k].valueDepth);
+    if (!deoptSite(e, ip, &e->deopt[k].ip, &e->deopt[k].depth,
+                   &e->deopt[k].valueDepth)) {
+        e->failed = true;
+        return;
+    }
+    if (lastFromDesc && !e->inlining && e->deopt[k].depth != e->depth) {
+        /* The from-descriptor entry is the top of the record, so a record that
+         * was trimmed is no longer describing it. No site does both today. */
+        e->whyNot = "a call's result guard resumes before the call";
+        e->failed = true;
+        return;
+    }
     e->deopt[k].lastFromDesc = lastFromDesc;
     e->deopt[k].fpLive       = e->fpLive;
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
@@ -1187,8 +1236,11 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
         return;
     }
     unsigned k = e->deoptCount++;
-    deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
-              &e->deopt[k].valueDepth);
+    if (!deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
+                   &e->deopt[k].valueDepth)) {
+        e->failed = true;
+        return;
+    }
     e->deopt[k].lastFromDesc = false;
     e->deopt[k].fpLive     = e->fpLive;
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
@@ -1999,6 +2051,8 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     int *savedMap = e->offsetToInst, *savedDepths = e->offsetToDepth;
     unsigned savedCarry = e->fpCarryCount;
     uint32_t savedCurOffset = e->curOffset;
+    unsigned savedInstDepth = e->instDepth;
+    unsigned savedInstValue = e->instValueDepth;
     e->offsetToInst = cmap;
     e->offsetToDepth = cdepths;
 
@@ -2008,6 +2062,8 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     e->offsetToDepth = savedDepths;
     e->fpCarryCount = savedCarry;
     e->curOffset = savedCurOffset;
+    e->instDepth = savedInstDepth;
+    e->instValueDepth = savedInstValue;
 
     if (!ok || e->failed) {
         /* Instructions have been written; there is no taking them back. The
@@ -2589,6 +2645,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         uint8_t op = code[off];
         e->lastOp = op;
         e->curOffset = (uint32_t)off;
+        e->instDepth = e->depth;
+        e->instValueDepth = e->valueDepth;
 
         if (e->fpLive != 0) {
             bool joinsHere = false;
