@@ -87,6 +87,10 @@ static uintptr_t stackLimit(void) {
 
 #define JIT_FIRST_SAVED 19u   /* x19..x28 are callee-saved and ours */
 #define JIT_MAX_SAVED   10u
+/* Entries the operand-stack MODEL can hold, which is no longer the same as the
+ * number of registers: an inlined body's entries live in a bank of their own,
+ * so the model has to describe more values than x19..x28 could hold. */
+#define JIT_MAX_STACK   20u
 /* How many slots the compile-time model can describe. Not the register budget:
  * a function may declare a wide frame and touch very little of it, and the
  * measuring pass has to walk the whole body to find that out. Only the second
@@ -188,7 +192,7 @@ typedef struct {
     int64_t nlocals;
     int64_t nstack;
     Value   locals[JIT_MAX_SLOTS + 1];
-    Value   stack[JIT_MAX_SAVED + 1];
+    Value   stack[JIT_MAX_STACK + 1];
 } JitDeoptRecord;
 
 static JitDeoptRecord gDeopt;
@@ -431,11 +435,11 @@ typedef struct {
     uint32_t  code[JIT_MAX_INSTS];
     unsigned  count;
 
-    SlotKind  stack[JIT_MAX_SAVED];
-    uint32_t  stackShape[JIT_MAX_SAVED];  /* class shapeId for SLOT_INST */
-    ObjClass *stackClass[JIT_MAX_SAVED];
-    Value     stackSeen[JIT_MAX_SAVED];   /* the live value, for field feedback */
-    int       stackLocal[JIT_MAX_SAVED];  /* which local it was copied from, or -1 */
+    SlotKind  stack[JIT_MAX_STACK];
+    uint32_t  stackShape[JIT_MAX_STACK];  /* class shapeId for SLOT_INST */
+    ObjClass *stackClass[JIT_MAX_STACK];
+    Value     stackSeen[JIT_MAX_STACK];   /* the live value, for field feedback */
+    int       stackLocal[JIT_MAX_STACK];  /* which local it was copied from, or -1 */
 
     /* Fields this body has already stored, and with what kind. A read of one
      * of them needs no tag check: nothing can have changed it, because the
@@ -512,6 +516,22 @@ typedef struct {
      * The compile is retried with this set when that is what went wrong. */
     bool      noInline;
     bool      inlined;
+    /* A callee whose body is being emitted where the call to it was.
+     *
+     * Its locals are operand-stack entries of the CALLER's frame: slots 1..n
+     * are the argument entries that are already sitting there, and anything it
+     * binds pins one more. Nothing is copied and no frame appears, which is
+     * the whole point -- but it also means the interpreter has no idea any of
+     * this is happening, so every guard inside the inlined body deoptimises to
+     * `inlIp`, the caller's own OP_CALL, with the model as it stood at
+     * `inlDepth`: the callee and its arguments, untouched, exactly what the
+     * interpreter expects to find at that offset. */
+    bool      inlining;
+    unsigned  inlDepth;
+    unsigned  inlPinned;      /* how many of its locals it has bound so far */
+    unsigned  inlValueBase;   /* value entries at or above this are the callee's */
+    uint32_t  inlIp;
+    int       inlSlot[JIT_MAX_SLOTS + 1];
     /* A local whose kind is not the same on every path into some point. It
      * lives in the frame with its tag and every read of it guards, which is
      * what lets two paths disagree. The compiler reuses one slot for the
@@ -567,8 +587,8 @@ typedef struct {
         uint32_t ip;
         unsigned depth;
         unsigned valueDepth;
-        SlotKind kinds[JIT_MAX_SAVED + 1];
-        ObjClass *classes[JIT_MAX_SAVED + 1];
+        SlotKind kinds[JIT_MAX_STACK + 1];
+        ObjClass *classes[JIT_MAX_STACK + 1];
         /* The topmost entry is the result of a call that already happened, so
          * it lives in the descriptor rather than a register. */
         bool     lastFromDesc;
@@ -810,36 +830,62 @@ static unsigned closureReg(const Emit *e) {
     return JIT_FIRST_SAVED + regBase(e);
 }
 
-static unsigned pushReg(const Emit *e) {
-    return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) +
-           e->valueDepth;
-}
-
 /* The X register value entry `idx` belongs in, counting from the bottom of the
- * operand stack rather than from the top the way pushReg does. */
+ * operand stack rather than from the top the way pushReg does.
+ *
+ * An inlined body gets a bank of its own. It cannot call anything -- that is
+ * the first thing inlinableBody checks -- so every register a call would
+ * destroy is free for the whole of it, and its temporaries cost the caller no
+ * callee-saved register at all. That is not a refinement: `evalA` inlined into
+ * spectral's inner loop wants eight live values where the OSR form had six
+ * left, so without this it does not fit and is not inlined. x9..x12 stay out
+ * of it, being the emitter's own scratches. */
+#define JIT_INL_BANK   0u    /* x0..x8, all caller-saved */
+#define JIT_INL_COUNT  9u
+
 static unsigned valueXReg(const Emit *e, unsigned idx) {
+    if (e->inlining && idx >= e->inlValueBase) {
+        return JIT_INL_BANK + (idx - e->inlValueBase);
+    }
     return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) + idx;
 }
 
-static unsigned fpRegAt(unsigned idx) { return JIT_FP_BANK + idx; }
+/* One past the top entry's register. Every `pushReg(e) - 1` in this file means
+ * "the entry just pushed", and expressing it this way rather than from the
+ * bottom is what keeps that idiom true across the two banks. */
+static unsigned pushReg(const Emit *e) {
+    if (e->valueDepth == 0) return valueXReg(e, 0);
+    return valueXReg(e, e->valueDepth - 1) + 1;
+}
+
+/* v16.. for the ordinary bank, v2..v7 for an inlined body -- caller-saved, and
+ * far enough from v16+JIT_MAX_SAVED, which the local-add path uses as a temp. */
+#define JIT_INL_FP_BANK 2u
+
+static unsigned fpRegAt(const Emit *e, unsigned idx) {
+    if (e->inlining && idx >= e->inlValueBase) {
+        return JIT_INL_FP_BANK + (idx - e->inlValueBase);
+    }
+    return JIT_FP_BANK + idx;
+}
 
 /* Put entry `idx` back where every other part of this file expects it. */
 static void fpSyncOne(Emit *e, unsigned idx) {
     if (!(e->fpLive & (1u << idx))) return;
     e->fpLive &= ~(1u << idx);
-    emit(e, jaiA64FmovXD(valueXReg(e, idx), fpRegAt(idx)));
+    emit(e, jaiA64FmovXD(valueXReg(e, idx), fpRegAt(e, idx)));
 }
 
 static void fpSyncAll(Emit *e) {
     if (e->fpLive == 0) return;
-    for (unsigned i = 0; i < JIT_MAX_SAVED; i++) fpSyncOne(e, i);
+    for (unsigned i = 0; i < 32u; i++) fpSyncOne(e, i);
 }
 
 /* A d register holding entry `idx`, loaded from its X register if that is
  * where it still is. Leaves fpLive alone: after this the two copies agree, and
  * claiming the X one is stale when it is not would cost a sync for nothing. */
 static unsigned fpOperand(Emit *e, unsigned idx) {
-    unsigned d = fpRegAt(idx);
+    unsigned d = fpRegAt(e, idx);
     if (!(e->fpLive & (1u << idx))) {
         emit(e, jaiA64FmovDX(d, valueXReg(e, idx)));
     }
@@ -852,11 +898,16 @@ static void fpClaim(Emit *e, unsigned idx) { e->fpLive |= 1u << idx; }
 
 static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
                        Value seen, int fromLocal) {
-    if (e->depth >= JIT_MAX_SAVED) {
+    if (e->depth >= JIT_MAX_STACK) {
         e->whyNot = "the operand stack is deeper than the model allows";
         return false;
     }
-    if (!e->measuring &&
+    if (!e->measuring && e->inlining &&
+        e->valueDepth + 1u - e->inlValueBase > JIT_INL_COUNT) {
+        e->whyNot = "an inlined body wants more registers than a call leaves free";
+        return false;
+    }
+    if (!e->measuring && !e->inlining &&
         regBase(e) + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
             JIT_MAX_SAVED) {
         e->whyNot = "more live values than there are callee-saved registers";
@@ -869,7 +920,12 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stack[e->depth++] = kind;
     e->fpLive &= ~(1u << e->valueDepth);
     e->valueDepth++;
-    if (e->valueDepth > e->maxValue) e->maxValue = e->valueDepth;
+    /* An inlined body's entries are not in the caller's bank, so they do not
+     * widen its save set -- which is the whole reason they fit. */
+    if (e->valueDepth > e->maxValue &&
+        !(e->inlining && e->valueDepth > e->inlValueBase)) {
+        e->maxValue = e->valueDepth;
+    }
     return true;
 }
 
@@ -907,7 +963,7 @@ static void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) 
 }
 
 static bool pushSelf(Emit *e) {
-    if (e->depth >= JIT_MAX_SAVED) return false;
+    if (e->depth >= JIT_MAX_STACK) return false;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
 }
@@ -922,8 +978,7 @@ static bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->valueDepth--;
     e->fpLive &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
-    *reg = JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) +
-           e->valueDepth;
+    *reg = valueXReg(e, e->valueDepth);
     return true;
 }
 
@@ -1074,6 +1129,30 @@ static bool jitDeoptStress(void) {
     return cached != 0;
 }
 
+/* Where a guard here has to send the interpreter, and what it must be holding.
+ *
+ * Inside an inlined body neither is the model's current state: the call has
+ * not happened as far as the interpreter is concerned, so it resumes at the
+ * OP_CALL holding the callee and its arguments, and every entry the inlined
+ * body has pushed above them -- its own locals and temporaries -- is not part
+ * of the picture. */
+static void deoptSite(const Emit *e, uint32_t ip, uint32_t *ipOut,
+                      unsigned *depthOut, unsigned *valueDepthOut) {
+    if (!e->inlining) {
+        *ipOut = ip;
+        *depthOut = e->depth;
+        *valueDepthOut = e->valueDepth;
+        return;
+    }
+    *ipOut = e->inlIp;
+    *depthOut = e->inlDepth;
+    unsigned seen = 0;
+    for (unsigned i = 0; i < e->inlDepth; i++) {
+        if (holdsRegister(e->stack[i])) seen++;
+    }
+    *valueDepthOut = seen;
+}
+
 static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
                             bool lastFromDesc) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
@@ -1083,12 +1162,11 @@ static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
         return;
     }
     unsigned k = e->deoptCount++;
-    e->deopt[k].ip           = ip;
-    e->deopt[k].depth        = e->depth;
-    e->deopt[k].valueDepth   = e->valueDepth;
+    deoptSite(e, ip, &e->deopt[k].ip, &e->deopt[k].depth,
+              &e->deopt[k].valueDepth);
     e->deopt[k].lastFromDesc = lastFromDesc;
     e->deopt[k].fpLive       = e->fpLive;
-    for (unsigned i = 0; i < e->depth; i++) {
+    for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
     }
@@ -1109,11 +1187,11 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
         return;
     }
     unsigned k = e->deoptCount++;
-    e->deopt[k].ip         = e->curOffset;
-    e->deopt[k].depth      = e->depth;
-    e->deopt[k].valueDepth = e->valueDepth;
+    deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
+              &e->deopt[k].valueDepth);
+    e->deopt[k].lastFromDesc = false;
     e->deopt[k].fpLive     = e->fpLive;
-    for (unsigned i = 0; i < e->depth; i++) {
+    for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
     }
@@ -1547,15 +1625,436 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
 }
 
+/* Every argument of a direct branch arrives as a raw payload, so the kind the
+ * caller holds has to be the kind the callee was specialised to -- and where
+ * that kind is an instance, the same class shape, because every field offset
+ * in the callee's body was resolved against it. jaiJitEnterFunc checks exactly
+ * this, one Value at a time, and it is the only thing standing between a
+ * float's bits and a body that will treat them as a pointer.
+ *
+ * `cidx` is the operand-stack index of the callee; the arguments are the
+ * `argc` entries above it. */
+static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn, unsigned cidx,
+                                unsigned argc) {
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned idx = cidx + 1u + i;
+        SlotKind have = e->stack[idx];
+        SlotKind want = (SlotKind)cfn->jitParamKind[i];
+        if (!holdsRegister(have)) {
+            e->whyNot = "a direct call argument that is not in a register";
+            return false;
+        }
+        if (want == SLOT_OPAQUE) continue;   /* never read; see seedLocals */
+        if (want == SLOT_MAYBE_INST) {
+            if (have != SLOT_INST && have != SLOT_MAYBE_INST) {
+                e->whyNot = "a direct call argument is not the parameter's kind";
+                return false;
+            }
+        } else if (have != want) {
+            e->whyNot = "a direct call argument is not the parameter's kind";
+            return false;
+        }
+        if ((want == SLOT_INST || want == SLOT_MAYBE_INST) &&
+            e->stackShape[idx] != cfn->jitParamShape[i]) {
+            e->whyNot = "a direct call passing a different class";
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Branch straight to a compiled callee's entry instead of building a
+ * descriptor and going out through jaiCallValue and an interpreter frame.
+ *
+ * The convention is the one jaiJitEnterFunc uses and a self-call already
+ * emits: raw payloads in x0.., the closure itself in the last argument
+ * register when the callee's body reads an upvalue, and on return x0 the value
+ * with x1 the verdict. Skipping jaiJitEnterFunc means skipping everything it
+ * checks, so each of those checks has to have an answer here:
+ *
+ *   - the module version, by the caller's own entry guard, which is why the
+ *     callee has to live in the caller's module;
+ *   - every parameter's kind and class shape, by the caller's model -- this is
+ *     what makes passing a raw payload rather than a Value sound;
+ *   - the verdict, below.
+ *
+ * A nonzero verdict is the part that is not obvious. jaiJitEnterFunc answers
+ * "the callee deoptimised" by pushing an interpreter frame for the callee and
+ * resuming inside it, and compiled code cannot do that. So the whole CALL is
+ * abandoned instead and the interpreter re-executes it from the operand stack
+ * as it stood before -- which is only sound if the abandoned attempt left
+ * nothing behind, hence jitFuncNoWrite. A raised exception is different: its
+ * effects have happened and the interpreter owns it, so that one goes to the
+ * throw exit rather than back to the call.
+ *
+ * `calleeReg` holds the ObjClosure when the callee is only known at run time,
+ * or -1 when it is baked in. `cidx` is the operand-stack index of the callee
+ * entry; the arguments are the `argc` entries above it. */
+static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
+                           Value calleeVal, int calleeReg, unsigned cidx,
+                           unsigned argc, uint32_t callOff) {
+    if (cfn->module != caller->module) {
+        e->whyNot = "a direct callee from another module";
+        return false;
+    }
+    if (cfn->jitArgBase != 1u) {
+        e->whyNot = "a direct callee that is not a plain function";
+        return false;
+    }
+    /* The callee's own baked classes, closures and natives are pinned by ITS
+     * jitFuncModuleVersion, checked at an entry this is about to skip. Handing
+     * that job to the caller's check works only if the two agree NOW: a global
+     * rebound after the callee compiled leaves a form jaiJitEnterFunc would
+     * refuse forever, still reachable through jitFunc, and the caller
+     * compiling afterwards would pin the newer version and never notice. */
+    if (caller->module == NULL ||
+        cfn->jitFuncModuleVersion != caller->module->version) {
+        e->whyNot = "a direct callee compiled against an older module";
+        return false;
+    }
+    if (!cfn->jitFuncNoWrite) {
+        e->whyNot = "a direct callee whose body writes the heap";
+        return false;
+    }
+    unsigned calleeArgs = (unsigned)cfn->jitArgCount;
+    bool wantsClosure = calleeArgs == argc + 1u;
+    if (!wantsClosure && calleeArgs != argc) {
+        e->whyNot = "a direct callee with a different arity";
+        return false;
+    }
+    if (calleeArgs > JIT_MAX_ARITY) {
+        e->whyNot = "a direct callee with too many arguments";
+        return false;
+    }
+
+    if (!directCallArgsMatch(e, cfn, cidx, argc)) return false;
+    if (wantsClosure &&
+        (SlotKind)cfn->jitParamKind[argc] != SLOT_CLOSURE) {
+        e->whyNot = "a direct callee whose trailing argument is not its closure";
+        return false;
+    }
+    if (wantsClosure && calleeReg < 0 && !IS_CLOSURE(calleeVal)) {
+        e->whyNot = "a direct callee that wants a closure it has not got";
+        return false;
+    }
+    SlotKind rk = (SlotKind)cfn->jitReturnKind;
+    ObjClass *rcls = NULL;
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ) {
+        e->whyNot = "callee's return kind not usable";
+        return false;
+    }
+    if (rk == SLOT_INST &&
+        (cfn->jitReturnShape == 0 ||
+         !jaiClassForShape(cfn->jitReturnShape, &rcls) || rcls == NULL)) {
+        e->whyNot = "callee's return class not on record";
+        return false;
+    }
+
+    /* Past here everything is settled and this call is happening: a failure
+     * below is the emitter running out of room, not a decision, so it stops
+     * the compile rather than falling back to the descriptor path onto a
+     * half-written instruction stream. */
+
+    /* Roots before the branch: a `bl` pushes none, and the callee may
+     * allocate -- OP_GET_SLICE builds a fresh list without ever counting as a
+     * heap write. */
+    unsigned callRoots = 0;
+    if (!emitRootFill(e, e->descOffset, &callRoots)) { e->failed = true; return false; }
+    if (callRoots > 0) {
+        unsigned dd = e->descOffset;
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, callRoots, 0));
+        emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+                           dd + (unsigned)offsetof(JitCallDesc, nroots)));
+        emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+        emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
+        emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                           (unsigned)offsetof(JitCallDesc, link)));
+        emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+    }
+
+    unsigned firstArg = valueXReg(e, cidx + 1u - (e->depth - e->valueDepth));
+    for (unsigned i = 0; i < argc; i++) {
+        emit(e, jaiA64MovX(i, firstArg + i));
+    }
+    if (wantsClosure) {
+        if (calleeReg >= 0) emit(e, jaiA64MovX(argc, (unsigned)calleeReg));
+        else emitConst64(e, argc, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
+    }
+    emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)cfn->jitFunc);
+    emit(e, jaiA64Blr(JIT_SCRATCH_D));
+
+    if (callRoots > 0) {
+        unsigned dd = e->descOffset;
+        emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+        emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
+        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                           (unsigned)offsetof(JitCallDesc, link)));
+        emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+    }
+
+    /* Verdict 2 is a pending exception: the interpreter owns it and this call
+     * must not run again. */
+    emit(e, jaiA64SubsXImm(31, 1, 2));
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    /* Anything else -- a bail, or a guard that failed inside the callee --
+     * hands the whole call back. The record is taken with the callee and its
+     * arguments still on the model's stack, which is what the interpreter
+     * expects to find at this offset. */
+    emit(e, jaiA64SubsXImm(31, 1, 0));
+    branchOnDeoptAt(e, JAI_A64_NE, callOff, false);
+
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+    }
+    if (e->depth == 0) { e->failed = true; return false; }
+    e->depth--;                                  /* the callee entry */
+    if (!pushValue(e, rk, cfn->jitReturnShape, rcls)) { e->failed = true; return false; }
+    emit(e, jaiA64MovX(pushReg(e) - 1, 0));
+    /* Deliberately not e->wroteHeap, unlike the descriptor path: this callee
+     * stores nothing and calls nothing, so an interpreted re-run of the whole
+     * caller would repeat no effect. It may still allocate -- OP_GET_SLICE
+     * does, and deliberately does not set the flag either -- and a fresh
+     * object is not an effect anything can see. */
+    return true;
+}
+
+static bool compileBody(Emit *e, ObjClosure *closure);
+static int instructionLength(const Chunk *c, int off);
+
+/* Something inside an inlined body could not be emitted, so the whole compile
+ * is worth retrying with inlining off rather than declining: the same call
+ * through the descriptor still compiles, and a compiled form with a real call
+ * in it beats none at all. A file static for the same reason the Emit buffers
+ * are -- compilation is not reentrant, nothing it calls compiles anything. */
+static bool gInlineFailed;
+
+/* Can this callee's body stand in for the call to it?
+ *
+ * Structural, and answered before anything is emitted, because a half-inlined
+ * body cannot be taken back. The list is short on purpose and each item buys
+ * something specific:
+ *
+ *   no branches      -- so there is no offset map to keep, no join to
+ *                       reconcile, and no fixup that could name one of the
+ *                       callee's offsets in the caller's table;
+ *   one RETURN, last -- so there is one place the result appears;
+ *   locals only in the four opcodes the frame below understands, and only
+ *                       slots this callee actually has;
+ *   globals only where they name one of the two builtins the tier emits
+ *                       inline, so a global VALUE load -- which would bake a
+ *                       JaiEntry from the callee's table and needs its own
+ *                       guard -- never arises;
+ *   nothing that stores -- because a guard inside the inlined body sends the
+ *                       interpreter back to re-execute the whole call, and a
+ *                       store made before it would then happen twice.
+ *
+ * What survives is straight-line arithmetic over registers, which is what the
+ * main walker already speaks -- so it, and not a second one, is what emits
+ * this. `evalA` in spectral is fifteen instructions of exactly this shape. */
+static bool inlinableBody(ObjClosure *callee, unsigned argc,
+                          unsigned *maxSlotOut) {
+    ObjFunction *cfn = callee->fn;
+    const Chunk *c = &cfn->chunk;
+    if (cfn->arity != argc || cfn->defaultCount != 0) return false;
+    if (cfn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
+    if (cfn->upvalueCount != 0) return false;
+    if (c->count <= 0 || c->count > 128) return false;
+
+    unsigned maxSlot = argc;
+    bool sawReturn = false;
+    for (int off = 0; off < c->count;) {
+        uint8_t op = c->code[off];
+        int len = instructionLength(c, off);
+        if (len <= 0) return false;
+        unsigned slot = 0, slot2 = 0;
+        switch (op) {
+        /* The local frame the caller builds understands exactly these. Any
+         * other opcode naming a slot -- a field read off one, a compare
+         * against one, an in-place update -- would read the CALLER's local of
+         * that number, which is a different variable entirely. */
+        case OP_GET_LOCAL:
+        case OP_BIND:
+            slot = jaiReadU16(c->code + off + 1);
+            if (slot > maxSlot) maxSlot = slot;
+            break;
+        case OP_GET_LOCAL2:
+        case OP_ADD_LOCALS:
+            slot  = jaiReadU16(c->code + off + 1);
+            slot2 = jaiReadU16(c->code + off + 3);
+            if (slot > maxSlot) maxSlot = slot;
+            if (slot2 > maxSlot) maxSlot = slot2;
+            break;
+        case OP_GET_GLOBAL: {
+            uint32_t nameIdx = jaiReadU24(c->code + off + 1);
+            Value nv;
+            if (globalNative(callee, nameIdx, &nv) == NULL) return false;
+            ObjNative *nat = AS_NATIVE(nv);
+            const char *nm = nat->name != NULL ? nat->name->chars : "";
+            if (strcmp(nm, "float") != 0 && strcmp(nm, "int") != 0) return false;
+            break;
+        }
+        case OP_CALL:
+            /* The only callee that can be on the stack here is one of the two
+             * builtins above, and the tier emits those as one instruction. */
+            if (c->code[off + 1] != 1) return false;
+            break;
+        case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
+        case OP_FLOORDIV: case OP_MOD: case OP_POW: case OP_NEG:
+        case OP_BAND: case OP_BOR: case OP_BXOR:
+        case OP_SHL: case OP_SHR: case OP_BNOT:
+        case OP_TYPE_GUARD:
+            break;
+        case OP_RETURN:
+            if (off + len != c->count) return false;
+            sawReturn = true;
+            break;
+        default:
+            return false;
+        }
+        off += len;
+    }
+    if (!sawReturn) return false;
+    if (maxSlot > JIT_MAX_SLOTS) return false;
+    *maxSlotOut = maxSlot;
+    return true;
+}
+
+/* Emit the callee's body in place of the call.
+ *
+ * Only the argument entries already on the operand stack are needed: slot 1+i
+ * IS entry cidx+1+i, so nothing is copied in. A slot the body binds pins one
+ * further entry, which stays put underneath everything pushed after it --
+ * sound only because the body is straight-line, so the stack above it is
+ * balanced by the time the result is taken.
+ *
+ * The callee's module must be the caller's. Its body bakes builtins the same
+ * way any compiled body does, and what retires those is the module-version
+ * check at the CALLER's entry, since the callee's own is never run. */
+static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                             unsigned argc, uint32_t callOff) {
+    if (e->noInline) return false;
+    ObjFunction *cfn = callee->fn;
+    if (cfn->module != caller->module) return false;
+    if (e->inlining) return false;             /* one level, no recursion */
+    unsigned cidx = e->depth - argc - 1;
+    unsigned maxSlot = 0;
+    if (!inlinableBody(callee, argc, &maxSlot)) return false;
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] inlining %s\n",
+                cfn->name ? cfn->name->chars : "<anon>");
+    }
+
+    /* Every argument has to be in a register, since that is where the body
+     * will read its parameters from. */
+    for (unsigned i = 0; i < argc; i++) {
+        if (!holdsRegister(e->stack[cidx + 1u + i])) return false;
+    }
+
+    int savedSlot[JIT_MAX_SLOTS + 1];
+    memcpy(savedSlot, e->inlSlot, sizeof savedSlot);
+    for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) e->inlSlot[i] = -1;
+    for (unsigned i = 0; i < argc; i++) e->inlSlot[1u + i] = (int)(cidx + 1u + i);
+
+    e->inlining     = true;
+    e->inlDepth     = cidx + 1u + argc;
+    e->inlPinned    = 0;
+    e->inlValueBase = e->valueDepth;
+    e->inlIp        = callOff;
+
+    /* The callee's own offset map, so its offsets cannot land in the
+     * caller's. Nothing reads it back -- there are no branches -- but
+     * compileBody writes one entry per instruction either way. */
+    int cmap[129], cdepths[129];
+    for (int i = 0; i <= cfn->chunk.count; i++) { cmap[i] = -1; cdepths[i] = -1; }
+    int *savedMap = e->offsetToInst, *savedDepths = e->offsetToDepth;
+    unsigned savedCarry = e->fpCarryCount;
+    uint32_t savedCurOffset = e->curOffset;
+    e->offsetToInst = cmap;
+    e->offsetToDepth = cdepths;
+
+    bool ok = compileBody(e, callee);
+
+    e->offsetToInst = savedMap;
+    e->offsetToDepth = savedDepths;
+    e->fpCarryCount = savedCarry;
+    e->curOffset = savedCurOffset;
+
+    if (!ok || e->failed) {
+        /* Instructions have been written; there is no taking them back. The
+         * whole compile is retried with inlining off, which is the same answer
+         * the register budget already gets. */
+        e->inlining = false;
+        memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
+        gInlineFailed = true;
+        e->failed = true;
+        return false;
+    }
+
+    /* OP_RETURN left the result on top and everything the body pinned beneath
+     * it. Both are read while `inlining` is still set, because that is what
+     * says which bank they are in; only the result's new home belongs to the
+     * caller. */
+    unsigned rres;
+    SlotKind kres;
+    uint32_t rshape;
+    ObjClass *rcls;
+    if (e->depth <= cidx) { e->failed = true; return false; }
+    rshape = e->stackShape[e->depth - 1];
+    rcls   = e->stackClass[e->depth - 1];
+    if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    while (e->depth > cidx) {
+        if (holdsRegister(e->stack[e->depth - 1])) {
+            unsigned r;
+            if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+        } else {
+            e->depth--;
+        }
+    }
+    e->inlining = false;
+    memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
+
+    if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }
+    unsigned dst = pushReg(e) - 1;
+    if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    e->inlined = true;
+    return true;
+}
+
 /* A call to a global function that has itself compiled. Its return kind types
  * the result; the tag that actually comes back is checked, and a surprise
  * deopts to the instruction after the call, since the call has happened. */
-static bool emitGlobalCall(Emit *e, unsigned argc, uint32_t after) {
+static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
+                           uint32_t callOff, uint32_t after) {
     unsigned cidx = e->depth - argc - 1;
     Value cv = e->stackSeen[cidx];
     if (!IS_CLOSURE(cv)) { e->whyNot = "callee vanished"; return false; }
     ObjFunction *cfn = AS_CLOSURE(cv)->fn;
     if (cfn->jitFunc == NULL) { e->whyNot = "callee no longer compiled"; return false; }
+
+    /* Straight to the callee's entry when everything jaiJitEnterFunc would
+     * have checked can be checked here instead. Falling back rather than
+     * declining matters: the descriptor path speaks a much wider language --
+     * any argument kind, any module, a callee that writes -- and a call
+     * through jaiCallValue still beats no compiled loop at all. */
+    {
+        const char *saved = e->whyNot;
+        if (emitDirectCall(e, caller, cfn, cv, -1, cidx, argc, callOff)) {
+            return true;
+        }
+        if (e->failed) return false;   /* it had started emitting */
+        e->whyNot = saved;
+    }
+
     SlotKind rk = (SlotKind)cfn->jitReturnKind;
     uint32_t rshape = cfn->jitReturnShape;
     ObjClass *rcls = NULL;
@@ -1925,13 +2424,116 @@ static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
     }
 }
 
+/* How many entries below `idx` hold a register, which is what names the one
+ * `idx` itself is in. Counted rather than subtracted from the top: a class, a
+ * resolved function, a builtin and `self` occupy no register and can sit
+ * anywhere -- a callee pushed below its own arguments puts one squarely in the
+ * middle, which is exactly the shape an inlined call site has. */
+static unsigned valueIndexOf(const Emit *e, unsigned idx) {
+    unsigned seen = 0;
+    for (unsigned i = 0; i < idx; i++) {
+        if (holdsRegister(e->stack[i])) seen++;
+    }
+    return seen;
+}
+
+static bool pushCopyOfEntry(Emit *e, unsigned idx) {
+    if (idx >= e->depth || !holdsRegister(e->stack[idx])) return false;
+    unsigned vi = valueIndexOf(e, idx);
+    fpSyncOne(e, vi);
+    unsigned src = valueXReg(e, vi);
+    if (!pushValue3(e, e->stack[idx], e->stackShape[idx], e->stackClass[idx],
+                    e->stackSeen[idx], -1)) {
+        return false;
+    }
+    unsigned dst = pushReg(e) - 1;
+    if (dst != src) emit(e, jaiA64MovX(dst, src));
+    return true;
+}
+
+/* The local opcodes of an inlined body, answered against its own frame.
+ *
+ * That frame is the caller's operand stack: a parameter is the argument entry
+ * already sitting there, and a bind pins whatever is on top rather than
+ * copying it anywhere. Reading these through the main switch instead would
+ * read the CALLER's local of the same number, which is a different variable. */
+static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
+    uint8_t op = code[off];
+    unsigned a = jaiReadU16(code + off + 1);
+    if (a > JIT_MAX_SLOTS) return false;
+
+    if (op == OP_BIND) {
+        if (e->inlSlot[a] >= 0) {
+            /* Straight-line code binds each `let` once. A second bind would
+             * have to move the value into the pinned entry's register, and
+             * that register may sit below something live. */
+            e->whyNot = "an inlined body binding a local twice";
+            return false;
+        }
+        /* Pinning is only sound where the value being bound is the ONLY thing
+         * above the region already pinned -- which is what `let x = expr` as a
+         * statement looks like, the expression stack being empty at the start
+         * of one. Two binds from one expression (`let a, b = ..`) would leave
+         * this entry the top for both of them, and the two slots would name
+         * one register: the aliasing mistake this tier keeps making, caught
+         * here by measuring the depth rather than by trusting the shape. */
+        if (e->depth != e->inlDepth + e->inlPinned + 1u) {
+            e->whyNot = "an inlined body binding with an expression under it";
+            return false;
+        }
+        if (!holdsRegister(e->stack[e->depth - 1])) return false;
+        fpSyncOne(e, e->valueDepth - 1);
+        e->inlSlot[a] = (int)(e->depth - 1);
+        e->inlPinned++;
+        return true;
+    }
+
+    if (e->inlSlot[a] < 0) {
+        e->whyNot = "an inlined body reading a local it never bound";
+        return false;
+    }
+    if (op == OP_GET_LOCAL) return pushCopyOfEntry(e, (unsigned)e->inlSlot[a]);
+
+    unsigned b = jaiReadU16(code + off + 3);
+    if (b > JIT_MAX_SLOTS || e->inlSlot[b] < 0) {
+        e->whyNot = "an inlined body reading a local it never bound";
+        return false;
+    }
+    if (op == OP_GET_LOCAL2) {
+        return pushCopyOfEntry(e, (unsigned)e->inlSlot[a]) &&
+               pushCopyOfEntry(e, (unsigned)e->inlSlot[b]);
+    }
+
+    /* OP_ADD_LOCALS */
+    unsigned ia = (unsigned)e->inlSlot[a], ib = (unsigned)e->inlSlot[b];
+    SlotKind k = e->stack[ia];
+    if (k != e->stack[ib] || (k != SLOT_INT && k != SLOT_FLOAT)) return false;
+    unsigned via = valueIndexOf(e, ia), vib = valueIndexOf(e, ib);
+    fpSyncOne(e, via);
+    fpSyncOne(e, vib);
+    unsigned ra = valueXReg(e, via), rb = valueXReg(e, vib);
+    if (!pushValue(e, k, 0, NULL)) return false;
+    unsigned rd = pushReg(e) - 1;
+    if (k == SLOT_FLOAT) {
+        emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
+        emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
+        emit(e, jaiA64FaddD(JIT_FSCRATCH_A, JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+        emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
+    } else {
+        emit(e, jaiA64AddsX(rd, ra, rb));
+        branchOnOverflow(e, 0u, JAI_A64_VS);
+    }
+    return true;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
     int count = fn->chunk.count;
 
-    int start = e->osr ? (int)e->osrTop : 0;
-    int stop  = e->osr ? (int)e->osrEnd : count;
+    /* An inlined body is walked whole; the OSR window belongs to the caller. */
+    int start = (!e->inlining && e->osr) ? (int)e->osrTop : 0;
+    int stop  = (!e->inlining && e->osr) ? (int)e->osrEnd : count;
     bool afterUncond = false;
     for (int off = start; off < stop && !e->failed;) {
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
@@ -1947,6 +2549,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             for (unsigned f = 0; f < e->fixupCount && !joinsHere; f++) {
                 joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
             }
+            /* Inside an inlined body the offsets are the callee's, so a
+             * caller fixup that happens to name the same number is not a join
+             * here at all -- and there are no branches in an inlined body for
+             * one to be. */
+            if (e->inlining) joinsHere = false;
             if (!fpFastOp(op) || joinsHere) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
@@ -1954,6 +2561,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 fpSyncAll(e);
             }
+        }
+
+        /* The four local opcodes an inlined body is allowed, answered against
+         * its own frame -- entries on the caller's operand stack -- before the
+         * main switch can read them as the caller's slot numbers. */
+        if (e->inlining && (op == OP_GET_LOCAL || op == OP_GET_LOCAL2 ||
+                            op == OP_ADD_LOCALS || op == OP_BIND)) {
+            if (!inlineLocalOp(e, code, off)) return false;
+            off += instructionLength(&fn->chunk, off);
+            continue;
+        }
+        if (e->inlining && op == OP_RETURN) {
+            /* The result is on top and stays there; the caller's driver takes
+             * it from the model. */
+            if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) {
+                e->whyNot = "an inlined body returning a value with no register";
+                return false;
+            }
+            fpSyncOne(e, e->valueDepth - 1);
+            break;
         }
 
         switch (op) {
@@ -1972,7 +2599,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->localKind[slot] == SLOT_FLOAT && !e->dynamicLocal[slot] &&
                 fpWorthLoading(e, code, off + 3, stop)) {
                 unsigned idx = e->valueDepth - 1;
-                localInFp(e, slot, fpRegAt(idx));
+                localInFp(e, slot, fpRegAt(e, idx));
                 fpClaim(e, idx);
             } else {
                 unsigned dst = pushReg(e) - 1;
@@ -2021,7 +2648,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!e->fpOff && !e->dynamicLocal[slot] &&
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
                 (e->fpLive & (1u << (e->valueDepth - 1)))) {
-                localOutFp(e, slot, fpRegAt(e->valueDepth - 1));
+                localOutFp(e, slot, fpRegAt(e, e->valueDepth - 1));
             } else {
                 localOut(e, slot, pushReg(e) - 1);
             }
@@ -2041,9 +2668,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka2 == SLOT_FLOAT && !e->dynamicLocal[a] &&
                 !e->dynamicLocal[b] && !e->fpOff) {
                 unsigned idx = e->valueDepth - 1;
-                localInFp(e, a, fpRegAt(idx));
+                localInFp(e, a, fpRegAt(e, idx));
                 localInFp(e, b, JIT_FP_BANK + JIT_MAX_SAVED);
-                emit(e, jaiA64FaddD(fpRegAt(idx), fpRegAt(idx),
+                emit(e, jaiA64FaddD(fpRegAt(e, idx), fpRegAt(e, idx),
                                     JIT_FP_BANK + JIT_MAX_SAVED));
                 fpClaim(e, idx);
                 off += 5;
@@ -2088,8 +2715,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned rx; SlotKind kx;
                 if (!popValueRaw(e, &rx, &kx)) return false;
                 if (!popValueRaw(e, &rx, &kx)) return false;
-                emit(e, jaiA64FaddD(fpRegAt(ia), da, db));
-                localOutFp(e, slot, fpRegAt(ia));
+                emit(e, jaiA64FaddD(fpRegAt(e, ia), da, db));
+                localOutFp(e, slot, fpRegAt(e, ia));
                 off += 3;
                 break;
             }
@@ -2156,8 +2783,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned rx; SlotKind kx;
                 if (!popValueRaw(e, &rx, &kx)) return false;
                 if (!popValueRaw(e, &rx, &kx)) return false;
-                emit(e, jaiA64FmulD(fpRegAt(ia), da, db));
-                localOutFp(e, slot, fpRegAt(ia));
+                emit(e, jaiA64FmulD(fpRegAt(e, ia), da, db));
+                localOutFp(e, slot, fpRegAt(e, ia));
                 off += 3;
                 break;
             }
@@ -2209,8 +2836,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned rx; SlotKind kx;
                 if (!popValueRaw(e, &rx, &kx)) return false;
                 if (!popValueRaw(e, &rx, &kx)) return false;
-                emit(e, jaiA64FsubD(fpRegAt(ia), da, db));
-                localOutFp(e, slot, fpRegAt(ia));
+                emit(e, jaiA64FsubD(fpRegAt(e, ia), da, db));
+                localOutFp(e, slot, fpRegAt(e, ia));
                 off += 3;
                 break;
             }
@@ -2259,7 +2886,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned idx = e->valueDepth - 1;
                 unsigned r2; SlotKind k2;
                 if (!popValueRaw(e, &r2, &k2)) return false;
-                localOutFp(e, slot, fpRegAt(idx));
+                localOutFp(e, slot, fpRegAt(e, idx));
                 off += 3;
                 break;
             }
@@ -2493,7 +3120,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned imm8;
                 if (!e->fpOff && jaiA64FpImm8(d, &imm8)) {
                     unsigned idx = e->valueDepth - 1;
-                    emit(e, jaiA64FmovDImm(fpRegAt(idx), imm8));
+                    emit(e, jaiA64FmovDImm(fpRegAt(e, idx), imm8));
                     fpClaim(e, idx);
                 } else {
                     emitConst64(e, pushReg(e) - 1, bits);
@@ -2629,7 +3256,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValueRaw(e, &rb, &kb)) return false;
                 if (!popValueRaw(e, &ra, &ka)) return false;
                 if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
-                emit(e, jaiA64FmulD(fpRegAt(ia), da, db));
+                emit(e, jaiA64FmulD(fpRegAt(e, ia), da, db));
                 fpClaim(e, ia);
                 off += 1;
                 break;
@@ -2707,7 +3334,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValueRaw(e, &rb, &kb)) return false;
                 if (!popValueRaw(e, &ra, &ka)) return false;
                 if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
-                unsigned dd = fpRegAt(ia);
+                unsigned dd = fpRegAt(e, ia);
                 emit(e, op == OP_ADD ? jaiA64FaddD(dd, da, db)
                      : op == OP_SUB  ? jaiA64FsubD(dd, da, db)
                                      : jaiA64FdivD(dd, da, db));
@@ -2904,7 +3531,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     !e->dynamicLocal[slot] &&
                     fpWorthLoading(e, code, off + 5, stop)) {
                     unsigned idx = e->valueDepth - 1;
-                    localInFp(e, slot, fpRegAt(idx));
+                    localInFp(e, slot, fpRegAt(e, idx));
                     fpClaim(e, idx);
                 } else {
                     unsigned dst = pushReg(e) - 1;
@@ -4035,7 +4662,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * no register -- it is baked into the call sequence. */
             ObjClass *cls = globalClass(closure, nameIdx);
             if (cls != NULL) {
-                if (e->depth >= JIT_MAX_SAVED) return false;
+                if (e->depth >= JIT_MAX_STACK) return false;
                 e->stackShape[e->depth] = cls->shapeId;
                 e->stackClass[e->depth] = cls;
                 e->stackSeen[e->depth]  = NULL_VAL;
@@ -4122,7 +4749,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                             : "callee is not a compiled global function";
                     return false;
                 }
-                if (e->depth >= JIT_MAX_SAVED) return false;
+                if (e->depth >= JIT_MAX_STACK) return false;
                 e->stackShape[e->depth] = 0;
                 e->stackClass[e->depth] = (ObjClass *)(void *)AS_OBJ(nv);
                 e->stackSeen[e->depth]  = nv;
@@ -4131,7 +4758,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 6;
                 break;
             }
-            if (e->depth >= JIT_MAX_SAVED) return false;
+            if (e->depth >= JIT_MAX_STACK) return false;
             e->stackShape[e->depth] = 0;
             /* The stub that writes a deopt record materialises a callee from
              * here, so it has to be the object and not NULL. */
@@ -4243,7 +4870,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (e->depth >= argc + 1u &&
                 e->stack[e->depth - argc - 1] == SLOT_FUNC) {
-                if (!emitGlobalCall(e, argc, (uint32_t)(off + 2))) return false;
+                /* Cheapest first: a body small enough to stand where the call
+                 * is costs neither the frame nor the argument shuffle. */
+                Value cvv = e->stackSeen[e->depth - argc - 1];
+                if (IS_CLOSURE(cvv) &&
+                    inlineGlobalCall(e, fn, AS_CLOSURE(cvv), argc,
+                                     (uint32_t)off)) {
+                    off += 2;
+                    break;
+                }
+                if (e->failed) return false;
+                if (!emitGlobalCall(e, fn, argc, (uint32_t)off,
+                                    (uint32_t)(off + 2))) return false;
                 off += 2;
                 break;
             }
@@ -4306,6 +4944,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
                 ObjFunction *cfn = AS_CLOSURE(cv)->fn;
+                /* The same two things the direct global call checks, and for
+                 * the same reasons: a raw payload is only sound if the callee
+                 * was specialised to that kind and shape, and the caller's
+                 * module-version guard only stands in for the callee's entry
+                 * check if the two were compiled against the same version. */
+                if (!directCallArgsMatch(e, cfn, cidx, argc)) return false;
+                if (fn->module == NULL ||
+                    cfn->jitFuncModuleVersion != fn->module->version) {
+                    e->whyNot = "an indirect callee compiled against an older module";
+                    return false;
+                }
                 if (cfn->jitFunc == NULL || cfn->arity != argc) {
                     e->whyNot = "the closure this calls has not compiled";
                     return false;
@@ -4526,7 +5175,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!emitCallOut(e, argc)) return false;
             } else if (e->depth >= argc + 1u &&
                        e->stack[e->depth - argc - 1] == SLOT_FUNC) {
-                if (!emitGlobalCall(e, argc, (uint32_t)(off + 2))) return false;
+                if (!emitGlobalCall(e, fn, argc, (uint32_t)off,
+                                    (uint32_t)(off + 2))) return false;
             } else {
                 e->whyNot = "tail callee is neither a class nor a compiled function";
                 return false;
@@ -4584,6 +5234,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
     }
     fpSyncAll(e);
+    /* An inlined body's offsets are the callee's; matching them against the
+     * caller's fixups compares two different numbering schemes. There is
+     * nothing to check either way -- it has no branches. */
+    if (e->inlining) return !e->failed;
     /* Nothing may branch to an offset this walk carried a float into: the
      * branch would arrive with that value only in its X register, and the
      * instruction there would read the FP bank. Declining is the safe answer,
@@ -4719,7 +5373,8 @@ static bool eligible(ObjFunction *fn) {
 
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *dynamic, bool *needDynamic,
-                            const bool *nullable, bool *needNullable);
+                            const bool *nullable, bool *needNullable,
+                            bool noInline);
 
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
@@ -4737,7 +5392,15 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         memset(need, 0, sizeof need);
         memset(needNull, 0, sizeof needNull);
         if (compileFuncOnce(closure, slotBase, dynamic, need, nullable,
-                            needNull)) {
+                            needNull, false)) {
+            return true;
+        }
+        /* An inlined body that could not be emitted is not a decline: the
+         * same call through the descriptor still compiles, and a compiled
+         * form with a real call in it beats none at all. */
+        if (gInlineFailed &&
+            compileFuncOnce(closure, slotBase, dynamic, need, nullable,
+                            needNull, true)) {
             return true;
         }
         bool grew = false;
@@ -4756,8 +5419,10 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *dynamic, bool *needDynamic,
-                            const bool *nullable, bool *needNullable) {
+                            const bool *nullable, bool *needNullable,
+                            bool noInline) {
     ObjFunction *fn = closure->fn;
+    gInlineFailed = false;
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] considering %s\n",
@@ -4780,6 +5445,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     e.arity        = fn->arity;
+    e.noInline     = noInline;
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
     e.limitLiteral = -1;
@@ -4794,6 +5460,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
     memcpy(body.nullableLocal, nullable, sizeof body.nullableLocal);
     body.arity        = fn->arity;
+    body.noInline     = noInline;
     /* The measuring pass runs with slot 0 available, purely to find out
      * whether the body reads it; the real pass then drops it if not. */
     body.base         = 0;
@@ -5081,7 +5748,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * still holds whatever it held there. Moving it here rather than
              * before the guard is what keeps the hot path free of it. */
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
-                emit(&e, jaiA64FmovXD(reg0, fpRegAt(valueSeen)));
+                emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
             }
             if (kind == SLOT_MAYBE_INST) {
                 emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
@@ -5340,6 +6007,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     }
     fn->jitArgBase    = (uint8_t)e.base;
     fn->jitArgCount   = (uint8_t)argCount;
+    fn->jitFuncNoWrite = !e.wroteHeap;
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr,
@@ -5696,7 +6364,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
                             (e.usesUpvalues ? 1u : 0u) + valueSeen;
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
-                emit(&e, jaiA64FmovXD(reg0, fpRegAt(valueSeen)));
+                emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
             }
             if (kind == SLOT_MAYBE_INST) {
                 emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
