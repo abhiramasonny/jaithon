@@ -12,6 +12,7 @@
 #include "object.h"
 #include "table.h"
 #include "vm.h"
+#include "jit.h"
 
 #define JAI_GC_DEFAULT_GROW_FACTOR 2.0
 #define JAI_GC_DEFAULT_MIN_HEAP    ((size_t)1 << 20)
@@ -433,6 +434,7 @@ static void markRoots(GCState *g) {
         jaiGCMarkObject((Obj *)uv);
 
     jaiMarkAsciiChars();
+    jaiJitMarkFrames();
 
     markValues(vm.defers.data, vm.defers.count);
     markStrings(vm.modulePath.data, vm.modulePath.count);
