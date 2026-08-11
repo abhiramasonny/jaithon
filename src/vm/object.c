@@ -81,7 +81,7 @@ Obj *jaiAllocateObject(size_t size, ObjType type) {
 
 /* Push `o` as a temporary root, tolerating NULL so that push/pop stay paired
  * in constructors whose arguments are optional. */
-static void pushObjRoot(void *o) {
+static inline void pushObjRoot(void *o) {
     jaiGCPushRoot(o != NULL ? OBJ_VAL(o) : NULL_VAL);
 }
 
@@ -274,32 +274,75 @@ const char *jaiObjTypeName(ObjType t) {
  * three in place, and returns how many items the slice selects. `step` must be
  * nonzero. Clamping |step| to n is safe (a step larger than the sequence can
  * select at most one item) and keeps `start + i * step` from overflowing. */
-static int64_t sliceCount(int64_t n, int64_t *pStart, int64_t *pStop,
-                          int64_t *pStep) {
-    int64_t start = *pStart, stop = *pStop, step = *pStep;
+static inline int64_t sliceCount(int64_t n, int64_t *pStart,
+                                 int64_t *pStop, int64_t *pStep) {
+    int64_t start = *pStart;
+    int64_t stop = *pStop;
+    int64_t step = *pStep;
 
     if (n <= 0) {
         *pStart = 0;
         *pStop = 0;
-        *pStep = (step > 0) ? 1 : -1;
+        *pStep = step > 0 ? 1 : -1;
         return 0;
     }
+
+    if (step == 1) {
+        if (start < 0) start = start < -n ? 0 : start + n;
+        else if (start > n) start = n;
+        if (stop < 0) stop = stop < -n ? 0 : stop + n;
+        else if (stop > n) stop = n;
+
+        const int64_t count = stop > start ? stop - start : 0;
+        *pStart = start;
+        *pStop = stop;
+        *pStep = 1;
+        return count;
+    }
+
+    if (step == -1) {
+        if (start < 0) start = start < -n ? -1 : start + n;
+        else if (start >= n) start = n - 1;
+        if (stop < 0) stop = stop < -n ? -1 : stop + n;
+        else if (stop >= n) stop = n - 1;
+
+        const int64_t count = start > stop ? start - stop : 0;
+        *pStart = start;
+        *pStop = stop;
+        *pStep = -1;
+        return count;
+    }
+
     if (step > n) step = n;
     if (step < -n) step = -n;
 
     int64_t count;
     if (step > 0) {
-        if (start < 0)      start = (start < -n) ? 0 : start + n;
+        if (start < 0) start = start < -n ? 0 : start + n;
         else if (start > n) start = n;
-        if (stop < 0)       stop = (stop < -n) ? 0 : stop + n;
-        else if (stop > n)  stop = n;
-        count = (stop > start) ? (stop - start + step - 1) / step : 0;
+        if (stop < 0) stop = stop < -n ? 0 : stop + n;
+        else if (stop > n) stop = n;
+
+        if (stop > start) {
+            const uint64_t span = (uint64_t)(stop - start);
+            const uint64_t stride = (uint64_t)step;
+            count = (int64_t)(span / stride + (span % stride != 0));
+        } else {
+            count = 0;
+        }
     } else {
-        if (start < 0)        start = (start < -n) ? -1 : start + n;
-        else if (start >= n)  start = n - 1;
-        if (stop < 0)         stop = (stop < -n) ? -1 : stop + n;
-        else if (stop >= n)   stop = n - 1;
-        count = (start > stop) ? (start - stop + (-step) - 1) / (-step) : 0;
+        if (start < 0) start = start < -n ? -1 : start + n;
+        else if (start >= n) start = n - 1;
+        if (stop < 0) stop = stop < -n ? -1 : stop + n;
+        else if (stop >= n) stop = n - 1;
+
+        if (start > stop) {
+            const uint64_t span = (uint64_t)(start - stop);
+            const uint64_t stride = (uint64_t)(-step);
+            count = (int64_t)(span / stride + (span % stride != 0));
+        } else {
+            count = 0;
+        }
     }
 
     *pStart = start;
@@ -334,7 +377,7 @@ static ObjString *allocString(size_t length) {
 
 /* Adds `s` to the intern table. The table may grow, so `s` is rooted across
  * the insertion. */
-static void internString(ObjString *s) {
+static inline void internString(ObjString *s) {
     JAI_STR_INTERNED(s) = true;
     jaiGCPushRoot(OBJ_VAL(s));
     jaiInternTableAdd(s);
@@ -343,16 +386,17 @@ static void internString(ObjString *s) {
 
 ObjString *jaiStringIntern(const char *chars, size_t length) {
     if (length > UINT32_MAX) {
-        jaiThrow(vm.cValueError, "string of %zu bytes exceeds the maximum length",
-                 length);
+        jaiThrow(vm.cValueError,
+                 "string of %zu bytes exceeds the maximum length", length);
         return NULL;
     }
-    uint64_t hash = jaiHashBytes(chars, length);
+
+    const uint64_t hash = jaiHashBytes(chars, length);
     ObjString *found = jaiInternTableFind(chars, length, hash);
     if (found != NULL) return found;
 
     ObjString *s = allocString(length);
-    if (length > 0) memcpy(s->chars, chars, length);
+    if (length != 0) memcpy(s->chars, chars, length);
     s->hash = hash;
     internString(s);
     return s;
@@ -375,7 +419,7 @@ ObjString *jaiStringCanonical(ObjString *s) {
 
 /* Should a run-time string of this length take part in interning at all —
  * both the probe and the insert? */
-static bool runtimeInternable(size_t length) {
+static inline bool runtimeInternable(size_t length) {
     return length <= JAI_INTERN_MAX &&
            jaiInternTableCount() < JAI_INTERN_SOFT_CAP;
 }
@@ -394,8 +438,9 @@ static bool runtimeInternable(size_t length) {
 static ObjString *sAsciiChar[128];
 
 void jaiMarkAsciiChars(void) {
-    for (unsigned i = 0; i < 128; i++) {
-        if (sAsciiChar[i] != NULL) jaiGCMarkObject((Obj *)sAsciiChar[i]);
+    for (unsigned i = 0; i < 128; ++i) {
+        if (sAsciiChar[i] != NULL)
+            jaiGCMarkObject((Obj *)sAsciiChar[i]);
     }
 }
 
@@ -403,36 +448,38 @@ ObjString **jaiAsciiCharTable(void) { return sAsciiChar; }
 
 ObjString *jaiStringChar(unsigned char c) {
     if (c >= 128) return NULL;
-    if (sAsciiChar[c] == NULL) {
-        char one = (char)c;
-        /* Straight to the allocator and the intern table: going through
-         * jaiStringNew would come back here. */
-        uint64_t hash = jaiHashBytes(&one, 1);
-        ObjString *found = jaiInternTableFind(&one, 1, hash);
-        if (found == NULL) {
-            found = allocString(1);
-            found->chars[0] = one;
-            found->hash = hash;
-            internString(found);
-        }
-        sAsciiChar[c] = found;
+
+    ObjString *cached = sAsciiChar[c];
+    if (cached != NULL) return cached;
+
+    const char one = (char)c;
+    const uint64_t hash = jaiHashBytes(&one, 1);
+    cached = jaiInternTableFind(&one, 1, hash);
+
+    if (cached == NULL) {
+        cached = allocString(1);
+        cached->chars[0] = one;
+        cached->hash = hash;
+        internString(cached);
     }
-    return sAsciiChar[c];
+
+    sAsciiChar[c] = cached;
+    return cached;
 }
 
 ObjString *jaiStringNew(const char *chars, size_t length) {
-    if (length == 1 && (unsigned char)chars[0] < 128) {
+    if (length == 1 && (unsigned char)chars[0] < 128)
         return jaiStringChar((unsigned char)chars[0]);
-    }
+
     if (length > UINT32_MAX) {
-        jaiThrow(vm.cValueError, "string of %zu bytes exceeds the maximum length",
-                 length);
+        jaiThrow(vm.cValueError,
+                 "string of %zu bytes exceeds the maximum length", length);
         return NULL;
     }
-    /* Hash only what the intern table is going to look at; a string the
-     * policy excludes may never need one. */
+
     bool insert = false;
     uint64_t hash = 0;
+
     if (runtimeInternable(length)) {
         hash = jaiHashBytes(chars, length);
         ObjString *found = jaiInternTableFind(chars, length, hash);
@@ -441,23 +488,29 @@ ObjString *jaiStringNew(const char *chars, size_t length) {
     }
 
     ObjString *s = allocString(length);
-    if (length > 0) memcpy(s->chars, chars, length);
+    if (length != 0) memcpy(s->chars, chars, length);
     s->hash = hash;
     if (insert) internString(s);
     return s;
 }
 
 ObjString *jaiStringTake(char *chars, size_t length) {
-    /* The buffer cannot become the payload — ObjString stores its bytes in a
-     * flexible array — so ownership means "copy out, then free". */
     if (length > UINT32_MAX) {
         (void)jaiRealloc(chars, length + 1, 0);
-        jaiThrow(vm.cValueError, "string of %zu bytes exceeds the maximum length",
-                 length);
+        jaiThrow(vm.cValueError,
+                 "string of %zu bytes exceeds the maximum length", length);
         return NULL;
     }
+
+    if (length == 1 && (unsigned char)chars[0] < 128) {
+        const unsigned char c = (unsigned char)chars[0];
+        (void)jaiRealloc(chars, length + 1, 0);
+        return jaiStringChar(c);
+    }
+
     bool insert = false;
     uint64_t hash = 0;
+
     if (runtimeInternable(length)) {
         hash = jaiHashBytes(chars, length);
         ObjString *found = jaiInternTableFind(chars, length, hash);
@@ -469,7 +522,7 @@ ObjString *jaiStringTake(char *chars, size_t length) {
     }
 
     ObjString *s = allocString(length);
-    if (length > 0) memcpy(s->chars, chars, length);
+    if (length != 0) memcpy(s->chars, chars, length);
     s->hash = hash;
     (void)jaiRealloc(chars, length + 1, 0);
     if (insert) internString(s);
@@ -481,6 +534,8 @@ ObjString *jaiStringTake(char *chars, size_t length) {
  * 280KB result move 5.6GB. These three give that loop spare capacity to grow
  * into, so it moves each byte once. */
 static ObjStrBuf *strBufNew(size_t capacity) {
+    if (capacity > UINT32_MAX) capacity = UINT32_MAX;
+
     ObjStrBuf *b = (ObjStrBuf *)jaiAllocateObjectRaw(
         sizeof(ObjStrBuf) + capacity + 1, OBJ_STRBUF);
     b->capacity = (uint32_t)capacity;
@@ -553,7 +608,14 @@ ObjString *jaiStringConcat(ObjString *a, ObjString *b) {
     /* No buffer, or somebody else already appended to it. Start one with room
      * to double, so a growing chain stops copying after this. */
     {
-        size_t want = length * 2 < 64 ? 64 : length * 2;
+        size_t want;
+        if (length < 32) {
+            want = 64;
+        } else if (length <= (size_t)UINT32_MAX / 2u) {
+            want = length * 2u;
+        } else {
+            want = length;
+        }
         ObjStrBuf *fresh = strBufNew(want);
         if (fresh != NULL) {
             jaiGCPushRoot(OBJ_VAL(fresh));
@@ -605,10 +667,13 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
      * Over JAI_INTERN_MAX nothing will probe for this, so the hash is left to
      * jaiStringHash. */
     ObjString *s = allocString(total);
-    size_t o = 0;
-    for (int i = 0; i < count; i++) {
-        memcpy(s->chars + o, runs[i], lens[i]);
-        o += lens[i];
+    char *dst = s->chars;
+    for (int i = 0; i < count; ++i) {
+        const uint32_t len = lens[i];
+        if (len != 0) {
+            memcpy(dst, runs[i], len);
+            dst += len;
+        }
     }
     return s;
 }
@@ -629,28 +694,42 @@ ObjString *jaiStringReserve(size_t length) {
 
 ObjString *jaiStringSeal(ObjString *s) {
     if (s == NULL) return NULL;
-    if (!runtimeInternable(s->length)) return s;   /* hash it only on demand */
 
-    uint64_t hash = jaiHashBytes(s->chars, s->length);
+    if (s->length == 1 && (unsigned char)s->chars[0] < 128)
+        return jaiStringChar((unsigned char)s->chars[0]);
+
+    if (!runtimeInternable(s->length))
+        return s;
+
+    const uint64_t hash = jaiHashBytes(s->chars, s->length);
     ObjString *found = jaiInternTableFind(s->chars, s->length, hash);
-    if (found != NULL) return found;     /* the reserved one becomes garbage */
+    if (found != NULL) return found;
+
     s->hash = hash;
     internString(s);
     return s;
 }
 
 uint32_t jaiStringScalarCount(ObjString *s) {
-    if (s->scalars == UINT32_MAX) {
-        s->scalars = (uint32_t)jaiUtf8Length(s->chars, s->length);
+    uint32_t count = s->scalars;
+    if (count == UINT32_MAX) {
+        count = (uint32_t)jaiUtf8Length(s->chars, s->length);
+        s->scalars = count;
     }
-    return s->scalars;
+    return count;
 }
 
 bool jaiStringEqualsSlow(const ObjString *a, const ObjString *b) {
-    if (a->length != b->length) return false;
+    if (a == b) return true;
+
+    const uint32_t length = a->length;
+    if (length != b->length) return false;
+    if (length == 0) return true;
+
     if (jaiStringHash((ObjString *)a) != jaiStringHash((ObjString *)b))
         return false;
-    return memcmp(a->chars, b->chars, a->length) == 0;
+
+    return memcmp(a->chars, b->chars, length) == 0;
 }
 
 /* Byte offset of every scalar in `s`, plus a terminator entry holding the byte
@@ -658,14 +737,21 @@ bool jaiStringEqualsSlow(const ObjString *a, const ObjString *b) {
 static uint32_t *buildScalarOffsets(const ObjString *s, int64_t n) {
     uint32_t *offsets = JAI_ALLOC(uint32_t, (size_t)n + 1);
     const char *p = s->chars;
-    const char *end = s->chars + s->length;
+    const char *const end = p + s->length;
     int64_t i = 0;
+
     while (p < end && i < n) {
         offsets[i++] = (uint32_t)(p - s->chars);
-        int len = 1;
-        (void)jaiUtf8Decode(p, end, &len);   /* len is 1 even for invalid bytes */
-        p += len;
+
+        if ((unsigned char)*p < 0x80u) {
+            ++p;
+        } else {
+            int len = 1;
+            (void)jaiUtf8Decode(p, end, &len);
+            p += len;
+        }
     }
+
     while (i <= n) offsets[i++] = s->length;
     return offsets;
 }
@@ -676,85 +762,109 @@ ObjString *jaiStringSlice(ObjString *s, int64_t start, int64_t stop,
         jaiThrow(vm.cValueError, "slice step cannot be zero");
         return NULL;
     }
-    int64_t n = (int64_t)jaiStringScalarCount(s);
-    int64_t count = sliceCount(n, &start, &stop, &step);
+
+    const int64_t n = (int64_t)jaiStringScalarCount(s);
+    const int64_t count = sliceCount(n, &start, &stop, &step);
     if (count <= 0) return jaiStringIntern("", 0);
 
-    bool ascii = ((int64_t)s->length == n);
+    const bool ascii = (int64_t)s->length == n;
 
-    /* One ASCII character, which is what `s[i]` is. The general path below
-     * builds a scratch buffer and hands it to jaiStringTake, so every
-     * character read allocated. A lexer, a scanner, any loop over text does
-     * this once per byte; `str_search` does it a million times. */
-    if (ascii && step == 1 && count == 1) {
-        unsigned char c = (unsigned char)s->chars[start];
-        if (c < 128) return jaiStringChar(c);
+    if (ascii && step == 1) {
+        if (count == 1)
+            return jaiStringChar((unsigned char)s->chars[start]);
+
+        /* Contiguous ASCII needs no scalar walk or scratch buffer. */
+        jaiGCPushRoot(OBJ_VAL(s));
+        ObjString *result = jaiStringNew(s->chars + start, (size_t)count);
+        jaiGCPopRoot();
+        return result;
     }
 
-    /* A forward slice is bounded by two byte offsets, and a scan finds them
-     * without the whole table. That matters: `text[i]` is a forward slice of
-     * one scalar, a lexer does it once per character, and building an offset
-     * table for the whole string each time makes lexing a file with a single
-     * non-ASCII byte in it quadratic — 68 seconds for a 5 KB source. */
     if (!ascii && step == 1) {
-        const char *end = s->chars + s->length;
-        /* Reach `start` from whichever of the origin and the memo is nearer,
-         * walking either way: UTF-8 is self-synchronising, so stepping back
-         * over continuation bytes costs no more than stepping forwards. A memo
-         * that only ran forwards was quadratic again on any interleaved walk —
-         * a formatter reading a line and then a span inside that line reset it
-         * to zero on every second call. */
+        const char *const end = s->chars + s->length;
         int64_t cursor = (int64_t)s->cursorScalar;
-        int64_t viaMemo = cursor <= start ? start - cursor : cursor - start;
+        const int64_t viaMemo = cursor <= start ? start - cursor : cursor - start;
         int64_t at = 0;
         const char *p = s->chars;
+
         if (viaMemo <= start) {
             at = cursor;
             p = s->chars + s->cursorByte;
         }
-        for (; at < start && p < end; at++) {
-            int len = 1;
-            (void)jaiUtf8Decode(p, end, &len);
-            p += len;
+
+        for (; at < start && p < end; ++at) {
+            if ((unsigned char)*p < 0x80u) {
+                ++p;
+            } else {
+                int len = 1;
+                (void)jaiUtf8Decode(p, end, &len);
+                p += len;
+            }
         }
-        for (; at > start; at--) {
-            do { p--; } while (p > s->chars && ((unsigned char)*p & 0xC0) == 0x80);
+
+        for (; at > start; --at) {
+            do {
+                --p;
+            } while (p > s->chars &&
+                     ((unsigned char)*p & 0xC0u) == 0x80u);
         }
+
         s->cursorScalar = (uint32_t)at;
         s->cursorByte = (uint32_t)(p - s->chars);
 
-        const char *from = p;
-        for (int64_t i = 0; i < count && p < end; i++) {
-            int len = 1;
-            (void)jaiUtf8Decode(p, end, &len);
-            p += len;
+        const char *const from = p;
+        for (int64_t i = 0; i < count && p < end; ++i) {
+            if ((unsigned char)*p < 0x80u) {
+                ++p;
+            } else {
+                int len = 1;
+                (void)jaiUtf8Decode(p, end, &len);
+                p += len;
+            }
         }
-        return jaiStringNew(from, (size_t)(p - from));
+
+        jaiGCPushRoot(OBJ_VAL(s));
+        ObjString *result = jaiStringNew(from, (size_t)(p - from));
+        jaiGCPopRoot();
+        return result;
     }
 
     uint32_t *offsets = ascii ? NULL : buildScalarOffsets(s, n);
 
-    size_t bytes = 0;
-    for (int64_t i = 0, idx = start; i < count; i++, idx += step) {
-        bytes += ascii ? 1u : (size_t)(offsets[idx + 1] - offsets[idx]);
+    size_t bytes;
+    if (ascii) {
+        bytes = (size_t)count;
+    } else {
+        bytes = 0;
+        for (int64_t i = 0, idx = start; i < count; ++i, idx += step)
+            bytes += (size_t)(offsets[idx + 1] - offsets[idx]);
     }
 
-    char *buf = JAI_ALLOC(char, bytes + 1);
-    size_t w = 0;
-    for (int64_t i = 0, idx = start; i < count; i++, idx += step) {
-        if (ascii) {
-            buf[w++] = s->chars[idx];
-        } else {
-            size_t off = offsets[idx];
-            size_t len = (size_t)(offsets[idx + 1] - offsets[idx]);
-            memcpy(buf + w, s->chars + off, len);
-            w += len;
+    jaiGCPushRoot(OBJ_VAL(s));
+    ObjString *result = jaiStringReserve(bytes);
+    jaiGCPopRoot();
+
+    if (result == NULL) {
+        if (offsets != NULL)
+            JAI_FREE_ARRAY(uint32_t, offsets, (size_t)n + 1);
+        return NULL;
+    }
+
+    char *dst = result->chars;
+    if (ascii) {
+        for (int64_t i = 0, idx = start; i < count; ++i, idx += step)
+            *dst++ = s->chars[idx];
+    } else {
+        for (int64_t i = 0, idx = start; i < count; ++i, idx += step) {
+            const size_t off = offsets[idx];
+            const size_t len = (size_t)(offsets[idx + 1] - offsets[idx]);
+            memcpy(dst, s->chars + off, len);
+            dst += len;
         }
+        JAI_FREE_ARRAY(uint32_t, offsets, (size_t)n + 1);
     }
-    buf[bytes] = '\0';
-    if (offsets != NULL) JAI_FREE_ARRAY(uint32_t, offsets, (size_t)n + 1);
 
-    return jaiStringTake(buf, bytes);
+    return jaiStringSeal(result);
 }
 
 /* ------------------------------------------------------------------ */
@@ -763,14 +873,22 @@ ObjString *jaiStringSlice(ObjString *s, int64_t start, int64_t stop,
 
 ObjBytes *jaiBytesNew(const uint8_t *data, size_t length) {
     if (length > UINT32_MAX) {
-        jaiThrow(vm.cValueError, "bytes of %zu bytes exceeds the maximum length",
-                 length);
+        jaiThrow(vm.cValueError,
+                 "bytes of %zu bytes exceeds the maximum length", length);
         return NULL;
     }
-    ObjBytes *b = (ObjBytes *)jaiAllocateObject(sizeof(ObjBytes) + length,
-                                                OBJ_BYTES);
+
+    ObjBytes *b = (ObjBytes *)jaiAllocateObjectRaw(
+        sizeof(ObjBytes) + length, OBJ_BYTES);
     b->length = (uint32_t)length;
-    if (data != NULL && length > 0) memcpy(b->data, data, length);
+
+    if (length != 0) {
+        if (data != NULL)
+            memcpy(b->data, data, length);
+        else
+            memset(b->data, 0, length);
+    }
+
     return b;
 }
 
@@ -780,17 +898,14 @@ ObjBytes *jaiBytesNew(const uint8_t *data, size_t length) {
 
 ObjList *jaiListNew(int initialCapacity) {
     ObjList *list = JAI_ALLOCATE_OBJ(ObjList, OBJ_LIST);
-    list->items = NULL;
-    list->count = 0;
-    list->capacity = 0;
-    list->version = 0;
+    /* jaiAllocateObject already zeroed items/count/capacity/version. */
+
     if (initialCapacity > 0) {
-        /* Reserving allocates, which can collect; the list is not reachable
-         * from any root yet. */
         jaiGCPushRoot(OBJ_VAL(list));
         jaiListReserve(list, initialCapacity);
         jaiGCPopRoot();
     }
+
     return list;
 }
 
@@ -804,11 +919,12 @@ void jaiListReserve(ObjList *list, int capacity) {
 /* Grows to hold one more item, keeping `pending` (the value about to be
  * stored, which may be the only reference to a fresh object) alive. */
 static bool listGrowFor(ObjList *list, Value pending) {
-    if (list->count < list->capacity) return true;
-    if (list->capacity > (INT32_MAX / 2)) {
-        jaiThrow(vm.cRuntimeError, "list cannot grow beyond %d items", INT32_MAX);
+    if (list->capacity > INT32_MAX / 2) {
+        jaiThrow(vm.cRuntimeError,
+                 "list cannot grow beyond %d items", INT32_MAX);
         return false;
     }
+
     jaiGCPushRoot(OBJ_VAL(list));
     jaiGCPushRoot(pending);
     jaiListReserve(list, JAI_GROW_CAP(list->capacity));
@@ -824,7 +940,10 @@ void jaiListTouch(ObjList *list) {
 }
 
 void jaiListPush(ObjList *list, Value v) {
-    if (!listGrowFor(list, v)) return;
+    if (JAI_UNLIKELY(list->count >= list->capacity) &&
+        !listGrowFor(list, v))
+        return;
+
     list->items[list->count++] = v;
     list->version++;
 }
@@ -845,7 +964,10 @@ void jaiListInsert(ObjList *list, int idx, Value v) {
     } else if (idx > list->count) {
         idx = list->count;
     }
-    if (!listGrowFor(list, v)) return;
+    if (JAI_UNLIKELY(list->count >= list->capacity) &&
+        !listGrowFor(list, v))
+        return;
+
     if (idx < list->count) {
         memmove(&list->items[idx + 1], &list->items[idx],
                 sizeof(Value) * (size_t)(list->count - idx));
@@ -872,48 +994,69 @@ Value jaiListRemove(ObjList *list, int idx) {
     return removed;
 }
 
-ObjList *jaiListSlice(ObjList *list, int64_t start, int64_t stop, int64_t step) {
+ObjList *jaiListSlice(ObjList *list, int64_t start,
+                          int64_t stop, int64_t step) {
     if (step == 0) {
         jaiThrow(vm.cValueError, "slice step cannot be zero");
         return NULL;
     }
-    int64_t count = sliceCount((int64_t)list->count, &start, &stop, &step);
+
+    const int64_t count =
+        sliceCount((int64_t)list->count, &start, &stop, &step);
 
     jaiGCPushRoot(OBJ_VAL(list));
     ObjList *out = jaiListNew((int)count);
-    for (int64_t i = 0, idx = start; i < count; i++, idx += step) {
-        out->items[out->count++] = list->items[idx];
+
+    if (count > 0) {
+        if (step == 1) {
+            memcpy(out->items, list->items + start,
+                   sizeof(Value) * (size_t)count);
+            out->count = (int)count;
+        } else {
+            Value *dst = out->items;
+            for (int64_t i = 0, idx = start; i < count; ++i, idx += step)
+                dst[i] = list->items[idx];
+            out->count = (int)count;
+        }
     }
+
     jaiGCPopRoot();
     return out;
 }
 
 ObjList *jaiListConcat(ObjList *a, ObjList *b) {
-    int64_t total = (int64_t)a->count + (int64_t)b->count;
+    const int aCount = a->count;
+    const int bCount = b->count;
+    const int64_t total = (int64_t)aCount + (int64_t)bCount;
+
     if (total > INT32_MAX) {
-        jaiThrow(vm.cRuntimeError, "list cannot grow beyond %d items", INT32_MAX);
+        jaiThrow(vm.cRuntimeError,
+                 "list cannot grow beyond %d items", INT32_MAX);
         return NULL;
     }
+
     jaiGCPushRoot(OBJ_VAL(a));
     jaiGCPushRoot(OBJ_VAL(b));
     ObjList *out = jaiListNew((int)total);
-    if (a->count > 0) {
-        memcpy(out->items, a->items, sizeof(Value) * (size_t)a->count);
-    }
-    if (b->count > 0) {
-        memcpy(out->items + a->count, b->items, sizeof(Value) * (size_t)b->count);
-    }
+
+    if (aCount != 0)
+        memcpy(out->items, a->items, sizeof(Value) * (size_t)aCount);
+
+    if (bCount != 0)
+        memcpy(out->items + aCount, b->items,
+               sizeof(Value) * (size_t)bCount);
+
     out->count = (int)total;
     jaiGCPopRoots(2);
     return out;
 }
 
 bool jaiNormalizeIndex(int64_t raw, int length, int *out) {
-    if (raw < 0) {
-        if (raw < -(int64_t)length) return false;   /* also guards INT64_MIN */
-        raw += length;
-    }
-    if (raw >= (int64_t)length) return false;
+    if (raw < 0) raw += (int64_t)length;
+
+    if ((uint64_t)raw >= (uint64_t)(unsigned)length)
+        return false;
+
     *out = (int)raw;
     return true;
 }
@@ -924,15 +1067,21 @@ bool jaiNormalizeIndex(int64_t raw, int length, int *out) {
 
 ObjTuple *jaiTupleNew(const Value *items, int count) {
     if (count < 0) count = 0;
-    ObjTuple *t = (ObjTuple *)jaiAllocateObject(
+
+    ObjTuple *t = (ObjTuple *)jaiAllocateObjectRaw(
         sizeof(ObjTuple) + sizeof(Value) * (size_t)count, OBJ_TUPLE);
     t->count = (uint32_t)count;
-    t->hash = 0;                    /* computed lazily by jaiValueHash */
-    if (items != NULL && count > 0) {
-        memcpy(t->items, items, sizeof(Value) * (size_t)count);
-    } else {
-        for (int i = 0; i < count; i++) t->items[i] = NULL_VAL;
+    t->hash = 0;
+
+    if (count != 0) {
+        if (items != NULL) {
+            memcpy(t->items, items, sizeof(Value) * (size_t)count);
+        } else {
+            for (int i = 0; i < count; ++i)
+                t->items[i] = NULL_VAL;
+        }
     }
+
     return t;
 }
 
@@ -952,14 +1101,15 @@ ObjDict *jaiDictNew(void) {
  * not a program's mistake; it asserts. So the rejection lives here instead, on
  * the two functions every dict write and set insertion funnels through, and the
  * hash is carried down so a user `__hash__` is not run a second time. */
-static bool keyHash(Value key, const char *role, uint64_t *hash) {
-    if (IS_NULL(key)) {
+static inline bool keyHash(Value key, const char *role, uint64_t *hash) {
+    if (IS_NULL(key))
         return jaiThrow(vm.cTypeError, "a %s cannot be null", role);
-    }
+
     bool ok = true;
     *hash = jaiValueHashFast(key, &ok);
     if (ok) return true;
-    if (vm.hasException) return false;      /* a user __hash__ raised */
+    if (vm.hasException) return false;
+
     return jaiThrow(vm.cTypeError, "unhashable type: '%s'",
                     jaiTypeNameStatic(key));
 }
@@ -985,11 +1135,14 @@ static ObjList *dictColumn(ObjDict *d, bool wantValues) {
     ObjList *out = jaiListNew(d->table.count);
     jaiGCPushRoot(OBJ_VAL(out));
 
-    int i = 0;
-    Value k, v;
-    while (jaiTableNext(&d->table, &i, &k, &v)) {
-        jaiListPush(out, wantValues ? v : k);
-    }
+    int slot = 0;
+    int count = 0;
+    Value key, value;
+
+    while (jaiTableNext(&d->table, &slot, &key, &value))
+        out->items[count++] = wantValues ? value : key;
+
+    out->count = count;
     jaiGCPopRoots(2);
     return out;
 }
@@ -1002,13 +1155,17 @@ ObjList *jaiDictItems(ObjDict *d) {
     ObjList *out = jaiListNew(d->table.count);
     jaiGCPushRoot(OBJ_VAL(out));
 
-    int i = 0;
-    Value k, v;
-    while (jaiTableNext(&d->table, &i, &k, &v)) {
-        Value pair[2] = {k, v};
-        ObjTuple *t = jaiTupleNew(pair, 2);
-        jaiListPush(out, OBJ_VAL(t));
+    int slot = 0;
+    int count = 0;
+    Value key, value;
+
+    while (jaiTableNext(&d->table, &slot, &key, &value)) {
+        Value pair[2] = {key, value};
+        ObjTuple *tuple = jaiTupleNew(pair, 2);
+        out->items[count++] = OBJ_VAL(tuple);
+        out->count = count;  /* tuple is reachable before the next allocation */
     }
+
     jaiGCPopRoots(2);
     return out;
 }
@@ -1049,27 +1206,44 @@ ObjRange *jaiRangeNew(int64_t start, int64_t stop, int64_t step,
 }
 
 int64_t jaiRangeLength(ObjRange *r) {
-    if (r->step == 0) return 0;
+    const int64_t step = r->step;
+    if (step == 0) return 0;
 
-    /* Unsigned span arithmetic: stop - start can exceed INT64_MAX. */
-    uint64_t span, stride;
-    if (r->step > 0) {
+    uint64_t span;
+
+    if (step > 0) {
         if (r->start > r->stop) return 0;
         span = (uint64_t)r->stop - (uint64_t)r->start;
-        stride = (uint64_t)r->step;
     } else {
         if (r->start < r->stop) return 0;
         span = (uint64_t)r->start - (uint64_t)r->stop;
-        stride = 0u - (uint64_t)r->step;   /* |step|, correct for INT64_MIN */
-    }
-    if (span == 0) return r->inclusive ? 1 : 0;
-    if (r->inclusive) {
-        if (span == UINT64_MAX) return INT64_MAX;
-        span += 1;
     }
 
-    uint64_t n = (span + stride - 1) / stride;
-    return (n > (uint64_t)INT64_MAX) ? INT64_MAX : (int64_t)n;
+    if (span == 0) return r->inclusive ? 1 : 0;
+
+    /* Unit-stride ranges are by far the common case and need no division. */
+    if (step == 1 || step == -1) {
+        uint64_t n = span;
+        if (r->inclusive) {
+            if (n == UINT64_MAX) return INT64_MAX;
+            ++n;
+        }
+        return n > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)n;
+    }
+
+    const uint64_t stride =
+        step > 0 ? (uint64_t)step : 0u - (uint64_t)step;
+
+    uint64_t n;
+    if (r->inclusive) {
+        /* floor(span / stride) + 1 avoids span+1 overflow. */
+        n = span / stride + 1u;
+    } else {
+        /* ceil(span / stride), written overflow-free. */
+        n = span / stride + (span % stride != 0);
+    }
+
+    return n > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1078,36 +1252,7 @@ int64_t jaiRangeLength(ObjRange *r) {
 
 ObjFunction *jaiFunctionNew(void) {
     ObjFunction *fn = JAI_ALLOCATE_OBJ(ObjFunction, OBJ_FUNCTION);
-    fn->name = NULL;
-    fn->qualifiedName = NULL;
-    fn->arity = 0;
-    fn->defaultCount = 0;
-    fn->flags = 0;
-    fn->entryCount = 0;
-    fn->jitCode = NULL;
-    fn->jitKind = 0;
-    fn->jitRefused = false;
-    fn->jitFunc = NULL;
-    fn->osrCount = 0;
-    fn->osrRefused = false;
-    fn->osrAttempts = 0;
-    fn->jitAttempts = 0;
-    fn->jitModuleVersion = 0;
-    fn->tickCount = 0;
-    fn->jitLoop = NULL;
-    fn->jitLoopExit = 0;
-    fn->jitLoopTop = 0;
-    fn->jitLoopLimit = 0;
-    fn->jitLoopKind = 0;
-    fn->maxSlots = 0;
-    fn->upvalueCount = 0;
-    fn->paramNames = NULL;
-    fn->paramCount = 0;
-    fn->exceptions = NULL;
-    fn->exceptionCount = 0;
-    fn->defaultOffsets = NULL;
-    fn->module = NULL;
-    fn->owner = NULL;
+    /* All scalar/pointer bookkeeping starts at zero/NULL by allocator contract. */
     jaiChunkInit(&fn->chunk, -1);
     return fn;
 }
@@ -1121,62 +1266,78 @@ ObjUpvalue *jaiUpvalueNew(Value *slot) {
     ObjUpvalue *up = JAI_ALLOCATE_OBJ(ObjUpvalue, OBJ_UPVALUE);
     up->location = slot;
     up->closed = NULL_VAL;
-    up->next = NULL;
     return up;
 }
 
 ObjUpvalue *jaiUpvalueClosed(Value v) {
-    jaiGCPushRoot(v);
-    ObjUpvalue *u = JAI_ALLOCATE_OBJ(ObjUpvalue, OBJ_UPVALUE);
-    jaiGCPopRoot();
-    u->closed = v;
-    u->location = &u->closed;
-    u->next = NULL;      /* never on vm.openUpvalues: there is nothing to close */
-    return u;
+    const bool root = IS_OBJ(v);
+    if (root) jaiGCPushRoot(v);
+
+    ObjUpvalue *up = JAI_ALLOCATE_OBJ(ObjUpvalue, OBJ_UPVALUE);
+
+    if (root) jaiGCPopRoot();
+
+    up->closed = v;
+    up->location = &up->closed;
+    return up;
 }
 
 ObjClosure *jaiClosureNew(ObjFunction *fn) {
-    int n = (fn == NULL) ? 0 : (int)fn->upvalueCount;
+    const int count = fn == NULL ? 0 : (int)fn->upvalueCount;
 
     pushObjRoot(fn);
     ObjUpvalue **upvalues = NULL;
-    if (n > 0) {
-        upvalues = JAI_ALLOC(ObjUpvalue *, n);
-        for (int i = 0; i < n; i++) upvalues[i] = NULL;
-    }
-    ObjClosure *c = JAI_ALLOCATE_OBJ(ObjClosure, OBJ_CLOSURE);
+    if (count > 0)
+        upvalues = JAI_ALLOC_ZEROED(ObjUpvalue *, count);
+
+    ObjClosure *closure = JAI_ALLOCATE_OBJ(ObjClosure, OBJ_CLOSURE);
     jaiGCPopRoot();
 
-    c->fn = fn;
-    c->upvalues = upvalues;
-    c->upvalueCount = n;
-    return c;
+    closure->fn = fn;
+    closure->upvalues = upvalues;
+    closure->upvalueCount = count;
+    return closure;
 }
 
-ObjNative *jaiNativeNew(JaiNativeFn fn, const char *name, int minArity,
-                        int maxArity, const char *const *paramNames) {
+ObjNative *jaiNativeNew(JaiNativeFn fn, const char *name,
+                        int minArity, int maxArity,
+                        const char *const *paramNames) {
     ObjString *interned = jaiStringInternC(name);
     pushObjRoot(interned);
-    ObjNative *n = JAI_ALLOCATE_OBJ(ObjNative, OBJ_NATIVE);
+    ObjNative *native = JAI_ALLOCATE_OBJ(ObjNative, OBJ_NATIVE);
     jaiGCPopRoot();
 
-    n->fn = fn;
-    n->name = interned;
-    n->minArity = (int8_t)(minArity < -128 ? -128 : (minArity > 127 ? 127 : minArity));
-    n->maxArity = (int8_t)(maxArity < -128 ? -128 : (maxArity > 127 ? 127 : maxArity));
-    n->paramNames = paramNames;
-    return n;
+    native->fn = fn;
+    native->name = interned;
+    native->minArity = (int8_t)(minArity < -128 ? -128 :
+                                 (minArity > 127 ? 127 : minArity));
+    native->maxArity = (int8_t)(maxArity < -128 ? -128 :
+                                 (maxArity > 127 ? 127 : maxArity));
+    native->paramNames = paramNames;
+    return native;
 }
 
 ObjBound *jaiBoundNew(Value receiver, Value method) {
-    jaiGCPushRoot(receiver);
-    jaiGCPushRoot(method);
-    ObjBound *b = JAI_ALLOCATE_OBJ(ObjBound, OBJ_BOUND);
-    jaiGCPopRoots(2);
+    const bool rootReceiver = IS_OBJ(receiver);
+    const bool rootMethod = IS_OBJ(method);
+    int roots = 0;
 
-    b->receiver = receiver;
-    b->method = method;
-    return b;
+    if (rootReceiver) {
+        jaiGCPushRoot(receiver);
+        ++roots;
+    }
+    if (rootMethod) {
+        jaiGCPushRoot(method);
+        ++roots;
+    }
+
+    ObjBound *bound = JAI_ALLOCATE_OBJ(ObjBound, OBJ_BOUND);
+
+    if (roots != 0) jaiGCPopRoots(roots);
+
+    bound->receiver = receiver;
+    bound->method = method;
+    return bound;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1197,10 +1358,12 @@ uint32_t jaiFreshShapeId(void) {
  * that operator dispatch never touches a hash table. */
 typedef struct {
     const char *name;
+    uint8_t     length;
     size_t      offset;       /* of the Value field inside ObjClass */
 } DunderEntry;
 
-#define DUNDER(field, text) {(text), offsetof(ObjClass, field)}
+#define DUNDER(field, text) \
+    {(text), (uint8_t)(sizeof(text) - 1u), offsetof(ObjClass, field)}
 
 static const DunderEntry kDunders[] = {
     DUNDER(dunderStr,      "__str__"),
@@ -1226,15 +1389,8 @@ static const DunderEntry kDunders[] = {
 
 #define DUNDER_COUNT ((int)(sizeof(kDunders) / sizeof(kDunders[0])))
 
-static void setDunderField(ObjClass *c, size_t offset, Value v) {
-    void *p = (char *)c + offset;
-    *(Value *)p = v;
-}
-
-static bool nameIs(const ObjString *name, const char *literal) {
-    size_t len = strlen(literal);
-    return name != NULL && name->length == len &&
-           memcmp(name->chars, literal, len) == 0;
+static inline void setDunderField(ObjClass *c, size_t offset, Value v) {
+    memcpy((char *)c + offset, &v, sizeof v);
 }
 
 ObjClass *jaiClassNew(ObjString *name, ObjClass *superclass) {
@@ -1244,24 +1400,19 @@ ObjClass *jaiClassNew(ObjString *name, ObjClass *superclass) {
     jaiGCPopRoots(2);
 
     c->name = name;
-    c->qualifiedName = name;      /* refined by the code generator if nested */
+    c->qualifiedName = name;
     c->superclass = superclass;
-    c->shapeId = nextShapeId++;
-    if (nextShapeId == 0) nextShapeId = 1;   /* 0 is reserved */
-    c->fields = NULL;
-    c->fieldCount = 0;
+    c->shapeId = jaiFreshShapeId();
     jaiTableInit(&c->methods);
     jaiTableInit(&c->statics);
     jaiTableInit(&c->getters);
     jaiTableInit(&c->setters);
     jaiTableInit(&c->restricted);
-    c->traits = NULL;
-    c->traitCount = 0;
     c->initializer = NULL_VAL;
-    c->isAbstract = false;
-    for (int i = 0; i < DUNDER_COUNT; i++) {
+
+    for (int i = 0; i < DUNDER_COUNT; ++i)
         setDunderField(c, kDunders[i].offset, NULL_VAL);
-    }
+
     return c;
 }
 
@@ -1269,94 +1420,111 @@ void jaiClassInherit(ObjClass *sub, ObjClass *super) {
     if (sub == NULL || super == NULL) return;
     sub->superclass = super;
 
-    /* Parent fields keep their slot numbers and come first, so an inline cache
-     * compiled against the parent stays valid for instances of the subclass. */
-    uint16_t ownCount = sub->fieldCount;
-    FieldInfo *own = sub->fields;
-    uint32_t wide = (uint32_t)super->fieldCount + ownCount;
+    const uint16_t superCount = super->fieldCount;
+    const uint16_t ownCount = sub->fieldCount;
+    FieldInfo *const own = sub->fields;
+    const uint32_t wide = (uint32_t)superCount + ownCount;
+
     if (wide > UINT16_MAX) {
-        jaiThrow(vm.cRuntimeError, "class '%s' would have %u fields, the limit is %u",
-                 (sub->name != NULL) ? sub->name->chars : "?", wide, UINT16_MAX);
+        jaiThrow(vm.cRuntimeError,
+                 "class '%s' would have %u fields, the limit is %u",
+                 sub->name != NULL ? sub->name->chars : "?",
+                 wide, UINT16_MAX);
         return;
     }
-    uint16_t total = (uint16_t)wide;
+
+    const uint16_t total = (uint16_t)wide;
     FieldInfo *merged = NULL;
-    if (total > 0) {
+
+    if (total != 0) {
         merged = JAI_ALLOC(FieldInfo, total);
-        for (uint16_t i = 0; i < super->fieldCount; i++) {
-            merged[i] = super->fields[i];
-        }
-        for (uint16_t i = 0; i < ownCount; i++) {
-            merged[super->fieldCount + i] = own[i];
-            merged[super->fieldCount + i].slot = (uint16_t)(super->fieldCount + i);
+
+        if (superCount != 0)
+            memcpy(merged, super->fields,
+                   sizeof(FieldInfo) * (size_t)superCount);
+
+        if (ownCount != 0) {
+            memcpy(merged + superCount, own,
+                   sizeof(FieldInfo) * (size_t)ownCount);
+
+            for (uint16_t i = 0; i < ownCount; ++i)
+                merged[superCount + i].slot = (uint16_t)(superCount + i);
         }
     }
+
     JAI_FREE_ARRAY(FieldInfo, own, ownCount);
     sub->fields = merged;
     sub->fieldCount = total;
 
-    /* Copy first, so members the subclass declares afterwards overwrite the
-     * inherited entries. */
     jaiTableAddAll(&super->methods, &sub->methods);
     jaiTableAddAll(&super->statics, &sub->statics);
     jaiTableAddAll(&super->getters, &sub->getters);
     jaiTableAddAll(&super->setters, &sub->setters);
-    /* Visibility travels with the method it describes; an override then
-     * rewrites or clears the entry from jaiClassAddMethod. */
     jaiTableAddAll(&super->restricted, &sub->restricted);
 
-    if (IS_NULL(sub->initializer)) sub->initializer = super->initializer;
-    jaiClassRefreshDunders(sub);
+    /* Inheritance runs before the subclass declares its own methods, so the
+     * fixed dunder cache can be copied directly instead of re-interning and
+     * probing every dunder name. Later jaiClassAddMethod calls overwrite the
+     * individual slots when the subclass declares an override. */
+    for (int i = 0; i < DUNDER_COUNT; ++i) {
+        Value inherited;
+        memcpy(&inherited,
+            (const char *)super + kDunders[i].offset,
+            sizeof inherited);
+        setDunderField(sub, kDunders[i].offset, inherited);
+    }
+
+    if (IS_NULL(sub->initializer))
+        sub->initializer = super->initializer;
 }
 
 void jaiClassAddMethod(ObjClass *c, ObjString *name, Value method,
                        Visibility vis, uint32_t flags) {
     JaiTable *target;
-    if (flags & FN_GETTER)      target = &c->getters;
+    if (flags & FN_GETTER) target = &c->getters;
     else if (flags & FN_SETTER) target = &c->setters;
     else if (flags & FN_STATIC) target = &c->statics;
-    else                        target = &c->methods;
+    else target = &c->methods;
 
-    /* A dunder is the object protocol, not part of the class's surface: the
-     * VM calls it on behalf of `print`, `==`, `for`, and the rest, from
-     * wherever the operator was written. Recording `fn __str__` — which the
-     * spec's own example leaves unmarked, i.e. private — as restricted would
-     * make printing an instance from outside its class raise. */
-    bool isDunder = name != NULL && name->length > 4 &&
-                    memcmp(name->chars, "__", 2) == 0 &&
-                    memcmp(name->chars + name->length - 2, "__", 2) == 0;
+    const uint32_t nameLength = name != NULL ? name->length : 0;
+    const bool isDunder =
+        name != NULL && nameLength > 4 &&
+        name->chars[0] == '_' && name->chars[1] == '_' &&
+        name->chars[nameLength - 2] == '_' &&
+        name->chars[nameLength - 1] == '_';
 
     jaiGCPushRoot(OBJ_VAL(c));
     jaiGCPushRoot(method);
     pushObjRoot(name);
     (void)jaiTableSetInterned(target, name, method);
+
     if (vis == VIS_PUBLIC || isDunder) {
-        /* An override may widen: the inherited entry must not outlive it. */
-        if (c->restricted.count > 0) {
+        if (c->restricted.count > 0)
             (void)jaiTableDelete(&c->restricted, OBJ_VAL(name));
-        }
     } else {
-        /* `c` is the declaring class by construction: a class only adds a
-         * method it declares, and jaiClassInherit copies the parent's entries
-         * — shapeId and all — before any of them run. */
-        (void)jaiTableSetInterned(&c->restricted, name,
-                                  INT_VAL((int64_t)vis |
-                                          ((int64_t)(flags & 0xFFFFu) << 8) |
-                                          ((int64_t)c->shapeId << 24)));
+        (void)jaiTableSetInterned(
+            &c->restricted, name,
+            INT_VAL((int64_t)vis |
+                    ((int64_t)(flags & 0xFFFFu) << 8) |
+                    ((int64_t)c->shapeId << 24)));
     }
+
     jaiGCPopRoots(3);
 
     if (target != &c->methods) return;
 
-    if ((flags & FN_INIT) || nameIs(name, "init")) {
+    if ((flags & FN_INIT) ||
+        (nameLength == 4 && memcmp(name->chars, "init", 4) == 0)) {
         c->initializer = method;
         return;
     }
-    for (int i = 0; i < DUNDER_COUNT; i++) {
-        if (nameIs(name, kDunders[i].name)) {
-            setDunderField(c, kDunders[i].offset, method);
-            return;
-        }
+
+    for (int i = 0; i < DUNDER_COUNT; ++i) {
+        const DunderEntry *const dunder = kDunders + i;
+        if (nameLength != dunder->length) continue;
+        if (memcmp(name->chars, dunder->name, dunder->length) != 0) continue;
+        setDunderField(c, dunder->offset, method);
+        return;
     }
 }
 
@@ -1395,10 +1563,26 @@ int jaiClassFieldSlot(ObjClass *c, ObjString *name) {
 
 const FieldInfo *jaiClassFieldInfo(ObjClass *c, ObjString *name) {
     if (c == NULL || name == NULL) return NULL;
-    for (uint16_t i = 0; i < c->fieldCount; i++) {
-        const FieldInfo *f = &c->fields[i];
-        if (f->name == name || jaiStringEquals(f->name, name)) return f;
+
+    const uint16_t count = c->fieldCount;
+    const FieldInfo *const fields = c->fields;
+
+    /* Compiler/deserializer names are canonical. For an interned lookup name,
+     * equal field names must therefore be pointer-identical. */
+    if (JAI_STR_INTERNED(name)) {
+        for (uint16_t i = 0; i < count; ++i) {
+            if (fields[i].name == name)
+                return fields + i;
+        }
+        return NULL;
     }
+
+    for (uint16_t i = 0; i < count; ++i) {
+        const FieldInfo *const field = fields + i;
+        if (field->name == name || jaiStringEquals(field->name, name))
+            return field;
+    }
+
     return NULL;
 }
 
@@ -1460,15 +1644,13 @@ void jaiClassRefreshDunders(ObjClass *c) {
 
 ObjTrait *jaiTraitNew(ObjString *name) {
     pushObjRoot(name);
-    ObjTrait *t = JAI_ALLOCATE_OBJ(ObjTrait, OBJ_TRAIT);
+    ObjTrait *trait = JAI_ALLOCATE_OBJ(ObjTrait, OBJ_TRAIT);
     jaiGCPopRoot();
 
-    t->name = name;
-    jaiTableInit(&t->required);
-    jaiTableInit(&t->defaults);
-    t->supers = NULL;
-    t->superCount = 0;
-    return t;
+    trait->name = name;
+    jaiTableInit(&trait->required);
+    jaiTableInit(&trait->defaults);
+    return trait;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1476,16 +1658,20 @@ ObjTrait *jaiTraitNew(ObjString *name) {
 /* ------------------------------------------------------------------ */
 
 ObjInstance *jaiInstanceNew(ObjClass *klass) {
-    uint16_t n = (klass == NULL) ? 0 : klass->fieldCount;
+    const uint16_t count = klass == NULL ? 0 : klass->fieldCount;
 
     pushObjRoot(klass);
-    ObjInstance *inst = (ObjInstance *)jaiAllocateObject(
-        sizeof(ObjInstance) + sizeof(Value) * (size_t)n, OBJ_INSTANCE);
+    ObjInstance *inst = (ObjInstance *)jaiAllocateObjectRaw(
+        sizeof(ObjInstance) + sizeof(Value) * (size_t)count,
+        OBJ_INSTANCE);
     jaiGCPopRoot();
 
     inst->klass = klass;
-    inst->fieldCount = n;
-    for (uint16_t i = 0; i < n; i++) inst->fields[i] = NULL_VAL;
+    inst->fieldCount = count;
+
+    for (uint16_t i = 0; i < count; ++i)
+        inst->fields[i] = NULL_VAL;
+
     return inst;
 }
 
@@ -1499,8 +1685,6 @@ ObjEnum *jaiEnumNew(ObjString *name) {
     jaiGCPopRoot();
 
     e->name = name;
-    e->variants = NULL;
-    e->variantCount = 0;
     jaiTableInit(&e->methods);
     e->shapeId = jaiFreshShapeId();
     return e;
@@ -1508,31 +1692,40 @@ ObjEnum *jaiEnumNew(ObjString *name) {
 
 ObjEnumCtor *jaiEnumCtorNew(ObjEnum *e, uint16_t tag) {
     pushObjRoot(e);
-    ObjEnumCtor *c = JAI_ALLOCATE_OBJ(ObjEnumCtor, OBJ_ENUM_CTOR);
+    ObjEnumCtor *ctor = JAI_ALLOCATE_OBJ(ObjEnumCtor, OBJ_ENUM_CTOR);
     jaiGCPopRoot();
 
-    c->type = e;
-    c->tag = tag;
-    return c;
+    ctor->type = e;
+    ctor->tag = tag;
+    return ctor;
 }
 
-ObjEnumVal *jaiEnumValNew(ObjEnum *e, uint16_t tag, const Value *payload,
-                          int count) {
+ObjEnumVal *jaiEnumValNew(ObjEnum *e, uint16_t tag,
+                          const Value *payload, int count) {
     if (count < 0) count = 0;
     if (count > 255) count = 255;
 
     pushObjRoot(e);
-    ObjEnumVal *ev = (ObjEnumVal *)jaiAllocateObject(
-        sizeof(ObjEnumVal) + sizeof(Value) * (size_t)count, OBJ_ENUM_VAL);
+    ObjEnumVal *value = (ObjEnumVal *)jaiAllocateObjectRaw(
+        sizeof(ObjEnumVal) + sizeof(Value) * (size_t)count,
+        OBJ_ENUM_VAL);
     jaiGCPopRoot();
 
-    ev->type = e;
-    ev->tag = tag;
-    ev->count = (uint8_t)count;
-    for (int i = 0; i < count; i++) {
-        ev->payload[i] = (payload != NULL) ? payload[i] : NULL_VAL;
+    value->type = e;
+    value->tag = tag;
+    value->count = (uint8_t)count;
+
+    if (count != 0) {
+        if (payload != NULL) {
+            memcpy(value->payload, payload,
+                   sizeof(Value) * (size_t)count);
+        } else {
+            for (int i = 0; i < count; ++i)
+                value->payload[i] = NULL_VAL;
+        }
     }
-    return ev;
+
+    return value;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1542,18 +1735,16 @@ ObjEnumVal *jaiEnumValNew(ObjEnum *e, uint16_t tag, const Value *payload,
 ObjModule *jaiModuleNew(ObjString *name, ObjString *path) {
     pushObjRoot(name);
     pushObjRoot(path);
-    ObjModule *m = JAI_ALLOCATE_OBJ(ObjModule, OBJ_MODULE);
+    ObjModule *module = JAI_ALLOCATE_OBJ(ObjModule, OBJ_MODULE);
     jaiGCPopRoots(2);
 
-    m->name = name;
-    m->path = path;
-    jaiTableInit(&m->globals);
-    jaiTableInit(&m->exports);
-    m->version = 0;
-    m->state = MOD_UNLOADED;
-    m->body = NULL;
-    m->sourceFileId = -1;
-    return m;
+    module->name = name;
+    module->path = path;
+    jaiTableInit(&module->globals);
+    jaiTableInit(&module->exports);
+    module->state = MOD_UNLOADED;
+    module->sourceFileId = -1;
+    return module;
 }
 
 bool jaiModuleGet(ObjModule *m, ObjString *name, Value *out) {
@@ -1580,81 +1771,84 @@ bool jaiModuleIsExported(ObjModule *m, ObjString *name) {
 
 /* Interned dunder names are cached on the VM at startup; fall back to
  * interning on demand so object.c works before jaiVMInit has run. */
-static ObjString *iterName(void) {
+static inline ObjString *iterName(void) {
     return vm.strIter != NULL ? vm.strIter : jaiStringInternC("__iter__");
 }
 
-static ObjString *nextName(void) {
+static inline ObjString *nextName(void) {
     return vm.strNext != NULL ? vm.strNext : jaiStringInternC("__next__");
 }
 
 /* The trait spellings of the same two methods (std.core `Iterable`/`Iterator`).
  * They are ordinary names, so there is no cached intern for them. */
-static ObjString *traitIterName(void) { return jaiStringInternC("iter"); }
-static ObjString *traitNextName(void) { return jaiStringInternC("next"); }
+static inline ObjString *traitIterName(void) {
+    return jaiStringInternC("iter");
+}
+
+static inline ObjString *traitNextName(void) {
+    return jaiStringInternC("next");
+}
 
 /* True when instances of `v`'s class answer `name`. Inherited methods are
  * copied down at class creation, so one table lookup is the whole answer. */
-static bool instanceHasMethod(Value v, ObjString *name) {
-    if (!IS_INSTANCE(v) || name == NULL) return false;
-    Value ignored;
-    return jaiTableGetInterned(&AS_INSTANCE(v)->klass->methods, name, &ignored);
-}
-
 ObjIter *jaiIterNew(IterKind kind, Value source) {
-    jaiGCPushRoot(source);
+    const bool rootSource = IS_OBJ(source);
+    if (rootSource) jaiGCPushRoot(source);
+
     ObjIter *it = JAI_ALLOCATE_OBJ(ObjIter, OBJ_ITER);
-    jaiGCPopRoot();
+
+    if (rootSource) jaiGCPopRoot();
 
     it->kind = kind;
     it->source = source;
-    it->index = 0;
-    it->limit = 0;
-    it->version = 0;
 
     switch (kind) {
-    case ITER_LIST:
-        if (IS_LIST(source)) {
-            /* Two witnesses: the count catches a resize, the version catches an
-             * in-place store the count cannot see (`xs[i] = v`, sort, reverse). */
-            it->limit = AS_LIST(source)->count;
-            it->version = AS_LIST(source)->version;
-        }
-        break;
-    /* Tuples and strings are immutable, so neither carries a version and
-     * neither needs a check; the limit is a bound, not a witness. */
-    case ITER_TUPLE:
-        if (IS_TUPLE(source)) it->limit = (int64_t)AS_TUPLE(source)->count;
-        break;
-    case ITER_STRING:
-        if (IS_STRING(source)) {
-            it->limit = (int64_t)AS_STRING(source)->length;   /* byte cursor */
-        }
-        break;
-    case ITER_DICT_KEYS:
-    case ITER_DICT_ITEMS:
-        if (IS_DICT(source)) {
-            it->limit = AS_DICT(source)->table.count;
-            it->version = AS_DICT(source)->table.version;
-        }
-        break;
-    case ITER_SET:
-        if (IS_SET(source)) {
-            it->limit = AS_SET(source)->table.count;
-            it->version = AS_SET(source)->table.version;
-        }
-        break;
-    case ITER_RANGE:
-        /* A range is frozen at construction; nothing can invalidate the bound. */
-        if (IS_RANGE(source)) it->limit = jaiRangeLength(AS_RANGE(source));
-        break;
-    /* A user iterator owns its own traversal state, so interference is its
-     * own business and there is nothing here to witness. */
-    case ITER_USER:
-    case ITER_TRAIT:
-    case ITER_GENERATOR:
-        break;
+        case ITER_LIST:
+            if (IS_LIST(source)) {
+                ObjList *const list = AS_LIST(source);
+                it->limit = list->count;
+                it->version = list->version;
+            }
+            break;
+
+        case ITER_TUPLE:
+            if (IS_TUPLE(source))
+                it->limit = (int64_t)AS_TUPLE(source)->count;
+            break;
+
+        case ITER_STRING:
+            if (IS_STRING(source))
+                it->limit = (int64_t)AS_STRING(source)->length;
+            break;
+
+        case ITER_DICT_KEYS:
+        case ITER_DICT_ITEMS:
+            if (IS_DICT(source)) {
+                JaiTable *const table = &AS_DICT(source)->table;
+                it->limit = table->count;
+                it->version = table->version;
+            }
+            break;
+
+        case ITER_SET:
+            if (IS_SET(source)) {
+                JaiTable *const table = &AS_SET(source)->table;
+                it->limit = table->count;
+                it->version = table->version;
+            }
+            break;
+
+        case ITER_RANGE:
+            if (IS_RANGE(source))
+                it->limit = jaiRangeLength(AS_RANGE(source));
+            break;
+
+        case ITER_USER:
+        case ITER_TRAIT:
+        case ITER_GENERATOR:
+            break;
     }
+
     return it;
 }
 
@@ -1662,22 +1856,27 @@ ObjIter *jaiIterNew(IterKind kind, Value source) {
  * the reader's next question differs: a resize invalidates the iterator's
  * bounds, while an in-place store leaves them valid and silently changes what
  * the loop sees. */
-static bool iterMutated(bool resized) {
-    return jaiThrow(vm.cRuntimeError, resized
-                        ? "container changed size during iteration"
-                        : "container was modified during iteration");
+static inline bool iterMutated(bool resized) {
+    return jaiThrow(vm.cRuntimeError,
+                    resized ? "container changed size during iteration"
+                            : "container was modified during iteration");
 }
 
 /* True when the pending exception is a StopIteration, i.e. an ordinary end of
  * a user-defined iterator rather than a failure. */
-static bool pendingIsStopIteration(void) {
-    if (!vm.hasException) return false;
-    if (vm.cStopIteration == NULL) return false;
-    Value e = vm.pendingException;
-    if (IS_INSTANCE(e)) {
-        return jaiClassIsSubclassOf(AS_INSTANCE(e)->klass, vm.cStopIteration);
-    }
-    if (IS_CLASS(e)) return jaiClassIsSubclassOf(AS_CLASS(e), vm.cStopIteration);
+static inline bool pendingIsStopIteration(void) {
+    if (!vm.hasException || vm.cStopIteration == NULL)
+        return false;
+
+    const Value exception = vm.pendingException;
+
+    if (IS_INSTANCE(exception))
+        return jaiClassIsSubclassOf(AS_INSTANCE(exception)->klass,
+                                    vm.cStopIteration);
+
+    if (IS_CLASS(exception))
+        return jaiClassIsSubclassOf(AS_CLASS(exception), vm.cStopIteration);
+
     return false;
 }
 
@@ -1726,149 +1925,220 @@ static bool iterTraitNext(ObjIter *it, Value *out) {
 
 bool jaiIterNext(ObjIter *it, Value *out) {
     switch (it->kind) {
-    case ITER_LIST: {
-        ObjList *l = AS_LIST(it->source);
-        if (l->version != it->version) {
-            return iterMutated((int64_t)l->count != it->limit);
+        case ITER_LIST: {
+            ObjList *const list = AS_LIST(it->source);
+            if (JAI_UNLIKELY(list->version != it->version))
+                return iterMutated((int64_t)list->count != it->limit);
+
+            const int64_t index = it->index;
+            if (index >= it->limit) return false;
+
+            *out = list->items[index];
+            it->index = index + 1;
+            return true;
         }
-        if (it->index >= it->limit) return false;
-        *out = l->items[it->index++];
-        return true;
-    }
-    case ITER_TUPLE: {
-        ObjTuple *t = AS_TUPLE(it->source);
-        if (it->index >= it->limit) return false;
-        *out = t->items[it->index++];
-        return true;
-    }
-    case ITER_STRING: {
-        ObjString *s = AS_STRING(it->source);
-        if (it->index >= it->limit) return false;
-        const char *p = s->chars + it->index;
-        int len = 1;
-        (void)jaiUtf8Decode(p, s->chars + s->length, &len);
-        if (it->index + len > it->limit) len = (int)(it->limit - it->index);
-        jaiGCPushRoot(OBJ_VAL(it));            /* keeps `s` (and `p`) alive */
-        ObjString *scalar = jaiStringNew(p, (size_t)len);
-        jaiGCPopRoot();
-        if (scalar == NULL) return false;      /* exception already pending */
-        it->index += len;
-        *out = OBJ_VAL(scalar);
-        return true;
-    }
-    case ITER_DICT_KEYS:
-    case ITER_DICT_ITEMS: {
-        ObjDict *d = AS_DICT(it->source);
-        if (d->table.version != it->version) {
-            return iterMutated((int64_t)d->table.count != it->limit);
+
+        case ITER_TUPLE: {
+            const int64_t index = it->index;
+            if (index >= it->limit) return false;
+
+            *out = AS_TUPLE(it->source)->items[index];
+            it->index = index + 1;
+            return true;
         }
-        int slot = (int)it->index;
-        Value k, v;
-        if (!jaiTableNext(&d->table, &slot, &k, &v)) {
+
+        case ITER_STRING: {
+            ObjString *const string = AS_STRING(it->source);
+            const int64_t index = it->index;
+            if (index >= it->limit) return false;
+
+            const char *const p = string->chars + index;
+            const unsigned char first = (unsigned char)*p;
+
+            if (first < 0x80u) {
+                ObjString *scalar = sAsciiChar[first];
+                if (scalar == NULL) {
+                    jaiGCPushRoot(OBJ_VAL(it));
+                    scalar = jaiStringChar(first);
+                    jaiGCPopRoot();
+                    if (scalar == NULL) return false;
+                }
+
+                it->index = index + 1;
+                *out = OBJ_VAL(scalar);
+                return true;
+            }
+
+            int len = 1;
+            (void)jaiUtf8Decode(p, string->chars + string->length, &len);
+            if (index + len > it->limit)
+                len = (int)(it->limit - index);
+
+            jaiGCPushRoot(OBJ_VAL(it));
+            ObjString *scalar = jaiStringNew(p, (size_t)len);
+            jaiGCPopRoot();
+            if (scalar == NULL) return false;
+
+            it->index = index + len;
+            *out = OBJ_VAL(scalar);
+            return true;
+        }
+
+        case ITER_DICT_KEYS:
+        case ITER_DICT_ITEMS: {
+            ObjDict *const dict = AS_DICT(it->source);
+            JaiTable *const table = &dict->table;
+
+            if (JAI_UNLIKELY(table->version != it->version))
+                return iterMutated((int64_t)table->count != it->limit);
+
+            int slot = (int)it->index;
+            Value key, value;
+            if (!jaiTableNext(table, &slot, &key, &value)) {
+                it->index = slot;
+                return false;
+            }
             it->index = slot;
-            return false;
+
+            if (it->kind == ITER_DICT_KEYS) {
+                *out = key;
+                return true;
+            }
+
+            Value pair[2] = {key, value};
+            jaiGCPushRoot(OBJ_VAL(it));
+            ObjTuple *tuple = jaiTupleNew(pair, 2);
+            jaiGCPopRoot();
+            *out = OBJ_VAL(tuple);
+            return true;
         }
-        it->index = slot;
-        if (it->kind == ITER_DICT_KEYS) {
-            *out = k;
-        } else {
-            Value pair[2] = {k, v};
-            jaiGCPushRoot(k);        /* the pair is unreachable until stored */
-            jaiGCPushRoot(v);
-            *out = OBJ_VAL(jaiTupleNew(pair, 2));
-            jaiGCPopRoots(2);
-        }
-        return true;
-    }
-    case ITER_SET: {
-        ObjSet *s = AS_SET(it->source);
-        if (s->table.version != it->version) {
-            return iterMutated((int64_t)s->table.count != it->limit);
-        }
-        int slot = (int)it->index;
-        Value k, v;
-        if (!jaiTableNext(&s->table, &slot, &k, &v)) {
+
+        case ITER_SET: {
+            ObjSet *const set = AS_SET(it->source);
+            JaiTable *const table = &set->table;
+
+            if (JAI_UNLIKELY(table->version != it->version))
+                return iterMutated((int64_t)table->count != it->limit);
+
+            int slot = (int)it->index;
+            Value key, ignored;
+            if (!jaiTableNext(table, &slot, &key, &ignored)) {
+                it->index = slot;
+                return false;
+            }
+
             it->index = slot;
-            return false;
+            *out = key;
+            return true;
         }
-        it->index = slot;
-        *out = k;
-        return true;
+
+        case ITER_RANGE: {
+            const int64_t index = it->index;
+            if (index >= it->limit) return false;
+
+            ObjRange *const range = AS_RANGE(it->source);
+            uint64_t value;
+
+            if (range->step == 1) {
+                value = (uint64_t)range->start + (uint64_t)index;
+            } else if (range->step == -1) {
+                value = (uint64_t)range->start - (uint64_t)index;
+            } else {
+                value = (uint64_t)range->start +
+                        (uint64_t)index * (uint64_t)range->step;
+            }
+
+            *out = INT_VAL((int64_t)value);
+            it->index = index + 1;
+            return true;
+        }
+
+        case ITER_USER:
+        case ITER_GENERATOR:
+            return iterUserNext(it, out);
+
+        case ITER_TRAIT:
+            return iterTraitNext(it, out);
     }
-    case ITER_RANGE: {
-        ObjRange *r = AS_RANGE(it->source);
-        if (it->index >= it->limit) return false;
-        *out = INT_VAL(r->start + it->index * r->step);
-        it->index++;
-        return true;
-    }
-    case ITER_USER:
-    case ITER_GENERATOR:
-        return iterUserNext(it, out);
-    case ITER_TRAIT:
-        return iterTraitNext(it, out);
-    }
+
     return false;
 }
 
 bool jaiGetIter(Value v, Value *out) {
     if (IS_OBJ(v)) {
         switch (OBJ_TYPE(v)) {
-        case OBJ_ITER:
-            *out = v;                       /* an iterator is its own iterator */
-            return true;
-        case OBJ_LIST:
-            *out = OBJ_VAL(jaiIterNew(ITER_LIST, v));
-            return true;
-        case OBJ_TUPLE:
-            *out = OBJ_VAL(jaiIterNew(ITER_TUPLE, v));
-            return true;
-        case OBJ_STRING:
-            *out = OBJ_VAL(jaiIterNew(ITER_STRING, v));
-            return true;
-        case OBJ_DICT:
-            *out = OBJ_VAL(jaiIterNew(ITER_DICT_KEYS, v));
-            return true;
-        case OBJ_SET:
-            *out = OBJ_VAL(jaiIterNew(ITER_SET, v));
-            return true;
-        case OBJ_RANGE:
-            *out = OBJ_VAL(jaiIterNew(ITER_RANGE, v));
-            return true;
-        case OBJ_INSTANCE: {
-            /* Two spellings reach the same place: the `__iter__` dunder of
-             * spec §7.1 and the `iter` of std.core's `trait Iterable`, which
-             * spec §5 requires of a user type in a `for`. */
-            ObjString *method = instanceHasMethod(v, iterName()) ? iterName()
-                                                                 : traitIterName();
-            Value result;
-            if (!jaiInvokeMethod(v, method, 0, NULL, &result)) {
-                if (!vm.hasException) {
-                    jaiThrow(vm.cTypeError, "'%s' object is not iterable",
-                             jaiTypeNameStatic(v));
+            case OBJ_ITER:
+                *out = v;
+                return true;
+
+            case OBJ_LIST:
+                *out = OBJ_VAL(jaiIterNew(ITER_LIST, v));
+                return true;
+
+            case OBJ_TUPLE:
+                *out = OBJ_VAL(jaiIterNew(ITER_TUPLE, v));
+                return true;
+
+            case OBJ_STRING:
+                *out = OBJ_VAL(jaiIterNew(ITER_STRING, v));
+                return true;
+
+            case OBJ_DICT:
+                *out = OBJ_VAL(jaiIterNew(ITER_DICT_KEYS, v));
+                return true;
+
+            case OBJ_SET:
+                *out = OBJ_VAL(jaiIterNew(ITER_SET, v));
+                return true;
+
+            case OBJ_RANGE:
+                *out = OBJ_VAL(jaiIterNew(ITER_RANGE, v));
+                return true;
+
+            case OBJ_INSTANCE: {
+                ObjInstance *const instance = AS_INSTANCE(v);
+                ObjClass *const klass = instance->klass;
+
+                const bool hasDunderIter =
+                    klass != NULL && !IS_NULL(klass->dunderIter);
+                ObjString *const method =
+                    hasDunderIter ? iterName() : traitIterName();
+
+                Value result;
+                if (!jaiInvokeMethod(v, method, 0, NULL, &result)) {
+                    if (!vm.hasException)
+                        jaiThrow(vm.cTypeError,
+                                 "'%s' object is not iterable",
+                                 jaiTypeNameStatic(v));
+                    return false;
                 }
-                return false;
+
+                if (IS_ITER(result)) {
+                    *out = result;
+                    return true;
+                }
+
+                if (IS_INSTANCE(result)) {
+                    ObjInstance *const iterator = AS_INSTANCE(result);
+                    ObjClass *const iteratorClass = iterator->klass;
+                    const IterKind kind =
+                        iteratorClass != NULL &&
+                        !IS_NULL(iteratorClass->dunderNext)
+                            ? ITER_USER
+                            : ITER_TRAIT;
+
+                    *out = OBJ_VAL(jaiIterNew(kind, result));
+                    return true;
+                }
+
+                return jaiGetIter(result, out);
             }
-            if (IS_ITER(result)) {
-                *out = result;
-                return true;
-            }
-            if (IS_INSTANCE(result)) {
-                /* Whichever `next` the iterator answers to decides how the end
-                 * is signalled: StopIteration for the dunder, null for the
-                 * trait. Preferring the dunder keeps a class that has both
-                 * behaving as it did before the trait was understood. */
-                IterKind kind = instanceHasMethod(result, nextName()) ? ITER_USER
-                                                                      : ITER_TRAIT;
-                *out = OBJ_VAL(jaiIterNew(kind, result));
-                return true;
-            }
-            return jaiGetIter(result, out);   /* terminates: not an instance */
-        }
-        default:
-            break;
+
+            default:
+                break;
         }
     }
+
     return jaiThrow(vm.cTypeError, "'%s' object is not iterable",
                     jaiTypeNameStatic(v));
 }
@@ -1877,19 +2147,35 @@ bool jaiGetIter(Value v, Value *out) {
 /* Files                                                                */
 /* ------------------------------------------------------------------ */
 
-ObjFile *jaiFileNew(FILE *handle, ObjString *path, const char *mode) {
+ObjFile *jaiFileNew(FILE *handle, ObjString *path,
+                    const char *mode) {
     pushObjRoot(path);
-    ObjFile *f = JAI_ALLOCATE_OBJ(ObjFile, OBJ_FILE);
+    ObjFile *file = JAI_ALLOCATE_OBJ(ObjFile, OBJ_FILE);
     jaiGCPopRoot();
 
-    const char *m = (mode != NULL) ? mode : "r";
-    bool update = strchr(m, '+') != NULL;
-    f->handle = handle;
-    f->path = path;
-    f->readable = update || strchr(m, 'r') != NULL;
-    f->writable = update || strchr(m, 'w') != NULL || strchr(m, 'a') != NULL ||
-                  strchr(m, 'x') != NULL;
-    f->binary = strchr(m, 'b') != NULL;
-    f->closed = (handle == NULL);
-    return f;
+    const char *p = mode != NULL ? mode : "r";
+    bool readable = false;
+    bool writable = false;
+    bool binary = false;
+    bool update = false;
+
+    for (; *p != '\0'; ++p) {
+        switch (*p) {
+            case '+': update = true; break;
+            case 'r': readable = true; break;
+            case 'w':
+            case 'a':
+            case 'x': writable = true; break;
+            case 'b': binary = true; break;
+            default: break;
+        }
+    }
+
+    file->handle = handle;
+    file->path = path;
+    file->readable = readable || update;
+    file->writable = writable || update;
+    file->binary = binary;
+    file->closed = handle == NULL;
+    return file;
 }
