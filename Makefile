@@ -442,7 +442,7 @@ reseed: $(TARGET)
 # whatever it imports, so collecting the whole tree embeds a set that varies run
 # to run. Measured, 44 modules and then 47 across two reseeds of an unchanged
 # tree. What is embedded has to be exactly what the step above set out to build.
-	@python3 scripts/gen_seed.py lib boot/seed.c lib
+	@python3 scripts/gen_seed.py lib boot/seed.c --manifest boot/seed.manifest lib
 	@$(MAKE) --no-print-directory
 # The rebuild above embeds the new seed, which changes JAI_BUILD_ID, which
 # invalidates every .jaic just written -- so reseeding used to hand back a tree
