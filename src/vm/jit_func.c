@@ -353,6 +353,66 @@ static int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
     return 0;
 }
 
+/* Allocate an instance, with no descriptor, no roots and no possibility of
+ * collecting. The compiled code that called this stores the fields.
+ *
+ * THE INVARIANT THAT MAKES THIS SAFE, since it is the whole of the review:
+ * a collection can begin in exactly one place, jaiGCMaybeCollect, and gc.c is
+ * explicit that the marker never runs from anywhere else -- not from inside
+ * jaiRealloc, not from object construction. `allocObj` calls it when and only
+ * when `jaiGCWanted()`, so a false answer to that test is gc.c's own proof
+ * that the allocation below cannot collect. Nothing this body's caller is
+ * holding in a callee-saved register can therefore be freed while this runs,
+ * which is precisely the reason jitNewInstance needs a root array and this
+ * does not. And the object is complete -- header, class, field count and every
+ * field written -- BEFORE the two stores that link it into the collector's
+ * list, so the first marker that can possibly see it sees a whole object.
+ *
+ * The gate is conservative in the safe direction only. jaiGCLimit is zero
+ * whenever the collector is absent, disabled, stressed or already running, and
+ * `jaiHeapBytes > 0` holds from the first allocation the VM ever makes, so all
+ * four of those cases answer "wanted" and decline here. --gc-stress therefore
+ * still stresses every allocation, which is the property that would otherwise
+ * quietly stop being tested.
+ *
+ * NULL means "I did nothing": the caller falls into the descriptor path, which
+ * writes its roots and lets the collection happen there. Declining is always
+ * correct and never observable, which is what makes this reviewable at all. */
+static ObjInstance *jitInstanceAlloc(ObjClass *cls) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+
+    GCState *g = jaiGCActive;
+    if (JAI_UNLIKELY(g == NULL || cls == NULL)) return NULL;
+
+    const uint16_t count = cls->fieldCount;
+    const size_t size = sizeof(ObjInstance) + sizeof(Value) * (size_t)count;
+    if (JAI_UNLIKELY(!jaiSmallServes(size))) return NULL;
+
+    ObjInstance *inst = (ObjInstance *)jaiSmallNew(size);
+    Obj *obj = (Obj *)inst;
+
+    obj->type = OBJ_INSTANCE;
+    obj->isMarked = false;
+    obj->subFlag = false;
+    obj->subFlag2 = false;
+
+    inst->klass = cls;
+    inst->fieldCount = count;
+    /* Every field, not just the ones the caller is about to overwrite: the
+     * marker reads all `count` of them and a field it has not written is
+     * whatever the last corpse in this bin left behind. */
+    for (uint16_t i = 0; i < count; ++i) inst->fields[i] = NULL_VAL;
+
+    /* Last. jaiGCTrackObject's `isMarked = jaiGCInCollect` case cannot arise
+     * here: a collection in progress makes jaiGCLimit zero, and the first line
+     * would have declined. */
+    obj->next = g->objects;
+    g->objects = obj;
+
+    vm.allocCount++;
+    return inst;
+}
+
 /* Allocate an instance of args[0]'s class, nothing more. The fields are stored
  * by the compiled code that called this. */
 static int jitNewInstance(JitCallDesc *d) {
@@ -3145,9 +3205,51 @@ static bool emitCallOut(Emit *e, unsigned argc) {
                       (e->usesUpvalues ? 1u : 0u) +
                       (first + i - (e->depth - e->valueDepth));
         }
+        /* Two ways to get the instance, and the fast one is tried first.
+         *
+         * jitInstanceAlloc is a leaf that cannot collect -- it declines
+         * whenever jaiGCWanted() is true, which is exactly when jaiInstanceNew
+         * would have collected -- so it needs no descriptor and no root array,
+         * and it reaches no allocator call of its own. That is what makes it
+         * worth branching for: the descriptor below is a dozen stores plus a
+         * helper that pushes and pops every root this body is holding, in
+         * order to allocate sixty-four bytes.
+         *
+         * The safety argument is entirely on the callee's side and is written
+         * out at its definition. What matters here is that a NULL answer means
+         * it did nothing at all, so falling into the descriptor path is always
+         * correct: the roots are written, the collection happens there, and
+         * both paths arrive at the load below with the instance in SCRATCH_C.
+         *
+         * Skipped for a class the bins cannot serve, which would otherwise pay
+         * a declined call per allocation. */
+        const size_t instBytes =
+            sizeof(ObjInstance) + sizeof(Value) * (size_t)cls->fieldCount;
+        unsigned skipSlow = 0;
+        bool haveFast = jaiSmallServes(instBytes);
+        if (haveFast) {
+            emitConst64(e, 0, (int64_t)(uintptr_t)cls);
+            emitConst64(e, JIT_SCRATCH_A,
+                        (int64_t)(uintptr_t)&jitInstanceAlloc);
+            emit(e, jaiA64Blr(JIT_SCRATCH_A));
+            emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+            skipSlow = e->count;
+            emit(e, jaiA64BCond(JAI_A64_NE, 0));   /* patched below */
+        }
         if (!emitDescriptor(e, OBJ_VAL((Obj *)cls), first, 0,
                             (void *)&jitNewInstance)) {
             return false;
+        }
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                           e->descOffset +
+                               (unsigned)offsetof(JitCallDesc, result) + 8));
+        /* The span is measured rather than counted: emitDescriptor's length
+         * moves with the number of roots this body holds and with how many
+         * halfwords the class pointer needs. */
+        if (haveFast && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+            e->code[skipSlow] =
+                jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
         }
         for (unsigned i = 0; i < argc; i++) {
             unsigned r;
@@ -3162,9 +3264,6 @@ static bool emitCallOut(Emit *e, unsigned argc) {
          * was about to store, and alloc_churn came back in 5ms with the wrong
          * answer -- the same aliasing mistake this tier keeps making. */
         unsigned rinst = pushReg(e) - 1;
-        emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
-                           e->descOffset +
-                               (unsigned)offsetof(JitCallDesc, result) + 8));
         for (unsigned i = 0; i < argc; i++) {
             unsigned at = (unsigned)offsetof(ObjInstance, fields) +
                           (unsigned)fslots[i] * (unsigned)sizeof(Value);

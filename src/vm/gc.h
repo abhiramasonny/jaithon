@@ -78,6 +78,29 @@ void jaiGCMarkValue(Value v);
 void jaiGCMarkObject(Obj *obj);
 void jaiGCMarkArray(const ValueArray *a);
 
+/* The two tests that decide a reference needs nothing done to it, moved to the
+ * call site.
+ *
+ * A tracer touches every reference every reachable object holds, and the great
+ * majority of them are already black by the time it gets there: the class each
+ * of a million instances names, the name each of its methods names, the node
+ * whichever subtree reached it first. jaiGCMarkObject cannot be a leaf -- it
+ * grays, and graying can grow the gray stack -- so it sets up a four-register
+ * frame before it is in a position to look at the byte that says there is
+ * nothing to do. On binary_trees, whose live set is a quarter of a million
+ * instances, that frame was most of what marking cost.
+ *
+ * This is NOT the inlining that gc.h warns about above. jaiGCPushRoot is
+ * called from allocation sites, which are hot in every program and everywhere;
+ * these are called only from tracers, which run only inside a collection. */
+JAI_INLINE void jaiGCMark(Obj *obj) {
+    if (obj != NULL && !obj->isMarked) jaiGCMarkObject(obj);
+}
+
+JAI_INLINE void jaiGCMarkVal(Value v) {
+    if (IS_OBJ(v)) jaiGCMark(AS_OBJ(v));
+}
+
 /* Temporary root protocol for C code:
  *     jaiGCPushRoot(v);  ... allocations ...  jaiGCPopRoot();
  */

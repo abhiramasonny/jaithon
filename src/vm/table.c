@@ -647,8 +647,8 @@ void jaiTableMark(JaiTable *t) {
         if (slot < 0) continue;
 
         JaiEntry *const e = entries + slot;
-        jaiGCMarkValue(e->key);
-        jaiGCMarkValue(e->value);
+        jaiGCMarkVal(e->key);
+        jaiGCMarkVal(e->value);
     }
 }
 

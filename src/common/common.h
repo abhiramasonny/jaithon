@@ -147,6 +147,67 @@ extern size_t jaiHeapBytes;
 static inline size_t jaiAllocatedBytes(void) { return jaiHeapBytes; }
 
 /* ------------------------------------------------------------------ */
+/* The small-object fast path, exposed                                 */
+/* ------------------------------------------------------------------ */
+
+/* memory.c owns the bins and the slab and is still the only place that calls
+ * malloc/realloc/free. What is published here is the half of `jaiRealloc(NULL,
+ * 0, n)` that touches neither: pop a bin, or bump the slab cursor. The slab
+ * *refill*, which is the only part that reaches libc, stays out of line in
+ * memory.c behind jaiSlabRefill.
+ *
+ * This exists because the JIT's allocation site is a leaf that must not call
+ * anything, and because a call per object was measurably a tenth of a program
+ * that only allocates. Every invariant the bins already depended on still
+ * holds and is unchanged: a block's size class is derived from the same exact
+ * size on both sides, a slab block never reaches free()/realloc(), and nothing
+ * here is ever returned to libc.
+ *
+ * A caller that uses this rather than jaiRealloc takes on exactly one duty:
+ * `size` must be one the bins serve (0 < size <= JAI_SMALL_MAX), which
+ * jaiSmallServes answers. */
+#define JAI_SMALL_GRAIN   16u
+#define JAI_SMALL_MAX     512u
+#define JAI_SMALL_CLASSES (JAI_SMALL_MAX / JAI_SMALL_GRAIN)
+
+extern void  *jaiSmallBin[JAI_SMALL_CLASSES + 1];
+extern char  *jaiSlabNext;
+extern size_t jaiSlabLeft;
+
+/* Hands back a fresh JAI_SLAB_BYTES slab with at least `need` bytes in it,
+ * having binned whatever tail the old one had left. Out of line: it is the
+ * one path here that calls malloc. */
+void jaiSlabRefill(size_t need);
+
+/* True when `size` is a request jaiSmallNew can serve. */
+JAI_INLINE bool jaiSmallServes(size_t size) {
+    return size != 0 && size <= JAI_SMALL_MAX;
+}
+
+/* jaiRealloc(NULL, 0, size) for a size jaiSmallServes accepts, with the
+ * accounting jaiRealloc would have done. Never NULL. */
+JAI_INLINE void *jaiSmallNew(size_t size) {
+    unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
+    void *p = jaiSmallBin[cls];
+
+    jaiHeapBytes += size;
+
+    if (JAI_LIKELY(p != NULL)) {
+        jaiSmallBin[cls] = *(void **)p;
+        return p;
+    }
+
+    size_t need = (size_t)cls * JAI_SMALL_GRAIN;
+    if (JAI_UNLIKELY(jaiSlabLeft < need)) jaiSlabRefill(need);
+
+    p = jaiSlabNext;
+    jaiSlabNext += need;
+    jaiSlabLeft -= need;
+    return p;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Arena — bump allocator for AST nodes and other phase-scoped data    */
 /* ------------------------------------------------------------------ */
 

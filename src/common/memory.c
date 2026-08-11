@@ -90,15 +90,16 @@ static inline void accountDelta(size_t oldSize, size_t newSize) {
  *
  * Bins are never returned to libc. What they hold is bounded by the peak
  * garbage of each size class between collections, which is what libc's own
- * free lists would have held anyway; measured peak RSS moved by under 4%. */
-
-#define JAI_SMALL_GRAIN   16u
-#define JAI_SMALL_MAX     512u
-#define JAI_SMALL_CLASSES (JAI_SMALL_MAX / JAI_SMALL_GRAIN)
+ * free lists would have held anyway; measured peak RSS moved by under 4%.
+ *
+ * The three words below are declared in common.h rather than here so that
+ * jaiSmallNew can be inlined into a caller that must not make a call; the
+ * grain and the maximum moved with them. Nothing outside this file writes
+ * them except through that one inline, which does what the code here does. */
 
 /* Bin 0 is unused (a zero-byte request never reaches here); bin c serves
  * requests of 16(c-1)+1 .. 16c bytes and holds blocks of exactly 16c. */
-static void *gBin[JAI_SMALL_CLASSES + 1];
+void *jaiSmallBin[JAI_SMALL_CLASSES + 1];
 
 /* 0 for anything the bins do not serve. */
 static inline unsigned smallClass(size_t n) {
@@ -109,8 +110,8 @@ static inline unsigned smallClass(size_t n) {
 }
 
 static inline void smallFree(void *p, unsigned cls) {
-    *(void **)p = gBin[cls];
-    gBin[cls] = p;
+    *(void **)p = jaiSmallBin[cls];
+    jaiSmallBin[cls] = p;
 }
 
 /* When a bin is empty the block has to come from somewhere, and one malloc per
@@ -141,37 +142,42 @@ static inline void smallFree(void *p, unsigned cls) {
  * The slab is not freed at exit for the same reason the bins are not. */
 #define JAI_SLAB_BYTES (64u * 1024u)
 
-static char  *gSlabNext;
-static size_t gSlabLeft;
+char  *jaiSlabNext;
+size_t jaiSlabLeft;
+
+/* The refill, which is the one thing here that calls malloc, and so the one
+ * thing jaiSmallNew in common.h cannot do for itself. */
+void jaiSlabRefill(size_t need) {
+    /* The tail is too small for this request but not too small to be a
+     * block: hand it to the bin it exactly fits rather than leaking it.
+     * jaiSlabLeft < need <= JAI_SMALL_MAX, so the class is in range, and it
+     * is at least one grain, which is wider than the free-list pointer. */
+    unsigned tail = (unsigned)(jaiSlabLeft / JAI_SMALL_GRAIN);
+    if (tail != 0) smallFree(jaiSlabNext, tail);
+
+    jaiSlabNext = (char *)malloc(JAI_SLAB_BYTES);
+    if (JAI_UNLIKELY(jaiSlabNext == NULL)) {
+        JAI_PANIC("out of memory: cannot allocate %u bytes (%zu live)",
+                  JAI_SLAB_BYTES, jaiHeapBytes);
+    }
+    jaiSlabLeft = JAI_SLAB_BYTES;
+    (void)need;   /* every class fits in a fresh slab; see JAI_SMALL_MAX */
+}
 
 static void *slabCarve(size_t need) {
-    if (JAI_UNLIKELY(gSlabLeft < need)) {
-        /* The tail is too small for this request but not too small to be a
-         * block: hand it to the bin it exactly fits rather than leaking it.
-         * gSlabLeft < need <= JAI_SMALL_MAX, so the class is in range, and it
-         * is at least one grain, which is wider than the free-list pointer. */
-        unsigned tail = (unsigned)(gSlabLeft / JAI_SMALL_GRAIN);
-        if (tail != 0) smallFree(gSlabNext, tail);
+    if (JAI_UNLIKELY(jaiSlabLeft < need)) jaiSlabRefill(need);
 
-        gSlabNext = (char *)malloc(JAI_SLAB_BYTES);
-        if (JAI_UNLIKELY(gSlabNext == NULL)) {
-            JAI_PANIC("out of memory: cannot allocate %u bytes (%zu live)",
-                      JAI_SLAB_BYTES, jaiHeapBytes);
-        }
-        gSlabLeft = JAI_SLAB_BYTES;
-    }
-
-    void *p = gSlabNext;
-    gSlabNext += need;
-    gSlabLeft -= need;
+    void *p = jaiSlabNext;
+    jaiSlabNext += need;
+    jaiSlabLeft -= need;
     return p;
 }
 
 static inline void *smallAlloc(unsigned cls) {
-    void *p = gBin[cls];
+    void *p = jaiSmallBin[cls];
 
     if (p != NULL) {
-        gBin[cls] = *(void **)p;
+        jaiSmallBin[cls] = *(void **)p;
         return p;
     }
 

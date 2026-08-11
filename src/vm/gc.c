@@ -190,23 +190,21 @@ void jaiGCMarkObject(Obj *obj) {
     g->grayStack[g->grayCount++] = obj;
 }
 
-void jaiGCMarkValue(Value v) {
-    if (IS_OBJ(v)) jaiGCMarkObject(AS_OBJ(v));
-}
+void jaiGCMarkValue(Value v) { jaiGCMarkVal(v); }
 
 void jaiGCMarkArray(const ValueArray *a) {
     if (a == NULL || a->data == NULL) return;
-    for (int i = 0; i < a->count; i++) jaiGCMarkValue(a->data[i]);
+    for (int i = 0; i < a->count; i++) jaiGCMarkVal(a->data[i]);
 }
 
 static void markValues(const Value *values, int count) {
     if (values == NULL) return;
-    for (int i = 0; i < count; i++) jaiGCMarkValue(values[i]);
+    for (int i = 0; i < count; i++) jaiGCMarkVal(values[i]);
 }
 
 static void markStrings(ObjString *const *names, int count) {
     if (names == NULL) return;
-    for (int i = 0; i < count; i++) jaiGCMarkObject((Obj *)names[i]);
+    for (int i = 0; i < count; i++) jaiGCMark((Obj *)names[i]);
 }
 
 static void markChunk(Chunk *chunk) {
@@ -223,23 +221,23 @@ static void markChunk(Chunk *chunk) {
      * next probe of that way would read a dangling Value. */
     for (int i = 0; i < chunk->cacheCount; i++) {
         InlineCache *ic = &chunk->caches[i];
-        for (int w = 0; w < JAI_IC_WAYS; w++) jaiGCMarkValue(ic->cached[w]);
+        for (int w = 0; w < JAI_IC_WAYS; w++) jaiGCMarkVal(ic->cached[w]);
     }
 }
 
 static void blackenFunction(ObjFunction *fn) {
-    jaiGCMarkObject((Obj *)fn->name);
-    jaiGCMarkObject((Obj *)fn->qualifiedName);
-    jaiGCMarkObject((Obj *)fn->module);
-    jaiGCMarkObject((Obj *)fn->owner);
+    jaiGCMark((Obj *)fn->name);
+    jaiGCMark((Obj *)fn->qualifiedName);
+    jaiGCMark((Obj *)fn->module);
+    jaiGCMark((Obj *)fn->owner);
     markStrings(fn->paramNames, (int)fn->paramCount);
     markChunk(&fn->chunk);
 }
 
 static void blackenClass(ObjClass *c) {
-    jaiGCMarkObject((Obj *)c->name);
-    jaiGCMarkObject((Obj *)c->qualifiedName);
-    jaiGCMarkObject((Obj *)c->superclass);
+    jaiGCMark((Obj *)c->name);
+    jaiGCMark((Obj *)c->qualifiedName);
+    jaiGCMark((Obj *)c->superclass);
 
     jaiTableMark(&c->methods);
     jaiTableMark(&c->statics);
@@ -250,50 +248,50 @@ static void blackenClass(ObjClass *c) {
     jaiTableMark(&c->restricted);
 
     for (int i = 0; i < (int)c->traitCount; i++)
-        jaiGCMarkObject((Obj *)c->traits[i]);
+        jaiGCMark((Obj *)c->traits[i]);
 
     /* Field names are only reachable from here; the FieldInfo array itself is
      * plain memory owned by the class. */
     for (int i = 0; i < (int)c->fieldCount; i++)
-        jaiGCMarkObject((Obj *)c->fields[i].name);
+        jaiGCMark((Obj *)c->fields[i].name);
 
-    jaiGCMarkValue(c->initializer);
+    jaiGCMarkVal(c->initializer);
 
     /* The dunder cache aliases entries in `methods`, but a method removed from
      * the table before the cache is refreshed would otherwise dangle. */
-    jaiGCMarkValue(c->dunderStr);
-    jaiGCMarkValue(c->dunderRepr);
-    jaiGCMarkValue(c->dunderEq);
-    jaiGCMarkValue(c->dunderLt);
-    jaiGCMarkValue(c->dunderHash);
-    jaiGCMarkValue(c->dunderAdd);
-    jaiGCMarkValue(c->dunderSub);
-    jaiGCMarkValue(c->dunderMul);
-    jaiGCMarkValue(c->dunderDiv);
-    jaiGCMarkValue(c->dunderMod);
-    jaiGCMarkValue(c->dunderPow);
-    jaiGCMarkValue(c->dunderNeg);
-    jaiGCMarkValue(c->dunderLen);
-    jaiGCMarkValue(c->dunderGetItem);
-    jaiGCMarkValue(c->dunderSetItem);
-    jaiGCMarkValue(c->dunderContains);
-    jaiGCMarkValue(c->dunderIter);
-    jaiGCMarkValue(c->dunderNext);
-    jaiGCMarkValue(c->dunderCall);
+    jaiGCMarkVal(c->dunderStr);
+    jaiGCMarkVal(c->dunderRepr);
+    jaiGCMarkVal(c->dunderEq);
+    jaiGCMarkVal(c->dunderLt);
+    jaiGCMarkVal(c->dunderHash);
+    jaiGCMarkVal(c->dunderAdd);
+    jaiGCMarkVal(c->dunderSub);
+    jaiGCMarkVal(c->dunderMul);
+    jaiGCMarkVal(c->dunderDiv);
+    jaiGCMarkVal(c->dunderMod);
+    jaiGCMarkVal(c->dunderPow);
+    jaiGCMarkVal(c->dunderNeg);
+    jaiGCMarkVal(c->dunderLen);
+    jaiGCMarkVal(c->dunderGetItem);
+    jaiGCMarkVal(c->dunderSetItem);
+    jaiGCMarkVal(c->dunderContains);
+    jaiGCMarkVal(c->dunderIter);
+    jaiGCMarkVal(c->dunderNext);
+    jaiGCMarkVal(c->dunderCall);
 }
 
 static void blackenEnum(ObjEnum *e) {
-    jaiGCMarkObject((Obj *)e->name);
+    jaiGCMark((Obj *)e->name);
     jaiTableMark(&e->methods);
     if (e->variants == NULL) return;
     for (int i = 0; i < (int)e->variantCount; i++) {
         EnumVariant *v = &e->variants[i];
-        jaiGCMarkObject((Obj *)v->name);
+        jaiGCMark((Obj *)v->name);
         /* The cached payload-less value and the cached constructor are
          * reachable only from here; without this the second mention of
          * `Color.Red` hands back freed memory. */
-        jaiGCMarkObject((Obj *)v->unit);
-        jaiGCMarkObject((Obj *)v->ctor);
+        jaiGCMark((Obj *)v->unit);
+        jaiGCMark((Obj *)v->ctor);
         markStrings(v->fieldNames, (int)v->arity);
     }
 }
@@ -329,24 +327,24 @@ static void blackenObject(Obj *obj) {
         break;
     case OBJ_CLOSURE: {
         ObjClosure *closure = (ObjClosure *)obj;
-        jaiGCMarkObject((Obj *)closure->fn);
+        jaiGCMark((Obj *)closure->fn);
         for (int i = 0; i < closure->upvalueCount; i++)
-            jaiGCMarkObject((Obj *)closure->upvalues[i]);
+            jaiGCMark((Obj *)closure->upvalues[i]);
         break;
     }
     case OBJ_UPVALUE:
         /* Only the closed slot. While the upvalue is open its target is a live
          * stack slot, already covered by the stack scan; following `location`
          * here would also read slots above stackTop during frame teardown. */
-        jaiGCMarkValue(((ObjUpvalue *)obj)->closed);
+        jaiGCMarkVal(((ObjUpvalue *)obj)->closed);
         break;
     case OBJ_NATIVE:
-        jaiGCMarkObject((Obj *)((ObjNative *)obj)->name);
+        jaiGCMark((Obj *)((ObjNative *)obj)->name);
         break;
     case OBJ_BOUND: {
         ObjBound *bound = (ObjBound *)obj;
-        jaiGCMarkValue(bound->receiver);
-        jaiGCMarkValue(bound->method);
+        jaiGCMarkVal(bound->receiver);
+        jaiGCMarkVal(bound->method);
         break;
     }
 
@@ -355,25 +353,25 @@ static void blackenObject(Obj *obj) {
         break;
     case OBJ_TRAIT: {
         ObjTrait *trait = (ObjTrait *)obj;
-        jaiGCMarkObject((Obj *)trait->name);
+        jaiGCMark((Obj *)trait->name);
         jaiTableMark(&trait->required);
         jaiTableMark(&trait->defaults);
         for (int i = 0; i < (int)trait->superCount; i++)
-            jaiGCMarkObject((Obj *)trait->supers[i]);
+            jaiGCMark((Obj *)trait->supers[i]);
         break;
     }
     case OBJ_INSTANCE: {
         ObjInstance *inst = (ObjInstance *)obj;
-        jaiGCMarkObject((Obj *)inst->klass);
+        jaiGCMark((Obj *)inst->klass);
         markValues(inst->fields, (int)inst->fieldCount);
         break;
     }
 
     case OBJ_MODULE: {
         ObjModule *module = (ObjModule *)obj;
-        jaiGCMarkObject((Obj *)module->name);
-        jaiGCMarkObject((Obj *)module->path);
-        jaiGCMarkObject((Obj *)module->body);
+        jaiGCMark((Obj *)module->name);
+        jaiGCMark((Obj *)module->path);
+        jaiGCMark((Obj *)module->body);
         jaiTableMark(&module->globals);
         jaiTableMark(&module->exports);
         break;
@@ -384,20 +382,20 @@ static void blackenObject(Obj *obj) {
         break;
     case OBJ_ENUM_VAL: {
         ObjEnumVal *ev = (ObjEnumVal *)obj;
-        jaiGCMarkObject((Obj *)ev->type);
+        jaiGCMark((Obj *)ev->type);
         markValues(ev->payload, (int)ev->count);
         break;
     }
 
     case OBJ_ITER:
-        jaiGCMarkValue(((ObjIter *)obj)->source);
+        jaiGCMarkVal(((ObjIter *)obj)->source);
         break;
     case OBJ_FILE:
-        jaiGCMarkObject((Obj *)((ObjFile *)obj)->path);
+        jaiGCMark((Obj *)((ObjFile *)obj)->path);
         break;
 
     case OBJ_ENUM_CTOR:
-        jaiGCMarkObject((Obj *)((ObjEnumCtor *)obj)->type);
+        jaiGCMark((Obj *)((ObjEnumCtor *)obj)->type);
         break;
 
     case OBJ_TYPE_COUNT:
@@ -430,24 +428,24 @@ static void markWellKnownClasses(void) {
         vm.cPermissionError, vm.cParseError, vm.cLookupError,
     };
     for (size_t i = 0; i < sizeof classes / sizeof classes[0]; i++)
-        jaiGCMarkObject((Obj *)classes[i]);
+        jaiGCMark((Obj *)classes[i]);
 }
 
 static void markRoots(GCState *g) {
     if (vm.stack != NULL) {
         for (Value *slot = vm.stack; slot < vm.stackTop; slot++)
-            jaiGCMarkValue(*slot);
+            jaiGCMarkVal(*slot);
     }
 
     if (vm.frames != NULL) {
         for (int i = 0; i < vm.frameCount; i++) {
-            jaiGCMarkObject((Obj *)vm.frames[i].closure);
-            jaiGCMarkObject((Obj *)vm.frames[i].module);
+            jaiGCMark((Obj *)vm.frames[i].closure);
+            jaiGCMark((Obj *)vm.frames[i].module);
         }
     }
 
     for (ObjUpvalue *uv = vm.openUpvalues; uv != NULL; uv = uv->next)
-        jaiGCMarkObject((Obj *)uv);
+        jaiGCMark((Obj *)uv);
 
     jaiMarkAsciiChars();
     jaiJitMarkFrames();
@@ -456,12 +454,12 @@ static void markRoots(GCState *g) {
     markStrings(vm.modulePath.data, vm.modulePath.count);
 
     jaiTableMark(&vm.modules);
-    jaiGCMarkObject((Obj *)vm.mainModule);
-    jaiGCMarkObject((Obj *)vm.builtins);
+    jaiGCMark((Obj *)vm.mainModule);
+    jaiGCMark((Obj *)vm.builtins);
 
     /* Marked whether or not hasException is set: a stale pending exception
      * that was never overwritten must not be left dangling. */
-    jaiGCMarkValue(vm.pendingException);
+    jaiGCMarkVal(vm.pendingException);
 
     markInternedNames();
     markWellKnownClasses();
