@@ -20,6 +20,7 @@
 #include <langinfo.h>
 #include <locale.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "cli.h"
@@ -42,6 +43,7 @@ typedef enum { COLOR_AUTO, COLOR_ALWAYS, COLOR_NEVER } ColorMode;
  * directories cannot be applied during parsing because jaiModulePathAdd writes
  * into vm.modulePath, which does not exist until jaiVMInit. */
 static const char **gIncludeDirs;
+static void        **gArgStorage;      /* one slab backing all argv pointer arrays */
 static int          gIncludeCount;
 static int          gArgSlots;        /* capacity of inputs[] and scriptArgv[] */
 static ColorMode    gColorMode = COLOR_AUTO;
@@ -67,7 +69,7 @@ static void cliError(const char *fmt, ...) {
     (void)jaiDiagError(JAI_OK, JAI_SPAN_NONE, "%s", message);
 }
 
-static bool cliFlush(void) { return jaiDiagFlush(&gDiags, stderr); }
+static inline bool cliFlush(void) { return jaiDiagFlush(&gDiags, stderr); }
 
 /* ------------------------------------------------------------------ */
 /* Usage and version                                                    */
@@ -147,42 +149,128 @@ void jaiCliPrintVersion(FILE *out) {
 /* Argument parsing                                                     */
 /* ------------------------------------------------------------------ */
 
-static const struct {
-    const char *name;
-    JaiCommand  command;
-} kCommands[] = {
-    {"run", CMD_RUN},         {"repl", CMD_REPL},   {"check", CMD_CHECK},
-    {"build", CMD_BUILD},     {"fmt", CMD_FMT},     {"test", CMD_TEST},
-    {"doc", CMD_DOC},         {"bench", CMD_BENCH}, {"disasm", CMD_DISASM},
-    {"ast", CMD_AST},         {"tokens", CMD_TOKENS},
-    {"version", CMD_VERSION}, {"help", CMD_HELP},
-};
-
 static bool commandFromName(const char *name, JaiCommand *out) {
-    for (size_t i = 0; i < sizeof kCommands / sizeof kCommands[0]; i++) {
-        if (strcmp(kCommands[i].name, name) == 0) {
-            *out = kCommands[i].command;
+    if (name == NULL || out == NULL) return false;
+
+    /*
+     * argc parsing happens once, but this is cheaper than walking thirteen
+     * strcmp() calls and keeps the common shorthand/file case short.
+     */
+    const size_t n = strlen(name);
+
+    switch (n) {
+    case 3:
+        if (name[0] == 'r' && memcmp(name, "run", 3) == 0) {
+            *out = CMD_RUN;
             return true;
         }
+        if (name[0] == 'f' && memcmp(name, "fmt", 3) == 0) {
+            *out = CMD_FMT;
+            return true;
+        }
+        if (name[0] == 'd' && memcmp(name, "doc", 3) == 0) {
+            *out = CMD_DOC;
+            return true;
+        }
+        if (name[0] == 'a' && memcmp(name, "ast", 3) == 0) {
+            *out = CMD_AST;
+            return true;
+        }
+        break;
+
+    case 4:
+        if (name[0] == 'r' && memcmp(name, "repl", 4) == 0) {
+            *out = CMD_REPL;
+            return true;
+        }
+        if (name[0] == 't' && memcmp(name, "test", 4) == 0) {
+            *out = CMD_TEST;
+            return true;
+        }
+        if (name[0] == 'h' && memcmp(name, "help", 4) == 0) {
+            *out = CMD_HELP;
+            return true;
+        }
+        break;
+
+    case 5:
+        if (name[0] == 'c' && memcmp(name, "check", 5) == 0) {
+            *out = CMD_CHECK;
+            return true;
+        }
+        if (name[0] == 'b' && name[1] == 'u' &&
+            memcmp(name, "build", 5) == 0) {
+            *out = CMD_BUILD;
+            return true;
+        }
+        if (name[0] == 'b' && name[1] == 'e' &&
+            memcmp(name, "bench", 5) == 0) {
+            *out = CMD_BENCH;
+            return true;
+        }
+        break;
+
+    case 6:
+        if (name[0] == 'd' && memcmp(name, "disasm", 6) == 0) {
+            *out = CMD_DISASM;
+            return true;
+        }
+        if (name[0] == 't' && memcmp(name, "tokens", 6) == 0) {
+            *out = CMD_TOKENS;
+            return true;
+        }
+        break;
+
+    case 7:
+        if (name[0] == 'v' && memcmp(name, "version", 7) == 0) {
+            *out = CMD_VERSION;
+            return true;
+        }
+        break;
+
+    default:
+        break;
     }
+
     return false;
 }
 
 /* `--eval` is spelled as an option rather than a command, because
  * `jaithon eval` is not a thing to type. */
 static const char *commandName(JaiCommand command) {
-    for (size_t i = 0; i < sizeof kCommands / sizeof kCommands[0]; i++) {
-        if (kCommands[i].command == command) return kCommands[i].name;
+    switch (command) {
+    case CMD_RUN:     return "run";
+    case CMD_REPL:    return "repl";
+    case CMD_CHECK:   return "check";
+    case CMD_BUILD:   return "build";
+    case CMD_FMT:     return "fmt";
+    case CMD_TEST:    return "test";
+    case CMD_DOC:     return "doc";
+    case CMD_BENCH:   return "bench";
+    case CMD_DISASM:  return "disasm";
+    case CMD_AST:     return "ast";
+    case CMD_TOKENS:  return "tokens";
+    case CMD_VERSION: return "version";
+    case CMD_HELP:    return "help";
+    case CMD_EVAL:    return "--eval";
     }
-    return command == CMD_EVAL ? "--eval" : "?";
+    return "?";
 }
 
 /* Match `--name` or `--name=VALUE`. *outValue is NULL for the bare form. */
-static bool optionIs(const char *arg, const char *name, const char **outValue) {
-    size_t n = strlen(name);
+static inline bool optionIs(const char *arg, const char *name, size_t n,
+                            const char **outValue) {
     if (strncmp(arg, name, n) != 0) return false;
-    if (arg[n] == '\0') { *outValue = NULL; return true; }
-    if (arg[n] == '=')  { *outValue = arg + n + 1; return true; }
+
+    const char tail = arg[n];
+    if (tail == '\0') {
+        *outValue = NULL;
+        return true;
+    }
+    if (tail == '=') {
+        *outValue = arg + n + 1;
+        return true;
+    }
     return false;
 }
 
@@ -229,7 +317,7 @@ static bool parseEmit(const char *text, ParseState *st) {
 }
 
 /* Commands whose implementation lives in lib/jaithon/tool and owns its own flags. */
-static bool commandIsTool(JaiCommand command) {
+static inline bool commandIsTool(JaiCommand command) {
     switch (command) {
     case CMD_FMT:
     case CMD_TEST:
@@ -287,11 +375,11 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         return true;
     }
 
-    if (optionIs(arg, "--threads", &value)) {
+    if (optionIs(arg, "--threads", 9, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--threads");
         return value != NULL && parseThreads(value, out);
     }
-    if (optionIs(arg, "--front", &value)) {
+    if (optionIs(arg, "--front", 7, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--front");
         if (value == NULL) return false;
         /* `jai` is the only front end. `c` is still recognised so that a
@@ -314,7 +402,7 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         cliError("--front expects `jai`, got `%s`", value);
         return false;
     }
-    if (optionIs(arg, "--emit", &value)) {
+    if (optionIs(arg, "--emit", 6, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--emit");
         return value != NULL && parseEmit(value, st);
     }
@@ -322,7 +410,7 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
      * command as much as `run` is, and claiming it here is what makes
      * `jaithon --eval EXPR file.jai` say that the file has no place on that
      * command line instead of quietly running the file. */
-    if (optionIs(arg, "--eval", &value)) {
+    if (optionIs(arg, "--eval", 6, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--eval");
         if (value == NULL) return false;
         if (*value == '\0') {
@@ -334,7 +422,7 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         st->haveCommand = true;
         return true;
     }
-    if (optionIs(arg, "--color", &value)) {
+    if (optionIs(arg, "--color", 7, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--color");
         if (value == NULL) return false;
         if (strcmp(value, "auto") == 0)        gColorMode = COLOR_AUTO;
@@ -346,7 +434,7 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         }
         return true;
     }
-    if (optionIs(arg, "--out", &value)) {
+    if (optionIs(arg, "--out", 5, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--out");
         if (value == NULL) return false;
         out->output = value;
@@ -376,7 +464,7 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
 }
 
 /* Commands that consume their positional arguments as source paths. */
-static bool commandTakesInputs(JaiCommand command) {
+static inline bool commandTakesInputs(JaiCommand command) {
     switch (command) {
     case CMD_REPL:
     case CMD_EVAL:
@@ -388,7 +476,7 @@ static bool commandTakesInputs(JaiCommand command) {
     }
 }
 
-static bool commandTakesOutput(JaiCommand command) {
+static inline bool commandTakesOutput(JaiCommand command) {
     switch (command) {
     case CMD_BUILD:
     case CMD_DOC:
@@ -403,7 +491,7 @@ static bool commandTakesOutput(JaiCommand command) {
 
 /* Commands for which "no paths given" is an error rather than "use the
  * current directory". */
-static bool commandNeedsInput(JaiCommand command) {
+static inline bool commandNeedsInput(JaiCommand command) {
     switch (command) {
     case CMD_RUN:
     case CMD_CHECK:
@@ -425,10 +513,14 @@ bool jaiCliParse(int argc, char **argv, JaiCliOptions *out) {
     out->command = CMD_REPL;
 
     gArgSlots = argc > 0 ? argc : 1;
-    out->inputs = JAI_ALLOC(const char *, gArgSlots);
-    out->toolArgs = JAI_ALLOC(const char *, gArgSlots);
-    out->scriptArgv = JAI_ALLOC(char *, gArgSlots);
-    gIncludeDirs = JAI_ALLOC(const char *, gArgSlots);
+
+    const size_t slots = (size_t)gArgSlots;
+    gArgStorage = JAI_ALLOC(void *, slots * 4u);
+
+    out->inputs = (const char **)(gArgStorage);
+    out->toolArgs = (const char **)(gArgStorage + slots);
+    out->scriptArgv = (char **)(gArgStorage + slots * 2u);
+    gIncludeDirs = (const char **)(gArgStorage + slots * 3u);
     gIncludeCount = 0;
 
     ParseState st = {out, false, -1};
@@ -508,15 +600,18 @@ bool jaiCliParse(int argc, char **argv, JaiCliOptions *out) {
 
 static void cliFreeOptions(JaiCliOptions *opts) {
     if (opts == NULL) return;
-    JAI_FREE_ARRAY(const char *, opts->inputs, gArgSlots);
-    JAI_FREE_ARRAY(const char *, opts->toolArgs, gArgSlots);
-    JAI_FREE_ARRAY(char *, opts->scriptArgv, gArgSlots);
-    JAI_FREE_ARRAY(const char *, gIncludeDirs, gArgSlots);
+
+    if (gArgStorage != NULL) {
+        JAI_FREE_ARRAY(void *, gArgStorage, (size_t)gArgSlots * 4u);
+    }
+
     opts->inputs = NULL;
     opts->toolArgs = NULL;
     opts->scriptArgv = NULL;
     gIncludeDirs = NULL;
+    gArgStorage = NULL;
     gIncludeCount = 0;
+    gArgSlots = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -545,41 +640,49 @@ static int compareNames(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-static bool hasJaiExtension(const char *name) {
-    size_t len = strlen(name);
-    return len > 4 && strcmp(name + len - 4, ".jai") == 0;
+static inline bool hasJaiExtension(const char *name) {
+    const size_t len = strlen(name);
+    return len > 4 && memcmp(name + len - 4, ".jai", 4) == 0;
 }
 
 /* Append `path` if it is a file, or every .jai file beneath it if it is a
  * directory. Directory order is sorted so that output is reproducible. */
-static bool collectSources(const char *path, PathList *out) {
-    if (!jaiPathExists(path)) {
-        cliError("no such file or directory: %s", path);
-        return false;
-    }
-    if (!jaiPathIsDir(path)) {
-        JAI_VEC_PUSH(char *, out, jaiStrdup(path));
-        return true;
-    }
-
+static bool collectDirectorySources(const char *path, PathList *out) {
     int count = 0;
     char **names = jaiListDir(path, &count);
+
     if (names == NULL) {
         cliError("cannot read directory: %s", path);
         return false;
     }
-    if (count > 1) qsort(names, (size_t)count, sizeof(char *), compareNames);
+
+    if (count > 1)
+        qsort(names, (size_t)count, sizeof(char *), compareNames);
 
     bool ok = true;
-    for (int i = 0; i < count; i++) {
-        const char *name = names[i];
-        if (name == NULL || name[0] == '.') continue;
-        if (strcmp(name, "__jaicache__") == 0) continue;
+
+    for (int i = 0; i < count; ++i) {
+        const char *const name = names[i];
+
+        if (name == NULL || name[0] == '.')
+            continue;
+
+        if (strcmp(name, "__jaicache__") == 0)
+            continue;
 
         char child[JAI_MAX_PATH];
         jaiPathJoin(child, sizeof child, path, name);
-        if (jaiPathIsDir(child)) {
-            if (!collectSources(child, out)) { ok = false; break; }
+
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            /*
+             * We already know this child is a directory. Recurse directly
+             * instead of running exists()+isDir() again inside collectSources.
+             */
+            if (!collectDirectorySources(child, out)) {
+                ok = false;
+                break;
+            }
         } else if (hasJaiExtension(name)) {
             JAI_VEC_PUSH(char *, out, jaiStrdup(child));
         }
@@ -587,6 +690,22 @@ static bool collectSources(const char *path, PathList *out) {
 
     freeNameList(names, count);
     return ok;
+}
+
+static bool collectSources(const char *path, PathList *out) {
+    struct stat st;
+
+    if (stat(path, &st) != 0) {
+        cliError("no such file or directory: %s", path);
+        return false;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        JAI_VEC_PUSH(char *, out, jaiStrdup(path));
+        return true;
+    }
+
+    return collectDirectorySources(path, out);
 }
 
 static bool collectAllInputs(const JaiCliOptions *opts, PathList *out,
@@ -621,62 +740,90 @@ static void releaseSource(char *source, size_t length, const ObjModule *module) 
  * both left on the GC root stack (module pushed first) and the caller pops two
  * roots once it is done with them. On failure nothing is rooted and the
  * diagnostics have already been rendered. */
+static ObjFunction *compileOwnedSource(const char *path,
+                                       char *source, size_t length,
+                                       const CodegenOptions *codegen,
+                                       ObjModule **outModule,
+                                       uint64_t *outSourceHash) {
+    char name[256];
+    char absolute[JAI_MAX_PATH];
+
+    jaiModuleNameFor(path, name, sizeof name);
+    if (!jaiPathAbsolute(absolute, sizeof absolute, path)) {
+        snprintf(absolute, sizeof absolute, "%s", path);
+    }
+
+    /*
+     * build needs the source hash and the self-hosted front end needs the same
+     * hash. Compute it from the exact buffer being compiled, never by reopening
+     * the file after compilation.
+     */
+    uint64_t sourceHash = 0;
+    if (gSelfHosted || outSourceHash != NULL)
+        sourceHash = jaiSourceHash(source, length);
+
+    if (outSourceHash != NULL)
+        *outSourceHash = sourceHash;
+
+    ObjModule *module = jaiModuleNew(jaiStringInternC(name),
+                                     jaiStringInternC(absolute));
+    jaiPushRoot(OBJ_VAL(module));
+
+    ObjFunction *body;
+
+    if (gSelfHosted) {
+        /*
+         * The self-hosted bridge does not register the source itself, so give
+         * ownership to the diagnostic registry before compiling it.
+         */
+        const int fileId = jaiSourceAdd(absolute, source, length);
+        module->sourceFileId = fileId;
+
+        const JaiSourceFile *const registered = jaiSourceGet(fileId);
+        body = jaiSelfHostedCompileInto(
+            registered != NULL ? registered->source : source,
+            registered != NULL ? registered->length : length,
+            absolute, module, sourceHash, codegen->optLevel);
+    } else {
+        body = jaiCompileSource(source, length, absolute, module, codegen);
+        releaseSource(source, length, module);
+    }
+
+    const bool hadErrors = cliFlush();
+
+    if (body == NULL || hadErrors) {
+        jaiPopRoot();
+
+        if (body == NULL && !hadErrors) {
+            cliError("%s: compilation failed", path);
+            (void)cliFlush();
+        }
+
+        return NULL;
+    }
+
+    jaiPushRoot(OBJ_VAL(body));
+
+    if (outModule != NULL)
+        *outModule = module;
+
+    return body;
+}
+
 static ObjFunction *compileFile(const char *path, const CodegenOptions *codegen,
-                                ObjModule **outModule) {
+                                ObjModule **outModule,
+                                uint64_t *outSourceHash) {
     size_t length = 0;
     char *source = jaiReadFile(path, &length);
+
     if (source == NULL) {
         cliError("cannot read %s", path);
         (void)cliFlush();
         return NULL;
     }
 
-    char name[256];
-    char absolute[JAI_MAX_PATH];
-    jaiModuleNameFor(path, name, sizeof name);
-    if (!jaiPathAbsolute(absolute, sizeof absolute, path)) {
-        snprintf(absolute, sizeof absolute, "%s", path);
-    }
-
-    ObjModule *module = jaiModuleNew(jaiStringInternC(name),
-                                     jaiStringInternC(absolute));
-    jaiPushRoot(OBJ_VAL(module));
-
-    /* Which front end. `--front=jai` has to reach every command that compiles,
-     * or `build` and `disasm` would quietly keep using the C one and the flag
-     * would be a lie on two of the commands most likely to be pointed at it. */
-    ObjFunction *body;
-    if (gSelfHosted) {
-        /* Register before compiling. `jaiCompileSource` does this on the C
-         * path and the bridge does not, so without it the module keeps file id
-         * zero and every span the self-hosted front end emits points at a file
-         * nothing registered — a build with no line numbers. */
-        uint64_t hash = jaiSourceHash(source, length);
-        int fileId = jaiSourceAdd(absolute, source, length); /* takes source */
-        module->sourceFileId = fileId;
-        const JaiSourceFile *registered = jaiSourceGet(fileId);
-        body = jaiSelfHostedCompileInto(
-            registered != NULL ? registered->source : source,
-            registered != NULL ? registered->length : length,
-            absolute, module, hash, codegen->optLevel);
-    } else {
-        body = jaiCompileSource(source, length, absolute, module, codegen);
-        releaseSource(source, length, module);
-    }
-
-    bool hadErrors = cliFlush();
-    if (body == NULL || hadErrors) {
-        jaiPopRoot();
-        if (body == NULL && !hadErrors) {
-            cliError("%s: compilation failed", path);
-            (void)cliFlush();
-        }
-        return NULL;
-    }
-
-    jaiPushRoot(OBJ_VAL(body));
-    if (outModule != NULL) *outModule = module;
-    return body;
+    return compileOwnedSource(path, source, length, codegen,
+                              outModule, outSourceHash);
 }
 
 /* ------------------------------------------------------------------ */
@@ -745,30 +892,42 @@ static int cmdEval(const JaiCliOptions *opts) {
     bool incomplete = false;
     jaiReplConfigure(opts);
 
+    char stackLine[512];
     const char *cursor = opts->eval;
+
     while (*cursor != '\0') {
-        const char *end = strchr(cursor, '\n');
-        size_t length = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
-        char *line = JAI_ALLOC(char, length + 1);
+        const char *const end = strchr(cursor, '\n');
+        const size_t length =
+            end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+
+        char *line = stackLine;
+
+        if (length + 1 > sizeof stackLine)
+            line = JAI_ALLOC(char, length + 1);
+
         memcpy(line, cursor, length);
         line[length] = '\0';
+
         (void)jaiReplFeed(line, &incomplete);
-        JAI_FREE_ARRAY(char, line, length + 1);
-        if (end == NULL) break;
+
+        if (line != stackLine)
+            JAI_FREE_ARRAY(char, line, length + 1);
+
+        if (end == NULL)
+            break;
+
         cursor = end + 1;
     }
-    /* The REPL flushes once per input for the same reason: diagnostics leave
-     * as they are made, and stdout to a pipe would otherwise arrive after. */
+
     fflush(stdout);
 
-    /* Only the last line's verdict: an earlier one that was incomplete is a
-     * continuation, which is the whole reason the loop above exists. */
     if (incomplete) {
         cliError("--eval expects a complete expression, but `%s` is the start "
                  "of one", opts->eval);
         (void)cliFlush();
         return 1;
     }
+
     return jaiReplFailed() ? 1 : 0;
 }
 
@@ -778,7 +937,11 @@ static int cmdEval(const JaiCliOptions *opts) {
 
 static int buildOne(const char *path, const JaiCliOptions *opts) {
     ObjModule *module = NULL;
-    ObjFunction *body = compileFile(path, &opts->run.codegen, &module);
+    uint64_t hash = 0;
+
+    ObjFunction *body =
+        compileFile(path, &opts->run.codegen, &module, &hash);
+
     if (body == NULL) return 1;
 
     int status = 0;
@@ -791,11 +954,6 @@ static int buildOne(const char *path, const JaiCliOptions *opts) {
         jaiPopRoots(2);
         return 1;
     }
-
-    size_t sourceLength = 0;
-    char *source = jaiReadFile(path, &sourceLength);
-    uint64_t hash = source != NULL ? jaiSourceHash(source, sourceLength) : 0;
-    if (source != NULL) JAI_FREE_ARRAY(char, source, sourceLength + 1);
 
     uint32_t flags = 0;
     if (opts->run.codegen.debugInfo) flags |= JAIC_FLAG_DEBUG;
@@ -909,18 +1067,18 @@ static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
  * hand it to the lexer — which used to report `unexpected control character
  * U+0000` on the header. The layout is spec/BYTECODE.md 7; only the fixed
  * prefix is decoded here, and jaiDeserializeModule validates the rest. */
-static bool imageIsJaic(const uint8_t *data, size_t size) {
+static inline bool imageIsJaic(const uint8_t *data, size_t size) {
     return size >= 4 && memcmp(data, JAIC_MAGIC, 4) == 0;
 }
 
-static uint16_t imageU16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint16_t imageU16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-static uint32_t imageU32(const uint8_t *p) {
+static inline uint32_t imageU32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
          | ((uint32_t)p[3] << 24);
 }
 
-static uint64_t imageU64(const uint8_t *p) {
+static inline uint64_t imageU64(const uint8_t *p) {
     return (uint64_t)imageU32(p) | ((uint64_t)imageU32(p + 4) << 32);
 }
 
@@ -1003,12 +1161,23 @@ static int cmdDisasm(const JaiCliOptions *opts) {
             JAI_FREE_ARRAY(char, image, imageSize + 1);
             continue;
         }
-        if (image != NULL) JAI_FREE_ARRAY(char, image, imageSize + 1);
-
         ObjModule *module = NULL;
-        ObjFunction *body = compileFile(files.data[i], &opts->run.codegen,
-                                        &module);
-        if (body == NULL) { status = 1; continue; }
+        ObjFunction *body;
+
+        if (image != NULL) {
+            /* compileOwnedSource takes ownership of image. */
+            body = compileOwnedSource(files.data[i], image, imageSize,
+                                      &opts->run.codegen, &module, NULL);
+        } else {
+            /* Preserve the old retry behavior when the first read failed. */
+            body = compileFile(files.data[i], &opts->run.codegen,
+                               &module, NULL);
+        }
+
+        if (body == NULL) {
+            status = 1;
+            continue;
+        }
         fprintf(out, "; %s\n", files.data[i]);
         disassembleTree(out, body, 0);
         jaiPopRoots(2);
@@ -1094,11 +1263,14 @@ static int cmdParseOnly(const JaiCliOptions *opts, bool tokensOnly) {
 /* fmt / test / doc / bench — implemented in Jaithon                    */
 /* ------------------------------------------------------------------ */
 
-static void toolPush(ObjList *args, const char *text) {
-    Value v = OBJ_VAL(jaiStringInternC(text));
-    jaiPushRoot(v);
-    jaiListPush(args, v);
-    jaiPopRoot();
+static inline void toolPush(ObjList *args, const char *text) {
+    ObjString *const s = jaiStringInternC(text);
+
+    JAI_ASSERT(args->count < args->capacity,
+               "tool argument list exceeded its reserved capacity");
+
+    args->items[args->count++] = OBJ_VAL(s);
+    args->version++;
 }
 
 /* Build the list[str] handed to a tool's main().
@@ -1129,7 +1301,7 @@ static ObjList *toolArguments(const JaiCliOptions *opts) {
 }
 
 /* True when the tool's `main` should be called with no arguments at all. */
-static bool toolMainTakesNoArgs(Value entry) {
+static inline bool toolMainTakesNoArgs(Value entry) {
     const ObjFunction *fn = NULL;
     if (IS_CLOSURE(entry)) fn = AS_CLOSURE(entry)->fn;
     else if (IS_FUNCTION(entry)) fn = AS_FUNCTION(entry);
@@ -1197,7 +1369,7 @@ static int runJaithonTool(const JaiCliOptions *opts, const char *tool) {
 /* The prelude is what makes unqualified names resolve (spec §9), so every
  * command that compiles or runs Jaithon needs it. `tokens` only lexes, and
  * `help`/`version` touch no source at all. */
-static bool commandNeedsPrelude(JaiCommand command) {
+static inline bool commandNeedsPrelude(JaiCommand command) {
     switch (command) {
     case CMD_TOKENS:
     case CMD_VERSION:
@@ -1210,7 +1382,7 @@ static bool commandNeedsPrelude(JaiCommand command) {
 
 /* JAITHON_NO_PRELUDE is the switch the runtime reads, so --no-prelude sets it
  * and both sides agree however the process was started. */
-static bool preludeDisabled(const JaiCliOptions *opts) {
+static inline bool preludeDisabled(const JaiCliOptions *opts) {
     if (opts->noPrelude) return true;
     const char *flag = getenv("JAITHON_NO_PRELUDE");
     return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
@@ -1397,9 +1569,15 @@ int main(int argc, char **argv) {
     jaiVMInit();
     initModulePath();
 
-    double started = jaiClockMonotonic();
+    double started = 0.0;
+    if (opts.showTiming)
+        started = jaiClockMonotonic();
+
     int status = jaiCliDispatch(&opts);
-    double elapsed = jaiClockMonotonic() - started;
+
+    double elapsed = 0.0;
+    if (opts.showTiming)
+        elapsed = jaiClockMonotonic() - started;
 
     /* Ordered after whatever the program printed, even when stdout is a pipe
      * and therefore block-buffered. */
