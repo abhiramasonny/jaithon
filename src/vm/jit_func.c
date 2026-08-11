@@ -1077,9 +1077,20 @@ static void emitSaveRestore(Emit *e, bool save) {
  * every write meant for the frame landed in the caller's, which showed up as a
  * failed stack check inside `jaiJitEnter` with nothing wrong at the crash site.
  * nbody's `advance` is the first body big enough to want one -- twelve spilled
- * locals and a call descriptor come to 528. */
+ * locals and a call descriptor come to 528.
+ *
+ * The field is signed, so the pre-index going in reaches -512 but the post-index
+ * coming out reaches only +504: `imm / 8` is 64 for 512, and 64 read back as a
+ * signed seven-bit field is -64. A 512-byte frame therefore passed the test on
+ * the way in and truncated on the way out, emitting `ldp x29, x30, [sp], #-512`.
+ * That restores the right x30 and returns correctly, having moved the stack
+ * pointer a kilobyte the wrong way, so the crash lands somewhere else entirely
+ * in a caller whose frame is gone. Both ends ask the same question here so they
+ * cannot disagree; whether any body lands on exactly 512 is a matter of luck. */
+static bool framePairFits(const Emit *e) { return e->frameBytes <= 504u; }
+
 static void emitFrameEnter(Emit *e) {
-    if (e->frameBytes <= 512u) {
+    if (framePairFits(e)) {
         emit(e, jaiA64StpPre(29, 30, 31, -(int32_t)e->frameBytes));
         return;
     }
@@ -1088,7 +1099,7 @@ static void emitFrameEnter(Emit *e) {
 }
 
 static void emitFrameLeave(Emit *e) {
-    if (e->frameBytes <= 512u) {
+    if (framePairFits(e)) {
         emit(e, jaiA64LdpPost(29, 30, 31, (int32_t)e->frameBytes));
         return;
     }

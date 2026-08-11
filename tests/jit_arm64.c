@@ -204,6 +204,28 @@ int main(void) {
                              jaiA64AddX(0, 1, 2), jaiA64Ret() };
       check("stp pre / ldp post", runWith(w, 8, cell), 16); }
 
+    /* The same pair at the largest frame that survives a round trip. The
+     * immediate is a signed seven-bit field scaled by eight, so it reaches -512
+     * going in and only +504 coming out: `512 / 8` is 64, and 64 read back as a
+     * signed seven-bit field is -64. A caller that asks for 512 in both
+     * directions gets `ldp x29, x30, [sp], #-512` and returns into a frame that
+     * has moved a kilobyte the wrong way. 504 is the limit the encoding allows,
+     * and since the stack pointer has to stay sixteen-byte aligned -- 504 itself
+     * raises SIGBUS -- 496 is the largest frame that can use the pair at all.
+     * That is why `framePairFits` in jit_func.c stops at 504 and not at 512. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64MovzX(2, 9, 0),
+                             jaiA64StpPre(1, 2, 31, -496),
+                             jaiA64MovzX(1, 0, 0), jaiA64MovzX(2, 0, 0),
+                             jaiA64LdpPost(1, 2, 31, 496),
+                             jaiA64AddX(0, 1, 2), jaiA64Ret() };
+      check("stp pre / ldp post at 496", runWith(w, 8, cell), 16); }
+
+    /* And the truncation itself, so the reason for that limit is pinned rather
+     * than described: asking the post-index for 512 encodes -512. */
+    check("ldp post truncates at 512",
+          (int64_t)jaiA64LdpPost(29, 30, 31, 512),
+          (int64_t)jaiA64LdpPost(29, 30, 31, -512));
+
     /* stp/ldp at a plain offset, base untouched: write two words into the
      * caller's cell array and read one back. */
     { int64_t scratch[4] = { 0, 0, 0, 0 };
