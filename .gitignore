@@ -33,3 +33,6 @@ jit_*.bin
 
 # Working notes
 spec/
+
+# Working notes: kept on disk, deliberately never tracked.
+docs/superpowers
