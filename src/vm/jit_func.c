@@ -5135,33 +5135,6 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.offsetToInst = map;
     e.offsetToDepth = depths;
     e.savedCount = JIT_MAX_SAVED;
-    /* Registers if they fit, memory otherwise. The reserved four (or one) plus
-     * the locals plus the deepest expression must all sit inside the ten
-     * callee-saved registers; a first pass measures the last of those. */
-    {
-        static Emit probe;
-        memset(&probe, 0, sizeof probe);
-        probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
-        probe.iterKind = iterKind; probe.elemSample = elemSample;
-        probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
-        probe.noInline = noInline;
-        probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
-        probe.offsetToInst = map; probe.offsetToDepth = depths;
-        probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
-        for (unsigned i = 0; i < e.locals; i++) {
-            probe.localKind[i]  = e.localKind[i];
-            probe.localShape[i] = e.localShape[i];
-            probe.localClass[i] = e.localClass[i];
-            probe.localTyped[i] = e.localTyped[i];
-            probe.localSeen[i]  = e.localSeen[i];
-        }
-        if (compileBody(&probe, closure) && !probe.failed &&
-            osrReserved(&e) + e.locals + probe.maxValue <= JIT_MAX_SAVED) {
-            e.osrRegLocals = true;
-        }
-        for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
-    }
-
     /* Each slot takes the kind it holds right now. The entry re-checks them on
      * every later entry, so this is a specialisation, not an assumption. */
     for (unsigned i = 0; i < e.locals; i++) {
@@ -5183,6 +5156,50 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             e.localKind[i] = SLOT_OPAQUE;
             e.localTyped[i] = false;
         }
+    }
+
+
+    /* The probe runs AFTER the seeding above, not before it. It used to copy
+     * the kinds while they were still zeroed, so it measured a body in which
+     * every slot was an untyped int -- a different program from the one being
+     * compiled, and the maxValue the register decision rests on was measured on
+     * the wrong one.
+     *
+     * It also narrows `locals` to what the loop actually names. OSR started
+     * from `fn->maxSlots`, the whole slot window of the enclosing function --
+     * eighteen or twenty slots for these bodies -- so
+     * `reserved + locals + maxValue <= 10` could never hold and register-
+     * resident locals were unreachable for any real function. The function tier
+     * has always narrowed to the highest slot its body touches; this does the
+     * same. */
+    /* Registers if they fit, memory otherwise. The reserved four (or one) plus
+     * the locals plus the deepest expression must all sit inside the ten
+     * callee-saved registers; a first pass measures the last of those. */
+    {
+        static Emit probe;
+        memset(&probe, 0, sizeof probe);
+        probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
+        probe.iterKind = iterKind; probe.elemSample = elemSample;
+        probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
+        probe.noInline = noInline;
+        probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
+        probe.offsetToInst = map; probe.offsetToDepth = depths;
+        probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
+        for (unsigned i = 0; i < e.locals; i++) {
+            probe.localKind[i]  = e.localKind[i];
+            probe.localShape[i] = e.localShape[i];
+            probe.localClass[i] = e.localClass[i];
+            probe.localTyped[i] = e.localTyped[i];
+            probe.localSeen[i]  = e.localSeen[i];
+        }
+        if (compileBody(&probe, closure) && !probe.failed) {
+            unsigned used = probe.maxSlotUsed + 1u;
+            if (used < e.locals) e.locals = used;
+            if (osrReserved(&e) + e.locals + probe.maxValue <= JIT_MAX_SAVED) {
+                e.osrRegLocals = true;
+            }
+        }
+        for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
     }
 
     unsigned frame = 16u + 8u * JIT_MAX_SAVED + (unsigned)sizeof(JitCallDesc);
