@@ -1,0 +1,61 @@
+# Modules the seed carries: exactly what the front end needs before it can
+# compile anything, and nothing else.
+#
+# The bootstrap window is narrow. `warmFrontEnd` in src/runtime/module.c loads
+# the compiler's own closure with `sLoadingFrontEnd` set, and only inside that
+# window is the seed consulted. Everything the compiler needs AFTER it is
+# running -- the rest of std, anything under lib/jaiplot -- is compiled from
+# source on demand and cached, so carrying it here only makes the binary
+# bigger.
+#
+# HOW TO REGENERATE THIS LIST. It is the set of modules actually served from
+# the seed, measured rather than reasoned about:
+#
+#     find lib -name __jaicache__ -type d -exec rm -rf {} +
+#     JAITHON_TRACE_LOAD=1 ./jaithon run <something> 2>&1 |
+#         awk '$1=="load" && $2=="seed" {print $3}'
+#
+# over a few different programs, unioned. Note the clean has to be `find`:
+# caches nest (lib/jaithon/compile/__jaicache__), and removing only the
+# top-level ones leaves a warm tree that will under-report by an order of
+# magnitude.
+#
+# A module missing from this list does not degrade anything -- it makes the
+# tree unable to compile at all, loudly, at `make seed-check`. That is the
+# intended failure: over-inclusion costs size, under-inclusion is caught.
+jaithon/ast.jai
+jaithon/compile/check/assign.jai
+jaithon/compile/check/checker.jai
+jaithon/compile/check/ctx.jai
+jaithon/compile/check/decl.jai
+jaithon/compile/check/expr.jai
+jaithon/compile/check/fold.jai
+jaithon/compile/check/kinds.jai
+jaithon/compile/check/modsig.jai
+jaithon/compile/check/nominal.jai
+jaithon/compile/check/operator.jai
+jaithon/compile/check/predicate.jai
+jaithon/compile/check/relate.jai
+jaithon/compile/check/render.jai
+jaithon/compile/check/stmt.jai
+jaithon/compile/check/substitute.jai
+jaithon/compile/check/ty.jai
+jaithon/compile/check/union.jai
+jaithon/compile/check/universe.jai
+jaithon/compile/emit.jai
+jaithon/compile/jaic.jai
+jaithon/compile/lexer.jai
+jaithon/compile/mod.jai
+jaithon/compile/opt/chunk.jai
+jaithon/compile/opt/coalesce.jai
+jaithon/compile/opt/dead.jai
+jaithon/compile/opt/fuse.jai
+jaithon/compile/opt/hoist.jai
+jaithon/compile/opt/mod.jai
+jaithon/compile/opt/peephole.jai
+jaithon/compile/parser.jai
+jaithon/compile/repl.jai
+jaithon/compile/resolve.jai
+std/json.jai
+std/math.jai
+std/str.jai

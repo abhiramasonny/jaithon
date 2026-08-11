@@ -142,16 +142,64 @@ def b64_table(indent="    "):
     return "\n".join(out) + "\n"
 
 
+def read_manifest(path):
+    """The library-relative source paths the seed is allowed to carry.
+
+    Blank lines and `#` comments are ignored so the list can explain itself.
+    """
+    wanted = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                wanted.append(line)
+    return wanted
+
+
 def main():
-    if len(sys.argv) < 3:
+    argv = sys.argv[1:]
+    manifest = None
+    if "--manifest" in argv:
+        i = argv.index("--manifest")
+        if i + 1 >= len(argv):
+            sys.stderr.write("gen_seed.py: --manifest needs a path\n")
+            return 2
+        manifest = argv[i + 1]
+        del argv[i : i + 2]
+
+    if len(argv) < 2:
         sys.stderr.write(
-            "usage: gen_seed.py <cache-root> <output.c> [subtree ...]\n"
+            "usage: gen_seed.py <cache-root> <output.c> [--manifest <file>] "
+            "[subtree ...]\n"
         )
         return 2
 
-    root, out_path = sys.argv[1], sys.argv[2]
-    subtrees = sys.argv[3:] or [root]
+    root, out_path = argv[0], argv[1]
+    subtrees = argv[2:] or [root]
     images = collect(root, subtrees)
+
+    if manifest is not None:
+        # An explicit list, and a missing entry is an error rather than a
+        # smaller seed. The seed is the only bootstrap: a module quietly left
+        # out of it does not degrade anything, it makes the next build unable
+        # to compile at all, and it would do so on someone else's machine.
+        wanted = read_manifest(manifest)
+        missing = [m for m in wanted if m not in images]
+        if missing:
+            sys.stderr.write(
+                "gen_seed.py: %d module(s) in %s were not found in the cache:\n"
+                "  %s\n"
+                "Run the compiler over the library first so __jaicache__ holds "
+                "them.\n" % (len(missing), manifest, "\n  ".join(missing))
+            )
+            return 1
+        dropped = len(images) - len(wanted)
+        images = {m: images[m] for m in wanted}
+        sys.stderr.write(
+            "gen_seed.py: manifest keeps %d module(s), leaves out %d\n"
+            % (len(wanted), dropped)
+        )
+
     if not images:
         sys.stderr.write(
             "gen_seed.py: no .jaic images under %r.\n"
