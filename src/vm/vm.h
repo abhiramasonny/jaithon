@@ -124,6 +124,13 @@ bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out);
+/* The result kind an OP_INVOKE site has been observed to produce for a
+ * receiver of `receiver`'s type, or JAI_FB_NONE. The builtin cache key lives
+ * in vm.c, so the way-matching does too. A PREDICTION -- see the note on
+ * InlineCache::resultKind; every caller must guard what it emits. */
+uint8_t jaiInvokeResultFeedback(const Chunk *chunk, uint16_t cacheIdx,
+                                Value receiver);
+
 /* OP_GET_SLICE's semantics, callable from the compiled tier. */
 bool jaiSliceGet(Value container, Value startValue, Value stopValue,
                  Value stepValue, bool hasStart, bool hasStop, bool hasStep,

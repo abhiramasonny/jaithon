@@ -165,6 +165,17 @@ void jaiJitMarkFrames(void) {
  * otherwise. The pointers in the registers stay valid across it because the
  * collector does not move objects -- only reachability was ever in question.
  *
+ * They go in as a RANGE rather than one at a time. Copying them into the
+ * collector's temp-root array was O(roots) on both sides of every call-out,
+ * and the descriptor already holds them contiguously in the caller's frame,
+ * which outlives the call by construction. Measured on its own -- no other
+ * change -- alloc_churn -7.5%, nbody -7%, spectral -4%, sort_merge -2.6%,
+ * object_dispatch a wash. It is also what turned a compiled dict_ops loop
+ * from 4.7% SLOWER than the interpreter into 5.5% faster: three call-outs an
+ * iteration, three to five roots each. An earlier attempt at a bulk
+ * `jaiGCPushRoots` measured zero and was reverted; the difference is that a
+ * bulk push still copies every value and a range copies none.
+ *
  * Returns 0 on success and 1 with an exception pending. */
 /* Raise the overflow the interpreter would have raised.
  *
@@ -243,30 +254,30 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
  * does, because push and its kin allocate. */
 /* A method on an instance: the receiver is args[0]. */
 static int jitInvokeMethod(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiCallMethodWithReceiver(d->callee, d->args, (int)d->argc,
                                         &d->result);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return ok ? 0 : 1;
 }
 
 static int jitInvokeNative(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiInvokeNativeWithReceiver(d->callee, d->args, (int)d->argc,
                                           &d->result);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return ok ? 0 : 1;
 }
 
 /* Build a list from the descriptor's arguments. Allocating, so the roots go
  * down first exactly as for a call. */
 static int jitBuildList(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjList *list = jaiListNew((int)d->argc);
     for (int64_t i = 0; i < d->argc; i++) list->items[i] = d->args[i];
     list->count = (int)d->argc;
     d->result = OBJ_VAL(list);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return 0;
 }
 
@@ -274,25 +285,25 @@ static int jitBuildList(JitCallDesc *d) {
  * the stop, args[2] whether it is inclusive. Allocating twice, so the roots go
  * down first as for any other call out of compiled code. */
 static int jitMakeRangeIter(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjRange *r = jaiRangeNew(AS_INT(d->args[0]), AS_INT(d->args[1]), 1,
                               AS_INT(d->args[2]) != 0);
     jaiGCPushRoot(OBJ_VAL(r));
     ObjIter *it = jaiIterNew(ITER_RANGE, OBJ_VAL(r));
     jaiGCPopRoot();
     d->result = OBJ_VAL(it);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return 0;
 }
 
 /* Make an iterator over whatever args[0] is. */
 static int jitMakeIter(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     Value src = d->args[0];
     IterKind k = IS_LIST(src) ? ITER_LIST : ITER_LIST;
     ObjIter *it = jaiIterNew(k, src);
     d->result = OBJ_VAL(it);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return IS_LIST(src) ? 0 : 1;
 }
 
@@ -303,19 +314,19 @@ static int jitMakeIter(JitCallDesc *d) {
  * checks at compile time that the module has not bound its own `str`, and the
  * module version retires this form if one appears. */
 static int jitFormat(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjString *formatted = jaiValueFormat(d->args, (int)d->argc);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     if (formatted == NULL) return 1;
     d->result = OBJ_VAL(formatted);
     return 0;
 }
 
 static int jitIterStep(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     Value item;
     bool ok = jaiIterNext(AS_ITER(d->args[0]), &item);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     if (!ok) return vm.hasException ? 2 : 1;
     d->result = item;
     return 0;
@@ -416,15 +427,15 @@ static ObjInstance *jitInstanceAlloc(ObjClass *cls) {
 /* Allocate an instance of args[0]'s class, nothing more. The fields are stored
  * by the compiled code that called this. */
 static int jitNewInstance(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
     d->result = OBJ_VAL(inst);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return 0;
 }
 
 static int jitGetSlice(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     uint8_t flags = (uint8_t)d->aux;
     bool hasStart = (flags & 1) != 0, hasStop = (flags & 2) != 0,
          hasStep = (flags & 4) != 0;
@@ -434,14 +445,27 @@ static int jitGetSlice(JitCallDesc *d) {
     Value stepV  = hasStep  ? d->args[at++] : NULL_VAL;
     bool ok = jaiSliceGet(d->args[0], startV, stopV, stepV,
                           hasStart, hasStop, hasStep, &d->result);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return ok ? 0 : 1;
 }
 
+/* `d[k] = v` where d is a dict, whose object type the call site has guarded.
+ *
+ * A dict store is not a list store: the index is a hash key rather than an
+ * offset, so there is nothing to normalise inline and the work is a table
+ * probe either way. What it saves over the interpreter is the dispatch and
+ * the indexSet type ladder, not the probe. */
+static int jitSetIndexDict(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    (void)jaiDictSet(AS_DICT(d->args[0]), d->args[1], d->args[2]);
+    jaiGCPopRootRange();
+    return vm.hasException ? 1 : 0;
+}
+
 static int jitCallOut(JitCallDesc *d) {
-    for (int64_t i = 0; i < d->nroots; i++) jaiGCPushRoot(d->roots[i]);
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
-    jaiGCPopRoots((int)d->nroots);
+    jaiGCPopRootRange();
     return ok ? 0 : 1;
 }
 
@@ -1962,6 +1986,42 @@ static void emitVersionBump(Emit *e, ObjModule *m) {
     emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
     emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
     emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+}
+
+/* The stack kind a recorded OP_INVOKE result predicts, and the tag a guard
+ * must see for it to hold. False when the tier has no use for the byte --
+ * never observed, mixed, null, or something whose kind carries more than the
+ * byte does.
+ *
+ * SLOT_INST is deliberately absent. It carries a class shape, and this byte
+ * names only the object type, so admitting it would silently lose the shape
+ * every field offset in the body was resolved against.
+ *
+ * A class, a closure and a native are absent for the same reason globalKind
+ * leaves them out: they have stack kinds of their own that occupy no register,
+ * and SLOT_OBJ would be a worse answer than declining. */
+static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
+    switch (fb) {
+    case 1u + VAL_INT:   *k = SLOT_INT;   *tag = VAL_INT;   return true;
+    case 1u + VAL_FLOAT: *k = SLOT_FLOAT; *tag = VAL_FLOAT; return true;
+    case 1u + VAL_BOOL:  *k = SLOT_BOOL;  *tag = VAL_BOOL;  return true;
+    default: break;
+    }
+    if (fb < JAI_FB_OBJ || fb >= JAI_FB_OBJ + (unsigned)OBJ_TYPE_COUNT) {
+        return false;
+    }
+    switch ((ObjType)(fb - JAI_FB_OBJ)) {
+    case OBJ_INSTANCE: case OBJ_CLASS: case OBJ_TRAIT:
+    case OBJ_CLOSURE:  case OBJ_FUNCTION: case OBJ_NATIVE:
+    case OBJ_BOUND:    case OBJ_ENUM: case OBJ_ENUM_CTOR:
+        return false;
+    default: break;
+    }
+    /* Anything else on the heap can be loaded, passed and stored and nothing
+     * else, which is exactly SLOT_OBJ. The tag guard below is the whole of
+     * what makes that sound: whatever object comes back, it is an object. */
+    *k = SLOT_OBJ; *tag = VAL_OBJ;
+    return true;
 }
 
 /* The kind a global's live value has, or false when the tier has no kind for
@@ -5282,7 +5342,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
                 branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
-                emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+                /* A bool is one byte; see the note in the SLOT_OBJ arm below.
+                 * Latent here since this path was written -- it needs a method
+                 * returning bool that emitDirectCall declines, which nothing
+                 * in the suite does -- and fixed with the arm that found it. */
+                if (rkind == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
+                } else {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+                }
                 if (rkind == SLOT_INST) {
                     /* "an object" is not "an object of this class", and a
                      * method entered with another specialisation runs
@@ -5297,6 +5365,105 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
 
                 e->wroteHeap = true;
+                off += 7;
+                break;
+            }
+
+            if (rk == SLOT_OBJ) {
+                /* A built-in method on a receiver the model types only as
+                 * "some object" -- a dict, a string, a set, a tuple. Three
+                 * things have to be answered and only the third was ever the
+                 * blocker.
+                 *
+                 * WHICH METHOD. From the observed receiver, the way the
+                 * SLOT_LIST arm below does it: a built-in method is a function
+                 * of (receiver type, name) and the name is in the instruction.
+                 *
+                 * THAT IT IS STILL THAT TYPE. SLOT_OBJ pins nothing, and
+                 * `for x in [d, "s"]` is enough to arrive here with either, so
+                 * the object type is guarded before anything is consumed. A
+                 * miss resumes this instruction with the receiver and every
+                 * argument still on the interpreter's stack.
+                 *
+                 * WHAT COMES BACK. `dict.get` has no result kind and no
+                 * argument determines one, and the tier had no per-call-site
+                 * feedback to predict from -- `stackSeen` comes from a live
+                 * frame's locals and a call result has never been in one. It
+                 * does now: InlineCache::resultKind, written where the cache
+                 * is filled. It is a PREDICTION and the tag guard after the
+                 * call is what makes it sound, deoptimising to the instruction
+                 * AFTER the call because the call has happened and must not
+                 * happen twice. A result the next instruction pops needs no
+                 * prediction at all. */
+                Value oseen = e->stackSeen[ridx];
+                if (!IS_OBJ(oseen)) {
+                    e->whyNot = "an invoke on an object with nothing to look at";
+                    return false;
+                }
+                if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+                Value oname = fn->chunk.constants.data[nameIdx];
+                if (!IS_STRING(oname)) return false;
+                Value obound;
+                if (!jaiBuiltinMethod(oseen, AS_STRING(oname), &obound)) {
+                    e->whyNot = "an invoke that is not a builtin of the "
+                                "observed receiver's type";
+                    return false;
+                }
+                Value onative = IS_BOUND(obound) ? AS_BOUND(obound)->method
+                                                 : obound;
+                if (!IS_NATIVE(onative)) return false;
+
+                bool odiscarded = (off + 7 < count && code[off + 7] == OP_POP);
+                SlotKind orkind = SLOT_INT;
+                unsigned owantTag = VAL_INT;
+                if (!odiscarded) {
+                    uint8_t fb = jaiInvokeResultFeedback(
+                        &fn->chunk, jaiReadU16(code + off + 5), oseen);
+                    if (!feedbackSlotKind(fb, &orkind, &owantTag)) {
+                        e->whyNot = "a builtin whose result kind has not been "
+                                    "observed";
+                        return false;
+                    }
+                }
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - argc - 1,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A,
+                                       (unsigned)OBJ_TYPE(oseen)));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                if (!emitDescriptor(e, onative, ridx, argc + 1,
+                                    (void *)&jitInvokeNative)) {
+                    return false;
+                }
+                for (unsigned i = 0; i <= argc; i++) {
+                    unsigned r;
+                    if (!popValue(e, &r, NULL)) return false;
+                }
+                e->wroteHeap = true;
+                if (odiscarded) {
+                    off += 8;          /* the OP_POP this consumed */
+                    break;
+                }
+                if (!pushValue(e, orkind, 0, NULL)) return false;
+                unsigned orat = e->descOffset +
+                                (unsigned)offsetof(JitCallDesc, result);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, orat));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, owantTag));
+                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+                /* One byte for a bool. `BOOL_VAL` writes the union's `boolean`
+                 * member and nothing above it, so an 8-byte load puts whatever
+                 * that Value's slot held before into a register a SLOT_BOOL is
+                 * required to hold 0 or 1 in -- and every consumer of one is a
+                 * `cbnz` on the whole word. It cost a day here: the front end
+                 * is itself compiled, and a `flags.get(name, false)` inside it
+                 * came back true, so jaithon reported `list[fn(T) -> bool]`
+                 * for a parameter that was not variadic. */
+                if (orkind == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, orat + 8));
+                } else {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, 31, orat + 8));
+                }
                 off += 7;
                 break;
             }
@@ -5847,6 +6014,37 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * Sixteen refusals across the benchmarks came from its absence --
              * `queens` could not compile the function that does the work. */
             if (e->depth < 3) return false;
+            if (e->stack[e->depth - 3] == SLOT_OBJ) {
+                /* `d[k] = v`. A dict is as ordinary a container in this
+                 * language as a list, and without this the invoke arm above
+                 * buys nothing: dict_ops' loop moved its decline from the
+                 * `get` straight to this store, and a loop that declines
+                 * anywhere runs interpreted end to end.
+                 *
+                 * The object type is guarded before anything is consumed, so
+                 * a miss resumes this instruction with the container, the key
+                 * and the value all still on the interpreter's stack. */
+                unsigned sidx = e->depth - 3;
+                if (!IS_DICT(e->stackSeen[sidx])) {
+                    e->whyNot = "an index store into an object that is not a dict";
+                    return false;
+                }
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 3,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeopt(e, JAI_A64_NE);
+                if (!emitDescriptor(e, NULL_VAL, sidx, 3,
+                                    (void *)&jitSetIndexDict)) {
+                    return false;
+                }
+                for (unsigned i = 0; i < 3; i++) {
+                    unsigned r;
+                    if (!popValue(e, &r, NULL)) return false;
+                }
+                e->wroteHeap = true;
+                off += 1;
+                break;
+            }
             if (e->stack[e->depth - 3] != SLOT_LIST) return false;
             if (e->stack[e->depth - 2] != SLOT_INT) return false;
             SlotKind vk = e->stack[e->depth - 1];
@@ -8284,6 +8482,12 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         case SLOT_BOOL:  if (!IS_BOOL(v))  return 0; break;
         case SLOT_LIST:  if (!IS_LIST(v))  return 0; break;
         case SLOT_INST:  if (!IS_INSTANCE(v)) return 0; break;
+        /* The whole-function tier's jitArgIn has always checked this one; the
+         * loop tier let it through `default`, so a slot compiled as "some
+         * object" could be entered holding an int and its payload read as a
+         * pointer. Nothing had exercised it, because nothing emitted a load
+         * off such a slot until the invoke arm below guards its receiver. */
+        case SLOT_OBJ:   if (!IS_OBJ(v))   return 0; break;
         default: break;   /* opaque: never read */
         }
     }

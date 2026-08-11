@@ -220,9 +220,50 @@ typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
 
 #define JAI_IC_WAYS 4
 
+/* What an OP_INVOKE site was observed to RETURN, one byte per way.
+ *
+ * The compiled tier can already guard a call's result -- the SLOT_INST arm
+ * deoptimises to the instruction after the call when the tag surprises it --
+ * but for a BUILT-IN method it had nothing to guard against. `stackSeen` is
+ * seeded from a live frame's locals at OSR entry and a call result has never
+ * been in one, so `counts.get(key, 0)` declined for want of a prediction
+ * rather than for want of a guard.
+ *
+ * This is only ever a PREDICTION. The tag guard is what makes it sound: a
+ * builtin that returns something else, today or after someone edits it,
+ * deoptimises instead of miscompiling. Nothing here may be relied on without
+ * emitting that guard.
+ *
+ * It is written where the inline cache is FILLED, not where it hits, so the
+ * interpreter's hot path is untouched -- a store there measured 2.4% of
+ * dict_ops. The cost is that the prediction is the first result the site ever
+ * produced. A site whose kind later changes therefore deoptimises every
+ * iteration; the tier's answer is to decline anything it cannot use (null and
+ * mixed included) rather than to compile a loop that deopts.
+ *
+ * Encoding: 0 never observed, 1 + ValueType for a non-object (1..4; VAL_OBJ
+ * never appears there), JAI_FB_OBJ + ObjType for an object, 255 mixed.
+ *
+ * The bytes sit in what was already padding before `shapeId`'s alignment, so
+ * sizeof(InlineCache) is unchanged. */
+#define JAI_FB_NONE   0u
+#define JAI_FB_OBJ    32u
+#define JAI_FB_MIXED  255u
+
+JAI_INLINE uint8_t jaiFeedbackKind(Value v) {
+    return IS_OBJ(v) ? (uint8_t)(JAI_FB_OBJ + (unsigned)OBJ_TYPE(v))
+                     : (uint8_t)(1u + (unsigned)jaiValueType(v));
+}
+
+JAI_INLINE uint8_t jaiFeedbackMerge(uint8_t prev, uint8_t seen) {
+    if (prev == JAI_FB_NONE) return seen;
+    return prev == seen ? prev : (uint8_t)JAI_FB_MIXED;
+}
+
 typedef struct {
     uint8_t  state;
     uint8_t  count;
+    uint8_t  resultKind[JAI_IC_WAYS];  /* see above; in former padding */
     uint32_t shapeId[JAI_IC_WAYS];   /* ObjClass.shapeId or ObjModule.version */
     uint32_t payload[JAI_IC_WAYS];   /* field slot or global table index */
     Value    cached[JAI_IC_WAYS];    /* bound method for INVOKE sites */
