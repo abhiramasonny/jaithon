@@ -19,14 +19,28 @@ static void freeStr(char *s) {
 }
 
 static char *formatV(const char *fmt, va_list ap) {
+    char stack[256];
+
     va_list probe;
     va_copy(probe, ap);
-    int n = vsnprintf(NULL, 0, fmt, probe);
+    int n = vsnprintf(stack, sizeof stack, fmt, probe);
     va_end(probe);
-    if (n < 0) return jaiStrdup("<malformed diagnostic message>");
 
-    char *buf = JAI_ALLOC(char, (size_t)n + 1);
-    (void)vsnprintf(buf, (size_t)n + 1, fmt, ap);
+    if (n < 0)
+        return jaiStrdup("<malformed diagnostic message>");
+
+    const size_t length = (size_t)n;
+    char *buf = JAI_ALLOC(char, length + 1);
+
+    if (length < sizeof stack) {
+        memcpy(buf, stack, length + 1);
+        return buf;
+    }
+
+    va_list render;
+    va_copy(render, ap);
+    (void)vsnprintf(buf, length + 1, fmt, render);
+    va_end(render);
     return buf;
 }
 
@@ -39,17 +53,31 @@ static JAI_VEC(JaiSourceFile) gSources;
 /* One pass to count lines, one to fill: the index is exact-sized and never
  * grown again, which matters because spans index it on every diagnostic. */
 static void buildLineIndex(JaiSourceFile *f) {
+    const char *const source = f->source;
+    const char *const end = source + f->length;
+
     int lines = 1;
-    for (size_t i = 0; i < f->length; i++) {
-        if (f->source[i] == '\n') lines++;
+    const char *p = source;
+
+    while (p < end) {
+        const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+        if (nl == NULL) break;
+        ++lines;
+        p = nl + 1;
     }
+
     f->lineStarts = JAI_ALLOC(uint32_t, lines);
     f->lineCount = lines;
 
     int n = 0;
     f->lineStarts[n++] = 0;
-    for (size_t i = 0; i < f->length; i++) {
-        if (f->source[i] == '\n' && n < lines) f->lineStarts[n++] = (uint32_t)(i + 1);
+    p = source;
+
+    while (p < end && n < lines) {
+        const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+        if (nl == NULL) break;
+        f->lineStarts[n++] = (uint32_t)((nl - source) + 1);
+        p = nl + 1;
     }
 }
 
@@ -85,14 +113,35 @@ void jaiSourceFreeAll(void) {
 }
 
 /* Index of the line containing `offset`; the offset is assumed clamped. */
-static int lineIndexFor(const JaiSourceFile *f, uint32_t offset) {
-    int lo = 0, hi = f->lineCount - 1;
-    while (lo < hi) {
-        int mid = lo + (hi - lo + 1) / 2;
-        if (f->lineStarts[mid] <= offset) lo = mid;
-        else hi = mid - 1;
+static inline int lineIndexFor(const JaiSourceFile *f, uint32_t offset) {
+    const int count = f->lineCount;
+    if (count <= 1) return 0;
+
+    const uint32_t *const starts = f->lineStarts;
+
+    if (offset < starts[1])
+        return 0;
+
+    const int last = count - 1;
+    if (offset >= starts[last])
+        return last;
+
+    int lo = 1;
+    int hi = last - 1;
+
+    while (lo <= hi) {
+        const int mid = lo + ((hi - lo) >> 1);
+
+        if (starts[mid] <= offset) {
+            if (starts[mid + 1] > offset)
+                return mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
     }
-    return lo;
+
+    return hi < 0 ? 0 : hi;
 }
 
 void jaiSourceLineCol(int fileId, uint32_t offset, int *line, int *col) {
@@ -159,19 +208,36 @@ bool jaiDiagCodeIsWarning(JaiDiagCode code) {
 }
 
 const char *jaiDiagCodeString(JaiDiagCode code) {
-    /* A small ring so that two codes can be live in one printf argument list. */
     static char bufs[4][16];
-    static int next = 0;
+    static unsigned next = 0;
 
     if (code == JAI_OK) return "";
-    char *b = bufs[next];
-    next = (next + 1) & 3;
+
+    char *const b = bufs[next];
+    next = (next + 1u) & 3u;
+
+    int value;
+    char prefix;
 
     if (jaiDiagCodeIsWarning(code)) {
-        (void)snprintf(b, sizeof bufs[0], "W%04d", (int)code - JAI_WARNING_BASE + 100);
+        prefix = 'W';
+        value = (int)code - JAI_WARNING_BASE + 100;
     } else {
-        (void)snprintf(b, sizeof bufs[0], "E%04d", (int)code);
+        prefix = 'E';
+        value = (int)code;
     }
+
+    if ((unsigned)value <= 9999u) {
+        b[0] = prefix;
+        b[1] = (char)('0' + (value / 1000) % 10);
+        b[2] = (char)('0' + (value / 100) % 10);
+        b[3] = (char)('0' + (value / 10) % 10);
+        b[4] = (char)('0' + value % 10);
+        b[5] = '\0';
+        return b;
+    }
+
+    (void)snprintf(b, sizeof bufs[0], "%c%04d", prefix, value);
     return b;
 }
 
@@ -199,53 +265,112 @@ JaiDiagCode jaiDiagCodeFromString(const char *text) {
 /* "did you mean" suggestions                                          */
 /* ------------------------------------------------------------------ */
 
-int jaiNameDistance(const char *a, const char *b, int max) {
-    if (a == NULL || b == NULL || max < 0) return max + 1;
-    size_t la = strlen(a), lb = strlen(b);
-    if (la > JAI_SUGGEST_MAX_LEN || lb > JAI_SUGGEST_MAX_LEN) return max + 1;
-    /* The length gap alone is already a lower bound on the distance. */
-    size_t gap = la > lb ? la - lb : lb - la;
-    if ((int)gap > max) return max + 1;
+/*
+ * Optimal-string-alignment Damerau-Levenshtein, restricted to the band that
+ * can possibly produce a result <= max. Suggestion callers cap max at 3, so
+ * this turns the common O(n*m) matrix into O(n*max) work.
+ */
+static int nameDistanceSized(const char *a, size_t la,
+                             const char *b, size_t lb, int max) {
+    if (max < 0) return max + 1;
+    if (la > JAI_SUGGEST_MAX_LEN || lb > JAI_SUGGEST_MAX_LEN)
+        return max + 1;
 
-    /* Three rows, because a transposition looks back two rows. */
-    int prev2[JAI_SUGGEST_MAX_LEN + 1];
-    int prev[JAI_SUGGEST_MAX_LEN + 1];
-    int cur[JAI_SUGGEST_MAX_LEN + 1];
-    for (size_t j = 0; j <= lb; j++) prev[j] = (int)j;
+    const size_t gap = la > lb ? la - lb : lb - la;
+    if ((int)gap > max)
+        return max + 1;
 
-    for (size_t i = 1; i <= la; i++) {
-        cur[0] = (int)i;
-        int best = cur[0];
-        for (size_t j = 1; j <= lb; j++) {
-            int cost = a[i - 1] == b[j - 1] ? 0 : 1;
-            int d = prev[j] + 1;                      /* delete */
-            if (cur[j - 1] + 1 < d) d = cur[j - 1] + 1;   /* insert */
-            if (prev[j - 1] + cost < d) d = prev[j - 1] + cost; /* substitute */
-            /* Adjacent transposition costs one, not two. */
-            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] &&
-                prev2[j - 2] + 1 < d)
-                d = prev2[j - 2] + 1;
+    const int inf = max + 1;
+    int row0[JAI_SUGGEST_MAX_LEN + 1];
+    int row1[JAI_SUGGEST_MAX_LEN + 1];
+    int row2[JAI_SUGGEST_MAX_LEN + 1];
+
+    int *prev2 = row0;
+    int *prev = row1;
+    int *cur = row2;
+
+    for (size_t j = 0; j <= lb; ++j) {
+        prev2[j] = inf;
+        prev[j] = j <= (size_t)max ? (int)j : inf;
+        cur[j] = inf;
+    }
+
+    for (size_t i = 1; i <= la; ++i) {
+        size_t lo = i > (size_t)max ? i - (size_t)max : 1u;
+        size_t hi = i + (size_t)max;
+        if (hi > lb) hi = lb;
+
+        cur[0] = i <= (size_t)max ? (int)i : inf;
+
+        if (lo > 1)
+            cur[lo - 1] = inf;
+
+        int best = lo == 1 ? cur[0] : inf;
+
+        for (size_t j = lo; j <= hi; ++j) {
+            const int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+
+            int d = prev[j] + 1;
+
+            const int insertion = cur[j - 1] + 1;
+            if (insertion < d) d = insertion;
+
+            const int substitution = prev[j - 1] + cost;
+            if (substitution < d) d = substitution;
+
+            if (i > 1 && j > 1 &&
+                a[i - 1] == b[j - 2] &&
+                a[i - 2] == b[j - 1]) {
+                const int transpose = prev2[j - 2] + 1;
+                if (transpose < d) d = transpose;
+            }
+
             cur[j] = d;
             if (d < best) best = d;
         }
-        /* Every remaining row can only add to the running minimum. */
-        if (best > max) return max + 1;
-        memcpy(prev2, prev, sizeof(int) * (lb + 1));
-        memcpy(prev, cur, sizeof(int) * (lb + 1));
+
+        if (hi < lb)
+            cur[hi + 1] = inf;
+
+        if (best > max)
+            return max + 1;
+
+        int *tmp = prev2;
+        prev2 = prev;
+        prev = cur;
+        cur = tmp;
     }
-    return prev[lb];
+
+    return prev[lb] <= max ? prev[lb] : max + 1;
+}
+
+int jaiNameDistance(const char *a, const char *b, int max) {
+    if (a == NULL || b == NULL)
+        return max + 1;
+
+    return nameDistanceSized(a, strlen(a), b, strlen(b), max);
 }
 
 bool jaiNameIsCloser(const char *name, const char *candidate, int *best) {
-    if (name == NULL || candidate == NULL || best == NULL) return false;
-    if (strcmp(name, candidate) == 0) return false;
+    if (name == NULL || candidate == NULL || best == NULL)
+        return false;
 
-    size_t len = strlen(name);
-    int limit = (int)((len > 3 ? len : 3) / 3);
+    const size_t nameLen = strlen(name);
+    const size_t candidateLen = strlen(candidate);
+
+    if (nameLen == candidateLen &&
+        memcmp(name, candidate, nameLen) == 0)
+        return false;
+
+    int limit = (int)((nameLen > 3 ? nameLen : 3) / 3);
     if (limit > 3) limit = 3;
 
-    int d = jaiNameDistance(name, candidate, limit);
-    if (d > limit || d >= *best) return false;
+    const int d =
+        nameDistanceSized(name, nameLen, candidate, candidateLen, limit);
+
+    if (d > limit || d >= *best)
+        return false;
+
     *best = d;
     return true;
 }
@@ -391,9 +516,9 @@ void jaiDiagAddNote(JaiDiag *d, const char *fmt, ...) {
 }
 
 bool jaiDiagHasErrors(const JaiDiagBag *bag) {
-    if (bag == NULL) return false;
-    if (bag->errorCount > 0) return true;
-    return bag->warningsAsErrors && bag->warningCount > 0;
+    return bag != NULL &&
+           (bag->errorCount > 0 ||
+            (bag->warningsAsErrors && bag->warningCount > 0));
 }
 
 /* ------------------------------------------------------------------ */
@@ -435,20 +560,33 @@ static const char *severityColor(JaiSeverity s, bool color) {
  * advance to the next multiple of JAI_TAB_WIDTH. */
 static int displayColumn(const char *line, size_t len, size_t byteOffset) {
     if (byteOffset > len) byteOffset = len;
+
     int col = 0;
     size_t i = 0;
+
     while (i < byteOffset) {
-        if (line[i] == '\t') {
+        const unsigned char c = (unsigned char)line[i];
+
+        if (c == '\t') {
             col = (col / JAI_TAB_WIDTH + 1) * JAI_TAB_WIDTH;
-            i++;
+            ++i;
             continue;
         }
+
+        if (c < 0x80u) {
+            ++i;
+            ++col;
+            continue;
+        }
+
         int n = 1;
         (void)jaiUtf8Decode(line + i, line + len, &n);
         if (n <= 0) n = 1;
+
         i += (size_t)n;
-        col++;
+        ++col;
     }
+
     return col;
 }
 
@@ -457,21 +595,53 @@ static int displayColumn(const char *line, size_t len, size_t byteOffset) {
 static void writeExpanded(FILE *out, const char *line, size_t len) {
     int col = 0;
     size_t i = 0;
+
     while (i < len) {
-        if (line[i] == '\t') {
-            int target = (col / JAI_TAB_WIDTH + 1) * JAI_TAB_WIDTH;
-            while (col < target) { fputc(' ', out); col++; }
-            i++;
+        const unsigned char c = (unsigned char)line[i];
+
+        if (c == '\t') {
+            const int target =
+                (col / JAI_TAB_WIDTH + 1) * JAI_TAB_WIDTH;
+
+            while (col < target) {
+                fputc(' ', out);
+                ++col;
+            }
+
+            ++i;
             continue;
         }
-        if (line[i] == '\r') { i++; continue; }
+
+        if (c == '\r') {
+            ++i;
+            continue;
+        }
+
+        if (c < 0x80u) {
+            const size_t start = i;
+
+            do {
+                ++i;
+            } while (i < len &&
+                     (unsigned char)line[i] < 0x80u &&
+                     line[i] != '\t' &&
+                     line[i] != '\r');
+
+            const size_t run = i - start;
+            (void)fwrite(line + start, 1, run, out);
+            col += (int)run;
+            continue;
+        }
+
         int n = 1;
         (void)jaiUtf8Decode(line + i, line + len, &n);
         if (n <= 0) n = 1;
-        if (i + (size_t)n > len) n = (int)(len - i);
+        if (i + (size_t)n > len)
+            n = (int)(len - i);
+
         (void)fwrite(line + i, 1, (size_t)n, out);
         i += (size_t)n;
-        col++;
+        ++col;
     }
 }
 
@@ -539,10 +709,17 @@ static void sortMarkers(Marker *m, int n) {
     }
 }
 
-static int digitCount(int n) {
-    int d = 1;
-    while (n >= 10) { n /= 10; d++; }
-    return d;
+static inline int digitCount(int n) {
+    if (n < 10) return 1;
+    if (n < 100) return 2;
+    if (n < 1000) return 3;
+    if (n < 10000) return 4;
+    if (n < 100000) return 5;
+    if (n < 1000000) return 6;
+    if (n < 10000000) return 7;
+    if (n < 100000000) return 8;
+    if (n < 1000000000) return 9;
+    return 10;
 }
 
 static void renderGutterBar(FILE *out, int gw, const char *blue, const char *reset) {
@@ -551,6 +728,21 @@ static void renderGutterBar(FILE *out, int gw, const char *blue, const char *res
 
 /* One location block: the arrow, then every marker line for this file in
  * source order, elided with "..." across gaps. */
+static void writeRepeatedChar(FILE *out, char c, int count) {
+    if (count <= 0) return;
+
+    char block[64];
+    memset(block, (unsigned char)c, sizeof block);
+
+    while (count >= (int)sizeof block) {
+        (void)fwrite(block, 1, sizeof block, out);
+        count -= (int)sizeof block;
+    }
+
+    if (count > 0)
+        (void)fwrite(block, 1, (size_t)count, out);
+}
+
 static void renderBlock(FILE *out, const Marker *m, int n, int gw,
                         JaiSeverity severity, bool color) {
     const char *blue = pick(color, ANSI_BLUE);
@@ -585,9 +777,9 @@ static void renderBlock(FILE *out, const Marker *m, int n, int gw,
 
         const char *mc = m[i].isPrimary ? sev : blue;
         fprintf(out, "%s%*s |%s ", blue, gw, "", reset);
-        for (int c = 0; c < m[i].startCol; c++) fputc(' ', out);
+        writeRepeatedChar(out, ' ', m[i].startCol);
         fputs(mc, out);
-        for (int c = 0; c < m[i].width; c++) fputc(m[i].isPrimary ? '^' : '-', out);
+        writeRepeatedChar(out, m[i].isPrimary ? '^' : '-', m[i].width);
         if (m[i].label != NULL) fprintf(out, " %s", m[i].label);
         fprintf(out, "%s\n", reset);
     }
