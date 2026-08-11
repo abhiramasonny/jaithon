@@ -53,7 +53,13 @@ static inline Obj *allocObj(size_t size, ObjType type) {
      * that stopped being true. */
     if (JAI_UNLIKELY(jaiGCWanted())) jaiGCMaybeCollect();
 
-    Obj *obj = (Obj *)jaiRealloc(NULL, 0, size);
+    /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size class
+     * computed from the same size, so this is the same block from the same
+     * place; what it skips is the call and the five branches that sort out
+     * resize, free and the classes the bins do not serve. Sampled on
+     * alloc_churn, jaiRealloc was 10% of the run for two calls per object. */
+    Obj *obj = (Obj *)(JAI_LIKELY(jaiSmallServes(size)) ? jaiSmallNew(size)
+                                                        : jaiRealloc(NULL, 0, size));
     obj->type = type;
     obj->isMarked = false;
     obj->next = NULL;
