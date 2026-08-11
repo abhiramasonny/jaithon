@@ -30,6 +30,19 @@ bool jaiGCInCollect;
 
 static GCState *activeGC(void) { return jaiGCActive != NULL ? jaiGCActive : vm.gc; }
 
+/* The back edge's one-word form of jaiGCWanted(). The expression below is the
+ * old inline test rearranged, not a new policy: it reads jaiGCActive rather
+ * than activeGC() and g->stress rather than gcStressOn(g) for exactly the
+ * reason the old one did. */
+size_t jaiGCLimit;
+
+void jaiGCSyncLimit(void) {
+    const GCState *g = jaiGCActive;
+    jaiGCLimit = (g != NULL && g->enabled && !jaiGCInCollect && !g->stress)
+                     ? g->nextGC
+                     : 0;
+}
+
 /* The CLI sets its flags on the VM; honour them directly so startup order
  * cannot leave --gc-stress or --debug-gc silently inactive. */
 static bool gcStressOn(const GCState *g)  { return g->stress  || vm.gcStress; }
@@ -91,6 +104,7 @@ void jaiGCInit(GCState *gc) {
     jaiGCActive = gc;
     vm.gc = gc;
     jaiGCInCollect = false;
+    jaiGCSyncLimit();
 }
 
 void jaiGCFree(GCState *gc) {
@@ -116,6 +130,7 @@ void jaiGCFree(GCState *gc) {
 
     if (jaiGCActive == gc) jaiGCActive = NULL;
     if (vm.gc == gc) vm.gc = NULL;
+    jaiGCSyncLimit();
 
     /* Raw free: the gray stack never went through jaiRealloc. See below. */
     free(gc->grayStack);
@@ -127,6 +142,7 @@ void jaiGCFree(GCState *gc) {
 void jaiGCEnable(bool enabled) {
     GCState *g = activeGC();
     if (g != NULL) g->enabled = enabled;
+    jaiGCSyncLimit();
 }
 
 /* ------------------------------------------------------------------ */
@@ -497,6 +513,7 @@ void jaiGCCollect(void) {
     if (g == NULL || !g->enabled || jaiGCInCollect) return;
 
     jaiGCInCollect = true;
+    jaiGCSyncLimit();
     double started = jaiClockMonotonic();
     bool verbose = gcVerboseOn(g);
     size_t before = gcLiveBytes(g);
@@ -517,6 +534,7 @@ void jaiGCCollect(void) {
     size_t freedBytes = before > after ? before - after : 0;
 
     g->nextGC = gcNextThreshold(g, after);
+    jaiGCSyncLimit();
     g->collections++;
     g->totalFreed += freedBytes;
     g->totalPauseSeconds += jaiClockMonotonic() - started;
@@ -529,6 +547,7 @@ void jaiGCCollect(void) {
     }
 
     jaiGCInCollect = false;
+    jaiGCSyncLimit();
 }
 
 void jaiGCMaybeCollect(void) {

@@ -46,15 +46,29 @@ void jaiGCEnable(bool enabled);
 extern GCState *jaiGCActive;     /* NULL until jaiGCInit */
 extern bool     jaiGCInCollect;  /* a collection must never start another */
 
+/* One word standing in for the four inputs of the test below, recomputed by
+ * jaiGCSyncLimit() wherever any of them changes. Inlining the four-input form
+ * cost the loop back edge seven dependent loads -- jaiGCActive, ->enabled,
+ * jaiGCInCollect, ->stress, ->nextGC and the heap total -- on the hottest path
+ * in the interpreter, which the comment there described as "one predictable
+ * branch". It was not. */
+extern size_t jaiGCLimit;
+
 /* Conservative "a collection may be due" test, for the interpreter's loop
  * back edge. Answering it through a call cost 5.4% of a benchmark that never
  * collects. False is a proof that jaiGCMaybeCollect would do nothing; true
- * only means the caller must ask it properly. */
+ * only means the caller must ask it properly. A limit of 0 means "ask
+ * properly every time", which is what a disabled, absent or stressed
+ * collector needs; it is exact for every heap that holds anything at all. */
 static inline bool jaiGCWanted(void) {
-    const GCState *g = jaiGCActive;
-    return !(g != NULL && g->enabled && !jaiGCInCollect && !g->stress &&
-             jaiHeapBytes <= g->nextGC);
+    return jaiHeapBytes > jaiGCLimit;
 }
+
+/* Recompute jaiGCLimit. Called from every place that can change any of its
+ * inputs. Forgetting one is benign in one direction only: too high a limit
+ * delays a collection, too low a one costs a jaiGCMaybeCollect that decides
+ * to do nothing. */
+void jaiGCSyncLimit(void);
 
 /* Links a freshly built object into the collector's list. Deliberately out of
  * line: see the note on the root protocol below. */

@@ -271,14 +271,32 @@ uint32_t jaiChunkAddConstant(Chunk *chunk, Value v);
 void     jaiChunkSpanAt(const Chunk *chunk, int codeOffset, uint32_t *start,
                         uint32_t *end);
 
+/* Operands are little-endian by construction (jaiChunkWriteU16 and friends).
+ * Assembled a byte at a time these cost four instructions for a u16 and six
+ * for a u24 in every operand-carrying opcode; as one unaligned load they cost
+ * one and two. arm64 and x86-64 both permit the unaligned access, and the
+ * three-byte form still reads exactly three bytes, so no chunk needs slack. */
+#if defined(__LITTLE_ENDIAN__) ||                                              \
+    (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#  define JAI_OPERANDS_ARE_NATIVE 1
+#else
+#  define JAI_OPERANDS_ARE_NATIVE 0
+#endif
+
 JAI_INLINE uint16_t jaiReadU16(const uint8_t *p) {
+#if JAI_OPERANDS_ARE_NATIVE
+    uint16_t v;
+    __builtin_memcpy(&v, p, sizeof v);
+    return v;
+#else
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+#endif
 }
 JAI_INLINE uint32_t jaiReadU24(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    return (uint32_t)jaiReadU16(p) | ((uint32_t)p[2] << 16);
 }
 JAI_INLINE int16_t jaiReadI16(const uint8_t *p) {
-    return (int16_t)(p[0] | ((uint16_t)p[1] << 8));
+    return (int16_t)jaiReadU16(p);
 }
 
 /* ------------------------------------------------------------------ */
