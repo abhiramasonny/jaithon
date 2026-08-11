@@ -31,6 +31,13 @@ typedef struct {
     int       tombstones;
     int       capacity;   /* always a power of two, or 0 */
     uint32_t  version;    /* bumped on every mutation; iterators snapshot it */
+    /* Bumped ONLY when a live entry's ADDRESS or KEY may have changed: a
+     * rehash, a delete, a clear. A compiled tier that has baked a JaiEntry*
+     * needs exactly this and nothing weaker -- `version` moves on every value
+     * write, which is the write the JIT is trying to make fast, and nothing
+     * stronger, because reading a slot whose array was freed is a use of freed
+     * memory rather than a wrong answer. Fits the padding after `version`. */
+    uint32_t  moves;
 } JaiTable;
 
 /* A dedicated sentinel distinguishing "deleted" from "never used". */
@@ -59,6 +66,10 @@ bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value);
 /* Index of the live entry for `key`, or -1. Stable until the next mutation;
  * used by the inline caches for globals. */
 int  jaiTableFindIndex(JaiTable *t, Value key);
+/* The live entry for an interned key, or NULL. The address is stable for as
+ * long as `moves` does not change; see the comment on that field. Used by the
+ * JIT to bake a module global's storage into compiled code. */
+JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key);
 
 /* Iteration: start with i = 0, repeat while it returns true.
  *   int i = 0; Value k, v;
