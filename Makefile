@@ -417,7 +417,28 @@ reseed: $(TARGET)
 # the previous seed and compiles the next one's sources explicitly, which is the
 # same guarantee by a route that does not need a second compiler.
 	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/seed_touch.jai >/dev/null 2>&1 || true
-# `lib/jaithon` and not `lib`: running the compiler writes cache entries for
+# STALE COMMENT, KEPT AS A WARNING -- do not follow it. It argued for
+# `lib/jaithon` rather than `lib`, and the invocation below has said `lib` for
+# some time. The comment describes the OLD seed_touch, which populated the cache
+# by importing a module and letting the side effects land; that did vary run to
+# run. It does not any more: seed_touch walks the tree and compiles each file
+# explicitly, so what is collected is exactly what was built.
+#
+# Narrowing to `lib/jaithon` now would WEDGE THE BOOTSTRAP. The compiler imports
+# std modules while it is itself loading -- `std.json` among them -- inside the
+# window where the compiler does not yet exist, so std has to be seeded too.
+# scripts/seed_touch.jai's SEED_ROOT carries that reasoning in full.
+#
+# The walk is blanket rather than a dependency closure, which is why lib/jaiplot
+# is in the seed: 24 modules and 277 KB the compiler never loads. Measured, a
+# seed of `lib/jaithon lib/std` alone still bootstraps cold and still lets
+# `import jaiplot` compile from source, and is 8.7% smaller. It is not done
+# because over-inclusion is the safe direction: a module the compiler needs
+# during its own load, left out of a hardcoded list, breaks the bootstrap, and
+# seed_touch.jai records what that costs -- 39 modules to 10 in one generation.
+# Doing it properly means seeding the compiler's real dependency closure.
+#
+# Original note, for the record: running the compiler writes cache entries for
 # whatever it imports, so collecting the whole tree embeds a set that varies run
 # to run. Measured, 44 modules and then 47 across two reseeds of an unchanged
 # tree. What is embedded has to be exactly what the step above set out to build.
