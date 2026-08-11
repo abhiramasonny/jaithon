@@ -14,17 +14,6 @@ const { execFile } = require('child_process');
 
 const MAX_BUFFER = 32 * 1024 * 1024;
 
-/**
- * The front end every answer the editor shows has to come from.
- *
- * `ast`, `tokens` and `--dump-sema` are only implemented for the C front end,
- * and the self-hosted one has no type checker, so `check` under it reports a
- * different diagnostic shape and exits zero with errors outstanding. Naming it
- * costs nothing and keeps the extension working whichever way the default
- * happens to be set in the build you are pointed at.
- */
-const C_FRONT_END = ['--front=c'];
-
 function config() {
     return vscode.workspace.getConfiguration('jaithon');
 }
@@ -276,7 +265,7 @@ async function version(document) {
 }
 
 module.exports = {
-    config, workspaceDir, binary, run, resetBinaryWarning, C_FRONT_END,
+    config, workspaceDir, binary, run, resetBinaryWarning,
     searchPath, includeArgs, resolveModule,
     snapshot, cleanup, version,
 };

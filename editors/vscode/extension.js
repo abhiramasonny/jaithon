@@ -134,7 +134,7 @@ function registerCommands(context) {
         const document = activeDocument();
         if (!document) return;
         await document.save();
-        await showInPanel(['ast', '--json', ...tool.C_FRONT_END, document.uri.fsPath],
+        await showInPanel(['ast', '--json', document.uri.fsPath],
                           tool.workspaceDir(document), 'json', document);
     });
 
@@ -142,7 +142,7 @@ function registerCommands(context) {
         const document = activeDocument();
         if (!document) return;
         await document.save();
-        await showInPanel(['tokens', ...tool.C_FRONT_END, document.uri.fsPath],
+        await showInPanel(['tokens', document.uri.fsPath],
                           tool.workspaceDir(document), undefined, document);
     });
 

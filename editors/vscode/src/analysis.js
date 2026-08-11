@@ -1,15 +1,18 @@
 // The language service.
 //
 // There is no reimplemented parser here. `jaithon ast --json` gives a syntax
-// tree with a byte span on every node, and `jaithon check --dump-sema` gives
-// the type the real checker assigned to each of those spans. Everything the
-// editor offers — definitions, references, rename, hover, completion — is those
-// two answers indexed.
+// tree with a byte span on every node, and everything the editor offers —
+// definitions, references, rename, hover, completion — is that answer indexed.
 //
-// What this file does add is lexical scoping, because neither dump records
-// which declaration a name resolved to. Member access does not need it: the
-// receiver's type comes from the sema dump, so `p.norm` is answered by the
-// checker, not by a guess.
+// It once had a second source. `jaithon check --dump-sema` gave the type the
+// checker assigned to each span, which is what answered member access: the
+// receiver's type came from the checker rather than from a guess. That option
+// belonged to the C front end, which no longer exists, so the sema index is
+// empty and member access falls back to what the syntax tree alone can say.
+// Reviving it means teaching the self-hosted front end to emit the same dump.
+//
+// What this file does add is lexical scoping, because the AST does not record
+// which declaration a name resolved to.
 
 const vscode = require('vscode');
 const fs = require('fs');
@@ -922,23 +925,18 @@ class Workspace {
             ? tool.snapshot(document)
             : { path: fsPath, mirrored: false, dir: path.dirname(fsPath), dispose() {} };
         const include = snapshot.mirrored ? tool.includeArgs(document, snapshot.dir) : [];
-        // Written to a scratch directory, never beside the source: analysis runs
-        // on every keystroke and must leave the workspace untouched.
-        const semaOut = path.join(os.tmpdir(), `jaithon-sema-${process.pid}-${Workspace.tick++}.txt`);
+        const astResult = await tool.run(
+            ['ast', '--json', '--color=never', ...include, snapshot.path],
+            { cwd: snapshot.dir, document, token });
 
-        const [astResult, semaResult] = await Promise.all([
-            tool.run(['ast', '--json', '--color=never', ...tool.C_FRONT_END, ...include, snapshot.path],
-                     { cwd: snapshot.dir, document, token }),
-            tool.run(['check', '--color=never', ...tool.C_FRONT_END,
-                      '--dump-sema', semaOut, ...include, snapshot.path],
-                     { cwd: snapshot.dir, document, token }),
-        ]);
-
-        let semaText = '';
-        try { semaText = fs.readFileSync(semaOut, 'utf8'); } catch { /* no dump written */ }
-        try { fs.unlinkSync(semaOut); } catch { /* never created */ }
+        /* No sema dump: `--dump-sema` was a C front end option and the compiler
+         * no longer accepts it, so asking for one failed on every keystroke.
+         * Everything downstream already treats the dump as optional -- the
+         * types it carried simply go unanswered, and hovers fall back to what
+         * the AST alone can say. Restoring them means the self-hosted front end
+         * growing an equivalent dump, not calling this flag again. */
+        const semaText = '';
         snapshot.dispose();
-        void semaResult;
 
         if (astResult.spawnFailed) return null;
 
