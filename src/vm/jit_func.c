@@ -2502,6 +2502,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_RETURN_NULL: {
+            /* An OSR form's x0 is the bytecode offset to resume at, not a
+             * value -- see jaiJitEnterOsr, which does `*resumeAt = at`. The
+             * return sequence below is the function tier's and leaves the
+             * returned value in x0, so a `return` inside a compiled loop hands
+             * the interpreter an integer or a pointer as an instruction
+             * offset. `for i in 0..n { if .. { return x } }` miscompiled that
+             * way in released builds: 14 runs in 20 wrong, and 10 in 10 under
+             * --gc-stress. */
+            if (e->osr) {
+                e->whyNot = "a return inside an OSR loop";
+                return false;
+            }
             if ((fn->flags & FN_INIT) == 0) {
                 /* A function with nothing to return. No register carries the
                  * answer; the entry point builds a null from the kind alone. */
@@ -3198,11 +3210,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
                 else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
                 else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
-                /* Scalars only. An instance element crashes the compiler's
-                 * own `for line in chunk.lines` under --gc-stress and the
-                 * cause is not yet understood, so a list of instances declines
-                 * at the head and runs interpreted, exactly as before. */
-                else {
+                else if (IS_INSTANCE(sample) &&
+                         AS_INSTANCE(sample)->klass != NULL) {
+                    /* The object type is checked before the class is read,
+                     * because VAL_OBJ is every heap object and a list holding
+                     * a string beside the sampled instance would otherwise
+                     * read `klass` one word past an ObjString's header. */
+                    ek = SLOT_INST; etag = VAL_OBJ;
+                    ecl = AS_INSTANCE(sample)->klass;
+                    esh = ecl->shapeId;
+                } else {
                     e->whyNot = "list element kind unknown";
                     return false;
                 }
@@ -3861,6 +3878,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_TAIL_CALL: {
+            /* An OSR form's x0 is the bytecode offset to resume at, not a
+             * value -- see jaiJitEnterOsr, which does `*resumeAt = at`. The
+             * return sequence below is the function tier's and leaves the
+             * returned value in x0, so a `return` inside a compiled loop hands
+             * the interpreter an integer or a pointer as an instruction
+             * offset. `for i in 0..n { if .. { return x } }` miscompiled that
+             * way in released builds: 14 runs in 20 wrong, and 10 in 10 under
+             * --gc-stress. */
+            if (e->osr) {
+                e->whyNot = "a return inside an OSR loop";
+                return false;
+            }
             /* `return C(...)` compiles to this. The call is made exactly as
              * OP_CALL makes it and its result is returned. */
             unsigned argc = code[off + 1];
@@ -3894,6 +3923,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_RETURN: {
+            /* An OSR form's x0 is the bytecode offset to resume at, not a
+             * value -- see jaiJitEnterOsr, which does `*resumeAt = at`. The
+             * return sequence below is the function tier's and leaves the
+             * returned value in x0, so a `return` inside a compiled loop hands
+             * the interpreter an integer or a pointer as an instruction
+             * offset. `for i in 0..n { if .. { return x } }` miscompiled that
+             * way in released builds: 14 runs in 20 wrong, and 10 in 10 under
+             * --gc-stress. */
+            if (e->osr) {
+                e->whyNot = "a return inside an OSR loop";
+                return false;
+            }
             uint32_t rsh = e->depth > 0 ? e->stackShape[e->depth - 1] : 0;
             unsigned r;
             SlotKind k;
