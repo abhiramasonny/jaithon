@@ -28,7 +28,7 @@ int main() {
                              "abdcadbc", "bdacbcad", "cabdbdca", "dbcaabcd"};
     std::string text;
     int64_t seed = 7;
-    for (int64_t i = 0; i < 25000; i++) {
+    for (int64_t i = 0; i < 250000; i++) {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         text += chunks[(seed / 65536) % 8];
     }

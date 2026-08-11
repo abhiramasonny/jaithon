@@ -26,7 +26,7 @@ public class Spectral {
     }
 
     public static void main(String[] args) {
-        final int n = 150;
+        final int n = 550;
         double[] u = new double[n];
         for (int i = 0; i < n; i++) u[i] = 1.0;
         double[] v = new double[n];

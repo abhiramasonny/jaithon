@@ -19,7 +19,7 @@ chunks = ["abcdbadc", "bcadcbda", "cdabacbd", "dacbdabc",
           "abdcadbc", "bdacbcad", "cabdbdca", "dbcaabcd"]
 parts = []
 seed = 7
-for _i in range(25_000):
+for _i in range(250_000):
     seed = (seed * 1103515245 + 12345) % 2147483648
     parts.append(chunks[(seed // 65536) % 8])
 text = "".join(parts)

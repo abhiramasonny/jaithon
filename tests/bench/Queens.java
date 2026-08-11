@@ -23,7 +23,7 @@ public class Queens {
     }
 
     public static void main(String[] args) {
-        final int n = 9;
+        final int n = 11;
         long[] cols = new long[n];
         long total = 0;
         for (int rep = 0; rep < 3; rep++) total = place(cols, 0, n);

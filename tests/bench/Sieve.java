@@ -1,7 +1,7 @@
 // Same program as sieve.jai.
 public class Sieve {
     public static void main(String[] args) {
-        final int n = 1000000;
+        final int n = 10000000;
         boolean[] flags = new boolean[n + 1];
         for (int i = 0; i <= n; i++) flags[i] = true;
 

@@ -6,7 +6,7 @@
 #include <cstdio>
 
 int main() {
-    const int width = 320;
+    const int width = 3200;
     const int height = 240;
     const int limit = 100;
 

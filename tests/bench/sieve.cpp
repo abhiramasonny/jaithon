@@ -5,7 +5,7 @@
 #include <vector>
 
 int main() {
-    const int64_t n = 1000000;
+    const int64_t n = 10000000;
     std::vector<bool> flags;
     for (int64_t i = 0; i <= n; i++) flags.push_back(true);
 

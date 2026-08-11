@@ -1,7 +1,7 @@
 #: Hash table insert, lookup, and iteration.
 fn main() -> int {
     var counts = {}
-    for i in 0..500_000 {
+    for i in 0..30_000_000 {
         let key = f"k{i % 10_000}"
         counts[key] = counts.get(key, 0) + 1
     }

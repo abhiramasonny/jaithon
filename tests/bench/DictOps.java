@@ -5,7 +5,7 @@ import java.util.Map;
 public class DictOps {
     public static void main(String[] args) {
         Map<String, Long> counts = new HashMap<>();
-        for (long i = 0; i < 500000L; i++) {
+        for (long i = 0; i < 30000000L; i++) {
             String key = "k" + (i % 10000L);
             counts.put(key, counts.getOrDefault(key, 0L) + 1L);
         }

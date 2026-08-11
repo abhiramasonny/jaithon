@@ -5,6 +5,6 @@
 static int64_t fib(int64_t n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 
 int main() {
-    std::printf("%lld\n", (long long)fib(30));
+    std::printf("%lld\n", (long long)fib(38));
     return 0;
 }

@@ -13,7 +13,7 @@ public class MatrixMul {
     }
 
     public static void main(String[] args) {
-        final int n = 120;
+        final int n = 320;
         double[][] a = make(n, 12345L);
         double[][] b = make(n, 67890L);
 

@@ -24,7 +24,7 @@ public class StrSearch {
                            "abdcadbc", "bdacbcad", "cabdbdca", "dbcaabcd"};
         StringBuilder builder = new StringBuilder();
         long seed = 7;
-        for (int i = 0; i < 25000; i++) {
+        for (int i = 0; i < 250000; i++) {
             seed = (seed * 1103515245L + 12345L) % 2147483648L;
             builder.append(chunks[(int) ((seed / 65536L) % 8L)]);
         }

@@ -32,7 +32,7 @@ static std::vector<std::string> split(const std::string &s, const std::string &s
 
 int main() {
     std::vector<std::string> parts;
-    for (int64_t i = 0; i < 200000; i++) {
+    for (int64_t i = 0; i < 2000000; i++) {
         char buf[32];
         std::snprintf(buf, sizeof buf, "item-%lld", (long long)i);
         parts.push_back(std::string(buf));

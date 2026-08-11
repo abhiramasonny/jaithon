@@ -7,7 +7,7 @@
 
 int main() {
     std::vector<int64_t> xs;
-    for (int64_t i = 0; i < 1000000; i++) {
+    for (int64_t i = 0; i < 10000000; i++) {
         xs.push_back(i * 3);
     }
 

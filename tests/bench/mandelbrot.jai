@@ -6,7 +6,7 @@
 #: is unpredictable. Each step of the recurrence is written to one intermediate
 #: at a time so that every port performs the same rounding in the same order.
 fn main() -> int {
-    let width = 320
+    let width = 3200
     let height = 240
     let limit = 100
 

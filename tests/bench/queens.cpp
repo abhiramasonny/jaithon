@@ -27,7 +27,7 @@ static int64_t place(std::vector<int64_t> &cols, int64_t row, int64_t n) {
 }
 
 int main() {
-    const int64_t n = 9;
+    const int64_t n = 11;
     std::vector<int64_t> cols((size_t)n, 0);
     int64_t total = 0;
     for (int rep = 0; rep < 3; rep++) total = place(cols, 0, n);

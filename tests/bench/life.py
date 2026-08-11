@@ -50,9 +50,9 @@ def step(board, h, w):
     return out
 
 
-h = 100
-w = 100
-generations = 50
+h = 500
+w = 500
+generations = 70
 
 board = seed_board(h, w, 7)
 for _g in range(generations):

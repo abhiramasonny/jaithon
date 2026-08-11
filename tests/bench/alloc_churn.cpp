@@ -12,7 +12,7 @@ struct Point {
 
 int main() {
     int64_t total = 0;
-    for (int64_t i = 0; i < 400000; i++) {
+    for (int64_t i = 0; i < 4000000; i++) {
         auto a = std::make_unique<Point>(i % 100, i % 37);
         auto b = std::make_unique<Point>(i % 53, i % 11);
         total = (total + a->dot(*b)) % 1000000007;

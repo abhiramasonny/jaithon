@@ -27,7 +27,7 @@ static int64_t walk(const Node *node) {
 }
 
 int main() {
-    const int64_t depth = 16;
+    const int64_t depth = 18;
     int64_t total = 0;
     for (int rep = 0; rep < 8; rep++) {
         std::unique_ptr<Node> tree = build(depth, 1);

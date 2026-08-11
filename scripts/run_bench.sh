@@ -62,9 +62,21 @@ PY
     printf '%s' "$best"
 }
 
+# How much work each benchmark does. `hard` is the real suite; the smaller
+# levels shorten it without changing its shape, for a quick pass while working.
+# Exported so every port sees it -- each of the four reads BENCH_LEVEL itself
+# and they must agree, which is what the output comparison below checks.
+LEVEL="${LEVEL:-${BENCH_LEVEL:-hard}}"
+case "$LEVEL" in
+    easy|medium|hard) ;;
+    *) echo "error: LEVEL must be easy, medium or hard, got '$LEVEL'" >&2; exit 2 ;;
+esac
+export BENCH_LEVEL="$LEVEL"
+
 # The build type belongs in the table itself: these rows get pasted into the
-# ROADMAP, and a number without its build type is not a measurement.
-printf '%s%s build, best of %s%s\n' "$DIM" "$BUILD_KIND" "$RUNS" "$RESET"
+# ROADMAP, and a number without its build type is not a measurement. So does the
+# level, for exactly the same reason.
+printf '%s%s build, %s, best of %s%s\n' "$DIM" "$BUILD_KIND" "$LEVEL" "$RUNS" "$RESET"
 # C++ and Java are optional columns: a benchmark only gets one where a port
 # exists, and the whole column disappears when the toolchain is absent. They are
 # a *scale* rather than a target -- C++ is roughly what the machine can do and

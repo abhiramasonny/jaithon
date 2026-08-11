@@ -19,7 +19,7 @@ def walk(node):
     return node.value + walk(node.left) + walk(node.right)
 
 
-depth = 16
+depth = 18
 total = 0
 for _rep in range(8):
     tree = build(depth, 1)

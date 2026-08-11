@@ -1,7 +1,7 @@
 #: List growth, indexing, and higher-order iteration.
 fn main() -> int {
     var xs = []
-    for i in 0..1_000_000 { xs.push(i * 3) }
+    for i in 0..10_000_000 { xs.push(i * 3) }
 
     var total = 0
     for x in xs { total += x % 11 }

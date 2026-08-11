@@ -35,7 +35,7 @@ fn main() -> int {
     ]
     var parts = []
     var seed = 7
-    for _i in 0..25_000 {
+    for _i in 0..250_000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
         parts.push(chunks[seed // 65536 % 8])
     }

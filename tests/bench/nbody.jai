@@ -88,7 +88,7 @@ fn main() -> int {
         ),
     ]
     print(f"{energy(bodies):.9f}")
-    for _step in 0..100_000 { advance(bodies, 0.01) }
+    for _step in 0..500_000 { advance(bodies, 0.01) }
     print(f"{energy(bodies):.9f}")
     return 0
 }

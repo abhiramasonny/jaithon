@@ -17,15 +17,12 @@ class Point {
     }
 }
 
-fn main() -> int {
-    var total = 0
-    var i = 0
-    while i < 400_000 {
-        let a = Point(i % 100, i % 37)
-        let b = Point(i % 53, i % 11)
-        total = (total + a.dot(b)) % 1000000007
-        i += 1
-    }
-    print(total)
-    return 0
+var total = 0
+var i = 0
+while i < 4_000_000 {
+    let a = Point(i % 100, i % 37)
+    let b = Point(i % 53, i % 11)
+    total = (total + a.dot(b)) % 1000000007
+    i += 1
 }
+print(total)

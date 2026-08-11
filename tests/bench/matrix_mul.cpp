@@ -19,7 +19,7 @@ static std::vector<std::vector<double>> make(int n, int64_t seed) {
 }
 
 int main() {
-    const int n = 120;
+    const int n = 320;
     std::vector<std::vector<double>> a = make(n, 12345);
     std::vector<std::vector<double>> b = make(n, 67890);
 

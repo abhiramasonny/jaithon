@@ -39,7 +39,7 @@ public class SortMerge {
     public static void main(String[] args) {
         List<Long> data = new ArrayList<>();
         long seed = 12345;
-        for (int i = 0; i < 60000; i++) {
+        for (int i = 0; i < 1000000; i++) {
             seed = (seed * 1103515245L + 12345L) % 2147483648L;
             data.add(seed % 100000L);
         }

@@ -41,7 +41,7 @@ static std::vector<int64_t> sort(const std::vector<int64_t> &values) {
 int main() {
     std::vector<int64_t> data;
     int64_t seed = 12345;
-    for (int64_t i = 0; i < 60000; i++) {
+    for (int64_t i = 0; i < 1000000; i++) {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         data.push_back(seed % 100000);
     }

@@ -21,7 +21,7 @@ fn main() -> int {
     var ones = 0
     var checksum = 0
     var i = 0
-    while i < 300_000 {
+    while i < 1_000_000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
         var v = seed ^ checksum
         v = v ^ v >> 7

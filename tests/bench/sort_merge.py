@@ -32,7 +32,7 @@ def sort(values):
 
 data = []
 seed = 12345
-for _i in range(60_000):
+for _i in range(1_000_000):
     seed = (seed * 1103515245 + 12345) % 2147483648
     data.append(seed % 100000)
 ordered = sort(data)
