@@ -3061,12 +3061,26 @@ uint64_t jaiPropRecv[32];
 #    define VM_NEXT()      do { DISPATCH_TRACE(); instStart = ip;                \
                               goto *jaiDispatchTable[*ip++]; } while (0)
 #  endif
+/* Clang emits exactly ONE indirect branch per function for computed goto --
+ * CodeGenFunction caches a single indirect-goto block and every `goto *p`
+ * branches to it -- so all 132 opcodes share one entry in the branch-target
+ * predictor no matter how this is written. VM_NEXT_HINT names the successor
+ * the census says is overwhelmingly likely and reaches it by a direct branch,
+ * which the predictor keys on its own address. A wrong guess costs one
+ * compare and falls through to the shared branch, so the only hints worth
+ * taking are the lopsided ones: a 50/50 hint replaces a predictable indirect
+ * branch with an unpredictable direct one. */
+#  define VM_NEXT_HINT(nextOp)                                                 \
+      do { DISPATCH_TRACE(); instStart = ip;                                   \
+           if (JAI_LIKELY(*ip == (nextOp))) { ip++; goto L_##nextOp; }         \
+           goto *jaiDispatchTable[*ip++]; } while (0)
 /* The trailing `;` lets the case labels that follow live in a plain block;
  * labels have function scope, so the nesting costs nothing. */
 #  define VM_DISPATCH()  VM_NEXT();
 #else
 #  define VM_CASE(name)  case name
 #  define VM_NEXT()      goto vmDispatch
+#  define VM_NEXT_HINT(nextOp)  ((void)(nextOp), VM_NEXT())
 #  define VM_DISPATCH()  vmDispatch:                                           \
                          DISPATCH_TRACE();                                     \
                          instStart = ip;                                       \
@@ -3185,7 +3199,7 @@ JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
 
 #define DISPATCH_TRACE()                                                       \
     do {                                                                       \
-        if (JAI_UNLIKELY(vm.countInstructions)) {                              \
+        if (JAI_UNLIKELY(countInsts)) {                                        \
             vm.instructionCount++;                                             \
             if (vm.debugTrace) {                                               \
                 vm.stackTop = stackTop;                                        \
@@ -3427,6 +3441,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
     Value *slots;
     Value *constants;
     Value retval = NULL_VAL;
+    /* vm.countInstructions is written once, by the CLI, before anything runs.
+     * Read from the struct it is an adrp, a load, a compare and a branch on
+     * every single dispatch -- four of the fourteen instructions OP_NOP costs.
+     * In a local it is a load off the frame and a cbnz. */
+    const bool countInsts = vm.countInstructions;
 
     LOAD_STATE();
 
@@ -3459,7 +3478,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
 
     VM_CASE(OP_POP):
         DROP(1);
-        VM_NEXT();
+        VM_NEXT_HINT(OP_LOOP);
 
     VM_CASE(OP_POPN):
         DROP(READ_BYTE());
@@ -3963,7 +3982,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 THROW(vm.cOverflowError, "integer overflow in '+'; use '+%%' to wrap");
             }
             slots[slot] = INT_VAL(r);
-            VM_NEXT();
+            VM_NEXT_HINT(OP_LOOP);
         }
         SAVE_STATE();
         Value result;
@@ -4031,7 +4050,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         Value condition = POP();
         REQUIRE_BOOL(condition, "condition");
         if (!AS_BOOL(condition)) ip += offset;
-        VM_NEXT();
+        VM_NEXT_HINT(OP_INC_LOCAL);
     }
 
     VM_CASE(OP_JUMP_IF_TRUE): {
@@ -4248,7 +4267,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         LOAD_STATE();
         stackTop -= count;
         PUSH(OBJ_VAL(formatted));
-        VM_NEXT();
+        VM_NEXT_HINT(OP_BIND);
     }
 
     VM_CASE(OP_LOOP): {
@@ -4856,7 +4875,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         if (!indexSet(stackTop[-3], stackTop[-2], stackTop[-1])) goto vmThrow;
         LOAD_STATE();
         DROP(3);
-        VM_NEXT();
+        VM_NEXT_HINT(OP_LOOP);
     }
 
     VM_CASE(OP_GET_SLICE): {
@@ -5889,6 +5908,10 @@ void jaiVMInit(void) {
     jaiGCInit(gc);
     gc->stress = vm.gcStress;
     gc->verbose = vm.debugGC;
+    /* stress is one of jaiGCLimit's four inputs and this is the only place
+     * outside gc.c that writes one. Without this, --gc-stress kept the
+     * threshold it was initialised with and stressed 11% less. */
+    jaiGCSyncLimit();
 
     jaiInternTableInit();
     jaiTableInit(&vm.modules);
