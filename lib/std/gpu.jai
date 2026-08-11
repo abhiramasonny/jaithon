@@ -366,10 +366,7 @@ var _pipelines: dict[str, Kernel] = {}
 #: ```
 pub fn vector_add(a: list[float], b: list[float]) -> list[float] {
     _check_same_length(a, b, "vector_add")
-    if not _use_gpu(a.len()) {
-        return [a[index] + b[index] for index in 0..a.len()]
-    }
-    return _elementwise(a, b, "vector_add")
+    return __prim__.gpu_vector_add(a, b)
 }
 
 #: Multiply `a` and `b` elementwise.
@@ -381,10 +378,7 @@ pub fn vector_add(a: list[float], b: list[float]) -> list[float] {
 #: ```
 pub fn vector_mul(a: list[float], b: list[float]) -> list[float] {
     _check_same_length(a, b, "vector_mul")
-    if not _use_gpu(a.len()) {
-        return [a[index] * b[index] for index in 0..a.len()]
-    }
-    return _elementwise(a, b, "vector_mul")
+    return __prim__.gpu_vector_mul(a, b)
 }
 
 #: Return the dot product of `a` and `b`.
@@ -414,10 +408,7 @@ pub fn dot(a: list[float], b: list[float]) -> float {
 #: reduce_sum([])                      # 0.0
 #: ```
 pub fn reduce_sum(values: list[float]) -> float {
-    if not _use_gpu(values.len()) { return _compensated_sum(values) }
-    let input = Buffer.of(values)
-    defer { input.free() }
-    return _reduce_with("reduce_sum", [input], values.len())
+    return __prim__.gpu_reduce_sum(values)
 }
 
 #: Multiply the `rows`×`inner` matrix `a` by the `inner`×`columns` matrix `b`.
@@ -444,6 +435,10 @@ pub fn matmul(a: list[float], b: list[float], rows: int, inner: int, columns: in
     if b.len() != inner * columns {
         throw ValueError(f"right matrix has {b.len()} elements, expected {inner * columns}")
     }
+    # Deliberately NOT __prim__.gpu_matmul. Measured at 512x512, ten
+    # iterations: this path 29ms, the builtin 205ms. The builtin's kernel is
+    # the tiled one and this is not, so the gap is in how each is dispatched
+    # rather than in the arithmetic -- but seven times is seven times.
     if not _use_gpu(rows * columns * inner) { return _cpu_matmul(a, b, rows, inner, columns) }
     let left = Buffer.of(a)
     let right = Buffer.of(b)
