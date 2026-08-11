@@ -57,11 +57,12 @@ LIBS     := -lm -lpthread
 EXTRA_CFLAGS  ?=
 EXTRA_LDFLAGS ?=
 
-# zlib inflates boot/seed.c's images. The seed is 3.2 MB of bytecode, and as a
-# `0x%02x, ` array that was a 20 MB source file; deflated and base64'd it is
-# under 2 MB. zlib is the one library assumed present beyond libc -- it ships
-# with macOS and with every Linux distribution -- and nothing else links it, so
-# dropping the compression again is this line plus the generator.
+# zlib inflates the seed's images. boot/seed.bin holds them deflated, one
+# stream per module, and boot/seed_blob.S pulls that file into the binary with
+# .incbin; boot/seed.c is only the index and the decoder. zlib is the one
+# library assumed present beyond libc -- it ships with macOS and with every
+# Linux distribution -- and nothing else links it, so dropping the compression
+# again is this line plus the generator.
 LIBS     += -lz
 
 ifeq ($(UNAME_S),Darwin)
@@ -171,6 +172,7 @@ endif
 # .jaic images the self-hosted front end needs before it can compile anything.
 # A wildcard rather than a literal so a tree without a seed still builds -- that
 # build simply needs a working front end on disk to start.
+SRCS_S  := $(wildcard boot/*.S)
 SRCS_C  := $(wildcard boot/*.c) \
            $(wildcard src/common/*.c) \
            $(wildcard src/vm/*.c) \
@@ -185,6 +187,7 @@ else
 endif
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS_C)) \
+        $(patsubst %.S,$(BUILD)/%.o,$(SRCS_S)) \
         $(patsubst %.m,$(BUILD)/%.o,$(SRCS_M))
 # verify_chunk.c is compiled with the same -MMD -MP, so its .d belongs here too
 # or a header change would relink it against stale knowledge of its own deps.
@@ -350,6 +353,15 @@ $(TARGET): $(OBJS)
 $(BUILD)/%.o: %.c | $(CC_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+# boot/seed_blob.S is `.S` so cpp runs before the assembler; it .incbin's
+# boot/seed.bin, which make cannot see as a dependency on its own.
+$(BUILD)/boot/seed_blob.o: boot/seed.bin
+
+$(BUILD)/%.o: %.S | $(CC_STAMP)
+	@mkdir -p $(dir $@)
+	@echo "  AS      $<"
 	@$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: %.m | $(CC_STAMP)
