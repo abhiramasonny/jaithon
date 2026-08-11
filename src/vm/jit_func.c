@@ -3668,6 +3668,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
             }
 
+            /* A `bl` pushes no roots, so anything this body holds in a
+             * callee-saved register is invisible to a collection inside the
+             * callee. Link the descriptor onto the collector's frame chain
+             * around the call instead. Costs six instructions and only when
+             * there is something to root. */
+            unsigned selfRoots = 0;
+            if (!emitRootFill(e, e->descOffset, &selfRoots)) return false;
+            if (selfRoots > 0) {
+                unsigned d = e->descOffset;
+                emit(e, jaiA64MovzX(JIT_SCRATCH_A, selfRoots, 0));
+                emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+                                   d + (unsigned)offsetof(JitCallDesc, nroots)));
+                emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+                emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                   (unsigned)offsetof(JitCallDesc, link)));
+                emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+            }
+
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
             unsigned first = JIT_FIRST_SAVED + regBase(e) +
@@ -3684,6 +3704,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             branchTo(e, FIXUP_ENTRY, false, 0);
             e->code[e->count - 1] = jaiA64Bl(0);
+            /* Unlink before anything can leave: the bail branch below and every
+             * later exit go through the epilogue, and a frame still on the
+             * chain then points at a stack slot that no longer exists. x0 and
+             * x1 carry the callee's answer, so only the scratches are free. */
+            if (selfRoots > 0) {
+                unsigned d = e->descOffset;
+                emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                   (unsigned)offsetof(JitCallDesc, link)));
+                emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+            }
             /* x1 carries the callee's verdict; a bail there is a bail here. */
             emit(e, jaiA64SubsXImm(31, 1, 0));
             branchOnCondition(e, JAI_A64_NE);
