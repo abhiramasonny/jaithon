@@ -38,11 +38,22 @@
 #endif
 
 #define JAI_VERSION_MAJOR 3
-#define JAI_VERSION_MINOR 0
+#define JAI_VERSION_MINOR 1
 #define JAI_VERSION_PATCH 0
-#define JAI_VERSION_STRING "3.0.0"
+#define JAI_VERSION_STRING "3.1.0"
 
-/* Bumped whenever bytecode emission changes; invalidates .jaic caches. */
+/* Bumped whenever bytecode emission changes; invalidates .jaic caches.
+ *
+ * Deliberately NOT bumped for 3.1.0's four new opcodes, and the reason is a
+ * bootstrap deadlock rather than an oversight. serialize.c checks this value
+ * BEFORE it exempts the seed from the build-id check, so raising it rejects the
+ * embedded seed image -- and regenerating the seed needs a working compiler,
+ * which needs the seed. The Makefile calls that "a loop with no way in".
+ *
+ * Nothing is lost by leaving it. The opcodes were APPENDED, so images written
+ * by an older compiler still decode, and images written by a newer one are
+ * already rejected by JAI_BUILD_ID, which every .jaic records and demands back.
+ * Raising this would have to happen in the same change that reseeds. */
 #define JAI_COMPILER_VERSION 18u
 
 /* ------------------------------------------------------------------ */
