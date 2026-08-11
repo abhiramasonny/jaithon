@@ -662,6 +662,59 @@ int main(void) {
                              jaiA64CsetX(0, JAI_A64_LT), jaiA64Ret() };
       check("eor sign same", runWith(w, 6, cell), 0); }
 
+    /* adds with an immediate. The value is the easy half; the flags are the
+     * point, since the overflow guard on `i += 1` is a b.vs on them. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 40, 0),
+                             jaiA64AddsXImm(0, 1, 2), jaiA64Ret() };
+      check("adds imm", runWith(w, 3, cell), 42); }
+    { /* INT64_MAX + 1 overflows, so V is set */
+      const uint32_t w[] = { jaiA64MovnX(1, 0),            /* x1 = -1 */
+                             jaiA64LsrX(1, 1, 1),          /* INT64_MAX */
+                             jaiA64AddsXImm(2, 1, 1),
+                             jaiA64CsetX(0, JAI_A64_VS), jaiA64Ret() };
+      check("adds imm overflows", runWith(w, 5, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 5, 0),
+                             jaiA64AddsXImm(2, 1, 1),
+                             jaiA64CsetX(0, JAI_A64_VS), jaiA64Ret() };
+      check("adds imm no overflow", runWith(w, 4, cell), 0); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 4095, 0),
+                             jaiA64AddsXImm(0, 1, 4095), jaiA64Ret() };
+      check("adds imm max", runWith(w, 3, cell), 8190); }
+
+    /* tbz/tbnz on bit 63, which is the sign test the floor-remainder
+     * correction uses. Bit 63 is the one that spans both operand fields, so it
+     * is the case a mis-split encoding gets wrong. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64SubsXReg(1, 31, 1),
+                             jaiA64Tbz(1, 63, 3),          /* -> 5, not taken */
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 2, 0), jaiA64Ret() };
+      check("tbz 63 negative", runWith(w, 7, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0),
+                             jaiA64Tbz(1, 63, 3),          /* -> 5, taken */
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 2, 0), jaiA64Ret() };
+      check("tbz 63 positive", runWith(w, 6, cell), 2); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 8, 0),
+                             jaiA64Tbz(1, 3, 3),           /* bit 3 set */
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 2, 0), jaiA64Ret() };
+      check("tbz low bit set", runWith(w, 6, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 8, 0),
+                             jaiA64Tbnz(1, 3, 3),
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 2, 0), jaiA64Ret() };
+      check("tbnz low bit set", runWith(w, 6, cell), 2); }
+    { /* a backward offset, so the sign of imm14 is exercised too */
+      const uint32_t w[] = { /* 0 */ jaiA64MovzX(0, 0, 0),
+                             /* 1 */ jaiA64MovzX(1, 0, 0),
+                             /* 2 */ jaiA64B(3),           /* -> 5 */
+                             /* 3 */ jaiA64MovzX(0, 7, 0),
+                             /* 4 */ jaiA64Ret(),
+                             /* 5 */ jaiA64Tbz(1, 63, -2), /* -> 3, taken */
+                             /* 6 */ jaiA64MovzX(0, 9, 0),
+                             /* 7 */ jaiA64Ret() };
+      check("tbz backward", runWith(w, 8, cell), 7); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;

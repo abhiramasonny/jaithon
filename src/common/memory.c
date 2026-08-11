@@ -108,6 +108,65 @@ static inline unsigned smallClass(size_t n) {
     return (unsigned)((n + (JAI_SMALL_GRAIN - 1u)) >> 4);
 }
 
+static inline void smallFree(void *p, unsigned cls) {
+    *(void **)p = gBin[cls];
+    gBin[cls] = p;
+}
+
+/* When a bin is empty the block has to come from somewhere, and one malloc per
+ * object is what that used to mean.
+ *
+ * The bins only recycle what has already died, so a program whose live set is
+ * *growing* -- building a list of two million strings, a tree of half a million
+ * nodes -- finds every bin empty and pays libc for every object. Sampled on
+ * tests/bench/string_build, malloc's internals were 29% of the whole run.
+ *
+ * Carving those blocks out of a slab instead makes the common case a compare,
+ * an add and two stores, and calls malloc once per slab rather than once per
+ * object. Nothing else changes: a slab block is indistinguishable from a
+ * malloc'd one to every caller, and when it dies it goes onto the same free
+ * list it would have before.
+ *
+ * Three properties make it safe, and all three already held:
+ *
+ *   - malloc returns 16-aligned memory and every size class is a multiple of
+ *     the 16-byte grain, so the cursor stays 16-aligned for the whole slab;
+ *   - a slab block is never handed to free() or realloc(), because those are
+ *     reached only when smallClass(oldSize) is 0 and a slab block's size is by
+ *     construction one the bins serve -- the same exact-oldSize invariant the
+ *     bins have always depended on;
+ *   - blocks are never returned to libc, which the bins above already
+ *     documented as their own behaviour.
+ *
+ * The slab is not freed at exit for the same reason the bins are not. */
+#define JAI_SLAB_BYTES (64u * 1024u)
+
+static char  *gSlabNext;
+static size_t gSlabLeft;
+
+static void *slabCarve(size_t need) {
+    if (JAI_UNLIKELY(gSlabLeft < need)) {
+        /* The tail is too small for this request but not too small to be a
+         * block: hand it to the bin it exactly fits rather than leaking it.
+         * gSlabLeft < need <= JAI_SMALL_MAX, so the class is in range, and it
+         * is at least one grain, which is wider than the free-list pointer. */
+        unsigned tail = (unsigned)(gSlabLeft / JAI_SMALL_GRAIN);
+        if (tail != 0) smallFree(gSlabNext, tail);
+
+        gSlabNext = (char *)malloc(JAI_SLAB_BYTES);
+        if (JAI_UNLIKELY(gSlabNext == NULL)) {
+            JAI_PANIC("out of memory: cannot allocate %u bytes (%zu live)",
+                      JAI_SLAB_BYTES, jaiHeapBytes);
+        }
+        gSlabLeft = JAI_SLAB_BYTES;
+    }
+
+    void *p = gSlabNext;
+    gSlabNext += need;
+    gSlabLeft -= need;
+    return p;
+}
+
 static inline void *smallAlloc(unsigned cls) {
     void *p = gBin[cls];
 
@@ -116,18 +175,7 @@ static inline void *smallAlloc(unsigned cls) {
         return p;
     }
 
-    p = malloc((size_t)cls * JAI_SMALL_GRAIN);
-    if (JAI_UNLIKELY(p == NULL)) {
-        JAI_PANIC("out of memory: cannot allocate %u bytes (%zu live)",
-                  cls * JAI_SMALL_GRAIN, jaiHeapBytes);
-    }
-
-    return p;
-}
-
-static inline void smallFree(void *p, unsigned cls) {
-    *(void **)p = gBin[cls];
-    gBin[cls] = p;
+    return slabCarve((size_t)cls * JAI_SMALL_GRAIN);
 }
 
 void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize) {
