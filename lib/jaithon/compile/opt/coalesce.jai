@@ -51,7 +51,19 @@ class SlotRange {
 pub fn coalesce_slots(proto: FuncProto) -> int {
     let code = decode(proto)
     if code == null { return 0 }
+    let changed = coalesce_slots_on(code)
+    if changed > 0 and not rebuild(code) { return 0 }
+    return changed
+}
 
+#: The pass on an already-decoded chunk. See `peephole_on` for why the decode
+#: is the caller's job.
+#:
+#: `max_slots` is narrowed here without waiting for a rebuild to confirm it,
+#: so a caller whose final rebuild fails has to put the old value back; the
+#: driver in `opt/mod.jai` saves it for exactly that.
+pub fn coalesce_slots_on(code: Code) -> int {
+    let proto = code.proto
     let slot_count = proto.max_slots
     let reserved = reserved_slots(proto)
     if slot_count <= reserved { return 0 }
@@ -104,8 +116,6 @@ pub fn coalesce_slots(proto: FuncProto) -> int {
             set_slot(instruction, at, target[slot_of(instruction, at)])
         }
     }
-
-    if not rebuild(code) { return 0 }
 
     if new_top < old_top {
         # Shrink the window by exactly the slots that disappeared rather than

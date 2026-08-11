@@ -37,7 +37,21 @@ const MAX_POPN: int = 255
 pub fn peephole(proto: FuncProto) -> int {
     let code = decode(proto)
     if code == null { return 0 }
+    let changes = peephole_on(code)
+    if changes > 0 and not rebuild(code) { return 0 }
+    return changes
+}
 
+#: The pass itself, on an already-decoded chunk.
+#:
+#: Decoding and re-encoding cost more than every rewrite in this file put
+#: together -- measured, one round trip over the standard library is 317ms and
+#: the optimiser used to do about six of them per function, because each pass
+#: decoded and rebuilt on its own. The driver in `opt/mod.jai` now decodes once
+#: and hands the same `Code` to every pass, so this entry point is the one that
+#: runs in a normal compile and the wrapper above is for callers holding only a
+#: proto.
+pub fn peephole_on(code: Code) -> int {
     # Rewriting strands blocks, and removing a stranded block puts new
     # neighbours next to each other, so the two feed each other until neither
     # has anything left to do.
@@ -48,8 +62,6 @@ pub fn peephole(proto: FuncProto) -> int {
         changes += mark_unreachable(code)
         if changes == before { break }
     }
-
-    if changes > 0 and not rebuild(code) { changes = 0 }
     return changes
 }
 

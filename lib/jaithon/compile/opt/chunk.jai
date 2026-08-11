@@ -669,6 +669,78 @@ pub fn mark_unreachable(code: Code) -> int {
 #: Re-encode the list into the chunk and rebuild every table that names a code
 #: offset. False without touching the chunk when the result cannot be encoded,
 #: in which case the caller must report zero changes.
+#: Drop deleted instructions and renumber everything that named one.
+#:
+#: Deleted instructions stay in the list so that recorded indices keep meaning
+#: what they meant, which is right within a pass and expensive between them:
+#: `next_live`, `prev_live` and `live_at_or_after` all walk over the holes, so a
+#: pipeline that never compacts turns a long dead run into a linear scan per
+#: lookup. That used to be hidden because every pass ended in a `rebuild` and
+#: began with a `decode`, and the round trip compacted as a side effect. With
+#: one decode shared across the passes the compaction has to be asked for, and
+#: this is the cheap half of what the round trip was doing -- no encoding, no
+#: line table, no exception rewrite, just the list and the indices into it.
+#:
+#: A target that pointed at a deleted instruction lands on the next live one,
+#: which is what `live_at_or_after` already answers for a stale target.
+pub fn compact(code: Code) -> void {
+    var dead_count = 0
+    for instruction in code.data {
+        if instruction.dead { dead_count += 1 }
+    }
+    if dead_count == 0 { return }
+
+    # Compacting is two allocations and a copy of the whole list, which is the
+    # same order of work as the decode it is standing in for -- so doing it for
+    # a single hole costs more than the holes do. It pays once a run is long
+    # enough that the live-walkers spend real time stepping over it, and the
+    # amortisation argument is the usual one: only rewrite when a constant
+    # fraction of the list is garbage.
+    if dead_count * 8 < code.count() { return }
+
+    let total = code.count()
+    var mapping: list[int] = [0 for _slot in 0..total + 1]
+    var live = 0
+    for (index, instruction) in code.data.enumerate() {
+        mapping[index] = live
+        if not instruction.dead { live += 1 }
+    }
+    mapping[total] = live
+
+    var kept: list[Instr] = []
+    for instruction in code.data {
+        if instruction.dead { continue }
+        if instruction.target >= 0 and instruction.target <= total {
+            instruction.target = mapping[instruction.target]
+        }
+        kept.push(instruction)
+    }
+
+    # `_retarget_fits` measures a branch against `new_offset`, so the layout is
+    # refreshed here exactly as `rebuild` would lay it out. Leaving it stale
+    # would make the peephole's reach test answer from a layout that no longer
+    # exists, and its decisions are what the emitted code is made of.
+    var offset = 0
+    for instruction in kept {
+        instruction.new_offset = offset
+        offset += instruction.size()
+    }
+
+    code.data = kept
+    for (row, start) in code.exception_start.enumerate() {
+        if start >= 0 and start <= total { code.exception_start[row] = mapping[start] }
+    }
+    for (row, end) in code.exception_end.enumerate() {
+        if end >= 0 and end <= total { code.exception_end[row] = mapping[end] }
+    }
+    for (row, handler) in code.exception_handler.enumerate() {
+        if handler >= 0 and handler <= total { code.exception_handler[row] = mapping[handler] }
+    }
+    for (row, entry) in code.defaults.enumerate() {
+        if entry >= 0 and entry <= total { code.defaults[row] = mapping[entry] }
+    }
+}
+
 pub fn rebuild(code: Code) -> bool {
     var live_count = 0
     for instruction in code.data {
