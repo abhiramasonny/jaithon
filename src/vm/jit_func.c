@@ -9058,13 +9058,43 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     }
     if (form == NULL) {
         if (fn->osrRefused || fn->osrCount >= JAI_OSR_MAX) return 0;
+        /* This head's own share of the budget. See ObjFunction::osrMissTop for
+         * why the count cannot be per function: the first loop to run spends
+         * it, and every later loop in the same body is then refused a look. */
+        unsigned miss = fn->osrMissCount;
+        for (unsigned i = 0; i < fn->osrMissCount; i++) {
+            if (fn->osrMissTop[i] == top) { miss = i; break; }
+        }
+        if (miss < JAI_OSR_MAX && fn->osrMissAttempts[miss] >= 5 * JAI_OSR_MAX) {
+            return 0;   /* this head is spent; other heads are not */
+        }
         if (!compileOsr(closure, top, frame->slots, iterKind, elemSample,
                         false) &&
             !compileOsr(closure, top, frame->slots, iterKind, elemSample,
                         true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
-            if (++fn->osrAttempts >= 5 * JAI_OSR_MAX) fn->osrRefused = true;
+            if (miss == fn->osrMissCount && miss < JAI_OSR_MAX) {
+                fn->osrMissTop[miss]      = top;
+                fn->osrMissAttempts[miss] = 0;
+                fn->osrMissCount++;
+            }
+            if (miss < JAI_OSR_MAX) fn->osrMissAttempts[miss]++;
+            /* The whole-function backstop, for a body with more uncompilable
+             * heads than the table holds: without it those heads share the
+             * untracked path and would be retried for the life of the run. */
+            if (++fn->osrAttempts >= 5 * JAI_OSR_MAX * JAI_OSR_MAX) {
+                fn->osrRefused = true;
+            } else if (fn->osrMissCount >= JAI_OSR_MAX) {
+                bool allSpent = true;
+                for (unsigned i = 0; i < JAI_OSR_MAX; i++) {
+                    if (fn->osrMissAttempts[i] < 5 * JAI_OSR_MAX) {
+                        allSpent = false;
+                        break;
+                    }
+                }
+                if (allSpent) fn->osrRefused = true;
+            }
             return 0;
         }
         form = &fn->osrForms[fn->osrCount - 1];
