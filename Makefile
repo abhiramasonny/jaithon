@@ -57,6 +57,13 @@ LIBS     := -lm -lpthread
 EXTRA_CFLAGS  ?=
 EXTRA_LDFLAGS ?=
 
+# zlib inflates boot/seed.c's images. The seed is 3.2 MB of bytecode, and as a
+# `0x%02x, ` array that was a 20 MB source file; deflated and base64'd it is
+# under 2 MB. zlib is the one library assumed present beyond libc -- it ships
+# with macOS and with every Linux distribution -- and nothing else links it, so
+# dropping the compression again is this line plus the generator.
+LIBS     += -lz
+
 ifeq ($(UNAME_S),Darwin)
   LIBS   += -framework Cocoa -framework Metal -framework QuartzCore \
             -framework MetalKit -framework Foundation
