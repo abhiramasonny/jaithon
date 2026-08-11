@@ -1,7 +1,7 @@
 /* table.c — the one hash table (see table.h) and the string intern table.
  *
  * Open addressing, linear probing, power-of-two capacities, tombstones. The
- * table grows before an insert would push (live + tombstones) past 3/4 of
+ * table grows before an insert would push (live + tombstones) past half of
  * capacity. That bound is also what makes every probe loop terminate: at least
  * one never-used slot always remains, so a walk always hits an empty slot.
  *
@@ -21,9 +21,31 @@
  * or deleting a key would hide every key that collided with it. */
 const Value JAI_TOMBSTONE = {VAL_OBJ, {.obj = NULL}};
 
-/* Max load factor, counting tombstones: a tombstone still costs a probe step. */
-#define TABLE_LOAD_NUM 3
-#define TABLE_LOAD_DEN 4
+/* Max load factor, counting tombstones: a tombstone still costs a probe step.
+ *
+ * Half, not three quarters, and the difference is much larger than it looks
+ * because linear probing degrades on 1/(1-alpha)^2 rather than on alpha. The
+ * probe counts are measured, not estimated -- a counter in findExisting,
+ * findEntry and jaiInternTableFind over tests/bench/dict_ops, which does 30M
+ * lookups against a 10,000-entry dict and a 10,405-entry intern table:
+ *
+ *              at 3/4 (alpha .61-.64)   at 1/2 (alpha .31-.32)
+ *   intern find      2.16 probes             1.27
+ *   dict get         2.03                    1.25
+ *   dict set         2.03                    1.25
+ *
+ * Six probe steps per iteration became under four, and each step is a load
+ * from a 48-byte entry in an array far too big for L1. dict_ops fell 7.5% for
+ * this one line. The cost is the array: peak RSS on that benchmark went from
+ * 15.0 MB to 16.9 MB, and no other benchmark in the suite moved at all -- the
+ * tables that dominate a real heap (a class's methods, a module's globals) are
+ * tens of entries, where a table twice as big is still one page.
+ *
+ * NUM must stay DEN-1: the threshold is written as `capacity - capacity/DEN`
+ * to avoid a divide by NUM on the insert path. 2/3 was measured too, and is
+ * 10% worse than 1/2 on dict_ops. */
+#define TABLE_LOAD_NUM 1
+#define TABLE_LOAD_DEN 2
 
 /* Refuse to build a table so large that the index arithmetic stops being
  * meaningful; jaiRealloc would have run out of memory long before this. */
@@ -197,10 +219,14 @@ static inline void ensureRoom(JaiTable *t, Value key, Value value) {
 /* ------------------------------------------------------------------ */
 /* Probing                                                             */
 /* ------------------------------------------------------------------ */
-static inline bool keyMatches(const JaiEntry *e, Value key, uint64_t hash) {
-    if (e->hash != hash) return false;
-
-    const Value stored = e->key;
+/* The rest of keyMatches: the hashes agree and the two keys are not the same
+ * object, so the answer needs the five-way type dispatch below.
+ *
+ * Deliberately out of line. As one function, keyMatches is too big for clang to
+ * inline into findExisting/findEntry, so every probe -- including the one that
+ * a pointer comparison would have settled -- paid a call. It was 6.6% of
+ * dict_ops by sample count, almost all of it the call rather than the work. */
+static JAI_NOINLINE bool keyEqualsOther(Value stored, Value key) {
     const ValueType type = jaiValueType(key);
 
     if (jaiValueType(stored) != type)
@@ -233,6 +259,23 @@ static inline bool keyMatches(const JaiEntry *e, Value key, uint64_t hash) {
     }
 
     return jaiValuesEqual(stored, key);
+}
+
+/* Does this live entry hold `key`? The hash is compared first because it is
+ * already in a register and rules out almost every wrong slot; then the one
+ * case that decides real dictionaries -- both keys are the same heap object,
+ * which is what an interned string key always is -- settles inline. Anything
+ * else defers to keyEqualsOther, whose `a == b` arm repeats this test
+ * harmlessly. */
+JAI_INLINE bool keyMatches(const JaiEntry *e, Value key, uint64_t hash) {
+    if (e->hash != hash) return false;
+
+    const Value stored = e->key;
+    if (jaiValueType(stored) == VAL_OBJ && jaiValueType(key) == VAL_OBJ &&
+        AS_OBJ(stored) == AS_OBJ(key))
+        return true;
+
+    return keyEqualsOther(stored, key);
 }
 
 /* Lookup-only probing. Unlike findEntry this need not remember the first
@@ -655,6 +698,33 @@ JaiTable *jaiInternTable(void) {
     return &internTable;
 }
 
+/* A short string's whole identity, packed into the one field an intern entry
+ * does not otherwise use.
+ *
+ * The intern table is a SET: every value is NULL_VAL, sixteen bytes per entry
+ * that nothing reads. Storing the length in the top byte and the first seven
+ * content bytes below it turns the probe's comparison into one that the entry
+ * already in a register can answer. For length <= 7 the fingerprint is the
+ * entire string, so two equal fingerprints are two equal strings exactly --
+ * not probably, which is why this is not the hash. Longer strings only get it
+ * pruned and still take the byte compare.
+ *
+ * What that buys is not the memcmp. It is the two dependent loads in front of
+ * it: `e->key` -> ObjString -> `->length` and `->chars` is a pointer chase
+ * into a second cache line on every probe step, hit or miss, and on
+ * dict_ops -- which builds `f"k{i % 10000}"` thirty million times and finds
+ * all but ten thousand of them already interned -- that chase and the memcmp
+ * call after it were 4.2% of the whole benchmark by themselves. */
+static inline uint64_t internFingerprint(const char *chars, size_t length) {
+    uint64_t fp = (uint64_t)(length > 255 ? 255 : length) << 56;
+    const size_t n = length < 7 ? length : 7;
+
+    for (size_t i = 0; i < n; ++i)
+        fp |= (uint64_t)(uint8_t)chars[i] << (i * 8);
+
+    return fp;
+}
+
 /* Probes by (hash, length, bytes) rather than by Value, because this runs
  * during string creation: the ObjString the caller is looking for may not exist
  * yet, so there is nothing for jaiValueHash to be called on. */
@@ -665,6 +735,7 @@ ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
     const uint32_t mask = (uint32_t)t->capacity - 1;
     uint32_t index = (uint32_t)hash & mask;
     JaiEntry *const entries = t->entries;
+    const uint64_t fp = internFingerprint(chars, length);
 
     for (;;) {
         JaiEntry *const e = entries + index;
@@ -672,12 +743,17 @@ ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
 
         if (state == ENTRY_EMPTY_ORDER) return NULL;
 
-        if (state >= 0 && e->hash == hash) {
+        if (state >= 0 && e->hash == hash &&
+            (uint64_t)AS_INT(e->value) == fp) {
             JAI_ASSERT(IS_STRING(e->key), "intern table holds only strings");
             ObjString *const s = (ObjString *)AS_OBJ(e->key);
 
+            /* Seven bytes or fewer: the fingerprint carried all of them and
+             * the length, so there is nothing left to compare. */
+            if (length <= 7) return s;
+
             if ((size_t)s->length == length &&
-                (length == 0 || memcmp(s->chars, chars, length) == 0))
+                memcmp(s->chars, chars, length) == 0)
                 return s;
         }
 
@@ -692,5 +768,9 @@ void jaiInternTableAdd(ObjString *s) {
     /* Set the flag here so that "in the intern table" and "s->interned" cannot
      * disagree; the insert below may collect, and the collector reads it. */
     JAI_STR_INTERNED(s) = true;
-    (void)jaiTableSetInterned(&internTable, s, NULL_VAL);
+    /* The value is the fingerprint jaiInternTableFind probes by. This is the
+     * only writer, so nothing else has to know the encoding. */
+    (void)jaiTableSetInterned(
+        &internTable, s,
+        INT_VAL((int64_t)internFingerprint(s->chars, s->length)));
 }

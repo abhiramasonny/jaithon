@@ -22,6 +22,7 @@
 #  define JAI_UNLIKELY(x)   __builtin_expect(!!(x), 0)
 #  define JAI_NORETURN      __attribute__((noreturn))
 #  define JAI_INLINE        static inline __attribute__((always_inline))
+#  define JAI_NOINLINE      __attribute__((noinline))
 #  define JAI_PRINTF(a, b)  __attribute__((format(printf, a, b)))
 #  define JAI_UNUSED        __attribute__((unused))
 #  define JAI_COMPUTED_GOTO 1
@@ -30,6 +31,7 @@
 #  define JAI_UNLIKELY(x)   (x)
 #  define JAI_NORETURN
 #  define JAI_INLINE        static inline
+#  define JAI_NOINLINE
 #  define JAI_PRINTF(a, b)
 #  define JAI_UNUSED
 #  define JAI_COMPUTED_GOTO 0

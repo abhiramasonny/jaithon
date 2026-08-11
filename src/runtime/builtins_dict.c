@@ -120,7 +120,7 @@ static bool dictLen(int argc, Value *args, Value *out) {
 static bool dictGet(int argc, Value *args, Value *out) {
     ObjDict *self;
     if (!selfDict(args, "dict.get", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict.get", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict.get", "key")) return false;
 
     Value found;
     if (jaiDictGet(self, args[1], &found)) {
@@ -136,7 +136,7 @@ static bool dictSet(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
     if (!selfDict(args, "dict.set", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict.set", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict.set", "key")) return false;
     (void)jaiDictSet(self, args[1], args[2]);
     if (vm.hasException) return false;
     *out = args[0];
@@ -147,7 +147,7 @@ static bool dictHas(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
     if (!selfDict(args, "dict.has", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict.has", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict.has", "key")) return false;
     bool found = jaiDictGet(self, args[1], NULL);
     if (vm.hasException) return false;
     *out = BOOL_VAL(found);
@@ -159,7 +159,7 @@ static bool dictDelete(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
     if (!selfDict(args, "dict.remove", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict.remove", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict.remove", "key")) return false;
     bool removed = jaiDictDelete(self, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(removed);
@@ -169,7 +169,7 @@ static bool dictDelete(int argc, Value *args, Value *out) {
 static bool dictPop(int argc, Value *args, Value *out) {
     ObjDict *self;
     if (!selfDict(args, "dict.pop", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict.pop", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict.pop", "key")) return false;
 
     Value found;
     if (jaiDictGet(self, args[1], &found)) {
@@ -276,7 +276,7 @@ static bool dictGetOrInsert(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
     if (!selfDict(args, "dict.get_or_insert", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict.get_or_insert", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict.get_or_insert", "key")) return false;
 
     Value found;
     if (jaiDictGet(self, args[1], &found)) {
@@ -383,7 +383,7 @@ static bool setAdd(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *self;
     if (!selfSet(args, "set.add", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "set.add", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set.add", "set element")) return false;
     (void)jaiSetAdd(self, args[1]);
     if (vm.hasException) return false;
     *out = args[0];
@@ -395,7 +395,7 @@ static bool setRemove(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *self;
     if (!selfSet(args, "set.remove", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "set.remove", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set.remove", "set element")) return false;
     bool removed = jaiSetDelete(self, args[1]);
     if (vm.hasException) return false;
     if (!removed) return missingKeyError("set.remove", "element", args[1]);
@@ -407,7 +407,7 @@ static bool setDiscard(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *self;
     if (!selfSet(args, "set.discard", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "set.discard", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set.discard", "set element")) return false;
     bool removed = jaiSetDelete(self, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(removed);
@@ -418,7 +418,7 @@ static bool setHasMethod(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *self;
     if (!selfSet(args, "set.has", &self)) return false;
-    if (!jaiSeqHashableKey(args[1], "set.has", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set.has", "set element")) return false;
     bool found = jaiSetHas(self, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(found);
@@ -633,7 +633,7 @@ static bool primDictNew(int argc, Value *args, Value *out) {
 static bool primDictGet(int argc, Value *args, Value *out) {
     ObjDict *dict;
     if (!jaiArgDict(args[0], 1, "dict_get", &dict)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict_get", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict_get", "key")) return false;
 
     Value found;
     if (jaiDictGet(dict, args[1], &found)) {
@@ -649,7 +649,7 @@ static bool primDictSet(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *dict;
     if (!jaiArgDict(args[0], 1, "dict_set", &dict)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict_set", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict_set", "key")) return false;
     bool isNew = jaiDictSet(dict, args[1], args[2]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(isNew);
@@ -660,7 +660,7 @@ static bool primDictDel(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *dict;
     if (!jaiArgDict(args[0], 1, "dict_del", &dict)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict_del", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict_del", "key")) return false;
     bool removed = jaiDictDelete(dict, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(removed);
@@ -671,7 +671,7 @@ static bool primDictHas(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *dict;
     if (!jaiArgDict(args[0], 1, "dict_has", &dict)) return false;
-    if (!jaiSeqHashableKey(args[1], "dict_has", "key")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "dict_has", "key")) return false;
     bool found = jaiDictGet(dict, args[1], NULL);
     if (vm.hasException) return false;
     *out = BOOL_VAL(found);
@@ -717,7 +717,7 @@ static bool primSetAdd(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *set;
     if (!argSet(args[0], 1, "set_add", &set)) return false;
-    if (!jaiSeqHashableKey(args[1], "set_add", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set_add", "set element")) return false;
     bool isNew = jaiSetAdd(set, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(isNew);
@@ -728,7 +728,7 @@ static bool primSetDel(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *set;
     if (!argSet(args[0], 1, "set_del", &set)) return false;
-    if (!jaiSeqHashableKey(args[1], "set_del", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set_del", "set element")) return false;
     bool removed = jaiSetDelete(set, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(removed);
@@ -739,7 +739,7 @@ static bool primSetHas(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *set;
     if (!argSet(args[0], 1, "set_has", &set)) return false;
-    if (!jaiSeqHashableKey(args[1], "set_has", "set element")) return false;
+    if (!JAI_SEQ_KEY_OK(args[1], "set_has", "set element")) return false;
     bool found = jaiSetHas(set, args[1]);
     if (vm.hasException) return false;
     *out = BOOL_VAL(found);
