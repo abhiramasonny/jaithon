@@ -123,6 +123,11 @@ typedef struct JitCallDesc {
     Value   args[JIT_MAX_ARGS_OUT];
     Value   result;
     int64_t argc;
+    /* Whatever else a helper needs that is not a Value. Only OP_GET_SLICE uses
+     * it, for the flags byte saying which of start, stop and step are present:
+     * presence cannot be read off the values, because `xs[null:3]` is a
+     * TypeError and must not read as `xs[:3]`. */
+    int64_t aux;
 } JitCallDesc;
 
 /* Compiled frames whose roots the collector must see.

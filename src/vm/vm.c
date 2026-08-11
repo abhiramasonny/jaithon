@@ -2104,6 +2104,58 @@ static bool sliceBounds(Value startV, Value stopV, Value stepV, bool hasStart,
     return true;
 }
 
+/* The whole of OP_GET_SLICE, so the compiled tier runs this rather than a copy
+ * of it. The caller must have saved VM state; returns false with an exception
+ * pending. */
+bool jaiSliceGet(Value container, Value startValue, Value stopValue,
+                 Value stepValue, bool hasStart, bool hasStop, bool hasStep,
+                 Value *out) {
+    int64_t length;
+    if (IS_LIST(container))        length = AS_LIST(container)->count;
+    else if (IS_STRING(container)) length = jaiStringScalarCount(AS_STRING(container));
+    else if (IS_TUPLE(container))  length = AS_TUPLE(container)->count;
+    else {
+        return jaiThrow(vm.cTypeError, "'%s' value does not support slicing",
+                        jaiTypeNameStatic(container));
+    }
+
+    int64_t start, stop, step;
+    if (!sliceBounds(startValue, stopValue, stepValue, hasStart, hasStop,
+                     hasStep, length, &start, &stop, &step)) {
+        return false;
+    }
+    if (IS_LIST(container)) {
+        ObjList *sliced = jaiListSlice(AS_LIST(container), start, stop, step);
+        if (sliced == NULL) return false;
+        *out = OBJ_VAL(sliced);
+        return true;
+    }
+    if (IS_STRING(container)) {
+        ObjString *sliced = jaiStringSlice(AS_STRING(container), start, stop, step);
+        if (sliced == NULL) return false;
+        *out = OBJ_VAL(sliced);
+        return true;
+    }
+    {
+        ObjTuple *tuple = AS_TUPLE(container);
+        /* Reuse the list slicer for index arithmetic, then re-wrap. */
+        ObjList *temp = jaiListNew((int)tuple->count);
+        jaiGCPushRoot(OBJ_VAL(temp));
+        for (uint32_t i = 0; i < tuple->count; i++) {
+            temp->items[temp->count++] = tuple->items[i];
+        }
+        ObjList *sliced = jaiListSlice(temp, start, stop, step);
+        jaiGCPopRoot();
+        if (sliced == NULL) return false;
+        jaiGCPushRoot(OBJ_VAL(sliced));
+        ObjTuple *outT = jaiTupleNew(sliced->items, sliced->count);
+        jaiGCPopRoot();
+        *out = OBJ_VAL(outT);
+        return true;
+    }
+}
+
+
 /* ------------------------------------------------------------------ */
 /* defer                                                                */
 /* ------------------------------------------------------------------ */
@@ -4631,51 +4683,14 @@ static JaiRunResult runLoop(int baseFrameCount) {
 
         SAVE_STATE();
         Value *args = stackTop - operands;
-        Value container = args[-1];
         int at = 0;
         Value startValue = hasStart ? args[at++] : NULL_VAL;
         Value stopValue = hasStop ? args[at++] : NULL_VAL;
         Value stepValue = hasStep ? args[at++] : NULL_VAL;
-
-        int64_t length;
-        if (IS_LIST(container))        length = AS_LIST(container)->count;
-        else if (IS_STRING(container)) length = jaiStringScalarCount(AS_STRING(container));
-        else if (IS_TUPLE(container))  length = AS_TUPLE(container)->count;
-        else {
-            THROW(vm.cTypeError, "'%s' value does not support slicing",
-                  jaiTypeNameStatic(container));
-        }
-
-        int64_t start, stop, step;
-        if (!sliceBounds(startValue, stopValue, stepValue, hasStart, hasStop,
-                         hasStep, length, &start, &stop, &step)) {
-            goto vmThrow;
-        }
         Value result;
-        if (IS_LIST(container)) {
-            ObjList *sliced = jaiListSlice(AS_LIST(container), start, stop, step);
-            if (sliced == NULL) goto vmThrow;
-            result = OBJ_VAL(sliced);
-        } else if (IS_STRING(container)) {
-            ObjString *sliced = jaiStringSlice(AS_STRING(container), start, stop,
-                                               step);
-            if (sliced == NULL) goto vmThrow;
-            result = OBJ_VAL(sliced);
-        } else {
-            ObjTuple *tuple = AS_TUPLE(container);
-            /* Reuse the list slicer for index arithmetic, then re-wrap. */
-            ObjList *temp = jaiListNew((int)tuple->count);
-            jaiGCPushRoot(OBJ_VAL(temp));
-            for (uint32_t i = 0; i < tuple->count; i++) {
-                temp->items[temp->count++] = tuple->items[i];
-            }
-            ObjList *sliced = jaiListSlice(temp, start, stop, step);
-            jaiGCPopRoot();
-            if (sliced == NULL) goto vmThrow;
-            jaiGCPushRoot(OBJ_VAL(sliced));
-            ObjTuple *out = jaiTupleNew(sliced->items, sliced->count);
-            jaiGCPopRoot();
-            result = OBJ_VAL(out);
+        if (!jaiSliceGet(args[-1], startValue, stopValue, stepValue,
+                         hasStart, hasStop, hasStep, &result)) {
+            goto vmThrow;
         }
         LOAD_STATE();
         DROP(operands + 1);
