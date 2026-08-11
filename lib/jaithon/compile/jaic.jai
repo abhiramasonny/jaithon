@@ -416,9 +416,40 @@ pub class Import {
 class Pool {
     pub var entries: list[Const]
 
-    pub fn init(self, entries: list[Const]) { self.entries = entries }
+    #: Content index over the string constants.
+    #:
+    #: `index_of` scanned the whole pool on every intern, which is quadratic in
+    #: the number of constants -- and a pool is mostly strings, because every
+    #: name, field, method and docstring in a module lands in one. Strings are
+    #: the only tag that can be indexed this way: `_same_constant` compares
+    #: every other tag by payload IDENTITY, which a content-keyed map cannot
+    #: express, so those keep the scan.
+    var _strings: dict[str, int]
+
+    pub fn init(self, entries: list[Const]) {
+        self.entries = entries
+        self._strings = {}
+        #: Built from whatever the pool was handed, because a pool read back
+        #: from a file starts full. First occurrence wins, which is what the
+        #: scan this replaces returned.
+        for (index, existing) in entries.enumerate() {
+            if existing.tag == ConstTag.Str {
+                if self._strings.get(existing.value, -1) < 0 {
+                    self._strings[existing.value] = index
+                }
+            }
+        }
+    }
 
     pub fn index_of(self, value: Const) -> int {
+        if value.tag == ConstTag.Str {
+            let found = self._strings.get(value.value, -1)
+            if found >= 0 { return found }
+            self.entries.push(value)
+            let added = self.entries.len() - 1
+            self._strings[value.value] = added
+            return added
+        }
         for (index, existing) in self.entries.enumerate() {
             if _same_constant(existing, value) { return index }
         }

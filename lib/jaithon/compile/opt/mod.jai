@@ -18,12 +18,12 @@
 #: does, and the two front ends have to agree byte for byte, so it is not a
 #: round that can be dropped for being redundant.
 from jaithon.compile.emit import ConstTag, FuncProto
-from .chunk import is_defer_thunk
-from .coalesce import coalesce_slots
+from .chunk import compact, decode, is_defer_thunk, mark_unreachable, rebuild
+from .coalesce import coalesce_slots, coalesce_slots_on
 from .dead import dead_code
-from .fuse import superinstructions
-from .hoist import hoist_globals
-from .peephole import peephole
+from .fuse import superinstructions, superinstructions_on
+from .hoist import hoist_globals, hoist_globals_on
+from .peephole import peephole, peephole_on
 
 #: Deepest nesting `optimize` descends into the constant pool.
 #:
@@ -56,36 +56,71 @@ fn _optimize_nested(proto: FuncProto, level: int, depth: int) -> void {
     }
 }
 
+#: Run the passes over one function, decoding once and re-encoding once.
+#:
+#: Each pass used to take a proto, decode it, work, and rebuild. That is a
+#: round trip per pass, about six per function once the fixpoint loop is
+#: counted, and it dominated the optimiser: measured over the standard library,
+#: one decode plus one rebuild is 317ms against 2.9s for every rewrite the
+#: passes perform. Nothing needed it -- no pass reads `chunk.code`, they all
+#: work on the decoded form -- so the decode moved here and the passes gained
+#: `_on` entry points that take the `Code` already in hand.
+#:
+#: One rebuild at the end also makes the failure all-or-nothing, which is the
+#: behaviour the passes documented individually and now get for real: a rebuild
+#: that cannot represent the result leaves the chunk exactly as it was, so a
+#: program that compiles at `--O0` cannot fail at `--O2`. `max_slots` is the one
+#: piece of state the passes write outside `code`, so it is saved and restored
+#: on that path.
 fn _optimize_function(proto: FuncProto, level: int, depth: int) -> void {
     if depth > MAX_DEPTH { return }
     _optimize_nested(proto, level, depth)
 
+    let code = decode(proto)
+    if code == null { return }
+    let slots_before = proto.max_slots
+
     # Unreachable code is removed at every level: spec §8 disables passes 3-7
     # under --O0, not pass 2.
-    dead_code(proto)
+    var changes = mark_unreachable(code)
+    if changes > 0 { compact(code) }
 
-    if level <= 0 { return }
+    if level > 0 {
+        # Fusing exposes new windows and deleting exposes new fusions, so run
+        # the byte-level passes to a fixpoint before the ones that depend on the
+        # final instruction stream.
+        for _round in 0..FIXPOINT_ROUNDS {
+            var round = peephole_on(code)
+            if round > 0 { compact(code) }
+            let fused = superinstructions_on(code)
+            if fused > 0 { compact(code) }
+            round += fused
+            if round == 0 { break }
+            changes += round
+        }
+        if not is_defer_thunk(proto) and hoist_globals_on(code, proto) > 0 {
+            changes += 1
+            compact(code)
+            if peephole_on(code) > 0 {
+                compact(code)
+                changes += 1
+            }
+            if superinstructions_on(code) > 0 {
+                compact(code)
+                changes += 1
+            }
+        }
 
-    # Fusing exposes new windows and deleting exposes new fusions, so run the
-    # byte-level passes to a fixpoint before the ones that depend on the final
-    # instruction stream.
-    for _round in 0..FIXPOINT_ROUNDS {
-        var changes = peephole(proto)
-        changes += superinstructions(proto)
-        if changes == 0 { break }
+        # Coalescing runs last so that it sees the final set of locals,
+        # including the ones hoisting just introduced. Running it earlier leaves
+        # a hoisted slot unpacked until the next call, which makes the pipeline
+        # disagree with itself about the frame size.
+        #
+        # A defer thunk is exempt: its slot numbers are the defining frame's, so
+        # renumbering them against its own (empty) parameter list would make it
+        # read the wrong local.
+        if not is_defer_thunk(proto) { changes += coalesce_slots_on(code) }
     }
-    if not is_defer_thunk(proto) and hoist_globals(proto) > 0 {
-        peephole(proto)
-        superinstructions(proto)
-    }
 
-    # Coalescing runs last so that it sees the final set of locals, including
-    # the ones hoisting just introduced. Running it earlier leaves a hoisted
-    # slot unpacked until the next call, which makes the pipeline disagree with
-    # itself about the frame size.
-    #
-    # A defer thunk is exempt: its slot numbers are the defining frame's, so
-    # renumbering them against its own (empty) parameter list would make it read
-    # the wrong local.
-    if not is_defer_thunk(proto) { coalesce_slots(proto) }
+    if changes > 0 and not rebuild(code) { proto.max_slots = slots_before }
 }

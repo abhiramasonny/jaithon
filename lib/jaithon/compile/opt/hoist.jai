@@ -76,6 +76,24 @@ pub fn hoist_globals(proto: FuncProto) -> int {
     return total
 }
 
+#: The pass on an already-decoded chunk. See `peephole_on` for why the decode
+#: is the caller's job.
+#:
+#: The rounds run against the one `Code` rather than re-decoding between them,
+#: which is sound because every index this pass reasons about is an index into
+#: `code.data` and `_hoist_round` maintains those as it splices. The frame is
+#: widened here, so a caller whose final rebuild fails has to put `max_slots`
+#: back -- the driver in `opt/mod.jai` saves it for exactly that.
+pub fn hoist_globals_on(code: Code, proto: FuncProto) -> int {
+    var total = 0
+    for _round in 0..HOIST_ROUNDS {
+        let hoisted = _hoist_round(code, proto)
+        if hoisted == 0 { break }
+        total += hoisted
+    }
+    return total
+}
+
 # One round: pick a set of non-overlapping loops, rewrite their in-loop reads
 # and splice in the pre-header loads. Answers the number of globals hoisted,
 # with proto.max_slots already widened on success.

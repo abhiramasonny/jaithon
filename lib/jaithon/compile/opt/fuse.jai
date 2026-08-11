@@ -24,7 +24,14 @@ from .chunk import window_clean, window_of
 pub fn superinstructions(proto: FuncProto) -> int {
     let code = decode(proto)
     if code == null { return 0 }
+    let changes = superinstructions_on(code)
+    if changes > 0 and not rebuild(code) { return 0 }
+    return changes
+}
 
+#: The pass itself, on an already-decoded chunk. See `peephole_on` for why the
+#: decode is the caller's job.
+pub fn superinstructions_on(code: Code) -> int {
     var changes = 0
     # Every fusion deletes at least one instruction, so the scan drains on its
     # own; the guard is insurance against a future rule that does not.
@@ -43,8 +50,6 @@ pub fn superinstructions(proto: FuncProto) -> int {
         let back = prev_live(code, index)
         if back >= 0 { index = back }
     }
-
-    if changes > 0 and not rebuild(code) { changes = 0 }
     return changes
 }
 
