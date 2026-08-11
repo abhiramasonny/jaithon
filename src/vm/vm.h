@@ -124,6 +124,11 @@ bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out);
+/* OP_GET_SLICE's semantics, callable from the compiled tier. */
+bool jaiSliceGet(Value container, Value startValue, Value stopValue,
+                 Value stepValue, bool hasStart, bool hasStop, bool hasStep,
+                 Value *out);
+
 bool jaiCallValue(Value callee, int argc, Value *args, Value *out);
 /* Call a method by name on a receiver; false if the method does not exist. */
 bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,
