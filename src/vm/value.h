@@ -1,9 +1,28 @@
 /* value.h — the Jaithon value representation.
  *
  * A Value is 16 bytes: an 8-byte tag word and an 8-byte payload. This is
- * deliberately not NaN-boxed: Jaithon distinguishes int from float as separate
- * types (spec §2.4), so a tagged union is both simpler and faster here than
- * NaN-boxing, which would have to unbox 64-bit ints anyway.
+ * deliberately not NaN-boxed, and that is now a measured decision rather than
+ * an assumption.
+ *
+ * An 8-byte NaN-boxed Value was built -- deliberately wrong, ints truncated to
+ * the 48-bit payload rather than boxed, which is enough to time the same work --
+ * and it is SLOWER than this one: loop_sum +13.3%, binary_trees +9.7%,
+ * alloc_churn +10.1%, matrix_mul +4.9%, sort_merge a wash, all with identical
+ * output and the same trip counts.
+ *
+ * The reason is that Jaithon's `int` is 64-bit (spec §2.4) and does not fit a
+ * 48-bit payload. On the hot path -- `IS_INT`/`AS_INT`/`INT_VAL` inside
+ * OP_ADD, not a tag switch -- that costs about eight extra ALU operations per
+ * integer opcode: `AS_INT` becomes a shift pair because the payload is signed,
+ * and the `IS_INT` comparison constant does not fit a `CMP` immediate so it is
+ * rematerialised. That exceeds what the narrower stack saves, which mostly
+ * hits in L1 anyway. matrix_mul loses 5% even though its doubles become free,
+ * because its indices are integers and that alone is enough.
+ *
+ * So the eight bytes are not the prize they look like, and anyone reopening
+ * this has to answer the 64-bit integer question first, not second. The full
+ * measurement is in the "NaN-boxing, measured" section of
+ * docs/superpowers/plans/2026-08-09-phase7-speed.md.
  */
 #ifndef JAI_VALUE_H
 #define JAI_VALUE_H
