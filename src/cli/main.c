@@ -765,8 +765,15 @@ static ObjFunction *compileOwnedSource(const char *path,
     if (outSourceHash != NULL)
         *outSourceHash = sourceHash;
 
-    ObjModule *module = jaiModuleNew(jaiStringInternC(name),
-                                     jaiStringInternC(absolute));
+    ObjString *moduleName = jaiStringInternC(name);
+    jaiPushRoot(OBJ_VAL(moduleName));
+
+    ObjString *modulePath = jaiStringInternC(absolute);
+    jaiPushRoot(OBJ_VAL(modulePath));
+
+    ObjModule *module = jaiModuleNew(moduleName, modulePath);
+
+    jaiPopRoots(2);
     jaiPushRoot(OBJ_VAL(module));
 
     ObjFunction *body;
@@ -955,9 +962,9 @@ static int buildOne(const char *path, const JaiCliOptions *opts) {
         return 1;
     }
 
-    uint32_t flags = 0;
-    if (opts->run.codegen.debugInfo) flags |= JAIC_FLAG_DEBUG;
-    if (opts->run.codegen.stripAsserts) flags |= JAIC_FLAG_RELEASE;
+    const uint32_t flags =
+        (opts->run.codegen.debugInfo ? JAIC_FLAG_DEBUG : 0u) |
+        (opts->run.codegen.stripAsserts ? JAIC_FLAG_RELEASE : 0u);
 
     if (opts->output != NULL) {
         size_t size = 0;
@@ -1093,12 +1100,13 @@ static bool disassembleImage(FILE *out, const char *path, const uint8_t *data,
         cliError("%s: truncated .jaic image (%zu bytes)", path, size);
         return false;
     }
-    uint16_t version  = imageU16(data + 4);
-    uint16_t flags    = imageU16(data + 6);
-    uint32_t compiler = imageU32(data + 8);
-    uint32_t buildId  = imageU32(data + 12);
-    uint64_t srcHash  = imageU64(data + 16);
-    uint16_t pathLen  = imageU16(data + 24);
+    const uint16_t version  = imageU16(data + 4);
+    const uint16_t flags    = imageU16(data + 6);
+    const uint32_t compiler = imageU32(data + 8);
+    const uint32_t buildId  = imageU32(data + 12);
+    const uint64_t srcHash  = imageU64(data + 16);
+    const uint16_t pathLen  = imageU16(data + 24);
+    const uint32_t thisBuildId = jaiBuildId();
 
     fprintf(out, "; %s\n", path);
     fprintf(out, "; container version %u", version);
@@ -1106,7 +1114,7 @@ static bool disassembleImage(FILE *out, const char *path, const uint8_t *data,
     fputc('\n', out);
     fprintf(out, "; compiler version  %u\n", compiler);
     fprintf(out, "; build id          0x%08x%s\n", buildId,
-            buildId == jaiBuildId() ? "  (this build)" : "  (a different build)");
+            buildId == thisBuildId ? "  (this build)" : "  (a different build)");
     fprintf(out, "; source hash       0x%016llx\n", (unsigned long long)srcHash);
     fprintf(out, "; flags             %s%s\n",
             (flags & JAIC_FLAG_DEBUG) ? "debug " : "",
@@ -1115,7 +1123,12 @@ static bool disassembleImage(FILE *out, const char *path, const uint8_t *data,
         fprintf(out, "; source            %.*s\n", (int)pathLen, (const char *)data + 26);
     fputc('\n', out);
 
-    ObjModule *module = jaiModuleNew(jaiStringInternC(path), jaiStringInternC(path));
+    ObjString *modulePath = jaiStringInternC(path);
+    jaiPushRoot(OBJ_VAL(modulePath));
+
+    ObjModule *module = jaiModuleNew(modulePath, modulePath);
+
+    jaiPopRoot();
     if (module == NULL) { cliError("%s: out of memory", path); return false; }
     jaiPushRoot(OBJ_VAL(module));
 
@@ -1126,7 +1139,7 @@ static bool disassembleImage(FILE *out, const char *path, const uint8_t *data,
     if (body == NULL) {
         jaiPopRoot();
         cliError("%s: this build cannot load the image", path);
-        if (compiler != JAI_COMPILER_VERSION || buildId != jaiBuildId())
+        if (compiler != JAI_COMPILER_VERSION || buildId != thisBuildId)
             cliError("it was written by a different compiler build; recompile "
                      "the source to inspect it");
         return false;
@@ -1161,18 +1174,19 @@ static int cmdDisasm(const JaiCliOptions *opts) {
             JAI_FREE_ARRAY(char, image, imageSize + 1);
             continue;
         }
-        ObjModule *module = NULL;
-        ObjFunction *body;
-
-        if (image != NULL) {
-            /* compileOwnedSource takes ownership of image. */
-            body = compileOwnedSource(files.data[i], image, imageSize,
-                                      &opts->run.codegen, &module, NULL);
-        } else {
-            /* Preserve the old retry behavior when the first read failed. */
-            body = compileFile(files.data[i], &opts->run.codegen,
-                               &module, NULL);
+        if (image == NULL) {
+            cliError("cannot read %s", files.data[i]);
+            (void)cliFlush();
+            status = 1;
+            continue;
         }
+
+        ObjModule *module = NULL;
+
+        /* compileOwnedSource takes ownership of image. */
+        ObjFunction *body =
+            compileOwnedSource(files.data[i], image, imageSize,
+                               &opts->run.codegen, &module, NULL);
 
         if (body == NULL) {
             status = 1;
@@ -1312,8 +1326,15 @@ static inline bool toolMainTakesNoArgs(Value entry) {
 }
 
 static int runJaithonTool(const JaiCliOptions *opts, const char *tool) {
+    static const char prefix[] = "jaithon.tool.";
     char moduleName[64];
-    snprintf(moduleName, sizeof moduleName, "jaithon.tool.%s", tool);
+
+    const size_t toolLen = strlen(tool);
+    JAI_ASSERT(sizeof prefix + toolLen <= sizeof moduleName,
+               "tool module name exceeds local buffer");
+
+    memcpy(moduleName, prefix, sizeof prefix - 1);
+    memcpy(moduleName + sizeof prefix - 1, tool, toolLen + 1);
 
     ObjModule *module = jaiImportModule(moduleName, NULL);
     if (module == NULL) {
@@ -1371,6 +1392,8 @@ static int runJaithonTool(const JaiCliOptions *opts, const char *tool) {
  * `help`/`version` touch no source at all. */
 static inline bool commandNeedsPrelude(JaiCommand command) {
     switch (command) {
+    case CMD_RUN:
+        /* jaiRunFile owns run-session prelude loading. */
     case CMD_TOKENS:
     case CMD_VERSION:
     case CMD_HELP:
@@ -1388,61 +1411,12 @@ static inline bool preludeDisabled(const JaiCliOptions *opts) {
     return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
 }
 
-/* --front=jai chooses which compiler produces the bytecode, so a command that
- * cannot honour it has to say so. Only `run` goes through jaiRunFile, which is
- * where the bridge to lib/jaithon/compile lives. Quietly using the C front end
- * for the rest would mean the output of `jaithon --front=jai build x.jai` was
- * not what its command line says it is. */
-static bool commandHonoursFrontEnd(JaiCommand command) {
-    switch (command) {
-    case CMD_RUN:
-    /* `check` runs the self-hosted front end over the entry file, which is what
-     * makes it a check of the compiler that will actually build the file. */
-    case CMD_CHECK:
-    /* Neither compiles anything, so the flag is vacuous rather than ignored. */
-    case CMD_VERSION:
-    case CMD_HELP:
-        return true;
-    /* Both compile, and both now go through the front end the flag names. */
-    case CMD_BUILD:
-    case CMD_DISASM:
-        return true;
-    /* These dispatch to Jaithon programs (jaithon.tool.*) rather than compiling
-     * anything themselves, and their imports now route through the front end
-     * the flag names. */
-    case CMD_FMT:
-    case CMD_TEST:
-    case CMD_DOC:
-    case CMD_BENCH:
-        return true;
-    /* The REPL and `eval` compile a snippet through the same module machinery,
-     * so they follow the flag like `run` does. */
-    case CMD_REPL:
-    case CMD_EVAL:
-        return true;
-    /* Both print what the front end read, and the self-hosted printer is now
-     * the one that prints it. */
-    case CMD_AST:
-    case CMD_TOKENS:
-        return true;
-    }
-    return false;
-}
+
 
 int jaiCliDispatch(const JaiCliOptions *opts) {
     if (opts == NULL) return 1;
 
     gSelfHosted = opts->run.selfHosted;
-
-    if (opts->run.selfHosted && !commandHonoursFrontEnd(opts->command)) {
-        JaiDiag *d = jaiDiagError(JAI_OK, JAI_SPAN_NONE,
-                                  "--front=jai is not implemented for `%s`; "
-                                  "only `run` uses the self-hosted front end",
-                                  commandName(opts->command));
-        jaiDiagAddHelp(d, "drop --front=jai to use the C front end");
-        (void)cliFlush();
-        return 1;
-    }
 
     /* A tree without lib/std is still usable, so a missing prelude is a
      * warning — one that jaiLoadPrelude has already printed, including the
@@ -1555,6 +1529,25 @@ int main(int argc, char **argv) {
         jaiSourceFreeAll();
         return 2;
     }
+
+    /*
+     * Help/version are pure process-level queries. Avoid VM initialization,
+     * module-path discovery, environment export, prelude logic, and VM teardown
+     * entirely. jaiCliPrintVersion's GPU query is independent of the VM.
+     */
+    if (opts.command == CMD_HELP || opts.command == CMD_VERSION) {
+        if (opts.command == CMD_HELP)
+            jaiCliPrintUsage(stdout);
+        else
+            jaiCliPrintVersion(stdout);
+
+        cliFreeOptions(&opts);
+        jaiDiagFree(&gDiags);
+        jaiSourceFreeAll();
+        fflush(stdout);
+        return 0;
+    }
+
     gDiags.colorOutput = detectColor();
 
     /* jaiVMInit keeps the flag fields it does not own, so these must be set
