@@ -20,6 +20,8 @@ from Python (no semicolons, comprehensions, f-strings, first class functions, an
 
 Pretty much everything (apart from the CORE primitive implementation stuff) is written in jaithon itself, jaithon is VERY much bootstrapped, which makes it easy to develop extra features onto.
 
+PS: A majority of the documentation (including documentation within .jai files and .c files via docstrings) are AI generated, and as such might be wrong about certain things. This was done to speed up development, however this is being re-written as I continuiously develop. Currently my focus is on improving jaithon as a language, making it faster etc, so shortcuts like this help me push developments quicker. The readme is completely written by me, same with a majority of the language.md file. I have checked over the language.md file and there are no errors within it.
+
 ## Quick start
 
 ```bash
