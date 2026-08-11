@@ -631,7 +631,7 @@ static bool nSorted(int argc, Value *args, Value *out) {
         for (int i = 0; i < items->count; i++) {
             Value key;
             Value arg = items->items[i];
-            if (!jaiCallValue(keyFn, 1, &arg, &key)) { ok = false; break; }
+            if (!jaiCallValue1(keyFn, arg, &key)) { ok = false; break; }
             jaiGCPushRoot(key);
             jaiListPush(keys, key);
             jaiGCPopRoot();
@@ -785,7 +785,7 @@ static bool nFilter(int argc, Value *args, Value *out) {
     for (int i = 0; i < items->count; i++) {
         Value item = items->items[i];
         Value verdict;
-        if (!jaiCallValue(fn, 1, &item, &verdict)) { ok = false; break; }
+        if (!jaiCallValue1(fn, item, &verdict)) { ok = false; break; }
         if (!IS_BOOL(verdict)) {
             ok = jaiThrow(vm.cTypeError, "filter(): predicate must return bool, not %s",
                           jaiTypeNameStatic(verdict));

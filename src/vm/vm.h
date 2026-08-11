@@ -130,6 +130,19 @@ bool jaiSliceGet(Value container, Value startValue, Value stopValue,
                  Value *out);
 
 bool jaiCallValue(Value callee, int argc, Value *args, Value *out);
+
+/* jaiCallValue for the one-argument case, which is what every higher-order
+ * list and iterator builtin does per element. The general form pushes the
+ * callee and argument on the VM stack, dispatches through invokeCallable and
+ * callClosure, and unwinds again -- and for a callee the tier has compiled,
+ * all of that surrounds an entry that reads its argument straight out of two
+ * stack cells. Measured on `xs.map(|x| x * 2)` over ten million elements,
+ * those three frames were 42% of the loop. This one keeps the two cells --
+ * they are what roots the callee and the argument across a body that may
+ * allocate -- and skips the rest. Anything the compiled tier declines, and
+ * every callee that is not a compiled closure, falls through to jaiCallValue
+ * unchanged. */
+bool jaiCallValue1(Value callee, Value arg, Value *out);
 /* Call a method by name on a receiver; false if the method does not exist. */
 bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,
                      Value *out);

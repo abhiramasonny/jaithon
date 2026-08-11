@@ -80,7 +80,7 @@ static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
  * §2.6), so anything but a bool is an error rather than a coercion. */
 static bool callPredicate(Value pred, Value item, const char *fnName, bool *out) {
     Value arg = item, verdict;
-    if (!jaiCallValue(pred, 1, &arg, &verdict)) return false;
+    if (!jaiCallValue1(pred, arg, &verdict)) return false;
     if (!IS_BOOL(verdict)) {
         return jaiThrow(vm.cTypeError,
                         "%s(): the predicate must return bool, not %s", fnName,
@@ -146,7 +146,7 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
     jaiGCPushRoot(OBJ_VAL(keys));
     for (int i = 0; i < items->count; i++) {
         Value arg = items->items[i], key;
-        if (!jaiCallValue(keyFn, 1, &arg, &key)) {
+        if (!jaiCallValue1(keyFn, arg, &key)) {
             jaiGCPopRoots(2);
             return false;
         }
@@ -552,13 +552,23 @@ static bool listMap(int argc, Value *args, Value *out) {
     bool ok = true;
     for (int i = 0; i < self->count; i++) {
         Value arg = self->items[i], mapped;
-        if (!jaiCallValue(args[1], 1, &arg, &mapped)) {
+        if (!jaiCallValue1(args[1], arg, &mapped)) {
             ok = false;
             break;
         }
-        jaiGCPushRoot(mapped);
-        jaiListPush(result, mapped);
-        jaiGCPopRoot();
+        /* The result list was sized to the source up front, so the store is
+         * the whole of the push and nothing between here and it allocates --
+         * which is what the root was for. Three out-of-line calls an element
+         * (push root, push, pop root) were 30% of this loop. The slow arm
+         * still runs whenever the callback grew `self` past that reservation. */
+        if (JAI_LIKELY(result->count < result->capacity)) {
+            result->items[result->count++] = mapped;
+            result->version++;
+        } else {
+            jaiGCPushRoot(mapped);
+            jaiListPush(result, mapped);
+            jaiGCPopRoot();
+        }
         if (vm.hasException) {
             ok = false;
             break;
@@ -655,7 +665,7 @@ static bool listForEach(int argc, Value *args, Value *out) {
 
     for (int i = 0; i < self->count; i++) {
         Value arg = self->items[i], ignored;
-        if (!jaiCallValue(args[1], 1, &arg, &ignored)) return false;
+        if (!jaiCallValue1(args[1], arg, &ignored)) return false;
     }
     *out = NULL_VAL;
     return true;
