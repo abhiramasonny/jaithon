@@ -31,6 +31,10 @@
  * host must dispatch it with exactly this group size. 256 is within the
  * guaranteed maximum on every Metal device. */
 #define JAI_REDUCE_GROUP 256
+#define JAI_REDUCE_LOADS 2
+#define JAI_MATMUL_TILE 16
+#define JAI_VECTOR_LANES 4
+#define JAI_DEFAULT_GROUP 256
 
 struct JaiGpuBuffer {
     void  *buffer;   /* id<MTLBuffer>, held at +1 */
@@ -46,56 +50,93 @@ static const char kBuiltinSource[] =
     "using namespace metal;\n"
     "\n"
     "constant uint JAI_GROUP = 256;\n"
+    "constant uint JAI_TILE = 16;\n"
+    "constant uint JAI_VECTOR_LANES = 4;\n"
     "\n"
     "kernel void jaiVectorAdd(device const float *a [[buffer(0)]],\n"
     "                         device const float *b [[buffer(1)]],\n"
     "                         device float *out [[buffer(2)]],\n"
     "                         constant uint &n [[buffer(3)]],\n"
-    "                         uint i [[thread_position_in_grid]]) {\n"
-    "    if (i < n) { out[i] = a[i] + b[i]; }\n"
+    "                         uint thread [[thread_position_in_grid]]) {\n"
+    "    uint base = thread * JAI_VECTOR_LANES;\n"
+    "    if (base >= n) return;\n"
+    "    out[base] = a[base] + b[base];\n"
+    "    if (base + 1 < n) out[base + 1] = a[base + 1] + b[base + 1];\n"
+    "    if (base + 2 < n) out[base + 2] = a[base + 2] + b[base + 2];\n"
+    "    if (base + 3 < n) out[base + 3] = a[base + 3] + b[base + 3];\n"
     "}\n"
     "\n"
     "kernel void jaiVectorMul(device const float *a [[buffer(0)]],\n"
     "                         device const float *b [[buffer(1)]],\n"
     "                         device float *out [[buffer(2)]],\n"
     "                         constant uint &n [[buffer(3)]],\n"
-    "                         uint i [[thread_position_in_grid]]) {\n"
-    "    if (i < n) { out[i] = a[i] * b[i]; }\n"
+    "                         uint thread [[thread_position_in_grid]]) {\n"
+    "    uint base = thread * JAI_VECTOR_LANES;\n"
+    "    if (base >= n) return;\n"
+    "    out[base] = a[base] * b[base];\n"
+    "    if (base + 1 < n) out[base + 1] = a[base + 1] * b[base + 1];\n"
+    "    if (base + 2 < n) out[base + 2] = a[base + 2] * b[base + 2];\n"
+    "    if (base + 3 < n) out[base + 3] = a[base + 3] * b[base + 3];\n"
     "}\n"
     "\n"
-    "// C[m*n] = A[m*k] * B[k*n], row-major, one thread per output element.\n"
+    "// 16x16 tiled row-major matrix multiply. Each A/B tile is loaded once\n"
+    "// from device memory and reused by all 256 threads in the threadgroup.\n"
     "kernel void jaiMatMul(device const float *a [[buffer(0)]],\n"
     "                      device const float *b [[buffer(1)]],\n"
     "                      device float *out [[buffer(2)]],\n"
     "                      constant uint &rows [[buffer(3)]],\n"
     "                      constant uint &inner [[buffer(4)]],\n"
     "                      constant uint &columns [[buffer(5)]],\n"
-    "                      uint gid [[thread_position_in_grid]]) {\n"
-    "    if (gid >= rows * columns) { return; }\n"
-    "    uint row = gid / columns;\n"
-    "    uint column = gid % columns;\n"
+    "                      uint2 lid [[thread_position_in_threadgroup]],\n"
+    "                      uint2 group [[threadgroup_position_in_grid]]) {\n"
+    "    threadgroup float tileA[JAI_TILE * JAI_TILE];\n"
+    "    threadgroup float tileB[JAI_TILE * JAI_TILE];\n"
+    "\n"
+    "    uint row = group.y * JAI_TILE + lid.y;\n"
+    "    uint col = group.x * JAI_TILE + lid.x;\n"
+    "    uint local = lid.y * JAI_TILE + lid.x;\n"
     "    float total = 0.0f;\n"
-    "    for (uint i = 0; i < inner; ++i) {\n"
-    "        total += a[row * inner + i] * b[i * columns + column];\n"
+    "\n"
+    "    for (uint base = 0; base < inner; base += JAI_TILE) {\n"
+    "        uint aCol = base + lid.x;\n"
+    "        uint bRow = base + lid.y;\n"
+    "        tileA[local] = (row < rows && aCol < inner)\n"
+    "                         ? a[row * inner + aCol] : 0.0f;\n"
+    "        tileB[local] = (bRow < inner && col < columns)\n"
+    "                         ? b[bRow * columns + col] : 0.0f;\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "\n"
+    "        for (uint t = 0; t < JAI_TILE; ++t) {\n"
+    "            total += tileA[lid.y * JAI_TILE + t] *\n"
+    "                     tileB[t * JAI_TILE + lid.x];\n"
+    "        }\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "    }\n"
-    "    out[gid] = total;\n"
+    "\n"
+    "    if (row < rows && col < columns)\n"
+    "        out[row * columns + col] = total;\n"
     "}\n"
     "\n"
-    "// One partial sum per threadgroup; the host adds the partials up.\n"
+    "// Two input values per thread halves the number of reduction groups and\n"
+    "// partials while retaining the fixed 256-thread scratch layout.\n"
     "kernel void jaiReduceSum(device const float *x [[buffer(0)]],\n"
     "                         device float *partials [[buffer(1)]],\n"
     "                         constant uint &n [[buffer(2)]],\n"
-    "                         uint gid [[thread_position_in_grid]],\n"
     "                         uint lid [[thread_index_in_threadgroup]],\n"
     "                         uint wid [[threadgroup_position_in_grid]]) {\n"
     "    threadgroup float scratch[JAI_GROUP];\n"
-    "    scratch[lid] = (gid < n) ? x[gid] : 0.0f;\n"
+    "    uint base = wid * (JAI_GROUP * 2) + lid;\n"
+    "    float sum = base < n ? x[base] : 0.0f;\n"
+    "    uint second = base + JAI_GROUP;\n"
+    "    if (second < n) sum += x[second];\n"
+    "    scratch[lid] = sum;\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "\n"
     "    for (uint stride = JAI_GROUP / 2; stride > 0; stride >>= 1) {\n"
-    "        if (lid < stride) { scratch[lid] += scratch[lid + stride]; }\n"
+    "        if (lid < stride) scratch[lid] += scratch[lid + stride];\n"
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "    }\n"
-    "    if (lid == 0) { partials[wid] = scratch[0]; }\n"
+    "    if (lid == 0) partials[wid] = scratch[0];\n"
     "}\n";
 
 /* ------------------------------------------------------------------ */
@@ -106,6 +147,7 @@ static id<MTLDevice>       gDevice;
 static id<MTLCommandQueue> gQueue;
 static bool                gDeviceReady;
 static bool                gNonUniformThreadgroups;
+static size_t              gMaxBufferLength;
 
 static id<MTLComputePipelineState> gVectorAdd;
 static id<MTLComputePipelineState> gVectorMul;
@@ -115,23 +157,32 @@ static bool                        gBuiltinsReady;
 
 static bool ensureDevice(void) {
     static dispatch_once_t once;
+
     dispatch_once(&once, ^{
         @autoreleasepool {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device == nil) return;
+
             id<MTLCommandQueue> queue = [device newCommandQueue];
             if (queue == nil) return;
 
             gDevice = device;
             gQueue = queue;
-            /* Non-uniform threadgroups let a dispatch cover exactly the thread
-             * count asked for; without them the grid is rounded up and the
-             * kernel's own bounds check absorbs the surplus threads. */
-            gNonUniformThreadgroups = [device supportsFamily:MTLGPUFamilyApple4] ||
-                                      [device supportsFamily:MTLGPUFamilyMac2];
+            gMaxBufferLength = (size_t)[device maxBufferLength];
+
+            /*
+             * Every Apple-silicon Mac is Apple GPU family 7 or newer, but keep
+             * the older Apple4/Mac2 capability check so this remains valid for
+             * the widest set of Metal-capable Apple hardware.
+             */
+            gNonUniformThreadgroups =
+                [device supportsFamily:MTLGPUFamilyApple4] ||
+                [device supportsFamily:MTLGPUFamilyMac2];
+
             gDeviceReady = true;
         }
     });
+
     return gDeviceReady;
 }
 
@@ -190,16 +241,17 @@ const char *jaiGpuDeviceName(void) {
 /* ------------------------------------------------------------------ */
 
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
-    if (bytes == 0) return NULL;
-    if (!ensureDevice()) return NULL;
-    if (bytes > [gDevice maxBufferLength]) return NULL;
+    if (bytes == 0 || !ensureDevice()) return NULL;
+    if (bytes > gMaxBufferLength) return NULL;
 
     @autoreleasepool {
-        id<MTLBuffer> buffer = [gDevice newBufferWithLength:bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buffer =
+            [gDevice newBufferWithLength:bytes
+                                 options:MTLResourceStorageModeShared];
+
         if (buffer == nil) return NULL;
 
-        JaiGpuBuffer *b = JAI_ALLOC_ZEROED(JaiGpuBuffer, 1);
+        JaiGpuBuffer *b = JAI_ALLOC(JaiGpuBuffer, 1);
         b->buffer = (__bridge_retained void *)buffer;
         b->bytes = bytes;
         return b;
@@ -208,11 +260,11 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
 
 void jaiGpuFree(JaiGpuBuffer *b) {
     if (b == NULL) return;
+
     @autoreleasepool {
-        /* Hand the +1 back to ARC, which drops it at the end of this scope. */
         CFBridgingRelease(b->buffer);
-        b->buffer = NULL;
     }
+
     JAI_FREE(JaiGpuBuffer, b);
 }
 
@@ -315,17 +367,39 @@ JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
 static void encodeDispatch(id<MTLComputeCommandEncoder> encoder,
                            id<MTLComputePipelineState> pipeline,
                            NSUInteger threads, NSUInteger groupSize) {
-    NSUInteger maxGroup = [pipeline maxTotalThreadsPerThreadgroup];
-    if (groupSize == 0 || groupSize > maxGroup) groupSize = maxGroup;
-    if (groupSize > threads) groupSize = threads;
-    if (groupSize == 0) groupSize = 1;
+    if (threads == 0) return;
 
-    MTLSize group = MTLSizeMake(groupSize, 1, 1);
+    const NSUInteger maxGroup = [pipeline maxTotalThreadsPerThreadgroup];
+    const NSUInteger width = [pipeline threadExecutionWidth];
+
+    if (groupSize == 0) {
+        groupSize = maxGroup < JAI_DEFAULT_GROUP ? maxGroup : JAI_DEFAULT_GROUP;
+
+        if (width > 1 && groupSize > width) {
+            groupSize -= groupSize % width;
+        }
+
+        if (groupSize == 0)
+            groupSize = width != 0 ? width : 1;
+    } else if (groupSize > maxGroup) {
+        groupSize = maxGroup;
+    }
+
+    if (groupSize > threads)
+        groupSize = threads;
+
+    if (groupSize == 0)
+        groupSize = 1;
+
+    const MTLSize group = MTLSizeMake(groupSize, 1, 1);
+
     if (gNonUniformThreadgroups) {
-        [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:group];
+        [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
+           threadsPerThreadgroup:group];
     } else {
-        NSUInteger groups = (threads + groupSize - 1) / groupSize;
-        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:group];
+        const NSUInteger groups = (threads + groupSize - 1) / groupSize;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:group];
     }
 }
 
@@ -358,7 +432,7 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
             (__bridge id<MTLComputePipelineState>)k->pipeline;
-        id<MTLCommandBuffer> commands = [gQueue commandBuffer];
+        id<MTLCommandBuffer> commands = [gQueue commandBufferWithUnretainedReferences];
         if (commands == nil) return false;
         id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
         if (encoder == nil) return false;
@@ -456,72 +530,110 @@ static void cpuMatMul(const double *a, const double *b, double *out,
 /* Built-in kernels                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Widening happens in these two helpers alone so that the float32 boundary is
- * in one place rather than in every built-in. */
-static float *toFloats(const double *src, size_t n) {
-    float *out = JAI_ALLOC(float, n);
-    for (size_t i = 0; i < n; i++) out[i] = (float)src[i];
-    return out;
-}
-
-static void freeFloats(float *p, size_t n) {
-    JAI_FREE_ARRAY(float, p, n);
-}
-
-static bool fitsDeviceBuffer(size_t elements) {
+/* The built-ins stage directly into Metal shared buffers so Apple silicon does
+ * not allocate a second CPU float array and then copy it into unified memory. */
+static inline bool fitsDeviceBuffer(size_t elements) {
     if (elements > SIZE_MAX / sizeof(float)) return false;
-    return elements * sizeof(float) <= [gDevice maxBufferLength];
+    return elements * sizeof(float) <= gMaxBufferLength;
+}
+
+static id<MTLBuffer> newInputBuffer(const double *src, size_t n) {
+    if (src == NULL || n == 0 || !fitsDeviceBuffer(n))
+        return nil;
+
+    const size_t bytes = n * sizeof(float);
+
+    /*
+     * Apple-silicon buffers are shared CPU/GPU memory. Write-combined caching
+     * is ideal here because the CPU streams values in once and never reads the
+     * input buffer back.
+     */
+    const MTLResourceOptions options =
+        MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined;
+
+    id<MTLBuffer> buffer =
+        [gDevice newBufferWithLength:bytes options:options];
+
+    if (buffer == nil)
+        return nil;
+
+    float *dst = (float *)[buffer contents];
+
+#if defined(__clang__)
+#  pragma clang loop vectorize(enable) interleave(enable)
+#endif
+    for (size_t i = 0; i < n; ++i)
+        dst[i] = (float)src[i];
+
+    return buffer;
+}
+
+static inline id<MTLBuffer> newOutputBuffer(size_t n) {
+    if (n == 0 || !fitsDeviceBuffer(n))
+        return nil;
+
+    return [gDevice newBufferWithLength:n * sizeof(float)
+                                options:MTLResourceStorageModeShared];
+}
+
+static void widenFloats(double *dst, const float *src, size_t n) {
+#if defined(__clang__)
+#  pragma clang loop vectorize(enable) interleave(enable)
+#endif
+    for (size_t i = 0; i < n; ++i)
+        dst[i] = (double)src[i];
 }
 
 /* Both elementwise built-ins differ only in their pipeline, so they share one
  * encoder. Returns false — having written nothing — if any Metal call fails,
  * and the caller then runs the scalar path. */
 static bool deviceElementwise(id<MTLComputePipelineState> pipeline,
-                              const double *a, const double *b, double *out, size_t n) {
-    if (!fitsDeviceBuffer(n)) return false;
-
-    bool ok = false;
-    float *af = toFloats(a, n);
-    float *bf = toFloats(b, n);
+                              const double *a, const double *b,
+                              double *out, size_t n) {
+    if (!fitsDeviceBuffer(n) || n > UINT32_MAX)
+        return false;
 
     @autoreleasepool {
-        size_t bytes = n * sizeof(float);
-        id<MTLBuffer> aBuf = [gDevice newBufferWithBytes:af length:bytes
-                                                 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [gDevice newBufferWithBytes:bf length:bytes
-                                                 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outBuf = [gDevice newBufferWithLength:bytes
-                                                    options:MTLResourceStorageModeShared];
-        uint32_t count = (uint32_t)n;
-        id<MTLBuffer> countBuf = [gDevice newBufferWithBytes:&count length:sizeof(count)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> commands = [gQueue commandBuffer];
+        id<MTLBuffer> aBuf = newInputBuffer(a, n);
+        id<MTLBuffer> bBuf = newInputBuffer(b, n);
+        id<MTLBuffer> outBuf = newOutputBuffer(n);
 
-        if (aBuf != nil && bBuf != nil && outBuf != nil && countBuf != nil && commands != nil) {
-            id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-            if (encoder != nil) {
-                [encoder setComputePipelineState:pipeline];
-                [encoder setBuffer:aBuf offset:0 atIndex:0];
-                [encoder setBuffer:bBuf offset:0 atIndex:1];
-                [encoder setBuffer:outBuf offset:0 atIndex:2];
-                [encoder setBuffer:countBuf offset:0 atIndex:3];
-                encodeDispatch(encoder, pipeline, n, 0);
-                [encoder endEncoding];
-                [commands commit];
-                [commands waitUntilCompleted];
+        if (aBuf == nil || bBuf == nil || outBuf == nil)
+            return false;
 
-                if ([commands status] == MTLCommandBufferStatusCompleted) {
-                    const float *result = (const float *)[outBuf contents];
-                    for (size_t i = 0; i < n; i++) out[i] = (double)result[i];
-                    ok = true;
-                }
-            }
-        }
+        id<MTLCommandBuffer> commands =
+            [gQueue commandBufferWithUnretainedReferences];
+        if (commands == nil)
+            return false;
+
+        id<MTLComputeCommandEncoder> encoder =
+            [commands computeCommandEncoder];
+        if (encoder == nil)
+            return false;
+
+        const uint32_t count = (uint32_t)n;
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:aBuf offset:0 atIndex:0];
+        [encoder setBuffer:bBuf offset:0 atIndex:1];
+        [encoder setBuffer:outBuf offset:0 atIndex:2];
+        [encoder setBytes:&count length:sizeof count atIndex:3];
+
+        const NSUInteger workItems =
+            ((NSUInteger)n + JAI_VECTOR_LANES - 1u) / JAI_VECTOR_LANES;
+
+        encodeDispatch(encoder, pipeline, workItems, 0);
+        [encoder endEncoding];
+
+        [commands commit];
+        [commands waitUntilCompleted];
+
+        if ([commands status] != MTLCommandBufferStatusCompleted)
+            return false;
+
+        widenFloats(out, (const float *)[outBuf contents], n);
+        return true;
     }
-
-    freeFloats(af, n);
-    freeFloats(bf, n);
-    return ok;
 }
 
 bool jaiGpuVectorAdd(const double *a, const double *b, double *out, size_t n) {
@@ -548,66 +660,89 @@ bool jaiGpuVectorMul(const double *a, const double *b, double *out, size_t n) {
     return true;
 }
 
+static inline void encodeMatMulDispatch(
+    id<MTLComputeCommandEncoder> encoder, size_t rows, size_t columns) {
+    const MTLSize threadsPerGroup =
+        MTLSizeMake(JAI_MATMUL_TILE, JAI_MATMUL_TILE, 1);
+
+    /*
+     * Always use complete 16x16 groups here. Unlike simple 1D kernels, the
+     * tiled shader relies on every lane existing to populate threadgroup tiles,
+     * so partial/non-uniform edge groups would leave scratch entries unloaded.
+     */
+    const NSUInteger groupsX =
+        ((NSUInteger)columns + JAI_MATMUL_TILE - 1u) / JAI_MATMUL_TILE;
+    const NSUInteger groupsY =
+        ((NSUInteger)rows + JAI_MATMUL_TILE - 1u) / JAI_MATMUL_TILE;
+
+    [encoder dispatchThreadgroups:MTLSizeMake(groupsX, groupsY, 1)
+            threadsPerThreadgroup:threadsPerGroup];
+}
+
 static bool deviceMatMul(const double *a, const double *b, double *out,
                          size_t m, size_t k, size_t n) {
-    size_t aCount = m * k;
-    size_t bCount = k * n;
-    size_t outCount = m * n;
-    if (!fitsDeviceBuffer(aCount) || !fitsDeviceBuffer(bCount) ||
+    const size_t aCount = m * k;
+    const size_t bCount = k * n;
+    const size_t outCount = m * n;
+
+    if (!fitsDeviceBuffer(aCount) ||
+        !fitsDeviceBuffer(bCount) ||
         !fitsDeviceBuffer(outCount)) {
         return false;
     }
-    /* One thread per output element, and the grid index is a uint in MSL. */
-    if (outCount > UINT32_MAX) return false;
 
-    bool ok = false;
-    float *af = toFloats(a, aCount);
-    float *bf = toFloats(b, bCount);
+    if (m > UINT32_MAX || k > UINT32_MAX || n > UINT32_MAX)
+        return false;
 
-    @autoreleasepool {
-        id<MTLBuffer> aBuf = [gDevice newBufferWithBytes:af length:aCount * sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [gDevice newBufferWithBytes:bf length:bCount * sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outBuf = [gDevice newBufferWithLength:outCount * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-        uint32_t rows = (uint32_t)m, inner = (uint32_t)k, columns = (uint32_t)n;
-        id<MTLBuffer> rowsBuf = [gDevice newBufferWithBytes:&rows length:sizeof(rows)
-                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> innerBuf = [gDevice newBufferWithBytes:&inner length:sizeof(inner)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> columnsBuf = [gDevice newBufferWithBytes:&columns length:sizeof(columns)
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> commands = [gQueue commandBuffer];
-
-        if (aBuf != nil && bBuf != nil && outBuf != nil && rowsBuf != nil &&
-            innerBuf != nil && columnsBuf != nil && commands != nil) {
-            id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-            if (encoder != nil) {
-                [encoder setComputePipelineState:gMatMul];
-                [encoder setBuffer:aBuf offset:0 atIndex:0];
-                [encoder setBuffer:bBuf offset:0 atIndex:1];
-                [encoder setBuffer:outBuf offset:0 atIndex:2];
-                [encoder setBuffer:rowsBuf offset:0 atIndex:3];
-                [encoder setBuffer:innerBuf offset:0 atIndex:4];
-                [encoder setBuffer:columnsBuf offset:0 atIndex:5];
-                encodeDispatch(encoder, gMatMul, outCount, 0);
-                [encoder endEncoding];
-                [commands commit];
-                [commands waitUntilCompleted];
-
-                if ([commands status] == MTLCommandBufferStatusCompleted) {
-                    const float *result = (const float *)[outBuf contents];
-                    for (size_t i = 0; i < outCount; i++) out[i] = (double)result[i];
-                    ok = true;
-                }
-            }
-        }
+    if ([gMatMul maxTotalThreadsPerThreadgroup] <
+        JAI_MATMUL_TILE * JAI_MATMUL_TILE) {
+        return false;
     }
 
-    freeFloats(af, aCount);
-    freeFloats(bf, bCount);
-    return ok;
+    @autoreleasepool {
+        id<MTLBuffer> aBuf = newInputBuffer(a, aCount);
+        id<MTLBuffer> bBuf = newInputBuffer(b, bCount);
+        id<MTLBuffer> outBuf = newOutputBuffer(outCount);
+
+        if (aBuf == nil || bBuf == nil || outBuf == nil)
+            return false;
+
+        id<MTLCommandBuffer> commands =
+            [gQueue commandBufferWithUnretainedReferences];
+        if (commands == nil)
+            return false;
+
+        id<MTLComputeCommandEncoder> encoder =
+            [commands computeCommandEncoder];
+        if (encoder == nil)
+            return false;
+
+        const uint32_t rows = (uint32_t)m;
+        const uint32_t inner = (uint32_t)k;
+        const uint32_t columns = (uint32_t)n;
+
+        [encoder setComputePipelineState:gMatMul];
+        [encoder setBuffer:aBuf offset:0 atIndex:0];
+        [encoder setBuffer:bBuf offset:0 atIndex:1];
+        [encoder setBuffer:outBuf offset:0 atIndex:2];
+
+        /* Apple explicitly recommends setBytes for tiny transient arguments. */
+        [encoder setBytes:&rows length:sizeof rows atIndex:3];
+        [encoder setBytes:&inner length:sizeof inner atIndex:4];
+        [encoder setBytes:&columns length:sizeof columns atIndex:5];
+
+        encodeMatMulDispatch(encoder, m, n);
+        [encoder endEncoding];
+
+        [commands commit];
+        [commands waitUntilCompleted];
+
+        if ([commands status] != MTLCommandBufferStatusCompleted)
+            return false;
+
+        widenFloats(out, (const float *)[outBuf contents], outCount);
+        return true;
+    }
 }
 
 bool jaiGpuMatMul(const double *a, const double *b, double *out,
@@ -636,51 +771,58 @@ bool jaiGpuMatMul(const double *a, const double *b, double *out,
 }
 
 static bool deviceReduceSum(const double *a, size_t n, double *out) {
-    if (!fitsDeviceBuffer(n)) return false;
-    size_t groups = (n + JAI_REDUCE_GROUP - 1) / JAI_REDUCE_GROUP;
-    if (!fitsDeviceBuffer(groups)) return false;
-    if (n > UINT32_MAX) return false;
+    if (!fitsDeviceBuffer(n) || n > UINT32_MAX)
+        return false;
 
-    bool ok = false;
-    float *af = toFloats(a, n);
+    const size_t valuesPerGroup =
+        (size_t)JAI_REDUCE_GROUP * JAI_REDUCE_LOADS;
+    const size_t groups =
+        (n + valuesPerGroup - 1u) / valuesPerGroup;
+
+    if (!fitsDeviceBuffer(groups))
+        return false;
+
+    if ([gReduceSum maxTotalThreadsPerThreadgroup] < JAI_REDUCE_GROUP)
+        return false;
 
     @autoreleasepool {
-        id<MTLBuffer> inBuf = [gDevice newBufferWithBytes:af length:n * sizeof(float)
-                                                  options:MTLResourceStorageModeShared];
-        id<MTLBuffer> partialBuf = [gDevice newBufferWithLength:groups * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
-        uint32_t count = (uint32_t)n;
-        id<MTLBuffer> countBuf = [gDevice newBufferWithBytes:&count length:sizeof(count)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> commands = [gQueue commandBuffer];
+        id<MTLBuffer> inBuf = newInputBuffer(a, n);
+        id<MTLBuffer> partialBuf = newOutputBuffer(groups);
 
-        if (inBuf != nil && partialBuf != nil && countBuf != nil && commands != nil &&
-            [gReduceSum maxTotalThreadsPerThreadgroup] >= JAI_REDUCE_GROUP) {
-            id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-            if (encoder != nil) {
-                [encoder setComputePipelineState:gReduceSum];
-                [encoder setBuffer:inBuf offset:0 atIndex:0];
-                [encoder setBuffer:partialBuf offset:0 atIndex:1];
-                [encoder setBuffer:countBuf offset:0 atIndex:2];
-                /* The kernel's scratch array is exactly this wide, so the group
-                 * size is not negotiable and the grid is padded to match. */
-                encodeDispatch(encoder, gReduceSum, groups * JAI_REDUCE_GROUP,
-                               JAI_REDUCE_GROUP);
-                [encoder endEncoding];
-                [commands commit];
-                [commands waitUntilCompleted];
+        if (inBuf == nil || partialBuf == nil)
+            return false;
 
-                if ([commands status] == MTLCommandBufferStatusCompleted) {
-                    const float *partials = (const float *)[partialBuf contents];
-                    *out = compensatedSumF32(partials, groups);
-                    ok = true;
-                }
-            }
-        }
+        id<MTLCommandBuffer> commands =
+            [gQueue commandBufferWithUnretainedReferences];
+        if (commands == nil)
+            return false;
+
+        id<MTLComputeCommandEncoder> encoder =
+            [commands computeCommandEncoder];
+        if (encoder == nil)
+            return false;
+
+        const uint32_t count = (uint32_t)n;
+
+        [encoder setComputePipelineState:gReduceSum];
+        [encoder setBuffer:inBuf offset:0 atIndex:0];
+        [encoder setBuffer:partialBuf offset:0 atIndex:1];
+        [encoder setBytes:&count length:sizeof count atIndex:2];
+
+        [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(JAI_REDUCE_GROUP, 1, 1)];
+        [encoder endEncoding];
+
+        [commands commit];
+        [commands waitUntilCompleted];
+
+        if ([commands status] != MTLCommandBufferStatusCompleted)
+            return false;
+
+        *out = compensatedSumF32(
+            (const float *)[partialBuf contents], groups);
+        return true;
     }
-
-    freeFloats(af, n);
-    return ok;
 }
 
 bool jaiGpuReduceSum(const double *a, size_t n, double *out) {
