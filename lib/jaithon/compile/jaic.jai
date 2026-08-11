@@ -41,7 +41,7 @@ pub const VERSION: int = 11
 #: `JAI_COMPILER_VERSION`, recorded so that a new compiler ignores old caches.
 #:
 #: Must equal `JAI_COMPILER_VERSION` in `src/common/common.h`.
-pub const COMPILER_VERSION: int = 18
+pub const COMPILER_VERSION: int = 19
 
 #: The `buildId` the running binary stamps into a `.jaic` and demands back.
 #:

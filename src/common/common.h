@@ -44,17 +44,32 @@
 
 /* Bumped whenever bytecode emission changes; invalidates .jaic caches.
  *
- * Deliberately NOT bumped for 3.1.0's four new opcodes, and the reason is a
- * bootstrap deadlock rather than an oversight. serialize.c checks this value
- * BEFORE it exempts the seed from the build-id check, so raising it rejects the
- * embedded seed image -- and regenerating the seed needs a working compiler,
- * which needs the seed. The Makefile calls that "a loop with no way in".
+ * Raising this is safe and is meant to be routine: the seed is checked against
+ * the range below rather than for equality, so an older seed still bootstraps
+ * the newer binary and `make reseed` then brings it up to date. See the note
+ * above `deserialize` in serialize.c for why equality deadlocked. */
+#define JAI_COMPILER_VERSION 19u
+
+/* The oldest emission this binary can still EXECUTE, and so the oldest seed it
+ * will bootstrap from. Opcodes are append-only (see OP_COUNT in chunk.h), so
+ * anything this VM has ever emitted it can still run, and this only has to move
+ * for a change append-only cannot express -- renumbering an opcode, or widening
+ * an operand.
  *
- * Nothing is lost by leaving it. The opcodes were APPENDED, so images written
- * by an older compiler still decode, and images written by a newer one are
- * already rejected by JAI_BUILD_ID, which every .jaic records and demands back.
- * Raising this would have to happen in the same change that reseeds. */
-#define JAI_COMPILER_VERSION 18u
+ * Moving it is a two-release migration, not a one-line edit: the release that
+ * introduces the break has to read BOTH formats so the seed can be regenerated
+ * across it, and the release after that drops the old reader. Setting it equal
+ * to JAI_COMPILER_VERSION without doing that is how the bootstrap wedges.
+ * JAITHON_SEED_ANY=1 is the way out if it happens anyway. */
+#define JAI_SEED_MIN_VERSION 18u
+
+/* A floor above the ceiling accepts no seed at all, which is a tree that cannot
+ * build itself by construction rather than by accident. Caught here, where the
+ * two numbers are next to each other, instead of as a missing front end an hour
+ * later. */
+_Static_assert(JAI_SEED_MIN_VERSION <= JAI_COMPILER_VERSION,
+               "JAI_SEED_MIN_VERSION is above JAI_COMPILER_VERSION: no seed "
+               "can satisfy that range, so nothing could ever bootstrap");
 
 /* ------------------------------------------------------------------ */
 /* Limits                                                              */
