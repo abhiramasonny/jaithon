@@ -2497,6 +2497,42 @@ static bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
 /* `k` is 2^shift, for a shift this can name. Positive only: floor division by
  * a negative power of two is not a shift, and `k` is at most 2^62 because 2^63
  * does not fit in a positive int64. */
+/* Turn the truncating remainder in `rr` into the flooring one, given the
+ * divisor in `rd`.
+ *
+ * The general rule is "add the divisor back when the remainder is non-zero and
+ * their signs differ", which is seven instructions: a zero test, a branch, an
+ * eor, a sign test, a branch and the add.
+ *
+ * A divisor whose sign is known at compile time collapses that. `msub` leaves
+ * |r| < |d| with r's sign following the dividend's, so for a positive divisor
+ * "non-zero and opposite sign" is exactly "r < 0" -- one bit -- and for a
+ * negative one it is exactly "r > 0". Two instructions instead of seven, with
+ * no change to which values are corrected.
+ *
+ * `r + d` cannot overflow: |r| < |d|, so the sum lies strictly between -|d| and
+ * |d|, and d is representable. */
+static void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
+                           bool signKnown, int64_t divisor, uint32_t fixup) {
+    if (signKnown && divisor > 0) {
+        emit(e, jaiA64Tbz(rrem, 63u, 2));
+        emit(e, fixup);
+        return;
+    }
+    if (signKnown) {
+        emit(e, jaiA64SubsXImm(31, rrem, 0));
+        emit(e, jaiA64BCond(JAI_A64_LE, 2));
+        emit(e, fixup);
+        return;
+    }
+    emit(e, jaiA64SubsXImm(31, rrem, 0));
+    emit(e, jaiA64BCond(JAI_A64_EQ, 5));
+    emit(e, jaiA64EorX(JIT_SCRATCH_D, rrem, rd));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+    emit(e, jaiA64BCond(JAI_A64_GE, 2));
+    emit(e, fixup);
+}
+
 static bool powerOfTwoShift(int64_t k, unsigned *shift) {
     if (k <= 0) return false;
     uint64_t u = (uint64_t)k;
@@ -3562,10 +3598,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->localKind[slot] != SLOT_INT) return false;
             if (slot == 0) e->usesSlot0 = true;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-            emitConst64(e, JIT_SCRATCH_A, imm);
-            emit(e, jaiA64AddsX(pushReg(e) - 1,
-                                localIn(e, slot, JIT_SCRATCH_C),
-                                JIT_SCRATCH_A));
+            {
+                unsigned dst = pushReg(e) - 1;
+                unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
+                /* imm12, so a step outside +/-4095 still goes through a
+                 * register. See OP_INC_LOCAL for why `subs` is the negative
+                 * arm rather than a negated constant. */
+                if (imm >= 0 && imm <= 4095) {
+                    emit(e, jaiA64AddsXImm(dst, cur, (unsigned)imm));
+                } else if (imm < 0 && imm >= -4095) {
+                    emit(e, jaiA64SubsXImm(dst, cur, (unsigned)(-(int)imm)));
+                } else {
+                    emitConst64(e, JIT_SCRATCH_A, imm);
+                    emit(e, jaiA64AddsX(dst, cur, JIT_SCRATCH_A));
+                }
+            }
             branchOnOverflow(e, 0u, JAI_A64_VS);
             off += 5;
             break;
@@ -3711,11 +3758,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!localInRange(e, slot)) return false;
             if (e->localKind[slot] != SLOT_INT) return false;
             if (slot == 0) e->usesSlot0 = true;
-            emitConst64(e, JIT_SCRATCH_A, imm);
             {
                 unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
                 unsigned dst = localDest(e, slot);
-                emit(e, jaiA64AddsX(dst, cur, JIT_SCRATCH_A));
+                /* The step is an i8, so it always fits the imm12 form and the
+                 * constant never needs a register of its own. `subs` for a
+                 * negative step rather than a negated `adds`: both set V on
+                 * signed overflow of the operation actually performed, which
+                 * is what the guard below reads. */
+                if (imm >= 0) {
+                    emit(e, jaiA64AddsXImm(dst, cur, (unsigned)imm));
+                } else {
+                    emit(e, jaiA64SubsXImm(dst, cur, (unsigned)(-(int)imm)));
+                }
                 localOut(e, slot, dst);
             }
             branchOnOverflow(e, 0u, JAI_A64_VS);
@@ -4657,7 +4712,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * low s bits, which two's complement already holds -- so it is
              * exact for negative dividends, where the truncating `msub` below
              * is not and the correction after it exists to fix that. */
-            int64_t kmod;
+            int64_t kmod = 0;
             bool kmodKnown = literalIntOperand(fn, prevOff, off, &kmod) &&
                              kmod != 0 && kmod != -1;
             unsigned mshift;
@@ -4681,20 +4736,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchOnDeopt(e, JAI_A64_EQ);
             }
 
+            /* The remainder lands in `rx`, which is where the result belongs:
+             * two entries come off and one goes on, so the surviving entry is
+             * the lower of the two and keeps its register. Writing it here
+             * rather than into a scratch and copying at the end is what
+             * removes the trailing `mov`, and it is safe because every guard
+             * this arm emits is above this line -- nothing below can deopt and
+             * find the dividend gone. */
             emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, ry));
-            emit(e, jaiA64MsubX(JIT_SCRATCH_C, JIT_SCRATCH_B, ry, rx));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
-            emit(e, jaiA64BCond(JAI_A64_EQ, 5));
-            emit(e, jaiA64EorX(JIT_SCRATCH_D, JIT_SCRATCH_C, ry));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
-            emit(e, jaiA64BCond(JAI_A64_GE, 2));
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, ry));
+            emit(e, jaiA64MsubX(rx, JIT_SCRATCH_B, ry, rx));
+            emitFloorFixup(e, rx, ry, kmodKnown, kmod,
+                           jaiA64AddX(rx, rx, ry));
 
             unsigned dm1, dm2;
             if (!popValue(e, &dm1, NULL)) return false;
             if (!popValue(e, &dm2, NULL)) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-            emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
             off += 1;
             break;
         }
@@ -4720,15 +4777,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             emitConst64(e, JIT_SCRATCH_A, imm);
             emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, JIT_SCRATCH_A));
-            emit(e, jaiA64MsubX(JIT_SCRATCH_C, JIT_SCRATCH_B, JIT_SCRATCH_A, rx));
-            /* r += k when r is nonzero and its sign differs from k's. */
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
-            emit(e, jaiA64BCond(JAI_A64_EQ, 5));
-            emit(e, jaiA64EorX(JIT_SCRATCH_D, JIT_SCRATCH_C, JIT_SCRATCH_A));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
-            emit(e, jaiA64BCond(JAI_A64_GE, 2));
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_A));
-            emit(e, jaiA64MovX(rx, JIT_SCRATCH_C));
+            emit(e, jaiA64MsubX(rx, JIT_SCRATCH_B, JIT_SCRATCH_A, rx));
+            emitFloorFixup(e, rx, JIT_SCRATCH_A, true, imm,
+                           jaiA64AddX(rx, rx, JIT_SCRATCH_A));
             off += 3;
             break;
         }
@@ -4747,7 +4798,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * asr rounds toward minus infinity and that is precisely what the
              * correction below exists to reproduce. Fifteen instructions and
              * two deopt sites become one instruction and none. */
-            int64_t kdiv;
+            int64_t kdiv = 0;
             bool kdivKnown = literalIntOperand(fn, prevOff, off, &kdiv) &&
                              kdiv != 0 && kdiv != -1;
             unsigned dshift;
@@ -4791,12 +4842,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * this floor division rather than C's. */
             emit(e, jaiA64SdivX(rq, JIT_SCRATCH_C, rb));
             emit(e, jaiA64MsubX(JIT_SCRATCH_A, rq, rb, JIT_SCRATCH_C));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
-            emit(e, jaiA64BCond(JAI_A64_EQ, 5));
-            emit(e, jaiA64EorX(JIT_SCRATCH_B, JIT_SCRATCH_A, rb));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
-            emit(e, jaiA64BCond(JAI_A64_GE, 2));
-            emit(e, jaiA64SubXImm(rq, rq, 1));
+            /* One down when the remainder is nonzero and its sign differs
+             * from the divisor's. A literal divisor makes that a single sign
+             * test on the remainder -- see emitFloorFixup. JIT_SCRATCH_B is
+             * free again here: the quotient is in rq, not in it. */
+            emitFloorFixup(e, JIT_SCRATCH_A, rb, kdivKnown, kdiv,
+                           jaiA64SubXImm(rq, rq, 1));
             off += 1;
             break;
         }

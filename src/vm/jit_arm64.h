@@ -91,6 +91,12 @@ uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64AndXOnes(unsigned rd, unsigned rn, unsigned ones);
 uint32_t jaiA64LslvX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64AsrvX(unsigned rd, unsigned rn, unsigned rm);
+/* adds Xd, Xn, #imm12 -- flag-setting, so the overflow guard still works */
+uint32_t jaiA64AddsXImm(unsigned rd, unsigned rn, unsigned imm12);
+/* tbz Xt, #bit, #offset -- branch when the bit is clear; offset in instructions */
+uint32_t jaiA64Tbz(unsigned rt, unsigned bit, int32_t instructions);
+/* tbnz Xt, #bit, #offset -- branch when the bit is set */
+uint32_t jaiA64Tbnz(unsigned rt, unsigned bit, int32_t instructions);
 /* cset Xd, <cond> -- 1 when the condition holds, else 0 */
 uint32_t jaiA64CsetX(unsigned rd, unsigned cond);
 /* ret */

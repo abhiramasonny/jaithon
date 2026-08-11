@@ -349,3 +349,32 @@ uint32_t jaiA64LslvX(unsigned rd, unsigned rn, unsigned rm) {
 uint32_t jaiA64AsrvX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x9ac02800u | (rm << 16) | (rn << 5) | rd;
 }
+
+/* adds Xd, Xn, #imm12 -- the flag-setting add-immediate. The register form
+ * already existed; this one exists because `i += 1` was two instructions, a
+ * movz of the constant and then the add, in every counted loop in the
+ * language. Same encoding family as SubsXImm above with the op bit clear. */
+uint32_t jaiA64AddsXImm(unsigned rd, unsigned rn, unsigned imm12) {
+    return 0xb1000000u | ((imm12 & 0xfffu) << 10) | (rn << 5) | rd;
+}
+
+/* tbz/tbnz Xt, #bit, #offset -- branch on one bit, offset in instructions.
+ *
+ * The bit index splits across two fields: its top bit is instruction bit 31
+ * (which is also what makes it a 64-bit test) and the low five are bits 23:19.
+ * Getting that split wrong tests a neighbouring bit and the instruction still
+ * runs, which is why this is executed in tests/jit_arm64.c rather than read. */
+static uint32_t tbEncode(unsigned op, unsigned rt, unsigned bit,
+                         int32_t instructions) {
+    return 0x36000000u | ((bit >> 5) << 31) | (op << 24) |
+           ((bit & 0x1fu) << 19) | (((uint32_t)instructions & 0x3fffu) << 5) |
+           rt;
+}
+
+uint32_t jaiA64Tbz(unsigned rt, unsigned bit, int32_t instructions) {
+    return tbEncode(0u, rt, bit, instructions);
+}
+
+uint32_t jaiA64Tbnz(unsigned rt, unsigned bit, int32_t instructions) {
+    return tbEncode(1u, rt, bit, instructions);
+}
