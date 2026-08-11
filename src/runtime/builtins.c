@@ -369,37 +369,42 @@ static void nativeCacheInsert(JaiNativeFn fn, ObjNative *native,
     ++gNativeCacheCount;
 }
 
-Value jaiBindNative(Value receiver, const char *name, JaiNativeFn fn,
-                    int minArity, int maxArity,
-                    const char *const *paramNames) {
-    ObjNative *native = NULL;
-
-    /* Primitive receivers cannot be collected, so avoid GC-root traffic on
-     * the int/float paths that dominate arithmetic method dispatch. */
+static Value bindNativeSlow(Value receiver, const char *name, JaiNativeFn fn,
+                            int minArity, int maxArity,
+                            const char *const *paramNames, uint64_t hash) {
     const bool rootReceiver = IS_OBJ(receiver);
+
     if (rootReceiver)
         jaiGCPushRoot(receiver);
 
     const bool anchored = ensureNativeAnchor();
 
+    /*
+     * Reaching here means either:
+     *
+     *  1. the anchor/cache was already valid and jaiBindNative() proved the
+     *     native was absent, or
+     *  2. ensureNativeAnchor() just created/reset the cache, so it is empty.
+     *
+     * Either way there is no reason to probe it again.
+     */
+    ObjNative *native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
+
+    /*
+     * native is only a raw C pointer at this point. Keep it rooted through
+     * cache insertion and jaiBoundNew(). This is particularly important when
+     * caching is unavailable: jaiBoundNew() itself may allocate/collect.
+     */
+    jaiGCPushRoot(OBJ_VAL(native));
+
     if (anchored) {
-        const uint64_t hash = hashNativeFn(fn);
-        native = nativeCacheFind(fn, name, hash);
-
-        if (native == NULL) {
-            native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
-
-            jaiGCPushRoot(OBJ_VAL(native));
-            jaiListPush(gNativeAnchor, OBJ_VAL(native));
-            nativeCacheInsert(fn, native, hash);
-            jaiGCPopRoot();
-        }
-    } else {
-        native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
+        jaiListPush(gNativeAnchor, OBJ_VAL(native));
+        nativeCacheInsert(fn, native, hash);
     }
 
-    /* Keep object receivers rooted through the allocation itself. */
     ObjBound *bound = jaiBoundNew(receiver, OBJ_VAL(native));
+
+    jaiGCPopRoot(); /* native */
 
     if (rootReceiver)
         jaiGCPopRoot();
@@ -407,6 +412,33 @@ Value jaiBindNative(Value receiver, const char *name, JaiNativeFn fn,
     return OBJ_VAL(bound);
 }
 
+Value jaiBindNative(Value receiver, const char *name, JaiNativeFn fn,
+                    int minArity, int maxArity,
+                    const char *const *paramNames) {
+    const uint64_t hash = hashNativeFn(fn);
+
+    /*
+     * Normal case after VM startup: no helper call, no anchor check function,
+     * no GC-root traffic until the allocation itself.
+     */
+    if (gNativeAnchor != NULL && gNativeAnchorModule == vm.builtins) {
+        ObjNative *native = nativeCacheFind(fn, name, hash);
+
+        if (native != NULL) {
+            if (!IS_OBJ(receiver))
+                return OBJ_VAL(jaiBoundNew(receiver, OBJ_VAL(native)));
+
+            jaiGCPushRoot(receiver);
+            ObjBound *bound = jaiBoundNew(receiver, OBJ_VAL(native));
+            jaiGCPopRoot();
+
+            return OBJ_VAL(bound);
+        }
+    }
+
+    return bindNativeSlow(receiver, name, fn,
+                          minArity, maxArity, paramNames, hash);
+}
 void jaiMethodTablesInit(void) {
     resetNativeCache();
     (void)ensureNativeAnchor();   /* a no-op until the builtins module exists */
