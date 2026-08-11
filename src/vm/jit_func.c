@@ -412,7 +412,12 @@ typedef enum {
                    * iterator on the stack is always current. */
     SLOT_BOOL,    /* 0 or 1 in a register; a Value's boolean member is its low
                    * byte, so the same word serves both */
-    SLOT_NULL,    /* a function with no value to return; never in a register */
+    SLOT_NULL,    /* what a `-> void` function returns. It occupies a register
+                   * like any other entry, holding a defined zero, so that a
+                   * caller can drop it or a deopt can write it out; what it
+                   * does NOT have is a payload worth reading, and its tag is
+                   * VAL_NULL rather than the VAL_OBJ every kind chain in this
+                   * file falls through to. */
     SLOT_OBJ,     /* some heap object, raw, of a type this tier does not model.
                    * It can be read, passed, stored and rooted -- nothing else.
                    * A closure held in a variable is the common case. */
@@ -608,6 +613,12 @@ typedef struct {
     unsigned  inlPinned;      /* how many of its locals it has bound so far */
     unsigned  inlValueBase;   /* value entries at or above this are the callee's */
     uint32_t  inlIp;
+    /* The register holding the ObjClosure being inlined, or -1 when the body
+     * has no upvalue to reach. It is the CALLEE's closure, not the caller's:
+     * the two are different objects and `closureReg` names the wrong one.
+     * Only meaningful while `inlining`, which is the only thing that writes
+     * it, so a zeroed Emit never reads a stale x0 out of it. */
+    int       inlClosureReg;
     int       inlSlot[JIT_MAX_SLOTS + 1];
     /* A local whose kind is not the same on every path into some point. It
      * lives in the frame with its tag and every read of it guards, which is
@@ -823,6 +834,7 @@ static void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
                      : kind == SLOT_FLOAT  ? VAL_FLOAT
                      : kind == SLOT_BOOL   ? VAL_BOOL
                      : kind == SLOT_OPAQUE ? VAL_NULL
+                     : kind == SLOT_NULL   ? VAL_NULL
                                            : VAL_OBJ;
         emit(e, jaiA64MovzX(tagReg, tag, 0));
         return;
@@ -839,6 +851,7 @@ static unsigned localTagFor(const Emit *e, unsigned slot) {
          : k == SLOT_FLOAT  ? VAL_FLOAT
          : k == SLOT_BOOL   ? VAL_BOOL
          : k == SLOT_OPAQUE ? VAL_NULL
+         : k == SLOT_NULL   ? VAL_NULL
                             : VAL_OBJ;
 }
 
@@ -2267,10 +2280,16 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         e->whyNot = "a direct callee that wants a closure it has not got";
         return false;
     }
+    /* SLOT_NULL is a function declared `-> void`. Nothing comes back in it and
+     * the epilogue leaves x0 zero, so the entry it pushes is a register whose
+     * payload is zero and whose tag is fixed -- the same treatment a self-call
+     * to a void function has always had. Refusing it declined every caller of
+     * a procedure, which in nbody is the whole of `main`. */
     SlotKind rk = (SlotKind)cfn->jitReturnKind;
     ObjClass *rcls = NULL;
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ) {
+        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
+        rk != SLOT_NULL) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
@@ -2519,16 +2538,16 @@ static bool gInlineFailed;
  * main walker already speaks -- so it, and not a second one, is what emits
  * this. `evalA` in spectral is fifteen instructions of exactly this shape. */
 static bool inlinableBody(ObjClosure *callee, unsigned argc,
-                          unsigned *maxSlotOut) {
+                          unsigned *maxSlotOut, bool *readsUpvalueOut) {
     ObjFunction *cfn = callee->fn;
     const Chunk *c = &cfn->chunk;
     if (cfn->arity != argc || cfn->defaultCount != 0) return false;
     if (cfn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
-    if (cfn->upvalueCount != 0) return false;
     if (c->count <= 0 || c->count > 128) return false;
 
     unsigned maxSlot = argc;
     bool sawReturn = false;
+    bool readsUpvalue = false;
     for (int off = 0; off < c->count;) {
         uint8_t op = c->code[off];
         int len = instructionLength(c, off);
@@ -2550,6 +2569,17 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
             slot2 = jaiReadU16(c->code + off + 3);
             if (slot > maxSlot) maxSlot = slot;
             if (slot2 > maxSlot) maxSlot = slot2;
+            break;
+        /* An upvalue is reached through the closure that is actually being
+         * called, which is a register the call site has to supply -- so this
+         * is only inlinable where that register exists. OP_SET_UPVALUE is not
+         * here and falls to `default`: a store would have to be undone if a
+         * later guard in the same body deoptimised to the call. */
+        case OP_GET_UPVALUE:
+            if ((unsigned)c->code[off + 1] >= (unsigned)cfn->upvalueCount) {
+                return false;
+            }
+            readsUpvalue = true;
             break;
         case OP_GET_GLOBAL: {
             uint32_t nameIdx = jaiReadU24(c->code + off + 1);
@@ -2584,6 +2614,7 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
     if (!sawReturn) return false;
     if (maxSlot > JIT_MAX_SLOTS) return false;
     *maxSlotOut = maxSlot;
+    *readsUpvalueOut = readsUpvalue;
     return true;
 }
 
@@ -2597,16 +2628,27 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
  *
  * The callee's module must be the caller's. Its body bakes builtins the same
  * way any compiled body does, and what retires those is the module-version
- * check at the CALLER's entry, since the callee's own is never run. */
+ * check at the CALLER's entry, since the callee's own is never run.
+ *
+ * `calleeReg` holds the ObjClosure when the call site has already guarded that
+ * a register names this exact ObjFunction, or -1 when the callee was resolved
+ * at compile time. Only a body that reads an upvalue needs it: `callee` is a
+ * SAMPLE of the closure at an indirect site, so its captured cells are not the
+ * ones the next call will carry -- one ObjFunction, many closures, which is
+ * precisely the shape `|x| x + step` takes. Constants and globals are safe to
+ * take from the sample because they belong to the function and the module,
+ * not to the closure. */
 static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
-                             unsigned argc, uint32_t callOff) {
+                             unsigned argc, uint32_t callOff, int calleeReg) {
     if (e->noInline) return false;
     ObjFunction *cfn = callee->fn;
     if (cfn->module != caller->module) return false;
     if (e->inlining) return false;             /* one level, no recursion */
     unsigned cidx = e->depth - argc - 1;
     unsigned maxSlot = 0;
-    if (!inlinableBody(callee, argc, &maxSlot)) return false;
+    bool readsUpvalue = false;
+    if (!inlinableBody(callee, argc, &maxSlot, &readsUpvalue)) return false;
+    if (readsUpvalue && calleeReg < 0) return false;
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] inlining %s\n",
                 cfn->name ? cfn->name->chars : "<anon>");
@@ -2628,6 +2670,7 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     e->inlPinned    = 0;
     e->inlValueBase = e->valueDepth;
     e->inlIp        = callOff;
+    e->inlClosureReg = calleeReg;
 
     /* The callee's own offset map, so its offsets cannot land in the
      * caller's. Nothing reads it back -- there are no branches -- but
@@ -2728,7 +2771,8 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         }
     }
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ) {
+        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
+        rk != SLOT_NULL) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
@@ -2748,11 +2792,16 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     unsigned wantTag = rk == SLOT_INT   ? VAL_INT
                      : rk == SLOT_FLOAT ? VAL_FLOAT
                      : rk == SLOT_BOOL  ? VAL_BOOL
+                     : rk == SLOT_NULL  ? VAL_NULL
                                         : VAL_OBJ;
     emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
     branchOnDeoptAt(e, JAI_A64_NE, after, true);
-    emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+    /* A null carries no payload worth loading, but the register still stands
+     * for the entry and a deopt materialises it, so it gets a defined zero
+     * rather than whatever the descriptor happened to leave behind. */
+    if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
+    else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
     e->wroteHeap = true;
     return true;
 }
@@ -4432,12 +4481,23 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_GET_UPVALUE: {
             unsigned index = code[off + 1];
             if (index >= (unsigned)fn->upvalueCount) return false;
-            if (!e->usesUpvalues) return false;   /* decided before this pass */
+            /* Whose closure. An inlined body's is in the register the call
+             * site guarded, not in the caller's own closure register: the
+             * caller may have no upvalues at all and still be inlining a body
+             * that has them. */
+            unsigned creg;
+            if (e->inlining) {
+                if (e->inlClosureReg < 0) return false;
+                creg = (unsigned)e->inlClosureReg;
+            } else {
+                if (!e->usesUpvalues) return false; /* decided before this pass */
+                creg = closureReg(e);
+            }
 
             /* closure->upvalues[index]->location, then the Value there. The
              * upvalue may still be open, pointing into the VM stack, so the
              * location is followed rather than assumed closed. */
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, closureReg(e),
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, creg,
                                (unsigned)offsetof(ObjClosure, upvalues)));
             emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A, index * 8u));
             emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
@@ -5824,7 +5884,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 Value cvv = e->stackSeen[e->depth - argc - 1];
                 if (IS_CLOSURE(cvv) &&
                     inlineGlobalCall(e, fn, AS_CLOSURE(cvv), argc,
-                                     (uint32_t)off)) {
+                                     (uint32_t)off, -1)) {
                     off += 2;
                     break;
                 }
@@ -5893,6 +5953,35 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
                 ObjFunction *cfn = AS_CLOSURE(cv)->fn;
+                unsigned rCallee0 = JIT_FIRST_SAVED + regBase(e) +
+                                    (e->usesUpvalues ? 1u : 0u) +
+                                    (cidx - (e->depth - e->valueDepth));
+
+                /* The guard comes first now, because what follows it is a
+                 * choice between two ways of making the call and both need it:
+                 * once this register is known to name `cfn`, the body behind
+                 * it is known too, and that is the whole licence to inline. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee0,
+                                   (unsigned)offsetof(ObjClosure, fn)));
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                /* Cheapest first, exactly as the direct call does it: a body
+                 * small enough to stand where the call is costs neither the
+                 * frame nor the argument shuffle nor the root fill. An
+                 * indirect site needs NONE of the checks below to do it --
+                 * no argument kind has to match a specialisation the callee
+                 * was compiled for, and the callee need not have compiled at
+                 * all -- because the arguments stay in the caller's own
+                 * registers with the caller's own kinds. */
+                if (inlineGlobalCall(e, fn, AS_CLOSURE(cv), argc,
+                                     (uint32_t)off, (int)rCallee0)) {
+                    off += 2;
+                    break;
+                }
+                if (e->failed) return false;
+
                 /* The same two things the direct global call checks, and for
                  * the same reasons: a raw payload is only sound if the callee
                  * was specialised to that kind and shape, and the caller's
@@ -5914,15 +6003,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->whyNot = "an indirect call whose result kind is not scalar";
                     return false;
                 }
-                unsigned rCallee = JIT_FIRST_SAVED + regBase(e) +
-                                   (e->usesUpvalues ? 1u : 0u) +
-                                   (cidx - (e->depth - e->valueDepth));
-
-                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee,
-                                   (unsigned)offsetof(ObjClosure, fn)));
-                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
-                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
-                branchOnDeopt(e, JAI_A64_NE);
+                unsigned rCallee = rCallee0;   /* guarded above */
 
                 /* Straight to the callee's compiled entry rather than out
                  * through jaiCallValue and an interpreter frame. The
@@ -6717,6 +6798,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                          : kind == SLOT_FLOAT  ? VAL_FLOAT
                          : kind == SLOT_BOOL   ? VAL_BOOL
                          : kind == SLOT_OPAQUE ? VAL_NULL
+                         : kind == SLOT_NULL   ? VAL_NULL
                                                : VAL_OBJ;
             unsigned at = (unsigned)offsetof(JitDeoptRecord, locals) +
                           i * (unsigned)sizeof(Value);
@@ -6792,9 +6874,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 valueSeen++;
                 continue;
             }
+            /* SLOT_NULL is a void call's result entry: it holds a register
+             * whose payload is zero, and its tag is not VAL_OBJ. Reaching
+             * this chain through the default arm wrote a null pointer out as
+             * an object. */
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
+                         : kind == SLOT_NULL  ? VAL_NULL
                                               : VAL_OBJ;
             unsigned reg = JIT_FIRST_SAVED + regBase(&e) +
                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
@@ -7120,6 +7207,50 @@ static int instructionLength(const Chunk *c, int off) {
     return 4 + 3 * (int)AS_FUNCTION(fnv)->upvalueCount;
 }
 
+/* Does this chunk hand one of its own locals to a closure BY REFERENCE?
+ *
+ * Such a slot is aliased by an ObjUpvalue whose `location` points straight
+ * into the VM's slot array, so the slot and the closure's view of it are the
+ * same storage. Caching it in a register makes them different storage for the
+ * length of the loop: every read through the closure sees whatever the slot
+ * held when the loop was entered, and every write through the closure is lost.
+ *
+ *     var base = 3
+ *     let f = |x| x + base
+ *     while i < n { acc = f(acc); base += 1; i += 1 }
+ *
+ * returned a different, and always short, sum on every run -- the prefix that
+ * ran before OSR was entered was right and everything after it added a frozen
+ * `base`. OSR is entered on a timer tick, which is what made it look random.
+ *
+ * The capture is not inside the loop, it is anywhere in the enclosing
+ * function, so this scans the whole chunk rather than the region compiled.
+ * `how` bit 1 marks a by-value capture, which copies the value into a closed
+ * cell and aliases nothing; only bit 0 alone is a reference to a slot.
+ *
+ * It marks the individual slots rather than answering yes or no for the whole
+ * chunk, because the register plan is per-slot: one captured `base` should cost
+ * `base` its register, not cost every other local in the function one too.
+ * Returns false if the chunk did not decode, and the caller then keeps every
+ * local in memory -- the answer that is right without knowing anything. */
+static bool chunkByRefCaptures(const Chunk *c, bool *byRef, unsigned nslots) {
+    for (unsigned i = 0; i < nslots; i++) byRef[i] = false;
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return false;
+        if (c->code[off] == OP_CLOSURE) {
+            for (int u = off + 4; u + 3 <= off + len; u += 3) {
+                uint8_t how = c->code[u];
+                if ((how & 1u) == 0 || (how & 2u) != 0) continue;
+                unsigned slot = jaiReadU16(c->code + u + 1);
+                if (slot < nslots) byRef[slot] = true;
+            }
+        }
+        off += len;
+    }
+    return true;
+}
+
 static bool isInstructionStart(const Chunk *c, uint32_t top) {
     for (int off = 0; off < c->count;) {
         if ((uint32_t)off == top) return true;
@@ -7294,10 +7425,17 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             /* Busiest first, and only slots the body names. A slot whose kind
              * varies at run time keeps its tag check and stays in memory. */
             uint8_t order[JIT_MAX_SLOTS + 1];
+            bool byRef[JIT_MAX_SLOTS + 1];
+            bool decoded = chunkByRefCaptures(&fn->chunk, byRef, e.locals);
             unsigned n = 0;
-            for (unsigned i = 0; i < e.locals; i++) {
+            for (unsigned i = 0; decoded && i < e.locals; i++) {
                 if (probe.slotUse[i] == 0) continue;
                 if (probe.dynamicLocal[i]) continue;
+                /* A slot a closure captured by reference is aliased by an
+                 * ObjUpvalue pointing into the VM's slot array, so a register
+                 * copy of it is different storage from the one the closure
+                 * reads and writes. It stays in memory. */
+                if (byRef[i]) continue;
                 order[n++] = (uint8_t)i;
             }
             for (unsigned i = 0; i + 1 < n; i++) {
@@ -7526,9 +7664,14 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 valueSeen++;
                 continue;
             }
+            /* SLOT_NULL is a void call's result entry: it holds a register
+             * whose payload is zero, and its tag is not VAL_OBJ. Reaching
+             * this chain through the default arm wrote a null pointer out as
+             * an object. */
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
+                         : kind == SLOT_NULL  ? VAL_NULL
                                               : VAL_OBJ;
             unsigned reg = JIT_FIRST_SAVED + regBase(&e) +
                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
