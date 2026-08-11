@@ -237,6 +237,61 @@ int main(void) {
       check("stp offset wrote", scratch[2], 3);
       check("stp offset wrote 2", scratch[3], 4); }
 
+    /* The uxtw extended-register forms, which is how one `ldp` can stand in for
+     * an `ldr x items` plus an `ldr w count`: the pair's second half arrives as
+     * `count | capacity << 32` and every use has to see only the low half.
+     *
+     * The value below is exactly that shape -- 5 in the low word and 0x7fff in
+     * the high -- so an encoder that forgot the extension answers with a huge
+     * number and an encoder that got the option field wrong (uxtb, sxtw) either
+     * truncates further or sign-extends. Both are visible in the arithmetic. */
+    { int64_t pair[2] = { (int64_t)0x00007fff00000005ll, 100 };
+      /* x0 = 100 + uxtw(pair[0]) = 105 */
+      const uint32_t w[] = { jaiA64LdrX(1, 0, 0), jaiA64LdrX(2, 0, 8),
+                             jaiA64AddXUxtw(0, 2, 1), jaiA64Ret() };
+      check("add uxtw", runWith(w, 4, pair), 105); }
+    { int64_t pair[2] = { (int64_t)0x00007fff00000005ll, 100 };
+      /* subs xzr, x2, w1 uxtw -- 100 - 5 is positive, so HS holds */
+      const uint32_t w[] = { jaiA64LdrX(1, 0, 0), jaiA64LdrX(2, 0, 8),
+                             jaiA64SubsXUxtw(31, 2, 1),
+                             jaiA64BCond(JAI_A64_HS, 3),   /* -> 6 */
+                             jaiA64MovzX(0, 0, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret() };
+      check("subs uxtw flags", runWith(w, 8, pair), 1); }
+    { int64_t pair[2] = { (int64_t)0x00007fff00000005ll, 3 };
+      /* the same compare with the index below the count: LO, not HS */
+      const uint32_t w[] = { jaiA64LdrX(1, 0, 0), jaiA64LdrX(2, 0, 8),
+                             jaiA64SubsXUxtw(31, 2, 1),
+                             jaiA64BCond(JAI_A64_LO, 3),   /* -> 6 */
+                             jaiA64MovzX(0, 0, 0), jaiA64Ret(),
+                             jaiA64MovzX(0, 1, 0), jaiA64Ret() };
+      check("subs uxtw flags lo", runWith(w, 8, pair), 1); }
+    { int64_t pair[2] = { (int64_t)0x00007fff00000005ll, 7 };
+      /* and the result register, not just the flags */
+      const uint32_t w[] = { jaiA64LdrX(1, 0, 0), jaiA64LdrX(2, 0, 8),
+                             jaiA64SubsXUxtw(0, 2, 1), jaiA64Ret() };
+      check("subs uxtw result", runWith(w, 4, pair), 2); }
+
+    /* One `ldp` standing in for the two header loads, exactly as OP_GET_INDEX
+     * emits it: items at +16 and count|capacity at +24 of a struct laid out
+     * like an ObjList. */
+    { int64_t hdr[4] = { 0, 0, 0, 0 };
+      int64_t elems[2] = { 0, 77 };
+      hdr[2] = (int64_t)(intptr_t)elems;                 /* items  */
+      hdr[3] = (int64_t)0x0000001000000002ll;             /* count 2, cap 16 */
+      /* x1 = items, x2 = count|cap ; index 1 is in bounds; load elems[1] */
+      const uint32_t w[] = {
+          /* 0 */ jaiA64LdpOff(1, 2, 0, 16),
+          /* 1 */ jaiA64MovzX(3, 1, 0),
+          /* 2 */ jaiA64SubsXUxtw(31, 3, 2),
+          /* 3 */ jaiA64BCond(JAI_A64_LO, 3),             /* -> 6 */
+          /* 4 */ jaiA64MovnX(0, 0),
+          /* 5 */ jaiA64Ret(),
+          /* 6 */ jaiA64AddXLsl(1, 1, 3, 3),
+          /* 7 */ jaiA64LdrX(0, 1, 0),
+          /* 8 */ jaiA64Ret() };
+      check("ldp header + uxtw bound", runWith(w, 9, hdr), 77); }
+
     /* bl and ret: call forward past a literal, have the callee add 1. x30 is
      * clobbered by the bl, so the outer return needs it saved. */
     { const uint32_t w[] = {

@@ -862,6 +862,15 @@ typedef struct {
      * than a path; JAI_JIT_WHY says so when it fires. */
     uint32_t  fpCarry[64];
     unsigned  fpCarryCount;
+    /* Offsets of an OP_BIND whose local's d register was written EARLY, by the
+     * float operator one instruction above it, so that the bind itself emits
+     * nothing. Nothing may branch to one of these: a path arriving there did
+     * not run the operator, and would find a bind that does no binding. Checked
+     * against the fixups at the end of the walk rather than while walking,
+     * because a back edge to the offset is not in the list yet when the bind is
+     * compiled -- the same reason fpCarry is checked there. */
+    uint32_t  homeEarly[32];
+    unsigned  homeEarlyCount;
     /* Value entries that are a plain read of a float local and are being held
      * in that LOCAL's own d register rather than copied into the bank. `x * x`
      * was two fmovs and a multiply; borrowing makes it the multiply. The
@@ -887,7 +896,10 @@ static void emit(Emit *e, uint32_t word) {
 #define JIT_SLOTS_REG (JIT_FIRST_SAVED)
 #define JIT_IDX_REG   (JIT_FIRST_SAVED + 1u)
 #define JIT_LIM_REG   (JIT_FIRST_SAVED + 2u)
-#define JIT_START_REG (JIT_FIRST_SAVED + 3u)   /* the range's first value */
+/* The ObjList a list head is walking. A range head has no use for a third
+ * register -- see osrReserved -- so this one is numbered after the two a range
+ * does keep, and a range's locals begin where it would have been. */
+#define JIT_START_REG (JIT_FIRST_SAVED + 3u)
 #define JIT_ITER_REG  (JIT_FIRST_SAVED + 4u)   /* the ObjIter itself */
 
 /* Registers OSR keeps for itself: the slots pointer, and for a range loop the
@@ -900,10 +912,25 @@ static void emit(Emit *e, uint32_t word) {
  * the frame instead, and the operand stack gets a sixth register. That is
  * exactly the amount that was missing: every "more live values" decline in the
  * benchmark suite wanted six and had five. JIT_ITER_REG is therefore the last
- * of the reserved block, so dropping it leaves the rest contiguous. */
+ * of the reserved block, so dropping it leaves the rest contiguous.
+ *
+ * Nor does a range loop keep the START. `for i in a..b` yields `a + index`, so
+ * the head used to hold `a` and add it every iteration. Biasing the index and
+ * the limit by it in the prologue instead makes the loop variable the index
+ * register itself: the add disappears from the loop, and a THIRD register comes
+ * back for every range-headed loop in the language -- which is the one that
+ * stands between matrix_mul and holding `ai`. The bias runs backwards once per
+ * exit, in OSR_SYNC_ITER, because the interpreter's ObjIter::index is
+ * zero-based; every exit already reloads the parked ObjIter, so the range and
+ * its start are one further load down a path that is not the loop.
+ *
+ * The bias is only sound while `start + limit` fits an int64, and `limit`
+ * saturates at INT64_MAX for a range that spans the whole type. jaiJitEnterOsr
+ * refuses to enter such a loop at all, which is where that has to be decided:
+ * it is a property of the iterator, not of the code. */
 static unsigned osrReserved(const Emit *e) {
     if (!e->hasIter) return 1u;
-    return e->iterKind == 1 ? 4u : 5u;
+    return e->iterKind == 1 ? 3u : 5u;
 }
 
 static unsigned regBase(const Emit *e) {
@@ -1332,6 +1359,91 @@ static void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
     e->fpLive |= 1u << idx;
     e->fpBorrow |= 1u << idx;
     e->fpBorrowReg[idx] = (uint8_t)reg;
+}
+
+/* Where a float operator whose result goes straight into a local should
+ * compute it.
+ *
+ * A `*_BIND` used to put its result in the operand stack's bank and then `fmov`
+ * that into the local's home: `fmul d17, d8, d8` then `fmov d10, d17`. The
+ * second instruction is the whole of the difference, and five of mandelbrot's
+ * 31 inner instructions were that trailing `fmov`. Naming the home as the
+ * operator's destination deletes it.
+ *
+ * Two things make it safe, and both are about ordering:
+ *
+ *  - The borrow release happens HERE, before the operator, not in localOutFp
+ *    afterwards. An entry borrowing the home wants the value that was in it
+ *    when the borrow was taken; once the operator has written its result that
+ *    value is gone, so a release afterwards copies the wrong number. This is
+ *    the same rule the FP borrow already follows for a guard, for the same
+ *    reason: a release has to be where the thing it protects has not happened.
+ *  - The operator may name the home among its own sources -- `sum += x` and
+ *    `let x2 = x * x` both do -- because an arm64 arithmetic instruction reads
+ *    its sources before writing its destination, and the release above has
+ *    already taken any copy that was owed.
+ *
+ * When the local has no d register the bank is returned unchanged, so callers
+ * keep one shape: localOutFp sees `src == home` and emits nothing in the first
+ * case, and does its ordinary store in the second. */
+static unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank) {
+    if (!e->osr || e->slotFpReg[slot] == 0) return bank;
+    fpReleaseHome(e, e->slotFpReg[slot]);
+    return e->slotFpReg[slot];
+}
+
+/* The same trick one instruction of lookahead further out: an unfused float
+ * operator whose result the NEXT instruction binds to a local.
+ * `y = 2.0 * xy + y0` is `OP_ADD` then `OP_BIND`, and the bind was an `fmov`
+ * out of the bank into the home. Answering the operator's destination question
+ * with the home makes the bind emit nothing.
+ *
+ * The operator's result entry is then marked as BORROWING the home, which is
+ * exactly what it is: a value living in a register that is also a local's, with
+ * the whole file's existing rule that anything about to write that register
+ * copies the borrowers out first. OP_BIND's float arm reads it through
+ * fpHeldIn, sees the home, and its `localOutFp(slot, home)` is a no-op.
+ *
+ * What has to be true, and how each part is enforced:
+ *
+ *  - Nothing between the operator and the bind may deopt or bail, because
+ *    between them the LOCAL holds its new value while the bytecode says it
+ *    still holds its old one. Only an OP_TYPE_GUARD is allowed in the gap, and
+ *    only one whose kind is already settled, which emits no instruction at all
+ *    and records nothing.
+ *  - Nothing may branch to the bind. A path arriving there did not run the
+ *    operator, so it needs the `fmov` that is no longer emitted. Recorded in
+ *    `homeEarly` and checked against every fixup after the walk, which is the
+ *    only point at which a back edge to it is known.
+ *  - The local must be the sole owner of that d register for the gap, which
+ *    fpBindDest's release establishes before the operator runs.
+ *
+ * Returns 0 when none of that holds, which is the ordinary answer. */
+static unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
+                                int stop, const ObjFunction *fn,
+                                uint32_t *bindOffOut) {
+    if (!e->osr || e->fpOff || e->inlining) return 0;
+    if (e->homeEarlyCount >= 32) return 0;
+    if (next < stop && code[next] == OP_TYPE_GUARD) {
+        /* Only the settled form. A guard that has to widen an int emits a
+         * `scvtf`, but then the entry it names is an int and this arm was
+         * never reached; a guard naming any other type declines below. */
+        if (next + 4 > stop) return 0;
+        uint32_t idx = jaiReadU24(code + next + 1);
+        if (idx >= (uint32_t)fn->chunk.constants.count) return 0;
+        Value t = fn->chunk.constants.data[idx];
+        if (!IS_STRING(t) || strcmp(AS_STRING(t)->chars, "float") != 0) return 0;
+        next += 4;
+    }
+    if (next + 3 > stop || code[next] != OP_BIND) return 0;
+    unsigned slot = jaiReadU16(code + next + 1);
+    /* Deliberately NOT localInRange: that one counts a use for the register
+     * allocator, and a slot merely peeked at has not been used. The bound it
+     * would apply is applied here instead. */
+    if (slot > JIT_MAX_SLOTS || slot >= e->locals) return 0;
+    if (e->dynamicLocal[slot] || e->slotFpReg[slot] == 0) return 0;
+    *bindOffOut = (uint32_t)next;
+    return e->slotFpReg[slot];
 }
 
 static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
@@ -1781,6 +1893,26 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
  * to raise exactly what it would have raised. */
 static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
+/* An ObjList's `items` and its count in one `ldp`.
+ *
+ * `rCount` comes back holding `count | capacity << 32`, not the count, because
+ * the two int32s share the pair's second doubleword. Everything that reads it
+ * must therefore use the uxtw forms -- emitBoundsNormalise(.., true) is the
+ * only caller, and it is the only place a count is wanted.
+ *
+ * The layout is the whole basis of the instruction, so it is asserted rather
+ * than assumed: a field reordered in object.h would otherwise load a pointer
+ * as a count and index off the end of the array. */
+static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
+                           unsigned rCount) {
+    _Static_assert(offsetof(ObjList, count) == offsetof(ObjList, items) + 8,
+                   "ObjList.count must follow items for the ldp");
+    _Static_assert(offsetof(ObjList, capacity) == offsetof(ObjList, count) + 4,
+                   "ObjList.capacity must share the count's doubleword");
+    emit(e, jaiA64LdpOff(rItems, rCount, rList,
+                         (int32_t)offsetof(ObjList, items)));
+}
+
 /* `jaiNormalizeIndex` and the bounds test in one, leaving the settled index in
  * `rOut`. `rCount` must hold a zero-extended 32-bit count, which is what an
  * `ldrw` of ObjList.count or ObjString.length gives, so one *unsigned* compare
@@ -1790,11 +1922,21 @@ static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
  * That is four instructions on the path every real loop takes, against the
  * seven the signed form needed -- and indexing was 42 of the 62 instructions in
  * matrix_mul's innermost body, three of these back to back. `xs[-1]` is still
- * exact; it just walks the three instructions the branch skips. */
+ * exact; it just walks the three instructions the branch skips.
+ *
+ * `countW` says the count is only the LOW HALF of `rCount`, which is what the
+ * `ldp` of an ObjList header leaves: `count | capacity << 32`. Every read of it
+ * then goes through the uxtw form, which costs nothing -- the extension is a
+ * field of the instruction that was running anyway -- and saves the separate
+ * `ldr w` the pair replaced. A caller whose count came from `ldr w` passes
+ * false and gets the plain register form; both are correct for that case, and
+ * keeping them apart means an ObjString's `length`, which has no capacity above
+ * it, is not silently relying on whatever follows it in the struct. */
 static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
-                                unsigned rOut) {
+                                unsigned rOut, bool countW) {
     emit(e, jaiA64MovX(rOut, rIdx));
-    emit(e, jaiA64SubsXReg(31, rOut, rCount));
+    emit(e, countW ? jaiA64SubsXUxtw(31, rOut, rCount)
+                   : jaiA64SubsXReg(31, rOut, rCount));
     /* The skip used to be a hand-counted four instructions. branchOnDeopt is
      * allowed to emit -- it releases FP borrows so the stub can find every
      * entry -- and one extra instruction inside the span turned the skip into
@@ -1802,8 +1944,10 @@ static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
      * had written. Measuring the span is the same instruction and cannot rot. */
     unsigned skip = e->count;
     emit(e, jaiA64BCond(JAI_A64_LO, 0));
-    emit(e, jaiA64AddX(rOut, rOut, rCount));
-    emit(e, jaiA64SubsXReg(31, rOut, rCount));
+    emit(e, countW ? jaiA64AddXUxtw(rOut, rOut, rCount)
+                   : jaiA64AddX(rOut, rOut, rCount));
+    emit(e, countW ? jaiA64SubsXUxtw(31, rOut, rCount)
+                   : jaiA64SubsXReg(31, rOut, rCount));
     branchOnDeopt(e, JAI_A64_HS);
     if (skip < e->count && e->count <= JIT_MAX_INSTS) {
         e->code[skip] = jaiA64BCond(JAI_A64_LO, (int32_t)(e->count - skip));
@@ -3617,6 +3761,15 @@ static bool fpBorrowSurvives(uint8_t op) {
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
+    /* A settled type guard is not an instruction at all -- the kinds already
+     * agree, so its arm emits nothing and records nothing. It is on this list
+     * because it is what stands between an unfused float operator and the
+     * OP_BIND it feeds: `y = 2.0 * xy + y0` is ADD, TYPE_GUARD, BIND, and
+     * releasing the borrow at the guard would put back exactly the `fmov` the
+     * lookahead removed, and then add a second one at the bind. The widening
+     * arm writes only v0 and an X register, neither of which a borrow can name.
+     */
+    case OP_TYPE_GUARD:
         return true;
     default:
         return false;
@@ -3855,8 +4008,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned rx; SlotKind kx;
                 if (!popValueRaw(e, &rx, &kx)) return false;
                 if (!popValueRaw(e, &rx, &kx)) return false;
-                emit(e, jaiA64FaddD(fpRegAt(e, ia), da, db));
-                localOutFp(e, slot, fpRegAt(e, ia));
+                unsigned dd = fpBindDest(e, slot, fpRegAt(e, ia));
+                emit(e, jaiA64FaddD(dd, da, db));
+                localOutFp(e, slot, dd);
                 off += 3;
                 break;
             }
@@ -3934,8 +4088,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned rx; SlotKind kx;
                 if (!popValueRaw(e, &rx, &kx)) return false;
                 if (!popValueRaw(e, &rx, &kx)) return false;
-                emit(e, jaiA64FmulD(fpRegAt(e, ia), da, db));
-                localOutFp(e, slot, fpRegAt(e, ia));
+                unsigned dd = fpBindDest(e, slot, fpRegAt(e, ia));
+                emit(e, jaiA64FmulD(dd, da, db));
+                localOutFp(e, slot, dd);
                 off += 3;
                 break;
             }
@@ -3987,8 +4142,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned rx; SlotKind kx;
                 if (!popValueRaw(e, &rx, &kx)) return false;
                 if (!popValueRaw(e, &rx, &kx)) return false;
-                emit(e, jaiA64FsubD(fpRegAt(e, ia), da, db));
-                localOutFp(e, slot, fpRegAt(e, ia));
+                unsigned dd = fpBindDest(e, slot, fpRegAt(e, ia));
+                emit(e, jaiA64FsubD(dd, da, db));
+                localOutFp(e, slot, dd);
                 off += 3;
                 break;
             }
@@ -4416,8 +4572,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValueRaw(e, &rb, &kb)) return false;
                 if (!popValueRaw(e, &ra, &ka)) return false;
                 if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
-                emit(e, jaiA64FmulD(fpRegAt(e, ia), da, db));
-                fpClaim(e, ia);
+                unsigned dm = fpRegAt(e, ia);
+                uint32_t bindOffM = 0;
+                unsigned homeM = fpBindLookahead(e, code, off + 1, stop, fn,
+                                                 &bindOffM);
+                if (homeM != 0) {
+                    fpReleaseHome(e, homeM);
+                    dm = homeM;
+                }
+                emit(e, jaiA64FmulD(dm, da, db));
+                if (homeM != 0) {
+                    fpBorrowLocal(e, ia, homeM);
+                    e->homeEarly[e->homeEarlyCount++] = bindOffM;
+                } else {
+                    fpClaim(e, ia);
+                }
                 off += 1;
                 break;
             }
@@ -4513,10 +4682,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValueRaw(e, &ra, &ka)) return false;
                 if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
                 unsigned dd = fpRegAt(e, ia);
+                uint32_t bindOff = 0;
+                unsigned home = fpBindLookahead(e, code, off + 1, stop, fn,
+                                                &bindOff);
+                if (home != 0) {
+                    fpReleaseHome(e, home);
+                    dd = home;
+                }
                 emit(e, op == OP_ADD ? jaiA64FaddD(dd, da, db)
                      : op == OP_SUB  ? jaiA64FsubD(dd, da, db)
                                      : jaiA64FdivD(dd, da, db));
-                fpClaim(e, ia);
+                if (home != 0) {
+                    fpBorrowLocal(e, ia, home);
+                    e->homeEarly[e->homeEarlyCount++] = bindOff;
+                } else {
+                    fpClaim(e, ia);
+                }
                 off += 1;
                 break;
             }
@@ -5834,10 +6015,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
             branchTo(e, e->iterExit, true, JAI_A64_GE);
-            /* The value is start + index, not the index: `for j in i + 1..n`
-             * is the inner loop of nbody's advance. */
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_START_REG, JIT_IDX_REG));
-            localOut(e, slot, JIT_SCRATCH_C);
+            /* The value is start + index, not the index -- `for j in i + 1..n`
+             * is the inner loop of nbody's advance -- and both registers were
+             * biased by the start in the prologue, so the value is the index
+             * register and the add that used to be here is gone. */
+            localOut(e, slot, JIT_IDX_REG);
             emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
             off += 5;
             break;
@@ -5872,8 +6054,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
                 branchOnDeopt(e, JAI_A64_NE);
 
-                /* jaiNormalizeIndex, then one unsigned compare for both ends. */
-                emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B);
+                /* jaiNormalizeIndex, then one unsigned compare for both ends.
+                 * `length` came from an `ldr w`, so it is already the whole
+                 * register. */
+                emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                    false);
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, rStr,
                                    (unsigned)offsetof(ObjString, chars)));
@@ -5958,12 +6143,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 elemShape = elemClass->shapeId;
             } else return false;
 
-            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                               (unsigned)offsetof(ObjList, count)));
-            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B);
+            /* One `ldp` for both header fields. `items` is at +16 and
+             * `count`/`capacity` are the adjacent int32s at +24, so the pair's
+             * second half is `count | capacity << 32` and the bounds test reads
+             * it with uxtw. That is one instruction per element read, and life
+             * does nine of them per cell. */
+            emitListHeader(e, rList, JIT_SCRATCH_C, JIT_SCRATCH_A);
+            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B, true);
 
-            emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
-                               (unsigned)offsetof(ObjList, items)));
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
                                   JIT_SCRATCH_B, 4));
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
@@ -6059,12 +6246,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned rIdx = pushReg(e) - 2;
             unsigned rList = pushReg(e) - 3;
 
-            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                               (unsigned)offsetof(ObjList, count)));
-            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B);
+            emitListHeader(e, rList, JIT_SCRATCH_C, JIT_SCRATCH_A);
+            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B, true);
 
-            emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
-                               (unsigned)offsetof(ObjList, items)));
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
                                   JIT_SCRATCH_B, 4));
             emit(e, jaiA64MovzX(JIT_SCRATCH_A, vtag, 0));
@@ -6854,6 +7038,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
             if (e->fixups[f].targetOffset != e->fpCarry[i]) continue;
             e->whyNot = "a branch lands inside a float expression";
+            return false;
+        }
+    }
+    /* ...and nothing may branch to a bind whose local was already written by
+     * the operator above it, for the mirror-image reason: that path did not run
+     * the operator, and the bind it lands on emits no move. See
+     * fpBindLookahead. A back edge to the offset is only visible here. */
+    for (unsigned i = 0; i < e->homeEarlyCount; i++) {
+        for (unsigned f = 0; f < e->fixupCount; f++) {
+            if (e->fixups[f].targetOffset != e->homeEarly[i]) continue;
+            e->whyNot = "a branch lands on a bind whose local was written early";
             return false;
         }
     }
@@ -8120,16 +8315,23 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                             (unsigned)offsetof(ObjIter, index)));
         emit(&e, jaiA64LdrX(JIT_LIM_REG, rIter,
                             (unsigned)offsetof(ObjIter, limit)));
-        /* A range yields start + index, so a loop that does not begin at zero
-         * needs its start too. ObjIter.source is a Value, so the object
-         * pointer sits eight bytes into it. */
-        emit(&e, jaiA64LdrX(JIT_START_REG, rIter,
-                            (unsigned)offsetof(ObjIter, source) + 8));
         if (iterKind == 1) {
-            emit(&e, jaiA64LdrX(JIT_START_REG, JIT_START_REG,
+            /* A range yields start + index, so both bounds are shifted by the
+             * start once, here, and the loop runs on the yielded value
+             * directly. ObjIter.source is a Value, so the object pointer sits
+             * eight bytes into it. jaiJitEnterOsr has already established that
+             * start + limit does not overflow. */
+            emit(&e, jaiA64LdrX(JIT_SCRATCH_A, rIter,
+                                (unsigned)offsetof(ObjIter, source) + 8));
+            emit(&e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
                                 (unsigned)offsetof(ObjRange, start)));
+            emit(&e, jaiA64AddX(JIT_IDX_REG, JIT_IDX_REG, JIT_SCRATCH_A));
+            emit(&e, jaiA64AddX(JIT_LIM_REG, JIT_LIM_REG, JIT_SCRATCH_A));
+        } else {
+            /* A list head keeps the ObjList itself in JIT_START_REG. */
+            emit(&e, jaiA64LdrX(JIT_START_REG, rIter,
+                                (unsigned)offsetof(ObjIter, source) + 8));
         }
-        /* A list head leaves JIT_START_REG holding the ObjList itself. */
     }
 
     if (!compileBody(&e, closure) || e.failed) {
@@ -8155,11 +8357,22 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
              * is a way out of the loop, so the load is off the hot path and   \
              * JIT_SCRATCH_A is dead at the top of all of them. */             \
             unsigned rIt = JIT_ITER_REG;                                       \
+            unsigned rIx = JIT_IDX_REG;                                        \
             if (iterKind == 1) {                                               \
                 rIt = JIT_SCRATCH_A;                                           \
                 emit(&e, jaiA64LdrX(rIt, 31, e.iterFrameOffset));              \
+                /* The index register carries the yielded value, not the       \
+                 * index; ObjIter::index is zero-based, so the start comes      \
+                 * back off. Two loads and a subtract, once per way out. */    \
+                emit(&e, jaiA64LdrX(JIT_SCRATCH_B, rIt,                        \
+                                    (unsigned)offsetof(ObjIter, source) + 8)); \
+                emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,              \
+                                    (unsigned)offsetof(ObjRange, start)));     \
+                emit(&e, jaiA64SubsXReg(JIT_SCRATCH_B, JIT_IDX_REG,            \
+                                        JIT_SCRATCH_B));                       \
+                rIx = JIT_SCRATCH_B;                                           \
             }                                                                  \
-            emit(&e, jaiA64StrX(JIT_IDX_REG, rIt,                              \
+            emit(&e, jaiA64StrX(rIx, rIt,                                      \
                                 (unsigned)offsetof(ObjIter, index)));          \
         }                                                                      \
         for (unsigned li = 0; li < e.locals; li++) {                           \
@@ -8426,6 +8639,18 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             /* Unit steps only -- that is what makes the yielded value start
              * plus the index. The start need not be 0; it is loaded at entry. */
             if (AS_RANGE(iter->source)->step != 1) return 0;
+            /* The compiled head runs on `start + index` in one register, which
+             * means the limit is biased by the start too -- see osrReserved.
+             * `limit` saturates at INT64_MAX for a range that spans the type,
+             * and a biased limit that wrapped would compare the wrong way
+             * round, so such a loop is left to the interpreter. */
+            {
+                int64_t biased;
+                if (__builtin_add_overflow(AS_RANGE(iter->source)->start,
+                                           iter->limit, &biased)) {
+                    return 0;
+                }
+            }
             iterKind = 1;
         } else if (iter->kind == ITER_LIST && IS_LIST(iter->source)) {
             ObjList *src = AS_LIST(iter->source);
