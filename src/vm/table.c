@@ -162,7 +162,6 @@ static void adjustCapacity(JaiTable *t, int capacity) {
     t->count = count;
     t->tombstones = 0;
     ++t->version;
-    ++t->moves;      /* every live entry just changed address */
 
     JAI_FREE_ARRAY(JaiEntry, oldEntries, oldCapacity);
     JAI_FREE_ARRAY(int32_t, oldOrder, oldCapacity);
@@ -362,7 +361,6 @@ static inline void removeEntry(JaiTable *t, JaiEntry *e) {
     --t->count;
     ++t->tombstones;
     ++t->version;
-    ++t->moves;      /* this address no longer holds this key */
 }
 
 /* Insert with an already-computed hash, comparing keys by value. Used by
@@ -404,7 +402,6 @@ void jaiTableInit(JaiTable *t) {
     t->tombstones = 0;
     t->capacity = 0;
     t->version = 0;
-    t->moves = 0;
 }
 
 void jaiTableFree(JaiTable *t) {
@@ -465,7 +462,6 @@ void jaiTableClear(JaiTable *t) {
     t->count = 0;
     t->tombstones = 0;
     t->version++;
-    t->moves++;
 }
 
 void jaiTableAddAll(const JaiTable *from, JaiTable *to) {
@@ -529,11 +525,6 @@ bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
     return insertAt(t,
                     findEntryInterned(t->entries, t->capacity, key),
                     k, hash, value);
-}
-
-JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key) {
-    if (t->count == 0) return NULL;
-    return findExistingInterned(t->entries, t->capacity, key);
 }
 
 int jaiTableFindIndex(JaiTable *t, Value key) {
