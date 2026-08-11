@@ -3604,27 +3604,78 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
                 branchOnDeopt(e, JAI_A64_NE);
 
-                if (!emitDescriptorStatus(e, NULL_VAL, cidx + 1, argc,
-                                          (void *)&jitCallOut, false,
-                                          (int)rCallee)) {
+                /* Straight to the callee's compiled entry rather than out
+                 * through jaiCallValue and an interpreter frame. The
+                 * convention is the one a self-call already uses and the one
+                 * jaiJitEnterFunc invokes: raw payloads in x0.., the closure
+                 * itself in the last argument register when the body reads an
+                 * upvalue, and on return x0 the value with x1 the verdict.
+                 *
+                 * The callee must live in this module, because it is the
+                 * caller's module-version check at entry that stands in for
+                 * the one jaiJitEnterFunc would have made. The arena is never
+                 * freed and jitFunc is written once, so the address baked in
+                 * here cannot go stale; only the ObjFunction identity has to
+                 * be guarded, and it is, above. */
+                unsigned calleeArgs = (unsigned)cfn->jitArgCount;
+                bool wantsClosure = calleeArgs == argc + 1u;
+                if (cfn->module != fn->module || cfn->jitArgBase != 1u ||
+                    (!wantsClosure && calleeArgs != argc)) {
+                    e->whyNot = "an indirect callee this tier cannot enter directly";
                     return false;
                 }
+                if (calleeArgs > JIT_MAX_ARITY) {
+                    e->whyNot = "an indirect callee with too many arguments";
+                    return false;
+                }
+
+                /* Roots before the branch: a `blr` pushes none, and the callee
+                 * may allocate. */
+                unsigned callRoots = 0;
+                if (!emitRootFill(e, e->descOffset, &callRoots)) return false;
+                if (callRoots > 0) {
+                    unsigned dd = e->descOffset;
+                    emit(e, jaiA64MovzX(JIT_SCRATCH_A, callRoots, 0));
+                    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+                                       dd + (unsigned)offsetof(JitCallDesc, nroots)));
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+                    emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
+                    emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(JitCallDesc, link)));
+                    emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+                }
+
+                unsigned firstArg = JIT_FIRST_SAVED + regBase(e) +
+                                    (e->usesUpvalues ? 1u : 0u) +
+                                    (cidx + 1u - (e->depth - e->valueDepth));
+                for (unsigned i = 0; i < argc; i++) {
+                    emit(e, jaiA64MovX(i, firstArg + i));
+                }
+                if (wantsClosure) emit(e, jaiA64MovX(argc, rCallee));
+                emitConst64(e, JIT_SCRATCH_D,
+                            (int64_t)(uintptr_t)cfn->jitFunc);
+                emit(e, jaiA64Blr(JIT_SCRATCH_D));
+
+                if (callRoots > 0) {
+                    unsigned dd = e->descOffset;
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+                    emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(JitCallDesc, link)));
+                    emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+                }
+                /* x1 carries the callee's verdict; a bail there is a bail
+                 * here, exactly as for a self-call. */
+                emit(e, jaiA64SubsXImm(31, 1, 0));
+                branchOnCondition(e, JAI_A64_NE);
+
                 for (unsigned i = 0; i <= argc; i++) {
                     unsigned r;
                     if (!popValue(e, &r, NULL)) return false;
                 }
                 if (!pushValue(e, rkind, 0, NULL)) return false;
-
-                unsigned rat = e->descOffset +
-                               (unsigned)offsetof(JitCallDesc, result);
-                unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
-                                 : rkind == SLOT_FLOAT ? VAL_FLOAT
-                                                       : VAL_BOOL;
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
-                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 2), true);
-                emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
-                e->wroteHeap = true;
+                emit(e, jaiA64MovX(pushReg(e) - 1, 0));
                 off += 2;
                 break;
             }
