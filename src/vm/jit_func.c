@@ -455,6 +455,13 @@ typedef struct {
      * it is nbody's advance. */
     bool      dynamicLocal[JIT_MAX_SLOTS + 1];
     bool      needDynamic[JIT_MAX_SLOTS + 1];   /* found during this attempt */
+    /* A slot that holds an instance on one path and null on another. Unlike a
+     * dynamic local it stays in a register -- the pointer, or zero -- and its
+     * tag is built when it is materialised. Per slot, because widening every
+     * instance parameter of any body that merely mentions null cost
+     * object_dispatch a factor of two. */
+    bool      nullableLocal[JIT_MAX_SLOTS + 1];
+    bool      needNullable[JIT_MAX_SLOTS + 1];
     bool      pendingRange;
     bool      rangeInclusive;
     unsigned  iterSlot;
@@ -1140,20 +1147,19 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         SlotKind k = e->stack[idx];
         if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
             k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
-            k != SLOT_ITER) {
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             e->whyNot = "an argument kind this call cannot pass";
             return false;
         }
-        unsigned tag = k == SLOT_INT   ? VAL_INT
-                     : k == SLOT_FLOAT ? VAL_FLOAT
-                     : k == SLOT_BOOL  ? VAL_BOOL
-                                       : VAL_OBJ;
         unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
                       i * (unsigned)sizeof(Value);
         unsigned reg = JIT_FIRST_SAVED + regBase(e) +
                        (e->usesUpvalues ? 1u : 0u) +
                        (idx - (e->depth - e->valueDepth));
-        emit(e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
+        /* A maybe-instance's tag is not a property of its kind, and this Value
+         * reaches jaiCallValue: writing VAL_OBJ over a zero payload would hand
+         * the interpreter a null pointer dressed as an object. */
+        emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(reg, 31, at + 8));
     }
@@ -1164,15 +1170,17 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         if (e->localKind[slot] != SLOT_INST &&
             e->localKind[slot] != SLOT_LIST &&
             e->localKind[slot] != SLOT_OBJ &&
-            e->localKind[slot] != SLOT_ITER) {
+            e->localKind[slot] != SLOT_ITER &&
+            e->localKind[slot] != SLOT_MAYBE_INST) {
             continue;
         }
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
                       nroots * (unsigned)sizeof(Value);
-        emit(e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
+        unsigned rslot = localIn(e, slot, JIT_SCRATCH_C);
+        emitTagFor(e, e->localKind[slot], rslot, JIT_SCRATCH_B, JIT_SCRATCH_A);
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
-        emit(e, jaiA64StrX(localIn(e, slot, JIT_SCRATCH_C), 31, at + 8));
+        emit(e, jaiA64StrX(rslot, 31, at + 8));
         nroots++;
     }
 
@@ -1185,7 +1193,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
     for (unsigned idx = e->depth - e->valueDepth; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
-            k != SLOT_ITER) {
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             continue;
         }
         if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
@@ -1194,7 +1202,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         unsigned reg = JIT_FIRST_SAVED + regBase(e) +
                        (e->usesUpvalues ? 1u : 0u) +
                        (idx - (e->depth - e->valueDepth));
-        emit(e, jaiA64MovzX(JIT_SCRATCH_B, VAL_OBJ, 0));
+        emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
         emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
         emit(e, jaiA64StrX(reg, 31, at + 8));
         nroots++;
@@ -2278,8 +2286,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             SlotKind kind;
             unsigned tag;
+            ObjClass *fcls = NULL;
             if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            else if (IS_INSTANCE(fieldVal) || IS_NULL(fieldVal)) {
+                /* A tree's `left` is a Node on one call and null on the next,
+                 * and its leaves are half of it. A leaf has no class to read,
+                 * so the receiver's own class is the guess -- a nullable
+                 * instance field is a linked structure far more often than
+                 * not -- and the class guard below makes the guess safe: being
+                 * wrong deopts, it does not miscompile. */
+                kind = SLOT_MAYBE_INST;
+                tag  = VAL_OBJ;
+                fcls = IS_INSTANCE(fieldVal) ? AS_INSTANCE(fieldVal)->klass
+                                             : e->localClass[slot];
+                if (fcls == NULL) return false;
+            }
             else return false;
 
             unsigned base = (unsigned)offsetof(ObjInstance, fields) +
@@ -2289,7 +2311,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * where a float was seen must bail rather than be read as one. */
             unsigned recv = localIn(e, slot, JIT_SCRATCH_C);
             SlotKind already = knownFieldKind(e, (int)slot, info->slot);
-            if (already != SLOT_SELF) {
+            if (kind == SLOT_MAYBE_INST) {
+                /* Three guards, and the receiver is the trick that makes them
+                 * branch-free. It is a live instance already -- the entry
+                 * guard or the null check above saw to that -- so when the
+                 * field is null the loads below are aimed at the receiver
+                 * instead, which is a real object of the right type. Nothing
+                 * ever dereferences zero. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));       /* tag */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, recv, base + 8));   /* value */
+                emit(e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, VAL_OBJ));
+                emit(e, jaiA64CselX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                    JIT_SCRATCH_B, JAI_A64_EQ));
+                emit(e, jaiA64CselX(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                    JIT_SCRATCH_A, JAI_A64_EQ));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+                branchOnDeopt(e, JAI_A64_NE);      /* neither object nor null */
+
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+                emit(e, jaiA64CselX(JIT_SCRATCH_B, recv, JIT_SCRATCH_D,
+                                    JAI_A64_EQ));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(ObjInstance, klass)));
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)fcls);
+                if (fcls != e->localClass[slot]) {
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+                    emit(e, jaiA64CselX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                        JIT_SCRATCH_A, JAI_A64_EQ));
+                }
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+            } else if (already != SLOT_SELF) {
                 kind = already;
             } else {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));
@@ -2297,8 +2355,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchOnDeopt(e, JAI_A64_NE);
             }
 
-            if (!pushValue(e, kind, 0, NULL)) return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, recv, base + 8));
+            if (kind == SLOT_MAYBE_INST) {
+                if (!pushValue3(e, kind, fcls->shapeId, fcls,
+                                IS_INSTANCE(fieldVal) ? fieldVal : NULL_VAL,
+                                -1)) {
+                    return false;
+                }
+                emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_D));
+            } else {
+                if (!pushValue(e, kind, 0, NULL)) return false;
+                emit(e, jaiA64LdrX(pushReg(e) - 1, recv, base + 8));
+            }
             off += 8;
             break;
         }
@@ -3441,6 +3508,40 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth < argc + 1) return false;
             if (e->stack[e->depth - argc - 1] != SLOT_SELF) return false;
 
+            /* A self-call branches to the prologue, past the entry guard, so
+             * nothing else checks what it hands over. Passing a maybe-instance
+             * into a slot typed as a plain instance would let a later field
+             * read dereference zero. Record the slot and let the retry seed it
+             * as a maybe-instance from the start -- per slot, so a body whose
+             * other parameters are never null pays nothing for this one. */
+            {
+                bool retry = false;
+                for (unsigned i = 0; i < argc; i++) {
+                    unsigned pslot = 1u + i;   /* parameters are slots 1..arity */
+                    unsigned aidx  = e->depth - argc + i;
+                    SlotKind ak = e->stack[aidx];
+                    SlotKind pk = e->localKind[pslot];
+                    if (ak == SLOT_MAYBE_INST && pk == SLOT_INST) {
+                        e->needNullable[pslot] = true;
+                        retry = true;
+                        continue;
+                    }
+                    if (ak != pk) {
+                        e->whyNot = "a self-call argument is not the parameter's kind";
+                        return false;
+                    }
+                    if ((pk == SLOT_INST || pk == SLOT_MAYBE_INST) &&
+                        e->stackClass[aidx] != e->localClass[pslot]) {
+                        e->whyNot = "a self-call passing a different class";
+                        return false;
+                    }
+                }
+                if (retry) {
+                    e->whyNot = "a parameter is sometimes null";
+                    return false;
+                }
+            }
+
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
             unsigned first = JIT_FIRST_SAVED + regBase(e) +
@@ -3554,7 +3655,12 @@ static bool seedLocals(Emit *e, Value *slotBase) {
         } else if (IS_FLOAT(v)) {
             e->localKind[i] = SLOT_FLOAT;
         } else if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != NULL) {
-            e->localKind[i]  = SLOT_INST;
+            /* A slot an earlier attempt found is sometimes null holds the
+             * pointer or zero. The class still comes from the argument this
+             * entry carried: a maybe-instance is a correct supertype of an
+             * instance, so widening cannot make a field offset wrong. */
+            e->localKind[i]  = e->nullableLocal[i] ? SLOT_MAYBE_INST
+                                                   : SLOT_INST;
             e->localClass[i] = AS_INSTANCE(v)->klass;
             e->localShape[i] = AS_INSTANCE(v)->klass->shapeId;
         } else if (IS_LIST(v)) {
@@ -3646,7 +3752,8 @@ static bool eligible(ObjFunction *fn) {
 }
 
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
-                            const bool *dynamic, bool *needDynamic);
+                            const bool *dynamic, bool *needDynamic,
+                            const bool *nullable, bool *needNullable);
 
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
@@ -3656,13 +3763,25 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
      * disagree about, and the next begins knowing it. */
     bool dynamic[JIT_MAX_SLOTS + 1];
     bool need[JIT_MAX_SLOTS + 1];
+    bool nullable[JIT_MAX_SLOTS + 1];
+    bool needNull[JIT_MAX_SLOTS + 1];
     memset(dynamic, 0, sizeof dynamic);
+    memset(nullable, 0, sizeof nullable);
     for (int attempt = 0; attempt < 4; attempt++) {
         memset(need, 0, sizeof need);
-        if (compileFuncOnce(closure, slotBase, dynamic, need)) return true;
+        memset(needNull, 0, sizeof needNull);
+        if (compileFuncOnce(closure, slotBase, dynamic, need, nullable,
+                            needNull)) {
+            return true;
+        }
         bool grew = false;
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             if (need[i] && !dynamic[i]) { dynamic[i] = true; grew = true; }
+            /* Dynamic wins: it is the more general representation, and a slot
+             * that wants both is one the nullable form cannot describe. */
+            if (needNull[i] && !dynamic[i] && !nullable[i]) {
+                nullable[i] = true; grew = true;
+            }
         }
         if (!grew) return false;
     }
@@ -3670,7 +3789,8 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 }
 
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
-                            const bool *dynamic, bool *needDynamic) {
+                            const bool *dynamic, bool *needDynamic,
+                            const bool *nullable, bool *needNullable) {
     ObjFunction *fn = closure->fn;
 
     if (getenv("JAI_JIT_WHY")) {
@@ -3692,6 +3812,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     static Emit e;
     memset(&e, 0, sizeof e);
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
+    memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     e.arity        = fn->arity;
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
@@ -3705,6 +3826,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     static Emit body;
     memset(&body, 0, sizeof body);
     memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
+    memcpy(body.nullableLocal, nullable, sizeof body.nullableLocal);
     body.arity        = fn->arity;
     /* The measuring pass runs with slot 0 available, purely to find out
      * whether the body reads it; the real pass then drops it if not. */
@@ -3734,6 +3856,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.frameBytes = (body.frameBytes + 15u) & ~15u;
     if (!compileBody(&body, closure)) {
         memcpy(needDynamic, body.needDynamic, sizeof body.needDynamic);
+        memcpy(needNullable, body.needNullable, sizeof body.needNullable);
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
                     fn->name ? fn->name->chars : "<anon>",
@@ -4691,6 +4814,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     /* Every slot must still hold what it held when this was compiled. */
     for (unsigned i = 0; i < form->slots; i++) {
         Value v = frame->slots[i];
+        if ((SlotKind)form->kinds[i] == SLOT_MAYBE_INST) {
+            if (!IS_NULL(v) && !IS_INSTANCE(v)) return 0;
+            continue;
+        }
         switch ((SlotKind)form->kinds[i]) {
         case SLOT_INT:   if (!IS_INT(v))   return 0; break;
         case SLOT_FLOAT: if (!IS_FLOAT(v)) return 0; break;
@@ -4749,6 +4876,21 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
             if (!IS_FLOAT(v)) return JAI_JIT_DECLINED;
             double d = AS_FLOAT(v);
             memcpy(&a[i], &d, sizeof a[i]);
+            break;
+        }
+        case SLOT_MAYBE_INST: {
+            /* The pointer, or zero for null -- the register form. The class is
+             * still checked when there is one, because a self-call branches
+             * straight to the prologue and this is the only place it is
+             * established. */
+            if (IS_NULL(v)) { a[i] = 0; break; }
+            if (!IS_INSTANCE(v)) return JAI_JIT_DECLINED;
+            ObjInstance *mi = AS_INSTANCE(v);
+            if (mi->klass == NULL ||
+                mi->klass->shapeId != fn->jitParamShape[i]) {
+                return JAI_JIT_DECLINED;
+            }
+            a[i] = (int64_t)(uintptr_t)mi;
             break;
         }
         case SLOT_INST: {
@@ -4815,6 +4957,12 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         return JAI_JIT_DECLINED;
     }
 
+    if ((SlotKind)fn->jitReturnKind == SLOT_MAYBE_INST) {
+        slotBase[0] = r.value == 0 ? NULL_VAL
+                                   : OBJ_VAL((Obj *)(uintptr_t)r.value);
+        vm.stackTop = slotBase + 1;
+        return JAI_JIT_DONE;
+    }
     switch ((SlotKind)fn->jitReturnKind) {
     case SLOT_INT:
         slotBase[0] = INT_VAL(r.value);
