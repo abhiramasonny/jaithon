@@ -3,6 +3,18 @@
 import java.util.Locale;
 
 public class Nbody {
+    // BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+    // medium a quarter, hard (the default, and anything unrecognised) all of it.
+    static long scale() {
+        String l = System.getenv("BENCH_LEVEL");
+        if ("easy".equals(l)) return 16;
+        if ("medium".equals(l)) return 4;
+        return 1;
+    }
+
+    static final long SCALE = scale();
+    static final long STEPS = 500000L / SCALE;
+
     static final double SOLAR_MASS = 39.47841760435743;
     static final double DAYS_PER_YEAR = 365.24;
 
@@ -86,7 +98,7 @@ public class Nbody {
             ),
         };
         System.out.printf(Locale.ROOT, "%.9f\n", energy(bodies));
-        for (int step = 0; step < 500000; step++) {
+        for (long step = 0; step < STEPS; step++) {
             advance(bodies, 0.01);
         }
         System.out.printf(Locale.ROOT, "%.9f\n", energy(bodies));

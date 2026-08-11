@@ -5,10 +5,24 @@
 #include <string>
 #include <unordered_map>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+static const int64_t N = 200000 / SCALE;
+
 int main() {
     std::string text;
     int64_t seed = 7;
-    for (int64_t i = 0; i < 200000; i++) {
+    for (int64_t i = 0; i < N; i++) {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         char buf[32];
         std::snprintf(buf, sizeof buf, "w%lld ", (long long)(seed % 500));

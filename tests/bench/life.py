@@ -1,3 +1,12 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+# The grid is a square dimension: work is n^2, so the level halves it rather
+# than dividing by 16 -- halving both sides is already 4x less work.
+DIM_DIV = 4 if _LEVEL == "easy" else 2 if _LEVEL == "medium" else 1
+SIZE = 500 // DIM_DIV
+
+
 def zeros(n):
     row = []
     for _i in range(n):
@@ -50,8 +59,8 @@ def step(board, h, w):
     return out
 
 
-h = 500
-w = 500
+h = SIZE
+w = SIZE
 generations = 70
 
 board = seed_board(h, w, 7)

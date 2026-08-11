@@ -1,4 +1,10 @@
 #: Floating-point heavy simulation — the classic n-body benchmark.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let STEPS = 500_000 // SCALE
+
 const SOLAR_MASS = 39.47841760435743
 const DAYS_PER_YEAR = 365.24
 
@@ -88,7 +94,7 @@ fn main() -> int {
         ),
     ]
     print(f"{energy(bodies):.9f}")
-    for _step in 0..500_000 { advance(bodies, 0.01) }
+    for _step in 0..STEPS { advance(bodies, 0.01) }
     print(f"{energy(bodies):.9f}")
     return 0
 }

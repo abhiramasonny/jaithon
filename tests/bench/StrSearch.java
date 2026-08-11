@@ -2,6 +2,19 @@
 // indexOf would measure the standard library rather than the per-character
 // indexing this benchmark is about.
 public class StrSearch {
+    // BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+    // medium a quarter, hard (the default, and anything unrecognised) all of it.
+    static long scale() {
+        String l = System.getenv("BENCH_LEVEL");
+        if ("easy".equals(l)) return 16;
+        if ("medium".equals(l)) return 4;
+        return 1;
+    }
+
+    static final long SCALE = scale();
+    // Scale the repetitions and leave the text size alone.
+    static final long REPS = Math.max(1L, 5L / SCALE);
+
     static long countOccurrences(String text, String needle) {
         long n = text.length();
         long m = needle.length();
@@ -31,7 +44,7 @@ public class StrSearch {
         String text = builder.toString();
 
         long hits = 0;
-        for (int rep = 0; rep < 5; rep++) hits = countOccurrences(text, "abcd");
+        for (long rep = 0; rep < REPS; rep++) hits = countOccurrences(text, "abcd");
         System.out.println(text.length());
         System.out.println(hits);
     }

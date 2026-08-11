@@ -1,3 +1,12 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+# n is a square dimension: work is n^3, so the level halves it rather than
+# dividing by 16.
+DIM_DIV = 4 if _LEVEL == "easy" else 2 if _LEVEL == "medium" else 1
+SIZE = 320 // DIM_DIV
+
+
 def make(n, seed):
     m = []
     s = seed
@@ -10,7 +19,7 @@ def make(n, seed):
     return m
 
 
-n = 320
+n = SIZE
 a = make(n, 12345)
 b = make(n, 67890)
 

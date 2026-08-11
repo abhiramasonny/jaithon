@@ -4,6 +4,21 @@
 #include <cstdio>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+// The work is n^2 in the grid side, so halve the side per level.
+static const int DIM_DIV = SCALE == 16 ? 4 : (SCALE == 4 ? 2 : 1);
+
 static std::vector<int64_t> zeros(int n) {
     std::vector<int64_t> row;
     for (int i = 0; i < n; i++) row.push_back(0);
@@ -61,8 +76,8 @@ static std::vector<std::vector<int64_t>> step(
 }
 
 int main() {
-    const int h = 500;
-    const int w = 500;
+    const int h = 500 / DIM_DIV;
+    const int w = 500 / DIM_DIV;
     const int generations = 70;
 
     std::vector<std::vector<int64_t>> board = seed_board(h, w, 7);

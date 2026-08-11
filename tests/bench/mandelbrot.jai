@@ -5,9 +5,16 @@
 #: pixel costs a different number of iterations and the branch that ends them
 #: is unpredictable. Each step of the recurrence is written to one intermediate
 #: at a time so that every port performs the same rounding in the same order.
+from std.os import env_or
+
+# The grid is width * height work, so each level halves both sides rather than
+# dividing one of them by the whole scale.
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SHRINK = if LEVEL == "easy" { 4 } elif LEVEL == "medium" { 2 } else { 1 }
+
 fn main() -> int {
-    let width = 3200
-    let height = 240
+    let width = 3200 // SHRINK
+    let height = 240 // SHRINK
     let limit = 100
 
     var inside = 0

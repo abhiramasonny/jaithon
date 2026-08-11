@@ -3,10 +3,16 @@
 #: `string_build` measures concatenation and `dict_ops` measures hashing of
 #: keys that already exist. This measures the third thing: cutting substrings
 #: out of a buffer and hashing each one once, which is what a scanner does.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let WORDS = 200_000 // SCALE
+
 fn main() -> int {
     var text = ""
     var seed = 7
-    for _i in 0..200_000 {
+    for _i in 0..WORDS {
         seed = (seed * 1103515245 + 12345) % 2147483648
         text = text + f"w{seed % 500} "
     }

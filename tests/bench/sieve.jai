@@ -3,8 +3,14 @@
 #: The inner loop strides rather than walking, so it defeats any prefetch the
 #: flat loops get, and every write is a bounds-checked store of a bool. Nothing
 #: else in the suite writes a list this hard.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let LIMIT = 10_000_000 // SCALE
+
 fn main() -> int {
-    let n = 10_000_000
+    let n = LIMIT
     var flags: list[bool] = []
     for _i in 0..n + 1 { flags.push(true) }
 

@@ -5,6 +5,21 @@
 #include <cstdio>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+// A repetition count around a fixed matrix: never below one round.
+static const long ROUNDS = (6 / SCALE) < 1 ? 1 : (6 / SCALE);
+
 static double evalA(int64_t i, int64_t j) {
     int64_t s = i + j;
     return 1.0 / (double)(s * (s + 1) / 2 + i + 1);
@@ -34,7 +49,7 @@ int main() {
     const int n = 550;
     std::vector<double> u((size_t)n, 1.0);
     std::vector<double> v;
-    for (int r = 0; r < 6; r++) {
+    for (long r = 0; r < ROUNDS; r++) {
         v = timesAt(timesA(u, n), n);
         u = timesAt(timesA(v, n), n);
     }

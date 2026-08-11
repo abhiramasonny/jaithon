@@ -1,8 +1,23 @@
 // Same program as mandelbrot.jai.
 public class Mandelbrot {
+    // BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+    // medium a quarter, hard (the default, and anything unrecognised) all of it.
+    static long scale() {
+        String l = System.getenv("BENCH_LEVEL");
+        if ("easy".equals(l)) return 16;
+        if ("medium".equals(l)) return 4;
+        return 1;
+    }
+
+    static final long SCALE = scale();
+    // Work is the pixel area, so halve each side per level rather than divide.
+    static final long SIDE_DIV = SCALE == 16 ? 4L : SCALE == 4 ? 2L : 1L;
+    static final int WIDTH = (int) (3200L / SIDE_DIV);
+    static final int HEIGHT = (int) (240L / SIDE_DIV);
+
     public static void main(String[] args) {
-        final int width = 3200;
-        final int height = 240;
+        final int width = WIDTH;
+        final int height = HEIGHT;
         final int limit = 100;
 
         long inside = 0;

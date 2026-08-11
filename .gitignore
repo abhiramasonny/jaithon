@@ -14,7 +14,7 @@ __jaicache__/
 *.jaic
 
 # Generated documentation
-/docs/api/
+docs/
 
 # Benchmark baselines are committed; local scratch runs are not
 /tests/bench/*.local.json

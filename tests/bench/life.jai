@@ -5,6 +5,13 @@
 #: cell is nine bounds-checked loads and a handful of adds. The board carries a
 #: ring of dead cells that is never updated, which keeps the neighbour sum free
 #: of edge tests — what is left is the indexing, not the branching.
+from std.os import env_or
+
+# The board is n^2 work, so the level shortens the run instead of shrinking it.
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let GENERATIONS = max(70 // SCALE, 1)
+
 fn zeros(n: int) -> list[int] {
     var row: list[int] = []
     for _i in 0..n { row.push(0) }
@@ -63,17 +70,16 @@ fn step(board: list[list[int]], h: int, w: int) -> list[list[int]] {
 fn main() -> int {
     let h = 500
     let w = 500
-    let generations = 70
 
     var board = seed_board(h, w, 7)
-    for _g in 0..generations { board = step(board, h, w) }
+    for _g in 0..GENERATIONS { board = step(board, h, w) }
 
     var live = 0
     for r in 1..h + 1 {
         let row = board[r]
         for c in 1..w + 1 { live += row[c] }
     }
-    print(generations)
+    print(GENERATIONS)
     print(live)
     return 0
 }

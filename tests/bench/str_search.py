@@ -1,3 +1,11 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+# The text stays the same size; the repetitions over it are what shortens.
+REPS = max(1, 5 // SCALE)
+
+
 def count_occurrences(text, needle):
     n = len(text)
     m = len(needle)
@@ -25,7 +33,7 @@ for _i in range(250_000):
 text = "".join(parts)
 
 hits = 0
-for _rep in range(5):
+for _rep in range(REPS):
     hits = count_occurrences(text, "abcd")
 print(len(text))
 print(hits)

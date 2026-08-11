@@ -5,6 +5,12 @@
 #: once and then chases the pointers back down it, which is the other half of
 #: what a collector costs: the walk is a load whose address the previous load
 #: produced, and nothing about it prefetches.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let REPS = max(8 // SCALE, 1)
+
 class Node {
     pub var value: int
     pub var left: Node?
@@ -30,7 +36,7 @@ fn walk(node: Node?) -> int {
 fn main() -> int {
     let depth = 18
     var total = 0
-    for _rep in 0..8 {
+    for _rep in 0..REPS {
         let tree = build(depth, 1)
         total = (total + walk(tree)) % 1000000007
     }

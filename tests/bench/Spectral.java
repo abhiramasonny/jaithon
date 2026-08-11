@@ -1,5 +1,18 @@
 // Same program as spectral.jai.
 public class Spectral {
+    // BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+    // medium a quarter, hard (the default, and anything unrecognised) all of it.
+    static long scale() {
+        String l = System.getenv("BENCH_LEVEL");
+        if ("easy".equals(l)) return 16;
+        if ("medium".equals(l)) return 4;
+        return 1;
+    }
+
+    static final long SCALE = scale();
+    // Scale the repetitions and leave the matrix size alone.
+    static final long ROUNDS = Math.max(1L, 6L / SCALE);
+
     static double evalA(long i, long j) {
         long s = i + j;
         return 1.0 / (double) (s * (s + 1) / 2 + i + 1);
@@ -30,7 +43,7 @@ public class Spectral {
         double[] u = new double[n];
         for (int i = 0; i < n; i++) u[i] = 1.0;
         double[] v = new double[n];
-        for (int r = 0; r < 6; r++) {
+        for (long r = 0; r < ROUNDS; r++) {
             v = timesAt(timesA(u, n), n);
             u = timesAt(timesA(v, n), n);
         }

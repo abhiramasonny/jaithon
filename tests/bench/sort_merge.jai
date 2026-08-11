@@ -3,6 +3,12 @@
 #: `list.sort()` would time two C implementations against each other and say
 #: nothing about the interpreter. This is list indexing, comparison and
 #: recursion in the loop instead.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let ITEMS = 1_000_000 // SCALE
+
 fn merge(left: list[int], right: list[int]) -> list[int] {
     var out: list[int] = []
     var i = 0
@@ -36,7 +42,7 @@ fn sort(values: list[int]) -> list[int] {
 fn main() -> int {
     var data: list[int] = []
     var seed = 12345
-    for _i in 0..1_000_000 {
+    for _i in 0..ITEMS {
         seed = (seed * 1103515245 + 12345) % 2147483648
         data.push(seed % 100000)
     }

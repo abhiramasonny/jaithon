@@ -5,6 +5,13 @@
 #: rounding error, and after that only reads it. What is left is indexing a
 #: string and comparing a character at a time — the reading half of string
 #: work, which nothing else in the suite measures on its own.
+from std.os import env_or
+
+# The text is built once and only read, so the level cuts the passes over it.
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let REPS = max(5 // SCALE, 1)
+
 fn count_occurrences(text: str, needle: str) -> int {
     let n = text.len()
     let m = needle.len()
@@ -42,7 +49,7 @@ fn main() -> int {
     let text = "".join(parts)
 
     var hits = 0
-    for _rep in 0..5 { hits = count_occurrences(text, "abcd") }
+    for _rep in 0..REPS { hits = count_occurrences(text, "abcd") }
     print(text.len())
     print(hits)
     return 0

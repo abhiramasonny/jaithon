@@ -1,4 +1,10 @@
 #: Method calls through an inline cache, plus field access.
+from std.os import env_or
+
+let LEVEL = env_or("BENCH_LEVEL", "hard")
+let SCALE = if LEVEL == "easy" { 16 } elif LEVEL == "medium" { 4 } else { 1 }
+let ITERS = 10_000_000 // SCALE
+
 class Vec2 {
     pub var x: float
     pub var y: float
@@ -21,7 +27,7 @@ fn main() -> int {
     var acc = Vec2(0.0, 0.0)
     let step = Vec2(1.0, 2.0)
     var total = 0.0
-    for _i in 0..10_000_000 {
+    for _i in 0..ITERS {
         acc = acc.add(step)
         total += acc.dot(step)
     }

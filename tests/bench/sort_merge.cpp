@@ -5,6 +5,20 @@
 #include <cstdio>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// BENCH_LEVEL picks how much work this benchmark does: easy a sixteenth of it,
+// medium a quarter, hard (the default, and anything unrecognised) all of it.
+static long bench_scale() {
+    const char *l = std::getenv("BENCH_LEVEL");
+    if (l && std::strcmp(l, "easy") == 0) return 16;
+    if (l && std::strcmp(l, "medium") == 0) return 4;
+    return 1;
+}
+static const long SCALE = bench_scale();
+static const int64_t N = 1000000 / SCALE;
+
 static std::vector<int64_t> merge(const std::vector<int64_t> &left,
                                   const std::vector<int64_t> &right) {
     std::vector<int64_t> out;
@@ -41,7 +55,7 @@ static std::vector<int64_t> sort(const std::vector<int64_t> &values) {
 int main() {
     std::vector<int64_t> data;
     int64_t seed = 12345;
-    for (int64_t i = 0; i < 1000000; i++) {
+    for (int64_t i = 0; i < N; i++) {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         data.push_back(seed % 100000);
     }

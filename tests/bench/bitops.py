@@ -1,3 +1,10 @@
+import os
+
+_LEVEL = os.environ.get("BENCH_LEVEL", "hard")
+SCALE = 16 if _LEVEL == "easy" else 4 if _LEVEL == "medium" else 1
+ITERS = 1_000_000 // SCALE
+
+
 def popcount(value):
     v = value
     bits = 0
@@ -12,7 +19,7 @@ seed = 7
 ones = 0
 checksum = 0
 i = 0
-while i < 1_000_000:
+while i < ITERS:
     seed = (seed * 1103515245 + 12345) % 2147483648
     v = seed ^ checksum
     v = v ^ (v >> 7)
