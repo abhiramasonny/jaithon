@@ -102,71 +102,93 @@ static void *gBin[JAI_SMALL_CLASSES + 1];
 
 /* 0 for anything the bins do not serve. */
 static inline unsigned smallClass(size_t n) {
-    return n - 1 < JAI_SMALL_MAX
-               ? (unsigned)((n + (JAI_SMALL_GRAIN - 1)) / JAI_SMALL_GRAIN)
-               : 0u;
+    /* Grain is a power of two, so avoid an integer divide on this allocator
+     * hot path. n==0 deliberately maps to class 0. */
+    if (n == 0 || n > JAI_SMALL_MAX) return 0u;
+    return (unsigned)((n + (JAI_SMALL_GRAIN - 1u)) >> 4);
 }
 
-static void *smallAlloc(unsigned cls) {
+static inline void *smallAlloc(unsigned cls) {
     void *p = gBin[cls];
+
     if (p != NULL) {
-        /* The free list threads through the first word of each block, which is
-         * safe because the smallest class is already pointer-sized. */
         gBin[cls] = *(void **)p;
         return p;
     }
+
     p = malloc((size_t)cls * JAI_SMALL_GRAIN);
-    if (JAI_UNLIKELY(p == NULL))
+    if (JAI_UNLIKELY(p == NULL)) {
         JAI_PANIC("out of memory: cannot allocate %u bytes (%zu live)",
                   cls * JAI_SMALL_GRAIN, jaiHeapBytes);
+    }
+
     return p;
 }
 
-static void smallFree(void *p, unsigned cls) {
+static inline void smallFree(void *p, unsigned cls) {
     *(void **)p = gBin[cls];
     gBin[cls] = p;
 }
 
 void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize) {
-    unsigned oldCls = ptr != NULL ? smallClass(oldSize) : 0u;
+    const unsigned oldCls = ptr != NULL ? smallClass(oldSize) : 0u;
 
-    if (newSize == 0) {
+    if (JAI_UNLIKELY(newSize == 0)) {
         accountDelta(oldSize, 0);
-        if (oldCls != 0) smallFree(ptr, oldCls);
-        else free(ptr);
+
+        if (oldCls != 0)
+            smallFree(ptr, oldCls);
+        else
+            free(ptr);
+
         return NULL;
     }
 
-    /* Account first so a caller that reads jaiAllocatedBytes() sees the pending
-     * request. What is accounted is the size asked for, not the class it rounds
-     * up to, so the GC's thresholds mean what they meant before the bins
-     * existed. */
+    /* Very common no-op resize (especially exact-capacity helpers). */
+    if (JAI_UNLIKELY(ptr != NULL && oldSize == newSize))
+        return ptr;
+
     accountDelta(oldSize, newSize);
 
-    unsigned newCls = smallClass(newSize);
+    const unsigned newCls = smallClass(newSize);
 
-    /* Same class: the block is already big enough and shrinking it would gain
-     * nothing. This covers a growing buffer's early life and every
-     * shrink-to-exact-size. */
-    if (newCls != 0 && newCls == oldCls) return ptr;
+    /* Fresh small allocation: by far the hottest allocation path. */
+    if (ptr == NULL) {
+        if (newCls != 0)
+            return smallAlloc(newCls);
 
-    if (newCls != 0) {
-        void *result = smallAlloc(newCls);
-        if (ptr != NULL) {
-            memcpy(result, ptr, oldSize < newSize ? oldSize : newSize);
-            if (oldCls != 0) smallFree(ptr, oldCls);
-            else free(ptr);
+        void *result = malloc(newSize);
+        if (JAI_UNLIKELY(result == NULL)) {
+            JAI_PANIC("out of memory: cannot allocate %zu bytes (%zu live)",
+                      newSize, jaiHeapBytes);
         }
         return result;
     }
 
-    /* Leaving the bins: a binned block is not a libc block, so it cannot be
-     * handed to realloc. */
+    /* Same small class: physical capacity already satisfies the request. */
+    if (newCls != 0 && newCls == oldCls)
+        return ptr;
+
+    if (newCls != 0) {
+        void *result = smallAlloc(newCls);
+        memcpy(result, ptr, oldSize < newSize ? oldSize : newSize);
+
+        if (oldCls != 0)
+            smallFree(ptr, oldCls);
+        else
+            free(ptr);
+
+        return result;
+    }
+
+    /* Leaving the bins: a recycled block is not safe to hand to realloc(). */
     if (oldCls != 0) {
         void *result = malloc(newSize);
-        if (JAI_UNLIKELY(result == NULL))
+        if (JAI_UNLIKELY(result == NULL)) {
             JAI_PANIC("out of memory: cannot allocate %zu bytes (%zu live)",
                       newSize, jaiHeapBytes);
+        }
+
         memcpy(result, ptr, oldSize < newSize ? oldSize : newSize);
         smallFree(ptr, oldCls);
         return result;
@@ -174,9 +196,10 @@ void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize) {
 
     void *result = realloc(ptr, newSize);
     if (JAI_UNLIKELY(result == NULL)) {
-        JAI_PANIC("out of memory: cannot allocate %zu bytes (%zu live)", newSize,
-                  jaiHeapBytes);
+        JAI_PANIC("out of memory: cannot allocate %zu bytes (%zu live)",
+                  newSize, jaiHeapBytes);
     }
+
     return result;
 }
 
@@ -224,9 +247,10 @@ struct JaiArenaBlock {
     size_t         allocSize; /* what jaiRealloc handed out, for the free */
 };
 
-static size_t alignUpSize(size_t n) {
-    size_t mask = (size_t)JAI_ARENA_ALIGN - 1;
-    if (n > SIZE_MAX - mask) JAI_PANIC("arena allocation size overflow: %zu", n);
+static inline size_t alignUpSize(size_t n) {
+    const size_t mask = (size_t)JAI_ARENA_ALIGN - 1u;
+    if (JAI_UNLIKELY(n > SIZE_MAX - mask))
+        JAI_PANIC("arena allocation size overflow: %zu", n);
     return (n + mask) & ~mask;
 }
 
@@ -260,26 +284,38 @@ void jaiArenaInit(JaiArena *arena, size_t blockSize) {
 
 void *jaiArenaAlloc(JaiArena *arena, size_t size) {
     if (arena == NULL) return NULL;
-    if (arena->blockSize == 0) arena->blockSize = JAI_ARENA_DEFAULT_BLOCK;
+    if (arena->blockSize == 0)
+        arena->blockSize = JAI_ARENA_DEFAULT_BLOCK;
 
-    /* A zero-size request still gets a distinct address; returning NULL would
-     * make JAI_ARENA_NEW_ARRAY(a, T, 0) indistinguishable from failure. */
     if (size == 0) size = 1;
     size = alignUpSize(size);
 
     JaiArenaBlock *b = arena->head;
-    if (b == NULL || b->capacity - b->used < size) {
-        /* After jaiArenaReset the retained blocks are empty again, so look
-         * before allocating. The scan only runs when the head block fills. */
+
+    if (JAI_UNLIKELY(b == NULL || b->capacity - b->used < size)) {
+        /*
+         * After reset there may already be a suitable retained block deeper in
+         * the chain. Move the one we find to the head, so subsequent bump
+         * allocations do not rescan the same prefix again.
+         */
+        JaiArenaBlock *prev = b;
         JaiArenaBlock *scan = b != NULL ? b->next : NULL;
-        while (scan != NULL && scan->capacity - scan->used < size) scan = scan->next;
+
+        while (scan != NULL && scan->capacity - scan->used < size) {
+            prev = scan;
+            scan = scan->next;
+        }
 
         if (scan != NULL) {
+            prev->next = scan->next;
+            scan->next = arena->head;
+            arena->head = scan;
             b = scan;
         } else if (size > arena->blockSize) {
-            /* Oversized allocations get a dedicated block, parked behind the
-             * head so the head stays the active bump block. */
+            /* Dedicated oversized block. Keep the normal bump block at head
+             * when one exists, because small allocations dominate. */
             b = arenaNewBlock(arena, size);
+
             if (arena->head == NULL) {
                 arena->head = b;
             } else {
@@ -357,32 +393,58 @@ void jaiBufFree(JaiBuf *b) {
 
 void jaiBufReserve(JaiBuf *b, size_t extra) {
     if (b == NULL || extra == 0) return;
-    if (b->capacity - b->count >= extra) return;
-    if (extra > SIZE_MAX - b->count) JAI_PANIC("buffer size overflow");
 
-    size_t needed = b->count + extra;
-    size_t cap = b->capacity < JAI_BUF_MIN_CAP ? JAI_BUF_MIN_CAP : b->capacity;
-    while (cap < needed) {
-        if (cap > SIZE_MAX / 2) { cap = needed; break; }
-        cap *= 2;
+    const size_t count = b->count;
+    const size_t capacity = b->capacity;
+
+    if (capacity - count >= extra)
+        return;
+
+    if (JAI_UNLIKELY(extra > SIZE_MAX - count))
+        JAI_PANIC("buffer size overflow");
+
+    const size_t needed = count + extra;
+    size_t cap = capacity < JAI_BUF_MIN_CAP ? JAI_BUF_MIN_CAP : capacity;
+
+    /* Usually one doubling is enough; keep that case branch-light. */
+    if (cap < needed) {
+        if (cap <= SIZE_MAX / 2)
+            cap *= 2;
+
+        if (cap < needed) {
+            while (cap < needed) {
+                if (cap > SIZE_MAX / 2) {
+                    cap = needed;
+                    break;
+                }
+                cap *= 2;
+            }
+        }
     }
 
-    b->data = JAI_GROW_ARRAY(uint8_t, b->data, b->capacity, cap);
+    b->data = JAI_GROW_ARRAY(uint8_t, b->data, capacity, cap);
     b->capacity = cap;
 }
 
 void jaiBufPush(JaiBuf *b, uint8_t byte) {
     if (b == NULL) return;
-    jaiBufReserve(b, 1);
+
+    if (JAI_UNLIKELY(b->count == b->capacity))
+        jaiBufReserve(b, 1);
+
     b->data[b->count++] = byte;
 }
 
 void jaiBufAppend(JaiBuf *b, const void *bytes, size_t n) {
-    if (b == NULL || n == 0) return;
-    if (bytes == NULL) return;
-    jaiBufReserve(b, n);
-    memcpy(b->data + b->count, bytes, n);
-    b->count += n;
+    if (b == NULL || bytes == NULL || n == 0) return;
+
+    const size_t count = b->count;
+
+    if (JAI_UNLIKELY(b->capacity - count < n))
+        jaiBufReserve(b, n);
+
+    memcpy(b->data + count, bytes, n);
+    b->count = count + n;
 }
 
 void jaiBufAppendStr(JaiBuf *b, const char *s) {
@@ -414,30 +476,65 @@ void jaiBufPrintf(JaiBuf *b, const char *fmt, ...) {
 
 void jaiBufWriteU16(JaiBuf *b, uint16_t v) {
     if (b == NULL) return;
-    jaiBufReserve(b, 2);
-    b->data[b->count++] = (uint8_t)(v & 0xFFu);
-    b->data[b->count++] = (uint8_t)((v >> 8) & 0xFFu);
+
+    const size_t count = b->count;
+    if (JAI_UNLIKELY(b->capacity - count < 2))
+        jaiBufReserve(b, 2);
+
+    uint8_t *p = b->data + count;
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    b->count = count + 2;
 }
 
 void jaiBufWriteU24(JaiBuf *b, uint32_t v) {
     if (b == NULL) return;
-    if (v > 0xFFFFFFu) JAI_PANIC("u24 operand out of range: %u", v);
-    jaiBufReserve(b, 3);
-    b->data[b->count++] = (uint8_t)(v & 0xFFu);
-    b->data[b->count++] = (uint8_t)((v >> 8) & 0xFFu);
-    b->data[b->count++] = (uint8_t)((v >> 16) & 0xFFu);
+    if (JAI_UNLIKELY(v > 0xFFFFFFu))
+        JAI_PANIC("u24 operand out of range: %u", v);
+
+    const size_t count = b->count;
+    if (JAI_UNLIKELY(b->capacity - count < 3))
+        jaiBufReserve(b, 3);
+
+    uint8_t *p = b->data + count;
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    b->count = count + 3;
 }
 
 void jaiBufWriteU32(JaiBuf *b, uint32_t v) {
     if (b == NULL) return;
-    jaiBufReserve(b, 4);
-    for (int i = 0; i < 4; i++) b->data[b->count++] = (uint8_t)((v >> (8 * i)) & 0xFFu);
+
+    const size_t count = b->count;
+    if (JAI_UNLIKELY(b->capacity - count < 4))
+        jaiBufReserve(b, 4);
+
+    uint8_t *p = b->data + count;
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+    b->count = count + 4;
 }
 
 void jaiBufWriteU64(JaiBuf *b, uint64_t v) {
     if (b == NULL) return;
-    jaiBufReserve(b, 8);
-    for (int i = 0; i < 8; i++) b->data[b->count++] = (uint8_t)((v >> (8 * i)) & 0xFFu);
+
+    const size_t count = b->count;
+    if (JAI_UNLIKELY(b->capacity - count < 8))
+        jaiBufReserve(b, 8);
+
+    uint8_t *p = b->data + count;
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+    p[4] = (uint8_t)(v >> 32);
+    p[5] = (uint8_t)(v >> 40);
+    p[6] = (uint8_t)(v >> 48);
+    p[7] = (uint8_t)(v >> 56);
+    b->count = count + 8;
 }
 
 void jaiBufWriteI16(JaiBuf *b, int16_t v) { jaiBufWriteU16(b, (uint16_t)v); }
@@ -472,14 +569,34 @@ char *jaiBufTakeCString(JaiBuf *b, size_t *outLen) {
 /* ------------------------------------------------------------------ */
 
 uint64_t jaiHashBytes(const void *data, size_t len) {
-    uint64_t hash = 14695981039346656037ULL;   /* FNV-1a 64 offset basis */
+    uint64_t hash = UINT64_C(14695981039346656037);
     const uint8_t *p = (const uint8_t *)data;
 
     if (p == NULL) return hash;
-    for (size_t i = 0; i < len; i++) {
-        hash ^= (uint64_t)p[i];
-        hash *= 1099511628211ULL;
+
+    /*
+     * FNV-1a is serial, so SIMD cannot break its dependency chain. Unrolling
+     * four bytes still removes most loop-control overhead on names/strings
+     * without changing the hash ABI.
+     */
+    while (len >= 4) {
+        hash ^= (uint64_t)p[0];
+        hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)p[1];
+        hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)p[2];
+        hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)p[3];
+        hash *= UINT64_C(1099511628211);
+        p += 4;
+        len -= 4;
     }
+
+    while (len-- != 0) {
+        hash ^= (uint64_t)*p++;
+        hash *= UINT64_C(1099511628211);
+    }
+
     return hash;
 }
 
@@ -528,52 +645,58 @@ uint32_t jaiCrc32(const void *data, size_t len) {
 #define UTF8_CONT(b) (((b) & 0xC0u) == 0x80u)
 
 int32_t jaiUtf8Decode(const char *s, const char *end, int *outLen) {
-    int len = 1;   /* invalid input always advances one byte */
-    int32_t cp = -1;
-
-    if (s == NULL || end == NULL || s >= end) goto done;
-
-    {
-        const uint8_t *p = (const uint8_t *)s;
-        size_t avail = (size_t)(end - s);
-        uint8_t b0 = p[0];
-
-        /* Unicode 15 table 3-7: the ranges of the second byte encode the
-         * overlong and surrogate rejections directly. */
-        if (b0 < 0x80u) {
-            cp = (int32_t)b0;
-        } else if (b0 < 0xC2u) {
-            /* continuation byte, or C0/C1 which can only be overlong */
-        } else if (b0 < 0xE0u) {
-            if (avail >= 2 && UTF8_CONT(p[1])) {
-                cp = (int32_t)(((uint32_t)(b0 & 0x1Fu) << 6) | (uint32_t)(p[1] & 0x3Fu));
-                len = 2;
-            }
-        } else if (b0 < 0xF0u) {
-            uint8_t lo = (b0 == 0xE0u) ? 0xA0u : 0x80u;   /* E0: no overlong */
-            uint8_t hi = (b0 == 0xEDu) ? 0x9Fu : 0xBFu;   /* ED: no surrogate */
-            if (avail >= 3 && p[1] >= lo && p[1] <= hi && UTF8_CONT(p[2])) {
-                cp = (int32_t)(((uint32_t)(b0 & 0x0Fu) << 12) |
-                               ((uint32_t)(p[1] & 0x3Fu) << 6) |
-                               (uint32_t)(p[2] & 0x3Fu));
-                len = 3;
-            }
-        } else if (b0 < 0xF5u) {
-            uint8_t lo = (b0 == 0xF0u) ? 0x90u : 0x80u;   /* F0: no overlong */
-            uint8_t hi = (b0 == 0xF4u) ? 0x8Fu : 0xBFu;   /* F4: cap at 10FFFF */
-            if (avail >= 4 && p[1] >= lo && p[1] <= hi && UTF8_CONT(p[2]) &&
-                UTF8_CONT(p[3])) {
-                cp = (int32_t)(((uint32_t)(b0 & 0x07u) << 18) |
-                               ((uint32_t)(p[1] & 0x3Fu) << 12) |
-                               ((uint32_t)(p[2] & 0x3Fu) << 6) |
-                               (uint32_t)(p[3] & 0x3Fu));
-                len = 4;
-            }
-        }
-        if (cp < 0) len = 1;
+    if (s == NULL || end == NULL || s >= end) {
+        if (outLen != NULL) *outLen = 1;
+        return -1;
     }
 
-done:
+    const uint8_t *p = (const uint8_t *)s;
+    const uint8_t b0 = p[0];
+
+    /* ASCII dominates text processing. Avoid computing end-s and entering the
+     * multibyte decision tree for it. */
+    if (b0 < 0x80u) {
+        if (outLen != NULL) *outLen = 1;
+        return (int32_t)b0;
+    }
+
+    const size_t avail = (size_t)(end - s);
+    int len = 1;
+    int32_t cp = -1;
+
+    if (b0 < 0xC2u) {
+        /* continuation byte, or C0/C1 overlong */
+    } else if (b0 < 0xE0u) {
+        if (avail >= 2 && UTF8_CONT(p[1])) {
+            cp = (int32_t)(((uint32_t)(b0 & 0x1Fu) << 6) |
+                           (uint32_t)(p[1] & 0x3Fu));
+            len = 2;
+        }
+    } else if (b0 < 0xF0u) {
+        const uint8_t lo = b0 == 0xE0u ? 0xA0u : 0x80u;
+        const uint8_t hi = b0 == 0xEDu ? 0x9Fu : 0xBFu;
+
+        if (avail >= 3 && p[1] >= lo && p[1] <= hi &&
+            UTF8_CONT(p[2])) {
+            cp = (int32_t)(((uint32_t)(b0 & 0x0Fu) << 12) |
+                           ((uint32_t)(p[1] & 0x3Fu) << 6) |
+                           (uint32_t)(p[2] & 0x3Fu));
+            len = 3;
+        }
+    } else if (b0 < 0xF5u) {
+        const uint8_t lo = b0 == 0xF0u ? 0x90u : 0x80u;
+        const uint8_t hi = b0 == 0xF4u ? 0x8Fu : 0xBFu;
+
+        if (avail >= 4 && p[1] >= lo && p[1] <= hi &&
+            UTF8_CONT(p[2]) && UTF8_CONT(p[3])) {
+            cp = (int32_t)(((uint32_t)(b0 & 0x07u) << 18) |
+                           ((uint32_t)(p[1] & 0x3Fu) << 12) |
+                           ((uint32_t)(p[2] & 0x3Fu) << 6) |
+                           (uint32_t)(p[3] & 0x3Fu));
+            len = 4;
+        }
+    }
+
     if (outLen != NULL) *outLen = len;
     return cp;
 }
@@ -611,46 +734,91 @@ int jaiUtf8Encode(int32_t cp, char *out) {
 size_t jaiUtf8Length(const char *s, size_t len) {
     if (s == NULL) return 0;
 
-    const char *p   = s;
-    const char *end = s + len;
+    const char *p = s;
+    const char *const end = s + len;
     size_t count = 0;
 
     while (p < end) {
-        /* An ASCII run's scalar count is its byte count, so skip it eight
-         * bytes at a time rather than decoding each one. `len()` on the 2.3 MB
-         * string tests/bench/string_build joins was 8% of that benchmark, all
-         * of it in the per-byte decoder. */
-        while (end - p >= (ptrdiff_t)sizeof(uint64_t)) {
+        /*
+         * 16-byte ASCII fast path using unaligned-safe memcpy loads. Two words
+         * at once reduce loop branches on long source files and joined strings.
+         */
+        while ((size_t)(end - p) >= 16u) {
+            uint64_t a, b;
+            memcpy(&a, p, sizeof a);
+            memcpy(&b, p + 8, sizeof b);
+
+            if ((a | b) & UINT64_C(0x8080808080808080))
+                break;
+
+            p += 16;
+            count += 16;
+        }
+
+        while ((size_t)(end - p) >= 8u) {
             uint64_t word;
             memcpy(&word, p, sizeof word);
-            if (word & UINT64_C(0x8080808080808080)) break;
-            p += sizeof word;
-            count += sizeof word;
+
+            if (word & UINT64_C(0x8080808080808080))
+                break;
+
+            p += 8;
+            count += 8;
         }
-        while (p < end && (unsigned char)*p < 0x80) { p++; count++; }
-        if (p >= end) break;
+
+        while (p < end && (unsigned char)*p < 0x80u) {
+            ++p;
+            ++count;
+        }
+
+        if (p >= end)
+            break;
 
         int step = 1;
-        jaiUtf8Decode(p, end, &step);   /* invalid bytes count as one scalar */
+        (void)jaiUtf8Decode(p, end, &step);
         p += step;
-        count++;
+        ++count;
     }
+
     return count;
 }
 
 size_t jaiUtf8Offset(const char *s, size_t len, size_t i) {
     if (s == NULL) return 0;
 
-    const char *p   = s;
-    const char *end = s + len;
+    const char *p = s;
+    const char *const end = s + len;
     size_t seen = 0;
 
     while (p < end && seen < i) {
+        size_t remaining = i - seen;
+
+        while (remaining >= 8u && (size_t)(end - p) >= 8u) {
+            uint64_t word;
+            memcpy(&word, p, sizeof word);
+
+            if (word & UINT64_C(0x8080808080808080))
+                break;
+
+            p += 8;
+            seen += 8;
+            remaining -= 8;
+        }
+
+        while (p < end && seen < i && (unsigned char)*p < 0x80u) {
+            ++p;
+            ++seen;
+        }
+
+        if (p >= end || seen >= i)
+            break;
+
         int step = 1;
-        jaiUtf8Decode(p, end, &step);
+        (void)jaiUtf8Decode(p, end, &step);
         p += step;
-        seen++;
+        ++seen;
     }
+
     return seen == i ? (size_t)(p - s) : len;
 }
 
@@ -658,14 +826,33 @@ bool jaiUtf8Validate(const char *s, size_t len) {
     if (len == 0) return true;
     if (s == NULL) return false;
 
-    const char *p   = s;
-    const char *end = s + len;
+    const char *p = s;
+    const char *const end = s + len;
 
     while (p < end) {
+        while ((size_t)(end - p) >= 8u) {
+            uint64_t word;
+            memcpy(&word, p, sizeof word);
+
+            if (word & UINT64_C(0x8080808080808080))
+                break;
+
+            p += 8;
+        }
+
+        while (p < end && (unsigned char)*p < 0x80u)
+            ++p;
+
+        if (p >= end)
+            break;
+
         int step = 1;
-        if (jaiUtf8Decode(p, end, &step) < 0) return false;
+        if (jaiUtf8Decode(p, end, &step) < 0)
+            return false;
+
         p += step;
     }
+
     return true;
 }
 
