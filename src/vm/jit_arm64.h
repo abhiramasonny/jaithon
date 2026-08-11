@@ -1,6 +1,7 @@
 #ifndef JAI_VM_JIT_ARM64_H
 #define JAI_VM_JIT_ARM64_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* The handful of arm64 instructions the compiled loop needs.
@@ -117,6 +118,11 @@ uint32_t jaiA64FcmpD(unsigned rn, unsigned rm);
 uint32_t jaiA64FmovDD(unsigned rd, unsigned rn);
 /* fmov Dd, Xn -- the general register's 64 bits, reinterpreted; NOT a convert */
 uint32_t jaiA64FmovDX(unsigned rd, unsigned rn);
+
+/* FMOV (scalar, immediate). `imm8` is the encoded form, not the number; see
+ * jaiA64FpImm8, which finds it or reports that the value has none. */
+uint32_t jaiA64FmovDImm(unsigned rd, unsigned imm8);
+bool jaiA64FpImm8(double v, unsigned *imm8);
 /* fmov Xd, Dn -- the fp register's 64 bits, reinterpreted; NOT a convert */
 uint32_t jaiA64FmovXD(unsigned rd, unsigned rn);
 /* scvtf Dd, Xn -- signed int64 to double; this one is the real conversion */

@@ -388,6 +388,23 @@ typedef enum {
 #define JIT_FSCRATCH_A 0u
 #define JIT_FSCRATCH_B 1u
 
+/* ...and that measured 3.7x. The recurrence `x2 = x*x; y2 = y*y; xy = x*y;
+ * y = 2*xy + y0; x = x2 - y2 + x0` runs at 3.3ns an iteration with its doubles
+ * in d registers and 12.1ns with them in X registers and an fmov pair per
+ * operation -- worse, in fact, than leaving them in memory and loading them
+ * straight into d registers, which is 8.5ns. The three instructions are not
+ * three instructions: each one is a cross-file move on the dependency chain.
+ *
+ * So a SLOT_FLOAT operand-stack entry may now *live* in an FP register between
+ * the instruction that computes it and the one that consumes it. Entry i's
+ * canonical home is still x(19 + regBase + i); `fpLive` bit i says that copy is
+ * stale and v(16 + i) holds the value instead. The bank is v16..v25, which is
+ * caller-saved on purpose: nothing here is allowed to survive a call, so there
+ * is nothing for the prologue to preserve and no save set to get wrong. The
+ * index is shared with the X bank, so two live entries can never name the same
+ * FP register. */
+#define JIT_FP_BANK 16u
+
 static bool holdsRegister(SlotKind k) {
     return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC &&
            k != SLOT_NATIVE;
@@ -555,6 +572,7 @@ typedef struct {
         /* The topmost entry is the result of a call that already happened, so
          * it lives in the descriptor rather than a register. */
         bool     lastFromDesc;
+        uint32_t fpLive;
         int      stub;
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
@@ -572,6 +590,18 @@ typedef struct {
     bool      sawReturn;
 
     bool      failed;
+
+    /* Value entries whose payload is in v(16 + index) rather than in their X
+     * register. See JIT_FP_BANK. */
+    uint32_t  fpLive;
+    bool      fpOff;         /* the retry that puts every float back in X */
+    /* Offsets this walk carried an FP-resident value *into*. A branch that
+     * lands on one of them would arrive with the value only in X, so the
+     * compile is declined and retried with fpOff. Straight-line float
+     * expressions are never branch targets, so this is a safety net rather
+     * than a path; JAI_JIT_WHY says so when it fires. */
+    uint32_t  fpCarry[64];
+    unsigned  fpCarryCount;
 } Emit;
 
 static void emit(Emit *e, uint32_t word) {
@@ -718,6 +748,43 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
     emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot) + 8));
 }
 
+/* The float half of localIn/localOut. A float local reached through the FP
+ * bank never visits an X register at all: in memory mode that turns
+ * `ldr x; fmov d, x` into one `ldr d` and `fmov x, d; str x` into one `str d`,
+ * which is the difference between 14.5ns and 8.5ns an iteration on the
+ * mandelbrot recurrence. Only for a local whose kind is fixed -- a dynamic one
+ * has a tag to check and goes the ordinary way. */
+static void localInFp(Emit *e, unsigned slot, unsigned dst) {
+    if (e->osr && e->osrRegLocals) {
+        emit(e, jaiA64FmovDX(dst, localReg(e, slot)));
+        return;
+    }
+    if (e->osr) {
+        emit(e, jaiA64LdrD(dst, JIT_SLOTS_REG, slot * 16u + 8u));
+        return;
+    }
+    if (!e->spilled) {
+        emit(e, jaiA64FmovDX(dst, localReg(e, slot)));
+        return;
+    }
+    emit(e, jaiA64LdrD(dst, 31, localFrameOff(e, slot) + 8));
+}
+
+static void localOutFp(Emit *e, unsigned slot, unsigned src) {
+    if ((e->osr && e->osrRegLocals) || (!e->osr && !e->spilled)) {
+        emit(e, jaiA64FmovXD(localReg(e, slot), src));
+        return;
+    }
+    emit(e, jaiA64MovzX(JIT_SCRATCH_D, VAL_FLOAT, 0));
+    if (e->osr) {
+        emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, slot * 16u));
+        emit(e, jaiA64StrD(src, JIT_SLOTS_REG, slot * 16u + 8u));
+        return;
+    }
+    emit(e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(e, slot)));
+    emit(e, jaiA64StrD(src, 31, localFrameOff(e, slot) + 8));
+}
+
 /* Slots the body may name at all. */
 static bool localInRange(Emit *e, unsigned slot) {
     if (e->osr) {
@@ -748,6 +815,41 @@ static unsigned pushReg(const Emit *e) {
            e->valueDepth;
 }
 
+/* The X register value entry `idx` belongs in, counting from the bottom of the
+ * operand stack rather than from the top the way pushReg does. */
+static unsigned valueXReg(const Emit *e, unsigned idx) {
+    return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) + idx;
+}
+
+static unsigned fpRegAt(unsigned idx) { return JIT_FP_BANK + idx; }
+
+/* Put entry `idx` back where every other part of this file expects it. */
+static void fpSyncOne(Emit *e, unsigned idx) {
+    if (!(e->fpLive & (1u << idx))) return;
+    e->fpLive &= ~(1u << idx);
+    emit(e, jaiA64FmovXD(valueXReg(e, idx), fpRegAt(idx)));
+}
+
+static void fpSyncAll(Emit *e) {
+    if (e->fpLive == 0) return;
+    for (unsigned i = 0; i < JIT_MAX_SAVED; i++) fpSyncOne(e, i);
+}
+
+/* A d register holding entry `idx`, loaded from its X register if that is
+ * where it still is. Leaves fpLive alone: after this the two copies agree, and
+ * claiming the X one is stale when it is not would cost a sync for nothing. */
+static unsigned fpOperand(Emit *e, unsigned idx) {
+    unsigned d = fpRegAt(idx);
+    if (!(e->fpLive & (1u << idx))) {
+        emit(e, jaiA64FmovDX(d, valueXReg(e, idx)));
+    }
+    return d;
+}
+
+/* Entry `idx` has just been computed into v(16 + idx); its X register is now
+ * stale until something asks for it. */
+static void fpClaim(Emit *e, unsigned idx) { e->fpLive |= 1u << idx; }
+
 static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
                        Value seen, int fromLocal) {
     if (e->depth >= JIT_MAX_SAVED) {
@@ -765,6 +867,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackSeen[e->depth]  = seen;
     e->stackLocal[e->depth] = fromLocal;
     e->stack[e->depth++] = kind;
+    e->fpLive &= ~(1u << e->valueDepth);
     e->valueDepth++;
     if (e->valueDepth > e->maxValue) e->maxValue = e->valueDepth;
     return true;
@@ -810,14 +913,24 @@ static bool pushSelf(Emit *e) {
 }
 
 /* Pop a value entry, reporting the register it was in and what it held. */
-static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
+/* Pop an entry that has already been read out of its FP register, or that was
+ * never in one. Only the float paths may call this; everything else goes
+ * through popValue, which materialises first. */
+static bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
     e->depth--;
     e->valueDepth--;
+    e->fpLive &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
     *reg = JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) +
            e->valueDepth;
     return true;
+}
+
+static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
+    if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
+    fpSyncOne(e, e->valueDepth - 1);
+    return popValueRaw(e, reg, kind);
 }
 
 /* Depth and the kind of every entry, in one word. Registers are assigned from
@@ -929,6 +1042,10 @@ static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
 static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    /* A join has to agree about where every value is, so nothing crosses a
+     * branch in an FP register. fmov does not touch NZCV, so this is still
+     * safe after the compare that set the condition. */
+    fpSyncAll(e);
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
         (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
         targetOffset = exitTargetFor(e, targetOffset);
@@ -970,6 +1087,7 @@ static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
     e->deopt[k].depth        = e->depth;
     e->deopt[k].valueDepth   = e->valueDepth;
     e->deopt[k].lastFromDesc = lastFromDesc;
+    e->deopt[k].fpLive       = e->fpLive;
     for (unsigned i = 0; i < e->depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
@@ -994,6 +1112,7 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
     e->deopt[k].ip         = e->curOffset;
     e->deopt[k].depth      = e->depth;
     e->deopt[k].valueDepth = e->valueDepth;
+    e->deopt[k].fpLive     = e->fpLive;
     for (unsigned i = 0; i < e->depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
@@ -1021,6 +1140,7 @@ static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    fpSyncAll(e);
     if (e->wroteHeap) e->bailAfterWrite = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
@@ -1039,6 +1159,7 @@ static void branchOnCondition(Emit *e, unsigned cond) {
  * instead of raising, which is a wrong answer, not a crash. */
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    fpSyncAll(e);
     e->overflowUsed[which] = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
@@ -1750,6 +1871,60 @@ static bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     return true;
 }
 
+/* Opcodes that know how to take a float operand out of the FP bank. Every
+ * other opcode sees the model exactly as it did before this existed, because
+ * the dispatch loop materialises everything before handing it one. Adding an
+ * opcode here without teaching it fpOperand is a miscompile, not a decline --
+ * that is the whole risk of this design, and the reason the list is short. */
+static bool fpFastOp(uint8_t op) {
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
+    case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
+    case OP_GET_LOCAL: case OP_GET_LOCAL2:
+    case OP_ADD_LOCALS: case OP_BIND: case OP_SET_LOCAL:
+    /* These three only ever write the entry they push, and the type guard at
+     * a `float` boundary on something already float emits nothing at all --
+     * it sat between the ADD and the BIND in mandelbrot's `x = x2 - y2 + x0`
+     * and made the whole expression materialise for nothing. */
+    case OP_CONST: case OP_INT: case OP_TYPE_GUARD:
+    case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+    case OP_EQ: case OP_NE:
+    case OP_JUMP_IF_CMP_FALSE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Whether it is worth loading a float local into the FP bank at all.
+ *
+ * `sum += a[i][k] * b[k][j]` reads `sum` and then does a great deal that is
+ * not float arithmetic, so the bank entry is materialised again immediately:
+ * `ldr d; fmov x` where `ldr x` would have done, and the extra cross-domain
+ * hop lands on the loop-carried chain. matrix_mul lost 25% to exactly that
+ * before this test existed. One opcode of lookahead is enough, because the
+ * only way a bank entry survives is for the very next instruction to be one
+ * that knows about it. */
+static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
+                           int stop) {
+    if (e->fpOff) return false;
+    if (next >= stop) return false;
+    /* A *consumer*, not merely another opcode on the list: `sum` in
+     * matrix_mul is followed by OP_GET_LOCAL2, which is on the list and yet
+     * has the whole of `a[i][k]` between it and any float operator. */
+    switch (code[next]) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
+    case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
+    case OP_BIND: case OP_SET_LOCAL:
+    case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+    case OP_EQ: case OP_NE:
+    case OP_JUMP_IF_CMP_FALSE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -1767,6 +1942,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         e->lastOp = op;
         e->curOffset = (uint32_t)off;
 
+        if (e->fpLive != 0) {
+            bool joinsHere = false;
+            for (unsigned f = 0; f < e->fixupCount && !joinsHere; f++) {
+                joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
+            }
+            if (!fpFastOp(op) || joinsHere) {
+                fpSyncAll(e);
+            } else if (e->fpCarryCount < 64) {
+                e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
+            } else {
+                fpSyncAll(e);
+            }
+        }
+
         switch (op) {
         case OP_GET_LOCAL: {
             unsigned slot = jaiReadU16(code + off + 1);
@@ -1780,7 +1969,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                             (int)slot)) {
                 return false;
             }
-            {
+            if (e->localKind[slot] == SLOT_FLOAT && !e->dynamicLocal[slot] &&
+                fpWorthLoading(e, code, off + 3, stop)) {
+                unsigned idx = e->valueDepth - 1;
+                localInFp(e, slot, fpRegAt(idx));
+                fpClaim(e, idx);
+            } else {
                 unsigned dst = pushReg(e) - 1;
                 unsigned src = localIn(e, slot, dst);
                 if (src != dst) emit(e, jaiA64MovX(dst, src));
@@ -1824,7 +2018,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
             }
-            localOut(e, slot, pushReg(e) - 1);
+            if (!e->fpOff && !e->dynamicLocal[slot] &&
+                e->stack[e->depth - 1] == SLOT_FLOAT &&
+                (e->fpLive & (1u << (e->valueDepth - 1)))) {
+                localOutFp(e, slot, fpRegAt(e->valueDepth - 1));
+            } else {
+                localOut(e, slot, pushReg(e) - 1);
+            }
             off += 3;
             break;
         }
@@ -1838,6 +2038,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka2 != SLOT_INT && ka2 != SLOT_FLOAT) return false;
             if (a == 0 || b == 0) e->usesSlot0 = true;
             if (!pushValue(e, ka2, 0, NULL)) return false;
+            if (ka2 == SLOT_FLOAT && !e->dynamicLocal[a] &&
+                !e->dynamicLocal[b] && !e->fpOff) {
+                unsigned idx = e->valueDepth - 1;
+                localInFp(e, a, fpRegAt(idx));
+                localInFp(e, b, JIT_FP_BANK + JIT_MAX_SAVED);
+                emit(e, jaiA64FaddD(fpRegAt(idx), fpRegAt(idx),
+                                    JIT_FP_BANK + JIT_MAX_SAVED));
+                fpClaim(e, idx);
+                off += 5;
+                break;
+            }
             {
                 unsigned ra2 = localIn(e, a, JIT_SCRATCH_C);
                 unsigned rb2 = localIn(e, b, JIT_SCRATCH_D);
@@ -1862,6 +2073,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned slot = jaiReadU16(code + off + 1);
             if (!localInRange(e, slot)) return false;
             if (slot == 0) e->usesSlot0 = true;
+            if (!e->fpOff && e->depth >= 2 && !e->dynamicLocal[slot] &&
+                e->stack[e->depth - 1] == SLOT_FLOAT &&
+                e->stack[e->depth - 2] == SLOT_FLOAT) {
+                /* The whole operation stays in the FP bank: two operands that
+                 * are already there, one instruction, and a store straight out
+                 * of a d register. */
+                if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
+                    e->whyNot = "a local was given two different kinds";
+                    return false;
+                }
+                unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
+                unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+                unsigned rx; SlotKind kx;
+                if (!popValueRaw(e, &rx, &kx)) return false;
+                if (!popValueRaw(e, &rx, &kx)) return false;
+                emit(e, jaiA64FaddD(fpRegAt(ia), da, db));
+                localOutFp(e, slot, fpRegAt(ia));
+                off += 3;
+                break;
+            }
             unsigned rb, ra;
             SlotKind kb, ka;
             if (!popValue(e, &rb, &kb)) return false;
@@ -1910,6 +2141,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned slot = jaiReadU16(code + off + 1);
             if (!localInRange(e, slot)) return false;
             if (slot == 0) e->usesSlot0 = true;
+            if (!e->fpOff && e->depth >= 2 && !e->dynamicLocal[slot] &&
+                e->stack[e->depth - 1] == SLOT_FLOAT &&
+                e->stack[e->depth - 2] == SLOT_FLOAT) {
+                /* The whole operation stays in the FP bank: two operands that
+                 * are already there, one instruction, and a store straight out
+                 * of a d register. */
+                if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
+                    e->whyNot = "a local was given two different kinds";
+                    return false;
+                }
+                unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
+                unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+                unsigned rx; SlotKind kx;
+                if (!popValueRaw(e, &rx, &kx)) return false;
+                if (!popValueRaw(e, &rx, &kx)) return false;
+                emit(e, jaiA64FmulD(fpRegAt(ia), da, db));
+                localOutFp(e, slot, fpRegAt(ia));
+                off += 3;
+                break;
+            }
             unsigned rb, ra;
             SlotKind kb, ka;
             if (!popValue(e, &rb, &kb)) return false;
@@ -1943,6 +2194,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned slot = jaiReadU16(code + off + 1);
             if (!localInRange(e, slot)) return false;
             if (slot == 0) e->usesSlot0 = true;
+            if (!e->fpOff && e->depth >= 2 && !e->dynamicLocal[slot] &&
+                e->stack[e->depth - 1] == SLOT_FLOAT &&
+                e->stack[e->depth - 2] == SLOT_FLOAT) {
+                /* The whole operation stays in the FP bank: two operands that
+                 * are already there, one instruction, and a store straight out
+                 * of a d register. */
+                if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
+                    e->whyNot = "a local was given two different kinds";
+                    return false;
+                }
+                unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
+                unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+                unsigned rx; SlotKind kx;
+                if (!popValueRaw(e, &rx, &kx)) return false;
+                if (!popValueRaw(e, &rx, &kx)) return false;
+                emit(e, jaiA64FsubD(fpRegAt(ia), da, db));
+                localOutFp(e, slot, fpRegAt(ia));
+                off += 3;
+                break;
+            }
             unsigned rb, ra;
             SlotKind kb, ka;
             if (!popValue(e, &rb, &kb)) return false;
@@ -1981,6 +2252,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     e->stackSeen[e->depth - 1])) {
                 e->whyNot = "a local was given two different kinds";
                 return false;
+            }
+            if (!e->fpOff && !e->dynamicLocal[slot] &&
+                e->stack[e->depth - 1] == SLOT_FLOAT &&
+                (e->fpLive & (1u << (e->valueDepth - 1)))) {
+                unsigned idx = e->valueDepth - 1;
+                unsigned r2; SlotKind k2;
+                if (!popValueRaw(e, &r2, &k2)) return false;
+                localOutFp(e, slot, fpRegAt(idx));
+                off += 3;
+                break;
             }
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
@@ -2039,9 +2320,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             default:    cond = ka == SLOT_FLOAT ? JAI_A64_GE : JAI_A64_GE; break;
             }
             if (ka == SLOT_FLOAT) {
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
-                emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+                /* Both operands stay where they are: the compare reads the
+                 * FP bank, and the NaN guard's stub knows how to write an
+                 * FP-resident entry out if it is ever taken. */
+                unsigned db = fpOperand(e, e->valueDepth - 1);
+                unsigned da = fpOperand(e, e->valueDepth - 2);
+                emit(e, jaiA64FcmpD(da, db));
                 nanToDeopt(e);
             } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
@@ -2069,8 +2353,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
             unsigned dropA, dropB;
-            if (!popValue(e, &dropB, NULL)) return false;
-            if (!popValue(e, &dropA, NULL)) return false;
+            /* Raw: the compare has read both, they are going away, and
+             * materialising them would put an fmov on the hot path for a
+             * register nothing will read. */
+            if (!popValueRaw(e, &dropB, NULL)) return false;
+            if (!popValueRaw(e, &dropA, NULL)) return false;
             if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
             emit(e, jaiA64CsetX(pushReg(e) - 1, cond));
             off += 1;
@@ -2131,9 +2418,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 case OP_NE: cond = JAI_A64_EQ; break;
                 default: return false;
                 }
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
-                emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+                /* Both operands stay where they are: the compare reads the
+                 * FP bank, and the NaN guard's stub knows how to write an
+                 * FP-resident entry out if it is ever taken. */
+                unsigned db = fpOperand(e, e->valueDepth - 1);
+                unsigned da = fpOperand(e, e->valueDepth - 2);
+                emit(e, jaiA64FcmpD(da, db));
                 nanToDeopt(e);
             } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
@@ -2192,12 +2482,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emitConst64(e, pushReg(e) - 1, AS_INT(k));
             } else if (IS_FLOAT(k)) {
                 /* The bits, not the number: a float lives in an X register
-                 * exactly as it does in a Value's payload. */
+                 * exactly as it does in a Value's payload -- unless the value
+                 * is one FMOV's eight-bit immediate can name, in which case it
+                 * goes straight to the FP bank in one instruction instead of
+                 * two into an X register and an fmov out of it. */
                 double d = AS_FLOAT(k);
                 int64_t bits;
                 memcpy(&bits, &d, sizeof bits);
                 if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
-                emitConst64(e, pushReg(e) - 1, bits);
+                unsigned imm8;
+                if (!e->fpOff && jaiA64FpImm8(d, &imm8)) {
+                    unsigned idx = e->valueDepth - 1;
+                    emit(e, jaiA64FmovDImm(fpRegAt(idx), imm8));
+                    fpClaim(e, idx);
+                } else {
+                    emitConst64(e, pushReg(e) - 1, bits);
+                }
             } else if (IS_BOOL(k)) {
                 if (!pushValue3(e, SLOT_BOOL, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, AS_BOOL(k) ? 1 : 0);
@@ -2322,21 +2622,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_MUL: {
             unsigned rb, ra;
             SlotKind kb, ka;
-            if (!popValue(e, &rb, &kb)) return false;
-            if (!popValue(e, &ra, &ka)) return false;
-            if (ka != kb) return false;
-
-            if (ka == SLOT_FLOAT) {
+            if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_FLOAT &&
+                e->stack[e->depth - 2] == SLOT_FLOAT) {
+                unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
+                unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+                if (!popValueRaw(e, &rb, &kb)) return false;
+                if (!popValueRaw(e, &ra, &ka)) return false;
                 if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
-                unsigned rf = pushReg(e) - 1;
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
-                emit(e, jaiA64FmulD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
-                                    JIT_FSCRATCH_B));
-                emit(e, jaiA64FmovXD(rf, JIT_FSCRATCH_A));
+                emit(e, jaiA64FmulD(fpRegAt(ia), da, db));
+                fpClaim(e, ia);
                 off += 1;
                 break;
             }
+            if (!popValue(e, &rb, &kb)) return false;
+            if (!popValue(e, &ra, &ka)) return false;
+            if (ka != kb) return false;
             if (ka != SLOT_INT) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
@@ -2400,27 +2700,24 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_DIV: {
             unsigned rb, ra;
             SlotKind kb, ka;
-            if (!popValue(e, &rb, &kb)) return false;
-            if (!popValue(e, &ra, &ka)) return false;
-            if (ka != kb) return false;   /* no implicit widening here */
-
-            if (ka == SLOT_FLOAT) {
+            if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_FLOAT &&
+                e->stack[e->depth - 2] == SLOT_FLOAT) {
+                unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
+                unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+                if (!popValueRaw(e, &rb, &kb)) return false;
+                if (!popValueRaw(e, &ra, &ka)) return false;
                 if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
-                unsigned rd = pushReg(e) - 1;
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ra));
-                emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, rb));
-                emit(e, op == OP_ADD
-                            ? jaiA64FaddD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
-                                          JIT_FSCRATCH_B)
-                        : op == OP_SUB
-                            ? jaiA64FsubD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
-                                          JIT_FSCRATCH_B)
-                            : jaiA64FdivD(JIT_FSCRATCH_A, JIT_FSCRATCH_A,
-                                          JIT_FSCRATCH_B));
-                emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
+                unsigned dd = fpRegAt(ia);
+                emit(e, op == OP_ADD ? jaiA64FaddD(dd, da, db)
+                     : op == OP_SUB  ? jaiA64FsubD(dd, da, db)
+                                     : jaiA64FdivD(dd, da, db));
+                fpClaim(e, ia);
                 off += 1;
                 break;
             }
+            if (!popValue(e, &rb, &kb)) return false;
+            if (!popValue(e, &ra, &ka)) return false;
+            if (ka != kb) return false;   /* no implicit widening here */
 
             /* Integer division is not here: it has a zero-divisor error and a
              * truncation rule of its own, and getting either wrong would be a
@@ -2603,7 +2900,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                 (int)slot)) {
                     return false;
                 }
-                {
+                if (e->localKind[slot] == SLOT_FLOAT &&
+                    !e->dynamicLocal[slot] &&
+                    fpWorthLoading(e, code, off + 5, stop)) {
+                    unsigned idx = e->valueDepth - 1;
+                    localInFp(e, slot, fpRegAt(idx));
+                    fpClaim(e, idx);
+                } else {
                     unsigned dst = pushReg(e) - 1;
                     unsigned src = localIn(e, slot, dst);
                     if (src != dst) emit(e, jaiA64MovX(dst, src));
@@ -4280,6 +4583,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             return false;   /* an opcode this tier does not speak */
         }
     }
+    fpSyncAll(e);
+    /* Nothing may branch to an offset this walk carried a float into: the
+     * branch would arrive with that value only in its X register, and the
+     * instruction there would read the FP bank. Declining is the safe answer,
+     * and the caller retries with the FP bank turned off. */
+    for (unsigned i = 0; i < e->fpCarryCount; i++) {
+        for (unsigned f = 0; f < e->fixupCount; f++) {
+            if (e->fixups[f].targetOffset != e->fpCarry[i]) continue;
+            e->whyNot = "a branch lands inside a float expression";
+            return false;
+        }
+    }
     return !e->failed;
 }
 
@@ -4762,6 +5077,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             }
             unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
                             (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            /* The stub is reached by a branch from the guard, so the FP bank
+             * still holds whatever it held there. Moving it here rather than
+             * before the guard is what keeps the hot path free of it. */
+            if (e.deopt[k].fpLive & (1u << valueSeen)) {
+                emit(&e, jaiA64FmovXD(reg0, fpRegAt(valueSeen)));
+            }
             if (kind == SLOT_MAYBE_INST) {
                 emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
@@ -5374,6 +5695,9 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             }
             unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
                             (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            if (e.deopt[k].fpLive & (1u << valueSeen)) {
+                emit(&e, jaiA64FmovXD(reg0, fpRegAt(valueSeen)));
+            }
             if (kind == SLOT_MAYBE_INST) {
                 emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
@@ -5385,7 +5709,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
                                               : VAL_OBJ;
-            unsigned reg = JIT_FIRST_SAVED + regBase(&e) + valueSeen;
+            unsigned reg = JIT_FIRST_SAVED + regBase(&e) +
+                           (e.usesUpvalues ? 1u : 0u) + valueSeen;
             valueSeen++;
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));

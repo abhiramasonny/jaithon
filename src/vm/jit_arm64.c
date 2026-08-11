@@ -1,5 +1,7 @@
 #include "jit_arm64.h"
 
+#include <string.h>
+
 uint32_t jaiA64LdrX(unsigned rt, unsigned rn, unsigned offset) {
     return 0xf9400000u | ((offset / 8u) << 10) | (rn << 5) | rt;
 }
@@ -205,6 +207,31 @@ uint32_t jaiA64FmovDD(unsigned rd, unsigned rn) {
  * zero, not 1.0. Use scvtf when a number is meant. */
 uint32_t jaiA64FmovDX(unsigned rd, unsigned rn) {
     return 0x9e670000u | (rn << 5) | rd;
+}
+
+uint32_t jaiA64FmovDImm(unsigned rd, unsigned imm8) {
+    return 0x1e601000u | ((imm8 & 0xffu) << 13) | rd;
+}
+
+/* The eight-bit form covers +-(1 + m/16) * 2^e for m in 0..15 and e in -3..4,
+ * which is where the constants in float code actually live: 0.5, 2.0, 4.0,
+ * 0.25. Zero is not in it -- the format has an implicit leading one -- so
+ * `x = 0.0` still goes the long way round, which is right, since it is not in
+ * a loop. Rather than reproduce VFPExpandImm's bit surgery backwards, this
+ * builds each of the 256 values and compares: it runs at compile time, once
+ * per constant, and it cannot be subtly wrong the way an inverse would be. */
+bool jaiA64FpImm8(double v, unsigned *imm8) {
+    for (unsigned i = 0; i < 256; i++) {
+        unsigned s = (i >> 7) & 1u, b = (i >> 6) & 1u;
+        unsigned cd = (i >> 4) & 3u, efgh = i & 15u;
+        uint64_t exp = ((uint64_t)(b ? 0u : 1u) << 10) |
+                       ((uint64_t)(b ? 0xffu : 0u) << 2) | cd;
+        uint64_t bits = ((uint64_t)s << 63) | (exp << 52) | ((uint64_t)efgh << 48);
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        if (d == v) { *imm8 = i; return true; }
+    }
+    return false;
 }
 
 /* fmov Xd, Dn -- the same transfer group with opcode 6, the other direction.
