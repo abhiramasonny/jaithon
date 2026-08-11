@@ -71,7 +71,7 @@ static struct {
  * this is remembered rather than acted on; jaiReplRun turns it into the exit
  * status. A warning is not one of these, and does not reach here unless the
  * session was asked to treat warnings as errors. */
-static void replNoteFailure(void) { gRepl.failed = true; }
+static inline void replNoteFailure(void) { gRepl.failed = true; }
 
 static void replError(const char *fmt, ...) JAI_PRINTF(1, 2);
 
@@ -107,21 +107,14 @@ static bool replFlushDiags(void) {
     return hadErrors;
 }
 
-static const char *skipSpace(const char *s) {
-    while (*s == ' ' || *s == '\t' || *s == '\r') s++;
+static inline const char *skipSpace(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r') ++s;
     return s;
 }
 
 /* Names the implementation owns are noise in :vars and in completion. */
-static bool isHiddenName(const char *name) {
+static inline bool isHiddenName(const char *name) {
     return name[0] == '_' && name[1] == '_';
-}
-
-/* The lexer reads up to the NUL as well as the length, so the accumulated
- * input must always have one just past its last byte. */
-static void bufTerminate(JaiBuf *b) {
-    jaiBufPush(b, '\0');
-    b->count--;
 }
 
 static void freeLine(char *line) {
@@ -154,10 +147,14 @@ static bool replTypeOf(int argc, Value *args, Value *out) {
 }
 
 static void defineHelper(ObjModule *module, const char *name, JaiNativeFn fn) {
+    ObjString *key = jaiStringInternC(name);
+    jaiPushRoot(OBJ_VAL(key));
+
     ObjNative *native = jaiNativeNew(fn, name, 1, 1, NULL);
     jaiPushRoot(OBJ_VAL(native));
-    jaiModuleSet(module, jaiStringInternC(name), OBJ_VAL(native));
-    jaiPopRoot();
+
+    jaiModuleSet(module, key, OBJ_VAL(native));
+    jaiPopRoots(2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -182,27 +179,31 @@ static void defineHelper(ObjModule *module, const char *name, JaiNativeFn fn) {
 
 static bool replInit(void) {
     if (gRepl.module != NULL) return true;
+
     if (vm.builtins == NULL) {
         replError("the virtual machine is not running");
         return false;
     }
 
     gRepl.codegen = jaiCodegenDefaults();
-    gRepl.codegen.debugInfo = true;   /* tracebacks are the point of a REPL */
+    gRepl.codegen.debugInfo = true;
     gRepl.strict = getenv("JAITHON_STRICT") != NULL;
 
     ObjString *path = jaiStringInternC("<repl>");
     jaiPushRoot(OBJ_VAL(path));
-    ObjModule *module = jaiModuleNew(jaiStringInternC("__repl__"), path);
+
+    ObjString *name = jaiStringInternC("__repl__");
+    jaiPushRoot(OBJ_VAL(name));
+
+    ObjModule *module = jaiModuleNew(name, path);
     jaiPushRoot(OBJ_VAL(module));
     module->state = MOD_LOADED;
 
-    /* vm.modules is a GC root, so registering the module is also what keeps it
-     * alive between lines. */
     jaiTableSet(&vm.modules, OBJ_VAL(path), OBJ_VAL(module));
     defineHelper(module, "__repl_echo__", replEcho);
     defineHelper(module, "__repl_type__", replTypeOf);
-    jaiPopRoots(2);
+
+    jaiPopRoots(3);
 
     gRepl.module = module;
     if (vm.mainModule == NULL) vm.mainModule = module;
@@ -310,30 +311,33 @@ static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
 /* Print the syntax tree for one input, the way `jaithon ast` prints it. */
 static void replPrintTree(const char *source, size_t length, int fileId) {
     ObjString *dump = jaiFrontEndAstText(source, length, "<repl>", fileId, false);
+
+    if (dump != NULL)
+        jaiPushRoot(OBJ_VAL(dump));
+
     (void)replFlushDiags();
+
     if (dump == NULL) {
-        /* The front end threw on an input the prompt already decided was
-         * whole, so the tree is the thing that does not exist. */
         jaiClearException();
         return;
     }
+
     fwrite(dump->chars, 1, dump->length, stdout);
     fputc('\n', stdout);
+    jaiPopRoot();
 }
 
 /* Compile one complete input against the persistent module and act on it.
  * Diagnostics and uncaught exceptions are reported here; the session always
  * continues afterwards. */
-static void replExecute(const char *source, size_t length, ReplAction action,
-                        bool wholeFile, const char *label) {
-    if (!replInit()) return;
+static void replExecuteOwned(char *owned, size_t length, ReplAction action,
+                              bool wholeFile, const char *label) {
+    if (!replInit()) {
+        JAI_FREE_ARRAY(char, owned, length + 1);
+        return;
+    }
 
-    /* jaiSourceAdd takes ownership: the copy outlives this function because
-     * compiled chunks refer to it by file id for tracebacks. */
-    char *owned = jaiMemdup(source, length);
-    int fileId = jaiSourceAdd(label, owned, length);
-    /* The front end stamps this id into every span it reports and into the line
-     * table, so a diagnostic can name a column and a traceback a line. */
+    const int fileId = jaiSourceAdd(label, owned, length);
     gRepl.module->sourceFileId = fileId;
 
     if (action == REPL_AST) {
@@ -342,52 +346,62 @@ static void replExecute(const char *source, size_t length, ReplAction action,
     }
 
     JaiReplCompileOptions opts;
-    opts.path      = label;
-    opts.fileId    = fileId;
-    opts.optLevel  = gRepl.codegen.optLevel;
+    opts.path = label;
+    opts.fileId = fileId;
+    opts.optLevel = gRepl.codegen.optLevel;
     opts.wholeFile = wholeFile;
-    /* `:disasm` compiles an input and never runs it, so what it declares is
-     * not the session's. */
-    opts.record    = action != REPL_DISASM;
-    /* `from m import T` at the prompt looks where the prompt was started, the
-     * way the C resolver did. The label names no directory of its own. */
+    opts.record = action != REPL_DISASM;
+
     char cwd[JAI_MAX_PATH];
     opts.sourceDir = getcwd(cwd, sizeof cwd) != NULL ? cwd : "";
-    opts.strict    = gRepl.strict;
-    /* Every line is a fragment of a session that is already running. */
+    opts.strict = gRepl.strict;
     opts.lateGlobals = true;
-    opts.echo      = action == REPL_EXEC ? "__repl_echo__"
-                   : action == REPL_TYPE ? "__repl_type__"
-                                         : NULL;
+    opts.echo = action == REPL_EXEC ? "__repl_echo__"
+              : action == REPL_TYPE ? "__repl_type__"
+                                    : NULL;
 
     bool wasExpression = false;
-    ObjFunction *body = jaiFrontEndReplCompile(owned, length, &opts,
-                                               gRepl.module, &wasExpression);
+    ObjFunction *body =
+        jaiFrontEndReplCompile(owned, length, &opts,
+                               gRepl.module, &wasExpression);
 
-    /* `:type` is the one action that needs a value, and a statement has none.
-     * Asked after the compile because only the front end knows which of the two
-     * readings the line got. */
+    if (body != NULL)
+        jaiPushRoot(OBJ_VAL(body));
+
     if (action == REPL_TYPE && !wholeFile && !wasExpression) {
         jaiDiagReset(&gDiags);
         replError(":type expects an expression");
+        if (body != NULL) jaiPopRoot();
         return;
     }
 
-    if (replFlushDiags()) return;   /* an input with an error never runs */
-    /* No body and no diagnostic is an input with nothing in it -- a comment, a
-     * blank line -- which is not a failure. Everything that *is* one reports
-     * before getting here, and replFlushDiags has already noted it. */
-    if (body == NULL) return;
+    if (replFlushDiags()) {
+        if (body != NULL) jaiPopRoot();
+        return;
+    }
 
-    jaiPushRoot(OBJ_VAL(body));
+    if (body == NULL)
+        return;
+
     if (action == REPL_DISASM) {
         disassembleTree(stdout, body, 0);
     } else {
-        /* jaiVMRunModule prints the traceback of anything that escapes. */
-        if (jaiVMRunModule(gRepl.module, body) != JAI_RUN_OK) replNoteFailure();
-        gRepl.module->state = MOD_LOADED;   /* a bad line does not end the session */
+        if (jaiVMRunModule(gRepl.module, body) != JAI_RUN_OK)
+            replNoteFailure();
+        gRepl.module->state = MOD_LOADED;
     }
+
     jaiPopRoot();
+}
+
+static void replExecute(const char *source, size_t length, ReplAction action,
+                        bool wholeFile, const char *label) {
+    char *owned = jaiMemdup(source, length);
+    if (owned == NULL) {
+        replError("out of memory while copying REPL input");
+        return;
+    }
+    replExecuteOwned(owned, length, action, wholeFile, label);
 }
 
 static const char *nextLabel(void) {
@@ -444,28 +458,33 @@ static void metaVars(void) {
     int index = 0;
     int shown = 0;
     Value key, value;
+
     while (jaiTableNext(&gRepl.module->globals, &index, &key, &value)) {
         if (!IS_STRING(key)) continue;
+
         ObjString *name = AS_STRING(key);
         if (isHiddenName(name->chars)) continue;
 
         ObjString *text = jaiValueToRepr(value);
-        if (text == NULL) {           /* a throwing __repr__ must not kill :vars */
+
+        if (text == NULL) {
             jaiClearException();
             printf("  %-16s <unprintable>\n", name->chars);
+        } else if (text->length <= 57) {
+            printf("  %-16s %s\n", name->chars, text->chars);
         } else {
-            /* Elide at a scalar boundary: the terminal must never be handed
-             * half a UTF-8 sequence. */
             size_t cut = jaiUtf8Offset(text->chars, text->length, 57);
-            if (cut < text->length) {
+            if (cut < text->length)
                 printf("  %-16s %.*s...\n", name->chars, (int)cut, text->chars);
-            } else {
+            else
                 printf("  %-16s %s\n", name->chars, text->chars);
-            }
         }
-        shown++;
+
+        ++shown;
     }
-    if (shown == 0) fputs("  (no bindings yet)\n", stdout);
+
+    if (shown == 0)
+        fputs("  (no bindings yet)\n", stdout);
 }
 
 static void metaLoad(const char *path) {
@@ -473,14 +492,17 @@ static void metaLoad(const char *path) {
         replError(":load expects a path");
         return;
     }
+
     size_t length = 0;
     char *source = jaiReadFile(path, &length);
+
     if (source == NULL) {
         replError("cannot read %s", path);
         return;
     }
-    replExecute(source, length, REPL_QUIET, true, path);
-    JAI_FREE_ARRAY(char, source, length + 1);
+
+    /* Transfer the exact file buffer directly to the source registry. */
+    replExecuteOwned(source, length, REPL_QUIET, true, path);
 }
 
 /* Run one expression through the pipeline for :type / :ast / :disasm / :time. */
@@ -490,63 +512,76 @@ static void metaExpression(const char *command, const char *text,
         replError("%s expects an expression", command);
         return;
     }
-    size_t length = strlen(text);
+
+    const size_t length = strlen(text);
     JaiReplScan scan;
     replScan(text, length, &scan);
+
     if (scan.mismatched) {
         replReportMismatch(&scan);
         return;
     }
+
     if (scan.incomplete) {
         replError("%s: the expression is incomplete", command);
         return;
     }
 
-    double started = jaiClockMonotonic();
-    replExecute(text, length, action, false, nextLabel());
     if (action == REPL_EXEC) {
-        printf("time: %.3f ms\n", (jaiClockMonotonic() - started) * 1000.0);
+        const double started = jaiClockMonotonic();
+        replExecute(text, length, action, false, nextLabel());
+        printf("time: %.3f ms\n",
+               (jaiClockMonotonic() - started) * 1000.0);
+        return;
     }
+
+    replExecute(text, length, action, false, nextLabel());
 }
 
 /* Returns false when the command was `:quit`. */
 static bool replMeta(const char *line) {
-    const char *cursor = skipSpace(line + 1);
-    char command[32];
-    size_t n = 0;
-    while (cursor[n] != '\0' && cursor[n] != ' ' && cursor[n] != '\t' &&
-           n + 1 < sizeof command) {
-        command[n] = cursor[n];
-        n++;
-    }
-    command[n] = '\0';
-    const char *rest = skipSpace(cursor + n);
+    const char *command = skipSpace(line + 1);
+    const char *end = command;
 
-    if (strcmp(command, "help") == 0)   { metaHelp();  return true; }
-    if (strcmp(command, "vars") == 0)   { metaVars();  return true; }
-    if (strcmp(command, "quit") == 0)   { return false; }
-    if (strcmp(command, "clear") == 0)  { metaClear(); return true; }
-    if (strcmp(command, "reset") == 0)  {
+    while (*end != '\0' && *end != ' ' && *end != '\t')
+        ++end;
+
+    const size_t n = (size_t)(end - command);
+    const char *rest = skipSpace(end);
+
+#define META_IS(lit) \
+    (n == sizeof(lit) - 1u && memcmp(command, lit, sizeof(lit) - 1u) == 0)
+
+    if (META_IS("help"))   { metaHelp();  return true; }
+    if (META_IS("vars"))   { metaVars();  return true; }
+    if (META_IS("quit"))   { return false; }
+    if (META_IS("clear"))  { metaClear(); return true; }
+
+    if (META_IS("reset")) {
         replReset();
         fputs("session reset\n", stdout);
         return true;
     }
-    if (strcmp(command, "cancel") == 0) {
-        if (gRepl.pending.count == 0) {
+
+    if (META_IS("cancel")) {
+        if (gRepl.pending.count == 0)
             fputs("nothing to cancel\n", stdout);
-        } else {
+        else {
             gRepl.pending.count = 0;
             fputs("input cancelled\n", stdout);
         }
         return true;
     }
-    if (strcmp(command, "load") == 0)   { metaLoad(rest); return true; }
-    if (strcmp(command, "type") == 0)   { metaExpression(":type", rest, REPL_TYPE); return true; }
-    if (strcmp(command, "ast") == 0)    { metaExpression(":ast", rest, REPL_AST); return true; }
-    if (strcmp(command, "disasm") == 0) { metaExpression(":disasm", rest, REPL_DISASM); return true; }
-    if (strcmp(command, "time") == 0)   { metaExpression(":time", rest, REPL_EXEC); return true; }
 
-    replError("unknown meta-command `:%s`; :help lists them all", command);
+    if (META_IS("load"))   { metaLoad(rest); return true; }
+    if (META_IS("type"))   { metaExpression(":type", rest, REPL_TYPE); return true; }
+    if (META_IS("ast"))    { metaExpression(":ast", rest, REPL_AST); return true; }
+    if (META_IS("disasm")) { metaExpression(":disasm", rest, REPL_DISASM); return true; }
+    if (META_IS("time"))   { metaExpression(":time", rest, REPL_EXEC); return true; }
+
+#undef META_IS
+
+    replError("unknown meta-command `:%.*s`; :help lists them all", (int)n, command);
     return true;
 }
 
@@ -599,13 +634,13 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
     if (outIncomplete != NULL) *outIncomplete = false;
     if (line == NULL || !replInit()) return false;
 
-    bool continuing = gRepl.pending.count > 0;
+    const bool continuing = gRepl.pending.count > 0;
     const char *trimmed = skipSpace(line);
+
     if (!continuing) {
-        /* A line comment is nothing to run, but `#*` opens a block that the
-         * next lines close, so that one has to be accumulated like any other
-         * unfinished construct. */
-        if (*trimmed == '\0' || (*trimmed == '#' && trimmed[1] != '*')) return false;
+        if (*trimmed == '\0' || (*trimmed == '#' && trimmed[1] != '*'))
+            return false;
+
         if (*trimmed == ':') {
             if (!replMeta(trimmed)) gRepl.quit = true;
             return true;
@@ -619,8 +654,6 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
     } else {
         const char *meta = metaCommandNamed(trimmed);
         if (meta != NULL) {
-            /* The pending input is left exactly as it was: the answer to a
-             * mistyped command is to go on finishing the input, not to lose it. */
             replError("`%s` is not available while an input is being typed; "
                       "finish it, or `:cancel` to abandon it", meta);
             if (outIncomplete != NULL) *outIncomplete = true;
@@ -628,29 +661,40 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
         }
     }
 
-    jaiBufAppendStr(&gRepl.pending, line);
-    jaiBufPush(&gRepl.pending, '\n');
-    bufTerminate(&gRepl.pending);
+    const size_t lineLen = strlen(line);
+
+    /* Reserve once for text + newline + uncounted NUL sentinel. */
+    jaiBufReserve(&gRepl.pending, lineLen + 2);
+    memcpy(gRepl.pending.data + gRepl.pending.count, line, lineLen);
+    gRepl.pending.count += lineLen;
+    gRepl.pending.data[gRepl.pending.count++] = '\n';
+    gRepl.pending.data[gRepl.pending.count] = '\0';
 
     const char *source = (const char *)gRepl.pending.data;
-    size_t length = gRepl.pending.count;
+    const size_t length = gRepl.pending.count;
+
     JaiReplScan scan;
     replScan(source, length, &scan);
 
     if (scan.mismatched) {
-        /* No later line can rescue this one, and keeping it would swallow
-         * every line that follows it into an input that never ends. */
         replReportMismatch(&scan);
         gRepl.pending.count = 0;
         return true;
     }
+
     if (scan.incomplete) {
         if (outIncomplete != NULL) *outIncomplete = true;
         return false;
     }
 
-    replExecute(source, length, REPL_EXEC, false, nextLabel());
-    gRepl.pending.count = 0;
+    /*
+     * Detach the exact completed buffer and transfer it to the source registry.
+     * This removes the old jaiMemdup() allocation + full input copy.
+     */
+    size_t ownedLength = 0;
+    char *owned = jaiBufTakeCString(&gRepl.pending, &ownedLength);
+
+    replExecuteOwned(owned, ownedLength, REPL_EXEC, false, nextLabel());
     return true;
 }
 
@@ -675,46 +719,52 @@ static bool isBlank(const char *s) { return *skipSpace(s) == '\0'; }
 static int    gCompletionPhase;
 static int    gCompletionIndex;
 static size_t gCompletionMeta;
+static size_t gCompletionTextLength;
 
 static char *completionGenerator(const char *text, int state) {
     if (state == 0) {
         gCompletionPhase = 0;
         gCompletionIndex = 0;
         gCompletionMeta = 0;
+        gCompletionTextLength = strlen(text);
     }
-    size_t length = strlen(text);
+
+    const size_t length = gCompletionTextLength;
 
     if (text[0] == ':') {
         while (gCompletionMeta < REPL_META_COUNT) {
             const char *candidate = kMetaCommands[gCompletionMeta++];
-            if (strncmp(candidate, text, length) == 0) {
+            if (strncmp(candidate, text, length) == 0)
                 return readlineOwnedCopy(candidate);
-            }
         }
         return NULL;
     }
 
     while (gCompletionPhase < 2) {
         JaiTable *table = NULL;
-        if (gCompletionPhase == 0 && gRepl.module != NULL) {
+
+        if (gCompletionPhase == 0 && gRepl.module != NULL)
             table = &gRepl.module->globals;
-        } else if (gCompletionPhase == 1 && vm.builtins != NULL) {
+        else if (gCompletionPhase == 1 && vm.builtins != NULL)
             table = &vm.builtins->globals;
-        }
 
         Value key, value;
         while (table != NULL &&
                jaiTableNext(table, &gCompletionIndex, &key, &value)) {
             if (!IS_STRING(key)) continue;
+
             ObjString *name = AS_STRING(key);
             if (isHiddenName(name->chars)) continue;
             if (name->length < length) continue;
             if (memcmp(name->chars, text, length) != 0) continue;
+
             return readlineOwnedCopy(name->chars);
         }
-        gCompletionPhase++;
+
+        ++gCompletionPhase;
         gCompletionIndex = 0;
     }
+
     return NULL;
 }
 
@@ -792,38 +842,57 @@ static char *readInputLine(const char *prompt) {
         if (sPromptInterrupted) {
             free(raw);
             fputc('\n', stdout);
-            return jaiStrdup("");        /* the caller drops it and reprompts */
+            return jaiStrdup("");
         }
+
         if (raw == NULL) return NULL;
+
         char *copy = jaiStrdup(raw);
-        free(raw);                       /* libc's, not ours */
-        if (!isBlank(copy)) add_history(copy);
+        free(raw);
+
+        if (!isBlank(copy))
+            add_history(copy);
+
         return copy;
     }
 #endif
+
     if (gRepl.interactive) {
         fputs(prompt, stdout);
         fflush(stdout);
     }
 
+    char chunk[512];
+    if (fgets(chunk, sizeof chunk, stdin) == NULL)
+        return NULL;
+
+    size_t n = strlen(chunk);
+
+    if (n > 0 && chunk[n - 1] == '\n') {
+        --n;
+        if (n > 0 && chunk[n - 1] == '\r') --n;
+
+        char *line = JAI_ALLOC(char, n + 1);
+        memcpy(line, chunk, n);
+        line[n] = '\0';
+        return line;
+    }
+
     JaiBuf buf;
     jaiBufInit(&buf);
-    char chunk[512];
-    bool any = false;
+    jaiBufAppend(&buf, chunk, n);
+
     while (fgets(chunk, sizeof chunk, stdin) != NULL) {
-        any = true;
-        size_t n = strlen(chunk);
+        n = strlen(chunk);
         if (n > 0 && chunk[n - 1] == '\n') {
             jaiBufAppend(&buf, chunk, n - 1);
             break;
         }
         jaiBufAppend(&buf, chunk, n);
     }
-    if (!any && buf.count == 0) {
-        jaiBufFree(&buf);
-        return NULL;
-    }
-    if (buf.count > 0 && buf.data[buf.count - 1] == '\r') buf.count--;
+
+    if (buf.count > 0 && buf.data[buf.count - 1] == '\r')
+        --buf.count;
 
     size_t length = 0;
     return jaiBufTakeCString(&buf, &length);
