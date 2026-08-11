@@ -251,6 +251,10 @@ typedef struct {
     uint8_t  *code;
     uint32_t  top;
     uint8_t   slots;
+    /* 0 no iterator, 1 a unit-step range, 2 a list. A form compiled for one
+     * must never be entered with the other: the prologue reads a different
+     * object out of ObjIter.source for each. */
+    uint8_t   iterKind;
     uint8_t   kinds[40];   /* what each slot must hold on entry */
 } JaiOsrForm;
 
