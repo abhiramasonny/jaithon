@@ -321,6 +321,38 @@ static int jitIterStep(JitCallDesc *d) {
     return 0;
 }
 
+/* Make room for one more element in `list`, and nothing else.
+ *
+ * No descriptor and no roots, which is what makes the call site three
+ * instructions instead of thirty. That is sound because growing a list cannot
+ * collect: `jaiListReserve` reaches `jaiRealloc`, and gc.c is explicit that
+ * the marker never runs from inside it -- collections happen only at the
+ * safepoints that call jaiGCMaybeCollect. Nothing this body is holding in a
+ * callee-saved register can be freed across this call, so nothing has to be
+ * made visible to the collector first.
+ *
+ * The element about to be stored travels anyway, as a tag and a payload, so
+ * this does not depend on that invariant for the one value whose only
+ * reference really is a register.
+ *
+ * Returns 1 when it raised -- a list past INT32_MAX is the only way. */
+static int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
+    Value pending;
+    pending.type = (ValueType)tag;
+    pending.as.integer = payload;
+    jaiGCPushRoot(OBJ_VAL(list));
+    jaiGCPushRoot(pending);
+    if (list->capacity > INT32_MAX / 2) {
+        jaiGCPopRoots(2);
+        (void)jaiThrow(vm.cRuntimeError,
+                       "list cannot grow beyond %d items", INT32_MAX);
+        return 1;
+    }
+    jaiListReserve(list, JAI_GROW_CAP(list->capacity));
+    jaiGCPopRoots(2);
+    return 0;
+}
+
 /* Allocate an instance of args[0]'s class, nothing more. The fields are stored
  * by the compiled code that called this. */
 static int jitNewInstance(JitCallDesc *d) {
@@ -435,8 +467,12 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
 #define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
 #define FIXUP_EXIT   (UINT32_MAX - 100u) /* minus the loop-exit index */
-#define JIT_MAX_SELF_SLOW 16u
+/* Self-calls and direct calls to a callee that writes share this table, so it
+ * is sized for a body with several of each rather than for recursion alone. */
+#define JIT_MAX_SELF_SLOW 32u
 #define FIXUP_SELFSLOW (UINT32_MAX - 200u) /* minus the self-call index */
+#define JIT_MAX_GROW   16u
+#define FIXUP_GROW   (UINT32_MAX - 400u) /* minus the list-growth index */
 
 #define JIT_MAX_DEOPT 160
 
@@ -650,8 +686,39 @@ typedef struct {
         unsigned deoptKind;  /* record for a result of an unexpected kind */
         unsigned tag;        /* the tag the compiled body was built for */
         unsigned resultReg;
+        /* Which closure the interpreter finishes on verdict 4. NULL means
+         * this one -- a self-call knows its own. A direct call to another
+         * compiled function that writes names it here instead. */
+        ObjClosure *callee;
+        /* What the continuation's object must be, when the fast path's kind
+         * says more than "a heap object". A shape alone is not enough to
+         * check: VAL_OBJ is EVERY heap object, and reading `klass` off an
+         * ObjString answers wrongly rather than faulting -- the same mistake
+         * the list-element head made. So the type is checked first. */
+        int      retType;    /* an ObjType, or -1 for no check */
+        uint32_t retShape;   /* class shapeId, or 0 for no check */
     } selfSlow[JIT_MAX_SELF_SLOW];
     unsigned  selfSlowCount;
+    /* A `xs.push(v)` whose list is full. Out of line for the same reason the
+     * self-call's cold half is: the store itself is nine instructions, and a
+     * realloc call sitting between them would be most of the loop.
+     *
+     * Before this existed the full case was a deopt, and that is worth
+     * spelling out because it is what made the function tier nearly worthless
+     * for any body that builds a list: a deopt hands the WHOLE REST of the
+     * function to the interpreter, and `out` starts empty, so the very first
+     * push abandoned the compiled body. merge in sort_merge deopted once per
+     * call -- 62434 times for 62500 items -- and ran interpreted from its
+     * first push onward every time. */
+    struct {
+        int      returnTo;   /* instruction index to resume the body at */
+        int      stub;
+        unsigned listReg;
+        unsigned valReg;
+        unsigned tag;
+        unsigned countReg;   /* the scratch the reload must refill */
+    } grow[JIT_MAX_GROW];
+    unsigned  growCount;
     uint32_t  curOffset;
     /* The model as it stood at the start of `curOffset`, before any of that
      * instruction's own pushes. A guard fires part-way through an instruction
@@ -1917,6 +1984,151 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
 }
 
+/* A call whose callee did not return cleanly. Out of line so that the body
+ * keeps one compare and one not-taken branch per call.
+ *
+ * Verdict 4 is the one that needed building: the callee deoptimised part-way
+ * and may have written, so the call can neither be re-executed nor recorded
+ * over -- gDeopt is a single global. The callee is FINISHED in the interpreter
+ * from its own record instead, and its value handed back here, which consumes
+ * the record at the innermost frame that sees it. That is why one record still
+ * suffices however deep the recursion goes, and it is what makes a recursive
+ * body that writes compilable -- and, since `callee` may name someone else,
+ * what makes a DIRECT call to a method that writes compilable too.
+ *
+ * `closure` is the body being compiled, which is what a self-call finishes.
+ *
+ * Emitted by both tiers. In an OSR form the fall-through is a continuation of
+ * the loop, so nothing is written back here: every branch out of this block
+ * goes to a stub that does its own syncing. */
+static void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
+    for (unsigned si = 0; si < e->selfSlowCount; si++) {
+        e->selfSlow[si].stub = (int)e->count;
+        unsigned d = e->descOffset;
+        unsigned resultAt = d + (unsigned)offsetof(JitCallDesc, result);
+
+        emit(e, jaiA64SubsXImm(31, 1, 2));             /* the callee raised */
+        emit(e, jaiA64BCond(JAI_A64_EQ,
+                            (int32_t)(e->exceptionExit - (int)e->count)));
+
+        emit(e, jaiA64SubsXImm(31, 1, 4));
+        if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; break; }
+        e->fixups[e->fixupCount].instIndex    = (int)e->count;
+        e->fixups[e->fixupCount].targetOffset =
+            FIXUP_DEOPT - e->selfSlow[si].deoptBail;
+        e->fixups[e->fixupCount].conditional  = true;
+        e->fixups[e->fixupCount].depth        = -1;
+        e->fixupCount++;
+        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+
+        /* jaiJitFinishDeopt runs interpreted code, which allocates, so the
+         * roots this frame filled before the `bl` go back on the chain. */
+        if (e->selfSlow[si].roots > 0) {
+            emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+            emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                               (unsigned)offsetof(JitCallDesc, link)));
+            emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+        }
+        emitConst64(e, 0, (int64_t)(uintptr_t)(e->selfSlow[si].callee != NULL
+                                                   ? e->selfSlow[si].callee
+                                                   : closure));
+        emit(e, jaiA64AddXImm(1, 31, resultAt));
+        emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jaiJitFinishDeopt);
+        emit(e, jaiA64Blr(JIT_SCRATCH_D));
+        if (e->selfSlow[si].roots > 0) {
+            emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                               (unsigned)offsetof(JitCallDesc, link)));
+            emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+        }
+        emit(e, jaiA64SubsXImm(31, 0, 0));             /* false: it raised */
+        emit(e, jaiA64BCond(JAI_A64_EQ,
+                            (int32_t)(e->exceptionExit - (int)e->count)));
+
+        /* The interpreted continuation may return a kind this body was not
+         * compiled for. It is in the descriptor with whatever tag it really
+         * has, which is exactly what a `lastFromDesc` record writes out. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, resultAt));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e->selfSlow[si].tag));
+        if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; break; }
+        e->fixups[e->fixupCount].instIndex    = (int)e->count;
+        e->fixups[e->fixupCount].targetOffset =
+            FIXUP_DEOPT - e->selfSlow[si].deoptKind;
+        e->fixups[e->fixupCount].conditional  = true;
+        e->fixups[e->fixupCount].depth        = -1;
+        e->fixupCount++;
+        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+        emit(e, jaiA64LdrX(e->selfSlow[si].resultReg, 31, resultAt + 8));
+
+        /* VAL_OBJ is every heap object, so a compiled body that was promised
+         * an instance or a list has to see the object's type before it treats
+         * the pointer as one: reading `klass` off an ObjString does not fault,
+         * it answers wrongly. Both checks go back to the same record. */
+        if (e->selfSlow[si].retType >= 0) {
+            unsigned rr = e->selfSlow[si].resultReg;
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A,
+                                   (unsigned)e->selfSlow[si].retType));
+            if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; break; }
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset =
+                FIXUP_DEOPT - e->selfSlow[si].deoptKind;
+            e->fixups[e->fixupCount].conditional  = true;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, jaiA64BCond(JAI_A64_NE, 0));
+            if (e->selfSlow[si].retShape != 0) {
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rr,
+                                   (unsigned)offsetof(ObjInstance, klass)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                   (unsigned)offsetof(ObjClass, shapeId)));
+                emitConst64(e, JIT_SCRATCH_B,
+                            (int64_t)e->selfSlow[si].retShape);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; break; }
+                e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                e->fixups[e->fixupCount].targetOffset =
+                    FIXUP_DEOPT - e->selfSlow[si].deoptKind;
+                e->fixups[e->fixupCount].conditional  = true;
+                e->fixups[e->fixupCount].depth        = -1;
+                e->fixupCount++;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));
+            }
+        }
+        emit(e, jaiA64B((int32_t)(e->selfSlow[si].returnTo - (int)e->count)));
+    }
+}
+
+/* The cold half of `xs.push(v)`: reserve, refill the count the fast path had
+ * already loaded, and branch back into it.
+ *
+ * Emitted with the other stubs so the store keeps one not-taken branch. No
+ * descriptor and no roots -- see jitListGrow for why a realloc cannot collect.
+ * `e->exceptionExit` must already be emitted, which it is at both call sites.
+ *
+ * This is a continuation, not a way out, so an OSR form must NOT sync its
+ * iterator or its locals here: the loop carries on with them where they are. */
+static void emitGrowStubs(Emit *e) {
+    for (unsigned gi = 0; gi < e->growCount; gi++) {
+        e->grow[gi].stub = (int)e->count;
+        emit(e, jaiA64MovX(0, e->grow[gi].listReg));
+        emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
+        emit(e, jaiA64MovX(2, e->grow[gi].valReg));
+        emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jitListGrow);
+        emit(e, jaiA64Blr(JIT_SCRATCH_D));
+        emit(e, jaiA64SubsXImm(31, 0, 0));
+        emit(e, jaiA64BCond(JAI_A64_NE,
+                            (int32_t)(e->exceptionExit - (int)e->count)));
+        emit(e, jaiA64LdrW(e->grow[gi].countReg, e->grow[gi].listReg,
+                           (unsigned)offsetof(ObjList, count)));
+        emit(e, jaiA64B((int32_t)(e->grow[gi].returnTo - (int)e->count)));
+    }
+}
+
 /* Every argument of a direct branch arrives as a raw payload, so the kind the
  * caller holds has to be the kind the callee was specialised to -- and where
  * that kind is an instance, the same class shape, because every field offset
@@ -1924,12 +2136,13 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
  * this, one Value at a time, and it is the only thing standing between a
  * float's bits and a body that will treat them as a pointer.
  *
- * `cidx` is the operand-stack index of the callee; the arguments are the
- * `argc` entries above it. */
-static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn, unsigned cidx,
-                                unsigned argc) {
+ * `firstIdx` is the operand-stack index of the first thing passed in a
+ * register. For a plain call that is the entry above the callee; for a method
+ * it is the receiver itself, which is the callee's slot 0. */
+static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
+                                unsigned firstIdx, unsigned argc) {
     for (unsigned i = 0; i < argc; i++) {
-        unsigned idx = cidx + 1u + i;
+        unsigned idx = firstIdx + i;
         SlotKind have = e->stack[idx];
         SlotKind want = (SlotKind)cfn->jitParamKind[i];
         if (!holdsRegister(have)) {
@@ -1970,27 +2183,44 @@ static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn, unsigned cidx,
  *     what makes passing a raw payload rather than a Value sound;
  *   - the verdict, below.
  *
- * A nonzero verdict is the part that is not obvious. jaiJitEnterFunc answers
- * "the callee deoptimised" by pushing an interpreter frame for the callee and
- * resuming inside it, and compiled code cannot do that. So the whole CALL is
- * abandoned instead and the interpreter re-executes it from the operand stack
- * as it stood before -- which is only sound if the abandoned attempt left
- * nothing behind, hence jitFuncNoWrite. A raised exception is different: its
- * effects have happened and the interpreter owns it, so that one goes to the
- * throw exit rather than back to the call.
+ * A nonzero verdict is the part that is not obvious, and there are two answers
+ * depending on what the callee is allowed to have done.
+ *
+ *   - A callee that writes nothing can simply have the whole CALL abandoned:
+ *     the interpreter re-executes it from the operand stack as it stood
+ *     before, and the abandoned attempt left nothing behind. Two compares on
+ *     the fast path, no stub.
+ *   - A callee that DOES write cannot be re-run, and this is not a rare case
+ *     -- `Vec2.add` returning a fresh Vec2 writes, and so does any method that
+ *     stores a field. Verdict 4 there means the callee deoptimised part-way,
+ *     so it is FINISHED in the interpreter from its own record, exactly as a
+ *     recursive self-call already does. That is what the `selfSlow` block is,
+ *     which is why this shares it rather than growing a second copy.
+ *
+ * A raised exception is different again: its effects have happened and the
+ * interpreter owns it, so that one goes to the throw exit rather than back to
+ * the call.
  *
  * `calleeReg` holds the ObjClosure when the callee is only known at run time,
  * or -1 when it is baked in. `cidx` is the operand-stack index of the callee
- * entry; the arguments are the `argc` entries above it. */
+ * entry -- for a method, of the RECEIVER, which is the callee's slot 0 and
+ * therefore an argument as well. `after` is the offset of the instruction the
+ * call falls through to. */
 static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
-                           unsigned argc, uint32_t callOff) {
+                           unsigned argc, uint32_t callOff, uint32_t after,
+                           bool method) {
     if (cfn->module != caller->module) {
         e->whyNot = "a direct callee from another module";
         return false;
     }
-    if (cfn->jitArgBase != 1u) {
-        e->whyNot = "a direct callee that is not a plain function";
+    /* Slot 0 is the closure for a plain function and the receiver for a
+     * method, so which of the two this is decides where the arguments start
+     * and whether the receiver is one of them. */
+    if (cfn->jitArgBase != (method ? 0u : 1u)) {
+        e->whyNot = method
+            ? "a direct method that does not take its receiver in slot 0"
+            : "a direct callee that is not a plain function";
         return false;
     }
     /* The callee's own baked classes, closures and natives are pinned by ITS
@@ -2004,13 +2234,21 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         e->whyNot = "a direct callee compiled against an older module";
         return false;
     }
-    if (!cfn->jitFuncNoWrite) {
-        e->whyNot = "a direct callee whose body writes the heap";
+    /* A callee that writes is finished in the interpreter on verdict 4, and
+     * that needs its ObjClosure -- which only a callee baked in at compile
+     * time provides. */
+    bool writes = !cfn->jitFuncNoWrite;
+    if (writes && (calleeReg >= 0 || !IS_CLOSURE(calleeVal))) {
+        e->whyNot = "a direct callee that writes and is not known here";
         return false;
     }
+    /* `nargs` is how many registers the branch fills. A method's receiver is
+     * one of them; a plain call's callee entry holds no register at all. */
+    unsigned nargs = method ? argc + 1u : argc;
+    unsigned firstIdx = method ? cidx : cidx + 1u;
     unsigned calleeArgs = (unsigned)cfn->jitArgCount;
-    bool wantsClosure = calleeArgs == argc + 1u;
-    if (!wantsClosure && calleeArgs != argc) {
+    bool wantsClosure = calleeArgs == nargs + 1u;
+    if (!wantsClosure && calleeArgs != nargs) {
         e->whyNot = "a direct callee with a different arity";
         return false;
     }
@@ -2019,9 +2257,9 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         return false;
     }
 
-    if (!directCallArgsMatch(e, cfn, cidx, argc)) return false;
+    if (!directCallArgsMatch(e, cfn, firstIdx, nargs)) return false;
     if (wantsClosure &&
-        (SlotKind)cfn->jitParamKind[argc] != SLOT_CLOSURE) {
+        (SlotKind)cfn->jitParamKind[nargs] != SLOT_CLOSURE) {
         e->whyNot = "a direct callee whose trailing argument is not its closure";
         return false;
     }
@@ -2040,6 +2278,13 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         (cfn->jitReturnShape == 0 ||
          !jaiClassForShape(cfn->jitReturnShape, &rcls) || rcls == NULL)) {
         e->whyNot = "callee's return class not on record";
+        return false;
+    }
+    /* Asked here rather than where the slot is taken: below this point the
+     * root fill has been emitted and the descriptor linked onto the collector's
+     * chain, so there is no falling back to the descriptor path any more. */
+    if (writes && e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
+        e->whyNot = "more slow call sites than the tier tracks";
         return false;
     }
 
@@ -2066,13 +2311,13 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
     }
 
-    unsigned firstArg = valueXReg(e, cidx + 1u - (e->depth - e->valueDepth));
-    for (unsigned i = 0; i < argc; i++) {
+    unsigned firstArg = valueXReg(e, firstIdx - (e->depth - e->valueDepth));
+    for (unsigned i = 0; i < nargs; i++) {
         emit(e, jaiA64MovX(i, firstArg + i));
     }
     if (wantsClosure) {
-        if (calleeReg >= 0) emit(e, jaiA64MovX(argc, (unsigned)calleeReg));
-        else emitConst64(e, argc, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
+        if (calleeReg >= 0) emit(e, jaiA64MovX(nargs, (unsigned)calleeReg));
+        else emitConst64(e, nargs, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
     }
     emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)cfn->jitFunc);
     emit(e, jaiA64Blr(JIT_SCRATCH_D));
@@ -2086,36 +2331,85 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
     }
 
-    /* Verdict 2 is a pending exception: the interpreter owns it and this call
-     * must not run again. */
-    emit(e, jaiA64SubsXImm(31, 1, 2));
-    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
-    e->fixups[e->fixupCount].instIndex    = (int)e->count;
-    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
-    e->fixups[e->fixupCount].conditional  = true;
-    e->fixups[e->fixupCount].depth        = -1;
-    e->fixupCount++;
-    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
-    /* Anything else -- a bail, or a guard that failed inside the callee --
-     * hands the whole call back. The record is taken with the callee and its
-     * arguments still on the model's stack, which is what the interpreter
-     * expects to find at this offset. */
-    emit(e, jaiA64SubsXImm(31, 1, 0));
-    branchOnDeoptAt(e, JAI_A64_NE, callOff, false);
+    unsigned si = 0;
+    if (writes) {
+        /* One compare and one not-taken branch on the fast path; every other
+         * answer is the shared cold block. The record has to be taken here,
+         * where the model still holds the receiver and the arguments, even
+         * though the block is emitted with the stubs. */
+        if (e->selfSlowCount >= JIT_MAX_SELF_SLOW) { e->failed = true; return false; }
+        si = e->selfSlowCount++;
+        e->selfSlow[si].roots    = callRoots;
+        e->selfSlow[si].stub     = -1;
+        e->selfSlow[si].callee   = AS_CLOSURE(calleeVal);
+        e->selfSlow[si].retShape = rk == SLOT_INST ? cfn->jitReturnShape : 0;
+        e->selfSlow[si].retType  = rk == SLOT_INST ? (int)OBJ_INSTANCE
+                                 : rk == SLOT_LIST ? (int)OBJ_LIST
+                                                   : -1;
+        if (!deoptRecordAt(e, callOff, false, &e->selfSlow[si].deoptBail)) {
+            e->failed = true;
+            return false;
+        }
+        emit(e, jaiA64SubsXImm(31, 1, 0));
+        if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+        e->fixups[e->fixupCount].instIndex    = (int)e->count;
+        e->fixups[e->fixupCount].targetOffset = FIXUP_SELFSLOW - si;
+        e->fixups[e->fixupCount].conditional  = true;
+        e->fixups[e->fixupCount].depth        = -1;
+        e->fixupCount++;
+        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    } else {
+        /* Verdict 2 is a pending exception: the interpreter owns it and this
+         * call must not run again. */
+        emit(e, jaiA64SubsXImm(31, 1, 2));
+        if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+        e->fixups[e->fixupCount].instIndex    = (int)e->count;
+        e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+        e->fixups[e->fixupCount].conditional  = true;
+        e->fixups[e->fixupCount].depth        = -1;
+        e->fixupCount++;
+        emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        /* Anything else -- a bail, or a guard that failed inside the callee --
+         * hands the whole call back. The record is taken with the callee and
+         * its arguments still on the model's stack, which is what the
+         * interpreter expects to find at this offset. */
+        emit(e, jaiA64SubsXImm(31, 1, 0));
+        branchOnDeoptAt(e, JAI_A64_NE, callOff, false);
+    }
 
-    for (unsigned i = 0; i < argc; i++) {
+    for (unsigned i = 0; i < nargs; i++) {
         unsigned r;
         if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
     }
-    if (e->depth == 0) { e->failed = true; return false; }
-    e->depth--;                                  /* the callee entry */
+    if (!method) {
+        if (e->depth == 0) { e->failed = true; return false; }
+        e->depth--;                              /* the callee entry */
+    }
     if (!pushValue(e, rk, cfn->jitReturnShape, rcls)) { e->failed = true; return false; }
     emit(e, jaiA64MovX(pushReg(e) - 1, 0));
-    /* Deliberately not e->wroteHeap, unlike the descriptor path: this callee
-     * stores nothing and calls nothing, so an interpreted re-run of the whole
-     * caller would repeat no effect. It may still allocate -- OP_GET_SLICE
-     * does, and deliberately does not set the flag either -- and a fresh
-     * object is not an effect anything can see. */
+    if (writes) {
+        e->selfSlow[si].resultReg = pushReg(e) - 1;
+        e->selfSlow[si].returnTo  = (int)e->count;
+        e->selfSlow[si].tag = rk == SLOT_INT   ? VAL_INT
+                            : rk == SLOT_FLOAT ? VAL_FLOAT
+                            : rk == SLOT_BOOL  ? VAL_BOOL
+                                               : VAL_OBJ;
+        /* The interpreted continuation is typed by nothing this compiled for,
+         * so what it hands back is checked and a surprise resumes AFTER the
+         * call -- which has happened and must not happen twice. */
+        if (!deoptRecordAt(e, after, true, &e->selfSlow[si].deoptKind)) {
+            e->failed = true;
+            return false;
+        }
+        /* A call that writes is an effect, so no bail may follow it -- the
+         * same rule the descriptor path lives under. */
+        e->wroteHeap = true;
+    }
+    /* For a callee that writes nothing this is deliberately NOT wroteHeap,
+     * unlike the descriptor path: it stores nothing and calls nothing, so an
+     * interpreted re-run of the whole caller would repeat no effect. It may
+     * still allocate -- OP_GET_SLICE does, and deliberately does not set the
+     * flag either -- and a fresh object is not an effect anything can see. */
     return true;
 }
 
@@ -2416,7 +2710,8 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
      * through jaiCallValue still beats no compiled loop at all. */
     {
         const char *saved = e->whyNot;
-        if (emitDirectCall(e, caller, cfn, cv, -1, cidx, argc, callOff)) {
+        if (emitDirectCall(e, caller, cfn, cv, -1, cidx, argc, callOff,
+                           after, false)) {
             return true;
         }
         if (e->failed) return false;   /* it had started emitting */
@@ -4464,9 +4759,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* Appending to a list is a bounds check and two stores, and
                  * going through a descriptor and a native for it costs far
                  * more than the work. `list_ops` pushes a million elements and
-                 * spent all of it on the call. Growing is left to the
-                 * interpreter: a full list deopts to this instruction, which
-                 * has written nothing yet. */
+                 * spent all of it on the call. A full list goes out to a
+                 * three-argument realloc helper and comes straight back --
+                 * see the `grow` stubs, and the note there for why this used
+                 * to be a deopt and what that cost. */
                 SlotKind vk = e->stack[e->depth - 1];
                 unsigned vtag = vk == SLOT_INT   ? VAL_INT
                               : vk == SLOT_FLOAT ? VAL_FLOAT
@@ -4486,7 +4782,29 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_B, rList,
                                    (unsigned)offsetof(ObjList, capacity)));
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
-                branchOnDeopt(e, JAI_A64_GE);
+                if (e->growCount >= JIT_MAX_GROW) {
+                    e->whyNot = "more list pushes than the tier tracks";
+                    return false;
+                }
+                {
+                    unsigned gi = e->growCount++;
+                    e->grow[gi].listReg  = rList;
+                    e->grow[gi].valReg   = rVal;
+                    e->grow[gi].tag      = vtag;
+                    e->grow[gi].countReg = JIT_SCRATCH_A;
+                    e->grow[gi].stub     = -1;
+                    if (e->fixupCount >= JIT_MAX_FIXUPS) {
+                        e->failed = true;
+                        return false;
+                    }
+                    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                    e->fixups[e->fixupCount].targetOffset = FIXUP_GROW - gi;
+                    e->fixups[e->fixupCount].conditional  = true;
+                    e->fixups[e->fixupCount].depth        = -1;
+                    e->fixupCount++;
+                    emit(e, jaiA64BCond(JAI_A64_GE, 0));
+                    e->grow[gi].returnTo = (int)e->count;
+                }
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
                                    (unsigned)offsetof(ObjList, items)));
@@ -4554,6 +4872,38 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     rkind != SLOT_BOOL && rkind != SLOT_INST &&
                     rkind != SLOT_LIST) {
                     return false;
+                }
+
+                /* Straight to the method's compiled entry when the receiver's
+                 * class is fixed here -- which it is, or this arm would not
+                 * have been reached: SLOT_INST carries a shape the caller has
+                 * already guarded, so the "inline cache" for the dispatch is
+                 * the model itself and costs nothing at run time.
+                 *
+                 * What that skips is the whole of jitInvokeMethod ->
+                 * jaiCallMethodWithReceiver -> invokeCallable -> callClosure
+                 * -> jaiJitEnterFunc -> jitArgIn, which is C glue between two
+                 * compiled bodies. On object_dispatch, by `sample`, those five
+                 * were 43% of the benchmark.
+                 *
+                 * Falling back rather than declining matters for the same
+                 * reason it does for a global call: the descriptor path speaks
+                 * a wider language. */
+                {
+                    const char *saved = e->whyNot;
+                    if (emitDirectCall(e, fn, mfn, method, -1, ridx, argc,
+                                       (uint32_t)off, (uint32_t)(off + 7),
+                                       true)) {
+                        if (getenv("JAI_JIT_WHY")) {
+                            fprintf(stderr, "[jit] direct method %s.%s at %d\n",
+                                    rcls->name ? rcls->name->chars : "?",
+                                    AS_STRING(mname)->chars, off);
+                        }
+                        off += 7;
+                        break;
+                    }
+                    if (e->failed) return false;   /* it had started emitting */
+                    e->whyNot = saved;
                 }
 
                 if (!emitDescriptor(e, method, ridx, argc + 1,
@@ -5548,7 +5898,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * was specialised to that kind and shape, and the caller's
                  * module-version guard only stands in for the callee's entry
                  * check if the two were compiled against the same version. */
-                if (!directCallArgsMatch(e, cfn, cidx, argc)) return false;
+                if (!directCallArgsMatch(e, cfn, cidx + 1u, argc)) return false;
                 if (fn->module == NULL ||
                     cfn->jitFuncModuleVersion != fn->module->version) {
                     e->whyNot = "an indirect callee compiled against an older module";
@@ -5787,6 +6137,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->selfSlow[si].roots     = selfRoots;
             e->selfSlow[si].resultReg = resultReg;
             e->selfSlow[si].stub      = -1;
+            /* This body is its own callee, and it checks the tag only: -1 is
+             * "no type check", and it has to be said rather than left to the
+             * zeroed struct, where 0 is OBJ_STRING. */
+            e->selfSlow[si].callee    = NULL;
+            e->selfSlow[si].retType   = -1;
+            e->selfSlow[si].retShape  = 0;
             /* Verdict 1: the callee bailed, and it may only do that having
              * written nothing, so the CALL is re-executed. Not a bail here --
              * a bail re-runs this whole body from the top, which is what
@@ -6338,76 +6694,9 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     emit(&e, jaiA64MovzX(0, 0, 0));
     emitEpilogue(&e, 2);
 
-    /* A self-call whose callee did not return cleanly. Out of line so that the
-     * body keeps one compare and one not-taken branch per recursive call.
-     *
-     * Verdict 4 is the one that needed building: the callee deoptimised
-     * part-way and may have written, so the call can neither be re-executed
-     * nor recorded over -- gDeopt is a single global. The callee is FINISHED
-     * in the interpreter from its own record instead, and its value handed
-     * back here, which consumes the record at the innermost frame that sees
-     * it. That is why one record still suffices however deep the recursion
-     * goes, and it is what makes a recursive body that writes compilable. */
-    for (unsigned si = 0; si < e.selfSlowCount; si++) {
-        e.selfSlow[si].stub = (int)e.count;
-        unsigned d = e.descOffset;
-        unsigned resultAt = d + (unsigned)offsetof(JitCallDesc, result);
+    emitSelfSlowStubs(&e, closure);
 
-        emit(&e, jaiA64SubsXImm(31, 1, 2));            /* the callee raised */
-        emit(&e, jaiA64BCond(JAI_A64_EQ,
-                             (int32_t)(e.exceptionExit - (int)e.count)));
-
-        emit(&e, jaiA64SubsXImm(31, 1, 4));
-        if (e.fixupCount >= JIT_MAX_FIXUPS) { e.failed = true; break; }
-        e.fixups[e.fixupCount].instIndex    = (int)e.count;
-        e.fixups[e.fixupCount].targetOffset =
-            FIXUP_DEOPT - e.selfSlow[si].deoptBail;
-        e.fixups[e.fixupCount].conditional  = true;
-        e.fixups[e.fixupCount].depth        = -1;
-        e.fixupCount++;
-        emit(&e, jaiA64BCond(JAI_A64_NE, 0));
-
-        /* jaiJitFinishDeopt runs interpreted code, which allocates, so the
-         * roots this frame filled before the `bl` go back on the chain. */
-        if (e.selfSlow[si].roots > 0) {
-            emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-            emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-            emit(&e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
-            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                                (unsigned)offsetof(JitCallDesc, link)));
-            emit(&e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
-        }
-        emitConst64(&e, 0, (int64_t)(uintptr_t)closure);
-        emit(&e, jaiA64AddXImm(1, 31, resultAt));
-        emitConst64(&e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jaiJitFinishDeopt);
-        emit(&e, jaiA64Blr(JIT_SCRATCH_D));
-        if (e.selfSlow[si].roots > 0) {
-            emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-            emit(&e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
-            emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                                (unsigned)offsetof(JitCallDesc, link)));
-            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-        }
-        emit(&e, jaiA64SubsXImm(31, 0, 0));            /* false: it raised */
-        emit(&e, jaiA64BCond(JAI_A64_EQ,
-                             (int32_t)(e.exceptionExit - (int)e.count)));
-
-        /* The interpreted continuation may return a kind this body was not
-         * compiled for. It is in the descriptor with whatever tag it really
-         * has, which is exactly what a `lastFromDesc` record writes out. */
-        emit(&e, jaiA64LdrW(JIT_SCRATCH_A, 31, resultAt));
-        emit(&e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e.selfSlow[si].tag));
-        if (e.fixupCount >= JIT_MAX_FIXUPS) { e.failed = true; break; }
-        e.fixups[e.fixupCount].instIndex    = (int)e.count;
-        e.fixups[e.fixupCount].targetOffset =
-            FIXUP_DEOPT - e.selfSlow[si].deoptKind;
-        e.fixups[e.fixupCount].conditional  = true;
-        e.fixups[e.fixupCount].depth        = -1;
-        e.fixupCount++;
-        emit(&e, jaiA64BCond(JAI_A64_NE, 0));
-        emit(&e, jaiA64LdrX(e.selfSlow[si].resultReg, 31, resultAt + 8));
-        emit(&e, jaiA64B((int32_t)(e.selfSlow[si].returnTo - (int)e.count)));
-    }
+    emitGrowStubs(&e);
 
     /* One stub per guard, out of line. Each writes the record the interpreter
      * resumes from: the locals, the operand stack as it stood at that
@@ -6613,6 +6902,18 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a stub it branches to "
                                     "was never emitted\n",
+                            fn->name ? fn->name->chars : "<anon>");
+                }
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
+        } else if (f->targetOffset <= FIXUP_GROW &&
+                   f->targetOffset > FIXUP_GROW - JIT_MAX_GROW) {
+            target = e.grow[FIXUP_GROW - f->targetOffset].stub;
+            if (target < 0) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: a list-growth block was "
+                                    "never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
                 jitFree(map, depths, fn->chunk.count + 1);
@@ -7173,6 +7474,10 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         emitEpilogue(&e, 0);
     }
 
+    emitSelfSlowStubs(&e, closure);
+
+    emitGrowStubs(&e);
+
     for (unsigned k = 0; k < e.deoptCount; k++) {
         e.deopt[k].stub = (int)e.count;
         OSR_SYNC_ITER();
@@ -7252,9 +7557,15 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         else if (f->targetOffset == FIXUP_THREW) target = e.exceptionExit;
         else if (f->targetOffset <= FIXUP_EXIT && f->targetOffset > FIXUP_EXIT - 8u)
             target = e.exitStub[FIXUP_EXIT - f->targetOffset];
+        else if (f->targetOffset <= FIXUP_SELFSLOW &&
+                 f->targetOffset > FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)
+            target = e.selfSlow[FIXUP_SELFSLOW - f->targetOffset].stub;
         else if (f->targetOffset <= FIXUP_DEOPT &&
                  f->targetOffset > FIXUP_DEOPT - JIT_MAX_DEOPT)
             target = e.deopt[FIXUP_DEOPT - f->targetOffset].stub;
+        else if (f->targetOffset <= FIXUP_GROW &&
+                 f->targetOffset > FIXUP_GROW - JIT_MAX_GROW)
+            target = e.grow[FIXUP_GROW - f->targetOffset].stub;
         else if (f->targetOffset <= FIXUP_OVF && f->targetOffset >= FIXUP_OVF - 2u)
             target = e.overflowStub[FIXUP_OVF - f->targetOffset];
         else {
