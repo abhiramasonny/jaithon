@@ -94,6 +94,27 @@ uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm) {
     return 0xeb000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+/* The two extended-register forms, which take only the LOW 32 BITS of Xm and
+ * zero-extend them.
+ *
+ * They exist so that an ObjList's `items` and `count` can be fetched by one
+ * `ldp`: count and capacity are adjacent int32s, so the second half of the pair
+ * arrives as `count | capacity << 32` and every use of it has to ignore the top
+ * half. `uxtw` is that, folded into the instruction that was going to run
+ * anyway rather than paid as a separate `and`.
+ *
+ * option = 010 (UXTW) sits at bits 15:13, and imm3 = 0 means no further shift,
+ * so the constant below is base | 0x4000. Note rd = 31 is XZR here and NOT the
+ * stack pointer, because these are the flag-setting/adding register forms with
+ * an extended operand -- SUBS with Rd = 31 is `cmp`, exactly as for SubsXReg. */
+uint32_t jaiA64SubsXUxtw(unsigned rd, unsigned rn, unsigned rm) {
+    return 0xeb204000u | (rm << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64AddXUxtw(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x8b204000u | (rm << 16) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64SubXImm(unsigned rd, unsigned rn, unsigned imm12) {
     return 0xd1000000u | (imm12 << 10) | (rn << 5) | rd;
 }

@@ -57,6 +57,10 @@ uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64AddXLsl(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
 /* subs Xd, Xn, Xm -- result AND flags; V set on signed overflow */
 uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm);
+/* subs Xd, Xn, Wm, uxtw -- Xm's low 32 bits, zero-extended; rd = 31 is `cmp` */
+uint32_t jaiA64SubsXUxtw(unsigned rd, unsigned rn, unsigned rm);
+/* add Xd, Xn, Wm, uxtw -- the same operand form, without the flags */
+uint32_t jaiA64AddXUxtw(unsigned rd, unsigned rn, unsigned rm);
 /* sub Xd, Xn, #imm12 */
 uint32_t jaiA64SubXImm(unsigned rd, unsigned rn, unsigned imm12);
 /* blr Xn -- call through a register, for an address bl cannot reach */
