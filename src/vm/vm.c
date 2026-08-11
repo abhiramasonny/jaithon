@@ -137,6 +137,20 @@ static uint32_t builtinShapeTag(Value v) {
     }
 }
 
+uint8_t jaiInvokeResultFeedback(const Chunk *chunk, uint16_t cacheIdx,
+                                Value receiver) {
+    uint32_t tag = builtinShapeTag(receiver);
+    if (tag == 0 || chunk->caches == NULL ||
+        (int)cacheIdx >= chunk->cacheCount) {
+        return JAI_FB_NONE;
+    }
+    const InlineCache *ic = &chunk->caches[cacheIdx];
+    for (int w = 0; w < ic->count; w++) {
+        if (ic->shapeId[w] == tag) return ic->resultKind[w];
+    }
+    return JAI_FB_NONE;
+}
+
 static bool valueIsCallable(Value v) {
     if (!IS_OBJ(v)) return false;
     switch (OBJ_TYPE(v)) {
@@ -4414,6 +4428,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
         uint16_t cacheIdx = READ_U16();
         Value receiver = stackTop[-argc - 1];
         uint32_t builtinTag = 0;
+        /* Set only when this pass FILLS a builtin way below, which is the one
+         * moment the site's result kind can be recorded without costing the
+         * fast path anything. See InlineCache::resultKind. */
+        InlineCache *fbCache = NULL;
+        int fbWay = 0;
 
         /* Fast path: the receiver's class is one the cache has already seen,
          * so the method is known without touching a hash table. */
@@ -4548,8 +4567,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     ic->shapeId[ic->count] = builtinTag;
                     ic->payload[ic->count] = 0;
                     ic->cached[ic->count] = AS_BOUND(method)->method;
+                    ic->resultKind[ic->count] = JAI_FB_NONE;
                     ic->count++;
                     ic->state = (ic->count == 1) ? IC_MONO : IC_POLY;
+                    fbCache = ic;
+                    fbWay   = ic->count - 1;
                 } else {
                     ic->state = IC_MEGA;
                 }
@@ -4558,6 +4580,14 @@ static JaiRunResult runLoop(int baseFrameCount) {
         if ((isMethod ? invokeMethodOnStack(method, argc)
                       : invokeCallable(method, argc)) == CALL_ERROR) {
             goto vmThrow;
+        }
+        /* A bound native pushes no frame, so the result is on the stack now.
+         * Only reached on the way that just filled the cache -- once per site
+         * and receiver type, never on the path a loop repeats. */
+        if (fbCache != NULL) {
+            fbCache->resultKind[fbWay] =
+                jaiFeedbackMerge(fbCache->resultKind[fbWay],
+                                 jaiFeedbackKind(vm.stackTop[-1]));
         }
         LOAD_STATE();
         VM_NEXT();

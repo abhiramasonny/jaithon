@@ -88,6 +88,9 @@ void jaiGCInit(GCState *gc) {
     gc->tempRoots = NULL;
     gc->tempRootCount = 0;
     gc->tempRootCapacity = 0;
+    gc->rootRanges = NULL;
+    gc->rootRangeCount = 0;
+    gc->rootRangeCapacity = 0;
 
     gc->permanentRoots = NULL;
     gc->permanentRootCount = 0;
@@ -122,6 +125,11 @@ void jaiGCFree(GCState *gc) {
     gc->tempRoots = NULL;
     gc->tempRootCount = 0;
     gc->tempRootCapacity = 0;
+    JAI_FREE_ARRAY(JaiGCRootRange, gc->rootRanges,
+                   gc->rootRangeCapacity);
+    gc->rootRanges = NULL;
+    gc->rootRangeCount = 0;
+    gc->rootRangeCapacity = 0;
 
     JAI_FREE_ARRAY(Value, gc->permanentRoots, gc->permanentRootCapacity);
     gc->permanentRoots = NULL;
@@ -465,6 +473,9 @@ static void markRoots(GCState *g) {
     markWellKnownClasses();
 
     markValues(g->tempRoots, g->tempRootCount);
+    for (int i = 0; i < g->rootRangeCount; i++) {
+        markValues(g->rootRanges[i].values, g->rootRanges[i].count);
+    }
     markValues(g->permanentRoots, g->permanentRootCount);
 }
 
@@ -590,6 +601,29 @@ void jaiGCPopRoots(int n) {
 }
 
 void jaiGCPopRoot(void) { jaiGCPopRoots(1); }
+
+void jaiGCPushRootRange(const Value *values, int count) {
+    GCState *g = jaiGCActive;
+    if (JAI_UNLIKELY(g == NULL))
+        JAI_PANIC("jaiGCPushRootRange before jaiGCInit");
+    if (JAI_UNLIKELY(g->rootRangeCapacity < g->rootRangeCount + 1)) {
+        int oldCapacity = g->rootRangeCapacity;
+        int newCapacity = JAI_GROW_CAP(oldCapacity);
+        if (newCapacity <= oldCapacity) JAI_PANIC("GC root-range overflow");
+        g->rootRanges = JAI_GROW_ARRAY(JaiGCRootRange, g->rootRanges,
+                                       oldCapacity, newCapacity);
+        g->rootRangeCapacity = newCapacity;
+    }
+    g->rootRanges[g->rootRangeCount].values = values;
+    g->rootRanges[g->rootRangeCount].count  = count;
+    g->rootRangeCount++;
+}
+
+void jaiGCPopRootRange(void) {
+    GCState *g = jaiGCActive;
+    if (g == NULL || g->rootRangeCount <= 0) return;
+    g->rootRangeCount--;
+}
 
 void jaiGCAddPermanentRoot(Value v) {
     GCState *g = jaiGCActive;

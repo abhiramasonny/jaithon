@@ -4,6 +4,8 @@
 
 #include "value.h"
 
+typedef struct { const Value *values; int count; } JaiGCRootRange;
+
 typedef struct GCState {
     Obj      *objects;          /* intrusive list of every live object */
     Obj     **grayStack;
@@ -18,6 +20,20 @@ typedef struct GCState {
     Value    *tempRoots;
     int       tempRootCount;
     int       tempRootCapacity;
+
+    /* Ranges of Values that already live in contiguous memory somewhere the
+     * collector cannot find on its own -- today, the `roots` array inside a
+     * compiled frame's JitCallDesc.
+     *
+     * Copying those into tempRoots one at a time is what a call out of
+     * compiled code used to cost: the copy is O(roots) on both sides of every
+     * call-out, and dict_ops' inner loop makes three call-outs holding three
+     * to five object-shaped values each. Pushing the range instead is one
+     * entry whatever the count. The descriptor outlives the call by
+     * construction -- it is the caller's frame -- so borrowing it is sound. */
+    JaiGCRootRange *rootRanges;
+    int       rootRangeCount;
+    int       rootRangeCapacity;
 
     /* Roots a native subsystem owns for the life of the VM. Never popped. */
     Value    *permanentRoots;
@@ -119,6 +135,10 @@ JAI_INLINE void jaiGCMarkVal(Value v) {
  * callers that are themselves hot. Re-measure before inlining them again. */
 void jaiGCPushRoot(Value v);
 void jaiGCPopRoots(int n);
+/* Root a Value array in place, without copying it. `values` must stay valid
+ * and unmoved until the matching pop. */
+void jaiGCPushRootRange(const Value *values, int count);
+void jaiGCPopRootRange(void);
 void jaiGCPopRoot(void);
 
 /* A root that lives as long as the VM does. Native code that parks a Jaithon
