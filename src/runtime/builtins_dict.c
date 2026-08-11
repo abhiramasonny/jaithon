@@ -308,7 +308,7 @@ static bool dictMapValues(int argc, Value *args, Value *out) {
     for (int i = 0; i < entries->count; i++) {
         ObjTuple *pair = AS_TUPLE(entries->items[i]);
         Value arg = pair->items[1], mapped;
-        if (!jaiCallValue(args[1], 1, &arg, &mapped)) {
+        if (!jaiCallValue1(args[1], arg, &mapped)) {
             ok = false;
             break;
         }

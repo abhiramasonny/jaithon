@@ -421,6 +421,8 @@ static bool holdsRegister(SlotKind k) {
 #define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
 #define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
 #define FIXUP_EXIT   (UINT32_MAX - 100u) /* minus the loop-exit index */
+#define JIT_MAX_SELF_SLOW 16u
+#define FIXUP_SELFSLOW (UINT32_MAX - 200u) /* minus the self-call index */
 
 #define JIT_MAX_DEOPT 160
 
@@ -596,6 +598,21 @@ typedef struct {
         int      stub;
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
+    /* What a self-call does when the callee's verdict is not zero. Emitted
+     * with the stubs rather than inline: the fast path is three instructions
+     * and a not-taken branch, and putting thirty instructions of cold code
+     * between two recursive call sites cost fib_recursive 25% -- measured,
+     * with the same code laid out both ways. */
+    struct {
+        int      returnTo;   /* instruction index to resume the body at */
+        int      stub;
+        unsigned roots;      /* the descriptor is on the frame chain when >0 */
+        unsigned deoptBail;  /* record for verdict 1: re-execute the call */
+        unsigned deoptKind;  /* record for a result of an unexpected kind */
+        unsigned tag;        /* the tag the compiled body was built for */
+        unsigned resultReg;
+    } selfSlow[JIT_MAX_SELF_SLOW];
+    unsigned  selfSlowCount;
     uint32_t  curOffset;
     /* The model as it stood at the start of `curOffset`, before any of that
      * instruction's own pushes. A guard fires part-way through an instruction
@@ -1192,26 +1209,28 @@ static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
     return true;
 }
 
-static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
-                            bool lastFromDesc) {
-    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+/* Take the record without emitting the branch to it. The model is what it is
+ * at this moment, so a site whose *code* is emitted later -- a self-call's
+ * cold block, which lives with the stubs -- still has to record here. */
+static bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
+                          unsigned *out) {
     if (e->deoptCount >= JIT_MAX_DEOPT) {
         e->whyNot = "too many guards to record";
         e->failed = true;
-        return;
+        return false;
     }
     unsigned k = e->deoptCount++;
     if (!deoptSite(e, ip, &e->deopt[k].ip, &e->deopt[k].depth,
                    &e->deopt[k].valueDepth)) {
         e->failed = true;
-        return;
+        return false;
     }
     if (lastFromDesc && !e->inlining && e->deopt[k].depth != e->depth) {
         /* The from-descriptor entry is the top of the record, so a record that
          * was trimmed is no longer describing it. No site does both today. */
         e->whyNot = "a call's result guard resumes before the call";
         e->failed = true;
-        return;
+        return false;
     }
     e->deopt[k].lastFromDesc = lastFromDesc;
     e->deopt[k].fpLive       = e->fpLive;
@@ -1219,6 +1238,15 @@ static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
     }
+    *out = k;
+    return true;
+}
+
+static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
+                            bool lastFromDesc) {
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    unsigned k;
+    if (!deoptRecordAt(e, ip, lastFromDesc, &k)) return;
     bool always = jitDeoptStress();
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
@@ -2471,6 +2499,20 @@ static bool fpFastOp(uint8_t op) {
      * moment a subscript appeared, which is every loop that sums over an
      * array -- `sum += ai[k] * b[k][j]` being the whole of matrix_mul. */
     case OP_GET_INDEX:
+    /* Reading a field is the same argument as reading an element, and the
+     * benchmark that wanted it is nbody: `bi.vx -= dx * bj.mass * mag` reads
+     * three fields between the local it multiplies and the multiply itself,
+     * so without these two on the list every operand of every field
+     * expression materialised into an X register and came back through an
+     * fmov. Neither opcode writes a v register, and neither reads an X
+     * register whose FP copy could be the live one -- a receiver is an
+     * instance and a local is always current in X. */
+    case OP_GET_FIELD: case OP_GET_FIELD_LOCAL:
+    /* Both take their operand out of the bank -- see fpConsumer -- so both
+     * belong here too, or the dispatch loop syncs it back out first and the
+     * arm never sees a live entry. `**0.5` is a square root and sat between
+     * every `d2` and the divide that uses it. */
+    case OP_SET_FIELD: case OP_POW:
         return true;
     default:
         return false;
@@ -2491,6 +2533,7 @@ static bool fpConsumer(uint8_t op) {
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
+    case OP_SET_FIELD: case OP_POW:
         return true;
     default:
         return false;
@@ -3610,7 +3653,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_D));
             } else {
                 if (!pushValue(e, kind, 0, NULL)) return false;
-                emit(e, jaiA64LdrX(pushReg(e) - 1, recv, base + 8));
+                /* A float field goes straight to the FP bank when something
+                 * downstream will read it there: `ldr d` instead of `ldr x`
+                 * followed by the `fmov` its consumer would emit. */
+                if (kind == SLOT_FLOAT &&
+                    fpWorthLoading(e, code, off + 8, stop)) {
+                    unsigned idx = e->valueDepth - 1;
+                    emit(e, jaiA64LdrD(fpRegAt(e, idx), recv, base + 8));
+                    fpClaim(e, idx);
+                } else {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, recv, base + 8));
+                }
             }
             off += 8;
             break;
@@ -3659,7 +3712,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned rv, rr;
             SlotKind kv, kr;
-            if (!popValue(e, &rv, &kv)) return false;
+            /* A float already in the FP bank is stored from there: `str d`
+             * rather than the `fmov x, d` popValue would emit followed by
+             * `str x`. Captured before the pop, because popping is what clears
+             * the bit and renames the index. */
+            bool vIsFp = e->depth >= 1 && e->valueDepth >= 1 &&
+                         e->stack[e->depth - 1] == SLOT_FLOAT &&
+                         (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
+            unsigned dv = vIsFp ? fpRegAt(e, e->valueDepth - 1) : 0u;
+            if (vIsFp) {
+                if (!popValueRaw(e, &rv, &kv)) return false;
+            } else if (!popValue(e, &rv, &kv)) {
+                return false;
+            }
             if (!popValue(e, &rr, &kr)) return false;
             if (kr != SLOT_INST) return false;
             /* Only a number goes in. Storing an object would put a pointer the
@@ -3681,7 +3746,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64MovzX(JIT_SCRATCH_A,
                                 kv == SLOT_INT ? VAL_INT : VAL_FLOAT, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
-            emit(e, jaiA64StrX(rv, rr, base + 8));
+            if (vIsFp) emit(e, jaiA64StrD(dv, rr, base + 8));
+            else       emit(e, jaiA64StrX(rv, rr, base + 8));
             recordFieldStore(e, recvLocal, info->slot, kv);
             e->wroteHeap = true;
             off += 6;
@@ -3812,7 +3878,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             SlotKind kr;
             if (!popValue(e, &popped, &kr)) return false;
             if (!pushValue(e, kind, 0, NULL)) return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
+            if (kind == SLOT_FLOAT && fpWorthLoading(e, code, off + 6, stop)) {
+                unsigned idx = e->valueDepth - 1;
+                emit(e, jaiA64LdrD(fpRegAt(e, idx), rr, fbase + 8));
+                fpClaim(e, idx);
+            } else {
+                emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
+            }
             off += 6;
             break;
         }
@@ -3852,18 +3924,27 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "an exponent other than 0.5";
                 return false;
             }
-            unsigned rbase = pushReg(e) - 2;
-            emit(e, jaiA64LsrX(JIT_SCRATCH_A, rbase, 63));
+            /* Wholly in the FP bank. The sign bit is the one thing that needs
+             * an integer register, and taking it with an `fmov` out of the d
+             * register costs one instruction where routing the operand
+             * through X cost four -- two for the exponent constant nothing
+             * reads, two more around the fsqrt. */
+            unsigned ia = e->valueDepth - 2;
+            unsigned da = fpOperand(e, ia);
+            emit(e, jaiA64FmovXD(JIT_SCRATCH_A, da));
+            emit(e, jaiA64LsrX(JIT_SCRATCH_A, JIT_SCRATCH_A, 63));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
             branchOnDeopt(e, JAI_A64_NE);
 
             unsigned dp1, dp2;
-            if (!popValue(e, &dp1, NULL)) return false;
-            if (!popValue(e, &dp2, NULL)) return false;
+            if (!popValueRaw(e, &dp1, NULL)) return false;
+            if (!popValueRaw(e, &dp2, NULL)) return false;
             if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
-            emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, rbase));
-            emit(e, jaiA64FsqrtD(JIT_FSCRATCH_A, JIT_FSCRATCH_A));
-            emit(e, jaiA64FmovXD(pushReg(e) - 1, JIT_FSCRATCH_A));
+            {
+                unsigned idx = e->valueDepth - 1;
+                emit(e, jaiA64FsqrtD(fpRegAt(e, idx), da));
+                fpClaim(e, idx);
+            }
             off += 1;
             break;
         }
@@ -5266,14 +5347,90 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                    (unsigned)offsetof(JitCallDesc, link)));
                 emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
             }
-            /* x1 carries the callee's verdict; a bail there is a bail here. */
-            emit(e, jaiA64SubsXImm(31, 1, 0));
-            branchOnCondition(e, JAI_A64_NE);
+            /* x1 carries the callee's verdict, and each of the three answers
+             * needs a different one here. This used to be one `bail`, which is
+             * why `place` in queens has never compiled: a bail re-runs the
+             * whole caller from the top, and `cols[row] = col` sits above the
+             * recursion, so `bailAfterWrite` declined the body outright.
+             *
+             *   0  the value is in x0. The whole cost of this is one compare
+             *      and one not-taken branch.
+             *   2  the callee raised. The interpreter owns it; leave.
+             *   1  the callee bailed, which it may only do having written
+             *      nothing, so the CALL can be re-executed. Not a bail here
+             *      though -- a deopt at this instruction, which resumes the
+             *      interpreter with the caller's own earlier writes done and
+             *      not repeated. That distinction is the whole unlock.
+             *   4  the callee deoptimised part-way and may have written. The
+             *      call cannot be re-executed, and the caller cannot record a
+             *      second deopt over the callee's. So the callee is FINISHED
+             *      in the interpreter, from its own record, and its value
+             *      handed back here -- gDeopt is consumed at the innermost
+             *      frame that sees it, which is why one record still suffices
+             *      however deep the recursion goes.
+             *
+             * The interpreted continuation may return a kind this body did not
+             * compile for -- a `return` the compiler typed from one
+             * observation. That lands in the descriptor's result slot with
+             * whatever tag it really has, and the existing `lastFromDesc`
+             * deopt writes it out from there. */
+            /* The fast path is what a recursive body pays per call: one
+             * compare and one branch that is not taken. Every other answer is
+             * a jump to a block emitted with the stubs -- inline, the two call
+             * sites in `fib` had thirty instructions of cold code between them
+             * and the benchmark lost 25%.
+             *
+             * The records have to be taken HERE even though the code is
+             * emitted later, because they are of the model as it stands at
+             * this instruction, and the model has moved on by then. */
+            if (e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
+                e->whyNot = "more self-calls than the tier tracks";
+                return false;
+            }
+            unsigned si = e->selfSlowCount++;
+            unsigned resultReg = valueXReg(e, e->valueDepth - argc);
+            e->selfSlow[si].roots     = selfRoots;
+            e->selfSlow[si].resultReg = resultReg;
+            e->selfSlow[si].stub      = -1;
+            /* Verdict 1: the callee bailed, and it may only do that having
+             * written nothing, so the CALL is re-executed. Not a bail here --
+             * a bail re-runs this whole body from the top, which is what
+             * `cols[row] = col` above the recursion in queens' `place` made
+             * unsound and is why that function has never compiled. A deopt at
+             * this instruction resumes the interpreter with the caller's own
+             * earlier writes done and not repeated. */
+            if (!deoptRecordAt(e, (uint32_t)off, false,
+                               &e->selfSlow[si].deoptBail)) {
+                return false;
+            }
 
+            emit(e, jaiA64SubsXImm(31, 1, 0));
+            if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_SELFSLOW - si;
+            e->fixups[e->fixupCount].conditional  = true;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, jaiA64BCond(JAI_A64_NE, 0));
+            emit(e, jaiA64MovX(resultReg, 0));
+            e->selfSlow[si].returnTo = (int)e->count;
+
+            /* The call has happened, so the model moves on before the second
+             * record: an unexpected result kind resumes AFTER the call,
+             * holding what the descriptor carries. */
             e->depth      -= argc + 1;
             e->valueDepth -= argc;
             if (!pushValue(e, e->returnKind, e->returnShape, NULL)) return false;
-            emit(e, jaiA64MovX(pushReg(e) - 1, 0));
+            e->selfSlow[si].tag =
+                  e->returnKind == SLOT_INT   ? VAL_INT
+                : e->returnKind == SLOT_FLOAT ? VAL_FLOAT
+                : e->returnKind == SLOT_BOOL  ? VAL_BOOL
+                : e->returnKind == SLOT_NULL  ? VAL_NULL
+                                              : VAL_OBJ;
+            if (!deoptRecordAt(e, (uint32_t)off + 2u, true,
+                               &e->selfSlow[si].deoptKind)) {
+                return false;
+            }
             off += 2;
             break;
         }
@@ -5786,6 +5943,77 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     emit(&e, jaiA64MovzX(0, 0, 0));
     emitEpilogue(&e, 2);
 
+    /* A self-call whose callee did not return cleanly. Out of line so that the
+     * body keeps one compare and one not-taken branch per recursive call.
+     *
+     * Verdict 4 is the one that needed building: the callee deoptimised
+     * part-way and may have written, so the call can neither be re-executed
+     * nor recorded over -- gDeopt is a single global. The callee is FINISHED
+     * in the interpreter from its own record instead, and its value handed
+     * back here, which consumes the record at the innermost frame that sees
+     * it. That is why one record still suffices however deep the recursion
+     * goes, and it is what makes a recursive body that writes compilable. */
+    for (unsigned si = 0; si < e.selfSlowCount; si++) {
+        e.selfSlow[si].stub = (int)e.count;
+        unsigned d = e.descOffset;
+        unsigned resultAt = d + (unsigned)offsetof(JitCallDesc, result);
+
+        emit(&e, jaiA64SubsXImm(31, 1, 2));            /* the callee raised */
+        emit(&e, jaiA64BCond(JAI_A64_EQ,
+                             (int32_t)(e.exceptionExit - (int)e.count)));
+
+        emit(&e, jaiA64SubsXImm(31, 1, 4));
+        if (e.fixupCount >= JIT_MAX_FIXUPS) { e.failed = true; break; }
+        e.fixups[e.fixupCount].instIndex    = (int)e.count;
+        e.fixups[e.fixupCount].targetOffset =
+            FIXUP_DEOPT - e.selfSlow[si].deoptBail;
+        e.fixups[e.fixupCount].conditional  = true;
+        e.fixups[e.fixupCount].depth        = -1;
+        e.fixupCount++;
+        emit(&e, jaiA64BCond(JAI_A64_NE, 0));
+
+        /* jaiJitFinishDeopt runs interpreted code, which allocates, so the
+         * roots this frame filled before the `bl` go back on the chain. */
+        if (e.selfSlow[si].roots > 0) {
+            emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+            emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+            emit(&e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                (unsigned)offsetof(JitCallDesc, link)));
+            emit(&e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+        }
+        emitConst64(&e, 0, (int64_t)(uintptr_t)closure);
+        emit(&e, jaiA64AddXImm(1, 31, resultAt));
+        emitConst64(&e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jaiJitFinishDeopt);
+        emit(&e, jaiA64Blr(JIT_SCRATCH_D));
+        if (e.selfSlow[si].roots > 0) {
+            emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+            emit(&e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+            emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                (unsigned)offsetof(JitCallDesc, link)));
+            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+        }
+        emit(&e, jaiA64SubsXImm(31, 0, 0));            /* false: it raised */
+        emit(&e, jaiA64BCond(JAI_A64_EQ,
+                             (int32_t)(e.exceptionExit - (int)e.count)));
+
+        /* The interpreted continuation may return a kind this body was not
+         * compiled for. It is in the descriptor with whatever tag it really
+         * has, which is exactly what a `lastFromDesc` record writes out. */
+        emit(&e, jaiA64LdrW(JIT_SCRATCH_A, 31, resultAt));
+        emit(&e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e.selfSlow[si].tag));
+        if (e.fixupCount >= JIT_MAX_FIXUPS) { e.failed = true; break; }
+        e.fixups[e.fixupCount].instIndex    = (int)e.count;
+        e.fixups[e.fixupCount].targetOffset =
+            FIXUP_DEOPT - e.selfSlow[si].deoptKind;
+        e.fixups[e.fixupCount].conditional  = true;
+        e.fixups[e.fixupCount].depth        = -1;
+        e.fixupCount++;
+        emit(&e, jaiA64BCond(JAI_A64_NE, 0));
+        emit(&e, jaiA64LdrX(e.selfSlow[si].resultReg, 31, resultAt + 8));
+        emit(&e, jaiA64B((int32_t)(e.selfSlow[si].returnTo - (int)e.count)));
+    }
+
     /* One stub per guard, out of line. Each writes the record the interpreter
      * resumes from: the locals, the operand stack as it stood at that
      * instruction, and the offset of the instruction itself. */
@@ -5966,6 +6194,18 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a stub it branches to "
                                     "was never emitted\n",
+                            fn->name ? fn->name->chars : "<anon>");
+                }
+                jitFree(map, depths, fn->chunk.count + 1);
+                return false;
+            }
+        } else if (f->targetOffset <= FIXUP_SELFSLOW &&
+                   f->targetOffset > FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW) {
+            target = e.selfSlow[FIXUP_SELFSLOW - f->targetOffset].stub;
+            if (target < 0) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: a self-call block was "
+                                    "never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
                 jitFree(map, depths, fn->chunk.count + 1);
@@ -6708,33 +6948,23 @@ typedef JitResult (*Fn2)(int64_t, int64_t);
 typedef JitResult (*Fn3)(int64_t, int64_t, int64_t);
 typedef JitResult (*Fn4)(int64_t, int64_t, int64_t, int64_t);
 
-JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
-    ObjFunction *fn = closure->fn;
-    if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
-
-    /* Compiled code reads the global that names this function exactly once,
-     * at compile time, and then calls it directly. Rebinding the name has to
-     * invalidate that, and a module's version counter moves on every global
-     * mutation, so one comparison covers it. It is conservative -- any global
-     * write in the module retires the compiled form -- and conservative is the
-     * safe direction. */
-    if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion) {
-        return JAI_JIT_DECLINED;
-    }
-
-    unsigned arity = fn->jitArgCount;
-    int64_t a[JIT_MAX_ARITY];
-    for (unsigned i = 0; i < arity; i++) {
-        Value v = slotBase[fn->jitArgBase + i];
+/* One incoming argument, converted from the Value the interpreter holds to the
+ * raw payload the compiled prologue expects, with every check the compiled
+ * body was allowed to assume. */
+static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
+                            unsigned i, int64_t *out) {
+    const ObjFunction *fn = closure->fn;
+    Value v = slotBase[fn->jitArgBase + i];
+    {
         switch ((SlotKind)fn->jitParamKind[i]) {
         case SLOT_INT:
-            if (!IS_INT(v)) return JAI_JIT_DECLINED;
-            a[i] = AS_INT(v);
+            if (!IS_INT(v)) return false;
+            *out = AS_INT(v);
             break;
         case SLOT_FLOAT: {
-            if (!IS_FLOAT(v)) return JAI_JIT_DECLINED;
+            if (!IS_FLOAT(v)) return false;
             double d = AS_FLOAT(v);
-            memcpy(&a[i], &d, sizeof a[i]);
+            memcpy(out, &d, sizeof *out);
             break;
         }
         case SLOT_MAYBE_INST: {
@@ -6742,14 +6972,14 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
              * still checked when there is one, because a self-call branches
              * straight to the prologue and this is the only place it is
              * established. */
-            if (IS_NULL(v)) { a[i] = 0; break; }
-            if (!IS_INSTANCE(v)) return JAI_JIT_DECLINED;
+            if (IS_NULL(v)) { *out = 0; break; }
+            if (!IS_INSTANCE(v)) return false;
             ObjInstance *mi = AS_INSTANCE(v);
             if (mi->klass == NULL ||
                 mi->klass->shapeId != fn->jitParamShape[i]) {
-                return JAI_JIT_DECLINED;
+                return false;
             }
-            a[i] = (int64_t)(uintptr_t)mi;
+            *out = (int64_t)(uintptr_t)mi;
             break;
         }
         case SLOT_INST: {
@@ -6758,51 +6988,47 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
              * raw pointer, which is safe only because the body cannot
              * allocate -- no collection can run while it does -- and the
              * argument slots keep the instance reachable meanwhile. */
-            if (!IS_INSTANCE(v)) return JAI_JIT_DECLINED;
+            if (!IS_INSTANCE(v)) return false;
             ObjInstance *inst = AS_INSTANCE(v);
             if (inst->klass == NULL ||
                 inst->klass->shapeId != fn->jitParamShape[i]) {
-                return JAI_JIT_DECLINED;
+                return false;
             }
-            a[i] = (int64_t)(uintptr_t)inst;
+            *out = (int64_t)(uintptr_t)inst;
             break;
         }
         case SLOT_LIST:
-            if (!IS_LIST(v)) return JAI_JIT_DECLINED;
-            a[i] = (int64_t)(uintptr_t)AS_LIST(v);
+            if (!IS_LIST(v)) return false;
+            *out = (int64_t)(uintptr_t)AS_LIST(v);
             break;
         case SLOT_OBJ:
-            if (!IS_OBJ(v)) return JAI_JIT_DECLINED;
-            a[i] = (int64_t)(uintptr_t)AS_OBJ(v);
+            if (!IS_OBJ(v)) return false;
+            *out = (int64_t)(uintptr_t)AS_OBJ(v);
             break;
         case SLOT_BOOL:
-            if (!IS_BOOL(v)) return JAI_JIT_DECLINED;
-            a[i] = AS_BOOL(v) ? 1 : 0;
+            if (!IS_BOOL(v)) return false;
+            *out = AS_BOOL(v) ? 1 : 0;
             break;
         case SLOT_OPAQUE:
-            a[i] = 0;   /* never read; see seedLocals */
+            *out = 0;   /* never read; see seedLocals */
             break;
         case SLOT_CLOSURE:
             /* Not a slot at all: the closure the interpreter is calling. Safe
              * to hold raw for the same reason every other pointer here is --
              * the body cannot allocate, and the caller holds this closure. */
-            a[i] = (int64_t)(uintptr_t)closure;
+            *out = (int64_t)(uintptr_t)closure;
             break;
         default:
-            return JAI_JIT_DECLINED;
+            return false;
         }
     }
+    return true;
+}
 
-    JitResult r;
-    switch (arity) {
-    case 0: r = ((Fn0)(uintptr_t)fn->jitFunc)(); break;
-    case 1: r = ((Fn1)(uintptr_t)fn->jitFunc)(a[0]); break;
-    case 2: r = ((Fn2)(uintptr_t)fn->jitFunc)(a[0], a[1]); break;
-    case 3: r = ((Fn3)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2]); break;
-    case 4: r = ((Fn4)(uintptr_t)fn->jitFunc)(a[0], a[1], a[2], a[3]); break;
-    default: return JAI_JIT_DECLINED;
-    }
-
+/* The verdict and the returned payload, turned back into what the
+ * interpreter holds. */
+static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
+                                         Value *slotBase) {
     if (r.bailed == 2) return JAI_JIT_ERROR;
     if (r.bailed == 4) return JAI_JIT_DEOPT;
     if (r.bailed) {
@@ -6849,6 +7075,47 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     vm.stackTop = slotBase + 1;
     return JAI_JIT_DONE;
 }
+
+JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
+    ObjFunction *fn = closure->fn;
+    if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
+
+    /* Compiled code reads the global that names this function exactly once,
+     * at compile time, and then calls it directly. Rebinding the name has to
+     * invalidate that, and a module's version counter moves on every global
+     * mutation, so one comparison covers it. It is conservative -- any global
+     * write in the module retires the compiled form -- and conservative is the
+     * safe direction. */
+    if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion) {
+        return JAI_JIT_DECLINED;
+    }
+
+    unsigned arity = fn->jitArgCount;
+    int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    /* Unrolled rather than a loop over `int64_t a[JIT_MAX_ARITY]`, and that is
+     * measured rather than tidy. An array of four int64 is what makes clang
+     * give this function a stack-protector prologue and epilogue, and it made
+     * every argument travel out to the frame and back on its way to the
+     * register the call is about to read it from. This function is on the path
+     * of every interpreted call to a compiled body -- 43% of `xs.map(|x| x*2)`
+     * and 13% of queens, by `sample` -- so both of those are paid per call. */
+    if (arity > JIT_MAX_ARITY) return JAI_JIT_DECLINED;
+    if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0)) return JAI_JIT_DECLINED;
+    if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1)) return JAI_JIT_DECLINED;
+    if (arity > 2 && !jitArgIn(closure, slotBase, 2, &a2)) return JAI_JIT_DECLINED;
+    if (arity > 3 && !jitArgIn(closure, slotBase, 3, &a3)) return JAI_JIT_DECLINED;
+
+    JitResult r;
+    switch (arity) {
+    case 0: r = ((Fn0)(uintptr_t)fn->jitFunc)(); break;
+    case 1: r = ((Fn1)(uintptr_t)fn->jitFunc)(a0); break;
+    case 2: r = ((Fn2)(uintptr_t)fn->jitFunc)(a0, a1); break;
+    case 3: r = ((Fn3)(uintptr_t)fn->jitFunc)(a0, a1, a2); break;
+    default: r = ((Fn4)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3); break;
+    }
+    return jitResultOut(fn, r, slotBase);
+}
+
 
 #else
 

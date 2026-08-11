@@ -71,6 +71,18 @@ typedef enum {
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
 
+/* Finish, in the interpreter, a compiled body that deoptimised part-way --
+ * building its frame entirely out of the record, since a compiled self-call
+ * left nothing of the callee on the VM stack. The value it returns goes to
+ * `*out`; false means an exception is pending.
+ *
+ * This is what lets a recursive body that writes the heap be compiled at all.
+ * The alternative answers -- bail, or record a second deopt for the caller --
+ * would either repeat the caller's writes or overwrite the callee's record,
+ * and the record is a single global precisely because it is consumed here,
+ * at the innermost frame that observes it, before anything can write another. */
+bool jaiJitFinishDeopt(ObjClosure *closure, Value *out);
+
 /* Mark the roots of every compiled frame that has linked itself. */
 void jaiJitMarkFrames(void);
 

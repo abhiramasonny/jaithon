@@ -1351,6 +1351,83 @@ bool jaiCallValue(Value callee, int argc, Value *args, Value *out) {
     return true;
 }
 
+/* See jit.h. A compiled self-call is a bare `bl`: the callee's arguments never
+ * reached the VM stack, so its frame is built here from nothing but the deopt
+ * record, which carries every local -- parameters included -- and the operand
+ * stack as they stood at the guard that failed. Slot 0 is the closure, which
+ * a self-call knows because it is its own. */
+bool jaiJitFinishDeopt(ObjClosure *closure, Value *out) {
+    ObjFunction *fn = closure->fn;
+    int window = frameWindowSize(fn);
+    if (!ensureRoom(vm.stackTop, window + JAI_FRAME_SLACK)) return false;
+
+    Value *base = vm.stackTop;
+    *vm.stackTop++ = OBJ_VAL(closure);
+    for (int i = 1; i < window; i++) *vm.stackTop++ = NULL_VAL;
+
+    int frameBase = vm.frameCount;
+    if (!pushFrame(closure, base) || !jaiJitApplyDeopt(closure, base) ||
+        run(frameBase) != JAI_RUN_OK) {
+        vm.stackTop = base;
+        return false;
+    }
+    *out = *(--vm.stackTop);
+    vm.stackTop = base;
+    return true;
+}
+
+/* See vm.h. The two stack cells stay: jaiJitEnterFunc reads its arguments from
+ * `base[jitArgBase + i]` and writes the result to `base[0]`, and while the
+ * compiled body runs those two cells are the only thing keeping the closure
+ * and the argument reachable -- a compiled body may allocate, and a collection
+ * scans the VM stack.
+ *
+ * A deopt is handled here rather than fallen through to jaiCallValue, and that
+ * is not a nicety: the compiled body ran partway and may have written, so
+ * re-entering the call from the top would repeat those writes. It is the same
+ * sequence callClosure runs for JAI_JIT_DEOPT, with the interpreter driven to
+ * completion the way jaiCallValue would have. */
+bool jaiCallValue1(Value callee, Value arg, Value *out) {
+    if (JAI_LIKELY(IS_CLOSURE(callee))) {
+        ObjClosure *closure = AS_CLOSURE(callee);
+        ObjFunction *fn = closure->fn;
+        if (fn->jitFunc != NULL && fn->arity == 1) {
+            if (!ensureStack(3)) return false;
+            Value *base = vm.stackTop;
+            base[0] = callee;
+            base[1] = arg;
+            vm.stackTop = base + 2;
+
+            int frameBase = vm.frameCount;
+            JaiJitOutcome outcome = jaiJitEnterFunc(closure, base);
+            if (outcome == JAI_JIT_DONE) {
+                *out = base[0];
+                vm.stackTop = base;
+                return true;
+            }
+            if (outcome == JAI_JIT_ERROR) {
+                vm.stackTop = base;
+                return false;
+            }
+            if (outcome == JAI_JIT_DEOPT) {
+                vm.stackTop = base + 2;
+                if (!bindCallArgs(closure, 1, base) ||
+                    !pushFrame(closure, base) ||
+                    !jaiJitApplyDeopt(closure, base) ||
+                    run(frameBase) != JAI_RUN_OK) {
+                    vm.stackTop = base;
+                    return false;
+                }
+                *out = *(--vm.stackTop);
+                vm.stackTop = base;
+                return true;
+            }
+            vm.stackTop = base;   /* declined; the general path below */
+        }
+    }
+    return jaiCallValue(callee, 1, &arg, out);
+}
+
 /* Resolve `receiver.name` to something callable with the receiver in slot 0.
  * Returns false *without* an exception when there is simply no such method:
  * callers such as value.c use that to fall back to a default behaviour.
