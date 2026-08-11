@@ -584,6 +584,38 @@ int main(void) {
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64OrrX(0, 1, 2), jaiA64Ret() };
       check("orr", runWith(w, 4, cell), 0xf0 | 0x3c); }
+
+    /* and-with-a-run-of-ones, which is floor-mod by a power of two. The
+     * negative case is the one that matters: `x %% 8` is 5 for x = -3, and the
+     * mask has to produce that rather than -3's truncated remainder. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x1234, 0),
+                             jaiA64AndXOnes(0, 1, 8), jaiA64Ret() };
+      check("and ones 8", runWith(w, 3, cell), 0x1234 & 0xff); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64SubsXReg(1, 31, 1),
+                             jaiA64AndXOnes(0, 1, 3), jaiA64Ret() };
+      check("and ones negative", runWith(w, 4, cell), 5); }
+    { const uint32_t w[] = { jaiA64MovnX(1, 0),          /* x1 = -1 */
+                             jaiA64AndXOnes(0, 1, 1), jaiA64Ret() };
+      check("and ones 1", runWith(w, 3, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovnX(1, 0),
+                             jaiA64AndXOnes(0, 1, 31), jaiA64Ret() };
+      check("and ones 31", runWith(w, 3, cell), 0x7fffffff); }
+    { const uint32_t w[] = { jaiA64MovnX(1, 0),
+                             jaiA64AndXOnes(0, 1, 62), jaiA64Ret() };
+      check("and ones 62", runWith(w, 3, cell),
+            (int64_t)(((uint64_t)1 << 62) - 1)); }
+    { const uint32_t w[] = { jaiA64MovnX(1, 0),
+                             jaiA64AndXOnes(0, 1, 63), jaiA64Ret() };
+      check("and ones 63", runWith(w, 3, cell),
+            (int64_t)(((uint64_t)1 << 63) - 1)); }
+    /* asr is the floor-division half of the same pair, and it too has to floor
+     * rather than truncate: -7 // 2 is -4, not -3. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64SubsXReg(1, 31, 1),
+                             jaiA64AsrX(0, 1, 1), jaiA64Ret() };
+      check("asr floors negative", runWith(w, 4, cell), -4); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 7, 0), jaiA64AsrX(0, 1, 0),
+                             jaiA64Ret() };
+      check("asr 0", runWith(w, 3, cell), 7); }
     { const uint32_t w[] = { jaiA64MovzX(1, 0x1234, 0), jaiA64MovzX(2, 5, 0),
                              jaiA64LslvX(0, 1, 2), jaiA64Ret() };
       check("lslv", runWith(w, 4, cell), 0x1234 << 5); }

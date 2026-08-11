@@ -87,6 +87,8 @@ uint32_t jaiA64CselX(unsigned rd, unsigned rn, unsigned rm, unsigned cond);
 uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset);
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm);
+/* and Xd, Xn, #((1 << ones) - 1) -- `ones` is 1..63, a low run of set bits */
+uint32_t jaiA64AndXOnes(unsigned rd, unsigned rn, unsigned ones);
 uint32_t jaiA64LslvX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64AsrvX(unsigned rd, unsigned rn, unsigned rm);
 /* cset Xd, <cond> -- 1 when the condition holds, else 0 */

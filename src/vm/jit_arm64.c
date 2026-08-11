@@ -325,6 +325,20 @@ uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xaa000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+/* and Xd, Xn, #((1 << ones) - 1) -- the AND (immediate) form, restricted to the
+ * one pattern this needs: a run of `ones` set bits at the bottom.
+ *
+ * arm64's logical immediates are an encoded (N, immr, imms) triple, not a
+ * number, and only some 64-bit values have one. A low run of n ones is
+ * N=1, immr=0, imms=n-1, which is why the restriction: it makes the encoding a
+ * subtraction rather than the general bitmask search, and the general search is
+ * exactly the sort of thing that would be wrong in a corner nothing exercises.
+ * `ones` must be 1..63 -- 0 is not a legal pattern (all-zero) and 64 is the
+ * all-ones one, and neither is reachable from a positive int64 power of two. */
+uint32_t jaiA64AndXOnes(unsigned rd, unsigned rn, unsigned ones) {
+    return 0x92400000u | (((ones - 1u) & 0x3fu) << 10) | (rn << 5) | rd;
+}
+
 /* Shift by a register. Both use only the low six bits of the amount, so a
  * count of 64 or more wraps rather than saturating -- the callers guard for
  * that before emitting these. */

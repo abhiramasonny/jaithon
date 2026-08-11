@@ -42,6 +42,10 @@
 /* For jaiBuiltinMethod: resolving `xs.len()` to its native happens at compile
  * time, so the tier has to ask the runtime what a name means. */
 #include "runtime/runtime.h"
+/* For jaiOpBranchOperandAt: the one list of which opcodes carry a code address,
+ * which is what says whether an offset can be reached by anything but the
+ * fall-through. */
+#include "verify.h"
 #include "vm.h"
 
 #include <stdio.h>
@@ -1930,6 +1934,78 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
 static bool compileBody(Emit *e, ObjClosure *closure);
 static int instructionLength(const Chunk *c, int off);
 
+/* ---- literal operands -------------------------------------------------- */
+
+/* Can anything but the fall-through arrive at `off`?
+ *
+ * The walk through a body is linear, so the instruction it visited last is the
+ * one lexically before this -- but only when nothing jumps here. `x // (if c {
+ * 2 } else { 4 })` puts an OP_INT immediately before the OP_FLOORDIV *and* a
+ * jump from the other arm onto it, so "the previous instruction pushed 2" is
+ * true on one path and false on the other. Reading the constant off the
+ * previous instruction without this test is a miscompile, not a decline.
+ *
+ * Every branch in the chunk is scanned, not just the ones already emitted: a
+ * back edge is compiled after its target is walked, so consulting the fixup
+ * list would miss exactly the loop tops. Handler and finally addresses count
+ * too -- the unwinder resumes at one with a stack this walk never saw. */
+static bool offsetIsBranchTarget(const Chunk *c, uint32_t off) {
+    for (int at = 0; at < c->count;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return true;      /* undecodable: assume the worst */
+        int rel = jaiOpBranchOperandAt(c->code[at]);
+        if (rel >= 0) {
+            int16_t jump = jaiReadI16(c->code + at + 1 + rel);
+            /* Every branch operand is measured from the end of the
+             * instruction, which is what `at + len` is. */
+            if ((int32_t)(at + len) + jump == (int32_t)off) return true;
+        }
+        at += len;
+    }
+    return false;
+}
+
+/* The int literal the instruction at `prevOff` pushes, when the instruction at
+ * `off` is guaranteed to see it on top of the stack.
+ *
+ * `OP_INT` carries the value in its operand and `OP_CONST` names a pool entry;
+ * those are the only two ways a literal reaches the stack. The adjacency check
+ * is belt and braces -- the walk is linear, so it always holds -- but an
+ * opcode arm that advanced `off` by the wrong amount would break it, and that
+ * has happened here before (OP_FORMAT advanced by nine instead of ten). */
+static bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
+                              int64_t *out) {
+    if (prevOff < 0 || prevOff >= off) return false;
+    const Chunk *c = &fn->chunk;
+    if (prevOff + instructionLength(c, prevOff) != off) return false;
+    uint8_t prev = c->code[prevOff];
+    if (prev == OP_INT) {
+        *out = jaiReadI16(c->code + prevOff + 1);
+    } else if (prev == OP_CONST) {
+        uint32_t idx = jaiReadU24(c->code + prevOff + 1);
+        if (idx >= (uint32_t)c->constants.count) return false;
+        Value k = c->constants.data[idx];
+        if (!IS_INT(k)) return false;
+        *out = AS_INT(k);
+    } else {
+        return false;
+    }
+    return !offsetIsBranchTarget(c, (uint32_t)off);
+}
+
+/* `k` is 2^shift, for a shift this can name. Positive only: floor division by
+ * a negative power of two is not a shift, and `k` is at most 2^62 because 2^63
+ * does not fit in a positive int64. */
+static bool powerOfTwoShift(int64_t k, unsigned *shift) {
+    if (k <= 0) return false;
+    uint64_t u = (uint64_t)k;
+    if ((u & (u - 1u)) != 0u) return false;
+    unsigned s = 0;
+    while ((u >> s) != 1u) s++;
+    *shift = s;
+    return true;
+}
+
 /* Something inside an inlined body could not be emitted, so the whole compile
  * is worth retrying with inlining off rather than declining: the same call
  * through the descriptor still compiles, and a compiled form with a real call
@@ -2680,7 +2756,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
     int start = (!e->inlining && e->osr) ? (int)e->osrTop : 0;
     int stop  = (!e->inlining && e->osr) ? (int)e->osrEnd : count;
     bool afterUncond = false;
+    /* The offset the walk visited before this one, for the arms that want to
+     * know whether the value on top of the stack came from a literal. Updated
+     * at the top rather than the bottom because arms leave the loop body by
+     * `break`, by `continue` and by `return` alike. */
+    int prevOff = -1, thisOff = -1;
     for (int off = start; off < stop && !e->failed;) {
+        prevOff = thisOff;
+        thisOff = off;
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
         afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
         e->offsetToInst[off]  = (int)e->count;
@@ -3447,7 +3530,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->stack[e->depth - 1] != SLOT_INT) return false;
             if (e->stack[e->depth - 2] != SLOT_INT) return false;
 
-            if (op == OP_SHL || op == OP_SHR) {
+            /* A literal count settles both edges here rather than at run time,
+             * and the immediate-form shift is then exactly the interpreter's
+             * rule for that count: `<<` is the unsigned shift LSL performs and
+             * `>>` the arithmetic one ASR performs, for every count in 0..63.
+             * bitops shifts by 7, 3, 11, 1 and 31 and paid five instructions
+             * and two deopt sites for each. */
+            int64_t kcount;
+            bool kcountUsable =
+                (op == OP_SHL || op == OP_SHR) &&
+                literalIntOperand(fn, prevOff, off, &kcount) &&
+                kcount >= 0 && kcount <= 63;
+
+            if ((op == OP_SHL || op == OP_SHR) && !kcountUsable) {
                 unsigned rCount = pushReg(e) - 1;
                 emit(e, jaiA64SubsXImm(31, rCount, 0));
                 branchOnDeopt(e, JAI_A64_LT);            /* negative count */
@@ -3460,6 +3555,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &ra, &ka)) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
+            if (kcountUsable) {
+                emit(e, op == OP_SHL ? jaiA64LslX(rd, ra, (unsigned)kcount)
+                                     : jaiA64AsrX(rd, ra, (unsigned)kcount));
+                off += 1;
+                break;
+            }
             emit(e, op == OP_BAND ? jaiA64AndX(rd, ra, rb)
                   : op == OP_BOR  ? jaiA64OrrX(rd, ra, rb)
                   : op == OP_BXOR ? jaiA64EorX(rd, ra, rb)
@@ -3957,11 +4058,35 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->stack[e->depth - 2] != SLOT_INT) return false;
             unsigned ry = pushReg(e) - 1, rx = pushReg(e) - 2;
 
-            emit(e, jaiA64SubsXImm(31, ry, 0));
-            branchOnDeopt(e, JAI_A64_EQ);
-            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, ry, 1));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
-            branchOnDeopt(e, JAI_A64_EQ);
+            /* A literal modulus decides both guards, and a literal power of
+             * two decides the whole thing. Floor remainder by a positive m is
+             * the unique r in [0, m) with x = m*q + r; for m = 2^s that is the
+             * low s bits, which two's complement already holds -- so it is
+             * exact for negative dividends, where the truncating `msub` below
+             * is not and the correction after it exists to fix that. */
+            int64_t kmod;
+            bool kmodKnown = literalIntOperand(fn, prevOff, off, &kmod) &&
+                             kmod != 0 && kmod != -1;
+            unsigned mshift;
+            if (kmodKnown && powerOfTwoShift(kmod, &mshift)) {
+                unsigned q1, q2;
+                if (!popValue(e, &q1, NULL)) return false;
+                if (!popValue(e, &q2, NULL)) return false;
+                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                unsigned rd = pushReg(e) - 1;
+                if (mshift == 0) emitConst64(e, rd, 0);   /* x %% 1 is 0 */
+                else emit(e, jaiA64AndXOnes(rd, rx, mshift));
+                off += 1;
+                break;
+            }
+
+            if (!kmodKnown) {
+                emit(e, jaiA64SubsXImm(31, ry, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, ry, 1));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
 
             emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, ry));
             emit(e, jaiA64MsubX(JIT_SCRATCH_C, JIT_SCRATCH_B, ry, rx));
@@ -3991,6 +4116,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_INT) return false;
             unsigned rx = pushReg(e) - 1;
 
+            /* A power of two is the low bits and nothing else -- see OP_MOD. */
+            unsigned kshift;
+            if (powerOfTwoShift(imm, &kshift)) {
+                if (kshift == 0) emitConst64(e, rx, 0);
+                else emit(e, jaiA64AndXOnes(rx, rx, kshift));
+                off += 3;
+                break;
+            }
+
             emitConst64(e, JIT_SCRATCH_A, imm);
             emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, JIT_SCRATCH_A));
             emit(e, jaiA64MsubX(JIT_SCRATCH_C, JIT_SCRATCH_B, JIT_SCRATCH_A, rx));
@@ -4014,15 +4148,38 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT || kb != SLOT_INT) return false;
             rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
+            /* A literal divisor decides both guards at compile time, and a
+             * literal power of two decides the whole thing: floor(x / 2^s) is
+             * `asr x, #s` for every int64 x, negative ones included, because
+             * asr rounds toward minus infinity and that is precisely what the
+             * correction below exists to reproduce. Fifteen instructions and
+             * two deopt sites become one instruction and none. */
+            int64_t kdiv;
+            bool kdivKnown = literalIntOperand(fn, prevOff, off, &kdiv) &&
+                             kdiv != 0 && kdiv != -1;
+            unsigned dshift;
+            if (kdivKnown && powerOfTwoShift(kdiv, &dshift)) {
+                unsigned p1, p2;
+                if (!popValue(e, &p1, NULL)) return false;
+                if (!popValue(e, &p2, NULL)) return false;
+                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                emit(e, jaiA64AsrX(pushReg(e) - 1, ra, dshift));
+                off += 1;
+                break;
+            }
+
             /* Zero, and -1 with it: the interpreter reports the
              * division-by-zero, and INT64_MIN / -1 is the one quotient that
              * does not fit. Both are rare enough that declining -1 outright
-             * costs nothing and removes the special case. */
-            emit(e, jaiA64SubsXImm(31, rb, 0));
-            branchOnDeopt(e, JAI_A64_EQ);
-            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, rb, 1));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
-            branchOnDeopt(e, JAI_A64_EQ);
+             * costs nothing and removes the special case. A literal divisor
+             * has already answered both. */
+            if (!kdivKnown) {
+                emit(e, jaiA64SubsXImm(31, rb, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, rb, 1));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
 
             unsigned d1, d2;
             if (!popValue(e, &d1, NULL)) return false;

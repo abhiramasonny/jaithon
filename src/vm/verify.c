@@ -23,8 +23,12 @@
 #include "vm.h"
 
 /* Byte index of the i16 branch operand inside `op`'s operand run, or -1 when
- * the instruction carries no code address. Keep in sync with chunk.h. */
-static int branchOperandAt(uint8_t op) {
+ * the instruction carries no code address. Keep in sync with chunk.h.
+ *
+ * Not static: the JIT asks the same question when it wants to know whether an
+ * offset can be reached by anything but the fall-through, and two copies of
+ * this list would drift. */
+int jaiOpBranchOperandAt(uint8_t op) {
     switch (op) {
     case OP_JUMP:
     case OP_JUMP_IF_FALSE:
@@ -59,7 +63,7 @@ static int branchOperandAt(uint8_t op) {
  * PUSH_HANDLER and PUSH_FINALLY only *register* an address; control does not
  * transfer there at that point, so no stack state flows along the edge. */
 static bool opBranchIsEdge(uint8_t op) {
-    return branchOperandAt(op) >= 0 && op != OP_PUSH_HANDLER &&
+    return jaiOpBranchOperandAt(op) >= 0 && op != OP_PUSH_HANDLER &&
            op != OP_PUSH_FINALLY;
 }
 
@@ -446,7 +450,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             uint32_t k = jaiReadU24(chunk->code + offset + 1);
             operands = 3 + 3 * (int)AS_FUNCTION(chunk->constants.data[k])->upvalueCount;
         }
-        int at = branchOperandAt(op);
+        int at = jaiOpBranchOperandAt(op);
         if (at >= 0) {
             int16_t rel = jaiReadI16(chunk->code + offset + 1 + at);
             long target = (long)offset + 1 + operands + rel;
@@ -552,7 +556,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
                 }
             }
 
-            int at = branchOperandAt(op);
+            int at = jaiOpBranchOperandAt(op);
             if (at >= 0 && opBranchIsEdge(op)) {
                 jumpTo = (int)((long)offset + 1 + operands +
                                jaiReadI16(chunk->code + offset + 1 + at));
@@ -620,7 +624,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             }
             if ((op == OP_PUSH_FINALLY || op == OP_PUSH_HANDLER) &&
                 depth[offset] >= 0) {
-                int at = branchOperandAt(op);
+                int at = jaiOpBranchOperandAt(op);
                 int to = (int)((long)offset + 1 + operands +
                                jaiReadI16(chunk->code + offset + 1 + at));
                 if (depth[to] < 0) {
