@@ -5,6 +5,6 @@ fn fib(n: int) -> int {
 }
 
 fn main() -> int {
-    print(fib(30))
+    print(fib(300))
     return 0
 }

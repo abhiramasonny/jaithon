@@ -110,7 +110,7 @@ Format-on-save is VS Code's own `editor.formatOnSave`, scoped to the language:
 | `extension.js` | Activation, commands, tasks, status bar |
 | `src/tool.js` | Running `jaithon`; binary resolution; the module search path; scratch copies of unsaved buffers |
 | `src/diagnostics.js` | Parsing the compiler's rustc-style diagnostic blocks |
-| `src/analysis.js` | The language service: `ast --json` plus `--dump-sema`, indexed into scopes, symbols and references |
+| `src/analysis.js` | The language service: `ast --json`, indexed into scopes, symbols and references |
 | `src/builtins.js` | The names the runtime registers in C, which no `.jai` file declares |
 | `src/navigation.js` | Definition, references, rename, outlines, folding, call hierarchy |
 | `src/completion.js` | Completion and signature help |
@@ -118,11 +118,16 @@ Format-on-save is VS Code's own `editor.formatOnSave`, scoped to the language:
 | `src/actions.js` | Formatting and code actions |
 | `src/jaic.js` | The bytecode viewer |
 
-Two facts do most of the work. `jaithon ast --json` puts a byte span on every
-node, and `jaithon check --dump-sema` reports the checker's type for each of
-those spans — so `p.norm` is answered by the type checker rather than guessed.
-Only lexical scoping is reimplemented here, because neither dump records which
+One fact does most of the work: `jaithon ast --json` puts a byte span on every
+node, and the whole language service is that answer indexed. Only lexical
+scoping is reimplemented here, because the tree does not record which
 declaration a bare name resolved to.
+
+There was a second source. `jaithon check --dump-sema` reported the checker's
+type for each span, which is what answered member access — `p.norm` came from
+the type checker rather than a guess. It was an option of the C front end, which
+no longer exists, so member access now falls back to the syntax tree. Reviving
+it means the self-hosted front end emitting the same dump.
 
 Spans are byte offsets and VS Code positions are UTF-16; `src/analysis.js`
 builds a conversion table only for files that are not pure ASCII.

@@ -113,7 +113,6 @@ void jaiCliPrintUsage(FILE *out) {
         "      --stats                print VM, inline-cache and GC statistics\n"
         "      --threads=N            worker threads for std.thread\n"
         "      --no-gpu               disable GPU acceleration\n"
-        "      --front=c|jai          front end: C (default) or self-hosted\n"
         "      --emit=ast|bc|tokens   compile and dump the given form\n"
         "      --json                 machine-readable output where supported\n"
         "      --color=auto|always|never\n"
