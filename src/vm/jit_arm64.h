@@ -10,7 +10,7 @@
  * loop body uses, and returns the instruction word rather than writing it, so
  * a test can check the bits without an arena and the emitter can buffer.
  *
- * Every one of these is verified by executing it -- see tests/jit_arm64.c.
+ * Every one of these is verified by executing it -- see tests/vm/jit_arm64.c.
  * Hand-computed encodings that are merely inspected are how a JIT acquires a
  * bug that reproduces once in a million iterations. */
 

@@ -384,7 +384,7 @@ uint32_t jaiA64AddsXImm(unsigned rd, unsigned rn, unsigned imm12) {
  * The bit index splits across two fields: its top bit is instruction bit 31
  * (which is also what makes it a 64-bit test) and the low five are bits 23:19.
  * Getting that split wrong tests a neighbouring bit and the instruction still
- * runs, which is why this is executed in tests/jit_arm64.c rather than read. */
+ * runs, which is why this is executed in tests/vm/jit_arm64.c rather than read. */
 static uint32_t tbEncode(unsigned op, unsigned rt, unsigned bit,
                          int32_t instructions) {
     return 0x36000000u | ((bit >> 5) << 31) | (op << 24) |

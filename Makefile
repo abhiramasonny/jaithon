@@ -382,9 +382,9 @@ test: $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
 # .jai source can express. Everything but the CLI entry point links in.
 VERIFY_OBJS := $(filter-out $(BUILD)/src/cli/main.o,$(OBJS))
 
-$(BUILD)/verify_chunk: $(VERIFY_OBJS) tests/verify_chunk.c | $(CC_STAMP)
-	@echo "  CC      tests/verify_chunk.c"
-	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/verify_chunk.c \
+$(BUILD)/verify_chunk: $(VERIFY_OBJS) tests/vm/verify_chunk.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/verify_chunk.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/verify_chunk.c \
 	    $(VERIFY_OBJS) $(LIBS)
 
 # The verifier on its own, with its own report, for working on it.
@@ -395,14 +395,14 @@ verify-test: $(BUILD)/verify_chunk
 # nothing in the language reaches it yet, and because the failure it guards --
 # a stale instruction cache on arm64 -- returns a plausible wrong number rather
 # than crashing.
-$(BUILD)/jit_arena: tests/jit_arena.c src/vm/jit_arena.c | $(CC_STAMP)
+$(BUILD)/jit_arena: tests/vm/jit_arena.c src/vm/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -o $@ tests/jit_arena.c src/vm/jit_arena.c
+	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arena.c src/vm/jit_arena.c
 
 # The arm64 encoders, each verified by executing the instruction it builds.
-$(BUILD)/jit_arm64: tests/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c | $(CC_STAMP)
+$(BUILD)/jit_arm64: tests/vm/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -o $@ tests/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c
+	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c
 
 .PHONY: jit-test
 jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64

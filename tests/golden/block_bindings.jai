@@ -13,7 +13,7 @@
 #:
 #: A `let` is captured by value (spec §6) and needs no close, and a block that
 #: captures nothing by reference emits no instruction at all — `caseBlockClose`
-#: in tests/verify_chunk.c reads the emitted chunk and pins both.
+#: in tests/vm/verify_chunk.c reads the emitted chunk and pins both.
 
 # --- the escaped closure must not read the next declaration -----------------
 fn escape_from_if(c: bool) -> fn() -> int {
