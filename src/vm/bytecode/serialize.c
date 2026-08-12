@@ -109,6 +109,12 @@ typedef struct {
     size_t         size;
     size_t         pos;
     bool           bad;   /* sticky: set by the first read that ran short */
+    /* The container version this image declares. Carried on the cursor rather
+     * than through every signature because only one section reads it -- the
+     * line table, whose encoding changed at JAIC_VERSION_LTV1 -- and threading
+     * it through readConstant/readTuple/readFunction would touch six
+     * signatures to reach one branch. */
+    uint16_t       version;
 } Cursor;
 
 static size_t curLeft(const Cursor *c) {
@@ -322,11 +328,10 @@ static bool writeFunction(JaiBuf *b, const ObjFunction *fn, int depth) {
     if (fn == NULL || depth > JAIC_MAX_DEPTH) return false;
     if (fn->flags & ~JAIC_KNOWN_FN_FLAGS) return false;
     if (!initFlagIsRecoverable(fn)) return false;
-    if (fn->chunk.count < 0 || fn->chunk.lineCount < 0) return false;
-    if ((uint32_t)fn->chunk.lineCount > UINT32_MAX / JAIC_LINE_ENTRY) return false;
+    if (fn->chunk.count < 0 || fn->chunk.lineStreamLen < 0) return false;
     /* A count without its array is a broken object, not a cacheable one. */
     if ((fn->chunk.count > 0 && fn->chunk.code == NULL) ||
-        (fn->chunk.lineCount > 0 && fn->chunk.lines == NULL) ||
+        (fn->chunk.lineStreamLen > 0 && fn->chunk.lineStream == NULL) ||
         (fn->exceptionCount > 0 && fn->exceptions == NULL) ||
         (fn->defaultCount > 0 && fn->defaultOffsets == NULL) ||
         (fn->paramCount > 0 && fn->paramNames == NULL)) {
@@ -379,13 +384,12 @@ static bool writeFunction(JaiBuf *b, const ObjFunction *fn, int depth) {
         jaiBufWriteU32(b, constCount);
         jaiBufAppend(b, constants.data, constants.count);
 
-        jaiBufWriteU32(b, (uint32_t)fn->chunk.lineCount * JAIC_LINE_ENTRY);
-        for (int i = 0; i < fn->chunk.lineCount; i++) {
-            const LineEntry *e = &fn->chunk.lines[i];
-            jaiBufWriteU32(b, e->offset);
-            jaiBufWriteU32(b, e->span);
-            jaiBufWriteU32(b, e->spanEnd);
-        }
+        /* The length stays a BYTE count, which is what lets a reader that does
+         * not understand the section skip it -- that property is why changing
+         * what is inside it is a contained change. The bytes are now the LTV1
+         * stream the chunk already holds, so writing the table is a memcpy. */
+        jaiBufWriteU32(b, (uint32_t)fn->chunk.lineStreamLen);
+        jaiBufAppend(b, fn->chunk.lineStream, (size_t)fn->chunk.lineStreamLen);
 
         jaiBufWriteU16(b, fn->exceptionCount);
         for (uint16_t i = 0; i < fn->exceptionCount; i++) {
@@ -749,22 +753,50 @@ static ObjFunction *readFunction(Cursor *c, ObjModule *module, int depth) {
 
     {
         uint32_t lineBytes = curU32(c);
-        if (c->bad || lineBytes > curLeft(c) ||
-            lineBytes % JAIC_LINE_ENTRY != 0) {
+        if (c->bad || lineBytes > curLeft(c) || lineBytes > (uint32_t)INT_MAX) {
             goto fail;
         }
-        uint32_t lineCount = lineBytes / JAIC_LINE_ENTRY;
-        if (lineCount > (uint32_t)INT_MAX) goto fail;
-        if (lineCount > 0) {
-            fn->chunk.lines = JAI_ALLOC(LineEntry, lineCount);
-            fn->chunk.lineCapacity = (int)lineCount;
-            fn->chunk.lineCount = (int)lineCount;
-            for (uint32_t i = 0; i < lineCount; i++) {
-                fn->chunk.lines[i].offset = curU32(c);
-                fn->chunk.lines[i].span = curU32(c);
-                fn->chunk.lines[i].spanEnd = curU32(c);
+        if (lineBytes > 0) {
+            if (c->version >= JAIC_VERSION_LTV1) {
+                /* LTV1 already: the on-disk bytes are the runtime form, so
+                 * loading the table is one copy and no decode at all. */
+                const uint8_t *p = NULL;
+                if (!curTake(c, lineBytes, &p)) goto fail;
+                fn->chunk.lineStream = JAI_ALLOC(uint8_t, lineBytes);
+                memcpy(fn->chunk.lineStream, p, lineBytes);
+                fn->chunk.lineStreamLen = (int)lineBytes;
+                fn->chunk.lineStreamCap = (int)lineBytes;
+            } else {
+                /* A pre-LTV1 image: three absolute u32s per entry. Re-encode on
+                 * the way in rather than keeping a second runtime form -- this
+                 * path exists only until the seed has been regenerated, and it
+                 * is the reason the version bump does not wedge the tree. */
+                if (lineBytes % JAIC_LINE_ENTRY != 0) goto fail;
+                uint32_t n = lineBytes / JAIC_LINE_ENTRY;
+                LineEntry prev = {0, 0, 0};
+                bool hasPrev = false;
+                /* 30 bytes is the worst case for three 10-byte varints. */
+                uint8_t *stream = JAI_ALLOC(uint8_t, (size_t)n * 30u + 1u);
+                size_t used = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    LineEntry e;
+                    e.offset = curU32(c);
+                    e.span = curU32(c);
+                    e.spanEnd = curU32(c);
+                    if (c->bad) {
+                        JAI_FREE_ARRAY(uint8_t, stream, (size_t)n * 30u + 1u);
+                        goto fail;
+                    }
+                    used += jaiLtv1EncodeEntry(stream + used,
+                                               (size_t)n * 30u + 1u - used,
+                                               hasPrev ? &prev : NULL, &e);
+                    prev = e;
+                    hasPrev = true;
+                }
+                fn->chunk.lineStream = stream;
+                fn->chunk.lineStreamLen = (int)used;
+                fn->chunk.lineStreamCap = (int)((size_t)n * 30u + 1u);
             }
-            if (c->bad) goto fail;
         }
     }
 
@@ -974,9 +1006,15 @@ static ObjFunction *deserialize(const uint8_t *data, size_t size,
     if (jaiCrc32(data, size - 4) != readU32At(data + size - 4)) return NULL;
 
     /* The cursor stops short of the checksum, so no parse can wander into it. */
-    Cursor c = { data, size - 4, 4, false };
+    Cursor c = { data, size - 4, 4, false, 0 };
 
-    if (curU16(&c) != JAIC_VERSION) return NULL;
+    /* A RANGE, not an equality. A strict test here is evaluated before the
+     * fromSeed branch below, so bumping JAIC_VERSION with it in place refuses
+     * every image in boot/seed.bin -- written by the previous generation -- and
+     * the tree wedges with "no front end" and no way to build one. */
+    uint16_t version = curU16(&c);
+    if (version < JAIC_VERSION_MIN || version > JAIC_VERSION) return NULL;
+    c.version = version;
     (void)curU16(&c);                                  /* flags, informational */
     uint32_t recordedCompiler = curU32(&c);
     if (jaiSeedAnyVersion()) {

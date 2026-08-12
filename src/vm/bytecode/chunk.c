@@ -8,6 +8,8 @@
 #include "vm/object/object.h"
 #include "vm/table.h"
 
+#include <stdlib.h>   /* getenv, for the JAI_DISASM_SPANS probe */
+
 /* ------------------------------------------------------------------ */
 /* Opcode metadata                                                      */
 /* ------------------------------------------------------------------ */
@@ -367,9 +369,11 @@ void jaiChunkInit(Chunk *chunk, int sourceFileId) {
     chunk->count = 0;
     chunk->capacity = 0;
     jaiValueArrayInit(&chunk->constants);
-    chunk->lines = NULL;
-    chunk->lineCount = 0;
-    chunk->lineCapacity = 0;
+    chunk->lineStream = NULL;
+    chunk->lineStreamLen = 0;
+    chunk->lineStreamCap = 0;
+    chunk->lineLast = (LineEntry){0, 0, 0};
+    chunk->lineHasLast = false;
     chunk->caches = NULL;
     chunk->cacheCount = 0;
     chunk->cacheCapacity = 0;
@@ -382,7 +386,7 @@ void jaiChunkFree(Chunk *chunk) {
 
     JAI_FREE_ARRAY(uint8_t, chunk->code, chunk->capacity);
     jaiValueArrayFree(&chunk->constants);
-    JAI_FREE_ARRAY(LineEntry, chunk->lines, chunk->lineCapacity);
+    JAI_FREE_ARRAY(uint8_t, chunk->lineStream, chunk->lineStreamCap);
     JAI_FREE_ARRAY(InlineCache, chunk->caches, chunk->cacheCapacity);
     if (chunk->constIndex != NULL) {
         jaiTableFree(chunk->constIndex);
@@ -441,23 +445,138 @@ bool jaiChunkReserveCaches(Chunk *chunk, int count) {
 /* Emission                                                            */
 /* ------------------------------------------------------------------ */
 
-/* One LineEntry per *run* of same-span instructions, so the table stays tiny
- * and jaiChunkSpanAt can binary-search it. */
+/* ------------------------------------------------------------------ */
+/* LTV1: the line table's encoding (chunk.h documents the layout)       */
+/* ------------------------------------------------------------------ */
+
+static size_t putUleb(uint8_t *out, size_t cap, size_t at, uint64_t v) {
+    do {
+        uint8_t byte = (uint8_t)(v & 0x7Fu);
+        v >>= 7;
+        if (v != 0) byte |= 0x80u;
+        if (at < cap) out[at] = byte;
+        at++;
+    } while (v != 0);
+    return at;
+}
+
+/* Zigzag, so a small negative delta costs one byte like a small positive one.
+ * Spans move backwards often -- an operand is emitted after the expression that
+ * owns it -- so this is not a theoretical case. */
+static size_t putSleb(uint8_t *out, size_t cap, size_t at, int64_t v) {
+    uint64_t zig = ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+    return putUleb(out, cap, at, zig);
+}
+
+static bool getUleb(const uint8_t *in, size_t len, size_t *at, uint64_t *out) {
+    uint64_t v = 0;
+    int shift = 0;
+    while (*at < len) {
+        uint8_t byte = in[(*at)++];
+        if (shift < 64) v |= (uint64_t)(byte & 0x7Fu) << shift;
+        shift += 7;
+        if ((byte & 0x80u) == 0) { *out = v; return true; }
+        if (shift > 70) return false;   /* malformed: refuse rather than spin */
+    }
+    return false;
+}
+
+static bool getSleb(const uint8_t *in, size_t len, size_t *at, int64_t *out) {
+    uint64_t zig = 0;
+    if (!getUleb(in, len, at, &zig)) return false;
+    *out = (int64_t)(zig >> 1) ^ -(int64_t)(zig & 1u);
+    return true;
+}
+
+/* Bytes written, whether or not they fit: a caller sizes its buffer by calling
+ * with cap 0 first, or passes a buffer known to be large enough. */
+size_t jaiLtv1EncodeEntry(uint8_t *out, size_t cap, const LineEntry *prev,
+                          const LineEntry *e) {
+    uint32_t prevOffset = prev != NULL ? prev->offset : 0;
+    int64_t  prevSpan   = prev != NULL ? (int64_t)prev->span : 0;
+
+    size_t at = 0;
+    at = putUleb(out, cap, at, (uint64_t)(e->offset - prevOffset));
+    at = putSleb(out, cap, at, (int64_t)e->span - prevSpan);
+    at = putSleb(out, cap, at, (int64_t)e->spanEnd - (int64_t)e->span);
+    return at;
+}
+
+/* The entry covering `codeOffset` -- the last one whose offset is <= it. Linear
+ * by design: see chunk.h. Returns false when the stream is empty, malformed, or
+ * starts past `codeOffset`. */
+bool jaiLtv1Lookup(const uint8_t *stream, size_t len, uint32_t codeOffset,
+                   uint32_t *span, uint32_t *spanEnd) {
+    if (stream == NULL || len == 0) return false;
+
+    size_t at = 0;
+    uint32_t offset = 0;
+    int64_t  curSpan = 0;
+    bool found = false;
+
+    while (at < len) {
+        uint64_t dOffset = 0;
+        int64_t dSpan = 0, dEnd = 0;
+        size_t entryStart = at;
+        if (!getUleb(stream, len, &at, &dOffset)) break;
+        if (!getSleb(stream, len, &at, &dSpan)) break;
+        if (!getSleb(stream, len, &at, &dEnd)) break;
+        (void)entryStart;
+
+        offset += (uint32_t)dOffset;
+        curSpan += dSpan;
+        if (offset > codeOffset) break;
+
+        found = true;
+        if (span != NULL) *span = (uint32_t)curSpan;
+        if (spanEnd != NULL) *spanEnd = (uint32_t)(curSpan + dEnd);
+    }
+    return found;
+}
+
+int jaiLtv1Count(const uint8_t *stream, size_t len) {
+    if (stream == NULL || len == 0) return 0;
+    size_t at = 0;
+    int n = 0;
+    while (at < len) {
+        uint64_t a = 0;
+        int64_t b = 0, c = 0;
+        if (!getUleb(stream, len, &at, &a)) break;
+        if (!getSleb(stream, len, &at, &b)) break;
+        if (!getSleb(stream, len, &at, &c)) break;
+        n++;
+    }
+    return n;
+}
+
+/* One entry per *run* of same-span instructions: a run collapses because the
+ * span it would record is the one already recorded. */
 static void recordSpan(Chunk *chunk, uint32_t start, uint32_t end) {
-    if (chunk->lineCount > 0) {
-        const LineEntry *last = &chunk->lines[chunk->lineCount - 1];
-        if (last->span == start && last->spanEnd == end) return;
+    if (chunk->lineHasLast && chunk->lineLast.span == start &&
+        chunk->lineLast.spanEnd == end) {
+        return;
     }
-    if (chunk->lineCapacity < chunk->lineCount + 1) {
-        int oldCapacity = chunk->lineCapacity;
-        chunk->lineCapacity = JAI_GROW_CAP(oldCapacity);
-        chunk->lines = JAI_GROW_ARRAY(LineEntry, chunk->lines, oldCapacity,
-                                      chunk->lineCapacity);
+
+    LineEntry e = { (uint32_t)chunk->count, start, end };
+    const LineEntry *prev = chunk->lineHasLast ? &chunk->lineLast : NULL;
+
+    uint8_t scratch[32];
+    size_t n = jaiLtv1EncodeEntry(scratch, sizeof scratch, prev, &e);
+    if (n > sizeof scratch) return;   /* unreachable: 3 varints of <= 10 bytes */
+
+    if (chunk->lineStreamCap < chunk->lineStreamLen + (int)n) {
+        int oldCapacity = chunk->lineStreamCap;
+        int wanted = chunk->lineStreamLen + (int)n;
+        int grown = JAI_GROW_CAP(oldCapacity);
+        while (grown < wanted) grown = JAI_GROW_CAP(grown);
+        chunk->lineStreamCap = grown;
+        chunk->lineStream = JAI_GROW_ARRAY(uint8_t, chunk->lineStream,
+                                           oldCapacity, chunk->lineStreamCap);
     }
-    chunk->lines[chunk->lineCount].offset = (uint32_t)chunk->count;
-    chunk->lines[chunk->lineCount].span = start;
-    chunk->lines[chunk->lineCount].spanEnd = end;
-    chunk->lineCount++;
+    memcpy(chunk->lineStream + chunk->lineStreamLen, scratch, n);
+    chunk->lineStreamLen += (int)n;
+    chunk->lineLast = e;
+    chunk->lineHasLast = true;
 }
 
 void jaiChunkWrite(Chunk *chunk, uint8_t byte, uint32_t spanStart,
@@ -557,21 +676,9 @@ uint32_t jaiChunkAddConstant(Chunk *chunk, Value v) {
 void jaiChunkSpanAt(const Chunk *chunk, int codeOffset, uint32_t *start,
                     uint32_t *end) {
     uint32_t s = 0, e = 0;
-    if (chunk != NULL && chunk->lineCount > 0 && codeOffset >= 0) {
-        int lo = 0, hi = chunk->lineCount - 1, best = -1;
-        while (lo <= hi) {
-            int mid = lo + (hi - lo) / 2;
-            if (chunk->lines[mid].offset <= (uint32_t)codeOffset) {
-                best = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        if (best >= 0) {
-            s = chunk->lines[best].span;
-            e = chunk->lines[best].spanEnd;
-        }
+    if (chunk != NULL && chunk->lineStreamLen > 0 && codeOffset >= 0) {
+        (void)jaiLtv1Lookup(chunk->lineStream, (size_t)chunk->lineStreamLen,
+                            (uint32_t)codeOffset, &s, &e);
     }
     if (start != NULL) *start = s;
     if (end != NULL) *end = e;
@@ -624,10 +731,32 @@ static void emitConstOperands(FILE *out, const Chunk *chunk,
 }
 
 /* "OFFSET  LINE  OP_NAME"; LINE is "|" when sharing the previous source line.
- * `pad` is off for operand-less ops so they don't trail spaces. */
+ * `pad` is off for operand-less ops so they don't trail spaces.
+ *
+ * JAI_DISASM_SPANS=1 replaces the line column with the raw `span..spanEnd` the
+ * line table actually stores. Line numbers are lossy -- two different spans on
+ * one line collapse to the same digits -- so a change to the line table's
+ * encoding has to be checked against the spans themselves, and this is what
+ * scripts/linetable_golden.sh captures. Off by default; it widens the column
+ * and no other test reads it. */
 static void printPrefix(FILE *out, const Chunk *chunk, int offset,
                         const char *name, bool pad) {
-    char line[8];
+    char line[40];
+    static int showSpans = -1;
+    if (showSpans < 0) {
+        const char *env = getenv("JAI_DISASM_SPANS");
+        showSpans = (env != NULL && env[0] == '1') ? 1 : 0;
+    }
+
+    if (showSpans) {
+        uint32_t s = 0, e = 0;
+        jaiChunkSpanAt(chunk, offset, &s, &e);
+        snprintf(line, sizeof line, "%u..%u", (unsigned)s, (unsigned)e);
+        fprintf(out, "%04d  %-16s  ", offset, line);
+        fprintf(out, pad ? "%-23s" : "%s", name);
+        return;
+    }
+
     int here = lineAt(chunk, offset);
     if (offset > 0 && here == lineAt(chunk, offset - 1)) {
         snprintf(line, sizeof line, "%4s", "|");

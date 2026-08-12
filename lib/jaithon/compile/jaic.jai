@@ -32,7 +32,20 @@ pub let MAGIC: list[int] = [0x4A, 0x41, 0x49, 0x43]
 #:
 #: Must equal `JAIC_VERSION` in `src/vm/bytecode/serialize.h` — one number split across
 #: two languages.
-pub const VERSION: int = 11
+pub const VERSION: int = 12
+
+#: Oldest container this reader accepts. Must equal `JAIC_VERSION_MIN` in
+#: `src/vm/bytecode/serialize.h`.
+#:
+#: A range, not an equality: across a format bump the seed's images were written
+#: by the previous generation, and refusing them leaves the tree with no front
+#: end and no way to build one. `make reseed` twice closes the gap — generation
+#: one still runs the old compiler out of the old seed.
+pub const VERSION_MIN: int = 11
+
+#: First container version whose line table is LTV1 (delta + LEB128). Below it,
+#: the table is `_LINE_ROW`-sized absolute rows.
+pub const VERSION_LTV1: int = 12
 
 #: `JAI_COMPILER_VERSION`, recorded so that a new compiler ignores old caches.
 #:
@@ -85,6 +98,7 @@ pub const MAX_DEPTH: int = 64
 #: Smallest file that could hold a header and a checksum.
 pub const MIN_SIZE: int = 32
 
+#: Bytes per line-table row before `VERSION_LTV1`: three absolute u32s.
 const _LINE_ROW: int = 12
 const _EXC_ROW: int = 16
 const _CONST_LIMIT: int = 16777216
@@ -275,6 +289,14 @@ pub class Reader {
     pub var limit: int
     #: Sticky: set by the first read that ran short.
     pub var bad: bool
+    #: Container version of the image being read.
+    #:
+    #: Carried here rather than passed down because exactly one section reads
+    #: it — the line table, whose encoding changed at `VERSION_LTV1` — and
+    #: threading it through `_read_function`, `_read_constants` and
+    #: `_read_tuple` would touch several signatures to reach one branch.
+    #: `VERSION` until the container header says otherwise.
+    pub var version: int
 
     #: Read `data` up to `limit`, which defaults to its length.
     pub fn init(self, data: list[int], limit: int = -1) {
@@ -282,6 +304,7 @@ pub class Reader {
         self.position = 0
         self.limit = if limit < 0 { data.len() } else { limit }
         self.bad = false
+        self.version = VERSION
     }
 
     #: Bytes still readable.
@@ -543,12 +566,9 @@ fn _write_function(out: Writer, proto: FuncProto, depth: int) -> void {
     out.u32(pool.entries.len())
     out.bytes(body.data)
 
-    out.u32(proto.chunk.lines.len() * _LINE_ROW)
-    for line in proto.chunk.lines {
-        out.u32(line.offset)
-        out.u32(line.span_start)
-        out.u32(line.span_end)
-    }
+    let line_stream = _ltv1_encode(proto.chunk.lines)
+    out.u32(line_stream.len())
+    out.bytes(line_stream)
 
     out.u16(proto.chunk.exceptions.len())
     for entry in proto.chunk.exceptions {
@@ -670,7 +690,9 @@ pub fn read_module(data: list[int], expected_hash: int? = null) -> Module? {
 
     let reader = Reader(data, body_length)
     reader.skip(4)
-    if reader.u16() != VERSION { return null }
+    let version = reader.u16()
+    if version < VERSION_MIN or version > VERSION { return null }
+    reader.version = version
     let flags = reader.u16()
     if reader.u32() != COMPILER_VERSION { return null }
     if reader.u32() != build_id() { return null }
@@ -724,6 +746,95 @@ pub fn read_module(data: list[int], expected_hash: int? = null) -> Module? {
     return mod
 }
 
+#: LTV1: the line table's encoding from `VERSION_LTV1` on.
+#:
+#: Must stay byte-identical to `jaiLtv1EncodeEntry` in `src/vm/bytecode/chunk.c`
+#: — the C runtime reads what this writes, and nothing in the tree compares the
+#: two implementations, so a disagreement surfaces as a wrong source span in a
+#: diagnostic and nowhere else. `tests/vm/linetable_ltv1.c` pins the C side and
+#: `scripts/linetable_golden.sh` pins the pair end to end.
+#:
+#: Per entry, deltas against the previous one, first against zero:
+#:     uleb128  offset - prev_offset      (offsets are non-decreasing)
+#:     sleb128  span - prev_span
+#:     sleb128  span_end - span           (against its OWN span)
+fn _uleb(out: list[int], value: int) -> void {
+    var v = value
+    while true {
+        var byte = v & 0x7F
+        v = v >> 7
+        if v != 0 { byte = byte | 0x80 }
+        out.push(byte)
+        if v == 0 { break }
+    }
+}
+
+#: Zigzag, so a small negative delta costs one byte like a small positive one.
+#: Spans move backwards often — an operand is emitted after the expression that
+#: owns it — so this is not a theoretical case.
+fn _sleb(out: list[int], value: int) -> void {
+    _uleb(out, value << 1 ^ value >> 63)
+}
+
+fn _ltv1_encode(lines: list[LineEntry]) -> list[int] {
+    var out: list[int] = []
+    var prev_offset = 0
+    var prev_span = 0
+    for line in lines {
+        _uleb(out, line.offset - prev_offset)
+        _sleb(out, line.span_start - prev_span)
+        _sleb(out, line.span_end - line.span_start)
+        prev_offset = line.offset
+        prev_span = line.span_start
+    }
+    return out
+}
+
+#: Reads exactly `byte_count` bytes. Null on a malformed stream, which is a
+#: refused image and therefore a recompile, never a wrong span.
+fn _ltv1_decode(reader: Reader, byte_count: int) -> list[LineEntry]? {
+    let stop = reader.position + byte_count
+    var lines: list[LineEntry] = []
+    var offset = 0
+    var span = 0
+
+    while reader.position < stop {
+        let d_offset = _read_uleb(reader, stop)
+        if d_offset == null { return null }
+        let d_span = _read_sleb(reader, stop)
+        if d_span == null { return null }
+        let d_end = _read_sleb(reader, stop)
+        if d_end == null { return null }
+
+        offset = offset + (d_offset ?? 0)
+        span = span + (d_span ?? 0)
+        lines.push(LineEntry(offset, span, span + (d_end ?? 0)))
+    }
+    if reader.position != stop { return null }
+    return lines
+}
+
+fn _read_uleb(reader: Reader, stop: int) -> int? {
+    var value = 0
+    var shift = 0
+    while reader.position < stop {
+        let byte = reader.u8()
+        if reader.bad { return null }
+        value = value | (byte & 0x7F) << shift
+        shift += 7
+        if byte & 0x80 == 0 { return value }
+        if shift > 63 { return null }
+    }
+    return null
+}
+
+fn _read_sleb(reader: Reader, stop: int) -> int? {
+    let zig = _read_uleb(reader, stop)
+    if zig == null { return null }
+    let z = zig ?? 0
+    return z >> 1 ^ -(z & 1)
+}
+
 fn _read_function(reader: Reader, depth: int) -> FuncProto? {
     if depth > MAX_DEPTH { return null }
     let name_index = reader.u32()
@@ -747,12 +858,18 @@ fn _read_function(reader: Reader, depth: int) -> FuncProto? {
     _link_class_specs(constants)
 
     let line_bytes = reader.u32()
-    if reader.bad or line_bytes > reader.left() or line_bytes % _LINE_ROW != 0 {
-        return null
-    }
+    if reader.bad or line_bytes > reader.left() { return null }
     var lines: list[LineEntry] = []
-    for _row in range(line_bytes // _LINE_ROW) {
-        lines.push(LineEntry(reader.u32(), reader.u32(), reader.u32()))
+    if reader.version >= VERSION_LTV1 {
+        let decoded = _ltv1_decode(reader, line_bytes)
+        if decoded == null { return null }
+        lines = decoded ?? []
+    } else {
+        # Pre-LTV1: three absolute u32s per row.
+        if line_bytes % _LINE_ROW != 0 { return null }
+        for _row in range(line_bytes // _LINE_ROW) {
+            lines.push(LineEntry(reader.u32(), reader.u32(), reader.u32()))
+        }
     }
 
     let exception_count = reader.u16()

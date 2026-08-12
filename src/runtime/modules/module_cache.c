@@ -108,7 +108,10 @@ bool jaiCacheFlagsMatchBuffer(const uint8_t *head, size_t length,
      * Debug and release still have to match: those change what the bytecode
      * contains, not who wrote it. */
     const uint16_t kLoadability = (uint16_t)~(uint16_t)JAIC_FLAG_SELFHOSTED;
-    return version == JAIC_VERSION &&
+    /* The same range the deserialiser accepts, for the same reason: an image a
+     * generation behind is loadable, and treating it as a miss during a format
+     * bump would recompile the whole tree on every run. */
+    return version >= JAIC_VERSION_MIN && version <= JAIC_VERSION &&
            (stored & kLoadability) == ((uint16_t)flags & kLoadability);
 }
 

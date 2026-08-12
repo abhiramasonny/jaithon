@@ -376,6 +376,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
+	@$(BUILD)/linetable_ltv1
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
@@ -396,6 +397,15 @@ opcode-check:
 .PHONY: opstats-check
 opstats-check:
 	@./scripts/opstats_check.sh
+
+# Every instruction offset of every function in lib, tests and examples must
+# resolve to the same source span it did before. The line table's encoding has
+# no differential oracle behind it (spec/BYTECODE.md §11), so this golden is the
+# oracle. Re-capture only when a corpus SOURCE changed:
+#   scripts/linetable_golden.sh capture
+.PHONY: linetable-check
+linetable-check:
+	@./scripts/linetable_golden.sh check
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
@@ -430,6 +440,16 @@ $(BUILD)/chunk_caches: $(VERIFY_OBJS) tests/vm/chunk_caches.c | $(CC_STAMP)
 
 chunk-caches-test: $(BUILD)/chunk_caches
 	@$(BUILD)/chunk_caches
+
+# The line table's encoding, at the edges a corpus does not reliably contain:
+# backwards span deltas, zero-length spans, u32 extremes, truncated streams.
+$(BUILD)/linetable_ltv1: $(VERIFY_OBJS) tests/vm/linetable_ltv1.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/linetable_ltv1.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/linetable_ltv1.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+linetable-test: $(BUILD)/linetable_ltv1
+	@$(BUILD)/linetable_ltv1
 
 # The code arena executes what it was written. C rather than .jai because
 # nothing in the language reaches it yet, and because the failure it guards --
