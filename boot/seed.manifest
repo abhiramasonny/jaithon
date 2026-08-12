@@ -25,6 +25,7 @@
 # intended failure: over-inclusion costs size, under-inclusion is caught.
 jaithon/ast.jai
 jaithon/ast_encode.jai
+jaithon/ast_unparse.jai
 jaithon/compile/check/assign.jai
 jaithon/compile/check/checker.jai
 jaithon/compile/check/ctx.jai

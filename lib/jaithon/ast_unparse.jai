@@ -951,7 +951,7 @@ class _Printer {
         self.emit("{")
         for (index, sub) in subs.enumerate() {
             if index > 0 { self.emit(", ") }
-            let name = _at_or_null(names, index)
+            let name = at_or_null(names, index)
             if name is null {
                 self.pattern(sub)
                 continue
@@ -993,7 +993,7 @@ fn _has_field_names(names: list[str?]) -> bool {
     return false
 }
 
-fn _at_or_null(names: list[str?], index: int) -> str? {
+pub fn at_or_null(names: list[str?], index: int) -> str? {
     if index >= names.len() { return null }
     return names[index]
 }
