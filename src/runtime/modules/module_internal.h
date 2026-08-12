@@ -64,6 +64,8 @@ uint32_t cacheFlagsFor(const CodegenOptions *opts, bool selfHosted);
  * loadability-relevant flags matching `flags`. A cheap 8-byte header probe,
  * not a full load. */
 bool cacheFlagsMatch(const char *sourcePath, uint32_t flags);
+bool jaiCacheFlagsMatchBuffer(const uint8_t *head, size_t length,
+                              uint32_t flags);
 
 /* Why jaiDeserializeModule/jaiDeserializeSeed said no, in one sentence, by
  * re-reading the fixed header this build's writer would have produced.
