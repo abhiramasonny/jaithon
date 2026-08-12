@@ -373,10 +373,18 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
+
+# Three tables describe the opcode list -- JAI_OPCODES in chunk.c (the wire
+# format), _OPS in emit.jai (a hand-transcribed copy), and spec/BYTECODE.md --
+# and nothing checked they agreed until this. It found four opcodes shipped and
+# undocumented. Pure text, so it costs nothing to run on every `make test`.
+.PHONY: opcode-check
+opcode-check:
+	@uv run python scripts/opcode_table_check.py
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
