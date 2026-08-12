@@ -149,24 +149,13 @@ void jaiValueArrayFree(ValueArray *a);
 void jaiValueArrayPush(ValueArray *a, Value v);
 
 bool jaiValuesEqual(Value a, Value b);
-/* Identity (`is`). Never calls user code. */
 bool jaiValuesIdentical(Value a, Value b);
-/* Hash for dict/set keys. Raises TypeError for unhashable values. */
 uint64_t jaiValueHash(Value v, bool *ok);
-/* Ordering for <,<=,>,>=. Returns -1/0/1 in *out; false if not comparable. */
 bool jaiValueCompare(Value a, Value b, int *out);
-
-/* The name of a value's type as user code sees it: "int", "list[int]",
- * "Account". Returns an interned ObjString. */
 ObjString *jaiTypeName(Value v);
-/* Static type-name for a ValueType/ObjType pair, no allocation. */
 const char *jaiTypeNameStatic(Value v);
-
-/* Human-readable form (`str()`): strings render without quotes. */
 ObjString *jaiValueToStr(Value v);
-/* Debug form (`repr()`): strings render with quotes and escapes. */
 ObjString *jaiValueToRepr(Value v);
-/* Fast path used by the disassembler and traceback printer. */
 void jaiPrintValue(FILE *out, Value v, bool repr);
 
 /* Most parts one OP_FORMAT can join; an f-string with more falls back to

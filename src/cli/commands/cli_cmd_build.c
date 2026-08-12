@@ -29,8 +29,12 @@ static int buildOne(const char *path, const JaiCliOptions *opts) {
         (opts->run.codegen.stripAsserts ? JAIC_FLAG_RELEASE : 0u);
 
     if (opts->output != NULL) {
+        /* No sidecar for an explicit `-o`: the caller named one output file and
+         * gets one, spans included, whatever the debug flag says. */
         size_t size = 0;
-        uint8_t *image = jaiSerializeModule(module, body, hash, flags, &size);
+        uint8_t *image = jaiSerializeModule(module, body, hash,
+                                            flags | JAIC_FLAG_DEBUG, &size,
+                                            NULL, NULL);
         if (image == NULL) {
             cliError("%s: could not serialise the compiled module", path);
             status = 1;

@@ -325,7 +325,8 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
-                cached = jaiDeserializeModule(cacheData, cacheLen, module, hash);
+                cached = jaiDeserializeCached(cacheData, cacheLen, module, hash,
+                                              path);
             }
             jaiCacheReadFree(cacheData, cacheLen);
             if (cached != NULL) {
@@ -956,7 +957,8 @@ static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
-                cached = jaiDeserializeModule(cacheData, cacheLen, module, hash);
+                cached = jaiDeserializeCached(cacheData, cacheLen, module, hash,
+                                              path);
             }
             jaiCacheReadFree(cacheData, cacheLen);
             if (cached != NULL) {
