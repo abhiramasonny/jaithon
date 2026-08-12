@@ -1,20 +1,53 @@
 #: Lazy iterators that compose without building intermediate lists.
 #:
+#: Every adapter here is a small object that pulls one element from its source
+#: inside `next` and computes nothing before that call. A chain therefore does
+#: no work when it is built, and stops as soon as its consumer is satisfied:
+#:
 #: ```
 #: iter([1, 2, 3, 4, 5]).map(|x| x * x).filter(|x| x % 2 == 1).take(2).collect()
 #: # [1, 9]
 #: ```
 #:
+#: That chain allocates exactly one list — the result — and pulls three of the
+#: five source elements. `iter(xs).map(f).filter(p).take(10).collect()` touches
+#: at most enough of `xs` to produce ten results, however long `xs` is, which is
+#: also why `count`, `repeat` and `cycle` can be infinite. Bound an infinite
+#: iterator with `take` or `take_while` before handing it to a consumer.
+#:
 #: Exhaustion is signalled by returning `null` from `next`, so a lazy sequence
-#: cannot contain `null`. Bound an infinite iterator (`count`, `repeat`,
-#: `cycle`) with `take` or `take_while` before consuming it.
+#: cannot itself contain `null`; once exhausted, an iterator keeps returning
+#: `null`. `Permutations`, `Combinations`, `Product` and `Unzip` are the only
+#: adapters that buffer: they need random access to their source, and each says
+#: so.
+#:
+#: `count`, `repeat`, `once`, `empty`, `successors` and `range_step` — the
+#: generators that build a sequence from scratch rather than adapting one —
+#: live in `std.iter.generators`, imported separately. Everything else stays
+#: here, in one file, because it has to: `Iter`'s own methods (`map`, `filter`,
+#: `chain`, `cycle`, ...) construct and return every adapter class below by
+#: name, and every adapter class extends `Iter`, so `Iter` and its adapters
+#: import each other no matter how the file is cut — the only boundary the
+#: compiler's import-cycle check (`E0801`) allows is one where the far side
+#: needs nothing back. `iter`, `cycle` and `from_fn` look like generators but
+#: fail that test too: `iter` is called from inside `chain`/`zip`/`interleave`/
+#: `cross`, and `cycle`/`from_fn` share private buffering classes with
+#: `Iter.cycle` and `Unzip`, so all three stay put alongside the class that
+#: needs them.
 from std.core import Iterable, Iterator
 
 #: The lazy-iterator protocol: a `next` method plus every adapter built on it.
 #:
-#: Subclass `Iter` and override `next`; every other method here is written
-#: against `next` alone, so a subclass inherits the whole surface. An `Iter`
-#: is consumed as it is read and cannot be restarted.
+#: Subclass `Iter` and override `next` to add a source or an adapter of your
+#: own: every other method here, from `map` and `filter` to `collect` and
+#: `fold`, is written against `next` alone, so a subclass inherits the whole
+#: surface. To walk something that already exists, call `iter` rather than
+#: subclassing.
+#:
+#: An `Iter` is consumed as it is read: what has been pulled is gone, the
+#: sequence cannot be restarted, and an adapter consumes its source as it goes.
+#: Once `next` has returned `null` it goes on returning `null`. `Iter` is both
+#: an `Iterable` and an `Iterator`, so a `for` loop walks one directly.
 #:
 #: ```
 #: let doubled = iter([1, 2, 3]).map(|x| x * 2)
@@ -25,8 +58,9 @@ from std.core import Iterable, Iterator
 pub class Iter[T]: Iterable[T], Iterator[T] {
     #: Produce the next element, or null once the sequence is exhausted.
     #:
-    #: Every adapter and consumer is written in terms of this alone; once
-    #: exhausted, keep returning null rather than restarting.
+    #: This is the whole protocol: every adapter and consumer below is written
+    #: in terms of it, and a new adapter only has to override it. An exhausted
+    #: iterator must keep returning null rather than restarting.
     pub fn next(self) -> T? {
         throw RuntimeError(f"{type_of(self)} must override next")
     }
@@ -247,6 +281,8 @@ pub class Iter[T]: Iterable[T], Iterator[T] {
     }
 
     #: Call `f` on every element as it passes through, unchanged.
+    #:
+    #: For tracing a chain without disturbing it: `.inspect(|x| print(x))`.
     pub fn inspect(self, f: fn(T) -> void) -> Inspect[T] {
         return Inspect(self, f)
     }
@@ -1341,6 +1377,7 @@ pub class Permutations[T] extends Iter[list[T]] {
         while i >= 0 {
             self.cycles[i] -= 1
             if self.cycles[i] == 0 {
+                # Rotate indices[i..n] one place left and restart that digit.
                 let moved = self.indices[i]
                 var j = i
                 while j < self.n - 1 {
@@ -1398,6 +1435,7 @@ pub class Combinations[T] extends Iter[list[T]] {
             self.first = false
             return self._emit()
         }
+        # Find the rightmost index that is not already at its ceiling.
         var i = self.k - 1
         while i >= 0 and self.indices[i] == i + self.n - self.k { i -= 1 }
         if i < 0 {
@@ -1452,61 +1490,6 @@ class _Pull extends Iter[any] {
     }
 }
 
-class _Count extends Iter[int] {
-    var value: int
-    let step: int
-
-    #: Count from `start` in steps of `step`.
-    pub fn init(self, start: int, step: int) {
-        self.value = start
-        self.step = step
-    }
-
-    pub fn next(self) -> int? {
-        let current = self.value
-        self.value += self.step
-        return current
-    }
-}
-
-class _Repeat extends Iter[any] {
-    let value: any
-    var remaining: int
-
-    #: Yield `value` `remaining` times; a negative count means forever.
-    pub fn init(self, value: any, remaining: int) {
-        self.value = value
-        self.remaining = remaining
-    }
-
-    pub fn next(self) -> any {
-        if self.remaining == 0 { return null }
-        if self.remaining > 0 { self.remaining -= 1 }
-        return self.value
-    }
-}
-
-class _Once extends Iter[any] {
-    var value: any
-
-    #: Yield `value` and then nothing.
-    pub fn init(self, value: any) {
-        self.value = value
-    }
-
-    pub fn next(self) -> any {
-        let taken = self.value
-        self.value = null
-        return taken
-    }
-}
-
-class _Empty extends Iter[any] {
-    pub fn next(self) -> any {
-        return null
-    }
-}
-
 class _FromFn extends Iter[any] {
     let f: fn() -> any
 
@@ -1517,45 +1500,6 @@ class _FromFn extends Iter[any] {
 
     pub fn next(self) -> any {
         return self.f()
-    }
-}
-
-class _Successors extends Iter[any] {
-    let f: fn(any) -> any
-    var current: any
-
-    #: Yield `seed` and then the iterates of `f`.
-    pub fn init(self, seed: any, f: fn(any) -> any) {
-        self.current = seed
-        self.f = f
-    }
-
-    pub fn next(self) -> any {
-        let value = self.current
-        if value is null { return null }
-        self.current = self.f(value)
-        return value
-    }
-}
-
-class _RangeStep extends Iter[int] {
-    var value: int
-    let stop: int
-    let step: int
-
-    #: Step from `start` towards `stop` by `step`.
-    pub fn init(self, start: int, stop: int, step: int) {
-        self.value = start
-        self.stop = stop
-        self.step = step
-    }
-
-    pub fn next(self) -> int? {
-        if self.step > 0 and self.value >= self.stop { return null }
-        if self.step < 0 and self.value <= self.stop { return null }
-        let current = self.value
-        self.value += self.step
-        return current
     }
 }
 
@@ -1588,9 +1532,12 @@ class _Cycle extends Iter[any] {
 
 #: Wrap any iterable in a lazy `Iter`.
 #:
-#: A dict, set, or range is materialised into a list first, because the VM's
-#: built-in iterator objects cannot be stepped from Jaithon; use `range_step`
-#: for a lazy arithmetic sequence instead.
+#: An `Iter` is returned unchanged, and lists, tuples and strings are walked by
+#: index without being copied. Anything else that is an `Iterator` or an
+#: `Iterable` is pulled through its own `next`. Every other iterable — a dict, a
+#: set, a range — is materialised into a list once, because the VM's built-in
+#: iterator objects cannot be stepped from Jaithon; use `range_step` when you
+#: want a lazy arithmetic sequence.
 #:
 #: ```
 #: iter([1, 2, 3]).collect()       # [1, 2, 3]
@@ -1606,30 +1553,6 @@ pub fn iter(source: any) -> Iter[any] {
     return _SeqIter([value for value in source])
 }
 
-#: Count from `start` forever in steps of `step`.
-#:
-#: ```
-#: count(1).take(4).collect()        # [1, 2, 3, 4]
-#: count(10, -2).take(3).collect()   # [10, 8, 6]
-#: ```
-pub fn count(start: int = 0, step: int = 1) -> Iter[int] {
-    if step == 0 { throw ValueError("step must be non-zero, got 0") }
-    return _Count(start, step)
-}
-
-#: Yield `value` `times` times, or forever when `times` is null.
-#:
-#: ```
-#: repeat("x", 3).collect()        # ["x", "x", "x"]
-#: repeat(0).take(2).collect()     # [0, 0]
-#: ```
-pub fn repeat(value: any, times: int? = null) -> Iter[any] {
-    if times is not null and times < 0 {
-        throw ValueError(f"times must be non-negative, got {times}")
-    }
-    return _Repeat(value, times ?? -1)
-}
-
 #: Repeat an iterable's elements forever, remembering them as they pass.
 #:
 #: The source is pulled once and replayed from the buffer thereafter, so it need
@@ -1640,26 +1563,6 @@ pub fn repeat(value: any, times: int? = null) -> Iter[any] {
 #: ```
 pub fn cycle(source: any) -> Iter[any] {
     return _Cycle(iter(source))
-}
-
-#: Yield `value` exactly once.
-#:
-#: ```
-#: once(7).collect()   # [7]
-#: ```
-pub fn once(value: any) -> Iter[any] {
-    return _Once(value)
-}
-
-#: Yield nothing.
-#:
-#: Useful as the identity for `chain` and as a base case in recursion.
-#:
-#: ```
-#: empty().collect()   # []
-#: ```
-pub fn empty() -> Iter[any] {
-    return _Empty()
 }
 
 #: Build an iterator that calls `f` for each element, ending when it returns null.
@@ -1674,28 +1577,4 @@ pub fn empty() -> Iter[any] {
 #: ```
 pub fn from_fn(f: fn() -> any) -> Iter[any] {
     return _FromFn(f)
-}
-
-#: Yield `seed`, then `f` of it, and so on until `f` returns null.
-#:
-#: ```
-#: successors(1, |x| if x < 100 { x * 2 } else { null }).collect()
-#: # [1, 2, 4, 8, 16, 32, 64, 128]
-#: ```
-pub fn successors(seed: any, f: fn(any) -> any) -> Iter[any] {
-    return _Successors(seed, f)
-}
-
-#: Count from `start` towards `stop` in steps of `step`, excluding `stop`.
-#:
-#: The lazy equivalent of a `..` range with a stride, and unlike `iter` over a
-#: range it never materialises its elements.
-#:
-#: ```
-#: range_step(0, 10, 3).collect()   # [0, 3, 6, 9]
-#: range_step(5, 0, -2).collect()   # [5, 3, 1]
-#: ```
-pub fn range_step(start: int, stop: int, step: int) -> Iter[int] {
-    if step == 0 { throw ValueError("step must be non-zero, got 0") }
-    return _RangeStep(start, stop, step)
 }
