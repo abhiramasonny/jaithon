@@ -144,6 +144,8 @@ static id<MTLComputePipelineState> gVectorAdd;
 static id<MTLComputePipelineState> gVectorMul;
 static id<MTLComputePipelineState> gMatMul;
 static id<MTLComputePipelineState> gReduceSum;
+static id<MTLCommandBuffer> gAsyncCommands;
+static id<MTLComputeCommandEncoder> gAsyncEncoder;
 static bool                        gBuiltinsReady;
 
 static bool ensureDevice(void) {
@@ -262,6 +264,14 @@ void jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset)
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy((uint8_t *)[buffer contents] + offset, src, bytes);
+}
+
+void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
+                    size_t offset, float scale) {
+    if (b == NULL || b->buffer == NULL || src == NULL || count == 0) return;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
+    float *destination = (float *)[buffer contents] + offset;
+    for (size_t i = 0; i < count; i++) destination[i] = (float)src[i] * scale;
 }
 
 void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
@@ -399,18 +409,51 @@ int jaiGpuMaxThreadsPerGroup(JaiGpuKernel *k) {
     return (int)[pipeline maxTotalThreadsPerThreadgroup];
 }
 
-bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
-                    const uint32_t *scalars, int scalarCount,
-                    int threads, int groupSize) {
+static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
+                           const uint32_t *scalars, int scalarCount,
+                           int threads, int groupSize, bool wait) {
     if (k == NULL || k->pipeline == NULL || threads <= 0) return false;
     if (count < 0 || (count > 0 && buffers == NULL)) return false;
     if (scalarCount < 0 || (scalarCount > 0 && scalars == NULL)) return false;
     if (groupSize < 0) return false;
     if (!ensureDevice()) return false;
+    for (int i = 0; i < count; i++) {
+        if (buffers[i] == NULL || buffers[i]->buffer == NULL) return false;
+    }
 
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
             (__bridge id<MTLComputePipelineState>)k->pipeline;
+        if (!wait) {
+            @synchronized(gQueue) {
+                if (gAsyncCommands == nil) {
+                    gAsyncCommands = [gQueue commandBuffer];
+                    if (gAsyncCommands == nil) return false;
+                    gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
+                    if (gAsyncEncoder == nil) {
+                        gAsyncCommands = nil;
+                        return false;
+                    }
+                }
+
+                [gAsyncEncoder setComputePipelineState:pipeline];
+                for (int i = 0; i < count; i++)
+                    [gAsyncEncoder setBuffer:(__bridge id<MTLBuffer>)buffers[i]->buffer
+                                      offset:0
+                                     atIndex:(NSUInteger)i];
+                for (int i = 0; i < scalarCount; i++)
+                    [gAsyncEncoder setBytes:&scalars[i]
+                                     length:sizeof scalars[i]
+                                    atIndex:(NSUInteger)(count + i)];
+                encodeDispatch(gAsyncEncoder, pipeline, (NSUInteger)threads,
+                               (NSUInteger)groupSize);
+            }
+            return true;
+        }
+
+        /* A synchronous dispatch submitted after queued work must stay behind
+         * it. Flush first, then use the low-overhead unretained command path. */
+        if (!jaiGpuSynchronize()) return false;
         id<MTLCommandBuffer> commands = [gQueue commandBufferWithUnretainedReferences];
         if (commands == nil) return false;
         id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
@@ -418,12 +461,7 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
 
         [encoder setComputePipelineState:pipeline];
         for (int i = 0; i < count; i++) {
-            JaiGpuBuffer *b = buffers[i];
-            if (b == NULL || b->buffer == NULL) {
-                [encoder endEncoding];
-                return false;
-            }
-            [encoder setBuffer:(__bridge id<MTLBuffer>)b->buffer
+            [encoder setBuffer:(__bridge id<MTLBuffer>)buffers[i]->buffer
                         offset:0
                        atIndex:(NSUInteger)i];
         }
@@ -439,8 +477,37 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                        (NSUInteger)groupSize);
         [encoder endEncoding];
         [commands commit];
-        /* std.gpu promises that every output buffer is readable once dispatch
-         * returns, which is what makes a separate fence unnecessary. */
+        [commands waitUntilCompleted];
+        return [commands status] == MTLCommandBufferStatusCompleted;
+    }
+}
+
+bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
+                    const uint32_t *scalars, int scalarCount,
+                    int threads, int groupSize) {
+    return dispatchKernel(k, buffers, count, scalars, scalarCount,
+                          threads, groupSize, true);
+}
+
+bool jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
+                         const uint32_t *scalars, int scalarCount,
+                         int threads, int groupSize) {
+    return dispatchKernel(k, buffers, count, scalars, scalarCount,
+                          threads, groupSize, false);
+}
+
+bool jaiGpuSynchronize(void) {
+    if (!ensureDevice()) return false;
+    @autoreleasepool {
+        id<MTLCommandBuffer> commands;
+        @synchronized(gQueue) {
+            if (gAsyncCommands == nil) return true;
+            [gAsyncEncoder endEncoding];
+            commands = gAsyncCommands;
+            gAsyncEncoder = nil;
+            gAsyncCommands = nil;
+            [commands commit];
+        }
         [commands waitUntilCompleted];
         return [commands status] == MTLCommandBufferStatusCompleted;
     }

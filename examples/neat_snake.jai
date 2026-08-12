@@ -1,10 +1,3 @@
-#: Train a compact NEAT population to play Snake on a 6x6 grid.
-#:
-#: The trainer stays responsive while it evaluates genomes. Click
-#: "save & watch" to write the champion topology and weights to
-#: `neat_snake.weights`, then open a live-play window.
-#:
-#:     jaithon run examples/neat_snake.jai
 from std.gui import Window
 from std.gui.canvas import Canvas
 from std.gui.color import rgb

@@ -122,6 +122,21 @@ more idepth file -> [`LANGUAGE.md`](LANGUAGE.md).
 
 Also you can checkout the examples directory.
 
+## External libraries
+
+These arent really external (since they are included right here) but until I write a package manager, lets pretend these are external.
+
+
+`jaiplot` provides Matplotlib-style figures and axes with file and window
+backends.
+
+`jaitensor` provides Metal-resident float32 tensors and a Keras-style API.
+It includes common tensor math, format-independent datasets, dense models,
+ReLU/sigmoid/tanh/softmax activations, momentum SGD, Adam, validation,
+prediction, and JSON weight files. Training queues each epoch as ordered GPU
+work and synchronizes once for metrics. See
+[`examples/mnist_gpu.jai`](examples/mnist_gpu.jai).
+
 ## Errors
 
 Every error is in this format, so hopefully its easy to debug

@@ -18,9 +18,19 @@
 #: so 70 exercises a ragged tile and 64 exercises the exact multiple.
 import std.gpu
 import std.math
-from std.test import assert_true, assert_len
+from std.test import assert_eq, assert_true, assert_len
 
 let N = 100_000  # comfortably past MIN_GPU_ELEMENTS
+
+let ASYNC_SOURCE = """#include <metal_stdlib>
+using namespace metal;
+kernel void add_one(device float* values [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    values[i] += 1.0f;
+}
+kernel void twice(device float* values [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    values[i] *= 2.0f;
+}
+"""
 
 fn ramp(n: int, scale: float) -> list[float] {
     var out: list[float] = []
@@ -155,4 +165,28 @@ fn test_matmul_handles_a_non_square_shape() -> void {
         }
         assert_true(close(got[r * cols + c], want, 1e-5), f"rect matmul at {r},{c}")
     }
+}
+
+fn test_upload_u8_expands_and_scales_without_a_boxed_host_list() -> void {
+    if not gpu.is_available() { return }
+    let buffer = gpu.Buffer(3)
+    defer { buffer.free() }
+    buffer.upload_u8(bytes([0, 127, 255]), scale: 0.5)
+    assert_eq(buffer.download(), [0.0, 63.5, 127.5])
+}
+
+fn test_async_dispatches_are_ordered_and_synchronize_once() -> void {
+    if not gpu.is_available() { return }
+    let add_one = gpu.Kernel.compile(ASYNC_SOURCE, "add_one")
+    let twice = gpu.Kernel.compile(ASYNC_SOURCE, "twice")
+    let values = gpu.Buffer.of([1.0, 2.0, 3.0])
+    defer { gpu.synchronize() }
+    defer { add_one.free() }
+    defer { twice.free() }
+    defer { values.free() }
+
+    add_one.dispatch_async([values], 3)
+    twice.dispatch_async([values], 3)
+    gpu.synchronize()
+    assert_eq(values.download(), [4.0, 6.0, 8.0])
 }

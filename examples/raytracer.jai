@@ -1,9 +1,3 @@
-#: A path-traced sphere scene rendered to a PPM file.
-#:
-#: Floating-point heavy, class heavy, and entirely standard library — a good
-#: measure of how the VM handles real numeric work.
-#:
-#:     jaithon run examples/raytracer.jai out.ppm 400 300 32
 import std.math
 import std.io
 from std.random import Random
@@ -124,8 +118,6 @@ class Sphere {
 }
 
 fn random_unit_vector(rng: Random) -> Vec3 {
-    # Rejection sampling inside the unit sphere, then normalise. Sampling the
-    # cube and normalising directly would bias toward the corners.
     loop {
         let p = Vec3(
             rng.float_range(-1.0, 1.0),
@@ -195,7 +187,6 @@ fn ray_color(ray: Ray, world: list[Sphere], depth: int, rng: Random) -> Vec3 {
 }
 
 fn to_byte(component: float, samples: int) -> int {
-    # Average, then gamma-correct with gamma 2.
     let scaled = math.sqrt(component / samples)
     return int(256.0 * math.clamp(scaled, 0.0, 0.999))
 }

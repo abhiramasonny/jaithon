@@ -124,6 +124,15 @@ void jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset)
     (void)offset;
 }
 
+void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
+                    size_t offset, float scale) {
+    (void)b;
+    (void)src;
+    (void)count;
+    (void)offset;
+    (void)scale;
+}
+
 void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     (void)b;
     (void)dst;
@@ -160,6 +169,16 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
     (void)scalarCount;
     (void)threads;
     (void)groupSize;
+    return false;
+}
+
+bool jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
+                         const uint32_t *scalars, int scalarCount,
+                         int threads, int groupSize) {
+    return jaiGpuDispatch(k, buffers, count, scalars, scalarCount, threads, groupSize);
+}
+
+bool jaiGpuSynchronize(void) {
     return false;
 }
 

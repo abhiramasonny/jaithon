@@ -76,6 +76,9 @@ void          jaiGpuFree(JaiGpuBuffer *b);
  * of a buffer without a read-modify-write of the whole thing. */
 void          jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes,
                            size_t offset);
+/* Expand unsigned bytes directly into float slots, applying `scale`. */
+void          jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
+                             size_t offset, float scale);
 void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
                              size_t offset);
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
@@ -89,6 +92,12 @@ int           jaiGpuMaxThreadsPerGroup(JaiGpuKernel *k);
 bool          jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                              const uint32_t *scalars, int scalarCount,
                              int threads, int groupSize);
+/* Queue work without waiting. Commands submitted to the same device execute
+ * in order; jaiGpuSynchronize waits for every queued dispatch. */
+bool          jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
+                                  const uint32_t *scalars, int scalarCount,
+                                  int threads, int groupSize);
+bool          jaiGpuSynchronize(void);
 /* Built-in kernels used by std.gpu when no custom source is supplied. */
 bool jaiGpuVectorAdd(const double *a, const double *b, double *out, size_t n);
 bool jaiGpuVectorMul(const double *a, const double *b, double *out, size_t n);
