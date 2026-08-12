@@ -171,7 +171,9 @@
     X(OP_MOD_INT_CONST,        2,  0)                                          \
     X(OP_ADD_BIND,             2, -2)                                          \
     X(OP_SUB_BIND,             2, -2)                                          \
-    X(OP_MUL_BIND,             2, -2)
+    X(OP_MUL_BIND,             2, -2)                                          \
+    /* container element type, stamped onto the value on top (§3.6) */         \
+    X(OP_ELEM_KIND,            1,  0)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

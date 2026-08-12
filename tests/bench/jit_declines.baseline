@@ -1,9 +1,12 @@
+declined at OP_ELEM_KIND
 declined at OP_FOR_ITER
+stopped : OP_ELEM_KIND
 stopped : OP_GET_LOCAL
 stopped : a parameter is sometimes null
 stopped : callee is not a compiled global function
 stopped : loop variable took two kinds
 stopped: OP_CALL
+stopped: OP_ELEM_KIND
 stopped: OP_FOR_ITER
 stopped: add-bind of a kind that is neither int nor float
 stopped: callee is not a compiled global function

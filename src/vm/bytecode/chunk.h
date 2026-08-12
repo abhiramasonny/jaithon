@@ -167,6 +167,15 @@ typedef enum {
     OP_SUB_BIND,             /* u16 S */
     OP_MUL_BIND,             /* u16 S */
 
+    /* Stamp a declared element type onto the container on top of the stack
+     * (spec §3.6). `list[int]` and `dict[str, int]` are otherwise compile-time
+     * facts only, and a container reaching a function through `any` can be
+     * mutated with no diagnostic at all -- the checker cannot see it, because
+     * with an `any` receiver it does not know what the container holds. Two
+     * FieldKind nibbles: element/value in the low four bits, dict key in the
+     * high four. Emitted only where a type was actually written. */
+    OP_ELEM_KIND,            /* u8: low nibble value kind, high nibble key kind */
+
     OP_COUNT
 } OpCode;
 

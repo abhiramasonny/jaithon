@@ -159,6 +159,15 @@ struct ObjList {
     int      count;
     int      capacity;
     uint32_t version;   /* bumped on every mutation; iterators snapshot it */
+    /* What `list[T]` promised, as a FieldKind, or FIELD_KIND_ANY when nothing
+     * was promised. A declared element type is otherwise a compile-time fact
+     * only, so a list reaching a function through `any` could be pushed a `str`
+     * with no diagnostic at all -- the checker cannot see it, because with an
+     * `any` receiver it does not know what the list was declared to hold.
+     *
+     * Lands in the struct's existing tail padding, so a list costs no more
+     * than it did. */
+    uint8_t  elemKind;
 };
 
 ObjList *jaiListNew(int initialCapacity);
@@ -198,6 +207,9 @@ ObjTuple *jaiTupleNew(const Value *items, int count);
 struct ObjDict {
     Obj      obj;
     JaiTable table;      /* Value keys */
+    /* What `dict[K, V]` promised, as FieldKinds. See ObjList::elemKind. */
+    uint8_t  keyKind;
+    uint8_t  valKind;
 };
 
 struct ObjSet {
@@ -500,6 +512,12 @@ typedef enum {
 
 /* "any", "int", … -- for diagnostics and for the disassembler. */
 const char *jaiFieldKindName(uint32_t kind);
+/* Whether a value satisfies a declared kind. Shared by the field guard and the
+ * container-element guard, so the two can never drift apart. */
+bool jaiKindAccepts(uint32_t kind, Value v);
+/* As jaiKindAccepts, but throws TypeError on a mismatch. `what` names the thing
+ * for the message, e.g. "an element". */
+bool jaiCheckKind(uint32_t kind, Value v, const char *what);
 
 typedef struct {
     ObjString *name;

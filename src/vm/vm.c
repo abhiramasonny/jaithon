@@ -770,32 +770,6 @@ bool jaiGetProperty(Value receiver, ObjString *name, Value *out) {
     return getPropertyInto(receiver, name, out, true, NULL);
 }
 
-/* Does `v` satisfy a field declared with this kind?
- *
- * FIELD_KIND_ANY accepts everything, and that is the answer for an `any` field,
- * a nullable one, a generic parameter, and every image written before the kind
- * bits existed. An unrecognised code is a newer encoding read by an older
- * binary and is treated the same way -- claiming nothing is always safe, and a
- * false TypeError on correct code is worse than a missed check.
- *
- * A float field accepts an int, per LANGUAGE.md §2.5, and stores it as an int:
- * a write arriving through `any` carries no OP_TO_FLOAT, because the checker
- * never saw a float on the target side. Rejecting it would break code that
- * works today. */
-static bool fieldKindAccepts(uint32_t kind, Value v) {
-    switch ((FieldKind)kind) {
-    case FIELD_KIND_ANY:      return true;
-    case FIELD_KIND_INT:      return IS_INT(v);
-    case FIELD_KIND_FLOAT:    return IS_FLOAT(v) || IS_INT(v);
-    case FIELD_KIND_BOOL:     return IS_BOOL(v);
-    case FIELD_KIND_STR:      return IS_STRING(v);
-    case FIELD_KIND_LIST:     return IS_LIST(v);
-    case FIELD_KIND_DICT:     return IS_DICT(v);
-    case FIELD_KIND_INSTANCE: return IS_INSTANCE(v) || IS_NULL(v);
-    }
-    return true;
-}
-
 static bool throwFieldKind(const FieldInfo *info, Value v) {
     return jaiThrow(vm.cTypeError,
                     "cannot assign %s to field '%s' declared %s",
@@ -846,7 +820,7 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
          * `any` receiver means it did not know the class, so it did not know
          * what the field was declared as. FieldInfo is the only place that
          * knows, so the runtime is the only place this can be rejected. */
-        if (!fieldKindAccepts(info->typeId, value)) {
+        if (!jaiKindAccepts(info->typeId, value)) {
             return throwFieldKind(info, value);
         }
         inst->fields[info->slot] = value;
@@ -2160,6 +2134,7 @@ static bool indexSet(Value container, Value index, Value value) {
                             "list index %" PRId64 " out of range for length %d",
                             AS_INT(index), list->count);
         }
+        if (!jaiCheckKind(list->elemKind, value, "an element")) return false;
         list->items[at] = value;
         jaiListTouch(list);      /* the count is unchanged; only the version tells */
         return true;
@@ -3403,6 +3378,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_ADD_BIND]           = &&L_OP_ADD_BIND,
         [OP_SUB_BIND]           = &&L_OP_SUB_BIND,
         [OP_MUL_BIND]           = &&L_OP_MUL_BIND,
+        [OP_ELEM_KIND]          = &&L_OP_ELEM_KIND,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -3960,6 +3936,23 @@ static JaiRunResult runLoop(int baseFrameCount) {
         LOAD_STATE();
         DROP(2);
         slots[slot] = out;
+        VM_NEXT();
+    }
+
+    /* Stamp `list[T]` / `dict[K, V]` onto the container the literal just built,
+     * so the mutation guards below have something to check. Peeks rather than
+     * pops: the container is still the expression's value. */
+    VM_CASE(OP_ELEM_KIND): {
+        uint8_t packed = READ_BYTE();
+        Value target = PEEK(0);
+        if (IS_LIST(target)) {
+            AS_LIST(target)->elemKind = (uint8_t)(packed & 0xFu);
+        } else if (IS_DICT(target)) {
+            AS_DICT(target)->keyKind = (uint8_t)((packed >> 4) & 0xFu);
+            AS_DICT(target)->valKind = (uint8_t)(packed & 0xFu);
+        }
+        /* Anything else: the annotation named a shape this does not model, and
+         * an unstamped container is simply unguarded. */
         VM_NEXT();
     }
 
@@ -5376,7 +5369,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     if (ic->payload[w] < instance->klass->fieldCount) {
                         const FieldInfo *fi =
                             &instance->klass->fields[ic->payload[w]];
-                        if (!fieldKindAccepts(fi->typeId, value)) {
+                        if (!jaiKindAccepts(fi->typeId, value)) {
                             SAVE_STATE();
                             (void)throwFieldKind(fi, value);
                             goto vmThrow;

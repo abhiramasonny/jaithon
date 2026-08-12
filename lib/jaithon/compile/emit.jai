@@ -168,6 +168,7 @@ pub enum Op {
     AddBind,
     SubBind,
     MulBind,
+    ElemKind,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -323,6 +324,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.AddBind, "OP_ADD_BIND", 2, -2),
     OpSpec(Op.SubBind, "OP_SUB_BIND", 2, -2),
     OpSpec(Op.MulBind, "OP_MUL_BIND", 2, -2),
+    OpSpec(Op.ElemKind, "OP_ELEM_KIND", 1, 0),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
@@ -1888,6 +1890,18 @@ pub class Emitter {
             NodeKind.VarDecl => {
                 self._expr(node.child("init"))
                 let pattern = node.child("pattern")
+                # `list[int]` is otherwise a compile-time fact only: a container
+                # reaching a function through `any` can be mutated with no
+                # diagnostic, because with an `any` receiver the checker does
+                # not know what it was declared to hold. Stamp it on the value
+                # so the mutation sites can check.
+                if pattern != null and pattern.kind == NodeKind.PatBind {
+                    let packed = _container_kind_code(node.type_field("declaredType"))
+                    if packed != 0 {
+                        self._chunk().write_op(Op.ElemKind, span)
+                        self._chunk().write_byte(packed)
+                    }
+                }
                 self._bind_pattern(pattern, span)
                 # A `pub let` inside a function body is a mistake, but the C
                 # exports it anyway. A destructuring pattern exports nothing: no single name to carry.
@@ -2849,6 +2863,32 @@ fn _field_kind_code(declared: TypeExpr?, type_params: list[str]) -> int {
     }
 
     # Optional, Union, Fn, Tuple, Infer.
+    return 0
+}
+
+#: The packed `OP_ELEM_KIND` byte for a declared container type, or 0 when the
+#: type is not a container or its element type cannot be named.
+#:
+#: Low nibble is the element (or dict value) kind, high nibble the dict key
+#: kind, both `FieldKind` codes. Zero means "promise nothing", which is what an
+#: untyped container carries and what makes the guard one compare on the common
+#: path.
+fn _container_kind_code(declared: TypeExpr?) -> int {
+    if declared == null { return 0 }
+    let t: TypeExpr = declared
+    if t.kind != TypeKind.Generic { return 0 }
+
+    let name = t.name ?? ""
+    if name == "list" {
+        if t.args.len() != 1 { return 0 }
+        return _field_kind_code(t.args[0], []) & 0xF
+    }
+    if name == "dict" {
+        if t.args.len() != 2 { return 0 }
+        let key = _field_kind_code(t.args[0], []) & 0xF
+        let value = _field_kind_code(t.args[1], []) & 0xF
+        return key << 4 | value
+    }
     return 0
 }
 
