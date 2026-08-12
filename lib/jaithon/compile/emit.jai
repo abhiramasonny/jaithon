@@ -8,7 +8,7 @@ from jaithon.ast import CompKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKi
 from jaithon.ast import Visibility
 from jaithon.ast import is_statement
 from jaithon.compile.diag import DiagnosticBag
-from jaithon.compile.resolve import Resolution, SemaCode, Symbol, SymbolKind
+from jaithon.compile.symbol import Resolution, SemaCode, Symbol, SymbolKind
 
 #: `ObjFunction` flag bits, as `spec/BYTECODE.md` §5 stores them.
 pub const FN_VARIADIC: int = 1

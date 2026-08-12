@@ -9,7 +9,7 @@ from jaithon.compile.check.render import render
 from jaithon.compile.check.ty import Type, TypeDecl
 from jaithon.compile.check.universe import Universe, fn_of
 from jaithon.compile.diag import Diagnostic, DiagnosticBag
-from jaithon.compile.resolve import Resolution, Symbol, SymbolKind
+from jaithon.compile.symbol import Resolution, Symbol, SymbolKind
 
 #: A `float` reaching an `int`, the direction that loses information.
 pub const E0411_INT_FLOAT_MIX: str = "E0411"

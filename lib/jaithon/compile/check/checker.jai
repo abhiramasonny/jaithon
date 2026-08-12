@@ -16,7 +16,7 @@ from jaithon.compile.check.universe import Universe, dict_of, fn_of, list_of
 from jaithon.compile.check.universe import named, set_of, tuple_of
 from jaithon.compile.diag import DiagnosticBag
 from jaithon.compile.parser import parse
-from jaithon.compile.resolve import Resolution
+from jaithon.compile.symbol import Resolution
 import jaithon.compile.check.decl as decl_mod
 import jaithon.compile.check.stmt as stmt_mod
 

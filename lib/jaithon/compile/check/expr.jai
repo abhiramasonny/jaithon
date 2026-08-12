@@ -42,7 +42,7 @@ from jaithon.compile.check.suggest import SUGGEST_NO_MATCH, closer, suggest_memb
 from jaithon.compile.check.ty import MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of
 from jaithon.compile.check.universe import dict_of, list_of, set_of, tuple_of
-from jaithon.compile.resolve import Symbol, SymbolKind
+from jaithon.compile.symbol import Symbol, SymbolKind
 
 #: A value does not fit the slot it is going into.
 #:
