@@ -10,8 +10,12 @@
 #:   already in the code keeps pointing at the same value.
 #: - A class spec's `superNameIndex` of 0 means "no superclass" (`OP_INHERIT`
 #:   links the subclass).
-#: - The line table is a *byte* length followed by 12-byte
-#:   `{offset, span, spanEnd}` rows; it is debug data, ignored when comparing.
+#: - The line table is a *byte* length followed by an LTV1 stream — delta and
+#:   LEB128 per entry, see `VERSION_LTV1`; it is debug data, ignored when
+#:   comparing. Before `VERSION_LTV1` it was 12-byte `{offset, span, spanEnd}`
+#:   rows, which the reader still accepts.
+#: - String constants are tag-10 indices into one module string table, not
+#:   inline bytes; see `VERSION_STRTAB` and `StrTab`.
 #: - Nothing is trusted: a short read, an out-of-range index or a bad CRC all
 #:   mean "recompile" — `read_module` returns null, never a half-built mod.
 #:
@@ -32,7 +36,7 @@ pub let MAGIC: list[int] = [0x4A, 0x41, 0x49, 0x43]
 #:
 #: Must equal `JAIC_VERSION` in `src/vm/bytecode/serialize.h` — one number split across
 #: two languages.
-pub const VERSION: int = 12
+pub const VERSION: int = 13
 
 #: Oldest container this reader accepts. Must equal `JAIC_VERSION_MIN` in
 #: `src/vm/bytecode/serialize.h`.
@@ -46,6 +50,11 @@ pub const VERSION_MIN: int = 11
 #: First container version whose line table is LTV1 (delta + LEB128). Below it,
 #: the table is `_LINE_ROW`-sized absolute rows.
 pub const VERSION_LTV1: int = 12
+
+#: First container version carrying a module string table, whose strings every
+#: pool then names by a tag-10 index. Below it, each pool holds its own tag-4
+#: bytes.
+pub const VERSION_STRTAB: int = 13
 
 #: `JAI_COMPILER_VERSION`, recorded so that a new compiler ignores old caches.
 #:
@@ -274,6 +283,19 @@ pub class Writer {
     pub fn bytes(self, values: list[int]) -> void {
         for value in values { self.data.push(value & 0xFF) }
     }
+
+    #: Append an unsigned LEB128. Seven bits per byte, high bit meaning
+    #: "continues", so a small value costs one byte instead of four.
+    pub fn uleb(self, value: int) -> void {
+        var v = value
+        while true {
+            var byte = v & 0x7F
+            v = v >> 7
+            if v != 0 { byte = byte | 0x80 }
+            self.data.push(byte)
+            if v == 0 { break }
+        }
+    }
 }
 
 #: A bounds-checked cursor over a byte list.
@@ -297,6 +319,10 @@ pub class Reader {
     #: `_read_tuple` would touch several signatures to reach one branch.
     #: `VERSION` until the container header says otherwise.
     pub var version: int
+    #: The module string table, from `VERSION_STRTAB` on: every tag-10 constant
+    #: is an index into it. Empty for older containers, which carry their
+    #: strings inline.
+    pub var strings: list[str]
 
     #: Read `data` up to `limit`, which defaults to its length.
     pub fn init(self, data: list[int], limit: int = -1) {
@@ -305,6 +331,7 @@ pub class Reader {
         self.limit = if limit < 0 { data.len() } else { limit }
         self.bad = false
         self.version = VERSION
+        self.strings = []
     }
 
     #: Bytes still readable.
@@ -349,6 +376,23 @@ pub class Reader {
             value = value | byte << shift * 8
         }
         return value
+    }
+
+    #: Read an unsigned LEB128, or null when the run is malformed or runs past
+    #: the limit. Ten bytes is the most a 64-bit value can occupy, so a bad run
+    #: refuses the image rather than spinning.
+    pub fn uleb(self) -> int? {
+        var value = 0
+        var shift = 0
+        for _step in range(10) {
+            if self.position >= self.limit { return null }
+            let byte = self.u8()
+            if self.bad { return null }
+            value = value | (byte & 0x7F) << shift
+            shift += 7
+            if byte & 0x80 == 0 { return value }
+        }
+        return null
     }
 
     #: Read a little-endian `u64` as a signed 64-bit integer.
@@ -498,6 +542,13 @@ pub fn write_module(mod: Module) -> list[int] {
     out.bytes(path)
     out.u64(mod.mtime)
 
+    # The body goes into its own buffer first: the string table has to be
+    # complete before it can be written, and it is only complete once every
+    # nested function record has been walked. The table then goes ahead of the
+    # body, so the reader has it before the first tag-10 constant.
+    let strings = StrTab()
+    let body = Writer()
+
     # The mod-level pool holds export/import names; the body's own constants
     # live in its function record.
     let pool = Pool([])
@@ -507,30 +558,73 @@ pub fn write_module(mod: Module) -> list[int] {
         names.push(entry.path)
         if entry.alias != null { names.push(entry.alias) }
     }
-    out.u32(names.len())
+    body.u32(names.len())
     for name in names {
-        out.u8(4)  # K_STR
-        let encoded = utf8_bytes(name)
-        out.u32(encoded.len())
-        out.bytes(encoded)
+        body.u8(10)  # K_STRREF
+        body.uleb(strings.intern(name))
         pool.index_of(Const(ConstTag.Str, name))
     }
 
-    _write_function(out, mod.body, 0)
+    _write_function(body, strings, mod.body, 0)
 
-    out.u32(mod.exports.len())
-    for name in mod.exports { out.u32(pool.index_of_name(name)) }
-    out.u32(mod.imports.len())
+    body.u32(mod.exports.len())
+    for name in mod.exports { body.u32(pool.index_of_name(name)) }
+    body.u32(mod.imports.len())
     for entry in mod.imports {
-        out.u32(pool.index_of_name(entry.path))
-        out.u32(pool.index_of_name(entry.alias))
+        body.u32(pool.index_of_name(entry.path))
+        body.u32(pool.index_of_name(entry.alias))
     }
+
+    strings.write(out)
+    out.bytes(body.data)
 
     out.u32(crc32(out.data))
     return out.data
 }
 
-fn _write_function(out: Writer, proto: FuncProto, depth: int) -> void {
+#: Every string constant in the module, once, in first-use order.
+#:
+#: Two things pay for this: 62.5% of a `.jaic`'s string payload was the same
+#: text repeated across nested function pools (73.8% in the seed), and interning
+#: at load drops from one call per occurrence to one per distinct text.
+#:
+#: Must stay byte-compatible with `StrTab` in `src/vm/bytecode/serialize.c` —
+#: the C runtime reads what this writes.
+pub class StrTab {
+    #: The distinct texts, in the order they were first seen.
+    pub var items: list[str]
+    #: text -> its index in `items`.
+    pub var index: dict[str, int]
+
+    pub fn init(self) -> void {
+        self.items = []
+        self.index = {}
+    }
+
+    #: The index of `text`, adding it if this is its first use.
+    pub fn intern(self, text: str) -> int {
+        let existing = self.index.get(text)
+        if existing != null { return existing ?? 0 }
+        let position = self.items.len()
+        self.items.push(text)
+        self.index[text] = position
+        return position
+    }
+
+    #: `count`, then each string as {uleb128 length, bytes}. Varint lengths
+    #: because 94.9% of strings are under 16 bytes, where a flat u32 length is
+    #: mostly zeroes.
+    pub fn write(self, out: Writer) -> void {
+        out.uleb(self.items.len())
+        for text in self.items {
+            let encoded = utf8_bytes(text)
+            out.uleb(encoded.len())
+            out.bytes(encoded)
+        }
+    }
+}
+
+fn _write_function(out: Writer, strings: StrTab, proto: FuncProto, depth: int) -> void {
     if depth > MAX_DEPTH {
         throw ValueError(f"function records nest deeper than {MAX_DEPTH}")
     }
@@ -547,7 +641,7 @@ fn _write_function(out: Writer, proto: FuncProto, depth: int) -> void {
     let body = Writer()
     var index = 0
     while index < pool.entries.len() {
-        _write_constant(body, pool, pool.entries[index], true, depth + 1)
+        _write_constant(body, pool, strings, pool.entries[index], true, depth + 1)
         index += 1
     }
     if pool.entries.len() >= _CONST_LIMIT {
@@ -591,7 +685,14 @@ fn _copy_constants(constants: list[Const]) -> list[Const] {
     return out
 }
 
-fn _write_constant(out: Writer, pool: Pool, value: Const, top_level: bool, depth: int) -> void {
+fn _write_constant(
+    out: Writer,
+    pool: Pool,
+    strings: StrTab,
+    value: Const,
+    top_level: bool,
+    depth: int
+) -> void {
     if depth > MAX_DEPTH { throw ValueError("constant nests too deeply") }
     match value.tag {
         ConstTag.Null => { out.u8(0) }
@@ -608,10 +709,10 @@ fn _write_constant(out: Writer, pool: Pool, value: Const, top_level: bool, depth
             out.f64(value.value)
         }
         ConstTag.Str => {
-            out.u8(4)
-            let encoded = utf8_bytes(value.value)
-            out.u32(encoded.len())
-            out.bytes(encoded)
+            # Tag 10, an index into the module string table — not tag 4 and not
+            # the bytes. See `StrTab` in `src/vm/bytecode/serialize.c`.
+            out.u8(10)
+            out.uleb(strings.intern(value.value))
         }
         ConstTag.Bytes => {
             out.u8(5)
@@ -620,7 +721,7 @@ fn _write_constant(out: Writer, pool: Pool, value: Const, top_level: bool, depth
         }
         ConstTag.Func => {
             out.u8(6)
-            _write_function(out, value.value, depth)
+            _write_function(out, strings, value.value, depth)
         }
         ConstTag.ClassSpec => {
             # A nested class spec's method indices would name a pool still
@@ -632,7 +733,7 @@ fn _write_constant(out: Writer, pool: Pool, value: Const, top_level: bool, depth
         ConstTag.Tuple => {
             out.u8(8)
             out.u32(value.value.len())
-            for item in value.value { _write_constant(out, pool, item, false, depth + 1) }
+            for item in value.value { _write_constant(out, pool, strings, item, false, depth + 1) }
         }
         ConstTag.Type => {
             out.u8(9)
@@ -703,6 +804,14 @@ pub fn read_module(data: list[int], expected_hash: int? = null) -> Module? {
     let path_bytes = reader.bytes(path_length)
     if reader.bad { return null }
     let mtime = reader.u64()
+
+    # The string table comes before the pools, because every tag-10 constant in
+    # them indexes it.
+    if reader.version >= VERSION_STRTAB {
+        let table = _read_strtab(reader)
+        if table == null { return null }
+        reader.strings = table ?? []
+    }
 
     let pool_count = reader.u32()
     if reader.bad or pool_count >= _CONST_LIMIT or not reader.fits(pool_count, 1) {
@@ -815,17 +924,31 @@ fn _ltv1_decode(reader: Reader, byte_count: int) -> list[LineEntry]? {
 }
 
 fn _read_uleb(reader: Reader, stop: int) -> int? {
-    var value = 0
-    var shift = 0
-    while reader.position < stop {
-        let byte = reader.u8()
+    if reader.position >= stop { return null }
+    return reader.uleb()
+}
+
+#: The module string table: count, then each string as {uleb128 length, bytes}.
+#: Null on a malformed table, which refuses the image and recompiles.
+fn _read_strtab(reader: Reader) -> list[str]? {
+    let count = reader.uleb()
+    if count == null { return null }
+    let n = count ?? 0
+    if n < 0 or n >= _CONST_LIMIT { return null }
+    # One byte minimum per entry, so a corrupt count cannot outrun the file.
+    if not reader.fits(n, 1) { return null }
+
+    var out: list[str] = []
+    for _index in range(n) {
+        let length = reader.uleb()
+        if length == null { return null }
+        let len = length ?? 0
+        if len < 0 or len > reader.left() { return null }
+        let encoded = reader.bytes(len)
         if reader.bad { return null }
-        value = value | (byte & 0x7F) << shift
-        shift += 7
-        if byte & 0x80 == 0 { return value }
-        if shift > 63 { return null }
+        out.push(utf8_text(encoded))
     }
-    return null
+    return out
 }
 
 fn _read_sleb(reader: Reader, stop: int) -> int? {
@@ -960,6 +1083,13 @@ fn _read_constant(reader: Reader, depth: int) -> Const? {
         let spec = _read_class_spec(reader)
         if spec == null { return null }
         return Const(ConstTag.ClassSpec, spec)
+    }
+    if tag == 10 {
+        let index = reader.uleb()
+        if index == null { return null }
+        let position = index ?? 0
+        if position < 0 or position >= reader.strings.len() { return null }
+        return Const(ConstTag.Str, reader.strings[position])
     }
     if tag == 8 {
         let count = reader.u32()

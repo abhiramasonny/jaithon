@@ -1,8 +1,4 @@
-/* value.h — the Jaithon value representation: a 16-byte {tag, payload} pair,
- * deliberately not NaN-boxed. An 8-byte NaN-boxed Value was built and measured
- * SLOWER (loop_sum +13.3%, binary_trees +9.7%, alloc_churn +10.1%) because
- * Jaithon's 64-bit `int` (spec §2.4) doesn't fit the 48-bit payload -- full
- * analysis in docs/superpowers/plans/2026-08-09-phase7-speed.md. */
+/* value.h — the Jaithon value representation: a 16-byte {tag, payload} pair */
 #ifndef JAI_VALUE_H
 #define JAI_VALUE_H
 
@@ -34,9 +30,9 @@ typedef struct ObjFile    ObjFile;
 typedef enum {
     VAL_NULL = 0,
     VAL_BOOL,
-    VAL_INT,      /* int64_t  */
-    VAL_FLOAT,    /* double   */
-    VAL_OBJ,      /* heap object; see obj->type */
+    VAL_INT,
+    VAL_FLOAT,
+    VAL_OBJ,
 } ValueType;
 
 typedef struct {
@@ -48,10 +44,6 @@ typedef struct {
         Obj    *obj;
     } as;
 } Value;
-
-/* ------------------------------------------------------------------ */
-/* Constructors and predicates                                         */
-/* ------------------------------------------------------------------ */
 
 #define NULL_VAL          ((Value){VAL_NULL,  {.integer = 0}})
 #define BOOL_VAL(b)       ((Value){VAL_BOOL,  {.boolean = (b)}})
@@ -71,43 +63,25 @@ typedef struct {
 #define AS_FLOAT(v)       ((v).as.number)
 #define AS_OBJ(v)         ((v).as.obj)
 
-/* Which of the five kinds `v` is: goes through here, not `.type` directly, so
- * every switch on a value's kind stays behind the macros -- a NaN-boxed Value
- * would have no tag field to read. */
 JAI_INLINE ValueType jaiValueType(Value v) { return v.type; }
 
-/* Numeric coercion helper: int or float -> double. Undefined for other types. */
 JAI_INLINE double jaiAsDouble(Value v) {
     return IS_INT(v) ? (double)AS_INT(v) : AS_FLOAT(v);
 }
-
-/* ------------------------------------------------------------------ */
-/* Object header                                                       */
-/* ------------------------------------------------------------------ */
 
 typedef enum {
     OBJ_STRING, OBJ_BYTES, OBJ_LIST, OBJ_DICT, OBJ_SET, OBJ_TUPLE, OBJ_RANGE,
     OBJ_FUNCTION, OBJ_CLOSURE, OBJ_UPVALUE, OBJ_NATIVE, OBJ_BOUND,
     OBJ_CLASS, OBJ_TRAIT, OBJ_INSTANCE, OBJ_MODULE, OBJ_ENUM, OBJ_ENUM_VAL,
-    OBJ_ITER, OBJ_FILE, OBJ_ENUM_CTOR,
-    /* Appended, never inserted: the numbering is written into images. */
-    OBJ_STRBUF,
-    /* No OBJ_GENERIC: generics are erased at run time (spec §6.1), so no heap
-     * object ever carries one. */
-    OBJ_TYPE_COUNT
+    OBJ_ITER, OBJ_FILE, OBJ_ENUM_CTOR, OBJ_STRBUF, OBJ_TYPE_COUNT
 } ObjType;
 
 struct Obj {
     ObjType  type;
     bool     isMarked;
-    /* Alignment padding between isMarked and next would otherwise cost a
-     * subtype's own bool a whole aligned word, so it lives here instead.
-     * ObjString uses this for "in the intern table". */
     bool     subFlag;
-    /* The third padding byte. ObjString uses it for whether a later append
-     * into the same buffer overwrote this string's NUL; see jaiStringCStr. */
     bool     subFlag2;
-    Obj     *next;        /* intrusive list of every heap object */
+    Obj     *next;
 };
 
 #define OBJ_TYPE(v)       (AS_OBJ(v)->type)
@@ -134,15 +108,8 @@ struct Obj {
 #define IS_ITER(v)        IS_OBJ_TYPE(v, OBJ_ITER)
 #define IS_FILE(v)        IS_OBJ_TYPE(v, OBJ_FILE)
 
-/* True when compiled code provably cannot have baked this value out of a
- * module global (it's data, not callable or a class); enumerating the inert
- * types rather than the live ones means an unrecognised type just costs an
- * invalidation. TWO CALLERS MUST STAY IN STEP: jaiModuleSet, and jit_func.c's
- * OP_SET_GLOBAL emitter, which recognises only the strict subset
- * {OBJ_INSTANCE, OBJ_LIST} -- adding a type here is safe, removing those two
- * is not without changing the emitter too. */
 JAI_INLINE bool jaiValueIsInertGlobal(Value v) {
-    if (!IS_OBJ(v)) return true;            /* null, bool, int, float */
+    if (!IS_OBJ(v)) return true;
     switch (AS_OBJ(v)->type) {
     case OBJ_STRING: case OBJ_BYTES:  case OBJ_LIST:  case OBJ_DICT:
     case OBJ_SET:    case OBJ_TUPLE:  case OBJ_RANGE: case OBJ_INSTANCE:
@@ -175,21 +142,12 @@ JAI_INLINE bool jaiValueIsInertGlobal(Value v) {
 #define AS_ITER(v)        ((ObjIter *)AS_OBJ(v))
 #define AS_FILE(v)        ((ObjFile *)AS_OBJ(v))
 
-/* ------------------------------------------------------------------ */
-/* Value array (constant pools, list storage)                          */
-/* ------------------------------------------------------------------ */
-
 typedef JAI_VEC(Value) ValueArray;
 
 void jaiValueArrayInit(ValueArray *a);
 void jaiValueArrayFree(ValueArray *a);
 void jaiValueArrayPush(ValueArray *a, Value v);
 
-/* ------------------------------------------------------------------ */
-/* Core value operations                                               */
-/* ------------------------------------------------------------------ */
-
-/* Structural equality (`==`). Calls __eq__ for instances. May raise. */
 bool jaiValuesEqual(Value a, Value b);
 /* Identity (`is`). Never calls user code. */
 bool jaiValuesIdentical(Value a, Value b);
