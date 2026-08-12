@@ -61,9 +61,8 @@ pub fn hoist_globals(proto: FuncProto) -> int {
         let code = decode(proto)
         if code == null { break }
 
-        # `_hoist_round` widens the frame itself, so a rebuild that cannot
-        # represent the result has to put the old size back or the function
-        # keeps slots nothing in it names.
+        # `_hoist_round` widens the frame itself, so a failed rebuild has to put
+        # the old size back, or the function keeps slots nothing names.
         let slots_before = proto.max_slots
         var hoisted = _hoist_round(code, proto)
         if hoisted > 0 and not rebuild(code) {
@@ -79,11 +78,10 @@ pub fn hoist_globals(proto: FuncProto) -> int {
 #: The pass on an already-decoded chunk. See `peephole_on` for why the decode
 #: is the caller's job.
 #:
-#: The rounds run against the one `Code` rather than re-decoding between them,
-#: which is sound because every index this pass reasons about is an index into
-#: `code.data` and `_hoist_round` maintains those as it splices. The frame is
-#: widened here, so a caller whose final rebuild fails has to put `max_slots`
-#: back -- the driver in `opt/mod.jai` saves it for exactly that.
+#: Rounds run against the one `Code` without re-decoding: every index this pass
+#: uses is into `code.data`, and `_hoist_round` maintains those as it splices.
+#: It also widens the frame, so a caller whose final rebuild fails has to
+#: restore `max_slots` -- `opt/mod.jai`'s driver saves it for exactly that.
 pub fn hoist_globals_on(code: Code, proto: FuncProto) -> int {
     var total = 0
     for _round in 0..HOIST_ROUNDS {
@@ -136,10 +134,8 @@ fn _hoist_round(code: Code, proto: FuncProto) -> int {
 # The widest loop that overlaps nothing already planned, or null when there is
 # none left.
 #
-# Outermost first: hoisting an outer loop removes the reads that an inner one
-# would otherwise hoist to a worse place, and the two cannot both be taken in
-# one round because the pre-header of the inner one would sit inside the outer
-# body and run every iteration.
+# Outermost first: taking an inner loop in the same round would put its
+# pre-header inside the outer body, running it every iteration.
 fn _pick_loop(code: Code, plans: list[HoistPlan]) -> HoistPlan? {
     var best_tail = NO_INDEX
     var best_header = 0
@@ -218,9 +214,9 @@ fn _apply(code: Code, plans: list[HoistPlan]) -> bool {
     var at: list[int] = []
     var runs: list[list[Instr]] = []
 
-    # `splice_before` wants ascending insertion points and the plans were picked
-    # widest first, so walk the code rather than the plan list. The planned
-    # ranges are disjoint, so at most one plan starts at any index.
+    # `splice_before` wants ascending insertion points, so walk the code rather
+    # than the (widest-first) plan list; disjoint ranges mean at most one plan
+    # starts at any index.
     for index in 0..code.count() {
         for plan in plans {
             if plan.header != index or plan.count() == 0 { continue }
@@ -266,10 +262,9 @@ fn _preheader(header: Instr, plan: HoistPlan) -> list[Instr] {
 # True when the loop header may only be entered by falling into it from outside
 # or by branching to it from inside the loop.
 #
-# Any other way in skips the pre-header, and the slot then holds whatever the
-# frame left there. An exception edge counts, and so does a `PUSH_HANDLER` that
-# merely registers the header as a landing site: control arrives there without
-# having run the load.
+# Any other way in skips the pre-header, leaving the slot holding whatever the
+# frame left there. A `PUSH_HANDLER` counts even though it only registers the
+# header as a landing site, since control can still arrive without the load.
 fn _header_is_private(code: Code, header: int, tail: int) -> bool {
     for (index, instruction) in code.data.enumerate() {
         if instruction.dead or instruction.target != header { continue }

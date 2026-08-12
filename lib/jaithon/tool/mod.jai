@@ -1,30 +1,14 @@
 #: The `jaithon` subcommands, written in Jaithon.
 #:
-#: `fmt`, `test`, `doc` and `bench` are toolchain code, not standard library:
-#: they live in `jaithon`, beside `std` rather than inside it, because no user
-#: program imports them. The C CLI parses the command line, decides which of
-#: them to run, and calls that module's `main` with the remaining arguments.
-#: Everything they need is in `jaithon.ast`, `jaithon.compile`, `std.io` and
-#: `std.test`, which is the point — a language whose tools cannot be written in
-#: it has not finished being a language.
-#:
-#: | Subcommand | Module | What it does |
-#: |---|---|---|
-#: | `jaithon fmt` | `jaithon.tool.fmt` | the canonical formatter, and `--migrate2` |
-#: | `jaithon test` | `jaithon.tool.test` | runs `test_` functions and `#:` examples |
-#: | `jaithon doc` | `jaithon.tool.doc` | renders the API pages and a search index |
-#: | `jaithon bench` | `jaithon.tool.bench` | runs `bench_` functions against a baseline |
-#:
-#: This module re-exports the four entry points and dispatches between them, so
-#: the whole toolchain is reachable through one name:
+#: They live beside `std` rather than inside it, because no user program
+#: imports them — a language whose tools cannot be written in it has not
+#: finished being a language.
 #:
 #: ```
 #: command_names()                 # ["bench", "doc", "fmt", "test"]
 #: is_command("fmt")               # true
 #: is_command("compile")           # false
 #: ```
-#:
-#: Running it directly does the same thing the CLI does:
 #:
 #: ```text
 #: jaithon run lib/jaithon/tool/mod.jai fmt --check lib
@@ -66,11 +50,9 @@ pub fn is_command(name: str) -> bool {
 
 #: Run the subcommand named by `name` with `args`.
 #:
-#: `args` is passed on unchanged, subcommand name included, because each
-#: `main` expects the same argument list the CLI would have handed it.
-#:
-#: Raises `KeyError` when `name` is not a subcommand; use `is_command` first if
-#: the name came from a user.
+#: `args` is passed through unchanged (name included) — each `main` expects
+#: the CLI's full argv. Raises `KeyError` for an unknown name; check
+#: `is_command` first if `name` came from a user.
 pub fn run(name: str, args: list[str]) -> int {
     if name not in _COMMANDS {
         throw KeyError(f"no such subcommand: {name}, expected one of " + ", ".join(command_names()))

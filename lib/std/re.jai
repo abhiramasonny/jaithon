@@ -1,21 +1,21 @@
 #: Regular expressions, simulated rather than backtracked.
 #:
-#: A pattern is parsed, compiled to a Thompson NFA program, and matched by a
-#: Pike VM: the simulation walks the input once, carrying the set of NFA states
-#: that are alive at the current position. Matching therefore costs
-#: O(program size * text length) always — no input makes it worse.
+#: A pattern compiles to a Thompson NFA and runs on a Pike VM: the simulation
+#: walks the input once, carrying every NFA state alive at the current
+#: position. Cost is O(program size * text length), always — no input makes
+#: it worse.
 #:
 #: That is the whole reason this engine exists. A backtracking engine — Perl,
 #: Python, Java, JavaScript — tries one path at a time and unwinds, so
-#: `(a+)+$` against thirty `a`s and a `!` explores every way of splitting the
-#: `a`s between the two quantifiers: 2^30 attempts, and the process stops
-#: responding. The same pattern here is a few thousand steps. Whenever a
-#: pattern comes start configuration, a user, or a log line, that difference is
-#: the difference between a service and an outage.
+#: `(a+)+$` against thirty `a`s and a `!` explores 2^30 ways of splitting the
+#: `a`s between the two quantifiers, and the process stops responding. The
+#: same pattern here is a few thousand steps — the difference between a
+#: service and an outage once the pattern meets a user or a log line instead
+#: of a test case.
 #:
-#: The price is that backreferences and lookaround are absent: neither is a
-#: regular language, and neither can be simulated in one pass. Everything else
-#: behaves as expected, including leftmost-first semantics, so a greedy `.*`
+#: The price: backreferences and lookaround are absent, since neither is a
+#: regular language and neither can be simulated in one pass. Everything else
+#: behaves as expected, including leftmost-first semantics — a greedy `.*`
 #: still takes as much as it can and `.*?` as little.
 #:
 #: Supported syntax:
@@ -90,10 +90,9 @@ let _CONTROL_ESCAPES: dict[str, int] = {
 
 #: One match of a pattern against a text, with the span of every group.
 #:
-#: Group 0 is the whole match and is always present; a group that took no part
-#: in the match — an alternative that lost, an optional group that was skipped
-#: — reports null rather than an empty string, which is how you tell "matched
-#: nothing" start "did not match".
+#: Group 0 is the whole match and is always present. A group that took no
+#: part in the match reports null, not an empty string — that's how you tell
+#: "matched nothing" from "did not match".
 #:
 #: ```
 #: let date = Regex.compile(r"(\d{4})-(\d{2})-(\d{2})")
@@ -172,10 +171,10 @@ pub class Match {
 
 #: A compiled pattern, ready to match any number of texts.
 #:
-#: Compilation parses the pattern and builds the NFA program once; every match
-#: after that allocates only the thread lists it needs. Hoist the `Regex` out
-#: of your loop — compiling inside one is the single most common way to make
-#: regular expressions look slow.
+#: Compilation parses the pattern and builds the NFA program once; matching
+#: after that only allocates the thread lists it needs. Hoist the `Regex` out
+#: of loops — compiling inside one is the most common way to make regular
+#: expressions look slow.
 #:
 #: ```
 #: let comma = Regex.compile(r"\s*,\s*")
@@ -229,10 +228,9 @@ pub class Regex {
 
     #: Return the leftmost match at or after `start`, or null.
     #:
-    #: Leftmost-first, exactly as a backtracking engine would resolve it: among
-    #: matches starting at the earliest possible position, the one a greedy or
-    #: lazy quantifier prefers. `^` still anchors to the start of the whole
-    #: text, not to `start`.
+    #: Leftmost-first, exactly as a backtracking engine would resolve it among
+    #: matches starting at the earliest position. `^` still anchors to the
+    #: start of the whole text, not to `start`.
     #:
     #: ```
     #: Regex.compile("a+").find("baaa")?.span()      # (1, 4)
@@ -281,12 +279,11 @@ pub class Regex {
 
     #: Replace every match in `text` with `replacement`.
     #:
-    #: In `replacement`, `$0` is the whole match, `$1` the first group and so
-    #: on, and `$$` is a literal dollar sign. Digits are read as far as they
-    #: name a group the pattern actually has, so `$12` is group 12 only when
-    #: there are twelve; otherwise it is group 1 followed by "2". A `$n` that
-    #: names no group at all is left as written, and a group that did not
-    #: participate expands to nothing.
+    #: `$0` is the whole match, `$1` the first group, and `$$` a literal
+    #: dollar sign. Digits are read only as far as they name a group that
+    #: exists, so `$12` is group 12 only with twelve groups, else group 1
+    #: followed by "2". An unmatched `$n` is left as written; a group that
+    #: didn't participate expands to nothing.
     #:
     #: ```
     #: let mail = Regex.compile(r"(\w+)@(\w+)")
@@ -337,14 +334,13 @@ pub class Regex {
         return "".join(out)
     }
 
-    #: Run the simulation start `start`, returning the capture slots of the
+    #: Run the simulation from `start`, returning the capture slots of the
     #: match, or an empty list when there is none.
     #:
-    #: Two thread lists are kept: `current` holds the states alive at this
-    #: position, `next` those reached by consuming one character. Both are in
-    #: priority order, and a state is added at most once per position — that
-    #: cap is what bounds the work at O(program size) per character however
-    #: many ways there are to reach a state.
+    #: Two thread lists are kept: `current` holds states alive at this
+    #: position, `next` those reached by consuming one character, both in
+    #: priority order. A state is added at most once per position — that cap
+    #: is what bounds the work to O(program size) per character.
     fn _search(self, codes: list[int], start: int) -> list[int] {
         let length = codes.len()
         let size = self.program.len()
@@ -357,11 +353,10 @@ pub class Regex {
         var matched: list[int] = []
         var position = start
         loop {
-            # A fresh thread joins at the back of the list at every position
-            # until something matches: lowest priority, so a match that started
-            # earlier always wins, which is what "leftmost" means. Injecting
-            # here rather than restarting the search at each position is what
-            # keeps an unanchored search linear.
+            # A fresh thread joins at the back (lowest priority) until
+            # something matches, so the earliest-started match always wins —
+            # "leftmost". Injecting here instead of restarting the search per
+            # position is what keeps an unanchored search linear.
             if matched.len() == 0 {
                 let fresh = [-1 for _ in 0..self.slot_count]
                 self._add_thread(
@@ -395,10 +390,10 @@ pub class Regex {
                     }
                 } elif instruction.op == OP_MATCH {
                     matched = thread.slots
-                    # Everything after this thread is a lower-priority
-                    # alternative that a backtracking engine would never have
-                    # reached either, so cutting them is what makes the result
-                    # leftmost-*first* rather than leftmost-longest.
+                    # Everything after this is lower priority and a
+                    # backtracking engine would never reach it either —
+                    # cutting it here is what makes the result
+                    # leftmost-*first*, not leftmost-longest.
                     break
                 }
                 index += 1
@@ -422,10 +417,10 @@ pub class Regex {
     #: do to `threads`.
     #:
     #: The stack makes this a depth-first walk with the preferred branch of
-    #: each `Split` on top, so threads land in `threads` in exactly the order a
+    #: each `Split` on top, so threads land in priority order — the order a
     #: backtracking engine would try them. `seen` stamps each program counter
-    #: with the current generation, which both prevents duplicates and stops an
-    #: empty loop body start spinning.
+    #: with the current generation, which prevents duplicates and stops an
+    #: empty loop body from spinning forever.
     fn _add_thread(
         self,
         threads: list[Thread],
@@ -644,8 +639,6 @@ class Parser {
             repeat.children = [atom]
             repeat.low = low
             repeat.high = high
-            # A trailing '?' makes the quantifier lazy: prefer the shortest
-            # match rather than the longest.
             if self._peek() == "?" {
                 repeat.lazy = true
                 self.index += 1
@@ -999,8 +992,8 @@ fn _expand(hit: Match, replacement: str) -> str {
             index += 2
             continue
         }
-        # Take digits only while they still name a group that exists, so "$12"
-        # is group 12 in a pattern with twelve groups and group 1 in one with
+        # Digits are taken only while they still name an existing group, so
+        # "$12" is group 12 with twelve groups, group 1 followed by "2" with
         # fewer.
         var group = 0
         var scan = index + 1

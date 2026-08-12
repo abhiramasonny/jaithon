@@ -1,15 +1,12 @@
 #: Read and write JSON, strictly, with positions on every error.
 #:
-#: The reader implements RFC 8259 and nothing more. Trailing commas, comments,
-#: single-quoted strings, unquoted member names, leading zeros, `NaN` and
-#: `Infinity` are all rejected, because a parser that quietly accepts them turns
-#: a malformed document into a silently different one. `\u` escapes are fully
-#: supported, surrogate pairs included.
+#: The reader implements RFC 8259 and nothing more — extensions like trailing
+#: commas or unquoted names are rejected rather than silently accepted, since
+#: that would turn a malformed document into a silently different one.
 #:
-#: Every syntax error raises `ParseError` carrying the line, the column and an
-#: excerpt with a caret under the offending character. A JSON error without a
-#: position is useless: real documents are one long minified line, and "expected
-#: ',' " tells you nothing about which of the four thousand commas is missing.
+#: Every syntax error raises `ParseError` with the line, column and a caret
+#: excerpt: a minified document is one long line, and "expected ','" alone
+#: doesn't say which of the four thousand commas is missing.
 #:
 #: ```
 #: parse("{\"a\": [1, 2]}")           # {"a": [1, 2]}
@@ -17,8 +14,8 @@
 #: get_path(parse("{\"a\":[7]}"), "a[0]")   # 7
 #: ```
 #:
-#: `parse` builds the whole document in memory. For inputs too large for that,
-#: drive a `Parser` event by event and materialise only the subtrees you want.
+#: `parse` builds the whole document in memory; for larger inputs, drive a
+#: `Parser` event by event instead.
 from std.math import is_inf, is_nan
 from std.str import StringBuilder, repeat, to_float, to_int
 
@@ -33,7 +30,6 @@ const _ARRAY = 1
 
 let _HEX = "0123456789abcdef"
 
-# The seven characters JSON gives a two-character escape to.
 let _SHORT_ESCAPES: dict[str, str] = {
     "\"": "\\\"",
     "\\": "\\\\",
@@ -45,10 +41,6 @@ let _SHORT_ESCAPES: dict[str, str] = {
 }
 
 #: Convert a value of your own type into something `stringify` can write.
-#:
-#: `stringify` knows null, bool, int, float, str, list, tuple and dict. A class
-#: that implements this trait joins that set: the writer calls `to_json` and
-#: serialises whatever comes back.
 #:
 #: ```
 #: class Money: JsonSerializable {
@@ -65,9 +57,8 @@ pub trait JsonSerializable {
 
 #: What a `Parser` event announces.
 #:
-#: `Key` carries the member name and `Value` the scalar; the four bracket
-#: events carry null. There is no event for the end of the document — the
-#: parser returns null instead.
+#: There is no event for the end of the document — the parser returns null
+#: instead.
 pub enum EventKind {
     #: An object opened. Every following `Key` belongs to it until the
     #: matching `ObjectEnd`.
@@ -117,12 +108,10 @@ pub class Event {
 
 #: A pull parser over one JSON document.
 #:
-#: Two front ends share one scanner. `parse_document` builds the whole tree;
-#: `next_event` walks the document one bracket, name or scalar at a time,
-#: allocating nothing but the scalars themselves. Mixing them is the point:
-#: read events until a `Key` you care about arrives, then call `read_value` to
-#: materialise that subtree, or `skip_value` to step over it without building
-#: anything.
+#: `parse_document` builds the whole tree; `next_event` walks it one bracket,
+#: name or scalar at a time. Mixing them is the point: read events until a
+#: `Key` you care about, then `read_value` to materialise that subtree or
+#: `skip_value` to step over it.
 #:
 #: ```
 #: let parser = Parser("{\"small\": 1, \"huge\": [0, 1, 2]}")
@@ -195,9 +184,8 @@ pub class Parser {
 
     #: Parse the value the parser is positioned at and return it whole.
     #:
-    #: Valid at the start of the document, immediately after a `Key` event, and
-    #: at an array element. Raises `ValueError` anywhere else, since there is no
-    #: value there to read.
+    #: Valid at the start of the document, after a `Key` event, or at an array
+    #: element; raises `ValueError` anywhere else.
     pub fn read_value(self) -> any {
         self._prepare_value()
         let value = self._read(0, true)
@@ -289,8 +277,6 @@ pub class Parser {
         return Event(EventKind.Key, key, line, column)
     }
 
-    # Consume the comma that must separate two elements of the container at
-    # `top`, and reject the trailing comma that would otherwise hide behind it.
     fn _separator(self, top: int, closing: str, what: str) -> void {
         if self.counts[top] == 0 { return }
         self._expect(",", f"expected ',' or '{closing}' after {what}")
@@ -373,8 +359,6 @@ pub class Parser {
         }
     }
 
-    # After an element, consume either the closing bracket — reporting that the
-    # container is finished — or the comma that introduces the next element.
     fn _tail(self, closing: str, what: str) -> bool {
         self._skip_whitespace()
         if self._at(closing) {
@@ -642,17 +626,16 @@ pub fn parse(text: str) -> any { return Parser(text).parse_document() }
 
 #: Render `value` as JSON.
 #:
-#: With `indent` at 0 the output is compact, with no space anywhere outside a
-#: string. A positive `indent` puts every element on its own line, indented by
-#: that many spaces per level. `sort_keys` orders every object's members by
-#: name, which is what makes two renderings of equal data byte-identical —
-#: without it members keep insertion order, which is stable per dict but not
-#: across two dicts built differently. `ascii_only` escapes every non-ASCII
-#: character as `\u`, using a surrogate pair above U+FFFF.
+#: `indent` at 0 is compact; a positive value puts every element on its own
+#: line, indented that many spaces per level. `sort_keys` orders members by
+#: name — the only way two renderings of equal data come out byte-identical,
+#: since insertion order is stable per dict but not across two dicts built
+#: differently. `ascii_only` escapes non-ASCII as `\u`, using a surrogate pair
+#: above U+FFFF.
 #:
-#: Raises `ValueError` for a NaN or an infinity, neither of which JSON can
-#: express, and for a structure that contains itself. Raises `TypeError` for a
-#: value of any other unsupported type, and for a non-str member name.
+#: Raises `ValueError` for a NaN, an infinity, or a self-referential
+#: structure. Raises `TypeError` for an unsupported type or a non-str member
+#: name.
 #:
 #: ```
 #: stringify({"b": 1, "a": 2}, sort_keys: true)   # "{\"a\":2,\"b\":1}"
@@ -673,11 +656,11 @@ pub fn stringify(
 
 #: Follow a dotted path into a parsed document, or return `default`.
 #:
-#: A path is member names joined by `.`, with `[i]` for array elements; a
-#: negative subscript counts from the end. Every step that is missing, out of
-#: range, or applied to the wrong kind of container yields `default` rather than
-#: raising, since probing an optional corner of a document is ordinary. A
-#: malformed path raises `ValueError`, because that is a bug in the caller.
+#: A path is member names joined by `.`, with `[i]` for array elements and a
+#: negative subscript counting from the end. A step that is missing, out of
+#: range, or the wrong container type yields `default` — probing an optional
+#: corner of a document is ordinary — but a malformed path raises
+#: `ValueError`, since that's a bug in the caller, not the data.
 #:
 #: A member name containing `.` or `[` cannot be addressed this way; index the
 #: dict directly for those.
@@ -708,27 +691,16 @@ pub fn get_path(value: any, path: str, default: any = null) -> any {
 
 #: Build an instance of `cls` from `data`, checking each field as it goes.
 #:
-#: Every member of `data` is assigned to the declared field of the same name. A
-#: member naming no declared field raises `ValueError` — a typo in a config file
-#: should be reported, not ignored — and a field absent from `data` keeps the
-#: value its declaration gives it.
+#: A member naming no declared field raises `ValueError` — a typo in a config
+#: file should be reported, not ignored. The instance is built via `cls()`
+#: rather than raw allocation so a field absent from `data` keeps its declared
+#: default instead of going null; a class whose `init` demands arguments is
+#: allocated raw instead, defaults unset.
 #:
-#: Keeping the declared value is why the instance is built by calling `cls()`
-#: when that is possible: a field initialiser is compiled into `init`, so an
-#: instance allocated without running it has null in every field, and both the
-#: promise above and the type inference below — which reads the type of the
-#: declared default — would be empty. A class whose `init` demands arguments
-#: cannot be called that way and is allocated raw, defaults and all left unset.
-#:
-#: Each value is checked against the expected type before it is stored, and
-#: `TypeError` names the field, the expectation and what arrived. The
-#: expectation comes from `types[name]` when you supply it — a type such as
-#: `int`, or a class — and otherwise from the type of the field's declared
-#: default; a field defaulting to null accepts anything, since its declaration
-#: leaves nothing to check against. An `int` where a `float` is wanted is
-#: promoted, because JSON writes 1.0 as `1`. A type given in `types` that is a
-#: class, against a value that is a dict, recurses — so nested objects map onto
-#: nested classes.
+#: Each value is checked against the expected type, taken from `types[name]`
+#: or else the field's declared default. An `int` is promoted to `float`
+#: because JSON writes `1.0` as `1`, and a `dict` against a class type
+#: recurses into nested classes.
 #:
 #: ```
 #: class Port {
@@ -762,10 +734,9 @@ pub fn to_class(cls: any, data: dict[str, any], types: dict[str, any]? = null) -
 
 #: Convert `instance` into a dict of its fields, ready for `stringify`.
 #:
-#: Every field `dir` reports whose name does not begin with `_` is included.
-#: Nested instances become nested dicts, and lists and dicts are converted
-#: element by element, so the result is built only from the types `stringify`
-#: knows. Raises `ValueError` on a structure that contains itself.
+#: Every field `dir` reports whose name does not begin with `_` is included,
+#: and nested instances become nested dicts. Raises `ValueError` on a
+#: structure that contains itself.
 #:
 #: ```
 #: class Point {
@@ -957,8 +928,6 @@ fn _jsonable(value: any, depth: int) -> any {
     return _from_class(value, depth + 1)
 }
 
-# A fresh instance of `cls` with its declared field values in place, or a raw
-# one when `init` needs arguments this function has no way to invent.
 fn _blank(cls: any) -> any {
     try {
         return cls()

@@ -1,12 +1,9 @@
 #: Number theory over the 64-bit integers: primality, factorisation, modular
 #: arithmetic and continued fractions.
 #:
-#: Every routine here is exact and total over the range it documents. Modular
-#: multiplication falls back to Russian-peasant doubling once the modulus grows
-#: past the square root of the largest int, so it never needs a product wider
-#: than an int: primality testing, Pollard's rho, the discrete logarithm and the
-#: rest stay correct right up to the largest int rather than stopping at its
-#: square root, as a naive `a * b % m` would force them to.
+#: Modular multiplication falls back to Russian-peasant doubling past the
+#: square root of the largest int, so every routine here stays exact up to the
+#: largest int rather than stopping at its square root, unlike a naive `a * b % m`.
 from std.math import gcd, isqrt
 
 # Products stay inside an int as long as both factors are below the square root
@@ -19,12 +16,9 @@ let SMALL_PRIMES: list[int] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
 
 #: Return true when `n` is prime.
 #:
-#: The test is deterministic for every value an int can hold: after trial
-#: division by the first twelve primes it runs Miller-Rabin against those same
-#: twelve bases. No composite below 3.3 * 10**24 is a strong pseudoprime to all
-#: of {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37} (Sorenson and Webster, 2015),
-#: and the largest int is below 10**19, so a "probable prime" verdict from this
-#: witness set is a proof. Costs O(log n) modular multiplications per base.
+#: Deterministic for every int: no composite below 3.3 * 10**24 is a strong
+#: pseudoprime to all twelve witness bases (Sorenson and Webster, 2015), and the
+#: largest int is under 10**19, so a pass here is a proof, not a probability.
 #:
 #: ```
 #: is_prime(2147483647)    # true
@@ -37,7 +31,6 @@ pub fn is_prime(n: int) -> bool {
         if n == prime { return true }
         if n % prime == 0 { return false }
     }
-    # Write n - 1 as odd * 2**power.
     var odd = n - 1
     var power = 0
     while odd % 2 == 0 {
@@ -62,9 +55,8 @@ pub fn is_prime(n: int) -> bool {
 
 #: Return every prime up to and including `limit`, ascending.
 #:
-#: The classic sieve: O(limit log log limit) time and O(limit) space. Crossing
-#: out starts at `p * p`, since every smaller multiple of `p` already carries a
-#: smaller prime factor.
+#: O(limit log log limit) time, O(limit) space. Crossing out starts at `p * p`
+#: since every smaller multiple of `p` already carries a smaller prime factor.
 #:
 #: ```
 #: sieve_of_eratosthenes(30)    # [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
@@ -94,10 +86,9 @@ pub fn sieve_of_eratosthenes(limit: int) -> list[int] {
 
 #: Return every prime in the closed interval `low..=high`, ascending.
 #:
-#: Only the primes up to `sqrt(high)` are sieved in full; the interval itself is
-#: then crossed out in one pass. That costs O(sqrt(high) + width log log high)
-#: time and O(sqrt(high) + width) space, so a window high up the number line
-#: needs no memory proportional to where it sits.
+#: Only primes up to `sqrt(high)` are sieved in full, then the interval is
+#: crossed out in one pass: O(sqrt(high) + width) space, so a window high up the
+#: number line needs no memory proportional to where it sits.
 #:
 #: ```
 #: segmented_sieve(100, 120)    # [101, 103, 107, 109, 113]
@@ -126,10 +117,9 @@ pub fn segmented_sieve(low: int, high: int) -> list[int] {
 
 #: Return the prime factors of `n` with multiplicity, ascending.
 #:
-#: Small factors are stripped by trial division, then each remaining composite
-#: is split by Pollard's rho with Brent's cycle detection, which finds a factor
-#: of a composite `m` in O(m**0.25) expected modular multiplications. `n` must
-#: be positive; `factorize(1)` is the empty product.
+#: Small factors are stripped by trial division; the rest is split by Pollard's
+#: rho with Brent's cycle detection, O(m**0.25) expected multiplications per
+#: composite `m`. `n` must be positive.
 #:
 #: ```
 #: factorize(360)             # [2, 2, 2, 3, 3, 5]
@@ -215,9 +205,8 @@ pub fn divisor_count(n: int) -> int {
 
 #: Sum the positive divisors of `n`.
 #:
-#: Uses the multiplicative form, summing `1 + p + ... + p**e` per prime, so it
-#: costs no more than `factorize`. Raises `OverflowError` if the sum does not
-#: fit in an int.
+#: Uses the multiplicative form, summing `1 + p + ... + p**e` per prime; costs
+#: no more than `factorize`. Raises `OverflowError` if the sum overflows an int.
 #:
 #: ```
 #: divisor_sum(28)    # 56
@@ -239,9 +228,8 @@ pub fn divisor_sum(n: int) -> int {
 
 #: Count the integers in `1..=n` that are coprime to `n`.
 #:
-#: Euler's totient, evaluated as `n * product(1 - 1/p)` over the distinct primes
-#: of `n`; costs no more than `factorize`. The division is done before the
-#: multiplication, so nothing overflows and nothing is rounded.
+#: Euler's totient as `n * product(1 - 1/p)` over the distinct primes of `n`.
+#: Division is done before multiplication, so nothing overflows or rounds.
 #:
 #: ```
 #: euler_phi(36)    # 12
@@ -275,9 +263,8 @@ pub fn mobius(n: int) -> int {
 
 #: Return `(g, x, y)` with `a*x + b*y == g` and `g == gcd(a, b)`.
 #:
-#: The iterative extended Euclidean algorithm: O(log min(|a|, |b|)) divisions.
-#: `g` is never negative, and the pair returned is the one the algorithm's own
-#: recurrence produces, which is the coefficient pair of least magnitude.
+#: Iterative extended Euclidean algorithm, O(log min(|a|, |b|)) divisions. `g`
+#: is never negative; the (x, y) returned is the recurrence's own least-magnitude pair.
 #:
 #: ```
 #: extended_gcd(240, 46)    # (2, -9, 47)
@@ -327,9 +314,8 @@ pub fn mod_inverse(a: int, modulus: int) -> int {
 
 #: Return `base ** exponent` modulo `modulus`, in `0..modulus`.
 #:
-#: Square-and-multiply, O(log exponent) modular multiplications, exact for every
-#: modulus an int can hold. A negative exponent inverts `base` first and so
-#: requires `base` to be coprime to `modulus`.
+#: Square-and-multiply, O(log exponent) modular multiplications. A negative
+#: exponent inverts `base` first, so `base` must be coprime to `modulus`.
 #:
 #: ```
 #: mod_pow(2, 100, 1000000007)    # 976371285
@@ -352,11 +338,8 @@ pub fn mod_pow(base: int, exponent: int, modulus: int) -> int {
 
 #: Solve a system of congruences `x == residues[i] (mod moduli[i])`.
 #:
-#: Returns `(x, m)` where `m` is the least common multiple of the moduli and `x`
-#: is the unique solution in `0..m`, or null when the system is inconsistent.
-#: The moduli need not be coprime — each step splits out `gcd` — and the cost is
-#: O(k log m) for k congruences. Raises `OverflowError` if the lcm exceeds an
-#: int.
+#: `x` is the unique solution in `0..m` (m = lcm of the moduli), or null if
+#: inconsistent. Moduli need not be coprime; raises `OverflowError` if the lcm overflows.
 #:
 #: ```
 #: chinese_remainder([2, 3, 2], [3, 5, 7])    # (23, 105)
@@ -390,9 +373,8 @@ pub fn chinese_remainder(residues: list[int], moduli: list[int]) -> tuple[int, i
 
 #: Return the least `x` with `base ** x == target (mod modulus)`, or null.
 #:
-#: Baby-step giant-step: O(sqrt(modulus)) modular multiplications and
-#: O(sqrt(modulus)) memory for the table of baby steps. `base` must be coprime
-#: to `modulus`, which is what makes the giant steps invertible.
+#: Baby-step giant-step, O(sqrt(modulus)) time and memory. `base` must be
+#: coprime to `modulus` — that's what makes the giant steps invertible.
 #:
 #: ```
 #: discrete_log(3, 13, 17)    # 4
@@ -428,11 +410,8 @@ pub fn discrete_log(base: int, target: int, modulus: int) -> int? {
 
 #: Return the least primitive root modulo `modulus`, or null when none exists.
 #:
-#: A primitive root generates the whole multiplicative group, which is cyclic
-#: only for 1, 2, 4, `p**k` and `2 * p**k` with `p` an odd prime; null is
-#: returned for every other modulus. Each candidate is checked by raising it to
-#: `phi / q` for each prime `q` dividing `phi`, so the cost is O(g log(phi)
-#: log(modulus)) for a least root `g`, plus one factorisation of `phi`.
+#: A primitive root exists only for moduli 1, 2, 4, `p**k` and `2 * p**k` (`p`
+#: an odd prime); null otherwise. Checked via `phi / q` for each prime `q` of `phi`.
 #:
 #: ```
 #: primitive_root(7)     # 3
@@ -460,9 +439,8 @@ pub fn primitive_root(modulus: int) -> int? {
 
 #: Return the Legendre symbol of `a` over the odd prime `p`: 0, 1 or -1.
 #:
-#: 1 when `a` is a non-zero quadratic residue mod `p`, -1 when it is not, 0 when
-#: `p` divides `a`. Evaluated by Euler's criterion in O(log p) modular
-#: multiplications, after confirming that `p` is an odd prime.
+#: 1 when `a` is a non-zero quadratic residue mod `p`, -1 when it isn't, 0 when
+#: `p` divides `a` — via Euler's criterion, O(log p) modular multiplications.
 #:
 #: ```
 #: legendre_symbol(2, 7)    # 1
@@ -480,9 +458,8 @@ pub fn legendre_symbol(a: int, p: int) -> int {
 
 #: Return the Jacobi symbol of `a` over the odd positive `n`: 0, 1 or -1.
 #:
-#: The Legendre symbol generalised to composite `n`, computed by reciprocity in
-#: O(log n) steps and without factorising `n`. Note that 1 does not imply `a` is
-#: a residue unless `n` is prime.
+#: Legendre symbol generalised to composite `n`, via reciprocity in O(log n)
+#: steps without factorising. Note: 1 doesn't imply `a` is a residue unless `n` is prime.
 #:
 #: ```
 #: jacobi_symbol(1001, 9907)    # -1
@@ -511,9 +488,8 @@ pub fn jacobi_symbol(a: int, n: int) -> int {
 
 #: Return a square root of `a` modulo the prime `p`, or null when none exists.
 #:
-#: Tonelli-Shanks. When `p == 3 (mod 4)` the root is one exponentiation; in
-#: general the loop costs O(log(p)**2) modular multiplications in the worst
-#: case. The other root is `p - result`.
+#: Tonelli-Shanks; one exponentiation when `p == 3 (mod 4)`, else O(log(p)**2)
+#: multiplications worst case. The other root is `p - result`.
 #:
 #: ```
 #: tonelli_shanks(2, 7)     # 4
@@ -540,8 +516,6 @@ pub fn tonelli_shanks(a: int, p: int) -> int? {
     var remainder = mod_pow(value, odd, p)
     var root = mod_pow(value, (odd + 1) // 2, p)
     while remainder != 1 {
-        # Find the order of `remainder`, then halve the exponent gap with a
-        # shifter of exactly the right order.
         var order = 0
         var square = remainder
         while square != 1 {
@@ -560,9 +534,8 @@ pub fn tonelli_shanks(a: int, p: int) -> int? {
 
 #: Return the continued fraction expansion of `numerator / denominator`.
 #:
-#: The terms are the quotients of the Euclidean algorithm, so the expansion is
-#: exact, finite and O(log min(|numerator|, denominator)) long. Every term after
-#: the first is positive, including for negative fractions.
+#: Terms are the Euclidean algorithm's quotients: exact, finite, O(log
+#: min(|numerator|, denominator)) long. Every term after the first is positive, even for negative fractions.
 #:
 #: ```
 #: continued_fraction(415, 93)    # [4, 2, 6, 7]
@@ -617,15 +590,12 @@ pub fn convergents(terms: list[int]) -> list[tuple[int, int]] {
 
 #: Return the closest fraction to `value` with a denominator at most the bound.
 #:
-#: The float is first turned into the exact fraction it stands for, then the
-#: continued fraction of that is walked until the denominator would exceed the
-#: bound; the answer is the better of the last convergent and the furthest
-#: semiconvergent, which is why 311/99 beats 22/7 for pi below 100. Runs in
-#: O(log max_denominator). Every convergent is built in exact integer
-#: arithmetic; only the final choice between the two candidates is weighed in
-#: floating point, so the result can differ from the exact answer only when the
-#: candidates are equidistant, and then the smaller denominator wins — ties
-#: round towards zero.
+#: Walks the float's exact continued fraction until the denominator would
+#: exceed the bound, then takes the better of the last convergent and the
+#: furthest semiconvergent — why 311/99 beats 22/7 for pi below 100. Built in
+#: exact integer arithmetic; only the final comparison is done in float, and can
+#: differ from the exact answer only when the two candidates are exactly
+#: equidistant (then the smaller denominator wins).
 #:
 #: ```
 #: rational_approximation(3.141592653589793, 100)     # (311, 99)
@@ -690,9 +660,8 @@ pub fn prev_prime(n: int) -> int? {
 
 #: Return the `k`-th prime, counting from `nth_prime(1) == 2`.
 #:
-#: Sieves up to `16 * k`, which holds at least k primes for every k up to about
-#: a million, and doubles the bound whenever it did not. Costs one sieve, so
-#: O(p log log p) time and O(p) space for the answer p.
+#: Sieves up to `16 * k` (holds at least k primes for k up to about a million;
+#: doubles the bound if not). O(p log log p) time, O(p) space for the answer p.
 #:
 #: ```
 #: nth_prime(1)       # 2
@@ -710,11 +679,9 @@ pub fn nth_prime(k: int) -> int {
 
 #: Count the primes up to and including `limit`.
 #:
-#: This is Lucy_Hedgehog's method, not a sieve: it keeps only the O(sqrt(limit))
-#: values of `limit // i` and repeatedly removes the multiples of each prime up
-#: to `sqrt(limit)` from the counts, in O(limit**0.75) time and O(sqrt(limit))
-#: space. That is what makes counting the primes below 10**9 reachable at all:
-#: a sieve would need a billion flags to answer the same question.
+#: Lucy_Hedgehog's method, not a sieve: keeps only the O(sqrt(limit)) distinct
+#: values of `limit // i`, removing each prime's multiples from the counts, in
+#: O(limit**0.75) time — a sieve would need a billion flags to count primes below 10**9.
 #:
 #: ```
 #: prime_count(100)        # 25
@@ -793,8 +760,7 @@ fn _split_into(n: int, factors: list[int]) -> void {
 
 fn _pollard_rho(n: int) -> int {
     if n % 2 == 0 { return 2 }
-    # Brent's variant of Pollard's rho. A different polynomial constant is tried
-    # whenever the cycle collapses onto n itself.
+    # Retries with a different polynomial constant when the cycle collapses onto n itself.
     var constant = 1
     loop {
         let divisor = _brent_cycle(n, constant)
@@ -866,12 +832,9 @@ fn _limit_denominator(numerator: int, denominator: int, max_denominator: int) ->
         bottom = remainder
         if bottom == 0 { return (best_numerator, best_denominator) }
     }
-    # The two candidates are the last convergent and the semiconvergent that
-    # walks as far towards it as the denominator bound allows. They straddle the
-    # value, so comparing the gap between them with the gap from the convergent
-    # to the value decides it: 2 * bottom * far_denominator against denominator.
-    # That product can exceed an int, so it is weighed in floating point, which
-    # can only pick the wrong side when the two are exactly equidistant.
+    # Deciding between the two straddling candidates needs 2 * bottom *
+    # far_denominator vs denominator, which can overflow an int, so it's done in
+    # float — wrong only when the two are exactly equidistant.
     let reach = (max_denominator - previous_denominator) // best_denominator
     let far_denominator = previous_denominator + reach * best_denominator
     if 2.0 * float(bottom) * float(far_denominator) <= float(denominator) {

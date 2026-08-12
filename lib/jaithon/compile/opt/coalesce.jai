@@ -83,9 +83,8 @@ pub fn coalesce_slots_on(code: Code) -> int {
 
     if not _scan_ranges(code, ranges, slot_count) { return 0 }
 
-    # Anything still live once exception flow can divert control is left alone:
-    # a handler may be entered from the middle of the protected region, and this
-    # linear scan cannot see which definitions were skipped.
+    # Left alone once exception flow can divert control: a handler may be
+    # entered mid-region, and this linear scan can't see which defs were skipped.
     for slot in reserved..slot_count {
         if ranges[slot].last >= hazard_start { ranges[slot].pinned = true }
     }
@@ -160,11 +159,10 @@ fn _scan_ranges(code: Code, ranges: list[SlotRange], slot_count: int) -> bool {
             ranges[slot].last = index
         }
 
-        # `OP_CLOSE_UPVALUE`'s operand names a position, not just a variable: it
-        # closes this slot *and everything above it*. Renumbering it would move
-        # the boundary. The captured slots it covers are pinned by their
-        # `OP_CLOSURE` already, so pinning the boundary is enough to keep the
-        # "at or above" relation intact.
+        # `OP_CLOSE_UPVALUE`'s operand names a position, not just a variable --
+        # it closes this slot and everything above it, so renumbering would move
+        # the boundary. The slots it covers are already pinned by their
+        # `OP_CLOSURE`, so pinning the boundary alone keeps the relation intact.
         if instruction.op == opcode(Op.CloseUpvalue) {
             ranges[slot_of(instruction, 0)].pinned = true
         }
@@ -210,18 +208,14 @@ fn _widen_across_back_edges(
 # each one the lowest number that is free where it starts. Answers the new
 # number of every slot, which is the slot itself for everything left alone.
 #
-# A number can host several candidates in turn, so what has to be tracked per
-# *number* is the furthest point any of its tenants reaches, not the identity of
-# one of them. Tracking a single "current occupant" and asking about that one's
-# range reads the wrong interval as soon as a number has taken a second tenant,
-# and hands out a number that is still live. That was a real miscompile; see the
-# `jaiOptCoalesceSlots` entry in ROADMAP.md.
+# `live_to[number]` tracks the furthest point any of that number's tenants
+# reaches, not just the current one: tracking a single "current occupant" hands
+# out a number that is still live as soon as a second tenant arrives. That was
+# a real miscompile; see the `jaiOptCoalesceSlots` entry in ROADMAP.md.
 #
-# `live_to[number]` is that furthest point, made of two parts:
-#   - the candidate still sitting in its own number, until it moves;
-#   - every candidate already assigned to that number.
-# `count()` is past the last instruction index, so it reads as "never free" for
-# a number that must not be reused at all.
+# It combines the candidate still sitting in its own number (until it moves)
+# and every candidate already assigned there; `count()` -- past the last
+# instruction index -- means "never free".
 fn _assign(code: Code, ranges: list[SlotRange], reserved: int, slot_count: int) -> list[int] {
     let never_free = code.count()
     var target = [slot for slot in 0..slot_count]
@@ -229,9 +223,8 @@ fn _assign(code: Code, ranges: list[SlotRange], reserved: int, slot_count: int) 
     var live_to = [NO_INDEX for _slot in 0..slot_count]
 
     for slot in 0..slot_count {
-        # A pinned number is never reusable, even when nothing in this linear
-        # scan references it: a slot captured by a closure is pinned but may
-        # carry no GET/SET of its own here, and handing its number to another
+        # A pinned number is never reusable, even unreferenced here: a closure
+        # capture may carry no GET/SET here, and handing its number to another
         # candidate would alias the open upvalue.
         if ranges[slot].pinned {
             live_to[slot] = never_free

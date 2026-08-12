@@ -1,18 +1,12 @@
 #: Random numbers: the xoshiro256** generator, the distributions built on it,
 #: and module-level shorthands that share one default instance.
 #:
-#: `Random` is xoshiro256** — 256 bits of state, a period of 2**256 - 1, and one
-#: multiply, one rotate and five xors per draw. It passes BigCrush. It is *not*
-#: cryptographically secure: 256 bits of output reveal the state, so never use
-#: it for keys, tokens or password salts.
+#: Not cryptographically secure: 256 bits of output reveal the xoshiro256**
+#: state, so never use it for keys, tokens or password salts.
 #:
-#: Every instance owns its state, so two generators never interfere. A generator
-#: made with `Random.with_seed(n)` produces exactly the same stream on every run
-#: and on every platform — that is what makes a failing randomised test
-#: reproducible. A generator made with `Random()`, and the default instance
-#: behind the module-level functions, is seeded from system entropy instead and
-#: produces a different stream every run. **A reproducible run needs an explicit
-#: seed**: call `Random.with_seed(n)`, or `seed(n)` to pin the default instance.
+#: `Random.with_seed(n)` reproduces the same stream on every run; `Random()`
+#: and the default instance are seeded from system entropy and are not.
+#: **A reproducible run needs an explicit seed.**
 #:
 #: ```
 #: let generator = Random.with_seed(2026)
@@ -31,23 +25,19 @@ pub const HEX_DIGITS: str = "0123456789abcdef"
 
 const _SIGN_BIT = -9223372036854775807 - 1
 
-# 2 ** -53: one unit in the last place of a float mantissa, the scale that turns
-# 53 random bits into a uniform value in [0, 1).
+# 2**-53: scales 53 random bits into a uniform value in [0, 1).
 const _TWO_POW_53_INVERSE = 1.1102230246251565e-16
 
-# Below this many trials the binomial is drawn by counting coin flips, which is
-# exact and needs no distribution machinery. Above it the cost of one flip per
-# trial stops being acceptable and the recursive beta split takes over.
+# Below this many trials, binomial draws by counting coin flips (exact, no
+# machinery needed); above it flipping gets too slow and beta-split takes over.
 const _BINOMIAL_FLIP_LIMIT = 40
 
-# Below this mean, Knuth's product method draws a Poisson variate in `mean` + 1
-# uniforms on average. Above it that is too many and PTRS takes over.
+# Below this mean, Knuth's method draws a Poisson variate cheaply; above it
+# that costs too many uniforms and PTRS takes over.
 const _POISSON_KNUTH_LIMIT = 30.0
 
-# The three SplitMix64 constants and the four xoshiro jump constants, written
-# as 32-bit halves because the full values are above INT_MAX and so have no
-# signed literal. The shift discards nothing: it moves `high` into bits 32-63,
-# sign bit included, which is exactly the pattern wanted.
+# Split into 32-bit halves since the full values exceed INT_MAX and have no
+# signed literal; the shift moves `high` into bits 32-63 intact, sign bit included.
 let _SPLIT_MIX_GAMMA = 0x9E3779B9 << 32 | 0x7F4A7C15
 let _SPLIT_MIX_A = 0xBF58476D << 32 | 0x1CE4E5B9
 let _SPLIT_MIX_B = 0x94D049BB << 32 | 0x133111EB
@@ -113,10 +103,9 @@ pub class Random {
 
     #: Restart the stream from `seed`, discarding the current position.
     #:
-    #: The 64-bit seed is expanded into the 256-bit state with SplitMix64, as
-    #: the xoshiro authors specify: seeding the state directly from a small
-    #: integer leaves it almost all zeros, and xoshiro needs thousands of draws
-    #: to escape that.
+    #: Expanded via SplitMix64 rather than seeded directly, since a small
+    #: integer state leaves xoshiro256** near-zero and takes thousands of
+    #: draws to escape.
     pub fn reseed(self, seed: int) -> void {
         let (after_first, first) = _split_mix(seed)
         let (after_second, second) = _split_mix(after_first)
@@ -134,9 +123,8 @@ pub class Random {
 
     #: Advance the state by 2**128 draws, in the time of 128 draws.
     #:
-    #: This is how independent streams are made: give each worker a copy of the
-    #: generator and jump the copy once more for each one. Their streams are
-    #: then 2**128 draws apart and will not overlap.
+    #: Gives each worker a jumped copy of the generator an independent stream:
+    #: 2**128 draws apart, so the streams never overlap.
     pub fn jump(self) -> void {
         var t0 = 0
         var t1 = 0
@@ -163,9 +151,6 @@ pub class Random {
     # --- Primitive draws -----------------------------------------------------
 
     #: Return a uniformly distributed 64-bit int, negative values included.
-    #:
-    #: Every one of the 2**64 bit patterns is equally likely, so the result
-    #: spans the whole int range rather than only the non-negative half.
     pub fn next_int(self) -> int {
         let result = _rotate_left(self.state1 *% 5, 7) *% 9
         let shifted = self.state1 << 17
@@ -180,10 +165,9 @@ pub class Random {
 
     #: Return a uniform float in `[0.0, 1.0)`.
     #:
-    #: Built from the top 53 bits of a draw, which is exactly the number of bits
-    #: a float mantissa holds: every representable value in the interval that is
-    #: a multiple of 2**-53 comes out with equal probability, and the result is
-    #: never 1.0.
+    #: Built from the top 53 bits of a draw — exactly a mantissa's width — so
+    #: every multiple of 2**-53 in the interval is equally likely and 1.0
+    #: never occurs.
     #:
     #: ```
     #: let value = Random.with_seed(4).next_float()
@@ -195,16 +179,11 @@ pub class Random {
 
     #: Return a uniform int in `[low, high)`, without modulo bias.
     #:
-    #: The half-open interval matches `low..high`, so `int_range(0, xs.len())`
-    #: is always a valid index. Raises `ValueError` when the interval is empty.
+    #: Raises `ValueError` when the interval is empty.
     #:
-    #: A plain `draw % span` is not uniform: the residues below
-    #: `2**64 % span` occur once more often than the rest, an error of one part
-    #: in 2**64/span that is glaring for a span near 2**63 and invisible — but
-    #: still there — for a span of 6. This masks the draw down to the next power
-    #: of two and redraws when the result overshoots, so every value is reached
-    #: through exactly the same number of bit patterns. The expected number of
-    #: draws is below 2.
+    #: A plain `draw % span` is biased: residues below `2**64 % span` land
+    #: slightly more often. This masks the draw to the next power of two and
+    #: redraws on overshoot instead, at an expected cost under 2 draws.
     #:
     #: ```
     #: let value = Random.with_seed(8).int_range(-5, 5)
@@ -335,10 +314,9 @@ pub class Random {
 
     #: Shuffle `items` in place, uniformly over all its permutations.
     #:
-    #: Fisher-Yates, drawing each position from the elements not yet placed.
-    #: The variant that draws from the whole list every time is the classic bug:
-    #: it produces n**n equally likely runs over n! permutations, and n! never
-    #: divides n**n for n > 2, so some orderings come out more often.
+    #: Fisher-Yates, drawing each position only from elements not yet placed —
+    #: drawing from the whole list each time is the classic biased-shuffle
+    #: bug, since n! never divides n**n for n > 2.
     pub fn shuffle[T](self, items: list[T]) -> void {
         var position = items.len() - 1
         while position > 0 {
@@ -377,10 +355,9 @@ pub class Random {
 
     #: Return a normal deviate with the given mean and standard deviation.
     #:
-    #: The Marsaglia polar method: draw points in the unit square until one
-    #: falls inside the unit circle, then map it to two independent standard
-    #: normals. It needs no trigonometry, and the second deviate is cached for
-    #: the next call, so the amortised cost is about 1.3 uniforms.
+    #: Marsaglia polar: draw points in the unit square until one lands in the
+    #: unit circle, mapped to two normals; the second is cached, so amortised
+    #: cost is about 1.3 uniforms.
     #:
     #: Raises `ValueError` for a negative `deviation`. Compare `normal`, which
     #: takes a variance.
@@ -410,11 +387,9 @@ pub class Random {
 
     #: Return a normal deviate parameterised as `N(mean, variance)`.
     #:
-    #: The second argument is the **variance** sigma squared, matching the
-    #: `N(mu, sigma**2)` notation; `gauss` takes the standard deviation sigma.
-    #: Which one an API means is the most common source of silently
-    #: wrong-scaled noise, so the two spellings are named apart rather than
-    #: aliased together.
+    #: Takes **variance** (sigma squared) where `gauss` takes standard
+    #: deviation sigma — named apart since confusing the two silently
+    #: mis-scales the noise.
     #:
     #: Raises `ValueError` for a negative `variance`.
     pub fn normal(self, mean: float = 0.0, variance: float = 1.0) -> float {
@@ -426,10 +401,9 @@ pub class Random {
 
     #: Return an exponential deviate with the given `rate`.
     #:
-    #: The mean is `1.0 / rate`. Drawn by inverting the cumulative distribution:
-    #: `-ln(1 - u) / rate`. The `1 - u` is not idle — `next_float` can return
-    #: 0.0 but never 1.0, so `ln(u)` would occasionally be asked for `ln(0.0)`
-    #: while `ln(1 - u)` never is.
+    #: The mean is `1.0 / rate`, drawn as `-ln(1 - u) / rate`. The `1 - u`
+    #: isn't idle — `next_float` can return 0.0 but never 1.0, so `ln(u)`
+    #: would occasionally hit `ln(0.0)`.
     #:
     #: Raises `ValueError` for a rate that is not positive.
     pub fn exponential(self, rate: float = 1.0) -> float {
@@ -441,10 +415,9 @@ pub class Random {
 
     #: Return a gamma deviate with the given `shape` and `scale`.
     #:
-    #: Marsaglia and Tsang's squeeze method, which accepts about 99% of its
-    #: candidates on the first test and needs one normal and one uniform per
-    #: attempt. A shape below 1.0 is drawn at `shape + 1.0` and scaled down by
-    #: `u ** (1 / shape)`, since the density is unbounded at zero there.
+    #: Marsaglia-Tsang squeeze method (~99% first-try acceptance). Shape below
+    #: 1.0 is drawn at `shape + 1.0` and scaled by `u ** (1 / shape)`, since
+    #: the density is unbounded at zero there.
     #:
     #: Raises `ValueError` unless both arguments are positive.
     pub fn gamma(self, shape: float, scale: float = 1.0) -> float {
@@ -481,10 +454,10 @@ pub class Random {
 
     #: Return a beta deviate with shape parameters `alpha` and `beta`.
     #:
-    #: The result lies in `[0.0, 1.0]`. Normally taken as the ratio of two gamma
-    #: deviates. When both shapes are below 1.0 that ratio is numerically
-    #: hopeless — both gammas underflow towards zero and their quotient loses
-    #: every significant bit — so Johnk's method is used there instead.
+    #: The result lies in `[0.0, 1.0]`. Normally the ratio of two gamma
+    #: deviates, but that's numerically hopeless when both shapes are below
+    #: 1.0 — both underflow toward zero and the ratio loses every significant
+    #: bit — so Johnk's method is used there instead.
     #:
     #: Raises `ValueError` unless both shapes are positive.
     #:
@@ -516,10 +489,8 @@ pub class Random {
 
     #: Return a triangular deviate on `[low, high]` peaking at `mode`.
     #:
-    #: `mode` defaults to the midpoint. This is the distribution to reach for
-    #: when all that is known about a quantity is a floor, a ceiling and a most
-    #: likely value — a task estimate, a latency budget — and it is drawn by
-    #: inverting the cumulative distribution, so it needs one uniform.
+    #: `mode` defaults to the midpoint. Drawn by inverting the cumulative
+    #: distribution, so it needs only one uniform.
     #:
     #: Raises `ValueError` unless `low < high` and `low <= mode <= high`.
     #:
@@ -545,10 +516,9 @@ pub class Random {
 
     #: Return a Poisson deviate with the given `mean`.
     #:
-    #: Below a mean of 30, Knuth's method multiplies uniforms until the product
-    #: falls below `exp(-mean)`, which costs `mean + 1` draws on average. Above
-    #: it, that is too many, and Hormann's PTRS transformed-rejection algorithm
-    #: takes over at a cost independent of the mean.
+    #: Below a mean of 30, Knuth's method multiplies uniforms below
+    #: `exp(-mean)` (costs `mean + 1` draws); above it, Hormann's PTRS takes
+    #: over at a cost independent of the mean.
     #:
     #: Raises `ValueError` for a negative or non-finite mean.
     #:
@@ -594,12 +564,9 @@ pub class Random {
     #: Return the number of successes in `trials` independent trials.
     #:
     #: Up to 40 trials the coins are simply flipped. Beyond that, Devroye's
-    #: identity splits the problem instead: the `a`-th smallest of `n` uniforms
-    #: is Beta(a, n + 1 - a), and knowing where it falls relative to
-    #: `probability` fixes the outcome of half the trials and leaves a smaller
-    #: binomial for the rest. Each step halves `trials`, so a billion trials
-    #: cost about two dozen beta deviates rather than a billion flips, and the
-    #: result is exact — not a normal approximation.
+    #: identity — the a-th smallest of n uniforms is Beta(a, n+1-a) — splits
+    #: off half the trials each step, so a billion trials cost dozens of beta
+    #: draws and the result stays exact, not a normal approximation.
     #:
     #: Raises `ValueError` for negative trials or a probability outside
     #: `[0.0, 1.0]`.
@@ -619,10 +586,9 @@ pub class Random {
 
     #: Return a random version-4 UUID in the canonical 8-4-4-4-12 form.
     #:
-    #: 122 of the 128 bits are random; the other six are the version and variant
-    #: fields that RFC 4122 fixes. Since the source is this generator, a seeded
-    #: instance produces the same identifiers every run — which is what a test
-    #: wants and what a production key must never rely on.
+    #: 122 of the 128 bits are random; the rest are the RFC 4122
+    #: version/variant fields. A seeded instance repeats identifiers every
+    #: run — good for tests, never rely on it for production keys.
     #:
     #: ```
     #: let identifier = Random.with_seed(21).uuid4()
@@ -681,17 +647,14 @@ pub class Random {
         }
         let pivot = 1 + trials // 2
         let split = self.beta(float(pivot), float(trials + 1 - pivot))
-        # `split` is where the pivot-th smallest of `trials` uniforms landed.
-        # Everything below it is one smaller binomial; everything above it is
-        # another. Only one of the two needs to be drawn.
+        # `split` is where the pivot-th smallest of `trials` uniforms landed;
+        # only the branch that `probability` falls into needs to be drawn.
         if split >= probability { return self._binomial(pivot - 1, probability / split) }
         return pivot + self._binomial(trials - pivot, (probability - split) / (1.0 - split))
     }
 }
 
-# The default instance behind the module-level functions. Seeded from system
-# entropy at import, so a program that wants a reproducible run must call
-# `seed`.
+# Seeded from system entropy at import; call `seed` for a reproducible run.
 let _DEFAULT = Random()
 
 #: Return the shared generator the module-level functions draw from.
@@ -848,9 +811,8 @@ fn _first_above(totals: list[float], target: float) -> int {
 
 #: Return the natural logarithm of the gamma function, for `x >= 1.0`.
 #:
-#: Lanczos' approximation. The Poisson rejection test needs `ln(k!)` for values
-#: of `k` far past where `k!` itself is representable, so the factorial can
-#: never be formed and cancelled.
+#: Lanczos' approximation. The Poisson rejection test needs `ln(k!)` for `k`
+#: values where `k!` itself would overflow, so it's never formed directly.
 fn _log_gamma(x: float) -> float {
     let z = x - 1.0
     var series = _LANCZOS[0]

@@ -1,36 +1,9 @@
 #: The Jaithon abstract syntax tree, as Jaithon data.
 #:
-#: This module mirrors `src/lang/ast.h` case for case and field for field: one
-#: `NodeKind` per C `AstKind`, one `OpKind` per C `OpKind`, and field names
-#: spelled exactly as `jaiAstToJson` writes them. Three properties hold, and the
-#: formatter, the documentation generator and the self-hosted front end all rest
-#: on them:
-#:
-#: - `from_json` reads, unchanged, what `jaithon --emit=ast` prints.
-#: - `from_json(to_json(node))` equals `node`.
-#: - Re-parsing `to_source(node)` yields `node` again, spans aside.
-#:
-#: A node is a kind, a span, and a `fields` dict keyed by the C field names.
-#: `fields_of(kind)` lists a kind's fields in the order the C emits them, each
-#: tagged with the shape of its value:
-#:
-#: | tag | Jaithon value |
-#: |---|---|
-#: | `"node"` | `Node?` |
-#: | `"nodes"` | `list[Node]` |
-#: | `"str"` | `str?` |
-#: | `"strs"` | `list[str?]` |
-#: | `"bool"`, `"int"`, `"float"` | the scalar of that name |
-#: | `"type"`, `"types"` | `TypeExpr?`, `list[TypeExpr]` |
-#: | `"op"`, `"ops"` | `OpKind`, `list[OpKind]` |
-#: | `"vis"`, `"vdk"`, `"compk"` | `Visibility`, `DeclKind`, `CompKind` |
-#: | `"param[]"` and its eight siblings | `list[dict[str, any]]` |
-#:
-#: The bracketed tags are the C sub-structures — `AstParam`, `AstArg`,
-#: `AstMatchArm` and the rest. They are dicts rather than classes because they
-#: carry no behaviour; build them with `param()`, `arg()`, `match_arm()` and
-#: their siblings so that every key is present, and read their shapes back with
-#: `record_fields()`.
+#: Mirrors `src/lang/ast.h` case for case and field for field. Three properties
+#: hold: `from_json` reads unchanged what `jaithon --emit=ast` prints,
+#: `from_json(to_json(node)) == node`, and re-parsing `to_source(node)`
+#: reproduces it, spans aside.
 #:
 #: ```
 #: from_json(to_json(Node.ident("x"))).text("name")   # "x"
@@ -42,9 +15,8 @@ from std.str import StringBuilder, escape, quote, repeat
 
 #: Every node kind, in the order of the C `AstKind` enum.
 #:
-#: Expressions come first, then statements, then declarations, then patterns,
-#: with `Program` last. `is_expression`, `is_statement`, `is_declaration` and
-#: `is_pattern` answer which group a kind belongs to.
+#: Expressions come first, then statements, declarations, patterns, `Program`
+#: last — `is_expression`/`is_statement`/`is_declaration`/`is_pattern` rely on this order.
 pub enum NodeKind {
     IntLit,
     FloatLit,
@@ -122,9 +94,6 @@ pub enum NodeKind {
 }
 
 #: Every operator code, in the order of the C `OpKind` enum.
-#:
-#: `AddWrap`, `SubWrap` and `MulWrap` are the wrapping operators `+%`, `-%` and
-#: `*%`; `Neg`, `Pos`, `Not` and `Bnot` are the four unary operators.
 pub enum OpKind {
     Add,
     Sub,
@@ -176,8 +145,7 @@ pub enum TypeKind { Name, Generic, Optional, Union, Fn, Tuple, Infer }
 # Name tables
 # ------------------------------------------------------------------
 
-# Parallel to `_KINDS`; both are in C declaration order and the asserts below
-# are this module's version of the C `_Static_assert` on the same tables.
+# Parallel to `_KINDS`, in C declaration order; the asserts below catch drift.
 let _KIND_NAMES: list[str] = [
     "AST_INT_LIT",
     "AST_FLOAT_LIT",
@@ -325,7 +293,6 @@ let _KINDS: list[NodeKind] = [
 let _KIND_INDEX: dict[NodeKind, int] = {kind: index for (index, kind) in _KINDS.enumerate()}
 let _KIND_BY_NAME: dict[str, NodeKind] = {name: kind for (name, kind) in zip(_KIND_NAMES, _KINDS)}
 
-# Group boundaries in `_KINDS`, matching the C category table.
 const _FIRST_STATEMENT = 34
 const _FIRST_DECLARATION = 50
 const _FIRST_PATTERN = 59
@@ -541,9 +508,6 @@ pub fn is_expression(kind: NodeKind) -> bool {
 }
 
 #: Whether nodes of `kind` may appear directly in a block.
-#:
-#: Declarations are statements, exactly as in the C predicate: they live in
-#: blocks. `AST_PROGRAM` is neither a statement nor an expression.
 pub fn is_statement(kind: NodeKind) -> bool {
     let index = _KIND_INDEX[kind]
     return index >= _FIRST_STATEMENT and index < _FIRST_PATTERN
@@ -565,8 +529,6 @@ pub fn is_pattern(kind: NodeKind) -> bool {
 # ------------------------------------------------------------------
 # Field schema
 # ------------------------------------------------------------------
-
-# List tags and the tag of their elements. Everything else is a scalar.
 let _ELEMENT_TAG: dict[str, str] = {
     "nodes": "node",
     "strs": "str",
@@ -696,14 +658,8 @@ fn _build_schemas() -> list[list[tuple[str, str]]] {
         [("cond", "node"), ("thenBranch", "node"), ("elseBranch", "node")]
     )
     define([NodeKind.Match, NodeKind.MatchExpr], [("subject", "node"), ("arms", "arm[]")])
-    # `widen` marks §2.2's int-to-float conversion, as it does on the C's
-    # `AST_CAST` (src/lang/ast.h:277). It is the one field here the C does not
-    # serialise — neither its text dump nor its JSON emits it — so a node read
-    # back from the C carries the default, which is correct: only a checker
-    # inserts a cast, and a C-produced tree has already had its casts turned
-    # into bytecode. The emitter needs it because it is the whole difference
-    # between `OP_TO_FLOAT` and `OP_TYPE_GUARD`, and without it the self-hosted
-    # front end cannot emit either correctly.
+    # `widen` (§2.2, C's AST_CAST at ast.h:277) is never serialised by the C —
+    # it picks OP_TO_FLOAT vs OP_TYPE_GUARD, so the self-hosted emitter needs it right.
     define([NodeKind.Cast], [("operand", "node"), ("target", "type"), ("widen", "bool")])
     define([NodeKind.Yield, NodeKind.Await, NodeKind.ThrowExpr], [("operand", "node")])
     define([NodeKind.Block, NodeKind.Program], [("stmts", "nodes")])
@@ -816,13 +772,10 @@ pub fn record_fields(tag: str) -> list[tuple[str, str]] {
     return fields
 }
 
-# The value a field holds when the encoder left it out or a builder omitted it.
 fn _default_field(name: str, tag: str) -> any {
-    # A sequence pattern with no `...rest` has restIndex -1; 0 would claim the
-    # first element is the rest.
+    # No `...rest` sentinel is -1, not 0 (0 would mean "index 0 is the rest").
     if name == "restIndex" { return -1 }
     if tag in _ELEMENT_TAG { return [] }
-    # A sub-structure always carries a span, synthesised when it has no source.
     if tag == "span" { return Span.none() }
     if tag == "bool" { return false }
     if tag == "int" { return 0 }
@@ -840,10 +793,9 @@ fn _default_field(name: str, tag: str) -> any {
 
 #: A half-open range of source text, as the C lexer records it.
 #:
-#: `start` and `end` are UTF-8 **byte** offsets into the file, so they can be
-#: compared with the C compiler's own diagnostics. Lines and columns are 1-based
-#: and count Unicode scalar values, which is what §1.1 of the language spec
-#: requires and what a caret under an emoji needs.
+#: `start`/`end` are UTF-8 byte offsets (matching the C's own diagnostics);
+#: line/column are 1-based and count Unicode scalars, per §1.1, so a caret lands
+#: right under an emoji.
 #:
 #: ```
 #: Span(0, 4, 5).line_column("let x = 1")   # (1, 5)
@@ -926,8 +878,6 @@ pub class Span {
     }
 
     #: The whole source line containing `start`, without its terminator.
-    #:
-    #: This is the line a diagnostic prints above its caret.
     pub fn line_text(self, source: str) -> str {
         let lines = source.split("\n")
         let index = self.line(source) - 1
@@ -948,7 +898,6 @@ pub class Span {
     }
 }
 
-# Bytes in the UTF-8 encoding of one scalar value.
 fn _utf8_length(character: str) -> int {
     let code = ord(character)
     if code < 0x80 { return 1 }
@@ -975,9 +924,8 @@ fn _char_index(source: str, offset: int) -> int {
 
 #: A type as it was written, before the checker resolves it.
 #:
-#: Mirrors the C `AstType`: `args` holds a generic's arguments, a union's
-#: members, a tuple's members or a function's parameters, and `inner` holds an
-#: optional's element or a function's return type.
+#: Mirrors the C `AstType`: `args`/`inner` are overloaded — generic arguments,
+#: union or tuple members, or function parameters/return type, depending on `kind`.
 #:
 #: ```
 #: TypeExpr.generic("list", [TypeExpr.named("int")]).to_source()   # "list[int]"
@@ -1095,10 +1043,8 @@ pub class TypeExpr {
 
 #: One node of the tree: a kind, a span, and the fields that kind declares.
 #:
-#: The constructor fills every field the kind declares with its default and then
-#: overlays `fields`, so a node is always complete and `to_json` never has to
-#: guess. A name the kind does not declare raises `KeyError` — that is how a
-#: typo in a tree-building pass is caught at the point of the mistake.
+#: Every declared field is always present, defaulted then overlaid by `fields`;
+#: an undeclared name raises `KeyError`, catching typos at the mistake.
 #:
 #: ```
 #: let call = Node.call(Node.ident("f"), [Node.int_lit(1)])
@@ -1175,10 +1121,8 @@ pub class Node {
         return Node(NodeKind.Logical, {"op": op, "left": left, "right": right})
     }
 
-    #: A call with positional arguments.
-    #:
-    #: Pass `arg()` records directly through `Node(NodeKind.Call, ...)` when an
-    #: argument is named or spread.
+    #: A call with positional arguments; use `arg()` records via
+    #: `Node(NodeKind.Call, ...)` for named or spread arguments.
     pub static fn call(callee: Node, args: list[Node]) -> Node {
         return Node(NodeKind.Call, {"callee": callee, "args": [arg(value) for value in args]})
     }
@@ -1415,7 +1359,6 @@ fn _record(tag: str, values: dict[str, any]) -> dict[str, any] {
     return record
 }
 
-# Typed reads of a sub-structure's fields, the counterpart of the builders below.
 fn _flag(record: dict[str, any], name: str) -> bool {
     let value: bool = record.get(name, false)
     return value
@@ -1520,13 +1463,8 @@ pub fn import_item(name: str, alias: str? = null) -> dict[str, any] {
 # S-expression printing
 # ------------------------------------------------------------------
 #
-# `jaiAstPrint` in src/lang/ast.c, which is what `jaithon ast` and the prompt's
-# `:ast` print. The shape is `(kind attr=value` followed by one line per child
-# slot, and an absent optional slot prints `nil` so that positional slots stay
-# unambiguous in a golden.
-#
-# `scripts/ast_parity.sh` diffs this against the C printer over every source in
-# the tree. That script exists only while both printers do.
+# Mirrors `jaiAstPrint` (src/lang/ast.c) — an absent slot prints `nil` so later
+# positions don't shift; checked against the C printer by `scripts/ast_parity.sh`.
 fn _emit(out: StringBuilder, text: str) -> void {
     out.push(text)
 }
@@ -1698,9 +1636,8 @@ fn _record_int(record: dict[str, any], key: str) -> int {
     return 0
 }
 
-# The per-kind body: attributes first, in the order `fields_of` lists them,
-# then one line per child slot. A transliteration of the switch in
-# `printNode` (src/lang/ast.c), checked against it by scripts/ast_parity.sh.
+# Attributes first (`fields_of` order), then one child slot per line —
+# transliterates `printNode`'s switch (src/lang/ast.c; checked by ast_parity.sh).
 fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
     match node.kind {
         NodeKind.IntLit => { _emit(out, " " + str(node.number("intLit"))) }
@@ -1809,7 +1746,7 @@ fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
             let comp_kind = node.get("compKind")
             _emit(out, f" kind={_COMP_KIND_NAMES[comp_kind]}")
             _child(out, node.child("element"), child)
-            _child(out, node.child("keyExpr"), child)  # dict comprehensions only
+            _child(out, node.child("keyExpr"), child)
             for clause in node.records("clauses") {
                 _emit(out, "\n")
                 _indent(out, child)
@@ -2103,10 +2040,9 @@ pub fn to_sexp(node: Node) -> str {
 
 #: Encode `node` as the JSON `jaiAstToJson` writes.
 #:
-#: Keys appear in the C's order, so the two front ends' output can be diffed
-#: directly. Two differences are deliberate: a float may be spelled differently
-#: though never valued differently, and the trailing newline the C writes after
-#: the document is the caller's to add.
+#: Keys appear in the C's order so the two front ends' output can be diffed
+#: directly. Deliberately not identical: a float may be spelled differently
+#: (never valued differently), and the trailing newline is the caller's to add.
 #:
 #: ```
 #: let encoded = to_json(Node.ident("x"))
@@ -2124,10 +2060,9 @@ pub fn from_json(text: str) -> Node {
     return from_value(json.parse(text))
 }
 
-#: Convert `node` to plain dicts, lists and scalars.
+#: Convert `node` to plain dicts, lists and scalars, the shape `to_json` uses.
 #:
-#: This is the same shape `to_json` serialises, for tools that would rather walk
-#: the data than re-parse it. A null node converts to null.
+#: A null node converts to null.
 pub fn to_value(node: Node?) -> any {
     if node is null { return null }
     let out: dict[str, any] = {"kind": kind_name(node.kind), "span": _span_value(node.span)}
@@ -2288,9 +2223,8 @@ fn _float_from(value: any) -> float {
 pub fn children_of(node: Node) -> list[Node] {
     let out: list[Node] = []
 
-    # Two orders differ from the field order and both matter to a rewriting
-    # pass: a dict literal alternates key and value, and a comprehension's key
-    # expression is visited before its element.
+    # `DictLit`/`Comprehension` deviate from field order — a rewriting pass
+    # depends on it: dict alternates key/value; comprehension visits keyExpr first.
     if node.kind == NodeKind.DictLit {
         let keys = node.child_list("keys")
         let values = node.child_list("values")
@@ -2338,10 +2272,9 @@ fn _collect_children(out: list[Node], value: any, tag: str) -> void {
 
 #: Walk the tree rooted at `node`, mirroring `jaiAstWalk`.
 #:
-#: `pre` runs on a node before its children and prunes them by returning false;
-#: `post` runs afterwards either way, so a visitor can keep balanced enter and
-#: leave state across a pruned subtree. A pre-hook that never prunes returns
-#: true unconditionally.
+#: `pre` runs before a node's children and prunes them by returning false;
+#: `post` always runs afterward, so a visitor can balance enter/leave state
+#: across a pruned subtree.
 #:
 #: ```
 #: var seen = 0
@@ -2384,10 +2317,9 @@ pub fn find_all(node: Node, predicate: fn(Node) -> bool) -> list[Node] {
 
 #: A visitor with one hook per node kind, dispatched by kind.
 #:
-#: Subclass it, override the hooks you care about, and call `visit`. Every hook
-#: defaults to `default_visit`, which visits the children and returns null, so an
-#: override that does not call it prunes that subtree. Hooks are `prot`, so a
-#: subclass may override them but outside code goes through `visit`.
+#: Subclass it, override the hooks you care about, and call `visit`. An override
+#: that skips calling `default_visit` prunes that subtree — hooks are `prot`, so
+#: outside code goes through `visit`.
 #:
 #: ```
 #: class NameCollector extends Visitor {
@@ -2405,9 +2337,8 @@ pub fn find_all(node: Node, predicate: fn(Node) -> bool) -> list[Node] {
 pub class Visitor {
     #: Dispatch `node` to the hook for its kind and return whatever it returns.
     #:
-    #: The match below is exhaustive over `NodeKind` on purpose: adding a kind
-    #: to the enum stops this file compiling until the kind has a hook, exactly
-    #: as adding one to `AstKind` stops `jaiAstWalk` compiling.
+    #: The match is exhaustive over `NodeKind` on purpose: adding a kind stops this
+    #: file compiling until it has a hook, as adding one to `AstKind` stops `jaiAstWalk`.
     pub fn visit(self, node: Node) -> any {
         match node.kind {
             NodeKind.IntLit => { return self.visit_int_lit(node) }
@@ -2647,8 +2578,7 @@ pub fn is_assignable(node: Node) -> bool {
         NodeKind.Ident | NodeKind.Member | NodeKind.Index | NodeKind.Slice | NodeKind.PatBind | NodeKind.PatWildcard => {
             return true
         }
-        # `x?.y = v` has no meaning: the point of `?.` is that it may reach no
-        # object at all.
+        # `x?.y = v` is meaningless: `?.` exists precisely so the target might not exist.
         NodeKind.OptMember => { return false }
         NodeKind.TupleLit | NodeKind.ListLit => { return _all_assignable(node.child_list("items")) }
         NodeKind.PatTuple | NodeKind.PatList => { return _all_assignable(node.child_list("elems")) }
@@ -2666,9 +2596,8 @@ fn _all_assignable(elements: list[Node]) -> bool {
 
 #: Whether `node` always transfers control instead of falling through.
 #:
-#: Conservative in the direction that keeps the missing-return check honest: a
-#: loop that any `break` can leave does not diverge, whether or not that break
-#: is reachable.
+#: Conservative in the direction that keeps the missing-return check honest: any
+#: loop a `break` can leave counts as non-diverging, reachable or not.
 #:
 #: ```
 #: always_diverges(Node.return_stmt())                     # true
@@ -2679,8 +2608,6 @@ pub fn always_diverges(node: Node) -> bool {
         NodeKind.Return | NodeKind.Throw | NodeKind.ThrowExpr | NodeKind.Break | NodeKind.Continue => {
             return true
         }
-        # Once one statement diverges the rest of the block is unreachable, so
-        # the block diverges too.
         NodeKind.Block | NodeKind.Program => {
             for stmt in node.child_list("stmts") {
                 if always_diverges(stmt) { return true }
@@ -2713,8 +2640,7 @@ pub fn always_diverges(node: Node) -> bool {
             }
             return true
         }
-        # A `finally` that diverges wins outright; otherwise the body and every
-        # handler have to diverge.
+        # A diverging `finally` wins outright; otherwise body and every handler must diverge.
         NodeKind.Try => {
             let ensure = node.child("finallyBlock")
             if ensure is not null and always_diverges(ensure) { return true }
@@ -2747,8 +2673,7 @@ fn _loop_has_break(node: Node) -> bool {
     var found = false
 
     fn enter(current: Node) -> bool {
-        # Control never crosses a function or type boundary, so a `break` down
-        # there cannot be ours.
+        # Control never crosses a function/type boundary — a nested `break` isn't ours.
         if _is_function_kind(current.kind) or
             current.kind == NodeKind.ClassDecl or
             current.kind == NodeKind.TraitDecl or
@@ -2783,9 +2708,8 @@ fn _loop_has_break(node: Node) -> bool {
 # Unparsing
 # ------------------------------------------------------------------
 
-# Precedence levels, from §4.1 of the language spec. A child is parenthesised
-# exactly when its level is below the level its position requires, which is what
-# makes `to_source` round-trip without wrapping everything in brackets.
+# Precedence levels (§4.1). A child is bracketed exactly when its level is below
+# what its position requires — this is what keeps `to_source` from over-bracketing.
 const _P_ATOM = 17
 const _P_POSTFIX = 16
 const _P_POW = 15
@@ -2855,15 +2779,12 @@ let _BLOCK_DECLARATIONS: set[NodeKind] = {
 
 #: Render `node` as Jaithon source.
 #:
-#: Parsing the result yields a tree equal to `node` in every field except its
-#: spans, which move because the text moved. That property is what makes the
-#: formatter possible: it parses, prints, and trusts that nothing but layout
-#: changed. Three details are worth knowing:
+#: Parsing the result reproduces `node` except for spans — the property the
+#: formatter relies on. Three asymmetries to know:
 #:
-#: - `Cast` nodes are inserted by the type checker and have no surface syntax,
-#:   so they print as their operand.
-#: - `isAbstract`, `isGenerator` and `isAsync` are inferred by the parser rather
-#:   than written, so they carry no output of their own.
+#: - `Cast` nodes have no surface syntax; they print as their operand.
+#: - `isAbstract`, `isGenerator`, `isAsync` are inferred, not written, so they
+#:   produce no output.
 #: - An empty set literal prints as `set()`, since `{}` is the empty dict.
 #:
 #: ```
@@ -2955,8 +2876,8 @@ class _Printer {
         self.emit("}")
     }
 
-    # A branch is a block in every tree the parser builds; anything else still
-    # has to print inside braces to parse back as one statement.
+    # The parser always builds a block here; anything else still needs braces
+    # to round-trip as one statement.
     fn body(self, node: Node?) -> void {
         if node is null {
             self.emit("{}")
@@ -3263,8 +3184,8 @@ class _Printer {
         self.emit("}")
     }
 
-    # Members are separated by a blank line; `written` says whether anything is
-    # above them already.
+    # `written` threads across calls: true once anything has printed, so later
+    # member groups know to add their separating blank line first.
     fn members(self, nodes: list[Node], keyword: str, written: bool) -> bool {
         var any_written = written
         for member in nodes {
@@ -3339,22 +3260,16 @@ class _Printer {
 
     fn expr(self, node: Node?, min_precedence: int) -> void {
         if node is null { return }
-        # A sign-leading literal is one token, not an operator and a number
-        # (§1.6: `-9223372036854775808` is the only one, since every other
-        # negative literal parses as `-` applied to a positive one). Let any
-        # operator stand in front of it and that minus binds to the operator
-        # instead, leaving digits that overflow `int`: `- -9223372036854775808`
-        # and `1 - -9223372036854775808` are both rejected. Brackets are the
-        # only spelling that survives in every position, so it always wears
-        # them.
+        # `-9223372036854775808` (§1.6) is one token, not `-` + digits that
+        # overflow `int` unbracketed — brackets are the only spelling that always survives.
         let wrap = _precedence(node) < min_precedence or _is_signed_literal(node)
         if wrap { self.emit("(") }
         self.bare_expr(node)
         if wrap { self.emit(")") }
     }
 
-    # `1.foo` would lex as a float, so an integer receiver keeps its brackets
-    # even though its precedence says it needs none.
+    # `1.foo` would lex as a float — an int receiver keeps its brackets even
+    # though its precedence alone wouldn't need them.
     fn receiver(self, node: Node?) -> void {
         if node is not null and node.kind == NodeKind.IntLit {
             self.emit("(")
@@ -3399,10 +3314,8 @@ class _Printer {
             NodeKind.Index => {
                 self.receiver(node.child("object"))
                 self.emit("[")
-                # `a[x, y]` parses to a tuple index, and the two spell the same
-                # tree — but `Dict[K, V]` is how a generic instantiation is
-                # written, so print the bare list and not `Dict[(K, V)]`. A
-                # one-element tuple keeps its brackets: `a[x,]` is not `a[x]`.
+                # `a[x, y]` and `Dict[K, V]` parse to the same tree, so print the
+                # bare list, not `Dict[(K, V)]`; `a[x,]` still needs its comma.
                 let subscript = node.child("index")
                 if subscript is not null and
                     subscript.kind == NodeKind.TupleLit and
@@ -3503,8 +3416,8 @@ class _Printer {
             return
         }
         self.emit(op_text(op))
-        # `- -x`: without the space the two signs would read as one token. A
-        # sign-leading *literal* needs no space here — `expr` brackets it.
+        # `- -x` needs the space or the two signs lex as one token; a sign-leading
+        # literal needs none here since `expr` already brackets it.
         if _leads_with_sign(operand) { self.emit(" ") }
         self.expr(operand, _P_UNARY)
     }
@@ -3520,10 +3433,8 @@ class _Printer {
             self.expr(node.child("right"), _P_UNARY)
             return
         }
-        # Comparison is chained, not left-associative (§4.2): printing the left
-        # operand of `(a > b) != c` without its brackets would re-parse as the
-        # three-operand chain `a > b and b != c`, a different program. Every
-        # other level is left-associative and needs no bracket on the left.
+        # Comparison chains, doesn't associate (§4.2): printing `(a > b) != c`'s
+        # left operand unbracketed would re-parse as `a > b and b != c` — a different program.
         let left_level = if level == _P_COMPARE { level + 1 } else { level }
         self.expr(node.child("left"), left_level)
         self.emit(" " + op_text(op) + " ")
@@ -3723,8 +3634,6 @@ fn _is_block_decl(node: Node) -> bool {
     return node.kind in _BLOCK_DECLARATIONS
 }
 
-# Whether a class pattern named its fields, `Point{x: a}`, rather than matching
-# them positionally, `Point(a)`.
 fn _has_field_names(names: list[str?]) -> bool {
     for name in names {
         if name is not null { return true }
@@ -3748,17 +3657,13 @@ fn _type_source(type_expr: TypeExpr?) -> str {
     return type_expr.to_source()
 }
 
-# True when `node` renders as a `-` or `+` applied to something, so that a
-# prefix `-` or `+` in front of it needs a space to stay a token of its own.
 fn _leads_with_sign(node: Node?) -> bool {
     if node is null or node.kind != NodeKind.Unary { return false }
     return node.op() == OpKind.Neg or node.op() == OpKind.Pos
 }
 
-# A literal whose own text opens with a sign. `expr` brackets one wherever it
-# appears, because a space in front is not enough: the sign has to stay part of
-# the token. `freeze_literals` rewrites a literal into an `Ident` holding its
-# spelling, so that shape counts too.
+# A sign-leading literal needs brackets, not just a space, to stay one token;
+# `freeze_literals` turns such literals into `Ident`s, so those count too.
 fn _is_signed_literal(node: Node?) -> bool {
     if node is null { return false }
     match node.kind {

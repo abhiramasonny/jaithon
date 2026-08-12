@@ -4,19 +4,12 @@
 #: The Jaithon half of `jaiOptimize` / `optimizeFunction`
 #: (`src/codegen/optimize.c:1808`). The order below is not a suggestion: the
 #: two front ends are compared instruction for instruction by `make bootstrap`,
-#: so the pipeline is part of the specification and every line of it is the
-#: same line the C driver runs.
+#: so it is part of the specification.
 #:
-#: `optimize` is called once per function, as codegen finishes it — that is
-#: where `jaiCgFinishFunction` (`src/codegen/codegen.c`) calls `jaiOptimize`,
-#: and `jaithon.compile.compile_source` is what hands this module to the
-#: emitter. `_optimize_nested` then walks the constant pool and optimises every
-#: function record it finds there, so a front end that only reached the module
-#: body would still get a fully optimised program — and a front end that does
-#: both, as this one does, runs the pipeline over a nested function once per
-#: enclosing function. That repetition is deliberate: it is what the C driver
-#: does, and the two front ends have to agree byte for byte, so it is not a
-#: round that can be dropped for being redundant.
+#: `_optimize_nested` walks the constant pool and re-optimises every nested
+#: function once per enclosing function -- that repetition looks redundant but
+#: is deliberate: it's what the C driver does, and the two front ends must
+#: agree byte for byte.
 from jaithon.compile.emit import ConstTag, FuncProto
 from .chunk import compact, decode, is_defer_thunk, mark_unreachable, rebuild
 from .coalesce import coalesce_slots, coalesce_slots_on
@@ -44,10 +37,9 @@ pub fn optimize(proto: FuncProto, level: int = 2) -> void {
     _optimize_function(proto, level, 0)
 }
 
-# Nested functions live in the constant pool, so optimising them from here
-# means a caller that only reaches the module body still gets a fully optimised
-# program. A record never names itself, but a malformed pool could, so the
-# identity test stays.
+# Nested functions live in the constant pool, so optimising from here reaches
+# them even from a caller that only visits the module body. A record never
+# names itself, but a malformed pool could, so the identity test stays.
 fn _optimize_nested(proto: FuncProto, level: int, depth: int) -> void {
     for value in proto.chunk.constants {
         if value.tag != ConstTag.Func { continue }
@@ -58,20 +50,16 @@ fn _optimize_nested(proto: FuncProto, level: int, depth: int) -> void {
 
 #: Run the passes over one function, decoding once and re-encoding once.
 #:
-#: Each pass used to take a proto, decode it, work, and rebuild. That is a
-#: round trip per pass, about six per function once the fixpoint loop is
-#: counted, and it dominated the optimiser: measured over the standard library,
-#: one decode plus one rebuild is 317ms against 2.9s for every rewrite the
-#: passes perform. Nothing needed it -- no pass reads `chunk.code`, they all
-#: work on the decoded form -- so the decode moved here and the passes gained
-#: `_on` entry points that take the `Code` already in hand.
+#: Each pass used to decode and rebuild on its own -- about six round trips per
+#: function once the fixpoint loop is counted, and it dominated the optimiser:
+#: measured over the standard library, decode+rebuild is 317ms against 2.9s for
+#: every rewrite combined. No pass reads `chunk.code`, so the decode moved here
+#: and passes gained `_on` entry points taking the `Code` already in hand.
 #:
-#: One rebuild at the end also makes the failure all-or-nothing, which is the
-#: behaviour the passes documented individually and now get for real: a rebuild
-#: that cannot represent the result leaves the chunk exactly as it was, so a
-#: program that compiles at `--O0` cannot fail at `--O2`. `max_slots` is the one
-#: piece of state the passes write outside `code`, so it is saved and restored
-#: on that path.
+#: One rebuild at the end also makes failure all-or-nothing: it leaves the
+#: chunk untouched when unrepresentable, so `--O0` can't fail to compile at
+#: `--O2`. `max_slots` is the one state the passes write outside `code`, so it
+#: is saved and restored on that path.
 fn _optimize_function(proto: FuncProto, level: int, depth: int) -> void {
     if depth > MAX_DEPTH { return }
     _optimize_nested(proto, level, depth)
@@ -111,14 +99,14 @@ fn _optimize_function(proto: FuncProto, level: int, depth: int) -> void {
             }
         }
 
-        # Coalescing runs last so that it sees the final set of locals,
-        # including the ones hoisting just introduced. Running it earlier leaves
-        # a hoisted slot unpacked until the next call, which makes the pipeline
-        # disagree with itself about the frame size.
+        # Coalescing runs last so it sees the final locals, including the ones
+        # hoisting just introduced -- running it earlier would leave a hoisted
+        # slot unpacked until the next call, disagreeing with the pipeline
+        # about frame size.
         #
         # A defer thunk is exempt: its slot numbers are the defining frame's, so
-        # renumbering them against its own (empty) parameter list would make it
-        # read the wrong local.
+        # renumbering against its own (empty) parameter list would read the
+        # wrong local.
         if not is_defer_thunk(proto) { changes += coalesce_slots_on(code) }
     }
 

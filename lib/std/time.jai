@@ -1,24 +1,7 @@
 #: Durations, monotonic timing, and a calendar over the Unix epoch.
 #:
-#: Three types carry the module. `Duration` is a signed span of nanoseconds and
-#: does the arithmetic. `Instant` is a reading of the monotonic clock and is the
-#: only correct way to measure how long something took. `DateTime` is a civil
-#: date and time pinned to a point on the Unix timeline.
-#:
-#: Use `Instant` for elapsed time and `DateTime` for wall-clock time, never the
-#: other way round. The wall clock is adjusted by NTP and by the user, so it can
-#: jump backwards; the difference of two wall-clock readings is therefore a
-#: meaningless — and occasionally negative — measurement of elapsed time. The
-#: monotonic clock never moves backwards but has no relation to the calendar.
-#:
-#: `DateTime` stores whole seconds since 1970-01-01T00:00:00Z plus a separate
-#: nanosecond field, so its range is the whole of recorded history rather than
-#: the +/-292 years a nanosecond counter would allow. Leap seconds do not exist
-#: on this timeline: every day is exactly 86400 seconds, which is what the Unix
-#: epoch means and what every other system agrees with. Time zones are fixed
-#: offsets from UTC in minutes east of it; there is no time-zone database, so a
-#: `DateTime` never silently changes its offset across a daylight-saving
-#: boundary.
+#: Use `Instant` for elapsed time, never `DateTime`: the wall clock can jump
+#: backwards (NTP, user changes), making elapsed-time math on it meaningless.
 #:
 #: ```
 #: DateTime.from_unix(0).to_iso()               # "1970-01-01T00:00:00Z"
@@ -38,8 +21,7 @@ const _NANOS_PER_HOUR = 3_600_000_000_000
 const _NANOS_PER_DAY = 86_400_000_000_000
 const _NANOS_MIN = -9223372036854775807 - 1
 
-# Guard rails for the float constructors. The exact int64 bounds are not
-# representable as floats, so the comparison uses the nearest safe magnitude.
+# int64 bounds aren't exactly representable as floats; this is the nearest safe magnitude.
 const _NANOS_LIMIT_F: float = 9.2e18
 
 let _MONTH_LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -63,9 +45,8 @@ let _DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Satur
 
 #: A signed span of time, held as a whole number of nanoseconds.
 #:
-#: A `Duration` is immutable: every operation returns a new one. The span it can
-#: represent is roughly +/-292 years, and any operation that leaves that range
-#: raises `OverflowError` rather than wrapping.
+#: Immutable (every operation returns a new one); a span past roughly +/-292
+#: years raises `OverflowError` rather than wrapping.
 #:
 #: ```
 #: Duration.from_minutes(1.5).to_str()                     # "1m 30s"
@@ -76,16 +57,11 @@ pub class Duration: Comparable, Printable {
 
     #: Create a duration of `nanos` nanoseconds, which may be negative.
     #:
-    #: The named constructors below read better at a call site; use this one
-    #: when the count is already in nanoseconds.
-    #:
     #: ```
     #: Duration(1_500_000_000).to_str()    # "1.5s"
     #: ```
     pub fn init(self, nanos: int) {
-        # Excluding the most negative int keeps `negate` and `absolute` total,
-        # so no later operation has to defend against an unrepresentable
-        # magnitude.
+        # Excludes INT64_MIN so `negate`/`absolute` stay total (no unrepresentable magnitude).
         if nanos == _NANOS_MIN {
             throw OverflowError(f"duration of {_NANOS_MIN}ns has no representable magnitude")
         }
@@ -159,8 +135,8 @@ pub class Duration: Comparable, Printable {
 
     #: Return the whole seconds in the span, truncated towards zero.
     #:
-    #: Together with `subsec_nanos` this splits the span without losing a digit,
-    #: which `to_seconds` cannot promise once the span exceeds about 104 days.
+    #: Together with `subsec_nanos`, splits the span without losing precision,
+    #: unlike `to_seconds` past about 104 days.
     #:
     #: ```
     #: Duration.from_millis(-1500.0).whole_seconds()    # -1
@@ -229,11 +205,6 @@ pub class Duration: Comparable, Printable {
 
     #: Render the span for a human reader.
     #:
-    #: Below a second a single unit is used, with a trimmed fraction. From a
-    #: second upwards the span is broken into days, hours, minutes and seconds,
-    #: starting at the largest non-zero unit and running down to seconds so that
-    #: the last component always carries the fraction.
-    #:
     #: ```
     #: Duration.from_nanos(1500).to_str()          # "1.5µs"
     #: Duration.from_millis(250.0).to_str()          # "250ms"
@@ -294,9 +265,8 @@ pub class Duration: Comparable, Printable {
 
 #: A reading of the monotonic clock, for measuring elapsed time.
 #:
-#: The origin is arbitrary and differs between runs, so an `Instant` is only
-#: meaningful when compared with another one from the same process. What it
-#: guarantees is that it never moves backwards, which the wall clock does not.
+#: Its origin is arbitrary and differs between runs, so only compare it with
+#: another `Instant` from the same process; it never moves backwards.
 #:
 #: ```
 #: let start = Instant.now()
@@ -307,8 +277,8 @@ pub class Instant: Comparable, Printable {
 
     #: Adopt a raw monotonic reading of `nanos` nanoseconds.
     #:
-    #: `Instant.now()` is what callers want; this exists so a reading can be
-    #: carried across a channel or a checkpoint and reconstructed.
+    #: For reconstructing a reading carried across a channel or checkpoint;
+    #: use `Instant.now()` for a fresh one.
     pub fn init(self, nanos: int) { self.nanos = nanos }
 
     #: Read the monotonic clock.
@@ -319,8 +289,7 @@ pub class Instant: Comparable, Printable {
 
     #: Return how long ago `self` was read.
     #:
-    #: The result is never negative, because the clock behind it never moves
-    #: backwards.
+    #: Never negative: the underlying clock never moves backwards.
     pub fn elapsed(self) -> Duration { return Duration(_mono_nanos() - self.nanos) }
 
     #: Return the span from `earlier` to `self`, negative when `earlier` is later.
@@ -364,8 +333,8 @@ pub class Instant: Comparable, Printable {
 
 #: An accumulating timer that can be stopped, resumed, and split into laps.
 #:
-#: `Instant.elapsed` measures one span. A `Stopwatch` measures a total across
-#: several spans, which is what profiling a function called in a loop needs.
+#: Unlike `Instant.elapsed` (one span), sums a total across several spans —
+#: e.g. profiling a function called in a loop.
 #:
 #: ```
 #: let watch = Stopwatch.start_new()
@@ -458,13 +427,8 @@ pub class Stopwatch: Printable {
 
 #: A civil date and time at a fixed offset from UTC.
 #:
-#: The instant is `unix_second` seconds plus `nanosecond` nanoseconds after
-#: 1970-01-01T00:00:00Z. The calendar fields are that instant rendered at
-#: `offset_minutes` minutes east of UTC, so two values that name the same
-#: instant at different offsets compare equal.
-#:
-#: The calendar is the proleptic Gregorian one: its rules are projected back
-#: before 1582 unchanged, which is the same choice ISO 8601 makes.
+#: Two values naming the same instant at different offsets compare equal.
+#: Calendar is proleptic Gregorian, rules projected back before 1582 (as ISO 8601 does).
 #:
 #: ```
 #: let moment = DateTime.of(2024, 2, 29, 12, 30, 15)
@@ -510,7 +474,7 @@ pub class DateTime: Comparable, Printable {
     #: Create the moment `unix_second` seconds and `nanosecond` nanoseconds
     #: after the epoch, rendered at `offset_minutes` east of UTC.
     #:
-    #: A `nanosecond` outside 0..999999999 is carried into the seconds, so
+    #: A `nanosecond` outside 0..999999999 is carried into the seconds —
     #: arithmetic can hand over an unnormalised pair.
     #:
     #: ```
@@ -543,9 +507,8 @@ pub class DateTime: Comparable, Printable {
 
     #: Read the wall clock.
     #:
-    #: The result is in UTC: there is no time-zone database to discover the
-    #: local offset with. Pass the offset to `with_offset` when a local
-    #: rendering is wanted.
+    #: Result is UTC — there's no time-zone database to find a local offset;
+    #: pass one to `with_offset` for local rendering.
     pub static fn now() -> DateTime {
         let nanos = _wall_nanos()
         let seconds = _floor_div(nanos, _NANOS_PER_SECOND)
@@ -563,10 +526,6 @@ pub class DateTime: Comparable, Printable {
     }
 
     #: Create a moment from calendar fields, which must name a real date.
-    #:
-    #: The fields are read at `offset_minutes` east of UTC. A month outside
-    #: 1..12, a day past the end of that month — 2023-02-29, say — or a time
-    #: field out of range raises `ValueError`.
     #:
     #: ```
     #: DateTime.of(2000, 2, 29).to_iso()             # "2000-02-29T00:00:00Z"
@@ -601,11 +560,6 @@ pub class DateTime: Comparable, Printable {
     }
 
     #: Parse an ISO 8601 timestamp.
-    #:
-    #: The accepted shapes are `YYYY-MM-DD` optionally followed by `T` or a
-    #: space and `HH:MM`, `HH:MM:SS` or `HH:MM:SS.fraction`, optionally followed
-    #: by `Z`, `+HH:MM`, `+HHMM` or `+HH`. A fraction longer than nine digits is
-    #: truncated. Anything else raises `ParseError`.
     #:
     #: ```
     #: DateTime.from_iso("2024-02-29T12:00:00Z").to_unix()        # 1709208000
@@ -687,16 +641,12 @@ pub class DateTime: Comparable, Printable {
 
     #: Return the nanoseconds since the epoch.
     #:
-    #: Raises `OverflowError` outside 1677-09-21 to 2262-04-11, where the count
-    #: leaves the range of an int.
+    #: Raises `OverflowError` outside 1677-09-21 to 2262-04-11 (int64 range).
     pub fn to_unix_nanos(self) -> int {
         return self.unix_second * _NANOS_PER_SECOND + self.nanosecond
     }
 
     #: Render the moment as an ISO 8601 timestamp.
-    #:
-    #: The offset is written as `Z` when it is zero and as `+HH:MM` otherwise.
-    #: A non-zero nanosecond field is written as a trimmed fraction.
     #:
     #: ```
     #: DateTime.of(2024, 12, 31, 23, 59, 59).to_iso()   # "2024-12-31T23:59:59Z"
@@ -732,9 +682,8 @@ pub class DateTime: Comparable, Printable {
     #: | `%n` | newline | `%t` | tab |
     #: | `%%` | a literal `%` | | |
     #:
-    #: An unknown specifier raises `ValueError` rather than being copied
-    #: through, because a silently literal `%q` is a typo that survives to
-    #: production.
+    #: An unknown specifier raises `ValueError` instead of passing through
+    #: silently — a silent `%q` typo would otherwise reach production.
     #:
     #: ```
     #: let moment = DateTime.of(2024, 2, 29, 13, 5, 9)
@@ -920,9 +869,8 @@ pub fn sleep(duration: Duration) -> void {
 
 #: Run `action` and return its result together with how long it took.
 #:
-#: The duration comes from the monotonic clock, so it is unaffected by a clock
-#: adjustment during the call. An exception from `action` propagates and no
-#: duration is produced.
+#: Duration comes from the monotonic clock, unaffected by wall-clock changes
+#: during the call. An exception from `action` propagates and produces no duration.
 #:
 #: ```
 #: let (value, spent) = timed(|| 6 * 7)
@@ -935,9 +883,6 @@ pub fn timed(action: fn() -> any) -> tuple[any, Duration] {
     return (result, start.elapsed())
 }
 
-# The three points of contact with the runtime clock. `time_mono` and
-# `time_wall` report integer nanoseconds — the monotonic one from an arbitrary
-# origin, the wall one from the Unix epoch — and `time_sleep` takes seconds.
 fn _mono_nanos() -> int { return __prim__.time_mono() }
 
 fn _wall_nanos() -> int { return __prim__.time_wall() }
@@ -952,8 +897,6 @@ fn _from_unit(value: float, unit: int, name: str) -> Duration {
     return Duration(int(__prim__.f64_round(nanos)))
 }
 
-# Render `value` as whole units plus a trimmed fraction, where `unit` nanoseconds
-# make one unit and `width` is the digit count of that fraction.
 fn _scaled(value: int, unit: int, width: int, suffix: str) -> str {
     let whole = value // unit
     let fraction = value - whole * unit
@@ -992,7 +935,6 @@ fn _is_digit(character: str) -> bool {
     return code >= 48 and code <= 57
 }
 
-# Read exactly `width` digits at `start`, naming `original` in the diagnostic.
 fn _digits_at(source: str, start: int, width: int, original: str) -> int {
     if start + width > source.len() {
         throw ParseError(f"expected {width} digits in {repr(original)}")
@@ -1008,7 +950,6 @@ fn _digits_at(source: str, start: int, width: int, original: str) -> int {
     return value
 }
 
-# Turn the digits after a decimal point into nanoseconds, truncating past nine.
 fn _fraction_nanos(digits: str) -> int {
     var value = 0
     for index in 0..9 {
@@ -1018,9 +959,8 @@ fn _fraction_nanos(digits: str) -> int {
     return value
 }
 
-# Howard Hinnant's civil-calendar algorithms, stated for floor division. `days`
-# counts days since 1970-01-01; 719468 is the day count from 0000-03-01, the
-# start of the 400-year era the algorithms are built on.
+# Howard Hinnant's civil-calendar algorithm (floor division). `days` counts from
+# 1970-01-01; 719468 is the day count from 0000-03-01, the era start it's built on.
 fn _days_from_civil(year: int, month: int, day: int) -> int {
     let shifted = if month <= 2 { year - 1 } else { year }
     let era = _floor_div(shifted, 400)
@@ -1045,9 +985,8 @@ fn _civil_from_days(days: int) -> tuple[int, int, int] {
     return (year, month, day)
 }
 
-# Floor division, written so it is correct whether `//` floors or truncates.
-# Every caller passes a positive divisor, which is what makes the one-sided
-# correction sufficient.
+# Correct whether `//` floors or truncates. Callers always pass a positive
+# divisor, which is what makes the one-sided correction sufficient.
 fn _floor_div(value: int, divisor: int) -> int {
     let quotient = value // divisor
     if quotient * divisor > value { return quotient - 1 }

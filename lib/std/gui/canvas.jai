@@ -1,17 +1,9 @@
 #: Software rasterisation: colours, shapes, curves, text and blitting, written
 #: entirely in Jaithon over a flat pixel buffer.
 #:
-#: A colour is one `int` packed `0xAARRGGBB`, so it costs nothing to pass and
-#: can be a `const`. Build one with `rgb` or `rgba`; take it apart with
-#: `red_of` and friends. Every drawing routine composites the source colour
-#: over the destination when its alpha is below 255, so translucency is
-#: available everywhere and costs nothing when unused.
-#:
-#: A `Canvas` draws into any `PixelTarget`: a `Window` for the screen, an
-#: `Image` for an offscreen sprite or a test. Coordinates are integer pixels
-#: with the origin at the top left and y increasing downward. Everything is
-#: clipped — to the canvas, and to the current `set_clip` rectangle — so
-#: drawing off the edge is ordinary and silent rather than an error.
+#: A colour is one `int` packed `0xAARRGGBB`. A `Canvas` draws into any
+#: `PixelTarget`, with integer pixel coordinates, origin top left, y increasing
+#: downward, everything clipped to the canvas and the current `set_clip` rect.
 #:
 #: ```
 #: let canvas = Canvas(Image(8, 8))
@@ -20,10 +12,8 @@
 #: canvas.get_pixel(6, 6) == rgb(255, 0, 0)    # false
 #: ```
 #:
-#: One caveat about alpha: a *filled* shape writes each pixel exactly once, but
-#: an *outline* — `polygon`, `triangle`, `thick_line` — can cross itself where
-#: two segments meet, and a translucent stroke shows a darker pixel at those
-#: joints. Stroke with an opaque colour, or fill.
+#: A translucent *outline* (`polygon`, `triangle`, `thick_line`) can show a
+#: darker pixel where it crosses itself; stroke opaque, or fill instead.
 from std.gui import PixelTarget
 import std.math
 
@@ -39,11 +29,8 @@ pub const GLYPH_SPACING = 1
 #: Baseline-to-baseline distance for `text` with a newline in it.
 pub const LINE_HEIGHT = 9
 
-# The 5x7 font, five column bytes per glyph, covering ASCII 32 to 126 in order.
-# Bit 0 of a column is its top pixel and bit 6 its bottom, so column 0x5F —
-# every row but the sixth — is the stem and dot of an exclamation mark. This is
-# the classic 5x7 cell used by LCD character generators, chosen because every
-# glyph is legible at one pixel per dot with no anti-aliasing to smear it.
+# 5x7 font, ASCII 32-126 in order, five column bytes per glyph. Bit 0 of a
+# column is its top pixel, bit 6 its bottom.
 let _GLYPHS: list[int] = [
     0x00, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x5F, 0x00, 0x00,   #   !
     0x00, 0x07, 0x00, 0x07, 0x00,  0x14, 0x7F, 0x14, 0x7F, 0x14,   # " #
@@ -379,8 +366,7 @@ pub class Canvas {
             self.fill_rect(x, y, width, height, color)
             return
         }
-        # Each corner row gets one span, and the straight middle gets the rest,
-        # so every pixel of the shape is written exactly once.
+        # Each corner row gets one span so every pixel is written exactly once.
         for row in 0..corner {
             let above = corner - row
             let reach = math.isqrt(corner * corner - above * above)
@@ -467,8 +453,6 @@ pub class Canvas {
                 decision += slope_x - slope_y + square_y
             }
         }
-        # Re-seed the decision variable for the second region, at the midpoint
-        # between the current pixel and the one diagonally inside it.
         let next_x = x + 0.5
         let inside_y = float(y - 1)
         decision = square_y * next_x * next_x + square_x * inside_y * inside_y
@@ -772,10 +756,8 @@ pub class Canvas {
 
     #: Copy a `width` by `height` rectangle of `source` to `(x, y)` on `self`.
     #:
-    #: Every pixel goes through the same compositing as `put_pixel`, so a
-    #: sprite with an alpha channel lands on the background correctly and an
-    #: opaque one is a straight copy. The source rectangle is clipped to the
-    #: source image, and the destination to this canvas's clip rectangle.
+    #: Composites like `put_pixel`, so an alpha sprite blends correctly. Source
+    #: and destination are each clipped to their own image's bounds.
     pub fn blit(
         self,
         source: Canvas,
@@ -802,10 +784,9 @@ pub class Canvas {
     #: Narrow the clip to the intersection of the current one and this
     #: rectangle, remembering what it was.
     #:
-    #: Unlike `set_clip`, which intersects with the whole canvas and can
-    #: therefore widen a clip already in force, this can only ever restrict.
-    #: Nesting is what a chart needs: an axis clips to its plot area, a series
-    #: clips again inside that, and neither has to know about the other.
+    #: Unlike `set_clip`, which can widen a clip already in force, this only
+    #: ever restricts — so nested layers can each clip without knowing about
+    #: each other.
     #:
     #: ```
     #: let canvas = Canvas(Image(20, 20))
@@ -840,12 +821,9 @@ pub class Canvas {
 
     #: Fill `path` with `color`, anti-aliased.
     #:
-    #: Coverage is computed exactly across each row and sampled `SUBSAMPLES`
-    #: times down it, then one native call composites the whole row. Because the
-    #: whole path is resolved into a single coverage value per pixel before
-    #: anything is written, a shape that overlaps itself still writes each pixel
-    #: once — which is what lets a translucent stroke avoid the dark knots the
-    #: integer outline routines leave at their joins.
+    #: Row coverage is sampled `SUBSAMPLES` times and resolved to one value per
+    #: pixel before writing, so a self-overlapping shape composites once —
+    #: avoiding the dark knots the integer routines get at their joins.
     #:
     #: ```
     #: let image = Image(10, 10, 0xFF000000)
@@ -857,10 +835,8 @@ pub class Canvas {
     #: ```
     pub fn fill_path(self, path: Path, color: int, winding: Winding = Winding.NonZero) -> void {
         if color >> 24 & 0xFF == 0 { return }
-        # Almost everything a chart draws is an axis-aligned rectangle: every
-        # gridline, tick, spine, bar, background and legend panel. Their coverage
-        # is a product of two independent overlaps rather than something to
-        # sample, so they skip the scanline machinery entirely.
+        # Axis-aligned rectangles (most chart shapes) have coverage as a product
+        # of two independent overlaps, so they skip the scanline machinery.
         let box = _axis_aligned_rect(path)
         if box != null {
             let (left, top, right, bottom) = box
@@ -889,12 +865,9 @@ pub class Canvas {
 
         let share = 255.0 / SUBSAMPLES.to_float()
 
-        # An active edge list. Testing every edge at every sub-scanline is
-        # quadratic in the shape's complexity, and a stroked series is thousands
-        # of edges over hundreds of rows -- millions of tests for a picture where
-        # only a handful of edges cross any given row. Sorting once by the top of
-        # each edge and carrying a window down the shape makes the work
-        # proportional to what actually crosses the scanline.
+        # An active edge list: testing every edge at every sub-scanline is
+        # quadratic, so edges are sorted once by top and windowed down the
+        # shape to keep work proportional to what actually crosses each row.
         let ordered = edges.sorted(|edge| edge.y0)
         var pending = 0
         var active = []
@@ -910,11 +883,8 @@ pub class Canvas {
             active = [edge for edge in active if edge.y1 > row_top]
             if active.len() == 0 { continue }
 
-            # Gather every sub-scanline first so the coverage buffer can be cut
-            # to the width this row actually needs. Sizing it to the whole shape
-            # instead would allocate a float per pixel of the bounding box on
-            # every row, which for a curve spanning the plot is most of the cost
-            # of the frame and nearly all of it wasted on empty space.
+            # Sub-scanlines are gathered first so the coverage buffer can be cut
+            # to the width this row needs, not the whole shape's bounding box.
             var samples = []
             var row_left = 0.0
             var row_right = 0.0
@@ -941,11 +911,9 @@ pub class Canvas {
             let window_right = min(int(math.ceil(row_right)), last_column)
             if window_left > window_right { continue }
 
-            # A row whose sub-scanlines each cover one interval -- a rectangle,
-            # a bar, a legend panel, a marker, the figure background -- has a
-            # solid middle with a fringe of at most one pixel on each side. The
-            # middle is written with a single native call, which is the
-            # difference between a chart that animates and one that does not.
+            # A row whose sub-scanlines each cover one interval has a solid
+            # middle with a one-pixel fringe; writing that middle with a single
+            # native call is what keeps a chart animating smoothly.
             var intervals = []
             var single = true
             for hits in samples {
@@ -958,11 +926,9 @@ pub class Canvas {
                 if self._solid_row(row, intervals, window_left, window_right, color) { continue }
             }
 
-            # A curve crosses one row in several places, so the row's extent is
-            # wide while the ink on it is a few pixels at each crossing. Working
-            # per cluster of overlapping spans keeps the per-pixel cost
-            # proportional to the ink rather than to the distance between the
-            # leftmost and rightmost crossing.
+            # A curve can cross one row in several places, wide extent but little
+            # ink; working per cluster keeps cost proportional to the ink, not
+            # the distance between the outermost crossings.
             var flat = []
             for spans in intervals {
                 for interval in spans { flat.push(interval) }
@@ -1012,10 +978,9 @@ pub class Canvas {
 
     #: Fill an axis-aligned rectangle with exact coverage on all four edges.
     #:
-    #: Vertical coverage is how much of the row the rectangle spans and
-    #: horizontal coverage how much of the column, so a pixel's coverage is
-    #: simply their product. A run of whole rows with a whole interior needs one
-    #: native call each and no per-pixel work at all.
+    #: A pixel's coverage is the product of its row's vertical overlap and its
+    #: column's horizontal overlap, so a whole interior row needs one native
+    #: call and no per-pixel work.
     fn _fill_axis_rect(
         self,
         left: float,
@@ -1083,11 +1048,9 @@ pub class Canvas {
 
     #: Fill a small convex polygon, anti-aliased.
     #:
-    #: A convex shape crosses any scanline exactly twice, so its span is a
-    #: minimum and a maximum rather than something to sort and pair up. Skipping
-    #: the general machinery matters because the shape this is for — a particle
-    #: drawn as an oriented wedge — is drawn thousands of times a frame, and
-    #: there the per-shape setup is the whole cost.
+    #: A convex shape crosses any scanline exactly twice, so its span is just a
+    #: min and max rather than sort-and-pair — this matters because callers
+    #: draw thousands of these (particle wedges) a frame.
     #:
     #: The polygon must be convex; a concave one comes out filled to its hull.
     pub fn fill_convex(self, points: list[tuple[float, float]], color: int) -> void {
@@ -1137,9 +1100,8 @@ pub class Canvas {
         }
         if width <= 0 or height <= 0 { return }
 
-        # Straight to the native blitter: building a row of pixels as a Jaithon
-        # list and handing that over costs a push per pixel, which for a full
-        # window is most of a frame spent copying an image that has not changed.
+        # Straight to the native blitter: building the row as a Jaithon list
+        # first would cost a push per pixel, most of a frame for a full window.
         __prim__.canvas_blit_scaled(
             self.buffer,
             self.width,
@@ -1159,11 +1121,9 @@ pub class Canvas {
 
     #: Stroke `path` with `color`, anti-aliased.
     #:
-    #: The outline is built as a single filled path — a quad per segment, a join
-    #: at every interior vertex, a cap at each end — and filled once with
-    #: non-zero winding. Overlaps between those pieces therefore cancel instead
-    #: of compositing twice, so a translucent stroke is evenly translucent all
-    #: the way along.
+    #: Built as one filled path (a quad per segment, a join per vertex, a cap at
+    #: each end) and filled once with non-zero winding, so overlapping pieces
+    #: cancel instead of double-compositing — keeping a translucent stroke even.
     pub fn stroke_path(
         self,
         path: Path,
@@ -1175,15 +1135,10 @@ pub class Canvas {
     ) -> void {
         if width <= 0.0 or color >> 24 & 0xFF == 0 { return }
 
-        # An opaque stroke can be laid down one segment at a time, because
-        # writing an opaque pixel twice is the same as writing it once. Each
-        # segment is then a convex quad and goes straight to the native filler,
-        # instead of the whole run becoming one large non-convex ring whose
-        # every scanline meets most of the path.
-        #
-        # A translucent one cannot: the overlaps at the joins would composite
-        # twice and show as dark knots, which is the bug the single-ring form
-        # exists to avoid.
+        # An opaque stroke can be laid down one segment (convex quad) at a time,
+        # since writing an opaque pixel twice is the same as once. A translucent
+        # one cannot: overlaps at the joins would double-composite into dark
+        # knots, which the single-ring form below exists to avoid.
         if color >> 24 & 0xFF == 255 and dash.len() == 0 {
             self._stroke_segments(path, color, width, cap, join)
             return
@@ -1442,9 +1397,8 @@ pub class Canvas {
         let stop = min(right, self.clip_right)
         if start > stop { return }
         let base = y * self.width
-        # Every filled primitive funnels through here, so this run is the one
-        # place worth handing to the native layer: a whole row of pixels per
-        # call instead of one interpreted store each.
+        # Every filled primitive funnels through here, so it's the one place
+        # worth a native call: a whole row per call instead of one store each.
         if alpha == 255 {
             __prim__.canvas_fill_span(self.buffer, base + start, stop - start + 1, color)
             return
@@ -1589,9 +1543,8 @@ fn _corner_radius(width: int, height: int, radius: int) -> int {
     return min(radius, min(width, height) // 2)
 }
 
-# x on the edge lo (y0, x0) to (y1, x1) at row `y`. A horizontal edge has no
-# single answer, so it reports its first endpoint, which is what makes the flat
-# top and flat bottom of a triangle come out with the right span.
+# x on the edge lo (y0, x0) to (y1, x1) at row `y`. A horizontal edge reports
+# its first endpoint, which keeps a triangle's flat top/bottom in the right span.
 fn _interpolate(y0: int, x0: int, y1: int, x1: int, y: int) -> int {
     if y1 == y0 { return x0 }
     return x0 + (x1 - x0) * (y - y0) // (y1 - y0)
@@ -1763,9 +1716,8 @@ class _Edge {
     pub let direction: int
 
     pub fn init(self, x0: float, y0: float, x1: float, y1: float) {
-        # Edges are stored top to bottom so a scanline test is one comparison,
-        # and the direction that was lost in the swap is kept for the winding
-        # count.
+        # Stored top to bottom so a scanline test is one comparison; direction
+        # lost in the swap is kept separately for the winding count.
         if y0 <= y1 {
             self.x0 = x0
             self.y0 = y0
@@ -1814,7 +1766,6 @@ fn _axis_aligned_rect(path: Path) -> tuple[float, float, float, float]? {
         top = min(top, run[index * 2 + 1])
         bottom = max(bottom, run[index * 2 + 1])
     }
-    # Every corner must sit on the box, and every edge must be axis aligned.
     for index in 0..4 {
         let x = run[index * 2]
         let y = run[index * 2 + 1]
@@ -2008,11 +1959,9 @@ fn _dashed(run: list[float], dash: list[float]) -> list[list[float]] {
 
 #: Add the outline of one stroked run into `outline`.
 #:
-#: The run becomes a single closed ring: out along one offset side and back
-#: along the other. That is half the edges of a quad per segment, and one
-#: subpath instead of hundreds, which is most of the cost of stroking a sampled
-#: curve. Sharp corners still get a disc, because a mitre there would either
-#: shoot off to infinity or leave a notch.
+#: Becomes one closed ring — out along one offset side, back along the other —
+#: half the edges of a quad-per-segment and one subpath instead of hundreds.
+#: Sharp corners still get a disc; a mitre there could shoot to infinity.
 fn _outline_run(outline: Path, run: list[float], width: float, cap: Cap, join: Join) -> void {
     let half = width * 0.5
     let count = run.len() // 2
@@ -2033,9 +1982,8 @@ fn _outline_run(outline: Path, run: list[float], width: float, cap: Cap, join: J
 
     if join != Join.Bevel and count > 2 {
         for vertex in 1..count - 1 {
-            # A join only has a wedge to fill when the path actually turns. A
-            # sampled curve turns by a fraction of a degree between samples, so
-            # this is rare and the ring covers the rest.
+            # A join only needs a wedge when the path actually turns, which is
+            # rare for a sampled curve turning a fraction of a degree per sample.
             if _turns_visibly(extended, vertex, half) {
                 _add_disc(outline, extended[vertex * 2], extended[vertex * 2 + 1], half)
             }
@@ -2164,11 +2112,9 @@ fn _add_disc(outline: Path, x: float, y: float, radius: float) -> void {
 
 #: Append a ring, turned so every piece of a stroke winds the same way.
 #:
-#: Non-zero winding cancels where two rings of opposite orientation overlap. A
-#: stroke's quads take their orientation from the direction of their segment, so
-#: a curve that doubles back produces opposing quads and the overlap punches a
-#: hole in the line. Normalising the orientation here is what keeps a stroked
-#: path solid.
+#: Non-zero winding cancels opposite-orientation overlaps; since a stroke's
+#: quads take their orientation from segment direction, a curve doubling back
+#: would punch a hole in the line unless normalised here.
 fn _add_ring(outline: Path, points: list[tuple[float, float]]) -> void {
     if points.len() < 3 { return }
     var twice_area = 0.0

@@ -1,8 +1,7 @@
 #: Algorithms over lists that the built-in list methods do not cover.
 #:
-#: Nothing here duplicates a method: `push`, `map`, `filter` and `sort` already
-#: live on `list`. Functions needing an ordering or an equality take one as an
-#: optional last argument and otherwise fall back to `<` and `==`.
+#: Functions needing an ordering or an equality take one as an optional last
+#: argument, falling back to `<` and `==`.
 const _INT_MAX = 0x7FFFFFFFFFFFFFFF
 const _UNIFORM_STEPS = 9007199254740992
 const _UNIFORM_SCALE = 9007199254740992.0
@@ -530,9 +529,6 @@ pub fn compare[T](a: list[T], b: list[T], less: Less[T]? = null) -> int {
 
 #: Report whether `a` and `b` match element by element under `same`.
 #:
-#: Use this where `==` is the wrong notion of equality: case-insensitive
-#: strings, floats within a tolerance, records compared on one field.
-#:
 #: ```
 #: equal_by(["A"], ["a"], |x, y| x.lower() == y.lower())    # true
 #: ```
@@ -640,8 +636,7 @@ fn _merge[T](left: list[T], right: list[T], less: Less[T]) -> list[T] {
     var left_index = 0
     var right_index = 0
     while left_index < left.len() and right_index < right.len() {
-        # Take from the right only when it is strictly smaller: equal elements
-        # keep the order they came in with, which is what makes this stable.
+        # Strict `<` keeps equal elements in original order, which is what makes this stable.
         if less(right[right_index], left[left_index]) {
             out.push(right[right_index])
             right_index += 1
@@ -663,8 +658,7 @@ fn _below(bound: int, sampler: Rng) -> int {
 
 fn _default_below(bound: int) -> int {
     if bound <= 0 { throw ValueError(f"bound must be positive, got {bound}") }
-    # Reject the short final block of the 63-bit range so that every residue is
-    # reachable from exactly the same number of draws.
+    # Rejects the short final block of the 63-bit range so every residue is equally reachable.
     let ceiling = _INT_MAX - (_INT_MAX % bound + 1) % bound
     loop {
         let draw = __prim__.random_u64() & _INT_MAX

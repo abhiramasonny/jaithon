@@ -1,21 +1,10 @@
 #: The documentation generator behind `jaithon doc`.
 #:
-#: Documentation is the `#:` comments and the declarations they sit above, and
-#: nothing else: there is no separate manual to fall out of date. This module
-#: reads a file, parses it into a `jaithon.ast` tree, pairs every `#:` block with
-#: the declaration on the line below it, and renders one page per module with a
-#: navigation index, the full public API with signatures and examples, links
-#: from every type named in a signature to the page that declares it, and a
-#: `search.json` an editor or a static site can index.
-#:
-#: Only `pub` declarations are documented, because `spec/STYLE.md` §4 makes the
-#: public surface the documentation. A `pub` declaration with no doc comment is
-#: still listed — it is a hole in the docs and hiding it would hide the hole.
-#:
-#: The doc comment is Markdown. Its first line is the summary shown in indexes
-#: and search results; a fenced block inside it is an example, and
-#: `jaithon test --doc` executes those, so the pages cannot drift from the code
-#: they document.
+#: Documentation is the `#:` comments and the declarations they sit above —
+#: there is no separate manual to fall out of date. Only `pub` declarations
+#: are documented (`spec/STYLE.md` §4); an undocumented one is still listed,
+#: since hiding it would hide the hole. Fenced examples are executed by
+#: `jaithon test --doc`, so pages can't drift from the code they document.
 #:
 #: ```
 #: module_name_of("lib/std/algo/sort.jai")    # "std.algo.sort"
@@ -34,9 +23,8 @@ pub const DEFAULT_OUTPUT: str = "docs/api"
 
 #: One fenced example lifted out of a doc comment.
 #:
-#: `lines` are the lines between the fences with the `#: ` prefix removed, and
-#: `line` is where the first of them sits in the file, so a failure reported by
-#: `jaithon test --doc` points at the source and not at a copy of it.
+#: `line` is tracked so a failure reported by `jaithon test --doc` points at
+#: the source, not a copy of it.
 pub class Example {
     #: The example's source lines, in order.
     pub let lines: list[str]
@@ -180,9 +168,9 @@ pub class ModuleDoc {
 
 #: Return the dotted module name a path denotes.
 #:
-#: A path under a `lib/` root keeps everything after it; `mod.jai` names its
-#: directory, as `spec/LANGUAGE.md` §8 says a package does. A path outside any
-#: `lib/` is named by its stem, which is what a test file wants.
+#: `mod.jai` names its directory (packages, per `spec/LANGUAGE.md` §8); a
+#: path outside `lib/` falls back to its stem, which is what a test file
+#: wants.
 #:
 #: ```
 #: module_name_of("lib/std/str.jai")            # "std.str"
@@ -244,9 +232,8 @@ pub fn collect_all(paths: list[str]) -> list[ModuleDoc] {
 
 #: Return the link target of every documented type, keyed by name.
 #:
-#: This is what turns `list[Heap]` in a signature into a link to the page that
-#: declares `Heap`. A name declared in two modules resolves to the first, in
-#: module-name order, and both pages still document it.
+#: A name declared in two modules resolves to the first, in module-name
+#: order; both pages still document it.
 pub fn build_links(modules: list[ModuleDoc], extension: str) -> dict[str, str] {
     let links: dict[str, str] = {}
     for mod in modules {
@@ -259,11 +246,11 @@ pub fn build_links(modules: list[ModuleDoc], extension: str) -> dict[str, str] {
     return links
 }
 
-#: How many documented and how many undocumented `pub` declarations there are.
+#: How many documented and how many undocumented `pub` declarations there
+#: are, as `(documented, total)`.
 #:
-#: Members count: a class whose methods carry no `#:` is as undocumented as a
-#: bare function, and a coverage figure that hid them would flatter the tree.
-#: The returned pair is `(documented, total)`.
+#: Members count too — a class whose methods carry no `#:` is as
+#: undocumented as a bare function, and hiding them would flatter the figure.
 pub fn coverage(modules: list[ModuleDoc]) -> tuple[int, int] {
     var documented = 0
     var total = 0
@@ -313,9 +300,9 @@ pub fn render_markdown(mod: ModuleDoc, modules: list[ModuleDoc]) -> str {
 
 #: Render one module's page as a self-contained HTML document.
 #:
-#: HTML allows a link inside a code block, so here the types named in a
-#: signature are linked in place, and every page carries the list of modules so
-#: that the site can be walked without going back to the index each time.
+#: HTML allows a link inside a code block, so the types named in a signature
+#: are linked in place; every page also carries the module list so the site
+#: can be walked without returning to the index.
 pub fn render_html(mod: ModuleDoc, modules: list[ModuleDoc]) -> str {
     let links = build_links(modules, "html")
     let out: list[str] = [
@@ -346,10 +333,8 @@ pub fn render_html(mod: ModuleDoc, modules: list[ModuleDoc]) -> str {
 
 #: Render the navigation index over every module.
 #:
-#: The HTML index carries the search records inline rather than fetching
-#: `search.json`, because a browser reading the site off a disk refuses the
-#: fetch and a search box that only works behind a web server is not a search
-#: box.
+#: The HTML index inlines the search records instead of fetching
+#: `search.json` — a browser reading the site off disk refuses that fetch.
 pub fn render_index(modules: list[ModuleDoc], html: bool) -> str {
     let extension = if html { "html" } else { "md" }
     let ordered = _by_name(modules)
@@ -393,10 +378,6 @@ pub fn render_index(modules: list[ModuleDoc], html: bool) -> str {
 }
 
 #: Return the search index as JSON.
-#:
-#: One record per documented declaration: the module, the name, the kind, the
-#: signature, the summary and the anchor to jump to. That is everything a
-#: search box needs and nothing it has to download the whole site for.
 pub fn search_index(modules: list[ModuleDoc], extension: str = "html") -> str {
     return stringify(_records_of(modules, extension))
 }
@@ -407,10 +388,8 @@ pub fn search_index(modules: list[ModuleDoc], extension: str = "html") -> str {
 #: jaithon doc [--out dir] [--html] [paths...]
 #: ```
 #:
-#: Writes one page per module, an `index` page linking them all, and
-#: `search.json`. The default output directory is `docs/api` and the default
-#: format is Markdown; `--html` writes self-contained HTML pages instead. The
-#: exit status is 1 when no module could be read.
+#: Writes one page per module, an index, and `search.json`. Exits 1 when no
+#: module could be read.
 pub fn main(args: list[str]) -> int {
     let options = _Options.parse(tail_arguments(args, "doc"))
     if options.usage_error is not null {
@@ -449,8 +428,6 @@ pub fn main(args: list[str]) -> int {
 }
 
 # --- Collecting --------------------------------------------------------------
-
-# Byte offset to 1-based line, precomputed once per file.
 class _LineIndex {
     pub let starts: list[int]
 
@@ -498,7 +475,6 @@ fn _doc_blocks(comments: list[Comment]) -> dict[int, DocComment] {
     return blocks
 }
 
-# A run of `#:` lines is Markdown; the fenced blocks in it are the examples.
 fn _doc_of(run: list[Comment]) -> DocComment {
     let body: list[str] = []
     let examples: list[Example] = []
@@ -524,15 +500,15 @@ fn _doc_of(run: list[Comment]) -> DocComment {
         }
         if open { fence.push(text) }
     }
-    # An unclosed fence is still an example: the text is there and running it is
-    # the only way to find out that it was never finished.
+    # An unclosed fence still becomes an example — running it is the only way
+    # to catch that it was never closed.
     if open and fence.len() > 0 { examples.push(Example(fence, fence_line, runnable)) }
     return DocComment("\n".join(body).strip(), examples)
 }
 
-# The module's own doc block: the one standing above the first declaration
-# without documenting it. A block further down documents something private, and
-# a module with no leading block has no module doc rather than the wrong one.
+# The doc block standing above the first declaration, not documenting it — a
+# block further down documents something private; no leading block means no
+# module doc, never the wrong one.
 fn _module_doc(blocks: dict[int, DocComment], claimed: set[int], first: int) -> DocComment? {
     var best: DocComment? = null
     var best_line = 0
@@ -649,10 +625,8 @@ fn _entry_summary(entry: Entry) -> str {
     return doc.summary
 }
 
-# An enum's variants are names, not signatures, so a heading and a fenced block
-# each would be three lines of chrome around one word. They are listed instead,
-# and a variant with no `#:` says so in place rather than in a paragraph of its
-# own.
+# Variants are names, not signatures — a heading and fenced block each would
+# be chrome around one word, so they're listed instead.
 fn _variants_of(entry: Entry) -> list[Entry] {
     return [member for member in entry.members if member.kind == "variant"]
 }
@@ -706,9 +680,8 @@ fn _markdown_entry(entry: Entry, links: dict[str, str], level: int) -> list[str]
     return out
 }
 
-# `prefix` is the anchor of the declaration this one is nested in, so that the
-# `init` of one class and the `init` of the next are two different ids and a
-# link into the page lands where it says it will.
+# `prefix` is the anchor of the declaration this is nested in, so two
+# classes' `init` methods get different ids and links land correctly.
 fn _html_entry(entry: Entry, links: dict[str, str], level: int, prefix: str) -> list[str] {
     let tag = f"h{min(level, 6)}"
     let anchor = if prefix.len() == 0 { entry.anchor() } else { prefix + "-" + entry.anchor() }
@@ -745,15 +718,14 @@ fn _html_entry(entry: Entry, links: dict[str, str], level: int, prefix: str) -> 
     return out
 }
 
-# The id a member is given on its module's page: unique within the page, and
-# the same one `search_index` hands out.
+# The id a member gets on its page — must match what `search_index` uses
+# for the same member.
 fn _member_anchor(entry: Entry, member: Entry) -> str {
     return entry.anchor() + "-" + member.anchor()
 }
 
-# Identifiers in a signature that name a documented type, in first-use order.
-# `own` is the declaration's own name: a link from `class Heap` to `class Heap`
-# tells the reader nothing they did not just read.
+# In first-use order. `own` is excluded: a link from `class Heap` to
+# `class Heap` tells the reader nothing they didn't just read.
 fn _referenced_types(signature: str, links: dict[str, str], own: str) -> list[str] {
     let found: list[str] = []
     let seen: set[str] = set()
@@ -805,8 +777,8 @@ fn _identifiers(text: str) -> list[str] {
     return words
 }
 
-# Markdown inside an HTML page: fenced blocks become <pre>, everything else
-# becomes a paragraph. A doc comment is prose and a code sample, not a document.
+# Fenced blocks become <pre>, everything else a paragraph — a doc comment is
+# prose and a code sample, not a full document.
 fn _html_block(markdown: str) -> str {
     let out: list[str] = []
     var paragraph: list[str] = []
@@ -849,11 +821,9 @@ fn _html_paragraph(lines: list[str]) -> str {
     return "<p>" + _inline_code(escape_html(" ".join(lines))) + "</p>"
 }
 
-# A doc comment names types and functions in backticks on nearly every line, and
-# a page that printed the backticks would be a page that had not been rendered.
-# Nothing else in Markdown's inline syntax appears often enough in `lib/` to be
-# worth guessing at, and guessing wrongly inside a signature would be worse than
-# not trying.
+# Only backtick code spans are handled — nothing else in Markdown's inline
+# syntax appears often enough in `lib/` to be worth it, and guessing wrong
+# inside a signature would be worse than not trying.
 fn _inline_code(escaped: str) -> str {
     let parts = escaped.split("`")
     if parts.len() < 3 { return escaped }
@@ -862,8 +832,7 @@ fn _inline_code(escaped: str) -> str {
         if index % 2 == 0 {
             out.push(part)
         } elif index == parts.len() - 1 {
-            # An odd number of backticks: the last one opens nothing, so it is
-            # text, and printing it back is the only honest thing to do.
+            # An odd backtick opens nothing, so it's text — print it back.
             out.push("`" + part)
         } else {
             out.push("<code>" + part + "</code>")
@@ -879,10 +848,8 @@ fn _html_head(title: str) -> str {
         "</head><body>"
 }
 
-# Every page carries the whole module list. It is a few kilobytes and it is
-# what makes the output a site rather than a pile of pages: a reader who has
-# followed a type link into `std.iter` can get to `std.list` without going back
-# through the index.
+# Every page carries the whole module list (a few kilobytes), so a reader
+# can get from one module's page to another without going back to the index.
 fn _html_sidebar(modules: list[ModuleDoc], current: str) -> str {
     let out: list[str] = [
         "<nav class=\"sidebar\"><a class=\"home\" href=\"index.html\">" +
@@ -943,7 +910,6 @@ let _STYLE: str = "body{font:16px/1.6 system-ui,sans-serif;margin:0;background:#
     "color:#e8e8ed}pre{background:#1c1c22}pre.sig{background:#161a2b}a{color:#8ab4f8}" +
     "nav.sidebar{border-color:#2a2a32}#q{border-color:#3a3a44}}"
 
-# One record per module, declaration and member, in page order.
 fn _records_of(modules: list[ModuleDoc], extension: str) -> list[any] {
     let records: list[any] = []
     for mod in _by_name(modules) {
@@ -980,9 +946,8 @@ fn _records_of(modules: list[ModuleDoc], extension: str) -> list[any] {
     return records
 }
 
-# The same records without the two fields a search box never reads. The index
-# page carries them inline, and a signature apiece would treble the page for
-# text nothing displays.
+# The same records without the two fields a search box never reads — a
+# signature apiece would treble the index page for text nothing displays.
 fn _brief_records(records: list[any]) -> list[any] {
     return [{"mod": record["mod"], "name": record["name"], "kind": record["kind"], "summary": record["summary"], "page": record["page"], "anchor": record["anchor"]} for record in records]
 }

@@ -1,17 +1,10 @@
 #: Ordered tree structures: an unbalanced search tree, an AVL tree, a segment
 #: tree over any associative operation, and a Fenwick tree.
 #:
-#: Every `BinarySearchTree` walk in this module is iterative. Inserting sorted
-#: keys into an unbalanced tree degenerates it into a chain of length n, so a
-#: recursive traversal would raise `RecursionError` on inputs an explicit stack
-#: handles without trouble. `AVLTree` is recursive where it is convenient
-#: because its depth is bounded by 1.44 * log2(n) — under 100 frames for any
-#: tree that fits in memory.
+#: BST walks are iterative to avoid `RecursionError` on chains from sorted
+#: inserts; AVLTree recurses safely — its depth is bounded by 1.44 * log2(n).
 
 #: Compare `a` and `b` with `<` and `>`, returning -1, 0, or 1.
-#:
-#: This is the default ordering for `BinarySearchTree` and `AVLTree`. Pass a
-#: different `fn(K, K) -> int` to either constructor to order keys another way.
 #:
 #: ```
 #: natural_order(1, 2)       # -1
@@ -39,9 +32,8 @@ class _BstNode[K, V] {
 
 #: An unbalanced binary search tree mapping keys to values.
 #:
-#: Operations are O(h) where h is the current height: O(log n) for keys that
-#: arrive in random order, O(n) for keys that arrive sorted. Use `AVLTree` when
-#: the insertion order is adversarial or unknown.
+#: Operations are O(h) — O(log n) for random insertion order, O(n) if sorted;
+#: use `AVLTree` when order is adversarial or unknown.
 #:
 #: ```
 #: let tree = BinarySearchTree[int, str]()
@@ -71,9 +63,8 @@ pub class BinarySearchTree[K, V] {
 
     #: Report whether the tree holds no keys. O(1).
     #:
-    #: The count is maintained by `insert` and `remove`, so this stays O(1) even
-    #: when sorted input has degenerated the tree into a chain and every other
-    #: query costs O(n).
+    #: `count` is maintained by `insert`/`remove`, so this is O(1) even when
+    #: other queries cost O(n) on a degenerate chain.
     pub fn is_empty(self) -> bool {
         return self.count == 0
     }
@@ -85,8 +76,6 @@ pub class BinarySearchTree[K, V] {
     }
 
     #: Associate `value` with `key`, returning true when `key` was new.
-    #:
-    #: An existing key keeps its position and takes the new value.
     pub fn insert(self, key: K, value: V) -> bool {
         if self.root == null {
             self.root = _BstNode[K, V](key, value)
@@ -203,12 +192,8 @@ pub class BinarySearchTree[K, V] {
         }
         if current == null { return false }
         if current.left != null and current.right != null {
-            # Two children: copy the in-order successor's payload into this
-            # node and delete the successor instead. The successor has no left
-            # child, so it falls into the one-child case below.
-            # The branch condition proved `current.right` is present, but a
-            # field is not a narrowing target (spec §2.1 narrows bindings), so
-            # the invariant is restated on a local.
+            # `current.right` was just proven non-null, but fields aren't
+            # narrowing targets (spec §2.1) — restate it via a local.
             var successor_parent = current
             var successor = current.right ?? (throw RuntimeError("bst: right child vanished"))
             var lower = successor.left
@@ -362,10 +347,6 @@ class _AvlNode[K, V] {
 
 #: A height-balanced binary search tree with O(log n) insert, remove and lookup.
 #:
-#: The tree keeps every node's subtree heights within one of each other by
-#: rotating on the way back up from a modification, so worst-case depth stays
-#: logarithmic no matter what order keys arrive in.
-#:
 #: ```
 #: let tree = AVLTree[int, int]()
 #: for key in 0..16 { tree.insert(key, key * key) }
@@ -393,8 +374,7 @@ pub class AVLTree[K, V] {
 
     #: Report whether the tree holds no keys. O(1).
     #:
-    #: An empty tree has a `height()` of -1 and a one-key tree has 0, so test
-    #: emptiness with this rather than with `height() == 0`.
+    #: `height()` is -1 when empty and 0 for one key — use this, not `height() == 0`.
     pub fn is_empty(self) -> bool {
         return self.count == 0
     }
@@ -525,10 +505,8 @@ pub class AVLTree[K, V] {
         return self._height_of(node.left) - self._height_of(node.right)
     }
 
-    #: A rotation is only ever reached from a node whose balance factor proved
-    #: the child exists. A field is not a narrowing target (spec §2.1 narrows
-    #: bindings), so each rotation restates that invariant on a local and fails
-    #: loudly rather than silently rotating around nothing.
+    #: A field can't be narrowed (spec §2.1), so each rotation restates via a
+    #: local — and throws loudly instead of silently rotating around null.
     fn _rotate_right(self, node: _AvlNode[K, V]) -> _AvlNode[K, V] {
         let pivot = node.left ?? (throw RuntimeError("avl: left-heavy node has no left child"))
         node.left = pivot.right
@@ -551,8 +529,6 @@ pub class AVLTree[K, V] {
         self._update_height(node)
         let balance = self._balance_factor(node)
         if balance > 1 {
-            # Left-heavy. A right-leaning left child needs the left-right
-            # double rotation, which is a left rotation of the child first.
             let left = node.left ?? (throw RuntimeError("avl: left-heavy node has no left child"))
             if self._balance_factor(left) < 0 {
                 node.left = self._rotate_left(left)
@@ -603,10 +579,8 @@ pub class AVLTree[K, V] {
                 self.count -= 1
                 return node.left
             }
-            # Two children: copy the in-order successor's payload here and
-            # delete the successor from the right subtree, where it has no left
-            # child and so hits one of the two cases above. The count is
-            # adjusted there, exactly once.
+            # count is decremented once, inside the recursive call below — not
+            # again here.
             var successor = node.right
             while successor.left != null { successor = successor.left }
             node.key = successor.key
@@ -637,10 +611,8 @@ pub class AVLTree[K, V] {
 
 #: A segment tree answering range queries over any associative operation.
 #:
-#: `combine` must be associative and `identity` must satisfy
-#: `combine(identity, x) == x == combine(x, identity)`. Commutativity is not
-#: required: queries fold the left and right frontiers separately and join them
-#: in index order, so `combine` may be string concatenation or matrix product.
+#: `combine` must be associative with `identity` as identity element;
+#: commutativity isn't required since frontiers are folded and joined in order.
 #:
 #: Queries and updates are O(log n); construction is O(n).
 #:
@@ -832,10 +804,8 @@ pub class FenwickTree {
 
     #: The smallest index whose prefix sum through it reaches `target`.
     #:
-    #: Returns `len()` when no prefix reaches `target`. Every element must be
-    #: non-negative, since the search relies on prefix sums being monotonic.
-    #: This turns a Fenwick tree of counts into an order-statistic structure:
-    #: with one count per value, `lower_bound(k)` is the k-th smallest.
+    #: Returns `len()` if none does; requires non-negative elements since the
+    #: search assumes prefix sums are monotonic.
     #:
     #: ```
     #: let counts = FenwickTree.from_list([1, 0, 2, 1])

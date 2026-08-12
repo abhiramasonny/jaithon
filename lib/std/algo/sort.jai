@@ -53,9 +53,8 @@ pub fn natural_order(a: any, b: any) -> int {
 
 #: Sort `xs` with an explicit comparator.
 #:
-#: The default sort: `tim_sort`, so it is stable, O(n log n) in the worst case,
-#: and linear on input that is already run-structured. Prefer this over naming
-#: an algorithm unless you have measured a reason not to.
+#: Delegates to `tim_sort`. Prefer this over naming an algorithm unless you
+#: have measured a reason not to.
 #:
 #: ```
 #: sort_by(["bb", "a", "ccc"], |a, b| natural_order(a.len(), b.len()))
@@ -67,12 +66,10 @@ pub fn sort_by[T](xs: list[T], cmp: Comparator[T]) -> list[T] {
 
 #: Sort `xs` by a key computed exactly once per element.
 #:
-#: A comparison sort invokes its comparator O(n log n) times, so the obvious
-#: `sort_by(xs, |a, b| natural_order(key(a), key(b)))` evaluates `key` about
-#: 2n log n times. This decorates instead — pairs each element's key with its
-#: position, sorts the pairs, then projects the values back (the Schwartzian
-#: transform). `key` runs exactly n times, which is what you want the moment it
-#: costs more than a field read: case folding, date parsing, a hash, a lookup.
+#: The naive `sort_by(xs, |a, b| natural_order(key(a), key(b)))` evaluates
+#: `key` about 2n log n times; this pairs each key with its position, sorts the
+#: pairs, then projects back (the Schwartzian transform), running `key`
+#: exactly n times — worth it once `key` costs more than a field read.
 #:
 #: Only keys are compared, so `T` itself need not be ordered, and ties keep
 #: their original order.
@@ -95,8 +92,7 @@ pub fn sort_by_key[T, K](xs: list[T], key: fn(T) -> K) -> list[T] {
 
 #: Sort `xs` with a stable top-down merge sort.
 #:
-#: O(n log n) comparisons in every case, O(n) extra memory, stable. Ranges of
-#: 16 or fewer elements are finished with insertion sort, and a run whose
+#: Ranges of 16 or fewer elements finish with insertion sort; a run whose
 #: halves are already in order skips the merge entirely.
 #:
 #: ```
@@ -112,13 +108,11 @@ pub fn merge_sort[T](xs: list[T], cmp: Comparator[T] = natural_order) -> list[T]
 
 #: Sort `xs` with a median-of-three quicksort.
 #:
-#: O(n log n) average with the smallest constant of any sort here; unstable;
-#: O(1) extra memory beyond the returned copy. The pivot is the median of the
-#: first, middle, and last element, which makes already-sorted input the best
-#: case rather than the worst. Recursion descends into the smaller partition
-#: only, bounding stack depth to O(log n), and a depth budget of 2*log2(n) + 8
-#: hands the range to `heap_sort` if partitioning keeps going badly — so the
-#: worst case is O(n log n), not O(n^2).
+#: The pivot is the median of the first, middle, and last element, which makes
+#: already-sorted input the best case rather than the worst. Recursion
+#: descends into the smaller partition only (O(log n) stack), and a depth
+#: budget of 2*log2(n) + 8 hands the range to `heap_sort` if partitioning goes
+#: badly — so the worst case is O(n log n), not O(n^2).
 #:
 #: ```
 #: quick_sort([3, 1, 2])   # [1, 2, 3]
@@ -132,9 +126,8 @@ pub fn quick_sort[T](xs: list[T], cmp: Comparator[T] = natural_order) -> list[T]
 
 #: Sort `xs` with a binary max-heap.
 #:
-#: O(n log n) in every case, unstable, and O(1) extra memory with no recursion
-#: — the reason it is the fallback for `quick_sort` and `nth_element`. Floyd's
-#: bottom-up heapify builds the heap in O(n).
+#: No recursion and O(1) extra memory — why it's the fallback for `quick_sort`
+#: and `nth_element`.
 #:
 #: ```
 #: heap_sort([3, 1, 2])    # [1, 2, 3]
@@ -147,8 +140,7 @@ pub fn heap_sort[T](xs: list[T], cmp: Comparator[T] = natural_order) -> list[T] 
 
 #: Sort `xs` by repeatedly inserting into a sorted prefix.
 #:
-#: O(n^2) worst case, O(n) when the input is nearly sorted, stable, and the
-#: fastest option below roughly 16 elements because it touches only adjacent
+#: The fastest option below roughly 16 elements — it touches only adjacent
 #: memory. `merge_sort`, `quick_sort`, and `tim_sort` all finish on it.
 #:
 #: ```
@@ -162,16 +154,12 @@ pub fn insertion_sort[T](xs: list[T], cmp: Comparator[T] = natural_order) -> lis
 
 #: Sort `xs` with TimSort: natural run detection plus balanced merging.
 #:
-#: Stable, O(n log n) worst case, O(n) on data that is already made of sorted
-#: runs — which real data usually is (appended batches, concatenated logs,
-#: a table re-sorted on a second column). The list is scanned for maximal
-#: ascending or strictly descending runs; descending runs are reversed in place
-#: (strictness is what keeps that stable), short runs are grown to a computed
-#: minimum length by binary insertion, and the runs are merged under the
-#: invariants `len[i-2] > len[i-1] + len[i]` and `len[i-1] > len[i]`, which keep
-#: every merge between runs of similar size. Galloping mode is not implemented,
-#: so merging two runs that interleave in long blocks costs O(n) rather than
-#: O(log n) per block.
+#: The list is scanned for maximal ascending or *strictly* descending runs —
+#: strictness is what keeps reversing them in place stable. Short runs are
+#: grown by binary insertion, and runs are merged under the invariants
+#: `len[i-2] > len[i-1] + len[i]` and `len[i-1] > len[i]`, keeping every merge
+#: between runs of similar size. Galloping mode is not implemented, so two
+#: runs that interleave in long blocks cost O(n) rather than O(log n) per block.
 #:
 #: ```
 #: tim_sort([1, 2, 3, 0])   # [0, 1, 2, 3]
@@ -208,11 +196,9 @@ pub fn tim_sort[T](xs: list[T], cmp: Comparator[T] = natural_order) -> list[T] {
 
 #: Sort `items` by an integer key using a count of each distinct key.
 #:
-#: O(n + k) time and O(k) memory, where k is the span between the smallest and
-#: largest key. Stable, and not a comparison sort, so it beats the O(n log n)
-#: bound. Use it when k is comparable to n: byte values, ages, scores, grid
-#: coordinates. Raises `ValueError` when the span exceeds
-#: `MAX_COUNTING_RANGE`, where `radix_sort` is the right answer instead.
+#: `k` is the span between the smallest and largest key; not a comparison
+#: sort, so it beats the O(n log n) bound when k is comparable to n. Raises
+#: `ValueError` past `MAX_COUNTING_RANGE`, where `radix_sort` is the answer instead.
 #:
 #: ```
 #: counting_sort([3, 1, 2, 1])                            # [1, 1, 2, 3]
@@ -242,8 +228,7 @@ pub fn counting_sort[T](items: list[T], key: fn(T) -> int = _int_key) -> list[T]
     for value in keys {
         counts[value - lowest] += 1
     }
-    # Turn counts into starting offsets, then place each element at the next
-    # free slot of its key: that is what makes the sort stable.
+    # Counts become starting offsets; each element takes the next free slot of its key — stable.
     var running = 0
     for offset in 0..span {
         let occurrences = counts[offset]
@@ -261,11 +246,10 @@ pub fn counting_sort[T](items: list[T], key: fn(T) -> int = _int_key) -> list[T]
 
 #: Sort `items` by an integer key, one byte at a time, least significant first.
 #:
-#: O(8n) time and O(n) memory for any 64-bit key, positive or negative, with no
-#: comparisons at all. Stable. Each pass is a stable counting sort on one byte;
-#: a pass whose byte is identical across the whole input is skipped, so small
-#: magnitudes cost two or three passes rather than eight. The most significant
-#: byte has its sign bit flipped, which is what orders negatives correctly.
+#: Each pass is a stable counting sort on one byte; a pass whose byte is
+#: identical across the whole input is skipped, so small magnitudes cost two
+#: or three passes rather than eight. The most significant byte has its sign
+#: bit flipped, which orders negatives correctly.
 #:
 #: Prefer it over `counting_sort` when keys are sparse, and over comparison
 #: sorts when n is large (roughly n > 1000) and the key really is an integer.
@@ -314,14 +298,12 @@ pub fn radix_sort[T](items: list[T], key: fn(T) -> int = _int_key) -> list[T] {
 
 #: Sort floats by scattering them into evenly spaced buckets.
 #:
-#: O(n) expected time when the values are spread uniformly over their range,
-#: because each of the n buckets then holds O(1) elements and the per-bucket
-#: insertion sort is constant. Degrades to O(n^2) when the distribution is
-#: skewed enough to pile everything into one bucket — for unknown
-#: distributions use `tim_sort`. Stable.
+#: O(n) expected when values are spread uniformly; degrades to O(n^2) when
+#: skewed enough to pile everything into one bucket — use `tim_sort` for
+#: unknown distributions.
 #:
-#: `bucket_count` defaults to `xs.len()`. Raises `ValueError` on NaN or an
-#: infinity, neither of which can be placed in a bucket.
+#: Raises `ValueError` on NaN or an infinity, neither of which can be placed
+#: in a bucket.
 #:
 #: ```
 #: bucket_sort([0.42, 0.13, 0.71])   # [0.13, 0.42, 0.71]
@@ -365,16 +347,14 @@ pub fn bucket_sort(xs: list[float], bucket_count: int = 0) -> list[float] {
 #: Order `items` so that every item follows the items it depends on.
 #:
 #: `key(item)` names an item; `depends_on(item)` lists the keys that must come
-#: first. Kahn's algorithm over a min-heap of ready items, O((V + E) log V).
+#: first. Kahn's algorithm over a min-heap of ready items.
 #:
-#: Among all valid orderings this returns the one that stays closest to the
-#: input: at every step the ready item with the smallest input position wins,
-#: so an input that is already in dependency order comes back unchanged. That
-#: determinism is what makes the result usable as a build order or a module
-#: initialisation order.
+#: Among all valid orderings this returns the one closest to the input: the
+#: ready item with the smallest input position wins at every step, so an
+#: already-ordered input comes back unchanged — useful for a build order or
+#: module initialisation order.
 #:
-#: Raises `ValueError` on a duplicate key, an unknown dependency, or a cycle
-#: (naming the keys still caught in it).
+#: Raises `ValueError` on a duplicate key, an unknown dependency, or a cycle.
 #:
 #: ```
 #: let deps = {"deploy": ["test"], "test": ["build"], "build": []}
@@ -432,11 +412,9 @@ pub fn topological_sort[T, K](
 
 #: Return the `count` smallest elements of `xs`, in ascending order.
 #:
-#: O(n log count) time and O(count) memory: a max-heap of the best `count`
-#: elements seen so far is kept, and each later element either loses to its
-#: root in one comparison or replaces it in O(log count). Sorting everything
-#: and slicing would be O(n log n), which is much worse for the usual case of a
-#: small `count` over a large list. Not stable.
+#: Keeps a max-heap of the best `count` elements seen so far; each later
+#: element either loses to the root in one comparison or replaces it in
+#: O(log count) — much cheaper than sorting everything and slicing. Not stable.
 #:
 #: ```
 #: partial_sort([5, 1, 4, 2, 3], 3)   # [1, 2, 3]
@@ -475,12 +453,9 @@ pub fn partial_sort[T](xs: list[T], count: int, cmp: Comparator[T] = natural_ord
 #: Return the element that would sit at index `n` if `xs` were sorted.
 #:
 #: Quickselect: partition as in `quick_sort`, then recurse into the one side
-#: that can contain index `n`. O(n) expected — the work halves each round, so
-#: n + n/2 + n/4 + ... — against O(n log n) for sorting. A depth budget hands
-#: the surviving range to `heap_sort`, making the worst case O(n log n) rather
-#: than O(n^2), so this is introselect rather than plain quickselect.
-#:
-#: Raises `IndexError` when `n` is out of range.
+#: that can contain index `n` — O(n) expected, since the work halves each
+#: round. A depth budget hands the range to `heap_sort` on bad partitioning,
+#: so this is introselect: worst case O(n log n), not O(n^2).
 #:
 #: ```
 #: nth_element([5, 1, 4, 2, 3], 2)   # 3
@@ -513,9 +488,8 @@ pub fn nth_element[T](xs: list[T], n: int, cmp: Comparator[T] = natural_order) -
 
 #: Report whether `xs` is in non-descending order.
 #:
-#: O(n), stopping at the first inversion. Worth calling before a sort only when
-#: the answer is usually yes; `tim_sort` already detects sorted input in one
-#: pass.
+#: Worth calling before a sort only when the answer is usually yes; `tim_sort`
+#: already detects sorted input in one pass.
 #:
 #: ```
 #: is_sorted([1, 2, 2, 3])   # true
@@ -532,8 +506,8 @@ pub fn is_sorted[T](xs: list[T], cmp: Comparator[T] = natural_order) -> bool {
 
 #: Merge two sorted lists into one sorted list.
 #:
-#: O(n + m) time and memory. Stable, and ties resolve in favour of `a`, so
-#: merging a list with a later batch keeps the earlier batch first.
+#: Ties resolve in favour of `a`, so merging a list with a later batch keeps
+#: the earlier batch first.
 #:
 #: ```
 #: merge([1, 4], [2, 3])   # [1, 2, 3, 4]
@@ -726,8 +700,7 @@ fn _quick_range[T](
         }
         depth -= 1
         let pivot = _partition(a, lo, hi, cmp)
-        # Recurse into the smaller side and iterate on the larger, so the call
-        # stack is O(log n) even when the partitions are badly skewed.
+        # Recurses into the smaller side, iterates the larger — bounds the call stack to O(log n).
         if pivot - lo < hi - pivot - 1 {
             _quick_range(a, lo, pivot, cmp, depth)
             lo = pivot + 1
@@ -759,8 +732,7 @@ fn _count_run[T](a: list[T], lo: int, hi: int, cmp: Comparator[T]) -> int {
     if lo + 1 >= hi { return hi - lo }
     var run_end = lo + 1
     if cmp(a[run_end], a[lo]) < 0 {
-        # Only a *strictly* descending run may be reversed: equal neighbours
-        # would swap places and break stability.
+        # Only a *strictly* descending run may be reversed — equal neighbours reversing would break stability.
         while run_end + 1 < hi and cmp(a[run_end + 1], a[run_end]) < 0 { run_end += 1 }
         _reverse_range(a, lo, run_end + 1)
     } else {
@@ -829,10 +801,9 @@ fn _merge_runs_at[T](
 #: Merge pending runs until the stack satisfies TimSort's two invariants.
 #:
 #: `lengths[i-2] > lengths[i-1] + lengths[i]` and `lengths[i-1] > lengths[i]`
-#: together keep the run lengths growing at least as fast as the Fibonacci
-#: numbers, which bounds the stack and keeps every merge between runs of
-#: similar size. The `index > 1` test is the correction to the original
-#: published algorithm, which could leave the deeper invariant violated.
+#: keep the run lengths growing at least as fast as Fibonacci, bounding the
+#: stack. The `index > 1` test corrects the originally published algorithm,
+#: which could leave the deeper invariant violated.
 fn _merge_collapse[T](
     a: list[T],
     buffer: list[T],
@@ -850,9 +821,8 @@ fn _merge_collapse[T](
             must_merge = true
         }
         if not must_merge { return }
-        # Merging the middle pair instead keeps the two neighbours of the new
-        # run closer in size. Whenever this test passes the invariant above is
-        # violated too, so this matches the published algorithm exactly.
+        # Merging the middle pair keeps the new run's neighbours closer in size;
+        # matches the published algorithm exactly (this test implies the invariant above is violated too).
         if index > 0 and lengths[index - 1] < lengths[index + 1] { index -= 1 }
         _merge_runs_at(a, buffer, starts, lengths, index, cmp)
     }

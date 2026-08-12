@@ -1,10 +1,5 @@
 #: String algorithms that the built-in `str` methods do not cover.
 #:
-#: The methods on `str` already split, join, trim, search and case-fold whole
-#: strings. This module adds the layout, case-style, distance, escaping and
-#: parsing operations that programs otherwise rewrite by hand, plus
-#: `StringBuilder` for accumulating text in linear time.
-#:
 #: Every function treats a string as a sequence of Unicode scalar values, so all
 #: indices and lengths agree with `str.len()`.
 const _INT_MIN = -9223372036854775807 - 1
@@ -88,10 +83,9 @@ let _SYMBOL_MAP: dict[str, str] = {
 
 #: Accumulate strings in a list and join them once.
 #:
-#: Repeated `text = text + piece` copies the whole accumulated string on every
-#: append, so building `n` pieces costs O(n^2) bytes copied. A builder appends
-#: to a list in O(1) amortised time and pays a single copy in `build()`, which
-#: is O(total length).
+#: Repeated `text = text + piece` copies the whole string on every append, an
+#: O(n^2) cost; a builder appends in O(1) amortised time and pays one copy in
+#: `build()`.
 #:
 #: ```
 #: StringBuilder.from_parts(["a", "b", "c"]).build()   # "abc"
@@ -171,8 +165,6 @@ pub fn repeat(text: str, times: int) -> str {
 
 #: Break `text` into lines of at most `width` characters, splitting on spaces.
 #:
-#: Existing newlines start a new line and runs of whitespace collapse to one
-#: space. A word longer than `width` is split rather than allowed to overflow.
 #: Width counts characters; for terminal output measured in display cells use
 #: `std.fmt.display_width`.
 #:
@@ -292,10 +284,6 @@ pub fn common_suffix(a: str, b: str) -> str {
 }
 
 #: Split `text` into words, honouring separators and camel-case humps.
-#:
-#: A word ends at any character that is neither a letter nor a digit, before an
-#: uppercase letter following a lowercase letter or digit, and at the end of an
-#: acronym. Words keep their original case; the `to_*` converters fold them.
 #:
 #: ```
 #: words("parseHTTPResponse")   # ["parse", "HTTP", "Response"]
@@ -483,9 +471,6 @@ pub fn hamming(a: str, b: str) -> int {
 }
 
 #: Return the Jaro similarity of `a` and `b`, from 0.0 to 1.0.
-#:
-#: Two characters match when they are equal and no further apart than
-#: `max(len(a), len(b)) / 2 - 1` positions.
 #:
 #: ```
 #: jaro("abc", "abc")   # 1.0
@@ -702,8 +687,7 @@ pub fn shuffle_deterministic(text: str, seed: int) -> str {
 
 #: Substitute `{name}` placeholders in `template` from `vars`.
 #:
-#: `{{` and `}}` produce literal braces. An unknown name raises `KeyError`
-#: unless `default` is given, which is substituted instead. This is
+#: An unknown name raises `KeyError` unless `default` is given. This is
 #: deliberately not the `std.fmt` format language: with no format specs, a
 #: template supplied by a user cannot reach anything but the values in `vars`.
 #:
@@ -849,10 +833,9 @@ pub fn escape_html(text: str) -> str {
 
 #: Quote `text` so a POSIX shell passes it through as one argument.
 #:
-#: Text built only from characters no shell treats specially comes back as is;
-#: anything else is wrapped in single quotes, with embedded single quotes
-#: spliced out and back in. The result carries its own quotes, so never add
-#: more around it.
+#: Text built only from characters no shell treats specially comes back as
+#: is; anything else is single-quoted, with embedded quotes spliced out and
+#: back in. The result carries its own quotes — never add more around it.
 #:
 #: ```
 #: escape_shell("simple")   # "simple"
@@ -887,11 +870,10 @@ pub fn escape_regex(text: str) -> str {
 
 #: Parse `text` as an integer, or return null when it is not one.
 #:
-#: Surrounding whitespace is ignored and an optional sign may precede the
-#: digits. Digit-group separators are rejected, because input from a user is not
-#: source code, and out-of-range values return null rather than wrapping.
-#: Failure is ordinary here, so this returns an optional instead of raising and
-#: `??` supplies the fallback.
+#: Whitespace is trimmed and a sign may precede the digits. Digit-group
+#: separators are rejected — input from a user isn't source code — and an
+#: out-of-range value returns null rather than wrapping. Failure here is
+#: ordinary, so this returns an optional and `??` supplies the fallback.
 #:
 #: ```
 #: to_int("42")       # 42
@@ -958,10 +940,9 @@ pub fn is_ascii(text: str) -> bool {
 
 #: Fold `text` down to ASCII, transliterating what it can.
 #:
-#: Accented Latin letters lose their accents, ligatures expand and typographic
-#: punctuation becomes its ASCII equivalent. Anything with no sensible ASCII
-#: spelling becomes `replacement`. This is for filenames, slugs and identifiers,
-#: never for display.
+#: Accented letters lose their accents, ligatures expand, and anything with
+#: no sensible ASCII spelling becomes `replacement`. For filenames, slugs and
+#: identifiers — never for display, since the fold is lossy.
 #:
 #: ```
 #: to_ascii("Crème brûlée")   # "Creme brulee"

@@ -1,9 +1,8 @@
 #: Define the traits, the comparison protocol, and the small value types that
 #: the rest of the standard library is built on.
 #:
-#: This module is the bottom of the library: it imports nothing, so every other
-#: module may depend on it without risking an import cycle. `std.prelude`
-#: re-exports the traits, `Ordering` and `cmp` into every program.
+#: Imports nothing, so every other module can depend on it without risking an
+#: import cycle. `std.prelude` re-exports the traits, `Ordering` and `cmp`.
 
 #: Produce fresh iterators over a sequence of values.
 #:
@@ -12,27 +11,23 @@ pub trait Iterable[T] {
     #: Return a fresh iterator over the elements of `self`.
     #:
     #: Two calls must not interfere with each other: return a new iterator
-    #: every time. A `for` loop over a user type calls this method once.
+    #: every time.
     fn iter(self) -> Iterator[T]
 }
 
 #: Walk a sequence of values one element at a time.
 #:
-#: Implement `next` and the two dozen default methods below come with it. Every
-#: adapter among them — `map`, `filter`, `take` and the rest — is lazy: it does
-#: no work until something calls `next` on the end of the chain. The methods
-#: that consume the iterator instead of wrapping it are `collect`, `fold`,
-#: `count`, `find`, `position`, `any`, `all`, `min_by`, `max_by`, `last`
-#: and `nth`.
+#: Implement `next` and the default methods below come with it. Every adapter
+#: among them — `map`, `filter`, `take` and the rest — is lazy: no work
+#: happens until something calls `next` on the end of the chain.
 pub trait Iterator[T]: Iterable[T] {
     #: Return `self`: an iterator is its own iterator.
     #:
-    #: This is what lets `for x in xs.iter().map(f)` work — an adapter answers
+    #: Lets `for x in xs.iter().map(f)` type-check — an adapter answers
     #: `Iterator[T]`, and without this a `for` over one would be a type error
-    #: even though the VM has always accepted it (`jaiGetIter` returns an
-    #: iterator unchanged). A class that is iterated more than once must
-    #: override it, because a fresh iterator is what `Iterable` promises and an
-    #: exhausted one cannot give it.
+    #: even though the VM (`jaiGetIter`) already accepts it. A class iterated
+    #: more than once must override this, since a fresh iterator is what
+    #: `Iterable` promises.
     fn iter(self) -> Iterator[T] { return self }
 
     #: Advance the iterator and return the next element, or null at the end.
@@ -45,10 +40,6 @@ pub trait Iterator[T]: Iterable[T] {
     #: Apply `transform` to every element, lazily.
     #:
     #: A `transform` that returns null ends the iteration early — see `next`.
-    #:
-    #: The adapters live in `std.iter`, whose `Iter` is the implementation of
-    #: this trait: a list's own `iter()` is the VM's iterator and has only
-    #: `next`.
     #:
     #: ```
     #: from std.iter import iter
@@ -219,9 +210,8 @@ pub trait Iterator[T]: Iterable[T] {
     #:
     #: Ties keep the earliest element.
     #:
-    #: `std.iter`'s `min_by` takes a key rather than a comparison, so this is
-    #: the trait's own default, reached through a `Peekable` that does not
-    #: override it.
+    #: `std.iter`'s `min_by` takes a key instead of a comparison; this is the
+    #: trait's own default, reached via a `Peekable` that doesn't override it.
     #:
     #: ```
     #: from std.iter import iter
@@ -279,11 +269,10 @@ pub trait Iterator[T]: Iterable[T] {
 
 #: Impose a total order on a type.
 #:
-#: Implement `compare`; the six comparisons derived from it come with it. Every
-#: sort and every ordered container in the library goes through `compare`.
+#: Implement `compare`; the six comparisons derived from it come with it.
 #:
 #: The order is over one type, so every method takes and returns `Self`
-#: (spec §7.2) — an implementer is ordered against its own kind, and `max`
+#: (spec §7.2): an implementer is ordered against its own kind, and `max`
 #: hands back one of its two arguments with that type intact.
 pub trait Comparable {
     #: Return a negative int when `self` sorts before `other`, zero when the two
@@ -344,8 +333,8 @@ pub trait Cloneable {
     #: Return a copy of `self` that can be mutated without affecting `self`.
     #:
     #: The copy is shallow unless the implementation says otherwise. `Self`
-    #: (spec §7.2) is what makes the promise exact: a clone of a `Matrix` is a
-    #: `Matrix`, with no annotation at the call site.
+    #: (spec §7.2) makes the promise exact: a clone of a `Matrix` is a
+    #: `Matrix`, with no annotation needed.
     fn clone(self) -> Self
 }
 
@@ -375,9 +364,9 @@ pub enum Ordering {
     #: The left operand sorts before the right one, the case `cmp` and
     #: `Comparable.compare` report as a negative int.
     Less,
-    #: Neither operand sorts before the other. This is equivalence under the
-    #: order rather than identity, though `Comparable` requires the two to
-    #: agree: whatever compares `Equal` must also be `==`.
+    #: Neither operand sorts before the other — equivalence under the order,
+    #: not identity; `Comparable` requires whatever compares `Equal` to also
+    #: be `==`.
     Equal,
     #: The left operand sorts after the right one, the case `cmp` and
     #: `Comparable.compare` report as a positive int.
@@ -406,8 +395,8 @@ pub enum Ordering {
 
 #: An immutable two-field record, ordered by `first` and then `second`.
 #:
-#: Use it where a tuple would lose its meaning — a key and its value, a bound
-#: and its index — and where the result must be hashable.
+#: Use it where a tuple would lose its meaning, or where the result must be
+#: hashable.
 #:
 #: ```
 #: let entry = Pair("width", 3)
@@ -448,12 +437,9 @@ pub class Pair[A, B]: Comparable, Hashable, Printable {
     pub fn hash(self) -> int {
         let first_hash = hash(self.first)
         let second_hash = hash(self.second)
-        # A plain xor would collide Pair(a, b) with Pair(b, a), so fold the
-        # second component into itself before mixing it in. The fold is a
-        # bijection, so it spends no entropy, and it is built from `>>` alone
-        # because a rotate is not expressible here: `<<` raises OverflowError
-        # as soon as a hash occupies its top bits and the only wrapping
-        # operators are `+%`, `-%` and `*%`.
+        # Plain xor would collide Pair(a, b) with Pair(b, a); the fold is a
+        # bijection (spends no entropy) built from `>>` alone since `<<` here
+        # would raise OverflowError once a hash occupies its top bits.
         return first_hash ^ second_hash ^ second_hash >> 13
     }
 
@@ -529,12 +515,11 @@ pub class Peekable[T]: Iterator[T], Iterable[T] {
 
 #: Compare any two values with a total order, returning -1, 0 or 1.
 #:
-#: This is the comparison every sort in the library uses by default. It knows
-#: null (which sorts before everything), bool, int, float, str, and lists and
-#: tuples (lexicographically, shorter first when one is a prefix of the other).
-#: Any type implementing `Comparable` supplies its own answer. NaN sorts after
-#: every other number so that a list of floats still has a total order.
-#: Anything else raises `TypeError`.
+#: Knows null (sorts before everything), bool, int, float, str, and lists and
+#: tuples (lexicographically, shorter first when one is a prefix of the
+#: other). Any type implementing `Comparable` supplies its own answer. NaN
+#: sorts after every other number, so a list of floats still has a total
+#: order. Anything else raises `TypeError`.
 #:
 #: ```
 #: cmp(3, 7)                  # -1
@@ -581,10 +566,8 @@ pub fn always(value: any) -> fn() -> any { return || value }
 #: unconditionally instead of testing it for null on every iteration.
 pub fn noop() -> void { }
 
-# The lazy adapters returned by the default methods of `Iterator`. They are
-# private to this module — a caller only ever sees them as `Iterator[T]` — and
-# every method on them implements a method already documented on the trait, so
-# the doc comments live there rather than being repeated eleven times here.
+# Private lazy adapters returned by `Iterator`'s default methods; their
+# methods implement ones already documented on the trait, so no docs here.
 class MapIter[T, U]: Iterator[U], Iterable[U] {
     let source: Iterator[T]
     let transform: fn(T) -> U

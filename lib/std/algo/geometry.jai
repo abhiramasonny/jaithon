@@ -1,62 +1,22 @@
 #: Computational geometry: the point and vector types, the primitive shapes,
 #: and the classical planar algorithms over them.
 #:
-#: ## Floating-point robustness
-#:
-#: Almost every decision made here reduces to the sign of one cross product:
-#: which side of a line a point falls on, whether a hull turns left, whether
-#: three vertices are collinear, whether a triangle is an ear. In exact
-#: arithmetic that sign is never in doubt. In binary64 it is. For three nearly
-#: collinear points the determinant `(b - a) x (c - a)` is a difference of two
-#: products that agree in almost every bit, so what survives the subtraction is
-#: rounding error and its sign is arbitrary. Worse, it is *inconsistently*
-#: arbitrary: two algebraically identical expressions can disagree, and then a
-#: hull walk pops a vertex it should have kept, or a point tests inside a
-#: polygon from one edge and outside from the next, and the loop never
-#: terminates.
-#:
-#: There are two honest responses. The first is exact arithmetic — Shewchuk's
-#: adaptive predicates evaluate the determinant to as many bits as the sign
-#: needs and no more. The second is to decide in advance how close is too close
-#: to call, and answer "collinear" inside that band. This module takes the
-#: second. `orientation` compares the determinant against
-#: `EPSILON * (1 + |x1*y2| + |y1*x2|)` — an absolute floor of `EPSILON` plus a
-#: term that grows with the magnitude of the operands — and every other
-#: predicate is expressed through `orientation` so that they cannot contradict
-#: one another.
-#:
-#: What that buys, and what it costs:
-#:
-#:   - Answers are consistent. The same three points always get the same
-#:     verdict, which is what keeps the loops here terminating.
-#:   - Answers are not exact. A polygon whose vertices differ only in the
-#:     fifteenth digit is reported as degenerate. That is usually the truth
-#:     about the data rather than a defect in the test.
-#:   - Accuracy is best for coordinates between about 1 and 1e6. Near 1e15 a
-#:     single ulp already exceeds `EPSILON` and no tolerance can rescue the
-#:     predicate; translate to a local origin before calling.
-#:   - Every routine that can subtract a local origin before multiplying does
-#:     so — `orientation`, the shoelace sum, the circumcentre, the closest-pair
-#:     strip — because that removes the leading cancellation instead of
-#:     tolerating it.
-#:   - Never compare coordinates with `==`. `Point2.approx_eq` is the test.
+#: Every predicate here reduces to the sign of a cross product, computed by
+#: `orientation` with a tolerance that scales with the operands so answers
+#: stay consistent; never compare coordinates with `==` — use `Point2.approx_eq`.
 import std.math
 from std.core import Printable
 from std.algo.sort import sort_by
 
 #: The tolerance that separates "zero" from "small" in every predicate here.
 #:
-#: Used as an absolute floor and scaled by the magnitude of the operands where
-#: the quantity being tested is a product. See the module doc comment.
+#: An absolute floor, scaled by operand magnitude for products — see the module doc.
 pub const EPSILON: float = 1e-9
 
 #: A point in the plane, doubling as a two-dimensional vector.
 #:
-#: Immutable: every operation returns a new point, so a `Point2` can be shared
-#: without copying and stored in a dict without the key changing underfoot.
-#: The vector operations (`dot`, `cross`, `length`, `normalize`) read the point
-#: as the vector from the origin to it, which is what makes `b - a` a
-#: displacement and `(b - a).length()` a distance.
+#: Immutable: every operation returns a new point, so it can be shared without
+#: copying or change underfoot when used as a dict key.
 pub class Point2: Printable {
     #: The horizontal coordinate.
     pub let x: float
@@ -81,9 +41,6 @@ pub class Point2: Printable {
 
     #: Return the scalar product of `self` and `other`.
     #:
-    #: Zero exactly when the two are perpendicular, positive when they point
-    #: within a quarter turn of each other.
-    #:
     #: ```
     #: Point2(1.0, 0.0).dot(Point2(0.0, 1.0))    # 0.0
     #: ```
@@ -93,10 +50,7 @@ pub class Point2: Printable {
 
     #: Return the z component of the three-dimensional cross product.
     #:
-    #: In the plane the cross product is a single number: the signed area of
-    #: the parallelogram the two vectors span. It is positive when `other` lies
-    #: counter-clockwise of `self`, negative when clockwise, zero when the two
-    #: are parallel. Every orientation test in this module is this number.
+    #: Every orientation test in this module is this number.
     #:
     #: ```
     #: Point2(1.0, 0.0).cross(Point2(0.0, 1.0))    # 1.0
@@ -107,8 +61,7 @@ pub class Point2: Printable {
 
     #: Return the distance from the origin.
     #:
-    #: Computed with `hypot`, which scales before squaring and so survives
-    #: coordinates whose squares would overflow or underflow.
+    #: Uses `hypot`, which scales before squaring to avoid overflow/underflow.
     #:
     #: ```
     #: Point2(3.0, 4.0).length()    # 5.0
@@ -117,14 +70,10 @@ pub class Point2: Printable {
 
     #: Return the squared distance from the origin.
     #:
-    #: Prefer this wherever only a comparison of lengths is needed: it saves a
-    #: square root and, being a sum of products rather than a root of one, it
-    #: is the more accurate comparison.
+    #: Prefer this for comparisons: it skips the square root and is more accurate.
     pub fn length_squared(self) -> float { return self.x * self.x + self.y * self.y }
 
     #: Return a vector of length one pointing the same way as `self`.
-    #:
-    #: Raises `ValueError` for the zero vector, which has no direction.
     #:
     #: ```
     #: Point2(3.0, 4.0).normalize().x    # 0.6
@@ -154,8 +103,7 @@ pub class Point2: Printable {
 
     #: Return the direction of `self` as an angle in `(-PI, PI]`.
     #:
-    #: Measured counter-clockwise from the positive x axis. The origin reports
-    #: 0.0, which is a convention rather than an answer.
+    #: The origin reports 0.0 by convention, not as a meaningful answer.
     #:
     #: ```
     #: Point2(0.0, 1.0).angle() == math.PI / 2.0    # true
@@ -164,12 +112,8 @@ pub class Point2: Printable {
 
     #: Return the signed angle from `self` to `other`, in `(-PI, PI]`.
     #:
-    #: Positive when `other` is counter-clockwise of `self`. Taken as
-    #: `atan2(cross, dot)` rather than `acos(dot / (|a| * |b|))`: the arccosine
-    #: form loses all its precision for nearly parallel vectors, where the
-    #: cosine is flat, and cannot tell the two turn directions apart.
-    #:
-    #: Raises `ValueError` when either vector is zero.
+    #: Uses `atan2(cross, dot)`, not `acos(dot / (|a| * |b|))`: acos loses
+    #: precision near-parallel and can't tell the two turn directions apart.
     #:
     #: ```
     #: Point2(1.0, 0.0).angle_to(Point2(0.0, 1.0)) == math.PI / 2.0    # true
@@ -199,8 +143,7 @@ pub class Point2: Printable {
 
     #: Return the point `t` of the way from `self` to `other`.
     #:
-    #: Exact at both ends, so `lerp(other, 1.0)` is `other` and not a rounding
-    #: short of it. Values outside `[0, 1]` extrapolate.
+    #: Exact at both ends: `lerp(other, 1.0)` is `other`, not a rounding short of it.
     #:
     #: ```
     #: Point2(0.0, 0.0).lerp(Point2(4.0, 8.0), 0.25).y    # 2.0
@@ -210,16 +153,12 @@ pub class Point2: Printable {
     }
 
     #: Return `self` rotated a quarter turn counter-clockwise: `(-y, x)`.
-    #:
-    #: This is the left normal of the vector, the one that points into the
-    #: half-plane a counter-clockwise polygon encloses.
     pub fn perpendicular(self) -> Point2 { return Point2(-self.y, self.x) }
 
     #: Report whether `self` and `other` agree to within `tolerance`.
     #:
-    #: The comparison is absolute on each coordinate, so choose a `tolerance`
-    #: on the scale of the data. This, never `==`, is how two computed points
-    #: are compared.
+    #: Absolute per coordinate — choose `tolerance` to match the data's scale;
+    #: use this, never `==`.
     #:
     #: ```
     #: Point2(1.0, 1.0).approx_eq(Point2(1.0, 1.0 + 1e-15))    # true
@@ -270,9 +209,8 @@ pub class Point2: Printable {
 
 #: A point in space, doubling as a three-dimensional vector.
 #:
-#: The same value semantics as `Point2`. The cross product is a vector here
-#: rather than a scalar, and it is the whole reason the type exists: surface
-#: normals, torques and the plane through three points all come from it.
+#: The cross product returns a vector here, not a scalar — the reason this
+#: type exists (surface normals, torques, the plane through three points).
 pub class Vec3: Printable {
     #: The x coordinate.
     pub let x: float
@@ -296,10 +234,6 @@ pub class Vec3: Printable {
     }
 
     #: Return the vector perpendicular to both `self` and `other`.
-    #:
-    #: Its length is the area of the parallelogram they span, and its direction
-    #: follows the right-hand rule, so the result is zero exactly when the two
-    #: are parallel.
     #:
     #: ```
     #: Vec3(1.0, 0.0, 0.0).cross(Vec3(0.0, 1.0, 0.0)).z    # 1.0
@@ -327,8 +261,6 @@ pub class Vec3: Printable {
     }
 
     #: Return a vector of length one pointing the same way as `self`.
-    #:
-    #: Raises `ValueError` for the zero vector.
     pub fn normalize(self) -> Vec3 {
         let magnitude = self.length()
         if magnitude == 0.0 { throw ValueError("cannot normalize the zero vector") }
@@ -354,12 +286,8 @@ pub class Vec3: Printable {
 
     #: Return the unsigned angle between `self` and `other`, in `[0, PI]`.
     #:
-    #: Taken as `atan2(|cross|, dot)`. The textbook `acos(dot / (|a| * |b|))`
-    #: is accurate only near a right angle: at small angles the cosine is flat,
-    #: so the arccosine amplifies the rounding error without bound, and a dot
-    #: product that rounds just past one makes it raise outright.
-    #:
-    #: Raises `ValueError` when either vector is zero.
+    #: Taken as `atan2(|cross|, dot)`, not `acos(dot/(|a|*|b|))`: acos is
+    #: inaccurate near small angles and can raise if a dot product rounds past one.
     #:
     #: ```
     #: let right = Vec3(1.0, 0.0, 0.0).angle_to(Vec3(0.0, 1.0, 0.0))
@@ -421,8 +349,8 @@ pub class Vec3: Printable {
 
 #: An infinite line, stored as a point on it and a direction along it.
 #:
-#: The direction is kept unnormalized so that `at(0.0)` and `at(1.0)` are the
-#: two points the line was built from.
+#: Direction is kept unnormalized, so `at(0.0)`/`at(1.0)` return the two
+#: points the line was built from.
 pub class Line: Printable {
     #: A point the line passes through.
     pub let point: Point2
@@ -431,8 +359,6 @@ pub class Line: Printable {
     pub let direction: Point2
 
     #: Create the line through `a` and `b`.
-    #:
-    #: Raises `ValueError` when the two points coincide, which fixes no line.
     pub fn init(self, a: Point2, b: Point2) {
         if a.approx_eq(b) {
             throw ValueError(f"a line needs two distinct points, both are {a}")
@@ -442,8 +368,6 @@ pub class Line: Printable {
     }
 
     #: Create the line through `point` running along `direction`.
-    #:
-    #: Raises `ValueError` for a zero direction.
     pub static fn from_direction(point: Point2, direction: Point2) -> Line {
         if direction.length_squared() == 0.0 {
             throw ValueError("a line needs a non-zero direction")
@@ -485,16 +409,14 @@ pub class Line: Printable {
 
     #: Report whether the two lines have parallel directions.
     #:
-    #: Coincident lines are parallel by this test: they never cross in exactly
-    #: one point either.
+    #: Coincident lines count as parallel: they don't cross in exactly one point either.
     pub fn is_parallel(self, other: Line) -> bool {
         return _cross_sign(self.direction, other.direction) == 0
     }
 
     #: Return the single point the two lines share, or null.
     #:
-    #: Null covers both parallel and coincident lines — neither has one
-    #: intersection point.
+    #: Null covers both parallel and coincident lines — neither has one intersection point.
     #:
     #: ```
     #: let horizontal = Line(Point2(0.0, 0.0), Point2(1.0, 0.0))
@@ -516,8 +438,7 @@ pub class Line: Printable {
 
 #: A straight segment between two endpoints.
 #:
-#: Degenerate segments — both endpoints equal — are allowed and behave as the
-#: single point they are.
+#: Degenerate segments — both endpoints equal — are allowed and behave as the single point they are.
 pub class Segment: Printable {
     #: The first endpoint.
     pub let a: Point2
@@ -542,8 +463,6 @@ pub class Segment: Printable {
 
     #: Return the point on the segment closest to `p`.
     #:
-    #: The projection onto the supporting line, clamped to the endpoints.
-    #:
     #: ```
     #: Segment(Point2(0.0, 0.0), Point2(2.0, 0.0)).closest_point(Point2(5.0, 1.0)).x    # 2.0
     #: ```
@@ -566,12 +485,6 @@ pub class Segment: Printable {
 
     #: Report whether the two segments share at least one point.
     #:
-    #: The complete test, collinear overlaps and touching endpoints included.
-    #: Four orientations decide the general case: the segments cross when each
-    #: straddles the other's supporting line. When any orientation is zero the
-    #: configuration is collinear or touching and is settled by a bounding-box
-    #: containment test instead.
-    #:
     #: ```
     #: let rising = Segment(Point2(0.0, 0.0), Point2(2.0, 2.0))
     #: let falling = Segment(Point2(0.0, 2.0), Point2(2.0, 0.0))
@@ -591,10 +504,8 @@ pub class Segment: Printable {
 
     #: Return the single point the two segments share, or null.
     #:
-    #: Null means either that they miss each other entirely or that they
-    #: overlap along a stretch, where there is no single point to return. Use
-    #: `intersects` for the yes-or-no question; the two disagree exactly on the
-    #: collinear-overlap case, and that difference is the point of having both.
+    #: Null covers both "miss entirely" and "overlap along a stretch" (no
+    #: single point); `intersects` and this disagree exactly on that collinear case.
     #:
     #: ```
     #: let rising = Segment(Point2(0.0, 0.0), Point2(2.0, 2.0))
@@ -626,9 +537,7 @@ pub class Rect: Printable {
 
     #: Create the rectangle spanning `min_corner` to `max_corner`.
     #:
-    #: Raises `ValueError` when either coordinate of `min_corner` exceeds the
-    #: matching coordinate of `max_corner`; an inverted rectangle is a bug in
-    #: the caller rather than an empty region.
+    #: Raises `ValueError` on inverted corners — a caller bug, not an empty region.
     pub fn init(self, min_corner: Point2, max_corner: Point2) {
         if min_corner.x > max_corner.x or min_corner.y > max_corner.y {
             throw ValueError(f"Rect corners are inverted: {min_corner} to {max_corner}")
@@ -638,8 +547,6 @@ pub class Rect: Printable {
     }
 
     #: Create the rectangle with its lower-left corner at `(x, y)`.
-    #:
-    #: Raises `ValueError` for a negative width or height.
     #:
     #: ```
     #: Rect.from_size(1.0, 1.0, 3.0, 2.0).area()    # 6.0
@@ -720,9 +627,6 @@ pub class Rect: Printable {
     }
 
     #: Return the rectangle grown by `amount` on every side.
-    #:
-    #: A negative `amount` shrinks it. Raises `ValueError` when that would
-    #: invert the rectangle.
     pub fn expanded(self, amount: float) -> Rect {
         if self.width() + 2.0 * amount < 0.0 or self.height() + 2.0 * amount < 0.0 {
             throw ValueError(f"expanding by {amount} would invert the rect")
@@ -758,8 +662,6 @@ pub class Circle: Printable {
     pub let radius: float
 
     #: Create the circle of radius `radius` around `center`.
-    #:
-    #: Raises `ValueError` for a negative radius.
     pub fn init(self, center: Point2, radius: float) {
         if radius < 0.0 { throw ValueError(f"radius must be non-negative, got {radius}") }
         self.center = center
@@ -793,8 +695,7 @@ pub class Circle: Printable {
 
     #: Return the points the two boundaries share: two, one, or none.
     #:
-    #: One point means tangency. Two identical circles share their whole
-    #: boundary and so return the empty list — there is no finite answer.
+    #: Identical circles return the empty list — infinitely many points is not a finite answer.
     #:
     #: ```
     #: let left = Circle(Point2(0.0, 0.0), 1.0)
@@ -831,16 +732,12 @@ pub class Circle: Printable {
 
 #: A closed polygon, as a ring of vertices.
 #:
-#: The ring is implicitly closed: the last vertex joins back to the first, and
-#: repeating the first vertex at the end would create a zero-length edge. The
-#: class validates the ring once at construction so that the free functions
-#: below, which take a bare `list[Point2]`, need not keep re-checking it.
+#: Implicitly closed — do not repeat the first vertex at the end, that would
+#: create a zero-length edge instead.
 pub class Polygon: Printable {
     let vertices: list[Point2]
 
     #: Create the polygon with the given vertex ring.
-    #:
-    #: Raises `ValueError` for fewer than three vertices.
     pub fn init(self, vertices: list[Point2]) {
         if vertices.len() < 3 {
             throw ValueError(f"a polygon needs at least 3 vertices, got {vertices.len()}")
@@ -852,8 +749,6 @@ pub class Polygon: Printable {
     pub fn vertex_count(self) -> int { return self.vertices.len() }
 
     #: Return the vertex at `index`.
-    #:
-    #: Raises `IndexError` when `index` is out of range.
     pub fn vertex(self, index: int) -> Point2 {
         if index < 0 or index >= self.vertices.len() {
             throw IndexError(f"vertex index must be in 0..{self.vertices.len()}, got {index}")
@@ -888,8 +783,7 @@ pub class Polygon: Printable {
 
     #: Return the smallest axis-aligned rectangle containing the polygon.
     #:
-    #: Calls the shared helper rather than the free `bounding_box`, which has
-    #: the same name as this method.
+    #: Calls the shared helper, not the free `bounding_box` — same name would recurse.
     pub fn bounding_box(self) -> Rect { return _bounds_of(self.vertices) }
 
     #: Report whether `p` is inside the polygon or on its boundary.
@@ -897,8 +791,7 @@ pub class Polygon: Printable {
 
     #: Report whether the ring turns the same way at every vertex.
     #:
-    #: Collinear vertices do not break convexity. A self-intersecting ring is
-    #: never convex by this test, since it must reverse somewhere.
+    #: A self-intersecting ring never tests convex — it must reverse somewhere.
     pub fn is_convex(self) -> bool { return _is_convex_ring(self.vertices) }
 
     #: Report whether the ring runs counter-clockwise.
@@ -906,15 +799,14 @@ pub class Polygon: Printable {
 
     #: Report whether no two non-adjacent edges touch.
     #:
-    #: O(n^2), comparing every pair of edges. Worth calling before
-    #: `triangulate`, which assumes a simple polygon and can only report the
-    #: failure late and vaguely.
+    #: O(n^2). Worth calling before `triangulate`, which assumes simplicity
+    #: and can only fail late and vaguely.
     pub fn is_simple(self) -> bool {
         let sides = self.edges()
         let count = sides.len()
         for i in 0..count {
             for j in i + 1..count {
-                # Adjacent edges are meant to share exactly one endpoint.
+                # Adjacent edges share exactly one endpoint.
                 if j == i + 1 or i == 0 and j == count - 1 { continue }
                 if sides[i].intersects(sides[j]) { return false }
             }
@@ -932,11 +824,9 @@ pub class Polygon: Printable {
 
 #: Return 1 when `a`, `b`, `c` turn counter-clockwise, -1 clockwise, 0 collinear.
 #:
-#: The predicate the whole module rests on. It is the sign of the determinant
-#: `(b - a) x (c - a)`, compared against a tolerance that grows with the
-#: magnitude of the two products so that the answer is the same however far
-#: from the origin the points sit. See the module doc comment for what that
-#: tolerance can and cannot do.
+#: The whole module rests on this: sign of `(b - a) x (c - a)`, compared
+#: against a tolerance that scales with magnitude so the answer holds however
+#: far from the origin the points sit. See the module doc comment.
 #:
 #: ```
 #: orientation(Point2(0.0, 0.0), Point2(1.0, 0.0), Point2(1.0, 1.0))    # 1
@@ -954,10 +844,7 @@ pub fn orientation(a: Point2, b: Point2, c: Point2) -> int {
 
 #: Return how many times the polygon's boundary winds around `point`.
 #:
-#: Zero means outside. Any other value means inside, and its magnitude counts
-#: the loops: a doubly wound ring reports 2, a ring wound the other way -1.
-#: Points on the boundary are unspecified — ask `point_in_polygon`, which
-#: settles them first.
+#: Boundary points are unspecified here — use `point_in_polygon`, which settles them.
 #:
 #: ```
 #: let square = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(2.0, 2.0), Point2(0.0, 2.0)]
@@ -971,8 +858,7 @@ pub fn winding_number(ring: list[Point2], point: Point2) -> int {
     for index in 0..count {
         let a = ring[index]
         let b = ring[(index + 1) % count]
-        # Half-open in y so that a vertex exactly at the ray's height is
-        # counted by one of its two edges and not by both.
+        # Half-open in y: a vertex at the ray's height counts once, not twice.
         if a.y <= point.y {
             if b.y > point.y and orientation(a, b, point) > 0 { winding += 1 }
         } elif b.y <= point.y and orientation(a, b, point) < 0 {
@@ -984,13 +870,9 @@ pub fn winding_number(ring: list[Point2], point: Point2) -> int {
 
 #: Report whether `point` is inside the polygon or on its boundary.
 #:
-#: The non-zero winding rule, and the one to reach for. It is the rule that
-#: matches the intuition "the ring encloses this point": for a self-
-#: intersecting ring, a region covered twice counts as inside, where the
-#: even-odd rule of `point_in_polygon_crossing` punches it out again. It also
-#: costs the same, and unlike the crossing test it answers boundary points
-#: definitely — they are inside — instead of leaving them to the rounding.
-#: On a simple polygon the two rules agree everywhere except the boundary.
+#: The non-zero winding rule: a self-intersecting ring's doubly-covered region
+#: counts as inside (the even-odd `point_in_polygon_crossing` punches it out),
+#: and boundary points are decisively inside rather than left to rounding.
 #:
 #: ```
 #: let square = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(2.0, 2.0), Point2(0.0, 2.0)]
@@ -1011,13 +893,9 @@ pub fn point_in_polygon(ring: list[Point2], point: Point2) -> bool {
 
 #: Report whether `point` is inside the polygon by the even-odd rule.
 #:
-#: Ray casting: shoot a ray to the right and count boundary crossings, odd
-#: meaning inside. Use it when even-odd is the semantics you want — it is what
-#: SVG's `fill-rule: evenodd` and most CAD formats mean by a hole cut into a
-#: ring drawn the same way round. Otherwise prefer `point_in_polygon`, whose
-#: winding rule handles self-intersection more intuitively and does not leave
-#: boundary points to chance; this test says nothing useful about a point that
-#: lies exactly on an edge.
+#: Ray casting, even-odd rule — what SVG's `fill-rule: evenodd` means by a
+#: hole cut into a ring. Prefer `point_in_polygon` otherwise; this one says
+#: nothing useful about a point exactly on an edge.
 #:
 #: ```
 #: let square = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(2.0, 2.0), Point2(0.0, 2.0)]
@@ -1031,8 +909,8 @@ pub fn point_in_polygon_crossing(ring: list[Point2], point: Point2) -> bool {
     for index in 0..count {
         let a = ring[index]
         let b = ring[(index + 1) % count]
-        # The half-open comparison is what makes a vertex on the ray count
-        # once: exactly one of the two edges meeting there straddles it.
+        # Half-open: exactly one of the two edges meeting at a vertex on the
+        # ray straddles it, so it counts once.
         if (a.y > point.y) != (b.y > point.y) {
             let crossing = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x)
             if point.x < crossing { inside = not inside }
@@ -1043,13 +921,9 @@ pub fn point_in_polygon_crossing(ring: list[Point2], point: Point2) -> bool {
 
 #: Return the vertices of the convex hull, counter-clockwise.
 #:
-#: Andrew's monotone chain: sort the points by x then y, sweep left to right
-#: building the lower chain and right to left building the upper one, popping
-#: any vertex that is not a strict left turn. O(n log n), all of it in the
-#: sort. Duplicate points are removed and collinear points are dropped, so the
-#: result is the minimal strictly convex ring. Fewer than three distinct
-#: points, or all of them collinear, gives the one or two extreme points back
-#: — a hull, just not a polygon.
+#: Andrew's monotone chain, O(n log n) (all of it in the sort). Fewer than
+#: three distinct points, or all collinear, returns the one or two extreme
+#: points — a hull, not necessarily a polygon.
 #:
 #: ```
 #: let cloud = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(1.0, 1.0), Point2(1.0, 0.2)]
@@ -1071,7 +945,7 @@ pub fn convex_hull(points: list[Point2]) -> list[Point2] {
         _push_turning_left(upper, ordered[index])
         index -= 1
     }
-    # Each chain ends where the other begins; drop the duplicated endpoints.
+    # Each chain ends where the other begins; drop the duplicate.
     lower.pop()
     upper.pop()
     return lower + upper
@@ -1079,17 +953,8 @@ pub fn convex_hull(points: list[Point2]) -> list[Point2] {
 
 #: Return the two closest points and the distance between them.
 #:
-#: Divide and conquer in O(n log n): split the points at the median x, solve
-#: both halves, then check only the points within the better of the two
-#: distances of the dividing line. That strip is scanned in y order, where a
-#: geometric packing argument caps the work at a constant number of comparisons
-#: per point — no pair further than seven positions apart in y can beat the
-#: distance already found. The brute-force alternative is O(n^2).
-#:
-#: Both index lists are sorted once up front and partitioned on the way down,
-#: which is what keeps the recursion linear per level rather than re-sorting.
-#: Raises `ValueError` for fewer than two points. Duplicate points are a
-#: legitimate answer at distance zero.
+#: Divide and conquer, O(n log n). Both index lists are sorted once up front
+#: and partitioned on the way down — resorting per level would blow the complexity.
 #:
 #: ```
 #: let cloud = [Point2(0.0, 0.0), Point2(5.0, 5.0), Point2(1.0, 1.0)]
@@ -1113,12 +978,9 @@ pub fn closest_pair(points: list[Point2]) -> tuple[Point2, Point2, float] {
 
 #: Return the signed area of the ring: positive counter-clockwise.
 #:
-#: The shoelace formula, evaluated as a triangle fan from the first vertex so
-#: that every coordinate is a local offset. Summing `x_i * y_(i+1)` on the raw
-#: coordinates instead would, for a small polygon far from the origin, form
-#: huge products and then subtract them — the classic cancellation, and the
-#: reason a survey polygon in metres-from-the-equator can come out with the
-#: wrong area entirely.
+#: Shoelace formula as a triangle fan from the first vertex, so every
+#: coordinate is a local offset — summing raw coordinates instead would
+#: cancel catastrophically far from the origin.
 #:
 #: ```
 #: polygon_signed_area([Point2(0.0, 0.0), Point2(4.0, 0.0), Point2(4.0, 3.0)])    # 6.0
@@ -1160,13 +1022,8 @@ pub fn polygon_perimeter(ring: list[Point2]) -> float {
 
 #: Return the area-weighted centroid of the region the ring encloses.
 #:
-#: This is the centre of mass of the filled polygon, which is not the mean of
-#: the vertices — see `centroid`. Subdividing an edge changes the vertex mean
-#: and leaves this unmoved, which is the property that makes it the right
-#: answer for a shape.
-#:
-#: Raises `ValueError` for a degenerate ring, whose zero area leaves the
-#: weighted average undefined.
+#: Unlike `centroid`, this is invariant to subdividing an edge — the true
+#: centre of mass, not the mean of the vertices.
 #:
 #: ```
 #: let square = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(2.0, 2.0), Point2(0.0, 2.0)]
@@ -1195,12 +1052,8 @@ pub fn polygon_centroid(ring: list[Point2]) -> Point2 {
 
 #: Return the arithmetic mean of the points.
 #:
-#: The centre of the *vertices*, not of the shape they outline: adding a point
-#: pulls it, and subdividing an edge of a polygon moves it. For the centre of
-#: mass of a filled polygon use `polygon_centroid`. This one is what a
-#: clustering step or an angular sort wants.
-#:
-#: Raises `ValueError` for an empty list.
+#: The mean of the *vertices*, not the shape — subdividing an edge moves it;
+#: for the centre of mass of a filled polygon use `polygon_centroid`.
 #:
 #: ```
 #: centroid([Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(1.0, 3.0)]).y    # 1.0
@@ -1219,8 +1072,6 @@ pub fn centroid(points: list[Point2]) -> Point2 {
 
 #: Return the smallest axis-aligned rectangle containing every point.
 #:
-#: Raises `ValueError` for an empty list.
-#:
 #: ```
 #: bounding_box([Point2(1.0, 5.0), Point2(-2.0, 0.0)]).width()    # 3.0
 #: ```
@@ -1228,14 +1079,9 @@ pub fn bounding_box(points: list[Point2]) -> Rect { return _bounds_of(points) }
 
 #: Return the circle through three points.
 #:
-#: The circumcircle: its centre is where the perpendicular bisectors of the
-#: three chords meet. Computed after translating `a` to the origin, which
-#: turns the textbook formula's differences of squared coordinates into
-#: squares of differences and so removes the cancellation that dominates it
-#: for points far from the origin.
-#:
-#: Raises `ValueError` when the three points are collinear — including when
-#: two coincide — since no finite circle passes through them.
+#: Computed after translating `a` to the origin, which turns differences of
+#: squared coordinates into squares of differences — removing the
+#: cancellation that dominates far from the origin.
 #:
 #: ```
 #: let unit = circle_from_points(Point2(1.0, 0.0), Point2(0.0, 1.0), Point2(-1.0, 0.0))
@@ -1257,11 +1103,8 @@ pub fn circle_from_points(a: Point2, b: Point2, c: Point2) -> Circle {
 
 #: Return the points where a line meets a circle: two, one, or none.
 #:
-#: Substituting the parametric line into the circle gives a quadratic in the
-#: line parameter; its discriminant decides the count. One point means the line
-#: is tangent, and because a discriminant of exactly zero is not something
-#: floating point produces, near-zero counts as tangency. The results come back
-#: in increasing order along the line's direction.
+#: A discriminant of exactly zero never happens in floating point, so
+#: near-zero counts as tangency.
 #:
 #: ```
 #: let axis = Line(Point2(-5.0, 0.0), Point2(5.0, 0.0))
@@ -1285,16 +1128,10 @@ pub fn line_circle_intersection(line: Line, circle: Circle) -> list[Point2] {
 
 #: Return `subject` clipped to the convex region `window`.
 #:
-#: The Sutherland-Hodgman algorithm: run the whole subject ring through one
-#: window edge at a time, keeping the vertices on the inside and adding a new
-#: vertex wherever the ring crosses. n passes over the ring, so O(n * m).
-#:
-#: `window` must be convex — that is the algorithm's premise, and it is checked
-#: — but `subject` need not be. A concave subject clipped by a window that cuts
-#: it into two pieces comes back as one ring joined by a degenerate edge along
-#: the window boundary; that is the known artefact of the method, and the price
-#: of its simplicity. Greiner-Hormann is the algorithm to reach for when the
-#: pieces must stay separate.
+#: Sutherland-Hodgman; `window` must be convex (checked), `subject` need not
+#: be. A concave subject split into two pieces comes back as one ring joined
+#: by a degenerate edge — the method's known artefact. Use Greiner-Hormann if
+#: the pieces must stay separate.
 #:
 #: ```
 #: let square = [Point2(0.0, 0.0), Point2(4.0, 0.0), Point2(4.0, 4.0), Point2(0.0, 4.0)]
@@ -1336,24 +1173,12 @@ pub fn polygon_clip(subject: list[Point2], window: list[Point2]) -> list[Point2]
 
 #: Return a triangulation of a simple polygon, as counter-clockwise triples.
 #:
-#: Ear clipping: repeatedly find a convex vertex whose triangle with its two
-#: neighbours holds no other vertex, emit that triangle, and unlink the vertex.
-#: Every simple polygon has at least two such ears at all times (the two-ears
-#: theorem), so the search always finds one and the loop always makes progress.
-#: O(n^2), which is the practical choice below a few thousand vertices;
-#: Seidel's and Chazelle's algorithms do better asymptotically and are far
-#: harder to make robust.
+#: Ear clipping. The two-ears theorem guarantees an un-trapped convex vertex
+#: always exists, so the loop always makes progress; collinear vertices are
+#: dropped rather than emitted as zero-area triangles.
 #:
-#: The triangles tile the polygon exactly and none of them is degenerate.
-#: Collinear vertices are dropped rather than turned into zero-area triangles,
-#: both the ones present at the start and the ones that only become collinear
-#: as their neighbours are clipped away, so the count is `m - 2` for the `m`
-#: vertices that survive that pruning — at most `n - 2`, and fewer for a ring
-#: with straight runs in it.
-#:
-#: Raises `ValueError` when the ring encloses no area, and when no ear can be
-#: found, which means the ring intersects itself; `Polygon.is_simple`
-#: diagnoses that ahead of time.
+#: Raises `ValueError` when no ear is found — the ring self-intersects;
+#: `Polygon.is_simple` diagnoses that ahead of time.
 #:
 #: ```
 #: let square = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(2.0, 2.0), Point2(0.0, 2.0)]
@@ -1378,11 +1203,8 @@ pub fn triangulate(ring: list[Point2]) -> list[tuple[Point2, Point2, Point2]] {
         let next = next_of[current]
         let turn = orientation(working[previous], working[current], working[next])
         if turn == 0 {
-            # Clipping the neighbours has left this vertex in a straight line
-            # between the two that remain. It bounds no area, so unlink it
-            # without emitting anything: a zero-area triangle is not a
-            # triangle, and leaving it in place deadlocks the search — a ring
-            # of collinear leftovers has no ear at all.
+            # Zero-area: unlink without emitting. Leaving it in place would
+            # deadlock the search — a ring of collinear leftovers has no ear.
             next_of[previous] = next
             previous_of[next] = previous
             remaining -= 1
@@ -1413,15 +1235,9 @@ pub fn triangulate(ring: list[Point2]) -> list[tuple[Point2, Point2, Point2]] {
 
 #: Return the two furthest-apart points and the distance between them.
 #:
-#: Rotating calipers over the convex hull. The diameter is always realised by
-#: two hull vertices, and specifically by an antipodal pair — two vertices
-#: with parallel supporting lines. Walking one edge of the hull forward while
-#: advancing the opposite vertex only as far as the triangle area keeps growing
-#: enumerates every antipodal pair in a single loop, so the whole search after
-#: the hull is O(h) rather than the O(h^2) of comparing all pairs.
-#:
-#: Raises `ValueError` for an empty list. Identical points give that point
-#: twice at distance zero.
+#: Rotating calipers over the convex hull: the diameter is always realised by
+#: an antipodal pair of hull vertices, so walking the hull once (O(h)) finds
+#: it without comparing all pairs.
 #:
 #: ```
 #: let cloud = [Point2(0.0, 0.0), Point2(3.0, 0.0), Point2(0.0, 4.0), Point2(1.0, 1.0)]
@@ -1442,8 +1258,7 @@ pub fn diameter(points: list[Point2]) -> tuple[Point2, Point2, float] {
     var opposite = 1
     for index in 0..count {
         let next = (index + 1) % count
-        # Advance the opposite vertex while it keeps moving away from this
-        # edge. The bound only guards against a tie cycling forever.
+        # Advance while still moving away; the bound guards a tie cycling forever.
         var steps = 0
         loop {
             if steps >= count { break }
@@ -1471,20 +1286,9 @@ pub fn diameter(points: list[Point2]) -> tuple[Point2, Point2, float] {
 
 #: Return the smallest circle containing every point.
 #:
-#: Welzl's algorithm in its incremental form. The key fact is that the answer
-#: is fixed by at most three of the points, so the circle is grown one point at
-#: a time and, whenever a point falls outside, rebuilt with that point pinned
-#: to the boundary — recursively, to a depth of three. A point processed after
-#: the circle already contains it costs one distance test, and a random order
-#: makes the expensive rebuild rare enough that the whole thing is O(n)
-#: expected. Processing the points in their given order is what would make it
-#: quadratic, so they are permuted first; the permutation comes from a fixed
-#: internal generator, so the same input always yields the same circle.
-#:
-#: Collinear inputs are handled: with no circumcircle to be had, the two
-#: furthest-apart of the three candidate points define a diametral circle.
-#:
-#: Raises `ValueError` for an empty list.
+#: Welzl's algorithm, incremental, expected O(n). Points are permuted first
+#: with a fixed internal generator — processing them in given order would make
+#: it quadratic, and the fixed seed keeps results reproducible.
 #:
 #: ```
 #: let corners = [Point2(0.0, 0.0), Point2(2.0, 0.0), Point2(2.0, 2.0), Point2(0.0, 2.0)]
@@ -1510,8 +1314,8 @@ pub fn minimum_enclosing_circle(points: list[Point2]) -> Circle {
 
 #: Return the sign of `value`, treating anything near enough to zero as zero.
 #:
-#: `scale` is the magnitude of the terms `value` was formed from, so the
-#: tolerance is absolute near the origin and relative once the products grow.
+#: `scale` is the magnitude of the terms `value` came from — tolerance is
+#: absolute near the origin, relative once the products grow.
 fn _sign_within(value: float, scale: float) -> int {
     let tolerance = EPSILON * (1.0 + scale)
     if value > tolerance { return 1 }
@@ -1534,8 +1338,7 @@ fn _require_ring(ring: list[Point2], function_name: str) -> void {
 
 #: Report whether `p` lies within the bounding box of `a` and `b`.
 #:
-#: Only meaningful once `p` is known to be collinear with them, which is how
-#: every caller uses it.
+#: Only meaningful once `p` is known to be collinear with them.
 fn _within_bounds(a: Point2, b: Point2, p: Point2) -> bool {
     return min(a.x, b.x) - EPSILON <= p.x <= max(a.x, b.x) + EPSILON and
         min(a.y, b.y) - EPSILON <= p.y <= max(a.y, b.y) + EPSILON
@@ -1599,9 +1402,8 @@ fn _push_turning_left(chain: list[Point2], point: Point2) -> void {
 
 #: Return the closest pair among the indices in `by_x`, as (i, j, distance).
 #:
-#: `by_x` and `by_y` hold the same indices ordered by x and by y. `in_left` is
-#: scratch space shared by the whole recursion so that the partition costs one
-#: pass instead of a set lookup per element.
+#: `in_left` is scratch space shared by the whole recursion so partitioning
+#: costs one pass instead of a set lookup per element.
 fn _closest_pair_of(
     points: list[Point2],
     by_x: list[int],
@@ -1640,8 +1442,7 @@ fn _closest_pair_of(
     }
     for i in 0..strip.len() {
         var j = i + 1
-        # The y ordering bounds this inner loop at a constant number of steps:
-        # past `best` in y no pair can improve on `best` in distance.
+        # Past `best` in y, no pair can improve on `best` in distance.
         while j < strip.len() and points[strip[j]].y - points[strip[i]].y < best {
             let gap = points[strip[i]].distance(points[strip[j]])
             if gap < best {
@@ -1657,8 +1458,7 @@ fn _closest_pair_of(
 
 #: Return the closest pair among two or three indices, by direct comparison.
 #:
-#: The base case of the recursion: below four points the divide step cannot
-#: split them usefully, and three comparisons settle it.
+#: The base case: below four points the divide step can't split usefully.
 fn _closest_pair_brute(points: list[Point2], indices: list[int]) -> tuple[int, int, float] {
     var best_a = indices[0]
     var best_b = indices[1]
@@ -1756,9 +1556,8 @@ fn _is_ear(
     if orientation(ring[previous], ring[current], ring[next]) <= 0 { return false }
     var index = next_of[next]
     while index != previous {
-        # Only a reflex vertex can be trapped inside another vertex's ear, and
-        # skipping the convex ones also avoids rejecting an ear because a
-        # neighbouring convex vertex grazes its boundary.
+        # Only a reflex vertex can be trapped in another vertex's ear; skipping
+        # convex ones also avoids a false reject from one grazing the boundary.
         let is_reflex = orientation(ring[previous_of[index]], ring[index], ring[next_of[index]]) < 0
         if is_reflex and _in_triangle(ring[index], ring[previous], ring[current], ring[next]) {
             return false
@@ -1775,8 +1574,8 @@ fn _in_triangle(p: Point2, a: Point2, b: Point2, c: Point2) -> bool {
 
 #: Return where the infinite lines `a`-`b` and `c`-`d` cross.
 #:
-#: The callers only reach this with a crossing that exists: one endpoint of
-#: `c`-`d` is inside the half-plane of `a`-`b` and the other is not.
+#: Callers only reach this when a crossing exists: one endpoint of `c`-`d` is
+#: inside the half-plane of `a`-`b` and the other is not.
 fn _line_crossing(a: Point2, b: Point2, c: Point2, d: Point2) -> Point2 {
     let along = d - c
     let edge = b - a
@@ -1836,11 +1635,9 @@ fn _enclosing_pinning_two(
 
 #: Return the points in a fixed pseudo-random order.
 #:
-#: Fisher-Yates driven by a 31-bit linear congruential generator with the
-#: constants from the C standard. The seed is fixed, so the permutation — and
-#: therefore every circle `minimum_enclosing_circle` returns — is reproducible.
-#: The generator's low bits are notoriously correlated, so the index comes from
-#: the high half of the state.
+#: Fisher-Yates with a 31-bit LCG (C-standard constants) and fixed seed —
+#: reproducible, and the index is taken from the high half of the state since
+#: an LCG's low bits are notoriously correlated.
 fn _pseudo_shuffled(points: list[Point2]) -> list[Point2] {
     let out = points[0:points.len()]
     var state = 20250804

@@ -1,13 +1,9 @@
 #: The Jaithon tokenizer: source text in, `list[Token]` out.
 #:
-#: This is the self-hosted half of the front end described in spec §11. It is
-#: the mirror of `src/lang/lexer.c` and must agree with it token for token:
-#: `make bootstrap` lexes and parses every file under `lib/` and `tests/` with
-#: both front ends and diffs the result.
-#:
-#: The whole input is tokenized up front. Lexical errors are reported into a
-#: `DiagnosticBag` and recovered from locally, so the parser always receives a
-#: well-formed stream terminated by exactly one `TokenKind.Eof`.
+#: Mirrors `src/lang/lexer.c` token-for-token (spec §11); `make bootstrap`
+#: diffs both front ends over `lib/` and `tests/` to enforce it. Lexical
+#: errors recover locally into a shared `DiagnosticBag`, so the parser always
+#: sees a well-formed stream ending in one `TokenKind.Eof`.
 #:
 #: ```
 #: let tokens = Lexer("x = 1").tokenize()
@@ -15,13 +11,6 @@
 #: tokens[0].kind == TokenKind.Ident      # true
 #: tokens[2].value                 # 1
 #: ```
-#:
-#: Positions. `jaithon.ast.Span` holds **byte** offsets, because that is what the C
-#: front end records and what `--emit=ast` prints. The scanner itself walks
-#: Unicode scalars, so `Lexer` keeps a table mapping each scalar index to its
-#: byte offset and converts once, when a span is built. Source arrives here
-#: already decoded, so the invalid-UTF-8 diagnostic (`E0006`) belongs to
-#: whoever read the file, not to this module.
 from jaithon.ast import Span
 from std.str import StringBuilder
 
@@ -79,13 +68,10 @@ pub class TokenFlags {
     pub static let NEG_MAGNITUDE: int = 16
 }
 
-# Bracket-stack markers. Everything except `_BRK_BRACE_BLOCK` suppresses
-# newlines: those brackets opened an expression, and an expression may span
-# lines freely (§1.3). An interpolation pushes `_BRK_INTERP` or-ed with the
-# flavour bits of the string it belongs to, so the `}` that closes it knows how
-# to resume scanning the tail. Keeping that on the bracket stack is what lets a
-# nested f-string inside an interpolation be lexed by the same loop, with no
-# recursion and no second stack.
+# Bracket-stack markers; every kind but `_BRK_BRACE_BLOCK` suppresses newlines
+# (§1.3), since it alone did not open an expression. An interpolation pushes
+# `_BRK_INTERP` or-ed with the string's flavour bits, so a nested f-string
+# lexes on this same stack with no recursion needed.
 const _BRK_PAREN = 1
 const _BRK_BRACKET = 2
 const _BRK_BRACE_BLOCK = 3
@@ -667,11 +653,6 @@ pub fn kind_text(kind: TokenKind) -> str {
 }
 
 #: One token: what it is, where it is, and what it means.
-#:
-#: `text` is the source text the token covers, verbatim. `value` is the cooked
-#: value — an `int` for `Int`, a `float` for `Float`, the unescaped contents for
-#: the four string kinds, and null for everything else, whose meaning is already
-#: in `kind`.
 pub class Token {
     #: What kind of token this is.
     pub let kind: TokenKind
@@ -709,11 +690,8 @@ pub class Token {
     }
 }
 
-# Where a string chunk stopped: at its closing quote, at a `{` that opens an
-# interpolation, or at an error.
 enum _ChunkStop { Closed, Interp, Broken }
 
-# The four bits that describe how a string literal was written.
 class _StrFlavor {
     pub let quote: str
     pub let triple: bool
@@ -735,8 +713,8 @@ class _StrFlavor {
 
 #: The tokenizer.
 #:
-#: Construct one per source file and call `tokenize`. The lexer keeps the token
-#: list, so a second call re-scans from scratch and replaces it.
+#: Construct one per source file; a second call to `tokenize` re-scans from
+#: scratch and replaces the token list.
 pub class Lexer {
     #: The source text, exactly as handed to `init`.
     pub let source: str
@@ -800,9 +778,8 @@ pub class Lexer {
 
         while self.pos < self.length { self._scan_token() }
 
-        # An interpolation still open at end of file means the f-string never
-        # closed. Each one gets an empty `FStringEnd` so that the parser sees a
-        # balanced sequence rather than a truncated one.
+        # An interpolation still open at EOF gets a synthetic empty `FStringEnd`,
+        # so the parser always sees a balanced START/END sequence.
         if self.interp_depth > 0 {
             self._error(
                 Code.E0008_UNTERMINATED_INTERPOLATION,
@@ -913,10 +890,9 @@ pub class Lexer {
         return self.brackets.len() > 0 and self._bracket_top() != _BRK_BRACE_BLOCK
     }
 
-    # `import *` is the one place a `*` ends a statement rather than continuing
-    # an expression. Without this the newline after it is swallowed as an
-    # operator continuation and the next line's `from` is read as the right
-    # operand, so two consecutive `from x import *` lines do not parse.
+    # `import *` is the one place `*` ends a statement, not an expression —
+    # without this, the newline after it is swallowed as an operator
+    # continuation and two consecutive `from x import *` lines fail to parse.
     fn _ends_wildcard_import(self) -> bool {
         let count = self.tokens.len()
         if count < 2 { return false }
@@ -937,11 +913,10 @@ pub class Lexer {
         self.at_line_start = true
     }
 
-    # Decide whether a `{` opens a block or an expression. Ambiguity resolves to
-    # BLOCK: mistaking a block for an expression swallows the newlines that
-    # separate its statements, whereas the reverse only leaves NEWLINE tokens
-    # inside a literal, which the parser skips. So only an unmistakable
-    # expression position opens an expression.
+    # Ambiguity resolves to BLOCK: mistaking a block for an expression swallows
+    # its statement-separating newlines, while the reverse only leaves harmless
+    # NEWLINE tokens the parser skips. So only an unmistakable expression
+    # position opens an expression.
     fn _brace_opens_expression(self) -> bool {
         let previous = self._last_kind()
         if _is_operator(previous) { return true }
@@ -949,12 +924,9 @@ pub class Lexer {
             # `{{` — inherit from the brace we are already inside.
             return self._bracket_top_is_expression()
         }
-        # `?` is deliberately absent, for the same reason it is absent from
-        # `_is_continuation`: it is the optional-type suffix far more often than
-        # anything else, so `fn f() -> int? { ... }` would otherwise open the
-        # function body as an expression brace and swallow the newlines that
-        # separate its statements. Jaithon spells the conditional `if`, so no
-        # `{` ever follows a `?` in expression position.
+        # `?` is deliberately absent (as in `_is_continuation`): it's the
+        # optional-type suffix, so including it would misparse
+        # `fn f() -> int? { ... }` as an expression brace.
         return match previous {
             TokenKind.Comma | TokenKind.Colon | TokenKind.LParen | TokenKind.LBracket => true,
             TokenKind.QuestionQuestion => true,
@@ -1002,9 +974,6 @@ pub class Lexer {
     }
 
     # --- numbers (§1.6) --------------------------------------------------
-
-    # Consume a run of base-`base` digits with `_` separators, returning the
-    # digits alone. Separators may not lead, trail, or double up.
     fn _scan_digits(self, base: int) -> tuple[bool, str] {
         let digits = StringBuilder()
         var previous_underscore = false
@@ -1114,9 +1083,9 @@ pub class Lexer {
         var flags = 0
         if ok {
             value = self._parse_int_text(text, base, start) ?? 0
-            # Only 9223372036854775808 lands on the smallest `int`, whatever the
-            # base, so this recognises the sign-and-magnitude pair for the
-            # parser without re-reading the digits.
+            # Only 9223372036854775808 is the magnitude of the smallest `int`;
+            # recognising the sign+magnitude pair here saves the parser a
+            # second read of the digits.
             if value == _INT_MIN and self._is_negated_literal() {
                 flags = TokenFlags.NEG_MAGNITUDE
             }
@@ -1124,11 +1093,10 @@ pub class Lexer {
         self._push(TokenKind.Int, start, self.pos, value, flags)
     }
 
-    # Decimal literals are signed and must fit in `int`, the one exception being
-    # the magnitude of the smallest `int` under a prefix `-`. Hex, octal and
-    # binary literals are bit patterns, so the whole unsigned range is accepted
-    # and reinterpreted two's complement — which is what the wrapping operators
-    # below produce.
+    # Decimal literals must fit signed `int` (except the smallest int's
+    # magnitude under a prefix `-`); hex/octal/binary are bit patterns, so the
+    # full unsigned range is accepted and reinterpreted two's-complement, as
+    # the wrapping operators below produce.
     fn _parse_int_text(self, digits: str, base: int, start: int) -> int? {
         var first = 0
         while first < digits.len() and digits[first] == "0" { first += 1 }
@@ -1152,12 +1120,10 @@ pub class Lexer {
         return value
     }
 
-    # One past the largest `int` only exists as the operand of a prefix `-`,
-    # where the pair spells the smallest `int`. Deciding this from the preceding
-    # token rather than from whitespace is what keeps `a -1` a subtraction (`a`
-    # ends an operand) and `- x` a negation: the magnitude is admitted only
-    # where a literal could start. A second `-` in front disqualifies it —
-    # `--9223372036854775808` asks for a value that is not an `int`.
+    # The smallest int's magnitude is admitted only right after a prefix `-`,
+    # decided by token kind rather than whitespace — keeping `a -1` a
+    # subtraction, `- x` a negation, and disqualifying `--9223372036854775808`
+    # (not a valid `int`).
     fn _is_negated_literal(self) -> bool {
         let count = self.tokens.len()
         if count == 0 or self.tokens[count - 1].kind != TokenKind.Minus { return false }
@@ -1197,9 +1163,8 @@ pub class Lexer {
         if to_index > from_index { out.push(self.source[from_index:to_index]) }
     }
 
-    # Consume one escape sequence with the cursor on the backslash. Returns
-    # false when the escape was rejected; the backslash is always consumed, so
-    # the caller still makes progress.
+    # Returns false when the escape was rejected; the backslash is always
+    # consumed regardless, so the caller still makes progress.
     fn _scan_escape(self, out: StringBuilder) -> bool {
         let escape_start = self.pos
         self.pos += 1
@@ -1209,9 +1174,8 @@ pub class Lexer {
 
         if character == "x" { return self._scan_hex_escape(out, escape_start) }
         if character == "u" { return self._scan_unicode_escape(out, escape_start) }
-        # Membership, not the cooked string's length: `\0` cooks to a string
-        # whose only scalar is NUL, and asking for its length is asking the
-        # wrong question — an escape is known because it is in the table.
+        # Checked by membership, not the cooked string's length: `\0` cooks to
+        # a NUL-only string, so length would ask the wrong question.
         if character in _SIMPLE_ESCAPES {
             out.push(_SIMPLE_ESCAPES[character])
             return true
@@ -1292,8 +1256,6 @@ pub class Lexer {
         return true
     }
 
-    # Cook characters up to the closing delimiter or, in an f-string, up to the
-    # `{` that opens an interpolation, which is consumed.
     fn _scan_string_chunk(
         self,
         flavor: _StrFlavor,
@@ -1420,7 +1382,6 @@ pub class Lexer {
         self._push(kind, at, at, "")
     }
 
-    # Scan the tail of an f-string after the `}` that closed an interpolation.
     fn _resume_fstring(self, flavor: _StrFlavor, token_start: int) -> void {
         let out = StringBuilder()
         let (stop, saw_escape) = self._scan_string_chunk(flavor, out, token_start)
@@ -1455,9 +1416,9 @@ pub class Lexer {
         }
     }
 
-    # A `:` at the top level of an interpolation introduces a format spec
-    # (§1.7). The spec is data, not Jaithon source — `.2f` would not lex as a
-    # number — so it is captured whole as one string token for `std.fmt`.
+    # A `:` at an interpolation's top level starts a format spec (§1.7): it's
+    # data, not Jaithon source (`.2f` would not lex as a number), so it's
+    # captured whole as one string token for `std.fmt`.
     fn _scan_format_spec(self) -> void {
         let start = self.pos
         var depth = 0
@@ -1525,8 +1486,6 @@ pub class Lexer {
         self._push(kind, start, self.pos)
     }
 
-    # The tokens a statement can begin after; the one position where a label may
-    # be declared.
     fn _at_statement_start(self) -> bool {
         return match self._last_kind() {
             TokenKind.Eof | TokenKind.Newline | TokenKind.Semicolon => true,
@@ -1535,11 +1494,10 @@ pub class Lexer {
         }
     }
 
-    # `'name` is a loop label and `'text'` is a string, and the grammar is what
-    # tells them apart: a label is only ever declared as `'name:` at the start of
-    # a statement, or used right after `break` or `continue`. Everything else
-    # that starts with a quote is a string — including `'single quotes'`, whose
-    # first word would otherwise read as a label.
+    # `'name` is a label, `'text'` a string; the grammar decides: a label is
+    # only declared as `'name:` at a statement start, or used after
+    # `break`/`continue` — everything else starting with `'` is a string, so
+    # `'single quotes'` isn't misread as a label.
     fn _scan_quote_or_label(self) -> void {
         let start = self.pos
         let after = start + 1
@@ -1570,9 +1528,9 @@ pub class Lexer {
 
     # --- punctuation and operators ---------------------------------------
 
-    # Pop only on a match: a stray closer is the parser's problem (E0107), and
-    # popping blindly would corrupt the newline state of every enclosing
-    # bracket.
+    # Pop only on a match — a stray closer is the parser's problem (E0107);
+    # popping blindly would corrupt the newline-suppression state of
+    # enclosing brackets.
     fn _pop_bracket(self, expected: int) -> void {
         if self.brackets.len() > 0 and self._bracket_top() == expected {
             self.brackets.pop()
@@ -1588,10 +1546,8 @@ pub class Lexer {
 
     fn _close_brace(self, start: int) -> void {
         if self._bracket_top_is_interp() {
-            # Closes an interpolation: no token, the f-string tail resumes.
-            # `f"{}"` has to be caught here — it produces the same token shape as
-            # an f-string with no interpolation at all, so the parser could never
-            # tell the two apart.
+            # Closes an interpolation (no token emitted); `f"{}"` must be caught
+            # here since it's otherwise indistinguishable from no interpolation.
             let last = self._last_kind()
             if last == TokenKind.FStringStart or last == TokenKind.FStringMid {
                 self._error(
@@ -1872,8 +1828,8 @@ fn _base_of(prefix: str) -> int {
     return 0
 }
 
-# Whether `digits`, with leading zeros already stripped, denotes a value the
-# 64-bit `int` can hold.
+# Assumes `digits`' leading zeros are already stripped: length alone decides
+# whether it fits the 64-bit `int`.
 fn _fits_in_int(digits: str, base: int, negated: bool) -> bool {
     let count = digits.len()
     if base == 16 { return count <= 16 }
@@ -1901,12 +1857,9 @@ fn _is_unicode_space(code: int) -> bool {
     return code == 0x2028 or code == 0x2029 or code == 0x202F or code == 0x205F
 }
 
-# Pragmatic approximation of XID_Start/XID_Continue (§1.4): any scalar >= 0x80 is
-# an identifier character unless it is space-like or lives in the General
-# Punctuation block. Real XID tables are ten kilobytes of data and buy nothing
-# the compiler needs; this accepts a superset that is stable across Unicode
-# versions and still rejects the confusable spaces and the smart quotes that
-# people paste in by accident.
+# Approximates XID_Start/XID_Continue (§1.4) rather than using real XID
+# tables (~10KB, unneeded here): accepts any scalar >= 0x80 except space-like
+# and General Punctuation ranges, still rejecting pasted-in smart quotes.
 fn _is_unicode_ident(code: int) -> bool {
     if code < 0x80 { return false }
     if _is_unicode_space(code) { return false }
@@ -1932,12 +1885,10 @@ fn _is_operator(kind: TokenKind) -> bool {
     }
 }
 
-# Tokens after which a line break cannot end a statement. This is the list in
-# §1.3 plus the wrapping operators, `..`, `..=`, and `{`. Suppressing the newline
-# directly after `{` costs nothing for a block — the grammar already allows
-# `"{" { NEWLINE }` — and it keeps multi-line dict and set literals working even
-# when the brace was classified as a block. `?` is deliberately absent: a
-# declaration such as `let x: int?` ends a statement with it.
+# Tokens after which a newline can't end a statement: §1.3's list plus `..`,
+# `..=`, and `{` (harmless for blocks, since the grammar already allows
+# `"{" { NEWLINE }`, and it keeps multi-line dict/set literals working). `?`
+# is deliberately absent — `let x: int?` ends a statement with it.
 fn _is_continuation(kind: TokenKind) -> bool {
     if _is_operator(kind) { return true }
     return match kind {
@@ -1951,8 +1902,6 @@ fn _is_continuation(kind: TokenKind) -> bool {
     }
 }
 
-# Whether a token can be the end of an operand. Used to tell a prefix `-` from a
-# subtraction.
 fn _ends_operand(kind: TokenKind) -> bool {
     return match kind {
         TokenKind.Ident | TokenKind.Int | TokenKind.Float | TokenKind.Str => true,
@@ -1988,9 +1937,8 @@ fn _string_noun(flavor: _StrFlavor) -> str {
 
 #: The token stream of `source`, in the format `jaithon tokens` prints.
 #:
-#: One line per token: index, kind name, line:column, then the text it was
-#: written as. A token with no text of its own prints the kind's display form,
-#: so end of file reads as `<end of file>` rather than as nothing.
+#: A token with no text of its own prints the kind's display form, so end of
+#: file reads as `<end of file>` rather than as nothing.
 #:
 #: ```
 #: dump_tokens("x\n").split("\n")[0].contains("TOK_IDENT")     # true

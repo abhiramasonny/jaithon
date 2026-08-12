@@ -1,16 +1,9 @@
 #: The command-line convention every `jaithon` subcommand obeys.
 #:
-#: There is one rule, and both sides of the CLI boundary keep it: an option
-#: that takes a value accepts `--name value` and `--name=value`, and the C
-#: driver forwards what the user typed without rewriting it. The driver cannot
-#: know which of a tool's flags take a value — it does not own their option
-#: tables — so it forwards every argument after the subcommand verbatim and in
-#: order, and the tool, which does know, pairs the flags with their values
-#: here. Before this existed the driver rewrote `--out DIR` into `--out=DIR`
-#: and `jaithon.tool.doc` rejected its own documented spelling.
-#:
-#: A tool's option table is then a loop over `Arguments`, and a usage error is
-#: whatever the cursor recorded:
+#: The C driver forwards every argument verbatim — it doesn't own a tool's
+#: option table and can't tell which flags take a value — and the tool pairs
+#: flags with values here. (Previously the driver rewrote `--out DIR` to
+#: `--out=DIR`, breaking `jaithon.tool.doc`'s documented spelling.)
 #:
 #: ```
 #: let reader = Arguments(["--out", "docs/api", "--html", "lib"])
@@ -23,11 +16,8 @@
 
 #: One command-line argument, split into the parts an option table needs.
 #:
-#: `text` is exactly what the user typed. `name` is the option it names —
-#: `--out` for both `--out docs` and `--out=docs` — or the empty string when
-#: the argument is a path. `value` is the part after the `=`, and null when the
-#: argument did not use that form, which is not the same as the empty value
-#: `--out=` gives.
+#: `value` is null when `=` wasn't used, which is not the same as the empty
+#: value `--out=` gives.
 #:
 #: ```
 #: Argument("--out=docs").name       # "--out"
@@ -49,8 +39,7 @@ pub class Argument {
     pub fn init(self, text: str) {
         var name = ""
         var value: str? = null
-        # `-` is a path (stdin, by convention) and `--` an end-of-options
-        # marker the caller handles; neither names an option.
+        # `-` (stdin) and `--` (end-of-options) are conventions, not option names.
         if text.starts_with("-") and text != "-" and text != "--" {
             let equals = text.find("=")
             if equals < 0 {
@@ -76,9 +65,8 @@ pub class Argument {
 
 #: A cursor over an argument list that understands both option spellings.
 #:
-#: The cursor also carries the first usage error it saw, so an option table can
-#: run to the end of the line and report once, and callers never have to invent
-#: the same message twice.
+#: It remembers the first usage error, so an option table can scan to the end
+#: of the line and report once instead of per-flag.
 #:
 #: ```
 #: let reader = Arguments(["--filter=slow", "tests"])
@@ -113,20 +101,16 @@ pub class Arguments {
 
     #: The value belonging to `argument`: its `=` part, or the next word.
     #:
-    #: Returns null and records the usage error when there is no value, or when
-    #: the next word is itself an option — `--filter --verbose` is a forgotten
-    #: value far more often than it is a search for the text `--verbose`, which
-    #: `--filter=--verbose` still expresses.
+    #: A following option-looking word counts as a missing value, not a value
+    #: — use `--filter=--verbose` to search for that literal text.
     #:
     #: ```
     #: let reader = Arguments(["--out", "docs"])
     #: reader.value_of(reader.next())    # "docs"
     #: ```
     pub fn value_of(self, argument: Argument?) -> str? {
-        #  `next()` answers `Argument?`, and the documented spelling of this
-        #  call is `reader.value_of(reader.next())`, so the optional is the
-        #  parameter type. There is nothing to find a value for once the
-        #  arguments are exhausted, and no option name to name in an error.
+        # Takes `Argument?` because the documented call is `value_of(next())`;
+        # nothing to look up once the args are exhausted.
         if argument is null { return null }
         let inline = argument.value
         if inline is not null { return inline }
@@ -141,9 +125,8 @@ pub class Arguments {
 
     #: Accept `argument` as an option that takes no value.
     #:
-    #: Returns false and records the usage error when a value was attached, so
-    #: that `--html=yes` is a mistake the user hears about rather than a flag
-    #: that quietly does nothing.
+    #: Fails if a value was attached, so `--html=yes` errors instead of
+    #: silently doing nothing.
     #:
     #: ```
     #: let reader = Arguments([])

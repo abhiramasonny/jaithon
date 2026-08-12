@@ -1,18 +1,12 @@
 #: Elementary mathematics: constants, the floating-point functions built on the
 #: `f64` primitive surface, and the integer helpers that belong beside them.
 #:
-#: What is not a hardware primitive is derived here in a form chosen to stay
-#: accurate where the naive algebra cancels: `expm1` and `log1p` carry the
-#: small-argument cases, `hypot` scales before squaring, `cbrt` takes a Newton
-#: step to recover the bits an inexact exponent loses.
+#: Non-primitive functions (`expm1`, `log1p`, `hypot`, `cbrt`, ...) are derived
+#: in a form chosen to stay accurate where the naive algebra cancels.
 #:
-#: Domain errors raise `ValueError`; they never return NaN. A NaN handed back
-#: from `sqrt(-1.0)` is a silent wrong answer: it flows through every later
-#: operation unremarked and surfaces as an unexplained NaN in some result, by
-#: which point the call that produced it is long gone from the stack. An
-#: exception names the function, the argument and the line. NaN *propagation* is
-#: a separate matter and is preserved everywhere: pass a NaN in and a NaN comes
-#: back, since that NaN already records an earlier diagnosis.
+#: Domain errors raise `ValueError` rather than return NaN — a NaN return is a
+#: silent wrong answer that surfaces untraceably far from its cause. NaN
+#: *propagation* is still preserved: a NaN in still yields a NaN out.
 
 #: The ratio of a circle's circumference to its diameter.
 pub const PI: float = 3.141592653589793
@@ -37,9 +31,8 @@ pub const LN_10: float = 2.302585092994046
 
 #: The difference between 1.0 and the next larger float, `2 ** -52`.
 #:
-#: This is the resolution of the format near 1.0, not an all-purpose tolerance:
-#: near 1e9 the gap between neighbouring floats is already 1.2e-7. Compare with
-#: `approx_eq`, not with a bare `EPSILON`.
+#: Resolution near 1.0 only — near 1e9 the float gap is already 1.2e-7. Use
+#: `approx_eq`, not a bare `EPSILON`, as a general tolerance.
 pub const EPSILON: float = 2.220446049250313e-16
 
 #: The largest representable `int`, `2 ** 63 - 1`.
@@ -47,16 +40,14 @@ pub const INT_MAX: int = 9223372036854775807
 
 #: The smallest representable `int`, `-(2 ** 63)`.
 #:
-#: `-9223372036854775808` is a single literal (spec §1.6): the magnitude is one
-#: past `INT_MAX` and is only accepted behind the `-`, which is why negating
-#: this constant raises `OverflowError`.
+#: `-9223372036854775808` is a single literal (spec §1.6): the magnitude only
+#: parses behind `-`, so negating this constant raises `OverflowError`.
 pub const INT_MIN: int = (-9223372036854775808)
 
 #: Positive infinity.
 #:
-#: Produced by overflowing the float range because the decimal grammar has no
-#: literal for it. IEEE-754 defines the overflow of a finite product as
-#: infinity, so this is exact rather than a large finite stand-in.
+#: No literal exists for it; IEEE-754 defines overflow of a finite product as
+#: exact infinity, not a large finite stand-in.
 pub let INF: float = 1e308 * 10.0
 
 #: A quiet not-a-number.
@@ -78,18 +69,10 @@ pub fn is_finite(x: float) -> bool { return not is_nan(x) and not is_inf(x) }
 #: Report whether `a` and `b` agree to within an absolute or a relative
 #: tolerance.
 #:
-#: Binary floating point cannot represent most decimal fractions — 0.1 is stored
-#: as 0.1000000000000000055511151231257827 — and every operation rounds its
-#: result to 53 significant bits. Those errors accumulate, so two values a
-#: derivation says are identical usually differ in the last few bits. `==`
-#: reports that as inequality: `0.1 + 0.2 == 0.3` is false. It is almost never
-#: the question the caller meant to ask.
-#:
-#: The absolute tolerance is what makes comparisons near zero work, where a
-#: relative tolerance shrinks to nothing; the relative tolerance is what makes
-#: comparisons of large values work, where one ulp already exceeds any fixed
-#: absolute bound. Values are close when *either* holds. Infinities are close
-#: only to themselves, and a NaN is close to nothing, itself included.
+#: Floating rounding error makes `==` unreliable (`0.1 + 0.2 == 0.3` is false).
+#: Absolute tolerance covers values near zero, where relative tolerance vanishes;
+#: relative tolerance covers large values, where one ulp exceeds any fixed bound.
+#: Close when *either* holds; infinities are close only to themselves, NaN to nothing.
 #:
 #: ```
 #: approx_eq(0.1 + 0.2, 0.3)                              # true
@@ -140,8 +123,7 @@ pub fn abs(n: int) -> int {
 
 #: Return -1.0, 0.0 or 1.0 according to the sign of `x`.
 #:
-#: A zero is returned unchanged so that it keeps its sign, and a NaN maps to NaN
-#: rather than to an arbitrary direction.
+#: A zero keeps its sign; a NaN maps to NaN rather than an arbitrary direction.
 #:
 #: ```
 #: sign(-4.5)   # -1.0
@@ -156,9 +138,8 @@ pub fn sign(x: float) -> float {
 
 #: Return `magnitude` carrying the sign of `sign_source`.
 #:
-#: The sign of a zero is respected, which is the reason this exists: `-0.0 <
-#: 0.0` is false, so no comparison can recover it. A NaN source counts as
-#: positive.
+#: The sign of a zero is respected — the reason this exists, since `-0.0 < 0.0`
+#: is false and no comparison can recover it. A NaN source counts as positive.
 #:
 #: ```
 #: copysign(3.0, -0.0)   # -3.0
@@ -173,8 +154,8 @@ pub fn copysign(magnitude: float, sign_source: float) -> float {
 
 #: Return the largest integral float not greater than `x`.
 #:
-#: The result is a float, since `floor(1e30)` has no int representation. Write
-#: `int(floor(x))` when the value is known to fit.
+#: Result is a float — `floor(1e30)` has no int representation. Write
+#: `int(floor(x))` when it's known to fit.
 pub fn floor(x: float) -> float { return __prim__.f64_floor(x) }
 
 #: Return the smallest integral float not less than `x`.
@@ -193,9 +174,8 @@ pub fn round(x: float) -> float { return __prim__.f64_round(x) }
 
 #: Return `x` rounded to `digits` places after the decimal point.
 #:
-#: A negative `digits` rounds to the left of the point. The decision follows the
-#: value actually stored, not the literal that was typed: 1.005 is held as
-#: 1.00499999999999989, so it rounds down.
+#: Negative `digits` rounds left of the point. Follows the value actually
+#: stored, not the literal typed — `1.005` is held as `1.00499999999999989`.
 #:
 #: ```
 #: round_to(3.14159, 2)   # 3.14
@@ -210,7 +190,7 @@ pub fn round_to(x: float, digits: int) -> float {
     if digits == 0 { return round(x) }
     let scale = 10.0 ** digits
     let scaled = x * scale
-    # Scaling out of range cannot change the answer: `x` already holds fewer
+    # Out-of-range scaling can't change the answer: `x` already holds fewer
     # significant digits than the request asks to keep.
     if not is_finite(scaled) { return x }
     return round(scaled) / scale
@@ -218,9 +198,8 @@ pub fn round_to(x: float, digits: int) -> float {
 
 #: Return the fractional part of `x` with its sign, `x - trunc(x)`.
 #:
-#: The signed fraction, not the periodic one: `fract(-1.25)` is -0.25, where the
-#: graphics convention `x - floor(x)` gives 0.75. An infinity yields a zero of
-#: the same sign, matching `modf`.
+#: Signed fraction, not the periodic one: `fract(-1.25)` is -0.25, unlike the
+#: graphics convention `x - floor(x)` (0.75). Infinity yields a signed zero, matching `modf`.
 #:
 #: ```
 #: fract(2.75)    # 0.75
@@ -295,11 +274,9 @@ pub fn exp2(x: float) -> float { return 2.0 ** x }
 
 #: Return `exp(x) - 1.0` without losing precision for small `x`.
 #:
-#: Near zero `exp(x)` is near 1.0 and the subtraction cancels almost every
-#: significant bit — `exp(1e-12) - 1.0` keeps about four correct digits. Kahan's
-#: identity `(u - 1) * (x / ln(u))` restores them, the two errors being the same
-#: relative size. The grouping matters: `(u - 1) * x` overflows above `x == 700`
-#: where the answer is still finite.
+#: Near zero, `exp(x) - 1.0` cancels almost every significant bit. Kahan's
+#: identity `(u - 1) * (x / ln(u))` restores them. Grouping matters: `(u - 1) * x`
+#: overflows above `x == 700` where the answer is still finite.
 #:
 #: ```
 #: approx_eq(expm1(1e-12), 1e-12)   # true
@@ -315,9 +292,8 @@ pub fn expm1(x: float) -> float {
 
 #: Return the Euclidean length `sqrt(x*x + y*y)` without intermediate overflow.
 #:
-#: Squaring first destroys the answer at both ends of the range: `x*x` overflows
-#: above 1.3e154 and falls subnormal below 1.5e-154, while the length itself is
-#: still perfectly representable. Factoring out the larger magnitude avoids it.
+#: Squaring first overflows above `x*x ~ 1.3e154` and goes subnormal below
+#: `1.5e-154`, even where the length itself is representable. Factoring out the larger magnitude avoids both.
 #:
 #: ```
 #: hypot(3.0, 4.0)                         # 5.0
@@ -363,10 +339,8 @@ pub fn log2(x: float) -> float {
     if x < 0.0 { throw ValueError(f"log2 is undefined for a negative argument, got {x}") }
     if x == 0.0 { throw ValueError("log2(0.0) is undefined; the limit is -inf") }
     if is_inf(x) { return x }
-    # Near 1.0 the exponent path cancels catastrophically: frexp returns a
-    # mantissa just under 1.0 and `1 + ln(m) / LN_2` subtracts two values that
-    # agree to fifteen digits, costing all of them. On [0.5, 2.0] the difference
-    # x - 1.0 is exact (Sterbenz), so log1p keeps every bit.
+    # Near 1.0 the exponent path cancels catastrophically (frexp's mantissa is
+    # just under 1.0). On [0.5, 2.0], x - 1.0 is exact (Sterbenz), so log1p keeps every bit.
     if x > 0.5 and x < 2.0 { return log1p(x - 1.0) / LN_2 }
     let (mantissa, exponent) = frexp(x)
     return exponent + ln(mantissa) / LN_2
@@ -383,9 +357,8 @@ pub fn log10(x: float) -> float {
     if x == 0.0 { throw ValueError("log10(0.0) is undefined; the limit is -inf") }
     if is_inf(x) { return x }
     let approximate = ln(x) / LN_10
-    # Two roundings leave exact powers of ten just short of the integer they
-    # belong on, and a decimal exponent is what callers of log10 read back as an
-    # int. Snap, but only when the input really is that power of ten.
+    # Two roundings leave exact powers of ten just short of their integer;
+    # snap back, but only when the input really is that power of ten.
     let nearest = round(approximate)
     if fabs(approximate - nearest) < 1e-10 and _is_power_of_ten(x, nearest) {
         return nearest
@@ -395,9 +368,8 @@ pub fn log10(x: float) -> float {
 
 #: Return `ln(1.0 + x)` without losing precision for small `x`.
 #:
-#: `1.0 + x` discards every bit of `x` below the 53rd, so the naive form returns
-#: 0.0 under 1e-16 and few correct digits just above. The identity
-#: `ln(u) * x / (u - 1)` computes the ratio where the bits still exist.
+#: `1.0 + x` discards bits of `x` below the 53rd, so the naive form returns 0.0
+#: under 1e-16. `ln(u) * x / (u - 1)` computes the ratio where the bits still exist.
 #:
 #: Raises `ValueError` for `x <= -1.0`.
 pub fn log1p(x: float) -> float {
@@ -445,9 +417,8 @@ pub fn cos(x: float) -> float {
 
 #: Return the tangent of `x` radians.
 #:
-#: No argument is exactly an odd multiple of pi/2 — `PI` is only the nearest
-#: float to pi — so the poles are unreachable and the result near them is merely
-#: very large.
+#: No argument is exactly an odd multiple of pi/2 (`PI` is only the nearest
+#: float to pi), so the poles are unreachable; near them the result is merely very large.
 pub fn tan(x: float) -> float {
     _require_finite(x, "tan")
     return __prim__.f64_tan(x)
@@ -524,8 +495,7 @@ pub fn cosh(x: float) -> float {
 pub fn tanh(x: float) -> float {
     if x == 0.0 or is_nan(x) { return x }
     let magnitude = fabs(x)
-    # Past 20 the distance from 1.0 is below one ulp of 1.0, and the exponential
-    # would only underflow.
+    # Past 20 the distance from 1.0 is below one ulp; the exponential would only underflow.
     if magnitude > 20.0 { return copysign(1.0, x) }
     let u = expm1(-2.0 * magnitude)
     return copysign(-u / (u + 2.0), x)
@@ -535,8 +505,7 @@ pub fn tanh(x: float) -> float {
 pub fn asinh(x: float) -> float {
     if x == 0.0 or not is_finite(x) { return x }
     let magnitude = fabs(x)
-    # Beyond this the square would overflow, and asinh has already collapsed
-    # into ln(2x) to well within a rounding.
+    # Beyond this the square would overflow; asinh has already collapsed into ln(2x) within a rounding.
     if magnitude > 1e150 { return copysign(ln(magnitude) + LN_2, x) }
     let square = magnitude * magnitude
     if magnitude < 1.0 {
@@ -554,8 +523,7 @@ pub fn acosh(x: float) -> float {
     if is_inf(x) { return x }
     if x > 1e150 { return ln(x) + LN_2 }
     let offset = x - 1.0
-    # As x approaches 1 the argument of the logarithm approaches 1 and cancels;
-    # written in terms of the offset the same expression keeps its bits.
+    # Near x == 1 the log argument approaches 1 and cancels; written via the offset, the expression keeps its bits.
     if offset < 0.5 { return log1p(offset + sqrt(offset * offset + 2.0 * offset)) }
     return ln(x + sqrt(x * x - 1.0))
 }
@@ -595,9 +563,8 @@ pub fn clamp(value: float, low: float, high: float) -> float {
 
 #: Return the point `t` of the way from `a` to `b`.
 #:
-#: The endpoints are exact. `a + t * (b - a)` at `t == 1.0` can land a rounding
-#: short of `b`, which breaks animations and range maps that must finish where
-#: they were told to. A `t` outside `[0.0, 1.0]` extrapolates.
+#: Endpoints are exact: `a + t * (b - a)` at `t == 1.0` can round short of `b`,
+#: breaking animations that must land exactly. `t` outside `[0.0, 1.0]` extrapolates.
 #:
 #: ```
 #: lerp(0.0, 10.0, 0.25)   # 2.5
@@ -736,9 +703,8 @@ pub fn lcm(a: int, b: int) -> int {
 
 #: Return the largest int `r` with `r * r <= n`.
 #:
-#: Exact for every non-negative int, including those above 2**53 where the float
-#: estimate `int(sqrt(float(n)))` is off by one. Raises `ValueError` for a
-#: negative `n`.
+#: Exact for every non-negative int, including above 2**53 where the float
+#: estimate `int(sqrt(float(n)))` is off by one. Raises `ValueError` for negative `n`.
 #:
 #: ```
 #: isqrt(17)   # 4
@@ -749,8 +715,7 @@ pub fn isqrt(n: int) -> int {
     if n == 0 { return 0 }
     var root = int(floor(sqrt(float(n))))
     if root < 1 { root = 1 }
-    # These divide rather than square: root * root overflows near INT_MAX, and
-    # the float estimate can start on either side of the answer.
+    # Divides rather than squares: root * root overflows near INT_MAX, and the float estimate can start on either side.
     while root > n // root { root -= 1 }
     while root + 1 <= n // (root + 1) { root += 1 }
     return root
@@ -803,9 +768,8 @@ pub fn permutations(n: int, k: int) -> int {
 #: coefficient.
 #:
 #: Every intermediate is itself a binomial coefficient no larger than the
-#: answer, so any result that fits is computed — where the textbook
-#: `n! / (k! * (n-k)!)` overflows from `n == 21` upwards for answers as small as
-#: 21. Zero when `k > n`.
+#: answer, unlike the textbook `n! / (k! * (n-k)!)`, which overflows from
+#: `n == 21` up. Zero when `k > n`.
 #:
 #: ```
 #: combinations(5, 2)     # 10
@@ -820,9 +784,8 @@ pub fn combinations(n: int, k: int) -> int {
     var result = 1
     for i in 0..steps {
         let divisor = i + 1
-        # result * (n - i) is divisible by divisor, but result alone need not
-        # be. Cancelling the shared factor first keeps the step exact and holds
-        # the running value at C(n, i + 1) rather than that times divisor.
+        # result * (n - i) divides evenly by divisor, but result alone need not;
+        # cancel the shared factor first to keep the step exact.
         let common = gcd(result, divisor)
         let reduced_result = result // common
         let factor = (n - i) // (divisor // common)
@@ -864,8 +827,7 @@ pub fn next_power_of_two(n: int) -> int {
 #: bit_count(-1)    # 64
 #: ```
 pub fn bit_count(n: int) -> int {
-    # The sign bit is counted separately: left in, it would make the first
-    # subtraction below overflow for INT_MIN.
+    # Sign bit counted separately: left in, the first subtraction below would overflow for INT_MIN.
     let sign_bit = if n < 0 { 1 } else { 0 }
     var x = n & INT_MAX
     x = x - (x >> 1 & 0x5555555555555555)
@@ -955,8 +917,7 @@ pub fn checked_sub(a: int, b: int) -> int? {
 pub fn checked_mul(a: int, b: int) -> int? {
     if a == 0 or b == 0 { return 0 }
     if a == INT_MIN or b == INT_MIN {
-        # 2**63 has no positive counterpart, so the only product that survives
-        # is INT_MIN itself.
+        # 2**63 has no positive counterpart; the only surviving product is INT_MIN itself.
         if a == 1 or b == 1 { return INT_MIN }
         return null
     }
@@ -969,8 +930,7 @@ pub fn checked_mul(a: int, b: int) -> int? {
         if negative { return -magnitude }
         return magnitude
     }
-    # One magnitude overshoots INT_MAX and is still representable: exactly
-    # 2**63, which is INT_MIN when the signs disagree.
+    # One magnitude overshoots INT_MAX yet is representable: exactly 2**63, i.e. INT_MIN when signs disagree.
     if negative and x == quotient + 1 and INT_MAX % y == y - 1 { return INT_MIN }
     return null
 }
@@ -979,10 +939,9 @@ pub fn checked_mul(a: int, b: int) -> int? {
 
 #: Return the arithmetic mean of `values`.
 #:
-#: Summed with Neumaier compensation, which carries the low-order bits each
-#: addition rounds away. A plain running total loses them, and loses everything
-#: when one large value precedes small ones: `[1e16, 1.0, 1.0]` totals 1e16
-#: naively and 1.0000000000000002e16 here.
+#: Summed with Neumaier compensation, which recovers the low-order bits a plain
+#: running total loses — `[1e16, 1.0, 1.0]` totals 1e16 naively,
+#: 1.0000000000000002e16 here.
 #:
 #: Raises `ValueError` for an empty list, which has no mean.
 #:
@@ -1001,17 +960,15 @@ fn _signbit(x: float) -> bool {
     if x < 0.0 { return true }
     if x > 0.0 { return false }
     if is_nan(x) { return false }
-    # The zeros compare equal, so the sign must come from a function that looks
-    # at it: IEEE-754 fixes atan2(0.0, -0.0) at PI and atan2(0.0, 0.0) at 0.0.
+    # Zeros compare equal; IEEE-754 fixes atan2(0.0,-0.0) at PI, atan2(0.0,0.0) at 0.0, so it can distinguish them.
     return atan2(0.0, x) > 0.0
 }
 
 #: Return `exp(magnitude) / 2.0` for a magnitude past the range of `exp`.
 #:
-#: `exp` overflows at 709.78 but sinh and cosh stay finite to 710.48, so their
-#: last stretch is unreachable through a single `exp`. Squaring `exp(m / 2)`
-#: with the halving between the factors keeps every intermediate in range; past
-#: 710.48 the product overflows to infinity, which is the answer there.
+#: `exp` overflows at 709.78 but sinh/cosh stay finite to 710.48; squaring
+#: `exp(m / 2)` keeps every intermediate in range (overflowing to infinity
+#: past 710.48, which is correct there).
 fn _exp_over_two(magnitude: float) -> float {
     let half = exp(magnitude * 0.5)
     return 0.5 * half * half
@@ -1026,8 +983,7 @@ fn _require_finite(x: float, function_name: str) -> void {
 
 #: Report whether `x` is exactly ten raised to the integral float `exponent`.
 fn _is_power_of_ten(x: float, exponent: float) -> bool {
-    # Past 1e22 the powers of ten are no longer exactly representable, so no
-    # comparison against one can be trusted.
+    # Past 1e22, powers of ten are no longer exactly representable, so no comparison against one can be trusted.
     if fabs(exponent) > 22.0 { return false }
     return 10.0 ** exponent == x
 }
@@ -1038,8 +994,7 @@ fn _compensated_sum(values: list[float]) -> float {
     var compensation = 0.0
     for value in values {
         let partial = total + value
-        # The larger operand keeps its bits; the smaller is where the rounding
-        # went, so the lost part is recovered from it.
+        # Larger operand keeps its bits; the smaller is where rounding went, so the lost part is recovered from it.
         if fabs(total) >= fabs(value) {
             compensation += total - partial + value
         } else {
