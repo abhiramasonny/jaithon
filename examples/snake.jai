@@ -5,7 +5,8 @@
 #:
 #:     jaithon run examples/snake.jai
 from std.gui import Window
-from std.gui.canvas import Canvas, rgb
+from std.gui.canvas import Canvas
+from std.gui.color import rgb
 from std.gui.input import Input, Key
 from std.collections import Deque
 from std.random import Random

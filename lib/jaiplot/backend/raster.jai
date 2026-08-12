@@ -16,7 +16,10 @@
 #: image.width()      # 120
 #: ```
 import std.math
-from std.gui.canvas import Canvas, Cap, Image, Join, Path, Winding, rgb
+from std.gui.canvas import Canvas
+from std.gui.color import rgb
+from std.gui.image import Image
+from std.gui.path import Cap, Join, Path, Winding
 
 from ..geom import Point, Rect, pose_outline
 from ..metrics import text_height, text_width

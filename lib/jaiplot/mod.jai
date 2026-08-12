@@ -13,7 +13,8 @@
 #: save(figure, "/tmp/first.svg")
 #: ```
 import std.io
-from std.gui.canvas import Image, blue_of, green_of, red_of
+from std.gui.color import blue_of, green_of, red_of
+from std.gui.image import Image
 
 from .axes import Axes
 from .backend import encode, render_image, to_svg

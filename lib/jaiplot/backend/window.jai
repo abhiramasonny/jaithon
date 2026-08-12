@@ -18,7 +18,9 @@
 import std.io
 import std.math
 from std.gui import Window
-from std.gui.canvas import Canvas, Image, rgb
+from std.gui.canvas import Canvas
+from std.gui.color import rgb
+from std.gui.image import Image
 from std.gui.input import Input, Key, MouseButton
 
 from ..axes import Axes

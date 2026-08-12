@@ -19,10 +19,10 @@
 from .geom import Point, Rect
 from .style import HorizontalAnchor, TextStyle, VerticalAnchor
 
-#: Width of one glyph cell, matching `std.gui.canvas.GLYPH_WIDTH`.
+#: Width of one glyph cell, matching `std.gui.font.GLYPH_WIDTH`.
 pub const GLYPH_WIDTH = 5
 
-#: Height of one glyph cell, matching `std.gui.canvas.GLYPH_HEIGHT`.
+#: Height of one glyph cell, matching `std.gui.font.GLYPH_HEIGHT`.
 pub const GLYPH_HEIGHT = 7
 
 #: Blank columns between two glyphs, so one character advances six pixels.

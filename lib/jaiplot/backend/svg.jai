@@ -9,7 +9,7 @@
 import std.math
 from std.algo.strings import base64_encode
 from std.fmt import format
-from std.gui.canvas import Image
+from std.gui.image import Image
 
 from ..geom import Point, Rect, pose_outline
 from ..metrics import text_height
