@@ -1,10 +1,36 @@
 #: Statements, control flow, and the narrowing a branch is allowed to keep.
 #:
-#: A port of `src/sema/check_stmt.c`. **Narrowing is scoped**: a fact learned by
-#: `if x is C` is pushed on entry to the arm and popped on exit, hence the
-#: `narrow_mark`/`narrow_restore` pairs. The false edge is collected, not
-#: inverted — `not (a or b)` proves both parts — and a diverging `then` with no
-#: `else` leaves its facts applied rather than restored.
+#: A port of `src/sema/check_stmt.c`: patterns and `match`, the `let`/`var`/
+#: `const` that appear inside a body, assignment, blocks and loops, `return`,
+#: `throw`, `try`, `defer`, `assert`, and function bodies.
+#:
+#: **There is no truthiness** (spec §5.1), so every condition goes through
+#: `expr.condition` and is checked for `bool` rather than coerced. And
+#: **narrowing is scoped**: a fact learned by `if x is C` is pushed on entry to
+#: the arm it holds in and popped on the way out, which is why so many functions
+#: here are a `narrow_mark`/`narrow_restore` pair around a recursive call.
+#:
+#: Three narrowing rules are worth stating outright:
+#:
+#: - **The false edge is collected, not inverted.** `a or b` proves nothing when
+#:   true, while `not (a or b)` proves both parts when false, and the second is
+#:   the `if x is null or x <= 0 { return }` guard the library is written with.
+#: - **A diverging `then` with no `else` narrows the rest of the block.** Those
+#:   facts are deliberately not restored; the enclosing `block` unwinds them.
+#: - **A store ends a fact.** The store is checked against the declaration —
+#:   `Ctx.declared_type` — and then calls `Ctx.narrow_invalidate`.
+#:
+#: `Ctx` is the seam and `expr.jai` owns it; `install` fills in five of its
+#: callbacks. `checker.jai` calls `install` too and then replaces
+#: `Ctx.check_decl`, `Ctx.resolve_ast_type` and `Ctx.layout_decl`, none of which
+#: this file can supply. Until it lands, every written annotation here reads as
+#: `any`, a declaration inside a block is unchecked, and a class is never laid
+#: out.
+#:
+#: Two gaps are the AST's rather than a callback's: a `for` loop's hidden
+#: iterator binding is never typed, because the Jaithon `For` schema has no such
+#: field; and a `const`'s folded value lives in `Ctx.consts` keyed by **name**
+#: rather than on the `Symbol`, so two `const K` in different scopes collide.
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, TypeKind
 from jaithon.ast import always_diverges, is_declaration, is_expression, is_pattern, op_text
 from jaithon.compile.check.assign import assignable
@@ -13,15 +39,16 @@ from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, E0404_NOT_INDEXABLE
 from jaithon.compile.check.expr import E0406_BAD_OPERAND_TYPES, E0410_UNKNOWN_MEMBER
 from jaithon.compile.check.expr import E0701_PRIVATE_ACCESS, W0102_UNREACHABLE_CODE, condition
 from jaithon.compile.check.expr import expr, iterable_element, self_skip_of, slice
-from jaithon.compile.check.expr import static_target_decl, suggest_member, value
-from jaithon.compile.check.expr import visibility_word, visible_from, widens_operands
+from jaithon.compile.check.expr import static_target_decl, value
+from jaithon.compile.check.expr import visibility_word, visible_from
 from jaithon.compile.check.fold import ConstKind, ConstValue, const_eval, const_replace
 from jaithon.compile.check.kinds import MAX_DECL_DEPTH, TyKind
 from jaithon.compile.check.nominal import find_accessor, find_member, owner_of_field
-from jaithon.compile.check.operator import binary_result
+from jaithon.compile.check.operator import binary_result, widens_operands
 from jaithon.compile.check.predicate import is_indexable, is_optional
 from jaithon.compile.check.relate import join
 from jaithon.compile.check.render import render
+from jaithon.compile.check.suggest import suggest_member
 from jaithon.compile.check.ty import FieldInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import dict_of, fn_of, generic_param, list_of
@@ -29,8 +56,9 @@ from jaithon.compile.resolve import Symbol
 
 #: A store into something declared `let`.
 #:
-#: These are `JaiDiagCode` names from `src/common/diag.h`; code and message text
-#: are a contract — Phase 4 turns `tests/errors` into goldens.
+#: The codes below are the `JaiDiagCode` names in `src/common/diag.h`. Both the
+#: code and the message text are a contract: Phase 4 turns `tests/errors` into
+#: goldens and a reworded message fails there.
 pub const E0301_ASSIGN_TO_IMMUTABLE: str = "E0301"
 
 #: A `const` whose initialiser has no compile-time value.
@@ -65,8 +93,9 @@ pub const E0702_UNDECLARED_FIELD: str = "E0702"
 
 #: How many names one pattern may bind before duplicates stop being reported.
 #:
-#: The C's caps are stack array sizes but are observable: past the cap the C
-#: stops reporting, so a port that kept going would over-report.
+#: `MAX_BINDS` in `src/sema/check_stmt.c`. The C's caps are stack array sizes,
+#: but every one of them is observable: past the cap the C stops reporting, so a
+#: port that kept going would produce diagnostics the C does not.
 pub const MAX_BINDS: int = 64
 
 #: How many distinct literal arms a `match` tracks for `E0500`.
@@ -78,8 +107,9 @@ pub const MAX_TRACKED_VARIANTS: int = 256
 #: How many sequence lengths a `match` tracks, the width of the C's bitset.
 pub const MAX_TRACKED_LENGTHS: int = 64
 
-# `jaiChkIsAny` etc. are file-private in `expr.jai` and cannot be imported;
-# duplicating two lines is cheaper than widening that file's surface for one caller.
+# `jaiChkIsAny` and the five below it are file-private in `expr.jai` and so
+# cannot be imported. Duplicating two lines is cheaper than widening that file's
+# surface for one caller.
 fn _is_any(t: Type?) -> bool {
     if t is null { return true }
     return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
@@ -89,8 +119,9 @@ fn _is_never(t: Type?) -> bool {
     return t is not null and t.kind == TyKind.Never
 }
 
-# `void` is `null` under the name a return position uses, so this always reads
-# false today; it starts reporting once either universe gives `void` its own identity.
+# `void` is `null` under the name a return position uses, so this is always
+# false in both front ends. It starts reporting the day either universe gives
+# `void` an identity of its own.
 fn _is_void(c: Ctx, t: Type?) -> bool {
     if t is null { return false }
     return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
@@ -116,9 +147,12 @@ fn _span_of(node: Node?) -> Span {
     return node.span
 }
 
-# Parent fields come before the declaration's own (matches `FieldInfo.slot`
-# order); nothing copies that into a `TypeDecl`, so it's walked here, capped at
-# `MAX_DECL_DEPTH` for a still-laying-out decl whose cycle isn't rejected yet.
+# `d->fields` as the C holds it: a parent's entries first, then the
+# declaration's own, which is the order `FieldInfo.slot` numbers.
+# `layoutClassFields` in `src/sema/check_decl.c` writes that order into the
+# child; nothing copies into a Jaithon `TypeDecl`, so the chain is walked here.
+# Capped at `MAX_DECL_DEPTH` because this is also asked about declarations still
+# being laid out, whose cycles layout has not rejected yet.
 fn _layout_fields(decl: TypeDecl?) -> list[FieldInfo] {
     return _collect_fields(decl, 0)
 }
@@ -130,8 +164,9 @@ fn _collect_fields(decl: TypeDecl?, depth: int) -> list[FieldInfo] {
     return out
 }
 
-# Returns the index, not the entry: an enum's variants are its first
-# `variant_count` fields — the only thing distinguishing a variant from a static member.
+# The index and not just the entry, because an enum's variants are its first
+# `variant_count` fields and that is the only thing distinguishing a variant
+# from a static member.
 fn _field_index(decl: TypeDecl?, name: str?) -> int {
     if decl is null or name is null { return -1 }
     for (position, field) in _layout_fields(decl).enumerate() {
@@ -188,7 +223,8 @@ fn _record_binding(c: Ctx, binds: _BindSet?, name: str?, span: Span) -> void {
     binds.spans.push(span)
 }
 
-# `index` of -1 asks for the whole sequence; a tuple answers per position.
+# The element type of a sequence subject; a tuple answers per position, and
+# `index` of -1 asks for the whole of it.
 fn _sequence_element(c: Ctx, subject: Type?, index: int) -> Type {
     let u = c.universe
     if subject is null { return u.t_any }
@@ -324,6 +360,7 @@ fn _pattern_class(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
     }
     c.layout_decl(c, decl)
 
+    # An enum written without a variant is a whole-enum pattern.
     if decl.is_enum and count == 0 { return }
 
     let fields = _layout_fields(decl)
@@ -648,8 +685,9 @@ fn _report_non_exhaustive(
     }
 }
 
-# An open `[..., ...rest]` arm covers everything from `covered_from` up, so only
-# shorter lengths need an exact arm; an `any` subject can never be exhausted this way.
+# An open `[..., ...rest]` arm takes everything from `covered_from` up, so only
+# the shorter lengths still need an exact arm. Only a list or tuple subject can
+# be exhausted this way: an `any` need not be a sequence at all.
 fn _sequence_coverage_complete(subject: Type?, cov: _Coverage) -> bool {
     if subject is null { return false }
     if subject.kind != TyKind.List and subject.kind != TyKind.Tuple { return false }
@@ -664,10 +702,13 @@ fn _sequence_coverage_complete(subject: Type?, cov: _Coverage) -> bool {
 
 #: The type of a `match`, and every diagnostic its arms and coverage produce.
 #:
-#: Statement position answers `void`; expression position joins the arms, and a
-#: match that may fall through yields `T?` on the missing arm. A statically
-#: unknown subject — `any`, or an unimported enum — is not evidence of a missing
-#: arm, so it never forces a `| null` onto the result.
+#: `jaiChkMatchExpr`, and the shape of the installed `Ctx.match_expr`. In
+#: statement position the answer is `void`; in expression position the arms are
+#: joined, and a match that may fall through yields `T?` on the missing arm.
+#:
+#: A statically unknown subject — `any`, or an enum this module only imported —
+#: is not evidence of a missing arm, so the arms are taken at their word rather
+#: than infecting every result with `| null`.
 pub fn match_expr(c: Ctx, node: Node?, is_statement_position: bool) -> Type {
     let u = c.universe
     if node is null { return u.t_any }
@@ -766,9 +807,11 @@ fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
         return
     }
 
-    # `Ctx.consts`, keyed by name, stands in for a Jaithon `Symbol` having no
-    # `isConstFolded`/`constValue`. Both rewrites are dumped, as in the C: the
-    # synthetic literal's `fold` record precedes the initialiser's.
+    # Keep the folded value where every use can inline it. A Jaithon `Symbol`
+    # has no `isConstFolded`/`constValue`, so `Ctx.consts` is the stand-in,
+    # keyed by name rather than identity. Both rewrites are dumped, as in the C:
+    # the synthetic literal produces a `fold` record of its own at the
+    # initialiser's span before the initialiser produces the second.
     let literal = Node.null_lit().with_span(init.span)
     c.set_type(literal, const_replace(c.universe, literal, v))
     c.set_type(init, const_replace(c.universe, init, v))
@@ -839,6 +882,7 @@ fn _check_field_assign(c: Ctx, node: Node, target: Node) -> void {
     let static_access = found is not null
     if found is null { found = _type_decl_of(value(c, object)) }
     if found is null {
+        # An `any` receiver, a module or a builtin: checked at run time.
         c.set_type(target, u.t_any)
         value(c, source)
         return
@@ -1030,6 +1074,7 @@ fn _check_assign(c: Ctx, node: Node) -> void {
         }
 
         _ => {
+            # Destructuring assignment: `(a, b) = point`.
             if is_pattern(target.kind) {
                 let got = value(c, source)
                 pattern(c, target, got)
@@ -1126,8 +1171,9 @@ fn _check_for(c: Ctx, node: Node) -> void {
     let mark = c.narrow_mark()
     pattern(c, node.child("pattern"), elem)
 
-    # The C types `AstNode.forLoop.iterSymbol` here; the Jaithon `For` schema has no
-    # such field and `resolve.jai` creates no such symbol, so there's nothing to type.
+    # The C types `AstNode.forLoop.iterSymbol` here. The Jaithon `For` schema
+    # has no such field and `resolve.jai` creates no such symbol, so there is
+    # nothing to type and this is where that step would go.
     let body = node.child("body")
     if body is not null { stmt(c, body) }
     c.narrow_restore(mark)
@@ -1375,10 +1421,14 @@ fn _parameter_binding_type(c: Ctx, p: dict[str, any]) -> Type {
 
 #: Check a function body against the signature it was written with.
 #:
-#: Generic names, the narrowing stack, the enclosing class and result type are
-#: all saved and restored, so a nested function leaves nothing behind. E0601 (an
-#: annotated non-`void` function falling off the end) is exempted for a
-#: generator, which returns through `yield` instead.
+#: `jaiChkFunction`. The generic names, the narrowing stack, the enclosing class
+#: and the enclosing result type are all saved and restored, so a nested function
+#: leaves nothing behind. `owner` is the class whose body this method is in, and
+#: `is_method` is what makes the first parameter a receiver.
+#:
+#: E0601 — an annotated non-`void` function must not fall off the end — is the
+#: one diagnostic here about the body as a whole. A generator returns through
+#: `yield`, so it is exempt.
 pub fn function(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> void {
     if fn_node is null { return }
     let u = c.universe
@@ -1436,6 +1486,7 @@ pub fn function(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> vo
         if body.kind == NodeKind.Block {
             block(c, body)
         } else {
+            # A lambda's body is its return value.
             if not _is_any(returns) { c.apply_context(c, body, returns) }
             let got = value(c, body)
             if annotated {
@@ -1484,10 +1535,13 @@ pub fn function(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> vo
 
 #: Install this file's entries into `c`, so an expression can reach a statement.
 #:
-#: Skipping this leaves a comprehension's loop variable unbound, a `match` in
-#: expression position answering `any`, and a block/lambda body unchecked — all
-#: silently. `checker.jai` still has to install `Ctx.check_decl`,
-#: `Ctx.resolve_ast_type`, `Ctx.layout_decl`, `Ctx.is_module` and `Ctx.module_member`.
+#: Without this call a comprehension's loop variable stays unbound, a `match` in
+#: expression position answers `any`, a block or statement in expression position
+#: is not walked, and a lambda body is not checked — each silently.
+#:
+#: `checker.jai` will call this and then install `Ctx.check_decl`,
+#: `Ctx.resolve_ast_type`, `Ctx.layout_decl`, `Ctx.is_module` and
+#: `Ctx.module_member`, none of which this file can supply.
 pub fn install(c: Ctx) -> void {
     c.check_pattern = pattern
     c.check_block = block

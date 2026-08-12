@@ -7,6 +7,26 @@ from jaithon.compile.check.relate import join as join_types
 from jaithon.compile.check.ty import MemberInfo, Type, TypeDecl
 from jaithon.compile.check.universe import Universe, list_of
 
+#: Whether `op` is one of the ten arithmetic operators.
+pub fn is_arithmetic(op: OpKind) -> bool {
+    match op {
+        OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div => { return true }
+        OpKind.FloorDiv | OpKind.Mod | OpKind.Pow => { return true }
+        OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => { return true }
+        _ => { return false }
+    }
+}
+
+#: Whether `op` widens an `int` operand against a `float` one (spec §2.5). The
+#: wrapping and bitwise forms are excluded: both are 64-bit integer operations
+#: with no float form, so a float operand there is still E0406.
+pub fn widens_operands(op: OpKind) -> bool {
+    match op {
+        OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => { return false }
+        _ => { return is_arithmetic(op) }
+    }
+}
+
 #: The dunder that implements `op` for a user type (spec §7.1). `//` and `@` are
 #: absent from the C's `arithDunder`; `__neg__` is looked up by name elsewhere.
 pub fn arith_dunder(op: OpKind) -> str? {

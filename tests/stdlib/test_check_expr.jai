@@ -24,10 +24,11 @@ from jaithon.compile.check.expr import E0603_UNKNOWN_KEYWORD_ARG, E0604_DUPLICAT
 from jaithon.compile.check.expr import E0605_POSITIONAL_AFTER_KEYWORD, E0701_PRIVATE_ACCESS
 from jaithon.compile.check.expr import E0710_ABSTRACT_INSTANTIATION, VIS_PRIVATE, VIS_PROTECTED
 from jaithon.compile.check.expr import VIS_PUBLIC, W0102_UNREACHABLE_CODE, condition, expr
-from jaithon.compile.check.expr import find_init_decl, is_arithmetic, iterable_element, member
+from jaithon.compile.check.expr import find_init_decl, iterable_element, member
 from jaithon.compile.check.expr import self_skip_of, slice, value, visibility_word
-from jaithon.compile.check.expr import visible_from, widens_operands
+from jaithon.compile.check.expr import visible_from
 from jaithon.compile.check.kinds import TyKind
+from jaithon.compile.check.operator import is_arithmetic, widens_operands
 from jaithon.compile.check.render import render
 from jaithon.compile.check.ty import FieldInfo, MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of

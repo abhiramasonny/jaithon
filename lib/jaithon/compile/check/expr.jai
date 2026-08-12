@@ -1,34 +1,53 @@
 #: The type of every expression form: operators, member access, calls,
 #: indexing and slicing, comprehensions and function expressions.
 #:
-#: A port of `src/sema/check_expr.c`; types live in side tables keyed by
-#: `id(node)`, reached through `Ctx` callbacks.
+#: A port of `src/sema/check_expr.c`. Types live in side tables keyed by
+#: `id(node)`, and everything the other checker files own arrives through `Ctx`
+#: as a callback whose default is documented below.
+#:
+#: What is NOT here: the pure, `Ctx`-free material that used to live in this
+#: file has moved out, each to the sibling it fits rather than to a new file
+#: invented just to hold it. `is_arithmetic` and `widens_operands` — OpKind
+#: classification with no operand types in sight — joined `binary_result` and
+#: `unary_result` in `operator.jai`, which already tables "what an operator
+#: does". The plain `dict[str, any]` field accessors for argument, parameter
+#: and comprehension-clause records joined `arg_value`/`param_type`/
+#: `param_variadic`/`param_kwrest` in `ctx.jai`, which already held that exact
+#: kind of accessor. The one genuinely new file is `suggest.jai`: the bounded
+#: edit-distance search and `suggest_member` did not fit any existing file's
+#: charter, and are shared as-is with `stmt.jai`'s own "did you mean"s.
+#: Everything that stayed is the dispatch in `expr` and the per-node-kind
+#: checks it calls, which constantly recurse through `value`/`expr`/`member`
+#: and thread `Ctx` for narrowing and diagnostics — one checking pass, not
+#: independent pieces.
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span
 from jaithon.ast import is_statement, op_is_comparison, op_text
 from jaithon.compile.check.assign import widen_target
-from jaithon.compile.check.ctx import Ctx, arg_value, decl_type, is_any, is_never
-from jaithon.compile.check.ctx import is_type_symbol, is_void, param_kwrest, param_type
+from jaithon.compile.check.ctx import Ctx, arg_name, arg_span, arg_spread, arg_value
+from jaithon.compile.check.ctx import clause_conditions, clause_iterable, clause_pattern
+from jaithon.compile.check.ctx import decl_type, is_any, is_never, is_type_symbol, is_void
+from jaithon.compile.check.ctx import param_default, param_kwrest, param_name, param_type
 from jaithon.compile.check.ctx import param_variadic, span_of, subject_of, type_decl_of
 from jaithon.compile.check.fold import ConstKind, const_eval, const_replace, try_fold
 from jaithon.compile.check.kinds import MAX_DECL_DEPTH, TyKind
 from jaithon.compile.check.nominal import find_accessor, find_field, find_member
 from jaithon.compile.check.nominal import inherits_opaquely, is_subclass_of
 from jaithon.compile.check.nominal import names_opaque_trait, owner_of_field, owner_of_member
-from jaithon.compile.check.operator import binary_result, unary_result
+from jaithon.compile.check.operator import binary_result, unary_result, widens_operands
 from jaithon.compile.check.predicate import is_callable, is_indexable, is_iterable, is_optional
 from jaithon.compile.check.relate import join, narrow
 from jaithon.compile.check.render import render
 from jaithon.compile.check.substitute import mentions_generic_param, substitute
+from jaithon.compile.check.suggest import SUGGEST_NO_MATCH, closer, suggest_member
 from jaithon.compile.check.ty import MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of
 from jaithon.compile.check.universe import dict_of, list_of, set_of, tuple_of
-from jaithon.compile.lexer import Diagnostic
 from jaithon.compile.resolve import Symbol, SymbolKind
 
 #: A value does not fit the slot it is going into.
 #:
-#: These are `JaiDiagCode` names from `src/common/diag.h`; the code and message
-#: text are a contract — `tests/errors` turns them into goldens.
+#: These are the C's `JaiDiagCode` names in `src/common/diag.h`. Both the code
+#: and the message text are a contract: `tests/errors` turns them into goldens.
 pub const E0400_TYPE_MISMATCH: str = "E0400"
 
 #: A condition is not a `bool`. There is no truthiness.
@@ -78,8 +97,8 @@ pub const W0102_UNREACHABLE_CODE: str = "W0102"
 
 #: A member or field declared with no modifier.
 #:
-#: These three match the ordinals of `jaithon.ast.Visibility` / C's
-#: `AstVisibility`; `ty.jai` stores visibility as a plain `int`.
+#: `ty.jai` holds visibility as a plain `int`; these three are the ordinals of
+#: `jaithon.ast.Visibility`, which is the order of the C `AstVisibility`.
 pub const VIS_PRIVATE: int = 0
 
 #: Reachable from the declaring class and its subclasses.
@@ -90,17 +109,13 @@ pub const VIS_PUBLIC: int = 2
 
 #: How many arguments or parameters one call binds, matching `JAI_MAX_ARGS`.
 #:
-#: Reproduced because it's observable: past it the C stops binding args, so a
-#: port that kept going would report errors the C doesn't.
+#: Reproduced because it is observable: past it the C stops binding arguments to
+#: parameters, so a port that kept binding would report errors the C does not.
 pub const MAX_ARGS: int = 255
 
-# `JAI_SUGGEST_NO_MATCH` in src/common/diag.h: worse than any accepted distance.
-const SUGGEST_NO_MATCH: int = 4
-
-# `JAI_SUGGEST_MAX_LEN`: past this a name is not compared at all.
-const SUGGEST_MAX_LEN: int = 64
-
-# `value` reports `any` for a void expr but records `void` — normalise the same way here.
+# The type an already-checked element contributes to a container's join. `value`
+# reports `any` for a void expression but records `void`, so re-reading the tree
+# has to normalise the same way.
 fn _element_type(c: Ctx, node: Node?) -> Type {
     if node is null { return c.universe.t_any }
     let t = c.type_of(node)
@@ -108,117 +123,13 @@ fn _element_type(c: Ctx, node: Node?) -> Type {
     return t ?? c.universe.t_any
 }
 
-# Consumed, so a stale hint cannot leak into a later literal.
+# The contextual type `apply_context` stamped on a container literal, if it is
+# the right shape. Consumed, so a stale hint cannot leak into a later literal.
 fn _take_container_context(c: Ctx, node: Node, want: TyKind, arity: int) -> Type? {
     let hint = c.type_of(node)
     c.clear_type(node)
     if hint is null or hint.kind != want or hint.arg_count() != arity { return null }
     return hint
-}
-
-fn _arg_name(record: dict[str, any]) -> str? {
-    let value: str? = record.get("name", null)
-    return value
-}
-
-fn _arg_spread(record: dict[str, any]) -> bool {
-    let value: bool = record.get("isSpread", false)
-    return value
-}
-
-fn _arg_span(record: dict[str, any]) -> Span {
-    let value: Span = record.get("span", Span.none())
-    return value
-}
-
-fn _param_name(record: dict[str, any]) -> str? {
-    let value: str? = record.get("name", null)
-    return value
-}
-
-fn _param_default(record: dict[str, any]) -> Node? {
-    let value: Node? = record.get("defaultValue", null)
-    return value
-}
-
-fn _clause_pattern(record: dict[str, any]) -> Node? {
-    let value: Node? = record.get("pattern", null)
-    return value
-}
-
-fn _clause_iterable(record: dict[str, any]) -> Node? {
-    let value: Node? = record.get("iterable", null)
-    return value
-}
-
-fn _clause_conditions(record: dict[str, any]) -> list[Node] {
-    let value: list[Node] = record.get("conditions", [])
-    return value
-}
-
-# Three rows because a transposition looks back two; compares scalars, not the
-# C's bytes — they agree only over ASCII.
-fn _name_distance(a: str, b: str, max_distance: int) -> int {
-    if max_distance < 0 { return max_distance + 1 }
-    let la = a.len()
-    let lb = b.len()
-    if la > SUGGEST_MAX_LEN or lb > SUGGEST_MAX_LEN { return max_distance + 1 }
-    # The length gap alone is already a lower bound on the distance.
-    let gap = if la > lb { la - lb } else { lb - la }
-    if gap > max_distance { return max_distance + 1 }
-
-    var prev2: list[int] = []
-    var prev: list[int] = []
-    var cur: list[int] = []
-    var column = 0
-    while column <= lb {
-        prev2.push(0)
-        prev.push(column)
-        cur.push(0)
-        column += 1
-    }
-
-    var row = 1
-    while row <= la {
-        cur[0] = row
-        var best = cur[0]
-        column = 1
-        while column <= lb {
-            let cost = if a[row - 1] == b[column - 1] { 0 } else { 1 }
-            var d = prev[column] + 1
-            if cur[column - 1] + 1 < d { d = cur[column - 1] + 1 }
-            if prev[column - 1] + cost < d { d = prev[column - 1] + cost }
-            # Adjacent transposition costs one, not two.
-            if row > 1 and column > 1 {
-                let swapped = a[row - 1] == b[column - 2] and a[row - 2] == b[column - 1]
-                if swapped and prev2[column - 2] + 1 < d { d = prev2[column - 2] + 1 }
-            }
-            cur[column] = d
-            if d < best { best = d }
-            column += 1
-        }
-        # Every remaining row can only add to the running minimum.
-        if best > max_distance { return max_distance + 1 }
-        var at = 0
-        while at <= lb {
-            prev2[at] = prev[at]
-            prev[at] = cur[at]
-            at += 1
-        }
-        row += 1
-    }
-    return prev[lb]
-}
-
-# The tolerance matches `src/common/diag.h`.
-fn _closer(name: str, candidate: str?, best: int) -> int? {
-    if candidate is null or name == candidate { return null }
-    let length = if name.len() > 3 { name.len() } else { 3 }
-    var limit = length // 3
-    if limit > 3 { limit = 3 }
-    let distance = _name_distance(name, candidate, limit)
-    if distance > limit or distance >= best { return null }
-    return distance
 }
 
 #: Check that `node` is a `bool`, naming `where` in the diagnostic. Every boolean
@@ -238,6 +149,7 @@ pub fn condition(c: Ctx, node: Node?, where: str) -> void {
     if help is not null { d.with_help(help) }
 }
 
+# Written with the condition's own spelling, so the help is a line to paste.
 fn _condition_help(t: Type?, node: Node?) -> str? {
     if t is null { return null }
     if is_optional(t) or t.kind == TyKind.Null {
@@ -264,7 +176,8 @@ pub fn iterable_element(c: Ctx, node: Node?, t: Type?) -> Type {
     let u = c.universe
     if is_any(t) or is_never(t) { return u.t_any }
 
-    # Layout first — an unlaid-out imported decl reports no members and looks non-iterable.
+    # Lay the declaration out first: an imported one that has not been would
+    # answer "no members, no traits" and be reported as not iterable.
     let iter_decl = type_decl_of(t)
     if iter_decl is not null { c.layout_decl(c, iter_decl) }
 
@@ -285,7 +198,8 @@ pub fn iterable_element(c: Ctx, node: Node?, t: Type?) -> Type {
     return u.t_any
 }
 
-# An imported `Iterable` impl only shows up via `names_opaque_trait`, not in `traits`.
+# An unknown shape is assumed iterable. `opaque_traits` is consulted alongside
+# `traits` because a class implementing an imported `Iterable` names it there.
 fn _class_is_iterable(decl: TypeDecl?) -> bool {
     if decl is null { return true }
     if find_member(decl, "__iter__") is not null { return true }
@@ -312,32 +226,13 @@ pub fn value(c: Ctx, node: Node?) -> Type {
     return t
 }
 
-#: Whether `op` is one of the ten arithmetic operators.
-pub fn is_arithmetic(op: OpKind) -> bool {
-    match op {
-        OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div => { return true }
-        OpKind.FloorDiv | OpKind.Mod | OpKind.Pow => { return true }
-        OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => { return true }
-        _ => { return false }
-    }
-}
-
-#: Whether `op` widens an `int` operand against a `float` one (spec §2.5). The
-#: wrapping and bitwise forms are excluded: both are 64-bit integer operations
-#: with no float form, so a float operand there is still E0406.
-pub fn widens_operands(op: OpKind) -> bool {
-    match op {
-        OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => { return false }
-        _ => { return is_arithmetic(op) }
-    }
-}
-
 fn _check_ident(c: Ctx, node: Node) -> Type {
     let u = c.universe
     let symbol = c.resolution.symbol_of(node)
     # The resolver already reported the undefined name; do not pile on.
     if symbol is null { return u.t_any }
 
+    # A folded `const` is inlined at its use site (spec §3).
     if c.fold_constants and symbol.mutability == DeclKind.Const and symbol.name in c.consts {
         let folded = const_eval(node, null, c.consts)
         if not folded.is_none() {
@@ -347,8 +242,10 @@ fn _check_ident(c: Ctx, node: Node) -> Type {
         }
     }
 
-    # Tests the resolved type, not symbol kind: kind alone would leave e.g.
-    # `ValueError` as `any`. Locals/params are excluded so a shadowing binding wins.
+    # Classes and enums may be referenced before their layout pass ran. The test
+    # is on the resolved type, not only the symbol kind: this front end has no
+    # runtime symbol registration, so `ValueError` would answer `any`. Locals and
+    # parameters stay excluded, so a binding that shadows a class name wins.
     if c.symbol_type(symbol) is null and symbol.kind != SymbolKind.Local {
         if symbol.kind != SymbolKind.Param {
             let named = c.lookup_type_name(c, symbol.name)
@@ -361,15 +258,18 @@ fn _check_ident(c: Ctx, node: Node) -> Type {
     return c.symbol_type(symbol) ?? u.t_any
 }
 
-# Numeric fusion (spec §2.2) converts int nodes to float in place; it returns
-# nothing, so a failed conversion still joins honestly via the re-read types.
+# Numeric fusion (spec §2.2): when an unannotated literal position mixes an exact
+# `int` with an exact `float`, every int node is converted in place. Nothing is
+# returned — the caller joins by re-reading the recorded types, so a node that
+# failed to convert leaves the join a union rather than a lie.
 fn _fuse_numeric(c: Ctx, nodes: list[Node]) -> void {
     let u = c.universe
     var has_int = false
     var has_float = false
     for node in nodes {
         let t = c.type_of(node)
-        # `widen_target` resolves null for `int?`, `any`, `never`, `list[int]` — only an exact `int`.
+        # `widen_target` is the exact-int test: it resolves to null for `int?`,
+        # `any`, `never` and `list[int]` alike.
         if widen_target(u, t, u.t_float) is not null { has_int = true }
         if t == u.t_float { has_float = true }
     }
@@ -410,6 +310,7 @@ fn _check_sequence_literal(c: Ctx, node: Node) -> Type {
     let shape = if node.kind == NodeKind.SetLit { TyKind.Set } else { TyKind.List }
     let want = _take_container_context(c, node, shape, 1)
 
+    # Annotated: each element is checked against the declared element type.
     if want is not null {
         for item in items {
             let got = value(c, item)
@@ -425,11 +326,13 @@ fn _check_sequence_literal(c: Ctx, node: Node) -> Type {
         return want
     }
 
-    # Folding the join incrementally would be order-dependent — `[1, "a", 2.0]`
-    # would never see the int and float as a pair — so join happens after a full re-read.
+    # Unannotated: check, fuse, then join by re-reading the tree. Folding the join
+    # as we went would make the result order-dependent — `[1, "a", 2.0]` would
+    # never see the int and the float as a pair.
     #
-    # Set literals are not fused: converting a hash-position number can merge
-    # two members that were distinct above 2^53.
+    # A set literal is deliberately not fused: a number in a hash position decides
+    # which elements are the same element, so converting one can merge two members
+    # that were distinct above 2^53.
     for item in items { value(c, item) }
     if node.kind == NodeKind.ListLit { _fuse_numeric(c, items) }
 
@@ -474,8 +377,9 @@ fn _check_dict_literal(c: Ctx, node: Node) -> Type {
         return want
     }
 
-    # Keys are a hash position and stay unfused (see `_check_sequence_literal`).
-    # Key then value, entry by entry, matches the C's error-reporting order.
+    # Unannotated: check, fuse the values, then join by re-reading the tree — see
+    # `_check_sequence_literal`. Keys are a hash position and are left alone. Key
+    # then value, entry by entry, is the order the C reports two errors in.
     for (position, key) in keys.enumerate() {
         value(c, key)
         if position < values.len() { value(c, values[position]) }
@@ -495,7 +399,8 @@ fn _check_dict_literal(c: Ctx, node: Node) -> Type {
     return dict_of(u, key_type ?? u.t_any, value_type ?? u.t_any)
 }
 
-# Conversion is inserted into the tree rather than left to the VM.
+# One int, one float: the int side widens and the expression is float, with the
+# conversion in the tree rather than left to the VM.
 fn _widen_numeric_mix(c: Ctx, node: Node, op: OpKind, left: Type, right: Type) -> (Type, Type) {
     let u = c.universe
     if not widens_operands(op) { return (left, right) }
@@ -649,8 +554,9 @@ fn _check_index(c: Ctx, node: Node) -> Type {
     let object = node.child("object")
     let subscript = node.child("index")
 
-    # Erasure makes a type-arg application (`Box[int](21)`) the bare declared
-    # type; only the resolver disambiguates brackets (spec §8) — trusted here.
+    # `Box[int](21)` applies type arguments; erasure makes the result the bare
+    # declared type. The resolver settled which reading the brackets have — it is
+    # the only pass that can (spec §8).
     if c.resolution.is_type_args(node) {
         let base = value(c, object)
         c.set_type(subscript, u.t_any)
@@ -677,6 +583,8 @@ fn _check_index(c: Ctx, node: Node) -> Type {
     let index_decl = type_decl_of(target)
     if index_decl is not null { c.layout_decl(c, index_decl) }
 
+    # A constant subscript answers with the member it selects: `pair[0]` on
+    # `(str, int)` is a `str`. A computed index keeps the join.
     if target.kind == TyKind.Tuple {
         let key = const_eval(subscript, null, c.consts)
         if key.kind == ConstKind.Int {
@@ -722,6 +630,7 @@ fn _check_index(c: Ctx, node: Node) -> Type {
     return u.t_any
 }
 
+# The names whose brackets mean a generic instantiation rather than a subscript.
 fn _names_a_type(c: Ctx, symbol: Symbol) -> bool {
     if is_type_symbol(symbol.kind) or symbol.kind == SymbolKind.TypeAlias { return true }
     return c.ident_type_decl(symbol) is not null
@@ -817,27 +726,6 @@ pub fn visibility_word(vis: int) -> str {
     return if vis == VIS_PROTECTED { "protected" } else { "private" }
 }
 
-#: Attach a "did you mean" to `d` when a field or member of `decl` is close to
-#: `name`. Fields are searched before members, and the closest candidate under
-#: the tolerance in `src/common/diag.h` wins. Nothing is attached otherwise.
-pub fn suggest_member(d: Diagnostic, decl: TypeDecl, name: str) -> void {
-    var best: str? = null
-    var best_distance = SUGGEST_NO_MATCH
-    for field in decl.fields {
-        let distance = _closer(name, field.name, best_distance)
-        if distance is null { continue }
-        best = field.name
-        best_distance = distance
-    }
-    for member in decl.members {
-        let distance = _closer(name, member.name, best_distance)
-        if distance is null { continue }
-        best = member.name
-        best_distance = distance
-    }
-    if best is not null { d.with_help(f"did you mean `{best}`?") }
-}
-
 #: The declaration behind `Account` in `Account.total()`, as opposed to an
 #: instance of it. Stamps the name's own type on the way past.
 pub fn static_target_decl(c: Ctx, object: Node?) -> TypeDecl? {
@@ -847,7 +735,8 @@ pub fn static_target_decl(c: Ctx, object: Node?) -> TypeDecl? {
     return decl
 }
 
-# `static_access` distinguishes `Account.count` from `account.count`; enum variants live in the field list.
+# Resolve `name` against a declared type. `static_access` distinguishes
+# `Account.count` from `account.count`; enum variants live in the field list.
 fn _lookup_member(
     c: Ctx,
     site: Node,
@@ -908,7 +797,11 @@ fn _lookup_member(
     return (u.t_any, null)
 }
 
-#: The declaration node is the C's `AstNode **outDecl`; null for a field or a dynamic load.
+#: The type of `object.name`, and the declaration node behind it when there is
+#: one — the C's `AstNode **outDecl`, which is what lets a call through a method
+#: be bound against a real parameter list. Null for a field or a dynamic load.
+#: `?.` narrows `null` off the receiver and puts it back on the result.
+# `Self` inside an inherited signature, bound to the type that inherited it.
 fn _substitute_self(c: Ctx, ty: Type?, decl: TypeDecl?) -> Type? {
     if ty is null or decl is null { return ty }
     let concrete = decl.ty
@@ -943,7 +836,8 @@ pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
 
     var target = value(c, object)
 
-    # `m.f` resolves by name at runtime, but the signature loader still lets this be checked statically.
+    # `import m` binds a module object and `m.f` is resolved by name at run time.
+    # The signature loader knows what `m` declares, so the call is still checked.
     if c.is_module(c, object) {
         let (result, decl_node) = c.module_member(c, object, name)
         return (if optional { optional_of(u, result) } else { result }, decl_node)
@@ -955,6 +849,7 @@ pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
     }
     if is_any(target) or is_never(target) { return (u.t_any, null) }
 
+    # Builtin containers, modules and Error classes carry methods in the runtime.
     let decl = type_decl_of(target)
     if decl is null { return (u.t_any, null) }
     c.layout_decl(c, decl)
@@ -973,6 +868,8 @@ pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
     return (if optional { optional_of(u, result) } else { result }, decl_node)
 }
 
+# What is known about the thing being called. `CalleeInfo` in the C, filled in
+# by `_check_call` and read by `_check_args`.
 class CalleeInfo {
     #: The function declaration, when the callee is statically known.
     pub var decl: Node?
@@ -1024,8 +921,12 @@ fn _binding_word(kind: SymbolKind) -> str {
     }
 }
 
-# `Symbol.decl` names the enclosing `fn` for a param/`self`, not this binding.
-# `importedDecl` comes first: a bare `Fn` type has no defaults or keyword names, which E0603 needs.
+# The function declaration this name *denotes*, or null. `Symbol.decl` is the
+# node that DECLARES the symbol, which for a parameter or for `self` is the
+# enclosing `fn`, so only the resolver's back-link says which binding names the
+# function. `Symbol.importedDecl` is followed first: a `Fn` type carries arity
+# and nothing else, so every default argument reads as required and a keyword
+# argument has no name to be checked against, which is what E0603 needs.
 fn _denoted_function_decl(c: Ctx, symbol: Symbol?) -> Node? {
     if symbol is null { return null }
     let imported = c.imported_decl(symbol)
@@ -1043,7 +944,7 @@ pub fn self_skip_of(fn_node: Node?) -> int {
     if fn_node.flag("isStatic") { return 0 }
     let params = fn_node.records("params")
     if params.len() <= 0 { return 0 }
-    return if _param_name(params[0]) == "self" { 1 } else { 0 }
+    return if param_name(params[0]) == "self" { 1 } else { 0 }
 }
 
 #: The `init` of `decl` or of the nearest ancestor that declares one, and the
@@ -1075,6 +976,7 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
     let arity_code = if info.named { E0602_BAD_CALL_ARITY } else { E0600_ARITY_MISMATCH }
     let name = info.name ?? "this callable"
 
+    # Per-argument expected type and bound parameter name, for the final pass.
     let tracked = if arg_count < MAX_ARGS { arg_count } else { MAX_ARGS }
     var targets: list[Type?] = []
     var bound: list[str?] = []
@@ -1088,16 +990,16 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
     var saw_keyword = false
     var saw_spread = false
     for (position, given) in args.enumerate() {
-        if _arg_spread(given) {
+        if arg_spread(given) {
             saw_spread = true
             continue
         }
-        let given_name = _arg_name(given)
+        let given_name = arg_name(given)
         if given_name is null {
             if saw_keyword {
                 c.error(
                     E0605_POSITIONAL_AFTER_KEYWORD,
-                    _arg_span(given),
+                    arg_span(given),
                     "positional argument follows a keyword argument"
                 )
             }
@@ -1106,13 +1008,13 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
         saw_keyword = true
         var earlier = 0
         while earlier < position {
-            if _arg_name(args[earlier]) == given_name {
+            if arg_name(args[earlier]) == given_name {
                 let d = c.error(
                     E0604_DUPLICATE_ARGUMENT,
-                    _arg_span(given),
+                    arg_span(given),
                     f"argument `{given_name}` is given twice"
                 )
-                d.label(_arg_span(args[earlier]), "first given here")
+                d.label(arg_span(args[earlier]), "first given here")
                 break
             }
             earlier += 1
@@ -1162,8 +1064,8 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
         var positional = 0
         var reported_overflow = false
         for (position, given) in args.enumerate() {
-            if _arg_spread(given) { continue }
-            let given_name = _arg_name(given)
+            if arg_spread(given) { continue }
+            let given_name = arg_name(given)
 
             if given_name is null {
                 var slot = -1
@@ -1179,7 +1081,7 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
                         let were = if arg_count == 1 { "was" } else { "were" }
                         let d = c.error(
                             arity_code,
-                            _arg_span(given),
+                            arg_span(given),
                             f"`{name}` takes {param_count} argument{plural} but {arg_count} {were} given"
                         )
                         if decl_node is not null {
@@ -1191,7 +1093,7 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
                     if slot != variadic { filled[slot] = true }
                     if position < tracked {
                         targets[position] = param_types[slot]
-                        bound[position] = _param_name(params[slot])
+                        bound[position] = param_name(params[slot])
                     }
                 }
                 positional += 1
@@ -1201,7 +1103,7 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
             var slot = -1
             for (candidate, parameter) in params.enumerate() {
                 if param_variadic(parameter) or param_kwrest(parameter) { continue }
-                if _param_name(parameter) == given_name {
+                if param_name(parameter) == given_name {
                     slot = candidate
                     break
                 }
@@ -1211,15 +1113,15 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
                 if kw_rest < 0 {
                     let d = c.error(
                         E0603_UNKNOWN_KEYWORD_ARG,
-                        _arg_span(given),
+                        arg_span(given),
                         f"`{name}` has no parameter named `{given_name}`"
                     )
                     var best: str? = null
                     var best_distance = SUGGEST_NO_MATCH
                     for parameter in params {
-                        let distance = _closer(given_name, _param_name(parameter), best_distance)
+                        let distance = closer(given_name, param_name(parameter), best_distance)
                         if distance is null { continue }
-                        best = _param_name(parameter)
+                        best = param_name(parameter)
                         best_distance = distance
                     }
                     if best is not null { d.with_help(f"did you mean `{best}`?") }
@@ -1230,14 +1132,14 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
             if filled[slot] {
                 c.error(
                     E0604_DUPLICATE_ARGUMENT,
-                    _arg_span(given),
+                    arg_span(given),
                     f"argument `{given_name}` is given twice"
                 )
             }
             filled[slot] = true
             if position < tracked {
                 targets[position] = param_types[slot]
-                bound[position] = _param_name(params[slot])
+                bound[position] = param_name(params[slot])
             }
         }
 
@@ -1247,8 +1149,8 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
             for (position, parameter) in params.enumerate() {
                 if filled[position] { continue }
                 if param_variadic(parameter) or param_kwrest(parameter) { continue }
-                if _param_default(parameter) is not null { continue }
-                if first_missing is null { first_missing = _param_name(parameter) }
+                if param_default(parameter) is not null { continue }
+                if first_missing is null { first_missing = param_name(parameter) }
                 missing += 1
             }
             if missing > 0 {
@@ -1274,6 +1176,7 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
                 call.span,
                 f"`{name}` takes {want} argument{plural} but {arg_count} {were} given"
             )
+            # Show the signature that was actually checked, at its binding.
             let binding_span = info.binding_span
             let binding_what = info.binding_what ?? "binding"
             if info.binding_what is not null and binding_span is not null {
@@ -1309,7 +1212,7 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
         var label = f"argument {position + 1} of `{name}`"
         let bound_name = bound[position]
         if bound_name is not null { label = f"argument `{bound_name}` of `{name}`" }
-        let want = if _arg_spread(given) { null } else { targets[position] }
+        let want = if arg_spread(given) { null } else { targets[position] }
         _check_arg_expr(c, held, want, label)
     }
 }
@@ -1360,6 +1263,7 @@ fn _check_call(c: Ctx, node: Node) -> Type {
     let callee = node.child("callee")
     if callee is null { return u.t_any }
 
+    # ClassName(...) constructs; there is no `new`.
     if callee.kind == NodeKind.Ident {
         let decl = c.ident_type_decl(c.resolution.symbol_of(callee))
         if decl is not null and not decl.is_enum {
@@ -1423,6 +1327,8 @@ fn _check_call(c: Ctx, node: Node) -> Type {
     if callee.kind == NodeKind.Ident {
         info.name = callee.opt_text("name")
         info.named = true
+        # A name that denotes no declaration is a value being called; its binding
+        # is recorded so an arity error can show the signature it checked.
         let symbol = c.resolution.symbol_of(callee)
         if callee_decl is null and symbol is not null {
             info.binding_span = symbol.decl_span
@@ -1498,11 +1404,11 @@ fn _check_comprehension(c: Ctx, node: Node) -> Type {
 
     let mark = c.narrow_mark()
     for clause in node.records("clauses") {
-        let over = _clause_iterable(clause)
+        let over = clause_iterable(clause)
         let source = value(c, over)
         let elem = iterable_element(c, over, source)
-        c.check_pattern(c, _clause_pattern(clause), elem)
-        for filter in _clause_conditions(clause) {
+        c.check_pattern(c, clause_pattern(clause), elem)
+        for filter in clause_conditions(clause) {
             condition(c, filter, "a comprehension filter")
         }
     }
@@ -1514,6 +1420,7 @@ fn _check_comprehension(c: Ctx, node: Node) -> Type {
     if key_node is not null { key_type = value(c, key_node) }
     c.narrow_restore(mark)
 
+    # Annotated: report the element that does not fit, not the whole literal.
     if want is not null {
         if key_node is not null {
             let _key_ok = c.require_assignable(
@@ -1648,6 +1555,7 @@ pub fn expr(c: Ctx, node: Node?) -> Type {
             t = u.t_any
         }
 
+        # A block in expression position is a lambda body or an `if` arm.
         NodeKind.Block => {
             c.check_block(c, node)
             t = u.t_any

@@ -41,6 +41,7 @@ jaithon/compile/check/relate.jai
 jaithon/compile/check/render.jai
 jaithon/compile/check/stmt.jai
 jaithon/compile/check/substitute.jai
+jaithon/compile/check/suggest.jai
 jaithon/compile/check/ty.jai
 jaithon/compile/check/union.jai
 jaithon/compile/check/universe.jai
