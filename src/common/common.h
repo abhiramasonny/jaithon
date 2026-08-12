@@ -305,6 +305,10 @@ char  *jaiBufTakeCString(JaiBuf *b, size_t *outLen);
 uint64_t jaiHashBytes(const void *data, size_t len);   /* FNV-1a 64 */
 uint64_t jaiHashU64(uint64_t x);                       /* splitmix64 finaliser */
 uint32_t jaiCrc32(const void *data, size_t len);
+/* The portable table implementation. jaiCrc32 uses the ARMv8 CRC32
+ * instructions where the target has them and falls back to this everywhere
+ * else; the two must be one function, which tests/vm/crc32_equiv.c asserts. */
+uint32_t jaiCrc32Table(const void *data, size_t len);
 
 /* ------------------------------------------------------------------ */
 /* UTF-8                                                               */
