@@ -32,7 +32,7 @@ e47e227f6887c4493c01ca2b4f32b3aaa56b3fc3a33d2086073d200f5befeb1e  283  lib/jaith
 ee924591df64dbfdcd8ffb611b75037700c0c22f611df4161e2e9bcd9a4a5009  344  lib/jaithon/compile/check/universe.jai
 e295b2c80d9404fef82b2caa5791830cb3d10d930dbc201048cad90546c4a70a  345  lib/jaithon/compile/diag.jai
 5582ebb5a60e1e195c3f92f3a8e2b6baac52957d1a1bd36e2030f797c1d1da6e  9613  lib/jaithon/compile/emit.jai
-83adb01147a8329e38d2134bffb42c4e08f075413a3caf750014ae3ef5b7bd53  3933  lib/jaithon/compile/jaic.jai
+4fe4c3708f62c0264e0f2df7f67934c7cbba598b505fdf60d012884b41f6fd72  3885  lib/jaithon/compile/jaic.jai
 a12604d1f1d115b181b5fa75174259804ffe102a4a92674fcd5adb66e05f4c6f  4452  lib/jaithon/compile/lexer.jai
 ec4ac06c65b7f200958801cd566a2159781b6461baa98629d88c49e7ad8d6e05  909  lib/jaithon/compile/mod.jai
 de63b31912fe7abad1865ce3619b2ddc9292c453938280e969bad7ff3704e111  2180  lib/jaithon/compile/opt/chunk.jai
@@ -147,4 +147,4 @@ ac063f67c22f9c22433c41969dd0e0849a2d6a8a36e5ae8d767c09734d0c2fed  86  tests/gold
 56829e59e3c10aab3e3034c1c03e11d464280807ce20346c7258b272302fcc86  116  tests/golden/shadowing.jai
 4dc922fb8cad60f5bd87b793c32d733a81995ad660ee59e0286873c8a59e30d3  227  tests/golden/type_tests.jai
 250323de8077b4a7d67436953eb2f030bb2ed62e2c31537d433dddfed9972dd5  485  tests/golden/values_and_dispatch.jai
-# 149 files, 189545 instructions probed
+# 149 files, 189497 instructions probed

@@ -12,8 +12,8 @@
 #:   links the subclass).
 #: - The line table is a *byte* length followed by an LTV1 stream — delta and
 #:   LEB128 per entry, see `VERSION_LTV1`; it is debug data, ignored when
-#:   comparing. Before `VERSION_LTV1` it was 12-byte `{offset, span, spanEnd}`
-#:   rows, which the reader still accepts.
+#:   comparing. A zero length means the spans were stripped into a `.jaid`
+#:   beside the image.
 #: - String constants are tag-10 indices into one module string table, not
 #:   inline bytes; see `VERSION_STRTAB` and `StrTab`.
 #: - Nothing is trusted: a short read, an out-of-range index or a bad CRC all
@@ -45,15 +45,16 @@ pub const VERSION: int = 13
 #: by the previous generation, and refusing them leaves the tree with no front
 #: end and no way to build one. `make reseed` twice closes the gap — generation
 #: one still runs the old compiler out of the old seed.
-pub const VERSION_MIN: int = 11
+pub const VERSION_MIN: int = 13
 
-#: First container version whose line table is LTV1 (delta + LEB128). Below it,
-#: the table is `_LINE_ROW`-sized absolute rows.
+#: First container version whose line table is LTV1 (delta + LEB128). Kept as
+#: the record of when the encoding changed; `VERSION_MIN` is now past it, so no
+#: accepted image predates LTV1 and the reader carries no other line format.
 pub const VERSION_LTV1: int = 12
 
 #: First container version carrying a module string table, whose strings every
-#: pool then names by a tag-10 index. Below it, each pool holds its own tag-4
-#: bytes.
+#: pool then names by a tag-10 index. `VERSION_MIN` is now past it, so the
+#: inline tag-4 form the reader used to accept is gone.
 pub const VERSION_STRTAB: int = 13
 
 #: `JAI_COMPILER_VERSION`, recorded so that a new compiler ignores old caches.
@@ -107,8 +108,6 @@ pub const MAX_DEPTH: int = 64
 #: Smallest file that could hold a header and a checksum.
 pub const MIN_SIZE: int = 32
 
-#: Bytes per line-table row before `VERSION_LTV1`: three absolute u32s.
-const _LINE_ROW: int = 12
 const _EXC_ROW: int = 16
 const _CONST_LIMIT: int = 16777216
 let _SIGN_BIT: int = -9223372036854775807 - 1
@@ -982,18 +981,9 @@ fn _read_function(reader: Reader, depth: int) -> FuncProto? {
 
     let line_bytes = reader.u32()
     if reader.bad or line_bytes > reader.left() { return null }
-    var lines: list[LineEntry] = []
-    if reader.version >= VERSION_LTV1 {
-        let decoded = _ltv1_decode(reader, line_bytes)
-        if decoded == null { return null }
-        lines = decoded ?? []
-    } else {
-        # Pre-LTV1: three absolute u32s per row.
-        if line_bytes % _LINE_ROW != 0 { return null }
-        for _row in range(line_bytes // _LINE_ROW) {
-            lines.push(LineEntry(reader.u32(), reader.u32(), reader.u32()))
-        }
-    }
+    let decoded = _ltv1_decode(reader, line_bytes)
+    if decoded == null { return null }
+    let lines = decoded ?? []
 
     let exception_count = reader.u16()
     if reader.bad or not reader.fits(exception_count, _EXC_ROW) { return null }
@@ -1063,11 +1053,13 @@ fn _read_constant(reader: Reader, depth: int) -> Const? {
     if tag == 1 { return Const(ConstTag.Bool, reader.u8() != 0) }
     if tag == 2 { return Const(ConstTag.Int, reader.u64()) }
     if tag == 3 { return Const(ConstTag.Float, reader.f64()) }
-    if tag == 4 or tag == 9 {
+    # Tag 4 (inline string bytes) is gone: from `VERSION_STRTAB` on every string
+    # is a tag-10 index, and `VERSION_MIN` no longer admits an image that could
+    # carry one.
+    if tag == 9 {
         let length = reader.u32()
         if reader.bad or length > reader.left() { return null }
-        let text = utf8_text(reader.bytes(length))
-        return Const(if tag == 4 { ConstTag.Str } else { ConstTag.Type }, text)
+        return Const(ConstTag.Type, utf8_text(reader.bytes(length)))
     }
     if tag == 5 {
         let length = reader.u32()
