@@ -415,6 +415,15 @@ linetable-check:
 jit-fusion-check:
 	@uv run python scripts/jit_fusion_check.py
 
+# The JIT's decline census, collapsed to distinct reasons and compared against a
+# recorded baseline. A NEW reason means the tier stopped compiling something it
+# used to; a reason that disappears is fine and needs no commit. Coverage only:
+# roadmap.md §7 is explicit that clearing a decline is not itself a speedup.
+# Runs the benchmark suite twice (warm, then measure), so it is not in `test`.
+.PHONY: jit-declines-check
+jit-declines-check:
+	@./scripts/jit_declines.sh check
+
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
 VERIFY_OBJS := $(filter-out $(BUILD)/src/cli/main.o,$(OBJS))
