@@ -1,16 +1,4 @@
-/* repl.c — the interactive read-eval-print loop.
- *
- * Every input is compiled into an anonymous module body that shares one
- * persistent module, so bindings survive from line to line: the resolver runs
- * in `replMode`, where a name it has never seen becomes a deferred global that
- * the VM looks up in that module at run time.
- *
- * Incomplete input is a first-class state, not an error: a bracket, a
- * triple-quoted string or a block comment that is still open, or a line that
- * ends on an operator, keeps the loop reading with a continuation prompt.
- * Every other outcome is decided now, so the prompt never waits for a line
- * that cannot arrive, and end of input never drops what was typed in silence.
- */
+/* repl.c — the interactive read-eval-print loop.*/
 
 #if !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L

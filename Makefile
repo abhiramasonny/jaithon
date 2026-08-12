@@ -373,7 +373,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check jit-fusion-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -406,6 +406,14 @@ opstats-check:
 .PHONY: linetable-check
 linetable-check:
 	@./scripts/linetable_golden.sh check
+
+# Every fused opcode must have an arm in the function JIT. The tier's switch
+# ends in `default: return false`, which declines the WHOLE function, so a fused
+# opcode without an arm evicts the hot loops it was created for. Measured on one
+# such shape: 906ms declining against 26ms compiled.
+.PHONY: jit-fusion-check
+jit-fusion-check:
+	@uv run python scripts/jit_fusion_check.py
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.

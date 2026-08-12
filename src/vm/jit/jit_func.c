@@ -3399,6 +3399,37 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        /* `slots[S] < imm`, pushing the bool.
+         *
+         * This arm was missing until 2026-08-12, so any function containing the
+         * opcode declined WHOLE -- which is the failure the peephole's own
+         * history records: OP_CMP_LOCAL_CONST_LT shipped without a JIT arm once
+         * before and cost 14 distinct declines. Nothing in the benchmark suite
+         * happened to hit it this time, which is exactly why it went unnoticed;
+         * `make jit-fusion-check` now refuses a build where a fused opcode has
+         * no arm here. */
+        case OP_CMP_LOCAL_CONST_LT: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int16_t  imm  = jaiReadI16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+
+            /* Compare before pushing: the compare reads the local, and the
+             * pushed entry is only the bool the flags produce. */
+            if (imm >= -4095 && imm <= 4095) {
+                emitCmpImm(e, localIn(e, slot, JIT_SCRATCH_C), imm);
+            } else {
+                emitConst64(e, JIT_SCRATCH_A, imm);
+                emit(e, jaiA64SubsXReg(31, localIn(e, slot, JIT_SCRATCH_C),
+                                       JIT_SCRATCH_A));
+            }
+            if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+            emit(e, jaiA64CsetX(pushReg(e) - 1, JAI_A64_LT));
+            off += 5;
+            break;
+        }
+
         case OP_ADD_INT_CONST: {
             unsigned slot = jaiReadU16(code + off + 1);
             int16_t  imm  = jaiReadI16(code + off + 3);

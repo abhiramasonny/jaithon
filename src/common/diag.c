@@ -1,19 +1,9 @@
-/* diag.c — source registry, diagnostic collection, and rendering.
- *
- * The rendered shape is normative; see spec/LANGUAGE.md §13. Nothing here
- * writes to stderr on its own — the caller picks the stream.
- */
-#include "common/diag.h"
+// diag.c has source registry, diagnostic collection, and rendering.
 
+#include "common/diag.h"
 #include <stdlib.h>
 #include <unistd.h>
 
-/* ------------------------------------------------------------------ */
-/* Small string helpers                                                */
-/* ------------------------------------------------------------------ */
-
-/* jaiRealloc needs the old size to keep its byte accounting honest, and every
- * string we own is NUL-terminated, so strlen is the authority. */
 static void freeStr(char *s) {
     if (s != NULL) (void)jaiRealloc(s, strlen(s) + 1, 0);
 }
@@ -44,14 +34,8 @@ static char *formatV(const char *fmt, va_list ap) {
     return buf;
 }
 
-/* ------------------------------------------------------------------ */
-/* Source registry                                                     */
-/* ------------------------------------------------------------------ */
-
 static JAI_VEC(JaiSourceFile) gSources;
 
-/* One pass to count lines, one to fill: the index is exact-sized and never
- * grown again, which matters because spans index it on every diagnostic. */
 static void buildLineIndex(JaiSourceFile *f) {
     const char *const source = f->source;
     const char *const end = source + f->length;
@@ -112,7 +96,6 @@ void jaiSourceFreeAll(void) {
     JAI_VEC_FREE(JaiSourceFile, &gSources);
 }
 
-/* Index of the line containing `offset`; the offset is assumed clamped. */
 static inline int lineIndexFor(const JaiSourceFile *f, uint32_t offset) {
     const int count = f->lineCount;
     if (count <= 1) return 0;
@@ -155,10 +138,7 @@ void jaiSourceLineCol(int fileId, uint32_t offset, int *line, int *col) {
     int idx = lineIndexFor(f, offset);
     uint32_t start = f->lineStarts[idx];
     if (line != NULL) *line = idx + 1;
-    if (col != NULL) {
-        /* Columns count Unicode scalars, per spec §1.1. */
-        *col = (int)jaiUtf8Length(f->source + start, offset - start) + 1;
-    }
+    if (col != NULL) { *col = (int)jaiUtf8Length(f->source + start, offset - start) + 1; }
 }
 
 const char *jaiSourceLineText(int fileId, uint32_t offset, size_t *outLen,
@@ -180,14 +160,10 @@ const char *jaiSourceLineText(int fileId, uint32_t offset, size_t *outLen,
     return f->source + start;
 }
 
-/* ------------------------------------------------------------------ */
-/* Spans                                                               */
-/* ------------------------------------------------------------------ */
-
 JaiSpan jaiSpanJoin(JaiSpan a, JaiSpan b) {
     if (a.file < 0) return b;
     if (b.file < 0) return a;
-    if (a.file != b.file) return a;   /* cross-file joins keep the first */
+    if (a.file != b.file) return a;
 
     JaiSpan out;
     out.file = a.file;
@@ -197,9 +173,7 @@ JaiSpan jaiSpanJoin(JaiSpan a, JaiSpan b) {
     return out;
 }
 
-/* ------------------------------------------------------------------ */
-/* Error codes                                                         */
-/* ------------------------------------------------------------------ */
+//error codes
 
 #define JAI_WARNING_BASE 10000
 
@@ -241,15 +215,7 @@ const char *jaiDiagCodeString(JaiDiagCode code) {
     return b;
 }
 
-/* "E0402" or "W0101" back to the code it names, or JAI_OK.
- *
- * The inverse of jaiDiagCodeString, and arithmetic for the same reason that is:
- * an error code *is* its enum value and a warning code is its offset from
- * JAI_WARNING_BASE. No table to keep in step.
- *
- * Needed because the self-hosted front end spells codes as strings -- Jaithon
- * has no C enum to share -- and its diagnostics have to become JaiDiag before
- * anything can render them properly. */
+// "E0402" or "W0101" back to the code it names, or JAI_OK
 JaiDiagCode jaiDiagCodeFromString(const char *text) {
     if (text == NULL || (text[0] != 'E' && text[0] != 'W')) return JAI_OK;
     int value = 0;
@@ -261,15 +227,6 @@ JaiDiagCode jaiDiagCodeFromString(const char *text) {
     return (JaiDiagCode)value;
 }
 
-/* ------------------------------------------------------------------ */
-/* "did you mean" suggestions                                          */
-/* ------------------------------------------------------------------ */
-
-/*
- * Optimal-string-alignment Damerau-Levenshtein, restricted to the band that
- * can possibly produce a result <= max. Suggestion callers cap max at 3, so
- * this turns the common O(n*m) matrix into O(n*max) work.
- */
 static int nameDistanceSized(const char *a, size_t la,
                              const char *b, size_t lb, int max) {
     if (max < 0) return max + 1;
@@ -375,14 +332,7 @@ bool jaiNameIsCloser(const char *name, const char *candidate, int *best) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* The bag                                                             */
-/* ------------------------------------------------------------------ */
-
 JaiDiagBag gDiags;
-
-/* Handed back once the error limit is hit so callers can keep attaching
- * labels to a diagnostic that will never be rendered. */
 static JaiDiag gSink;
 
 #define JAI_DEFAULT_MAX_ERRORS 25
@@ -435,8 +385,6 @@ static JaiDiag *addDiag(JaiDiagCode code, JaiSeverity severity, JaiSpan span,
     JaiDiagBag *bag = &gDiags;
 
     if (severity == JAI_SEV_ERROR) {
-        /* errorCount keeps rising past the limit; flush compares it against
-         * the number of errors it actually rendered to detect truncation. */
         if (bag->maxErrors > 0 && bag->errorCount >= bag->maxErrors) {
             bag->errorCount++;
             freeStr(message);
@@ -479,8 +427,6 @@ JaiDiag *jaiDiagWarn(JaiDiagCode code, JaiSpan span, const char *fmt, ...) {
 
 void jaiDiagAddLabel(JaiDiag *d, JaiSpan span, const char *fmt, ...) {
     if (d == NULL || d == &gSink) return;
-    /* secondary[] is fixed at four by the header; a fifth label is dropped
-     * rather than displacing an earlier, usually more relevant one. */
     if (d->secondaryCount >= (int)(sizeof d->secondary / sizeof d->secondary[0])) return;
 
     char *label = NULL;
@@ -501,7 +447,7 @@ void jaiDiagAddHelp(JaiDiag *d, const char *fmt, ...) {
     va_start(ap, fmt);
     char *text = formatV(fmt, ap);
     va_end(ap);
-    freeStr(d->help);          /* last writer wins; the old text is not leaked */
+    freeStr(d->help);
     d->help = text;
 }
 
@@ -520,10 +466,6 @@ bool jaiDiagHasErrors(const JaiDiagBag *bag) {
            (bag->errorCount > 0 ||
             (bag->warningsAsErrors && bag->warningCount > 0));
 }
-
-/* ------------------------------------------------------------------ */
-/* Rendering                                                           */
-/* ------------------------------------------------------------------ */
 
 #define ANSI_RESET  "\x1b[0m"
 #define ANSI_BOLD   "\x1b[1m"
@@ -556,8 +498,6 @@ static const char *severityColor(JaiSeverity s, bool color) {
     return ANSI_RED;
 }
 
-/* Display column of a byte offset within a line: scalars count one, tabs
- * advance to the next multiple of JAI_TAB_WIDTH. */
 static int displayColumn(const char *line, size_t len, size_t byteOffset) {
     if (byteOffset > len) byteOffset = len;
 
@@ -590,8 +530,6 @@ static int displayColumn(const char *line, size_t len, size_t byteOffset) {
     return col;
 }
 
-/* Writes the line with the same tab expansion displayColumn assumes, so the
- * markers below it land under the right characters. */
 static void writeExpanded(FILE *out, const char *line, size_t len) {
     int col = 0;
     size_t i = 0;
@@ -647,13 +585,13 @@ static void writeExpanded(FILE *out, const char *line, size_t len) {
 
 typedef struct {
     int32_t     file;
-    int         line;        /* 1-based */
-    const char *text;        /* line text, newline excluded */
+    int         line;
+    const char *text;
     size_t      textLen;
-    int         startCol;    /* display column, 0-based, tabs expanded */
-    int         col;         /* 1-based scalar column, as jaiSourceLineCol reports */
-    int         width;       /* caret run length, >= 1 */
-    const char *label;       /* borrowed from the diagnostic; may be NULL */
+    int         startCol;
+    int         col;
+    int         width;
+    const char *label;
     bool        isPrimary;
 } Marker;
 
@@ -677,15 +615,14 @@ static bool makeMarker(JaiSpan span, const char *label, bool isPrimary, Marker *
     size_t s = span.start > lineStart ? span.start - lineStart : 0;
     size_t e = span.end > lineStart ? span.end - lineStart : 0;
     if (s > len) s = len;
-    if (e > len) e = len;          /* multi-line spans stop at the line end */
+    if (e > len) e = len;
     if (e < s) e = s;
 
     m->file = span.file;
     m->line = line;
     m->text = text;
     m->textLen = len;
-    /* The caret sits at the tab-expanded column, but the reported column is
-     * the scalar count so that it agrees with jaiSourceLineCol (spec §1.1). */
+
     m->startCol = displayColumn(text, len, s);
     m->col = (int)jaiUtf8Length(text, s) + 1;
     int endCol = displayColumn(text, len, e);
@@ -710,24 +647,15 @@ static void sortMarkers(Marker *m, int n) {
 }
 
 static inline int digitCount(int n) {
-    if (n < 10) return 1;
-    if (n < 100) return 2;
-    if (n < 1000) return 3;
-    if (n < 10000) return 4;
-    if (n < 100000) return 5;
-    if (n < 1000000) return 6;
-    if (n < 10000000) return 7;
-    if (n < 100000000) return 8;
-    if (n < 1000000000) return 9;
-    return 10;
+    if (n < 0) n = -n;
+    if (n == 0) return 1;
+    return (int)floor(log10(n)) + 1;
 }
 
 static void renderGutterBar(FILE *out, int gw, const char *blue, const char *reset) {
     fprintf(out, "%s%*s |%s\n", blue, gw, "", reset);
 }
 
-/* One location block: the arrow, then every marker line for this file in
- * source order, elided with "..." across gaps. */
 static void writeRepeatedChar(FILE *out, char c, int count) {
     if (count <= 0) return;
 
@@ -752,8 +680,6 @@ static void renderBlock(FILE *out, const Marker *m, int n, int gw,
     JaiSourceFile *f = jaiSourceGet(m[0].file);
     const char *path = (f != NULL && f->path != NULL) ? f->path : "<unknown>";
 
-    /* The arrow points at the primary marker even when a secondary sorts
-     * ahead of it. */
     const Marker *anchor = &m[0];
     for (int i = 0; i < n; i++) {
         if (m[i].isPrimary) { anchor = &m[i]; break; }
@@ -765,7 +691,6 @@ static void renderBlock(FILE *out, const Marker *m, int n, int gw,
     int prevLine = 0;
     for (int i = 0; i < n; i++) {
         if (i > 0 && m[i].line != prevLine) {
-            /* The elision sits in the gutter, right-aligned with the bar. */
             if (m[i].line - prevLine > 1) fprintf(out, "%s%*s%s\n", blue, gw + 2, "...", reset);
         }
         if (m[i].line != prevLine) {
@@ -787,7 +712,7 @@ static void renderBlock(FILE *out, const Marker *m, int n, int gw,
 
 void jaiDiagRender(const JaiDiag *d, FILE *out, bool color) {
     if (d == NULL || out == NULL) return;
-    if (d == &gSink) return;   /* dropped by the error limit; never shown */
+    if (d == &gSink) return;
 
     const char *reset = pick(color, ANSI_RESET);
     const char *bold = pick(color, ANSI_BOLD);
@@ -803,9 +728,6 @@ void jaiDiagRender(const JaiDiag *d, FILE *out, bool color) {
                 bold, message, reset);
     }
 
-    /* JaiDiag.primary is a bare span, so the only way to label the caret run
-     * is a label attached to exactly that span; it folds into the primary
-     * marker instead of drawing a second underline on the same columns. */
     const char *primaryLabel = NULL;
     for (int i = 0; i < d->secondaryCount; i++) {
         if (spanEqual(d->secondary[i].span, d->primary) && d->secondary[i].label != NULL) {
@@ -829,7 +751,6 @@ void jaiDiagRender(const JaiDiag *d, FILE *out, bool color) {
         }
         int gw = digitCount(maxLine) + 1;
 
-        /* Group by file, first appearance first, so the primary's file leads. */
         bool taken[JAI_MAX_MARKERS] = {false};
         for (int i = 0; i < n; i++) {
             if (taken[i]) continue;
@@ -878,10 +799,6 @@ bool jaiDiagFlush(JaiDiagBag *bag, FILE *out) {
     return hadErrors;
 }
 
-/* ------------------------------------------------------------------ */
-/* Runtime tracebacks                                                  */
-/* ------------------------------------------------------------------ */
-
 void jaiPrintTraceback(FILE *out, const JaiFrameInfo *frames, int count,
                        const char *excType, const char *excMessage, bool color) {
     if (out == NULL) return;
@@ -893,7 +810,6 @@ void jaiPrintTraceback(FILE *out, const JaiFrameInfo *frames, int count,
 
     if (frames != NULL && count > 0) {
         fprintf(out, "%sTraceback (most recent call last):%s\n", bold, reset);
-        /* frames[0] is the outermost call — "most recent call last". */
         for (int i = 0; i < count; i++) {
             const JaiFrameInfo *fr = &frames[i];
             const char *name = fr->functionName != NULL ? fr->functionName : "<module>";
@@ -919,8 +835,6 @@ void jaiPrintTraceback(FILE *out, const JaiFrameInfo *frames, int count,
             size_t len = 0;
             const char *text = jaiSourceLineText(sf->id, fr->span.start, &len, NULL);
             if (text == NULL) continue;
-            /* Re-indent to a fixed four spaces, as Python does, so deeply
-             * nested source stays readable in the traceback. */
             size_t s = 0;
             while (s < len && (text[s] == ' ' || text[s] == '\t')) s++;
             if (s < len) {
