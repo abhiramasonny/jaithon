@@ -196,10 +196,8 @@ pub fn try_fold(
     return (true, literal)
 }
 
-#: A folded value in the one spelling both front ends must produce for it.
-#:
-#: Integers in decimal, floats through the `%.17g` the constant pool uses. A
-#: The retired sema dump held this and compared it byte for byte.
+#: A folded value in the one spelling both front ends must produce for it:
+#: integers in decimal, floats through the `%.17g` the constant pool uses.
 pub fn render_const(value: ConstValue) -> str {
     match value.kind {
         ConstKind.Int => { return f"{value.as_int()}" }

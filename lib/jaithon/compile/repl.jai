@@ -1,22 +1,15 @@
 #: What the prompt needs from the front end that a file never asks for.
 #:
-#: A REPL reads one line at a time and has to decide, before compiling
-#: anything, whether what it has is a whole input or the start of one. The C
-#: driver used to answer that by running the C lexer and parser directly, which
-#: is the last reason `src/lang` existed. Everything here replaces that: the
-#: driver hands over the accumulated buffer and gets back a verdict.
-#:
-#: The verdict has three shapes, and telling them apart is the whole job:
-#: complete (compile it), incomplete (keep reading), and mismatched (reject it
-#: now, because no later line can fix a closer that opened nothing).
+#: A REPL reads one line at a time and must decide, before compiling, whether
+#: it has a whole input, the start of one, or a mismatched closer.
 from jaithon.compile.lexer import Code, Diagnostic, DiagnosticBag, Lexer, Token, TokenKind
 from jaithon.compile.parser import Parser
 
 #: What is holding an input open.
 #:
-#: The distinction matters at the continuation prompt: a blank line abandons an
-#: input that only trails an operator, but inside a bracket or a literal a
-#: blank line is content, and a pasted block that contains one has to survive.
+#: Matters at the continuation prompt: a blank line abandons input that only
+#: trails an operator, but inside a bracket or literal it's content that must
+#: survive.
 pub enum OpenKind {
     None,
     #: `(`, `[` or `{` is still waiting for its closer.
@@ -58,9 +51,8 @@ pub class Scan {
 
     #: `open` as a number, for a driver that cannot name a Jaithon enum.
     #:
-    #: The C prompt reads the verdict through this: the order here is the
-    #: order of `JaiReplOpenKind` in `src/runtime/frontend.h`, and the two have
-    #: to be changed together.
+    #: Order must match `JaiReplOpenKind` in `src/runtime/frontend.h` -- change
+    #: both together.
     pub fn open_ordinal(self) -> int {
         return match self.open {
             OpenKind.None => 0,
@@ -81,10 +73,9 @@ fn _utf8_length(code_point: int) -> int {
 
 #: The buffer indexed both ways at once.
 #:
-#: Every span the lexer produces is a pair of *byte* offsets, while a `str` is
-#: indexed by scalar. Mixing the two silently works on ASCII and puts the caret
-#: in the wrong place on anything else, so the conversion happens here and
-#: nowhere else. The lexer builds the same two lists for the same reason.
+#: Lexer spans are *byte* offsets; a `str` is indexed by scalar. Mixing the
+#: two silently works on ASCII and misplaces the caret on anything else, so
+#: the conversion happens here and nowhere else.
 class _Text {
     pub let chars: list[str]
     #: Byte offset of each character, plus the total length at the end.
@@ -116,9 +107,8 @@ class _Text {
         return low
     }
 
-    # 1-based line and column of a byte offset. Columns count scalars, not
-    # bytes, so a line with text above U+007F before the bracket still points
-    # at the right place.
+    # 1-based line and column; columns count scalars, not bytes, so text
+    # above U+007F before the bracket still lines up correctly.
     pub fn position_at(self, offset: int) -> tuple[int, int] {
         let limit = self.index_of_byte(offset)
         var line = 1
@@ -193,8 +183,8 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
     }
 
     if stack.len() > 0 {
-        # Name the outermost one: that is the construct the input set out to
-        # write, and the one the user is being asked to finish.
+        # Name the outermost bracket -- the construct the user is being asked
+        # to finish.
         out.incomplete = true
         out.open = OpenKind.Bracket
         out.opener = stack[0][0]
@@ -218,13 +208,10 @@ fn _is_triple_quote_at(text: _Text, offset: int) -> bool {
 
 #: Where the f-string the lexer is still inside was opened, or -1.
 #:
-#: An f-string diagnostic is raised where the lexer noticed the trouble, not at
-#: the quote that started the literal: `f"""a {n}` reports at the byte after the
-#: interpolation, and an interpolation still open at end of input reports at the
-#: end of the buffer. Neither offset says whether the literal was triple-quoted,
-#: so the opener has to come from the token stream, where every f-string leaves
-#: an `FStringStart` at its first byte. The last one is the one still open: the
-#: lexer only stops mid-literal at the end of the input.
+#: The diagnostic reports where the lexer noticed trouble, not the opening
+#: quote, so the opener comes from the token stream's `FStringStart` instead;
+#: the last one is the one still open, since the lexer only stops mid-literal
+#: at end of input.
 fn _open_fstring_offset(tokens: list[Token]) -> int {
     var offset = -1
     for token in tokens {
@@ -233,12 +220,13 @@ fn _open_fstring_offset(tokens: list[Token]) -> int {
     return offset
 }
 
-#: An unterminated literal only means "keep typing" when a later line could
-#: still finish it: a block comment, or a triple-quoted string still open where
-#: the input stops. The decision is made on the span of the literal the lexer
-#: complained about rather than on the whole buffer, so a complete `"""..."""`
-#: earlier in the input cannot make a broken one-line string look like the start
-#: of a long one.
+#: An unterminated literal means "keep typing" only when a later line could
+#: finish it: a block comment, or a triple-quoted string still open at the
+#: input's end.
+#:
+#: Decided from the offending literal's own span, not the whole buffer, so a
+#: complete `"""..."""` earlier in the input can't disguise a broken one-line
+#: string as the start of a long one.
 fn _unterminated_literal_continues(
     bag: DiagnosticBag,
     tokens: list[Token],
@@ -275,11 +263,10 @@ fn _unterminated_literal_continues(
         if found < 0 { return false }
         opener = found
     } else {
-        # The literal has to reach the end of the input; one the lexer recovered
-        # from at an earlier newline is a plain error. The buffer always ends in
-        # the newline the prompt appended, which the span stops short of. An
-        # f-string needs no such test: the lexer leaves a triple-quoted one open
-        # only when it runs out of input.
+        # The literal must reach the end of input; the buffer always ends in
+        # the newline the prompt appended, which the span stops short of by
+        # one. An f-string needs no such test: the lexer only leaves a
+        # triple-quoted one open when it runs out of input.
         if span.end + 1 < text.byte_length() { return false }
     }
     if not _is_triple_quote_at(text, opener) { return false }
@@ -293,9 +280,9 @@ fn _unterminated_literal_continues(
 
 #: Decide what to do with `source`: run it, keep reading, or reject it now.
 #:
-#: Nothing is registered and no diagnostic escapes: a line still being typed
-#: must not add to the source table, and the compile that follows a complete
-#: input produces the real diagnostics with real spans.
+#: Nothing is registered and no diagnostic escapes: a still-typing line must
+#: not add to the source table, and the real diagnostics come from the
+#: compile that follows a complete input.
 #:
 #: ```
 #: scan("1 + 1\n").incomplete       # false
