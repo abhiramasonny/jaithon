@@ -18,8 +18,6 @@ pub const E0411_INT_FLOAT_MIX: str = "E0411"
 pub const MAX_FACTS: int = 8
 
 #: One thing a condition proved about a binding, on the branch it names.
-#:
-#: `NarrowFact` in `src/sema/check_internal.h`.
 pub class NarrowFact {
     #: The binding the fact is about.
     pub let symbol: Symbol
@@ -37,16 +35,12 @@ pub class NarrowFact {
 }
 
 #: Everything one checker run holds, and every operation this file borrows.
-#:
-#: The C's `Checker *c` and its file-static `gJaiCheck` in one object, plus the
-#: two side tables a Jaithon AST needs. The callbacks are fields rather than
-#: methods so `checker.jai` can replace them without subclassing.
 pub class Ctx {
     #: The intern table every answer is built from.
     pub let universe: Universe
     #: Where diagnostics go. A `var` because a foreign scope swaps in a scratch
     #: bag: a signature read out of another module must not raise a diagnostic
-    #: against this file. `jaiChkForeignBegin` does the same to `gDiags`.
+    #: against this file.
     pub var bag: DiagnosticBag
     #: What the resolver decided: symbols, and which brackets held type args.
     pub let resolution: Resolution
@@ -54,19 +48,18 @@ pub class Ctx {
     #: The class whose body is being checked, for `self`, `super` and visibility.
     pub var current_class: TypeDecl?
     #: What the function whose body is being checked was declared to return, or
-    #: null outside every body. The C's `Checker.currentReturnType`.
+    #: null outside every body.
     pub var current_return_type: Type?
     #: `--strict`: an unannotated parameter is an error. The C's `Checker.strict`.
     pub var strict: bool
-    #: Whether a folded operator node is replaced by its literal. The C's
-    #: `c->foldConstants`.
+    #: Whether a folded operator node is replaced by its literal.
     pub var fold_constants: bool
     #: `const` name to the initialiser it folded to, as `fold.jai` takes it.
     pub var consts: dict[str, Node]
     #: How far each declaration has got through layout, keyed by `id(decl)`:
     #: absent or 0 for unstarted, 1 for in progress, 2 for laid out. Layout has
     #: to be idempotent, and a declaration reached again while in progress is
-    #: `E0706` — `DeclEntry.status` in `src/sema/check.c`. `decl.jai` writes it.
+    #: `E0706`.
     pub var layout_status: dict[int, int]
 
     var node_types: dict[int, Type]
@@ -90,7 +83,7 @@ pub class Ctx {
     #: module it came from. Null when nothing set one, and then `m.f` is `any`.
     pub var sig_loader: any?
     #: The module whose namespace names currently resolve in, or null for this
-    #: file's own. `gJaiCheck.foreignOrigin`, held as `any` like `TypeDecl.origin`.
+    #: file's own.
     pub var foreign_origin: any?
     #: Every name an import bound in this file. A name in here that denotes no
     #: declaration this checker could load is `any` rather than E0402.
@@ -102,50 +95,47 @@ pub class Ctx {
     var type_names: list[tuple[str, Type]]
 
     #: Check that `source` fits `target`, converting or guarding where it must.
-    #: `jaiChkRequireAssignable` in `src/sema/check.c`; the default is a port.
     pub var require_assignable: fn(Ctx, Node?, Type?, Type?, str, str) -> bool
     #: Push an expected type down into a literal before it is checked.
-    #: `jaiChkApplyContext`. The default is a port of it.
     pub var apply_context: fn(Ctx, Node?, Type?) -> void
     #: Rewrite an `int` expression so that it produces `to`, a `float`.
-    #: `jaiChkWidenToFloat`. The default is a port of it.
     pub var widen_to_float: fn(Ctx, Node?, Type) -> void
-    #: The type a written annotation denotes. `jaiChkResolveAstType`.
+    #: The type a written annotation denotes.
     #: **The default answers null**, so every annotation reads as `any`.
     pub var resolve_ast_type: fn(Ctx, TypeExpr?) -> Type?
-    #: The type a bare name denotes, when it denotes one. `jaiChkLookupTypeName`.
+    #: The type a bare name denotes, when it denotes one.
     #: The default answers from the declaration registry; `checker.jai` extends it.
     pub var lookup_type_name: fn(Ctx, str?) -> Type?
     #: Lay a declaration out, so that its members can be looked up.
-    #: `jaiChkLayoutDecl`. **The default does nothing.**
+    #: **The default does nothing.**
     pub var layout_decl: fn(Ctx, TypeDecl?) -> void
-    #: Bind a pattern against the type it destructures. `jaiChkPattern`.
+    #: Bind a pattern against the type it destructures.
     #: **The default does nothing**, so a comprehension's loop variable is `any`.
     pub var check_pattern: fn(Ctx, Node?, Type) -> void
     #: Check a block in expression position.
-    #: `jaiChkBlock`. **The default does nothing.**
+    #: **The default does nothing.**
     pub var check_block: fn(Ctx, Node?) -> void
     #: Check a statement that reached expression position.
-    #: `jaiChkStmt`. **The default does nothing.**
+    #: **The default does nothing.**
     pub var check_stmt: fn(Ctx, Node?) -> void
-    #: Check a declaration that appeared in a block. `jaiChkDecl`, which
-    #: `check_decl.c` owns. **The default does nothing.** `stmt.jai` reaches it.
+    #: Check a declaration that appeared in a block.
+    #: **The default does nothing.**
     pub var check_decl: fn(Ctx, Node?) -> void
-    #: Check the body of a lambda or an anonymous function. `jaiChkFunction`.
+    #: Check the body of a lambda or an anonymous function.
     #: **The default does nothing**; `function_type` still builds the signature.
     pub var check_function: fn(Ctx, Node?) -> void
     #: The `Fn` type of a function, lambda or anonymous function node.
-    #: `jaiChkFunctionType`. The default gives `any` per parameter until
-    #: `resolve_ast_type` is supplied; the arity and flags are right anyway.
+    #: The default gives `any` per parameter until `resolve_ast_type` is
+    #: supplied; the arity and flags are right anyway.
     pub var function_type: fn(Ctx, Node?) -> Type
     #: The type of a `match` in expression position.
-    #: `jaiChkMatchExpr`. **The default answers `any`** and checks nothing.
+    #: **The default answers `any`** and checks nothing.
     pub var match_expr: fn(Ctx, Node?, bool) -> Type
     #: Whether this expression is a module object bound by `import m`.
-    #: `moduleSigOfIdent`. **The default answers false.**
+    #: **The default answers false.**
     pub var is_module: fn(Ctx, Node?) -> bool
     #: The type of `name` in a module, and the declaration behind it.
-    #: `moduleMemberType`. **The default answers `(any, null)`.**
+    #: **The default answers `(any, null)`.**
     pub var module_member: fn(Ctx, Node?, str) -> (Type, Node?)
 
     #: Build a run over `universe`, with a fresh bag and resolution by default.
@@ -230,7 +220,7 @@ pub class Ctx {
     #: Register a declaration, by name and by declaring node. `visible` is
     #: `DeclEntry.visible`: everything an imported module declares is registered
     #: so annotations can mention siblings, but only what this file imported may
-    #: be reached by a bare name. `binding` is `DeclEntry.alias`.
+    #: be reached by a bare name.
     pub fn register_decl(self, decl: TypeDecl, visible: bool = true, binding: str? = null) -> void {
         let name = binding ?? decl.name
         # A name this file already declares wins; a genuine clash is E0302.
@@ -261,9 +251,9 @@ pub class Ctx {
         return self.decl_order
     }
 
-    #: The name `t` is bound to in this file, or null when nothing binds it.
-    #: `jaiTypeDeclBindingName`: a runtime guard names a class the way the
-    #: module's globals do — the bare name or the alias, never the qualified one.
+    #: The name `t` is bound to in this file, or null when nothing binds it. A
+    #: runtime guard names a class the way the module's globals do — the bare
+    #: name or the alias, never the qualified one.
     pub fn binding_name(self, t: Type?) -> str? {
         if t is null or not t.is_named() { return null }
         for declared in self.decl_order {
@@ -277,10 +267,6 @@ pub class Ctx {
     #: the declaration, which for an imported enum is in another file.
     #: Every type name this compilation knows and what each was declared as --
     #: the file's own declarations and the imported ones alike.
-    #:
-    #: The prompt carries these from one input to the next. It cannot read the
-    #: tree for them: `from m import Point` binds a name to a class as surely
-    #: as `class Point` does, and only the checker has been to `m`.
     pub fn declared_kinds(self) -> dict[str, TyKind] {
         var out: dict[str, TyKind] = {}
         for name in self.decls_by_name.keys() {
@@ -319,10 +305,10 @@ pub class Ctx {
     }
 
     #: Resolve names in `origin`'s namespace until `leave_foreign` puts it back.
-    #: `jaiChkForeignBegin`. The scope and the bag change together: a name the
-    #: foreign module can see and this file cannot is not this file's mistake to
-    #: report, so the bag is swapped for a scratch one and dropped. A null origin
-    #: is a no-op with a real saved state, so a caller may wrap unconditionally.
+    #: The scope and the bag change together: a name the foreign module can see
+    #: and this file cannot is not this file's mistake to report, so the bag is
+    #: swapped for a scratch one and dropped. A null origin is a no-op with a
+    #: real saved state, so a caller may wrap unconditionally.
     pub fn enter_foreign(self, origin: any?) -> tuple[any?, DiagnosticBag] {
         let saved = (self.foreign_origin, self.bag)
         self.foreign_origin = origin
@@ -337,7 +323,7 @@ pub class Ctx {
     }
 
     #: The module `node` was parsed from, or null for one written in this file.
-    #: `jaiChkOriginOfNode`: every span carries the file it came from.
+    #: Every span carries the file it came from.
     pub fn origin_of_node(self, node: Node?) -> any? {
         if node is null { return null }
         let loader = self.sig_loader
@@ -364,15 +350,14 @@ pub class Ctx {
         return self.decls_by_node.get(id(node), null)
     }
 
-    #: The class, trait or enum a bound name denotes, or null.
-    #: `jaiChkIdentTypeDecl`. Anything the resolver did not call a class answers
-    #: node, which is how an imported binding is recognised.
+    #: The class, trait or enum a bound name denotes, or null. Anything the
+    #: resolver did not call a class answers node, which is how an imported
+    #: binding is recognised.
     pub fn ident_type_decl(self, symbol: Symbol?) -> TypeDecl? {
         if symbol is null { return null }
         if is_type_symbol(symbol.kind) { return self.decl_named(symbol.name) }
-        # An imported binding keeps the resolver's kind — it occupies a local or
-        # a global slot and the emitter relies on that — so what it names is
-        # reached through the declaration attached to the symbol instead.
+        # An imported binding keeps the resolver's kind — it occupies a local or a
+        # global slot — so what it names comes from the declaration on the symbol.
         let imported = self.imported_decl(symbol)
         if imported is not null {
             if imported.kind == NodeKind.ClassDecl or
@@ -386,14 +371,14 @@ pub class Ctx {
     }
 
     #: Where the type-name scope stack stands, so a declaration can unwind here.
-    #: `jaiChkTypeNameMark`. The stack holds names that denote a type only inside
-    #: the declaration that introduced them, and is consulted before the registry.
+    #: The stack holds names that denote a type only inside the declaration that
+    #: introduced them, and is consulted before the registry.
     pub fn type_name_mark(self) -> int {
         return self.type_names.len()
     }
 
     #: Bind `name` to `ty` until the enclosing declaration ends.
-    #: `jaiChkPushTypeName`. A null name or type is dropped.
+    #: A null name or type is dropped.
     pub fn push_type_name(self, name: str?, ty: Type?) -> void {
         if name is null or ty is null { return }
         self.type_names.push((name, ty))
@@ -468,16 +453,16 @@ pub class Ctx {
         return self.symbol_type(symbol)
     }
 
-    #: End the fact a store to `symbol` invalidated. `jaiChkNarrowInvalidate`. The
-    #: save stack is left alone: `narrow_restore` still has to unwind in order.
+    #: End the fact a store to `symbol` invalidated. The save stack is left
+    #: alone: `narrow_restore` still has to unwind in order.
     pub fn narrow_invalidate(self, symbol: Symbol?) -> void {
         let declared = self.declared_type(symbol)
         if declared is not null { self.set_symbol_type(symbol, declared) }
     }
 
-    #: What `cond` proves, on the edge `negate` names. `jaiChkCollectFacts`.
-    #: `a and b` gives both facts on the true edge and `not (a or b)` both on the
-    #: false edge; anything else is a disjunction guaranteeing no single fact.
+    #: What `cond` proves, on the edge `negate` names. `a and b` gives both
+    #: facts on the true edge and `not (a or b)` both on the false edge;
+    #: anything else is a disjunction guaranteeing no single fact.
     pub fn collect_facts(self, cond: Node?, negate: bool) -> list[NarrowFact] {
         var out: list[NarrowFact] = []
         self._collect_facts(cond, negate, out)
@@ -664,8 +649,7 @@ fn _default_apply_context(c: Ctx, node: Node?, expected: Type?) -> void {
     }
 
     # Container literals adopt the expected type itself, not just the element
-    # context: without it `let s: list[Shape] = [Circle(), Square()]` infers
-    # `list[Circle | Square]` and is rejected against its own annotation.
+    # context: without it `list[Shape] = [Circle(), Square()]` infers a union.
     match expected.kind {
         TyKind.List | TyKind.Set => {
             # A comprehension builds a fresh container and takes the annotation.
@@ -788,9 +772,8 @@ pub fn is_never(t: Type?) -> bool {
     return t is not null and t.kind == TyKind.Never
 }
 
-# `jaiChkIsVoid`. `void` is `null` under the name a return position uses, so
-# `t_void == t_null` and this is always false, in the C too. Ported because
-# E0409 is.
+# `void` is `null` under the name a return position uses, so `t_void == t_null`
+# and this is always false, in the C too. Ported because E0409 is.
 pub fn is_void(c: Ctx, t: Type?) -> bool {
     if t is null { return false }
     return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
@@ -816,8 +799,7 @@ pub fn type_decl_of(t: Type?) -> TypeDecl? {
 }
 
 # One half of §2.2's implicit conversion: respelling an int literal as a float
-# literal. Not the assignment rule — this decides only whether a conversion node
-# is needed, never whether a conversion happens.
+# literal. Decides only whether a conversion node is needed, not whether one happens.
 fn _retype_int_literal(c: Ctx, node: Node?) -> bool {
     if node is null { return false }
 
@@ -874,11 +856,6 @@ fn _mentions_generic_param(t: Type?) -> bool {
 }
 
 #: The name a runtime type guard checks against.
-#:
-#: `runtimeTypeName` in `src/codegen/codegen.c`. NOT the rendered type: the run
-#: time has erased every type argument, so `list[int]` guards as `list`. A class,
-#: trait or enum answers its *bare* binding name, or the alias it was imported
-#: under, because the VM resolves this operand against the module's globals.
 pub fn runtime_type_name(c: Ctx?, t: Type?) -> str? {
     if t is null { return "any" }
     match t.kind {
@@ -921,7 +898,7 @@ fn _binding_name(c: Ctx?, t: Type) -> str {
 }
 
 #: A union wider than this guards as `any`: dropping members would turn the
-#: check into a wrong rejection. `MAX_UNION_GUARD` in `src/codegen/codegen.c`.
+#: check into a wrong rejection.
 pub const MAX_UNION_GUARD: int = 32
 
 # What a cast records as the thing to check against: a plain name, or a `Union`
@@ -946,9 +923,8 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
 
     let inner = Node(node.kind, node.fields, node.span)
     c.set_type(inner, c.type_of(node))
-    # The resolver keys symbols on node identity and the operand is a *new* node,
-    # so without re-binding a wrapped identifier loses its symbol and is reported
-    # undefined.
+    # The resolver keys symbols on node identity, and the operand is a *new* node:
+    # without re-binding, a wrapped identifier loses its symbol and reads undefined.
     c.resolution.bind(inner, c.resolution.symbol_of(node))
     # And the scope, for the same reason: a wrapped lambda that loses its scope
     # loses its capture list, and compiled to a closure over nothing.

@@ -391,16 +391,11 @@ pub fn check_program(
     outer_type_names: list[tuple[str, Type]] = [],
     strict: bool = false
 ) -> Ctx {
-    # Names bound before anything in `program` is looked at. A file needs none:
-    # it declares everything it can name. A prompt input needs the classes the
-    # inputs before it declared, which are in no registry this compilation can
-    # reach.
-
-    # `--strict`: an unannotated parameter is an error (E0400).
     let c = Ctx(universe, bag, resolution)
     c.fold_constants = fold_constants
     c.strict = strict
     install(c)
+    # A REPL session's earlier inputs declared these; no registry holds them.
     for (name, ty) in outer_type_names { c.push_type_name(name, ty) }
     if program == null { return c }
 

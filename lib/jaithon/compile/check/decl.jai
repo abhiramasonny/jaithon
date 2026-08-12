@@ -1,24 +1,4 @@
 #: Declarations: class, trait and enum layout, conformance, and bodies.
-#:
-#: A port of `src/sema/check_decl.c`, plus the three forms `check_stmt.c` owns
-#: that layout cannot be written without: `jaiChkFunctionType`, `jaiChkFunction`
-#: and `checkVarDecl`.
-#:
-#: Layout does not copy, where the C does. A class's `fields` and `members` hold
-#: exactly what the class itself declares, and every inherited answer is walked
-#: for through `nominal.jai`. `_next_slot` still numbers own fields after the
-#: superclass chain's highest, so an inherited field keeps its slot and a
-#: subclass's inline caches stay valid (§6), and `expr.jai`'s `suggest_member` no
-#: longer offers inherited names. A trait is the exception and restates a
-#: supertrait's members, because `verify_traits` enumerates `trait.members` and
-#: `nominal.jai` has no walking enumerator for it.
-#:
-#: Two E0709 corners are stricter than the C, which reads one flat array where
-#: this reads three lists: a redeclared inherited method is reported, and so is a
-#: field and a method of one name that a trait also declares.
-#:
-#: A folded `const` is recorded in `Ctx.consts`, because a Jaithon `Symbol` has
-#: no `constValue`.
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, TypeKind, Visibility
 from jaithon.ast import always_diverges, preorder
 from jaithon.compile.check.assign import is_subtype
@@ -37,9 +17,6 @@ from jaithon.compile.check.universe import list_of, named
 from jaithon.compile.resolve import Symbol
 
 #: The initialiser of a `const` is not a constant expression.
-#:
-#: Both the code and the message text are a contract with the C front end —
-#: Phase 4 turns `tests/errors` into goldens.
 pub const E0303_NON_CONSTANT_CONST: str = "E0303"
 
 #: A `const` was declared with no initialiser.
@@ -76,9 +53,6 @@ pub const E0708_SUPER_INIT_NOT_FIRST: str = "E0708"
 pub const E0709_DUPLICATE_MEMBER: str = "E0709"
 
 #: The name `Self` is bound to inside a declaration, matching `jaiChkSelfName`.
-#:
-#: The parser forbids a declaration from introducing it (E0114), so substituting
-#: it is one ordinary generic parameter.
 pub const SELF_NAME: str = "Self"
 
 const _NOT_FOUND: int = -1
@@ -91,8 +65,7 @@ let _VISIBILITY_ORDINAL: dict[Visibility, int] = {
 }
 
 # `jaiChkIsAny`, `jaiChkIsNever`, `jaiChkIsVoid`, `jaiChkOrAny` and
-# `jaiChkDeclType`. Spelled again rather than imported because `expr.jai` keeps
-# its copies private.
+# `jaiChkDeclType`, respelled because `expr.jai` keeps its copies private.
 fn _is_any(t: Type?) -> bool {
     if t is null { return true }
     return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
@@ -124,7 +97,6 @@ fn _type_decl_of(t: Type?) -> TypeDecl? {
     return t.decl
 }
 
-# Typed reads of the AST sub-structure records, matching `expr.jai`'s.
 fn _record_span(record: dict[str, any]) -> Span {
     let span: Span = record.get("span", Span.none())
     return span
@@ -166,10 +138,6 @@ fn _node_visibility(node: Node) -> int {
 
 #: Bind each of `generics` as a generic parameter until the enclosing
 #: declaration ends.
-#:
-#: `jaiChkPushGenerics`. The bounds are resolved in a second pass, once every
-#: parameter is in scope, so that `[T: Comparable[T]]` can see itself. A bound is
-#: resolved for its diagnostics alone — nothing records it, as in the C.
 pub fn push_generics(c: Ctx, generics: list[dict[str, any]]) -> void {
     for record in generics {
         let name = _record_name(record)
@@ -183,20 +151,11 @@ pub fn push_generics(c: Ctx, generics: list[dict[str, any]]) -> void {
 }
 
 #: Bind `Self` to `ty`, or leave it abstract when `ty` is null.
-#:
-#: `jaiChkPushSelf`. A trait body wants the abstract form: `Self` stays a generic
-#: parameter, and a requirement written `-> Self` is substituted only when a
-#: class names the trait.
 pub fn push_self(c: Ctx, ty: Type?) -> void {
     c.push_type_name(SELF_NAME, ty ?? generic_param(c.universe, SELF_NAME))
 }
 
 #: Give `node` a `TypeDecl` and an interned type, and register both.
-#:
-#: `jaiChkRegisterDecl`. A name that is already registered answers with the
-#: declaration that holds it and registers nothing — the duplicate is `E0302`
-#: and the resolver's to report. Answers null for any node that is not a class,
-#: trait or enum, and for one with no name.
 pub fn register_decl(c: Ctx, node: Node?) -> TypeDecl? {
     if node is null { return null }
 
@@ -261,8 +220,7 @@ fn _signature_compatible(c: Ctx, sub: Type?, super_ty: Type?) -> (bool, str?) {
 }
 
 # `class MapIter[T, U]: Iterator[U]` on `trait Iterator[T]` binds the trait's own
-# `T` to `U`, so its `fn next(self) -> T?` requires `-> U?` here. The C's
-# `TraitBinding` also carries the parameter names and a `Self`.
+# `T` to `U`, so its `fn next(self) -> T?` requires `-> U?` here.
 fn _trait_binding_of(c: Ctx, trait_decl: TypeDecl, ref: TypeExpr) -> list[Type] {
     var values: list[Type] = []
     let node = trait_decl.node
@@ -275,8 +233,7 @@ fn _trait_binding_of(c: Ctx, trait_decl: TypeDecl, ref: TypeExpr) -> list[Type] 
 
     for (position, written) in ref.args.enumerate() {
         # An argument that resolved to nothing binds the parameter to itself:
-        # `substitute` takes a `dict[str, Type]` and cannot express the C's null,
-        # which leaves the parameter unchanged.
+        # `substitute` takes a `dict[str, Type]` and cannot express the C's null.
         let resolved = c.resolve_ast_type(c, written)
         values.push(resolved ?? generic_param(c.universe, _record_name(generics[position])))
     }
@@ -295,9 +252,8 @@ fn _binding_map(trait_decl: TypeDecl, binding: list[Type]) -> dict[str, Type] {
     return out
 }
 
-# `applyTraitBinding`: the requirement as `owner` wrote it. `Self` is
-# substituted first, so a requirement written `-> Self` becomes the implementer's
-# own type (§7.2); a trait extending a trait leaves it abstract.
+# `Self` is substituted first, so a requirement written `-> Self` becomes the
+# implementer's own type (§7.2); a trait extending a trait leaves it abstract.
 fn _apply_trait_binding(
     c: Ctx,
     owner: TypeDecl,
@@ -324,8 +280,7 @@ fn _render_trait_ref(trait_decl: TypeDecl, binding: list[Type]) -> str {
 }
 
 # Spec §7 makes `self` an explicit first parameter, so a help quoting the bare
-# `fn` type would send the reader straight into E0703. Names come from the trait;
-# types come from `required`, which is already substituted.
+# `fn` type would send the reader straight into E0703.
 fn _render_required_method(name: str, trait_fn: Node?, required: Type?) -> str {
     var params: list[dict[str, any]] = []
     var skip = 0
@@ -386,9 +341,8 @@ fn _inherited_pick(decl: TypeDecl?, name: str, want_setter: bool, fallback: bool
     return find_member(decl, name)
 }
 
-# What the C's flat member array would hold for `name`, in the precedence its
-# construction encodes: own text, then the superclass chain, then the traits in
-# written order. A member reached through a trait comes back substituted.
+# What the C's flat member array would hold for `name`: own text, then the
+# superclass chain, then the traits in written order.
 fn _provided_member(c: Ctx, d: TypeDecl, name: str, want_setter: bool) -> MemberInfo? {
     let own = _own_index(d, name, want_setter, true)
     if own != _NOT_FOUND { return d.members[own] }
@@ -486,9 +440,8 @@ fn _member_type_of(c: Ctx, fn_node: Node, is_getter: bool, is_setter: bool) -> T
     return signature_of(c, fn_node, true)
 }
 
-# `installMember`. `own_from` is where this declaration's own text starts: zero
-# for a class and an enum, the end of the restated supertrait requirements for a
-# trait. An entry before it is replaced; one at or after it is a duplicate.
+# `own_from` is where this declaration's own text starts: zero for a class or
+# enum, the end of restated supertrait requirements for a trait.
 fn _install_member(
     c: Ctx,
     d: TypeDecl,
@@ -655,9 +608,8 @@ fn _verify_traits(c: Ctx, d: TypeDecl) -> void {
     }
 }
 
-# `resolveDeclReference`. Answers `(decl, opaque_name)`: the declaration when
-# this unit can see one, otherwise the name of a trait or class that resolved to
-# a type but to no declaration here.
+# Answers `(decl, opaque_name)`: the declaration when this unit can see one,
+# otherwise the name of a trait or class that resolved to no declaration here.
 fn _resolve_decl_reference(
     c: Ctx,
     ref: TypeExpr,
@@ -669,9 +621,8 @@ fn _resolve_decl_reference(
     let target = _type_decl_of(t)
 
     if target is null {
-        # A trait or class reached through the prelude or an import has a type
-        # but no declaration to lay out here. It is opaque, not wrong: its
-        # contract was checked where it was declared (spec §9).
+        # A trait or class reached through the prelude or an import has a type but
+        # no declaration to lay out here. It is opaque, not wrong (spec §9).
         var opaque = false
         if t is not null {
             opaque = if want_trait { t.kind == TyKind.Trait } else { t.kind == TyKind.Class }
@@ -698,10 +649,8 @@ fn _resolve_decl_reference(
         return (null, null)
     }
 
-    # Through `Ctx`, not the function below: a superclass or trait named here can
-    # live in another module, and laying it out has to install *its* namespace.
-    # Calling straight through kept the current scope and reported E0402 for
-    # `Iterator`'s `Peekable[T]` against a `std.io` file that never wrote it.
+    # Through `Ctx`, not the function below: calling straight through kept the
+    # current scope and falsely reported E0402 for `Iterator`'s `Peekable[T]`.
     c.layout_decl(c, target)
     return (target, null)
 }
@@ -764,9 +713,8 @@ fn _layout_trait(c: Ctx, d: TypeDecl, node: Node) -> void {
         d.traits.push(super_decl)
     }
 
-    # The one place this port copies. `verify_traits` enumerates `trait.members`
-    # rather than walking, so a requirement that was not restated would never be
-    # checked: `trait Sorted[T]: Comparable[T]` must carry `compare(T)` itself.
+    # The one place this port copies: `verify_traits` enumerates `trait.members`
+    # rather than walking, so an unrestated requirement would never be checked.
     for (index, super_decl) in d.traits.enumerate() {
         var binding: list[Type] = []
         if index < d.trait_bindings.len() { binding = d.trait_bindings[index] }
@@ -835,11 +783,6 @@ fn _layout_enum(c: Ctx, d: TypeDecl, node: Node) -> void {
 }
 
 #: Lay `decl` out, so that its fields and members can be looked up.
-#:
-#: `jaiChkLayoutDecl`. Idempotent, and re-entrant on purpose: a superclass or a
-#: trait is laid out on demand from the middle of the declaration that names it,
-#: and a declaration reached while it is still in progress is the cycle `E0706`
-#: reports. Install it as `Ctx.layout_decl`, or let `install` do it.
 pub fn layout_decl(c: Ctx, decl: TypeDecl?) -> void {
     if decl is null { return }
     let key = id(decl)
@@ -865,10 +808,6 @@ pub fn is_init_method(fn_node: Node?) -> bool {
 }
 
 #: The return type `fn_node` was declared with.
-#:
-#: `jaiChkDeclaredReturnType`, with the one place where omission means `void`
-#: rather than `any`: a constructor. Answers null only when a written annotation
-#: failed to resolve.
 pub fn declared_return_type(c: Ctx, fn_node: Node?, is_method: bool) -> Type? {
     if fn_node is null { return c.universe.t_any }
     let written = fn_node.type_field("returnType")
@@ -880,10 +819,6 @@ pub fn declared_return_type(c: Ctx, fn_node: Node?, is_method: bool) -> Type? {
 }
 
 #: The `Fn` type of `fn_node`, dropping the receiver when `is_method`.
-#:
-#: `jaiChkFunctionType`. The type carries the variadic and kwrest flags; the
-#: *binding* types those two parameters have inside the body are `check_body`'s.
-#: A parameter whose written type does not resolve reads as `any`.
 pub fn signature_of(c: Ctx, fn_node: Node?, is_method: bool) -> Type {
     let u = c.universe
     if fn_node is null { return u.t_any }
@@ -924,10 +859,6 @@ fn _parameter_binding_type(c: Ctx, record: dict[str, any]) -> Type {
 }
 
 #: Check the body of `fn_node`, and its parameters' defaults.
-#:
-#: `jaiChkFunction`. `owner` is the declaration a method belongs to, which becomes
-#: `Ctx.current_class` for the body and the type its `self` binds to. E0601 is
-#: reported here because it is a fact about the declaration, not a statement.
 pub fn check_body(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> void {
     if fn_node is null { return }
     let u = c.universe
@@ -1075,9 +1006,8 @@ fn _check_super_init_position(c: Ctx, d: TypeDecl, init: Node) -> void {
 }
 
 fn _check_class_body(c: Ctx, node: Node) -> void {
-    # `jaiTypeDeclFind(name)` followed by `d->decl != node`: a declaration whose
-    # name another one already held was never registered against this node, so
-    # `decl_for_node` answers null and the body is skipped.
+    # A declaration whose name another one already held was never registered
+    # against this node, so `decl_for_node` answers null and the body is skipped.
     let d = c.decl_for_node(node)
     if d is null { return }
     c.layout_decl(c, d)
@@ -1161,10 +1091,6 @@ fn _check_enum_body(c: Ctx, node: Node) -> void {
 
 #: Check one declaration: a function, a class, a trait, an enum, a type alias or
 #: an import.
-#:
-#: `jaiChkDecl`, and the shape `Ctx.check_decl` takes. A `let`, `var` or `const`
-#: is **not** one of these — `jaithon.ast.is_declaration` puts it with the
-#: statements, as the C does — so it goes to `check_var_decl` below instead.
 pub fn check_decl(c: Ctx, node: Node?) -> void {
     if node is null { return }
     match node.kind {
@@ -1221,9 +1147,8 @@ fn _decl_symbol(c: Ctx, node: Node) -> Symbol? {
     return c.resolution.symbol_of(pattern)
 }
 
-# `foldConstDecl`. The folded value is kept so every use can inline it: on the
-# C's `Symbol.constValue`, and here in `Ctx.consts` under the binding's name,
-# where `fold.jai` and `expr.jai` look for it.
+# The folded value is kept in `Ctx.consts` under the binding's name so every use
+# can inline it — where `fold.jai` and `expr.jai` look for it.
 fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
     let init = node.child("init")
     if init is null {
@@ -1252,13 +1177,6 @@ fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
 }
 
 #: Check a `let`, `var` or `const` and give its binding a type.
-#:
-#: `checkVarDecl` in `src/sema/check_stmt.c`. It lives here because `stmt.jai`
-#: does not exist yet; when it does, its `AST_VAR_DECL` case calls this.
-#:
-#: An annotation is the binding's type and the initialiser is checked against it;
-#: without one the initialiser's own type is inferred, widened to `any` for a
-#: `var` bound to null so that a later assignment is not refused.
 pub fn check_var_decl(c: Ctx, node: Node?) -> void {
     if node is null { return }
     let u = c.universe
@@ -1302,9 +1220,6 @@ pub fn check_var_decl(c: Ctx, node: Node?) -> void {
 }
 
 #: Install this file's four callbacks over `Ctx`'s defaults.
-#:
-#: `checker.jai` calls this rather than assigning each field, so that a callback
-#: added here reaches every construction site at once.
 pub fn install(c: Ctx) -> void {
     c.layout_decl = layout_decl
     c.check_decl = check_decl

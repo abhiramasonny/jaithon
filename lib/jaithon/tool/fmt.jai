@@ -9,23 +9,11 @@
 #: a 100-column soft limit that breaks an over-long argument or element list one
 #: item to a line.
 #:
-#: The pipeline is parse, then unparse:
-#:
-#: 1. `jaithon.compile.parser` turns the source into a `jaithon.ast` tree.
-#: 2. `freeze_literals` pins every literal to the text it was written as.
-#: 3. `scan_comments` collects the comments, which the tree does not carry.
-#: 4. The printer walks the tree, delegating expressions to `jaithon.ast.to_source`
-#:    — the one canonical renderer — and owning what that renderer cannot know
-#:    about: comments, blank lines, one-line blocks and the column limit.
-#:
-#: Comments are the whole difficulty. A formatter that drops one is worse than
-#: no formatter, so the rule here is total: every comment in the input appears
-#: in the output, or the file is left exactly as it was. Own-line comments
-#: become leading trivia of the statement below them; a comment sharing a line
-#: with code becomes trailing trivia of that statement, and consecutive trailing
-#: comments at one indentation depth are aligned into a column. A comment
-#: *inside* an expression is the one place the printer cannot put it back, so a
-#: statement holding one is copied from the source verbatim instead.
+#: Pipeline: parse into a `jaithon.ast` tree, `freeze_literals`, `scan_comments`,
+#: then print, delegating expressions to `jaithon.ast.to_source` and owning what
+#: that can't know: comments, blank lines, one-line blocks, the column limit.
+#: Every comment in the input must appear in the output, or the file is left
+#: exactly as it was.
 #:
 #: ```
 #: format_source("let x=1+2\n", "demo.jai")         # "let x = 1 + 2\n"
@@ -41,9 +29,8 @@ from .args import Arguments
 
 #: The column the formatter tries to keep every line inside.
 #:
-#: It is a soft limit: one long string literal or a chain of operators may
-#: exceed it, because the alternative is breaking something that reads worse
-#: broken. Only argument and element lists are broken to obey it.
+#: A soft limit — a long string literal or operator chain may exceed it. Only
+#: argument and element lists are broken to obey it.
 pub const LINE_WIDTH: int = 100
 
 #: How many unchanged lines `unified_diff` prints around each change.
@@ -103,10 +90,9 @@ pub class Comment {
 
 #: Return every comment in `source`, in source order.
 #:
-#: The scan knows about strings, so a `#` inside `"a # b"` is text and not a
-#: comment, and about the nesting of `#* ... *#`. Continuation lines of a block
-#: comment are dedented to the comment's own column, so that a caller can
-#: re-indent the whole comment as a unit.
+#: Aware of strings (a `#` inside one is text, not a comment) and of nested
+#: `#* ... *#`; block-comment continuation lines are dedented to the comment's
+#: own column.
 #:
 #: ```
 #: scan_comments("let x = 1  # why\n")[0].body()    # "why"
@@ -193,15 +179,9 @@ pub fn scan_comments(source: str) -> list[Comment] {
 
 #: Parse `source` into a `jaithon.ast` tree, or raise `ParseError`.
 #:
-#: The tree comes from the front end the compiler itself runs, so the formatter
-#: rewrites the program the compiler sees rather than a second reading of it.
-#: It used to arrive through `__prim__.parse_ast`, which parsed with the C front
-#: end and handed the tree over as the §12 JSON encoding; with the C front end
-#: gone the parser answers `Node` directly and the round trip is not needed.
-#:
-#: The message carries the first diagnostic the front end produced, with its
-#: stable code and the path, so a caller can report it without knowing anything
-#: about `jaithon.compile`.
+#: Uses the front end the compiler itself runs, so the formatter sees the same
+#: tree the compiler does. The exception message carries the first diagnostic's
+#: stable code.
 pub fn parse_module(source: str, path: str) -> Node {
     let bag = DiagnosticBag()
     let program = parse(source, 0, bag)
@@ -219,14 +199,10 @@ pub fn parse_module(source: str, path: str) -> Node {
 
 #: Pin every literal in `program` to the text it was written as, in place.
 #:
-#: The tree remembers a literal's value, not its spelling, so re-rendering one
-#: turns `0xFF` into `255`, `1_000_000` into `1000000` and `r"\d+"` into
-#: `"\\d+"`. A formatter may not do that. Each literal node is therefore
-#: rewritten into the one node kind that prints its text unchanged and binds as
-#: tightly — an identifier holding the original slice of source.
-#:
-#: The result is a tree for printing, not for compiling: run it through
-#: `jaithon.ast.to_source` and parse that, never a later compiler pass.
+#: The tree remembers a literal's value, not its spelling (`0xFF` would
+#: re-render as `255`), so each literal node is rewritten into an identifier
+#: holding the original source slice. The result is for printing only — never
+#: feed it to a later compiler pass.
 pub fn freeze_literals(program: Node, source: str) -> Node {
     let text = _Source(source)
     walk(program, fn(current: Node) -> bool {
@@ -246,10 +222,9 @@ pub fn freeze_literals(program: Node, source: str) -> Node {
 
 #: Format one source file and return the canonical form of it.
 #:
-#: Raises `ParseError` when the source does not parse, because a file the
-#: compiler rejects is not a file the formatter may rewrite. Returns `source`
-#: unchanged in the one case the printer cannot promise fidelity: a comment it
-#: found no place for. Declining to format always beats losing text.
+#: Raises `ParseError` when the source does not parse. Returns `source`
+#: unchanged when the printer found no place for a comment — declining to
+#: format always beats losing text.
 #:
 #: ```
 #: format_source("fn f( a:int )->int{return a}\n", "d.jai")
@@ -264,10 +239,8 @@ pub fn format_source(source: str, path: str) -> str {
 #: Return the comments in `source` the printer found no place for.
 #:
 #: Empty for every file the formatter can rewrite. A non-empty answer is a bug
-#: in this module, not in the file: it means `format_source` had to decline, and
-#: the file will never be formatted until the printer learns where the comment
-#: belongs. `jaithon fmt` reports one line per such file so the bug is visible
-#: rather than silently absorbed.
+#: in this module, not the file — `jaithon fmt` reports it rather than silently
+#: absorbing it.
 #:
 #: ```
 #: unplaceable_comments("let x = 1   # why\n", "d.jai").len()    # 0
@@ -277,8 +250,8 @@ pub fn unplaceable_comments(source: str, path: str) -> list[Comment] {
     return lost
 }
 
-# The printer's raw result: the canonical text, and the comments that did not
-# reach it. Both callers need both halves, and the work is too slow to do twice.
+# The printer's raw result: text and unused comments. Both callers need both
+# halves, and the work is too slow to do twice.
 fn _format(source: str, path: str) -> tuple[str, list[Comment]] {
     let text = _Source(source)
     let program = freeze_literals(parse_module(source, path), source)
@@ -303,9 +276,8 @@ pub fn is_formatted(source: str, path: str) -> bool {
 
 #: Return the one-line header of a declaration, without its body.
 #:
-#: This is what `jaithon doc` prints above a doc comment. Pass a node from a
-#: tree that `freeze_literals` has been over, so that a default value reads the
-#: way it was written.
+#: Pass a node from a tree `freeze_literals` has been over, so a default value
+#: reads the way it was written.
 #:
 #: ```
 #: let source = "pub fn f(a: int = 2) -> str? { return null }\n"
@@ -318,8 +290,8 @@ pub fn render_signature(decl: Node) -> str {
 
 #: Return a unified diff from `before` to `after`, or the empty string.
 #:
-#: The format is the usual one — `---`/`+++` headers, `@@` hunk markers and
-#: `DIFF_CONTEXT` lines of context — so the output can be piped into `patch`.
+#: Standard format — `---`/`+++` headers, `@@` hunks, `DIFF_CONTEXT` lines of
+#: context — so the output pipes into `patch`.
 #:
 #: ```
 #: unified_diff("a\n", "a\n", "f.jai")                   # ""
@@ -337,10 +309,8 @@ pub fn unified_diff(before: str, after: str, path: str) -> str {
 #: Return the 1-based number of the first line where `before` and `after`
 #: differ, or 0 when they hold the same text.
 #:
-#: A line the two share counts as the same only in full: trailing whitespace or
-#: a changed indent is a difference, because both are things the formatter is
-#: there to fix. When one text merely runs on past the other, the difference is
-#: the first line the shorter one does not have.
+#: A shared line counts as the same only in full — trailing whitespace or a
+#: changed indent counts as a difference too.
 #:
 #: ```
 #: first_difference("a\nb\n", "a\nb\n")    # 0
@@ -360,10 +330,8 @@ pub fn first_difference(before: str, after: str) -> int {
 #: Report where `path` stops being canonical, as one `file:line:` message and
 #: the two spellings of the line beneath it.
 #:
-#: This is what `--check` prints. A bare path tells a CI log that something is
-#: wrong and nothing about what, which leaves the reader to run the formatter
-#: locally to find out; naming the line and showing both forms of it means the
-#: log alone is enough to see the change coming.
+#: What `--check` prints — naming the line and both spellings means the log
+#: alone is enough to see the change coming.
 pub fn check_report(before: str, after: str, path: str) -> str {
     let line = first_difference(before, after)
     if line == 0 { return "" }
@@ -377,19 +345,10 @@ pub fn check_report(before: str, after: str, path: str) -> str {
 
 #: Rewrite Jaithon 2 source into Jaithon 3, mechanically.
 #:
-#: This is the table in `spec/LANGUAGE.md` §16 applied to text — text, because
-#: Jaithon 2 source is not Jaithon 3 and so cannot be parsed into a tree first.
-#: `print x` becomes `print(x)`, `input x` becomes `let x = input()`, `a eq b`
-#: becomes `a == b`, `2 ^ 3` becomes `2 ** 3`, `5!` becomes `math.factorial(5)`,
-#: `func`, `then do`, `do` and `end` become `fn` and braces, `new Dog()` becomes
-#: `Dog()`, and the `_alen`/`arrayGet` family becomes method and index syntax.
-#: `system "ls"` becomes `os.shell("ls")`, which is how `std.os` spells that
-#: operation. No rewrite reaches inside a string literal or a comment.
-#:
-#: What cannot be done mechanically — a `namespace` block, which becomes either
-#: a module file or a class of statics — is marked with a `# TODO(migrate2):`
-#: comment rather than guessed at. The result is not guaranteed to compile; it
-#: is guaranteed to be a strictly smaller job than the rewrite by hand.
+#: The table in `spec/LANGUAGE.md` §16 applied to text (Jaithon 2 source cannot
+#: be parsed into a Jaithon 3 tree). What cannot be done mechanically — a
+#: `namespace` block — is marked with a `# TODO(migrate2):` comment instead of
+#: guessed at. The result is not guaranteed to compile.
 #:
 #: ```
 #: migrate2("print x\n")              # "print(x)\n"
@@ -417,13 +376,9 @@ pub fn migrate2(source: str) -> str {
 
 #: Expand command-line paths into the `.jai` files they name.
 #:
-#: A file argument is taken as given; a directory argument is walked. `keep`
-#: filters the files found by walking and is not consulted for a file named
-#: explicitly, because naming a file means wanting that file. The result is
-#: sorted and free of duplicates.
-#:
-#: Raises `FileNotFoundError` for an argument that does not exist: silently
-#: processing nothing is how a misspelled path passes CI.
+#: A file argument is taken as given (not filtered by `keep`); a directory
+#: argument is walked and filtered. Raises `FileNotFoundError` for a missing
+#: argument — silently processing nothing is how a misspelled path passes CI.
 pub fn expand_paths(inputs: list[str], keep: fn(Path) -> bool = _every_file) -> list[str] {
     let found: list[str] = []
     let seen: set[str] = set()
@@ -452,9 +407,8 @@ pub fn expand_paths(inputs: list[str], keep: fn(Path) -> bool = _every_file) -> 
 
 #: Drop the leading subcommand or script path from `args`.
 #:
-#: The CLI hands a subcommand its own name in `args[0]`, exactly as it hands a
-#: script its path; either way the options start after it. Shared by the four
-#: `jaithon.tool` entry points.
+#: Shared by the four `jaithon.tool` entry points: the CLI hands a subcommand
+#: its own name (or a script its path) in `args[0]`.
 #:
 #: ```
 #: tail_arguments(["fmt", "--check"], "fmt")          # ["--check"]
@@ -465,9 +419,8 @@ pub fn expand_paths(inputs: list[str], keep: fn(Path) -> bool = _every_file) -> 
 pub fn tail_arguments(args: list[str], command: str) -> list[str] {
     if args.len() == 0 { return args }
     if args[0] == command { return args[1:args.len()] }
-    # The tool's own script path, when it was run as `jaithon .../test.jai x`.
-    # Only that one path is dropped: any other `.jai` argument is a file the
-    # caller asked for, and swallowing it silently runs the whole tree instead.
+    # Only the tool's own script path is dropped here — any other `.jai`
+    # argument is a file the caller asked for.
     if args[0].ends_with("/" + command + ".jai") { return args[1:args.len()] }
     return args
 }
@@ -478,14 +431,10 @@ pub fn tail_arguments(args: list[str], command: str) -> list[str] {
 #: jaithon fmt [--check] [--diff] [--migrate2] [paths...]
 #: ```
 #:
-#: With no flag every file is rewritten in place and each rewritten path is
-#: printed. `--check` writes nothing, reports the first line of every file that
-#: is not formatted — as `file:line:` with the line as it is and as it should
-#: be — and exits 1 when there is at least one, which is the CI gate. `--diff`
-#: writes
-#: nothing and prints a unified diff per file. `--migrate2` runs the Jaithon 2
-#: rewrite before formatting. The exit status is 0 when everything is clean, 1
-#: for `--check` with unformatted files, and 2 when a file could not be parsed.
+#: `--check` reports each unformatted file and exits 1 (the CI gate); `--diff`
+#: prints a unified diff instead of writing; `--migrate2` runs the Jaithon 2
+#: rewrite first. Exit status: 0 clean, 1 for `--check` findings, 2 on parse
+#: failure.
 pub fn main(args: list[str]) -> int {
     let options = _Options.parse(tail_arguments(args, "fmt"))
     if options.usage_error is not null {
@@ -503,9 +452,8 @@ pub fn main(args: list[str]) -> int {
         try {
             let (formatted, lost) = _format(input, path)
             if lost.len() > 0 {
-                # Left alone rather than reformatted, and said out loud: a
-                # comment with nowhere to go means this file is frozen until
-                # the printer is taught where it belongs.
+                # A comment with nowhere to go freezes this file until the
+                # printer is taught where it belongs.
                 print_err(
                     f"{path}:{lost[0].line}: the formatter cannot place " +
                         f"{lost.len()} comment(s); the file is left unchanged"
@@ -515,8 +463,7 @@ pub fn main(args: list[str]) -> int {
             }
         } catch error: ParseError {
             if options.migrate {
-                # The rewrite is still worth keeping: it is the part of the job
-                # nobody has to do by hand any more.
+                # The rewrite is still worth keeping even if formatting failed.
                 print_err(f"{path}: migrated but not formatted: {error.message}")
                 if not options.check and not options.diff { write_file(path, input) }
             } else {
@@ -540,18 +487,15 @@ pub fn main(args: list[str]) -> int {
     return 0
 }
 
-# The default filter of `expand_paths`: every `.jai` file under a directory that
-# is not a diagnostic fixture. `scripts/run_tests.sh` recognises a fixture by a
-# leading `# expect: Exxxx`, and those files do not parse on purpose — walking
-# into one makes the formatter report a failure for a file doing its job.
+# The default filter of `expand_paths`: skips diagnostic fixtures, which don't
+# parse on purpose and would otherwise report as formatter failures.
 fn _every_file(path: Path) -> bool { return not is_diagnostic_fixture(path) }
 
 #: Report whether `path` is a diagnostic fixture: a file whose first line reads
 #: `# expect: Exxxx`, declaring the error it exists to provoke.
 #:
-#: Such a file is invalid on purpose, so a tool that walks a directory skips it.
-#: Naming one on the command line still processes it, because naming a file
-#: means wanting that file.
+#: Invalid on purpose, so a directory walk skips it; naming one explicitly
+#: still processes it.
 #:
 #: ```
 #: is_diagnostic_fixture(Path("tests/errors/unclosed_brace.jai"))    # true
@@ -575,10 +519,9 @@ fn _first_line_of(source: str) -> str {
 
 # A file plus the two indexes the printer needs over it.
 #
-# `jaithon.ast` spans are byte offsets while Jaithon strings are indexed by scalar,
-# so every span crossing into this module goes through `scalar_index` first.
-# `Span.line_column` answers the same question in O(n) per call, which is one
-# whole-file scan per node; these tables answer it in O(log n).
+# `jaithon.ast` spans are byte offsets but Jaithon strings are indexed by
+# scalar, so every span goes through `scalar_index` first. These tables answer
+# what `Span.line_column` computes in O(n) per call, in O(log n) instead.
 class _Source {
     pub let text: str
     pub let offsets: list[int]  # byte offset of each scalar, plus one past the end
@@ -643,8 +586,8 @@ class _Source {
 
 # --- Comment bookkeeping -----------------------------------------------------
 
-# The comment list with a consumption mark, so that every comment is emitted
-# exactly once and `format_source` can check at the end that none were missed.
+# The comment list with a consumption mark: every comment is emitted exactly
+# once, and `format_source` can check at the end that none were missed.
 class _Trivia {
     pub let items: list[Comment]
     pub let used: list[bool]
@@ -656,7 +599,6 @@ class _Trivia {
         self.cursor = 0
     }
 
-    # Every unconsumed own-line comment starting before `line`.
     pub fn take_leading(self, line: int) -> list[Comment] {
         pub let taken: list[Comment] = []
         var index = self.cursor
@@ -671,7 +613,6 @@ class _Trivia {
         return taken
     }
 
-    # The comment sitting after code on `line`, if there is one.
     pub fn take_trailing(self, line: int) -> Comment? {
         var index = self.cursor
         while index < self.items.len() and self.items[index].line <= line {
@@ -686,8 +627,7 @@ class _Trivia {
         return null
     }
 
-    # Consume everything left between `first` and `last`, which is what a
-    # statement copied verbatim from the source already carries.
+    # Consume everything a verbatim-copied statement already carries.
     pub fn consume_within(self, first: int, last: int) -> void {
         var index = self.cursor
         while index < self.items.len() and self.items[index].line <= last {
@@ -706,10 +646,8 @@ class _Trivia {
         return false
     }
 
-    # Like `any_within`, but ignoring the comment written after the code on
-    # `last`. That one is the statement's trailing comment and a reprint has a
-    # place for it, so counting it drove every commented one-line statement
-    # down the verbatim path and left it unformatted for good.
+    # Like `any_within` but ignores the comment on `last` itself — counting it
+    # drove every commented one-line statement down the verbatim path forever.
     pub fn any_inside(self, first: int, last: int) -> bool {
         var index = self.cursor
         while index < self.items.len() and self.items[index].line <= last {
@@ -730,7 +668,6 @@ class _Trivia {
         return true
     }
 
-    # The comments nobody claimed, in source order.
     pub fn unused(self) -> list[Comment] {
         return [self.items[index] for index in 0..self.items.len() if not self.used[index]]
     }
@@ -740,8 +677,8 @@ class _Trivia {
     }
 }
 
-# One physical output line: its text, the trailing comment to align beside it,
-# and the depth that decides which alignment run it belongs to.
+# One physical output line, tagged with the depth that decides which trailing-
+# comment alignment run it belongs to.
 class _Line {
     pub let text: str
     pub var comment: str?
@@ -754,8 +691,8 @@ class _Line {
     }
 }
 
-# One member of a class or enum body: a field record or a method node, tagged
-# with how it must be printed and where it was written.
+# One member of a class or enum body. `node` is a `Node` for a method/getter/
+# setter but a field record (dict) for a field — tagged by `role`.
 class _Member {
     pub let role: str
     pub let node: any
@@ -794,7 +731,6 @@ class _Printer {
         }
     }
 
-    # Emit a line that opens a block, taking the comment written beside it.
     pub fn header(self, text: str, line: int) -> void {
         self.emit(text)
         let trailing = self.trivia.take_trailing(line)
@@ -820,8 +756,8 @@ class _Printer {
 
     pub fn column(self) -> int { return self.depth * _INDENT.len() }
 
-    # Join the lines, aligning each run of consecutive trailing comments that
-    # share an indentation depth into one column.
+    # Aligns each run of consecutive trailing comments sharing a depth into
+    # one column.
     pub fn render(self) -> list[str] {
         pub let text: list[str] = []
         var index = 0
@@ -865,8 +801,8 @@ class _Printer {
             self.comments(leading)
             self.last_line = start
             let end = self.src.line_of(statement.span.end)
-            # A verbatim copy already carries every comment in its span; asking
-            # for the trailing one again would print it twice.
+            # A verbatim copy already carries its trailing comment — asking
+            # again would print it twice.
             if not self.statement(statement, start, end) {
                 let trailing = self.trivia.take_trailing(end)
                 if trailing is not null { self.attach(trailing) }
@@ -884,11 +820,11 @@ class _Printer {
         }
     }
 
-    # Print one statement. True when it was copied from the source verbatim,
-    # which means it already carries the comments in its span.
+    # Prints one statement; returns true when it was copied verbatim (so it
+    # already carries the comments in its span).
     pub fn statement(self, node: Node, start: int, end: int) -> bool {
-        # A comment inside an expression has nowhere to go in a reprinted
-        # statement, so that statement is reproduced instead of reprinted.
+        # A comment inside an expression has nowhere to go when reprinted, so
+        # the statement is copied verbatim instead.
         if not _has_block(node) and self.trivia.any_inside(start, end) {
             self.trivia.consume_within(start, end)
             self.emit(_dedent_block(self.src, start, end))
@@ -901,9 +837,8 @@ class _Printer {
             return false
         }
 
-        # A block written on one line stays on one line: `if x { return null }`
-        # is the house style of `spec/STYLE.md` §10, and exploding it would
-        # rewrite most of the library for nothing.
+        # A block written on one line stays on one line (`spec/STYLE.md` §10);
+        # exploding it would rewrite most of the library for nothing.
         if start == end {
             let probe = _Printer(self.src, _Trivia([]))
             probe.block_statement(node)
@@ -953,9 +888,8 @@ class _Printer {
 
     # `head { ... }` on one line, or null when the body does not fit that shape.
     #
-    # The body is printed by a throwaway printer holding no comments — the
-    # caller has already established that this construct spans one source line,
-    # and one source line has no interior comment to lose.
+    # Printed by a throwaway printer holding no comments — safe because the
+    # caller has already established this construct spans one source line.
     pub fn collapse_body(self, head: str, body: Node?) -> str? {
         if body is null { return null }
         let probe = _Printer(self.src, _Trivia([]))
@@ -1093,10 +1027,9 @@ class _Printer {
         self.emit("}")
     }
 
-    # The arms of a `match`, each with the comments written around it. The arms
-    # are records rather than statements, so `statements` never sees them and
-    # a comment here would otherwise drift out to the end of the enclosing
-    # block — or, for a trailing one, be dropped and abandon the whole file.
+    # Arms are records rather than statements, so `statements` never sees them;
+    # without this, a comment here would drift to the end of the block or be
+    # dropped entirely.
     pub fn arms(self, node: Node) -> void {
         self.last_line = self.src.line_of(node.span.start)
         for arm in node.records("arms") {
@@ -1141,10 +1074,8 @@ class _Printer {
                     "fn " +
                     (node.opt_text("name") ?? "") +
                     self.generics(node.records("generics"))
-                # The return type and the ` {` that opens the body land on the
-                # same line as the parameters, so they are part of what has to
-                # fit inside `LINE_WIDTH` — a signature measured without them
-                # is the commonest way a formatted line runs long.
+                # The return type and opening ` {` land on the same line as the
+                # parameters, so both count toward `LINE_WIDTH` too.
                 return head +
                     self.params(node.records("params"), self.column() + head.len(), arrow.len() + 2) +
                     arrow
@@ -1215,9 +1146,8 @@ class _Printer {
         self.emit("}")
     }
 
-    # One enum variant. A variant with no payload is written bare — `None`,
-    # never `None()` — so `params`, which answers "()" for the empty list
-    # because that is what a function needs, cannot be used unconditionally.
+    # A payload-less variant is written bare (`None`, never `None()`), so
+    # `params` — which answers "()" for an empty list — can't be reused as is.
     pub fn variant(self, entry: dict[str, any]) -> str {
         let payload = entry["params"]
         if payload.len() == 0 { return entry["name"] }
@@ -1230,8 +1160,8 @@ class _Printer {
         let open = self.src.line_of(node.span.start)
         let close = self.src.line_of(node.span.end)
         let flat = self.signature(node) + " { " + ", ".join(variants) + " }"
-        # Collapsing an enum onto one line has nowhere to put a comment written
-        # between its variants, so a commented enum keeps its lines.
+        # Collapsing onto one line has nowhere to put a comment between
+        # variants, so a commented enum keeps its lines.
         if methods.len() == 0 and
             self.column() + flat.len() <= LINE_WIDTH and
             not flat.contains("\n") and
@@ -1263,8 +1193,8 @@ class _Printer {
         self.emit("}")
     }
 
-    # Class and enum bodies keep source order, which the tree has split apart
-    # into one list per member kind.
+    # Class and enum bodies keep source order, though the tree splits members
+    # into one list per kind.
     pub fn members(self, owner: Node, entries: list[_Member]) -> void {
         self.last_line = self.src.line_of(owner.span.start)
         for (index, member) in _by_position(entries).enumerate() {
@@ -1370,19 +1300,14 @@ class _Printer {
 
     # --- expressions --------------------------------------------------------
 
-    # `jaithon.ast.to_source` is the canonical renderer and the only one: it owns
-    # precedence, parentheses and spelling. What it cannot know is where the
-    # text will land, so this wrapper is the column limit and nothing else.
+    # `to_source` is the canonical renderer — it owns precedence, parentheses
+    # and spelling. This wrapper only knows about the column limit.
     pub fn expr(self, node: Node?, column: int) -> str {
         if node is null { return "" }
         let flat = to_source(node)
         if flat.contains("\n") {
-            # `to_source` opens a block whenever an `if` or a `match` is used
-            # as an expression, because it has no column to lay it out against.
-            # This wrapper does, and a conditional short enough to fit belongs
-            # on its line: `let normal = if front { outward } else { -outward }`
-            # is the house style of `spec/STYLE.md` §10, and exploding it into
-            # five lines is how a one-line file turns into a paragraph.
+            # `to_source` always opens a block for an `if`/`match` expression;
+            # this wrapper folds it back when it fits (`spec/STYLE.md` §10).
             let folded = _collapse(flat.split("\n"))
             if folded is not null and column + folded.len() <= LINE_WIDTH { return folded }
             return flat
@@ -1391,9 +1316,8 @@ class _Printer {
         return self.broken(node, column, flat) ?? flat
     }
 
-    # One item per line, for the outermost list this node has to offer. `flat`
-    # is the same node rendered on one line, which is where the parentheses a
-    # low-precedence callee needs have already been worked out.
+    # One item per line. `flat` is the same node rendered on one line, so any
+    # parentheses a low-precedence callee needs are already resolved there.
     pub fn broken(self, node: Node, column: int, flat: str) -> str? {
         match node.kind {
             NodeKind.Call => {
@@ -1408,8 +1332,7 @@ class _Printer {
                 }
                 let rendered = to_source(node.require("callee"))
                 let callee = if flat.starts_with(rendered + "(") { rendered } else { "(" + rendered + ")" }
-                # No trailing comma: `args` in the grammar of §15 does not
-                # admit one.
+                # No trailing comma — the §15 grammar for `args` doesn't admit one.
                 return callee + "(\n" + ",\n".join([_indent_block(part) for part in parts]) + "\n)"
             }
             NodeKind.ListLit => { return self.spread_items(node, "[", "]", column) }
@@ -1446,9 +1369,9 @@ class _Printer {
             close
     }
 
-    # A block appearing inside an expression, rendered by its own printer so
-    # that the comments inside it are placed by the same rules. The lines come
-    # back with relative indentation, which `emit` shifts into place.
+    # A block inside an expression, rendered by its own printer so its comments
+    # follow the same rules; the lines return relatively indented, which `emit`
+    # shifts into place.
     pub fn nested_block(self, block: Node) -> str {
         let inner = _Printer(self.src, self.trivia)
         inner.depth = 1
@@ -1482,9 +1405,8 @@ fn _method_members(node: Node) -> list[_Member] {
     return [_Member("method", method, method.span.start) for method in node.child_list("methods")]
 }
 
-# Source order, which the split-by-kind member lists have lost. Insertion sort:
-# a class body holds a handful of members, the input is four already-sorted
-# runs, and stability keeps two members sharing a span in their original order.
+# Insertion sort: a class body holds a handful of members, the input is four
+# already-sorted runs, and stability keeps co-located members in source order.
 fn _by_position(entries: list[_Member]) -> list[_Member] {
     let ordered = [entry for entry in entries]
     var index = 1
@@ -1503,19 +1425,8 @@ fn _by_position(entries: list[_Member]) -> list[_Member] {
 
 # An operator chain broken after each operator, continuations indented a step.
 #
-# An `and`, `or` or `+` chain is the long line the argument-per-line rule of
-# `spec/STYLE.md` §1 cannot reach: there is no bracket to break inside, so the
-# break has to fall at an operator. It goes *after* the operator, because a line
-# ending in `and` is visibly unfinished where one starting with it is only
-# unfinished once you have looked at the line above.
-#
-# The split is made in the rendered text and not over the tree, which matters
-# more than it sounds. `(a + b) / c` and `a + b / c` are different programs and
-# only `to_source` knows which brackets keep them apart; re-rendering an operand
-# on its own loses them, because a node carries no memory of the grouping it was
-# printed inside. Cutting `flat` at its own top-level operators moves the text
-# the canonical renderer already produced onto new lines and changes nothing
-# else.
+# Splits the rendered text, not the tree: re-rendering an operand alone would
+# lose the parens that keep `(a+b)/c` different from `a+b/c`.
 fn _broken_chain(node: Node, flat: str) -> str? {
     let pieces = _split_operator(flat, op_text(node.op()))
     if pieces.len() < 2 { return null }
@@ -1567,11 +1478,8 @@ fn _matches_at(chars: list[str], index: int, needle: str) -> bool {
     return true
 }
 
-# Fold a printed block onto one line, or refuse.
-#
-# Two statements cannot share a line — the language has no separator but the
-# newline — so a body of more than one statement is exactly the case where this
-# returns null and the block stays open.
+# Fold a printed block onto one line, or refuse when it can't (a body of more
+# than one statement has no separator but the newline).
 #
 # ["if c {", "    return 1", "}"]  ->  "if c { return 1 }"
 # ["if c {", "    a()", "    b()", "}"]  ->  null
