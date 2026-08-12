@@ -7,7 +7,7 @@
 #: Clips become nested `<g clip-path=...>` groups, which is exactly the stack
 #: discipline `PushClip` and `PopClip` describe.
 import std.math
-from std.algo.strings import base64_encode
+from std.algo.codecs import base64_encode
 from std.fmt import format
 from std.gui.image import Image
 
