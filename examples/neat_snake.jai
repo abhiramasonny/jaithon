@@ -6,7 +6,8 @@
 #:
 #:     jaithon run examples/neat_snake.jai
 from std.gui import Window
-from std.gui.canvas import Canvas, rgb
+from std.gui.canvas import Canvas
+from std.gui.color import rgb
 from std.gui.input import Input, Key
 from std.gui.widgets import UI, Theme
 from std.random import Random

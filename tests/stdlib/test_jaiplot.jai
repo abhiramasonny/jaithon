@@ -5,7 +5,10 @@
 import std.math
 import jaiplot
 from std.test import assert_eq, assert_near, assert_true, assert_false, assert_throws, assert_ne
-from std.gui.canvas import Canvas, Image, Path, Winding, red_of, rgb
+from std.gui.canvas import Canvas
+from std.gui.color import red_of, rgb
+from std.gui.image import Image
+from std.gui.path import Path, Winding
 
 from jaiplot import Figure, MarkerShape, Theme
 from jaiplot.backend.png import encode

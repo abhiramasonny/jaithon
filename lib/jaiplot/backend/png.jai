@@ -7,11 +7,11 @@
 #: else, including the CRC and the filtering, is here.
 #:
 #: ```
-#: from std.gui.canvas import Image
+#: from std.gui.image import Image
 #: let bytes = encode(Image(4, 4))
 #: bytes.len() > 8      # true
 #: ```
-from std.gui.canvas import Image
+from std.gui.image import Image
 
 #: The eight bytes every PNG begins with.
 #:

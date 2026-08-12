@@ -2,7 +2,7 @@
 #: `TextStyle`, `MarkerShape` and `Theme`.
 #:
 #: `std` packs three bytes into an int and stops there: no hex parsing, no HSL,
-#: no luminance, no contrast, no palette. Worse, `std.gui.canvas.mix`
+#: no luminance, no contrast, no palette. Worse, `std.gui.color.mix`
 #: interpolates the sRGB bytes directly, and sRGB bytes are not light — mixing
 #: black and white that way gives 128, a colour that carries a fifth of white's
 #: light rather than half of it, so every ramp built on it sags and bands
@@ -16,7 +16,7 @@
 #: Theme.dark().background.to_hex()          # "#14161a"
 #: ```
 import std.math
-from std.gui.canvas import rgba, red_of, green_of, blue_of, alpha_of
+from std.gui.color import rgba, red_of, green_of, blue_of, alpha_of
 
 # The sRGB transfer function, IEC 61966-2-1: a short linear toe below the
 # cutoff, a 2.4 power curve above it.
@@ -273,7 +273,7 @@ pub class Color {
 
     #: Interpolate towards `other` in linear light, `t` 0.0 here and 1.0 there.
     #:
-    #: This is the gamma-correct mix `std.gui.canvas.mix` does not do. That one
+    #: This is the gamma-correct mix `std.gui.color.mix` does not do. That one
     #: averages the sRGB bytes, so black-to-white at the midpoint gives 128 — a
     #: colour carrying 21% of white's light, visibly too dark, and the same
     #: error bends every ramp towards its darker end. Here both colours are
