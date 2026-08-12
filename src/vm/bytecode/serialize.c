@@ -1548,7 +1548,7 @@ void jaiCacheReadFree(uint8_t *data, size_t length) {
 /* The .jaid beside `sourcePath`'s image, validated and positioned past its
  * header, or NULL. Never an error: an absent, stale or corrupt sidecar costs
  * source spans in tracebacks, nothing more. */
-uint8_t *jaiSidecarRead(const char *sourcePath, uint64_t sourceHash,
+static uint8_t *jaiSidecarRead(const char *sourcePath, uint64_t sourceHash,
                         size_t *outLength, size_t *outOffset) {
     char path[JAI_MAX_PATH];
     char sidecarPath[JAI_MAX_PATH];

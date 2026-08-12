@@ -257,6 +257,13 @@ typedef struct {
 
 #define JAI_OSR_MAX 4
 
+/* Instance-typed slots one compiled loop may pin a class shape on. A (slot,
+ * shape) pair list rather than a shape beside every kind: 40 shapes per form
+ * times JAI_OSR_MAX forms is 640 bytes on every ObjFunction, and a loop with
+ * more than eight distinct instance locals does not exist in this tree. A form
+ * that would need more is refused rather than compiled unguarded. */
+#define JAI_OSR_SHAPES 8
+
 /* A compiled loop: where it starts, and what each slot must hold to enter. */
 typedef struct {
     uint8_t  *code;
@@ -267,6 +274,26 @@ typedef struct {
      * object out of ObjIter.source for each. */
     uint8_t   iterKind;
     uint8_t   kinds[40];   /* what each slot must hold on entry */
+
+    /* Which CLASS an instance slot held, not merely that it held an instance.
+     *
+     * A field read compiles to a load at a baked slot index, and two classes
+     * declaring the same field name put it at different indices whenever their
+     * declaration order differs. Checking only IS_INSTANCE let a loop compiled
+     * for one class be entered holding another and read the wrong field --
+     * silently, with a plausible number. The probe:
+     *
+     *   class A { pub var x: int  pub var y: int }   # x is slot 0
+     *   class B { pub var y: int  pub var x: int }   # x is slot 1
+     *   fn sum_x(o: any, n: int) -> int { ... o.x ... }
+     *   sum_x(A(), 2_000_000)   # compiles the loop against A
+     *   sum_x(B(), 2_000_000)   # entered it holding a B: read 333, not 444
+     *
+     * A shape of 0 means the compile pinned no class to that slot, so any
+     * instance may enter it. */
+    uint8_t   shapeSlot[JAI_OSR_SHAPES];
+    uint32_t  shapeId[JAI_OSR_SHAPES];
+    uint8_t   shapeCount;
 } JaiOsrForm;
 
 struct ObjFunction {
