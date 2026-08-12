@@ -1,5 +1,5 @@
-/* gc.c — precise mark-sweep collector (spec/BYTECODE.md §10). Tri-colour:
- * white = unmarked, gray = marked and awaiting tracing, black = traced. */
+// gc.c is a precise mark-sweep collector
+
 #include <stdlib.h>
 
 #include "vm/gc.h"
@@ -12,19 +12,9 @@
 #define JAI_GC_DEFAULT_GROW_FACTOR 2.0
 #define JAI_GC_DEFAULT_MIN_HEAP    ((size_t)1 << 20)
 
-/* Kept here as well as in vm.gc since most entry points take no GCState arg;
- * activeGC() prefers this copy so the collector still works if the VM struct
- * is re-zeroed after installation. */
 GCState *jaiGCActive;
-
-/* Set while jaiGCCollect runs: re-entering would blacken objects a second
- * pass has already begun to free. */
 bool jaiGCInCollect;
-
 static GCState *activeGC(void) { return jaiGCActive != NULL ? jaiGCActive : vm.gc; }
-
-/* The back edge's one-word form of jaiGCWanted(); reads jaiGCActive/->stress
- * directly rather than through activeGC()/gcStressOn(). */
 size_t jaiGCLimit;
 
 void jaiGCSyncLimit(void) {
@@ -34,15 +24,9 @@ void jaiGCSyncLimit(void) {
                      : 0;
 }
 
-/* The CLI sets its flags on the VM; honour them directly so startup order
- * cannot leave --gc-stress or --debug-gc silently inactive. */
 static bool gcStressOn(const GCState *g)  { return g->stress  || vm.gcStress; }
 static bool gcVerboseOn(const GCState *g) { return g->verbose || vm.debugGC; }
 
-/* Reads the allocator's own running total directly; a mirrored counter
- * updated via a hook on every jaiRealloc cost 3.5% of dict_ops for nothing.
- * Collection itself never runs from inside jaiRealloc -- only from the
- * safepoints that call jaiGCMaybeCollect, never mid-construction. */
 static size_t gcLiveBytes(const GCState *g) { (void)g; return jaiHeapBytes; }
 
 static size_t gcNextThreshold(const GCState *g, size_t live) {
@@ -52,10 +36,6 @@ static size_t gcNextThreshold(const GCState *g, size_t live) {
     size_t floorBytes = g->minHeap != 0 ? g->minHeap : JAI_GC_DEFAULT_MIN_HEAP;
     return next > floorBytes ? next : floorBytes;
 }
-
-/* ------------------------------------------------------------------ */
-/* Lifecycle                                                           */
-/* ------------------------------------------------------------------ */
 
 void jaiGCInit(GCState *gc) {
     if (gc == NULL) JAI_PANIC("jaiGCInit: NULL collector state");
@@ -67,8 +47,6 @@ void jaiGCInit(GCState *gc) {
 
     gc->growFactor = JAI_GC_DEFAULT_GROW_FACTOR;
     gc->minHeap = JAI_GC_DEFAULT_MIN_HEAP;
-    /* Starts from the allocator's running total: whatever the front end
-     * allocated before the VM came up already counts against the heap. */
     gc->nextGC = gcNextThreshold(gc, jaiHeapBytes);
 
     gc->tempRoots = NULL;
@@ -126,7 +104,6 @@ void jaiGCFree(GCState *gc) {
     if (vm.gc == gc) vm.gc = NULL;
     jaiGCSyncLimit();
 
-    /* Raw free: the gray stack never went through jaiRealloc. */
     free(gc->grayStack);
     gc->grayStack = NULL;
     gc->grayCount = 0;
@@ -139,20 +116,14 @@ void jaiGCEnable(bool enabled) {
     jaiGCSyncLimit();
 }
 
-/* ------------------------------------------------------------------ */
-/* Marking                                                             */
-/* ------------------------------------------------------------------ */
+//marking
 
 void jaiGCMarkObject(Obj *obj) {
     if (obj == NULL || obj->isMarked) return;
     obj->isMarked = true;
 
-    /* Leaf types own no references, so blackening them would do nothing and
-     * they never enter the gray stack. */
     switch (obj->type) {
     case OBJ_STRING: {
-        /* Leaf, except a slice keeps its buffer alive; marking it here rather
-         * than graying this string keeps every string off the gray stack. */
         ObjString *s = (ObjString *)obj;
         if (s->owner != NULL) jaiGCMarkObject((Obj *)s->owner);
         return;
@@ -171,8 +142,8 @@ void jaiGCMarkObject(Obj *obj) {
     if (g->grayCapacity < g->grayCount + 1) {
         int newCapacity = JAI_GROW_CAP(g->grayCapacity);
         if (newCapacity <= g->grayCapacity) JAI_PANIC("GC gray stack overflow");
-        /* Grown with the raw system allocator, not jaiRealloc, so growing it
-         * mid-collection can't recurse back into the collector. */
+
+        //this is grown with the raw system allocator, not jaiRealloc
         Obj **grown = realloc(g->grayStack, sizeof(Obj *) * (size_t)newCapacity);
         if (grown == NULL) JAI_PANIC("out of memory growing the GC gray stack");
         g->grayStack = grown;
@@ -201,12 +172,6 @@ static void markStrings(ObjString *const *names, int count) {
 static void markChunk(Chunk *chunk) {
     jaiGCMarkArray(&chunk->constants);
 
-    /* chunk->constIndex isn't marked: keys/values are plain ints (hash, pool
-     * index), and every constant it names is already marked above. */
-
-    /* Every way is marked, not just the first `count`: a way written and
-     * later abandoned would otherwise be freed while the slot still points
-     * at it. */
     for (int i = 0; i < chunk->cacheCount; i++) {
         InlineCache *ic = &chunk->caches[i];
         for (int w = 0; w < JAI_IC_WAYS; w++) jaiGCMarkVal(ic->cached[w]);
@@ -231,22 +196,12 @@ static void blackenClass(ObjClass *c) {
     jaiTableMark(&c->statics);
     jaiTableMark(&c->getters);
     jaiTableMark(&c->setters);
-    /* Values here are packed ints, but the keys are the method names and this
-     * table can outlive the entry that put them in the intern table. */
     jaiTableMark(&c->restricted);
 
-    for (int i = 0; i < (int)c->traitCount; i++)
-        jaiGCMark((Obj *)c->traits[i]);
-
-    /* Field names are only reachable from here; the FieldInfo array itself is
-     * plain memory owned by the class. */
-    for (int i = 0; i < (int)c->fieldCount; i++)
-        jaiGCMark((Obj *)c->fields[i].name);
+    for (int i = 0; i < (int)c->traitCount; i++) jaiGCMark((Obj *)c->traits[i]);
+    for (int i = 0; i < (int)c->fieldCount; i++) jaiGCMark((Obj *)c->fields[i].name);
 
     jaiGCMarkVal(c->initializer);
-
-    /* The dunder cache aliases entries in `methods`, but a method removed from
-     * the table before the cache is refreshed would otherwise dangle. */
     jaiGCMarkVal(c->dunderStr);
     jaiGCMarkVal(c->dunderRepr);
     jaiGCMarkVal(c->dunderEq);
@@ -275,16 +230,13 @@ static void blackenEnum(ObjEnum *e) {
     for (int i = 0; i < (int)e->variantCount; i++) {
         EnumVariant *v = &e->variants[i];
         jaiGCMark((Obj *)v->name);
-        /* The cached payload-less value and the cached constructor are
-         * reachable only from here; without this the second mention of
-         * `Color.Red` hands back freed memory. */
         jaiGCMark((Obj *)v->unit);
         jaiGCMark((Obj *)v->ctor);
         markStrings(v->fieldNames, (int)v->arity);
     }
 }
 
-/* Trace one gray object's references, turning it black. */
+// trace one gray objs refrences
 static void blackenObject(Obj *obj) {
     switch (obj->type) {
     case OBJ_STRING:
@@ -321,9 +273,6 @@ static void blackenObject(Obj *obj) {
         break;
     }
     case OBJ_UPVALUE:
-        /* Only the closed slot. While the upvalue is open its target is a live
-         * stack slot, already covered by the stack scan; following `location`
-         * here would also read slots above stackTop during frame teardown. */
         jaiGCMarkVal(((ObjUpvalue *)obj)->closed);
         break;
     case OBJ_NATIVE:
@@ -392,9 +341,7 @@ static void blackenObject(Obj *obj) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Roots                                                               */
-/* ------------------------------------------------------------------ */
+//roots
 
 static void markInternedNames(void) {
     ObjString *const names[] = {
@@ -444,9 +391,6 @@ static void markRoots(GCState *g) {
     jaiTableMark(&vm.modules);
     jaiGCMark((Obj *)vm.mainModule);
     jaiGCMark((Obj *)vm.builtins);
-
-    /* Marked whether or not hasException is set: a stale pending exception
-     * that was never overwritten must not be left dangling. */
     jaiGCMarkVal(vm.pendingException);
 
     markInternedNames();
@@ -463,9 +407,7 @@ static void traceReferences(GCState *g) {
     while (g->grayCount > 0) blackenObject(g->grayStack[--g->grayCount]);
 }
 
-/* ------------------------------------------------------------------ */
-/* Sweep                                                               */
-/* ------------------------------------------------------------------ */
+//sweep
 
 static int sweep(GCState *g) {
     int freedObjects = 0;
@@ -474,7 +416,7 @@ static int sweep(GCState *g) {
 
     while (object != NULL) {
         if (object->isMarked) {
-            object->isMarked = false;   /* white again for the next cycle */
+            object->isMarked = false; //white again for the next cycle
             previous = object;
             object = object->next;
             continue;
@@ -493,9 +435,7 @@ static int sweep(GCState *g) {
     return freedObjects;
 }
 
-/* ------------------------------------------------------------------ */
-/* Collection                                                          */
-/* ------------------------------------------------------------------ */
+//collection stuff
 
 void jaiGCCollect(void) {
     GCState *g = activeGC();
@@ -511,9 +451,6 @@ void jaiGCCollect(void) {
     markRoots(g);
     traceReferences(g);
 
-    /* The intern table's references are weak: an interned string stays alive
-     * only if something else marked it. Drop the white entries before sweep,
-     * or the table would keep keys pointing at freed strings. */
     JaiTable *interned = jaiInternTable();
     if (interned != NULL) jaiTableRemoveWhite(interned);
 
@@ -545,19 +482,11 @@ void jaiGCMaybeCollect(void) {
     if (gcStressOn(g) || gcLiveBytes(g) > g->nextGC) jaiGCCollect();
 }
 
-/* ------------------------------------------------------------------ */
-/* Temporary roots                                                     */
-/* ------------------------------------------------------------------ */
-
-/* The cold growth half, kept separate so jaiGCPushRoot stays a check and a
- * store on the path that does not grow. */
 static void jaiGCGrowRoots(void);
 
 void jaiGCTrackObject(Obj *obj) {
     GCState *g = jaiGCActive;
     if (JAI_UNLIKELY(g == NULL)) JAI_PANIC("jaiGCTrackObject before jaiGCInit");
-    /* Anything born during a collection is black on arrival: sweep is already
-     * walking this list and would otherwise reclaim it as soon as it's linked in. */
     obj->isMarked = jaiGCInCollect;
     obj->next = g->objects;
     g->objects = obj;
@@ -626,10 +555,6 @@ static void jaiGCGrowRoots(void) {
     g->tempRoots = JAI_GROW_ARRAY(Value, g->tempRoots, oldCapacity, newCapacity);
     g->tempRootCapacity = newCapacity;
 }
-
-/* ------------------------------------------------------------------ */
-/* Statistics                                                          */
-/* ------------------------------------------------------------------ */
 
 void jaiGCPrintStats(FILE *out) {
     if (out == NULL) return;

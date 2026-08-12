@@ -11,8 +11,21 @@
 /* Bump on any change to what codegen emits, not only the file format: a cache
  * entry is validated against its source's mtime, so an unchanged source
  * compiled by a newer compiler is otherwise served stale.
- * 11: top-level `fn` declarations are hoisted ahead of top-level statements. */
-#define JAIC_VERSION     11
+ * 11: top-level `fn` declarations are hoisted ahead of top-level statements.
+ * 12: the line table is LTV1 (delta+LEB128) instead of 12-byte records. */
+#define JAIC_VERSION     12
+
+/* Oldest container the reader accepts. It must stay below JAIC_VERSION across a
+ * format bump, or the newly built binary refuses boot/seed.bin -- whose images
+ * were written by the PREVIOUS generation -- and the tree has no front end and
+ * no way to build one. `make reseed` twice is what closes the gap: generation 1
+ * still runs the old compiler out of the old seed and writes the old version;
+ * generation 2 writes the new one. Only then may this be raised. */
+#define JAIC_VERSION_MIN 11
+
+/* First container version whose line table is LTV1. Below it, the table is
+ * JAIC_LINE_ENTRY-sized absolute records and the reader re-encodes on load. */
+#define JAIC_VERSION_LTV1 12
 
 typedef enum {
     JAIC_FLAG_DEBUG   = 1 << 0,

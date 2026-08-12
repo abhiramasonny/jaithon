@@ -183,9 +183,26 @@ int  jaiOpStackEffect(OpCode op);
 int  jaiOpCacheOperand(OpCode op);
 
 /* ------------------------------------------------------------------ */
-/* Line tables (spec §5): source *spans*, not line numbers, uncompressed --  */
-/* one flat 12-byte entry per covered range. jaiChunkSpanAt hands a span to  */
-/* the diagnostic printer, landing a caret under one expression, not a line. */
+/* Line tables (spec §5): source *spans*, not line numbers, so a diagnostic
+ * lands a caret under one expression rather than pointing at a line.
+ *
+ * Stored as LTV1 -- a delta+LEB128 byte stream, not an array of records. Three
+ * absolute u32s per entry was 55.5% of every .jaic and 54.4% of boot/seed.bin
+ * to carry values whose deltas encode in about three bytes; LTV1 measures
+ * ~3.1 bytes per entry against 12.
+ *
+ * The stream is also the RUNTIME form: it is never expanded. jaiChunkSpanAt
+ * decodes it forward, which costs O(entries) instead of a binary search on a
+ * path with exactly one runtime caller -- frameSpan in vm.c, reached only when
+ * a diagnostic or traceback is actually printed. Expanding at load would give
+ * back the file-size win and none of the memory or load-time win.
+ *
+ * Per entry, deltas against the previous one:
+ *     uleb128  offset - prevOffset        (offsets are non-decreasing)
+ *     sleb128  span   - prevSpan
+ *     sleb128  spanEnd - span             (against its OWN span: a span's
+ *                                          length is small and local)
+ * The first entry encodes against zero. */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -193,6 +210,15 @@ typedef struct {
     uint32_t span;     /* source span start (byte offset in the source file) */
     uint32_t spanEnd;
 } LineEntry;
+
+/* LTV1 codec, shared with the serialiser and with tests/vm/linetable_ltv1.c.
+ * jaiLtv1Encode appends one entry to `buf`; jaiLtv1Decode walks the stream and
+ * returns the entry covering `codeOffset`. */
+size_t jaiLtv1EncodeEntry(uint8_t *out, size_t cap, const LineEntry *prev,
+                          const LineEntry *e);
+bool   jaiLtv1Lookup(const uint8_t *stream, size_t len, uint32_t codeOffset,
+                     uint32_t *span, uint32_t *spanEnd);
+int    jaiLtv1Count(const uint8_t *stream, size_t len);
 
 /* ------------------------------------------------------------------ */
 /* Inline caches: allocated per chunk, indexed by a u16 operand baked into  */
@@ -244,9 +270,15 @@ typedef struct {
 
     ValueArray constants;
 
-    LineEntry *lines;      /* parallel run-length table, sorted by offset */
-    int        lineCount;
-    int        lineCapacity;
+    /* LTV1 stream (see above), appended to as code is emitted and decoded in
+     * place when a diagnostic asks. `lineLast` is the encoder's running state:
+     * the deltas are against it, and it is also what collapses a run of
+     * instructions sharing one span into a single entry. */
+    uint8_t   *lineStream;
+    int        lineStreamLen;
+    int        lineStreamCap;
+    LineEntry  lineLast;
+    bool       lineHasLast;
 
     InlineCache *caches;
     int          cacheCount;
