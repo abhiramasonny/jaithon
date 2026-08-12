@@ -2,8 +2,10 @@
 #:
 #: A REPL reads one line at a time and must decide, before compiling, whether
 #: it has a whole input, the start of one, or a mismatched closer.
-from jaithon.compile.lexer import Code, Diagnostic, DiagnosticBag, Lexer, Token, TokenKind
+from jaithon.compile.diag import Code, Diagnostic, DiagnosticBag
+from jaithon.compile.lexer import Lexer
 from jaithon.compile.parser import Parser
+from jaithon.compile.token import Token, TokenKind
 
 #: What is holding an input open.
 #:

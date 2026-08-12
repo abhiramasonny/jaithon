@@ -20,7 +20,8 @@ from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type
 from jaithon.compile.check.universe import Universe, named
-from jaithon.compile.lexer import Diagnostic, DiagnosticBag, Lexer, Severity
+from jaithon.compile.diag import Diagnostic, DiagnosticBag, Severity
+from jaithon.compile.lexer import Lexer
 from jaithon.compile.opt import optimize
 from jaithon.compile.parser import Parser, parse
 from jaithon.compile.resolve import Resolution, SemaCode, resolve

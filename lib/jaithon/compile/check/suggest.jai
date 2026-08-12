@@ -10,7 +10,7 @@
 #: over parameter names for an unknown keyword argument, inline, rather than
 #: importing `suggest_member` itself — a parameter list is not a `TypeDecl`.
 from jaithon.compile.check.ty import TypeDecl
-from jaithon.compile.lexer import Diagnostic
+from jaithon.compile.diag import Diagnostic
 
 #: `JAI_SUGGEST_NO_MATCH` in src/common/diag.h: worse than any accepted distance.
 pub const SUGGEST_NO_MATCH: int = 4

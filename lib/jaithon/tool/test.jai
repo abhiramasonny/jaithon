@@ -14,8 +14,10 @@
 #: ```
 from jaithon.ast import NodeKind
 from jaithon.ast_unparse import to_source
-from jaithon.compile.lexer import DiagnosticBag, Lexer, TokenKind
+from jaithon.compile.diag import DiagnosticBag
+from jaithon.compile.lexer import Lexer
 from jaithon.compile.parser import parse
+from jaithon.compile.token import TokenKind
 from std.fmt import bold, green, red
 from std.io import Path, print_err, read_file
 from std.test import Outcome, Report, Test, TestResult

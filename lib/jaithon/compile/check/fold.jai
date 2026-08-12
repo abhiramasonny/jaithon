@@ -18,7 +18,7 @@ from jaithon.compile.check.assign import assignable
 from jaithon.compile.check.kinds import MAX_DECL_DEPTH
 from jaithon.compile.check.ty import Type
 from jaithon.compile.check.universe import Universe
-from jaithon.compile.lexer import DiagnosticBag
+from jaithon.compile.diag import DiagnosticBag
 from std.math import INT_MAX, INT_MIN, floor, fmod
 from std.str import StringBuilder
 

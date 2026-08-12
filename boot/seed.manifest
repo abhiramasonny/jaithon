@@ -45,6 +45,7 @@ jaithon/compile/check/suggest.jai
 jaithon/compile/check/ty.jai
 jaithon/compile/check/union.jai
 jaithon/compile/check/universe.jai
+jaithon/compile/diag.jai
 jaithon/compile/emit.jai
 jaithon/compile/jaic.jai
 jaithon/compile/lexer.jai
@@ -59,6 +60,7 @@ jaithon/compile/opt/peephole.jai
 jaithon/compile/parser.jai
 jaithon/compile/repl.jai
 jaithon/compile/resolve.jai
+jaithon/compile/token.jai
 std/json.jai
 std/math.jai
 std/str.jai

@@ -22,7 +22,7 @@ from jaithon.compile.check.fold import const_eval, const_replace, render_const, 
 from jaithon.compile.check.ty import Type
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import Universe, list_of
-from jaithon.compile.lexer import DiagnosticBag
+from jaithon.compile.diag import DiagnosticBag
 
 # op, `7 op 3`, `7.0 op 3.0`, `"b" op "a"`, `op 5`. `<none>` is no constant.
 fn _table() -> list[tuple[OpKind, str, str, str, str]] {
