@@ -373,8 +373,9 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/crc32_equiv
+	@$(BUILD)/chunk_caches
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
@@ -419,6 +420,16 @@ $(BUILD)/crc32_equiv: $(VERIFY_OBJS) tests/vm/crc32_equiv.c | $(CC_STAMP)
 
 crc-test: $(BUILD)/crc32_equiv
 	@$(BUILD)/crc32_equiv
+
+# Deserialised cache arrays must be sized exactly: the grow-by-doubling path
+# left 1.19 MB of slack across the seed's images.
+$(BUILD)/chunk_caches: $(VERIFY_OBJS) tests/vm/chunk_caches.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/chunk_caches.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/chunk_caches.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+chunk-caches-test: $(BUILD)/chunk_caches
+	@$(BUILD)/chunk_caches
 
 # The code arena executes what it was written. C rather than .jai because
 # nothing in the language reaches it yet, and because the failure it guards --

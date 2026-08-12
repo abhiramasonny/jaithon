@@ -266,6 +266,13 @@ void jaiChunkInit(Chunk *chunk, int sourceFileId);
 uint16_t jaiChunkAddCache(Chunk *chunk);
 void jaiChunkFree(Chunk *chunk);
 
+/* Allocate exactly `count` cache slots in one go, initialised as
+ * jaiChunkAddCache initialises them. The deserialiser knows the count before it
+ * allocates, and jaiChunkAddCache's JAI_GROW_CAP rounding left 1.19 MB of slack
+ * across the seed's images. Refuses a chunk that already has caches: sizing one
+ * array twice is a bug, not a resize. */
+bool jaiChunkReserveCaches(Chunk *chunk, int count);
+
 void jaiChunkWrite(Chunk *chunk, uint8_t byte, uint32_t spanStart, uint32_t spanEnd);
 void jaiChunkWriteU16(Chunk *chunk, uint16_t v, uint32_t s, uint32_t e);
 void jaiChunkWriteU24(Chunk *chunk, uint32_t v, uint32_t s, uint32_t e);
