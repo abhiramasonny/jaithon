@@ -7,10 +7,10 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include "value.h"
-#include "object.h"
-#include "table.h"
-#include "vm.h"
+#include "vm/value.h"
+#include "vm/object/object.h"
+#include "vm/table.h"
+#include "vm/vm.h"
 
 /* Exactly representable bounds of int64_t as doubles. -2^63 is exact; +2^63 is
  * the first double above INT64_MAX. */

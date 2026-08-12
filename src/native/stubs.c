@@ -3,7 +3,7 @@
  * from gpu.m rather than shared, since the two files never compile together
  * and a shared object would be dead weight on both. */
 
-#include "native.h"
+#include "native/native.h"
 
 /* Keeps the translation unit non-empty on Apple targets, where everything below
  * is compiled out. */

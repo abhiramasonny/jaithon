@@ -7,13 +7,13 @@
  *
  * Built by `make verify-test`; not part of the shipped binary.
  */
-#include "../src/common/common.h"
-#include "../src/common/diag.h"
-#include "../src/runtime/runtime.h"
-#include "../src/vm/chunk.h"
-#include "../src/vm/object.h"
-#include "../src/vm/verify.h"
-#include "../src/vm/vm.h"
+#include "common/common.h"
+#include "common/diag.h"
+#include "runtime/runtime.h"
+#include "vm/bytecode/chunk.h"
+#include "vm/object/object.h"
+#include "vm/bytecode/verify.h"
+#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

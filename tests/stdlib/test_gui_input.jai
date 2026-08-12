@@ -2,7 +2,7 @@
 #:
 #: `std.gui.Event` carries USB HID usage ids and `std.gui.input.Key` decodes
 #: them; the window system underneath has its own numbering — on macOS a
-#: virtual keycode, where Escape is 53 rather than 41 — and `src/native/gui.m`
+#: virtual keycode, where Escape is 53 rather than 41 — and `src/native/apple/gui.m`
 #: translates between the two at the boundary. Nothing above the native layer
 #: ever sees a platform code, which is exactly why the translation needs
 #: pinning: when it was missing, `Key.from_code` returned null for every key
@@ -20,7 +20,7 @@
 #:
 #: A GUI program cannot be driven headlessly, so (2) goes through
 #: `__prim__.gui_test_key_event` and `__prim__.gui_test_key_state`, the
-#: documented injection point in `src/native/gui.m`. They write to a scratch
+#: documented injection point in `src/native/apple/gui.m`. They write to a scratch
 #: window private to the native layer, never to a window a program opened, and
 #: need no display.
 #:

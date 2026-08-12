@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include "src/vm/jit.h"
-#include "src/vm/jit_arm64.h"
+#include "vm/jit/jit.h"
+#include "vm/jit/jit_arm64.h"
 
 #if !(defined(__aarch64__) || defined(__arm64__))
 int main(void) { printf("jit_arm64: skipped (not arm64)\n"); return 0; }

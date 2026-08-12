@@ -185,7 +185,7 @@ pub fn write_u24_at(bytes: list[int], at: int, value: int) -> void {
 #: `NO_INDEX` when the instruction carries no code address.
 #:
 #: `branchOperandAt` in `src/codegen/optimize.c`; keep the two in step with
-#: `src/vm/chunk.h`.
+#: `src/vm/bytecode/chunk.h`.
 pub fn branch_operand_at(op: int) -> int {
     return _BRANCH_AT.get(op, NO_INDEX)
 }
@@ -308,7 +308,7 @@ pub fn highest_slot_used(code: Code) -> int {
 
 #: True when `proto` is a `defer` thunk.
 #:
-#: `jaiFunctionIsDeferThunk` in `src/vm/object.c` recognises one by name alone,
+#: `jaiFunctionIsDeferThunk` in `src/vm/object/object.c` recognises one by name alone,
 #: and the emitter names every thunk it builds `defer` for exactly that reason.
 pub fn is_defer_thunk(proto: FuncProto) -> bool {
     return proto.name == "defer"
@@ -734,7 +734,7 @@ pub fn rebuild(code: Code) -> bool {
         }
 
         # One line entry per run of instructions sharing a span, matching what
-        # recordSpan in src/vm/chunk.c would have produced during emission.
+        # recordSpan in src/vm/bytecode/chunk.c would have produced during emission.
         let rows = lines.len()
         if rows == 0 or
             lines[rows - 1].span_start != instruction.span_start or

@@ -7,7 +7,7 @@
  */
 #include <stdio.h>
 #include <stdint.h>
-#include "src/vm/jit.h"
+#include "vm/jit/jit.h"
 
 typedef int (*Fn0)(void);
 

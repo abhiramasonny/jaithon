@@ -3,7 +3,7 @@
  * The rendered shape is normative; see spec/LANGUAGE.md §13. Nothing here
  * writes to stderr on its own — the caller picks the stream.
  */
-#include "diag.h"
+#include "common/diag.h"
 
 #include <stdlib.h>
 #include <unistd.h>

@@ -3,11 +3,11 @@
  * check below is what makes passing a mutex to gpu_dispatch an error instead
  * of a crash. */
 
-#include "handles.h"
+#include "runtime/handles.h"
 
-#include "../common/common.h"
-#include "../vm/vm.h"
-#include "runtime.h"
+#include "common/common.h"
+#include "vm/vm.h"
+#include "runtime/runtime.h"
 
 typedef struct {
     HandleKind kind;

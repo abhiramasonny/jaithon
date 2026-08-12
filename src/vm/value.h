@@ -6,7 +6,7 @@
 #ifndef JAI_VALUE_H
 #define JAI_VALUE_H
 
-#include "../common/common.h"
+#include "common/common.h"
 
 typedef struct Obj        Obj;
 typedef struct ObjString  ObjString;

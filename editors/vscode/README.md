@@ -17,7 +17,7 @@ greys out rather than shouting.
 
 **Navigation.** Go to definition, type definition, implementations, find all
 references, call hierarchy, document and workspace symbols. Definitions follow
-`import` into other modules, resolved the way `src/runtime/module.c` resolves
+`import` into other modules, resolved the way `src/runtime/modules/module.c` resolves
 them, so cmd-clicking `std.math` opens the file the compiler would have loaded.
 
 **Rename.** Across files, driven by the same resolution as go-to-definition, so
@@ -169,7 +169,7 @@ comment to read. For those:
 - **Names** come from the compiler at run time. `src/builtins.js` asks it
   `dir(0)`, `dir("")`, `dir([])` and so on in a single 6 ms process, which
   probes the real dispatch tables. That is not a convenience: the static tables
-  in `src/runtime/builtins.c` list the names `dir` *tries*, and thirteen of the
+  in `src/runtime/builtins/builtins.c` list the names `dir` *tries*, and thirteen of the
   forty-six it lists for `list` are not implemented in any build. Completion
   offered all thirteen before this asked.
 - **Prose** is the short table in `src/builtins.js`, because nothing in the

@@ -4,7 +4,7 @@
 #ifndef JAI_NATIVE_H
 #define JAI_NATIVE_H
 
-#include "../common/common.h"
+#include "common/common.h"
 
 #ifdef __cplusplus
 extern "C" {

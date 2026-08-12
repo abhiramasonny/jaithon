@@ -1,7 +1,7 @@
 #: Lower a resolved `jaithon.ast` tree to bytecode: the opcode set, the chunk, and
 #: the emitter.
 #:
-#: `Op` lists the opcodes of `src/vm/chunk.h` in exactly that order: that order
+#: `Op` lists the opcodes of `src/vm/bytecode/chunk.h` in exactly that order: that order
 #: *is* the wire format, so the enum's position is what a `.jaic` file stores
 #: and a new opcode may only be appended.
 from jaithon.ast import CompKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind
@@ -32,7 +32,7 @@ pub const SPEC_ENUM: int = 2
 #: `JAI_HANDLER_CATCH_ALL` in `src/vm/vm.c`; no pool index can reach it.
 pub const CATCH_ALL: int = 4294967295
 
-#: The opcode set of `src/vm/chunk.h`, in wire order.
+#: The opcode set of `src/vm/bytecode/chunk.h`, in wire order.
 pub enum Op {
     Nop,
     Const,
@@ -171,7 +171,7 @@ pub enum Op {
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
-#: `SE_VAR` in `src/vm/chunk.c`; the emitter adjusts those by hand.
+#: `SE_VAR` in `src/vm/bytecode/chunk.c`; the emitter adjusts those by hand.
 pub const STACK_EFFECT_VARIABLE: int = -1000000
 
 class OpSpec {
@@ -188,7 +188,7 @@ class OpSpec {
     }
 }
 
-# From the JAI_OPCODES table in src/vm/chunk.c. OP_CLOSURE is variable-length,
+# From the JAI_OPCODES table in src/vm/bytecode/chunk.c. OP_CLOSURE is variable-length,
 # recorded as -1 operand bytes.
 let _OPS: list[OpSpec] = [
     OpSpec(Op.Nop, "OP_NOP", 0, 0),
@@ -529,7 +529,7 @@ pub class Chunk {
         let offset = self.here()
         if span != null and span.is_known() {
             let rows = self.lines.len()
-            # Compares both ends, matching src/vm/chunk.c's recordSpan: keying on
+            # Compares both ends, matching src/vm/bytecode/chunk.c's recordSpan: keying on
             # start alone previously made the line table come out too short.
             let same = rows > 0 and
                 self.lines[rows - 1].span_start == span.start and
@@ -547,7 +547,7 @@ pub class Chunk {
 
     #: Add `value` to the pool and return its index, reusing an equal entry.
     #: Functions and class specs are never shared, which is the line
-    #: `constDedupable` in `src/vm/chunk.c` draws; a tuple is on the sharing
+    #: `constDedupable` in `src/vm/bytecode/chunk.c` draws; a tuple is on the sharing
     #: side of it.
     pub fn add_constant(self, value: Const) -> int {
         let key = _const_key(value)

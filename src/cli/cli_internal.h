@@ -12,7 +12,7 @@
 #ifndef JAI_CLI_INTERNAL_H
 #define JAI_CLI_INTERNAL_H
 
-#include "cli.h"
+#include "cli/cli.h"
 
 /* ------------------------------------------------------------------ */
 /* Diagnostics for command-line problems (main.c)                       */

@@ -2,12 +2,12 @@
  * white = unmarked, gray = marked and awaiting tracing, black = traced. */
 #include <stdlib.h>
 
-#include "gc.h"
-#include "chunk.h"
-#include "object.h"
-#include "table.h"
-#include "vm.h"
-#include "jit.h"
+#include "vm/gc.h"
+#include "vm/bytecode/chunk.h"
+#include "vm/object/object.h"
+#include "vm/table.h"
+#include "vm/vm.h"
+#include "vm/jit/jit.h"
 
 #define JAI_GC_DEFAULT_GROW_FACTOR 2.0
 #define JAI_GC_DEFAULT_MIN_HEAP    ((size_t)1 << 20)

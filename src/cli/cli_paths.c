@@ -6,12 +6,12 @@
  * files in a reproducible (sorted) order. collectAllInputs is that shared
  * expansion, kept in one place instead of once per command.
  */
-#include "cli_internal.h"
+#include "cli/cli_internal.h"
 
 #include <stdlib.h>   /* qsort */
 #include <sys/stat.h>
 
-#include "../native/native.h"
+#include "native/native.h"
 
 static void freeNameList(char **names, int count) {
     if (names == NULL) return;

@@ -45,7 +45,7 @@ pub class SigReexport {
     }
 }
 
-#: One module a module imports. `ImportEdge` in `src/runtime/module.c`: a plain
+#: One module a module imports. `ImportEdge` in `src/runtime/modules/module.c`: a plain
 #: `import m` binds no name, so only this records the edge that can close a cycle.
 pub class SigImport {
     #: The dotted module name, as written.
@@ -203,7 +203,7 @@ pub class SigLoader {
 }
 
 #: Split a dotted module name into its leading dots and a relative path.
-#: `splitModuleName` in src/runtime/module.c. `..` and path separators are
+#: `splitModuleName` in src/runtime/modules/module.c. `..` and path separators are
 #: refused, so a name out of source text cannot escape a search directory.
 pub fn split_module_name(dotted: str) -> tuple[int, str]? {
     if dotted == "" { return null }

@@ -6,7 +6,7 @@
 #ifndef JAI_DIAG_H
 #define JAI_DIAG_H
 
-#include "common.h"
+#include "common/common.h"
 
 /* ------------------------------------------------------------------ */
 /* Source positions                                                    */

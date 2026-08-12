@@ -3,9 +3,9 @@
  * jaiClassInherit pins Error's two fields at the same slots in every
  * subclass: slot 0 message, slot 1 traceback (VM-written only, no setter). */
 
-#include "runtime.h"
+#include "runtime/runtime.h"
 
-#include "../vm/gc.h"
+#include "vm/gc.h"
 
 #define FIELD_MESSAGE   0
 #define FIELD_TRACEBACK 1

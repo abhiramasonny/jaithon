@@ -2,7 +2,7 @@
 #ifndef JAI_RUNTIME_H
 #define JAI_RUNTIME_H
 
-#include "../vm/vm.h"
+#include "vm/vm.h"
 
 /* What the front end is asked to produce. It lived in
  * `src/codegen/codegen.h`, which is how four files outside the front end came

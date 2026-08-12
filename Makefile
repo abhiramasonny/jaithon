@@ -175,13 +175,13 @@ endif
 SRCS_S  := $(wildcard boot/*.S)
 SRCS_C  := $(wildcard boot/*.c) \
            $(wildcard src/common/*.c) \
-           $(wildcard src/vm/*.c) \
-           $(wildcard src/runtime/*.c) \
-           $(wildcard src/native/*.c) \
-           $(wildcard src/cli/*.c)
+           $(wildcard src/vm/*.c src/vm/*/*.c) \
+           $(wildcard src/runtime/*.c src/runtime/*/*.c src/runtime/*/*/*.c) \
+           $(wildcard src/native/*.c src/native/*/*.c) \
+           $(wildcard src/cli/*.c src/cli/*/*.c)
 
 ifeq ($(UNAME_S),Darwin)
-  SRCS_M := $(wildcard src/native/*.m)
+  SRCS_M := $(wildcard src/native/apple/*.m)
 else
   SRCS_M :=
 endif
@@ -248,8 +248,8 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # it made the seed part of its own identity. Reseeding changed seed.c, which
 # changed the fingerprint, which changed the id stamped into the next seed's
 # images. That loop cannot converge and a fixpoint over it never holds.
-ALL_SRCS := src/vm/chunk.h src/vm/serialize.h src/vm/serialize.c \
-            src/vm/object.h src/vm/value.h
+ALL_SRCS := src/vm/bytecode/chunk.h src/vm/bytecode/serialize.h \
+            src/vm/bytecode/serialize.c src/vm/object/object.h src/vm/value.h
 SRC_FINGERPRINT := $(shell cat $(ALL_SRCS) 2>/dev/null | shasum -a 256 | cut -c1-8)
 # At BUILD_ROOT, not $(BUILD): the fingerprint does not depend on build type,
 # and BASE_CFLAGS is expanded before $(BUILD) is narrowed to debug/release.
@@ -262,7 +262,7 @@ $(BUILD_ID_H):
 	@cmp -s $@.tmp $@ 2>/dev/null || mv $@.tmp $@
 	@rm -f $@.tmp
 
-$(BUILD)/src/vm/serialize.o: $(BUILD_ID_H)
+$(BUILD)/src/vm/bytecode/serialize.o: $(BUILD_ID_H)
 
 # --- rebuild stamps ---------------------------------------------------------
 #
@@ -395,14 +395,14 @@ verify-test: $(BUILD)/verify_chunk
 # nothing in the language reaches it yet, and because the failure it guards --
 # a stale instruction cache on arm64 -- returns a plausible wrong number rather
 # than crashing.
-$(BUILD)/jit_arena: tests/vm/jit_arena.c src/vm/jit_arena.c | $(CC_STAMP)
+$(BUILD)/jit_arena: tests/vm/jit_arena.c src/vm/jit/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arena.c src/vm/jit_arena.c
+	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arena.c src/vm/jit/jit_arena.c
 
 # The arm64 encoders, each verified by executing the instruction it builds.
-$(BUILD)/jit_arm64: tests/vm/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c | $(CC_STAMP)
+$(BUILD)/jit_arm64: tests/vm/jit_arm64.c src/vm/jit/jit_arm64.c src/vm/jit/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arm64.c src/vm/jit_arm64.c src/vm/jit_arena.c
+	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arm64.c src/vm/jit/jit_arm64.c src/vm/jit/jit_arena.c
 
 .PHONY: jit-test
 jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64

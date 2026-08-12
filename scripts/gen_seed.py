@@ -2,16 +2,14 @@
 """Generate boot/seed.c from the .jaic images the front end needs to start.
 
 The self-hosted front end is written in Jaithon, so compiling it needs a
-Jaithon compiler. Today that circle is broken by the C front end, which
-compiles the compiler's own closure inside the `sLoadingFrontEnd` window in
-src/runtime/module.c. That window is the last thing keeping src/lang, src/sema
-and src/codegen alive: everything outside it is already self-hosted.
+Jaithon compiler. The embedded seed breaks that circle. It holds the serialised
+.jaic image of each module in the compiler's startup closure as a byte array in
+the binary. The `sLoadingFrontEnd` window in src/runtime/modules/module.c limits
+seed access to that startup phase.
 
-The seed breaks the circle without a second compiler. It holds the serialised
-.jaic image of every module in that closure, as a byte array compiled into the
-binary, so a fresh clone builds offline with no extra files and no network.
-src/vm/serialize.c already reads .jaic, so loading one costs a memcpy and a
-deserialise.
+A fresh clone can build offline with no second compiler. The loader in
+src/vm/bytecode/serialize.c already reads .jaic, so loading one costs a memcpy
+and a deserialise.
 
 Usage:
     scripts/gen_seed.py <cache-root> <output.c> [subtree ...]

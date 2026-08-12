@@ -4,7 +4,7 @@
 #:
 #: It used to work by *importing* `std.list` and letting the importer populate
 #: the cache as a side effect. That relied on the C front end: inside the
-#: bootstrap window `src/runtime/module.c` compiled with C, so the front end's
+#: bootstrap window `src/runtime/modules/module.c` compiled with C, so the front end's
 #: own closure was compiled even though the front end was not loaded yet. With
 #: one front end the window has only the seed, and a seed that serves a module
 #: means that module is never compiled from source -- so the next seed would be

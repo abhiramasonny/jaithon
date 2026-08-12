@@ -80,7 +80,7 @@ pub class Compiled {
 
 #: Compile `text` as the module at `path`. Nothing is written to disk.
 #:
-#: `opt_level` defaults to 2, matching what `src/runtime/module.c` and
+#: `opt_level` defaults to 2, matching what `src/runtime/modules/module.c` and
 #: `make bootstrap` expect.
 #:
 #: ```
