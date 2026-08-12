@@ -4,7 +4,7 @@
 # The bootstrap window is narrow. `warmFrontEnd` in src/runtime/modules/module.c loads
 # the compiler's own closure with `sLoadingFrontEnd` set, and only inside that
 # window is the seed consulted. Everything the compiler needs AFTER it is
-# running -- the rest of std, anything under lib/jaiplot -- is compiled from
+# running -- the rest of std and anything under packages -- is compiled from
 # source on demand and cached, so carrying it here only makes the binary
 # bigger.
 #

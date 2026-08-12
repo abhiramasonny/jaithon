@@ -122,19 +122,21 @@ more idepth file -> [`LANGUAGE.md`](LANGUAGE.md).
 
 Also you can checkout the examples directory.
 
-## External libraries
+## Packages
 
-These arent really external (since they are included right here) but until I write a package manager, lets pretend these are external.
+Libraries that can ship outside the Jaithon standard library can be found under
+[`packages/`](packages/README.md). Each package owns its source, tests, version,
+and dependency manifest. Jaithon finds workspace packages from a checkout and
+from an installed `share/jaithon/packages` directory.
 
 
-`jaiplot` provides Matplotlib-style figures and axes with file and window
+`jaiplot` is a library for Matplotlib-style figures and axes with file and window
 backends.
 
 `jaitensor` provides Metal-resident float32 tensors and a Keras-style API.
 It includes common tensor math, format-independent datasets, dense models,
 ReLU/sigmoid/tanh/softmax activations, momentum SGD, Adam, validation,
-prediction, and JSON weight files. Training queues each epoch as ordered GPU
-work and synchronizes once for metrics. The examples cover
+prediction, and JSON weight files. The examples cover
 [`MNIST`](examples/mnist_gpu.jai) and a
 [`nonlinear spiral classifier`](examples/spiral_classifier.jai).
 

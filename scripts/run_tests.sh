@@ -12,14 +12,14 @@
 #                     something still live, a pass that rewrites a jump wrongly
 #                     and a guard that hands the interpreter the wrong operand
 #                     stack all show up nowhere else
-#   3. unit         — tests/lang and tests/stdlib, run by `jaithon test`
+#   3. unit         — core and workspace package tests, run by `jaithon test`
 #                     (jaithon.tool.test): every top-level `test_` function
 #   4. diagnostics  — tests/errors/*.jai must FAIL with the code named on the
 #                     file's first line, proving the checker catches it
 #   5. repl         — tests/repl/*.repl, a session fed to `jaithon repl` on
 #                     stdin; its stdout must match the .expected beside it, and
 #                     its stderr the .expected-err when there is one
-#   6. formatting   — `jaithon fmt --check` over lib, tests and examples, the
+#   6. formatting   — `jaithon fmt --check` over lib, tests, examples and packages, the
 #                     gate that keeps the tree canonical. Off by default: it
 #                     re-parses every file and costs more than the other four
 #                     together. `make fmt-check` runs the same thing alone.
@@ -176,7 +176,7 @@ done
 
 # ------------------------------------------------------------------ 3. unit
 #
-# One `jaithon test` run covers both directories: the runner discovers the
+# One `jaithon test` run covers the core and package directories: the runner discovers the
 # files, executes each in a namespace of its own, and reports one line per
 # test under --verbose. Those lines are counted here so that the summary
 # counts tests rather than files; the runner's own summary is dropped, since
@@ -184,7 +184,12 @@ done
 printf '%sUnit tests%s\n' "$BOLD" "$RESET"
 unit_args=(test --verbose)
 [[ -n "$FILTER" ]] && unit_args+=("--filter=$FILTER")
-unit_args+=("$ROOT/tests/lang" "$ROOT/tests/stdlib")
+unit_args+=(
+    "$ROOT/tests/lang"
+    "$ROOT/tests/stdlib"
+    "$ROOT/packages/jaiplot/tests"
+    "$ROOT/packages/jaitensor/tests"
+)
 
 start=$(now_ms)
 unit_output="$("$JAITHON" "${unit_args[@]}" 2>&1)"
@@ -323,13 +328,13 @@ $(diff -u "$expected_err" <(printf '%s\n' "$errout") | head -40)"
 done
 
 # ------------------------------------------------------------ 6. formatting
-# Off by default: re-parsing every file under lib, tests and examples costs
+# Off by default: re-parsing every file under lib, tests, examples and packages costs
 # several times what the other four layers cost together, which is too much to
 # pay on every run. `make fmt-check` is the same gate on its own.
 if [[ $FORMAT -eq 1 ]]; then
     printf '%sFormat check%s\n' "$BOLD" "$RESET"
     start=$(now_ms)
-    fmt_output="$("$JAITHON" fmt --check "$ROOT/lib" "$ROOT/tests" "$ROOT/examples" 2>&1)"
+    fmt_output="$("$JAITHON" fmt --check "$ROOT/lib" "$ROOT/tests" "$ROOT/examples" "$ROOT/packages" 2>&1)"
     fmt_status=$?
     if [[ $fmt_status -eq 0 ]]; then
         record_pass "fmt --check" "$(( $(now_ms) - start ))"

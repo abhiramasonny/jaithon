@@ -1,10 +1,3 @@
-#: Train and evaluate a dense MNIST classifier with jaitensor.
-#:
-#: With the dataset installed in `data/mnist`, run:
-#:
-#:     jaithon run examples/mnist_gpu.jai
-#:
-#: You can pass image IDX, label IDX, epoch count, and batch size.
 import jaitensor as jt
 from jaitensor import Dataset
 from std.io import read_bytes
@@ -17,23 +10,13 @@ fn read_u32(data: bytes, offset: int) -> int {
 fn load_mnist(images_path: str, labels_path: str) -> Dataset {
     let images = read_bytes(images_path)
     let labels = read_bytes(labels_path)
-    if read_u32(images, 0) != 2051 or read_u32(labels, 0) != 2049 {
-        throw ValueError("expected uncompressed MNIST IDX image and label files")
-    }
     let samples = read_u32(images, 4)
     let label_count = read_u32(labels, 4)
+
     let rows = read_u32(images, 8)
     let columns = read_u32(images, 12)
-    if samples != label_count {
-        throw ValueError(f"MNIST has {samples} images but {label_count} labels")
-    }
     let pixels = rows * columns
-    if images.len() != 16 + samples * pixels {
-        throw ValueError("MNIST image file is truncated or has trailing data")
-    }
-    if labels.len() != 8 + samples {
-        throw ValueError("MNIST label file is truncated or has trailing data")
-    }
+
     return jt.Dataset.from_u8(
         images,
         labels,
@@ -55,6 +38,11 @@ fn main(args: list[str]) -> int {
     print(f"GPU: {jt.device_name()}")
     let train = load_mnist(image_path, label_path)
     defer { train.free() }
+    var test: Dataset? = null
+    if image_path == "data/mnist/train-images-idx3-ubyte" {
+        test = load_mnist("data/mnist/t10k-images-idx3-ubyte", "data/mnist/t10k-labels-idx1-ubyte")
+    }
+    defer { if test is not null { test.free() } }
 
     let model = jt.Sequential(
         [
@@ -64,16 +52,15 @@ fn main(args: list[str]) -> int {
     )
     defer { model.free() }
     model.compile(optimizer: jt.SGD(learning_rate: 0.08), loss: jt.SparseCategoricalCrossentropy())
-    # The input width becomes known from the dataset on the first fit.
-    model.fit(train, epochs: epochs, batch_size: batch_size)
-    model.summary()
 
-    let test_images = "data/mnist/t10k-images-idx3-ubyte"
-    let test_labels = "data/mnist/t10k-labels-idx1-ubyte"
-    if image_path == "data/mnist/train-images-idx3-ubyte" {
-        let test = load_mnist(test_images, test_labels)
-        defer { test.free() }
-        print(f"test: {model.evaluate(test, batch_size: batch_size)}")
-    }
+    model.fit(
+        train,
+        epochs: epochs,
+        batch_size: batch_size,
+        test_data: test,
+        plot_path: "data/mnist/training.svg"
+    )
+
+    model.summary()
     return 0
 }

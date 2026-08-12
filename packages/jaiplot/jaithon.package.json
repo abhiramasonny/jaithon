@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "jaiplot",
+  "version": "0.1.0",
+  "description": "Plotting for Jaithon",
+  "source": "src",
+  "dependencies": {}
+}
