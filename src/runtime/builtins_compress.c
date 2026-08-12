@@ -1,43 +1,16 @@
-/* builtins_compress.c — __prim__.deflate and __prim__.adler32.
- *
- * A PNG is a container around one zlib stream, so writing PNGs from Jaithon
- * needs DEFLATE and nothing else needs it at all. That is the whole reason
- * this file exists: everything above it — the chunk layout, the CRC, the
- * filters — is ordinary byte shuffling that lib/std writes in Jaithon, while
- * the compressor is a hash-chain match search over a 32 KB window, which is
- * millions of comparisons per image and cannot be interpreted.
- *
- * Nothing is linked in to do it. zlib is on most machines but not all of them,
- * and a build that silently produces uncompressed PNGs where the library is
- * missing is worse than one that carries its own compressor. So this is a real
- * DEFLATE: LZ77 with lazy matching against a 32 KB window, emitted with the
- * fixed Huffman code of RFC 1951 §3.2.6. A dynamic code would buy a few more
- * percent on large images at the cost of the code-length code, the
- * canonical-code builder and the block-splitting heuristic that decides when
- * it pays — a lot of machinery for a small margin. Level 0 emits stored blocks
- * and is what an encoder asks for when it wants the bytes back untouched.
- *
- * The output carries the zlib wrapper of RFC 1950 — two header bytes and a
- * trailing Adler-32 — because that is what a PNG IDAT chunk holds and what
- * every decompressor on the other side expects.
- */
+/* builtins_compress.c — __prim__.deflate/adler32/crc32: a native DEFLATE (RFC 1951 fixed Huffman) and checksums, since zlib is not guaranteed to be linked and PNG output needs it. */
 
 #include "builtins.h"
 #include "runtime.h"
 
-/* ------------------------------------------------------------------ */
-/* Bit output                                                           */
-/* ------------------------------------------------------------------ */
-
-/* DEFLATE fills a byte from its least significant bit upwards, but a Huffman
- * code is written most significant bit first, which is why writerCode reverses
- * one before handing it over. Getting this backwards produces a stream that
- * looks plausible and decodes to nothing. */
+/* DEFLATE fills a byte LSB-first but a Huffman code is written MSB-first, so
+ * writerCode reverses one before handing it over; getting this backwards
+ * produces a stream that looks plausible and decodes to nothing. */
 typedef struct {
     uint8_t *bytes;
     size_t   count;
     size_t   capacity;
-    uint32_t bits;        /* the partial byte, low bits first */
+    uint32_t bits;
     int      bitCount;    /* how many of them are live, always 0-7 between calls */
 } BitWriter;
 
@@ -49,16 +22,15 @@ static void writerReserve(BitWriter *writer, size_t extra) {
     writer->capacity = capacity;
 }
 
-/* Appends a whole byte, bypassing the bit buffer. Every caller other than
- * writerBits is placing a byte-aligned field — a stored block's header, the
- * zlib wrapper — and has flushed the partial byte first. */
+/* Callers other than writerBits place a byte-aligned field (a stored block's
+ * header, the zlib wrapper) and must have flushed the partial byte first. */
 static void writerPush(BitWriter *writer, uint8_t byte) {
     writerReserve(writer, 1);
     writer->bytes[writer->count++] = byte;
 }
 
-/* Up to 16 bits at a time, which covers the longest code (9) and the longest
- * extra-bit field (13) with room to spare. */
+/* Never called with more than 16 bits, which is what keeps the accumulator
+ * from overflowing while a partial byte (up to 7 bits) is still pending. */
 static void writerBits(BitWriter *writer, uint32_t value, int count) {
     writer->bits |= (value & ((1u << count) - 1u)) << writer->bitCount;
     writer->bitCount += count;
@@ -69,8 +41,7 @@ static void writerBits(BitWriter *writer, uint32_t value, int count) {
     }
 }
 
-/* Pad the partial byte with zeroes. A stored block and the zlib trailer both
- * start on a byte boundary. */
+/* A stored block and the zlib trailer must both start on a byte boundary. */
 static void writerAlign(BitWriter *writer) {
     if (writer->bitCount == 0) return;
     writerPush(writer, (uint8_t)(writer->bits & 0xFFu));
@@ -83,10 +54,6 @@ static void writerCode(BitWriter *writer, uint32_t code, int bits) {
     for (int i = 0; i < bits; i++) reversed = (reversed << 1) | ((code >> i) & 1u);
     writerBits(writer, reversed, bits);
 }
-
-/* ------------------------------------------------------------------ */
-/* The fixed Huffman code (RFC 1951 §3.2.6)                             */
-/* ------------------------------------------------------------------ */
 
 static void writeSymbol(BitWriter *writer, int symbol) {
     if (symbol <= 143)      writerCode(writer, 0x30u + (uint32_t)symbol, 8);
@@ -130,10 +97,6 @@ static void writeMatch(BitWriter *writer, int length, int64_t distance) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Match finding                                                        */
-/* ------------------------------------------------------------------ */
-
 #define WINDOW_SIZE 32768
 #define WINDOW_MASK (WINDOW_SIZE - 1)
 #define HASH_BITS   15
@@ -141,11 +104,10 @@ static void writeMatch(BitWriter *writer, int length, int64_t distance) {
 #define MIN_MATCH   3
 #define MAX_MATCH   258
 
-/* head: the most recent position whose next three bytes hash here, or -1.
- * prev: for the position in each window slot, the previous position with the
- * same hash. A slot is only overwritten by a position a full window later, so
- * every entry still inside the window is current — which is what makes the
- * distance test below enough to reject a stale one. */
+/* head[hash]: most recent position with that hash, or -1. prev[pos & MASK]:
+ * previous position sharing it. A slot is only overwritten a full window
+ * later, so any entry still in-window is current -- the distance check below
+ * is enough on its own to reject a stale one. */
 typedef struct {
     int32_t head[HASH_SIZE];
     int32_t prev[WINDOW_SIZE];
@@ -156,10 +118,9 @@ static uint32_t hashAt(const uint8_t *data) {
                       (uint32_t)data[2]) & (HASH_SIZE - 1u);
 }
 
-/* Returns the position that held this hash before, which is where a search
- * from `position` starts: the chain must not begin with `position` itself, or
- * the first match found is the string against itself at distance zero — a
- * distance DEFLATE does not have and every decompressor rejects. */
+/* Returns the prior position for this hash (the search start point) -- the
+ * chain must not begin with `position` itself, or the first match found is
+ * the string against itself at distance zero, which DEFLATE has no code for. */
 static int32_t tableInsert(MatchTable *table, const uint8_t *data, int64_t length,
                            int64_t position) {
     if (position + MIN_MATCH > length) return -1;
@@ -170,10 +131,8 @@ static int32_t tableInsert(MatchTable *table, const uint8_t *data, int64_t lengt
     return previous;
 }
 
-/* The longest match for the bytes at `position`, or 0 when there is none worth
- * coding. `candidate` is where the hash chain starts, `chainLimit` bounds the
- * search, and `niceLength` stops it early once a match is long enough to not be
- * worth improving — the two knobs the level turns. */
+/* Longest match at `position`, or 0 if none is worth coding. `chainLimit` and
+ * `niceLength` are the two knobs the compression level tunes. */
 static int findMatch(const MatchTable *table, const uint8_t *data, int64_t length,
                      int64_t position, int64_t candidate, int chainLimit,
                      int niceLength, int64_t *outDistance) {
@@ -188,9 +147,8 @@ static int findMatch(const MatchTable *table, const uint8_t *data, int64_t lengt
 
     for (int chain = 0; chain < chainLimit && candidate >= oldest; chain++) {
         const uint8_t *there = data + candidate;
-        /* Reject on the byte that would have to improve on the best match so
-         * far before comparing anything else; it is the cheapest test that can
-         * rule a candidate out. */
+        /* Cheapest test first: reject on the byte that would have to beat the
+         * best match so far before comparing anything else. */
         if (there[best] == here[best] && there[0] == here[0] && there[1] == here[1]) {
             int64_t matched = 0;
             while (matched < maxLength && there[matched] == here[matched]) matched++;
@@ -208,20 +166,14 @@ static int findMatch(const MatchTable *table, const uint8_t *data, int64_t lengt
     return best;
 }
 
-/* ------------------------------------------------------------------ */
-/* The two block encodings                                              */
-/* ------------------------------------------------------------------ */
-
-/* What writeStoredBlocks will cost: five bytes of header per block, and the
- * bytes themselves. */
+/* Cost of writeStoredBlocks: five header bytes per block plus the data. */
 static size_t storedSize(size_t length) {
     size_t blocks = length == 0 ? 1 : (length + 65534) / 65535;
     return blocks * 5 + length;
 }
 
-/* Level 0: the bytes verbatim, in blocks of at most 65535 as the length field
- * allows. An empty input still emits one final empty block, because a zlib
- * stream with no block in it is not a stream. */
+/* Blocks are capped at 65535 bytes (the 16-bit length field). An empty input
+ * still emits one empty block -- a zlib stream needs at least one. */
 static void writeStoredBlocks(BitWriter *writer, const uint8_t *data, size_t length) {
     size_t offset = 0;
     do {
@@ -243,9 +195,8 @@ static void writeStoredBlocks(BitWriter *writer, const uint8_t *data, size_t len
     } while (offset < length);
 }
 
-/* How hard each level looks. Level 1 takes the first match it can see; level 9
- * walks 4096 candidates and defers every one of them to check whether the next
- * position does better. */
+/* Level 1 takes the first match it sees; level 9 walks up to 4096 candidates
+ * and defers each to check whether the next position does better. */
 static const int  kChainLimit[10] = {0, 4, 8, 16, 32, 64, 128, 256, 1024, 4096};
 static const int  kNiceLength[10] = {0, 16, 24, 32, 48, 64, 128, 192, 258, 258};
 static const bool kUseLazy[10] = {
@@ -280,9 +231,8 @@ static void writeFixedBlock(BitWriter *writer, const uint8_t *data, int64_t leng
 
         if (holding) {
             if (found > heldLength) {
-                /* One byte later buys a longer match, so the byte we were
-                 * holding is worth more as a literal than as the start of the
-                 * shorter one. */
+                /* One byte later buys a longer match, so the held byte is
+                 * worth more as a literal than as the start of the shorter one. */
                 writeSymbol(writer, data[position - 1]);
                 heldLength = found;
                 heldDistance = distance;
@@ -317,18 +267,13 @@ static void writeFixedBlock(BitWriter *writer, const uint8_t *data, int64_t leng
         position++;
     }
 
-    /* A held match is at least three bytes long, so it always leaves two behind
-     * it and the loop cannot end while one is held. Emitting it anyway keeps
-     * that argument off the critical path. */
+    /* A held match is >= 3 bytes, so the loop can never actually end while one
+     * is held; emitting it anyway keeps that argument off the critical path. */
     if (holding) writeMatch(writer, heldLength, heldDistance);
 
     writeSymbol(writer, 256);                          /* end of block */
     JAI_FREE(MatchTable, table);
 }
-
-/* ------------------------------------------------------------------ */
-/* Adler-32                                                             */
-/* ------------------------------------------------------------------ */
 
 /* 5552 is the most bytes that can be summed before the second accumulator can
  * overflow 32 bits, which is what lets the modulo happen once per block. */
@@ -351,21 +296,14 @@ static uint32_t adler32Of(const uint8_t *data, size_t length) {
     return (high << 16) | low;
 }
 
-/* ------------------------------------------------------------------ */
-/* The primitives                                                       */
-/* ------------------------------------------------------------------ */
-
 static bool compressArgBytes(Value v, int index, const char *fnName, ObjBytes **out) {
     if (!IS_BYTES(v)) return jaiBuiltinArgTypeError(index, fnName, "bytes", v);
     *out = AS_BYTES(v);
     return true;
 }
 
-/* deflate(data, level) -> bytes
- *
- * A complete zlib stream: the two-byte header of RFC 1950, one DEFLATE stream,
- * and the Adler-32 of the input in big-endian order. That is exactly what a
- * PNG IDAT chunk carries. */
+/* deflate(data, level) -> bytes: a complete zlib stream (RFC 1950 header +
+ * DEFLATE stream + big-endian Adler-32), exactly what a PNG IDAT chunk holds. */
 static bool nDeflate(int argc, Value *args, Value *out) {
     (void)argc;
     ObjBytes *data;
@@ -395,10 +333,8 @@ static bool nDeflate(int argc, Value *args, Value *out) {
     } else {
         writeFixedBlock(&writer, data->data, (int64_t)data->length, (int)level);
         writerAlign(&writer);
-        /* Half of the fixed code's literals are nine bits, so data with no
-         * matches in it comes out about five percent larger than it went in.
-         * Storing it is smaller, just as valid, and what the caller wanted when
-         * it asked for compression. */
+        /* Data with no matches comes out ~5% larger under the fixed code (half
+         * its literals are nine bits); fall back to stored if that happens. */
         if (writer.count - blockStart > storedSize(data->length)) {
             writer.count = blockStart;
             writeStoredBlocks(&writer, data->data, data->length);
@@ -419,9 +355,7 @@ static bool nDeflate(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* adler32(data) -> int
- *
- * The checksum RFC 1950 puts at the end of a zlib stream: two 16-bit sums
+/* adler32(data) -> int: RFC 1950's zlib-trailer checksum -- two 16-bit sums
  * modulo 65521, packed high then low. */
 static bool nAdler32(int argc, Value *args, Value *out) {
     (void)argc;
@@ -432,12 +366,8 @@ static bool nAdler32(int argc, Value *args, Value *out) {
 }
 
 
-/* crc32(data)
- *
- * The CRC-32 PNG puts on every chunk. Table-driven, and native for the same
- * reason adler32 is: a bit-at-a-time loop in Jaithon runs eight iterations per
- * byte, and a megabyte of image data makes that the most expensive part of
- * writing a file whose actual compression is already native. */
+/* crc32(data): PNG's per-chunk CRC-32, table-driven and native for the same
+ * reason adler32 is -- a bit-at-a-time Jaithon loop would dominate runtime. */
 static uint32_t sCrcTable[256];
 static bool sCrcReady = false;
 

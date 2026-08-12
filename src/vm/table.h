@@ -1,12 +1,6 @@
-/* table.h — the one hash table used everywhere in Jaithon.
- *
- * Open addressing, linear probing, tombstones, 75% max load. Keys are Values;
- * hashing goes through jaiValueHash so dicts, sets, method tables, and global
- * tables all share one implementation.
- *
- * For the common case of ObjString* keys, jaiTableGetInterned skips hashing by
- * using the string's cached hash and compares by pointer.
- */
+/* table.h — the one hash table used everywhere in Jaithon; keys are Values,
+ * hashed through jaiValueHash. jaiTableGetInterned skips hashing for
+ * ObjString* keys by using the string's cached hash and comparing by pointer. */
 #ifndef JAI_TABLE_H
 #define JAI_TABLE_H
 
@@ -21,29 +15,17 @@ typedef struct {
 
 typedef struct {
     JaiEntry *entries;
-    /* Slot indices in insertion order, with -1 for an entry since deleted.
-     * Iteration walks this rather than the slot array, because a dict keeps
-     * insertion order (std.json documents it, and `{1: 1, 2: 4}` has to print
-     * the way it was written). Holes are compacted on the next rehash. */
+    /* Slot indices in insertion order (-1 = since deleted); iteration walks
+     * this so a dict prints in insertion order. Holes compact on next rehash. */
     int32_t  *order;
     int       orderCount; /* used slots of `order`, holes included */
     int       count;      /* live entries */
     int       tombstones;
     int       capacity;   /* always a power of two, or 0 */
     uint32_t  version;    /* bumped on every mutation; iterators snapshot it */
-    /* Bumped when the SET OF KEYS or the LAYOUT changes: a new key, a rehash,
-     * a delete, a clear. Not on a value write -- that is the write the
-     * compiled tier exists to make fast, and `version` already covers it.
-     *
-     * Two readers, and both need exactly this:
-     *   - jit_func.c bakes a JaiEntry* into compiled code. Only a rehash, a
-     *     delete or a clear can make that address stop being the storage for
-     *     the name it came from, and reading a slot whose array was freed is a
-     *     use of freed memory rather than a wrong answer.
-     *   - OP_FORMAT memoises "this module does not bind `str`". That is a fact
-     *     about the key set, so a new key has to move it too -- which is why
-     *     this counter is wider than the address question alone needs.
-     * Fits the padding after `version`; sizeof(JaiTable) is 40 either way. */
+    /* Bumped on key-set/layout changes (insert, rehash, delete, clear), not
+     * value writes: guards a JaiEntry* the JIT bakes into compiled code, and
+     * OP_FORMAT's "module doesn't bind this name" cache. */
     uint32_t  keyVersion;
 } JaiTable;
 
@@ -58,9 +40,8 @@ void jaiTableReserve(JaiTable *t, int minCapacity);
 bool jaiTableGet(JaiTable *t, Value key, Value *out);
 /* Returns true if the key was newly inserted. */
 bool jaiTableSet(JaiTable *t, Value key, Value value);
-/* Same, with a hash the caller has already computed for `key`. A caller that
- * has to inspect the key first (jaiDictSet, which rejects the ones spec §5.4
- * forbids) uses this so a user `__hash__` runs once rather than twice. */
+/* Same, with a hash the caller has already computed, so a user `__hash__`
+ * runs once rather than twice. */
 bool jaiTableSetHashed(JaiTable *t, Value key, uint64_t hash, Value value);
 /* Returns true if a live entry was removed. */
 bool jaiTableDelete(JaiTable *t, Value key);
@@ -70,18 +51,15 @@ void jaiTableAddAll(const JaiTable *from, JaiTable *to);
 /* Fast path for interned-string keys: pointer comparison, cached hash. */
 bool jaiTableGetInterned(JaiTable *t, ObjString *key, Value *out);
 bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value);
-/* Same, handing back what the key was bound to (NULL_VAL when it was absent).
- * The entry is already in hand at the point the value is overwritten, so this
- * costs nothing; a caller that looked the old value up itself would pay a
- * second probe. jaiModuleSet needs it to tell a rebinding from an update. */
+/* Same, handing back what the key was bound to (NULL_VAL if absent) at no
+ * extra cost; jaiModuleSet needs it to tell a rebinding from an update. */
 bool jaiTableSetInternedPrev(JaiTable *t, ObjString *key, Value value,
                              Value *outPrev);
 /* Index of the live entry for `key`, or -1. Stable until the next mutation;
  * used by the inline caches for globals. */
 int  jaiTableFindIndex(JaiTable *t, Value key);
-/* The live entry for an interned key, or NULL. The address is stable for as
- * long as `keyVersion` does not change; see the comment on that field. Used by
- * the JIT to bake a module global's storage into compiled code. */
+/* The live entry for an interned key, or NULL; stable as long as `keyVersion`
+ * doesn't change. Used by the JIT to bake a module global's storage in. */
 JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key);
 
 /* Iteration: start with i = 0, repeat while it returns true.
@@ -105,8 +83,7 @@ void       jaiInternTableAdd(ObjString *s);
 void       jaiInternTableInit(void);
 void       jaiInternTableFree(void);
 JaiTable  *jaiInternTable(void);
-/* Population, for callers deciding whether interning is still worth it. Owned
- * by table.c; read-only here, and inline because it is on the string-creation
+/* Population; owned by table.c, read-only here, inline for the string-creation
  * path. */
 extern JaiTable jaiInternTableStorage;
 static inline int jaiInternTableCount(void) { return jaiInternTableStorage.count; }

@@ -1,29 +1,8 @@
-/* value.h — the Jaithon value representation.
- *
- * A Value is 16 bytes: an 8-byte tag word and an 8-byte payload. This is
- * deliberately not NaN-boxed, and that is now a measured decision rather than
- * an assumption.
- *
- * An 8-byte NaN-boxed Value was built -- deliberately wrong, ints truncated to
- * the 48-bit payload rather than boxed, which is enough to time the same work --
- * and it is SLOWER than this one: loop_sum +13.3%, binary_trees +9.7%,
- * alloc_churn +10.1%, matrix_mul +4.9%, sort_merge a wash, all with identical
- * output and the same trip counts.
- *
- * The reason is that Jaithon's `int` is 64-bit (spec §2.4) and does not fit a
- * 48-bit payload. On the hot path -- `IS_INT`/`AS_INT`/`INT_VAL` inside
- * OP_ADD, not a tag switch -- that costs about eight extra ALU operations per
- * integer opcode: `AS_INT` becomes a shift pair because the payload is signed,
- * and the `IS_INT` comparison constant does not fit a `CMP` immediate so it is
- * rematerialised. That exceeds what the narrower stack saves, which mostly
- * hits in L1 anyway. matrix_mul loses 5% even though its doubles become free,
- * because its indices are integers and that alone is enough.
- *
- * So the eight bytes are not the prize they look like, and anyone reopening
- * this has to answer the 64-bit integer question first, not second. The full
- * measurement is in the "NaN-boxing, measured" section of
- * docs/superpowers/plans/2026-08-09-phase7-speed.md.
- */
+/* value.h — the Jaithon value representation: a 16-byte {tag, payload} pair,
+ * deliberately not NaN-boxed. An 8-byte NaN-boxed Value was built and measured
+ * SLOWER (loop_sum +13.3%, binary_trees +9.7%, alloc_churn +10.1%) because
+ * Jaithon's 64-bit `int` (spec §2.4) doesn't fit the 48-bit payload -- full
+ * analysis in docs/superpowers/plans/2026-08-09-phase7-speed.md. */
 #ifndef JAI_VALUE_H
 #define JAI_VALUE_H
 
@@ -92,12 +71,9 @@ typedef struct {
 #define AS_FLOAT(v)       ((v).as.number)
 #define AS_OBJ(v)         ((v).as.obj)
 
-/* Which of the five kinds `v` is.
- *
- * A five-way branch on a value is a switch, and a switch needs something to
- * switch on. Reading `.type` directly works only while a Value has a tag field;
- * a NaN-boxed one does not, so every such switch goes through here instead and
- * the representation stays behind the macros. */
+/* Which of the five kinds `v` is: goes through here, not `.type` directly, so
+ * every switch on a value's kind stays behind the macros -- a NaN-boxed Value
+ * would have no tag field to read. */
 JAI_INLINE ValueType jaiValueType(Value v) { return v.type; }
 
 /* Numeric coercion helper: int or float -> double. Undefined for other types. */
@@ -124,15 +100,12 @@ typedef enum {
 struct Obj {
     ObjType  type;
     bool     isMarked;
-    /* Three bytes of alignment padding sit between isMarked and next whatever
-     * we do, so a subtype whose own bool would otherwise add a whole aligned
-     * word to its header keeps it here instead. Only ObjString uses this, for
-     * whether the string is in the intern table; that moves the flexible
-     * character array eight bytes earlier on every string in the heap. */
+    /* Alignment padding between isMarked and next would otherwise cost a
+     * subtype's own bool a whole aligned word, so it lives here instead.
+     * ObjString uses this for "in the intern table". */
     bool     subFlag;
-    /* The third padding byte, which was going spare. ObjString uses it for
-     * whether a later append into the same buffer overwrote this string's NUL
-     * terminator; see jaiStringCStr. */
+    /* The third padding byte. ObjString uses it for whether a later append
+     * into the same buffer overwrote this string's NUL; see jaiStringCStr. */
     bool     subFlag2;
     Obj     *next;        /* intrusive list of every heap object */
 };
@@ -162,15 +135,12 @@ struct Obj {
 #define IS_FILE(v)        IS_OBJ_TYPE(v, OBJ_FILE)
 
 /* True when compiled code provably cannot have baked this value out of a
- * module global: it is data, not something callable or a class. Enumerating
- * the inert types rather than the live ones is deliberate -- a type nobody
- * thought about answers false, which only costs an invalidation.
- *
- * TWO CALLERS, and they must stay in step. jaiModuleSet is one. The other is
- * machine code: jit_func.c's OP_SET_GLOBAL emits a runtime test that skips the
- * ObjModule::version bump, and that test recognises a STRICT SUBSET of this
- * list (OBJ_INSTANCE and OBJ_LIST). Adding a type here is always safe; taking
- * OBJ_INSTANCE or OBJ_LIST away is not, and has to change the emitter too. */
+ * module global (it's data, not callable or a class); enumerating the inert
+ * types rather than the live ones means an unrecognised type just costs an
+ * invalidation. TWO CALLERS MUST STAY IN STEP: jaiModuleSet, and jit_func.c's
+ * OP_SET_GLOBAL emitter, which recognises only the strict subset
+ * {OBJ_INSTANCE, OBJ_LIST} -- adding a type here is safe, removing those two
+ * is not without changing the emitter too. */
 JAI_INLINE bool jaiValueIsInertGlobal(Value v) {
     if (!IS_OBJ(v)) return true;            /* null, bool, int, float */
     switch (AS_OBJ(v)->type) {
@@ -241,14 +211,14 @@ ObjString *jaiValueToRepr(Value v);
 /* Fast path used by the disassembler and traceback printer. */
 void jaiPrintValue(FILE *out, Value v, bool repr);
 
-/* Most parts one OP_FORMAT can join. An f-string with more falls back to the
- * build-a-list-and-join lowering, so this only has to cover what fits in the
- * instruction's u24 literal mask. */
+/* Most parts one OP_FORMAT can join; an f-string with more falls back to
+ * build-a-list-and-join, so this only covers the instruction's u24 literal
+ * mask. */
 #define JAI_FMT_MAX_PARTS 24
 
-/* str() of every part, concatenated, in one allocation — what an f-string
+/* str() of every part, concatenated, in one allocation -- what an f-string
  * lowers to. `parts` must be reachable from a root (OP_FORMAT leaves them on
- * the value stack) because building the result can collect. Returns NULL with
+ * the value stack), since building the result can collect. Returns NULL with
  * an exception pending when a user __str__ raises. */
 ObjString *jaiValueFormat(const Value *parts, int count);
 

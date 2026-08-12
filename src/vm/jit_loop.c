@@ -8,27 +8,10 @@
 #include "jit_arm64.h"
 #include "vm.h"
 
-/* The compiled loop.
- *
- * One shape, recognised by exact opcode sequence:
- *
- *     JUMP_IF_CMP_LOCAL_K LT, i, K, exit
- *     GET_LOCAL2 acc, i
- *     MOD_INT_CONST d
- *     ADD_BIND acc
- *     INC_LOCAL i, 1
- *     LOOP
- *
- * That is `loop_sum`'s body and nothing else. A pattern matcher is not a
- * compiler and this file does not pretend to be one -- the point is to prove
- * the mechanism end to end on a shape that exists, and then widen.
- *
- * Every write in the body goes to `acc` or `i`, both locals. That is what makes
- * the bail sound: on any guard failure the values the iteration STARTED with
- * are written back and the interpreter re-runs that whole iteration, raising
- * the overflow itself. A body that called, allocated or stored to a field could
- * not be re-run and is refused.
- */
+/* The compiled loop: matches one exact opcode shape (loop_sum's body), not a
+ * general compiler. Every write goes to `acc`/`i` locals only, so a guard
+ * failure can write back the pre-iteration values and safely re-run in the
+ * interpreter; a body that calls, allocates, or writes a field is refused. */
 
 #if defined(__aarch64__) || defined(__arm64__)
 
@@ -70,10 +53,9 @@ static bool matchLoop(const Chunk *c, uint32_t at, LoopShape *out) {
 
     q += 4;
     if (p[q] != OP_LOOP) return false;
-    /* 9 + 5 + 3 + 3 + 4 + 3 = 27. The first instruction carries a u8 compare,
-     * a u16 slot, a u24 constant index and an i16 jump, which is eight operand
-     * bytes and not five -- getting that wrong is why this declined silently on
-     * every tick while the loop it was meant to match ran fifty million times. */
+    /* 9 + 5 + 3 + 3 + 4 + 3 = 27, matching the first instruction's real 8
+     * operand bytes (u8 compare, u16 slot, u24 constant, i16 jump); getting
+     * this wrong made it decline silently on every tick of a 50M-iteration run. */
     if (q + 3 != at + 27) return false;
 
     if (kIndex >= (uint32_t)c->constants.count) return false;
@@ -84,18 +66,10 @@ static bool matchLoop(const Chunk *c, uint32_t at, LoopShape *out) {
     return true;
 }
 
-/* The same body behind a `for i in 0..n` head.
- *
- *     OP_FOR_ITER_BIND +jump, slot   5 bytes (i16 jump, u16 slot)
- *     OP_GET_LOCAL2                  5
- *     OP_MOD_INT_CONST               3
- *     OP_ADD_BIND                    3
- *     OP_LOOP                        3      = 19
- *
- * The body is byte-for-byte what the counted head already compiles, so this is
- * a second entry guard rather than a second code generator. What differs is
- * that the limit is a runtime property of the iterator, and that the iterator's
- * position has to be written back. */
+/* The same body behind a `for i in 0..n` head: byte-for-byte what the counted
+ * head already compiles, so this is a second entry guard rather than a second
+ * code generator. What differs: the limit is a runtime property of the
+ * iterator, and the iterator's position has to be written back. */
 static bool matchRangeLoop(const Chunk *c, uint32_t at, LoopShape *out) {
     const uint8_t *p = c->code;
     if (at + 19 > (uint32_t)c->count) return false;
@@ -138,28 +112,20 @@ static int emitConst(uint32_t *w, int n, unsigned reg, uint64_t value) {
     return n;
 }
 
-/* 0 = the loop ran to completion, 1 = it bailed.
- *
- * `limit` is a parameter rather than baked into the code so that one emitted
- * body serves both loop heads: the counted head passes the constant it matched,
- * and the range head will pass the iterator's limit, which is only known at
- * entry. */
+/* 0 = the loop ran to completion, 1 = it bailed. `limit` is a parameter
+ * rather than baked into the code so one emitted body serves both loop heads:
+ * the counted head passes its matched constant, the range head its iterator's
+ * limit, known only at entry. */
 typedef int (*JaiCompiledLoop)(Value *slots, int64_t limit);
 
 /* x1 holds the accumulator and x2 the counter for the whole loop. That
  * residency, not the removal of dispatch, is where the win is. */
 
-/* The multiply-shift reciprocal for a constant divisor (Hacker's Delight 10-4).
- *
- * sdiv is not fully pipelined on this core: its throughput, not its latency,
- * is what puts loop_sum at 4.4 cycles an iteration against C++'s 2.2, and C++
- * gets there with exactly this reciprocal. An earlier attempt at it measured
- * SLOWER and was reverted -- but that was best-of-3 timing, and loop_sum turns
- * out to swing 59-71ms run to run, so the earlier number said nothing.
- *
- * The quotient sequence is verified against exact integer arithmetic over 1380
- * divisor/value pairs including INT64_MIN and INT64_MAX before it was written
- * here, because a reciprocal that is wrong for one input in 2^64 is a bug
+/* The multiply-shift reciprocal for a constant divisor (Hacker's Delight
+ * 10-4): sdiv's throughput (not latency) put loop_sum at 4.4 cycles/iter
+ * against C++'s 2.2, which gets there via this same reciprocal. Verified
+ * against exact arithmetic over 1380 divisor/value pairs (incl. INT64_MIN/MAX)
+ * before use, because a reciprocal wrong for one input in 2^64 is a bug
  * nothing would ever reproduce. */
 static bool magicDivide(int64_t d, int64_t *magic, unsigned *shift) {
     if (d < 2) return false;          /* 0, 1 and negatives keep sdiv */
@@ -189,8 +155,8 @@ static bool magicDivide(int64_t d, int64_t *magic, unsigned *shift) {
 static void *compileLoop(const LoopShape *shape) {
     JaiCodeArena *arena = jaiJitArena();
     /* Unseal rather than decline: the function tier shares this arena and
-     * seals it after each compile, so a program whose first compiled thing is
-     * a function would have had every later loop refused. */
+     * seals it after each compile, so declining would refuse every later loop
+     * once a program's first compiled thing was a function. */
     if (arena == NULL || !jaiCodeArenaUnseal(arena)) return NULL;
 
     unsigned accInt = shape->accSlot * 16 + 8, accTag = shape->accSlot * 16;
@@ -200,10 +166,10 @@ static void *compileLoop(const LoopShape *shape) {
     int n = 0;
 
     /* x1 arrives holding the limit and is about to be reused for the
-     * accumulator, so stash it first. Doing this after the loads produced a
-     * loop that compared the accumulator against itself and answered
-     * 29963580 instead of 149999997 -- wrong, not crashed, which is why the
-     * check is the interpreter's answer and not that it ran. */
+     * accumulator, so stash it first; doing this after the loads instead
+     * produced a loop comparing the accumulator against itself -- a wrong
+     * answer, not a crash, which is why this is checked against the
+     * interpreter's answer rather than just "did it run". */
     w[n++] = jaiA64MovX(3, 1);
 
     /* Both locals must already be ints; the body assumes it throughout. */
@@ -305,10 +271,10 @@ bool jaiJitEnterLoop(ObjClosure *closure, uint32_t targetOffset) {
     unsigned iSlot = 0;
 
     if (fn->jitLoopKind == 1) {
-        /* The iterator is what OP_FOR_ITER_BIND peeks. Everything about it is a
-         * runtime fact, so it is guarded here rather than at compile time: only
-         * a range from zero in unit steps makes the yielded value equal the
-         * index, which is what lets the counted body run unchanged. */
+        /* The iterator is what OP_FOR_ITER_BIND peeks; guarded here rather
+         * than at compile time since it's all a runtime fact. Only a range
+         * from zero in unit steps makes the yielded value equal the index,
+         * which is what lets the counted body run unchanged. */
         Value it = vm.stackTop[-1];
         if (!IS_ITER(it)) return false;
         iter = AS_ITER(it);
@@ -326,17 +292,15 @@ bool jaiJitEnterLoop(ObjClosure *closure, uint32_t targetOffset) {
     int status = ((JaiCompiledLoop)(uintptr_t)fn->jitLoop)(frame->slots, limit);
 
     if (iter != NULL) {
-        /* Ran to completion: the iterator is exhausted, and the slot it leaves
-         * holding `limit` is dead -- the `for` binding is loop-scoped, and a
-         * later loop reusing the slot binds it before reading.
-         * Bailed at i: that iteration never finished, so it must be yielded
-         * again. */
+        /* Completed: the iterator is exhausted and the slot holding `limit`
+         * is dead (the `for` binding is loop-scoped). Bailed: that iteration
+         * never finished, so it must be yielded again. */
         iter->index = (status == 0) ? limit : AS_INT(frame->slots[iSlot]);
     }
 
-    /* Both outcomes hand control back to the interpreter and only `ip` differs:
-     * past the loop when it finished, at the loop's own top when it bailed,
-     * where re-running the iteration is safe. The caller cannot tell which. */
+    /* Both outcomes return to the interpreter with only `ip` differing: past
+     * the loop when finished, at the loop's own top when bailed (safe to
+     * re-run); the caller cannot tell which. */
     frame->ip = fn->chunk.code +
                 (status == 0 ? fn->jitLoopExit : fn->jitLoopTop);
     return true;

@@ -1,22 +1,9 @@
-/* builtins.c — the builtin namespace, the argument helpers, and the method
- * dispatcher for primitive receivers.
- *
- * Two namespaces are built here (spec §9 and Appendix C):
- *
- *   - the *builtins module* (`vm.builtins`), which is the implicit global scope
- *     every module sees: print, len, range, the conversions, and the exception
- *     classes registered by errors.c;
- *   - `__prim__`, a module object living in the builtins, holding the raw C
- *     primitives that `lib/std` wraps. Primitives are registered by passing a
- *     dotted name to jaiDefineNative ("__prim__.add"), which is what keeps them
- *     out of the global namespace.
- *
- * Every name defined here is also registered with the resolver so that the
- * front end binds it at compile time instead of reporting E0200.
- *
- * The natives themselves are next door: builtins_core.c holds the ones a
- * program can name, builtins_prim.c the `__prim__` operators.
- */
+/* builtins.c — the builtin namespace (spec §9 / Appendix C), the argument
+ * helpers, and the method dispatcher for primitive receivers. Builds
+ * `vm.builtins` (the implicit global scope) and `__prim__` (a nested module
+ * holding the raw C primitives lib/std wraps, kept out of the global
+ * namespace via dotted jaiDefineNative names like "__prim__.add"); the
+ * natives themselves live in builtins_core.c and builtins_prim.c. */
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -59,15 +46,14 @@ bool jaiBuiltinIsCallable(Value v) {
 /* Registration                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Resolve the leading dotted components of `name` to a namespace module inside
- * the builtins, creating the modules on the way, and advance `name` past them.
- * "__prim__.f64_sqrt" therefore defines `f64_sqrt` in the `__prim__` module. */
+/* Resolves the leading dotted components of `name` to a namespace module,
+ * creating modules on the way, and advances `name` past them: e.g.
+ * "__prim__.f64_sqrt" defines `f64_sqrt` in the `__prim__` module. */
 static ObjModule *namespaceFor(const char **name);
 
-/* A builtin that *is* a class, a trait or an enum used to be registered with
- * the C resolver, so that `class P: Printable` could name it in a type
- * position. That registry was part of the C checker and went with it; the
- * self-hosted checker learns the same names from the prelude it compiles. */
+/* Builtins that are classes/traits/enums no longer need separate C-resolver
+ * registration: the self-hosted checker learns those names from the prelude
+ * it compiles. */
 
 static ObjModule *makeNamespace(ObjModule *parent, const char *name, size_t len) {
     ObjString *key = jaiStringIntern(name, len);
@@ -145,10 +131,8 @@ void jaiDefineNative(const char *name, JaiNativeFn fn, int minArity, int maxArit
 /* Argument helpers                                                     */
 /* ------------------------------------------------------------------ */
 
-/* One wording for every argument mismatch, so that a native reads as a
- * straight line of guards and every message looks the same:
- *     print() argument 1: expected int, got str
- * `index` is 1-based — it is what the user counted when writing the call. */
+/* One wording for every argument mismatch, e.g. "print() argument 1: expected
+ * int, got str". `index` is 1-based, matching what the user counted. */
 bool jaiBuiltinArgTypeError(int index, const char *fnName, const char *expected,
                          Value got) {
     return jaiThrow(vm.cTypeError, "%s() argument %d: expected %s, got %s",
@@ -214,8 +198,8 @@ bool jaiArgCallable(Value v, int index, const char *fnName) {
 /* ------------------------------------------------------------------ */
 
 void jaiRegisterAllBuiltins(void) {
-    /* Error classes come first: every other native throws through them. The VM
-     * may already have built them during jaiVMInit. */
+    /* Error classes first (jaiVMInit may already have built them): every
+     * other native throws through them. */
     if (vm.cError == NULL) jaiRegisterErrorClasses();
 
     jaiMethodTablesInit();
@@ -242,11 +226,11 @@ void jaiRegisterAllBuiltins(void) {
 /* Bound natives for built-in methods                                   */
 /* ------------------------------------------------------------------ */
 
-/* `xs.push` must not allocate a fresh ObjNative on every lookup, so the natives
- * are memoised per (name, fn) pair. The cache holds raw pointers, so every
- * cached native is also kept in an anchor list stored in the builtins module —
- * that list is what the GC traces. Without a builtins module to anchor to,
- * caching is skipped rather than risking a dangling pointer. */
+/* Natives are memoised per (name, fn) pair so a lookup like `xs.push` doesn't
+ * allocate a fresh ObjNative each time. The cache holds raw pointers, so each
+ * cached native is also kept in an anchor list in the builtins module — that
+ * list is what the GC traces; without a builtins module to anchor to, caching
+ * is skipped rather than risking a dangling pointer. */
 
 typedef struct {
     JaiNativeFn fn;
@@ -263,8 +247,8 @@ static ObjModule        *gNativeAnchorModule;
 static const char kNativeAnchorName[] = "__natives__";
 
 static inline uint64_t hashNativeFn(JaiNativeFn fn) {
-    /* Hash the low representation bytes without a non-portable function-pointer
-     * cast. On normal 32/64-bit ABIs this compiles to a move + jaiHashU64(). */
+    /* Avoids a non-portable function-pointer cast; on normal 32/64-bit ABIs
+     * this compiles to a move + jaiHashU64(). */
     uint64_t bits = 0;
     const size_t n = sizeof fn < sizeof bits ? sizeof fn : sizeof bits;
     memcpy(&bits, &fn, n);
@@ -379,22 +363,12 @@ static Value bindNativeSlow(Value receiver, const char *name, JaiNativeFn fn,
 
     const bool anchored = ensureNativeAnchor();
 
-    /*
-     * Reaching here means either:
-     *
-     *  1. the anchor/cache was already valid and jaiBindNative() proved the
-     *     native was absent, or
-     *  2. ensureNativeAnchor() just created/reset the cache, so it is empty.
-     *
-     * Either way there is no reason to probe it again.
-     */
+    /* The cache was either already checked absent by jaiBindNative(), or was
+     * just created/reset and so is empty either way — no reason to re-probe. */
     ObjNative *native = jaiNativeNew(fn, name, minArity, maxArity, paramNames);
 
-    /*
-     * native is only a raw C pointer at this point. Keep it rooted through
-     * cache insertion and jaiBoundNew(). This is particularly important when
-     * caching is unavailable: jaiBoundNew() itself may allocate/collect.
-     */
+    /* native is only a raw C pointer here; keep it rooted through cache
+     * insertion and jaiBoundNew(), which may itself allocate/collect. */
     jaiGCPushRoot(OBJ_VAL(native));
 
     if (anchored) {
@@ -417,10 +391,8 @@ Value jaiBindNative(Value receiver, const char *name, JaiNativeFn fn,
                     const char *const *paramNames) {
     const uint64_t hash = hashNativeFn(fn);
 
-    /*
-     * Normal case after VM startup: no helper call, no anchor check function,
-     * no GC-root traffic until the allocation itself.
-     */
+    /* Normal case after VM startup: no helper call, no GC-root traffic until
+     * the allocation itself. */
     if (gNativeAnchor != NULL && gNativeAnchorModule == vm.builtins) {
         ObjNative *native = nativeCacheFind(fn, name, hash);
 
@@ -535,9 +507,8 @@ bool jaiBuiltinMethod(Value receiver, ObjString *name, Value *out) {
 /* Introspection                                                        */
 /* ------------------------------------------------------------------ */
 
-/* dir() cannot enumerate a lookup function, so it probes it with the names each
- * type is known to answer to. A name the implementation does not (yet) provide
- * simply does not appear; nothing here is load-bearing for dispatch. */
+/* dir() cannot enumerate a lookup function, so it probes these known-name
+ * lists instead; nothing here is load-bearing for dispatch. */
 
 static const char *const kStrMethodNames[] = {
     "at", "capitalize", "center", "chars", "code_at", "contains", "count",

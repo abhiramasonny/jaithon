@@ -1,12 +1,4 @@
-/* builtins_list.c — the `list` method table and the `__prim__.list_*` surface
- * (spec Appendix C).
- *
- * The largest of the three container files, and the only one that needs a
- * sort, a shuffle and a predicate caller, all of which are here because
- * nothing else in the tree uses them. builtins_seq.h holds what it shares with
- * dict, set, tuple and range, and its file comment states the three rules
- * about re-entrancy and rooting that every method below obeys.
- */
+/* builtins_list.c — the `list` method table and the `__prim__.list_*` surface (spec Appendix C). */
 
 #include "builtins_seq.h"
 #include "methods.h"
@@ -76,8 +68,7 @@ static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
                     jaiTypeNameStatic(a), jaiTypeNameStatic(b));
 }
 
-/* Call a one-argument predicate. There is no truthiness in Jaithon (spec
- * §2.6), so anything but a bool is an error rather than a coercion. */
+/* No truthiness in Jaithon (spec §2.6): a predicate must return bool, not coerce. */
 static bool callPredicate(Value pred, Value item, const char *fnName, bool *out) {
     Value arg = item, verdict;
     if (!jaiCallValue1(pred, arg, &verdict)) return false;
@@ -94,9 +85,8 @@ static bool callPredicate(Value pred, Value item, const char *fnName, bool *out)
 /* Stable sort over an index permutation                                */
 /* ------------------------------------------------------------------ */
 
-/* Values stay inside GC-visible lists throughout; only integer indices live in
- * raw C memory, so a collection triggered by a user key function or a user
- * __lt__ cannot invalidate anything here. */
+/* Values stay in GC-visible lists; only indices are raw C ints, so GC during a
+ * user key/__lt__ call cannot invalidate anything here. */
 static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                              bool reverse, const char *fnName) {
     for (int width = 1; width < n; width *= 2) {
@@ -110,9 +100,8 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                                     fnName, &order))
                     return false;
                 if (reverse) order = -order;
-                /* Take from the right half only when it is strictly smaller:
-                 * that is what makes the sort stable, and it keeps `reverse`
-                 * from reversing the order of equal elements. */
+                /* Take from the right half only when strictly smaller: keeps the
+                 * sort stable and stops `reverse` from reordering equal elements. */
                 scratch[k++] = order < 0 ? idx[b++] : idx[a++];
             }
             while (a < mid) scratch[k++] = idx[a++];
@@ -123,9 +112,8 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
     return true;
 }
 
-/* Take a private copy of `source` and the sort key of every element, calling
- * `keyFn` exactly once per element. On success two temp roots are left on the
- * stack — the items and the keys — which the caller pops together. */
+/* Calls `keyFn` exactly once per element. Leaves two temp roots (items, keys)
+ * on the stack on success, which the caller pops together. */
 static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
                             ObjList **outKeys) {
     ObjList *items = jaiListNew(source->count);
@@ -159,8 +147,8 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
     return true;
 }
 
-/* Order `items` by `keys` into a fresh list. Both must be rooted by the caller
- * and have the same length; `keys` is `items` when there is no key function. */
+/* `items` and `keys` must be rooted by the caller and have the same length;
+ * `keys` is `items` itself when there is no key function. */
 static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
                            const char *fnName) {
     int n = items->count;
@@ -187,7 +175,6 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
     return ok ? result : NULL;
 }
 
-/* The shared body of list.sort and list.sorted: a sorted copy of `source`. */
 static ObjList *sortedList(ObjList *source, Value keyFn, bool reverse,
                            const char *fnName) {
     ObjList *items = NULL, *keys = NULL;
@@ -257,7 +244,7 @@ static uint64_t shuffleBelow(uint64_t bound) {
 /* Text assembly                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Turns a finished buffer into a string, consuming it either way. */
+/* Consumes `buf` either way, even on failure. */
 static bool takeString(JaiBuf *buf, Value *out) {
     size_t length = 0;
     char *chars = jaiBufTakeCString(buf, &length);
@@ -292,7 +279,6 @@ static bool listPush(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* pop() takes the last element, pop(i) the one at `i`. */
 static bool listPop(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.pop", &self)) return false;
@@ -556,11 +542,8 @@ static bool listMap(int argc, Value *args, Value *out) {
             ok = false;
             break;
         }
-        /* The result list was sized to the source up front, so the store is
-         * the whole of the push and nothing between here and it allocates --
-         * which is what the root was for. Three out-of-line calls an element
-         * (push root, push, pop root) were 30% of this loop. The slow arm
-         * still runs whenever the callback grew `self` past that reservation. */
+        /* No root needed: `result` is pre-sized and nothing else here allocates
+         * (rooting per element cost 30% of this loop). Slow path covers callback growth. */
         if (JAI_LIKELY(result->count < result->capacity)) {
             result->items[result->count++] = mapped;
             result->version++;
@@ -611,10 +594,8 @@ static bool listFilter(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* reduce(f) folds from the left starting at the first element; reduce(init, f)
- * starts at `init`, which is also what makes it total over the empty list.
- * The combining function is last in both forms, matching Iterable.fold's
- * (initial, combine) order in std.core. */
+/* reduce(f) folds from the first element; reduce(init, f) starts at `init` and
+ * is total over the empty list. Combine is always last, matching std.core's fold. */
 static bool listReduce(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.reduce", &self)) return false;
@@ -671,8 +652,6 @@ static bool listForEach(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* any()/all() with a predicate test every element through it; without one the
- * elements must already be bools. */
 static bool listQuantify(int argc, Value *args, Value *out, bool wantAny) {
     const char *fnName = wantAny ? "list.any" : "list.all";
     ObjList *self;
@@ -743,8 +722,7 @@ static bool listSum(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* min()/max(), optionally ranking by key(element) rather than the element. The
- * key is computed once per element, as it is for sort. */
+/* Each element's key is computed once, as for sort, not once per comparison. */
 static bool listExtremum(int argc, Value *args, Value *out, bool wantMax) {
     const char *fnName = wantMax ? "list.max" : "list.min";
     ObjList *self;
@@ -788,8 +766,6 @@ static bool listMax(int argc, Value *args, Value *out) {
     return listExtremum(argc, args, out, true);
 }
 
-/* first()/last() raise on an empty list unless a fallback is supplied, which
- * is the difference between "I know it is there" and "give me something". */
 static bool listEnd(int argc, Value *args, Value *out, bool wantLast) {
     const char *fnName = wantLast ? "list.last" : "list.first";
     ObjList *self;
@@ -813,8 +789,7 @@ static bool listLast(int argc, Value *args, Value *out) {
     return listEnd(argc, args, out, true);
 }
 
-/* Elements are rendered with str(), so join is total over any list; the
- * separator defaults to the empty string. */
+/* Elements go through str(), so join is total over any list (never a TypeError). */
 static bool listJoin(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.join", &self)) return false;
@@ -877,7 +852,6 @@ static bool listFlatten(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Pairs, stopping at the shorter of the two sequences. */
 static bool listZip(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -926,8 +900,6 @@ static bool listEnumerate(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Consecutive blocks of `size`; the last one is short when the length is not a
- * multiple of the size. */
 static bool listChunk(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -958,7 +930,6 @@ static bool listChunk(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Overlapping windows of exactly `size`; empty when the list is shorter. */
 static bool listWindow(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -990,8 +961,7 @@ static bool listWindow(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* First occurrences only, in the order they appear. `null` is tracked apart
- * because it cannot be a table key. */
+/* `null` is tracked separately since it cannot be a set/table key. */
 static bool listUnique(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -1056,11 +1026,8 @@ static bool listShuffle(int argc, Value *args, Value *out) {
 /* Method table                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Parameter names for the methods whose trailing arguments are optional, so
- * that `xs.sorted(reverse: true)` binds the argument the caller meant. Index 0
- * is the receiver, which the VM passes as args[0] and a caller can never name.
- * A method with no optional argument has nothing to disambiguate and so
- * declares nothing. */
+/* Names trailing optional params for keyword calls like `xs.sorted(reverse:
+ * true)`; index 0 is the receiver "self", which callers can never name. */
 static const char *const kSelfKey[]        = {"self", "key"};
 static const char *const kSelfKeyReverse[] = {"self", "key", "reverse"};
 static const char *const kSelfPredicate[]  = {"self", "predicate"};
@@ -1120,13 +1087,11 @@ bool jaiListMethod(Value receiver, ObjString *name, Value *out) {
 /* __prim__.list_*                                                      */
 /* ------------------------------------------------------------------ */
 
-/* The primitives are the thin layer std.list and std.dict are written over:
- * one C operation each, no defaulting beyond an omitted slice bound, and the
- * same errors the methods raise. */
+/* Thin layer std.list/std.dict are written over: one C op each, same errors as
+ * the methods, no defaulting beyond an omitted slice bound. */
 
-/* A primitive has no receiver, so args[i] is the argument the user counted as
- * i + 1; the methods above pass the index straight through because their
- * args[0] is the receiver. */
+/* No receiver here, so args[i] is the user's argument i+1; methods above pass
+ * the index straight through since their args[0] is the receiver. */
 static bool optIntPrim(int argc, Value *args, int index, const char *fnName,
                        int64_t fallback, int64_t *out) {
     Value v = jaiSeqOptArg(argc, args, index);

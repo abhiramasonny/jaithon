@@ -1,24 +1,10 @@
 /* builtins_io.c — the half of the primitive surface that talks to the machine:
  * files, the filesystem, the environment, child processes, the collector,
  * reflection, and threads (spec Appendix C).
- *
- * Four rules hold throughout this file.
- *
- *   - Every failing syscall is reported by throwErrno(), so one errno always
- *     produces one exception class (§7.2) and every message names the path.
- *   - A `file` owns its FILE*. The three standard streams are addressed by
- *     descriptor number — 0, 1, 2 — and are never closed here; that is what
- *     lets lib/std/fmt.jai write a carriage return straight to the terminal.
- *   - The reflection primitives all go through jaiCompileSource, so `eval`,
- *     the REPL and lib/jaithon/compile see exactly one front end.
- *   - Nothing here runs Jaithon code anywhere but on the thread that entered
- *     the VM. See the thread section for how that is enforced rather than
- *     merely documented.
  */
 
-/* Feature macros must precede every include: fseeko, setenv, getcwd and
- * fileno are POSIX, not C11, and _DARWIN_C_SOURCE puts back what asking for
- * POSIX takes away on macOS. */
+/* Must precede every include: fseeko/setenv/getcwd/fileno need POSIX, and
+ * _DARWIN_C_SOURCE restores what requesting POSIX removes on macOS. */
 #if !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
@@ -47,9 +33,8 @@ extern char **environ;
 /* errno -> exception                                                   */
 /* ------------------------------------------------------------------ */
 
-/* Spec §7.2 gives IOError exactly two subclasses, and these are the two errno
- * values that mean them. Everything else is an IOError with its own text: an
- * exhaustive errno table would be a list of synonyms for "the call failed". */
+/* Spec §7.2 gives IOError exactly two subclasses; everything else stays a
+ * plain IOError rather than an exhaustive (and synonym-heavy) errno table. */
 static ObjClass *classForErrno(int err) {
     switch (err) {
     case ENOENT: return vm.cFileNotFoundError;
@@ -59,7 +44,6 @@ static ObjClass *classForErrno(int err) {
     }
 }
 
-/* `what` reads as a verb phrase: "cannot open", "cannot read from". */
 static bool throwErrno(int err, const char *what, const char *path) {
     return jaiThrow(classForErrno(err), "%s '%s': %s", what,
                     path != NULL ? path : "?", strerror(err));
@@ -71,16 +55,8 @@ static bool throwErrno2(int err, const char *what, const char *from,
                     strerror(err));
 }
 
-/* A path crossing into libc must be NUL-terminated, so a str holding a NUL is
- * not the path the caller thinks it is. Rejecting it keeps the error message
- * and the syscall talking about the same file. */
-/* A NUL-terminated pointer for a syscall.
- *
- * A string can be a view into a shared append buffer, in which case the byte
- * after it belongs to a later concatenation rather than being a terminator --
- * and `dir + "/" + name` is exactly how paths get built. Costs nothing for an
- * ordinary string; copies only for a view that a later append ran past. Pass
- * the same `tmp` to ioPathDone when the call is finished. */
+/* A str can be a view into a shared append buffer, so the byte past it may
+ * not be a terminator; copy only then. Pass `tmp` to ioPathDone when done. */
 static const char *ioPathCStr(ObjString *path, char **tmp) {
     *tmp = NULL;
     if (!JAI_STR_UNTERMINATED(path)) return path->chars;
@@ -104,9 +80,8 @@ static int mkdirAt(ObjString *path) {
 static bool checkPath(ObjString *path, const char *fnName) {
     if (path->length == 0)
         return jaiThrow(vm.cValueError, "%s(): the path is empty", fnName);
-    /* Bounded by the length rather than by a terminator: a string may be a
-     * view into a shared append buffer, in which case the byte after it
-     * belongs to a later concatenation and strlen would run on past. */
+    /* Bounded by length, not a terminator, since a str may be a view whose
+     * byte past it isn't one. */
     if (memchr(path->chars, '\0', path->length) != NULL)
         return jaiThrow(vm.cValueError, "%s(): the path contains a NUL byte",
                         fnName);
@@ -117,9 +92,8 @@ static bool checkPath(ObjString *path, const char *fnName) {
 /* Streams                                                              */
 /* ------------------------------------------------------------------ */
 
-/* A resolved I/O target: a `file` value, or one of the standard streams named
- * by descriptor number. `file` is NULL for the latter, which is what decides
- * whether a read yields str or bytes and whether closing is even allowed. */
+/* A resolved I/O target: a `file`, or a standard stream by descriptor number.
+ * `file` is NULL for the latter, which gates str-vs-bytes and closability. */
 typedef struct {
     FILE       *handle;
     ObjFile    *file;
@@ -224,8 +198,6 @@ static bool readCountInto(Stream *s, size_t want, JaiBuf *buf, const char *what)
     return !streamError(s, buf, what);
 }
 
-/* A binary file yields bytes and a text file yields str; a standard stream has
- * no mode of its own and is text. */
 static bool isBinary(const Stream *s) {
     return s->file != NULL && s->file->binary;
 }
@@ -315,7 +287,6 @@ static bool nIoRead(int argc, Value *args, Value *out) {
     if (!resolveStream(args[0], 1, "read", &s)) return false;
     if (!requireReadable(&s, "read")) return false;
 
-    /* A negative or absent count means "the rest of the stream". */
     int64_t count = -1;
     if (argc >= 2 && !IS_NULL(args[1]) &&
         !jaiArgInt(args[1], 2, "read", &count))
@@ -328,10 +299,8 @@ static bool nIoRead(int argc, Value *args, Value *out) {
                                         "cannot read from");
     if (!ok) return false;
 
-    /* Always bytes, whatever the mode: `io_read` is the raw primitive and
-     * std.io decodes with `str_decode` (Appendix C). A count is a byte count, so
-     * decoding here could also split a multi-byte sequence — which is exactly
-     * the boundary std.io's readers are written to handle. */
+    /* Always bytes: io_read is the raw primitive (spec Appendix C); decoding
+     * here could split a multi-byte sequence, which std.io's readers handle. */
     ObjBytes *raw = jaiBytesNew(buf.data, buf.count);
     jaiBufFree(&buf);
     if (raw == NULL) return false;
@@ -339,9 +308,8 @@ static bool nIoRead(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Returns null at end of input rather than an empty line, so that a read loop
- * ends on `null` and an empty line stays distinguishable from EOF. The
- * terminator is not part of the line. */
+/* Returns null at EOF rather than an empty line, so a read loop ends on
+ * `null` while an empty line stays distinguishable from it. */
 static bool nIoReadLine(int argc, Value *args, Value *out) {
     (void)argc;
     Stream s;
@@ -368,8 +336,8 @@ static bool nIoReadLine(int argc, Value *args, Value *out) {
     return finishRead(&s, &buf, out);
 }
 
-/* Splits what is left of the stream on '\n'. A final newline terminates the
- * last line rather than starting an empty one. */
+/* A final newline terminates the last line rather than starting an empty
+ * one. */
 static bool readLinesInto(Stream *s, ObjList *lines) {
     JaiBuf buf;
     jaiBufInit(&buf);
@@ -554,9 +522,8 @@ static bool nIoEof(int argc, Value *args, Value *out) {
 /* File methods                                                         */
 /* ------------------------------------------------------------------ */
 
-/* `f.lines()` and `f.iter()` materialise the remaining lines and hand back a
- * list iterator: the iterator protocol has no file kind, and a lazy line
- * iterator would have to keep a raw FILE* alive inside a GC object. */
+/* Materialises remaining lines into a list iterator — there's no file
+ * iterator kind, and a lazy one would need a raw FILE* inside a GC object. */
 static bool nFileLines(int argc, Value *args, Value *out) {
     Value lines;
     if (!nIoReadLines(argc, args, &lines)) return false;
@@ -638,9 +605,8 @@ bool jaiFileMethod(Value receiver, ObjString *name, Value *out) {
     return false;
 }
 
-/* Line reading, `tell` and the end-of-stream flag are methods of the `file`
- * type rather than primitives: each is either derivable from io_read or, in
- * the case of tell, exactly `io_seek(handle, 0, SEEK_CURRENT)`. */
+/* read_line/tell/is_eof are `file` methods, not primitives: each is
+ * derivable from io_read, or for tell, from io_seek(handle, 0, CURRENT). */
 void jaiRegisterIOPrimitives(void) {
     jaiDefineNative("__prim__.io_open",  nIoOpen,  1, 2);
     jaiDefineNative("__prim__.io_read",  nIoRead,  1, 2);
@@ -710,8 +676,6 @@ static bool environSnapshot(Value *out) {
     return true;
 }
 
-/* os_env() is the whole environment, os_env(name) reads one variable, and
- * os_env(name, value) writes it — with a null value removing it. */
 static bool nOsEnv(int argc, Value *args, Value *out) {
     if (argc == 0) return environSnapshot(out);
 
@@ -750,10 +714,8 @@ static bool nOsEnv(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The command line is not something libc hands back portably, so the CLI
- * publishes it as the builtin global `__argv__` — the same list spec §8.4
- * hands to main(). Until it does, the executable path is all there is to
- * report truthfully. */
+/* The CLI publishes the real argv as global `__argv__` (spec §8.4); if that
+ * hasn't run yet, the executable path is all there is to report. */
 static bool nOsArgv(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -787,20 +749,8 @@ static bool nOsArgv(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* __prim__.module_path() -> list[str]
- *
- * The directories an import resolves against, exactly as this binary resolves
- * them: JAITHON_PATH, whatever -I added, and the library directories derived
- * from the executable's own location. `vm.modulePath` already mirrors all of
- * that for reflection (src/runtime/module.c:152).
- *
- * The self-hosted front end needs it to resolve an import the same way the C
- * front end does. Without it, it was reduced to guessing from the importing
- * file's ancestors — which cannot find `lib` from `tests/lang`, and which no
- * heuristic fixes in general, because the answer depends on where the binary
- * was installed rather than on where the source sits. Two front ends that
- * disagree about where a module lives disagree about everything downstream of
- * it. */
+/* The self-hosted front end needs this to resolve imports exactly like the C
+ * front end; guessing from file ancestors couldn't find `lib` from `tests/lang`. */
 static bool nModulePath(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -855,17 +805,15 @@ static bool nOsChdir(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* jaiListDir hands back a jaiRealloc'd array of jaiStrdup'd names, which is
- * the tree-wide convention for an owned string: freeing each with its own
- * length keeps the allocator's accounting exact. */
+/* Freeing each entry with its own length keeps the allocator's accounting
+ * exact, per the tree-wide convention for an owned string. */
 static void freeDirEntries(char **entries, int count) {
     for (int i = 0; i < count; i++) {
         if (entries[i] == NULL) continue;
         JAI_FREE_ARRAY(char, entries[i], strlen(entries[i]) + 1);
     }
-    /* count + 1: jaiListDir shrinks the array to exactly that, the extra slot
-     * holding the NULL terminator. Freeing by `count` under-reports oldSize by
-     * one pointer. */
+    /* +1: jaiListDir's extra slot holds the NULL terminator; freeing by
+     * `count` alone under-reports oldSize by one pointer. */
     JAI_FREE_ARRAY(char *, entries, count + 1);
 }
 
@@ -923,8 +871,6 @@ static bool nIoMkdir(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* remove() unlinks a file and removes an empty directory, which is exactly the
- * pair a caller means by "remove this path". */
 static bool nIoRemove(int argc, Value *args, Value *out) {
     (void)argc;
     ObjString *path;
@@ -963,13 +909,9 @@ static bool nIoRename(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* io_stat answers null for a path that is not there rather than raising:
- * Path.exists() is written over it, and an exception is not an answer to
- * "is anything here". lstat by default, because the spec's four kinds include
- * "link" and a symlink has to be distinguishable from what it points at; the
- * second argument asks for stat instead, which is what "is a directory here"
- * means — `/tmp` is a link to `/private/tmp` on macOS and answering "link" to
- * `Path("/tmp").is_dir()` made every tool that writes under it fail. */
+/* Null for a missing path rather than raising. lstat by default distinguishes
+ * links; `follow`=stat is needed since /tmp->/private/tmp broke is_dir() for
+ * every tool writing under /tmp when it answered "link". */
 static bool nIoStat(int argc, Value *args, Value *out) {
     ObjString *path;
     if (!jaiArgString(args[0], 1, "io_stat", &path)) return false;
@@ -1057,10 +999,8 @@ static bool nCpuCount(int argc, Value *args, Value *out) {
 
 /* --- os_spawn ------------------------------------------------------ */
 
-/* A NUL-terminated argv (or "K=V" environment) built out of Jaithon strings.
- * Each entry points into the ObjString it came from, so the strings must stay
- * rooted for as long as the array is used — they are, being the native's own
- * arguments and the dict reachable from them. */
+/* Each entry points into the ObjString it came from, so those strings must
+ * stay rooted for the array's lifetime — they do, as the native's own args. */
 typedef struct {
     const char **items;
     int          count;      /* entries, not counting the NULL terminator */
@@ -1072,9 +1012,8 @@ static void cstrVecFree(CStrVec *v) {
     v->count = 0;
 }
 
-/* A NUL inside an argument would silently truncate it at the exec boundary,
- * where there is no length to carry, so it is refused here rather than
- * half-honoured. */
+/* A NUL inside an argument would silently truncate it at the exec boundary
+ * (no length to carry there), so it's refused here instead. */
 static bool checkExecText(ObjString *s, const char *what) {
     if (memchr(s->chars, '\0', s->length) != NULL)
         return jaiThrow(vm.cValueError, "os_spawn(): %s contains a NUL byte", what);
@@ -1103,8 +1042,8 @@ static bool argvFromList(ObjList *list, CStrVec *out) {
     return true;
 }
 
-/* The child's environment as "K=V" strings. The joined text is owned by this
- * vector, since neither half exists as one string anywhere else. */
+/* The joined "K=V" text is owned by this vector, since neither half exists
+ * as one string anywhere else. */
 typedef struct {
     CStrVec  vec;
     char   **owned;
@@ -1178,9 +1117,8 @@ static bool spawnOption(ObjDict *options, const char *key, Value *out) {
     return jaiDictGet(options, OBJ_VAL(name), out) && !IS_NULL(*out);
 }
 
-/* The pid of the child a `wait`/`poll`/`signal` callable belongs to travels as
- * the bound receiver, which is why these are ObjBound over an int rather than
- * closures: the VM already passes a bound receiver as args[0]. */
+/* wait/poll/signal are ObjBound over an int pid, not closures, so the pid
+ * travels as the bound receiver the VM already passes as args[0]. */
 static bool nOsWait(int argc, Value *args, Value *out) {
     (void)argc;
     int64_t pid;
@@ -1233,8 +1171,8 @@ static Value boundToPid(int pid, JaiNativeFn fn, const char *name,
     return OBJ_VAL(bound);
 }
 
-/* One end of a child's pipe as a `file`, so std.io.File can adopt it. Closing
- * the File closes the descriptor, which is what the class documents. */
+/* One end of a child's pipe as a `file`, so std.io.File can adopt it; closing
+ * the File closes the descriptor. */
 static ObjFile *fileFromFd(int fd, const char *mode, const char *label) {
     FILE *stream = fdopen(fd, mode);
     if (stream == NULL) { (void)close(fd); return NULL; }
@@ -1246,11 +1184,8 @@ static ObjFile *fileFromFd(int fd, const char *mode, const char *label) {
 }
 
 static bool spawnStreamResult(const JaiSpawnResult *spawned, Value *out) {
-    /* Each wrapper is rooted before the next one allocates, and each is
-     * created only if the one before it succeeded — so `wrapped` is both the
-     * number of roots to pop and the number of descriptors already owned by an
-     * ObjFile, which the collector closes for us. Everything past it is a raw
-     * descriptor nothing owns yet. */
+    /* `wrapped` counts both roots to pop and descriptors already owned by an
+     * ObjFile (which the collector closes); descriptors past it are unowned. */
     const int fd[3] = { spawned->stdinFd, spawned->stdoutFd, spawned->stderrFd };
     static const char *const mode[3] = { "w", "r", "r" };
     static const char *const label[3] = { "<stdin>", "<stdout>", "<stderr>" };
@@ -1355,8 +1290,8 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
     if (hasEnv) envVecFree(&env);
 
     if (status == JAI_SPAWN_EXEC) {
-        /* ENOENT here is "the program is not on PATH", which lib/std/os.jai
-         * documents as FileNotFoundError; anything else is an OSError. */
+        /* ENOENT means "not on PATH", documented as FileNotFoundError by
+         * lib/std/os.jai; anything else is an OSError. */
         if (failure == ENOENT || failure == ENOTDIR)
             return jaiThrow(vm.cFileNotFoundError,
                             "os_spawn(): no such program: %s", programCopy);
@@ -1399,10 +1334,8 @@ void jaiRegisterOSPrimitives(void) {
     jaiDefineNative("__prim__.os_spawn",    nOsSpawn,    2, 2);
     jaiDefineNative("__prim__.os_platform", nOsPlatform, 0, 0);
 
-    /* The filesystem group is `io_*` in Appendix C, not `os_*`: `os_` is env,
-     * argv, exit, cwd, chdir, spawn and the platform name. `exists` and
-     * `is_dir` are not primitives — std.io derives both from io_stat, and it
-     * derives path joining and the temp directory the same way. */
+    /* Filesystem calls are `io_*`, not `os_*`. `exists`/`is_dir` aren't
+     * primitives — std.io derives both from io_stat. */
     jaiDefineNative("__prim__.io_listdir", nIoListdir, 1, 1);
     jaiDefineNative("__prim__.io_mkdir",   nIoMkdir,   1, 2);
     jaiDefineNative("__prim__.io_remove",  nIoRemove,  1, 1);
@@ -1481,9 +1414,8 @@ void jaiRegisterGCPrimitives(void) {
 /* Reflection                                                           */
 /* ------------------------------------------------------------------ */
 
-/* The binding eval() compiles into and then removes. It is not of the form
- * `__x__`, which the parser reserves (§2.1), and it starts with an underscore,
- * which is what stops the checker warning that it is never read. */
+/* Not of the form `__x__` (parser-reserved, §2.1); starts with `_` so the
+ * checker doesn't warn it's unused. */
 static const char kEvalSlot[] = "__jai_eval";
 
 /* A native runs on the caller's frame, so the caller's module is the top one.
@@ -1502,10 +1434,8 @@ static CodegenOptions reflectOptions(void) {
     return opts;
 }
 
-/* A compile error inside a running program cannot be printed — the caller is
- * mid-expression and expects an exception — so the first diagnostic becomes
- * the message and the bag is emptied rather than left to leak into whatever
- * flushes it next. */
+/* A compile error here must become an exception, not a print, so the first
+ * diagnostic becomes the message and the bag is emptied so it can't leak. */
 static bool throwCompileError(const char *fnName) {
     char message[512];
     const JaiDiag *first = NULL;
@@ -1527,8 +1457,7 @@ static bool throwCompileError(const char *fnName) {
     return jaiThrow(vm.cParseError, "%s", message);
 }
 
-/* Compile a fragment as a module body of `module`. Returns NULL with the
- * exception already raised. */
+/* Returns NULL with the exception already raised. */
 static ObjFunction *compileFragment(const char *source, size_t length,
                                     const char *path, ObjModule *module,
                                     const char *fnName) {
@@ -1542,9 +1471,8 @@ static ObjFunction *compileFragment(const char *source, size_t length,
     return fn;
 }
 
-/* Runs a fragment by calling it like any other closure. jaiVMRunModule is not
- * an option here: it resets the value stack, which the native's own caller is
- * still standing on. */
+/* jaiVMRunModule isn't an option here: it resets the value stack, which the
+ * native's own caller is still standing on. */
 static bool runFragment(ObjFunction *fn, Value *out) {
     Value ignored;
     if (out == NULL) out = &ignored;
@@ -1582,10 +1510,8 @@ static bool nReflectCompile(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* An expression is evaluated by binding it to a module-level name and reading
- * that name back: the module body is the only thing the code generator emits,
- * and a body discards the value of an expression statement. The binding is
- * removed afterwards so eval leaves no trace in the module. */
+/* Binds to a module-level name and reads it back, since codegen only emits
+ * module bodies that discard expression values; the binding is removed after. */
 static bool nReflectEval(int argc, Value *args, Value *out) {
     (void)argc;
     ObjString *source;
@@ -1616,21 +1542,17 @@ static bool nReflectEval(int argc, Value *args, Value *out) {
     Value value = NULL_VAL;
     if (module != NULL) {
         (void)jaiModuleGet(module, slot, &value);
-        /* Deleting a name can take a class or a callable away, so compiled
-         * forms have to be retired. The table's own keyVersion covers the
-         * cached slot addresses and OP_FORMAT's negative cache; removeEntry
-         * bumps it, so there is nothing to do for those here. */
+        /* Deleting a name can take a class/callable away; removeEntry already
+         * bumps the table's keyVersion, covering cached slots and OP_FORMAT's
+         * negative cache. */
         if (jaiTableDelete(&module->globals, OBJ_VAL(slot))) module->version++;
     }
     *out = value;
     return true;
 }
 
-/* The namespace a two-argument `exec` runs in: a module of its own, made on
- * first use and kept in vm.modules so that a later call sees what an earlier
- * one bound. jaithon.tool.test needs this — running a test file in the runner's
- * own namespace lets an `import std.str as str` in that file shadow the
- * runner's `str`, and the runner then fails inside its own reporting code. */
+/* Kept in vm.modules so a later exec() call sees earlier bindings —
+ * jaithon.tool.test needs this so a test's own imports can shadow the runner's. */
 static ObjModule *execNamespace(ObjString *name) {
     /* vm.modules is keyed by pointer and `name` is whatever the caller passed. */
     name = jaiStringCanonical(name);
@@ -1699,10 +1621,8 @@ static bool nReflectGlobals(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The §7 `buildId` this binary writes into every .jaic and demands back out of
- * one. It is a hash of the C sources, so the self-hosted front end cannot
- * derive it and has to be told; a `.jaic` it writes without this stamp is
- * rejected by the reader with the header otherwise perfectly well formed. */
+/* The §7 buildId is a hash of the C sources, so the self-hosted front end
+ * can't derive it and must be told — a .jaic without this stamp is rejected. */
 static bool nReflectBuildId(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -1720,24 +1640,10 @@ void jaiRegisterReflectPrimitives(void) {
 
 /* ------------------------------------------------------------------ */
 /* Threads                                                              */
-/*                                                                      */
-/* A spawned thread must not touch VM state. Nothing in the VM is       */
-/* synchronised: the allocator keeps one byte counter, the collector    */
-/* stops the world it can see, the intern table is a plain hash table,  */
-/* and every Value is a pointer into a heap only the collector may      */
-/* move through. A second thread inside any of that is a data race, not */
-/* a slow program.                                                      */
-/*                                                                      */
-/* So this is not a documented rule, it is an enforced one: thread_spawn */
-/* refuses anything but a native primitive, and the worker receives two  */
-/* plain integers — the address and the length of a private copy of the  */
-/* caller's buffer. No Value it is handed refers to the heap, and only   */
-/* an int comes back. A Jaithon closure cannot be passed at all, which   */
-/* is the whole point: there is no way to express the unsafe thing.      */
-/*                                                                      */
-/* The thread, mutex, condition and atomic handles below come from the   */
-/* shared table in handles.c.                                            */
 /* ------------------------------------------------------------------ */
+
+/* VM state is unsynchronised, so a thread must never touch it: thread_spawn
+ * only accepts a native, which gets a private (address, length) buffer copy. */
 
 typedef struct {
     JaiThread       *thread;
@@ -1748,9 +1654,8 @@ typedef struct {
     volatile int64_t finished;     /* the worker's only word of shared state */
 } ThreadTask;
 
-/* Detached tasks nobody will ever join. They are reclaimed the next time a
- * thread primitive runs and finds one whose worker has finished, which bounds
- * the outstanding memory by the number of threads still running. */
+/* Detached tasks are reclaimed lazily on the next thread primitive call,
+ * bounding outstanding memory by the number of threads still running. */
 static ThreadTask **gDetached;
 static int           gDetachedCount;
 static int           gDetachedCapacity;
@@ -1785,9 +1690,8 @@ static void rememberDetached(ThreadTask *task) {
     gDetached[gDetachedCount++] = task;
 }
 
-/* Runs on the worker thread. Everything it touches is either on its own stack
- * or in the private payload; the two Values it builds are integers, so no
- * heap object is read, written or allocated. */
+/* Runs on the worker thread — only its own stack and private payload are
+ * touched; the two Values it builds are plain integers, no heap object. */
 static void *threadEntry(void *arg) {
     ThreadTask *task = (ThreadTask *)arg;
     Value args[2] = {
@@ -1929,9 +1833,8 @@ static bool nMutexUnlock(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Freeing a mutex another thread is waiting on is undefined, so the handle is
- * released first: a later use is then a clean "not a live handle" error rather
- * than a use-after-free. */
+/* Freeing a mutex another thread waits on is undefined, so the handle is
+ * released first — a later use then errors cleanly instead of UAF. */
 static bool nMutexFree(int argc, Value *args, Value *out) {
     (void)argc;
     void *ptr;

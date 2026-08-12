@@ -21,16 +21,10 @@ typedef struct GCState {
     int       tempRootCount;
     int       tempRootCapacity;
 
-    /* Ranges of Values that already live in contiguous memory somewhere the
-     * collector cannot find on its own -- today, the `roots` array inside a
-     * compiled frame's JitCallDesc.
-     *
-     * Copying those into tempRoots one at a time is what a call out of
-     * compiled code used to cost: the copy is O(roots) on both sides of every
-     * call-out, and dict_ops' inner loop makes three call-outs holding three
-     * to five object-shaped values each. Pushing the range instead is one
-     * entry whatever the count. The descriptor outlives the call by
-     * construction -- it is the caller's frame -- so borrowing it is sound. */
+    /* Ranges of Values already in contiguous memory the collector can't find
+     * on its own (a compiled frame's JitCallDesc::roots). Pushing the range is
+     * one entry regardless of count, instead of an O(roots) copy per call-out
+     * into tempRoots; the descriptor outlives the call, so borrowing is sound. */
     JaiGCRootRange *rootRanges;
     int       rootRangeCount;
     int       rootRangeCapacity;
@@ -62,28 +56,23 @@ void jaiGCEnable(bool enabled);
 extern GCState *jaiGCActive;     /* NULL until jaiGCInit */
 extern bool     jaiGCInCollect;  /* a collection must never start another */
 
-/* One word standing in for the four inputs of the test below, recomputed by
- * jaiGCSyncLimit() wherever any of them changes. Inlining the four-input form
- * cost the loop back edge seven dependent loads -- jaiGCActive, ->enabled,
- * jaiGCInCollect, ->stress, ->nextGC and the heap total -- on the hottest path
- * in the interpreter, which the comment there described as "one predictable
- * branch". It was not. */
+/* One word standing in for the four-input test below, recomputed by
+ * jaiGCSyncLimit() wherever an input changes -- inlining the four-input form
+ * cost the interpreter's loop back edge seven dependent loads. */
 extern size_t jaiGCLimit;
 
 /* Conservative "a collection may be due" test, for the interpreter's loop
- * back edge. Answering it through a call cost 5.4% of a benchmark that never
- * collects. False is a proof that jaiGCMaybeCollect would do nothing; true
- * only means the caller must ask it properly. A limit of 0 means "ask
- * properly every time", which is what a disabled, absent or stressed
- * collector needs; it is exact for every heap that holds anything at all. */
+ * back edge (a call here cost 5.4% of a benchmark that never collects).
+ * False proves jaiGCMaybeCollect would do nothing; true means ask it
+ * properly. 0 means "ask every time", for a disabled/absent/stressed
+ * collector. */
 static inline bool jaiGCWanted(void) {
     return jaiHeapBytes > jaiGCLimit;
 }
 
-/* Recompute jaiGCLimit. Called from every place that can change any of its
- * inputs. Forgetting one is benign in one direction only: too high a limit
- * delays a collection, too low a one costs a jaiGCMaybeCollect that decides
- * to do nothing. */
+/* Recompute jaiGCLimit; call from anywhere that can change its inputs.
+ * Forgetting one is benign: too high delays a collection, too low just
+ * costs an extra no-op jaiGCMaybeCollect. */
 void jaiGCSyncLimit(void);
 
 /* Links a freshly built object into the collector's list. Deliberately out of
@@ -94,21 +83,11 @@ void jaiGCMarkValue(Value v);
 void jaiGCMarkObject(Obj *obj);
 void jaiGCMarkArray(const ValueArray *a);
 
-/* The two tests that decide a reference needs nothing done to it, moved to the
- * call site.
- *
- * A tracer touches every reference every reachable object holds, and the great
- * majority of them are already black by the time it gets there: the class each
- * of a million instances names, the name each of its methods names, the node
- * whichever subtree reached it first. jaiGCMarkObject cannot be a leaf -- it
- * grays, and graying can grow the gray stack -- so it sets up a four-register
- * frame before it is in a position to look at the byte that says there is
- * nothing to do. On binary_trees, whose live set is a quarter of a million
- * instances, that frame was most of what marking cost.
- *
- * This is NOT the inlining that gc.h warns about above. jaiGCPushRoot is
- * called from allocation sites, which are hot in every program and everywhere;
- * these are called only from tracers, which run only inside a collection. */
+/* The already-black check moved to the call site: jaiGCMarkObject can't be a
+ * leaf (graying may grow the gray stack), so its frame setup dominated
+ * marking cost when most references are already black. Unlike jaiGCPushRoot
+ * below, these run only from tracers, inside a collection, so inlining here
+ * is cheap. */
 JAI_INLINE void jaiGCMark(Obj *obj) {
     if (obj != NULL && !obj->isMarked) jaiGCMarkObject(obj);
 }
@@ -120,19 +99,10 @@ JAI_INLINE void jaiGCMarkVal(Value v) {
 /* Temporary root protocol for C code:
  *     jaiGCPushRoot(v);  ... allocations ...  jaiGCPopRoot();
  */
-/* These stay OUT OF LINE, and that is a measured decision rather than an
- * oversight. They were moved into this header as `static inline` on the
- * argument that the bodies are a bounds check and a store and that natives run
- * the push/pop pair once per container element. Re-measured against the tree
- * as it now stands -- after the f-string opcode and the bound-method work
- * removed most of the surrounding allocation traffic -- inlining them is a
- * consistent LOSS. Two interleaved A/B sweeps of exactly this change against
- * the inlined build, 25 reps each, put the inlined build at 1.039x dict_ops,
- * 1.023x list_ops, 1.031x string_build and 1.009x overall; two further sweeps
- * using __attribute__((noinline)) rather than this layout agree, and the sign
- * was stable in every replicate. Inlining a bounds check and a store into
- * every allocation site pays for the saved call with I-cache pressure in
- * callers that are themselves hot. Re-measure before inlining them again. */
+/* Kept OUT OF LINE by measurement, not oversight: inlining these (a bounds
+ * check + a store) was tried and was a consistent ~1-4% loss across repeated
+ * A/B benchmark sweeps, from I-cache pressure at hot allocation sites.
+ * Re-measure before inlining again. */
 void jaiGCPushRoot(Value v);
 void jaiGCPopRoots(int n);
 /* Root a Value array in place, without copying it. `values` must stay valid
@@ -141,10 +111,10 @@ void jaiGCPushRootRange(const Value *values, int count);
 void jaiGCPopRootRange(void);
 void jaiGCPopRoot(void);
 
-/* A root that lives as long as the VM does. Native code that parks a Jaithon
- * object in a C global registers it here; the alternative of publishing the
- * object under a name is not a root at all, because a program can then reach
- * the name and drop the reference while the native side still uses it. */
+/* A root that lives as long as the VM does, for native code that parks a
+ * Jaithon object in a C global -- publishing it under a name instead isn't a
+ * root, since a program could drop that reference while native code still
+ * uses it. */
 void jaiGCAddPermanentRoot(Value v);
 
 void jaiGCPrintStats(FILE *out);

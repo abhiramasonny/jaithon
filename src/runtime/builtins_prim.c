@@ -1,14 +1,4 @@
-/* builtins_prim.c — the `__prim__` operator surface (spec Appendix C).
- *
- * These are the raw operations lib/std is written over: arithmetic that
- * raises OverflowError instead of wrapping, the bitwise and comparison
- * operators, and the type, object and exception primitives. None of them is
- * reachable by name from a program — they live in the `__prim__` module,
- * which only the standard library imports.
- *
- * The registration machinery and the jaiArg* helpers are in builtins.c; the
- * named builtins are in builtins_core.c.
- */
+/* builtins_prim.c — the `__prim__` operator surface (spec Appendix C); reachable only through std, never by name from user code. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -18,10 +8,6 @@
 #include "runtime.h"
 
 #include "../vm/gc.h"
-
-/* ------------------------------------------------------------------ */
-/* Integer arithmetic with overflow detection                           */
-/* ------------------------------------------------------------------ */
 
 /* Plain + - * raise OverflowError (spec §2.5); only the explicit wrapping
  * operators wrap, and those never reach these helpers. */
@@ -102,10 +88,6 @@ static bool powI64(int64_t base, int64_t exp, int64_t *out) {
     *out = result;
     return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* __prim__: arithmetic, bitwise, comparison                            */
-/* ------------------------------------------------------------------ */
 
 /* The VM has its own fast paths for these opcodes; the primitives exist so that
  * `lib/std` can reach the same semantics from Jaithon code. Both must agree. */
@@ -345,10 +327,6 @@ static bool nPrimGe(int argc, Value *args, Value *out) {
     return primOrder(args[0], args[1], "ge", 0, 1, out);
 }
 
-/* ------------------------------------------------------------------ */
-/* __prim__: types, objects, exceptions                                 */
-/* ------------------------------------------------------------------ */
-
 static bool nPrimTypeOf(int argc, Value *args, Value *out) {
     (void)argc;
     *out = OBJ_VAL(jaiTypeName(args[0]));
@@ -461,15 +439,7 @@ static bool nPrimTraceback(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* Registration                                                         */
-/* ------------------------------------------------------------------ */
-
 void jaiRegisterOperatorPrimitives(void) {
-    /* __prim__ (Appendix C). Everything here is namespaced rather than global:
-     * user code reaches it only through the std wrappers. */
     jaiDefineNative("__prim__.add",      nPrimAdd,      2, 2);
     jaiDefineNative("__prim__.sub",      nPrimSub,      2, 2);
     jaiDefineNative("__prim__.mul",      nPrimMul,      2, 2);

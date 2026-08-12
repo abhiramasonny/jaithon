@@ -1,12 +1,4 @@
-/* builtins_dict.c — the `dict` and `set` method tables and the
- * `__prim__.dict_*` and `__prim__.set_*` surfaces (spec Appendix C).
- *
- * The two live together because they are one data structure seen twice: a set
- * is a table whose values are ignored, every set operation is written over the
- * same JaiTable walk, and both answer the same question about a key before
- * they touch it — does it hash, and is it non-null. builtins_seq.h holds what
- * they share with list, tuple and range.
- */
+/* builtins_dict.c — the `dict` and `set` method tables and the `__prim__.dict_*`/`__prim__.set_*` surfaces (spec Appendix C). */
 
 #include "builtins_seq.h"
 #include "methods.h"
@@ -50,8 +42,8 @@ static bool missingKeyError(const char *fnName, const char *role, Value key) {
                     text->chars);
 }
 
-/* Every element of a set, in table order. Nothing here allocates after the
- * result is sized, so the walk cannot be disturbed by a collection. */
+/* Nothing here allocates after `out` is sized, so the walk cannot be
+ * disturbed by a collection. */
 static ObjList *setElements(ObjSet *s) {
     jaiGCPushRoot(OBJ_VAL(s));
     ObjList *out = jaiListNew(s->table.count);
@@ -66,9 +58,8 @@ static ObjList *setElements(ObjSet *s) {
     return out;
 }
 
-/* The operand of a set operation: a set is taken as it is, any other iterable
- * is copied into a temporary one. Either way exactly one temp root is pushed,
- * which the caller pops when it is done. */
+/* Either way exactly one temp root is pushed here, which the caller pops
+ * when done. */
 static bool operandSet(Value v, const char *fnName, ObjSet **out) {
     if (IS_SET(v)) {
         jaiGCPushRoot(v);
@@ -116,7 +107,6 @@ static bool dictLen(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* get(k) is null when the key is absent; get(k, d) is `d`. */
 static bool dictGet(int argc, Value *args, Value *out) {
     ObjDict *self;
     if (!selfDict(args, "dict.get", &self)) return false;
@@ -154,7 +144,6 @@ static bool dictHas(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* delete answers whether anything was there; pop insists that there was. */
 static bool dictDelete(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
@@ -253,7 +242,6 @@ static bool dictCopy(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* merge is copy + update: `other` wins on the keys they share. */
 static bool dictMerge(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
@@ -326,7 +314,6 @@ static bool dictMapValues(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* filter's predicate takes the key and the value, in that order. */
 static bool dictFilter(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
@@ -390,7 +377,6 @@ static bool setAdd(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* remove insists the element was there; discard reports whether it was. */
 static bool setRemove(int argc, Value *args, Value *out) {
     (void)argc;
     ObjSet *self;
@@ -567,9 +553,8 @@ static bool setToList(int argc, Value *args, Value *out) {
 
 static const JaiSeqMethod kDictMethods[] = {
     JAI_METHOD("clear",         dictClear,       1, 1),
-    /* `contains` alongside `has`: every other container spells membership that
-     * way (list, str, bytes, tuple, range), and the spec's own §5.5 example
-     * calls it on a set. `has` stays because all of lib/std was written to it. */
+    /* `contains` mirrors every other container (spec §5.5); `has` stays too
+     * since lib/std was written against it. */
     JAI_METHOD("contains",      dictHas,         2, 2),
     JAI_METHOD("copy",          dictCopy,        1, 1),
     JAI_METHOD("filter",        dictFilter,      2, 2),
@@ -629,7 +614,6 @@ static bool primDictNew(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* dict_get(d, k) is null when absent; the third argument replaces that. */
 static bool primDictGet(int argc, Value *args, Value *out) {
     ObjDict *dict;
     if (!jaiArgDict(args[0], 1, "dict_get", &dict)) return false;

@@ -1,60 +1,29 @@
-/* table.c — the one hash table (see table.h) and the string intern table.
- *
- * Open addressing, linear probing, power-of-two capacities, tombstones. The
- * table grows before an insert would push (live + tombstones) past half of
- * capacity. That bound is also what makes every probe loop terminate: at least
- * one never-used slot always remains, so a walk always hits an empty slot.
- *
- * Growth rehashes live entries only, so tombstones are the one kind of garbage
- * that a resize collects for free.
- */
+/* table.c — the one hash table (see table.h) and the string intern table. */
 
 #include "table.h"
 
 #include "gc.h"
 #include "object.h"
 
-/* A tombstone is VAL_OBJ carrying a NULL pointer. No real Value can look like
- * that — OBJ_VAL is only ever built from an allocated Obj — and it is distinct
- * from NULL_VAL, which marks a slot that was never used. The distinction is
- * load-bearing: a probe stops at an empty slot but must walk past a tombstone,
- * or deleting a key would hide every key that collided with it. */
+/* Tombstone = VAL_OBJ{NULL}, distinct from NULL_VAL (never-used slot): a probe
+ * must walk past a tombstone rather than stop, or a delete could hide keys
+ * that collided with it. */
 const Value JAI_TOMBSTONE = {VAL_OBJ, {.obj = NULL}};
 
-/* Max load factor, counting tombstones: a tombstone still costs a probe step.
- *
- * Half, not three quarters, and the difference is much larger than it looks
- * because linear probing degrades on 1/(1-alpha)^2 rather than on alpha. The
- * probe counts are measured, not estimated -- a counter in findExisting,
- * findEntry and jaiInternTableFind over tests/bench/dict_ops, which does 30M
- * lookups against a 10,000-entry dict and a 10,405-entry intern table:
- *
- *              at 3/4 (alpha .61-.64)   at 1/2 (alpha .31-.32)
- *   intern find      2.16 probes             1.27
- *   dict get         2.03                    1.25
- *   dict set         2.03                    1.25
- *
- * Six probe steps per iteration became under four, and each step is a load
- * from a 48-byte entry in an array far too big for L1. dict_ops fell 7.5% for
- * this one line. The cost is the array: peak RSS on that benchmark went from
- * 15.0 MB to 16.9 MB, and no other benchmark in the suite moved at all -- the
- * tables that dominate a real heap (a class's methods, a module's globals) are
- * tens of entries, where a table twice as big is still one page.
- *
- * NUM must stay DEN-1: the threshold is written as `capacity - capacity/DEN`
- * to avoid a divide by NUM on the insert path. 2/3 was measured too, and is
- * 10% worse than 1/2 on dict_ops. */
+/* Max load factor, counting tombstones. Half, not 3/4: measured on dict_ops
+ * (30M lookups), probes drop from ~2.1 to ~1.3 and the benchmark is 7.5%
+ * faster, at the cost of ~13% more peak RSS. NUM must stay DEN-1 so the
+ * threshold `capacity - capacity/DEN` avoids a divide on the insert path. */
 #define TABLE_LOAD_NUM 1
 #define TABLE_LOAD_DEN 2
 
-/* Refuse to build a table so large that the index arithmetic stops being
- * meaningful; jaiRealloc would have run out of memory long before this. */
+/* Beyond this the index arithmetic stops being meaningful; jaiRealloc would
+ * OOM long before this anyway. */
 #define TABLE_MAX_CAPACITY ((int64_t)1 << 30)
 
-/* Probe state piggybacks on JaiEntry.order:
- * -2 = never-used slot, -1 = tombstone, >=0 = live insertion-order index.
- * This keeps the hot probe path on a small integer until a real candidate
- * survives the state/hash tests. */
+/* Probe state piggybacks on JaiEntry.order: -2 = never-used, -1 = tombstone,
+ * >=0 = live insertion-order index. Keeps the hot probe path on a small
+ * integer until a candidate survives the state/hash tests. */
 #define ENTRY_EMPTY_ORDER     (-2)
 #define ENTRY_TOMBSTONE_ORDER (-1)
 
@@ -74,9 +43,8 @@ JAI_INLINE JAI_UNUSED bool entryIsLive(const JaiEntry *e) {
     return e->order >= 0;
 }
 
-/* Neither sentinel may be used as a key: NULL_VAL would read back as an empty
- * slot and a NULL Obj* as a deleted one. `null` is therefore not a usable dict
- * or set key; the caller must reject it before reaching this layer. */
+/* NULL_VAL would read back as empty and a NULL Obj* as deleted, so `null` is
+ * not a usable key; the caller must reject it before this layer. */
 JAI_INLINE JAI_UNUSED bool keyIsUsable(Value key) {
     return !(IS_NULL(key) || (IS_OBJ(key) && AS_OBJ(key) == NULL));
 }
@@ -95,9 +63,8 @@ static void clearEntries(JaiEntry *entries, int capacity) {
     }
 }
 
-/* Squeeze the holes left by deletions out of the order array. Called only when
- * it is full, which needs `capacity` inserts since the last compaction, so the
- * O(capacity) walk is amortised to O(1) per insert. */
+/* Called only when `order` is full, which needs `capacity` inserts since the
+ * last compaction, so the O(capacity) walk amortises to O(1) per insert. */
 static void compactOrder(JaiTable *t) {
     int32_t *const order = t->order;
     JaiEntry *const entries = t->entries;
@@ -138,10 +105,9 @@ static int capacityFor(int64_t liveEntries) {
     return (int)(cap + 1);
 }
 
-/* Destination slot during a rehash. The new array has no tombstones and the
- * keys being moved are already known to be distinct, so the first empty slot is
- * the answer — no key comparison, hence no chance of re-entering user code
- * while the table is half-migrated. */
+/* Destination slot during a rehash: the new array has no tombstones and the
+ * keys are already known distinct, so no key comparison is needed -- hence no
+ * chance of re-entering user code while the table is half-migrated. */
 static inline JaiEntry *findEmptySlot(JaiEntry *entries, int capacity,
                                       uint64_t hash) {
     const uint32_t mask = (uint32_t)capacity - 1;
@@ -189,16 +155,10 @@ static void adjustCapacity(JaiTable *t, int capacity) {
     JAI_FREE_ARRAY(JaiEntry, oldEntries, oldCapacity);
     JAI_FREE_ARRAY(int32_t, oldOrder, oldCapacity);
 }
-/* Rehash if one more entry would exceed the load factor. `key` and `value` are
- * rooted across the resize because the resize allocates, and a caller that has
- * only just built them may have them nowhere else the collector can see.
- *
- * What filled the table may be tombstones rather than live entries — the weak
- * intern table replaces its whole contents on every collection. Doubling then
- * would grow the array without bound while the live count stayed flat, so the
- * capacity only grows when the live entries themselves need the room. Using
- * half the capacity as that trigger leaves at least a quarter of the slots
- * free after a rehash, so the O(capacity) walk is still amortised to O(1). */
+/* Rehash if one more entry would exceed the load factor. `key`/`value` are
+ * GC-rooted since the resize allocates. Growth triggers on live-entry count,
+ * not slot count, so a table full of tombstones (e.g. the intern table after
+ * a GC pass) doesn't grow unbounded while live entries stay flat. */
 static inline void ensureRoom(JaiTable *t, Value key, Value value) {
     const int capacity = t->capacity;
     const int count = t->count;
@@ -219,13 +179,9 @@ static inline void ensureRoom(JaiTable *t, Value key, Value value) {
 /* ------------------------------------------------------------------ */
 /* Probing                                                             */
 /* ------------------------------------------------------------------ */
-/* The rest of keyMatches: the hashes agree and the two keys are not the same
- * object, so the answer needs the five-way type dispatch below.
- *
- * Deliberately out of line. As one function, keyMatches is too big for clang to
- * inline into findExisting/findEntry, so every probe -- including the one that
- * a pointer comparison would have settled -- paid a call. It was 6.6% of
- * dict_ops by sample count, almost all of it the call rather than the work. */
+/* Deliberately kept out of line: merged into keyMatches, it was too big for
+ * clang to inline into findExisting/findEntry, so every probe paid a call --
+ * 6.6% of dict_ops by sample count, almost all of it the call itself. */
 static JAI_NOINLINE bool keyEqualsOther(Value stored, Value key) {
     const ValueType type = jaiValueType(key);
 
@@ -261,12 +217,9 @@ static JAI_NOINLINE bool keyEqualsOther(Value stored, Value key) {
     return jaiValuesEqual(stored, key);
 }
 
-/* Does this live entry hold `key`? The hash is compared first because it is
- * already in a register and rules out almost every wrong slot; then the one
- * case that decides real dictionaries -- both keys are the same heap object,
- * which is what an interned string key always is -- settles inline. Anything
- * else defers to keyEqualsOther, whose `a == b` arm repeats this test
- * harmlessly. */
+/* Hash first (already in a register, rules out most slots), then the common
+ * case -- same heap object, as an interned string key always is -- inline.
+ * Anything else defers to keyEqualsOther. */
 JAI_INLINE bool keyMatches(const JaiEntry *e, Value key, uint64_t hash) {
     if (e->hash != hash) return false;
 
@@ -278,9 +231,8 @@ JAI_INLINE bool keyMatches(const JaiEntry *e, Value key, uint64_t hash) {
     return keyEqualsOther(stored, key);
 }
 
-/* Lookup-only probing. Unlike findEntry this need not remember the first
- * tombstone, removing a dependency and branch from every successful get and
- * from the overwhelmingly common miss that reaches a never-used slot. */
+/* Lookup-only: unlike findEntry this need not remember the first tombstone,
+ * saving a dependency and branch on every get and every miss. */
 static inline JaiEntry *findExisting(JaiEntry *entries, int capacity,
                                      Value key, uint64_t hash) {
     const uint32_t mask = (uint32_t)capacity - 1;
@@ -297,9 +249,8 @@ static inline JaiEntry *findExisting(JaiEntry *entries, int capacity,
     }
 }
 
-/* Returns the entry holding `key`, or the slot it should be inserted into —
- * preferring the first tombstone seen, so deletions do not permanently cost
- * space. Never returns NULL. */
+/* Returns the entry holding `key`, or the slot to insert into (preferring the
+ * first tombstone seen, so deletions don't permanently cost space). */
 static inline JaiEntry *findEntry(JaiEntry *entries, int capacity,
                                   Value key, uint64_t hash) {
     const uint32_t mask = (uint32_t)capacity - 1;
@@ -323,8 +274,7 @@ static inline JaiEntry *findEntry(JaiEntry *entries, int capacity,
 }
 
 /* Same, comparing by pointer. Valid only when every key that could equal `key`
- * is the same interned ObjString, i.e. on tables whose keys all come from the
- * intern table (globals, exports, method tables). */
+ * is the same interned ObjString (globals, exports, method tables). */
 static inline JaiEntry *findEntryInterned(JaiEntry *entries, int capacity,
                                           ObjString *key) {
     const uint32_t mask = (uint32_t)capacity - 1;
@@ -385,9 +335,7 @@ static inline bool insertAt(JaiTable *t, JaiEntry *e, Value key,
         e->hash = hash;
         e->order = orderIndex;
         t->order[orderIndex] = (int32_t)(e - t->entries);
-        /* A new key. Nothing moved unless ensureRoom already rehashed, but the
-         * key SET changed, and OP_FORMAT's negative cache is a fact about the
-         * key set. See the comment on JaiTable::keyVersion. */
+        /* Key set changed; see JaiTable::keyVersion. */
         ++t->keyVersion;
     }
 
@@ -412,9 +360,8 @@ static inline void removeEntry(JaiTable *t, JaiEntry *e) {
     ++t->keyVersion;   /* this address no longer holds this key */
 }
 
-/* Insert with an already-computed hash, comparing keys by value. Used by
- * jaiTableSet and by jaiTableAddAll, which must not re-hash (that could
- * re-enter a user __hash__). */
+/* Insert with an already-computed hash. Used by jaiTableAddAll too, which
+ * must not re-hash (that could re-enter a user __hash__). */
 static bool tableSetHashed(JaiTable *t, Value key, uint64_t hash, Value value) {
     const int capacity = t->capacity;
 
@@ -469,8 +416,8 @@ void jaiTableReserve(JaiTable *t, int minCapacity) {
 
 bool jaiTableGet(JaiTable *t, Value key, Value *out) {
     bool ok = true;
-    /* Hash first: it can raise TypeError for an unhashable key, and it can run
-     * user code that mutates `t`, so nothing may be cached across it. */
+    /* Hash first: it can raise on an unhashable key and can run user code
+     * that mutates `t`, so nothing may be cached across it. */
     uint64_t hash = jaiValueHashFast(key, &ok);
     if (!ok) return false;
     if (t->count == 0) return false;
@@ -551,9 +498,8 @@ bool jaiTableGetInterned(JaiTable *t, ObjString *key, Value *out) {
     return true;
 }
 
-/* insertAt, reporting what the slot held first. `e->order < 0` is exactly the
- * test insertAt uses for "not a live entry", so an empty slot and a tombstone
- * both read back as absent. */
+/* insertAt, reporting what the slot held first (`e->order < 0` reads back
+ * both an empty slot and a tombstone as absent). */
 static inline bool insertAtPrev(JaiTable *t, JaiEntry *e, Value key,
                                 uint64_t hash, Value value, Value *outPrev) {
     if (outPrev != NULL) *outPrev = e->order < 0 ? NULL_VAL : e->value;
@@ -652,9 +598,8 @@ void jaiTableMark(JaiTable *t) {
     }
 }
 
-/* Called between marking and sweeping. An unmarked key is about to be freed,
- * so its entry has to go — this is exactly what makes the intern table a set of
- * weak references instead of a leak that pins every string ever created. */
+/* Called between marking and sweeping: an unmarked key is about to be freed,
+ * so its entry goes too -- this is what makes the intern table weak. */
 void jaiTableRemoveWhite(JaiTable *t) {
     if (t->entries == NULL) return;
 
@@ -678,11 +623,8 @@ void jaiTableRemoveWhite(JaiTable *t) {
 /* String intern table                                                  */
 /* ------------------------------------------------------------------ */
 
-/* A set: keys are ObjString*, values are always NULL_VAL. There is exactly one
- * per process; the GC reaches it through jaiInternTable() and treats it weakly
- * via jaiTableRemoveWhite. Not file-static only so that jaiInternTableCount()
- * can be inlined — string construction consults the population on every short
- * string, and a cross-TU call for it cost dict_ops 6%. */
+/* A set: keys are ObjString*, values are always NULL_VAL. Not file-static so
+ * jaiInternTableCount() can be inlined -- a cross-TU call cost dict_ops 6%. */
 JaiTable jaiInternTableStorage;
 #define internTable jaiInternTableStorage
 
@@ -698,23 +640,10 @@ JaiTable *jaiInternTable(void) {
     return &internTable;
 }
 
-/* A short string's whole identity, packed into the one field an intern entry
- * does not otherwise use.
- *
- * The intern table is a SET: every value is NULL_VAL, sixteen bytes per entry
- * that nothing reads. Storing the length in the top byte and the first seven
- * content bytes below it turns the probe's comparison into one that the entry
- * already in a register can answer. For length <= 7 the fingerprint is the
- * entire string, so two equal fingerprints are two equal strings exactly --
- * not probably, which is why this is not the hash. Longer strings only get it
- * pruned and still take the byte compare.
- *
- * What that buys is not the memcmp. It is the two dependent loads in front of
- * it: `e->key` -> ObjString -> `->length` and `->chars` is a pointer chase
- * into a second cache line on every probe step, hit or miss, and on
- * dict_ops -- which builds `f"k{i % 10000}"` thirty million times and finds
- * all but ten thousand of them already interned -- that chase and the memcmp
- * call after it were 4.2% of the whole benchmark by themselves. */
+/* Packs a short string's identity into the value slot an intern-set entry
+ * otherwise wastes: length in the top byte, first 7 content bytes below. For
+ * length <= 7 this is exact, not a hash, so it settles equality without the
+ * chars pointer-chase, which was 4.2% of dict_ops by itself. */
 static inline uint64_t internFingerprint(const char *chars, size_t length) {
     uint64_t fp = (uint64_t)(length > 255 ? 255 : length) << 56;
     const size_t n = length < 7 ? length : 7;
@@ -725,9 +654,8 @@ static inline uint64_t internFingerprint(const char *chars, size_t length) {
     return fp;
 }
 
-/* Probes by (hash, length, bytes) rather than by Value, because this runs
- * during string creation: the ObjString the caller is looking for may not exist
- * yet, so there is nothing for jaiValueHash to be called on. */
+/* Probes by (hash, length, bytes) rather than by Value: this runs during
+ * string creation, before the ObjString being looked for exists. */
 ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
     JaiTable *const t = &internTable;
     if (t->count == 0) return NULL;

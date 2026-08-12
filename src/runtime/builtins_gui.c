@@ -1,27 +1,4 @@
-/* builtins_gui.c — __prim__.gui_*, the surface std.gui is written over.
- *
- * std.gui owns every pixel of drawing; this file owns exactly four things: the
- * window, the back buffer, the event queue and the frame clock. The split is
- * why `Canvas` can draw to a window, to an offscreen image and to a test buffer
- * with no display attached — none of that code is here.
- *
- * The back buffer is the one interesting decision. `Window.pixels()` hands out
- * a `list[int]` and promises it is live: `Canvas` caches it once at startup and
- * assigns into it for the rest of the program's life, never asking for it
- * again. A Jaithon list is an array of tagged `Value`s and the native buffer is
- * an array of packed `uint32_t`, so the two cannot be the same memory. The list
- * is therefore the buffer of record and `gui_present` packs it down into the
- * ARGB buffer on the way out — one linear pass over the frame, which at
- * 640x480 is far cheaper than the upload that follows it. Handing back an
- * opaque handle plus a put_pixel primitive would be faster still per pixel, but
- * it would put a native call in the innermost loop of every drawing routine,
- * and that is the loop std.gui.canvas exists to keep in Jaithon.
- *
- * That list has to survive collections while only C holds it, and the GC has no
- * permanent-root API — only the temp-root stack, which unwinds. So every live
- * window's buffer is also parked in a list hanging off `__prim__`, which is a
- * module global and therefore a root the collector already traces.
- */
+/* builtins_gui.c — __prim__.gui_*, the surface std.gui is written over: the window, back buffer, event queue and frame clock; drawing itself is not here. */
 
 #include "runtime.h"
 #include "handles.h"
@@ -39,16 +16,15 @@
 
 typedef struct {
     JaiWindow *window;
-    ObjList   *pixels;      /* the live back buffer; see the header comment */
+    ObjList   *pixels;      /* live back buffer (Value list, not uint32_t); gui_present packs it into the native ARGB buffer */
     int        width;
     int        height;
     int        slot;        /* index into gKeepAlive */
 } GuiWindow;
 
-/* Every live window's pixel list, so the collector can see them. It is a
- * permanent GC root rather than a published name: as `__prim__.gui_buffers` it
- * was reachable from ordinary Jaithon, and clearing it there freed buffers the
- * native window still drew into. */
+/* Every live window's pixel list, kept as a permanent GC root rather than a
+ * published name: as `__prim__.gui_buffers` it was reachable from Jaithon, and
+ * clearing it there freed buffers the native window still drew into. */
 static ObjList *gKeepAlive;
 
 static bool requireGui(const char *fnName) {
@@ -66,10 +42,6 @@ static bool requireWindow(Value v, int index, const char *fnName,
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Lifetime                                                            */
-/* ------------------------------------------------------------------ */
-
 static bool nGuiAvailable(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -77,11 +49,8 @@ static bool nGuiAvailable(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_window_open(width, height, title, target_fps = 0)
- *
- * std.gui paces its own frames with time_mono and sleep, so it opens the window
- * uncapped and the native limiter stays out of the way. The parameter is still
- * here because a caller that wants the native pacing can ask for it. */
+/* gui_window_open(width, height, title, target_fps = 0): std.gui paces itself
+ * and opens uncapped; target_fps exists for callers who want native pacing. */
 static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
     if (!requireGui("gui_window_open")) return false;
 
@@ -109,9 +78,8 @@ static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
         return jaiThrow(vm.cRuntimeError,
                         "gui_window_open(): the window could not be created");
 
-    /* Allocating the list can collect, and the window is not yet reachable from
-     * anywhere the collector looks — but it is not a GC object either, so the
-     * only thing at risk is the list itself, which is rooted below. */
+    /* Allocating can collect; the window is not GC-visible and not a GC object
+     * either, so only the list itself is at risk, and it's rooted below. */
     int64_t count = width * height;
     ObjList *pixels = jaiListNew((int)count);
     jaiGCPushRoot(OBJ_VAL(pixels));
@@ -159,10 +127,6 @@ static bool nGuiWindowClose(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Back buffer                                                         */
-/* ------------------------------------------------------------------ */
-
 static bool nGuiPixels(int argc, Value *args, Value *out) {
     (void)argc;
     GuiWindow *w;
@@ -208,10 +172,6 @@ static bool nGuiPresent(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Events                                                              */
-/* ------------------------------------------------------------------ */
-
 static bool nGuiPoll(int argc, Value *args, Value *out) {
     (void)argc;
     GuiWindow *w;
@@ -220,9 +180,8 @@ static bool nGuiPoll(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Append `count` values as one event record. The record is `[tag, ...payload]`,
- * which is what std.gui's `_decode` reads; a tag it does not know is dropped
- * there, so this may grow without breaking an older library. */
+/* Record format is `[tag, ...payload]`, what std.gui's `_decode` reads; an
+ * unknown tag is dropped there, so this may grow without breaking older code. */
 static bool pushRecord(ObjList *into, const Value *values, int count) {
     ObjList *record = jaiListNew(count);
     jaiGCPushRoot(OBJ_VAL(record));
@@ -232,8 +191,7 @@ static bool pushRecord(ObjList *into, const Value *values, int count) {
     return true;
 }
 
-/* Move every queued event of `window` into `events` as one record apiece.
- * `events` must already be rooted: appending to it allocates. */
+/* `events` must already be rooted: appending to it allocates. */
 static void drainEventsInto(JaiWindow *window, ObjList *events) {
     JaiWindowEvent batch[GUI_EVENT_BATCH];
     int taken;
@@ -309,10 +267,6 @@ static bool nGuiDrainEvents(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Frame clock and polled input                                        */
-/* ------------------------------------------------------------------ */
-
 static bool nGuiDeltaTime(int argc, Value *args, Value *out) {
     (void)argc;
     GuiWindow *w;
@@ -362,17 +316,8 @@ static bool nGuiKeyDown(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Key code translation, and the test harness over it                  */
-/* ------------------------------------------------------------------ */
-
-/* gui_key_from_platform(platform_code) -> hid_code
- *
- * The window system's own number for a key — an AppKit virtual keycode on
- * macOS — as the USB HID usage id every event carries, or 0 for a key std.gui
- * does not name. Every event leaving the native layer is already translated,
- * so std.gui itself never calls this; it exists so the table can be checked
- * against `Key.code()` on a machine with no display. */
+/* gui_key_from_platform(platform_code) -> hid_code: USB HID id for a native
+ * keycode (0 if unnamed); exists to check the table against `Key.code()` headless. */
 static bool nGuiKeyFromPlatform(int argc, Value *args, Value *out) {
     (void)argc;
     int64_t code;
@@ -383,17 +328,11 @@ static bool nGuiKeyFromPlatform(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_test_key_event(platform_code, down, repeat = false) -> list[record]
- *
- * Test-only. Feeds one synthetic key transition through the same native path a
- * real key event takes and returns the events it produced, in exactly the
- * records `gui_drain_events` yields. A GUI program cannot be driven headlessly,
- * so this is the only way to prove a platform keycode reaches Jaithon as the
- * right `Key`; see tests/stdlib/test_gui_input.jai.
- *
- * It touches a scratch window private to the native layer, never a window the
- * program opened, and needs no display. On a platform with no window system it
- * injects nothing and returns an empty list. */
+/* gui_test_key_event(platform_code, down, repeat = false) -> list[record]:
+ * test-only, feeds one synthetic key event through the native path and returns
+ * it in `gui_drain_events`'s record format -- the only way to prove a platform
+ * keycode reaches Jaithon as the right `Key` with no real GUI (see
+ * tests/stdlib/test_gui_input.jai). Touches only a native scratch window. */
 static bool nGuiTestKeyEvent(int argc, Value *args, Value *out) {
     int64_t code;
     bool down = false, repeat = false;
@@ -414,12 +353,9 @@ static bool nGuiTestKeyEvent(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_test_key_state() -> list[int]
- *
- * Test-only companion to the above: the HID usage ids the scratch window's
- * polled arrays currently report down, ascending. This is `gui_key_down` read
- * over every code at once, and it is what proves those arrays are indexed by
- * HID id rather than by the platform's own number. */
+/* gui_test_key_state() -> list[int]: test-only; the HID ids the scratch
+ * window's polled arrays currently report down, proving those arrays are
+ * indexed by HID id and not the platform's own number. */
 static bool nGuiTestKeyState(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -463,9 +399,6 @@ void jaiRegisterGuiPrimitives(void) {
     jaiDefineNative("__prim__.gui_key_down",     nGuiKeyDown,     2, 2);
     jaiDefineNative("__prim__.gui_set_title",    nGuiSetTitle,    2, 2);
 
-    /* The translation and its test harness. Documented at each definition
-     * above; `gui_test_*` exists for tests/stdlib/test_gui_input.jai and
-     * reaches nothing but a scratch window inside the native layer. */
     jaiDefineNative("__prim__.gui_key_from_platform", nGuiKeyFromPlatform, 1, 1);
     jaiDefineNative("__prim__.gui_test_key_event",    nGuiTestKeyEvent,    2, 3);
     jaiDefineNative("__prim__.gui_test_key_state",    nGuiTestKeyState,    0, 0);

@@ -1,17 +1,9 @@
 /* value.c — equality, hashing, ordering, and rendering of Values.
  *
- * Three invariants drive most of the code here:
- *
- *   1. int and float are distinct types (spec §2.4) but `==` compares them
- *      numerically, so equality and hashing must agree across the two: a float
- *      with an exact integral value hashes as that int.
- *   2. Every comparison of an int against a float is done exactly, never by
- *      widening the int to double — doubles cannot hold every int64.
- *   3. Rendering may re-enter the VM (__str__/__repr__), so it is written
- *      against a sink abstraction with a cycle/depth guard, and the fast path
- *      used by the disassembler and traceback printer runs it with user
- *      dispatch disabled so it can never recurse into the interpreter.
- */
+ * int/float equality and hashing agree: an exact-integral float hashes as
+ * that int. int-vs-float compares exactly, never widening to double. Rendering
+ * may re-enter the VM, so the disassembler/traceback path disables user
+ * dispatch. */
 #include <math.h>
 #include <stdlib.h>
 
@@ -47,10 +39,8 @@ void jaiValueArrayPush(ValueArray *a, Value v) { JAI_VEC_PUSH(Value, a, v); }
 /* Temporary GC roots                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Root `v` if it is a heap object and the collector is running. Returns whether
- * a matching jaiPopRoot() is owed. Needed because the JaiBuf we render into is
- * plain memory, so an object we hold only in a C local can be collected by an
- * allocation performed while appending to it. */
+/* Needed because the JaiBuf we render into is plain memory: an object held
+ * only in a C local can be collected by an allocation during the append. */
 JAI_INLINE bool tempRoot(Value v) {
     if (!IS_OBJ(v) || vm.gc == NULL) return false;
     jaiPushRoot(v);
@@ -67,9 +57,8 @@ JAI_INLINE void tempUnroot(bool rooted) {
 
 /* True when `d` is finite, integral, and within int64 range. */
 JAI_INLINE bool doubleIsExactInt(double d, int64_t *out) {
-    /* Checking the range before converting makes the cast defined and also
-     * rejects infinities and NaN.  Converting back is cheaper than floor() and
-     * proves integrality without losing the exact-int64 guarantee. */
+    /* Checking the range before casting makes the cast defined and rejects
+     * inf/NaN; casting back is cheaper than floor() and still proves integrality. */
     if (!(d >= JAI_I64_MIN_D && d < JAI_I64_SUP_D)) return false;
     int64_t i = (int64_t)d;
     if ((double)i != d) return false;
@@ -89,8 +78,8 @@ static bool compareIntDouble(int64_t i, double d, int *out) {
     if (d >= JAI_I64_SUP_D) { *out = -1; return true; }   /* covers +inf */
     if (d < JAI_I64_MIN_D)  { *out = 1;  return true; }   /* covers -inf */
 
-    /* Truncation is defined after the bounds checks.  When the integer parts
-     * match, only the sign of the fractional remainder is left to decide. */
+    /* Truncation is well-defined after the bounds checks; when the integer
+     * parts match, only the fractional remainder's sign is left to decide. */
     int64_t di = (int64_t)d;
     if (i < di) { *out = -1; return true; }
     if (i > di) { *out = 1;  return true; }
@@ -161,8 +150,6 @@ ObjString *jaiTypeName(Value v) {
 
 static int eqDepth = 0;
 
-/* The class's cached __eq__, or NULL_VAL when the value is not an instance or
- * its class does not define one. */
 JAI_INLINE bool instanceHasEq(Value v) {
     if (!IS_OBJ(v)) return false;
     Obj *o = AS_OBJ(v);
@@ -171,8 +158,8 @@ JAI_INLINE bool instanceHasEq(Value v) {
     return k != NULL && !IS_NULL(k->dunderEq);
 }
 
-/* Dispatch a.__eq__(b). Returns false with the exception pending on error, or
- * with *missing set when the method vanished from under the cache. */
+/* Returns false with an exception pending on error, or *missing set when
+ * the method vanished from under the cache. */
 static bool dispatchEq(Value a, Value b, bool *result, bool *missing) {
     Value out;
     Value arg = b;
@@ -294,9 +281,8 @@ bool jaiValuesEqual(Value a, Value b) {
         return false;
     }
 
-    /* Scalar equality is overwhelmingly dominant and cannot recurse.  Keep it
-     * out of the global depth counter, whose load/store pair otherwise becomes
-     * part of every integer comparison and every successful table probe. */
+    /* Scalar equality can't recurse and is overwhelmingly common, so it skips
+     * the depth counter -- its load/store would otherwise tax every int compare. */
     ValueType ta = jaiValueType(a);
     ValueType tb = jaiValueType(b);
     if (JAI_LIKELY(ta == VAL_INT && tb == VAL_INT))
@@ -312,7 +298,7 @@ bool jaiValuesEqual(Value a, Value b) {
                 if (ao == bo && ao->type != OBJ_INSTANCE) return true;
                 if (ao->type != bo->type) return false;
 
-                /* These object kinds are leaf comparisons too.  Containers,
+                /* These object kinds are leaf comparisons too; containers,
                  * enum payloads, and instances continue through the guarded
                  * recursive dispatcher below. */
                 switch (ao->type) {
@@ -469,9 +455,8 @@ uint64_t jaiValueHash(Value v, bool *ok) {
         return 0;
     }
 
-    /* As with equality, only tuples, enum payloads, and user __hash__ methods
-     * recurse.  Settling every leaf here removes two global counter writes
-     * from the normal int/float/bytes/range key path. */
+    /* Only tuples, enum payloads, and user __hash__ recurse, as with equality;
+     * settling every leaf here skips the depth counter for int/float/bytes/range. */
     ValueType type = jaiValueType(v);
     if (JAI_LIKELY(type == VAL_INT))
         return jaiHashU64((uint64_t)AS_INT(v));
@@ -544,8 +529,8 @@ JAI_INLINE bool instanceHasLt(Value v) {
     return k != NULL && !IS_NULL(k->dunderLt);
 }
 
-/* Evaluate a.__lt__(b). Returns false with the exception pending on error, or
- * with *missing set when the method could not be invoked. */
+/* Returns false with an exception pending on error, or *missing set when
+ * the method could not be invoked. */
 static bool dispatchLt(Value a, Value b, bool *result, bool *missing) {
     Value out;
     Value arg = b;
@@ -563,8 +548,7 @@ static bool dispatchLt(Value a, Value b, bool *result, bool *missing) {
     return true;
 }
 
-/* Order two values where at least one is an instance with __lt__: a < b decides
- * -1, otherwise b < a decides 1, otherwise they compare equal. */
+/* a<b decides -1, b<a decides 1, otherwise equal (at least one side has __lt__). */
 static bool compareWithLt(Value a, Value b, int *out) {
     bool less = false, missing = false;
     bool aHasLt = instanceHasLt(a);
@@ -638,9 +622,8 @@ bool jaiValueCompare(Value a, Value b, int *out) {
 /* Rendering                                                           */
 /* ------------------------------------------------------------------ */
 
-/* One renderer, two destinations: a growable buffer (str/repr) or a stream
- * (the disassembler and traceback printer, which must not allocate an
- * ObjString just to print one). */
+/* Two destinations: a growable buffer (str/repr) or a stream (the
+ * disassembler/traceback printer, which must not allocate an ObjString). */
 typedef struct {
     JaiBuf *buf;
     FILE   *file;
@@ -668,15 +651,13 @@ JAI_INLINE void sinkReserve(ValSink *s, size_t n) {
         jaiBufReserve(s->buf, n);
 }
 
-/* Decimal digits of an int64 into `out`, which must hold 20 bytes plus a sign.
- * Returns the length; nothing is NUL-terminated because every caller has the
- * length in hand. The negation goes through uint64_t so INT64_MIN, whose
- * absolute value is not representable, still comes out right. */
+/* Output isn't NUL-terminated (callers have the length) and must fit 20
+ * digits plus a sign. Negation goes via uint64_t so INT64_MIN comes out right. */
 #define JAI_INT_DIGITS 24
 #define JAI_FLOAT_CHARS 32
 
-/* Two digits per lookup halves the number of constant divisions in the common
- * multi-digit path.  The compiler turns /100 into a multiply and shift. */
+/* Two digits per lookup halves the divisions in the common multi-digit path;
+ * the compiler turns /100 into a multiply and shift. */
 static const char digitPairs[] =
     "00010203040506070809"
     "10111213141516171819"
@@ -744,20 +725,15 @@ static int writeInt64(char *out, int64_t value) {
     return len;
 }
 
-/* Generic printf formatting drags in locale lookup and varargs machinery just
- * to lay down at most twenty digits. Integers are the single most rendered
- * thing in the language, so they get their own path. */
+/* printf drags in locale lookup and varargs for at most twenty digits;
+ * integers are rendered often enough to earn their own fast path. */
 JAI_INLINE void sinkInt(ValSink *s, int64_t value) {
     char digits[JAI_INT_DIGITS];
     sinkWrite(s, digits, (size_t)writeInt64(digits, value));
 }
 
-/* Shortest decimal form that strtod maps back to the same double, and never
- * one that would read back as an int.
- *
- * The digit count and the choice of notation are decided separately: "%g"
- * would couple them and print 100.0 as "1e+02" once the shortest round-trip
- * turns out to be one significant digit. */
+/* Shortest decimal that round-trips via strtod and never reads back as an
+ * int; digit count and notation decide separately, unlike "%g". */
 static size_t formatDouble(char *out, size_t outSize, double d) {
     if (isnan(d)) {
         memcpy(out, "nan", 4);
@@ -769,8 +745,8 @@ static size_t formatDouble(char *out, size_t outSize, double d) {
         return 3;
     }
 
-    /* Human-written floats are very often small whole numbers.  Their exact
-     * spelling is known without entering printf/strtod at all. */
+    /* Human-written floats are often small whole numbers, whose exact spelling
+     * is known without entering printf/strtod at all. */
     int64_t whole;
     if (d > -10000000000000000.0 && d < 10000000000000000.0 &&
         doubleIsExactInt(d, &whole)) {
@@ -785,9 +761,8 @@ static size_t formatDouble(char *out, size_t outSize, double d) {
 
     char sci[JAI_FLOAT_CHARS];
     int digits = 0, last = 0;
-    /* Preserve the one-to-three-probe path for ordinary short decimals, then
-     * binary-search the remaining range.  Complex doubles fall from as many
-     * as 17 printf/parse pairs to seven without penalising 1.0, 1.5, or 1.25. */
+    /* Linear probe for ordinary short decimals, then binary search the rest:
+     * complex doubles drop from up to 17 printf/parse pairs to seven. */
     for (int p = 1; p <= 3; p++) {
         snprintf(sci, sizeof sci, "%.*e", p - 1, d);
         last = p;
@@ -958,8 +933,8 @@ JAI_INLINE bool renderInProgress(const Obj *o) {
 
 static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser);
 
-/* Enter a container: emits the Python-style elision and returns false when the
- * container is already being rendered or the nesting limit is reached. */
+/* Returns false, having emitted `elision`, when `o` is already being
+ * rendered or the depth limit is hit. */
 JAI_INLINE bool renderEnter(ValSink *s, const Obj *o, const char *elision) {
     if (renderInProgress(o) || renderDepth >= JAI_RENDER_MAX_DEPTH) {
         sinkStr(s, elision);
@@ -1284,9 +1259,8 @@ static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser) {
 }
 
 static ObjString *renderToString(Value v, bool repr) {
-    /* A scalar's rendering is short, bounded, and identical under str and
-     * repr, so it needs neither a growable buffer nor the root dance: going
-     * straight to the string skips a malloc/free pair per f-string hole. */
+    /* A scalar renders short and identically under str/repr, so it skips the
+     * buffer and root dance -- straight to the string, no malloc/free pair. */
     switch (jaiValueType(v)) {
     case VAL_INT: {
         char digits[JAI_INT_DIGITS];
@@ -1325,10 +1299,8 @@ static ObjString *renderToString(Value v, bool repr) {
 
 /* --- f-string assembly ------------------------------------------- */
 
-/* Anything the measure-then-fill path cannot size up front — a list, a dict,
- * an instance with __str__ — goes through the ordinary renderer into a buffer.
- * The parts are rooted by the caller (OP_FORMAT leaves them on the value
- * stack), so a user dunder collecting mid-render is safe. */
+/* Fallback for what measure-then-fill can't size up front (lists, dicts,
+ * __str__ instances); parts are rooted by the caller's value stack (OP_FORMAT). */
 static ObjString *formatViaBuffer(const Value *parts, int count) {
     JaiBuf buf;
     jaiBufInit(&buf);
@@ -1350,10 +1322,8 @@ ObjString *jaiValueFormat(const Value *parts, int count) {
     if (count <= 0) return jaiStringIntern("", 0);
     if (count > JAI_FMT_MAX_PARTS) return formatViaBuffer(parts, count);
 
-    /* Measure first, then fill: every scalar's rendered length is known
-     * without a buffer, so the result is one exactly-sized allocation. The
-     * scalars are rendered once, here, into scratch that the assembly step
-     * reads back. */
+    /* Measure first, then fill: every scalar's length is known without a
+     * buffer, so scalars render once into scratch that assembly reads back. */
     char        scratch[JAI_FMT_MAX_PARTS][JAI_FLOAT_CHARS];
     const char *runs[JAI_FMT_MAX_PARTS];
     uint32_t    lens[JAI_FMT_MAX_PARTS];

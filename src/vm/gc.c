@@ -1,10 +1,5 @@
-/* gc.c — precise mark-sweep collector (spec/BYTECODE.md §10).
- *
- * Tri-colour: white = unmarked, gray = marked and on the gray stack awaiting
- * tracing, black = marked and traced. Marking is precise — every reference is
- * reached through a typed field, never by scanning memory conservatively — so
- * anything the root set and the tracers below miss is a use-after-free.
- */
+/* gc.c — precise mark-sweep collector (spec/BYTECODE.md §10). Tri-colour:
+ * white = unmarked, gray = marked and awaiting tracing, black = traced. */
 #include <stdlib.h>
 
 #include "gc.h"
@@ -17,23 +12,19 @@
 #define JAI_GC_DEFAULT_GROW_FACTOR 2.0
 #define JAI_GC_DEFAULT_MIN_HEAP    ((size_t)1 << 20)
 
-/* Every entry point but jaiGCInit/jaiGCFree is declared without a GCState
- * argument, so the active state is kept here as well as in vm.gc. Init writes
- * both; activeGC() prefers this copy so the collector keeps working even if
- * the VM struct is re-zeroed after installation. */
+/* Kept here as well as in vm.gc since most entry points take no GCState arg;
+ * activeGC() prefers this copy so the collector still works if the VM struct
+ * is re-zeroed after installation. */
 GCState *jaiGCActive;
 
-/* Set while jaiGCCollect runs. A collection must never start another: the
- * heap is inconsistent between mark and sweep, and re-entering would blacken
- * objects a second pass has already begun to free. */
+/* Set while jaiGCCollect runs: re-entering would blacken objects a second
+ * pass has already begun to free. */
 bool jaiGCInCollect;
 
 static GCState *activeGC(void) { return jaiGCActive != NULL ? jaiGCActive : vm.gc; }
 
-/* The back edge's one-word form of jaiGCWanted(). The expression below is the
- * old inline test rearranged, not a new policy: it reads jaiGCActive rather
- * than activeGC() and g->stress rather than gcStressOn(g) for exactly the
- * reason the old one did. */
+/* The back edge's one-word form of jaiGCWanted(); reads jaiGCActive/->stress
+ * directly rather than through activeGC()/gcStressOn(). */
 size_t jaiGCLimit;
 
 void jaiGCSyncLimit(void) {
@@ -48,15 +39,10 @@ void jaiGCSyncLimit(void) {
 static bool gcStressOn(const GCState *g)  { return g->stress  || vm.gcStress; }
 static bool gcVerboseOn(const GCState *g) { return g->verbose || vm.debugGC; }
 
-/* The collector used to keep its own byte total, mirrored from the allocator
- * by a hook fired on every jaiRealloc. Two counters holding the same number,
- * one of them reached through a function pointer, cost 3.5% of dict_ops for
- * nothing: the allocator's counter is the answer, so read it.
- *
- * The marker still never runs from inside jaiRealloc — that would hit
- * arbitrary points in object construction, where a half-built object is
- * reachable from no root yet. Collections happen only at the safepoints that
- * call jaiGCMaybeCollect. */
+/* Reads the allocator's own running total directly; a mirrored counter
+ * updated via a hook on every jaiRealloc cost 3.5% of dict_ops for nothing.
+ * Collection itself never runs from inside jaiRealloc -- only from the
+ * safepoints that call jaiGCMaybeCollect, never mid-construction. */
 static size_t gcLiveBytes(const GCState *g) { (void)g; return jaiHeapBytes; }
 
 static size_t gcNextThreshold(const GCState *g, size_t live) {
@@ -79,10 +65,10 @@ void jaiGCInit(GCState *gc) {
     gc->grayCount = 0;
     gc->grayCapacity = 0;
 
-    /* Whatever the front end allocated before the VM came up already counts
-     * against the heap, so start from the allocator's running total. */
     gc->growFactor = JAI_GC_DEFAULT_GROW_FACTOR;
     gc->minHeap = JAI_GC_DEFAULT_MIN_HEAP;
+    /* Starts from the allocator's running total: whatever the front end
+     * allocated before the VM came up already counts against the heap. */
     gc->nextGC = gcNextThreshold(gc, jaiHeapBytes);
 
     gc->tempRoots = NULL;
@@ -140,7 +126,7 @@ void jaiGCFree(GCState *gc) {
     if (vm.gc == gc) vm.gc = NULL;
     jaiGCSyncLimit();
 
-    /* Raw free: the gray stack never went through jaiRealloc. See below. */
+    /* Raw free: the gray stack never went through jaiRealloc. */
     free(gc->grayStack);
     gc->grayStack = NULL;
     gc->grayCount = 0;
@@ -165,9 +151,8 @@ void jaiGCMarkObject(Obj *obj) {
      * they never enter the gray stack. */
     switch (obj->type) {
     case OBJ_STRING: {
-        /* Leaf, except that a slice keeps its buffer alive. The buffer is
-         * itself a leaf, so marking it here rather than graying this string
-         * costs one call and keeps every string off the gray stack. */
+        /* Leaf, except a slice keeps its buffer alive; marking it here rather
+         * than graying this string keeps every string off the gray stack. */
         ObjString *s = (ObjString *)obj;
         if (s->owner != NULL) jaiGCMarkObject((Obj *)s->owner);
         return;
@@ -186,10 +171,8 @@ void jaiGCMarkObject(Obj *obj) {
     if (g->grayCapacity < g->grayCount + 1) {
         int newCapacity = JAI_GROW_CAP(g->grayCapacity);
         if (newCapacity <= g->grayCapacity) JAI_PANIC("GC gray stack overflow");
-        /* The gray stack is the one permitted exception to the jaiRealloc
-         * rule: it is grown with the raw system allocator so that growing it
-         * in the middle of a collection cannot feed the GC's allocation hook
-         * and recurse back into the collector. */
+        /* Grown with the raw system allocator, not jaiRealloc, so growing it
+         * mid-collection can't recurse back into the collector. */
         Obj **grown = realloc(g->grayStack, sizeof(Obj *) * (size_t)newCapacity);
         if (grown == NULL) JAI_PANIC("out of memory growing the GC gray stack");
         g->grayStack = grown;
@@ -218,15 +201,12 @@ static void markStrings(ObjString *const *names, int count) {
 static void markChunk(Chunk *chunk) {
     jaiGCMarkArray(&chunk->constants);
 
-    /* chunk->constIndex is deliberately not marked: its keys are constant
-     * hashes and its values pool indices, both plain ints, and every constant
-     * it names is already marked above. Marking it would be a no-op that
-     * invites someone to start storing Values in it. */
+    /* chunk->constIndex isn't marked: keys/values are plain ints (hash, pool
+     * index), and every constant it names is already marked above. */
 
-    /* Inline caches hold strong references to what they memoise. Every way is
-     * marked, not just the first `count`: a way written and later abandoned
-     * would otherwise be freed while the slot still points at it, and the
-     * next probe of that way would read a dangling Value. */
+    /* Every way is marked, not just the first `count`: a way written and
+     * later abandoned would otherwise be freed while the slot still points
+     * at it. */
     for (int i = 0; i < chunk->cacheCount; i++) {
         InlineCache *ic = &chunk->caches[i];
         for (int w = 0; w < JAI_IC_WAYS; w++) jaiGCMarkVal(ic->cached[w]);
@@ -577,9 +557,7 @@ void jaiGCTrackObject(Obj *obj) {
     GCState *g = jaiGCActive;
     if (JAI_UNLIKELY(g == NULL)) JAI_PANIC("jaiGCTrackObject before jaiGCInit");
     /* Anything born during a collection is black on arrival: sweep is already
-     * walking this list and would otherwise reclaim it the moment it is linked
-     * in. Nothing in the collector allocates objects, so this is a safety net
-     * rather than a normal path. */
+     * walking this list and would otherwise reclaim it as soon as it's linked in. */
     obj->isMarked = jaiGCInCollect;
     obj->next = g->objects;
     g->objects = obj;

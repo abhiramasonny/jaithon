@@ -1,28 +1,12 @@
-/* builtins_seq.c — the methods of tuple, range and iterator, and the pieces
- * every container method file shares.
+/* builtins_seq.c — tuple, range and iterator methods, plus the pieces shared
+ * with builtins_list.c and builtins_dict.c.
  *
- * list is builtins_list.c and dict and set are builtins_dict.c; the three are
- * split because each is a large table with its own `__prim__` surface, and
- * builtins_seq.h is the short list of things more than one of them needs.
- *
- * A built-in method is reached through an ObjBound, so the receiver arrives in
- * args[0] and argc counts it: args[1] is the first argument the user wrote and
- * its user-visible position is 1, which is what the jaiArg* helpers print.
- *
- * Three rules run through all three files.
- *
- *   - Anything that can re-enter Jaithon — a map callback, a sort key, a user
- *     __eq__ reached from a comparison, a user __hash__ reached from a dict
- *     insert — can allocate and therefore collect. Every partially built
- *     result is held in a GC temp root across such a call, and every loop
- *     bound over a container the caller can still reach is re-read each turn.
- *   - Methods that take a callback over a snapshot (sort, min, max) copy the
- *     receiver first. The callback is user code and may mutate the receiver;
- *     working from a private copy is what keeps the key array and the element
- *     array the same length.
- *   - A mutator with no natural result returns the receiver, so that
- *     `xs.push(1).push(2)` reads the way it looks. Everything else returns the
- *     answer to the question it was asked.
+ * The receiver arrives in args[0] (counted in argc); args[1] is the user's
+ * first argument, reported as position 1. Anything that can re-enter Jaithon
+ * (a callback, a user __eq__ or __hash__) can allocate and collect, so live
+ * results stay GC-rooted and container bounds are re-read afterward.
+ * sort/min/max copy the receiver before running a callback that might mutate
+ * it. A mutator with no natural result returns the receiver so calls chain.
  */
 
 #include "builtins_seq.h"
@@ -42,7 +26,7 @@ Value jaiSeqOptArg(int argc, Value *args, int index) {
 }
 
 /* Reachable only when a bound method outlives the value it was bound to in a
- * way the VM cannot see; cheap enough to check, fatal enough to be worth it. */
+ * way the VM cannot see. */
 bool jaiSeqReceiverError(const char *fnName, const char *expected, Value got) {
     return jaiThrow(vm.cTypeError, "%s() needs a %s receiver, not %s", fnName,
                     expected, jaiTypeNameStatic(got));
@@ -103,8 +87,8 @@ bool jaiSeqEqualsChecked(Value a, Value b, bool *equal) {
     return !vm.hasException;
 }
 
-/* Hashing fails only for the mutable containers and for the composites that
- * may contain one — or for an instance with no (or a raising) __hash__. */
+/* Hashing can fail only for the mutable containers, composites that may
+ * contain one, or an instance with no (or a raising) __hash__. */
 static inline bool hashMayFail(Value v) {
     if (!IS_OBJ(v)) return false;
 
@@ -121,15 +105,11 @@ static inline bool hashMayFail(Value v) {
     }
 }
 
-/* Dict keys and set elements must hash, and must not be `null`: the table
- * layer reserves null to mark an empty slot (table.c), so it has to be
- * rejected here rather than corrupting a probe.
- *
- * The hash check cannot be left to the table either, because the table
- * reports "this does not hash" exactly the way it reports "this key was
- * already present" — a false. Only the keys whose hash can fail at all are
- * probed here, which keeps a user __hash__ from being run twice for the keys
- * that dominate (int, str, bool, float). */
+/* Keys/elements must be non-null (table.c reserves null for an empty slot,
+ * so a null here would corrupt a probe) and must hash. Checked here rather
+ * than left to the table, since the table's "false" means both "already
+ * present" and "does not hash"; only types whose hash can actually fail are
+ * probed, so a user __hash__ isn't run twice for int/str/bool/float. */
 bool jaiSeqHashableKey(Value key, const char *fnName, const char *role) {
     if (IS_NULL(key)) {
         return jaiThrow(vm.cTypeError, "%s(): a %s cannot be null", fnName, role);
@@ -144,8 +124,8 @@ bool jaiSeqHashableKey(Value key, const char *fnName, const char *role) {
                     role, jaiTypeNameStatic(key));
 }
 
-/* Drain any iterable into a fresh list. NULL with the exception pending on
- * failure. The result is unrooted: root it before allocating again. */
+/* NULL means an exception is pending. Result is unrooted — root it before
+ * allocating again. */
 ObjList *jaiSeqCollectIterable(Value v) {
     Value iterVal;
     if (!jaiGetIter(v, &iterVal)) return NULL;
@@ -159,8 +139,8 @@ ObjList *jaiSeqCollectIterable(Value v) {
     jaiGCPushRoot(iterVal);
     ObjIter *const it = AS_ITER(iterVal);
 
-    /* Reserve when the source has a cheap, stable size. This changes only
-     * allocation behavior; iteration still goes through the canonical iterator. */
+    /* Reserving when the source has a cheap, stable size only changes
+     * allocation; iteration still goes through the canonical iterator. */
     int capacity = 0;
     if (IS_TUPLE(v)) {
         const uint32_t n = AS_TUPLE(v)->count;
@@ -351,9 +331,8 @@ static bool tupleToList(int argc, Value *args, Value *out) {
 /* range                                                                */
 /* ------------------------------------------------------------------ */
 
-/* The last value a range yields. Only called when the length is nonzero, and
- * computed in unsigned arithmetic because start + (n-1)*step is exact but its
- * intermediates need not be. */
+/* The last value a range yields (length must be nonzero). Unsigned arithmetic
+ * because start + (n-1)*step is exact but its intermediates need not be. */
 static inline int64_t rangeLast(ObjRange *r, int64_t length) {
     const uint64_t offset =
         (uint64_t)(length - 1) * (uint64_t)r->step;
@@ -468,8 +447,7 @@ static bool rangeStop(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The same values in the other order, still as a range: start at the last
- * element and walk back, inclusively, to the original start. */
+/* Starts at the last element and walks back, inclusively, to the original start. */
 static bool rangeReversed(int argc, Value *args, Value *out) {
     (void)argc;
     ObjRange *self;
@@ -485,9 +463,8 @@ static bool rangeReversed(int argc, Value *args, Value *out) {
         *out = OBJ_VAL(jaiRangeNew(last, last, 1, true));
         return true;
     }
-    /* Every other reversal walks back by -step, which INT64_MIN has no room
-     * for. Nothing else in the language can represent that sequence, so it is
-     * an error rather than a rounded answer. */
+    /* -step of INT64_MIN has no room to exist, and nothing else in the
+     * language can represent that sequence, so this errors instead. */
     if (self->step == INT64_MIN) {
         return jaiThrow(vm.cOverflowError,
                         "range.reversed(): step %lld cannot be negated",

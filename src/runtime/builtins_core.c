@@ -1,12 +1,4 @@
-/* builtins_core.c — the functions a Jaithon program can name without
- * importing anything: print, len, range, the conversions, the sequence
- * utilities and the container constructors (spec §9).
- *
- * Everything here is registered by jaiRegisterCoreBuiltins at the bottom,
- * which is also where the `__prim__` operators of builtins_prim.c join in, so
- * that the builtin namespace still has a single entry point. The registration
- * machinery and the jaiArg* helpers are in builtins.c.
- */
+/* builtins_core.c — the functions a Jaithon program can name without importing anything (spec §9). */
 
 #include <ctype.h>
 #include <math.h>
@@ -20,13 +12,13 @@
 
 // Small shared helpers
 
-// Get the dunder name for a method, caching it on the VM (the REPL creates a VM lazily).
+// Cached on the VM, not a static, since the REPL creates the VM lazily.
 static ObjString *dunderName(ObjString *cached, const char *text) {
     return cached != NULL ? cached : jaiStringInternC(text);
 }
 
-/* Length of any sized value. Returns false with no exception pending when the
- * value simply has no length, and false with one pending when __len__ threw. */
+/* False with no exception pending: `v` has no length. False with one pending:
+ * __len__ threw. */
 static bool valueLength(Value v, int64_t *out) {
     if (!IS_OBJ(v)) return false;
     switch (OBJ_TYPE(v)) {
@@ -60,8 +52,8 @@ static bool valueLength(Value v, int64_t *out) {
     }
 }
 
-/* Collect any iterable into a fresh list. NULL with the exception pending on
- * failure. The result is unrooted: root it before allocating again. */
+/* NULL means the exception is pending. The result is unrooted -- root it
+ * before allocating again. */
 static ObjList *collectIterable(Value v) {
     Value iterVal;
     if (!jaiGetIter(v, &iterVal)) return NULL;
@@ -85,8 +77,7 @@ static ObjList *collectIterable(Value v) {
     return vm.hasException ? NULL : out;
 }
 
-/* Three-way comparison that turns "no order between these two" into a
- * TypeError, which is what every ordering builtin wants. */
+/* Turns "no order between these two" into a TypeError, as every ordering builtin wants. */
 static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
     if (jaiValueCompare(a, b, out)) return true;
     if (vm.hasException) return false;
@@ -209,9 +200,8 @@ static ParseResult parseFloatText(const char *s, size_t len, double *out) {
 
 // Stable sort over an index permutation
 
-/* Values stay inside GC-visible lists throughout; only integer indices live in
- * raw C memory, so a collection triggered by a user key function or __lt__
- * cannot invalidate anything here. */
+/* Values stay in GC-visible lists; only indices are raw C ints, so GC during a
+ * user key/__lt__ call cannot invalidate anything here. */
 static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                              bool reverse, const char *fnName) {
     for (int width = 1; width < n; width *= 2) {
@@ -237,8 +227,8 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
     return true;
 }
 
-/* Sort `items` (rooted by the caller) into a fresh list, ordering by `keys`
- * (which must be `items` itself when there is no key function). */
+/* `items` must be rooted by the caller; `keys` is `items` itself when there is
+ * no key function. */
 static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
                            const char *fnName) {
     int n = items->count;
@@ -539,7 +529,6 @@ static bool nAbs(int argc, Value *args, Value *out) {
     return jaiBuiltinArgTypeError(1, "abs", "int or float", v);
 }
 
-/* min() and max() take either several values or one iterable of them. */
 static bool extremum(int argc, Value *args, Value *out, bool wantMax) {
     const char *fnName = wantMax ? "max" : "min";
 
@@ -688,8 +677,8 @@ static bool nEnumerate(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Collect every argument in [from, argc) into a list of lists, so that zip()
- * and map() can walk them in lockstep with everything reachable for the GC. */
+/* Held in a list of lists (not raw arrays) so zip()/map() stay GC-reachable
+ * while walking them in lockstep. */
 static ObjList *collectAll(int argc, Value *args, int from, int *outShortest) {
     ObjList *holder = jaiListNew(argc - from);
     jaiGCPushRoot(OBJ_VAL(holder));
@@ -868,9 +857,8 @@ static bool nOrd(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Does `v` match the type token `t`? The builtin type names are the native
- * conversion functions (`int`, `list`, ...), so a native whose name is a type
- * name matches by name; classes, traits and enums match structurally. */
+/* Type tokens are classes/traits/enums (structural match) or native/str type
+ * names like `int`/`list` (match by name). */
 bool jaiBuiltinMatchesType(Value v, Value t, bool *matched) {
     if (IS_CLASS(t)) {
         *matched = IS_INSTANCE(v) && jaiClassIsSubclassOf(AS_INSTANCE(v)->klass, AS_CLASS(t));
@@ -930,7 +918,6 @@ static void collectTableKeys(const JaiTable *table, ObjList *into) {
     }
 }
 
-/* Names of everything reachable through `.` on this value. */
 static ObjList *memberNames(Value v) {
     if (IS_MODULE(v)) {
         ObjList *names = jaiListNew(0);
@@ -1021,9 +1008,8 @@ static bool nAssertEq(int argc, Value *args, Value *out) {
         return true;
     }
 
-    /* Both renderings stay rooted until the throw is done with them: building
-     * the exception allocates, and a collection there must not free the text
-     * the message is still being formatted from. */
+    /* Both renderings stay rooted until the throw: building the exception
+     * allocates, and a collection must not free text still being formatted. */
     ObjString *actual = jaiValueToRepr(args[0]);
     if (actual == NULL) return false;
     jaiGCPushRoot(OBJ_VAL(actual));
@@ -1115,7 +1101,6 @@ static bool nSetConv(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* dict() accepts another dict or a sequence of (key, value) pairs. */
 static bool dictFromPairs(ObjDict *dict, ObjList *pairs) {
     for (int i = 0; i < pairs->count; i++) {
         Value entry = pairs->items[i];
@@ -1269,8 +1254,7 @@ void jaiRegisterCoreBuiltins(void) {
     jaiDefineNative("tuple", nTupleConv, 0, 1);
     jaiDefineNative("bytes", nBytesConv, 0, 1);
 
-    /* The operators of Appendix C are registered from here rather than from
-     * their own entry point, so that runtime.h still declares one registrar
-     * for the whole builtin namespace. */
+    /* Appendix C operators register from here too, so runtime.h keeps a single
+     * registrar for the whole builtin namespace. */
     jaiRegisterOperatorPrimitives();
 }

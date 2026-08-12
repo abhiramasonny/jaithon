@@ -1,15 +1,7 @@
 /* builtins_str.c — the `str` method table and the `__prim__.str_*` surface.
  *
- * Every operation here counts Unicode scalar values, never bytes: an index, a
- * length, a width, a slice bound and a padding count all mean the same thing
- * to a program whatever the encoding of the text underneath. Byte offsets
- * exist only inside this file and its two siblings, derived from scalar
- * indices on demand, with an identity fast path for the ASCII strings that
- * dominate real programs.
- *
- * The format engine that `str.format` and every f-string hole run through is
- * builtins_format.c; `bytes`, which shares the argument plumbing and none of
- * the Unicode, is builtins_bytes.c. builtins_str.h is what the three agree on.
+ * Every operation here counts Unicode scalar values, never bytes; byte
+ * offsets are derived from scalar indices on demand, with an ASCII fast path.
  */
 
 #include "builtins_str.h"
@@ -26,12 +18,8 @@
 /* Unicode: simple case mapping and classification                      */
 /* ------------------------------------------------------------------ */
 
-/* The case tables below cover the scripts whose casing is algorithmic —
- * Latin, Greek, Cyrillic, Armenian, the fullwidth forms and Deseret — which is
- * every simple (1:1) case pair reachable without shipping UnicodeData.txt into
- * the core. Anything else maps to itself. Multi-scalar mappings (ß -> SS, the
- * Turkish dotted i) are deliberately absent: they are locale-dependent, and
- * std.str layers them on top where a locale is available. */
+/* Covers algorithmic 1:1 case pairs only (no UnicodeData.txt); multi-scalar
+ * mappings like ß->SS are locale-dependent and layered on top by std.str. */
 
 typedef struct { int32_t lo, hi; } CpRange;
 
@@ -68,25 +56,25 @@ static int32_t caseMap(int32_t c, bool up) {
         if (up) return (c >= 'a' && c <= 'z') ? c - 32 : c;
         return (c >= 'A' && c <= 'Z') ? c + 32 : c;
     }
-    if (c < 0x100) {                                  /* Latin-1 supplement */
-        if (c == 0xB5) return up ? 0x39C : c;         /* micro sign -> capital mu */
+    if (c < 0x100) {
+        if (c == 0xB5) return up ? 0x39C : c;
         if (c == 0xFF) return up ? 0x178 : c;
-        if (c == 0xDF) return c;                      /* ß: no 1:1 capital */
+        if (c == 0xDF) return c;
         if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return up ? c : c + 32;
         if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return up ? c - 32 : c;
         return c;
     }
-    if (c <= 0x17F) {                                 /* Latin Extended-A */
-        if (c == 0x131) return up ? 'I' : c;          /* dotless i */
-        if (c == 0x138 || c == 0x149) return c;       /* ĸ, ŉ: uncased or 1:2 */
-        if (c == 0x17F) return up ? 'S' : c;          /* long s */
+    if (c <= 0x17F) {
+        if (c == 0x131) return up ? 'I' : c;
+        if (c == 0x138 || c == 0x149) return c;
+        if (c == 0x17F) return up ? 'S' : c;
         if (c == 0x178) return up ? c : 0xFF;
         if (c <= 0x137 || (c >= 0x14A && c <= 0x177)) return evenPair(c, up);
-        return oddPair(c, up);                        /* 0x139-0x148, 0x179-0x17E */
+        return oddPair(c, up);
     }
-    if (c <= 0x24F) {                                 /* Latin Extended-B */
-        /* Only the regular pair blocks; the Africanist and IPA additions in
-         * between are individually irregular and stay uncased here. */
+    if (c <= 0x24F) {
+        /* Only regular pair blocks; irregular Africanist/IPA codepoints stay
+         * uncased. */
         if (c >= 0x1CD && c <= 0x1DC) return oddPair(c, up);
         if (c >= 0x1DE && c <= 0x1EF) return evenPair(c, up);
         if (c >= 0x1F8 && c <= 0x21F) return evenPair(c, up);
@@ -95,7 +83,7 @@ static int32_t caseMap(int32_t c, bool up) {
         return c;
     }
 
-    if (c >= 0x386 && c <= 0x3CE) {                   /* Greek */
+    if (c >= 0x386 && c <= 0x3CE) {
         if (c == 0x386) return up ? c : 0x3AC;
         if (c >= 0x388 && c <= 0x38A) return up ? c : c + 0x25;
         if (c == 0x38C) return up ? c : 0x3CC;
@@ -103,13 +91,13 @@ static int32_t caseMap(int32_t c, bool up) {
         if (c >= 0x391 && c <= 0x3AB && c != 0x3A2) return up ? c : c + 0x20;
         if (c == 0x3AC) return up ? 0x386 : c;
         if (c >= 0x3AD && c <= 0x3AF) return up ? c - 0x25 : c;
-        if (c == 0x3C2) return up ? 0x3A3 : c;        /* final sigma */
+        if (c == 0x3C2) return up ? 0x3A3 : c;
         if (c >= 0x3B1 && c <= 0x3CB) return up ? c - 0x20 : c;
         if (c == 0x3CC) return up ? 0x38C : c;
         if (c == 0x3CD || c == 0x3CE) return up ? c - 0x3F : c;
         return c;
     }
-    if (c >= 0x400 && c <= 0x52F) {                   /* Cyrillic */
+    if (c >= 0x400 && c <= 0x52F) {
         if (c <= 0x40F) return up ? c : c + 0x50;
         if (c <= 0x42F) return up ? c : c + 0x20;
         if (c <= 0x44F) return up ? c - 0x20 : c;
@@ -120,11 +108,11 @@ static int32_t caseMap(int32_t c, bool up) {
         if (c >= 0x4D0) return evenPair(c, up);
         return c;
     }
-    if (c >= 0x531 && c <= 0x556) return up ? c : c + 0x30;   /* Armenian */
+    if (c >= 0x531 && c <= 0x556) return up ? c : c + 0x30;
     if (c >= 0x561 && c <= 0x586) return up ? c - 0x30 : c;
-    if (c >= 0xFF21 && c <= 0xFF3A) return up ? c : c + 0x20;  /* fullwidth */
+    if (c >= 0xFF21 && c <= 0xFF3A) return up ? c : c + 0x20;
     if (c >= 0xFF41 && c <= 0xFF5A) return up ? c - 0x20 : c;
-    if (c >= 0x10400 && c <= 0x10427) return up ? c : c + 0x28; /* Deseret */
+    if (c >= 0x10400 && c <= 0x10427) return up ? c : c + 0x28;
     if (c >= 0x10428 && c <= 0x1044F) return up ? c - 0x28 : c;
     return c;
 }
@@ -136,7 +124,6 @@ static inline int32_t lowerCp(int32_t c) {
     return caseMap(c, false);
 }
 
-/* A scalar is cased when either mapping moves it. */
 static inline bool isCasedCp(int32_t c) {
     return upperCp(c) != c || lowerCp(c) != c;
 }
@@ -156,8 +143,8 @@ static const CpRange kDigitRanges[] = {
     {0x1D7CE, 0x1D7FF},
 };
 
-/* Letters that no case mapping reaches: uncased scripts and the modifier
- * letters. Cased scalars are recognised by isCasedCp and are not repeated. */
+/* Uncased letters no case mapping reaches; cased scalars are covered by
+ * isCasedCp and not repeated here. */
 static const CpRange kLetterRanges[] = {
     {0x00AA, 0x00AA}, {0x00BA, 0x00BA}, {0x01BB, 0x01BB}, {0x01C0, 0x01C3},
     {0x0294, 0x0294}, {0x02B0, 0x02C1}, {0x0370, 0x0374}, {0x037A, 0x037A},
@@ -213,7 +200,7 @@ static inline bool isAscii(ObjString *s) {
     return (size_t)jaiStringScalarCount(s) == (size_t)s->length;
 }
 
-/* Byte offset of scalar `index`; clamped to the byte length when past the end. */
+/* Clamped to the byte length when past the end. */
 size_t jaiStrByteOffsetOf(ObjString *s, size_t index) {
     const size_t length = (size_t)s->length;
 
@@ -262,8 +249,8 @@ static inline void resolveWindow(ObjString *s, int64_t start, int64_t end,
     *outEnd = jaiUtf8Offset(s->chars, byteLength, (size_t)end);
 }
 
-/* First occurrence of `needle` in `hay`, or NULL. memchr narrows the scan to
- * the candidate starts, which is what makes the naive loop acceptable. */
+/* memchr narrows scans to candidate starts, keeping this loop fast despite
+ * its naive appearance. */
 const char *jaiStrFindBytes(const char *hay, size_t hayLen,
                             const char *needle, size_t needleLen) {
     if (needleLen == 0) return hay;
@@ -397,15 +384,14 @@ bool jaiStrWantInt(Value v, const char *method, const char *what,
                     what, jaiTypeNameStatic(v));
 }
 
-/* An absent or null argument falls back; anything else must be an int. */
 bool jaiStrOptInt(int argc, Value *args, int slot, const char *method,
                    const char *what, int64_t fallback, int64_t *out) {
     if (argc <= slot || IS_NULL(args[slot])) { *out = fallback; return true; }
     return jaiStrWantInt(args[slot], method, what, out);
 }
 
-/* An absent or null argument yields NULL, which every caller reads as "use the
- * default character set". */
+/* Absent or null yields NULL, which every caller reads as "the default
+ * character set". */
 static inline bool optStr(int argc, Value *args, int slot,
                           const char *method, const char *what,
                           ObjString **out) {
@@ -428,12 +414,9 @@ static bool strLen(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Shared body for upper/lower: `up` selects the mapping direction. */
 static bool mapCase(ObjString *s, bool up, Value *out) {
     const size_t length = (size_t)s->length;
 
-    /* Pure ASCII is overwhelmingly common and case mapping cannot change its
-     * byte length, so write the result exactly once. */
     bool ascii = true;
     for (size_t i = 0; i < length; ++i) {
         if ((unsigned char)s->chars[i] & 0x80u) {
@@ -511,8 +494,6 @@ static bool strLower(int argc, Value *args, Value *out) {
     return mapCase(s, false, out);
 }
 
-/* Word-initial scalars go up, the rest go down. A word starts wherever the
- * previous scalar is neither a letter nor a digit. */
 static bool strTitle(int argc, Value *args, Value *out) {
     ObjString *s;
     if (!strReceiver(argc, args, "title", &s)) return false;
@@ -672,7 +653,6 @@ static bool strCapitalize(int argc, Value *args, Value *out) {
     return jaiStrTakeBuf(&buf, out);
 }
 
-/* Shared body for strip/lstrip/rstrip. A NULL set means "whitespace". */
 static bool stripSides(ObjString *s, ObjString *set, bool left, bool right,
                        Value *out) {
     const char *begin = s->chars;
@@ -775,7 +755,6 @@ static bool pushSlice(ObjList *list, const char *chars, size_t length) {
     return true;
 }
 
-/* split()/rsplit() with no separator: fields are the runs of non-whitespace. */
 static bool splitWhitespace(ObjString *s, int64_t maxsplit, bool fromRight,
                             Value *out) {
     ObjList *list = jaiListNew(0);
@@ -981,8 +960,8 @@ static bool strRsplit(int argc, Value *args, Value *out) {
     return splitCommon(argc, args, out, "rsplit", true);
 }
 
-/* Byte length of the line terminator starting at `p`, or 0. Recognises the
- * whole Unicode set so that text from any platform round-trips. */
+/* Recognises the full Unicode set of line terminators so text from any
+ * platform round-trips. */
 static inline size_t lineBreakAt(const char *p, const char *end) {
     const unsigned char c = (unsigned char)*p;
 
@@ -1053,9 +1032,8 @@ static inline bool joinItem(JaiBuf *buf, Value item, int index) {
     return true;
 }
 
-/* A list or tuple can be measured before it is copied, so the result is one
- * exactly-sized allocation written once. Everything else has to go through a
- * growable buffer, because an iterator's length is not known until it ends. */
+/* A list/tuple can be sized before copying (one exact allocation); anything
+ * else needs a growable buffer since an iterator's length is unknown. */
 static bool joinSized(ObjString *sep, const Value *items, int count,
                       Value *out) {
     const size_t sepLength = (size_t)sep->length;
@@ -1205,7 +1183,6 @@ static bool strReplace(int argc, Value *args, Value *out) {
     return jaiStrTakeBuf(&buf, out);
 }
 
-/* Shared body for find/rfind/index: returns the scalar index or -1. */
 static bool searchIn(int argc, Value *args, const char *method, bool fromRight,
                      int64_t *outIndex) {
     ObjString *s, *sub;
@@ -1317,8 +1294,6 @@ static bool strContains(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Shared body for the is_* predicates. `kind` selects the test; every one of
- * them is false for the empty string, since no scalar satisfies it. */
 typedef enum { CLASS_DIGIT, CLASS_ALPHA, CLASS_ALNUM, CLASS_SPACE,
                CLASS_UPPER, CLASS_LOWER } CharClass;
 
@@ -1470,7 +1445,6 @@ static bool strIsLower(int argc, Value *args, Value *out) {
     return classifyAll(s, CLASS_LOWER, out);
 }
 
-/* The fill argument of pad_left/pad_right/center: exactly one scalar. */
 static bool fillScalar(int argc, Value *args, int slot, const char *method,
                        const char **outBytes, int *outLen) {
     *outBytes = " ";
@@ -1521,7 +1495,7 @@ static void appendFill(JaiBuf *buf, const char *fill, int fillLen, int64_t n) {
         jaiBufAppend(buf, fill, (size_t)fillLen);
 }
 
-/* Shared body for pad_left/pad_right/center. `side` is -1, 1 or 0. */
+/* `side` is -1, 1 or 0. */
 static bool padCommon(int argc, Value *args, const char *method, int side,
                       Value *out) {
     ObjString *s;
@@ -1671,8 +1645,8 @@ static bool strCodePoints(int argc, Value *args, Value *out) {
         } else {
             cp = jaiUtf8Decode(p, end, &len);
         }
-        /* An invalid byte reports as its negated value so that the list stays
-         * the same length as chars() and the damage stays locatable. */
+        /* An invalid byte reports as its negated value, so the list stays the
+         * same length as chars() and the damage stays locatable. */
         jaiListPush(list, INT_VAL(cp));
         p += len;
     }
@@ -1796,8 +1770,6 @@ static ParseStatus parseIntText(const char *s, size_t len, int base,
     return PARSE_OK;
 }
 
-/* strtod over a copy with the underscores removed; the copy also guarantees
- * the NUL that strtod needs. */
 static ParseStatus parseFloatText(const char *s, size_t len, double *out) {
     size_t i = 0, end = len;
 
@@ -2275,10 +2247,8 @@ static ObjModule *primNamespace(void) {
     return m;
 }
 
-/* Registers one primitive under both spellings the rest of the tree might use:
- * a member of the `__prim__` module, which is how `__prim__.str_cmp(a, b)` in
- * lib/std resolves, and a builtins global with the dotted name, for a front end
- * that folds the whole path into one identifier. */
+/* Registers both a `__prim__` module member (what lib/std resolves against)
+ * and a dotted builtins global (for a front end using one identifier). */
 void jaiStrDefinePrim(ObjModule *ns, const char *name, JaiNativeFn fn,
                        int minArity, int maxArity) {
     if (ns != NULL) {
@@ -2310,8 +2280,7 @@ void jaiRegisterStringPrimitives(void) {
     jaiStrDefinePrim(ns, "str_encode",         primStrEncode,         1, 1);
     jaiStrDefinePrim(ns, "str_decode",         primStrDecode,         1, 1);
 
-    /* The bytes primitives are registered from here rather than from their own
-     * entry point: Appendix C lists them beside the str ones and runtime.h
-     * declares one registrar for the pair. */
+    /* Registered here, not their own entry point: Appendix C lists them beside
+     * the str ones and runtime.h declares one registrar for the pair. */
     jaiBytesRegisterPrimitives(ns);
 }

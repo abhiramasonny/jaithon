@@ -40,9 +40,8 @@ bool jaiFrontEndCall0(Value v, const char *name, Value *out) {
 
 bool jaiFrontEndInvoke(const char *module, const char *name, int argc,
                        Value *args, Value *out) {
-    /* Through the front-end door, not the ordinary one: this module is part of
-     * the compiler, so the seed may serve it. Only the import needs the
-     * window; the call below is ordinary Jaithon code. */
+    /* This module is part of the compiler, so the seed may serve the import;
+     * the call below is ordinary Jaithon code. */
     ObjModule *owner = jaiImportFrontEndModule(module);
     if (owner == NULL) {
         jaiClearException();
@@ -60,16 +59,14 @@ bool jaiFrontEndInvoke(const char *module, const char *name, int argc,
     jaiPopRoot();
 
     if (!ok) {
-        /* A front end that raises is a bug, and the traceback is the only
-         * thing that can say where. */
+        /* A front end that raises is a bug; report the traceback. */
         jaiReportUncaught(vm.pendingException);
         jaiClearException();
     }
     return ok;
 }
 
-/* The first character of a Jaithon string, or '\0' for an empty one. Every
- * opener and closer the scan reports is one ASCII byte. */
+/* Every opener/closer the scan reports is one ASCII byte. */
 static char firstChar(Value v) {
     if (!IS_STRING(v)) return '\0';
     ObjString *s = AS_STRING(v);
@@ -114,10 +111,8 @@ bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out) {
     out->closerLine = intField(produced, "closer_line");
     out->closerCol  = intField(produced, "closer_col");
 
-    /* `open` is a Jaithon enum, which has no C spelling; the module answers its
-     * ordinal instead. A verdict the driver cannot read is worse than none, so
-     * a missing accessor fails the whole scan rather than silently reporting
-     * JAI_REPL_OPEN_NONE for a bracket. */
+    /* `open` is a Jaithon enum with no C spelling; a missing accessor fails
+     * the whole scan rather than silently reporting JAI_REPL_OPEN_NONE. */
     Value ordinal = NULL_VAL;
     bool gotOrdinal = jaiFrontEndCall0(produced, "open_ordinal", &ordinal) &&
                       IS_INT(ordinal);
@@ -137,8 +132,8 @@ bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out) {
 
 #define JAI_FRONT_END_MODULE "jaithon.compile"
 
-/* `Compiled.image` is a list of byte-sized ints: Jaithon has no writable bytes
- * type, so the front end returns the container that way. */
+/* Jaithon has no writable bytes type, so the front end returns the image as a
+ * list of byte-sized ints. */
 static ObjBytes *imageBytes(Value compiled) {
     Value field;
     if (!jaiFrontEndField(compiled, "image", &field) || !IS_LIST(field)) {
@@ -162,8 +157,8 @@ static ObjBytes *imageBytes(Value compiled) {
     return bytes;
 }
 
-/* The session object, made once and held for the process. A prompt is one
- * conversation; nothing about it is per-input. */
+/* Made once and held for the process: a prompt is one conversation, nothing
+ * about it is per-input. */
 static Value sSession = NULL_VAL;
 static bool  sSessionTried;
 
@@ -237,10 +232,8 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
         *outWasExpression = boolField(produced, "repl_expression");
     }
 
-    /* Diagnostics first: an input can be rejected with an image already empty,
-     * and they are the whole of what the prompt has to say about it. Into the
-     * bag rather than onto stderr, so the driver renders them the way it
-     * renders everything else. */
+    /* Diagnostics first: an input can be rejected with an image already
+     * empty. Into the bag, not stderr, so the driver renders them uniformly. */
     (void)jaiFrontEndTransferDiagnostics(produced);
 
     ObjBytes *image = imageBytes(produced);
@@ -268,20 +261,9 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
 /* Diagnostics                                                          */
 /* ------------------------------------------------------------------ */
 
-/* The front end reports into a Jaithon `DiagnosticBag`, and rendering one as
- * text is all `Compiled.report` can do: a flat line per diagnostic, with no
- * source excerpt, no caret and no help.
- *
- * That is not what a diagnostic is supposed to look like, and printing it that
- * way is what the driver did between the day the self-hosted front end became
- * the default and the day this was written. `tests/errors` never noticed --
- * it greps the output for the code and nothing else -- and only the REPL
- * goldens, which pin the rendered form, ever failed.
- *
- * So the diagnostics are rebuilt as `JaiDiag` and put in the bag the driver
- * already flushes. `jaiDiagRender` then produces the same output for both
- * front ends, which is the only way the two can be told apart by what they
- * accept rather than by how they complain. */
+/* Diagnostics are rebuilt as `JaiDiag` in the bag the driver already flushes,
+ * rather than printed via `Compiled.report` (a flat line per diagnostic, no
+ * excerpt/caret/help): `jaiDiagRender` then renders both front ends alike. */
 
 static JaiSpan spanFrom(Value v) {
     JaiSpan span = JAI_SPAN_NONE;
@@ -318,9 +300,8 @@ static void transferOne(Value diagnostic) {
         primary = spanFrom(spanValue);
     }
 
-    /* Severity comes off the code rather than the record's own field: the
-     * letter and the numeric range say the same thing here, and reading a
-     * Jaithon enum from C costs a call. */
+    /* Severity comes off the code, not the record's own field: reading a
+     * Jaithon enum from C costs a call, and the code says the same thing. */
     JaiDiag *d = (codeText != NULL && codeText[0] == 'W')
                      ? jaiDiagWarn(code, primary, "%s", message)
                      : jaiDiagError(code, primary, "%s", message);
@@ -352,8 +333,7 @@ static void transferOne(Value diagnostic) {
 
 bool jaiFrontEndTransferDiagnostics(Value compiled) {
     /* `Compiled` carries a bag; `import_cycles` answers one directly. Both are
-     * worth accepting, so that a caller does not have to know which shape the
-     * entry point it used happens to return. */
+     * accepted so a caller need not know which shape its entry point returns. */
     Value bag;
     if (!jaiFrontEndField(compiled, "diagnostics", &bag)) bag = compiled;
     Value items;
@@ -370,10 +350,8 @@ bool jaiFrontEndTransferDiagnostics(Value compiled) {
 /* Dumps                                                                */
 /* ------------------------------------------------------------------ */
 
-/* `jaithon ast` and `jaithon tokens` used to run the C lexer and parser and
- * print from the C tree. Both now ask the front end, which is the only one
- * left: a dump of a tree the compiler does not build would describe a program
- * nothing runs. */
+/* Both ask the front end, not a C lexer/parser: a dump of a tree the compiler
+ * does not build would describe a program nothing runs. */
 static ObjString *dumpText(const char *module, const char *entry,
                            const char *source, size_t length, int fileId,
                            bool wantsJson) {

@@ -1,11 +1,7 @@
 /* handles.c — the one handle table, shared by std.thread, std.gui and std.gpu.
- *
- * Kept in its own translation unit rather than in whichever builtins file
- * happened to need it first, because three unrelated subsystems hand out
- * handles and a handle from one must never resolve inside another: the kind
+ * A handle from one subsystem must never resolve inside another: the kind
  * check below is what makes passing a mutex to gpu_dispatch an error instead
- * of a crash.
- */
+ * of a crash. */
 
 #include "handles.h"
 

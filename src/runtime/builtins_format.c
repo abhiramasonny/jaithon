@@ -1,14 +1,6 @@
-/* builtins_format.c — the format-spec engine of spec §5.2.
- *
- * Split out of builtins_str.c because it has two independent users and belongs
- * to neither: an f-string hole with a spec compiles to `value.__format__(spec)`
- * (parser.c applyFormatSpec), and `str.format` runs the same spec parser once
- * per replacement field. std.fmt is a thin Jaithon wrapper over the two.
- *
- * A spec is read once into a FormatSpec, the value is rendered into a body
- * buffer, and the padding is applied last, so alignment sees the finished text
- * whatever produced it.
- */
+/* builtins_format.c — the format-spec engine of spec §5.2, shared by f-string
+ * holes (`value.__format__`, parser.c applyFormatSpec) and `str.format`;
+ * std.fmt wraps both in Jaithon. */
 
 #include "builtins_str.h"
 #include "methods.h"
@@ -25,14 +17,14 @@
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    int32_t fill;        /* padding scalar */
+    int32_t fill;
     bool    hasFill;     /* an explicit fill outranks the '0' flag */
-    char    align;       /* '<' '>' '^' '=' or 0 for "by type" */
-    char    sign;        /* '+' '-' ' ' */
-    bool    alt;         /* '#': show the base prefix */
-    bool    zero;        /* '0': pad with zeros between sign and digits */
+    char    align;       /* 0 for "by type" */
+    char    sign;
+    bool    alt;
+    bool    zero;        /* zeros pad between sign and digits, not before the sign */
     int64_t width;
-    char    group;       /* ',' '_' or 0 */
+    char    group;
     int64_t precision;   /* -1 when unset */
     char    type;        /* 0 for "by type" */
 } FormatSpec;
@@ -135,10 +127,9 @@ static bool typeIsFloat(char t) {
            t == 'G' || t == '%';
 }
 
-/* Appends `digits`, inserting `sep` every `groupSize` characters from the
- * right of its first `head` characters. The caller decides how far the
- * groupable run reaches, because only it knows whether an 'e' is a hex digit
- * or the start of an exponent. */
+/* Groups `head` characters of `digits` from the right, every `groupSize`
+ * chars; caller sets `head` since only it knows whether a trailing 'e' is a
+ * hex digit or the start of an exponent. */
 static void appendGrouped(JaiBuf *out, const char *digits, size_t n,
                           size_t head, char sep, int groupSize) {
     if (sep == 0 || groupSize <= 0 || head == 0) {
@@ -161,8 +152,7 @@ static void appendGrouped(JaiBuf *out, const char *digits, size_t n,
 }
 
 /* Writes sign, base prefix and grouped magnitude into `body`; *headLen counts
- * the sign and prefix, which is where '=' alignment inserts its padding.
- * `groupable` is how many leading characters of `digits` may take separators. */
+ * the sign and prefix, which is where '=' alignment inserts its padding. */
 static void assembleNumber(JaiBuf *body, size_t *headLen, bool negative,
                            const char *prefix, const char *digits,
                            size_t digitLen, size_t groupable,
@@ -245,8 +235,7 @@ static bool renderInteger(JaiBuf *body, size_t *headLen, int64_t value,
     return true;
 }
 
-/* Renders a finite or non-finite double. *zeroPad is cleared for nan and inf,
- * where zero padding would produce "0000-inf". */
+/* *zeroPad is cleared for nan/inf, else zero padding would produce "0000-inf". */
 static void renderDouble(JaiBuf *body, size_t *headLen, double value,
                          const FormatSpec *fs, bool *zeroPad) {
     char type = fs->type ? fs->type : 'g';
@@ -423,9 +412,8 @@ bool jaiFormatValue(JaiBuf *out, Value value, const char *spec,
 /* str.format                                                          */
 /* ------------------------------------------------------------------ */
 
-/* `{name}` resolves against the dict arguments, searched left to right. There
- * is no other namespace to consult: a native cannot see the caller's bindings,
- * which is why f-strings capture their holes as positional arguments instead. */
+/* `{name}` resolves against the dict arguments, searched left to right — a
+ * native can't see the caller's bindings, hence no other namespace here. */
 static bool namedArgument(Value *args, int argc, const char *name, size_t len,
                           Value *out) {
     ObjString *key = jaiStringIntern(name, len);
@@ -529,10 +517,8 @@ bool jaiFormatTemplate(ObjString *tmpl, Value *args, int argc, Value *out,
     return jaiStrTakeBuf(&result, out);
 }
 
-/* An f-string hole with a spec compiles to `value.__format__(spec)` (parser.c
- * applyFormatSpec), and the hole may hold a value of any type, so this is not
- * a str method: jaiBuiltinMethod offers it for every receiver. The spec engine
- * already dispatches on the value's type. */
+/* An f-string hole may hold a value of any type, so this isn't a str method —
+ * jaiBuiltinMethod offers it for every receiver instead. */
 static bool valueDunderFormat(int argc, Value *args, Value *out) {
     ObjString *spec;
     if (argc < 2) {

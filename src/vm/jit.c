@@ -22,10 +22,7 @@ bool jaiJitEnabled(void) {
     return cached != 0;
 }
 
-/* The one arena every compiled function lives in. Never freed: a compiled
- * function is reachable for the life of the process, and reclaiming code while
- * a frame might return into it is a whole problem this tier does not have yet.
- */
+/* The one arena every compiled function lives in. Never freed. */
 static JaiCodeArena sArena;
 static bool sArenaReady;
 
@@ -38,13 +35,9 @@ static bool arenaReady(void) {
 }
 
 /* The compiled tier's entire repertoire, for now: a body that is exactly
- * `OP_RETURN_NULL`.
- *
- * Useless as an optimisation -- such a function is not hot and returning null
- * is not slow. That is deliberate. It is the smallest thing that proves the
- * hard part: that generated code can be entered from the interpreter, run, and
- * returned from, leaving the stack exactly as OP_RETURN would. Everything after
- * this widens the set of opcodes; nothing after this changes the mechanism. */
+ * `OP_RETURN_NULL`. Useless as an optimisation, deliberately -- it's the
+ * smallest proof that generated code can be entered, run, and returned from
+ * leaving the stack exactly as OP_RETURN would. */
 static bool compileReturnNull(ObjFunction *fn) {
     if (fn->chunk.count != 1 || fn->chunk.code[0] != OP_RETURN_NULL) return false;
     if (!arenaReady() || sArena.sealed) return false;
@@ -62,9 +55,8 @@ static bool compileReturnNull(ObjFunction *fn) {
 
     uint8_t *entry = jaiCodeArenaWrite(&sArena, code, sizeof code);
     if (entry == NULL) return false;
-    /* Sealing the whole arena after one function is wasteful and temporary: a
-     * real tier writes many functions and seals in batches. It is correct,
-     * which is what this step is for. */
+    /* Sealing the whole arena per function is wasteful and temporary: a real
+     * tier writes many functions and seals in batches. */
     if (!jaiCodeArenaSeal(&sArena)) return false;
     fn->jitCode = entry;
     fn->jitKind = 0;   /* returns null; ignores its arguments */
@@ -72,18 +64,10 @@ static bool compileReturnNull(ObjFunction *fn) {
 }
 
 /* `OP_GET_LOCAL k; OP_RETURN` -- an accessor, and the first compiled body that
- * has to move data.
- *
- * It cannot fail: reading a slot throws nothing and overflows nothing, so this
- * needs no deopt path and settles the calling convention while the hard part is
- * still out of scope. The convention is the narrowest one that works: the slot
- * base arrives in x0, the result is written to slotBase[0], and nothing is
- * returned -- the caller already knows where to look.
- *
- * A Value is 16 bytes, so slot k sits at x0 + k*16 and moves in one ldp/stp
- * pair. LDP's immediate is scaled by 8 and signed 7-bit, which caps k at 31;
- * beyond that this declines rather than encoding a second form, because a
- * 32-slot accessor is not the case worth the extra encoding. */
+ * has to move data. Cannot fail (reading a slot throws/overflows nothing), so
+ * this settles the calling convention (slot base in x0, result written to
+ * slotBase[0]) with no deopt path needed. A Value is 16 bytes, moved in one
+ * ldp/stp pair; LDP's imm7 caps slot k at 31, beyond which this declines. */
 static bool compileAccessor(ObjFunction *fn) {
     const Chunk *c = &fn->chunk;
     if (c->count != 4) return false;
@@ -121,9 +105,8 @@ typedef void (*JaiCompiledAccessor)(Value *slotBase);
 bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
 
-    /* The whole-function tier first: it is the only one that makes a hot
-     * function meaningfully faster, and it declines quickly for anything
-     * outside the small language it speaks. */
+    /* Whole-function tier first: the only one that makes a hot function
+     * meaningfully faster, and it declines quickly otherwise. */
     if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
 
     if (fn->jitCode == NULL) {
@@ -158,8 +141,7 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
 /* ------------------------------------------------------------------ */
 
 /* Set by the timer, read by the interpreter's safepoint. `2` rather than `1`
- * so the existing `sInterrupted` test fires without a new branch: 1 stays
- * Ctrl-C and throws, 2 is a tick. */
+ * so the existing test fires without a new branch: 1 stays Ctrl-C, 2 is a tick. */
 extern volatile sig_atomic_t jaiInterrupted;
 
 static void onTick(int signum) {
@@ -180,45 +162,30 @@ void jaiJitStartSampling(void) {
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGPROF, &sa, NULL) != 0) return;
 
-    /* ITIMER_PROF counts CPU time, so a process blocked on IO is not sampled --
-     * which is right, since it has no hot loop to find. */
+    /* ITIMER_PROF counts CPU time, so a process blocked on IO isn't sampled --
+     * right, since it has no hot loop to find. */
     struct itimerval it;
     it.it_interval.tv_sec = 0;
-    /* 4kHz, not 1. A tick only counts when it lands with the ip on a back
-     * edge, so the wait before a loop is compiled is always longer than the
-     * rate; raising the rate shortens it directly. Two binaries interleaved:
-     * 484ms against 492ms across the suite, all of it loop_sum going 48.6ms to
-     * 40.8ms. 10kHz was worse again at 486 -- the signal itself starts to cost
-     * more than the earlier compile saves, so this is a peak and not a slope. */
+    /* 4kHz: a tick only counts on a back-edge ip, so raising the rate directly
+     * shortens the wait before compiling; 10kHz measured worse (signal cost
+     * outweighs the earlier compile), so this is a peak, not a slope. */
     it.it_interval.tv_usec = 250;
     it.it_value = it.it_interval;
     (void)setitimer(ITIMER_PROF, &it, NULL);
 }
 
-/* Ticks seen in one function before its loop is compiled.
- *
- * One, and it was twenty once. At 1kHz twenty ticks looked like 20ms of warmup
- * and cost 150, because the interpreter runs the loop for the whole of it and
- * that loop is the entire program; three cost another 25 on the same argument.
- * Two binaries, interleaved: 490ms against 515ms across the suite, nearly all
- * of it loop_sum going 67.3ms to 48.1ms and alloc_churn 42.9 to 39.0.
- *
- * A tick is not a millisecond. It only counts when one arrives while the ip
- * sits on a back edge, so the wait is always longer than the rate suggests --
- * which is why lowering this kept paying long after it looked like it should
- * have stopped.
- *
- * Compiling costs microseconds, so there is little to protect against by
- * waiting; a function that runs once still collects no ticks at all. */
+/* Ticks seen in one function before its loop is compiled. Was 20, then 3;
+ * lowering kept winning benchmarks because a tick only counts on a back-edge
+ * ip, so the real wait is longer than the rate suggests -- and compiling
+ * costs microseconds, so there's little to gain by waiting longer. */
 #define JAI_JIT_HOT_TICKS 1
 
 bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
     if (fn->tickCount >= JAI_JIT_HOT_TICKS) {
-        /* Already hot. A tick landing on a loop top is the OSR entry point, and
-         * the only moment the interpreter's state matches what compiled code
-         * expects on entry: OP_LOOP sets ip to the loop's first instruction and
-         * *then* runs the safepoint. */
+        /* Already hot. A tick on a loop top is the OSR entry point, the only
+         * moment interpreter state matches what compiled code expects: OP_LOOP
+         * sets ip to the loop's first instruction, *then* runs the safepoint. */
         if (jaiJitEnterLoop(closure, offset)) return true;
         /* The shape matcher covers one loop; this covers the rest, with the
          * interpreter's own slots as the compiled body's locals. */

@@ -1,20 +1,15 @@
 /* vm.c — the bytecode interpreter (spec/BYTECODE.md).
  *
- * Three invariants hold everywhere below.
- *
- *   1. `ip`, `stackTop`, `slots`, `constants` and `frame` live in C locals for
- *      the whole of runLoop(). SAVE_STATE() writes ip and stackTop back into
- *      the VM before anything that can allocate, call, or throw; LOAD_STATE()
- *      reloads afterwards. The GC scans the value stack up to vm.stackTop, so
- *      a stale vm.stackTop is not a slow path — it is a collected live object.
- *
- *   2. Every helper that can re-enter the interpreter works off vm.stackTop,
- *      never the loop's local, and leaves vm.stackTop where it found it (plus
- *      whatever it was asked to push). That is what makes jaiCallValue and
- *      friends callable from native code at any depth.
- *
- *   3. There is no setjmp/longjmp. A raise sets vm.pendingException and the
- *      loop jumps to `vmThrow`, which walks handlers and frames explicitly.
+ * Three invariants hold everywhere below:
+ *   1. ip/stackTop/slots/constants/frame are C locals throughout runLoop();
+ *      SAVE_STATE()/LOAD_STATE() sync them with the VM around anything that
+ *      can allocate, call, or throw -- the GC scans up to vm.stackTop, so a
+ *      stale one is a collected live object, not just a slow path.
+ *   2. Every re-entrant helper works off vm.stackTop, not the loop's local,
+ *      and restores it after (plus whatever it pushed) -- this is what lets
+ *      jaiCallValue and friends be called from native code at any depth.
+ *   3. No setjmp/longjmp: a raise sets vm.pendingException and jumps to
+ *      `vmThrow`, which walks handlers and frames explicitly.
  */
 #include <inttypes.h>
 #include <math.h>
@@ -463,9 +458,7 @@ static void closeUpvalues(Value *last) {
 /* Visibility                                                           */
 /*                                                                      */
 /* The checker rejects what it can prove (E0701); this is the dynamic    */
-/* half, for `any`-typed receivers. "Inside the class" is decided by the */
-/* running frame's slot 0: in a method that is the receiver, everywhere  */
-/* else it is the callee, so a private access from outside cannot pass.  */
+/* half, for `any`-typed receivers.                                      */
 /* ------------------------------------------------------------------ */
 
 static bool accessPermitted(const ObjClass *owner, Visibility vis) {
@@ -473,21 +466,12 @@ static bool accessPermitted(const ObjClass *owner, Visibility vis) {
     CallFrame *frame = topFrame();
     if (frame == NULL || owner == NULL) return false;
 
-    /* Slot 0 is the receiver: the instance for an ordinary method, and the
-     * class itself for a `static fn`. Both answer "which class is running?",
-     * and spec §7.1 makes members private to the *declaring class* — a static
-     * method is a member of that class, so it sees them. Reading only the
-     * instance form locked every static factory out of the fields it exists to
-     * fill in. A class only reaches slot 0 by being called, and calling a class
-     * runs `init`, which has the instance there instead; so nothing but a
-     * static method of that class can present it here. */
-    /* The declaring class of the running function, when there is one, is the
-     * exact answer and does not depend on how the call was made. Slot 0 is the
-     * fallback: a lambda inside a method carries no owner, and there the
-     * receiver is still the only evidence available. `Box.make(n)` in tail
-     * position compiles to GET_FIELD plus TAIL_CALL, which leaves the function
-     * in slot 0, and every static factory in the library was refused the
-     * fields it exists to fill in. */
+    /* fn->owner (the declaring class, spec §7.1) is checked first and is
+     * exact; slot 0 -- the instance, or for a `static fn` the class itself --
+     * is only a fallback for a lambda with no owner. A tail-called static
+     * factory compiles to GET_FIELD+TAIL_CALL, leaving the function itself in
+     * slot 0, so relying on slot 0 alone locked every static factory out of
+     * its own fields. */
     ObjClass *selfClass = NULL;
     if (frame->closure != NULL && frame->closure->fn != NULL)
         selfClass = frame->closure->fn->owner;
@@ -2921,7 +2905,6 @@ static const char *typeConstantName(Value typeConstant) {
     return jaiTypeNameStatic(typeConstant);
 }
 
-/* Append one declared field to a class under construction. */
 static bool classDeclareField(ObjClass *klass, ObjString *name, uint8_t info) {
     if (jaiClassFieldInfo(klass, name) != NULL) return true;   /* redeclared */
     if (klass->fieldCount == UINT16_MAX) {
@@ -4287,10 +4270,6 @@ static JaiRunResult runLoop(int baseFrameCount) {
     VM_CASE(OP_LOOP): {
         int16_t offset = READ_I16();
         ip += offset;
-        /* Both halves of the safepoint are almost always "nothing to do", so
-         * only the taken case pays for writing the frame state back: the
-         * common back edge is one predictable branch, not a
-         * SAVE_STATE/call/LOAD_STATE round trip. */
         /* Both halves of the safepoint are almost always "nothing to do", so
          * only the taken case pays for writing the frame state back: the
          * common back edge is one predictable branch, not a
