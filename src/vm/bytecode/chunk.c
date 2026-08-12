@@ -416,6 +416,27 @@ uint16_t jaiChunkAddCache(Chunk *chunk) {
     return (uint16_t)chunk->cacheCount++;
 }
 
+bool jaiChunkReserveCaches(Chunk *chunk, int count) {
+    if (chunk == NULL || count < 0 || count > UINT16_MAX + 1) return false;
+    if (chunk->caches != NULL || chunk->cacheCount != 0) return false;
+    if (count == 0) return true;
+
+    chunk->caches = JAI_ALLOC(InlineCache, count);
+    /* Initialised exactly as jaiChunkAddCache does, rather than assuming a
+     * zeroed slot is an empty one: IC_EMPTY and NULL_VAL both happen to be
+     * zero today, and a slot that silently stopped being empty would read as a
+     * stale hit on the first execution. */
+    for (int i = 0; i < count; i++) {
+        InlineCache *ic = &chunk->caches[i];
+        memset(ic, 0, sizeof *ic);
+        ic->state = IC_EMPTY;
+        for (int w = 0; w < JAI_IC_WAYS; w++) ic->cached[w] = NULL_VAL;
+    }
+    chunk->cacheCapacity = count;
+    chunk->cacheCount = count;
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Emission                                                            */
 /* ------------------------------------------------------------------ */

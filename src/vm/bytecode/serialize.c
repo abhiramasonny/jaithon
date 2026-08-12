@@ -689,8 +689,12 @@ static bool rebuildCaches(Chunk *chunk) {
         off += 1 + size;
     }
 
-    for (long i = 0; i <= maxIndex; i++) (void)jaiChunkAddCache(chunk);
-    return chunk->cacheCount == (int)(maxIndex + 1);
+    /* Exactly maxIndex + 1 slots, not JAI_GROW_CAP's next power of two: the
+     * count is known here, and the rounding cost 1.19 MB across the seed's
+     * images. maxIndex starts at -1, so a chunk with no cache operands reserves
+     * zero and allocates nothing. */
+    return jaiChunkReserveCaches(chunk, (int)(maxIndex + 1)) &&
+           chunk->cacheCount == (int)(maxIndex + 1);
 }
 
 /* §5. Returns an unrooted function; callers store it immediately, and no
