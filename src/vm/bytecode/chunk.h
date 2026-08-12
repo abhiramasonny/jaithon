@@ -176,6 +176,29 @@ typedef enum {
      * high four. Emitted only where a type was actually written. */
     OP_ELEM_KIND,            /* u8: low nibble value kind, high nibble key kind */
 
+    /* `for … in X.items()`: replace X on the stack with an iterator over its
+     * pairs (spec §3.4). On a dict this is ITER_DICT_ITEMS, which walks the
+     * table and yields one tuple at a time; on anything else it calls the
+     * receiver's own `items()` and iterates the result, so a user class that
+     * defines `items()` behaves exactly as before.
+     *
+     * The dispatch is at RUNTIME on purpose: emit.jai has no checker types
+     * (see its note), so the emitter matches only the syntactic shape and this
+     * opcode decides what the receiver actually is.
+     *
+     * It does NOT call `items()` itself -- invoking a Jaithon method from
+     * inside an opcode is not safe here, and --gc-stress caught it. It only
+     * converts a dict and jumps past the ordinary sequence; anything else is
+     * left on the stack for that sequence to handle:
+     *
+     *     <receiver>
+     *     GET_ITER_ITEMS J   ; dict: replace with a lazy iterator, jump to J
+     *     INVOKE items 0     ; anything else: its own items(), unchanged
+     *     GET_ITER
+     *   J:
+     */
+    OP_GET_ITER_ITEMS,       /* i16 J */
+
     OP_COUNT
 } OpCode;
 

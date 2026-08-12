@@ -22,7 +22,6 @@ bool jaiJitEnabled(void) {
     return cached != 0;
 }
 
-/* The one arena every compiled function lives in. Never freed. */
 static JaiCodeArena sArena;
 static bool sArenaReady;
 
@@ -63,11 +62,6 @@ static bool compileReturnNull(ObjFunction *fn) {
     return true;
 }
 
-/* `OP_GET_LOCAL k; OP_RETURN` -- an accessor, and the first compiled body that
- * has to move data. Cannot fail (reading a slot throws/overflows nothing), so
- * this settles the calling convention (slot base in x0, result written to
- * slotBase[0]) with no deopt path needed. A Value is 16 bytes, moved in one
- * ldp/stp pair; LDP's imm7 caps slot k at 31, beyond which this declines. */
 static bool compileAccessor(ObjFunction *fn) {
     const Chunk *c = &fn->chunk;
     if (c->count != 4) return false;
@@ -115,8 +109,6 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
             return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
         }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {
-            /* Same reasoning as the loop tier: a body that calls something not
-             * yet compiled may compile perfectly well a moment later. */
             if (++fn->jitAttempts >= 5) fn->jitRefused = true;
             else fn->entryCount = 0;
             return false;
@@ -130,24 +122,14 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
         slotBase[0] = NULL_VAL;
     }
 
-    /* The contract in jit.h: the call is complete, the frame was never pushed,
-     * and the result sits at slotBase[0]. */
     vm.stackTop = slotBase + 1;
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Sampling                                                             */
-/* ------------------------------------------------------------------ */
-
-/* Set by the timer, read by the interpreter's safepoint. `2` rather than `1`
- * so the existing test fires without a new branch: 1 stays Ctrl-C, 2 is a tick. */
 extern volatile sig_atomic_t jaiInterrupted;
 
 static void onTick(int signum) {
     (void)signum;
-    /* Nothing but the flag. A signal handler that touched VM state or
-     * allocated would be a reentrancy bug that reproduces once a month. */
     if (jaiInterrupted == 0) jaiInterrupted = 2;
 }
 
@@ -162,8 +144,6 @@ void jaiJitStartSampling(void) {
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGPROF, &sa, NULL) != 0) return;
 
-    /* ITIMER_PROF counts CPU time, so a process blocked on IO isn't sampled --
-     * right, since it has no hot loop to find. */
     struct itimerval it;
     it.it_interval.tv_sec = 0;
     /* 4kHz: a tick only counts on a back-edge ip, so raising the rate directly
