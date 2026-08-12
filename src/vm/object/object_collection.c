@@ -104,6 +104,18 @@ void jaiListTouch(ObjList *list) {
 }
 
 void jaiListPush(ObjList *list, Value v) {
+    /* The guard belongs HERE, not in the `list.push` builtin: a typed receiver
+     * and an `any` one reach the list through different entry points, and
+     * guarding only the builtin caught the first and missed the second -- which
+     * is the case that matters, since the `any` path is the one the checker
+     * cannot see. Every caller already handles vm.hasException.
+     *
+     * A list with no declared element type carries FIELD_KIND_ANY and this is
+     * one predictable not-taken compare. */
+    if (JAI_UNLIKELY(list->elemKind != FIELD_KIND_ANY) &&
+        !jaiCheckKind(list->elemKind, v, "an element")) {
+        return;
+    }
     if (JAI_UNLIKELY(list->count >= list->capacity) &&
         !listGrowFor(list, v))
         return;
@@ -122,6 +134,10 @@ Value jaiListPop(ObjList *list) {
 }
 
 void jaiListInsert(ObjList *list, int idx, Value v) {
+    if (JAI_UNLIKELY(list->elemKind != FIELD_KIND_ANY) &&
+        !jaiCheckKind(list->elemKind, v, "an element")) {
+        return;
+    }
     if (idx < 0) {
         idx += list->count;
         if (idx < 0) idx = 0;
@@ -283,6 +299,16 @@ bool jaiDictGet(ObjDict *d, Value key, Value *out) {
 }
 
 bool jaiDictSet(ObjDict *d, Value key, Value value) {
+    /* Same reasoning as jaiListPush: the lowest common point every writer
+     * reaches, so an `any` receiver cannot slip past. */
+    if (JAI_UNLIKELY(d->keyKind != FIELD_KIND_ANY) &&
+        !jaiCheckKind(d->keyKind, key, "a key")) {
+        return false;
+    }
+    if (JAI_UNLIKELY(d->valKind != FIELD_KIND_ANY) &&
+        !jaiCheckKind(d->valKind, value, "a value")) {
+        return false;
+    }
     uint64_t hash;
     if (!keyHash(key, "dict key", &hash)) return false;
     return jaiTableSetHashed(&d->table, key, hash, value);

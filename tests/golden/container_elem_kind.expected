@@ -1,0 +1,11 @@
+[0, 1, 2]
+3
+push: cannot put str into an element of int
+insert: cannot put str into an element of int
+setindex: cannot put str into an element of int
+dictval: cannot put str into a value of int
+dictkey: cannot put int into a key of str
+[0, 1, 2]
+2
+[1, "mixed"]
+[3]

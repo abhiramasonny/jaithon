@@ -237,6 +237,47 @@ void jaiFreeObject(Obj *obj) {
     JAI_PANIC("jaiFreeObject: object with invalid type tag %d", (int)obj->type);
 }
 
+/* Does `v` satisfy a declared kind?
+ *
+ * One vocabulary for every place a declared type meets a runtime value: a
+ * class field (OP_FIELD_DEF's spare bits) and a container element
+ * (OP_ELEM_KIND). FIELD_KIND_ANY accepts everything, which is what an
+ * undeclared field, a nullable, a generic parameter, an unstamped container
+ * and any kind this encoding cannot name all carry -- claiming nothing is
+ * always safe, and a false TypeError on correct code is worse than a missed
+ * one. An unrecognised code is a newer encoding read by an older binary and is
+ * treated the same way.
+ *
+ * A float accepts an int, per LANGUAGE.md §2.5, and stores it as an int: a
+ * write arriving through `any` carries no OP_TO_FLOAT, because the checker
+ * never saw a float on the target side. Rejecting it would break code that
+ * works today. */
+bool jaiKindAccepts(uint32_t kind, Value v) {
+    switch ((FieldKind)kind) {
+    case FIELD_KIND_ANY:      return true;
+    case FIELD_KIND_INT:      return IS_INT(v);
+    case FIELD_KIND_FLOAT:    return IS_FLOAT(v) || IS_INT(v);
+    case FIELD_KIND_BOOL:     return IS_BOOL(v);
+    case FIELD_KIND_STR:      return IS_STRING(v);
+    case FIELD_KIND_LIST:     return IS_LIST(v);
+    case FIELD_KIND_DICT:     return IS_DICT(v);
+    case FIELD_KIND_INSTANCE: return IS_INSTANCE(v) || IS_NULL(v);
+    }
+    return true;
+}
+
+/* Throws TypeError and returns false when `v` violates a declared kind.
+ *
+ * `what` names the thing for the message: "element of list[int]" reads better
+ * at a push than "field 'x'". A kind of FIELD_KIND_ANY is the overwhelmingly
+ * common case and is one compare away, so an unstamped container pays a
+ * predictable not-taken branch and nothing else. */
+bool jaiCheckKind(uint32_t kind, Value v, const char *what) {
+    if (kind == FIELD_KIND_ANY || jaiKindAccepts(kind, v)) return true;
+    return jaiThrow(vm.cTypeError, "cannot put %s into %s of %s",
+                    jaiTypeNameStatic(v), what, jaiFieldKindName(kind));
+}
+
 const char *jaiFieldKindName(uint32_t kind) {
     switch ((FieldKind)kind) {
     case FIELD_KIND_INT:      return "int";
