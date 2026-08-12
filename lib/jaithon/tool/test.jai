@@ -12,7 +12,8 @@
 #: is_test_name("test_adds")          # true
 #: is_test_name("tester")             # false
 #: ```
-from jaithon.ast import NodeKind, to_source
+from jaithon.ast import NodeKind
+from jaithon.ast_unparse import to_source
 from jaithon.compile.lexer import DiagnosticBag, Lexer, TokenKind
 from jaithon.compile.parser import parse
 from std.fmt import bold, green, red

@@ -20,7 +20,8 @@
 #: format_source("if a{f( 1,2 )}\n", "demo.jai")    # "if a { f(1, 2) }\n"
 #: ```
 from jaithon.ast import DeclKind, Node, NodeKind, TypeExpr, TypeKind, Visibility
-from jaithon.ast import op_text, to_source, walk
+from jaithon.ast import op_text, walk
+from jaithon.ast_unparse import to_source
 from jaithon.compile.lexer import DiagnosticBag, Severity
 from jaithon.compile.parser import parse
 from std.io import Path, print_err, read_file, write_file
