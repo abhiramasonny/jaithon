@@ -169,6 +169,7 @@ pub enum Op {
     SubBind,
     MulBind,
     ElemKind,
+    GetIterItems,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -325,6 +326,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.SubBind, "OP_SUB_BIND", 2, -2),
     OpSpec(Op.MulBind, "OP_MUL_BIND", 2, -2),
     OpSpec(Op.ElemKind, "OP_ELEM_KIND", 1, 0),
+    OpSpec(Op.GetIterItems, "OP_GET_ITER_ITEMS", 2, 0),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
@@ -1539,6 +1541,9 @@ pub class Emitter {
         var skips: list[list[int]] = []
         for clause in clauses {
             before_iter.push(self._depth())
+            # Plain `for` only, not comprehension clauses: a clause's jumps are
+            # tracked by the comprehension itself, and threading another branch
+            # through that bookkeeping broke `{k: v for (v, k) in d.items()}`.
             self._expr(clause["iterable"])
             self._op(Op.GetIter, span)
             starts.push(self._chunk().here())
@@ -2254,11 +2259,28 @@ pub class Emitter {
         return base
     }
 
+    #: `X.items()` as a loop iterable: take the lazy path when X turns out to
+    #: be a dict, and otherwise fall through to the ordinary call so a user
+    #: class's own `items()` still runs. The branch is the opcode's, because
+    #: this file cannot know X's type — see `_is_items_call`.
+    fn _items_iterable(self, iterable: Node?, span: Span) -> void {
+        self._expr(_items_receiver(iterable))
+        let skip = self._emit_jump(Op.GetIterItems, span)
+        self._invoke_name("items", 0, span)
+        self._op(Op.GetIter, span)
+        self._patch(skip)
+    }
+
     fn _for(self, node: Node) -> void {
         let span = node.span
         let base = self._depth()
-        self._expr(node.child("iterable"))
-        self._op(Op.GetIter, span)
+        let iterable = node.child("iterable")
+        if _is_items_call(iterable) {
+            self._items_iterable(iterable, span)
+        } else {
+            self._expr(iterable)
+            self._op(Op.GetIter, span)
+        }
         let start = self._chunk().here()
         let exit = self._emit_jump(Op.ForIter, span)
         self._adjust(1)  # the element, on the fall-through path
@@ -2890,6 +2912,42 @@ fn _container_kind_code(declared: TypeExpr?) -> int {
         return key << 4 | value
     }
     return 0
+}
+
+#: Emit the iterable of a `for` loop, leaving an iterator on the stack.
+#:
+#: `for … in X.items()` gets `OP_GET_ITER_ITEMS` applied to X rather than a call
+#: to `items()` followed by `OP_GET_ITER`. On a dict that iterates the table
+#: lazily instead of building the whole list of pairs first — `jaiDictItems`
+#: allocates an N-element list of N fresh 2-tuples per call and keeps all N
+#: alive at once, so every collection during the loop marks the lot.
+#:
+#: Matched on SHAPE only, because this file has no checker types. The opcode
+#: decides at run time what the receiver actually is, so a user class defining
+#: its own `items()` still gets that method called and behaves exactly as
+#: before.
+fn _is_items_call(iterable: Node?) -> bool {
+    if iterable == null { return false }
+    let node: Node = iterable
+    if node.kind != NodeKind.Call { return false }
+    if node.records("args").len() != 0 { return false }
+    let callee = node.child("callee")
+    if callee == null { return false }
+    let target: Node = callee
+    if target.kind != NodeKind.Member { return false }
+    if target.opt_text("name") != "items" { return false }
+    # `super.items()` binds to slot 0 and has its own lowering.
+    let receiver = target.child("object")
+    if receiver == null { return false }
+    let recv: Node = receiver
+    return recv.kind != NodeKind.Super
+}
+
+#: The receiver of an `X.items()` call matched by `_is_items_call`.
+fn _items_receiver(iterable: Node?) -> Node? {
+    if iterable == null { return null }
+    let node: Node = iterable
+    return node.child("callee")?.child("object")
 }
 
 fn _then_of(node: Node) -> Node? {

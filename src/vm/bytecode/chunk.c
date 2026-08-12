@@ -173,7 +173,9 @@
     X(OP_SUB_BIND,             2, -2)                                          \
     X(OP_MUL_BIND,             2, -2)                                          \
     /* container element type, stamped onto the value on top (§3.6) */         \
-    X(OP_ELEM_KIND,            1,  0)
+    X(OP_ELEM_KIND,            1,  0)                                          \
+    /* `for … in X.items()`: X -> an iterator over its pairs (§3.4) */         \
+    X(OP_GET_ITER_ITEMS,       2,  0)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

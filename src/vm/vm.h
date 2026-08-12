@@ -61,6 +61,8 @@ typedef struct VM {
     /* Interned dunder names, resolved once at startup. */
     ObjString   *strInit, *strStr, *strRepr, *strEq, *strLt, *strHash, *strLen,
                 *strGetItem, *strSetItem, *strContains, *strIter, *strNext,
+                /* `items`, for OP_GET_ITER_ITEMS's non-dict fallback. */
+                *strItems,
                 *strCall, *strAdd, *strSub, *strMul, *strDiv, *strMod,
                 *strPow, *strNeg, *strMain, *strSelf, *strMessage;
 

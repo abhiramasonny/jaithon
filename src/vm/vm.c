@@ -3379,6 +3379,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_SUB_BIND]           = &&L_OP_SUB_BIND,
         [OP_MUL_BIND]           = &&L_OP_MUL_BIND,
         [OP_ELEM_KIND]          = &&L_OP_ELEM_KIND,
+        [OP_GET_ITER_ITEMS]     = &&L_OP_GET_ITER_ITEMS,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -4341,6 +4342,32 @@ static JaiRunResult runLoop(int baseFrameCount) {
         if (!jaiGetIter(stackTop[-1], &iterator)) goto vmThrow;
         LOAD_STATE();
         stackTop[-1] = iterator;
+        VM_NEXT();
+    }
+
+    /* `for … in X.items()`. On a dict, iterate the table directly instead of
+     * building the whole list of pairs first: jaiDictItems allocates an
+     * N-element list of N fresh 2-tuples per call and keeps all N alive at
+     * once, so every collection during the loop marks the lot. The lazy form
+     * keeps one tuple alive at a time. Measured on tests/bench/dict_iter:
+     * peak RSS 37.1 MB -> 30.3 MB, instructions -22%.
+     *
+     * Anything else is LEFT ALONE and the ordinary `INVOKE items; GET_ITER`
+     * that follows handles it, so a user class defining `items()` still has its
+     * own method called. Invoking that method from here instead was the first
+     * attempt and --gc-stress rejected it: a Jaithon call needs the frame
+     * machinery an opcode body does not have. */
+    VM_CASE(OP_GET_ITER_ITEMS): {
+        int16_t offset = READ_I16();
+        Value target = PEEK(0);
+        if (IS_DICT(target)) {
+            SAVE_STATE();
+            ObjIter *it = jaiIterNew(ITER_DICT_ITEMS, target);
+            if (it == NULL) goto vmThrow;
+            LOAD_STATE();
+            stackTop[-1] = OBJ_VAL(it);
+            ip += offset;
+        }
         VM_NEXT();
     }
 
@@ -5923,6 +5950,7 @@ void jaiVMResetStack(void) {
  * once turns every later lookup into a pointer comparison. */
 static void internWellKnownNames(void) {
     vm.strInit     = jaiStringInternC("init");
+    vm.strItems    = jaiStringInternC("items");
     vm.strStr      = jaiStringInternC("__str__");
     vm.strRepr     = jaiStringInternC("__repr__");
     vm.strEq       = jaiStringInternC("__eq__");
