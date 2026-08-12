@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Benchmark Jaithon against CPython on equivalent programs.
 #
-# Each benchmark is a pair: tests/bench/NAME.jai and tests/bench/NAME.py that
-# compute the same result. Both must print the same value, which is checked —
+# Each benchmark is a pair: tests/bench/NAME/NAME.jai and tests/bench/NAME/NAME.py
+# that compute the same result. Both must print the same value, which is checked —
 # a benchmark that computes the wrong thing quickly is not a benchmark.
 
 set -uo pipefail
@@ -109,7 +109,7 @@ build_all() {
     # Every C++ port at once, streaming rather than in batches: xargs keeps all
     # cores fed instead of stalling at a barrier every `max` files.
     if [[ $HAVE_CXX -eq 1 ]]; then
-        for src in "$ROOT"/tests/bench/*.cpp; do
+        for src in "$ROOT"/tests/bench/*/*.cpp; do
             printf '%s\0%s\0' "$src" "$BENCH_BUILD/$(basename "$src" .cpp)"
         done | xargs -0 -P "$max" -n 2 sh -c 'c++ -O2 -std=c++17 -o "$1" "$0" 2>/dev/null || true'
     fi
@@ -118,7 +118,7 @@ build_all() {
     # twenty times, which was most of the Java build cost; javac takes the whole
     # list and compiles it in one process.
     if [[ $HAVE_JAVA -eq 1 ]]; then
-        local jsrcs=("$ROOT"/tests/bench/*.java)
+        local jsrcs=("$ROOT"/tests/bench/*/*.java)
         (( ${#jsrcs[@]} )) && javac -d "$BENCH_BUILD/classes" "${jsrcs[@]}" 2>/dev/null
     fi
 }
@@ -131,7 +131,7 @@ printf '%s\n' "─────────────────────�
 
 shopt -s nullglob
 total_j=0; total_p=0
-for src in "$ROOT"/tests/bench/*.jai; do
+for src in "$ROOT"/tests/bench/*/*.jai; do
     name="$(basename "$src" .jai)"
     py="${src%.jai}.py"
 
@@ -159,7 +159,7 @@ for src in "$ROOT"/tests/bench/*.jai; do
     jms_java="—"
     # Java classes are CamelCase: loop_sum -> LoopSum.
     cls="$(python3 -c "import sys; print(''.join(w.capitalize() for w in sys.argv[1].split('_')))" "$name")"
-    jsrc="$ROOT/tests/bench/$cls.java"
+    jsrc="$ROOT/tests/bench/$name/$cls.java"
     if [[ $HAVE_JAVA -eq 1 && -f "$jsrc" && -f "$BENCH_BUILD/classes/$cls.class" ]]; then
         jms_java="$(best_ms java -cp "$BENCH_BUILD/classes" "$cls")ms"
         [[ "$(cat "$BENCH_CAP")" != "$jout" ]] && jms_java="MISMATCH"

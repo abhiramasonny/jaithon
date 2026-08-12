@@ -5,10 +5,12 @@ port for. The `.jai` file is the reference; a peer only counts if it prints the
 same output, which the runner checks on every run — a benchmark that computes
 the wrong thing quickly is not a benchmark.
 
-    tests/bench/loop_sum.jai        required
-    tests/bench/loop_sum.py         python3 column
-    tests/bench/loop_sum.cpp        c++ column      (optional)
-    tests/bench/LoopSum.java        java column     (optional, CamelCase name)
+Each benchmark lives in its own subdirectory, named for the benchmark:
+
+    tests/bench/loop_sum/loop_sum.jai        required
+    tests/bench/loop_sum/loop_sum.py         python3 column
+    tests/bench/loop_sum/loop_sum.cpp        c++ column      (optional)
+    tests/bench/loop_sum/LoopSum.java        java column     (optional, CamelCase name)
 
 Run with `make bench`, or `RUNS=3 scripts/run_bench.sh` for a quicker pass.
 Columns whose toolchain is missing disappear; benchmarks without a port show
@@ -41,11 +43,12 @@ is small; a benchmark whose Java column is far away has headroom.
 
 ## Adding one
 
-Write the `.jai` first and make it print something derived from the whole
-computation, so a wrong answer cannot look fast. Add the `.py` and check both
-by hand before trusting the table. C++ and Java ports are optional and worth
-adding for anything you intend to optimise, since without them you cannot tell
-a real gap from an already-tight one.
+Make a subdirectory named for the benchmark and write the `.jai` there first,
+making it print something derived from the whole computation, so a wrong
+answer cannot look fast. Add the `.py` alongside it and check both by hand
+before trusting the table. C++ and Java ports are optional and worth adding
+for anything you intend to optimise, since without them you cannot tell a real
+gap from an already-tight one.
 
 Keep the runtime in the same range as the others — roughly 50–200ms for
 jaithon, with `loop_sum` the deliberate outlier — so no single benchmark

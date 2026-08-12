@@ -50,7 +50,7 @@ jaithon disasm program.jai  # bytecode listing
 ```
 
 The REPL keeps its bindings across lines, continues an unfinished input on a
-`... ` prompt, and takes meta-commands. `:help` lists every one of them.
+`...` prompt, and takes meta-commands. `:help` lists every one of them.
 
 ## Examples of .jai Code
 
@@ -140,7 +140,7 @@ help: change the declaration to `var x = 1`
 These are what the codes mean:
 
 | Code | Area |
-|---|---|
+| --- | --- |
 | `E00xx` | lexical |
 | `E01xx` | syntax |
 | `E02xx` | names |
