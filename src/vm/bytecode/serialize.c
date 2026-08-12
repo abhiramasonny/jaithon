@@ -60,10 +60,11 @@
 #include "vm/table.h"
 
 /* Constant-pool tags (spec §4). 7 and 9 are missing on purpose: they were a
- * class-spec record and a serialised type descriptor, and neither was ever
- * written by either front end. The numbers stay burned rather than reused, so
- * that a tag this reader does not know is always a newer format and never an
- * older one misread. An unknown tag refuses the image, which recompiles. */
+ * class-spec record and a serialised type descriptor, and neither is written by
+ * either front end. They are not free, though -- jaic.jai still DECODES them --
+ * so a new tag takes the next unused number rather than reusing one. That is
+ * what keeps "a tag this reader does not know" always a newer format and never
+ * an older one misread. An unknown tag refuses the image, which recompiles. */
 typedef enum {
     K_NULL  = 0,
     K_BOOL  = 1,
@@ -73,6 +74,19 @@ typedef enum {
     K_BYTES = 5,
     K_FUNC  = 6,
     K_TUPLE = 8,
+    /* An index into the module's string table (§4). From JAIC_VERSION_STRTAB on
+     * this replaces K_STR everywhere: 62.5% of a .jaic's string payload was one
+     * text repeated across nested function pools, and 94.9% of strings are
+     * under 16 bytes yet each paid a 4-byte u32 length. K_STR stays defined
+     * because older containers still use it.
+     *
+     * 10, NOT 7. The header above says 7 and 9 were never written by either
+     * front end; that is true of the writers and false of the readers.
+     * lib/jaithon/compile/jaic.jai decodes 7 as a class-spec record and 9 as a
+     * type descriptor, so claiming 7 here would have made the two
+     * implementations disagree about the same byte, silently, in the one
+     * direction nothing in the tree compares. */
+    K_STRREF = 10,
 } ConstTag;
 
 #define JAIC_CACHE_DIR   "__jaicache__"
@@ -115,6 +129,12 @@ typedef struct {
      * it through readConstant/readTuple/readFunction would touch six
      * signatures to reach one branch. */
     uint16_t       version;
+    /* The module string table, from JAIC_VERSION_STRTAB on: every K_STRREF is
+     * an index into it. Interned once here rather than once per occurrence --
+     * across lib that is 2,327 interns instead of 9,988. Owned by deserialize,
+     * which frees the array (not the strings, which the intern table owns). */
+    Value         *strings;
+    uint32_t       stringCount;
 } Cursor;
 
 static size_t curLeft(const Cursor *c) {
@@ -174,6 +194,62 @@ static double curF64(Cursor *c) {
     double d;
     memcpy(&d, &bits, sizeof d);   /* IEEE-754 bit pattern, as written */
     return d;
+}
+
+/* LEB128, bounded by the cursor. A malformed run refuses the image rather than
+ * spinning: 10 bytes is the most a 64-bit value can occupy. */
+static bool curUleb(Cursor *c, uint64_t *out) {
+    uint64_t v = 0;
+    int shift = 0;
+    for (int i = 0; i < 10; i++) {
+        const uint8_t *p = NULL;
+        if (!curTake(c, 1, &p)) return false;
+        if (shift < 64) v |= (uint64_t)(p[0] & 0x7Fu) << shift;
+        shift += 7;
+        if ((p[0] & 0x80u) == 0) {
+            *out = v;
+            return true;
+        }
+    }
+    c->bad = true;
+    return false;
+}
+
+/* The module string table: count, then {uleb128 length, bytes} each. Interning
+ * happens exactly once per distinct text, here.
+ *
+ * The array is a GC ROOT RANGE for the whole of the rest of the load. The
+ * intern table's references are weak (spec §10), so an interned string reachable
+ * only from this C array would be swept by the first collection the remaining
+ * reads trigger -- and they allocate a function object per record. Pushing the
+ * range up front, pre-filled with NULL_VAL so a collection mid-fill marks a
+ * well-formed range, is what keeps them alive until the pools point at them.
+ * The caller pops it. */
+static bool readStrTab(Cursor *c) {
+    uint64_t count = 0;
+    if (!curUleb(c, &count)) return false;
+    if (count >= JAIC_CONST_MAX) return false;
+    if (count == 0) return true;
+    /* One byte minimum per entry (a zero-length string is one length byte), so
+     * a corrupt count cannot size an allocation larger than the file. */
+    if (!curFits(c, count, 1)) return false;
+
+    c->strings = JAI_ALLOC(Value, (size_t)count);
+    for (uint64_t i = 0; i < count; i++) c->strings[i] = NULL_VAL;
+    c->stringCount = (uint32_t)count;
+    jaiGCPushRootRange(c->strings, (int)count);
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t len = 0;
+        if (!curUleb(c, &len)) return false;
+        if (len > curLeft(c)) return false;
+        const uint8_t *p = NULL;
+        if (!curTake(c, (size_t)len, &p)) return false;
+        ObjString *s = jaiStringIntern((const char *)p, (uint32_t)len);
+        if (s == NULL) return false;
+        c->strings[i] = OBJ_VAL(s);
+    }
+    return true;
 }
 
 static uint32_t readU32At(const uint8_t *p) {
@@ -244,12 +320,93 @@ static bool poolIndexOfString(PoolWriter *w, ObjString *s, uint32_t *out) {
 /* Writing: constants and function records                              */
 /* ------------------------------------------------------------------ */
 
-static bool writeFunction(JaiBuf *b, const ObjFunction *fn, int depth);
-static bool writeConstant(JaiBuf *b, PoolWriter *w, Value v, int depth);
+/* ------------------------------------------------------------------ */
+/* Writing: the module string table                                     */
+/* ------------------------------------------------------------------ */
+
+/* Every string constant in the module, once, in first-use order.
+ *
+ * Strings are interned, so identity is equality and the dedup index can be a
+ * pointer-keyed table. Two things pay for this: 62.5% of a .jaic's string
+ * payload was the same text repeated across nested function pools (73.8% in the
+ * seed), and interning at load drops from one call per occurrence -- 9,988
+ * across lib -- to one per distinct text, 2,327. */
+typedef struct {
+    const ObjString **items;
+    uint32_t          count;
+    uint32_t          capacity;
+    JaiTable          index;   /* interned string -> INT_VAL(position) */
+} StrTab;
+
+static void strTabInit(StrTab *st) {
+    st->items = NULL;
+    st->count = 0;
+    st->capacity = 0;
+    jaiTableInit(&st->index);
+}
+
+static void strTabFree(StrTab *st) {
+    JAI_FREE_ARRAY(const ObjString *, st->items, st->capacity);
+    jaiTableFree(&st->index);
+    st->items = NULL;
+    st->count = 0;
+    st->capacity = 0;
+}
+
+static bool strTabIntern(StrTab *st, const ObjString *s, uint32_t *out) {
+    if (s == NULL) return false;
+
+    Value existing;
+    if (jaiTableGetInterned(&st->index, (ObjString *)s, &existing) &&
+        IS_INT(existing)) {
+        *out = (uint32_t)AS_INT(existing);
+        return true;
+    }
+    if (st->count >= JAIC_CONST_MAX) return false;
+
+    if (st->capacity < st->count + 1) {
+        uint32_t oldCapacity = st->capacity;
+        st->capacity = (uint32_t)JAI_GROW_CAP((int)oldCapacity);
+        st->items = JAI_GROW_ARRAY(const ObjString *, st->items, oldCapacity,
+                                   st->capacity);
+    }
+    st->items[st->count] = s;
+    *out = st->count;
+    (void)jaiTableSetInterned(&st->index, (ObjString *)s, INT_VAL(st->count));
+    st->count++;
+    return true;
+}
+
+static void bufWriteUleb(JaiBuf *b, uint64_t v) {
+    do {
+        uint8_t byte = (uint8_t)(v & 0x7Fu);
+        v >>= 7;
+        if (v != 0) byte |= 0x80u;
+        jaiBufPush(b, byte);
+    } while (v != 0);
+}
+
+/* `count`, then each string as {uleb128 length, bytes}. Varint lengths because
+ * 94.9% of strings are under 16 bytes: a flat u32 length cost 38,672 bytes
+ * across lib to carry 75,717 bytes of payload. */
+static void writeStrTab(JaiBuf *b, const StrTab *st) {
+    bufWriteUleb(b, st->count);
+    for (uint32_t i = 0; i < st->count; i++) {
+        const ObjString *s = st->items[i];
+        bufWriteUleb(b, s->length);
+        jaiBufAppend(b, s->chars, s->length);
+    }
+}
+
+static bool writeFunction(JaiBuf *b, StrTab *st, const ObjFunction *fn,
+                          int depth);
+static bool writeConstant(JaiBuf *b, PoolWriter *w, StrTab *st, Value v,
+                          int depth);
 
 /* §4. Refusing a value the format cannot express is always allowed: the
  * caller's fallback is to skip the cache and recompile. */
-static bool writeConstant(JaiBuf *b, PoolWriter *w, Value v, int depth) {
+static bool writeConstant(JaiBuf *b, PoolWriter *w, StrTab *st, Value v,
+                          int depth) {
     if (depth > JAIC_MAX_DEPTH) return false;
 
     switch (jaiValueType(v)) {
@@ -277,10 +434,12 @@ static bool writeConstant(JaiBuf *b, PoolWriter *w, Value v, int depth) {
 
     switch (o->type) {
     case OBJ_STRING: {
-        const ObjString *s = (const ObjString *)o;
-        jaiBufPush(b, K_STR);
-        jaiBufWriteU32(b, s->length);
-        jaiBufAppend(b, s->chars, s->length);
+        /* The bytes live once, in the module string table; the pool entry is
+         * an index into it. */
+        uint32_t index = 0;
+        if (!strTabIntern(st, (const ObjString *)o, &index)) return false;
+        jaiBufPush(b, K_STRREF);
+        bufWriteUleb(b, index);
         return true;
     }
     case OBJ_BYTES: {
@@ -292,13 +451,13 @@ static bool writeConstant(JaiBuf *b, PoolWriter *w, Value v, int depth) {
     }
     case OBJ_FUNCTION:
         jaiBufPush(b, K_FUNC);
-        return writeFunction(b, (const ObjFunction *)o, depth + 1);
+        return writeFunction(b, st, (const ObjFunction *)o, depth + 1);
     case OBJ_TUPLE: {
         const ObjTuple *t = (const ObjTuple *)o;
         jaiBufPush(b, K_TUPLE);
         jaiBufWriteU32(b, t->count);
         for (uint32_t i = 0; i < t->count; i++) {
-            if (!writeConstant(b, w, t->items[i], depth + 1)) return false;
+            if (!writeConstant(b, w, st, t->items[i], depth + 1)) return false;
         }
         return true;
     }
@@ -324,7 +483,8 @@ static bool initFlagIsRecoverable(const ObjFunction *fn) {
 }
 
 /* §5. */
-static bool writeFunction(JaiBuf *b, const ObjFunction *fn, int depth) {
+static bool writeFunction(JaiBuf *b, StrTab *st, const ObjFunction *fn,
+                          int depth) {
     if (fn == NULL || depth > JAIC_MAX_DEPTH) return false;
     if (fn->flags & ~JAIC_KNOWN_FN_FLAGS) return false;
     if (!initFlagIsRecoverable(fn)) return false;
@@ -365,7 +525,7 @@ static bool writeFunction(JaiBuf *b, const ObjFunction *fn, int depth) {
     }
 
     for (uint32_t i = 0; ok && i < poolTotal(&w); i++) {
-        ok = writeConstant(&constants, &w, poolAt(&w, i), depth + 1);
+        ok = writeConstant(&constants, &w, st, poolAt(&w, i), depth + 1);
     }
 
     uint32_t constCount = poolTotal(&w);
@@ -432,7 +592,8 @@ static int64_t sourceMtime(const ObjModule *module) {
 
 /* The module-level pool (§7) holds the export and import names; the module
  * body's own constants live in its function record. */
-static bool writeModulePool(JaiBuf *b, ObjModule *module, uint32_t *outCount) {
+static bool writeModulePool(JaiBuf *b, StrTab *st, ObjModule *module,
+                            uint32_t *outCount) {
     uint32_t count = 0;
     if (module != NULL) {
         int slot = 0;
@@ -449,10 +610,10 @@ static bool writeModulePool(JaiBuf *b, ObjModule *module, uint32_t *outCount) {
         Value key, value;
         while (jaiTableNext(&module->exports, &slot, &key, &value)) {
             if (!IS_STRING(key)) continue;
-            const ObjString *s = AS_STRING(key);
-            jaiBufPush(b, K_STR);
-            jaiBufWriteU32(b, s->length);
-            jaiBufAppend(b, s->chars, s->length);
+            uint32_t index = 0;
+            if (!strTabIntern(st, AS_STRING(key), &index)) return false;
+            jaiBufPush(b, K_STRREF);
+            bufWriteUleb(b, index);
         }
     }
     *outCount = count;
@@ -484,19 +645,37 @@ uint8_t *jaiSerializeModule(ObjModule *module, ObjFunction *body,
     if (pathLen > 0) jaiBufAppend(&b, path->chars, pathLen);
     jaiBufWriteU64(&b, (uint64_t)sourceMtime(module));
 
+    /* The body is built into its own buffer first, because the string table has
+     * to be complete before it can be written and it is only complete once
+     * every nested function record has been walked. The table then goes ahead
+     * of the body, so the reader has it before the first K_STRREF. */
+    StrTab st;
+    strTabInit(&st);
+    JaiBuf body_buf;
+    jaiBufInit(&body_buf);
+
     uint32_t exportCount = 0;
-    bool ok = writeModulePool(&b, module, &exportCount);
-    if (ok) ok = writeFunction(&b, body, 0);
+    bool ok = writeModulePool(&body_buf, &st, module, &exportCount);
+    if (ok) ok = writeFunction(&body_buf, &st, body, 0);
 
     if (ok) {
-        jaiBufWriteU32(&b, exportCount);
+        jaiBufWriteU32(&body_buf, exportCount);
         for (uint32_t i = 0; i < exportCount; i++) {
-            jaiBufWriteU32(&b, i);   /* the pool holds exactly the export names */
+            /* the pool holds exactly the export names */
+            jaiBufWriteU32(&body_buf, i);
         }
         /* ObjModule keeps no import list; the body's OP_IMPORT instructions
          * are what actually import. The section stays for format conformance. */
-        jaiBufWriteU32(&b, 0);
+        jaiBufWriteU32(&body_buf, 0);
     }
+
+    if (ok) {
+        writeStrTab(&b, &st);
+        jaiBufAppend(&b, body_buf.data, body_buf.count);
+    }
+
+    jaiBufFree(&body_buf);
+    strTabFree(&st);
 
     if (!ok) {
         jaiBufFree(&b);
@@ -611,6 +790,14 @@ static bool readConstant(Cursor *c, ObjModule *module, Value *out, int depth) {
         ObjString *s = jaiStringIntern((const char *)p, len);   /* §4: interned */
         if (s == NULL) return false;
         *out = OBJ_VAL(s);
+        return true;
+    }
+    case K_STRREF: {
+        uint64_t index = 0;
+        if (!curUleb(c, &index)) return false;
+        if (c->strings == NULL || index >= c->stringCount) return false;
+        if (!IS_STRING(c->strings[index])) return false;   /* corrupt table */
+        *out = c->strings[index];
         return true;
     }
     case K_BYTES: {
@@ -1006,7 +1193,7 @@ static ObjFunction *deserialize(const uint8_t *data, size_t size,
     if (jaiCrc32(data, size - 4) != readU32At(data + size - 4)) return NULL;
 
     /* The cursor stops short of the checksum, so no parse can wander into it. */
-    Cursor c = { data, size - 4, 4, false, 0 };
+    Cursor c = { data, size - 4, 4, false, 0, NULL, 0 };
 
     /* A RANGE, not an equality. A strict test here is evaluated before the
      * fromSeed branch below, so bumping JAIC_VERSION with it in place refuses
@@ -1078,8 +1265,16 @@ static ObjFunction *deserialize(const uint8_t *data, size_t size,
     ObjFunction *body = NULL;
     bool ok = true;
 
-    uint32_t poolCount = curU32(&c);
-    if (c.bad || poolCount >= JAIC_CONST_MAX || !curFits(&c, poolCount, 1)) {
+    /* The string table comes before the pools, because every K_STRREF in them
+     * indexes it. Its root range stays pushed for the whole read and is popped
+     * on every exit below. */
+    if (version >= JAIC_VERSION_STRTAB) {
+        ok = readStrTab(&c);
+    }
+
+    uint32_t poolCount = ok ? curU32(&c) : 0;
+    if (ok && (c.bad || poolCount >= JAIC_CONST_MAX ||
+               !curFits(&c, poolCount, 1))) {
         ok = false;
     }
     if (ok) {
@@ -1149,6 +1344,12 @@ static ObjFunction *deserialize(const uint8_t *data, size_t size,
     }
     jaiValueArrayFree(&modulePool);
     jaiGCPopRoots(poolRoots);
+    if (c.strings != NULL) {
+        /* Popped only here: every constant pool now holds its own reference to
+         * each string, so the range has done its job. */
+        jaiGCPopRootRange();
+        JAI_FREE_ARRAY(Value, c.strings, c.stringCount);
+    }
     return ok ? body : NULL;
 }
 

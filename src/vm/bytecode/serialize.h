@@ -12,8 +12,9 @@
  * entry is validated against its source's mtime, so an unchanged source
  * compiled by a newer compiler is otherwise served stale.
  * 11: top-level `fn` declarations are hoisted ahead of top-level statements.
- * 12: the line table is LTV1 (delta+LEB128) instead of 12-byte records. */
-#define JAIC_VERSION     12
+ * 12: the line table is LTV1 (delta+LEB128) instead of 12-byte records.
+ * 13: string constants are K_STRREF indices into one module string table. */
+#define JAIC_VERSION     13
 
 /* Oldest container the reader accepts. It must stay below JAIC_VERSION across a
  * format bump, or the newly built binary refuses boot/seed.bin -- whose images
@@ -26,6 +27,11 @@
 /* First container version whose line table is LTV1. Below it, the table is
  * JAIC_LINE_ENTRY-sized absolute records and the reader re-encodes on load. */
 #define JAIC_VERSION_LTV1 12
+
+/* First container version carrying a module string table, whose strings every
+ * pool then names by K_STRREF index. Below it, each pool holds its own K_STR
+ * bytes. */
+#define JAIC_VERSION_STRTAB 13
 
 typedef enum {
     JAIC_FLAG_DEBUG   = 1 << 0,

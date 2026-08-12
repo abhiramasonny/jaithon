@@ -1,9 +1,4 @@
-/* value.c — equality, hashing, ordering, and rendering of Values.
- *
- * int/float equality and hashing agree: an exact-integral float hashes as
- * that int. int-vs-float compares exactly, never widening to double. Rendering
- * may re-enter the VM, so the disassembler/traceback path disables user
- * dispatch. */
+// value.c houses equality, hashing, ordering, and rendering of Values.
 #include <math.h>
 #include <stdlib.h>
 
@@ -12,35 +7,17 @@
 #include "vm/table.h"
 #include "vm/vm.h"
 
-/* Exactly representable bounds of int64_t as doubles. -2^63 is exact; +2^63 is
- * the first double above INT64_MAX. */
 #define JAI_I64_MIN_D (-9223372036854775808.0)
 #define JAI_I64_SUP_D (9223372036854775808.0)
 
-/* Comparison and hashing recurse through nested containers; cap the depth so a
- * pathological structure cannot smash the C stack. */
 #define JAI_EQ_MAX_DEPTH   256
 #define JAI_HASH_MAX_DEPTH 256
-/* Rendering nests further (one level per container) but also has to stay well
- * inside the C stack while a user __repr__ may re-enter the VM. */
 #define JAI_RENDER_MAX_DEPTH 64
 
-/* ------------------------------------------------------------------ */
-/* Value array                                                         */
-/* ------------------------------------------------------------------ */
-
 void jaiValueArrayInit(ValueArray *a) { JAI_VEC_INIT(a); }
-
 void jaiValueArrayFree(ValueArray *a) { JAI_VEC_FREE(Value, a); }
-
 void jaiValueArrayPush(ValueArray *a, Value v) { JAI_VEC_PUSH(Value, a, v); }
 
-/* ------------------------------------------------------------------ */
-/* Temporary GC roots                                                  */
-/* ------------------------------------------------------------------ */
-
-/* Needed because the JaiBuf we render into is plain memory: an object held
- * only in a C local can be collected by an allocation during the append. */
 JAI_INLINE bool tempRoot(Value v) {
     if (!IS_OBJ(v) || vm.gc == NULL) return false;
     jaiPushRoot(v);
@@ -51,14 +28,7 @@ JAI_INLINE void tempUnroot(bool rooted) {
     if (rooted) jaiPopRoot();
 }
 
-/* ------------------------------------------------------------------ */
-/* Exact int/float arithmetic predicates                               */
-/* ------------------------------------------------------------------ */
-
-/* True when `d` is finite, integral, and within int64 range. */
 JAI_INLINE bool doubleIsExactInt(double d, int64_t *out) {
-    /* Checking the range before casting makes the cast defined and rejects
-     * inf/NaN; casting back is cheaper than floor() and still proves integrality. */
     if (!(d >= JAI_I64_MIN_D && d < JAI_I64_SUP_D)) return false;
     int64_t i = (int64_t)d;
     if ((double)i != d) return false;
@@ -71,15 +41,11 @@ JAI_INLINE bool intEqualsDouble(int64_t i, double d) {
     return doubleIsExactInt(d, &di) && di == i;
 }
 
-/* Three-way compare of an int against a double without precision loss.
- * Returns false when `d` is NaN (unordered). */
 static bool compareIntDouble(int64_t i, double d, int *out) {
     if (isnan(d)) return false;
     if (d >= JAI_I64_SUP_D) { *out = -1; return true; }   /* covers +inf */
     if (d < JAI_I64_MIN_D)  { *out = 1;  return true; }   /* covers -inf */
 
-    /* Truncation is well-defined after the bounds checks; when the integer
-     * parts match, only the fractional remainder's sign is left to decide. */
     int64_t di = (int64_t)d;
     if (i < di) { *out = -1; return true; }
     if (i > di) { *out = 1;  return true; }
@@ -92,12 +58,10 @@ static bool compareDoubles(double x, double y, int *out) {
     if (x < y) { *out = -1; return true; }
     if (x > y) { *out = 1; return true; }
     if (x == y) { *out = 0; return true; }
-    return false;                                      /* at least one NaN */
+    return false;
 }
 
-/* ------------------------------------------------------------------ */
-/* Type names                                                          */
-/* ------------------------------------------------------------------ */
+// type names
 
 static const char *classNameOf(const ObjClass *k) {
     if (k == NULL || k->name == NULL) return "object";
@@ -127,15 +91,12 @@ const char *jaiTypeNameStatic(Value v) {
     if (type != VAL_OBJ) return scalarNames[type];
 
     ObjType objectType = OBJ_TYPE(v);
-    if (objectType == OBJ_INSTANCE)
-        return classNameOf(AS_INSTANCE(v)->klass);
+    if (objectType == OBJ_INSTANCE) return classNameOf(AS_INSTANCE(v)->klass);
     if (objectType == OBJ_ENUM_VAL) {
         ObjEnumVal *e = AS_ENUM_VAL(v);
-        return e->type != NULL && e->type->name != NULL ? e->type->name->chars
-                                                        : "enum";
+        return e->type != NULL && e->type->name != NULL ? e->type->name->chars: "enum";
     }
-    /* Enum constructors are deliberately typed as functions: `Shape.Circle`
-     * has type `fn(float) -> Shape`. */
+
     const char *name = objectType < OBJ_TYPE_COUNT ? objectNames[objectType] : NULL;
     return name != NULL ? name : "object";
 }
@@ -144,10 +105,7 @@ ObjString *jaiTypeName(Value v) {
     return jaiStringInternC(jaiTypeNameStatic(v));
 }
 
-/* ------------------------------------------------------------------ */
-/* Equality                                                            */
-/* ------------------------------------------------------------------ */
-
+// equality
 static int eqDepth = 0;
 
 JAI_INLINE bool instanceHasEq(Value v) {
@@ -158,8 +116,6 @@ JAI_INLINE bool instanceHasEq(Value v) {
     return k != NULL && !IS_NULL(k->dunderEq);
 }
 
-/* Returns false with an exception pending on error, or *missing set when
- * the method vanished from under the cache. */
 static bool dispatchEq(Value a, Value b, bool *result, bool *missing) {
     Value out;
     Value arg = b;
@@ -193,7 +149,6 @@ static bool tuplesEqual(ObjTuple *a, ObjTuple *b) {
     return true;
 }
 
-/* Dicts are equal as unordered key->value sets. */
 static bool dictsEqual(ObjDict *a, ObjDict *b) {
     if (a->table.count != b->table.count) return false;
     int i = 0;
@@ -227,8 +182,6 @@ static bool enumValsEqual(ObjEnumVal *a, ObjEnumVal *b) {
 }
 
 static bool objectsEqual(Obj *ao, Obj *bo, Value a, Value b) {
-    /* The public fast path has already settled identity, unlike object kinds,
-     * and every non-recursive object. */
     switch (ao->type) {
         case OBJ_LIST:     return listsEqual((ObjList *)ao, (ObjList *)bo);
         case OBJ_TUPLE:    return tuplesEqual((ObjTuple *)ao, (ObjTuple *)bo);
@@ -239,23 +192,19 @@ static bool objectsEqual(Obj *ao, Obj *bo, Value a, Value b) {
             bool result = false, missing = false;
             if (instanceHasEq(a)) {
                 if (dispatchEq(a, b, &result, &missing)) return result;
-                if (!missing) return false;          /* exception pending */
+                if (!missing) return false;
             }
             return ao == bo;
         }
         default:
-            return ao == bo;                          /* functions, classes, ... */
+            return ao == bo;
     }
 }
 
 static bool valuesEqualInner(Value a, Value b) {
     ValueType ta = jaiValueType(a);
     ValueType tb = jaiValueType(b);
-    if (ta == VAL_OBJ && tb == VAL_OBJ)
-        return objectsEqual(AS_OBJ(a), AS_OBJ(b), a, b);
-
-    /* All scalar and numeric cases were settled before the recursion guard.
-     * Reaching this helper with unlike tags means an instance dunder remains. */
+    if (ta == VAL_OBJ && tb ==VAL_OBJ) return objectsEqual(AS_OBJ(a), AS_OBJ(b), a, b);
     if (ta != tb) {
         bool result = false, missing = false;
         if (instanceHasEq(a)) {
@@ -281,8 +230,6 @@ bool jaiValuesEqual(Value a, Value b) {
         return false;
     }
 
-    /* Scalar equality can't recurse and is overwhelmingly common, so it skips
-     * the depth counter -- its load/store would otherwise tax every int compare. */
     ValueType ta = jaiValueType(a);
     ValueType tb = jaiValueType(b);
     if (JAI_LIKELY(ta == VAL_INT && tb == VAL_INT))
@@ -298,9 +245,6 @@ bool jaiValuesEqual(Value a, Value b) {
                 if (ao == bo && ao->type != OBJ_INSTANCE) return true;
                 if (ao->type != bo->type) return false;
 
-                /* These object kinds are leaf comparisons too; containers,
-                 * enum payloads, and instances continue through the guarded
-                 * recursive dispatcher below. */
                 switch (ao->type) {
                     case OBJ_STRING:
                         return jaiStringEquals((ObjString *)ao, (ObjString *)bo);
@@ -323,18 +267,15 @@ bool jaiValuesEqual(Value a, Value b) {
                     case OBJ_ENUM_VAL:
                         break;
                     default:
-                        return false;                 /* distinct identity objects */
+                        return false;
                 }
                 break;
             }
         }
     } else {
-        if (ta == VAL_INT && tb == VAL_FLOAT)
-            return intEqualsDouble(AS_INT(a), AS_FLOAT(b));
-        if (ta == VAL_FLOAT && tb == VAL_INT)
-            return intEqualsDouble(AS_INT(b), AS_FLOAT(a));
+        if (ta == VAL_INT && tb == VAL_FLOAT) return intEqualsDouble(AS_INT(a), AS_FLOAT(b));
+        if (ta == VAL_FLOAT && tb == VAL_INT) return intEqualsDouble(AS_INT(b), AS_FLOAT(a));
         if (ta == VAL_NULL || tb == VAL_NULL) return false;
-        /* Only an instance can make two unlike Value tags equal. */
         if (!instanceHasEq(a) && !instanceHasEq(b)) return false;
     }
 
@@ -352,7 +293,6 @@ bool jaiValuesIdentical(Value a, Value b) {
         case VAL_BOOL:  return AS_BOOL(a) == AS_BOOL(b);
         case VAL_INT:   return AS_INT(a) == AS_INT(b);
         case VAL_FLOAT: {
-            /* Bit identity, so `nan is nan` holds and `0.0 is -0.0` does not. */
             uint64_t x, y;
             double da = AS_FLOAT(a), db = AS_FLOAT(b);
             memcpy(&x, &da, sizeof x);
@@ -365,14 +305,10 @@ bool jaiValuesIdentical(Value a, Value b) {
     return false;
 }
 
-/* ------------------------------------------------------------------ */
-/* Hashing                                                             */
-/* ------------------------------------------------------------------ */
+// hashing
 
 static int hashDepth = 0;
 
-/* A float that denotes an integer hashes as that integer, so that the equal
- * values 1 and 1.0 land in the same bucket. */
 JAI_INLINE uint64_t hashDouble(double d) {
     int64_t i;
     if (doubleIsExactInt(d, &i)) return jaiHashU64((uint64_t)i);
@@ -399,7 +335,7 @@ static uint64_t hashTuple(ObjTuple *t, bool *ok) {
         h = hashCombine(h, eh);
     }
     h = jaiHashU64(h ^ (uint64_t)t->count);
-    if (h == 0) h = 1;      /* 0 is the "not computed" marker */
+    if (h == 0) h = 1; // 0 is the not compute marker
     t->hash = h;
     return h;
 }
@@ -421,7 +357,7 @@ static uint64_t hashInstance(ObjInstance *inst, bool *ok) {
 
     Value out;
     if (!jaiInvokeMethod(OBJ_VAL(inst), vm.strHash, 0, NULL, &out)) {
-        *ok = false;                     /* exception pending, or no such method */
+        *ok = false; //exception pending
         return 0;
     }
     if (!IS_INT(out)) {
@@ -434,7 +370,6 @@ static uint64_t hashInstance(ObjInstance *inst, bool *ok) {
 }
 
 static uint64_t valueHashInner(Value v, bool *ok) {
-    /* Every leaf kind is handled before the recursion guard. */
     switch (OBJ_TYPE(v)) {
         case OBJ_TUPLE:    return hashTuple(AS_TUPLE(v), ok);
         case OBJ_ENUM_VAL: return hashEnumVal(AS_ENUM_VAL(v), ok);
@@ -455,15 +390,11 @@ uint64_t jaiValueHash(Value v, bool *ok) {
         return 0;
     }
 
-    /* Only tuples, enum payloads, and user __hash__ recurse, as with equality;
-     * settling every leaf here skips the depth counter for int/float/bytes/range. */
     ValueType type = jaiValueType(v);
     if (JAI_LIKELY(type == VAL_INT))
         return jaiHashU64((uint64_t)AS_INT(v));
 
     switch (type) {
-        /* `null` is not a valid key (spec §5.4). JaiEntry uses it as the empty
-         * slot marker, so dict/set insertion turns this false into TypeError. */
         case VAL_NULL:
             *ok = false;
             return 0;
@@ -475,8 +406,7 @@ uint64_t jaiValueHash(Value v, bool *ok) {
             return 0;
         case VAL_FLOAT:
             return hashDouble(AS_FLOAT(v));
-        case VAL_OBJ:
-            break;
+        case VAL_OBJ: break;
     }
 
     switch (OBJ_TYPE(v)) {
@@ -507,8 +437,7 @@ uint64_t jaiValueHash(Value v, bool *ok) {
         case OBJ_SET:
             *ok = false;
             return 0;
-        default:
-            return hashPointer(AS_OBJ(v));
+        default: return hashPointer(AS_OBJ(v));
     }
 
     hashDepth++;
@@ -517,10 +446,7 @@ uint64_t jaiValueHash(Value v, bool *ok) {
     return *ok ? h : 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Ordering                                                            */
-/* ------------------------------------------------------------------ */
-
+// ordering
 JAI_INLINE bool instanceHasLt(Value v) {
     if (!IS_OBJ(v)) return false;
     Obj *o = AS_OBJ(v);
@@ -529,8 +455,6 @@ JAI_INLINE bool instanceHasLt(Value v) {
     return k != NULL && !IS_NULL(k->dunderLt);
 }
 
-/* Returns false with an exception pending on error, or *missing set when
- * the method could not be invoked. */
 static bool dispatchLt(Value a, Value b, bool *result, bool *missing) {
     Value out;
     Value arg = b;
@@ -548,7 +472,6 @@ static bool dispatchLt(Value a, Value b, bool *result, bool *missing) {
     return true;
 }
 
-/* a<b decides -1, b<a decides 1, otherwise equal (at least one side has __lt__). */
 static bool compareWithLt(Value a, Value b, int *out) {
     bool less = false, missing = false;
     bool aHasLt = instanceHasLt(a);
@@ -557,7 +480,7 @@ static bool compareWithLt(Value a, Value b, int *out) {
         if (!dispatchLt(a, b, &less, &missing)) return false;
         if (less) { *out = -1; return true; }
     }
-    /* a.__lt__ may mutate b's class, so inspect b only after that dispatch. */
+
     bool bHasLt = instanceHasLt(b);
     if (bHasLt) {
         if (!dispatchLt(b, a, &less, &missing)) return false;
@@ -567,7 +490,6 @@ static bool compareWithLt(Value a, Value b, int *out) {
     }
     if (!aHasLt) return false;
 
-    /* Only `a` knows how to order itself; not-less means equal or greater. */
     bool eq = jaiValuesEqual(a, b);
     if (vm.hasException) return false;
     *out = eq ? 0 : 1;
@@ -611,19 +533,12 @@ bool jaiValueCompare(Value a, Value b, int *out) {
 
     if (ta == VAL_OBJ && tb == VAL_OBJ &&
         AS_OBJ(a)->type == OBJ_STRING && AS_OBJ(b)->type == OBJ_STRING) {
-        /* Byte order over UTF-8 is code-point order. */
         return compareStrings(AS_STRING(a), AS_STRING(b), out);
     }
 
     return compareWithLt(a, b, out);
 }
 
-/* ------------------------------------------------------------------ */
-/* Rendering                                                           */
-/* ------------------------------------------------------------------ */
-
-/* Two destinations: a growable buffer (str/repr) or a stream (the
- * disassembler/traceback printer, which must not allocate an ObjString). */
 typedef struct {
     JaiBuf *buf;
     FILE   *file;
@@ -651,13 +566,10 @@ JAI_INLINE void sinkReserve(ValSink *s, size_t n) {
         jaiBufReserve(s->buf, n);
 }
 
-/* Output isn't NUL-terminated (callers have the length) and must fit 20
- * digits plus a sign. Negation goes via uint64_t so INT64_MIN comes out right. */
 #define JAI_INT_DIGITS 24
 #define JAI_FLOAT_CHARS 32
 
-/* Two digits per lookup halves the divisions in the common multi-digit path;
- * the compiler turns /100 into a multiply and shift. */
+//magic sh*t
 static const char digitPairs[] =
     "00010203040506070809"
     "10111213141516171819"
@@ -725,15 +637,11 @@ static int writeInt64(char *out, int64_t value) {
     return len;
 }
 
-/* printf drags in locale lookup and varargs for at most twenty digits;
- * integers are rendered often enough to earn their own fast path. */
 JAI_INLINE void sinkInt(ValSink *s, int64_t value) {
     char digits[JAI_INT_DIGITS];
     sinkWrite(s, digits, (size_t)writeInt64(digits, value));
 }
 
-/* Shortest decimal that round-trips via strtod and never reads back as an
- * int; digit count and notation decide separately, unlike "%g". */
 static size_t formatDouble(char *out, size_t outSize, double d) {
     if (isnan(d)) {
         memcpy(out, "nan", 4);
@@ -745,8 +653,6 @@ static size_t formatDouble(char *out, size_t outSize, double d) {
         return 3;
     }
 
-    /* Human-written floats are often small whole numbers, whose exact spelling
-     * is known without entering printf/strtod at all. */
     int64_t whole;
     if (d > -10000000000000000.0 && d < 10000000000000000.0 &&
         doubleIsExactInt(d, &whole)) {
@@ -761,8 +667,6 @@ static size_t formatDouble(char *out, size_t outSize, double d) {
 
     char sci[JAI_FLOAT_CHARS];
     int digits = 0, last = 0;
-    /* Linear probe for ordinary short decimals, then binary search the rest:
-     * complex doubles drop from up to 17 printf/parse pairs to seven. */
     for (int p = 1; p <= 3; p++) {
         snprintf(sci, sizeof sci, "%.*e", p - 1, d);
         last = p;
@@ -792,8 +696,6 @@ static size_t formatDouble(char *out, size_t outSize, double d) {
         if (negative) exp = -exp;
     }
 
-    /* Same switch-over points as Python's float repr, so round numbers stay
-     * readable and extremes stay short. */
     if (exp < -4 || exp >= 16) {
         size_t len = strlen(sci);
         memcpy(out, sci, len + 1);
@@ -821,8 +723,6 @@ JAI_INLINE void sinkByteEscape(ValSink *s, unsigned byte) {
     sinkWrite(s, escaped, sizeof escaped);
 }
 
-/* Rendering only escapes ASCII and C1 controls here, so two hex digits cover
- * every call and avoid printf for each control byte. */
 JAI_INLINE void sinkControlEscape(ValSink *s, unsigned cp) {
     char escaped[6] = {'\\', 'u', '{', 0, 0, '}'};
     if (cp < 16) {
@@ -875,8 +775,8 @@ static void emitQuotedString(ValSink *s, const char *chars, size_t length) {
         if (len <= 0) len = 1;
         if (cp < 0 || (cp >= 0x80 && cp <= 0x9f)) {
             sinkWrite(s, run, (size_t)(p - run));
-            if (cp < 0) sinkByteEscape(s, (unsigned)c);  /* invalid UTF-8 */
-            else sinkControlEscape(s, (unsigned)cp);    /* C1 control */
+            if (cp < 0) sinkByteEscape(s, (unsigned)c); //invalid utf-8
+            else sinkControlEscape(s, (unsigned)cp);
             p += len;
             run = p;
         } else {
@@ -920,7 +820,6 @@ static void emitBytesLiteral(ValSink *s, const uint8_t *data, size_t length) {
     sinkWrite(s, "\"", 1);
 }
 
-/* Containers currently being rendered, innermost last; a repeat is a cycle. */
 static const Obj *renderStack[JAI_RENDER_MAX_DEPTH];
 static int renderDepth = 0;
 
@@ -933,8 +832,6 @@ JAI_INLINE bool renderInProgress(const Obj *o) {
 
 static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser);
 
-/* Returns false, having emitted `elision`, when `o` is already being
- * rendered or the depth limit is hit. */
 JAI_INLINE bool renderEnter(ValSink *s, const Obj *o, const char *elision) {
     if (renderInProgress(o) || renderDepth >= JAI_RENDER_MAX_DEPTH) {
         sinkStr(s, elision);
@@ -1005,7 +902,7 @@ static bool renderInstance(ValSink *s, ObjInstance *inst, bool repr, bool allowU
         } else if (!IS_NULL(k->dunderStr)) {
             dunder = vm.strStr;
         } else if (!IS_NULL(k->dunderRepr)) {
-            dunder = vm.strRepr;      /* str() falls back to repr() */
+            dunder = vm.strRepr;
         }
     }
     if (dunder == NULL) {
@@ -1020,7 +917,7 @@ static bool renderInstance(ValSink *s, ObjInstance *inst, bool repr, bool allowU
         if (vm.hasException) return false;
         sinkWrite(s, "<", 1);
         sinkStr(s, classNameOf(k));
-        sinkStr(s, " instance>");                     /* method vanished */
+        sinkStr(s, " instance>");
         return true;
     }
     if (!IS_STRING(out)) {
@@ -1030,7 +927,7 @@ static bool renderInstance(ValSink *s, ObjInstance *inst, bool repr, bool allowU
     }
 
     ObjString *str = AS_STRING(out);
-    bool rooted = tempRoot(out);          /* sinkWrite may allocate and collect */
+    bool rooted = tempRoot(out);
     sinkWrite(s, str->chars, str->length);
     tempUnroot(rooted);
     return true;
@@ -1042,7 +939,7 @@ static bool renderList(ValSink *s, ObjList *l, bool allowUser) {
         sinkReserve(s, (size_t)l->count * 3);
     sinkWrite(s, "[", 1);
     bool ok = true;
-    /* Re-read count each step: a user __repr__ may mutate the list. */
+
     for (int i = 0; i < l->count; i++) {
         if (i > 0) sinkWrite(s, ", ", 2);
         Value item = l->items[i];
@@ -1067,7 +964,7 @@ static bool renderTuple(ValSink *s, ObjTuple *t, bool allowUser) {
         ok = renderValue(s, t->items[i], true, allowUser);
         if (!ok) break;
     }
-    /* A one-tuple needs the trailing comma to stay distinguishable from (x). */
+
     if (ok && t->count == 1) sinkWrite(s, ",", 1);
     if (ok) sinkWrite(s, ")", 1);
     renderLeave();
@@ -1100,7 +997,6 @@ static bool renderDict(ValSink *s, ObjDict *d, bool allowUser) {
 }
 
 static bool renderSet(ValSink *s, ObjSet *set, bool allowUser) {
-    /* `{}` is the empty dict literal, so the empty set has to spell itself. */
     if (set->table.count == 0) { sinkStr(s, "set()"); return true; }
     if (!renderEnter(s, (const Obj *)set, "{...}")) return true;
     if ((size_t)set->table.count <= SIZE_MAX / 3)
@@ -1153,15 +1049,12 @@ static void renderRange(ValSink *s, ObjRange *r) {
     sinkInt(s, r->start);
     sinkWrite(s, r->inclusive ? "..=" : "..", r->inclusive ? 3 : 2);
     sinkInt(s, r->stop);
-    /* A stepped range has no `..` spelling; borrow the slice notation. */
     if (r->step != 1) {
         sinkWrite(s, ":", 1);
         sinkInt(s, r->step);
     }
 }
 
-/* Returns false only when a user dunder raised; the exception is then pending
- * and whatever was emitted so far is discarded by the caller. */
 static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser) {
     switch (jaiValueType(v)) {
         case VAL_NULL: sinkStr(s, "null"); return true;
@@ -1177,7 +1070,7 @@ static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser) {
     }
 
     switch (OBJ_TYPE(v)) {
-        case OBJ_STRBUF: break;   /* never reaches a Value */
+        case OBJ_STRBUF: break;
         case OBJ_STRING: {
             ObjString *str = AS_STRING(v);
             if (repr) emitQuotedString(s, str->chars, str->length);
@@ -1259,8 +1152,6 @@ static bool renderValue(ValSink *s, Value v, bool repr, bool allowUser) {
 }
 
 static ObjString *renderToString(Value v, bool repr) {
-    /* A scalar renders short and identically under str/repr, so it skips the
-     * buffer and root dance -- straight to the string, no malloc/free pair. */
     switch (jaiValueType(v)) {
     case VAL_INT: {
         char digits[JAI_INT_DIGITS];
@@ -1287,7 +1178,7 @@ static ObjString *renderToString(Value v, bool repr) {
     bool ok = renderValue(&sink, v, repr, true);
     tempUnroot(rooted);
 
-    if (!ok) {                       /* exception pending; the caller unwinds */
+    if (!ok) {
         jaiBufFree(&buf);
         return NULL;
     }
@@ -1297,10 +1188,7 @@ static ObjString *renderToString(Value v, bool repr) {
     return out;
 }
 
-/* --- f-string assembly ------------------------------------------- */
-
-/* Fallback for what measure-then-fill can't size up front (lists, dicts,
- * __str__ instances); parts are rooted by the caller's value stack (OP_FORMAT). */
+//fstring
 static ObjString *formatViaBuffer(const Value *parts, int count) {
     JaiBuf buf;
     jaiBufInit(&buf);
@@ -1309,7 +1197,7 @@ static ObjString *formatViaBuffer(const Value *parts, int count) {
     for (int i = 0; i < count; i++) {
         if (!renderValue(&sink, parts[i], false, true)) {
             jaiBufFree(&buf);
-            return NULL;                 /* a user dunder raised */
+            return NULL;
         }
     }
     ObjString *out = jaiStringNew(buf.data != NULL ? (const char *)buf.data : "",
@@ -1322,8 +1210,6 @@ ObjString *jaiValueFormat(const Value *parts, int count) {
     if (count <= 0) return jaiStringIntern("", 0);
     if (count > JAI_FMT_MAX_PARTS) return formatViaBuffer(parts, count);
 
-    /* Measure first, then fill: every scalar's length is known without a
-     * buffer, so scalars render once into scratch that assembly reads back. */
     char        scratch[JAI_FMT_MAX_PARTS][JAI_FLOAT_CHARS];
     const char *runs[JAI_FMT_MAX_PARTS];
     uint32_t    lens[JAI_FMT_MAX_PARTS];
@@ -1363,7 +1249,7 @@ ObjString *jaiValueFormat(const Value *parts, int count) {
 }
 
 ObjString *jaiValueToStr(Value v) {
-    if (IS_STRING(v)) return AS_STRING(v);   /* str() of a str is itself */
+    if (IS_STRING(v)) return AS_STRING(v);
     return renderToString(v, false);
 }
 
@@ -1374,7 +1260,5 @@ ObjString *jaiValueToRepr(Value v) {
 void jaiPrintValue(FILE *out, Value v, bool repr) {
     if (out == NULL) return;
     ValSink sink = {NULL, out};
-    /* allowUser = false: this runs from the disassembler and from traceback
-     * printing, where re-entering the interpreter is not safe. */
     (void)renderValue(&sink, v, repr, false);
 }
