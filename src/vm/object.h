@@ -15,21 +15,24 @@ struct ObjString {
     uint32_t length;      /* bytes, excluding NUL */
     uint32_t scalars;     /* UTF-8 scalar count, computed lazily (UINT32_MAX = unknown) */
     /* Memo for scalar indexing: cursorByte is the byte offset of scalar
-     * cursorScalar. Any byte above 127 makes finding an offset require
-     * decoding, so a lexer walking forward one scalar at a time would
-     * otherwise rescan from the start every step. Zero/zero always starts
-     * valid; this is a pure cache, never changing what the string is. */
+     * cursorScalar. Indexing is by scalar, so on a string holding any byte
+     * above 127 the offset has to be found by decoding — and a lexer walking
+     * forwards one scalar at a time would rescan from the start every step,
+     * which is quadratic. Zero/zero is always a valid starting memo. A pure
+     * cache: it never changes what the string is. */
     uint32_t cursorScalar;
     uint32_t cursorByte;
     uint64_t hash;
     /* `interned` lives in Obj.subFlag: a bool of its own here would be padded
      * out to eight bytes ahead of the flexible array. Use the accessor. */
-    /* A pointer, not a flexible array, so a string can address bytes it does
-     * not own -- a slice of a shared append buffer -- without touching the
-     * hundreds of places that read `s->chars`. Ordinary strings are still
-     * NUL-terminated; one whose terminator got overwritten by a later append
-     * into the same buffer is flagged, and jaiStringCStr is the only safe way
-     * to get a C string. */
+    /* A pointer, not a flexible array. For an ordinary string it addresses the
+     * bytes immediately after this header, which is the same layout the
+     * flexible array had plus one word. Making it a pointer is what lets a
+     * string address bytes it does not own -- a slice of a shared append
+     * buffer -- without changing any of the several hundred places that read
+     * `s->chars`. Ordinary strings are still NUL-terminated; a string whose
+     * terminator was overwritten by a later append into the same buffer is
+     * flagged, and jaiStringCStr is the only safe way to get a C string. */
     char    *chars;
     /* The buffer these bytes live in, or NULL when the string owns them.
      * Several strings share one buffer while a concatenation chain grows: an
@@ -38,8 +41,9 @@ struct ObjString {
     struct ObjStrBuf *owner;
 };
 
-/* Bytes to allocate for a string of `length` characters: header, bytes, NUL --
- * the header ends on an eight-byte boundary, so nothing is wasted between. */
+/* Bytes to allocate for a string of `length` characters: the header, then the
+ * bytes, then a NUL. The header now ends on an eight-byte boundary, so the
+ * bytes start immediately after it with nothing wasted between. */
 #define JAI_STRING_ALLOC(length) (sizeof(ObjString) + (size_t)(length) + 1)
 
 #define JAI_STR_INTERNED(s)      ((s)->obj.subFlag)
@@ -59,16 +63,17 @@ typedef struct ObjStrBuf {
  * terminator. Use this anywhere a bare `char *` is handed to printf or str*. */
 const char *jaiStringCStr(ObjString *s);
 
-/* Every string literal and identifier the compiler or deserialiser produces
- * goes through the intern table, so for interned strings pointer equality is
- * string equality -- what lets member/global lookup use jaiTableGetInterned.
- * Run-time strings are *not* interned; equality on them is always by content. */
+/* Interning: every string literal and identifier the compiler or the
+ * deserialiser produces goes through the intern table, so that for interned
+ * strings pointer equality is string equality — which is what lets member and
+ * global lookup use jaiTableGetInterned. Strings built at run time are *not*
+ * interned; equality on them is by content either way. */
 ObjString *jaiStringIntern(const char *chars, size_t length);
 ObjString *jaiStringInternC(const char *cstr);
-/* The interned twin of `s`, interning `s` itself if none exists. Needed before
- * using a run-time string as a key into a pointer-keyed table -- the
- * reflective paths only (get_field, module.get, exec's namespace), since
- * every compiler-emitted name arrives interned already. */
+/* The interned twin of `s`, interning `s` itself if none exists. Required
+ * before using a run-time string as a key into a pointer-keyed table — i.e.
+ * only on the reflective paths (get_field, module.get, exec's namespace),
+ * since every name the compiler emits arrives interned already. */
 ObjString *jaiStringCanonical(ObjString *s);
 /* Not interned. The constructor for any string that is data rather than a name. */
 ObjString *jaiStringNew(const char *chars, size_t length);
@@ -77,27 +82,39 @@ ObjString *jaiStringTake(char *chars, size_t length);
 ObjString *jaiStringConcat(ObjString *a, ObjString *b);
 /* The shared one-byte ASCII string. NULL for c >= 128. */
 ObjString *jaiStringChar(unsigned char c);
-/* The 128 one-byte strings, addressable as an array so compiled code can index
- * it directly. An entry is NULL until first asked for. */
-ObjString **jaiAsciiCharTable(void);
+/* Backing storage for the 128 one-byte ASCII strings (object_string.c owns
+ * writing to it: jaiStringChar fills a slot on first use, jaiMarkAsciiChars
+ * keeps filled slots alive across a collection). External linkage rather than
+ * file-static because jaiAsciiCharTable below has to reach it from any
+ * translation unit at zero cost -- the string iterator's per-character fast
+ * path (object_iter.c) reads one slot per scalar of a `for c in s` loop, and
+ * a real function call there was measurable on tests/bench/str_search. */
+extern ObjString *jaiAsciiChars[128];
+/* The 128 one-byte strings, addressable as an array so compiled code (and the
+ * string iterator) can index it directly. An entry is NULL until first asked
+ * for. `static inline` so every caller, including cross-TU ones, compiles
+ * this down to the bare array access it used to be when both sides lived in
+ * the same file. */
+static inline ObjString **jaiAsciiCharTable(void) { return jaiAsciiChars; }
 void       jaiMarkAsciiChars(void);
 /* Concatenates `count` byte runs into one string, sized exactly, under the
  * same run-time interning policy jaiStringNew applies. The runs must stay
  * valid across a collection — allocating the result can trigger one. */
 ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
                               int count, size_t total);
-/* An uninitialised string of exactly `length` bytes: the caller fills chars[]
- * (without allocating, since it's not yet rooted) then hands it to
- * jaiStringSeal, which applies the interning policy and returns the string to
- * use (an existing equal one, if interning found it). */
+/* An uninitialised string of exactly `length` bytes. The caller fills chars[]
+ * — without allocating, since the string is not yet rooted — and then hands it
+ * to jaiStringSeal, which applies the run-time interning policy and returns
+ * the string to use (an existing equal one, if interning found it). */
 ObjString *jaiStringReserve(size_t length);
 ObjString *jaiStringSeal(ObjString *s);
 ObjString *jaiStringSlice(ObjString *s, int64_t start, int64_t stop, int64_t step);
 uint32_t   jaiStringScalarCount(ObjString *s);
-/* The cached content hash, computed on first use, so a string that never
- * becomes a dict key or takes part in interning is never hashed at all (vs.
- * hashing eagerly, which meant walking e.g. a 2.2 MB join the program only
- * prints). Zero doubles as "not computed"; a real zero hash just recomputes. */
+/* The cached content hash, computed on first use. A string that never becomes
+ * a dict key and never takes part in interning is then never hashed at all:
+ * hashing in the constructor meant walking every byte of, for instance, the
+ * 2.2 MB result of a join that the program only prints. Zero doubles as "not
+ * computed yet"; a string that really does hash to zero just recomputes. */
 static inline uint64_t jaiStringHash(ObjString *s) {
     if (s->hash == 0) s->hash = jaiHashBytes(s->chars, s->length);
     return s->hash;
@@ -107,10 +124,11 @@ static inline uint64_t jaiStringHash(ObjString *s) {
 bool       jaiStringEqualsSlow(const ObjString *a, const ObjString *b);
 
 /* Inline because the callers are linear scans over parameter and field names
- * (vm.c bindCallArgs, jaiClassFieldInfo) run tens of millions of times per
- * compile, answered by the two cheap tests below for interned names. Out of
- * line, this was the second hottest function in the program by sample count
- * -- almost entirely the cost of the call, not of the work. */
+ * (vm.c bindCallArgs, jaiClassFieldInfo) that run tens of millions of times in
+ * a compile, and for interned names every one of those iterations answers from
+ * the two cheap tests below. Out of line, `jaiStringEquals` was the second
+ * hottest function in the whole program by sample count -- almost entirely the
+ * cost of calling it, not of anything it did. */
 static inline bool jaiStringEquals(const ObjString *a, const ObjString *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
@@ -149,11 +167,11 @@ Value    jaiListPop(ObjList *list);
 void     jaiListInsert(ObjList *list, int index, Value v);
 Value    jaiListRemove(ObjList *list, int index);
 void     jaiListReserve(ObjList *list, int capacity);
-/* Records a mutation the list functions above did not perform (an in-place
- * store through `items`, a sort, a direct write to `count`); any such site on
- * a list the program can already reach must call this or a live iterator
- * won't see the change. Exempt while the list hasn't escaped yet -- nothing
- * can be iterating it. */
+/* Records a mutation the list functions above did not perform: an in-place
+ * store through `items`, a sort, or a direct write to `count`. Any such site
+ * on a list the program can already reach must call this, or a live iterator
+ * will not see the change. Filling a list that has not escaped yet is exempt:
+ * nothing can be iterating it. */
 void     jaiListTouch(ObjList *list);
 ObjList *jaiListSlice(ObjList *list, int64_t start, int64_t stop, int64_t step);
 ObjList *jaiListConcat(ObjList *a, ObjList *b);
@@ -265,8 +283,9 @@ struct ObjFunction {
     uint16_t    paramCount;
     ExceptionEntry *exceptions;
     uint16_t    exceptionCount;
-    /* Entries so far, saturating at JAI_JIT_THRESHOLD: read by the compiled
-     * tier to decide when a function is worth compiling. */
+    /* Entries so far, saturating at JAI_JIT_THRESHOLD. The compiled tier reads
+     * it to decide when a function is worth compiling; it costs one increment
+     * on the call path and stops counting once hot. */
     uint16_t    entryCount;
     /* Entry point of this function's compiled form, or NULL. Owned by the JIT's
      * arena, which outlives every function, so this is not freed here. */
@@ -277,71 +296,70 @@ struct ObjFunction {
      * and returning one, calling itself directly. See jit_func.c. */
     uint8_t    *jitFunc;
     /* The module's global-mutation counter as it stood when each tier's form
-     * was built; a form is retired once a binding it resolved at compile time
-     * (class/closure/native) may have moved. NOT bumped by a write that merely
-     * updates a global to another inert value -- see jaiModuleSet and
-     * jaiValueIsInertGlobal.
+     * was built. Compiled code resolves a class, a closure or a native once;
+     * if any such binding may have moved since, that form is retired.
      *
-     * ONE PER TIER, and that is load-bearing: a shared field once let
-     * compileOsr re-arm a whole-function form that a rebinding had already
-     * retired, resurrecting stale baked callees. See tests/jit/rearm. */
+     * ONE PER TIER, and that is load-bearing. A single field let compileOsr
+     * re-arm a whole-function form that a rebinding had already retired: the
+     * function tier's guard compares against whatever the OSR tier last
+     * stored, so compiling a loop resurrected stale baked callees. See
+     * tests/jit/rearm. */
     uint32_t    jitFuncModuleVersion;
     uint32_t    jitOsrModuleVersion;
     /* A builtin resolved at compile time is pinned by the builtins module's
      * own version, the same way a module global is pinned by its module's. */
     uint32_t    jitBuiltinsVersion;
-    /* What the compiled form was specialised to: each parameter's kind, the
-     * class shape when that kind is an instance, and the return kind. The
-     * entry guard re-checks every one on every call. */
+    /* What the compiled form was specialised to: the kind of each parameter,
+     * the class shape where that kind is an instance, and the kind it returns.
+     * The entry guard re-checks every one on every call. */
     uint8_t     jitParamKind[4];
     uint32_t    jitParamShape[4];
     uint8_t     jitReturnKind;
     uint32_t    jitReturnShape;   /* class shape when the kind is an instance */
     uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */
     uint8_t     jitArgCount;
-    /* The compiled whole-function form never stores to the heap, so re-running
-     * it from the top is indistinguishable from not having run it -- which a
-     * caller that branched straight to its entry depends on: it can't hand the
-     * interpreter a half-finished callee frame, so a nonzero verdict must be
-     * answered by re-executing the whole call. */
+    /* The compiled whole-function form never stores to the heap, so running it
+     * again from the top is indistinguishable from not having run it. A caller
+     * that branched straight to its entry needs this: it cannot hand the
+     * interpreter a half-finished callee frame, so a nonzero verdict has to be
+     * answered by re-executing the whole call, and that is only sound when the
+     * abandoned attempt left nothing behind. */
     bool        jitFuncNoWrite;
     /* On-stack replacement: a compiled loop entered from the interpreter, with
-     * the interpreter's own slots as its locals -- what reaches a loop in a
-     * function that runs once (`main`, mostly). One form per loop head, not
-     * per function: a second offset meeting `osrTop != top` is refused, so
-     * e.g. `sieve`'s `main` only ever compiles its first of four loops. */
+     * the interpreter's own slots as its locals. This is what reaches a loop
+     * in a function that runs once -- `main`, mostly. */
+    /* One form per loop head, not one per function. `main` in `sieve` has
+     * four loops and only the first ever compiled, because a second offset met
+     * `osrTop != top` and was refused: the loop that does the sieving was
+     * interpreted for the life of the program. */
     JaiOsrForm  osrForms[JAI_OSR_MAX];
     uint8_t     osrCount;
-    /* Attempts so far. A body can only use a callee's return kind once that
-     * callee has itself compiled, which depends on tick timing, so one look
-     * isn't enough and refusing forever on the first miss made compilation
-     * timing-dependent.
-     *
-     * COUNTED PER LOOP HEAD: a single counter is a starvation bug, not just
-     * imprecision -- whichever loop ran first could spend the whole budget
-     * and get every OTHER loop in the body refused for the program's life
-     * with no decline ever reported (real case: word_freq's concatenation
-     * loop, which the tier can't compile, burning all 20 attempts before the
-     * 64%-of-benchmark scan loop got to run once). osrMissTop/osrMissAttempts
-     * split that budget by head; osrRefused means every head the table can
-     * hold is spent, and osrAttempts is the whole-function backstop for more
-     * uncompilable heads than the table has room for. */
+    /* Attempts so far. One look is not enough: a body can only use a callee's
+     * return kind once that callee has itself compiled, and which of them have
+     * depends on when the sampler happened to fire. Refusing forever on the
+     * first miss made compilation depend on tick timing. */
     uint8_t     osrAttempts;
+    /* Counted per loop head, not once per function: one counter starved every
+     * other loop once the first one spent the budget, which was invisible
+     * because a never-offered head reports no decline. Same attempts per head
+     * as before; osrAttempts is the backstop for more heads than fit here. */
     uint32_t    osrMissTop[JAI_OSR_MAX];
     uint8_t     osrMissAttempts[JAI_OSR_MAX];
     uint8_t     osrMissCount;
     uint8_t     jitAttempts;
     bool        osrRefused;
     /* The back edge enters the compiled loop directly. An entry that keeps
-     * declining (slots aren't the kinds it was compiled for) would otherwise
-     * pay a call per iteration for nothing -- cost `sieve` 20%. After a few in
-     * a row the back edge stops trying; the timer tick is the only way back in. */
+     * declining -- the slots are not the kinds it was compiled for -- would
+     * otherwise pay a call per iteration for nothing, which cost `sieve` 20%.
+     * After a few in a row the back edge stops trying and the timer tick is
+     * the only way back in. */
     bool        osrHot;
     uint8_t     osrDeclines;
-    /* Set once the tier has looked at this function and refused it. Without
-     * it, every call past the threshold pays a call into jaiJitEnter to be
-     * told no again -- 2.6% of `check lib/std`, for no benefit. A decline has
-     * to be free after the first one, the same lesson the loop back edge taught. */
+    /* Set once the tier has looked at this function and refused it. Without it
+     * every call past the threshold pays a call into jaiJitEnter to be told no
+     * again -- 2.6% of `check lib/std`, on a workload the tier does not help at
+     * all. A decline has to be free after the first one, which is the same
+     * lesson the loop back edge taught. */
     bool        jitRefused;
     /* Sampling ticks that landed in this function, saturating once hot. */
     uint16_t    tickCount;
@@ -361,20 +379,21 @@ struct ObjFunction {
     uint32_t   *defaultOffsets;
     ObjModule  *module;          /* defining module, for globals resolution */
     /* The class, trait or enum this function was declared in, or NULL for a
-     * free function. Set by OP_METHOD, which runs regardless of source vs.
-     * cached image, so needs no place in the image format. Visibility needs
-     * it because slot 0 answers "which class is running" only for a call
-     * through OP_INVOKE; a `static fn` reached in tail position arrives with
-     * the function here instead. */
+     * free function. Set by OP_METHOD, which runs whether the module came from
+     * source or from a cached image, so it needs no place in the image format.
+     * Visibility asks for it: slot 0 answers "which class is running" only for
+     * a call that went through OP_INVOKE, and a `static fn` reached in tail
+     * position arrives with the function there instead. */
     ObjClass   *owner;
 };
 
 ObjFunction *jaiFunctionNew(void);
 
 /* A deferred block is compiled as a thunk over the *defining* frame's slot
- * numbering and upvalue indices (spec §5.4: it reads/writes that function's
- * locals) -- nothing may renumber its slots, and the VM enters it with the
- * definer's window. `defer` is a keyword, so no user function can be named this. */
+ * numbering and upvalue indices (spec §5.4: it reads and writes that
+ * function's locals). Nothing may renumber its slots, and the VM enters it
+ * with the definer's window. `defer` is a keyword, so the name is unambiguous:
+ * no user function can be called this. */
 bool jaiFunctionIsDeferThunk(const ObjFunction *fn);
 
 struct ObjUpvalue {
@@ -385,9 +404,9 @@ struct ObjUpvalue {
 };
 
 ObjUpvalue *jaiUpvalueNew(Value *slot);
-/* An upvalue closed from the start, holding a copy of `v` -- how a `let` is
- * captured (spec §6): the closure keeps the value the binding had when built,
- * not the slot it lived in. */
+/* An upvalue that is closed from the start, holding a copy of `v`. This is how
+ * a `let` is captured (spec §6): the closure keeps the value the binding had
+ * when it was built, not the slot it lived in. */
 ObjUpvalue *jaiUpvalueClosed(Value v);
 
 struct ObjClosure {
@@ -409,10 +428,10 @@ struct ObjNative {
     ObjString   *name;
     int8_t       minArity;
     int8_t       maxArity;   /* -1 = variadic */
-    /* Parameter names, parallel to args[0..maxArity-1], beginning with the
-     * receiver for a method. NULL when the native declares none, making
-     * `f(key: v)` on it a TypeError instead of a silent misbind. Points at
-     * static storage owned by the method table. */
+    /* Parameter names, parallel to args[0..maxArity-1] and so beginning with
+     * the receiver for a method. NULL when the native declares none, which is
+     * what makes `f(key: v)` on it a TypeError instead of a silent misbind.
+     * Points at static storage owned by the method table. */
     const char *const *paramNames;
 };
 
@@ -464,12 +483,14 @@ struct ObjClass {
     JaiTable    statics;        /* ObjString* -> Value */
     JaiTable    getters;        /* ObjString* -> Value */
     JaiTable    setters;        /* ObjString* -> Value */
-    /* The non-public methods, name -> INT_VAL(vis | flags<<8 | ownerShape<<24).
-     * Only non-public methods appear, so `restricted.count == 0` (the common
-     * case) settles the visibility test for a whole class with one load
-     * instead of a hash probe on every dispatch -- a parallel MethodInfo array
-     * would cost a linear scan on the hottest path in the VM. The declaring
-     * class travels as its shapeId, so finding it needs no hashing. */
+    /* The non-public methods, name -> INT_VAL(vis | flags<<8 | ownerShape<<24),
+     * inherited entries copied down like the method tables themselves. Only
+     * non-public methods appear, so `restricted.count == 0` — every class in
+     * the common case — settles the runtime visibility test for a whole class
+     * with one load, instead of a hash probe on every dispatch. A parallel
+     * MethodInfo array would have cost a linear scan per lookup on the hottest
+     * path in the VM. The declaring class travels as its shapeId so that
+     * finding it is a walk up the superclass pointers with no hashing. */
     JaiTable    restricted;
     ObjTrait  **traits;
     uint16_t    traitCount;
@@ -528,8 +549,9 @@ typedef struct {
     uint8_t     arity;
     ObjString **fieldNames;
     /* The one value of a payload-less variant, made on first mention and
-     * shared from then on: with no state to tell two instances apart,
-     * `Color.Red is Color.Red` must hold (`is` is identity, spec §4.2).
+     * shared from then on. A variant with no payload has no state to tell two
+     * instances apart, so `Color.Red is Color.Red` has to hold — `is` is
+     * identity (spec §4.2) — and there is no reason to allocate twice.
      * NULL for a variant that takes a payload: those are built per call. */
     ObjEnumVal *unit;
     /* The callable form, for a variant that does take a payload. Cached for
@@ -543,10 +565,10 @@ struct ObjEnum {
     EnumVariant *variants;
     uint16_t     variantCount;
     JaiTable     methods;
-    /* Inline-cache key, from the same counter ObjClass.shapeId uses, so an
-     * enum way and a class way in one cache can never collide. Monotonic, so
-     * a freed enum whose address gets reused can't be mistaken for the
-     * original -- what makes caching members by identity safe at all. */
+    /* Inline-cache key, from the same counter ObjClass.shapeId uses so that an
+     * enum way and a class way in one cache can never collide. Monotonic, so a
+     * freed enum whose address gets reused cannot be mistaken for the original
+     * -- which is what makes caching members by identity safe at all. */
     uint32_t     shapeId;
 };
 
@@ -558,11 +580,13 @@ struct ObjEnumVal {
     Value    payload[];
 };
 
-/* The callable form of a variant that takes a payload: `Shape.Circle` alone
- * isn't a value the way `Color.Red` is, it's a *function* of its arguments
- * (how the checker types it), so `let make = Shape.Circle` and
- * `radii.map(Shape.Circle)` need to be ordinary code. Cached on the variant,
- * so two mentions give the same object. */
+/* The callable form of a variant that takes a payload.
+ *
+ * `Shape.Circle` on its own is not a value the way `Color.Red` is — it still
+ * needs its arguments. It is a *function* of them, which is how the checker
+ * types it, so it has to be one at run time too: `let make = Shape.Circle`
+ * and `radii.map(Shape.Circle)` are ordinary code. Cached on the variant, so
+ * two mentions give the same object. */
 struct ObjEnumCtor {
     Obj      obj;
     ObjEnum *type;
@@ -589,15 +613,17 @@ struct ObjModule {
     ObjString   *path;         /* absolute filesystem path */
     JaiTable     globals;      /* ObjString* -> Value */
     JaiTable     exports;      /* ObjString* -> BOOL_VAL(true) */
-    /* "Can compiled code still trust the bindings it baked in?" jit_func.c
-     * resolves a class/closure/native at compile time and calls it directly,
-     * so a rebinding must retire the compiled form; this moves on such a
-     * write and NOT on one that merely updates a global to another inert
-     * value (see jaiModuleSet, jaiValueIsInertGlobal).
+    /* "Can compiled code still trust the bindings it baked in?"
      *
-     * A NEW READER MUST PICK THE RIGHT COUNTER: anything memoising a global's
-     * VALUE or a resolved callee keys on this; anything memoising a table
-     * slot's address or a name's absence keys on globals.keyVersion instead. */
+     * jit_func.c resolves a class, a closure or a native at compile time and
+     * calls it directly, so a rebinding has to retire the compiled form. This
+     * moves on any write that could change such a binding, and NOT on one that
+     * merely updates a global to another inert value -- see jaiModuleSet and
+     * jaiValueIsInertGlobal.
+     *
+     * A NEW READER MUST PICK THE RIGHT COUNTER. Anything memoising a global's
+     * VALUE, or a resolved callee, keys on this. Anything memoising a table
+     * slot's address or the absence of a name keys on globals.keyVersion. */
     uint32_t     version;
     ModuleState  state;
     ObjClosure  *body;
@@ -613,9 +639,9 @@ bool       jaiModuleIsExported(ObjModule *m, ObjString *name);
 /* Iterators                                                            */
 /* ------------------------------------------------------------------ */
 
-/* ITER_USER drives spec §7.1's `__next__` dunder, ending on StopIteration;
- * ITER_TRAIT drives std.core's `trait Iterator`, whose `next` ends by
- * returning null. Both are user objects; a class may implement either. */
+/* ITER_USER drives spec §7.1's `__next__` dunder, which ends on StopIteration;
+ * ITER_TRAIT drives std.core's `trait Iterator`, whose `next` ends by returning
+ * null. Both are user objects, and a class may implement either. */
 typedef enum {
     ITER_LIST, ITER_TUPLE, ITER_STRING, ITER_DICT_KEYS, ITER_DICT_ITEMS,
     ITER_SET, ITER_RANGE, ITER_USER, ITER_TRAIT, ITER_GENERATOR
@@ -669,15 +695,19 @@ const char *jaiObjTypeName(ObjType t);
 /* Hashing                                                              */
 /* ------------------------------------------------------------------ */
 
-/* jaiValueHash with the one case that dominates real dictionaries -- a string
- * key -- settled inline, against an out-of-line call that maintains the
- * recursion guard and switches twice.
+/* jaiValueHash with the one case that dominates real dictionaries — a string
+ * key — settled inline, against an out-of-line call that maintains the
+ * recursion guard and switches twice. Everything else defers, so there is
+ * exactly one line here to keep in step with valueHashInner.
  *
- * Must go through jaiStringHash and not read `->hash` directly: the field is
- * lazy (zero means "not computed"), and reading it raw filed every such key
- * under hash 0 -- then the first later call that forced the hash rewrote the
- * field on the key the table was already holding, making that entry
- * unreachable through the very object keys() hands back. */
+ * It must go through jaiStringHash and not read `->hash`. The field is lazy:
+ * jaiStringSeal leaves it at zero for any run-time string past
+ * JAI_INTERN_MAX, and zero means "not computed yet". Reading it raw filed
+ * every such key under hash 0, and the first later call that did force the
+ * hash rewrote the field on the key the table was already holding — so the
+ * entry became unreachable through the very object keys() hands back, and
+ * `for k in d.keys() { k in d }` could be false. That is the line this comment
+ * used to claim did not need to exist. */
 JAI_INLINE uint64_t jaiValueHashFast(Value v, bool *ok) {
     if (IS_STRING(v)) {
         *ok = true;
