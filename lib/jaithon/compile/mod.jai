@@ -8,7 +8,8 @@
 #: built.ok()                       # true
 #: built.image.len() > 32           # true
 #: ```
-from jaithon.ast import Node, NodeKind, to_json, to_sexp
+from jaithon.ast import Node, NodeKind
+from jaithon.ast_encode import to_json, to_sexp
 from jaithon.compile.emit import ConstTag, FuncProto, emit, op_name
 from jaithon.compile.jaic import FLAG_DEBUG, FLAG_RELEASE, Module, disassemble
 from jaithon.compile.jaic import flags_for

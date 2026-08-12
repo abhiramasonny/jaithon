@@ -24,6 +24,7 @@
 # tree unable to compile at all, loudly, at `make seed-check`. That is the
 # intended failure: over-inclusion costs size, under-inclusion is caught.
 jaithon/ast.jai
+jaithon/ast_encode.jai
 jaithon/compile/check/assign.jai
 jaithon/compile/check/checker.jai
 jaithon/compile/check/ctx.jai
