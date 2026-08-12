@@ -1,12 +1,6 @@
 #: Data structures: stacks and queues, search trees, graphs, matrices and
 #: string indexes.
 #:
-#: This module is the front door of the package. It defines `Stack` and `Queue`
-#: — thin wrappers that give a list and a `Deque` the interface and the
-#: guarantees each name promises — and re-exports everything from `std.ds.tree`,
-#: `std.ds.graph`, `std.ds.matrix` and `std.ds.text`, so `import std.ds` is
-#: enough for all of them.
-#:
 #: ```
 #: from std.ds import Stack, Graph
 #: let stack = Stack[int]()

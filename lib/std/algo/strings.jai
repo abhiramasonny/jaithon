@@ -1,41 +1,14 @@
 #: String algorithms that need a real construction rather than a scan.
 #:
-#: `std.str` covers what a program does to one string at a time — padding,
-#: case, distance, escaping. This module holds the algorithms that build an
-#: index, a code or a transform first, and it is where the linear-time
-#: classics live:
-#:
-#:   palindrome_radii / longest_palindrome   Manacher, O(n).
-#:   z_function / prefix_function            The two linear scans the rest of
-#:                                           string matching is built from.
-#:   SuffixAutomaton                         Every substring of a text, as a
-#:                                           DFA with O(n) states.
-#:   minimal_rotation                        Booth, O(n).
-#:   diff                                    Myers, O((n + m) * d).
-#:
-#: The compression half is a working pipeline rather than a museum:
-#: `bwt_encode` sorts equal characters next to each other, `rle_encode`
-#: shortens the runs that creates, and `HuffmanCode` codes what is left —
-#: which is bzip2. `lz77_compress` is the other classic answer to the same
-#: problem. `base64_encode` and `hex_encode` then move the result through a
-#: text-only channel, and `crc32` and `fnv1a` say whether it arrived intact.
-#:
-#: Byte-oriented functions take and return `list[int]` whose elements are all
-#: in 0..=255; `utf8_encode` and `utf8_decode` convert between those and `str`.
-#: Everything else treats a string as a sequence of Unicode scalar values, so
-#: indices and lengths agree with `str.len()`.
-#:
-#: See `std.ds.text` for the indexes built by sorting instead: a trie, a suffix
-#: array and a rolling hash.
+#: Byte-oriented functions take and return `list[int]` restricted to 0..=255;
+#: everything else treats a string as Unicode scalar values matching `str.len()`.
 from std.algo.sort import sort_by, natural_order
 
-# Shortest match LZ77 will encode as a back-reference: a two-character match
-# costs more to store than the literals it replaces.
+# A two-character match costs more to store than the literals it replaces.
 const MIN_MATCH = 3
 
-# Back-references examined per position. Bounding the hash chain is what keeps
-# compression linear on input like "aaaa..." where every position is a
-# candidate; raising it buys a slightly better ratio for a lot of time.
+# Bounds the hash chain so compression stays linear on repetitive input like
+# "aaaa..."; raising it trades a slightly better ratio for a lot of time.
 const MAX_CHAIN = 64
 
 const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -70,9 +43,8 @@ let _SOUNDEX_DIGITS: dict[str, str] = {
 
 #: One step of an edit script, as produced by `diff`.
 #:
-#: `before_index` indexes the old sequence and `after_index` the new one. An
-#: `Insert` names only the new position, a `Delete` only the old one, and a
-#: `Keep` both — which is what lets a renderer print two aligned columns.
+#: An `Insert` names only the new position, a `Delete` only the old one, and
+#: a `Keep` both — enough for a renderer to print two aligned columns.
 pub enum DiffOp {
     #: `line` is common to both sides and survives the edit untouched.
     Keep(before_index: int, after_index: int, line: str),
@@ -88,11 +60,8 @@ pub enum DiffOp {
 
 #: A single LZ77 instruction: copy, then emit one literal.
 #:
-#: Copy `length` characters starting `distance` characters back from the end of
-#: the output, then append `literal`. `length` is 0 when no back-reference was
-#: found, and `literal` is empty when the input ended on a match. `distance`
-#: may be smaller than `length`: the copy is character by character, so
-#: `LZ77Token(1, 5, "")` repeats the previous character five times.
+#: `distance` may be smaller than `length` — the copy is character by
+#: character, so `LZ77Token(1, 5, "")` repeats the previous character five times.
 pub class LZ77Token {
     #: How far back the copy starts, in characters; 0 when there is no copy.
     pub let distance: int
@@ -115,15 +84,9 @@ pub class LZ77Token {
 
 #: Every substring of a text, as a deterministic automaton with O(n) states.
 #:
-#: Built by Blumer's online construction, one character at a time, in O(n) for
-#: a fixed alphabet. A walk from the start state spells a substring, so
-#: `contains` costs the length of the pattern with no preprocessing of the
-#: pattern at all — the mirror image of KMP, and the right structure when one
-#: text is searched for many patterns.
-#:
-#: The suffix links form a tree whose subtree sizes are occurrence counts,
-#: which is what `count` uses; the state lengths give the number of distinct
-#: substrings without enumerating them.
+#: The mirror image of KMP: no preprocessing of the pattern, so `contains`
+#: costs its length — the right structure when one text is searched for many
+#: patterns.
 #:
 #: ```
 #: let sam = SuffixAutomaton("banana")
@@ -136,8 +99,7 @@ pub class SuffixAutomaton {
     var transitions: list[dict[str, int]]
     var link: list[int]
     var length: list[int]
-    # 1 for a state a character created, 0 for a clone: the occurrences a state
-    # owns before anything is summed up the suffix-link tree.
+    # 1 for a state a character created, 0 for a clone.
     var owned: list[int]
     var counts: list[int]
     var last: int
@@ -174,10 +136,8 @@ pub class SuffixAutomaton {
             if self.length[p] + 1 == self.length[q] {
                 self.link[current] = q
             } else {
-                # `q` stands for occurrences both longer and shorter than
-                # length[p] + 1, and only the shorter ones may follow `p`. It
-                # splits into a clone carrying those and the original keeping
-                # the rest.
+                # `q` covers occurrences both longer and shorter than
+                # length[p] + 1; splits into a clone carrying the shorter ones.
                 let clone = self._new_state(self.length[p] + 1, 0)
                 self.transitions[clone] = {k: v for (k, v) in self.transitions[q].items()}
                 self.link[clone] = self.link[q]
@@ -200,8 +160,8 @@ pub class SuffixAutomaton {
 
     #: Number of occurrences of `pattern`, overlaps included.
     #:
-    #: O(pattern length), after an O(n) propagation on the first call following
-    #: a change. The empty string is reported as 0 rather than n + 1.
+    #: The first call after a change costs O(n) to propagate counts; the empty
+    #: string reports 0, not `n + 1`.
     pub fn count(self, pattern: str) -> int {
         if pattern.len() == 0 { return 0 }
         let state = self._walk(pattern)
@@ -224,10 +184,7 @@ pub class SuffixAutomaton {
 
     #: Return the longest string occurring in both the text and `other`.
     #:
-    #: O(other.len()): walk `other` through the automaton, following suffix
-    #: links whenever the next character has no transition, which shortens the
-    #: current match by exactly as much as it must. Ties resolve to the
-    #: earliest run in `other`.
+    #: O(other.len()). Ties resolve to the earliest run in `other`.
     pub fn longest_common_substring(self, other: str) -> str {
         var state = 0
         var length = 0
@@ -273,13 +230,9 @@ pub class SuffixAutomaton {
 
     #: Sum occurrence counts up the suffix-link tree.
     #:
-    #: A state occurs wherever its children in that tree do, and a child is
-    #: always longer than its parent. Ordering the states by length with a
-    #: counting sort therefore puts every child before its parent, which is all
-    #: the ordering the sum needs — no recursion over the tree.
-    #:
-    #: The sum starts from `owned` rather than from the previous totals, so
-    #: extending the text after counting stays correct.
+    #: Ordering states by length via counting sort puts every child before its
+    #: parent, so one linear pass suffices — no recursion. Starts from `owned`,
+    #: not previous totals, so a later `extend` recounts correctly.
     fn _ensure_counts(self) -> void {
         if self.counted { return }
         let states = self.link.len()
@@ -317,12 +270,9 @@ pub class SuffixAutomaton {
 
 #: A canonical Huffman code: an optimal prefix code over a known alphabet.
 #:
-#: The code lengths come from the two-queue construction, which is O(k log k)
-#: for the initial sort and O(k) after it — no heap, because merged weights
-#: come out in non-decreasing order and so stay ordered in a plain queue. The
-#: codes themselves are then assigned canonically: shortest first, and
-#: alphabetically within one length. That makes the table reproducible across
-#: runs and means a decoder needs only the code lengths, never the tree.
+#: The two-queue construction needs no heap — merged weights come out
+#: non-decreasing, so they stay ordered in a plain queue. Codes are assigned
+#: canonically, so the table is reproducible and a decoder needs only the lengths.
 #:
 #: ```
 #: let code = HuffmanCode.from_text("abracadabra")
@@ -332,14 +282,11 @@ pub class SuffixAutomaton {
 #: ```
 pub class HuffmanCode {
     var codes: dict[str, str]
-    # Indexed by code length: the numeric value of a code of that length maps
-    # back to its symbol. Decoding is then one dict probe per bit.
+    # Indexed by code length: the numeric value maps back to its symbol, so
+    # decoding is one dict probe per bit.
     var by_length: list[dict[int, str]]
 
     #: Build the code for a symbol-to-frequency table.
-    #:
-    #: Raises `ValueError` on an empty table, a symbol that is not exactly one
-    #: character, or a frequency below 1.
     pub fn init(self, frequencies: dict[str, int]) {
         self.codes = {}
         self.by_length = [{}]
@@ -356,9 +303,8 @@ pub class HuffmanCode {
             }
         }
         let lengths = _huffman_lengths(alphabet, frequencies)
-        # Canonical assignment: add one, then shift left by the growth in
-        # length. The code stays prefix-free because a longer code always
-        # extends a value one past every shorter one.
+        # Add one, then shift by the growth in length: stays prefix-free
+        # because a longer code always extends a value one past every shorter one.
         var value = 0
         var previous = 0
         for symbol in sort_by(alphabet, |a, b| _by_length_then_symbol(lengths, a, b)) {
@@ -384,8 +330,6 @@ pub class HuffmanCode {
     }
 
     #: Encode `text` as a string of "0" and "1".
-    #:
-    #: Raises `KeyError` on a character the code was not built for.
     pub fn encode(self, text: str) -> str {
         let out: list[str] = []
         for ch in text {
@@ -396,9 +340,6 @@ pub class HuffmanCode {
     }
 
     #: Decode a string of "0" and "1" produced by `encode`.
-    #:
-    #: Raises `ValueError` on a character other than "0" or "1", or on trailing
-    #: bits that complete no code.
     pub fn decode(self, bits: str) -> str {
         let out: list[str] = []
         var value = 0
@@ -407,8 +348,8 @@ pub class HuffmanCode {
             if bit != "0" and bit != "1" { throw ValueError(f"expected a bit, got '{bit}'") }
             value = value * 2 + (bit == "1" ? 1 : 0)
             length += 1
-            # The code is prefix-free, so the first value that is a code is the
-            # only one it can be: no lookahead and no backtracking.
+            # Prefix-free, so the first value that is a code is the only one
+            # it can be: no lookahead or backtracking.
             if length < self.by_length.len() and value in self.by_length[length] {
                 out.push(self.by_length[length][value])
                 value = 0
@@ -426,22 +367,15 @@ pub class HuffmanCode {
 
 #: Return the radius of the longest palindrome centred at every position.
 #:
-#: Manacher's algorithm, O(n). The result has `2 * text.len() + 1` entries, one
-#: per character and one per gap: index `2 * i + 1` centres on character `i`
-#: and an even index centres on the gap before character `index / 2`. The value
-#: is the **length in the original string** of the palindrome centred there, so
-#: odd-length palindromes sit at odd indices and even-length ones at even
-#: indices.
-#:
-#: Every question about the palindromes of a string is a scan of this array:
-#: the longest one, how many there are, whether a given slice is one.
+#: Manacher's algorithm, O(n). Index `2 * i + 1` centres on character `i`, an
+#: even index on the gap before it; the value is length in the original string.
 #:
 #: ```
 #: palindrome_radii("aba")   # [0, 1, 0, 3, 0, 1, 0]
 #: ```
 pub fn palindrome_radii(text: str) -> list[int] {
-    # Interleaving a separator that cannot occur in the input makes every
-    # palindrome odd-length, which collapses the two cases into one.
+    # A separator absent from the input makes every palindrome odd-length,
+    # collapsing the two cases into one.
     let scan: list[int] = [-1]
     for ch in text {
         scan.push(ord(ch))
@@ -452,9 +386,8 @@ pub fn palindrome_radii(text: str) -> list[int] {
     var center = 0
     var right = 0
     for i in 0..width {
-        # Inside the rightmost palindrome found so far, the mirror position
-        # already answers this one — up to the point where it would reach past
-        # the edge, which is the only part that has to be tested.
+        # Inside the rightmost palindrome so far, the mirror position already
+        # answers this one, up to where it would reach past the edge.
         if i < right { radii[i] = min(right - i, radii[2 * center - i]) }
         while i - radii[i] - 1 >= 0 and
             i + radii[i] + 1 < width and
@@ -496,9 +429,8 @@ pub fn longest_palindrome(text: str) -> str {
 #: Return, for every position of `text`, the length of the longest prefix of
 #: `text` that starts there.
 #:
-#: The Z-array, in O(n). `z[0]` is the whole length by convention. To find
-#: every occurrence of a pattern, run this over `pattern + "\0" + text` and
-#: look for entries equal to `pattern.len()`.
+#: The Z-array, O(n). To find every occurrence of a pattern, run this over
+#: `pattern + "\0" + text` and look for entries equal to `pattern.len()`.
 #:
 #: ```
 #: z_function("aabxaab")   # [7, 1, 0, 0, 3, 1, 0]
@@ -509,8 +441,8 @@ pub fn z_function(text: str) -> list[int] {
     let z = [0 for _ in 0..n]
     if n == 0 { return z }
     z[0] = n
-    # [left, right) is the match with the furthest right edge seen so far; a
-    # position inside it starts from its mirror instead of from zero.
+    # [left, right) is the furthest-reaching match so far; a position inside
+    # it starts from its mirror instead of from zero.
     var left = 0
     var right = 0
     for i in 1..n {
@@ -526,14 +458,8 @@ pub fn z_function(text: str) -> list[int] {
 
 #: Return, for every prefix of `text`, the length of its longest proper border.
 #:
-#: A border is a string that is both a prefix and a suffix of the prefix ending
-#: at that position. This is the KMP failure function, in O(n): after a
-#: mismatch at position `i` of a pattern, matching resumes at
-#: `prefix_function(pattern)[i - 1]` without re-reading a character of the
-#: text.
-#:
-#: `n - border[n - 1]` is also the shortest period of the string, which is how
-#: to test in linear time whether a string is a repetition of a shorter one.
+#: The KMP failure function: after a mismatch at position `i`, matching
+#: resumes at `prefix_function(pattern)[i - 1]`.
 #:
 #: ```
 #: prefix_function("abcabcd")   # [0, 0, 0, 1, 2, 3, 0]
@@ -555,9 +481,7 @@ pub fn prefix_function(text: str) -> list[int] {
 
 #: Return the starting index of the lexicographically smallest rotation.
 #:
-#: Booth's algorithm: one failure function over `text + text`, carrying the
-#: best candidate start as it scans, in O(n) time and O(n) memory. Building all
-#: n rotations and taking the minimum is O(n^2).
+#: Booth's algorithm, O(n) — building all n rotations and taking the minimum is O(n^2).
 #:
 #: ```
 #: least_rotation_index("cabbage")   # 1
@@ -573,8 +497,7 @@ pub fn least_rotation_index(text: str) -> int {
         let here = codes[j]
         var i = failure[j - best - 1]
         while i != -1 and here != codes[best + i + 1] {
-            # The candidate starting at `best` has just lost to one starting
-            # inside the part already matched; that later start takes over.
+            # `best` just lost to a candidate inside the part already matched.
             if here < codes[best + i + 1] { best = j - i - 1 }
             i = failure[i]
         }
@@ -590,9 +513,8 @@ pub fn least_rotation_index(text: str) -> int {
 
 #: Return the lexicographically smallest rotation of `text`.
 #:
-#: The canonical form of a cyclic string: two strings are rotations of each
-#: other exactly when their minimal rotations are equal, so this is how to key
-#: a cycle in a dict.
+#: The canonical form of a cyclic string — two strings are rotations of each
+#: other exactly when their minimal rotations are equal; use this to key a cycle in a dict.
 #:
 #: ```
 #: minimal_rotation("cabbage")                          # "abbagec"
@@ -606,10 +528,7 @@ pub fn minimal_rotation(text: str) -> str {
 
 #: Collapse `text` into (character, run length) pairs.
 #:
-#: O(n). Runs come back as pairs rather than as a packed string because a
-#: packed string cannot be read back unambiguously once the text itself
-#: contains digits. Pair it with `bwt_encode`, which is what makes long runs
-#: appear in ordinary text in the first place.
+#: Pairs, not a packed string: a packed string is ambiguous once the text itself contains digits.
 #:
 #: ```
 #: rle_encode("aaabbc")   # [("a", 3), ("b", 2), ("c", 1)]
@@ -628,9 +547,6 @@ pub fn rle_encode(text: str) -> list[tuple[str, int]] {
 }
 
 #: Expand (character, run length) pairs back into a string.
-#:
-#: Raises `ValueError` on a symbol that is not exactly one character, or on a
-#: run length below 1.
 #:
 #: ```
 #: rle_decode([("a", 3), ("b", 2)])   # "aaabb"
@@ -651,14 +567,9 @@ pub fn rle_decode(runs: list[tuple[str, int]]) -> str {
 
 #: Return the Burrows-Wheeler transform of `text` and the row of the original.
 #:
-#: The last column of the sorted table of all rotations of `text`. Characters
-#: that share a following context end up next to each other, which is what
-#: makes `rle_encode` and then `HuffmanCode` pay off — this is the front of the
-#: bzip2 pipeline. The transform is reversible from the returned row index
-#: alone, so no sentinel character has to be reserved.
-#:
-#: The rotations are ordered by prefix doubling, O(n log^2 n), rather than by
-#: comparing rotations character by character, O(n^2 log n).
+#: Reversible from the row index alone, so no sentinel character is needed.
+#: Rotations are ordered by prefix doubling, O(n log^2 n), not by comparing
+#: them character by character, O(n^2 log n).
 #:
 #: ```
 #: bwt_encode("banana")   # ("nnbaaa", 3)
@@ -679,9 +590,6 @@ pub fn bwt_encode(text: str) -> tuple[str, int] {
 
 #: Invert `bwt_encode`, given the last column and the original's row.
 #:
-#: O(n): one pass to rank the column and one to walk the LF mapping backwards.
-#: Raises `ValueError` when `row` is out of range.
-#:
 #: ```
 #: bwt_decode("nnbaaa", 3)   # "banana"
 #: ```
@@ -693,9 +601,8 @@ pub fn bwt_decode(last_column: str, row: int) -> str {
         return ""
     }
     if row < 0 or row >= n { throw ValueError(f"row must be in 0..{n}, got {row}") }
-    # rank[i] counts the copies of chars[i] before position i. The i-th copy of
-    # a character in the last column is also the i-th in the sorted first
-    # column, and that correspondence is the whole of the LF mapping.
+    # rank[i] counts copies of chars[i] before i; the i-th copy in the last
+    # column is also the i-th in the sorted first column — the LF mapping.
     let counts: dict[str, int] = {}
     let rank = [0 for _ in 0..n]
     for i in 0..n {
@@ -722,15 +629,9 @@ pub fn bwt_decode(last_column: str, row: int) -> str {
 
 #: Compress `text` into LZ77 copy-then-literal tokens.
 #:
-#: Matches are found through a hash chain over three-character prefixes: `head`
-#: holds the most recent position of each trigram and `previous` chains the
-#: older ones, so a position only ever examines places that really do share
-#: three characters. Each walk is capped at `MAX_CHAIN` links and at `window`
-#: characters, which bounds the whole compression at O(n) for repetitive input
+#: A hash chain over three-character prefixes, each walk capped at
+#: `MAX_CHAIN` and `window` — bounds compression at O(n) for repetitive input
 #: instead of O(n^2).
-#:
-#: `window` is how far back a copy may reach and `max_length` how long one may
-#: be; both trade ratio against the size of an encoded token.
 #:
 #: ```
 #: let tokens = lz77_compress("abcabcabc")
@@ -773,8 +674,8 @@ pub fn lz77_compress(text: str, window: int = 4096, max_length: int = 18) -> lis
             best_length = 0
             best_distance = 0
         }
-        # Index every position the token covers, the one the literal consumes
-        # included, or a later match would never see inside this copy.
+        # Index every position the token covers (literal included), or a later
+        # match would never see inside this copy.
         let covered = min(position + max(best_length, 1), n)
         for j in position..covered {
             if j + MIN_MATCH <= n {
@@ -792,8 +693,8 @@ pub fn lz77_compress(text: str, window: int = 4096, max_length: int = 18) -> lis
 
 #: Rebuild the text that `lz77_compress` produced these tokens from.
 #:
-#: O(output length). Raises `ValueError` on a distance reaching before the
-#: start of the output, which is the one way a token stream can be malformed.
+#: O(output length). A distance reaching before the output's start is the one
+#: malformed case checked.
 #:
 #: ```
 #: lz77_decompress([LZ77Token(0, 0, "a"), LZ77Token(1, 3, "")])   # "aaaa"
@@ -806,8 +707,8 @@ pub fn lz77_decompress(tokens: list[LZ77Token]) -> str {
                 throw ValueError(f"distance must be in 1..={out.len()}, got {token.distance}")
             }
             let start = out.len() - token.distance
-            # Reading through the tail as it grows is deliberate: that is how a
-            # distance shorter than the length encodes a repeating run.
+            # Deliberate: reading through the growing tail is how a distance
+            # shorter than the length encodes a repeating run.
             for offset in 0..token.length { out.push(out[start + offset]) }
         }
         if token.literal.len() > 0 { out.push(token.literal) }
@@ -845,10 +746,8 @@ pub fn utf8_encode(text: str) -> list[int] {
 
 #: Decode UTF-8 bytes into a string.
 #:
-#: Raises `ValueError` on a truncated sequence or on a byte that can neither
-#: start nor continue one, rather than substituting a replacement character: a
-#: decoder that silently repairs its input hides the corruption that produced
-#: it.
+#: Raises rather than substituting a replacement character: silently repairing
+#: invalid input would hide the corruption that produced it.
 #:
 #: ```
 #: utf8_decode([104, 195, 169])   # "hé"
@@ -902,7 +801,7 @@ pub fn base64_encode(data: list[int]) -> str {
     let out: list[str] = []
     let n = data.len()
     var index = 0
-    # Three bytes are 24 bits, which is exactly four six-bit digits.
+    # Three bytes are 24 bits: exactly four six-bit digits.
     while index + 2 < n {
         let chunk = data[index] << 16 | data[index + 1] << 8 | data[index + 2]
         out.push(_base64_digit(chunk >> 18))
@@ -929,10 +828,8 @@ pub fn base64_encode(data: list[int]) -> str {
 
 #: Decode base64 back into bytes.
 #:
-#: ASCII whitespace is skipped, so text wrapped at 76 columns decodes as it
-#: stands, and everything from the first `=` on is ignored. Raises `ValueError`
-#: on a character outside the alphabet or on a final group of one digit, which
-#: encodes no whole byte.
+#: ASCII whitespace is skipped, so 76-column-wrapped text decodes as-is;
+#: everything from the first `=` on is ignored.
 #:
 #: ```
 #: utf8_decode(base64_decode("aGVsbG8="))   # "hello"
@@ -991,8 +888,6 @@ pub fn hex_encode(data: list[int], upper: bool = false) -> str {
 
 #: Decode hexadecimal, in either case, back into bytes.
 #:
-#: Raises `ValueError` on an odd number of digits or on a non-hex character.
-#:
 #: ```
 #: hex_decode("ff0010")   # [255, 0, 16]
 #: ```
@@ -1017,10 +912,7 @@ pub fn hex_decode(text: str) -> list[int] {
 
 #: Return the CRC-32 checksum of `data`, as used by zip, gzip and PNG.
 #:
-#: The reflected IEEE 802.3 polynomial, computed bit by bit: eight shifts per
-#: byte and no 256-entry table to build or carry. A CRC detects accidental
-#: corruption, burst errors especially; it is not a hash, and forging a
-#: collision for one is arithmetic, not work.
+#: Not a hash: forging a collision for a CRC is arithmetic, not work.
 #:
 #: ```
 #: crc32(utf8_encode("hello"))   # 907060870
@@ -1041,10 +933,7 @@ pub fn crc32(data: list[int]) -> int {
 
 #: Return the 32-bit FNV-1a hash of `data`.
 #:
-#: One xor and one multiply per byte, which makes it the cheapest hash worth
-#: using for short keys: dict keys, string interning, bloom filters. Like every
-#: non-cryptographic hash it is easy to find collisions for, so never use it on
-#: input an adversary chooses.
+#: Non-cryptographic: never use it on input an adversary chooses.
 #:
 #: ```
 #: fnv1a(utf8_encode("hello"))   # 1335831723
@@ -1061,14 +950,9 @@ pub fn fnv1a(data: list[int]) -> int {
 
 #: Return the four-character Soundex key of `name`.
 #:
-#: An initial letter and three digits standing for the consonant sounds after
-#: it, so that names spelled differently but said alike collide. Vowels, `H`
-#: and `W` drop out, but only a vowel resets the rule that collapses a repeated
-#: digit — which is why the `2` and `1` of `Ashcraft` survive the `H` between
-#: them. Non-letters are ignored, and a name with no letters returns "".
-#:
-#: Soundex is coarse and English-specific. `metaphone` is the better key for
-#: anything beyond the surname matching this was designed for in 1918.
+#: `H` and `W` don't reset the digit-collapse rule (only a vowel does), which
+#: is why the `2` and `1` of `Ashcraft` survive the `H` between them. Coarse
+#: and English-specific — `metaphone` is the better key for most uses.
 #:
 #: ```
 #: soundex("Robert")     # "R163"
@@ -1098,15 +982,8 @@ pub fn soundex(name: str) -> str {
 
 #: Return the Metaphone key of `word`.
 #:
-#: Lawrence Philips' original 1990 rules: the word is rewritten as the
-#: consonant sounds of English, with `0` standing for the "th" sound and `X`
-#: for "sh". Unlike Soundex the key has no fixed length and keeps the order of
-#: the sounds, so it discriminates far better on ordinary words. Vowels survive
-#: only in first position, and silent letters — the `K` of `knight`, the `GH`
-#: of `night`, the `B` of `lamb` — go by rule rather than by table.
-#:
-#: Non-letters are ignored. This is the original algorithm, not Double
-#: Metaphone: one key per word, and tuned for English.
+#: `0` stands for the "th" sound, `X` for "sh"; silent letters go by rule
+#: rather than by table.
 #:
 #: ```
 #: metaphone("phone")                          # "FN"
@@ -1119,11 +996,10 @@ pub fn metaphone(word: str) -> str {
     if n == 0 { return "" }
     let out: list[str] = []
     var index = 0
-    # Where the word's first sound begins. Dropping a silent first letter moves
-    # it, so that the `E` of "aero" is still an initial vowel and survives.
+    # Where the word's first sound begins; dropping a silent first letter
+    # moves it, so the `E` of "aero" is still an initial vowel.
     var first_sound = 0
-    # Silent first letters, which no later rule can catch because they are
-    # silent only at the very start.
+    # Silent only at the very start, so no later rule can catch these.
     let opening = n >= 2 ? letters[0] + letters[1] : ""
     if opening == "AE" or opening == "GN" or opening == "KN" or opening == "PN" or opening == "WR" {
         index = 1
@@ -1232,9 +1108,8 @@ pub fn metaphone(word: str) -> str {
 
 #: Split `text` into word tokens.
 #:
-#: A token is a maximal run of letters and digits, keeping an apostrophe that
-#: stands between two of them, so `don't` is one token. Case is preserved;
-#: `word_frequency` folds it.
+#: A token is a maximal run of letters and digits, keeping an apostrophe
+#: between two of them, so `don't` is one token. Case is preserved.
 #:
 #: ```
 #: tokenize("Don't stop, it's fine!")   # ["Don't", "stop", "it's", "fine"]
@@ -1294,10 +1169,6 @@ pub fn top_words(text: str, count: int) -> list[tuple[str, int]] {
 
 #: Return every contiguous run of `size` characters in `text`.
 #:
-#: Character n-grams are the standard feature for language detection and fuzzy
-#: matching: two strings sharing many of them are similar however their words
-#: are ordered.
-#:
 #: ```
 #: char_ngrams("hello", 2)   # ["he", "el", "ll", "lo"]
 #: ```
@@ -1314,9 +1185,7 @@ pub fn char_ngrams(text: str, size: int) -> list[str] {
 
 #: Return every run of `size` consecutive tokens of `text`, space-joined.
 #:
-#: Joining makes an n-gram usable as a dict key, which is what a phrase count
-#: or a language model needs. Tokens never contain a space, so `split(" ")`
-#: takes one apart again.
+#: Tokens never contain a space, so `split(" ")` takes one apart again.
 #:
 #: ```
 #: word_ngrams("a b c d", 2)   # ["a b", "b c", "c d"]
@@ -1335,16 +1204,8 @@ pub fn word_ngrams(text: str, size: int) -> list[str] {
 
 #: Return a shortest edit script turning `before` into `after`.
 #:
-#: Myers' algorithm: O((n + m) * d) time for an edit distance of d, so the cost
-#: follows how different the two sequences are rather than how long they are.
-#: That is why it is the diff every version control system uses — two revisions
-#: of a file are mostly the same file. The trace kept to rebuild the script
-#: costs O((n + m) * d) memory.
-#:
-#: The script is in output order and holds exactly one operation per element of
-#: each side: applying `Keep` and `Insert` in order rebuilds `after`, and the
-#: number of `Delete` and `Insert` operations is the edit distance. A changed
-#: line appears as a `Delete` followed by an `Insert`.
+#: Myers' algorithm: O((n + m) * d) for an edit distance of d, so cost follows
+#: how different the sequences are, not how long — why every VCS uses this.
 #:
 #: ```
 #: diff(["a", "b", "c"], ["a", "x", "c"])
@@ -1355,7 +1216,7 @@ pub fn diff(before: list[str], after: list[str]) -> list[DiffOp] {
     let n = before.len()
     let m = after.len()
     let bound = n + m
-    # Diagonal k = x - y runs from -bound to bound; one spare slot at each end
+    # Diagonal k = x - y runs from -bound to bound; a spare slot at each end
     # keeps the k - 1 and k + 1 probes in range without a bounds test.
     let offset = bound + 1
     let furthest = [0 for _ in 0..2 * bound + 3]
@@ -1366,10 +1227,9 @@ pub fn diff(before: list[str], after: list[str]) -> list[DiffOp] {
         trace.push([value for value in furthest])
         var k = -depth
         while k <= depth {
-            # Step from the better of the two neighbouring diagonals — down is
-            # an insertion, right is a deletion — then run the diagonal as far
-            # as the two sides agree. Everything free is taken greedily, which
-            # is what makes the whole edit script optimal.
+            # Step from the better neighbouring diagonal, then run as far as
+            # the two sides agree; taking everything free greedily is what
+            # makes the script optimal.
             var x = 0
             if k == -depth or k != depth and furthest[k - 1 + offset] < furthest[k + 1 + offset] {
                 x = furthest[k + 1 + offset]
@@ -1431,8 +1291,8 @@ fn _at(letters: list[str], index: int) -> str {
     return letters[index]
 }
 
-# Guards against the empty string that `_at` returns past either end: "" is a
-# substring of every string, so `"" in "AEIOU"` would be true.
+# Guards the empty string `_at` returns past either end: "" is a substring of
+# every string, so `"" in "AEIOU"` would be true.
 fn _is_vowel(ch: str) -> bool {
     return ch.len() == 1 and ch in "AEIOU"
 }
@@ -1440,8 +1300,8 @@ fn _is_vowel(ch: str) -> bool {
 fn _is_token_char(ch: str) -> bool {
     let code = ord(ch)
     if code >= 48 and code <= 57 { return true }
-    # A character with two cases is a letter; CJK scalars have one case but are
-    # still words.
+    # A character with two cases is a letter; CJK scalars have one case
+    # but are still words.
     if ch.lower() != ch.upper() { return true }
     return code >= 0x3041
 }
@@ -1497,14 +1357,8 @@ fn _by_count_then_word(counts: dict[str, int], a: str, b: str) -> int {
 
 #: Return the code length of every symbol under an optimal prefix code.
 #:
-#: The two-queue construction: leaves in one queue in non-decreasing weight,
-#: merged nodes in the other. A merge always produces a weight at least as
-#: large as the last one, so merged nodes stay ordered without a heap and the
-#: two smallest nodes are always at one head or the other. Every merge deepens
-#: both groups by one, which yields the lengths — all a canonical code needs.
-#:
-#: `alphabet` must be sorted and `sort_by` is stable, so equal frequencies keep
-#: alphabetical order and the code is the same on every run.
+#: Two-queue construction: merged weights come out non-decreasing, so no heap
+#: is needed. Requires `alphabet` already sorted — reproducibility depends on it silently.
 fn _huffman_lengths(alphabet: list[str], frequencies: dict[str, int]) -> dict[str, int] {
     let lengths = {symbol: 0 for symbol in alphabet}
     if alphabet.len() == 1 {
@@ -1544,10 +1398,8 @@ fn _huffman_lengths(alphabet: list[str], frequencies: dict[str, int]) -> dict[st
 
 #: Order the rotations of `codes` by prefix doubling.
 #:
-#: Round k orders every rotation by its first 2^k characters, using the ranks
-#: from round k - 1 as the two halves of a pair. Each round is therefore one
-#: sort of integer pairs rather than a character-by-character comparison, and
-#: log n rounds suffice: O(n log^2 n).
+#: Round k sorts by integer-pair rank rather than character comparison,
+#: O(n log^2 n) over log n rounds.
 fn _rotation_order(codes: list[int]) -> list[int] {
     let n = codes.len()
     var order = [index for index in 0..n]
@@ -1585,10 +1437,8 @@ fn _by_rank_pair(rank: list[int], shift: int, n: int, a: int, b: int) -> int {
 
 #: Walk Myers' trace backwards, turning each round into one edit.
 #:
-#: Round d recorded how far every diagonal reached after d edits. Starting from
-#: the end point, the diagonal that fed each round says whether its last move
-#: was an insertion or a deletion, and the run along the diagonal before it is
-#: a block of keeps. The script comes out backwards and is reversed once.
+#: Reconstructs from the end point using each round's recorded diagonal
+#: reach; the script comes out backwards and is reversed once.
 fn _backtrack(
     before: list[str],
     after: list[str],

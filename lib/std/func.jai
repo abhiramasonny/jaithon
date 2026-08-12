@@ -1,9 +1,5 @@
 #: Function combinators, and `Result`/`Option` for recoverable failure.
 #:
-#: The combinators build functions out of other functions: `compose` and `pipe`
-#: for wiring, `curry` and `partial` for fixing arguments ahead of time,
-#: `memoize`, `once` and `Lazy` for controlling when work actually happens.
-#:
 #: `Result` and `Option` are the ergonomic alternative to exceptions when a
 #: failure is expected rather than exceptional. `try_call` turns a raising
 #: function into a `Result`, and `map`/`and_then` thread the rest of the
@@ -262,14 +258,12 @@ pub class Lazy[T] {
 
 # A least-recently-used cache with a fixed capacity, backing `memoize`.
 #
-# Entries live in parallel slot lists, and `newer`/`older` thread a doubly
-# linked recency order through the slot indices, so lookup, insertion and
-# eviction are all O(1) without ever removing a dict entry. `index_of` can
-# still name a key whose slot has since been recycled, which is why `find`
-# re-checks the slot's own key; the map is rebuilt once it holds twice the live
-# entries, costing O(capacity) once per capacity evictions.
+# Parallel slot lists plus a doubly linked recency order (`newer`/`older`)
+# keep lookup, insertion and eviction O(1) without removing dict entries.
+# `index_of` can name a recycled slot, so `find` re-checks the slot's own
+# key; the map rebuilds once it holds twice the live entries.
 #
-# `find` and `value_at` are separate so that a cached null is still a hit.
+# `find` and `value_at` are separate so a cached null is still a hit.
 class _LruCache {
     let capacity: int
     let keys: list[any] = []
@@ -362,9 +356,6 @@ class _LruCache {
 
 #: Return `value` unchanged.
 #:
-#: The identity element of `compose` and `pipe`, and the neutral choice wherever
-#: an API asks for a transformation you do not want to apply.
-#:
 #: ```
 #: identity(3)   # 3
 #: ```
@@ -404,8 +395,7 @@ pub fn compose(...fs: fn(any) -> any) -> fn(any) -> any {
 
 #: Compose functions left to right: `pipe(f, g)(x)` is `g(f(x))`.
 #:
-#: The same wiring as `compose` in reading order, which is usually the clearer
-#: of the two for a data-processing chain.
+#: The same wiring as `compose`, in reading order.
 #:
 #: ```
 #: pipe(|x| x + 1, |x| x * 2)(5)   # 12
@@ -421,9 +411,6 @@ pub fn pipe(...fs: fn(any) -> any) -> fn(any) -> any {
 }
 
 #: Turn an `arity`-argument function into one taking its arguments a few at a time.
-#:
-#: The curried function collects arguments and returns another curried function
-#: until `arity` of them have arrived, then calls `f` with all of them at once.
 #:
 #: ```
 #: let add3 = fn(a: int, b: int, c: int) -> int { return a + b + c }
@@ -457,10 +444,9 @@ pub fn flip(f: fn(any, any) -> any) -> fn(any, any) -> any {
 
 #: Cache `f`'s results so that repeated calls with the same arguments are free.
 #:
-#: `key` maps the argument list to a cache key; it defaults to `repr` of that
-#: list, which is correct for any argument with a faithful `__repr__` and is
-#: worth replacing when a cheaper or more precise key exists. `max_size` bounds
-#: the cache with least-recently-used eviction, and 0 leaves it unbounded.
+#: `key` maps the argument list to a cache key, defaulting to `repr` of that
+#: list -- correct only when `__repr__` is faithful. `max_size` bounds the
+#: cache with least-recently-used eviction; 0 leaves it unbounded.
 #:
 #: Only memoise a pure function: a cached call does not run `f` again, so any
 #: side effect happens once.
@@ -520,9 +506,8 @@ pub fn once(f: any) -> any {
 
 #: Wrap `f` so that only every `n`-th call reaches it.
 #:
-#: The wrapper returns `f`'s result on the calls that get through and null on
-#: the ones it swallows, which makes it a cheap sampler for progress reporting
-#: inside a hot loop.
+#: Returns `f`'s result on calls that get through, and null on the ones it
+#: swallows.
 #:
 #: ```
 #: var calls = 0
@@ -607,10 +592,9 @@ pub fn fixed_point[T](
 
 #: Build a recursive function without giving it a name.
 #:
-#: `builder` receives the function being defined and returns its body, so an
-#: anonymous function can call itself. This is the practical form of the Y
-#: combinator, and it is what lets a recursive helper stay local to the
-#: expression that needs it.
+#: `builder` receives the function being defined and returns its body -- the
+#: practical form of the Y combinator, letting a recursive helper stay local
+#: to the expression that needs it.
 #:
 #: ```
 #: let factorial = recursive(|recurse| |n| if n <= 1 { 1 } else { n * recurse(n - 1) })
@@ -618,8 +602,7 @@ pub fn fixed_point[T](
 #: ```
 pub fn recursive(builder: fn(any) -> any) -> any {
     var target: any = null
-    # The inner wrapper reads `target` at call time, by which point `builder`
-    # has returned and the binding holds the finished function.
+    # The wrapper reads `target` at call time, once `builder` has returned and the binding holds the finished function.
     target = builder(fn(...args: any) -> any { return target(...args) })
     return target
 }

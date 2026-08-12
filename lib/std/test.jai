@@ -1,9 +1,6 @@
 #: The testing framework the repository runs on: assertions, suites, a runner
 #: and a benchmark harness.
 #:
-#: A test file declares its tests with `describe` and `it`, and ends by handing
-#: the report's exit code back to the shell.
-#:
 #: ```
 #: describe("arithmetic", fn() {
 #:     it("adds", fn() { assert_eq(2 + 2, 4) })
@@ -14,16 +11,8 @@
 #: run_all(verbose: false).exit_code()    # 0
 #: ```
 #:
-#: Every assertion failure names both values with `repr`, because "assertion
-#: failed" costs the reader the run they would otherwise not have had to repeat.
-#: A failing test is reported with its suite, its message, the interpreter's
-#: traceback and how long it took, and the rest of the suite still runs.
-#:
-#: `Suite` is the same machinery without the global registry, for tests that
-#: generate their cases rather than writing them out. `benchmark` and `compare`
-#: measure rather than assert, and report a median beside the mean because one
-#: slow sample — a collection, a page fault — moves a mean and leaves a median
-#: where it was.
+#: Every assertion failure names both values with `repr`, since a bare
+#: "assertion failed" costs the reader the run they'd have to repeat.
 import std.algo.stat as stat
 import std.math as math
 
@@ -34,8 +23,7 @@ from std.time import Duration, Instant
 #: How many samples `benchmark` and `compare` take when not told otherwise.
 pub const DEFAULT_ITERATIONS: int = 1000
 
-# Assertion messages quote their operands; past this many characters the quote
-# is cut short, since a failure report with a whole list in it is unreadable.
+# Truncated past this length -- an unclipped list makes a failure message unreadable.
 const _QUOTE_LIMIT = 240
 
 #: How a single test ended.
@@ -46,14 +34,12 @@ pub enum Outcome {
     #: `AssertionError`. The failure is the test doing its job.
     Failed,
     #: The body raised something that was not an `AssertionError`, or a hook
-    #: around it did. The test never reached a verdict, so the fault is as
-    #: likely to be in the test as in the code it was checking. A `before_all`
-    #: that raises errors every test in the suite this way.
+    #: around it did. The fault could be in the test as much as the code it
+    #: was checking, since no verdict was reached.
     Errored,
-    #: The test was declared with `skip: true` and never run. It has no
-    #: duration and no message, and it is counted separately from the passes
-    #: so that a disabled test stays visible instead of vanishing from the
-    #: totals. Skipping does not turn the run red.
+    #: The test was declared with `skip: true` and never run. It is counted
+    #: separately from passes, so a disabled test stays visible instead of
+    #: vanishing from the totals.
     Skipped,
 
     #: Report whether this outcome should turn the run red.
@@ -171,10 +157,8 @@ pub class Test {
 
     #: Run the body between the two hooks and return what happened.
     #:
-    #: Never raises: an `AssertionError` from the body becomes `Outcome.Failed`,
-    #: any other exception becomes `Outcome.Errored`, and either way the
-    #: teardown hook still runs and the caller still gets a result. That is what
-    #: lets one broken test leave the rest of the suite running.
+    #: Never raises: an `AssertionError` becomes `Outcome.Failed`, any other
+    #: exception becomes `Outcome.Errored`; the teardown hook always runs.
     #:
     #: ```
     #: Test("passes", fn() { assert_true(true) }).run().outcome.is_passed()    # true
@@ -208,9 +192,8 @@ pub class Test {
         try {
             after()
         } catch error: Error {
-            # A teardown that fails after the body already failed is almost
-            # always the same fault reported twice, and the first message is the
-            # one worth keeping.
+            # A teardown failure after the body already failed is usually the
+            # same fault reported twice, so the first message wins.
             if not outcome.is_failure() {
                 outcome = Outcome.Errored
                 message = f"teardown raised {type_of(error)}: {error.message}"
@@ -222,9 +205,6 @@ pub class Test {
 }
 
 #: A named group of tests sharing setup and teardown hooks.
-#:
-#: `describe` builds one of these and registers it. Construct one directly when
-#: the cases are generated rather than written out.
 #:
 #: ```
 #: let suite = Suite("squares")
@@ -264,9 +244,8 @@ pub class Suite {
 
     #: Run `hook` once, before the suite's first test.
     #:
-    #: Its cost is paid once, which is why an expensive fixture belongs here —
-    #: but what it builds is shared, and a test that mutates it will be felt by
-    #: every test after it.
+    #: Paid once, so put an expensive fixture here — but it's shared, and a
+    #: test that mutates it affects every test after it.
     pub fn setup_all(self, hook: fn() -> any) -> void { self.before_all = hook }
 
     #: Run `hook` once, after the suite's last test.
@@ -277,9 +256,8 @@ pub class Suite {
 
     #: Run every test in order and return their results.
     #:
-    #: A `setup_all` that raises fails every test in the suite rather than
-    #: taking the whole run down, because the fixture it failed to build is
-    #: exactly what those tests needed.
+    #: A `setup_all` failure fails every test in the suite instead of aborting
+    #: the run, since those tests needed the fixture it never built.
     pub fn run(self) -> list[TestResult] {
         let results: list[TestResult] = []
         try {
@@ -401,11 +379,9 @@ pub class Report {
 
 #: The timings of one benchmarked body.
 #:
-#: Both the mean and the median are reported. They disagree exactly when the
-#: distribution is skewed, which for a timing measurement it almost always is:
-#: nothing makes a run faster than it can be, and a great many things make one
-#: slower. A mean well above the median means the run was interrupted, and the
-#: median is then the honest number.
+#: Mean and median disagree when the distribution is skewed, which timing
+#: data almost always is; a mean well above the median means the run was
+#: interrupted, and the median is the honest number.
 pub class BenchmarkResult {
     #: The name the benchmark was given.
     pub let name: str
@@ -541,9 +517,8 @@ pub fn assert_false(value: bool, message: str = "") -> void {
 
 #: Fail unless `actual` equals `expected`.
 #:
-#: The failure quotes both with `repr`, and names their types when the two
-#: reprs come out identical — which is what `1` against `1.0` looks like once
-#: the only difference left is the type.
+#: Types are named too when the two reprs come out identical, as `1` vs `1.0`
+#: does once the type is the only difference left.
 #:
 #: ```
 #: assert_eq(2 + 2, 4)
@@ -572,9 +547,6 @@ pub fn assert_ne(actual: any, forbidden: any, message: str = "") -> void {
 
 #: Fail unless `smaller` sorts strictly before `larger`.
 #:
-#: Ordered by `std.core.cmp`, so this works on anything with a total order,
-#: user types implementing `Comparable` included.
-#:
 #: ```
 #: assert_lt(1, 2)
 #: assert_lt("apple", "banana")
@@ -596,11 +568,9 @@ pub fn assert_gt(larger: any, smaller: any, message: str = "") -> void {
 
 #: Fail unless `actual` is within `tolerance` of `expected`.
 #:
-#: The tolerance is absolute. Two floats a derivation says are equal usually
-#: differ in their last bits, so `assert_eq` on a pair of computed floats is a
-#: test that fails for no reason; this is the assertion for them. The failure
-#: reports the difference, so a tolerance that is merely too tight can be read
-#: straight off the message.
+#: The tolerance is absolute. Computed floats rarely match bit-for-bit, so
+#: `assert_eq` fails on them for no real reason — this is the assertion for
+#: those cases.
 #:
 #: ```
 #: assert_near(0.1 + 0.2, 0.3)
@@ -613,9 +583,8 @@ pub fn assert_near(
     message: str = ""
 ) -> void {
     if tolerance < 0.0 { throw ValueError(f"tolerance must be non-negative, got {tolerance}") }
-    # A NaN is unequal to everything, this comparison included, which is the
-    # right verdict — but the message has to say so instead of quoting a
-    # difference that is itself NaN.
+    # NaN vs anything is correctly "not equal", but the message must say so
+    # rather than show a difference that's itself NaN.
     if actual != actual or expected != expected {
         throw AssertionError(
             _explain(f"expected {expected} within {tolerance}, got {actual}", message)
@@ -634,11 +603,9 @@ pub fn assert_near(
 
 #: Fail unless `body` raises an exception of class `expected`, and return it.
 #:
-#: The class comes first so that it reads as the assertion rather than as an
-#: afterthought to a block. A subclass counts: `assert_throws(LookupError, body)`
-#: accepts a `KeyError`. The exception is returned so that its message can be
-#: checked too, which is usually worth doing — a test that asserts only the
-#: class passes just as happily when the code raises for the wrong reason.
+#: A subclass counts: `assert_throws(LookupError, body)` accepts a `KeyError`.
+#: The exception is returned so its message can be checked too — asserting
+#: only the class lets a test pass when the code raised for the wrong reason.
 #:
 #: ```
 #: let error = assert_throws(IndexError, || [1][5])
@@ -721,16 +688,13 @@ pub fn assert_len(container: any, expected: int, message: str = "") -> void {
 pub fn fail(message: str) -> void { throw AssertionError(message) }
 
 # --- Declaring and running tests ----------------------------------------------
-
-# The suites `describe` has registered, and the one `it` is currently filling.
 var _suites: list[Suite] = []
 var _current: Suite? = null
 
 #: Declare a suite named `name`, whose body calls `it` for each of its tests.
 #:
-#: The suite is registered for `run_all` and also returned, so a caller who
-#: wants to run it alone can. Describes may nest: an `it` inside an inner
-#: describe belongs to the inner suite.
+#: Registered for `run_all` but also returned, for a caller that wants to run
+#: it alone. Describes may nest: an inner `it` attaches to the inner suite.
 #:
 #: ```
 #: let suite = describe("empty", fn() { })
@@ -740,8 +704,8 @@ pub fn describe(name: str, body: fn() -> any) -> Suite {
     let suite = Suite(name)
     let enclosing = _current
     _current = suite
-    # Restored even when the body raises, so that one broken declaration does
-    # not silently attach every later test to the wrong suite.
+    # Restored even on a raise, so one broken describe can't leak later tests
+    # into the wrong suite.
     defer { _current = enclosing }
     body()
     _suites.push(suite)
@@ -750,9 +714,8 @@ pub fn describe(name: str, body: fn() -> any) -> Suite {
 
 #: Declare a test inside the enclosing `describe`.
 #:
-#: Raises `RuntimeError` outside a describe block, where there is no suite to
-#: attach to. Pass `skip: true` to declare a test without running it; it is then
-#: counted and reported as skipped rather than quietly disappearing.
+#: Raises `RuntimeError` outside a describe block. `skip: true` declares a
+#: test without running it, still counted rather than silently missing.
 pub fn it(name: str, body: fn() -> any, skip: bool = false) -> void {
     let suite = _current
     if suite is null {
@@ -763,9 +726,8 @@ pub fn it(name: str, body: fn() -> any, skip: bool = false) -> void {
 
 #: Run every registered suite, print the results, and return the report.
 #:
-#: With `verbose`, every test prints as it finishes; without, only the failures
-#: and the counts are printed. The registry is cleared on the way out, so a
-#: second call does not re-run the same suites.
+#: The registry is cleared on the way out, so a second call won't re-run the
+#: same suites.
 pub fn run_all(verbose: bool = true) -> Report {
     let results: list[TestResult] = []
     for suite in _suites {
@@ -783,9 +745,8 @@ pub fn run_all(verbose: bool = true) -> Report {
 
 #: Forget every registered suite.
 #:
-#: `run_all` calls this for you. It is public for the framework's own tests,
-#: which register suites of their own and must not leak them into the run that
-#: is testing them.
+#: Public so the framework's own tests can reset the registry without leaking
+#: their suites into the run that's testing them.
 pub fn reset() -> void {
     _suites = []
     _current = null
@@ -793,10 +754,8 @@ pub fn reset() -> void {
 
 #: Run `body` once per row of `cases`, reporting which row failed.
 #:
-#: A table-driven test collapses twenty near-identical tests into one table and
-#: one body — but a plain loop loses the one thing the twenty of them had, which
-#: is knowing which case broke. This catches the assertion failure, prefixes it
-#: with the row's index and value, and re-raises.
+#: A plain loop over the same cases would lose the one thing table-driven
+#: tests need: knowing which row broke.
 #:
 #: ```
 #: for_each_case(
@@ -818,14 +777,12 @@ pub fn for_each_case(cases: list[any], body: fn(any) -> any) -> void {
 
 #: Time `body` over `iterations` samples and report the distribution.
 #:
-#: A warmup phase runs first and is not measured, so the timings exclude the
-#: first-call costs — the lazy initialisation, the cold caches, the branch
-#: predictor that has seen nothing yet — which would otherwise all be charged to
-#: sample one. It defaults to a tenth of the iterations, capped at 100.
+#: A warmup phase runs unmeasured first, since first-call costs — init, cold
+#: caches, branch prediction — would otherwise land on sample one. Defaults
+#: to a tenth of `iterations`, capped at 100.
 #:
-#: `batch` answers a body faster than the clock: each sample runs the body
-#: `batch` times and divides, so a body of a few nanoseconds can still be
-#: measured against a clock whose resolution is a microsecond.
+#: `batch` runs the body `batch` times per sample and divides, so bodies
+#: faster than the clock's resolution can still be measured.
 #:
 #: ```
 #: let result = benchmark("addition", fn() { let _sum = 1 + 1 }, 50)
@@ -848,11 +805,9 @@ pub fn benchmark(
 
 #: Time two implementations against each other and report which is faster.
 #:
-#: The two are measured in alternating rounds rather than one after the other.
-#: Machines drift — a core clocks down, another process wakes, the collector
-#: runs — and back-to-back runs charge the whole of that drift to whichever
-#: implementation happened to be running during it. Interleaving splits it
-#: between them.
+#: Measured in alternating rounds rather than back-to-back, so machine drift
+#: (a core clocking down, a collector pause) is split between them instead of
+#: all charged to whichever ran during it.
 #:
 #: ```
 #: let verdict = compare("a", fn() { let _x = 1 }, "b", fn() { let _y = 2 }, 20)
@@ -920,8 +875,8 @@ fn _quote(value: any) -> str {
 
 #: Return the interpreter's traceback for the exception being handled.
 #:
-#: The primitive may hand back either the rendered text or a list of frames;
-#: both are folded into one string here so callers only ever see a string.
+#: The primitive may return either text or a list of frames; both are folded
+#: into one string here.
 fn _current_trace() -> str {
     let raw = __prim__.traceback()
     if raw is null { return "" }

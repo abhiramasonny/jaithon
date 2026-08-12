@@ -1,16 +1,13 @@
 #: Graphs and disjoint sets.
 #:
-#: `Graph` stores adjacency lists and covers both the directed and undirected,
-#: weighted and unweighted cases with one type: an unweighted edge is an edge of
-#: weight 1.0, and an undirected edge is stored once in each direction.
+#: `Graph` covers directed/undirected and weighted/unweighted with one type:
+#: unweighted means weight 1.0, undirected means each edge is stored twice.
 #:
-#: Unreachability is represented by *absence*, never by a sentinel distance: a
-#: node missing from a distance map cannot be reached from the source.
+#: Unreachability is *absence*, never a sentinel: a node missing from a
+#: distance map cannot be reached from the source.
 #:
-#: Every traversal here is iterative. A graph is not a balanced tree — a path
-#: graph of a million nodes is an ordinary input, and its depth-first walk is a
-#: million frames deep, so recursion would raise `RecursionError` on a shape the
-#: algorithm is otherwise perfectly happy with.
+#: Every traversal is iterative — a graph is not a balanced tree, and a
+#: million-node path graph would blow a recursive walk's stack.
 from std.collections import IndexedHeap
 
 const FLOW_EPSILON = 1e-9
@@ -555,9 +552,8 @@ pub class Graph {
 
     #: The strongly connected components of a directed graph, by Tarjan.
     #:
-    #: Each component is a maximal set of nodes that can all reach each other.
-    #: Components come out in reverse topological order of the condensation, in
-    #: O(V + E).
+    #: Each component is a maximal set of nodes that can all reach each other, in
+    #: reverse topological order of the condensation. O(V + E).
     #:
     #: ```
     #: let graph = Graph(directed: true)
@@ -669,9 +665,8 @@ pub class Graph {
 
     #: Report whether the nodes can be two-coloured with no edge inside a colour.
     #:
-    #: Bipartiteness is a property of the underlying undirected graph, so the
-    #: colouring crosses edges in both directions even when the graph is
-    #: directed. A self-loop makes a graph non-bipartite.
+    #: Bipartiteness is a property of the underlying undirected graph — colouring
+    #: crosses edges both directions even when directed. A self-loop is non-bipartite.
     #:
     #: ```
     #: Graph.from_edges([("a", "b"), ("b", "c"), ("c", "d")]).is_bipartite()   # true
@@ -820,9 +815,8 @@ pub class Graph {
         for middle in self.order {
             let through = distance[middle]
             for start in self.order {
-                # Skipped rather than special-cased: with start == middle the
-                # row and the pivot are the same dict, and rewriting a dict
-                # while iterating it is not defined.
+                # Skipped, not special-cased: with start == middle, row and
+                # pivot are the same dict, and mutating one while iterating it is undefined.
                 if start == middle { continue }
                 let row = distance[start]
                 if not row.has(middle) { continue }
@@ -862,10 +856,8 @@ pub class Graph {
             throw ValueError("minimum_spanning_tree requires an undirected graph")
         }
         let candidates = self.edges()
-        # Sorting the positions by weight, rather than (weight, position) pairs
-        # by the default tuple order: `<` is not defined between tuples, and the
-        # sort is stable, so equal weights keep their insertion order anyway and
-        # the chosen tree is still reproducible.
+        # Sorts positions, not (weight, position) tuples — `<` isn't defined
+        # between tuples. Stable sort keeps equal weights in insertion order, so the tree is reproducible.
         let positions: list[int] = []
         for position in 0..candidates.len() { positions.push(position) }
         let sets = UnionFind(self.order.len())
@@ -896,9 +888,8 @@ pub class Graph {
         self._offer(start, frontier, cheapest, inside)
         while not frontier.is_empty() {
             let (node, _priority) = frontier.pop()
-            # A heap that implements `decrease` by inserting a second entry
-            # hands back the stale copy too; skipping settled nodes keeps this
-            # correct either way.
+            # `decrease` may leave a stale duplicate entry in the heap;
+            # skipping settled nodes keeps this correct either way.
             if inside.has(node) { continue }
             inside.add(node)
             chosen.push(cheapest[node])
@@ -909,9 +900,8 @@ pub class Graph {
 
     #: The maximum flow from `source` to `sink`, by Dinic.
     #:
-    #: Edge weights are capacities and must be non-negative. An undirected edge
-    #: is one pipe of that capacity usable in either direction. Runs in
-    #: O(V^2 * E), and O(E * sqrt(E)) on unit capacities.
+    #: Edge weights are capacities and must be non-negative; an undirected edge is
+    #: one pipe usable either direction. O(V^2 * E), O(E * sqrt(E)) on unit capacities.
     #:
     #: ```
     #: let graph = Graph(directed: true)

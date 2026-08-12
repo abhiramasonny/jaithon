@@ -1,22 +1,10 @@
 #: The test runner behind `jaithon test`.
 #:
-#: Discovery is by convention and nothing else: walking a directory picks up
-#: the files whose name begins with `test_`, and a test is a top-level function
-#: taking no arguments whose name also begins with `test_`. There is no
-#: registration list to forget to add to. A path named on the command line is
-#: run whatever it is called — naming a file means wanting that file.
-#:
-#: Each file is parsed before it is run, so the runner knows which functions it
-#: is about to call and can report `path: no tests` instead of executing a file
-#: for nothing. The functions themselves are run through `std.test`, which turns
-#: an `AssertionError` into a failure, any other exception into an error, and
-#: either way keeps going — one broken test never ends the run.
-#:
-#: `--doc` runs the examples in `#:` comments. Every fenced block in a doc
-#: comment becomes a test: the lines run in order, and a line with a trailing
-#: `# value` comment becomes an assertion that the line evaluates to that value.
-#: That is what keeps `spec/STYLE.md` §6's promise that the examples are
-#: correct — they are executed, and a stale one fails the build.
+#: Discovery is by convention only — a file and its top-level, no-argument
+#: functions named `test_*` — so there is no registration list to forget.
+#: `--doc` instead runs every fenced block in a `#:` comment as a test; a
+#: line with a trailing `# value` comment asserts that value, which is what
+#: keeps stale examples from passing silently.
 #:
 #: ```
 #: expected_of("f(1)   # 2")          # "2"
@@ -51,11 +39,10 @@ pub fn is_test_name(name: str) -> bool {
 #: Report whether `path` is a file the runner should look inside when walking
 #: a directory.
 #:
-#: The rule is the file name and nothing else. "Anything under `tests`" is the
-#: obvious alternative and it is wrong: `tests` also holds the benchmarks and
-#: the diagnostic fixtures, and the fixtures do not compile *on purpose* — a
-#: runner that walks into them reports the suite red for files that are doing
-#: their job. A path named on the command line is run whatever it is called.
+#: The obvious alternative — anything under `tests` — is wrong: that
+#: directory also holds benchmarks and diagnostic fixtures that don't compile
+#: *on purpose*, and walking into them would report the suite red for files
+#: doing their job.
 #:
 #: ```
 #: is_test_file(Path("tests/lang/test_closures.jai"))    # true
@@ -122,15 +109,11 @@ pub fn code_of(line: str) -> str {
 
 #: Run every test in one file and return the results.
 #:
-#: The file is executed once, in a namespace of its own, and then each test
-#: function is called by name. `filter`, when given, keeps only the tests whose
-#: `module:name` contains it.
+#: `filter`, when given, keeps only tests whose `module:name` contains it.
 #:
-#: The namespace matters: a test file's own imports must not reach the runner.
-#: Run in this module's namespace, `import std.str as str` inside a test file
-#: rebinds the runner's `str` and the next report the runner formats fails on
-#: it. It also keeps two test files from seeing each other's bindings, which is
-#: what makes the order files are run in stop mattering.
+#: Each file runs in a namespace of its own: run in the runner's namespace, a
+#: test file's `import std.str as str` would rebind the runner's own `str`
+#: and break the next report — and files could no longer be run in any order.
 pub fn run_file(path: str, filter: str?, verbose: bool) -> list[TestResult] {
     let source = read_file(path)
     let suite = module_name_of(path)
@@ -163,24 +146,14 @@ pub fn run_file(path: str, filter: str?, verbose: bool) -> list[TestResult] {
 
 #: Build the runnable program for one doc example.
 #:
-#: The example runs with the module's own imports in scope, plus everything the
-#: module exports — when the module is importable under its own name, which is
-#: to say it lives under `lib/` — so an example may name what its module names
-#: whether that module is `std.list` or `jaithon.ast`. The lines
-#: themselves go inside an anonymous function that is called immediately: that
-#: keeps one example's `let` bindings from colliding with the next one's.
+#: The lines run inside an immediately-called anonymous function, so one
+#: example's `let` bindings can't collide with the next one's.
 #:
-#: The module's own surface is imported by listing its public names, not as
-#: `from m import *`: the wildcard is in the grammar but has no bytecode form
-#: (`E0902` from `emitFromImport`), so every example built on one failed to
-#: compile and `--doc` found no tests at all.
-#:
-#: Only the names the example actually mentions are imported, which is what
-#: keeps the program quiet: an import nothing uses is `W0100`, and importing a
-#: whole module's surface for a two-line example would bury the example's own
-#: output under a hundred warnings. It also settles the collision — a name the
-#: module already imported is never imported twice, and a name declared twice in
-#: one scope is `E0302`.
+#: The module surface is imported by listing names, not `from m import *` —
+#: the wildcard has no bytecode form (`E0902`), so examples built on it never
+#: compiled and `--doc` found nothing. Only names the example actually uses
+#: are imported, to dodge an unused-import warning (`W0100`) and a duplicate
+#: declaration (`E0302`) for names already in scope.
 pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> str {
     let body: list[str] = []
     let own: list[str] = []
@@ -191,9 +164,8 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
             body.push("")
             continue
         }
-        # An example may open with an import of its own, and it belongs at the
-        # top of the program rather than inside the wrapper: what a reader has
-        # to type to run the example is exactly what the example shows.
+        # An example's own import goes at the top of the program, not inside
+        # the wrapper, so what a reader types matches what the example shows.
         if _is_import(code) {
             own.push(code)
             continue
@@ -207,11 +179,9 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
         }
     }
 
-    # The body, not the example: a name may appear only in an expected-value
-    # comment — `kind_from_name("AST_CALL")   # NodeKind.Call` — and the comment
-    # is where the tokenizer stops looking. By the time the body is built that
-    # comment has become the right-hand side of an assertion, and the name is
-    # code like any other.
+    # Scans `body`, after comments have become assertions — a name that only
+    # appeared in an expected-value comment is now real code, not text the
+    # tokenizer would skip.
     let used = _names_used(body)
     let bound: set[str] = set()
     let head: list[str] = []
@@ -219,8 +189,8 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
         head.push("from std.test import assert_eq")
         bound.add("assert_eq")
     }
-    # The example's own imports first: what it asked for by name wins over what
-    # the module happens to import under the same name.
+    # The example's own imports go first, so a name it asks for wins over the
+    # module's import of the same name.
     for (statement, names) in _import_bindings(mod, own, used) {
         head.push(statement)
         for name in names { bound.add(name) }
@@ -231,10 +201,9 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
         head.push(statement)
         for name in names { bound.add(name) }
     }
-    # Only when the module is importable under its own name. `module_name_of`
-    # returns the dotted path for a file under `lib/` — `std.list`,
-    # `jaithon.ast` — and a bare stem for anything else; a test or example file
-    # names no module, and importing from its stem would be `E0800`.
+    # Only if the module is importable under its own name: `module_name_of`
+    # gives a dotted path for files under `lib/` and a bare stem otherwise,
+    # and importing from a bare stem is `E0800`.
     if mod.name.contains(".") {
         let surface: list[str] = []
         for entry in mod.entries {
@@ -270,10 +239,8 @@ pub fn run_doc_examples(path: str, filter: str?, verbose: bool) -> list[TestResu
 #: jaithon test [--verbose] [--doc] [--filter=substring] [paths...]
 #: ```
 #:
-#: With no path, `tests` is searched. `--doc` runs the examples in `#:` comments
-#: instead of the `test_` functions; give both `--doc` and paths under `lib` to
-#: check the library's documentation. The exit status is 1 when anything failed,
-#: which is what the CI gate reads.
+#: With no path, `tests` is searched (or `lib` when `--doc` is given). Exits
+#: 1 when anything failed — what the CI gate reads.
 pub fn main(args: list[str]) -> int {
     let options = _Options.parse(tail_arguments(args, "test"))
     if options.usage_error is not null {
@@ -311,9 +278,9 @@ pub fn main(args: list[str]) -> int {
 
 # --- Running -----------------------------------------------------------------
 
-# Whether `text` is one expression, and so can stand on either side of an
-# assertion. Doc comments end lines with prose as often as with a value, and
-# `# true: a file with an error has no tree` must not become an assertion.
+# Whether `text` is one expression, so it can be asserted against — a prose
+# comment like `# true: a file with an error has no tree` must not become an
+# assertion.
 fn _is_expression(text: str) -> bool {
     let program = parse(text, 0, DiagnosticBag())
     if program is null { return false }
@@ -344,11 +311,9 @@ fn _run_examples(
         let name = f"{owner} (line {example.line})"
         if not _matches(suite, name, filter) { continue }
         let program = example_program(mod, imports, example)
-        # A namespace of its own, for the reason `run_file` gives: an example
-        # of `std.json` opens with `from std.json import parse`, and run in
-        # this module's namespace that rebinds the runner's own `parse` — the
-        # next example to reach `_is_expression` then dies on it, and the run
-        # ends wherever the alphabet put the module that did it.
+        # Its own namespace, same reason as `run_file`: e.g. `std.json`'s
+        # example imports `parse`, which run in this namespace would rebind
+        # the runner's own `parse` and crash a later example in `_is_expression`.
         let namespace = f"<doc {mod.name}:{example.line}>"
         let result = Test(name, fn() -> any { return __prim__.exec(program, namespace) }).run(suite)
         if verbose { print("  " + result.to_str()) }
@@ -357,7 +322,6 @@ fn _run_examples(
     return results
 }
 
-# Every example in a module, paired with the name of what it documents.
 fn _examples_of(mod: ModuleDoc) -> list[tuple[str, Example]] {
     let found: list[tuple[str, Example]] = []
     let doc = mod.doc
@@ -380,22 +344,21 @@ fn _examples_of(mod: ModuleDoc) -> list[tuple[str, Example]] {
     return found
 }
 
-# Every identifier an example mentions. The example is tokenized rather than
-# searched for substrings, so a name inside a string literal or a comment is
-# not mistaken for a use of it — that is the difference between importing what
-# the example needs and importing whatever happens to be spelled in it.
+# Every identifier an example mentions, found by tokenizing rather than
+# substring search, so a name inside a string or comment isn't mistaken for a
+# use of it.
 #
-# A lexical error costs the tokens after it and nothing else: an example that
-# does not lex will not compile either, and the failure the runner wants to
-# report is that one, not a missing import.
+# A lexical error costs only the tokens after it: an example that doesn't lex
+# won't compile either, so the runner still reports that failure, not a
+# missing-import red herring.
 fn _names_used(lines: list[str]) -> set[str] {
     let used: set[str] = set()
     var previous = TokenKind.Eof
     let lexer = Lexer("\n".join(lines) + "\n", 0, DiagnosticBag())
     for token in lexer.tokenize() {
-        # `summary.mean()` is not a use of the free function `mean`: a name
-        # after a dot is a member of whatever precedes it, and importing it
-        # would leave an import nothing uses.
+        # `summary.mean()` isn't a use of the free function `mean` — a name
+        # after a dot is a member access, and importing it would be an unused
+        # import.
         let member = previous == TokenKind.Dot or previous == TokenKind.QuestionDot
         if token.kind == TokenKind.Ident and not member { used.add(token.text) }
         previous = token.kind
@@ -403,19 +366,14 @@ fn _names_used(lines: list[str]) -> set[str] {
     return used
 }
 
-# Whether `code` is an import statement, which the wrapper has to hoist.
 fn _is_import(code: str) -> bool {
     return code.starts_with("import ") or code.starts_with("from ")
 }
 
-# The module's import statements cut down to the names `used` mentions, each
-# paired with the names it goes on to bind.
+# The module's import statements, cut down to the names `used` mentions.
 #
-# The cut is per name and not per statement because the statements are written
-# for the module, not for the example: `from std.iter import iter, cycle` is
-# one statement, and an example that says `iter` and not `cycle` still has to
-# not import `cycle`. `import std.math` binds `math` — the last component of
-# the path — unless it was given an alias, and there is nothing to cut down.
+# The cut is per name, not per statement: `from std.iter import iter, cycle`
+# is one statement, and using only `iter` must still not import `cycle`.
 fn _import_bindings(
     mod: ModuleDoc,
     imports: list[str],
@@ -454,11 +412,11 @@ fn _import_bindings(
     return bindings
 }
 
-# A relative import path, spelled absolutely. The example does not run in the
-# module's file, so `.graph` has nothing to be relative to and the loader looks
-# for it beside the working directory instead. A `mod.jai` file *is* its
-# package, so one leading dot already names a child of it; anything else is a
-# module inside a package, and one dot means a sibling.
+# A relative import path, spelled absolutely — the example doesn't run in
+# the module's file, so a leading dot has nothing to be relative to.
+#
+# A `mod.jai` file *is* its package, so one leading dot names a child of it;
+# any other file is a module inside a package, so one dot means a sibling.
 fn _absolute_path(path: str, mod: ModuleDoc) -> str {
     if not path.starts_with(".") { return path }
     var depth = 0
@@ -474,7 +432,6 @@ fn _absolute_path(path: str, mod: ModuleDoc) -> str {
     return ".".join(parts)
 }
 
-# The module's own import statements, as source, to put back around an example.
 fn _imports_of(path: str) -> list[str] {
     let program = parse_module(read_file(path), path)
     let out: list[str] = []
@@ -540,11 +497,9 @@ class _Options {
             }
         }
         options.usage_error = reader.error
-        # Two jobs, two defaults. `test_` functions live under `tests`, but the
-        # examples `--doc` runs are the ones `jaithon doc` publishes, so the
-        # default there has to be the default of `jaithon.tool.doc` — pointed at
-        # `tests` it found nothing and reported "no tests found" for a tree
-        # holding seven hundred examples.
+        # Two different defaults: `--doc` examples are what `jaithon doc`
+        # publishes from `lib`, not `tests` — pointed at `tests` this found
+        # nothing for a tree of seven hundred examples.
         if options.paths.len() == 0 {
             options.paths = if options.doc { ["lib"] } else { ["tests"] }
         }

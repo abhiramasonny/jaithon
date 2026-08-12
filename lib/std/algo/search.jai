@@ -1,41 +1,5 @@
 #: Searching: ordered lists, unordered lists, unimodal functions, and strings.
 #:
-#: Ordered search over a list sorted by the same comparator, n elements:
-#:
-#:   binary_search        O(log n). The default. Index of the first equal
-#:                        element, or null.
-#:   lower_bound          O(log n). Insertion point before equals.
-#:   upper_bound          O(log n). Insertion point after equals.
-#:   equal_range          O(log n). Both bounds, so the run of equals is
-#:                        `xs[lower:upper]` and its length is the count.
-#:   binary_search_by     O(log n). The general form: the partition point of
-#:                        any predicate that is false then true.
-#:   exponential_search   O(log i) for a hit at index i. Beats binary search
-#:                        when the target is near the front of a long list.
-#:   interpolation_search O(log log n) expected on evenly spread numeric keys
-#:                        (timestamps, ids), O(n) worst. Guesses where the key
-#:                        should be rather than always halving.
-#:   ternary_search       O(log((hi - lo) / tolerance)) over a unimodal
-#:                        function — a continuous domain, not a list.
-#:
-#: Unordered search: `linear_search` and `find_all`, both O(n). For anything
-#: repeated, build a dict or a set instead — O(1) per lookup beats both.
-#:
-#: String search, text of length n, pattern of length m, alphabet size s:
-#:
-#:   kmp_search           O(n + m) guaranteed, O(m) memory, never backs up over
-#:                        the text. The safe default and the one for streams.
-#:   boyer_moore_search   O(n / m) best, O(n * m) worst, O(m + s) memory. Skips
-#:                        ahead instead of stepping, so it is the fastest in
-#:                        practice for long patterns over large alphabets.
-#:   rabin_karp_search    O(n + m) expected, O(1) memory. Worth it when the
-#:                        rolling hash generalises: many equal-length patterns
-#:                        at once, or 2-D pattern matching.
-#:   z_algorithm          O(n). Not a search but the structure underneath one;
-#:                        also gives periods, borders, and longest prefixes.
-#:   AhoCorasick          O(n + total pattern length + matches) for many
-#:                        patterns in one pass, whatever their lengths.
-#:
 #: Positions are code point offsets, not byte offsets, so they stay correct for
 #: non-ASCII text. An empty pattern matches nothing.
 from std.algo.sort import Comparator, natural_order
@@ -46,17 +10,9 @@ const MAX_TERNARY_STEPS = 200
 
 #: An Aho-Corasick automaton: find any number of patterns in one pass.
 #:
-#: Construction is O(total pattern length) and searching is O(n + matches),
-#: independent of how many patterns there are — the reason to use it instead of
-#: running `kmp_search` once per pattern, which costs O(k * n) for k patterns.
-#:
-#: The patterns form a trie; each node also carries a failure link to the
-#: longest proper suffix of its path that is itself a trie node, so a mismatch
-#: falls back without rescanning the text. Output sets are merged along those
-#: links, so a node reports every pattern ending there, including the shorter
-#: ones nested inside it.
-#:
-#: Build once and search many texts; `aho_corasick` is the one-shot form.
+#: O(total pattern length) to build, O(n + matches) to search, independent of
+#: pattern count — cheaper than running `kmp_search` once per pattern (O(k * n)).
+#: `aho_corasick` is the one-shot form.
 pub class AhoCorasick {
     var lengths: list[int]
     var edges: list[dict[int, int]]
@@ -118,9 +74,8 @@ pub class AhoCorasick {
         return found
     }
 
-    #: Compute failure links breadth first, so that a node's link is always
-    #: resolved before its children need it, and fold each target's outputs
-    #: into the node itself to keep reporting O(1) per match.
+    #: Failure links are computed breadth first so a node's link resolves
+    #: before its children need it; outputs are folded in for O(1) reporting.
     fn _link(self) -> void {
         let queue: list[int] = []
         for node in self.edges[0].values() {
@@ -149,9 +104,8 @@ pub class AhoCorasick {
 
 #: Return the index of the first element equal to `target`, or null.
 #:
-#: O(log n) comparisons. `xs` must be sorted by `cmp`; the result is
-#: unspecified otherwise. Returning the *first* equal element rather than an
-#: arbitrary one makes the answer independent of the list's length.
+#: O(log n) comparisons. `xs` must be sorted by `cmp` or the result is
+#: unspecified. Returns the *first* equal element, so the answer doesn't depend on the list's length.
 #:
 #: ```
 #: binary_search([1, 3, 5], 3)   # 1
@@ -213,11 +167,8 @@ pub fn equal_range[T](
 #: Return the first index where `predicate` holds, or `xs.len()` if it never
 #: does.
 #:
-#: O(log n) predicate calls. `predicate` must be monotone over `xs`: false for
-#: a prefix, then true for the rest. This is the general binary search — every
-#: other one here is a special case — and it is what to use when the ordering
-#: key is computed rather than compared, or when searching for a boundary
-#: rather than a value.
+#: O(log n) predicate calls. `predicate` must be monotone: false for a prefix,
+#: then true for the rest — every other search here is a special case of this one.
 #:
 #: ```
 #: binary_search_by([1, 3, 5, 7], |x| x >= 4)   # 2
@@ -236,11 +187,9 @@ pub fn binary_search_by[T](xs: list[T], predicate: fn(T) -> bool) -> int {
 #: Return the index of the first element equal to `target`, or null, by
 #: doubling a bound before searching inside it.
 #:
-#: O(log i) where i is the index found, against O(log n) for `binary_search`.
-#: The probe indices double — 1, 2, 4, 8 — until they overshoot, and the
-#: binary search then covers only the last doubling. Prefer it when the list is
-#: very long and hits cluster near the front, or when reading far-away elements
-#: is expensive (a paged or memory-mapped list).
+#: O(log i) for a hit at index i, vs O(log n) for `binary_search`: probes
+#: double (1, 2, 4, 8...) until they overshoot, then binary search covers just
+#: the last doubling. Prefer it for hits near the front, or expensive reads (a paged or memory-mapped list).
 #:
 #: ```
 #: exponential_search([1, 2, 3, 4, 5, 6, 7, 8], 7)   # 6
@@ -263,13 +212,10 @@ pub fn exponential_search[T](xs: list[T], target: T, cmp: Comparator[T] = natura
 #: Return the index of an element equal to `target`, or null, by estimating
 #: where it should be.
 #:
-#: O(log log n) expected when the keys are spread evenly, because each probe
-#: interpolates the target's position within the remaining range instead of
-#: taking the midpoint; O(n) worst case when they are not (an exponential
-#: distribution defeats it). Prefer it for large, dense, near-uniform integer
-#: keys — auto-increment ids, second-resolution timestamps — and
-#: `binary_search` for everything else, including short lists, where the extra
-#: arithmetic per probe costs more than the probes it saves.
+#: O(log log n) expected on evenly-spread keys (each probe interpolates
+#: position instead of halving); O(n) worst case otherwise. Prefer it for
+#: large, near-uniform integer keys (ids, timestamps) — use `binary_search`
+#: elsewhere, since the extra arithmetic can cost more than it saves.
 #:
 #: With duplicates, which equal element is found is unspecified.
 #:
@@ -298,11 +244,9 @@ pub fn interpolation_search(xs: list[int], target: int) -> int? {
 
 #: Return the argument that minimises a unimodal `f` on `[lo, hi]`.
 #:
-#: O(log((hi - lo) / tolerance)) iterations, two evaluations of `f` each: the
-#: range is cut into thirds and whichever outer third cannot hold the minimum
-#: is discarded, shrinking it by 2/3 per step. `f` must be unimodal — strictly
-#: decreasing then strictly increasing. To maximise instead, search `|x| -f(x)`.
-#: Unlike the list searches this needs no data, only the function.
+#: O(log((hi - lo) / tolerance)) iterations: each step discards whichever
+#: outer third can't hold the minimum. `f` must be unimodal (strictly
+#: decreasing then increasing); to maximise, search `|x| -f(x)` instead.
 #:
 #: Raises `ValueError` when `hi < lo` or `tolerance` is not positive.
 #:
@@ -365,13 +309,9 @@ pub fn find_all[T](xs: list[T], target: T) -> list[int] {
 #: Return the start of every occurrence of `pattern` in `text`, using
 #: Knuth-Morris-Pratt.
 #:
-#: O(n + m) time and O(m) memory in every case. The failure function records,
-#: for each prefix of the pattern, the longest proper prefix that is also a
-#: suffix of it; on a mismatch the pattern slides by that much and the text
-#: cursor never moves backwards. Overlapping matches are all reported.
-#:
-#: This is the default: linear worst case, no dependence on alphabet size, and
-#: the only one here that can run against a stream.
+#: O(n + m) time, O(m) memory, guaranteed — the text cursor never moves
+#: backwards. The default: no dependence on alphabet size, and the only one
+#: here that can run against a stream.
 #:
 #: ```
 #: kmp_search("abababa", "aba")   # [0, 2, 4]
@@ -402,14 +342,9 @@ pub fn kmp_search(text: str, pattern: str) -> list[int] {
 #: Return the start of every occurrence of `pattern` in `text`, using
 #: Boyer-Moore.
 #:
-#: O(n / m) at best, O(n * m) at worst, O(m + s) memory for an alphabet of s
-#: distinct code points in the pattern. The pattern is compared right to left,
-#: and a mismatch shifts it by the larger of two precomputed rules: the bad
-#: character rule (align the mismatched text symbol with its last occurrence in
-#: the pattern, or skip past it entirely if it never occurs) and the good
-#: suffix rule (realign the part that already matched). Whole blocks of text
-#: are therefore never examined — the longer the pattern and the larger the
-#: alphabet, the faster it gets, which is why it is what `grep` reaches for.
+#: O(n/m) best, O(n*m) worst, O(m + s) memory for alphabet size s. Compared
+#: right to left with skip-ahead shifts, so whole blocks of text are never
+#: examined — faster with longer patterns and larger alphabets, why `grep` uses it.
 #:
 #: Prefer `kmp_search` when the worst case matters or the alphabet is tiny
 #: (DNA, bits), where the skips shrink to nothing.
@@ -449,15 +384,12 @@ pub fn boyer_moore_search(text: str, pattern: str) -> list[int] {
 #: Return the start of every occurrence of `pattern` in `text`, using
 #: Rabin-Karp.
 #:
-#: O(n + m) expected, O(n * m) worst case, O(1) memory. One rolling hash of the
-#: pattern is compared against the hash of each window of the text, which is
-#: updated in constant time as the window slides; equal hashes are verified
-#: character by character, so the result is exact rather than probabilistic.
+#: O(n + m) expected, O(1) memory. A rolling hash updates in constant time per
+#: window; equal hashes are verified character by character, so the result is
+#: exact, not probabilistic.
 #:
-#: On its own it loses to `kmp_search`. It earns its place when the rolling
-#: hash does more work: hash k patterns of the same length into a set and find
-#: them all in one pass, detect duplicate substrings, or hash rows to search a
-#: 2-D grid.
+#: Loses to `kmp_search` alone — it earns its place when the hash does more
+#: work: many equal-length patterns at once, duplicate detection, or 2-D grids.
 #:
 #: ```
 #: rabin_karp_search("abcabc", "abc")   # [0, 3]
@@ -496,15 +428,11 @@ pub fn rabin_karp_search(text: str, pattern: str) -> list[int] {
 #: Return the Z array of `s`: `z[i]` is the length of the longest substring
 #: starting at `i` that is also a prefix of `s`.
 #:
-#: O(n) time and memory. The trick is the rightmost segment `[left, right)`
-#: already known to match a prefix: inside it, the answer at `i` is read off
-#: its mirror `i - left` for free, and only the part beyond `right` is ever
-#: compared, so the text cursor only moves forward.
+#: O(n) time and memory: the rightmost known-matching segment `[left, right)`
+#: lets `z[i]` be read off its mirror `i - left` for free, so the cursor only moves forward.
 #:
-#: This is the substrate for string search rather than a search itself. To find
-#: `pattern` in `text`, run it over `pattern + separator + text` where the
-#: separator occurs in neither, and every `i` with `z[i] == pattern.len()`
-#: marks a match. It also yields periods and borders directly.
+#: A substrate, not a search itself — run it over `pattern + separator + text`
+#: (separator absent from both); every `i` with `z[i] == pattern.len()` marks a match.
 #:
 #: ```
 #: z_algorithm("aabaab")   # [6, 1, 0, 3, 1, 0]
@@ -538,10 +466,9 @@ pub fn z_algorithm(s: str) -> list[int] {
 
 #: Find every occurrence of every pattern in `text` in a single pass.
 #:
-#: O(n + total pattern length + matches). Each match is
-#: `(pattern_index, start_position)`, ordered by where the match ends. Build an
-#: `AhoCorasick` yourself instead when the same patterns are searched in more
-#: than one text: this rebuilds the automaton on every call.
+#: O(n + total pattern length + matches), `(pattern_index, start_position)`
+#: ordered by match end. Build an `AhoCorasick` yourself for repeated
+#: searches — this rebuilds the automaton on every call.
 #:
 #: ```
 #: aho_corasick("ushers", ["he", "she", "his", "hers"])
@@ -598,11 +525,8 @@ fn _kmp_failure(pattern: list[int]) -> list[int] {
 
 #: Build the Boyer-Moore good suffix table.
 #:
-#: `shifts[j + 1]` is how far to slide the pattern after a mismatch at index
-#: `j`, and `shifts[0]` after a full match. The first pass handles the case
-#: where the matched suffix occurs again elsewhere in the pattern; the second
-#: fills the rest with the longest pattern prefix that is also a suffix of that
-#: matched part. Every entry is at least 1, so the search always advances.
+#: `shifts[j + 1]` is the slide after a mismatch at index `j`, `shifts[0]`
+#: after a full match. Every entry is at least 1, so the search always advances.
 fn _good_suffix_shifts(pattern: list[int]) -> list[int] {
     let m = pattern.len()
     let shifts = [0 for _ in 0..=m]

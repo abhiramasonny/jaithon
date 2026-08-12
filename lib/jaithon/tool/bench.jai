@@ -1,37 +1,20 @@
 #: The benchmark harness behind `jaithon bench`.
 #:
-#: There are two kinds of benchmark and the file says which it is. A file
-#: declaring top-level `bench_` functions taking no arguments is measured a
-#: function at a time, in this process. A file declaring only `main` — which is
-#: what everything in `tests/bench` is, because each of those has a Python peer
-#: that has to compute the same answer — is measured as a whole program, by
-#: running it the way a user would and timing the process. Either way the
-#: result is reported with its mean, median, fastest and slowest sample, its
-#: standard deviation and its throughput.
+#: A file with top-level `bench_` functions is measured one function at a
+#: time; a file with only `main` is run as a whole program instead — what
+#: every `tests/bench` pair is, so it stays comparable to its Python peer.
 #:
-#: Discovery is `tests/bench` and nothing else. `tests` as a whole is the wrong
-#: root: it also holds `tests/errors`, whose files do not parse *on purpose*,
-#: and a harness that walks into those reports seven parse failures for seven
-#: files doing their job. A path named on the command line is measured whatever
-#: it is called, because naming a file means wanting that file.
+#: Discovery is `tests/bench` only: the rest of `tests` holds files (like
+#: `tests/errors`) that don't parse *on purpose*, and walking into them would
+#: report failures for files doing their job.
 #:
-#: Calibration is what makes the numbers mean anything. A body that takes forty
-#: nanoseconds cannot be timed against a clock whose resolution is a
-#: microsecond, so the harness first times one call, then chooses a batch size
-#: that puts a whole sample comfortably above the clock's resolution, and
-#: finally chooses how many samples fit in the time budget. Every reported
-#: figure is per call, whatever the batch turned out to be.
+#: Calibration lifts a sample above the clock's resolution before timing it.
+#: Both mean and median are reported since a timing distribution is always
+#: skewed — an interrupted run inflates the mean, so the median, not the
+#: mean, is what a regression is measured against.
 #:
-#: Both the mean and the median are reported because they disagree exactly when
-#: the distribution is skewed, and a timing distribution always is: nothing
-#: makes a run faster than it can be, and a great many things make one slower.
-#: When the mean sits well above the median, something interrupted the run and
-#: the median is the honest number — which is why it, and not the mean, is what
-#: a regression is measured against.
-#:
-#: With a baseline file present, every benchmark is compared against its
-#: recorded median and anything slower by more than the threshold is a
-#: regression, and a regression is a non-zero exit status.
+#: With a baseline present, any benchmark slower than its recorded median by
+#: more than the threshold is a regression, and exits non-zero.
 #:
 #: ```
 #: is_bench_name("bench_sort")    # true
@@ -73,9 +56,9 @@ const _MAX_SAMPLES = 200
 const _MAX_BATCH = 10_000_000
 const _BASELINE_VERSION = 1
 
-# A whole-program sample costs a process, so the counts are much smaller than
-# the in-process ones. Five is `scripts/run_bench.sh`'s RUNS, and the least a
-# median means anything over.
+# Whole-program samples cost a process, so the counts are far smaller. Five
+# matches `scripts/run_bench.sh`'s RUNS — the least a median means anything
+# over.
 const _MIN_PROGRAM_SAMPLES = 5
 const _MAX_PROGRAM_SAMPLES = 50
 
@@ -101,11 +84,9 @@ pub fn bench_functions(source: str, path: str) -> list[str] {
 
 #: Report whether `source` declares a program entry point.
 #:
-#: A file with no `bench_` function but with a `main` is still a benchmark: it
-#: is measured as a whole program rather than a function at a time. That is
-#: what the pairs in `tests/bench` are, each with a Python peer computing the
-#: same answer, and measuring them any other way would stop the two being
-#: comparable.
+#: A file with no `bench_` function but a `main` is still a benchmark, run
+#: as a whole program — what `tests/bench` pairs need to stay comparable
+#: with their Python peer.
 #:
 #: ```
 #: declares_main("fn main() -> int { return 0 }\n", "b.jai")    # true
@@ -137,10 +118,9 @@ fn _declares_main_in(program: Node) -> bool {
 
 #: Choose the batch size and sample count for `body` within `budget` seconds.
 #:
-#: The batch is how many calls make up one sample and exists to lift a sample
-#: above the clock's resolution; the count is how many samples the budget
-#: affords, never fewer than ten — a standard deviation over three samples is
-#: not a measurement — and never more than two hundred.
+#: The batch lifts a sample above clock resolution; the count is what the
+#: budget affords, never fewer than ten (a stddev over three samples isn't a
+#: measurement) and never more than two hundred.
 pub fn calibrate(body: fn() -> any, budget: float) -> tuple[int, int] {
     # One untimed call pays for whatever the first call has to build.
     body()
@@ -170,14 +150,12 @@ pub fn measure(name: str, body: fn() -> any, budget: float = DEFAULT_BUDGET) -> 
 
 #: Measure `command` by running it to completion, repeatedly.
 #:
-#: A whole program cannot be batched — every sample is one process — so the
-#: only thing the budget buys is the number of samples, and the floor is five
-#: so that a median and a spread exist at all. The first run is a warm-up and
-#: is not recorded: it is the one that pays for reading the file, filling the
-#: page cache and writing the bytecode cache, and charging that to the program
-#: would overstate every benchmark by the same wrong amount.
+#: Each sample is one process, so the budget only buys sample count (floor
+#: five, so a median and spread exist). The first run is an unrecorded
+#: warm-up — it pays for the page and bytecode cache, and charging that to
+#: every sample would overstate them all by the same wrong amount.
 #:
-#: Raises `OSError` when the program fails, because a benchmark that computes
+#: Raises `OSError` when the program fails, since a benchmark that computes
 #: nothing is arbitrarily fast.
 pub fn measure_program(
     name: str,
@@ -196,10 +174,9 @@ pub fn measure_program(
 
 #: Return the `jaithon` executable to run a program benchmark with.
 #:
-#: `argv[0]` is the running interpreter whenever the tool was reached through
-#: the CLI, which is the case that matters: a build tree must benchmark its own
-#: build and not whichever `jaithon` happens to be installed. Anything else
-#: falls back to the one on `PATH`.
+#: `argv[0]` is preferred so a build tree benchmarks its own build, not
+#: whichever `jaithon` happens to be on `PATH`; anything else falls back to
+#: that.
 pub fn jaithon_executable() -> str {
     let argv = os_argv()
     if argv.len() > 0 and Path(argv[0]).is_executable() { return argv[0] }
@@ -219,12 +196,11 @@ pub fn shell_quote(argument: str) -> str {
     return "'" + argument.replace("'", "'\\''") + "'"
 }
 
-# One timed run of a child process. The clock covers the whole process, exactly
-# as `scripts/run_bench.sh` times it, so the two agree on what they measured.
+# Times the whole process, matching how `scripts/run_bench.sh` measures it.
 #
-# `run` starts the program directly, so what is timed is one process and no
-# shell: the argument list cannot be re-parsed, and standard error arrives
-# separately instead of interleaved into the output a failure has to report.
+# `run` starts the program directly, with no shell: the argument list can't
+# be re-parsed, and stderr arrives separately rather than interleaved into
+# the failure output.
 fn _time_process(command: list[str]) -> float {
     let start = Instant.now()
     let finished = run(command)
@@ -338,11 +314,10 @@ pub class Baseline {
 
 #: Run every benchmark in one file and return the results.
 #:
-#: `bench_` functions win when the file has any: it is executed once, in this
-#: module's namespace, and then each is called by name. A file with none but
-#: with a `main` is measured as a whole program instead. A file that is neither
-#: contributes nothing and says nothing — walking a directory turns up plenty
-#: of files that were never meant to be benchmarks.
+#: `bench_` functions win when present; a file with only `main` runs as a
+#: whole program instead. A file that's neither is silently skipped —
+#: walking a directory turns up plenty of files that were never meant to be
+#: benchmarks.
 pub fn run_file(path: str, filter: str?, budget: float) -> list[BenchmarkResult] {
     let source = read_file(path)
     let suite = module_name_of(path)
@@ -431,13 +406,10 @@ pub fn render_report(results: list[BenchmarkResult], baseline: Baseline, thresho
 #:               [--filter substring] [paths...]
 #: ```
 #:
-#: With no path, `tests/bench` is measured. `--save` writes the run to the
-#: baseline file instead of comparing against it. `--budget` is roughly how long
-#: each benchmark is given, in seconds; it is not spelled `--time` because the
-#: driver owns that flag for timing a whole run, and one word cannot mean two
-#: things on one command line. The exit status is 1 when any benchmark is slower
-#: than its baseline by more than the threshold, which is what makes a
-#: performance regression fail a build rather than be noticed six months later.
+#: With no path, `tests/bench` is measured. `--budget`, not `--time`: the
+#: driver owns that flag for timing a whole run. Exits 1 when any benchmark
+#: is slower than its baseline by more than the threshold — what makes a
+#: regression fail a build instead of surfacing six months later.
 pub fn main(args: list[str]) -> int {
     let options = _Options.parse(tail_arguments(args, "bench"))
     if options.usage_error is not null {
@@ -453,8 +425,7 @@ pub fn main(args: list[str]) -> int {
     try {
         paths = expand_paths(options.paths)
     } catch error: FileNotFoundError {
-        # The default root is only a default: being run from somewhere without
-        # one is a thing to say plainly, not a traceback.
+        # The default root is only a default — say so plainly, not with a traceback.
         print_err(f"jaithon bench: {error.message}")
         return 1
     }
@@ -502,8 +473,6 @@ pub fn main(args: list[str]) -> int {
 }
 
 # --- Formatting --------------------------------------------------------------
-
-# Seconds at whatever scale keeps three significant figures readable.
 fn _seconds(value: float) -> str {
     if value <= 0.0 { return "0" }
     if value < 1e-6 { return fixed(value * 1e9, 1) + "ns" }

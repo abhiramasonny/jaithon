@@ -1,16 +1,15 @@
 #: Classic dynamic-programming algorithms, solved bottom-up.
 #:
-#: Every table here is filled iteratively, and every routine whose answer has a
-#: witness — a subsequence, a set of items, a list of cuts — returns that
-#: witness beside the optimum rather than the optimal value alone. Each doc
-#: comment states the running time in terms of the input sizes it names.
+#: Every routine whose answer has a witness — a subsequence, a set of items, a
+#: list of cuts — returns that witness beside the optimum, not the optimal
+#: value alone.
 from std.func import memoize
 
 #: One step of an edit script, as produced by `edit_script`.
 #:
-#: `index` is a position in the source string: for `Keep`, `Replace` and
-#: `Delete` it is the index of the character consumed, and for `Insert` it is
-#: the index the new character is placed before.
+#: `index` is a position in the source string: for `Keep`/`Replace`/`Delete`
+#: it's the character consumed; for `Insert` it's the position the new
+#: character goes before.
 pub enum EditOp {
     #: The character at `index` already matches the target and is copied
     #: through; the only operation that does not count towards the distance.
@@ -75,8 +74,8 @@ pub class Submatrix {
 
 #: Return the `n`-th Fibonacci number, counting from `fibonacci(0) == 0`.
 #:
-#: Runs in O(n) additions and O(1) space. `F(92)` is the largest term that fits
-#: in a 64-bit integer; past it the addition raises `OverflowError`.
+#: `F(92)` is the largest term that fits in a 64-bit integer; past it the
+#: addition raises `OverflowError`.
 #:
 #: ```
 #: fibonacci(10)    # 55
@@ -87,8 +86,7 @@ pub fn fibonacci(n: int) -> int {
     if n == 0 { return 0 }
     var previous = 0
     var current = 1
-    # Stopping at F(n) rather than running one step past it is what keeps
-    # `fibonacci(92)` from forming F(93), which no int can hold.
+    # Stops at F(n), not F(n + 1) — F(93) would overflow.
     for _ in 1..n {
         let next = previous + current
         previous = current
@@ -99,11 +97,9 @@ pub fn fibonacci(n: int) -> int {
 
 #: Return the `n`-th Fibonacci number by raising `[[1, 1], [1, 0]]` to a power.
 #:
-#: Runs in O(log n) 2x2 matrix products. Because `M**(n - 1)` has `F(n)` in its
-#: top-left corner, the domain matches `fibonacci`: `n <= 92`. The exponential
-#: speed-up is theoretical at that size — the routine is here because the same
-#: squaring skeleton is what carries any linear recurrence, modular or not, to
-#: exponents no linear scan could reach.
+#: Same domain as `fibonacci` (`n <= 92`, since `M**(n-1)` puts F(n) in the
+#: top-left corner). The point isn't speed here — it's the squaring skeleton,
+#: which carries any linear recurrence to exponents no linear scan could reach.
 #:
 #: ```
 #: fibonacci_matrix(10)    # 55
@@ -117,10 +113,8 @@ pub fn fibonacci_matrix(n: int) -> int {
 
 #: Return one longest common subsequence of `a` and `b`.
 #:
-#: Runs in O(n*m) time and O(n*m) space, where n and m are the two lengths; the
-#: table is kept in full because the subsequence is reconstructed from it. When
-#: several subsequences tie, the one preferring earlier elements of `a` is
-#: returned. Its length is `result.len()`.
+#: The full O(n*m) table is kept, not just O(min(n,m)), so the subsequence can
+#: be reconstructed from it. Ties prefer earlier elements of `a`.
 #:
 #: ```
 #: longest_common_subsequence([1, 2, 3, 4, 5], [2, 3, 5, 7])    # [2, 3, 5]
@@ -158,10 +152,9 @@ pub fn longest_common_subsequence[T](a: list[T], b: list[T]) -> list[T] {
 
 #: Return one longest increasing subsequence of `xs`.
 #:
-#: This is the patience-sorting formulation: O(n log n) time, O(n) space. Each
-#: element is placed on the leftmost pile whose top is not smaller than it, and
-#: a parent link to the previous pile's top lets the run be read back at the
-#: end. With `strict: false` a non-decreasing subsequence is returned instead.
+#: Patience-sorting: each element goes on the leftmost pile whose top isn't
+#: smaller than it, and a parent link back to the previous pile's top lets the
+#: run be reconstructed without extra table space.
 #:
 #: ```
 #: longest_increasing_subsequence([10, 9, 2, 5, 3, 7, 101, 18])   # [2, 3, 7, 18]
@@ -170,8 +163,7 @@ pub fn longest_common_subsequence[T](a: list[T], b: list[T]) -> list[T] {
 pub fn longest_increasing_subsequence(xs: list[int], strict: bool = true) -> list[int] {
     let n = xs.len()
     if n == 0 { return [] }
-    # pile_top[k] is the index of the smallest tail among subsequences of
-    # length k + 1, and pile_values[k] is that tail's value.
+    # pile_top[k]/pile_values[k]: index/value of the smallest tail among length-(k+1) subsequences.
     let pile_top: list[int] = []
     let pile_values: list[int] = []
     let parent = [-1 for _ in 0..n]
@@ -197,7 +189,6 @@ pub fn longest_increasing_subsequence(xs: list[int], strict: bool = true) -> lis
 
 #: Return the Levenshtein distance between `source` and `target`.
 #:
-#: Insertion, deletion and substitution each cost one. Runs in O(n*m) time and
 #: O(min(n, m)) space — only two rows of the table are ever live. Use
 #: `edit_script` when the operations themselves are wanted.
 #:
@@ -223,9 +214,9 @@ pub fn edit_distance(source: str, target: str) -> int {
 
 #: Return a shortest sequence of edits turning `source` into `target`.
 #:
-#: Runs in O(n*m) time and space. The script is in source order and its cost —
-#: the number of non-`Keep` operations — equals `edit_distance(source, target)`.
-#: Ties are resolved towards substitution, then deletion, then insertion.
+#: The script is in source order; its cost (non-`Keep` operations) equals
+#: `edit_distance(source, target)`. Ties resolve substitution, then deletion,
+#: then insertion.
 #:
 #: ```
 #: let script = edit_script("kitten", "sitting")
@@ -270,9 +261,8 @@ pub fn edit_script(source: str, target: str) -> list[EditOp] {
 
 #: Apply `script` to `source` and return the resulting string.
 #:
-#: Runs in O(len(script)). Raises `ValueError` when an operation names a
-#: character that is not the one standing at its index in `source`, which makes
-#: this a checked inverse of `edit_script` rather than a blind replay.
+#: Raises `ValueError` when an operation names a character that doesn't match
+#: `source` at its index — a checked inverse of `edit_script`, not a blind replay.
 #:
 #: ```
 #: apply_edit_script("cat", edit_script("cat", "cart"))    # "cart"
@@ -298,9 +288,7 @@ pub fn apply_edit_script(source: str, script: list[EditOp]) -> str {
 
 #: Solve the 0/1 knapsack: return the best value and the indices achieving it.
 #:
-#: Each item may be taken at most once. Runs in O(n*capacity) time and space —
-#: the full table is retained so the chosen items can be read back. Weights must
-#: be non-negative and `weights` and `values` must have the same length.
+#: The full O(n*capacity) table is kept so the chosen items can be read back.
 #:
 #: ```
 #: knapsack_01([1, 3, 4, 5], [1, 4, 5, 7], 7)    # (9, [1, 2])
@@ -333,10 +321,8 @@ pub fn knapsack_01(weights: list[int], values: list[int], capacity: int) -> tupl
 
 #: Solve the unbounded knapsack: return the best value and the items used.
 #:
-#: Each item may be taken any number of times, so the returned index list is a
-#: multiset and may repeat an index. Runs in O(n*capacity) time and O(capacity)
-#: space. Items of weight zero are rejected, since they would be worth taking
-#: infinitely often.
+#: The returned index list is a multiset and may repeat an index. Items of
+#: weight zero are rejected, since they'd be worth taking infinitely often.
 #:
 #: ```
 #: knapsack_unbounded([3, 4, 5], [4, 5, 8], 10)    # (16, [2, 2])
@@ -377,9 +363,6 @@ pub fn knapsack_unbounded(
 
 #: Return a smallest multiset of `coins` summing to `amount`, or null.
 #:
-#: Runs in O(amount * len(coins)) time and O(amount) space. The coins are
-#: returned ascending; `coin_change_min(coins, 0)` is the empty list.
-#:
 #: ```
 #: coin_change_min([1, 5, 6, 9], 11)    # [5, 6]
 #: coin_change_min([5, 7], 3)           # null
@@ -410,9 +393,8 @@ pub fn coin_change_min(coins: list[int], amount: int) -> list[int]? {
 
 #: Count the distinct multisets of `coins` that sum to `amount`.
 #:
-#: Order does not matter: `1 + 2` and `2 + 1` are one way. Runs in
-#: O(amount * len(coins)) time and O(amount) space. Looping over coins outside
-#: and amounts inside is what makes combinations, not permutations, be counted.
+#: Order does not matter (`1 + 2` and `2 + 1` are one way): looping over coins
+#: outside and amounts inside is what counts combinations, not permutations.
 #:
 #: ```
 #: coin_change_ways([1, 2, 5], 5)    # 4
@@ -433,8 +415,7 @@ pub fn coin_change_ways(coins: list[int], amount: int) -> int {
 
 #: Return the indices of a sublist of `xs` summing to `target`, or null.
 #:
-#: Runs in O(n*target) time and space; the elements must be non-negative, which
-#: is what bounds the table. The indices come back ascending.
+#: Elements must be non-negative — that's what bounds the O(n*target) table.
 #:
 #: ```
 #: subset_sum([2, 3, 7, 8, 10], 11)          # [1, 3]
@@ -448,9 +429,8 @@ pub fn subset_sum(xs: list[int], target: int) -> list[int]? {
 
 #: Split the indices of `xs` into two groups of equal sum, or return null.
 #:
-#: Runs in O(n * sum(xs)) time and space, by looking for a sublist summing to
-#: half the total; an odd total is rejected outright. As for `subset_sum`, the
-#: elements must be non-negative.
+#: Looks for a sublist summing to half the total; an odd total is rejected
+#: outright. Elements must be non-negative, as for `subset_sum`.
 #:
 #: ```
 #: partition_equal([1, 5, 11, 5])    # ([2], [0, 1, 3])
@@ -471,10 +451,9 @@ pub fn partition_equal(xs: list[int]) -> tuple[list[int], list[int]]? {
 
 #: Return the cheapest cost of multiplying a chain of matrices, and its shape.
 #:
-#: `dimensions` holds n + 1 numbers describing n matrices, matrix i being
-#: `dimensions[i - 1]` by `dimensions[i]`. Runs in O(n**3) time and O(n**2)
-#: space. The second element of the result is the parenthesisation, with
-#: matrices named `A1` upwards.
+#: `dimensions` holds n + 1 numbers for n matrices: matrix i is
+#: `dimensions[i - 1]` by `dimensions[i]`. The shape string is the
+#: parenthesisation, matrices named `A1` upwards.
 #:
 #: ```
 #: matrix_chain_order([40, 20, 30, 10, 30])    # (26000, "((A1(A2A3))A4)")
@@ -506,9 +485,7 @@ pub fn matrix_chain_order(dimensions: list[int]) -> tuple[int, str] {
 
 #: Cut a rod of `length` for the best total price, returning price and pieces.
 #:
-#: `prices[i]` is what a piece of length `i + 1` sells for. Runs in
-#: O(length * len(prices)) time and O(length) space. The piece lengths come
-#: back ascending and sum to `length` whenever any cut is worth making.
+#: `prices[i]` is what a piece of length `i + 1` sells for.
 #:
 #: ```
 #: rod_cutting([1, 5, 8, 9, 10, 17, 17, 20], 8)    # (22, [2, 6])
@@ -538,9 +515,8 @@ pub fn rod_cutting(prices: list[int], length: int) -> tuple[int, list[int]] {
 
 #: Return the maximum-sum contiguous slice of `xs`.
 #:
-#: Kadane's scan: O(n) time, O(1) space. The slice is never empty, so an
-#: all-negative list yields its largest single element. Raises `ValueError` on
-#: an empty list, where no such slice exists.
+#: Kadane's scan. The slice is never empty, so an all-negative list yields its
+#: largest single element.
 #:
 #: ```
 #: max_subarray([-2, 1, -3, 4, -1, 2, 1, -5, 4]).sum      # 6
@@ -554,9 +530,9 @@ pub fn max_subarray(xs: list[int]) -> Subarray {
 
 #: Return the maximum-sum rectangular block of `grid`.
 #:
-#: Every pair of rows is fixed in turn, the columns between them are collapsed
-#: into a running sum, and Kadane's scan finds the best column span: O(r**2 * c)
-#: time and O(c) space for an r-by-c grid. The block is never empty.
+#: Fixes each pair of rows, collapses the columns between them into a running
+#: sum, and runs Kadane's scan for the best column span. The block is never
+#: empty.
 #:
 #: ```
 #: let grid = [[1, 2, -1, -4, -20], [-8, -3, 4, 2, 1],
@@ -575,8 +551,7 @@ pub fn max_submatrix(grid: list[list[int]]) -> Submatrix {
             throw ValueError(f"row {r} has {grid[r].len()} columns, expected {columns}")
         }
     }
-    # The single top-left cell is a valid block, so `best` starts admissible
-    # and every replacement below is a strict improvement.
+    # Seeded with the top-left cell (a valid block), so every replacement below is a strict improvement.
     var best = Submatrix(grid[0][0], 0, 0, 1, 1)
     for top in 0..rows {
         let column_sums = [0 for _ in 0..columns]
@@ -593,9 +568,7 @@ pub fn max_submatrix(grid: list[list[int]]) -> Submatrix {
 
 #: Choose non-adjacent houses of maximum total value.
 #:
-#: Runs in O(n) time and O(n) space, the space being the take/skip decisions the
-#: house list is read back from. The indices come back ascending and no two are
-#: consecutive.
+#: O(n) space holds the take/skip decision at each house, for reconstruction.
 #:
 #: ```
 #: house_robber([2, 7, 9, 3, 1])    # (12, [0, 2, 4])
@@ -630,11 +603,9 @@ pub fn house_robber(values: list[int]) -> tuple[int, list[int]] {
 
 #: Return the indices of a shortest jump path from the first cell to the last.
 #:
-#: `steps[i]` is the furthest distance forward that may be jumped from cell `i`.
-#: The greedy layer scan runs in O(n): from the cells reachable in `k` jumps,
-#: the one whose own reach is furthest is the only candidate worth taking. The
-#: path always starts at 0 and ends at `len(steps) - 1`, or is null when the end
-#: cannot be reached.
+#: `steps[i]` is the furthest distance forward that may be jumped from cell
+#: `i`. The greedy scan only needs the furthest-reaching cell at each layer —
+#: it's always at least as good as any other reachable cell.
 #:
 #: ```
 #: jump_game([2, 3, 1, 1, 4])    # [0, 1, 4]
@@ -672,8 +643,7 @@ pub fn jump_game(steps: list[int]) -> list[int]? {
 
 #: Count the paths from the top-left to the bottom-right cell of `grid`.
 #:
-#: Only steps right and down are allowed, and a `true` cell is an obstacle.
-#: Runs in O(r*c) time and O(c) space, one row of counts at a time.
+#: Only steps right and down are allowed; a `true` cell is an obstacle.
 #:
 #: ```
 #: unique_paths([[false, false, false], [false, true, false], [false, false, false]])   # 2
@@ -704,9 +674,8 @@ pub fn unique_paths(grid: list[list[bool]]) -> int {
 
 #: Split `text` into a sequence of `words`, or return null if it cannot be done.
 #:
-#: Runs in O(n*L) substring probes for a text of length n and a longest word of
-#: length L, since only the last L characters can start the final word. The
-#: first segmentation found for each prefix is the one reported.
+#: Only the last L characters (L = longest word) can start the final word,
+#: which bounds the search. The first segmentation found per prefix wins.
 #:
 #: ```
 #: word_break("applepenapple", {"apple", "pen"})                    # ["apple", "pen", "apple"]
@@ -740,9 +709,8 @@ pub fn word_break(text: str, words: set[str]) -> list[str]? {
 
 #: Split `text` into the fewest palindromic pieces possible.
 #:
-#: A palindrome table is filled in O(n**2) first, then a single left-to-right
-#: pass finds the minimum-cut split, also O(n**2). The pieces concatenate back
-#: to `text`, and `pieces.len() - 1` is the classic minimum cut count.
+#: A palindrome table is filled first, then a single left-to-right pass finds
+#: the minimum-cut split.
 #:
 #: ```
 #: palindrome_partitioning("aab")        # ["aa", "b"]
@@ -765,8 +733,7 @@ pub fn palindrome_partitioning(text: str) -> list[str] {
     let cuts = [0 for _ in 0..=n]
     let start_of = [0 for _ in 0..=n]
     for stop in 1..=n {
-        # Seed with the always-valid split that peels off the last character on
-        # its own, so `start_of` never holds a span that is not a palindrome.
+        # Seeded with peeling off the last character alone — always a valid (palindrome) split.
         cuts[stop] = cuts[stop - 1] + 1
         start_of[stop] = stop - 1
         for start in 0..stop - 1 {
@@ -787,11 +754,9 @@ pub fn palindrome_partitioning(text: str) -> list[str] {
 
 #: Return the `n`-th Catalan number, counting from `catalan(0) == 1`.
 #:
-#: Uses the convolution `C(n) = sum C(i) * C(n - 1 - i)`, which is O(n**2) but
-#: never forms a value larger than the answer itself — the closed form
-#: `binomial(2n, n) / (n + 1)` overflows long before the result does.
-#: `C(35)` is the last Catalan number that fits in a 64-bit integer; past it the
-#: addition raises `OverflowError`.
+#: Uses the convolution `C(n) = sum C(i) * C(n-1-i)`, which never forms a value
+#: larger than the answer — the closed form `binomial(2n,n)/(n+1)` overflows
+#: long before the result does. `C(35)` is the last one that fits a 64-bit int.
 #:
 #: ```
 #: catalan(5)     # 42
@@ -812,10 +777,8 @@ pub fn catalan(n: int) -> int {
 #: Turn a recursive definition into a memoised function.
 #:
 #: `body` is called with the memoised function itself as its first argument, so
-#: a recursive rule can be written directly without naming the function it is
-#: defining, and every recursive call goes through the cache. The cache is the
-#: one from `std.func.memoize`, keyed on the argument; the argument must
-#: therefore be hashable. Each distinct argument evaluates `body` exactly once.
+#: a recursive rule can be written without naming the function it defines. The
+#: argument must be hashable — it's the cache key.
 #:
 #: ```
 #: let fib = memoize_recursive(fn(recurse, n) {
@@ -825,8 +788,7 @@ pub fn catalan(n: int) -> int {
 #: fib(50)    # 12586269025
 #: ```
 pub fn memoize_recursive(body: fn(fn(any) -> any, any) -> any) -> fn(any) -> any {
-    # `recurse` is a var so the closure below captures the cell, not the
-    # placeholder: it is patched to the memoised entry point on the next line.
+    # `var`, not `let` — the closure below must capture the cell, patched to the real entry point next.
     var recurse: fn(any) -> any = |argument| argument
     recurse = memoize(fn(argument: any) -> any { return body(recurse, argument) })
     return recurse
@@ -839,8 +801,7 @@ fn _mat2_fib_power(exponent: int) -> list[int] {
     while remaining > 0 {
         if remaining & 1 == 1 { result = _mat2_multiply(result, base) }
         remaining >>= 1
-        # Skipping the final squaring keeps every intermediate entry at or below
-        # F(92), which is what lets `fibonacci_matrix(92)` fit in an int.
+        # Skips the final squaring — keeps every intermediate entry at or below F(92).
         if remaining > 0 { base = _mat2_multiply(base, base) }
     }
     return result
@@ -932,8 +893,7 @@ fn _subset_indices(reachable: list[list[bool]], xs: list[int], target: int) -> l
     var remaining = target
     var i = xs.len()
     while i > 0 {
-        # Element i - 1 is needed exactly when the same sum was out of reach
-        # without it.
+        # Element i - 1 is needed exactly when the sum was out of reach without it.
         if not reachable[i - 1][remaining] {
             picked.push(i - 1)
             remaining -= xs[i - 1]

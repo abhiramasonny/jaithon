@@ -1,44 +1,28 @@
 #: OS threads: mutexes, atomics, bounded channels, a thread pool, and parallel
 #: map, for and reduce over a list.
 #:
-#: ## The safety contract — read this before using anything else
+#: **A worker callback (`spawn`, `ThreadPool.submit`, `parallel_map`,
+#: `parallel_for`, `parallel_reduce`) must be a pure function of its inputs:**
+#: read arguments and captured bindings, allocate, return a value -- that is
+#: all.
 #:
-#: Every callback handed to `spawn`, `ThreadPool.submit`, `parallel_map`,
-#: `parallel_for` or `parallel_reduce` runs on a different OS thread from the
-#: one that created it. **A worker callback must be a pure function of its
-#: inputs.** It may read its arguments and the bindings it captured, allocate
-#: whatever it likes, and return a value. That is all. Concretely:
+#: - Do not assign to a captured `var` -- it's captured by reference (spec
+#:   §6), so two workers incrementing one counter race and undercount.
+#: - Do not mutate a list, dict, set or object another thread can reach,
+#:   including the list passed to `parallel_map`; reading is fine.
+#: - Do not read a field another thread writes unless *every* access to that
+#:   object happens under the same `Mutex`.
+#: - `Mutex`, `Atomic` and `Channel` are the exceptions: safe to share from
+#:   any thread. A worker publishes only through one of those three, or its
+#:   return value.
 #:
-#: - Do not assign to a captured `var`. Language spec §6 captures `var` by
-#:   reference, so two workers incrementing one captured counter is a data race
-#:   and the total will be wrong on a machine you do not own.
-#: - Do not mutate a list, dict, set or object another thread can reach — the
-#:   list passed to `parallel_map` included. Reading it is fine, and every
-#:   function here only ever reads it.
-#: - Do not read a field of an object another thread writes unless *every*
-#:   access to that object, reads included, happens under the same `Mutex`.
+#: No condition variables exist, so `Channel.send`/`recv` and `Future.get`
+#: block by spinning then sleeping with back-off capped at 2ms. A thread can
+#: trail the event that woke it by up to that cap -- do not build a hard
+#: deadline on it.
 #:
-#: `Mutex`, `Atomic` and `Channel` are the exceptions: they exist to be shared
-#: and every operation on them is safe from any thread. Anything a worker wants
-#: to publish leaves through one of those three or through its return value.
-#:
-#: ## How blocking is implemented
-#:
-#: The primitive surface gives us mutexes and atomics but no condition
-#: variables, so `Channel.send`, `Channel.recv` and `Future.get` block by
-#: spinning briefly and then sleeping with exponential back-off, capped at two
-#: milliseconds. Throughput is unaffected — a busy pool never reaches the
-#: sleeping stage — but a thread woken by the last back-off step can trail the
-#: event that woke it by up to that cap. Do not build a hard deadline on it.
-#:
-#: ## Primitives used
-#:
-#: `thread_spawn`, `thread_join`, `cpu_count`, `mutex_new`, `mutex_lock`,
-#: `mutex_unlock`, `mutex_try_lock`, `atomic_new`, `atomic_load`,
-#: `atomic_store`, `atomic_add`, `atomic_exchange`, `atomic_cas` and `sleep`.
-#: A native mutex and a native atomic cell are owned by the `Mutex` and
-#: `Atomic` object that created them and are released when it is collected, so
-#: neither type needs — or has — a `free`.
+#: A native mutex/atomic cell is owned by the `Mutex`/`Atomic` object that
+#: created it and released when collected, so neither type has a `free`.
 #:
 #: ```
 #: parallel_map([1, 2, 3, 4], |x| x * x)             # [1, 4, 9, 16]
@@ -46,18 +30,17 @@
 #: ```
 from std.core import Iterable, Iterator
 
-# Rounds of pure spinning before the first sleep. A hand-off between two
-# running threads almost always completes inside this window, which is why the
-# back-off below never shows up in the throughput of a saturated pool.
+# Chosen so a hand-off between threads almost always completes before the
+# first sleep, keeping a saturated pool's throughput unaffected by back-off.
 const _SPIN_LIMIT = 40
 const _MIN_BACKOFF: float = 0.00002
 const _MAX_BACKOFF: float = 0.002
 
 #: Lists shorter than this are processed on the calling thread.
 #:
-#: Spawning a thread costs far more than mapping a handful of elements, so the
-#: parallel functions fall back to a sequential pass below this length. It is
-#: also what makes them deterministic and cheap in a doc example.
+#: Spawning a thread costs far more than mapping a few elements, so parallel
+#: functions fall back to sequential below this length -- which also keeps
+#: them deterministic in a doc example.
 pub const MIN_PARALLEL_ITEMS = 64
 
 #: Return the number of hardware threads the machine reports, at least 1.
@@ -69,9 +52,9 @@ pub fn cpu_count() -> int {
 
 #: A mutual-exclusion lock guarding data shared between threads.
 #:
-#: The lock is **not** reentrant: locking it twice from one thread deadlocks
-#: that thread. Prefer `locked`, which cannot leak a lock down an exceptional
-#: path, over hand-written `lock`/`unlock` pairs.
+#: **Not** reentrant: locking it twice from one thread deadlocks that thread.
+#: Prefer `locked`, which cannot leak a lock down an exceptional path, over
+#: hand-written `lock`/`unlock` pairs.
 pub class Mutex {
     let handle: int
 
@@ -107,9 +90,8 @@ pub class Mutex {
 
 #: An integer that every thread can read and update without a lock.
 #:
-#: Use it for counters and flags. Anything larger than one integer — a running
-#: list, a best-so-far object — needs a `Mutex` instead, because a sequence of
-#: atomic operations is not itself atomic.
+#: Use it for counters and flags. Anything larger needs a `Mutex` instead,
+#: because a sequence of atomic operations is not itself atomic.
 pub class Atomic {
     let cell: int
 
@@ -142,8 +124,8 @@ pub class Atomic {
 
     #: Store `desired` only if the current value is `expected`.
     #:
-    #: Returns whether the store happened. This is the building block for
-    #: "exactly one thread wins" — a one-shot initialiser, a first-error slot.
+    #: Returns whether the store happened -- the building block for "exactly
+    #: one thread wins".
     #:
     #: ```
     #: let flag = Atomic(0)
@@ -159,14 +141,12 @@ pub class Atomic {
 
 #: A bounded first-in-first-out queue that hands values between threads.
 #:
-#: `send` blocks while the channel is full and `recv` blocks while it is empty,
-#: so a fixed capacity is also the back-pressure that stops a fast producer
-#: from growing an unbounded backlog. Closing the channel is how a producer
-#: says "no more values": queued values still arrive, and `recv` returns null
-#: once the last one has been taken.
+#: `send` blocks while full and `recv` blocks while empty, so capacity is also
+#: back-pressure. Closing means "no more values": queued values still arrive,
+#: and `recv` returns null once the last one is taken.
 #:
-#: Since null ends iteration, a channel carrying values that may themselves be
-#: null must wrap them — in a one-element list, or a `Pair`.
+#: Null ends iteration, so a channel carrying null values must wrap them -- in
+#: a one-element list, or a `Pair`.
 #:
 #: ```
 #: let channel = Channel(2)
@@ -203,8 +183,7 @@ pub class Channel: Iterable[any] {
     pub fn send(self, value: any) -> void {
         var spins = 0
         loop {
-            # `defer` unlocks at function exit, not at the end of the loop body,
-            # so every path out of the critical section unlocks by hand here.
+            # `defer` unlocks at function exit, not loop-body end, so every path out unlocks by hand here.
             self.lock.lock()
             if self.closed {
                 self.lock.unlock()
@@ -339,8 +318,7 @@ pub class Handle {
     #: Wait for the thread to finish and return the value its body produced.
     #:
     #: An exception that escaped the body is re-raised here, on the joining
-    #: thread, with its original type and message. Joining twice returns the
-    #: same result again rather than blocking.
+    #: thread. Joining twice returns the same result again rather than blocking.
     pub fn join(self) -> any {
         if not self.joined {
             self.outcome = __prim__.thread_join(self.id)
@@ -392,8 +370,8 @@ pub class Future {
     #: Wait for the work to finish and return its value.
     #:
     #: An exception raised by the submitted function is re-raised here. Calling
-    #: `get` twice returns the same result again. Raises `RuntimeError` when the
-    #: pool shut down before the work ran.
+    #: `get` twice returns the same result. Raises `RuntimeError` if the pool
+    #: shut down before the work ran.
     pub fn get(self) -> any {
         var outcome = self.outcome
         if outcome is null {
@@ -407,9 +385,9 @@ pub class Future {
 
 #: A fixed set of worker threads pulling jobs off one bounded queue.
 #:
-#: Create the pool once and keep it: the whole point is to pay for thread
-#: creation once instead of once per job. `submit` blocks when the queue is
-#: full, which throttles the producer instead of letting the backlog grow.
+#: Create the pool once and keep it: the point is to pay for thread creation
+#: once instead of once per job. `submit` blocks when the queue is full,
+#: throttling the producer instead of letting the backlog grow.
 #:
 #:     let pool = ThreadPool()
 #:     defer { pool.join() }
@@ -467,10 +445,10 @@ pub class ThreadPool {
 
 #: Apply `transform` to every element of `items` in parallel, in order.
 #:
-#: The result is the same list `items.map(transform)` would produce; only the
-#: order the elements are *visited* in is unspecified. Each worker builds its
-#: own slice of the answer, so no lock is taken and no element is contended.
-#: `transform` must obey the purity contract at the top of this module.
+#: Produces the same list as `items.map(transform)`; only the order elements
+#: are *visited* in is unspecified. Each worker builds its own slice, so
+#: nothing is shared or contended. `transform` must obey the purity contract
+#: at the top of this module.
 #:
 #: `workers` is the number of threads, or 0 for one per hardware thread.
 #:
@@ -491,11 +469,9 @@ pub fn parallel_map(items: list[any], transform: fn(any) -> any, workers: int = 
 
 #: Run `body` once per element of `items`, in parallel, for its side effects.
 #:
-#: This is the one function here whose callback is *not* required to be pure —
-#: a body with no side effects would do nothing at all. Its effects must still
-#: be safe to interleave: write to state private to the body, to an `Atomic`,
-#: to a `Channel`, or to shared state guarded by a `Mutex`. Elements are
-#: visited in an unspecified order.
+#: The one function here whose callback need *not* be pure. Effects must still
+#: be safe to interleave: write to state private to the body, an `Atomic`, a
+#: `Channel`, or state guarded by a `Mutex`. Visit order is unspecified.
 #:
 #:     let failures = Atomic(0)
 #:     parallel_for(urls, fn(url) -> void {
@@ -546,9 +522,8 @@ pub fn parallel_reduce(
     return total
 }
 
-# The value a worker thread hands back: either a result or the exception that
-# replaced it. Exceptions cannot cross a native thread boundary on their own,
-# so the guard below turns one into a value and `unwrap` turns it back.
+# Exceptions cannot cross a native thread boundary, so the guard below turns
+# one into a value and `unwrap` turns it back.
 class _Outcome {
     let value: any
     let error: Error?

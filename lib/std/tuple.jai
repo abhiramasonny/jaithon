@@ -1,14 +1,9 @@
 #: Operations on tuples, and named tuples built from a list of field names.
 #:
 #: Tuples are fixed-size and immutable, so everything here returns a new value.
-#: Arity is part of a tuple's type, which is why `from_list` has to enumerate
-#: the shapes it can build.
 const _MAX_ARITY = 8
 
 #: The shape of a named tuple: a type name plus its field names.
-#:
-#: Calling the shape builds a record, exactly as calling a class does. Build a
-#: shape with `named_tuple`.
 pub class NamedTupleType {
     #: The name this shape prints under.
     pub let name: str
@@ -151,9 +146,8 @@ pub class NamedTuple {
 
 #: Define a named-tuple shape and return the constructor for it.
 #:
-#: `fields` is either a list of names or one string of names separated by
-#: spaces or commas. Fields are read back by name or by position: Jaithon has
-#: no dynamic attribute lookup, so `point["x"]` stands in for `point.x`.
+#: Jaithon has no dynamic attribute lookup, so `point["x"]` stands in for
+#: `point.x`.
 #:
 #: ```
 #: let Point = named_tuple("Point", "x y")

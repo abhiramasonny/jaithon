@@ -1,56 +1,11 @@
 #: An immediate-mode user interface drawn on a `Canvas`.
 #:
-#: There is no widget tree and no retained state to keep in step with the
-#: program: a widget is a function call that draws the control and returns what
-#: the user did to it. A button call returns whether it was clicked this frame;
-#: a slider call takes the current value and returns the new one. The only
-#: state `UI` keeps between frames is which widget the pointer is over, which
-#: one is being dragged, and which text field has focus — three strings.
-#:
 #: Every widget takes an `id` that must be unique among the widgets alive in
-#: the same frame. Two controls sharing an id drag together.
+#: the same frame — two controls sharing an id drag together.
 #:
-#: A complete tool, at 60 frames per second:
-#:
-#:     from std.gui import Window
-#:     from std.gui.canvas import Canvas
-#:     from std.gui.input import Input
-#:     from std.gui.widgets import UI, Theme
-#:
-#:     fn main() -> int {
-#:         let window = Window(420, 260, "mixer", target_fps: 60)
-#:         defer { window.close() }
-#:         let ui = UI(Canvas(window), Input(window))
-#:
-#:         var gain = 0.5
-#:         var muted = false
-#:         var name = "track 1"
-#:
-#:         loop {
-#:             if not window.poll() { break }
-#:             ui.begin()
-#:             ui.canvas.clear(ui.theme.background)
-#:
-#:             ui.panel(10, 10, 400, 240, "mixer")
-#:             name = ui.text_field("name", 24, 50, 250, name)
-#:             gain = ui.slider("gain", 24, 90, 250, gain, 0.0, 1.0)
-#:             ui.label(288, 92, f"{gain:.2f}")
-#:             muted = ui.checkbox("mute", 24, 130, "mute", muted)
-#:             if ui.button("reset", 24, 170, 90, 26, "reset") {
-#:                 gain = 0.5
-#:                 muted = false
-#:             }
-#:             ui.label(24, 216, f"{window.fps():.0f} fps")
-#:
-#:             ui.end()
-#:             window.present()
-#:         }
-#:         return 0
-#:     }
-#:
-#: `begin` must be called before the first widget of a frame and `end` after
-#: the last: `begin` clears the hover state the widgets are about to set, and
-#: `end` is what notices that the mouse button was let go somewhere else.
+#: Call `begin` before the first widget of a frame and `end` after the last:
+#: `begin` clears the hover state, and `end` is what notices the mouse button
+#: was let go somewhere else.
 from std.gui.canvas import Canvas, rgb, GLYPH_HEIGHT, GLYPH_WIDTH, GLYPH_SPACING
 from std.gui.input import Input, Key, MouseButton
 
@@ -60,14 +15,11 @@ pub const WIDGET_HEIGHT = 22
 #: Side of a checkbox's box, in pixels.
 pub const CHECKBOX_SIZE = 16
 
-# Horizontal advance of one character of the built-in font.
 let _ADVANCE = GLYPH_WIDTH + GLYPH_SPACING
 
-# Text inset from the left edge of a field or a button.
 const _PADDING = 6
 
-# Frames the caret spends visible, and again hidden. At 60 fps this is a blink
-# a little under twice a second, which is the usual rate.
+# Frames caret is visible / hidden; 30 frames is a ~2Hz blink at 60fps.
 const _CARET_PERIOD = 30
 
 #: The eight colours every widget draws itself from.
@@ -184,9 +136,8 @@ pub class UI {
 
     #: Finish a frame. Call it after the last widget.
     #:
-    #: Releasing the button anywhere ends a drag, which is why this cannot be
-    #: left to the widget: the pointer is usually somewhere else by then.
-    #: Pressing it over no widget at all drops text-field focus.
+    #: Ending a drag can't be left to the widget — the pointer is usually
+    #: somewhere else by release time. Also drops focus if nothing was hit.
     pub fn end(self) -> void {
         if not self.input.mouse.is_down(MouseButton.Left) { self.active = "" }
         if self.input.mouse.just_pressed(MouseButton.Left) and self.hot.len() == 0 {
@@ -204,8 +155,8 @@ pub class UI {
 
     #: Draw a button and report whether it was clicked this frame.
     #:
-    #: A click is a press and a release both inside the button, so dragging off
-    #: it cancels — the behaviour every desktop toolkit has.
+    #: A click needs press and release both inside the button; dragging off
+    #: it cancels.
     pub fn button(self, id: str, x: int, y: int, width: int, height: int, label: str) -> bool {
         let hovering = self._hover(id, x, y, width, height)
         var clicked = false
@@ -262,9 +213,8 @@ pub class UI {
 
     #: Draw a horizontal slider and return its value after this frame's drag.
     #:
-    #: The value is clamped into `[minimum, maximum]` on the way in, so a
-    #: caller can hand back whatever it stored without checking it first.
-    #: Raises `ValueError` when the range is empty.
+    #: Auto-clamps into `[minimum, maximum]`, so a caller can pass back an
+    #: unchecked stored value. Raises `ValueError` when the range is empty.
     pub fn slider(
         self,
         id: str,
@@ -303,20 +253,12 @@ pub class UI {
     }
 
     #: Draw an editable single-line text field and return its new contents.
-    #:
-    #: Clicking gives it focus and puts the caret where the click landed;
-    #: clicking anywhere else takes focus away. Typing inserts what the
-    #: platform composed — the user's real layout, dead keys and all — and
-    #: Backspace, Delete, Left, Right, Home and End move and edit, with
-    #: auto-repeat while held. Text longer than the field scrolls to keep the
-    #: caret in view.
     pub fn text_field(self, id: str, x: int, y: int, width: int, value: str) -> str {
         let hovering = self._hover(id, x, y, width, WIDGET_HEIGHT)
         let inner_x = x + _PADDING
         let inner_width = width - 2 * _PADDING
         if hovering and self.input.mouse.just_pressed(MouseButton.Left) {
             self.focused = id
-            # Put the caret at the nearest character boundary to the click.
             let column = (self.input.mouse.x() - inner_x + _ADVANCE // 2) // _ADVANCE
             self.caret = min(max(column, 0), value.len())
         }
@@ -327,7 +269,6 @@ pub class UI {
         self.canvas.fill_rounded_rect(x, y, width, WIDGET_HEIGHT, 4, face)
         let outline = if focused { self.theme.accent } else { self.theme.border }
         self.canvas.rounded_rect(x, y, width, WIDGET_HEIGHT, 4, outline)
-        # Keep the caret on screen by sliding the whole string left.
         let caret_offset = self.caret * _ADVANCE
         let scroll = if focused { max(caret_offset - inner_width, 0) } else { 0 }
         let text_y = y + (WIDGET_HEIGHT - GLYPH_HEIGHT) // 2
@@ -360,8 +301,6 @@ pub class UI {
         return inside
     }
 
-    # One frame of editing for the focused field. Every key that moves or
-    # deletes honours auto-repeat, so holding one down keeps going.
     fn _edit(self, value: str) -> str {
         var result = value
         var caret = min(self.caret, result.len())

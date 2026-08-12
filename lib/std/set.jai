@@ -1,11 +1,7 @@
 #: Set algebra as free functions over any number of sets, plus multisets.
 #:
-#: The built-in `set` type has `add`, `del`, `len` and `in`. What it does not
-#: have is the algebra: this module supplies it in n-ary form, so the common
-#: "intersect all of these" reads as one call rather than a fold.
-#:
-#: A multiset is an ordinary `dict[T, int]` mapping each element to how many
-#: times it occurs; `std.list.frequency` builds one from a list.
+#: The built-in `set` has `add`/`del`/`len`/`in` but no algebra; this module adds
+#: it in n-ary form, so "intersect all of these" is one call, not a fold.
 from std.list import power_set as list_power_set
 
 #: An element-to-count mapping. Counts are always positive; absent means zero.

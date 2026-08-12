@@ -1,10 +1,9 @@
 #: General-purpose collections: the `Counter` and `Bag` multisets, plus every
 #: other collection in the package re-exported.
 #:
-#: `from std.collections import Deque, Heap, LRUCache` reaches everything. The
-#: sub-modules — `heap`, `linked`, `ring`, `dicts`, `lru` — exist so that a
-#: program wanting only a heap does not compile the rest, and so that no file
-#: here holds more than one family of structures.
+#: Submodules — `heap`, `linked`, `ring`, `dicts`, `lru` — stay split so a
+#: program wanting only a heap doesn't compile the rest, and no file holds more
+#: than one family of structures.
 from std.core import Iterable, Iterator
 from std.collections.heap import Heap, IndexedHeap, merge, nlargest, nsmallest
 from std.collections.linked import DoublyLinkedList, DoublyNode
@@ -23,10 +22,9 @@ pub class Counter[T]: Iterable[T] {
 
     #: Create an empty counter. O(1).
     #:
-    #: Counts may be negative — that is what makes `subtract` total — and a
-    #: count of zero is never stored, so `len`, `keys` and `in` always agree
-    #: with each other. Use `Bag` when counts are multiplicities rather than
-    #: measurements.
+    #: Counts may be negative (that's what makes `subtract` total); a zero count
+    #: is never stored, so `len`/`keys`/`in` stay consistent. Use `Bag` instead
+    #: when counts are multiplicities rather than measurements.
     pub fn init(self) {
         self.counts = {}
     }

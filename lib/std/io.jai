@@ -1,10 +1,5 @@
 #: Files, paths, buffered streams, the standard streams, and delimited text.
 #:
-#: The whole module is POSIX-shaped: paths are separated by `/`, a file is a
-#: stream of bytes with no text mode to opt into, and the three standard streams
-#: are ordinary `File` values that can be written to and buffered like any
-#: other.
-#:
 #: Four layers, from the shortest thing that works to the most controlled:
 #:
 #: - `read_file`, `write_file`, `read_lines` and friends do the whole job in one
@@ -23,31 +18,9 @@
 #: Path("/tmp/jaithon-io-doc.txt").stem()       # "jaithon-io-doc"
 #: ```
 #:
-#: Text is UTF-8 everywhere. The readers decode on a character boundary even
-#: when a buffer boundary falls in the middle of a multi-byte sequence, so a
-#: chunked read of a file and a whole-file read produce the same string.
-#:
-#: ## The primitive contract
-#:
-#: Everything here reaches the operating system through the `io` primitives of
-#: the language specification, and only through the private wrappers at the
-#: bottom of this file. Those primitives are:
-#:
-#: - `io_open(path, mode)` returns an opaque stream handle, or raises
-#:   `FileNotFoundError`, `PermissionError` or `IOError`.
-#: - `io_read(handle, count) -> bytes` reads at most `count` bytes, or the rest
-#:   of the stream when `count` is negative, and returns empty at end of stream.
-#: - `io_write(handle, data) -> int` writes a `bytes`, or a `str` encoded as
-#:   UTF-8, and returns the number of bytes written.
-#: - `io_seek(handle, offset, whence) -> int` returns the new absolute position.
-#: - `io_close(handle)`, `io_flush(handle)`.
-#: - `io_stat(path, follow = false) -> dict?` is null when nothing is there, and
-#:   otherwise has `kind` (`"file"`, `"dir"`, `"link"` or `"other"`), `size` in
-#:   bytes, `modified` in nanoseconds since the Unix epoch, and `mode`
-#:   permission bits. It reports the link itself unless `follow` asks for the
-#:   target, which is what `is_file` and `is_dir` want.
-#: - `io_listdir(path) -> list[str]`, `io_mkdir(path)`, `io_remove(path)`, the
-#:   last of which removes one file or one empty directory.
+#: Paths are separated by `/`, a file has no text mode to opt into, and text is
+#: UTF-8 everywhere. Everything here reaches the operating system only through
+#: the private primitive wrappers at the bottom of this file.
 from std.core import Comparable, Hashable, Iterable, Iterator, Printable, cmp
 from std.time import DateTime
 
@@ -72,15 +45,9 @@ let _MODES = ["r", "w", "a", "r+", "w+", "a+"]
 
 #: One open operating-system handle, unbuffered.
 #:
-#: A `File` does no buffering of its own: each `read` and `write` is one system
-#: call. That is what you want for whole-file transfers and for the standard
-#: streams, and what you do not want for a loop over lines — wrap the file in a
-#: `BufferedReader` for that.
-#:
-#: A file is closed by `close`, which is idempotent, and every operation on a
-#: closed file raises `IOError`. Nothing closes a file for you, so pair the
-#: `open` with a `defer` and the file is closed on both the normal and the
-#: exceptional path:
+#: Each `read` and `write` is one system call — fine for whole-file transfers,
+#: wasteful for a line-by-line loop (use `BufferedReader` instead). Nothing
+#: closes a file for you, so pair `open` with `defer { file.close() }`:
 #:
 #: ```
 #: write_file("/tmp/jaithon-file-doc.txt", "alpha\nbeta\n")
@@ -98,18 +65,16 @@ pub class File: Printable {
     #: The mode the file was opened in.
     pub let mode: str
 
-    #: The stream this file reads and writes. `io_open` returns one; the
-    #: integers 0, 1 and 2 name the standard streams. It is opaque either way,
-    #: so it is only ever handed straight back to an `io_` primitive.
+    #: The stream this file reads and writes: opaque, only ever handed
+    #: straight back to an `io_` primitive.
     let handle: any
     var closed: bool
 
     #: Adopt an already-open `handle`, such as one end of a pipe.
     #:
-    #: `open` is what a caller normally wants. This constructor exists for
-    #: handles that did not come from a path — the standard streams and the
-    #: pipes of a spawned process — and takes ownership of the handle: closing
-    #: the file closes the handle.
+    #: `open` is what a caller normally wants; this exists for handles that
+    #: did not come from a path (standard streams, spawned-process pipes) and
+    #: takes ownership of `handle`.
     pub fn init(self, handle: any, name: str, mode: str) {
         self.handle = handle
         self.name = name
@@ -217,11 +182,9 @@ pub class File: Printable {
 #: A reader that turns many small reads of a `File` into few large ones.
 #:
 #: Reading a file line by line without buffering costs one system call per
-#: character. This reader pulls `capacity` bytes at a time and hands out lines
-#: and chunks from what it holds, so the cost is one system call per buffer.
-#:
-#: It decodes UTF-8 on character boundaries: a multi-byte character split across
-#: two buffers is held back until the rest of it arrives.
+#: character; this pulls `capacity` bytes at a time instead. It decodes UTF-8
+#: on character boundaries, holding back a multi-byte character split across
+#: two buffers until the rest arrives.
 #:
 #: ```
 #: write_file("/tmp/jaithon-reader-doc.txt", "alpha\nbeta\ngamma\n")
@@ -255,9 +218,8 @@ pub class BufferedReader: Iterable[str] {
     #: same as one with LF terminators. A final line without a terminator is
     #: still returned.
     pub fn read_line(self) -> str? {
-        # Counted from `position` rather than from the start of the buffer,
-        # because `_fill` drops the consumed prefix and shifts every absolute
-        # index left.
+        # Counted from `position`, not buffer start: `_fill` drops the
+        # consumed prefix, shifting absolute indices left.
         var scanned = 0
         loop {
             let found = _index_of_char(self.buffer, "\n", self.position + scanned)
@@ -327,11 +289,10 @@ pub class BufferedReader: Iterable[str] {
         self.position = 0
     }
 
-    # Append at least one character to the buffer, or report end of stream.
     fn _fill(self) -> bool {
         if self.finished { return false }
-        # Drop the consumed prefix before growing the buffer. Without this, a
-        # file read line by line copies the whole buffer once per line.
+        # Drop the consumed prefix first — otherwise a line-by-line read
+        # copies the whole buffer per line.
         if self.position > 0 {
             self.buffer = self.buffer[self.position:self.buffer.len()]
             self.position = 0
@@ -341,8 +302,8 @@ pub class BufferedReader: Iterable[str] {
             if chunk.len() == 0 {
                 self.finished = true
                 if self.carry.len() == 0 { return false }
-                # A truncated sequence at end of stream: hand the bytes to the
-                # decoder rather than dropping them without a word.
+                # A truncated sequence at end of stream is handed to the
+                # decoder rather than dropped silently.
                 self.buffer = self.buffer + _decode(self.carry)
                 self.carry = _EMPTY_BYTES
                 return true
@@ -628,8 +589,8 @@ pub class Path: Comparable, Hashable, Printable {
     #:
     #: Raises `FileNotFoundError` when nothing is there.
     pub fn modified_time(self) -> DateTime {
-        # `DateTime` normalises an out-of-range nanosecond field into the
-        # seconds, so the whole timestamp can go in as nanoseconds.
+        # `DateTime` normalises an out-of-range nanosecond field, so raw
+        # nanoseconds can go in directly.
         return DateTime(0, self._stat()["modified"])
     }
 
@@ -750,11 +711,9 @@ pub class Path: Comparable, Hashable, Printable {
     #: Return the path as written.
     pub fn to_str(self) -> str { return self.text }
 
-    # The kind of what this path leads to, following a symlink to its target.
-    # "is there a directory here" is a question about the target: `/tmp` is a
-    # link to `/private/tmp` on macOS, and answering "link" made every caller
-    # that writes under it decide the directory was missing. `io_stat` without
-    # the flag still reports the link itself, which is what `remove` needs.
+    # Follows symlinks: on macOS `/tmp` links to `/private/tmp`, and reporting
+    # "link" there broke every caller's is_dir() check. Plain `io_stat` (no
+    # follow) is what `remove` needs instead.
     fn _kind(self) -> str {
         let info = __prim__.io_stat(self.text, true)
         if info is null { return "" }
@@ -1036,8 +995,7 @@ pub fn read_tsv(path: str) -> list[list[str]] { return read_csv(path, "\t") }
 #: Write `rows` to `path` as tab-separated values.
 pub fn write_tsv(path: str, rows: list[list[str]]) -> void { write_csv(path, rows, "\t") }
 
-# The lines of a reader, as an iterator. It is private because a caller only
-# ever meets it as the `Iterator[str]` that `lines` returns.
+# Private: a caller only ever meets this as the `Iterator[str]` `lines` returns.
 class LineIter: Iterator[str], Iterable[str] {
     let reader: BufferedReader
 
@@ -1048,8 +1006,6 @@ class LineIter: Iterator[str], Iterable[str] {
     pub fn iter(self) -> Iterator[str] { return self }
 }
 
-# A depth-first walk of a directory tree, holding one stack of pending entries
-# rather than the whole listing.
 class PathWalk: Iterator[Path], Iterable[Path] {
     let root: Path
     var pending: list[Path]?
@@ -1060,8 +1016,8 @@ class PathWalk: Iterator[Path], Iterable[Path] {
     }
 
     pub fn next(self) -> Path? {
-        # The root is listed on the first `next`, not in `init`, so building
-        # the walk costs nothing and reads no directory the caller skips.
+        # Listed on first `next`, not in `init`, so building the walk reads
+        # nothing yet.
         var stack = self.pending
         if stack is null {
             stack = _reversed_listing(self.root)
@@ -1089,7 +1045,6 @@ fn _reversed_listing(directory: Path) -> list[Path] {
     return stacked
 }
 
-# Expand `segments` from `index` onwards against `base`, collecting matches.
 fn _glob_into(base: Path, segments: list[str], index: int, found: list[Path]) -> void {
     if index == segments.len() {
         found.push(base)
@@ -1097,8 +1052,8 @@ fn _glob_into(base: Path, segments: list[str], index: int, found: list[Path]) ->
     }
     let segment = segments[index]
     if segment == "**" {
-        # `**` matches no directories at all, and then one more at a time. Each
-        # match is reached through exactly one chain, so nothing is duplicated.
+        # `**` matches zero or more directories; each result is reached
+        # through exactly one chain, so nothing duplicates.
         _glob_into(base, segments, index + 1, found)
         if not base.is_dir() { return }
         for entry in base.list() {
@@ -1107,8 +1062,8 @@ fn _glob_into(base: Path, segments: list[str], index: int, found: list[Path]) ->
         return
     }
     if not _has_wildcard(segment) {
-        # A literal component is looked up rather than listed, so a deep
-        # pattern with one wildcard does not read every directory on the way.
+        # A literal component is looked up directly, so a deep pattern
+        # doesn't list every directory on the way.
         let child = base.join(segment)
         if child.exists() { _glob_into(child, segments, index + 1, found) }
         return
@@ -1126,9 +1081,9 @@ fn _has_wildcard(segment: str) -> bool {
     return false
 }
 
-# Match one path component against one glob segment. The two-pointer walk
-# remembers the last `*` and the text it had consumed, so a mismatch retries
-# with that `*` one character longer instead of recursing.
+# Two-pointer walk: remembers the last `*` and its consumed text, so a
+# mismatch retries with that `*` extended by one character instead of
+# recursing.
 fn _match_glob(name: str, pattern: str) -> bool {
     var text = 0
     var spec = 0
@@ -1174,12 +1129,10 @@ fn _is_absolute_text(text: str) -> bool {
     return text.len() > 0 and text[0] == SEPARATOR
 }
 
-# The components of `text`, with empty ones and `.` dropped.
 fn _components(text: str) -> list[str] {
     return [part for part in text.split(SEPARATOR) if part.len() > 0 and part != "."]
 }
 
-# The half-open span of the last component of `text`, ignoring trailing slashes.
 fn _name_bounds(text: str) -> tuple[int, int] {
     var end = text.len()
     while end > 0 and text[end - 1] == SEPARATOR { end -= 1 }
@@ -1188,7 +1141,6 @@ fn _name_bounds(text: str) -> tuple[int, int] {
     return (start, end)
 }
 
-# The index of the dot that starts the extension of `name`, or -1.
 fn _extension_dot(name: str) -> int {
     var index = name.len() - 1
     while index > 0 {
@@ -1245,9 +1197,9 @@ fn _needs_quoting(cell: str, delimiter: str) -> bool {
     return false
 }
 
-# Split `data` before a trailing UTF-8 sequence the buffer does not yet hold in
-# full, so a chunk boundary never lands inside a character. A continuation byte
-# is 0x80..0xBF and a lead byte says how many bytes the sequence takes.
+# Splits off a trailing UTF-8 sequence the buffer doesn't fully hold yet, so a
+# chunk boundary never lands inside a character. Continuation bytes are
+# 0x80-0xBF; the lead byte's high bits give the sequence length.
 fn _utf8_split(data: bytes) -> tuple[bytes, bytes] {
     let length = data.len()
     var back = 0

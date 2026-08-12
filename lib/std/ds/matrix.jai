@@ -1,8 +1,7 @@
 #: A dense matrix of floats with the standard decompositions.
 #:
-#: Rows are stored as `list[list[float]]`, so `m.row(i)` is a copy of a stored
-#: row and `m.column(j)` is gathered. Every operation that combines two matrices
-#: names both shapes when they disagree.
+#: Stored as `list[list[float]]`; `row(i)` copies, `column(j)` gathers, so
+#: mutating a returned row/column never mutates the matrix.
 import std.math
 import std.random
 
@@ -218,8 +217,7 @@ pub class Matrix {
         for row in 0..self.rows {
             let line = self.cells[row]
             let out = result.cells[row]
-            # Accumulating into the output row one source column at a time
-            # walks `other` in row order, which is how it is laid out.
+            # Walking `other` row-by-row matches its row-major layout.
             for inner in 0..self.columns {
                 let factor = line[inner]
                 if factor == 0.0 { continue }
@@ -323,8 +321,8 @@ pub class Matrix {
                 let carry = permutation[pivot]
                 permutation[pivot] = permutation[best]
                 permutation[best] = carry
-                # The multipliers already written into `lower` belong to the
-                # rows that just moved, so they have to move with them.
+                # Multipliers already stored in `lower` belong to these rows,
+                # so they move too.
                 for column in 0..pivot {
                     let held = lower.cells[pivot][column]
                     lower.cells[pivot][column] = lower.cells[best][column]
@@ -498,10 +496,8 @@ pub class Matrix {
 
     #: The eigenvalues of a symmetric matrix, ascending, by cyclic Jacobi.
     #:
-    #: A sweep annihilates each off-diagonal entry in turn with a plane
-    #: rotation, and the diagonal converges to the spectrum. Raises `ValueError`
-    #: on a non-symmetric matrix, whose eigenvalues may be complex and are out
-    #: of scope here.
+    #: Raises `ValueError` on a non-symmetric matrix — its eigenvalues may be
+    #: complex, which is out of scope here.
     #:
     #: ```
     #: let m = Matrix.from_list([[2.0, 1.0], [1.0, 2.0]])
@@ -527,8 +523,7 @@ pub class Matrix {
                 for other in pivot + 1..size {
                     let entry = work.cells[pivot][other]
                     if abs(entry) <= tolerance { continue }
-                    # Choose the rotation angle that zeroes cells[pivot][other]
-                    # exactly; theta is cot(2 * phi) for that rotation.
+                    # theta = cot(2*phi) is the rotation that zeroes this entry.
                     let spread = work.cells[other][other] - work.cells[pivot][pivot]
                     let theta = spread / (2.0 * entry)
                     var t = 1.0 / (abs(theta) + math.sqrt(theta * theta + 1.0))

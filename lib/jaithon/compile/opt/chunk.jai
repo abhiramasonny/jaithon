@@ -1,37 +1,12 @@
 #: The bytecode-rewriting substrate every optimisation pass sits on.
 #:
-#: This is the Jaithon half of the instruction list at the top of
-#: `src/codegen/optimize.c`, and it exists for the reason that file gives: a
-#: peephole that rewrites bytes in place cannot fix up the jumps that cross the
-#: edit, and that is precisely how these passes normally corrupt a chunk. Every
-#: pass therefore works on a *decoded instruction list*, never on raw bytes,
-#: and always in the same four steps:
-#:
-#: 1. `decode` turns the chunk into `Instr` records and resolves every branch
-#:    operand to the *index* of the instruction it lands on. A byte offset that
-#:    is not an instruction boundary aborts the decode, which answers null, and
-#:    the pass then reports zero changes.
-#: 2. Everything branched to, every exception-region edge and every
-#:    default-thunk entry point comes back flagged `is_target`. That flag is
-#:    what stops a window from being rewritten across an incoming edge.
-#: 3. The pass transforms the list: `set_instr` rewrites an instruction in
-#:    place, `kill` deletes one, `splice_before` inserts a run.
-#: 4. `rebuild` lays the survivors out to a fixpoint, recomputes every branch
-#:    operand from the new layout, and rebuilds the line table, the exception
-#:    table and the default-thunk offsets against it.
-#:
-#: Step 4 is what keeps tracebacks and `try` regions pointing at the code they
-#: described before the pass ran. When anything in it cannot be represented —
-#: a branch that no longer fits in `i16` — `rebuild` answers false, the pass is
-#: abandoned and the chunk is left exactly as it was. A missed optimisation,
-#: never a wrong one.
-#:
-#: Branch targets are held as instruction *indices* for the whole life of a
-#: pass, so deleting an instruction needs no jump fixup at all: `rebuild`
-#: resolves each edge through `live_at_or_after`, which walks past whatever
-#: died. Only insertion renumbers the list, and `splice_before` is the one
-#: primitive that does it — it remaps every target, every exception edge and
-#: every default offset in one pass over the new numbering.
+#: A peephole that rewrites bytes in place can't fix up jumps that cross the
+#: edit -- precisely how these passes normally corrupt a chunk -- so passes
+#: here work on a decoded `Instr` list instead: `decode` resolves every branch
+#: to a target *index*, `set_instr`/`kill`/`splice_before` transform the list,
+#: and `rebuild` lays out the survivors and re-resolves everything against the
+#: new layout, refusing (leaving the chunk untouched) if a branch no longer
+#: fits `i16`.
 from jaithon.compile.emit import Chunk, Const, ConstTag, ExceptionEntry, FN_KWREST
 from jaithon.compile.emit import FN_VARIADIC, FuncProto, LineEntry, MAX_CONSTANTS, Op
 from jaithon.compile.emit import op_count, op_operand_bytes, opcode
@@ -349,8 +324,8 @@ pub fn decode(proto: FuncProto) -> Code? {
     if chunk.code.len() == 0 { return null }
 
     let code = Code(proto)
-    # Instruction index for a code offset; NO_INDEX where the offset is not an
-    # instruction boundary. chunk.code.len() maps to count(), one past the end.
+    # NO_INDEX for a non-boundary offset; chunk.code.len() maps to count(), one
+    # past the end.
     var offset_index: list[int] = [NO_INDEX for _slot in 0..chunk.code.len() + 1]
 
     var line = 0
@@ -365,9 +340,8 @@ pub fn decode(proto: FuncProto) -> Code? {
         if op == opcode(Op.Closure) { operand_count = closure_operand_bytes(chunk, offset) }
         if operand_count < 0 or offset + 1 + operand_count > chunk.code.len() { return null }
 
-        # The line table is sorted by offset and covers everything from a row
-        # up to the next one, so walking it alongside the decode gives the same
-        # answer as jaiChunkSpanAt's binary search for a fraction of the work.
+        # Sorted and covering each row up to the next, so walking it alongside
+        # the decode matches jaiChunkSpanAt's binary search for less work.
         while line < chunk.lines.len() and chunk.lines[line].offset <= offset {
             span_start = chunk.lines[line].span_start
             span_end = chunk.lines[line].span_end
@@ -397,10 +371,9 @@ pub fn decode(proto: FuncProto) -> Code? {
         code.data[index].is_target = true
     }
 
-    # Exception regions. Marking the start and end instructions as targets is
-    # what stops a peephole window from straddling a region edge: a fused
-    # instruction that is half inside a protected region cannot be described by
-    # (start, end) at all.
+    # Marking start/end as targets stops a peephole window from straddling a
+    # region edge -- a fused instruction half inside a protected region can't
+    # be described by (start, end) at all.
     for entry in chunk.exceptions {
         let start = _index_of_offset(offset_index, entry.start)
         let end = _index_of_offset(offset_index, entry.end)
@@ -482,12 +455,6 @@ pub fn window_of(code: Code, index: int, want: int) -> list[int] {
 #: Nothing *inside* the tested prefix may be branched to: an edge landing on the
 #: first instruction still executes the whole window, so fusing or deleting it
 #: as a unit is invisible to that edge. An edge landing further in is not.
-#:
-#: The prefix length is a parameter because the fusion pass decodes one window
-#: four deep and offers a *prefix* of it to each of its eleven rules; testing
-#: all four when the rule only rewrites two would refuse a legal fusion. That is
-#: `windowClean(c, idx, n)` in `src/codegen/optimize.c:347`, whose `n` is the
-#: same number.
 pub fn window_clean(code: Code, window: list[int], want: int = NO_INDEX) -> bool {
     let last = if want < 0 or want > window.len() { window.len() } else { want }
     for position in 1..last {
@@ -500,8 +467,7 @@ pub fn window_clean(code: Code, window: list[int], want: int = NO_INDEX) -> bool
 #:
 #: The instruction keeps its position, its span and — when the new opcode
 #: carries a branch operand at all — its `target`, so an edge into it still
-#: works. Deleting the rest of a window with `kill` and rewriting its head with
-#: this is how every fusion is expressed.
+#: works.
 pub fn set_instr(instruction: Instr, op: int, operands: list[int]) -> void {
     instruction.op = op
     instruction.operands = operands
@@ -541,18 +507,12 @@ pub fn pool_int_index(code: Code, value: int) -> int {
 
 #: Insert instruction runs into the list and remap every recorded index.
 #:
-#: `at[k]` is the instruction the run `runs[k]` goes immediately *before*, and
-#: the instruction that was at `at[k]` keeps every edge that pointed at it — a
-#: backward branch into a loop header still lands on the header and not on the
-#: pre-header just spliced in front of it. `at` must be ascending and free of
-#: duplicates, and both lists must be the same length.
-#:
-#: Every branch target, exception-region edge and default-thunk offset is
-#: remapped onto the new numbering, which is the whole reason insertion is one
-#: primitive and not something a pass does by hand. Byte offsets are
-#: meaningless afterwards; `rebuild` works from indices only.
-#:
-#: Answers false and changes nothing when the plan is empty or malformed.
+#: `at[k]` is the instruction `runs[k]` goes immediately before; the instruction
+#: that was at `at[k]` keeps every edge that pointed at it. `at` must be
+#: ascending and free of duplicates, and both lists must be the same length.
+#: Every branch target, exception edge and default offset is remapped to the
+#: new numbering — byte offsets are meaningless until `rebuild` runs. Answers
+#: false, changing nothing, when the plan is empty or malformed.
 pub fn splice_before(code: Code, at: list[int], runs: list[list[Instr]]) -> bool {
     if at.len() == 0 or at.len() != runs.len() { return false }
 
@@ -605,17 +565,9 @@ pub fn splice_before(code: Code, at: list[int], runs: list[list[Instr]]) -> bool
 #: Mark everything unreachable from an entry point dead; answer how many that
 #: removed.
 #:
-#: Entry points are instruction 0 and every default-value thunk, which the call
-#: sequence enters directly. An exception handler is *not* an unconditional
-#: entry point: it runs only when something inside its protected region throws,
-#: so it is reachable exactly when some instruction of that region is. Seeding
-#: it regardless resurrects the handler of a `try` the front end has just
-#: proved unreachable, and with it — through the backward branch at the end of
-#: an enclosing loop body — the loop's `OP_FOR_ITER`, whose iterator is
-#: produced by the setup code that stayed dead.
-#:
-#: Shared substrate rather than part of `opt.dead`: the peephole alternates
-#: rewriting with this until neither has anything left to do.
+#: An exception handler is reachable only when its protected region is, not
+#: unconditionally -- seeding it regardless can resurrect code (e.g. a dead
+#: loop's `OP_FOR_ITER` setup) the front end already proved unreachable.
 pub fn mark_unreachable(code: Code) -> int {
     if code.count() == 0 { return 0 }
 
@@ -632,9 +584,8 @@ pub fn mark_unreachable(code: Code) -> int {
         while work.len() > 0 {
             let index = work.pop()
             let instruction = code.data[index]
-            # Every address an instruction carries counts, including the one
-            # PUSH_HANDLER and PUSH_FINALLY register: control does not go there
-            # now, but it can later, and only if this instruction runs.
+            # Includes the address PUSH_HANDLER/PUSH_FINALLY only register:
+            # control can go there later, but only if this instruction runs.
             if instruction.target >= 0 { _seed(code, reached, work, instruction.target) }
             if op_falls_through(instruction.op) {
                 let following = next_live(code, index)
@@ -671,18 +622,10 @@ pub fn mark_unreachable(code: Code) -> int {
 #: in which case the caller must report zero changes.
 #: Drop deleted instructions and renumber everything that named one.
 #:
-#: Deleted instructions stay in the list so that recorded indices keep meaning
-#: what they meant, which is right within a pass and expensive between them:
-#: `next_live`, `prev_live` and `live_at_or_after` all walk over the holes, so a
-#: pipeline that never compacts turns a long dead run into a linear scan per
-#: lookup. That used to be hidden because every pass ended in a `rebuild` and
-#: began with a `decode`, and the round trip compacted as a side effect. With
-#: one decode shared across the passes the compaction has to be asked for, and
-#: this is the cheap half of what the round trip was doing -- no encoding, no
-#: line table, no exception rewrite, just the list and the indices into it.
-#:
-#: A target that pointed at a deleted instruction lands on the next live one,
-#: which is what `live_at_or_after` already answers for a stale target.
+#: Deleted instructions stay so recorded indices keep meaning what they meant,
+#: which the live-walkers pay for with a linear scan over long dead runs. That
+#: used to be free because every pass round-tripped through `decode`/`rebuild`;
+#: with one decode shared across passes, compaction has to be asked for.
 pub fn compact(code: Code) -> void {
     var dead_count = 0
     for instruction in code.data {
@@ -690,12 +633,8 @@ pub fn compact(code: Code) -> void {
     }
     if dead_count == 0 { return }
 
-    # Compacting is two allocations and a copy of the whole list, which is the
-    # same order of work as the decode it is standing in for -- so doing it for
-    # a single hole costs more than the holes do. It pays once a run is long
-    # enough that the live-walkers spend real time stepping over it, and the
-    # amortisation argument is the usual one: only rewrite when a constant
-    # fraction of the list is garbage.
+    # Compacting costs as much as a decode, so a single hole isn't worth it --
+    # only rewrite once a constant fraction of the list is garbage.
     if dead_count * 8 < code.count() { return }
 
     let total = code.count()
@@ -716,10 +655,9 @@ pub fn compact(code: Code) -> void {
         kept.push(instruction)
     }
 
-    # `_retarget_fits` measures a branch against `new_offset`, so the layout is
-    # refreshed here exactly as `rebuild` would lay it out. Leaving it stale
-    # would make the peephole's reach test answer from a layout that no longer
-    # exists, and its decisions are what the emitted code is made of.
+    # Refreshed exactly as `rebuild` would lay it out: `_retarget_fits` measures
+    # branches against `new_offset`, and a stale value would make the
+    # peephole's reach test answer from a layout that no longer exists.
     var offset = 0
     for instruction in kept {
         instruction.new_offset = offset
@@ -748,10 +686,8 @@ pub fn rebuild(code: Code) -> bool {
     }
     if live_count == 0 { return false }
 
-    # Lay the instructions out to a fixpoint. Every branch operand in this
-    # bytecode is a fixed-width i16, so the second round always agrees with the
-    # first; the loop is here so that a narrower encoding added later cannot
-    # silently produce stale offsets.
+    # Current i16 operands converge in 2 rounds; the loop guards against a
+    # narrower encoding later silently leaving offsets stale.
     var total = 0
     var settled = false
     var round = 0
@@ -770,16 +706,9 @@ pub fn rebuild(code: Code) -> bool {
     }
     if not settled { return false }
 
-    # Resolve branches before allocating anything, so an unrepresentable jump
-    # leaves the chunk untouched.
-    #
-    # Failing here is a *capacity* verdict, not a diagnosis: hoisting splices
-    # instructions into a pre-header, and in a function whose jumps already sit
-    # near the i16 limit that is enough to make one not fit. Reporting it would
-    # make a program that compiles at -O0 fail at -O2, which is the one thing
-    # the pass list may never do. The caller reports zero changes, the chunk
-    # stays exactly as it was, and a chunk that was malformed before the pass
-    # is still caught by the verifier afterwards.
+    # Resolve branches before allocating, so an unrepresentable jump (e.g. one
+    # hoisting pushed near the i16 limit) leaves the chunk untouched -- a
+    # program that compiles at -O0 must never fail to compile at -O2.
     for instruction in code.data {
         if instruction.dead or instruction.branch_at < 0 { continue }
         let landing = live_at_or_after(code, instruction.target)
@@ -816,8 +745,6 @@ pub fn rebuild(code: Code) -> bool {
         }
     }
 
-    # Exception table: a region whose body vanished is dropped, otherwise both
-    # edges move to the first surviving instruction at or after them.
     var kept: list[ExceptionEntry] = []
     var kept_start: list[int] = []
     var kept_end: list[int] = []
@@ -911,10 +838,9 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.IncLocal,
         Op.CmpLocalConstLt,
         Op.GetFieldLocal,
-        # Without this the coalescer renumbers every *reader* of a slot and
-        # leaves the fused writer pointing at the old one: `line` was stored to
-        # slot 4 while every read of it had moved to slot 3, which still held an
-        # int. A fused opcode that carries a slot has to be listed here.
+        # Any fused opcode carrying a slot must be listed here, or the coalescer
+        # renumbers its readers but not this writer (real miscompile: `line`
+        # stored to slot 4 while every read moved to slot 3).
         Op.AddBind,
         Op.SubBind,
         Op.MulBind,

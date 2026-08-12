@@ -1,7 +1,5 @@
 #: Algorithms over dicts that the built-in dict methods do not cover.
 #:
-#: `get`, `keys`, `values` and `items` are methods on `dict` itself. This module
-#: holds the reshaping, merging and counting operations built on top of them.
 #: Every function here returns a new dict unless its name says otherwise.
 
 #: A view over a dict that materialises missing entries on first read.
@@ -255,9 +253,8 @@ pub fn increment[K](counts: dict[K, int], key: K, amount: int = 1) -> int {
 
 #: Wrap `entries` so that reading a missing key yields `default` and stores it.
 #:
-#: The wrapper writes through to `entries`, so both views stay in step. Every
-#: missing key gets the *same* `default` object; when the default is mutable,
-#: construct `WithDefault` directly with a factory that makes a fresh one.
+#: Writes through to `entries`; every missing key gets the *same* `default`
+#: object, so for mutable defaults construct `WithDefault` with a factory instead.
 #:
 #: ```
 #: let counts = with_default({}, 0)

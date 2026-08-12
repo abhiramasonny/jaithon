@@ -1,11 +1,5 @@
 #: Fixed-width integers, rational numbers and complex numbers.
 #:
-#: The core language has exactly two numeric types, `int` and `float`. This
-#: module adds the rest of the tower as ordinary classes with operator
-#: overloads: `I8` through `U64` for machine-width integers with a choice of
-#: overflow behaviour, `Rational` for exact fractions, and `Complex`. Arbitrary
-#: precision integers live next door in `std.num.bigint`.
-#:
 #: ```
 #: (I32(2) ** 3).value                  # 8
 #: (U8(200, WRAP) + U8(100)).value      # 44
@@ -27,11 +21,9 @@ const MASK63: int = 0x7FFFFFFFFFFFFFFF
 
 #: The behaviour shared by every fixed-width integer type.
 #:
-#: A `Fixed` holds one value and one overflow mode. Arithmetic between two
-#: fixed-width values requires them to have the same type; an ordinary `int`
-#: operand is accepted and must itself be in range. The mode of the left operand
-#: decides what happens when a result does not fit: `CHECKED` raises
-#: `OverflowError`, and the other two modes produce a value.
+#: A `Fixed` holds one value and one overflow mode. Binary ops require the same
+#: type (or an in-range `int`); the *left* operand's mode decides the result:
+#: `CHECKED` raises `OverflowError`, the other two produce a value.
 #:
 #: ```
 #: (I8(120, WRAP) + I8(10)).value       # -126
@@ -61,8 +53,7 @@ pub class Fixed {
             self.min_raw = -(1 << bits - 1)
             self.max_raw = (1 << bits - 1) - 1
         } elif bits == 64 {
-            # Every bit pattern is a valid u64, and 2**64 - 1 has none to spare:
-            # it is stored as the all-ones pattern, which reads back as -1.
+            # Every bit pattern is a valid u64; 2**64-1 is the all-ones pattern, which reads back as -1.
             self.min_raw = 0
             self.max_raw = -1
         } else {
@@ -130,9 +121,7 @@ pub class Fixed {
         return 0
     }
 
-    # Each of these returns the wrapped result together with a direction: 0 when
-    # the true result was in range, 1 when it was above the maximum and -1 when
-    # it was below the minimum.
+    # Each returns (wrapped result, direction): 0 in range, 1 above the max, -1 below the min.
     prot fn _add_parts(self, a: int, b: int) -> tuple[int, int] {
         # Operands are at most 32 bits wide here, so the sum cannot overflow.
         let total = a + b
@@ -147,8 +136,7 @@ pub class Fixed {
     prot fn _mul_parts(self, a: int, b: int) -> tuple[int, int] {
         if a == 0 or b == 0 { return (0, 0) }
         let negative = (a < 0) != (b < 0)
-        # U32 products reach 2**64, so test the magnitude by division first and
-        # only multiply once the product is known to fit.
+        # U32 products reach 2**64; test the magnitude by division before multiplying.
         let limit = if negative { -self.min_raw } else { self.max_raw }
         if abs(a) <= limit // abs(b) { return (a * b, 0) }
         let direction = if negative { -1 } else { 1 }
@@ -349,12 +337,10 @@ pub class U32 extends Fixed {
 
 #: An unsigned 64-bit integer, 0 through 18446744073709551615.
 #:
-#: The upper half of the range does not fit in an int, so a `U64` stores the
-#: two's-complement bit pattern and interprets it without a sign: `value` reads
-#: back as a negative int for anything from 2**63 up, while `to_str` and every
-#: comparison and arithmetic operator treat it as unsigned. Build such a value
-#: with `from_str` or `from_bits`, and read it back with `to_str`. `to_int`
-#: raises `OverflowError` rather than hand back the negative pattern.
+#: The upper half of the range doesn't fit in an int, so `U64` stores the raw
+#: two's-complement bits: `value` reads back negative from 2**63 up, while
+#: `to_str` and every operator treat it as unsigned. Build with `from_str` or
+#: `from_bits`; `to_int` raises `OverflowError` rather than return the negative pattern.
 #:
 #: ```
 #: U64.from_bits(-1).to_str()                        # "18446744073709551615"
@@ -396,8 +382,7 @@ pub class U64 extends Fixed {
     }
 
     prot fn _contains(self, value: int) -> bool {
-        # Only the constructor consults this, and it takes an int, so anything
-        # non-negative is representable; from_bits covers the rest.
+        # Only the constructor (which takes an int) consults this; from_bits covers the rest.
         return value >= 0
     }
 
@@ -470,13 +455,10 @@ pub class Rational {
     #: Return the closest fraction to `value` with a denominator at most
     #: `max_denominator`.
     #:
-    #: Expands `value` as a continued fraction and keeps the last convergent that
-    #: fits, then checks the best semiconvergent beyond it — the same result
-    #: Stern-Brocot search would give, in O(log max_denominator) steps. Every
-    #: comparison is exact integer arithmetic, so the answer is the true nearest
-    #: fraction; the one caveat is that for `abs(value)` below 2**-10 the low
-    #: mantissa bits are dropped to keep the working values inside an int, which
-    #: can shift the last digit when `max_denominator` is above about 10**9.
+    #: Expands `value` as a continued fraction, keeping the best convergent or
+    #: semiconvergent that fits — exact integer arithmetic throughout, except
+    #: that below `abs(value) < 2**-10` low mantissa bits are dropped, which can
+    #: shift the last digit when `max_denominator` exceeds about 10**9.
     #:
     #: Raises `ValueError` for NaN or an infinity, and `OverflowError` for a
     #: value too large for an int numerator.
@@ -498,8 +480,7 @@ pub class Rational {
         let magnitude = math.fabs(value)
         if magnitude == 0.0 { return Rational(0, 1) }
         let (mantissa, exponent) = math.frexp(magnitude)
-        # mantissa is in [0.5, 1), so mantissa * 2**53 is an exact integer and
-        # magnitude is exactly that integer over 2**(53 - exponent).
+        # mantissa is in [0.5, 1), so mantissa * 2**53 is exact, and magnitude is that integer over 2**(53-exponent).
         var top = int(mantissa * 9007199254740992.0)
         if exponent >= 53 {
             if exponent - 53 > 10 {
@@ -511,8 +492,7 @@ pub class Rational {
         }
         var bits = 53 - exponent
         if bits > 62 {
-            # Below 2**-10 the exact denominator no longer fits in an int; drop
-            # the bits that cannot influence a denominator of this size.
+            # Below 2**-10 the exact denominator no longer fits in an int; drop bits that can't affect a denominator this size.
             top = top >> bits - 62
             bits = 62
         }
@@ -729,8 +709,7 @@ pub class Complex {
     #: Return the principal square root, the one with a non-negative real part.
     #:
     #: The two half-angle identities each cancel catastrophically on one side of
-    #: the imaginary axis, so only the one that adds `abs(re)` to the modulus is
-    #: evaluated and the other part is recovered by division.
+    #: the imaginary axis; only the one adding `abs(re)` to the modulus is evaluated, the other recovered by division.
     #:
     #: ```
     #: Complex(-4.0, 0.0).sqrt().to_str()   # "0.0 + 2.0i"
@@ -823,8 +802,8 @@ fn _complex(value: any, operation: str) -> Complex {
     throw TypeError(f"cannot {operation} a Complex and {type_of(value)}")
 }
 
-# The best approximation to `top / bottom` with a denominator at most `limit`,
-# where the fraction is already reduced and its denominator exceeds `limit`.
+# Best approximation to `top / bottom` with denominator <= `limit`; assumes an
+# already-reduced fraction whose denominator exceeds `limit`.
 fn _limit_denominator(top: int, bottom: int, limit: int) -> Rational {
     var previous_top = 0
     var previous_bottom = 1
@@ -849,9 +828,8 @@ fn _limit_denominator(top: int, bottom: int, limit: int) -> Rational {
         remainder_top = remainder_bottom
         remainder_bottom = rest
     }
-    # The convergent `current` and the best semiconvergent below it are the only
-    # candidates. With t the remaining tail, the semiconvergent wins exactly
-    # when t * current_bottom < previous_bottom + 2 * steps * current_bottom.
+    # `current` and the best semiconvergent below it are the only candidates;
+    # the semiconvergent wins when t*current_bottom < previous_bottom + 2*steps*current_bottom.
     let steps = (limit - previous_bottom) // current_bottom
     let threshold = previous_bottom + 2 * steps * current_bottom
     if _compare_products(remainder_top, current_bottom, remainder_bottom, threshold) < 0 {
@@ -863,10 +841,8 @@ fn _limit_denominator(top: int, bottom: int, limit: int) -> Rational {
     return Rational(current_top, current_bottom)
 }
 
-# Compare a * b against c * d for non-negative operands, forming no product.
-#
-# Each round divides the pair down like Euclid's algorithm, so this costs
-# O(log n) steps and never leaves the range of an int.
+# Compares a*b against c*d without forming a product, dividing the pair down
+# like Euclid's algorithm (O(log n) steps, never overflows an int).
 fn _compare_products(a: int, b: int, c: int, d: int) -> int {
     var left_high = a
     var left_low = b
@@ -906,7 +882,6 @@ fn _u64_compare(a: int, b: int) -> int {
     return 0
 }
 
-# Unsigned 64-bit division of two bit patterns.
 fn _u64_divmod(a: int, b: int) -> tuple[int, int] {
     if b == 0 { throw DivisionByZeroError("U64 division by zero") }
     if b < 0 {
@@ -915,8 +890,7 @@ fn _u64_divmod(a: int, b: int) -> tuple[int, int] {
         return (1, a -% b)
     }
     if a >= 0 { return (a // b, a % b) }
-    # Halving first keeps the dividend positive; `& MASK63` makes the shift
-    # logical whether or not `>>` sign-extends.
+    # Halving first keeps the dividend positive; `& MASK63` makes the shift logical regardless of whether `>>` sign-extends.
     let half = a >> 1 & MASK63
     var quotient = half // b *% 2
     var remainder = a -% quotient *% b

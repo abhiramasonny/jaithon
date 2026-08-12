@@ -1,25 +1,20 @@
 #: Scope tree, symbol table, slot and upvalue assignment over a `jaithon.ast` tree.
 #:
-#: The Jaithon counterpart of `src/sema/resolve.c`, bound by the same rules,
-#: because `make bootstrap` diffs the bytecode the two front ends produce and a
-#: slot numbered differently is a divergence:
+#: Counterpart of `src/sema/resolve.c`; `make bootstrap` diffs the two front
+#: ends' bytecode, so a slot numbered differently here is a divergence:
 #:
-#: - Two passes per block. Declarations that may be mutually recursive (`fn`,
-#:   `class`, `trait`, `enum`, `type`, `import`) are hoisted first, then the
-#:   statements are walked in order, so `let`/`var`/`const` bind at their
-#:   declaration point. That split is what makes `fn a() { b() } fn b() { a() }`
-#:   legal while `print(x)` above `let x = 1` is `E0201`.
-#: - Slot 0 of a frame is the callee or the receiver, declared parameters are
-#:   slots 1..arity, locals follow, and sibling blocks reuse slots.
+#: - Two passes per block: mutually-recursive declarations (`fn`, `class`,
+#:   `trait`, `enum`, `type`, `import`) hoist first, then statements walk in
+#:   order, so `let`/`var`/`const` bind at their declaration point — legal
+#:   `fn a() { b() } fn b() { a() }`, but `E0201` for `print(x)` above `let x = 1`.
+#: - Slot 0 is the callee/receiver; declared parameters are slots 1..arity,
+#:   and sibling blocks reuse slots.
 #: - Captures use the Crafting Interpreters algorithm: the innermost function
 #:   captures the owner's local directly and every function in between
 #:   recaptures the upvalue of the one outside it.
 #:
-#: A `jaithon.ast` node holds only what the C AST serialises, so the results live
-#: beside the tree in a `Resolution` keyed by node identity rather than in the
-#: nodes themselves. After a successful pass every identifier has a `Symbol`
-#: whose kind and slot say which instruction `emit.jai` must produce; the
-#: emitter looks up no names of its own.
+#: Results live beside the tree in a `Resolution` keyed by node identity,
+#: since a `jaithon.ast` node holds only what the C AST serialises.
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, Visibility
 from jaithon.compile.lexer import DiagnosticBag
 
@@ -607,9 +602,9 @@ pub class Resolver {
         return owner.upvalues.len() - 1
     }
 
-    # Crafting Interpreters' resolveUpvalue over the function stack: the
-    # function just inside the owner captures the local, and every function
-    # after it recaptures the upvalue of the one before.
+    # Crafting Interpreters' resolveUpvalue: the function just inside the
+    # owner captures the local; each function after it recaptures the
+    # upvalue of the one before.
     fn _capture(self, owner_index: int, slot: int, by_value: bool, span: Span) -> int {
         var index = self._add_upvalue(self.functions[owner_index + 1], slot, true, by_value, span)
         var level = owner_index + 2
@@ -631,12 +626,11 @@ pub class Resolver {
         return symbol.decl == null or symbol.decl.kind != NodeKind.FnDecl
     }
 
-    # Spec §5.2: each iteration declares the body's bindings afresh, so two
-    # closures made in two iterations must not share a cell. A by-value capture
-    # is already a snapshot; a by-reference one aliases the frame slot, and only
-    # closing the upvalue at the iteration boundary hands the next iteration a
-    # new cell. The *innermost* enclosing loop owns the close: it runs before
-    # any outer iteration boundary is reached.
+    # Spec §5.2: each iteration declares its bindings afresh, so two closures
+    # from different iterations must not share a cell. A by-value capture is
+    # already a snapshot; a by-reference one closes at the iteration boundary
+    # instead, owned by the *innermost* enclosing loop (which runs before any
+    # outer iteration boundary).
     fn _mark_captured_in_loop(self, scope_index: int, slot: int) -> void {
         if slot < 0 { return }
         var index = scope_index
@@ -656,14 +650,11 @@ pub class Resolver {
         }
     }
 
-    # The same argument one level down. A block's bindings die when the block
-    # exits and the next sibling block is handed their slots, so a closure that
-    # escaped the block would go on aliasing a slot that now holds something
-    # else — a wrong answer with no error anywhere. Only the scope that
-    # *declares* the slot records it: an inner block must not close an outer
-    # block's still-live bindings, and the innermost close runs first on every
-    # path out. A slot declared straight in a loop or function scope is covered
-    # by the iteration close and by OP_RETURN respectively.
+    # Same argument, one block down: block-scoped slots are reused by sibling
+    # blocks, so an escaped closure aliasing a dead slot would silently read
+    # the wrong value. Only the declaring scope records the close, innermost
+    # first; slots declared straight in a loop or function scope are covered
+    # by the iteration close and by OP_RETURN instead.
     fn _mark_captured_in_block(self, scope_index: int, slot: int) -> void {
         if slot < 0 { return }
         let scope = self.scopes[scope_index]
@@ -720,17 +711,17 @@ pub class Resolver {
                 }
             }
             if name in scope.pending and name not in scope.cleared {
-                # Within the current function this is unambiguously a read of a
-                # slot that does not exist yet. Across a function boundary the
-                # closure may legitimately run later, so keep looking.
+                # Within the current function this is unambiguously a read
+                # before declaration; across a function boundary the closure
+                # may legitimately run later, so keep looking.
                 if scope.fn_index == current_fn {
                     self._use_before_decl(name, span, scope.pending[name])
                     return null
                 }
                 # A module-level binding is initialised by the module body,
-                # which runs before anything can call a function declared above
-                # it. Only a read from the same block is premature (spec §3), so
-                # this one is left unresolved and the emitter loads a global.
+                # which runs before any function declared above it can be
+                # called (spec §3) — only a same-block read is premature, so
+                # this stays unresolved and the emitter loads a global.
                 if scope.kind == ScopeKind.Module {
                     cross_module = true
                 } elif cross_fn == null {
@@ -788,16 +779,16 @@ pub class Resolver {
         self.out.bind(node, self.resolve_name(node.text("name"), node.span, mark_used))
     }
 
-    # Whether the brackets of an `Index` held type arguments rather than a
-    # subscript. Only the symbol table can tell, which is why the parser leaves
-    # both spellings as an `Index` and this decides.
+    # Whether an `Index` node's brackets held type arguments, not a subscript.
+    # Only the symbol table can tell, so the parser leaves both spellings as
+    # `Index` and this decides.
     fn _is_generic_instantiation(self, node: Node) -> bool {
         let object = node.child("object")
         if object == null { return false }
 
-        # `m.Box[int]` after `import m`: a module member is resolved by name at
-        # run time, so nothing here knows whether it is a generic class. The
-        # brackets decide, exactly as they do for a name imported directly.
+        # `m.Box[int]` after `import m`: a module member resolves by name at
+        # run time, so only the brackets can decide generic-ness here, same
+        # as for a directly imported name.
         if object.kind == NodeKind.Member {
             let base = object.child("object")
             if base == null or base.kind != NodeKind.Ident { return false }
@@ -1578,12 +1569,10 @@ pub class Resolver {
             NodeKind.Ident => { self._ident(node, true) }
             NodeKind.Self => {
                 # A nested function has no receiver in slot 0, but the
-                # enclosing method's `self` is an ordinary `let` binding and
-                # closures capture those (spec §6). Resolving it as the name it
-                # already is hands it to the upvalue machinery instead of
-                # inventing a second one; the emitter reads the symbol back and
-                # loads the capture. Only a `self` with no enclosing method at
-                # all is an error.
+                # enclosing method's `self` is an ordinary `let` that closures
+                # capture (spec §6) — resolving it as that name reuses the
+                # upvalue machinery instead of inventing a second one. Only
+                # `self` with no enclosing method at all is an error.
                 if not self.self_ok {
                     let captured = self.resolve_name("self", node.span, true)
                     if captured != null {
@@ -1631,14 +1620,12 @@ pub class Resolver {
                 for argument in node.records("args") { self._node(argument["value"]) }
             }
             NodeKind.Index => {
-                # `Box[int](0)` and `Pair[A, B](a, b)` parse as an index because
-                # the parser cannot know whether `Box` names a generic type —
-                # only the symbol table can. Now that the object is resolved, a
-                # class, trait, enum or alias receiver means the brackets held
-                # *type* arguments, so they must not be resolved as values.
-                # Generics are erased at run time (spec §6.1), so the arguments
-                # carry no runtime meaning and the checker reads them off the
-                # tree.
+                # `Box[int](0)`/`Pair[A, B](a, b)` parse as Index since only the
+                # symbol table (not the parser) can tell a generic type apart;
+                # once resolved, a class/trait/enum/alias receiver means the
+                # brackets held *type* arguments and must not be resolved as
+                # values — generics are erased at run time (spec §6.1), so the
+                # checker reads them off the tree instead.
                 self._node(node.child("object"))
                 if self._is_generic_instantiation(node) {
                     self.out.set_type_args(node)

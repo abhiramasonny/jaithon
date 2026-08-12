@@ -1,24 +1,15 @@
 #: The peephole: pass 3 of `spec/BYTECODE.md` §8.
 #:
-#: The Jaithon half of `jaiOptPeephole` (`src/codegen/optimize.c:1198`): jump
-#: chains, a conditional inverted over a lone jump, a constant condition, `NOT`
-#: folded into the jump it feeds, and runs of `POP` merged into `POPN`.
+#: The Jaithon half of `jaiOptPeephole` (`src/codegen/optimize.c:1198`).
 #:
-#: Rewriting strands blocks and removing a stranded block puts new neighbours
-#: next to each other, so this pass alternates its own scan with
-#: `mark_unreachable` until neither has anything left to do.
+#: Fusion is deliberately not here: run first (as the C used to), it consumes
+#: every §3.3 window before branch rewrites finish, hiding e.g. `JUMP_IF_FALSE
+#: over a lone JUMP` from the rule that would delete the `JUMP`. Pass 3 finishes
+#: the control flow and pass 6 fuses what is left.
 #:
-#: Fusion is deliberately not here. It used to be the first rule in the C, which
-#: meant `opt.fuse` found every §3.3 window already consumed and reported zero
-#: rewrites for the whole tree, so spec §8's two passes were one. Worse, fusing a
-#: comparison into its jump before the branch rewrites have run hides
-#: `JUMP_IF_FALSE over a lone JUMP` from the rule that would have deleted the
-#: `JUMP`. Pass 3 finishes the control flow and pass 6 fuses what is left.
-#:
-#: Constant *folding* is not here either, and is not a back-end job at all: the
-#: C folds `-5` to a constant and inlines a folded `const` in the type checker
-#: (`src/sema/check_fold.c`), which spec §8 lists as pass 1, on the AST, before
-#: emission.
+#: Constant *folding* isn't here either, and isn't a back-end job at all: the C
+#: folds it in the type checker (`src/sema/check_fold.c`, spec §8 pass 1), on
+#: the AST, before emission.
 from jaithon.compile.emit import ConstTag, FuncProto, Op, opcode
 from .chunk import Code, Instr, decode, fits_i16, first_live, kill, live_at_or_after
 from .chunk import mark_unreachable, next_live, op_branch_is_edge, prev_live, read_u24
@@ -44,13 +35,11 @@ pub fn peephole(proto: FuncProto) -> int {
 
 #: The pass itself, on an already-decoded chunk.
 #:
-#: Decoding and re-encoding cost more than every rewrite in this file put
-#: together -- measured, one round trip over the standard library is 317ms and
-#: the optimiser used to do about six of them per function, because each pass
-#: decoded and rebuilt on its own. The driver in `opt/mod.jai` now decodes once
-#: and hands the same `Code` to every pass, so this entry point is the one that
-#: runs in a normal compile and the wrapper above is for callers holding only a
-#: proto.
+#: Decode/re-encode cost more than every rewrite here combined -- measured, one
+#: round trip over the standard library is 317ms, and the optimiser used to do
+#: about six of them per function. `opt/mod.jai` now decodes once and shares
+#: the `Code`; this is the entry point a normal compile runs, and the wrapper
+#: above is for callers holding only a proto.
 pub fn peephole_on(code: Code) -> int {
     # Rewriting strands blocks, and removing a stranded block puts new
     # neighbours next to each other, so the two feed each other until neither
@@ -139,12 +128,10 @@ fn _rewrite_branch(code: Code, index: int) -> bool {
             not over.is_target and
             after >= 0 and
             live_at_or_after(code, instruction.target) == after {
-            # `live_at_or_after` answers `count()` when everything from the
-            # JUMP's target on has been deleted, and there is no instruction
-            # there to retarget onto. The C reads `data[count]` here and writes
-            # `isTarget` through it, one past the end of its array; refusing the
-            # rewrite is the same answer for every input where that read is
-            # defined, because `rebuild` rejects a branch off the end anyway.
+            # `count()` here means everything past the JUMP's target is deleted;
+            # the C reads/writes one past its array's end in this case, and
+            # refusing matches every input where that read is defined, since
+            # `rebuild` rejects a branch off the end anyway.
             let landing = live_at_or_after(code, over.target)
             if landing < code.count() and _retarget_fits(code, index, landing) {
                 instruction.op = _inverted_jump(instruction.op)
@@ -233,13 +220,11 @@ fn _rewrite_const_condition(code: Code, index: int) -> bool {
 # NOT feeding a conditional jump: invert the jump instead. Both instructions
 # change meaning for an incoming edge, so neither may be a branch target.
 #
-# The jump checks its condition is a bool too, so erasing the NOT looks free,
-# but the two report the failure differently ("operand of 'not'" against
-# "condition"), and a program that catches the TypeError can read the message.
-# There is no truthiness in Jaithon (LANGUAGE.md §5.1), so an `any` value here is
-# exactly the case that fails, which is why the rewrite waits for a producer that
-# is a bool by construction: then the check cannot fire at all and which
-# instruction would have run it stops mattering.
+# Erasing the NOT looks free since the jump checks its condition is a bool too,
+# but the two report the failure differently ("operand of 'not'" vs.
+# "condition") and a program can catch and read that message. So the rewrite
+# waits for a producer that is a bool by construction, where the check can
+# never fire and which instruction would have run it stops mattering.
 fn _rewrite_not_jump(code: Code, index: int) -> bool {
     let window = window_of(code, index, 2)
     if window.len() < 2 { return false }

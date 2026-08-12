@@ -1,26 +1,8 @@
 #: Keyboard and mouse state, tracked from one frame to the next.
 #:
-#: A raw `Event` says what changed; a game loop almost always wants to know
-#: what *is*. `Input` keeps both: `is_down` for held keys and buttons,
-#: `just_pressed` and `just_released` for the edges inside the frame that has
-#: just been polled.
-#:
-#: One `Input` is created per window and updated once per frame, immediately
-#: after `Window.poll`:
-#:
-#:     let input = Input(window)
-#:     loop {
-#:         if not window.poll() { break }
-#:         input.update()
-#:         if input.just_pressed(Key.Escape) { break }
-#:     }
-#:
-#: Update it exactly once per frame. Twice and the second call sees no events,
-#: so every edge disappears; never, and the state is frozen.
-#:
-#: Keys are named, not numbered: `Key.Escape`, never 41. The numbers are USB
-#: HID usage ids and live in one table at the bottom of this module, which is
-#: the only place in the library that knows them.
+#: Call `update` exactly once per frame, right after `Window.poll`: twice and
+#: the second call sees no events, so every edge disappears; never, and the
+#: state is frozen.
 #:
 #: ```
 #: let keyboard = Keyboard()
@@ -35,15 +17,12 @@ from std.gui import Window, Event
 
 #: Every key this library names.
 #:
-#: `Key.from_code` and `code` convert between a variant and the platform's own
-#: number for a key that arrives on an `Event`. A key the platform reports and
-#: this enum does not name is dropped by `Keyboard`, which is why adding one is
-#: a single row in the table at the bottom of this module.
+#: An unnamed key is dropped by `Keyboard`; add one as a single row in the
+#: table at the bottom of this module.
 #:
-#: The letters are physical positions on a US layout, so `Key.W` is the key
-#: above `Key.S` on every keyboard and `Key.Z` on an AZERTY layout is where a
-#: US keyboard has W. Never spell text out of key codes — use `Keyboard.text`,
-#: which the platform composes with the user's real layout.
+#: Letters are physical positions on a US layout (`Key.W` is above `Key.S`
+#: everywhere, even AZERTY). Never build text from key codes — use
+#: `Keyboard.text`, composed from the user's real layout.
 pub enum Key {
     #: The key at the `A` position on a US layout.
     A,
@@ -321,9 +300,6 @@ pub class Keyboard {
     }
 
     #: Fold one frame of events into the state.
-    #:
-    #: The edge sets and the typed text describe only this frame; `down`
-    #: persists until the key comes back up.
     pub fn update(self, events: list[Event]) -> void {
         self.pressed = set()
         self.released = set()
@@ -368,15 +344,14 @@ pub class Keyboard {
 
     #: Report whether `key` fired this frame, first press or auto-repeat.
     #:
-    #: This is what a text editor wants for Backspace and the arrow keys, so
-    #: that holding one down keeps moving; `just_pressed` is what a game wants
-    #: for a jump, so that holding it down does not.
+    #: Editors want this for Backspace and arrow keys (repeat keeps moving);
+    #: games want `just_pressed` for actions like a jump (repeat should not).
     pub fn repeated(self, key: Key) -> bool { return self.repeats.has(key) }
 
     #: Text composed during the frame just polled, "" when none.
     #:
-    #: The platform produces it from the user's layout, dead keys and input
-    #: method, so it is the only correct source of characters to insert.
+    #: The only correct source of characters — dead keys and input method
+    #: composition make key codes insufficient.
     pub fn text(self) -> str { return self.typed }
 
     #: Report whether either shift key is held.
@@ -493,9 +468,6 @@ pub class Mouse {
     pub fn just_released(self, button: MouseButton) -> bool { return self.released.has(button) }
 
     #: Report whether the pointer is inside this rectangle.
-    #:
-    #: The hit test every widget starts with, which is why it lives here rather
-    #: than being written out at each call site.
     pub fn in_rect(self, x: int, y: int, width: int, height: int) -> bool {
         let inside_x = x <= self.position_x and self.position_x < x + width
         let inside_y = y <= self.position_y and self.position_y < y + height
@@ -542,9 +514,8 @@ pub class Input {
     pub fn text(self) -> str { return self.keyboard.text() }
 }
 
-# The one place in the library that knows a key's number. These are USB HID
-# usage ids, which is what every desktop platform reports underneath its own
-# API, so the same table works on all of them.
+# USB HID usage ids: the same numbers on every desktop platform, so one
+# table covers all of them.
 let _KEY_TABLE: list[tuple[int, Key]] = [
     (4, Key.A),
     (5, Key.B),

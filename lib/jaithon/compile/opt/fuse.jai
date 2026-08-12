@@ -1,16 +1,16 @@
 #: Superinstruction selection: pass 6 of `spec/BYTECODE.md` §8.
 #:
-#: The Jaithon half of `jaiOptSuperinstructions`
-#: (`src/codegen/optimize.c:895`): a greedy longest match over the fused set of
-#: §3.3, rewriting the head of every window in place and deleting the rest, so
-#: an edge that lands on the window head still performs the whole sequence.
+#: The Jaithon half of `jaiOptSuperinstructions` (`src/codegen/optimize.c:895`):
+#: a greedy longest match over the fused set of §3.3, rewriting the head of
+#: every window in place and deleting the rest, so an edge landing on the head
+#: still performs the whole sequence.
 #:
-#: Fusion is deliberately not part of the peephole. Running it there consumed
-#: every §3.3 window before `peephole` had finished rewriting the control flow,
-#: which both hid the branch rewrites and made §8's two passes one.
+#: Deliberately not part of the peephole: run there, it used to consume every
+#: §3.3 window before branch rewrites finished, hiding them and merging §8's
+#: two passes into one.
 #:
-#: The file is `fuse.jai` and not `super.jai` because `super` is a keyword and
-#: cannot be a module path (E0804).
+#: Named `fuse.jai`, not `super.jai`: `super` is a keyword and can't be a
+#: module path (E0804).
 from jaithon.compile.emit import ConstTag, FuncProto, Op, opcode
 from .chunk import Code, Instr, NO_INDEX, decode, first_live, fits_i16, fits_i8
 from .chunk import kill, kill_all, next_live, pool_int_index, prev_live, read_i16
@@ -44,9 +44,9 @@ pub fn superinstructions_on(code: Code) -> int {
             continue
         }
         changes += 1
-        # The window head always survives a fusion, so staying at or before
-        # `index` is what chains GET_LOCAL2 into ADD_LOCALS; backing up one lets
-        # the closed hole open a window for the instruction in front of it.
+        # The window head always survives a fusion, so backing up one lets the
+        # closed hole open a window for the instruction in front of it (chains
+        # GET_LOCAL2 into ADD_LOCALS).
         let back = prev_live(code, index)
         if back >= 0 { index = back }
     }
@@ -63,16 +63,13 @@ fn _fuse_at(code: Code, index: int) -> bool {
 
     # GET_LOCAL a; <int k>; ADD; BIND a  ->  INC_LOCAL a, k.
     #
-    # The store is OP_BIND, not SET_LOCAL; POP: the emitter uses BIND for every
-    # store-and-discard, so the two rules this replaces matched nothing in the
-    # whole tree while `i += 1`, the single hottest pair measured, went unfused.
+    # Matches BIND, not SET_LOCAL;POP (the emitter never emits that for a
+    # store-and-discard) -- `i += 1`, the hottest pair measured, went unfused
+    # until this matched it.
     #
-    # SUB is *not* folded in as INC_LOCAL a, -k, which is what the dead rule
-    # used to say. It is only the same instruction for numbers: on anything else
-    # both raise, but INC_LOCAL's slow path adds, so `y - 1` on a str reported
-    # "unsupported operand types for '+'" from -O1 up and for '-' at -O0. A
-    # fused form may be a fast path and nothing else. Folding `-=` back in needs
-    # an operator byte on INC_LOCAL.
+    # SUB is not folded in as INC_LOCAL a, -k: for non-numbers both raise, but
+    # INC_LOCAL's slow path only adds, so `y -= 1` on a str used to report the
+    # wrong operator in its error. Folding `-=` back in needs an operator byte.
     if n >= 4 and head.op == opcode(Op.GetLocal) and window_clean(code, w, 4) {
         let arith = code.data[w[2]]
         let store = code.data[w[3]]
@@ -106,18 +103,12 @@ fn _fuse_at(code: Code, index: int) -> bool {
     #     GET_LOCAL a; <const k>; JUMP_IF_CMP_FALSE cmp, J
     #     CMP_LOCAL_CONST_LT a, k; JUMP_IF_FALSE J
     #
-    # all collapse to JUMP_IF_CMP_LOCAL_K cmp, a, k, J. That is `while i < N` and
-    # `if n < 2`, a loop guard and a recursion base case, in one dispatch instead
-    # of three. The three windows are the same shape caught at three stages: the
-    # raw one, the one a previous round already half-fused into
-    # JUMP_IF_CMP_FALSE, and the one the CMP_LOCAL_CONST_LT rule below claimed
-    # first. The last two exist because fusion runs to a fixed point, so a rule
-    # that only matched the raw form would lose every window whose head was
-    # reached in a later round.
+    # all collapse to JUMP_IF_CMP_LOCAL_K cmp, a, k, J. Three rules catch the
+    # same shape at three fixpoint stages, since a rule that only matched the
+    # raw form would miss a window whose head is reached in a later round.
     #
-    # K is a pool index rather than an immediate on purpose: the immediate form
-    # OP_CMP_LOCAL_CONST_LT already exists and cannot express `i < 5_000_000`,
-    # which is exactly the guard worth fusing.
+    # K is a pool index, not an immediate, because OP_CMP_LOCAL_CONST_LT's
+    # immediate form can't express e.g. `i < 5_000_000`.
     if n >= 4 and
         head.op == opcode(Op.GetLocal) and
         window_clean(code, w, 4) and
@@ -353,10 +344,9 @@ fn _const_index_of(code: Code, instruction: Instr) -> int {
 # A bare i16 immediate: the shape of MOD_INT_CONST.
 # The fused `<binop>; BIND a` form of `op`, or null when there is none.
 #
-# Every opcode answered here carries a slot, so every one of them also has to
-# be listed in the coalescer's slot-operand table (`_build_slot_operands` in
-# chunk.jai). Leaving one out renumbers the readers of a slot and not the fused
-# writer, which is a miscompile three steps removed from its cause.
+# Every opcode answered here must also be in the coalescer's slot-operand table
+# (`_build_slot_operands` in chunk.jai), or it renumbers readers but not this
+# fused writer -- a miscompile three steps removed from its cause.
 fn _bind_fused_form(op: int) -> int? {
     if op == opcode(Op.Add) { return opcode(Op.AddBind) }
     if op == opcode(Op.Sub) { return opcode(Op.SubBind) }

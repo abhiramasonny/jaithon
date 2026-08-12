@@ -1,40 +1,6 @@
 #: Presentation: format specs, number and unit rendering, tables, progress
 #: bars, colour, and pretty-printing.
 #:
-#: ## Format specs
-#:
-#: `format` and f-string interpolation share the built-in format engine. A
-#: replacement field is
-#:
-#:     {[selector][:spec]}
-#:
-#: where `selector` is a positional index (`{0}`), a name (`{count}`, only
-#: available to f-strings, which capture the binding), or empty for "the next
-#: argument", and `spec` is
-#:
-#:     [[fill]align][sign][#][0][width][group][.precision][type]
-#:
-#: | Part | Values | Meaning |
-#: |---|---|---|
-#: | fill | any character | pad with this; requires an explicit align |
-#: | align | `<` `>` `^` `=` | left, right, centre, pad between sign and digits |
-#: | sign | `+` `-` space | always show, negative only (default), leading space |
-#: | `#` | — | prefix `0b`, `0o` or `0x` on the integer bases |
-#: | `0` | — | zero-pad the field, the same as `0=` |
-#: | width | integer | minimum field width, in characters |
-#: | group | `,` `_` | digit-group separator |
-#: | precision | `.` integer | digits after the point, or max length for `s` |
-#: | type | below | how to render the value |
-#:
-#: Integer types are `d` decimal, `b` binary, `o` octal, `x`/`X` hex and `c`
-#: codepoint. Float types are `f` fixed, `e`/`E` scientific, `g`/`G` general and
-#: `%` percentage. Any value accepts `s` for `str(value)` and `r` for
-#: `repr(value)`. `{{` and `}}` are literal braces.
-#:
-#: Padding in a spec counts characters. When the text may contain wide or
-#: combining characters, or ANSI colour, pad with `align_left`, `align_right`
-#: and `center`, which count display cells instead.
-#:
 #: ```
 #: format("{}: {:.2f}", "pi", 3.14159)   # "pi: 3.14"
 #: format("[{:>5}]", 42)                 # "[   42]"
@@ -46,8 +12,7 @@ const _STDOUT = 1
 let _BINARY_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
 let _DECIMAL_UNITS = ["B", "kB", "MB", "GB", "TB", "PB", "EB"]
 
-# Scalars drawn in two terminal cells, and scalars drawn in none. Both are
-# sorted, so `_in_ranges` can stop at the first range that starts too late.
+# Both lists must stay sorted -- `_in_ranges` stops at the first range that starts too late.
 let _WIDE_RANGES: list[(int, int)] = [
     (0x1100, 0x115F),
     (0x2E80, 0x303E),
@@ -109,10 +74,8 @@ pub enum TableStyle {
 
 #: A text table whose columns are sized from their widest display cell.
 #:
-#: Every column is declared before the first row, so a row with the wrong
-#: number of cells is caught where it is added rather than at render time. Cell
-#: text may contain ANSI colour: widths are measured with `display_width`, which
-#: ignores escapes and counts wide characters as two cells.
+#: Cell text may contain ANSI colour: widths are measured with `display_width`,
+#: which ignores escapes and counts wide characters as two cells.
 pub class Table {
     var headers: list[str]
     var alignments: list[Align]
@@ -149,8 +112,6 @@ pub class Table {
     pub fn row_count(self) -> int { return self.rows.len() }
 
     #: Render the table, with no trailing newline.
-    #:
-    #: An empty table renders as the empty string.
     pub fn render(self, style: TableStyle = TableStyle.Box) -> str {
         if self.headers.len() == 0 { return "" }
         let widths = self.column_widths()
@@ -220,8 +181,7 @@ pub class Table {
     fn markdown_line(self, cells: list[str], widths: list[int]) -> str {
         let parts: list[str] = []
         for (index, cell) in cells.enumerate() {
-            # Widen the column by whatever the escaping added, so the rendered
-            # table still lines up when a cell contains a pipe.
+            # Escaping widens the cell, so add that back to keep columns aligned.
             let escaped = cell.replace("|", "\\|")
             let extra = display_width(escaped) - display_width(cell)
             parts.push(self.pad(escaped, widths[index] + extra, self.alignments[index]))
@@ -249,9 +209,8 @@ pub class Table {
 
 #: A single-line progress bar for a terminal.
 #:
-#: `render` is pure, so it can be logged or tested; `draw` rewrites the current
-#: line in place. Call `finish` once, which fills the bar and ends the line, so
-#: later output does not land on top of it.
+#: `render` is pure; `draw` rewrites the line in place. Call `finish` once so
+#: later output does not overlap the bar.
 pub class ProgressBar {
     var total: int
     var current: int
@@ -304,8 +263,8 @@ pub class ProgressBar {
 
     #: Redraw the bar over the current terminal line.
     #:
-    #: Writes to file descriptor 1 directly, because a carriage return has to
-    #: reach the terminal without the newline `print` appends.
+    #: Writes to fd 1 directly -- `print` would append a newline and break the
+    #: in-place redraw.
     pub fn draw(self) -> void {
         __prim__.io_write(_STDOUT, "\r" + self.render())
         __prim__.io_flush(_STDOUT)
@@ -324,9 +283,8 @@ pub class ProgressBar {
 
 #: Format `args` into `template` using the built-in format engine.
 #:
-#: Only positional fields are filled, since the arguments arrive without names;
-#: use an f-string for `{name}` fields, or `std.str.expand` when the template
-#: comes from outside the program.
+#: Only positional fields are filled; use an f-string for `{name}` fields, or
+#: `std.str.expand` for templates from outside the program.
 #:
 #: ```
 #: format("{} of {}", 3, 10)     # "3 of 10"
@@ -399,9 +357,8 @@ pub fn as_percent(value: float, digits: int = 1) -> str {
 
 #: Render a byte count with a binary (KiB) or decimal (kB) unit.
 #:
-#: Counts below the base are shown as whole bytes. Rounding that would reach the
-#: base carries into the next unit, so 1048575 bytes is "1.0 MiB", never
-#: "1024.0 KiB".
+#: Rounding that would reach the base carries into the next unit, so 1048575
+#: bytes is "1.0 MiB", never "1024.0 KiB".
 #:
 #: ```
 #: as_bytes(1536)          # "1.5 KiB"
@@ -429,9 +386,8 @@ pub fn as_bytes(count: int, binary: bool = true, digits: int = 1) -> str {
 
 #: Render a duration in seconds as its `parts` most significant units.
 #:
-#: Below a second the result is whole milliseconds, below ten seconds it is one
-#: decimal, and above that it is days, hours, minutes and seconds with the
-#: zero-valued units dropped.
+#: Below a second it is whole milliseconds, below ten seconds one decimal,
+#: otherwise days/hours/minutes/seconds with zero-valued units dropped.
 #:
 #: ```
 #: as_duration(5025.0)    # "1h 23m"
@@ -506,8 +462,8 @@ pub fn engineering(value: float, digits: int = 3) -> str {
 
 #: Pad `text` on the right until it occupies `width` display cells.
 #:
-#: `fill` must be one cell wide. Text already at least that wide is returned
-#: unchanged rather than truncated.
+#: `fill` must be one cell wide; text already that wide is returned unchanged,
+#: not truncated.
 #:
 #: ```
 #: align_left("ab", 5) + "|"   # "ab   |"
@@ -542,10 +498,8 @@ pub fn center(text: str, width: int, fill: str = " ") -> str {
 
 #: Count the terminal cells `text` occupies.
 #:
-#: ANSI escapes and control characters count as nothing, combining marks and
-#: zero-width scalars count as nothing, East Asian wide scalars and emoji count
-#: as two, and everything else counts as one. A tab counts as one cell, since
-#: its real width depends on the column it starts in.
+#: A tab counts as one cell, since its real width depends on the column it
+#: starts in.
 #:
 #: ```
 #: display_width("日本")   # 4
@@ -565,9 +519,6 @@ pub fn display_width(text: str) -> int {
 }
 
 #: Remove every ANSI escape sequence from `text`.
-#:
-#: Handles CSI sequences such as colour codes and OSC sequences such as window
-#: titles, so the result is what a terminal would actually show.
 #:
 #: ```
 #: strip_ansi("\x1b[31mred\x1b[39m")   # "red"
@@ -599,9 +550,8 @@ pub fn strip_ansi(text: str) -> str {
 
 #: Pretty-print nested lists, dicts, sets and tuples over multiple lines.
 #:
-#: Containers already on the path are printed as `<cycle>` instead of recursing
-#: forever, so a structure that refers to itself is still printable. Strings are
-#: quoted and escaped; anything else falls back to `str(value)`.
+#: Containers already on the path print as `<cycle>` instead of recursing
+#: forever, so self-referential structures don't stack-overflow.
 #:
 #: ```
 #: pretty([1, 2])   # "[\n  1,\n  2\n]"
@@ -616,9 +566,8 @@ pub fn colors_enabled() -> bool { return _colors_enabled }
 
 #: Turn the colour helpers on or off for the whole program.
 #:
-#: Call this once at startup with the answer to "is stdout a terminal, and is
-#: NO_COLOR unset". Every helper below then becomes the identity function, so no
-#: call site needs a condition.
+#: Once set, every helper below becomes the identity function, so no call site
+#: needs a condition.
 pub fn set_colors_enabled(enabled: bool) -> void {
     _colors_enabled = enabled
 }
@@ -709,8 +658,7 @@ fn _round_to(value: float, digits: int) -> float {
     return __prim__.f64_round(value * scale) / scale
 }
 
-# Split `value` into a mantissa in [1, 10) and a power of ten, then correct for
-# a mantissa that rounding at `digits` would carry up to exactly 10.
+# Corrects for rounding at `digits` carrying the mantissa up to exactly 10.
 fn _decompose(value: float, digits: int) -> (float, int) {
     if value == 0.0 { return (0.0, 0) }
     var mantissa = abs(value)
@@ -755,7 +703,6 @@ fn _is_csi_final(ch: str) -> bool {
     return code >= 0x40 and code <= 0x7E
 }
 
-# An OSC string runs to a BEL or to the two-character string terminator.
 fn _skip_osc(text: str, start: int) -> int {
     var index = start
     while index < text.len() {

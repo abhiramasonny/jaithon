@@ -2,48 +2,20 @@
 #: vector operations most programs actually want — with a correct CPU
 #: implementation of every operation for when there is no device.
 #:
-#: ## Availability
+#: `is_available` reports whether a device was found; `Buffer` and `Kernel`
+#: raise `RuntimeError` without one, but every operation below picks CPU or
+#: GPU itself and never does.
 #:
-#: `is_available` answers whether a device was found. `Buffer` and `Kernel`
-#: need one and raise `RuntimeError` without it; the operations below never do,
-#: because each has a CPU implementation and picks between the two itself.
-#: Small inputs take the CPU path even on a machine with a GPU: below
-#: `MIN_GPU_ELEMENTS` elements the upload alone costs more than the arithmetic.
+#: A device buffer holds 32-bit floats (Metal's only option), so `upload` and
+#: `download` round through that; the CPU path computes in double precision
+#: with Neumaier compensation and is *more* accurate, not just different —
+#: never compare the two paths for exact equality, only with a tolerance such
+#: as `math.approx_eq`.
 #:
-#: ## Precision
-#:
-#: A device buffer holds 32-bit floats, because that is what Metal Shading
-#: Language offers. A Jaithon `float` is a 64-bit double, so `upload` rounds
-#: and `download` returns the rounded value — `0.1` uploaded comes back as
-#: `0.100000001490116...`. The CPU paths compute in full double precision and
-#: sum with Neumaier compensation, so they are *more* accurate than the device,
-#: not merely different. Never compare results from the two paths for exact
-#: equality; compare with a tolerance, as `math.approx_eq` does.
-#:
-#: ## Benchmark
-#:
-#: The crossover is around a hundred thousand elements for elementwise work and
-#: far lower for `matmul`, whose CPU cost is cubic:
-#:
-#:     import std.gpu
-#:
-#:     let size = 1 << 22
-#:     let a = [float(i % 97) for i in 0..size]
-#:     let b = [float(i % 89) for i in 0..size]
-#:
-#:     let start = __prim__.time_mono_seconds()
-#:     let sum = gpu.vector_add(a, b)
-#:     let elapsed = __prim__.time_mono_seconds() - start
-#:     print(f"{gpu.device_name()}: {size} adds in {elapsed * 1000.0} ms")
-#:     print(f"checksum {sum[size - 1]}")
-#:
-#: ## Primitives used
-#:
-#: `gpu_available`, `gpu_device_name`, `gpu_buffer_new`, `gpu_buffer_upload`,
-#: `gpu_buffer_download`, `gpu_buffer_free`, `gpu_compile`, `gpu_kernel_free`,
-#: `gpu_dispatch` and `gpu_max_threads_per_group`. `gpu_dispatch` runs the
-#: command buffer to completion before it returns, so nothing here needs a
-#: separate fence: when `dispatch` returns, the output buffer is readable.
+#: The CPU/GPU crossover is roughly a hundred thousand elements for elementwise
+#: work and far lower for `matmul`, whose CPU cost is cubic. `gpu_dispatch` runs
+#: its command buffer to completion before returning, so nothing here needs a
+#: separate fence.
 #:
 #: ```
 #: vector_add([1.0, 2.0], [3.0, 4.0])    # [4.0, 6.0]
@@ -58,9 +30,8 @@ import std.math
 #: of microseconds; below this size the arithmetic does not.
 pub const MIN_GPU_ELEMENTS = 4096
 
-# Every reduction kernel uses this threadgroup width, and its threadgroup
-# scratch array is declared with it, so the host must dispatch with exactly
-# this group size. 256 is within the guaranteed maximum on every Metal device.
+# Must equal the Metal kernels' hardcoded threadgroup width (their scratch
+# array size); 256 is within every device's guaranteed maximum.
 const _REDUCE_GROUP = 256
 
 let _ELEMENTWISE_SOURCE = """#include <metal_stdlib>
@@ -159,9 +130,6 @@ let _MAP_SUFFIX = """);
 """
 
 #: Report whether a compute device was found.
-#:
-#: Call it before reaching for `Buffer` or `Kernel`. The operations in this
-#: module call it themselves and do not need the caller to.
 pub fn is_available() -> bool { return __prim__.gpu_available() }
 
 #: Return the device name, or "none" when there is no device.
@@ -175,14 +143,8 @@ pub fn device_name() -> str {
 
 #: A block of 32-bit floats in device memory.
 #:
-#: Buffers are the only way data reaches a `Kernel`. Free one when done with
-#: it: device memory is not garbage collected, and a leak here survives every
-#: collection until the process exits.
-#:
-#:     let input = Buffer.of(samples)
-#:     let output = Buffer(samples.len())
-#:     defer { input.free() }
-#:     defer { output.free() }
+#: Free it when done: device memory isn't garbage collected, so a leak here
+#: survives every collection until the process exits.
 pub class Buffer {
     #: Number of float slots the buffer holds.
     pub let count: int
@@ -261,27 +223,9 @@ pub class Buffer {
 
 #: One compute kernel, compiled from Metal Shading Language source.
 #:
-#: A kernel's arguments are bound in one fixed order: the buffers occupy
-#: `buffer(0)` upwards in the order they are passed to `dispatch`, and the
-#: scalars follow them, each as a `constant uint&`. A kernel that expects its
-#: element count last therefore declares it after every buffer.
-#:
-#:     let source = """
-#:     #include <metal_stdlib>
-#:     using namespace metal;
-#:     kernel void scale(device float* x [[buffer(0)]],
-#:                       constant uint& n [[buffer(1)]],
-#:                       uint i [[thread_position_in_grid]]) {
-#:         if (i < n) { x[i] = x[i] * 2.0f; }
-#:     }
-#:     """
-#:
-#:     let kernel = Kernel.compile(source, "scale")
-#:     let data = Buffer.of([1.0, 2.0, 3.0])
-#:     kernel.dispatch([data], 3, scalars: [3])
-#:     print(data.download())        # [2.0, 4.0, 6.0]
-#:     data.free()
-#:     kernel.free()
+#: A kernel's arguments bind in fixed order: buffers occupy `buffer(0)` upward
+#: in the order passed to `dispatch`, then scalars as `constant uint&` — a
+#: kernel expecting its element count last must declare it after every buffer.
 pub class Kernel {
     #: The entry-point function name this kernel was compiled from.
     pub let entry: str
@@ -316,10 +260,9 @@ pub class Kernel {
 
     #: Run the kernel over `threads` threads and wait for it to finish.
     #:
-    #: `group_size` 0 lets the device choose the widest group the kernel
-    #: supports. When the kernel is written against a fixed threadgroup width —
-    #: any kernel declaring a `threadgroup` array is — pass that width instead.
-    #: When `dispatch` returns, every output buffer is readable.
+    #: `group_size` 0 lets the device pick the widest group the kernel supports;
+    #: a kernel written against a fixed threadgroup width (any with a
+    #: `threadgroup` array) must be dispatched with that exact width instead.
     pub fn dispatch(
         self,
         buffers: list[Buffer],
@@ -352,9 +295,8 @@ pub class Kernel {
     fn __str__(self) -> str { return f"Kernel({self.entry})" }
 }
 
-# Pipelines compiled so far, so that an operation called in a loop compiles its
-# kernel once. Keyed by entry name and source together, because `map_kernel`
-# compiles many different sources under the one entry `apply`.
+# Caches compiled kernels; keyed by entry+source together since `map_kernel`
+# reuses the entry name `apply` for many different sources.
 var _pipelines: dict[str, Kernel] = {}
 
 #: Add `a` and `b` elementwise.
@@ -383,10 +325,9 @@ pub fn vector_mul(a: list[float], b: list[float]) -> list[float] {
 
 #: Return the dot product of `a` and `b`.
 #:
-#: The CPU path accumulates with Neumaier compensation, so a long vector of
-#: mixed magnitudes does not lose the small terms. The device path sums a tree
-#: of threadgroup partials, which is a different — also accurate — order, so
-#: the two agree to a tolerance rather than to the bit.
+#: The CPU path uses Neumaier-compensated summation; the device path sums a
+#: threadgroup-partial tree — a different but equally accurate order, so the
+#: two agree only to a tolerance.
 #:
 #: ```
 #: dot([1.0, 2.0], [3.0, 4.0])    # 11.0
@@ -435,10 +376,8 @@ pub fn matmul(a: list[float], b: list[float], rows: int, inner: int, columns: in
     if b.len() != inner * columns {
         throw ValueError(f"right matrix has {b.len()} elements, expected {inner * columns}")
     }
-    # Deliberately NOT __prim__.gpu_matmul. Measured at 512x512, ten
-    # iterations: this path 29ms, the builtin 205ms. The builtin's kernel is
-    # the tiled one and this is not, so the gap is in how each is dispatched
-    # rather than in the arithmetic -- but seven times is seven times.
+    # Deliberately not __prim__.gpu_matmul: measured 29ms vs its 205ms at
+    # 512x512 (its kernel is tiled, this isn't -- gap is dispatch, not arithmetic).
     if not _use_gpu(rows * columns * inner) { return _cpu_matmul(a, b, rows, inner, columns) }
     let left = Buffer.of(a)
     let right = Buffer.of(b)
@@ -481,9 +420,8 @@ pub fn map_kernel(
     return output.download()
 }
 
-# `work` counts multiply-adds, not elements: an elementwise operation does one
-# per element, but a matmul does `rows * inner * columns` of them, and it is the
-# arithmetic rather than the output size that has to outweigh the upload.
+# `work` counts multiply-adds, not elements -- matmul passes `rows*inner*columns`,
+# since it's the arithmetic that must outweigh the upload, not the output size.
 fn _use_gpu(work: int) -> bool {
     return work >= MIN_GPU_ELEMENTS and is_available()
 }
@@ -535,9 +473,8 @@ fn _reduce_with(entry: str, inputs: list[Buffer], count: int) -> float {
     return _compensated_sum(partials.download())
 }
 
-# Neumaier's variant of Kahan summation: it keeps the low bits of every
-# addition, including the ones a plain Kahan loop loses when the running total
-# is smaller than the term being added.
+# Neumaier's variant of Kahan summation: keeps the low bits even when the
+# running total is smaller than the term being added (plain Kahan loses them).
 fn _compensated_sum(values: list[float]) -> float {
     var total = 0.0
     var correction = 0.0

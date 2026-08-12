@@ -1,17 +1,11 @@
 #: The environment, the working directory, and child processes.
 #:
-#: Everything a program needs to know about the machine it is running on and
-#: everything it needs to run another program. Paths and files are `std.io`'s
-#: job; this module is about the process.
+#: Paths and files are `std.io`'s job; this module is about the process.
 #:
 #: Running a command comes in three shapes, in increasing order of control:
-#:
-#: - `run(command)` runs it to completion and hands back a `Completed` with the
-#:   exit code and the captured output.
-#: - `run_checked(command)` does the same but raises `OSError` when the command
-#:   fails, which is what a build step or a deploy script wants.
-#: - `spawn(command)` returns a live `Process` whose input and output are open
-#:   pipes, for a command that streams or that outlives the call.
+#: `run` waits and returns a `Completed`; `run_checked` does the same but
+#: raises `OSError` on failure; `spawn` returns a live `Process` for streaming
+#: or long-running commands.
 #:
 #: ```
 #: run(["echo", "hello"]).stdout        # "hello\n"
@@ -19,34 +13,14 @@
 #: which("no-such-program-xyzzy")       # null
 #: ```
 #:
-#: A command is a list of arguments, never a string, so nothing is ever handed
-#: to a shell to re-parse: an argument containing a space, a quote or a `$` is
-#: passed through untouched. `shell` exists for the cases that genuinely want a
-#: shell, and says in its own documentation why you should not reach for it
-#: with untrusted input.
+#: A command is a list of arguments, never a string, so nothing is handed to a
+#: shell to re-parse — a space, quote or `$` passes through untouched. `shell`
+#: exists for the cases that genuinely want a shell; its own docs explain why
+#: not to use it on untrusted input.
 #:
-#: ## The primitive contract
-#:
-#: This module reaches the operating system through the `os` primitives of the
-#: language specification, and only through the private wrappers at the bottom
-#: of this file:
-#:
-#: - `os_env()` returns the whole environment as a `dict[str, str]`;
-#:   `os_env(name)` returns one value or null; `os_env(name, value)` sets it,
-#:   and a null `value` removes it.
-#: - `os_argv() -> list[str]` is the command line, program name first.
-#: - `os_cwd() -> str`, `os_chdir(path)`, `os_exit(code)`.
-#: - `os_spawn(argv, options) -> dict` starts `argv[0]`, searching `PATH` when
-#:   it holds no `/`, and raises `FileNotFoundError` when it is not there. The
-#:   options are `cwd`, `env`, `stdin` and `stream`. Without `stream` the call
-#:   waits and returns `exit_code`, `stdout` and `stderr`. With `stream` it
-#:   returns at once with `pid`, the three pipe handles, and the `wait`, `poll`
-#:   and `signal` callables that a `Process` is built from.
-#: - `cpu_count() -> int`.
-#:
-#: There is no primitive for the platform name, the host name or this process's
-#: own id, so those three are derived by asking a child process and are cached
-#: after the first call.
+#: There's no primitive for the platform name, host name or this process's own
+#: id, so `platform`/`hostname`/`username`/`pid` derive them via a child
+#: process and cache the result after the first call.
 from std.core import Iterator, Printable
 from std.io import BufferedReader, File, Path
 
@@ -102,14 +76,13 @@ pub class Completed: Printable {
 
 #: A running child process, with its three streams open as pipes.
 #:
-#: Use this when `run` will not do: when the output has to be consumed as it
-#: arrives, when the child expects input that depends on its own output, or
-#: when the child should outlive the call that started it.
+#: Use this over `run` when output must be consumed as it arrives, input
+#: depends on the child's own output, or the child should outlive the call.
 #:
-#: A pipe holds a finite amount of data. If the child fills its output pipe
-#: while this process is blocked writing to its input pipe, both stop for good.
-#: The way out is to read the output as you go, or to close `stdin` before
-#: waiting — a child reading to end of input needs that close to finish at all.
+#: A pipe holds finite data: if the child fills its output pipe while this
+#: process blocks writing its input pipe, both stop for good. Read output as
+#: you go, or close `stdin` before waiting — a child reading to end of input
+#: needs that close to finish at all.
 #:
 #: ```
 #: let process = spawn(["cat"])
@@ -352,8 +325,8 @@ pub fn temp_dir() -> str {
 pub fn platform() -> str {
     let cached = _platform_name
     if cached is not null { return cached }
-    # A fresh binding rather than a store into `cached`: a store ends the
-    # narrowing fact (spec §2.1), so the assigned value has to carry its own.
+    # Fresh binding, not a store into `cached` -- a store ends the narrowing
+    # fact (spec §2.1).
     let detected = _detect_platform()
     _platform_name = detected
     return detected
@@ -370,8 +343,8 @@ pub fn cpu_count() -> int { return __prim__.cpu_count() }
 pub fn hostname() -> str {
     let cached = _host_name
     if cached is not null { return cached }
-    # A fresh binding rather than a store into `cached`: a store ends the
-    # narrowing fact (spec §2.1), so the assigned value has to carry its own.
+    # Fresh binding, not a store into `cached` -- a store ends the narrowing
+    # fact (spec §2.1).
     let detected = _uname("-n")
     _host_name = detected
     return detected
@@ -384,8 +357,8 @@ pub fn hostname() -> str {
 pub fn username() -> str {
     let cached = _user_name
     if cached is not null { return cached }
-    # A fresh binding rather than a store into `cached`: a store ends the
-    # narrowing fact (spec §2.1), so the assigned value has to carry its own.
+    # Fresh binding, not a store into `cached` -- a store ends the narrowing
+    # fact (spec §2.1).
     let detected = _detect_username()
     _user_name = detected
     return detected
@@ -399,8 +372,8 @@ pub fn username() -> str {
 pub fn pid() -> int {
     let cached = _process_id
     if cached is not null { return cached }
-    # A fresh binding rather than a store into `cached`: a store ends the
-    # narrowing fact (spec §2.1), so the assigned value has to carry its own.
+    # Fresh binding, not a store into `cached` -- a store ends the narrowing
+    # fact (spec §2.1).
     let detected = _detect_pid()
     _process_id = detected
     return detected
@@ -408,11 +381,10 @@ pub fn pid() -> int {
 
 #: Run `command` to completion and return how it went.
 #:
-#: `command[0]` is looked up on `PATH` unless it contains a `/`. Standard output
-#: and standard error are captured separately and decoded as UTF-8, so this is
-#: for commands that produce text; a command producing binary output wants
-#: `spawn` and `read_bytes` on the pipe. `stdin_text`, when given, is written to
-#: the child and the stream is then closed.
+#: `command[0]` is looked up on `PATH` unless it contains a `/`. Output is
+#: captured as UTF-8 text — binary output wants `spawn` and `read_bytes`
+#: instead. `stdin_text`, when given, is written to the child and the stream
+#: is then closed.
 #:
 #: A command that fails is not an error here — inspect `exit_code`, or use
 #: `run_checked`. Raises `FileNotFoundError` when the program does not exist.

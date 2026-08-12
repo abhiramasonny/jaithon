@@ -1,10 +1,5 @@
 #: String indexes: a prefix trie, a suffix array with its LCP table, and a
 #: rolling hash.
-#:
-#: All three index a text once so that later queries are cheap: the trie answers
-#: prefix questions in the length of the prefix, the suffix array answers
-#: substring questions in the length of the pattern plus a logarithm, and the
-#: rolling hash compares any two substrings in constant time.
 const DEFAULT_BASE = 257
 const DEFAULT_MODULUS = 1000000007
 
@@ -61,8 +56,7 @@ pub class Trie {
 
     #: Report whether the trie holds no keys. O(1).
     #:
-    #: This counts keys, not nodes. The empty string is a key like any other, so
-    #: a trie that holds only `""` is not empty.
+    #: Counts keys, not nodes — a trie holding only `""` is not empty.
     pub fn is_empty(self) -> bool {
         return self.size == 0
     }
@@ -107,8 +101,7 @@ pub class Trie {
         let start = self._walk(prefix)
         let found: list[str] = []
         if start == null { return found }
-        # Children are pushed in reverse order so the smallest is popped first,
-        # which makes the walk emit keys in lexicographic order.
+        # Pushed in reverse so the smallest pops first, keeping output sorted.
         let stack: list[tuple[_TrieNode, str]] = [(start, prefix)]
         while stack.len() > 0 {
             let frame = stack.pop()
@@ -132,9 +125,6 @@ pub class Trie {
     }
 
     #: The longest key that is a prefix of `text`, or null when there is none.
-    #:
-    #: This is the lookup a tokenizer or a routing table wants: match as much of
-    #: the input as the dictionary allows.
     pub fn longest_prefix_of(self, text: str) -> str? {
         var node = self.root
         var best: str? = null
@@ -162,8 +152,8 @@ pub class Trie {
         }
         node.terminal = false
         self.size -= 1
-        # Walk back up dropping nodes that no longer lead to a key. A node with
-        # keys_below == 0 cannot be on the path to any remaining key.
+        # A node with keys_below == 0 is on no remaining key's path, so it's
+        # safe to prune here.
         var position = path.len() - 1
         var child = node
         while position >= 0 {
@@ -216,9 +206,8 @@ pub class Trie {
 
 #: The sorted suffixes of a string, with the longest-common-prefix table.
 #:
-#: Construction sorts by prefix doubling in O(n log^2 n): ranks are refined by
-#: sorting (rank, next rank) pairs, doubling the compared length each round.
-#: The LCP table is then filled by Kasai's algorithm in O(n).
+#: Construction is O(n log^2 n) by prefix doubling; the LCP table is filled by
+#: Kasai's algorithm in O(n).
 #:
 #: ```
 #: let index = SuffixArray("banana")
@@ -364,8 +353,7 @@ pub class SuffixArray {
 #:
 #: The hash of `text[start:stop]` is
 #: `prefix[stop] - prefix[start] * base ** (stop - start)` modulo a prime, so any
-#: two substrings can be compared in constant time. This is the engine behind
-#: Rabin-Karp search and behind binary searching on a common prefix length.
+#: two substrings can be compared in constant time.
 #:
 #: Equal hashes are strong evidence, not proof: `equals` verifies a hash match
 #: character by character, so it never reports a false positive.
@@ -416,8 +404,8 @@ pub class RollingHash {
             throw IndexError(f"range [{start}, {stop}) is not within [0, {self.text.len()})")
         }
         let span = self.prefix[start] * self.powers[stop - start] % self.modulus
-        # The modulus is added back before the reduction so the result stays in
-        # [0, modulus) whatever sign convention `%` uses for negative operands.
+        # Adding modulus back first keeps the result in [0, modulus) regardless
+        # of `%`'s sign convention on negative operands.
         return (self.prefix[stop] - span + self.modulus) % self.modulus
     }
 
@@ -505,10 +493,8 @@ fn _build_suffix_array(text: str) -> list[int] {
     let length = text.len()
     let suffixes: list[int] = []
     if length == 0 { return suffixes }
-    # Every ordering here is a stable sort by one integer key, never a sort of
-    # tuples: `<` is not defined between tuples, so a pair is ordered by sorting
-    # on the minor key and then, stably, on the major one — a radix pass, which
-    # is what prefix doubling wants anyway.
+    # `<` isn't defined for tuples, so pairs are ordered by two stable sorts
+    # (minor key, then major) — a radix pass, which doubling wants anyway.
     let offsets: list[int] = []
     for index in 0..length { offsets.push(index) }
     let by_character = sorted(offsets, |index| ord(text[index]))
