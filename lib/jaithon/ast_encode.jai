@@ -16,6 +16,7 @@
 #: from_json(to_json(Node.ident("x"))).text("name")      # "x"
 #: ```
 import std.json
+from jaithon.ast_unparse import at_or_null
 from std.math import INF, NAN, is_inf, is_nan
 from std.str import StringBuilder, quote
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind, Visibility
@@ -605,7 +606,7 @@ fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
             let names = node.get("fieldNames")
             # A null name is a positional sub-pattern; a named one gets its own line.
             for (index, sub) in node.child_list("subPatterns").enumerate() {
-                let name = _at_or_null(names, index)
+                let name = at_or_null(names, index)
                 if name is null {
                     _child(out, sub, child)
                     continue
