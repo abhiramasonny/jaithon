@@ -849,15 +849,6 @@ static bool readConstant(Cursor *c, ObjModule *module, Value *out, int depth) {
         *out = FLOAT_VAL(d);
         return true;
     }
-    case K_STR: {
-        const uint8_t *p = NULL;
-        uint32_t len = 0;
-        if (!readBlob(c, &p, &len)) return false;
-        ObjString *s = jaiStringIntern((const char *)p, len);   /* §4: interned */
-        if (s == NULL) return false;
-        *out = OBJ_VAL(s);
-        return true;
-    }
     case K_STRREF: {
         uint64_t index = 0;
         if (!curUleb(c, &index)) return false;
@@ -1024,46 +1015,14 @@ static ObjFunction *readFunction(Cursor *c, ObjModule *module, int depth) {
             }
         }
         if (lineBytes > 0) {
-            if (c->version >= JAIC_VERSION_LTV1) {
-                /* LTV1 already: the on-disk bytes are the runtime form, so
-                 * loading the table is one copy and no decode at all. */
-                const uint8_t *p = NULL;
-                if (!curTake(lineSrc, lineBytes, &p)) goto fail;
-                fn->chunk.lineStream = JAI_ALLOC(uint8_t, lineBytes);
-                memcpy(fn->chunk.lineStream, p, lineBytes);
-                fn->chunk.lineStreamLen = (int)lineBytes;
-                fn->chunk.lineStreamCap = (int)lineBytes;
-            } else {
-                /* A pre-LTV1 image: three absolute u32s per entry. Re-encode on
-                 * the way in rather than keeping a second runtime form -- this
-                 * path exists only until the seed has been regenerated, and it
-                 * is the reason the version bump does not wedge the tree. */
-                if (lineBytes % JAIC_LINE_ENTRY != 0) goto fail;
-                uint32_t n = lineBytes / JAIC_LINE_ENTRY;
-                LineEntry prev = {0, 0, 0};
-                bool hasPrev = false;
-                /* 30 bytes is the worst case for three 10-byte varints. */
-                uint8_t *stream = JAI_ALLOC(uint8_t, (size_t)n * 30u + 1u);
-                size_t used = 0;
-                for (uint32_t i = 0; i < n; i++) {
-                    LineEntry e;
-                    e.offset = curU32(lineSrc);
-                    e.span = curU32(lineSrc);
-                    e.spanEnd = curU32(lineSrc);
-                    if (lineSrc->bad) {
-                        JAI_FREE_ARRAY(uint8_t, stream, (size_t)n * 30u + 1u);
-                        goto fail;
-                    }
-                    used += jaiLtv1EncodeEntry(stream + used,
-                                               (size_t)n * 30u + 1u - used,
-                                               hasPrev ? &prev : NULL, &e);
-                    prev = e;
-                    hasPrev = true;
-                }
-                fn->chunk.lineStream = stream;
-                fn->chunk.lineStreamLen = (int)used;
-                fn->chunk.lineStreamCap = (int)((size_t)n * 30u + 1u);
-            }
+            /* The on-disk bytes ARE the runtime form, so loading the table
+             * is one copy and no decode at all. */
+            const uint8_t *p = NULL;
+            if (!curTake(lineSrc, lineBytes, &p)) goto fail;
+            fn->chunk.lineStream = JAI_ALLOC(uint8_t, lineBytes);
+            memcpy(fn->chunk.lineStream, p, lineBytes);
+            fn->chunk.lineStreamLen = (int)lineBytes;
+            fn->chunk.lineStreamCap = (int)lineBytes;
         }
     }
 

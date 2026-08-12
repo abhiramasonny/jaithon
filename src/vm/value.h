@@ -158,15 +158,8 @@ ObjString *jaiValueToStr(Value v);
 ObjString *jaiValueToRepr(Value v);
 void jaiPrintValue(FILE *out, Value v, bool repr);
 
-/* Most parts one OP_FORMAT can join; an f-string with more falls back to
- * build-a-list-and-join, so this only covers the instruction's u24 literal
- * mask. */
 #define JAI_FMT_MAX_PARTS 24
 
-/* str() of every part, concatenated, in one allocation -- what an f-string
- * lowers to. `parts` must be reachable from a root (OP_FORMAT leaves them on
- * the value stack), since building the result can collect. Returns NULL with
- * an exception pending when a user __str__ raises. */
 ObjString *jaiValueFormat(const Value *parts, int count);
 
 #endif /* JAI_VALUE_H */

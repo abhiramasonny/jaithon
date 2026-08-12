@@ -16,13 +16,21 @@
  * 13: string constants are K_STRREF indices into one module string table. */
 #define JAIC_VERSION     13
 
-/* Oldest container the reader accepts. It must stay below JAIC_VERSION across a
- * format bump, or the newly built binary refuses boot/seed.bin -- whose images
- * were written by the PREVIOUS generation -- and the tree has no front end and
- * no way to build one. `make reseed` twice is what closes the gap: generation 1
- * still runs the old compiler out of the old seed and writes the old version;
- * generation 2 writes the new one. Only then may this be raised. */
-#define JAIC_VERSION_MIN 11
+/* Oldest container the reader accepts.
+ *
+ * LOWER THIS BEFORE BUMPING JAIC_VERSION, not after. A strict reader refuses
+ * boot/seed.bin -- whose images were written by the PREVIOUS generation -- and
+ * the tree then has no front end and no way to build one; the failure is
+ * `internal error: no front end ... module.c:370` and JAITHON_SEED_ANY=1 does
+ * not rescue it. The sequence that works: widen the range, bump the version,
+ * `make reseed` TWICE (generation 1 still runs the old compiler out of the old
+ * seed and writes the old version; generation 2 writes the new one), and only
+ * then raise this back up.
+ *
+ * At 13 because that sequence completed for v12 and v13 and the seed now
+ * carries v13. The pre-LTV1 line table and the inline-K_STR pool are gone from
+ * the reader with it: code no image can reach is code no test can check. */
+#define JAIC_VERSION_MIN 13
 
 /* First container version whose line table is LTV1. Below it, the table is
  * JAIC_LINE_ENTRY-sized absolute records and the reader re-encodes on load. */
