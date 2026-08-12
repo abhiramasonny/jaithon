@@ -1734,12 +1734,22 @@ pub class Emitter {
             self._op_k(Op.ImplTrait, self._string(trait_type.name ?? ""), span)
         }
 
+        # A class's own type parameters are ordinary `Name` types here, so the
+        # kind mapping has to be told which names are not concrete.
+        var type_params: list[str] = []
+        for generic in node.records("generics") {
+            let generic_name = generic["name"]
+            if generic_name != null { type_params.push(generic_name) }
+        }
+
         let fields = node.records("fields")
         for field in fields {
-            # bits 0-1 visibility, bit 2 static, bit 3 immutable
+            # bits 0-1 visibility, bit 2 static, bit 3 immutable,
+            # bits 4-7 the declared kind
             var bits = _visibility_code(field["visibility"]) & 0x3
             if field["isStatic"] { bits = bits | 4 }
             if field["isLet"] { bits = bits | 8 }
+            bits = bits | ((_field_kind_code(field["type"], type_params) & 0xF) << 4)
             self._chunk().write_op(Op.FieldDef, field["span"])
             self._chunk().write_u24(self._string(field["name"]))
             self._chunk().write_byte(bits)
@@ -2797,6 +2807,48 @@ fn _symbol_is_global_like(symbol: Symbol) -> bool {
 fn _visibility_code(visibility: Visibility) -> int {
     if visibility == Visibility.Public { return 2 }
     if visibility == Visibility.Protected { return 1 }
+    return 0
+}
+
+#: The declared kind of a field, for bits 4-7 of `OP_FIELD_DEF`'s info byte.
+#: Mirrors `FieldKind` in `src/vm/object/object.h`; 0 is `any`.
+#:
+#: A HINT, not a guarantee, and the VM guards on it rather than trusting it. So
+#: the safe direction is downward: anything this cannot name exactly comes out
+#: `any`, which claims nothing. A wrong claim is a false `TypeError` on correct
+#: code, which is far worse than a missed one.
+#:
+#: `T?` is `any` because a nullable holds `null`, and a bare type parameter is
+#: `any` because its type is not known here. `list[T]` is still `list`: the
+#: container is known even when its element is not.
+fn _field_kind_code(declared: TypeExpr?, type_params: list[str]) -> int {
+    if declared == null { return 0 }
+    let t: TypeExpr = declared
+
+    if t.kind == TypeKind.Name {
+        let n = t.name ?? ""
+        if type_params.contains(n) { return 0 }
+        if n == "int" { return 1 }
+        if n == "float" { return 2 }
+        if n == "bool" { return 3 }
+        if n == "str" { return 4 }
+        if n == "list" { return 5 }
+        if n == "dict" { return 6 }
+        if n == "any" { return 0 }
+        # A class or trait name. Not `instance` yet: telling a class name from
+        # an alias or an enum needs the checker, which does not run here, and
+        # an enum value is not an instance.
+        return 0
+    }
+
+    if t.kind == TypeKind.Generic {
+        let n = t.name ?? ""
+        if n == "list" { return 5 }
+        if n == "dict" { return 6 }
+        return 0
+    }
+
+    # Optional, Union, Fn, Tuple, Infer.
     return 0
 }
 

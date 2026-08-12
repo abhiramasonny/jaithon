@@ -237,6 +237,22 @@ void jaiFreeObject(Obj *obj) {
     JAI_PANIC("jaiFreeObject: object with invalid type tag %d", (int)obj->type);
 }
 
+const char *jaiFieldKindName(uint32_t kind) {
+    switch ((FieldKind)kind) {
+    case FIELD_KIND_INT:      return "int";
+    case FIELD_KIND_FLOAT:    return "float";
+    case FIELD_KIND_BOOL:     return "bool";
+    case FIELD_KIND_STR:      return "str";
+    case FIELD_KIND_LIST:     return "list";
+    case FIELD_KIND_DICT:     return "dict";
+    case FIELD_KIND_INSTANCE: return "instance";
+    case FIELD_KIND_ANY:      break;
+    }
+    /* An unrecognised code is a newer encoding read by an older binary, and
+     * "any" is the reading that claims nothing. */
+    return "any";
+}
+
 const char *jaiObjTypeName(ObjType t) {
     switch (t) {
     case OBJ_STRING:    return "str";

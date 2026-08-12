@@ -119,6 +119,20 @@ fi
 # A truncated or corrupt .jaic must be an ordinary cache miss, never a crash and
 # never a load failure. It reads and corrupts real cache files, so it runs here
 # rather than as a golden -- a golden only compares stdout.
+# Bits 4-7 of OP_FIELD_DEF's info byte are visible only through the
+# disassembler, and emit.jai is the only front end, so nothing else can catch a
+# wrong kind mapping.
+if [[ -x "$ROOT/tests/vm/field_kind_disasm.sh" ]]; then
+    kind_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/field_kind_disasm.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="field_kind: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL"*)  record_fail "field_kind: ${line#FAIL: }" "" ;;
+        esac
+    done <<< "$kind_output"
+fi
+
 if [[ -x "$ROOT/tests/vm/cache_corrupt.sh" ]]; then
     corrupt_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/cache_corrupt.sh" 2>&1)"
     while IFS= read -r line; do
