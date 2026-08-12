@@ -185,6 +185,24 @@ pub class Buffer {
         __prim__.gpu_buffer_upload(self.handle, values, offset)
     }
 
+    #: Expand `count` unsigned bytes into float slots without a host-side list.
+    #:
+    #: Each destination value is `float(data[source_offset + i]) * scale`.
+    #: This is intended for byte datasets such as images and token ids, where
+    #: constructing millions of boxed Jaithon floats would dominate loading.
+    pub fn upload_u8(
+        self,
+        data: bytes,
+        source_offset: int = 0,
+        count: int? = null,
+        offset: int = 0,
+        scale: float = 1.0
+    ) -> void {
+        self._check_live()
+        let wanted = count ?? data.len() - source_offset
+        __prim__.gpu_buffer_upload_u8(self.handle, data, source_offset, wanted, offset, scale)
+    }
+
     #: Read `count` values back, starting at `offset`.
     #:
     #: A null `count` reads to the end of the buffer.
@@ -278,6 +296,27 @@ pub class Kernel {
         __prim__.gpu_dispatch(self.handle, handles, scalars, threads, width)
     }
 
+    #: Queue a kernel without waiting for it to finish.
+    #:
+    #: Async dispatches execute in submission order. Call `synchronize` before
+    #: downloading, uploading to, or freeing any buffer used by queued work.
+    #: This is useful for a sequence of dependent kernels such as a neural
+    #: network training step: enqueue the whole step, then pay for one fence.
+    pub fn dispatch_async(
+        self,
+        buffers: list[Buffer],
+        threads: int,
+        scalars: list[int] = [],
+        group_size: int = 0
+    ) -> void {
+        self._check_live()
+        if threads <= 0 { throw ValueError(f"threads must be positive, got {threads}") }
+        if group_size < 0 { throw ValueError(f"group_size must be non-negative, got {group_size}") }
+        let handles = buffers.map(|buffer| buffer.handle_of())
+        let width = if group_size > 0 { group_size } else { self.max_group_size() }
+        __prim__.gpu_dispatch_async(self.handle, handles, scalars, threads, width)
+    }
+
     #: Release the compiled pipeline. Freeing twice is harmless.
     pub fn free(self) -> void {
         if self.freed { return }
@@ -293,6 +332,15 @@ pub class Kernel {
     }
 
     fn __str__(self) -> str { return f"Kernel({self.entry})" }
+}
+
+#: Wait until every asynchronously dispatched kernel has completed.
+#:
+#: Returns immediately when no work is queued. A failed command raises
+#: `RuntimeError`; after this returns, its output buffers are safe to read.
+pub fn synchronize() -> void {
+    _require_device("synchronize")
+    __prim__.gpu_synchronize()
 }
 
 # Caches compiled kernels; keyed by entry+source together since `map_kernel`

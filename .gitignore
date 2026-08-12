@@ -8,6 +8,7 @@
 
 # Benchmark and example output
 *.ppm
+/data/
 
 # Bytecode cache
 __jaicache__/

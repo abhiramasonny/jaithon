@@ -5,6 +5,7 @@
 
 #include "runtime.h"
 #include "handles.h"
+#include <math.h>
 
 #include "../native/native.h"
 #include "../vm/gc.h"
@@ -149,6 +150,43 @@ static bool nGpuBufferUpload(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* gpu_buffer_upload_u8(buffer, bytes, source_offset, count, dest_offset, scale) */
+static bool nGpuBufferUploadU8(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *b;
+    if (!requireBuffer(args[0], 1, "gpu_buffer_upload_u8", &b)) return false;
+    if (!IS_BYTES(args[1]))
+        return jaiThrow(vm.cTypeError,
+                        "gpu_buffer_upload_u8() argument 2 is %s, expected bytes",
+                        jaiTypeNameStatic(args[1]));
+
+    ObjBytes *bytes = AS_BYTES(args[1]);
+    int64_t sourceOffset, count, destOffset;
+    double scale;
+    if (!jaiArgInt(args[2], 3, "gpu_buffer_upload_u8", &sourceOffset)) return false;
+    if (!jaiArgInt(args[3], 4, "gpu_buffer_upload_u8", &count)) return false;
+    if (!jaiArgInt(args[4], 5, "gpu_buffer_upload_u8", &destOffset)) return false;
+    if (!jaiArgNumber(args[5], 6, "gpu_buffer_upload_u8", &scale)) return false;
+    if (!isfinite(scale))
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_upload_u8(): scale must be finite");
+
+    if (sourceOffset < 0 || count < 0 || sourceOffset > bytes->length ||
+        count > (int64_t)bytes->length - sourceOffset)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_upload_u8(): %lld bytes at %lld exceed source length %u",
+                        (long long)count, (long long)sourceOffset, bytes->length);
+    if (destOffset < 0 || destOffset > b->count || count > b->count - destOffset)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_upload_u8(): %lld values at %lld exceed buffer capacity %lld",
+                        (long long)count, (long long)destOffset, (long long)b->count);
+    if (count > 0)
+        jaiGpuUploadU8(b->buffer, bytes->data + sourceOffset, (size_t)count,
+                       (size_t)destOffset, (float)scale);
+    *out = NULL_VAL;
+    return true;
+}
+
 static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *b;
@@ -226,34 +264,33 @@ static bool nGpuMaxThreadsPerGroup(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gpu_dispatch(kernel, buffer_handles, scalars, threads, group_size) */
-static bool nGpuDispatch(int argc, Value *args, Value *out) {
-    (void)argc;
+/* gpu_dispatch[_async](kernel, buffer_handles, scalars, threads, group_size) */
+static bool dispatchKernel(Value *args, Value *out, bool async) {
+    const char *name = async ? "gpu_dispatch_async" : "gpu_dispatch";
     JaiGpuKernel *kernel;
-    if (!requireKernel(args[0], 1, "gpu_dispatch", &kernel)) return false;
+    if (!requireKernel(args[0], 1, name, &kernel)) return false;
 
     ObjList *handles, *scalarList;
     int64_t threads, groupSize;
-    if (!jaiArgList(args[1], 2, "gpu_dispatch", &handles)) return false;
-    if (!jaiArgList(args[2], 3, "gpu_dispatch", &scalarList)) return false;
-    if (!jaiArgInt(args[3], 4, "gpu_dispatch", &threads)) return false;
-    if (!jaiArgInt(args[4], 5, "gpu_dispatch", &groupSize)) return false;
+    if (!jaiArgList(args[1], 2, name, &handles)) return false;
+    if (!jaiArgList(args[2], 3, name, &scalarList)) return false;
+    if (!jaiArgInt(args[3], 4, name, &threads)) return false;
+    if (!jaiArgInt(args[4], 5, name, &groupSize)) return false;
 
     if (threads <= 0 || threads > INT32_MAX)
         return jaiThrow(vm.cValueError,
-                        "gpu_dispatch(): threads must be positive, got %lld",
+                        "%s(): threads must be positive, got %lld", name,
                         (long long)threads);
     if (groupSize < 0 || groupSize > INT32_MAX)
         return jaiThrow(vm.cValueError,
-                        "gpu_dispatch(): group_size must be non-negative, got %lld",
+                        "%s(): group_size must be non-negative, got %lld", name,
                         (long long)groupSize);
 
     JaiGpuBuffer **buffers = NULL;
     if (handles->count > 0) buffers = JAI_ALLOC(JaiGpuBuffer *, handles->count);
     for (int i = 0; i < handles->count; i++) {
         void *ptr;
-        if (!jaiHandleGet(handles->items[i], 2, HANDLE_GPU_BUFFER, "gpu_dispatch",
-                          &ptr)) {
+        if (!jaiHandleGet(handles->items[i], 2, HANDLE_GPU_BUFFER, name, &ptr)) {
             if (buffers != NULL)
                 JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
             return false;
@@ -267,28 +304,51 @@ static bool nGpuDispatch(int argc, Value *args, Value *out) {
         int64_t scalar;
         /* Each binds as a `constant uint&`, so anything that is not a
          * non-negative 32-bit value would arrive silently wrapped. */
-        if (!jaiArgInt(scalarList->items[i], 3, "gpu_dispatch", &scalar) ||
+        if (!jaiArgInt(scalarList->items[i], 3, name, &scalar) ||
             scalar < 0 || scalar > UINT32_MAX) {
             if (buffers != NULL)
                 JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
             JAI_FREE_ARRAY(uint32_t, scalars, scalarList->count);
             if (vm.hasException) return false;
             return jaiThrow(vm.cValueError,
-                            "gpu_dispatch(): scalar %d does not fit in a uint",
-                            i);
+                            "%s(): scalar %d does not fit in a uint", name, i);
         }
         scalars[i] = (uint32_t)scalar;
     }
 
-    bool ok = jaiGpuDispatch(kernel, buffers, handles->count, scalars,
-                             scalarList->count, (int)threads, (int)groupSize);
+    bool ok = async
+        ? jaiGpuDispatchAsync(kernel, buffers, handles->count, scalars,
+                              scalarList->count, (int)threads, (int)groupSize)
+        : jaiGpuDispatch(kernel, buffers, handles->count, scalars,
+                         scalarList->count, (int)threads, (int)groupSize);
     if (buffers != NULL) JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
     if (scalars != NULL) JAI_FREE_ARRAY(uint32_t, scalars, scalarList->count);
 
     if (!ok)
         return jaiThrow(vm.cRuntimeError,
-                        "gpu_dispatch(): the device did not complete the kernel");
+                        "%s(): the device did not accept or complete the kernel", name);
 
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuDispatch(int argc, Value *args, Value *out) {
+    (void)argc;
+    return dispatchKernel(args, out, false);
+}
+
+static bool nGpuDispatchAsync(int argc, Value *args, Value *out) {
+    (void)argc;
+    return dispatchKernel(args, out, true);
+}
+
+static bool nGpuSynchronize(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    if (!requireGpu("gpu_synchronize")) return false;
+    if (!jaiGpuSynchronize())
+        return jaiThrow(vm.cRuntimeError,
+                        "gpu_synchronize(): queued GPU work did not complete");
     *out = NULL_VAL;
     return true;
 }
@@ -425,12 +485,15 @@ void jaiRegisterGpuPrimitives(void) {
 
     jaiDefineNative("__prim__.gpu_buffer_new",      nGpuBufferNew,      1, 1);
     jaiDefineNative("__prim__.gpu_buffer_upload",   nGpuBufferUpload,   3, 3);
+    jaiDefineNative("__prim__.gpu_buffer_upload_u8", nGpuBufferUploadU8, 6, 6);
     jaiDefineNative("__prim__.gpu_buffer_download", nGpuBufferDownload, 3, 3);
     jaiDefineNative("__prim__.gpu_buffer_free",     nGpuBufferFree,     1, 1);
 
     jaiDefineNative("__prim__.gpu_compile",               nGpuCompile,            2, 2);
     jaiDefineNative("__prim__.gpu_max_threads_per_group", nGpuMaxThreadsPerGroup, 1, 1);
     jaiDefineNative("__prim__.gpu_dispatch",              nGpuDispatch,           5, 5);
+    jaiDefineNative("__prim__.gpu_dispatch_async",        nGpuDispatchAsync,      5, 5);
+    jaiDefineNative("__prim__.gpu_synchronize",           nGpuSynchronize,        0, 0);
     jaiDefineNative("__prim__.gpu_kernel_free",           nGpuKernelFree,         1, 1);
 
     jaiDefineNative("__prim__.gpu_vector_add", nGpuVectorAdd, 2, 2);

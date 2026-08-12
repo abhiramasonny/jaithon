@@ -1,10 +1,3 @@
-#: Charts, drawn entirely in Jaithon.
-#:
-#: `jaiplot` reduces a figure to a display list of primitives and hands that to
-#: a backend, so the same figure goes to SVG, to a PNG, or into a window with no
-#: second code path. This builds four panels covering the plot types and writes
-#: them both ways.
-#:
 #:     jaithon run examples/plot.jai            # writes plot.svg and plot.png
 #:     jaithon run examples/plot.jai -- --show     # opens a window you can pan
 #:     jaithon run examples/plot.jai -- --animate  # a live travelling wave
@@ -29,8 +22,6 @@ fn main(args: list[str]) -> int {
     }
 
     if args.contains("--show") {
-        # One panel at a time in a window: the interactive backend pans and
-        # zooms the first set of axes, and a grid has four.
         let single = Figure(width: 900, height: 600)
         _waves(single.axes())
         show(single, "jaiplot — drag to pan, wheel to zoom, r resets")
@@ -43,7 +34,6 @@ fn main(args: list[str]) -> int {
     return 0
 }
 
-#: Two trigonometric curves, one dashed, with the turning points marked.
 fn _waves(axes: any) -> void {
     let x = linspace(0.0, math.TAU, 240)
     axes.line(x, x.map(|v| math.sin(v)), label: "sin")
@@ -62,7 +52,6 @@ fn _waves(axes: any) -> void {
     axes.legend()
 }
 
-#: A sample binned into a histogram.
 fn _distribution(axes: any) -> void {
     let rng = Random.with_seed(20260805)
     var sample = []
@@ -73,7 +62,6 @@ fn _distribution(axes: any) -> void {
     axes.set_ylabel("count")
 }
 
-#: Three growth rates on a logarithmic x axis, where they separate.
 fn _growth(axes: any) -> void {
     let x = logspace(0.0, 4.0, 120)
     axes.line(x, x.map(|v| math.log10(v) + 1.0), label: "log n")
@@ -86,15 +74,12 @@ fn _growth(axes: any) -> void {
     axes.legend()
 }
 
-#: A mean with an uncertainty band, and a gap where the data is missing.
 fn _band(axes: any) -> void {
     let t = linspace(0.0, 12.0, 160)
     var centre = []
     var lower = []
     var upper = []
     for (index, value) in t.enumerate() {
-        # A run of NaN stands for a sensor that dropped out. Both the line and
-        # the band must break there rather than interpolate across it.
         if index >= 62 and index < 78 {
             centre.push(math.NAN)
             lower.push(math.NAN)
@@ -114,11 +99,6 @@ fn _band(axes: any) -> void {
     axes.legend()
 }
 
-#: A travelling wave, re-fed each frame.
-#:
-#: The limits are pinned first so the axis holds still while the data moves;
-#: without that it would re-range every frame and the wave would appear to stand
-#: still inside a breathing box.
 fn _animation() -> void {
     let x = linspace(0.0, math.TAU * 2.0, 220)
     let figure = Figure(width: 640, height: 420)
