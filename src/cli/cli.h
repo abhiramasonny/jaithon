@@ -2,7 +2,7 @@
 #ifndef JAI_CLI_H
 #define JAI_CLI_H
 
-#include "../runtime/runtime.h"
+#include "runtime/runtime.h"
 
 typedef enum {
     CMD_RUN,        /* default: jaithon file.jai  */

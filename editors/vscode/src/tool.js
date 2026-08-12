@@ -105,7 +105,7 @@ function run(args, options = {}) {
 // ---------------------------------------------------------------------------
 // Search path
 //
-// Mirrors src/runtime/module.c: the importing file's own directory first, then
+// Mirrors src/runtime/modules/module.c: the importing file's own directory first, then
 // JAITHON_PATH and -I, then the library directories derived from the binary's
 // location. Reproduced here so that go-to-definition follows an import to the
 // same file the compiler would have loaded.
@@ -176,7 +176,7 @@ function includeArgs(document, fileDir) {
 }
 
 /**
- * Resolve a dotted module path the way src/runtime/module.c does: `std.math`
+ * Resolve a dotted module path the way src/runtime/modules/module.c does: `std.math`
  * becomes `<dir>/std/math.jai`, falling back to the package form
  * `<dir>/std/math/mod.jai`. Leading dots count up from the importing file.
  */

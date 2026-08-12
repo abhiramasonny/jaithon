@@ -5,7 +5,7 @@
 #ifndef JAI_HANDLES_H
 #define JAI_HANDLES_H
 
-#include "../vm/value.h"
+#include "vm/value.h"
 
 typedef enum {
     HANDLE_FREE = 0,

@@ -528,7 +528,7 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
 
 #: Report `E0801` when the imports reachable from `path` close a cycle.
 #:
-#: `checkImportCycles` in `src/runtime/module.c`, over the signature loader's
+#: `checkImportCycles` in `src/runtime/modules/module.c`, over the signature loader's
 #: graph. Deliberately not part of `check_program`: a cycle is a property of a
 #: program, not a translation unit, and folding it in made the self-hosted
 #: compiler reject two files the C compiles.

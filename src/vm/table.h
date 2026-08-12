@@ -4,7 +4,7 @@
 #ifndef JAI_TABLE_H
 #define JAI_TABLE_H
 
-#include "value.h"
+#include "vm/value.h"
 
 typedef struct {
     Value    key;        /* NULL_VAL = empty slot; TOMBSTONE = deleted */

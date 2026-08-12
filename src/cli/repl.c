@@ -30,11 +30,11 @@
 #  include <readline/readline.h>
 #endif
 
-#include "cli.h"
+#include "cli/cli.h"
 
-#include "../runtime/frontend.h"
+#include "runtime/modules/frontend.h"
 
-#include "../vm/chunk.h"
+#include "vm/bytecode/chunk.h"
 
 #define REPL_PROMPT      ">>> "
 #define REPL_CONTINUE    "... "

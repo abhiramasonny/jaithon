@@ -4,7 +4,7 @@
 #ifndef JAI_METHODS_H
 #define JAI_METHODS_H
 
-#include "../vm/object.h"
+#include "vm/object/object.h"
 
 /* Each returns false when `name` is not a method of that type. */
 bool jaiStrMethod(Value receiver, ObjString *name, Value *out);

@@ -40,9 +40,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "cli_internal.h"
+#include "cli/cli_internal.h"
 
-#include "../native/native.h"
+#include "native/native.h"
 
 /* ------------------------------------------------------------------ */
 /* Diagnostics for command-line problems                                */

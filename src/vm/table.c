@@ -1,9 +1,9 @@
 /* table.c — the one hash table (see table.h) and the string intern table. */
 
-#include "table.h"
+#include "vm/table.h"
 
-#include "gc.h"
-#include "object.h"
+#include "vm/gc.h"
+#include "vm/object/object.h"
 
 /* Tombstone = VAL_OBJ{NULL}, distinct from NULL_VAL (never-used slot): a probe
  * must walk past a tombstone rather than stop, or a delete could hide keys

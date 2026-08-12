@@ -6,10 +6,10 @@
  * shared step: naming the module, choosing the C or self-hosted front end,
  * and handing back a rooted function or a rendered diagnostic.
  */
-#include "cli_internal.h"
+#include "cli/cli_internal.h"
 
-#include "../runtime/frontend.h"
-#include "../vm/serialize.h"
+#include "runtime/modules/frontend.h"
+#include "vm/bytecode/serialize.h"
 
 /* --front=jai, for the compile paths that are handed codegen options rather
  * than the whole invocation. */

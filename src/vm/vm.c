@@ -15,14 +15,14 @@
 #include <math.h>
 #include <signal.h>
 
-#include "vm.h"
-#include "jit.h"
+#include "vm/vm.h"
+#include "vm/jit/jit.h"
 
-#include "gc.h"
-#include "object.h"
-#include "table.h"
-#include "../common/diag.h"
-#include "../runtime/runtime.h"
+#include "vm/gc.h"
+#include "vm/object/object.h"
+#include "vm/table.h"
+#include "common/diag.h"
+#include "runtime/runtime.h"
 
 VM vm;
 

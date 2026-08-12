@@ -53,7 +53,7 @@ pub class Scan {
 
     #: `open` as a number, for a driver that cannot name a Jaithon enum.
     #:
-    #: Order must match `JaiReplOpenKind` in `src/runtime/frontend.h` -- change
+    #: Order must match `JaiReplOpenKind` in `src/runtime/modules/frontend.h` -- change
     #: both together.
     pub fn open_ordinal(self) -> int {
         return match self.open {

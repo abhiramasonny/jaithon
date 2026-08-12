@@ -7,10 +7,10 @@
  * for `-h`/`-v`/`help`/`version` before the rest of the CLI machinery (VM
  * init, module path, prelude) is even set up.
  */
-#include "cli_internal.h"
+#include "cli/cli_internal.h"
 
-#include "../native/native.h"
-#include "../vm/serialize.h"
+#include "native/native.h"
+#include "vm/bytecode/serialize.h"
 
 void jaiCliPrintUsage(FILE *out) {
     if (out == NULL) return;

@@ -13,7 +13,7 @@
  * by other files in this directory after jaiCliParse returns, so they are declared
  * extern in cli_internal.h.
  */
-#include "cli_internal.h"
+#include "cli/cli_internal.h"
 
 #include <stdlib.h>   /* strtol */
 

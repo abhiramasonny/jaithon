@@ -1,7 +1,7 @@
 #: Read and write the `.jaic` container of `spec/BYTECODE.md` §4-§7, and
 #: disassemble what comes out of it.
 #:
-#: This is the Jaithon half of `src/vm/serialize.c` and must agree with it byte
+#: This is the Jaithon half of `src/vm/bytecode/serialize.c` and must agree with it byte
 #: for byte, so the layout below is normative rather than convenient:
 #:
 #: - Every integer is little-endian; a function record's pool is the chunk's
@@ -30,7 +30,7 @@ pub let MAGIC: list[int] = [0x4A, 0x41, 0x49, 0x43]
 
 #: Container format version; a mismatch means recompile.
 #:
-#: Must equal `JAIC_VERSION` in `src/vm/serialize.h` — one number split across
+#: Must equal `JAIC_VERSION` in `src/vm/bytecode/serialize.h` — one number split across
 #: two languages.
 pub const VERSION: int = 11
 
@@ -43,7 +43,7 @@ pub const COMPILER_VERSION: int = 19
 #:
 #: Keyed on a hash of the C sources (`build/jai_build_id.h`) rather than
 #: written down here, since this compiler never reads C. An image missing it
-#: is rejected by `src/vm/serialize.c` with a header that otherwise validates
+#: is rejected by `src/vm/bytecode/serialize.c` with a header that otherwise validates
 #: in full.
 #:
 #: ```
@@ -59,7 +59,7 @@ pub const FLAG_DEBUG: int = 1
 pub const FLAG_RELEASE: int = 2
 
 #: Where the optimisation level lives in the container flags, matching
-#: `JAIC_FLAG_OPT_SHIFT`/`JAIC_FLAG_OPT_MASK` in `src/vm/serialize.h`.
+#: `JAIC_FLAG_OPT_SHIFT`/`JAIC_FLAG_OPT_MASK` in `src/vm/bytecode/serialize.h`.
 #:
 #: Must match what `cacheFlagsFor` expects exactly: an image missing these
 #: bits silently fails the cache check and falls back to the seed, so a
@@ -955,7 +955,7 @@ fn _pool_string(constants: list[Const], index: int) -> str? {
 
 # Cache slots are never stored — sizes come from scanning the code, which
 # doubles as a decodability check. The per-opcode cache-operand offset must
-# track `jaiOpCacheOperand` in src/vm/chunk.c, or a loaded chunk silently gets
+# track `jaiOpCacheOperand` in src/vm/bytecode/chunk.c, or a loaded chunk silently gets
 # too few cache lines and every site degrades to the slow path.
 fn _cache_slots(code: list[int], constants: list[Const]) -> int {
     var highest = -1

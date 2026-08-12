@@ -2,10 +2,10 @@
 #ifndef JAI_VM_H
 #define JAI_VM_H
 
-#include "../common/diag.h"
-#include "object.h"
-#include "chunk.h"
-#include "table.h"
+#include "common/diag.h"
+#include "vm/object/object.h"
+#include "vm/bytecode/chunk.h"
+#include "vm/table.h"
 
 /* ------------------------------------------------------------------ */
 /* Call frames. Inline caches live in the Chunk (chunk.h) so they survive */

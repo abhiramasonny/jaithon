@@ -2,7 +2,7 @@
 #ifndef JAI_GC_H
 #define JAI_GC_H
 
-#include "value.h"
+#include "vm/value.h"
 
 typedef struct { const Value *values; int count; } JaiGCRootRange;
 

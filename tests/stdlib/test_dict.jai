@@ -109,7 +109,7 @@ fn test_with_default_never_raises() -> void {
     assert_eq(counts.get("absent"), 0)
 }
 
-#: A run-time string longer than `JAI_INTERN_MAX` (32 bytes, src/vm/object.c)
+#: A run-time string longer than `JAI_INTERN_MAX` (32 bytes, src/vm/object/object.c)
 #: is not interned and `jaiStringSeal` leaves its hash unset, because a string
 #: that never becomes a key should not pay to be hashed. Zero means "not
 #: computed yet", and `jaiValueHashFast` read the field raw instead of going

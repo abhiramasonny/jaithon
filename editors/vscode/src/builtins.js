@@ -3,7 +3,7 @@
 // Builtin functions, methods on primitive receivers and the exception
 // hierarchy are all registered in C, so no `.jai` file declares them and the
 // analyser cannot find them by parsing. The tables here mirror
-// src/runtime/builtins.c, builtins_core.c and errors.c. Hover and completion
+// src/runtime/builtins/builtins.c, builtins_core.c and errors.c. Hover and completion
 // use them; nothing depends on them being exhaustive, and a name that has
 // drifted simply stops being offered.
 
@@ -21,7 +21,7 @@ const PRIMITIVE_TYPES = [
     'list', 'dict', 'set', 'tuple', 'range',
 ];
 
-/** name -> signature, from jaiDefineNative in src/runtime/builtins_core.c. */
+/** name -> signature, from jaiDefineNative in src/runtime/builtins/builtins_core.c. */
 const FUNCTIONS = {
     print: { signature: 'print(...values) -> void', doc: 'Write each value to standard output, separated by spaces, then a newline.' },
     input: { signature: 'input(prompt: str = "") -> str', doc: 'Read one line from standard input.' },
