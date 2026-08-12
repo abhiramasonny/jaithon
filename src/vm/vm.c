@@ -2919,7 +2919,9 @@ static bool classDeclareField(ObjClass *klass, ObjString *name, uint8_t info) {
     field->visibility = (Visibility)(info & 0x3);
     field->isStatic = (info & 0x4) != 0;
     field->isLet = (info & 0x8) != 0;
-    field->typeId = 0;
+    /* Bits 4-7 are the declared kind (spec §3.7). Zero -- which is every image
+     * written before this encoding existed -- is FIELD_KIND_ANY. */
+    field->typeId = (uint32_t)((info >> 4) & 0xF);
     klass->fieldCount = (uint16_t)(oldCount + 1);
 
     /* A static field lives on the class, not in an instance window, so it needs

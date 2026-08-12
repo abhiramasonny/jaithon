@@ -452,6 +452,28 @@ ObjBound *jaiBoundNew(Value receiver, Value method);
 
 typedef enum { VIS_PRIVATE = 0, VIS_PROTECTED = 1, VIS_PUBLIC = 2 } Visibility;
 
+/* A field's declared kind, carried in bits 4-7 of OP_FIELD_DEF's info byte.
+ *
+ * A HINT, not a guarantee. A value can still reach a field through an `any`
+ * receiver, which is exactly why the guard in OP_SET_FIELD exists -- and a
+ * generic parameter, a nullable, or any shape this encoding cannot name is
+ * FIELD_KIND_ANY, which accepts everything. ANY is zero so that every image
+ * written before this encoding existed, whose bits 4-7 are zero, decodes to
+ * "no claim" rather than to a wrong claim. */
+typedef enum {
+    FIELD_KIND_ANY      = 0,
+    FIELD_KIND_INT      = 1,
+    FIELD_KIND_FLOAT    = 2,
+    FIELD_KIND_BOOL     = 3,
+    FIELD_KIND_STR      = 4,
+    FIELD_KIND_LIST     = 5,
+    FIELD_KIND_DICT     = 6,
+    FIELD_KIND_INSTANCE = 7,
+} FieldKind;
+
+/* "any", "int", … -- for diagnostics and for the disassembler. */
+const char *jaiFieldKindName(uint32_t kind);
+
 typedef struct {
     ObjString *name;
     uint16_t   slot;        /* index into ObjInstance.fields */

@@ -799,8 +799,12 @@ int jaiDisassembleInstruction(FILE *out, const Chunk *chunk, int offset) {
              * "visibility 10" for a public `let`. */
             static const char *const kVis[4] = { "private", "protected",
                                                  "public", "?" };
-            snprintf(suffix, sizeof suffix, "  %s%s%s", kVis[b & 0x3],
-                     (b & 0x4) ? " static" : "", (b & 0x8) ? " let" : "");
+            /* Bits 4-7 are the declared kind, and printing it is the only way
+             * to see it: nothing else surfaces those bits, and there is no
+             * second front end to disagree with. */
+            snprintf(suffix, sizeof suffix, "  %s%s%s %s", kVis[b & 0x3],
+                     (b & 0x4) ? " static" : "", (b & 0x8) ? " let" : "",
+                     jaiFieldKindName((uint32_t)((b >> 4) & 0xF)));
         } else {
             snprintf(suffix, sizeof suffix, "  %u arg%s", b, b == 1 ? "" : "s");
         }
