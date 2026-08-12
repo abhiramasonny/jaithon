@@ -60,6 +60,7 @@ jaithon/compile/opt/peephole.jai
 jaithon/compile/parser.jai
 jaithon/compile/repl.jai
 jaithon/compile/resolve.jai
+jaithon/compile/symbol.jai
 jaithon/compile/token.jai
 std/json.jai
 std/math.jai

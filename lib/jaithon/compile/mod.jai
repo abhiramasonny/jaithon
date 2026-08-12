@@ -24,7 +24,8 @@ from jaithon.compile.diag import Diagnostic, DiagnosticBag, Severity
 from jaithon.compile.lexer import Lexer
 from jaithon.compile.opt import optimize
 from jaithon.compile.parser import Parser, parse
-from jaithon.compile.resolve import Resolution, SemaCode, resolve
+from jaithon.compile.resolve import resolve
+from jaithon.compile.symbol import Resolution, SemaCode
 
 #: Everything one compilation produced.
 pub class Compiled {

@@ -52,7 +52,7 @@ from jaithon.compile.check.suggest import suggest_member
 from jaithon.compile.check.ty import FieldInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import dict_of, fn_of, generic_param, list_of
-from jaithon.compile.resolve import Symbol
+from jaithon.compile.symbol import Symbol
 
 #: A store into something declared `let`.
 #:

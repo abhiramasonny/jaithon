@@ -41,7 +41,7 @@ from jaithon.compile.check.stmt import match_expr, pattern, push_generics, stmt
 from jaithon.compile.check.ty import FieldInfo, MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of
 from jaithon.compile.check.universe import Universe, fn_of, list_of, named, tuple_of
-from jaithon.compile.resolve import Symbol, SymbolKind
+from jaithon.compile.symbol import Symbol, SymbolKind
 
 # ------------------------------------------------------------------
 # Fixtures

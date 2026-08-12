@@ -14,7 +14,7 @@ from jaithon.compile.check.substitute import substitute
 from jaithon.compile.check.ty import FieldInfo, MemberInfo, Type, TypeDecl
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, generic_param
 from jaithon.compile.check.universe import list_of, named
-from jaithon.compile.resolve import Symbol
+from jaithon.compile.symbol import Symbol
 
 #: The initialiser of a `const` is not a constant expression.
 pub const E0303_NON_CONSTANT_CONST: str = "E0303"

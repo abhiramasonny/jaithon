@@ -33,7 +33,7 @@ from jaithon.compile.check.render import render
 from jaithon.compile.check.ty import FieldInfo, MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, list_of, named
-from jaithon.compile.resolve import Symbol, SymbolKind
+from jaithon.compile.symbol import Symbol, SymbolKind
 
 # ------------------------------------------------------------------
 # Fixtures

@@ -40,7 +40,7 @@ from jaithon.compile.check.ty import Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, instantiate, list_of
 from jaithon.compile.check.universe import set_of, tuple_of
-from jaithon.compile.resolve import Symbol, SymbolKind
+from jaithon.compile.symbol import Symbol, SymbolKind
 
 # ------------------------------------------------------------------
 # Fixtures
