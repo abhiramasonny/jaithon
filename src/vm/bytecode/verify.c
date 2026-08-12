@@ -24,6 +24,10 @@ int jaiOpBranchOperandAt(uint8_t op) {
     case OP_LOOP:
     case OP_FOR_ITER:
     case OP_FOR_ITER_BIND:
+    /* Branches past the ordinary `INVOKE items; GET_ITER` when its receiver
+     * turns out to be a dict. Missing from this list when the opcode landed,
+     * which left the verifier unable to see the edge at all. */
+    case OP_GET_ITER_ITEMS:
     case OP_PUSH_FINALLY:
     case OP_PUSH_HANDLER:
         return 0;

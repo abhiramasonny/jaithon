@@ -5,7 +5,7 @@
  * including itself. The images are deflated one per module and
  * inflated on first use, so a program pays for what it imports.
  *
- * 42 modules, 797523 bytes of images, 411874 bytes packed.
+ * 42 modules, 797558 bytes of images, 411920 bytes packed.
  * Regenerate with `make reseed`.
  */
 
@@ -53,21 +53,21 @@ static const SeedSource kSources[] = {
     {"jaithon/compile/jaic.jai", 225309, 18297, 33328},
     {"jaithon/compile/lexer.jai", 243606, 18757, 37030},
     {"jaithon/compile/mod.jai", 262363, 5815, 9434},
-    {"jaithon/compile/opt/chunk.jai", 268178, 10902, 19465},
-    {"jaithon/compile/opt/coalesce.jai", 279080, 3162, 5093},
-    {"jaithon/compile/opt/dead.jai", 282242, 403, 513},
-    {"jaithon/compile/opt/fuse.jai", 282645, 5068, 10669},
-    {"jaithon/compile/opt/hoist.jai", 287713, 4692, 7592},
-    {"jaithon/compile/opt/mod.jai", 292405, 1397, 2102},
-    {"jaithon/compile/opt/peephole.jai", 293802, 4806, 8630},
-    {"jaithon/compile/parser.jai", 298608, 41360, 88942},
-    {"jaithon/compile/repl.jai", 339968, 3859, 6486},
-    {"jaithon/compile/resolve.jai", 343827, 21224, 40150},
-    {"jaithon/compile/symbol.jai", 365051, 3716, 6437},
-    {"jaithon/compile/token.jai", 368767, 7232, 16011},
-    {"std/json.jai", 375999, 13843, 25694},
-    {"std/math.jai", 389842, 9499, 19967},
-    {"std/str.jai", 399341, 12533, 23224},
+    {"jaithon/compile/opt/chunk.jai", 268178, 10948, 19500},
+    {"jaithon/compile/opt/coalesce.jai", 279126, 3162, 5093},
+    {"jaithon/compile/opt/dead.jai", 282288, 403, 513},
+    {"jaithon/compile/opt/fuse.jai", 282691, 5068, 10669},
+    {"jaithon/compile/opt/hoist.jai", 287759, 4692, 7592},
+    {"jaithon/compile/opt/mod.jai", 292451, 1397, 2102},
+    {"jaithon/compile/opt/peephole.jai", 293848, 4806, 8630},
+    {"jaithon/compile/parser.jai", 298654, 41360, 88942},
+    {"jaithon/compile/repl.jai", 340014, 3859, 6486},
+    {"jaithon/compile/resolve.jai", 343873, 21224, 40150},
+    {"jaithon/compile/symbol.jai", 365097, 3716, 6437},
+    {"jaithon/compile/token.jai", 368813, 7232, 16011},
+    {"std/json.jai", 376045, 13843, 25694},
+    {"std/math.jai", 389888, 9499, 19967},
+    {"std/str.jai", 399387, 12533, 23224},
 };
 
 #define JAI_SEED_N (sizeof kSources / sizeof kSources[0])

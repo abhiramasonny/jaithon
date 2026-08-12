@@ -35,7 +35,7 @@ cda5642fabc8d64f3b7c2d71131dd72eff14200d9cc6cafaef0179d1877aa047  9869  lib/jait
 ecb76240458b23b2b03eab8b2f5d746e4d75ad158b01c88e145f70b374c0cc34  3900  lib/jaithon/compile/jaic.jai
 0a2e311342d9f6badd20d479f1d2272690614f914041fb3b515f9b037f6ab00d  4455  lib/jaithon/compile/lexer.jai
 3e9bff3816d223a336452adf50df3da314058255d6f2e459ea0e0c89b8a2dfab  912  lib/jaithon/compile/mod.jai
-d82b8f1f7b48a1c6647c68c2ef9ae9ac361277f2cf0b0317a884e087f8090408  2196  lib/jaithon/compile/opt/chunk.jai
+408aebf472fb1cc101bfa81ce32242467ac81726b73c15627895b05c7ffec1f7  2198  lib/jaithon/compile/opt/chunk.jai
 1dfd41f9686efa97e7f7031b29fd363396cd895b8f34e7fa0af327596ac46870  619  lib/jaithon/compile/opt/coalesce.jai
 46453ccb2aebf661f4d93d59d35470d0293c4243d384c51f6b4437d73c8a9d36  43  lib/jaithon/compile/opt/dead.jai
 1c10968717390c3b9d17d9a1ffc9dbd1b68cff5e56c2bb46544368cc601f6179  1368  lib/jaithon/compile/opt/fuse.jai
@@ -151,4 +151,4 @@ ac063f67c22f9c22433c41969dd0e0849a2d6a8a36e5ae8d767c09734d0c2fed  86  tests/gold
 56829e59e3c10aab3e3034c1c03e11d464280807ce20346c7258b272302fcc86  116  tests/golden/shadowing.jai
 4dc922fb8cad60f5bd87b793c32d733a81995ad660ee59e0286873c8a59e30d3  227  tests/golden/type_tests.jai
 250323de8077b4a7d67436953eb2f030bb2ed62e2c31537d433dddfed9972dd5  485  tests/golden/values_and_dispatch.jai
-# 153 files, 190680 instructions probed
+# 153 files, 190682 instructions probed
