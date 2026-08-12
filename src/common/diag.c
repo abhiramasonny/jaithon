@@ -3,6 +3,7 @@
 #include "common/diag.h"
 #include <stdlib.h>
 #include <unistd.h>
+#include <math.h>
 
 static void freeStr(char *s) {
     if (s != NULL) (void)jaiRealloc(s, strlen(s) + 1, 0);
