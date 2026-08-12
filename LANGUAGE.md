@@ -34,6 +34,30 @@ let pi: float = 3.14159
 var total: int = 0
 ```
 
+There is one gap, and it is worth knowing exactly where it is. A value routed
+through `any` escapes the checker, because with an `any` receiver the checker
+does not know the class and so cannot know what a field was declared as. **Field
+writes are checked at run time**, so this raises `TypeError`:
+
+```jai
+class Point { pub var x: float
+              fn init(self, x: float) { self.x = x } }
+
+fn poison(p: any) { p.x = "not a float" }
+poison(Point(1.5))          # TypeError: cannot assign str to field 'x' declared float
+```
+
+**Container elements are not**, so this is currently accepted:
+
+```jai
+let xs: list[int] = []
+fn poison2(l: any) { l.push("str") }
+poison2(xs)                 # xs is now ["str"]
+```
+
+Treat a container's element type as checked at the boundaries the checker can
+see, and not through `any`.
+
 ## Types
 
 `int`, `float`, `bool`, `str`, `bytes`, and `null`. Containers are `list`,
