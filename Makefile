@@ -373,7 +373,8 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/jit_arena $(BUILD)/jit_arm64
+	@$(BUILD)/crc32_equiv
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
@@ -407,6 +408,17 @@ $(BUILD)/verify_chunk: $(VERIFY_OBJS) tests/vm/verify_chunk.c | $(CC_STAMP)
 # The verifier on its own, with its own report, for working on it.
 verify-test: $(BUILD)/verify_chunk
 	@$(BUILD)/verify_chunk
+
+# The two CRC32 implementations must be one function. Every .jaic carries a CRC
+# written by the table path, so a divergence rejects every cached image in the
+# tree -- correct output, 100x the load time, and no error anywhere.
+$(BUILD)/crc32_equiv: $(VERIFY_OBJS) tests/vm/crc32_equiv.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/crc32_equiv.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/crc32_equiv.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+crc-test: $(BUILD)/crc32_equiv
+	@$(BUILD)/crc32_equiv
 
 # The code arena executes what it was written. C rather than .jai because
 # nothing in the language reaches it yet, and because the failure it guards --
