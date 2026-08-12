@@ -3067,10 +3067,24 @@ uint64_t jaiPropRecv[32];
  * compare and falls through to the shared branch, so the only hints worth
  * taking are the lopsided ones: a 50/50 hint replaces a predictable indirect
  * branch with an unpredictable direct one. */
-#  define VM_NEXT_HINT(nextOp)                                                 \
-      do { DISPATCH_TRACE(); instStart = ip;                                   \
-           if (JAI_LIKELY(*ip == (nextOp))) { ip++; goto L_##nextOp; }         \
-           goto *jaiDispatchTable[*ip++]; } while (0)
+#  ifdef JAI_OPCODE_STATS
+/* Counted on both arms, and before the compare, so a hinted dispatch is not
+ * invisible to the census. It used to be: the five hint sites cover OP_LOOP,
+ * OP_INC_LOCAL and OP_BIND, and loop_sum's OP_LOOP -- 14.28% of that run --
+ * reported as zero. sum(jaiOpCounts) == vm.instructionCount is the invariant
+ * that says no dispatch path is missing, and scripts/opstats_check.sh is what
+ * asserts it. */
+#    define VM_NEXT_HINT(nextOp)                                               \
+        do { DISPATCH_TRACE(); instStart = ip;                                 \
+             jaiOpCounts[*ip]++;                                               \
+             if (JAI_LIKELY(*ip == (nextOp))) { ip++; goto L_##nextOp; }       \
+             goto *jaiDispatchTable[*ip++]; } while (0)
+#  else
+#    define VM_NEXT_HINT(nextOp)                                               \
+        do { DISPATCH_TRACE(); instStart = ip;                                 \
+             if (JAI_LIKELY(*ip == (nextOp))) { ip++; goto L_##nextOp; }       \
+             goto *jaiDispatchTable[*ip++]; } while (0)
+#  endif
 /* The trailing `;` lets the case labels that follow live in a plain block;
  * labels have function scope, so the nesting costs nothing. */
 #  define VM_DISPATCH()  VM_NEXT();
@@ -6056,8 +6070,11 @@ void jaiVMPrintStats(FILE *out) {
     {
         uint64_t tot = 0;
         for (int i = 0; i < OP_COUNT; i++) tot += jaiOpCounts[i];
+        /* Every non-zero opcode, not a top slice: a filtered histogram cannot
+         * be summed, and summing it against vm.instructionCount is the only
+         * check that no dispatch path skips the census. */
         for (int i = 0; i < OP_COUNT; i++)
-            if (jaiOpCounts[i] > tot / 200)
+            if (jaiOpCounts[i] > 0)
                 fprintf(out, "op %3d %-24s %10" PRIu64 "  %5.2f%%\n", i,
                         jaiOpName((OpCode)i), jaiOpCounts[i],
                         100.0 * (double)jaiOpCounts[i] / (double)tot);

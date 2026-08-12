@@ -386,6 +386,15 @@ test: package-check opcode-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_ar
 opcode-check:
 	@uv run python scripts/opcode_table_check.py
 
+# sum(jaiOpCounts) == vm.instructionCount, which is the only evidence that no
+# dispatch path skips the census. VM_NEXT_HINT skipped it and loop_sum's
+# OP_LOOP -- 14.28% of that run -- reported as zero, so every histogram taken
+# before this gate existed was wrong. Out of `test` on purpose: it needs a
+# second full build with -DJAI_OPCODE_STATS.
+.PHONY: opstats-check
+opstats-check:
+	@./scripts/opstats_check.sh
+
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
 VERIFY_OBJS := $(filter-out $(BUILD)/src/cli/main.o,$(OBJS))
