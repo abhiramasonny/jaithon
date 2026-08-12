@@ -133,6 +133,19 @@ if [[ -x "$ROOT/tests/vm/field_kind_disasm.sh" ]]; then
     done <<< "$kind_output"
 fi
 
+# The .jaid sidecar: release strips the line tables into it, and a missing or
+# corrupt one must cost spans and nothing else.
+if [[ -x "$ROOT/tests/vm/sidecar.sh" ]]; then
+    sidecar_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/sidecar.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="sidecar: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "sidecar: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$sidecar_output"
+fi
+
 if [[ -x "$ROOT/tests/vm/cache_corrupt.sh" ]]; then
     corrupt_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/cache_corrupt.sh" 2>&1)"
     while IFS= read -r line; do

@@ -51,9 +51,17 @@ typedef enum {
 } JaicFlags;
 
 /* Serialise a compiled module. Returns a heap buffer (jaiRealloc) or NULL. */
+/* The image, and optionally its debug sidecar.
+ *
+ * When `flags` lacks JAIC_FLAG_DEBUG and `outSidecar` is non-NULL, the line
+ * tables are stripped from the image and returned separately as .jaid content
+ * -- 37% of what a .jaic weighs once LTV1 has shrunk it, and of no use to a
+ * release build until something throws. Both buffers are the caller's to free.
+ * `outSidecar` is left NULL when nothing was stripped. */
 uint8_t *jaiSerializeModule(ObjModule *module, ObjFunction *body,
                             uint64_t sourceHash, uint32_t flags,
-                            size_t *outSize);
+                            size_t *outSize, uint8_t **outSidecar,
+                            size_t *outSidecarSize);
 
 /* Deserialise into `module`. Returns the module body function, or NULL if the
  * data is invalid, stale, or corrupt. Never partially mutates `module` on
@@ -79,6 +87,14 @@ bool  jaiCacheStore(const char *sourcePath, ObjModule *module,
  * module, more than reading the entire 116 KB image (16.92 us). */
 uint8_t *jaiCacheRead(const char *sourcePath, size_t *outLength);
 void     jaiCacheReadFree(uint8_t *data, size_t length);
+
+/* Deserialise an already-read cache image, attaching the .jaid beside it when
+ * the image was written stripped. Callers that read the file themselves must
+ * use this rather than jaiDeserializeModule, or a release image silently loads
+ * with no source spans at all. */
+ObjFunction *jaiDeserializeCached(const uint8_t *data, size_t size,
+                                  ObjModule *module, uint64_t sourceHash,
+                                  const char *sourcePath);
 
 ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
                           uint64_t sourceHash);

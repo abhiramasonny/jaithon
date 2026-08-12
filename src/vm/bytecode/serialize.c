@@ -93,6 +93,17 @@ typedef enum {
 #define JAIC_SUFFIX      ".jaic"
 #define JAIC_SOURCE_EXT  ".jai"
 
+/* The debug sidecar: the line tables a stripped .jaic left out, beside it under
+ * the same stem. Its own magic and checksum, and its srcHash must equal the
+ * image's -- a .jaid that does not match is ignored rather than lined up
+ * against the wrong records. Missing entirely is not an error: a release
+ * install can simply not ship them, and tracebacks fall back to function name
+ * plus code offset. */
+#define JAID_MAGIC       "JAID"
+#define JAID_VERSION     1u
+#define JAID_SUFFIX      ".jaid"
+#define JAID_HEADER      16u   /* magic 4, version 2, reserved 2, srcHash 8 */
+
 /* A function record has no name when its nameIndex is this sentinel; §5 has no
  * other way to say "unnamed", and index 0 is a perfectly good constant. */
 #define JAIC_NO_NAME     UINT32_MAX
@@ -118,7 +129,7 @@ typedef enum {
 /* Reading: bounds-checked cursor                                       */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
+typedef struct Cursor_ {
     const uint8_t *data;
     size_t         size;
     size_t         pos;
@@ -135,6 +146,11 @@ typedef struct {
      * which frees the array (not the strings, which the intern table owns). */
     Value         *strings;
     uint32_t       stringCount;
+    /* The .jaid's line-table stream, when the image was written stripped. Read
+     * in lockstep with the records, because both were produced by the same
+     * traversal in the same order. NULL means the spans are inline (a debug
+     * image) or simply absent (a release install without its sidecar). */
+    struct Cursor_ *sidecar;
 } Cursor;
 
 static size_t curLeft(const Cursor *c) {
@@ -398,15 +414,21 @@ static void writeStrTab(JaiBuf *b, const StrTab *st) {
     }
 }
 
-static bool writeFunction(JaiBuf *b, StrTab *st, const ObjFunction *fn,
-                          int depth);
-static bool writeConstant(JaiBuf *b, PoolWriter *w, StrTab *st, Value v,
-                          int depth);
+/* When `sidecar` is non-NULL the line table is STRIPPED from the image and
+ * written there instead: the .jaic gets a zero byte-length and the stream goes
+ * to the .jaid beside it. The two stay in step because both are produced by
+ * this same traversal, in this same order, one record per function -- including
+ * functions with no line entries at all, which write a zero length rather than
+ * nothing. */
+static bool writeFunction(JaiBuf *b, JaiBuf *sidecar, StrTab *st,
+                          const ObjFunction *fn, int depth);
+static bool writeConstant(JaiBuf *b, JaiBuf *sidecar, PoolWriter *w, StrTab *st,
+                          Value v, int depth);
 
 /* §4. Refusing a value the format cannot express is always allowed: the
  * caller's fallback is to skip the cache and recompile. */
-static bool writeConstant(JaiBuf *b, PoolWriter *w, StrTab *st, Value v,
-                          int depth) {
+static bool writeConstant(JaiBuf *b, JaiBuf *sidecar, PoolWriter *w, StrTab *st,
+                          Value v, int depth) {
     if (depth > JAIC_MAX_DEPTH) return false;
 
     switch (jaiValueType(v)) {
@@ -451,13 +473,15 @@ static bool writeConstant(JaiBuf *b, PoolWriter *w, StrTab *st, Value v,
     }
     case OBJ_FUNCTION:
         jaiBufPush(b, K_FUNC);
-        return writeFunction(b, st, (const ObjFunction *)o, depth + 1);
+        return writeFunction(b, sidecar, st, (const ObjFunction *)o, depth + 1);
     case OBJ_TUPLE: {
         const ObjTuple *t = (const ObjTuple *)o;
         jaiBufPush(b, K_TUPLE);
         jaiBufWriteU32(b, t->count);
         for (uint32_t i = 0; i < t->count; i++) {
-            if (!writeConstant(b, w, st, t->items[i], depth + 1)) return false;
+            if (!writeConstant(b, sidecar, w, st, t->items[i], depth + 1)) {
+                return false;
+            }
         }
         return true;
     }
@@ -483,8 +507,8 @@ static bool initFlagIsRecoverable(const ObjFunction *fn) {
 }
 
 /* §5. */
-static bool writeFunction(JaiBuf *b, StrTab *st, const ObjFunction *fn,
-                          int depth) {
+static bool writeFunction(JaiBuf *b, JaiBuf *sidecar, StrTab *st,
+                          const ObjFunction *fn, int depth) {
     if (fn == NULL || depth > JAIC_MAX_DEPTH) return false;
     if (fn->flags & ~JAIC_KNOWN_FN_FLAGS) return false;
     if (!initFlagIsRecoverable(fn)) return false;
@@ -525,7 +549,8 @@ static bool writeFunction(JaiBuf *b, StrTab *st, const ObjFunction *fn,
     }
 
     for (uint32_t i = 0; ok && i < poolTotal(&w); i++) {
-        ok = writeConstant(&constants, &w, st, poolAt(&w, i), depth + 1);
+        ok = writeConstant(&constants, sidecar, &w, st, poolAt(&w, i),
+                           depth + 1);
     }
 
     uint32_t constCount = poolTotal(&w);
@@ -548,8 +573,19 @@ static bool writeFunction(JaiBuf *b, StrTab *st, const ObjFunction *fn,
          * not understand the section skip it -- that property is why changing
          * what is inside it is a contained change. The bytes are now the LTV1
          * stream the chunk already holds, so writing the table is a memcpy. */
-        jaiBufWriteU32(b, (uint32_t)fn->chunk.lineStreamLen);
-        jaiBufAppend(b, fn->chunk.lineStream, (size_t)fn->chunk.lineStreamLen);
+        if (sidecar != NULL) {
+            /* Stripped: the image says "no spans", and the stream goes to the
+             * sidecar. A release binary that ships without its .jaid loses
+             * source spans in tracebacks and nothing else. */
+            jaiBufWriteU32(b, 0);
+            jaiBufWriteU32(sidecar, (uint32_t)fn->chunk.lineStreamLen);
+            jaiBufAppend(sidecar, fn->chunk.lineStream,
+                         (size_t)fn->chunk.lineStreamLen);
+        } else {
+            jaiBufWriteU32(b, (uint32_t)fn->chunk.lineStreamLen);
+            jaiBufAppend(b, fn->chunk.lineStream,
+                         (size_t)fn->chunk.lineStreamLen);
+        }
 
         jaiBufWriteU16(b, fn->exceptionCount);
         for (uint16_t i = 0; i < fn->exceptionCount; i++) {
@@ -622,9 +658,21 @@ static bool writeModulePool(JaiBuf *b, StrTab *st, ObjModule *module,
 
 uint8_t *jaiSerializeModule(ObjModule *module, ObjFunction *body,
                             uint64_t sourceHash, uint32_t flags,
-                            size_t *outSize) {
+                            size_t *outSize, uint8_t **outSidecar,
+                            size_t *outSidecarSize) {
     if (outSize != NULL) *outSize = 0;
+    if (outSidecar != NULL) *outSidecar = NULL;
+    if (outSidecarSize != NULL) *outSidecarSize = 0;
     if (body == NULL || flags > 0xFFFFu) return NULL;
+
+    /* The line table is 37% of what a .jaic still weighs after LTV1, and a
+     * release build has no use for it until something throws. Absent
+     * JAIC_FLAG_DEBUG it goes to a .jaid beside the image, which a release
+     * install can simply not ship. */
+    bool strip = (flags & JAIC_FLAG_DEBUG) == 0 && outSidecar != NULL;
+    JaiBuf sidecarBuf;
+    jaiBufInit(&sidecarBuf);
+    JaiBuf *sidecar = strip ? &sidecarBuf : NULL;
 
     JaiBuf b;
     jaiBufInit(&b);
@@ -656,7 +704,7 @@ uint8_t *jaiSerializeModule(ObjModule *module, ObjFunction *body,
 
     uint32_t exportCount = 0;
     bool ok = writeModulePool(&body_buf, &st, module, &exportCount);
-    if (ok) ok = writeFunction(&body_buf, &st, body, 0);
+    if (ok) ok = writeFunction(&body_buf, sidecar, &st, body, 0);
 
     if (ok) {
         jaiBufWriteU32(&body_buf, exportCount);
@@ -679,8 +727,26 @@ uint8_t *jaiSerializeModule(ObjModule *module, ObjFunction *body,
 
     if (!ok) {
         jaiBufFree(&b);
+        jaiBufFree(&sidecarBuf);
         return NULL;
     }
+
+    if (strip && sidecarBuf.count > 0) {
+        /* Its own magic and checksum: a .jaid that does not match its .jaic is
+         * ignored, never trusted to line up with the wrong image. srcHash is
+         * what ties them together. */
+        JaiBuf sc;
+        jaiBufInit(&sc);
+        jaiBufAppend(&sc, JAID_MAGIC, 4);
+        jaiBufWriteU16(&sc, JAID_VERSION);
+        jaiBufWriteU16(&sc, 0);
+        jaiBufWriteU64(&sc, sourceHash);
+        jaiBufAppend(&sc, sidecarBuf.data, sidecarBuf.count);
+        jaiBufWriteU32(&sc, jaiCrc32(sc.data, sc.count));
+        if (outSidecar != NULL) *outSidecar = sc.data;
+        if (outSidecarSize != NULL) *outSidecarSize = sc.count;
+    }
+    jaiBufFree(&sidecarBuf);
 
     jaiBufWriteU32(&b, jaiCrc32(b.data, b.count));
 
@@ -943,12 +1009,26 @@ static ObjFunction *readFunction(Cursor *c, ObjModule *module, int depth) {
         if (c->bad || lineBytes > curLeft(c) || lineBytes > (uint32_t)INT_MAX) {
             goto fail;
         }
+        /* A stripped image says zero here and the bytes live in the .jaid. The
+         * sidecar is advanced for EVERY record, including ones with no entries,
+         * so the two stay aligned. */
+        Cursor *lineSrc = c;
+        if (lineBytes == 0 && c->sidecar != NULL) {
+            uint32_t sidecarBytes = curU32(c->sidecar);
+            if (c->sidecar->bad || sidecarBytes > curLeft(c->sidecar)) {
+                /* A malformed sidecar costs spans, not the load. */
+                c->sidecar = NULL;
+            } else {
+                lineBytes = sidecarBytes;
+                lineSrc = c->sidecar;
+            }
+        }
         if (lineBytes > 0) {
             if (c->version >= JAIC_VERSION_LTV1) {
                 /* LTV1 already: the on-disk bytes are the runtime form, so
                  * loading the table is one copy and no decode at all. */
                 const uint8_t *p = NULL;
-                if (!curTake(c, lineBytes, &p)) goto fail;
+                if (!curTake(lineSrc, lineBytes, &p)) goto fail;
                 fn->chunk.lineStream = JAI_ALLOC(uint8_t, lineBytes);
                 memcpy(fn->chunk.lineStream, p, lineBytes);
                 fn->chunk.lineStreamLen = (int)lineBytes;
@@ -967,10 +1047,10 @@ static ObjFunction *readFunction(Cursor *c, ObjModule *module, int depth) {
                 size_t used = 0;
                 for (uint32_t i = 0; i < n; i++) {
                     LineEntry e;
-                    e.offset = curU32(c);
-                    e.span = curU32(c);
-                    e.spanEnd = curU32(c);
-                    if (c->bad) {
+                    e.offset = curU32(lineSrc);
+                    e.span = curU32(lineSrc);
+                    e.spanEnd = curU32(lineSrc);
+                    if (lineSrc->bad) {
                         JAI_FREE_ARRAY(uint8_t, stream, (size_t)n * 30u + 1u);
                         goto fail;
                     }
@@ -1168,9 +1248,19 @@ static bool jaiSeedAnyVersion(void) {
  * JAITHON_SEED_ANY=1 relaxes the floor for one run. It exists so a tree that has
  * wedged itself can always reseed its way out rather than needing a checkout; it
  * warns, and it is never the default. */
+static ObjFunction *deserializeWithSidecar(const uint8_t *data, size_t size,
+                                           ObjModule *module,
+                                           uint64_t expectedHash, bool fromSeed,
+                                           const uint8_t *sidecar,
+                                           size_t sidecarSize,
+                                           size_t sidecarOffset);
+
 static ObjFunction *deserialize(const uint8_t *data, size_t size,
                                 ObjModule *module, uint64_t expectedHash,
-                                bool fromSeed);
+                                bool fromSeed) {
+    return deserializeWithSidecar(data, size, module, expectedHash, fromSeed,
+                                  NULL, 0, 0);
+}
 
 ObjFunction *jaiDeserializeSeed(const uint8_t *data, size_t size,
                                 ObjModule *module, uint64_t expectedHash) {
@@ -1182,9 +1272,12 @@ ObjFunction *jaiDeserializeModule(const uint8_t *data, size_t size,
     return deserialize(data, size, module, expectedHash, false);
 }
 
-static ObjFunction *deserialize(const uint8_t *data, size_t size,
-                                ObjModule *module, uint64_t expectedHash,
-                                bool fromSeed) {
+static ObjFunction *deserializeWithSidecar(const uint8_t *data, size_t size,
+                                           ObjModule *module,
+                                           uint64_t expectedHash, bool fromSeed,
+                                           const uint8_t *sidecar,
+                                           size_t sidecarSize,
+                                           size_t sidecarOffset) {
     if (data == NULL || module == NULL || size < JAIC_MIN_SIZE) return NULL;
     if (memcmp(data, JAIC_MAGIC, 4) != 0) return NULL;
 
@@ -1193,7 +1286,10 @@ static ObjFunction *deserialize(const uint8_t *data, size_t size,
     if (jaiCrc32(data, size - 4) != readU32At(data + size - 4)) return NULL;
 
     /* The cursor stops short of the checksum, so no parse can wander into it. */
-    Cursor c = { data, size - 4, 4, false, 0, NULL, 0 };
+    Cursor c = { data, size - 4, 4, false, 0, NULL, 0, NULL };
+    Cursor sidecarCursor = { sidecar, sidecarSize, sidecarOffset, false, 0,
+                             NULL, 0, NULL };
+    if (sidecar != NULL) c.sidecar = &sidecarCursor;
 
     /* A RANGE, not an equality. A strict test here is evaluated before the
      * fromSeed branch below, so bumping JAIC_VERSION with it in place refuses
@@ -1400,6 +1496,18 @@ void jaiCachePathFor(const char *sourcePath, char *out, size_t outSize) {
     jaiPathJoin(out, outSize, cacheDir, file);
 }
 
+/* "…/util.jaic" -> "…/util.jaid". False when it does not fit. */
+static bool sidecarPathFor(const char *cachePath, char *out, size_t outSize) {
+    size_t len = strlen(cachePath);
+    size_t extLen = strlen(JAIC_SUFFIX);
+    if (len <= extLen || len + 1 > outSize) return false;
+    if (memcmp(cachePath + len - extLen, JAIC_SUFFIX, extLen) != 0) return false;
+    memcpy(out, cachePath, len);
+    memcpy(out + len - extLen, JAID_SUFFIX, extLen);
+    out[len] = '\0';
+    return true;
+}
+
 bool jaiCacheStore(const char *sourcePath, ObjModule *module,
                    ObjFunction *body, uint64_t sourceHash, uint32_t flags) {
     char path[JAI_MAX_PATH];
@@ -1410,9 +1518,30 @@ bool jaiCacheStore(const char *sourcePath, ObjModule *module,
     jaiPathDirname(dir, sizeof dir, path);
     if (dir[0] == '\0' || !jaiMakeDirs(dir)) return false;
 
-    size_t size = 0;
-    uint8_t *data = jaiSerializeModule(module, body, sourceHash, flags, &size);
+    size_t size = 0, sidecarSize = 0;
+    uint8_t *sidecar = NULL;
+    uint8_t *data = jaiSerializeModule(module, body, sourceHash, flags, &size,
+                                       &sidecar, &sidecarSize);
     if (data == NULL) return false;
+
+    /* Best effort, and deliberately before the image is renamed into place: a
+     * .jaid without its .jaic is inert, whereas a .jaic whose .jaid never
+     * arrived would silently lose spans. A failure here costs source spans in
+     * release tracebacks and nothing else, so it does not fail the store. */
+    if (sidecar != NULL) {
+        char sidecarPath[JAI_MAX_PATH];
+        if (sidecarPathFor(path, sidecarPath, sizeof sidecarPath)) {
+            (void)jaiWriteFile(sidecarPath, sidecar, sidecarSize);
+        }
+        (void)jaiRealloc(sidecar, sidecarSize, 0);
+    } else {
+        /* A debug rebuild over a stripped one must not leave the old sidecar
+         * behind: its records would no longer line up. */
+        char sidecarPath[JAI_MAX_PATH];
+        if (sidecarPathFor(path, sidecarPath, sizeof sidecarPath)) {
+            (void)unlink(sidecarPath);
+        }
+    }
 
     /* Write to a pid-tagged temporary and rename: rename is atomic within a
      * directory, so a concurrent reader sees either the old file or the whole
@@ -1457,13 +1586,68 @@ void jaiCacheReadFree(uint8_t *data, size_t length) {
     if (data != NULL) (void)jaiRealloc(data, length + 1, 0);
 }
 
+/* The .jaid beside `sourcePath`'s image, validated and positioned past its
+ * header, or NULL. Never an error: an absent, stale or corrupt sidecar costs
+ * source spans in tracebacks, nothing more. */
+uint8_t *jaiSidecarRead(const char *sourcePath, uint64_t sourceHash,
+                        size_t *outLength, size_t *outOffset) {
+    char path[JAI_MAX_PATH];
+    char sidecarPath[JAI_MAX_PATH];
+    jaiCachePathFor(sourcePath, path, sizeof path);
+    if (path[0] == '\0') return NULL;
+    if (!sidecarPathFor(path, sidecarPath, sizeof sidecarPath)) return NULL;
+
+    size_t length = 0;
+    char *data = jaiReadFile(sidecarPath, &length);
+    if (data == NULL) return NULL;
+
+    const uint8_t *p = (const uint8_t *)data;
+    bool ok = length >= JAID_HEADER + 4 &&
+              memcmp(p, JAID_MAGIC, 4) == 0 &&
+              ((uint16_t)p[4] | (uint16_t)(p[5] << 8)) == JAID_VERSION &&
+              jaiCrc32(p, length - 4) == readU32At(p + length - 4);
+    if (ok) {
+        uint64_t recorded = 0;
+        for (int i = 0; i < 8; i++) recorded |= (uint64_t)p[8 + i] << (8 * i);
+        /* The tie to its image. Records are matched by position, so a sidecar
+         * from a different compile would silently attach the wrong spans. */
+        ok = recorded == sourceHash;
+    }
+    if (!ok) {
+        (void)jaiRealloc(data, length + 1, 0);
+        return NULL;
+    }
+
+    *outLength = length - 4;      /* the cursor stops short of the checksum */
+    *outOffset = JAID_HEADER;
+    return (uint8_t *)data;
+}
+
+ObjFunction *jaiDeserializeCached(const uint8_t *data, size_t size,
+                                  ObjModule *module, uint64_t sourceHash,
+                                  const char *sourcePath) {
+    size_t sidecarLen = 0, sidecarOffset = 0;
+    uint8_t *sidecar = jaiSidecarRead(sourcePath, sourceHash, &sidecarLen,
+                                      &sidecarOffset);
+
+    ObjFunction *fn = deserializeWithSidecar(data, size, module, sourceHash,
+                                             false, sidecar, sidecarLen,
+                                             sidecarOffset);
+    if (sidecar != NULL) {
+        /* jaiReadFile allocated sidecarLen + 4 (checksum) + 1 (terminator). */
+        (void)jaiRealloc(sidecar, sidecarLen + 5, 0);
+    }
+    return fn;
+}
+
 ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
                           uint64_t sourceHash) {
     size_t length = 0;
     uint8_t *data = jaiCacheRead(sourcePath, &length);
     if (data == NULL) return NULL;
 
-    ObjFunction *fn = jaiDeserializeModule(data, length, module, sourceHash);
+    ObjFunction *fn = jaiDeserializeCached(data, length, module, sourceHash,
+                                           sourcePath);
     jaiCacheReadFree(data, length);
     return fn;
 }
