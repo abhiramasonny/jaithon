@@ -1,50 +1,11 @@
-/* jit_func.c — compiling a whole function, calls and all.
- *
- * The loop tier in jit_loop.c compiles a counted loop out of a function that
- * the interpreter still owns. This one compiles the function itself, into an
- * ordinary arm64 routine with a native calling convention, so that a call it
- * makes to itself is a `bl` and not a CallFrame. That is the entire point: at
- * 15ns per interpreted call, `fib(30)` spends nearly all of its time in
- * pushFrame and OP_RETURN, and no amount of faster dispatch reaches C.
- *
- * The language it accepts is small and the restrictions are what make it
- * sound rather than what make it easy:
- *
- *   - integers only, and every operand is an int by construction: the entry
- *     guard checks the arguments, and the only values the body can make are
- *     results of int arithmetic or of a call to this same function
- *   - no allocation, and no globals but this function's own name
- *   - a store to an instance field is allowed, but only where no bail can
- *     follow it. A bail throws the compiled work away and lets the interpreter
- *     run the call from the top, and that is sound exactly while partial
- *     execution is invisible; a store that had already happened would be
- *     applied twice
- *   - self-recursion only. A general call would need a compiled callee and an
- *     agreed convention between them; that comes later
- *
- * Values live in registers for the whole call. Locals get x19 upward and the
- * operand stack continues from there, all callee-saved, so a value that is
- * live across a recursive call survives it without a spill. That caps the
- * function at nine live values, which is generous for anything this tier can
- * compile and is checked rather than assumed.
- *
- * Two things can go wrong at run time, and both take the same exit: signed
- * overflow, and the native stack running low. Compiled code sets a flag and
- * returns; the entry point sees the flag, discards the result, and hands the
- * call back to the interpreter, which then produces the real OverflowError or
- * RecursionError with a traceback. The function is refused from then on --
- * once a body has bailed, compiling it again only buys another bail.
- */
+/* jit_func.c -- whole-function JIT tier: compiles self-recursive, integer-only bodies to native arm64, bailing to the interpreter on overflow, deep recursion, or an unsupported shape. */
 #include "jit.h"
 
 #include "jit_arm64.h"
 #include "gc.h"
-/* For jaiBuiltinMethod: resolving `xs.len()` to its native happens at compile
- * time, so the tier has to ask the runtime what a name means. */
+/* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 #include "runtime/runtime.h"
-/* For jaiOpBranchOperandAt: the one list of which opcodes carry a code address,
- * which is what says whether an offset can be reached by anything but the
- * fall-through. */
+/* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
 #include "verify.h"
 #include "vm.h"
 
@@ -61,26 +22,18 @@
 /* Run-time state shared with compiled code                             */
 /* ------------------------------------------------------------------ */
 
-/* Compiled code returns two words: the value in x0 and whether it gave up in
- * x1. AAPCS64 returns a 16-byte struct of integers in exactly that pair, so
- * the flag costs no memory traffic at all -- it used to be a global, which was
- * a store and a load on every single call. A recursive call propagates it:
- * a callee that bailed sends its caller straight to its own bail block, so the
- * whole recursion unwinds at once instead of computing on with a junk value. */
+/* Two words in x0/x1 per AAPCS64 struct return (no store/load like the old global flag). A bailed
+ * callee sends its caller straight to its own bail block, so recursion unwinds in one shot. */
 typedef struct { int64_t value; int64_t bailed; } JitResult;
 
-/* The lowest stack address compiled code may use, computed from the thread's
- * real bounds rather than from wherever the compile happened to run. Deriving
- * it from the compiling frame's sp looked simpler and is wrong: a function
- * compiled near the top of the stack and later entered from deep inside the
- * interpreter would bail on entry every time, and silently refuse itself. */
+/* Derived from the thread's real bounds, not the compiling frame's sp -- that would bail on
+ * every entry for a function compiled near the top of stack and called later from deep in the interpreter. */
 static uintptr_t stackLimit(void) {
     pthread_t self = pthread_self();
-    void  *top  = pthread_get_stackaddr_np(self);   /* high address */
+    void  *top  = pthread_get_stackaddr_np(self);
     size_t size = pthread_get_stacksize_np(self);
     if (top == NULL || size == 0) return 0;
-    /* The margin has to cover the deepest single compiled frame plus whatever
-     * the interpreter needs to unwind and report the error afterwards. */
+    /* Margin covers the deepest compiled frame plus what the interpreter needs to unwind and report the error. */
     return (uintptr_t)top - size + (256u * 1024u);
 }
 
@@ -91,20 +44,13 @@ static uintptr_t stackLimit(void) {
 
 #define JIT_FIRST_SAVED 19u   /* x19..x28 are callee-saved and ours */
 #define JIT_MAX_SAVED   10u
-/* Entries the operand-stack MODEL can hold, which is no longer the same as the
- * number of registers: an inlined body's entries live in a bank of their own,
- * so the model has to describe more values than x19..x28 could hold. */
+/* Model entries, not register count -- an inlined body's operand-stack entries live in their own bank, wider than x19..x28. */
 #define JIT_MAX_STACK   20u
-/* How many slots the compile-time model can describe. Not the register budget:
- * a function may declare a wide frame and touch very little of it, and the
- * measuring pass has to walk the whole body to find that out. Only the second
- * pass is held to JIT_MAX_SAVED. */
+/* Slots the compile-time model can describe, not the register budget: a declared frame can be wider
+ * than what it touches; only the second (measuring) pass is held to JIT_MAX_SAVED. */
 #define JIT_MAX_SLOTS   64u
 #define JIT_MAX_ARITY    4u   /* arguments arrive in x0..x3 */
-/* Deopt stubs are the reason this is not small: each one writes out every
- * local and every live stack entry, so a body with a dozen guards spends more
- * on its cold paths than on its hot one. `merge` needed 512 and did not say
- * so, which is what the diagnostics were for. */
+/* Deopt stubs dominate this size: each writes out every local and live stack entry. `merge` silently needed 512 -- hence the diagnostics. */
 #define JIT_MAX_INSTS 20000u
 #define JIT_MAX_FIXUPS 6000u
 #define JIT_SCRATCH_A    9u
@@ -118,12 +64,9 @@ static uintptr_t stackLimit(void) {
 
 #define JIT_MAX_ARGS_OUT 4
 
-/* Built on the compiled frame and handed to the helper below. Values first, so
- * every field is 8-aligned and the emitted stores can use the scaled forms. */
+/* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
-    /* `link` and `nroots` come first so that `roots` sits at a fixed offset
-     * from the head of a chain the collector can walk. A descriptor whose
-     * `link` is non-NULL is on that chain. */
+    /* link/nroots come first so `roots` sits at a fixed offset from the chain head; link != NULL means this descriptor is on the collector's walk chain. */
     struct JitCallDesc *link;
     int64_t nroots;
     Value   roots[JIT_MAX_SAVED];
@@ -131,23 +74,12 @@ typedef struct JitCallDesc {
     Value   args[JIT_MAX_ARGS_OUT];
     Value   result;
     int64_t argc;
-    /* Whatever else a helper needs that is not a Value. Only OP_GET_SLICE uses
-     * it, for the flags byte saying which of start, stop and step are present:
-     * presence cannot be read off the values, because `xs[null:3]` is a
-     * TypeError and must not read as `xs[:3]`. */
+    /* aux: only OP_GET_SLICE uses it, for which of start/stop/step are present -- `xs[null:3]` vs `xs[:3]` can't be told apart from the values alone. */
     int64_t aux;
 } JitCallDesc;
 
-/* Compiled frames whose roots the collector must see.
- *
- * A call through the descriptor hands its roots to a C helper, which pushes
- * them. A *self*-call does not: it is a bare `bl` to the prologue, so whatever
- * the caller holds in callee-saved registers is invisible to a collection that
- * runs inside the callee. Today the tier refuses that shape -- a body that
- * allocates and then self-calls declines with "a bail follows a heap write" --
- * but any operation that allocates without setting that flag would reach it,
- * `OP_GET_SLICE` in a recursive `sort` being the first. The emitted code links
- * its descriptor on here before the `bl` and unlinks after. */
+/* A descriptor call pushes its roots via a C helper; a self-call (bare `bl`) does not, so callee-saved
+ * registers are invisible to a collection inside the callee -- the tier refuses allocate-then-self-call for exactly this reason. */
 static JitCallDesc *gJitFrames;
 
 void jaiJitMarkFrames(void) {
@@ -156,37 +88,10 @@ void jaiJitMarkFrames(void) {
     }
 }
 
-/* The one thing compiled code cannot do for itself.
- *
- * `roots` is why this is a C helper rather than an emitted sequence: the callee
- * can allocate, and an allocation can collect, and every instance this body is
- * holding lives in a callee-saved register the collector has never heard of.
- * Pushing them as temporary roots is three lines here and a page of emission
- * otherwise. The pointers in the registers stay valid across it because the
- * collector does not move objects -- only reachability was ever in question.
- *
- * They go in as a RANGE rather than one at a time. Copying them into the
- * collector's temp-root array was O(roots) on both sides of every call-out,
- * and the descriptor already holds them contiguously in the caller's frame,
- * which outlives the call by construction. Measured on its own -- no other
- * change -- alloc_churn -7.5%, nbody -7%, spectral -4%, sort_merge -2.6%,
- * object_dispatch a wash. It is also what turned a compiled dict_ops loop
- * from 4.7% SLOWER than the interpreter into 5.5% faster: three call-outs an
- * iteration, three to five roots each. An earlier attempt at a bulk
- * `jaiGCPushRoots` measured zero and was reverted; the difference is that a
- * bulk push still copies every value and a range copies none.
- *
- * Returns 0 on success and 1 with an exception pending. */
-/* Raise the overflow the interpreter would have raised.
- *
- * An overflow is not a reason to deoptimise: the interpreter's answer to it is
- * to throw, and compiled code can throw the same thing. That matters more than
- * it sounds -- a bail hands the call back to be run from the top, which is
- * sound only while nothing has been written, so every arithmetic operation
- * after a field store used to decline the whole function. Raising instead
- * makes overflow an exception exit, which is sound after any amount of
- * writing: the interpreter would have written exactly the same things before
- * throwing. */
+/* Roots go in as a RANGE (jaiGCPushRootRange/Pop), not copied one at a time -- copying individually
+ * was O(roots) per call-out; a bulk jaiGCPushRoots variant was tried and reverted, since it still copied every value. Returns 0 on success, 1 with an exception pending. */
+/* Not a deopt: overflow raises directly, since the interpreter would also throw here. A bail is only
+ * sound before any write; raising stays sound after a field store has already happened. */
 static void jitThrowOverflow(int64_t which) {
     static const char *ops[3]  = { "+",  "-",  "*"  };
     static const char *wrap[3] = { "+%", "-%", "*%" };
@@ -195,15 +100,10 @@ static void jitThrowOverflow(int64_t which) {
                    "integer overflow in '%s'; use '%s' to wrap", ops[i], wrap[i]);
 }
 
-/* Where a deoptimising body leaves what it was holding.
- *
- * A global rather than a frame field: the compiled frame is gone by the time
- * the C side looks, and one record is enough because only one compiled body
- * can be deoptimising at a time -- the VM is single-threaded and the record is
- * consumed before anything else runs. */
+/* Global, not a frame field: the compiled frame is gone by the time C looks, and the VM is single-threaded so only one body can be deoptimising at a time. */
 typedef struct {
-    int64_t ip;        /* bytecode offset to resume at */
-    int64_t base;      /* first local slot the record covers */
+    int64_t ip;
+    int64_t base;
     int64_t nlocals;
     int64_t nstack;
     Value   locals[JIT_MAX_SLOTS + 1];
@@ -212,11 +112,8 @@ typedef struct {
 
 static JitDeoptRecord gDeopt;
 
-/* Cached, because this sits on the deopt path and a deopt is not rare -- a
- * guard that misses once per loop iteration reaches this every time. getenv
- * walks the whole environment, so leaving it uncached made every measurement a
- * function of how many variables happened to be exported: sort_merge moved
- * 70ms to 100ms on shell padding alone. Same idiom as jaiJitEnabled. */
+/* Cached: getenv is O(environ) and this sits on the hot deopt path, so leaving it uncached let ambient
+ * shell-exported variable count perturb benchmarks (sort_merge moved 70ms->100ms on padding alone). Same idiom as jaiJitEnabled. */
 static bool jitReconTrace(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -249,10 +146,7 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     return true;
 }
 
-/* Invoke a built-in method: the receiver is args[0], which is exactly where
- * callNativeAt wants it, so no bound wrapper is made. Roots as jitCallOut
- * does, because push and its kin allocate. */
-/* A method on an instance: the receiver is args[0]. */
+/* Receiver is args[0], exactly where callNativeAt wants it, so no bound wrapper is made. Roots as jitCallOut does, since push and its kin allocate. */
 static int jitInvokeMethod(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiCallMethodWithReceiver(d->callee, d->args, (int)d->argc,
@@ -269,8 +163,7 @@ static int jitInvokeNative(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
-/* Build a list from the descriptor's arguments. Allocating, so the roots go
- * down first exactly as for a call. */
+/* Allocates (jaiListNew), so roots go down first as for any call out of compiled code. */
 static int jitBuildList(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjList *list = jaiListNew((int)d->argc);
@@ -281,9 +174,7 @@ static int jitBuildList(JitCallDesc *d) {
     return 0;
 }
 
-/* Build the range and its iterator in one step. args[0] is the start, args[1]
- * the stop, args[2] whether it is inclusive. Allocating twice, so the roots go
- * down first as for any other call out of compiled code. */
+/* args: start, stop, inclusive-flag. Allocates twice (range + iterator), so roots go down first as usual. */
 static int jitMakeRangeIter(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjRange *r = jaiRangeNew(AS_INT(d->args[0]), AS_INT(d->args[1]), 1,
@@ -296,7 +187,6 @@ static int jitMakeRangeIter(JitCallDesc *d) {
     return 0;
 }
 
-/* Make an iterator over whatever args[0] is. */
 static int jitMakeIter(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     Value src = d->args[0];
@@ -308,11 +198,8 @@ static int jitMakeIter(JitCallDesc *d) {
 }
 
 /* One step. 0 advanced with the item in `result`, 1 exhausted, 2 raised. */
-/* An f-string. The interpreter reads its parts straight off the operand stack;
- * the descriptor's args array is contiguous in the same way, so the pieces go
- * there and this is the whole of it. Only the builtin path -- the compiler
- * checks at compile time that the module has not bound its own `str`, and the
- * module version retires this form if one appears. */
+/* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
+ * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 static int jitFormat(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjString *formatted = jaiValueFormat(d->args, (int)d->argc);
@@ -332,21 +219,8 @@ static int jitIterStep(JitCallDesc *d) {
     return 0;
 }
 
-/* Make room for one more element in `list`, and nothing else.
- *
- * No descriptor and no roots, which is what makes the call site three
- * instructions instead of thirty. That is sound because growing a list cannot
- * collect: `jaiListReserve` reaches `jaiRealloc`, and gc.c is explicit that
- * the marker never runs from inside it -- collections happen only at the
- * safepoints that call jaiGCMaybeCollect. Nothing this body is holding in a
- * callee-saved register can be freed across this call, so nothing has to be
- * made visible to the collector first.
- *
- * The element about to be stored travels anyway, as a tag and a payload, so
- * this does not depend on that invariant for the one value whose only
- * reference really is a register.
- *
- * Returns 1 when it raised -- a list past INT32_MAX is the only way. */
+/* No descriptor/roots: growing a list cannot collect -- jaiListReserve->jaiRealloc never triggers the
+ * marker (gc.c: collections only happen at jaiGCMaybeCollect safepoints). Returns 1 if it raised (list past INT32_MAX). */
 static int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
     Value pending;
     pending.type = (ValueType)tag;
@@ -364,31 +238,8 @@ static int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
     return 0;
 }
 
-/* Allocate an instance, with no descriptor, no roots and no possibility of
- * collecting. The compiled code that called this stores the fields.
- *
- * THE INVARIANT THAT MAKES THIS SAFE, since it is the whole of the review:
- * a collection can begin in exactly one place, jaiGCMaybeCollect, and gc.c is
- * explicit that the marker never runs from anywhere else -- not from inside
- * jaiRealloc, not from object construction. `allocObj` calls it when and only
- * when `jaiGCWanted()`, so a false answer to that test is gc.c's own proof
- * that the allocation below cannot collect. Nothing this body's caller is
- * holding in a callee-saved register can therefore be freed while this runs,
- * which is precisely the reason jitNewInstance needs a root array and this
- * does not. And the object is complete -- header, class, field count and every
- * field written -- BEFORE the two stores that link it into the collector's
- * list, so the first marker that can possibly see it sees a whole object.
- *
- * The gate is conservative in the safe direction only. jaiGCLimit is zero
- * whenever the collector is absent, disabled, stressed or already running, and
- * `jaiHeapBytes > 0` holds from the first allocation the VM ever makes, so all
- * four of those cases answer "wanted" and decline here. --gc-stress therefore
- * still stresses every allocation, which is the property that would otherwise
- * quietly stop being tested.
- *
- * NULL means "I did nothing": the caller falls into the descriptor path, which
- * writes its roots and lets the collection happen there. Declining is always
- * correct and never observable, which is what makes this reviewable at all. */
+/* Safe because jaiGCWanted()==false is gc.c's own proof no collection can happen here (collections begin
+ * only in jaiGCMaybeCollect), and the object is fully built before being linked in. NULL means "declined": caller falls back to the descriptor path, which roots and may collect. */
 static ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
 
@@ -409,14 +260,11 @@ static ObjInstance *jitInstanceAlloc(ObjClass *cls) {
 
     inst->klass = cls;
     inst->fieldCount = count;
-    /* Every field, not just the ones the caller is about to overwrite: the
-     * marker reads all `count` of them and a field it has not written is
-     * whatever the last corpse in this bin left behind. */
+    /* Zeroes every field, not just the ones about to be overwritten: the marker reads all `count` of them,
+ * and an unwritten field is whatever the last occupant of this bin left behind. */
     for (uint16_t i = 0; i < count; ++i) inst->fields[i] = NULL_VAL;
 
-    /* Last. jaiGCTrackObject's `isMarked = jaiGCInCollect` case cannot arise
-     * here: a collection in progress makes jaiGCLimit zero, and the first line
-     * would have declined. */
+    /* Linked last: a mid-collection isMarked state can't arise here, since a collection in progress makes jaiGCLimit zero and the first line above would already have declined. */
     obj->next = g->objects;
     g->objects = obj;
 
@@ -424,8 +272,6 @@ static ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     return inst;
 }
 
-/* Allocate an instance of args[0]'s class, nothing more. The fields are stored
- * by the compiled code that called this. */
 static int jitNewInstance(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
@@ -449,12 +295,8 @@ static int jitGetSlice(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
-/* `d[k] = v` where d is a dict, whose object type the call site has guarded.
- *
- * A dict store is not a list store: the index is a hash key rather than an
- * offset, so there is nothing to normalise inline and the work is a table
- * probe either way. What it saves over the interpreter is the dispatch and
- * the indexSet type ladder, not the probe. */
+/* Dict store: unlike a list store there's no offset to normalise, it's a table probe either way --
+ * this only saves the dispatch and indexSet's type ladder, not the probe itself. */
 static int jitSetIndexDict(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     (void)jaiDictSet(AS_DICT(d->args[0]), d->args[1], d->args[2]);
@@ -469,78 +311,41 @@ static int jitCallOut(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
-/* One entry of the compile-time operand stack. A `self` entry is the callee of
- * a recursive call: it names this function and occupies no register, which is
- * why register numbers are derived from the count of value entries below an
- * entry rather than from its depth. */
+/* A `self` entry (the callee of a recursive call) occupies no register; register numbers are
+ * derived from the count of value entries below an entry, not from its depth. */
 typedef enum {
-    SLOT_INT,     /* int64 payload, in an X register */
-    SLOT_FLOAT,   /* double, held as raw bits in an X register */
-    SLOT_INST,    /* ObjInstance *, raw, of a class fixed at compile time */
-    /* An instance of a fixed class, or null, held as the pointer or as zero --
-     * which is how C would spell it, and makes `x == null` a compare against
-     * zero. `T?` is how this language writes optional, so refusing it stopped
-     * six hundred stdlib bodies. The one thing it costs is that the tag stops
-     * being a property of the kind: materialising one picks VAL_NULL or
-     * VAL_OBJ off the register at run time. */
+    SLOT_INT,
+    SLOT_FLOAT,
+    SLOT_INST,
+    /* Fixed class or null, held as the pointer or zero (`x == null` is then a compare against zero);
+ * refusing this stopped six hundred stdlib bodies. Cost: materialising picks VAL_NULL/VAL_OBJ off the register at run time -- the tag isn't a static property of the kind. */
     SLOT_MAYBE_INST,
-    SLOT_SELF,    /* this function, as a callee; occupies no register */
+    SLOT_SELF,
     SLOT_OPAQUE,  /* present in a register, but nothing may be done with it */
-    SLOT_CLOSURE, /* the running closure, for reaching its upvalues */
-    SLOT_CLASS,   /* a class resolved at compile time; only ever a callee */
-    SLOT_FUNC,    /* a global function resolved at compile time, likewise */
-    SLOT_NATIVE,  /* a builtin resolved at compile time, likewise */
-    SLOT_ITER,    /* an ObjIter this body built, held raw. Its index stays in
-                   * memory rather than a register, which costs a load and a
-                   * store an iteration and makes a deopt need nothing: the
-                   * iterator on the stack is always current. */
-    SLOT_BOOL,    /* 0 or 1 in a register; a Value's boolean member is its low
-                   * byte, so the same word serves both */
-    SLOT_NULL,    /* what a `-> void` function returns. It occupies a register
-                   * like any other entry, holding a defined zero, so that a
-                   * caller can drop it or a deopt can write it out; what it
-                   * does NOT have is a payload worth reading, and its tag is
-                   * VAL_NULL rather than the VAL_OBJ every kind chain in this
-                   * file falls through to. */
-    SLOT_OBJ,     /* some heap object, raw, of a type this tier does not model.
-                   * It can be read, passed, stored and rooted -- nothing else.
-                   * A closure held in a variable is the common case. */
-    SLOT_LIST     /* ObjList *, raw. Safe for the same reason an instance is:
-                   * nothing moves, and a call spills it as a root first */
+    SLOT_CLOSURE,
+    SLOT_CLASS,
+    SLOT_FUNC,
+    SLOT_NATIVE,
+    SLOT_ITER,    /* ObjIter this body built, held raw; its index stays in memory (not a register) -- costs a load/store
+                   * per iteration but means a deopt needs no write-back, since the stack's iterator is always current. */
+    SLOT_BOOL,    /* 0 or 1 in a register -- a Value's boolean member is its low byte, so the same word serves both. */
+    SLOT_NULL,    /* What `-> void` returns: a defined zero in a register (droppable, or written out by a deopt) whose
+                   * tag is VAL_NULL rather than the VAL_OBJ every other kind chain in this file falls through to. */
+    SLOT_OBJ,     /* Heap object of a type this tier doesn't model, held raw: may only be read, passed, stored and rooted. */
+    SLOT_LIST     /* ObjList *, raw -- safe for the same reason an instance is: nothing moves, and a call spills it as a root first. */
 } SlotKind;
 
-/* Floats live in X registers and visit d0/d1 only for the arithmetic itself.
- * Three extra fmovs per operation, against a second register bank with its own
- * allocator, its own save set and its own spill rules -- for a tier this young
- * the simpler thing that is obviously correct is worth more than the three
- * instructions. Nothing calls between the fmovs, so the scratch pair is safe. */
+/* Floats live in X registers, visiting d0/d1 only for the arithmetic itself -- simpler-but-correct beats
+ * a second register bank (own allocator/save-set/spill rules) for a tier this young. Nothing calls between the fmovs, so the scratch pair is safe. */
 #define JIT_FSCRATCH_A 0u
 #define JIT_FSCRATCH_B 1u
 
-/* ...and that measured 3.7x. The recurrence `x2 = x*x; y2 = y*y; xy = x*y;
- * y = 2*xy + y0; x = x2 - y2 + x0` runs at 3.3ns an iteration with its doubles
- * in d registers and 12.1ns with them in X registers and an fmov pair per
- * operation -- worse, in fact, than leaving them in memory and loading them
- * straight into d registers, which is 8.5ns. The three instructions are not
- * three instructions: each one is a cross-file move on the dependency chain.
- *
- * So a SLOT_FLOAT operand-stack entry may now *live* in an FP register between
- * the instruction that computes it and the one that consumes it. Entry i's
- * canonical home is still x(19 + regBase + i); `fpLive` bit i says that copy is
- * stale and v(16 + i) holds the value instead. The bank is v16..v25, which is
- * caller-saved on purpose: nothing here is allowed to survive a call, so there
- * is nothing for the prologue to preserve and no save set to get wrong. The
- * index is shared with the X bank, so two live entries can never name the same
- * FP register. */
+/* A SLOT_FLOAT entry may live in an FP register between the instruction that computes it and the one
+ * that consumes it: entry i's canonical home is x(19+regBase+i), but `fpLive` bit i means that copy is stale and v(16+i) holds the value instead. Bank v16..v25 is caller-saved on purpose (nothing here survives a call); the index is shared with the X bank so two live entries can never collide. */
 #define JIT_FP_BANK 16u
 
-/* ...and the same argument applies to a float LOCAL, which is why there is a
- * second callee-saved bank. v8..v15 are preserved across a call by the
- * platform ABI, nothing else this tier emits names them (the operand stack's
- * bank starts at v16 and the scratches are v0/v1), and only fmov, ldr d and
- * str d ever touch a local's home -- never arithmetic. So a slot parked here
- * is a bit-exact 64-bit home: a slot whose kind the allocator guessed wrong
- * costs an fmov, it cannot be read back as the wrong bits. */
+/* Same argument for a float LOCAL: v8..v15 is ABI-preserved across a call, nothing else here names it,
+ * and only fmov/ldr d/str d ever touch a local's home -- never arithmetic -- so a slot parked here is a bit-exact 64-bit home (a kind the allocator guessed wrong costs an fmov, never wrong bits). */
 #define JIT_FP_FIRST_SAVED 8u
 #define JIT_FP_MAX_SAVED   8u
 
@@ -566,10 +371,10 @@ static bool holdsRegister(SlotKind k) {
 #define JIT_MAX_DEOPT 160
 
 typedef struct {
-    int      instIndex;    /* which emitted instruction to patch */
+    int      instIndex;
     uint32_t targetOffset; /* bytecode offset, or FIXUP_BAIL / FIXUP_ENTRY */
-    bool     conditional;  /* b.cond rather than b */
-    int      depth;        /* value-stack depth where the branch leaves from */
+    bool     conditional;
+    int      depth;
 } Fixup;
 
 typedef struct {
@@ -577,158 +382,96 @@ typedef struct {
     unsigned  count;
 
     SlotKind  stack[JIT_MAX_STACK];
-    uint32_t  stackShape[JIT_MAX_STACK];  /* class shapeId for SLOT_INST */
+    uint32_t  stackShape[JIT_MAX_STACK];
     ObjClass *stackClass[JIT_MAX_STACK];
-    Value     stackSeen[JIT_MAX_STACK];   /* the live value, for field feedback */
-    int       stackLocal[JIT_MAX_STACK];  /* which local it was copied from, or -1 */
+    Value     stackSeen[JIT_MAX_STACK];
+    int       stackLocal[JIT_MAX_STACK];
 
-    /* Fields this body has already stored, and with what kind. A read of one
-     * of them needs no tag check: nothing can have changed it, because the
-     * body cannot call. That matters more than it sounds -- `self.n = self.n +
-     * 1; return self.n` is the commonest shape there is, and without this the
-     * trailing read is a bail after a write, which the tier refuses. */
+    /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
+     * can have changed it (the body can't call) -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses. */
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
     SlotKind  localKind[JIT_MAX_SLOTS + 1];
     uint32_t  localShape[JIT_MAX_SLOTS + 1];
     ObjClass *localClass[JIT_MAX_SLOTS + 1];
-    bool      localTyped[JIT_MAX_SLOTS + 1];   /* parameter, or already bound */
-    /* A value of the kind this local holds, kept only so a field read on it
-     * has something to read the field's type off. A local bound from a list
-     * element has no argument to look at, which is why `bi` in nbody's
-     * advance could not have its fields read. */
+    bool      localTyped[JIT_MAX_SLOTS + 1];
+    /* Kept only so a field read on this local has something to read the field's type off; a local bound
+     * from a list element has no argument to look at (why nbody's `advance`'s `bi` couldn't have its fields read). */
     Value     localSeen[JIT_MAX_SLOTS + 1];
-    Value    *observed;      /* the live arguments, for field-type feedback */
+    Value    *observed;
     bool      assumedIntReturn;
-    unsigned  depth;       /* entries on the operand stack */
-    unsigned  valueDepth;  /* of those, how many hold a register */
-    unsigned  maxValue;    /* high-water mark, for the save set */
+    unsigned  depth;
+    unsigned  valueDepth;
+    unsigned  maxValue;
 
     Fixup     fixups[JIT_MAX_FIXUPS];
     unsigned  fixupCount;
 
-    int      *offsetToInst;  /* bytecode offset -> instruction index, or -1 */
-    int      *offsetToDepth; /* bytecode offset -> stack signature, or -1 */
+    int      *offsetToInst;
+    int      *offsetToDepth;
 
     unsigned  arity;
-    /* Slot 0 is the callee for a plain call and the RECEIVER for a method, so
-     * a method's `self.x` reads it. When the body touches it, it becomes an
-     * ordinary local and an extra incoming argument; when it does not -- every
-     * plain function -- it costs nothing. */
-    unsigned  base;        /* first slot held in a register: 0 or 1 */
+    /* Slot 0 is the callee for a plain call, the RECEIVER for a method (so `self.x` reads it). Touching
+     * it turns it into an ordinary local plus an extra incoming argument; untouched (every plain function), it costs nothing. */
+    unsigned  base;
     bool      usesSlot0;
-    /* The highest slot the body actually names. maxSlots is the frame window
-     * the interpreter reserves, which is routinely larger -- and every slot
-     * costs one of the ten callee-saved registers here. */
+    /* Highest slot the body actually names -- not maxSlots, the (routinely larger) frame window the
+     * interpreter reserves. Every slot here costs one of the ten callee-saved registers. */
     unsigned  maxSlotUsed;
     /* The first pass exists to find maxValue and maxSlotUsed, so it must not
      * stop at a budget computed from a slot count it is still discovering. */
     bool      measuring;
-    /* Locals live in the compiled frame instead of registers. A body with more
-     * live values than there are callee-saved registers would otherwise be
-     * declined outright, and nbody's `advance` wants nineteen. The operand
-     * stack stays in registers either way -- that is where the arithmetic is.
-     *
-     * This used to be the whole decision: one local over budget and every
-     * local went to the frame. It is now the flag that says the PER-SLOT plan
-     * in slotXReg/slotFpReg is in force -- the busiest slots keep a register
-     * and the rest live in the frame, exactly as the OSR tier does. A body
-     * that fits entirely leaves this false and its codegen is untouched. */
+    /* Locals spill to the frame instead of registers when the body has more live values than callee-saved
+     * registers (nbody's `advance` wants nineteen); the operand stack always stays in registers. Flags that the PER-SLOT plan (slotXReg/slotFpReg) is in force: busiest slots keep a register, the rest live in the frame, as the OSR tier does. */
     bool      spilled;
     unsigned  localsFrameOffset;
-    /* On-stack replacement: the locals ARE the interpreter's frame slots,
-     * reached through a pointer handed to the entry. Nothing is copied either
-     * way, which is also what makes a deopt cheap here -- the slots are
-     * already what the interpreter expects, so only the operand stack needs
-     * rebuilding. */
+    /* OSR: locals ARE the interpreter's frame slots via a pointer handed to the entry -- nothing is copied
+     * either way, which is also what makes a deopt cheap here: only the operand stack needs rebuilding. */
     bool      osr;
     uint32_t  osrTop;
     uint32_t  osrEnd;
-    /* A `for i in a..b` loop, compiled as a counted one. The iterator object
-     * stays on the interpreter's stack untouched; only its index rides in a
-     * register, and every way out writes it back so the interpreter can carry
-     * on from wherever this stopped. */
+    /* `for i in a..b` compiled as a counted loop: the iterator object stays on the interpreter's stack
+     * untouched, only its index rides in a register, and every exit writes it back. */
     bool      hasIter;
     uint8_t   iterKind;   /* 1 a unit-step range, 2 a list */
-    Value     elemSample; /* a live element, for a list head */
-    /* Where each slot lives, per slot. The entry already checks every slot's
-     * kind before calling, so the prologue only has to load payloads; every
-     * way out writes back the ones that took a register.
-     *
-     * This used to be one flag for the whole loop, and the test it turned on
-     * was `reserved + every slot in the enclosing function's frame window +
-     * the deepest expression <= ten`. No loop in a real function passes that,
-     * so every one of them ran with all of its locals in memory as full
-     * Values -- mandelbrot's recurrence measured 8.7ns an iteration against
-     * the 8.5 the hand-written memory kernel gets and the 3.3 the register one
-     * does. Three things together fix it and none of them alone does:
-     *
-     *   - only slots the body actually NAMES take a register. A function
-     *     declares a wide frame and a loop inside it touches a third of it.
-     *   - a float slot takes one of v8..v15 (see JIT_FP_FIRST_SAVED) rather
-     *     than an X register, which both keeps it out of the X budget and
-     *     puts it where the arithmetic wants it.
-     *   - what is left over stays in the frame exactly as before, so a body
-     *     one slot over budget loses one slot rather than all of them. The
-     *     busiest slots win, counted in the measuring pass and weighted by
-     *     how deeply nested the loop naming them is. */
+    Value     elemSample;
+    /* Per-slot register assignment. Historically one flag gated the whole loop on a budget check that
+     * almost nothing passed, so most loops ran fully in memory. Three things fixed it: only NAMED slots take a register; a float slot takes v8..v15 instead of an X register; overflow slots stay in the frame (busiest slots win, weighted by loop nesting) rather than all-or-nothing. */
     uint8_t   slotXReg[JIT_MAX_SLOTS + 1];   /* x19..x28, or 0 for none */
     uint8_t   slotFpReg[JIT_MAX_SLOTS + 1];  /* d8..d15, or 0 for none */
-    unsigned  xLocals;                       /* how many took an X register */
-    unsigned  fpLocals;                      /* ...and how many a d register */
-    uint32_t  slotUse[JIT_MAX_SLOTS + 1];    /* sites, weighted by loop depth */
-    /* The same again for the function tier, but counted in INSTRUCTIONS SAVED
-     * rather than in sites -- see noteSlotCost. A float read through the FP
-     * bank costs one `ldr d` from the frame and one `fmov d, x` from an X
-     * register, so an X register buys such a slot exactly nothing and a flat
-     * per-use count would hand it one anyway. Two banks, two ledgers. */
+    unsigned  xLocals;
+    unsigned  fpLocals;
+    uint32_t  slotUse[JIT_MAX_SLOTS + 1];
+    /* Same idea for the function tier, but counted in INSTRUCTIONS SAVED, not sites (see noteSlotCost):
+     * a float read through the FP bank costs one `ldr d` plus one `fmov d,x` from an X register, so a flat per-use count would wrongly credit an X register for such a slot. Two banks, two ledgers. */
     uint32_t  slotSaveX[JIT_MAX_SLOTS + 1];
     uint32_t  slotSaveFp[JIT_MAX_SLOTS + 1];
-    const uint8_t *loopDepth;                /* per bytecode offset */
+    const uint8_t *loopDepth;
     unsigned  loopDepthCount;
-    unsigned  fpSaveOffset;                  /* where d8.. are preserved */
-    /* Where a range loop parks the ObjIter, since it holds no register for it.
-     * Written once in the prologue and read once in each exit stub. */
+    unsigned  fpSaveOffset;
+    /* Where a range loop parks the ObjIter, since it holds no register for it -- written once in the prologue, read once per exit stub. */
     unsigned  iterFrameOffset;
-    /* Inlining a method widens the live range of everything it reads, so a
-     * loop that fitted the registers as a call may not fit as an expression.
-     * The compile is retried with this set when that is what went wrong. */
+    /* Inlining widens the live range of everything the callee reads, so a loop that fit the registers as
+     * a call may not fit as an expression; the compile retries with this set when that's what went wrong. */
     bool      noInline;
     bool      inlined;
-    /* A callee whose body is being emitted where the call to it was.
-     *
-     * Its locals are operand-stack entries of the CALLER's frame: slots 1..n
-     * are the argument entries that are already sitting there, and anything it
-     * binds pins one more. Nothing is copied and no frame appears, which is
-     * the whole point -- but it also means the interpreter has no idea any of
-     * this is happening, so every guard inside the inlined body deoptimises to
-     * `inlIp`, the caller's own OP_CALL, with the model as it stood at
-     * `inlDepth`: the callee and its arguments, untouched, exactly what the
-     * interpreter expects to find at that offset. */
+    /* Inlined callee: its locals are operand-stack entries of the CALLER's frame (slots 1..n are the
+     * already-present argument entries); nothing is copied, no frame appears -- but the interpreter has no idea, so every guard inside deoptimises to `inlIp` (the caller's OP_CALL) with the model as of `inlDepth`. */
     bool      inlining;
     unsigned  inlDepth;
-    unsigned  inlPinned;      /* how many of its locals it has bound so far */
-    unsigned  inlValueBase;   /* value entries at or above this are the callee's */
+    unsigned  inlPinned;
+    unsigned  inlValueBase;
     uint32_t  inlIp;
-    /* The register holding the ObjClosure being inlined, or -1 when the body
-     * has no upvalue to reach. It is the CALLEE's closure, not the caller's:
-     * the two are different objects and `closureReg` names the wrong one.
-     * Only meaningful while `inlining`, which is the only thing that writes
-     * it, so a zeroed Emit never reads a stale x0 out of it. */
+    /* Register holding the ObjClosure being inlined (-1 if none) -- the CALLEE's closure, not the caller's;
+     * only meaningful while `inlining`, the only thing that writes it, so a zeroed Emit never reads stale state. */
     int       inlClosureReg;
     int       inlSlot[JIT_MAX_SLOTS + 1];
-    /* A local whose kind is not the same on every path into some point. It
-     * lives in the frame with its tag and every read of it guards, which is
-     * what lets two paths disagree. The compiler reuses one slot for the
-     * induction variables of loops that do not overlap, so this is not exotic:
-     * it is nbody's advance. */
+    /* A local whose kind differs across paths into some point: lives in the frame with its tag, and every
+     * read guards. Not exotic -- the compiler reuses one slot for non-overlapping loop induction variables (nbody's advance). */
     bool      dynamicLocal[JIT_MAX_SLOTS + 1];
-    bool      needDynamic[JIT_MAX_SLOTS + 1];   /* found during this attempt */
-    /* A slot that holds an instance on one path and null on another. Unlike a
-     * dynamic local it stays in a register -- the pointer, or zero -- and its
-     * tag is built when it is materialised. Per slot, because widening every
-     * instance parameter of any body that merely mentions null cost
-     * object_dispatch a factor of two. */
+    bool      needDynamic[JIT_MAX_SLOTS + 1];
+    /* A slot holding an instance on one path, null on another: unlike a dynamic local it stays in a register
+     * (pointer or zero), tag built at materialisation. Per-slot, since widening every nullable-mentioning parameter cost object_dispatch 2x. */
     bool      nullableLocal[JIT_MAX_SLOTS + 1];
     bool      needNullable[JIT_MAX_SLOTS + 1];
     bool      pendingRange;
@@ -738,33 +481,26 @@ typedef struct {
     uint32_t  rangeBuildIp;
     unsigned  iterSlot;
     uint32_t  iterExit;
-    int       exitStub[8];       /* one per distinct offset jumped out to */
+    int       exitStub[8];
     uint32_t  exitOffset[8];
     unsigned  exitCount;
-    /* A body that reads an upvalue needs the closure itself, which is not any
-     * slot: for a method slot 0 is the receiver, not the callee. It arrives as
-     * one extra argument and takes the register just past the locals. */
+    /* A body that reads an upvalue needs the closure itself -- not any slot (a method's slot 0 is the
+     * receiver, not the callee) -- so it arrives as one extra argument, in the register just past the locals. */
     bool      usesUpvalues;
     /* Set once the body has written to the heap. After that a bail is no
      * longer free: re-running the call interpreted would apply the write a
      * second time. See branchOnCondition. */
     bool      wroteHeap;
-    /* Module globals baked into this body. Every global this body touches
-     * lives in one table -- the defining module's -- so one guard covers all
-     * of them: `keyVersion` changes only when a live entry's ADDRESS or KEY
-     * could have changed (a new key, a rehash, a delete, a clear), which is
-     * exactly the condition that makes a baked JaiEntry* unusable.
-     * ObjModule::version, which the function tier's entry check uses, is
-     * neither necessary here (a value write moves no entry) nor sufficient
-     * (under jaiModuleSet's narrowed rule an inert write does not move it). */
+    /* Baked globals share the defining module's table, so one `keyVersion` guard covers all of them --
+     * it changes only when a live entry's address or key could move (new key, rehash, delete, clear). ObjModule::version (used by the function-tier entry check) is neither necessary nor sufficient here. */
     JaiTable *globalsTable;
     uint32_t  globalsKeyVersion;
     bool      bailAfterWrite;
-    bool      callsOut;      /* the body reaches out to another function */
+    bool      callsOut;
     const char *whyNot;
     uint8_t     lastOp;
-    unsigned  descOffset;    /* JitCallDesc within the compiled frame */
-    int       exceptionExit; /* instruction index of the "callee threw" exit */
+    unsigned  descOffset;
+    int       exceptionExit;
     bool      overflowUsed[3];
     int       overflowStub[3];
 
@@ -784,66 +520,48 @@ typedef struct {
         int      stub;
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
-    /* What a self-call does when the callee's verdict is not zero. Emitted
-     * with the stubs rather than inline: the fast path is three instructions
-     * and a not-taken branch, and putting thirty instructions of cold code
-     * between two recursive call sites cost fib_recursive 25% -- measured,
-     * with the same code laid out both ways. */
+    /* Self-call cold path, emitted with the stubs, not inline: the fast path is three instructions plus a
+     * not-taken branch; interleaving thirty instructions of cold code between recursive call sites cost fib_recursive 25% (measured, same code, two layouts). */
     struct {
-        int      returnTo;   /* instruction index to resume the body at */
+        int      returnTo;
         int      stub;
         unsigned roots;      /* the descriptor is on the frame chain when >0 */
         unsigned deoptBail;  /* record for verdict 1: re-execute the call */
         unsigned deoptKind;  /* record for a result of an unexpected kind */
-        unsigned tag;        /* the tag the compiled body was built for */
+        unsigned tag;
         unsigned resultReg;
-        /* Which closure the interpreter finishes on verdict 4. NULL means
-         * this one -- a self-call knows its own. A direct call to another
-         * compiled function that writes names it here instead. */
+        /* Closure to finish on verdict 4: NULL means this one (a self-call knows its own); a direct call to
+         * another compiled function that writes names it here instead. */
         ObjClosure *callee;
-        /* What the continuation's object must be, when the fast path's kind
-         * says more than "a heap object". A shape alone is not enough to
-         * check: VAL_OBJ is EVERY heap object, and reading `klass` off an
-         * ObjString answers wrongly rather than faulting -- the same mistake
-         * the list-element head made. So the type is checked first. */
-        int      retType;    /* an ObjType, or -1 for no check */
-        uint32_t retShape;   /* class shapeId, or 0 for no check */
+        /* Continuation's required object type/shape, when the fast path's kind says more than "a heap object":
+         * VAL_OBJ covers every heap object, and reading `klass` off an ObjString answers wrongly rather than faulting (the list-element-head bug) -- so the type is checked first. */
+        int      retType;
+        uint32_t retShape;
     } selfSlow[JIT_MAX_SELF_SLOW];
     unsigned  selfSlowCount;
-    /* A `xs.push(v)` whose list is full. Out of line for the same reason the
-     * self-call's cold half is: the store itself is nine instructions, and a
-     * realloc call sitting between them would be most of the loop.
-     *
-     * Before this existed the full case was a deopt, and that is worth
-     * spelling out because it is what made the function tier nearly worthless
-     * for any body that builds a list: a deopt hands the WHOLE REST of the
-     * function to the interpreter, and `out` starts empty, so the very first
-     * push abandoned the compiled body. merge in sort_merge deopted once per
-     * call -- 62434 times for 62500 items -- and ran interpreted from its
-     * first push onward every time. */
+    /* Out-of-line list-grow path (like the self-call cold half, to keep the store's 9 instructions and a
+     * realloc call from sitting in the loop). Before this existed, list-full was a full deopt -- handing the WHOLE rest of the function to the interpreter -- which made compiled list-building bodies nearly worthless (merge in sort_merge deopted on every single push, 62434 times for 62500 items). */
     struct {
-        int      returnTo;   /* instruction index to resume the body at */
+        int      returnTo;
         int      stub;
         unsigned listReg;
         unsigned valReg;
         unsigned tag;
-        unsigned countReg;   /* the scratch the reload must refill */
+        unsigned countReg;
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
     uint32_t  curOffset;
-    /* The model as it stood at the start of `curOffset`, before any of that
-     * instruction's own pushes. A guard fires part-way through an instruction
-     * and the interpreter resumes at its start, so this is what it is holding
-     * there -- see deoptSite. */
+    /* Model as it stood at the start of `curOffset`, before that instruction's own pushes -- a guard fires
+     * mid-instruction and the interpreter resumes at its start, so this is what's live there (see deoptSite). */
     unsigned  instDepth;
     unsigned  instValueDepth;
     bool      hasSelfCall;
-    unsigned  locals;      /* slots base..base+locals-1 live in registers */
+    unsigned  locals;
     unsigned  frameBytes;
     unsigned  savedCount;
 
-    int       limitLiteral;  /* instruction index of the stack-limit word */
-    int       bailBlock;     /* instruction index of the bail sequence */
+    int       limitLiteral;
+    int       bailBlock;
 
     SlotKind  returnKind;
     uint32_t  returnShape;
@@ -854,67 +572,28 @@ typedef struct {
     /* Value entries whose payload is in v(16 + index) rather than in their X
      * register. See JIT_FP_BANK. */
     uint32_t  fpLive;
-    bool      fpOff;         /* the retry that puts every float back in X */
-    /* Offsets this walk carried an FP-resident value *into*. A branch that
-     * lands on one of them would arrive with the value only in X, so the
-     * compile is declined and retried with fpOff. Straight-line float
-     * expressions are never branch targets, so this is a safety net rather
-     * than a path; JAI_JIT_WHY says so when it fires. */
+    bool      fpOff;
+    /* Offsets this walk carried an FP-resident value INTO: a branch landing on one would arrive with the
+     * value only in X, so the compile declines and retries with fpOff. Safety net, not a real path -- straight-line float expressions are never branch targets; JAI_JIT_WHY reports it when it fires. */
     uint32_t  fpCarry[64];
     unsigned  fpCarryCount;
-    /* Offsets of an OP_BIND whose local's d register was written EARLY, by the
-     * float operator one instruction above it, so that the bind itself emits
-     * nothing. Nothing may branch to one of these: a path arriving there did
-     * not run the operator, and would find a bind that does no binding. Checked
-     * against the fixups at the end of the walk rather than while walking,
-     * because a back edge to the offset is not in the list yet when the bind is
-     * compiled -- the same reason fpCarry is checked there. */
+    /* Offsets of an OP_BIND whose local's d register was written EARLY by the float operator just above it,
+     * so the bind itself emits nothing -- nothing may branch here, since an arriving path skipped the operator. Checked against fixups at the end of the walk, since a back-edge isn't in the list yet mid-walk (same reason as fpCarry). */
     uint32_t  homeEarly[32];
     unsigned  homeEarlyCount;
-    /* Value entries that are a plain read of a float local and are being held
-     * in that LOCAL's own d register rather than copied into the bank. `x * x`
-     * was two fmovs and a multiply; borrowing makes it the multiply. The
-     * borrow is read-only, so the whole obligation is that nothing writes the
-     * register underneath it -- and the only two places that ever write a
-     * local's d home are localOut and localOutFp, both of which release first.
-     * Cleared on push, on pop, on claim, and before any deopt record, so an
-     * entry that survives one of those is back in the bank where the rest of
-     * this file expects it. */
+    /* Value entries that are a plain read of a float local, held in that LOCAL's own d register instead of
+     * copied into the bank (`x * x` becomes one multiply instead of two fmovs + a multiply). Read-only borrow: only localOut/localOutFp ever write a local's d home, and both release the borrow first. Cleared on push/pop/claim/before any deopt record. */
     uint32_t  fpBorrow;
     uint8_t   fpBorrowReg[32];
 
-    /* Value entries whose own X register does not hold the value yet. Two
-     * flavours, one mechanism:
-     *
-     * kPend  -- the entry is an integer literal `OP_INT`/`OP_CONST` declined
-     *           to materialise, so a consumer that can spell it as an imm12
-     *           spends nothing on it at all. `n - 1` was `movz` plus `subs`
-     *           and is now `subs`.
-     * xBorrow -- the entry is a plain read of a register-resident local and
-     *           is held in THAT register rather than copied into its own.
-     *           The X twin of fpBorrow, read-only for the same reason, and
-     *           `fib(n - 1)` loses the `mov` that copied `n`.
-     *
-     * Both are settled -- put where the rest of this file expects them -- at
-     * the TOP of the next instruction unless that instruction is on
-     * deferSurvives' whitelist. The top of an instruction is the one place
-     * the settling code is unconditionally on the executed path; a guard is
-     * not, which is the lesson fpBorrow already paid for. It sits before
-     * `offsetToInst` records where the instruction starts, so a branch that
-     * lands here -- arriving with everything already in registers -- skips it.
-     *
-     * Nothing deferred may reach a deopt record: the stub writes entries out
-     * of valueXReg. deoptRecordAt and branchOnDeopt assert that, so a
-     * whitelist that is wrong costs a decline and not a wrong answer. */
+    /* Two deferred-materialisation flavors, one mechanism: kPend is an int literal (OP_INT/OP_CONST) left
+     * unmaterialised so a consumer can fold it as an imm12 (`n - 1` becomes just `subs`); xBorrow is a plain read of a register-resident local held in THAT register (X-twin of fpBorrow, `fib(n-1)` loses its `mov`). Both settle at the TOP of the next instruction (the one point unconditionally on the executed path -- a guard is not) unless whitelisted by deferSurvives. Nothing deferred may reach a deopt record: deoptRecordAt/branchOnDeopt assert it, so a wrong whitelist entry costs a decline, not a wrong answer. */
     uint32_t  kPend;
     int64_t   kPendVal[32];
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
-    /* Offsets this walk carried a deferred entry into, for the same reason
-     * fpCarry exists: a BACKWARD branch to one of them would arrive with the
-     * value in its register while the instruction there reads the borrow.
-     * Forward branches are caught during the walk, where the fixup already
-     * exists; this catches the rest. */
+    /* Offsets this walk carried a deferred entry into (same reason as fpCarry): a BACKWARD branch there
+     * would arrive with the value in-register while the instruction reads the borrow. Forward branches are caught during the walk; this catches the rest. */
     uint32_t  deferCarry[64];
     unsigned  deferCarryCount;
 } Emit;
@@ -931,38 +610,13 @@ static void emit(Emit *e, uint32_t word) {
 #define JIT_SLOTS_REG (JIT_FIRST_SAVED)
 #define JIT_IDX_REG   (JIT_FIRST_SAVED + 1u)
 #define JIT_LIM_REG   (JIT_FIRST_SAVED + 2u)
-/* The ObjList a list head is walking. A range head has no use for a third
- * register -- see osrReserved -- so this one is numbered after the two a range
- * does keep, and a range's locals begin where it would have been. */
+/* The ObjList a list head is walking. A range head has no use for a third register (see osrReserved),
+ * so this is numbered after the two a range keeps, and a range's locals begin where it would have been. */
 #define JIT_START_REG (JIT_FIRST_SAVED + 3u)
-#define JIT_ITER_REG  (JIT_FIRST_SAVED + 4u)   /* the ObjIter itself */
+#define JIT_ITER_REG  (JIT_FIRST_SAVED + 4u)
 
-/* Registers OSR keeps for itself: the slots pointer, and for a range loop the
- * iterator, its index and its limit.
- *
- * A range loop does not keep the ObjIter in a register. Everything the head
- * needs is read out of it once in the prologue -- index, limit, and the
- * range's start -- and the only later use is writing the index back on the way
- * out, which happens once per exit stub and never in the loop. So it lives in
- * the frame instead, and the operand stack gets a sixth register. That is
- * exactly the amount that was missing: every "more live values" decline in the
- * benchmark suite wanted six and had five. JIT_ITER_REG is therefore the last
- * of the reserved block, so dropping it leaves the rest contiguous.
- *
- * Nor does a range loop keep the START. `for i in a..b` yields `a + index`, so
- * the head used to hold `a` and add it every iteration. Biasing the index and
- * the limit by it in the prologue instead makes the loop variable the index
- * register itself: the add disappears from the loop, and a THIRD register comes
- * back for every range-headed loop in the language -- which is the one that
- * stands between matrix_mul and holding `ai`. The bias runs backwards once per
- * exit, in OSR_SYNC_ITER, because the interpreter's ObjIter::index is
- * zero-based; every exit already reloads the parked ObjIter, so the range and
- * its start are one further load down a path that is not the loop.
- *
- * The bias is only sound while `start + limit` fits an int64, and `limit`
- * saturates at INT64_MAX for a range that spans the whole type. jaiJitEnterOsr
- * refuses to enter such a loop at all, which is where that has to be decided:
- * it is a property of the iterator, not of the code. */
+/* OSR reserves only the slots pointer plus (for a range loop) the iterator's index and limit --
+ * not the ObjIter or the start, which are folded in via a prologue bias. Bias is sound only while start+limit fits int64; jaiJitEnterOsr refuses entry otherwise since that's a property of the iterator, not the code. */
 static unsigned osrReserved(const Emit *e) {
     if (!e->hasIter) return 1u;
     return e->iterKind == 1 ? 3u : 5u;
@@ -978,49 +632,20 @@ static unsigned localReg(const Emit *e, unsigned slot) {
     return JIT_FIRST_SAVED + (slot - e->base);
 }
 
-/* Sixteen bytes each, not eight: the tag travels with the value so a local
- * whose kind varies can be read behind a guard.
- *
- * Every slot keeps a frame home whether or not it also has a register: the
- * dense layout is what makes this one multiply rather than a table, and the
- * few wasted words cost nothing next to the 4095-byte frame limit. */
+/* Sixteen bytes per slot, not eight: the tag travels with the value so a local whose kind varies can
+ * be read behind a guard. Every slot keeps a frame home even with a register too -- dense layout costs one multiply instead of a table, and the wasted words are nothing against the 4095-byte frame limit. */
 static unsigned localFrameOff(const Emit *e, unsigned slot) {
     return e->localsFrameOffset + (slot - e->base) * 16u;
 }
 
-/* A frame home only has to carry a tag when something is going to READ that
- * tag: a slot whose kind is fixed for the whole function has one the deopt
- * stub can rebuild from the kind, so nothing does. That takes a spilled write
- * from three instructions (materialise the tag, store it, store the payload)
- * to one. Only a dynamic slot -- one two paths reached disagreeing about --
- * has a tag that is a run-time fact, and only its reads check it. */
+/* A frame home only needs a stored tag when something will READ it: a fixed-kind slot's tag is
+ * rebuildable by the deopt stub from the kind, cutting a spilled write from three instructions to one. Only a dynamic slot (kind disagrees across paths) has a runtime tag, and only its reads check it. */
 static bool localTagInFrame(const Emit *e, unsigned slot) {
     return e->dynamicLocal[slot];
 }
 
-/* What one access to `slot` would save, in emitted instructions, if the slot
- * had a home in each bank rather than in the frame. Accumulated by the
- * accessors themselves during the measuring pass, so the ranking is charged by
- * what the code generator actually does rather than by a flat per-use
- * constant, and weighted by how deeply nested the loop naming the site is: a
- * site two loops deep is worth sixteen of one outside any loop.
- *
- * The numbers, against a frame home with no tag to store:
- *
- *   localIn      X home saves the `ldr x`;    an FP home replaces it with an
- *                                             `fmov x, d`, so it saves 0.
- *   localOut     X home saves the `str x`;    an FP home replaces it with an
- *                                             `fmov d, x`, so it saves 0.
- *   localInFp    an FP home is BORROWED, so the read disappears entirely and
- *                it saves the `ldr d`; an X home turns it into `fmov d, x`
- *                and saves 0.
- *   localOutFp   both homes are one `fmov`, and so is the `str d` they
- *                replace: 0 either way. What makes a float slot worth a
- *                register is its reads.
- *
- * Zero-saving slots are not merely ranked last, they are excluded: a slot the
- * loop never touches would otherwise take a register on a tie-break and pay a
- * prologue write for a value nothing reads. */
+/* Per-access instruction savings from giving `slot` a register instead of a frame home, accumulated
+ * by the accessors during the measuring pass and weighted by loop nesting. Zero-saving slots are excluded outright, not just ranked last -- otherwise a tie-break could hand a register to a slot the loop never touches, paying a prologue write for nothing. */
 static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
                          unsigned saveFp) {
     if (!e->measuring || e->osr || e->inlining) return;
@@ -1038,8 +663,7 @@ static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
 static void branchOnDeopt(Emit *e, unsigned cond);
 static void fpReleaseHome(Emit *e, unsigned reg);
 
-/* Put the tag for `kind` in `tagReg`. Every kind but SLOT_MAYBE_INST has one
- * fixed at compile time; that one reads it off the payload. */
+/* Every kind but SLOT_MAYBE_INST has a tag fixed at compile time; that one reads it off the payload (null vs non-null). */
 static void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
                        unsigned tagReg, unsigned spare) {
     if (kind != SLOT_MAYBE_INST) {
@@ -1068,10 +692,8 @@ static unsigned localTagFor(const Emit *e, unsigned slot) {
                             : VAL_OBJ;
 }
 
-/* A register holding `slot`'s value. In register mode that is the local's own
- * register and `scratch` goes unused; in memory mode the value is loaded into
- * `scratch`. Only the payload moves: a local's kind is fixed for the whole
- * function, so the tag never needs storing. */
+/* Register mode: the local's own register, `scratch` unused. Memory mode: loaded into `scratch`.
+ * Only the payload moves -- a local's kind is fixed for the whole function, so the tag is never restored. */
 static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
     if (e->osr) {
         if (e->slotXReg[slot] != 0) return e->slotXReg[slot];
@@ -1093,12 +715,8 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         /* Two paths reached here disagreeing about this slot, so what it holds
          * is a runtime fact: check it against what this read was compiled for
          * and hand the instruction back otherwise. */
-        /* Into `scratch`, not a fixed register: the caller has already
-         * given this one up -- it is where the payload is about to land --
-         * whereas JIT_SCRATCH_A may be holding an operand. `i + 1` on a
-         * dynamic slot loaded the tag over the constant and added VAL_INT
-         * instead, so `for j in i + 1..n` ran from i+2 and every nested loop
-         * was one iteration short. */
+        /* Into `scratch`, not JIT_SCRATCH_A, since the caller may already be holding an operand there: this
+         * exact mistake once loaded the tag over the constant on a dynamic slot, so `for j in i + 1..n` silently ran from i+2 and every nested loop was one iteration short. */
         emit(e, jaiA64LdrW(scratch, 31, localFrameOff(e, slot)));
         emit(e, jaiA64SubsXImm(31, scratch, localTagFor(e, slot)));
         branchOnDeopt(e, JAI_A64_NE);
@@ -1107,13 +725,8 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
     return scratch;
 }
 
-/* Where an operation that writes a local should compute its result.
- *
- * Only register-resident locals can be written in place. In OSR mode the
- * locals are the interpreter's slots and `localReg` names a register that is
- * holding something else entirely -- the loop counter, as it turned out. A
- * float add landed in x21 and the induction variable became a bit pattern, so
- * the loop finished early or never finished, depending on the value. */
+/* Only register-resident locals can be written in place. In OSR mode `localReg` would name a register
+ * already holding something else (the loop counter) -- once let a float add land in x21, turning the induction variable into a bit pattern, so the loop finished early or never finished. */
 static unsigned localDest(const Emit *e, unsigned slot) {
     if (e->osr) {
         return e->slotXReg[slot] != 0 ? e->slotXReg[slot] : JIT_SCRATCH_C;
@@ -1124,11 +737,8 @@ static unsigned localDest(const Emit *e, unsigned slot) {
     return localReg(e, slot);
 }
 
-/* A local's X register is about to be written, so no entry may still be
- * borrowing it. Copying it out here is wrong for the reason deoptRecordAt
- * gives -- the write can sit inside a span an earlier branch skips -- so this
- * declines instead. It cannot fire from the whitelist as it stands: no opcode
- * on it writes a local. */
+/* A local's X register is about to be written, so nothing may still be borrowing it. Can't just copy
+ * the borrow out here (same reason as deoptRecordAt: the write can sit inside a span an earlier branch skips) -- declines instead. Can't fire from the whitelist as it stands: no whitelisted opcode writes a local. */
 static void xHomeWritten(Emit *e, unsigned reg) {
     if (e->xBorrow == 0 || reg == 0) return;
     for (unsigned i = 0; i < 32u; i++) {
@@ -1155,8 +765,7 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
             emit(e, jaiA64FmovDX(e->slotFpReg[slot], src));
             return;
         }
-        /* Tag as well as payload: writing straight through is what lets a
-         * deopt here cost nothing. The kind is fixed for the compile. */
+        /* Tag as well as payload, written straight through -- what makes a deopt here free; the kind is fixed for the whole compile. */
         SlotKind k = e->localKind[slot];
         emitTagFor(e, k, src, JIT_SCRATCH_D, JIT_SCRATCH_C);
         emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, slot * 16u));
@@ -1184,12 +793,8 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
     emit(e, jaiA64StrX(src, 31, localFrameOff(e, slot) + 8));
 }
 
-/* The float half of localIn/localOut. A float local reached through the FP
- * bank never visits an X register at all: in memory mode that turns
- * `ldr x; fmov d, x` into one `ldr d` and `fmov x, d; str x` into one `str d`,
- * which is the difference between 14.5ns and 8.5ns an iteration on the
- * mandelbrot recurrence. Only for a local whose kind is fixed -- a dynamic one
- * has a tag to check and goes the ordinary way. */
+/* Float half of localIn/localOut: an FP-bank local never visits an X register at all (memory mode
+ * collapses `ldr x; fmov d,x` to one `ldr d`, and the store side likewise) -- only for a fixed-kind local; a dynamic one has a tag to check and goes the ordinary (X) way. */
 static void localInFp(Emit *e, unsigned slot, unsigned dst) {
     if (e->osr) {
         if (e->slotFpReg[slot] != 0) {
@@ -1268,15 +873,12 @@ static void localOutFp(Emit *e, unsigned slot, unsigned src) {
     emit(e, jaiA64StrD(src, 31, localFrameOff(e, slot) + 8));
 }
 
-/* Slots the body may name at all. */
 static bool localInRange(Emit *e, unsigned slot) {
     if (e->osr) {
         if (slot >= e->locals) return false;
         if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
-        /* Which slots deserve the registers. A site inside a nested loop is
-         * worth four of one outside it -- the alternative, counting sites
-         * flat, gives `width` and `height` the same claim as the recurrence
-         * variable they are read once per row to set up. */
+        /* Nested-loop sites are worth more: flat counting would give `width`/`height` (read once per row)
+         * the same claim as the recurrence variable read every iteration. */
         if (e->measuring && !e->inlining && e->loopDepth != NULL &&
             e->curOffset < e->loopDepthCount && slot <= JIT_MAX_SLOTS) {
             unsigned d = e->loopDepth[e->curOffset];
@@ -1290,7 +892,6 @@ static bool localInRange(Emit *e, unsigned slot) {
     return true;
 }
 
-/* Slots whose value this call can be looked at, for type feedback. */
 static bool localObserved(Emit *e, unsigned slot) {
     if (e->osr) return slot < e->locals;
     if (slot < e->base || slot > e->arity) return false;
@@ -1298,21 +899,12 @@ static bool localObserved(Emit *e, unsigned slot) {
     return true;
 }
 
-/* The register a new value entry would occupy. */
 static unsigned closureReg(const Emit *e) {
     return JIT_FIRST_SAVED + regBase(e);
 }
 
-/* The X register value entry `idx` belongs in, counting from the bottom of the
- * operand stack rather than from the top the way pushReg does.
- *
- * An inlined body gets a bank of its own. It cannot call anything -- that is
- * the first thing inlinableBody checks -- so every register a call would
- * destroy is free for the whole of it, and its temporaries cost the caller no
- * callee-saved register at all. That is not a refinement: `evalA` inlined into
- * spectral's inner loop wants eight live values where the OSR form had six
- * left, so without this it does not fit and is not inlined. x9..x12 stay out
- * of it, being the emitter's own scratches. */
+/* Counts from the bottom of the operand stack, not the top (unlike pushReg). An inlined body gets its
+ * own bank (x0..x8, minus the emitter's x9..x12 scratches): it can't call anything, so every caller-saved register is free and costs the caller nothing -- `evalA` inlined into spectral's inner loop needs eight live values where the OSR form had only six left, so without this it wouldn't fit. */
 #define JIT_INL_BANK   0u    /* x0..x8, all caller-saved */
 #define JIT_INL_COUNT  9u
 
@@ -1323,9 +915,8 @@ static unsigned valueXReg(const Emit *e, unsigned idx) {
     return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) + idx;
 }
 
-/* One past the top entry's register. Every `pushReg(e) - 1` in this file means
- * "the entry just pushed", and expressing it this way rather than from the
- * bottom is what keeps that idiom true across the two banks. */
+/* One past the top entry's register. Expressing it this way (not from the bottom) is what keeps
+ * `pushReg(e) - 1` == "the entry just pushed" true across both register banks. */
 static unsigned pushReg(const Emit *e) {
     if (e->valueDepth == 0) return valueXReg(e, 0);
     return valueXReg(e, e->valueDepth - 1) + 1;
@@ -1342,15 +933,13 @@ static unsigned fpRegAt(const Emit *e, unsigned idx) {
     return JIT_FP_BANK + idx;
 }
 
-/* The d register entry `idx` is actually in: its own, or the local's it
- * borrowed. Every READ of a live FP entry goes through this; the writes keep
- * naming fpRegAt, which is what a borrow is released back into. */
+/* The d register entry `idx` is actually in: its own, or a borrowed local's. Every READ of a live FP
+ * entry goes through this; writes keep naming fpRegAt, which is what a borrow releases back into. */
 static unsigned fpHeldIn(const Emit *e, unsigned idx) {
     if (e->fpBorrow & (1u << idx)) return e->fpBorrowReg[idx];
     return fpRegAt(e, idx);
 }
 
-/* Put entry `idx` back where every other part of this file expects it. */
 static void fpSyncOne(Emit *e, unsigned idx) {
     if (!(e->fpLive & (1u << idx))) return;
     unsigned d = fpHeldIn(e, idx);
@@ -1387,18 +976,16 @@ static void fpSyncAll(Emit *e) {
     for (unsigned i = 0; i < 32u; i++) fpSyncOne(e, i);
 }
 
-/* A d register holding entry `idx`, loaded from its X register if that is
- * where it still is. Leaves fpLive alone: after this the two copies agree, and
- * claiming the X one is stale when it is not would cost a sync for nothing. */
+/* d register holding entry `idx`, loaded from X if that's where it still lives. Leaves fpLive
+ * untouched -- the two copies now agree, and marking the X copy stale when it isn't would cost a needless sync. */
 static unsigned xHeldIn(Emit *e, unsigned idx);
 
 static unsigned fpOperand(Emit *e, unsigned idx) {
     if (e->fpBorrow & (1u << idx)) return e->fpBorrowReg[idx];
     unsigned d = fpRegAt(e, idx);
     if (!(e->fpLive & (1u << idx))) {
-        /* xHeldIn, not valueXReg: a float entry that is a plain read of a
-         * local held in an X register is in THAT register, and reading its
-         * own would read whatever the bank last had. */
+        /* xHeldIn, not valueXReg: a float entry that's a plain read of an X-resident local lives in THAT
+         * register; reading its own would read whatever the bank last held. */
         emit(e, jaiA64FmovDX(d, xHeldIn(e, idx)));
     }
     return d;
@@ -1411,81 +998,30 @@ static void fpClaim(Emit *e, unsigned idx) {
     e->fpBorrow &= ~(1u << idx);
 }
 
-/* Entry `idx` is a read of a float local that lives in `reg`, and is held
- * there rather than copied. */
 static void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
     e->fpLive |= 1u << idx;
     e->fpBorrow |= 1u << idx;
     e->fpBorrowReg[idx] = (uint8_t)reg;
 }
 
-/* Where a float operator whose result goes straight into a local should
- * compute it.
- *
- * A `*_BIND` used to put its result in the operand stack's bank and then `fmov`
- * that into the local's home: `fmul d17, d8, d8` then `fmov d10, d17`. The
- * second instruction is the whole of the difference, and five of mandelbrot's
- * 31 inner instructions were that trailing `fmov`. Naming the home as the
- * operator's destination deletes it.
- *
- * Two things make it safe, and both are about ordering:
- *
- *  - The borrow release happens HERE, before the operator, not in localOutFp
- *    afterwards. An entry borrowing the home wants the value that was in it
- *    when the borrow was taken; once the operator has written its result that
- *    value is gone, so a release afterwards copies the wrong number. This is
- *    the same rule the FP borrow already follows for a guard, for the same
- *    reason: a release has to be where the thing it protects has not happened.
- *  - The operator may name the home among its own sources -- `sum += x` and
- *    `let x2 = x * x` both do -- because an arm64 arithmetic instruction reads
- *    its sources before writing its destination, and the release above has
- *    already taken any copy that was owed.
- *
- * When the local has no d register the bank is returned unchanged, so callers
- * keep one shape: localOutFp sees `src == home` and emits nothing in the first
- * case, and does its ordinary store in the second. */
+/* Float op writing straight to a local's home instead of the bank + fmov (saves the trailing `fmov`
+ * on every `*_BIND`). Safe only because the borrow release happens HERE, before the operator, not after in localOutFp -- a borrower wants the pre-operator value, and since arm64 reads sources before writing its destination, `sum += x` naming the home among its own sources is fine once the borrow is already released. No FP register on the local: bank returned unchanged, so callers see one shape either way. */
 static unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank) {
     if (!e->osr || e->slotFpReg[slot] == 0) return bank;
     fpReleaseHome(e, e->slotFpReg[slot]);
     return e->slotFpReg[slot];
 }
 
-/* The same trick one instruction of lookahead further out: an unfused float
- * operator whose result the NEXT instruction binds to a local.
- * `y = 2.0 * xy + y0` is `OP_ADD` then `OP_BIND`, and the bind was an `fmov`
- * out of the bank into the home. Answering the operator's destination question
- * with the home makes the bind emit nothing.
- *
- * The operator's result entry is then marked as BORROWING the home, which is
- * exactly what it is: a value living in a register that is also a local's, with
- * the whole file's existing rule that anything about to write that register
- * copies the borrowers out first. OP_BIND's float arm reads it through
- * fpHeldIn, sees the home, and its `localOutFp(slot, home)` is a no-op.
- *
- * What has to be true, and how each part is enforced:
- *
- *  - Nothing between the operator and the bind may deopt or bail, because
- *    between them the LOCAL holds its new value while the bytecode says it
- *    still holds its old one. Only an OP_TYPE_GUARD is allowed in the gap, and
- *    only one whose kind is already settled, which emits no instruction at all
- *    and records nothing.
- *  - Nothing may branch to the bind. A path arriving there did not run the
- *    operator, so it needs the `fmov` that is no longer emitted. Recorded in
- *    `homeEarly` and checked against every fixup after the walk, which is the
- *    only point at which a back edge to it is known.
- *  - The local must be the sole owner of that d register for the gap, which
- *    fpBindDest's release establishes before the operator runs.
- *
- * Returns 0 when none of that holds, which is the ordinary answer. */
+/* Fuses an OP_ADD/OP_SUB immediately followed by OP_BIND to a float local, by aiming the operator's
+ * result straight at the local's home register instead of the bank + fmov. Only safe when nothing between them can deopt/branch into the gap (tracked via homeEarly, checked against fixups post-walk) and fpBindDest already gave the local sole ownership of the register. Returns 0 (ordinary path) otherwise. */
 static unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
                                 int stop, const ObjFunction *fn,
                                 uint32_t *bindOffOut) {
     if (!e->osr || e->fpOff || e->inlining) return 0;
     if (e->homeEarlyCount >= 32) return 0;
     if (next < stop && code[next] == OP_TYPE_GUARD) {
-        /* Only the settled form. A guard that has to widen an int emits a
-         * `scvtf`, but then the entry it names is an int and this arm was
-         * never reached; a guard naming any other type declines below. */
+        /* Only the settled form: a guard that widens an int emits `scvtf` (making the entry an int, so this
+         * arm is never reached); a guard naming any other type declines below. */
         if (next + 4 > stop) return 0;
         uint32_t idx = jaiReadU24(code + next + 1);
         if (idx >= (uint32_t)fn->chunk.constants.count) return 0;
@@ -1514,10 +1050,8 @@ static bool anyDeferred(const Emit *e) {
     return (e->kPend | e->xBorrow) != 0;
 }
 
-/* Put entry `idx` in its own register, so every other part of this file finds
- * it where it expects to. Both forms are one instruction, and neither touches
- * NZCV -- movz/movk and `orr xd, xzr, xs` -- so this is still safe between a
- * compare and the branch that reads its flags. */
+/* Puts entry `idx` in its own register. Both forms are one instruction and neither touches NZCV
+ * (movz/movk, or `orr xd,xzr,xs`), so this stays safe between a compare and the branch reading its flags. */
 static void settleEntry(Emit *e, unsigned idx) {
     if (e->kPend & (1u << idx)) {
         e->kPend &= ~(1u << idx);
@@ -1536,32 +1070,27 @@ static void settleAll(Emit *e) {
     for (unsigned i = 0; i < 32u; i++) settleEntry(e, i);
 }
 
-/* The register entry `idx` may be READ from. A borrow answers with the local's
- * own register and costs nothing; a pending constant has to be materialised
- * first, which is exactly the instruction the deferral was trying to avoid --
- * so an arm that can fold checks kPend before it asks. */
+/* Register entry `idx` may be READ from. A borrow answers with the local's own register for free; a
+ * pending constant must first be materialised -- exactly the instruction deferral was avoiding -- so an arm that can fold checks kPend before calling this. */
 static unsigned xHeldIn(Emit *e, unsigned idx) {
     if (e->xBorrow & (1u << idx)) return e->xBorrowReg[idx];
     if (e->kPend & (1u << idx)) settleEntry(e, idx);
     return valueXReg(e, idx);
 }
 
-/* The X register a local permanently lives in, or 0 when it lives nowhere a
- * stack entry could borrow: a spilled frame slot, or an OSR slot the register
- * plan left in memory. */
+/* X register a local permanently lives in, or 0 when it lives nowhere a stack entry could borrow
+ * (a spilled frame slot, or an OSR slot the register plan left in memory). */
 static unsigned localHomeX(const Emit *e, unsigned slot) {
     if (e->osr) return e->slotXReg[slot];
     if (e->spilled) return 0u;
     return localReg(e, slot);
 }
 
-/* Entry `idx` is a read of an int-like local that lives in `reg`. */
 static void xBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
     e->xBorrow |= 1u << idx;
     e->xBorrowReg[idx] = (uint8_t)reg;
 }
 
-/* Entry `idx` is the integer `k`, not yet in any register. */
 static void kPendLocal(Emit *e, unsigned idx, int64_t k) {
     e->kPend |= 1u << idx;
     e->kPendVal[idx] = k;
@@ -1648,9 +1177,8 @@ static SlotKind knownFieldKind(const Emit *e, int local, uint16_t field) {
     return SLOT_SELF;
 }
 
-/* Record a store, and drop what any other receiver claimed about the same
- * field: two locals can name the same object, so a store through one has to
- * retire the other's knowledge. */
+/* Records a store and drops what any OTHER receiver claimed about the same field: two locals can
+ * alias the same object, so a store through one must retire the other's knowledge of it. */
 static void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) {
     unsigned out = 0;
     for (unsigned i = 0; i < e->knownCount; i++) {
@@ -1672,7 +1200,6 @@ static bool pushSelf(Emit *e) {
     return true;
 }
 
-/* Pop a value entry, reporting the register it was in and what it held. */
 /* Pop an entry that has already been read out of its FP register, or that was
  * never in one. Only the float paths may call this; everything else goes
  * through popValue, which materialises first. */
@@ -1689,12 +1216,8 @@ static bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     return true;
 }
 
-/* Pop, reporting the register the value is ACTUALLY in. For a borrowed entry
- * that is the local's own register, which is what removes the copy: every arm
- * that pops its operands and computes into `pushReg(e) - 1` reads one place
- * and writes another, so it needs no change at all to be right. An arm that
- * wrote back into a popped register would not -- there is none, and the
- * whitelist is what keeps it that way. */
+/* Pops, reporting the register the value is ACTUALLY in -- a borrowed entry reports the local's own
+ * register, removing the copy, since every arm reads one register and writes `pushReg(e)-1`. No arm writes back into a popped register; the whitelist is what keeps that true. */
 static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
     if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
     fpSyncOne(e, e->valueDepth - 1);
@@ -1723,8 +1246,6 @@ static uint32_t stackSignature(const Emit *e) {
 /* Constants                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Materialise a full 64-bit constant. One instruction for the small cases
- * that matter (`n < 2`, `n - 1`), up to four for anything else. */
 static void emitConst64(Emit *e, unsigned rd, int64_t value) {
     if (value >= 0 && value <= 0xffff) {
         emit(e, jaiA64MovzX(rd, (unsigned)value, 0));
@@ -1760,22 +1281,8 @@ static void emitSaveRestore(Emit *e, bool save) {
     }
 }
 
-/* STP's pre-index immediate is a signed seven-bit field scaled by eight, so it
- * reaches -512 and no further. Past that the stack pointer has to move on its
- * own: the encoder truncates silently, so a 528-byte frame moved SP by 16 and
- * every write meant for the frame landed in the caller's, which showed up as a
- * failed stack check inside `jaiJitEnter` with nothing wrong at the crash site.
- * nbody's `advance` is the first body big enough to want one -- twelve spilled
- * locals and a call descriptor come to 528.
- *
- * The field is signed, so the pre-index going in reaches -512 but the post-index
- * coming out reaches only +504: `imm / 8` is 64 for 512, and 64 read back as a
- * signed seven-bit field is -64. A 512-byte frame therefore passed the test on
- * the way in and truncated on the way out, emitting `ldp x29, x30, [sp], #-512`.
- * That restores the right x30 and returns correctly, having moved the stack
- * pointer a kilobyte the wrong way, so the crash lands somewhere else entirely
- * in a caller whose frame is gone. Both ends ask the same question here so they
- * cannot disagree; whether any body lands on exactly 512 is a matter of luck. */
+/* STP's pre-index immediate is a signed 7-bit field scaled by 8: reaches -512 going in but only +504
+ * coming out (imm/8=64 read back as a signed 7-bit field is -64), so an exactly-512-byte frame passed entry and silently truncated on exit -- `ldp x29,x30,[sp],#-512` moves SP a kilobyte the WRONG way, corrupting a caller's frame instead of crashing at the fault site. framePairFits()'s <=504 bound is what both ends agree on. */
 static bool framePairFits(const Emit *e) { return e->frameBytes <= 504u; }
 
 static void emitFrameEnter(Emit *e) {
@@ -1796,11 +1303,8 @@ static void emitFrameLeave(Emit *e) {
     emit(e, jaiA64AddXImm(31, 31, e->frameBytes));
 }
 
-/* The float half of the save set. v8..v15 are callee-saved only in their low
- * 64 bits, which is exactly what a double is, so `str d`/`ldr d` is the whole
- * protocol. Two instructions each rather than a paired form because there is
- * no STP for FP in this encoder and this runs once per entry and once per way
- * out, never in a loop. */
+/* v8..v15 are callee-saved only in their low 64 bits -- exactly a double -- so `str d`/`ldr d` is the
+ * whole protocol; no FP STP in this encoder, but it only runs once per entry/exit, never in a loop. */
 static void emitFpSaveRestore(Emit *e, bool save) {
     for (unsigned i = 0; i < e->fpLocals; i++) {
         unsigned r = JIT_FP_FIRST_SAVED + i;
@@ -1838,10 +1342,8 @@ static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
 static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    /* A join has to agree about where every value is, so nothing crosses a
-     * branch in an FP register, and nothing crosses one deferred either.
-     * Neither fmov nor mov nor movz touches NZCV, so this is still safe after
-     * the compare that set the condition. */
+    /* A join must agree where every value is: nothing may cross a branch in an FP register or deferred.
+     * Settling here stays safe after a compare, since neither fmov, mov, nor movz touches NZCV. */
     fpSyncAll(e);
     settleAll(e);
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
@@ -1856,13 +1358,8 @@ static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
     emit(e, conditional ? jaiA64BCond(cond, 0) : jaiA64B(0));
 }
 
-/* A guard failed: hand this exact point to the interpreter.
- *
- * Not a bail. A bail re-runs the call from the top, which stops being sound
- * the moment the body has written anything -- and the guards that matter are
- * on field reads inside loops that write. This records where the interpreter
- * should pick up and what it should be holding; the stub that writes it out is
- * emitted after the body, so the hot path keeps one not-taken branch. */
+/* A guard failed: not a bail (unsound once the body has written anything, and the guards that matter
+ * guard field reads inside loops that write) -- records where the interpreter resumes and what it holds; the stub is emitted after the body so the hot path keeps one not-taken branch. */
 static bool jitDeoptStress(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -1872,28 +1369,8 @@ static bool jitDeoptStress(void) {
     return cached != 0;
 }
 
-/* Where a guard here has to send the interpreter, and what it must be holding.
- *
- * Inside an inlined body neither is the model's current state: the call has
- * not happened as far as the interpreter is concerned, so it resumes at the
- * OP_CALL holding the callee and its arguments, and every entry the inlined
- * body has pushed above them -- its own locals and temporaries -- is not part
- * of the picture.
- *
- * And outside one it is still not the model's current state, because a guard
- * sits PART-WAY THROUGH an instruction. `OP_GET_LOCAL2` pushes its operand and
- * then guards that operand's tag, so by the time the guard is written the model
- * is two entries deeper than the interpreter's stack is at that offset. The
- * interpreter resumes at the instruction's start and pushes those entries
- * itself; handing them to it as well leaves them stranded underneath, and a
- * `for` whose iterator is two entries down reads the loop variable as its
- * iterator. `instDepth` is the model at the instruction's start, which is
- * exactly what the interpreter holds there.
- *
- * Only entries this instruction pushed can be dropped and they are the topmost
- * ones, so every entry that remains keeps the register it was assigned. The
- * other direction -- an instruction that has already popped an entry the
- * interpreter still holds -- cannot be repaired by trimming and is refused. */
+/* Neither an inline's state nor mid-instruction state is the model's actual current state. Inside an
+ * inline the interpreter hasn't made the call yet, so it resumes at OP_CALL holding just callee+args, not the inlined body's locals/temporaries. Outside one, a guard mid-instruction (OP_GET_LOCAL2 pushes then guards) leaves the model deeper than the interpreter's stack there -- handing over those extra entries strands them, and a loop can read its own iterator as its loop variable. `instDepth` is the model at the instruction's START, matching the interpreter; only entries THIS instruction pushed (the topmost) may be trimmed back to it -- an instruction that already popped something the interpreter still holds cannot be repaired and is refused. */
 static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
                       unsigned *depthOut, unsigned *valueDepthOut) {
     if (e->inlining) {
@@ -1914,20 +1391,8 @@ static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
      * already on the stack -- is describing a point this walk has not reached
      * and `instDepth` says nothing about it. */
     if (ip != e->curOffset) return true;
-    /* OP_BUILD_RANGE emits nothing: the range is deferred and folded into the
-     * OP_GET_ITER that must follow it, which builds the iterator straight from
-     * the two integers. So at this offset the model holds `start` and `stop`
-     * while the INTERPRETER holds the range object OP_BUILD_RANGE gave it, and
-     * a record taken here handed it two ints where it expected one range -- it
-     * resumed, executed OP_GET_ITER, and reported `'int' object is not
-     * iterable`. The answer is to resume one instruction EARLIER, at the
-     * OP_BUILD_RANGE the model still describes: nothing between the two has
-     * run, and re-executing it just builds the range the interpreter wants.
-     *
-     * Nothing reached this until a guard could be emitted inside the header
-     * itself, which the root fill for the iterator's own descriptor does as
-     * soon as one of the locals it roots is dynamic. It reproduces on a body
-     * with no spilling and no floats at all. */
+    /* OP_BUILD_RANGE emits nothing (deferred, folded into the following OP_GET_ITER), so a deopt record
+     * taken at this offset would hand the interpreter two ints where it expects the range object -- it resumed, ran OP_GET_ITER, and reported 'int' object is not iterable. Fix: resume one instruction EARLIER, at the OP_BUILD_RANGE the model still describes (nothing between them has run). Reachable once a guard can fire inside the header itself, e.g. via root-filling a dynamic-local iterator descriptor; needs no spilling and no floats to reproduce. */
     if (e->pendingRange) {
         *ipOut = e->rangeBuildIp;
         *depthOut = e->instDepth;
@@ -1958,25 +1423,15 @@ static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
  * cold block, which lives with the stubs -- still has to record here. */
 static bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
                           unsigned *out) {
-    /* A deopt stub writes every entry out of fpRegAt, so nothing may still be
-     * borrowing a local's register here. Releasing it at this point was tried
-     * and is wrong: a guard is often emitted inside a span some earlier branch
-     * skips over -- emitBoundsNormalise's is -- so the fmov would land on a
-     * path that is not taken and matrix_mul read `sum` from a register nothing
-     * had written. The release happens at the top of the instruction instead,
-     * where it is unconditionally on the path; this is the assertion that it
-     * did, and it declines rather than miscompiles if some opcode is reached
-     * that fpBorrowSurvives should not have allowed through. */
+    /* Assertion, not the fix: a deopt stub writes every entry out of fpRegAt, so nothing may still be
+     * borrowing a local's register here. Releasing HERE (rather than at the top of the instruction) was tried and is wrong -- a guard can sit inside a span an earlier branch skips (emitBoundsNormalise's does), so the fmov landed on a not-taken path and matrix_mul read `sum` from a register nothing had written. Declines rather than miscompiles if fpBorrowSurvives let something through it shouldn't have. */
     if (e->fpBorrow != 0) {
         e->whyNot = "a float borrow reached a guard";
         e->failed = true;
         return false;
     }
-    /* And for exactly the same reason, nothing may still be a pending constant
-     * or be borrowing a local's X register. Settling here is wrong for the
-     * same reason it is wrong for a float borrow -- the guard may sit inside a
-     * span an earlier branch skips -- so this is the assertion that the
-     * whitelist held, and it declines rather than miscompiling if it did not. */
+    /* Same reasoning as above, for a pending constant or X-register borrow: an assertion that the
+     * whitelist held, declining rather than miscompiling if it didn't. */
     if (anyDeferred(e)) {
         e->whyNot = "a deferred value reached a guard";
         e->failed = true;
@@ -2055,10 +1510,8 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
     }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
-    /* JAITHON_JIT_DEOPT_STRESS makes every guard fail. Compiled code then
-     * deoptimises at the first one it meets, so the whole test suite becomes a
-     * test of the resume path -- which is otherwise reached only when a
-     * program changes a field's type, and almost none do. */
+    /* JAITHON_JIT_DEOPT_STRESS makes every guard fail, so the whole test suite exercises the resume path
+     * -- otherwise reached only when a program changes a field's type, which almost none do. */
     bool always = jitDeoptStress();
     e->fixups[e->fixupCount].conditional  = !always;
     e->fixups[e->fixupCount].depth        = -1;
@@ -2068,22 +1521,12 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
 
 /* Branch to the bail block on `cond`. The block's index is not known yet, so
  * it is patched with the rest. */
-/* Comparing a NaN is a TypeError here, not false: the interpreter tests isnan
- * before it compares, and falls through to the slow path that raises. fcmp
- * reports unordered in V, so an unordered result goes back to the interpreter
- * to raise exactly what it would have raised. */
+/* NaN comparison is a TypeError here, not false, matching the interpreter's isnan check: fcmp sets V
+ * on an unordered result, and that's routed to a deopt so the interpreter raises exactly what it would have. */
 static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
-/* An ObjList's `items` and its count in one `ldp`.
- *
- * `rCount` comes back holding `count | capacity << 32`, not the count, because
- * the two int32s share the pair's second doubleword. Everything that reads it
- * must therefore use the uxtw forms -- emitBoundsNormalise(.., true) is the
- * only caller, and it is the only place a count is wanted.
- *
- * The layout is the whole basis of the instruction, so it is asserted rather
- * than assumed: a field reordered in object.h would otherwise load a pointer
- * as a count and index off the end of the array. */
+/* items+count via one ldp: rCount comes back as `count | capacity << 32` (the two int32s share the
+ * pair's second doubleword), so every reader must use the uxtw forms. Layout is asserted below, not assumed -- a field reordered in object.h would load a pointer as a count and index off the end of the array. */
 static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount) {
     _Static_assert(offsetof(ObjList, count) == offsetof(ObjList, items) + 8,
@@ -2094,35 +1537,15 @@ static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                          (int32_t)offsetof(ObjList, items)));
 }
 
-/* `jaiNormalizeIndex` and the bounds test in one, leaving the settled index in
- * `rOut`. `rCount` must hold a zero-extended 32-bit count, which is what an
- * `ldrw` of ObjList.count or ObjString.length gives, so one *unsigned* compare
- * answers both ends: a negative index is a huge unsigned and fails the same
- * test an index past the end does.
- *
- * That is four instructions on the path every real loop takes, against the
- * seven the signed form needed -- and indexing was 42 of the 62 instructions in
- * matrix_mul's innermost body, three of these back to back. `xs[-1]` is still
- * exact; it just walks the three instructions the branch skips.
- *
- * `countW` says the count is only the LOW HALF of `rCount`, which is what the
- * `ldp` of an ObjList header leaves: `count | capacity << 32`. Every read of it
- * then goes through the uxtw form, which costs nothing -- the extension is a
- * field of the instruction that was running anyway -- and saves the separate
- * `ldr w` the pair replaced. A caller whose count came from `ldr w` passes
- * false and gets the plain register form; both are correct for that case, and
- * keeping them apart means an ObjString's `length`, which has no capacity above
- * it, is not silently relying on whatever follows it in the struct. */
+/* Normalises the index and bounds-checks it in one unsigned compare: a negative index is a huge
+ * unsigned value and fails the same test as one past the end. `countW` means rCount's low half only, as an ObjList header `ldp` leaves it (`count | capacity << 32`) -- every read goes through uxtw; an ObjString length (no capacity above it) passes false and uses the plain register form instead. */
 static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
                                 unsigned rOut, bool countW) {
     emit(e, jaiA64MovX(rOut, rIdx));
     emit(e, countW ? jaiA64SubsXUxtw(31, rOut, rCount)
                    : jaiA64SubsXReg(31, rOut, rCount));
-    /* The skip used to be a hand-counted four instructions. branchOnDeopt is
-     * allowed to emit -- it releases FP borrows so the stub can find every
-     * entry -- and one extra instruction inside the span turned the skip into
-     * a jump onto the bail branch, which read `sum` from a register nothing
-     * had written. Measuring the span is the same instruction and cannot rot. */
+    /* Skip length used to be hand-counted (four instructions) -- branchOnDeopt may itself emit an FP-
+     * borrow release, and one extra instruction inside the span turned the skip into a jump onto the bail branch (same matrix_mul `sum`-from-nothing bug as deoptRecordAt). Measured with `e->count`, so it can't rot. */
     unsigned skip = e->count;
     emit(e, jaiA64BCond(JAI_A64_LO, 0));
     emit(e, countW ? jaiA64AddXUxtw(rOut, rOut, rCount)
@@ -2147,13 +1570,8 @@ static void branchOnCondition(Emit *e, unsigned cond) {
     emit(e, jaiA64BCond(cond, 0));
 }
 
-/* Overflow goes to a per-operator stub that throws, not to the bail block.
- *
- * `cond` is not always VS. adds and subs set the overflow flag, but the
- * multiply test is a comparison of the product's high half against the low
- * half's replicated sign, so its answer is NE. Routing it through VS meant
- * multiply overflow was simply never detected -- 4 * 2^62 came back as 0
- * instead of raising, which is a wrong answer, not a crash. */
+/* `cond` isn't always VS: adds/subs set the overflow flag, but the multiply test compares the
+ * product's high half against the low half's replicated sign, so its answer is NE -- routing multiply through VS meant its overflow was never detected (4 * 2^62 silently came back as 0). */
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     fpSyncAll(e);
@@ -2180,8 +1598,6 @@ static bool negatedCondition(uint8_t cmp, unsigned *out) {
     }
 }
 
-/* Does this OP_GET_GLOBAL name the function being compiled? */
-/* The class a global names, or NULL when it names something else. */
 static ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     ObjFunction *fn = closure->fn;
     if (fn->module == NULL) return NULL;
@@ -2193,7 +1609,6 @@ static ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
 }
 
-/* The global function a name refers to, or NULL. */
 static ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
                                    Value *out) {
     ObjFunction *fn = closure->fn;
@@ -2208,10 +1623,8 @@ static ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
     return AS_CLOSURE(bound)->fn;
 }
 
-/* A builtin, resolved the way the interpreter resolves one: the module first,
- * and `vm.builtins` only when the module has no such name. A module-level
- * binding of the same name is therefore never mistaken for the builtin, and if
- * one appears later the module's version retires this compiled form. */
+/* Resolved the way the interpreter resolves a builtin: the module first, `vm.builtins` only when the
+ * module has no such name -- a module-level binding is never mistaken for it, and if one appears later the module's version retires this compiled form. */
 static ObjNative *globalNative(ObjClosure *closure, uint32_t nameIdx,
                                Value *out) {
     ObjFunction *fn = closure->fn;
@@ -2244,14 +1657,8 @@ static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
 /* Module globals                                                       */
 /* ------------------------------------------------------------------ */
 
-/* The storage for a module global, or NULL when the name has none here.
- *
- * A JaiEntry's address is stable for as long as the table does not rehash,
- * delete or clear -- jaiTableSetInterned reaches ensureRoom only when it is
- * about to insert a NEW key, so overwriting an existing global never moves
- * anything. That is what makes a compiled load one `ldr` from a baked pointer
- * rather than a probe. `JaiTable.keyVersion` counts every event that breaks
- * it, and emitGlobalsGuard checks it. */
+/* A JaiEntry's address is stable as long as the table doesn't rehash/delete/clear -- overwriting an
+ * existing global never moves it (ensureRoom only runs for a NEW key) -- which is what lets a compiled load be one `ldr` from a baked pointer. `keyVersion` counts every event that breaks this; emitGlobalsGuard checks it. */
 static JaiEntry *globalSlot(Emit *e, ObjClosure *closure, uint32_t nameIdx,
                             Value *out) {
     ObjFunction *fn = closure->fn;
@@ -2273,14 +1680,8 @@ static JaiEntry *globalSlot(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     return slot;
 }
 
-/* The table has not rehashed since this was compiled, so every baked slot
- * address is still the live storage for the name it came from.
- *
- * Emitted before EVERY access rather than hoisted. Hoisting is sound only with
- * a claim about control flow -- a call-out between a guard and a later access
- * on a back edge would be unguarded -- and the cheap version of that claim is
- * the kind of reasoning this file has been bitten by. Measured cost is in the
- * plan; it is four instructions on a predictable branch. */
+/* Emitted before EVERY access, not hoisted: hoisting is sound only given a control-flow claim (no
+ * call-out between a guard and a later access on a back edge) -- exactly the kind of reasoning this file has been bitten by before. Costs four instructions on a predictable branch. */
 static void emitGlobalsGuard(Emit *e) {
     uint32_t at = e->globalsKeyVersion;
     emitConst64(e, JIT_SCRATCH_D,
@@ -2295,17 +1696,8 @@ static void emitGlobalsGuard(Emit *e) {
     branchOnDeopt(e, JAI_A64_NE);
 }
 
-/* `m->version` retires the caches that resolved a NAME to a heap object or to
- * presence: the interpreter's global inline cache (which stores an entry
- * index, so a value write cannot invalidate it), OP_FORMAT's "is `str` still
- * the builtin", and this tier's own baked classes, closures and natives --
- * every one of which required the bound value to BE a heap object.
- *
- * So a store that replaces a non-object with a non-object changes nothing any
- * of them cached, and may skip the bump. That matters a great deal: the bump
- * is what makes `total = total + 1` at module scope retire every compiled
- * function in the module, measured at 6.0M declined entries and 19% of the
- * running time on a Point-allocating loop. */
+/* `m->version` retires every cache that resolved a NAME to a heap object or presence (interpreter's
+ * global inline cache, OP_FORMAT's builtin-str check, this tier's baked classes/closures/natives) -- all of which required the bound value to BE a heap object. A store replacing a non-object with a non-object changes none of them and may skip the bump; getting this wrong made `total = total + 1` at module scope retire every compiled function in the module. */
 static void emitVersionBump(Emit *e, ObjModule *m) {
     emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&m->version);
     emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
@@ -2313,18 +1705,8 @@ static void emitVersionBump(Emit *e, ObjModule *m) {
     emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
 }
 
-/* The stack kind a recorded OP_INVOKE result predicts, and the tag a guard
- * must see for it to hold. False when the tier has no use for the byte --
- * never observed, mixed, null, or something whose kind carries more than the
- * byte does.
- *
- * SLOT_INST is deliberately absent. It carries a class shape, and this byte
- * names only the object type, so admitting it would silently lose the shape
- * every field offset in the body was resolved against.
- *
- * A class, a closure and a native are absent for the same reason globalKind
- * leaves them out: they have stack kinds of their own that occupy no register,
- * and SLOT_OBJ would be a worse answer than declining. */
+/* Predicted stack kind + guard tag for a recorded OP_INVOKE result; false when the tier has no use
+ * for the byte. SLOT_INST is deliberately excluded: it carries a class shape this byte can't encode, and admitting it would silently lose the shape every field offset was resolved against. Class/closure/native excluded too -- they have register-free stack kinds of their own. */
 static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
     switch (fb) {
     case 1u + VAL_INT:   *k = SLOT_INT;   *tag = VAL_INT;   return true;
@@ -2349,8 +1731,6 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
     return true;
 }
 
-/* The kind a global's live value has, or false when the tier has no kind for
- * it. Read off the value the way a parameter is seeded. */
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     *shape = 0; *kls = NULL;
     if (IS_INT(v))      { *k = SLOT_INT;   return true; }
@@ -2363,10 +1743,8 @@ static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
         *k = SLOT_INST; *kls = inst->klass; *shape = inst->klass->shapeId;
         return true;
     }
-    /* Anything else on the heap -- a dict, a string, a closure -- can be
-     * loaded, passed and stored, and nothing else. A class, a function and a
-     * native never reach here: OP_GET_GLOBAL resolves those to their own stack
-     * kinds above, which occupy no register. */
+    /* Anything else on the heap (dict, string, closure) can be loaded, passed and stored, nothing else.
+ * A class, function or native never reach here: OP_GET_GLOBAL resolves those to their own register-free stack kinds first. */
     if (IS_OBJ(v) && AS_OBJ(v) != NULL && !IS_CLASS(v) && !IS_CLOSURE(v) &&
         !IS_NATIVE(v)) {
         *k = SLOT_OBJ; return true;
@@ -2377,15 +1755,8 @@ static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
 /* A callee that is not this function: only a class, whose result is an
  * instance of a shape known here. Anything else would need a guard on a return
  * value nothing can predict. */
-/* An initializer that does nothing but store its arguments into fields, in
- * order: `GET_LOCAL2 0 k; SET_FIELD f` repeated, then RETURN_NULL. Anything
- * else -- a default, a computed field, a call, a branch -- is not this, and
- * goes the long way.
- *
- * Recognising it is what lets `Point(a, b)` become an allocation and two
- * stores instead of a descriptor, jaiCallValue, invokeCallable's type switch
- * and a compiled init. That machinery is most of the 35ns an allocation costs
- * here, against 5ns for the same thing in C++. */
+/* Recognises an initializer that does nothing but store its arguments into fields in order
+ * (`GET_LOCAL2 0 k; SET_FIELD f` repeated, then RETURN_NULL) -- anything else (a default, a computed field, a call, a branch) goes the long way. Lets `Point(a, b)` become an allocation and two stores instead of a descriptor + jaiCallValue + invokeCallable's type switch + a compiled init. */
 static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
     Value initv;
     if (cls == NULL) return false;
@@ -2401,8 +1772,8 @@ static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
     int off = 0;
     for (unsigned i = 0; i < argc; i++) {
         if (off + 5 > n || c[off] != OP_GET_LOCAL2) return false;
-        if (jaiReadU16(c + off + 1) != 0) return false;          /* self */
-        if (jaiReadU16(c + off + 3) != i + 1) return false;      /* arg i */
+        if (jaiReadU16(c + off + 1) != 0) return false;
+        if (jaiReadU16(c + off + 3) != i + 1) return false;
         off += 5;
         if (off + 6 > n || c[off] != OP_SET_FIELD) return false;
         uint32_t nameIdx = jaiReadU24(c + off + 1);
@@ -2427,18 +1798,10 @@ static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
 static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
                                uint32_t shape, ObjClass *klass, Value seen);
 
-/* `ownStatus` means the caller decodes the helper's return itself, so the
- * built-in "nonzero means raised" test is not emitted. Only the iterator step
- * wants that: it answers 0 yielded, 1 exhausted, 2 raised, and the default test
- * sends `exhausted` to the throw stub -- which reports an error the interpreter
- * then cannot find, and the run dies on "internal error: failed operation
- * raised nothing". The hand-written EQ/GT tests at the call site were dead code
- * until now, because control never reached them with a nonzero status. */
-/* Write every object this body is holding into the descriptor's root array.
- *
- * Shared by the descriptor path, where a C helper pushes them, and by the
- * self-call path, where the emitted code links the descriptor onto the
- * collector's frame chain instead -- a `bl` to the prologue pushes nothing. */
+/* ownStatus: caller decodes the helper's return itself, skipping the built-in "nonzero means raised"
+ * test. Only the iterator step needs this (0 yielded, 1 exhausted, 2 raised) -- the default test sent `exhausted` to the throw stub, which found no pending exception and died on "internal error: failed operation raised nothing"; the call site's EQ/GT tests were dead code until this existed. */
+/* Root-fills the descriptor: shared by the descriptor path (a C helper pushes them) and the self-call
+ * path (the emitted code links the descriptor onto the collector's frame chain instead, since a bare `bl` pushes nothing). */
 static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
@@ -2459,20 +1822,10 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
         nroots++;
     }
 
-    /* And what the operand stack is holding. Locals alone were enough only
-     * while nothing object-shaped stayed on the stack across a call -- but an
-     * iterator does exactly that: OP_GET_ITER pushes an ObjIter that lives in
-     * a register for the whole loop, and the call this descriptor belongs to
-     * may be the one that collects it. Visible only under --gc-stress, and
-     * only once a body with a loop like that could compile at all. */
-    /* Count the register-holding entries from the bottom rather than assuming
-     * they are the top `valueDepth` of them. A class, a resolved function, a
-     * builtin and `self` occupy no register and can sit anywhere -- a callee
-     * pushed before its arguments puts one squarely in the middle, which is
-     * exactly what `join(f(a), f(b))` does. Subtracting valueDepth names the
-     * wrong register for everything above such an entry, and worse, starts the
-     * walk past entries that still need rooting. The deopt stub has always
-     * counted this way. */
+    /* Locals alone weren't enough once OP_GET_ITER started leaving an ObjIter live in a register across
+ * a call that might collect -- only visible under --gc-stress, and only once such a loop could compile at all. */
+    /* Counts register-holding entries from the bottom, not by assuming they're the top `valueDepth` --
+ * a no-register entry (class/function/builtin/self) can sit in the middle of the stack, e.g. `join(f(a), f(b))` pushes a callee before its arguments. Subtracting valueDepth would name the wrong register above it and skip entries that still need rooting; the deopt stub has always counted this way. */
     unsigned seen = 0;
     for (unsigned idx = 0; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
@@ -2505,11 +1858,8 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
 
     unsigned d = e->descOffset;
 
-    /* The callee, as a whole Value. From a register when the callee is only
-     * known at run time -- a closure held in a local. Baking the one that
-     * happened to be live at compile time would freeze its upvalues, and
-     * `closure_calls` builds a fresh closure over a different `step` on every
-     * outer iteration. */
+    /* Callee as a whole Value, from a register when only known at run time (a closure held in a local):
+     * baking the compile-time-live closure would freeze its upvalues -- `closure_calls` builds a fresh closure over a different `step` every outer iteration. */
     if (calleeReg >= 0) {
         emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
         emit(e, jaiA64StrW(JIT_SCRATCH_A, 31,
@@ -2580,23 +1930,8 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
 }
 
-/* A call whose callee did not return cleanly. Out of line so that the body
- * keeps one compare and one not-taken branch per call.
- *
- * Verdict 4 is the one that needed building: the callee deoptimised part-way
- * and may have written, so the call can neither be re-executed nor recorded
- * over -- gDeopt is a single global. The callee is FINISHED in the interpreter
- * from its own record instead, and its value handed back here, which consumes
- * the record at the innermost frame that sees it. That is why one record still
- * suffices however deep the recursion goes, and it is what makes a recursive
- * body that writes compilable -- and, since `callee` may name someone else,
- * what makes a DIRECT call to a method that writes compilable too.
- *
- * `closure` is the body being compiled, which is what a self-call finishes.
- *
- * Emitted by both tiers. In an OSR form the fall-through is a continuation of
- * the loop, so nothing is written back here: every branch out of this block
- * goes to a stub that does its own syncing. */
+/* Verdict 4: the callee deoptimised part-way and may have written, so the call can't be re-executed
+ * or recorded over (gDeopt is a single global) -- instead the callee is FINISHED in the interpreter from its own record, and the value handed back here, consuming the record at the innermost frame that sees it. Makes a recursive body that writes compilable, and (since `callee` may name someone else) a direct call to a writing method too. OSR form: fall-through continues the loop, so nothing syncs here -- every branch out goes to a stub that syncs itself. */
 static void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
     for (unsigned si = 0; si < e->selfSlowCount; si++) {
         e->selfSlow[si].stub = (int)e->count;
@@ -2659,10 +1994,8 @@ static void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
         emit(e, jaiA64BCond(JAI_A64_NE, 0));
         emit(e, jaiA64LdrX(e->selfSlow[si].resultReg, 31, resultAt + 8));
 
-        /* VAL_OBJ is every heap object, so a compiled body that was promised
-         * an instance or a list has to see the object's type before it treats
-         * the pointer as one: reading `klass` off an ObjString does not fault,
-         * it answers wrongly. Both checks go back to the same record. */
+        /* VAL_OBJ is every heap object -- reading `klass` off the wrong type (e.g. an ObjString) doesn't
+         * fault, it answers wrongly, so the type is checked before the shape. */
         if (e->selfSlow[si].retType >= 0) {
             unsigned rr = e->selfSlow[si].resultReg;
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr,
@@ -2699,15 +2032,8 @@ static void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
     }
 }
 
-/* The cold half of `xs.push(v)`: reserve, refill the count the fast path had
- * already loaded, and branch back into it.
- *
- * Emitted with the other stubs so the store keeps one not-taken branch. No
- * descriptor and no roots -- see jitListGrow for why a realloc cannot collect.
- * `e->exceptionExit` must already be emitted, which it is at both call sites.
- *
- * This is a continuation, not a way out, so an OSR form must NOT sync its
- * iterator or its locals here: the loop carries on with them where they are. */
+/* Cold half of `xs.push(v)`: reserve, refill the count the fast path already loaded, branch back in.
+ * No descriptor/roots (see jitListGrow). This is a continuation, not an exit -- an OSR form must NOT sync its iterator or locals here, since the loop carries on with them where they are. */
 static void emitGrowStubs(Emit *e) {
     for (unsigned gi = 0; gi < e->growCount; gi++) {
         e->grow[gi].stub = (int)e->count;
@@ -2725,16 +2051,8 @@ static void emitGrowStubs(Emit *e) {
     }
 }
 
-/* Every argument of a direct branch arrives as a raw payload, so the kind the
- * caller holds has to be the kind the callee was specialised to -- and where
- * that kind is an instance, the same class shape, because every field offset
- * in the callee's body was resolved against it. jaiJitEnterFunc checks exactly
- * this, one Value at a time, and it is the only thing standing between a
- * float's bits and a body that will treat them as a pointer.
- *
- * `firstIdx` is the operand-stack index of the first thing passed in a
- * register. For a plain call that is the entry above the callee; for a method
- * it is the receiver itself, which is the callee's slot 0. */
+/* Direct-branch arguments arrive as a raw payload, so the caller's kind must match what the callee
+ * was specialised for -- and for an instance, the same class shape, since every field offset was resolved against it. jaiJitEnterFunc is the only check standing between a float's bits and a body that treats them as a pointer. `firstIdx`: the entry above the callee for a plain call, or the receiver (callee's slot 0) for a method. */
 static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
                                 unsigned firstIdx, unsigned argc) {
     for (unsigned i = 0; i < argc; i++) {
@@ -2764,44 +2082,8 @@ static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
     return true;
 }
 
-/* Branch straight to a compiled callee's entry instead of building a
- * descriptor and going out through jaiCallValue and an interpreter frame.
- *
- * The convention is the one jaiJitEnterFunc uses and a self-call already
- * emits: raw payloads in x0.., the closure itself in the last argument
- * register when the callee's body reads an upvalue, and on return x0 the value
- * with x1 the verdict. Skipping jaiJitEnterFunc means skipping everything it
- * checks, so each of those checks has to have an answer here:
- *
- *   - the module version, by the caller's own entry guard, which is why the
- *     callee has to live in the caller's module;
- *   - every parameter's kind and class shape, by the caller's model -- this is
- *     what makes passing a raw payload rather than a Value sound;
- *   - the verdict, below.
- *
- * A nonzero verdict is the part that is not obvious, and there are two answers
- * depending on what the callee is allowed to have done.
- *
- *   - A callee that writes nothing can simply have the whole CALL abandoned:
- *     the interpreter re-executes it from the operand stack as it stood
- *     before, and the abandoned attempt left nothing behind. Two compares on
- *     the fast path, no stub.
- *   - A callee that DOES write cannot be re-run, and this is not a rare case
- *     -- `Vec2.add` returning a fresh Vec2 writes, and so does any method that
- *     stores a field. Verdict 4 there means the callee deoptimised part-way,
- *     so it is FINISHED in the interpreter from its own record, exactly as a
- *     recursive self-call already does. That is what the `selfSlow` block is,
- *     which is why this shares it rather than growing a second copy.
- *
- * A raised exception is different again: its effects have happened and the
- * interpreter owns it, so that one goes to the throw exit rather than back to
- * the call.
- *
- * `calleeReg` holds the ObjClosure when the callee is only known at run time,
- * or -1 when it is baked in. `cidx` is the operand-stack index of the callee
- * entry -- for a method, of the RECEIVER, which is the callee's slot 0 and
- * therefore an argument as well. `after` is the offset of the instruction the
- * call falls through to. */
+/* Branches straight to a compiled callee's entry, skipping the descriptor/jaiCallValue/interpreter-
+ * frame path. Convention: raw payloads in x0.., closure in the last arg register if the callee reads an upvalue, x0/x1 = value/verdict on return -- the same one jaiJitEnterFunc checks and a self-call already uses, so skipping that entry means answering its checks here instead: module version (why the callee must live in the caller's module), every parameter's kind+shape (by the caller's model), and the verdict (below). Nonzero verdict: a callee that writes NOTHING can have the whole call abandoned and re-executed from the pre-call stack (two compares, no stub); a callee that WRITES cannot be re-run -- verdict 4 means it deoptimised part-way and is FINISHED in the interpreter from its own record, sharing the `selfSlow` machinery a recursive self-call already uses. A raised exception goes to the throw exit instead, since its effects already happened. `calleeReg`: the ObjClosure register, or -1 if baked in. `cidx`: operand-stack index of the callee entry (the RECEIVER for a method, i.e. its slot 0). `after`: offset of the fall-through instruction. */
 static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
@@ -2819,12 +2101,8 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
             : "a direct callee that is not a plain function";
         return false;
     }
-    /* The callee's own baked classes, closures and natives are pinned by ITS
-     * jitFuncModuleVersion, checked at an entry this is about to skip. Handing
-     * that job to the caller's check works only if the two agree NOW: a global
-     * rebound after the callee compiled leaves a form jaiJitEnterFunc would
-     * refuse forever, still reachable through jitFunc, and the caller
-     * compiling afterwards would pin the newer version and never notice. */
+    /* The callee's baked classes/closures/natives are pinned by ITS jitFuncModuleVersion, checked at the
+     * entry this call skips -- valid only if the caller's own check agrees NOW: a global rebound after the callee compiled would leave jitFuncModuleVersion stale but still reachable via a direct call, and a caller compiling afterwards would silently pin the newer version. */
     if (caller->module == NULL ||
         cfn->jitFuncModuleVersion != caller->module->version) {
         e->whyNot = "a direct callee compiled against an older module";
@@ -2863,11 +2141,8 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         e->whyNot = "a direct callee that wants a closure it has not got";
         return false;
     }
-    /* SLOT_NULL is a function declared `-> void`. Nothing comes back in it and
-     * the epilogue leaves x0 zero, so the entry it pushes is a register whose
-     * payload is zero and whose tag is fixed -- the same treatment a self-call
-     * to a void function has always had. Refusing it declined every caller of
-     * a procedure, which in nbody is the whole of `main`. */
+    /* SLOT_NULL: a `-> void` function. Epilogue leaves x0 zero, so the pushed entry has a fixed tag and
+     * zero payload -- same treatment a self-call to a void function gets. Refusing it declined every caller of a procedure, which in nbody is the whole of `main`. */
     SlotKind rk = (SlotKind)cfn->jitReturnKind;
     ObjClass *rcls = NULL;
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
@@ -2985,7 +2260,7 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     }
     if (!method) {
         if (e->depth == 0) { e->failed = true; return false; }
-        e->depth--;                              /* the callee entry */
+        e->depth--;
     }
     if (!pushValue(e, rk, cfn->jitReturnShape, rcls)) { e->failed = true; return false; }
     emit(e, jaiA64MovX(pushReg(e) - 1, 0));
@@ -3007,11 +2282,8 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
          * same rule the descriptor path lives under. */
         e->wroteHeap = true;
     }
-    /* For a callee that writes nothing this is deliberately NOT wroteHeap,
-     * unlike the descriptor path: it stores nothing and calls nothing, so an
-     * interpreted re-run of the whole caller would repeat no effect. It may
-     * still allocate -- OP_GET_SLICE does, and deliberately does not set the
-     * flag either -- and a fresh object is not an effect anything can see. */
+    /* Deliberately NOT wroteHeap for a non-writing callee, unlike the descriptor path: it stores and
+     * calls nothing, so a re-run repeats no visible effect. It may still allocate (OP_GET_SLICE does) -- a fresh object isn't an observable effect. */
     return true;
 }
 
@@ -3020,19 +2292,8 @@ static int instructionLength(const Chunk *c, int off);
 
 /* ---- literal operands -------------------------------------------------- */
 
-/* Can anything but the fall-through arrive at `off`?
- *
- * The walk through a body is linear, so the instruction it visited last is the
- * one lexically before this -- but only when nothing jumps here. `x // (if c {
- * 2 } else { 4 })` puts an OP_INT immediately before the OP_FLOORDIV *and* a
- * jump from the other arm onto it, so "the previous instruction pushed 2" is
- * true on one path and false on the other. Reading the constant off the
- * previous instruction without this test is a miscompile, not a decline.
- *
- * Every branch in the chunk is scanned, not just the ones already emitted: a
- * back edge is compiled after its target is walked, so consulting the fixup
- * list would miss exactly the loop tops. Handler and finally addresses count
- * too -- the unwinder resumes at one with a stack this walk never saw. */
+/* Whether anything but fall-through can reach `off`: reading the previous instruction's literal
+ * without this check is a miscompile, not a decline -- `x // (if c {2} else {4})` puts OP_INT right before OP_FLOORDIV *and* a jump from the other arm onto it. Scans the WHOLE chunk, not just fixups already emitted (a back edge compiles after its target is walked, so the fixup list would miss loop tops) -- and handler/finally addresses too, since the unwinder can resume there with a stack this walk never saw. */
 static bool offsetIsBranchTarget(const Chunk *c, uint32_t off) {
     for (int at = 0; at < c->count;) {
         int len = instructionLength(c, at);
@@ -3049,14 +2310,8 @@ static bool offsetIsBranchTarget(const Chunk *c, uint32_t off) {
     return false;
 }
 
-/* The int literal the instruction at `prevOff` pushes, when the instruction at
- * `off` is guaranteed to see it on top of the stack.
- *
- * `OP_INT` carries the value in its operand and `OP_CONST` names a pool entry;
- * those are the only two ways a literal reaches the stack. The adjacency check
- * is belt and braces -- the walk is linear, so it always holds -- but an
- * opcode arm that advanced `off` by the wrong amount would break it, and that
- * has happened here before (OP_FORMAT advanced by nine instead of ten). */
+/* OP_INT carries its value inline, OP_CONST names a pool entry -- the only two ways a literal reaches
+ * the stack. The adjacency check is belt-and-braces (the walk is linear) but a real bug: OP_FORMAT once advanced `off` by nine instead of ten, and this is what would have caught it. */
 static bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
                               int64_t *out) {
     if (prevOff < 0 || prevOff >= off) return false;
@@ -3080,21 +2335,8 @@ static bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
 /* `k` is 2^shift, for a shift this can name. Positive only: floor division by
  * a negative power of two is not a shift, and `k` is at most 2^62 because 2^63
  * does not fit in a positive int64. */
-/* Turn the truncating remainder in `rr` into the flooring one, given the
- * divisor in `rd`.
- *
- * The general rule is "add the divisor back when the remainder is non-zero and
- * their signs differ", which is seven instructions: a zero test, a branch, an
- * eor, a sign test, a branch and the add.
- *
- * A divisor whose sign is known at compile time collapses that. `msub` leaves
- * |r| < |d| with r's sign following the dividend's, so for a positive divisor
- * "non-zero and opposite sign" is exactly "r < 0" -- one bit -- and for a
- * negative one it is exactly "r > 0". Two instructions instead of seven, with
- * no change to which values are corrected.
- *
- * `r + d` cannot overflow: |r| < |d|, so the sum lies strictly between -|d| and
- * |d|, and d is representable. */
+/* Collapses the general "add divisor back if remainder is non-zero and signs differ" (7 instructions)
+ * to 2 when the divisor's sign is known at compile time: msub leaves |r| < |d| with r's sign following the dividend's, so for a positive divisor the whole test is "r < 0" (one bit), and for a negative one "r > 0". `r + d` cannot overflow since |r| < |d| puts the sum strictly between -|d| and |d|. */
 static void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
                            bool signKnown, int64_t divisor, uint32_t fixup) {
     if (signKnown && divisor > 0) {
@@ -3133,29 +2375,8 @@ static bool powerOfTwoShift(int64_t k, unsigned *shift) {
  * are -- compilation is not reentrant, nothing it calls compiles anything. */
 static bool gInlineFailed;
 
-/* Can this callee's body stand in for the call to it?
- *
- * Structural, and answered before anything is emitted, because a half-inlined
- * body cannot be taken back. The list is short on purpose and each item buys
- * something specific:
- *
- *   no branches      -- so there is no offset map to keep, no join to
- *                       reconcile, and no fixup that could name one of the
- *                       callee's offsets in the caller's table;
- *   one RETURN, last -- so there is one place the result appears;
- *   locals only in the four opcodes the frame below understands, and only
- *                       slots this callee actually has;
- *   globals only where they name one of the two builtins the tier emits
- *                       inline, so a global VALUE load -- which would bake a
- *                       JaiEntry from the callee's table and needs its own
- *                       guard -- never arises;
- *   nothing that stores -- because a guard inside the inlined body sends the
- *                       interpreter back to re-execute the whole call, and a
- *                       store made before it would then happen twice.
- *
- * What survives is straight-line arithmetic over registers, which is what the
- * main walker already speaks -- so it, and not a second one, is what emits
- * this. `evalA` in spectral is fifteen instructions of exactly this shape. */
+/* Structural check, answered before anything is emitted (a half-inlined body can't be taken back):
+ * no branches (no offset map, no join, no fixup naming a callee offset in the caller's table); exactly one RETURN, last; locals only via the four opcodes the inline frame understands, and only slots this callee actually has; globals only for the two builtins the tier emits inline (else a global VALUE load would bake a JaiEntry from the callee's own table, needing its own guard); nothing that stores (a guard inside re-executes the WHOLE call, so an earlier store would run twice). What's left is straight-line register arithmetic -- the main walker already speaks it, so no second emitter is needed. `evalA` in spectral is fifteen instructions of exactly this shape. */
 static bool inlinableBody(ObjClosure *callee, unsigned argc,
                           unsigned *maxSlotOut, bool *readsUpvalueOut) {
     ObjFunction *cfn = callee->fn;
@@ -3237,26 +2458,8 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
     return true;
 }
 
-/* Emit the callee's body in place of the call.
- *
- * Only the argument entries already on the operand stack are needed: slot 1+i
- * IS entry cidx+1+i, so nothing is copied in. A slot the body binds pins one
- * further entry, which stays put underneath everything pushed after it --
- * sound only because the body is straight-line, so the stack above it is
- * balanced by the time the result is taken.
- *
- * The callee's module must be the caller's. Its body bakes builtins the same
- * way any compiled body does, and what retires those is the module-version
- * check at the CALLER's entry, since the callee's own is never run.
- *
- * `calleeReg` holds the ObjClosure when the call site has already guarded that
- * a register names this exact ObjFunction, or -1 when the callee was resolved
- * at compile time. Only a body that reads an upvalue needs it: `callee` is a
- * SAMPLE of the closure at an indirect site, so its captured cells are not the
- * ones the next call will carry -- one ObjFunction, many closures, which is
- * precisely the shape `|x| x + step` takes. Constants and globals are safe to
- * take from the sample because they belong to the function and the module,
- * not to the closure. */
+/* Inlines the callee's body: slot 1+i IS entry cidx+1+i already on the stack, so nothing is copied in;
+ * a bound slot pins one more entry underneath what's pushed after it, sound only because the body is straight-line. Callee's module must be the caller's, and its baked builtins are retired by the CALLER's own module-version check (the callee's is never run). `calleeReg`: needed only if the body reads an upvalue, since `callee` is a SAMPLE closure at an indirect site -- one ObjFunction, many closures (`|x| x + step`), so its captured cells aren't necessarily the next call's. Constants/globals are safe from the sample since they belong to the function/module, not the closure. */
 static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg) {
     if (e->noInline) return false;
@@ -3451,7 +2654,6 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     if (mfn->upvalueCount != 0) return false;
     if (mfn->chunk.count > 96) return false;
 
-    /* The receiver and arguments, as the caller holds them. */
     unsigned base = JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u);
     unsigned inReg[JIT_MAX_ARGS_OUT + 1];
     Value    inSeen[JIT_MAX_ARGS_OUT + 1];
@@ -3546,14 +2748,12 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
             return false;
         }
         if (pass == 0) {
-            /* Undo the model changes the dry walk made. */
             while ((int)e->depth > depth0) {
                 unsigned r; if (!popValue(e, &r, NULL)) return false;
             }
         }
     }
 
-    /* The result is on top; the receiver and arguments below it go away. */
     unsigned rres;
     SlotKind kres;
     if (!popValue(e, &rres, &kres)) return false;
@@ -3573,7 +2773,6 @@ static bool emitCallOut(Emit *e, unsigned argc) {
 
     uint16_t fslots[JIT_MAX_ARGS_OUT];
     if (argc <= JIT_MAX_ARGS_OUT && simpleInitFields(cls, argc, fslots)) {
-        /* Allocate, then store the arguments into their fields here. */
         unsigned first = e->depth - argc;
         SlotKind kinds[JIT_MAX_ARGS_OUT];
         unsigned regs[JIT_MAX_ARGS_OUT];
@@ -3590,24 +2789,8 @@ static bool emitCallOut(Emit *e, unsigned argc) {
                       (e->usesUpvalues ? 1u : 0u) +
                       (first + i - (e->depth - e->valueDepth));
         }
-        /* Two ways to get the instance, and the fast one is tried first.
-         *
-         * jitInstanceAlloc is a leaf that cannot collect -- it declines
-         * whenever jaiGCWanted() is true, which is exactly when jaiInstanceNew
-         * would have collected -- so it needs no descriptor and no root array,
-         * and it reaches no allocator call of its own. That is what makes it
-         * worth branching for: the descriptor below is a dozen stores plus a
-         * helper that pushes and pops every root this body is holding, in
-         * order to allocate sixty-four bytes.
-         *
-         * The safety argument is entirely on the callee's side and is written
-         * out at its definition. What matters here is that a NULL answer means
-         * it did nothing at all, so falling into the descriptor path is always
-         * correct: the roots are written, the collection happens there, and
-         * both paths arrive at the load below with the instance in SCRATCH_C.
-         *
-         * Skipped for a class the bins cannot serve, which would otherwise pay
-         * a declined call per allocation. */
+        /* Fast path (jitInstanceAlloc) is a leaf that cannot collect -- it declines whenever jaiGCWanted(),
+     * exactly when jaiInstanceNew would have collected -- so needs no descriptor/roots, versus the descriptor's dozen stores plus a root push/pop just to allocate 64 bytes. NULL means it did nothing, so falling into the descriptor path is always correct; both paths land at the load below with the instance in SCRATCH_C. Skipped for a class the small-object bins can't serve. */
         const size_t instBytes =
             sizeof(ObjInstance) + sizeof(Value) * (size_t)cls->fieldCount;
         unsigned skipSlow = 0;
@@ -3643,11 +2826,8 @@ static bool emitCallOut(Emit *e, unsigned argc) {
         if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_CLASS) return false;
         e->depth--;
         if (!pushValue(e, SLOT_INST, cls->shapeId, cls)) return false;
-        /* The result reuses the register the first argument was in, so the
-         * instance is held in a scratch until every field has been stored.
-         * Loading it into its final register first overwrote the argument it
-         * was about to store, and alloc_churn came back in 5ms with the wrong
-         * answer -- the same aliasing mistake this tier keeps making. */
+        /* Instance held in a scratch (SCRATCH_C) until every field is stored, since the result reuses the
+     * first argument's register: loading it into its final register first overwrote the argument about to be stored into it -- alloc_churn came back in 5ms with a wrong answer. */
         unsigned rinst = pushReg(e) - 1;
         for (unsigned i = 0; i < argc; i++) {
             unsigned at = (unsigned)offsetof(ObjInstance, fields) +
@@ -3687,13 +2867,8 @@ static bool emitCallOut(Emit *e, unsigned argc) {
     return true;
 }
 
-/* An unconditional OP_LOOP or OP_JUMP does not fall through, so the instruction
- * after it is reachable only by a branch. The linear walk would otherwise carry
- * the preceding instruction's operand stack across that gap. Take the stack
- * from a branch that targets this offset instead, accepting only a pure
- * truncation: register entries are the top `valueDepth` of the stack, so
- * popping from the top keeps `depth - valueDepth`, and with it every register
- * index below the join. */
+/* After an unconditional OP_LOOP/OP_JUMP there's no fall-through, so the linear walk can't carry the
+ * preceding instruction's stack across the gap -- reconciles from a branch that targets this offset instead, accepting only a pure truncation (register entries are the top `valueDepth`, so popping from the top preserves every index below the join). */
 static void reconcileAfterUncond(Emit *e, uint32_t off) {
     for (unsigned i = 0; i < e->fixupCount; i++) {
         if (e->fixups[i].targetOffset != off) continue;
@@ -3710,19 +2885,8 @@ static void reconcileAfterUncond(Emit *e, uint32_t off) {
     }
 }
 
-/* Fold one more `return` into what this function is known to return.
- *
- * `build` in binary_trees ends `return null` on one path and `return Node(..)`
- * on the other, which is what an optional return type means, and demanding a
- * single kind refused it outright. An instance joined with a maybe-instance is
- * a maybe-instance; the shape survives only when both sides agree on it.
- *
- * This was written once before and reverted, because compiling `build` made the
- * program eleven times slower. That was not the merge: `build` is the first body
- * in the language to hold a freshly allocated object on the operand stack across
- * an allocating self-call, and at the time a self-call rooted nothing and the
- * operand-stack-to-register mapping in emitRootFill was wrong. Both are fixed,
- * and the same merge now makes binary_trees faster than the interpreter. */
+/* `build` in binary_trees returns `null` on one path and `Node(..)` on another -- an instance merged
+ * with a maybe-instance becomes a maybe-instance (shape survives only if both sides agree). Written once before and reverted when it made binary_trees 11x slower -- not this merge's fault: at the time a self-call rooted nothing and emitRootFill's operand-stack-to-register mapping was wrong, and `build` was the first body to hold a fresh allocation across an allocating self-call. Both bugs are now fixed. */
 static bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     if (!e->sawReturn) {
         e->sawReturn = true; e->returnKind = k; e->returnShape = shape;
@@ -3740,44 +2904,28 @@ static bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     return true;
 }
 
-/* Opcodes that know how to take a float operand out of the FP bank. Every
- * other opcode sees the model exactly as it did before this existed, because
- * the dispatch loop materialises everything before handing it one. Adding an
- * opcode here without teaching it fpOperand is a miscompile, not a decline --
- * that is the whole risk of this design, and the reason the list is short. */
+/* Opcodes that pull a float operand straight out of the FP bank; every other opcode sees the model
+ * materialised as before. Adding an opcode here without also teaching it fpOperand is a MISCOMPILE, not a decline -- the whole risk of this design, and why the list stays short. */
 static bool fpFastOp(uint8_t op) {
     switch (op) {
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
     case OP_GET_LOCAL: case OP_GET_LOCAL2:
     case OP_ADD_LOCALS: case OP_BIND: case OP_SET_LOCAL:
-    /* These three only ever write the entry they push, and the type guard at
-     * a `float` boundary on something already float emits nothing at all --
-     * it sat between the ADD and the BIND in mandelbrot's `x = x2 - y2 + x0`
-     * and made the whole expression materialise for nothing. */
+    /* These three only ever write the entry they push; a `float`-boundary type guard on something
+     * already float emits nothing -- it sat between the ADD and the BIND in mandelbrot's `x = x2 - y2 + x0` and made the whole expression materialise for nothing. */
     case OP_CONST: case OP_INT: case OP_TYPE_GUARD:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
-    /* Reading an element writes only the entry it pushes and the four
-     * scratch X registers; it touches no v register and calls nothing. Until
-     * it was on this list an FP-resident accumulator was materialised the
-     * moment a subscript appeared, which is every loop that sums over an
-     * array -- `sum += ai[k] * b[k][j]` being the whole of matrix_mul. */
+    /* Reading an element writes only the entry it pushes plus the four scratch X registers -- no v
+     * register, no call. Until this was listed, an FP-resident accumulator materialised the moment a subscript appeared, i.e. every array-summing loop (`sum += ai[k] * b[k][j]`, all of matrix_mul). */
     case OP_GET_INDEX:
-    /* Reading a field is the same argument as reading an element, and the
-     * benchmark that wanted it is nbody: `bi.vx -= dx * bj.mass * mag` reads
-     * three fields between the local it multiplies and the multiply itself,
-     * so without these two on the list every operand of every field
-     * expression materialised into an X register and came back through an
-     * fmov. Neither opcode writes a v register, and neither reads an X
-     * register whose FP copy could be the live one -- a receiver is an
-     * instance and a local is always current in X. */
+    /* Same argument as reading an element; nbody wanted it: `bi.vx -= dx * bj.mass * mag` reads three
+     * fields between the local it multiplies and the multiply, so without this every field-expression operand materialised into X and came back through an fmov. Neither opcode writes a v register or reads an X register whose FP copy could be the live one. */
     case OP_GET_FIELD: case OP_GET_FIELD_LOCAL:
-    /* Both take their operand out of the bank -- see fpConsumer -- so both
-     * belong here too, or the dispatch loop syncs it back out first and the
-     * arm never sees a live entry. `**0.5` is a square root and sat between
-     * every `d2` and the divide that uses it. */
+    /* Both take their operand out of the bank (see fpConsumer), or the dispatch loop syncs it back out
+     * first and the arm never sees a live entry. `**0.5` (square root) sat between every `d2` and the divide that used it. */
     case OP_SET_FIELD: case OP_POW:
         return true;
     default:
@@ -3785,12 +2933,8 @@ static bool fpFastOp(uint8_t op) {
     }
 }
 
-/* The instructions that actually read a float operand out of the FP bank.
- *
- * This used to be the whole of `fpWorthLoading`, tested against the very next
- * opcode on the reasoning that a bank entry only survives if its consumer is
- * adjacent. That was true when OP_GET_INDEX materialised everything; it is not
- * true now, and `fpWorthLoading` below walks to the consumer instead. */
+/* Used to be the whole of `fpWorthLoading`, tested against just the very next opcode -- true only
+ * while OP_GET_INDEX still materialised everything; fpWorthLoading below now walks to the consumer instead. */
 static bool fpConsumer(uint8_t op) {
     switch (op) {
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
@@ -3806,11 +2950,8 @@ static bool fpConsumer(uint8_t op) {
     }
 }
 
-/* How many entries below `idx` hold a register, which is what names the one
- * `idx` itself is in. Counted rather than subtracted from the top: a class, a
- * resolved function, a builtin and `self` occupy no register and can sit
- * anywhere -- a callee pushed below its own arguments puts one squarely in the
- * middle, which is exactly the shape an inlined call site has. */
+/* Counted rather than subtracted from the top: a no-register entry (class/function/builtin/self) can
+ * sit in the middle of the stack -- exactly the shape an inlined call site has. */
 static unsigned valueIndexOf(const Emit *e, unsigned idx) {
     unsigned seen = 0;
     for (unsigned i = 0; i < idx; i++) {
@@ -3833,12 +2974,8 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
     return true;
 }
 
-/* The local opcodes of an inlined body, answered against its own frame.
- *
- * That frame is the caller's operand stack: a parameter is the argument entry
- * already sitting there, and a bind pins whatever is on top rather than
- * copying it anywhere. Reading these through the main switch instead would
- * read the CALLER's local of the same number, which is a different variable. */
+/* Answered against the inlined body's own frame -- the CALLER's operand stack: a parameter is the
+ * argument entry already sitting there, a bind pins whatever's on top. Reading these through the main switch would read the CALLER's local of the same number, a different variable entirely. */
 static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
     uint8_t op = code[off];
     unsigned a = jaiReadU16(code + off + 1);
@@ -3852,13 +2989,8 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
             e->whyNot = "an inlined body binding a local twice";
             return false;
         }
-        /* Pinning is only sound where the value being bound is the ONLY thing
-         * above the region already pinned -- which is what `let x = expr` as a
-         * statement looks like, the expression stack being empty at the start
-         * of one. Two binds from one expression (`let a, b = ..`) would leave
-         * this entry the top for both of them, and the two slots would name
-         * one register: the aliasing mistake this tier keeps making, caught
-         * here by measuring the depth rather than by trusting the shape. */
+        /* Sound only when the bound value is the ONLY thing above the already-pinned region (`let x = expr`
+     * as a statement) -- `let a, b = ..` would leave this entry the top for both binds, aliasing two slots to one register. Caught by measuring depth, not by trusting the shape. */
         if (e->depth != e->inlDepth + e->inlPinned + 1u) {
             e->whyNot = "an inlined body binding with an expression under it";
             return false;
@@ -3886,7 +3018,6 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
                pushCopyOfEntry(e, (unsigned)e->inlSlot[b]);
     }
 
-    /* OP_ADD_LOCALS */
     unsigned ia = (unsigned)e->inlSlot[a], ib = (unsigned)e->inlSlot[b];
     SlotKind k = e->stack[ia];
     if (k != e->stack[ib] || (k != SLOT_INT && k != SLOT_FLOAT)) return false;
@@ -3908,30 +3039,10 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
     return true;
 }
 
-/* Is a float operand worth putting in the FP bank rather than an X register?
- *
- * A *consumer* has to be reachable, not merely another opcode on the list.
- * The original rule looked only at the very next instruction, which said no
- * for `sum` in matrix_mul: it is followed by OP_GET_LOCAL2 and then the whole
- * of `ai[k] * b[k][j]` before any float operator. That cost the loop its
- * accumulator -- `str d` out, `ldr x` plus `fmov d, x` back in, twice a
- * cross-register-file move on the loop-carried chain, which measured as
- * `sum += 1.0` running at 15 cycles an iteration against 2 for `sum += 1`.
- *
- * So walk forward instead, through the instructions that leave an FP-resident
- * entry where it is (`fpFastOp`, which is the same set the main loop uses to
- * decide whether to sync), and answer on the first thing that is neither. The
- * walk is bounded: none of those opcodes is variable length, so
- * `jaiOpOperandSize` is enough and no Chunk is needed. */
-/* Opcodes a float borrow may live across.
- *
- * Deliberately a whitelist and deliberately short: every one of these reads
- * float entries through fpOperand or fpHeldIn, and none of them records a
- * deopt while one is live -- an int overflow inside OP_ADD goes through
- * fpSyncAll, which materialises a borrow the same way it materialises a bank
- * entry. Anything else releases at the top of the instruction, where the
- * release is unconditionally on the path. deoptRecordAt declines if one gets
- * through anyway, so the cost of this list being wrong is a decline. */
+/* A *consumer* must be reachable, not merely the next instruction: the original rule looked only at
+ * the very next opcode, which said no for `sum` in matrix_mul (followed by OP_GET_LOCAL2 then all of `ai[k] * b[k][j]` before any float operator) and cost the loop its accumulator to a cross-register-file bounce every iteration. Walks forward instead through fpFastOp's opcodes and answers on the first one that isn't; bounded since none of them is variable length. */
+/* Deliberately a short whitelist: every one of these reads float entries through fpOperand/fpHeldIn
+ * and none records a deopt while one is live (an int overflow inside OP_ADD goes through fpSyncAll first). Anything else releases at the top of the instruction; deoptRecordAt declines if one gets through anyway, so a wrong entry here costs a decline, not a miscompile. */
 static bool fpBorrowSurvives(uint8_t op) {
     switch (op) {
     case OP_GET_LOCAL: case OP_GET_LOCAL2:
@@ -3942,14 +3053,8 @@ static bool fpBorrowSurvives(uint8_t op) {
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
-    /* A settled type guard is not an instruction at all -- the kinds already
-     * agree, so its arm emits nothing and records nothing. It is on this list
-     * because it is what stands between an unfused float operator and the
-     * OP_BIND it feeds: `y = 2.0 * xy + y0` is ADD, TYPE_GUARD, BIND, and
-     * releasing the borrow at the guard would put back exactly the `fmov` the
-     * lookahead removed, and then add a second one at the bind. The widening
-     * arm writes only v0 and an X register, neither of which a borrow can name.
-     */
+    /* A settled type guard emits/records nothing, but sits on this list because it stands between an
+     * unfused float op and its OP_BIND (`y = 2.0*xy+y0` is ADD,TYPE_GUARD,BIND) -- releasing the borrow at the guard would reintroduce the exact `fmov` the lookahead removed. */
     case OP_TYPE_GUARD:
         return true;
     default:
@@ -3957,14 +3062,8 @@ static bool fpBorrowSurvives(uint8_t op) {
     }
 }
 
-/* Opcodes a deferred X entry may live across.
- *
- * The same shape as fpBorrowSurvives and just as deliberately short: every one
- * of these reads its operands through popValue or xHeldIn, computes into
- * `pushReg(e) - 1`, and takes no deopt record with a deferred entry still on
- * the model. Anything else settles at the top of the instruction. Two of them
- * earn their place on their own: OP_INT and OP_CONST are what stands between
- * `GET_LOCAL n` and the `SUB` that consumes it. */
+/* Same shape as fpBorrowSurvives, just as deliberately short: each reads its operands via popValue/
+ * xHeldIn, computes into `pushReg(e)-1`, and takes no deopt record with a deferred entry live. OP_INT/OP_CONST earn their place standing between `GET_LOCAL n` and the `SUB` consuming it. */
 static bool deferSurvives(uint8_t op) {
     switch (op) {
     case OP_GET_LOCAL: case OP_GET_LOCAL2:
@@ -3993,10 +3092,8 @@ static bool foldsIntLiteral(uint8_t op) {
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
-    /* Not because a shift takes an imm12 -- it does not -- but because the
-     * count already becomes part of the instruction when it is a literal in
-     * 0..63, so the register this used to fill was written and never read.
-     * bitops shifts by 7, 3, 11, 1 and 31 and paid a movz for each. */
+    /* Not because a shift takes an imm12 (it doesn't) -- the shift count becomes part of the instruction
+     * encoding when it's a literal 0..63, so the register that used to hold it was written and never read. bitops paid a `movz` for every one of its shifts before this. */
     case OP_SHL: case OP_SHR:
         return true;
     default:
@@ -4038,16 +3135,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
         afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
         uint8_t op = code[off];
-        /* Settle any deferred entry BEFORE the offset map records where this
-         * instruction begins, so that a branch landing here -- which arrives
-         * with every entry already in its own register -- skips the settling
-         * and the fall-through pays for it. Both paths then agree, which is
-         * the whole requirement at a join.
-         *
-         * A join that the instruction is *allowed* to carry a deferral into is
-         * the one case that does not work, because the arm would read the
-         * borrow and the arriving path put the value elsewhere. Forward
-         * branches are known here; backward ones are checked at the end. */
+        /* Settles any deferred entry BEFORE the offset map records the instruction start, so a branch landing
+ * here (arriving with everything in its own register) skips the settle and only the fall-through pays -- both paths then agree, which a join requires. Forward branches are known here; backward ones checked at the end. */
         if (anyDeferred(e)) {
             bool joinsHere = false;
             if (!e->inlining) {
@@ -4091,9 +3180,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
         }
 
-        /* The four local opcodes an inlined body is allowed, answered against
-         * its own frame -- entries on the caller's operand stack -- before the
-         * main switch can read them as the caller's slot numbers. */
+        /* The four local opcodes an inlined body is allowed, answered against its own frame, before the main
+         * switch reads them as the caller's slot numbers. */
         if (e->inlining && (op == OP_GET_LOCAL || op == OP_GET_LOCAL2 ||
                             op == OP_ADD_LOCALS || op == OP_BIND)) {
             if (!inlineLocalOp(e, code, off)) return false;
@@ -4137,14 +3225,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 unsigned home = localHomeX(e, slot);
                 if (home != 0) {
-                    /* The copy this used to emit is the whole cost of reading
-                     * a local, and every one of them was a copy of a register
-                     * that is not going to change: only localOut writes a
-                     * local's home, and no opcode a borrow lives across does.
-                     * Six of them in `fib`. If nothing consumes it before an
-                     * instruction that cannot read a borrow, the settle at the
-                     * top of that instruction emits exactly the mov that used
-                     * to be here, so this never costs anything. */
+                    /* The copy this used to always emit is the whole cost of reading a local (six of them in `fib`) --
+                     * borrowing defers it; if nothing consumes the value before an instruction that can't read a borrow, the settle there emits exactly the same mov, so this never costs more. */
                     xBorrowLocal(e, e->valueDepth - 1, home);
                 } else {
                     unsigned dst = pushReg(e) - 1;
@@ -4351,9 +3433,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!e->fpOff && e->depth >= 2 && !e->dynamicLocal[slot] &&
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
                 e->stack[e->depth - 2] == SLOT_FLOAT) {
-                /* The whole operation stays in the FP bank: two operands that
-                 * are already there, one instruction, and a store straight out
-                 * of a d register. */
                 if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
                     e->whyNot = "a local was given two different kinds";
                     return false;
@@ -4405,9 +3484,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!e->fpOff && e->depth >= 2 && !e->dynamicLocal[slot] &&
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
                 e->stack[e->depth - 2] == SLOT_FLOAT) {
-                /* The whole operation stays in the FP bank: two operands that
-                 * are already there, one instruction, and a store straight out
-                 * of a d register. */
                 if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
                     e->whyNot = "a local was given two different kinds";
                     return false;
@@ -4489,11 +3565,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             {
                 unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
                 unsigned dst = localDest(e, slot);
-                /* The step is an i8, so it always fits the imm12 form and the
-                 * constant never needs a register of its own. `subs` for a
-                 * negative step rather than a negated `adds`: both set V on
-                 * signed overflow of the operation actually performed, which
-                 * is what the guard below reads. */
+                /* Step is an i8, always fits imm12, so the constant never needs a register of its own. `subs` for a
+                 * negative step rather than a negated `adds`: both set V for the operation actually performed, which is what the overflow guard below reads. */
                 if (imm >= 0) {
                     emit(e, jaiA64AddsXImm(dst, cur, (unsigned)imm));
                 } else {
@@ -4508,12 +3581,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_EQ: case OP_NE:
         case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
-            /* Read the operands without taking them off the model: a NaN sends
-             * this instruction back to the interpreter, whose stack still has
-             * them. Popping first left it two entries short, and the
-             * comparison it re-ran then read whatever was underneath -- the
-             * error came out one line late instead of not at all, which is a
-             * good deal harder to notice. */
+            /* Operands are read without popping them off the model: a NaN sends this back to the interpreter,
+             * whose stack still has them. Popping first once left the model two entries short, so the re-run comparison silently read whatever was underneath -- a bug that surfaced one line later instead of not at all. */
             if (e->depth < 2) return false;
             SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
             /* `node == null` puts an instance beside a maybe-instance. Both
@@ -4573,11 +3642,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 settleAll(e);
                 unsigned rb = valueXReg(e, e->valueDepth - 1);
                 unsigned ra = valueXReg(e, e->valueDepth - 2);
-                /* Two interned strings are equal exactly when they are the
-                 * same object -- that is what interning buys, and it is what
-                 * `text[i] == " "` is, since one-character strings are shared
-                 * singletons. Anything not interned, or not a string, deopts
-                 * and the interpreter compares properly. */
+                /* Two interned strings are equal exactly when they are the same object (`text[i] == " "` relies on
+                 * this: one-character strings are shared singletons). Anything not interned, or not a string, deopts and the interpreter compares properly. */
                 for (unsigned side = 0; side < 2; side++) {
                     unsigned r = side == 0 ? ra : rb;
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
@@ -4632,9 +3698,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             int16_t  jump = jaiReadI16(code + off + 2);
             if (e->depth < 2) return false;
             SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
-            /* `node == null` puts an instance beside a maybe-instance. Both
-             * are a pointer or zero in a register, so the compare is the same
-             * one; treat the pair as maybe-instance. */
             if (ka != kb) {
                 bool mixable =
                     (ka == SLOT_INST && kb == SLOT_MAYBE_INST) ||
@@ -4664,9 +3727,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 case OP_NE: cond = JAI_A64_EQ; break;
                 default: return false;
                 }
-                /* Both operands stay where they are: the compare reads the
-                 * FP bank, and the NaN guard's stub knows how to write an
-                 * FP-resident entry out if it is ever taken. */
                 unsigned db = fpOperand(e, e->valueDepth - 1);
                 unsigned da = fpOperand(e, e->valueDepth - 2);
                 settleAll(e);          /* nanToDeopt records */
@@ -4687,11 +3747,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 settleAll(e);          /* this path guards */
                 unsigned rb = valueXReg(e, e->valueDepth - 1);
                 unsigned ra = valueXReg(e, e->valueDepth - 2);
-                /* Two interned strings are equal exactly when they are the
-                 * same object -- that is what interning buys, and it is what
-                 * `text[i] == " "` is, since one-character strings are shared
-                 * singletons. Anything not interned, or not a string, deopts
-                 * and the interpreter compares properly. */
                 for (unsigned side = 0; side < 2; side++) {
                     unsigned r = side == 0 ? ra : rb;
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
@@ -4753,11 +3808,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     emitConst64(e, pushReg(e) - 1, kv);
                 }
             } else if (IS_FLOAT(k)) {
-                /* The bits, not the number: a float lives in an X register
-                 * exactly as it does in a Value's payload -- unless the value
-                 * is one FMOV's eight-bit immediate can name, in which case it
-                 * goes straight to the FP bank in one instruction instead of
-                 * two into an X register and an fmov out of it. */
+                /* The bits, not the number: a float lives in an X register exactly as in a Value's payload -- unless
+                 * the value is one FMOV's 8-bit immediate can name, in which case it goes straight to the FP bank in one instruction instead of two plus an fmov. */
                 double d = AS_FLOAT(k);
                 int64_t bits;
                 memcpy(&bits, &d, sizeof bits);
@@ -4774,12 +3826,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!pushValue3(e, SLOT_BOOL, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, AS_BOOL(k) ? 1 : 0);
             } else if (IS_STRING(k)) {
-                /* A pointer to the constant pool's own string. Safe to hold
-                 * raw for the same reason the resolved globals above are: the
-                 * pool belongs to the chunk, the chunk to the function, and
-                 * the caller is holding the closure for the whole call. A
-                 * string constant was the commonest reason this tier declined
-                 * a body -- thirty refusals across the benchmark suite. */
+                /* Pointer to the constant pool's own string, safe to hold raw for the same reason resolved globals
+                 * are: the pool belongs to the chunk, the chunk to the function, and the caller holds the closure for the whole call. Was the commonest reason this tier declined a body -- thirty refusals across the benchmark suite. */
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)AS_OBJ(k));
             } else {
@@ -4790,12 +3838,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_TYPE_GUARD: {
-            /* A declared boundary -- a parameter or a return type. The kind is
-             * already known here, so the guard is either nothing at all or the
-             * int-to-float widening the interpreter does at the same place
-             * (spec 2.2). Anything the kinds cannot settle is declined rather
-             * than guessed: `evalA` in spectral is a one-line function whose
-             * whole body was refused for want of this. */
+            /* A declared boundary (parameter or return type). The kind is already known here, so the guard is
+             * either nothing at all or the int-to-float widening the interpreter does at the same place (spec 2.2). Anything the kinds can't settle is declined, not guessed: `evalA` in spectral was refused outright for want of this. */
             uint32_t idx = jaiReadU24(code + off + 1);
             if (idx >= (uint32_t)fn->chunk.constants.count) return false;
             Value t = fn->chunk.constants.data[idx];
@@ -4819,7 +3863,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
             } else if ((strcmp(tn, "int") == 0 && k == SLOT_INT) ||
                        (strcmp(tn, "bool") == 0 && k == SLOT_BOOL)) {
-                /* Already what the boundary asks for. */
             } else {
                 e->whyNot = "a type guard the kinds cannot settle";
                 return false;
@@ -4829,10 +3872,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_FORMAT: {
-            /* Ninety refusals across the benchmarks, the largest entry in the
-             * census by a wide margin: every f-string is one of these, and
-             * dict_ops, word_freq and string_build all build their keys with
-             * one. */
+            /* Largest single refusal reason across the benchmark census (ninety) -- every f-string is one, and
+             * dict_ops, word_freq and string_build all build their keys with one. */
             unsigned parts = code[off + 1];
             if (parts == 0 || parts > JIT_MAX_ARGS_OUT) {
                 e->whyNot = "an f-string with more parts than the descriptor holds";
@@ -4878,13 +3919,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_LOOP: {
-            /* The interpreter runs a safepoint on the back edge; compiled code
-             * cannot, so a compiled loop is not interruptible and does not get
-             * sampled. Both are acceptable only because this tier bails on any
-             * unbounded construct: the loop is over ints, cannot allocate, and
-             * the stack guard still catches runaway recursion. Ctrl-C during a
-             * long compiled loop waits for the loop, which is a real cost and
-             * the reason the trip count is not unbounded in practice. */
+            /* Compiled code has no safepoint on the back edge (uninterruptible, unsampled) -- acceptable only
+             * because this tier bails on anything unbounded: the loop is over ints, can't allocate, and the stack guard still catches runaway recursion. Ctrl-C during a long compiled loop waits for the loop to end. */
             int16_t jump = jaiReadI16(code + off + 1);
             branchTo(e, (uint32_t)((int32_t)(off + 3) + jump), false, 0);
             off += 3;
@@ -4942,28 +3978,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_BXOR:
         case OP_SHL:
         case OP_SHR: {
-            /* The rest of the integer instruction set. None of `& | ^` can
-             * fail, so they are three registers and one instruction.
-             *
-             * The shifts have two edges the hardware does not share: jaithon
-             * throws on a negative count and saturates at 64 or more, while
-             * arm64's LSLV and ASRV use the low six bits of the count and so
-             * wrap. Both edges are guarded and deopt, which is right twice
-             * over -- they are vanishingly rare, and the interpreter already
-             * has the exact rule. The guards precede the pops, so a deopt
-             * resumes at an instruction that has not happened. */
+            /* None of `& | ^` can fail, so they're one instruction. Shifts have two edges hardware doesn't share:
+             * jaithon throws on a negative count and saturates at >=64, while arm64's LSLV/ASRV wrap on the low six bits of the count. Both edges are guarded and deopt; the guards precede the pops, so a deopt resumes at an instruction that hasn't happened yet. */
             unsigned rb, ra;
             SlotKind kb, ka;
             if (e->depth < 2) return false;
             if (e->stack[e->depth - 1] != SLOT_INT) return false;
             if (e->stack[e->depth - 2] != SLOT_INT) return false;
 
-            /* A literal count settles both edges here rather than at run time,
-             * and the immediate-form shift is then exactly the interpreter's
-             * rule for that count: `<<` is the unsigned shift LSL performs and
-             * `>>` the arithmetic one ASR performs, for every count in 0..63.
-             * bitops shifts by 7, 3, 11, 1 and 31 and paid five instructions
-             * and two deopt sites for each. */
+            /* A literal count settles both edges here rather than at run time: the immediate-form shift then IS
+             * the interpreter's rule for that count. bitops shifts by 7, 3, 11, 1 and 31 and paid five instructions and two deopt sites for each before this. */
             int64_t kcount;
             bool kcountUsable =
                 (op == OP_SHL || op == OP_SHR) &&
@@ -5084,10 +4108,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value k = fn->chunk.constants.data[kIdx];
             if (!IS_INT(k)) return false;
 
-            /* `while i < n` and `if n < 2` are the same instruction here, and
-             * the constant fits the compare's own imm12 far more often than
-             * not -- so it gets one instruction rather than a movz and a
-             * three-register subs. */
+            /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's
+             * own imm12 far more often than not, so it costs one instruction rather than a movz plus a three-register subs. */
             int64_t kv = AS_INT(k);
             if (kv >= -4095 && kv <= 4095) {
                 emitCmpImm(e, localIn(e, slot, JIT_SCRATCH_C), kv);
@@ -5105,12 +4127,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned slot    = jaiReadU16(code + off + 1);
             uint32_t nameIdx = jaiReadU24(code + off + 3);
 
-            /* A maybe-instance reads like an instance once it is known not
-             * to be null. The program has usually just tested it -- `if node
-             * == null { return 0 }` -- but the tier does not track that, so
-             * the guard stands and costs one compare against zero. A null
-             * really arriving here deopts, and the interpreter raises the
-             * error it would have raised anyway. */
+            /* A maybe-instance reads like an instance once known not-null. The program has usually just tested
+             * it (`if node == null { return 0 }`) but the tier doesn't track that, so the guard stands and costs one compare against zero; a null arriving for real just deopts. */
             if (e->localKind[slot] != SLOT_INST &&
                 e->localKind[slot] != SLOT_MAYBE_INST) {
                 return false;
@@ -5130,13 +4148,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 jaiClassFieldInfo(e->localClass[slot], AS_STRING(nameVal));
             if (info == NULL || info->isStatic) return false;
 
-            /* Which type this field holds is read off the live receiver, so
-             * the tier specialises to what the program actually stores rather
-             * than to a declaration. That is only possible for a parameter,
-             * which is why the slot is capped at the arity above: a local
-             * assigned further in has no value to look at yet. */
-            /* A parameter has its argument to look at; anything else has
-             * whatever was bound to it. */
+            /* Field type is read off the LIVE receiver, so the tier specialises to what the program actually
+             * stores rather than a declaration -- only possible for a parameter (hence the arity cap above): a local assigned further in has no value yet to look at. */
             Value seen = localObserved(e, slot) ? e->observed[slot]
                                                 : e->localSeen[slot];
             if (!IS_INSTANCE(seen)) return false;
@@ -5150,12 +4163,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
             else if (IS_INSTANCE(fieldVal) || IS_NULL(fieldVal)) {
-                /* A tree's `left` is a Node on one call and null on the next,
-                 * and its leaves are half of it. A leaf has no class to read,
-                 * so the receiver's own class is the guess -- a nullable
-                 * instance field is a linked structure far more often than
-                 * not -- and the class guard below makes the guess safe: being
-                 * wrong deopts, it does not miscompile. */
+                /* A tree's `left` is a Node on one call and null on the next; a leaf has no class to read, so the
+                 * receiver's own class is the guess (a nullable instance field is usually a linked structure) -- safe because the class guard below just deopts if wrong, never miscompiles. */
                 kind = SLOT_MAYBE_INST;
                 tag  = VAL_OBJ;
                 fcls = IS_INSTANCE(fieldVal) ? AS_INSTANCE(fieldVal)->klass
@@ -5172,12 +4181,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned recv = localIn(e, slot, JIT_SCRATCH_C);
             SlotKind already = knownFieldKind(e, (int)slot, info->slot);
             if (kind == SLOT_MAYBE_INST) {
-                /* Three guards, and the receiver is the trick that makes them
-                 * branch-free. It is a live instance already -- the entry
-                 * guard or the null check above saw to that -- so when the
-                 * field is null the loads below are aimed at the receiver
-                 * instead, which is a real object of the right type. Nothing
-                 * ever dereferences zero. */
+                /* Three guards, branch-free via a trick: when the field is null, the loads below are redirected at
+                 * the receiver instead (already a live instance, per the entry guard/null check above) -- a real object of the right type, so nothing ever dereferences zero. */
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));       /* tag */
                 emit(e, jaiA64LdrX(JIT_SCRATCH_D, recv, base + 8));   /* value */
                 emit(e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
@@ -5243,14 +4248,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_GET_LOCAL2: {
             unsigned a = jaiReadU16(code + off + 1);
             unsigned b = jaiReadU16(code + off + 3);
-            /* Reading the second local checks a tag when that slot is dynamic,
-             * and a guard may not be reached with a borrow live -- the stub
-             * writes float entries out of fpRegAt, and a borrowed one is not
-             * there. The first local therefore takes a copy rather than a
-             * borrow when the second one is going to guard. `dt * b.vx` in
-             * nbody's second loop is exactly this shape: `dt` is a float with
-             * a home and `b` is the loop variable, which took two kinds and so
-             * became dynamic. */
+            /* The second local may guard (if dynamic), and a guard can't be reached with a borrow live -- the
+             * deopt stub writes float entries out of fpRegAt, where a borrowed one isn't. So the FIRST local takes a copy instead of a borrow whenever the second is going to guard: `dt * b.vx` in nbody's second loop is exactly this shape (`dt` has a home, `b` is dynamic). */
             bool guardFollows = b <= JIT_MAX_SLOTS && e->dynamicLocal[b];
             for (unsigned k = 0; k < 2; k++) {
                 unsigned slot = k == 0 ? a : b;
@@ -5291,20 +4290,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_SET_FIELD: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
-            /* The stack is receiver then value, and both are dropped. The
-             * receiver's class is read off its stack entry, not guessed from
-             * the locals: two instance locals of different classes would make
-             * any guess a silently wrong field offset. */
+            /* Receiver then value, both dropped. The receiver's class comes from its STACK entry, not guessed
+             * from the locals: two instance locals of different classes would make any guess a silently wrong field offset. */
             if (e->depth < 2) return false;
             ObjClass *klass = e->stackClass[e->depth - 2];
             int recvLocal = e->stackLocal[e->depth - 2];
 
             unsigned rv, rr;
             SlotKind kv, kr;
-            /* A float already in the FP bank is stored from there: `str d`
-             * rather than the `fmov x, d` popValue would emit followed by
-             * `str x`. Captured before the pop, because popping is what clears
-             * the bit and renames the index. */
+            /* A float already in the FP bank is stored from there (`str d`, not popValue's `fmov x,d` + `str x`)
+             * -- captured before the pop, since popping is what clears the bit and renames the index. */
             bool vIsFp = e->depth >= 1 && e->valueDepth >= 1 &&
                          e->stack[e->depth - 1] == SLOT_FLOAT &&
                          (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
@@ -5316,11 +4311,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (!popValue(e, &rr, &kr)) return false;
             if (kr != SLOT_INST) return false;
-            /* Only a number goes in. Storing an object would put a pointer the
-             * collector has not seen into a field, and while this tier cannot
-             * allocate -- so nothing can move or be swept while it runs -- the
-             * value would still have to be one the caller already had rooted.
-             * Not worth the argument for what it buys. */
+            /* Only a number goes in: storing an object would put a pointer the collector hasn't seen into a
+             * field. This tier can't allocate, so nothing can move or be swept while it runs, but the value would still need to already be rooted by the caller -- not worth it for what it buys. */
             if (kv != SLOT_INT && kv != SLOT_FLOAT) return false;
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
@@ -5344,14 +4336,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_RETURN_NULL: {
-            /* An OSR form's x0 is the bytecode offset to resume at, not a
-             * value -- see jaiJitEnterOsr, which does `*resumeAt = at`. The
-             * return sequence below is the function tier's and leaves the
-             * returned value in x0, so a `return` inside a compiled loop hands
-             * the interpreter an integer or a pointer as an instruction
-             * offset. `for i in 0..n { if .. { return x } }` miscompiled that
-             * way in released builds: 14 runs in 20 wrong, and 10 in 10 under
-             * --gc-stress. */
+            /* An OSR form's x0 is the resume bytecode offset (see jaiJitEnterOsr's `*resumeAt = at`), but this
+             * return sequence is the function tier's and leaves the VALUE in x0 -- a `return` inside a compiled loop once handed the interpreter an int/pointer as an instruction offset instead, miscompiling `for i in 0..n { if .. { return x } }` (14/20 wrong in released builds, 10/10 under --gc-stress). */
             if (e->osr) {
                 e->whyNot = "a return inside an OSR loop";
                 return false;
@@ -5512,10 +4498,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_POW: {
-            /* Only `** 0.5`, which is a square root. C says pow(x, 0.5) is
-             * sqrt(x) for every x >= +0, and differs only for -0.0, where pow
-             * gives +0.0 and sqrt gives -0.0. So a negative sign bit -- which
-             * is what tells -0.0 from +0.0 -- goes back to the interpreter. */
+            /* Only `** 0.5` (square root): C's pow(x,0.5) is sqrt(x) for x >= +0, differing only at -0.0 (pow
+             * gives +0.0, sqrt gives -0.0) -- so a negative sign bit sends this back to the interpreter. */
             if (e->depth < 2) return false;
             if (e->stack[e->depth - 1] != SLOT_FLOAT) return false;
             if (e->stack[e->depth - 2] != SLOT_FLOAT) return false;
@@ -5524,11 +4508,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "an exponent other than 0.5";
                 return false;
             }
-            /* Wholly in the FP bank. The sign bit is the one thing that needs
-             * an integer register, and taking it with an `fmov` out of the d
-             * register costs one instruction where routing the operand
-             * through X cost four -- two for the exponent constant nothing
-             * reads, two more around the fsqrt. */
+            /* Wholly in the FP bank: the sign bit is the only thing needing an integer register, and an `fmov`
+             * out of d costs one instruction where routing the operand through X cost four (two for an exponent constant nothing reads, two more around the fsqrt). */
             unsigned ia = e->valueDepth - 2;
             unsigned da = fpOperand(e, ia);
             emit(e, jaiA64FmovXD(JIT_SCRATCH_A, da));
@@ -5557,12 +4538,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->stack[e->depth - 2] != SLOT_INT) return false;
             unsigned ry = pushReg(e) - 1, rx = pushReg(e) - 2;
 
-            /* A literal modulus decides both guards, and a literal power of
-             * two decides the whole thing. Floor remainder by a positive m is
-             * the unique r in [0, m) with x = m*q + r; for m = 2^s that is the
-             * low s bits, which two's complement already holds -- so it is
-             * exact for negative dividends, where the truncating `msub` below
-             * is not and the correction after it exists to fix that. */
+            /* A literal power-of-two modulus decides the whole thing: floor remainder by 2^s is exactly the low
+             * s bits, which two's complement already holds -- exact even for negative dividends, unlike the truncating `msub` path below (whose correction exists to fix exactly that). */
             int64_t kmod = 0;
             bool kmodKnown = literalIntOperand(fn, prevOff, off, &kmod) &&
                              kmod != 0 && kmod != -1;
@@ -5587,13 +4564,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchOnDeopt(e, JAI_A64_EQ);
             }
 
-            /* The remainder lands in `rx`, which is where the result belongs:
-             * two entries come off and one goes on, so the surviving entry is
-             * the lower of the two and keeps its register. Writing it here
-             * rather than into a scratch and copying at the end is what
-             * removes the trailing `mov`, and it is safe because every guard
-             * this arm emits is above this line -- nothing below can deopt and
-             * find the dividend gone. */
+            /* Remainder lands in `rx`, where the result belongs: two entries come off, one goes on, so the
+             * surviving (lower) entry keeps its register -- removes a trailing `mov`. Safe because every guard this arm emits is above this line: nothing below can deopt and find the dividend gone. */
             emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, ry));
             emit(e, jaiA64MsubX(rx, JIT_SCRATCH_B, ry, rx));
             emitFloorFixup(e, rx, ry, kmodKnown, kmod,
@@ -5608,10 +4580,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_MOD_INT_CONST: {
-            /* `<int k>; MOD` fused: floor remainder by a constant. k cannot be
-             * zero -- fusion only happens when it is known non-zero -- and -1
-             * goes back to the interpreter so INT64_MIN %% -1 stays its
-             * problem. */
+            /* `<int k>; MOD` fused: k is known non-zero (fusion requires it); -1 goes back to the interpreter so
+             * INT64_MIN %% -1 stays its problem. */
             int16_t imm = jaiReadI16(code + off + 1);
             if (imm == 0 || imm == -1) return false;
             if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_INT) return false;
@@ -5643,12 +4613,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT || kb != SLOT_INT) return false;
             rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
-            /* A literal divisor decides both guards at compile time, and a
-             * literal power of two decides the whole thing: floor(x / 2^s) is
-             * `asr x, #s` for every int64 x, negative ones included, because
-             * asr rounds toward minus infinity and that is precisely what the
-             * correction below exists to reproduce. Fifteen instructions and
-             * two deopt sites become one instruction and none. */
+            /* A literal power-of-two divisor decides the whole thing: floor(x / 2^s) is exactly `asr x, #s` for
+             * every int64 x (negative included), since asr already rounds toward minus infinity -- what the correction below exists to reproduce for the general case. */
             int64_t kdiv = 0;
             bool kdivKnown = literalIntOperand(fn, prevOff, off, &kdiv) &&
                              kdiv != 0 && kdiv != -1;
@@ -5663,11 +4629,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
 
-            /* Zero, and -1 with it: the interpreter reports the
-             * division-by-zero, and INT64_MIN / -1 is the one quotient that
-             * does not fit. Both are rare enough that declining -1 outright
-             * costs nothing and removes the special case. A literal divisor
-             * has already answered both. */
+            /* Zero and -1 both decline: the interpreter reports division-by-zero, and INT64_MIN / -1 is the one
+             * quotient that doesn't fit -- both rare enough that declining -1 outright costs nothing. A literal divisor has already answered both. */
             if (!kdivKnown) {
                 emit(e, jaiA64SubsXImm(31, rb, 0));
                 branchOnDeopt(e, JAI_A64_EQ);
@@ -5682,10 +4645,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rq = pushReg(e) - 1;
 
-            /* The quotient lands in the register the dividend was in -- the
-             * push reuses it -- so the dividend is copied out first. Without
-             * that, msub read a value sdiv had already overwritten and 7 // 2
-             * came out 2. */
+            /* Quotient lands in the register the dividend was in (the push reuses it), so the dividend is copied
+             * out first -- without that, msub read a value sdiv had already overwritten and 7 // 2 came out 2. */
             emit(e, jaiA64MovX(JIT_SCRATCH_C, ra));
 
             /* Truncating quotient, then one down when the remainder is nonzero
@@ -5693,10 +4654,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * this floor division rather than C's. */
             emit(e, jaiA64SdivX(rq, JIT_SCRATCH_C, rb));
             emit(e, jaiA64MsubX(JIT_SCRATCH_A, rq, rb, JIT_SCRATCH_C));
-            /* One down when the remainder is nonzero and its sign differs
-             * from the divisor's. A literal divisor makes that a single sign
-             * test on the remainder -- see emitFloorFixup. JIT_SCRATCH_B is
-             * free again here: the quotient is in rq, not in it. */
+            /* A literal divisor makes the correction a single sign test on the remainder (see emitFloorFixup).
+             * JIT_SCRATCH_B is free again here -- the quotient is in rq, not in it. */
             emitFloorFixup(e, JIT_SCRATCH_A, rb, kdivKnown, kdiv,
                            jaiA64SubXImm(rq, rq, 1));
             off += 1;
@@ -5718,13 +4677,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 IS_STRING(fn->chunk.constants.data[nameIdx]) &&
                 strcmp(AS_STRING(fn->chunk.constants.data[nameIdx])->chars,
                        "push") == 0) {
-                /* Appending to a list is a bounds check and two stores, and
-                 * going through a descriptor and a native for it costs far
-                 * more than the work. `list_ops` pushes a million elements and
-                 * spent all of it on the call. A full list goes out to a
-                 * three-argument realloc helper and comes straight back --
-                 * see the `grow` stubs, and the note there for why this used
-                 * to be a deopt and what that cost. */
+                /* Appending to a list is a bounds check and two stores -- a descriptor+native round trip costs far
+                 * more than the work itself (list_ops spent all its time on the call). A full list goes out to the `grow` stubs' realloc helper and comes straight back; see there for why this used to be a deopt and what that cost. */
                 SlotKind vk = e->stack[e->depth - 1];
                 unsigned vtag = vk == SLOT_INT   ? VAL_INT
                               : vk == SLOT_FLOAT ? VAL_FLOAT
@@ -5794,11 +4748,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
 
             if (rk == SLOT_INST) {
-                /* A method whose whole body is one arithmetic expression over
-                 * its receiver and arguments is worth putting inline: the call
-                 * around it costs more than the expression does. Vec2.dot is
-                 * four field reads, two multiplies and an add, reached through
-                 * a descriptor, a helper and a compiled entry. */
+                /* A method whose whole body is one arithmetic expression over receiver+arguments is worth inlining:
+                 * the call costs more than the expression. Vec2.dot is four field reads, two multiplies and an add, reached through a descriptor, a helper and a compiled entry. */
                 if (inlineMethod(e, closure, nameIdx, argc, off)) {
                     off += 7;
                     break;
@@ -5836,21 +4787,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
 
-                /* Straight to the method's compiled entry when the receiver's
-                 * class is fixed here -- which it is, or this arm would not
-                 * have been reached: SLOT_INST carries a shape the caller has
-                 * already guarded, so the "inline cache" for the dispatch is
-                 * the model itself and costs nothing at run time.
-                 *
-                 * What that skips is the whole of jitInvokeMethod ->
-                 * jaiCallMethodWithReceiver -> invokeCallable -> callClosure
-                 * -> jaiJitEnterFunc -> jitArgIn, which is C glue between two
-                 * compiled bodies. On object_dispatch, by `sample`, those five
-                 * were 43% of the benchmark.
-                 *
-                 * Falling back rather than declining matters for the same
-                 * reason it does for a global call: the descriptor path speaks
-                 * a wider language. */
+                /* Straight to the method's compiled entry since the receiver's class is fixed here (SLOT_INST
+                 * carries a shape the caller already guarded) -- the "inline cache" is the model itself, free at run time. Skips the whole jitInvokeMethod -> jaiCallMethodWithReceiver -> invokeCallable -> callClosure -> jaiJitEnterFunc -> jitArgIn chain of C glue between two compiled bodies, which was a large fraction of object_dispatch. Falls back rather than declines, for the same reason a global call does: the descriptor path speaks a wider language. */
                 {
                     const char *saved = e->whyNot;
                     if (emitDirectCall(e, fn, mfn, method, -1, ridx, argc,
@@ -5887,10 +4825,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
                 branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
-                /* A bool is one byte; see the note in the SLOT_OBJ arm below.
-                 * Latent here since this path was written -- it needs a method
-                 * returning bool that emitDirectCall declines, which nothing
-                 * in the suite does -- and fixed with the arm that found it. */
+                /* Bool result is one byte, not eight (see the SLOT_OBJ arm below for why) -- latent here since this
+                 * was written: needs a bool-returning method emitDirectCall declines, which nothing in the suite exercises. */
                 if (rkind == SLOT_BOOL) {
                     emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
                 } else {
@@ -5915,31 +4851,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
 
             if (rk == SLOT_OBJ) {
-                /* A built-in method on a receiver the model types only as
-                 * "some object" -- a dict, a string, a set, a tuple. Three
-                 * things have to be answered and only the third was ever the
-                 * blocker.
-                 *
-                 * WHICH METHOD. From the observed receiver, the way the
-                 * SLOT_LIST arm below does it: a built-in method is a function
-                 * of (receiver type, name) and the name is in the instruction.
-                 *
-                 * THAT IT IS STILL THAT TYPE. SLOT_OBJ pins nothing, and
-                 * `for x in [d, "s"]` is enough to arrive here with either, so
-                 * the object type is guarded before anything is consumed. A
-                 * miss resumes this instruction with the receiver and every
-                 * argument still on the interpreter's stack.
-                 *
-                 * WHAT COMES BACK. `dict.get` has no result kind and no
-                 * argument determines one, and the tier had no per-call-site
-                 * feedback to predict from -- `stackSeen` comes from a live
-                 * frame's locals and a call result has never been in one. It
-                 * does now: InlineCache::resultKind, written where the cache
-                 * is filled. It is a PREDICTION and the tag guard after the
-                 * call is what makes it sound, deoptimising to the instruction
-                 * AFTER the call because the call has happened and must not
-                 * happen twice. A result the next instruction pops needs no
-                 * prediction at all. */
+                /* Built-in method on a receiver typed only as "some object" (dict/string/set/tuple). Three things:
+                 * WHICH METHOD -- from the observed receiver, like the SLOT_LIST arm below (a builtin is a function of receiver-type + name). THAT IT'S STILL THAT TYPE -- SLOT_OBJ pins nothing (`for x in [d, "s"]` mixes types), so the object type is guarded before anything is consumed; a miss resumes with receiver+args untouched. WHAT COMES BACK -- predicted via InlineCache::resultKind (no per-call-site feedback existed before), and the tag guard after the call is what makes the prediction sound, deopting to the instruction AFTER the call since it already happened. */
                 Value oseen = e->stackSeen[ridx];
                 if (!IS_OBJ(oseen)) {
                     e->whyNot = "an invoke on an object with nothing to look at";
@@ -5996,14 +4909,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, orat));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, owantTag));
                 branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
-                /* One byte for a bool. `BOOL_VAL` writes the union's `boolean`
-                 * member and nothing above it, so an 8-byte load puts whatever
-                 * that Value's slot held before into a register a SLOT_BOOL is
-                 * required to hold 0 or 1 in -- and every consumer of one is a
-                 * `cbnz` on the whole word. It cost a day here: the front end
-                 * is itself compiled, and a `flags.get(name, false)` inside it
-                 * came back true, so jaithon reported `list[fn(T) -> bool]`
-                 * for a parameter that was not variadic. */
+                /* One byte for a bool: BOOL_VAL writes only the union's `boolean` member, so an 8-byte load would
+                 * pull in whatever garbage was above it in that Value's slot, and every SLOT_BOOL consumer does `cbnz` on the whole word. Cost a day: the (self-hosted) front end's own `flags.get(name, false)` came back true from garbage bits, misreporting a non-variadic parameter as `list[fn(T) -> bool]`. */
                 if (orkind == SLOT_BOOL) {
                     emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, orat + 8));
                 } else {
@@ -6018,11 +4925,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
 
-            /* Which method a name means depends on the receiver's type, not on
-             * what it holds -- so when the receiver is a list this body built
-             * and there is no sample to look at, an empty one answers just as
-             * well. Rooted across the lookup because resolving allocates the
-             * bound wrapper; only the native is kept, and that outlives it. */
+            /* Which method a name means depends on the receiver's type, not what it holds -- so for a list this
+             * body built with no sample to look at, an empty probe list answers just as well. Rooted across the lookup since resolving allocates the bound wrapper; only the native is kept, and that outlives it. */
             Value probe = e->stackSeen[ridx];
             bool madeProbe = false;
             if (!IS_LIST(probe)) {
@@ -6038,21 +4942,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value nativeVal = IS_BOUND(bound) ? AS_BOUND(bound)->method : bound;
             if (!IS_NATIVE(nativeVal)) return false;
 
-            /* What comes back. `len` is an int; anything whose result is
-             * dropped on the next instruction needs no kind at all. Nothing
-             * else, because a call's result cannot be guarded -- the call
-             * already happened, so a wrong guess has nowhere to go. */
+            /* What comes back: `len` is an int; anything whose result is dropped on the next instruction needs no
+             * kind at all. Nothing else -- a call's result can't be guarded, since the call already happened and a wrong guess has nowhere to go. */
             const char *mname = AS_STRING(nameVal)->chars;
             bool discarded = (off + 7 < count && code[off + 7] == OP_POP);
             bool isLen = strcmp(mname, "len") == 0 && argc == 0;
             if (!isLen && !discarded) return false;
 
-            /* `xs.len()` on a list is one field. Going out through the
-             * descriptor for it meant a GC root push and pop, a bound-method
-             * resolve, an arity check and a native call, all to read a 32-bit
-             * count -- and `while i < xs.len()` is the ordinary loop in this
-             * language, so that was paid once per iteration. The receiver's
-             * kind is already known here, which is the whole guard needed. */
+            /* `xs.len()` on a list is one field read. Through the descriptor it meant a GC root push/pop, a
+             * bound-method resolve, an arity check and a native call just to read a 32-bit count -- paid every iteration of the ordinary `while i < xs.len()` loop. The receiver's kind is already known here, which is the whole guard needed. */
             if (isLen && e->stack[ridx] == SLOT_LIST) {
                 unsigned rList = pushReg(e) - 1;
                 unsigned r;
@@ -6106,7 +5004,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_GET_ITER: {
             if (!e->pendingRange) {
-                /* Not a range: iterate whatever it is, through the runtime. */
                 if (e->depth == 0) return false;
                 if (e->stack[e->depth - 1] != SLOT_LIST) {
                     e->whyNot = "iterating something other than a list or range";
@@ -6131,12 +5028,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 unsigned rdrop;
                 if (!popValue(e, &rdrop, NULL)) return false;
-                /* Shape 1 marks an iterator the runtime has to step; a
-                 * range is 0 and gets the inline path. It rides on the stack
-                 * entry rather than on the Emit because a function can build
-                 * both -- nbody's `advance` runs two range loops and then a
-                 * list loop, and one flag for the whole compile made the path
-                 * a FOR_ITER_BIND took depend on what came before it. */
+                /* Shape 1 marks an iterator the runtime has to step; a range is 0 and gets the inline path. Rides on
+                 * the stack entry, not the Emit, since a function can build both -- nbody's `advance` runs two range loops then a list loop, and one whole-compile flag made the path taken depend on what came before it. */
                 if (!pushValue3(e, SLOT_ITER, 1, NULL, sample, -1)) return false;
                 emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                    e->descOffset +
@@ -6146,7 +5039,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
             if (!e->callsOut) return false;
-            /* start, stop and the inclusive flag go in as arguments. */
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             emitConst64(e, pushReg(e) - 1, e->rangeInclusive ? 1 : 0);
             if (!emitDescriptor(e, NULL_VAL, e->depth - 3, 3,
@@ -6171,11 +5063,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* A loop this body built the iterator for: the index lives in the
              * iterator, so every iteration loads and stores it, and a deopt
              * needs nothing -- what is on the stack is already current. */
-            /* Only the loop at the OSR entry point owns the reserved
-             * iterator registers. A FOR_ITER_BIND nested inside it built its
-             * own iterator and is an ordinary one -- refusing it stopped the
-             * outer loops of spectral, mandelbrot, matrix_mul and life from
-             * compiling at all, while their inner loops compiled fine. */
+            /* Only the loop at the OSR entry point owns the reserved iterator registers -- a nested FOR_ITER_BIND
+             * built its own iterator and is an ordinary one. Refusing it stopped the outer loops of spectral, mandelbrot, matrix_mul and life from compiling at all, while their inner loops compiled fine. */
             if (!e->osr || !e->hasIter || (uint32_t)off != e->osrTop) {
                 if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER) {
                     return false;
@@ -6241,14 +5130,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
                               JAI_A64_GE,
                               (int)stackSignatureAt(e, e->depth - 1));
-                /* A range yields `start + index * step`, not the index --
-                 * see jaiIterNext's ITER_RANGE case. The index is always
-                 * zero-based, so using it as the value is only right for
-                 * `0..n` in unit steps. `for j in i + 1..n` counted from zero
-                 * instead of from i+1, which is a plausible wrong answer
-                 * rather than a crash: nested loops summed the wrong pairs.
-                 * The limit register is dead after the compare, so it carries
-                 * the index across to the increment. */
+                /* A range yields `start + index * step`, not the index itself (see jaiIterNext's ITER_RANGE case) --
+                 * the index is always zero-based, so using it directly is only right for `0..n` in unit steps. `for j in i + 1..n` once counted from zero instead of i+1, a plausible wrong answer (nested loops summed the wrong pairs), not a crash. The dead-after-compare limit register carries the index across to the increment. */
                 emit(e, jaiA64MovX(JIT_SCRATCH_B, JIT_SCRATCH_A));
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
                                    (unsigned)offsetof(ObjIter, source) + 8));
@@ -6267,10 +5150,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 5;
                 break;
             }
-            /* Only as the head of the loop being compiled, and only for a
-             * range from zero in unit steps -- that is what makes the yielded
-             * value the index itself. Everything else about the iterator is a
-             * runtime fact, checked at the entry. */
+            /* Only as the head of the loop being compiled, and only for a range from zero in unit steps -- that's
+             * what makes the yielded value the index itself. Everything else about the iterator is a runtime fact, checked at entry. */
             if (!e->osr || !e->hasIter) return false;
             if ((uint32_t)off != e->osrTop) return false;
             int16_t  jump = jaiReadI16(code + off + 1);
@@ -6278,12 +5159,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!localInRange(e, slot)) return false;
 
             if (e->iterKind == 2) {
-                /* A list at the loop head. The reserved registers mean what
-                 * they do for a range except that JIT_START_REG holds the
-                 * ObjList rather than a first value. Without this a top-level
-                 * `for x in xs` was never even attempted -- the gate refused
-                 * anything that was not a range before compileOsr was called,
-                 * so not even a decline was recorded. */
+                /* A list at the loop head: reserved registers mean what they do for a range, except JIT_START_REG
+                 * holds the ObjList instead of a first value. Without this, a top-level `for x in xs` was never even attempted -- the gate refused anything not a range before compileOsr ran, so not even a decline was recorded. */
                 Value sample = e->elemSample;
                 SlotKind ek;
                 unsigned etag;
@@ -6340,12 +5217,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
                 if (ek == SLOT_INST) {
                     emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
-                    /* VAL_OBJ is every heap object, not just an instance. A
-                     * list holding a string beside the instance the sample saw
-                     * passes the tag test, and reading `klass` off an ObjString
-                     * is a load one word past its header -- which is a live
-                     * pointer in several subtypes, so it does not fault, it
-                     * just answers wrongly. Check the type first. */
+                    /* Same hazard as above: VAL_OBJ covers every heap object, so the type is checked before `klass` is read. */
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
                                        (unsigned)offsetof(Obj, type)));
                     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
@@ -6379,10 +5251,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
             branchTo(e, e->iterExit, true, JAI_A64_GE);
-            /* The value is start + index, not the index -- `for j in i + 1..n`
-             * is the inner loop of nbody's advance -- and both registers were
-             * biased by the start in the prologue, so the value is the index
-             * register and the add that used to be here is gone. */
+            /* Value is start + index, not the index (`for j in i + 1..n` is nbody advance's inner loop): both
+             * registers were biased by the start in the prologue, so the value IS the index register and the add that used to be here is gone. */
             localOut(e, slot, JIT_IDX_REG);
             emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
             off += 5;
@@ -6390,12 +5260,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_GET_INDEX: {
-            /* `s[i]` on a string. Every guard is a load and a compare, and the
-             * result is a table lookup rather than an allocation, because the
-             * 128 one-byte strings are made once and shared. Without this the
-             * whole loop around a character scan declines, which is why
-             * `str_search` ran interpreted end to end -- and a scanner reading
-             * one byte at a time is the shape of every lexer. */
+            /* `s[i]` on a string: every guard is a load+compare, and the result is a table lookup, not an
+             * allocation (the 128 one-byte strings are made once and shared). Without this the whole loop around a character scan declines -- why `str_search` ran interpreted end to end, and every lexer scans one byte at a time. */
             if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_INT &&
                 e->stack[e->depth - 2] == SLOT_OBJ &&
                 IS_STRING(e->stackSeen[e->depth - 2])) {
@@ -6457,12 +5323,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 1;
                 break;
             }
-            /* list[i], with the index normalised the way jaiNormalizeIndex
-             * does it and one unsigned compare covering both ends. Anything
-             * out of range, or an element that is not the kind seen at compile
-             * time, goes back to the interpreter -- which raises the IndexError
-             * or re-reads the element, whichever it is. Reading an element has
-             * no effect, so resuming at this instruction is sound. */
+            /* Index normalised as jaiNormalizeIndex does it, one unsigned compare covering both ends. Out of
+             * range, or an element not the kind seen at compile time, goes back to the interpreter -- reading an element has no effect, so resuming at this instruction is always sound. */
             if (e->depth < 2) return false;
             if (e->stack[e->depth - 2] != SLOT_LIST) return false;
             if (e->stack[e->depth - 1] != SLOT_INT) return false;
@@ -6487,13 +5349,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 tag = VAL_OBJ;
             }
             else if (IS_STRING(elem)) {
-                /* A list of strings, held opaquely. Everything that then wants
-                 * to know it is a string -- the interned compare, `s[i]` --
-                 * checks OBJ_STRING for itself, which is the same contract a
-                 * SLOT_OBJ local has always had: the sample says what to
-                 * specialise for, the guard says whether it was right.
-                 * `str_search` builds its text out of `chunks[seed % 8]` and
-                 * declined that whole loop forty times over. */
+                /* A list of strings, held opaquely: the interned compare and `s[i]` each check OBJ_STRING for
+                 * themselves, same contract as any SLOT_OBJ local (sample specialises, guard confirms). `str_search` builds text out of `chunks[seed %% 8]` and declined that whole loop forty times over before this. */
                 kind = SLOT_OBJ;
                 tag = VAL_OBJ;
             }
@@ -6507,11 +5364,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 elemShape = elemClass->shapeId;
             } else return false;
 
-            /* One `ldp` for both header fields. `items` is at +16 and
-             * `count`/`capacity` are the adjacent int32s at +24, so the pair's
-             * second half is `count | capacity << 32` and the bounds test reads
-             * it with uxtw. That is one instruction per element read, and life
-             * does nine of them per cell. */
+            /* One `ldp` for both header fields: `items` at +16, `count`/`capacity` the adjacent int32s at +24, so
+             * the pair's second half is `count | capacity << 32` and the bounds test reads it with uxtw -- one instruction per element read (life does nine per cell). */
             emitListHeader(e, rList, JIT_SCRATCH_C, JIT_SCRATCH_A);
             emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B, true);
 
@@ -6536,10 +5390,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &d1, NULL)) return false;
             if (!popValue(e, &d2, NULL)) return false;
             if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) return false;
-            /* A bool's payload is one byte: `BOOL_VAL` compiles to `strb`, so
-             * the seven bytes above it are whatever the slot held before. An
-             * 8-byte load would put that in a register a SLOT_BOOL is required
-             * to hold 0 or 1 in, and `if xs[i]` is `cbnz` on the whole word. */
+            /* Bool payload is one byte (`BOOL_VAL` compiles to `strb`), so the other seven bytes are stale --
+             * an 8-byte load would hand a SLOT_BOOL register (required to hold exactly 0 or 1, since every consumer does `cbnz` on the whole word) garbage. */
             if (kind == SLOT_BOOL) {
                 emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_C, 8));
             } else if (kind == SLOT_FLOAT &&
@@ -6559,22 +5411,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_SET_INDEX: {
-            /* list[i] = v, the write half of OP_GET_INDEX and normalised the
-             * same way. Every guard runs before the store, so a deopt here
-             * still resumes at an instruction that has not happened yet.
-             * Sixteen refusals across the benchmarks came from its absence --
-             * `queens` could not compile the function that does the work. */
+            /* Write half of OP_GET_INDEX, normalised the same way; every guard runs before the store, so a deopt
+             * here still resumes at an instruction that hasn't happened yet. Sixteen refusals across the benchmarks came from its absence -- `queens` couldn't compile the function that does the work. */
             if (e->depth < 3) return false;
             if (e->stack[e->depth - 3] == SLOT_OBJ) {
-                /* `d[k] = v`. A dict is as ordinary a container in this
-                 * language as a list, and without this the invoke arm above
-                 * buys nothing: dict_ops' loop moved its decline from the
-                 * `get` straight to this store, and a loop that declines
-                 * anywhere runs interpreted end to end.
-                 *
-                 * The object type is guarded before anything is consumed, so
-                 * a miss resumes this instruction with the container, the key
-                 * and the value all still on the interpreter's stack. */
+                /* `d[k] = v`: a dict is as ordinary a container here as a list -- without this, dict_ops' loop just
+                 * moved its decline from `get` to this store (a loop that declines anywhere runs interpreted end to end). Object type guarded before anything is consumed, so a miss resumes with container/key/value all still on the interpreter's stack. */
                 unsigned sidx = e->depth - 3;
                 if (!IS_DICT(e->stackSeen[sidx])) {
                     e->whyNot = "an index store into an object that is not a dict";
@@ -6687,23 +5529,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_GET_GLOBAL: {
-            /* TWO WAYS OUT OF HERE, and they carry different obligations.
-             *
-             * BY VALUE: globalIsSelf, globalClass, globalFunction and
-             * globalNative resolve the binding at compile time and bake it in.
-             * Nothing re-checks it at run time, so ObjModule::version has to
-             * retire the whole form when such a binding could have changed --
-             * which is what jaiModuleSet's jaiValueIsInertGlobal test decides.
-             * Teach any of those four a further kind of value, or teach this
-             * arm to constant-fold an int out of `let ITERS = ..`, and
-             * jaiValueIsInertGlobal must stop calling that kind inert.
-             *
-             * BY ADDRESS: the value case below bakes the JaiEntry*, not the
-             * value, and re-loads it behind a tag guard -- plus an Obj.type
-             * guard and a class-shape guard where the kind needs one -- on
-             * EVERY access. It depends on the table's layout, guarded by
-             * JaiTable::keyVersion, and on nothing ObjModule::version
-             * protects. */
+            /* Two resolution paths with different obligations. BY VALUE (globalIsSelf/globalClass/globalFunction/
+             * globalNative): resolved and baked at compile time, nothing rechecked at run time, so ObjModule::version must retire the whole form whenever such a binding could change (jaiModuleSet's jaiValueIsInertGlobal decides that) -- teaching any of the four a new value kind, or constant-folding a module int here, means updating jaiValueIsInertGlobal too. BY ADDRESS (the value case below): bakes the JaiEntry*, not the value, and re-loads it behind a tag guard (+ Obj.type/class-shape guards where needed) on EVERY access -- depends on JaiTable::keyVersion, not on ObjModule::version. */
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             if (globalIsSelf(closure, nameIdx)) {
                 if (!pushSelf(e)) return false;
@@ -6733,15 +5560,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 Value nv;
                 ObjNative *nat = globalNative(closure, nameIdx, &nv);
                 if (nat == NULL) {
-                    /* A global holding a plain value -- an int, a float, a
-                     * list, an instance. Its storage is a JaiEntry whose
-                     * address is fixed once the entry exists, so the load is
-                     * one `ldr` behind two guards: the table has not moved,
-                     * and the value still has the kind this was compiled for.
-                     *
-                     * Refusing this is what declined every loop that so much
-                     * as reads a module-level variable, which since the
-                     * benchmarks moved to module scope is most of them. */
+                    /* A global holding a plain value: storage is a JaiEntry whose address is fixed once it exists, so the
+                     * load is one `ldr` behind two guards (table hasn't moved, value still has the compiled-for kind). Refusing this declined every loop reading a module-level variable -- most benchmarks, once they moved to module scope. */
                     Value gvv = NULL_VAL;
                     JaiEntry *gslot = globalSlot(e, closure, nameIdx, &gvv);
                     SlotKind gk = SLOT_OPAQUE;
@@ -6767,10 +5587,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
                                            (unsigned)offsetof(JaiEntry, value) + 8u));
                         if (gk == SLOT_INST || gk == SLOT_LIST) {
-                            /* VAL_OBJ is every heap object, so the tag alone
-                             * does not say this is an instance -- reading a
-                             * class pointer off an ObjString answers wrongly
-                             * rather than faulting. */
+                            /* VAL_OBJ is every heap object; the tag alone doesn't confirm the specific type, so it's checked before the class pointer is read. */
                             emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C,
                                                   (unsigned)offsetof(Obj, type)));
                             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B,
@@ -6842,16 +5659,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             SlotKind sk = e->stack[e->depth - 1];
             if (sk != SLOT_INT && sk != SLOT_FLOAT && sk != SLOT_BOOL &&
                 sk != SLOT_LIST && sk != SLOT_INST && sk != SLOT_MAYBE_INST) {
-                /* SLOT_OBJ is deliberately NOT on this list. It means "some
-                 * heap object of a type this tier does not model", which
-                 * includes a closure -- the OP_CALL arm below calls one --
-                 * and storing a closure into a global rebinds a callee that a
-                 * compiled form, possibly this one a few instructions above,
-                 * has already baked BY VALUE. ObjModule::version retires that
-                 * form at its next ENTRY, not in the middle of a body, so it
-                 * would be a wrong answer rather than a decline. Every kind
-                 * left here is inert by jaiValueIsInertGlobal, which is what
-                 * makes the bump rule below sound. */
+                /* SLOT_OBJ deliberately excluded: it covers a closure too, and storing a closure into a global
+                 * rebinds a callee some compiled form may have already baked BY VALUE -- ObjModule::version only retires that form at its next ENTRY, not mid-body, so this would be a silently wrong answer, not a decline. Every remaining kind is inert per jaiValueIsInertGlobal, which is what makes the bump rule below sound. */
                 e->whyNot = "a global store of a kind that has no Value form";
                 return false;
             }
@@ -6859,16 +5668,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             {
                 unsigned src = pushReg(e) - 1;
                 emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
-                /* ObjModule::version only has to move when a write takes a
-                 * class, a closure or a native AWAY or puts one IN; see
-                 * jaiValueIsInertGlobal, whose C form is the authority. The
-                 * value going IN is provably inert here (SLOT_OBJ is refused
-                 * above), so only the value coming OUT can matter, and this
-                 * recognises a STRICT SUBSET of the inert types: not an object
-                 * at all, an ObjInstance, or an ObjList. Everything else
-                 * bumps, which is only ever conservative. Widening
-                 * jaiValueIsInertGlobal needs no change here; taking
-                 * OBJ_INSTANCE or OBJ_LIST out of it does. */
+                /* Version only needs to move when a class/closure/native leaves or arrives (jaiValueIsInertGlobal is
+                 * the authority). The incoming value is already provably inert (SLOT_OBJ refused above), so only what's overwritten matters -- this checks a STRICT SUBSET of the inert types (non-object, ObjInstance, ObjList); anything else conservatively bumps. Widening jaiValueIsInertGlobal needs no change here; narrowing it (removing OBJ_INSTANCE/OBJ_LIST) does. */
                 unsigned skip[3];
                 unsigned nskip = 0;
                 emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
@@ -6895,11 +5696,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                             (int32_t)(e->count - at));
                     }
                 }
-                /* No write barrier: the collector is a plain mark-sweep and
-                 * the module's globals are traced as a root at every
-                 * collection, so a raw store is all a store is. Nothing
-                 * between the two writes can allocate, so no collection can
-                 * see a tag and a payload that disagree. */
+                /* No write barrier: mark-sweep traces module globals as a root every collection, so a raw store is
+                 * enough. Nothing between the tag and payload writes can allocate, so no collection can ever see them disagree. */
                 emitTagFor(e, sk, src, JIT_SCRATCH_B, JIT_SCRATCH_A);
                 emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
                                    (unsigned)offsetof(JaiEntry, value)));
@@ -6940,12 +5738,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (e->depth >= argc + 1u &&
                 e->stack[e->depth - argc - 1] == SLOT_NATIVE) {
-                /* `float(i)` and `int(x)` are one instruction each, so they are
-                 * emitted rather than called. They are what `spectral` and
-                 * `matrix_mul` have in their inner loops, and the whole body
-                 * was declined for want of them. Every other builtin still
-                 * declines: a call needs a result kind, and only these have one
-                 * that is known without running anything. */
+                /* `float(i)`/`int(x)` are one instruction each, so they're emitted rather than called -- what
+                 * `spectral`/`matrix_mul` have in their inner loops, and the whole body was declined for want of them. Every other builtin still declines: a call needs a result kind known without running anything, and only these two have one. */
                 if (argc != 1) { e->whyNot = "builtin arity"; return false; }
                 Value cv = e->stackSeen[e->depth - 2];
                 ObjNative *nat = IS_NATIVE(cv) ? AS_NATIVE(cv) : NULL;
@@ -6980,16 +5774,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             if (e->depth >= argc + 1u &&
                 e->stack[e->depth - argc - 1] == SLOT_OBJ) {
-                /* A closure held in a local -- `apply_n(f, ..)` doing
-                 * `acc = f(acc)`, which is the shape most library code takes.
-                 *
-                 * The guard is on the closure's FUNCTION, not on the closure.
-                 * `closure_calls` builds a fresh closure over a different
-                 * `step` every outer iteration, so guarding the closure itself
-                 * would deoptimise twenty times; all twenty share one
-                 * ObjFunction and differ only in an upvalue, so the function
-                 * pointer is monomorphic. The callee Value still comes from the
-                 * register, which is what keeps the upvalues right. */
+                /* Closure held in a local (`apply_n(f, ..)` doing `acc = f(acc)`, the shape most library code takes).
+                 * Guard is on the FUNCTION, not the closure: `closure_calls` builds a fresh closure over a different `step` every outer iteration, so guarding the closure itself would deoptimise every time -- all share one ObjFunction (monomorphic) and differ only by upvalue. The callee Value still comes from the register, which is what keeps the upvalues right. */
                 unsigned cidx = e->depth - argc - 1;
                 Value cv = e->stackSeen[cidx];
                 if (!IS_CLOSURE(cv)) {
@@ -7011,14 +5797,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
                 branchOnDeopt(e, JAI_A64_NE);
 
-                /* Cheapest first, exactly as the direct call does it: a body
-                 * small enough to stand where the call is costs neither the
-                 * frame nor the argument shuffle nor the root fill. An
-                 * indirect site needs NONE of the checks below to do it --
-                 * no argument kind has to match a specialisation the callee
-                 * was compiled for, and the callee need not have compiled at
-                 * all -- because the arguments stay in the caller's own
-                 * registers with the caller's own kinds. */
+                /* Cheapest first, as the direct call does it: a body small enough to stand where the call is costs
+                 * neither frame, argument shuffle, nor root fill. An indirect site needs NONE of the checks below to inline -- no argument kind has to match a specialisation, and the callee need not have compiled at all, since arguments stay in the caller's own registers with the caller's own kinds. */
                 if (inlineGlobalCall(e, fn, AS_CLOSURE(cv), argc,
                                      (uint32_t)off, (int)rCallee0)) {
                     off += 2;
@@ -7049,19 +5829,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 unsigned rCallee = rCallee0;   /* guarded above */
 
-                /* Straight to the callee's compiled entry rather than out
-                 * through jaiCallValue and an interpreter frame. The
-                 * convention is the one a self-call already uses and the one
-                 * jaiJitEnterFunc invokes: raw payloads in x0.., the closure
-                 * itself in the last argument register when the body reads an
-                 * upvalue, and on return x0 the value with x1 the verdict.
-                 *
-                 * The callee must live in this module, because it is the
-                 * caller's module-version check at entry that stands in for
-                 * the one jaiJitEnterFunc would have made. The arena is never
-                 * freed and jitFunc is written once, so the address baked in
-                 * here cannot go stale; only the ObjFunction identity has to
-                 * be guarded, and it is, above. */
+                /* Straight to the callee's compiled entry, not through jaiCallValue/an interpreter frame -- same
+                 * convention a self-call and jaiJitEnterFunc use. Callee must live in this module since the caller's module-version guard stands in for the callee's own entry check. The baked jitFunc address can't go stale: the arena is never freed and jitFunc is written once; only the ObjFunction identity needs guarding (done above). */
                 unsigned calleeArgs = (unsigned)cfn->jitArgCount;
                 bool wantsClosure = calleeArgs == argc + 1u;
                 if (cfn->module != fn->module || cfn->jitArgBase != 1u ||
@@ -7126,21 +5895,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
 
             if (argc != e->arity) return false;
-            /* Recorded, not rejected here: the measuring pass always runs
-             * with slot 0 available, so testing the base in this pass aborted
-             * every recursive function and quietly cost fib_recursive its
-             * compiled form -- 8.8ms back to 83ms. The decision belongs after
-             * the base is chosen. */
+            /* Recorded, not rejected, here: the measuring pass always runs with slot 0 available, so testing the
+             * base in THIS pass silently aborted every recursive function's compile (fib_recursive: 8.8ms back to 83ms). The decision belongs after the base is actually chosen. */
             e->hasSelfCall = true;
             if (e->depth < argc + 1) return false;
             if (e->stack[e->depth - argc - 1] != SLOT_SELF) return false;
 
-            /* A self-call branches to the prologue, past the entry guard, so
-             * nothing else checks what it hands over. Passing a maybe-instance
-             * into a slot typed as a plain instance would let a later field
-             * read dereference zero. Record the slot and let the retry seed it
-             * as a maybe-instance from the start -- per slot, so a body whose
-             * other parameters are never null pays nothing for this one. */
+            /* A self-call branches past the entry guard, so nothing else checks what it hands over -- passing a
+             * maybe-instance into a slot typed as a plain instance would let a later field read dereference zero. Recorded per-slot so the retry seeds only that slot as nullable, costing nothing for parameters that are never null. */
             {
                 bool retry = false;
                 for (unsigned i = 0; i < argc; i++) {
@@ -7217,33 +5979,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                    (unsigned)offsetof(JitCallDesc, link)));
                 emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
             }
-            /* x1 carries the callee's verdict, and each of the three answers
-             * needs a different one here. This used to be one `bail`, which is
-             * why `place` in queens has never compiled: a bail re-runs the
-             * whole caller from the top, and `cols[row] = col` sits above the
-             * recursion, so `bailAfterWrite` declined the body outright.
-             *
-             *   0  the value is in x0. The whole cost of this is one compare
-             *      and one not-taken branch.
-             *   2  the callee raised. The interpreter owns it; leave.
-             *   1  the callee bailed, which it may only do having written
-             *      nothing, so the CALL can be re-executed. Not a bail here
-             *      though -- a deopt at this instruction, which resumes the
-             *      interpreter with the caller's own earlier writes done and
-             *      not repeated. That distinction is the whole unlock.
-             *   4  the callee deoptimised part-way and may have written. The
-             *      call cannot be re-executed, and the caller cannot record a
-             *      second deopt over the callee's. So the callee is FINISHED
-             *      in the interpreter, from its own record, and its value
-             *      handed back here -- gDeopt is consumed at the innermost
-             *      frame that sees it, which is why one record still suffices
-             *      however deep the recursion goes.
-             *
-             * The interpreted continuation may return a kind this body did not
-             * compile for -- a `return` the compiler typed from one
-             * observation. That lands in the descriptor's result slot with
-             * whatever tag it really has, and the existing `lastFromDesc`
-             * deopt writes it out from there. */
+            /* x1 is the callee's verdict, each needing a different response here (this used to be one `bail`,
+             * which is why queens' `place` never compiled -- a bail re-runs the whole caller, unsound above `cols[row] = col`):
+             *   0  value is in x0. Costs one compare, one not-taken branch.
+             *   2  callee raised; the interpreter owns it, leave.
+             *   1  callee bailed (only possible having written nothing) -- NOT a bail here, but a deopt at
+             *      this instruction, re-executing just the call with the caller's own earlier writes intact.
+             *   4  callee deoptimised part-way and may have written -- can't be re-executed or recorded over
+             *      (gDeopt is one global), so it's FINISHED in the interpreter from its own record, value handed back here. One record suffices at any recursion depth since it's consumed at the innermost frame that sees it.
+             * A kind the body wasn't compiled for lands in the descriptor's result slot with its real tag,
+             * written out by the existing `lastFromDesc` deopt. */
             /* The fast path is what a recursive body pays per call: one
              * compare and one branch that is not taken. Every other answer is
              * a jump to a block emitted with the stubs -- inline, the two call
@@ -7268,13 +6013,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->selfSlow[si].callee    = NULL;
             e->selfSlow[si].retType   = -1;
             e->selfSlow[si].retShape  = 0;
-            /* Verdict 1: the callee bailed, and it may only do that having
-             * written nothing, so the CALL is re-executed. Not a bail here --
-             * a bail re-runs this whole body from the top, which is what
-             * `cols[row] = col` above the recursion in queens' `place` made
-             * unsound and is why that function has never compiled. A deopt at
-             * this instruction resumes the interpreter with the caller's own
-             * earlier writes done and not repeated. */
             if (!deoptRecordAt(e, (uint32_t)off, false,
                                &e->selfSlow[si].deoptBail)) {
                 return false;
@@ -7312,14 +6050,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_TAIL_CALL: {
-            /* An OSR form's x0 is the bytecode offset to resume at, not a
-             * value -- see jaiJitEnterOsr, which does `*resumeAt = at`. The
-             * return sequence below is the function tier's and leaves the
-             * returned value in x0, so a `return` inside a compiled loop hands
-             * the interpreter an integer or a pointer as an instruction
-             * offset. `for i in 0..n { if .. { return x } }` miscompiled that
-             * way in released builds: 14 runs in 20 wrong, and 10 in 10 under
-             * --gc-stress. */
+            /* Same OSR resume-offset hazard as OP_RETURN_NULL -- see there. */
             if (e->osr) {
                 e->whyNot = "a return inside an OSR loop";
                 return false;
@@ -7355,14 +6086,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_RETURN: {
-            /* An OSR form's x0 is the bytecode offset to resume at, not a
-             * value -- see jaiJitEnterOsr, which does `*resumeAt = at`. The
-             * return sequence below is the function tier's and leaves the
-             * returned value in x0, so a `return` inside a compiled loop hands
-             * the interpreter an integer or a pointer as an instruction
-             * offset. `for i in 0..n { if .. { return x } }` miscompiled that
-             * way in released builds: 14 runs in 20 wrong, and 10 in 10 under
-             * --gc-stress. */
+            /* Same OSR resume-offset hazard as OP_RETURN_NULL -- see there. */
             if (e->osr) {
                 e->whyNot = "a return inside an OSR loop";
                 return false;
@@ -7395,10 +6119,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
      * caller's fixups compares two different numbering schemes. There is
      * nothing to check either way -- it has no branches. */
     if (e->inlining) return !e->failed;
-    /* Nothing may branch to an offset this walk carried a float into: the
-     * branch would arrive with that value only in its X register, and the
-     * instruction there would read the FP bank. Declining is the safe answer,
-     * and the caller retries with the FP bank turned off. */
+    /* Nothing may branch to an offset this walk carried a float into (see fpCarry) -- declines, and the caller retries with the FP bank off. */
     for (unsigned i = 0; i < e->fpCarryCount; i++) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
             if (e->fixups[f].targetOffset != e->fpCarry[i]) continue;
@@ -7406,10 +6127,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             return false;
         }
     }
-    /* ...and nothing may branch to a bind whose local was already written by
-     * the operator above it, for the mirror-image reason: that path did not run
-     * the operator, and the bind it lands on emits no move. See
-     * fpBindLookahead. A back edge to the offset is only visible here. */
+    /* Mirror image for homeEarly (see fpBindLookahead): a back edge to such a bind is only visible here, after the whole walk. */
     for (unsigned i = 0; i < e->homeEarlyCount; i++) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
             if (e->fixups[f].targetOffset != e->homeEarly[i]) continue;
@@ -7417,11 +6135,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             return false;
         }
     }
-    /* And the same for a deferred X entry. Forward branches were settled
-     * during the walk; this is what catches a backward one -- a loop head that
-     * happens to sit between an OP_INT and the operator that consumes it.
-     * Nothing in the suite or in `check lib/std` reaches it, which is the
-     * point: it costs a decline rather than a register nothing wrote. */
+    /* Same for a deferred X entry: forward branches were settled during the walk, this catches a
+     * backward one (a loop head sitting between an OP_INT and the operator consuming it). Nothing in the suite reaches it -- the point is that it costs a decline, not a register nothing wrote. */
     for (unsigned i = 0; i < e->deferCarryCount; i++) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
             if (e->fixups[f].targetOffset != e->deferCarry[i]) continue;
@@ -7455,10 +6170,8 @@ static bool seedLocals(Emit *e, Value *slotBase) {
         } else if (IS_FLOAT(v)) {
             e->localKind[i] = SLOT_FLOAT;
         } else if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != NULL) {
-            /* A slot an earlier attempt found is sometimes null holds the
-             * pointer or zero. The class still comes from the argument this
-             * entry carried: a maybe-instance is a correct supertype of an
-             * instance, so widening cannot make a field offset wrong. */
+            /* A slot an earlier attempt found sometimes-null holds the pointer or zero; the class still comes
+         * from this call's argument -- a maybe-instance is a correct supertype, so widening can't make a field offset wrong. */
             e->localKind[i]  = e->nullableLocal[i] ? SLOT_MAYBE_INST
                                                    : SLOT_INST;
             e->localClass[i] = AS_INSTANCE(v)->klass;
@@ -7470,11 +6183,8 @@ static bool seedLocals(Emit *e, Value *slotBase) {
         } else if (IS_BOOL(v)) {
             e->localKind[i] = SLOT_BOOL;
         } else if (IS_NULL(v)) {
-            /* A null argument -- a defaulted parameter, mostly. Nothing can be
-             * done with it, but a body that never reads it compiles, and the
-             * entry guard needs no check because an opaque slot is never read.
-             * Refusing outright stopped every stdlib function with a defaulted
-             * parameter, which is most of them. */
+            /* A null argument (a defaulted parameter, mostly): nothing can be done with it, but a body that
+             * never reads it compiles, and the entry guard needs no check since an opaque slot is never read. Refusing outright stopped every stdlib function with a defaulted parameter -- most of them. */
             e->localKind[i] = SLOT_OPAQUE;
         } else if (i == 0) {
             /* A plain function's slot 0 is the closure being called. Nothing
@@ -7554,28 +6264,8 @@ static bool eligible(ObjFunction *fn) {
 /* Filled by loopDepthTable, which lives with the OSR entry below. */
 static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count);
 
-/* Which slots earn a register in a body that cannot keep all of them.
- *
- * `m` is the finished measuring pass, whose accessors charged each slot the
- * instructions a home in each bank would have saved it (see noteSlotCost).
- * Greedy, most saved first, across BOTH banks at once: an int slot read four
- * times in the inner loop outranks a float slot read twice even though they
- * would take registers from different pools, and taking them in one order
- * keeps that comparison meaningful when only one pool runs out.
- *
- * Three exclusions, each of which cost something to learn:
- *
- *   - a slot with zero saving is not merely ranked last, it is skipped. A slot
- *     the loop never touches would otherwise win a tie-break and pay a
- *     prologue write for a value nothing ever reads.
- *   - a dynamic slot keeps its frame home: its tag is a run-time fact and only
- *     the frame has anywhere to put one.
- *   - the X pool is what the operand stack did not want; the FP pool is all of
- *     v8..v15, which nothing else in this tier names.
- *
- * A wrong guess costs an `fmov` and cannot cost a wrong answer: only fmov, ldr
- * and str ever touch a home, so every home is a bit-exact 64-bit box whatever
- * kind the slot turns out to hold. */
+/* Greedy: most instructions-saved first, across BOTH register banks at once (an int slot read 4x in
+ * a loop outranks a float slot read 2x, different pools, but comparing them in one order keeps that meaningful when only one pool runs out -- see noteSlotCost). Three exclusions: a zero-saving slot is skipped outright, not just ranked last (else a tie-break could pay a prologue write for nothing); a dynamic slot keeps its frame home, since only the frame has anywhere to put a run-time tag; a wrong guess costs an `fmov`, never a wrong answer, since only fmov/ldr/str ever touch a home. */
 static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
     unsigned availFp = JIT_FP_MAX_SAVED;
     unsigned top = e->base + e->locals;
@@ -7689,10 +6379,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.limitLiteral = -1;
     e.bailBlock    = -1;
 
-    /* The prologue cannot be emitted first: its save set depends on how deep
-     * the operand stack gets, which only the body knows. So the body goes into
-     * the buffer at a fixed offset and the prologue is written in front of it
-     * afterwards, with every instruction index shifted by the same amount. */
+    /* The prologue can't be emitted first: its save set depends on how deep the operand stack gets,
+     * which only the body knows. So the body goes into the buffer at a fixed offset and the prologue is written in front of it afterwards, with every instruction index shifted by the same amount. */
     static Emit body;
     memset(&body, 0, sizeof body);
     memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
@@ -7827,11 +6515,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     emitFrameEnter(&e);
     emitSaveRestore(&e, true);
     emitFpSaveRestore(&e, true);
-    /* The real arguments land in the local registers in order; the closure,
-     * when there is one, is the last incoming register but lives just past the
-     * locals, where closureReg expects it. Placing it by argument index
-     * instead put it three registers low and the first upvalue read
-     * dereferenced whatever was there. */
+    /* Real arguments land in local registers in order; the closure (if any) lives just past the locals,
+     * where closureReg expects it. Placing it by argument index instead once put it three registers low, and the first upvalue read dereferenced whatever was there. */
     unsigned realArgs = e.usesUpvalues ? argCount - 1u : argCount;
     for (unsigned i = 0; i < realArgs; i++) {
         unsigned slot = e.base + i;
@@ -7844,12 +6529,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         } else if (e.slotFpReg[slot] != 0) {
             emit(&e, jaiA64FmovDX(e.slotFpReg[slot], i));
         } else {
-            /* A spilled local is a whole Value: tag first, payload eight bytes
-             * on. Writing the payload at the tag's offset instead leaves the
-             * payload word untouched, so the first read of an argument gets
-             * whatever the frame happened to hold -- which is a small integer
-             * often enough that it reads as a pointer and the crash lands
-             * somewhere else entirely. */
+            /* Spilled local is a whole Value: tag first, payload 8 bytes on. Writing the payload at the tag's
+             * offset instead leaves the payload word untouched -- the first read then gets whatever garbage the frame held, often a small int that reads as a pointer, crashing somewhere else entirely. */
             /* From the measuring pass: `e`'s own kinds are seeded after this
              * point, so reading them here would take whatever the struct was
              * zeroed to. */
@@ -7947,11 +6628,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         for (unsigned i = 0; i < (e.osr ? 0u : e.locals); i++) {
             unsigned slot = e.base + i;
             SlotKind kind = e.localKind[slot];
-            /* Only an opaque slot is null; everything else that is not a
-             * scalar is an object. Listing the object kinds instead meant a
-             * SLOT_OBJ local -- a string, a dict, a closure -- was written out
-             * as null on every deopt, which stayed invisible until a body
-             * holding one could compile and then deopt. */
+            /* Only an opaque slot is null; everything else non-scalar is an object. Listing object kinds
+             * explicitly instead once wrote a SLOT_OBJ local (string/dict/closure) out as null on every deopt -- invisible until a body holding one could compile and then actually deopt. */
             unsigned tag = kind == SLOT_INT    ? VAL_INT
                          : kind == SLOT_FLOAT  ? VAL_FLOAT
                          : kind == SLOT_BOOL   ? VAL_BOOL
@@ -7970,12 +6648,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 continue;
             }
 
-            /* The record must describe every local correctly whichever of the
-             * three homes it came from, which is the one place a mistake in
-             * the register plan becomes a wrong answer rather than a crash.
-             * A dynamic slot is the only one whose tag is not a compile-time
-             * fact, and it is also the only one the plan never gives a
-             * register, so it is the only case that copies a tag through. */
+            /* Must describe every local correctly whichever of the three homes it came from -- the one place a
+             * register-plan mistake becomes a wrong answer, not a crash. A dynamic slot is the only one whose tag isn't a compile-time fact and the only one the plan never gives a register, so it's the only case that copies a tag through. */
             if (e.spilled && e.slotXReg[slot] == 0 && e.slotFpReg[slot] == 0 &&
                 localTagInFrame(&e, slot)) {
                 emit(&e, jaiA64LdrW(JIT_SCRATCH_C, 31, localFrameOff(&e, slot)));
@@ -8059,10 +6733,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 valueSeen++;
                 continue;
             }
-            /* SLOT_NULL is a void call's result entry: it holds a register
-             * whose payload is zero, and its tag is not VAL_OBJ. Reaching
-             * this chain through the default arm wrote a null pointer out as
-             * an object. */
+            /* SLOT_NULL is a void call's result entry: register payload zero, tag NOT VAL_OBJ. Reaching this
+             * chain through the default arm once wrote a null pointer out tagged as an object. */
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
@@ -8130,12 +6802,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         return false;
     }
 
-    /* Patch the two literal loads and the guard branch. */
     e.code[guardLoad] = jaiA64LdrLit(JIT_SCRATCH_A, e.limitLiteral - guardLoad);
     e.code[guardBranch] =
         jaiA64BCond(JAI_A64_LO, e.bailBlock - (int)guardBranch);
 
-    /* Patch every branch and the recursive calls. */
     for (unsigned i = 0; i < e.fixupCount; i++) {
         const Fixup *f = &e.fixups[i];
         int target;
@@ -8215,12 +6885,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 jitFree(map, depths, fn->chunk.count + 1);
                 return false;
             }
-            /* Registers are assigned from the operand-stack depth at each
-             * point, so a join reached at two different depths would read a
-             * value out of a register that holds something else. The walk
-             * through the bytecode is linear and cannot see that, so it is
-             * checked here and the function is declined rather than
-             * mis-compiled. */
+            /* Registers are assigned from the operand-stack depth at each point, so a join reached at two
+             * different depths would read a value out of a register holding something else. The linear bytecode walk can't see that, so it's checked here and declined rather than mis-compiled. */
             if (f->depth >= 0 && depths[f->targetOffset] != f->depth) {
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: offset %u is reached "
@@ -8242,15 +6908,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             e.code[f->instIndex] = jaiA64B(rel);
         }
     }
-    /* JAI_JIT_DUMP=<function> writes that function's words to
-     * jit_<function>.bin and prints the bytecode-offset-to-instruction map, so
-     * generated code can be read back:
-     *
-     *     llvm-mc --disassemble --triple=aarch64
-     *
-     * on the file's bytes. Reading the code is how the register plan gets
-     * checked at all -- three of the bugs in this tier were found no other
-     * way, and none of them were visible in the emitter's own bookkeeping. */
+    /* JAI_JIT_DUMP=<function> writes that function's words to jit_<function>.bin and prints the
+     * bytecode-offset-to-instruction map, so the code can be read back with `llvm-mc --disassemble --triple=aarch64` on the file's bytes. Reading the code is how the register plan gets checked at all -- three of this tier's bugs were found no other way. */
     {
         const char *dump = getenv("JAI_JIT_DUMP");
         if (dump != NULL && fn->name != NULL &&
@@ -8285,12 +6944,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (entry == NULL) return false;
     if (!jaiCodeArenaSeal(arena)) return false;
 
-    /* The tier's whole bail protocol rests on partial execution being
-     * invisible. Field writes ended that: a body that stores to an instance
-     * and then bails would have the store applied again by the interpreted
-     * re-run. Nothing in the suite hits this -- an initializer's writes come
-     * after its last guard -- but "hard to construct" is not the standard a
-     * compiled tier gets to work to. */
+    /* The tier's whole bail protocol rests on partial execution being invisible. Field writes end that:
+     * a body that stores to an instance and then bails would have the store applied again by the interpreted re-run. Nothing in the suite hits this, but "hard to construct" isn't the standard a compiled tier gets to work to. */
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",
                 fn->name ? fn->name->chars : "<anon>", e.whyNot);
@@ -8362,22 +7017,10 @@ typedef int64_t (*OsrFnIter)(Value *slots, ObjIter *iter);
 
 /* The OP_LOOP that jumps back to `top`, and so the end of the loop. Gives up
  * on OP_CLOSURE, whose length depends on its operands. */
-/* Is `top` where an instruction actually starts?
- *
- * findLoopEnd walks from `top` itself, so if that offset is in the middle of
- * an instruction the walk decodes operands as opcodes and can find a plausible
- * OP_LOOP that is not one. nbody's advance was being compiled from offset 128,
- * which is inside a GET_LOCAL2's operands. Walking from the start costs a scan
- * once per compile and removes the question. */
-/* Bytes of the instruction at `off`, or 0 when it cannot be decoded.
- *
- * OP_CLOSURE is the one variable-length instruction: a u24 constant index and
- * then three bytes per upvalue, and the count is on the function that index
- * names. Treating it as undecodable refused OSR for the WHOLE CHUNK -- both
- * walks below start from offset 0 or scan forward -- so a module that declares
- * a class or a function before its hot loop, which is every one of them, could
- * never enter a compiled loop at module scope at all. Nothing reported it:
- * compileOsr was not reached, so there was no decline to see. */
+/* findLoopEnd walks from `top` itself, so if that offset is mid-instruction the walk decodes operand
+ * bytes as opcodes and can find a plausible-but-wrong OP_LOOP -- nbody's advance was once compiled from offset 128, inside a GET_LOCAL2's operands. Walking from the start (isInstructionStart, below) costs one scan per compile and removes the question. */
+/* OP_CLOSURE is the one variable-length instruction (u24 constant index + 3 bytes/upvalue, count
+ * from the function the index names). Treating it as undecodable once refused OSR for the WHOLE CHUNK (both walks below scan from offset 0), so a module declaring a class or function before its hot loop -- i.e. every one of them -- could never enter a compiled loop at module scope, silently: compileOsr was never even reached, so nothing was there to report a decline. */
 static int instructionLength(const Chunk *c, int off) {
     uint8_t op = c->code[off];
     if (op != OP_CLOSURE) {
@@ -8392,32 +7035,8 @@ static int instructionLength(const Chunk *c, int off) {
     return 4 + 3 * (int)AS_FUNCTION(fnv)->upvalueCount;
 }
 
-/* Does this chunk hand one of its own locals to a closure BY REFERENCE?
- *
- * Such a slot is aliased by an ObjUpvalue whose `location` points straight
- * into the VM's slot array, so the slot and the closure's view of it are the
- * same storage. Caching it in a register makes them different storage for the
- * length of the loop: every read through the closure sees whatever the slot
- * held when the loop was entered, and every write through the closure is lost.
- *
- *     var base = 3
- *     let f = |x| x + base
- *     while i < n { acc = f(acc); base += 1; i += 1 }
- *
- * returned a different, and always short, sum on every run -- the prefix that
- * ran before OSR was entered was right and everything after it added a frozen
- * `base`. OSR is entered on a timer tick, which is what made it look random.
- *
- * The capture is not inside the loop, it is anywhere in the enclosing
- * function, so this scans the whole chunk rather than the region compiled.
- * `how` bit 1 marks a by-value capture, which copies the value into a closed
- * cell and aliases nothing; only bit 0 alone is a reference to a slot.
- *
- * It marks the individual slots rather than answering yes or no for the whole
- * chunk, because the register plan is per-slot: one captured `base` should cost
- * `base` its register, not cost every other local in the function one too.
- * Returns false if the chunk did not decode, and the caller then keeps every
- * local in memory -- the answer that is right without knowing anything. */
+/* A slot captured BY REFERENCE by a closure is aliased by an ObjUpvalue pointing straight into the
+ * VM's slot array; caching it in a register during OSR makes them different storage for the loop's duration -- reads through the closure see a frozen value, writes through it are lost. (`var base=3; let f=|x| x+base; while .. { acc=f(acc); base+=1 }` once returned a different, always-short sum every run, since OSR triggers on a timer tick.) Scans the WHOLE enclosing function, not just the loop region, since the capture can be anywhere. `how` bit 1 = by-value capture (safe, copies into a closed cell); bit 0 alone = by-reference. Marks individual slots, not chunk-wide, since the register plan is per-slot. Returns false (keep everything in memory) if the chunk doesn't decode. */
 static bool chunkByRefCaptures(const Chunk *c, bool *byRef, unsigned nslots) {
     for (unsigned i = 0; i < nslots; i++) byRef[i] = false;
     for (int off = 0; off < c->count;) {
@@ -8462,16 +7081,8 @@ static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
     return 0;
 }
 
-/* How many loops enclose each byte of the chunk. Every OP_LOOP is a back edge
- * and the range it jumps over is its body, so one pass over the chunk counting
- * those ranges answers "how hot is this site relative to that one" well enough
- * to rank slots by. It does not need to be exact -- it only has to put the
- * innermost loop's variables ahead of the setup around them.
- *
- * A file static rather than an allocation, because both Emit structures read
- * the same table and compilation is not reentrant, which is already why they
- * are static themselves. A chunk longer than this goes unweighted: that costs
- * ranking quality and nothing else. */
+/* How many loops enclose each byte, so slots can be ranked by heat: every OP_LOOP is a back edge, the
+ * range it jumps over is its body, and one pass counting those ranges is enough to put the innermost loop's variables ahead of the setup around them (doesn't need to be exact). File static since both Emit structures read the same table and compilation isn't reentrant; a chunk longer than JIT_MAX_DEPTH_MAP just goes unweighted. */
 #define JIT_MAX_DEPTH_MAP 8192
 static uint8_t gLoopDepth[JIT_MAX_DEPTH_MAP];
 
@@ -8565,19 +7176,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
 
-    /* The probe runs AFTER the seeding above, not before it. It used to copy
-     * the kinds while they were still zeroed, so it measured a body in which
-     * every slot was an untyped int -- a different program from the one being
-     * compiled, and the maxValue the register decision rests on was measured on
-     * the wrong one.
-     *
-     * It also narrows `locals` to what the loop actually names. OSR started
-     * from `fn->maxSlots`, the whole slot window of the enclosing function --
-     * eighteen or twenty slots for these bodies -- so
-     * `reserved + locals + maxValue <= 10` could never hold and register-
-     * resident locals were unreachable for any real function. The function tier
-     * has always narrowed to the highest slot its body touches; this does the
-     * same. */
+    /* Runs AFTER the seeding above, not before: it used to measure a body where every slot was still an
+     * untyped int (zeroed), a different program from the one being compiled, corrupting the maxValue the register decision rests on. Also narrows `locals` to what the loop actually names -- OSR started from the whole enclosing function's `maxSlots` (18-20 for real bodies), so `reserved + locals + maxValue <= 10` could never hold and register-resident locals were unreachable for any real function. */
     /* Registers for the slots that earn them, memory for the rest. The
      * reserved four (or one) plus the X locals plus the deepest expression
      * must all sit inside the ten callee-saved registers; a first pass
@@ -8623,10 +7223,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             for (unsigned i = 0; decoded && i < e.locals; i++) {
                 if (probe.slotUse[i] == 0) continue;
                 if (probe.dynamicLocal[i]) continue;
-                /* A slot a closure captured by reference is aliased by an
-                 * ObjUpvalue pointing into the VM's slot array, so a register
-                 * copy of it is different storage from the one the closure
-                 * reads and writes. It stays in memory. */
+                /* Captured by reference (see chunkByRefCaptures): stays in memory, since a register copy would be different storage from what the closure reads/writes. */
                 if (byRef[i]) continue;
                 order[n++] = (uint8_t)i;
             }
@@ -8847,12 +7444,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 continue;
             }
             if (e.deopt[k].lastFromDesc && i + 1 == e.deopt[k].depth) {
-                /* The result of a call that already happened lives in the
-                 * descriptor, with whatever tag the callee actually returned.
-                 * The function tier's stub knew this; this one did not, and
-                 * alloc_churn came back 982406343 instead of 550770565 under
-                 * deopt stress -- which is the entire reason that switch
-                 * exists. */
+                /* Result of an already-happened call lives in the descriptor with whatever tag the callee actually
+                 * returned. The function tier's stub knew this; this OSR one didn't, and alloc_churn came back 982406343 instead of 550770565 under deopt stress -- the entire reason this lastFromDesc branch exists. */
                 unsigned rat = e.descOffset +
                                (unsigned)offsetof(JitCallDesc, result);
                 emit(&e, jaiA64LdrW(JIT_SCRATCH_B, 31, rat));
@@ -8874,10 +7467,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 valueSeen++;
                 continue;
             }
-            /* SLOT_NULL is a void call's result entry: it holds a register
-             * whose payload is zero, and its tag is not VAL_OBJ. Reaching
-             * this chain through the default arm wrote a null pointer out as
-             * an object. */
+            /* Same SLOT_NULL hazard as the function tier's stub -- see there. */
             unsigned tag = kind == SLOT_INT   ? VAL_INT
                          : kind == SLOT_FLOAT ? VAL_FLOAT
                          : kind == SLOT_BOOL  ? VAL_BOOL
@@ -9016,11 +7606,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             /* Unit steps only -- that is what makes the yielded value start
              * plus the index. The start need not be 0; it is loaded at entry. */
             if (AS_RANGE(iter->source)->step != 1) return 0;
-            /* The compiled head runs on `start + index` in one register, which
-             * means the limit is biased by the start too -- see osrReserved.
-             * `limit` saturates at INT64_MAX for a range that spans the type,
-             * and a biased limit that wrapped would compare the wrong way
-             * round, so such a loop is left to the interpreter. */
+            /* Compiled head runs on `start + index` in one register, so the limit is biased by the start too (see
+             * osrReserved). `limit` saturates at INT64_MAX for a range spanning the whole type, and a biased limit that wrapped would compare the wrong way round -- such a loop is left to the interpreter. */
             {
                 int64_t biased;
                 if (__builtin_add_overflow(AS_RANGE(iter->source)->start,
@@ -9031,11 +7618,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             iterKind = 1;
         } else if (iter->kind == ITER_LIST && IS_LIST(iter->source)) {
             ObjList *src = AS_LIST(iter->source);
-            /* The element the loop is about to bind, taken from the list
-             * itself. Reading the loop variable's slot instead gives whatever
-             * the previous iteration left there -- nothing at all on the first
-             * entry -- and a kind guard built from that is aimed at the wrong
-             * type. That is what made the first attempt at this crash. */
+            /* Element the loop is about to bind, taken from the list itself: reading the loop variable's slot
+             * instead gives whatever the previous iteration left there (nothing on the first entry), aiming the kind guard at the wrong type -- what crashed the first attempt at this. */
             int at = (int)iter->index;
             if (at < 0 || at >= src->count) return 0;
             elemSample = src->items[at];
@@ -9047,9 +7631,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     JaiOsrForm *form = NULL;
     for (unsigned i = 0; i < fn->osrCount; i++) {
-        /* The kind as well as the offset: a form compiled for a range head
-          * entered with a list iterator would read ObjRange::start out of an
-          * ObjList, and `for x in cond ? xs : 0..n` is enough to arrange it. */
+        /* Kind as well as offset: a form compiled for a range head, entered with a list iterator, would read
+          * ObjRange::start out of an ObjList -- `for x in cond ? xs : 0..n` is enough to arrange it. */
         if (fn->osrForms[i].top == top &&
             fn->osrForms[i].iterKind == iterKind) {
             form = &fn->osrForms[i];
@@ -9114,11 +7697,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         case SLOT_BOOL:  if (!IS_BOOL(v))  return 0; break;
         case SLOT_LIST:  if (!IS_LIST(v))  return 0; break;
         case SLOT_INST:  if (!IS_INSTANCE(v)) return 0; break;
-        /* The whole-function tier's jitArgIn has always checked this one; the
-         * loop tier let it through `default`, so a slot compiled as "some
-         * object" could be entered holding an int and its payload read as a
-         * pointer. Nothing had exercised it, because nothing emitted a load
-         * off such a slot until the invoke arm below guards its receiver. */
+        /* jitArgIn (function tier) has always checked this; the loop tier let it through via `default`, so a
+         * slot compiled as "some object" could be entered holding an int and have its payload read as a pointer. Unexercised until something emitted a load off such a slot (the invoke arm's receiver guard, below). */
         case SLOT_OBJ:   if (!IS_OBJ(v))   return 0; break;
         default: break;   /* opaque: never read */
         }
@@ -9180,11 +7760,8 @@ static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
             break;
         }
         case SLOT_INST: {
-            /* The class as well as the type: every field offset in the body
-             * was resolved against this one shape. Compiled code holds the
-             * raw pointer, which is safe only because the body cannot
-             * allocate -- no collection can run while it does -- and the
-             * argument slots keep the instance reachable meanwhile. */
+            /* Class as well as type: every field offset in the body was resolved against this one shape. Holding
+             * the raw pointer is safe only because the body can't allocate (no collection can run meanwhile), and the argument slots keep the instance reachable. */
             if (!IS_INSTANCE(v)) return false;
             ObjInstance *inst = AS_INSTANCE(v);
             if (inst->klass == NULL ||
@@ -9222,18 +7799,13 @@ static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
     return true;
 }
 
-/* The verdict and the returned payload, turned back into what the
- * interpreter holds. */
 static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
                                          Value *slotBase) {
     if (r.bailed == 2) return JAI_JIT_ERROR;
     if (r.bailed == 4) return JAI_JIT_DEOPT;
     if (r.bailed) {
-        /* Overflow or a stack that ran low. Nothing was written -- the body
-         * cannot write -- so handing the call back to the interpreter is
-         * enough, and it will raise the error with a traceback. Refusing the
-         * function permanently keeps a bailing body from being re-entered on
-         * every call only to bail again. */
+        /* Overflow or a low stack: nothing was written (the body cannot write), so handing the call back to
+         * the interpreter is enough -- it raises the error with a traceback. Refused permanently so a bailing body isn't re-entered every call only to bail again. */
         fn->jitRefused = true;
         fn->jitFunc = NULL;
         return JAI_JIT_DECLINED;
@@ -9277,25 +7849,16 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
 
-    /* Compiled code reads the global that names this function exactly once,
-     * at compile time, and then calls it directly. Rebinding the name has to
-     * invalidate that, and a module's version counter moves on every global
-     * mutation, so one comparison covers it. It is conservative -- any global
-     * write in the module retires the compiled form -- and conservative is the
-     * safe direction. */
+    /* Compiled code reads the global naming this function exactly once, at compile time, then calls it
+     * directly. Rebinding the name must invalidate that; the module's version counter moves on every global mutation, so one comparison covers it -- conservative (any global write in the module retires the form), which is the safe direction. */
     if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion) {
         return JAI_JIT_DECLINED;
     }
 
     unsigned arity = fn->jitArgCount;
     int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-    /* Unrolled rather than a loop over `int64_t a[JIT_MAX_ARITY]`, and that is
-     * measured rather than tidy. An array of four int64 is what makes clang
-     * give this function a stack-protector prologue and epilogue, and it made
-     * every argument travel out to the frame and back on its way to the
-     * register the call is about to read it from. This function is on the path
-     * of every interpreted call to a compiled body -- 43% of `xs.map(|x| x*2)`
-     * and 13% of queens, by `sample` -- so both of those are paid per call. */
+    /* Unrolled rather than a loop over `int64_t a[JIT_MAX_ARITY]` -- measured, not tidiness: an array of
+     * four int64 makes clang add a stack-protector prologue/epilogue and sends every argument out to the frame and back on its way to the register the call reads it from. This function sits on the path of every interpreted call into a compiled body, so both costs are paid per call. */
     if (arity > JIT_MAX_ARITY) return JAI_JIT_DECLINED;
     if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0)) return JAI_JIT_DECLINED;
     if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1)) return JAI_JIT_DECLINED;
