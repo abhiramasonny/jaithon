@@ -16,7 +16,7 @@
 #: Results live beside the tree in a `Resolution` keyed by node identity,
 #: since a `jaithon.ast` node holds only what the C AST serialises.
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, Visibility
-from jaithon.compile.lexer import DiagnosticBag
+from jaithon.compile.diag import DiagnosticBag
 
 #: Most local slots one function frame can hold, matching `JAI_MAX_LOCALS`.
 pub const MAX_LOCALS: int = 65535

@@ -7,8 +7,9 @@
 #: ```
 from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind
 from jaithon.ast import Visibility
-from jaithon.compile.lexer import Code, Diagnostic, DiagnosticBag, Lexer, Token, TokenFlags
-from jaithon.compile.lexer import TokenKind, kind_text
+from jaithon.compile.diag import Code, Diagnostic, DiagnosticBag
+from jaithon.compile.lexer import Lexer
+from jaithon.compile.token import Token, TokenFlags, TokenKind, kind_text
 
 #: How deeply the recursive productions may nest before `E0107` stops them.
 pub const MAX_RECURSION: int = 200

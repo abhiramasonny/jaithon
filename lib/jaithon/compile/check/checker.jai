@@ -14,7 +14,7 @@ from jaithon.compile.check.ty import Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, list_of
 from jaithon.compile.check.universe import named, set_of, tuple_of
-from jaithon.compile.lexer import DiagnosticBag
+from jaithon.compile.diag import DiagnosticBag
 from jaithon.compile.parser import parse
 from jaithon.compile.resolve import Resolution
 import jaithon.compile.check.decl as decl_mod
