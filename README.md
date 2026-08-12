@@ -134,8 +134,9 @@ backends.
 It includes common tensor math, format-independent datasets, dense models,
 ReLU/sigmoid/tanh/softmax activations, momentum SGD, Adam, validation,
 prediction, and JSON weight files. Training queues each epoch as ordered GPU
-work and synchronizes once for metrics. See
-[`examples/mnist_gpu.jai`](examples/mnist_gpu.jai).
+work and synchronizes once for metrics. The examples cover
+[`MNIST`](examples/mnist_gpu.jai) and a
+[`nonlinear spiral classifier`](examples/spiral_classifier.jai).
 
 ## Errors
 
