@@ -8,20 +8,17 @@
 #include "table.h"
 
 /* ------------------------------------------------------------------ */
-/* Call frames                                                          */
-/*                                                                      */
-/* Inline caches live in the Chunk (see chunk.h) so that they survive   */
-/* serialisation boundaries and are reachable from the code generator.  */
+/* Call frames. Inline caches live in the Chunk (chunk.h) so they survive */
+/* serialisation boundaries and stay reachable from the code generator.   */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
     ObjClosure *closure;
     uint8_t    *ip;
     Value      *slots;         /* the local window this frame reads and writes */
-    /* Where the value stack rewinds to when the frame exits. Equal to `slots`
-     * for an ordinary call. A deferred block is the exception: it runs in the
-     * defining frame's window (spec §7.3 — it sees that function's locals), so
-     * it borrows `slots` and owns only the stack above them. */
+    /* Where the value stack rewinds to on exit; equal to `slots` for an
+     * ordinary call. A deferred block runs in the defining frame's window
+     * (spec §7.3), so it borrows `slots` and owns only the stack above it. */
     Value      *base;
     int         handlerBase;   /* index into vm->handlers */
     int         deferBase;     /* index into vm->defers */
@@ -77,9 +74,9 @@ typedef struct VM {
 
     /* Flags */
     bool         debugTrace;
-    /* Per-instruction bookkeeping. An unconditional `instructionCount++` in the
-     * dispatch macro cost 1-3% of every benchmark, so the counter is only kept
-     * when something will read it (--stats, --trace-exec). */
+    /* Per-instruction bookkeeping: an unconditional `instructionCount++` in
+     * the dispatch macro cost 1-3% of every benchmark, so it's only kept when
+     * something will read it (--stats, --trace-exec). */
     bool         countInstructions;
     bool         debugGC;
     bool         gcStress;
@@ -124,9 +121,8 @@ bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out);
-/* The result kind an OP_INVOKE site has been observed to produce for a
- * receiver of `receiver`'s type, or JAI_FB_NONE. The builtin cache key lives
- * in vm.c, so the way-matching does too. A PREDICTION -- see the note on
+/* The result kind an OP_INVOKE site has observed for a receiver of
+ * `receiver`'s type, or JAI_FB_NONE. A PREDICTION, not a guarantee -- see
  * InlineCache::resultKind; every caller must guard what it emits. */
 uint8_t jaiInvokeResultFeedback(const Chunk *chunk, uint16_t cacheIdx,
                                 Value receiver);
@@ -138,17 +134,12 @@ bool jaiSliceGet(Value container, Value startValue, Value stopValue,
 
 bool jaiCallValue(Value callee, int argc, Value *args, Value *out);
 
-/* jaiCallValue for the one-argument case, which is what every higher-order
- * list and iterator builtin does per element. The general form pushes the
- * callee and argument on the VM stack, dispatches through invokeCallable and
- * callClosure, and unwinds again -- and for a callee the tier has compiled,
- * all of that surrounds an entry that reads its argument straight out of two
- * stack cells. Measured on `xs.map(|x| x * 2)` over ten million elements,
- * those three frames were 42% of the loop. This one keeps the two cells --
- * they are what roots the callee and the argument across a body that may
- * allocate -- and skips the rest. Anything the compiled tier declines, and
- * every callee that is not a compiled closure, falls through to jaiCallValue
- * unchanged. */
+/* jaiCallValue for the one-argument case, what every higher-order list/
+ * iterator builtin does per element: the general form's push/dispatch/unwind
+ * through invokeCallable and callClosure measured as 42% of the loop on
+ * `xs.map(|x| x * 2)` over ten million elements when the callee was a
+ * compiled closure. This keeps just the two stack cells that root the callee
+ * and argument, and falls through to jaiCallValue for anything else. */
 bool jaiCallValue1(Value callee, Value arg, Value *out);
 /* Call a method by name on a receiver; false if the method does not exist. */
 bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,

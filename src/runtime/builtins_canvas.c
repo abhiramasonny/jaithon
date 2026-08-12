@@ -1,53 +1,28 @@
 /* builtins_canvas.c — __prim__.canvas_*, the bulk pixel operations behind
- * std.gui.canvas.
- *
- * The canvas keeps its geometry in Jaithon and its pixels in a `list[int]`, one
- * packed 0xAARRGGBB value per pixel — builtins_gui.c explains why the back
- * buffer is a list and not a native block. That trade is right everywhere
- * except the innermost loop: clearing a 1280-pixel scanline is 1280 interpreted
- * stores, and an anti-aliased one is 1280 interpreted composites on top of
- * that. The four primitives here are exactly the runs a rasteriser produces — a
- * flat span, a coverage-weighted span, a scaled rectangle, and a box reduction
- * for supersampled edges — so every geometric decision stays in Jaithon while
- * one native call replaces a scanline's worth of interpretation.
- *
- * The compositing arithmetic is transcribed from `blend` in
- * lib/std/gui/canvas.jai rather than reinvented. The two draw the same colours
- * over each other in the same frame, and a rounding difference between them
- * would show up as a seam where an anti-aliased edge meets a plotted pixel.
- *
- * Nothing here trusts an argument. A primitive that can be talked into writing
- * outside a list is a memory-safety hole in a memory-safe language, so every
- * offset, count and rectangle is checked against the real list length before a
- * single pixel is written, and a run that would leave the buffer raises instead
- * of being clipped: the caller knows what it meant to draw, and this does not.
- * Values are checked ahead of the writes too, so an operation that raises has
- * changed nothing rather than leaving half a scanline behind.
- */
+ * std.gui.canvas: scanline fills, blends and blits over its `list[int]` back
+ * buffer. Compositing matches `blend` in lib/std/gui/canvas.jai byte for byte,
+ * and every write is bounds- and type-checked before anything is written, so a
+ * failed call leaves the buffer untouched rather than half drawn. */
 
 #include <math.h>
 
 #include "runtime.h"
 
-/* A pixel is a packed 0xAARRGGBB value, so it occupies 32 bits of an int and
- * nothing above them. */
+/* A pixel is a packed 0xAARRGGBB value: 32 bits, nothing above them. */
 #define CANVAS_PIXEL_MAX 0xFFFFFFFFLL
 
 /* ------------------------------------------------------------------ */
 /* Compositing                                                          */
 /* ------------------------------------------------------------------ */
 
-/* `_over` in lib/std/gui/canvas.jai: rounded rather than truncated, which is
- * what makes compositing an opaque white give back exactly white. */
+/* `_over` in lib/std/gui/canvas.jai: rounded, not truncated, so compositing an
+ * opaque white gives back exactly white. */
 static uint32_t canvasOver(uint32_t source, uint32_t destination,
                            uint32_t alpha, uint32_t inverse) {
     return (source * alpha + destination * inverse + 127u) / 255u;
 }
 
-/* `blend` in lib/std/gui/canvas.jai, byte for byte. Both operands are read as
- * 32 bits, which is what the Jaithon version does too: it takes the alpha from
- * bits 24-31 and each colour from below them, so anything higher never reaches
- * the result either way. */
+/* `blend` in lib/std/gui/canvas.jai, byte for byte — must match exactly. */
 static uint32_t canvasBlend(uint32_t destination, uint32_t source) {
     uint32_t alpha = (source >> 24) & 0xFFu;
     if (alpha == 255u) return source;
@@ -81,9 +56,8 @@ static bool canvasArgColor(Value v, int index, const char *fnName, uint32_t *out
     return true;
 }
 
-/* A run of `count` pixels from `offset` has to lie inside the list. Written as
- * two comparisons against the length rather than one against `offset + count`
- * so that a caller cannot reach the buffer by overflowing the sum. */
+/* Checked as two comparisons against the length, not one against
+ * `offset + count`, so overflow of the sum can't smuggle a bad access past this. */
 static bool canvasCheckSpan(const ObjList *pixels, int64_t offset, int64_t count,
                             const char *fnName) {
     if (count < 0) {
@@ -100,9 +74,8 @@ static bool canvasCheckSpan(const ObjList *pixels, int64_t offset, int64_t count
     return true;
 }
 
-/* The buffer is `width` x `height` and holds exactly that many pixels. The two
- * comparisons against the length come before the product so that the product
- * cannot overflow: a list holds at most INT_MAX values. */
+/* The length checks come before the width*height product so the product
+ * itself cannot overflow (a list holds at most INT_MAX values). */
 static bool canvasCheckShape(const ObjList *pixels, int64_t width, int64_t height,
                              const char *fnName, const char *role) {
     if (width <= 0 || height <= 0) {
@@ -121,8 +94,7 @@ static bool canvasCheckShape(const ObjList *pixels, int64_t width, int64_t heigh
     return true;
 }
 
-/* A rectangle has to be inside the buffer it names. Same shape of test as
- * canvasCheckSpan, and for the same reason. */
+/* Same overflow-safe bounds test as canvasCheckSpan, for a rectangle. */
 static bool canvasCheckRect(int64_t x, int64_t y, int64_t width, int64_t height,
                             int64_t bufferWidth, int64_t bufferHeight,
                             const char *fnName, const char *role) {
@@ -144,9 +116,8 @@ static bool canvasCheckRect(int64_t x, int64_t y, int64_t width, int64_t height,
     return true;
 }
 
-/* Every pixel the operation will read or write has to be an int before any of
- * it is written, so that a buffer holding one stray value is a clean error
- * rather than a half-drawn image. */
+/* Checked fully before any write, so a stray non-int is a clean error rather
+ * than a half-drawn image. */
 static bool canvasCheckRectValues(const ObjList *pixels, int64_t bufferWidth,
                                   int64_t x, int64_t y, int64_t width, int64_t height,
                                   const char *fnName, const char *role) {
@@ -174,10 +145,8 @@ static uint32_t canvasPixelAt(const ObjList *pixels, int64_t index) {
 /* Spans                                                                */
 /* ------------------------------------------------------------------ */
 
-/* canvas_fill_span(pixels, offset, count, color)
- *
- * A straight store, matching `clear` and the opaque half of `_span`: filling
- * with a translucent colour replaces what was there rather than tinting it. */
+/* canvas_fill_span(pixels, offset, count, color) — straight store: a
+ * translucent colour replaces what was there rather than tinting it. */
 static bool nCanvasFillSpan(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels;
@@ -197,12 +166,8 @@ static bool nCanvasFillSpan(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_write_span(pixels, offset, source)
- *
- * Copy a run of already-packed pixels into the buffer. The row of an occupancy
- * grid or a heatmap is built in Jaithon and lands here in one call rather than
- * one interpreted store per pixel. A straight store, like canvas_fill_span:
- * the source is a picture, not a tint. */
+/* canvas_write_span(pixels, offset, source) — straight store like
+ * canvas_fill_span: the source is a picture, not a tint. */
 static bool nCanvasWriteSpan(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels, *source;
@@ -228,12 +193,9 @@ static bool nCanvasWriteSpan(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_scanlines(pixels, width, height)
- *
- * Pack a packed-ARGB pixel buffer into PNG's raw image data: each row prefixed
- * with its filter-type byte, then RGBA per pixel. Building that in Jaithon
- * means a list of (width * 4 + 1) * height boxed integers -- three million of
- * them for a 900x900 figure, which costs more than compressing the result. */
+/* canvas_scanlines(pixels, width, height) — packs ARGB pixels into PNG raw
+ * scanlines (filter byte + RGBA per row); native to avoid boxing millions of
+ * ints in Jaithon. */
 static bool nCanvasScanlines(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels;
@@ -264,7 +226,7 @@ static bool nCanvasScanlines(int argc, Value *args, Value *out) {
 
     for (int64_t row = 0; row < height; row++) {
         uint8_t *line = raw + (size_t)row * stride;
-        *line++ = 0;                       /* filter type 0: no prediction */
+        *line++ = 0;
         const Value *source = pixels->items + (size_t)row * (size_t)width;
         for (int64_t column = 0; column < width; column++) {
             Value pixel = source[column];
@@ -276,10 +238,10 @@ static bool nCanvasScanlines(int argc, Value *args, Value *out) {
                                 jaiTypeNameStatic(pixel));
             }
             uint32_t packed = (uint32_t)AS_INT(pixel);
-            *line++ = (uint8_t)(packed >> 16);   /* red   */
-            *line++ = (uint8_t)(packed >> 8);    /* green */
-            *line++ = (uint8_t)packed;           /* blue  */
-            *line++ = (uint8_t)(packed >> 24);   /* alpha */
+            *line++ = (uint8_t)(packed >> 16);
+            *line++ = (uint8_t)(packed >> 8);
+            *line++ = (uint8_t)packed;
+            *line++ = (uint8_t)(packed >> 24);
         }
     }
 
@@ -293,20 +255,9 @@ static bool nCanvasScanlines(int argc, Value *args, Value *out) {
 }
 
 /* canvas_fill_convex(pixels, width, height, points, color, clipLeft, clipTop,
- *                    clipRight, clipBottom)
- *
- * Anti-aliased fill of a convex polygon, `points` being a flat list of
- * alternating x and y in device pixels.
- *
- * This is the one piece of geometry that lives in C rather than in Jaithon,
- * and it is here because of what a robot visualiser draws: a laser ray is a
- * quad, a particle is a wedge, a marker is a small polygon, and there are
- * thousands of them a frame. Each is a handful of pixels, so the per-shape
- * setup -- not the shading -- is the entire cost, and that setup is exactly
- * what an interpreter is worst at.
- *
- * Convex is what makes it short: any scanline meets the outline exactly twice,
- * so the span is a minimum and a maximum with nothing to sort or pair. */
+ * clipRight, clipBottom) — anti-aliased convex-polygon fill; `points` is a
+ * flat list of alternating x,y in device pixels. Convexity is required: each
+ * scanline must cross the outline exactly twice (min/max span, no sort/pair). */
 static bool nCanvasFillConvex(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels, *points;
@@ -461,13 +412,9 @@ static bool nCanvasFillConvex(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_blend_span(pixels, offset, coverage, color)
- *
- * One anti-aliased scanline: `coverage` holds one 0-255 weight per pixel, its
- * length is the length of the run, and each pixel is composited with the
- * colour's alpha scaled by its weight. A weight of 255 scales the alpha to
- * itself, so a fully covered pixel is exactly what put_pixel would have
- * written. */
+/* canvas_blend_span(pixels, offset, coverage, color) — composites color's
+ * alpha scaled by each 0-255 coverage weight; weight 255 reproduces exactly
+ * what an opaque write would have. */
 static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels, *coverage;
@@ -512,8 +459,7 @@ static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
     for (int i = 0; i < coverage->count; i++) {
         uint32_t weight = (uint32_t)AS_INT(coverage->items[i]);
         if (weight == 0u) continue;
-        /* Rounded like every other channel operation here, and exact at the
-         * ends: weight 255 leaves the alpha alone. */
+        /* Rounded, like every channel op here; exact at weight 255. */
         uint32_t scaled = (alpha * weight + 127u) / 255u;
         if (scaled == 0u) continue;
         uint32_t source = (color & 0x00FFFFFFu) | (scaled << 24);
@@ -532,15 +478,9 @@ static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
 /* ------------------------------------------------------------------ */
 
 /* canvas_blit_scaled(dst, dst_width, src, src_width, src_height,
- *                    sx, sy, sw, sh, dx, dy, dw, dh)
- *
- * Nearest-neighbour: destination pixel `i` of a row samples source column
- * `sx + i * sw / dw`, which is the sampling every integer-scaled blit agrees
- * on. Each sample is composited over what is already there, so a translucent
- * source tints rather than replaces.
- *
- * Passing one buffer as both source and destination is allowed and safe, but
- * overlapping rectangles then read pixels this call has already written. */
+ * sx, sy, sw, sh, dx, dy, dw, dh) — nearest-neighbour scaled blit, composited
+ * (not replaced) onto dst. src and dst may be the same buffer, but
+ * overlapping rects then read pixels this call has already written. */
 static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
     (void)argc;
     const char *fnName = "canvas_blit_scaled";
@@ -581,9 +521,7 @@ static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
     if (!canvasCheckRect(dx, dy, dw, dh, dstWidth, dstHeight, fnName, "destination"))
         return false;
 
-    /* An empty rectangle on either side has nothing to sample or nowhere to put
-     * it. Checked after the bounds so that a degenerate call is still told
-     * about a rectangle that was outside the buffer. */
+    /* Checked after the bounds, so an empty rect outside the buffer still errors. */
     if (sw == 0 || sh == 0 || dw == 0 || dh == 0) {
         *out = NULL_VAL;
         return true;
@@ -611,16 +549,10 @@ static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_downsample_box(dst, src, width, height, factor)
- *
- * The reduction half of supersampled anti-aliasing: every `factor` x `factor`
- * block of `src` becomes one pixel of `dst`. Colours are averaged weighted by
- * their own alpha — the premultiplied average — because averaging the channels
- * of a transparent pixel as if they were visible drags the result towards
- * black at every soft edge.
- *
- * Rows and columns past the last whole block are dropped, so `dst` holds
- * exactly (width / factor) * (height / factor) pixels. */
+/* canvas_downsample_box(dst, src, width, height, factor) — box-reduces src by
+ * factor; colours are averaged weighted by their own alpha (premultiplied),
+ * because a plain average of transparent pixels drags soft edges toward
+ * black. Trailing rows/columns past the last whole block are dropped. */
 static bool nCanvasDownsampleBox(int argc, Value *args, Value *out) {
     (void)argc;
     const char *fnName = "canvas_downsample_box";

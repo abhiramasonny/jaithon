@@ -1,18 +1,7 @@
-/* stubs.c — the windowing and GPU surface on platforms that have neither.
- *
- * Only compiled in on non-Apple targets; gui.m and gpu.m own these symbols on
- * macOS. Everything that needs a device reports that there is none, so std.gui
- * and std.gpu see the same "no device" answer they would get from a Mac without
- * one, and the tree links on Linux.
- *
- * The four built-in kernels are the exception: they carry the same scalar code
- * their macOS counterparts fall back on, because a caller of jaiGpuVectorAdd
- * wants the sum, not a report that this machine has no Metal. Keeping them here
- * is what makes the built-ins produce identical answers on every platform. The
- * arithmetic is duplicated from gpu.m rather than shared, because the two files
- * are compiled on mutually exclusive platforms and a shared object file would
- * be dead weight on both.
- */
+/* stubs.c — windowing/GPU surface for platforms with neither; gui.m and gpu.m
+ * own these symbols on macOS. The four arithmetic kernels are duplicated here
+ * from gpu.m rather than shared, since the two files never compile together
+ * and a shared object would be dead weight on both. */
 
 #include "native.h"
 
@@ -23,10 +12,6 @@ typedef int JaiNativeStubsUnit;
 #ifndef __APPLE__
 
 #include <math.h>
-
-/* ------------------------------------------------------------------ */
-/* Windowing                                                           */
-/* ------------------------------------------------------------------ */
 
 bool jaiGuiAvailable(void) {
     return false;
@@ -88,8 +73,6 @@ bool jaiWindowKeyDown(JaiWindow *w, int hidCode) {
     return false;
 }
 
-/* No window system, so no platform key numbering to translate out of. 0 is the
- * "names no key" answer, which is what every code gets here. */
 int jaiWindowKeyFromPlatform(int platformCode) {
     (void)platformCode;
     return 0;
@@ -116,10 +99,6 @@ void jaiWindowSetTitle(JaiWindow *w, const char *title) {
     (void)w;
     (void)title;
 }
-
-/* ------------------------------------------------------------------ */
-/* GPU                                                                 */
-/* ------------------------------------------------------------------ */
 
 bool jaiGpuAvailable(void) {
     return false;
@@ -184,9 +163,8 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
     return false;
 }
 
-/* Neumaier's variant of Kahan summation: it also keeps the low bits of the
- * additions a plain Kahan loop drops, the ones where the running total is
- * smaller than the term being added. Must stay identical to gpu.m's copy. */
+/* Neumaier variant of Kahan summation — also captures the low bits dropped
+ * when the running total is smaller than the term added. Must stay identical to gpu.m's copy. */
 static double compensatedSum(const double *values, size_t n) {
     double total = 0.0;
     double correction = 0.0;
@@ -215,9 +193,8 @@ bool jaiGpuVectorMul(const double *a, const double *b, double *out, size_t n) {
     return true;
 }
 
-/* Row, inner, column order so that both `b` and the output row are walked
- * forwards; the arithmetic is the textbook triple loop's, the cache behaviour
- * is not. */
+/* Row/inner/column loop order keeps `b` and the output row walked forward;
+ * same arithmetic as the textbook triple loop, different cache behavior. */
 bool jaiGpuMatMul(const double *a, const double *b, double *out,
                   size_t m, size_t k, size_t n) {
     if (a == NULL || b == NULL || out == NULL) return false;

@@ -78,10 +78,9 @@ uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x8b000000u | (rm << 16) | (rn << 5) | rd;
 }
 
-/* add Xd, Xn, Xm, lsl #shift -- the shifted-register form. A Value is sixteen
- * bytes, so every element address is base + index*16, and folding the shift
- * into the add is one instruction instead of two on a path that runs eight
- * times per cell in `life`. */
+/* add Xd, Xn, Xm, lsl #shift -- folding the shift into the add is one
+ * instruction instead of two for a Value-array element address (base +
+ * index*16), on a path that runs eight times per cell in `life`. */
 uint32_t jaiA64AddXLsl(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
     return 0x8b000000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
 }
@@ -94,19 +93,10 @@ uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm) {
     return 0xeb000000u | (rm << 16) | (rn << 5) | rd;
 }
 
-/* The two extended-register forms, which take only the LOW 32 BITS of Xm and
- * zero-extend them.
- *
- * They exist so that an ObjList's `items` and `count` can be fetched by one
- * `ldp`: count and capacity are adjacent int32s, so the second half of the pair
- * arrives as `count | capacity << 32` and every use of it has to ignore the top
- * half. `uxtw` is that, folded into the instruction that was going to run
- * anyway rather than paid as a separate `and`.
- *
- * option = 010 (UXTW) sits at bits 15:13, and imm3 = 0 means no further shift,
- * so the constant below is base | 0x4000. Note rd = 31 is XZR here and NOT the
- * stack pointer, because these are the flag-setting/adding register forms with
- * an extended operand -- SUBS with Rd = 31 is `cmp`, exactly as for SubsXReg. */
+/* The extended-register forms take only Xm's low 32 bits, zero-extended:
+ * ObjList's `items`/`count` fetch as one `ldp`, giving `count | capacity<<32`,
+ * and uxtw discards the top half for free. rd = 31 here is XZR (`cmp`/plain
+ * add), not the stack pointer -- these are the flag-setting register forms. */
 uint32_t jaiA64SubsXUxtw(unsigned rd, unsigned rn, unsigned rm) {
     return 0xeb204000u | (rm << 16) | (rn << 5) | rd;
 }
@@ -124,8 +114,8 @@ uint32_t jaiA64Bl(int32_t instructions) {
 }
 
 /* stp Xt1, Xt2, [Xn, #imm]! -- imm is a byte offset, 8-aligned, -512..504.
- * The pre-index form writes the new base back, which is how a prologue both
- * saves a pair and opens the frame in one instruction. */
+ * Pre-index writes the new base back, so a prologue saves a pair and opens
+ * the frame in one instruction. */
 uint32_t jaiA64StpPre(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     uint32_t imm7 = (uint32_t)((imm / 8) & 0x7f);
     return 0xa9800000u | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
@@ -149,9 +139,9 @@ uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     return 0xa9400000u | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
 }
 
-/* ldr Xt, <label> -- PC-relative literal load. One instruction to get a full
- * 64-bit constant, against four for a movz/movk chain, which is why the stack
- * limit is a literal after the body rather than materialised at every entry. */
+/* ldr Xt, <label> -- PC-relative literal load: one instruction for a full
+ * 64-bit constant vs four for movz/movk, why the stack limit is a literal
+ * after the body rather than materialised at every entry. */
 uint32_t jaiA64LdrLit(unsigned rt, int32_t instructions) {
     uint32_t imm19 = (uint32_t)(instructions & 0x7ffff);
     return 0x58000000u | (imm19 << 5) | rt;
@@ -179,10 +169,9 @@ uint32_t jaiA64SubsXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
     return 0xeb800000u | (shift << 10) | (rm << 16) | (rn << 5) | rd;
 }
 
-/* The two-source floating-point forms share one skeleton: 0x1e6.. is "scalar
- * fp, type = double", and a 4-bit opcode at bit 12 is the only thing that
- * separates add from sub from mul from div. Register fields sit exactly where
- * the integer forms put them, which is the one mercy of this corner. */
+/* The two-source fp forms share one skeleton (0x1e6.., "scalar fp, double");
+ * a 4-bit opcode at bit 12 alone separates add/sub/mul/div, and register
+ * fields sit exactly where the integer forms put them. */
 uint32_t jaiA64FaddD(unsigned rd, unsigned rn, unsigned rm) {
     return 0x1e602800u | (rm << 16) | (rn << 5) | rd;
 }
@@ -203,9 +192,8 @@ uint32_t jaiA64FdivD(unsigned rd, unsigned rn, unsigned rm) {
     return 0x1e601800u | (rm << 16) | (rn << 5) | rd;
 }
 
-/* The one-source forms swap the layout: the opcode grows to six bits and moves
- * up to bit 15, taking the space where a two-source form keeps Rm. So there is
- * no Rm field here at all, and only Rn and Rd stay put. */
+/* The one-source forms swap the layout: opcode grows to six bits at bit 15,
+ * the space a two-source form gives Rm -- so there is no Rm field here. */
 uint32_t jaiA64FnegD(unsigned rd, unsigned rn) {
     return 0x1e614000u | (rn << 5) | rd;
 }
@@ -215,25 +203,21 @@ uint32_t jaiA64FsqrtD(unsigned rd, unsigned rn) {
     return 0x1e61c000u | (rn << 5) | rd;
 }
 
-/* fcmp Dn, Dm -- the odd one: it has no destination, so the field where Rd
- * would go is a 5-bit opcode instead, and zero there means "compare against a
- * register" rather than against #0.0. Writing rd = 31 out of integer habit
- * would silently assemble fcmpe Dn, #0.0. */
+/* fcmp Dn, Dm -- the odd one: no destination, so Rd's field is a 5-bit opcode
+ * instead, and zero means "compare against a register" not against #0.0.
+ * Writing rd = 31 out of integer habit would silently assemble fcmpe Dn, #0.0. */
 uint32_t jaiA64FcmpD(unsigned rn, unsigned rm) {
     return 0x1e602000u | (rm << 16) | (rn << 5);
 }
 
-/* fmov Dd, Dn -- opcode 0 of the one-source group, which makes it the plain
- * register move rather than an alias of anything. */
+/* fmov Dd, Dn -- opcode 0 of the one-source group: the plain register move. */
 uint32_t jaiA64FmovDD(unsigned rd, unsigned rn) {
     return 0x1e604000u | (rn << 5) | rd;
 }
 
-/* fmov Dd, Xn -- a different instruction class from the one above: this is the
- * fp/integer transfer group, sf = 1 for a 64-bit source and opcode 7 meaning
- * "general to fp". It copies bits. The double it produces is whatever those 64
- * bits already spelled, so feeding it the integer 1 yields a denormal near
- * zero, not 1.0. Use scvtf when a number is meant. */
+/* fmov Dd, Xn -- the fp/integer transfer group, opcode 7. Copies bits: the
+ * double it produces is whatever those 64 bits spelled, so feeding it the
+ * integer 1 yields a denormal near zero, not 1.0. Use scvtf for a number. */
 uint32_t jaiA64FmovDX(unsigned rd, unsigned rn) {
     return 0x9e670000u | (rn << 5) | rd;
 }
@@ -242,13 +226,10 @@ uint32_t jaiA64FmovDImm(unsigned rd, unsigned imm8) {
     return 0x1e601000u | ((imm8 & 0xffu) << 13) | rd;
 }
 
-/* The eight-bit form covers +-(1 + m/16) * 2^e for m in 0..15 and e in -3..4,
- * which is where the constants in float code actually live: 0.5, 2.0, 4.0,
- * 0.25. Zero is not in it -- the format has an implicit leading one -- so
- * `x = 0.0` still goes the long way round, which is right, since it is not in
- * a loop. Rather than reproduce VFPExpandImm's bit surgery backwards, this
- * builds each of the 256 values and compares: it runs at compile time, once
- * per constant, and it cannot be subtly wrong the way an inverse would be. */
+/* The eight-bit form covers +-(1 + m/16) * 2^e, where the constants in float
+ * code actually live (0.5, 2.0, 4.0, 0.25). Rather than invert VFPExpandImm's
+ * bit surgery, this builds all 256 values and compares -- compile-time cost,
+ * and it can't be subtly wrong the way an inverse derivation could be. */
 bool jaiA64FpImm8(double v, unsigned *imm8) {
     for (unsigned i = 0; i < 256; i++) {
         unsigned s = (i >> 7) & 1u, b = (i >> 6) & 1u;
@@ -307,8 +288,7 @@ uint32_t jaiA64Blr(unsigned rn) {
 }
 
 /* cset Xd, <cond> -- 1 when the condition holds, 0 otherwise. Encoded as
- * CSINC Xd, XZR, XZR with the condition inverted, which is the standard alias:
- * a comparison's answer becomes a value without a branch. */
+ * CSINC Xd, XZR, XZR with the condition inverted, the standard alias. */
 uint32_t jaiA64CsetX(unsigned rd, unsigned cond) {
     unsigned inv = cond ^ 1u;
     return 0x9a9f07e0u | (inv << 12) | rd;
@@ -346,16 +326,9 @@ uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xaa000000u | (rm << 16) | (rn << 5) | rd;
 }
 
-/* and Xd, Xn, #((1 << ones) - 1) -- the AND (immediate) form, restricted to the
- * one pattern this needs: a run of `ones` set bits at the bottom.
- *
- * arm64's logical immediates are an encoded (N, immr, imms) triple, not a
- * number, and only some 64-bit values have one. A low run of n ones is
- * N=1, immr=0, imms=n-1, which is why the restriction: it makes the encoding a
- * subtraction rather than the general bitmask search, and the general search is
- * exactly the sort of thing that would be wrong in a corner nothing exercises.
- * `ones` must be 1..63 -- 0 is not a legal pattern (all-zero) and 64 is the
- * all-ones one, and neither is reachable from a positive int64 power of two. */
+/* and Xd, Xn, #((1 << ones) - 1): the general logical-immediate encoding is a
+ * bitmask search, but a low run of `ones` bits is just N=1, immr=0,
+ * imms=ones-1. `ones` must be 1..63 (0 and 64 aren't legal patterns here). */
 uint32_t jaiA64AndXOnes(unsigned rd, unsigned rn, unsigned ones) {
     return 0x92400000u | (((ones - 1u) & 0x3fu) << 10) | (rn << 5) | rd;
 }
@@ -371,20 +344,16 @@ uint32_t jaiA64AsrvX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x9ac02800u | (rm << 16) | (rn << 5) | rd;
 }
 
-/* adds Xd, Xn, #imm12 -- the flag-setting add-immediate. The register form
- * already existed; this one exists because `i += 1` was two instructions, a
- * movz of the constant and then the add, in every counted loop in the
- * language. Same encoding family as SubsXImm above with the op bit clear. */
+/* adds Xd, Xn, #imm12 -- flag-setting add-immediate, added because `i += 1`
+ * was two instructions (movz then add) in every counted loop in the language. */
 uint32_t jaiA64AddsXImm(unsigned rd, unsigned rn, unsigned imm12) {
     return 0xb1000000u | ((imm12 & 0xfffu) << 10) | (rn << 5) | rd;
 }
 
-/* tbz/tbnz Xt, #bit, #offset -- branch on one bit, offset in instructions.
- *
- * The bit index splits across two fields: its top bit is instruction bit 31
- * (which is also what makes it a 64-bit test) and the low five are bits 23:19.
- * Getting that split wrong tests a neighbouring bit and the instruction still
- * runs, which is why this is executed in tests/vm/jit_arm64.c rather than read. */
+/* tbz/tbnz Xt, #bit, #offset -- branch on one bit. The bit index splits across
+ * two fields (top bit at 31, low five at 23:19); getting that split wrong
+ * tests a neighbouring bit and still runs, why this is executed in
+ * tests/jit_arm64.c rather than read. */
 static uint32_t tbEncode(unsigned op, unsigned rt, unsigned bit,
                          int32_t instructions) {
     return 0x36000000u | ((bit >> 5) << 31) | (op << 24) |

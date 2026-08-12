@@ -1,21 +1,7 @@
 /* builtins_gpu.c — __prim__.gpu_*, the surface std.gpu is written over.
- *
- * Device memory is 32-bit floats and Jaithon floats are doubles, so every
- * transfer narrows on the way down and widens on the way back. That is the
- * whole reason `Buffer` is measured in "float slots" rather than in bytes:
- * the precision loss belongs in the caller's model of the thing, not hidden
- * inside a byte count.
- *
- * Buffers and kernels are integer handles, not objects. Neither is GC memory,
- * the collector cannot trace into the device, and a finaliser would free device
- * memory at an unpredictable point in a frame — so std.gpu frees both
- * explicitly and documents the `defer`. See handles.h.
- *
- * The four built-in kernels at the bottom are the exception to all of the
- * above: they take and return plain lists, allocate nothing the caller has to
- * release, and fall back to compensated scalar arithmetic when there is no
- * device, so they answer the same on every platform.
- */
+ * Buffers and kernels are integer handles rather than GC objects, since the
+ * collector can't trace into the device and a finaliser can't free it
+ * predictably -- std.gpu frees both explicitly via `defer` (see handles.h). */
 
 #include "runtime.h"
 #include "handles.h"
@@ -23,8 +9,7 @@
 #include "../native/native.h"
 #include "../vm/gc.h"
 
-/* Metal's diagnostic listing for a failed compile: file, line and caret for
- * every error in the source. */
+/* Metal's diagnostic listing for a failed compile: file, line, caret per error. */
 #define GPU_ERROR_BUFFER 4096
 
 typedef struct {
@@ -56,8 +41,8 @@ static bool requireKernel(Value v, int index, const char *fnName,
     return true;
 }
 
-/* Copy a list of numbers into a fresh double array. Returns NULL after raising
- * when an element is not a number; an empty list yields NULL with count 0. */
+/* Returns NULL both after raising (a non-number element) and for an empty
+ * list -- every caller filters count == 0 first. */
 static double *numbersOf(ObjList *list, const char *fnName, int index) {
     if (list->count == 0) return NULL;
     double *values = JAI_ALLOC(double, list->count);
@@ -82,10 +67,6 @@ static ObjList *listOfDoubles(const double *values, int64_t count) {
     return list;
 }
 
-/* ------------------------------------------------------------------ */
-/* Device                                                              */
-/* ------------------------------------------------------------------ */
-
 static bool nGpuAvailable(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -100,10 +81,6 @@ static bool nGpuDeviceName(int argc, Value *args, Value *out) {
     *out = OBJ_VAL(jaiStringInternC(name != NULL ? name : "none"));
     return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* Buffers                                                             */
-/* ------------------------------------------------------------------ */
 
 static bool nGpuBufferNew(int argc, Value *args, Value *out) {
     (void)argc;
@@ -221,10 +198,6 @@ static bool nGpuBufferFree(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Kernels                                                             */
-/* ------------------------------------------------------------------ */
-
 static bool nGpuCompile(int argc, Value *args, Value *out) {
     (void)argc;
     if (!requireGpu("gpu_compile")) return false;
@@ -332,14 +305,9 @@ static bool nGpuKernelFree(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Built-in kernels                                                    */
-/*                                                                     */
-/* These do not require a device: the native layer runs them on the    */
-/* GPU when there is one and in compensated scalar arithmetic when     */
-/* there is not, so they answer identically everywhere.                */
-/* ------------------------------------------------------------------ */
-
+/* The built-in kernels below need no device: the native layer runs them on
+ * the GPU when there is one and in compensated scalar arithmetic when there
+ * is not, so they answer identically everywhere. */
 static bool elementwise(Value *args, Value *out, const char *fnName,
                         bool (*run)(const double *, const double *, double *,
                                     size_t)) {

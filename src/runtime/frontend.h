@@ -3,25 +3,20 @@
 
 #include "../vm/value.h"
 
-/* The C side of the boundary with the self-hosted front end.
- *
- * The compiler is a Jaithon program, so every question the driver asks it is a
- * VM call that returns a Jaithon object. The mechanics of that -- import the
- * module, find the entry, root the arguments, read a field back off the result
- * -- are the same for every question, and they live here so that no driver has
- * to know them twice. */
+/* The C side of the boundary with the self-hosted front end: import, call,
+ * and read results, in one place so no driver needs to know it twice. */
 
-/* Read `name` off a Jaithon instance. False when `v` is not an instance or has
- * no such field, in which case `*out` is untouched. */
+/* False when `v` isn't an instance or has no such field; `*out` is left
+ * untouched. */
 bool jaiFrontEndField(Value v, const char *name, Value *out);
 
-/* Call the zero-argument method `name` on `v`. False when there is no such
- * method or the call raised; a raise is cleared, not reported. */
+/* False if there's no such method or the call raised; a raise is cleared, not
+ * reported. */
 bool jaiFrontEndCall0(Value v, const char *name, Value *out);
 
-/* Call `module.name(args...)`. False when the module cannot be imported, does
- * not export `name`, or the call raised -- the raise is reported and cleared,
- * because a front end that throws is a bug worth a traceback. */
+/* False if the module can't be imported/doesn't export `name`, or the call
+ * raised — here the raise is reported (not just cleared): a front end that
+ * throws is a bug worth a traceback. */
 bool jaiFrontEndInvoke(const char *module, const char *name, int argc,
                        Value *args, Value *out);
 
@@ -29,8 +24,8 @@ bool jaiFrontEndInvoke(const char *module, const char *name, int argc,
 /* The prompt                                                           */
 /* ------------------------------------------------------------------ */
 
-/* What is holding an input open. Mirrors `OpenKind.open_ordinal` in
- * lib/jaithon/compile/repl.jai; the two are changed together. */
+/* Mirrors `OpenKind.open_ordinal` in lib/jaithon/compile/repl.jai; change both
+ * together. */
 typedef enum {
     JAI_REPL_OPEN_NONE = 0,
     JAI_REPL_OPEN_BRACKET,   /* `(`, `[` or `{` is still waiting for its closer */
@@ -51,25 +46,13 @@ typedef struct {
     int             closerCol;
 } JaiReplScan;
 
-/* Ask the front end whether `source` is a whole input.
- *
- * False means the question could not be asked -- no front end on the path --
- * and leaves `*out` zeroed, which reads as "complete": the compile that
- * follows will report the real reason rather than the prompt hanging on a line
- * nothing can finish. */
+/* False (no front end on the path) leaves `*out` zeroed, which reads as
+ * "complete" — the compile that follows reports the real reason. */
 bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out);
 
-/* Compile one prompt input into `module`.
- *
- * The session -- the type names earlier inputs declared -- lives on the Jaithon
- * side and is held for the process, so a class declared on one line is
- * nameable in an annotation on the next.
- *
- * `echo` names the native a bare expression's value is handed to, or NULL to
- * discard it. `wholeFile` reads the input as a file rather than as one prompt
- * line, which is what `:load` wants.
- *
- * NULL when the input was rejected; its diagnostics have been printed. */
+/* The session (type names declared so far) persists across calls, so a class
+ * declared on one line is nameable in an annotation on the next. NULL when
+ * the input was rejected — diagnostics already printed. */
 typedef struct {
     const char *path;       /* the label the input is registered under */
     int         fileId;
@@ -86,24 +69,18 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
                                     const JaiReplCompileOptions *opts,
                                     ObjModule *module, bool *outWasExpression);
 
-/* Rebuild the front end's own diagnostics as JaiDiag in `gDiags`, so the
- * driver renders them exactly as it renders the C's -- with the source
- * excerpt, the caret and the help. True when there were any.
- *
- * `Compiled.report()` is the alternative and it is a flat line per diagnostic;
- * printing that was a real loss of quality that no gate caught. */
+/* Rebuilds the diagnostics as JaiDiag in `gDiags`, so they render exactly
+ * like the C front end's (source excerpt, caret, help) rather than as
+ * `Compiled.report()`'s flat line per diagnostic. True when there were any. */
 bool jaiFrontEndTransferDiagnostics(Value compiled);
 
 /* ------------------------------------------------------------------ */
 /* Dumps                                                                */
 /* ------------------------------------------------------------------ */
 
-/* What `jaithon ast`, `jaithon ast --json` and `jaithon tokens` print for
- * `source`, as the front end renders it. NULL when the front end could not be
- * reached or refused the input; the reason is in gDiags or was thrown.
- *
- * The returned string is a Jaithon object and is only guaranteed live until the
- * next allocation, so callers write it out and drop it. */
+/* NULL when the front end couldn't be reached or refused the input (reason in
+ * gDiags, or thrown). The returned string is only guaranteed live until the
+ * next allocation — callers write it out and drop it. */
 ObjString *jaiFrontEndAstText(const char *source, size_t length,
                               const char *path, int fileId, bool json);
 ObjString *jaiFrontEndTokenText(const char *source, size_t length, int fileId);

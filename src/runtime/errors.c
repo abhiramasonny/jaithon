@@ -1,21 +1,7 @@
 /* errors.c — the built-in exception hierarchy of spec §7.2.
- *
- * The hierarchy is built in C, not declared in Jaithon, because the runtime
- * throws from paths that run long before any Jaithon source is loaded: a
- * failed import, a bad argument to a native, a stack overflow. std.prelude
- * only re-exports what this file defines.
- *
- * Every exception is an ordinary ObjInstance. `Error` declares two fields and
- * nothing else derives from anything but `Error`, so jaiClassInherit — which
- * copies parent fields down first, keeping their slot numbers — pins them at
- * the same slots in every subclass, including subclasses a program declares:
- *
- *     slot 0  message    the constructor argument, always a str
- *     slot 1  traceback  filled by the VM at throw time, null until then
- *
- * The VM writes slot 1 directly; there is no setter, because a Jaithon-visible
- * one would let user code forge a traceback.
- */
+ * Built in C because the runtime throws before any Jaithon source loads.
+ * jaiClassInherit pins Error's two fields at the same slots in every
+ * subclass: slot 0 message, slot 1 traceback (VM-written only, no setter). */
 
 #include "runtime.h"
 
@@ -42,9 +28,8 @@ static const char *classNameOf(const ObjInstance *inst) {
     return inst->klass->name->chars;
 }
 
-/* A native method is called with the receiver in args[0] (spec: slot 0 of a
- * frame is callee/self) and argc counting it. Everything below therefore reads
- * its arguments from args[1] onwards. */
+/* Receiver is args[0] (spec: frame slot 0 is callee/self), argc counts it;
+ * everything below reads its arguments from args[1] onward. */
 static bool errorSelf(int argc, Value *args, const char *method,
                       ObjInstance **out) {
     if (argc >= 1 && args != NULL && IS_INSTANCE(args[0]) &&
@@ -56,8 +41,6 @@ static bool errorSelf(int argc, Value *args, const char *method,
                     method);
 }
 
-/* Appends the str() of a value. Returns false with the exception pending if a
- * user __str__ raised. */
 static bool appendText(JaiBuf *buf, Value v) {
     if (IS_STRING(v)) {
         jaiBufAppend(buf, AS_STRING(v)->chars, AS_STRING(v)->length);
@@ -69,7 +52,6 @@ static bool appendText(JaiBuf *buf, Value v) {
     return true;
 }
 
-/* Turns a finished buffer into a string, consuming it either way. */
 static bool takeString(JaiBuf *buf, Value *out) {
     size_t length = 0;
     char *chars = jaiBufTakeCString(buf, &length);
@@ -84,9 +66,8 @@ static bool takeString(JaiBuf *buf, Value *out) {
 /* Natives on Error                                                     */
 /* ------------------------------------------------------------------ */
 
-/* init(self, message = "") — this is what makes `ValueError("bad")` work.
- * A non-str argument is converted rather than rejected so that the message
- * field is a str for every construction path. */
+/* A non-str message is converted rather than rejected, so the message field
+ * is a str for every construction path. */
 static bool errorInit(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.init", &self)) return false;
@@ -110,7 +91,7 @@ static bool errorInit(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* str(e) is the bare message, so `print(e)` and `print(e.message)` agree. */
+/* The bare message, so `print(e)` and `print(e.message)` agree. */
 static bool errorStr(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.__str__", &self)) return false;
@@ -129,7 +110,7 @@ static bool errorStr(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* repr(e) is the call that would rebuild it: ValueError("bad input"). */
+/* The call that would rebuild it: ValueError("bad input"). */
 static bool errorRepr(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.__repr__", &self)) return false;
@@ -153,9 +134,8 @@ static bool errorRepr(int argc, Value *args, Value *out) {
     return takeString(&buf, out);
 }
 
-/* The traceback the VM recorded, verbatim; null if this exception was never
- * thrown. Spelled as a dunder because a method named `traceback` would be
- * unreachable — the field of that name wins every property lookup. */
+/* Named __traceback__, not traceback: a method of that name would be
+ * unreachable, since the field wins every property lookup. */
 static bool errorTraceback(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.__traceback__", &self)) return false;
@@ -163,9 +143,6 @@ static bool errorTraceback(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The same thing rendered for printing: one frame per line, "" when unset.
- * Whatever the VM stored is accepted — a list of strings, a list of frame
- * tuples, or a single pre-rendered string. */
 static bool errorTracebackString(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.traceback_string", &self)) return false;
@@ -210,8 +187,8 @@ static void addNativeMethod(ObjClass *c, const char *name, JaiNativeFn fn,
     jaiGCPopRoot();
 }
 
-/* message and traceback, declared by hand: no Jaithon class body ever runs for
- * Error, so nothing else would allocate its FieldInfo array. */
+/* Declared by hand: no Jaithon class body runs for Error, so nothing else
+ * would allocate its FieldInfo array. */
 static void addErrorFields(ObjClass *error) {
     ObjString *messageName =
         (vm.strMessage != NULL) ? vm.strMessage : jaiStringInternC("message");
@@ -236,8 +213,6 @@ static void addErrorFields(ObjClass *error) {
     jaiGCPopRoots(2);
 }
 
-/* Creates one class, links it under `super`, and binds it in the builtins
- * module. Inheriting copies down Error's fields, its init, and its dunders. */
 static ObjClass *defineErrorClass(const char *name, ObjClass *super) {
     ObjString *className = jaiStringInternC(name);
     jaiGCPushRoot(OBJ_VAL(className));

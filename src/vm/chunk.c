@@ -1,10 +1,7 @@
 /* chunk.c — bytecode chunks, the opcode metadata tables, and the disassembler.
  *
- * Normative reference: spec/BYTECODE.md §2 (operand encoding), §3 (opcode
- * table). The single source of truth for opcode metadata is JAI_OPCODES below;
- * jaiOpName, jaiOpOperandSize and jaiOpStackEffect are all generated from it so
- * they cannot drift apart, and a static assert ties the row count to OP_COUNT.
- */
+ * JAI_OPCODES below is the single source of truth for opcode metadata; a
+ * static assert ties the generated tables' row count to OP_COUNT. */
 #include "chunk.h"
 
 #include "../common/diag.h"
@@ -19,12 +16,8 @@
  * (argument counts, element counts) or on which way it branches. */
 #define SE_VAR INT32_MIN
 
-/* OP_CLOSURE is the one variable-length instruction: its operand run is a u24
- * constant index followed by upvalueCount * (u8 isLocal, u16 index), and
- * upvalueCount lives in the referenced ObjFunction. -1 is returned so that a
- * caller that forgets to special-case it fails loudly (a zero-length
- * instruction hangs its decode loop) instead of silently decoding the upvalue
- * bytes as opcodes. */
+/* OP_CLOSURE's operands are variable-length (u24 index + per-upvalue u8/u16
+ * pairs); -1 makes a caller that forgets to special-case it fail loudly. */
 #define OPERANDS_VARIABLE (-1)
 
 /* X(opcode, operandBytes, stackEffect) — order must match enum OpCode. */
@@ -236,18 +229,10 @@ int jaiOpCacheOperand(OpCode op) {
 
 /* ------------------------------------------------------------------ */
 /* Constant deduplication                                              */
-/*                                                                      */
-/* Small pools are scanned linearly. Past CONST_LINEAR_MAX the chunk's   */
-/* Chunk.constIndex table is built, mapping a 64-bit hash of a constant  */
-/* to its pool index.                                                    */
-/*                                                                      */
-/* The table is keyed by hash rather than by the Value itself because    */
-/* jaiValueHash/jaiValuesEqual compare numerically: they would collapse  */
-/* INT_VAL(1) and FLOAT_VAL(1.0) into one constant, and int and float    */
-/* are distinct types (spec §2.2). Every hash hit is therefore verified  */
-/* with constEqual, which is exact; a hash collision costs one duplicate */
-/* pool entry and never a wrong one.                                     */
 /* ------------------------------------------------------------------ */
+
+/* Keyed by hash, not Value: jaiValueHash conflates INT_VAL(1)/FLOAT_VAL(1.0),
+ * which spec §2.2 keeps distinct, so every hash hit is verified via constEqual. */
 
 #define CONST_LINEAR_MAX 64
 #define CONST_MAX_COUNT  (1u << 24)   /* u24 operand */
@@ -268,9 +253,8 @@ static bool constDedupable(Value v) {
     return false;
 }
 
-/* Exact structural equality for constant-pool entries. Deliberately not
- * jaiValuesEqual: this must never conflate int with float, must keep -0.0
- * distinct from 0.0, and must never run user code (__eq__). */
+/* Deliberately not jaiValuesEqual: this must keep int distinct from float,
+ * -0.0 distinct from 0.0, and never run user code (__eq__). */
 static bool constEqual(Value a, Value b, int depth) {
     if (jaiValueType(a) != jaiValueType(b)) return false;
     switch (jaiValueType(a)) {
@@ -350,9 +334,8 @@ static uint64_t constHash(Value v, int depth) {
     return jaiHashU64((uint64_t)(uintptr_t)o);
 }
 
-/* The chunk's dedup table, created and back-filled from the existing pool on
- * first use. Deserialised chunks arrive with a full pool and no index, so the
- * back-fill is what keeps their indices correct if anything appends later. */
+/* Created and back-filled from the existing pool on first use: a deserialised
+ * chunk arrives with a full pool but no index. */
 static JaiTable *indexMapFor(Chunk *chunk) {
     if (chunk->constIndex != NULL) return chunk->constIndex;
 
@@ -378,9 +361,8 @@ static JaiTable *indexMapFor(Chunk *chunk) {
 
 void jaiChunkInit(Chunk *chunk, int sourceFileId) {
     if (chunk == NULL) return;
-    /* Init only zeroes: it is also called on raw memory (jaiFunctionNew), so
-     * it must never dereference what the fields happen to contain. Releasing
-     * a populated chunk is jaiChunkFree's job. */
+    /* Only zeroes -- also called on raw memory (jaiFunctionNew), so it must
+     * never dereference existing field values; jaiChunkFree releases a populated chunk. */
     chunk->code = NULL;
     chunk->count = 0;
     chunk->capacity = 0;
@@ -438,9 +420,8 @@ uint16_t jaiChunkAddCache(Chunk *chunk) {
 /* Emission                                                            */
 /* ------------------------------------------------------------------ */
 
-/* One LineEntry per *run* of instructions sharing a source span: operand bytes
- * and consecutive instructions from the same expression collapse into one
- * entry, so the table stays tiny and jaiChunkSpanAt can binary-search it. */
+/* One LineEntry per *run* of same-span instructions, so the table stays tiny
+ * and jaiChunkSpanAt can binary-search it. */
 static void recordSpan(Chunk *chunk, uint32_t start, uint32_t end) {
     if (chunk->lineCount > 0) {
         const LineEntry *last = &chunk->lines[chunk->lineCount - 1];
@@ -528,15 +509,14 @@ uint32_t jaiChunkAddConstant(Chunk *chunk, Value v) {
                 constEqual(chunk->constants.data[index], v, 0)) {
                 return (uint32_t)index;
             }
-            /* Hash collision with a different constant: fall through and append
-             * a second entry rather than aliasing them. The earlier index keeps
-             * the slot, so leave the table alone. */
+            /* Hash collision with a different constant: append a second entry
+             * rather than aliasing; the earlier index keeps the slot, so leave
+             * the table alone. */
             map = NULL;
         }
     }
-    /* Beyond CONST_LINEAR_MAX, values that cannot be hashed structurally
-     * (functions, class specs) are appended without a dedup search; they are
-     * unique per emission site anyway. */
+    /* Beyond CONST_LINEAR_MAX, values that can't hash structurally (functions,
+     * class specs) append without a dedup search -- they're unique per site anyway. */
 
     if ((unsigned)count >= CONST_MAX_COUNT) {
         jaiDiagError(E0902_INTERNAL_ERROR,
@@ -622,10 +602,8 @@ static void emitConstOperands(FILE *out, const Chunk *chunk,
     fputc('\n', out);
 }
 
-/* "OFFSET  LINE  OP_NAME", where LINE is "|" when this instruction shares a
- * source line with the previous one. `pad` right-pads the mnemonic for the
- * operand column; it is off for operand-less instructions so that they do not
- * end in a run of spaces. */
+/* "OFFSET  LINE  OP_NAME"; LINE is "|" when sharing the previous source line.
+ * `pad` is off for operand-less ops so they don't trail spaces. */
 static void printPrefix(FILE *out, const Chunk *chunk, int offset,
                         const char *name, bool pad) {
     char line[8];
@@ -684,8 +662,7 @@ static int disassembleClosure(FILE *out, const Chunk *chunk, int offset) {
             return chunk->count;
         }
         /* bit 0: source is a local of the enclosing frame; bit 1: captured by
-         * value. Printing only bit 0 made a `let` capture indistinguishable
-         * from a `var` one, which is the difference the reader is looking for. */
+         * value. Printing only bit 0 hid the `let`-vs-`var` distinction readers want. */
         uint8_t how = chunk->code[next];
         uint16_t slot = jaiReadU16(chunk->code + next + 1);
         fprintf(out, "%04d  %4s  %-23s %s %u%s\n", next, "|", "|",

@@ -1,20 +1,14 @@
 /* gui.m — one window, one CPU-side ARGB back buffer, uploaded every present.
  *
- * The window is an NSWindow holding an MTKView whose drawable size is pinned to
- * the buffer size the caller asked for. Presenting copies the buffer into a
- * BGRA8Unorm texture and draws it over two triangles, so resizing the window
- * scales the image instead of reallocating: a pointer handed out by
- * jaiWindowPixels stays valid for the window's whole life, which is what the
- * drawing code in std.gui.canvas assumes.
+ * Presenting copies the buffer into a BGRA8Unorm texture drawn over two
+ * triangles, so resizing scales the image instead of reallocating — a pointer
+ * from jaiWindowPixels stays valid for the window's whole life, which
+ * std.gui.canvas assumes. Pixels are 0xAARRGGBB; little-endian that's B,G,R,A,
+ * exactly MTLPixelFormatBGRA8Unorm, so the upload needs no swizzle.
  *
- * Pixels are 0xAARRGGBB `uint32_t`. Little-endian that is the byte order B,G,R,A
- * — exactly MTLPixelFormatBGRA8Unorm — so the upload needs no swizzle.
- *
- * No drawing primitive lives here. Jaithon writes into the buffer directly.
- *
- * AppKit is main-thread-only, so every entry point that touches it checks and
- * degrades to a no-op rather than corrupting the app's state from a worker.
- */
+ * No drawing primitive lives here — Jaithon writes into the buffer directly.
+ * AppKit is main-thread-only, so every entry point touching it checks first
+ * and degrades to a no-op rather than corrupting state from a worker. */
 
 #ifdef __APPLE__
 
@@ -28,8 +22,7 @@
 #include "native.h"
 
 /* Keycodes leaving this file are USB HID usage ids, not AppKit virtual
- * keycodes — see the translation table below. The keyboard page tops out at
- * 231 (Right GUI), so a byte indexes it. */
+ * keycodes; the keyboard page tops out at 231 (Right GUI), so a byte indexes it. */
 #define JAI_KEY_COUNT 256
 
 /* AppKit virtual keycodes are 7-bit; nothing on a keyboard reports above 0x7F. */
@@ -125,10 +118,6 @@ static JaiWindowEvent *pushEvent(JaiWindow *w, int tag) {
     e->tag = tag;
     return e;
 }
-
-/* ------------------------------------------------------------------ */
-/* Objective-C half                                                    */
-/* ------------------------------------------------------------------ */
 
 @interface JaiBlitView : MTKView
 @property (nonatomic, assign) JaiWindow *owner;
@@ -229,10 +218,6 @@ static JaiWindowEvent *pushEvent(JaiWindow *w, int tag) {
 
 @end
 
-/* ------------------------------------------------------------------ */
-/* Window registry                                                     */
-/* ------------------------------------------------------------------ */
-
 static JaiWindow *gWindows[JAI_MAX_WINDOWS];
 static int        gWindowCount;
 
@@ -260,10 +245,6 @@ static JaiWindow *windowForNSWindow(NSWindow *native) {
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Availability and process setup                                      */
-/* ------------------------------------------------------------------ */
-
 bool jaiGuiAvailable(void) {
     static bool checked = false;
     static bool available = false;
@@ -290,19 +271,11 @@ static void ensureApplication(void) {
     [NSApp finishLaunching];
 }
 
-/* ------------------------------------------------------------------ */
-/* Key codes                                                           */
-/* ------------------------------------------------------------------ */
-
-/* The virtual keycodes of the modifier keys, which arrive as a state word
- * rather than as key events and so have to be named at the call site. These
- * are Carbon's kVK_* constants, spelled out so this file does not have to pull
- * in <Carbon/Carbon.h> for nine integers.
- *
- * They index the table below as well as feeding recordModifier, so a wrong
- * value here cannot make the two disagree — it moves the row and the lookup
- * together, and shows up in tests/stdlib/test_gui_input.jai as the real
- * keycode translating to nothing. */
+/* Modifier keycodes arrive as a state word, not key events, so they're named
+ * here as Carbon's kVK_* constants — spelled out so this file avoids pulling
+ * in <Carbon/Carbon.h> for nine integers. They also index the table below, so
+ * a wrong value can't make the two disagree; it shows up as a keycode
+ * translating to nothing (tests/stdlib/test_gui_input.jai). */
 enum {
     JAI_VK_RIGHT_COMMAND = 54,
     JAI_VK_COMMAND       = 55,
@@ -315,28 +288,20 @@ enum {
     JAI_VK_RIGHT_CONTROL = 62,
 };
 
-/* AppKit virtual keycode -> USB HID usage id.
+/* AppKit virtual keycode -> USB HID usage id. AppKit numbers keys by 1984
+ * Mac keyboard position (A=0, S=1, Escape=53); everything else in this tree
+ * speaks USB HID (keyboard/keypad page 0x07), so translation happens once,
+ * here, at the boundary.
  *
- * AppKit numbers keys by where they sat on a 1984 Macintosh keyboard: A is 0,
- * S is 1, Escape is 53. Nothing else in this tree speaks that numbering.
- * std.gui.Event, std.gui.input.Key and every other desktop platform speak USB
- * HID usage ids (HID Usage Tables, keyboard/keypad page 0x07), so the platform
- * numbers are translated here — at the boundary — and never leave the file.
+ * Exact inverse of `_KEY_TABLE` in lib/std/gui/input.jai, checked row-for-row
+ * by tests/stdlib/test_gui_input.jai against `Key.code()` so the two can't
+ * silently drift — adding a key means a row there, a row here, and a `Key`
+ * variant.
  *
- * This table is the exact inverse of `_KEY_TABLE` in lib/std/gui/input.jai:
- * 104 macOS codes, 104 HID ids, one per `Key` variant, no duplicates either
- * way. tests/stdlib/test_gui_input.jai checks every row against `Key.code()`,
- * so the two cannot drift apart silently. Adding a key means adding a row
- * there, a row here and a variant to `Key`.
- *
- * 0 means "this platform key names no `Key`" — the `fn` key, the volume and
- * media keys, the JIS-only keys and F16 through F20, which `Key` does not
- * name. HID usage 0 is reserved precisely as this no-event value, and
- * `Key.from_code(0)` is null, so an unmapped key is dropped rather than
- * reported under a number that means something else.
- */
+ * 0 means this platform key names no `Key` (fn, volume/media, JIS-only,
+ * F16-F20); HID usage 0 is reserved for that, and `Key.from_code(0)` is null,
+ * so an unmapped key is dropped rather than misreported. */
 static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
-    /* Letters. */
     [0] = 4,     /* A */
     [11] = 5,    /* B */
     [8] = 6,     /* C */
@@ -364,7 +329,7 @@ static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
     [16] = 28,   /* Y */
     [6] = 29,    /* Z */
 
-    /* Digits. HID orders them 1..9 then 0, and so does `Key`. */
+    /* HID orders digits 1..9 then 0, and so does `Key`. */
     [18] = 30,   /* 1 */
     [19] = 31,   /* 2 */
     [20] = 32,   /* 3 */
@@ -376,8 +341,8 @@ static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
     [25] = 38,   /* 9 */
     [29] = 39,   /* 0 */
 
-    /* Editing and punctuation. AppKit's "Delete" is the backspace key; the one
-     * labelled Delete on a full keyboard is ForwardDelete, further down. */
+    /* AppKit's "Delete" is the backspace key; the one labelled Delete on a
+     * full keyboard is ForwardDelete, further down. */
     [36] = 40,   /* Return */
     [53] = 41,   /* Escape */
     [51] = 42,   /* Backspace */
@@ -396,8 +361,8 @@ static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
     [44] = 56,   /* Slash */
     [JAI_VK_CAPS_LOCK] = 57,
 
-    /* Function keys. AppKit's order is not monotonic — F5 through F9 sit below
-     * F1 through F4 — which is why each row is spelled out. */
+    /* AppKit's order is not monotonic — F5 through F9 sit below F1 through
+     * F4 — so each row is spelled out. */
     [122] = 58,  /* F1 */
     [120] = 59,  /* F2 */
     [99] = 60,   /* F3 */
@@ -418,7 +383,7 @@ static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
     [107] = 71,  /* ScrollLock (F14) */
     [113] = 72,  /* Pause (F15) */
 
-    /* Navigation cluster. Insert is the Mac's Help key, in the same position. */
+    /* Insert is the Mac's Help key, in the same position. */
     [114] = 73,  /* Insert (Help) */
     [115] = 74,  /* Home */
     [116] = 75,  /* PageUp */
@@ -430,7 +395,7 @@ static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
     [125] = 81,  /* Down */
     [126] = 82,  /* Up */
 
-    /* Keypad. The Mac's Clear key occupies the NumLock position. */
+    /* The Mac's Clear key occupies the NumLock position. */
     [71] = 83,   /* NumLock (Clear) */
     [75] = 84,   /* KeypadDivide */
     [67] = 85,   /* KeypadMultiply */
@@ -451,8 +416,8 @@ static const unsigned char kPlatformToHid[JAI_PLATFORM_KEY_COUNT] = {
 
     [110] = 101, /* Menu */
 
-    /* Modifiers. Left and right are distinct HID ids, and AppKit gives each
-     * side its own virtual keycode, so the pairs survive the translation. */
+    /* Left and right are distinct HID ids, and AppKit gives each side its own
+     * virtual keycode, so the pairs survive the translation. */
     [JAI_VK_CONTROL] = 224,        /* LeftControl */
     [JAI_VK_SHIFT] = 225,          /* LeftShift */
     [JAI_VK_OPTION] = 226,         /* LeftAlt */
@@ -467,10 +432,6 @@ int jaiWindowKeyFromPlatform(int platformCode) {
     if (platformCode < 0 || platformCode >= JAI_PLATFORM_KEY_COUNT) return 0;
     return kPlatformToHid[platformCode];
 }
-
-/* ------------------------------------------------------------------ */
-/* Event pump                                                          */
-/* ------------------------------------------------------------------ */
 
 static void recordMouseMove(JaiWindow *w, JaiWindowState *s, NSEvent *event) {
     NSPoint inWindow = [event locationInWindow];
@@ -492,9 +453,8 @@ static void recordMouseMove(JaiWindow *w, JaiWindowState *s, NSEvent *event) {
     w->mouseY = y;
 }
 
-/* Queue the composed text of a key press, if it composed any. AppKit reports
- * arrow keys, function keys and the like as private-use scalars through the
- * same string, and those are not text a caret should receive. */
+/* AppKit reports arrow/function keys as private-use scalars through the same
+ * string; those are not text a caret should receive. */
 static void recordText(JaiWindow *w, NSEvent *event) {
     NSString *characters = [event characters];
     if (characters == nil || [characters length] == 0) return;
@@ -523,22 +483,11 @@ static void recordText(JaiWindow *w, NSEvent *event) {
     e->text[length] = '\0';
 }
 
-/* One key's transition, named by its AppKit virtual keycode.
- *
- * The only place a keycode is translated, and the only place `keys` and `hits`
- * are written, so the two arrays and the event queue cannot disagree about
- * which numbering they are in: all three are HID. Indexing the arrays by HID
- * rather than translating on the way out is what makes that true — the arrays
- * are read by jaiWindowKeyDown and by windowDidResignKey, which turns each set
- * element straight back into a key-up event, and a platform-indexed array
- * would have to be translated in both places or leak macOS numbers from the
- * second. It costs nothing: HID keyboard ids stop at 231, inside the same 256
- * slots the platform codes used.
- *
- * A key the table does not name is dropped rather than reported as 0, which
- * `Key.from_code` would discard anyway — but silently, and only after the
- * polled arrays had already recorded a press at index 0 that nothing would
- * ever clear. */
+/* The only place a keycode is translated, and the only place `keys`/`hits`
+ * are written, so the arrays and the event queue never disagree on numbering
+ * — all three are HID, since jaiWindowKeyDown and windowDidResignKey read
+ * these arrays directly. An unnamed key is dropped here, not stored at index
+ * 0, which nothing would ever clear. */
 static void recordKey(JaiWindow *w, int platformCode, bool down, bool repeat) {
     int hid = jaiWindowKeyFromPlatform(platformCode);
     if (hid <= 0 || hid >= JAI_KEY_COUNT) return;
@@ -552,9 +501,8 @@ static void recordKey(JaiWindow *w, int platformCode, bool down, bool repeat) {
     e->i1 = repeat ? 1 : 0;
 }
 
-/* One modifier keycode's transition, as a key event. Modifiers arrive as a
- * state word rather than as up/down pairs, so the edge has to be found — in
- * the HID-indexed array, since that is where the state now lives. */
+/* Modifiers arrive as a state word, not up/down pairs, so the edge has to be
+ * found in the HID-indexed array, where the state now lives. */
 static void recordModifier(JaiWindow *w, int platformCode, bool down) {
     int hid = jaiWindowKeyFromPlatform(platformCode);
     if (hid <= 0 || hid >= JAI_KEY_COUNT) return;
@@ -639,8 +587,8 @@ static void recordEvent(JaiWindow *w, JaiWindowState *s, NSEvent *event) {
     }
 }
 
-/* Drain the queue without blocking. Runs for every open window at once because
- * Cocoa has one queue for the process, not one per window. */
+/* Runs for every open window at once: Cocoa has one event queue for the
+ * process, not one per window. */
 static void pumpEvents(void) {
     if (gWindowCount == 0) return;
     if (![NSThread isMainThread]) return;
@@ -669,10 +617,6 @@ static void pumpEvents(void) {
         }
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Open and close                                                      */
-/* ------------------------------------------------------------------ */
 
 /* Everything the window owns, released in the order it was built. Safe to call
  * on a half-built window: every step checks. */
@@ -789,8 +733,8 @@ JaiWindow *jaiWindowOpen(int width, int height, const char *title, int targetFPS
          * link, or it would present frames the caller has not finished. */
         s.view.paused = YES;
         s.view.enableSetNeedsDisplay = NO;
-        /* Pin the drawable to the back-buffer size. Resizing then scales rather
-         * than reallocating, which is what keeps jaiWindowPixels() stable. */
+        /* Resizing then scales rather than reallocating, which is what keeps
+         * jaiWindowPixels() stable. */
         s.view.autoResizeDrawable = NO;
         s.view.drawableSize = CGSizeMake(width, height);
         s.view.layer.magnificationFilter = kCAFilterNearest;
@@ -813,10 +757,6 @@ void jaiWindowClose(JaiWindow *w) {
     w->open = false;
     destroyWindow(w);
 }
-
-/* ------------------------------------------------------------------ */
-/* Frame loop                                                          */
-/* ------------------------------------------------------------------ */
 
 uint32_t *jaiWindowPixels(JaiWindow *w, int *outWidth, int *outHeight) {
     if (w == NULL) {
@@ -859,10 +799,8 @@ void jaiWindowPresent(JaiWindow *w) {
 
     double now = jaiClockMonotonic();
     if (w->targetFrame > 0.0) {
-        /* Pace against a fixed grid of deadlines rather than against the last
-         * present: nanosleep routinely overshoots by a millisecond, and
-         * measuring each wait from where the previous one landed would let that
-         * error accumulate into a frame rate several per cent below target. */
+        /* Paces against a fixed grid of deadlines, not the last present:
+         * nanosleep overshoots, and measuring from the previous wait would let that error accumulate well below the target rate. */
         if (w->nextFrame == 0.0) w->nextFrame = w->lastPresent + w->targetFrame;
         if (now < w->nextFrame) {
             sleepSeconds(w->nextFrame - now);
@@ -919,21 +857,10 @@ bool jaiWindowKeyDown(JaiWindow *w, int hidCode) {
     return w->keys[hidCode] || w->hits[hidCode];
 }
 
-/* ------------------------------------------------------------------ */
-/* Test-only input injection                                           */
-/* ------------------------------------------------------------------ */
-
-/* A GUI program cannot be driven headlessly, so without these two entry points
- * the translation above would only ever run inside an NSEvent callback on a
- * machine with a display — untestable, which is how it came to be missing in
- * the first place. They expose the key path, and only the key path, on a
- * scratch window that has no NSWindow, no Metal device and no registration in
- * gWindows, so nothing pumps it and nothing draws it.
- *
- * Reachable from Jaithon as `__prim__.gui_test_key_event` and
- * `__prim__.gui_test_key_state`, used by tests/stdlib/test_gui_input.jai. No
- * production path calls them, and they cannot reach a real window: the scratch
- * window is private to this file and is the only thing they touch. */
+/* A GUI program can't be driven headlessly, so these test-only entry points
+ * exist to let the key-path translation run without a display. They touch
+ * only a scratch window with no NSWindow, no Metal device and no registration
+ * in gWindows, so nothing pumps or draws it and no production path can reach it. */
 static JaiWindow *gTestWindow;
 
 JaiWindow *jaiWindowTestWindow(void) {
@@ -948,10 +875,8 @@ JaiWindow *jaiWindowTestWindow(void) {
     return gTestWindow;
 }
 
-/* Feed one key transition through recordKey — the same function every real
- * NSEvent goes through. One call is one frame: it clears the tap flags first,
- * exactly as jaiWindowPoll does at a frame boundary, so a sequence of calls
- * reads as a sequence of frames. */
+/* One call is one frame: tap flags are cleared first, exactly as
+ * jaiWindowPoll does at a frame boundary, so a sequence of calls reads as a sequence of frames. */
 void jaiWindowTestInjectKey(int platformCode, bool down, bool repeat) {
     JaiWindow *w = jaiWindowTestWindow();
     memset(w->hits, 0, sizeof w->hits);

@@ -4,15 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* The handful of arm64 instructions the compiled loop needs.
- *
- * Not a general assembler. Each encoder covers exactly the operand forms the
- * loop body uses, and returns the instruction word rather than writing it, so
- * a test can check the bits without an arena and the emitter can buffer.
- *
- * Every one of these is verified by executing it -- see tests/vm/jit_arm64.c.
- * Hand-computed encodings that are merely inspected are how a JIT acquires a
- * bug that reproduces once in a million iterations. */
+/* The handful of arm64 instructions the compiled loop needs: not a general
+ * assembler, just the operand forms the loop body uses. Every encoder is
+ * verified by executing it (tests/jit_arm64.c), not merely inspected -- a
+ * hand-checked encoding is how a JIT gets a bug that reproduces once in a
+ * million iterations. */
 
 /* ldr Xt, [Xn, #offset] -- offset is a byte offset, must be 8-aligned, 0..32760 */
 uint32_t jaiA64LdrX(unsigned rt, unsigned rn, unsigned offset);
@@ -106,10 +102,9 @@ uint32_t jaiA64CsetX(unsigned rd, unsigned cond);
 /* ret */
 uint32_t jaiA64Ret(void);
 
-/* The double-precision arithmetic. Doubles live in d0-d31, a register file the
- * integer instructions cannot reach, so a value has to be moved across
- * explicitly -- and there are two ways to move it, one that reinterprets the
- * bits and one that converts the number. They are named apart below because
+/* Doubles live in d0-d31, unreachable from integer instructions, so moving one
+ * across is explicit -- and there are two ways to do it, one that reinterprets
+ * the bits and one that converts the number. Named apart below because
  * substituting one for the other is silent: both produce a double. */
 
 /* fadd Dd, Dn, Dm */

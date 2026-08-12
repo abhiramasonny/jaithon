@@ -1,8 +1,5 @@
 /* native.h — platform subsystems behind a C ABI.
- *
- * These are the only places Jaithon touches the OS beyond libc. Each function
- * is a no-op stub returning false on platforms that do not support it, so the
- * rest of the tree never needs #ifdef __APPLE__.
+ * Stubs return false where a platform doesn't support them, so the rest of the tree never needs #ifdef __APPLE__.
  */
 #ifndef JAI_NATIVE_H
 #define JAI_NATIVE_H
@@ -12,10 +9,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* ------------------------------------------------------------------ */
-/* Windowing and 2-D canvas (Metal/Cocoa on macOS)                      */
-/* ------------------------------------------------------------------ */
 
 typedef struct JaiWindow JaiWindow;
 
@@ -35,32 +28,19 @@ bool        jaiWindowMouseDown(JaiWindow *w, int button);
 bool        jaiWindowKeyDown(JaiWindow *w, int hidCode);
 void        jaiWindowSetTitle(JaiWindow *w, const char *title);
 
-/* Translate one of the window system's own key numbers — an AppKit virtual
- * keycode on macOS — into the USB HID usage id everything above speaks.
- * 0 when this platform's number names no key std.gui knows, which is also what
- * a platform with no window system returns for every input.
- *
- * The translation is applied inside the event pump, so nothing outside this
- * header needs it; it is exported only so the table can be tested without a
- * display, which is the one thing a GUI program cannot be made to do. */
+/* Maps a platform key code (an AppKit virtual keycode on macOS) to the USB
+ * HID id std.gui uses; 0 if unknown, or on a platform with no window system.
+ * Exported (despite being internal) so the table can be unit-tested headless. */
 int         jaiWindowKeyFromPlatform(int platformCode);
 
-/* Test-only key injection, the counterpart to the above: push one synthetic
- * transition through the very code path a real key event takes, on a scratch
- * window with nothing behind it, then read the result back with the ordinary
- * jaiWindowDrainEvents and jaiWindowKeyDown. `jaiWindowTestWindow` returns that
- * window, creating it on first use, and NULL where windowing is unsupported.
- *
- * One injection is one frame: the tap flags are cleared first, as jaiWindowPoll
- * clears them. Exposed to Jaithon as `__prim__.gui_test_key_event` and
- * `__prim__.gui_test_key_state` for tests/stdlib/test_gui_input.jai. */
+/* Test-only key injection: drives a synthetic key transition through the real
+ * event path on a scratch window (NULL where windowing is unsupported); one
+ * injection is one frame, so tap flags are cleared first, as jaiWindowPoll does. */
 JaiWindow  *jaiWindowTestWindow(void);
 void        jaiWindowTestInjectKey(int platformCode, bool down, bool repeat);
 
-/* Discrete events, as opposed to the polled state above. std.gui.Event is
- * decoded straight from these tags, so they may be appended to but never
- * renumbered. Button codes are 0 left, 1 middle, 2 right — the same numbering
- * jaiWindowMouseDown uses. */
+/* std.gui.Event decodes these tags directly — append only, never renumber.
+ * Button codes: 0 left, 1 middle, 2 right, matching jaiWindowMouseDown. */
 typedef enum {
     JAI_EVENT_CLOSE = 0,
     JAI_EVENT_KEY_DOWN,     /* i0 keycode, i1 non-zero when auto-repeat */
@@ -75,20 +55,15 @@ typedef enum {
 } JaiWindowEventTag;
 
 typedef struct {
-    int    tag;             /* a JaiWindowEventTag */
+    int    tag;
     int    i0, i1, i2;
     double d0, d1;
     char   text[32];        /* JAI_EVENT_TEXT only; always NUL-terminated */
 } JaiWindowEvent;
 
-/* Move up to `max` queued events into `out`, oldest first, and drop them from
- * the queue. Returns how many were written. The queue fills during
- * jaiWindowPoll and jaiWindowPresent, so drain it once per frame. */
+/* Drains up to `max` events, oldest first; the queue fills during both
+ * jaiWindowPoll and jaiWindowPresent, so drain once per frame. */
 int         jaiWindowDrainEvents(JaiWindow *w, JaiWindowEvent *out, int max);
-
-/* ------------------------------------------------------------------ */
-/* GPU compute (Metal on macOS)                                         */
-/* ------------------------------------------------------------------ */
 
 typedef struct JaiGpuBuffer JaiGpuBuffer;
 typedef struct JaiGpuKernel JaiGpuKernel;
@@ -103,17 +78,14 @@ void          jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes,
                            size_t offset);
 void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
                              size_t offset);
-/* Compile a kernel from Metal Shading Language source. */
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
                             char *errBuf, size_t errBufSize);
-/* Release a compiled pipeline. The kernel is opaque, so this is the only way to
- * free one — std.gpu's Kernel.free is written over it. */
+/* The kernel is opaque; this is the only way to free one. */
 void          jaiGpuKernelFree(JaiGpuKernel *k);
 /* The widest threadgroup this kernel can be dispatched with; 0 when unknown. */
 int           jaiGpuMaxThreadsPerGroup(JaiGpuKernel *k);
-/* Buffers bind at buffer(0) upwards, then the scalars follow them one apiece as
- * `constant uint&` — the argument order std.gpu.Kernel documents. `groupSize` 0
- * means the widest group the kernel supports. */
+/* Buffers bind at buffer(0) upward, then scalars follow as `constant uint&`.
+ * `groupSize` 0 means the widest group the kernel supports. */
 bool          jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                              const uint32_t *scalars, int scalarCount,
                              int threads, int groupSize);
@@ -123,10 +95,6 @@ bool jaiGpuVectorMul(const double *a, const double *b, double *out, size_t n);
 bool jaiGpuMatMul(const double *a, const double *b, double *out,
                   size_t m, size_t k, size_t n);
 bool jaiGpuReduceSum(const double *a, size_t n, double *out);
-
-/* ------------------------------------------------------------------ */
-/* Threads                                                              */
-/* ------------------------------------------------------------------ */
 
 typedef struct JaiThread JaiThread;
 typedef struct JaiMutex  JaiMutex;
@@ -139,9 +107,8 @@ void        jaiThreadDetach(JaiThread *t);
 JaiMutex   *jaiMutexNew(void);
 void        jaiMutexFree(JaiMutex *m);
 void        jaiMutexLock(JaiMutex *m);
-/* Non-blocking: true when the lock was taken, false when another thread holds
- * it. A failure other than "busy" is the same caller bug jaiMutexLock panics
- * on, so it panics here too rather than reading as ordinary contention. */
+/* Non-blocking: true if the lock was taken, false if another thread holds it.
+ * Any other failure panics (same as jaiMutexLock), not read as ordinary contention. */
 bool        jaiMutexTryLock(JaiMutex *m);
 void        jaiMutexUnlock(JaiMutex *m);
 JaiCond    *jaiCondNew(void);
@@ -152,20 +119,14 @@ void        jaiCondBroadcast(JaiCond *c);
 int64_t     jaiAtomicAddI64(volatile int64_t *p, int64_t delta);
 bool        jaiAtomicCasI64(volatile int64_t *p, int64_t expect, int64_t desired);
 
-/* A fixed-size work-stealing pool used by std.thread's parallel map/reduce.
- * Tasks must not touch VM state; they operate on raw buffers. */
+/* Tasks must not touch VM state — they operate only on raw buffers. */
 typedef void (*JaiTaskFn)(void *arg, int index);
 bool jaiParallelFor(int start, int end, JaiTaskFn fn, void *arg, int maxThreads);
 
-/* ------------------------------------------------------------------ */
-/* Process and filesystem                                              */
-/* ------------------------------------------------------------------ */
-
 int   jaiProcessRun(const char *command, char **outStdout, size_t *outLen);
 
-/* What jaiProcessSpawn hands back. In the waiting form only `exitCode`, the
- * two captured buffers and their lengths are meaningful; in the streaming form
- * only `pid` and the three descriptors are. */
+/* Fields split by mode: waiting form only fills exitCode + the two buffers;
+ * streaming form only fills pid and the three descriptors. */
 typedef struct {
     int    pid;
     int    exitCode;
@@ -174,39 +135,27 @@ typedef struct {
     char  *err;  size_t errLen;
 } JaiSpawnResult;
 
-/* Reasons a spawn did not produce a child. `JAI_SPAWN_EXEC` means the fork
- * succeeded and the exec did not, so `outErrno` is the child's errno — which
- * is how "no such program" is told apart from "out of file descriptors". */
+/* JAI_SPAWN_EXEC means fork succeeded but exec failed, so outErrno is the
+ * child's errno — how "no such program" is distinguished from "out of fds". */
 typedef enum {
     JAI_SPAWN_OK = 0,
     JAI_SPAWN_SETUP,     /* pipe/fork failed in the parent */
-    JAI_SPAWN_EXEC,      /* the child could not exec argv[0] */
+    JAI_SPAWN_EXEC,
     JAI_SPAWN_IO,        /* a pipe read or the wait failed */
 } JaiSpawnStatus;
 
-/* Start `argv` (NULL-terminated, argv[0] searched on PATH when it holds no
- * '/') and either wait for it or hand back its pipes.
- *
- *   cwd     directory to run in, or NULL to inherit
- *   envp    NULL-terminated "K=V" list to replace the environment, or NULL
- *   stdinText/stdinLen  written to the child, then its stdin is closed
- *   stream  false: wait, capture both output streams into the result;
- *           true:  return at once with pid and the three descriptors
- *
- * On JAI_SPAWN_OK in the waiting form the caller owns `out` and `err` and
- * frees each with JAI_FREE_ARRAY(char, p, len + 1). */
+/* argv[0] searches PATH if it holds no '/'; envp (if given) replaces the
+ * environment. Caller frees out/err via JAI_FREE_ARRAY(char, p, len+1). */
 JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
                                const char *const *envp,
                                const char *stdinText, size_t stdinLen,
                                bool stream, JaiSpawnResult *result,
                                int *outErrno);
 
-/* Wait for `pid`. `block` false polls: it answers false with *outExit
- * untouched while the child is still running. Returns false on error too, so
- * the caller distinguishes by errno being set. */
+/* `block` false polls: returns false with *outExit untouched while running,
+ * or false with errno set on real error — that's how callers tell them apart. */
 bool jaiProcessWait(int pid, bool block, int *outExit);
 
-/* Send `sig` to `pid`. False when it could not be delivered. */
 bool jaiProcessSignal(int pid, int sig);
 char **jaiListDir(const char *path, int *outCount);   /* caller frees */
 bool  jaiStatPath(const char *path, int64_t *size, int64_t *mtime, bool *isDir);

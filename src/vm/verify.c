@@ -1,16 +1,6 @@
-/* verify.c -- the bytecode verifier.
- *
- * A chunk arriving from anywhere -- an optimiser pass, a .jaic image, a
- * hand-written test -- is checked here before anything runs it: operands in
- * range, jumps landing on instruction boundaries, and one stack depth per
- * instruction whichever path reaches it.
- *
- * It lived in `src/codegen/optimize.c` while the optimiser was its only
- * caller. It belongs to the bytecode contract rather than to any front end,
- * which is why it outlived the front end that used to sit beside it. The four
- * helpers below are copies of the optimiser's; each is a fact about an opcode's
- * operand layout, and `chunk.h` is what they must agree with.
- */
+/* verify.c -- the bytecode verifier: operands in range, jumps landing on
+ * instruction boundaries, one stack depth per instruction whichever path
+ * reaches it. The four helpers below must agree with chunk.h. */
 
 #include "verify.h"
 
@@ -22,12 +12,7 @@
 #include "object.h"
 #include "vm.h"
 
-/* Byte index of the i16 branch operand inside `op`'s operand run, or -1 when
- * the instruction carries no code address. Keep in sync with chunk.h.
- *
- * Not static: the JIT asks the same question when it wants to know whether an
- * offset can be reached by anything but the fall-through, and two copies of
- * this list would drift. */
+/* Keep in sync with chunk.h. */
 int jaiOpBranchOperandAt(uint8_t op) {
     switch (op) {
     case OP_JUMP:
@@ -60,8 +45,8 @@ int jaiOpBranchOperandAt(uint8_t op) {
 }
 
 /* True when `target` is a control-flow edge taken by the instruction itself.
- * PUSH_HANDLER and PUSH_FINALLY only *register* an address; control does not
- * transfer there at that point, so no stack state flows along the edge. */
+ * PUSH_HANDLER/PUSH_FINALLY only *register* an address; no stack state flows
+ * along that edge. */
 static bool opBranchIsEdge(uint8_t op) {
     return jaiOpBranchOperandAt(op) >= 0 && op != OP_PUSH_HANDLER &&
            op != OP_PUSH_FINALLY;
@@ -79,9 +64,8 @@ static bool opFallsThrough(uint8_t op) {
     case OP_HALT:
         return false;
     default:
-        /* OP_TAIL_CALL reuses the frame and normally ends it, but the emitter
-         * is free to follow it with a RETURN; keeping the edge is the
-         * conservative choice and costs one instruction. */
+        /* OP_TAIL_CALL normally ends the frame, but the emitter is free to
+         * follow it with a RETURN, so keep the edge conservatively. */
         return true;
     }
 }
@@ -210,8 +194,8 @@ typedef struct {
 } Effect;
 
 /* Pops and pushes of the instruction at `offset` on its fall-through path.
- * Where only the net effect is tabulated in chunk.c, pops is a lower bound;
- * that keeps the depth check free of false positives. */
+ * Where only the net effect is tabulated in chunk.c, pops is a lower bound,
+ * to keep the depth check free of false positives. */
 static Effect fallEffect(const Chunk *chunk, int offset, uint8_t op,
                          const uint8_t *a) {
     Effect e = {0, 0, true};
@@ -510,13 +494,10 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
     depth[0] = 0;
     work[workCount++] = 0;
 
-    /* Entry points the VM jumps to directly are seeded between drains, and a
-     * seeded block can contain further entry points, so this repeats until a
-     * round adds nothing. Precise seeds (a dynamic handler, whose depth is the
-     * depth of its own PUSH) go first; the imprecise ones — an exception-table
-     * handler and a default thunk, both entered at depth 0 — only when nothing
-     * precise is left, so a target that turns out to be reachable keeps its
-     * flow-derived depth. */
+    /* Repeats until a round adds nothing, since a seeded block can contain
+     * further entry points. Precise seeds (dynamic handlers) go first, so an
+     * exception-table handler/default thunk (both imprecise, depth 0) only
+     * seed once nothing precise is left. */
     for (;;) {
         while (workCount > 0) {
             int offset = work[--workCount];
@@ -610,9 +591,8 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             }
         }
 
-        /* A dynamic handler records the stack top live when it was pushed and
-         * the unwinder restores exactly that, so its target runs at the depth
-         * of the push — not at 0, the way an exception-table handler does. */
+        /* A dynamic handler's target runs at the depth of its own PUSH (the
+         * unwinder restores that), not at 0 like an exception-table handler. */
         int added = 0;
         for (int offset = 0; offset < n;) {
             uint8_t op = chunk->code[offset];
@@ -637,13 +617,10 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
         }
         if (added > 0) continue;
 
-        /* Exactly one imprecise seed per round. Seeding them all at once loses
-         * the staging: the code a handler falls into can contain the
-         * PUSH_FINALLY of a *second* region, and that region's handler is then
-         * already pinned at 0 when the precise pass finally gets to look at it.
-         * A `finally` inside a loop is the case in the wild — its handler sits
-         * under the loop's iterator, at depth 1, and the table entry that
-         * shadows it says 0. */
+        /* Exactly one imprecise seed per round: seeding them all at once can
+         * pin a nested region's handler at depth 0 before the precise pass
+         * reaches it -- e.g. a `finally` inside a loop, whose handler is
+         * really at depth 1 (under the iterator). */
         for (int e = 0; e < (int)fn->exceptionCount && added == 0; e++) {
             uint32_t handler = fn->exceptions[e].handler;
             if (depth[handler] < 0) {

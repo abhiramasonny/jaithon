@@ -1,17 +1,13 @@
 /* gpu.m — Metal compute: device buffers, kernels compiled from MSL, and the
  * four built-in operations std.gpu falls back on when no source is supplied.
  *
- * Precision. Metal Shading Language has no `double`, so a device buffer holds
- * 32-bit floats and the built-ins round on the way in and widen on the way out.
- * The CPU paths compute in full double precision — they are more accurate than
- * the device, not merely different — so the two agree to a tolerance and never
- * to the bit. lib/std/gpu.jai documents the same contract to callers.
+ * MSL has no `double`: buffers hold float32, built-ins round going in and
+ * widen coming out; the CPU paths stay double, so GPU and CPU agree to a
+ * tolerance, never to the bit (lib/std/gpu.jai documents this contract).
  *
- * Every built-in is total: it produces the right answer with no device, with a
- * device too small for the buffers, and after any Metal call fails midway. The
- * GPU path is an optimisation that is allowed to give up at any point, and each
- * one that gives up falls into the same scalar code the no-device path uses.
- */
+ * Every built-in is total: it's correct with no device, a device too small
+ * for the buffers, or a Metal call failing midway — each give-up path falls
+ * back to the same scalar code the no-device build uses. */
 
 #ifdef __APPLE__
 
@@ -23,13 +19,12 @@
 
 #include "native.h"
 
-/* Below this much arithmetic the upload, the encode and the queue wait cost
- * more than the work. Mirrors MIN_GPU_ELEMENTS in lib/std/gpu.jai. */
+/* Below this much arithmetic the upload, encode and queue wait cost more than
+ * the work. Mirrors MIN_GPU_ELEMENTS in lib/std/gpu.jai. */
 #define JAI_GPU_MIN_WORK 4096
 
-/* The reduction kernel declares its threadgroup scratch with this width, so the
- * host must dispatch it with exactly this group size. 256 is within the
- * guaranteed maximum on every Metal device. */
+/* The reduction kernel's threadgroup scratch is this width, so the host must
+ * dispatch with exactly this group size. 256 is within every Metal device's guaranteed maximum. */
 #define JAI_REDUCE_GROUP 256
 #define JAI_REDUCE_LOADS 2
 #define JAI_MATMUL_TILE 16
@@ -139,10 +134,6 @@ static const char kBuiltinSource[] =
     "    if (lid == 0) partials[wid] = scratch[0];\n"
     "}\n";
 
-/* ------------------------------------------------------------------ */
-/* Device                                                              */
-/* ------------------------------------------------------------------ */
-
 static id<MTLDevice>       gDevice;
 static id<MTLCommandQueue> gQueue;
 static bool                gDeviceReady;
@@ -170,11 +161,8 @@ static bool ensureDevice(void) {
             gQueue = queue;
             gMaxBufferLength = (size_t)[device maxBufferLength];
 
-            /*
-             * Every Apple-silicon Mac is Apple GPU family 7 or newer, but keep
-             * the older Apple4/Mac2 capability check so this remains valid for
-             * the widest set of Metal-capable Apple hardware.
-             */
+            /* Checks the older Apple4/Mac2 capability (not just family 7+) to
+             * stay valid across the widest set of Metal-capable hardware. */
             gNonUniformThreadgroups =
                 [device supportsFamily:MTLGPUFamilyApple4] ||
                 [device supportsFamily:MTLGPUFamilyMac2];
@@ -236,10 +224,6 @@ const char *jaiGpuDeviceName(void) {
     return name[0] != '\0' ? name : "none";
 }
 
-/* ------------------------------------------------------------------ */
-/* Buffers                                                             */
-/* ------------------------------------------------------------------ */
-
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
     if (bytes == 0 || !ensureDevice()) return NULL;
     if (bytes > gMaxBufferLength) return NULL;
@@ -287,10 +271,6 @@ void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
 }
-
-/* ------------------------------------------------------------------ */
-/* Kernels                                                             */
-/* ------------------------------------------------------------------ */
 
 static void writeError(char *buf, size_t size, const char *fmt, ...) JAI_PRINTF(3, 4);
 
@@ -361,9 +341,8 @@ JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
     }
 }
 
-/* One-dimensional dispatch of `threads` threads. `groupSize` 0 means the widest
- * group the pipeline supports; a kernel with a fixed-width threadgroup array
- * must pass that width instead. */
+/* `groupSize` 0 means the widest group the pipeline supports; a kernel with
+ * a fixed-width threadgroup array must pass that width explicitly instead. */
 static void encodeDispatch(id<MTLComputeCommandEncoder> encoder,
                            id<MTLComputePipelineState> pipeline,
                            NSUInteger threads, NSUInteger groupSize) {
@@ -467,13 +446,8 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Scalar implementations                                              */
-/* ------------------------------------------------------------------ */
-
-/* Neumaier's variant of Kahan summation: it also keeps the low bits of the
- * additions a plain Kahan loop drops, the ones where the running total is
- * smaller than the term being added. */
+/* Neumaier variant of Kahan summation — also captures the low bits dropped
+ * when the running total is smaller than the term added. */
 static double compensatedSum(const double *values, size_t n) {
     double total = 0.0;
     double correction = 0.0;
@@ -506,9 +480,8 @@ static double compensatedSumF32(const float *values, size_t n) {
     return total + correction;
 }
 
-/* Row, inner, column order so that both `b` and the output row are walked
- * forwards; the arithmetic is the textbook triple loop's, the cache behaviour
- * is not. */
+/* Row/inner/column loop order keeps `b` and the output row walked forward;
+ * same arithmetic as the textbook triple loop, different cache behavior. */
 static void cpuMatMul(const double *a, const double *b, double *out,
                       size_t m, size_t k, size_t n) {
     memset(out, 0, m * n * sizeof(double));
@@ -526,10 +499,6 @@ static void cpuMatMul(const double *a, const double *b, double *out,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Built-in kernels                                                    */
-/* ------------------------------------------------------------------ */
-
 /* The built-ins stage directly into Metal shared buffers so Apple silicon does
  * not allocate a second CPU float array and then copy it into unified memory. */
 static inline bool fitsDeviceBuffer(size_t elements) {
@@ -543,11 +512,8 @@ static id<MTLBuffer> newInputBuffer(const double *src, size_t n) {
 
     const size_t bytes = n * sizeof(float);
 
-    /*
-     * Apple-silicon buffers are shared CPU/GPU memory. Write-combined caching
-     * is ideal here because the CPU streams values in once and never reads the
-     * input buffer back.
-     */
+    /* Write-combined caching is ideal here: the CPU streams values in once and
+     * never reads the input buffer back. */
     const MTLResourceOptions options =
         MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined;
 
@@ -584,9 +550,8 @@ static void widenFloats(double *dst, const float *src, size_t n) {
         dst[i] = (double)src[i];
 }
 
-/* Both elementwise built-ins differ only in their pipeline, so they share one
- * encoder. Returns false — having written nothing — if any Metal call fails,
- * and the caller then runs the scalar path. */
+/* Both elementwise built-ins differ only in pipeline, so they share this
+ * encoder. Returns false (nothing written) if any Metal call fails; the caller then falls back to the scalar path. */
 static bool deviceElementwise(id<MTLComputePipelineState> pipeline,
                               const double *a, const double *b,
                               double *out, size_t n) {
@@ -665,11 +630,8 @@ static inline void encodeMatMulDispatch(
     const MTLSize threadsPerGroup =
         MTLSizeMake(JAI_MATMUL_TILE, JAI_MATMUL_TILE, 1);
 
-    /*
-     * Always use complete 16x16 groups here. Unlike simple 1D kernels, the
-     * tiled shader relies on every lane existing to populate threadgroup tiles,
-     * so partial/non-uniform edge groups would leave scratch entries unloaded.
-     */
+    /* Always dispatches complete 16x16 groups: the tiled shader needs every
+     * lane present to populate its threadgroup tiles, so partial edge groups would leave scratch entries unloaded. */
     const NSUInteger groupsX =
         ((NSUInteger)columns + JAI_MATMUL_TILE - 1u) / JAI_MATMUL_TILE;
     const NSUInteger groupsY =

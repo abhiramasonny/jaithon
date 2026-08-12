@@ -1,10 +1,6 @@
-/* process.c — subprocesses, directory listing, stat, and the path of the
- * running binary.
- *
- * These back __prim__.os_spawn, __prim__.io_listdir and __prim__.io_stat. They
- * report failure as a status code or false; turning that into a language-level
- * IOError is the wrapper's job, not this layer's.
- */
+/* process.c — subprocesses, directory listing, stat, and the running binary's
+ * path; backs __prim__.os_spawn, __prim__.io_listdir, __prim__.io_stat.
+ * Failures are a status code or false — turning that into IOError is the wrapper's job, not this layer's. */
 
 /* Feature macros must precede every include: popen, readdir and readlink are
  * POSIX, and getprogname needs the full Darwin surface. */
@@ -33,19 +29,12 @@
 #  include <mach-o/dyld.h>
 #endif
 
-/* ------------------------------------------------------------------ */
-/* Running a command                                                   */
-/* ------------------------------------------------------------------ */
-
 #define JAI_PROC_READ_BLOCK 4096u
 
-/* Runs `command` through the shell and captures its stdout. Returns the exit
- * code, 128 + signal for a killed child, or -1 if the command could not be run
- * or its output could not be read. On -1 no output is handed back.
- *
- * *outStdout is a NUL-terminated heap string of *outLen bytes (it may contain
- * embedded NULs, hence the length); release it with
- * JAI_FREE_ARRAY(char, s, len + 1). stderr is left attached to the parent's. */
+/* Runs `command` through the shell; returns the exit code, 128 + signal for a
+ * killed child, or -1 (no output handed back) on failure. *outStdout is a
+ * NUL-terminated heap string that may hold embedded NULs — free with
+ * JAI_FREE_ARRAY(char, s, len + 1). stderr stays attached to the parent's. */
 int jaiProcessRun(const char *command, char **outStdout, size_t *outLen) {
     if (outStdout != NULL) *outStdout = NULL;
     if (outLen != NULL) *outLen = 0;
@@ -85,16 +74,10 @@ int jaiProcessRun(const char *command, char **outStdout, size_t *outLen) {
     return status;   /* stopped or unknown: hand the raw wait status back */
 }
 
-/* ------------------------------------------------------------------ */
-/* Spawning a child                                                     */
-/* ------------------------------------------------------------------ */
-
 extern char **environ;
 
-/* The child reports an exec failure by writing its errno down this pipe and
- * exiting; the write end is close-on-exec, so a successful exec closes it and
- * the parent reads end-of-file instead. That is the only way to tell "the
- * program is not there" from "the program ran and exited 127". */
+/* The child reports exec failure by writing errno down a close-on-exec pipe;
+ * a successful exec closes it, so EOF there tells "not found" from "ran and exited 127". */
 #define JAI_EXEC_FAILED 127
 
 static void closeFd(int *fd) {
@@ -106,8 +89,7 @@ static bool setCloexec(int fd) {
     return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
 }
 
-/* Read whatever is available on `fd` into `buf`. Returns false at end of
- * stream, which is what takes the descriptor out of the poll set. */
+/* Returns false at end of stream; that's what drops the descriptor from the poll set. */
 static bool drainFd(int fd, JaiBuf *buf, bool *outFailed) {
     char block[JAI_PROC_READ_BLOCK];
     for (;;) {
@@ -117,7 +99,7 @@ static bool drainFd(int fd, JaiBuf *buf, bool *outFailed) {
             if ((size_t)got < sizeof block) return true;   /* drained for now */
             continue;
         }
-        if (got == 0) return false;                        /* end of stream */
+        if (got == 0) return false;
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
         *outFailed = true;
@@ -125,12 +107,8 @@ static bool drainFd(int fd, JaiBuf *buf, bool *outFailed) {
     }
 }
 
-/* Pump the child's three pipes until both output streams end.
- *
- * All three are non-blocking and polled together, which is the whole point: a
- * child that fills its stdout pipe while this process is blocked writing to
- * its stdin pipe deadlocks, and that is exactly what a naive
- * write-everything-then-read implementation does. */
+/* All three pipes are non-blocking and polled together: a child that fills
+ * stdout while this process is blocked writing its stdin would deadlock a naive write-then-read implementation. */
 static bool pumpChild(int inFd, int outFd, int errFd,
                       const char *stdinText, size_t stdinLen,
                       JaiBuf *outBuf, JaiBuf *errBuf) {
@@ -243,8 +221,7 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
         if (outErrno != NULL) *outErrno = errno;
         goto setupFailed;
     }
-    /* Only the report pipe's write end is close-on-exec: closing it is the
-     * signal that the exec succeeded. */
+    /* Only the report pipe's write end is close-on-exec — closing it signals a successful exec. */
     if (!setCloexec(report[1])) {
         if (outErrno != NULL) *outErrno = errno;
         goto setupFailed;
@@ -271,10 +248,8 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
 
         if (failure == 0 && cwd != NULL && chdir(cwd) != 0) failure = errno;
         if (failure == 0) {
-            /* SIGPIPE is ignored in the parent so that writing to a child
-             * that stopped reading is an EPIPE rather than a death; the child
-             * must not inherit that, or a program in a pipeline behaves
-             * differently under `run` than under a shell. */
+            /* SIGPIPE is ignored in the parent so a dead-reader write becomes
+             * EPIPE, not death; the child must not inherit that, or it behaves unlike a shell pipeline. */
             struct sigaction restore;
             memset(&restore, 0, sizeof restore);
             restore.sa_handler = SIG_DFL;
@@ -293,7 +268,6 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
         _exit(JAI_EXEC_FAILED);
     }
 
-    /* Parent. */
     closeFd(&inPipe[0]);
     closeFd(&outPipe[1]);
     closeFd(&errPipe[1]);
@@ -326,7 +300,6 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
         return JAI_SPAWN_OK;
     }
 
-    /* Waiting form: pump, then reap. */
     for (int i = 0; i < 3; i++) {
         int fd = i == 0 ? inPipe[1] : (i == 1 ? outPipe[0] : errPipe[0]);
         int flags = fcntl(fd, F_GETFL);
@@ -369,10 +342,6 @@ setupFailed:
     return JAI_SPAWN_SETUP;
 }
 
-/* ------------------------------------------------------------------ */
-/* Directory listing                                                   */
-/* ------------------------------------------------------------------ */
-
 static void freeNameList(char **names, int count, int capacity) {
     for (int i = 0; i < count; i++) {
         JAI_FREE_ARRAY(char, names[i], strlen(names[i]) + 1);
@@ -380,14 +349,9 @@ static void freeNameList(char **names, int count, int capacity) {
     JAI_FREE_ARRAY(char *, names, capacity);
 }
 
-/* Entry names in `path`, without "." and "..", in whatever order the
- * filesystem gives them. Returns a NULL-terminated array of *outCount names,
- * or NULL if the directory could not be read; an empty directory still yields
- * a one-element array holding the terminator.
- *
- * The caller owns everything: free each name with
- * JAI_FREE_ARRAY(char, names[i], strlen(names[i]) + 1) and the array itself
- * with JAI_FREE_ARRAY(char *, names, count + 1). */
+/* Excludes "." and ".."; an empty directory still yields a one-element array
+ * holding the NULL terminator. Caller frees each name, then the array, with
+ * JAI_FREE_ARRAY (sizes: strlen(name) + 1 and count + 1). */
 char **jaiListDir(const char *path, int *outCount) {
     if (outCount != NULL) *outCount = 0;
     if (path == NULL) return NULL;
@@ -439,14 +403,9 @@ char **jaiListDir(const char *path, int *outCount) {
     return names;
 }
 
-/* ------------------------------------------------------------------ */
-/* Stat                                                                */
-/* ------------------------------------------------------------------ */
-
-/* Follows symlinks. `mtime` is whole seconds since the Unix epoch; sub-second
- * precision is dropped because std.time's file timestamps are second-grained.
- * Every out parameter is optional and is cleared before the stat is attempted,
- * so a false return leaves no stale values behind. */
+/* Follows symlinks. mtime is whole seconds (std.time's timestamps are
+ * second-grained); every out param is optional and cleared up front, so a
+ * false return leaves no stale values. */
 bool jaiStatPath(const char *path, int64_t *size, int64_t *mtime, bool *isDir) {
     if (size != NULL) *size = 0;
     if (mtime != NULL) *mtime = 0;
@@ -461,10 +420,6 @@ bool jaiStatPath(const char *path, int64_t *size, int64_t *mtime, bool *isDir) {
     if (isDir != NULL) *isDir = S_ISDIR(st.st_mode) != 0;
     return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* Executable path                                                     */
-/* ------------------------------------------------------------------ */
 
 static char            gExecPath[JAI_MAX_PATH];
 static bool            gExecPathOk   = false;
@@ -513,7 +468,6 @@ static void execPathInit(void) {
 #endif
 
     if (raw[0] == '\0') {
-        /* Last resort: the name the process was started under. */
         const char *argv0 = NULL;
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
     defined(__OpenBSD__) || defined(__DragonFly__)
@@ -531,14 +485,13 @@ static void execPathInit(void) {
         memcpy(raw, argv0, len + 1);
     }
 
-    /* _NSGetExecutablePath and argv[0] can both be relative and can both run
-     * through symlinks; callers were promised a resolved absolute path. */
+    /* Both _NSGetExecutablePath and argv[0] can be relative or run through
+     * symlinks; callers were promised a resolved absolute path. */
     gExecPathOk = jaiPathAbsolute(gExecPath, sizeof gExecPath, raw);
 }
 
-/* The absolute, symlink-resolved path of the running binary, or NULL if the
- * platform cannot report it. Computed once; the returned string is owned by
- * this module and stays valid for the life of the process. */
+/* Absolute, symlink-resolved path of the running binary, or NULL if unknown.
+ * Computed once; the string is owned by this module and valid for the process's life. */
 const char *jaiExecutablePath(void) {
     pthread_once(&gExecPathOnce, execPathInit);
     return gExecPathOk ? gExecPath : NULL;

@@ -1,21 +1,10 @@
-/* builtins_bytes.c — the `bytes` method table and the `__prim__.bytes_*`
- * surface (spec Appendix C).
- *
- * bytes is the one text-adjacent type with no Unicode in it: every index,
- * length and window here counts bytes, which is why it reads nothing from the
- * scalar machinery in builtins_str.c and shares only the small argument and
- * buffer helpers that builtins_str.h declares.
- */
+/* builtins_bytes.c — the `bytes` method table and `__prim__.bytes_*` surface (spec Appendix C); every index/length/window here counts bytes, not codepoints. */
 
 #include "builtins_str.h"
 #include "methods.h"
 #include "runtime.h"
 
 #include "../vm/gc.h"
-
-/* ------------------------------------------------------------------ */
-/* Receiver                                                             */
-/* ------------------------------------------------------------------ */
 
 /* A bound native receives the receiver as args[0] and argc counts it, so every
  * body below reads its declared arguments from args[1] onwards. */
@@ -31,11 +20,6 @@ static bool bytesReceiver(int argc, Value *args, const char *method,
                                                 : "nothing");
 }
 
-/* ------------------------------------------------------------------ */
-/* bytes methods                                                        */
-/* ------------------------------------------------------------------ */
-
-/* Normalises a possibly-negative byte window, clamping both ends. */
 static void resolveByteWindow(uint32_t length, int64_t start, int64_t end,
                               size_t *outStart, size_t *outEnd) {
     int64_t n = (int64_t)length;
@@ -48,7 +32,6 @@ static void resolveByteWindow(uint32_t length, int64_t start, int64_t end,
     *outEnd = (size_t)end;
 }
 
-/* The needle of a bytes search: another bytes value, or one byte as an int. */
 static bool bytesNeedle(Value v, const char *method, const uint8_t **outData,
                         size_t *outLen, uint8_t *scratch) {
     if (IS_BYTES(v)) {
@@ -277,10 +260,6 @@ static bool bytesConcat(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Method table                                                         */
-/* ------------------------------------------------------------------ */
-
 static const JaiStrMethodEntry kBytesMethods[] = {
     {"len",         bytesLen,        1,  1, NULL},
     {"decode",      bytesDecode,     1,  1, NULL},
@@ -306,10 +285,6 @@ bool jaiBytesMethod(Value receiver, ObjString *name, Value *out) {
     if (!IS_BYTES(receiver)) return false;
     return jaiStrLookupMethod(&gBytesTable, receiver, name, out);
 }
-
-/* ------------------------------------------------------------------ */
-/* The __prim__ bytes surface (spec Appendix C)                         */
-/* ------------------------------------------------------------------ */
 
 static bool primBytesNew(int argc, Value *args, Value *out) {
     ObjList *list;

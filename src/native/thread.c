@@ -1,11 +1,6 @@
 /* thread.c — OS threads, mutexes, condition variables, atomics, and the
- * parallel-for pool behind std.thread.
- *
- * Everything here is pthreads. The VM is single-threaded: nothing on a worker
- * may touch VM state, allocate GC objects, or raise. Tasks see raw buffers
- * only, which is why the failure mode of every entry point is a status code
- * rather than a diagnostic.
- */
+ * parallel-for pool behind std.thread. The VM is single-threaded: workers must
+ * not touch VM state, allocate GC objects, or raise — tasks see only raw buffers, so failures are a status code, not a diagnostic. */
 
 /* Feature macros must precede every include: sysconf's _SC_NPROCESSORS_ONLN is
  * not in the C11 headers on its own. */
@@ -39,10 +34,6 @@
 #  define JAI_ATOMIC_LOCKED 1
 #endif
 
-/* ------------------------------------------------------------------ */
-/* CPU count                                                           */
-/* ------------------------------------------------------------------ */
-
 int jaiCpuCount(void) {
 #if defined(_SC_NPROCESSORS_ONLN)
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -58,10 +49,6 @@ int jaiCpuCount(void) {
 #endif
     return 1;
 }
-
-/* ------------------------------------------------------------------ */
-/* Threads                                                             */
-/* ------------------------------------------------------------------ */
 
 /* Join and detach are the two disposal paths; both release the handle, so a
  * JaiThread* is dead after either one. There is no separate free. */
@@ -102,10 +89,6 @@ void jaiThreadDetach(JaiThread *t) {
     JAI_FREE(JaiThread, t);
 }
 
-/* ------------------------------------------------------------------ */
-/* Mutexes and condition variables                                     */
-/* ------------------------------------------------------------------ */
-
 struct JaiMutex {
     pthread_mutex_t handle;
 };
@@ -129,10 +112,8 @@ void jaiMutexFree(JaiMutex *m) {
     JAI_FREE(JaiMutex, m);
 }
 
-/* lock/unlock return void, and carrying on without the lock would silently
- * corrupt whatever it guards, so a failure here is fatal rather than ignored.
- * The only ways to get one are a destroyed mutex or a self-deadlock: both are
- * bugs in the caller, not conditions a program can recover from. */
+/* Failure here would otherwise silently corrupt the guarded state, so it's
+ * fatal, not ignored — the only causes (destroyed mutex, self-deadlock) are caller bugs. */
 void jaiMutexLock(JaiMutex *m) {
     if (m == NULL) return;
     int err = pthread_mutex_lock(&m->handle);
@@ -185,10 +166,6 @@ void jaiCondBroadcast(JaiCond *c) {
     pthread_cond_broadcast(&c->handle);
 }
 
-/* ------------------------------------------------------------------ */
-/* Atomics                                                             */
-/* ------------------------------------------------------------------ */
-
 #if defined(JAI_ATOMIC_LOCKED)
 /* No atomics from the compiler: one global lock serialises every operation.
  * Correct, and slow enough that std.thread's counters stay honest. */
@@ -233,16 +210,11 @@ bool jaiAtomicCasI64(volatile int64_t *p, int64_t expect, int64_t desired) {
 #endif
 }
 
-/* ------------------------------------------------------------------ */
-/* Parallel for                                                        */
-/* ------------------------------------------------------------------ */
-
 /* Below this many iterations the spawn and join cost more than the body. */
 #define JAI_PARALLEL_MIN_ITERS   1024
 #define JAI_PARALLEL_MAX_THREADS 64
-/* Chunks per thread. More than one lets a fast worker take over for a slow
- * one when the body's cost varies with the index; too many and the shared
- * cursor becomes the bottleneck. */
+/* Chunks per thread: more than one lets a fast worker take over for a slow
+ * one when the body's cost varies with the index; too many and the shared cursor becomes the bottleneck. */
 #define JAI_PARALLEL_OVERSUBSCRIBE 4
 
 typedef struct {

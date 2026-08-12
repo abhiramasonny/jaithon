@@ -1,8 +1,6 @@
-/* chunk.h — bytecode chunks and the opcode enumeration.
- *
- * Normative reference: spec/BYTECODE.md. The order of OpCode here defines the
- * on-disk format; append new opcodes at the end and bump JAI_COMPILER_VERSION.
- */
+/* chunk.h — bytecode chunks and the opcode enumeration. Normative reference:
+ * spec/BYTECODE.md. OpCode's order is the on-disk format: append new opcodes
+ * at the end and bump JAI_COMPILER_VERSION. */
 #ifndef JAI_CHUNK_H
 #define JAI_CHUNK_H
 
@@ -134,12 +132,11 @@ typedef enum {
     OP_HALT,
 
     /* --- fused forms appended after compiler version 13 (spec §3.3) ---
-     *
-     * Appended here rather than beside the older fused forms because the
+     * Appended here, not beside the older fused forms, because the
      * enumeration order is the on-disk encoding: inserting one in the middle
      * renumbers every opcode above it and silently misreads every cached
-     * .jaic. Each of these replaces a pair the VM was measured executing
-     * millions of times per benchmark run. */
+     * .jaic. Each replaces a pair measured executing millions of times per
+     * benchmark run. */
     OP_GET_FIELD_LOCAL,      /* u16 S, u24 K, u16 C */
     OP_FOR_ITER_BIND,        /* i16 J, u16 S */
     OP_JUMP_IF_CMP_FALSE,    /* u8 cmp (an OP_EQ..OP_GE byte), i16 J */
@@ -148,31 +145,24 @@ typedef enum {
     OP_FORMAT,               /* u8 N, u24 litmask, u24 K("str"), u16 C */
 
     /* --- fused form appended after compiler version 15 (spec §3.3) ---
-     *
-     * `while i < N` and `if n < 2` are a loop guard and a base case, which is
-     * to say the two most frequently executed conditionals there are, and both
-     * lowered to three instructions: push the local, push the constant,
-     * compare-and-branch. This is all three. The constant is a pool index
-     * rather than an immediate so that a guard against a large literal — the
-     * case OP_CMP_LOCAL_CONST_LT's i16 cannot reach — fuses too. */
+     * `while i < N` / `if n < 2` -- a loop guard and a base case, the two most
+     * frequent conditionals -- both lower to push-local/push-const/compare-
+     * branch; this is all three. The constant is a pool index rather than an
+     * immediate so a guard against a large literal fuses too. */
     OP_JUMP_IF_CMP_LOCAL_K,  /* u8 cmp (an OP_EQ..OP_GE byte), u16 S, u24 K, i16 J */
 
     /* --- numeric widening, appended after compiler version 17 (spec §3.3) ---
-     *
-     * Converts the int on top of the stack to a float. The checker emits it
-     * wherever §2.2's int-to-float widening applies and both types are known,
-     * so that statically typed code pays a conversion and not the type test
-     * the `any` path in the arithmetic opcodes pays. */
+     * int-on-stack -> float. The checker emits it wherever §2.2's widening
+     * applies and both types are known, so typed code pays a conversion, not
+     * the type test the `any` path in arithmetic opcodes pays. */
     OP_TO_FLOAT,
 
-    /* `<int k>; MOD` fused (§3.3): pops the dividend, pushes `x % k`. The
-     * modulus is an i16 immediate, so no slot operand is needed and the pair
-     * collapses wherever it appears rather than only after a local read. */
+    /* `<int k>; MOD` fused (§3.3): pops the dividend, pushes `x % k`. An i16
+     * immediate modulus, so the pair collapses wherever it appears. */
     OP_MOD_INT_CONST,        /* i16 */
 
     /* `ADD; BIND a` fused (§3.3): pops both operands, adds, stores into slot a.
-     * The net stack effect matches the pair, so what produced either operand
-     * does not matter. */
+     * Net stack effect matches the pair, so operand provenance doesn't matter. */
     OP_ADD_BIND,             /* u16 S */
     OP_SUB_BIND,             /* u16 S */
     OP_MUL_BIND,             /* u16 S */
@@ -187,19 +177,15 @@ const char *jaiOpName(OpCode op);
 /* Net stack effect, or INT32_MIN when it depends on operands. */
 int  jaiOpStackEffect(OpCode op);
 /* Byte offset of the u16 inline-cache operand inside `op`'s operand run, or -1
- * when it has none. One definition, because two used to exist — the verifier's
- * and the .jaic reader's — and adding OP_GET_FIELD_LOCAL to one and not the
- * other silently gave every deserialised chunk too few cache slots, which
- * costs no correctness and all of the performance. */
+ * when it has none. One definition, not two (verifier + .jaic reader): the
+ * old split let OP_GET_FIELD_LOCAL be added to one and not the other,
+ * silently under-sizing every deserialised chunk's cache array. */
 int  jaiOpCacheOperand(OpCode op);
 
 /* ------------------------------------------------------------------ */
-/* Line tables (spec §5)                                                */
-/*                                                                      */
-/* Despite the name these hold source *spans*, not line numbers, and    */
-/* they are not compressed: one flat 12-byte entry per covered range.   */
-/* A span is what jaiChunkSpanAt hands the diagnostic printer, which is */
-/* how a caret lands under one expression rather than a whole line.     */
+/* Line tables (spec §5): source *spans*, not line numbers, uncompressed --  */
+/* one flat 12-byte entry per covered range. jaiChunkSpanAt hands a span to  */
+/* the diagnostic printer, landing a caret under one expression, not a line. */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -209,43 +195,25 @@ typedef struct {
 } LineEntry;
 
 /* ------------------------------------------------------------------ */
-/* Inline caches                                                        */
-/*                                                                      */
-/* Allocated per chunk and indexed by a u16 operand baked into the      */
-/* instruction, so a cache lookup is one array index with no hashing.   */
-/* The code generator hands out slots with jaiChunkAddCache.            */
+/* Inline caches: allocated per chunk, indexed by a u16 operand baked into  */
+/* the instruction, so a lookup is one array index with no hashing. The    */
+/* code generator hands out slots with jaiChunkAddCache.                   */
 /* ------------------------------------------------------------------ */
 
 typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
 
 #define JAI_IC_WAYS 4
 
-/* What an OP_INVOKE site was observed to RETURN, one byte per way.
- *
- * The compiled tier can already guard a call's result -- the SLOT_INST arm
- * deoptimises to the instruction after the call when the tag surprises it --
- * but for a BUILT-IN method it had nothing to guard against. `stackSeen` is
- * seeded from a live frame's locals at OSR entry and a call result has never
- * been in one, so `counts.get(key, 0)` declined for want of a prediction
- * rather than for want of a guard.
- *
- * This is only ever a PREDICTION. The tag guard is what makes it sound: a
- * builtin that returns something else, today or after someone edits it,
- * deoptimises instead of miscompiling. Nothing here may be relied on without
- * emitting that guard.
- *
- * It is written where the inline cache is FILLED, not where it hits, so the
- * interpreter's hot path is untouched -- a store there measured 2.4% of
- * dict_ops. The cost is that the prediction is the first result the site ever
- * produced. A site whose kind later changes therefore deoptimises every
- * iteration; the tier's answer is to decline anything it cannot use (null and
- * mixed included) rather than to compile a loop that deopts.
- *
- * Encoding: 0 never observed, 1 + ValueType for a non-object (1..4; VAL_OBJ
- * never appears there), JAI_FB_OBJ + ObjType for an object, 255 mixed.
- *
- * The bytes sit in what was already padding before `shapeId`'s alignment, so
- * sizeof(InlineCache) is unchanged. */
+/* What an OP_INVOKE site was observed to RETURN, one byte per way, for
+ * built-in methods (the SLOT_INST arm already guards user-class results by
+ * tag). Only ever a PREDICTION -- the tag guard emitted alongside it is what
+ * makes it sound, so a builtin returning something else deoptimises rather
+ * than miscompiles. Written where the cache is FILLED, not where it hits (a
+ * store on the hit path measured 2.4% of dict_ops), so a site whose result
+ * kind later changes deoptimises every iteration rather than the tier
+ * declining a loop it can't use. Encoding: 0 never observed, 1+ValueType for
+ * a non-object, JAI_FB_OBJ+ObjType for an object, 255 mixed. Sits in
+ * `shapeId`'s former alignment padding, so sizeof(InlineCache) is unchanged. */
 #define JAI_FB_NONE   0u
 #define JAI_FB_OBJ    32u
 #define JAI_FB_MIXED  255u
@@ -285,10 +253,9 @@ typedef struct {
     int          cacheCapacity;
 
     /* Constant-pool dedup index: hash of a constant -> its pool index. Built
-     * lazily by jaiChunkAddConstant once the pool outgrows a linear scan, so
-     * NULL means "not built yet", never "empty". Owned by the chunk and freed
-     * by jaiChunkFree. Not serialised (it is derived from `constants`) and not
-     * traced by the GC (every key and value is an int). */
+     * lazily once the pool outgrows a linear scan, so NULL means "not built
+     * yet". Not serialised (derived from `constants`) and not GC-traced
+     * (every key/value is an int). */
     JaiTable  *constIndex;
 
     int        sourceFileId;
@@ -312,11 +279,9 @@ uint32_t jaiChunkAddConstant(Chunk *chunk, Value v);
 void     jaiChunkSpanAt(const Chunk *chunk, int codeOffset, uint32_t *start,
                         uint32_t *end);
 
-/* Operands are little-endian by construction (jaiChunkWriteU16 and friends).
- * Assembled a byte at a time these cost four instructions for a u16 and six
- * for a u24 in every operand-carrying opcode; as one unaligned load they cost
- * one and two. arm64 and x86-64 both permit the unaligned access, and the
- * three-byte form still reads exactly three bytes, so no chunk needs slack. */
+/* Operands are little-endian by construction. Read as one unaligned load
+ * (both arm64 and x86-64 permit it) instead of byte-assembled, this costs one
+ * instruction for a u16 and two for a u24, against four and six. */
 #if defined(__LITTLE_ENDIAN__) ||                                              \
     (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
 #  define JAI_OPERANDS_ARE_NATIVE 1

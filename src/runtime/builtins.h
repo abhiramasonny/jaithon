@@ -1,14 +1,5 @@
-/* builtins.h — what the three halves of the builtin namespace share.
- *
- * builtins.c owns registration, the argument helpers and the method-table
- * dispatcher; builtins_core.c owns the functions a program can name
- * (print, len, sorted, the conversions); builtins_prim.c owns the `__prim__`
- * operators that lib/std is written over. Five things straddle that split and
- * this header is all of them.
- *
- * Not a public interface: runtime.h declares what the VM and the registrar
- * call, and nothing below belongs there.
- */
+/* builtins.h — what builtins.c, builtins_core.c and builtins_prim.c share.
+ * Not a public interface: runtime.h declares what the VM and registrar call. */
 #ifndef JAI_BUILTINS_H
 #define JAI_BUILTINS_H
 
@@ -19,16 +10,15 @@
 /* Callable in the sense the call path means it: anything jaiCallValue accepts. */
 bool jaiBuiltinIsCallable(Value v);
 
-/* One wording for every argument mismatch, so that a native reads as a
- * language error rather than as a C function that was handed the wrong thing.
- * `index` is 0-based over the user-visible arguments. */
+/* Consistent wording for every argument mismatch. `index` is 0-based over the
+ * user-visible arguments. */
 bool jaiBuiltinArgTypeError(int index, const char *fnName, const char *expected,
                             Value got);
 
 /* --- defined in builtins_core.c ------------------------------------ */
 
-/* Does `v` match the type token `t`? The builtin type names are the native
- * conversion functions, so the test is by identity against those. */
+/* Builtin type tokens are the native conversion functions, so this tests
+ * identity against those. */
 bool jaiBuiltinMatchesType(Value v, Value t, bool *matched);
 
 /* --- defined in builtins_prim.c ------------------------------------ */
@@ -38,8 +28,8 @@ bool jaiBuiltinMatchesType(Value v, Value t, bool *matched);
 bool jaiBuiltinAddI64(int64_t a, int64_t b, int64_t *out);
 bool jaiBuiltinOverflowError(const char *op);
 
-/* The `__prim__` operator surface (spec Appendix C), registered from
- * jaiRegisterCoreBuiltins so that there is still one entry point. */
+/* The __prim__ operator surface (spec Appendix C); registered from
+ * jaiRegisterCoreBuiltins for one entry point. */
 void jaiRegisterOperatorPrimitives(void);
 
 #endif /* JAI_BUILTINS_H */

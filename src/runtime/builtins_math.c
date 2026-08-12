@@ -1,27 +1,9 @@
 /* builtins_math.c — the numeric, random and clock primitives, plus the method
  * tables for the two numeric types.
  *
- * Three groups of `__prim__` natives live here (spec Appendix C):
- *
- *   - `__prim__.f64_*`: the C math library, which Jaithon source cannot
- *     reproduce to the same accuracy;
- *   - `__prim__.random_u64` and `random_seed`: one xoshiro256** stream shared
- *     by the process, which std.random draws every distribution from;
- *   - `__prim__.time_*`: the two clocks, sleeping, and calendar text.
- *
- * The integer helpers further down are not primitives. They back the `int`
- * methods (`abs`, `bit_count`, `bit_length`, `pow_mod`); std.math writes gcd,
- * lcm and isqrt in Jaithon, which is where anything expressible belongs.
- *
- * A domain error — sqrt of a negative, log of a non-positive, asin outside
- * [-1, 1] — raises ValueError. It does not return NaN. A NaN that escapes a
- * math call propagates silently through every arithmetic operation downstream
- * and finally surfaces as a wrong number in a place that has nothing to do with
- * the call that produced it; by then there is nothing left to debug. Jaithon
- * fails where the mistake was made. A NaN *argument* is different: it is passed
- * through untouched, because the caller already had one and reporting it here
- * would hide where it came from.
- */
+ * A domain error (sqrt of a negative, log of a non-positive, ...) raises
+ * ValueError instead of returning NaN, which would corrupt a result silently
+ * downstream; a NaN *argument*, though, passes through untouched. */
 
 /* Feature macros must precede every include: -std=c11 alone does not expose
  * nanosleep, clock_gettime, strptime, localtime_r or getentropy. */
@@ -59,9 +41,8 @@
 static const double kTwoPow63 = 9223372036854775808.0;
 
 
-/* Fast paths for the overwhelmingly common already-correct primitive argument.
- * Fall back to the canonical helpers so diagnostics/coercion semantics stay
- * exactly where the runtime defines them. */
+/* Fast path for an already-correct primitive argument; anything else falls
+ * back to the canonical helper so diagnostics/coercion stay centralized. */
 static inline bool argNumberFast(Value v, int position, const char *fnName,
                                  double *out) {
     if (IS_FLOAT(v)) {
@@ -94,8 +75,6 @@ static inline uint64_t magnitudeOf(int64_t v) {
     return v < 0 ? -(uint64_t)v : (uint64_t)v;
 }
 
-/* Turn an unsigned magnitude back into a signed value, given the sign it
- * should carry. Returns false when the magnitude does not fit. */
 static inline bool signedFromMagnitude(uint64_t magnitude, bool negative,
                                        int64_t *out) {
     if (negative) {
@@ -200,9 +179,8 @@ static inline bool floatToInt(double d, const char *fnName, int64_t *out) {
 /* __prim__.f64_*                                                       */
 /* ------------------------------------------------------------------ */
 
-/* The unary primitives with no domain restriction all have the same body; the
- * ones that can be handed an argument they have no value for are written out
- * below so that each can say what it expected. */
+/* Unrestricted-domain unaries share this body via macro; the ones with a
+ * domain error are written out below so each can say what it expected. */
 #define F64_UNARY(cName, jaiName, expr)                                        \
     static bool cName(int argc, Value *args, Value *out) {                     \
         (void)argc;                                                            \
@@ -356,9 +334,8 @@ static bool nF64Pow(int argc, Value *args, Value *out) {
     if (!argNumberFast(args[0], 1, "f64_pow", &base)) return false;
     if (!argNumberFast(args[1], 2, "f64_pow", &exponent)) return false;
 
-    /* Two cases where pow() answers NaN or infinity for a reason the caller can
-     * act on: a negative base has no real fractional power, and zero has no
-     * negative power at all. */
+    /* Two cases where pow() would answer NaN/inf uninformatively: a negative
+     * base with a non-integral exponent, and zero to a negative power. */
     if (base < 0.0 && isfinite(exponent) && exponent != trunc(exponent))
         return jaiThrow(vm.cValueError,
                         "f64_pow() expects an integral exponent for a negative "
@@ -792,9 +769,9 @@ static bool nSleep(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Days from 1970-01-01 to the given proleptic Gregorian date (Hinnant's
- * days_from_civil). Written out rather than calling timegm, which is not in any
- * standard, and mktime, which would apply the local time zone. */
+/* Days from 1970-01-01 to a proleptic Gregorian date (Hinnant's
+ * days_from_civil) -- avoids timegm (nonstandard) and mktime (applies the
+ * local time zone). */
 static inline int64_t daysFromCivil(int64_t year, int64_t month, int64_t day) {
     year -= month <= 2;
     const int64_t era = (year >= 0 ? year : year - 399) / 400;
@@ -995,9 +972,8 @@ void jaiRegisterTimePrimitives(void) {
     jaiDefineNative("__prim__.time_wall", nTimeWall, 0, 0);
     jaiDefineNative("__prim__.time_mono_seconds", nTimeMonoSeconds, 0, 0);
 
-    /* Appendix C names this `sleep`. `time_sleep` is the same native under a
-     * second name and exists only because lib/std/time.jai still calls it; it
-     * goes when that one call is repointed. */
+    /* Appendix C calls this `sleep`; `time_sleep` is the same native kept only
+     * because lib/std/time.jai still calls it under that name. */
     jaiDefineNative("__prim__.sleep",      nSleep, 1, 1);
     jaiDefineNative("__prim__.time_sleep", nSleep, 1, 1);
 
@@ -1009,9 +985,8 @@ void jaiRegisterTimePrimitives(void) {
 /* int and float methods                                                */
 /* ------------------------------------------------------------------ */
 
-/* A bound native is called with the receiver in args[0] and argc counting it,
- * so every method below reads its own arguments from args[1] onwards and every
- * arity in the tables includes the receiver. */
+/* A bound native gets the receiver in args[0] (argc counts it), so methods
+ * read their own args from args[1] on; table arities include the receiver. */
 
 static inline bool intSelf(Value *args, const char *method, int64_t *out) {
     const Value self = args[0];

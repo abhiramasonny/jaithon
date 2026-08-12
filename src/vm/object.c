@@ -1,10 +1,5 @@
 /* object.c — heap object construction, destruction, and the pure-data
- * operations on them (slicing, class layout, iteration).
- *
- * Nothing here interprets bytecode; the only calls back into the VM are
- * jaiThrow for runtime errors and jaiInvokeMethod for user-defined
- * __iter__/__next__.
- */
+ * operations on them (slicing, class layout, iteration). */
 
 #include "object.h"
 
@@ -12,32 +7,8 @@
 #include "table.h"
 #include "vm.h"
 
-/* Interning policy. Names — everything the compiler and the deserialiser
- * produce — are interned unconditionally, because pointer equality standing in
- * for string equality is what makes member and global lookup a pointer compare
- * (jaiTableGetInterned). Run-time strings are a different trade: interning
- * them pays off only when they repeat (tests/bench/dict_ops rebuilds the same
- * 10,000 keys 50 times each and wants the existing object back), and costs
- * when they do not (tests/bench/string_build makes 2,000,000 distinct ones;
- * growing the table for them and sweeping each as a weak reference on every
- * collection was 45% of its run). So a run-time string takes part only while
- * doing so still pays, and the signal is table population: a program whose
- * short strings repeat reaches a steady state (dict_ops settles around 20,000
- * entries and reuses them for the rest of its run) while one producing
- * distinct strings climbs without bound. Past the cap run-time strings stop
- * taking part altogether — no probe, no insert — so the table neither grows
- * nor costs a cache miss per string, and what is already in it goes on serving
- * the program that put it there. 1<<15 measured best; 1<<16 gave back 2.4%.
- *
- * A hit-rate window was tried instead and is worse, because the choice is
- * self-reinforcing: whichever mode is live decides which object a container
- * ends up holding, so switching modes orphans everything the other mode
- * interned and the table collapses. Measured, it flapped every few thousand
- * probes and cost dict_ops 24%.
- *
- * The cap has to clear the names as well, since they share the table; the
- * stdlib interns about 2,500. jaiStringCanonical is the way in for the few
- * reflective entry points that need identity for a string the caller built. */
+/* Names intern unconditionally (pointer equality drives lookup). Run-time
+ * strings intern only below JAI_INTERN_SOFT_CAP population. */
 #define JAI_INTERN_MAX      32        /* longest run-time string worth a probe */
 #define JAI_INTERN_SOFT_CAP (1 << 15) /* entries, past which run-time strings stop */
 
@@ -46,18 +17,12 @@
 /* ------------------------------------------------------------------ */
 
 static inline Obj *allocObj(size_t size, ObjType type) {
-    /* Collect *before* the allocation: afterwards the new object is not yet
-     * reachable from any root and a collection would free it. Guarding this
-     * with the inlined jaiGCWanted() test used to measure a wash, because the
-     * allocation dwarfed the call; once small objects came from a free list
-     * that stopped being true. */
+    /* Collect *before* the allocation: the new object is unreachable from any
+     * root until returned, so a collection after would free it. */
     if (JAI_UNLIKELY(jaiGCWanted())) jaiGCMaybeCollect();
 
-    /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size class
-     * computed from the same size, so this is the same block from the same
-     * place; what it skips is the call and the five branches that sort out
-     * resize, free and the classes the bins do not serve. Sampled on
-     * alloc_churn, jaiRealloc was 10% of the run for two calls per object. */
+    /* jaiSmallNew skips jaiRealloc's resize/free branches for a size class it
+     * already knows serves this request; jaiRealloc alone was 10% of alloc_churn. */
     Obj *obj = (Obj *)(JAI_LIKELY(jaiSmallServes(size)) ? jaiSmallNew(size)
                                                         : jaiRealloc(NULL, 0, size));
     obj->type = type;
@@ -68,11 +33,8 @@ static inline Obj *allocObj(size_t size, ObjType type) {
     return obj;
 }
 
-/* Hands back `size` bytes with only the Obj header set and everything after it
- * uninitialised. Worth it only where the payload is about to be overwritten
- * wholesale, which means the variable-length types: zeroing a string's
- * characters and then memcpying over them turned the memset into a call into
- * libc with a runtime length, and that was 11% of tests/bench/string_build. */
+/* Uninitialised past the Obj header -- use only where the payload will be
+ * overwritten wholesale; zeroing first cost 11% of tests/bench/string_build. */
 Obj *jaiAllocateObjectRaw(size_t size, ObjType type) {
     return allocObj(size, type);
 }
@@ -85,8 +47,8 @@ Obj *jaiAllocateObject(size_t size, ObjType type) {
     return obj;
 }
 
-/* Push `o` as a temporary root, tolerating NULL so that push/pop stay paired
- * in constructors whose arguments are optional. */
+/* Tolerates NULL so a constructor with optional arguments can keep every
+ * push paired with a pop. */
 static inline void pushObjRoot(void *o) {
     jaiGCPushRoot(o != NULL ? OBJ_VAL(o) : NULL_VAL);
 }
@@ -96,8 +58,7 @@ void jaiFreeObject(Obj *obj) {
 
     switch (obj->type) {
     case OBJ_STRING: {
-        /* Flexible array: header and payload are one block. The intern table
-         * holds only weak references and is purged by the sweep, so there is
+        /* Intern table entries are weak and purged by the sweep, so there is
          * nothing to unlink here. */
         ObjString *s = (ObjString *)obj;
         /* A slice carries no bytes of its own; the buffer is swept separately
@@ -361,10 +322,6 @@ static inline int64_t sliceCount(int64_t n, int64_t *pStart,
 /* Strings                                                              */
 /* ------------------------------------------------------------------ */
 
-/* Raw ObjString of `length` payload bytes. The caller fills chars[] and sets
- * hash and interned. */
-/* Raw allocation: every ObjString field is assigned here, and the characters
- * are written by the caller immediately after. */
 static ObjString *allocString(size_t length) {
     ObjString *s = (ObjString *)jaiAllocateObjectRaw(JAI_STRING_ALLOC(length),
                                                      OBJ_STRING);
@@ -381,8 +338,7 @@ static ObjString *allocString(size_t length) {
     return s;
 }
 
-/* Adds `s` to the intern table. The table may grow, so `s` is rooted across
- * the insertion. */
+/* Rooted across the insert: growing the table may trigger a collection. */
 static inline void internString(ObjString *s) {
     JAI_STR_INTERNED(s) = true;
     jaiGCPushRoot(OBJ_VAL(s));
@@ -414,8 +370,8 @@ ObjString *jaiStringInternC(const char *cstr) {
 
 ObjString *jaiStringCanonical(ObjString *s) {
     if (s == NULL || JAI_STR_INTERNED(s)) return s;
-    /* Force the hash: an interned string's is what the table probes by, and a
-     * run-time string may not have needed one yet. */
+    /* The intern table probes by hash; a run-time string may not have needed
+     * one computed yet, so force it here. */
     uint64_t hash = jaiStringHash(s);
     ObjString *found = jaiInternTableFind(s->chars, s->length, hash);
     if (found != NULL) return found;
@@ -423,24 +379,13 @@ ObjString *jaiStringCanonical(ObjString *s) {
     return s;
 }
 
-/* Should a run-time string of this length take part in interning at all —
- * both the probe and the insert? */
 static inline bool runtimeInternable(size_t length) {
     return length <= JAI_INTERN_MAX &&
            jaiInternTableCount() < JAI_INTERN_SOFT_CAP;
 }
 
-/* The 128 one-byte ASCII strings, made once and kept forever.
- *
- * `s[i]` builds a string, and before this it built a fresh one every time:
- * allocate, hash the byte, probe the intern table, and give the collector
- * another object to walk. `str_search` reads a million characters and
- * `word_freq`'s scanner reads a quarter of a million, but so does every lexer,
- * parser and text-munging loop ever written in this language -- the front end
- * itself is one. Interning already made them one object; this makes them free.
- *
- * Held strongly here because the intern table's references are weak (see
- * jaiTableRemoveWhite in gc.c), so nothing else would keep them alive. */
+/* Cache of the 128 ASCII byte strings; held strongly since the intern table
+ * only holds weak references (see jaiTableRemoveWhite in gc.c). */
 static ObjString *sAsciiChar[128];
 
 void jaiMarkAsciiChars(void) {
@@ -535,10 +480,8 @@ ObjString *jaiStringTake(char *chars, size_t length) {
     return s;
 }
 
-/* Growing a string by copying the whole accumulation each time makes the
- * ordinary `text = text + piece` loop quadratic: forty thousand steps over a
- * 280KB result move 5.6GB. These three give that loop spare capacity to grow
- * into, so it moves each byte once. */
+/* Copying the whole accumulation on every `text = text + piece` makes that
+ * loop quadratic; these three give it spare capacity so each byte moves once. */
 static ObjStrBuf *strBufNew(size_t capacity) {
     if (capacity > UINT32_MAX) capacity = UINT32_MAX;
 
@@ -550,8 +493,8 @@ static ObjStrBuf *strBufNew(size_t capacity) {
     return b;
 }
 
-/* A view of the first `length` bytes of `buf`. Header only: the bytes belong to
- * the buffer, which the collector keeps alive through `owner`. */
+/* View over the first `length` bytes of `buf`; the collector keeps `buf`
+ * alive via `owner`. */
 static ObjString *strSliceOver(ObjStrBuf *buf, size_t length) {
     ObjString *s = (ObjString *)jaiAllocateObjectRaw(sizeof(ObjString),
                                                      OBJ_STRING);
@@ -569,9 +512,8 @@ static ObjString *strSliceOver(ObjStrBuf *buf, size_t length) {
 
 const char *jaiStringCStr(ObjString *s) {
     if (!JAI_STR_UNTERMINATED(s)) return s->chars;
-    /* Somebody appended past this view, so the byte after it is no longer a
-     * NUL. The bytes up to `length` are still exactly right, so a fresh copy
-     * of them is a correct C string. */
+    /* UNTERMINATED means something appended past this view, so the byte after
+     * it is no longer NUL; a fresh copy up to `length` is a correct C string. */
     ObjString *copy = jaiStringNew(s->chars, s->length);
     return copy != NULL ? copy->chars : "";
 }
@@ -597,8 +539,8 @@ ObjString *jaiStringConcat(ObjString *a, ObjString *b) {
     jaiGCPushRoot(OBJ_VAL(a));
     jaiGCPushRoot(OBJ_VAL(b));
 
-    /* `a` is the newest view of its buffer and there is room: write `b` after
-     * it. Every older view ends before this point and is untouched. */
+    /* `a` is the newest view of its buffer with room to grow; older views end
+     * before this point and are untouched by the append. */
     ObjStrBuf *buf = a->owner;
     if (buf != NULL && buf->used == a->length && buf->capacity >= length) {
         memcpy(buf->data + a->length, b->chars, b->length);
@@ -611,8 +553,8 @@ ObjString *jaiStringConcat(ObjString *a, ObjString *b) {
         return grown;
     }
 
-    /* No buffer, or somebody else already appended to it. Start one with room
-     * to double, so a growing chain stops copying after this. */
+    /* No buffer, or someone else already appended to it: start a fresh one
+     * with room to double, so a growing chain stops copying after this. */
     {
         size_t want;
         if (length < 32) {
@@ -644,11 +586,8 @@ ObjString *jaiStringConcat(ObjString *a, ObjString *b) {
     return s;
 }
 
-/* One allocation, sized exactly, for the n-way concatenation an f-string
- * performs. Short results still go through jaiStringNew so that the run-time
- * interning policy sees them; a long one is built in place, which is the point
- * — the pairwise OP_CONCAT lowering this replaces allocated an intermediate
- * string per hole and copied the prefix again for each one. */
+/* Exact-sized n-way concat for f-strings, replacing the old pairwise
+ * OP_CONCAT that allocated an intermediate string per hole. */
 ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
                               int count, size_t total) {
     if (total > UINT32_MAX) {
@@ -659,11 +598,8 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
     if (total == 0) return jaiStringIntern("", 0);
 
     if (total <= JAI_INTERN_MAX) {
-        /* Byte at a time rather than memcpy per run. The runs an f-string
-         * produces are one to five bytes each -- `f"k{i}"` is a one-byte
-         * literal and four digits -- and at that length the call into
-         * _platform_memmove costs several times the copy. Two of them per
-         * f-string were 6.6% of tests/bench/dict_ops by sample count. */
+        /* Byte-at-a-time beats memcpy per run here: f-string runs are 1-5
+         * bytes, and at that length the libc call costs more than the copy. */
         char buf[JAI_INTERN_MAX];
         size_t o = 0;
 
@@ -675,10 +611,8 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
         return jaiStringNew(buf, total);
     }
 
-    /* allocString may collect, but it collects *before* it allocates and the
-     * runs belong to the caller's roots, so they are still there afterwards.
-     * Over JAI_INTERN_MAX nothing will probe for this, so the hash is left to
-     * jaiStringHash. */
+    /* allocString may collect, but the runs are already rooted by the caller,
+     * so they survive; the hash is left unset since nothing will probe for it. */
     ObjString *s = allocString(total);
     char *dst = s->chars;
     for (int i = 0; i < count; ++i) {
@@ -691,11 +625,8 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
     return s;
 }
 
-/* Reserve/seal: for a caller that can size the result up front and would
- * otherwise build it in a JaiBuf and copy it in. str.join over a list is the
- * case — the old path grew a buffer by doubling, reallocated it to size, then
- * memcpy'd the whole thing into the string, which on the 2.3 MB join in
- * tests/bench/string_build meant three passes over the bytes instead of one. */
+/* Lets a caller that knows the final size skip building it in a JaiBuf and
+ * copying it in; str.join's old path made three passes over the bytes. */
 ObjString *jaiStringReserve(size_t length) {
     if (length > UINT32_MAX) {
         jaiThrow(vm.cValueError, "string of %zu bytes exceeds the maximum length",
@@ -745,8 +676,8 @@ bool jaiStringEqualsSlow(const ObjString *a, const ObjString *b) {
     return memcmp(a->chars, b->chars, length) == 0;
 }
 
-/* Byte offset of every scalar in `s`, plus a terminator entry holding the byte
- * length. Only needed for non-ASCII strings; the caller frees it. */
+/* offsets[i] is the byte offset of scalar i; offsets[n] is the terminator
+ * (byte length). Caller frees the array. */
 static uint32_t *buildScalarOffsets(const ObjString *s, int64_t n) {
     uint32_t *offsets = JAI_ALLOC(uint32_t, (size_t)n + 1);
     const char *p = s->chars;
@@ -929,8 +860,8 @@ void jaiListReserve(ObjList *list, int capacity) {
     list->capacity = capacity;
 }
 
-/* Grows to hold one more item, keeping `pending` (the value about to be
- * stored, which may be the only reference to a fresh object) alive. */
+/* Roots `pending` across the grow: it may be the only reference to a fresh
+ * object, and growing can allocate. */
 static bool listGrowFor(ObjList *list, Value pending) {
     if (list->capacity > INT32_MAX / 2) {
         jaiThrow(vm.cRuntimeError,
@@ -945,9 +876,8 @@ static bool listGrowFor(ObjList *list, Value pending) {
     return true;
 }
 
-/* A monotone counter, not a state hash: a live iterator only asks whether the
- * list is the one it started on, and wrapping after 2^32 mutations would take
- * a single loop longer than any program runs. */
+/* A monotone counter, not a hash: an iterator only checks whether the list is
+ * the one it started on, and 2^32-mutation wraparound outlives any real loop. */
 void jaiListTouch(ObjList *list) {
     list->version++;
 }
@@ -1108,12 +1038,8 @@ ObjDict *jaiDictNew(void) {
     return d;
 }
 
-/* Hash a key, refusing the ones spec §5.4 does not allow: `null`, and anything
- * that does not hash at all. The table layer cannot make that judgement itself,
- * because it is also the VM's own symbol table, where such a key is a bug and
- * not a program's mistake; it asserts. So the rejection lives here instead, on
- * the two functions every dict write and set insertion funnels through, and the
- * hash is carried down so a user `__hash__` is not run a second time. */
+/* Rejects null/unhashable keys here, not in JaiTable: the table doubles as
+ * the VM's symbol table, where such a key is a bug, not a user mistake. */
 static inline bool keyHash(Value key, const char *role, uint64_t *hash) {
     if (IS_NULL(key))
         return jaiThrow(vm.cTypeError, "a %s cannot be null", role);
@@ -1141,8 +1067,6 @@ bool jaiDictDelete(ObjDict *d, Value key) {
     return jaiTableDelete(&d->table, key);
 }
 
-/* Collects one column of the dict into a fresh list. `wantValues` picks the
- * column; both are gathered in one pass so the table is walked once. */
 static ObjList *dictColumn(ObjDict *d, bool wantValues) {
     jaiGCPushRoot(OBJ_VAL(d));
     ObjList *out = jaiListNew(d->table.count);
@@ -1475,10 +1399,8 @@ void jaiClassInherit(ObjClass *sub, ObjClass *super) {
     jaiTableAddAll(&super->setters, &sub->setters);
     jaiTableAddAll(&super->restricted, &sub->restricted);
 
-    /* Inheritance runs before the subclass declares its own methods, so the
-     * fixed dunder cache can be copied directly instead of re-interning and
-     * probing every dunder name. Later jaiClassAddMethod calls overwrite the
-     * individual slots when the subclass declares an override. */
+    /* Runs before the subclass declares its own methods, so the dunder cache
+     * copies directly; later jaiClassAddMethod overwrites a slot on override. */
     for (int i = 0; i < DUNDER_COUNT; ++i) {
         Value inherited;
         memcpy(&inherited,
@@ -1542,8 +1464,7 @@ void jaiClassAddMethod(ObjClass *c, ObjString *name, Value method,
 }
 
 bool jaiClassRestrictedMethod(ObjClass *c, ObjString *name, MethodInfo *out) {
-    /* The whole point of the side table: a class with no non-public method
-     * answers here, before any hashing. */
+    /* A class with no non-public methods answers here, before any hashing. */
     if (c == NULL || name == NULL || c->restricted.count == 0) return false;
     Value packed;
     if (!jaiTableGetInterned(&c->restricted, name, &packed)) return false;
@@ -1554,10 +1475,8 @@ bool jaiClassRestrictedMethod(ObjClass *c, ObjString *name, MethodInfo *out) {
     out->visibility = (Visibility)(bits & 0xFF);
     out->flags = (uint32_t)((bits >> 8) & 0xFFFF);
 
-    /* `private` is private to the *declaring* class, not to whoever inherited
-     * the entry, so the verdict needs that class. Its shapeId was packed in
-     * when the method was added; recovering the pointer is a walk up the
-     * superclass chain with no hashing at all. */
+    /* `private` scopes to the *declaring* class, so the verdict needs it; its
+     * shapeId was packed in, and we recover the pointer by walking the chain. */
     uint32_t ownerShape = (uint32_t)((uint64_t)bits >> 24);
     out->owner = c;
     for (ObjClass *k = c; k != NULL; k = k->superclass) {
@@ -1771,19 +1690,9 @@ void jaiModuleSet(ObjModule *m, ObjString *name, Value v) {
     const bool added = jaiTableSetInternedPrev(&m->globals, name, v, &prev);
     jaiGCPopRoots(2);
 
-    /* ObjModule::version retires compiled code, and compiled code resolves a
-     * global by VALUE exactly four ways -- globalClass, globalFunction,
-     * globalNative and globalIsSelf in jit_func.c -- each of which demands
-     * IS_CLASS, IS_CLOSURE or IS_NATIVE. Everything else it resolves by
-     * ADDRESS, re-loading the value behind a tag guard on every access, so an
-     * update to an inert value needs no invalidation at all.
-     *
-     * jaiValueIsInertGlobal is the test, and it is written the safe way round:
-     * it lists the types compiled code provably cannot bake and answers false
-     * for everything else, so a new ObjType falls into the conservative arm.
-     *
-     * The key set and the table layout are NOT tracked here -- JaiTable bumps
-     * keyVersion itself, so no writer can forget to. */
+    /* version retires compiled code that baked a global by VALUE (see
+     * jaiValueIsInertGlobal); everything else resolves by address and needs
+     * no invalidation. */
     if (added || ((IS_OBJ(prev) || IS_OBJ(v)) &&
                   (!jaiValueIsInertGlobal(prev) || !jaiValueIsInertGlobal(v)))) {
         m->version++;
@@ -1819,8 +1728,6 @@ static inline ObjString *traitNextName(void) {
     return jaiStringInternC("next");
 }
 
-/* True when instances of `v`'s class answer `name`. Inherited methods are
- * copied down at class creation, so one table lookup is the whole answer. */
 ObjIter *jaiIterNew(IterKind kind, Value source) {
     const bool rootSource = IS_OBJ(source);
     if (rootSource) jaiGCPushRoot(source);
@@ -1882,18 +1789,14 @@ ObjIter *jaiIterNew(IterKind kind, Value source) {
     return it;
 }
 
-/* Both forms are fatal to the traversal, but they are reported apart because
- * the reader's next question differs: a resize invalidates the iterator's
- * bounds, while an in-place store leaves them valid and silently changes what
- * the loop sees. */
+/* Reported apart because the reader's next question differs: a resize
+ * invalidates the iterator's bounds; an in-place store leaves them valid. */
 static inline bool iterMutated(bool resized) {
     return jaiThrow(vm.cRuntimeError,
                     resized ? "container changed size during iteration"
                             : "container was modified during iteration");
 }
 
-/* True when the pending exception is a StopIteration, i.e. an ordinary end of
- * a user-defined iterator rather than a failure. */
 static inline bool pendingIsStopIteration(void) {
     if (!vm.hasException || vm.cStopIteration == NULL)
         return false;
@@ -1910,11 +1813,8 @@ static inline bool pendingIsStopIteration(void) {
     return false;
 }
 
-/* Two exhaustion protocols meet here. `__next__` (spec §7.1) ends by raising
- * StopIteration; `trait Iterator.next` (spec §9), which the whole standard
- * library is written against, ends by returning null. Which one applies is
- * decided by which method the object actually has, so neither has to know
- * about the other. */
+/* Two protocols coexist: __next__ (spec §7.1) raises StopIteration; trait
+ * Iterator.next (spec §9) returns null. Dispatch picks by which method exists. */
 static bool iterUserNext(ObjIter *it, Value *out) {
     Value result;
     if (!jaiInvokeMethod(it->source, nextName(), 0, NULL, &result)) {
@@ -1932,9 +1832,8 @@ static bool iterUserNext(ObjIter *it, Value *out) {
     return true;
 }
 
-/* std.core's contract: `next` returns null at the end and must keep returning
- * null afterwards. An iterator over values that can themselves be null wraps
- * them, which is why null is safe to read as "done" here. */
+/* `next` returns null at the end and keeps returning null after; a
+ * null-valued item is wrapped elsewhere, so null is safe to read as "done". */
 static bool iterTraitNext(ObjIter *it, Value *out) {
     Value result;
     if (!jaiInvokeMethod(it->source, traitNextName(), 0, NULL, &result)) {

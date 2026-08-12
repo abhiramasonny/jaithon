@@ -3,84 +3,47 @@
 
 #include "object.h"
 
-/* The compiled tier.
- *
- * The interpreter stays authoritative. The JIT is an accelerator that may
- * always decline: `jaiJitEnter` answers false and the interpreter runs the
- * function exactly as it would have. Every stage of this is built that way, so
- * a tier that is wrong is slow rather than fatal, and so the suite can stay
- * green while the compiler behind it is still a stub.
- *
- * Nothing here compiles anything yet. This is the plumbing -- the entry count,
- * the threshold, the decline path -- proved on its own before a byte of machine
- * code exists. */
+/* The compiled tier: an accelerator that may always decline -- jaiJitEnter
+ * returns false and the interpreter runs the function exactly as it would. */
 
-/* How many entries before a function is considered hot. Arbitrary for now; the
- * only requirement is that it is high enough that the counter itself does not
- * cost anything on cold code and low enough that a benchmark reaches it. */
+/* How many entries before a function is considered hot: arbitrary, just high
+ * enough the counter costs nothing on cold code and low enough a benchmark
+ * reaches it. */
 #define JAI_JIT_THRESHOLD 64
 
 /* Called on entry to a Jaithon function once it has crossed the threshold.
  *
- * THE BOUNDARY CONTRACT, which is the whole safety argument:
- *
- *   On false -- nothing has been touched. `vm.stackTop` and the frame stack are
- *   exactly as they were, and the interpreter proceeds as if this was never
- *   called. Declining must be free of side effects, because it is the path
- *   every unsupported function takes.
- *
- *   On true -- the call is COMPLETE. The callee's frame was never pushed, the
- *   arguments and callee slot are gone, and the single return value sits at
- *   `slotBase[0]` with `vm.stackTop == slotBase + 1`. That is precisely the
- *   state `OP_RETURN` leaves behind, so the caller cannot tell which tier ran.
- *
- * Why the frame is never pushed: a compiled region has no `CallFrame`, so a
- * traceback taken inside it would show the caller's frame and nothing else.
- * That is acceptable only because compiled regions cannot yet throw, call, or
- * allocate. The moment one of those becomes possible, this contract needs a
- * frame -- or a way to reconstruct one -- and that is the next hard problem
- * rather than a detail.
- *
- * The interpreter caches `ip` and `stackTop` in locals across an instruction
- * (`SAVE_STATE`/`LOAD_STATE` in vm.c). `callClosure` is called from a point
- * where that state is already saved, so this runs against memory that is
- * current -- but anything here that re-enters the VM has to save and restore it
- * the same way. */
+ * Boundary contract: false leaves vm.stackTop and the frame stack untouched,
+ * and the interpreter proceeds as if this was never called. True means the
+ * call is COMPLETE, in exactly OP_RETURN's poststate -- return value at
+ * `slotBase[0]`, `vm.stackTop == slotBase + 1`, frame never pushed. */
 bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
 
 /* The whole-function tier (jit_func.c). Compile returns false for anything it
  * does not speak; enter obeys the same boundary contract as jaiJitEnter. */
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
 
-/* Three answers, not two. DECLINED means nothing was touched and the
- * interpreter should run the call. ERROR means the compiled code called out,
- * the callee raised, and the effects up to that point already happened -- so
- * running the call again would repeat them. */
+/* DECLINED: nothing touched, interpreter should run the call. ERROR: compiled
+ * code called out, the callee raised, and those effects already happened, so
+ * the call must not be re-run. */
 typedef enum {
     JAI_JIT_DECLINED,
     JAI_JIT_DONE,
     JAI_JIT_ERROR,
-    /* The compiled body met a value that was not the kind it was compiled for.
-     * Unlike DECLINED this cannot re-run the call: the body may already have
-     * written something. The interpreter takes over from the exact bytecode
-     * offset instead, with the locals and operand stack the compiled code was
-     * holding. Call jaiJitApplyDeopt once a frame exists. */
+    /* Met a value it wasn't compiled for; unlike DECLINED cannot re-run, so
+     * the interpreter resumes from the exact offset instead. Call
+     * jaiJitApplyDeopt once a frame exists. */
     JAI_JIT_DEOPT
 } JaiJitOutcome;
 
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
 
-/* Finish, in the interpreter, a compiled body that deoptimised part-way --
- * building its frame entirely out of the record, since a compiled self-call
- * left nothing of the callee on the VM stack. The value it returns goes to
- * `*out`; false means an exception is pending.
- *
- * This is what lets a recursive body that writes the heap be compiled at all.
- * The alternative answers -- bail, or record a second deopt for the caller --
- * would either repeat the caller's writes or overwrite the callee's record,
- * and the record is a single global precisely because it is consumed here,
- * at the innermost frame that observes it, before anything can write another. */
+/* Finish, in the interpreter, a compiled body that deoptimised part-way,
+ * building its frame entirely from the deopt record. `*out` gets the return
+ * value; false means an exception is pending. The record is a single global,
+ * safe because it's consumed here, at the innermost frame, before anything
+ * else can write another. */
 bool jaiJitFinishDeopt(ObjClosure *closure, Value *out);
 
 /* Mark the roots of every compiled frame that has linked itself. */
@@ -88,26 +51,19 @@ void jaiJitMarkFrames(void);
 
 /* Compile and enter the loop at `top` with the interpreter's own slots. On
  * success `*resumeAt` is the bytecode offset the interpreter should continue
- * from, and any operand-stack values the loop was holding have been pushed. */
-/* 0 declined, 1 resume at *resumeAt, 2 an exception is pending. */
+ * from, and any operand-stack values the loop was holding have been pushed.
+ * Returns 0 declined, 1 resume at *resumeAt, 2 an exception is pending. */
 int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt);
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
 void jaiJitStartSampling(void);
 
-/* A sampling tick landed while `closure` was executing at `offset`.
- *
- * Called from the interpreter's existing safepoint, which already runs on the
- * back edge, so noticing a hot loop costs nothing on the common path. Counting
- * back edges instead cost between 4.7% and 4.7x depending on where the counter
- * lived -- and 11% even with the counter switched off, purely from the branch
- * existing in OP_LOOP. There is no budget for a new test on that edge.
- *
- * Sampling has a second property the counter lacked: its cost is proportional
- * to wall time rather than to iterations, so a tight loop is not punished for
- * being tight. */
-/* False when the compiled loop left an exception pending. */
+/* A sampling tick landed while `closure` was executing at `offset`. Rides the
+ * interpreter's existing back-edge safepoint rather than counting back edges,
+ * which cost 4.7%-4.7x depending on counter placement (11% even switched off,
+ * from the branch alone) and punishes tight loops for being tight.
+ * False when the compiled loop left an exception pending. */
 bool jaiJitSample(ObjClosure *closure, uint32_t offset);
 
 /* Enter a compiled loop at `targetOffset`, compiling it first if this is the
@@ -122,18 +78,12 @@ bool jaiJitEnabled(void);
 /* Executable memory                                                    */
 /* ------------------------------------------------------------------ */
 
-/* A page of code, written then sealed.
- *
- * arm64 will not let a page be writable and executable at once, so the arena is
- * mapped RW, filled, and flipped to RX before anything jumps into it. Measured
- * on this machine: an unsigned binary can do that with plain mmap and mprotect;
- * neither MAP_JIT nor the allow-jit entitlement is needed, which is worth
- * knowing because the alternative would have meant codesigning every build.
- *
- * The instruction cache must be invalidated after writing. On arm64 the data
- * and instruction caches are not coherent, so code that was just stored is not
- * necessarily what gets fetched -- this is the failure that looks like random
- * corruption and is not reproducible under a debugger. */
+/* A page of code, written then sealed. arm64 forbids writable+executable at
+ * once, so the arena is mapped RW, filled, then flipped to RX; an unsigned
+ * binary can do this with plain mmap/mprotect, no MAP_JIT or entitlement
+ * needed. Instruction cache must be invalidated after writing, or arm64's
+ * incoherent I/D caches fetch stale code -- looks like random, undebuggable
+ * corruption. */
 typedef struct {
     uint8_t *code;      /* base of the mapping */
     size_t   capacity;
@@ -153,8 +103,7 @@ bool jaiCodeArenaUnseal(JaiCodeArena *arena);
 void jaiCodeArenaFree(JaiCodeArena *arena);
 
 /* The one arena compiled code lives in. Never freed: a compiled function is
- * reachable for the life of the process, and reclaiming code while a frame
- * might return into it is a problem this tier does not have yet. */
+ * reachable for the life of the process. */
 JaiCodeArena *jaiJitArena(void);
 
 #endif /* JAI_VM_JIT_H */
