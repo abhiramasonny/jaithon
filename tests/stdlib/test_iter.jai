@@ -3,6 +3,7 @@
 #: consumes its source exactly once.
 import std.iter as iter
 
+from std.iter.generators import count, repeat, once, empty, successors, range_step
 from std.test import assert_eq, assert_true, assert_false
 
 fn test_iter_over_the_builtin_containers() -> void {
@@ -121,19 +122,19 @@ fn test_partition_splits_without_reordering() -> void {
 }
 
 fn test_infinite_sources_are_safe_when_bounded() -> void {
-    assert_eq(iter.count().take(3).collect(), [0, 1, 2])
-    assert_eq(iter.count(10, -2).take(3).collect(), [10, 8, 6])
-    assert_eq(iter.repeat("x").take(2).collect(), ["x", "x"])
-    assert_eq(iter.repeat("x", 2).collect(), ["x", "x"])
+    assert_eq(count().take(3).collect(), [0, 1, 2])
+    assert_eq(count(10, -2).take(3).collect(), [10, 8, 6])
+    assert_eq(repeat("x").take(2).collect(), ["x", "x"])
+    assert_eq(repeat("x", 2).collect(), ["x", "x"])
     assert_eq(iter.cycle([1, 2]).take(5).collect(), [1, 2, 1, 2, 1])
-    assert_eq(iter.successors(1, |n| n * 2).take(4).collect(), [1, 2, 4, 8])
+    assert_eq(successors(1, |n| n * 2).take(4).collect(), [1, 2, 4, 8])
 }
 
 fn test_once_and_empty_are_the_degenerate_sources() -> void {
-    assert_eq(iter.once(7).collect(), [7])
-    assert_eq(iter.empty().collect(), [])
-    assert_eq(iter.range_step(0, 10, 3).collect(), [0, 3, 6, 9])
-    assert_eq(iter.range_step(10, 0, -3).collect(), [10, 7, 4, 1])
+    assert_eq(once(7).collect(), [7])
+    assert_eq(empty().collect(), [])
+    assert_eq(range_step(0, 10, 3).collect(), [0, 3, 6, 9])
+    assert_eq(range_step(10, 0, -3).collect(), [10, 7, 4, 1])
 }
 
 fn test_collect_dict_and_set() -> void {
