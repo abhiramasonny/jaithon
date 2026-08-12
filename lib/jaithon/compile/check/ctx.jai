@@ -968,6 +968,46 @@ pub fn param_kwrest(record: dict[str, any]) -> bool {
     return value
 }
 
+pub fn arg_name(record: dict[str, any]) -> str? {
+    let value: str? = record.get("name", null)
+    return value
+}
+
+pub fn arg_spread(record: dict[str, any]) -> bool {
+    let value: bool = record.get("isSpread", false)
+    return value
+}
+
+pub fn arg_span(record: dict[str, any]) -> Span {
+    let value: Span = record.get("span", Span.none())
+    return value
+}
+
+pub fn param_name(record: dict[str, any]) -> str? {
+    let value: str? = record.get("name", null)
+    return value
+}
+
+pub fn param_default(record: dict[str, any]) -> Node? {
+    let value: Node? = record.get("defaultValue", null)
+    return value
+}
+
+pub fn clause_pattern(record: dict[str, any]) -> Node? {
+    let value: Node? = record.get("pattern", null)
+    return value
+}
+
+pub fn clause_iterable(record: dict[str, any]) -> Node? {
+    let value: Node? = record.get("iterable", null)
+    return value
+}
+
+pub fn clause_conditions(record: dict[str, any]) -> list[Node] {
+    let value: list[Node] = record.get("conditions", [])
+    return value
+}
+
 #: The subject of a help that shows the fix: a bare name quoted back verbatim,
 #: and `fallback` for anything larger.
 pub fn subject_of(node: Node?, fallback: str) -> str {
