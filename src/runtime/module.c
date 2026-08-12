@@ -1,7 +1,55 @@
-/* module.c — the module search path, the importer, and the top-level driver.
+/* module.c — module loading and the self-hosting bootstrap window.
  *
- * A module is registered in vm.modules as MOD_LOADING before its body runs,
- * which is what makes an import cycle detectable (E0801) instead of infinite.
+ * Everything that turns a file into a running program lives here: the
+ * guarantee that a module body runs exactly once, the .jaic cache handshake,
+ * the entry-point protocol of §8.4, and the bootstrap window
+ * (sLoadingFrontEnd) that lets the self-hosted front end compile itself.
+ *
+ * Three pieces this file used to hold moved out to siblings, because none of
+ * them share the state described below:
+ *
+ *   - module_path.c: the search path (JAITHON_PATH, jaiModulePathAdd) and
+ *     turning a dotted module name into a file on disk
+ *     (jaiResolveModulePath, spec §8). Pure directory lookups and dotted-name
+ *     syntax; it never reads sOptions, sLoadingFrontEnd, or the import stack.
+ *   - module_cache.c: computing and probing .jaic header flags
+ *     (cacheFlagsFor/cacheFlagsMatch), the JAITHON_TRACE_LOAD/JAITHON_NO_SEED
+ *     env gates, and decoding a rejected .jaic header into a reason
+ *     (jaicRejectionReason). Pure functions of their arguments, or of an env
+ *     var read fresh each call.
+ *   - module_methods.c: the native methods on module objects themselves
+ *     (mod.get/.has/.members/.name/.path) — behaviour of an already-loaded
+ *     module, not part of loading one, and sharing none of this file's
+ *     private state.
+ *
+ * A handful of small helpers (importFailure, ensurePathReady, isRegularFile,
+ * storeResolved, displayName, and the module_cache.c functions above) cross
+ * those file boundaries in one direction or the other; module_internal.h is
+ * where each is declared, private to this directory.
+ *
+ * What stayed is one cohesive state machine and is not split further. Two
+ * facts shape it.
+ *
+ *   - A module is registered in vm.modules *before* its body runs, in the
+ *     MOD_LOADING state. That is what makes a cycle detectable (E0801) instead
+ *     of infinite, and it is why an importer caught in a cycle can observe a
+ *     half-initialised module rather than a fresh empty one.
+ *   - An import happens either before the machine is running (the prelude, the
+ *     entry module) or from inside a live frame (OP_IMPORT). The first wants a
+ *     diagnostic, the second a catchable ImportError. Every failure path here
+ *     goes through one reporting helper that picks between them, so the E-code
+ *     is the same either way.
+ *
+ * The bootstrap window adds a third fact, and it is why warmFrontEnd,
+ * maybeWarmFor, loadModuleBody, jaiImportModule and the self-hosted-compile
+ * functions below stay together rather than being teased apart further:
+ * sLoadingFrontEnd and sFrontEndWarmed are read and set across all of them,
+ * and getting the order wrong is a two-sided deadlock hazard — see
+ * warmFrontEnd's and maybeWarmFor's own comments for two ways that has
+ * actually gone wrong (a cycle reported against std.math; two generations of
+ * the compiler loaded into one process). Splitting this dispatch apart would
+ * not make it easier to follow; it would just move the shared state into a
+ * header where the ordering constraints are no longer visible in one place.
  */
 
 #include <stdlib.h>
@@ -10,10 +58,9 @@
 #include "boot/seed.h"
 #include "frontend.h"
 #include "../vm/jit.h"
-#include "methods.h"
+#include "module_internal.h"
 
 #include "../common/diag.h"
-#include "../native/native.h"
 #include "../vm/serialize.h"
 
 CodegenOptions jaiCodegenDefaults(void) {
@@ -25,15 +72,9 @@ CodegenOptions jaiCodegenDefaults(void) {
     return opts;
 }
 
-#define JAI_MODULE_EXT   ".jai"
-#define JAI_PACKAGE_FILE "mod.jai"
-
 /* Enough to hold a legitimate package chain; a longer one is a runaway import
  * that would otherwise recurse the C stack (each level nests a VM run). */
 #define JAI_MAX_IMPORT_DEPTH 64
-
-/* Directories listed in an E0800 note before the list is elided. */
-#define JAI_MAX_SEARCH_REPORTED 8
 
 /* ------------------------------------------------------------------ */
 /* Run options                                                          */
@@ -44,8 +85,13 @@ CodegenOptions jaiCodegenDefaults(void) {
 static JaiRunOptions sOptions;
 static bool          sOptionsSet;
 
-/* True while the self-hosted front end is itself being imported: compiling it
- * with itself would recurse, so the C front end handles this window instead. */
+/* True while the self-hosted front end is itself being imported.
+ *
+ * The front end is a set of Jaithon modules, so compiling them with the
+ * self-hosted front end would need the self-hosted front end: importing
+ * `jaithon.compile` under --front=jai recurses without this. Inside the window
+ * the C front end compiles whatever the compiler's own closure needs -- which
+ * is precisely the job the seed takes over once C is gone. */
 static bool          sLoadingFrontEnd;
 /* Set once the front end has been pulled in; see loadModuleBody. */
 static bool          sFrontEndWarmed;
@@ -57,8 +103,9 @@ JaiRunOptions jaiRunDefaults(void) {
     o.codegen    = jaiCodegenDefaults();
     o.useCache   = true;
     o.writeCache = true;
-    /* The self-hosted front end is the default; `--front=c` stays so a
-     * regression is bisectable rather than only observable. */
+    /* The self-hosted front end is the default. `--front=c` stays while the C
+     * front end exists, so a regression is bisectable rather than only
+     * observable. */
     o.selfHosted = true;
     o.checkOnly  = false;
     o.verbose    = false;
@@ -82,12 +129,10 @@ static void setOptions(const JaiRunOptions *opts) {
 /* Failure reporting                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Messages stay short on purpose: jaiThrow renders into 512 bytes; the long
- * payload (the searched directory list) is elided by the caller, not here. */
-static bool importFailure(JaiDiagCode code, ObjClass *klass, const char *fmt, ...)
-    JAI_PRINTF(3, 4);
-
-static bool importFailure(JaiDiagCode code, ObjClass *klass, const char *fmt, ...) {
+/* Messages stay short on purpose: jaiThrow renders into 512 bytes, and the one
+ * long payload an import failure has (the searched directory list) is elided
+ * explicitly by the caller rather than truncated here. */
+bool importFailure(JaiDiagCode code, ObjClass *klass, const char *fmt, ...) {
     char message[512];
     va_list ap;
     va_start(ap, fmt);
@@ -104,374 +149,29 @@ static bool importFailure(JaiDiagCode code, ObjClass *klass, const char *fmt, ..
 }
 
 /* ------------------------------------------------------------------ */
-/* Search path                                                          */
-/* ------------------------------------------------------------------ */
-
-typedef JAI_VEC(char *) DirList;
-
-/* sUserDirs (JAITHON_PATH + jaiModulePathAdd) and sLibDirs (the installed
- * library) hold C strings, not ObjStrings, so the path works before the VM exists. */
-static DirList sUserDirs;
-static DirList sLibDirs;
-static bool    sPathReady;
-
-static bool dirListHas(const DirList *list, const char *dir) {
-    for (int i = 0; i < list->count; i++) {
-        if (strcmp(list->data[i], dir) == 0) return true;
-    }
-    return false;
-}
-
-static void dirListAdd(DirList *list, const char *dir) {
-    if (dir == NULL || dir[0] == '\0') return;
-
-    /* Absolute form where possible: it makes the duplicate check meaningful
-     * and keeps `..` out of the directory list an error message prints. */
-    char absolute[JAI_MAX_PATH];
-    const char *entry = jaiPathAbsolute(absolute, sizeof absolute, dir)
-                            ? absolute
-                            : dir;
-    if (dirListHas(list, entry)) return;
-
-    char *copy = jaiStrdup(entry);
-    if (copy == NULL) return;
-    JAI_VEC_PUSH(char *, list, copy);
-}
-
-static void dirListClear(DirList *list) {
-    for (int i = 0; i < list->count; i++) {
-        char *s = list->data[i];
-        if (s != NULL) (void)jaiRealloc(s, strlen(s) + 1, 0);
-    }
-    list->count = 0;
-}
-
-/* vm.modulePath is a mirror: nothing resolves through it, so it is rebuilt
- * wholesale whenever the path changes. */
-static void syncModulePathMirror(void) {
-    if (vm.gc == NULL) return;   /* before jaiVMInit there is nothing to intern */
-
-    vm.modulePath.count = 0;
-    for (int i = 0; i < sUserDirs.count; i++) {
-        JAI_VEC_PUSH(ObjString *, &vm.modulePath,
-                     jaiStringInternC(sUserDirs.data[i]));
-    }
-    for (int i = 0; i < sLibDirs.count; i++) {
-        JAI_VEC_PUSH(ObjString *, &vm.modulePath,
-                     jaiStringInternC(sLibDirs.data[i]));
-    }
-}
-
-static void addLibDir(const char *dir) {
-    if (dir == NULL || dir[0] == '\0' || !jaiPathIsDir(dir)) return;
-    dirListAdd(&sLibDirs, dir);
-}
-
-static void addLibDirRelative(const char *base, const char *suffix) {
-    char candidate[JAI_MAX_PATH];
-    jaiPathJoin(candidate, sizeof candidate, base, suffix);
-    addLibDir(candidate);
-}
-
-void jaiModulePathInit(const char *execDir) {
-    /* Idempotent: the derived library directories are recomputed and anything
-     * added by hand in the meantime is kept. */
-    dirListClear(&sLibDirs);
-    sPathReady = true;
-
-    const char *env = getenv("JAITHON_PATH");
-    if (env != NULL) {
-        const char *p = env;
-        for (;;) {
-            const char *sep = strchr(p, ':');
-            size_t n = sep != NULL ? (size_t)(sep - p) : strlen(p);
-            if (n > 0 && n < JAI_MAX_PATH) {
-                char entry[JAI_MAX_PATH];
-                memcpy(entry, p, n);
-                entry[n] = '\0';
-                dirListAdd(&sUserDirs, entry);
-            }
-            if (sep == NULL) break;
-            p = sep + 1;
-        }
-    }
-
-    /* `make install` puts lib in <prefix>/share/jaithon/lib; a build tree has
-     * ./lib next to the binary. Both are derived from the binary's own path. */
-    char derived[JAI_MAX_PATH];
-    if (execDir == NULL || execDir[0] == '\0') {
-        const char *exe = jaiExecutablePath();
-        if (exe != NULL && exe[0] != '\0') {
-            jaiPathDirname(derived, sizeof derived, exe);
-            execDir = derived;
-        }
-    }
-    if (execDir != NULL && execDir[0] != '\0') {
-        addLibDirRelative(execDir, "lib");
-        addLibDirRelative(execDir, "../lib");
-        addLibDirRelative(execDir, "../share/jaithon/lib");
-        addLibDirRelative(execDir, "../share/jaithon");
-    }
-
-    /* JAITHON_NO_DEFAULT_PATH exists so a test can't quietly pass by falling
-     * back to an already-installed copy of the library. */
-    if (getenv("JAITHON_NO_DEFAULT_PATH") == NULL) {
-        addLibDir("/usr/local/share/jaithon/lib");
-        addLibDir("/usr/local/share/jaithon");
-        addLibDir("/opt/homebrew/share/jaithon/lib");
-        addLibDir("/opt/homebrew/share/jaithon");
-    }
-
-    syncModulePathMirror();
-}
-
-void jaiModulePathAdd(const char *dir) {
-    if (dir == NULL || dir[0] == '\0') return;
-    dirListAdd(&sUserDirs, dir);
-    syncModulePathMirror();
-}
-
-static void ensurePathReady(void) {
-    if (!sPathReady) jaiModulePathInit(NULL);
-}
-
-/* ------------------------------------------------------------------ */
-/* Dotted name -> file                                                  */
-/* ------------------------------------------------------------------ */
-
-/* Path components come from source text and must not escape a search
- * directory; non-ASCII is let through (spec §2.1), separators and `..` are not. */
-static bool isNameByte(char c) {
-    unsigned char u = (unsigned char)c;
-    if (u >= 0x80) return true;
-    return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
-           (u >= '0' && u <= '9') || u == '_';
-}
-
-static bool splitModuleName(const char *dotted, int *outDots, char *relative,
-                            size_t relSize) {
-    *outDots = 0;
-    if (relSize > 0) relative[0] = '\0';
-
-    if (dotted == NULL || dotted[0] == '\0') {
-        return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                             "empty module path");
-    }
-
-    const char *p = dotted;
-    while (*p == '.') { (*outDots)++; p++; }
-    if (*p == '\0') {
-        return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                             "module path '%s' names no module", dotted);
-    }
-
-    size_t pos = 0;
-    while (*p != '\0') {
-        size_t start = pos;
-        while (*p != '\0' && *p != '.') {
-            if (!isNameByte(*p)) {
-                return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                                     "module path '%s' is not a dotted name",
-                                     dotted);
-            }
-            if (pos + 1 >= relSize) {
-                return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                                     "module path '%s' is too long", dotted);
-            }
-            relative[pos++] = *p++;
-        }
-        if (pos == start) {
-            /* An empty component: "a..b", or a trailing dot. */
-            return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                                 "module path '%s' has an empty component",
-                                 dotted);
-        }
-        if (*p == '.') {
-            p++;
-            if (pos + 1 >= relSize) {
-                return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                                     "module path '%s' is too long", dotted);
-            }
-            relative[pos++] = '/';
-        }
-    }
-    relative[pos] = '\0';
-    return true;
-}
-
-/* The name a module is known by. Leading dots are an instruction to the
- * resolver, not part of the identity: `.util` is the module `util`. */
-static const char *displayName(const char *dotted) {
-    const char *p = dotted;
-    while (*p == '.') p++;
-    return *p != '\0' ? p : dotted;
-}
-
-static bool isRegularFile(const char *path) {
-    return path[0] != '\0' && jaiPathExists(path) && !jaiPathIsDir(path);
-}
-
-/* Absolute, symlink-resolved form of `candidate`, so that two spellings of the
- * same file share one entry in vm.modules. */
-static bool storeResolved(char *out, size_t outSize, const char *candidate) {
-    if (jaiPathAbsolute(out, outSize, candidate)) return true;
-    size_t len = strlen(candidate);
-    if (len + 1 > outSize) {
-        out[0] = '\0';
-        return false;
-    }
-    memcpy(out, candidate, len + 1);
-    return true;
-}
-
-static bool tryDirectory(const char *dir, const char *relative, char *out,
-                         size_t outSize) {
-    char leaf[JAI_MAX_PATH];
-    char candidate[JAI_MAX_PATH];
-
-    int n = snprintf(leaf, sizeof leaf, "%s%s", relative, JAI_MODULE_EXT);
-    if (n > 0 && (size_t)n < sizeof leaf) {
-        jaiPathJoin(candidate, sizeof candidate, dir, leaf);
-        if (isRegularFile(candidate)) return storeResolved(out, outSize, candidate);
-    }
-
-    n = snprintf(leaf, sizeof leaf, "%s/%s", relative, JAI_PACKAGE_FILE);
-    if (n > 0 && (size_t)n < sizeof leaf) {
-        jaiPathJoin(candidate, sizeof candidate, dir, leaf);
-        if (isRegularFile(candidate)) return storeResolved(out, outSize, candidate);
-    }
-    return false;
-}
-
-static void noteSearched(JaiBuf *searched, int *count, const char *dir) {
-    (*count)++;
-    if (*count > JAI_MAX_SEARCH_REPORTED) return;
-    if (searched->count > 0) jaiBufAppendStr(searched, ", ");
-    jaiBufAppendStr(searched, dir);
-}
-
-/* Base directory of a relative import: one dot is the importer's directory,
- * each further dot climbs one level. */
-static bool relativeBase(const char *fromDir, int dots, char *out,
-                         size_t outSize) {
-    const char *start = (fromDir != NULL && fromDir[0] != '\0') ? fromDir : ".";
-    if (!storeResolved(out, outSize, start)) return false;
-
-    for (int i = 1; i < dots; i++) {
-        char parent[JAI_MAX_PATH];
-        jaiPathDirname(parent, sizeof parent, out);
-        if (parent[0] == '\0' || strcmp(parent, out) == 0) return false;
-        if (!storeResolved(out, outSize, parent)) return false;
-    }
-    return true;
-}
-
-bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
-                          char *out, size_t outSize) {
-    if (out == NULL || outSize == 0) return false;
-    out[0] = '\0';
-    ensurePathReady();
-
-    int dots = 0;
-    char relative[JAI_MAX_PATH];
-    if (!splitModuleName(dottedName, &dots, relative, sizeof relative)) return false;
-
-    JaiBuf searched;
-    jaiBufInit(&searched);
-    int searchedCount = 0;
-    bool found = false;
-
-    if (dots > 0) {
-        char base[JAI_MAX_PATH];
-        if (!relativeBase(fromDir, dots, base, sizeof base)) {
-            jaiBufFree(&searched);
-            return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                                 "relative import '%s' climbs past the root",
-                                 dottedName);
-        }
-        found = tryDirectory(base, relative, out, outSize);
-        if (!found) noteSearched(&searched, &searchedCount, base);
-    } else {
-        if (fromDir != NULL && fromDir[0] != '\0') {
-            found = tryDirectory(fromDir, relative, out, outSize);
-            if (!found) noteSearched(&searched, &searchedCount, fromDir);
-        }
-        for (int i = 0; !found && i < sUserDirs.count; i++) {
-            found = tryDirectory(sUserDirs.data[i], relative, out, outSize);
-            if (!found) noteSearched(&searched, &searchedCount, sUserDirs.data[i]);
-        }
-        for (int i = 0; !found && i < sLibDirs.count; i++) {
-            found = tryDirectory(sLibDirs.data[i], relative, out, outSize);
-            if (!found) noteSearched(&searched, &searchedCount, sLibDirs.data[i]);
-        }
-    }
-
-    if (found && out[0] != '\0') {
-        jaiBufFree(&searched);
-        return true;
-    }
-    if (found) {
-        /* The file exists but its path does not fit in the caller's buffer. */
-        jaiBufFree(&searched);
-        return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
-                             "path of module '%s' is too long", dottedName);
-    }
-
-    if (searchedCount > JAI_MAX_SEARCH_REPORTED) {
-        jaiBufPrintf(&searched, " and %d more",
-                     searchedCount - JAI_MAX_SEARCH_REPORTED);
-    }
-    jaiBufPush(&searched, '\0');
-    const char *dirs = (searchedCount > 0 && searched.data != NULL)
-                           ? (const char *)searched.data
-                           : "no directories";
-
-    if (vm.frameCount > 0) {
-        (void)jaiThrow(vm.cImportError, "%s: cannot find module '%s'; searched %s",
-                       jaiDiagCodeString(E0800_MODULE_NOT_FOUND), dottedName, dirs);
-    } else {
-        JaiDiag *d = jaiDiagError(E0800_MODULE_NOT_FOUND, JAI_SPAN_NONE,
-                                  "cannot find module `%s`", dottedName);
-        jaiDiagAddNote(d, "searched %s", dirs);
-        if (sLibDirs.count == 0) {
-            jaiDiagAddHelp(d, "no installed library was found; set JAITHON_PATH "
-                              "to the directory holding `std`");
-        }
-    }
-    jaiBufFree(&searched);
-    return false;
-}
-
-/* Speculative variant: jaiResolveModulePath always reports a miss, but here a
- * "no" is a valid answer, so diagnostics/exception state is saved and restored. */
-bool jaiResolveModulePathQuiet(const char *dottedName, const char *fromDir,
-                               char *out, size_t outSize) {
-    JaiDiagBag live = gDiags;
-    jaiDiagInit(&gDiags);
-    bool hadException = vm.hasException;
-
-    bool found = jaiResolveModulePath(dottedName, fromDir, out, outSize);
-
-    jaiDiagFree(&gDiags);
-    gDiags = live;
-    if (!hadException && vm.hasException) jaiClearException();
-    return found;
-}
-
-/* ------------------------------------------------------------------ */
 /* Front end                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Registers a source buffer with the diagnostic engine, which takes ownership.
- * The copy must be exact -- an embedded NUL must not shorten it (jaiMemdup). */
+/* Register a source buffer with the diagnostic engine, which takes ownership
+ * of it. The copy is exact — an embedded NUL must not shorten it, or the
+ * registry believes it owns more bytes than it does. That is what jaiMemdup is
+ * for, and this predates it. */
 static int registerSource(const char *path, const char *source, size_t length) {
     return jaiSourceAdd(path, jaiMemdup(source, length), length);
 }
 
 /* Compile a source string into a module body.
  *
- * A *fragment* is text compiled into a module that already exists; it defers
- * unresolved names instead of reporting E0200, unlike a fresh CLI module. */
+ * `__prim__.eval`, `exec` and `compile` reach this, and so does the CLI. It ran
+ * the C front end until that front end was deleted; it now asks the self-hosted
+ * one, which is the compiler every other path already used.
+ *
+ * A *fragment* is text compiled into a module that already exists -- one that
+ * finished loading, or the very module whose body is on the frame stack right
+ * now. A name that module's body defined at run time lives in no symbol table
+ * this compilation can see, so a fragment defers it rather than reporting
+ * E0200. A fresh module handed over by the CLI is neither, and keeps the strict
+ * rule. */
 ObjFunction *jaiCompileSource(const char *source, size_t length,
                               const char *path, ObjModule *module,
                               const CodegenOptions *opts) {
@@ -507,72 +207,41 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
 /* Cache handshake                                                      */
 /* ------------------------------------------------------------------ */
 
-/* JAIC_FLAG_SELFHOSTED records who produced the image, not whether --front=jai
- * was passed -- imports still compile via C even in that mode. */
-/* `make reseed` sets this. The seed must not serve its own replacement's
- * compile, or nothing new lands in __jaicache__ and the seed stops advancing. */
-/* JAITHON_TRACE_LOAD=1 reports where each module body came from: the seed can
- * serve a compiler whose source moved, silently invalidating measurements. */
-static bool traceLoads(void) {
-    const char *flag = getenv("JAITHON_TRACE_LOAD");
-    return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
-}
-
-
-static bool seedDisabled(void) {
-    const char *flag = getenv("JAITHON_NO_SEED");
-    return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
-}
-
+/* `selfHosted` is who actually compiled this image, NOT whether --front=jai was
+ * passed. Only the entry file goes through the self-hosted front end today;
+ * every import is compiled by C (loadModuleBody). Deriving the flag from the
+ * option instead of the producer stamped those C-compiled imports as
+ * self-hosted, which is exactly the cross-contamination the flag exists to
+ * prevent. */
 /* Whether THIS compilation goes through the self-hosted front end. */
 static bool selfHosting(void) {
     return sOptions.selfHosted && !sLoadingFrontEnd;
 }
 
-static uint32_t cacheFlagsFor(const CodegenOptions *opts, bool selfHosted) {
-    uint32_t flags = 0;
-    if (opts->debugInfo) flags |= JAIC_FLAG_DEBUG;
-    if (opts->stripAsserts) flags |= JAIC_FLAG_RELEASE;
-    if (selfHosted) flags |= JAIC_FLAG_SELFHOSTED;
-
-    int level = opts->optLevel;
-    if (level < 0) level = 0;
-    if (level > 3) level = 3;
-    flags |= ((uint32_t)level << JAIC_FLAG_OPT_SHIFT) & JAIC_FLAG_OPT_MASK;
-    return flags;
-}
-
-/* Probes the .jaic header (magic, u16 version, u16 flags; spec/BYTECODE.md §7)
- * so a debug-built cache can't be silently loaded into a --release run. */
-static bool cacheFlagsMatch(const char *sourcePath, uint32_t flags) {
-    char path[JAI_MAX_PATH];
-    jaiCachePathFor(sourcePath, path, sizeof path);
-    if (path[0] == '\0') return false;
-
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) return false;
-    uint8_t head[8];
-    bool complete = fread(head, 1, sizeof head, f) == sizeof head;
-    fclose(f);
-    if (!complete) return false;
-
-    if (memcmp(head, JAIC_MAGIC, 4) != 0) return false;
-    uint16_t version = (uint16_t)((uint16_t)head[4] | (uint16_t)(head[5] << 8));
-    uint16_t stored  = (uint16_t)((uint16_t)head[6] | (uint16_t)(head[7] << 8));
-
-    /* JAIC_FLAG_SELFHOSTED (who produced the image) is excluded from this
-     * comparison -- including it caused spurious cache misses during bootstrap. */
-    const uint16_t kLoadability = (uint16_t)~(uint16_t)JAIC_FLAG_SELFHOSTED;
-    return version == JAIC_VERSION &&
-           (stored & kLoadability) == ((uint16_t)flags & kLoadability);
-}
-
-/* Reads `path`, then deserialises its cache or compiles it. The source is
- * registered first: a cache hit still needs the text for tracebacks. */
+/* Read `path`, then either deserialise its cache or compile it. The source is
+ * registered before the cache is consulted because a cache-loaded chunk carries
+ * byte offsets into it: without the registration a traceback through a cached
+ * module would have no text to quote. */
 #define JAI_SELF_HOSTED_MODULE "jaithon.compile"
 
-/* Pulls in the whole front end once. Must run before the triggering module is
- * marked MOD_LOADING (see maybeWarmFor), or warming mid-import falsely cycles. */
+/* Pull the whole front end in, once, before any compile begins.
+ *
+ * This used to run at the top of every module load, so `jaithon run` on a
+ * fully cached program still deserialised 35 compiler modules out of the seed
+ * in order to compile nothing: 12ms of the 18ms an empty program cost.
+ *
+ * Warming it at the first compile instead is wrong in a way that only shows up
+ * when the entry file is cached and something it imports is not. The compiler
+ * imports std.math, std.str and std.json, so warming while one of those is
+ * itself mid-load finds it MOD_LOADING and reports a cycle -- the front end
+ * then fails, the failure is swallowed, and the import that triggered it dies
+ * with "module 'std.math' failed to load". A cold run passes, because there
+ * the entry misses first and the warm happens with nothing on the import
+ * stack.
+ *
+ * So the warm happens at the first module that is going to need compiling,
+ * BEFORE that module is published as MOD_LOADING -- see maybeWarmFor. Then
+ * the compiler's own imports find std.math untouched and load it normally. */
 static void warmFrontEnd(void) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return;
     sFrontEndWarmed = true;
@@ -582,15 +251,36 @@ static void warmFrontEnd(void) {
     jaiClearException();
 }
 
-/* Warms on either a cache miss (safe to warm early; a missed warm cycles, see
- * above) or a lib/jaithon module (else the seed can mix two compiler generations). */
-static bool cacheFlagsMatch(const char *sourcePath, uint32_t flags);
-
+/* Warm the front end if loading `path` is about to need it.
+ *
+ * Two reasons to warm, and both are necessary.
+ *
+ * A cache miss means this module has to be compiled, so the compiler has to be
+ * here. The probe reads the cache entry's 8-byte header, not the module: a hit
+ * only means the flags are loadable, and the source hash can still reject it
+ * further in. That asymmetry is the safe direction -- a stale cache warms the
+ * compiler slightly early, where a missed warm is the cycle above.
+ *
+ * A module under lib/jaithon is one of the front end's own, and those must
+ * never be loaded through the ordinary door first. `jaithon fmt` imports
+ * jaithon.ast directly, so without this it got ast.jai from the cache and then
+ * the warm got compile/mod.jai from the seed -- two generations of the
+ * compiler in one process, which failed importing std.json. Warming here makes
+ * the whole front end arrive as one set, from one source, and the caller's
+ * re-check then finds the module already loaded.
+ *
+ * The test is the directory, not seed membership: the seed also carries
+ * std.math, std.str and std.json, which the compiler imports but user code
+ * owns just as much. Warming for those put the 12ms straight back, because
+ * std.core is among them and every program loads it. */
 static bool maybeWarmFor(const char *path) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return false;
 
-    /* Matches the seed's library-relative path ("jaithon/ast.jai") rather than
-     * the absolute path, which would match the whole repo (also named jaithon). */
+    /* The seed keys on the library-relative path ("jaithon/ast.jai"), which is
+     * the only reliable way to ask this question. Matching "/jaithon/" against
+     * the absolute path instead matched every file in the tree, because the
+     * repository directory is itself called jaithon -- so everything warmed
+     * and the 12ms came straight back. */
     const JaiSeedEntry *seeded = seedDisabled() ? NULL : jaiSeedFind(path);
     bool ownedByFrontEnd = seeded != NULL &&
                            strncmp(seeded->module, "jaithon/", 8) == 0;
@@ -658,15 +348,25 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
         body = jaiSelfHostedCompileInto(file->source, length, path, module,
                                         hash, opts->codegen.optLevel);
         if (body == NULL) return NULL;
-        /* Self-hosted bodies are named from the file stem (`b`, not `sub.b`);
-         * a cached body with that name can't resolve its own imports later. */
+        /* The self-hosted front end is handed a path, not a module name, so it
+         * names the module body from the file's stem: `b` where the C front end
+         * uses the registered name `sub.b`. Only the importer knows the
+         * qualified name, so it is applied here.
+         *
+         * This is not cosmetic. The name is serialised into the cache entry,
+         * and a cached module whose name has lost its package cannot resolve
+         * its own imports when loaded back -- a warm run failed where a cold
+         * one passed. The differential oracle could not see it either: it
+         * compared arity, flags, frame size, code and constants, but never the
+         * function's name. */
         if (module->name != NULL) {
             body->name = module->name;
             body->qualifiedName = module->name;
         }
     } else {
-        /* Unreachable: the branch above is the only front end that remains;
-         * nothing makes selfHosting() false outside the bootstrap window. */
+        /* One front end remains and the branch above is the one that runs it.
+         * Reaching here would mean `selfHosting()` said no outside the
+         * bootstrap window, which nothing does. */
         JAI_PANIC("no front end for `%s`", path);
     }
 
@@ -751,8 +451,13 @@ static void forgetModule(ObjString *pathKey) {
     (void)jaiTableDelete(&vm.modules, OBJ_VAL(pathKey));
 }
 
-/* jaiVMRunModule resets the interpreter stack -- fine for the entry module,
- * but it would discard a live import's frame, so a running VM calls instead. */
+/* Run a module body.
+ *
+ * jaiVMRunModule resets the interpreter stack, which is right for the entry
+ * module and fatal for an import: OP_IMPORT runs inside a live frame whose
+ * slots would be discarded. While the machine is running the body is therefore
+ * invoked as an ordinary call, which is reentrant. Either way the closure
+ * carries the module, so the body's frame gets the right global scope. */
 static bool runModuleBody(ObjModule *module, ObjFunction *body) {
     if (vm.frameCount == 0) {
         return jaiVMRunModule(module, body) == JAI_RUN_OK;
@@ -813,14 +518,24 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
         return NULL;
     }
 
-    /* Runs before createModule (else the compiler's own import of this module
-     * looks like a cycle); pathKey is rooted because warming can GC it away. */
+    /* Before createModule: publishing this module as MOD_LOADING first would
+     * make the compiler's own import of it look like a cycle.
+     *
+     * Rooted, because warming loads the whole compiler and every allocation in
+     * it can collect. `pathKey` is interned but nothing else refers to it yet,
+     * so without this it is freed underneath createModule -- a segfault that
+     * appears only when the entry file is cached and an import is not. */
     jaiPushRoot(OBJ_VAL(pathKey));
     bool warmed = maybeWarmFor(path);
     jaiPopRoot();
 
-    /* Warming can itself load this module, so re-check here -- otherwise a
-     * duplicate ObjModule is built (symptom: KeyError on NodeKind). */
+    /* The warm can load this very module: `jaithon fmt` imports the compiler
+     * as ordinary user code, so the import that triggered the warm is often
+     * one the warm itself satisfies. The lookup above ran before it, so
+     * without re-checking here a second ObjModule is built for a path that
+     * already has one -- two copies of ast.jai, two NodeKind enums, and a dict
+     * built under one that cannot be read with the other. That surfaced as
+     * `KeyError: key <NodeKind> not found` from the formatter. */
     if (warmed &&
         jaiTableGetInterned(&vm.modules, pathKey, &existing) &&
         IS_MODULE(existing) && AS_MODULE(existing)->state == MOD_LOADED) {
@@ -886,8 +601,11 @@ bool jaiLoadPrelude(void) {
 
     ObjModule *prelude = jaiImportModule("std.prelude", NULL);
     if (prelude == NULL) {
-        /* A tree without lib/std still works (prelude only re-exports optional
-         * names); the error is printed then dropped, not left pending. */
+        /* A tree without lib/std is still usable: the prelude only re-exports
+         * names a program may never mention. Whatever went wrong is printed
+         * here — including the list of directories searched — and then dropped,
+         * because leaving an error in the bag or an exception pending would
+         * abort the next compile for a reason it had nothing to do with. */
         jaiClearException();
         (void)jaiDiagFlush(&gDiags, stderr);
         fprintf(stderr, "jaithon: warning: could not load std.prelude; the "
@@ -895,8 +613,10 @@ bool jaiLoadPrelude(void) {
         return false;
     }
 
-    /* The prelude's export table (spec §9) is exactly the implicit global
-     * scope; jaiDefineGlobal also registers each name so E0200 doesn't fire. */
+    /* The prelude is a list of re-exports (spec §9), so its export table is the
+     * exact set of names that belong in the implicit global scope. Going
+     * through jaiDefineGlobal also registers each with the resolver, which is
+     * what stops the front end reporting E0200 for them. */
     int slot = 0;
     Value key, unused;
     while (jaiTableNext(&prelude->exports, &slot, &key, &unused)) {
@@ -918,8 +638,9 @@ bool jaiLoadPrelude(void) {
 /* Entry point                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Builds argv (script path first, per spec §8.4) into the global `__argv__`,
- * which `__prim__.os_argv` reads -- libc can't hand argv back portably. */
+/* The program's argument vector, first entry the script itself — the list spec
+ * §8.4 hands to main(). libc cannot hand argv back portably, so the builtin
+ * global `__argv__` is where `__prim__.os_argv` reads it from. */
 static ObjList *installArgv(const char *scriptPath, int argc, char **argv) {
     int extra = argc > 0 ? argc : 0;
     ObjList *list = jaiListNew(extra + 1);
@@ -1002,8 +723,17 @@ static void reportTiming(double load, double run, double total) {
 /* The self-hosted front end (--front=jai)                              */
 /* ------------------------------------------------------------------ */
 
-/* --front=jai hands over only the entry module (imports still load via the C
- * front end); nothing here silently falls back to C on failure. */
+/* lib/jaithon/compile is itself a Jaithon program, so reaching it means running the
+ * VM: the C front end compiles `jaithon.compile`, and `jaithon.compile` then compiles
+ * the user's file. Stage 0 is always C; there is nothing else to bootstrap
+ * from. Only the entry module is handed over — whatever it imports is loaded by
+ * the ordinary importer, which is the C front end. That is a real limit of
+ * `--front=jai` and it is documented here rather than hidden, but it is not a
+ * lie: the file the user named really was compiled by the self-hosted compiler.
+ *
+ * Every failure below names what failed. Nothing here falls back to the C front
+ * end: a compiler that quietly substitutes a different compiler is worse than
+ * one that refuses, because the output looks like a passing test. */
 
 #define JAI_SELF_HOSTED_ENTRY  "compile_source"
 
@@ -1069,9 +799,22 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
         return NULL;
     }
 
-    /* Rooted: interning the second value can collect the first. optLevel and
-     * fileId aren't placeholders -- a stale optLevel once silently ignored
-     * -O0, and fileId=0 broke every span's line number in tracebacks. */
+    /* Two live objects before the call, so both are rooted: the second
+     * jaiStringInternC can collect the first.
+     *
+     * The trailing three are `compile_source`'s defaulted parameters
+     * (release, fileId, optLevel). Only the last carries information, and it
+     * has to: a bridge that always took the default compiled at -O2 whatever
+     * the caller asked for, so `-O0` was accepted and ignored.
+     *
+     * `fileId` carries information too. It was a hardcoded zero on the
+     * reasoning that nothing read it; something does. Every span the
+     * self-hosted front end emits records it, the line table is made of spans,
+     * and a disassembler resolves a span back to a line through the source
+     * registered under that id. With zero, a `--front=jai` build disassembled
+     * with no line numbers and its tracebacks could not name a line. Every
+     * caller therefore has to have registered its source and set
+     * `module->sourceFileId` first. */
     Value args[5];
     args[0] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[0]);
@@ -1098,16 +841,19 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
     jaiPushRoot(produced);
     ObjBytes *image = NULL;
 
-    /* Accepts both a plain `bytes` (the shape compile_source is expected to
-     * settle on) and today's `Compiled` record, so the module can evolve
-     * without a silent fallback to C. */
+    /* A plain `bytes` is the shape the driver would rather have and the shape
+     * `compile_source` is expected to settle on; the `Compiled` record is what
+     * lib/jaithon/compile returns today. Both are understood so that the module can
+     * change without the driver going silently back to the C front end. */
     Value field;
     if (IS_BYTES(produced)) {
         image = AS_BYTES(produced);
     } else if (instanceField(produced, "image", &field) && IS_LIST(field)) {
         if (AS_LIST(field)->count == 0) {
-            /* The front end's own diagnostics (flushed like C's) say why; E0902
-             * fires only if it produced neither an image nor a reason. */
+            /* The front end's own diagnostics say why, in the bag the driver
+             * flushes, rendered the same way the C's are. E0902 is only for
+             * the case where it produced neither an image nor a reason, which
+             * is a bug in the front end rather than in the file. */
             if (!jaiFrontEndTransferDiagnostics(produced)) {
                 (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
                                    "%s: the self-hosted front end emitted "
@@ -1126,72 +872,6 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
 
     jaiPopRoots(2);   /* produced, compiler */
     return image;
-}
-
-static uint16_t readLE16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8));
-}
-
-static uint32_t readLE32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
-static uint64_t readLE64(const uint8_t *p) {
-    return (uint64_t)readLE32(p) | ((uint64_t)readLE32(p + 4) << 32);
-}
-
-/* jaiDeserializeModule only answers yes/no (a cache miss just means recompile),
- * so this re-reads the fixed header to name which field actually mismatched. */
-static const char *jaicRejectionReason(const uint8_t *data, size_t size,
-                                       uint64_t expectedHash, char *buf,
-                                       size_t bufSize) {
-    if (size < 32) {
-        snprintf(buf, bufSize,
-                 "the image is %zu bytes, too short to hold a header", size);
-        return buf;
-    }
-    if (memcmp(data, JAIC_MAGIC, 4) != 0) {
-        return "it does not begin with the four magic bytes `JAIC`";
-    }
-    uint32_t crc = jaiCrc32(data, size - 4);
-    uint32_t stored = readLE32(data + size - 4);
-    if (crc != stored) {
-        snprintf(buf, bufSize,
-                 "the trailing CRC32 is 0x%08x but the bytes hash to 0x%08x",
-                 stored, crc);
-        return buf;
-    }
-    uint16_t version = readLE16(data + 4);
-    if (version != (uint16_t)JAIC_VERSION) {
-        snprintf(buf, bufSize,
-                 "it declares container version %u and this build reads "
-                 "version %d (`VERSION` in lib/jaithon/compile/jaic.jai)",
-                 (unsigned)version, JAIC_VERSION);
-        return buf;
-    }
-    uint32_t compiler = readLE32(data + 8);
-    if (compiler != JAI_COMPILER_VERSION) {
-        snprintf(buf, bufSize,
-                 "it declares compiler version %u and this build is %u "
-                 "(`COMPILER_VERSION` in lib/jaithon/compile/jaic.jai)",
-                 (unsigned)compiler, (unsigned)JAI_COMPILER_VERSION);
-        return buf;
-    }
-    uint32_t buildId = readLE32(data + 12);
-    if (buildId != jaiBuildId()) {
-        snprintf(buf, bufSize,
-                 "it declares build id 0x%08x and this binary is 0x%08x "
-                 "(`build_id()` in lib/jaithon/compile/jaic.jai, which reads "
-                 "`__prim__.jaic_build_id()`)",
-                 (unsigned)buildId, (unsigned)jaiBuildId());
-        return buf;
-    }
-    uint64_t hash = readLE64(data + 16);
-    if (hash != expectedHash) {
-        return "the source hash it records is not the hash of this file";
-    }
-    return "the header is well formed, so it is the body the reader rejected";
 }
 
 ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
@@ -1222,9 +902,19 @@ ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
     return body;
 }
 
-/* --front=jai counterpart of loadModuleBody: same contract, but compiles via
- * lib/jaithon/compile. JAIC_FLAG_SELFHOSTED lets either front end's cache
- * entries coexist without cross-compiler mix-ups. */
+/* The --front=jai counterpart of loadModuleBody: same source registration, same
+ * contract (a body, or NULL with the reason in gDiags), but the bytecode
+ * arrives as a .jaic image from lib/jaithon/compile.
+ *
+ * The cache is consulted and written, exactly as loadModuleBody does. It used
+ * not to be, because a __jaicache__ entry recorded no front end and one
+ * compiler reading the other's would be the mix-up this flag exists to expose.
+ * JAIC_FLAG_SELFHOSTED now records the producer, so an entry written by the
+ * other front end is an ordinary cache miss rather than a hazard.
+ *
+ * This is what makes the warm path measurable at all: a warm run deserialises a
+ * .jaic and never reaches a front end, so it costs the same whichever compiler
+ * filled the cache -- but only if the self-hosted path is allowed to fill it. */
 static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
     size_t length = 0;
     char *text = jaiReadFile(path, &length);
@@ -1357,9 +1047,15 @@ static void fileStem(char *out, size_t outSize, const char *path) {
     }
 }
 
-/* fileStem, with `__main__` as fallback for an empty stem. A second copy
- * lives in `module_name_for` (lib/jaithon/compile/mod.jai) and must agree
- * with this one, or a cached module can't resolve its own imports. */
+/* The module name a *path* carries: `fileStem` plus the fallback an import
+ * chain does not want -- a path with nothing left after the extension is
+ * stripped names the main module, not the empty module.
+ *
+ * Shared rather than static because the CLI and the self-hosted bridge need the
+ * same answer. A second copy lives in `module_name_for`
+ * (lib/jaithon/compile/mod.jai) and must agree with this one: the name is a
+ * constant in the record's pool, and a cached module whose name has lost its
+ * package cannot resolve its own imports. */
 void jaiModuleNameFor(const char *path, char *out, size_t outSize) {
     fileStem(out, outSize, path);
     if (out[0] == '\0') snprintf(out, outSize, "__main__");
@@ -1369,9 +1065,15 @@ void jaiModuleNameFor(const char *path, char *out, size_t outSize) {
 /* Import cycles                                                        */
 /* ------------------------------------------------------------------ */
 
-/* A cycle is a whole-program property, not a per-file one, so `check` asks
- * this (via `import_cycles` in lib/jaithon/compile/mod.jai) before the front
- * end -- otherwise every missing export in the cycle triggers its own E0200. */
+/* A module in a cycle compiles perfectly well on its own; it is the graph the
+ * files form together that is wrong, so this is a whole-program question and
+ * separate from compiling any one file. `check` asks it before the front end,
+ * because every name a module in the cycle should have exported is missing and
+ * the E0200 storm that follows is a consequence rather than a second problem.
+ *
+ * The C walked the graph itself, over trees the C parser built. The front end
+ * answers the same question -- `import_cycles` in lib/jaithon/compile/mod.jai --
+ * so the walk went with the parser that fed it. */
 static void checkImportCycles(const char *path, int fileId) {
     (void)fileId;
     Value arg = OBJ_VAL(jaiStringInternC(path));
@@ -1421,7 +1123,9 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     }
     int fileId = jaiSourceAdd(absolute, text, length);   /* takes ownership */
 
-    /* Runs before the front end so a cycle is reported once, not as an E0200 storm. */
+    /* Before the front end, so that a cycle is the first thing reported: every
+     * name a module in the cycle should have exported is missing, and the
+     * E0200 storm that follows is a consequence, not a second problem. */
     checkImportCycles(absolute, fileId);
 
     /* Checking needs a module for the resolver to hang globals off, but it must
@@ -1435,8 +1139,10 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     ObjString *pathStr = jaiStringIntern(absolute, strlen(absolute));
     jaiPushRoot(OBJ_VAL(pathStr));
     ObjModule *module = jaiModuleNew(nameStr, pathStr);
-    /* Stamped into every span the front end reports; without it, diagnostics
-     * render with no source line or caret (file 0). */
+    /* The self-hosted front end is handed this id and stamps it into every span
+     * it reports, so a diagnostic can be pointed back at the text. Without it
+     * the spans name file 0 and every diagnostic renders with no source line
+     * and no caret. */
     module->sourceFileId = fileId;
     jaiPushRoot(OBJ_VAL(module));
 
@@ -1461,146 +1167,4 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
         fprintf(stderr, "jaithon: %s is clean\n", entry);
     }
     return ok ? 0 : 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Module members                                                      */
-/* ------------------------------------------------------------------ */
-
-/* Reflective path only (dir(), or a C caller on the method tables) --
- * `mod.thing` resolves directly in the VM. An un-annotated module exposes
- * everything (spec §8.2). */
-
-static bool moduleExposes(ObjModule *m, ObjString *name, Value *out) {
-    /* Reflective: `name` came from the caller, and a module table is keyed by
-     * pointer. */
-    name = jaiStringCanonical(name);
-    if (!jaiModuleGet(m, name, out)) return false;
-    return m->exports.count == 0 || jaiModuleIsExported(m, name);
-}
-
-static bool requireModuleArg(Value v, const char *fnName, ObjModule **out) {
-    if (!IS_MODULE(v))
-        return jaiThrow(vm.cTypeError, "%s() expected a module, not %s", fnName,
-                        jaiTypeNameStatic(v));
-    *out = AS_MODULE(v);
-    return true;
-}
-
-static bool nModuleName(int argc, Value *args, Value *out) {
-    (void)argc;
-    ObjModule *m;
-    if (!requireModuleArg(args[0], "name", &m)) return false;
-    *out = m->name != NULL ? OBJ_VAL(m->name) : OBJ_VAL(jaiStringIntern("", 0));
-    return true;
-}
-
-static bool nModulePath(int argc, Value *args, Value *out) {
-    (void)argc;
-    ObjModule *m;
-    if (!requireModuleArg(args[0], "path", &m)) return false;
-    *out = m->path != NULL ? OBJ_VAL(m->path) : OBJ_VAL(jaiStringIntern("", 0));
-    return true;
-}
-
-static bool nModuleHas(int argc, Value *args, Value *out) {
-    (void)argc;
-    ObjModule *m;
-    ObjString *name;
-    if (!requireModuleArg(args[0], "has", &m)) return false;
-    if (!jaiArgString(args[1], 2, "has", &name)) return false;
-    Value ignored;
-    *out = BOOL_VAL(moduleExposes(m, name, &ignored));
-    return true;
-}
-
-/* get(name, default = null): the reflective read, so a missing name is a value
- * rather than an exception — a caller who wants the raise uses `mod.name`. */
-static bool nModuleGet(int argc, Value *args, Value *out) {
-    ObjModule *m;
-    ObjString *name;
-    if (!requireModuleArg(args[0], "get", &m)) return false;
-    if (!jaiArgString(args[1], 2, "get", &name)) return false;
-
-    if (moduleExposes(m, name, out)) return true;
-    *out = argc >= 3 ? args[2] : NULL_VAL;
-    return true;
-}
-
-static int compareNames(const void *a, const void *b) {
-    ObjString *left = *(ObjString *const *)a;
-    ObjString *right = *(ObjString *const *)b;
-    uint32_t shortest = left->length < right->length ? left->length : right->length;
-    int order = memcmp(left->chars, right->chars, shortest);
-    if (order != 0) return order;
-    return left->length < right->length ? -1
-         : left->length > right->length ? 1 : 0;
-}
-
-/* Sorted, because a hash table's order is an implementation detail and a
- * program that prints `members()` should not change output between runs. */
-static bool nModuleMembers(int argc, Value *args, Value *out) {
-    (void)argc;
-    ObjModule *m;
-    if (!requireModuleArg(args[0], "members", &m)) return false;
-
-    int slot = 0;
-    Value key, value;
-    int found = 0;
-    while (jaiTableNext(&m->globals, &slot, &key, &value)) {
-        if (IS_STRING(key) && moduleExposes(m, AS_STRING(key), &value)) found++;
-    }
-
-    ObjString **names = found > 0 ? JAI_ALLOC(ObjString *, found) : NULL;
-    int written = 0;
-    slot = 0;
-    while (jaiTableNext(&m->globals, &slot, &key, &value) && written < found) {
-        if (IS_STRING(key) && moduleExposes(m, AS_STRING(key), &value))
-            names[written++] = AS_STRING(key);
-    }
-    if (written > 1) qsort(names, (size_t)written, sizeof *names, compareNames);
-
-    ObjList *list = jaiListNew(written);
-    jaiPushRoot(OBJ_VAL(list));
-    for (int i = 0; i < written; i++) jaiListPush(list, OBJ_VAL(names[i]));
-    jaiPopRoot();
-    if (names != NULL) JAI_FREE_ARRAY(ObjString *, names, found);
-
-    *out = OBJ_VAL(list);
-    return true;
-}
-
-bool jaiModuleMethod(Value receiver, ObjString *name, Value *out) {
-    if (!IS_MODULE(receiver) || name == NULL) return false;
-    ObjModule *m = AS_MODULE(receiver);
-
-    /* A member the module exports outranks the introspection helpers: a module
-     * defining `get` means its own `get` everywhere it is named. */
-    if (moduleExposes(m, name, out)) return true;
-
-    const char *text = name->chars;
-
-/* Arities count the receiver, which the VM passes as args[0]. */
-#define MODULE_METHOD(label, fn, minArity, maxArity)                           \
-    if (strcmp(text, (label)) == 0) {                                          \
-        *out = jaiBindNative(receiver, (label), (fn), (minArity), (maxArity),  \
-                             NULL);                                            \
-        return true;                                                           \
-    }
-
-    MODULE_METHOD("get",     nModuleGet,     2, 3)
-    MODULE_METHOD("has",     nModuleHas,     2, 2)
-    MODULE_METHOD("members", nModuleMembers, 1, 1)
-    MODULE_METHOD("name",    nModuleName,    1, 1)
-    MODULE_METHOD("path",    nModulePath,    1, 1)
-
-#undef MODULE_METHOD
-
-    /* Present but private: this is E0802's wording (same as the VM and
-     * `from ... import`), not "no such member", so it doesn't read as a typo. */
-    Value hidden;
-    if (jaiModuleGet(m, name, &hidden))
-        return jaiThrow(vm.cImportError, "'%s' is not exported by module '%s'",
-                        name->chars, m->name != NULL ? m->name->chars : "?");
-    return false;
 }
