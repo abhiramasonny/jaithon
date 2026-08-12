@@ -1198,8 +1198,7 @@ bool jaiCacheStore(const char *sourcePath, ObjModule *module,
     return true;
 }
 
-ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
-                          uint64_t sourceHash) {
+uint8_t *jaiCacheRead(const char *sourcePath, size_t *outLength) {
     char path[JAI_MAX_PATH];
     jaiCachePathFor(sourcePath, path, sizeof path);
     if (path[0] == '\0') return NULL;
@@ -1208,9 +1207,25 @@ ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
     char *data = jaiReadFile(path, &length);
     if (data == NULL) return NULL;
 
-    ObjFunction *fn = jaiDeserializeModule((const uint8_t *)data, length, module,
-                                           sourceHash);
-    (void)jaiRealloc(data, length + 1, 0);   /* jaiReadFile allocates len + 1 */
+    *outLength = length;
+    return (uint8_t *)data;
+}
+
+void jaiCacheReadFree(uint8_t *data, size_t length) {
+    /* jaiReadFile allocates length + 1 for its terminator; freeing the wrong
+     * size corrupts the allocator's accounting, which is what decides when the
+     * collector runs. */
+    if (data != NULL) (void)jaiRealloc(data, length + 1, 0);
+}
+
+ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
+                          uint64_t sourceHash) {
+    size_t length = 0;
+    uint8_t *data = jaiCacheRead(sourcePath, &length);
+    if (data == NULL) return NULL;
+
+    ObjFunction *fn = jaiDeserializeModule(data, length, module, sourceHash);
+    jaiCacheReadFree(data, length);
     return fn;
 }
 

@@ -116,6 +116,20 @@ else
     done <<< "$verify_output"
 fi
 
+# A truncated or corrupt .jaic must be an ordinary cache miss, never a crash and
+# never a load failure. It reads and corrupts real cache files, so it runs here
+# rather than as a golden -- a golden only compares stdout.
+if [[ -x "$ROOT/tests/vm/cache_corrupt.sh" ]]; then
+    corrupt_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/cache_corrupt.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="cache_corrupt: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "cache_corrupt: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$corrupt_output"
+fi
+
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 

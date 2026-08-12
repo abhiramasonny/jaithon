@@ -79,6 +79,20 @@ bool cacheFlagsMatch(const char *sourcePath, uint32_t flags) {
     fclose(f);
     if (!complete) return false;
 
+    return jaiCacheFlagsMatchBuffer(head, sizeof head, flags);
+}
+
+/* The same decision against a buffer the caller has already read.
+ *
+ * A caller that goes on to load the module must use this rather than the path
+ * form above: opening the file a second time for eight bytes cost 18.49 us per
+ * module, which is more than reading the whole 116 KB image (16.92 us). The
+ * path form survives for maybeWarmFor, which asks the question and then does
+ * NOT load -- there is no second read to fold into. */
+bool jaiCacheFlagsMatchBuffer(const uint8_t *head, size_t length,
+                              uint32_t flags) {
+    if (head == NULL || length < 8) return false;
+
     if (memcmp(head, JAIC_MAGIC, 4) != 0) return false;
     uint16_t version = (uint16_t)((uint16_t)head[4] | (uint16_t)(head[5] << 8));
     uint16_t stored  = (uint16_t)((uint16_t)head[6] | (uint16_t)(head[7] << 8));
