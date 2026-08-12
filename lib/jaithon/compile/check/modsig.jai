@@ -12,6 +12,9 @@ pub const MODULE_EXT: str = ".jai"
 #: The file that stands in for a directory-shaped module: `std/gui/mod.jai`.
 pub const PACKAGE_FILE: str = "mod.jai"
 
+#: The marker file for a workspace package whose import root is `src`.
+pub const PROJECT_MANIFEST: str = "jaithon.package.json"
+
 #: How many re-exports `SigLoader.find` follows. `SIG_MAX_REEXPORT_DEPTH` in C.
 pub const MAX_REEXPORT_DEPTH: int = 8
 
@@ -259,6 +262,9 @@ pub fn default_search_path(exec_dir: str? = null) -> list[str] {
         for suffix in ["lib", "../lib", "../share/jaithon/lib", "../share/jaithon"] {
             _add_lib_dir(dirs, _join(exec_dir, suffix))
         }
+        for suffix in ["packages", "../packages", "../share/jaithon/packages"] {
+            _add_package_dirs(dirs, _join(exec_dir, suffix))
+        }
     }
     for fixed in [
         "/usr/local/share/jaithon/lib",
@@ -267,6 +273,9 @@ pub fn default_search_path(exec_dir: str? = null) -> list[str] {
         "/opt/homebrew/share/jaithon",
     ] {
         _add_lib_dir(dirs, fixed)
+    }
+    for fixed in ["/usr/local/share/jaithon/packages", "/opt/homebrew/share/jaithon/packages"] {
+        _add_package_dirs(dirs, fixed)
     }
     return dirs
 }
@@ -345,6 +354,17 @@ fn _add_dir(dirs: list[str], dir: str) -> void {
 fn _add_lib_dir(dirs: list[str], dir: str) -> void {
     if dir == "" or not _is_dir(dir) { return }
     _add_dir(dirs, dir)
+}
+
+fn _add_package_dirs(dirs: list[str], packages_dir: str) -> void {
+    if not _is_dir(packages_dir) { return }
+    for name in __prim__.io_listdir(packages_dir).sorted() {
+        if name.starts_with(".") { continue }
+        let package = _join(packages_dir, name)
+        let manifest = _join(package, PROJECT_MANIFEST)
+        let source = _join(package, "src")
+        if _is_regular_file(manifest) { _add_lib_dir(dirs, source) }
+    }
 }
 
 # `isNameByte`. Spec §2.1 allows non-ASCII identifiers, so 0x80 and up passes.

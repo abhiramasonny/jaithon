@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "name": "jaitensor",
+  "version": "0.1.0",
+  "description": "GPU tensor operations and neural-network training for Jaithon",
+  "source": "src",
+  "dependencies": {
+    "jaiplot": "^0.1.0"
+  }
+}

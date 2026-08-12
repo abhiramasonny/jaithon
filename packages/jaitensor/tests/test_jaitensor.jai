@@ -2,7 +2,7 @@
 import jaitensor as jt
 import std.os
 from jaitensor import Dataset
-from std.io import Path
+from std.io import Path, read_file
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
@@ -137,10 +137,24 @@ fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
     defer { data.free() }
     defer { model.free() }
+    let plot = Path(os.temp_dir()).join("jaithon-jaitensor-fit-test.svg")
+    defer { if plot.exists() { plot.remove() } }
     model.compile(jt.SGD(learning_rate: 0.4, momentum: 0.2))
-    let history = model.fit(data, epochs: 8, batch_size: 64, verbose: false, validation_data: data)
+    let history = model.fit(
+        data,
+        epochs: 8,
+        batch_size: 64,
+        verbose: false,
+        validation_data: data,
+        test_data: data,
+        plot_path: plot.to_str()
+    )
     assert_eq(history.accuracy.len(), 8)
     assert_eq(history.val_accuracy.len(), 8)
+    assert_true(history.test_accuracy is not null)
+    assert_true((history.test_accuracy ?? 0.0) >= 99.0)
+    assert_eq(history.plot_path, plot.to_str())
+    assert_true(plot.is_file())
     assert_true(history.accuracy[7] >= 99.0, f"accuracy was {history.accuracy[7]}")
     let probabilities = model.predict(data.features, batch_size: 31)
     defer { probabilities.free() }
@@ -164,7 +178,7 @@ fn test_adam_trains_sigmoid_and_tanh_layers() -> void {
         jt.Adam(learning_rate: 0.03),
         loss: jt.SparseCategoricalCrossentropy(from_logits: true)
     )
-    let history = model.fit(data, epochs: 10, batch_size: 64, verbose: false)
+    let history = model.fit(data, epochs: 10, batch_size: 64, verbose: false, plot_path: null)
     assert_true(history.accuracy[9] >= 99.0, f"Adam accuracy was {history.accuracy[9]}")
 }
 
@@ -195,4 +209,22 @@ fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _nesterov = assert_throws(ValueError, || jt.SGD(nesterov: true))
     let _beta = assert_throws(ValueError, || jt.Adam(beta1: 1.0))
     let _epsilon = assert_throws(ValueError, || jt.Adam(epsilon: 0.0))
+}
+
+fn test_history_plot_uses_the_jaiplot_package_dependency() -> void {
+    let history = jt.History()
+    history.loss.extend([1.2, 0.7, 0.4])
+    history.accuracy.extend([42.0, 71.0, 89.0])
+    history.val_loss.extend([1.3, 0.8, 0.5])
+    history.val_accuracy.extend([39.0, 68.0, 85.0])
+    history.test_loss = 0.45
+    history.test_accuracy = 87.0
+    let path = Path(os.temp_dir()).join("jaithon-jaitensor-history-test.svg")
+    defer { if path.exists() { path.remove() } }
+    history.plot(path.to_str())
+    let document = read_file(path.to_str())
+    assert_true(document.starts_with("<svg"))
+    assert_true(document.contains("validation"))
+    assert_true(document.contains("test"))
+    assert_eq(history.plot_path, path.to_str())
 }

@@ -373,7 +373,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
@@ -441,14 +441,10 @@ reseed: $(TARGET)
 # window where the compiler does not yet exist, so std has to be seeded too.
 # scripts/seed_touch.jai's SEED_ROOT carries that reasoning in full.
 #
-# The walk is blanket rather than a dependency closure, which is why lib/jaiplot
-# is in the seed: 24 modules and 277 KB the compiler never loads. Measured, a
-# seed of `lib/jaithon lib/std` alone still bootstraps cold and still lets
-# `import jaiplot` compile from source, and is 8.7% smaller. It is not done
-# because over-inclusion is the safe direction: a module the compiler needs
-# during its own load, left out of a hardcoded list, breaks the bootstrap, and
-# seed_touch.jai records what that costs -- 39 modules to 10 in one generation.
-# Doing it properly means seeding the compiler's real dependency closure.
+# The walk is blanket rather than a dependency closure. Workspace packages live
+# outside lib, so they no longer enter the seed. Narrowing this to
+# `lib/jaithon` would still break bootstrap because the compiler imports std
+# modules while it loads.
 #
 # Original note, for the record: running the compiler writes cache entries for
 # whatever it imports, so collecting the whole tree embeds a set that varies run
@@ -483,24 +479,29 @@ seed-check: $(TARGET)
 fixpoint-check: $(TARGET)
 	@scripts/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
 
-check: $(TARGET)
-	@./$(TARGET) check lib tests examples
+.PHONY: package-check
+package-check:
+	@python3 scripts/check_packages.py
+
+check: package-check $(TARGET)
+	@./$(TARGET) check lib tests/lang tests/stdlib tests/bench examples packages
 
 fmt: $(TARGET)
-	@./$(TARGET) fmt lib tests examples
+	@./$(TARGET) fmt lib tests examples packages
 
 # The CI gate behind `fmt`: writes nothing, names the first line of every file
 # that is not canonical, and exits nonzero if there is one. Kept out of `test`
 # because it re-parses the whole tree and takes several times as long as the
 # rest of the suite put together; `run_tests.sh --format` runs it inline.
 fmt-check: $(TARGET)
-	@./$(TARGET) fmt --check lib tests examples
+	@./$(TARGET) fmt --check lib tests examples packages
 
-install: $(TARGET)
+install: package-check $(TARGET)
 	@install -d $(DESTDIR)$(PREFIX)/bin
 	@install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 	@install -d $(DESTDIR)$(PREFIX)/share/jaithon
 	@cp -R lib $(DESTDIR)$(PREFIX)/share/jaithon/
+	@cp -R packages $(DESTDIR)$(PREFIX)/share/jaithon/
 	@echo "installed to $(DESTDIR)$(PREFIX)"
 
 uninstall:
@@ -530,4 +531,4 @@ distclean: clean
 	@echo "  CLEAN   removed every build tree, binary and generated artefact"
 
 help:
-	@echo "targets: all debug release test bench fixpoint-check reseed check fmt install clean"
+	@echo "targets: all debug release test bench package-check fixpoint-check reseed check fmt install clean"

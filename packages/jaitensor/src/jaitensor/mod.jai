@@ -26,11 +26,13 @@ from .model import History, Metrics, Sequential
 from .ops import add, argmax, divide, exp, log, matmul, multiply, one_hot
 from .ops import relu, reshape, scale, sigmoid, softmax, subtract, tanh, transpose
 from .optimizers import Adam, Optimizer, SGD
+from .plots import save_history_plot
 from .tensor import Tensor, constant, fill, ones, zeros
 
 export { Tensor, constant, zeros, ones, fill, Dataset }
 export { Activation, Dense, Optimizer, SGD, Adam, SparseCategoricalCrossentropy }
 export { History, Metrics, Sequential }
+export { save_history_plot }
 export { add, subtract, multiply, divide, scale, reshape, matmul, transpose }
 export { relu, sigmoid, tanh, exp, log, softmax, argmax, one_hot }
 

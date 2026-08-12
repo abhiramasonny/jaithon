@@ -282,8 +282,17 @@ fn test_both_installed_layouts_derive_the_same_library_directory() -> void {
     # A build tree has `./jaithon` beside `./lib`; `make install` puts the
     # binary in `<prefix>/bin` and the library in `<prefix>/lib`. `<exe>/lib`
     # and `<exe>/../lib` cover the two, and both land on the same directory.
-    assert_eq(_under(default_search_path(root), root), [f"{root}/lib"])
-    assert_eq(_under(default_search_path(f"{root}/pkg"), root), [f"{root}/lib"])
+    let expected = [f"{root}/lib", f"{root}/packages/demo/src"]
+    assert_eq(_under(default_search_path(root), root), expected)
+    assert_eq(_under(default_search_path(f"{root}/pkg"), root), expected)
+}
+
+fn test_a_workspace_package_source_is_an_import_root() -> void {
+    let root = _fixture()
+    let search = default_search_path(root)
+    assert_eq(resolve_module_path("demo", "", search), f"{root}/packages/demo/src/demo/mod.jai")
+    # A source-shaped directory without a manifest is not a package.
+    assert_true(f"{root}/packages/unlisted/src" not in search)
 }
 
 fn test_a_derived_directory_that_is_not_there_is_dropped() -> void {
@@ -300,7 +309,7 @@ fn test_jaithon_path_comes_before_the_derived_directories() -> void {
     let found = _under(default_search_path(root), root)
     __prim__.os_env("JAITHON_PATH", saved)
     # Empty entries are skipped, order is kept, and the library comes after.
-    assert_eq(found, [f"{root}/shadow", f"{root}/pkg", f"{root}/lib"])
+    assert_eq(found, [f"{root}/shadow", f"{root}/pkg", f"{root}/lib", f"{root}/packages/demo/src"])
 }
 
 # The fixed system directories are whatever this machine has installed, and an
@@ -333,9 +342,25 @@ fn _fixture() -> str {
     while base.len() > 1 and base.ends_with("/") { base = base[:base.len() - 1] }
     let root = f"{base}/jaithon-modsig-tests"
 
-    for dir in [root, f"{root}/pkg", f"{root}/pkg/deep", f"{root}/shadow", f"{root}/dual", f"{root}/lib"] {
+    for dir in [
+        root,
+        f"{root}/pkg",
+        f"{root}/pkg/deep",
+        f"{root}/shadow",
+        f"{root}/dual",
+        f"{root}/lib",
+        f"{root}/packages",
+        f"{root}/packages/demo",
+        f"{root}/packages/demo/src",
+        f"{root}/packages/demo/src/demo",
+        f"{root}/packages/unlisted",
+        f"{root}/packages/unlisted/src",
+    ] {
         _ensure_dir(dir)
     }
+
+    _write(f"{root}/packages/demo/jaithon.package.json", "{}\n")
+    _write(f"{root}/packages/demo/src/demo/mod.jai", "pub fn value() -> int { return 3 }\n")
 
     _write(f"{root}/pkg/leaf.jai", _LEAF)
     _write(f"{root}/pkg/mod.jai", "from .leaf import Widget as Gadget\n")

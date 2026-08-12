@@ -1,6 +1,6 @@
-#:     jaithon run examples/plot.jai            # writes plot.svg and plot.png
-#:     jaithon run examples/plot.jai -- --show     # opens a window you can pan
-#:     jaithon run examples/plot.jai -- --animate  # a live travelling wave
+#:     jaithon run examples/plot.jai
+#:     jaithon run examples/plot.jai -- --show
+#:     jaithon run examples/plot.jai -- --animate
 import std.math
 from std.random import Random
 

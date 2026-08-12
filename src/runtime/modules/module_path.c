@@ -24,6 +24,7 @@
 #include "native/native.h"
 
 #define JAI_PACKAGE_FILE "mod.jai"
+#define JAI_PROJECT_MANIFEST "jaithon.package.json"
 
 /* Directories listed in an E0800 note before the list is elided. */
 #define JAI_MAX_SEARCH_REPORTED 8
@@ -101,6 +102,53 @@ static void addLibDirRelative(const char *base, const char *suffix) {
     addLibDir(candidate);
 }
 
+static void freePackageNames(char **names, int count) {
+    if (names == NULL) return;
+    for (int i = 0; i < count; i++) {
+        if (names[i] != NULL)
+            JAI_FREE_ARRAY(char, names[i], strlen(names[i]) + 1);
+    }
+    JAI_FREE_ARRAY(char *, names, count + 1);
+}
+
+static int comparePackageNames(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* A workspace package owns one import root at <package>/src. The manifest is
+ * the marker that distinguishes a package from an arbitrary directory. JSON
+ * validation and dependency checks happen before tests and installation; the
+ * runtime only needs the filesystem convention during bootstrap. */
+static void addPackageSourceDirs(const char *packagesDir) {
+    if (packagesDir == NULL || !jaiPathIsDir(packagesDir)) return;
+
+    int count = 0;
+    char **names = jaiListDir(packagesDir, &count);
+    if (names == NULL) return;
+    if (count > 1)
+        qsort(names, (size_t)count, sizeof(char *), comparePackageNames);
+
+    for (int i = 0; i < count; i++) {
+        const char *name = names[i];
+        if (name == NULL || name[0] == '.') continue;
+
+        char package[JAI_MAX_PATH];
+        char manifest[JAI_MAX_PATH];
+        char source[JAI_MAX_PATH];
+        jaiPathJoin(package, sizeof package, packagesDir, name);
+        jaiPathJoin(manifest, sizeof manifest, package, JAI_PROJECT_MANIFEST);
+        jaiPathJoin(source, sizeof source, package, "src");
+        if (isRegularFile(manifest)) addLibDir(source);
+    }
+    freePackageNames(names, count);
+}
+
+static void addPackageDirsRelative(const char *base, const char *suffix) {
+    char candidate[JAI_MAX_PATH];
+    jaiPathJoin(candidate, sizeof candidate, base, suffix);
+    addPackageSourceDirs(candidate);
+}
+
 void jaiModulePathInit(const char *execDir) {
     /* Idempotent: the derived library directories are recomputed and anything
      * added by hand in the meantime is kept. */
@@ -141,6 +189,9 @@ void jaiModulePathInit(const char *execDir) {
         addLibDirRelative(execDir, "../lib");
         addLibDirRelative(execDir, "../share/jaithon/lib");
         addLibDirRelative(execDir, "../share/jaithon");
+        addPackageDirsRelative(execDir, "packages");
+        addPackageDirsRelative(execDir, "../packages");
+        addPackageDirsRelative(execDir, "../share/jaithon/packages");
     }
 
     /* The installed library, which a machine with jaithon already on it always
@@ -153,6 +204,8 @@ void jaiModulePathInit(const char *execDir) {
         addLibDir("/usr/local/share/jaithon");
         addLibDir("/opt/homebrew/share/jaithon/lib");
         addLibDir("/opt/homebrew/share/jaithon");
+        addPackageSourceDirs("/usr/local/share/jaithon/packages");
+        addPackageSourceDirs("/opt/homebrew/share/jaithon/packages");
     }
 
     syncModulePathMirror();

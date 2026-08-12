@@ -132,10 +132,13 @@ fn main(args: list[str]) -> int {
     if not jt.is_available() { throw RuntimeError("spiral training needs a GPU") }
     let (train_rows, train_labels) = spiral_rows(300, 0.18, 41)
     let (validation_rows, validation_labels) = spiral_rows(100, 0.22, 92)
+    let (test_rows, test_labels) = spiral_rows(100, 0.22, 117)
     let train = Dataset.from_tensor_slices(train_rows, train_labels)
     let validation = Dataset.from_tensor_slices(validation_rows, validation_labels)
+    let test = Dataset.from_tensor_slices(test_rows, test_labels)
     defer { train.free() }
     defer { validation.free() }
+    defer { test.free() }
 
     print(f"GPU: {jt.device_name()}")
     print(f"training on {train.samples} generated spiral points")
@@ -147,7 +150,9 @@ fn main(args: list[str]) -> int {
         epochs: epochs,
         batch_size: 300,
         verbose: true,
-        validation_data: validation
+        validation_data: validation,
+        test_data: test,
+        plot_path: output.join("training_history.svg").to_str()
     )
 
     let weights_path = output.join("spiral_classifier.weights.json")
@@ -170,6 +175,7 @@ fn main(args: list[str]) -> int {
     draw_report(output, restored, history, validation_rows, validation_labels)
     print(f"wrote {output.join("spiral_classifier.svg")}")
     print(f"wrote {output.join("spiral_classifier.png")}")
+    print(f"wrote {history.plot_path}")
     print(f"wrote {weights_path}")
     return 0
 }

@@ -11,6 +11,7 @@ from .layers import Activation, Dense
 from .losses import SparseCategoricalCrossentropy
 from .ops import argmax
 from .optimizers import Optimizer, SGD
+from .plots import save_history_plot
 from .tensor import Tensor
 
 #: Aggregate loss and accuracy for one pass over a dataset.
@@ -41,6 +42,12 @@ pub class History {
     pub let val_loss: list[float]
     #: Validation accuracy after each epoch, empty without validation data.
     pub let val_accuracy: list[float]
+    #: Final test loss, or null when `fit` received no test dataset.
+    pub var test_loss: float?
+    #: Final test accuracy, or null when `fit` received no test dataset.
+    pub var test_accuracy: float?
+    #: The report written by `fit`, or null when plotting was disabled.
+    pub var plot_path: str?
 
     #: Create an empty training history.
     pub fn init(self) {
@@ -49,6 +56,23 @@ pub class History {
         self.seconds = []
         self.val_loss = []
         self.val_accuracy = []
+        self.test_loss = null
+        self.test_accuracy = null
+        self.plot_path = null
+    }
+
+    #: Save this history through jaitensor's jaiplot dependency.
+    pub fn plot(self, path: str) -> void {
+        save_history_plot(
+            path,
+            self.loss,
+            self.accuracy,
+            self.val_loss,
+            self.val_accuracy,
+            self.test_loss,
+            self.test_accuracy
+        )
+        self.plot_path = path
     }
 }
 
@@ -162,14 +186,18 @@ pub class Sequential {
     #: Train for `epochs`, returning loss and accuracy histories.
     #:
     #: A larger batch keeps the GPU occupied longer. The default is intended
-    #: for medium-sized dense classifiers on Apple silicon.
+    #: for medium-sized dense classifiers on Apple silicon. The method plots
+    #: the completed history at `data/jaitensor-training.svg`; pass
+    #: `plot_path: null` to skip the report.
     pub fn fit(
         self,
         dataset: Dataset,
         epochs: int = 1,
         batch_size: int = 2048,
         verbose: bool = true,
-        validation_data: Dataset? = null
+        validation_data: Dataset? = null,
+        test_data: Dataset? = null,
+        plot_path: str? = "data/jaitensor-training.svg"
     ) -> History {
         self._prepare(dataset, epochs, batch_size)
         let workspace = Workspace(self.layers, min(batch_size, dataset.samples), dataset.samples)
@@ -202,6 +230,16 @@ pub class Sequential {
                 }
                 print(f"epoch {epoch}/{epochs}: {metrics}{suffix} ({seconds:.3f}s)")
             }
+        }
+        if test_data is not null {
+            let testing = self.evaluate(test_data, batch_size: batch_size)
+            history.test_loss = testing.loss
+            history.test_accuracy = testing.accuracy
+            if verbose { print(f"test: {testing}") }
+        }
+        if plot_path is not null {
+            history.plot(plot_path)
+            if verbose { print(f"training plot: {plot_path}") }
         }
         return history
     }
