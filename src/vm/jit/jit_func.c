@@ -7581,6 +7581,31 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     form->slots = (uint8_t)e.locals;
     form->iterKind = iterKind;
     for (unsigned i = 0; i < e.locals; i++) form->kinds[i] = (uint8_t)e.localKind[i];
+
+    /* Pin the class of every instance slot the compile specialised on. Without
+     * this the entry guard checks only IS_INSTANCE, and a loop compiled for one
+     * class entered holding another reads a field at the wrong slot index --
+     * see JaiOsrForm's note for the probe. Refuse rather than compile
+     * unguarded if the pairs do not fit. */
+    form->shapeCount = 0;
+    for (unsigned i = 0; i < e.locals; i++) {
+        SlotKind k = e.localKind[i];
+        if (k != SLOT_INST && k != SLOT_MAYBE_INST) continue;
+        if (e.localShape[i] == 0) continue;   /* no class pinned to this slot */
+        if (form->shapeCount >= JAI_OSR_SHAPES) {
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] osr %s at %u stopped: more than %d "
+                        "instance slots to pin\n",
+                        fn->name ? fn->name->chars : "<anon>", top,
+                        JAI_OSR_SHAPES);
+            }
+            return false;
+        }
+        form->shapeSlot[form->shapeCount] = (uint8_t)i;
+        form->shapeId[form->shapeCount]   = e.localShape[i];
+        form->shapeCount++;
+    }
+
     fn->osrCount++;
     fn->osrHot = true;
     fn->osrDeclines = 0;
@@ -7733,6 +7758,17 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         case SLOT_OBJ:   if (!IS_OBJ(v))   return 0; break;
         default: break;   /* opaque: never read */
         }
+    }
+
+    /* And it must be the same CLASS, not merely an instance. The kind check
+     * above passes any instance; the compiled code reads fields at slot indices
+     * baked in from one particular class. */
+    for (unsigned i = 0; i < form->shapeCount; i++) {
+        Value v = frame->slots[form->shapeSlot[i]];
+        if (IS_NULL(v)) continue;    /* SLOT_MAYBE_INST, and it is the null */
+        if (!IS_INSTANCE(v)) return 0;
+        ObjClass *klass = AS_INSTANCE(v)->klass;
+        if (klass == NULL || klass->shapeId != form->shapeId[i]) return 0;
     }
 
     gDeopt.nstack = 0;
