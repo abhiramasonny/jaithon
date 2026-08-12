@@ -1749,7 +1749,7 @@ pub class Emitter {
             var bits = _visibility_code(field["visibility"]) & 0x3
             if field["isStatic"] { bits = bits | 4 }
             if field["isLet"] { bits = bits | 8 }
-            bits = bits | ((_field_kind_code(field["type"], type_params) & 0xF) << 4)
+            bits = bits | (_field_kind_code(field["type"], type_params) & 0xF) << 4
             self._chunk().write_op(Op.FieldDef, field["span"])
             self._chunk().write_u24(self._string(field["name"]))
             self._chunk().write_byte(bits)

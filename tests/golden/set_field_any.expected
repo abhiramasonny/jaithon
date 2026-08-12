@@ -1,0 +1,6 @@
+caught: cannot assign str to field 'x' declared float
+1.5
+2.5
+3
+caught cached: cannot assign str to field 'x' declared float
+3

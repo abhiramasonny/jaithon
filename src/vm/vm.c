@@ -770,6 +770,39 @@ bool jaiGetProperty(Value receiver, ObjString *name, Value *out) {
     return getPropertyInto(receiver, name, out, true, NULL);
 }
 
+/* Does `v` satisfy a field declared with this kind?
+ *
+ * FIELD_KIND_ANY accepts everything, and that is the answer for an `any` field,
+ * a nullable one, a generic parameter, and every image written before the kind
+ * bits existed. An unrecognised code is a newer encoding read by an older
+ * binary and is treated the same way -- claiming nothing is always safe, and a
+ * false TypeError on correct code is worse than a missed check.
+ *
+ * A float field accepts an int, per LANGUAGE.md §2.5, and stores it as an int:
+ * a write arriving through `any` carries no OP_TO_FLOAT, because the checker
+ * never saw a float on the target side. Rejecting it would break code that
+ * works today. */
+static bool fieldKindAccepts(uint32_t kind, Value v) {
+    switch ((FieldKind)kind) {
+    case FIELD_KIND_ANY:      return true;
+    case FIELD_KIND_INT:      return IS_INT(v);
+    case FIELD_KIND_FLOAT:    return IS_FLOAT(v) || IS_INT(v);
+    case FIELD_KIND_BOOL:     return IS_BOOL(v);
+    case FIELD_KIND_STR:      return IS_STRING(v);
+    case FIELD_KIND_LIST:     return IS_LIST(v);
+    case FIELD_KIND_DICT:     return IS_DICT(v);
+    case FIELD_KIND_INSTANCE: return IS_INSTANCE(v) || IS_NULL(v);
+    }
+    return true;
+}
+
+static bool throwFieldKind(const FieldInfo *info, Value v) {
+    return jaiThrow(vm.cTypeError,
+                    "cannot assign %s to field '%s' declared %s",
+                    jaiTypeNameStatic(v), info->name->chars,
+                    jaiFieldKindName(info->typeId));
+}
+
 bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
     if (name == NULL) return false;
 
@@ -808,6 +841,13 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
             return jaiThrow(vm.cAttributeError,
                             "field '%s' is not present on this instance",
                             name->chars);
+        }
+        /* The checker could not have caught this: reaching a field through an
+         * `any` receiver means it did not know the class, so it did not know
+         * what the field was declared as. FieldInfo is the only place that
+         * knows, so the runtime is the only place this can be rejected. */
+        if (!fieldKindAccepts(info->typeId, value)) {
+            return throwFieldKind(info, value);
         }
         inst->fields[info->slot] = value;
         return true;
@@ -5327,6 +5367,21 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 for (int w = 0; w < ic->count; w++) {
                     if (ic->shapeId[w] != instance->klass->shapeId) continue;
                     if (ic->payload[w] >= instance->fieldCount) break;
+                    /* The kind guard has to be here too, not only in
+                     * jaiSetProperty: once a site's cache is warm every later
+                     * write takes this path and never reaches it. A field's
+                     * slot is its index in klass->fields by construction
+                     * (classDeclareField assigns slot = fieldCount as it
+                     * appends), so this is one indexed load, not a lookup. */
+                    if (ic->payload[w] < instance->klass->fieldCount) {
+                        const FieldInfo *fi =
+                            &instance->klass->fields[ic->payload[w]];
+                        if (!fieldKindAccepts(fi->typeId, value)) {
+                            SAVE_STATE();
+                            (void)throwFieldKind(fi, value);
+                            goto vmThrow;
+                        }
+                    }
                     vm.icHits++;
                     instance->fields[ic->payload[w]] = value;
                     DROP(2);
