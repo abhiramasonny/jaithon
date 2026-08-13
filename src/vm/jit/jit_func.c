@@ -2637,14 +2637,13 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     Value cv = e->stackSeen[cidx];
     if (!IS_CLOSURE(cv)) { e->whyNot = "callee vanished"; return false; }
     ObjFunction *cfn = AS_CLOSURE(cv)->fn;
-    if (cfn->jitFunc == NULL) { e->whyNot = "callee no longer compiled"; return false; }
 
     /* Straight to the callee's entry when everything jaiJitEnterFunc would
      * have checked can be checked here instead. Falling back rather than
      * declining matters: the descriptor path speaks a much wider language --
      * any argument kind, any module, a callee that writes -- and a call
      * through jaiCallValue still beats no compiled loop at all. */
-    {
+    if (cfn->jitFunc != NULL) {
         const char *saved = e->whyNot;
         if (emitDirectCall(e, caller, cfn, cv, -1, cidx, argc, callOff,
                            after, false)) {
@@ -2654,18 +2653,31 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         e->whyNot = saved;
     }
 
-    SlotKind rk = (SlotKind)cfn->jitReturnKind;
-    uint32_t rshape = cfn->jitReturnShape;
+    /* A callee with no compiled form of its own still knows what it has been
+     * returning; see ObjFunction::obsReturnKind and the twin case at OP_INVOKE.
+     * A recursive function is the ordinary way to reach this -- the loop being
+     * compiled is inside the very function the call names, so there is nothing
+     * for `jitReturnKind` to have been written by yet. */
+    SlotKind rk = SLOT_NULL;
+    uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    if (rk == SLOT_INST) {
-        if (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL) {
-            e->whyNot = "callee's return class not on record";
-            return false;
-        }
+    bool haveKind;
+    if (cfn->jitFunc != NULL) {
+        rk = (SlotKind)cfn->jitReturnKind;
+        rshape = cfn->jitReturnShape;
+        haveKind = true;
+    } else {
+        haveKind = observedReturnKind(cfn, &rk, &rshape);
     }
-    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
-        rk != SLOT_NULL) {
+    if (haveKind && rk == SLOT_INST &&
+        (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
+        e->whyNot = "callee's return class not on record";
+        return false;
+    }
+    if (!haveKind ||
+        (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+         rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
+         rk != SLOT_NULL)) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
@@ -2695,6 +2707,24 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
      * rather than whatever the descriptor happened to leave behind. */
     if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
     else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+    if (rk == SLOT_INST) {
+        /* The tag says "an object", which is not "an instance of this class",
+         * and every field offset resolved against the entry below assumes it
+         * is. The object type is checked before `klass` is read for the same
+         * reason it is at the invoke arm: VAL_OBJ covers every heap object and
+         * a returned string's header is shorter than an instance's. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(ObjInstance, klass)));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                           (unsigned)offsetof(ObjClass, shapeId)));
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    }
     e->wroteHeap = true;
     return true;
 }
