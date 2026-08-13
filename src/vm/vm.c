@@ -2084,9 +2084,8 @@ JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
         if (JAI_UNLIKELY(!jaiNormalizeIndex(raw, (int)s->length, &at))) return false;
         const unsigned char c = (unsigned char)s->chars[at];
         if (JAI_UNLIKELY(c >= 128)) return false;
-        ObjString *cached = jaiAsciiCharTable()[c];
-        if (JAI_UNLIKELY(cached == NULL)) return false;   /* first use allocates */
-        *out = OBJ_VAL(cached);
+        /* Every slot is filled by jaiVMInit, so there is no null to test. */
+        *out = OBJ_VAL(jaiAsciiCharTable()[c]);
         return true;
     }
 
@@ -6122,6 +6121,11 @@ void jaiVMInit(void) {
     jaiInternTableInit();
     jaiTableInit(&vm.modules);
 
+    /* Before anything else interns: from here on every reader of the one-byte
+     * ASCII table may assume a slot is populated, which is a branch each of
+     * them used to carry. See jaiAsciiCharsFill. */
+    jaiAsciiCharsFill();
+
     internWellKnownNames();
 
     /* The intern table is a weak root, so `builtinsName` would be swept by the
@@ -6176,6 +6180,8 @@ void jaiVMFree(void) {
         JAI_FREE(GCState, gc);
     }
     vm.gc = NULL;
+    /* After the sweep the 128 slots point at freed objects. */
+    jaiAsciiCharsReset();
     jaiInternTableFree();
 
     JAI_FREE_ARRAY(Value, vm.stack, JAI_STACK_MAX);
