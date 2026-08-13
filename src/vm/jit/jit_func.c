@@ -1768,6 +1768,20 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
     return true;
 }
 
+/* The same test feedbackSlotKind applies to a call's result, as a predicate on a Value: is this a heap
+ * object with no stack kind of its own, so SLOT_OBJ's "read, pass, store, root and nothing else" describes it exactly? Excludes the kinds a later arm resolves to a register-free entry (class/closure/native/...), which SLOT_OBJ would silently outrank. */
+static bool rawObjValue(Value v) {
+    if (!IS_OBJ(v) || AS_OBJ(v) == NULL) return false;
+    switch (OBJ_TYPE(v)) {
+    case OBJ_INSTANCE: case OBJ_CLASS: case OBJ_TRAIT:
+    case OBJ_CLOSURE:  case OBJ_FUNCTION: case OBJ_NATIVE:
+    case OBJ_BOUND:    case OBJ_ENUM: case OBJ_ENUM_CTOR:
+        return false;
+    default: break;
+    }
+    return true;
+}
+
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     *shape = 0; *kls = NULL;
     if (IS_INT(v))      { *k = SLOT_INT;   return true; }
@@ -4288,6 +4302,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                              : e->localClass[slot];
                 if (fcls == NULL) return false;
             }
+            /* A list field earns the stronger kind: SLOT_OBJ can be passed and stored but not iterated,
+             * indexed or pushed to, and `for x in self.items` / `self.items.push(v)` is the commonest thing
+             * a class holding a list does. Paid for with the OBJ_LIST check below, since VAL_OBJ alone
+             * would let a str reach a header read. */
+            else if (IS_LIST(fieldVal)) { kind = SLOT_LIST; tag = VAL_OBJ; }
+            /* A str/dict/set field, held raw -- the same contract as a SLOT_OBJ global or list element:
+             * the tag guard below says "an object", the sample says which type it was, and every consumer
+             * (index, invoke, compare) re-checks Obj.type for itself before it does anything type-specific.
+             * Refusing this declined the whole enclosing FUNCTION, which is most object-oriented code. */
+            else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
             else return false;
 
             unsigned base = (unsigned)offsetof(ObjInstance, fields) +
@@ -4335,17 +4359,38 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
                 branchOnDeopt(e, JAI_A64_NE);
+                /* "an object" is not "a list": every SLOT_LIST consumer reads the header with no check of
+                 * its own, so the object type is confirmed here, once, before the kind is handed out.
+                 * `already` is never SLOT_LIST (see recordFieldStore's caller), so this arm sees them all. */
+                if (kind == SLOT_LIST) {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, recv, base + 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
             }
 
-            if (kind == SLOT_MAYBE_INST) {
-                if (!pushValue3(e, kind, fcls->shapeId, fcls,
-                                IS_INSTANCE(fieldVal) ? fieldVal : NULL_VAL,
+            if (kind == SLOT_MAYBE_INST || kind == SLOT_LIST) {
+                if (!pushValue3(e, kind,
+                                kind == SLOT_MAYBE_INST ? fcls->shapeId : 0,
+                                kind == SLOT_MAYBE_INST ? fcls : NULL,
+                                kind == SLOT_LIST ? fieldVal
+                                : IS_INSTANCE(fieldVal) ? fieldVal : NULL_VAL,
                                 -1)) {
                     return false;
                 }
                 emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_D));
             } else {
-                if (!pushValue(e, kind, 0, NULL)) return false;
+                /* SLOT_OBJ needs the sample carried: it is the only record of which object type this was,
+                 * and a consumer with nothing to look at declines. NULL_VAL when `already` overrode the
+                 * observation, since then the stored kind and the sampled value need not agree. */
+                if (!pushValue3(e, kind, 0, NULL,
+                                kind == SLOT_OBJ && rawObjValue(fieldVal)
+                                    ? fieldVal : NULL_VAL,
+                                -1)) {
+                    return false;
+                }
                 /* A float field goes straight to the FP bank when something
                  * downstream will read it there: `ldr d` instead of `ldr x`
                  * followed by the `fmov` its consumer would emit. */
@@ -4428,9 +4473,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (!popValue(e, &rr, &kr)) return false;
             if (kr != SLOT_INST) return false;
-            /* Only a number goes in: storing an object would put a pointer the collector hasn't seen into a
-             * field. This tier can't allocate, so nothing can move or be swept while it runs, but the value would still need to already be rooted by the caller -- not worth it for what it buys. */
-            if (kv != SLOT_INT && kv != SLOT_FLOAT) return false;
+            /* An object goes in as readily as a number. The collector is a plain mark-sweep with no write
+             * barrier and nothing moves, so the only question is reachability: the receiver is rooted (it
+             * is a live SLOT_INST here), and after the store the value hangs off it, while before the store
+             * it was rooted in its own right by emitRootFill. What is refused is a kind with no payload
+             * register to store (class/function/native/self) and SLOT_ITER, whose index lives in memory. */
+            if (kv != SLOT_INT && kv != SLOT_FLOAT && kv != SLOT_BOOL &&
+                kv != SLOT_OBJ && kv != SLOT_LIST && kv != SLOT_INST &&
+                kv != SLOT_MAYBE_INST) {
+                e->whyNot = "storing a field kind this tier cannot write";
+                return false;
+            }
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
@@ -4441,12 +4494,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned base = (unsigned)offsetof(ObjInstance, fields) +
                             (unsigned)info->slot * (unsigned)sizeof(Value);
-            emit(e, jaiA64MovzX(JIT_SCRATCH_A,
-                                kv == SLOT_INT ? VAL_INT : VAL_FLOAT, 0));
+            /* Not a constant tag any more: a maybe-instance's is null-or-object,
+             * read off the payload, which is exactly what emitTagFor does. */
+            emitTagFor(e, kv, rv, JIT_SCRATCH_A, JIT_SCRATCH_B);
             emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
             if (vIsFp) emit(e, jaiA64StrD(dv, rr, base + 8));
             else       emit(e, jaiA64StrX(rv, rr, base + 8));
-            recordFieldStore(e, recvLocal, info->slot, kv);
+            /* Only a kind a later read can replay EXACTLY is remembered; the rest merely retire what was
+             * known of this field (local -1), because the read side would otherwise take SLOT_INST with no
+             * class behind it -- a shape every field offset it then resolved would be resolved against. */
+            bool replayable = kv == SLOT_INT || kv == SLOT_FLOAT ||
+                              kv == SLOT_BOOL || kv == SLOT_OBJ;
+            recordFieldStore(e, replayable ? recvLocal : -1, info->slot, kv);
             e->wroteHeap = true;
             off += 6;
             break;
@@ -4560,6 +4619,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned tag;
             if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            /* As in OP_GET_FIELD_LOCAL: an object-typed field is held raw
+             * rather than declining the enclosing function, and a list earns
+             * the stronger kind at the price of an OBJ_LIST check. */
+            else if (IS_LIST(fieldVal))     { kind = SLOT_LIST; tag = VAL_OBJ; }
+            else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ;  tag = VAL_OBJ; }
             else return false;
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
@@ -4576,11 +4640,27 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr, fbase));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
                 branchOnDeopt(e, JAI_A64_NE);
+                /* And that it is a list, not merely an object -- same reason as
+                 * in OP_GET_FIELD_LOCAL, and likewise while the receiver is
+                 * still on the model, since this guard resumes here too. */
+                if (kind == SLOT_LIST) {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, rr, fbase + 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
             }
             unsigned popped;
             SlotKind kr;
             if (!popValue(e, &popped, &kr)) return false;
-            if (!pushValue(e, kind, 0, NULL)) return false;
+            if (!pushValue3(e, kind, 0, NULL,
+                            (kind == SLOT_OBJ && rawObjValue(fieldVal)) ||
+                                    (kind == SLOT_LIST && IS_LIST(fieldVal))
+                                ? fieldVal : NULL_VAL,
+                            -1)) {
+                return false;
+            }
             if (kind == SLOT_FLOAT && fpWorthLoading(e, code, off + 6, stop)) {
                 unsigned idx = e->valueDepth - 1;
                 emit(e, jaiA64LdrD(fpRegAt(e, idx), rr, fbase + 8));
@@ -5906,11 +5986,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned nargs = 1u + nops;
             if (e->depth < nargs) return false;
             unsigned cidx = e->depth - nargs;
-            if (e->stack[cidx] != SLOT_LIST) {
+            Value cseen = e->stackSeen[cidx];
+            /* A string slices as readily as a list -- same runtime call, same
+             * "the guard pins the type so the result kind follows" argument --
+             * and `s[a:b]` is what every hand-written scanner cuts tokens with.
+             * Held as SLOT_OBJ, since that is what a string is here. */
+            unsigned cType;
+            SlotKind sliceKind;
+            if (e->stack[cidx] == SLOT_LIST) {
+                cType = OBJ_LIST; sliceKind = SLOT_LIST;
+            } else if (e->stack[cidx] == SLOT_OBJ && IS_STRING(cseen)) {
+                cType = OBJ_STRING; sliceKind = SLOT_OBJ;
+            } else {
                 e->whyNot = "slicing a container this tier does not model";
                 return false;
             }
-            Value cseen = e->stackSeen[cidx];
 
             /* Guard the container, not the result: with its object type pinned
              * the arm jaiSliceGet takes is settled, so the result's kind
@@ -5918,7 +6008,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * resumes here with everything still on the interpreter's stack. */
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - nargs,
                                (unsigned)offsetof(Obj, type)));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, cType));
             branchOnDeopt(e, JAI_A64_NE);
 
             emit(e, jaiA64MovzX(JIT_SCRATCH_A, flags, 0));
@@ -5934,9 +6024,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValue(e, &r, NULL)) return false;
             }
             /* The container's own sample types the slice: a slice of a list of
-             * ints is a list of ints, and every element read re-checks its own
-             * tag, so this is a hint and not an assumption. */
-            if (!pushValue3(e, SLOT_LIST, 0, NULL, cseen, -1)) return false;
+             * ints is a list of ints, a slice of a string is a string, and
+             * every element read re-checks its own tag, so this is a hint and
+             * not an assumption. */
+            if (!pushValue3(e, sliceKind, 0, NULL, cseen, -1)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
