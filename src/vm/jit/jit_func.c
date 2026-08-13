@@ -2594,11 +2594,20 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     if (e->depth <= cidx) { e->failed = true; return false; }
     rshape = e->stackShape[e->depth - 1];
     rcls   = e->stackClass[e->depth - 1];
-    if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    /* Read while `inlining` is still set, so this names the inlined bank's d
+     * register; the caller's own is taken after it is cleared. */
+    bool rfp = (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
+    unsigned rfpReg = rfp ? fpHeldIn(e, e->valueDepth - 1) : 0;
+    if (rfp) {
+        if (!popValueRaw(e, &rres, &kres)) { e->failed = true; return false; }
+    } else if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    /* Raw, because nothing reads these again: the body is over and its pinned
+     * locals go with it, so materialising one costs an instruction whose
+     * destination is dead. */
     while (e->depth > cidx) {
         if (holdsRegister(e->stack[e->depth - 1])) {
             unsigned r;
-            if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+            if (!popValueRaw(e, &r, NULL)) { e->failed = true; return false; }
         } else {
             e->depth--;
         }
@@ -2607,8 +2616,14 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
 
     if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }
-    unsigned dst = pushReg(e) - 1;
-    if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    if (rfp) {
+        unsigned dd = fpRegAt(e, e->valueDepth - 1);
+        if (dd != rfpReg) emit(e, jaiA64FmovDD(dd, rfpReg));
+        fpClaim(e, e->valueDepth - 1);
+    } else {
+        unsigned dst = pushReg(e) - 1;
+        if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    }
     e->inlined = true;
     return true;
 }
@@ -3236,7 +3251,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * here at all -- and there are no branches in an inlined body for
              * one to be. */
             if (e->inlining) joinsHere = false;
-            if (!fpFastOp(op) || joinsHere) {
+            /* An inlined OP_RETURN is not a sync point: the only entry that outlives it is the result, and
+             * inlineGlobalCall carries that one across in the bank. Everything under it is discarded unread. */
+            if (e->inlining && op == OP_RETURN) {
+                /* handled below */
+            } else if (!fpFastOp(op) || joinsHere) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
@@ -3260,7 +3279,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "an inlined body returning a value with no register";
                 return false;
             }
-            fpSyncOne(e, e->valueDepth - 1);
+            /* A float result stays in its d register: inlineGlobalCall moves it into the caller's bank with
+             * one FP-to-FP move, where syncing here spent an `fmov x,d` and then made the caller's first float operator pay an `fmov d,x` to undo it. settleAll still runs -- it is X-side only (kPend/xBorrow), and those bits are never set on an entry the bank holds. */
+            if (!(e->fpLive & (1u << (e->valueDepth - 1)))) {
+                fpSyncOne(e, e->valueDepth - 1);
+            }
             settleAll(e);   /* the caller reads the result out of valueXReg */
             break;
         }
@@ -6637,12 +6660,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             return false;   /* an opcode this tier does not speak */
         }
     }
-    fpSyncAll(e);
-    settleAll(e);
     /* An inlined body's offsets are the callee's; matching them against the
      * caller's fixups compares two different numbering schemes. There is
      * nothing to check either way -- it has no branches. */
-    if (e->inlining) return !e->failed;
+    if (e->inlining) {
+        /* All but the result, which OP_RETURN deliberately left in the bank for
+         * inlineGlobalCall to carry across. Everything under it is either the
+         * caller's (settled before the call) or about to be discarded. */
+        unsigned keep = e->valueDepth > 0 ? e->valueDepth - 1 : 32u;
+        for (unsigned i = 0; i < 32u; i++) {
+            if (i != keep) fpSyncOne(e, i);
+        }
+        settleAll(e);
+        return !e->failed;
+    }
+    fpSyncAll(e);
+    settleAll(e);
     /* Nothing may branch to an offset this walk carried a float into (see fpCarry) -- declines, and the caller retries with the FP bank off. */
     for (unsigned i = 0; i < e->fpCarryCount; i++) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
