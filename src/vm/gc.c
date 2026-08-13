@@ -426,6 +426,7 @@ static void traceReferences(GCState *g) {
 
 static int sweep(GCState *g) {
     int freedObjects = 0;
+    size_t freedBytes = 0;
     Obj *previous = NULL;
     Obj *object = g->objects;
 
@@ -456,12 +457,16 @@ static int sweep(GCState *g) {
          * register pairs on entry it does not need for any of them.
          * jaiObjSoleBlock is the same size jaiFreeObject would have used. */
         size_t sole = jaiObjSoleBlock(unreached);
-        if (JAI_LIKELY(sole != 0 && jaiSmallServes(sole)))
-            jaiSmallDelete(unreached, sole);
-        else
+        if (JAI_LIKELY(sole != 0 && jaiSmallServes(sole))) {
+            jaiSmallDeleteUnaccounted(unreached, sole);
+            freedBytes += sole;   /* charged once, after the loop */
+        } else {
             jaiFreeObject(unreached);
+        }
         freedObjects++;
     }
+
+    jaiHeapAccountFreed(freedBytes);
     return freedObjects;
 }
 
