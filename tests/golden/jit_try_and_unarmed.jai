@@ -105,7 +105,7 @@ fn inc_local_step(total: int, i: int, boom: bool) -> int {
 fn add_expr_step(total: int, i: int, boom: bool) -> int {
     try {
         let big = if boom { 9223372036854775807 } else { 2 }
-        return (i % 5 + 1) + big
+        return i % 5 + 1 + big
     } catch e: OverflowError {
         return -total
     }
@@ -251,7 +251,7 @@ fn hot_unarmed(n: int) -> int {
     var i = 0
     while i < n {
         total += i % 7
-        let odd = not (i % 2 == 0)
+        let odd = not i % 2 == 0
         if odd { total += 1 }
         i += 1
     }
@@ -302,6 +302,7 @@ fn try_with_call(n: int) -> int {
 
 class Marker {
     pub var n: int
+
     fn init(self, n: int) -> void { self.n = n }
 }
 
