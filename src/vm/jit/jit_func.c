@@ -1651,9 +1651,17 @@ static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
     }
 }
 
+/* Neither of the two blocks below reads an operand-stack entry -- a bail says
+ * "could not continue" and the caller throws the whole computation away, and an
+ * overflow raises -- so the entries do NOT have to be in their X homes to
+ * branch to one. The fpSyncAll both used to do was pure hot-path cost: in a
+ * float expression carrying an int guard through it (a stencil's `mid[j-1]`),
+ * each one wrote every live float out and the next use read it back, four
+ * cross-bank fmovs sitting in the middle of the accumulate chain. A join
+ * (branchTo) and a deopt record are different and still settle -- the first
+ * because the other edge must agree, the second because the record is read. */
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    fpSyncAll(e);
     if (e->wroteHeap) e->bailAfterWrite = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
@@ -1667,7 +1675,6 @@ static void branchOnCondition(Emit *e, unsigned cond) {
  * product's high half against the low half's replicated sign, so its answer is NE -- routing multiply through VS meant its overflow was never detected (4 * 2^62 silently came back as 0). */
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    fpSyncAll(e);
     e->overflowUsed[which] = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
