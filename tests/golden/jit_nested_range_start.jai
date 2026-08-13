@@ -27,7 +27,6 @@
 #:     part-way through;
 #:   * an inner loop whose body deoptimises, so the interpreter picks the same
 #:     loop up from the ObjIter this code has been writing.
-
 fn zero_start(n: int) -> int {
     var acc = 0
     for _i in 0..n {
