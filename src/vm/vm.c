@@ -5016,6 +5016,28 @@ static JaiRunResult runLoop(int baseFrameCount) {
         if (FRAME_HAS_DEFERS(frame)) (void)runFrameDefers(frame);
         if (vm.hasException) goto vmThrow;
 
+        /* Record what this function returns, for a compiled caller that cannot
+         * ask its compiled form because it has none yet. Costs the steady state
+         * one already-hot load and a not-taken branch: entryCount saturates at
+         * the compile threshold and never moves again. See
+         * ObjFunction::obsReturnKind for why this is per callee, not per site. */
+        if (JAI_UNLIKELY(fn->entryCount < JAI_JIT_THRESHOLD)) {
+            uint32_t shape = 0;
+            if (IS_INSTANCE(retval) && AS_INSTANCE(retval)->klass != NULL) {
+                shape = AS_INSTANCE(retval)->klass->shapeId;
+                /* A shape is only usable by the tier if the shape->class table
+                 * can answer it, and until now the only thing that filled that
+                 * table was a function COMPILING with an instance return -- so
+                 * a callee that has not compiled recorded a shape nothing could
+                 * resolve, which is exactly the callee this record is for. */
+                jaiClassRememberShape(AS_INSTANCE(retval)->klass);
+            }
+            if (fn->obsReturnKind == JAI_FB_NONE) fn->obsReturnShape = shape;
+            else if (fn->obsReturnShape != shape) fn->obsReturnShape = 0;
+            fn->obsReturnKind = jaiFeedbackMerge(fn->obsReturnKind,
+                                                 jaiFeedbackKind(retval));
+        }
+
         closeUpvalues(frame->base);
         vm.handlers.count = frame->handlerBase;
         vm.defers.count = frame->deferBase;
