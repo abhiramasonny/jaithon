@@ -3325,6 +3325,60 @@ static bool offsetIsProtected(const ObjFunction *fn, uint32_t off) {
     return false;
 }
 
+/* An opcode with no arm in the switch below.
+ *
+ * It used to `return false`, which declines the WHOLE enclosing function -- so
+ * a `try` whose catch block holds OP_GET_EXC, or a `{}` literal on a path that
+ * never runs, evicted every function containing it from the compiled tier for
+ * good. 66 of 137 opcodes were in that position (tests/vm/jit_unarmed.baseline)
+ * and `tests/bench/error_paths`' eight-million-iteration counted loop was one
+ * of them: 124ms interpreted against 12ms compiled, decided by a catch block
+ * the opcode histogram says runs zero times.
+ *
+ * Instead, deoptimise unconditionally here. The interpreter resumes at this
+ * exact instruction holding exactly what the model says, which is what every
+ * failed guard already does -- the cold path is interpreted and the hot path
+ * around it still compiles. It declines only when a deopt site cannot be built
+ * at this offset, which is deoptSite's existing "a guard resumes an instruction
+ * whose operands it has already consumed" test and exactly the right question.
+ *
+ * Nothing on the fall-through edge past an unconditional deopt can execute, so
+ * the walk does not model it: it skips to the next offset something can BRANCH
+ * to, or to the end. Advancing the model by the opcode's static stack effect
+ * instead was the other option and buys nothing -- every instruction it would
+ * emit is unreachable -- while needing a kind for whatever the opcode produced,
+ * which the tier by definition does not have for an opcode it cannot compile.
+ * A skipped offset keeps offsetToInst == -1, so a branch that does target one
+ * declines when the fixups are resolved rather than jumping into nothing. */
+static bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
+    if (e->inlining) {
+        /* Half an inlined body cannot be taken back, and the caller reads the
+         * result out of the model -- past a deopt there is none. */
+        e->whyNot = "an inlined body reaching an opcode this tier cannot speak";
+        return false;
+    }
+    unsigned k;
+    if (!deoptRecordAt(e, e->curOffset, false, &k)) return false;
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
+    e->fixups[e->fixupCount].conditional  = false;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64B(0));
+
+    int at = *off;
+    for (;;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;      /* undecodable: the walk is lost */
+        at += len;
+        if (at >= stop) break;
+        if (offsetIsBranchTarget(c, (uint32_t)at)) break;
+    }
+    *off = at;
+    return true;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -6823,12 +6877,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         default:
-            if (getenv("JAI_JIT_WHY")) {
-                fprintf(stderr, "[jit] %s declined at %s\n",
-                        fn->name ? fn->name->chars : "<anon>",
-                        jaiOpName((OpCode)op));
+            /* An opcode this tier does not speak: interpreted from here, rather
+             * than the whole function interpreted. See emitUnarmedDeopt. */
+            if (!emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s declined at %s\n",
+                            fn->name ? fn->name->chars : "<anon>",
+                            jaiOpName((OpCode)op));
+                }
+                return false;
             }
-            return false;   /* an opcode this tier does not speak */
+            afterUncond = true;   /* the fall-through edge is gone */
+            continue;
         }
     }
     fpSyncAll(e);
