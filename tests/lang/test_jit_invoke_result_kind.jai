@@ -25,6 +25,18 @@
 #: iteration, which is what turns a wrong resume point into a wrong answer:
 #: the call has already happened when the guard is reached, so a deopt that
 #: resumed AT the call rather than after it would run it twice.
+#:
+#: scripts/jit_compile_check.py fails if any name below stops reaching the
+#: compiled tier under JAI_JIT_WHY=1. `sum_boxes` compiles only through OSR --
+#: its whole-function attempt always declines on OP_GET_FIELD, reading off a
+#: PREDICTED result the measuring pass does not support -- so `warm_boxes`'s
+#: n=8 inner loop has to give the sampler enough on-function time across 8000
+#: calls; measured reliable. `sum_labels` needed the same thing but was not
+#: getting it at n=8 (OP_EQ has the identical measuring-pass gap), so
+#: `warm_labels` below calls it with n=64 instead -- purely to buy the sampler
+#: more time in the one function that matters, not a change to what is
+#: asserted.
+# jit-compiles: sum_boxes, sum_labels, drive
 from std.test import assert_eq, assert_near, assert_throws
 
 class Box {
@@ -111,7 +123,11 @@ fn warm_boxes(m: Maker) -> void {
 }
 
 fn warm_labels(m: Maker) -> void {
-    for _r in 0..8000 { sum_labels(m, 8) }
+    #: n=64 rather than sum_boxes's n=8: at n=8 the sampler did not reliably
+    #: land a tick inside sum_labels across all 8000 calls (see the file
+    #: header). More work per call, same number of calls, no change to what
+    #: any assertion below checks.
+    for _r in 0..8000 { sum_labels(m, 64) }
 }
 
 fn warm_drive(m: Maker) -> void {
