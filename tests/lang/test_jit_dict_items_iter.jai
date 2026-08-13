@@ -24,6 +24,20 @@
 #: expectations and the plain run proves the compiled code agrees. A deopt does
 #: not retire compiled code, so one function keeps its teeth across a whole
 #: test.
+#:
+#: scripts/jit_compile_check.py fails if any name below stops reaching the
+#: compiled tier under JAI_JIT_WHY=1. `join_keys` and `spell` are NOT in it:
+#: both concatenate a `str` (`acc = acc + k`), and OP_ADD_LOCALS on two dynamic
+#: operands has no measuring-pass support at all -- "add-bind of a kind that is
+#: neither int nor float", every attempt, warm or not. That is a real gap in
+#: what this file can pin about the compiled tier's key-side handling; it is
+#: not a heat problem this marker (or moving the case) can fix, so it is
+#: recorded here rather than silently marked as covered. `bag_total` is
+#: correctly never compiled -- `Bag.items()` is a user method, not a dict, and
+#: `OP_FOR_ITER_BIND`'s whole reason for existing is to decline exactly that
+#: receiver rather than guess, so its absence from the marker is the point, not
+#: a gap.
+# jit-compiles: sum_values, count, one_call_sum, nested
 from std.test import assert_eq, assert_near, assert_throws
 
 #: `any` rather than `int` because the whole point is that a value may widen the
