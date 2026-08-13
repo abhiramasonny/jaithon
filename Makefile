@@ -479,10 +479,20 @@ jit-declines-check:
 # list_for-add-int-to-*, printing raw pointers and IEEE bit patterns where the
 # interpreter raises TypeError. Against the fixed tree, 0 of 144.
 #
+# Its companion, iter_mutation.py, asks the other half of the question: not
+# "what if the KIND changes" but "what if the CONTAINER does". A compiled loop
+# caches an iterator's index, its limit and a pointer to the backing array, and
+# ObjList::version is the only thing that says the program moved the ground.
+# Teeth established the same way: with that one branchOnDeopt removed from
+# OP_FOR_ITER_BIND's list arm, 15 of 21 cases mismatch and the compiled loop
+# silently returns 2115/65 -- walking a REALLOCATED array -- where the
+# interpreter raises RuntimeError.
+#
 # Out of `make test` because it is ~4 minutes. Run it when touching the tier.
 .PHONY: kind-fuzz
 kind-fuzz: $(TARGET)
 	@python3 tests/fuzz/kind_mutation.py --warm $(KIND_FUZZ_WARM)
+	@python3 tests/fuzz/iter_mutation.py --warm $(KIND_FUZZ_WARM)
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
