@@ -5167,7 +5167,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!localInRange(e, fslot)) return false;
                 unsigned rIt = pushReg(e) - 1;
 
-                if (e->stackShape[e->depth - 1] == 1) {
+                /* 0 is a range, 1 an iterator the runtime has to step, 2 and 3
+                 * ranges this body built (see OP_GET_ITER). Anything else is
+                 * not something the inline range form may assume, so it keeps
+                 * the stepped path this test has always sent it down. */
+                uint32_t iterShape = e->stackShape[e->depth - 1];
+                if (iterShape != 0 && iterShape != 2 && iterShape != 3) {
                     /* A list iterator: ask the runtime for each element and
                      * take the kind from the one it is holding now. */
                     Value sample = e->stackSeen[e->depth - 1];
@@ -5233,7 +5238,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * read at all, which is five loads and a multiply off the back
                  * of every nested `for k in 0..n`: matrix_mul spends fourteen
                  * of its innermost forty-nine instructions on this counter. */
-                uint32_t iterShape = e->stackShape[e->depth - 1];
+                /* Shape 3's constant travels in the entry's sample, and an
+                 * entry can reach here having been through a local, where the
+                 * sample need not have come with it. No sample, no shortcut:
+                 * the general form below is right for any range. */
+                if (iterShape == 3 && !IS_INT(e->stackSeen[e->depth - 1])) {
+                    iterShape = 2;
+                }
                 if (iterShape == 3) {
                     int64_t k = AS_INT(e->stackSeen[e->depth - 1]);
                     if (k > 0 && k <= 4095) {
