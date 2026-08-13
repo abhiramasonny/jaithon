@@ -386,6 +386,17 @@ typedef struct {
     ObjClass *stackClass[JIT_MAX_STACK];
     Value     stackSeen[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
+    /* This entry is not merely a string by sample -- it came out of the shared
+     * one-byte ASCII table, so it IS an interned ObjString, and the guards a
+     * string compare would otherwise emit for it are dead code. A proof, not a
+     * prediction, so it may delete a guard rather than only choose one.
+     *
+     * A prediction survives a branch merge harmlessly (a wrong guess still
+     * guards); a proof does not, because the other edge into a join carries a
+     * value this walk never saw. The linear walk models only the fall-through
+     * edge, so every flag is dropped at any offset something else can reach --
+     * see the clearAsciiProofs call in the walk. */
+    bool      stackAscii[JIT_MAX_STACK];
 
     /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
      * can have changed it (the body can't call) -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses. */
@@ -1147,6 +1158,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackClass[e->depth] = klass;
     e->stackSeen[e->depth]  = seen;
     e->stackLocal[e->depth] = fromLocal;
+    e->stackAscii[e->depth] = false;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
@@ -1196,8 +1208,21 @@ static void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) 
 
 static bool pushSelf(Emit *e) {
     if (e->depth >= JIT_MAX_STACK) return false;
+    e->stackAscii[e->depth] = false;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
+}
+
+/* Retire every "came out of the ASCII table" proof. See Emit::stackAscii. */
+static void clearAsciiProofs(Emit *e) {
+    for (unsigned i = 0; i < JIT_MAX_STACK; i++) e->stackAscii[i] = false;
+}
+
+static bool anyAsciiProof(const Emit *e) {
+    for (unsigned i = 0; i < e->depth; i++) {
+        if (e->stackAscii[i]) return true;
+    }
+    return false;
 }
 
 /* Pop an entry that has already been read out of its FP register, or that was
@@ -3135,6 +3160,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
         afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
         uint8_t op = code[off];
+        /* An ASCII-table proof is only good along the fall-through edge this
+         * walk is following. offsetIsBranchTarget scans the whole chunk, so it
+         * catches a back edge whose branch has not been emitted yet -- and it
+         * is only asked while a proof is actually live, which is the two or
+         * three instructions between `s[i]` and whatever consumes it. */
+        if (anyAsciiProof(e) &&
+            offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
+            clearAsciiProofs(e);
+        }
         /* Settles any deferred entry BEFORE the offset map records the instruction start, so a branch landing
  * here (arriving with everything in its own register) skips the settle and only the fall-through pays -- both paths then agree, which a join requires. Forward branches are known here; backward ones checked at the end. */
         if (anyDeferred(e)) {
@@ -3705,6 +3739,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * this: one-character strings are shared singletons). Anything not interned, or not a string, deopts and the interpreter compares properly. */
                 for (unsigned side = 0; side < 2; side++) {
                     unsigned r = side == 0 ? ra : rb;
+                    /* Already known to be an interned string: `s[i] == t[j]`
+                     * would otherwise guard twelve instructions to reach one
+                     * compare. */
+                    if (e->stackAscii[e->depth - (side == 0 ? 2u : 1u)]) continue;
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
                                        (unsigned)offsetof(Obj, type)));
                     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
@@ -3808,6 +3846,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned ra = valueXReg(e, e->valueDepth - 2);
                 for (unsigned side = 0; side < 2; side++) {
                     unsigned r = side == 0 ? ra : rb;
+                    /* See the same skip in OP_EQ. */
+                    if (e->stackAscii[e->depth - (side == 0 ? 2u : 1u)]) continue;
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
                                        (unsigned)offsetof(Obj, type)));
                     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
@@ -5353,19 +5393,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                    (unsigned)offsetof(ObjString, chars)));
                 emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
                 emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
-                emitConst64(e, JIT_SCRATCH_B, 128);
-                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                /* 128 is an imm12, so the compare needs no register: a
+                 * materialised constant on a body this hot is not free the way
+                 * a register copy is. */
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 128));
                 branchOnDeopt(e, JAI_A64_HS);
 
-                /* The shared one-byte string. NULL until first asked for, so a
-                 * character this program has not seen deopts once. */
+                /* The shared one-byte string. jaiVMInit fills all 128 slots, so
+                 * this is a load and not a load plus a null test -- see
+                 * jaiAsciiCharsFill. The scaled add folds the shift in. */
                 emitConst64(e, JIT_SCRATCH_C,
                             (int64_t)(uintptr_t)jaiAsciiCharTable());
-                emit(e, jaiA64LslX(JIT_SCRATCH_B, JIT_SCRATCH_A, 3));
-                emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_A, 3));
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C, 0));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
-                branchOnDeopt(e, JAI_A64_EQ);
 
                 /* Carry a sample so later instructions know this is a
                  * string: the receiver serves, since only its type is read.
@@ -5378,6 +5419,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, strSample, -1)) {
                     return false;
                 }
+                /* What the table holds is interned by construction -- see
+                 * jaiStringChar -- so a consumer that would guard this for
+                 * being a string, and for being interned, need not. */
+                e->stackAscii[e->depth - 1] = true;
                 emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
                 off += 1;
                 break;
