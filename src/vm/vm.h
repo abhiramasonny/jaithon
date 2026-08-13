@@ -82,6 +82,7 @@ typedef struct VM {
     bool         countInstructions;
     bool         debugGC;
     bool         gcStress;
+    unsigned     gcStressEvery;   /* see GCState::stressEvery */
     bool         releaseMode;
     int          optLevel;
 
