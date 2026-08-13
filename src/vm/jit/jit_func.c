@@ -580,6 +580,13 @@ typedef struct {
     uint32_t  clobberOff[JIT_MAX_CLOBBER];
     unsigned  clobberCount;
     bool      clobberSpill;
+    /* The deepest the operand stack ever was at one of those sites. Every entry
+     * live when a helper runs is below it, so every entry AT or ABOVE it is
+     * provably never live across a call -- which is the whole condition for
+     * putting one in a caller-saved register. Unlike a region, this is an
+     * index, so where an entry lives stays a function of its index alone and
+     * every join, deopt record and stub keeps agreeing about it for free. */
+    unsigned  clobberDepth;
     /* The operand stack lives in x0..x8 rather than above the locals in the
      * callee-saved bank. Sound exactly when nothing can clobber a caller-saved
      * register between a push and its use, i.e. `!clobbersScratch` and the
@@ -589,6 +596,21 @@ typedef struct {
      * expression is seven deep left NOTHING for its four row pointers and its
      * index, and reloaded all five from the frame every iteration. */
     bool      scratchValues;
+    /* The same idea one granularity down, for a body that DOES call. Entries
+     * below `splitAt` stay in the callee-saved bank; entries at or above it
+     * live in x0..x8. `splitAt` is the deepest the operand stack ever is at a
+     * clobber site (Emit::clobberDepth), so an entry at or above it is one no
+     * helper can ever be running underneath -- which is the whole soundness
+     * condition, stated about an entry's live range rather than about the
+     * body. Zero means no split.
+     *
+     * A split INDEX rather than a region is what keeps this cheap: where an
+     * entry lives stays a function of its index alone, so joins, deopt records
+     * and stubs all keep agreeing about it without being told anything. The
+     * price is that the operand stack is no longer one run of registers, and
+     * every site that used to add an index to a base has to say `valueBankReg`
+     * instead. */
+    unsigned  splitAt;
     /* probe.clobbersScratch, carried into the real pass. `no call anywhere in
      * this body` is a stronger statement than `the values may live in x0..x8`
      * -- scratchValues also wants the stack to fit nine -- and the hoist below
@@ -1116,7 +1138,17 @@ static unsigned valueBankBase(const Emit *e) {
 static unsigned valueBankRoom(const Emit *e) {
     if (e->scratchValues) return e->scratchRoom;
     unsigned taken = regBase(e) + (e->usesUpvalues ? 1u : 0u);
-    return taken < JIT_MAX_SAVED ? JIT_MAX_SAVED - taken : 0u;
+    unsigned saved = taken < JIT_MAX_SAVED ? JIT_MAX_SAVED - taken : 0u;
+    /* Split: `splitAt` entries in what is left of the callee-saved bank and
+     * nine more above them. If the callee-saved half does not itself fit --
+     * which the plan sized it not to, but `usesUpvalues` is decided later --
+     * the answer is that smaller number, so the push declines rather than
+     * running off the end of the bank. */
+    if (e->splitAt != 0) {
+        return saved < e->splitAt ? saved
+                                  : e->splitAt + JIT_SCRATCH_BANK_COUNT;
+    }
+    return saved;
 }
 
 /* Something about to be emitted can destroy x0..x8 with the body still live:
@@ -1140,6 +1172,7 @@ static void noteScratchClobber(Emit *e) {
         } else {
             e->clobberSpill = true;
         }
+        if (e->valueDepth > e->clobberDepth) e->clobberDepth = e->valueDepth;
     }
     if (e->scratchValues) {
         e->whyNot = "a call reached a body whose values are in scratch";
@@ -1160,6 +1193,14 @@ static void noteScratchClobber(Emit *e) {
             return;
         }
     }
+    /* And the ratchet the split bank rests on. `splitAt` was chosen as the
+     * deepest the measuring pass ever saw the stack at one of these, so a real
+     * pass standing deeper means the two walks disagreed and an entry in
+     * x0..x8 is about to be run over by the helper. Costs a compile. */
+    if (!e->measuring && e->splitAt != 0 && e->valueDepth > e->splitAt) {
+        e->whyNot = "a call stood deeper than the split bank allows";
+        e->failed = true;
+    }
 }
 
 /* An inlined body needs its own bank only when the caller's is somewhere else.
@@ -1171,15 +1212,31 @@ static bool inlineOwnBank(const Emit *e) {
     return e->inlining && !e->scratchValues;
 }
 
-static unsigned valueXReg(const Emit *e, unsigned idx) {
-    if (inlineOwnBank(e) && idx >= e->inlValueBase) {
-        return JIT_INL_BANK + (idx - e->inlValueBase);
+/* Where entry `idx` of the ordinary (non-inlined) operand stack lives. One run
+ * of registers unless the bank is split, in which case the entries at and above
+ * `splitAt` continue in x0.. instead. Every site that used to write
+ * `valueBankBase(e) + idx` says this now, so the split cannot be half-applied:
+ * with splitAt == 0 the two are the same expression. */
+static unsigned valueBankReg(const Emit *e, unsigned idx) {
+    if (e->splitAt != 0 && idx >= e->splitAt) {
+        return JIT_INL_BANK + (idx - e->splitAt);
     }
     return valueBankBase(e) + idx;
 }
 
+static unsigned valueXReg(const Emit *e, unsigned idx) {
+    if (inlineOwnBank(e) && idx >= e->inlValueBase) {
+        return JIT_INL_BANK + (idx - e->inlValueBase);
+    }
+    return valueBankReg(e, idx);
+}
+
 /* One past the top entry's register. Expressing it this way (not from the bottom) is what keeps
- * `pushReg(e) - 1` == "the entry just pushed" true across both register banks. */
+ * `pushReg(e) - 1` == "the entry just pushed" true across both register banks.
+ *
+ * Subtracting TWO or more from it is not safe under a split bank -- the entry
+ * below the top may be in the other half -- so those sites name the entry they
+ * mean, as `valueXReg(e, e->valueDepth - n)`. */
 static unsigned pushReg(const Emit *e) {
     if (e->valueDepth == 0) return valueXReg(e, 0);
     return valueXReg(e, e->valueDepth - 1) + 1;
@@ -2361,7 +2418,7 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
     for (unsigned idx = 0; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
         if (!holdsRegister(k)) continue;
-        unsigned reg = valueBankBase(e) + seen;
+        unsigned reg = valueBankReg(e, seen);
         seen++;
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
@@ -2417,8 +2474,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
                       i * (unsigned)sizeof(Value);
-        unsigned reg = valueBankBase(e) +
-                       (idx - (e->depth - e->valueDepth));
+        unsigned reg = valueBankReg(e, idx - (e->depth - e->valueDepth));
         /* A maybe-instance's tag is not a property of its kind, and this Value
          * reaches jaiCallValue: writing VAL_OBJ over a zero payload would hand
          * the interpreter a null pointer dressed as an object. */
@@ -2781,9 +2837,9 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
     }
 
-    unsigned firstArg = valueXReg(e, firstIdx - (e->depth - e->valueDepth));
+    unsigned firstArg = firstIdx - (e->depth - e->valueDepth);
     for (unsigned i = 0; i < nargs; i++) {
-        emit(e, jaiA64MovX(i, firstArg + i));
+        emit(e, jaiA64MovX(i, valueXReg(e, firstArg + i)));
     }
     if (wantsClosure) {
         if (calleeReg >= 0) emit(e, jaiA64MovX(nargs, (unsigned)calleeReg));
@@ -3057,6 +3113,12 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
 static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg) {
     if (e->noInline) return false;
+    /* An inlined body's entries want x0..x8 (inlineOwnBank) and a split bank
+     * is already using them, so the plan withholds the split from a body the
+     * measuring pass saw inline. Refusing here as well is what makes that a
+     * fact rather than an agreement between two passes: the worst this can do
+     * is decline an inline the probe never took. */
+    if (e->splitAt != 0) return false;
     ObjFunction *cfn = callee->fn;
     if (cfn->module != caller->module) return false;
     if (e->inlining) return false;             /* one level, no recursion */
@@ -3284,6 +3346,7 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
 static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
                          unsigned argc, int callOff) {
     if (e->noInline) return false;
+    if (e->splitAt != 0) return false;   /* see inlineGlobalCall */
     unsigned ridx = e->depth - argc - 1;
     ObjClass *rcls = e->stackClass[ridx];
     if (rcls == NULL) return false;
@@ -3300,14 +3363,13 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     if (mfn->upvalueCount != 0) return false;
     if (mfn->chunk.count > 96) return false;
 
-    unsigned base = valueBankBase(e);
     unsigned inReg[JIT_MAX_ARGS_OUT + 1];
     Value    inSeen[JIT_MAX_ARGS_OUT + 1];
     ObjClass *inCls[JIT_MAX_ARGS_OUT + 1];
     for (unsigned i = 0; i <= argc; i++) {
         unsigned idx = ridx + i;
         if (!holdsRegister(e->stack[idx])) return false;
-        inReg[i]  = base + (idx - (e->depth - e->valueDepth));
+        inReg[i]  = valueBankReg(e, idx - (e->depth - e->valueDepth));
         inSeen[i] = e->stackSeen[idx];
         inCls[i]  = e->stackClass[idx];
     }
@@ -3431,8 +3493,7 @@ static bool emitCallOut(Emit *e, unsigned argc) {
                 e->whyNot = "an argument kind a field cannot take";
                 return false;
             }
-            regs[i] = valueBankBase(e) +
-                      (first + i - (e->depth - e->valueDepth));
+            regs[i] = valueBankReg(e, first + i - (e->depth - e->valueDepth));
         }
         /* Fast path (jitInstanceAlloc) is a leaf that cannot collect -- it declines whenever jaiGCWanted(),
      * exactly when jaiInstanceNew would have collected -- so needs no descriptor/roots, versus the descriptor's dozen stores plus a root push/pop just to allocate 64 bytes. NULL means it did nothing, so falling into the descriptor path is always correct; both paths land at the load below with the instance in SCRATCH_C. Skipped for a class the small-object bins can't serve. */
@@ -5275,7 +5336,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                              (unsigned)info->slot * (unsigned)sizeof(Value);
-            unsigned rr = valueBankBase(e) + e->valueDepth - 1;
+            unsigned rr = valueBankReg(e, e->valueDepth - 1);
             SlotKind already = knownFieldKind(e, fromLocal, info->slot);
             if (already != SLOT_SELF) {
                 kind = already;
@@ -5379,7 +5440,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth < 2) return false;
             if (e->stack[e->depth - 1] != SLOT_INT) return false;
             if (e->stack[e->depth - 2] != SLOT_INT) return false;
-            unsigned ry = pushReg(e) - 1, rx = pushReg(e) - 2;
+            unsigned ry = pushReg(e) - 1, rx = valueXReg(e, e->valueDepth - 2);
 
             /* A literal power-of-two modulus decides the whole thing: floor remainder by 2^s is exactly the low
              * s bits, which two's complement already holds -- exact even for negative dividends, unlike the truncating `msub` path below (whose correction exists to fix exactly that). */
@@ -5475,7 +5536,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* Every path below reads both operands out of their own registers,
              * and two of them guard. */
             settleAll(e);
-            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
+            rb = pushReg(e) - 1; ra = valueXReg(e, e->valueDepth - 2);
 
             /* Zero and -1 both decline: the interpreter reports division-by-zero, and INT64_MIN / -1 is the one
              * quotient that doesn't fit -- both rare enough that declining -1 outright costs nothing. A literal divisor has already answered both. */
@@ -5539,7 +5600,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
                 unsigned rVal  = pushReg(e) - 1;
-                unsigned rList = pushReg(e) - 2;
+                unsigned rList = valueXReg(e, e->valueDepth - 2);
 
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
                                    (unsigned)offsetof(ObjList, count)));
@@ -6770,7 +6831,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_INT &&
                 e->stack[e->depth - 2] == SLOT_OBJ &&
                 IS_STRING(e->stackSeen[e->depth - 2])) {
-                unsigned rIdx = pushReg(e) - 1, rStr = pushReg(e) - 2;
+                unsigned rIdx = pushReg(e) - 1;
+                unsigned rStr = valueXReg(e, e->valueDepth - 2);
 
                 /* Really a string, and not something else this object slot
                  * happened to hold when the loop was compiled. */
@@ -6838,7 +6900,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth < 2) return false;
             if (e->stack[e->depth - 2] != SLOT_LIST) return false;
             if (e->stack[e->depth - 1] != SLOT_INT) return false;
-            unsigned rIdx = pushReg(e) - 1, rList = pushReg(e) - 2;
+            unsigned rIdx = pushReg(e) - 1;
+            unsigned rList = valueXReg(e, e->valueDepth - 2);
 
             Value seenList = e->stackSeen[e->depth - 2];
             if (!IS_LIST(seenList)) return false;
@@ -6940,7 +7003,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->whyNot = "an index store into an object that is not a dict";
                     return false;
                 }
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 3,
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, valueXReg(e, e->valueDepth - 3),
                                    (unsigned)offsetof(Obj, type)));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
                 branchOnDeopt(e, JAI_A64_NE);
@@ -6967,8 +7030,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                               : 0xffffffffu;
             if (vtag == 0xffffffffu) return false;
             unsigned rVal = pushReg(e) - 1;
-            unsigned rIdx = pushReg(e) - 2;
-            unsigned rList = pushReg(e) - 3;
+            unsigned rIdx = valueXReg(e, e->valueDepth - 2);
+            unsigned rList = valueXReg(e, e->valueDepth - 3);
 
             noteSlotIndexed(e, e->stackLocal[e->depth - 3]);
             unsigned sItems = JIT_SCRATCH_C, sCount = JIT_SCRATCH_A;
@@ -7105,7 +7168,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     uint32_t gshape = 0;
                     ObjClass *gcls = NULL;
                     if (gslot != NULL && globalKind(gvv, &gk, &gshape, &gcls)) {
-                        unsigned dst = pushReg(e);
+                        /* The register the push BELOW will land in, named
+                         * ahead of it because the guards have to run against
+                         * the model as it is now. `pushReg` is one past the
+                         * CURRENT top, which is the same register only while
+                         * the bank is one contiguous run -- at a split
+                         * boundary it is the last callee-saved one and the
+                         * push goes to x0. That mismatch loaded a global into
+                         * a register nothing then read, and bitops printed
+                         * 68720029766 for 999625. */
+                        unsigned dst = valueXReg(e, e->valueDepth);
                         unsigned tag = gk == SLOT_INT   ? VAL_INT
                                      : gk == SLOT_FLOAT ? VAL_FLOAT
                                      : gk == SLOT_BOOL  ? VAL_BOOL
@@ -7327,8 +7399,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
                 ObjFunction *cfn = AS_CLOSURE(cv)->fn;
-                unsigned rCallee0 = valueBankBase(e) +
-                                    (cidx - (e->depth - e->valueDepth));
+                unsigned rCallee0 =
+                    valueBankReg(e, cidx - (e->depth - e->valueDepth));
 
                 /* The guard comes first now, because what follows it is a
                  * choice between two ways of making the call and both need it:
@@ -7403,10 +7475,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
                 }
 
-                unsigned firstArg = valueBankBase(e) +
-                                    (cidx + 1u - (e->depth - e->valueDepth));
+                unsigned firstArg = cidx + 1u - (e->depth - e->valueDepth);
                 for (unsigned i = 0; i < argc; i++) {
-                    emit(e, jaiA64MovX(i, firstArg + i));
+                    emit(e, jaiA64MovX(i, valueBankReg(e, firstArg + i)));
                 }
                 if (wantsClosure) emit(e, jaiA64MovX(argc, rCallee));
                 emitConst64(e, JIT_SCRATCH_D,
@@ -7496,9 +7567,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
-            unsigned first = valueBankBase(e) + e->valueDepth - argc;
+            unsigned first = e->valueDepth - argc;
             for (unsigned i = 0; i < argc; i++) {
-                emit(e, jaiA64MovX(i, first + i));
+                emit(e, jaiA64MovX(i, valueBankReg(e, first + i)));
             }
 
             /* To instruction 0, the prologue -- NOT to the first instruction
@@ -8271,7 +8342,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 valueSeen++;
                 continue;
             }
-            unsigned reg0 = valueBankBase(&e) + valueSeen;
+            unsigned reg0 = valueBankReg(&e, valueSeen);
             /* The stub is reached by a branch from the guard, so the FP bank
              * still holds whatever it held there. Moving it here rather than
              * before the guard is what keeps the hot path free of it. */
@@ -8292,7 +8363,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                          : kind == SLOT_BOOL  ? VAL_BOOL
                          : kind == SLOT_NULL  ? VAL_NULL
                                               : VAL_OBJ;
-            unsigned reg = valueBankBase(&e) + valueSeen;
+            unsigned reg = valueBankReg(&e, valueSeen);
             valueSeen++;
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
@@ -8748,6 +8819,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     unsigned probeMaxValue = 0;
     unsigned probeMaxValueAll = 0;
     unsigned probeStranded = 0;
+    unsigned probeClobberDepth = 0;
     bool probeRan = false;
     {
         static Emit probe;
@@ -8779,6 +8851,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             if (used < e.locals) e.locals = used;
             probeMaxValue = probe.maxValue;
             probeMaxValueAll = probe.maxValueAll;
+            probeClobberDepth = probe.clobberDepth;
             probeRan = true;
 
             /* A body that never calls out and never inlines can put its
@@ -8790,12 +8863,33 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
              * or accumulators to keep. */
             e.scratchValues = !probe.clobbersScratch &&
                               probe.maxValueAll <= JIT_INL_COUNT;
+            /* A body that DOES call still need not keep its WHOLE stack in the
+             * callee-saved bank -- only the part of it that can be live while
+             * a helper runs, which is everything below the deepest the stack
+             * ever is at a call. life's `step` goes five deep summing nine
+             * neighbours and two deep at its `row.push`, so three of its five
+             * operand registers were being held against a call that can never
+             * see them, while five of its locals sat in memory.
+             *
+             * Not offered to a body that inlines: an inlined body takes x0..x8
+             * for its own entries (inlineOwnBank), and both cannot have them.
+             * Not offered to the function tier either, which does not run this
+             * code -- x0..x3 are its arguments and the roadmap prices the same
+             * change there at +-1%. */
+            if (!e.scratchValues && probe.clobbersScratch && !probe.inlined &&
+                probe.maxValue > probe.clobberDepth &&
+                probe.maxValue - probe.clobberDepth <= JIT_SCRATCH_BANK_COUNT) {
+                e.splitAt = probe.clobberDepth;
+            }
             /* What is left over after the loop's own reserved registers and
              * the deepest expression the body builds. maxValue is model state,
              * not a register number, so measuring it in memory mode and
-             * spending it here is sound. */
+             * spending it here is sound. Under a split only the half below
+             * `splitAt` is charged to the callee-saved bank. */
             unsigned overhead = osrReserved(&e) +
-                                (e.scratchValues ? 0u : probe.maxValue);
+                                (e.scratchValues ? 0u
+                                 : e.splitAt != 0 ? e.splitAt
+                                                  : probe.maxValue);
             unsigned availX = overhead < JIT_MAX_SAVED
                                   ? JIT_MAX_SAVED - overhead : 0u;
             unsigned availFp = JIT_FP_MAX_SAVED;
@@ -8970,13 +9064,14 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
          * that adding it cannot invent census entries. */
         if (probeRan) fprintf(stderr,
                 "[jit] osr %s at %u registers: %u reserved, %u stack "
-                "(%u incl. inlined), %u x-locals, %u fp-locals, %u stranded, "
-                "bank %s, of %u; %s\n",
+                "(%u incl. inlined), %u deep at a call, %u x-locals, "
+                "%u fp-locals, %u stranded, bank %s, of %u; %s\n",
                 fn->name ? fn->name->chars : "<anon>", top,
                 osrReserved(&e), probeMaxValue, probeMaxValueAll,
-                e.xLocals, e.fpLocals, probeStranded,
-                e.scratchValues ? "x0" : "callee-saved", JIT_MAX_SAVED,
-                e.bodyCalls ? "calls" : "call-free");
+                probeClobberDepth, e.xLocals, e.fpLocals, probeStranded,
+                e.scratchValues ? "x0"
+                                : e.splitAt != 0 ? "split" : "callee-saved",
+                JIT_MAX_SAVED, e.bodyCalls ? "calls" : "call-free");
         for (unsigned i = 0; i < e.hoistCount; i++) {
             fprintf(stderr,
                     "[jit] osr at %u hoists slot %u's header out of %u..%u "
@@ -9136,7 +9231,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 valueSeen++;
                 continue;
             }
-            unsigned reg0 = valueBankBase(&e) + valueSeen;
+            unsigned reg0 = valueBankReg(&e, valueSeen);
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
                 emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
             }
@@ -9153,7 +9248,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                          : kind == SLOT_BOOL  ? VAL_BOOL
                          : kind == SLOT_NULL  ? VAL_NULL
                                               : VAL_OBJ;
-            unsigned reg = valueBankBase(&e) + valueSeen;
+            unsigned reg = valueBankReg(&e, valueSeen);
             valueSeen++;
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
