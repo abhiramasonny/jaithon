@@ -199,6 +199,29 @@ typedef enum {
      */
     OP_GET_ITER_ITEMS,       /* i16 J */
 
+    /* `for (a, b) in …` fused (spec §3.3): the whole of
+     *
+     *     FOR_ITER J; UNPACK 2 255; BIND A; BIND B
+     *
+     * in one instruction, and — this is the point of it — with no pair object
+     * in between. The unfused sequence makes the iterator materialise a pair,
+     * pushes it, takes it apart and drops it again, so a dict walked by
+     * `for (k, v) in d.items()` allocated one 2-tuple per entry per pass:
+     * 4.8M tuples and 306 MB freed on tests/bench/dict_iter, where the
+     * collector was 30% of the run.
+     *
+     * Deliberately fused from the BYTECODE and not emitted from the pattern:
+     * every `for (a, b) in <anything>` lowers to exactly the four instructions
+     * above, whatever the receiver is, so matching them covers dicts, lists of
+     * pairs, `enumerate` and a user iterator alike with no type knowledge at
+     * the emitter — which has none to offer (see emit.jai's note at :2853).
+     *
+     * A dict-items iterator yields its key and value straight into the two
+     * slots. Anything else produces its item as usual and the item is split in
+     * place; an item that is not a 2-element list or tuple raises exactly what
+     * OP_UNPACK raised for it. */
+    OP_FOR_ITER_PAIR,        /* i16 J, u16 A, u16 B */
+
     OP_COUNT
 } OpCode;
 

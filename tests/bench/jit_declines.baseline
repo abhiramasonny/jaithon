@@ -5,6 +5,7 @@ stopped : callee is not a compiled global function
 stopped : loop variable took two kinds
 stopped: OP_CALL
 stopped: OP_FOR_ITER
+stopped: OP_FOR_ITER_PAIR
 stopped: add-bind of a kind that is neither int nor float
 stopped: callee is not a compiled global function
 stopped: callee's return kind not usable

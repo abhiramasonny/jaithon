@@ -807,6 +807,7 @@ fn _build_branch_at() -> dict[int, int] {
         Op.Loop,
         Op.ForIter,
         Op.ForIterBind,
+        Op.ForIterPair,
         # Branches past the ordinary `INVOKE items; GET_ITER` when its receiver
         # turns out to be a dict. The optimiser rebuilds chunks and re-resolves
         # every branch, so an unregistered one is not merely unoptimised: the
@@ -853,6 +854,7 @@ fn _build_slot_operands() -> dict[int, list[int]] {
     ]
     for op in leading { table[opcode(op)] = [0] }
     table[opcode(Op.ForIterBind)] = [2]      # the slot follows the i16 jump
+    table[opcode(Op.ForIterPair)] = [2, 4]   # both slots follow the i16 jump
     table[opcode(Op.JumpIfCmpLocalK)] = [1]  # the slot follows the u8 comparison
     for op in [Op.GetLocal2, Op.AddLocals] { table[opcode(op)] = [0, 2] }
     return table
