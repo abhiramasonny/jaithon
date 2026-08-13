@@ -38,6 +38,10 @@
 
 #include "vm/object/object.h"
 
+#ifdef JAI_ALLOC_CENSUS
+#  include <inttypes.h>
+#endif
+
 #include "vm/gc.h"
 #include "vm/table.h"
 #include "vm/vm.h"
@@ -46,7 +50,39 @@
 /* Allocation and lifetime                                              */
 /* ------------------------------------------------------------------ */
 
+/* The allocation census: how many objects of each kind a program made, and how
+ * many bytes that was. Off unless the whole tree is built with it, because the
+ * two increments belong on the hottest path there is:
+ *
+ *   make -j8 BUILD_ROOT=build-census TARGET=jaithon-census \
+ *        EXTRA_CFLAGS=-DJAI_ALLOC_CENSUS
+ *   ./jaithon-census --stats run prog.jai
+ *
+ * `--stats` already reported a single allocation total, which says a program
+ * allocates a lot but never what. Splitting it by kind is what identified 4.5M
+ * of nbody's 4.5M allocations as the ObjRange and ObjIter that `for i in 0..n`
+ * builds per loop ENTRY -- a benchmark whose own header says it measures float
+ * math. The GC half of the same picture is in jaiGCPrintStats. */
+#ifdef JAI_ALLOC_CENSUS
+uint64_t jaiAllocByType[OBJ_TYPE_COUNT];
+uint64_t jaiAllocBytesByType[OBJ_TYPE_COUNT];
+
+void jaiAllocPrintCensus(FILE *out) {
+    if (out == NULL) return;
+    for (int i = 0; i < OBJ_TYPE_COUNT; i++) {
+        if (jaiAllocByType[i] == 0) continue;
+        fprintf(out, "alloc %-14s %12" PRIu64 " %14" PRIu64 " bytes\n",
+                jaiObjTypeName((ObjType)i), jaiAllocByType[i],
+                jaiAllocBytesByType[i]);
+    }
+}
+#endif
+
 static inline Obj *allocObj(size_t size, ObjType type) {
+#ifdef JAI_ALLOC_CENSUS
+    jaiAllocByType[type]++;
+    jaiAllocBytesByType[type] += size;
+#endif
     /* Collect *before* the allocation: afterwards the new object is not yet
      * reachable from any root and a collection would free it. Guarding this
      * with the inlined jaiGCWanted() test used to measure a wash, because the

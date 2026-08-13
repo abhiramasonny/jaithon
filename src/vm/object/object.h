@@ -758,6 +758,11 @@ Obj  *jaiAllocateObjectRaw(size_t size, ObjType type);
 void  jaiFreeObject(Obj *obj);
 const char *jaiObjTypeName(ObjType t);
 
+#ifdef JAI_ALLOC_CENSUS
+/* Allocations by object kind. See the census note in object.c. */
+void jaiAllocPrintCensus(FILE *out);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Hashing                                                              */
 /* ------------------------------------------------------------------ */

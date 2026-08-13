@@ -6163,6 +6163,9 @@ void jaiVMPrintStats(FILE *out) {
         if (jaiPropRecv[i] > 0)
             fprintf(out, "getProperty recv type %d: %" PRIu64 "\n", i, jaiPropRecv[i]);
 #endif
+#ifdef JAI_ALLOC_CENSUS
+    jaiAllocPrintCensus(out);
+#endif
     fprintf(out, "vm: %" PRIu64 " instructions, %" PRIu64 " calls, %" PRIu64
                  " allocations\n",
             vm.instructionCount, vm.callCount, vm.allocCount);
