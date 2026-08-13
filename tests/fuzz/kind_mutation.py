@@ -116,6 +116,53 @@ fn probe(d: dict) -> str {
     return f"{acc}/{text.len()}"
 }
 """,
+    # A tuple element. Fixed-size and hashable, so a different arm than a list.
+    "tuple_elem": """
+fn probe(xs: list) -> str {
+    var acc = 0
+    var text = ""
+    for t in xs {
+        let x = t[1]
+        CONSUMER
+    }
+    return f"{acc}/{text.len()}"
+}
+""",
+    # A closure upvalue read through the closure. `cur` is a `var`, so it is
+    # captured BY REFERENCE -- the compiled body specialises to the kind it was
+    # holding, and the loop then puts a different one there.
+    "upvalue": """
+fn probe(xs: list) -> str {
+    var acc = 0
+    var text = ""
+    var cur: any = 0
+    let peek = || cur
+    for e in xs {
+        cur = e
+        let x = peek()
+        CONSUMER
+    }
+    return f"{acc}/{text.len()}"
+}
+""",
+    # A function whose RETURN kind changes. Roadmap section 6: a prediction
+    # recorded at inline-cache fill is a first observation.
+    "return_kind": """
+fn source(v: any, flip: bool) -> any {
+    if flip { return v }
+    return 1
+}
+
+fn probe(xs: list) -> str {
+    var acc = 0
+    var text = ""
+    for e in xs {
+        let x = source(e, true)
+        CONSUMER
+    }
+    return f"{acc}/{text.len()}"
+}
+""",
 }
 
 # How main builds the container for each shape, warms it, then mutates it.
@@ -173,6 +220,45 @@ fn main() -> int {
     d["late"] = LATE
     print(attempt(d))
     print(attempt(d))
+    return 0
+}
+""",
+    "tuple_elem": """
+fn main() -> int {
+    var xs: list = []
+    for _i in 0..64 { xs.push((0, EARLY)) }
+    var warm = ""
+    for _r in 0..WARM { warm = attempt(xs) }
+    print(warm)
+    xs.push((0, LATE))
+    print(attempt(xs))
+    print(attempt(xs))
+    return 0
+}
+""",
+    "upvalue": """
+fn main() -> int {
+    var xs: list = []
+    for _i in 0..64 { xs.push(EARLY) }
+    var warm = ""
+    for _r in 0..WARM { warm = attempt(xs) }
+    print(warm)
+    xs.push(LATE)
+    print(attempt(xs))
+    print(attempt(xs))
+    return 0
+}
+""",
+    "return_kind": """
+fn main() -> int {
+    var xs: list = []
+    for _i in 0..64 { xs.push(EARLY) }
+    var warm = ""
+    for _r in 0..WARM { warm = attempt(xs) }
+    print(warm)
+    xs.push(LATE)
+    print(attempt(xs))
+    print(attempt(xs))
     return 0
 }
 """,
