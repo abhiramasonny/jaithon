@@ -1292,9 +1292,13 @@ static void emitConst64(Emit *e, unsigned rd, int64_t value) {
         emit(e, jaiA64MovnX(rd, (unsigned)(~(uint64_t)value & 0xffffu)));
         return;
     }
+    /* MOVZ where the first non-zero chunk is, not always at chunk 0: it zeroes the other three either way,
+     * so a `movz rd,#0` under a single `movk` was one instruction spent writing nothing. Every float constant has this shape -- IEEE-754 puts sign, exponent and the leading mantissa bits in the TOP chunk -- so `1.0` was two instructions and is now one, everywhere a float literal reaches a register. */
     uint64_t bits = (uint64_t)value;
-    emit(e, jaiA64MovzX(rd, (unsigned)(bits & 0xffffu), 0));
-    for (unsigned shift = 1; shift < 4; shift++) {
+    unsigned first = 0;
+    while (first < 3 && ((bits >> (16 * first)) & 0xffffu) == 0) first++;
+    emit(e, jaiA64MovzX(rd, (unsigned)((bits >> (16 * first)) & 0xffffu), first));
+    for (unsigned shift = first + 1; shift < 4; shift++) {
         unsigned part = (unsigned)((bits >> (16 * shift)) & 0xffffu);
         if (part != 0) emit(e, jaiA64MovkX(rd, part, shift));
     }
