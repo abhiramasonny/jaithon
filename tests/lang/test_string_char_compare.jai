@@ -75,8 +75,7 @@ fn count_self_matches(a: str, b: str, reps: int) -> int {
 #: leave a proof lying where the other arm's value will be. With the arms the
 #: other way round the then-arm's proof is overwritten by the else-arm's push
 #: and nothing can go wrong, which is why that ordering tests nothing.
-fn char_in_else(s: str, other: str, lit: str, take_other: bool,
-                reps: int) -> int {
+fn char_in_else(s: str, other: str, lit: str, take_other: bool, reps: int) -> int {
     var hits = 0
     var r = 0
     while r < reps {
