@@ -403,6 +403,7 @@ typedef struct {
     unsigned  depth;
     unsigned  valueDepth;
     unsigned  maxValue;
+    unsigned  maxValueAll;
 
     Fixup     fixups[JIT_MAX_FIXUPS];
     unsigned  fixupCount;
@@ -511,8 +512,9 @@ typedef struct {
     bool      clobbersScratch;
     /* The operand stack lives in x0..x8 rather than above the locals in the
      * callee-saved bank. Sound exactly when nothing can clobber a caller-saved
-     * register between a push and its use, i.e. `!clobbersScratch` and no
-     * inlined body (which claims that bank for itself). Worth having because
+     * register between a push and its use, i.e. `!clobbersScratch` and the
+     * whole stack -- an inlined body's entries included, which is what
+     * maxValueAll counts -- fits the nine. Worth having because
      * the two banks were competing for the same ten registers: a stencil whose
      * expression is seven deep left NOTHING for its four row pointers and its
      * index, and reloaded all five from the frame every iteration. */
@@ -975,8 +977,17 @@ static void noteScratchClobber(Emit *e) {
     }
 }
 
+/* An inlined body needs its own bank only when the caller's is somewhere else.
+ * Once the caller's operand stack is already x0..x8 the two are the SAME bank,
+ * and restarting at x0 would overwrite the entries the call site is standing
+ * on -- so the inlined entries simply continue the caller's numbering, which
+ * `scratchValues` has already proved fits (probe.maxValueAll <= the bank). */
+static bool inlineOwnBank(const Emit *e) {
+    return e->inlining && !e->scratchValues;
+}
+
 static unsigned valueXReg(const Emit *e, unsigned idx) {
-    if (e->inlining && idx >= e->inlValueBase) {
+    if (inlineOwnBank(e) && idx >= e->inlValueBase) {
         return JIT_INL_BANK + (idx - e->inlValueBase);
     }
     return valueBankBase(e) + idx;
@@ -994,7 +1005,7 @@ static unsigned pushReg(const Emit *e) {
 #define JIT_INL_FP_BANK 2u
 
 static unsigned fpRegAt(const Emit *e, unsigned idx) {
-    if (e->inlining && idx >= e->inlValueBase) {
+    if (inlineOwnBank(e) && idx >= e->inlValueBase) {
         return JIT_INL_FP_BANK + (idx - e->inlValueBase);
     }
     return JIT_FP_BANK + idx;
@@ -1199,12 +1210,12 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
         e->whyNot = "the operand stack is deeper than the model allows";
         return false;
     }
-    if (!e->measuring && e->inlining &&
+    if (!e->measuring && inlineOwnBank(e) &&
         e->valueDepth + 1u - e->inlValueBase > JIT_INL_COUNT) {
         e->whyNot = "an inlined body wants more registers than a call leaves free";
         return false;
     }
-    if (!e->measuring && !e->inlining &&
+    if (!e->measuring && !inlineOwnBank(e) &&
         e->valueDepth + 1 > valueBankRoom(e)) {
         e->whyNot = "more live values than there are callee-saved registers";
         return false;
@@ -1227,6 +1238,11 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
         !(e->inlining && e->valueDepth > e->inlValueBase)) {
         e->maxValue = e->valueDepth;
     }
+    /* The same number counted the other way: how wide the stack gets when the
+     * inlined entries are NOT given a bank of their own. That is the question
+     * "may this body's values live in x0..x8" asks, and maxValue cannot answer
+     * it -- it deliberately stops counting at the inline boundary. */
+    if (e->valueDepth > e->maxValueAll) e->maxValueAll = e->valueDepth;
     return true;
 }
 
@@ -2610,9 +2626,13 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) e->inlSlot[i] = -1;
     for (unsigned i = 0; i < argc; i++) e->inlSlot[1u + i] = (int)(cidx + 1u + i);
 
-    /* The inlined body's own entries live in x0..x8, which is the same bank
-     * `scratchValues` hands the caller's operand stack. One claim each. */
-    noteScratchClobber(e);
+    /* No noteScratchClobber here. An inlined body cannot call -- inlinableBody
+     * admits nothing that does -- so it destroys x0..x8 only by USING them,
+     * which is not a clobber but an allocation: when the caller already owns
+     * that bank the two share one numbering (see inlineOwnBank), and when it
+     * does not, the inlined entries have x0..x8 to themselves as before.
+     * Anything inside that really does call still reaches noteScratchClobber
+     * on its own, and under scratchValues that declines the compile. */
     e->inlining     = true;
     e->inlDepth     = cidx + 1u + argc;
     e->inlPinned    = 0;
@@ -8002,7 +8022,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
              * loops that go seven deep are exactly the ones with several rows
              * or accumulators to keep. */
             e.scratchValues = !probe.clobbersScratch &&
-                              probe.maxValue <= JIT_INL_COUNT;
+                              probe.maxValueAll <= JIT_INL_COUNT;
             /* What is left over after the loop's own reserved registers and
              * the deepest expression the body builds. maxValue is model state,
              * not a register number, so measuring it in memory mode and
