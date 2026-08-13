@@ -12,8 +12,8 @@ static long bench_shrink() {
     return 1;
 }
 static const long SHRINK = bench_shrink();
-static const int SIDE = (int)(300 / SHRINK);
-static const int STEPS = (40 / SHRINK) < 1 ? 1 : (int)(40 / SHRINK);
+static const int SIDE = (int)(500 / SHRINK);
+static const int STEPS = (60 / SHRINK) < 1 ? 1 : (int)(60 / SHRINK);
 
 static std::vector<std::vector<double>> plate(int n) {
     std::vector<std::vector<double>> g;

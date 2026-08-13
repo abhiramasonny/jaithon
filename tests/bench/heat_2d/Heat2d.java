@@ -8,8 +8,8 @@ public class Heat2d {
     }
 
     static final long SHRINK = shrink();
-    static final int SIDE = (int) (300 / SHRINK);
-    static final int STEPS = (int) Math.max(40 / SHRINK, 1);
+    static final int SIDE = (int) (500 / SHRINK);
+    static final int STEPS = (int) Math.max(60 / SHRINK, 1);
 
     static double[][] plate(int n) {
         double[][] g = new double[n][n];
