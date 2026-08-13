@@ -6264,11 +6264,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 bool toFloat = strcmp(nm, "float") == 0;
                 bool toInt   = strcmp(nm, "int") == 0;
                 if (toFloat && ak == SLOT_INT) {
-                    emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
-                    emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                    /* Straight into the bank, not out through X: what consumes a `float(i)` is a float
+                     * operator, and one reads the bank through fpOperand. Computing into d0 and storing the bits to X cost spectral's inner loop two cross-register-file fmovs per iteration -- the store, and the load the very next instruction made of it. */
+                    unsigned fidx = e->valueDepth - 1;
+                    if (!e->fpOff) {
+                        emit(e, jaiA64ScvtfDX(fpRegAt(e, fidx), ar));
+                        fpClaim(e, fidx);
+                    } else {
+                        emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
+                        emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                    }
                 } else if (toInt && ak == SLOT_FLOAT) {
-                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ar));
-                    emit(e, jaiA64FcvtzsXD(ar, JIT_FSCRATCH_A));
+                    emit(e, jaiA64FcvtzsXD(ar, fpOperand(e, e->valueDepth - 1)));
                 } else if (!((toFloat && ak == SLOT_FLOAT) ||
                              (toInt && ak == SLOT_INT))) {
                     e->whyNot = "a builtin with no known result kind";
