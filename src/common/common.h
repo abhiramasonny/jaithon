@@ -39,8 +39,8 @@
 
 #define JAI_VERSION_MAJOR 3
 #define JAI_VERSION_MINOR 1
-#define JAI_VERSION_PATCH 1
-#define JAI_VERSION_STRING "3.1.1"
+#define JAI_VERSION_PATCH 2
+#define JAI_VERSION_STRING "3.1.2"
 
 /* Bumped whenever bytecode emission changes; invalidates .jaic caches.
  *
