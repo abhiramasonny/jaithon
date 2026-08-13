@@ -17,6 +17,17 @@
 #: all come back interned. The guard stays because that is an invariant of
 #: object_string.c and not of this arm, and because the OP_EQ arm beside it
 #: makes the same check for the same reason.
+#:
+#: scripts/jit_compile_check.py fails if `scan` or `is_open` stops reaching
+#: the compiled tier under JAI_JIT_WHY=1. `scan_concat` is deliberately NOT in
+#: the marker: `let c = a + b` concatenates two strings, and OP_ADD_LOCALS on
+#: two dynamic operands has no measuring-pass support at all ("OP_ADD_LOCALS",
+#: every attempt) -- the same gap as join_keys/spell in
+#: test_jit_dict_items_iter.jai. `test_a_concatenation_equal_by_content_is_still_equal`
+#: therefore only ever proves the INTERPRETER's answer for the
+#: runtime-built-string case; that is a real hole in this file's compiled-tier
+#: coverage, not a heat problem, and no marker or warm-up closes it.
+# jit-compiles: scan, is_open
 from std.test import assert_eq
 
 #: Interned one-character strings, straight out of the shared table.
