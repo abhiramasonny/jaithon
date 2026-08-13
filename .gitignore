@@ -37,3 +37,4 @@ spec/
 
 # Working notes: kept on disk, deliberately never tracked.
 docs/superpowers
+__pycache__/
