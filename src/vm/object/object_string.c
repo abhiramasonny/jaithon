@@ -154,6 +154,14 @@ void jaiMarkAsciiChars(void) {
     }
 }
 
+void jaiAsciiCharsFill(void) {
+    for (unsigned i = 0; i < 128; ++i) (void)jaiStringChar((unsigned char)i);
+}
+
+void jaiAsciiCharsReset(void) {
+    for (unsigned i = 0; i < 128; ++i) jaiAsciiChars[i] = NULL;
+}
+
 ObjString *jaiStringChar(unsigned char c) {
     if (c >= 128) return NULL;
 

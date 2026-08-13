@@ -82,6 +82,15 @@ ObjString *jaiStringTake(char *chars, size_t length);
 ObjString *jaiStringConcat(ObjString *a, ObjString *b);
 /* The shared one-byte ASCII string. NULL for c >= 128. */
 ObjString *jaiStringChar(unsigned char c);
+/* Fills all 128 slots, so that from the end of jaiVMInit onwards
+ * `jaiAsciiCharTable()[c]` for c < 128 is never NULL. That is a promise three
+ * readers rely on to drop a branch: the interpreter's `s[i]`, the string
+ * iterator, and the JIT's OP_GET_INDEX arm, which would otherwise have to
+ * deopt the first time a program met a character. 128 objects, ~7KB, once.
+ * jaiAsciiCharsReset undoes it: the slots hold raw pointers into the heap the
+ * collector is about to free, so a VM teardown must not leave them dangling. */
+void       jaiAsciiCharsFill(void);
+void       jaiAsciiCharsReset(void);
 /* Backing storage for the 128 one-byte ASCII strings (object_string.c owns
  * writing to it: jaiStringChar fills a slot on first use, jaiMarkAsciiChars
  * keeps filled slots alive across a collection). External linkage rather than
