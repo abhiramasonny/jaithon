@@ -4244,7 +4244,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                              : e->localClass[slot];
                 if (fcls == NULL) return false;
             }
-            /* A str/list/dict/set field, held raw -- the same contract as a SLOT_OBJ global or list element:
+            /* A list field earns the stronger kind: SLOT_OBJ can be passed and stored but not iterated,
+             * indexed or pushed to, and `for x in self.items` / `self.items.push(v)` is the commonest thing
+             * a class holding a list does. Paid for with the OBJ_LIST check below, since VAL_OBJ alone
+             * would let a str reach a header read. */
+            else if (IS_LIST(fieldVal)) { kind = SLOT_LIST; tag = VAL_OBJ; }
+            /* A str/dict/set field, held raw -- the same contract as a SLOT_OBJ global or list element:
              * the tag guard below says "an object", the sample says which type it was, and every consumer
              * (index, invoke, compare) re-checks Obj.type for itself before it does anything type-specific.
              * Refusing this declined the whole enclosing FUNCTION, which is most object-oriented code. */
@@ -4296,11 +4301,24 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
                 branchOnDeopt(e, JAI_A64_NE);
+                /* "an object" is not "a list": every SLOT_LIST consumer reads the header with no check of
+                 * its own, so the object type is confirmed here, once, before the kind is handed out.
+                 * `already` is never SLOT_LIST (see recordFieldStore's caller), so this arm sees them all. */
+                if (kind == SLOT_LIST) {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, recv, base + 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
             }
 
-            if (kind == SLOT_MAYBE_INST) {
-                if (!pushValue3(e, kind, fcls->shapeId, fcls,
-                                IS_INSTANCE(fieldVal) ? fieldVal : NULL_VAL,
+            if (kind == SLOT_MAYBE_INST || kind == SLOT_LIST) {
+                if (!pushValue3(e, kind,
+                                kind == SLOT_MAYBE_INST ? fcls->shapeId : 0,
+                                kind == SLOT_MAYBE_INST ? fcls : NULL,
+                                kind == SLOT_LIST ? fieldVal
+                                : IS_INSTANCE(fieldVal) ? fieldVal : NULL_VAL,
                                 -1)) {
                     return false;
                 }
@@ -4544,8 +4562,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
             /* As in OP_GET_FIELD_LOCAL: an object-typed field is held raw
-             * rather than declining the enclosing function. */
-            else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
+             * rather than declining the enclosing function, and a list earns
+             * the stronger kind at the price of an OBJ_LIST check. */
+            else if (IS_LIST(fieldVal))     { kind = SLOT_LIST; tag = VAL_OBJ; }
+            else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ;  tag = VAL_OBJ; }
             else return false;
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
@@ -4562,12 +4582,23 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr, fbase));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
                 branchOnDeopt(e, JAI_A64_NE);
+                /* And that it is a list, not merely an object -- same reason as
+                 * in OP_GET_FIELD_LOCAL, and likewise while the receiver is
+                 * still on the model, since this guard resumes here too. */
+                if (kind == SLOT_LIST) {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, rr, fbase + 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
             }
             unsigned popped;
             SlotKind kr;
             if (!popValue(e, &popped, &kr)) return false;
             if (!pushValue3(e, kind, 0, NULL,
-                            kind == SLOT_OBJ && rawObjValue(fieldVal)
+                            (kind == SLOT_OBJ && rawObjValue(fieldVal)) ||
+                                    (kind == SLOT_LIST && IS_LIST(fieldVal))
                                 ? fieldVal : NULL_VAL,
                             -1)) {
                 return false;
