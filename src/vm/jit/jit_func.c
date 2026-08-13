@@ -3141,6 +3141,9 @@ static bool deferSurvives(uint8_t op) {
     case OP_INT: case OP_CONST:
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_SHL: case OP_SHR:
+    /* Its arm settles both operands itself on every path that reads a register
+     * for them, and takes no deopt record before doing so. */
+    case OP_FLOORDIV:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
@@ -3166,6 +3169,9 @@ static bool foldsIntLiteral(uint8_t op) {
     /* Not because a shift takes an imm12 (it doesn't) -- the shift count becomes part of the instruction
      * encoding when it's a literal 0..63, so the register that used to hold it was written and never read. bitops paid a `movz` for every one of its shifts before this. */
     case OP_SHL: case OP_SHR:
+    /* Same again: a power-of-two divisor is spelt by the `asr`'s own shift field. Says yes for divisors
+     * that are not powers of two too, which is harmless -- that path settles what it cannot fold, exactly as this list's contract allows. spectral's `s * (s + 1) // 2` paid a `movz x3,#2` into a register no instruction read, once per inner iteration. */
+    case OP_FLOORDIV:
         return true;
     default:
         return false;
@@ -4838,7 +4844,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth < 2) return false;
             ka = e->stack[e->depth - 2]; kb = e->stack[e->depth - 1];
             if (ka != SLOT_INT || kb != SLOT_INT) return false;
-            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
             /* A literal power-of-two divisor decides the whole thing: floor(x / 2^s) is exactly `asr x, #s` for
              * every int64 x (negative included), since asr already rounds toward minus infinity -- what the correction below exists to reproduce for the general case. */
@@ -4847,14 +4852,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                              kdiv != 0 && kdiv != -1;
             unsigned dshift;
             if (kdivKnown && powerOfTwoShift(kdiv, &dshift)) {
+                /* The divisor is spelt by the shift field, so drop its deferral rather than settle it -- the
+                 * same move OP_ADD makes for an imm12 -- popValueRaw drops it. The dividend comes back from popValue, not from pushReg, because a borrowed entry lives in the local's register and not in its own. */
                 unsigned p1, p2;
-                if (!popValue(e, &p1, NULL)) return false;
+                if (!popValueRaw(e, &p1, NULL)) return false;
                 if (!popValue(e, &p2, NULL)) return false;
                 if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64AsrX(pushReg(e) - 1, ra, dshift));
+                emit(e, jaiA64AsrX(pushReg(e) - 1, p2, dshift));
                 off += 1;
                 break;
             }
+            /* Every path below reads both operands out of their own registers,
+             * and two of them guard. */
+            settleAll(e);
+            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
             /* Zero and -1 both decline: the interpreter reports division-by-zero, and INT64_MIN / -1 is the one
              * quotient that doesn't fit -- both rare enough that declining -1 outright costs nothing. A literal divisor has already answered both. */
