@@ -1759,21 +1759,22 @@ static int hoistFor(const Emit *e, int slot) {
     return -1;
 }
 
-/* Nothing outside [top, end) may branch to `top`. The hoist is emitted just
- * ABOVE the loop head, so a path that arrives at the head from anywhere else
- * would run the body with registers nobody loaded. Back edges are fine by
- * construction -- they are inside the loop, where the slot cannot change. */
+/* Nothing outside [top, end) may branch INTO it. The hoisted loads sit just
+ * above the head, so any path that reaches the body without passing through
+ * them would run it against registers nobody loaded. Written as "into the
+ * range", not "to the head", because the head is only the entrance a
+ * structured loop is supposed to have -- this is what makes that a checked
+ * fact rather than an assumption about the emitter. */
 static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
     for (int at = 0; at < c->count;) {
         int len = instructionLength(c, at);
         if (len <= 0) return false;
+        if ((uint32_t)at >= top && (uint32_t)at < end) { at += len; continue; }
         int rel = jaiOpBranchOperandAt(c->code[at]);
         if (rel >= 0) {
-            int16_t jump = jaiReadI16(c->code + at + 1 + rel);
-            if ((int32_t)(at + len) + jump == (int32_t)top &&
-                ((uint32_t)at < top || (uint32_t)at >= end)) {
-                return false;
-            }
+            int32_t to = (int32_t)(at + len) +
+                         jaiReadI16(c->code + at + 1 + rel);
+            if (to >= (int32_t)top && to < (int32_t)end) return false;
         }
         at += len;
     }
