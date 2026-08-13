@@ -1586,8 +1586,24 @@ pub class Emitter {
                 # Plain `for` only, not comprehension clauses: a clause's jumps are
                 # tracked by the comprehension itself, and threading another branch
                 # through that bookkeeping broke `{k: v for (v, k) in d.items()}`.
-                self._expr(iterable)
-                self._op(Op.GetIter, span)
+                #
+                # `_items_iterable` is safe here even though it plants its own
+                # branch (`OP_GET_ITER_ITEMS`'s skip jump): that jump is opened
+                # and patched entirely inside the call, before `starts`/`exits`
+                # start tracking this clause, so it never threads through the
+                # comprehension's own bookkeeping. Reused from `_for` rather
+                # than re-derived, so a clause declines the lazy-pair path for
+                # exactly the same reasons a `for` statement does — same shape
+                # match on `X.items()`, same run-time decision, so a user class
+                # with its own `items()` still gets that method called. Either
+                # way this leaves exactly one iterator on the stack, so the
+                # accumulator's peek index still counts one push per clause.
+                if _is_items_call(iterable) {
+                    self._items_iterable(iterable, span)
+                } else {
+                    self._expr(iterable)
+                    self._op(Op.GetIter, span)
+                }
                 starts.push(self._chunk().here())
                 exits.push(self._emit_jump(Op.ForIter, span))
                 self._adjust(1)  # the loop value, on the fall-through
