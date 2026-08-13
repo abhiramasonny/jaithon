@@ -5,7 +5,7 @@ d6307c6027d17ebe888106f4ef7a417f04d6ad705dac5f0f1d92545abd8c69d9  2456  examples
 c43851615afb95d42a5fe55c52f2c4f6da679c15212b598ec658e9273ef0e357  518  examples/plot.jai
 d3d6c81cda037e9f191fef724fbfa1e2c3592c26b519ee75c9ba27720971b9c8  923  examples/raytracer.jai
 5a53f4f6ca885fece1c9bc45091049d0fb77200d8348ed2ee63df266145ba5b0  371  examples/snake.jai
-fcf4f2a67ff37a35f4157a0773b56d242b90a2e4a0697a7576e37fcf91544590  697  examples/spiral_classifier.jai
+5dc8eb792c49bf6803432a55a03161279f112ac77783e0153f62fb35028ff40f  697  examples/spiral_classifier.jai
 2b09e31be59883c0c225c8013a8d3462b9b53850ee890363883f133c4ed9da8c  3876  lib/jaithon/ast.jai
 c685fdd8cfa1e94672d76063cf2e66c62f47dfb0525caf329a0b5f1c2868311a  3743  lib/jaithon/ast_encode.jai
 83a88b29769e841d13be05f1619f8ac7d46ea468d8f8821029761d94b1d1a38b  4354  lib/jaithon/ast_unparse.jai
@@ -31,7 +31,7 @@ fb12f965860b57d1ca7d6e5c0aad34d6cd048a743704015e624887508cdb9d4f  310  lib/jaith
 4976e979c0db491c0c8e9e23e3a519c030636c820c316538480a800c23135edd  280  lib/jaithon/compile/check/union.jai
 db2ebbb1e048f976acf4142b67b625b717c1810de4007afd68984d804d7e3cc3  345  lib/jaithon/compile/check/universe.jai
 d5d31413ca5401bc40e247a9e02564aab135b81bf9884bfc3604d6dc64ec3bd8  345  lib/jaithon/compile/diag.jai
-8ff6897080e305ba5dcd6a0e01b19312887fe429350c9eb6c694a92ce058084a  10056  lib/jaithon/compile/emit.jai
+bef6016c912cf5552f8161def850153055d6b75f85b1ec4a72219cf5cea8144c  10075  lib/jaithon/compile/emit.jai
 effd03ca6035cb1e7f59091ea36408ae082792b799c6488b33265b7a323f72c1  3891  lib/jaithon/compile/jaic.jai
 4b61c761af487a1ee473739d35bd9da34d9e61b8d93ce4c1ccdece2eaf911ea6  4454  lib/jaithon/compile/lexer.jai
 6381612587a504e9dd123d6d68ff6d32722d841ebc84c772a6ccb08afeb279a1  909  lib/jaithon/compile/mod.jai
@@ -156,4 +156,4 @@ a34928aff255b25af223f1276823769d9966236baca8a55779af925b70b47a48  283  tests/gol
 ab24386359c45ad0294dbe47a759781f8431b30b7736f6dfa1c9ee63dd5b14e4  116  tests/golden/shadowing.jai
 8765a5c34fda9efdae28a00fee44d89e8dada90637139ccec8f0a2d52f2e9b95  227  tests/golden/type_tests.jai
 549b1a36527afb9d8aecaa83ac3b85f2bbdf855847c178e6f706414f86afa964  485  tests/golden/values_and_dispatch.jai
-# 158 files, 192020 instructions probed
+# 158 files, 192039 instructions probed

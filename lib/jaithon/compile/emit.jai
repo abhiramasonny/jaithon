@@ -2283,11 +2283,16 @@ pub class Emitter {
     #: It carries a slot number and nothing else, so a global, an upvalue and a
     #: destructuring pattern all fall back to the general loop — a range never
     #: yields anything unpackable anyway, so the tuple case is an error program
-    #: either way and belongs on the path that reports it. A wildcard has no
-    #: symbol, and gets `spare`, which the caller reserved for exactly that.
-    fn _range_bind_slot(self, pattern: Node?, spare: int) -> int {
+    #: either way and belongs on the path that reports it.
+    #:
+    #: A wildcard has no symbol and needs a destination nothing will read, so it
+    #: takes a temporary — but only when `allocate` says this call is the one
+    #: about to emit the loop, not the one deciding whether to.
+    fn _range_bind_slot(self, pattern: Node?, allocate: bool) -> int {
         if pattern == null { return -1 }
-        if pattern.kind == NodeKind.PatWildcard { return spare }
+        if pattern.kind == NodeKind.PatWildcard {
+            return if allocate { self._alloc_temp() } else { 0 }
+        }
         if pattern.kind != NodeKind.PatBind { return -1 }
         let symbol = self.resolution.symbol_of(pattern)
         if symbol == null or not symbol.is_slotted() { return -1 }
@@ -2313,15 +2318,17 @@ pub class Emitter {
     #: it must bind to a single frame slot.
     fn _for_range(self, node: Node, iterable: Node?) -> bool {
         if iterable == null or iterable.kind != NodeKind.Range { return false }
-        if self._range_bind_slot(node.child("pattern"), 0) < 0 { return false }
+        let pattern = node.child("pattern")
+        if self._range_bind_slot(pattern, false) < 0 { return false }
         let span = node.span
         let base = self._depth()
-        # Three, always: the wildcard's throwaway destination is reserved
-        # whether or not this pattern is one, so the count freed at the end does
-        # not have to re-derive which it was.
+        # Two temporaries, and a third only for `for _ in a..b`, which has no
+        # symbol to bind into. Every range loop is one nesting level of frame,
+        # and the frame is what the compiled tier spends its registers on.
+        let wildcard = pattern != null and pattern.kind == NodeKind.PatWildcard
         let counter = self._alloc_temp()
         let end = self._alloc_temp()
-        let slot = self._range_bind_slot(node.child("pattern"), self._alloc_temp())
+        let slot = self._range_bind_slot(pattern, wildcard)
         self._expr(iterable.child("start"))
         self._expr(iterable.child("stop"))
         self._chunk().write_op(Op.IterRange, span)
@@ -2349,7 +2356,7 @@ pub class Emitter {
         # six bytes past its own operand rather than the usual zero.
         self._patch_from(exit, exit + 8)
         self._close_loop()
-        self._free_temps(3)
+        self._free_temps(if wildcard { 3 } else { 2 })
         return true
     }
 
