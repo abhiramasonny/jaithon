@@ -3408,6 +3408,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
          * happened to hit it this time, which is exactly why it went unnoticed;
          * `make jit-fusion-check` now refuses a build where a fused opcode has
          * no arm here. */
+        /* Stamp the declared element kind onto the container on top.
+         *
+         * Needs an arm rather than a decline: it sits right after a container
+         * literal, so `var out: list[int] = []` inside a hot function put it in
+         * the middle of one. Without this, sort_merge's `merge` -- whose whole
+         * body is pushes onto exactly such a list -- declined and ran
+         * interpreted: 270ms to 510ms. A new opcode in ordinary code is a JIT
+         * admission question before it is anything else. */
+        case OP_ELEM_KIND: {
+            uint8_t packed = code[off + 1];
+            if (e->depth == 0) return false;
+            /* The STATIC kind, not the sampled value: the measuring pass runs
+             * with no sample, so keying on stackSeen declined every time and
+             * cost the whole function. OP_BUILD_LIST pushes SLOT_LIST, which is
+             * exactly what the emitter puts this opcode after. */
+            if (e->stack[e->depth - 1] != SLOT_LIST) {
+                e->whyNot = "elem-kind target is not a known list";
+                return false;
+            }
+            unsigned r = valueXReg(e, e->valueDepth - 1);
+            emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
+            emit(e, jaiA64StrByte(JIT_SCRATCH_A, r,
+                                  (unsigned)offsetof(ObjList, elemKind)));
+            e->wroteHeap = true;
+            off += 2;
+            break;
+        }
+
         case OP_CMP_LOCAL_CONST_LT: {
             unsigned slot = jaiReadU16(code + off + 1);
             int16_t  imm  = jaiReadI16(code + off + 3);

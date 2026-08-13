@@ -658,6 +658,15 @@ int main(void) {
       check("csel not taken", runWith(w, 6, cell), 9); }
     { const uint32_t w[] = { jaiA64LdrByte(0, 0, 1), jaiA64Ret() };
       check("ldrb offset", runWith(w, 2, cell), (cell[0] >> 8) & 0xffu); }
+    { /* Write one byte at offset 3 and read it back: the store must touch that
+       * byte and no other, which reading the whole word would not prove. */
+      const uint32_t w[] = { jaiA64MovzX(1, 0xa5, 0), jaiA64StrByte(1, 0, 3),
+                             jaiA64LdrByte(0, 0, 3), jaiA64Ret() };
+      check("strb", runWith(w, 4, cell), 0xa5); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x5a, 0), jaiA64StrByte(1, 0, 0),
+                             jaiA64LdrByte(0, 0, 1), jaiA64Ret() };
+      check("strb leaves neighbours", runWith(w, 4, cell),
+            (cell[0] >> 8) & 0xffu); }
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64OrrX(0, 1, 2), jaiA64Ret() };
       check("orr", runWith(w, 4, cell), 0xf0 | 0x3c); }
