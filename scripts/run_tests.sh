@@ -200,7 +200,33 @@ for src in "$ROOT"/tests/golden/*.jai; do
         continue
     fi
     run_golden "$name" "$src" "$expected"
-    [[ $GC_STRESS -eq 1 ]] && run_golden "$name (gc-stress)" "$src" "$expected" --gc-stress
+    # `--gc-stress` bare collects on EVERY allocation, which is quadratic in the
+    # live set. That is what is wanted for a straight-line golden -- it visits
+    # each program point once, so every allocation is a distinct place to
+    # collect, and `self_type` gets 1941 collection points for 31ms.
+    #
+    # It is the wrong price for a golden whose whole job is to run a loop until
+    # the tier compiles it. Those revisit ONE loop body millions of times, so
+    # the millionth collection point is the same program point as the first --
+    # and two of them were 59% of this entire suite:
+    #
+    #   jit_field_obj (gc-stress)   92,775ms
+    #   jit_str_slice (gc-stress)   15,866ms
+    #
+    # So a golden may cap its own cadence with a `#: gc-stress-every: N` header,
+    # in the `#:` comment form these files already use. Only the hot-loop ones
+    # carry it; the other 41 keep full density, because a cadence that fixed
+    # those two by weakening all 43 would be a bad trade. Measured at N=50:
+    # jit_field_obj 92,775ms -> 1,728ms and still 20,730 collections,
+    # jit_str_slice 15,866ms -> 151ms and still 8,204.
+    #
+    # `[0-9][0-9]*` not `[0-9]\+` -- `\+` in a BRE is a GNU extension and BSD
+    # sed, which is what macOS ships, matches nothing and silently leaves the
+    # cadence empty.
+    gc_every="$(sed -n 's/^#: *gc-stress-every: *\([0-9][0-9]*\).*/\1/p' "$src" | head -1)"
+    gc_flag="--gc-stress"
+    [[ -n "$gc_every" ]] && gc_flag="--gc-stress=$gc_every"
+    [[ $GC_STRESS -eq 1 ]] && run_golden "$name (gc-stress)" "$src" "$expected" "$gc_flag"
     # Every guard in compiled code fails at once, so each of these runs the
     # deoptimisation path too -- the record a guard hands back, and the
     # interpreter picking up from it. Nothing else reaches it: a guard fires in
