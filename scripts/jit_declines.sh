@@ -40,13 +40,28 @@ census() {
       | sort -u
 }
 
+# The census is NOT deterministic. Which sites the tier offers to the compiler
+# is driven by a wall-clock sampler, so a marginal site is attempted on some
+# runs and not others: three consecutive runs of the SAME binary gave 20, 20 and
+# 21 reasons, differing by `more live values than there are callee-saved
+# registers` from heat_2d's OSR head. A single-run capture therefore produces a
+# baseline that the very next check fails against.
+#
+# So capture takes the UNION of several runs. That is the honest baseline: a
+# reason that can appear is a reason that does appear. It does not weaken the
+# ratchet, which only ever fails on a reason that is new to the union.
+CAPTURE_RUNS=${CAPTURE_RUNS:-3}
+
 case "${1:-show}" in
 show)
     census
     ;;
 capture)
-    census > "$BASELINE"
-    printf 'captured %s distinct decline reasons\n' "$(wc -l < "$BASELINE" | tr -d ' ')"
+    tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+    for _i in $(seq "$CAPTURE_RUNS"); do census >> "$tmp"; done
+    sort -u "$tmp" > "$BASELINE"
+    printf 'captured %s distinct decline reasons (union of %s runs)\n' \
+        "$(wc -l < "$BASELINE" | tr -d ' ')" "$CAPTURE_RUNS"
     ;;
 check)
     if [[ ! -f "$BASELINE" ]]; then

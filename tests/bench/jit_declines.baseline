@@ -18,3 +18,4 @@ stopped: add-bind of a kind that is neither int nor float
 stopped: callee is not a compiled global function
 stopped: callee's return kind not usable
 stopped: loop variable took two kinds
+stopped: more live values than there are callee-saved registers
