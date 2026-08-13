@@ -7594,6 +7594,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
      * measures the last of those, and which slots are named at all, and how
      * often each of them is named inside the innermost loop. */
     unsigned probeMaxValue = 0;
+    bool probeRan = false;
     {
         static Emit probe;
         memset(&probe, 0, sizeof probe);
@@ -7617,6 +7618,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             unsigned used = probe.maxSlotUsed + 1u;
             if (used < e.locals) e.locals = used;
             probeMaxValue = probe.maxValue;
+            probeRan = true;
 
             /* A body that never calls out and never inlines can put its
              * operand stack in x0..x8 instead of above the locals, and then
@@ -7748,8 +7750,13 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
              * reserved, how deep the body went and which bank it was using --
              * the shortfall is those three against JIT_MAX_SAVED. Its own
              * line, and without the words the decline census greps for, so
-             * that adding it cannot invent census entries. */
-            fprintf(stderr,
+             * that adding it cannot invent census entries.
+             *
+             * Only when the measuring pass got through: a loop that declined
+             * for some other reason never reached the register plan, and
+             * printing its zeroed numbers reads as "nought entries deep",
+             * which is a different and false claim. */
+            if (probeRan) fprintf(stderr,
                     "[jit] osr at %u registers: %u reserved, %u stack, "
                     "%u x-locals, bank %s, of %u\n",
                     top, osrReserved(&e), probeMaxValue, e.xLocals,
