@@ -109,19 +109,27 @@ fn hide(x) { return x }
 
 try {
     for (_a, _b) in hide([(1, 2, 3)]) { print("NOT REACHED") }
-} catch e: ValueError { print(e.message) }
+} catch e: ValueError {
+    print(e.message)
+}
 
 try {
     for (_a, _b) in hide([(1,)]) { print("NOT REACHED") }
-} catch e: ValueError { print(e.message) }
+} catch e: ValueError {
+    print(e.message)
+}
 
 try {
     for (_a, _b) in hide([1, 2]) { print("NOT REACHED") }
-} catch e: TypeError { print(e.message) }
+} catch e: TypeError {
+    print(e.message)
+}
 
 try {
     for (_a, _b) in hide([["only"]]) { print("NOT REACHED") }
-} catch e: ValueError { print(e.message) }
+} catch e: ValueError {
+    print(e.message)
+}
 
 # The first entry binds; the second is the one that raises. Both slots must
 # still hold what the first pass put there.
@@ -132,7 +140,9 @@ try {
         partialA = pa
         partialB = pb
     }
-} catch e: ValueError { print(e.message) }
+} catch e: ValueError {
+    print(e.message)
+}
 print(partialA)
 print(partialB)
 
@@ -140,13 +150,17 @@ print(partialB)
 try {
     for (k, _v) in d.items() { d[f"{k}!"] = 0 }
     print("NOT REACHED")
-} catch _e: RuntimeError { print("dict mutation caught") }
+} catch _e: RuntimeError {
+    print("dict mutation caught")
+}
 
 let growing = [(1, 2), (3, 4)]
 try {
     for (_a, _b) in growing { growing.push((5, 6)) }
     print("NOT REACHED")
-} catch _e: RuntimeError { print("list mutation caught") }
+} catch _e: RuntimeError {
+    print("list mutation caught")
+}
 
 # --- an empty source jumps straight out --------------------------------------
 let empty: dict[str, int] = {}
