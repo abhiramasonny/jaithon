@@ -16,7 +16,8 @@
 # function that contained it.
 #
 #   scripts/jit_declines.sh            # print the census
-#   scripts/jit_declines.sh capture    # record it as the baseline
+#   scripts/jit_declines.sh capture       # add to the baseline (never shrinks)
+#   scripts/jit_declines.sh capture fresh # start the baseline over
 #   scripts/jit_declines.sh check      # fail if a NEW reason appeared
 set -uo pipefail
 
@@ -57,11 +58,29 @@ show)
     census
     ;;
 capture)
+    # Unions with the EXISTING baseline, and never shrinks it unless you ask.
+    #
+    # The asymmetry is the whole point. A line that stays but no longer occurs
+    # costs a benign "no longer occurs (good)" note. A line that is DROPPED
+    # because this capture's runs happened not to see it hands the next person
+    # a gate that fails the first time the sampler behaves differently -- and
+    # `more live values than there are callee-saved registers` (heat_2d's OSR
+    # head) is exactly such a line: it appeared in 1 of 3 runs when this was
+    # written. An agent caught a capture silently dropping it and put it back
+    # by hand.
+    #
+    # `capture fresh` starts over, for when reasons are genuinely retired.
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
     for _i in $(seq "$CAPTURE_RUNS"); do census >> "$tmp"; done
+    if [[ "${2:-}" != fresh && -f "$BASELINE" ]]; then
+        cat "$BASELINE" >> "$tmp"
+        note="union of $CAPTURE_RUNS runs and the previous baseline"
+    else
+        note="union of $CAPTURE_RUNS runs, previous baseline discarded"
+    fi
     sort -u "$tmp" > "$BASELINE"
-    printf 'captured %s distinct decline reasons (union of %s runs)\n' \
-        "$(wc -l < "$BASELINE" | tr -d ' ')" "$CAPTURE_RUNS"
+    printf 'captured %s distinct decline reasons (%s)\n' \
+        "$(wc -l < "$BASELINE" | tr -d ' ')" "$note"
     ;;
 check)
     if [[ ! -f "$BASELINE" ]]; then
