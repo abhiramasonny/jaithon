@@ -13,9 +13,8 @@
 ## What Jaithon is
 
 Jaithon is a dynamically executed and garbage collected language with a
-bytecode VM. It takes heavy insp from the structure from Java (declared fields, forced
-visibility, interfaces, type annotations) and insp for everything else
-from Python (no semicolons, comprehensions, f-strings, first class functions, and the ease of use).
+bytecode VM. It takes heavy insp from the structure from Java (for its architecture) and insp for everything else
+from a combination of Rust & Python.
 
 Pretty much everything (apart from the CORE primitive implementation stuff) is written in jaithon itself, making it VERY much bootstrapped and easy to extend with new features.
 
