@@ -497,6 +497,25 @@ typedef struct {
      * longer free: re-running the call interpreted would apply the write a
      * second time. See branchOnCondition. */
     bool      wroteHeap;
+    /* The instruction being compiled is inside a protected region of the
+     * function's static exception table (spec §3.8) -- i.e. inside a `try`.
+     *
+     * A raise from compiled code unwinds from a frame the interpreter never
+     * pushed (function tier) or from the loop head rather than the faulting
+     * instruction (OSR tier), so vmThrow consults the wrong offset and the
+     * function's OWN handler is skipped. Nothing used to check this because no
+     * function containing a `try` could compile at all -- every catch block
+     * holds OP_GET_EXC, which had no arm and declined the whole function. The
+     * unarmed-opcode deopt below removes that accident, so the rule is now
+     * explicit: inside a protected region an overflow resumes at its
+     * instruction (branchOnDeoptInstStart) and lets the interpreter raise it,
+     * and anything else that can raise -- a call, a list growth -- declines. */
+    bool      inProtected;
+    /* Every operand-stack entry was in its own register at the top of the
+     * instruction being compiled -- nothing deferred, nothing borrowed. See
+     * branchOnDeoptInstStart, whose record describes entries the arm may
+     * already have popped. */
+    bool      instClean;
     /* Baked globals share the defining module's table, so one `keyVersion` guard covers all of them --
      * it changes only when a live entry's address or key could move (new key, rehash, delete, clear). ObjModule::version (used by the function-tier entry check) is neither necessary nor sufficient here. */
     JaiTable *globalsTable;
@@ -1556,6 +1575,78 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
     emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
 }
 
+/* A guard that resumes at the START of the instruction being compiled, whatever
+ * that instruction's arm has already popped.
+ *
+ * deoptRecordAt refuses this case ("a guard resumes an instruction whose
+ * operands it has already consumed") because the entries below `depth` are the
+ * only ones it will describe. They are still readable here: popValue moves
+ * `depth` and `valueDepth` and nothing else, so entry i's kind is still in
+ * stack[i] and its register is still valueXReg(i) -- the mapping is positional.
+ * What is NOT guaranteed is that the arm has left those registers alone, which
+ * is why this is not a general facility: its one caller is the overflow guard
+ * inside a `try`, and the arms that reach it compute into a scratch (ovfDest)
+ * so nothing an entry lives in, and no local, has been written when it fires.
+ *
+ * fpLive is read as it stands rather than as it was: popValue calls fpSyncOne
+ * first, so an entry whose bit this instruction cleared has its X register
+ * current, which is exactly what the stub then writes out. */
+static void branchOnDeoptInstStart(Emit *e, unsigned cond) {
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    if (e->fpBorrow != 0) {          /* see deoptRecordAt */
+        e->whyNot = "a float borrow reached a guard";
+        e->failed = true;
+        return;
+    }
+    if (anyDeferred(e)) {            /* see deoptRecordAt */
+        e->whyNot = "a deferred value reached a guard";
+        e->failed = true;
+        return;
+    }
+    if (e->deoptCount >= JIT_MAX_DEOPT) {
+        e->whyNot = "too many guards to record";
+        e->failed = true;
+        return;
+    }
+    /* The record below describes entries this instruction may already have
+     * popped, and popValue clears the bit that said an entry was only ever a
+     * borrow of a local's register. So the question has to be asked of the
+     * instruction's START, where the walk recorded it. */
+    if (!e->instClean && !e->inlining) {
+        e->whyNot = "a raise resumes an instruction whose operands were borrowed";
+        e->failed = true;
+        return;
+    }
+    unsigned k = e->deoptCount++;
+    if (e->inlining) {
+        /* Inside an inline the interpreter has not made the call yet, so the
+         * only resume point is the caller's OP_CALL -- which deoptSite already
+         * answers, and which is already "the start of an instruction". */
+        if (!deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
+                       &e->deopt[k].valueDepth)) {
+            e->failed = true;
+            return;
+        }
+    } else {
+        e->deopt[k].ip         = e->curOffset;
+        e->deopt[k].depth      = e->instDepth;
+        e->deopt[k].valueDepth = e->instValueDepth;
+    }
+    e->deopt[k].lastFromDesc = false;
+    e->deopt[k].fpLive       = e->fpLive;
+    for (unsigned i = 0; i < e->deopt[k].depth; i++) {
+        e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].classes[i] = e->stackClass[i];
+    }
+    bool always = jitDeoptStress();
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
+    e->fixups[e->fixupCount].conditional  = !always;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
+}
+
 /* Branch to the bail block on `cond`. The block's index is not known yet, so
  * it is patched with the rest. */
 /* NaN comparison is a TypeError here, not false, matching the interpreter's isnan check: fcmp sets V
@@ -1612,6 +1703,11 @@ static void branchOnCondition(Emit *e, unsigned cond) {
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     fpSyncAll(e);
+    /* Inside a `try` the overflow stub's raise would unwind past the region
+     * that should have caught it (see Emit::inProtected). Resume at this
+     * instruction instead: the interpreter re-executes it, overflows too, and
+     * raises with a frame and an ip that name the right handler. */
+    if (e->inProtected) { branchOnDeoptInstStart(e, cond); return; }
     e->overflowUsed[which] = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
@@ -1619,6 +1715,32 @@ static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     e->fixups[e->fixupCount].depth        = -1;
     e->fixupCount++;
     emit(e, jaiA64BCond(cond, 0));
+}
+
+/* Where an integer arm that can overflow computes its result.
+ *
+ * Inside a `try` the overflow guard resumes at the instruction (see
+ * branchOnOverflow), so the result must not have reached its home yet -- the
+ * interpreter would otherwise apply the operation a second time on top of the
+ * wrapped value, and `total += x` inside a caught `try` would come back wrong.
+ * A scratch keeps every canonical register untouched until the guard is past;
+ * the copy out is a `mov`, which §5 of the roadmap prices at zero on this core,
+ * and it only appears inside a protected region at all. */
+static unsigned ovfDest(const Emit *e, unsigned home) {
+    return e->inProtected ? JIT_SCRATCH_B : home;
+}
+
+/* Whether a raise that leaves compiled code with the exception pending can be
+ * emitted here. It cannot inside a `try`: the effects already happened, so the
+ * site cannot resume at its instruction the way an overflow can, and the
+ * unwinder would consult an offset outside the protected region. Declines --
+ * which is exactly what the whole function did before OP_GET_EXC had a deopt,
+ * so no shape that used to compile stops. */
+static bool raiseExitAllowed(Emit *e, const char *what) {
+    if (!e->inProtected) return true;
+    e->whyNot = what;
+    e->failed = true;
+    return false;
 }
 
 /* The condition to branch on when the comparison is FALSE: the opcode jumps
@@ -1966,6 +2088,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
     if (ownStatus) return true;
 
     /* Nonzero means the callee raised; the interpreter owns it from here. */
+    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
     emit(e, jaiA64SubsXImm(31, 0, 0));
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
@@ -2140,6 +2263,8 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
                            bool method) {
+    /* Either verdict path below can come back with an exception pending. */
+    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
     if (cfn->module != caller->module) {
         e->whyNot = "a direct callee from another module";
         return false;
@@ -2518,6 +2643,11 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     ObjFunction *cfn = callee->fn;
     if (cfn->module != caller->module) return false;
     if (e->inlining) return false;             /* one level, no recursion */
+    /* The inlined body's offsets are the callee's, so `inProtected` describes
+     * the CALLER's regions throughout -- a `try` of the callee's own would go
+     * unseen. inlinableBody's whitelist already refuses every opcode a handler
+     * needs; this says so rather than relying on it. */
+    if (cfn->exceptionCount > 0) return false;
     unsigned cidx = e->depth - argc - 1;
     unsigned maxSlot = 0;
     bool readsUpvalue = false;
@@ -2701,6 +2831,7 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     if (!jaiClassFindMethod(rcls, AS_STRING(mname), &method)) return false;
     if (!IS_CLOSURE(method)) return false;
     ObjFunction *mfn = AS_CLOSURE(method)->fn;
+    if (mfn->exceptionCount > 0) return false;   /* see inlineGlobalCall */
     if (mfn->arity != argc || mfn->defaultCount != 0) return false;
     if (mfn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
     if (mfn->upvalueCount != 0) return false;
@@ -3167,6 +3298,17 @@ static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
     return false;
 }
 
+/* Inside a `try`: an entry of the function's own static exception table covers
+ * this offset. Linear over the table because a function has one or two entries,
+ * never a table worth indexing. */
+static bool offsetIsProtected(const ObjFunction *fn, uint32_t off) {
+    for (uint16_t i = 0; i < fn->exceptionCount; i++) {
+        const ExceptionEntry *x = &fn->exceptions[i];
+        if (off >= x->start && off < x->end) return true;
+    }
+    return false;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -3187,6 +3329,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
         afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
         uint8_t op = code[off];
+        /* Whose regions these are matters: inside an inline the offsets are the
+         * callee's while every guard resumes at the CALLER's call site, so the
+         * caller's answer is the one that stands. inlineGlobalCall/inlineMethod
+         * refuse a callee with a table of its own. */
+        if (!e->inlining) {
+            e->inProtected = offsetIsProtected(fn, (uint32_t)off);
+        }
         /* An ASCII-table proof is only good along the fall-through edge this
          * walk is following. offsetIsBranchTarget scans the whole chunk, so it
          * catches a back edge whose branch has not been emitted yet -- and it
@@ -3205,7 +3354,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
                 }
             }
-            if (joinsHere || !deferSurvives(op) || e->deferCarryCount >= 64) {
+            /* Inside a `try` nothing may cross an instruction boundary
+             * unmaterialised: branchOnDeoptInstStart describes the model as of
+             * the instruction's START, which means describing entries this
+             * instruction has already popped -- and a popped entry that was
+             * only ever a borrow of a local's register never wrote its own.
+             * Settling here is the same conservative branch a non-whitelisted
+             * opcode already takes, and it costs `mov`s that §5 prices at zero.
+             */
+            if (joinsHere || e->inProtected || !deferSurvives(op) ||
+                e->deferCarryCount >= 64) {
                 settleAll(e);
             } else {
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
@@ -3217,10 +3375,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         /* A borrow ends here unless the instruction is one of the few it is
          * allowed to live across. The top of an instruction is the one place
          * the release is guaranteed to be on the executed path. */
-        if (e->fpBorrow != 0 && !fpBorrowSurvives(op)) fpReleaseAll(e);
+        if (e->fpBorrow != 0 && (e->inProtected || !fpBorrowSurvives(op))) {
+            fpReleaseAll(e);
+        }
         e->curOffset = (uint32_t)off;
         e->instDepth = e->depth;
         e->instValueDepth = e->valueDepth;
+        /* Every entry is in its own register right now, so a record taken of
+         * this instruction's START stays readable however far the arm below
+         * gets. An assertion, not the mechanism: the settles above are what
+         * make it true inside a protected region, and branchOnDeoptInstStart
+         * declines rather than describing a register nothing wrote. */
+        e->instClean = (e->kPend == 0 && e->xBorrow == 0 && e->fpBorrow == 0);
 
         if (e->fpLive != 0) {
             bool joinsHere = false;
@@ -3232,7 +3398,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * here at all -- and there are no branches in an inlined body for
              * one to be. */
             if (e->inlining) joinsHere = false;
-            if (!fpFastOp(op) || joinsHere) {
+            if (!fpFastOp(op) || joinsHere || e->inProtected) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
@@ -3451,6 +3617,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     JIT_FSCRATCH_B));
                 emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
             } else if (ka == SLOT_INT) {
+                rd = ovfDest(e, rd);   /* localOut copies it home below */
                 emit(e, jaiA64AddsX(rd, ra, rb));
                 branchOnOverflow(e, 0u, JAI_A64_VS);
             } else {
@@ -3587,6 +3754,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     JIT_FSCRATCH_B));
                 emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
             } else if (ka == SLOT_INT) {
+                rd = ovfDest(e, rd);   /* localOut copies it home below */
                 emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
                 emit(e, jaiA64MulX(rd, ra, rb));
                 emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
@@ -3638,6 +3806,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     JIT_FSCRATCH_B));
                 emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
             } else if (ka == SLOT_INT) {
+                rd = ovfDest(e, rd);   /* localOut copies it home below */
                 emit(e, jaiA64SubsXReg(rd, ra, rb));
                 branchOnOverflow(e, 1u, JAI_A64_VS);
             } else {
@@ -3686,7 +3855,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (slot == 0) e->usesSlot0 = true;
             {
                 unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
-                unsigned dst = localDest(e, slot);
+                unsigned dst = ovfDest(e, localDest(e, slot));
                 /* Step is an i8, always fits imm12, so the constant never needs a register of its own. `subs` for a
                  * negative step rather than a negated `adds`: both set V for the operation actually performed, which is what the overflow guard below reads. */
                 if (imm >= 0) {
@@ -3694,9 +3863,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 } else {
                     emit(e, jaiA64SubsXImm(dst, cur, (unsigned)(-(int)imm)));
                 }
+                /* The guard is taken before the home is written, not after: it
+                 * resumes at this instruction inside a `try` (ovfDest), and
+                 * neither fpSyncAll nor a b.cond disturbs V or `dst`. */
+                branchOnOverflow(e, 0u, JAI_A64_VS);
                 localOut(e, slot, dst);
             }
-            branchOnOverflow(e, 0u, JAI_A64_VS);
             off += 4;
             break;
         }
@@ -4092,14 +4264,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
+            unsigned rt = ovfDest(e, rd);
             /* The product overflows exactly when the high half is not the low
              * half's sign bit replicated, so smulh and one shifted compare
              * decide it. mul must come after smulh reads its inputs, since rd
-             * may be one of them. */
+             * may be one of them -- which is also why `rt` differs inside a
+             * `try`: rd IS the first operand's register, and the guard resumes
+             * at an instruction whose operands the interpreter still needs. */
             emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
-            emit(e, jaiA64MulX(rd, ra, rb));
-            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+            emit(e, jaiA64MulX(rt, ra, rb));
+            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rt, 63));
             branchOnOverflow(e, 2u, JAI_A64_NE);
+            if (rt != rd) emit(e, jaiA64MovX(rd, rt));
             off += 1;
             break;
         }
@@ -4215,10 +4391,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT || op == OP_DIV) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
-            if (foldK) emitAddSubImm(e, rd, ra, kimm, op == OP_SUB);
-            else emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
-                                      : jaiA64SubsXReg(rd, ra, rb));
+            /* rd is the first operand's own register (two off, one on), so
+             * inside a `try` the sum computes elsewhere: the overflow guard
+             * resumes at this instruction and the interpreter reads the
+             * operands back off its stack. See ovfDest. */
+            unsigned rt = ovfDest(e, rd);
+            if (foldK) emitAddSubImm(e, rt, ra, kimm, op == OP_SUB);
+            else emit(e, op == OP_ADD ? jaiA64AddsX(rt, ra, rb)
+                                      : jaiA64SubsXReg(rt, ra, rb));
             branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
+            if (rt != rd) emit(e, jaiA64MovX(rd, rt));
             off += 1;
             break;
         }
@@ -4897,6 +5079,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
                 if (e->growCount >= JIT_MAX_GROW) {
                     e->whyNot = "more list pushes than the tier tracks";
+                    return false;
+                }
+                /* jitListGrow can raise, and the stub routes that to the
+                 * exception exit (see emitGrowStubs). */
+                if (!raiseExitAllowed(e, "a list growth inside a try")) {
                     return false;
                 }
                 {
@@ -6510,6 +6697,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * this instruction, and the model has moved on by then. */
             if (e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
                 e->whyNot = "more self-calls than the tier tracks";
+                return false;
+            }
+            /* Its cold block routes a raised exception to the exception exit
+             * (see emitSelfSlowStubs). */
+            if (!raiseExitAllowed(e, "a call that can raise inside a try")) {
                 return false;
             }
             unsigned si = e->selfSlowCount++;
