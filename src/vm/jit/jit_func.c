@@ -1782,6 +1782,25 @@ static bool rawObjValue(Value v) {
     return true;
 }
 
+/* Predicted stack kind for a callee that has not compiled, from what it has been observed to return
+ * (ObjFunction::obsReturnKind). Same contract as feedbackSlotKind's: a prediction the caller must guard.
+ * SLOT_INST is admissible here where it is not there, because a per-callee record can carry the class
+ * shape a one-byte-per-way cache cannot -- and the shape is guarded after the call like the tag. */
+static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
+                               uint32_t *shape) {
+    uint8_t fb = cfn->obsReturnKind;
+    *shape = 0;
+    if (fb == 1u + (unsigned)VAL_NULL) { *k = SLOT_NULL; return true; }
+    if (fb == JAI_FB_OBJ + (unsigned)OBJ_INSTANCE) {
+        if (cfn->obsReturnShape == 0) return false;
+        *k = SLOT_INST;
+        *shape = cfn->obsReturnShape;
+        return true;
+    }
+    unsigned tag;
+    return feedbackSlotKind(fb, k, &tag);
+}
+
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     *shape = 0; *kls = NULL;
     if (IS_INT(v))      { *k = SLOT_INT;   return true; }
@@ -4968,25 +4987,46 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 if (!IS_CLOSURE(method)) return false;
                 ObjFunction *mfn = AS_CLOSURE(method)->fn;
-                if (mfn->jitFunc == NULL) return false;   /* kind unknown yet */
-                SlotKind rkind = (SlotKind)mfn->jitReturnKind;
-                uint32_t rshape = mfn->jitReturnShape;
+                /* The callee's own compiled form states its return kind exactly; without one the
+                 * interpreter's record of what it has been returning stands in. That case is not exotic --
+                 * two methods that call each other can never take turns being the first to compile, so
+                 * neither ever has a jitFunc to ask, and json_parse's whole parser is that shape. Either
+                 * way it is only a prediction: the tag guard below is what makes it sound. */
+                SlotKind rkind = SLOT_NULL;
+                uint32_t rshape = 0;
                 ObjClass *rrcls = NULL;
-                if (rkind == SLOT_INST) {
-                    if (rshape == 0) return false;
-                    if (!jaiClassForShape(rshape, &rrcls) || rrcls == NULL) {
-                        return false;
-                    }
+                bool haveKind;
+                if (mfn->jitFunc != NULL) {
+                    rkind = (SlotKind)mfn->jitReturnKind;
+                    rshape = mfn->jitReturnShape;
+                    haveKind = true;
+                } else {
+                    haveKind = observedReturnKind(mfn, &rkind, &rshape);
                 }
-                if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
+                if (haveKind && rkind == SLOT_INST &&
+                    (rshape == 0 || !jaiClassForShape(rshape, &rrcls) ||
+                     rrcls == NULL)) {
+                    haveKind = false;
+                    rrcls = NULL;
+                }
+                if (haveKind && rkind != SLOT_INT && rkind != SLOT_FLOAT &&
                     rkind != SLOT_BOOL && rkind != SLOT_INST &&
-                    rkind != SLOT_LIST) {
+                    rkind != SLOT_LIST && rkind != SLOT_OBJ &&
+                    rkind != SLOT_NULL) {
+                    haveKind = false;
+                }
+                /* A result the very next instruction pops needs no kind at all -- which is every `-> void`
+                 * method called as a statement, and the reason a parser's `self.skip()` used to decline the
+                 * function around it. Same relaxation the builtin arm below already makes. */
+                bool mdiscarded = (off + 7 < count && code[off + 7] == OP_POP);
+                if (!haveKind && !mdiscarded) {
+                    e->whyNot = "callee's return kind not usable";
                     return false;
                 }
 
                 /* Straight to the method's compiled entry since the receiver's class is fixed here (SLOT_INST
                  * carries a shape the caller already guarded) -- the "inline cache" is the model itself, free at run time. Skips the whole jitInvokeMethod -> jaiCallMethodWithReceiver -> invokeCallable -> callClosure -> jaiJitEnterFunc -> jitArgIn chain of C glue between two compiled bodies, which was a large fraction of object_dispatch. Falls back rather than declines, for the same reason a global call does: the descriptor path speaks a wider language. */
-                {
+                if (mfn->jitFunc != NULL) {
                     const char *saved = e->whyNot;
                     if (emitDirectCall(e, fn, mfn, method, -1, ridx, argc,
                                        (uint32_t)off, (uint32_t)(off + 7),
@@ -5011,6 +5051,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     unsigned r;
                     if (!popValue(e, &r, NULL)) return false;
                 }
+                if (!haveKind) {
+                    /* Nothing observes the result, so nothing has to be
+                     * predicted or guarded about it. */
+                    e->wroteHeap = true;
+                    off += 8;          /* the OP_POP this consumed */
+                    break;
+                }
                 if (!pushValue(e, rkind, rshape, rrcls)) return false;
 
                 unsigned rat = e->descOffset +
@@ -5018,6 +5065,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
                                  : rkind == SLOT_FLOAT ? VAL_FLOAT
                                  : rkind == SLOT_BOOL  ? VAL_BOOL
+                                 : rkind == SLOT_NULL  ? VAL_NULL
                                                        : VAL_OBJ;
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
@@ -5026,6 +5074,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * was written: needs a bool-returning method emitDirectCall declines, which nothing in the suite exercises. */
                 if (rkind == SLOT_BOOL) {
                     emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
+                } else if (rkind == SLOT_NULL) {
+                    /* A null Value's payload word is not written by NULL_VAL, so
+                     * there is nothing to load; SLOT_NULL is a defined zero. */
+                    emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
                 } else {
                     emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
                 }
