@@ -1493,9 +1493,13 @@ static void emitConst64(Emit *e, unsigned rd, int64_t value) {
         emit(e, jaiA64MovnX(rd, (unsigned)(~(uint64_t)value & 0xffffu)));
         return;
     }
+    /* MOVZ where the first non-zero chunk is, not always at chunk 0: it zeroes the other three either way,
+     * so a `movz rd,#0` under a single `movk` was one instruction spent writing nothing. Every float constant has this shape -- IEEE-754 puts sign, exponent and the leading mantissa bits in the TOP chunk -- so `1.0` was two instructions and is now one, everywhere a float literal reaches a register. */
     uint64_t bits = (uint64_t)value;
-    emit(e, jaiA64MovzX(rd, (unsigned)(bits & 0xffffu), 0));
-    for (unsigned shift = 1; shift < 4; shift++) {
+    unsigned first = 0;
+    while (first < 3 && ((bits >> (16 * first)) & 0xffffu) == 0) first++;
+    emit(e, jaiA64MovzX(rd, (unsigned)((bits >> (16 * first)) & 0xffffu), first));
+    for (unsigned shift = first + 1; shift < 4; shift++) {
         unsigned part = (unsigned)((bits >> (16 * shift)) & 0xffffu);
         if (part != 0) emit(e, jaiA64MovkX(rd, part, shift));
     }
@@ -3059,11 +3063,20 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     if (e->depth <= cidx) { e->failed = true; return false; }
     rshape = e->stackShape[e->depth - 1];
     rcls   = e->stackClass[e->depth - 1];
-    if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    /* Read while `inlining` is still set, so this names the inlined bank's d
+     * register; the caller's own is taken after it is cleared. */
+    bool rfp = (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
+    unsigned rfpReg = rfp ? fpHeldIn(e, e->valueDepth - 1) : 0;
+    if (rfp) {
+        if (!popValueRaw(e, &rres, &kres)) { e->failed = true; return false; }
+    } else if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    /* Raw, because nothing reads these again: the body is over and its pinned
+     * locals go with it, so materialising one costs an instruction whose
+     * destination is dead. */
     while (e->depth > cidx) {
         if (holdsRegister(e->stack[e->depth - 1])) {
             unsigned r;
-            if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+            if (!popValueRaw(e, &r, NULL)) { e->failed = true; return false; }
         } else {
             e->depth--;
         }
@@ -3072,8 +3085,14 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
 
     if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }
-    unsigned dst = pushReg(e) - 1;
-    if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    if (rfp) {
+        unsigned dd = fpRegAt(e, e->valueDepth - 1);
+        if (dd != rfpReg) emit(e, jaiA64FmovDD(dd, rfpReg));
+        fpClaim(e, e->valueDepth - 1);
+    } else {
+        unsigned dst = pushReg(e) - 1;
+        if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    }
     e->inlined = true;
     return true;
 }
@@ -3621,6 +3640,9 @@ static bool deferSurvives(uint8_t op) {
     case OP_INT: case OP_CONST:
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_SHL: case OP_SHR:
+    /* Its arm settles both operands itself on every path that reads a register
+     * for them, and takes no deopt record before doing so. */
+    case OP_FLOORDIV:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
@@ -3646,6 +3668,9 @@ static bool foldsIntLiteral(uint8_t op) {
     /* Not because a shift takes an imm12 (it doesn't) -- the shift count becomes part of the instruction
      * encoding when it's a literal 0..63, so the register that used to hold it was written and never read. bitops paid a `movz` for every one of its shifts before this. */
     case OP_SHL: case OP_SHR:
+    /* Same again: a power-of-two divisor is spelt by the `asr`'s own shift field. Says yes for divisors
+     * that are not powers of two too, which is harmless -- that path settles what it cannot fold, exactly as this list's contract allows. spectral's `s * (s + 1) // 2` paid a `movz x3,#2` into a register no instruction read, once per inner iteration. */
+    case OP_FLOORDIV:
         return true;
     default:
         return false;
@@ -3734,7 +3759,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * here at all -- and there are no branches in an inlined body for
              * one to be. */
             if (e->inlining) joinsHere = false;
-            if (!fpFastOp(op) || joinsHere) {
+            /* An inlined OP_RETURN is not a sync point: the only entry that outlives it is the result, and
+             * inlineGlobalCall carries that one across in the bank. Everything under it is discarded unread. */
+            if (e->inlining && op == OP_RETURN) {
+                /* handled below */
+            } else if (!fpFastOp(op) || joinsHere) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
@@ -3758,7 +3787,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "an inlined body returning a value with no register";
                 return false;
             }
-            fpSyncOne(e, e->valueDepth - 1);
+            /* A float result stays in its d register: inlineGlobalCall moves it into the caller's bank with
+             * one FP-to-FP move, where syncing here spent an `fmov x,d` and then made the caller's first float operator pay an `fmov d,x` to undo it. settleAll still runs -- it is X-side only (kPend/xBorrow), and those bits are never set on an entry the bank holds. */
+            if (!(e->fpLive & (1u << (e->valueDepth - 1)))) {
+                fpSyncOne(e, e->valueDepth - 1);
+            }
             settleAll(e);   /* the caller reads the result out of valueXReg */
             break;
         }
@@ -4445,7 +4478,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 memcpy(&bits, &d, sizeof bits);
                 if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
                 unsigned imm8;
-                if (!e->fpOff && jaiA64FpImm8(d, &imm8)) {
+                /* The lookahead, not just the encodability: a constant with no float consumer ahead of it is
+                 * synced back out to X at the next ordinary opcode, so the bank form costs `fmov d,#imm` plus that `fmov x,d` where one `movz` would have done. Every value FMOV's imm8 can name has its whole payload in the top 16 bits, so emitConst64 is exactly one instruction for all of them. spectral's `1.0 / float(..)` is the shape: OP_GET_GLOBAL stands between the constant and its divide. */
+                if (!e->fpOff && jaiA64FpImm8(d, &imm8) &&
+                    fpWorthLoading(e, code, off + 4, stop)) {
                     /* Not `idx`: that is this instruction's constant index, and
                      * shadowing it here was the tree's only build warning. This
                      * one is a position on the operand stack. */
@@ -5342,7 +5378,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth < 2) return false;
             ka = e->stack[e->depth - 2]; kb = e->stack[e->depth - 1];
             if (ka != SLOT_INT || kb != SLOT_INT) return false;
-            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
             /* A literal power-of-two divisor decides the whole thing: floor(x / 2^s) is exactly `asr x, #s` for
              * every int64 x (negative included), since asr already rounds toward minus infinity -- what the correction below exists to reproduce for the general case. */
@@ -5351,14 +5386,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                              kdiv != 0 && kdiv != -1;
             unsigned dshift;
             if (kdivKnown && powerOfTwoShift(kdiv, &dshift)) {
+                /* The divisor is spelt by the shift field, so drop its deferral rather than settle it -- the
+                 * same move OP_ADD makes for an imm12 -- popValueRaw drops it. The dividend comes back from popValue, not from pushReg, because a borrowed entry lives in the local's register and not in its own. */
                 unsigned p1, p2;
-                if (!popValue(e, &p1, NULL)) return false;
+                if (!popValueRaw(e, &p1, NULL)) return false;
                 if (!popValue(e, &p2, NULL)) return false;
                 if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64AsrX(pushReg(e) - 1, ra, dshift));
+                emit(e, jaiA64AsrX(pushReg(e) - 1, p2, dshift));
                 off += 1;
                 break;
             }
+            /* Every path below reads both operands out of their own registers,
+             * and two of them guard. */
+            settleAll(e);
+            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
             /* Zero and -1 both decline: the interpreter reports division-by-zero, and INT64_MIN / -1 is the one
              * quotient that doesn't fit -- both rare enough that declining -1 outright costs nothing. A literal divisor has already answered both. */
@@ -7170,11 +7211,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 bool toFloat = strcmp(nm, "float") == 0;
                 bool toInt   = strcmp(nm, "int") == 0;
                 if (toFloat && ak == SLOT_INT) {
-                    emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
-                    emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                    /* Straight into the bank, not out through X: what consumes a `float(i)` is a float
+                     * operator, and one reads the bank through fpOperand. Computing into d0 and storing the bits to X cost spectral's inner loop two cross-register-file fmovs per iteration -- the store, and the load the very next instruction made of it. */
+                    unsigned fidx = e->valueDepth - 1;
+                    if (!e->fpOff) {
+                        emit(e, jaiA64ScvtfDX(fpRegAt(e, fidx), ar));
+                        fpClaim(e, fidx);
+                    } else {
+                        emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
+                        emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                    }
                 } else if (toInt && ak == SLOT_FLOAT) {
-                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ar));
-                    emit(e, jaiA64FcvtzsXD(ar, JIT_FSCRATCH_A));
+                    emit(e, jaiA64FcvtzsXD(ar, fpOperand(e, e->valueDepth - 1)));
                 } else if (!((toFloat && ak == SLOT_FLOAT) ||
                              (toInt && ak == SLOT_INT))) {
                     e->whyNot = "a builtin with no known result kind";
@@ -7532,12 +7580,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             return false;   /* an opcode this tier does not speak */
         }
     }
-    fpSyncAll(e);
-    settleAll(e);
     /* An inlined body's offsets are the callee's; matching them against the
      * caller's fixups compares two different numbering schemes. There is
      * nothing to check either way -- it has no branches. */
-    if (e->inlining) return !e->failed;
+    if (e->inlining) {
+        /* All but the result, which OP_RETURN deliberately left in the bank for
+         * inlineGlobalCall to carry across. Everything under it is either the
+         * caller's (settled before the call) or about to be discarded. */
+        unsigned keep = e->valueDepth > 0 ? e->valueDepth - 1 : 32u;
+        for (unsigned i = 0; i < 32u; i++) {
+            if (i != keep) fpSyncOne(e, i);
+        }
+        settleAll(e);
+        return !e->failed;
+    }
+    fpSyncAll(e);
+    settleAll(e);
     /* Nothing may branch to an offset this walk carried a float into (see fpCarry) -- declines, and the caller retries with the FP bank off. */
     for (unsigned i = 0; i < e->fpCarryCount; i++) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
