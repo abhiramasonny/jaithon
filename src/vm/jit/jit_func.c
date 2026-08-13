@@ -343,21 +343,49 @@ static bool holdsRegister(SlotKind k) {
            k != SLOT_NATIVE;
 }
 
-/* Two targets are not bytecode offsets at all. */
-#define FIXUP_BAIL   UINT32_MAX
-#define FIXUP_ENTRY  (UINT32_MAX - 1u)
-#define FIXUP_THREW  (UINT32_MAX - 2u)
-#define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
-#define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
-#define FIXUP_EXIT   (UINT32_MAX - 100u) /* minus the loop-exit index */
+/* Some fixup targets are not bytecode offsets at all: they are sentinels at the
+ * top of the u32 range, each one a base minus an index into a table.
+ *
+ * The bases are DERIVED from the table sizes rather than written down, because
+ * hand-picked ones overlapped. FIXUP_DEOPT was UINT32_MAX-7 minus an index into
+ * a 160-entry table, so it ran down to UINT32_MAX-166 -- straight through
+ * FIXUP_EXIT at UINT32_MAX-100. The resolver tests EXIT first, so **deopt sites
+ * 93 through 100 would have resolved to an exit stub**: a compiled body jumping
+ * out of its loop where it meant to hand back to the interpreter.
+ *
+ * It was never reachable, which is why it sat here: the largest deopt count
+ * anyone had seen was 16. It is 47 today across the benchmark suite, because a
+ * day of adding guards to the tier moved it halfway. Deriving the bases makes
+ * the overlap impossible rather than merely unlikely, and the assertions below
+ * fail the build if a future table size reintroduces it. */
+#define JIT_MAX_DEOPT     160u
+#define JIT_MAX_EXIT      8u
 /* Self-calls and direct calls to a callee that writes share this table, so it
  * is sized for a body with several of each rather than for recursion alone. */
 #define JIT_MAX_SELF_SLOW 32u
-#define FIXUP_SELFSLOW (UINT32_MAX - 200u) /* minus the self-call index */
-#define JIT_MAX_GROW   16u
-#define FIXUP_GROW   (UINT32_MAX - 400u) /* minus the list-growth index */
+#define JIT_MAX_GROW      16u
 
-#define JIT_MAX_DEOPT 160
+#define FIXUP_BAIL   UINT32_MAX
+#define FIXUP_ENTRY  (UINT32_MAX - 1u)
+#define FIXUP_THREW  (UINT32_MAX - 2u)
+#define FIXUP_OVF    (UINT32_MAX - 3u)   /* minus 0,1,2 for the three operators */
+#define FIXUP_DEOPT    (UINT32_MAX - 7u)                     /* minus a deopt index */
+#define FIXUP_EXIT     (FIXUP_DEOPT - JIT_MAX_DEOPT)         /* minus an exit index */
+#define FIXUP_SELFSLOW (FIXUP_EXIT - JIT_MAX_EXIT)           /* minus a self-call index */
+#define FIXUP_GROW     (FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)  /* minus a growth index */
+
+/* Every sentinel range must stay above any offset a real chunk can have. A
+ * chunk that large is not representable long before this matters, so half the
+ * u32 range is an enormous margin -- the point is that the build fails if the
+ * tables ever grow enough to reach down into bytecode-offset territory. */
+_Static_assert(FIXUP_GROW - JIT_MAX_GROW > UINT32_MAX / 2u,
+               "jit fixup sentinels have grown down into bytecode offsets");
+_Static_assert(FIXUP_EXIT < FIXUP_DEOPT - (JIT_MAX_DEOPT - 1u),
+               "jit deopt and exit fixup ranges overlap");
+_Static_assert(FIXUP_SELFSLOW < FIXUP_EXIT - (JIT_MAX_EXIT - 1u),
+               "jit exit and self-call fixup ranges overlap");
+_Static_assert(FIXUP_GROW < FIXUP_SELFSLOW - (JIT_MAX_SELF_SLOW - 1u),
+               "jit self-call and growth fixup ranges overlap");
 
 typedef struct {
     int      instIndex;
@@ -487,7 +515,7 @@ typedef struct {
     uint32_t  rangeBuildIp;
     unsigned  iterSlot;
     uint32_t  iterExit;
-    int       exitStub[8];
+    int       exitStub[JIT_MAX_EXIT];
     uint32_t  exitOffset[8];
     unsigned  exitCount;
     /* A body that reads an upvalue needs the closure itself -- not any slot (a method's slot 0 is the
@@ -1413,7 +1441,7 @@ static uint32_t exitTargetFor(Emit *e, uint32_t target) {
     for (unsigned i = 0; i < e->exitCount; i++) {
         if (e->exitOffset[i] == target) return FIXUP_EXIT - i;
     }
-    if (e->exitCount >= 8) { e->whyNot = "too many ways out of the loop"; e->failed = true; return FIXUP_EXIT; }
+    if (e->exitCount >= JIT_MAX_EXIT) { e->whyNot = "too many ways out of the loop"; e->failed = true; return FIXUP_EXIT; }
     e->exitOffset[e->exitCount] = target;
     return FIXUP_EXIT - e->exitCount++;
 }
@@ -7588,7 +7616,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         } else if (f->targetOffset == FIXUP_THREW) {
             target = e.exceptionExit;
         } else if (f->targetOffset <= FIXUP_EXIT &&
-                   f->targetOffset > FIXUP_EXIT - 8u) {
+                   f->targetOffset > FIXUP_EXIT - JIT_MAX_EXIT) {
             target = e.exitStub[FIXUP_EXIT - f->targetOffset];
             if (target < 0) {
                 if (getenv("JAI_JIT_WHY")) {
@@ -8143,7 +8171,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
     /* Falling off the end of the compiled range is the loop exiting there. */
-    if (e.exitCount >= 8) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.exitCount >= JIT_MAX_EXIT) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
 /* Every way out writes back what the loop was holding: the iterator's index,
  * and the locals if they were living in registers. Miss one and the
@@ -8321,7 +8349,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         int target;
         if (f->targetOffset == FIXUP_BAIL) target = e.bailBlock;
         else if (f->targetOffset == FIXUP_THREW) target = e.exceptionExit;
-        else if (f->targetOffset <= FIXUP_EXIT && f->targetOffset > FIXUP_EXIT - 8u)
+        else if (f->targetOffset <= FIXUP_EXIT &&
+                 f->targetOffset > FIXUP_EXIT - JIT_MAX_EXIT)
             target = e.exitStub[FIXUP_EXIT - f->targetOffset];
         else if (f->targetOffset <= FIXUP_SELFSLOW &&
                  f->targetOffset > FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)
