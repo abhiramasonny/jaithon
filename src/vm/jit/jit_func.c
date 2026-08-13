@@ -712,7 +712,14 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
             emit(e, jaiA64FmovXD(scratch, e->slotFpReg[slot]));
             return scratch;
         }
-        emit(e, jaiA64LdrX(scratch, JIT_SLOTS_REG, slot * 16u + 8u));
+        /* One byte for a bool. The slot is the interpreter's, and BOOL_VAL is a
+         * `strb`, so the seven bytes above it are whatever the slot held
+         * before. See the OSR prologue for the same load and what it cost. */
+        if (e->localKind[slot] == SLOT_BOOL) {
+            emit(e, jaiA64LdrByte(scratch, JIT_SLOTS_REG, slot * 16u + 8u));
+        } else {
+            emit(e, jaiA64LdrX(scratch, JIT_SLOTS_REG, slot * 16u + 8u));
+        }
         return scratch;
     }
     noteSlotCost(e, slot, 1u, 0u);
@@ -7371,9 +7378,20 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     emitFpSaveRestore(&e, true);
     emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
     /* Payloads only: the entry has already checked every slot's kind, so there
-     * is nothing left to guard here. */
+     * is nothing left to guard here.
+     *
+     * Except the width. Unlike the function tier, which marshals every argument
+     * through jitArgOut and hands a bool over as a clean 0 or 1, these slots
+     * are the interpreter's own and BOOL_VAL is a one-byte `strb` -- the seven
+     * bytes above a bool are whatever that slot last held. An eight-byte load
+     * puts that garbage in a SLOT_BOOL register, and every consumer of one
+     * tests the whole word, so `if flag {` took the wrong arm whenever the
+     * slot had previously held anything with a high byte set. Silent: the
+     * program ran, and computed the other branch. */
     for (unsigned i = 0; i < e.locals; i++) {
-        if (e.slotXReg[i] != 0) {
+        if (e.slotXReg[i] != 0 && e.localKind[i] == SLOT_BOOL) {
+            emit(&e, jaiA64LdrByte(e.slotXReg[i], JIT_SLOTS_REG, i * 16u + 8u));
+        } else if (e.slotXReg[i] != 0) {
             emit(&e, jaiA64LdrX(e.slotXReg[i], JIT_SLOTS_REG, i * 16u + 8u));
         } else if (e.slotFpReg[i] != 0) {
             emit(&e, jaiA64LdrD(e.slotFpReg[i], JIT_SLOTS_REG, i * 16u + 8u));
