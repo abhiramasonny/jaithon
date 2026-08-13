@@ -1,12 +1,17 @@
-declined at OP_FOR_ITER
+declined at OP_GET_EXC
+stopped : OP_GET_FIELD_LOCAL
 stopped : OP_GET_LOCAL
+stopped : OP_INVOKE
+stopped : OP_SET_FIELD
 stopped : a parameter is sometimes null
 stopped : callee is not a compiled global function
 stopped : loop variable took two kinds
 stopped: OP_CALL
-stopped: OP_FOR_ITER
 stopped: OP_FOR_ITER_PAIR
+stopped: OP_GET_EXC
+stopped: OP_GET_FIELD_LOCAL
 stopped: add-bind of a kind that is neither int nor float
 stopped: callee is not a compiled global function
 stopped: callee's return kind not usable
+stopped: loop variable took two kinds
 stopped: slicing a container this tier does not model
