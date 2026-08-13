@@ -1920,6 +1920,27 @@ static bool compareOp(OpCode op, Value a, Value b, Value *out) {
     }
 }
 
+/* `a == b` when both are strings: the one object case jaiValuesEqual cannot be
+ * reached without a call.
+ *
+ * Every `==` whose operands are not both ints goes out of line through
+ * jaiValuesEqual, wrapped in SAVE_STATE/LOAD_STATE because in general it can
+ * dispatch to a user `__eq__` and therefore re-enter the interpreter. Two
+ * strings can do none of that: jaiValuesEqual's OBJ_STRING arm is exactly
+ * jaiStringEquals, which is already inline, allocates nothing and cannot
+ * throw. Comparing a scanned character against a literal is the single
+ * hottest comparison shape there is -- `text[at] == " "` was 17% of
+ * tests/bench/word_freq's scan by sample -- and it was paying a call and eight
+ * memory operations to reach a pointer compare. */
+JAI_INLINE bool valuesEqualFast(Value a, Value b, bool *equal) {
+    if (JAI_UNLIKELY(!IS_OBJ(a) || !IS_OBJ(b))) return false;
+    Obj *ao = AS_OBJ(a), *bo = AS_OBJ(b);
+    if (JAI_UNLIKELY(ao->type != OBJ_STRING || bo->type != OBJ_STRING))
+        return false;
+    *equal = jaiStringEquals((ObjString *)ao, (ObjString *)bo);
+    return true;
+}
+
 /* `element in container`. */
 static bool containsOp(Value container, Value element, bool *out) {
     if (IS_STRING(container)) {
@@ -2023,6 +2044,62 @@ static bool unaryNegate(Value v, Value *out) {
 /* ------------------------------------------------------------------ */
 /* Indexing and slicing                                                 */
 /* ------------------------------------------------------------------ */
+
+/* The part of `c[i]` that can neither allocate, call, nor throw, so the
+ * interpreter can answer it without saving and restoring its state.
+ *
+ * indexGet below is a real call behind SAVE_STATE/LOAD_STATE -- two stores and
+ * six loads, one of them a three-deep chase to the constant pool -- and for a
+ * string it reaches the general slice machinery (scalar count, sliceCount,
+ * step and ASCII analysis) to produce one character. That is what a scanner
+ * does per byte: tests/bench/word_freq runs this 956,166 times and gets no
+ * help from the JIT, and every lexer written in this language has the same
+ * shape.
+ *
+ * Anything this declines -- a non-int index, out of range, a non-ASCII string,
+ * a character not yet in the shared one-byte table, any other container --
+ * falls through to indexGet unchanged, so the error messages and the slow
+ * paths stay in exactly one place. */
+JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
+    if (JAI_UNLIKELY(!IS_OBJ(container) || !IS_INT(index))) return false;
+
+    Obj *o = AS_OBJ(container);
+    const int64_t raw = AS_INT(index);
+
+    if (o->type == OBJ_LIST) {
+        ObjList *list = (ObjList *)o;
+        int at;
+        if (JAI_UNLIKELY(!jaiNormalizeIndex(raw, list->count, &at))) return false;
+        *out = list->items[at];
+        return true;
+    }
+
+    if (o->type == OBJ_STRING) {
+        ObjString *s = (ObjString *)o;
+        /* Indexing is by scalar. `scalars` is UINT32_MAX until something asks,
+         * so the first index of any string goes the slow way and fills it in;
+         * after that this is the ASCII test, one byte per scalar. */
+        if (JAI_UNLIKELY(s->scalars != s->length)) return false;
+        int at;
+        if (JAI_UNLIKELY(!jaiNormalizeIndex(raw, (int)s->length, &at))) return false;
+        const unsigned char c = (unsigned char)s->chars[at];
+        if (JAI_UNLIKELY(c >= 128)) return false;
+        ObjString *cached = jaiAsciiCharTable()[c];
+        if (JAI_UNLIKELY(cached == NULL)) return false;   /* first use allocates */
+        *out = OBJ_VAL(cached);
+        return true;
+    }
+
+    if (o->type == OBJ_TUPLE) {
+        ObjTuple *t = (ObjTuple *)o;
+        int at;
+        if (JAI_UNLIKELY(!jaiNormalizeIndex(raw, (int)t->count, &at))) return false;
+        *out = t->items[at];
+        return true;
+    }
+
+    return false;
+}
 
 static bool indexGet(Value container, Value index, Value *out) {
     if (IS_LIST(container)) {
@@ -3834,6 +3911,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
     VM_CASE(OP_EQ):
     VM_CASE(OP_NE): {
         bool wantEqual = (instStart[0] == OP_EQ);
+        bool fast;
+        if (JAI_LIKELY(valuesEqualFast(stackTop[-2], stackTop[-1], &fast))) {
+            DROP(2);
+            PUSH(BOOL_VAL(fast == wantEqual));
+            VM_NEXT();
+        }
         SAVE_STATE();
         bool equal = jaiValuesEqual(stackTop[-2], stackTop[-1]);
         if (vm.hasException) goto vmThrow;
@@ -4158,6 +4241,15 @@ static JaiRunResult runLoop(int baseFrameCount) {
             VM_NEXT();
         }
 
+        if (cmp == OP_EQ || cmp == OP_NE) {
+            bool fast;
+            if (JAI_LIKELY(valuesEqualFast(a, b, &fast))) {
+                stackTop -= 2;
+                if (fast != (cmp == OP_EQ)) ip += offset;
+                VM_NEXT();
+            }
+        }
+
         SAVE_STATE();
         bool condition;
         if (cmp == OP_EQ || cmp == OP_NE) {
@@ -4202,6 +4294,14 @@ static JaiRunResult runLoop(int baseFrameCount) {
             }
             if (!taken) ip += offset;
             VM_NEXT();
+        }
+
+        if (cmp == OP_EQ || cmp == OP_NE) {
+            bool fast;
+            if (JAI_LIKELY(valuesEqualFast(a, b, &fast))) {
+                if (fast != (cmp == OP_EQ)) ip += offset;
+                VM_NEXT();
+            }
         }
 
         SAVE_STATE();
@@ -4946,8 +5046,13 @@ static JaiRunResult runLoop(int baseFrameCount) {
     }
 
     VM_CASE(OP_GET_INDEX): {
-        SAVE_STATE();
         Value result;
+        if (JAI_LIKELY(indexGetFast(stackTop[-2], stackTop[-1], &result))) {
+            DROP(2);
+            PUSH(result);
+            VM_NEXT();
+        }
+        SAVE_STATE();
         if (!indexGet(stackTop[-2], stackTop[-1], &result)) goto vmThrow;
         LOAD_STATE();
         DROP(2);
