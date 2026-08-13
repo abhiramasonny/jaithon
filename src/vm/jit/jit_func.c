@@ -3940,9 +3940,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
                 unsigned imm8;
                 if (!e->fpOff && jaiA64FpImm8(d, &imm8)) {
-                    unsigned idx = e->valueDepth - 1;
-                    emit(e, jaiA64FmovDImm(fpRegAt(e, idx), imm8));
-                    fpClaim(e, idx);
+                    /* Not `idx`: that is this instruction's constant index, and
+                     * shadowing it here was the tree's only build warning. This
+                     * one is a position on the operand stack. */
+                    unsigned at = e->valueDepth - 1;
+                    emit(e, jaiA64FmovDImm(fpRegAt(e, at), imm8));
+                    fpClaim(e, at);
                 } else {
                     emitConst64(e, pushReg(e) - 1, bits);
                 }
