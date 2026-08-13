@@ -1731,6 +1731,20 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
     return true;
 }
 
+/* The same test feedbackSlotKind applies to a call's result, as a predicate on a Value: is this a heap
+ * object with no stack kind of its own, so SLOT_OBJ's "read, pass, store, root and nothing else" describes it exactly? Excludes the kinds a later arm resolves to a register-free entry (class/closure/native/...), which SLOT_OBJ would silently outrank. */
+static bool rawObjValue(Value v) {
+    if (!IS_OBJ(v) || AS_OBJ(v) == NULL) return false;
+    switch (OBJ_TYPE(v)) {
+    case OBJ_INSTANCE: case OBJ_CLASS: case OBJ_TRAIT:
+    case OBJ_CLOSURE:  case OBJ_FUNCTION: case OBJ_NATIVE:
+    case OBJ_BOUND:    case OBJ_ENUM: case OBJ_ENUM_CTOR:
+        return false;
+    default: break;
+    }
+    return true;
+}
+
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     *shape = 0; *kls = NULL;
     if (IS_INT(v))      { *k = SLOT_INT;   return true; }
@@ -4230,6 +4244,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                              : e->localClass[slot];
                 if (fcls == NULL) return false;
             }
+            /* A str/list/dict/set field, held raw -- the same contract as a SLOT_OBJ global or list element:
+             * the tag guard below says "an object", the sample says which type it was, and every consumer
+             * (index, invoke, compare) re-checks Obj.type for itself before it does anything type-specific.
+             * Refusing this declined the whole enclosing FUNCTION, which is most object-oriented code. */
+            else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
             else return false;
 
             unsigned base = (unsigned)offsetof(ObjInstance, fields) +
@@ -4287,7 +4306,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_D));
             } else {
-                if (!pushValue(e, kind, 0, NULL)) return false;
+                /* SLOT_OBJ needs the sample carried: it is the only record of which object type this was,
+                 * and a consumer with nothing to look at declines. NULL_VAL when `already` overrode the
+                 * observation, since then the stored kind and the sampled value need not agree. */
+                if (!pushValue3(e, kind, 0, NULL,
+                                kind == SLOT_OBJ && rawObjValue(fieldVal)
+                                    ? fieldVal : NULL_VAL,
+                                -1)) {
+                    return false;
+                }
                 /* A float field goes straight to the FP bank when something
                  * downstream will read it there: `ldr d` instead of `ldr x`
                  * followed by the `fmov` its consumer would emit. */
@@ -4502,6 +4529,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned tag;
             if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            /* As in OP_GET_FIELD_LOCAL: an object-typed field is held raw
+             * rather than declining the enclosing function. */
+            else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
             else return false;
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
@@ -4522,7 +4552,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned popped;
             SlotKind kr;
             if (!popValue(e, &popped, &kr)) return false;
-            if (!pushValue(e, kind, 0, NULL)) return false;
+            if (!pushValue3(e, kind, 0, NULL,
+                            kind == SLOT_OBJ && rawObjValue(fieldVal)
+                                ? fieldVal : NULL_VAL,
+                            -1)) {
+                return false;
+            }
             if (kind == SLOT_FLOAT && fpWorthLoading(e, code, off + 6, stop)) {
                 unsigned idx = e->valueDepth - 1;
                 emit(e, jaiA64LdrD(fpRegAt(e, idx), rr, fbase + 8));
