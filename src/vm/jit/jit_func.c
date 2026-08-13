@@ -1834,6 +1834,25 @@ static bool rawObjValue(Value v) {
     return true;
 }
 
+/* Predicted stack kind for a callee that has not compiled, from what it has been observed to return
+ * (ObjFunction::obsReturnKind). Same contract as feedbackSlotKind's: a prediction the caller must guard.
+ * SLOT_INST is admissible here where it is not there, because a per-callee record can carry the class
+ * shape a one-byte-per-way cache cannot -- and the shape is guarded after the call like the tag. */
+static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
+                               uint32_t *shape) {
+    uint8_t fb = cfn->obsReturnKind;
+    *shape = 0;
+    if (fb == 1u + (unsigned)VAL_NULL) { *k = SLOT_NULL; return true; }
+    if (fb == JAI_FB_OBJ + (unsigned)OBJ_INSTANCE) {
+        if (cfn->obsReturnShape == 0) return false;
+        *k = SLOT_INST;
+        *shape = cfn->obsReturnShape;
+        return true;
+    }
+    unsigned tag;
+    return feedbackSlotKind(fb, k, &tag);
+}
+
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     *shape = 0; *kls = NULL;
     if (IS_INT(v))      { *k = SLOT_INT;   return true; }
@@ -2673,14 +2692,13 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     Value cv = e->stackSeen[cidx];
     if (!IS_CLOSURE(cv)) { e->whyNot = "callee vanished"; return false; }
     ObjFunction *cfn = AS_CLOSURE(cv)->fn;
-    if (cfn->jitFunc == NULL) { e->whyNot = "callee no longer compiled"; return false; }
 
     /* Straight to the callee's entry when everything jaiJitEnterFunc would
      * have checked can be checked here instead. Falling back rather than
      * declining matters: the descriptor path speaks a much wider language --
      * any argument kind, any module, a callee that writes -- and a call
      * through jaiCallValue still beats no compiled loop at all. */
-    {
+    if (cfn->jitFunc != NULL) {
         const char *saved = e->whyNot;
         if (emitDirectCall(e, caller, cfn, cv, -1, cidx, argc, callOff,
                            after, false)) {
@@ -2690,18 +2708,31 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         e->whyNot = saved;
     }
 
-    SlotKind rk = (SlotKind)cfn->jitReturnKind;
-    uint32_t rshape = cfn->jitReturnShape;
+    /* A callee with no compiled form of its own still knows what it has been
+     * returning; see ObjFunction::obsReturnKind and the twin case at OP_INVOKE.
+     * A recursive function is the ordinary way to reach this -- the loop being
+     * compiled is inside the very function the call names, so there is nothing
+     * for `jitReturnKind` to have been written by yet. */
+    SlotKind rk = SLOT_NULL;
+    uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    if (rk == SLOT_INST) {
-        if (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL) {
-            e->whyNot = "callee's return class not on record";
-            return false;
-        }
+    bool haveKind;
+    if (cfn->jitFunc != NULL) {
+        rk = (SlotKind)cfn->jitReturnKind;
+        rshape = cfn->jitReturnShape;
+        haveKind = true;
+    } else {
+        haveKind = observedReturnKind(cfn, &rk, &rshape);
     }
-    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
-        rk != SLOT_NULL) {
+    if (haveKind && rk == SLOT_INST &&
+        (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
+        e->whyNot = "callee's return class not on record";
+        return false;
+    }
+    if (!haveKind ||
+        (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+         rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
+         rk != SLOT_NULL)) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
@@ -2731,6 +2762,24 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
      * rather than whatever the descriptor happened to leave behind. */
     if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
     else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+    if (rk == SLOT_INST) {
+        /* The tag says "an object", which is not "an instance of this class",
+         * and every field offset resolved against the entry below assumes it
+         * is. The object type is checked before `klass` is read for the same
+         * reason it is at the invoke arm: VAL_OBJ covers every heap object and
+         * a returned string's header is shorter than an instance's. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(ObjInstance, klass)));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                           (unsigned)offsetof(ObjClass, shapeId)));
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    }
     e->wroteHeap = true;
     return true;
 }
@@ -4288,10 +4337,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned cond;
             if (!negatedCondition(cmp, &cond)) return false;
             if (!localInRange(e, slot)) return false;
-            if (e->localKind[slot] != SLOT_INT) return false;
-            if (slot == 0) e->usesSlot0 = true;
             if (kIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value k = fn->chunk.constants.data[kIdx];
+
+            /* `if c == "{"` where c came out of a string index. Every hand-written scanner in the language is
+             * this shape, and the peephole folds it to exactly this instruction, so declining it declined the
+             * whole enclosing function -- json_parse's `value` dispatches on six of them. Two interned strings
+             * are equal exactly when they are the same object, which the OP_EQ arm already relies on; the
+             * difference here is that one side is a constant, so its interning is settled at compile time and
+             * only the local needs guarding. Nothing has been written yet, so a guard resumes at this very
+             * instruction. */
+            if ((cmp == OP_EQ || cmp == OP_NE) &&
+                e->localKind[slot] == SLOT_OBJ && IS_STRING(k) &&
+                JAI_STR_INTERNED(AS_STRING(k)) &&
+                IS_STRING(localObserved(e, slot) ? e->observed[slot]
+                                                 : e->localSeen[slot])) {
+                if (slot == 0) e->usesSlot0 = true;
+                settleAll(e);          /* this path guards */
+                unsigned rs = localIn(e, slot, JIT_SCRATCH_C);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+                /* Not interned means content equality is not pointer equality,
+                 * and the interpreter is the one that knows how to tell. */
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, rs,
+                                      (unsigned)offsetof(Obj, subFlag)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
+                emit(e, jaiA64SubsXReg(31, rs, JIT_SCRATCH_B));
+                branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
+                off += 9;
+                break;
+            }
+
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
             if (!IS_INT(k)) return false;
 
             /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's
@@ -5023,25 +5105,46 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 if (!IS_CLOSURE(method)) return false;
                 ObjFunction *mfn = AS_CLOSURE(method)->fn;
-                if (mfn->jitFunc == NULL) return false;   /* kind unknown yet */
-                SlotKind rkind = (SlotKind)mfn->jitReturnKind;
-                uint32_t rshape = mfn->jitReturnShape;
+                /* The callee's own compiled form states its return kind exactly; without one the
+                 * interpreter's record of what it has been returning stands in. That case is not exotic --
+                 * two methods that call each other can never take turns being the first to compile, so
+                 * neither ever has a jitFunc to ask, and json_parse's whole parser is that shape. Either
+                 * way it is only a prediction: the tag guard below is what makes it sound. */
+                SlotKind rkind = SLOT_NULL;
+                uint32_t rshape = 0;
                 ObjClass *rrcls = NULL;
-                if (rkind == SLOT_INST) {
-                    if (rshape == 0) return false;
-                    if (!jaiClassForShape(rshape, &rrcls) || rrcls == NULL) {
-                        return false;
-                    }
+                bool haveKind;
+                if (mfn->jitFunc != NULL) {
+                    rkind = (SlotKind)mfn->jitReturnKind;
+                    rshape = mfn->jitReturnShape;
+                    haveKind = true;
+                } else {
+                    haveKind = observedReturnKind(mfn, &rkind, &rshape);
                 }
-                if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
+                if (haveKind && rkind == SLOT_INST &&
+                    (rshape == 0 || !jaiClassForShape(rshape, &rrcls) ||
+                     rrcls == NULL)) {
+                    haveKind = false;
+                    rrcls = NULL;
+                }
+                if (haveKind && rkind != SLOT_INT && rkind != SLOT_FLOAT &&
                     rkind != SLOT_BOOL && rkind != SLOT_INST &&
-                    rkind != SLOT_LIST) {
+                    rkind != SLOT_LIST && rkind != SLOT_OBJ &&
+                    rkind != SLOT_NULL) {
+                    haveKind = false;
+                }
+                /* A result the very next instruction pops needs no kind at all -- which is every `-> void`
+                 * method called as a statement, and the reason a parser's `self.skip()` used to decline the
+                 * function around it. Same relaxation the builtin arm below already makes. */
+                bool mdiscarded = (off + 7 < count && code[off + 7] == OP_POP);
+                if (!haveKind && !mdiscarded) {
+                    e->whyNot = "callee's return kind not usable";
                     return false;
                 }
 
                 /* Straight to the method's compiled entry since the receiver's class is fixed here (SLOT_INST
                  * carries a shape the caller already guarded) -- the "inline cache" is the model itself, free at run time. Skips the whole jitInvokeMethod -> jaiCallMethodWithReceiver -> invokeCallable -> callClosure -> jaiJitEnterFunc -> jitArgIn chain of C glue between two compiled bodies, which was a large fraction of object_dispatch. Falls back rather than declines, for the same reason a global call does: the descriptor path speaks a wider language. */
-                {
+                if (mfn->jitFunc != NULL) {
                     const char *saved = e->whyNot;
                     if (emitDirectCall(e, fn, mfn, method, -1, ridx, argc,
                                        (uint32_t)off, (uint32_t)(off + 7),
@@ -5066,6 +5169,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     unsigned r;
                     if (!popValue(e, &r, NULL)) return false;
                 }
+                if (!haveKind) {
+                    /* Nothing observes the result, so nothing has to be
+                     * predicted or guarded about it. */
+                    e->wroteHeap = true;
+                    off += 8;          /* the OP_POP this consumed */
+                    break;
+                }
                 if (!pushValue(e, rkind, rshape, rrcls)) return false;
 
                 unsigned rat = e->descOffset +
@@ -5073,6 +5183,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
                                  : rkind == SLOT_FLOAT ? VAL_FLOAT
                                  : rkind == SLOT_BOOL  ? VAL_BOOL
+                                 : rkind == SLOT_NULL  ? VAL_NULL
                                                        : VAL_OBJ;
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
@@ -5081,13 +5192,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * was written: needs a bool-returning method emitDirectCall declines, which nothing in the suite exercises. */
                 if (rkind == SLOT_BOOL) {
                     emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
+                } else if (rkind == SLOT_NULL) {
+                    /* A null Value's payload word is not written by NULL_VAL, so
+                     * there is nothing to load; SLOT_NULL is a defined zero. */
+                    emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
                 } else {
                     emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
                 }
                 if (rkind == SLOT_INST) {
                     /* "an object" is not "an object of this class", and a
                      * method entered with another specialisation runs
-                     * interpreted and may return either. */
+                     * interpreted and may return either. The object TYPE goes
+                     * first: VAL_OBJ is every heap object, so a method that
+                     * returned a string here would have `klass` read one word
+                     * past its header and the shape loaded through whatever was
+                     * there -- a segfault, reachable from ordinary code. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
                     emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
                                        (unsigned)offsetof(ObjInstance, klass)));
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,

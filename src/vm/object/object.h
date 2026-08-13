@@ -335,6 +335,24 @@ struct ObjFunction {
      * it to decide when a function is worth compiling; it costs one increment
      * on the call path and stops counting once hot. */
     uint16_t    entryCount;
+    /* What this function has been observed to RETURN, merged over its first
+     * JAI_JIT_THRESHOLD interpreted returns and then frozen: JAI_FB_NONE never
+     * seen, 1+ValueType for a non-object, JAI_FB_OBJ+ObjType for an object,
+     * JAI_FB_MIXED for more than one. `obsReturnShape` is the class shape when
+     * every observation was an instance of one class, else 0.
+     *
+     * A PREDICTION, never a fact -- the caller that uses it guards the tag (and
+     * the shape) of what actually comes back, exactly as it does for a callee
+     * that HAS compiled. Its whole point is the callee that has not: two
+     * methods that call each other can never take turns being the first to
+     * compile, so `jitReturnKind` is unreachable for both and a compiled caller
+     * would otherwise have to decline every such site. Recorded per callee
+     * rather than per call site because the observation has to be made where
+     * the value is produced, and a per-site record armed at the call is lost
+     * whenever the callee calls the same site again before returning -- which
+     * is precisely the recursive shape this exists for. */
+    uint8_t     obsReturnKind;
+    uint32_t    obsReturnShape;
     /* Entry point of this function's compiled form, or NULL. Owned by the JIT's
      * arena, which outlives every function, so this is not freed here. */
     void       *jitCode;
