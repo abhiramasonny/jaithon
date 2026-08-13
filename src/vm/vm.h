@@ -129,6 +129,14 @@ bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
 uint8_t jaiInvokeResultFeedback(const Chunk *chunk, uint16_t cacheIdx,
                                 Value receiver);
 
+/* The megamorphic method cache is held weakly: this drops every entry the
+ * marker did not reach, and must run in the same phase jaiTableRemoveWhite
+ * runs for the intern table -- after tracing, before the sweep. */
+void jaiMethodCacheRemoveWhite(void);
+/* Reads JAITHON_MEGA_STRESS, which collapses that cache to one entry so every
+ * key collides. Called by jaiVMInit. */
+void jaiMethodCacheInit(void);
+
 /* OP_GET_SLICE's semantics, callable from the compiled tier. */
 bool jaiSliceGet(Value container, Value startValue, Value stopValue,
                  Value stepValue, bool hasStart, bool hasStop, bool hasStep,
