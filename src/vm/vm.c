@@ -161,7 +161,7 @@ static uint32_t builtinShapeTag(Value v) {
  * method the marker did not reach, in the same phase jaiTableRemoveWhite runs
  * for the intern table. So the cache neither keeps a dead class alive nor is
  * ever left pointing at one. */
-#define JAI_MEGA_WAYS 512u        /* power of two */
+#define JAI_MEGA_WAYS 64u        /* power of two */
 
 typedef struct {
     ObjClass  *klass;
