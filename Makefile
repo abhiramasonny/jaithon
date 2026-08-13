@@ -467,6 +467,41 @@ branch-table-check:
 jit-declines-check:
 	@./scripts/jit_declines.sh check
 
+# A `test_jit_*` case can pass with its own fix reverted: `jaithon test` never
+# makes the body it means to exercise hot enough to compile, so the test only
+# ever proves the interpreter agrees with itself. Measured across six files in
+# tests/lang, the fraction of their OWN functions that reached `[jit] compiled`
+# or an OSR form ranged 9/18 down to 1/12 (docs/roadmap.md §7). Every author
+# verified teeth by reverting and watching the test still pass, so the fixes
+# are real -- but nothing enforced it, and an edit that drops a loop below
+# JAI_JIT_THRESHOLD hollows the gate with no signal.
+#
+# scripts/jit_compile_check.py closes that hole with a declaration next to the
+# test rather than a separate list that drifts: a `# jit-compiles: name, ...`
+# line naming the helpers (never the `test_*` wrappers) the file claims reach
+# the compiled tier. It fails if a name is not a real top-level `fn` in that
+# file (the marker rotted) and if a name never reaches `[jit] compiled` or
+# `[jit] osr` under JAI_JIT_WHY=1 (the thing it claims stopped being true).
+#
+# Deliberately OUT of `test`. Two reasons, not one:
+#
+#   - It needs its own per-file `JAI_JIT_WHY=1` process, which is not the
+#     single combined `jaithon test tests/lang ...` run_tests.sh already does
+#     for the "unit" layer -- turning JAI_JIT_WHY on for that whole run would
+#     bury the signal in decline spew from every file, marked or not.
+#   - Some marked functions can only be reached through the sampler-driven OSR
+#     tier (one has 5 arguments, past JIT_MAX_ARITY; a couple exist
+#     specifically to test OSR's own entry mechanics, which the whole-function
+#     tier does not share). That tier is not deterministic no matter how long
+#     a loop runs -- roadmap.md §7 -- so even with generous warm-up this is a
+#     coverage gate with an irreducibly small chance of a false alarm, and
+#     tying that to every `make test` risks exactly the flaky-gate problem
+#     roadmap.md §7 spends a page warning about. Run it deliberately instead,
+#     the same way jit-declines-check and kind-fuzz are.
+.PHONY: jit-compile-check
+jit-compile-check: $(TARGET)
+	@python3 scripts/jit_compile_check.py
+
 # The kind-mutation fuzzer: 144 generated programs, each warming a loop until it
 # compiles and then putting a different kind where the tier sampled one, run
 # four ways and diffed against the interpreter.
