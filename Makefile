@@ -401,9 +401,13 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 # where the live-bytes threshold collects at tens.
 .PHONY: gc-stress-test
 gc-stress-test: $(TARGET)
-	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test --gc-stress=$(GC_STRESS_EVERY) \
-	    tests/lang tests/stdlib packages/jaiplot/tests packages/jaitensor/tests \
-	    | tail -1
+	@out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
+	          --gc-stress=$(GC_STRESS_EVERY) \
+	          tests/lang tests/stdlib \
+	          packages/jaiplot/tests packages/jaitensor/tests 2>&1); \
+	  status=$$?; \
+	  if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
+	  printf '%s\n' "$$out" | tail -1
 
 # Three tables describe the opcode list -- JAI_OPCODES in chunk.c (the wire
 # format), _OPS in emit.jai (a hand-transcribed copy), and spec/BYTECODE.md --
