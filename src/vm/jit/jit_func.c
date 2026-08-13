@@ -3947,7 +3947,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 memcpy(&bits, &d, sizeof bits);
                 if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
                 unsigned imm8;
-                if (!e->fpOff && jaiA64FpImm8(d, &imm8)) {
+                /* The lookahead, not just the encodability: a constant with no float consumer ahead of it is
+                 * synced back out to X at the next ordinary opcode, so the bank form costs `fmov d,#imm` plus that `fmov x,d` where one `movz` would have done. Every value FMOV's imm8 can name has its whole payload in the top 16 bits, so emitConst64 is exactly one instruction for all of them. spectral's `1.0 / float(..)` is the shape: OP_GET_GLOBAL stands between the constant and its divide. */
+                if (!e->fpOff && jaiA64FpImm8(d, &imm8) &&
+                    fpWorthLoading(e, code, off + 4, stop)) {
                     /* Not `idx`: that is this instruction's constant index, and
                      * shadowing it here was the tree's only build warning. This
                      * one is a position on the operand stack. */
