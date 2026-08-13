@@ -14,6 +14,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <signal.h>
+#include <stdlib.h>
 
 #include "vm/vm.h"
 #include "vm/jit/jit.h"
@@ -132,9 +133,93 @@ static uint32_t builtinShapeTag(Value v) {
     }
 }
 
+/* One shared, direct-mapped cache for call sites that have gone megamorphic.
+ *
+ * A site whose inline cache runs out of ways is marked IC_MEGA and then stops
+ * caching ALTOGETHER: every call re-resolves the method. That is the shape a
+ * trait with eight implementations produces, and it is the one shape a
+ * per-site cache cannot help with, because the problem is not that the site
+ * forgot -- it is that four ways cannot hold eight answers. Widening the ways
+ * is not the fix either: it costs every cache in every chunk memory for a case
+ * almost none of them see, and a ninth class puts the site right back where it
+ * was. One table shared by every megamorphic site in the program makes the
+ * cost of the ninth class the same as the cost of the fifth.
+ *
+ * Only a hit in `klass->methods` is cached, and `methods.version` -- which
+ * JaiTable bumps on EVERY set, key or value -- is stored alongside and checked
+ * on use. findMethod consults `methods` first, so a name found there can only
+ * start meaning something else if that table changes, and then the version
+ * says so. Nothing has to remember to invalidate this, which is the property
+ * worth having: statics and trait defaults are simply not cached here and take
+ * the slow path they take today.
+ *
+ * Whether the CALLER may call what it found is not a property of the class, so
+ * `recheck` records only that a visibility test is owed and the test itself is
+ * re-run per call -- the same split InlineCache::payload makes.
+ *
+ * Held weakly: jaiMethodCacheRemoveWhite drops any entry whose class, name or
+ * method the marker did not reach, in the same phase jaiTableRemoveWhite runs
+ * for the intern table. So the cache neither keeps a dead class alive nor is
+ * ever left pointing at one. */
+#define JAI_MEGA_WAYS 64u        /* power of two */
+
+typedef struct {
+    ObjClass  *klass;
+    ObjString *name;
+    Value      method;
+    uint32_t   tableVersion;
+    bool       recheck;
+} MegaEntry;
+
+static MegaEntry sMegaCache[JAI_MEGA_WAYS];
+
+/* JAITHON_MEGA_STRESS=1 collapses the table to a single entry, so every
+ * megamorphic (class, name) pair collides with every other and the key is the
+ * only thing left deciding what a call reaches. Without it a wrong key is
+ * invisible: nine classes in five hundred slots simply never collide, so a
+ * cache keyed on the name alone passes every test in the tree. Same idea as
+ * JAITHON_JIT_DEOPT_STRESS -- make the rare path the only path. */
+static unsigned sMegaMask = JAI_MEGA_WAYS - 1u;
+
+void jaiMethodCacheInit(void) {
+    const char *v = getenv("JAITHON_MEGA_STRESS");
+    sMegaMask = (v != NULL && v[0] != '\0') ? 0u : JAI_MEGA_WAYS - 1u;
+}
+
+static inline unsigned megaSlot(const ObjClass *k, const ObjString *n) {
+    uint64_t h = ((uint64_t)(uintptr_t)k >> 4) ^ (n->hash * 0x9E3779B97F4A7C15ull);
+    h ^= h >> 29;
+    return (unsigned)(h & sMegaMask);
+}
+
+void jaiMethodCacheRemoveWhite(void) {
+    for (unsigned i = 0; i < JAI_MEGA_WAYS; i++) {
+        MegaEntry *e = &sMegaCache[i];
+        if (e->klass == NULL) continue;
+        if (!((Obj *)e->klass)->isMarked ||
+            !((Obj *)e->name)->isMarked ||
+            (IS_OBJ(e->method) && !AS_OBJ(e->method)->isMarked)) {
+            e->klass = NULL;
+            e->name = NULL;
+            e->method = NULL_VAL;
+        }
+    }
+}
+
+/* The key a receiver files its way under: a class's shape for an instance, a
+ * type tag for a builtin. The two keyspaces are disjoint by IC_BUILTIN_TAG's
+ * high bit, so one site holds both without either matching the other. */
+static uint32_t invokeCacheKey(Value receiver) {
+    if (IS_INSTANCE(receiver)) {
+        ObjClass *klass = AS_INSTANCE(receiver)->klass;
+        return klass != NULL ? klass->shapeId : 0u;
+    }
+    return builtinShapeTag(receiver);
+}
+
 uint8_t jaiInvokeResultFeedback(const Chunk *chunk, uint16_t cacheIdx,
                                 Value receiver) {
-    uint32_t tag = builtinShapeTag(receiver);
+    uint32_t tag = invokeCacheKey(receiver);
     if (tag == 0 || chunk->caches == NULL ||
         (int)cacheIdx >= chunk->cacheCount) {
         return JAI_FB_NONE;
@@ -144,6 +229,50 @@ uint8_t jaiInvokeResultFeedback(const Chunk *chunk, uint16_t cacheIdx,
         if (ic->shapeId[w] == tag) return ic->resultKind[w];
     }
     return JAI_FB_NONE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Recording an INVOKE's result kind per site and per way.
+ *
+ * A builtin method pushes no frame, so the invoke can read its own result off
+ * the stack. An INSTANCE method cannot: invokeMethodOnStack hands back
+ * CALL_FRAME for a closure method -- measured, 350 of 352 instance invokes in a
+ * plain run -- and the result does not exist until that frame returns. So the
+ * SITE travels with the call, and the record is made at OP_RETURN.
+ *
+ * ONE DEEP, on purpose. An armed invoke inside the callee overwrites this one,
+ * so the outer call loses that observation. It can never record a WRONG one:
+ * the return that lands is matched on both the callee's frame depth and the
+ * caller's resume address, and a resume address is a pointer into one chunk's
+ * code at one offset -- two different sites cannot share one. Losing
+ * observations only makes the record settle more slowly, and a recursive method
+ * loses nothing at all, since the recursion runs through the same site.
+ *
+ * Cleared in popFrameForUnwind, which is the only way a frame leaves without an
+ * OP_RETURN. That is not belt-and-braces: `ic` points into a chunk kept alive by
+ * the caller's frame, and after an unwind that frame is gone. */
+static struct {
+    InlineCache   *ic;
+    const uint8_t *resumeIp;   /* the caller's ip: the call site's identity */
+    int            depth;      /* vm.frameCount as the callee sees it */
+    uint8_t        way;
+} sResultSite;
+
+JAI_INLINE void recordInvokeResult(InlineCache *ic, unsigned way, Value result) {
+    ic->resultKind[way] = jaiFeedbackMerge(ic->resultKind[way],
+                                           jaiFeedbackKind(result));
+}
+
+/* Arm the record for a call about to be made from `resumeIp` in the current
+ * frame. Spends one of the site's observations whether or not the return is
+ * ever seen, so a site whose callee always throws still stops paying. */
+JAI_INLINE void armInvokeResult(InlineCache *ic, unsigned way,
+                                const uint8_t *resumeIp) {
+    ic->obsBudget--;
+    sResultSite.ic       = ic;
+    sResultSite.resumeIp = resumeIp;
+    sResultSite.depth    = vm.frameCount + 1;
+    sResultSite.way      = (uint8_t)way;
 }
 
 static bool valueIsCallable(Value v) {
@@ -2449,6 +2578,9 @@ static bool handlerMatches(ObjFunction *fn, uint32_t typeConst, Value exception)
 /* Discard the innermost frame after its defers have run. */
 static void popFrameForUnwind(void) {
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
+    /* This call produced no value, and the chunk sResultSite points into is
+     * kept alive only by the frames being discarded here. */
+    sResultSite.ic = NULL;
     (void)runFrameDefers(frame);
     closeUpvalues(frame->base);
     if (vm.handlers.count > frame->handlerBase) vm.handlers.count = frame->handlerBase;
@@ -3547,6 +3679,8 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_ELEM_KIND]          = &&L_OP_ELEM_KIND,
         [OP_GET_ITER_ITEMS]     = &&L_OP_GET_ITER_ITEMS,
         [OP_FOR_ITER_PAIR]      = &&L_OP_FOR_ITER_PAIR,
+        [OP_ITER_RANGE]         = &&L_OP_ITER_RANGE,
+        [OP_FOR_RANGE_BIND]     = &&L_OP_FOR_RANGE_BIND,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -4498,6 +4632,57 @@ static JaiRunResult runLoop(int baseFrameCount) {
         VM_NEXT();
     }
 
+    /* `for x in a..b`, opened (spec §3.4). Where BUILD_RANGE; GET_ITER built an
+     * ObjRange and an ObjIter per loop ENTRY, this writes the loop's whole
+     * state into two int frame slots and allocates nothing at all.
+     *
+     * `end` is one past the last value, computed WRAPPING, so the counter test
+     * downstream is `!=` rather than `<` and `a..=INT64_MAX` still terminates:
+     * the counter wraps to INT64_MIN and meets it there. See OP_ITER_RANGE in
+     * chunk.h for the single range where that disagrees with ObjIter's
+     * saturating limit, and why it does not matter. */
+    VM_CASE(OP_ITER_RANGE): {
+        bool     inclusive = READ_BYTE() != 0;
+        uint16_t curSlot   = READ_U16();
+        uint16_t endSlot   = READ_U16();
+        Value stopValue = PEEK(0), startValue = PEEK(1);
+        /* The same check, and the same wording, OP_BUILD_RANGE makes: this is a
+         * fast path for one loop shape, never a second set of rules. */
+        if (!IS_INT(startValue) || !IS_INT(stopValue)) {
+            THROW(vm.cTypeError, "range bounds must be int, not '%s' and '%s'",
+                  jaiTypeNameStatic(startValue), jaiTypeNameStatic(stopValue));
+        }
+        int64_t start = AS_INT(startValue), stop = AS_INT(stopValue);
+        int64_t end = stop < start
+                          ? start          /* empty: end where it begins */
+                          : (inclusive
+                                 ? (int64_t)((uint64_t)stop + 1u)
+                                 : stop);
+        DROP(2);
+        slots[curSlot] = INT_VAL(start);
+        slots[endSlot] = INT_VAL(end);
+        VM_NEXT();
+    }
+
+    /* One step of that loop (spec §3.4). Both slots were written by the
+     * OP_ITER_RANGE above and by this instruction and by nothing else — the
+     * emitter hands out fresh temporaries for them — so the payloads are read
+     * without re-testing a tag the loop itself is the only writer of. */
+    VM_CASE(OP_FOR_RANGE_BIND): {
+        int16_t  offset  = READ_I16();
+        uint16_t slot    = READ_U16();
+        uint16_t curSlot = READ_U16();
+        uint16_t endSlot = READ_U16();
+        int64_t cur = AS_INT(slots[curSlot]);
+        if (cur == AS_INT(slots[endSlot])) {
+            ip += offset;
+            VM_NEXT();
+        }
+        slots[slot]    = INT_VAL(cur);
+        slots[curSlot] = INT_VAL((int64_t)((uint64_t)cur + 1u));
+        VM_NEXT();
+    }
+
     /* An f-string, whole (spec §3.6). The parts are on the stack in order and
      * the result replaces them.
      *
@@ -4724,11 +4909,15 @@ static JaiRunResult runLoop(int baseFrameCount) {
         uint16_t cacheIdx = READ_U16();
         Value receiver = stackTop[-argc - 1];
         uint32_t builtinTag = 0;
-        /* Set only when this pass FILLS a builtin way below, which is the one
-         * moment the site's result kind can be recorded without costing the
-         * fast path anything. See InlineCache::resultKind. */
+        /* Set when this pass has a way whose result kind is still being
+         * observed and the call is one that finishes here (a builtin, or an
+         * instance method the compiled tier completed). See
+         * InlineCache::resultKind. */
         InlineCache *fbCache = NULL;
         int fbWay = 0;
+        /* True when the record is also armed in sResultSite, so the return will
+         * make it unless the call turns out to have finished here. */
+        bool fbFromFrame = false;
 
         /* Fast path: the receiver's class is one the cache has already seen,
          * so the method is known without touching a hash table. */
@@ -4753,7 +4942,56 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     }
                     /* The cache is only filled when slot 0 is the receiver
                      * (see the fill site below), so this is a method call. */
-                    if (invokeMethodOnStack(ic->cached[w], argc) == CALL_ERROR) {
+                    bool armed = false;
+                    if (JAI_UNLIKELY(ic->obsBudget != 0)) {
+                        armInvokeResult(ic, (unsigned)w, frame->ip);
+                        armed = true;
+                    }
+                    CallOutcome outcome = invokeMethodOnStack(ic->cached[w],
+                                                              argc);
+                    if (outcome == CALL_ERROR) goto vmThrow;
+                    /* CALL_DONE means no frame was pushed -- a native method in
+                     * the class's table, or a closure the compiled tier ran
+                     * outright -- so no OP_RETURN will ever answer the arming,
+                     * and the result is on the stack right here instead. */
+                    if (JAI_UNLIKELY(armed) && outcome == CALL_DONE) {
+                        recordInvokeResult(ic, (unsigned)w, vm.stackTop[-1]);
+                        sResultSite.ic = NULL;
+                    }
+                    LOAD_STATE();
+                    VM_NEXT();
+                }
+            } else if (ic != NULL && klass != NULL && ic->state == IC_MEGA) {
+                /* Out of ways: the shared table above answers instead. */
+                ObjString *mname = AS_STRING(constants[nameIdx]);
+                MegaEntry *me = &sMegaCache[megaSlot(klass, mname)];
+                Value found;
+                if (me->klass == klass && me->name == mname &&
+                    me->tableVersion == klass->methods.version) {
+                    vm.icHits++;
+                    SAVE_STATE();
+                    if (me->recheck && !methodPermitted(klass, mname, true)) {
+                        goto vmThrow;
+                    }
+                    if (invokeMethodOnStack(me->method, argc) == CALL_ERROR) {
+                        goto vmThrow;
+                    }
+                    LOAD_STATE();
+                    VM_NEXT();
+                }
+                if (jaiTableGetInterned(&klass->methods, mname, &found)) {
+                    MethodInfo mi;
+                    vm.icMisses++;
+                    SAVE_STATE();
+                    me->klass = klass;
+                    me->name = mname;
+                    me->method = found;
+                    me->tableVersion = klass->methods.version;
+                    me->recheck = jaiClassRestrictedMethod(klass, mname, &mi);
+                    if (me->recheck && !methodPermitted(klass, mname, true)) {
+                        goto vmThrow;
+                    }
+                    if (invokeMethodOnStack(found, argc) == CALL_ERROR) {
                         goto vmThrow;
                     }
                     LOAD_STATE();
@@ -4779,6 +5017,16 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     }
                     vm.stackTop = slot;
                     *vm.stackTop++ = result;
+                    /* The result is right here, so a builtin needs none of the
+                     * frame machinery an instance method does -- but it does
+                     * need the same WINDOW. Recorded only at the fill, this was
+                     * a single observation, which roadmap §6 records as an open
+                     * bug: `d.get(k)` over a dict holding two kinds predicted
+                     * whichever key came first, and every later call deopted. */
+                    if (JAI_UNLIKELY(ic->obsBudget != 0)) {
+                        ic->obsBudget--;
+                        recordInvokeResult(ic, (unsigned)w, result);
+                    }
                     /* A built-in method pushes no frame: `xs.push(v)` in a hot
                      * loop reaches here, and LOAD_STATE's constant-pool chase
                      * was the largest thing left in it. */
@@ -4836,16 +5084,32 @@ static JaiRunResult runLoop(int baseFrameCount) {
              * payload set, which tells the fast path above to re-run the
              * visibility test it cannot cache. */
             MethodInfo restricted;
-            uint32_t recheck =
-                jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
             if (ic != NULL && klass != NULL && AS_OBJ(slotZero) == AS_OBJ(receiver) &&
                 ic->state != IC_MEGA) {
+                /* Inside the guard, not above it: a site that has gone
+                 * megamorphic reaches here on every call and has nothing to
+                 * fill, so the walk was pure cost exactly where calls are
+                 * dearest. */
+                uint32_t recheck =
+                    jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
                 if (ic->count < JAI_IC_WAYS) {
                     ic->shapeId[ic->count] = klass->shapeId;
                     ic->payload[ic->count] = recheck;
                     ic->cached[ic->count] = method;
+                    ic->resultKind[ic->count] = JAI_FB_NONE;
                     ic->count++;
                     ic->state = (ic->count == 1) ? IC_MONO : IC_POLY;
+                    /* The way this pass just filled is the way this call's
+                     * result belongs to, and the interpreter is about to make
+                     * that call: arm it here rather than waiting for the next
+                     * hit, so a site called exactly once is still recorded. */
+                    if (ic->obsBudget != 0) {
+                        armInvokeResult(ic, (unsigned)(ic->count - 1),
+                                        frame->ip);
+                        fbCache = ic;
+                        fbWay   = ic->count - 1;
+                        fbFromFrame = true;
+                    }
                 } else {
                     ic->state = IC_MEGA;
                 }
@@ -4866,24 +5130,29 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     ic->resultKind[ic->count] = JAI_FB_NONE;
                     ic->count++;
                     ic->state = (ic->count == 1) ? IC_MONO : IC_POLY;
-                    fbCache = ic;
-                    fbWay   = ic->count - 1;
+                    if (ic->obsBudget != 0) {
+                        ic->obsBudget--;
+                        fbCache = ic;
+                        fbWay   = ic->count - 1;
+                    }
                 } else {
                     ic->state = IC_MEGA;
                 }
             }
         }
-        if ((isMethod ? invokeMethodOnStack(method, argc)
-                      : invokeCallable(method, argc)) == CALL_ERROR) {
-            goto vmThrow;
-        }
-        /* A bound native pushes no frame, so the result is on the stack now.
-         * Only reached on the way that just filled the cache -- once per site
-         * and receiver type, never on the path a loop repeats. */
-        if (fbCache != NULL) {
-            fbCache->resultKind[fbWay] =
-                jaiFeedbackMerge(fbCache->resultKind[fbWay],
-                                 jaiFeedbackKind(vm.stackTop[-1]));
+        CallOutcome fillOutcome = isMethod ? invokeMethodOnStack(method, argc)
+                                           : invokeCallable(method, argc);
+        if (fillOutcome == CALL_ERROR) goto vmThrow;
+        /* Only reached on the way that just filled the cache -- once per site
+         * and receiver type, never on the path a loop repeats.
+         *
+         * A bound native pushed no frame, so its result is on the stack now. An
+         * instance method usually did push one, and then the record is already
+         * armed and OP_RETURN will make it; CALL_DONE says otherwise and this
+         * is the only place that can tell. */
+        if (fbCache != NULL && (!fbFromFrame || fillOutcome == CALL_DONE)) {
+            recordInvokeResult(fbCache, (unsigned)fbWay, vm.stackTop[-1]);
+            if (fbFromFrame) sResultSite.ic = NULL;
         }
         LOAD_STATE();
         VM_NEXT();
@@ -5015,6 +5284,46 @@ static JaiRunResult runLoop(int baseFrameCount) {
         }
         if (FRAME_HAS_DEFERS(frame)) (void)runFrameDefers(frame);
         if (vm.hasException) goto vmThrow;
+
+        /* Record what this function returns, for a compiled caller that cannot
+         * ask its compiled form because it has none yet. Costs the steady state
+         * one already-hot load and a not-taken branch: entryCount saturates at
+         * the compile threshold and never moves again. See
+         * ObjFunction::obsReturnKind for why this is per callee, not per site. */
+        if (JAI_UNLIKELY(fn->entryCount < JAI_JIT_THRESHOLD)) {
+            uint32_t shape = 0;
+            if (IS_INSTANCE(retval) && AS_INSTANCE(retval)->klass != NULL) {
+                shape = AS_INSTANCE(retval)->klass->shapeId;
+                /* A shape is only usable by the tier if the shape->class table
+                 * can answer it, and until now the only thing that filled that
+                 * table was a function COMPILING with an instance return -- so
+                 * a callee that has not compiled recorded a shape nothing could
+                 * resolve, which is exactly the callee this record is for. */
+                jaiClassRememberShape(AS_INSTANCE(retval)->klass);
+            }
+            if (fn->obsReturnKind == JAI_FB_NONE) fn->obsReturnShape = shape;
+            else if (fn->obsReturnShape != shape) fn->obsReturnShape = 0;
+            fn->obsReturnKind = jaiFeedbackMerge(fn->obsReturnKind,
+                                                 jaiFeedbackKind(retval));
+        }
+
+        /* And the same question asked per SITE: whichever OP_INVOKE armed
+         * itself for this frame gets what that frame returned. The two are not
+         * redundant -- a caller that has pinned nothing about its receiver
+         * cannot name the callee, so it has no obsReturnKind to read.
+         *
+         * Two tests, not one. The depth says the return belongs to the frame
+         * the arming was for; the resume address says it belongs to the SITE it
+         * was for, which is what an intervening unwind and a re-entry at the
+         * same depth would otherwise get wrong. Costs the steady state one load
+         * and a not-taken branch: every site freezes after JAI_IC_OBS_BUDGET
+         * invokes and nothing arms again. */
+        if (JAI_UNLIKELY(sResultSite.ic != NULL) &&
+            sResultSite.depth == vm.frameCount && vm.frameCount >= 2 &&
+            vm.frames[vm.frameCount - 2].ip == sResultSite.resumeIp) {
+            recordInvokeResult(sResultSite.ic, sResultSite.way, retval);
+            sResultSite.ic = NULL;
+        }
 
         closeUpvalues(frame->base);
         vm.handlers.count = frame->handlerBase;
@@ -6185,6 +6494,7 @@ static JaiRunResult run(int baseFrameCount) {
 void jaiVMResetStack(void) {
     vm.stackTop = vm.stack;
     vm.frameCount = 0;
+    sResultSite.ic = NULL;
     vm.openUpvalues = NULL;
     vm.handlers.count = 0;
     vm.defers.count = 0;
@@ -6235,6 +6545,9 @@ void jaiVMInit(void) {
     JAI_VEC_INIT(&vm.defers);
     JAI_VEC_INIT(&vm.modulePath);
 
+    jaiMethodCacheInit();
+    memset(sMegaCache, 0, sizeof sMegaCache);
+
     vm.pendingException = NULL_VAL;
     vm.hasException = false;
     vm.mainModule = NULL;
@@ -6254,6 +6567,7 @@ void jaiVMInit(void) {
     GCState *gc = JAI_ALLOC(GCState, 1);
     jaiGCInit(gc);
     gc->stress = vm.gcStress;
+    gc->stressEvery = vm.gcStressEvery;
     gc->verbose = vm.debugGC;
     /* stress is one of jaiGCLimit's four inputs and this is the only place
      * outside gc.c that writes one. Without this, --gc-stress kept the

@@ -55,6 +55,11 @@ LIBS     := -lm -lpthread
 # They are part of CC_ID and LINK_ID below, so changing them invalidates the
 # build tree exactly as changing the real flags would.
 EXTRA_CFLAGS  ?=
+# Collector cadence for `make gc-stress-test`. See that target for the numbers.
+GC_STRESS_EVERY ?= 5000
+# Loop repetitions before `make kind-fuzz` changes a kind. Must exceed the
+# tier's hotness threshold or nothing under test ever compiles.
+KIND_FUZZ_WARM ?= 3000
 EXTRA_LDFLAGS ?=
 
 # zlib inflates the seed's images. boot/seed.bin holds them deflated, one
@@ -373,13 +378,41 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
+	@$(BUILD)/field_natives
+	@$(BUILD)/invoke_result_kind
 	@./scripts/run_tests.sh
+	@$(MAKE) --no-print-directory gc-stress-test
+
+# The unit suites under a collector that runs every N allocations.
+#
+# Only the GOLDENS ever got a --gc-stress pass (run_tests.sh runs each one a
+# second time under it). The 1000-odd unit tests in tests/lang, tests/stdlib and
+# the package trees ran once, plain, so no gate covered them under a collector
+# at all -- and a use-after-free or a missed root is exactly what gc stress is
+# for. Two silent miscompiles were found on 2026-08-12 by stress modes, neither
+# by any other gate.
+#
+# It was not covered because --gc-stress collects on EVERY allocation, and that
+# is quadratic: tests/lang alone runs in 1.09s plain and did not finish in ten
+# minutes under it. --gc-stress=N is what makes it affordable. Measured on
+# tests/lang: N=500 556s, N=5000 9.6s, N=20000 4.4s. N=5000 is the operating
+# point -- under 10x the plain cost, and still collecting at thousands of points
+# where the live-bytes threshold collects at tens.
+.PHONY: gc-stress-test
+gc-stress-test: $(TARGET)
+	@out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
+	          --gc-stress=$(GC_STRESS_EVERY) \
+	          tests/lang tests/stdlib \
+	          packages/jaiplot/tests packages/jaitensor/tests 2>&1); \
+	  status=$$?; \
+	  if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
+	  printf '%s\n' "$$out" | tail -1
 
 # Three tables describe the opcode list -- JAI_OPCODES in chunk.c (the wire
 # format), _OPS in emit.jai (a hand-transcribed copy), and spec/BYTECODE.md --
@@ -437,6 +470,35 @@ branch-table-check:
 jit-declines-check:
 	@./scripts/jit_declines.sh check
 
+# The kind-mutation fuzzer: 144 generated programs, each warming a loop until it
+# compiles and then putting a different kind where the tier sampled one, run
+# four ways and diffed against the interpreter.
+#
+# This is the gate for the class of bug that has cost this project the most.
+# BOTH silent miscompiles found on 2026-08-12 were "the tier sampled a kind and
+# the program changed it": a str in a list bound its POINTER as an integer, and
+# a bool local was read eight bytes wide. Neither was caught by anything.
+#
+# Its teeth are established, not assumed: run against a tree built from d41ec16
+# (before the list-element fix) it reports 6 of 144 mismatched, all of them
+# list_for-add-int-to-*, printing raw pointers and IEEE bit patterns where the
+# interpreter raises TypeError. Against the fixed tree, 0 of 144.
+#
+# Its companion, iter_mutation.py, asks the other half of the question: not
+# "what if the KIND changes" but "what if the CONTAINER does". A compiled loop
+# caches an iterator's index, its limit and a pointer to the backing array, and
+# ObjList::version is the only thing that says the program moved the ground.
+# Teeth established the same way: with that one branchOnDeopt removed from
+# OP_FOR_ITER_BIND's list arm, 15 of 21 cases mismatch and the compiled loop
+# silently returns 2115/65 -- walking a REALLOCATED array -- where the
+# interpreter raises RuntimeError.
+#
+# Out of `make test` because it is ~4 minutes. Run it when touching the tier.
+.PHONY: kind-fuzz
+kind-fuzz: $(TARGET)
+	@python3 tests/fuzz/kind_mutation.py --warm $(KIND_FUZZ_WARM)
+	@python3 tests/fuzz/iter_mutation.py --warm $(KIND_FUZZ_WARM)
+
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
 VERIFY_OBJS := $(filter-out $(BUILD)/src/cli/main.o,$(OBJS))
@@ -493,6 +555,35 @@ $(BUILD)/jit_arena: tests/vm/jit_arena.c src/vm/jit/jit_arena.c | $(CC_STAMP)
 $(BUILD)/jit_arm64: tests/vm/jit_arm64.c src/vm/jit/jit_arm64.c src/vm/jit/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arm64.c src/vm/jit/jit_arm64.c src/vm/jit/jit_arena.c
+
+# The compiled tier replaces a call to one of these builtins with a single load
+# from the receiver (src/vm/jit/jit_field_read.h). Nothing in C connects that
+# byte offset to the native it stands in for, or the declared result kind to
+# what the native returns -- roadmap.md §6 records "a builtin named len returns
+# an int" as an invariant that was true everywhere and checked nowhere. This
+# calls every one of them for real and compares. C rather than .jai because a
+# .jai test cannot see a struct offset, and would silently test the interpreter
+# whenever the loop it warms declines.
+$(BUILD)/field_natives: $(VERIFY_OBJS) tests/vm/field_natives.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/field_natives.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/field_natives.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+.PHONY: field-natives-test
+field-natives-test: $(BUILD)/field_natives
+	@$(BUILD)/field_natives
+
+# What an OP_INVOKE site records about its own result. C rather than .jai
+# because InlineCache::resultKind reaches no program's output, and a test that
+# could only see it through the compiled tier would be testing the tier.
+$(BUILD)/invoke_result_kind: $(VERIFY_OBJS) tests/vm/invoke_result_kind.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/invoke_result_kind.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/invoke_result_kind.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+.PHONY: invoke-result-test
+invoke-result-test: $(BUILD)/invoke_result_kind
+	@$(BUILD)/invoke_result_kind
 
 .PHONY: jit-test
 jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64

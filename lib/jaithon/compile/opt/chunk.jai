@@ -814,6 +814,10 @@ fn _build_branch_at() -> dict[int, int] {
         # rebuild loses whatever followed the loop. That is what a missing entry
         # here looks like — a chunk that simply stops.
         Op.GetIterItems,
+        # `for x in a..b`'s loop head. Unlike its three neighbours above it pops
+        # nothing on the exhausted edge, because a range loop keeps nothing on
+        # the operand stack in the first place.
+        Op.ForRangeBind,
         Op.PushFinally,
         Op.PushHandler,
     ]
@@ -853,8 +857,14 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.MulBind,
     ]
     for op in leading { table[opcode(op)] = [0] }
-    table[opcode(Op.ForIterBind)] = [2]      # the slot follows the i16 jump
-    table[opcode(Op.ForIterPair)] = [2, 4]   # both slots follow the i16 jump
+    table[opcode(Op.ForIterBind)] = [2]     # the slot follows the i16 jump
+    table[opcode(Op.ForIterPair)] = [2, 4]  # both slots follow the i16 jump
+    # The counter and the end follow the u8 inclusive flag; the loop variable,
+    # the counter and the end follow the i16 jump. Missing here, the coalescer
+    # would renumber the loop variable and leave the range loop reading and
+    # writing a slot nothing else refers to.
+    table[opcode(Op.IterRange)] = [1, 3]
+    table[opcode(Op.ForRangeBind)] = [2, 4, 6]
     table[opcode(Op.JumpIfCmpLocalK)] = [1]  # the slot follows the u8 comparison
     for op in [Op.GetLocal2, Op.AddLocals] { table[opcode(op)] = [0, 2] }
     return table

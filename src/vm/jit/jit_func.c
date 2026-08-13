@@ -2,6 +2,8 @@
 #include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
+/* For jaiJitFieldReadFor: which builtins are one load from their receiver. */
+#include "vm/jit/jit_field_read.h"
 #include "vm/gc.h"
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 #include "runtime/runtime.h"
@@ -57,6 +59,17 @@ static uintptr_t stackLimit(void) {
 #define JIT_SCRATCH_B   10u
 #define JIT_SCRATCH_C   11u
 #define JIT_SCRATCH_D   12u
+/* x13..x17 are caller-saved and the tier names none of them, so a body that
+ * calls nothing owns them outright. x18 is Darwin's platform register and is
+ * NOT in the range. They are the only registers a loop-invariant hoist can
+ * spend without taking one from the locals -- see planHoists. */
+#define JIT_FREE_FIRST  13u
+#define JIT_FREE_COUNT   5u
+/* Two registers each; four list headers is every stencil seen so far. */
+#define JIT_MAX_HOIST    4u
+/* Repeated from the register plan below, which cannot be declared this early:
+ * x0..x8, the bank a call-free body's operand stack uses. */
+#define JIT_SCRATCH_BANK_COUNT 9u
 
 /* ------------------------------------------------------------------ */
 /* Calling out of compiled code                                         */
@@ -213,6 +226,20 @@ static int jitMakeIter(JitCallDesc *d) {
     return IS_LIST(src) ? 0 : 1;
 }
 
+/* OP_GET_ITER_ITEMS' dict case: the lazy view `for (k, v) in d.items()` walks,
+ * built once per loop entry rather than the N 2-tuples the eager `items()`
+ * materialises. Allocates, so roots go down first as for any call out of
+ * compiled code. The emitted guard has already proved the receiver is a dict;
+ * the test here is the same belt-and-braces jitMakeIter carries. */
+static int jitMakeItemsIter(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    Value src = d->args[0];
+    ObjIter *it = IS_DICT(src) ? jaiIterNew(ITER_DICT_ITEMS, src) : NULL;
+    if (it != NULL) d->result = OBJ_VAL(it);
+    jaiGCPopRootRange();
+    return it != NULL ? 0 : 1;
+}
+
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 static int jitFormat(JitCallDesc *d) {
@@ -359,21 +386,49 @@ static bool holdsRegister(SlotKind k) {
            k != SLOT_NATIVE;
 }
 
-/* Two targets are not bytecode offsets at all. */
-#define FIXUP_BAIL   UINT32_MAX
-#define FIXUP_ENTRY  (UINT32_MAX - 1u)
-#define FIXUP_THREW  (UINT32_MAX - 2u)
-#define FIXUP_OVF    (UINT32_MAX - 3u)   /* + 0,1,2 for the three operators */
-#define FIXUP_DEOPT  (UINT32_MAX - 7u)   /* minus the deopt-site index */
-#define FIXUP_EXIT   (UINT32_MAX - 100u) /* minus the loop-exit index */
+/* Some fixup targets are not bytecode offsets at all: they are sentinels at the
+ * top of the u32 range, each one a base minus an index into a table.
+ *
+ * The bases are DERIVED from the table sizes rather than written down, because
+ * hand-picked ones overlapped. FIXUP_DEOPT was UINT32_MAX-7 minus an index into
+ * a 160-entry table, so it ran down to UINT32_MAX-166 -- straight through
+ * FIXUP_EXIT at UINT32_MAX-100. The resolver tests EXIT first, so **deopt sites
+ * 93 through 100 would have resolved to an exit stub**: a compiled body jumping
+ * out of its loop where it meant to hand back to the interpreter.
+ *
+ * It was never reachable, which is why it sat here: the largest deopt count
+ * anyone had seen was 16. It is 47 today across the benchmark suite, because a
+ * day of adding guards to the tier moved it halfway. Deriving the bases makes
+ * the overlap impossible rather than merely unlikely, and the assertions below
+ * fail the build if a future table size reintroduces it. */
+#define JIT_MAX_DEOPT     160u
+#define JIT_MAX_EXIT      8u
 /* Self-calls and direct calls to a callee that writes share this table, so it
  * is sized for a body with several of each rather than for recursion alone. */
 #define JIT_MAX_SELF_SLOW 32u
-#define FIXUP_SELFSLOW (UINT32_MAX - 200u) /* minus the self-call index */
-#define JIT_MAX_GROW   16u
-#define FIXUP_GROW   (UINT32_MAX - 400u) /* minus the list-growth index */
+#define JIT_MAX_GROW      16u
 
-#define JIT_MAX_DEOPT 160
+#define FIXUP_BAIL   UINT32_MAX
+#define FIXUP_ENTRY  (UINT32_MAX - 1u)
+#define FIXUP_THREW  (UINT32_MAX - 2u)
+#define FIXUP_OVF    (UINT32_MAX - 3u)   /* minus 0,1,2 for the three operators */
+#define FIXUP_DEOPT    (UINT32_MAX - 7u)                     /* minus a deopt index */
+#define FIXUP_EXIT     (FIXUP_DEOPT - JIT_MAX_DEOPT)         /* minus an exit index */
+#define FIXUP_SELFSLOW (FIXUP_EXIT - JIT_MAX_EXIT)           /* minus a self-call index */
+#define FIXUP_GROW     (FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)  /* minus a growth index */
+
+/* Every sentinel range must stay above any offset a real chunk can have. A
+ * chunk that large is not representable long before this matters, so half the
+ * u32 range is an enormous margin -- the point is that the build fails if the
+ * tables ever grow enough to reach down into bytecode-offset territory. */
+_Static_assert(FIXUP_GROW - JIT_MAX_GROW > UINT32_MAX / 2u,
+               "jit fixup sentinels have grown down into bytecode offsets");
+_Static_assert(FIXUP_EXIT < FIXUP_DEOPT - (JIT_MAX_DEOPT - 1u),
+               "jit deopt and exit fixup ranges overlap");
+_Static_assert(FIXUP_SELFSLOW < FIXUP_EXIT - (JIT_MAX_EXIT - 1u),
+               "jit exit and self-call fixup ranges overlap");
+_Static_assert(FIXUP_GROW < FIXUP_SELFSLOW - (JIT_MAX_SELF_SLOW - 1u),
+               "jit self-call and growth fixup ranges overlap");
 
 typedef struct {
     int      instIndex;
@@ -419,6 +474,7 @@ typedef struct {
     unsigned  depth;
     unsigned  valueDepth;
     unsigned  maxValue;
+    unsigned  maxValueAll;
 
     Fixup     fixups[JIT_MAX_FIXUPS];
     unsigned  fixupCount;
@@ -449,7 +505,7 @@ typedef struct {
     /* `for i in a..b` compiled as a counted loop: the iterator object stays on the interpreter's stack
      * untouched, only its index rides in a register, and every exit writes it back. */
     bool      hasIter;
-    uint8_t   iterKind;   /* 1 a unit-step range, 2 a list */
+    uint8_t   iterKind;   /* 1 a unit-step range, 2 a list, 3 a dict-items view */
     Value     elemSample;
     /* Per-slot register assignment. Historically one flag gated the whole loop on a budget check that
      * almost nothing passed, so most loops ran fully in memory. Three things fixed it: only NAMED slots take a register; a float slot takes v8..v15 instead of an X register; overflow slots stay in the frame (busiest slots win, weighted by loop nesting) rather than all-or-nothing. */
@@ -503,7 +559,7 @@ typedef struct {
     uint32_t  rangeBuildIp;
     unsigned  iterSlot;
     uint32_t  iterExit;
-    int       exitStub[8];
+    int       exitStub[JIT_MAX_EXIT];
     uint32_t  exitOffset[8];
     unsigned  exitCount;
     /* A body that reads an upvalue needs the closure itself -- not any slot (a method's slot 0 is the
@@ -538,6 +594,51 @@ typedef struct {
     uint32_t  globalsKeyVersion;
     bool      bailAfterWrite;
     bool      callsOut;
+    /* Set the moment anything is emitted that can destroy x0..x8 while the
+     * body is still running: a call out, or one of the two stubs that call and
+     * then branch BACK into the body (list grow, self-call slow path). It is
+     * what `scratchValues` below is decided from, and the measuring pass is
+     * what observes it. */
+    bool      clobbersScratch;
+    /* The operand stack lives in x0..x8 rather than above the locals in the
+     * callee-saved bank. Sound exactly when nothing can clobber a caller-saved
+     * register between a push and its use, i.e. `!clobbersScratch` and the
+     * whole stack -- an inlined body's entries included, which is what
+     * maxValueAll counts -- fits the nine. Worth having because
+     * the two banks were competing for the same ten registers: a stencil whose
+     * expression is seven deep left NOTHING for its four row pointers and its
+     * index, and reloaded all five from the frame every iteration. */
+    bool      scratchValues;
+    /* probe.clobbersScratch, carried into the real pass. `no call anywhere in
+     * this body` is a stronger statement than `the values may live in x0..x8`
+     * -- scratchValues also wants the stack to fit nine -- and the hoist below
+     * needs the stronger one. */
+    bool      bodyCalls;
+    /* Where the measuring pass saw each slot written, and where it saw each one
+     * used as the base of a subscript. Bounds rather than a set: a loop is a
+     * contiguous range of offsets, so "written inside this loop" is a range
+     * overlap, and widening a range can only lose a hoist, never make a wrong
+     * one. lo > hi means "never". */
+    uint32_t  slotWriteLo[JIT_MAX_SLOTS + 1];
+    uint32_t  slotWriteHi[JIT_MAX_SLOTS + 1];
+    uint32_t  slotIndexLo[JIT_MAX_SLOTS + 1];
+    uint32_t  slotIndexHi[JIT_MAX_SLOTS + 1];
+    unsigned  slotIndexUse[JIT_MAX_SLOTS + 1];
+    /* Loop-invariant list headers. See planHoists. */
+    struct {
+        uint32_t top, end;
+        uint8_t  slot, itemsReg, countReg;
+    } hoist[JIT_MAX_HOIST];
+    unsigned  hoistCount;
+    uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
+    unsigned  hoistPoolCount;
+    unsigned  hoistTaken;
+    /* How many entries the scratch bank may still hold once the hoists have
+     * taken theirs off the top. The probe said the body never goes deeper, but
+     * "said" is not "cannot": lowering the room here is what turns a walk that
+     * disagreed with the probe into a decline instead of a value read out of a
+     * register a hoisted header owns. */
+    unsigned  scratchRoom;
     const char *whyNot;
     uint8_t     lastOp;
     unsigned  descOffset;
@@ -663,12 +764,20 @@ static void emit(Emit *e, uint32_t word) {
  * so this is numbered after the two a range keeps, and a range's locals begin where it would have been. */
 #define JIT_START_REG (JIT_FIRST_SAVED + 3u)
 #define JIT_ITER_REG  (JIT_FIRST_SAVED + 4u)
+/* The ObjIter a dict-items head is walking, and the ONLY register that head
+ * reserves: it keeps no index and no limit, because the step reads both out of
+ * the iterator and writes the index straight back, so nothing has to be
+ * unwound at an exit. Numbered second so a dict head's locals start where a
+ * range head's index would have been -- see osrReserved. */
+#define JIT_PAIR_ITER_REG (JIT_FIRST_SAVED + 1u)
 
 /* OSR reserves only the slots pointer plus (for a range loop) the iterator's index and limit --
  * not the ObjIter or the start, which are folded in via a prologue bias. Bias is sound only while start+limit fits int64; jaiJitEnterOsr refuses entry otherwise since that's a property of the iterator, not the code. */
 static unsigned osrReserved(const Emit *e) {
     if (!e->hasIter) return 1u;
-    return e->iterKind == 1 ? 3u : 5u;
+    if (e->iterKind == 1) return 3u;
+    if (e->iterKind == 3) return 2u;   /* dict items: the ObjIter, nothing else */
+    return 5u;
 }
 
 static unsigned regBase(const Emit *e) {
@@ -806,7 +915,52 @@ static void xHomeWritten(Emit *e, unsigned reg) {
     }
 }
 
+/* Every write to a local goes through localOut or localOutFp, so recording it
+ * in those two places is what makes "this slot does not change inside that
+ * loop" a fact about the emitter rather than a re-reading of the bytecode. */
+static void noteSlotWrite(Emit *e, unsigned slot) {
+    if (slot > JIT_MAX_SLOTS) return;
+    if (!e->measuring) {
+        /* The real pass writing a slot the measuring pass said this loop never
+         * touches means the two walks disagreed, and a hoisted header would
+         * then be stale. It cannot happen -- both walk the same bytecode with
+         * the same inlining -- so this is a ratchet, not a path: it costs a
+         * compile, never a wrong answer. */
+        for (unsigned i = 0; i < e->hoistCount; i++) {
+            if (e->hoist[i].slot != (uint8_t)slot) continue;
+            if (e->curOffset < e->hoist[i].top) continue;
+            if (e->curOffset >= e->hoist[i].end) continue;
+            e->whyNot = "a hoisted list header's local was written after all";
+            e->failed = true;
+        }
+        return;
+    }
+    if (e->inlining) return;
+    if (e->curOffset < e->slotWriteLo[slot]) e->slotWriteLo[slot] = e->curOffset;
+    if (e->curOffset > e->slotWriteHi[slot]) e->slotWriteHi[slot] = e->curOffset;
+}
+
+/* Twin of noteSlotWrite for the other half of the question: where a local is
+ * used as the base of a subscript, and how hot those sites are. Weighted by
+ * loop nesting for the same reason slotUse is -- a header read once per row
+ * must not outrank one read every iteration. */
+static void noteSlotIndexed(Emit *e, int slot) {
+    if (!e->measuring || e->inlining || slot < 0 || slot > (int)JIT_MAX_SLOTS) {
+        return;
+    }
+    unsigned w = 1u;
+    if (e->loopDepth != NULL && e->curOffset < e->loopDepthCount) {
+        unsigned d = e->loopDepth[e->curOffset];
+        if (d > 6u) d = 6u;
+        w = 1u << (2u * d);
+    }
+    e->slotIndexUse[slot] += w;
+    if (e->curOffset < e->slotIndexLo[slot]) e->slotIndexLo[slot] = e->curOffset;
+    if (e->curOffset > e->slotIndexHi[slot]) e->slotIndexHi[slot] = e->curOffset;
+}
+
 static void localOut(Emit *e, unsigned slot, unsigned src) {
+    noteSlotWrite(e, slot);
     xHomeWritten(e, e->osr ? e->slotXReg[slot]
                            : (e->spilled ? 0u : localReg(e, slot)));
     if (e->osr) {
@@ -887,6 +1041,7 @@ static void localInFp(Emit *e, unsigned slot, unsigned dst) {
 }
 
 static void localOutFp(Emit *e, unsigned slot, unsigned src) {
+    noteSlotWrite(e, slot);
     if (e->osr) {
         if (e->slotFpReg[slot] != 0) {
             fpReleaseHome(e, e->slotFpReg[slot]);
@@ -960,15 +1115,57 @@ static unsigned closureReg(const Emit *e) {
 }
 
 /* Counts from the bottom of the operand stack, not the top (unlike pushReg). An inlined body gets its
- * own bank (x0..x8, minus the emitter's x9..x12 scratches): it can't call anything, so every caller-saved register is free and costs the caller nothing -- `evalA` inlined into spectral's inner loop needs eight live values where the OSR form had only six left, so without this it wouldn't fit. */
+ * own bank (x0..x8, minus the emitter's x9..x12 scratches) whenever the caller's stack is NOT already
+ * there: it can't call anything, so every caller-saved register is free and costs the caller nothing -- `evalA` inlined into spectral's inner loop needs eight live values where the OSR form had only six left, so without this it wouldn't fit. When the caller IS on that bank the two share one numbering instead; see inlineOwnBank. */
 #define JIT_INL_BANK   0u    /* x0..x8, all caller-saved */
-#define JIT_INL_COUNT  9u
+#define JIT_INL_COUNT  JIT_SCRATCH_BANK_COUNT
+
+/* Where entry 0 of the ordinary operand stack sits. Two answers, one rule: it
+ * is x0 when the body proved nothing can clobber a caller-saved register while
+ * it runs (see Emit::scratchValues), and otherwise the register just past the
+ * locals, where it has always been. Every site that used to spell this sum out
+ * by hand goes through here, so the two banks cannot disagree. */
+static unsigned valueBankBase(const Emit *e) {
+    if (e->scratchValues) return JIT_INL_BANK;
+    return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u);
+}
+
+/* How many entries the operand stack may hold. The scratch bank is a fixed
+ * nine; the callee-saved one is whatever the locals and the reserved registers
+ * left behind. */
+static unsigned valueBankRoom(const Emit *e) {
+    if (e->scratchValues) return e->scratchRoom;
+    unsigned taken = regBase(e) + (e->usesUpvalues ? 1u : 0u);
+    return taken < JIT_MAX_SAVED ? JIT_MAX_SAVED - taken : 0u;
+}
+
+/* Something about to be emitted can destroy x0..x8 with the body still live:
+ * a call out, or one of the two stubs that call and then branch back in. The
+ * measuring pass records it so the real pass can choose a bank; the real pass
+ * declines if it happens anyway, so a missed site costs a decline and never a
+ * value read out of a register a helper overwrote. */
+static void noteScratchClobber(Emit *e) {
+    e->clobbersScratch = true;
+    if (e->scratchValues) {
+        e->whyNot = "a call reached a body whose values are in scratch";
+        e->failed = true;
+    }
+}
+
+/* An inlined body needs its own bank only when the caller's is somewhere else.
+ * Once the caller's operand stack is already x0..x8 the two are the SAME bank,
+ * and restarting at x0 would overwrite the entries the call site is standing
+ * on -- so the inlined entries simply continue the caller's numbering, which
+ * `scratchValues` has already proved fits (probe.maxValueAll <= the bank). */
+static bool inlineOwnBank(const Emit *e) {
+    return e->inlining && !e->scratchValues;
+}
 
 static unsigned valueXReg(const Emit *e, unsigned idx) {
-    if (e->inlining && idx >= e->inlValueBase) {
+    if (inlineOwnBank(e) && idx >= e->inlValueBase) {
         return JIT_INL_BANK + (idx - e->inlValueBase);
     }
-    return JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u) + idx;
+    return valueBankBase(e) + idx;
 }
 
 /* One past the top entry's register. Expressing it this way (not from the bottom) is what keeps
@@ -983,7 +1180,7 @@ static unsigned pushReg(const Emit *e) {
 #define JIT_INL_FP_BANK 2u
 
 static unsigned fpRegAt(const Emit *e, unsigned idx) {
-    if (e->inlining && idx >= e->inlValueBase) {
+    if (inlineOwnBank(e) && idx >= e->inlValueBase) {
         return JIT_INL_FP_BANK + (idx - e->inlValueBase);
     }
     return JIT_FP_BANK + idx;
@@ -1188,14 +1385,13 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
         e->whyNot = "the operand stack is deeper than the model allows";
         return false;
     }
-    if (!e->measuring && e->inlining &&
-        e->valueDepth + 1u - e->inlValueBase > JIT_INL_COUNT) {
+    if (!e->measuring && inlineOwnBank(e) &&
+        e->valueDepth + 1u - e->inlValueBase > JIT_SCRATCH_BANK_COUNT) {
         e->whyNot = "an inlined body wants more registers than a call leaves free";
         return false;
     }
-    if (!e->measuring && !e->inlining &&
-        regBase(e) + (e->usesUpvalues ? 1u : 0u) + e->valueDepth + 1 >
-            JIT_MAX_SAVED) {
+    if (!e->measuring && !inlineOwnBank(e) &&
+        e->valueDepth + 1 > valueBankRoom(e)) {
         e->whyNot = "more live values than there are callee-saved registers";
         return false;
     }
@@ -1217,6 +1413,11 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
         !(e->inlining && e->valueDepth > e->inlValueBase)) {
         e->maxValue = e->valueDepth;
     }
+    /* The same number counted the other way: how wide the stack gets when the
+     * inlined entries are NOT given a bank of their own. That is the question
+     * "may this body's values live in x0..x8" asks, and maxValue cannot answer
+     * it -- it deliberately stops counting at the inline boundary. */
+    if (e->valueDepth > e->maxValueAll) e->maxValueAll = e->valueDepth;
     return true;
 }
 
@@ -1327,9 +1528,13 @@ static void emitConst64(Emit *e, unsigned rd, int64_t value) {
         emit(e, jaiA64MovnX(rd, (unsigned)(~(uint64_t)value & 0xffffu)));
         return;
     }
+    /* MOVZ where the first non-zero chunk is, not always at chunk 0: it zeroes the other three either way,
+     * so a `movz rd,#0` under a single `movk` was one instruction spent writing nothing. Every float constant has this shape -- IEEE-754 puts sign, exponent and the leading mantissa bits in the TOP chunk -- so `1.0` was two instructions and is now one, everywhere a float literal reaches a register. */
     uint64_t bits = (uint64_t)value;
-    emit(e, jaiA64MovzX(rd, (unsigned)(bits & 0xffffu), 0));
-    for (unsigned shift = 1; shift < 4; shift++) {
+    unsigned first = 0;
+    while (first < 3 && ((bits >> (16 * first)) & 0xffffu) == 0) first++;
+    emit(e, jaiA64MovzX(rd, (unsigned)((bits >> (16 * first)) & 0xffffu), first));
+    for (unsigned shift = first + 1; shift < 4; shift++) {
         unsigned part = (unsigned)((bits >> (16 * shift)) & 0xffffu);
         if (part != 0) emit(e, jaiA64MovkX(rd, part, shift));
     }
@@ -1403,7 +1608,7 @@ static uint32_t exitTargetFor(Emit *e, uint32_t target) {
     for (unsigned i = 0; i < e->exitCount; i++) {
         if (e->exitOffset[i] == target) return FIXUP_EXIT - i;
     }
-    if (e->exitCount >= 8) { e->whyNot = "too many ways out of the loop"; e->failed = true; return FIXUP_EXIT; }
+    if (e->exitCount >= JIT_MAX_EXIT) { e->whyNot = "too many ways out of the loop"; e->failed = true; return FIXUP_EXIT; }
     e->exitOffset[e->exitCount] = target;
     return FIXUP_EXIT - e->exitCount++;
 }
@@ -1669,6 +1874,28 @@ static void branchOnDeoptInstStart(Emit *e, unsigned cond) {
  * on an unordered result, and that's routed to a deopt so the interpreter raises exactly what it would have. */
 static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
+static int instructionLength(const Chunk *c, int off);
+
+/* One past the LAST back edge to `top`, or 0 if nothing branches back there.
+ * Not findLoopEnd, which stops at the first: `continue` is a second back edge
+ * to the same head, and stopping at it would call the rest of the body
+ * "outside the loop" -- which is exactly the half a hoist must not believe. */
+static uint32_t loopBodyEnd(const Chunk *c, uint32_t top) {
+    uint32_t last = 0;
+    for (int off = (int)top; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return 0;
+        if (c->code[off] == OP_LOOP) {
+            int16_t jump = jaiReadI16(c->code + off + 1);
+            if ((uint32_t)((int32_t)(off + 3) + jump) == top) {
+                last = (uint32_t)(off + 3);
+            }
+        }
+        off += len;
+    }
+    return last;
+}
+
 /* items+count via one ldp: rCount comes back as `count | capacity << 32` (the two int32s share the
  * pair's second doubleword), so every reader must use the uxtw forms. Layout is asserted below, not assumed -- a field reordered in object.h would load a pointer as a count and index off the end of the array. */
 static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
@@ -1679,6 +1906,139 @@ static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                    "ObjList.capacity must share the count's doubleword");
     emit(e, jaiA64LdpOff(rItems, rCount, rList,
                          (int32_t)offsetof(ObjList, items)));
+}
+
+/* The hoisted header for a subscript whose base is a plain read of local
+ * `slot`, or -1. `curOffset` is checked against the loop the entry was made
+ * for, so an entry the walk has already left cannot be picked up again by a
+ * later loop that happens to name the same slot. */
+static int hoistFor(const Emit *e, int slot) {
+    if (slot < 0 || e->inlining) return -1;
+    for (unsigned i = 0; i < e->hoistCount; i++) {
+        if (e->hoist[i].slot != (uint8_t)slot) continue;
+        if (e->curOffset < e->hoist[i].top) continue;
+        if (e->curOffset >= e->hoist[i].end) continue;
+        return (int)i;
+    }
+    return -1;
+}
+
+/* Nothing outside [top, end) may branch INTO it. The hoisted loads sit just
+ * above the head, so any path that reaches the body without passing through
+ * them would run it against registers nobody loaded. Written as "into the
+ * range", not "to the head", because the head is only the entrance a
+ * structured loop is supposed to have -- this is what makes that a checked
+ * fact rather than an assumption about the emitter. */
+static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
+    for (int at = 0; at < c->count;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;
+        if ((uint32_t)at >= top && (uint32_t)at < end) { at += len; continue; }
+        int rel = jaiOpBranchOperandAt(c->code[at]);
+        if (rel >= 0) {
+            int32_t to = (int32_t)(at + len) +
+                         jaiReadI16(c->code + at + 1 + rel);
+            if (to >= (int32_t)top && to < (int32_t)end) return false;
+        }
+        at += len;
+    }
+    return true;
+}
+
+/* Loop-invariant list headers, hoisted above the loop head.
+ *
+ * Every `xs[i]` reloads `items` and `count` off the ObjList, and in a stencil
+ * (five neighbours, four of them from rows the loop is not walking) that is
+ * five loads an iteration of something no iteration changes. The reload is
+ * also what makes the read SOUND without a version guard, so hoisting it needs
+ * the guard back -- unless the body can be shown to contain nothing that could
+ * move a list at all, which is exactly what `bodyCalls` answers. Every way a
+ * list is resized (push, insert, remove, clear, slice, anything through a
+ * descriptor) is a call out, and so is every collection; an in-place `xs[i] =
+ * v` moves neither `items` nor `count`. So in a call-free body a header is
+ * invariant for as long as the LOCAL is, and that is a fact the measuring pass
+ * already recorded (noteSlotWrite).
+ *
+ * Registers come from x13..x17, which the tier otherwise never names, plus
+ * whatever the operand stack left unused at the top of the scratch bank. Both
+ * are caller-saved, which is the same reason they are free and the reason this
+ * is confined to a body that calls nothing. */
+/* Chooses the loop each candidate is hoisted out of and pays for the registers
+ * busiest first, ONCE, before a line of the body is emitted. Doing it at the
+ * loop heads as the walk reaches them spends the pool in program order, which
+ * means the outermost loop -- the one whose header load happens least often --
+ * takes the registers the innermost one wanted. Weight is the measuring pass's
+ * own loop-depth-weighted count of subscript sites, the same currency the
+ * local allocator ranks slots in.
+ *
+ * The loop chosen is the OUTERMOST one the slot is invariant across, so the
+ * load runs as rarely as the proof allows. */
+static void planHoists(Emit *e, ObjFunction *fn) {
+    if (e->measuring || !e->osr || e->bodyCalls) return;
+    const Chunk *c = &fn->chunk;
+
+    struct { uint32_t top, end, use; uint8_t slot; } cand[JIT_MAX_SLOTS + 1];
+    unsigned ncand = 0;
+
+    for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
+        if (e->localKind[s] != SLOT_LIST) continue;
+        if (e->slotXReg[s] == 0) continue;   /* no register to load from */
+        if (e->slotIndexUse[s] == 0) continue;
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
+            int len = instructionLength(c, at);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)at;
+            uint32_t le = loopBodyEnd(c, lt);
+            at += len;
+            if (le == 0 || le <= lt || le > e->osrEnd) continue;
+            /* Every subscript of this slot inside the loop... */
+            if (e->slotIndexLo[s] < lt || e->slotIndexHi[s] >= le) continue;
+            /* ...and no write to it anywhere in the loop. */
+            if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        cand[ncand].top  = bestTop;
+        cand[ncand].end  = bestEnd;
+        cand[ncand].use  = e->slotIndexUse[s];
+        cand[ncand].slot = (uint8_t)s;
+        ncand++;
+    }
+
+    while (e->hoistCount < JIT_MAX_HOIST &&
+           e->hoistPoolCount - e->hoistTaken >= 2u) {
+        unsigned pick = ncand, bestUse = 0;
+        for (unsigned i = 0; i < ncand; i++) {
+            if (cand[i].use > bestUse) { bestUse = cand[i].use; pick = i; }
+        }
+        if (pick == ncand) break;
+        cand[pick].use = 0;                  /* taken */
+        unsigned rI = e->hoistPool[e->hoistTaken++];
+        unsigned rC = e->hoistPool[e->hoistTaken++];
+        if (rI < e->scratchRoom) e->scratchRoom = rI;
+        if (rC < e->scratchRoom) e->scratchRoom = rC;
+        e->hoist[e->hoistCount].top      = cand[pick].top;
+        e->hoist[e->hoistCount].end      = cand[pick].end;
+        e->hoist[e->hoistCount].slot     = cand[pick].slot;
+        e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
+        e->hoist[e->hoistCount].countReg = (uint8_t)rC;
+        e->hoistCount++;
+    }
+}
+
+/* The loads themselves, emitted just above the head of the loop they were
+ * planned out of -- which is where the walk is when it reaches that offset. */
+static void emitHoistsAt(Emit *e, uint32_t off) {
+    if (e->inlining) return;
+    for (unsigned i = 0; i < e->hoistCount; i++) {
+        if (e->hoist[i].top != off) continue;
+        emitListHeader(e, e->slotXReg[e->hoist[i].slot],
+                       e->hoist[i].itemsReg, e->hoist[i].countReg);
+    }
 }
 
 /* Normalises the index and bounds-checks it in one unsigned compare: a negative index is a huge
@@ -1702,9 +2062,17 @@ static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
     }
 }
 
+/* Neither of the two blocks below reads an operand-stack entry -- a bail says
+ * "could not continue" and the caller throws the whole computation away, and an
+ * overflow raises -- so the entries do NOT have to be in their X homes to
+ * branch to one. The fpSyncAll both used to do was pure hot-path cost: in a
+ * float expression carrying an int guard through it (a stencil's `mid[j-1]`),
+ * each one wrote every live float out and the next use read it back, four
+ * cross-bank fmovs sitting in the middle of the accumulate chain. A join
+ * (branchTo) and a deopt record are different and still settle -- the first
+ * because the other edge must agree, the second because the record is read. */
 static void branchOnCondition(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    fpSyncAll(e);
     if (e->wroteHeap) e->bailAfterWrite = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
@@ -1718,12 +2086,17 @@ static void branchOnCondition(Emit *e, unsigned cond) {
  * product's high half against the low half's replicated sign, so its answer is NE -- routing multiply through VS meant its overflow was never detected (4 * 2^62 silently came back as 0). */
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    fpSyncAll(e);
     /* Inside a `try` the overflow stub's raise would unwind past the region
      * that should have caught it (see Emit::inProtected). Resume at this
      * instruction instead: the interpreter re-executes it, overflows too, and
-     * raises with a frame and an ip that name the right handler. */
-    if (e->inProtected) { branchOnDeoptInstStart(e, cond); return; }
+     * raises with a frame and an ip that name the right handler. The deopt
+     * record IS read, so that path settles the FP bank; the overflow stub is
+     * not, which is why the unconditional fpSyncAll above it is gone. */
+    if (e->inProtected) {
+        fpSyncAll(e);
+        branchOnDeoptInstStart(e, cond);
+        return;
+    }
     e->overflowUsed[which] = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
@@ -1782,6 +2155,23 @@ static ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     Value bound;
     if (!jaiModuleGet(fn->module, AS_STRING(name), &bound)) return NULL;
     return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
+}
+
+/* The first entry a dict walk would yield, for the component kinds the compiled
+ * pair head specialises on -- the dict equivalent of taking items[0] off a list.
+ * False for a dict with nothing live in it, which declines rather than guessing.
+ * Reads the order array exactly as jaiTableNext does, so "first" here and
+ * "first" at run time are the same entry. */
+static bool firstLiveEntry(const JaiTable *t, Value *key, Value *value) {
+    if (t->entries == NULL) return false;
+    for (int i = 0; i < t->orderCount; i++) {
+        const int32_t slot = t->order[i];
+        if (slot < 0) continue;
+        *key   = t->entries[slot].key;
+        *value = t->entries[slot].value;
+        return true;
+    }
+    return false;
 }
 
 static ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
@@ -1920,6 +2310,25 @@ static bool rawObjValue(Value v) {
     return true;
 }
 
+/* Predicted stack kind for a callee that has not compiled, from what it has been observed to return
+ * (ObjFunction::obsReturnKind). Same contract as feedbackSlotKind's: a prediction the caller must guard.
+ * SLOT_INST is admissible here where it is not there, because a per-callee record can carry the class
+ * shape a one-byte-per-way cache cannot -- and the shape is guarded after the call like the tag. */
+static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
+                               uint32_t *shape) {
+    uint8_t fb = cfn->obsReturnKind;
+    *shape = 0;
+    if (fb == 1u + (unsigned)VAL_NULL) { *k = SLOT_NULL; return true; }
+    if (fb == JAI_FB_OBJ + (unsigned)OBJ_INSTANCE) {
+        if (cfn->obsReturnShape == 0) return false;
+        *k = SLOT_INST;
+        *shape = cfn->obsReturnShape;
+        return true;
+    }
+    unsigned tag;
+    return feedbackSlotKind(fb, k, &tag);
+}
+
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     *shape = 0; *kls = NULL;
     if (IS_INT(v))      { *k = SLOT_INT;   return true; }
@@ -2020,8 +2429,7 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
     for (unsigned idx = 0; idx < e->depth; idx++) {
         SlotKind k = e->stack[idx];
         if (!holdsRegister(k)) continue;
-        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
-                       (e->usesUpvalues ? 1u : 0u) + seen;
+        unsigned reg = valueBankBase(e) + seen;
         seen++;
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
@@ -2077,8 +2485,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
                       i * (unsigned)sizeof(Value);
-        unsigned reg = JIT_FIRST_SAVED + regBase(e) +
-                       (e->usesUpvalues ? 1u : 0u) +
+        unsigned reg = valueBankBase(e) +
                        (idx - (e->depth - e->valueDepth));
         /* A maybe-instance's tag is not a property of its kind, and this Value
          * reaches jaiCallValue: writing VAL_OBJ over a zero payload would hand
@@ -2099,6 +2506,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
 
     emit(e, jaiA64AddXImm(0, 31, d));
     emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)helper);
+    noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
 
     if (ownStatus) return true;
@@ -2119,6 +2527,69 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
 static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper) {
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
+}
+
+/* A builtin whose whole body is a load from its receiver (jit_field_read.h).
+ * The caller has already guarded that the receiver is `fr->type`, so the load
+ * is the entire call: no callee Value, no argument Value, no root fill, no
+ * status test, no result tag test. `k.len()` was 39 instructions and a `blr`
+ * into jitInvokeNative for a 32-bit field.
+ *
+ * A lazily-computed field (ObjString::scalars) keeps the descriptor call as a
+ * slow path *inline*, reached only when the memo is empty, so the native fills
+ * it and every later call takes the load. Deopting there instead would be
+ * wrong: a loop over freshly built strings would leave the compiled body on
+ * every iteration. Both paths land on the same register, and the span over the
+ * slow path is measured rather than counted -- emitDescriptor's length moves
+ * with the number of roots the body holds. */
+static bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
+                          unsigned ridx, unsigned argc, uint32_t afterIp) {
+    if (fr->tag != VAL_INT) {
+        e->whyNot = "a field-reading builtin whose result is not an int";
+        return false;
+    }
+    unsigned rRecv   = pushReg(e) - argc - 1;
+    unsigned skipSlow = 0;
+
+    if (fr->width == 4) {
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rRecv, fr->offset));
+    } else {
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, rRecv, fr->offset));
+    }
+
+    if (fr->lazy) {
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint64_t)fr->sentinel);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        skipSlow = e->count;
+        emit(e, jaiA64BCond(JAI_A64_NE, 0));      /* patched below */
+        if (!emitDescriptor(e, nativeVal, ridx, argc + 1,
+                            (void *)&jitInvokeNative)) {
+            return false;
+        }
+    }
+
+    for (unsigned i = 0; i <= argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) return false;
+    }
+    if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+
+    if (fr->lazy) {
+        unsigned rat = e->descOffset +
+                       (unsigned)offsetof(JitCallDesc, result);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_B, 31, rat));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, VAL_INT));
+        branchOnDeoptAt(e, JAI_A64_NE, afterIp, true);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, 31, rat + 8));
+        if (skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+            e->code[skipSlow] =
+                jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
+        }
+        /* The slow path calls out, and a native may write. */
+        e->wroteHeap = true;
+    }
+    emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_A));
+    return true;
 }
 
 /* Verdict 4: the callee deoptimised part-way and may have written, so the call can't be re-executed
@@ -2390,6 +2861,7 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         else emitConst64(e, nargs, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
     }
     emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)cfn->jitFunc);
+    noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_D));
 
     if (callRoots > 0) {
@@ -2685,6 +3157,13 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) e->inlSlot[i] = -1;
     for (unsigned i = 0; i < argc; i++) e->inlSlot[1u + i] = (int)(cidx + 1u + i);
 
+    /* No noteScratchClobber here. An inlined body cannot call -- inlinableBody
+     * admits nothing that does -- so it destroys x0..x8 only by USING them,
+     * which is not a clobber but an allocation: when the caller already owns
+     * that bank the two share one numbering (see inlineOwnBank), and when it
+     * does not, the inlined entries have x0..x8 to themselves as before.
+     * Anything inside that really does call still reaches noteScratchClobber
+     * on its own, and under scratchValues that declines the compile. */
     e->inlining     = true;
     e->inlDepth     = cidx + 1u + argc;
     e->inlPinned    = 0;
@@ -2736,11 +3215,20 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     if (e->depth <= cidx) { e->failed = true; return false; }
     rshape = e->stackShape[e->depth - 1];
     rcls   = e->stackClass[e->depth - 1];
-    if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    /* Read while `inlining` is still set, so this names the inlined bank's d
+     * register; the caller's own is taken after it is cleared. */
+    bool rfp = (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
+    unsigned rfpReg = rfp ? fpHeldIn(e, e->valueDepth - 1) : 0;
+    if (rfp) {
+        if (!popValueRaw(e, &rres, &kres)) { e->failed = true; return false; }
+    } else if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    /* Raw, because nothing reads these again: the body is over and its pinned
+     * locals go with it, so materialising one costs an instruction whose
+     * destination is dead. */
     while (e->depth > cidx) {
         if (holdsRegister(e->stack[e->depth - 1])) {
             unsigned r;
-            if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+            if (!popValueRaw(e, &r, NULL)) { e->failed = true; return false; }
         } else {
             e->depth--;
         }
@@ -2749,8 +3237,14 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
 
     if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }
-    unsigned dst = pushReg(e) - 1;
-    if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    if (rfp) {
+        unsigned dd = fpRegAt(e, e->valueDepth - 1);
+        if (dd != rfpReg) emit(e, jaiA64FmovDD(dd, rfpReg));
+        fpClaim(e, e->valueDepth - 1);
+    } else {
+        unsigned dst = pushReg(e) - 1;
+        if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    }
     e->inlined = true;
     return true;
 }
@@ -2764,14 +3258,13 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     Value cv = e->stackSeen[cidx];
     if (!IS_CLOSURE(cv)) { e->whyNot = "callee vanished"; return false; }
     ObjFunction *cfn = AS_CLOSURE(cv)->fn;
-    if (cfn->jitFunc == NULL) { e->whyNot = "callee no longer compiled"; return false; }
 
     /* Straight to the callee's entry when everything jaiJitEnterFunc would
      * have checked can be checked here instead. Falling back rather than
      * declining matters: the descriptor path speaks a much wider language --
      * any argument kind, any module, a callee that writes -- and a call
      * through jaiCallValue still beats no compiled loop at all. */
-    {
+    if (cfn->jitFunc != NULL) {
         const char *saved = e->whyNot;
         if (emitDirectCall(e, caller, cfn, cv, -1, cidx, argc, callOff,
                            after, false)) {
@@ -2781,18 +3274,31 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         e->whyNot = saved;
     }
 
-    SlotKind rk = (SlotKind)cfn->jitReturnKind;
-    uint32_t rshape = cfn->jitReturnShape;
+    /* A callee with no compiled form of its own still knows what it has been
+     * returning; see ObjFunction::obsReturnKind and the twin case at OP_INVOKE.
+     * A recursive function is the ordinary way to reach this -- the loop being
+     * compiled is inside the very function the call names, so there is nothing
+     * for `jitReturnKind` to have been written by yet. */
+    SlotKind rk = SLOT_NULL;
+    uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    if (rk == SLOT_INST) {
-        if (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL) {
-            e->whyNot = "callee's return class not on record";
-            return false;
-        }
+    bool haveKind;
+    if (cfn->jitFunc != NULL) {
+        rk = (SlotKind)cfn->jitReturnKind;
+        rshape = cfn->jitReturnShape;
+        haveKind = true;
+    } else {
+        haveKind = observedReturnKind(cfn, &rk, &rshape);
     }
-    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
-        rk != SLOT_NULL) {
+    if (haveKind && rk == SLOT_INST &&
+        (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
+        e->whyNot = "callee's return class not on record";
+        return false;
+    }
+    if (!haveKind ||
+        (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+         rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
+         rk != SLOT_NULL)) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
@@ -2822,6 +3328,24 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
      * rather than whatever the descriptor happened to leave behind. */
     if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
     else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+    if (rk == SLOT_INST) {
+        /* The tag says "an object", which is not "an instance of this class",
+         * and every field offset resolved against the entry below assumes it
+         * is. The object type is checked before `klass` is read for the same
+         * reason it is at the invoke arm: VAL_OBJ covers every heap object and
+         * a returned string's header is shorter than an instance's. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(ObjInstance, klass)));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                           (unsigned)offsetof(ObjClass, shapeId)));
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    }
     e->wroteHeap = true;
     return true;
 }
@@ -2853,7 +3377,7 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     if (mfn->upvalueCount != 0) return false;
     if (mfn->chunk.count > 96) return false;
 
-    unsigned base = JIT_FIRST_SAVED + regBase(e) + (e->usesUpvalues ? 1u : 0u);
+    unsigned base = valueBankBase(e);
     unsigned inReg[JIT_MAX_ARGS_OUT + 1];
     Value    inSeen[JIT_MAX_ARGS_OUT + 1];
     ObjClass *inCls[JIT_MAX_ARGS_OUT + 1];
@@ -2984,8 +3508,7 @@ static bool emitCallOut(Emit *e, unsigned argc) {
                 e->whyNot = "an argument kind a field cannot take";
                 return false;
             }
-            regs[i] = JIT_FIRST_SAVED + regBase(e) +
-                      (e->usesUpvalues ? 1u : 0u) +
+            regs[i] = valueBankBase(e) +
                       (first + i - (e->depth - e->valueDepth));
         }
         /* Fast path (jitInstanceAlloc) is a leaf that cannot collect -- it declines whenever jaiGCWanted(),
@@ -2998,6 +3521,7 @@ static bool emitCallOut(Emit *e, unsigned argc) {
             emitConst64(e, 0, (int64_t)(uintptr_t)cls);
             emitConst64(e, JIT_SCRATCH_A,
                         (int64_t)(uintptr_t)&jitInstanceAlloc);
+            noteScratchClobber(e);
             emit(e, jaiA64Blr(JIT_SCRATCH_A));
             emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
@@ -3269,6 +3793,9 @@ static bool deferSurvives(uint8_t op) {
     case OP_INT: case OP_CONST:
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_SHL: case OP_SHR:
+    /* Its arm settles both operands itself on every path that reads a register
+     * for them, and takes no deopt record before doing so. */
+    case OP_FLOORDIV:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_EQ: case OP_NE:
     case OP_JUMP_IF_CMP_FALSE:
@@ -3294,6 +3821,9 @@ static bool foldsIntLiteral(uint8_t op) {
     /* Not because a shift takes an imm12 (it doesn't) -- the shift count becomes part of the instruction
      * encoding when it's a literal 0..63, so the register that used to hold it was written and never read. bitops paid a `movz` for every one of its shifts before this. */
     case OP_SHL: case OP_SHR:
+    /* Same again: a power-of-two divisor is spelt by the `asr`'s own shift field. Says yes for divisors
+     * that are not powers of two too, which is harmless -- that path settles what it cannot fold, exactly as this list's contract allows. spectral's `s * (s + 1) // 2` paid a `movz x3,#2` into a register no instruction read, once per inner iteration. */
+    case OP_FLOORDIV:
         return true;
     default:
         return false;
@@ -3439,6 +3969,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
             }
         }
+        /* Above the offset map on purpose: a back edge to `off` must land on
+         * the loop head, not on the loads that were hoisted out of it. */
+        emitHoistsAt(e, (uint32_t)off);
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = (int)stackSignature(e);
         e->lastOp = op;
@@ -3468,7 +4001,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * here at all -- and there are no branches in an inlined body for
              * one to be. */
             if (e->inlining) joinsHere = false;
-            if (!fpFastOp(op) || joinsHere || e->inProtected) {
+            /* An inlined OP_RETURN is not a sync point: the only entry that outlives it is the result, and
+             * inlineGlobalCall carries that one across in the bank. Everything under it is discarded unread. */
+            if (e->inlining && op == OP_RETURN) {
+                /* handled below */
+            } else if (!fpFastOp(op) || joinsHere || e->inProtected) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
@@ -3492,7 +4029,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "an inlined body returning a value with no register";
                 return false;
             }
-            fpSyncOne(e, e->valueDepth - 1);
+            /* A float result stays in its d register: inlineGlobalCall moves it into the caller's bank with
+             * one FP-to-FP move, where syncing here spent an `fmov x,d` and then made the caller's first float operator pay an `fmov d,x` to undo it. settleAll still runs -- it is X-side only (kPend/xBorrow), and those bits are never set on an entry the bank holds. */
+            if (!(e->fpLive & (1u << (e->valueDepth - 1)))) {
+                fpSyncOne(e, e->valueDepth - 1);
+            }
             settleAll(e);   /* the caller reads the result out of valueXReg */
             break;
         }
@@ -4185,7 +4726,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 memcpy(&bits, &d, sizeof bits);
                 if (!pushValue3(e, SLOT_FLOAT, 0, NULL, k, -1)) return false;
                 unsigned imm8;
-                if (!e->fpOff && jaiA64FpImm8(d, &imm8)) {
+                /* The lookahead, not just the encodability: a constant with no float consumer ahead of it is
+                 * synced back out to X at the next ordinary opcode, so the bank form costs `fmov d,#imm` plus that `fmov x,d` where one `movz` would have done. Every value FMOV's imm8 can name has its whole payload in the top 16 bits, so emitConst64 is exactly one instruction for all of them. spectral's `1.0 / float(..)` is the shape: OP_GET_GLOBAL stands between the constant and its divide. */
+                if (!e->fpOff && jaiA64FpImm8(d, &imm8) &&
+                    fpWorthLoading(e, code, off + 4, stop)) {
                     /* Not `idx`: that is this instruction's constant index, and
                      * shadowing it here was the tree's only build warning. This
                      * one is a position on the operand stack. */
@@ -4485,10 +5029,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned cond;
             if (!negatedCondition(cmp, &cond)) return false;
             if (!localInRange(e, slot)) return false;
-            if (e->localKind[slot] != SLOT_INT) return false;
-            if (slot == 0) e->usesSlot0 = true;
             if (kIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value k = fn->chunk.constants.data[kIdx];
+
+            /* `if c == "{"` where c came out of a string index. Every hand-written scanner in the language is
+             * this shape, and the peephole folds it to exactly this instruction, so declining it declined the
+             * whole enclosing function -- json_parse's `value` dispatches on six of them. Two interned strings
+             * are equal exactly when they are the same object, which the OP_EQ arm already relies on; the
+             * difference here is that one side is a constant, so its interning is settled at compile time and
+             * only the local needs guarding. Nothing has been written yet, so a guard resumes at this very
+             * instruction. */
+            if ((cmp == OP_EQ || cmp == OP_NE) &&
+                e->localKind[slot] == SLOT_OBJ && IS_STRING(k) &&
+                JAI_STR_INTERNED(AS_STRING(k)) &&
+                IS_STRING(localObserved(e, slot) ? e->observed[slot]
+                                                 : e->localSeen[slot])) {
+                if (slot == 0) e->usesSlot0 = true;
+                settleAll(e);          /* this path guards */
+                unsigned rs = localIn(e, slot, JIT_SCRATCH_C);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+                /* Not interned means content equality is not pointer equality,
+                 * and the interpreter is the one that knows how to tell. */
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, rs,
+                                      (unsigned)offsetof(Obj, subFlag)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
+                emit(e, jaiA64SubsXReg(31, rs, JIT_SCRATCH_B));
+                branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
+                off += 9;
+                break;
+            }
+
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
             if (!IS_INT(k)) return false;
 
             /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's
@@ -4880,8 +5457,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                              (unsigned)info->slot * (unsigned)sizeof(Value);
-            unsigned rr = JIT_FIRST_SAVED + regBase(e) +
-                          (e->usesUpvalues ? 1u : 0u) + e->valueDepth - 1;
+            unsigned rr = valueBankBase(e) + e->valueDepth - 1;
             SlotKind already = knownFieldKind(e, fromLocal, info->slot);
             if (already != SLOT_SELF) {
                 kind = already;
@@ -5060,7 +5636,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->depth < 2) return false;
             ka = e->stack[e->depth - 2]; kb = e->stack[e->depth - 1];
             if (ka != SLOT_INT || kb != SLOT_INT) return false;
-            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
             /* A literal power-of-two divisor decides the whole thing: floor(x / 2^s) is exactly `asr x, #s` for
              * every int64 x (negative included), since asr already rounds toward minus infinity -- what the correction below exists to reproduce for the general case. */
@@ -5069,14 +5644,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                              kdiv != 0 && kdiv != -1;
             unsigned dshift;
             if (kdivKnown && powerOfTwoShift(kdiv, &dshift)) {
+                /* The divisor is spelt by the shift field, so drop its deferral rather than settle it -- the
+                 * same move OP_ADD makes for an imm12 -- popValueRaw drops it. The dividend comes back from popValue, not from pushReg, because a borrowed entry lives in the local's register and not in its own. */
                 unsigned p1, p2;
-                if (!popValue(e, &p1, NULL)) return false;
+                if (!popValueRaw(e, &p1, NULL)) return false;
                 if (!popValue(e, &p2, NULL)) return false;
                 if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64AsrX(pushReg(e) - 1, ra, dshift));
+                emit(e, jaiA64AsrX(pushReg(e) - 1, p2, dshift));
                 off += 1;
                 break;
             }
+            /* Every path below reads both operands out of their own registers,
+             * and two of them guard. */
+            settleAll(e);
+            rb = pushReg(e) - 1; ra = pushReg(e) - 2;
 
             /* Zero and -1 both decline: the interpreter reports division-by-zero, and INT64_MIN / -1 is the one
              * quotient that doesn't fit -- both rare enough that declining -1 outright costs nothing. A literal divisor has already answered both. */
@@ -5157,6 +5738,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
                 {
+                    noteScratchClobber(e);
                     unsigned gi = e->growCount++;
                     e->grow[gi].listReg  = rList;
                     e->grow[gi].valReg   = rVal;
@@ -5225,25 +5807,46 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 if (!IS_CLOSURE(method)) return false;
                 ObjFunction *mfn = AS_CLOSURE(method)->fn;
-                if (mfn->jitFunc == NULL) return false;   /* kind unknown yet */
-                SlotKind rkind = (SlotKind)mfn->jitReturnKind;
-                uint32_t rshape = mfn->jitReturnShape;
+                /* The callee's own compiled form states its return kind exactly; without one the
+                 * interpreter's record of what it has been returning stands in. That case is not exotic --
+                 * two methods that call each other can never take turns being the first to compile, so
+                 * neither ever has a jitFunc to ask, and json_parse's whole parser is that shape. Either
+                 * way it is only a prediction: the tag guard below is what makes it sound. */
+                SlotKind rkind = SLOT_NULL;
+                uint32_t rshape = 0;
                 ObjClass *rrcls = NULL;
-                if (rkind == SLOT_INST) {
-                    if (rshape == 0) return false;
-                    if (!jaiClassForShape(rshape, &rrcls) || rrcls == NULL) {
-                        return false;
-                    }
+                bool haveKind;
+                if (mfn->jitFunc != NULL) {
+                    rkind = (SlotKind)mfn->jitReturnKind;
+                    rshape = mfn->jitReturnShape;
+                    haveKind = true;
+                } else {
+                    haveKind = observedReturnKind(mfn, &rkind, &rshape);
                 }
-                if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
+                if (haveKind && rkind == SLOT_INST &&
+                    (rshape == 0 || !jaiClassForShape(rshape, &rrcls) ||
+                     rrcls == NULL)) {
+                    haveKind = false;
+                    rrcls = NULL;
+                }
+                if (haveKind && rkind != SLOT_INT && rkind != SLOT_FLOAT &&
                     rkind != SLOT_BOOL && rkind != SLOT_INST &&
-                    rkind != SLOT_LIST) {
+                    rkind != SLOT_LIST && rkind != SLOT_OBJ &&
+                    rkind != SLOT_NULL) {
+                    haveKind = false;
+                }
+                /* A result the very next instruction pops needs no kind at all -- which is every `-> void`
+                 * method called as a statement, and the reason a parser's `self.skip()` used to decline the
+                 * function around it. Same relaxation the builtin arm below already makes. */
+                bool mdiscarded = (off + 7 < count && code[off + 7] == OP_POP);
+                if (!haveKind && !mdiscarded) {
+                    e->whyNot = "callee's return kind not usable";
                     return false;
                 }
 
                 /* Straight to the method's compiled entry since the receiver's class is fixed here (SLOT_INST
                  * carries a shape the caller already guarded) -- the "inline cache" is the model itself, free at run time. Skips the whole jitInvokeMethod -> jaiCallMethodWithReceiver -> invokeCallable -> callClosure -> jaiJitEnterFunc -> jitArgIn chain of C glue between two compiled bodies, which was a large fraction of object_dispatch. Falls back rather than declines, for the same reason a global call does: the descriptor path speaks a wider language. */
-                {
+                if (mfn->jitFunc != NULL) {
                     const char *saved = e->whyNot;
                     if (emitDirectCall(e, fn, mfn, method, -1, ridx, argc,
                                        (uint32_t)off, (uint32_t)(off + 7),
@@ -5268,6 +5871,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     unsigned r;
                     if (!popValue(e, &r, NULL)) return false;
                 }
+                if (!haveKind) {
+                    /* Nothing observes the result, so nothing has to be
+                     * predicted or guarded about it. */
+                    e->wroteHeap = true;
+                    off += 8;          /* the OP_POP this consumed */
+                    break;
+                }
                 if (!pushValue(e, rkind, rshape, rrcls)) return false;
 
                 unsigned rat = e->descOffset +
@@ -5275,6 +5885,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
                                  : rkind == SLOT_FLOAT ? VAL_FLOAT
                                  : rkind == SLOT_BOOL  ? VAL_BOOL
+                                 : rkind == SLOT_NULL  ? VAL_NULL
                                                        : VAL_OBJ;
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
@@ -5283,13 +5894,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * was written: needs a bool-returning method emitDirectCall declines, which nothing in the suite exercises. */
                 if (rkind == SLOT_BOOL) {
                     emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
+                } else if (rkind == SLOT_NULL) {
+                    /* A null Value's payload word is not written by NULL_VAL, so
+                     * there is nothing to load; SLOT_NULL is a defined zero. */
+                    emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
                 } else {
                     emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
                 }
                 if (rkind == SLOT_INST) {
                     /* "an object" is not "an object of this class", and a
                      * method entered with another specialisation runs
-                     * interpreted and may return either. */
+                     * interpreted and may return either. The object TYPE goes
+                     * first: VAL_OBJ is every heap object, so a method that
+                     * returned a string here would have `klass` read one word
+                     * past its header and the shape loaded through whatever was
+                     * there -- a segfault, reachable from ordinary code. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
                     emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
                                        (unsigned)offsetof(ObjInstance, klass)));
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
@@ -5325,10 +5948,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                                  : obound;
                 if (!IS_NATIVE(onative)) return false;
 
+                /* A builtin that only reads a field of its receiver needs
+                 * neither the feedback nor the call: the type guard below is
+                 * already the whole precondition, and the table states what
+                 * comes back. See jit_field_read.h. */
+                const JaiJitFieldRead *ofr = jaiJitFieldReadFor(
+                    OBJ_TYPE(oseen), AS_STRING(oname)->chars,
+                    AS_STRING(oname)->length, argc);
+
                 bool odiscarded = (off + 7 < count && code[off + 7] == OP_POP);
                 SlotKind orkind = SLOT_INT;
                 unsigned owantTag = VAL_INT;
-                if (!odiscarded) {
+                if (ofr == NULL && !odiscarded) {
                     uint8_t fb = jaiInvokeResultFeedback(
                         &fn->chunk, jaiReadU16(code + off + 5), oseen);
                     if (!feedbackSlotKind(fb, &orkind, &owantTag)) {
@@ -5343,6 +5974,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A,
                                        (unsigned)OBJ_TYPE(oseen)));
                 branchOnDeopt(e, JAI_A64_NE);
+
+                if (ofr != NULL) {
+                    if (!emitFieldRead(e, ofr, onative, ridx, argc,
+                                       (uint32_t)(off + 7))) {
+                        return false;
+                    }
+                    off += 7;   /* a discarded result is the next OP_POP's */
+                    break;
+                }
 
                 if (!emitDescriptor(e, onative, ridx, argc + 1,
                                     (void *)&jitInvokeNative)) {
@@ -5396,23 +6036,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value nativeVal = IS_BOUND(bound) ? AS_BOUND(bound)->method : bound;
             if (!IS_NATIVE(nativeVal)) return false;
 
-            /* What comes back: `len` is an int; anything whose result is dropped on the next instruction needs no
-             * kind at all. Nothing else -- a call's result can't be guarded, since the call already happened and a wrong guess has nowhere to go. */
-            const char *mname = AS_STRING(nameVal)->chars;
+            /* What comes back: a field-reading builtin says so itself (`len`
+             * is the list's count); anything whose result is dropped on the
+             * next instruction needs no kind at all. Nothing else -- a call's
+             * result can't be guarded, since the call already happened and a
+             * wrong guess has nowhere to go. */
             bool discarded = (off + 7 < count && code[off + 7] == OP_POP);
-            bool isLen = strcmp(mname, "len") == 0 && argc == 0;
-            if (!isLen && !discarded) return false;
+            const JaiJitFieldRead *lfr = jaiJitFieldReadFor(
+                OBJ_LIST, AS_STRING(nameVal)->chars, AS_STRING(nameVal)->length,
+                argc);
+            if (lfr == NULL && !discarded) return false;
 
             /* `xs.len()` on a list is one field read. Through the descriptor it meant a GC root push/pop, a
-             * bound-method resolve, an arity check and a native call just to read a 32-bit count -- paid every iteration of the ordinary `while i < xs.len()` loop. The receiver's kind is already known here, which is the whole guard needed. */
-            if (isLen && e->stack[ridx] == SLOT_LIST) {
-                unsigned rList = pushReg(e) - 1;
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64LdrW(pushReg(e) - 1, rList,
-                                   (unsigned)offsetof(ObjList, count)));
-                off += 7;
+             * bound-method resolve, an arity check and a native call just to read a 32-bit count -- paid every iteration of the ordinary `while i < xs.len()` loop. SLOT_LIST is the type guard, already made. */
+            if (lfr != NULL) {
+                if (!emitFieldRead(e, lfr, nativeVal, ridx, argc,
+                                   (uint32_t)(off + 7))) {
+                    return false;
+                }
+                off += 7;   /* a discarded result is the next OP_POP's */
                 break;
             }
 
@@ -5425,15 +6067,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;
             }
-            if (isLen) {
-                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                                   e->descOffset +
-                                       (unsigned)offsetof(JitCallDesc, result) + 8));
-            }
             e->wroteHeap = true;
-            off += 7;
-            if (!isLen) off += 1;      /* the OP_POP this consumed */
+            off += 8;      /* the OP_POP this consumed */
             break;
         }
 
@@ -5529,6 +6164,165 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_ITER_RANGE: {
+            /* `for x in a..b` opened, with neither object built. The two ints
+             * this writes are the whole loop, so there is no descriptor, no
+             * root fill and no call out -- and, being ordinary int locals, they
+             * compete for registers on the same terms as everything else
+             * instead of reserving four the way an ObjIter head does.
+             *
+             * `end` is one past the last value, WRAPPING, which is what makes
+             * `a..=INT64_MAX` terminate: the counter meets INT64_MIN there.
+             * Same arithmetic as the interpreter's, deliberately -- see
+             * OP_ITER_RANGE in chunk.h. */
+            bool     inclusive = code[off + 1] != 0;
+            unsigned curSlot   = jaiReadU16(code + off + 2);
+            unsigned endSlot   = jaiReadU16(code + off + 4);
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            if (e->stack[e->depth - 2] != SLOT_INT) return false;
+            if (!localInRange(e, curSlot) || !localInRange(e, endSlot)) {
+                return false;
+            }
+            if (!adoptLocalKind(e, curSlot, SLOT_INT, 0, NULL)) return false;
+            if (!adoptLocalKind(e, endSlot, SLOT_INT, 0, NULL)) return false;
+            if (curSlot == 0 || endSlot == 0) e->usesSlot0 = true;
+
+            unsigned rHi, rLo;
+            if (!popValue(e, &rHi, NULL)) return false;
+            if (!popValue(e, &rLo, NULL)) return false;
+            /* Both ends stay read-only: a popped register may be a local's own,
+             * borrowed, and writing it would rewrite the local. */
+            if (inclusive) {
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, rHi, 1));
+            } else {
+                emit(e, jaiA64MovX(JIT_SCRATCH_A, rHi));
+            }
+            emit(e, jaiA64SubsXReg(31, rHi, rLo));
+            /* An empty range ends where it begins, so the first test already
+             * fails and the body never runs. */
+            emit(e, jaiA64CselX(JIT_SCRATCH_B, rLo, JIT_SCRATCH_A, JAI_A64_LT));
+            localOut(e, endSlot, JIT_SCRATCH_B);
+            localOut(e, curSlot, rLo);
+            off += 6;
+            break;
+        }
+
+        case OP_FOR_RANGE_BIND: {
+            /* One step of that loop: a compare, a branch, a bind and an add,
+             * with nothing to load from the heap and nothing to guard. The two
+             * slots are written by OP_ITER_RANGE and by this instruction and by
+             * nothing else -- the emitter hands out fresh temporaries for them
+             * -- so their kind is a fact of the shape rather than a sample, and
+             * this arm has no deopt of its own. A bail lands on this
+             * instruction with the counter unadvanced. */
+            int16_t  jump    = jaiReadI16(code + off + 1);
+            unsigned slot    = jaiReadU16(code + off + 3);
+            unsigned curSlot = jaiReadU16(code + off + 5);
+            unsigned endSlot = jaiReadU16(code + off + 7);
+            if (!localInRange(e, slot)) return false;
+            if (!localInRange(e, curSlot) || !localInRange(e, endSlot)) {
+                return false;
+            }
+            if (e->localKind[curSlot] != SLOT_INT ||
+                e->localKind[endSlot] != SLOT_INT) {
+                return false;
+            }
+            if (!adoptLocalKind(e, slot, SLOT_INT, 0, NULL)) {
+                e->whyNot = "loop variable took two kinds";
+                return false;
+            }
+            if (slot == 0) e->usesSlot0 = true;
+
+            unsigned rCur = localIn(e, curSlot, JIT_SCRATCH_A);
+            unsigned rEnd = localIn(e, endSlot, JIT_SCRATCH_B);
+            emit(e, jaiA64SubsXReg(31, rCur, rEnd));
+            /* Nothing of this loop's is on the operand stack, so the exit is
+             * reached at exactly the depth this branch leaves from. */
+            branchTo(e, (uint32_t)((int32_t)(off + 9) + jump), true,
+                     JAI_A64_EQ);
+            /* Bind before stepping: in register mode the counter's home IS
+             * rCur, so the add would destroy the value about to be bound. */
+            localOut(e, slot, rCur);
+            {
+                unsigned dst = localDest(e, curSlot);
+                emit(e, jaiA64AddXImm(dst, rCur, 1));
+                localOut(e, curSlot, dst);
+            }
+            off += 9;
+            break;
+        }
+
+        case OP_GET_ITER_ITEMS: {
+            /* `for (a, b) in X.items()`. The emitter cannot know X's type, so
+             * it plants this ahead of an ordinary `INVOKE items; GET_ITER` and
+             * lets the opcode jump over the pair when X turns out to be a dict,
+             * building a lazy ITER_DICT_ITEMS instead. Unarmed, it declined the
+             * whole enclosing function -- which is why dict_iter's two loops
+             * ran interpreted end to end.
+             *
+             * The dict case is specialised and the branch is resolved HERE, by
+             * walking on at the target rather than by emitting a jump: the
+             * skipped `INVOKE items` never executes in this form, so its inline
+             * cache is empty and compiling it as dead code would decline. That
+             * is only sound because the region really is the emitter's own, so
+             * nothing branches into it -- checked below, and backstopped by the
+             * fixup resolver, which declines a branch to an offset the walk
+             * never reached rather than mis-resolving it.
+             *
+             * Specialising rather than falling through to the eager `items()`
+             * is required, not merely faster: the lazy view raises when the
+             * dict changes under the loop and the materialised list does not,
+             * so a compiled body that took the other path would answer
+             * differently from the interpreter. */
+            if (e->depth == 0) return false;
+            unsigned sidx = e->depth - 1;
+            if (e->stack[sidx] != SLOT_OBJ || !IS_DICT(e->stackSeen[sidx])) {
+                e->whyNot = "items() on something that is not a dict";
+                return false;
+            }
+            if (!e->callsOut) return false;
+            /* Read before the entry is popped below, not through the model
+             * afterwards: the push that replaces it overwrites this cell. */
+            Value    itemsDict = e->stackSeen[sidx];
+            int16_t  ijump = jaiReadI16(code + off + 1);
+            int32_t  after = (int32_t)(off + 3) + ijump;
+            /* The emitter's shape exactly: OP_INVOKE (7 bytes) then
+             * OP_GET_ITER (1), and the head that follows must be the pair form,
+             * since that is the only one shape 4 has an arm for. */
+            if (after != off + 11 || after >= stop ||
+                code[off + 3] != OP_INVOKE || code[off + 10] != OP_GET_ITER ||
+                code[after] != OP_FOR_ITER_PAIR) {
+                e->whyNot = "an items() head this tier does not recognise";
+                return false;
+            }
+
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            if (!emitDescriptor(e, NULL_VAL, sidx, 1,
+                                (void *)&jitMakeItemsIter)) {
+                return false;
+            }
+            unsigned rdrop;
+            if (!popValue(e, &rdrop, NULL)) return false;
+            /* Shape 4 is an ITER_DICT_ITEMS, and it carries the DICT as its
+             * sample rather than an element: the pair head reads the first live
+             * entry off it for the component kinds, exactly as the list form
+             * reads items[0]. */
+            if (!pushValue3(e, SLOT_ITER, 4, NULL, itemsDict, -1)) {
+                return false;
+            }
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off = after;
+            break;
+        }
+
         case OP_FOR_ITER_BIND: {
             /* A loop this body built the iterator for: the index lives in the
              * iterator, so every iteration loads and stores it, and a deopt
@@ -5549,6 +6343,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * not something the inline range form may assume, so it keeps
                  * the stepped path this test has always sent it down. */
                 uint32_t iterShape = e->stackShape[e->depth - 1];
+                /* Shape 4 is a dict-items view, and the arm below would read
+                 * ObjList's offsets out of an ObjDict were the kind guard not
+                 * there to stop it. OP_GET_ITER_ITEMS only makes one when a
+                 * pair head follows, so this is unreachable -- kept because the
+                 * fact lives in another arm and a decline is the cheap side. */
+                if (iterShape == 4) {
+                    e->whyNot = "a non-destructuring loop over dict items";
+                    return false;
+                }
                 if (iterShape != 0 && iterShape != 2 && iterShape != 3) {
                     /* A list iterator, stepped inline (jaiIterNext's ITER_LIST
                      * case, instruction for instruction) rather than through
@@ -5863,10 +6666,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * only from OP_GET_ITER's jitMakeIter, over a SLOT_LIST -- but the
              * kind is guarded anyway rather than assumed, because that fact
              * lives two arms away. */
-            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER) {
+            /* As the head of an OSR loop the iterator is not on the modelled
+             * operand stack at all -- it arrives in a reserved register and
+             * stays on the interpreter's stack, which is what lets an exit
+             * leave without unwinding anything. Only iterKind 3 gets here: a
+             * range or list head is an OP_FOR_ITER_BIND. */
+            bool pairHead = e->osr && e->hasIter && e->iterKind == 3 &&
+                            (uint32_t)off == e->osrTop;
+            if (!pairHead &&
+                (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER)) {
                 return false;
             }
-            if (e->stackShape[e->depth - 1] == 0) {
+            if (!pairHead && e->stackShape[e->depth - 1] == 0) {
                 /* A range head yields ints, which never destructure. */
                 e->whyNot = "destructuring what a range yields";
                 return false;
@@ -5884,19 +6695,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
 
-            /* Component kinds come from the element the list was holding when
-             * the iterator was built (OP_GET_ITER carries it forward), and the
-             * guards below are what make that a specialisation rather than an
-             * assumption. */
-            Value psample = e->stackSeen[e->depth - 1];
-            if (!IS_TUPLE(psample) || AS_TUPLE(psample)->count != 2) {
-                e->whyNot = "pair element is not a 2-tuple";
-                return false;
-            }
+            /* Component kinds come from the pair the source was holding when
+             * the iterator was built (OP_GET_ITER / OP_GET_ITER_ITEMS carries
+             * it forward), and the guards below are what make that a
+             * specialisation rather than an assumption. */
+            bool pairIsDict = pairHead || e->stackShape[e->depth - 1] == 4;
+            Value psample = pairHead ? e->elemSample : e->stackSeen[e->depth - 1];
             SlotKind pk[2];
             unsigned ptag[2];
-            Value pseen[2] = { AS_TUPLE(psample)->items[0],
-                               AS_TUPLE(psample)->items[1] };
+            Value pseen[2];
+            if (pairIsDict) {
+                /* Shape 4 carries the dict itself, so the sample is its first
+                 * live entry -- the one the loop is about to yield. */
+                if (!IS_DICT(psample) ||
+                    !firstLiveEntry(&AS_DICT(psample)->table,
+                                    &pseen[0], &pseen[1])) {
+                    e->whyNot = "iterating a dict with nothing to look at";
+                    return false;
+                }
+            } else {
+                if (!IS_TUPLE(psample) || AS_TUPLE(psample)->count != 2) {
+                    e->whyNot = "pair element is not a 2-tuple";
+                    return false;
+                }
+                pseen[0] = AS_TUPLE(psample)->items[0];
+                pseen[1] = AS_TUPLE(psample)->items[1];
+            }
             for (unsigned i = 0; i < 2; i++) {
                 Value v = pseen[i];
                 if (IS_INT(v))        { pk[i] = SLOT_INT;   ptag[i] = VAL_INT; }
@@ -5918,7 +6742,126 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
 
-            unsigned rIter = pushReg(e) - 1;
+            unsigned rIter = pairHead ? JIT_PAIR_ITER_REG : pushReg(e) - 1;
+            uint32_t pairExit = (uint32_t)((int32_t)(off + 7) + pjump);
+            /* A head's exit leaves the model at the depth it is already at --
+             * the iterator it drops was never in the model. Registering it as
+             * iterExit is what makes the exit stub tell the interpreter to pop
+             * the exhausted iterator off its own stack. */
+            int pairExitDepth = pairHead
+                                    ? (int)stackSignature(e)
+                                    : (int)stackSignatureAt(e, e->depth - 1);
+            if (pairHead) e->iterExit = pairExit;
+
+            if (pairIsDict) {
+                /* iterStepPairFast's ITER_DICT_ITEMS case plus the jaiTableNext
+                 * it calls, inline. Same discipline as the list arm below:
+                 * every guard, and the whole scan, runs before the index is
+                 * written back, so a deopt -- forced or real -- resumes at this
+                 * instruction with the iterator exactly as the interpreter left
+                 * it and re-does the scan. */
+                _Static_assert(sizeof(JaiEntry) == 48,
+                               "the dict-items step scales the order index by "
+                               "hand: slot * 16 * 3");
+                const unsigned tOff = (unsigned)offsetof(ObjDict, table);
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIter,
+                                   (unsigned)offsetof(ObjIter, kind)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_DICT_ITEMS));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIter,
+                                   (unsigned)offsetof(ObjIter, source) + 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                /* A dict that changed under the loop must raise, and only the
+                 * version says so. jaiIterNext owns that message, so the guard
+                 * hands the whole instruction back unadvanced. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, version)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_C, rIter,
+                                   (unsigned)offsetof(ObjIter, version)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_C));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIter,
+                                   (unsigned)offsetof(ObjIter, index)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                   tOff +
+                                       (unsigned)offsetof(JaiTable, orderCount)));
+
+                /* The scan. `order` holds an entry index per insertion
+                 * position, negative where a delete left a hole, so a dict with
+                 * deletions in it costs one extra pass per hole and nothing
+                 * else. orderCount is hoisted because only a mutation can move
+                 * it and the version guard above has already excluded one.
+                 *
+                 * branchToDepth inside a loop is sound only because it settles
+                 * nothing here: the branchOnDeopt three lines up fails the
+                 * compile outright if a deferred value is live, so the settle
+                 * it performs is a no-op and cannot be re-executed. */
+                unsigned scanTop = e->count;
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+                /* The exhausted arm drops the iterator, so the target is
+                 * reached one entry shallower than this branch leaves from. */
+                branchToDepth(e, pairExit, JAI_A64_GE, pairExitDepth);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, order)));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                      JIT_SCRATCH_C, 2));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A, 0));
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 1));
+                /* A hole: the slot is int32 and negative, which after the
+                 * zero-extending load is bit 31 set. Measured against e->count
+                 * so an instruction added above cannot rot the distance. */
+                emit(e, jaiA64Tbnz(JIT_SCRATCH_A, 31,
+                                   (int32_t)scanTop - (int32_t)e->count));
+
+                /* entries + slot * sizeof(JaiEntry): slot << 4, then + itself
+                 * twice over, which is the 48 the assert above pins. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, entries)));
+                emit(e, jaiA64LslX(JIT_SCRATCH_A, JIT_SCRATCH_A, 4));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                      JIT_SCRATCH_A, 1));
+                emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_D, JIT_SCRATCH_A));
+
+                /* Key and value carry the kinds sampled off the first live
+                 * entry; a dict that later holds another kind fails here with
+                 * nothing written. */
+                for (unsigned i = 0; i < 2; i++) {
+                    unsigned at = i == 0 ? (unsigned)offsetof(JaiEntry, key)
+                                         : (unsigned)offsetof(JaiEntry, value);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ptag[i]));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
+
+                /* Past the last guard. The index goes first because localOut
+                 * spends JIT_SCRATCH_C and JIT_SCRATCH_D on a frame-resident
+                 * slot's tag; only JIT_SCRATCH_B survives it. */
+                emit(e, jaiA64StrX(JIT_SCRATCH_C, rIter,
+                                   (unsigned)offsetof(ObjIter, index)));
+                for (unsigned i = 0; i < 2; i++) {
+                    unsigned at = (i == 0 ? (unsigned)offsetof(JaiEntry, key)
+                                          : (unsigned)offsetof(JaiEntry, value))
+                                  + 8u;
+                    /* A bool is one byte (see OP_GET_INDEX) -- the rest of its
+                     * payload word is stale, and a SLOT_BOOL register must hold
+                     * 0 or 1. */
+                    if (pk[i] == SLOT_BOOL) {
+                        emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                    } else {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                    }
+                    localOut(e, i == 0 ? pslotA : pslotB, JIT_SCRATCH_A);
+                }
+                e->wroteHeap = true;
+                off += 7;
+                break;
+            }
 
             /* Really a list iterator, and its source really a list. */
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIter,
@@ -5949,9 +6892,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
             /* The exhausted arm drops the iterator, so the target is reached
              * one entry shallower than this branch leaves from. */
-            branchToDepth(e, (uint32_t)((int32_t)(off + 7) + pjump),
-                          JAI_A64_GE,
-                          (int)stackSignatureAt(e, e->depth - 1));
+            branchToDepth(e, pairExit, JAI_A64_GE, pairExitDepth);
 
             /* items is reloaded rather than hoisted: a reallocation bumps the
              * version, which the guard above covers, and one ldr removes the
@@ -6122,10 +7063,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* One `ldp` for both header fields: `items` at +16, `count`/`capacity` the adjacent int32s at +24, so
              * the pair's second half is `count | capacity << 32` and the bounds test reads it with uxtw -- one instruction per element read (life does nine per cell). */
-            emitListHeader(e, rList, JIT_SCRATCH_C, JIT_SCRATCH_A);
-            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B, true);
+            noteSlotIndexed(e, e->stackLocal[e->depth - 2]);
+            unsigned gItems = JIT_SCRATCH_C, gCount = JIT_SCRATCH_A;
+            int gh = hoistFor(e, e->stackLocal[e->depth - 2]);
+            if (gh >= 0) {
+                gItems = e->hoist[gh].itemsReg;
+                gCount = e->hoist[gh].countReg;
+            } else {
+                emitListHeader(e, rList, gItems, gCount);
+            }
+            emitBoundsNormalise(e, rIdx, gCount, JIT_SCRATCH_B, true);
 
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems,
                                   JIT_SCRATCH_B, 4));
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
@@ -6208,10 +7157,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned rIdx = pushReg(e) - 2;
             unsigned rList = pushReg(e) - 3;
 
-            emitListHeader(e, rList, JIT_SCRATCH_C, JIT_SCRATCH_A);
-            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B, true);
+            noteSlotIndexed(e, e->stackLocal[e->depth - 3]);
+            unsigned sItems = JIT_SCRATCH_C, sCount = JIT_SCRATCH_A;
+            int sh = hoistFor(e, e->stackLocal[e->depth - 3]);
+            if (sh >= 0) {
+                sItems = e->hoist[sh].itemsReg;
+                sCount = e->hoist[sh].countReg;
+            } else {
+                emitListHeader(e, rList, sItems, sCount);
+            }
+            emitBoundsNormalise(e, rIdx, sCount, JIT_SCRATCH_B, true);
 
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, sItems,
                                   JIT_SCRATCH_B, 4));
             emit(e, jaiA64MovzX(JIT_SCRATCH_A, vtag, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
@@ -6517,11 +7474,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 bool toFloat = strcmp(nm, "float") == 0;
                 bool toInt   = strcmp(nm, "int") == 0;
                 if (toFloat && ak == SLOT_INT) {
-                    emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
-                    emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                    /* Straight into the bank, not out through X: what consumes a `float(i)` is a float
+                     * operator, and one reads the bank through fpOperand. Computing into d0 and storing the bits to X cost spectral's inner loop two cross-register-file fmovs per iteration -- the store, and the load the very next instruction made of it. */
+                    unsigned fidx = e->valueDepth - 1;
+                    if (!e->fpOff) {
+                        emit(e, jaiA64ScvtfDX(fpRegAt(e, fidx), ar));
+                        fpClaim(e, fidx);
+                    } else {
+                        emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, ar));
+                        emit(e, jaiA64FmovXD(ar, JIT_FSCRATCH_A));
+                    }
                 } else if (toInt && ak == SLOT_FLOAT) {
-                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_A, ar));
-                    emit(e, jaiA64FcvtzsXD(ar, JIT_FSCRATCH_A));
+                    emit(e, jaiA64FcvtzsXD(ar, fpOperand(e, e->valueDepth - 1)));
                 } else if (!((toFloat && ak == SLOT_FLOAT) ||
                              (toInt && ak == SLOT_INT))) {
                     e->whyNot = "a builtin with no known result kind";
@@ -6550,8 +7514,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return false;
                 }
                 ObjFunction *cfn = AS_CLOSURE(cv)->fn;
-                unsigned rCallee0 = JIT_FIRST_SAVED + regBase(e) +
-                                    (e->usesUpvalues ? 1u : 0u) +
+                unsigned rCallee0 = valueBankBase(e) +
                                     (cidx - (e->depth - e->valueDepth));
 
                 /* The guard comes first now, because what follows it is a
@@ -6627,8 +7590,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
                 }
 
-                unsigned firstArg = JIT_FIRST_SAVED + regBase(e) +
-                                    (e->usesUpvalues ? 1u : 0u) +
+                unsigned firstArg = valueBankBase(e) +
                                     (cidx + 1u - (e->depth - e->valueDepth));
                 for (unsigned i = 0; i < argc; i++) {
                     emit(e, jaiA64MovX(i, firstArg + i));
@@ -6636,6 +7598,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (wantsClosure) emit(e, jaiA64MovX(argc, rCallee));
                 emitConst64(e, JIT_SCRATCH_D,
                             (int64_t)(uintptr_t)cfn->jitFunc);
+                noteScratchClobber(e);
                 emit(e, jaiA64Blr(JIT_SCRATCH_D));
 
                 if (callRoots > 0) {
@@ -6720,8 +7683,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* The arguments sit in the top `argc` value registers, in order.
              * They move to x0.. which nothing else is using. */
-            unsigned first = JIT_FIRST_SAVED + regBase(e) +
-                             (e->usesUpvalues ? 1u : 0u) + e->valueDepth - argc;
+            unsigned first = valueBankBase(e) + e->valueDepth - argc;
             for (unsigned i = 0; i < argc; i++) {
                 emit(e, jaiA64MovX(i, first + i));
             }
@@ -6732,6 +7694,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * locals and the recursion would never terminate. */
             if (!e->sawReturn) e->assumedIntReturn = true;
 
+            noteScratchClobber(e);
             branchTo(e, FIXUP_ENTRY, false, 0);
             e->code[e->count - 1] = jaiA64Bl(0);
             /* Unlink before anything can leave: the bail branch below and every
@@ -6891,12 +7854,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             continue;
         }
     }
-    fpSyncAll(e);
-    settleAll(e);
     /* An inlined body's offsets are the callee's; matching them against the
      * caller's fixups compares two different numbering schemes. There is
      * nothing to check either way -- it has no branches. */
-    if (e->inlining) return !e->failed;
+    if (e->inlining) {
+        /* All but the result, which OP_RETURN deliberately left in the bank for
+         * inlineGlobalCall to carry across. Everything under it is either the
+         * caller's (settled before the call) or about to be discarded. */
+        unsigned keep = e->valueDepth > 0 ? e->valueDepth - 1 : 32u;
+        for (unsigned i = 0; i < 32u; i++) {
+            if (i != keep) fpSyncOne(e, i);
+        }
+        settleAll(e);
+        return !e->failed;
+    }
+    fpSyncAll(e);
+    settleAll(e);
     /* Nothing may branch to an offset this walk carried a float into (see fpCarry) -- declines, and the caller retries with the FP bank off. */
     for (unsigned i = 0; i < e->fpCarryCount; i++) {
         for (unsigned f = 0; f < e->fixupCount; f++) {
@@ -7513,8 +8486,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 valueSeen++;
                 continue;
             }
-            unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
-                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            unsigned reg0 = valueBankBase(&e) + valueSeen;
             /* The stub is reached by a branch from the guard, so the FP bank
              * still holds whatever it held there. Moving it here rather than
              * before the guard is what keeps the hot path free of it. */
@@ -7535,8 +8507,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                          : kind == SLOT_BOOL  ? VAL_BOOL
                          : kind == SLOT_NULL  ? VAL_NULL
                                               : VAL_OBJ;
-            unsigned reg = JIT_FIRST_SAVED + regBase(&e) +
-                           (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            unsigned reg = valueBankBase(&e) + valueSeen;
             valueSeen++;
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
@@ -7609,7 +8580,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         } else if (f->targetOffset == FIXUP_THREW) {
             target = e.exceptionExit;
         } else if (f->targetOffset <= FIXUP_EXIT &&
-                   f->targetOffset > FIXUP_EXIT - 8u) {
+                   f->targetOffset > FIXUP_EXIT - JIT_MAX_EXIT) {
             target = e.exitStub[FIXUP_EXIT - f->targetOffset];
             if (target < 0) {
                 if (getenv("JAI_JIT_WHY")) {
@@ -7952,6 +8923,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.bailBlock = -1;
     e.exceptionExit = -1;
     e.callsOut = true;
+    e.scratchRoom = JIT_SCRATCH_BANK_COUNT;
     e.noInline = noInline;
     e.observed = slots;
     e.offsetToInst = map;
@@ -7988,6 +8960,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
      * must all sit inside the ten callee-saved registers; a first pass
      * measures the last of those, and which slots are named at all, and how
      * often each of them is named inside the innermost loop. */
+    unsigned probeMaxValue = 0;
+    bool probeRan = false;
     {
         static Emit probe;
         memset(&probe, 0, sizeof probe);
@@ -7996,10 +8970,16 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
+        probe.scratchRoom = JIT_SCRATCH_BANK_COUNT;
         probe.offsetToInst = map; probe.offsetToDepth = depths;
         probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
         probe.loopDepth = gLoopDepth;
         probe.loopDepthCount = e.loopDepthCount;
+        /* "Never seen" is an empty range, not offset zero. */
+        for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+            probe.slotWriteLo[i] = UINT32_MAX;
+            probe.slotIndexLo[i] = UINT32_MAX;
+        }
         for (unsigned i = 0; i < e.locals; i++) {
             probe.localKind[i]  = e.localKind[i];
             probe.localShape[i] = e.localShape[i];
@@ -8010,12 +8990,24 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         if (compileBody(&probe, closure) && !probe.failed) {
             unsigned used = probe.maxSlotUsed + 1u;
             if (used < e.locals) e.locals = used;
+            probeMaxValue = probe.maxValue;
+            probeRan = true;
 
+            /* A body that never calls out and never inlines can put its
+             * operand stack in x0..x8 instead of above the locals, and then
+             * the whole callee-saved bank is the locals'. This is the
+             * difference between a five-deep expression leaving room for two
+             * locals and a seven-deep one leaving room for none -- and the
+             * loops that go seven deep are exactly the ones with several rows
+             * or accumulators to keep. */
+            e.scratchValues = !probe.clobbersScratch &&
+                              probe.maxValueAll <= JIT_INL_COUNT;
             /* What is left over after the loop's own reserved registers and
              * the deepest expression the body builds. maxValue is model state,
              * not a register number, so measuring it in memory mode and
              * spending it here is sound. */
-            unsigned overhead = osrReserved(&e) + probe.maxValue;
+            unsigned overhead = osrReserved(&e) +
+                                (e.scratchValues ? 0u : probe.maxValue);
             unsigned availX = overhead < JIT_MAX_SAVED
                                   ? JIT_MAX_SAVED - overhead : 0u;
             unsigned availFp = JIT_FP_MAX_SAVED;
@@ -8051,6 +9043,35 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                     e.slotXReg[slot] = (uint8_t)(JIT_FIRST_SAVED +
                                                  osrReserved(&e) + e.xLocals++);
                     availX--;
+                }
+            }
+
+            /* What planHoists needs: where each slot was written and where it
+             * was subscripted, and the registers nothing else claims. The pool
+             * exists only for a body that calls nothing -- which is also the
+             * condition that makes a hoisted header sound (see planHoists). */
+            e.bodyCalls = probe.clobbersScratch;
+            for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+                e.slotWriteLo[i]  = probe.slotWriteLo[i];
+                e.slotWriteHi[i]  = probe.slotWriteHi[i];
+                e.slotIndexLo[i]  = probe.slotIndexLo[i];
+                e.slotIndexHi[i]  = probe.slotIndexHi[i];
+                e.slotIndexUse[i] = probe.slotIndexUse[i];
+            }
+            if (!e.bodyCalls) {
+                for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
+                    e.hoistPool[e.hoistPoolCount++] =
+                        (uint8_t)(JIT_FREE_FIRST + r);
+                }
+                /* Whatever the operand stack left at the top of its own bank.
+                 * Only when it IS that bank -- otherwise an inlined body has
+                 * x0..x8 to itself and none of it is spare. */
+                if (e.scratchValues) {
+                    for (unsigned r = probe.maxValueAll;
+                         r < JIT_SCRATCH_BANK_COUNT; r++) {
+                        e.hoistPool[e.hoistPoolCount++] =
+                            (uint8_t)(JIT_INL_BANK + r);
+                    }
                 }
             }
         }
@@ -8091,7 +9112,12 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             emit(&e, jaiA64LdrD(e.slotFpReg[i], JIT_SLOTS_REG, i * 16u + 8u));
         }
     }
-    if (hasIter) {
+    if (hasIter && iterKind == 3) {
+        /* A dict-items head keeps only the pointer: its index, limit and
+         * version all live in the ObjIter and the step reads them there, so
+         * there is nothing to hoist here and nothing to write back at an exit. */
+        emit(&e, jaiA64MovX(JIT_PAIR_ITER_REG, 1));
+    } else if (hasIter) {
         /* x1 is the iterator on entry. A range head reads everything it wants
          * out of it here and parks the pointer in the frame; a list head keeps
          * it, because its version guard reads the iterator every iteration. */
@@ -8124,8 +9150,35 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
 
+    planHoists(&e, fn);
+    if (getenv("JAI_JIT_WHY")) {
+        for (unsigned i = 0; i < e.hoistCount; i++) {
+            fprintf(stderr,
+                    "[jit] osr at %u hoists slot %u's header out of %u..%u "
+                    "into x%u/x%u\n",
+                    top, e.hoist[i].slot, e.hoist[i].top, e.hoist[i].end,
+                    e.hoist[i].itemsReg, e.hoist[i].countReg);
+        }
+    }
+
     if (!compileBody(&e, closure) || e.failed) {
         if (getenv("JAI_JIT_WHY")) {
+            /* The register arithmetic, not just the verdict: a "more live
+             * values" decline is unreadable without knowing how many the head
+             * reserved, how deep the body went and which bank it was using --
+             * the shortfall is those three against JIT_MAX_SAVED. Its own
+             * line, and without the words the decline census greps for, so
+             * that adding it cannot invent census entries.
+             *
+             * Only when the measuring pass got through: a loop that declined
+             * for some other reason never reached the register plan, and
+             * printing its zeroed numbers reads as "nought entries deep",
+             * which is a different and false claim. */
+            if (probeRan) fprintf(stderr,
+                    "[jit] osr at %u registers: %u reserved, %u stack, "
+                    "%u x-locals, bank %s, of %u\n",
+                    top, osrReserved(&e), probeMaxValue, e.xLocals,
+                    e.scratchValues ? "x0" : "callee-saved", JIT_MAX_SAVED);
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
                     e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
         }
@@ -8134,14 +9187,17 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
     /* Falling off the end of the compiled range is the loop exiting there. */
-    if (e.exitCount >= 8) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.exitCount >= JIT_MAX_EXIT) { jitFree(map, depths, fn->chunk.count + 1); return false; }
 
 /* Every way out writes back what the loop was holding: the iterator's index,
  * and the locals if they were living in registers. Miss one and the
  * interpreter carries on from stale values. */
 #define OSR_SYNC_ITER()                                                        \
     do {                                                                       \
-        if (hasIter) {                                                         \
+        /* iterKind 3 keeps nothing in a register but the pointer, and the step \
+         * has already stored the index it advanced -- so every way out of a    \
+         * dict-items loop finds the ObjIter already current. */                \
+        if (hasIter && iterKind != 3) {                                        \
             /* A range head left the iterator in the frame rather than in a    \
              * register, so it comes back here. Every stub this expands into   \
              * is a way out of the loop, so the load is off the hot path and   \
@@ -8271,8 +9327,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 valueSeen++;
                 continue;
             }
-            unsigned reg0 = JIT_FIRST_SAVED + regBase(&e) +
-                            (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            unsigned reg0 = valueBankBase(&e) + valueSeen;
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
                 emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
             }
@@ -8289,8 +9344,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                          : kind == SLOT_BOOL  ? VAL_BOOL
                          : kind == SLOT_NULL  ? VAL_NULL
                                               : VAL_OBJ;
-            unsigned reg = JIT_FIRST_SAVED + regBase(&e) +
-                           (e.usesUpvalues ? 1u : 0u) + valueSeen;
+            unsigned reg = valueBankBase(&e) + valueSeen;
             valueSeen++;
             emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
@@ -8314,7 +9368,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         int target;
         if (f->targetOffset == FIXUP_BAIL) target = e.bailBlock;
         else if (f->targetOffset == FIXUP_THREW) target = e.exceptionExit;
-        else if (f->targetOffset <= FIXUP_EXIT && f->targetOffset > FIXUP_EXIT - 8u)
+        else if (f->targetOffset <= FIXUP_EXIT &&
+                 f->targetOffset > FIXUP_EXIT - JIT_MAX_EXIT)
             target = e.exitStub[FIXUP_EXIT - f->targetOffset];
         else if (f->targetOffset <= FIXUP_SELFSLOW &&
                  f->targetOffset > FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)
@@ -8434,8 +9489,11 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     /* A for-loop head keeps its iterator on the stack. Only a range from zero
      * in unit steps is taken, because that is what makes the yielded value the
      * index and lets the body run against a plain counter. */
-    bool hasIter = top < (uint32_t)fn->chunk.count &&
-                   fn->chunk.code[top] == OP_FOR_ITER_BIND;
+    bool pairTop = top < (uint32_t)fn->chunk.count &&
+                   fn->chunk.code[top] == OP_FOR_ITER_PAIR;
+    bool hasIter = pairTop ||
+                   (top < (uint32_t)fn->chunk.count &&
+                    fn->chunk.code[top] == OP_FOR_ITER_BIND);
     ObjIter *iter = NULL;
     uint8_t iterKind = 0;
     Value elemSample = NULL_VAL;
@@ -8444,7 +9502,19 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         Value it = vm.stackTop[-1];
         if (!IS_ITER(it)) return 0;
         iter = AS_ITER(it);
-        if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
+        if (pairTop) {
+            /* `for (k, v) in d.items()` at the top of the loop being entered.
+             * Only the lazy dict view: a pair loop over a LIST of tuples has no
+             * head arm, and letting it through here would enter a form compiled
+             * for a dict with an ObjList in the register. The sample is the
+             * dict itself -- the head arm reads the first live entry out of it
+             * for the component kinds, as the list head reads items[index]. */
+            if (iter->kind != ITER_DICT_ITEMS || !IS_DICT(iter->source)) {
+                return 0;
+            }
+            elemSample = iter->source;
+            iterKind = 3;
+        } else if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
             /* Unit steps only -- that is what makes the yielded value start
              * plus the index. The start need not be 0; it is loaded at entry. */
             if (AS_RANGE(iter->source)->step != 1) return 0;

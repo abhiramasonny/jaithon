@@ -1,6 +1,7 @@
 #ifndef JAI_VM_JIT_H
 #define JAI_VM_JIT_H
 
+#include "vm/bytecode/chunk.h"
 #include "vm/object/object.h"
 
 /* The compiled tier: an accelerator that may always decline -- jaiJitEnter
@@ -10,6 +11,14 @@
  * enough the counter costs nothing on cold code and low enough a benchmark
  * reaches it. */
 #define JAI_JIT_THRESHOLD 64
+
+/* An inline cache's observation window is meant to close before the tier first
+ * asks what a site returns; a window that outlived the threshold would hand the
+ * tier a half-formed record, which is the "first observation" failure this
+ * whole mechanism exists to avoid. chunk.h states the intent and cannot see
+ * this constant, so the two are tied here. */
+_Static_assert(JAI_IC_OBS_BUDGET <= JAI_JIT_THRESHOLD,
+               "an inline cache must settle before the tier reads it");
 
 /* Called on entry to a Jaithon function once it has crossed the threshold.
  *

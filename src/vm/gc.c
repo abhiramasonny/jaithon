@@ -24,7 +24,16 @@ void jaiGCSyncLimit(void) {
                      : 0;
 }
 
-static bool gcStressOn(const GCState *g)  { return g->stress  || vm.gcStress; }
+/* Non-const: it advances the cadence counter. Called once per allocation on
+ * the slow path, which stress mode pins open by holding jaiGCLimit at zero. */
+static bool gcStressDue(GCState *g) {
+    if (!(g->stress || vm.gcStress)) return false;
+    unsigned every = g->stressEvery ? g->stressEvery : vm.gcStressEvery;
+    if (every <= 1) return true;
+    if (++g->stressTick < every) return false;
+    g->stressTick = 0;
+    return true;
+}
 static bool gcVerboseOn(const GCState *g) { return g->verbose || vm.debugGC; }
 
 static size_t gcLiveBytes(const GCState *g) { (void)g; return jaiHeapBytes; }
@@ -494,6 +503,7 @@ void jaiGCCollect(void) {
 
     JaiTable *interned = jaiInternTable();
     if (interned != NULL) jaiTableRemoveWhite(interned);
+    jaiMethodCacheRemoveWhite();
 #ifdef JAI_ALLOC_CENSUS
     double t2 = jaiClockMonotonic();
 #endif
@@ -529,7 +539,7 @@ void jaiGCCollect(void) {
 void jaiGCMaybeCollect(void) {
     GCState *g = activeGC();
     if (g == NULL || !g->enabled || jaiGCInCollect) return;
-    if (gcStressOn(g) || gcLiveBytes(g) > g->nextGC) jaiGCCollect();
+    if (gcStressDue(g) || gcLiveBytes(g) > g->nextGC) jaiGCCollect();
 }
 
 static void jaiGCGrowRoots(void);
