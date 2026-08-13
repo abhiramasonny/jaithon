@@ -3204,6 +3204,87 @@ JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
     }
 }
 
+/* The same step for a loop that binds a PAIR, `for (a, b) in …`. Two things
+ * are different and both are the point of OP_FOR_ITER_PAIR.
+ *
+ * A dict-items iterator is served here rather than declared slow: it is the
+ * one built-in kind whose item does not exist until jaiIterNext builds it, and
+ * building it is pure cost when the very next instruction takes it apart
+ * again. Walking the table writes key and value straight out. Nothing here
+ * allocates, calls or throws, so no SAVE_STATE is owed -- jaiTableNext only
+ * scans the order array.
+ *
+ * Every other kind produces its item the ordinary way and the item is split in
+ * place, so a list of pairs or a user iterator costs exactly what it did.
+ * PAIR_STEP_BAD is separate from PAIR_STEP_SLOW because the step has already
+ * advanced by then: retrying it on the slow path would skip an entry before
+ * raising. The caller raises from `*a` instead. */
+typedef enum {
+    PAIR_STEP_DONE, PAIR_STEP_VALUE, PAIR_STEP_BAD, PAIR_STEP_SLOW
+} PairStep;
+
+JAI_INLINE bool pairSplit(Value item, Value *a, Value *b) {
+    if (IS_TUPLE(item)) {
+        ObjTuple *const tuple = AS_TUPLE(item);
+        if (tuple->count != 2) return false;
+        *a = tuple->items[0];
+        *b = tuple->items[1];
+        return true;
+    }
+    if (IS_LIST(item)) {
+        ObjList *const list = AS_LIST(item);
+        if (list->count != 2) return false;
+        *a = list->items[0];
+        *b = list->items[1];
+        return true;
+    }
+    return false;
+}
+
+/* Word for word what `UNPACK 2 255` raises for `item`, because that is the
+ * sequence this replaces and an optimisation may not change a message. */
+static bool pairSplitFail(Value item) {
+    if (!IS_LIST(item) && !IS_TUPLE(item)) {
+        return jaiThrow(vm.cTypeError, "cannot destructure a '%s' value",
+                        jaiTypeNameStatic(item));
+    }
+    const int available = IS_LIST(item) ? AS_LIST(item)->count
+                                        : (int)AS_TUPLE(item)->count;
+    return jaiThrow(vm.cValueError, "cannot unpack %d value%s into 2 targets",
+                    available, available == 1 ? "" : "s");
+}
+
+JAI_INLINE PairStep iterStepPairFast(ObjIter *it, Value *a, Value *b) {
+    if (it->kind == ITER_DICT_ITEMS) {
+        /* A dict that changed under the loop must raise, and jaiIterNext is
+         * where that message lives; hand it over untouched and unadvanced. */
+        JaiTable *const table = &AS_DICT(it->source)->table;
+        if (JAI_UNLIKELY(table->version != it->version)) return PAIR_STEP_SLOW;
+
+        int slot = (int)it->index;
+        Value key, value;
+        if (!jaiTableNext(table, &slot, &key, &value)) {
+            it->index = slot;
+            return PAIR_STEP_DONE;
+        }
+        it->index = slot;
+        *a = key;
+        *b = value;
+        return PAIR_STEP_VALUE;
+    }
+
+    Value item;
+    switch (iterStepFast(it, &item)) {
+    case ITER_STEP_VALUE:
+        return pairSplit(item, a, b) ? PAIR_STEP_VALUE
+                                     : (*a = item, PAIR_STEP_BAD);
+    case ITER_STEP_DONE:
+        return PAIR_STEP_DONE;
+    default:
+        return PAIR_STEP_SLOW;
+    }
+}
+
 #define READ_BYTE()  (*ip++)
 #define READ_I8()    ((int8_t)*ip++)
 #define READ_U16()   (ip += 2, jaiReadU16(ip - 2))
@@ -3380,6 +3461,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_MUL_BIND]           = &&L_OP_MUL_BIND,
         [OP_ELEM_KIND]          = &&L_OP_ELEM_KIND,
         [OP_GET_ITER_ITEMS]     = &&L_OP_GET_ITER_ITEMS,
+        [OP_FOR_ITER_PAIR]      = &&L_OP_FOR_ITER_PAIR,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -4254,6 +4336,57 @@ static JaiRunResult runLoop(int baseFrameCount) {
         /* `slots` is reloaded above: jaiIterNext can re-enter the VM through a
          * user __next__ and grow the value stack, moving every frame window. */
         slots[slot] = item;
+        VM_NEXT();
+    }
+
+    /* FOR_ITER J; UNPACK 2 255; BIND A; BIND B fused (spec §3.3):
+     * `for (a, b) in …` in one instruction and, on a dict, with no pair object
+     * built at all. See OP_FOR_ITER_PAIR in chunk.h for what that is worth. */
+    VM_CASE(OP_FOR_ITER_PAIR): {
+        int16_t  offset = READ_I16();
+        uint16_t slotA  = READ_U16();
+        uint16_t slotB  = READ_U16();
+        Value iterator = PEEK(0);
+        if (!IS_ITER(iterator)) {
+            THROW(vm.cTypeError, "for-loop expected an iterator, not '%s'",
+                  jaiTypeNameStatic(iterator));
+        }
+        Value a, b;
+        PairStep step = iterStepPairFast(AS_ITER(iterator), &a, &b);
+        if (JAI_LIKELY(step == PAIR_STEP_VALUE)) {
+            slots[slotA] = a;
+            slots[slotB] = b;
+            VM_NEXT();
+        }
+        if (step == PAIR_STEP_DONE) {
+            DROP(1);
+            ip += offset;
+            VM_NEXT();
+        }
+        if (step == PAIR_STEP_BAD) {
+            SAVE_STATE();
+            (void)pairSplitFail(a);
+            goto vmThrow;
+        }
+        SAVE_STATE();
+        Value item;
+        bool advanced = jaiIterNext(AS_ITER(iterator), &item);
+        if (!advanced && vm.hasException) goto vmThrow;
+        LOAD_STATE();
+        if (!advanced) {
+            DROP(1);            /* exhausted: the iterator goes with the loop */
+            ip += offset;
+            VM_NEXT();
+        }
+        if (!pairSplit(item, &a, &b)) {
+            SAVE_STATE();
+            (void)pairSplitFail(item);
+            goto vmThrow;
+        }
+        /* `slots` is reloaded above: jaiIterNext can re-enter the VM through a
+         * user __next__ and grow the value stack, moving every frame window. */
+        slots[slotA] = a;
+        slots[slotB] = b;
         VM_NEXT();
     }
 

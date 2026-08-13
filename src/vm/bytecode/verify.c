@@ -24,6 +24,7 @@ int jaiOpBranchOperandAt(uint8_t op) {
     case OP_LOOP:
     case OP_FOR_ITER:
     case OP_FOR_ITER_BIND:
+    case OP_FOR_ITER_PAIR:
     /* Branches past the ordinary `INVOKE items; GET_ITER` when its receiver
      * turns out to be a dict. Missing from this list when the opcode landed,
      * which left the verifier unable to see the edge at all. */
@@ -90,6 +91,10 @@ static int slotOperands(uint8_t op, int *out) {
     case OP_FOR_ITER_BIND:
         out[0] = 2;   /* the slot follows the i16 jump */
         return 1;
+    case OP_FOR_ITER_PAIR:
+        out[0] = 2;   /* both slots follow the i16 jump */
+        out[1] = 4;
+        return 2;
     case OP_JUMP_IF_CMP_LOCAL_K:
         out[0] = 1;   /* the slot follows the u8 comparison */
         return 1;
@@ -560,6 +565,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
                     break;
                 case OP_FOR_ITER:
                 case OP_FOR_ITER_BIND:
+                case OP_FOR_ITER_PAIR:
                     /* Exhaustion pops the iterator and leaves the loop. */
                     jumpDepth = here - 1;
                     break;

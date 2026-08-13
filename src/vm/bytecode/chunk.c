@@ -175,7 +175,9 @@
     /* container element type, stamped onto the value on top (§3.6) */         \
     X(OP_ELEM_KIND,            1,  0)                                          \
     /* `for … in X.items()`: X -> an iterator over its pairs (§3.4) */         \
-    X(OP_GET_ITER_ITEMS,       2,  0)
+    X(OP_GET_ITER_ITEMS,       2,  0)                                          \
+    /* `for (a, b) in …` fused, with no pair object in between (§3.3) */       \
+    X(OP_FOR_ITER_PAIR,        6,  0)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),
@@ -1200,6 +1202,17 @@ int jaiDisassembleInstruction(FILE *out, const Chunk *chunk, int offset) {
         snprintf(operands, sizeof operands, "%+d %u", (int)j, slot);
         snprintf(note, sizeof note, "-> slot %u, exhausted -> %04d", slot,
                  jumpTarget(offset, size, j));
+        break;
+    }
+
+    /* --- i16 jump + two u16 local slots --- */
+    case OP_FOR_ITER_PAIR: {
+        int16_t j = jaiReadI16(a);
+        unsigned slotA = jaiReadU16(a + 2);
+        unsigned slotB = jaiReadU16(a + 4);
+        snprintf(operands, sizeof operands, "%+d %u %u", (int)j, slotA, slotB);
+        snprintf(note, sizeof note, "-> slots %u, %u, exhausted -> %04d",
+                 slotA, slotB, jumpTarget(offset, size, j));
         break;
     }
 
