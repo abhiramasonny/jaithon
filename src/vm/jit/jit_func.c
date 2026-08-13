@@ -5032,7 +5032,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (rkind == SLOT_INST) {
                     /* "an object" is not "an object of this class", and a
                      * method entered with another specialisation runs
-                     * interpreted and may return either. */
+                     * interpreted and may return either. The object TYPE goes
+                     * first: VAL_OBJ is every heap object, so a method that
+                     * returned a string here would have `klass` read one word
+                     * past its header and the shape loaded through whatever was
+                     * there -- a segfault, reachable from ordinary code. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
                     emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
                                        (unsigned)offsetof(ObjInstance, klass)));
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
