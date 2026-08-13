@@ -106,9 +106,24 @@ typedef struct {
     int64_t base;
     int64_t nlocals;
     int64_t nstack;
+    /* Bit i: local i is NOT described by this record and must be left as the
+     * frame already has it. SLOT_OPAQUE means "the compiled body never reads
+     * this slot", which jitArgIn relies on to pass a raw 0 for an argument of
+     * a kind the tier has no register for -- but a DEOPT hands the frame to
+     * the interpreter, and the interpreter does read it. Writing the record's
+     * null over it turned `enter_foreign(module)` into `enter_foreign(null)`
+     * and the whole compiler then failed to resolve an imported type.
+     * bindCallArgs runs before jaiJitApplyDeopt at every call site, so the
+     * real argument is already there; the fix is to not touch it.
+     * The OSR tier has always got this right -- OSR_SYNC_ITER skips a slot
+     * whose tag is VAL_NULL -- which is why only the function tier was wrong. */
+    int64_t skipLocals;
     Value   locals[JIT_MAX_SLOTS + 1];
     Value   stack[JIT_MAX_STACK + 1];
 } JitDeoptRecord;
+
+_Static_assert(JIT_MAX_SLOTS <= 64,
+               "skipLocals is one bit per local slot");
 
 static JitDeoptRecord gDeopt;
 
@@ -128,6 +143,7 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     if (gDeopt.ip < 0 || gDeopt.ip >= fn->chunk.count) return false;
 
     for (int64_t i = 0; i < gDeopt.nlocals; i++) {
+        if (i < 64 && (((uint64_t)gDeopt.skipLocals >> i) & 1u) != 0) continue;
         slotBase[gDeopt.base + i] = gDeopt.locals[i];
     }
     /* The operand stack sits above the frame's window, which bindCallArgs has
@@ -7327,9 +7343,20 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         e.deopt[k].stub = (int)e.count;
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
 
+        uint64_t skipLocals = 0;
         for (unsigned i = 0; i < (e.osr ? 0u : e.locals); i++) {
             unsigned slot = e.base + i;
             SlotKind kind = e.localKind[slot];
+            /* An opaque slot is one the compiled body never reads, so the tier
+             * never learned what is in it -- and jitArgIn passed a raw 0 for
+             * it. The interpreter this record hands over to DOES read it, and
+             * bindCallArgs has already put the caller's real argument in the
+             * frame, so the record must say "not mine" rather than null.
+             * See JitDeoptRecord::skipLocals. */
+            if (kind == SLOT_OPAQUE) {
+                skipLocals |= (uint64_t)1 << i;
+                continue;
+            }
             /* Only an opaque slot is null; everything else non-scalar is an object. Listing object kinds
              * explicitly instead once wrote a SLOT_OBJ local (string/dict/closure) out as null on every deopt -- invisible until a body holding one could compile and then actually deopt. */
             unsigned tag = kind == SLOT_INT    ? VAL_INT
@@ -7387,6 +7414,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
             emit(&e, jaiA64StrX(pr, JIT_SCRATCH_A, at + 8));
         }
+        /* Written unconditionally, including the zero: gDeopt is one global and
+         * a mask left over from another function's stub would silently drop a
+         * local this one does describe. */
+        emitConst64(&e, JIT_SCRATCH_B, (int64_t)skipLocals);
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, skipLocals)));
 
         unsigned valueSeen = 0;
         for (unsigned i = 0; i < e.deopt[k].depth; i++) {
@@ -8466,6 +8499,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     gDeopt.nstack = 0;
     gDeopt.base = 0;
+    /* An OSR form's locals ARE the frame slots and its stub writes none, so
+     * nothing here fills the mask -- clear it rather than leave the last
+     * function-tier stub's behind for whoever reads the record next. */
+    gDeopt.skipLocals = 0;
     int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
     if (at == -1) return 0;
     if (at == -2) return 2;              /* an exception is pending */
