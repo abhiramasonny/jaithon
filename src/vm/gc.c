@@ -118,9 +118,24 @@ void jaiGCEnable(bool enabled) {
 
 //marking
 
+/* The collector half of the allocation census (see object.c); same build.
+ *
+ * `total pause` alone says a collection is expensive without saying which of
+ * its three phases is. Split, it says the same thing on every benchmark that
+ * allocates: the sweep is 80-95% of the pause, 94-98% of the objects it visits
+ * are corpses, and it costs ~2.75ns each. That is the number any nursery
+ * proposal has to be priced against, so it is worth being able to re-derive. */
+#ifdef JAI_ALLOC_CENSUS
+uint64_t jaiGCMarked, jaiGCSwept, jaiGCSweptDead;
+double   jaiGCMarkSec, jaiGCInternSec, jaiGCSweepSec;
+#endif
+
 void jaiGCMarkObject(Obj *obj) {
     if (obj == NULL || obj->isMarked) return;
     obj->isMarked = true;
+#ifdef JAI_ALLOC_CENSUS
+    jaiGCMarked++;
+#endif
 
     switch (obj->type) {
     case OBJ_STRING: {
@@ -411,10 +426,15 @@ static void traceReferences(GCState *g) {
 
 static int sweep(GCState *g) {
     int freedObjects = 0;
+    size_t freedBytes = 0;
     Obj *previous = NULL;
     Obj *object = g->objects;
 
     while (object != NULL) {
+#ifdef JAI_ALLOC_CENSUS
+        jaiGCSwept++;
+        if (!object->isMarked) jaiGCSweptDead++;
+#endif
         if (object->isMarked) {
             object->isMarked = false; //white again for the next cycle
             previous = object;
@@ -429,9 +449,24 @@ static int sweep(GCState *g) {
         } else {
             g->objects = object;
         }
-        jaiFreeObject(unreached);
+        /* The overwhelming majority of what a sweep frees owns nothing but its
+         * own block -- 94-98% of the objects it visits are corpses on every
+         * benchmark that allocates, and they are instances, strings, tuples,
+         * iterators and ranges. Those go straight onto the bin here rather
+         * than through jaiFreeObject, which is 550 instructions and saves six
+         * register pairs on entry it does not need for any of them.
+         * jaiObjSoleBlock is the same size jaiFreeObject would have used. */
+        size_t sole = jaiObjSoleBlock(unreached);
+        if (JAI_LIKELY(sole != 0 && jaiSmallServes(sole))) {
+            jaiSmallDeleteUnaccounted(unreached, sole);
+            freedBytes += sole;   /* charged once, after the loop */
+        } else {
+            jaiFreeObject(unreached);
+        }
         freedObjects++;
     }
+
+    jaiHeapAccountFreed(freedBytes);
     return freedObjects;
 }
 
@@ -448,13 +483,28 @@ void jaiGCCollect(void) {
     size_t before = gcLiveBytes(g);
     if (verbose) fprintf(stderr, "-- gc begin\n");
 
+#ifdef JAI_ALLOC_CENSUS
+    double t0 = jaiClockMonotonic();
+#endif
     markRoots(g);
     traceReferences(g);
+#ifdef JAI_ALLOC_CENSUS
+    double t1 = jaiClockMonotonic();
+#endif
 
     JaiTable *interned = jaiInternTable();
     if (interned != NULL) jaiTableRemoveWhite(interned);
+#ifdef JAI_ALLOC_CENSUS
+    double t2 = jaiClockMonotonic();
+#endif
 
     int freedObjects = sweep(g);
+#ifdef JAI_ALLOC_CENSUS
+    double t3 = jaiClockMonotonic();
+    jaiGCMarkSec += t1 - t0;
+    jaiGCInternSec += t2 - t1;
+    jaiGCSweepSec += t3 - t2;
+#endif
 
     size_t after = gcLiveBytes(g);
     size_t freedBytes = before > after ? before - after : 0;
@@ -575,6 +625,14 @@ void jaiGCPrintStats(FILE *out) {
             (unsigned long long)g->totalFreed);
     fprintf(out, "  total pause     : %.3f ms\n", totalMs);
     fprintf(out, "  average pause   : %.3f ms\n", averageMs);
+#ifdef JAI_ALLOC_CENSUS
+    fprintf(out, "  marked total    : %llu\n", (unsigned long long)jaiGCMarked);
+    fprintf(out, "  swept total     : %llu\n", (unsigned long long)jaiGCSwept);
+    fprintf(out, "  swept dead      : %llu\n", (unsigned long long)jaiGCSweptDead);
+    fprintf(out, "  mark ms         : %.3f\n", jaiGCMarkSec * 1000.0);
+    fprintf(out, "  intern ms       : %.3f\n", jaiGCInternSec * 1000.0);
+    fprintf(out, "  sweep ms        : %.3f\n", jaiGCSweepSec * 1000.0);
+#endif
     fprintf(out, "  gray capacity   : %d\n", g->grayCapacity);
     fprintf(out, "  temp roots      : %d\n", g->tempRootCount);
 }
