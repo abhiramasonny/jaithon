@@ -1713,6 +1713,28 @@ static bool jitDeoptStress(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_SPLIT_STRESS=1 puts the split bank's boundary into every OSR body
+ * that can take one, instead of only the ones that pay for it -- the same idea
+ * as JAITHON_JIT_DEOPT_STRESS, for the same reason.
+ *
+ * A split makes the operand stack two runs of registers instead of one, and the
+ * failure mode is a site that adds an index to a base and lands one past the
+ * end of the first run. That is silent: the value is written to a register
+ * nothing reads. It shipped once already -- OP_GET_GLOBAL wrote through
+ * `pushReg`, one past the CURRENT top rather than the register the next push
+ * lands in, and bitops printed 68720029766 for 999625 on the runs where its
+ * loop compiled. It was found by the benchmark differential because bitops
+ * happened to be split-eligible AND to read a global at exactly the boundary.
+ * Under this flag it would have been found by any of them. */
+static bool jitSplitStress(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SPLIT_STRESS");
+        cached = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 /* Neither an inline's state nor mid-instruction state is the model's actual current state. Inside an
  * inline the interpreter hasn't made the call yet, so it resumes at OP_CALL holding just callee+args, not the inlined body's locals/temporaries. Outside one, a guard mid-instruction (OP_GET_LOCAL2 pushes then guards) leaves the model deeper than the interpreter's stack there -- handing over those extra entries strands them, and a loop can read its own iterator as its loop variable. `instDepth` is the model at the instruction's START, matching the interpreter; only entries THIS instruction pushed (the topmost) may be trimmed back to it -- an instruction that already popped something the interpreter still holds cannot be repaired and is refused. */
 static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
@@ -8863,6 +8885,10 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
              * or accumulators to keep. */
             e.scratchValues = !probe.clobbersScratch &&
                               probe.maxValueAll <= JIT_INL_COUNT;
+            /* Under split stress the split is preferred to the whole-scratch
+             * bank, because it is the two-run layout that has the boundary in
+             * it and the whole-scratch one does not. */
+            if (jitSplitStress()) e.scratchValues = false;
             /* A body that DOES call still need not keep its WHOLE stack in the
              * callee-saved bank -- only the part of it that can be live while
              * a helper runs, which is everything below the deepest the stack
@@ -8876,10 +8902,18 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
              * Not offered to the function tier either, which does not run this
              * code -- x0..x3 are its arguments and the roadmap prices the same
              * change there at +-1%. */
-            if (!e.scratchValues && probe.clobbersScratch && !probe.inlined &&
-                probe.maxValue > probe.clobberDepth &&
-                probe.maxValue - probe.clobberDepth <= JIT_SCRATCH_BANK_COUNT) {
-                e.splitAt = probe.clobberDepth;
+            unsigned wantSplit = probe.clobberDepth;
+            /* Stress: a body with no calls at all has clobberDepth 0, and a
+             * split at 0 is no split. Moving the boundary up to 1 is still
+             * sound there -- nothing can clobber x0..x8 in a body that never
+             * calls -- and it is what puts the two-run layout under every
+             * existing gate rather than under the few bodies that want it. */
+            if (jitSplitStress() && wantSplit == 0) wantSplit = 1;
+            if (!e.scratchValues && !probe.inlined &&
+                (probe.clobbersScratch || jitSplitStress()) &&
+                probe.maxValue > wantSplit &&
+                probe.maxValue - wantSplit <= JIT_SCRATCH_BANK_COUNT) {
+                e.splitAt = wantSplit;
             }
             /* What is left over after the loop's own reserved registers and
              * the deepest expression the body builds. maxValue is model state,
