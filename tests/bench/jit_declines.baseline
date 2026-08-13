@@ -1,6 +1,3 @@
-declined at OP_BUILD_DICT
-declined at OP_GET_EXC
-stopped : OP_BUILD_DICT
 stopped : OP_GET_LOCAL
 stopped : OP_INVOKE
 stopped : OP_LT
@@ -11,7 +8,6 @@ stopped : iterating a list with nothing to look at
 stopped : loop variable took two kinds
 stopped: OP_CALL
 stopped: OP_FOR_ITER_PAIR
-stopped: OP_GET_EXC
 stopped: OP_INVOKE
 stopped: OP_LT
 stopped: add-bind of a kind that is neither int nor float
