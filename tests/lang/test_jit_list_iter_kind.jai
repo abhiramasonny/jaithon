@@ -24,6 +24,10 @@
 #: `JAITHON_NO_JIT=1` proves the expectations and the plain run proves the
 #: compiled code agrees. A deopt does not retire compiled code, so one summing
 #: function keeps its teeth across all of them.
+#:
+#: total/total_f/count are the guarded loop bodies; scripts/jit_compile_check.py
+#: fails if any of them stops reaching the compiled tier under JAI_JIT_WHY=1.
+# jit-compiles: total, total_f, count
 from std.test import assert_eq, assert_near, assert_throws
 
 class Marker {

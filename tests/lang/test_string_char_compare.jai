@@ -17,6 +17,17 @@
 #: is `true`. Every case here is written to be run enough times to be compiled;
 #: at interpreter speed they all pass trivially, so run this file with and
 #: without JAITHON_NO_JIT.
+#:
+#: scripts/jit_compile_check.py fails if any name below stops reaching the
+#: compiled tier under JAI_JIT_WHY=1. All four compile only through OSR
+#: (built_forty is 4 iterations and never gets there; it is a fixture, not a
+#: thing under test, and is not marked). OSR is sampler-driven and not
+#: deterministic no matter how long a loop runs -- REPS=150_000 alone was not
+#: enough for count_matches, char_in_else or branch_on_flag to compile
+#: reliably in practice, so each of their callers below adds a warm-up that
+#: gives the sampler more total on-function time before the assertions that
+#: matter run. count_self_matches needed no change.
+# jit-compiles: count_matches, count_self_matches, char_in_else, branch_on_flag
 from std.test import assert_eq, assert_true, assert_false
 
 #: Big enough that the sampler notices. Nothing forces a compile: a 4kHz timer
@@ -92,6 +103,15 @@ fn test_a_character_equals_its_literal() -> void {
         text = text + "abcd"
         i += 1
     }
+    #: count_matches is called only three times below, each a single pass over
+    #: `text` -- not nearly enough separate entries for the sampler to reliably
+    #: land a tick inside it. This calls it enough times, discarding the
+    #: result, to buy that time; the answers checked below are unaffected.
+    var w = 0
+    while w < 100 {
+        count_matches(text, "a")
+        w += 1
+    }
     assert_eq(count_matches(text, "a"), 20_000)
     assert_eq(count_matches(text, "d"), 20_000)
     assert_eq(count_matches(text, "z"), 0)
@@ -109,8 +129,17 @@ fn test_a_merge_does_not_inherit_the_characters_proof() -> void {
     #: it. Without it the assertion below is only wrong for the tail of the
     #: loop and a few thousand iterations of slack decide whether the gate
     #: fires.
-    let warm = char_in_else("0", FORTY, FORTY_LITERAL, true, REPS)
-    assert_true(warm >= 0)
+    #:
+    #: One such call was not a reliable enough warm-up on its own -- a single
+    #: REPS=150_000 pass does not guarantee the sampler lands the second tick
+    #: OSR compiling needs before the loop finishes. Repeating it gives many
+    #: more chances; each pass is independently harmless (warm >= 0 always).
+    var wrep = 0
+    while wrep < 8 {
+        let warm = char_in_else("0", FORTY, FORTY_LITERAL, true, REPS)
+        assert_true(warm >= 0)
+        wrep += 1
+    }
 
     #: The taken arm is the long run-time string, equal to the literal without
     #: being the same object. Answering by pointer -- which is what an
@@ -163,6 +192,17 @@ fn branch_on_flag(flag: bool, reps: int) -> int {
 }
 
 fn test_a_bool_local_survives_an_osr_entry() -> void {
+    #: Warm-up pairs, true then false, ending on a false call -- same order
+    #: the real sequence below starts with (true dirties the slot, false is
+    #: what would show it) -- so the setup this test depends on is intact
+    #: either way. Existing REPS was not reliably enough sampler time on its
+    #: own; more pairs buys more chances at the tick OSR compiling needs.
+    var bw = 0
+    while bw < 8 {
+        branch_on_flag(true, REPS)
+        branch_on_flag(false, REPS)
+        bw += 1
+    }
     assert_eq(branch_on_flag(true, REPS), REPS)
     assert_eq(branch_on_flag(false, REPS), 0)
     assert_eq(branch_on_flag(true, REPS), REPS)
