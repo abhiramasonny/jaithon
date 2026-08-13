@@ -476,6 +476,12 @@ typedef struct {
     bool      needNullable[JIT_MAX_SLOTS + 1];
     bool      pendingRange;
     bool      rangeInclusive;
+    /* Whether the pending range's low end was an integer literal, and which
+     * one. A range this body builds always steps by 1 (jitMakeRangeIter takes
+     * no step), so with the start known too the value a nested FOR_ITER_BIND
+     * yields is `index + K` -- no ObjRange to reach through at all. */
+    bool      rangeStartKnown;
+    int64_t   rangeStartVal;
     /* Where the deferred OP_BUILD_RANGE was, so a guard inside the header it
      * folded into can resume at an offset the model still describes. */
     uint32_t  rangeBuildIp;
@@ -590,6 +596,14 @@ typedef struct {
      * unmaterialised so a consumer can fold it as an imm12 (`n - 1` becomes just `subs`); xBorrow is a plain read of a register-resident local held in THAT register (X-twin of fpBorrow, `fib(n-1)` loses its `mov`). Both settle at the TOP of the next instruction (the one point unconditionally on the executed path -- a guard is not) unless whitelisted by deferSurvives. Nothing deferred may reach a deopt record: deoptRecordAt/branchOnDeopt assert it, so a wrong whitelist entry costs a decline, not a wrong answer. */
     uint32_t  kPend;
     int64_t   kPendVal[32];
+    /* Which entries are known to BE a given integer literal, whether or not
+     * they were materialised. kPend answers "may I fold this into the next
+     * instruction" and is gone the moment the literal reaches a register;
+     * this answers "what is this value", which stays true afterwards. Set
+     * where a literal is pushed, cleared with every other per-entry mask on
+     * push and pop, so it cannot outlive the entry it describes. */
+    uint32_t  kKnown;
+    int64_t   kKnownVal[32];
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
     /* Offsets this walk carried a deferred entry into (same reason as fpCarry): a BACKWARD branch there
@@ -1151,6 +1165,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
+    e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->valueDepth++;
     /* An inlined body's entries are not in the caller's bank, so they do not
@@ -1210,6 +1225,7 @@ static bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
+    e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
     *reg = valueXReg(e, e->valueDepth);
@@ -3241,6 +3257,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_INT: {
             int16_t k = jaiReadI16(code + off + 1);
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            e->kKnown |= 1u << (e->valueDepth - 1);
+            e->kKnownVal[e->valueDepth - 1] = k;
             /* Push nothing when the next instruction can say the literal as an
              * immediate: `n - 1` is one `subs`, not a `movz` and a `subs`. The
              * consumer settles it if the rest of its shape turns out not to
@@ -5057,6 +5075,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->rangeInclusive = code[off + 1] != 0;
             e->pendingRange = true;
             e->rangeBuildIp = (uint32_t)off;
+            /* Both ends hold registers, so the low end is the entry one below
+             * the top in the value bank as well as on the stack. */
+            {
+                unsigned lo = e->valueDepth - 2;
+                e->rangeStartKnown = (e->kKnown & (1u << lo)) != 0;
+                e->rangeStartVal   = e->rangeStartKnown ? e->kKnownVal[lo] : 0;
+            }
             off += 2;
             break;
         }
@@ -5108,7 +5133,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;
             }
-            if (!pushValue(e, SLOT_ITER, 0, NULL)) return false;
+            /* Shape 2 says this body built the range itself, so its step is 1
+             * by construction; shape 3 adds a start the emitter knows, carried
+             * as the entry's sample. Shape 0 stays the general form, for an
+             * ObjIter that arrived from anywhere else. */
+            if (!pushValue3(e, SLOT_ITER, e->rangeStartKnown ? 3u : 2u, NULL,
+                            e->rangeStartKnown ? INT_VAL(e->rangeStartVal)
+                                               : NULL_VAL,
+                            -1)) {
+                return false;
+            }
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
@@ -5133,7 +5167,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!localInRange(e, fslot)) return false;
                 unsigned rIt = pushReg(e) - 1;
 
-                if (e->stackShape[e->depth - 1] != 0) {
+                if (e->stackShape[e->depth - 1] == 1) {
                     /* A list iterator: ask the runtime for each element and
                      * take the kind from the one it is holding now. */
                     Value sample = e->stackSeen[e->depth - 1];
@@ -5192,16 +5226,41 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* A range yields `start + index * step`, not the index itself (see jaiIterNext's ITER_RANGE case) --
                  * the index is always zero-based, so using it directly is only right for `0..n` in unit steps. `for j in i + 1..n` once counted from zero instead of i+1, a plausible wrong answer (nested loops summed the wrong pairs), not a crash. The dead-after-compare limit register carries the index across to the increment. */
                 emit(e, jaiA64MovX(JIT_SCRATCH_B, JIT_SCRATCH_A));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
-                                   (unsigned)offsetof(ObjIter, source) + 8));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C,
-                                   (unsigned)offsetof(ObjRange, step)));
-                emit(e, jaiA64MulX(JIT_SCRATCH_A, JIT_SCRATCH_A,
-                                   JIT_SCRATCH_D));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C,
-                                   (unsigned)offsetof(ObjRange, start)));
-                emit(e, jaiA64AddX(JIT_SCRATCH_A, JIT_SCRATCH_D,
-                                   JIT_SCRATCH_A));
+                /* Both halves of that map are loop-invariant, and for a range
+                 * this body built (shape 2) the step is 1 by construction --
+                 * jitMakeRangeIter has no step argument. With the start a
+                 * literal too (shape 3) nothing about the ObjRange has to be
+                 * read at all, which is five loads and a multiply off the back
+                 * of every nested `for k in 0..n`: matrix_mul spends fourteen
+                 * of its innermost forty-nine instructions on this counter. */
+                uint32_t iterShape = e->stackShape[e->depth - 1];
+                if (iterShape == 3) {
+                    int64_t k = AS_INT(e->stackSeen[e->depth - 1]);
+                    if (k > 0 && k <= 4095) {
+                        emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                              (unsigned)k));
+                    } else if (k < 0 && k >= -4095) {
+                        emit(e, jaiA64SubXImm(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                              (unsigned)(-k)));
+                    } else if (k != 0) {
+                        emitConst64(e, JIT_SCRATCH_D, k);
+                        emit(e, jaiA64AddX(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                           JIT_SCRATCH_A));
+                    }
+                } else {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
+                                       (unsigned)offsetof(ObjIter, source) + 8));
+                    if (iterShape != 2) {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C,
+                                           (unsigned)offsetof(ObjRange, step)));
+                        emit(e, jaiA64MulX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                           JIT_SCRATCH_D));
+                    }
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(ObjRange, start)));
+                    emit(e, jaiA64AddX(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       JIT_SCRATCH_A));
+                }
                 localOut(e, fslot, JIT_SCRATCH_A);
                 emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
                 emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
