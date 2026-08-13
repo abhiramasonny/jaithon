@@ -407,12 +407,15 @@ opstats-check:
 linetable-check:
 	@./scripts/linetable_golden.sh check
 
-# No opcode may NEWLY lack an arm in the function JIT. The tier's switch ends in
-# `default: return false`, which declines the WHOLE function, so a missing arm
-# evicts every function containing that opcode. Measured twice the hard way:
-# 906ms vs 26ms on one shape, and sort_merge 270ms -> 510ms on another.
-# Fused opcodes must always be armed; the rest ratchet against
-# tests/vm/jit_unarmed.baseline.
+# No opcode may NEWLY lack an arm in the function JIT. An unarmed opcode now
+# deoptimises at its own offset rather than declining the whole function, so it
+# is no longer a coverage cliff -- but the deopt is an unconditional exit from
+# compiled code, so one on a hot path still costs the rest of that body, and one
+# on a loop's straight-line path costs an entry and a deopt per iteration.
+# Measured twice the hard way: 906ms vs 26ms on one shape, and sort_merge
+# 270ms -> 510ms on another. Fused opcodes must always be armed; the rest
+# ratchet against tests/vm/jit_unarmed.baseline, whose header says what being
+# on it costs.
 .PHONY: jit-fusion-check
 jit-fusion-check:
 	@uv run python scripts/jit_fusion_check.py

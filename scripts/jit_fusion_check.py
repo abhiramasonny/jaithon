@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 """No opcode may newly lack an arm in the function JIT.
 
-The tier's opcode switch ends in `default: return false`, which declines the
-WHOLE function rather than the instruction. So an opcode without an arm does not
-run slower -- it evicts every function containing it from the compiled tier.
-Adding an opcode is therefore a JIT ADMISSION decision before it is anything
-else, and the cost of getting it wrong is not subtle:
+What that costs CHANGED on 2026-08-13. The tier's opcode switch used to end in
+`default: return false`, which declines the WHOLE function rather than the
+instruction -- so an opcode without an arm did not run slower, it evicted every
+function containing it from the compiled tier. It now deoptimises at its own
+offset: the interpreter resumes exactly there and the code around it still
+compiles. `OP_GET_EXC` sat on the baseline and every catch block holds one, so
+NO function containing a `try` could be compiled at all; tests/bench/error_paths
+ran its eight-million-iteration counted loop interpreted end to end because of a
+handler its own opcode histogram says executes zero times.
+
+So this is no longer a coverage cliff -- but it is still a ratchet, because the
+deopt is not free. It is an unconditional exit from compiled code, so an unarmed
+opcode on a HOT path costs the whole rest of that body, and on a loop's
+straight-line path it costs one compiled entry and one deopt per iteration.
+Some still decline outright: inside an INLINED body (half an inline cannot be
+taken back), and where no deopt site can be built. Adding an opcode is therefore
+still a JIT ADMISSION decision before it is anything else, and the cost of
+getting it wrong has been measured twice:
 
   * `OP_CMP_LOCAL_CONST_LT` shipped with no arm. 906ms against 26ms compiled on
     a loop of that shape -- 34.8x -- and it went unnoticed because no benchmark
@@ -23,7 +36,8 @@ Two rules, because the two kinds of opcode differ in how they arrive:
 2. **Every other opcode is a RATCHET** against tests/vm/jit_unarmed.baseline.
    67 of them have no arm today and that is not a bug to fix in one go -- but a
    NEW one is a decision, and this makes it a deliberate one: add the arm, or
-   add the opcode to the baseline with a reason in the commit.
+   add the opcode to the baseline with a reason in the commit. The baseline's
+   own header says what being on it costs now.
 
 An opcode that GAINS an arm is never an error; the check says so and asks for
 the baseline line to be dropped.
