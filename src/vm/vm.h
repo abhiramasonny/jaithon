@@ -143,6 +143,26 @@ bool jaiCallValue(Value callee, int argc, Value *args, Value *out);
  * compiled closure. This keeps just the two stack cells that root the callee
  * and argument, and falls through to jaiCallValue for anything else. */
 bool jaiCallValue1(Value callee, Value arg, Value *out);
+
+/* What a higher-order builtin should call per element. Same contract as
+ * jaiCallValue1 -- it falls back to it for anything it does not recognise --
+ * but the compiled-callee case is one C frame instead of three.
+ *
+ * The three were the builtin's element loop, jaiCallValue1 and
+ * jaiJitEnterFunc, each with its own callee-saved prologue: 175 arm64
+ * instructions retired per `xs.map(|x| x * 2)` element against 19 in the
+ * compiled body itself, and 36 of the memory operations were register saves.
+ * Defined in jit_func.c, where the argument and result conversions live, so
+ * that flattening them costs no duplicated knowledge of SlotKind. */
+bool jaiCallFn1(Value callee, Value arg, Value *out);
+
+/* Finish, in the interpreter, a one-argument compiled call that deoptimised
+ * part-way: the body already ran and may have written, so it must not be
+ * re-entered from the top. `base` is the two-cell window [closure, argument]
+ * the entry was made with and `frameBase` the frame count before it. */
+bool jaiFinishJitDeopt1(ObjClosure *closure, Value *base, int frameBase,
+                        Value *out);
+
 /* Call a method by name on a receiver; false if the method does not exist. */
 bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,
                      Value *out);
