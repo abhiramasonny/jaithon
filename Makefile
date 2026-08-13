@@ -55,6 +55,8 @@ LIBS     := -lm -lpthread
 # They are part of CC_ID and LINK_ID below, so changing them invalidates the
 # build tree exactly as changing the real flags would.
 EXTRA_CFLAGS  ?=
+# Collector cadence for `make gc-stress-test`. See that target for the numbers.
+GC_STRESS_EVERY ?= 5000
 EXTRA_LDFLAGS ?=
 
 # zlib inflates the seed's images. boot/seed.bin holds them deflated, one
@@ -380,6 +382,28 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@./scripts/run_tests.sh
+	@$(MAKE) --no-print-directory gc-stress-test
+
+# The unit suites under a collector that runs every N allocations.
+#
+# Only the GOLDENS ever got a --gc-stress pass (run_tests.sh runs each one a
+# second time under it). The 1000-odd unit tests in tests/lang, tests/stdlib and
+# the package trees ran once, plain, so no gate covered them under a collector
+# at all -- and a use-after-free or a missed root is exactly what gc stress is
+# for. Two silent miscompiles were found on 2026-08-12 by stress modes, neither
+# by any other gate.
+#
+# It was not covered because --gc-stress collects on EVERY allocation, and that
+# is quadratic: tests/lang alone runs in 1.09s plain and did not finish in ten
+# minutes under it. --gc-stress=N is what makes it affordable. Measured on
+# tests/lang: N=500 556s, N=5000 9.6s, N=20000 4.4s. N=5000 is the operating
+# point -- under 10x the plain cost, and still collecting at thousands of points
+# where the live-bytes threshold collects at tens.
+.PHONY: gc-stress-test
+gc-stress-test: $(TARGET)
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test --gc-stress=$(GC_STRESS_EVERY) \
+	    tests/lang tests/stdlib packages/jaiplot/tests packages/jaitensor/tests \
+	    | tail -1
 
 # Three tables describe the opcode list -- JAI_OPCODES in chunk.c (the wire
 # format), _OPS in emit.jai (a hand-transcribed copy), and spec/BYTECODE.md --
