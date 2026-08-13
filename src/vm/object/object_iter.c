@@ -215,16 +215,10 @@ bool jaiIterNext(ObjIter *it, Value *out) {
             const unsigned char first = (unsigned char)*p;
 
             if (first < 0x80u) {
-                ObjString *scalar = jaiAsciiCharTable()[first];
-                if (scalar == NULL) {
-                    jaiGCPushRoot(OBJ_VAL(it));
-                    scalar = jaiStringChar(first);
-                    jaiGCPopRoot();
-                    if (scalar == NULL) return false;
-                }
-
+                /* jaiVMInit filled every slot, so this allocates nothing and
+                 * needs no root. See jaiAsciiCharsFill. */
                 it->index = index + 1;
-                *out = OBJ_VAL(scalar);
+                *out = OBJ_VAL(jaiAsciiCharTable()[first]);
                 return true;
             }
 
