@@ -57,6 +57,9 @@ LIBS     := -lm -lpthread
 EXTRA_CFLAGS  ?=
 # Collector cadence for `make gc-stress-test`. See that target for the numbers.
 GC_STRESS_EVERY ?= 5000
+# Loop repetitions before `make kind-fuzz` changes a kind. Must exceed the
+# tier's hotness threshold or nothing under test ever compiles.
+KIND_FUZZ_WARM ?= 3000
 EXTRA_LDFLAGS ?=
 
 # zlib inflates the seed's images. boot/seed.bin holds them deflated, one
@@ -461,6 +464,25 @@ branch-table-check:
 .PHONY: jit-declines-check
 jit-declines-check:
 	@./scripts/jit_declines.sh check
+
+# The kind-mutation fuzzer: 144 generated programs, each warming a loop until it
+# compiles and then putting a different kind where the tier sampled one, run
+# four ways and diffed against the interpreter.
+#
+# This is the gate for the class of bug that has cost this project the most.
+# BOTH silent miscompiles found on 2026-08-12 were "the tier sampled a kind and
+# the program changed it": a str in a list bound its POINTER as an integer, and
+# a bool local was read eight bytes wide. Neither was caught by anything.
+#
+# Its teeth are established, not assumed: run against a tree built from d41ec16
+# (before the list-element fix) it reports 6 of 144 mismatched, all of them
+# list_for-add-int-to-*, printing raw pointers and IEEE bit patterns where the
+# interpreter raises TypeError. Against the fixed tree, 0 of 144.
+#
+# Out of `make test` because it is ~4 minutes. Run it when touching the tier.
+.PHONY: kind-fuzz
+kind-fuzz: $(TARGET)
+	@python3 tests/fuzz/kind_mutation.py --warm $(KIND_FUZZ_WARM)
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
