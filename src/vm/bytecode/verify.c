@@ -59,7 +59,7 @@ static bool opBranchIsEdge(uint8_t op) {
 }
 
 
-static bool opFallsThrough(uint8_t op) {
+bool jaiOpFallsThrough(uint8_t op) {
     switch (op) {
     case OP_JUMP:
     case OP_LOOP:
@@ -321,7 +321,10 @@ static Effect fallEffect(const Chunk *chunk, int offset, uint8_t op,
     return e;
 }
 
-bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
+/* `depthOut`, when given, receives pass 4's table on success -- see
+ * jaiChunkStackDepths. Nothing is written unless the whole chunk verified. */
+static bool verifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize,
+                        int *depthOut) {
     if (errBuf != NULL && errBufSize > 0) errBuf[0] = '\0';
     if (fn == NULL) return verifyFail(errBuf, errBufSize, "function is null");
 
@@ -335,6 +338,13 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
     bool *boundary = JAI_ALLOC_ZEROED(bool, n + 1);
     int *depth = JAI_ALLOC(int, n + 1);
     int *work = JAI_ALLOC(int, n + 1);
+    /* An offset whose depth came from an imprecise seed, or from one by
+     * following edges. Pass 4 pins an exception handler and a default thunk at
+     * 0 because nothing tells it what the unwinder will have left there, and
+     * that answer is good enough to verify against but is NOT the truth. Only
+     * built for a caller that asked for the table, which is the only one that
+     * has to tell the two apart. */
+    bool *approx = depthOut != NULL ? JAI_ALLOC_ZEROED(bool, n + 1) : NULL;
     int workCount = 0;
     for (int i = 0; i <= n; i++) depth[i] = -1;
 
@@ -543,7 +553,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             int fallTo = -1, fallDepth = after;
             int jumpTo = -1, jumpDepth = after;
 
-            if (opFallsThrough(op)) {
+            if (jaiOpFallsThrough(op)) {
                 /* OP_TAIL_CALL is modelled as falling through so that a
                  * following RETURN is verified, but it is also a legitimate
                  * last instruction. */
@@ -608,6 +618,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
                 }
                 if (depth[to] < 0) {
                     depth[to] = d;
+                    if (approx != NULL) approx[to] = approx[offset];
                     work[workCount++] = to;
                 } else if (depth[to] != d) {
                     VFAIL("offset %d: stack depth %d here disagrees with depth "
@@ -635,6 +646,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
                                jaiReadI16(chunk->code + offset + 1 + at));
                 if (depth[to] < 0) {
                     depth[to] = depth[offset];
+                    if (approx != NULL) approx[to] = approx[offset];
                     work[workCount++] = to;
                     added++;
                 }
@@ -651,6 +663,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             uint32_t handler = fn->exceptions[e].handler;
             if (depth[handler] < 0) {
                 depth[handler] = 0;
+                if (approx != NULL) approx[handler] = true;
                 work[workCount++] = (int)handler;
                 added++;
             }
@@ -660,6 +673,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             uint32_t at = fn->defaultOffsets[d];
             if (depth[at] < 0) {
                 depth[at] = 0;
+                if (approx != NULL) approx[at] = true;
                 work[workCount++] = (int)at;
                 added++;
             }
@@ -669,8 +683,23 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
 #undef VFAIL
 
 done:
+    if (ok && depthOut != NULL) {
+        for (int i = 0; i <= n; i++) {
+            depthOut[i] = approx[i] ? -1 : depth[i];
+        }
+    }
     JAI_FREE_ARRAY(bool, boundary, n + 1);
     JAI_FREE_ARRAY(int, depth, n + 1);
     JAI_FREE_ARRAY(int, work, n + 1);
+    if (approx != NULL) JAI_FREE_ARRAY(bool, approx, n + 1);
     return ok;
+}
+
+bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
+    return verifyChunk(fn, errBuf, errBufSize, NULL);
+}
+
+bool jaiChunkStackDepths(const ObjFunction *fn, int *out) {
+    char err[8];
+    return verifyChunk(fn, err, sizeof err, out);
 }
