@@ -5,7 +5,8 @@
 #include "vm/object/object.h"
 
 /* The compiled tier: an accelerator that may always decline -- jaiJitEnter
- * returns false and the interpreter runs the function exactly as it would. */
+ * answers JAI_JIT_DECLINED and the interpreter runs the function exactly as it
+ * would. Any other answer means the call has begun and must not be re-run. */
 
 /* How many entries before a function is considered hot: arbitrary, just high
  * enough the counter costs nothing on cold code and low enough a benchmark
@@ -20,18 +21,6 @@
 _Static_assert(JAI_IC_OBS_BUDGET <= JAI_JIT_THRESHOLD,
                "an inline cache must settle before the tier reads it");
 
-/* Called on entry to a Jaithon function once it has crossed the threshold.
- *
- * Boundary contract: false leaves vm.stackTop and the frame stack untouched,
- * and the interpreter proceeds as if this was never called. True means the
- * call is COMPLETE, in exactly OP_RETURN's poststate -- return value at
- * `slotBase[0]`, `vm.stackTop == slotBase + 1`, frame never pushed. */
-bool jaiJitEnter(ObjClosure *closure, Value *slotBase);
-
-/* The whole-function tier (jit_func.c). Compile returns false for anything it
- * does not speak; enter obeys the same boundary contract as jaiJitEnter. */
-bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
-
 /* DECLINED: nothing touched, interpreter should run the call. ERROR: compiled
  * code called out, the callee raised, and those effects already happened, so
  * the call must not be re-run. */
@@ -44,6 +33,20 @@ typedef enum {
      * jaiJitApplyDeopt once a frame exists. */
     JAI_JIT_DEOPT
 } JaiJitOutcome;
+
+/* Called on entry to a Jaithon function once it has crossed the threshold.
+ *
+ * Boundary contract: JAI_JIT_DECLINED leaves vm.stackTop and the frame stack
+ * untouched, and the interpreter proceeds as if this was never called.
+ * JAI_JIT_DONE means the call is COMPLETE, in exactly OP_RETURN's poststate --
+ * return value at `slotBase[0]`, `vm.stackTop == slotBase + 1`, frame never
+ * pushed. The other two say the call has already started and must NOT be run
+ * again from the top; every caller has to say what it does with them. */
+JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase);
+
+/* The whole-function tier (jit_func.c). Compile returns false for anything it
+ * does not speak; enter obeys the same boundary contract as jaiJitEnter. */
+bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
 
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
