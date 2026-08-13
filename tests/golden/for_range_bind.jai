@@ -213,6 +213,21 @@ fn via_variable(lo: int, hi: int) -> int {
 }
 print([via_variable(0, 5), via_variable(5, 0), via_variable(-3, 3)])
 
+# And hot enough to be compiled, which is the only remaining gate on the range
+# arms of OP_BUILD_RANGE, OP_GET_ITER and OP_FOR_ITER_BIND: every `for i in a..b`
+# written out at the loop now goes the fused way instead, so tests/golden/
+# jit_osr_range_bias and jit_nested_range_start no longer reach them either.
+fn hot_via_variable(n: int) -> int {
+    let outer = 0..n
+    var t = 0
+    for i in outer {
+        let inner = i..n
+        for j in inner { t = t + i * j }
+    }
+    return t
+}
+print(hot_via_variable(300))
+
 # A non-int bound raises the same TypeError, with the same words, as
 # OP_BUILD_RANGE always did.
 fn bad_bound(hi) -> str {
