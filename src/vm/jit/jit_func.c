@@ -8670,6 +8670,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
      * measures the last of those, and which slots are named at all, and how
      * often each of them is named inside the innermost loop. */
     unsigned probeMaxValue = 0;
+    unsigned probeMaxValueAll = 0;
+    unsigned probeStranded = 0;
     bool probeRan = false;
     {
         static Emit probe;
@@ -8700,6 +8702,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             unsigned used = probe.maxSlotUsed + 1u;
             if (used < e.locals) e.locals = used;
             probeMaxValue = probe.maxValue;
+            probeMaxValueAll = probe.maxValueAll;
             probeRan = true;
 
             /* A body that never calls out and never inlines can put its
@@ -8752,6 +8755,11 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                     e.slotXReg[slot] = (uint8_t)(JIT_FIRST_SAVED +
                                                  osrReserved(&e) + e.xLocals++);
                     availX--;
+                } else {
+                    /* Wanted one and there was none left. This is the number a
+                     * wider bank would buy, and it is 0 far more often than the
+                     * decline census suggests -- so it is worth reporting. */
+                    probeStranded++;
                 }
             }
 
@@ -8861,6 +8869,28 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     planHoists(&e, fn);
     if (getenv("JAI_JIT_WHY")) {
+        /* The register arithmetic, not just the verdict, and for a body that
+         * COMPILES as much as one that does not: "declined for want of a
+         * register" is only half the census -- the other half is a body that
+         * fitted with nothing left over, which is what a bank decision is
+         * chosen against. Printed here rather than in the failure arm because
+         * this is the point where every number in it is final.
+         *
+         * Only when the measuring pass got through: a loop that declined
+         * before the register plan has zeroed numbers, and printing them reads
+         * as "nought entries deep", which is a different and false claim.
+         *
+         * Its own line, and without the words the decline census greps for, so
+         * that adding it cannot invent census entries. */
+        if (probeRan) fprintf(stderr,
+                "[jit] osr %s at %u registers: %u reserved, %u stack "
+                "(%u incl. inlined), %u x-locals, %u fp-locals, %u stranded, "
+                "bank %s, of %u; %s\n",
+                fn->name ? fn->name->chars : "<anon>", top,
+                osrReserved(&e), probeMaxValue, probeMaxValueAll,
+                e.xLocals, e.fpLocals, probeStranded,
+                e.scratchValues ? "x0" : "callee-saved", JIT_MAX_SAVED,
+                e.bodyCalls ? "calls" : "call-free");
         for (unsigned i = 0; i < e.hoistCount; i++) {
             fprintf(stderr,
                     "[jit] osr at %u hoists slot %u's header out of %u..%u "
@@ -8872,22 +8902,6 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     if (!compileBody(&e, closure) || e.failed) {
         if (getenv("JAI_JIT_WHY")) {
-            /* The register arithmetic, not just the verdict: a "more live
-             * values" decline is unreadable without knowing how many the head
-             * reserved, how deep the body went and which bank it was using --
-             * the shortfall is those three against JIT_MAX_SAVED. Its own
-             * line, and without the words the decline census greps for, so
-             * that adding it cannot invent census entries.
-             *
-             * Only when the measuring pass got through: a loop that declined
-             * for some other reason never reached the register plan, and
-             * printing its zeroed numbers reads as "nought entries deep",
-             * which is a different and false claim. */
-            if (probeRan) fprintf(stderr,
-                    "[jit] osr at %u registers: %u reserved, %u stack, "
-                    "%u x-locals, bank %s, of %u\n",
-                    top, osrReserved(&e), probeMaxValue, e.xLocals,
-                    e.scratchValues ? "x0" : "callee-saved", JIT_MAX_SAVED);
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
                     e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
         }
