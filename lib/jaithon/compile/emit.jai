@@ -1545,17 +1545,54 @@ pub class Emitter {
         var exits: list[int] = []
         var before_iter: list[int] = []
         var skips: list[list[int]] = []
+        # Which clauses used the range lowering below: their exit is patched
+        # like `_for_range`'s (`_patch_from(., . + 8)`, not the ordinary
+        # two-byte `_patch`), and they own temps that must be freed on the
+        # way out, in the same reverse order this loop already closes in.
+        var is_range: list[bool] = []
+        var range_temps: list[int] = []
         for clause in clauses {
             before_iter.push(self._depth())
-            # Plain `for` only, not comprehension clauses: a clause's jumps are
-            # tracked by the comprehension itself, and threading another branch
-            # through that bookkeeping broke `{k: v for (v, k) in d.items()}`.
-            self._expr(clause["iterable"])
-            self._op(Op.GetIter, span)
-            starts.push(self._chunk().here())
-            exits.push(self._emit_jump(Op.ForIter, span))
-            self._adjust(1)  # the loop value, on the fall-through
-            self._bind_pattern(clause["pattern"], span)
+            let iterable: Node = clause["iterable"]
+            let pattern: Node = clause["pattern"]
+            # `for x in a..b`: the same lowering `_for_range` gives the
+            # statement form, and it declines for exactly the same reasons —
+            # reused via `_range_bind_slot` rather than re-derived, since a
+            # range reached through a variable, a destructuring pattern or a
+            # global loop variable all fall back to the general path below.
+            if iterable.kind == NodeKind.Range and self._range_bind_slot(pattern, false) >= 0 {
+                is_range.push(true)
+                let wildcard = pattern.kind == NodeKind.PatWildcard
+                let counter = self._alloc_temp()
+                let end = self._alloc_temp()
+                let slot = self._range_bind_slot(pattern, wildcard)
+                self._expr(iterable.child("start"))
+                self._expr(iterable.child("stop"))
+                self._chunk().write_op(Op.IterRange, span)
+                self._chunk().write_byte(if iterable.flag("inclusive") { 1 } else { 0 })
+                self._chunk().write_u16(counter)
+                self._chunk().write_u16(end)
+                starts.push(self._chunk().here())
+                self._chunk().write_op(Op.ForRangeBind, span)
+                exits.push(self._chunk().here())
+                self._chunk().write_u16(0)
+                self._chunk().write_u16(slot)
+                self._chunk().write_u16(counter)
+                self._chunk().write_u16(end)
+                range_temps.push(if wildcard { 3 } else { 2 })
+            } else {
+                is_range.push(false)
+                range_temps.push(0)
+                # Plain `for` only, not comprehension clauses: a clause's jumps are
+                # tracked by the comprehension itself, and threading another branch
+                # through that bookkeeping broke `{k: v for (v, k) in d.items()}`.
+                self._expr(iterable)
+                self._op(Op.GetIter, span)
+                starts.push(self._chunk().here())
+                exits.push(self._emit_jump(Op.ForIter, span))
+                self._adjust(1)  # the loop value, on the fall-through
+                self._bind_pattern(pattern, span)
+            }
             var failures: list[int] = []
             let conditions: list[Node] = clause["conditions"]
             for condition in conditions {
@@ -1565,7 +1602,9 @@ pub class Emitter {
             skips.push(failures)
         }
 
-        # The accumulator's peek index, below one iterator per clause.
+        # The accumulator's peek index, below one iterator per clause that
+        # pushed one — a range clause pushed nothing, so `self._depth()`
+        # already reflects only the clauses that did.
         if kind == CompKind.Dict {
             self._expr(node.child("keyExpr"))
             self._expr(node.child("element"))
@@ -1583,8 +1622,20 @@ pub class Emitter {
             # A filter that fails continues its own clause, not an inner one.
             self._patch_all(skips[index])
             self._loop_back(starts[index], span)
-            self._set_depth(before_iter[index])  # FOR_ITER drops the iterator
-            self._patch(exits[index])
+            # Both paths land back at this clause's own depth: FOR_ITER drops
+            # the exhausted iterator; a range clause never put anything on the
+            # operand stack to begin with, so this is a no-op there rather
+            # than an assumed one.
+            self._set_depth(before_iter[index])
+            if is_range[index] {
+                # The displacement is measured from the end of the
+                # instruction, six bytes past its own operand rather than the
+                # usual zero — same as `_for_range`'s `OP_FOR_RANGE_BIND` patch.
+                self._patch_from(exits[index], exits[index] + 8)
+                self._free_temps(range_temps[index])
+            } else {
+                self._patch(exits[index])
+            }
             index -= 1
         }
     }
