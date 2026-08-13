@@ -3547,6 +3547,8 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_ELEM_KIND]          = &&L_OP_ELEM_KIND,
         [OP_GET_ITER_ITEMS]     = &&L_OP_GET_ITER_ITEMS,
         [OP_FOR_ITER_PAIR]      = &&L_OP_FOR_ITER_PAIR,
+        [OP_ITER_RANGE]         = &&L_OP_ITER_RANGE,
+        [OP_FOR_RANGE_BIND]     = &&L_OP_FOR_RANGE_BIND,
         [OP_INC_LOCAL]          = &&L_OP_INC_LOCAL,
         [OP_CMP_LOCAL_CONST_LT] = &&L_OP_CMP_LOCAL_CONST_LT,
         [OP_GET_LOCAL2]         = &&L_OP_GET_LOCAL2,
@@ -4495,6 +4497,57 @@ static JaiRunResult runLoop(int baseFrameCount) {
          * user __next__ and grow the value stack, moving every frame window. */
         slots[slotA] = a;
         slots[slotB] = b;
+        VM_NEXT();
+    }
+
+    /* `for x in a..b`, opened (spec §3.4). Where BUILD_RANGE; GET_ITER built an
+     * ObjRange and an ObjIter per loop ENTRY, this writes the loop's whole
+     * state into two int frame slots and allocates nothing at all.
+     *
+     * `end` is one past the last value, computed WRAPPING, so the counter test
+     * downstream is `!=` rather than `<` and `a..=INT64_MAX` still terminates:
+     * the counter wraps to INT64_MIN and meets it there. See OP_ITER_RANGE in
+     * chunk.h for the single range where that disagrees with ObjIter's
+     * saturating limit, and why it does not matter. */
+    VM_CASE(OP_ITER_RANGE): {
+        bool     inclusive = READ_BYTE() != 0;
+        uint16_t curSlot   = READ_U16();
+        uint16_t endSlot   = READ_U16();
+        Value stopValue = PEEK(0), startValue = PEEK(1);
+        /* The same check, and the same wording, OP_BUILD_RANGE makes: this is a
+         * fast path for one loop shape, never a second set of rules. */
+        if (!IS_INT(startValue) || !IS_INT(stopValue)) {
+            THROW(vm.cTypeError, "range bounds must be int, not '%s' and '%s'",
+                  jaiTypeNameStatic(startValue), jaiTypeNameStatic(stopValue));
+        }
+        int64_t start = AS_INT(startValue), stop = AS_INT(stopValue);
+        int64_t end = stop < start
+                          ? start          /* empty: end where it begins */
+                          : (inclusive
+                                 ? (int64_t)((uint64_t)stop + 1u)
+                                 : stop);
+        DROP(2);
+        slots[curSlot] = INT_VAL(start);
+        slots[endSlot] = INT_VAL(end);
+        VM_NEXT();
+    }
+
+    /* One step of that loop (spec §3.4). Both slots were written by the
+     * OP_ITER_RANGE above and by this instruction and by nothing else — the
+     * emitter hands out fresh temporaries for them — so the payloads are read
+     * without re-testing a tag the loop itself is the only writer of. */
+    VM_CASE(OP_FOR_RANGE_BIND): {
+        int16_t  offset  = READ_I16();
+        uint16_t slot    = READ_U16();
+        uint16_t curSlot = READ_U16();
+        uint16_t endSlot = READ_U16();
+        int64_t cur = AS_INT(slots[curSlot]);
+        if (cur == AS_INT(slots[endSlot])) {
+            ip += offset;
+            VM_NEXT();
+        }
+        slots[slot]    = INT_VAL(cur);
+        slots[curSlot] = INT_VAL((int64_t)((uint64_t)cur + 1u));
         VM_NEXT();
     }
 

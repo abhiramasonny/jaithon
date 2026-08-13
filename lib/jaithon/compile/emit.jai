@@ -171,6 +171,8 @@ pub enum Op {
     ElemKind,
     GetIterItems,
     ForIterPair,
+    IterRange,
+    ForRangeBind,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -329,6 +331,8 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.ElemKind, "OP_ELEM_KIND", 1, 0),
     OpSpec(Op.GetIterItems, "OP_GET_ITER_ITEMS", 2, 0),
     OpSpec(Op.ForIterPair, "OP_FOR_ITER_PAIR", 6, 0),
+    OpSpec(Op.IterRange, "OP_ITER_RANGE", 5, -2),
+    OpSpec(Op.ForRangeBind, "OP_FOR_RANGE_BIND", 8, 0),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
@@ -2273,10 +2277,87 @@ pub class Emitter {
         self._patch(skip)
     }
 
+    #: The frame slot `for <pattern> in <range>` binds each value into, or -1
+    #: when the pattern is not one `OP_FOR_RANGE_BIND` can carry.
+    #:
+    #: It carries a slot number and nothing else, so a global, an upvalue and a
+    #: destructuring pattern all fall back to the general loop — a range never
+    #: yields anything unpackable anyway, so the tuple case is an error program
+    #: either way and belongs on the path that reports it. A wildcard has no
+    #: symbol, and gets `spare`, which the caller reserved for exactly that.
+    fn _range_bind_slot(self, pattern: Node?, spare: int) -> int {
+        if pattern == null { return -1 }
+        if pattern.kind == NodeKind.PatWildcard { return spare }
+        if pattern.kind != NodeKind.PatBind { return -1 }
+        let symbol = self.resolution.symbol_of(pattern)
+        if symbol == null or not symbol.is_slotted() { return -1 }
+        return symbol.slot
+    }
+
+    #: `for x in a..b` with no ObjRange and no ObjIter: two int temporaries hold
+    #: the counter and the end, and nothing is pushed at all.
+    #:
+    #: The saving is per loop ENTRY, which is why it is worth an opcode pair: an
+    #: allocation census found the two objects a range loop's header builds were
+    #: 99.95% of everything `tests/bench/nbody` allocated and 98.5% of
+    #: `matrix_mul`'s. Measured at ~15.7ns per entry on an M2 Max, two thirds of
+    #: it the allocation itself and a third the collections it forces.
+    #:
+    #: Emitted here rather than fused from bytecode — unlike `FOR_ITER_PAIR`,
+    #: which is a peephole rule — because the loop stops occupying an operand
+    #: stack slot, and `break` unwinds to a depth only this function knows.
+    #:
+    #: Answers false, having emitted nothing, for a loop that is not this shape:
+    #: the range must be written out at the loop (one reaching it through a
+    #: variable already built its object, so there is nothing left to save) and
+    #: it must bind to a single frame slot.
+    fn _for_range(self, node: Node, iterable: Node?) -> bool {
+        if iterable == null or iterable.kind != NodeKind.Range { return false }
+        if self._range_bind_slot(node.child("pattern"), 0) < 0 { return false }
+        let span = node.span
+        let base = self._depth()
+        # Three, always: the wildcard's throwaway destination is reserved
+        # whether or not this pattern is one, so the count freed at the end does
+        # not have to re-derive which it was.
+        let counter = self._alloc_temp()
+        let end = self._alloc_temp()
+        let slot = self._range_bind_slot(node.child("pattern"), self._alloc_temp())
+        self._expr(iterable.child("start"))
+        self._expr(iterable.child("stop"))
+        self._chunk().write_op(Op.IterRange, span)
+        self._chunk().write_byte(if iterable.flag("inclusive") { 1 } else { 0 })
+        self._chunk().write_u16(counter)
+        self._chunk().write_u16(end)
+
+        let start = self._chunk().here()
+        self._chunk().write_op(Op.ForRangeBind, span)
+        let exit = self._chunk().here()
+        self._chunk().write_u16(0)
+        self._chunk().write_u16(slot)
+        self._chunk().write_u16(counter)
+        self._chunk().write_u16(end)
+
+        # Nothing of this loop's is on the operand stack, so `break` and
+        # `continue` both unwind to `base` and neither has anything to drop.
+        let capture_base = self.resolution.capture_base_of(node)
+        self._enter_loop(node.opt_text("label"), start, capture_base, base, base)
+        self._loop_body(node.child("body"))
+        self._close_iteration(capture_base, span)
+        self._loop_back(start, span)
+        self._set_depth(base)
+        # The displacement is measured from the end of the instruction, which is
+        # six bytes past its own operand rather than the usual zero.
+        self._patch_from(exit, exit + 8)
+        self._close_loop()
+        self._free_temps(3)
+        return true
+    }
+
     fn _for(self, node: Node) -> void {
         let span = node.span
         let base = self._depth()
         let iterable = node.child("iterable")
+        if self._for_range(node, iterable) { return }
         if _is_items_call(iterable) {
             self._items_iterable(iterable, span)
         } else {

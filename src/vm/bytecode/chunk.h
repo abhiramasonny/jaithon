@@ -222,6 +222,46 @@ typedef enum {
      * OP_UNPACK raised for it. */
     OP_FOR_ITER_PAIR,        /* i16 J, u16 A, u16 B */
 
+    /* `for x in a..b` with neither object built (spec §3.4). The pair below
+     * replaces the whole of
+     *
+     *     <a>; <b>; BUILD_RANGE incl; GET_ITER
+     *   L: FOR_ITER_BIND J, S
+     *
+     * which allocated an ObjRange (48B) AND an ObjIter (64B) on every LOOP
+     * ENTRY — not per program, per entry. An allocation census put that at
+     * 99.95% of everything tests/bench/nbody allocates (4.5M objects, 243 MB,
+     * 114 collections) for a benchmark whose own header says it measures float
+     * math, 98.5% of matrix_mul's and 88.6% of graph_bfs's.
+     *
+     * Nothing is on the heap and nothing is on the operand stack: the loop's
+     * whole state is two int frame slots, which the register allocator can
+     * treat like any other int local and a deopt writes back like any other.
+     *
+     *   ITER_RANGE incl, C, E   pops the two bounds, seeds slots[C] with the
+     *                           first value and slots[E] with the value one
+     *                           past the last
+     *   FOR_RANGE_BIND J,S,C,E  slots[C] == slots[E] ends the loop; otherwise
+     *                           bind slots[S] = slots[C] and step slots[C]
+     *
+     * `E` is an END, not a count, so the test is one compare and the step one
+     * add — the same shape the compiled range loop already ran on. It is
+     * computed WRAPPING, which is what makes `a..=INT64_MAX` terminate: the
+     * counter wraps to INT64_MIN, which is exactly what E holds. The one range
+     * that does not survive the round trip is the full-width inclusive
+     * `INT64_MIN..=INT64_MAX`, which iterates 2^64 times here and INT64_MAX
+     * times through ObjIter's saturating `limit`. Both tiers agree, and
+     * neither terminates this side of the heat death of the universe.
+     *
+     * Emitted from the loop, not fused from bytecode, because the operand
+     * stack shrinks: `break` unwinds to a depth the emitter alone knows. The
+     * shape it matches is the syntactic one (`for <name> in <range>`), which
+     * needs no type knowledge — a range literal is a range literal. Every
+     * other iterable, and a range that reaches the loop through a variable,
+     * still lowers to BUILD_RANGE/GET_ITER/FOR_ITER_BIND unchanged. */
+    OP_ITER_RANGE,           /* u8 inclusive, u16 C, u16 E */
+    OP_FOR_RANGE_BIND,       /* i16 J, u16 S, u16 C, u16 E */
+
     OP_COUNT
 } OpCode;
 

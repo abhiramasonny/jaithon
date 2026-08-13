@@ -5272,6 +5272,95 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_ITER_RANGE: {
+            /* `for x in a..b` opened, with neither object built. The two ints
+             * this writes are the whole loop, so there is no descriptor, no
+             * root fill and no call out -- and, being ordinary int locals, they
+             * compete for registers on the same terms as everything else
+             * instead of reserving four the way an ObjIter head does.
+             *
+             * `end` is one past the last value, WRAPPING, which is what makes
+             * `a..=INT64_MAX` terminate: the counter meets INT64_MIN there.
+             * Same arithmetic as the interpreter's, deliberately -- see
+             * OP_ITER_RANGE in chunk.h. */
+            bool     inclusive = code[off + 1] != 0;
+            unsigned curSlot   = jaiReadU16(code + off + 2);
+            unsigned endSlot   = jaiReadU16(code + off + 4);
+            if (e->depth < 2) return false;
+            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            if (e->stack[e->depth - 2] != SLOT_INT) return false;
+            if (!localInRange(e, curSlot) || !localInRange(e, endSlot)) {
+                return false;
+            }
+            if (!adoptLocalKind(e, curSlot, SLOT_INT, 0, NULL)) return false;
+            if (!adoptLocalKind(e, endSlot, SLOT_INT, 0, NULL)) return false;
+            if (curSlot == 0 || endSlot == 0) e->usesSlot0 = true;
+
+            unsigned rHi, rLo;
+            if (!popValue(e, &rHi, NULL)) return false;
+            if (!popValue(e, &rLo, NULL)) return false;
+            /* Both ends stay read-only: a popped register may be a local's own,
+             * borrowed, and writing it would rewrite the local. */
+            if (inclusive) {
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, rHi, 1));
+            } else {
+                emit(e, jaiA64MovX(JIT_SCRATCH_A, rHi));
+            }
+            emit(e, jaiA64SubsXReg(31, rHi, rLo));
+            /* An empty range ends where it begins, so the first test already
+             * fails and the body never runs. */
+            emit(e, jaiA64CselX(JIT_SCRATCH_B, rLo, JIT_SCRATCH_A, JAI_A64_LT));
+            localOut(e, endSlot, JIT_SCRATCH_B);
+            localOut(e, curSlot, rLo);
+            off += 6;
+            break;
+        }
+
+        case OP_FOR_RANGE_BIND: {
+            /* One step of that loop: a compare, a branch, a bind and an add,
+             * with nothing to load from the heap and nothing to guard. The two
+             * slots are written by OP_ITER_RANGE and by this instruction and by
+             * nothing else -- the emitter hands out fresh temporaries for them
+             * -- so their kind is a fact of the shape rather than a sample, and
+             * this arm has no deopt of its own. A bail lands on this
+             * instruction with the counter unadvanced. */
+            int16_t  jump    = jaiReadI16(code + off + 1);
+            unsigned slot    = jaiReadU16(code + off + 3);
+            unsigned curSlot = jaiReadU16(code + off + 5);
+            unsigned endSlot = jaiReadU16(code + off + 7);
+            if (!localInRange(e, slot)) return false;
+            if (!localInRange(e, curSlot) || !localInRange(e, endSlot)) {
+                return false;
+            }
+            if (e->localKind[curSlot] != SLOT_INT ||
+                e->localKind[endSlot] != SLOT_INT) {
+                return false;
+            }
+            if (!adoptLocalKind(e, slot, SLOT_INT, 0, NULL)) {
+                e->whyNot = "loop variable took two kinds";
+                return false;
+            }
+            if (slot == 0) e->usesSlot0 = true;
+
+            unsigned rCur = localIn(e, curSlot, JIT_SCRATCH_A);
+            unsigned rEnd = localIn(e, endSlot, JIT_SCRATCH_B);
+            emit(e, jaiA64SubsXReg(31, rCur, rEnd));
+            /* Nothing of this loop's is on the operand stack, so the exit is
+             * reached at exactly the depth this branch leaves from. */
+            branchTo(e, (uint32_t)((int32_t)(off + 9) + jump), true,
+                     JAI_A64_EQ);
+            /* Bind before stepping: in register mode the counter's home IS
+             * rCur, so the add would destroy the value about to be bound. */
+            localOut(e, slot, rCur);
+            {
+                unsigned dst = localDest(e, curSlot);
+                emit(e, jaiA64AddXImm(dst, rCur, 1));
+                localOut(e, curSlot, dst);
+            }
+            off += 9;
+            break;
+        }
+
         case OP_FOR_ITER_BIND: {
             /* A loop this body built the iterator for: the index lives in the
              * iterator, so every iteration loads and stores it, and a deopt
