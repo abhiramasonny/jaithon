@@ -334,6 +334,7 @@ fn _build_blocks_hoist() -> dict[int, bool] {
         Op.GetIter,
         Op.ForIter,
         Op.ForIterBind,    # a user __next__ is user code
+        Op.ForIterPair,    # so is a user __next__ that yields pairs
         Op.Format,         # a user __str__, or a rebound `str`, is too
         Op.In,
         Op.NotIn,

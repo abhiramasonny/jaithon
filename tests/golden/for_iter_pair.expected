@@ -1,0 +1,29 @@
+["aa", "bbb", "cccc"]
+[1, 2, 3]
+["x=1", "y=2", "p=7", "q=8"]
+["0a", "1b", "2c"]
+cccc
+3
+36
+579
+["1:[2, 3]", "4:[5]"]
+14
+uw
+30
+1
+["aa1", "bbb2", "cccc3"]
+cannot unpack 3 values into 2 targets
+cannot unpack 1 value into 2 targets
+cannot destructure a 'int' value
+cannot unpack 1 value into 2 targets
+cannot unpack 3 values into 2 targets
+ok
+5
+dict mutation caught
+list mutation caught
+0
+400000
+182000.0
+300000
+300000
+1000

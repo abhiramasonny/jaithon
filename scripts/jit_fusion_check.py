@@ -54,6 +54,7 @@ FUSED = [
     "OP_ADD_BIND",
     "OP_SUB_BIND",
     "OP_MUL_BIND",
+    "OP_FOR_ITER_PAIR",
 ]
 
 

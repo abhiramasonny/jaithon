@@ -4,8 +4,10 @@
 #: alive at once, so every collection during the loop marks the lot. The loop
 #: form takes ITER_DICT_ITEMS instead, which walks the table one pair at a time.
 #: Measured on tests/bench/dict_iter: peak RSS 37.1 MB -> 30.3 MB (-18.2%),
-#: instructions -22%. Wall time is unchanged -- the per-entry tuple, which this
-#: does not remove, is the dominant cost.
+#: instructions -22%. Wall time was unchanged on its own -- the per-entry tuple,
+#: which this does not remove, was the dominant cost. OP_FOR_ITER_PAIR removes
+#: that one (tests/golden/for_iter_pair.jai) and the two together are what took
+#: the benchmark from 176ms to 117ms.
 #:
 #: The dispatch is at RUNTIME, so everything below must behave exactly as it did
 #: before: `items()` called on anything else is still that object's own method,

@@ -5388,6 +5388,170 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_FOR_ITER_PAIR: {
+            /* `for (a, b) in xs` over a list of 2-tuples, stepped inline.
+             *
+             * Deliberately NOT the jitIterStep call-out the list arm of
+             * OP_FOR_ITER_BIND uses. That helper advances the iterator before
+             * returning, so a component-kind guard after it would deopt to an
+             * instruction that has already happened -- and under
+             * JAITHON_JIT_DEOPT_STRESS every guard is turned into an
+             * unconditional branch, which would then skip an element on every
+             * pass. Every guard here is placed BEFORE anything is written, so
+             * resuming at this very instruction is exact whether the guard
+             * failed for a real reason or because the stress flag forced it.
+             *
+             * The reachable iterator is always a list one -- shape != 0 comes
+             * only from OP_GET_ITER's jitMakeIter, over a SLOT_LIST -- but the
+             * kind is guarded anyway rather than assumed, because that fact
+             * lives two arms away. */
+            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER) {
+                return false;
+            }
+            if (e->stackShape[e->depth - 1] == 0) {
+                /* A range head yields ints, which never destructure. */
+                e->whyNot = "destructuring what a range yields";
+                return false;
+            }
+            int16_t  pjump = jaiReadI16(code + off + 1);
+            unsigned pslotA = jaiReadU16(code + off + 3);
+            unsigned pslotB = jaiReadU16(code + off + 5);
+            if (!localInRange(e, pslotA) || !localInRange(e, pslotB)) {
+                return false;
+            }
+            if (pslotA == pslotB) {
+                /* `for (x, x) in …`: legal, and the second write wins. Not
+                 * worth a special case; the interpreter keeps it. */
+                e->whyNot = "a pair loop binding one slot twice";
+                return false;
+            }
+
+            /* Component kinds come from the element the list was holding when
+             * the iterator was built (OP_GET_ITER carries it forward), and the
+             * guards below are what make that a specialisation rather than an
+             * assumption. */
+            Value psample = e->stackSeen[e->depth - 1];
+            if (!IS_TUPLE(psample) || AS_TUPLE(psample)->count != 2) {
+                e->whyNot = "pair element is not a 2-tuple";
+                return false;
+            }
+            SlotKind pk[2];
+            unsigned ptag[2];
+            Value pseen[2] = { AS_TUPLE(psample)->items[0],
+                               AS_TUPLE(psample)->items[1] };
+            for (unsigned i = 0; i < 2; i++) {
+                Value v = pseen[i];
+                if (IS_INT(v))        { pk[i] = SLOT_INT;   ptag[i] = VAL_INT; }
+                else if (IS_FLOAT(v)) { pk[i] = SLOT_FLOAT; ptag[i] = VAL_FLOAT; }
+                else if (IS_BOOL(v))  { pk[i] = SLOT_BOOL;  ptag[i] = VAL_BOOL; }
+                else if (IS_OBJ(v) && AS_OBJ(v) != NULL) {
+                    /* Held raw, like any other SLOT_OBJ: the tag guard is the
+                     * whole of what this promises, and an arm that wants to
+                     * know WHICH object type checks that itself. */
+                    pk[i] = SLOT_OBJ; ptag[i] = VAL_OBJ;
+                } else {
+                    e->whyNot = "pair component kind unknown";
+                    return false;
+                }
+            }
+            if (!adoptLocalKindSeen(e, pslotA, pk[0], 0, NULL, pseen[0]) ||
+                !adoptLocalKindSeen(e, pslotB, pk[1], 0, NULL, pseen[1])) {
+                e->whyNot = "loop variable took two kinds";
+                return false;
+            }
+
+            unsigned rIter = pushReg(e) - 1;
+
+            /* Really a list iterator, and its source really a list. */
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIter,
+                               (unsigned)offsetof(ObjIter, kind)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+            emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIter,
+                               (unsigned)offsetof(ObjIter, source) + 8));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            /* A list that grew or shrank under the loop must raise, and the
+             * version is the only thing that says so. Nothing has happened
+             * yet, so the interpreter raises it from this instruction. */
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                               (unsigned)offsetof(ObjList, version)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_C, rIter,
+                               (unsigned)offsetof(ObjIter, version)));
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_C));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIter,
+                               (unsigned)offsetof(ObjIter, index)));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_D, rIter,
+                               (unsigned)offsetof(ObjIter, limit)));
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            /* The exhausted arm drops the iterator, so the target is reached
+             * one entry shallower than this branch leaves from. */
+            branchToDepth(e, (uint32_t)((int32_t)(off + 7) + pjump),
+                          JAI_A64_GE,
+                          (int)stackSignatureAt(e, e->depth - 1));
+
+            /* items is reloaded rather than hoisted: a reallocation bumps the
+             * version, which the guard above covers, and one ldr removes the
+             * question. */
+            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                               (unsigned)offsetof(ObjList, items)));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                  JIT_SCRATCH_C, 4));
+
+            /* The element is a 2-tuple whose components have the sampled
+             * kinds. Object type is checked before `count` is read: VAL_OBJ
+             * covers every heap object, so a string beside the sampled tuple
+             * would otherwise have `count` read out of an ObjString. */
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, VAL_OBJ));
+            branchOnDeopt(e, JAI_A64_NE);
+            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B, 8));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_TUPLE));
+            branchOnDeopt(e, JAI_A64_NE);
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                               (unsigned)offsetof(ObjTuple, count)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 2));
+            branchOnDeopt(e, JAI_A64_NE);
+            for (unsigned i = 0; i < 2; i++) {
+                unsigned at = (unsigned)offsetof(ObjTuple, items) +
+                              i * (unsigned)sizeof(Value);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ptag[i]));
+                branchOnDeopt(e, JAI_A64_NE);
+            }
+
+            /* Past the last guard: from here nothing may fail, and every write
+             * below is what the interpreter would have left behind. The index
+             * goes first because localOut spends JIT_SCRATCH_C and
+             * JIT_SCRATCH_D on the tag of a slot that lives in the frame; only
+             * the element pointer in JIT_SCRATCH_B survives it. */
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 1));
+            emit(e, jaiA64StrX(JIT_SCRATCH_C, rIter,
+                               (unsigned)offsetof(ObjIter, index)));
+            /* A bool is one byte (see OP_GET_INDEX) -- the rest of its payload
+             * word is stale, and a SLOT_BOOL register must hold 0 or 1. */
+            for (unsigned i = 0; i < 2; i++) {
+                unsigned at = (unsigned)offsetof(ObjTuple, items) +
+                              i * (unsigned)sizeof(Value) + 8u;
+                if (pk[i] == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                } else {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                }
+                localOut(e, i == 0 ? pslotA : pslotB, JIT_SCRATCH_A);
+            }
+            e->wroteHeap = true;
+            off += 7;
+            break;
+        }
+
         case OP_GET_INDEX: {
             /* `s[i]` on a string: every guard is a load+compare, and the result is a table lookup, not an
              * allocation (the 128 one-byte strings are made once and shared). Without this the whole loop around a character scan declines -- why `str_search` ran interpreted end to end, and every lexer scans one byte at a time. */
