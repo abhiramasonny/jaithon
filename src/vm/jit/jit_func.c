@@ -447,7 +447,7 @@ typedef struct {
     /* `for i in a..b` compiled as a counted loop: the iterator object stays on the interpreter's stack
      * untouched, only its index rides in a register, and every exit writes it back. */
     bool      hasIter;
-    uint8_t   iterKind;   /* 1 a unit-step range, 2 a list */
+    uint8_t   iterKind;   /* 1 a unit-step range, 2 a list, 3 a dict-items view */
     Value     elemSample;
     /* Per-slot register assignment. Historically one flag gated the whole loop on a budget check that
      * almost nothing passed, so most loops ran fully in memory. Three things fixed it: only NAMED slots take a register; a float slot takes v8..v15 instead of an X register; overflow slots stay in the frame (busiest slots win, weighted by loop nesting) rather than all-or-nothing. */
@@ -642,12 +642,20 @@ static void emit(Emit *e, uint32_t word) {
  * so this is numbered after the two a range keeps, and a range's locals begin where it would have been. */
 #define JIT_START_REG (JIT_FIRST_SAVED + 3u)
 #define JIT_ITER_REG  (JIT_FIRST_SAVED + 4u)
+/* The ObjIter a dict-items head is walking, and the ONLY register that head
+ * reserves: it keeps no index and no limit, because the step reads both out of
+ * the iterator and writes the index straight back, so nothing has to be
+ * unwound at an exit. Numbered second so a dict head's locals start where a
+ * range head's index would have been -- see osrReserved. */
+#define JIT_PAIR_ITER_REG (JIT_FIRST_SAVED + 1u)
 
 /* OSR reserves only the slots pointer plus (for a range loop) the iterator's index and limit --
  * not the ObjIter or the start, which are folded in via a prologue bias. Bias is sound only while start+limit fits int64; jaiJitEnterOsr refuses entry otherwise since that's a property of the iterator, not the code. */
 static unsigned osrReserved(const Emit *e) {
     if (!e->hasIter) return 1u;
-    return e->iterKind == 1 ? 3u : 5u;
+    if (e->iterKind == 1) return 3u;
+    if (e->iterKind == 3) return 2u;   /* dict items: the ObjIter, nothing else */
+    return 5u;
 }
 
 static unsigned regBase(const Emit *e) {
@@ -5713,10 +5721,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * only from OP_GET_ITER's jitMakeIter, over a SLOT_LIST -- but the
              * kind is guarded anyway rather than assumed, because that fact
              * lives two arms away. */
-            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER) {
+            /* As the head of an OSR loop the iterator is not on the modelled
+             * operand stack at all -- it arrives in a reserved register and
+             * stays on the interpreter's stack, which is what lets an exit
+             * leave without unwinding anything. Only iterKind 3 gets here: a
+             * range or list head is an OP_FOR_ITER_BIND. */
+            bool pairHead = e->osr && e->hasIter && e->iterKind == 3 &&
+                            (uint32_t)off == e->osrTop;
+            if (!pairHead &&
+                (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER)) {
                 return false;
             }
-            if (e->stackShape[e->depth - 1] == 0) {
+            if (!pairHead && e->stackShape[e->depth - 1] == 0) {
                 /* A range head yields ints, which never destructure. */
                 e->whyNot = "destructuring what a range yields";
                 return false;
@@ -5738,8 +5754,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * the iterator was built (OP_GET_ITER / OP_GET_ITER_ITEMS carries
              * it forward), and the guards below are what make that a
              * specialisation rather than an assumption. */
-            bool pairIsDict = e->stackShape[e->depth - 1] == 4;
-            Value psample = e->stackSeen[e->depth - 1];
+            bool pairIsDict = pairHead || e->stackShape[e->depth - 1] == 4;
+            Value psample = pairHead ? e->elemSample : e->stackSeen[e->depth - 1];
             SlotKind pk[2];
             unsigned ptag[2];
             Value pseen[2];
@@ -5781,9 +5797,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
 
-            unsigned rIter = pushReg(e) - 1;
+            unsigned rIter = pairHead ? JIT_PAIR_ITER_REG : pushReg(e) - 1;
             uint32_t pairExit = (uint32_t)((int32_t)(off + 7) + pjump);
-            int      pairExitDepth = (int)stackSignatureAt(e, e->depth - 1);
+            /* A head's exit leaves the model at the depth it is already at --
+             * the iterator it drops was never in the model. Registering it as
+             * iterExit is what makes the exit stub tell the interpreter to pop
+             * the exhausted iterator off its own stack. */
+            int pairExitDepth = pairHead
+                                    ? (int)stackSignature(e)
+                                    : (int)stackSignatureAt(e, e->depth - 1);
+            if (pairHead) e->iterExit = pairExit;
 
             if (pairIsDict) {
                 /* iterStepPairFast's ITER_DICT_ITEMS case plus the jaiTableNext
@@ -8036,7 +8059,12 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             emit(&e, jaiA64LdrD(e.slotFpReg[i], JIT_SLOTS_REG, i * 16u + 8u));
         }
     }
-    if (hasIter) {
+    if (hasIter && iterKind == 3) {
+        /* A dict-items head keeps only the pointer: its index, limit and
+         * version all live in the ObjIter and the step reads them there, so
+         * there is nothing to hoist here and nothing to write back at an exit. */
+        emit(&e, jaiA64MovX(JIT_PAIR_ITER_REG, 1));
+    } else if (hasIter) {
         /* x1 is the iterator on entry. A range head reads everything it wants
          * out of it here and parks the pointer in the frame; a list head keeps
          * it, because its version guard reads the iterator every iteration. */
@@ -8086,7 +8114,10 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
  * interpreter carries on from stale values. */
 #define OSR_SYNC_ITER()                                                        \
     do {                                                                       \
-        if (hasIter) {                                                         \
+        /* iterKind 3 keeps nothing in a register but the pointer, and the step \
+         * has already stored the index it advanced -- so every way out of a    \
+         * dict-items loop finds the ObjIter already current. */                \
+        if (hasIter && iterKind != 3) {                                        \
             /* A range head left the iterator in the frame rather than in a    \
              * register, so it comes back here. Every stub this expands into   \
              * is a way out of the loop, so the load is off the hot path and   \
@@ -8379,8 +8410,11 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     /* A for-loop head keeps its iterator on the stack. Only a range from zero
      * in unit steps is taken, because that is what makes the yielded value the
      * index and lets the body run against a plain counter. */
-    bool hasIter = top < (uint32_t)fn->chunk.count &&
-                   fn->chunk.code[top] == OP_FOR_ITER_BIND;
+    bool pairTop = top < (uint32_t)fn->chunk.count &&
+                   fn->chunk.code[top] == OP_FOR_ITER_PAIR;
+    bool hasIter = pairTop ||
+                   (top < (uint32_t)fn->chunk.count &&
+                    fn->chunk.code[top] == OP_FOR_ITER_BIND);
     ObjIter *iter = NULL;
     uint8_t iterKind = 0;
     Value elemSample = NULL_VAL;
@@ -8389,7 +8423,19 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         Value it = vm.stackTop[-1];
         if (!IS_ITER(it)) return 0;
         iter = AS_ITER(it);
-        if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
+        if (pairTop) {
+            /* `for (k, v) in d.items()` at the top of the loop being entered.
+             * Only the lazy dict view: a pair loop over a LIST of tuples has no
+             * head arm, and letting it through here would enter a form compiled
+             * for a dict with an ObjList in the register. The sample is the
+             * dict itself -- the head arm reads the first live entry out of it
+             * for the component kinds, as the list head reads items[index]. */
+            if (iter->kind != ITER_DICT_ITEMS || !IS_DICT(iter->source)) {
+                return 0;
+            }
+            elemSample = iter->source;
+            iterKind = 3;
+        } else if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
             /* Unit steps only -- that is what makes the yielded value start
              * plus the index. The start need not be 0; it is loaded at entry. */
             if (AS_RANGE(iter->source)->step != 1) return 0;
