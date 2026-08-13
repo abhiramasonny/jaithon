@@ -124,43 +124,18 @@ Obj *jaiAllocateObject(size_t size, ObjType type) {
 void jaiFreeObject(Obj *obj) {
     if (obj == NULL) return;
 
+    /* Every kind whose whole footprint is its own block -- string, instance,
+     * tuple, iterator, range and the rest -- is sized in one place, and the
+     * sweep uses the same answer without coming through here at all. The
+     * intern table holds only weak references and is purged by the sweep, so a
+     * string has nothing to unlink either. */
+    size_t sole = jaiObjSoleBlock(obj);
+    if (sole != 0) {
+        (void)jaiRealloc(obj, sole, 0);
+        return;
+    }
+
     switch (obj->type) {
-    case OBJ_STRING: {
-        /* Flexible array: header and payload are one block. The intern table
-         * holds only weak references and is purged by the sweep, so there is
-         * nothing to unlink here. */
-        ObjString *s = (ObjString *)obj;
-        /* A slice carries no bytes of its own; the buffer is swept separately
-         * once nothing views it. */
-        (void)jaiRealloc(obj, s->owner != NULL ? sizeof(ObjString)
-                                               : JAI_STRING_ALLOC(s->length), 0);
-        return;
-    }
-    case OBJ_STRBUF: {
-        ObjStrBuf *b = (ObjStrBuf *)obj;
-        (void)jaiRealloc(obj, sizeof(ObjStrBuf) + b->capacity + 1, 0);
-        return;
-    }
-    case OBJ_BYTES: {
-        ObjBytes *b = (ObjBytes *)obj;
-        (void)jaiRealloc(obj, sizeof(ObjBytes) + b->length, 0);
-        return;
-    }
-    case OBJ_TUPLE: {
-        ObjTuple *t = (ObjTuple *)obj;
-        (void)jaiRealloc(obj, sizeof(ObjTuple) + sizeof(Value) * (size_t)t->count, 0);
-        return;
-    }
-    case OBJ_INSTANCE: {
-        ObjInstance *inst = (ObjInstance *)obj;
-        (void)jaiRealloc(obj, sizeof(ObjInstance) + sizeof(Value) * (size_t)inst->fieldCount, 0);
-        return;
-    }
-    case OBJ_ENUM_VAL: {
-        ObjEnumVal *ev = (ObjEnumVal *)obj;
-        (void)jaiRealloc(obj, sizeof(ObjEnumVal) + sizeof(Value) * (size_t)ev->count, 0);
-        return;
-    }
     case OBJ_LIST: {
         ObjList *l = (ObjList *)obj;
         JAI_FREE_ARRAY(Value, l->items, l->capacity);
@@ -179,9 +154,6 @@ void jaiFreeObject(Obj *obj) {
         JAI_FREE(ObjSet, obj);
         return;
     }
-    case OBJ_RANGE:
-        JAI_FREE(ObjRange, obj);
-        return;
     case OBJ_FUNCTION: {
         ObjFunction *fn = (ObjFunction *)obj;
         jaiChunkFree(&fn->chunk);
@@ -197,15 +169,6 @@ void jaiFreeObject(Obj *obj) {
         JAI_FREE(ObjClosure, obj);
         return;
     }
-    case OBJ_UPVALUE:
-        JAI_FREE(ObjUpvalue, obj);
-        return;
-    case OBJ_NATIVE:
-        JAI_FREE(ObjNative, obj);
-        return;
-    case OBJ_BOUND:
-        JAI_FREE(ObjBound, obj);
-        return;
     case OBJ_CLASS: {
         ObjClass *c = (ObjClass *)obj;
         JAI_FREE_ARRAY(FieldInfo, c->fields, c->fieldCount);
@@ -244,9 +207,6 @@ void jaiFreeObject(Obj *obj) {
         JAI_FREE(ObjEnum, obj);
         return;
     }
-    case OBJ_ITER:
-        JAI_FREE(ObjIter, obj);
-        return;
     case OBJ_FILE: {
         ObjFile *f = (ObjFile *)obj;
         /* A file reaching the collector without being closed is closed here;
@@ -260,16 +220,28 @@ void jaiFreeObject(Obj *obj) {
         JAI_FREE(ObjFile, obj);
         return;
     }
+    /* Freed above, off jaiObjSoleBlock's size. Named rather than defaulted so
+     * that -Wswitch still forces a new kind to be classified in both places. */
+    case OBJ_STRING:
+    case OBJ_STRBUF:
+    case OBJ_BYTES:
+    case OBJ_TUPLE:
+    case OBJ_INSTANCE:
+    case OBJ_ENUM_VAL:
+    case OBJ_RANGE:
+    case OBJ_UPVALUE:
+    case OBJ_NATIVE:
+    case OBJ_BOUND:
+    case OBJ_ITER:
     case OBJ_ENUM_CTOR:
-        JAI_FREE(ObjEnumCtor, obj);
-        return;
-
     case OBJ_TYPE_COUNT:
-        break;   /* not a real tag; fall through to the panic below */
+        break;   /* fall through to the panic below */
     }
 
-    /* Every real tag returns from its own case. Reaching here means obj->type
-     * is corrupt, and there is no size with which to free it correctly. */
+    /* Every compound tag returns from its own case and every sole-block tag
+     * returned above. Reaching here means obj->type is corrupt, or that a kind
+     * is classified as sole-block by one of the two and compound by the other
+     * -- and there is no size with which to free it correctly either way. */
     JAI_PANIC("jaiFreeObject: object with invalid type tag %d", (int)obj->type);
 }
 
