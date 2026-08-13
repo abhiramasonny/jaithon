@@ -197,7 +197,6 @@ static int jitMakeIter(JitCallDesc *d) {
     return IS_LIST(src) ? 0 : 1;
 }
 
-/* One step. 0 advanced with the item in `result`, 1 exhausted, 2 raised. */
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 static int jitFormat(JitCallDesc *d) {
@@ -206,16 +205,6 @@ static int jitFormat(JitCallDesc *d) {
     jaiGCPopRootRange();
     if (formatted == NULL) return 1;
     d->result = OBJ_VAL(formatted);
-    return 0;
-}
-
-static int jitIterStep(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
-    Value item;
-    bool ok = jaiIterNext(AS_ITER(d->args[0]), &item);
-    jaiGCPopRootRange();
-    if (!ok) return vm.hasException ? 2 : 1;
-    d->result = item;
     return 0;
 }
 
@@ -1847,7 +1836,8 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
                                uint32_t shape, ObjClass *klass, Value seen);
 
 /* ownStatus: caller decodes the helper's return itself, skipping the built-in "nonzero means raised"
- * test. Only the iterator step needs this (0 yielded, 1 exhausted, 2 raised) -- the default test sent `exhausted` to the throw stub, which found no pending exception and died on "internal error: failed operation raised nothing"; the call site's EQ/GT tests were dead code until this existed. */
+ * test. Written for the iterator step (0 yielded, 1 exhausted, 2 raised), whose call-out the list arm of
+ * OP_FOR_ITER_BIND no longer makes -- the default test sent `exhausted` to the throw stub, which found no pending exception and died on "internal error: failed operation raised nothing". Kept because any helper with a three-way answer needs it, and because the lesson is not rediscoverable from the code. */
 /* Root-fills the descriptor: shared by the descriptor path (a C helper pushes them) and the self-call
  * path (the emitted code links the descriptor onto the collector's frame chain instead, since a bare `bl` pushes nothing). */
 static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
@@ -5223,45 +5213,125 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * the stepped path this test has always sent it down. */
                 uint32_t iterShape = e->stackShape[e->depth - 1];
                 if (iterShape != 0 && iterShape != 2 && iterShape != 3) {
-                    /* A list iterator: ask the runtime for each element and
-                     * take the kind from the one it is holding now. */
+                    /* A list iterator, stepped inline (jaiIterNext's ITER_LIST
+                     * case, instruction for instruction) rather than through
+                     * jitIterStep. The kind still comes from the element the
+                     * list is holding now, but the tag of what the step
+                     * actually produces is GUARDED, and every guard runs
+                     * BEFORE the index advances.
+                     *
+                     * Calling out cannot be made sound: jitIterStep advances
+                     * the iterator before it returns, so a guard on its result
+                     * has nowhere to resume -- this instruction would re-run
+                     * and SKIP an element, and under
+                     * JAITHON_JIT_DEOPT_STRESS (where branchOnDeopt is
+                     * unconditional) it would skip one on every iteration of
+                     * every list loop. Reading the payload out of the
+                     * descriptor with no tag check at all was worse: a list
+                     * sampled as int and later pushed a str bound the string's
+                     * POINTER as an integer (probe: 41080394656 where the
+                     * interpreter raises TypeError), and a float's IEEE bits
+                     * likewise. Inline, nothing has happened when a guard
+                     * fires, so the resume point is this instruction and the
+                     * interpreter does the raise. */
                     Value sample = e->stackSeen[e->depth - 1];
-                    SlotKind ek; uint32_t esh = 0; ObjClass *ecl = NULL;
-                    if (IS_INT(sample))        ek = SLOT_INT;
-                    else if (IS_FLOAT(sample)) ek = SLOT_FLOAT;
+                    SlotKind ek; unsigned etag; uint32_t esh = 0;
+                    ObjClass *ecl = NULL;
+                    if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
+                    else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
                     else if (IS_INSTANCE(sample) && AS_INSTANCE(sample)->klass) {
-                        ek = SLOT_INST;
+                        ek = SLOT_INST; etag = VAL_OBJ;
                         ecl = AS_INSTANCE(sample)->klass;
                         esh = ecl->shapeId;
                     } else { e->whyNot = "element kind unknown"; return false; }
-
-                    if (!emitDescriptorStatus(e, NULL_VAL, e->depth - 1, 1,
-                                              (void *)&jitIterStep, true,
-                                              -1)) {
-                        return false;
-                    }
-                    /* 1 is exhausted, anything higher is a raise. */
-                    emit(e, jaiA64SubsXImm(31, 0, 1));
-                    branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
-                                  JAI_A64_EQ,
-                                  (int)stackSignatureAt(e, e->depth - 1));
-                    emit(e, jaiA64SubsXImm(31, 0, 1));
-                    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
-                    e->fixups[e->fixupCount].instIndex    = (int)e->count;
-                    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
-                    e->fixups[e->fixupCount].conditional  = true;
-                    e->fixups[e->fixupCount].depth        = -1;
-                    e->fixupCount++;
-                    emit(e, jaiA64BCond(JAI_A64_GT, 0));
 
                     if (!adoptLocalKindSeen(e, fslot, ek, esh, ecl, sample)) {
                         e->whyNot = "loop variable took two kinds";
                         return false;
                     }
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, 31,
-                                       e->descOffset +
-                                           (unsigned)offsetof(JitCallDesc, result) + 8));
+
+                    /* Only OP_GET_ITER's list arm makes a shape-nonzero
+                     * SLOT_ITER, and SLOT_ITER is never adopted into a local,
+                     * so this is an ITER_LIST over an ObjList. Checked anyway,
+                     * one load: the alternative is reading an ObjString or an
+                     * ObjDict through ObjList's offsets if another iterator
+                     * shape is ever added above, and a wrong answer is the one
+                     * failure mode this tier is not allowed. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIt,
+                                       (unsigned)offsetof(ObjIter, kind)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
+                                       (unsigned)offsetof(ObjIter, source) + 8));
+
+                    /* Mutation first, as jaiIterNext tests it: a list that grew
+                     * or shrank under the loop must raise, and the version is
+                     * the only thing that says so. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(ObjList, version)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_B, rIt,
+                                       (unsigned)offsetof(ObjIter, version)));
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                    branchOnDeopt(e, JAI_A64_NE);
+
+                    /* `limit` is the snapshot count, not the live one -- the
+                     * version guard above owns any disagreement between them. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, rIt,
+                                       (unsigned)offsetof(ObjIter, index)));
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIt,
+                                       (unsigned)offsetof(ObjIter, limit)));
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                    /* The exhausted arm drops the iterator, so the target is
+                     * reached one entry shallower than this branch leaves
+                     * from. */
+                    branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                                  JAI_A64_GE,
+                                  (int)stackSignatureAt(e, e->depth - 1));
+
+                    /* Reload items rather than hoisting: a reallocation bumps
+                     * the version, which the guard above covers. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(ObjList, items)));
+                    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                          JIT_SCRATCH_A, 4));
+
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, etag));
+                    branchOnDeopt(e, JAI_A64_NE);
+
+                    if (ek == SLOT_INST) {
+                        /* VAL_OBJ is every heap object, so the object type is
+                         * checked before `klass` is read -- otherwise a list
+                         * that gained a string reads `klass` one word past an
+                         * ObjString's header. JIT_SCRATCH_A still holds the
+                         * index and must survive to the store below. */
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C, 8));
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(Obj, type)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
+                        branchOnDeopt(e, JAI_A64_NE);
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(ObjInstance, klass)));
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(ObjClass, shapeId)));
+                        emitConst64(e, JIT_SCRATCH_D, (int64_t)esh);
+                        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_D));
+                        branchOnDeopt(e, JAI_A64_NE);
+                    }
+
+                    /* Past the last guard: advance, then bind. The advance goes
+                     * first because localOut may use JIT_SCRATCH_C/D for the
+                     * tag and the index has to be stored out of a register the
+                     * write cannot touch. */
+                    emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_A, 1));
+                    emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
+                                       (unsigned)offsetof(ObjIter, index)));
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
                     localOut(e, fslot, JIT_SCRATCH_A);
+                    /* The index store is a heap write, as the call-out this
+                     * replaced was: a bail after it would re-run the loop from
+                     * the top with the iterator already advanced. */
                     e->wroteHeap = true;
                     off += 5;
                     break;
@@ -5441,10 +5511,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_FOR_ITER_PAIR: {
             /* `for (a, b) in xs` over a list of 2-tuples, stepped inline.
              *
-             * Deliberately NOT the jitIterStep call-out the list arm of
-             * OP_FOR_ITER_BIND uses. That helper advances the iterator before
-             * returning, so a component-kind guard after it would deopt to an
-             * instruction that has already happened -- and under
+             * Deliberately not a call-out to a helper that steps the iterator.
+             * OP_FOR_ITER_BIND's list arm used to be one, and it is inline for
+             * the same reason this is: such a helper advances the iterator
+             * before returning, so a component-kind guard after it would deopt
+             * to an instruction that has already happened -- and under
              * JAITHON_JIT_DEOPT_STRESS every guard is turned into an
              * unconditional branch, which would then skip an element on every
              * pass. Every guard here is placed BEFORE anything is written, so
