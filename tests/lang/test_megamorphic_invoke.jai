@@ -21,39 +21,55 @@ from std.test import assert_eq, assert_throws
 
 trait Op {
     fn tag(self) -> int
+
     fn twice(self) -> int
 }
 
 class A: Op {
     pub fn tag(self) -> int { return 1 }
+
     pub fn twice(self) -> int { return 10 }
 }
+
 class B: Op {
     pub fn tag(self) -> int { return 2 }
+
     pub fn twice(self) -> int { return 20 }
 }
+
 class C: Op {
     pub fn tag(self) -> int { return 3 }
+
     pub fn twice(self) -> int { return 30 }
 }
+
 class D: Op {
     pub fn tag(self) -> int { return 4 }
+
     pub fn twice(self) -> int { return 40 }
 }
+
 class E: Op {
     pub fn tag(self) -> int { return 5 }
+
     pub fn twice(self) -> int { return 50 }
 }
+
 class F: Op {
     pub fn tag(self) -> int { return 6 }
+
     pub fn twice(self) -> int { return 60 }
 }
+
 class G: Op {
     pub fn tag(self) -> int { return 7 }
+
     pub fn twice(self) -> int { return 70 }
 }
+
 class H: Op {
     pub fn tag(self) -> int { return 8 }
+
     pub fn twice(self) -> int { return 80 }
 }
 
@@ -61,7 +77,9 @@ class H: Op {
 #: the ninth also has a method the other eight do not.
 class I: Op {
     pub fn tag(self) -> int { return 9 }
+
     pub fn twice(self) -> int { return 90 }
+
     pub fn only_mine(self) -> int { return 900 }
 }
 
