@@ -138,13 +138,6 @@ static inline int32_t lowerCp(int32_t c) {
 static inline bool isCasedCp(int32_t c) {
     return upperCp(c) != c || lowerCp(c) != c;
 }
-static inline bool isUpperCp(int32_t c) {
-    return lowerCp(c) != c;
-}
-static inline bool isLowerCp(int32_t c) {
-    return upperCp(c) != c;
-}
-
 static const CpRange kDigitRanges[] = {
     {0x0030, 0x0039}, {0x0660, 0x0669}, {0x06F0, 0x06F9}, {0x07C0, 0x07C9},
     {0x0966, 0x096F}, {0x09E6, 0x09EF}, {0x0A66, 0x0A6F}, {0x0AE6, 0x0AEF},
@@ -767,11 +760,6 @@ static inline char *writeRepeated(char *dst, const char *pattern,
     }
 
     return dst + total;
-}
-
-static void appendFill(JaiBuf *buf, const char *fill, int fillLen, int64_t n) {
-    for (int64_t i = 0; i < n; i++)
-        jaiBufAppend(buf, fill, (size_t)fillLen);
 }
 
 /* Shared body for pad_left/pad_right/center. `side` is -1, 1 or 0. */
