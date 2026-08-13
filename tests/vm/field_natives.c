@@ -235,6 +235,7 @@ int main(void) {
          * count. */
         const int sizes[] = {0, 1, 7, 19, 23};
         bool discriminated = false;
+        bool sawUnset = false;
         size_t aliasAt = 0;
         for (unsigned s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
             Value recv;
@@ -250,7 +251,19 @@ int main(void) {
                 break;
             }
 
-            if (r->lazy) {
+            /* An INTERNED receiver is not fresh, whatever this test did to
+             * build it. jaiStringNew still interns anything short, so at the
+             * small sizes below the object that comes back is whichever one
+             * the process already had -- and on a COLD __jaicache__ the
+             * prelude compile has already asked it for its scalar count, so
+             * the memo is full and the sentinel is gone. That made this check
+             * pass on a warm cache and fail 5/5 on a cold one, i.e. fail on
+             * every fresh clone. The sentinel is only meaningful for a
+             * receiver nothing else can be holding. */
+            bool freshEnough = OBJ_TYPE(recv) != OBJ_STRING ||
+                               !JAI_STR_INTERNED(AS_STRING(recv));
+            if (r->lazy && freshEnough) {
+                sawUnset = true;
                 gChecks++;
                 int64_t before = fieldLoad(r, recv);
                 if (before != (int64_t)(uint64_t)r->sentinel) {
@@ -267,6 +280,16 @@ int main(void) {
                 discriminated = true;
             }
             jaiPopRoot();
+        }
+        if (r->lazy) {
+            /* Skipping every size would retire the sentinel check without
+             * anyone noticing -- the same failure mode as the alias check
+             * below. At least one size must produce a non-interned receiver. */
+            gChecks++;
+            if (!sawUnset) {
+                fail(r, "every receiver this test built was interned, so the "
+                        "empty-memo case was never exercised");
+            }
         }
         gChecks++;
         if (!discriminated) {
