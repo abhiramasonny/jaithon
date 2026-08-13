@@ -29,6 +29,7 @@ int jaiOpBranchOperandAt(uint8_t op) {
      * turns out to be a dict. Missing from this list when the opcode landed,
      * which left the verifier unable to see the edge at all. */
     case OP_GET_ITER_ITEMS:
+    case OP_FOR_RANGE_BIND:
     case OP_PUSH_FINALLY:
     case OP_PUSH_HANDLER:
         return 0;
@@ -95,6 +96,15 @@ static int slotOperands(uint8_t op, int *out) {
         out[0] = 2;   /* both slots follow the i16 jump */
         out[1] = 4;
         return 2;
+    case OP_ITER_RANGE:
+        out[0] = 1;   /* both slots follow the u8 inclusive flag */
+        out[1] = 3;
+        return 2;
+    case OP_FOR_RANGE_BIND:
+        out[0] = 2;   /* loop variable, counter and end follow the i16 jump */
+        out[1] = 4;
+        out[2] = 6;
+        return 3;
     case OP_JUMP_IF_CMP_LOCAL_K:
         out[0] = 1;   /* the slot follows the u8 comparison */
         return 1;
@@ -395,7 +405,7 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
             }
         }
 
-        int slotAt[2];
+        int slotAt[3];
         int slotCount = slotOperands(op, slotAt);
         for (int k = 0; k < slotCount; k++) {
             uint16_t slot = jaiReadU16(a + slotAt[k]);
@@ -568,6 +578,12 @@ bool jaiVerifyChunk(const ObjFunction *fn, char *errBuf, size_t errBufSize) {
                 case OP_FOR_ITER_PAIR:
                     /* Exhaustion pops the iterator and leaves the loop. */
                     jumpDepth = here - 1;
+                    break;
+                case OP_FOR_RANGE_BIND:
+                    /* A range loop keeps nothing on the operand stack, so
+                     * unlike its three neighbours above there is nothing for
+                     * exhaustion to pop. */
+                    jumpDepth = here;
                     break;
                 case OP_MATCH_FIELDS:
                     jumpDepth = here;   /* nothing destructured on no-match */
