@@ -502,6 +502,17 @@ jit-declines-check:
 jit-compile-check: $(TARGET)
 	@python3 scripts/jit_compile_check.py
 
+# The split operand bank makes the operand stack two runs of registers instead
+# of one, and a site that adds an index to a base can then land one past the end
+# of the first run -- silently, into a register nothing reads.
+# JAITHON_JIT_SPLIT_STRESS=1 puts that boundary into every OSR body that can
+# take one rather than only the ones that pay for it, and this runs the
+# benchmarks against the interpreter under it. Not in `test`: it runs the
+# benchmark suite four times over.
+.PHONY: jit-split-check
+jit-split-check:
+	@./scripts/jit_split_check.sh
+
 # The kind-mutation fuzzer: 144 generated programs, each warming a loop until it
 # compiles and then putting a different kind where the tier sampled one, run
 # four ways and diffed against the interpreter.
