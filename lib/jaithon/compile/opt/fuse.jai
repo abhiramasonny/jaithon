@@ -181,6 +181,47 @@ fn _fuse_at(code: Code, index: int) -> bool {
         return true
     }
 
+    # FOR_ITER J; UNPACK 2 255; BIND a; BIND b  ->  FOR_ITER_PAIR J, a, b.
+    #
+    # `for (a, b) in <anything>` lowers to exactly these four, whatever the
+    # receiver is — a dict's items, a list of tuples, `enumerate`, a user
+    # iterator. Matching the BYTECODE rather than the loop pattern is what makes
+    # one rule cover all of them: the emitter has no checker types (see its own
+    # note) and cannot tell a dict from a user class that defines `items()`,
+    # while this window is the same shape either way.
+    #
+    # `UNPACK 2` pushes right to left, so the leftmost target is on top and the
+    # FIRST `BIND` takes it. That is where the slots come from — reading them
+    # off the two BINDs rather than off the pattern, which is not in source
+    # order relative to the slots the resolver assigns.
+    #
+    # Only the exact `2, no rest` form: `for (a, *rest) in xs` has a rest index
+    # and must keep building its list.
+    #
+    # Longest match first, so it is tested ahead of FOR_ITER; BIND — which
+    # cannot match this window anyway, since w[1] is the UNPACK.
+    if n >= 4 and
+        head.op == opcode(Op.ForIter) and
+        window_clean(code, w, 4) and
+        code.data[w[1]].op == opcode(Op.Unpack) and
+        code.data[w[1]].operands[0] == 2 and
+        code.data[w[1]].operands[1] == 255 and
+        code.data[w[2]].op == opcode(Op.Bind) and
+        code.data[w[3]].op == opcode(Op.Bind) {
+        let target = head.target
+        set_instr(
+            head,
+            opcode(Op.ForIterPair),
+            # The first u16 is patched by `rebuild` from `target`.
+            u16_bytes(0)
+                + u16_bytes(slot_of(code.data[w[2]], 0))
+                + u16_bytes(slot_of(code.data[w[3]], 0))
+        )
+        head.target = target
+        kill_all(code, [w[1], w[2], w[3]])
+        return true
+    }
+
     # FOR_ITER J; BIND a  ->  FOR_ITER_BIND J, a. The loop variable goes straight
     # to its slot. The jump operand keeps byte index 0, so `rebuild` resolves the
     # branch with no special case.
