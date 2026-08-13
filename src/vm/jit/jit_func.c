@@ -4282,10 +4282,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned cond;
             if (!negatedCondition(cmp, &cond)) return false;
             if (!localInRange(e, slot)) return false;
-            if (e->localKind[slot] != SLOT_INT) return false;
-            if (slot == 0) e->usesSlot0 = true;
             if (kIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value k = fn->chunk.constants.data[kIdx];
+
+            /* `if c == "{"` where c came out of a string index. Every hand-written scanner in the language is
+             * this shape, and the peephole folds it to exactly this instruction, so declining it declined the
+             * whole enclosing function -- json_parse's `value` dispatches on six of them. Two interned strings
+             * are equal exactly when they are the same object, which the OP_EQ arm already relies on; the
+             * difference here is that one side is a constant, so its interning is settled at compile time and
+             * only the local needs guarding. Nothing has been written yet, so a guard resumes at this very
+             * instruction. */
+            if ((cmp == OP_EQ || cmp == OP_NE) &&
+                e->localKind[slot] == SLOT_OBJ && IS_STRING(k) &&
+                JAI_STR_INTERNED(AS_STRING(k)) &&
+                IS_STRING(localObserved(e, slot) ? e->observed[slot]
+                                                 : e->localSeen[slot])) {
+                if (slot == 0) e->usesSlot0 = true;
+                settleAll(e);          /* this path guards */
+                unsigned rs = localIn(e, slot, JIT_SCRATCH_C);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+                /* Not interned means content equality is not pointer equality,
+                 * and the interpreter is the one that knows how to tell. */
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, rs,
+                                      (unsigned)offsetof(Obj, subFlag)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
+                emit(e, jaiA64SubsXReg(31, rs, JIT_SCRATCH_B));
+                branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
+                off += 9;
+                break;
+            }
+
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
             if (!IS_INT(k)) return false;
 
             /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's
