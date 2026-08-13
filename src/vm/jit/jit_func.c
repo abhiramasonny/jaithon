@@ -7593,6 +7593,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
      * must all sit inside the ten callee-saved registers; a first pass
      * measures the last of those, and which slots are named at all, and how
      * often each of them is named inside the innermost loop. */
+    unsigned probeMaxValue = 0;
     {
         static Emit probe;
         memset(&probe, 0, sizeof probe);
@@ -7615,6 +7616,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         if (compileBody(&probe, closure) && !probe.failed) {
             unsigned used = probe.maxSlotUsed + 1u;
             if (used < e.locals) e.locals = used;
+            probeMaxValue = probe.maxValue;
 
             /* A body that never calls out and never inlines can put its
              * operand stack in x0..x8 instead of above the locals, and then
@@ -7741,6 +7743,17 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     if (!compileBody(&e, closure) || e.failed) {
         if (getenv("JAI_JIT_WHY")) {
+            /* The register arithmetic, not just the verdict: a "more live
+             * values" decline is unreadable without knowing how many the head
+             * reserved, how deep the body went and which bank it was using --
+             * the shortfall is those three against JIT_MAX_SAVED. Its own
+             * line, and without the words the decline census greps for, so
+             * that adding it cannot invent census entries. */
+            fprintf(stderr,
+                    "[jit] osr at %u registers: %u reserved, %u stack, "
+                    "%u x-locals, bank %s, of %u\n",
+                    top, osrReserved(&e), probeMaxValue, e.xLocals,
+                    e.scratchValues ? "x0" : "callee-saved", JIT_MAX_SAVED);
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
                     e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
         }
