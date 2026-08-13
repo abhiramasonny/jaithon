@@ -7381,7 +7381,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
      * is nothing left to guard here.
      *
      * Except the width. Unlike the function tier, which marshals every argument
-     * through jitArgOut and hands a bool over as a clean 0 or 1, these slots
+     * through jitArgIn and hands a bool over as a clean 0 or 1, these slots
      * are the interpreter's own and BOOL_VAL is a one-byte `strb` -- the seven
      * bytes above a bool are whatever that slot last held. An eight-byte load
      * puts that garbage in a SLOT_BOOL register, and every consumer of one
