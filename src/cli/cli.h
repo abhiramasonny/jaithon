@@ -34,6 +34,7 @@ typedef struct {
     bool  showStats;
     bool  traceExec;
     bool  gcStress;
+    unsigned gcStressEvery;
     bool  noPrelude;
     bool  fmtCheck;
     bool  jsonOutput;

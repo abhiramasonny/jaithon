@@ -6254,6 +6254,7 @@ void jaiVMInit(void) {
     GCState *gc = JAI_ALLOC(GCState, 1);
     jaiGCInit(gc);
     gc->stress = vm.gcStress;
+    gc->stressEvery = vm.gcStressEvery;
     gc->verbose = vm.debugGC;
     /* stress is one of jaiGCLimit's four inputs and this is the only place
      * outside gc.c that writes one. Without this, --gc-stress kept the
