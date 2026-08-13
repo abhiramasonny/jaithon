@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""Every fused opcode must have an arm in the function JIT.
+"""No opcode may newly lack an arm in the function JIT.
 
-The function tier's opcode switch ends in `default: return false`, which
-declines the WHOLE function -- not the instruction. So a fused opcode without an
-arm does not merely run slower: it evicts every function that contains it from
-the compiled tier, and a fused opcode is by construction emitted into exactly
-the hot loops that most want compiling.
+The tier's opcode switch ends in `default: return false`, which declines the
+WHOLE function rather than the instruction. So an opcode without an arm does not
+run slower -- it evicts every function containing it from the compiled tier.
+Adding an opcode is therefore a JIT ADMISSION decision before it is anything
+else, and the cost of getting it wrong is not subtle:
 
-That has now happened twice to the same opcode. `OP_CMP_LOCAL_CONST_LT` shipped
-without an arm and cost 14 distinct declines (docs/roadmap.md), and was still
-missing one on 2026-08-12 -- invisible because no benchmark happened to contain
-it. Fusion is a JIT ADMISSION gate, not a dispatch optimisation: at -O0 life's
-`step` declines at OP_FOR_ITER and runs 151.2 ms; at -O2 the peephole produces
-OP_FOR_ITER_BIND, it compiles, and it runs 21.8 ms. An unhandled fused opcode
-turns that 7x the wrong way round.
+  * `OP_CMP_LOCAL_CONST_LT` shipped with no arm. 906ms against 26ms compiled on
+    a loop of that shape -- 34.8x -- and it went unnoticed because no benchmark
+    happened to contain it.
+  * `OP_ELEM_KIND` shipped with no arm. `tests/bench/sort_merge`'s `merge`, whose
+    body is pushes onto a `list[int]`, declined whole: 270ms -> 510ms. That is a
+    2% suite regression from one missing arm.
 
-So this is a build gate, not a lint. Adding a fused opcode without teaching the
-JIT about it should fail the build, which is strictly stronger than letting it
-fall back to something slower.
+Two rules, because the two kinds of opcode differ in how they arrive:
+
+1. **Fused opcodes must ALWAYS have an arm.** The peephole synthesises them into
+   exactly the hot loops that most want compiling, so one without an arm is
+   worse than not fusing at all. No exceptions list.
+
+2. **Every other opcode is a RATCHET** against tests/vm/jit_unarmed.baseline.
+   67 of them have no arm today and that is not a bug to fix in one go -- but a
+   NEW one is a decision, and this makes it a deliberate one: add the arm, or
+   add the opcode to the baseline with a reason in the commit.
+
+An opcode that GAINS an arm is never an error; the check says so and asks for
+the baseline line to be dropped.
 """
 import pathlib
 import re
@@ -26,12 +35,11 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CHUNK_C = ROOT / "src/vm/bytecode/chunk.c"
 JIT_C = ROOT / "src/vm/jit/jit_func.c"
+BASELINE = ROOT / "tests/vm/jit_unarmed.baseline"
 
-# A fused opcode is one the peephole SYNTHESISES -- it never comes from the
-# parser, so it appears only when the optimiser put it there, and only in code
-# hot enough for the optimiser to have bothered. Listed explicitly rather than
-# inferred: "is this fused" is a judgement about intent, and a wrong guess here
-# would either wave through a real gap or block a build for nothing.
+# Opcodes the PEEPHOLE synthesises. Listed explicitly rather than inferred:
+# "is this fused" is a judgement about intent, and a wrong guess would either
+# wave through a real gap or block a build for nothing.
 FUSED = [
     "OP_ADD_INT_CONST",
     "OP_INC_LOCAL",
@@ -49,48 +57,76 @@ FUSED = [
 ]
 
 
-def opcodes_in_chunk():
+def declared_opcodes():
     body = CHUNK_C.read_text()
     body = body.split("#define JAI_OPCODES(X)", 1)[1].split("#define X_NAME", 1)[0]
-    return set(re.findall(r"X\(\s*(OP_[A-Z0-9_]+)", body))
+    return re.findall(r"X\(\s*(OP_[A-Z0-9_]+)", body)
 
 
-def opcodes_with_jit_arms():
-    text = JIT_C.read_text()
-    return set(re.findall(r"case\s+(OP_[A-Z0-9_]+)\s*:", text))
+def armed_opcodes():
+    return set(re.findall(r"case\s+(OP_[A-Z0-9_]+)\s*:", JIT_C.read_text()))
 
 
 def main():
-    declared = opcodes_in_chunk()
-    armed = opcodes_with_jit_arms()
+    declared = declared_opcodes()
+    armed = armed_opcodes()
     problems = []
+    notes = []
 
     if not declared:
         problems.append("chunk.c: JAI_OPCODES parsed as empty -- regex is stale")
     if not armed:
         problems.append("jit_func.c: no `case OP_...:` found -- regex is stale")
 
-    # The list itself must stay true, or the gate silently checks nothing.
     for name in FUSED:
         if name not in declared:
+            problems.append(f"{name} is in this script's FUSED list but not in "
+                            f"chunk.c -- the list is stale")
+        elif name not in armed:
             problems.append(
-                f"{name} is in this script's FUSED list but not in chunk.c "
-                f"-- the list is stale")
+                f"{name} is FUSED and has no `case {name}:` in "
+                f"src/vm/jit/jit_func.c -- every function the peephole puts it "
+                f"in will decline WHOLE. A fused opcode has no baseline "
+                f"exemption; write the arm.")
 
-    for name in FUSED:
-        if name in declared and name not in armed:
+    baseline = set()
+    if BASELINE.exists():
+        baseline = {l.strip() for l in BASELINE.read_text().splitlines()
+                    if l.strip() and not l.startswith("#")}
+    else:
+        problems.append(f"missing {BASELINE.relative_to(ROOT)} -- regenerate it")
+
+    unarmed = [o for o in declared if o not in armed]
+    for name in unarmed:
+        if name in FUSED:
+            continue          # already reported above, with a sharper message
+        if name not in baseline:
             problems.append(
-                f"{name} is fused but has no `case {name}:` in "
-                f"src/vm/jit/jit_func.c -- every function containing it will "
-                f"decline WHOLE")
+                f"{name} has no arm in src/vm/jit/jit_func.c and is not in "
+                f"{BASELINE.relative_to(ROOT)} -- every function containing it "
+                f"will decline WHOLE. Write the arm, or add it to the baseline "
+                f"and say why in the commit.")
+
+    for name in sorted(baseline - set(unarmed)):
+        if name in declared:
+            notes.append(f"{name} now has an arm -- drop it from "
+                         f"{BASELINE.relative_to(ROOT)}")
+        else:
+            notes.append(f"{name} is in the baseline but no longer exists -- "
+                         f"drop it from {BASELINE.relative_to(ROOT)}")
+
+    for n in notes:
+        print(f"note: {n}")
 
     if problems:
-        print(f"jit fusion check FAILED ({len(problems)} problem(s)):")
+        print(f"jit arm check FAILED ({len(problems)} problem(s)):")
         for p in problems:
             print(f"  {p}")
         return 1
 
-    print(f"jit fusion check ok: {len(FUSED)} fused opcodes, all have JIT arms")
+    print(f"jit arm check ok: {len(FUSED)} fused opcodes all armed; "
+          f"{len(armed & set(declared))}/{len(declared)} opcodes armed, "
+          f"{len(unarmed)} known-unarmed")
     return 0
 
 
