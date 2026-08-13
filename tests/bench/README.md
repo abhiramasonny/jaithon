@@ -41,6 +41,24 @@ than `loop_sum`'s, because both are paying for a collector rather than for
 dispatch. A benchmark whose Java column is close is one where the remaining win
 is small; a benchmark whose Java column is far away has headroom.
 
+## The holdout set
+
+Five of these — `poly_dispatch`, `json_parse`, `heat_2d`, `graph_bfs`,
+`error_paths` — are a **holdout**. They were written after the optimisation
+work on the other twenty was finished, deliberately covering shapes that work
+did not target: a call site with eight receiver classes, a hand-written parser,
+a 2D float stencil, pointer-chasing search, and exception paths.
+
+They are not more important than the other twenty. They are the check that the
+other twenty are not being fitted. When a change makes one of the original
+twenty faster and leaves the holdouts alone, that is the evidence it
+generalised — and when it moves a holdout backwards, that is a regression the
+original twenty cannot see.
+
+They found something the day they landed: `json_parse` and `error_paths` are
+the same speed with `JAITHON_NO_JIT=1` as without it, because every function in
+both declines from the compiled tier. See `docs/roadmap.md` §8.
+
 ## Adding one
 
 Make a subdirectory named for the benchmark and write the `.jai` there first,
