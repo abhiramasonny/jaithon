@@ -373,7 +373,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check jit-fusion-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -407,13 +407,23 @@ opstats-check:
 linetable-check:
 	@./scripts/linetable_golden.sh check
 
-# Every fused opcode must have an arm in the function JIT. The tier's switch
-# ends in `default: return false`, which declines the WHOLE function, so a fused
-# opcode without an arm evicts the hot loops it was created for. Measured on one
-# such shape: 906ms declining against 26ms compiled.
+# No opcode may NEWLY lack an arm in the function JIT. The tier's switch ends in
+# `default: return false`, which declines the WHOLE function, so a missing arm
+# evicts every function containing that opcode. Measured twice the hard way:
+# 906ms vs 26ms on one shape, and sort_merge 270ms -> 510ms on another.
+# Fused opcodes must always be armed; the rest ratchet against
+# tests/vm/jit_unarmed.baseline.
 .PHONY: jit-fusion-check
 jit-fusion-check:
 	@uv run python scripts/jit_fusion_check.py
+
+# Where a branch keeps its displacement is written down twice, in verify.c and
+# in opt/chunk.jai, and neither consults the other. A missing entry makes the
+# optimiser's rebuild DROP whatever followed the loop -- a chunk that simply
+# stops, with no diagnostic. Pure text, so it runs on every `make test`.
+.PHONY: branch-table-check
+branch-table-check:
+	@uv run python scripts/branch_table_check.py
 
 # The JIT's decline census, collapsed to distinct reasons and compared against a
 # recorded baseline. A NEW reason means the tier stopped compiling something it

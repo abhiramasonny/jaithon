@@ -1,0 +1,81 @@
+# Opcodes with no arm in src/vm/jit/jit_func.c.
+#
+# The tier's opcode switch ends in `default: return false`, which declines the
+# WHOLE function -- so every function containing one of these runs interpreted.
+# That is a known state, not an approved one: `OP_ELEM_KIND` sitting here by
+# accident cost tests/bench/sort_merge 270ms -> 510ms.
+#
+# This file is a RATCHET, enforced by scripts/jit_fusion_check.py. A NEW opcode
+# with no arm fails the build until someone either writes the arm or adds it
+# here deliberately, with the reason in the commit. Removing a line because an
+# opcode gained an arm is always welcome.
+#
+# A FUSED opcode may never appear here -- the peephole puts those into exactly
+# the hot loops that most want compiling.
+OP_NOP
+OP_POPN
+OP_DUP
+OP_DUP2
+OP_SWAP
+OP_ROT3
+OP_SET_UPVALUE
+OP_CLOSE_UPVALUE
+OP_DEF_GLOBAL
+OP_GET_MODULE
+OP_ADD_WRAP
+OP_SUB_WRAP
+OP_MUL_WRAP
+OP_POS
+OP_IS
+OP_IS_NOT
+OP_IN
+OP_NOT_IN
+OP_NOT
+OP_CONCAT
+OP_JUMP_IF_NULL
+OP_FOR_ITER
+OP_CALL_KW
+OP_CALL_SPREAD
+OP_SUPER_INVOKE
+OP_CLOSURE
+OP_BUILD_DICT
+OP_BUILD_SET
+OP_BUILD_TUPLE
+OP_LIST_APPEND
+OP_DICT_INSERT
+OP_SET_ADD
+OP_SET_SLICE
+OP_UNPACK
+OP_CLASS
+OP_INHERIT
+OP_IMPL_TRAIT
+OP_METHOD
+OP_FIELD_DEF
+OP_GET_SUPER
+OP_NEW
+OP_ENUM_NEW
+OP_ENUM_TAG
+OP_ENUM_FIELD
+OP_IS_INSTANCE
+OP_THROW
+OP_RERAISE
+OP_PUSH_HANDLER
+OP_POP_HANDLER
+OP_PUSH_FINALLY
+OP_END_FINALLY
+OP_PUSH_DEFER
+OP_RUN_DEFERS
+OP_MATCH_EXC
+OP_GET_EXC
+OP_MATCH_CONST
+OP_MATCH_RANGE
+OP_MATCH_TYPE
+OP_MATCH_SEQ
+OP_MATCH_FIELDS
+OP_IMPORT
+OP_IMPORT_FROM
+OP_EXPORT
+OP_ASSERT_FAIL
+OP_HALT
+OP_TO_FLOAT
+OP_GET_ITER_ITEMS
