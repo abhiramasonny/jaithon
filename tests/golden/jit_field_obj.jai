@@ -1,3 +1,8 @@
+#: gc-stress-every: 50
+#: This golden loops until the tier compiles, so bare --gc-stress collected on
+#: every allocation of the SAME loop body and cost 92,775ms -- half this whole
+#: suite, for one case. At N=50 it is 1,728ms and still collects 20,730 times,
+#: which is far denser than the N=5000 the unit suites run at.
 #: A field of object type must not decline the enclosing function, and must not
 #: be read as the wrong type once admitted.
 #:

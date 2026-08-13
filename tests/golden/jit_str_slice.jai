@@ -1,3 +1,7 @@
+#: gc-stress-every: 50
+#: Same reason as jit_field_obj: a hot loop revisits one program point, so
+#: collecting on every allocation buys nothing after the first pass. Bare was
+#: 15,866ms; at N=50 it is 151ms and still collects 8,204 times.
 #: `s[a:b]` on a string used to decline the enclosing loop -- `OP_GET_SLICE`
 #: accepted only SLOT_LIST and said "slicing a container this tier does not
 #: model" for everything else, which is what kept `word_freq`'s scan loop (64%
