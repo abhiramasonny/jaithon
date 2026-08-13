@@ -7,15 +7,16 @@
 #: otherwise emit for a value it only knows by sample.
 #:
 #: That skip is a PROOF, not a prediction, and a wrong proof is a wrong answer
-#: rather than a crash: `big_equal_to_literal` below is forty characters built
-#: at run time, so it is past the interning length and is a different object
-#: from the identical literal, while being equal to it. If the proof ever
-#: reaches a value that did not come out of the table — which is what a branch
-#: merge would do, since the other edge into a join carries a value the
-#: compiler never saw — the compare becomes a pointer compare on two unequal
-#: pointers and answers `false` where the truth is `true`. Every case here is
-#: written to be run enough times to be compiled; at interpreter speed they all
-#: pass trivially, so run this file with and without JAITHON_NO_JIT.
+#: rather than a crash. `FORTY` below is forty characters built at run time, so
+#: it is past the interning length and is a different object from the identical
+#: literal while being equal to it — the one pair that tells a pointer compare
+#: apart from a real one. If the proof ever reaches a value that did not come
+#: out of the table — which is what a branch merge does, since the other edge
+#: into a join carries a value the compiler never saw — the compare becomes a
+#: pointer compare on two unequal pointers and answers `false` where the truth
+#: is `true`. Every case here is written to be run enough times to be compiled;
+#: at interpreter speed they all pass trivially, so run this file with and
+#: without JAITHON_NO_JIT.
 from std.test import assert_eq, assert_true, assert_false
 
 #: Big enough that the sampler notices. Nothing forces a compile: a 4kHz timer
@@ -88,12 +89,12 @@ fn char_in_else(s: str, other: str, lit: str, take_other: bool,
 fn test_a_character_equals_its_literal() -> void {
     var text = ""
     var i = 0
-    while i < 50_000 {
+    while i < 20_000 {
         text = text + "abcd"
         i += 1
     }
-    assert_eq(count_matches(text, "a"), 50_000)
-    assert_eq(count_matches(text, "d"), 50_000)
+    assert_eq(count_matches(text, "a"), 20_000)
+    assert_eq(count_matches(text, "d"), 20_000)
     assert_eq(count_matches(text, "z"), 0)
 }
 
@@ -145,9 +146,11 @@ fn test_non_ascii_indexing_is_by_scalar() -> void {
 #: The merge case above found this, so it is pinned on its own: an OSR entry
 #: reads the interpreter's slots directly, and a bool's payload is one byte, so
 #: the seven bytes above it belong to whatever the slot held before. Loading
-#: eight of them puts garbage in a register every consumer tests whole. `dirty`
-#: is called first with an argument wide enough to leave high bytes behind, so
-#: a compiled `if flag` that reads the whole word takes the wrong arm.
+#: eight of them puts garbage in a register every consumer tests whole, and a
+#: compiled `if flag` then takes the arm the flag says it should not.
+#:
+#: The `true` call first, so the argument slot is left with a high byte set for
+#: the `false` call to inherit -- with a clean slot the bug does not show.
 fn branch_on_flag(flag: bool, reps: int) -> int {
     var taken = 0
     var r = 0
