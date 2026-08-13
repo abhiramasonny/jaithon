@@ -4397,9 +4397,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (!popValue(e, &rr, &kr)) return false;
             if (kr != SLOT_INST) return false;
-            /* Only a number goes in: storing an object would put a pointer the collector hasn't seen into a
-             * field. This tier can't allocate, so nothing can move or be swept while it runs, but the value would still need to already be rooted by the caller -- not worth it for what it buys. */
-            if (kv != SLOT_INT && kv != SLOT_FLOAT) return false;
+            /* An object goes in as readily as a number. The collector is a plain mark-sweep with no write
+             * barrier and nothing moves, so the only question is reachability: the receiver is rooted (it
+             * is a live SLOT_INST here), and after the store the value hangs off it, while before the store
+             * it was rooted in its own right by emitRootFill. What is refused is a kind with no payload
+             * register to store (class/function/native/self) and SLOT_ITER, whose index lives in memory. */
+            if (kv != SLOT_INT && kv != SLOT_FLOAT && kv != SLOT_BOOL &&
+                kv != SLOT_OBJ && kv != SLOT_LIST && kv != SLOT_INST &&
+                kv != SLOT_MAYBE_INST) {
+                e->whyNot = "storing a field kind this tier cannot write";
+                return false;
+            }
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
@@ -4410,12 +4418,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             unsigned base = (unsigned)offsetof(ObjInstance, fields) +
                             (unsigned)info->slot * (unsigned)sizeof(Value);
-            emit(e, jaiA64MovzX(JIT_SCRATCH_A,
-                                kv == SLOT_INT ? VAL_INT : VAL_FLOAT, 0));
+            /* Not a constant tag any more: a maybe-instance's is null-or-object,
+             * read off the payload, which is exactly what emitTagFor does. */
+            emitTagFor(e, kv, rv, JIT_SCRATCH_A, JIT_SCRATCH_B);
             emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
             if (vIsFp) emit(e, jaiA64StrD(dv, rr, base + 8));
             else       emit(e, jaiA64StrX(rv, rr, base + 8));
-            recordFieldStore(e, recvLocal, info->slot, kv);
+            /* Only a kind a later read can replay EXACTLY is remembered; the rest merely retire what was
+             * known of this field (local -1), because the read side would otherwise take SLOT_INST with no
+             * class behind it -- a shape every field offset it then resolved would be resolved against. */
+            bool replayable = kv == SLOT_INT || kv == SLOT_FLOAT ||
+                              kv == SLOT_BOOL || kv == SLOT_OBJ;
+            recordFieldStore(e, replayable ? recvLocal : -1, info->slot, kv);
             e->wroteHeap = true;
             off += 6;
             break;
