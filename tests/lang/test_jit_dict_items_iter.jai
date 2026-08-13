@@ -219,6 +219,74 @@ fn bag_total(b: Bag) -> int {
     return t
 }
 
+#: Everything above reaches the compiled tier through the FUNCTION tier: the
+#: bodies are small and called thousands of times. The OSR tier is a different
+#: entry with different rules -- the iterator is not on its modelled operand
+#: stack at all, it arrives in a reserved register while staying on the
+#: interpreter's stack, and the exhausted exit has to tell the interpreter to
+#: pop it. Get that wrong and the loop leaves a spare iterator behind, or drops
+#: a live value; neither shows up in a sum.
+#:
+#: These functions are called ONCE, so the function tier never sees them and
+#: whatever compiles came in through OSR. `mark` is `any` so that binding the
+#: key needs no OP_TYPE_GUARD, which is unarmed and would decline the loop for
+#: an unrelated reason.
+fn one_call_sum(d: dict[str, int], rounds: int) -> str {
+    var acc = 0
+    var mark: any = ""
+    var r = 0
+    while r < rounds {
+        for (k, v) in d.items() {
+            acc += v
+            mark = k
+        }
+        r += 1
+    }
+    return f"{mark}/{acc}"
+}
+
+#: Nesting is the shape that can SEE the exhausted exit go wrong. The outer
+#: loop's iterator sits on the operand stack UNDER the inner one, so an inner
+#: exit that forgot to tell the interpreter to drop its iterator leaves the
+#: stale inner iterator where the outer one should be, and the outer loop then
+#: steps the wrong thing. A single flat loop cannot catch that -- nothing after
+#: it looks at the stack, so the spare entry is dead until the frame returns,
+#: and the first version of this test passed with the pop deliberately removed.
+#: With the pop removed this returns a wrong, run-to-run varying total (43998660
+#: and 286545300 were two of them) rather than 939870000 -- varying because how
+#: much of the walk the compiled form did depends on when the sampler entered.
+fn nested(d: dict[str, int], rounds: int) -> int {
+    var acc = 0
+    var r = 0
+    while r < rounds {
+        for (_k1, v1) in d.items() {
+            for (_k2, v2) in d.items() { acc += v1 * v2 }
+        }
+        r += 1
+    }
+    return acc
+}
+
+fn many_keys(n: int) -> dict[str, int] {
+    var d: dict[str, int] = {}
+    var i = 0
+    while i < n {
+        d[f"k{i}"] = i
+        i += 1
+    }
+    return d
+}
+
+fn test_an_osr_entry_at_a_pair_head_binds_both_halves() -> void {
+    let d = many_keys(400)
+    assert_eq(one_call_sum(d, 3000), "k399/239400000")
+}
+
+fn test_an_osr_pair_loop_leaves_the_stack_where_it_found_it() -> void {
+    let d = many_keys(60)
+    assert_eq(nested(d, 300), 939870000)
+}
+
 fn test_a_user_class_items_method_is_not_hijacked() -> void {
     #: The opcode's whole reason for existing is that the emitter cannot know
     #: the receiver's type, so the compiled form must not assume it either: a
