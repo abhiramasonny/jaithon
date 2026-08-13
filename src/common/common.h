@@ -206,6 +206,29 @@ JAI_INLINE void *jaiSmallNew(size_t size) {
     return p;
 }
 
+/* The other half of the same pair: jaiRealloc(ptr, size, 0) for a size the
+ * bins serve, with the accounting jaiRealloc would have done.
+ *
+ * This buys nothing wherever LTO can already see jaiRealloc -- it inlines this
+ * exact sequence into jaiFreeObject, and putting it in the source there
+ * measured as pure code growth. It exists for the one caller LTO cannot help:
+ * the GC sweep, whose cost is the *call* to jaiFreeObject and not what
+ * jaiFreeObject then does.
+ *
+ * The duty is jaiSmallNew's, unchanged: `size` must be the exact size the
+ * block was allocated with, and one jaiSmallServes accepts. */
+JAI_INLINE void jaiSmallDelete(void *p, size_t size) {
+    unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
+
+    /* The clamp jaiRealloc's accountDelta applies, for the same reason: a
+     * caller that misreports size must not wrap the counter to near SIZE_MAX
+     * and convince the collector it can never free enough. */
+    jaiHeapBytes = size > jaiHeapBytes ? 0 : jaiHeapBytes - size;
+
+    *(void **)p = jaiSmallBin[cls];
+    jaiSmallBin[cls] = p;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Arena — bump allocator for AST nodes and other phase-scoped data    */
