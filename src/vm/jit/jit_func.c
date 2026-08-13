@@ -7280,8 +7280,18 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * the recursive-call fixups above are relative to the function's own
      * start, which is where the arena is about to place it. */
     if (!jaiCodeArenaUnseal(arena)) return false;
-    /* 8-align the entry so the literal pool's alignment is what it looks. */
-    while ((arena->used & 7u) != 0) {
+    /* 32-align the entry, which is two things at once.
+     *
+     * The literal pool's alignment is what it looks, as the 8-align this
+     * replaced already gave. And every body now starts at a fixed offset
+     * modulo the fetch block, so a size change ANYWHERE upstream stops
+     * relabelling where every later body lands. That relabelling was the
+     * suite's largest source of false A/B results: sweeping 0-7 padding nops
+     * moved bitops +/-13% and loop_sum +/-7% with byte-identical loop bodies,
+     * and matrix_mul +/-18.9% and list_ops +/-15.4% were both observed between
+     * binaries with identical dynamic instruction counts. The cost is at most
+     * 28 wasted bytes per compiled body in a 1 MB arena. */
+    while ((arena->used & 31u) != 0) {
         uint32_t pad = jaiA64Nop();
         if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) return false;
     }
@@ -7891,7 +7901,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     jitFree(map, depths, fn->chunk.count + 1);
 
     if (!jaiCodeArenaUnseal(arena)) return false;
-    while ((arena->used & 7u) != 0) {
+    /* Same 32-alignment as the function tier above, for the same two reasons. */
+    while ((arena->used & 31u) != 0) {
         uint32_t pad = jaiA64Nop();
         if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) return false;
     }
