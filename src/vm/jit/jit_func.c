@@ -197,6 +197,20 @@ static int jitMakeIter(JitCallDesc *d) {
     return IS_LIST(src) ? 0 : 1;
 }
 
+/* OP_GET_ITER_ITEMS' dict case: the lazy view `for (k, v) in d.items()` walks,
+ * built once per loop entry rather than the N 2-tuples the eager `items()`
+ * materialises. Allocates, so roots go down first as for any call out of
+ * compiled code. The emitted guard has already proved the receiver is a dict;
+ * the test here is the same belt-and-braces jitMakeIter carries. */
+static int jitMakeItemsIter(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    Value src = d->args[0];
+    ObjIter *it = IS_DICT(src) ? jaiIterNew(ITER_DICT_ITEMS, src) : NULL;
+    if (it != NULL) d->result = OBJ_VAL(it);
+    jaiGCPopRootRange();
+    return it != NULL ? 0 : 1;
+}
+
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 static int jitFormat(JitCallDesc *d) {
@@ -1644,6 +1658,23 @@ static ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     Value bound;
     if (!jaiModuleGet(fn->module, AS_STRING(name), &bound)) return NULL;
     return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
+}
+
+/* The first entry a dict walk would yield, for the component kinds the compiled
+ * pair head specialises on -- the dict equivalent of taking items[0] off a list.
+ * False for a dict with nothing live in it, which declines rather than guessing.
+ * Reads the order array exactly as jaiTableNext does, so "first" here and
+ * "first" at run time are the same entry. */
+static bool firstLiveEntry(const JaiTable *t, Value *key, Value *value) {
+    if (t->entries == NULL) return false;
+    for (int i = 0; i < t->orderCount; i++) {
+        const int32_t slot = t->order[i];
+        if (slot < 0) continue;
+        *key   = t->entries[slot].key;
+        *value = t->entries[slot].value;
+        return true;
+    }
+    return false;
 }
 
 static ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
@@ -5272,6 +5303,73 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_GET_ITER_ITEMS: {
+            /* `for (a, b) in X.items()`. The emitter cannot know X's type, so
+             * it plants this ahead of an ordinary `INVOKE items; GET_ITER` and
+             * lets the opcode jump over the pair when X turns out to be a dict,
+             * building a lazy ITER_DICT_ITEMS instead. Unarmed, it declined the
+             * whole enclosing function -- which is why dict_iter's two loops
+             * ran interpreted end to end.
+             *
+             * The dict case is specialised and the branch is resolved HERE, by
+             * walking on at the target rather than by emitting a jump: the
+             * skipped `INVOKE items` never executes in this form, so its inline
+             * cache is empty and compiling it as dead code would decline. That
+             * is only sound because the region really is the emitter's own, so
+             * nothing branches into it -- checked below, and backstopped by the
+             * fixup resolver, which declines a branch to an offset the walk
+             * never reached rather than mis-resolving it.
+             *
+             * Specialising rather than falling through to the eager `items()`
+             * is required, not merely faster: the lazy view raises when the
+             * dict changes under the loop and the materialised list does not,
+             * so a compiled body that took the other path would answer
+             * differently from the interpreter. */
+            if (e->depth == 0) return false;
+            unsigned sidx = e->depth - 1;
+            if (e->stack[sidx] != SLOT_OBJ || !IS_DICT(e->stackSeen[sidx])) {
+                e->whyNot = "items() on something that is not a dict";
+                return false;
+            }
+            if (!e->callsOut) return false;
+            int16_t  ijump = jaiReadI16(code + off + 1);
+            int32_t  after = (int32_t)(off + 3) + ijump;
+            /* The emitter's shape exactly: OP_INVOKE (7 bytes) then
+             * OP_GET_ITER (1), and the head that follows must be the pair form,
+             * since that is the only one shape 4 has an arm for. */
+            if (after != off + 11 || after >= stop ||
+                code[off + 3] != OP_INVOKE || code[off + 10] != OP_GET_ITER ||
+                code[after] != OP_FOR_ITER_PAIR) {
+                e->whyNot = "an items() head this tier does not recognise";
+                return false;
+            }
+
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+            branchOnDeopt(e, JAI_A64_NE);
+
+            if (!emitDescriptor(e, NULL_VAL, sidx, 1,
+                                (void *)&jitMakeItemsIter)) {
+                return false;
+            }
+            unsigned rdrop;
+            if (!popValue(e, &rdrop, NULL)) return false;
+            /* Shape 4 is an ITER_DICT_ITEMS, and it carries the DICT as its
+             * sample rather than an element: the pair head reads the first live
+             * entry off it for the component kinds, exactly as the list form
+             * reads items[0]. */
+            if (!pushValue3(e, SLOT_ITER, 4, NULL, e->stackSeen[sidx], -1)) {
+                return false;
+            }
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off = after;
+            break;
+        }
+
         case OP_FOR_ITER_BIND: {
             /* A loop this body built the iterator for: the index lives in the
              * iterator, so every iteration loads and stores it, and a deopt
@@ -5292,6 +5390,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * not something the inline range form may assume, so it keeps
                  * the stepped path this test has always sent it down. */
                 uint32_t iterShape = e->stackShape[e->depth - 1];
+                /* Shape 4 is a dict-items view, and the arm below would read
+                 * ObjList's offsets out of an ObjDict were the kind guard not
+                 * there to stop it. OP_GET_ITER_ITEMS only makes one when a
+                 * pair head follows, so this is unreachable -- kept because the
+                 * fact lives in another arm and a decline is the cheap side. */
+                if (iterShape == 4) {
+                    e->whyNot = "a non-destructuring loop over dict items";
+                    return false;
+                }
                 if (iterShape != 0 && iterShape != 2 && iterShape != 3) {
                     /* A list iterator, stepped inline (jaiIterNext's ITER_LIST
                      * case, instruction for instruction) rather than through
@@ -5627,19 +5734,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
 
-            /* Component kinds come from the element the list was holding when
-             * the iterator was built (OP_GET_ITER carries it forward), and the
-             * guards below are what make that a specialisation rather than an
-             * assumption. */
+            /* Component kinds come from the pair the source was holding when
+             * the iterator was built (OP_GET_ITER / OP_GET_ITER_ITEMS carries
+             * it forward), and the guards below are what make that a
+             * specialisation rather than an assumption. */
+            bool pairIsDict = e->stackShape[e->depth - 1] == 4;
             Value psample = e->stackSeen[e->depth - 1];
-            if (!IS_TUPLE(psample) || AS_TUPLE(psample)->count != 2) {
-                e->whyNot = "pair element is not a 2-tuple";
-                return false;
-            }
             SlotKind pk[2];
             unsigned ptag[2];
-            Value pseen[2] = { AS_TUPLE(psample)->items[0],
-                               AS_TUPLE(psample)->items[1] };
+            Value pseen[2];
+            if (pairIsDict) {
+                /* Shape 4 carries the dict itself, so the sample is its first
+                 * live entry -- the one the loop is about to yield. */
+                if (!IS_DICT(psample) ||
+                    !firstLiveEntry(&AS_DICT(psample)->table,
+                                    &pseen[0], &pseen[1])) {
+                    e->whyNot = "iterating a dict with nothing to look at";
+                    return false;
+                }
+            } else {
+                if (!IS_TUPLE(psample) || AS_TUPLE(psample)->count != 2) {
+                    e->whyNot = "pair element is not a 2-tuple";
+                    return false;
+                }
+                pseen[0] = AS_TUPLE(psample)->items[0];
+                pseen[1] = AS_TUPLE(psample)->items[1];
+            }
             for (unsigned i = 0; i < 2; i++) {
                 Value v = pseen[i];
                 if (IS_INT(v))        { pk[i] = SLOT_INT;   ptag[i] = VAL_INT; }
@@ -5662,6 +5782,118 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
 
             unsigned rIter = pushReg(e) - 1;
+            uint32_t pairExit = (uint32_t)((int32_t)(off + 7) + pjump);
+            int      pairExitDepth = (int)stackSignatureAt(e, e->depth - 1);
+
+            if (pairIsDict) {
+                /* iterStepPairFast's ITER_DICT_ITEMS case plus the jaiTableNext
+                 * it calls, inline. Same discipline as the list arm below:
+                 * every guard, and the whole scan, runs before the index is
+                 * written back, so a deopt -- forced or real -- resumes at this
+                 * instruction with the iterator exactly as the interpreter left
+                 * it and re-does the scan. */
+                _Static_assert(sizeof(JaiEntry) == 48,
+                               "the dict-items step scales the order index by "
+                               "hand: slot * 16 * 3");
+                const unsigned tOff = (unsigned)offsetof(ObjDict, table);
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIter,
+                                   (unsigned)offsetof(ObjIter, kind)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_DICT_ITEMS));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIter,
+                                   (unsigned)offsetof(ObjIter, source) + 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                /* A dict that changed under the loop must raise, and only the
+                 * version says so. jaiIterNext owns that message, so the guard
+                 * hands the whole instruction back unadvanced. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, version)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_C, rIter,
+                                   (unsigned)offsetof(ObjIter, version)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_C));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIter,
+                                   (unsigned)offsetof(ObjIter, index)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                   tOff +
+                                       (unsigned)offsetof(JaiTable, orderCount)));
+
+                /* The scan. `order` holds an entry index per insertion
+                 * position, negative where a delete left a hole, so a dict with
+                 * deletions in it costs one extra pass per hole and nothing
+                 * else. orderCount is hoisted because only a mutation can move
+                 * it and the version guard above has already excluded one.
+                 *
+                 * branchToDepth inside a loop is sound only because it settles
+                 * nothing here: the branchOnDeopt three lines up fails the
+                 * compile outright if a deferred value is live, so the settle
+                 * it performs is a no-op and cannot be re-executed. */
+                unsigned scanTop = e->count;
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+                /* The exhausted arm drops the iterator, so the target is
+                 * reached one entry shallower than this branch leaves from. */
+                branchToDepth(e, pairExit, JAI_A64_GE, pairExitDepth);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, order)));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                      JIT_SCRATCH_C, 2));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A, 0));
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 1));
+                /* A hole: the slot is int32 and negative, which after the
+                 * zero-extending load is bit 31 set. Measured against e->count
+                 * so an instruction added above cannot rot the distance. */
+                emit(e, jaiA64Tbnz(JIT_SCRATCH_A, 31,
+                                   (int32_t)scanTop - (int32_t)e->count));
+
+                /* entries + slot * sizeof(JaiEntry): slot << 4, then + itself
+                 * twice over, which is the 48 the assert above pins. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, entries)));
+                emit(e, jaiA64LslX(JIT_SCRATCH_A, JIT_SCRATCH_A, 4));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                      JIT_SCRATCH_A, 1));
+                emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_D, JIT_SCRATCH_A));
+
+                /* Key and value carry the kinds sampled off the first live
+                 * entry; a dict that later holds another kind fails here with
+                 * nothing written. */
+                for (unsigned i = 0; i < 2; i++) {
+                    unsigned at = i == 0 ? (unsigned)offsetof(JaiEntry, key)
+                                         : (unsigned)offsetof(JaiEntry, value);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ptag[i]));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
+
+                /* Past the last guard. The index goes first because localOut
+                 * spends JIT_SCRATCH_C and JIT_SCRATCH_D on a frame-resident
+                 * slot's tag; only JIT_SCRATCH_B survives it. */
+                emit(e, jaiA64StrX(JIT_SCRATCH_C, rIter,
+                                   (unsigned)offsetof(ObjIter, index)));
+                for (unsigned i = 0; i < 2; i++) {
+                    unsigned at = (i == 0 ? (unsigned)offsetof(JaiEntry, key)
+                                          : (unsigned)offsetof(JaiEntry, value))
+                                  + 8u;
+                    /* A bool is one byte (see OP_GET_INDEX) -- the rest of its
+                     * payload word is stale, and a SLOT_BOOL register must hold
+                     * 0 or 1. */
+                    if (pk[i] == SLOT_BOOL) {
+                        emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                    } else {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
+                    }
+                    localOut(e, i == 0 ? pslotA : pslotB, JIT_SCRATCH_A);
+                }
+                e->wroteHeap = true;
+                off += 7;
+                break;
+            }
 
             /* Really a list iterator, and its source really a list. */
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIter,
@@ -5692,9 +5924,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
             /* The exhausted arm drops the iterator, so the target is reached
              * one entry shallower than this branch leaves from. */
-            branchToDepth(e, (uint32_t)((int32_t)(off + 7) + pjump),
-                          JAI_A64_GE,
-                          (int)stackSignatureAt(e, e->depth - 1));
+            branchToDepth(e, pairExit, JAI_A64_GE, pairExitDepth);
 
             /* items is reloaded rather than hoisted: a reallocation bumps the
              * version, which the guard above covers, and one ldr removes the
