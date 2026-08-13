@@ -16,6 +16,13 @@
 # still names the file that diverged. Re-run with `dump <file>` to see what
 # changed inside it.
 #
+# The hash covers the dump FROM THE SECOND LINE ON. `disasm`'s first line echoes
+# the path it was handed, which is absolute and rooted at $ROOT -- so every hash
+# used to depend on where the tree happened to be checked out, and this gate was
+# unconditionally red in a git worktree, on a pristine tree, with no span having
+# moved. Dropping that one line is enough: verified by disassembling the same
+# file by absolute and by relative path and comparing the rest byte for byte.
+#
 #   scripts/linetable_golden.sh capture       # write tests/golden/linetable.golden
 #   scripts/linetable_golden.sh check         # compare against it
 #   scripts/linetable_golden.sh dump <file>   # raw spans for one file
@@ -46,7 +53,8 @@ manifest() {
             hash="<<did-not-disassemble>>"
             n=0
         else
-            hash="$(printf '%s' "$out" | shasum -a 256 | cut -d' ' -f1)"
+            hash="$(printf '%s\n' "$out" | tail -n +2 | shasum -a 256 |
+                    cut -d' ' -f1)"
             n="$(printf '%s\n' "$out" | grep -c '^[0-9][0-9][0-9][0-9]  ')"
         fi
         printf '%s  %s  %s\n' "$hash" "$n" "${f#$ROOT/}"
