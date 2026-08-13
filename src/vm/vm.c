@@ -5017,6 +5017,16 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     }
                     vm.stackTop = slot;
                     *vm.stackTop++ = result;
+                    /* The result is right here, so a builtin needs none of the
+                     * frame machinery an instance method does -- but it does
+                     * need the same WINDOW. Recorded only at the fill, this was
+                     * a single observation, which roadmap §6 records as an open
+                     * bug: `d.get(k)` over a dict holding two kinds predicted
+                     * whichever key came first, and every later call deopted. */
+                    if (JAI_UNLIKELY(ic->obsBudget != 0)) {
+                        ic->obsBudget--;
+                        recordInvokeResult(ic, (unsigned)w, result);
+                    }
                     /* A built-in method pushes no frame: `xs.push(v)` in a hot
                      * loop reaches here, and LOAD_STATE's constant-pool chase
                      * was the largest thing left in it. */
@@ -5120,8 +5130,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     ic->resultKind[ic->count] = JAI_FB_NONE;
                     ic->count++;
                     ic->state = (ic->count == 1) ? IC_MONO : IC_POLY;
-                    fbCache = ic;
-                    fbWay   = ic->count - 1;
+                    if (ic->obsBudget != 0) {
+                        ic->obsBudget--;
+                        fbCache = ic;
+                        fbWay   = ic->count - 1;
+                    }
                 } else {
                     ic->state = IC_MEGA;
                 }
