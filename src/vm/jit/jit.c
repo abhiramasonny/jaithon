@@ -96,22 +96,35 @@ static bool compileAccessor(ObjFunction *fn) {
 typedef int (*JaiCompiledFn)(void);
 typedef void (*JaiCompiledAccessor)(Value *slotBase);
 
-bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
+/* Returns jaiJitEnterFunc's verdict, not a bool, and the difference is a
+ * correctness one. This used to answer `== JAI_JIT_DONE`, so a body that
+ * DEOPTED on the very call that compiled it read as "declined" -- and the
+ * caller's decline path pushes a frame and runs the function again FROM THE
+ * TOP. Everything the compiled body did before the guard is then done twice.
+ *
+ * It stayed invisible while a fresh body deopting on its first compiled call
+ * was a rarity. An unarmed opcode now emits an unconditional deopt, so it is
+ * the NORMAL outcome for any function that mentions one, and any such function
+ * that writes before reaching it is a double effect: `Bag.items`, whose whole
+ * body is `self.made += 1` and a list of tuples, counted 6002 calls for 6001.
+ * One per function, on the call that compiles it, which is exactly the shape
+ * that hides in a test suite. */
+JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
 
     /* Whole-function tier first: the only one that makes a hot function
      * meaningfully faster, and it declines quickly otherwise. */
-    if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
+    if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase);
 
     if (fn->jitCode == NULL) {
         if (jaiJitCompileFunc(closure, slotBase)) {
             fn->jitFuncModuleVersion = fn->module->version;
-            return jaiJitEnterFunc(closure, slotBase) == JAI_JIT_DONE;
+            return jaiJitEnterFunc(closure, slotBase);
         }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {
             if (++fn->jitAttempts >= 5) fn->jitRefused = true;
             else fn->entryCount = 0;
-            return false;
+            return JAI_JIT_DECLINED;
         }
     }
 
@@ -123,7 +136,7 @@ bool jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     }
 
     vm.stackTop = slotBase + 1;
-    return true;
+    return JAI_JIT_DONE;
 }
 
 extern volatile sig_atomic_t jaiInterrupted;

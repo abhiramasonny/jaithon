@@ -1221,9 +1221,20 @@ static CallOutcome callClosure(ObjClosure *closure, int argc) {
     if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
     if (fn->entryCount < JAI_JIT_THRESHOLD) {
         fn->entryCount++;
-    } else if (!fn->jitRefused && jaiJitEnabled() &&
-               jaiJitEnter(closure, slotBase)) {
-        return CALL_DONE;
+    } else if (!fn->jitRefused && jaiJitEnabled()) {
+        /* Every verdict, not just DONE. The body that just compiled may have
+         * run and then deoptimised, in which case falling through to the
+         * pushFrame below would run the function a SECOND time from the top --
+         * see jaiJitEnter. bindCallArgs is already done, which is the one
+         * thing the branch above this has to do for itself. */
+        JaiJitOutcome outcome = jaiJitEnter(closure, slotBase);
+        if (outcome == JAI_JIT_DONE) return CALL_DONE;
+        if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
+        if (outcome == JAI_JIT_DEOPT) {
+            if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+            if (!jaiJitApplyDeopt(closure, slotBase)) return CALL_ERROR;
+            return CALL_FRAME;
+        }
     }
 
     if (!pushFrame(closure, slotBase)) return CALL_ERROR;
@@ -5230,11 +5241,25 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 }
             } else if (tfn->entryCount < JAI_JIT_THRESHOLD) {
                 tfn->entryCount++;
-            } else if (!tfn->jitRefused && jaiJitEnabled() &&
-                       jaiJitEnter(target, tailBase)) {
-                retval = tailBase[0];
-                stackTop = vm.stackTop;
-                goto opReturn;
+            } else if (!tfn->jitRefused && jaiJitEnabled()) {
+                /* Same three-way answer the jitFunc branch above already
+                 * handles: on the call that compiles it, the body may run and
+                 * then deoptimise, and reusing this frame for the tail call
+                 * would re-run the callee from the top. */
+                JaiJitOutcome outcome = jaiJitEnter(target, tailBase);
+                if (outcome == JAI_JIT_ERROR) goto vmThrow;
+                if (outcome == JAI_JIT_DEOPT) {
+                    if (!bindCallArgs(target, argc, tailBase)) goto vmThrow;
+                    if (!pushFrame(target, tailBase)) goto vmThrow;
+                    if (!jaiJitApplyDeopt(target, tailBase)) goto vmThrow;
+                    LOAD_STATE();
+                    VM_NEXT();
+                }
+                if (outcome == JAI_JIT_DONE) {
+                    retval = tailBase[0];
+                    stackTop = vm.stackTop;
+                    goto opReturn;
+                }
             }
 
             if (FRAME_HAS_DEFERS(frame) && !runFrameDefers(frame)) goto vmThrow;
