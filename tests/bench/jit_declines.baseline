@@ -3,6 +3,7 @@ declined at OP_GET_EXC
 stopped : OP_BUILD_DICT
 stopped : OP_GET_FIELD_LOCAL
 stopped : OP_GET_LOCAL
+stopped : OP_INVOKE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_LT
 stopped : a local was given two different kinds
@@ -13,8 +14,10 @@ stopped : loop variable took two kinds
 stopped: OP_CALL
 stopped: OP_FOR_ITER_PAIR
 stopped: OP_GET_EXC
+stopped: OP_INVOKE
 stopped: OP_LT
 stopped: add-bind of a kind that is neither int nor float
 stopped: callee is not a compiled global function
 stopped: callee's return kind not usable
 stopped: loop variable took two kinds
+stopped: more live values than there are callee-saved registers

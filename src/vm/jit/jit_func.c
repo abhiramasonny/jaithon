@@ -124,9 +124,24 @@ typedef struct {
     int64_t base;
     int64_t nlocals;
     int64_t nstack;
+    /* Bit i: local i is NOT described by this record and must be left as the
+     * frame already has it. SLOT_OPAQUE means "the compiled body never reads
+     * this slot", which jitArgIn relies on to pass a raw 0 for an argument of
+     * a kind the tier has no register for -- but a DEOPT hands the frame to
+     * the interpreter, and the interpreter does read it. Writing the record's
+     * null over it turned `enter_foreign(module)` into `enter_foreign(null)`
+     * and the whole compiler then failed to resolve an imported type.
+     * bindCallArgs runs before jaiJitApplyDeopt at every call site, so the
+     * real argument is already there; the fix is to not touch it.
+     * The OSR tier has always got this right -- OSR_SYNC_ITER skips a slot
+     * whose tag is VAL_NULL -- which is why only the function tier was wrong. */
+    int64_t skipLocals;
     Value   locals[JIT_MAX_SLOTS + 1];
     Value   stack[JIT_MAX_STACK + 1];
 } JitDeoptRecord;
+
+_Static_assert(JIT_MAX_SLOTS <= 64,
+               "skipLocals is one bit per local slot");
 
 static JitDeoptRecord gDeopt;
 
@@ -146,6 +161,7 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     if (gDeopt.ip < 0 || gDeopt.ip >= fn->chunk.count) return false;
 
     for (int64_t i = 0; i < gDeopt.nlocals; i++) {
+        if (i < 64 && (((uint64_t)gDeopt.skipLocals >> i) & 1u) != 0) continue;
         slotBase[gDeopt.base + i] = gDeopt.locals[i];
     }
     /* The operand stack sits above the frame's window, which bindCallArgs has
@@ -470,6 +486,12 @@ typedef struct {
 
     int      *offsetToInst;
     int      *offsetToDepth;
+    /* What the BYTECODE says the operand stack is at each offset, from
+     * jaiChunkStackDepths -- an oracle this file did not write, checked against
+     * every deopt record. NULL only when the chunk would not verify, which is
+     * already impossible by the time anything is compiled. See modelAgreesWithChunk. */
+    const int *chunkDepth;
+    int        chunkDepthCount;
 
     unsigned  arity;
     /* Slot 0 is the callee for a plain call, the RECEIVER for a method (so `self.x` reads it). Touching
@@ -558,6 +580,25 @@ typedef struct {
      * longer free: re-running the call interpreted would apply the write a
      * second time. See branchOnCondition. */
     bool      wroteHeap;
+    /* The instruction being compiled is inside a protected region of the
+     * function's static exception table (spec §3.8) -- i.e. inside a `try`.
+     *
+     * A raise from compiled code unwinds from a frame the interpreter never
+     * pushed (function tier) or from the loop head rather than the faulting
+     * instruction (OSR tier), so vmThrow consults the wrong offset and the
+     * function's OWN handler is skipped. Nothing used to check this because no
+     * function containing a `try` could compile at all -- every catch block
+     * holds OP_GET_EXC, which had no arm and declined the whole function. The
+     * unarmed-opcode deopt below removes that accident, so the rule is now
+     * explicit: inside a protected region an overflow resumes at its
+     * instruction (branchOnDeoptInstStart) and lets the interpreter raise it,
+     * and anything else that can raise -- a call, a list growth -- declines. */
+    bool      inProtected;
+    /* Every operand-stack entry was in its own register at the top of the
+     * instruction being compiled -- nothing deferred, nothing borrowed. See
+     * branchOnDeoptInstStart, whose record describes entries the arm may
+     * already have popped. */
+    bool      instClean;
     /* Baked globals share the defining module's table, so one `keyVersion` guard covers all of them --
      * it changes only when a live entry's address or key could move (new key, rehash, delete, clear). ObjModule::version (used by the function-tier entry check) is neither necessary nor sufficient here. */
     JaiTable *globalsTable;
@@ -1784,6 +1825,39 @@ static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
     return true;
 }
 
+/* Does the operand model still say what the BYTECODE says at this offset?
+ *
+ * The model is maintained by ~140 hand-written arms plus two inliners, and
+ * until this check nothing asked it to agree with anything: a wrong depth still
+ * emits a self-consistent body, because every register is derived from an index
+ * and the indices all shift together. What it corrupts is the deopt record --
+ * the one part of the model another component reads -- which then hands the
+ * interpreter operand entries it has not got. That is not a crash, it is a
+ * wrong answer, and the two it produced were `'float' object has no method
+ * 'push'` out of lib/std/gui/path.jai (inlineMethod's dry walk left two entries
+ * behind) and the same class from a walk resuming past an unarmed deopt with a
+ * stale model (see emitUnarmedDeopt). Neither was visible in the generated
+ * code; both are one comparison away here.
+ *
+ * jaiChunkStackDepths is the oracle, and this file did not write it: it is the
+ * verifier's own pass, the one the interpreter's stack discipline is defined
+ * by. -1 is "no answer" -- an offset no path reaches, one an unmodelled opcode
+ * stopped the walk at, or one whose depth came from an imprecise handler seed
+ * -- and is never a failure.
+ *
+ * Asked only of the function tier's own walk. An OSR body's model starts at the
+ * loop head rather than at offset 0, so its depth is relative and disagrees by
+ * a constant; an inlined body's offsets are the callee's and mean nothing in
+ * the caller's table.
+ *
+ * Declines, so an arm that drifts in future costs coverage and not an answer. */
+static bool modelAgreesWithChunk(const Emit *e, uint32_t off) {
+    if (e->osr || e->inlining || e->chunkDepth == NULL) return true;
+    if (off >= (uint32_t)e->chunkDepthCount) return true;
+    int want = e->chunkDepth[off];
+    return want < 0 || want == (int)e->depth;
+}
+
 /* Take the record without emitting the branch to it. The model is what it is
  * at this moment, so a site whose *code* is emitted later -- a self-call's
  * cold block, which lives with the stubs -- still has to record here. */
@@ -1879,6 +1953,78 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
     /* JAITHON_JIT_DEOPT_STRESS makes every guard fail, so the whole test suite exercises the resume path
      * -- otherwise reached only when a program changes a field's type, which almost none do. */
     bool always = jitDeoptStress();
+    e->fixups[e->fixupCount].conditional  = !always;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
+}
+
+/* A guard that resumes at the START of the instruction being compiled, whatever
+ * that instruction's arm has already popped.
+ *
+ * deoptRecordAt refuses this case ("a guard resumes an instruction whose
+ * operands it has already consumed") because the entries below `depth` are the
+ * only ones it will describe. They are still readable here: popValue moves
+ * `depth` and `valueDepth` and nothing else, so entry i's kind is still in
+ * stack[i] and its register is still valueXReg(i) -- the mapping is positional.
+ * What is NOT guaranteed is that the arm has left those registers alone, which
+ * is why this is not a general facility: its one caller is the overflow guard
+ * inside a `try`, and the arms that reach it compute into a scratch (ovfDest)
+ * so nothing an entry lives in, and no local, has been written when it fires.
+ *
+ * fpLive is read as it stands rather than as it was: popValue calls fpSyncOne
+ * first, so an entry whose bit this instruction cleared has its X register
+ * current, which is exactly what the stub then writes out. */
+static void branchOnDeoptInstStart(Emit *e, unsigned cond) {
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    if (e->fpBorrow != 0) {          /* see deoptRecordAt */
+        e->whyNot = "a float borrow reached a guard";
+        e->failed = true;
+        return;
+    }
+    if (anyDeferred(e)) {            /* see deoptRecordAt */
+        e->whyNot = "a deferred value reached a guard";
+        e->failed = true;
+        return;
+    }
+    if (e->deoptCount >= JIT_MAX_DEOPT) {
+        e->whyNot = "too many guards to record";
+        e->failed = true;
+        return;
+    }
+    /* The record below describes entries this instruction may already have
+     * popped, and popValue clears the bit that said an entry was only ever a
+     * borrow of a local's register. So the question has to be asked of the
+     * instruction's START, where the walk recorded it. */
+    if (!e->instClean && !e->inlining) {
+        e->whyNot = "a raise resumes an instruction whose operands were borrowed";
+        e->failed = true;
+        return;
+    }
+    unsigned k = e->deoptCount++;
+    if (e->inlining) {
+        /* Inside an inline the interpreter has not made the call yet, so the
+         * only resume point is the caller's OP_CALL -- which deoptSite already
+         * answers, and which is already "the start of an instruction". */
+        if (!deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
+                       &e->deopt[k].valueDepth)) {
+            e->failed = true;
+            return;
+        }
+    } else {
+        e->deopt[k].ip         = e->curOffset;
+        e->deopt[k].depth      = e->instDepth;
+        e->deopt[k].valueDepth = e->instValueDepth;
+    }
+    e->deopt[k].lastFromDesc = false;
+    e->deopt[k].fpLive       = e->fpLive;
+    for (unsigned i = 0; i < e->deopt[k].depth; i++) {
+        e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].classes[i] = e->stackClass[i];
+    }
+    bool always = jitDeoptStress();
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
     e->fixups[e->fixupCount].conditional  = !always;
     e->fixups[e->fixupCount].depth        = -1;
     e->fixupCount++;
@@ -2134,6 +2280,17 @@ static void branchOnCondition(Emit *e, unsigned cond) {
  * product's high half against the low half's replicated sign, so its answer is NE -- routing multiply through VS meant its overflow was never detected (4 * 2^62 silently came back as 0). */
 static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    /* Inside a `try` the overflow stub's raise would unwind past the region
+     * that should have caught it (see Emit::inProtected). Resume at this
+     * instruction instead: the interpreter re-executes it, overflows too, and
+     * raises with a frame and an ip that name the right handler. The deopt
+     * record IS read, so that path settles the FP bank; the overflow stub is
+     * not, which is why the unconditional fpSyncAll above it is gone. */
+    if (e->inProtected) {
+        fpSyncAll(e);
+        branchOnDeoptInstStart(e, cond);
+        return;
+    }
     e->overflowUsed[which] = true;
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_OVF - which;
@@ -2141,6 +2298,32 @@ static void branchOnOverflow(Emit *e, unsigned which, unsigned cond) {
     e->fixups[e->fixupCount].depth        = -1;
     e->fixupCount++;
     emit(e, jaiA64BCond(cond, 0));
+}
+
+/* Where an integer arm that can overflow computes its result.
+ *
+ * Inside a `try` the overflow guard resumes at the instruction (see
+ * branchOnOverflow), so the result must not have reached its home yet -- the
+ * interpreter would otherwise apply the operation a second time on top of the
+ * wrapped value, and `total += x` inside a caught `try` would come back wrong.
+ * A scratch keeps every canonical register untouched until the guard is past;
+ * the copy out is a `mov`, which §5 of the roadmap prices at zero on this core,
+ * and it only appears inside a protected region at all. */
+static unsigned ovfDest(const Emit *e, unsigned home) {
+    return e->inProtected ? JIT_SCRATCH_B : home;
+}
+
+/* Whether a raise that leaves compiled code with the exception pending can be
+ * emitted here. It cannot inside a `try`: the effects already happened, so the
+ * site cannot resume at its instruction the way an overflow can, and the
+ * unwinder would consult an offset outside the protected region. Declines --
+ * which is exactly what the whole function did before OP_GET_EXC had a deopt,
+ * so no shape that used to compile stops. */
+static bool raiseExitAllowed(Emit *e, const char *what) {
+    if (!e->inProtected) return true;
+    e->whyNot = what;
+    e->failed = true;
+    return false;
 }
 
 /* The condition to branch on when the comparison is FALSE: the opcode jumps
@@ -2522,6 +2705,7 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
     if (ownStatus) return true;
 
     /* Nonzero means the callee raised; the interpreter owns it from here. */
+    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
     emit(e, jaiA64SubsXImm(31, 0, 0));
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
@@ -2759,6 +2943,8 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
                            bool method) {
+    /* Either verdict path below can come back with an exception pending. */
+    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
     if (cfn->module != caller->module) {
         e->whyNot = "a direct callee from another module";
         return false;
@@ -3144,6 +3330,11 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     ObjFunction *cfn = callee->fn;
     if (cfn->module != caller->module) return false;
     if (e->inlining) return false;             /* one level, no recursion */
+    /* The inlined body's offsets are the callee's, so `inProtected` describes
+     * the CALLER's regions throughout -- a `try` of the callee's own would go
+     * unseen. inlinableBody's whitelist already refuses every opcode a handler
+     * needs; this says so rather than relying on it. */
+    if (cfn->exceptionCount > 0) return false;
     unsigned cidx = e->depth - argc - 1;
     unsigned maxSlot = 0;
     bool readsUpvalue = false;
@@ -3364,9 +3555,12 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
  * own parameters and int or float arithmetic. Those restrictions are what make
  * a second walker over the callee's bytecode safe to write -- with no branches
  * there is no offset map to keep, and with no stores there is nothing to undo
- * if a guard inside it deoptimises to the call site. */
-static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
-                         unsigned argc, int callOff) {
+ * if a guard inside it deoptimises to the call site.
+ *
+ * Reached through inlineMethod, which is what puts the model back when this
+ * declines -- see there. */
+static bool inlineMethodWalk(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                             unsigned argc, int callOff) {
     if (e->noInline) return false;
     if (e->splitAt != 0) return false;   /* see inlineGlobalCall */
     unsigned ridx = e->depth - argc - 1;
@@ -3380,6 +3574,7 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     if (!jaiClassFindMethod(rcls, AS_STRING(mname), &method)) return false;
     if (!IS_CLOSURE(method)) return false;
     ObjFunction *mfn = AS_CLOSURE(method)->fn;
+    if (mfn->exceptionCount > 0) return false;   /* see inlineGlobalCall */
     if (mfn->arity != argc || mfn->defaultCount != 0) return false;
     if (mfn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
     if (mfn->upvalueCount != 0) return false;
@@ -3497,6 +3692,44 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     return true;
 }
 
+/* The model must be exactly where it was if the inline did not happen.
+ *
+ * inlineMethodWalk's dry pass pushes and pops as it reads the callee, and every
+ * one of its two dozen refusals returns from the middle of that -- so on its
+ * own it leaves the model as deep as the walk got. Its caller does NOT decline
+ * when it declines: the OP_INVOKE arm falls through to the descriptor path,
+ * which then names every later entry's register from an index that is too high
+ * and, far worse, writes deopt records describing an operand stack the
+ * interpreter does not have. `_crossings` in lib/std/gui/path.jai is the shape
+ * that found this: `edge.crossing(y)` gets three instructions into `crossing`
+ * before an OP_BIND stops the walk, so every deopt after it handed the
+ * interpreter the receiver and the argument a second time and the next
+ * instruction read a float where a list belonged.
+ *
+ * Unwinding here rather than at each `return false` is deliberate: there are
+ * far too many of them to keep right by hand, and the dry pass's own tail
+ * already pops back to its starting depth in exactly this way.
+ *
+ * A failure that has already emitted cannot be unwound at all -- the caller
+ * would stack a second call sequence on top of half of this one -- so that
+ * declines the compile instead. */
+static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                         unsigned argc, int callOff) {
+    unsigned depth0 = e->depth;
+    unsigned count0 = e->count;
+    if (inlineMethodWalk(e, closure, nameIdx, argc, callOff)) return true;
+    if (e->failed) return false;
+    if (e->count != count0) { e->failed = true; return false; }
+    while (e->depth > depth0) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+    }
+    /* Below where it started is not something an unwind can repair: the
+     * entries are the caller's and their registers are gone. */
+    if (e->depth != depth0) { e->failed = true; return false; }
+    return false;
+}
+
 static bool emitCallOut(Emit *e, unsigned argc) {
     ObjClass *cls = e->stackClass[e->depth - argc - 1];
     if (cls == NULL) { e->whyNot = "callee class"; return false; }
@@ -3598,7 +3831,12 @@ static bool emitCallOut(Emit *e, unsigned argc) {
 
 /* After an unconditional OP_LOOP/OP_JUMP there's no fall-through, so the linear walk can't carry the
  * preceding instruction's stack across the gap -- reconciles from a branch that targets this offset instead, accepting only a pure truncation (register entries are the top `valueDepth`, so popping from the top preserves every index below the join). */
-static void reconcileAfterUncond(Emit *e, uint32_t off) {
+/* The depth an emitted branch to `off` would reconcile the model to, or -1 for
+ * none. Split out because emitUnarmedDeopt has to ask the question WITHOUT
+ * answering it: a resume point it cannot reconcile is one it must not stop at.
+ * A "no" here is usually the kinds disagreeing, not the depth -- the signature
+ * carries both -- and that is exactly a join this tier cannot compile. */
+static int reconcileDepth(const Emit *e, uint32_t off) {
     for (unsigned i = 0; i < e->fixupCount; i++) {
         if (e->fixups[i].targetOffset != off) continue;
         int want = e->fixups[i].depth;
@@ -3606,12 +3844,17 @@ static void reconcileAfterUncond(Emit *e, uint32_t off) {
         unsigned d = (unsigned)want & 0xfu;
         if (d > e->depth) continue;
         if ((int)stackSignatureAt(e, d) != want) continue;
-        unsigned popped = e->depth - d;
-        if (popped > e->valueDepth) continue;
-        e->depth = d;
-        e->valueDepth -= popped;
-        return;
+        if (e->depth - d > e->valueDepth) continue;
+        return (int)d;
     }
+    return -1;
+}
+
+static void reconcileAfterUncond(Emit *e, uint32_t off) {
+    int d = reconcileDepth(e, off);
+    if (d < 0) return;
+    e->valueDepth -= e->depth - (unsigned)d;
+    e->depth = (unsigned)d;
 }
 
 /* `build` in binary_trees returns `null` on one path and `Node(..)` on another -- an instance merged
@@ -3850,6 +4093,116 @@ static bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
     return false;
 }
 
+/* Inside a `try`: an entry of the function's own static exception table covers
+ * this offset. Linear over the table because a function has one or two entries,
+ * never a table worth indexing. */
+static bool offsetIsProtected(const ObjFunction *fn, uint32_t off) {
+    for (uint16_t i = 0; i < fn->exceptionCount; i++) {
+        const ExceptionEntry *x = &fn->exceptions[i];
+        if (off >= x->start && off < x->end) return true;
+    }
+    return false;
+}
+
+/* An opcode with no arm in the switch below.
+ *
+ * It used to `return false`, which declines the WHOLE enclosing function -- so
+ * a `try` whose catch block holds OP_GET_EXC, or a `{}` literal on a path that
+ * never runs, evicted every function containing it from the compiled tier for
+ * good. 66 of 137 opcodes were in that position (tests/vm/jit_unarmed.baseline)
+ * and `tests/bench/error_paths`' eight-million-iteration counted loop was one
+ * of them: 124ms interpreted against 12ms compiled, decided by a catch block
+ * the opcode histogram says runs zero times.
+ *
+ * Instead, deoptimise unconditionally here. The interpreter resumes at this
+ * exact instruction holding exactly what the model says, which is what every
+ * failed guard already does -- the cold path is interpreted and the hot path
+ * around it still compiles. It declines only when a deopt site cannot be built
+ * at this offset, which is deoptSite's existing "a guard resumes an instruction
+ * whose operands it has already consumed" test and exactly the right question.
+ *
+ * Nothing on the fall-through edge past an unconditional deopt can execute, so
+ * the walk does not model it: it skips ahead. Advancing the model by the
+ * opcode's static stack effect instead was the other option and buys nothing --
+ * every instruction it would emit is unreachable -- while needing a kind for
+ * whatever the opcode produced, which the tier by definition does not have for
+ * an opcode it cannot compile. A skipped offset keeps offsetToInst == -1, so a
+ * branch that does target one declines when the fixups are resolved rather than
+ * jumping into nothing.
+ *
+ * WHERE it may resume is the part that has to be earned. Skipping to the next
+ * offset anything in the chunk can branch to was not enough: the branch that
+ * reaches it may itself have been inside the skipped run, in which case nothing
+ * establishes the model there and the walk carries on with the one it had at
+ * the deopt. That is silent -- the registers all shift by the same amount, so
+ * the body stays self-consistent -- right up until a deopt record names an
+ * operand stack the interpreter has not got. `_is_any` in
+ * lib/jaithon/compile/check/decl.jai is the shape: its `t is null` is unarmed,
+ * and the only branch to the code after it is the `if`'s own jump, three bytes
+ * into the skipped run.
+ *
+ * So it resumes only where the model can be stated:
+ *   - an offset an already-emitted branch targets, which reconcileAfterUncond
+ *     trims to that branch's own depth on the next iteration; or
+ *   - an offset the BYTECODE says has an empty operand stack, where there are
+ *     no entries and therefore no kinds to invent. This is what keeps a `while`
+ *     whose head has not been compiled yet -- a back edge is a branch target
+ *     the walk has not reached -- from being lost.
+ * Anything else keeps skipping, and running out means the rest of the function
+ * is not compiled: the last thing emitted is the unconditional branch to the
+ * deopt stub, so control never falls off the end. */
+static bool skipResumeOk(const Emit *e, uint32_t at) {
+    if (reconcileDepth(e, at) >= 0) return true;
+    return e->chunkDepth != NULL && at < (uint32_t)e->chunkDepthCount &&
+           e->chunkDepth[at] == 0;
+}
+
+static bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
+    if (e->inlining) {
+        /* Half an inlined body cannot be taken back, and the caller reads the
+         * result out of the model -- past a deopt there is none. */
+        e->whyNot = "an inlined body reaching an opcode this tier cannot speak";
+        return false;
+    }
+    unsigned k;
+    if (!deoptRecordAt(e, e->curOffset, false, &k)) return false;
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - k;
+    e->fixups[e->fixupCount].conditional  = false;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64B(0));
+
+    int at = *off;
+    for (;;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;      /* undecodable: the walk is lost */
+        at += len;
+        if (at >= stop) break;
+        if (offsetIsBranchTarget(c, (uint32_t)at) &&
+            skipResumeOk(e, (uint32_t)at)) {
+            /* Nothing an emitted branch reaches, so reconcileAfterUncond has
+             * nothing to trim to and the empty stack the bytecode promises is
+             * the whole model. Cleared raw rather than through popValue: this
+             * sits immediately after an unconditional branch, so an fmov
+             * settling an entry nobody will read is dead code. */
+            if (reconcileDepth(e, (uint32_t)at) < 0) {
+                e->depth      = 0;
+                e->valueDepth = 0;
+                e->fpLive     = 0;
+                e->fpBorrow   = 0;
+                e->kPend      = 0;
+                e->xBorrow    = 0;
+            }
+            break;
+        }
+    }
+    if (at > stop) at = stop;
+    *off = at;
+    return true;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
@@ -3867,9 +4220,40 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
     for (int off = start; off < stop && !e->failed;) {
         prevOff = thisOff;
         thisOff = off;
+        bool fellIn = !afterUncond;
         if (afterUncond) reconcileAfterUncond(e, (uint32_t)off);
-        afterUncond = (code[off] == OP_JUMP || code[off] == OP_LOOP);
+        /* The one place the model is asked to agree with anything. Which of the
+         * two answers is right depends on how the walk got here: along a
+         * fall-through edge a disagreement means an arm moved the model by the
+         * wrong amount, and there is nothing to do but decline; arriving
+         * without one means this offset is reached only by a branch, and if
+         * reconcileAfterUncond could not restate the model from that branch
+         * then this is code the compiled body has no way in to. Stopping is
+         * right there and declining would be a coverage loss for nothing: the
+         * last thing emitted is unconditional, so control never falls off the
+         * end, and a branch that does target a skipped offset declines when the
+         * fixups are resolved. */
+        if (!modelAgreesWithChunk(e, (uint32_t)off)) {
+            if (fellIn) {
+                e->whyNot = "the operand model disagrees with the bytecode";
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr,
+                            "[jit] at %d: model depth %u, the bytecode says %d\n",
+                            off, e->depth, e->chunkDepth[off]);
+                }
+                return false;
+            }
+            break;
+        }
         uint8_t op = code[off];
+        afterUncond = !jaiOpFallsThrough(op);
+        /* Whose regions these are matters: inside an inline the offsets are the
+         * callee's while every guard resumes at the CALLER's call site, so the
+         * caller's answer is the one that stands. inlineGlobalCall/inlineMethod
+         * refuse a callee with a table of its own. */
+        if (!e->inlining) {
+            e->inProtected = offsetIsProtected(fn, (uint32_t)off);
+        }
         /* An ASCII-table proof is only good along the fall-through edge this
          * walk is following. offsetIsBranchTarget scans the whole chunk, so it
          * catches a back edge whose branch has not been emitted yet -- and it
@@ -3888,7 +4272,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
                 }
             }
-            if (joinsHere || !deferSurvives(op) || e->deferCarryCount >= 64) {
+            /* Inside a `try` nothing may cross an instruction boundary
+             * unmaterialised: branchOnDeoptInstStart describes the model as of
+             * the instruction's START, which means describing entries this
+             * instruction has already popped -- and a popped entry that was
+             * only ever a borrow of a local's register never wrote its own.
+             * Settling here is the same conservative branch a non-whitelisted
+             * opcode already takes, and it costs `mov`s that §5 prices at zero.
+             */
+            if (joinsHere || e->inProtected || !deferSurvives(op) ||
+                e->deferCarryCount >= 64) {
                 settleAll(e);
             } else {
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
@@ -3903,10 +4296,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         /* A borrow ends here unless the instruction is one of the few it is
          * allowed to live across. The top of an instruction is the one place
          * the release is guaranteed to be on the executed path. */
-        if (e->fpBorrow != 0 && !fpBorrowSurvives(op)) fpReleaseAll(e);
+        if (e->fpBorrow != 0 && (e->inProtected || !fpBorrowSurvives(op))) {
+            fpReleaseAll(e);
+        }
         e->curOffset = (uint32_t)off;
         e->instDepth = e->depth;
         e->instValueDepth = e->valueDepth;
+        /* Every entry is in its own register right now, so a record taken of
+         * this instruction's START stays readable however far the arm below
+         * gets. An assertion, not the mechanism: the settles above are what
+         * make it true inside a protected region, and branchOnDeoptInstStart
+         * declines rather than describing a register nothing wrote. */
+        e->instClean = (e->kPend == 0 && e->xBorrow == 0 && e->fpBorrow == 0);
 
         if (e->fpLive != 0) {
             bool joinsHere = false;
@@ -3922,7 +4323,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * inlineGlobalCall carries that one across in the bank. Everything under it is discarded unread. */
             if (e->inlining && op == OP_RETURN) {
                 /* handled below */
-            } else if (!fpFastOp(op) || joinsHere) {
+            } else if (!fpFastOp(op) || joinsHere || e->inProtected) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
@@ -4145,6 +4546,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     JIT_FSCRATCH_B));
                 emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
             } else if (ka == SLOT_INT) {
+                rd = ovfDest(e, rd);   /* localOut copies it home below */
                 emit(e, jaiA64AddsX(rd, ra, rb));
                 branchOnOverflow(e, 0u, JAI_A64_VS);
             } else {
@@ -4281,6 +4683,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     JIT_FSCRATCH_B));
                 emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
             } else if (ka == SLOT_INT) {
+                rd = ovfDest(e, rd);   /* localOut copies it home below */
                 emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
                 emit(e, jaiA64MulX(rd, ra, rb));
                 emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
@@ -4332,6 +4735,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     JIT_FSCRATCH_B));
                 emit(e, jaiA64FmovXD(rd, JIT_FSCRATCH_A));
             } else if (ka == SLOT_INT) {
+                rd = ovfDest(e, rd);   /* localOut copies it home below */
                 emit(e, jaiA64SubsXReg(rd, ra, rb));
                 branchOnOverflow(e, 1u, JAI_A64_VS);
             } else {
@@ -4380,7 +4784,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (slot == 0) e->usesSlot0 = true;
             {
                 unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
-                unsigned dst = localDest(e, slot);
+                unsigned dst = ovfDest(e, localDest(e, slot));
                 /* Step is an i8, always fits imm12, so the constant never needs a register of its own. `subs` for a
                  * negative step rather than a negated `adds`: both set V for the operation actually performed, which is what the overflow guard below reads. */
                 if (imm >= 0) {
@@ -4388,9 +4792,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 } else {
                     emit(e, jaiA64SubsXImm(dst, cur, (unsigned)(-(int)imm)));
                 }
+                /* The guard is taken before the home is written, not after: it
+                 * resumes at this instruction inside a `try` (ovfDest), and
+                 * neither fpSyncAll nor a b.cond disturbs V or `dst`. */
+                branchOnOverflow(e, 0u, JAI_A64_VS);
                 localOut(e, slot, dst);
             }
-            branchOnOverflow(e, 0u, JAI_A64_VS);
             off += 4;
             break;
         }
@@ -4789,14 +5196,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
+            unsigned rt = ovfDest(e, rd);
             /* The product overflows exactly when the high half is not the low
              * half's sign bit replicated, so smulh and one shifted compare
              * decide it. mul must come after smulh reads its inputs, since rd
-             * may be one of them. */
+             * may be one of them -- which is also why `rt` differs inside a
+             * `try`: rd IS the first operand's register, and the guard resumes
+             * at an instruction whose operands the interpreter still needs. */
             emit(e, jaiA64SmulhX(JIT_SCRATCH_A, ra, rb));
-            emit(e, jaiA64MulX(rd, ra, rb));
-            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+            emit(e, jaiA64MulX(rt, ra, rb));
+            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rt, 63));
             branchOnOverflow(e, 2u, JAI_A64_NE);
+            if (rt != rd) emit(e, jaiA64MovX(rd, rt));
             off += 1;
             break;
         }
@@ -4912,10 +5323,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != SLOT_INT || op == OP_DIV) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
             unsigned rd = pushReg(e) - 1;
-            if (foldK) emitAddSubImm(e, rd, ra, kimm, op == OP_SUB);
-            else emit(e, op == OP_ADD ? jaiA64AddsX(rd, ra, rb)
-                                      : jaiA64SubsXReg(rd, ra, rb));
+            /* rd is the first operand's own register (two off, one on), so
+             * inside a `try` the sum computes elsewhere: the overflow guard
+             * resumes at this instruction and the interpreter reads the
+             * operands back off its stack. See ovfDest. */
+            unsigned rt = ovfDest(e, rd);
+            if (foldK) emitAddSubImm(e, rt, ra, kimm, op == OP_SUB);
+            else emit(e, op == OP_ADD ? jaiA64AddsX(rt, ra, rb)
+                                      : jaiA64SubsXReg(rt, ra, rb));
             branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
+            if (rt != rd) emit(e, jaiA64MovX(rd, rt));
             off += 1;
             break;
         }
@@ -5631,6 +6048,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
                 if (e->growCount >= JIT_MAX_GROW) {
                     e->whyNot = "more list pushes than the tier tracks";
+                    return false;
+                }
+                /* jitListGrow can raise, and the stub routes that to the
+                 * exception exit (see emitGrowStubs). */
+                if (!raiseExitAllowed(e, "a list growth inside a try")) {
                     return false;
                 }
                 {
@@ -7638,6 +8060,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->whyNot = "more self-calls than the tier tracks";
                 return false;
             }
+            /* Its cold block routes a raised exception to the exception exit
+             * (see emitSelfSlowStubs). */
+            if (!raiseExitAllowed(e, "a call that can raise inside a try")) {
+                return false;
+            }
             unsigned si = e->selfSlowCount++;
             unsigned resultReg = valueXReg(e, e->valueDepth - argc);
             e->selfSlow[si].roots     = selfRoots;
@@ -7741,12 +8168,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         default:
-            if (getenv("JAI_JIT_WHY")) {
-                fprintf(stderr, "[jit] %s declined at %s\n",
-                        fn->name ? fn->name->chars : "<anon>",
-                        jaiOpName((OpCode)op));
+            /* An opcode this tier does not speak: interpreted from here, rather
+             * than the whole function interpreted. See emitUnarmedDeopt. */
+            if (!emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s declined at %s\n",
+                            fn->name ? fn->name->chars : "<anon>",
+                            jaiOpName((OpCode)op));
+                }
+                return false;
             }
-            return false;   /* an opcode this tier does not speak */
+            afterUncond = true;   /* the fall-through edge is gone */
+            continue;
         }
     }
     /* An inlined body's offsets are the callee's; matching them against the
@@ -7879,9 +8312,23 @@ static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
     return adoptLocalKindSeen(e, slot, kind, shape, klass, NULL_VAL);
 }
 
-static void jitFree(int *map, int *depths, int count) {
+static void jitFree(int *map, int *depths, int *chunkDepth, int count) {
     JAI_FREE_ARRAY(int, map, count);
     JAI_FREE_ARRAY(int, depths, count);
+    JAI_FREE_ARRAY(int, chunkDepth, count);
+}
+
+/* The bytecode's own answer for every offset, or NULL if it cannot be had.
+ * NULL is not a failure: modelAgreesWithChunk simply has nothing to check
+ * against, which is the state the tier was in before this existed. */
+static int *chunkDepthTable(const ObjFunction *fn) {
+    int *d = JAI_ALLOC(int, fn->chunk.count + 1);
+    if (d == NULL) return NULL;
+    if (!jaiChunkStackDepths(fn, d)) {
+        JAI_FREE_ARRAY(int, d, fn->chunk.count + 1);
+        return NULL;
+    }
+    return d;
 }
 
 static bool eligible(ObjFunction *fn) {
@@ -8008,6 +8455,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
 
     int *map = JAI_ALLOC(int, fn->chunk.count + 1);
     int *depths = JAI_ALLOC(int, fn->chunk.count + 1);
+    int *chunkDepth = chunkDepthTable(fn);
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 
 
@@ -8022,6 +8470,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.noInline     = noInline;
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
+    e.chunkDepth = chunkDepth;
+    e.chunkDepthCount = fn->chunk.count + 1;
     e.limitLiteral = -1;
     e.bailBlock    = -1;
 
@@ -8043,6 +8493,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.descOffset   = 16u;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
+    body.chunkDepth = chunkDepth;
+    body.chunkDepthCount = fn->chunk.count + 1;
     /* So the per-slot charges the accessors record are weighted by how deeply
      * nested the site is. Without it every site in the function counts the
      * same and `n`, read once to set the loop up, outranks nothing. */
@@ -8053,7 +8505,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     fn->name ? fn->name->chars : "<anon>",
                     body.whyNot ? body.whyNot : "its arguments");
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
@@ -8071,14 +8523,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     fn->name ? fn->name->chars : "<anon>",
                     body.whyNot ? body.whyNot : jaiOpName((OpCode)body.lastOp));
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
     /* A self-call cannot reproduce slot 0: no register holds the callee. A
      * body that both recurses and reads slot 0 is not compiled. */
     if (body.usesSlot0 && body.hasSelfCall) {
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
     e.base         = body.usesSlot0 ? 0u : 1u;
@@ -8124,7 +8576,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     fn->name ? fn->name->chars : "<anon>", e.whyNot, e.locals,
                     body.maxValue);
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
@@ -8153,7 +8605,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             fprintf(stderr, "[jit] %s stopped: frame of %u bytes\n",
                     fn->name ? fn->name->chars : "<anon>", e.frameBytes);
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
@@ -8227,8 +8679,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
+    e.chunkDepth = chunkDepth;
+    e.chunkDepthCount = fn->chunk.count + 1;
     if (!seedLocals(&e, slotBase)) {
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
     if (!compileBody(&e, closure) && getenv("JAI_JIT_WHY")) {
@@ -8236,14 +8690,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 e.whyNot ? e.whyNot : "an unsupported operand form");
     }
     if (e.failed || e.whyNot != NULL)
-        { jitFree(map, depths, fn->chunk.count + 1); return false; }
+        { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
     if (e.failed) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
                     fn->name ? fn->name->chars : "<anon>",
                     e.whyNot ? e.whyNot : "the emitter ran out of room");
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
     (void)prologue;
@@ -8271,9 +8725,20 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         e.deopt[k].stub = (int)e.count;
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
 
+        uint64_t skipLocals = 0;
         for (unsigned i = 0; i < (e.osr ? 0u : e.locals); i++) {
             unsigned slot = e.base + i;
             SlotKind kind = e.localKind[slot];
+            /* An opaque slot is one the compiled body never reads, so the tier
+             * never learned what is in it -- and jitArgIn passed a raw 0 for
+             * it. The interpreter this record hands over to DOES read it, and
+             * bindCallArgs has already put the caller's real argument in the
+             * frame, so the record must say "not mine" rather than null.
+             * See JitDeoptRecord::skipLocals. */
+            if (kind == SLOT_OPAQUE) {
+                skipLocals |= (uint64_t)1 << i;
+                continue;
+            }
             /* Only an opaque slot is null; everything else non-scalar is an object. Listing object kinds
              * explicitly instead once wrote a SLOT_OBJ local (string/dict/closure) out as null on every deopt -- invisible until a body holding one could compile and then actually deopt. */
             unsigned tag = kind == SLOT_INT    ? VAL_INT
@@ -8331,6 +8796,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
             emit(&e, jaiA64StrX(pr, JIT_SCRATCH_A, at + 8));
         }
+        /* Written unconditionally, including the zero: gDeopt is one global and
+         * a mask left over from another function's stub would silently drop a
+         * local this one does describe. */
+        emitConst64(&e, JIT_SCRATCH_B, (int64_t)skipLocals);
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                            (unsigned)offsetof(JitDeoptRecord, skipLocals)));
 
         unsigned valueSeen = 0;
         for (unsigned i = 0; i < e.deopt[k].depth; i++) {
@@ -8430,7 +8901,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             fprintf(stderr, "[jit] %s stopped: no stack bound available\n",
                     fn->name ? fn->name->chars : "<anon>");
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
     emit(&e, (uint32_t)(uint64_t)limit);
@@ -8442,7 +8913,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     fn->name ? fn->name->chars : "<anon>",
                     e.whyNot ? e.whyNot : "the emitter ran out of room");
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
@@ -8466,7 +8937,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                     "was never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         } else if (f->targetOffset <= FIXUP_SELFSLOW &&
@@ -8478,7 +8949,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                     "never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         } else if (f->targetOffset <= FIXUP_DEOPT &&
@@ -8490,7 +8961,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                     "was never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         } else if (f->targetOffset <= FIXUP_GROW &&
@@ -8502,7 +8973,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                     "never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         } else if (f->targetOffset <= FIXUP_OVF &&
@@ -8514,19 +8985,19 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                     "was never emitted\n",
                             fn->name ? fn->name->chars : "<anon>");
                 }
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         } else if (f->targetOffset == FIXUP_ENTRY) {
             target = 0;
         } else {
             if (f->targetOffset > (uint32_t)fn->chunk.count) {
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
             target = map[f->targetOffset];
             if (target < 0) {
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
             /* Registers are assigned from the operand-stack depth at each point, so a join reached at two
@@ -8538,7 +9009,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             fn->name ? fn->name->chars : "<anon>",
                             f->targetOffset);
                 }
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         }
@@ -8573,7 +9044,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             }
         }
     }
-    jitFree(map, depths, fn->chunk.count + 1);
+    jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
 
     /* A `bl` at instruction i must reach instruction 0 of this function, so
      * the recursive-call fixups above are relative to the function's own
@@ -8609,7 +9080,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             fprintf(stderr, "[jit] %s declined: a bail follows a heap write\n",
                     fn->name ? fn->name->chars : "<anon>");
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
@@ -8783,6 +9254,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     int *map = JAI_ALLOC(int, fn->chunk.count + 1);
     int *depths = JAI_ALLOC(int, fn->chunk.count + 1);
+    int *chunkDepth = chunkDepthTable(fn);
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 
     static Emit e;
@@ -8806,6 +9278,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.observed = slots;
     e.offsetToInst = map;
     e.offsetToDepth = depths;
+    e.chunkDepth = chunkDepth;
+    e.chunkDepthCount = fn->chunk.count + 1;
     e.savedCount = JIT_MAX_SAVED;
     /* Each slot takes the kind it holds right now. The entry re-checks them on
      * every later entry, so this is a specialisation, not an assumption. */
@@ -8853,6 +9327,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
         probe.scratchRoom = JIT_SCRATCH_BANK_COUNT;
         probe.offsetToInst = map; probe.offsetToDepth = depths;
+        probe.chunkDepth = chunkDepth; probe.chunkDepthCount = fn->chunk.count + 1;
         probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
         probe.loopDepth = gLoopDepth;
         probe.loopDepthCount = e.loopDepthCount;
@@ -9120,12 +9595,12 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
                     e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
         }
-        jitFree(map, depths, fn->chunk.count + 1);
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
 
     /* Falling off the end of the compiled range is the loop exiting there. */
-    if (e.exitCount >= JIT_MAX_EXIT) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.exitCount >= JIT_MAX_EXIT) { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
 
 /* Every way out writes back what the loop was holding: the iterator's index,
  * and the locals if they were living in registers. Miss one and the
@@ -9299,7 +9774,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     }
 #undef OSR_SYNC_ITER
 
-    if (e.failed) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+    if (e.failed) { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
 
     for (unsigned i = 0; i < e.fixupCount; i++) {
         const Fixup *f = &e.fixups[i];
@@ -9321,7 +9796,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         else if (f->targetOffset <= FIXUP_OVF && f->targetOffset >= FIXUP_OVF - 2u)
             target = e.overflowStub[FIXUP_OVF - f->targetOffset];
         else {
-            if (f->targetOffset > (uint32_t)fn->chunk.count) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+            if (f->targetOffset > (uint32_t)fn->chunk.count) { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
             target = map[f->targetOffset];
             if (target < 0 && getenv("JAI_JIT_WHY")) {
                 fprintf(stderr, "[jit] %s stopped: a branch to %u, which is "
@@ -9330,18 +9805,18 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             }
             if (target < 0 ||
                 (f->depth >= 0 && depths[f->targetOffset] != f->depth)) {
-                jitFree(map, depths, fn->chunk.count + 1);
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
         }
-        if (target < 0) { jitFree(map, depths, fn->chunk.count + 1); return false; }
+        if (target < 0) { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
         int rel = target - f->instIndex;
         uint32_t word = e.code[f->instIndex];
         if ((word & 0xfc000000u) == 0x94000000u) e.code[f->instIndex] = jaiA64Bl(rel);
         else if (f->conditional) e.code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
         else e.code[f->instIndex] = jaiA64B(rel);
     }
-    jitFree(map, depths, fn->chunk.count + 1);
+    jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
 
     if (!jaiCodeArenaUnseal(arena)) return false;
     /* Same 32-alignment as the function tier above, for the same two reasons. */
@@ -9567,6 +10042,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     gDeopt.nstack = 0;
     gDeopt.base = 0;
+    /* An OSR form's locals ARE the frame slots and its stub writes none, so
+     * nothing here fills the mask -- clear it rather than leave the last
+     * function-tier stub's behind for whoever reads the record next. */
+    gDeopt.skipLocals = 0;
     int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
     if (at == -1) return 0;
     if (at == -2) return 2;              /* an exception is pending */
