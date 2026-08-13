@@ -2,8 +2,8 @@ import os
 
 _LEVEL = os.environ.get("BENCH_LEVEL", "hard")
 SHRINK = 4 if _LEVEL == "easy" else 2 if _LEVEL == "medium" else 1
-SIDE = 300 // SHRINK
-STEPS = max(40 // SHRINK, 1)
+SIDE = 500 // SHRINK
+STEPS = max(60 // SHRINK, 1)
 
 
 def plate(n):

@@ -10,8 +10,8 @@ from std.os import env_or
 let LEVEL = env_or("BENCH_LEVEL", "hard")
 # Work is n^2 per step, so the level cuts the side and the step count together.
 let SHRINK = if LEVEL == "easy" { 4 } elif LEVEL == "medium" { 2 } else { 1 }
-let SIDE = 300 // SHRINK
-let STEPS = max(40 // SHRINK, 1)
+let SIDE = 500 // SHRINK
+let STEPS = max(60 // SHRINK, 1)
 
 fn plate(n: int) -> list[list[float]] {
     var g: list[list[float]] = []
