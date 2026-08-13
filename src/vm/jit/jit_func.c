@@ -5340,6 +5340,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
             if (!e->callsOut) return false;
+            /* Read before the entry is popped below, not through the model
+             * afterwards: the push that replaces it overwrites this cell. */
+            Value    itemsDict = e->stackSeen[sidx];
             int16_t  ijump = jaiReadI16(code + off + 1);
             int32_t  after = (int32_t)(off + 3) + ijump;
             /* The emitter's shape exactly: OP_INVOKE (7 bytes) then
@@ -5367,7 +5370,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * sample rather than an element: the pair head reads the first live
              * entry off it for the component kinds, exactly as the list form
              * reads items[0]. */
-            if (!pushValue3(e, SLOT_ITER, 4, NULL, e->stackSeen[sidx], -1)) {
+            if (!pushValue3(e, SLOT_ITER, 4, NULL, itemsDict, -1)) {
                 return false;
             }
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
