@@ -67,6 +67,11 @@ static uintptr_t stackLimit(void) {
 #define JIT_FREE_COUNT   5u
 /* Two registers each; four list headers is every stencil seen so far. */
 #define JIT_MAX_HOIST    4u
+/* How many distinct clobber SITES the measuring pass will remember, so that
+ * "does x0..x8 survive across this bytecode range" can be asked of a range
+ * rather than of the whole body. Past this the body answers yes everywhere,
+ * which is the same answer it gave before the range existed. */
+#define JIT_MAX_CLOBBER 24u
 /* Repeated from the register plan below, which cannot be declared this early:
  * x0..x8, the bank a call-free body's operand stack uses. */
 #define JIT_SCRATCH_BANK_COUNT 9u
@@ -565,6 +570,16 @@ typedef struct {
      * what `scratchValues` below is decided from, and the measuring pass is
      * what observes it. */
     bool      clobbersScratch;
+    /* WHERE each of those sites was, in bytecode offsets, so the same question
+     * can be asked of one loop instead of the whole body: a nest whose inner
+     * loop calls nothing still owns x0..x8 and x13..x17 *inside* that loop,
+     * however many times the outer one calls. Recorded by the measuring pass
+     * and copied into the real one. Overflowing the array sets `clobberSpill`,
+     * which answers "yes, everywhere" -- the whole-body answer, so running out
+     * of room costs a hoist and never a wrong one. */
+    uint32_t  clobberOff[JIT_MAX_CLOBBER];
+    unsigned  clobberCount;
+    bool      clobberSpill;
     /* The operand stack lives in x0..x8 rather than above the locals in the
      * callee-saved bank. Sound exactly when nothing can clobber a caller-saved
      * register between a push and its use, i.e. `!clobbersScratch` and the
@@ -1111,9 +1126,39 @@ static unsigned valueBankRoom(const Emit *e) {
  * value read out of a register a helper overwrote. */
 static void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
+    if (e->measuring) {
+        /* An inlined body's offsets are the CALLEE's, so they say nothing
+         * about where in the caller this sits; `inlIp` is the caller's own
+         * OP_CALL, which is the offset every range in this file is measured
+         * in. An inlined body is not supposed to reach here at all (see
+         * inlineGlobalCall) -- but "not supposed to" is not "cannot", and a
+         * callee offset landing inside a caller loop by coincidence would
+         * over-report, not under-report, which is the safe direction. */
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        if (e->clobberCount < JIT_MAX_CLOBBER) {
+            e->clobberOff[e->clobberCount++] = at;
+        } else {
+            e->clobberSpill = true;
+        }
+    }
     if (e->scratchValues) {
         e->whyNot = "a call reached a body whose values are in scratch";
         e->failed = true;
+    }
+    /* Same ratchet one granularity down. A hoisted header sits in a
+     * caller-saved register for the length of a loop the measuring pass called
+     * call-free; a call turning up inside that loop in the real pass means the
+     * two walks disagreed, and the header would be read out of a register the
+     * helper had overwritten. It cannot happen -- both walk the same bytecode
+     * with the same inlining -- so this costs a compile, never an answer. */
+    if (!e->measuring && e->hoistCount > 0) {
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned i = 0; i < e->hoistCount; i++) {
+            if (at < e->hoist[i].top || at >= e->hoist[i].end) continue;
+            e->whyNot = "a call reached a loop a header was hoisted out of";
+            e->failed = true;
+            return;
+        }
     }
 }
 
@@ -1801,6 +1846,20 @@ static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                          (int32_t)offsetof(ObjList, items)));
 }
 
+/* Can anything in [lo, hi) destroy a caller-saved register? The measuring pass
+ * recorded every site that can (noteScratchClobber), so this is a lookup and
+ * not a re-derivation -- which matters, because the set of things that clobber
+ * is not the set of things that look like calls: the list-grow stub is an
+ * OP_LIST_APPEND, and the self-call slow path is an OP_CALL that never leaves
+ * the body. Whatever reaches noteScratchClobber is in here by construction. */
+static bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
+    if (e->clobberSpill) return true;
+    for (unsigned i = 0; i < e->clobberCount; i++) {
+        if (e->clobberOff[i] >= lo && e->clobberOff[i] < hi) return true;
+    }
+    return false;
+}
+
 /* The hoisted header for a subscript whose base is a plain read of local
  * `slot`, or -1. `curOffset` is checked against the loop the entry was made
  * for, so an entry the walk has already left cannot be picked up again by a
@@ -1844,18 +1903,32 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  * (five neighbours, four of them from rows the loop is not walking) that is
  * five loads an iteration of something no iteration changes. The reload is
  * also what makes the read SOUND without a version guard, so hoisting it needs
- * the guard back -- unless the body can be shown to contain nothing that could
- * move a list at all, which is exactly what `bodyCalls` answers. Every way a
- * list is resized (push, insert, remove, clear, slice, anything through a
- * descriptor) is a call out, and so is every collection; an in-place `xs[i] =
- * v` moves neither `items` nor `count`. So in a call-free body a header is
+ * the guard back -- unless the stretch of code the load is hoisted over can be
+ * shown to contain nothing that could move a list at all. Every way a list is
+ * resized (push, insert, remove, clear, slice, anything through a descriptor)
+ * is a call out, and so is every collection; an in-place `xs[i] = v` moves
+ * neither `items` nor `count`. So across a call-free stretch a header is
  * invariant for as long as the LOCAL is, and that is a fact the measuring pass
  * already recorded (noteSlotWrite).
  *
+ * That stretch is the CANDIDATE LOOP, not the body. `bodyCalls` -- the whole
+ * body -- is what this used to ask, and it is both sound and far too strong:
+ * matrix_mul's `k` loop calls nothing, but the `i` loop it sits in pushes a row
+ * per iteration, so the body answered "calls" and the innermost loop in the
+ * benchmark got nothing. A hoist out of a call-free loop is sound for exactly
+ * the same two reasons it was before -- nothing between the load and its uses
+ * can move the list, and nothing between them can overwrite a caller-saved
+ * register -- because both are statements about the code the value is live
+ * across, and that is the loop.
+ *
  * Registers come from x13..x17, which the tier otherwise never names, plus
  * whatever the operand stack left unused at the top of the scratch bank. Both
- * are caller-saved, which is the same reason they are free and the reason this
- * is confined to a body that calls nothing. */
+ * are caller-saved, which is what makes them free and also what confines a
+ * hoist to a call-free region: a call outside the loop may destroy them, and is
+ * welcome to -- by then the hoisted header is dead, and re-entering the loop
+ * re-runs the load that sits above its head. The scratch-bank half is offered
+ * only under `scratchValues`, which is still a whole-body claim, since those
+ * registers are the operand stack's everywhere else in the body. */
 /* Chooses the loop each candidate is hoisted out of and pays for the registers
  * busiest first, ONCE, before a line of the body is emitted. Doing it at the
  * loop heads as the walk reaches them spends the pool in program order, which
@@ -1867,7 +1940,7 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  * The loop chosen is the OUTERMOST one the slot is invariant across, so the
  * load runs as rarely as the proof allows. */
 static void planHoists(Emit *e, ObjFunction *fn) {
-    if (e->measuring || !e->osr || e->bodyCalls) return;
+    if (e->measuring || !e->osr) return;
     const Chunk *c = &fn->chunk;
 
     struct { uint32_t top, end, use; uint8_t slot; } cand[JIT_MAX_SLOTS + 1];
@@ -1889,6 +1962,9 @@ static void planHoists(Emit *e, ObjFunction *fn) {
             if (e->slotIndexLo[s] < lt || e->slotIndexHi[s] >= le) continue;
             /* ...and no write to it anywhere in the loop. */
             if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
+            /* ...and nothing in the loop that could resize the list or take
+             * back the registers the header is being put in. */
+            if (regionCalls(e, lt, le)) continue;
             if (!onlyBackEdgesEnter(c, lt, le)) continue;
             if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
                 bestTop = lt; bestEnd = le;
@@ -8763,10 +8839,9 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 }
             }
 
-            /* What planHoists needs: where each slot was written and where it
-             * was subscripted, and the registers nothing else claims. The pool
-             * exists only for a body that calls nothing -- which is also the
-             * condition that makes a hoisted header sound (see planHoists). */
+            /* What planHoists needs: where each slot was written, where it was
+             * subscripted, where the body can destroy a caller-saved register,
+             * and the registers nothing else claims. */
             e.bodyCalls = probe.clobbersScratch;
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 e.slotWriteLo[i]  = probe.slotWriteLo[i];
@@ -8775,20 +8850,31 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                 e.slotIndexHi[i]  = probe.slotIndexHi[i];
                 e.slotIndexUse[i] = probe.slotIndexUse[i];
             }
-            if (!e.bodyCalls) {
-                for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
+            e.clobberCount = probe.clobberCount;
+            e.clobberSpill = probe.clobberSpill;
+            for (unsigned i = 0; i < probe.clobberCount; i++) {
+                e.clobberOff[i] = probe.clobberOff[i];
+            }
+            /* x13..x17 are nobody's in any body -- a call destroys them, which
+             * is why only a call-free REGION may hold anything there, and
+             * planHoists is what tests that. Offering them unconditionally is
+             * the whole per-region change: they used to be withheld from every
+             * body containing a call, including the ones whose inner loop is
+             * the entire benchmark. */
+            for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
+                e.hoistPool[e.hoistPoolCount++] = (uint8_t)(JIT_FREE_FIRST + r);
+            }
+            /* Whatever the operand stack left at the top of its own bank.
+             * Only when it IS that bank -- otherwise those registers are
+             * carrying operands, or an inlined body has x0..x8 to itself and
+             * none of it is spare. `scratchValues` is a whole-body claim and
+             * has to stay one: unlike x13..x17, these registers have another
+             * owner outside the region. */
+            if (e.scratchValues) {
+                for (unsigned r = probe.maxValueAll;
+                     r < JIT_SCRATCH_BANK_COUNT; r++) {
                     e.hoistPool[e.hoistPoolCount++] =
-                        (uint8_t)(JIT_FREE_FIRST + r);
-                }
-                /* Whatever the operand stack left at the top of its own bank.
-                 * Only when it IS that bank -- otherwise an inlined body has
-                 * x0..x8 to itself and none of it is spare. */
-                if (e.scratchValues) {
-                    for (unsigned r = probe.maxValueAll;
-                         r < JIT_SCRATCH_BANK_COUNT; r++) {
-                        e.hoistPool[e.hoistPoolCount++] =
-                            (uint8_t)(JIT_INL_BANK + r);
-                    }
+                        (uint8_t)(JIT_INL_BANK + r);
                 }
             }
         }
