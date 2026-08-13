@@ -1422,22 +1422,31 @@ bool jaiCallValue1(Value callee, Value arg, Value *out) {
                 return false;
             }
             if (outcome == JAI_JIT_DEOPT) {
-                vm.stackTop = base + 2;
-                if (!bindCallArgs(closure, 1, base) ||
-                    !pushFrame(closure, base) ||
-                    !jaiJitApplyDeopt(closure, base) ||
-                    run(frameBase) != JAI_RUN_OK) {
-                    vm.stackTop = base;
-                    return false;
-                }
-                *out = *(--vm.stackTop);
-                vm.stackTop = base;
-                return true;
+                return jaiFinishJitDeopt1(closure, base, frameBase, out);
             }
             vm.stackTop = base;   /* declined; the general path below */
         }
     }
     return jaiCallValue(callee, 1, &arg, out);
+}
+
+/* See vm.h. Split out of the branch above so that a caller which entered the
+ * compiled body for itself -- jaiCallFn1, which exists so the boundary is one
+ * C frame rather than three -- can finish the same way without duplicating
+ * the sequence or reaching for vm.c's statics. */
+bool jaiFinishJitDeopt1(ObjClosure *closure, Value *base, int frameBase,
+                        Value *out) {
+    vm.stackTop = base + 2;
+    if (!bindCallArgs(closure, 1, base) ||
+        !pushFrame(closure, base) ||
+        !jaiJitApplyDeopt(closure, base) ||
+        run(frameBase) != JAI_RUN_OK) {
+        vm.stackTop = base;
+        return false;
+    }
+    *out = *(--vm.stackTop);
+    vm.stackTop = base;
+    return true;
 }
 
 /* Resolve `receiver.name` to something callable with the receiver in slot 0.

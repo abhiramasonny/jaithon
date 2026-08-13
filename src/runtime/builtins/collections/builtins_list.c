@@ -71,7 +71,7 @@ static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
 /* No truthiness in Jaithon (spec §2.6): a predicate must return bool, not coerce. */
 static bool callPredicate(Value pred, Value item, const char *fnName, bool *out) {
     Value arg = item, verdict;
-    if (!jaiCallValue1(pred, arg, &verdict)) return false;
+    if (!jaiCallFn1(pred, arg, &verdict)) return false;
     if (!IS_BOOL(verdict)) {
         return jaiThrow(vm.cTypeError,
                         "%s(): the predicate must return bool, not %s", fnName,
@@ -134,7 +134,7 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
     jaiGCPushRoot(OBJ_VAL(keys));
     for (int i = 0; i < items->count; i++) {
         Value arg = items->items[i], key;
-        if (!jaiCallValue1(keyFn, arg, &key)) {
+        if (!jaiCallFn1(keyFn, arg, &key)) {
             jaiGCPopRoots(2);
             return false;
         }
@@ -538,7 +538,7 @@ static bool listMap(int argc, Value *args, Value *out) {
     bool ok = true;
     for (int i = 0; i < self->count; i++) {
         Value arg = self->items[i], mapped;
-        if (!jaiCallValue1(args[1], arg, &mapped)) {
+        if (!jaiCallFn1(args[1], arg, &mapped)) {
             ok = false;
             break;
         }
@@ -646,7 +646,7 @@ static bool listForEach(int argc, Value *args, Value *out) {
 
     for (int i = 0; i < self->count; i++) {
         Value arg = self->items[i], ignored;
-        if (!jaiCallValue1(args[1], arg, &ignored)) return false;
+        if (!jaiCallFn1(args[1], arg, &ignored)) return false;
     }
     *out = NULL_VAL;
     return true;
