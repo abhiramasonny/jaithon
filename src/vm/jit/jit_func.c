@@ -8434,6 +8434,15 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
     planHoists(&e, fn);
+    if (getenv("JAI_JIT_WHY")) {
+        for (unsigned i = 0; i < e.hoistCount; i++) {
+            fprintf(stderr,
+                    "[jit] osr at %u hoists slot %u's header out of %u..%u "
+                    "into x%u/x%u\n",
+                    top, e.hoist[i].slot, e.hoist[i].top, e.hoist[i].end,
+                    e.hoist[i].itemsReg, e.hoist[i].countReg);
+        }
+    }
 
     if (!compileBody(&e, closure) || e.failed) {
         if (getenv("JAI_JIT_WHY")) {
