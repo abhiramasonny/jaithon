@@ -3356,9 +3356,12 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
  * own parameters and int or float arithmetic. Those restrictions are what make
  * a second walker over the callee's bytecode safe to write -- with no branches
  * there is no offset map to keep, and with no stores there is nothing to undo
- * if a guard inside it deoptimises to the call site. */
-static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
-                         unsigned argc, int callOff) {
+ * if a guard inside it deoptimises to the call site.
+ *
+ * Reached through inlineMethod, which is what puts the model back when this
+ * declines -- see there. */
+static bool inlineMethodWalk(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                             unsigned argc, int callOff) {
     if (e->noInline) return false;
     unsigned ridx = e->depth - argc - 1;
     ObjClass *rcls = e->stackClass[ridx];
@@ -3488,6 +3491,45 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     if (dst != rres) emit(e, jaiA64MovX(dst, rres));
     e->inlined = true;
     return true;
+}
+
+/* The model must be exactly where it was if the inline did not happen.
+ *
+ * inlineMethodWalk's dry pass pushes and pops as it reads the callee, and every
+ * one of its two dozen refusals returns from the middle of that -- so on its
+ * own it leaves the model as deep as the walk got. Its caller does NOT decline
+ * when it declines: the OP_INVOKE arm falls through to the descriptor path,
+ * which then names every later entry's register from an index that is too high
+ * and, far worse, writes deopt records describing an operand stack the
+ * interpreter does not have. `_crossings` in lib/std/gui/path.jai is the shape
+ * that found this: `edge.crossing(y)` gets three instructions into `crossing`
+ * before an OP_BIND stops the walk, so every deopt after it handed the
+ * interpreter the receiver and the argument a second time and the next
+ * instruction read a float where a list belonged -- `'float' object has no
+ * method 'push'`, out of three jaiplot rendering tests and nothing else.
+ *
+ * Unwinding here rather than at each `return false` is deliberate: there are
+ * far too many of them to keep right by hand, and the dry pass's own tail
+ * already pops back to its starting depth in exactly this way.
+ *
+ * A failure that has already emitted cannot be unwound at all -- the caller
+ * would stack a second call sequence on top of half of this one -- so that
+ * declines the compile instead. */
+static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                         unsigned argc, int callOff) {
+    unsigned depth0 = e->depth;
+    unsigned count0 = e->count;
+    if (inlineMethodWalk(e, closure, nameIdx, argc, callOff)) return true;
+    if (e->failed) return false;
+    if (e->count != count0) { e->failed = true; return false; }
+    while (e->depth > depth0) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) { e->failed = true; return false; }
+    }
+    /* Below where it started is not something an unwind can repair: the
+     * entries are the caller's and their registers are gone. */
+    if (e->depth != depth0) { e->failed = true; return false; }
+    return false;
 }
 
 static bool emitCallOut(Emit *e, unsigned argc) {
