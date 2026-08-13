@@ -325,19 +325,40 @@ typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
 
 #define JAI_IC_WAYS 4
 
-/* What an OP_INVOKE site was observed to RETURN, one byte per way, for
- * built-in methods (the SLOT_INST arm already guards user-class results by
- * tag). Only ever a PREDICTION -- the tag guard emitted alongside it is what
- * makes it sound, so a builtin returning something else deoptimises rather
- * than miscompiles. Written where the cache is FILLED, not where it hits (a
- * store on the hit path measured 2.4% of dict_ops), so a site whose result
- * kind later changes deoptimises every iteration rather than the tier
- * declining a loop it can't use. Encoding: 0 never observed, 1+ValueType for
- * a non-object, JAI_FB_OBJ+ObjType for an object, 255 mixed. Sits in
- * `shapeId`'s former alignment padding, so sizeof(InlineCache) is unchanged. */
+/* What an OP_INVOKE site was observed to RETURN, one byte per way. Only ever a
+ * PREDICTION -- the tag guard emitted alongside it is what makes it sound, so a
+ * method returning something else deoptimises rather than miscompiles.
+ * Encoding: 0 never observed, 1+ValueType for a non-object, JAI_FB_OBJ+ObjType
+ * for an object, 255 mixed. Sits in `shapeId`'s former alignment padding, so
+ * sizeof(InlineCache) is unchanged.
+ *
+ * Per WAY, so one site with three receiver classes keeps three answers: merging
+ * them would say MIXED for a site that is perfectly predictable once the
+ * receiver's class is known.
+ *
+ * The record is MERGED over a window rather than taken from one call. A first
+ * observation is what this used to be, and roadmap §6 records the consequence:
+ * a site whose result kind later changes then deoptimises every iteration, and
+ * a wrong prediction at a polymorphic site measured 5.7x slower than declining.
+ * A merge that disagrees goes to JAI_FB_MIXED, which no consumer can turn into
+ * a slot kind -- "unstable, predict nothing" is the answer, and it is a better
+ * one than a lucky guess. */
 #define JAI_FB_NONE   0u
 #define JAI_FB_OBJ    32u
 #define JAI_FB_MIXED  255u
+
+/* How many INVOKEs one site observes before it stops recording.
+ *
+ * The window has to close: recording forever is a store on the hit path, which
+ * measured 2.4% of dict_ops when it was unconditional. Once the budget is spent
+ * the steady state is one already-hot load and a not-taken branch, at the
+ * invoke and at the return.
+ *
+ * 64 is JAI_JIT_THRESHOLD -- the point at which the tier first looks at a
+ * function -- so a site inside a loop is settled well before anything reads it,
+ * and a site reached once per call is settled on the entry that compiles.
+ * chunk.h cannot include jit.h, so this is checked against it in jit.h. */
+#define JAI_IC_OBS_BUDGET 64u
 
 JAI_INLINE uint8_t jaiFeedbackKind(Value v) {
     return IS_OBJ(v) ? (uint8_t)(JAI_FB_OBJ + (unsigned)OBJ_TYPE(v))
@@ -353,10 +374,18 @@ typedef struct {
     uint8_t  state;
     uint8_t  count;
     uint8_t  resultKind[JAI_IC_WAYS];  /* see above; in former padding */
+    uint8_t  obsBudget;   /* invokes left to observe; 0 = frozen. Also padding. */
+    uint8_t  obsPad;      /* the last byte before shapeId's alignment */
     uint32_t shapeId[JAI_IC_WAYS];   /* ObjClass.shapeId or ObjModule.version */
     uint32_t payload[JAI_IC_WAYS];   /* field slot or global table index */
     Value    cached[JAI_IC_WAYS];    /* bound method for INVOKE sites */
 } InlineCache;
+
+/* The two observation bytes were meant to be free. If a field is ever added
+ * that pushes shapeId past offset 8, every chunk in the program pays for it and
+ * nothing else says so. */
+_Static_assert(offsetof(InlineCache, shapeId) == 8,
+               "InlineCache observation bytes must fit shapeId's padding");
 
 typedef struct {
     uint8_t   *code;

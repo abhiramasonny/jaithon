@@ -378,13 +378,14 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives
+test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 	@$(BUILD)/field_natives
+	@$(BUILD)/invoke_result_kind
 	@./scripts/run_tests.sh
 	@$(MAKE) --no-print-directory gc-stress-test
 
@@ -568,6 +569,18 @@ $(BUILD)/field_natives: $(VERIFY_OBJS) tests/vm/field_natives.c | $(CC_STAMP)
 .PHONY: field-natives-test
 field-natives-test: $(BUILD)/field_natives
 	@$(BUILD)/field_natives
+
+# What an OP_INVOKE site records about its own result. C rather than .jai
+# because InlineCache::resultKind reaches no program's output, and a test that
+# could only see it through the compiled tier would be testing the tier.
+$(BUILD)/invoke_result_kind: $(VERIFY_OBJS) tests/vm/invoke_result_kind.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/invoke_result_kind.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/invoke_result_kind.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+.PHONY: invoke-result-test
+invoke-result-test: $(BUILD)/invoke_result_kind
+	@$(BUILD)/invoke_result_kind
 
 .PHONY: jit-test
 jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64

@@ -425,6 +425,7 @@ uint16_t jaiChunkAddCache(Chunk *chunk) {
     InlineCache *ic = &chunk->caches[chunk->cacheCount];
     memset(ic, 0, sizeof *ic);
     ic->state = IC_EMPTY;
+    ic->obsBudget = JAI_IC_OBS_BUDGET;
     for (int i = 0; i < JAI_IC_WAYS; i++) ic->cached[i] = NULL_VAL;
     return (uint16_t)chunk->cacheCount++;
 }
@@ -443,6 +444,7 @@ bool jaiChunkReserveCaches(Chunk *chunk, int count) {
         InlineCache *ic = &chunk->caches[i];
         memset(ic, 0, sizeof *ic);
         ic->state = IC_EMPTY;
+        ic->obsBudget = JAI_IC_OBS_BUDGET;
         for (int w = 0; w < JAI_IC_WAYS; w++) ic->cached[w] = NULL_VAL;
     }
     chunk->cacheCapacity = count;
