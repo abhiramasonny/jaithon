@@ -85,6 +85,7 @@ uint32_t jaiA64Nop(void);
 uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64CselX(unsigned rd, unsigned rn, unsigned rm, unsigned cond);
 uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset);
+uint32_t jaiA64StrByte(unsigned rt, unsigned rn, unsigned offset);
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm);
 /* and Xd, Xn, #((1 << ones) - 1) -- `ones` is 1..63, a low run of set bits */

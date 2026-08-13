@@ -318,6 +318,13 @@ uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset) {
     return 0x39400000u | ((offset & 0xfffu) << 10) | (rn << 5) | rd;
 }
 
+/* STRB Wt, [Xn, #imm12] -- the store twin of jaiA64LdrByte, same unscaled
+ * 12-bit immediate. Used to stamp a container's declared element kind, which is
+ * a single byte in the object header region. */
+uint32_t jaiA64StrByte(unsigned rt, unsigned rn, unsigned offset) {
+    return 0x39000000u | ((offset & 0xfffu) << 10) | (rn << 5) | rt;
+}
+
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x8a000000u | (rm << 16) | (rn << 5) | rd;
 }
