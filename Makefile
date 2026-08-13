@@ -378,12 +378,13 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64
+test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
+	@$(BUILD)/field_natives
 	@./scripts/run_tests.sh
 	@$(MAKE) --no-print-directory gc-stress-test
 
@@ -550,6 +551,23 @@ $(BUILD)/jit_arena: tests/vm/jit_arena.c src/vm/jit/jit_arena.c | $(CC_STAMP)
 $(BUILD)/jit_arm64: tests/vm/jit_arm64.c src/vm/jit/jit_arm64.c src/vm/jit/jit_arena.c | $(CC_STAMP)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -o $@ tests/vm/jit_arm64.c src/vm/jit/jit_arm64.c src/vm/jit/jit_arena.c
+
+# The compiled tier replaces a call to one of these builtins with a single load
+# from the receiver (src/vm/jit/jit_field_read.h). Nothing in C connects that
+# byte offset to the native it stands in for, or the declared result kind to
+# what the native returns -- roadmap.md §6 records "a builtin named len returns
+# an int" as an invariant that was true everywhere and checked nowhere. This
+# calls every one of them for real and compares. C rather than .jai because a
+# .jai test cannot see a struct offset, and would silently test the interpreter
+# whenever the loop it warms declines.
+$(BUILD)/field_natives: $(VERIFY_OBJS) tests/vm/field_natives.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/field_natives.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/field_natives.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+.PHONY: field-natives-test
+field-natives-test: $(BUILD)/field_natives
+	@$(BUILD)/field_natives
 
 .PHONY: jit-test
 jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64

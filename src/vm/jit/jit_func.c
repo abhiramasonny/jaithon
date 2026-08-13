@@ -2,6 +2,8 @@
 #include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
+/* For jaiJitFieldReadFor: which builtins are one load from their receiver. */
+#include "vm/jit/jit_field_read.h"
 #include "vm/gc.h"
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 #include "runtime/runtime.h"
@@ -2376,6 +2378,69 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
 static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper) {
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
+}
+
+/* A builtin whose whole body is a load from its receiver (jit_field_read.h).
+ * The caller has already guarded that the receiver is `fr->type`, so the load
+ * is the entire call: no callee Value, no argument Value, no root fill, no
+ * status test, no result tag test. `k.len()` was 39 instructions and a `blr`
+ * into jitInvokeNative for a 32-bit field.
+ *
+ * A lazily-computed field (ObjString::scalars) keeps the descriptor call as a
+ * slow path *inline*, reached only when the memo is empty, so the native fills
+ * it and every later call takes the load. Deopting there instead would be
+ * wrong: a loop over freshly built strings would leave the compiled body on
+ * every iteration. Both paths land on the same register, and the span over the
+ * slow path is measured rather than counted -- emitDescriptor's length moves
+ * with the number of roots the body holds. */
+static bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
+                          unsigned ridx, unsigned argc, uint32_t afterIp) {
+    if (fr->tag != VAL_INT) {
+        e->whyNot = "a field-reading builtin whose result is not an int";
+        return false;
+    }
+    unsigned rRecv   = pushReg(e) - argc - 1;
+    unsigned skipSlow = 0;
+
+    if (fr->width == 4) {
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rRecv, fr->offset));
+    } else {
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, rRecv, fr->offset));
+    }
+
+    if (fr->lazy) {
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint64_t)fr->sentinel);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        skipSlow = e->count;
+        emit(e, jaiA64BCond(JAI_A64_NE, 0));      /* patched below */
+        if (!emitDescriptor(e, nativeVal, ridx, argc + 1,
+                            (void *)&jitInvokeNative)) {
+            return false;
+        }
+    }
+
+    for (unsigned i = 0; i <= argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) return false;
+    }
+    if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+
+    if (fr->lazy) {
+        unsigned rat = e->descOffset +
+                       (unsigned)offsetof(JitCallDesc, result);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_B, 31, rat));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, VAL_INT));
+        branchOnDeoptAt(e, JAI_A64_NE, afterIp, true);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, 31, rat + 8));
+        if (skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+            e->code[skipSlow] =
+                jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
+        }
+        /* The slow path calls out, and a native may write. */
+        e->wroteHeap = true;
+    }
+    emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_A));
+    return true;
 }
 
 /* Verdict 4: the callee deoptimised part-way and may have written, so the call can't be re-executed
@@ -5579,10 +5644,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                                  : obound;
                 if (!IS_NATIVE(onative)) return false;
 
+                /* A builtin that only reads a field of its receiver needs
+                 * neither the feedback nor the call: the type guard below is
+                 * already the whole precondition, and the table states what
+                 * comes back. See jit_field_read.h. */
+                const JaiJitFieldRead *ofr = jaiJitFieldReadFor(
+                    OBJ_TYPE(oseen), AS_STRING(oname)->chars,
+                    AS_STRING(oname)->length, argc);
+
                 bool odiscarded = (off + 7 < count && code[off + 7] == OP_POP);
                 SlotKind orkind = SLOT_INT;
                 unsigned owantTag = VAL_INT;
-                if (!odiscarded) {
+                if (ofr == NULL && !odiscarded) {
                     uint8_t fb = jaiInvokeResultFeedback(
                         &fn->chunk, jaiReadU16(code + off + 5), oseen);
                     if (!feedbackSlotKind(fb, &orkind, &owantTag)) {
@@ -5597,6 +5670,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A,
                                        (unsigned)OBJ_TYPE(oseen)));
                 branchOnDeopt(e, JAI_A64_NE);
+
+                if (ofr != NULL) {
+                    if (!emitFieldRead(e, ofr, onative, ridx, argc,
+                                       (uint32_t)(off + 7))) {
+                        return false;
+                    }
+                    off += 7;   /* a discarded result is the next OP_POP's */
+                    break;
+                }
 
                 if (!emitDescriptor(e, onative, ridx, argc + 1,
                                     (void *)&jitInvokeNative)) {
@@ -5650,23 +5732,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value nativeVal = IS_BOUND(bound) ? AS_BOUND(bound)->method : bound;
             if (!IS_NATIVE(nativeVal)) return false;
 
-            /* What comes back: `len` is an int; anything whose result is dropped on the next instruction needs no
-             * kind at all. Nothing else -- a call's result can't be guarded, since the call already happened and a wrong guess has nowhere to go. */
-            const char *mname = AS_STRING(nameVal)->chars;
+            /* What comes back: a field-reading builtin says so itself (`len`
+             * is the list's count); anything whose result is dropped on the
+             * next instruction needs no kind at all. Nothing else -- a call's
+             * result can't be guarded, since the call already happened and a
+             * wrong guess has nowhere to go. */
             bool discarded = (off + 7 < count && code[off + 7] == OP_POP);
-            bool isLen = strcmp(mname, "len") == 0 && argc == 0;
-            if (!isLen && !discarded) return false;
+            const JaiJitFieldRead *lfr = jaiJitFieldReadFor(
+                OBJ_LIST, AS_STRING(nameVal)->chars, AS_STRING(nameVal)->length,
+                argc);
+            if (lfr == NULL && !discarded) return false;
 
             /* `xs.len()` on a list is one field read. Through the descriptor it meant a GC root push/pop, a
-             * bound-method resolve, an arity check and a native call just to read a 32-bit count -- paid every iteration of the ordinary `while i < xs.len()` loop. The receiver's kind is already known here, which is the whole guard needed. */
-            if (isLen && e->stack[ridx] == SLOT_LIST) {
-                unsigned rList = pushReg(e) - 1;
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64LdrW(pushReg(e) - 1, rList,
-                                   (unsigned)offsetof(ObjList, count)));
-                off += 7;
+             * bound-method resolve, an arity check and a native call just to read a 32-bit count -- paid every iteration of the ordinary `while i < xs.len()` loop. SLOT_LIST is the type guard, already made. */
+            if (lfr != NULL) {
+                if (!emitFieldRead(e, lfr, nativeVal, ridx, argc,
+                                   (uint32_t)(off + 7))) {
+                    return false;
+                }
+                off += 7;   /* a discarded result is the next OP_POP's */
                 break;
             }
 
@@ -5679,15 +5763,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;
             }
-            if (isLen) {
-                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
-                emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                                   e->descOffset +
-                                       (unsigned)offsetof(JitCallDesc, result) + 8));
-            }
             e->wroteHeap = true;
-            off += 7;
-            if (!isLen) off += 1;      /* the OP_POP this consumed */
+            off += 8;      /* the OP_POP this consumed */
             break;
         }
 
