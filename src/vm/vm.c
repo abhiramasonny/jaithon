@@ -14,6 +14,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <signal.h>
+#include <stdlib.h>
 
 #include "vm/vm.h"
 #include "vm/jit/jit.h"
@@ -129,6 +130,79 @@ static uint32_t builtinShapeTag(Value v) {
     case OBJ_BYTES:  return IC_BUILTIN_TAG | 9u;
     case OBJ_ITER:   return IC_BUILTIN_TAG | 10u;
     default:         return 0;
+    }
+}
+
+/* One shared, direct-mapped cache for call sites that have gone megamorphic.
+ *
+ * A site whose inline cache runs out of ways is marked IC_MEGA and then stops
+ * caching ALTOGETHER: every call re-resolves the method. That is the shape a
+ * trait with eight implementations produces, and it is the one shape a
+ * per-site cache cannot help with, because the problem is not that the site
+ * forgot -- it is that four ways cannot hold eight answers. Widening the ways
+ * is not the fix either: it costs every cache in every chunk memory for a case
+ * almost none of them see, and a ninth class puts the site right back where it
+ * was. One table shared by every megamorphic site in the program makes the
+ * cost of the ninth class the same as the cost of the fifth.
+ *
+ * Only a hit in `klass->methods` is cached, and `methods.version` -- which
+ * JaiTable bumps on EVERY set, key or value -- is stored alongside and checked
+ * on use. findMethod consults `methods` first, so a name found there can only
+ * start meaning something else if that table changes, and then the version
+ * says so. Nothing has to remember to invalidate this, which is the property
+ * worth having: statics and trait defaults are simply not cached here and take
+ * the slow path they take today.
+ *
+ * Whether the CALLER may call what it found is not a property of the class, so
+ * `recheck` records only that a visibility test is owed and the test itself is
+ * re-run per call -- the same split InlineCache::payload makes.
+ *
+ * Held weakly: jaiMethodCacheRemoveWhite drops any entry whose class, name or
+ * method the marker did not reach, in the same phase jaiTableRemoveWhite runs
+ * for the intern table. So the cache neither keeps a dead class alive nor is
+ * ever left pointing at one. */
+#define JAI_MEGA_WAYS 512u        /* power of two */
+
+typedef struct {
+    ObjClass  *klass;
+    ObjString *name;
+    Value      method;
+    uint32_t   tableVersion;
+    bool       recheck;
+} MegaEntry;
+
+static MegaEntry sMegaCache[JAI_MEGA_WAYS];
+
+/* JAITHON_MEGA_STRESS=1 collapses the table to a single entry, so every
+ * megamorphic (class, name) pair collides with every other and the key is the
+ * only thing left deciding what a call reaches. Without it a wrong key is
+ * invisible: nine classes in five hundred slots simply never collide, so a
+ * cache keyed on the name alone passes every test in the tree. Same idea as
+ * JAITHON_JIT_DEOPT_STRESS -- make the rare path the only path. */
+static unsigned sMegaMask = JAI_MEGA_WAYS - 1u;
+
+void jaiMethodCacheInit(void) {
+    const char *v = getenv("JAITHON_MEGA_STRESS");
+    sMegaMask = (v != NULL && v[0] != '\0') ? 0u : JAI_MEGA_WAYS - 1u;
+}
+
+static inline unsigned megaSlot(const ObjClass *k, const ObjString *n) {
+    uint64_t h = ((uint64_t)(uintptr_t)k >> 4) ^ (n->hash * 0x9E3779B97F4A7C15ull);
+    h ^= h >> 29;
+    return (unsigned)(h & sMegaMask);
+}
+
+void jaiMethodCacheRemoveWhite(void) {
+    for (unsigned i = 0; i < JAI_MEGA_WAYS; i++) {
+        MegaEntry *e = &sMegaCache[i];
+        if (e->klass == NULL) continue;
+        if (!((Obj *)e->klass)->isMarked ||
+            !((Obj *)e->name)->isMarked ||
+            (IS_OBJ(e->method) && !AS_OBJ(e->method)->isMarked)) {
+            e->klass = NULL;
+            e->name = NULL;
+            e->method = NULL_VAL;
+        }
     }
 }
 
@@ -4759,6 +4833,42 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     LOAD_STATE();
                     VM_NEXT();
                 }
+            } else if (ic != NULL && klass != NULL && ic->state == IC_MEGA) {
+                /* Out of ways: the shared table above answers instead. */
+                ObjString *mname = AS_STRING(constants[nameIdx]);
+                MegaEntry *me = &sMegaCache[megaSlot(klass, mname)];
+                Value found;
+                if (me->klass == klass && me->name == mname &&
+                    me->tableVersion == klass->methods.version) {
+                    vm.icHits++;
+                    SAVE_STATE();
+                    if (me->recheck && !methodPermitted(klass, mname, true)) {
+                        goto vmThrow;
+                    }
+                    if (invokeMethodOnStack(me->method, argc) == CALL_ERROR) {
+                        goto vmThrow;
+                    }
+                    LOAD_STATE();
+                    VM_NEXT();
+                }
+                if (jaiTableGetInterned(&klass->methods, mname, &found)) {
+                    MethodInfo mi;
+                    vm.icMisses++;
+                    SAVE_STATE();
+                    me->klass = klass;
+                    me->name = mname;
+                    me->method = found;
+                    me->tableVersion = klass->methods.version;
+                    me->recheck = jaiClassRestrictedMethod(klass, mname, &mi);
+                    if (me->recheck && !methodPermitted(klass, mname, true)) {
+                        goto vmThrow;
+                    }
+                    if (invokeMethodOnStack(found, argc) == CALL_ERROR) {
+                        goto vmThrow;
+                    }
+                    LOAD_STATE();
+                    VM_NEXT();
+                }
             }
         } else if ((builtinTag = builtinShapeTag(receiver)) != 0) {
             /* Same idea for `xs.push(v)`. The cached value is the ObjNative
@@ -4836,10 +4946,14 @@ static JaiRunResult runLoop(int baseFrameCount) {
              * payload set, which tells the fast path above to re-run the
              * visibility test it cannot cache. */
             MethodInfo restricted;
-            uint32_t recheck =
-                jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
             if (ic != NULL && klass != NULL && AS_OBJ(slotZero) == AS_OBJ(receiver) &&
                 ic->state != IC_MEGA) {
+                /* Inside the guard, not above it: a site that has gone
+                 * megamorphic reaches here on every call and has nothing to
+                 * fill, so the walk was pure cost exactly where calls are
+                 * dearest. */
+                uint32_t recheck =
+                    jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
                 if (ic->count < JAI_IC_WAYS) {
                     ic->shapeId[ic->count] = klass->shapeId;
                     ic->payload[ic->count] = recheck;
@@ -6256,6 +6370,9 @@ void jaiVMInit(void) {
     JAI_VEC_INIT(&vm.handlers);
     JAI_VEC_INIT(&vm.defers);
     JAI_VEC_INIT(&vm.modulePath);
+
+    jaiMethodCacheInit();
+    memset(sMegaCache, 0, sizeof sMegaCache);
 
     vm.pendingException = NULL_VAL;
     vm.hasException = false;
