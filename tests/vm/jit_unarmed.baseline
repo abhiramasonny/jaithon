@@ -1,14 +1,37 @@
 # Opcodes with no arm in src/vm/jit/jit_func.c.
 #
-# The tier's opcode switch ends in `default: return false`, which declines the
-# WHOLE function -- so every function containing one of these runs interpreted.
-# That is a known state, not an approved one: `OP_ELEM_KIND` sitting here by
-# accident cost tests/bench/sort_merge 270ms -> 510ms.
+# WHAT THIS COSTS CHANGED on 2026-08-13. The tier's opcode switch used to end in
+# `default: return false`, which declines the WHOLE function -- so an opcode on
+# this list evicted every function that so much as MENTIONED it, from a block
+# that never ran. It now deoptimises at its own offset instead: the interpreter
+# resumes exactly there and the code around it still compiles. An opcode here is
+# "slow where I appear", not "I evict my function".
 #
-# This file is a RATCHET, enforced by scripts/jit_fusion_check.py. A NEW opcode
-# with no arm fails the build until someone either writes the arm or adds it
-# here deliberately, with the reason in the commit. Removing a line because an
-# opcode gained an arm is always welcome.
+# That was worth a benchmark on its own. `OP_GET_EXC` sat on this list, every
+# catch block holds one, and so NO function containing a `try` could ever be
+# compiled: tests/bench/error_paths' eight-million-iteration counted loop ran
+# interpreted end to end -- 124ms against 12ms compiled -- because of a handler
+# its own opcode histogram says executes zero times.
+#
+# So this file is no longer a coverage cliff. It is still a RATCHET, enforced by
+# scripts/jit_fusion_check.py, for three reasons that survive the change:
+#
+#   1. The deopt is not free. It is an unconditional exit from compiled code, so
+#      an opcode here on a HOT path costs the whole rest of that body -- and on
+#      a loop's straight-line path it costs one compiled entry and one deopt per
+#      iteration, which can be worse than never compiling the loop at all.
+#      `OP_ELEM_KIND` sitting here by accident cost tests/bench/sort_merge
+#      270ms -> 510ms; today it would cost less than that, and still cost.
+#   2. Some of them still decline outright. An unarmed opcode inside an INLINED
+#      body declines (half an inline cannot be taken back), and so does one at
+#      an offset where no deopt site can be built.
+#   3. A deopt hands the rest of the function to the interpreter. Arming the
+#      opcode is still the fix; this only stops the damage spreading to code
+#      that has nothing to do with it.
+#
+# A NEW opcode with no arm therefore still fails the build, until someone either
+# writes the arm or adds it here deliberately, with the reason in the commit.
+# Removing a line because an opcode gained an arm is always welcome.
 #
 # A FUSED opcode may never appear here -- the peephole puts those into exactly
 # the hot loops that most want compiling.
