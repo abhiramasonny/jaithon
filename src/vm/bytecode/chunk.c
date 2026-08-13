@@ -177,7 +177,10 @@
     /* `for … in X.items()`: X -> an iterator over its pairs (§3.4) */         \
     X(OP_GET_ITER_ITEMS,       2,  0)                                          \
     /* `for (a, b) in …` fused, with no pair object in between (§3.3) */       \
-    X(OP_FOR_ITER_PAIR,        6,  0)
+    X(OP_FOR_ITER_PAIR,        6,  0)                                          \
+    /* `for x in a..b` with neither an ObjRange nor an ObjIter built (§3.4) */ \
+    X(OP_ITER_RANGE,           5, -2)                                          \
+    X(OP_FOR_RANGE_BIND,       8,  0)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),
@@ -422,6 +425,7 @@ uint16_t jaiChunkAddCache(Chunk *chunk) {
     InlineCache *ic = &chunk->caches[chunk->cacheCount];
     memset(ic, 0, sizeof *ic);
     ic->state = IC_EMPTY;
+    ic->obsBudget = JAI_IC_OBS_BUDGET;
     for (int i = 0; i < JAI_IC_WAYS; i++) ic->cached[i] = NULL_VAL;
     return (uint16_t)chunk->cacheCount++;
 }
@@ -440,6 +444,7 @@ bool jaiChunkReserveCaches(Chunk *chunk, int count) {
         InlineCache *ic = &chunk->caches[i];
         memset(ic, 0, sizeof *ic);
         ic->state = IC_EMPTY;
+        ic->obsBudget = JAI_IC_OBS_BUDGET;
         for (int w = 0; w < JAI_IC_WAYS; w++) ic->cached[w] = NULL_VAL;
     }
     chunk->cacheCapacity = count;
@@ -1213,6 +1218,31 @@ int jaiDisassembleInstruction(FILE *out, const Chunk *chunk, int offset) {
         snprintf(operands, sizeof operands, "%+d %u %u", (int)j, slotA, slotB);
         snprintf(note, sizeof note, "-> slots %u, %u, exhausted -> %04d",
                  slotA, slotB, jumpTarget(offset, size, j));
+        break;
+    }
+
+    /* --- u8 inclusive flag + two u16 local slots --- */
+    case OP_ITER_RANGE: {
+        unsigned cur = jaiReadU16(a + 1);
+        unsigned end = jaiReadU16(a + 3);
+        snprintf(operands, sizeof operands, "%u %u %u", (unsigned)a[0], cur,
+                 end);
+        snprintf(note, sizeof note, "%s, counter slot %u, end slot %u",
+                 a[0] ? "inclusive" : "exclusive", cur, end);
+        break;
+    }
+
+    /* --- i16 jump + three u16 local slots --- */
+    case OP_FOR_RANGE_BIND: {
+        int16_t j = jaiReadI16(a);
+        unsigned slot = jaiReadU16(a + 2);
+        unsigned cur = jaiReadU16(a + 4);
+        unsigned end = jaiReadU16(a + 6);
+        snprintf(operands, sizeof operands, "%+d %u %u %u", (int)j, slot, cur,
+                 end);
+        snprintf(note, sizeof note,
+                 "-> slot %u from %u until %u, exhausted -> %04d", slot, cur,
+                 end, jumpTarget(offset, size, j));
         break;
     }
 

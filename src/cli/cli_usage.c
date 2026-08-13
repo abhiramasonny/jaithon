@@ -44,7 +44,7 @@ void jaiCliPrintUsage(FILE *out) {
         "  -O0 -O1 -O2 -O3            optimisation level (default -O2)\n"
         "      --release              strip asserts and debug information\n"
         "      --debug-trace          trace every instruction as it executes\n"
-        "      --gc-stress            collect on every allocation\n"
+        "      --gc-stress[=N]        collect on every allocation, or every Nth\n"
         "      --no-cache             ignore and do not write __jaicache__\n"
         "      --no-prelude           do not load std.prelude\n"
         "      --strict               unannotated parameters are an error\n"

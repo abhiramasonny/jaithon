@@ -209,6 +209,7 @@ int main(int argc, char **argv)
     vm.debugTrace = opts.traceExec;
     vm.countInstructions = opts.traceExec || opts.showStats;
     vm.gcStress = opts.gcStress;
+    vm.gcStressEvery = opts.gcStressEvery;
     vm.releaseMode = opts.run.codegen.stripAsserts;
     vm.optLevel = opts.run.codegen.optLevel;
 

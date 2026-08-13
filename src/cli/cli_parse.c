@@ -246,7 +246,23 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         return true;
     }
     if (strcmp(arg, "--debug-trace") == 0) { out->traceExec = true;  return true; }
-    if (strcmp(arg, "--gc-stress") == 0)   { out->gcStress = true;   return true; }
+    if (strcmp(arg, "--gc-stress") == 0)   { out->gcStress = true;
+                                             out->gcStressEvery = 1;
+                                             return true; }
+    /* --gc-stress=N collects every Nth allocation. N=1 is the old behaviour and
+     * is quadratic; a larger N is what makes stressing a whole test suite
+     * affordable while still collecting at far more points than the live-bytes
+     * threshold ever would. */
+    if (strncmp(arg, "--gc-stress=", 12) == 0) {
+        char *end = NULL;
+        long n = strtol(arg + 12, &end, 10);
+        if (end == arg + 12 || *end != '\0' || n < 1 || n > 1000000000L) {
+            return false;
+        }
+        out->gcStress = true;
+        out->gcStressEvery = (unsigned)n;
+        return true;
+    }
     if (strcmp(arg, "--no-prelude") == 0)  { out->noPrelude = true;  return true; }
     if (strcmp(arg, "--time") == 0)        { out->showTiming = true; return true; }
     if (strcmp(arg, "--stats") == 0)       { out->showStats = true;  return true; }

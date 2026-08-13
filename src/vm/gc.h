@@ -30,6 +30,14 @@ typedef struct GCState {
     bool      enabled;
     bool      stress;
     bool      verbose;
+    /* Stress cadence: collect every Nth allocation rather than every one.
+     * 0 or 1 means every allocation, which is what --gc-stress has always
+     * done. Higher N exists because N=1 is quadratic -- the unit suites run
+     * in 5.89s plain and tests/lang alone does not finish in 10 minutes under
+     * N=1, so no gate covered them at all. `stress` stays the on/off flag
+     * because it is one of jaiGCSyncLimit's four inputs. */
+    unsigned  stressEvery;
+    unsigned  stressTick;
 
     uint64_t  collections;
     uint64_t  totalFreed;
