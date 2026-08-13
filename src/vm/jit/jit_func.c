@@ -7971,6 +7971,86 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     return jitResultOut(fn, r, slotBase);
 }
 
+/* See vm.h. Everything jaiCallValue1 and jaiJitEnterFunc do for one argument,
+ * in one frame: the checks are unchanged and in the same order, but the
+ * callee-saved prologue, the argument's round trip through the caller's frame
+ * and the second `bl` are gone. Higher-order builtins drive this once per
+ * element, so all of that was per-element cost.
+ *
+ * Only jitArgCount 1 is taken, plus a trailing SLOT_CLOSURE for a callee that
+ * reads an upvalue -- that is not a slot, it is the closure itself, so a
+ * capturing lambda still gets the flat path. Anything else declines and
+ * jaiCallValue1 handles it exactly as before. */
+static JAI_NOINLINE bool callFn1Rerun(Value *base, Value *out) {
+    Value callee = base[0], arg = base[1];
+    vm.stackTop = base;
+    return jaiCallValue1(callee, arg, out);
+}
+
+bool jaiCallFn1(Value callee, Value arg, Value *out) {
+    if (JAI_UNLIKELY(!IS_CLOSURE(callee))) return jaiCallValue1(callee, arg, out);
+    ObjClosure *closure = AS_CLOSURE(callee);
+    ObjFunction *fn = closure->fn;
+    if (JAI_UNLIKELY(fn->jitFunc == NULL || fn->arity != 1))
+        return jaiCallValue1(callee, arg, out);
+
+    unsigned nargs = fn->jitArgCount;
+    if (JAI_UNLIKELY(nargs == 0 || nargs > 2))
+        return jaiCallValue1(callee, arg, out);
+    if (nargs == 2 && (SlotKind)fn->jitParamKind[1] != SLOT_CLOSURE)
+        return jaiCallValue1(callee, arg, out);
+
+    /* Same guard jaiJitEnterFunc makes: compiled code read this module's
+     * globals once, at compile time. */
+    if (JAI_UNLIKELY(fn->module == NULL ||
+                     fn->module->version != fn->jitFuncModuleVersion)) {
+        return jaiCallValue1(callee, arg, out);
+    }
+
+    if (JAI_UNLIKELY(vm.stack == NULL ||
+                     vm.stackTop + 3 > vm.stack + JAI_STACK_MAX)) {
+        return jaiCallValue1(callee, arg, out);
+    }
+
+    /* The two cells are what keeps the closure and the argument reachable
+     * while the compiled body runs, exactly as in jaiCallValue1: a compiled
+     * body may allocate and a collection scans the VM stack. */
+    Value *base = vm.stackTop;
+    base[0] = callee;
+    base[1] = arg;
+    vm.stackTop = base + 2;
+
+    int64_t a0 = 0;
+    if (JAI_UNLIKELY(!jitArgIn(closure, base, 0, &a0))) {
+        vm.stackTop = base;
+        return jaiCallValue1(callee, arg, out);
+    }
+
+    int frameBase = vm.frameCount;
+    JitResult r = nargs == 1
+                      ? ((Fn1)(uintptr_t)fn->jitFunc)(a0)
+                      : ((Fn2)(uintptr_t)fn->jitFunc)(a0,
+                                                      (int64_t)(uintptr_t)closure);
+    JaiJitOutcome outcome = jitResultOut(fn, r, base);
+    if (JAI_LIKELY(outcome == JAI_JIT_DONE)) {
+        *out = base[0];
+        vm.stackTop = base;
+        return true;
+    }
+    if (outcome == JAI_JIT_ERROR) {
+        vm.stackTop = base;
+        return false;
+    }
+    if (outcome == JAI_JIT_DEOPT) {
+        return jaiFinishJitDeopt1(closure, base, frameBase, out);
+    }
+    /* Refused mid-flight (a bail retires the form), so re-run it interpreted.
+     * Reading the callee and the argument back out of the two cells rather
+     * than off the parameters is what keeps them dead across the `blr`: with
+     * four live registers fewer, the callee-saved set this function has to
+     * spill on every element drops from six pairs to two. */
+    return callFn1Rerun(base, out);
+}
 
 #else
 
@@ -7979,6 +8059,9 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 }
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return JAI_JIT_DECLINED;
+}
+bool jaiCallFn1(Value callee, Value arg, Value *out) {
+    return jaiCallValue1(callee, arg, out);
 }
 
 #endif
