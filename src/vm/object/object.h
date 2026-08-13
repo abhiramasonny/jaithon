@@ -767,6 +767,73 @@ Obj  *jaiAllocateObjectRaw(size_t size, ObjType type);
 void  jaiFreeObject(Obj *obj);
 const char *jaiObjTypeName(ObjType t);
 
+/* The byte size of an object whose entire footprint is the one block it was
+ * allocated in, or 0 for a kind that also owns arrays, tables or a FILE and so
+ * has to go through jaiFreeObject's switch.
+ *
+ * It exists so the sweep can free the common kinds without a call.
+ * jaiFreeObject is 550 instructions and saves six register pairs on entry, and
+ * the sweep reaches it once per object the program ever allocated -- 8.0M times
+ * in tests/bench/alloc_churn, where 94% of what the sweep visits is a corpse.
+ * Twelve stack accesses of prologue and epilogue is most of what a dead
+ * ObjInstance costs.
+ *
+ * jaiFreeObject asks this first and frees exactly what it returns, so the two
+ * cannot drift: a size stated in two places that disagree puts a block in the
+ * wrong bin, and the next request served from that bin is short. The switch is
+ * exhaustive over ObjType for the same reason the one in jaiFreeObject is --
+ * so -Wswitch names a new kind here rather than letting it fall to 0 and quietly
+ * take the slow path forever. */
+JAI_INLINE size_t jaiObjSoleBlock(const Obj *obj) {
+    switch (obj->type) {
+    case OBJ_STRING: {
+        /* A slice carries no bytes of its own; the buffer it views is swept
+         * separately once nothing views it. */
+        const ObjString *s = (const ObjString *)obj;
+        return s->owner != NULL ? sizeof(ObjString) : JAI_STRING_ALLOC(s->length);
+    }
+    case OBJ_STRBUF:
+        return sizeof(ObjStrBuf) + ((const ObjStrBuf *)obj)->capacity + 1;
+    case OBJ_BYTES:
+        return sizeof(ObjBytes) + ((const ObjBytes *)obj)->length;
+    case OBJ_TUPLE:
+        return sizeof(ObjTuple) +
+               sizeof(Value) * (size_t)((const ObjTuple *)obj)->count;
+    case OBJ_INSTANCE:
+        return sizeof(ObjInstance) +
+               sizeof(Value) * (size_t)((const ObjInstance *)obj)->fieldCount;
+    case OBJ_ENUM_VAL:
+        return sizeof(ObjEnumVal) +
+               sizeof(Value) * (size_t)((const ObjEnumVal *)obj)->count;
+    case OBJ_RANGE:     return sizeof(ObjRange);
+    case OBJ_UPVALUE:   return sizeof(ObjUpvalue);
+    case OBJ_NATIVE:    return sizeof(ObjNative);
+    case OBJ_BOUND:     return sizeof(ObjBound);
+    case OBJ_ITER:      return sizeof(ObjIter);
+    case OBJ_ENUM_CTOR: return sizeof(ObjEnumCtor);
+
+    /* Own something besides their own block. */
+    case OBJ_LIST:      /* items array */
+    case OBJ_DICT:      /* table */
+    case OBJ_SET:       /* table */
+    case OBJ_FUNCTION:  /* chunk, param names, exception table, defaults */
+    case OBJ_CLOSURE:   /* upvalue array */
+    case OBJ_CLASS:     /* fields, traits, five tables */
+    case OBJ_TRAIT:     /* two tables, supers */
+    case OBJ_MODULE:    /* two tables */
+    case OBJ_ENUM:      /* variants and their field names, methods table */
+    case OBJ_FILE:      /* an open FILE * to close */
+    case OBJ_TYPE_COUNT:
+        return 0;
+    }
+    return 0;
+}
+
+#ifdef JAI_ALLOC_CENSUS
+/* Allocations by object kind. See the census note in object.c. */
+void jaiAllocPrintCensus(FILE *out);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Hashing                                                              */
 /* ------------------------------------------------------------------ */
