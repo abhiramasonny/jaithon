@@ -1028,7 +1028,8 @@ static unsigned closureReg(const Emit *e) {
 }
 
 /* Counts from the bottom of the operand stack, not the top (unlike pushReg). An inlined body gets its
- * own bank (x0..x8, minus the emitter's x9..x12 scratches): it can't call anything, so every caller-saved register is free and costs the caller nothing -- `evalA` inlined into spectral's inner loop needs eight live values where the OSR form had only six left, so without this it wouldn't fit. */
+ * own bank (x0..x8, minus the emitter's x9..x12 scratches) whenever the caller's stack is NOT already
+ * there: it can't call anything, so every caller-saved register is free and costs the caller nothing -- `evalA` inlined into spectral's inner loop needs eight live values where the OSR form had only six left, so without this it wouldn't fit. When the caller IS on that bank the two share one numbering instead; see inlineOwnBank. */
 #define JIT_INL_BANK   0u    /* x0..x8, all caller-saved */
 #define JIT_INL_COUNT  JIT_SCRATCH_BANK_COUNT
 
