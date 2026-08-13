@@ -5626,11 +5626,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned nargs = 1u + nops;
             if (e->depth < nargs) return false;
             unsigned cidx = e->depth - nargs;
-            if (e->stack[cidx] != SLOT_LIST) {
+            Value cseen = e->stackSeen[cidx];
+            /* A string slices as readily as a list -- same runtime call, same
+             * "the guard pins the type so the result kind follows" argument --
+             * and `s[a:b]` is what every hand-written scanner cuts tokens with.
+             * Held as SLOT_OBJ, since that is what a string is here. */
+            unsigned cType;
+            SlotKind sliceKind;
+            if (e->stack[cidx] == SLOT_LIST) {
+                cType = OBJ_LIST; sliceKind = SLOT_LIST;
+            } else if (e->stack[cidx] == SLOT_OBJ && IS_STRING(cseen)) {
+                cType = OBJ_STRING; sliceKind = SLOT_OBJ;
+            } else {
                 e->whyNot = "slicing a container this tier does not model";
                 return false;
             }
-            Value cseen = e->stackSeen[cidx];
 
             /* Guard the container, not the result: with its object type pinned
              * the arm jaiSliceGet takes is settled, so the result's kind
@@ -5638,7 +5648,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * resumes here with everything still on the interpreter's stack. */
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - nargs,
                                (unsigned)offsetof(Obj, type)));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, cType));
             branchOnDeopt(e, JAI_A64_NE);
 
             emit(e, jaiA64MovzX(JIT_SCRATCH_A, flags, 0));
@@ -5654,9 +5664,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValue(e, &r, NULL)) return false;
             }
             /* The container's own sample types the slice: a slice of a list of
-             * ints is a list of ints, and every element read re-checks its own
-             * tag, so this is a hint and not an assumption. */
-            if (!pushValue3(e, SLOT_LIST, 0, NULL, cseen, -1)) return false;
+             * ints is a list of ints, a slice of a string is a string, and
+             * every element read re-checks its own tag, so this is a hint and
+             * not an assumption. */
+            if (!pushValue3(e, sliceKind, 0, NULL, cseen, -1)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
