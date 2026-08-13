@@ -21,6 +21,11 @@
 #: the plain run proves the compiled code agrees. Under
 #: `JAITHON_JIT_DEOPT_STRESS=1` every guard fires on every iteration, which is
 #: the pass that catches a resume point that consumed the receiver.
+#:
+#: `jaithon test` alone does not make any of this hot: scripts/jit_compile_check.py
+#: runs this file under JAI_JIT_WHY=1 and fails if one of the names below stops
+#: reaching `[jit] compiled` -- see that script for what the marker means.
+# jit-compiles: count_str, count_list, count_dict, count_set, count_tuple, count_bytes, count_any, touch
 from std.test import assert_eq, assert_throws
 
 fn count_str(x: any) -> int {
