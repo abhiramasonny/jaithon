@@ -52,12 +52,6 @@
 /* Scalars and byte offsets                                             */
 /* ------------------------------------------------------------------ */
 
-/* True when scalar index and byte offset coincide, which lets every offset
- * conversion below become a no-op for ASCII text. */
-static inline bool isAscii(ObjString *s) {
-    return (size_t)jaiStringScalarCount(s) == (size_t)s->length;
-}
-
 /* Byte offset of scalar `index`; clamped to the byte length when past the end. */
 size_t jaiStrByteOffsetOf(ObjString *s, size_t index) {
     const size_t length = (size_t)s->length;
