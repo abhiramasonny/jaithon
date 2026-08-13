@@ -170,6 +170,7 @@ pub enum Op {
     MulBind,
     ElemKind,
     GetIterItems,
+    ForIterPair,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -327,6 +328,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.MulBind, "OP_MUL_BIND", 2, -2),
     OpSpec(Op.ElemKind, "OP_ELEM_KIND", 1, 0),
     OpSpec(Op.GetIterItems, "OP_GET_ITER_ITEMS", 2, 0),
+    OpSpec(Op.ForIterPair, "OP_FOR_ITER_PAIR", 6, 0),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
