@@ -7431,9 +7431,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 kind = SLOT_LIST;
                 tag = VAL_OBJ;
             }
-            else if (IS_STRING(elem)) {
-                /* A list of strings, held opaquely: the interned compare and `s[i]` each check OBJ_STRING for
-                 * themselves, same contract as any SLOT_OBJ local (sample specialises, guard confirms). `str_search` builds text out of `chunks[seed %% 8]` and declined that whole loop forty times over before this. */
+            else if (rawObjValue(elem)) {
+                /* A list of strings, dicts, sets, or tuples, held raw: the same contract as a SLOT_OBJ
+                 * global or field (sample specialises, the tag guard below confirms, every consumer
+                 * re-checks Obj.type for itself). `str_search` builds text out of `chunks[seed %% 8]` and
+                 * declined that whole loop forty times over before the string case alone was admitted;
+                 * widened from IS_STRING to rawObjValue so every other raw-holdable element kind gets the
+                 * same treatment rather than only strings. */
                 kind = SLOT_OBJ;
                 tag = VAL_OBJ;
             }
