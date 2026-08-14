@@ -40,6 +40,7 @@ int jaiOpBranchOperandAt(uint8_t op) {
     case OP_MATCH_SEQ:
         return 2;
     case OP_MATCH_CONST:
+    case OP_MATCH_CONST_POP:
     case OP_MATCH_TYPE:
     case OP_MATCH_FIELDS:
         return 3;

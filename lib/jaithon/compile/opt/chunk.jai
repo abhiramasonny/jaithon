@@ -823,14 +823,23 @@ fn _build_branch_at() -> dict[int, int] {
     # After the u8 comparison, the u16 slot and the u24 constant index.
     table[opcode(Op.JumpIfCmpLocalK)] = 6
     table[opcode(Op.MatchSeq)] = 2
-    for op in [Op.MatchConst, Op.MatchType, Op.MatchFields] { table[opcode(op)] = 3 }
+    for op in [Op.MatchConst, Op.MatchConstPop, Op.MatchType, Op.MatchFields] { table[opcode(op)] = 3 }
     table[opcode(Op.MatchRange)] = 7
     return table
 }
 
 fn _build_terminators() -> dict[int, bool] {
     var table: dict[int, bool] = {}
-    let ops = [Op.Jump, Op.Loop, Op.Return, Op.ReturnNull, Op.Throw, Op.Reraise, Op.Halt]
+    let ops = [
+        Op.Jump,
+        Op.Loop,
+        Op.Return,
+        Op.ReturnNull,
+        Op.PopReturnNull,
+        Op.Throw,
+        Op.Reraise,
+        Op.Halt,
+    ]
     for op in ops { table[opcode(op)] = true }
     return table
 }

@@ -173,6 +173,7 @@ pub enum Op {
     ForRangeBind,
     SubIntConst,
     PopReturnNull,
+    MatchConstPop,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -333,6 +334,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.ForRangeBind, "OP_FOR_RANGE_BIND", 8, 0),
     OpSpec(Op.SubIntConst, "OP_SUB_INT_CONST", 4, 1),
     OpSpec(Op.PopReturnNull, "OP_POP_RETURN_NULL", 0, -1),
+    OpSpec(Op.MatchConstPop, "OP_MATCH_CONST_POP", 5, -1),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
@@ -2567,11 +2569,13 @@ pub class Emitter {
             self._get_local(slot, span)
             self._store_symbol(symbol, pattern.opt_text("name") ?? "_", span, symbol == null)
         } elif kind == NodeKind.PatLiteral {
+            # The success path always pops the subject copy right here -- see
+            # spec/BYTECODE.md's `MATCH_CONST_POP` entry -- so it is emitted
+            # fused rather than as MatchConst followed by a separate Pop.
             self._get_local(slot, span)
-            self._chunk().write_op(Op.MatchConst, span)
+            self._chunk().write_op(Op.MatchConstPop, span)
             self._chunk().write_u24(self._literal_constant(pattern.child("value")))
             misses.push(self._reserve_jump())
-            self._op(Op.Pop, span)
         } elif kind == NodeKind.PatRange {
             self._get_local(slot, span)
             self._chunk().write_op(Op.MatchRange, span)
@@ -2718,10 +2722,9 @@ pub class Emitter {
             self._op(Op.EnumTag, span)
             self._op(Op.Swap, span)
             self._op(Op.Pop, span)
-            self._chunk().write_op(Op.MatchConst, span)
+            self._chunk().write_op(Op.MatchConstPop, span)
             self._chunk().write_u24(self._chunk().add_constant(Const(ConstTag.Int, tag)))
             misses.push(self._reserve_jump())
-            self._op(Op.Pop, span)
         }
 
         for (index, element) in pattern.child_list("subPatterns").enumerate() {

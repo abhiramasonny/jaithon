@@ -184,7 +184,9 @@
     /* `GET_LOCAL; <int k>; SUB` fused (§3.3) */                               \
     X(OP_SUB_INT_CONST,        4, +1)                                         \
     /* `POP; RETURN_NULL` fused (§3.3) */                                     \
-    X(OP_POP_RETURN_NULL,      0, -1)
+    X(OP_POP_RETURN_NULL,      0, -1)                                          \
+    /* `MATCH_CONST; POP` fused (§3.3) */                                     \
+    X(OP_MATCH_CONST_POP,      5, -1)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),
