@@ -178,6 +178,7 @@ pub enum Op {
     MatchTypePop,
     MatchRangePop,
     MatchSeqPop,
+    MulIntConst,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -343,6 +344,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.MatchTypePop, "OP_MATCH_TYPE_POP", 5, -1),
     OpSpec(Op.MatchRangePop, "OP_MATCH_RANGE_POP", 9, -1),
     OpSpec(Op.MatchSeqPop, "OP_MATCH_SEQ_POP", 4, -1),
+    OpSpec(Op.MulIntConst, "OP_MUL_INT_CONST", 4, 1),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,

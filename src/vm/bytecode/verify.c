@@ -96,6 +96,7 @@ static int slotOperands(uint8_t op, int *out) {
     case OP_ADD_BIND:
     case OP_SUB_BIND:
     case OP_MUL_BIND:
+    case OP_MUL_INT_CONST:
         out[0] = 0;
         return 1;
     case OP_FOR_ITER_BIND:
