@@ -212,6 +212,36 @@ fn _rewrite_stack_ops(code: Code, index: int) -> bool {
 
     if head.op == opcode(Op.Dup) {
         let window = window_of(code, index, 2)
+        if window.len() == 2 and window_clean(code, window) {
+            let tail = code.data[window[1]]
+            if tail.op == opcode(Op.Pop) {
+                kill(code, window[0])
+                kill(code, window[1])
+                return true
+            }
+            if tail.op == opcode(Op.Bind) {
+                set_instr(head, opcode(Op.SetLocal), tail.operands)
+                kill(code, window[1])
+                return true
+            }
+        }
+        return false
+    }
+
+    if head.op == opcode(Op.SetLocal) {
+        let window = window_of(code, index, 2)
+        if window.len() == 2 and
+            window_clean(code, window) and
+            code.data[window[1]].op == opcode(Op.Pop) {
+            set_instr(head, opcode(Op.Bind), head.operands)
+            kill(code, window[1])
+            return true
+        }
+        return false
+    }
+
+    if _is_discardable_push(head.op) {
+        let window = window_of(code, index, 2)
         if window.len() == 2 and
             window_clean(code, window) and
             code.data[window[1]].op == opcode(Op.Pop) {
@@ -298,3 +328,12 @@ fn _is_conditional_jump(op: int) -> bool { return op in _INVERTED }
 fn _inverted_jump(op: int) -> int { return _INVERTED.get(op, op) }
 
 fn _pushes_bool(op: int) -> bool { return _PUSHES_BOOL.get(op, false) }
+
+fn _is_discardable_push(op: int) -> bool {
+    return op == opcode(Op.Const) or
+        op == opcode(Op.Null) or
+        op == opcode(Op.True) or
+        op == opcode(Op.False) or
+        op == opcode(Op.Int) or
+        op == opcode(Op.GetLocal)
+}

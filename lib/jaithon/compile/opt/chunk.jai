@@ -451,7 +451,15 @@ pub fn window_of(code: Code, index: int, want: int) -> list[int] {
 pub fn window_clean(code: Code, window: list[int], want: int = NO_INDEX) -> bool {
     let last = if want < 0 or want > window.len() { window.len() } else { want }
     for position in 1..last {
-        if code.data[window[position]].is_target { return false }
+        # A target on an instruction deleted by an earlier rewrite lands on
+        # the next live instruction. Check the dead gap as well as that live
+        # instruction, or a later fusion can accidentally consume a loop
+        # header whose target marker stayed on the deleted instruction.
+        var at = window[position]
+        while at > window[position - 1] {
+            if code.data[at].is_target { return false }
+            at -= 1
+        }
     }
     return true
 }
@@ -659,6 +667,30 @@ pub fn compact(code: Code) -> void {
     for (row, entry) in code.defaults.enumerate() {
         if entry >= 0 and entry <= total { code.defaults[row] = mapping[entry] }
     }
+
+    # `is_target` is derived state. A branch aimed at a deleted instruction is
+    # remapped above to the next survivor, so carrying the old flags forward
+    # leaves that survivor looking like ordinary fall-through code. The next
+    # fixpoint round may then fuse across a live loop header. Rebuild every
+    # marker from the remapped edges before another pass sees the compacted
+    # list.
+    for instruction in code.data { instruction.is_target = false }
+    for instruction in code.data {
+        if instruction.target >= 0 and instruction.target < code.count() {
+            code.data[instruction.target].is_target = true
+        }
+    }
+    for row in 0..code.exception_count() {
+        let start = code.exception_start[row]
+        let end = code.exception_end[row]
+        let handler = code.exception_handler[row]
+        if start >= 0 and start < code.count() { code.data[start].is_target = true }
+        if end >= 0 and end < code.count() { code.data[end].is_target = true }
+        if handler >= 0 and handler < code.count() { code.data[handler].is_target = true }
+    }
+    for entry in code.defaults {
+        if entry >= 0 and entry < code.count() { code.data[entry].is_target = true }
+    }
 }
 
 pub fn rebuild(code: Code) -> bool {
@@ -811,6 +843,7 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.Bind,
         Op.CloseUpvalue,
         Op.AddIntConst,
+        Op.SubIntConst,
         Op.IncLocal,
         Op.CmpLocalConstLt,
         Op.GetFieldLocal,

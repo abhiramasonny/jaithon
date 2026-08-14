@@ -3683,6 +3683,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_NOT]                = &&L_OP_NOT,
         [OP_CONCAT]             = &&L_OP_CONCAT,
         [OP_ADD_INT_CONST]      = &&L_OP_ADD_INT_CONST,
+        [OP_SUB_INT_CONST]      = &&L_OP_SUB_INT_CONST,
         [OP_MOD_INT_CONST]      = &&L_OP_MOD_INT_CONST,
         [OP_ADD_BIND]           = &&L_OP_ADD_BIND,
         [OP_SUB_BIND]           = &&L_OP_SUB_BIND,
@@ -4332,6 +4333,28 @@ static JaiRunResult runLoop(int baseFrameCount) {
         SAVE_STATE();
         Value result;
         if (!arithmetic(OP_ADD, local, INT_VAL(imm), &result)) goto vmThrow;
+        LOAD_STATE();
+        PUSH(result);
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_SUB_INT_CONST): {
+        uint16_t slot = READ_U16();
+        int16_t imm = READ_I16();
+        Value local = slots[slot];
+        if (JAI_LIKELY(IS_INT(local))) {
+            int64_t r;
+            if (JAI_UNLIKELY(__builtin_sub_overflow(AS_INT(local),
+                                                    (int64_t)imm, &r))) {
+                THROW(vm.cOverflowError,
+                      "integer overflow in '-'; use '-%%' to wrap");
+            }
+            PUSH(INT_VAL(r));
+            VM_NEXT();
+        }
+        SAVE_STATE();
+        Value result;
+        if (!arithmetic(OP_SUB, local, INT_VAL(imm), &result)) goto vmThrow;
         LOAD_STATE();
         PUSH(result);
         VM_NEXT();
