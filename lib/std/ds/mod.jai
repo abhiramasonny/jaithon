@@ -1,6 +1,8 @@
 #: Data structures: stacks and queues, search trees, graphs, matrices and
 #: string indexes.
 #:
+#: Facade: imports and re-exports every sibling module in this directory.
+#:
 #: ```
 #: from std.ds import Stack, Graph
 #: let stack = Stack[int]()

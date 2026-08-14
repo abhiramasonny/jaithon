@@ -1,5 +1,7 @@
 #: Windows, frame timing, and the raw event stream.
 #:
+#: Non-facade: holds the Window/Event API directly, no sibling re-exports.
+#:
 #: A `Window` is a pixel buffer with a title bar. It owns no drawing code at
 #: all: `pixels` hands out the back buffer as a live list of packed colours and
 #: `std.gui.canvas` does every line, circle and glyph in Jaithon. The native

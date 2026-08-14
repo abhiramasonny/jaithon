@@ -63,6 +63,12 @@ caches excluded. `fixpoint-check` asks that compiler to compile each selected
 source twice and compares the resulting images byte for byte. Run `make reseed`
 after changing a module that the compiler needs during startup.
 
+If a change to the compiler's own sources leaves it unable to compile itself
+-- a bootstrap deadlock where the working `./jaithon` is too broken to run
+`make reseed` on its own output -- run `scripts/stage0_reseed.sh` instead: it
+reseeds from a snapshot of `lib/jaithon/compile` at `HEAD` rather than the
+working compiler.
+
 ## Formatting
 
 ```bash

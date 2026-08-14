@@ -1,3 +1,5 @@
+#: Non-facade: imports nothing on purpose (see below for why).
+
 #: The semantic type system: the Jaithon half of `src/sema`. It is the stage
 #: between `resolve` and `emit`, and the reason the self-hosted front end
 #: cannot yet match the C's bytecode: no `OP_TYPE_GUARD`, no `OP_TO_FLOAT`, no

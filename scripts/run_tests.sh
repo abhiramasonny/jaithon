@@ -162,6 +162,7 @@ unit_args=(test --verbose)
 unit_args+=(
     "$ROOT/tests/lang"
     "$ROOT/tests/stdlib"
+    "$ROOT/tests/checker"
     "$ROOT/packages/jaiplot/tests"
     "$ROOT/packages/jaitensor/tests"
 )
