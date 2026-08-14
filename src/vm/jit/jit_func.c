@@ -946,21 +946,43 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
             emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(Obj, type)));
             emit(e, jaiA64SubsXImm(31, scratch, OBJ_LIST));
             branchOnDeopt(e, JAI_A64_NE);
-        } else if (e->localKind[slot] == SLOT_INST) {
+        } else if (e->localKind[slot] == SLOT_INST ||
+                   e->localKind[slot] == SLOT_MAYBE_INST) {
             /* Same hazard, for a slot that took two different classes: a tag
              * of VAL_OBJ says "an instance", not "an instance of THIS class",
              * so the object type and its class shape are both confirmed here
              * before a consumer reads a field at an offset only this class
-             * has. JIT_SCRATCH_D is free at every call site that can carry a
-             * SLOT_INST-kinded dynamic local through this helper (audited:
-             * OP_GET_LOCAL, OP_GET_LOCAL2, the init-returns-self arms of
-             * OP_RETURN_NULL/OP_POP_RETURN_NULL, emitRootFill's root loop).
+             * has. JIT_SCRATCH_D is free at every call site that can carry an
+             * instance-kinded dynamic local through this helper (audited:
+             * OP_GET_LOCAL, OP_GET_LOCAL2, OP_GET_FIELD_LOCAL's two reads of
+             * its receiver, the init-returns-self arms of
+             * OP_RETURN_NULL/OP_POP_RETURN_NULL, emitRootFill's root loop --
+             * every other site names a scalar kind and cannot reach here).
              * `scratch` keeps the instance pointer as the base throughout --
              * loading FROM it doesn't clobber it -- until it is chained into
              * the class pointer and then the shapeId, since nothing after
              * this needs the original pointer back (the unconditional reload
-             * below restores it for the return regardless). */
+             * below restores it for the return regardless).
+             *
+             * SLOT_MAYBE_INST shares the arm rather than going unchecked: it
+             * is a kind a dynamic slot really does take, both from the
+             * nullable-parameter seed and from any OP_BIND of a nullable
+             * instance field, and its tag is the same VAL_OBJ, so without
+             * this a `Bird` left in the slot by a sibling write was read at
+             * `Dog`'s field offsets. What it does NOT share is the pointer
+             * being known non-null. A null cannot be chased and cannot be
+             * jumped over either -- every branch this file emits leaves the
+             * block for a stub -- so it deopts, and the interpreter finishes
+             * the instruction. That costs one deopt on a value the tier could
+             * in principle have carried, which is the price of not letting a
+             * guard load off address zero. (The prologue's own tag write is
+             * payload-dependent for the same reason, so a null argument is
+             * usually already stopped by the tag check above.) */
             emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
+            if (e->localKind[slot] == SLOT_MAYBE_INST) {
+                emit(e, jaiA64SubsXImm(31, scratch, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
             emit(e, jaiA64LdrW(JIT_SCRATCH_D, scratch, (unsigned)offsetof(Obj, type)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
             branchOnDeopt(e, JAI_A64_NE);
@@ -8903,8 +8925,22 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * point, so reading them here would take whatever the struct was
              * zeroed to. */
             if (localTagInFrame(&e, slot)) {
-                emit(&e, jaiA64MovzX(JIT_SCRATCH_D,
-                                     localTagFor(&body, slot), 0));
+                unsigned tag = localTagFor(&body, slot);
+                /* Payload-dependent for every object-ish kind, exactly as
+                 * localOut writes one: a null argument arrives as a zero
+                 * payload (jitArgIn's SLOT_MAYBE_INST arm), and a constant
+                 * VAL_OBJ over it would leave the frame claiming an object at
+                 * address zero -- which localIn's guard would then trust as
+                 * far as `Obj.type`, and which a deopt copies out verbatim as
+                 * OBJ_VAL(NULL) for the interpreter to trip over. The other
+                 * VAL_OBJ kinds cannot be null (jitArgIn refuses), so for
+                 * them the csel below only ever picks the same VAL_OBJ. */
+                if (tag == VAL_OBJ) {
+                    emitTagFor(&e, SLOT_MAYBE_INST, i, JIT_SCRATCH_D,
+                               JIT_SCRATCH_C);
+                } else {
+                    emit(&e, jaiA64MovzX(JIT_SCRATCH_D, tag, 0));
+                }
                 emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(&e, slot)));
             }
             emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, slot) + 8));
