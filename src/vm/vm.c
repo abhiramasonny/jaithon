@@ -3754,6 +3754,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_GET_EXC]            = &&L_OP_GET_EXC,
         [OP_MATCH_CONST]        = &&L_OP_MATCH_CONST,
         [OP_MATCH_CONST_POP]    = &&L_OP_MATCH_CONST_POP,
+        [OP_SWAP_POP]           = &&L_OP_SWAP_POP,
         [OP_MATCH_RANGE]        = &&L_OP_MATCH_RANGE,
         [OP_MATCH_TYPE]         = &&L_OP_MATCH_TYPE,
         [OP_MATCH_SEQ]          = &&L_OP_MATCH_SEQ,
@@ -3846,6 +3847,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
         Value top = stackTop[-1];
         stackTop[-1] = stackTop[-2];
         stackTop[-2] = top;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_SWAP_POP): {
+        stackTop[-2] = stackTop[-1];
+        stackTop--;
         VM_NEXT();
     }
 
