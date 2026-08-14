@@ -3758,6 +3758,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_MATCH_TYPE_POP]     = &&L_OP_MATCH_TYPE_POP,
         [OP_MATCH_RANGE_POP]    = &&L_OP_MATCH_RANGE_POP,
         [OP_MATCH_SEQ_POP]      = &&L_OP_MATCH_SEQ_POP,
+        [OP_MUL_INT_CONST]      = &&L_OP_MUL_INT_CONST,
         [OP_MATCH_RANGE]        = &&L_OP_MATCH_RANGE,
         [OP_MATCH_TYPE]         = &&L_OP_MATCH_TYPE,
         [OP_MATCH_SEQ]          = &&L_OP_MATCH_SEQ,
@@ -4367,6 +4368,26 @@ static JaiRunResult runLoop(int baseFrameCount) {
         SAVE_STATE();
         Value result;
         if (!arithmetic(OP_SUB, local, INT_VAL(imm), &result)) goto vmThrow;
+        LOAD_STATE();
+        PUSH(result);
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MUL_INT_CONST): {
+        uint16_t slot = READ_U16();
+        int16_t imm = READ_I16();
+        Value local = slots[slot];
+        if (JAI_LIKELY(IS_INT(local))) {
+            int64_t r;
+            if (JAI_UNLIKELY(__builtin_mul_overflow(AS_INT(local), (int64_t)imm, &r))) {
+                THROW(vm.cOverflowError, "integer overflow in '*'; use '*%%' to wrap");
+            }
+            PUSH(INT_VAL(r));
+            VM_NEXT();
+        }
+        SAVE_STATE();
+        Value result;
+        if (!arithmetic(OP_MUL, local, INT_VAL(imm), &result)) goto vmThrow;
         LOAD_STATE();
         PUSH(result);
         VM_NEXT();

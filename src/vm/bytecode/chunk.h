@@ -298,6 +298,14 @@ typedef enum {
     OP_MATCH_RANGE_POP,      /* u24 K, u24 K, u8 inclusive, i16 J */
     OP_MATCH_SEQ_POP,        /* u8 count, u8 restFlag, i16 J */
 
+    /* `GET_LOCAL S; <int k>; MUL` fused (§3.3): the same shape as
+     * ADD_INT_CONST/SUB_INT_CONST, extended to multiplication. Overflow still
+     * raises exactly as unfused `*` does -- the fusion only skips the two
+     * extra dispatches, never the check. (DIV has no sibling here: int/int
+     * division answers a float, spec §3.3, so it does not fit this
+     * same-type-in-same-type-out template the way ADD/SUB/MUL do.) */
+    OP_MUL_INT_CONST,        /* u16 S, i16 */
+
     OP_COUNT
 } OpCode;
 

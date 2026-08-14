@@ -216,6 +216,30 @@ fn test_a_pooled_subtrahend_folds_the_same_way() -> void {
     )
 }
 
+fn test_a_local_times_an_immediate_folds_into_the_operand() -> void {
+    let proto = _proto(
+        _op16(Op.GetLocal, 1) + _op16(Op.Int, 7) + _one(Op.Mul) + _one(Op.ReturnNull)
+    )
+    assert_eq(superinstructions(proto), 1)
+    assert_eq(proto.chunk.code, [opcode(Op.MulIntConst)] + _u16(1) + _u16(7) + _one(Op.ReturnNull))
+}
+
+fn test_a_pooled_multiplicand_folds_the_same_way() -> void {
+    let proto = _proto_with_ints(
+        _op16(Op.GetLocal, 2) +
+            [opcode(Op.Const)] +
+            _u24(0) +
+            _one(Op.Mul) +
+            _one(Op.ReturnNull),
+        [-30000]
+    )
+    assert_eq(superinstructions(proto), 1)
+    assert_eq(
+        proto.chunk.code,
+        [opcode(Op.MulIntConst)] + _u16(2) + _u16(-30000) + _one(Op.ReturnNull)
+    )
+}
+
 fn test_a_field_read_off_a_local_keeps_its_name_and_cache() -> void {
     let proto = _proto(
         _op16(Op.GetLocal, 1) +

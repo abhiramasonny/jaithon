@@ -215,6 +215,11 @@ fn _fuse_at(code: Code, index: int) -> bool {
                 kill_all(code, [w[1], w[2]])
                 return true
             }
+            if third == opcode(Op.Mul) {
+                _make_slot_imm16(head, opcode(Op.MulIntConst), slot_of(head, 0), value)
+                kill_all(code, [w[1], w[2]])
+                return true
+            }
             if third == opcode(Op.Lt) {
                 _make_slot_imm16(head, opcode(Op.CmpLocalConstLt), slot_of(head, 0), value)
                 kill_all(code, [w[1], w[2]])

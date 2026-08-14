@@ -184,8 +184,7 @@ pub fn write_u24_at(bytes: list[int], at: int, value: int) -> void {
 #: Byte index of the `i16` branch operand inside `op`'s operand run, or
 #: `NO_INDEX` when the instruction carries no code address.
 #:
-#: `branchOperandAt` in `src/codegen/optimize.c`; keep the two in step with
-#: `src/vm/bytecode/chunk.h`.
+#: `jaiOpBranchOperandAt` in `src/vm/bytecode/verify.c`; keep the two in step.
 pub fn branch_operand_at(op: int) -> int {
     return _BRANCH_AT.get(op, NO_INDEX)
 }
@@ -247,9 +246,16 @@ pub fn closure_descriptor_slot(instruction: Instr, which: int) -> int {
 #: Byte offsets of the `u16` local-slot operands of `op`, in operand-run
 #: coordinates. Empty when `op` names no slot.
 #:
-#: `slotOperands` in `src/codegen/optimize.c`. `OP_CLOSURE` is not here: its
-#: slots live in a variable-length descriptor run, reached through
-#: `closure_descriptor_slot`.
+#: Every opcode with a slot operand belongs in `_build_slot_operands` below
+#: (`coalesce.jai`'s slot renumbering, live-range scan, and the fresh-slot
+#: picker in `hoist.jai` all read this table) AND in `slotOperands` in
+#: `src/vm/bytecode/verify.c` (the bounds check). Missing either one is
+#: silent: the C side under-checks a malformed `.jaic`; the Jai side leaves
+#: the opcode's own operand unrenumbered while every other reference to the
+#: same variable moves, so a fused opcode with an unregistered slot operand
+#: can end up reading a different, wrong (and possibly unwritten) local
+#: after coalescing. `OP_CLOSURE` is not here: its slots live in a
+#: variable-length descriptor run, reached through `closure_descriptor_slot`.
 pub fn slot_operands(op: int) -> list[int] {
     return _SLOT_OPERANDS.get(op, [])
 }
@@ -861,6 +867,7 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.AddBind,
         Op.SubBind,
         Op.MulBind,
+        Op.MulIntConst,
     ]
     for op in leading { table[opcode(op)] = [0] }
     table[opcode(Op.ForIterBind)] = [2]     # the slot follows the i16 jump

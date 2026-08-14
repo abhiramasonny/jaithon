@@ -192,7 +192,9 @@
     /* `MATCH_TYPE; POP` / `MATCH_RANGE; POP` / `MATCH_SEQ; POP` fused (§3.3) */\
     X(OP_MATCH_TYPE_POP,       5, -1)                                         \
     X(OP_MATCH_RANGE_POP,      9, -1)                                         \
-    X(OP_MATCH_SEQ_POP,        4, -1)
+    X(OP_MATCH_SEQ_POP,        4, -1)                                         \
+    /* `GET_LOCAL; <int k>; MUL` fused (§3.3) */                             \
+    X(OP_MUL_INT_CONST,        4, +1)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

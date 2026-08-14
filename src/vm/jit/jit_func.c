@@ -4719,6 +4719,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_MUL_INT_CONST: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int16_t  imm  = jaiReadI16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            unsigned dst = pushReg(e) - 1;
+            unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
+            unsigned rt = ovfDest(e, dst);
+            /* MUL has no immediate form on this encoder, so the constant goes
+             * into JIT_SCRATCH_D -- left free by `cur` and `rt` above, so it
+             * cannot collide with either even when ovfDest hands back
+             * JIT_SCRATCH_B inside a `try`. Same overflow test as plain
+             * OP_MUL: the product overflows exactly when smulh's high half is
+             * not the low half's sign bit replicated, and it shares that
+             * arm's overflow-stub slot (2, the `*` message) since it is the
+             * same operator. */
+            emitConst64(e, JIT_SCRATCH_D, imm);
+            emit(e, jaiA64SmulhX(JIT_SCRATCH_A, cur, JIT_SCRATCH_D));
+            emit(e, jaiA64MulX(rt, cur, JIT_SCRATCH_D));
+            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rt, 63));
+            branchOnOverflow(e, 2u, JAI_A64_NE);
+            if (rt != dst) emit(e, jaiA64MovX(dst, rt));
+            off += 5;
+            break;
+        }
+
         case OP_MUL_BIND: {
             unsigned slot = jaiReadU16(code + off + 1);
             if (!localInRange(e, slot)) return false;
