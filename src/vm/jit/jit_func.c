@@ -928,6 +928,24 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         emit(e, jaiA64LdrW(scratch, 31, localFrameOff(e, slot)));
         emit(e, jaiA64SubsXImm(31, scratch, localTagFor(e, slot)));
         branchOnDeopt(e, JAI_A64_NE);
+
+        /* VAL_OBJ is shared by SLOT_LIST, SLOT_OBJ and SLOT_INST alike (see
+         * localTagFor), so the tag check above cannot tell a list from a dict
+         * a sibling write left in this slot -- confirmed the same way
+         * OP_GET_INDEX's own SLOT_LIST arm does, once, before a consumer
+         * trusts it with no check of its own. Chained through `scratch`
+         * alone (no second register): the payload is reloaded fresh into it,
+         * then `Obj.type` is loaded from that address back into the same
+         * register -- valid on this encoder elsewhere (e.g. the
+         * OP_GET_INDEX/OP_SET_INDEX list arms chain JIT_SCRATCH_C the same
+         * way), and it never needs the pointer again afterward, since the
+         * unconditional reload below re-reads it from the frame regardless. */
+        if (e->localKind[slot] == SLOT_LIST) {
+            emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
+            emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, scratch, OBJ_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+        }
     }
     emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
     return scratch;
