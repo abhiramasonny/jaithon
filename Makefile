@@ -392,8 +392,8 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 # The unit suites under a collector that runs every N allocations.
 #
 # Only the GOLDENS ever got a --gc-stress pass (run_tests.sh runs each one a
-# second time under it). The 1000-odd unit tests in tests/lang, tests/stdlib and
-# the package trees ran once, plain, so no gate covered them under a collector
+# second time under it). The 1000-odd unit tests in tests/lang, tests/stdlib,
+# tests/checker and the package trees ran once, plain, so no gate covered them under a collector
 # at all -- and a use-after-free or a missed root is exactly what gc stress is
 # for. Two silent miscompiles were found on 2026-08-12 by stress modes, neither
 # by any other gate.
@@ -408,7 +408,7 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 gc-stress-test: $(TARGET)
 	@out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
 	          --gc-stress=$(GC_STRESS_EVERY) \
-	          tests/lang tests/stdlib \
+	          tests/lang tests/stdlib tests/checker \
 	          packages/jaiplot/tests packages/jaitensor/tests 2>&1); \
 	  status=$$?; \
 	  if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
@@ -420,7 +420,7 @@ gc-stress-test: $(TARGET)
 # undocumented. Pure text, so it costs nothing to run on every `make test`.
 .PHONY: opcode-check
 opcode-check:
-	@uv run python scripts/opcode_table_check.py
+	@python3 scripts/opcode_table_check.py
 
 # sum(jaiOpCounts) == vm.instructionCount, which is the only evidence that no
 # dispatch path skips the census. VM_NEXT_HINT skipped it and loop_sum's
@@ -451,7 +451,7 @@ linetable-check:
 # on it costs.
 .PHONY: jit-fusion-check
 jit-fusion-check:
-	@uv run python scripts/jit_fusion_check.py
+	@python3 scripts/jit_fusion_check.py
 
 # Where a branch keeps its displacement is written down twice, in verify.c and
 # in opt/chunk.jai, and neither consults the other. A missing entry makes the
@@ -459,7 +459,7 @@ jit-fusion-check:
 # stops, with no diagnostic. Pure text, so it runs on every `make test`.
 .PHONY: branch-table-check
 branch-table-check:
-	@uv run python scripts/branch_table_check.py
+	@python3 scripts/branch_table_check.py
 
 # The JIT's decline census, collapsed to distinct reasons and compared against a
 # recorded baseline. A NEW reason means the tier stopped compiling something it
@@ -711,7 +711,7 @@ package-check:
 	@python3 scripts/check_packages.py
 
 check: package-check $(TARGET)
-	@./$(TARGET) check lib tests/lang tests/stdlib tests/bench examples packages
+	@./$(TARGET) check lib tests/lang tests/stdlib tests/checker tests/bench examples packages
 
 fmt: $(TARGET)
 	@./$(TARGET) fmt lib tests examples packages

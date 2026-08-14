@@ -1,6 +1,8 @@
 #: The optimiser: the pass pipeline of `spec/BYTECODE.md` §8, over a chunk the
 #: emitter has just finished.
 #:
+#: Facade: imports and re-exports every sibling module in this directory.
+#:
 #: The Jaithon half of `jaiOptimize` / `optimizeFunction`
 #: (`src/codegen/optimize.c:1808`). The order below is not a suggestion: the
 #: two front ends are compared instruction for instruction by `make bootstrap`,
