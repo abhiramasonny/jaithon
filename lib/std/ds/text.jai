@@ -265,7 +265,7 @@ pub class SuffixArray {
     #: The empty pattern matches every suffix, so it counts the text length.
     pub fn count(self, pattern: str) -> int {
         if pattern.len() == 0 { return self.suffixes.len() }
-        return self._upper_bound(pattern) - self._lower_bound(pattern)
+        return self._bound(pattern, false) - self._bound(pattern, true)
     }
 
     #: Report whether `pattern` occurs in the text.
@@ -275,8 +275,8 @@ pub class SuffixArray {
 
     #: Every starting offset of `pattern`, ascending.
     pub fn positions(self, pattern: str) -> list[int] {
-        let low = self._lower_bound(pattern)
-        let high = self._upper_bound(pattern)
+        let low = self._bound(pattern, true)
+        let high = self._bound(pattern, false)
         let found: list[int] = []
         for rank in low..high { found.push(self.suffixes[rank]) }
         return sorted(found)
@@ -298,28 +298,15 @@ pub class SuffixArray {
         return self.text[at:at + best]
     }
 
-    #: The first rank whose suffix is not less than `pattern`.
-    fn _lower_bound(self, pattern: str) -> int {
+    #: The first rank whose suffix is not less than `pattern` (`strict`), or
+    #: the first rank whose suffix does not begin with `pattern` (not `strict`).
+    fn _bound(self, pattern: str, strict: bool) -> int {
         var low = 0
         var high = self.suffixes.len()
         while low < high {
             let middle = (low + high) // 2
-            if self._prefix_compare(self.suffixes[middle], pattern) < 0 {
-                low = middle + 1
-            } else {
-                high = middle
-            }
-        }
-        return low
-    }
-
-    #: The first rank whose suffix does not begin with `pattern`.
-    fn _upper_bound(self, pattern: str) -> int {
-        var low = 0
-        var high = self.suffixes.len()
-        while low < high {
-            let middle = (low + high) // 2
-            if self._prefix_compare(self.suffixes[middle], pattern) <= 0 {
+            let compared = self._prefix_compare(self.suffixes[middle], pattern)
+            if compared < 0 or not strict and compared == 0 {
                 low = middle + 1
             } else {
                 high = middle

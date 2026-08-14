@@ -16,14 +16,14 @@ static bool selfList(Value *args, const char *fnName, ObjList **out) {
     return true;
 }
 
-static bool optIntArg(int argc, Value *args, int index, const char *fnName,
-                      int64_t fallback, int64_t *out) {
+static bool optIntArgAt(int argc, Value *args, int index, const char *fnName,
+                        int64_t fallback, int posOffset, int64_t *out) {
     Value v = jaiSeqOptArg(argc, args, index);
     if (IS_NULL(v)) {
         *out = fallback;
         return true;
     }
-    return jaiArgInt(v, index, fnName, out);
+    return jaiArgInt(v, index + posOffset, fnName, out);
 }
 
 static bool optBoolArg(int argc, Value *args, int index, const char *fnName,
@@ -355,7 +355,7 @@ static bool listIndex(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.index", &self)) return false;
     int64_t from;
-    if (!optIntArg(argc, args, 2, "list.index", 0, &from)) return false;
+    if (!optIntArgAt(argc, args, 2, "list.index", 0, 0, &from)) return false;
     if (from < 0) {
         from += self->count;
         if (from < 0) from = 0;
@@ -470,13 +470,13 @@ static bool listSlice(int argc, Value *args, Value *out) {
     if (!selfList(args, "list.slice", &self)) return false;
 
     int64_t step;
-    if (!optIntArg(argc, args, 3, "list.slice", 1, &step)) return false;
+    if (!optIntArgAt(argc, args, 3, "list.slice", 1, 0, &step)) return false;
     if (step == 0) return jaiThrow(vm.cValueError, "list.slice(): step cannot be zero");
 
     int64_t start, stop;
-    if (!optIntArg(argc, args, 1, "list.slice", step > 0 ? 0 : INT64_MAX, &start))
+    if (!optIntArgAt(argc, args, 1, "list.slice", step > 0 ? 0 : INT64_MAX, 0, &start))
         return false;
-    if (!optIntArg(argc, args, 2, "list.slice", step > 0 ? INT64_MAX : INT64_MIN, &stop))
+    if (!optIntArgAt(argc, args, 2, "list.slice", step > 0 ? INT64_MAX : INT64_MIN, 0, &stop))
         return false;
 
     ObjList *result = jaiListSlice(self, start, stop, step);
@@ -838,7 +838,7 @@ static bool listEnumerate(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.enumerate", &self)) return false;
     int64_t start;
-    if (!optIntArg(argc, args, 1, "list.enumerate", 0, &start)) return false;
+    if (!optIntArgAt(argc, args, 1, "list.enumerate", 0, 0, &start)) return false;
 
     int n = self->count;
     ObjList *result = jaiListNew(n);
@@ -1044,19 +1044,9 @@ bool jaiListMethod(Value receiver, ObjString *name, Value *out) {
 /* __prim__.list_*                                                      */
 /* ------------------------------------------------------------------ */
 
-static bool optIntPrim(int argc, Value *args, int index, const char *fnName,
-                       int64_t fallback, int64_t *out) {
-    Value v = jaiSeqOptArg(argc, args, index);
-    if (IS_NULL(v)) {
-        *out = fallback;
-        return true;
-    }
-    return jaiArgInt(v, index + 1, fnName, out);
-}
-
 static bool primListNew(int argc, Value *args, Value *out) {
     int64_t capacity;
-    if (!optIntPrim(argc, args, 0, "list_new", 0, &capacity)) return false;
+    if (!optIntArgAt(argc, args, 0, "list_new", 0, 1, &capacity)) return false;
     if (capacity < 0) capacity = 0;
     if (capacity > INT32_MAX) {
         return jaiThrow(vm.cValueError, "list_new(): capacity %lld is too large",
@@ -1149,13 +1139,13 @@ static bool primListSlice(int argc, Value *args, Value *out) {
     if (!jaiArgList(args[0], 1, "list_slice", &list)) return false;
 
     int64_t step;
-    if (!optIntPrim(argc, args, 3, "list_slice", 1, &step)) return false;
+    if (!optIntArgAt(argc, args, 3, "list_slice", 1, 1, &step)) return false;
     if (step == 0) return jaiThrow(vm.cValueError, "list_slice(): step cannot be zero");
 
     int64_t start, stop;
-    if (!optIntPrim(argc, args, 1, "list_slice", step > 0 ? 0 : INT64_MAX, &start))
+    if (!optIntArgAt(argc, args, 1, "list_slice", step > 0 ? 0 : INT64_MAX, 1, &start))
         return false;
-    if (!optIntPrim(argc, args, 2, "list_slice", step > 0 ? INT64_MAX : INT64_MIN, &stop))
+    if (!optIntArgAt(argc, args, 2, "list_slice", step > 0 ? INT64_MAX : INT64_MIN, 1, &stop))
         return false;
 
     ObjList *result = jaiListSlice(list, start, stop, step);

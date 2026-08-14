@@ -11,7 +11,7 @@ from std.algo.codecs import base64_encode
 from std.fmt import format
 from std.gui.image import Image
 
-from ..geom import Point, Rect, pose_outline
+from ..geom import Point, Rect, cross_arms, pose_outline
 from ..metrics import text_height
 from ..primitive import DisplayList, Primitive
 from .png import encode
@@ -131,7 +131,7 @@ fn _marker(at: Point, shape: MarkerShape, size: float, fill: Paint, edge: Stroke
         return f"<circle {centre} {paint} {outline}/>"
     }
     if shape == MarkerShape.Plus or shape == MarkerShape.Cross {
-        let arms = _cross_points(at, radius, shape == MarkerShape.Cross)
+        let arms = cross_arms(at, radius, shape == MarkerShape.Cross)
         let line_stroke = Stroke(fill.color(), width: max(1.0, size * 0.22), cap: LineCap.Butt)
         var out = []
         for arm in arms {
@@ -244,21 +244,6 @@ fn _marker_points(at: Point, radius: float, shape: MarkerShape) -> list[Point] {
         Point(at.x, at.y - radius),
         Point(at.x + radius, at.y + radius * 0.8),
         Point(at.x - radius, at.y + radius * 0.8),
-    ]
-}
-
-#: The two strokes of a plus or a diagonal cross.
-fn _cross_points(at: Point, radius: float, diagonal: bool) -> list[list[Point]] {
-    if diagonal {
-        let reach = radius * 0.7071
-        return [
-            [Point(at.x - reach, at.y - reach), Point(at.x + reach, at.y + reach)],
-            [Point(at.x - reach, at.y + reach), Point(at.x + reach, at.y - reach)],
-        ]
-    }
-    return [
-        [Point(at.x - radius, at.y), Point(at.x + radius, at.y)],
-        [Point(at.x, at.y - radius), Point(at.x, at.y + radius)],
     ]
 }
 

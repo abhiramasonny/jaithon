@@ -2,7 +2,7 @@
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, TypeKind, Visibility
 from jaithon.ast import always_diverges, preorder
 from jaithon.compile.check.assign import is_subtype
-from jaithon.compile.check.ctx import Ctx
+from jaithon.compile.check.ctx import Ctx, or_any, decl_type, is_any, is_never, is_void, type_decl_of
 from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, VIS_PRIVATE, VIS_PROTECTED
 from jaithon.compile.check.expr import VIS_PUBLIC, find_init_decl, self_skip_of, value
 from jaithon.compile.check.fold import const_eval, const_replace
@@ -61,35 +61,6 @@ let _VISIBILITY_ORDINAL: dict[Visibility, int] = {
     Visibility.Private: VIS_PRIVATE,
     Visibility.Protected: VIS_PROTECTED,
     Visibility.Public: VIS_PUBLIC,
-}
-
-fn _is_any(t: Type?) -> bool {
-    if t is null { return true }
-    return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
-}
-
-fn _is_never(t: Type?) -> bool {
-    return t is not null and t.kind == TyKind.Never
-}
-
-fn _is_void(c: Ctx, t: Type?) -> bool {
-    if t is null { return false }
-    return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
-}
-
-fn _or_any(c: Ctx, t: Type?) -> Type {
-    return t ?? c.universe.t_any
-}
-
-fn _decl_type(c: Ctx, decl: TypeDecl?) -> Type {
-    if decl is null { return c.universe.t_any }
-    return decl.ty ?? c.universe.t_any
-}
-
-fn _type_decl_of(t: Type?) -> TypeDecl? {
-    if t is null { return null }
-    if not t.is_named() { return null }
-    return t.decl
 }
 
 fn _record_span(record: dict[str, any]) -> Span {
@@ -182,14 +153,14 @@ pub fn register_decl(c: Ctx, node: Node?) -> TypeDecl? {
 
 fn _type_fits(c: Ctx, sub: Type?, super_ty: Type?) -> bool {
     if sub is null or super_ty is null { return true }
-    if _is_any(sub) or _is_any(super_ty) { return true }
+    if is_any(sub) or is_any(super_ty) { return true }
     if sub == super_ty { return true }
     return is_subtype(c.universe, sub, super_ty)
 }
 
 fn _signature_compatible(c: Ctx, sub: Type?, super_ty: Type?) -> (bool, str?) {
     if sub is null or super_ty is null { return (true, null) }
-    if _is_any(sub) or _is_any(super_ty) { return (true, null) }
+    if is_any(sub) or is_any(super_ty) { return (true, null) }
 
     if sub.kind != TyKind.Fn or super_ty.kind != TyKind.Fn {
         if _type_fits(c, sub, super_ty) { return (true, null) }
@@ -385,7 +356,7 @@ fn _add_field(c: Ctx, d: TypeDecl, record: dict[str, any], next_slot: int) -> in
     d.fields.push(
         FieldInfo(
             name,
-            ty: _or_any(c, c.resolve_ast_type(c, _record_type(record))),
+            ty: or_any(c, c.resolve_ast_type(c, _record_type(record))),
             slot: slot,
             visibility: _record_visibility(record),
             is_static: is_static,
@@ -493,7 +464,7 @@ fn _install_member(
 
     let info = MemberInfo(
         name,
-        ty: _or_any(c, ty),
+        ty: or_any(c, ty),
         visibility: vis,
         is_static: is_static,
         is_getter: is_getter,
@@ -573,7 +544,7 @@ fn _resolve_decl_reference(
 ) -> (TypeDecl?, str?) {
     let word = if want_trait { "trait" } else { "class" }
     let t = c.resolve_ast_type(c, ref)
-    let target = _type_decl_of(t)
+    let target = type_decl_of(t)
 
     if target is null {
         var opaque = false
@@ -581,7 +552,7 @@ fn _resolve_decl_reference(
             opaque = if want_trait { t.kind == TyKind.Trait } else { t.kind == TyKind.Class }
         }
         if opaque and t is not null { return (null, t.name) }
-        if not _is_any(t) {
+        if not is_any(t) {
             c.error(E0700_UNKNOWN_CLASS, ref.span, f"`{ref.name ?? "this type"}` is not a {word}")
         }
         return (null, null)
@@ -667,7 +638,7 @@ fn _layout_trait(c: Ctx, d: TypeDecl, node: Node) -> void {
             d.members.push(
                 MemberInfo(
                     inherited.name,
-                    ty: _or_any(c, _apply_trait_binding(c, d, super_decl, binding, inherited.ty)),
+                    ty: or_any(c, _apply_trait_binding(c, d, super_decl, binding, inherited.ty)),
                     visibility: inherited.visibility,
                     is_static: inherited.is_static,
                     is_getter: inherited.is_getter,
@@ -692,7 +663,7 @@ fn _layout_enum(c: Ctx, d: TypeDecl, node: Node) -> void {
     push_generics(c, node.records("generics"))
     push_self(c, d.ty)
 
-    let own = _decl_type(c, d)
+    let own = decl_type(c, d)
     for record in node.records("variants") {
         let name = _record_name(record)
         if name is null { continue }
@@ -702,7 +673,7 @@ fn _layout_enum(c: Ctx, d: TypeDecl, node: Node) -> void {
         if params.len() > 0 {
             var payload: list[Type] = []
             for parameter in params {
-                payload.push(_or_any(c, c.resolve_ast_type(c, _record_type(parameter))))
+                payload.push(or_any(c, c.resolve_ast_type(c, _record_type(parameter))))
             }
             ty = fn_of(u, payload, own, 0)
         }
@@ -777,7 +748,7 @@ pub fn signature_of(c: Ctx, fn_node: Node?, is_method: bool) -> Type {
         let record = params[index]
         if _record_flag(record, "isVariadic") { flags = flags | FN_VARIADIC }
         if _record_flag(record, "isKwRest") { flags = flags | FN_KWREST }
-        types.push(_or_any(c, c.resolve_ast_type(c, _record_type(record))))
+        types.push(or_any(c, c.resolve_ast_type(c, _record_type(record))))
         index += 1
     }
 
@@ -794,7 +765,7 @@ pub fn function_type(c: Ctx, fn_node: Node?) -> Type {
 # The type a parameter's binding has inside the body, which is not the type in
 # the signature for `...xs` and `**opts`.
 fn _parameter_binding_type(c: Ctx, record: dict[str, any]) -> Type {
-    let declared = _or_any(c, c.resolve_ast_type(c, _record_type(record)))
+    let declared = or_any(c, c.resolve_ast_type(c, _record_type(record)))
     if _record_flag(record, "isVariadic") { return list_of(c.universe, declared) }
     if _record_flag(record, "isKwRest") { return dict_of(c.universe, c.universe.t_str, declared) }
     return declared
@@ -817,7 +788,7 @@ pub fn check_body(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> 
     for (index, record) in fn_node.records("params").enumerate() {
         var bound = u.t_any
         if index < skip {
-            bound = _decl_type(c, owner)
+            bound = decl_type(c, owner)
         } else {
             bound = _parameter_binding_type(c, record)
             if c.strict and _record_type(record) is null and not _record_flag(record, "isKwRest") {
@@ -856,7 +827,7 @@ pub fn check_body(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> 
         if body.kind == NodeKind.Block {
             c.check_block(c, body)
         } else {
-            if not _is_any(ret) { c.apply_context(c, body, ret) }
+            if not is_any(ret) { c.apply_context(c, body, ret) }
             let got = value(c, body)
             if annotated {
                 let _ok = c.require_assignable(
@@ -884,7 +855,7 @@ pub fn check_body(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> 
 fn _check_falls_off_end(c: Ctx, fn_node: Node, body: Node?, ret: Type?, annotated: bool) -> void {
     if body is null or body.kind != NodeKind.Block { return }
     if fn_node.flag("isGenerator") or not annotated { return }
-    if _is_void(c, ret) or _is_any(ret) or _is_never(ret) { return }
+    if is_void(c, ret) or is_any(ret) or is_never(ret) { return }
     if ret is null or ret.kind == TyKind.Null or is_optional(ret) { return }
     if always_diverges(body) { return }
 
@@ -949,7 +920,7 @@ fn _check_class_body(c: Ctx, node: Node) -> void {
 
     let mark = c.type_name_mark()
     push_generics(c, node.records("generics"))
-    push_self(c, _decl_type(c, d))
+    push_self(c, decl_type(c, d))
     let saved_class = c.current_class
     c.current_class = d
 
@@ -1007,7 +978,7 @@ fn _check_enum_body(c: Ctx, node: Node) -> void {
 
     let mark = c.type_name_mark()
     push_generics(c, node.records("generics"))
-    push_self(c, _decl_type(c, d))
+    push_self(c, decl_type(c, d))
     let saved_class = c.current_class
     c.current_class = d
 

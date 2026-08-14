@@ -619,17 +619,5 @@ let _KEY_TABLE: list[tuple[int, Key]] = [
     (231, Key.RightSuper),
 ]
 
-let _CODE_TO_KEY: dict[int, Key] = _index_by_code()
-let _KEY_TO_CODE: dict[Key, int] = _index_by_key()
-
-fn _index_by_code() -> dict[int, Key] {
-    let table: dict[int, Key] = {}
-    for (code, key) in _KEY_TABLE { table[code] = key }
-    return table
-}
-
-fn _index_by_key() -> dict[Key, int] {
-    let table: dict[Key, int] = {}
-    for (code, key) in _KEY_TABLE { table[key] = code }
-    return table
-}
+let _CODE_TO_KEY: dict[int, Key] = {code: key for (code, key) in _KEY_TABLE}
+let _KEY_TO_CODE: dict[Key, int] = {key: code for (code, key) in _KEY_TABLE}
