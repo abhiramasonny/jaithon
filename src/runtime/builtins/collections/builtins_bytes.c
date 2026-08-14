@@ -344,10 +344,6 @@ static bool primBytesSlice(int argc, Value *args, Value *out) {
     return true;
 }
 
-static bool primBytesConcat(int argc, Value *args, Value *out) {
-    return bytesConcat(argc, args, out);
-}
-
 static bool primBytesCmp(int argc, Value *args, Value *out) {
     ObjBytes *a, *b;
     if (!primBytesReceiver(args[0], "bytes_cmp", &a)) return false;
@@ -357,18 +353,6 @@ static bool primBytesCmp(int argc, Value *args, Value *out) {
     if (cmp == 0) cmp = (a->length < b->length) ? -1 : (a->length > b->length);
     *out = INT_VAL(cmp < 0 ? -1 : (cmp > 0 ? 1 : 0));
     return true;
-}
-
-static bool primBytesFind(int argc, Value *args, Value *out) {
-    return bytesFind(argc, args, out);
-}
-
-static bool primBytesToList(int argc, Value *args, Value *out) {
-    return bytesToList(argc, args, out);
-}
-
-static bool primBytesHex(int argc, Value *args, Value *out) {
-    return bytesHex(argc, args, out);
 }
 
 static bool primBytesFromHex(int argc, Value *args, Value *out) {
@@ -403,10 +387,10 @@ void jaiBytesRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "bytes_len",      primBytesLen,      1, 1);
     jaiStrDefinePrim(ns, "bytes_get",      primBytesGet,      2, 2);
     jaiStrDefinePrim(ns, "bytes_slice",    primBytesSlice,    3, 3);
-    jaiStrDefinePrim(ns, "bytes_concat",   primBytesConcat,   2, 2);
+    jaiStrDefinePrim(ns, "bytes_concat",   bytesConcat,       2, 2);
     jaiStrDefinePrim(ns, "bytes_cmp",      primBytesCmp,      2, 2);
-    jaiStrDefinePrim(ns, "bytes_find",     primBytesFind,     2, 4);
-    jaiStrDefinePrim(ns, "bytes_to_list",  primBytesToList,   1, 1);
-    jaiStrDefinePrim(ns, "bytes_hex",      primBytesHex,      1, 1);
+    jaiStrDefinePrim(ns, "bytes_find",     bytesFind,         2, 4);
+    jaiStrDefinePrim(ns, "bytes_to_list",  bytesToList,       1, 1);
+    jaiStrDefinePrim(ns, "bytes_hex",      bytesHex,          1, 1);
     jaiStrDefinePrim(ns, "bytes_from_hex", primBytesFromHex,  1, 1);
 }

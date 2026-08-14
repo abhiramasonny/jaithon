@@ -34,7 +34,8 @@
 from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, TypeKind
 from jaithon.ast import always_diverges, is_declaration, is_expression, is_pattern, op_text
 from jaithon.compile.check.assign import assignable
-from jaithon.compile.check.ctx import Ctx, E0411_INT_FLOAT_MIX, subject_of
+from jaithon.compile.check.ctx import Ctx, E0411_INT_FLOAT_MIX, decl_type, is_any, is_never
+from jaithon.compile.check.ctx import is_void, or_any, subject_of, type_decl_of
 from jaithon.compile.check.expr import E0400_TYPE_MISMATCH, E0404_NOT_INDEXABLE
 from jaithon.compile.check.expr import E0406_BAD_OPERAND_TYPES, E0410_UNKNOWN_MEMBER
 from jaithon.compile.check.expr import E0701_PRIVATE_ACCESS, W0102_UNREACHABLE_CODE, condition
@@ -106,40 +107,6 @@ pub const MAX_TRACKED_VARIANTS: int = 256
 
 #: How many sequence lengths a `match` tracks, the width of the C's bitset.
 pub const MAX_TRACKED_LENGTHS: int = 64
-
-fn _is_any(t: Type?) -> bool {
-    if t is null { return true }
-    return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
-}
-
-fn _is_never(t: Type?) -> bool {
-    return t is not null and t.kind == TyKind.Never
-}
-
-fn _is_void(c: Ctx, t: Type?) -> bool {
-    if t is null { return false }
-    return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
-}
-
-fn _or_any(c: Ctx, t: Type?) -> Type {
-    return t ?? c.universe.t_any
-}
-
-fn _decl_type(c: Ctx, decl: TypeDecl?) -> Type {
-    if decl is null { return c.universe.t_any }
-    return decl.ty ?? c.universe.t_any
-}
-
-fn _type_decl_of(t: Type?) -> TypeDecl? {
-    if t is null { return null }
-    if not t.is_named() { return null }
-    return t.decl
-}
-
-fn _span_of(node: Node?) -> Span {
-    if node is null { return Span.none() }
-    return node.span
-}
 
 fn _layout_fields(decl: TypeDecl?) -> list[FieldInfo] {
     return _collect_fields(decl, 0)
@@ -258,11 +225,11 @@ fn _pattern_enum(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
 
     var decl = c.decl_named(type_name)
     if decl is null {
-        let from_subject = _type_decl_of(subject)
+        let from_subject = type_decl_of(subject)
         if from_subject is not null and from_subject.name == type_name { decl = from_subject }
     }
     if decl is null {
-        if not _is_any(subject) {
+        if not is_any(subject) {
             let shown = type_name ?? "?"
             c.error(E0402_UNKNOWN_TYPE, pat.span, f"unknown type `{shown}` in pattern")
         }
@@ -321,7 +288,7 @@ fn _pattern_class(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
     let count = pat.child_list("subPatterns").len()
     let decl = c.decl_named(type_name)
     if decl is null {
-        if not _is_any(subject) {
+        if not is_any(subject) {
             let shown = type_name ?? "?"
             c.error(E0402_UNKNOWN_TYPE, pat.span, f"unknown type `{shown}` in pattern")
         }
@@ -367,7 +334,7 @@ fn _pattern_class(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
             suggest_member(d, decl, field_name)
         } elif fi >= 0 {
             let field = fields[fi]
-            field_type = _or_any(c, field.ty)
+            field_type = or_any(c, field.ty)
             let owner = owner_of_field(decl, field.name)
             if not visible_from(c, owner, field.visibility) {
                 let word = visibility_word(field.visibility)
@@ -393,7 +360,7 @@ fn _pattern_class(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
 fn _pattern_walk(c: Ctx, pat: Node?, raw_subject: Type?, binds: _BindSet?) -> void {
     if pat is null { return }
     let u = c.universe
-    let subject = _or_any(c, raw_subject)
+    let subject = or_any(c, raw_subject)
 
     match pat.kind {
         NodeKind.PatWildcard => { }
@@ -403,8 +370,8 @@ fn _pattern_walk(c: Ctx, pat: Node?, raw_subject: Type?, binds: _BindSet?) -> vo
             var bound: Type? = subject
             if written is not null { bound = c.resolve_ast_type(c, written) }
             _record_binding(c, binds, pat.opt_text("name"), pat.span)
-            c.set_symbol_type(c.resolution.symbol_of(pat), _or_any(c, bound))
-            c.set_type(pat, _or_any(c, bound))
+            c.set_symbol_type(c.resolution.symbol_of(pat), or_any(c, bound))
+            c.set_type(pat, or_any(c, bound))
             return
         }
 
@@ -415,7 +382,7 @@ fn _pattern_walk(c: Ctx, pat: Node?, raw_subject: Type?, binds: _BindSet?) -> vo
                 let lit = value(c, literal_node)
                 let (forwards, _fg) = assignable(u, lit, subject)
                 let (backwards, _bg) = assignable(u, subject, lit)
-                if not _is_any(subject) and not _is_any(lit) and not forwards and not backwards {
+                if not is_any(subject) and not is_any(lit) and not forwards and not backwards {
                     let want = render(subject)
                     let got = render(lit)
                     c.error(
@@ -677,7 +644,7 @@ pub fn match_expr(c: Ctx, node: Node?, is_statement_position: bool) -> Type {
     if node is null { return u.t_any }
 
     let subject = value(c, node.child("subject"))
-    var enum_decl = _type_decl_of(subject)
+    var enum_decl = type_decl_of(subject)
     if enum_decl is not null and not enum_decl.is_enum { enum_decl = null }
     if enum_decl is not null { c.layout_decl(c, enum_decl) }
 
@@ -706,7 +673,7 @@ pub fn match_expr(c: Ctx, node: Node?, is_statement_position: bool) -> Type {
         let body = if arm_body is null { u.t_void } else { expr(c, arm_body) }
         c.narrow_restore(mark)
 
-        if not is_statement_position and not _is_void(c, body) and not _is_never(body) {
+        if not is_statement_position and not is_void(c, body) and not is_never(body) {
             result = if result is null { body } else { join(u, result, body) }
         }
 
@@ -718,7 +685,7 @@ pub fn match_expr(c: Ctx, node: Node?, is_statement_position: bool) -> Type {
     if result is null { return u.t_any }
     let total = cov.saw_catch_all or
         enum_decl is not null or
-        _is_any(subject) or
+        is_any(subject) or
         _sequence_coverage_complete(subject, cov)
     return if total { result } else { optional_of(u, result) }
 }
@@ -795,7 +762,7 @@ fn _check_var_decl(c: Ctx, node: Node) -> void {
         }
     }
 
-    let settled = _or_any(c, bound)
+    let settled = or_any(c, bound)
     c.set_type(node, settled)
 
     let symbol = _decl_symbol(c, node)
@@ -808,7 +775,7 @@ fn _check_var_decl(c: Ctx, node: Node) -> void {
 }
 
 fn _check_stored_value(c: Ctx, source: Node?, want: Type?) -> void {
-    if want is not null and not _is_any(want) { c.apply_context(c, source, want) }
+    if want is not null and not is_any(want) { c.apply_context(c, source, want) }
     let got = value(c, source)
     if want is null { return }
     let _ok = c.require_assignable(
@@ -829,7 +796,7 @@ fn _check_field_assign(c: Ctx, node: Node, target: Node) -> void {
 
     var found = static_target_decl(c, object)
     let static_access = found is not null
-    if found is null { found = _type_decl_of(value(c, object)) }
+    if found is null { found = type_decl_of(value(c, object)) }
     if found is null {
         c.set_type(target, u.t_any)
         value(c, source)
@@ -862,14 +829,14 @@ fn _check_field_assign(c: Ctx, node: Node, target: Node) -> void {
             d.with_help("declare it `var` if it needs to change after `init`")
         }
 
-        c.set_type(target, _or_any(c, field.ty))
+        c.set_type(target, or_any(c, field.ty))
         _check_stored_value(c, source, c.type_of(target))
         return
     }
 
     let setter = find_accessor(decl, name, true)
     if setter is not null {
-        c.set_type(target, _or_any(c, setter.ty))
+        c.set_type(target, or_any(c, setter.ty))
         _check_stored_value(c, source, c.type_of(target))
         return
     }
@@ -894,7 +861,7 @@ fn _check_compound_assign(c: Ctx, node: Node, target: Node, source: Node) -> voi
     let u = c.universe
     let current = expr(c, target)
     var rhs = value(c, source)
-    if _is_any(current) or _is_any(rhs) or _is_never(current) or _is_never(rhs) { return }
+    if is_any(current) or is_any(rhs) or is_never(current) or is_never(rhs) { return }
 
     let op = node.op()
     if widens_operands(op) and current.kind == TyKind.Float and rhs.kind == TyKind.Int {
@@ -947,10 +914,10 @@ fn _check_index_assign(c: Ctx, node: Node, target: Node) -> void {
     let index = value(c, index_node)
 
     var element: Type? = null
-    let shape = if _is_any(container) { null } else { is_indexable(u, container) }
+    let shape = if is_any(container) { null } else { is_indexable(u, container) }
     if shape is not null {
         let (want_index, want_element) = shape
-        if not _is_any(index) {
+        if not is_any(index) {
             let _ok = c.require_assignable(
                 c,
                 index_node,
@@ -962,7 +929,7 @@ fn _check_index_assign(c: Ctx, node: Node, target: Node) -> void {
         }
         element = want_element
         c.apply_context(c, source, want_element)
-    } elif not _is_any(container) and _type_decl_of(container) is null {
+    } elif not is_any(container) and type_decl_of(container) is null {
         let got = render(container)
         c.error(E0404_NOT_INDEXABLE, target.span, f"`{got}` does not support indexed assignment")
     }
@@ -978,7 +945,7 @@ fn _check_index_assign(c: Ctx, node: Node, target: Node) -> void {
             "mismatched types in this assignment"
         )
     }
-    c.set_type(target, _or_any(c, element))
+    c.set_type(target, or_any(c, element))
 }
 
 fn _check_assign(c: Ctx, node: Node) -> void {
@@ -996,9 +963,9 @@ fn _check_assign(c: Ctx, node: Node) -> void {
             var want = expr(c, target)
             let symbol = c.resolution.symbol_of(target)
             if symbol is not null and c.symbol_type(symbol) is not null {
-                want = _or_any(c, c.declared_type(symbol))
+                want = or_any(c, c.declared_type(symbol))
             }
-            c.set_type(target, _or_any(c, want))
+            c.set_type(target, or_any(c, want))
             _check_stored_value(c, source, want)
             c.narrow_invalidate(symbol)
         }
@@ -1113,8 +1080,8 @@ fn _check_return(c: Ctx, node: Node) -> void {
 
     if returned is null {
         if want is not null and
-            not _is_any(want) and
-            not _is_void(c, want) and
+            not is_any(want) and
+            not is_void(c, want) and
             want.kind != TyKind.Null and
             not is_optional(want) {
             let expected = render(want)
@@ -1128,7 +1095,7 @@ fn _check_return(c: Ctx, node: Node) -> void {
         return
     }
 
-    if want is not null and _is_void(c, want) {
+    if want is not null and is_void(c, want) {
         value(c, returned)
         c.error(
             E0408_RETURN_TYPE_MISMATCH,
@@ -1155,7 +1122,7 @@ fn _check_throw(c: Ctx, node: Node) -> void {
     let thrown = node.child("value")
     if thrown is null { return }
     let t = value(c, thrown)
-    if _is_any(t) or _is_never(t) { return }
+    if is_any(t) or is_never(t) { return }
     if t.kind == TyKind.Class or t.kind == TyKind.Trait or t.kind == TyKind.GenericParam { return }
 
     let got = render(t)
@@ -1186,9 +1153,9 @@ fn _check_try(c: Ctx, node: Node) -> void {
             # An unannotated `catch` binds `Error`. `Ctx.lookup_type_name`
             # answers null until the prelude registers it, so until then the
             # binding is `any`.
-            caught = _or_any(c, c.lookup_type_name(c, "Error"))
+            caught = or_any(c, c.lookup_type_name(c, "Error"))
         }
-        c.set_symbol_type(c.resolution.symbol_of(handler), _or_any(c, caught))
+        c.set_symbol_type(c.resolution.symbol_of(handler), or_any(c, caught))
         let handler_body: Node? = handler.get("body", null)
         if handler_body is not null { stmt(c, handler_body) }
     }
@@ -1202,7 +1169,7 @@ fn _check_assert(c: Ctx, node: Node) -> void {
     let message = node.child("message")
     if message is null { return }
     let t = value(c, message)
-    if _is_any(t) or t.kind == TyKind.Str { return }
+    if is_any(t) or t.kind == TyKind.Str { return }
     let _ok = c.require_assignable(
         c,
         message,
@@ -1288,7 +1255,7 @@ pub fn declared_return_type(c: Ctx, fn_node: Node?, is_method: bool) -> Type {
     if fn_node is null { return u.t_any }
     let written = fn_node.type_field("returnType")
     if written is not null and written.kind != TypeKind.Infer {
-        return _or_any(c, c.resolve_ast_type(c, written))
+        return or_any(c, c.resolve_ast_type(c, written))
     }
     if is_method and is_init_method(fn_node) { return u.t_void }
     return u.t_any
@@ -1321,7 +1288,7 @@ pub fn function_type(c: Ctx, fn_node: Node?, is_method: bool) -> Type {
         let written: TypeExpr? = p.get("type", null)
         var declared: Type? = null
         if written is not null { declared = c.resolve_ast_type(c, written) }
-        params.push(_or_any(c, declared))
+        params.push(or_any(c, declared))
         at += 1
     }
 
@@ -1337,7 +1304,7 @@ fn _parameter_binding_type(c: Ctx, p: dict[str, any]) -> Type {
     let written: TypeExpr? = p.get("type", null)
     var declared: Type? = null
     if written is not null { declared = c.resolve_ast_type(c, written) }
-    let settled = _or_any(c, declared)
+    let settled = or_any(c, declared)
     if p.get("isVariadic", false) { return list_of(u, settled) }
     if p.get("isKwRest", false) { return dict_of(u, u.t_str, settled) }
     return settled
@@ -1369,7 +1336,7 @@ pub fn function(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> vo
     for (position, p) in fn_node.records("params").enumerate() {
         var bound: Type = u.t_any
         if position < skip {
-            bound = _decl_type(c, owner)
+            bound = decl_type(c, owner)
         } else {
             bound = _parameter_binding_type(c, p)
             let written: TypeExpr? = p.get("type", null)
@@ -1411,7 +1378,7 @@ pub fn function(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> vo
             block(c, body)
         } else {
             # A lambda's body is its return value.
-            if not _is_any(returns) { c.apply_context(c, body, returns) }
+            if not is_any(returns) { c.apply_context(c, body, returns) }
             let got = value(c, body)
             if annotated {
                 let _ok = c.require_assignable(
@@ -1432,9 +1399,9 @@ pub fn function(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> vo
         body.kind == NodeKind.Block and
         not fn_node.flag("isGenerator") and
         annotated and
-        not _is_void(c, returns) and
-        not _is_any(returns) and
-        not _is_never(returns) and
+        not is_void(c, returns) and
+        not is_any(returns) and
+        not is_never(returns) and
         returns.kind != TyKind.Null and
         not is_optional(returns) and
         not always_diverges(body) {

@@ -135,7 +135,7 @@ pub class SigLoader {
         if resolved is null { return null }
         if resolved in self._cache { return self._cache[resolved] }
 
-        let text = _read_source(resolved)
+        let text = read_source(resolved)
         if text is null { return null }
 
         let sig = ModuleSig(resolved, dotted, self._next_file_id)
@@ -442,7 +442,7 @@ fn _is_dir(path: str) -> bool {
     return info["kind"] == "dir"
 }
 
-fn _read_source(path: str) -> str? {
+pub fn read_source(path: str) -> str? {
     try {
         let handle = __prim__.io_open(path, "rb")
         let raw = __prim__.io_read(handle, -1)

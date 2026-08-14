@@ -78,8 +78,8 @@ pub fn closest_pair(points: list[Point2]) -> tuple[Point2, Point2, float] {
         throw ValueError(f"closest_pair needs at least 2 points, got {count}")
     }
     let indices = [index for index in 0..count]
-    let by_x = sort_by(indices, |left, right| _compare_xy(points[left], points[right]))
-    let by_y = sort_by(indices, |left, right| _compare_yx(points[left], points[right]))
+    let by_x = sort_by(indices, |left, right| _compare(points[left], points[right], false))
+    let by_y = sort_by(indices, |left, right| _compare(points[left], points[right], true))
     let in_left = [false for _ in 0..count]
     let (first, second, distance) = _closest_pair_of(points, by_x, by_y, in_left)
     return (points[first], points[second], distance)
@@ -212,25 +212,25 @@ pub fn minimum_enclosing_circle(points: list[Point2]) -> Circle {
 }
 
 # --- Private helpers ---------------------------------------------------------
-fn _compare_xy(a: Point2, b: Point2) -> int {
+#: Lexicographically compare two points, `y` before `x` when `y_first`.
+fn _compare(a: Point2, b: Point2, y_first: bool) -> int {
+    if y_first {
+        if a.y < b.y { return -1 }
+        if a.y > b.y { return 1 }
+        if a.x < b.x { return -1 }
+        if a.x > b.x { return 1 }
+        return 0
+    }
     if a.x < b.x { return -1 }
     if a.x > b.x { return 1 }
     if a.y < b.y { return -1 }
     if a.y > b.y { return 1 }
-    return 0
-}
-
-fn _compare_yx(a: Point2, b: Point2) -> int {
-    if a.y < b.y { return -1 }
-    if a.y > b.y { return 1 }
-    if a.x < b.x { return -1 }
-    if a.x > b.x { return 1 }
     return 0
 }
 
 #: Return the points sorted by x then y, with exact duplicates removed.
 fn _sorted_distinct(points: list[Point2]) -> list[Point2] {
-    let ordered = sort_by(points, _compare_xy)
+    let ordered = sort_by(points, |a, b| _compare(a, b, false))
     let distinct: list[Point2] = []
     for point in ordered {
         if distinct.len() == 0 or not distinct[distinct.len() - 1].approx_eq(point) {

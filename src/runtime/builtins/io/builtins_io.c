@@ -161,18 +161,13 @@ static bool resolveStream(Value v, int index, const char *fnName, Stream *out) {
 
 /* The open mode is authoritative: asking a "w" file to read fails here rather
  * than in libc, where the error would carry no useful errno. */
-static bool requireReadable(const Stream *s, const char *fnName) {
-    if (s->file != NULL && !s->file->readable)
-        return jaiThrow(vm.cIOError, "%s(): '%s' is not open for reading",
-                        fnName, s->name);
-    return true;
-}
-
-static bool requireWritable(const Stream *s, const char *fnName) {
-    if (s->file != NULL && !s->file->writable)
-        return jaiThrow(vm.cIOError, "%s(): '%s' is not open for writing",
-                        fnName, s->name);
-    return true;
+static bool requireStreamAccess(const Stream *s, bool wantRead,
+                                const char *fnName) {
+    bool ok = s->file == NULL ||
+              (wantRead ? s->file->readable : s->file->writable);
+    if (ok) return true;
+    return jaiThrow(vm.cIOError, "%s(): '%s' is not open for %s", fnName,
+                    s->name, wantRead ? "reading" : "writing");
 }
 
 /* Operations that manipulate the handle itself need the object, not a stream:
@@ -308,7 +303,7 @@ static bool nIoOpen(int argc, Value *args, Value *out) {
 static bool nIoRead(int argc, Value *args, Value *out) {
     Stream s;
     if (!resolveStream(args[0], 1, "read", &s)) return false;
-    if (!requireReadable(&s, "read")) return false;
+    if (!requireStreamAccess(&s, true, "read")) return false;
 
     int64_t count = -1;
     if (argc >= 2 && !IS_NULL(args[1]) &&
@@ -333,7 +328,7 @@ static bool nIoReadLine(int argc, Value *args, Value *out) {
     (void)argc;
     Stream s;
     if (!resolveStream(args[0], 1, "read_line", &s)) return false;
-    if (!requireReadable(&s, "read_line")) return false;
+    if (!requireStreamAccess(&s, true, "read_line")) return false;
 
     JaiBuf buf;
     jaiBufInit(&buf);
@@ -388,7 +383,7 @@ static bool nIoReadLines(int argc, Value *args, Value *out) {
     (void)argc;
     Stream s;
     if (!resolveStream(args[0], 1, "read_lines", &s)) return false;
-    if (!requireReadable(&s, "read_lines")) return false;
+    if (!requireStreamAccess(&s, true, "read_lines")) return false;
 
     ObjList *lines = jaiListNew(0);
     jaiGCPushRoot(OBJ_VAL(lines));
@@ -407,7 +402,7 @@ static bool nIoWrite(int argc, Value *args, Value *out) {
     (void)argc;
     Stream s;
     if (!resolveStream(args[0], 1, "write", &s)) return false;
-    if (!requireWritable(&s, "write")) return false;
+    if (!requireStreamAccess(&s, false, "write")) return false;
 
     const void *data;
     size_t length;
@@ -543,7 +538,7 @@ static bool nFileLines(int argc, Value *args, Value *out) {
 static bool nFileWriteLine(int argc, Value *args, Value *out) {
     Stream s;
     if (!resolveStream(args[0], 1, "write_line", &s)) return false;
-    if (!requireWritable(&s, "write_line")) return false;
+    if (!requireStreamAccess(&s, false, "write_line")) return false;
 
     ObjString *text = NULL;
     if (argc >= 2 && !IS_NULL(args[1]) &&
