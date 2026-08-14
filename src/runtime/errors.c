@@ -57,7 +57,7 @@ static bool takeString(JaiBuf *buf, Value *out) {
     char *chars = jaiBufTakeCString(buf, &length);
     if (chars == NULL) return jaiThrow(vm.cRuntimeError, "out of memory rendering an exception");
     ObjString *text = jaiStringTake(chars, length);
-    if (text == NULL) return false;      /* over the length limit; it threw */
+    if (text == NULL) return false;
     *out = OBJ_VAL(text);
     return true;
 }
@@ -66,8 +66,6 @@ static bool takeString(JaiBuf *buf, Value *out) {
 /* Natives on Error                                                     */
 /* ------------------------------------------------------------------ */
 
-/* A non-str message is converted rather than rejected, so the message field
- * is a str for every construction path. */
 static bool errorInit(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.init", &self)) return false;
@@ -86,12 +84,10 @@ static bool errorInit(int argc, Value *args, Value *out) {
     if (text == NULL) return false;
 
     setFieldAt(self, FIELD_MESSAGE, OBJ_VAL(text));
-    /* traceback stays null; the VM sets it if and when this is thrown. */
     *out = OBJ_VAL(self);
     return true;
 }
 
-/* The bare message, so `print(e)` and `print(e.message)` agree. */
 static bool errorStr(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.__str__", &self)) return false;
@@ -110,7 +106,6 @@ static bool errorStr(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The call that would rebuild it: ValueError("bad input"). */
 static bool errorRepr(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.__repr__", &self)) return false;
@@ -134,8 +129,6 @@ static bool errorRepr(int argc, Value *args, Value *out) {
     return takeString(&buf, out);
 }
 
-/* Named __traceback__, not traceback: a method of that name would be
- * unreachable, since the field wins every property lookup. */
 static bool errorTraceback(int argc, Value *args, Value *out) {
     ObjInstance *self;
     if (!errorSelf(argc, args, "Error.__traceback__", &self)) return false;
@@ -155,7 +148,6 @@ static bool errorTracebackString(int argc, Value *args, Value *out) {
     bool ok = true;
     if (IS_LIST(tb)) {
         ObjList *frames = AS_LIST(tb);
-        /* count is re-read every step: a user __str__ may mutate the list. */
         for (int i = 0; ok && i < frames->count; i++) {
             if (i > 0) jaiBufPush(&buf, '\n');
             ok = appendText(&buf, frames->items[i]);
@@ -187,8 +179,6 @@ static void addNativeMethod(ObjClass *c, const char *name, JaiNativeFn fn,
     jaiGCPopRoot();
 }
 
-/* Declared by hand: no Jaithon class body runs for Error, so nothing else
- * would allocate its FieldInfo array. */
 static void addErrorFields(ObjClass *error) {
     ObjString *messageName =
         (vm.strMessage != NULL) ? vm.strMessage : jaiStringInternC("message");
@@ -205,8 +195,6 @@ static void addErrorFields(ObjClass *error) {
         .name = tracebackName, .slot = FIELD_TRACEBACK, .visibility = VIS_PUBLIC,
         .isStatic = false, .isLet = false, .typeId = 0,
     };
-    /* Publish only once both names are in place: the GC reaches them through
-     * fieldCount, and a collection between the two writes would mark garbage. */
     error->fields = fields;
     error->fieldCount = 2;
 
@@ -227,8 +215,6 @@ static ObjClass *defineErrorClass(const char *name, ObjClass *super) {
 }
 
 void jaiRegisterErrorClasses(void) {
-    /* Error first and complete: every defineErrorClass below copies its fields
-     * and methods down, so nothing may be added to Error after this point. */
     ObjClass *error = defineErrorClass("Error", NULL);
     vm.cError = error;                    /* also makes it a GC root */
     addErrorFields(error);
@@ -269,8 +255,6 @@ void jaiRegisterErrorClasses(void) {
 Value jaiMakeException(ObjClass *klass, const char *message) {
     ObjClass *k = (klass != NULL) ? klass : vm.cError;
     if (k == NULL) {
-        /* Nothing can be thrown before the hierarchy exists, and pretending
-         * otherwise would hand the VM a null exception to unwind with. */
         JAI_PANIC("jaiMakeException called before jaiRegisterErrorClasses");
     }
 
@@ -278,8 +262,6 @@ Value jaiMakeException(ObjClass *klass, const char *message) {
     ObjInstance *inst = jaiInstanceNew(k);
     jaiGCPushRoot(OBJ_VAL(inst));
 
-    /* init is deliberately not called: this path must stay allocation-only so
-     * that throwing from inside a native cannot re-enter the interpreter. */
     ObjString *text = jaiStringNew(message != NULL ? message : "",
                                    message != NULL ? strlen(message) : 0);
     if (text == NULL) {
@@ -292,8 +274,6 @@ Value jaiMakeException(ObjClass *klass, const char *message) {
 
     ObjString *name = (vm.strMessage != NULL) ? vm.strMessage
                                               : jaiStringInternC("message");
-    /* A class with no message field is not part of this hierarchy; it still
-     * gets an instance, just nowhere to record the text. */
     int slot = (name != NULL) ? jaiClassFieldSlot(k, name) : -1;
     if (slot >= 0 && text != NULL) setFieldAt(inst, (uint16_t)slot, OBJ_VAL(text));
 

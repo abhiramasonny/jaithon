@@ -23,10 +23,6 @@ from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, Span, TypeEx
 from jaithon.ast import _ELEMENT_TAG, _RECORDS, _default_field, fields_of, kind_from_name, kind_name
 from jaithon.ast import op_from_name, op_name, op_text
 
-# The C enum name of each `Visibility`/`DeclKind`/`CompKind`/`TypeKind` value,
-# and each one's reverse lookup for `from_json`. Parallel to ast.jai's own
-# `_KIND_NAMES`/`_OP_NAMES` tables, kept here because `to_sexp` and the JSON
-# codec below are the only readers.
 let _VISIBILITY_NAMES: dict[Visibility, str] = {
     Visibility.Private: "AST_VIS_PRIVATE",
     Visibility.Protected: "AST_VIS_PROTECTED",
@@ -64,14 +60,6 @@ let _TYPE_KIND_BY_NAME: dict[str, TypeKind] = {name: value for (value, name) in 
 # ------------------------------------------------------------------
 # S-expression printing
 # ------------------------------------------------------------------
-#
-# `jaiAstPrint` in src/lang/ast.c, which is what `jaithon ast` and the prompt's
-# `:ast` print. The shape is `(kind attr=value` followed by one line per child
-# slot, and an absent optional slot prints `nil` so that positional slots stay
-# unambiguous in a golden.
-#
-# `scripts/ast_parity.sh` diffs this against the C printer over every source in
-# the tree. That script exists only while both printers do.
 fn _emit(out: StringBuilder, text: str) -> void {
     out.push(text)
 }
@@ -243,9 +231,6 @@ fn _record_int(record: dict[str, any], key: str) -> int {
     return 0
 }
 
-# The per-kind body: attributes first, in the order `fields_of` lists them,
-# then one line per child slot. A transliteration of the switch in
-# `printNode` (src/lang/ast.c), checked against it by scripts/ast_parity.sh.
 fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
     match node.kind {
         NodeKind.IntLit => { _emit(out, " " + str(node.number("intLit"))) }
@@ -256,7 +241,6 @@ fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
 
         NodeKind.BoolLit => { _emit(out, if node.flag("boolLit") { " true" } else { " false" }) }
 
-        # The kind tag is the whole node.
         NodeKind.NullLit | NodeKind.Self | NodeKind.Super => { }
 
         NodeKind.FString => { _children(out, node.child_list("parts"), child) }
@@ -501,7 +485,6 @@ fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
                 _emit(out, "(field")
                 _name_attr(out, "name", _record_str(current, "name"))
                 _type_attr(out, "type", _record_type(current, "type"))
-                # A field's visibility prints even when private; a declaration's does not.
                 let field_vis: Visibility = current.get("visibility", Visibility.Private)
                 _emit(out, f" vis={_VISIBILITY_NAMES[field_vis]}")
                 if _record_flag(current, "isStatic") { _emit(out, " static") }
@@ -604,7 +587,6 @@ fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
             _name_attr(out, "typeName", node.opt_text("typeName"))
             _name_attr(out, "variantName", node.opt_text("variantName"))
             let names = node.get("fieldNames")
-            # A null name is a positional sub-pattern; a named one gets its own line.
             for (index, sub) in node.child_list("subPatterns").enumerate() {
                 let name = at_or_null(names, index)
                 if name is null {
@@ -729,7 +711,6 @@ fn _type_value(type_expr: TypeExpr?) -> any {
     }
 }
 
-# JSON has no infinity or NaN, so the C writes them as strings and so do we.
 fn _float_value(value: float) -> any {
     if is_nan(value) { return "NaN" }
     if is_inf(value) {

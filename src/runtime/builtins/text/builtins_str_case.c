@@ -24,16 +24,8 @@
 /* Unicode: simple case mapping and classification                      */
 /* ------------------------------------------------------------------ */
 
-/* The case tables below cover the scripts whose casing is algorithmic —
- * Latin, Greek, Cyrillic, Armenian, the fullwidth forms and Deseret — which is
- * every simple (1:1) case pair reachable without shipping UnicodeData.txt into
- * the core. Anything else maps to itself. Multi-scalar mappings (ß -> SS, the
- * Turkish dotted i) are deliberately absent: they are locale-dependent, and
- * std.str layers them on top where a locale is available. */
-
 typedef struct { int32_t lo, hi; } CpRange;
 
-/* The range tables are sorted, so a miss costs log2(n) comparisons. */
 static inline bool inRanges(int32_t cp, const CpRange *ranges, size_t count) {
     size_t lo = 0, hi = count;
 
@@ -50,7 +42,6 @@ static inline bool inRanges(int32_t cp, const CpRange *ranges, size_t count) {
     return false;
 }
 
-/* Blocks laid out as (even = capital, odd = small) pairs, and the reverse. */
 static inline int32_t evenPair(int32_t c, bool up) {
     return up ? ((c & 1) ? c - 1 : c) : ((c & 1) ? c : c + 1);
 }
@@ -134,7 +125,6 @@ static inline int32_t lowerCp(int32_t c) {
     return caseMap(c, false);
 }
 
-/* A scalar is cased when either mapping moves it. */
 static inline bool isCasedCp(int32_t c) {
     return upperCp(c) != c || lowerCp(c) != c;
 }
@@ -147,8 +137,6 @@ static const CpRange kDigitRanges[] = {
     {0x1D7CE, 0x1D7FF},
 };
 
-/* Letters that no case mapping reaches: uncased scripts and the modifier
- * letters. Cased scalars are recognised by isCasedCp and are not repeated. */
 static const CpRange kLetterRanges[] = {
     {0x00AA, 0x00AA}, {0x00BA, 0x00BA}, {0x01BB, 0x01BB}, {0x01C0, 0x01C3},
     {0x0294, 0x0294}, {0x02B0, 0x02C1}, {0x0370, 0x0374}, {0x037A, 0x037A},
@@ -200,12 +188,9 @@ bool isSpaceCp(int32_t c) {
 /* upper / lower / title / capitalize                                   */
 /* ------------------------------------------------------------------ */
 
-/* Shared body for upper/lower: `up` selects the mapping direction. */
 static bool mapCase(ObjString *s, bool up, Value *out) {
     const size_t length = (size_t)s->length;
 
-    /* Pure ASCII is overwhelmingly common and case mapping cannot change its
-     * byte length, so write the result exactly once. */
     bool ascii = true;
     for (size_t i = 0; i < length; ++i) {
         if ((unsigned char)s->chars[i] & 0x80u) {
@@ -465,7 +450,6 @@ static inline bool cpInSet(int32_t cp, ObjString *set) {
     return false;
 }
 
-/* Shared body for strip/lstrip/rstrip. A NULL set means "whitespace". */
 static bool stripSides(ObjString *s, ObjString *set, bool left, bool right,
                        Value *out) {
     const char *begin = s->chars;
@@ -559,8 +543,6 @@ bool strRstrip(int argc, Value *args, Value *out) {
 /* is_digit / is_alpha / is_alnum / is_space / is_upper / is_lower       */
 /* ------------------------------------------------------------------ */
 
-/* Shared body for the is_* predicates. `kind` selects the test; every one of
- * them is false for the empty string, since no scalar satisfies it. */
 typedef enum { CLASS_DIGIT, CLASS_ALPHA, CLASS_ALNUM, CLASS_SPACE,
                CLASS_UPPER, CLASS_LOWER } CharClass;
 
@@ -716,7 +698,6 @@ bool strIsLower(int argc, Value *args, Value *out) {
 /* pad_left / pad_right / center / repeat                               */
 /* ------------------------------------------------------------------ */
 
-/* The fill argument of pad_left/pad_right/center: exactly one scalar. */
 static bool fillScalar(int argc, Value *args, int slot, const char *method,
                        const char **outBytes, int *outLen) {
     *outBytes = " ";

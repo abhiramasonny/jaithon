@@ -216,7 +216,6 @@ const char *jaiDiagCodeString(JaiDiagCode code) {
     return b;
 }
 
-// "E0402" or "W0101" back to the code it names, or JAI_OK
 JaiDiagCode jaiDiagCodeFromString(const char *text) {
     if (text == NULL || (text[0] != 'E' && text[0] != 'W')) return JAI_OK;
     int value = 0;

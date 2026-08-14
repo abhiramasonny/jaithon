@@ -1,7 +1,4 @@
 # expect: E0705
-# A requirement written `-> Self` substitutes to the implementing class, so an
-# implementation returning anything else is not compatible (spec §7.2).
-
 trait Scalable {
     fn scale(self, factor: int) -> Self
 }

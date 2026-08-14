@@ -94,9 +94,6 @@ pub fn bwt_decode(last_column: str, row: int) -> str {
         return ""
     }
     if row < 0 or row >= n { throw ValueError(f"row must be in 0..{n}, got {row}") }
-    # rank[i] counts the copies of chars[i] before position i. The i-th copy of
-    # a character in the last column is also the i-th in the sorted first
-    # column, and that correspondence is the whole of the LF mapping.
     let counts: dict[str, int] = {}
     let rank = [0 for _ in 0..n]
     for i in 0..n {
@@ -121,8 +118,6 @@ pub fn bwt_decode(last_column: str, row: int) -> str {
     return "".join(out)
 }
 
-# Duplicated in every sibling file that needs O(1) random access into a string
-# rather than repeated O(n) slicing: too small to be worth a shared import for.
 fn _chars(text: str) -> list[str] {
     let out: list[str] = []
     for ch in text { out.push(ch) }
@@ -160,8 +155,6 @@ fn _rotation_order(codes: list[int]) -> list[int] {
             index += 1
         }
         rank = updated
-        # Every rotation now has a rank of its own: no later round can separate
-        # them further.
         if rank[order[n - 1]] == n - 1 { break }
         step = step * 2
     }

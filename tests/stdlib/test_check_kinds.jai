@@ -15,8 +15,6 @@ fn test_there_are_twenty_one_kinds() -> void {
 }
 
 fn test_ordinals_match_the_c_enum_position_for_position() -> void {
-    # src/sema/types.h:14-36, in declaration order. Written out rather than
-    # derived, so that this test disagrees with KINDS when either moves.
     let expected = [
         (TyKind.Any, 0),
         (TyKind.Never, 1),
@@ -54,15 +52,10 @@ fn test_every_kind_has_exactly_one_ordinal() -> void {
 }
 
 fn test_the_orders_that_the_measured_union_renderings_imply() -> void {
-    # `float | bool | int` renders `bool | int | float`, so BOOL < INT < FLOAT.
     assert_true(ordinal(TyKind.Bool) < ordinal(TyKind.Int))
     assert_true(ordinal(TyKind.Int) < ordinal(TyKind.Float))
-    # `list[int] | dict[str, int] | set[int]` renders unchanged, so the three
-    # are already in ordinal order.
     assert_true(ordinal(TyKind.List) < ordinal(TyKind.Dict))
     assert_true(ordinal(TyKind.Dict) < ordinal(TyKind.Set))
-    # Null sorts near the front but is forced last when rendered; the ordinal
-    # is what makes that a special case rather than a consequence.
     assert_true(ordinal(TyKind.Null) < ordinal(TyKind.Int))
 }
 
@@ -75,7 +68,6 @@ fn test_the_primitive_spellings() -> void {
     assert_eq(PRIMITIVE_SPELLING[TyKind.Bytes], "bytes")
     assert_eq(PRIMITIVE_SPELLING[TyKind.Range], "range")
     assert_eq(PRIMITIVE_SPELLING[TyKind.Null], "null")
-    # A composite renders from its parts and so has no entry here.
     assert_true(TyKind.List not in PRIMITIVE_SPELLING)
     assert_true(TyKind.Class not in PRIMITIVE_SPELLING)
 }

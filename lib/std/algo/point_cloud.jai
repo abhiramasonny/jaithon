@@ -46,7 +46,6 @@ pub fn convex_hull(points: list[Point2]) -> list[Point2] {
         _push_turning_left(upper, ordered[index])
         index -= 1
     }
-    # Each chain ends where the other begins; drop the duplicated endpoints.
     lower.pop()
     upper.pop()
     return lower + upper
@@ -150,8 +149,6 @@ pub fn diameter(points: list[Point2]) -> tuple[Point2, Point2, float] {
     var opposite = 1
     for index in 0..count {
         let next = (index + 1) % count
-        # Advance the opposite vertex while it keeps moving away from this
-        # edge. The bound only guards against a tie cycling forever.
         var steps = 0
         loop {
             if steps >= count { break }
@@ -297,8 +294,6 @@ fn _closest_pair_of(
     }
     for i in 0..strip.len() {
         var j = i + 1
-        # The y ordering bounds this inner loop at a constant number of steps:
-        # past `best` in y no pair can improve on `best` in distance.
         while j < strip.len() and points[strip[j]].y - points[strip[i]].y < best {
             let gap = points[strip[i]].distance(points[strip[j]])
             if gap < best {
@@ -372,7 +367,6 @@ fn _circle_through_two(first: Point2, second: Point2) -> Circle {
 #: Return the smallest circle through three points, collinear ones included.
 fn _circle_through_three(a: Point2, b: Point2, c: Point2) -> Circle {
     if orientation(a, b, c) != 0 { return circle_from_points(a, b, c) }
-    # Collinear: the outermost two points span the whole set.
     var best = _circle_through_two(a, b)
     let with_c = _circle_through_two(a, c)
     if with_c.radius > best.radius { best = with_c }

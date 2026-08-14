@@ -49,8 +49,6 @@ class Holder {
     pub fn init(self, inner) { self.inner = inner }
 }
 
-# The pool-ordering regression: `h.inner.n` names `n` and `inner`, and the two
-# front ends have to intern them in the same order.
 fn nested_assign(h, v) {
     h.inner.n = v
     h.inner.n += 1

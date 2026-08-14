@@ -84,8 +84,6 @@ fn test_every_public_declaration_reaches_the_page() -> void {
     for name in ["Colour", "Drawable", "Circle", "paint", "radius", "draw", "Red", "Blue"] {
         assert_true(name in page)
     }
-    # A class's methods, a trait's requirement and an enum's variants all carry
-    # their doc text, which is the whole point of extracting it.
     assert_true("The warm one." in page)
     assert_true("Draw `self`." in page)
     assert_true("Distance from the centre." in page)
@@ -93,8 +91,8 @@ fn test_every_public_declaration_reaches_the_page() -> void {
 
 fn test_a_declaration_without_a_doc_comment_is_still_listed() -> void {
     let page = render_markdown(_shape(), [_shape()])
-    assert_true("*Undocumented.*" in page)          # Circle.draw
-    assert_true("`Blue` — *undocumented*" in page)  # a variant, listed inline
+    assert_true("*Undocumented.*" in page)
+    assert_true("`Blue` — *undocumented*" in page)
 }
 
 fn test_a_signature_links_to_the_types_it_names() -> void {
@@ -105,7 +103,6 @@ fn test_a_signature_links_to_the_types_it_names() -> void {
     assert_true(
         "Types: [`Circle`](demo.shapes.md#circle), " + "[`Colour`](demo.shapes.md#colour)" in page
     )
-    # A type does not link to itself: the reader is already there.
     assert_false(
         "## `Circle`\n\n```jai\npub class Circle: Drawable\n```\n\n" + "A round shape.\n\nTypes: [`Circle`]" in
             page
@@ -121,9 +118,8 @@ fn test_the_index_links_every_module_and_counts_the_holes() -> void {
 
 fn test_coverage_counts_members_as_declarations() -> void {
     let (documented, total) = coverage([_shape()])
-    # Four top-level declarations, two variants, one field and two methods.
     assert_eq(total, 9)
-    assert_eq(documented, 7)  # `Blue` and `Circle.draw` carry no `#:` block
+    assert_eq(documented, 7)
 }
 
 fn test_the_search_index_addresses_members_uniquely() -> void {

@@ -42,8 +42,6 @@ static bool missingKeyError(const char *fnName, const char *role, Value key) {
                     text->chars);
 }
 
-/* Nothing here allocates after `out` is sized, so the walk cannot be
- * disturbed by a collection. */
 static ObjList *setElements(ObjSet *s) {
     jaiGCPushRoot(OBJ_VAL(s));
     ObjList *out = jaiListNew(s->table.count);
@@ -58,8 +56,6 @@ static ObjList *setElements(ObjSet *s) {
     return out;
 }
 
-/* Either way exactly one temp root is pushed here, which the caller pops
- * when done. */
 static bool operandSet(Value v, const char *fnName, ObjSet **out) {
     if (IS_SET(v)) {
         jaiGCPushRoot(v);
@@ -88,8 +84,6 @@ static bool operandSet(Value v, const char *fnName, ObjSet **out) {
     jaiGCPopRoots(2);
     if (!ok) return false;
 
-    /* No allocation happens between the pops and this push, so `s` cannot be
-     * collected in the gap. */
     jaiGCPushRoot(OBJ_VAL(s));
     *out = s;
     return true;
@@ -222,7 +216,6 @@ static bool dictUpdate(int argc, Value *args, Value *out) {
     ObjDict *other;
     if (!selfDict(args, "dict.update", &self)) return false;
     if (!jaiArgDict(args[1], 1, "dict.update", &other)) return false;
-    /* AddAll reuses the stored hashes, so no user __hash__ runs mid-copy. */
     jaiTableAddAll(&other->table, &self->table);
     *out = args[0];
     return true;
@@ -278,8 +271,6 @@ static bool dictGetOrInsert(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The entries are snapshotted first: the callback is user code and may insert
- * into the dict, which would rehash the table under the walk. */
 static bool dictMapValues(int argc, Value *args, Value *out) {
     (void)argc;
     ObjDict *self;
@@ -422,8 +413,6 @@ static bool setClear(int argc, Value *args, Value *out) {
 
 typedef enum { SET_UNION, SET_INTERSECTION, SET_DIFFERENCE, SET_SYMMETRIC } SetOp;
 
-/* The four algebraic operations, which differ only in which side contributes
- * an element and under what membership test. */
 static bool setCombine(int argc, Value *args, Value *out, SetOp op,
                        const char *fnName) {
     (void)argc;
@@ -489,7 +478,6 @@ static bool setSymmetricDifference(int argc, Value *args, Value *out) {
     return setCombine(argc, args, out, SET_SYMMETRIC, "set.symmetric_difference");
 }
 
-/* Containment one way or the other: `wantSuper` swaps which side is walked. */
 static bool setContainment(int argc, Value *args, Value *out, bool wantSuper,
                            const char *fnName) {
     (void)argc;
@@ -553,8 +541,6 @@ static bool setToList(int argc, Value *args, Value *out) {
 
 static const JaiSeqMethod kDictMethods[] = {
     JAI_METHOD("clear",         dictClear,       1, 1),
-    /* `contains` mirrors every other container (spec §5.5); `has` stays too
-     * since lib/std was written against it. */
     JAI_METHOD("contains",      dictHas,         2, 2),
     JAI_METHOD("copy",          dictCopy,        1, 1),
     JAI_METHOD("filter",        dictFilter,      2, 2),
@@ -568,8 +554,6 @@ static const JaiSeqMethod kDictMethods[] = {
     JAI_METHOD("map_values",    dictMapValues,   2, 2),
     JAI_METHOD("merge",         dictMerge,       2, 2),
     JAI_METHOD("pop",           dictPop,         2, 3),
-    /* `remove`, not `delete`: list and set both spell it that way, and every
-     * caller in lib/std was written against that name. */
     JAI_METHOD("remove",        dictDelete,      2, 2),
     JAI_METHOD("set",           dictSet,         3, 3),
     JAI_METHOD("update",        dictUpdate,      2, 2),
@@ -742,8 +726,6 @@ static bool primSetLen(int argc, Value *args, Value *out) {
 /* Registration                                                         */
 /* ------------------------------------------------------------------ */
 
-/* The set primitives ride along here: Appendix C lists them beside the dict
- * ones, and runtime.h declares no separate registrar for them. */
 void jaiRegisterDictPrimitives(void) {
     jaiDefineNative("__prim__.dict_new",    primDictNew,    0, 0);
     jaiDefineNative("__prim__.dict_get",    primDictGet,    2, 3);

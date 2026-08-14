@@ -75,8 +75,6 @@ fn test_containers_nest() -> void {
 }
 
 fn test_a_tuple_is_parenthesised_not_bracketed() -> void {
-    # Written `tuple[int, str]`, rendered `(int, str)`. A one-member tuple has
-    # no trailing comma and an empty one is `()`.
     assert_eq(render(_tuple([INT, STR])), "(int, str)")
     assert_eq(render(_tuple([INT])), "(int)")
     assert_eq(render(_tuple([])), "()")
@@ -89,20 +87,16 @@ fn test_the_functions() -> void {
 }
 
 fn test_a_function_with_no_written_return_is_any() -> void {
-    # Null `ret` means none was written; a `Null` ret is what `-> void` means.
     assert_eq(render(_fn([INT], null)), "fn(int) -> any")
     assert_eq(render(_fn([INT], NULL)), "fn(int) -> void")
 }
 
 fn test_the_variadic_and_kwrest_markers() -> void {
-    # Neither marker carries a trailing space.
     assert_eq(render(_fn([INT, _list(STR)], NULL, FN_VARIADIC)), "fn(int, ...list[str]) -> void")
     assert_eq(
         render(_fn([INT, _dict(STR, ANY)], NULL, FN_KWREST)),
         "fn(int, **dict[str, any]) -> void"
     )
-    # With both, `...` sits one before the `**`, because the variadic index is
-    # keyed on whether a kwrest parameter is present rather than on the flag.
     assert_eq(
         render(_fn([INT, _list(STR), _dict(STR, ANY)], NULL, FN_VARIADIC | FN_KWREST)),
         "fn(int, ...list[str], **dict[str, any]) -> void"
@@ -139,22 +133,17 @@ fn test_a_two_member_union_with_null_is_the_optional_sugar() -> void {
 }
 
 fn test_the_sugar_is_refused_for_a_function_or_a_union() -> void {
-    # `fn() -> int?` would read back as a function returning `int?`.
     assert_eq(render(_union([NULL, _fn([], INT)])), "fn() -> int | null")
     assert_eq(render(_union([NULL, _union([INT, STR])])), "int | str | null")
 }
 
 fn test_null_is_rendered_last_whatever_position_it_holds() -> void {
-    # Members arrive in intern order, which sorts null near the front. It is
-    # moved to the end when rendered.
     assert_eq(render(_union([NULL, INT, STR])), "int | str | null")
     assert_eq(render(_union([INT, NULL, STR])), "int | str | null")
     assert_eq(render(_union([INT, STR, NULL])), "int | str | null")
 }
 
 fn test_a_union_renders_its_members_in_the_order_it_holds_them() -> void {
-    # render does not sort. The sort happens when the union is interned, and
-    # these are the orders the C was measured to produce.
     assert_eq(render(_union([BOOL, INT, FLOAT])), "bool | int | float")
     assert_eq(render(_union([INT, FLOAT, STR])), "int | float | str")
     assert_eq(
@@ -168,9 +157,6 @@ fn test_a_union_of_one_still_renders() -> void {
 }
 
 fn test_a_deeply_nested_type_is_truncated() -> void {
-    # The top level is depth 0 and the guard is strictly greater than 32, so
-    # the first `...` appears at the thirty-fourth level. Thirty-three nested
-    # lists therefore still render in full.
     var deep = INT
     for _step in range(40) { deep = _list(deep) }
     let text = render(deep)

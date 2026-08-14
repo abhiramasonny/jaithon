@@ -1,31 +1,5 @@
 /* builtins_thread.c — threads, mutexes, condition variables and atomics
- * (spec Appendix C), plus cpu_count.
- *
- * Split out of builtins_io.c, which explains what else moved and why.
- * cpu_count is a Host fact, not a thread primitive, but it has always been
- * registered here rather than with the filesystem/environment group in
- * builtins_fs.c: the one thing that number is for is sizing a thread pool,
- * so its registration stayed next to what reads it, and the move kept that
- * call site intact rather than routing it through a cross-file declaration
- * for a two-line function.
- *
- * A spawned thread must not touch VM state. Nothing in the VM is
- * synchronised: the allocator keeps one byte counter, the collector
- * stops the world it can see, the intern table is a plain hash table,
- * and every Value is a pointer into a heap only the collector may
- * move through. A second thread inside any of that is a data race, not
- * a slow program.
- *
- * So this is not a documented rule, it is an enforced one: thread_spawn
- * refuses anything but a native primitive, and the worker receives two
- * plain integers — the address and the length of a private copy of the
- * caller's buffer. No Value it is handed refers to the heap, and only
- * an int comes back. A Jaithon closure cannot be passed at all, which
- * is the whole point: there is no way to express the unsafe thing.
- *
- * The thread, mutex, condition and atomic handles below come from the
- * shared table in handles.c.
- */
+ * (spec Appendix C), plus cpu_count. */
 
 #include "runtime/runtime.h"
 #include "runtime/handles.h"
@@ -35,15 +9,12 @@
 typedef struct {
     JaiThread       *thread;
     JaiNativeFn      fn;
-    uint8_t         *payload;      /* private copy, off the GC heap */
+    uint8_t         *payload;
     size_t           payloadLength;
     int64_t          result;
-    volatile int64_t finished;     /* the worker's only word of shared state */
+    volatile int64_t finished;
 } ThreadTask;
 
-/* Detached tasks nobody will ever join. They are reclaimed the next time a
- * thread primitive runs and finds one whose worker has finished, which bounds
- * the outstanding memory by the number of threads still running. */
 static ThreadTask **gDetached;
 static int           gDetachedCount;
 static int           gDetachedCapacity;
@@ -78,9 +49,6 @@ static void rememberDetached(ThreadTask *task) {
     gDetached[gDetachedCount++] = task;
 }
 
-/* Runs on the worker thread. Everything it touches is either on its own stack
- * or in the private payload; the two Values it builds are integers, so no
- * heap object is read, written or allocated. */
 static void *threadEntry(void *arg) {
     ThreadTask *task = (ThreadTask *)arg;
     Value args[2] = {
@@ -129,8 +97,6 @@ static bool nThreadSpawn(int argc, Value *args, Value *out) {
     memset(task, 0, sizeof *task);
     task->fn = worker->fn;
     if (length > 0) {
-        /* A copy, not the bytes object: the worker must not be able to reach
-         * anything the collector owns. */
         task->payload = JAI_ALLOC(uint8_t, length);
         memcpy(task->payload, data, length);
         task->payloadLength = length;
@@ -174,7 +140,6 @@ static bool nThreadDetach(int argc, Value *args, Value *out) {
 
     jaiThreadDetach(task->thread);
     jaiHandleRelease(AS_INT(args[0]));
-    /* The worker still owns its payload, so the record outlives the handle. */
     rememberDetached(task);
     reapDetached();
 
@@ -245,8 +210,6 @@ static bool nCondNew(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The mutex must be held by this thread; it is released while waiting and
- * reacquired before the call returns, as the underlying primitive requires. */
 static bool nCondWait(int argc, Value *args, Value *out) {
     (void)argc;
     void *condPtr, *mutexPtr;
@@ -289,8 +252,6 @@ static bool nCondFree(int argc, Value *args, Value *out) {
 /* Atomics                                                              */
 /* ------------------------------------------------------------------ */
 
-/* An atomic cell is one int64 outside the GC heap, so a worker thread can
- * update it without any collector interaction. */
 static bool nAtomicNew(int argc, Value *args, Value *out) {
     int64_t initial = 0;
     if (argc >= 1 && !IS_NULL(args[0]) &&
@@ -354,8 +315,6 @@ static bool nAtomicExchange(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Returns the value the cell held *before* the addition, as fetch-and-add
- * does everywhere else. */
 static bool nAtomicAdd(int argc, Value *args, Value *out) {
     (void)argc;
     volatile int64_t *cell;

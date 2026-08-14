@@ -41,7 +41,7 @@ print(p == Point(0.0, 0.0))
 # --- visibility is enforced -------------------------------------------------
 class Account {
     pub var owner: str
-    var balance: float  # private: no `pub`
+    var balance: float
 
     fn init(self, owner: str, opening: float) {
         self.owner = owner
@@ -105,7 +105,7 @@ class Dog extends Animal {
 
 let d = Dog("Rex", "Husky")
 print(d.speak())
-print(d.describe())  # dynamic dispatch through the parent
+print(d.describe())
 print(d.parent_speak())
 print(d.breed)
 print(isinstance(d, Animal))
@@ -145,7 +145,7 @@ fn total_area(shapes: list[Shape]) -> float {
 let shapes: list[Shape] = [Circle(1.0), Square(2.0)]
 print(f"{total_area(shapes):.4f}")
 print(shapes[0].name())
-print(shapes[1].name())  # the trait's default implementation
+print(shapes[1].name())
 
 # --- properties -------------------------------------------------------------
 class Rect {

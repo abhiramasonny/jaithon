@@ -16,8 +16,6 @@ static bool selfList(Value *args, const char *fnName, ObjList **out) {
     return true;
 }
 
-/* An omitted argument and an explicit `null` mean the same thing for every
- * optional parameter here: use the default. */
 static bool optIntArg(int argc, Value *args, int index, const char *fnName,
                       int64_t fallback, int64_t *out) {
     Value v = jaiSeqOptArg(argc, args, index);
@@ -60,7 +58,6 @@ static bool addI64(int64_t a, int64_t b, int64_t *out) {
     return true;
 }
 
-/* "These two have no order" is a TypeError for every caller in this file. */
 static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
     if (jaiValueCompare(a, b, out)) return true;
     if (vm.hasException) return false;
@@ -68,7 +65,6 @@ static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
                     jaiTypeNameStatic(a), jaiTypeNameStatic(b));
 }
 
-/* No truthiness in Jaithon (spec §2.6): a predicate must return bool, not coerce. */
 static bool callPredicate(Value pred, Value item, const char *fnName, bool *out) {
     Value arg = item, verdict;
     if (!jaiCallFn1(pred, arg, &verdict)) return false;
@@ -85,8 +81,6 @@ static bool callPredicate(Value pred, Value item, const char *fnName, bool *out)
 /* Stable sort over an index permutation                                */
 /* ------------------------------------------------------------------ */
 
-/* Values stay in GC-visible lists; only indices are raw C ints, so GC during a
- * user key/__lt__ call cannot invalidate anything here. */
 static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                              bool reverse, const char *fnName) {
     for (int width = 1; width < n; width *= 2) {
@@ -100,8 +94,6 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                                     fnName, &order))
                     return false;
                 if (reverse) order = -order;
-                /* Take from the right half only when strictly smaller: keeps the
-                 * sort stable and stops `reverse` from reordering equal elements. */
                 scratch[k++] = order < 0 ? idx[b++] : idx[a++];
             }
             while (a < mid) scratch[k++] = idx[a++];
@@ -112,8 +104,6 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
     return true;
 }
 
-/* Calls `keyFn` exactly once per element. Leaves two temp roots (items, keys)
- * on the stack on success, which the caller pops together. */
 static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
                             ObjList **outKeys) {
     ObjList *items = jaiListNew(source->count);
@@ -123,7 +113,6 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
     }
 
     if (IS_NULL(keyFn)) {
-        /* Push the same list twice so the caller always pops two roots. */
         jaiGCPushRoot(OBJ_VAL(items));
         *outItems = items;
         *outKeys = items;
@@ -139,7 +128,7 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
             return false;
         }
         jaiGCPushRoot(key);
-        jaiListPush(keys, key);          /* capacity reserved: cannot allocate */
+        jaiListPush(keys, key);
         jaiGCPopRoot();
     }
     *outItems = items;
@@ -147,8 +136,6 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
     return true;
 }
 
-/* `items` and `keys` must be rooted by the caller and have the same length;
- * `keys` is `items` itself when there is no key function. */
 static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
                            const char *fnName) {
     int n = items->count;
@@ -193,8 +180,6 @@ static ObjList *sortedList(ObjList *source, Value keyFn, bool reverse,
 /* Shuffling                                                            */
 /* ------------------------------------------------------------------ */
 
-/* std.random owns the language-level generator; shuffle only needs a stream of
- * its own, seeded once. xoshiro256** over a splitmix64 seed. */
 static uint64_t gShuffleState[4];
 static bool     gShuffleSeeded;
 
@@ -229,8 +214,6 @@ static uint64_t shuffleNext(void) {
     return result;
 }
 
-/* Unbiased value in [0, bound): reject everything above the largest multiple
- * of `bound` that fits in 64 bits. */
 static uint64_t shuffleBelow(uint64_t bound) {
     uint64_t zone = UINT64_MAX - (UINT64_MAX % bound);
     uint64_t r;
@@ -244,7 +227,6 @@ static uint64_t shuffleBelow(uint64_t bound) {
 /* Text assembly                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Consumes `buf` either way, even on failure. */
 static bool takeString(JaiBuf *buf, Value *out) {
     size_t length = 0;
     char *chars = jaiBufTakeCString(buf, &length);
@@ -252,7 +234,7 @@ static bool takeString(JaiBuf *buf, Value *out) {
         return jaiThrow(vm.cRuntimeError, "out of memory building a string");
     }
     ObjString *text = jaiStringTake(chars, length);
-    if (text == NULL) return false;       /* over the length limit; it threw */
+    if (text == NULL) return false;
     *out = OBJ_VAL(text);
     return true;
 }
@@ -295,8 +277,6 @@ static bool listPop(int argc, Value *args, Value *out) {
     return !vm.hasException;
 }
 
-/* An out-of-range index clamps to an end, as it does in Python: insert is the
- * one position argument for which "past the end" has an obvious meaning. */
 static bool listInsert(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -322,7 +302,6 @@ static bool listRemove(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.remove", &self)) return false;
 
-    /* The count is re-read because a user __eq__ may resize the list. */
     for (int i = 0; i < self->count; i++) {
         bool same;
         if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
@@ -349,8 +328,6 @@ static bool listClear(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
     if (!selfList(args, "list.clear", &self)) return false;
-    /* The capacity is kept: a cleared list is usually about to be refilled,
-     * and the stale slots past `count` are never traced. */
     self->count = 0;
     jaiListTouch(self);
     *out = args[0];
@@ -362,8 +339,6 @@ static bool listExtend(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.extend", &self)) return false;
 
-    /* Snapshot first, so that `xs.extend(xs)` terminates instead of tripping
-     * the iterator's mutation check. */
     ObjList *items = jaiSeqCollectIterable(args[1]);
     if (items == NULL) return false;
     jaiGCPushRoot(OBJ_VAL(items));
@@ -468,8 +443,6 @@ static bool listSort(int argc, Value *args, Value *out) {
     if (self->count != n) {
         return jaiThrow(vm.cRuntimeError, "list.sort(): list changed size during the sort");
     }
-    /* Nothing allocates between here and the copy, so `sorted` stays alive
-     * without a root. */
     if (n > 0) {
         memcpy(self->items, sorted->items, sizeof(Value) * (size_t)n);
         jaiListTouch(self);
@@ -500,8 +473,6 @@ static bool listSlice(int argc, Value *args, Value *out) {
     if (!optIntArg(argc, args, 3, "list.slice", 1, &step)) return false;
     if (step == 0) return jaiThrow(vm.cValueError, "list.slice(): step cannot be zero");
 
-    /* The defaults depend on the direction of travel: INT64_MIN and INT64_MAX
-     * clamp to "one before the start" and "one past the end". */
     int64_t start, stop;
     if (!optIntArg(argc, args, 1, "list.slice", step > 0 ? 0 : INT64_MAX, &start))
         return false;
@@ -542,8 +513,6 @@ static bool listMap(int argc, Value *args, Value *out) {
             ok = false;
             break;
         }
-        /* No root needed: `result` is pre-sized and nothing else here allocates
-         * (rooting per element cost 30% of this loop). Slow path covers callback growth. */
         if (JAI_LIKELY(result->count < result->capacity)) {
             result->items[result->count++] = mapped;
             result->version++;
@@ -594,16 +563,12 @@ static bool listFilter(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* reduce(f) folds from the first element; reduce(init, f) starts at `init` and
- * is total over the empty list. Combine is always last, matching std.core's fold. */
 static bool listReduce(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.reduce", &self)) return false;
     Value combine = argc >= 3 ? args[2] : args[1];
     if (!jaiArgCallable(combine, argc >= 3 ? 2 : 1, "list.reduce")) return false;
 
-    /* A null seed is the seedless form: that is what a keyword call leaves in
-     * the hole when only `combine` is named. */
     int start = 0;
     Value acc;
     if (argc >= 3 && !IS_NULL(args[1])) {
@@ -626,8 +591,6 @@ static bool listReduce(int argc, Value *args, Value *out) {
             ok = false;
             break;
         }
-        /* The accumulator is a fresh object more often than not, so it is
-         * re-rooted rather than left behind on the previous root. */
         jaiGCPopRoot();
         acc = next;
         jaiGCPushRoot(acc);
@@ -722,7 +685,6 @@ static bool listSum(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Each element's key is computed once, as for sort, not once per comparison. */
 static bool listExtremum(int argc, Value *args, Value *out, bool wantMax) {
     const char *fnName = wantMax ? "list.max" : "list.min";
     ObjList *self;
@@ -789,7 +751,6 @@ static bool listLast(int argc, Value *args, Value *out) {
     return listEnd(argc, args, out, true);
 }
 
-/* Elements go through str(), so join is total over any list (never a TypeError). */
 static bool listJoin(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.join", &self)) return false;
@@ -817,7 +778,6 @@ static bool listJoin(int argc, Value *args, Value *out) {
     return takeString(&buf, out);
 }
 
-/* One level deep: every element must itself be iterable. */
 static bool listFlatten(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -961,7 +921,6 @@ static bool listWindow(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* `null` is tracked separately since it cannot be a set/table key. */
 static bool listUnique(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -1026,8 +985,6 @@ static bool listShuffle(int argc, Value *args, Value *out) {
 /* Method table                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Names trailing optional params for keyword calls like `xs.sorted(reverse:
- * true)`; index 0 is the receiver "self", which callers can never name. */
 static const char *const kSelfKey[]        = {"self", "key"};
 static const char *const kSelfKeyReverse[] = {"self", "key", "reverse"};
 static const char *const kSelfPredicate[]  = {"self", "predicate"};
@@ -1087,11 +1044,6 @@ bool jaiListMethod(Value receiver, ObjString *name, Value *out) {
 /* __prim__.list_*                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Thin layer std.list/std.dict are written over: one C op each, same errors as
- * the methods, no defaulting beyond an omitted slice bound. */
-
-/* No receiver here, so args[i] is the user's argument i+1; methods above pass
- * the index straight through since their args[0] is the receiver. */
 static bool optIntPrim(int argc, Value *args, int index, const char *fnName,
                        int64_t fallback, int64_t *out) {
     Value v = jaiSeqOptArg(argc, args, index);

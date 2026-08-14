@@ -192,8 +192,6 @@ pub class BinarySearchTree[K, V] {
         }
         if current == null { return false }
         if current.left != null and current.right != null {
-            # `current.right` was just proven non-null, but fields aren't
-            # narrowing targets (spec §2.1) — restate it via a local.
             var successor_parent = current
             var successor = current.right ?? (throw RuntimeError("bst: right child vanished"))
             var lower = successor.left
@@ -302,8 +300,6 @@ pub class BinarySearchTree[K, V] {
         while stack.len() > 0 {
             let node = stack.pop()
             visited.push(node)
-            # Left is pushed first so the right subtree is visited first; the
-            # reversal at the end turns root-right-left into left-right-root.
             if node.left != null { stack.push(node.left) }
             if node.right != null { stack.push(node.right) }
         }
@@ -579,8 +575,6 @@ pub class AVLTree[K, V] {
                 self.count -= 1
                 return node.left
             }
-            # count is decremented once, inside the recursive call below — not
-            # again here.
             var successor = node.right
             while successor.left != null { successor = successor.left }
             node.key = successor.key

@@ -1,5 +1,4 @@
 # expect: E0705
-# A class listing a trait must implement every required method.
 
 trait Shape {
     fn area(self) -> float

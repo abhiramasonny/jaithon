@@ -53,9 +53,6 @@ JAI_NORETURN void jaiPanic(const char *file, int line, const char *fmt, ...) {
 
 size_t jaiHeapBytes = 0;
 
-/* Shrinks and frees count too. Tracking only growth left the collector's live
- * total monotonically increasing: nextGC = live * factor then ratcheted upward
- * after every cycle until collections effectively stopped. */
 static inline void accountDelta(size_t oldSize, size_t newSize) {
     if (newSize >= oldSize) {
         jaiHeapBytes += newSize - oldSize;
@@ -71,40 +68,12 @@ static inline void accountDelta(size_t oldSize, size_t newSize) {
 /* Small-object recycling                                              */
 /* ------------------------------------------------------------------ */
 
-/* An interpreted program's heap traffic is overwhelmingly small, uniform and
- * short-lived: a bound method is 48 bytes and dies on the next instruction, a
- * short string is 40 + n, a tuple 32 + 16n. Measured on tests/bench, libc's
- * malloc and free together were 9-17% of a run and nearly everything passing
- * through them was under 128 bytes. Recycling those sizes here costs a shift
- * and two loads on each side, and was worth 10-12% on every benchmark that
- * allocates (and, as it should be, 0% on the two that do not).
- *
- * This works only because oldSize is exact. Every caller reaching jaiRealloc
- * reports the size it was given, which the JAI_*_ARRAY macros derive from the
- * same type and count as the allocation. The two places that did not — the
- * lexer freeing a cooked literal by strlen, io_listdir freeing the name array
- * one pointer short — were found by building with each block carrying its true
- * size and checking every report against it, and are fixed. Re-run that check
- * before trusting a new caller: a lie puts the block in the wrong bin, and the
- * next request served from that bin is short.
- *
- * Bins are never returned to libc. What they hold is bounded by the peak
- * garbage of each size class between collections, which is what libc's own
- * free lists would have held anyway; measured peak RSS moved by under 4%.
- *
- * The three words below are declared in common.h rather than here so that
- * jaiSmallNew can be inlined into a caller that must not make a call; the
- * grain and the maximum moved with them. Nothing outside this file writes
- * them except through that one inline, which does what the code here does. */
-
 /* Bin 0 is unused (a zero-byte request never reaches here); bin c serves
  * requests of 16(c-1)+1 .. 16c bytes and holds blocks of exactly 16c. */
 void *jaiSmallBin[JAI_SMALL_CLASSES + 1];
 
 /* 0 for anything the bins do not serve. */
 static inline unsigned smallClass(size_t n) {
-    /* Grain is a power of two, so avoid an integer divide on this allocator
-     * hot path. n==0 deliberately maps to class 0. */
     if (n == 0 || n > JAI_SMALL_MAX) return 0u;
     return (unsigned)((n + (JAI_SMALL_GRAIN - 1u)) >> 4);
 }
@@ -114,39 +83,11 @@ static inline void smallFree(void *p, unsigned cls) {
     jaiSmallBin[cls] = p;
 }
 
-/* When a bin is empty the block has to come from somewhere, and one malloc per
- * object is what that used to mean.
- *
- * The bins only recycle what has already died, so a program whose live set is
- * *growing* -- building a list of two million strings, a tree of half a million
- * nodes -- finds every bin empty and pays libc for every object. Sampled on
- * tests/bench/string_build, malloc's internals were 29% of the whole run.
- *
- * Carving those blocks out of a slab instead makes the common case a compare,
- * an add and two stores, and calls malloc once per slab rather than once per
- * object. Nothing else changes: a slab block is indistinguishable from a
- * malloc'd one to every caller, and when it dies it goes onto the same free
- * list it would have before.
- *
- * Three properties make it safe, and all three already held:
- *
- *   - malloc returns 16-aligned memory and every size class is a multiple of
- *     the 16-byte grain, so the cursor stays 16-aligned for the whole slab;
- *   - a slab block is never handed to free() or realloc(), because those are
- *     reached only when smallClass(oldSize) is 0 and a slab block's size is by
- *     construction one the bins serve -- the same exact-oldSize invariant the
- *     bins have always depended on;
- *   - blocks are never returned to libc, which the bins above already
- *     documented as their own behaviour.
- *
- * The slab is not freed at exit for the same reason the bins are not. */
 #define JAI_SLAB_BYTES (64u * 1024u)
 
 char  *jaiSlabNext;
 size_t jaiSlabLeft;
 
-/* The refill, which is the one thing here that calls malloc, and so the one
- * thing jaiSmallNew in common.h cannot do for itself. */
 void jaiSlabRefill(size_t need) {
     /* The tail is too small for this request but not too small to be a
      * block: hand it to the bin it exactly fits rather than leaking it.
@@ -198,7 +139,6 @@ void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize) {
         return NULL;
     }
 
-    /* Very common no-op resize (especially exact-capacity helpers). */
     if (JAI_UNLIKELY(ptr != NULL && oldSize == newSize))
         return ptr;
 
@@ -206,7 +146,6 @@ void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize) {
 
     const unsigned newCls = smallClass(newSize);
 
-    /* Fresh small allocation: by far the hottest allocation path. */
     if (ptr == NULL) {
         if (newCls != 0)
             return smallAlloc(newCls);
@@ -219,7 +158,6 @@ void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize) {
         return result;
     }
 
-    /* Same small class: physical capacity already satisfies the request. */
     if (newCls != 0 && newCls == oldCls)
         return ptr;
 
@@ -277,9 +215,6 @@ char *jaiStrdup(const char *s) {
 char *jaiMemdup(const char *s, size_t n) {
     if (s == NULL) return NULL;
 
-    /* Exactly `n` bytes: its one caller hands the same `n` to jaiSourceAdd and
-     * jaiLexerInit, so a copy that stopped at an embedded NUL would leave them
-     * reading past the end of the allocation. */
     char *copy = JAI_ALLOC(char, n + 1);
     if (n > 0) memcpy(copy, s, n);
     copy[n] = '\0';
@@ -308,8 +243,6 @@ static inline size_t alignUpSize(size_t n) {
     return (n + mask) & ~mask;
 }
 
-/* Blocks carry JAI_ARENA_ALIGN of slack so the payload can start on an aligned
- * address regardless of what malloc returned. */
 static JaiArenaBlock *arenaNewBlock(JaiArena *arena, size_t payload) {
     size_t total = sizeof(JaiArenaBlock) + JAI_ARENA_ALIGN;
     if (payload > SIZE_MAX - total) JAI_PANIC("arena block size overflow: %zu", payload);
@@ -347,11 +280,6 @@ void *jaiArenaAlloc(JaiArena *arena, size_t size) {
     JaiArenaBlock *b = arena->head;
 
     if (JAI_UNLIKELY(b == NULL || b->capacity - b->used < size)) {
-        /*
-         * After reset there may already be a suitable retained block deeper in
-         * the chain. Move the one we find to the head, so subsequent bump
-         * allocations do not rescan the same prefix again.
-         */
         JaiArenaBlock *prev = b;
         JaiArenaBlock *scan = b != NULL ? b->next : NULL;
 
@@ -366,8 +294,6 @@ void *jaiArenaAlloc(JaiArena *arena, size_t size) {
             arena->head = scan;
             b = scan;
         } else if (size > arena->blockSize) {
-            /* Dedicated oversized block. Keep the normal bump block at head
-             * when one exists, because small allocations dominate. */
             b = arenaNewBlock(arena, size);
 
             if (arena->head == NULL) {
@@ -397,10 +323,6 @@ void *jaiArenaAllocZeroed(JaiArena *arena, size_t size) {
 char *jaiArenaMemdup(JaiArena *arena, const char *s, size_t n) {
     if (s == NULL) return NULL;
 
-    /* This used to stop at the first NUL, the way strndup does, while every
-     * caller went on recording `n` as the length: `"a\0b"` was stored as the
-     * two bytes `a\0` and read back as three, so the third came from whatever
-     * followed in the arena. Length-prefixed means length-prefixed. */
     char *copy = (char *)jaiArenaAlloc(arena, n + 1);
     if (copy == NULL) return NULL;
     if (n > 0) memcpy(copy, s, n);
@@ -460,7 +382,6 @@ void jaiBufReserve(JaiBuf *b, size_t extra) {
     const size_t needed = count + extra;
     size_t cap = capacity < JAI_BUF_MIN_CAP ? JAI_BUF_MIN_CAP : capacity;
 
-    /* Usually one doubling is enough; keep that case branch-light. */
     if (cap < needed) {
         if (cap <= SIZE_MAX / 2)
             cap *= 2;
@@ -609,8 +530,6 @@ char *jaiBufTakeCString(JaiBuf *b, size_t *outLen) {
     b->data[b->count] = '\0';
     size_t len = b->count;
 
-    /* Shrink to the exact size so the caller can release it with
-     * JAI_FREE_ARRAY(char, s, len + 1) and keep the byte accounting honest. */
     char *s = (char *)jaiRealloc(b->data, b->capacity, len + 1);
     jaiBufInit(b);
 
@@ -628,11 +547,6 @@ uint64_t jaiHashBytes(const void *data, size_t len) {
 
     if (p == NULL) return hash;
 
-    /*
-     * FNV-1a is serial, so SIMD cannot break its dependency chain. Unrolling
-     * four bytes still removes most loop-control overhead on names/strings
-     * without changing the hash ABI.
-     */
     while (len >= 4) {
         hash ^= (uint64_t)p[0];
         hash *= UINT64_C(1099511628211);
@@ -695,15 +609,6 @@ uint32_t jaiCrc32Table(const void *data, size_t len) {
 #if defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
 
-/* ARMv8's CRC32 instructions implement this exact polynomial in this exact bit
- * order, so this is the same function as the table form, not an approximation
- * of it -- tests/vm/crc32_equiv.c holds the two to that. Measured 20x: 420 MB/s
- * table against 8494 MB/s hardware, and the CRC is 26% of a warm module load.
- *
- * The 8-byte step reads through memcpy rather than a pointer cast: a .jaic
- * buffer is malloc'd and hashed from an arbitrary offset, and a misaligned
- * 64-bit load is undefined behaviour that a sanitiser build will flag. The
- * compiler turns this into a single `ldr`. */
 uint32_t jaiCrc32(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     if (p == NULL) return 0u;
@@ -740,8 +645,6 @@ int32_t jaiUtf8Decode(const char *s, const char *end, int *outLen) {
     const uint8_t *p = (const uint8_t *)s;
     const uint8_t b0 = p[0];
 
-    /* ASCII dominates text processing. Avoid computing end-s and entering the
-     * multibyte decision tree for it. */
     if (b0 < 0x80u) {
         if (outLen != NULL) *outLen = 1;
         return (int32_t)b0;
@@ -826,10 +729,6 @@ size_t jaiUtf8Length(const char *s, size_t len) {
     size_t count = 0;
 
     while (p < end) {
-        /*
-         * 16-byte ASCII fast path using unaligned-safe memcpy loads. Two words
-         * at once reduce loop branches on long source files and joined strings.
-         */
         while ((size_t)(end - p) >= 16u) {
             uint64_t a, b;
             memcpy(&a, p, sizeof a);
@@ -964,9 +863,6 @@ char *jaiReadFile(const char *path, size_t *outLen) {
         return NULL;
     }
 
-    /* st_size is only a hint — the file may change under us — so the read loop
-     * is authoritative and grows when it has to. Two bytes of slack (NUL plus
-     * one probe byte) let the common case hit EOF without ever growing. */
     size_t cap = (size_t)st.st_size + 2;
     if (cap < 64) cap = 64;
     char *buf = JAI_ALLOC(char, cap);
@@ -1042,8 +938,6 @@ bool jaiMakeDirs(const char *path) {
     char buf[JAI_MAX_PATH];
     memcpy(buf, path, len + 1);
 
-    /* Start at 1: index 0 is either a leading '/' (nothing to create) or the
-     * first character of a relative component. */
     for (size_t i = 1; i <= len; i++) {
         if (buf[i] != '/' && buf[i] != '\0') continue;
         char saved = buf[i];
@@ -1078,7 +972,6 @@ static bool pathStore(char *out, size_t outSize, const char *src, size_t len) {
     return true;
 }
 
-/* Appends `s`, collapsing runs of '/' into one. */
 static bool pathPushNorm(char *dst, size_t dstSize, size_t *pos, const char *s) {
     for (const char *c = s; *c != '\0'; c++) {
         if (*c == '/' && *pos > 0 && dst[*pos - 1] == '/') continue;
@@ -1091,12 +984,9 @@ static bool pathPushNorm(char *dst, size_t dstSize, size_t *pos, const char *s) 
 void jaiPathJoin(char *out, size_t outSize, const char *a, const char *b) {
     if (out == NULL || outSize == 0) return;
 
-    /* Assembled in a temporary so `out` may alias `a` or `b`. That caps a
-     * joined path at JAI_MAX_PATH, which is the limit anyway. */
     char tmp[JAI_MAX_PATH];
     size_t pos = 0;
 
-    /* An absolute second half discards the first, as every path join does. */
     if (b != NULL && b[0] == '/') a = NULL;
 
     bool haveA = a != NULL && a[0] != '\0';

@@ -100,8 +100,6 @@ pub class UnionFind {
         self._check(element)
         var root = element
         while self.parent[root] != root { root = self.parent[root] }
-        # Second pass instead of recursion: the chain can be long before the
-        # first compression, and this keeps the stack flat.
         var walk = element
         while self.parent[walk] != root {
             let next = self.parent[walk]
@@ -370,8 +368,6 @@ pub class Graph {
         let result: list[Edge] = []
         for (position, node) in self.order.enumerate() {
             for edge in self.adjacency[node] {
-                # Undirected edges are stored twice; keep the copy whose target
-                # is not earlier in insertion order so each pair is emitted once.
                 if self.directed or self.slots[edge.target] >= position {
                     result.push(edge)
                 }
@@ -477,8 +473,6 @@ pub class Graph {
         let visited: set[any] = set()
         visited.add(start)
         let order: list[any] = [start]
-        # A list plus a read cursor is a queue with O(1) amortised dequeue; the
-        # discarded prefix is bounded by the number of nodes.
         var cursor = 0
         while cursor < order.len() {
             let node = order[cursor]
@@ -509,8 +503,6 @@ pub class Graph {
             if visited.has(node) { continue }
             visited.add(node)
             order.push(node)
-            # Reversed so the first neighbour is popped first, matching the
-            # order a recursive walk would visit them in.
             for edge in self.adjacency[node].reversed() {
                 if not visited.has(edge.target) { stack.push(edge.target) }
             }
@@ -581,8 +573,6 @@ pub class Graph {
         let components: list[list[any]] = []
         for start in 0..count {
             if index[start] != -1 { continue }
-            # Each frame is (node, position of the next neighbour to explore),
-            # which is exactly the state a recursive Tarjan keeps on the stack.
             let work: list[tuple[int, int]] = [(start, 0)]
             while work.len() > 0 {
                 let frame = work[work.len() - 1]
@@ -757,8 +747,6 @@ pub class Graph {
             }
             if not relaxed { return distance }
         }
-        # A relaxation on the V-th pass means some path uses V edges, which can
-        # only happen if it repeats a node around a negative cycle.
         for edge in arcs {
             if not distance.has(edge.source) { continue }
             if distance[edge.source] + edge.weight < distance[edge.target] {
@@ -792,8 +780,6 @@ pub class Graph {
                     relaxed = true
                 }
             }
-            # V - 1 rounds settle every acyclic path, so a relaxation left over
-            # on the V-th round can only come from a cycle that keeps paying.
             if not relaxed { return false }
         }
         return true
@@ -815,8 +801,6 @@ pub class Graph {
         for middle in self.order {
             let through = distance[middle]
             for start in self.order {
-                # Skipped, not special-cased: with start == middle, row and
-                # pivot are the same dict, and mutating one while iterating it is undefined.
                 if start == middle { continue }
                 let row = distance[start]
                 if not row.has(middle) { continue }
@@ -955,8 +939,6 @@ pub class Graph {
                         capacity[arc ^ 1] += bottleneck
                     }
                     flow += bottleneck
-                    # Retreat to just before the first arc this augmentation
-                    # saturated; everything earlier still has residual room.
                     var cut = 0
                     while cut < path.len() and capacity[path[cut]] > FLOW_EPSILON { cut += 1 }
                     node = cut == 0 ? start : target_of[path[cut - 1]]
@@ -976,7 +958,6 @@ pub class Graph {
                 }
                 if advanced { continue }
                 if node == start { break }
-                # Dead end: no admissible arc leaves this node in this phase.
                 level[node] = -1
                 let arc = path.pop()
                 node = target_of[arc ^ 1]

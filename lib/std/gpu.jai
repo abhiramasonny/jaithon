@@ -30,8 +30,6 @@ import std.math
 #: of microseconds; below this size the arithmetic does not.
 pub const MIN_GPU_ELEMENTS = 4096
 
-# Must equal the Metal kernels' hardcoded threadgroup width (their scratch
-# array size); 256 is within every device's guaranteed maximum.
 const _REDUCE_GROUP = 256
 
 let _ELEMENTWISE_SOURCE = """#include <metal_stdlib>
@@ -343,8 +341,6 @@ pub fn synchronize() -> void {
     __prim__.gpu_synchronize()
 }
 
-# Caches compiled kernels; keyed by entry+source together since `map_kernel`
-# reuses the entry name `apply` for many different sources.
 var _pipelines: dict[str, Kernel] = {}
 
 #: Add `a` and `b` elementwise.
@@ -424,8 +420,6 @@ pub fn matmul(a: list[float], b: list[float], rows: int, inner: int, columns: in
     if b.len() != inner * columns {
         throw ValueError(f"right matrix has {b.len()} elements, expected {inner * columns}")
     }
-    # Deliberately not __prim__.gpu_matmul: measured 29ms vs its 205ms at
-    # 512x512 (its kernel is tiled, this isn't -- gap is dispatch, not arithmetic).
     if not _use_gpu(rows * columns * inner) { return _cpu_matmul(a, b, rows, inner, columns) }
     let left = Buffer.of(a)
     let right = Buffer.of(b)
@@ -468,8 +462,6 @@ pub fn map_kernel(
     return output.download()
 }
 
-# `work` counts multiply-adds, not elements -- matmul passes `rows*inner*columns`,
-# since it's the arithmetic that must outweigh the upload, not the output size.
 fn _use_gpu(work: int) -> bool {
     return work >= MIN_GPU_ELEMENTS and is_available()
 }
@@ -507,8 +499,6 @@ fn _elementwise(a: list[float], b: list[float], entry: str) -> list[float] {
     return output.download()
 }
 
-# One threadgroup produces one partial sum; there are few enough of them that
-# summing them on the host costs nothing and keeps the kernel to a single pass.
 fn _reduce_with(entry: str, inputs: list[Buffer], count: int) -> float {
     let groups = (count + _REDUCE_GROUP - 1) // _REDUCE_GROUP
     let partials = Buffer(groups)
@@ -521,8 +511,6 @@ fn _reduce_with(entry: str, inputs: list[Buffer], count: int) -> float {
     return _compensated_sum(partials.download())
 }
 
-# Neumaier's variant of Kahan summation: keeps the low bits even when the
-# running total is smaller than the term being added (plain Kahan loses them).
 fn _compensated_sum(values: list[float]) -> float {
     var total = 0.0
     var correction = 0.0

@@ -18,7 +18,6 @@ pub const MAX_RECURSION: int = 200
 # argument count in one byte.
 const _MAX_ARGS = 255
 
-# The two readings a prompt line has, and the verdict that it has neither yet.
 const _REPL_AS_STATEMENT = 0
 const _REPL_AS_EXPRESSION = 1
 const _REPL_NEED_MORE = 2
@@ -38,9 +37,6 @@ pub class Parser {
     var expr_depth: int
     var yield_count: int
 
-    # Trial parsing, used only by `parse_repl_line`: read the line one way, note
-    # whether `Eof` (incomplete) or a real token (wrong) ended it, then undo it — a
-    # trial's own diagnostics are swallowed.
     var trial_active: bool
     var trial_failed: bool
     var trial_error_tok: int
@@ -128,9 +124,6 @@ pub class Parser {
         return (self._read_repl_statement(), false)
     }
 
-    # Decided by parsing, not bracket counting: a bracket count can't tell input
-    # that stopped early from input the parser rejected, and treating both as
-    # "incomplete" would hang the prompt open after a syntax error.
     fn _choose_repl_reading(self) -> int {
         let (statement_ok, statement_ran_out, statement_tok) = self._repl_trial(false)
         if statement_ok { return _REPL_AS_STATEMENT }
@@ -141,14 +134,10 @@ pub class Parser {
         if expression_ok { return _REPL_AS_EXPRESSION }
         if expression_ran_out { return _REPL_NEED_MORE }
 
-        # Neither reading worked; report whichever got further, since that's the
-        # one the line more nearly was — a tie goes to the block reading.
         if expression_tok > statement_tok { return _REPL_AS_EXPRESSION }
         return _REPL_AS_STATEMENT
     }
 
-    # Reads the line one way, then undoes it entirely. `error_tok` doubles as how
-    # far the reading got, which is what breaks a tie in `_choose_repl_reading`.
     fn _repl_trial(self, as_expression: bool) -> tuple[bool, bool, int] {
         let mark_current = self.current
         let mark_expr_depth = self.expr_depth
@@ -179,7 +168,6 @@ pub class Parser {
         return (ok, ran_out, error_tok)
     }
 
-    # The reading a file gives the line, and the one nearly every line gets.
     fn _read_repl_statement(self) -> Node? {
         let node = self._parse_declaration()
         if self.panic_mode { self._synchronize() }
@@ -189,9 +177,6 @@ pub class Parser {
         return node
     }
 
-    # The reading only the prompt has: a statement `{` is a block (so `{"a": 1}`
-    # stays a block containing a string statement in a file); without this, the
-    # REPL could never type a dict or set literal.
     fn _read_repl_expression(self) -> Node? {
         let start_index = self.current
         let expr = self._parse_expression()
@@ -202,7 +187,6 @@ pub class Parser {
         return _node(NodeKind.ExprStmt, self._span_since(start_index), {"expr": expr})
     }
 
-    # Nothing may follow a prompt line but newlines.
     fn _expect_repl_end(self) -> void {
         if self._check(TokenKind.Eof) or self.had_error { return }
         self._error_at_cur(
@@ -254,8 +238,6 @@ pub class Parser {
         while self._check(TokenKind.Newline) { self._advance() }
     }
 
-    # Lexical errors were already reported by the lexer; the parser steps over
-    # the placeholder tokens without reporting them a second time.
     fn _skip_error_tokens(self) -> void {
         while self._token_at(self.current).kind == TokenKind.Error {
             self.had_error = true
@@ -267,8 +249,6 @@ pub class Parser {
         return self._peek().span
     }
 
-    # The span covering tokens [start_index, current), ignoring trailing
-    # newlines so that a statement's span stops at its last real token.
     fn _span_since(self, start_index: int) -> Span {
         var end_index = self.current - 1
         while end_index > start_index and self._token_at(end_index).kind == TokenKind.Newline {
@@ -283,7 +263,6 @@ pub class Parser {
         return token.kind == TokenKind.Ident and token.text == text
     }
 
-    # Label tokens carry their leading quote; the tree stores the bare name.
     fn _label_name(self, token: Token) -> str {
         if token.text.len() > 0 and token.text[0] == "'" { return token.text[1:token.text.len()] }
         return token.text
@@ -298,8 +277,6 @@ pub class Parser {
         return f"`{token.text}`"
     }
 
-    # The single error entry point. Returns null when the diagnostic was
-    # suppressed, so a caller that wants to attach a label must check.
     fn _error_at(
         self,
         span: Span,
@@ -315,7 +292,6 @@ pub class Parser {
         return self.diagnostics.error(code, span, message, help: help, note: note)
     }
 
-    # Remember the first diagnostic of a trial and swallow it.
     fn _trial_note_error(self) -> Diagnostic? {
         if not self.trial_failed {
             self.trial_failed = true
@@ -328,9 +304,6 @@ pub class Parser {
         return self._error_at(self._cur_span(), code, message, help: help)
     }
 
-    # A construct understood well enough to keep parsing: report it without
-    # entering panic mode, so the rest of the line still gets good diagnostics.
-    # Used by the Jaithon 2 spellings.
     fn _error_recovered(
         self,
         span: Span,
@@ -357,9 +330,6 @@ pub class Parser {
         return false
     }
 
-    # Reports E0107 at the unclosed delimiter, not at the token the parser gave up
-    # on (usually EOF, an empty line a caret can't underline); where it stopped is
-    # still shown as a secondary label.
     fn _unclosed(self, open_index: int, close_text: str, what: str) -> void {
         let found = self._describe(self._peek())
         let open_span = self._token_at(open_index).span
@@ -370,8 +340,6 @@ pub class Parser {
         )
         if diag != null {
             diag.label(open_span, f"unclosed {what} opened here")
-            # End of file has no line of its own to underline, and the message
-            # already names it; anything else is worth pointing at.
             if not self._check(TokenKind.Eof) {
                 diag.label(self._cur_span(), f"{found} reached before the `{close_text}`")
             }
@@ -393,8 +361,6 @@ pub class Parser {
         return null
     }
 
-    # Placeholder returned instead of null so that no expression caller has to
-    # check; the tree is discarded anyway once `had_error` is set.
     fn _error_expr(self, span: Span) -> Node {
         return _node(NodeKind.NullLit, span)
     }
@@ -412,8 +378,6 @@ pub class Parser {
     }
 
     # --- statement termination and synchronisation -----------------------
-
-    # Skip to the next statement boundary at the current brace depth.
     fn _synchronize(self) -> void {
         self.panic_mode = false
         if self._check(TokenKind.Eof) or self._check(TokenKind.RBrace) { return }
@@ -541,7 +505,6 @@ pub class Parser {
             return _type(TypeKind.Infer, self._cur_span())
         }
 
-        # A dotted name is a module-qualified type such as `std.math.Vec`.
         var name = self._advance().text
         while self._check(TokenKind.Dot) and self._kind_at(1) == TokenKind.Ident {
             self._advance()
@@ -602,7 +565,6 @@ pub class Parser {
         return _type(TypeKind.Union, self._span_since(start_index), args: parts)
     }
 
-    # `catch e: A | B` and `class C: A, B` both flatten into a type list.
     fn _parse_type_list(self) -> list[TypeExpr] {
         var types: list[TypeExpr] = []
         loop {
@@ -619,8 +581,6 @@ pub class Parser {
     }
 
     # --- arguments and f-strings -----------------------------------------
-
-    # Parse an argument list up to and including the closing `)`.
     fn _parse_args(self, open_index: int) -> list[dict[str, any]] {
         var args: list[dict[str, any]] = []
         self._skip_newlines()
@@ -630,8 +590,6 @@ pub class Parser {
                 let arg_start = self.current
                 var name: str? = null
                 let is_spread = self._match(TokenKind.Ellipsis)
-                # `name: value` is a keyword argument; nothing else puts a colon
-                # directly after an identifier here.
                 if not is_spread and
                     self._check(TokenKind.Ident) and
                     self._kind_at(1) == TokenKind.Colon {
@@ -664,8 +622,6 @@ pub class Parser {
         return args
     }
 
-    # A format spec (`{x:.2f}`) becomes an explicit `__format__` call, so that
-    # code generation needs no special case for it.
     fn _apply_format_spec(self, value: Node) -> Node {
         if not self._match(TokenKind.Colon) { return value }
         let spec_span = self._cur_span()
@@ -691,7 +647,6 @@ pub class Parser {
         let start_index = self.current
         var parts: list[Node] = []
 
-        # An f-string with no holes arrives as a lone `FStringEnd` chunk.
         let start_token = self._advance()
         if start_token.string_value().len() > 0 {
             parts.push(_str_lit(start_token.span, start_token.string_value()))
@@ -707,7 +662,6 @@ pub class Parser {
                 break
             }
             if self._check(TokenKind.Colon) {
-                # An empty `{:spec}` is a hole with no expression.
                 let empty = self._error_expr(self._cur_span())
                 self._error_at_cur(
                     Code.E0102_EXPECTED_EXPRESSION,
@@ -770,8 +724,6 @@ pub class Parser {
         return clauses
     }
 
-    # Every comprehension is opened by the bracket at `start_index`, which is
-    # both where the node starts and what the unclosed-delimiter diagnostic points at.
     fn _finish_comprehension(
         self,
         start_index: int,
@@ -798,7 +750,6 @@ pub class Parser {
         )
     }
 
-    # Elements of a `[...]`, `{...}` or `(...)` literal after the first one.
     fn _parse_rest_of_sequence(self, first: Node, closer: TokenKind) -> list[Node] {
         var items: list[Node] = [first]
         self._skip_newlines()
@@ -852,7 +803,6 @@ pub class Parser {
         return _sequence(NodeKind.ListLit, self._span_since(start_index), items)
     }
 
-    # `{}` is the empty dict, `{a, b}` a set, and `{k: v}` a dict.
     fn _parse_brace_literal(self) -> Node {
         let start_index = self.current
         self._advance()
@@ -1011,8 +961,6 @@ pub class Parser {
         if kind == TokenKind.FStringStart or kind == TokenKind.FStringEnd {
             return self._parse_fstring()
         }
-        # `throw e` has type `never` (§4.3), which is what lets a match arm or the
-        # right side of `??` raise; the statement form is matched earlier.
         if kind == TokenKind.KwThrow {
             self._advance()
             let operand = self._parse_expression()
@@ -1078,7 +1026,6 @@ pub class Parser {
     }
 
     fn _parse_ident_primary(self, token: Token, start_index: int) -> Node {
-        # `new Foo()` — the keyword was removed in Jaithon 3.
         if token.text == "new" and self._kind_at(1) == TokenKind.Ident {
             let class_name = self._token_at(self.current + 1).text
             self._error_recovered(
@@ -1090,8 +1037,6 @@ pub class Parser {
             self._advance()
             return self._parse_primary()
         }
-        # `await expr` is contextual: `std.async` defines it, so it is only an
-        # operator when an operand plainly follows.
         if token.text == "await" and _starts_await_operand(self._kind_at(1)) {
             self._advance()
             let operand = self._parse_unary()
@@ -1131,14 +1076,11 @@ pub class Parser {
             )
         }
 
-        # `x[a, b]` can't be an index (that takes one expression), so a comma here
-        # means generic type args (`Pair[B, A](x, y)`); stays an `Index` over a tuple,
-        # since only the resolver — not the parser — knows if `Pair` names a class.
         if self._check(TokenKind.Comma) {
             var args: list[Node] = [start ?? self._error_expr(self._cur_span())]
             while self._match(TokenKind.Comma) {
                 self._skip_newlines()
-                if self._check(TokenKind.RBracket) { break }  # trailing comma
+                if self._check(TokenKind.RBracket) { break }
                 args.push(self._parse_expression())
                 if self.panic_mode { break }
             }
@@ -1192,14 +1134,9 @@ pub class Parser {
     fn _parse_power(self) -> Node {
         let left = self._parse_postfix()
         if not self._match(TokenKind.StarStar) { return left }
-        # Right-associative, and looser than a unary on its right so that
-        # `2 ** -1` parses.
         return _binary(NodeKind.Binary, OpKind.Pow, left, self._parse_unary())
     }
 
-    # `-9223372036854775808` is the only way to write the smallest `int`: the lexer
-    # already negates NEG_MAGNITUDE literals, so matching the token pair (not just an
-    # equal IntLit) spends the sign exactly once. Call with the cursor on the `-`.
     fn _parse_neg_magnitude(self) -> Node? {
         let literal = self._token_at(self.current + 1)
         if literal.kind != TokenKind.Int or not literal.has_flag(TokenFlags.NEG_MAGNITUDE) {
@@ -1287,9 +1224,6 @@ pub class Parser {
             let op_span = self._cur_span()
             self._advance()
             let right = self._parse_bit_and()
-            # Two numeric literals around `^` are almost always a Jaithon 2 power; warn,
-            # but suppressed during a trial — the REPL parses every line as a trial
-            # before parsing it for real, and a trial's diagnostics are its own to swallow.
             if not self.trial_active and _is_numeric_literal(left) and _is_numeric_literal(right) {
                 self.diagnostics.warn(
                     Code.W0105_DEPRECATED,
@@ -1326,7 +1260,6 @@ pub class Parser {
         return _node(NodeKind.Range, span, {"start": left, "stop": stop, "inclusive": inclusive})
     }
 
-    # The level-6 operator at the cursor, as `(op, token count, is legacy)`.
     fn _peek_compare_op(self) -> tuple[OpKind, int, bool]? {
         let kind = self._kind()
         let simple = _compare_op(kind)
@@ -1347,7 +1280,6 @@ pub class Parser {
         return null
     }
 
-    # `a < b <= c` is one chain node, with `b` evaluated once (§4.2).
     fn _parse_comparison(self) -> Node {
         let first = self._parse_range()
         if self._peek_compare_op() == null { return first }
@@ -1452,9 +1384,6 @@ pub class Parser {
     }
 
     # --- patterns --------------------------------------------------------
-
-    # Elements of a `(...)` or `[...]` pattern, including one `...rest`. Returns
-    # (elements, rest index or -1, whether a comma was seen — telling `(x)` from `(x,)`).
     fn _parse_pattern_list(
         self,
         closer: TokenKind,
@@ -1563,7 +1492,6 @@ pub class Parser {
         if self._check(TokenKind.Ident) {
             let name = self._advance().text
 
-            # `Shape.Circle(r)` — an enum variant, with an optional payload.
             if self._match(TokenKind.Dot) {
                 let variant = self._expect_ident_name("an enum variant name")
                 if variant == null {
@@ -1590,12 +1518,10 @@ pub class Parser {
                 )
             }
 
-            # `Point{x, y}` or `Point{x: 1, y}` — a class pattern.
             if self._check(TokenKind.LBrace) {
                 return self._parse_class_pattern(name, start_index)
             }
 
-            # `Some(x)` — a positional class pattern.
             if self._check(TokenKind.LParen) {
                 self._advance()
                 let (elems, _rest, _comma) = self._parse_pattern_list(
@@ -1677,8 +1603,6 @@ pub class Parser {
         return _pat_seq(NodeKind.PatOr, self._span_since(start_index), alternatives, -1)
     }
 
-    # Reinterpret an already-parsed expression as an assignment pattern, for
-    # `(a, b) = point`. Returns null when the expression is not a pattern.
     fn _expr_to_pattern(self, expr: Node) -> Node? {
         if expr.kind == NodeKind.Ident { return _pat_bind(expr.span, expr.text("name")) }
         if expr.kind != NodeKind.TupleLit and expr.kind != NodeKind.ListLit { return null }
@@ -1705,7 +1629,7 @@ pub class Parser {
             let stmt = self._parse_declaration()
             if stmt != null { stmts.push(stmt) }
             if self.panic_mode { self._synchronize() }
-            if self.current == before { self._advance() }  # guarantee progress
+            if self.current == before { self._advance() }
             self._skip_newlines()
         }
         self._close_sequence(TokenKind.RBrace, "}", "block", start_index)
@@ -1719,7 +1643,6 @@ pub class Parser {
     fn _expect_block(self, what: str) -> Node {
         if self._check(TokenKind.LBrace) { return self._parse_block() }
 
-        # Jaithon 2 wrote `if c then do ... end`.
         if self._ident_text(0, "then") or self._ident_text(0, "do") {
             self._error_at(
                 self._cur_span(),
@@ -1819,7 +1742,6 @@ pub class Parser {
             var guard: Node? = null
             if self._match(TokenKind.KwIf) { guard = self._parse_expression() }
             self._expect(TokenKind.FatArrow, "`=>` after a match pattern")
-            # In arm position a `{` opens a block, never a dict literal.
             let is_block = self._check(TokenKind.LBrace)
             let body = is_block ? self._parse_block() : self._parse_expression()
             arms.push(_arm(pattern, guard, body, self._span_since(before)))
@@ -1873,8 +1795,6 @@ pub class Parser {
         )
     }
 
-    # True when the statement starts with a destructuring target: a bracketed
-    # pattern whose matching close bracket is followed by `=`.
     fn _looks_like_destructuring(self) -> bool {
         let open = self._kind()
         if open != TokenKind.LParen and open != TokenKind.LBracket { return false }
@@ -1916,7 +1836,6 @@ pub class Parser {
         let op_span = self._cur_span()
         self._advance()
 
-        # `(a, b) = point` and `[x, ...rest] = xs` destructure.
         if not compound and (target.kind == NodeKind.TupleLit or target.kind == NodeKind.ListLit) {
             let as_pattern = self._expr_to_pattern(target)
             if as_pattern != null { target = as_pattern }
@@ -1950,7 +1869,6 @@ pub class Parser {
         )
     }
 
-    # `print x`, `input name` and `system "ls"` were statements in Jaithon 2.
     fn _parse_legacy_call_statement(self, name: str) -> Node {
         let start_index = self.current
         let name_token = self._advance()
@@ -1984,9 +1902,6 @@ pub class Parser {
         return stmt
     }
 
-    # Diagnostics for the Jaithon 2 spellings that are now plain identifiers.
-    # Returns `(handled, node)`; a handled statement may still be null, since some
-    # recover by reporting and skipping.
     fn _check_legacy_statement(self) -> tuple[bool, Node?] {
         if not self._check(TokenKind.Ident) { return (false, null) }
         let text = self._peek().text
@@ -1996,9 +1911,6 @@ pub class Parser {
             return (true, self._parse_legacy_call_statement(text))
         }
 
-        # `end` is a plain identifier in Jaithon 3 (§1.5 doesn't reserve it), so
-        # `end += 1` and `end = x` are statements — only bare `end` alone on its own
-        # line is diagnosed.
         if text == "end" {
             let next = self._kind_at(1)
             if next != TokenKind.Newline and next != TokenKind.Eof and next != TokenKind.RBrace {
@@ -2124,8 +2036,6 @@ pub class Parser {
     }
 
     # --- declarations ----------------------------------------------------
-
-    # §1.4: `__name__` is reserved for the implementation.
     fn _check_reserved_name(self, name: str?, span: Span) -> void {
         if name == null or not _is_reserved_name(name) { return }
         self._error_recovered(
@@ -2136,9 +2046,6 @@ pub class Parser {
         )
     }
 
-    # §7.2: `Self` is in scope inside every class/trait/enum body as the name of
-    # the implementing type, so nothing may declare a type called `Self` — it would
-    # be unreachable from outside its own body.
     fn _check_reserved_type_name(self, name: str?, span: Span) -> void {
         if name != "Self" { return }
         self._error_recovered(
@@ -2185,7 +2092,6 @@ pub class Parser {
         return generics
     }
 
-    # Parse a parameter list up to and including the closing `)`.
     fn _parse_params(self, open_index: int) -> list[dict[str, any]] {
         var params: list[dict[str, any]] = []
         var rest_span: Span? = null
@@ -2251,8 +2157,6 @@ pub class Parser {
         return params
     }
 
-    # Shared by `fn` declarations, methods, trait members and anonymous `fn`.
-    # The cursor sits on the `fn` keyword, or on the Jaithon 2 spelling of it.
     fn _parse_fn_rest(
         self,
         visibility: Visibility,
@@ -2286,7 +2190,6 @@ pub class Parser {
         if body_optional and not self._check(TokenKind.LBrace) {
             body = null  # a trait requirement: a signature and no definition
         } elif self._check(TokenKind.FatArrow) {
-            # Not in the grammar, but a common typo carried over from lambdas.
             self._error_at(
                 self._cur_span(),
                 Code.E0104_EXPECTED_BLOCK,
@@ -2321,7 +2224,6 @@ pub class Parser {
         )
     }
 
-    # `get area() -> float { ... }` and `set width(v: float) { ... }`.
     fn _parse_accessor(self, visibility: Visibility, is_static: bool, is_setter: bool) -> Node? {
         let start_index = self.current
         self._advance()
@@ -2686,7 +2588,6 @@ pub class Parser {
         )
     }
 
-    # `std.math`, `.sibling`, `..pkg.mod`
     fn _parse_module_path(self) -> str? {
         var path = ""
         while self._check(TokenKind.Dot) or
@@ -2818,7 +2719,6 @@ pub class Parser {
         if kind == TokenKind.KwLet or kind == TokenKind.KwVar or kind == TokenKind.KwConst {
             return self._parse_var_decl(visibility, start_index)
         }
-        # `fn name(...)` declares; `fn(...)` is an anonymous function value.
         if kind == TokenKind.KwFn and self._kind_at(1) == TokenKind.Ident {
             return self._parse_fn_rest(visibility, is_static, start_index, true, false)
         }
@@ -2876,11 +2776,6 @@ pub fn parse(source: str, file_id: int = 0, diagnostics: DiagnosticBag? = null) 
 }
 
 # --- node construction -------------------------------------------------
-#
-# Every node here is built through these helpers, keeping the coupling to
-# `jaithon.ast` narrow: a node is its kind, span, and a field payload keyed to
-# match the AST's JSON encoding (spec §12); non-node structures (params, args,
-# arms, ...) are plain records using those same keys.
 fn _node(kind: NodeKind, span: Span, fields: dict[str, any] = {}) -> Node {
     return Node(kind, fields, span)
 }
@@ -2898,7 +2793,7 @@ fn _type(
 fn _join(first: Span, second: Span) -> Span {
     if first.file < 0 { return second }
     if second.file < 0 { return first }
-    if first.file != second.file { return first }  # a cross-file join keeps the first
+    if first.file != second.file { return first }
     let start = min(first.start, second.start)
     return Span(first.file, start, max(start, max(first.end, second.end)))
 }
@@ -2967,8 +2862,6 @@ fn _pat_class(
     )
 }
 
-# A positional class or enum pattern still carries one field-name slot per
-# sub-pattern; a null entry means "matched by position".
 fn _nulls(count: int) -> list[str?] {
     return [null for _index in 0..count]
 }
@@ -3045,9 +2938,6 @@ fn _import_item(name: str?, alias: str?, span: Span) -> dict[str, any] {
 }
 
 # --- token classification ----------------------------------------------
-#
-# Each operator table returns null for a token that is not an operator of that
-# level, which is what ends the corresponding loop in the ladder.
 fn _multiplicative_op(kind: TokenKind) -> OpKind? {
     return match kind {
         TokenKind.Star => OpKind.Mul,
@@ -3110,8 +3000,6 @@ fn _starts_expression_kind(kind: TokenKind) -> bool {
         TokenKind.KwNot | TokenKind.KwTrue | TokenKind.KwFalse | TokenKind.KwNull => true,
         TokenKind.KwSelf | TokenKind.KwSuper | TokenKind.KwFn | TokenKind.KwIf => true,
         TokenKind.KwMatch | TokenKind.KwYield => true,
-        # `throw e` has type `never` (§4.3) only in expression position; the
-        # statement form is matched earlier, so this only affects genuine expression contexts.
         TokenKind.KwThrow => true,
         _ => false,
     }
@@ -3138,8 +3026,6 @@ fn _starts_pattern_literal(kind: TokenKind) -> bool {
     }
 }
 
-# `await` binds an operand only when one plainly follows, which is what keeps it
-# a contextual keyword rather than a reserved word.
 fn _starts_await_operand(kind: TokenKind) -> bool {
     return match kind {
         TokenKind.Ident | TokenKind.KwSelf | TokenKind.Int | TokenKind.Float => true,
@@ -3148,7 +3034,6 @@ fn _starts_await_operand(kind: TokenKind) -> bool {
     }
 }
 
-# The tokens a bare Jaithon 2 `print x` argument could start with.
 fn _starts_bare_argument(kind: TokenKind) -> bool {
     return match kind {
         TokenKind.Ident | TokenKind.Int | TokenKind.Float | TokenKind.Str => true,

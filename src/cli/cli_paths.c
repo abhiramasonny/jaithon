@@ -8,7 +8,7 @@
  */
 #include "cli/cli_internal.h"
 
-#include <stdlib.h>   /* qsort */
+#include <stdlib.h>
 #include <sys/stat.h>
 
 #include "native/native.h"
@@ -30,8 +30,6 @@ static inline bool hasJaiExtension(const char *name) {
     return len > 4 && memcmp(name + len - 4, ".jai", 4) == 0;
 }
 
-/* Append `path` if it is a file, or every .jai file beneath it if it is a
- * directory. Directory order is sorted so that output is reproducible. */
 static bool collectDirectorySources(const char *path, PathList *out) {
     int count = 0;
     char **names = jaiListDir(path, &count);
@@ -60,10 +58,6 @@ static bool collectDirectorySources(const char *path, PathList *out) {
 
         struct stat st;
         if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
-            /*
-             * We already know this child is a directory. Recurse directly
-             * instead of running exists()+isDir() again inside collectSources.
-             */
             if (!collectDirectorySources(child, out)) {
                 ok = false;
                 break;

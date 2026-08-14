@@ -29,8 +29,6 @@ class Cell {
 }
 
 # --- one range loop, one list loop, one slot --------------------------------
-# The guard on `i` is recorded inside `for i in 0..n`, one entry deep with that
-# loop's iterator beneath it.
 fn walk(cells: list[Cell], n: int) -> int {
     var total = 0
     for i in 0..n { total = total + i }
@@ -39,10 +37,6 @@ fn walk(cells: list[Cell], n: int) -> int {
 }
 
 # --- nbody's `advance`, in miniature ----------------------------------------
-# Nested range loops indexing a list, then a list loop over the same slot.
-# `i + 1` reads the dynamic slot from an OP_ADD_INT_CONST, and the reads in the
-# tail loop happen with a field value already on the stack, so those records are
-# short by two entries rather than one.
 fn pairs(cells: list[Cell], n: int) -> int {
     var total = 0
     for i in 0..n {

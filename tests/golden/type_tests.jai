@@ -58,10 +58,6 @@ print(5 is 5, 5 is 6)
 print(null is null, 1 is null, null is not null)
 
 # --- a class reached through a variable is still a type ----------------------
-#
-# The test is decided from the value on the right, not from the spelling, so a
-# class that arrived by import, alias or assignment behaves the same as one
-# named directly.
 let alias = Base
 print(sub is alias)
 

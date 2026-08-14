@@ -9,9 +9,6 @@
 
 #include "vm/gc.h"
 
-/* Plain + - * raise OverflowError (spec §2.5); only the explicit wrapping
- * operators wrap, and those never reach these helpers. */
-
 bool jaiBuiltinAddI64(int64_t a, int64_t b, int64_t *out) {
     if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return false;
     *out = a + b;
@@ -26,8 +23,6 @@ static bool subI64(int64_t a, int64_t b, int64_t *out) {
 
 static bool mulI64(int64_t a, int64_t b, int64_t *out) {
     if (a == 0 || b == 0) { *out = 0; return true; }
-    /* -1 is special-cased so the division tests below never divide by -1,
-     * which would itself overflow for INT64_MIN. */
     if (a == -1) { if (b == INT64_MIN) return false; *out = -b; return true; }
     if (b == -1) { if (a == INT64_MIN) return false; *out = -a; return true; }
     if (a > 0) {
@@ -45,8 +40,6 @@ bool jaiBuiltinOverflowError(const char *op) {
     return jaiThrow(vm.cOverflowError, "integer overflow in %s", op);
 }
 
-/* Floor division and modulo follow the divisor's sign, as in Python:
- * -7 // 2 == -4 and 7 % -3 == -2. */
 static bool floorDivI64(int64_t a, int64_t b, int64_t *out) {
     if (b == 0) return jaiThrow(vm.cDivisionByZeroError, "integer division by zero");
     if (a == INT64_MIN && b == -1) return jaiBuiltinOverflowError("//");
@@ -68,8 +61,6 @@ static bool modI64(int64_t a, int64_t b, int64_t *out) {
 
 static double floorDivF64(double a, double b) { return floor(a / b); }
 
-/* The float modulo agrees with the integer one: the result takes the sign of
- * the divisor, which C's fmod does not do. */
 static double modF64(double a, double b) {
     double r = fmod(a, b);
     if (r != 0.0 && ((r < 0.0) != (b < 0.0))) r += b;
@@ -88,9 +79,6 @@ static bool powI64(int64_t base, int64_t exp, int64_t *out) {
     *out = result;
     return true;
 }
-
-/* The VM has its own fast paths for these opcodes; the primitives exist so that
- * `lib/std` can reach the same semantics from Jaithon code. Both must agree. */
 
 static bool primOperands(Value a, Value b, const char *name) {
     if (!IS_NUMBER(a)) return jaiBuiltinArgTypeError(1, name, "int or float", a);
@@ -142,7 +130,6 @@ static bool nPrimDiv(int argc, Value *args, Value *out) {
     if (!primOperands(args[0], args[1], "div")) return false;
     double divisor = jaiAsDouble(args[1]);
     if (divisor == 0.0) return jaiThrow(vm.cDivisionByZeroError, "division by zero");
-    /* `/` always yields float, even for two ints (spec §2.5; opcode DIV). */
     *out = FLOAT_VAL(jaiAsDouble(args[0]) / divisor);
     return true;
 }
@@ -188,7 +175,6 @@ static bool nPrimPow(int argc, Value *args, Value *out) {
             *out = INT_VAL(power);
             return true;
         }
-        /* A negative exponent leaves the integers: 2 ** -1 is 0.5. */
         if (base == 0) return jaiThrow(vm.cDivisionByZeroError,
                                        "zero to a negative power");
         *out = FLOAT_VAL(pow((double)base, (double)exponent));
@@ -254,8 +240,6 @@ static bool nPrimShl(int argc, Value *args, Value *out) {
     if (!bitOperands(args[0], args[1], "shl", &a, &n)) return false;
     if (n < 0) return jaiThrow(vm.cValueError, "negative shift count");
     if (n >= 64) { *out = INT_VAL(0); return true; }
-    /* Shift through the unsigned domain: a signed left shift that overflows is
-     * undefined in C, and `<<` is defined to wrap here. */
     *out = INT_VAL((int64_t)((uint64_t)a << (unsigned)n));
     return true;
 }
@@ -266,7 +250,6 @@ static bool nPrimShr(int argc, Value *args, Value *out) {
     if (!bitOperands(args[0], args[1], "shr", &a, &n)) return false;
     if (n < 0) return jaiThrow(vm.cValueError, "negative shift count");
     if (n >= 64) { *out = INT_VAL(a < 0 ? -1 : 0); return true; }
-    /* Arithmetic shift: -8 >> 1 is -4, so the sign bit is replicated. */
     if (a >= 0) {
         *out = INT_VAL((int64_t)((uint64_t)a >> (unsigned)n));
     } else {
@@ -292,8 +275,6 @@ static bool nPrimNe(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Ordering primitives. Two numbers that cannot be ordered are NaN cases and
- * answer false; anything else without an order is a TypeError. */
 static bool primOrder(Value a, Value b, const char *name, int wantLow, int wantHigh,
                       Value *out) {
     int order;
@@ -353,8 +334,6 @@ static bool nPrimCast(int argc, Value *args, Value *out) {
 static bool nPrimObjNew(int argc, Value *args, Value *out) {
     (void)argc;
     if (!IS_CLASS(args[0])) return jaiBuiltinArgTypeError(1, "obj_new", "class", args[0]);
-    /* Allocation only: `init` is the caller's business, which is what lets
-     * std wrap construction (deserialisation, clone) without re-running it. */
     *out = OBJ_VAL(jaiInstanceNew(AS_CLASS(args[0])));
     return true;
 }
@@ -363,8 +342,6 @@ static bool nPrimGetField(int argc, Value *args, Value *out) {
     (void)argc;
     ObjString *name;
     if (!jaiArgString(args[1], 2, "get_field", &name)) return false;
-    /* Reflective: the name is a run-time string, and the method/getter tables
-     * behind jaiGetProperty are keyed by pointer. */
     return jaiGetProperty(args[0], jaiStringCanonical(name), out);
 }
 
@@ -427,7 +404,7 @@ static bool nPrimTraceback(int argc, Value *args, Value *out) {
         ObjString *entry = jaiStringNew(text.data != NULL ? (const char *)text.data : "",
                                         text.count);
         jaiBufFree(&text);
-        if (entry == NULL) break;              /* exception already pending */
+        if (entry == NULL) break;
         jaiGCPushRoot(OBJ_VAL(entry));
         jaiListPush(lines, OBJ_VAL(entry));
         jaiGCPopRoot();

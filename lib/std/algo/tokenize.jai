@@ -106,8 +106,6 @@ pub fn word_ngrams(text: str, size: int) -> list[str] {
     return out
 }
 
-# Duplicated in every sibling file that needs O(1) random access into a string
-# rather than repeated O(n) slicing: too small to be worth a shared import for.
 fn _chars(text: str) -> list[str] {
     let out: list[str] = []
     for ch in text { out.push(ch) }
@@ -117,8 +115,6 @@ fn _chars(text: str) -> list[str] {
 fn _is_token_char(ch: str) -> bool {
     let code = ord(ch)
     if code >= 48 and code <= 57 { return true }
-    # A character with two cases is a letter; CJK scalars have one case but are
-    # still words.
     if ch.lower() != ch.upper() { return true }
     return code >= 0x3041
 }

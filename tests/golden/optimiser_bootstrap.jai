@@ -24,15 +24,11 @@
 #: is worth nothing if the bytes are wrong.
 
 # --- pass 6, superinstructions ----------------------------------------------
-#
-# Between them these reach OP_GET_LOCAL2, OP_ADD_LOCALS, OP_ADD_INT_CONST,
-# OP_INC_LOCAL, OP_CMP_LOCAL_CONST_LT, OP_JUMP_IF_CMP_LOCAL_K,
-# OP_JUMP_IF_CMP_FALSE, OP_GET_FIELD_LOCAL and OP_FOR_ITER_BIND.
 fn arith(a, b) {
     var t: any = a + b
     t = t + 1
     t += 1
-    t -= 1  # never folded into an increment: see fuse.jai
+    t -= 1
     var u: any = a
     u = u + a
     var n: any = 0
@@ -61,19 +57,12 @@ fn fields(p) {
     return s
 }
 
-# The one fusion the loops above never reach: `n < 7` as a *condition* is taken
-# by the four-instruction JUMP_IF_CMP_LOCAL_K rule before CMP_LOCAL_CONST_LT can
-# see it, so the comparison has to be wanted as a value.
 fn under_three(x) {
     var y: any = x
     return y < 3
 }
 
 # --- pass 3, peephole -------------------------------------------------------
-#
-# A jump to the next instruction, a conditional over a lone jump, both constant
-# conditions, `not` in front of a branch, and the POP runs that `and`/`or`
-# leave behind.
 fn branches(a, b) {
     var r: any = 0
     if a { r = 1 } else { r = 2 }
@@ -90,10 +79,6 @@ fn branches(a, b) {
 }
 
 # --- pass 2, dead code ------------------------------------------------------
-#
-# The epilogue after a `return`, a body that can fall off the end and must keep
-# its epilogue, and a `try` inside a branch the peephole proved dead — whose
-# handler and exception-table row go with it.
 fn returns_always(a) { return a }
 
 fn falls_off(a) {
@@ -129,11 +114,6 @@ fn with_defer(a) {
 }
 
 # --- pass 4, slot coalescing ------------------------------------------------
-#
-# A chain of dead bindings collapsing onto one number, one number taking tenant
-# after tenant while a live local holds its own, a captured slot that may not be
-# renumbered, a slot live into a guarded region, and a back edge that has to
-# keep two loop locals apart.
 fn chain(a) {
     let p: any = a + 1
     let q: any = p + 1
@@ -180,13 +160,6 @@ fn loop_carried(xs) {
 }
 
 # --- pass 7, global hoisting ------------------------------------------------
-#
-# `many` reads nine distinct globals in one loop, which is one more than a loop
-# takes in a round, so it needs the second. `blocked` has a call in the body and
-# `writes` a global store, and neither may hoist. `siblings` takes two loops in
-# one round — the ascending-insertion path through `splice_before` — and
-# `nested` is the shape where the inner loop is skipped because it overlaps the
-# plan already recorded for the outer one.
 var g1: any = 1
 var g2: any = 2
 var g3: any = 3

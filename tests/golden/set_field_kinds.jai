@@ -34,22 +34,17 @@ h.n = 7
 h.f = 2.5
 h.s = "ok"
 
-# An int widening into a float field is legal (LANGUAGE.md §2.5).
 h.f = 3
 
-# An `any` field takes anything.
 h.loose = "anything"
 h.loose = 42
 
-# A nullable field takes null and its element type.
 h.maybe = null
 h.maybe = 9
 
-# Correct types arriving through `any` must still pass.
 fn poke(o: any, v: any) -> void { o.n = v }
 poke(h, 11)
 
-# A generic field takes whatever the instantiation holds.
 let b = Box("held")
 let c = Box(3)
 

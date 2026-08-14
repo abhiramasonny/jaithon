@@ -218,8 +218,6 @@ pub class BufferedReader: Iterable[str] {
     #: same as one with LF terminators. A final line without a terminator is
     #: still returned.
     pub fn read_line(self) -> str? {
-        # Counted from `position`, not buffer start: `_fill` drops the
-        # consumed prefix, shifting absolute indices left.
         var scanned = 0
         loop {
             let found = _index_of_char(self.buffer, "\n", self.position + scanned)
@@ -291,8 +289,6 @@ pub class BufferedReader: Iterable[str] {
 
     fn _fill(self) -> bool {
         if self.finished { return false }
-        # Drop the consumed prefix first — otherwise a line-by-line read
-        # copies the whole buffer per line.
         if self.position > 0 {
             self.buffer = self.buffer[self.position:self.buffer.len()]
             self.position = 0
@@ -302,13 +298,10 @@ pub class BufferedReader: Iterable[str] {
             if chunk.len() == 0 {
                 self.finished = true
                 if self.carry.len() == 0 { return false }
-                # A truncated sequence at end of stream is handed to the
-                # decoder rather than dropped silently.
                 self.buffer = self.buffer + _decode(self.carry)
                 self.carry = _EMPTY_BYTES
                 return true
             }
-            # `concat`, not `+`: `+` is not defined between two `bytes`.
             let (complete, pending) = _utf8_split(self.carry.concat(chunk))
             self.carry = pending
             if complete.len() > 0 {
@@ -589,8 +582,6 @@ pub class Path: Comparable, Hashable, Printable {
     #:
     #: Raises `FileNotFoundError` when nothing is there.
     pub fn modified_time(self) -> DateTime {
-        # `DateTime` normalises an out-of-range nanosecond field, so raw
-        # nanoseconds can go in directly.
         return DateTime(0, self._stat()["modified"])
     }
 
@@ -711,9 +702,6 @@ pub class Path: Comparable, Hashable, Printable {
     #: Return the path as written.
     pub fn to_str(self) -> str { return self.text }
 
-    # Follows symlinks: on macOS `/tmp` links to `/private/tmp`, and reporting
-    # "link" there broke every caller's is_dir() check. Plain `io_stat` (no
-    # follow) is what `remove` needs instead.
     fn _kind(self) -> str {
         let info = __prim__.io_stat(self.text, true)
         if info is null { return "" }
@@ -995,7 +983,6 @@ pub fn read_tsv(path: str) -> list[list[str]] { return read_csv(path, "\t") }
 #: Write `rows` to `path` as tab-separated values.
 pub fn write_tsv(path: str, rows: list[list[str]]) -> void { write_csv(path, rows, "\t") }
 
-# Private: a caller only ever meets this as the `Iterator[str]` `lines` returns.
 class LineIter: Iterator[str], Iterable[str] {
     let reader: BufferedReader
 
@@ -1016,8 +1003,6 @@ class PathWalk: Iterator[Path], Iterable[Path] {
     }
 
     pub fn next(self) -> Path? {
-        # Listed on first `next`, not in `init`, so building the walk reads
-        # nothing yet.
         var stack = self.pending
         if stack is null {
             stack = _reversed_listing(self.root)
@@ -1052,8 +1037,6 @@ fn _glob_into(base: Path, segments: list[str], index: int, found: list[Path]) ->
     }
     let segment = segments[index]
     if segment == "**" {
-        # `**` matches zero or more directories; each result is reached
-        # through exactly one chain, so nothing duplicates.
         _glob_into(base, segments, index + 1, found)
         if not base.is_dir() { return }
         for entry in base.list() {
@@ -1062,8 +1045,6 @@ fn _glob_into(base: Path, segments: list[str], index: int, found: list[Path]) ->
         return
     }
     if not _has_wildcard(segment) {
-        # A literal component is looked up directly, so a deep pattern
-        # doesn't list every directory on the way.
         let child = base.join(segment)
         if child.exists() { _glob_into(child, segments, index + 1, found) }
         return
@@ -1081,9 +1062,6 @@ fn _has_wildcard(segment: str) -> bool {
     return false
 }
 
-# Two-pointer walk: remembers the last `*` and its consumed text, so a
-# mismatch retries with that `*` extended by one character instead of
-# recursing.
 fn _match_glob(name: str, pattern: str) -> bool {
     var text = 0
     var spec = 0
@@ -1197,9 +1175,6 @@ fn _needs_quoting(cell: str, delimiter: str) -> bool {
     return false
 }
 
-# Splits off a trailing UTF-8 sequence the buffer doesn't fully hold yet, so a
-# chunk boundary never lands inside a character. Continuation bytes are
-# 0x80-0xBF; the lead byte's high bits give the sequence length.
 fn _utf8_split(data: bytes) -> tuple[bytes, bytes] {
     let length = data.len()
     var back = 0

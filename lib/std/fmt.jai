@@ -12,7 +12,6 @@ const _STDOUT = 1
 let _BINARY_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
 let _DECIMAL_UNITS = ["B", "kB", "MB", "GB", "TB", "PB", "EB"]
 
-# Both lists must stay sorted -- `_in_ranges` stops at the first range that starts too late.
 let _WIDE_RANGES: list[(int, int)] = [
     (0x1100, 0x115F),
     (0x2E80, 0x303E),
@@ -181,7 +180,6 @@ pub class Table {
     fn markdown_line(self, cells: list[str], widths: list[int]) -> str {
         let parts: list[str] = []
         for (index, cell) in cells.enumerate() {
-            # Escaping widens the cell, so add that back to keep columns aligned.
             let escaped = cell.replace("|", "\\|")
             let extra = display_width(escaped) - display_width(cell)
             parts.push(self.pad(escaped, widths[index] + extra, self.alignments[index]))
@@ -506,7 +504,6 @@ pub fn center(text: str, width: int, fill: str = " ") -> str {
 #: display_width("abc")   # 3
 #: ```
 pub fn display_width(text: str) -> int {
-    # Stripping allocates, and the overwhelmingly common case has no escapes.
     let plain = "\x1B" in text ? strip_ansi(text) : text
     var total = 0
     for ch in plain {
@@ -603,8 +600,6 @@ pub fn dim(text: str) -> str { return _sgr("2", "22", text) }
 #: Underline `text`.
 pub fn underline(text: str) -> str { return _sgr("4", "24", text) }
 
-# Each helper closes with the reset for its own attribute rather than `0`, so
-# colouring part of an already-styled string leaves the outer style intact.
 fn _sgr(code: str, reset: str, text: str) -> str {
     if not _colors_enabled { return text }
     return "\x1B[" + code + "m" + text + "\x1B[" + reset + "m"
@@ -658,7 +653,6 @@ fn _round_to(value: float, digits: int) -> float {
     return __prim__.f64_round(value * scale) / scale
 }
 
-# Corrects for rounding at `digits` carrying the mantissa up to exactly 10.
 fn _decompose(value: float, digits: int) -> (float, int) {
     if value == 0.0 { return (0.0, 0) }
     var mantissa = abs(value)

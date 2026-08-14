@@ -1,45 +1,10 @@
 #!/usr/bin/env bash
 # Jaithon test driver — the whole gate behind `make test`.
-#
-# Six layers, each of which must pass on its own:
-#
-#   1. verifier     — build/*/verify_chunk, the C-only bytecode verifier tests;
-#                     they feed jaiVerifyChunk malformed bytecode, which no
-#                     .jai source can express. Skipped when not built.
-#   2. golden       — a .jai file next to a .expected file; stdout must match
-#                     at every optimisation level, under --gc-stress, and under
-#                     JAITHON_JIT_DEOPT_STRESS=1, since a collection that frees
-#                     something still live, a pass that rewrites a jump wrongly
-#                     and a guard that hands the interpreter the wrong operand
-#                     stack all show up nowhere else
-#   3. unit         — core and workspace package tests, run by `jaithon test`
-#                     (jaithon.tool.test): every top-level `test_` function
-#   4. diagnostics  — tests/errors/*.jai must FAIL with the code named on the
-#                     file's first line, proving the checker catches it
-#   5. repl         — tests/repl/*.repl, a session fed to `jaithon repl` on
-#                     stdin; its stdout must match the .expected beside it, and
-#                     its stderr the .expected-err when there is one
-#   6. formatting   — `jaithon fmt --check` over lib, tests, examples and packages, the
-#                     gate that keeps the tree canonical. Off by default: it
-#                     re-parses every file and costs more than the other four
-#                     together. `make fmt-check` runs the same thing alone.
-#
-# All six report into one summary and one exit status: 0 only when every
-# layer passed.
-#
-# Usage: scripts/run_tests.sh [-v] [--no-gc-stress] [--format] [filter]
-#
-#   -v              name every test as it passes, not just the failures
-#   --no-gc-stress  skip the second golden pass, which is the slow half
-#   --format        also run `jaithon fmt --check` over the tree
-#   filter          substring; only matching cases run, in every layer
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-build}"
-# Overridable so a second build can be tested without touching the shared tree:
-#   BUILD_ROOT=build-repl JAITHON=$PWD/jaithon-repl ./scripts/run_tests.sh
 JAITHON="${JAITHON:-$ROOT/jaithon}"
 VERBOSE=0
 GC_STRESS=1
@@ -70,10 +35,6 @@ else
     RED=""; GREEN=""; YELLOW=""; DIM=""; BOLD=""; RESET=""
 fi
 
-# The reverse of run_bench.sh's guard, and not fatal: this suite is meaningful
-# against either build, but only the debug one has the assertions and the chunk
-# verifier compiled in, so a green run against release proves strictly less.
-# Say which was used rather than leave it to be inferred later from a timing.
 BUILD_KIND="$(cut -d'|' -f1 "$ROOT/$BUILD_ROOT/.link-id" 2>/dev/null | tr -d '[:space:]')"
 printf '%s%s build%s\n\n' "$DIM" "${BUILD_KIND:-unattributed}" "$RESET"
 
@@ -88,13 +49,11 @@ now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
 matches_filter() { [[ -z "$FILTER" || "$1" == *"$FILTER"* ]]; }
 
-# Strip the SGR sequences a tool writes when it thinks it has a terminal.
 plain_text() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
 
 shopt -s nullglob
 
 # -------------------------------------------------------------- 1. verifier
-# `make test` builds this; a bare invocation of this script may not have it.
 VERIFY=""
 for candidate in "$ROOT/$BUILD_ROOT/release/verify_chunk" "$ROOT/$BUILD_ROOT/debug/verify_chunk"; do
     [[ -x "$candidate" ]] && { VERIFY="$candidate"; break; }
@@ -116,12 +75,6 @@ else
     done <<< "$verify_output"
 fi
 
-# A truncated or corrupt .jaic must be an ordinary cache miss, never a crash and
-# never a load failure. It reads and corrupts real cache files, so it runs here
-# rather than as a golden -- a golden only compares stdout.
-# Bits 4-7 of OP_FIELD_DEF's info byte are visible only through the
-# disassembler, and emit.jai is the only front end, so nothing else can catch a
-# wrong kind mapping.
 if [[ -x "$ROOT/tests/vm/field_kind_disasm.sh" ]]; then
     kind_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/field_kind_disasm.sh" 2>&1)"
     while IFS= read -r line; do
@@ -133,8 +86,6 @@ if [[ -x "$ROOT/tests/vm/field_kind_disasm.sh" ]]; then
     done <<< "$kind_output"
 fi
 
-# The .jaid sidecar: release strips the line tables into it, and a missing or
-# corrupt one must cost spans and nothing else.
 if [[ -x "$ROOT/tests/vm/sidecar.sh" ]]; then
     sidecar_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/sidecar.sh" 2>&1)"
     while IFS= read -r line; do
@@ -160,19 +111,12 @@ fi
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
-run_golden() {   # name, source, expected, extra jaithon flag ("" for none),
-                 # NAME=VALUE for the child's environment ("" for none)
+run_golden() {
     local name="$1" src="$2" expected="$3" flag="${4:-}" envset="${5:-}"
     local start actual status errout elapsed prefix
-    # Words rather than an array: macOS ships bash 3.2, where "${a[@]}" on an
-    # empty array is an unbound variable under `set -u` and every golden test
-    # fails with no command having run at all. Both halves are literals from
-    # this script, so splitting them is what is wanted.
     prefix="env"
     [[ -n "$envset" ]] && prefix="env $envset"
     start=$(now_ms)
-    # Compare stdout only. Diagnostics and warnings go to stderr by design, so
-    # merging the two here would make every test fail on unrelated noise.
     if [[ -n "$flag" ]]; then
         actual="$($prefix "$JAITHON" run "$flag" "$src" 2>"/tmp/jai_test_err.$$")"
     else
@@ -200,54 +144,18 @@ for src in "$ROOT"/tests/golden/*.jai; do
         continue
     fi
     run_golden "$name" "$src" "$expected"
-    # `--gc-stress` bare collects on EVERY allocation, which is quadratic in the
-    # live set. That is what is wanted for a straight-line golden -- it visits
-    # each program point once, so every allocation is a distinct place to
-    # collect, and `self_type` gets 1941 collection points for 31ms.
-    #
-    # It is the wrong price for a golden whose whole job is to run a loop until
-    # the tier compiles it. Those revisit ONE loop body millions of times, so
-    # the millionth collection point is the same program point as the first --
-    # and two of them were 59% of this entire suite:
-    #
-    #   jit_field_obj (gc-stress)   92,775ms
-    #   jit_str_slice (gc-stress)   15,866ms
-    #
-    # So a golden may cap its own cadence with a `#: gc-stress-every: N` header,
-    # in the `#:` comment form these files already use. Only the hot-loop ones
-    # carry it; the other 41 keep full density, because a cadence that fixed
-    # those two by weakening all 43 would be a bad trade. Measured at N=50:
-    # jit_field_obj 92,775ms -> 1,728ms and still 20,730 collections,
-    # jit_str_slice 15,866ms -> 151ms and still 8,204.
-    #
-    # `[0-9][0-9]*` not `[0-9]\+` -- `\+` in a BRE is a GNU extension and BSD
-    # sed, which is what macOS ships, matches nothing and silently leaves the
-    # cadence empty.
     gc_every="$(sed -n 's/^#: *gc-stress-every: *\([0-9][0-9]*\).*/\1/p' "$src" | head -1)"
     gc_flag="--gc-stress"
     [[ -n "$gc_every" ]] && gc_flag="--gc-stress=$gc_every"
     [[ $GC_STRESS -eq 1 ]] && run_golden "$name (gc-stress)" "$src" "$expected" "$gc_flag"
-    # Every guard in compiled code fails at once, so each of these runs the
-    # deoptimisation path too -- the record a guard hands back, and the
-    # interpreter picking up from it. Nothing else reaches it: a guard fires in
-    # ordinary running only when a program changes a type under the compiler,
-    # and almost none do. It costs about 2% of this suite.
     run_golden "$name (deopt-stress)" "$src" "$expected" "" \
         JAITHON_JIT_DEOPT_STRESS=1
-    # The optimisation level may change how long a program takes, never what it
-    # prints. -O2 is the default the line above already covered.
     for level in -O0 -O1 -O3; do
         run_golden "$name ($level)" "$src" "$expected" "$level"
     done
 done
 
 # ------------------------------------------------------------------ 3. unit
-#
-# One `jaithon test` run covers the core and package directories: the runner discovers the
-# files, executes each in a namespace of its own, and reports one line per
-# test under --verbose. Those lines are counted here so that the summary
-# counts tests rather than files; the runner's own summary is dropped, since
-# this script owns the total.
 printf '%sUnit tests%s\n' "$BOLD" "$RESET"
 unit_args=(test --verbose)
 [[ -n "$FILTER" ]] && unit_args+=("--filter=$FILTER")
@@ -267,9 +175,6 @@ unit_failed=0
 unit_suite=""
 in_failures=0
 
-# A per-test line is "  LABEL  name  duration"; the same labels appear again in
-# the FAILURES block the runner prints afterwards, so stop at that heading or
-# every failure is counted twice.
 strip_duration() { local s="$1"; printf '%s' "${s%  *}"; }
 
 while IFS= read -r line; do
@@ -290,17 +195,13 @@ while IFS= read -r line; do
             unit_seen=1
             record_skip "$unit_suite$(strip_duration "${plain#  skip  }")" "skipped by the runner" ;;
         "  "*|"") ;;
-        *) unit_suite="$plain > " ;;      # a bare line is the file's heading
+        *) unit_suite="$plain > " ;;
     esac
 done <<< "$unit_output"
 
 if [[ $unit_seen -eq 0 ]]; then
-    # No test line at all: discovery or loading broke, which is a failure of
-    # the layer rather than of any one test.
     record_fail "jaithon test" "$unit_output"
 elif [[ $unit_status -ne 0 ]]; then
-    # A nonzero status with nothing counted would let a failure through, so
-    # the status is authoritative even if the output could not be read.
     [[ $unit_failed -eq 0 ]] && record_fail "jaithon test" "exited $unit_status"
     printf '%s\n' "$unit_output" | sed -n '/FAILURES/,$p' | sed 's/^/       /'
 fi
@@ -310,7 +211,6 @@ printf '%sDiagnostic tests%s\n' "$BOLD" "$RESET"
 for src in "$ROOT"/tests/errors/*.jai; do
     name="$(basename "$src" .jai)"
     matches_filter "$name" || continue
-    # First line looks like:  # expect: E0301
     want="$(head -1 "$src" | sed -n 's/^# *expect: *\([EW][0-9]\{4\}\).*/\1/p')"
     if [[ -z "$want" ]]; then
         record_skip "$name" "no '# expect: Exxxx' header"
@@ -326,26 +226,8 @@ $output"
 done
 
 # ------------------------------------------------------------------ 5. repl
-#
-# One case is a .repl file of lines fed to `jaithon repl` on stdin, next to the
-# .expected stdout it must produce. stderr is compared separately, against a
-# .expected-err, and only when that file exists: the REPL flushes stdout once
-# per input while diagnostics leave as they are made, so a merged transcript
-# would interleave by whatever the pipe happened to buffer rather than by
-# anything the REPL decides.
-#
-# The exit status is checked too, because a REPL fed by a pipe is a program
-# being run and a shell has nothing else to test. It must be 0 unless an
-# .expected-exit beside the case says which status the session is meant to end
-# with, so a new case that quietly starts failing is a failure of the suite.
-#
-# Cases run with tests/repl as the working directory, so a `:load` in one names
-# its fixture without a path. A first line of `# args: -O0` passes flags to the
-# process; the REPL treats it as a comment, so it costs the case nothing.
 printf '%sREPL tests%s\n' "$BOLD" "$RESET"
 
-# `:time` reports a duration that is different every run. Nothing else in a
-# transcript varies, so this is the only normalisation.
 repl_normalise() { sed 's/^time: [0-9.]* ms$/time: <duration>/'; }
 
 for src in "$ROOT"/tests/repl/*.repl; do
@@ -356,20 +238,10 @@ for src in "$ROOT"/tests/repl/*.repl; do
         record_skip "$name" "no .expected file"
         continue
     fi
-    # The header is a flag list rather than one argument, so it is split the
-    # way a shell splits a command line: on spaces, but honouring quotes, so a
-    # flag whose value contains a space (`--eval=':disasm 1+2'`) is one word.
-    # Word splitting alone lost those, and left `[` and `*` in an expression to
-    # be globbed away under the `nullglob` this script sets.
     repl_flags="$(sed -n '1s/^# args: *//p' "$src")"
     declare -a repl_argv=()
     [[ -n "$repl_flags" ]] && eval "repl_argv=($repl_flags)"
     start=$(now_ms)
-    # Not a pipeline: the status wanted is the REPL's own, and inside a command
-    # substitution PIPESTATUS is gone by the time it could be read.
-    # `${a[@]+"${a[@]}"}`, not `"${a[@]}"`: bash 3.2 is what /usr/bin/env finds
-    # on a stock Mac, and there an empty array under `set -u` is an unbound
-    # variable, which would fail every case that passes no flags.
     (cd "$ROOT/tests/repl" && "$JAITHON" repl ${repl_argv[@]+"${repl_argv[@]}"} \
         < "$src" >"/tmp/jai_repl_out.$$" 2>"/tmp/jai_repl_err.$$")
     status=$?
@@ -395,9 +267,6 @@ $(diff -u "$expected_err" <(printf '%s\n' "$errout") | head -40)"
 done
 
 # ------------------------------------------------------------ 6. formatting
-# Off by default: re-parsing every file under lib, tests, examples and packages costs
-# several times what the other four layers cost together, which is too much to
-# pay on every run. `make fmt-check` is the same gate on its own.
 if [[ $FORMAT -eq 1 ]]; then
     printf '%sFormat check%s\n' "$BOLD" "$RESET"
     start=$(now_ms)

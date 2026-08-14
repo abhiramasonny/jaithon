@@ -103,7 +103,6 @@ pub class Polygon: Printable {
         let count = sides.len()
         for i in 0..count {
             for j in i + 1..count {
-                # Adjacent edges are meant to share exactly one endpoint.
                 if j == i + 1 or i == 0 and j == count - 1 { continue }
                 if sides[i].intersects(sides[j]) { return false }
             }
@@ -138,8 +137,6 @@ pub fn winding_number(ring: list[Point2], point: Point2) -> int {
     for index in 0..count {
         let a = ring[index]
         let b = ring[(index + 1) % count]
-        # Half-open in y so that a vertex exactly at the ray's height is
-        # counted by one of its two edges and not by both.
         if a.y <= point.y {
             if b.y > point.y and orientation(a, b, point) > 0 { winding += 1 }
         } elif b.y <= point.y and orientation(a, b, point) < 0 {
@@ -198,8 +195,6 @@ pub fn point_in_polygon_crossing(ring: list[Point2], point: Point2) -> bool {
     for index in 0..count {
         let a = ring[index]
         let b = ring[(index + 1) % count]
-        # The half-open comparison is what makes a vertex on the ray count
-        # once: exactly one of the two edges meeting there straddles it.
         if (a.y > point.y) != (b.y > point.y) {
             let crossing = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x)
             if point.x < crossing { inside = not inside }
@@ -385,11 +380,6 @@ pub fn triangulate(ring: list[Point2]) -> list[tuple[Point2, Point2, Point2]] {
         let next = next_of[current]
         let turn = orientation(working[previous], working[current], working[next])
         if turn == 0 {
-            # Clipping the neighbours has left this vertex in a straight line
-            # between the two that remain. It bounds no area, so unlink it
-            # without emitting anything: a zero-area triangle is not a
-            # triangle, and leaving it in place deadlocks the search — a ring
-            # of collinear leftovers has no ear at all.
             next_of[previous] = next
             previous_of[next] = previous
             remaining -= 1
@@ -485,9 +475,6 @@ fn _is_ear(
     if orientation(ring[previous], ring[current], ring[next]) <= 0 { return false }
     var index = next_of[next]
     while index != previous {
-        # Only a reflex vertex can be trapped inside another vertex's ear, and
-        # skipping the convex ones also avoids rejecting an ear because a
-        # neighbouring convex vertex grazes its boundary.
         let is_reflex = orientation(ring[previous_of[index]], ring[index], ring[next_of[index]]) < 0
         if is_reflex and _in_triangle(ring[index], ring[previous], ring[current], ring[next]) {
             return false

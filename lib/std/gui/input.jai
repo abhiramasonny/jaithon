@@ -326,8 +326,6 @@ pub class Keyboard {
                 }
                 Event.Text(text) => { self.typed += text }
                 Event.Focus(gained) => { if not gained { self.down = set() } }
-                # Keys held when the window loses focus never send their
-                # release, so drop them rather than leaving a key stuck.
                 _ => { }
             }
         }
@@ -514,8 +512,6 @@ pub class Input {
     pub fn text(self) -> str { return self.keyboard.text() }
 }
 
-# USB HID usage ids: the same numbers on every desktop platform, so one
-# table covers all of them.
 let _KEY_TABLE: list[tuple[int, Key]] = [
     (4, Key.A),
     (5, Key.B),

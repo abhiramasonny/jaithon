@@ -38,8 +38,6 @@ fn sum_x(o: any, n: int) -> int {
     return s
 }
 
-# Enough iterations that the loop is compiled on the first call, then entered
-# with the other class on the second.
 print(sum_x(A(), 200000) / 200000)
 print(sum_x(B(), 200000) / 200000)
 print(sum_x(A(), 200000) / 200000)

@@ -31,8 +31,6 @@ fn test_each_closure_gets_its_own_environment() -> void {
 }
 
 fn test_loop_variables_are_fresh_per_iteration() -> void {
-    # The classic trap: in a language that shares one loop variable, every
-    # closure here would see the final value.
     var fns = []
     for i in 0..3 { fns.push(|| i) }
     assert_eq(fns.map(|f| f()), [0, 1, 2])

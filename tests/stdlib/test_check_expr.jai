@@ -42,27 +42,22 @@ fn _ctx() -> Ctx {
     return Ctx(Universe())
 }
 
-# A binding of `ty`, and the symbol behind it, so that two use sites can share
-# one symbol — which is what narrowing needs.
 fn _symbol(c: Ctx, name: str, ty: Type?, kind: SymbolKind = SymbolKind.Local) -> Symbol {
     let symbol = Symbol(kind, name, Span(0, 0, 1), DeclKind.Let)
     c.set_symbol_type(symbol, ty)
     return symbol
 }
 
-# A fresh use of `symbol`, bound the way the resolver would have bound it.
 fn _use(c: Ctx, symbol: Symbol) -> Node {
     let node = Node.ident(symbol.name)
     c.resolution.bind(node, symbol)
     return node
 }
 
-# One binding used once: the common case.
 fn _binding(c: Ctx, name: str, ty: Type?) -> Node {
     return _use(c, _symbol(c, name, ty))
 }
 
-# A registered class, with its type interned and attached.
 fn _class(c: Ctx, name: str) -> TypeDecl {
     let decl = TypeDecl(name, Span(0, 0, 1))
     decl.ty = named(c.universe, TyKind.Class, name, decl)
@@ -70,13 +65,10 @@ fn _class(c: Ctx, name: str) -> TypeDecl {
     return decl
 }
 
-# The name of a class, as an expression: `Point` in `Point(1, 2)`.
 fn _class_name(c: Ctx, decl: TypeDecl) -> Node {
     return _use(c, _symbol(c, decl.name, decl.ty, SymbolKind.Class))
 }
 
-# A top-level function, its symbol and a call site for it. The symbol's `decl`
-# back-link is what makes the call bind against the real parameter list.
 fn _function(c: Ctx, name: str, params: list[dict[str, any]], signature: Type) -> Symbol {
     let decl = Node.fn_decl(name, params, Node.block([]))
     let symbol = _symbol(c, name, signature, SymbolKind.Global)
@@ -89,8 +81,6 @@ fn _call(c: Ctx, symbol: Symbol, args: list[dict[str, any]]) -> Node {
     return Node(NodeKind.Call, {"callee": _use(c, symbol), "args": args})
 }
 
-# A `resolve_ast_type` that knows the four scalars, so the argument tests can
-# see a declared parameter type at all. `checker.jai` supplies the real one.
 fn _scalar_types(c: Ctx, written: TypeExpr?) -> Type? {
     if written is null { return null }
     let name = written.name
@@ -117,7 +107,6 @@ fn test_literals_answer_their_own_type_and_record_it() -> void {
     let u = c.universe
     let node = Node.int_lit(3)
     assert_true(expr(c, node) == u.t_int)
-    # The answer is recorded, which is the C's `node->type`.
     assert_true(c.type_of(node) == u.t_int)
     assert_true(expr(c, Node.float_lit(1.5)) == u.t_float)
     assert_true(expr(c, Node.str_lit("a")) == u.t_str)
@@ -133,15 +122,11 @@ fn test_the_type_table_is_keyed_by_identity_not_by_value() -> void {
     let other = Node.int_lit(1)
     c.set_type(one, c.universe.t_int)
     assert_true(c.type_of(one) == c.universe.t_int)
-    # Two structurally equal nodes are two expressions, so `x` in two scopes
-    # cannot share a type any more than it can share a symbol.
     assert_true(c.type_of(other) is null)
 }
 
 fn test_an_unresolved_name_is_any_and_reports_nothing() -> void {
     let c = _ctx()
-    # The resolver already reported the undefined name; the checker does not
-    # pile on.
     assert_true(expr(c, Node.ident("nowhere")) == c.universe.t_any)
     assert_eq(c.bag.items.len(), 0)
 }
@@ -155,12 +140,9 @@ fn test_a_bound_name_answers_its_symbol_type() -> void {
 fn test_a_class_name_picks_its_type_up_from_the_registry() -> void {
     let c = _ctx()
     let decl = _class(c, "Point")
-    # The symbol has no type yet, which is the state a class referenced before
-    # its layout pass is in.
     let symbol = Symbol(SymbolKind.Class, "Point", Span.none(), DeclKind.Let)
     let node = _use(c, symbol)
     assert_eq(render(expr(c, node)), "Point")
-    # And it is remembered on the symbol, so the second use costs no lookup.
     assert_true(c.symbol_type(symbol) == decl.ty)
 }
 
@@ -171,7 +153,6 @@ fn test_a_folded_const_is_inlined_at_its_use_site() -> void {
     let symbol = Symbol(SymbolKind.Global, "K", Span.none(), DeclKind.Const)
     let node = _use(c, symbol)
     assert_true(expr(c, node) == u.t_int)
-    # Spec §3: the use site becomes the literal.
     assert_true(node.kind == NodeKind.IntLit)
     assert_eq(node.number("intLit"), 8)
 }
@@ -203,8 +184,6 @@ fn test_a_list_literal_fuses_an_int_with_a_float() -> void {
     let c = _ctx()
     let one = Node.int_lit(1)
     let node = Node(NodeKind.ListLit, {"items": [one, Node.float_lit(2.0)]})
-    # Spec §2.2: the int element is converted in place, so the `list[float]`
-    # the join reports is one the elements agree with.
     assert_eq(render(expr(c, node)), "list[float]")
     assert_true(one.kind == NodeKind.FloatLit)
 }
@@ -213,8 +192,6 @@ fn test_a_set_literal_is_deliberately_not_fused() -> void {
     let c = _ctx()
     let one = Node.int_lit(1)
     let node = Node(NodeKind.SetLit, {"items": [one, Node.float_lit(2.0)]})
-    # A number in a hash position decides which elements are the same element,
-    # so an inferred conversion could silently shrink the set.
     assert_eq(render(expr(c, node)), "set[int | float]")
     assert_true(one.kind == NodeKind.IntLit)
 }
@@ -226,8 +203,6 @@ fn test_an_annotated_list_checks_each_element_against_the_annotation() -> void {
     let node = Node(NodeKind.ListLit, {"items": [Node.int_lit(1), bad]})
     c.apply_context(c, node, list_of(u, u.t_int))
     assert_true(expr(c, node) == list_of(u, u.t_int))
-    # The offending element is reported, not the whole container failing
-    # against its own annotation.
     assert_eq(_code(c, 0), E0400_TYPE_MISMATCH)
     assert_eq(_message(c, 0), "mismatched element type: expected `int`, found `str`")
 }
@@ -244,9 +219,6 @@ fn test_a_container_context_of_the_wrong_shape_is_ignored_and_dropped() -> void 
     let c = _ctx()
     let u = c.universe
     let node = Node(NodeKind.ListLit, {"items": []})
-    # A hint is taken only when it is the right kind and arity for the literal
-    # under it; anything else is consumed and discarded, so it cannot leak into
-    # the inference.
     c.set_type(node, dict_of(u, u.t_str, u.t_int))
     assert_eq(render(expr(c, node)), "list[any]")
     assert_eq(c.bag.items.len(), 0)
@@ -280,8 +252,6 @@ fn test_arithmetic_widens_an_int_operand_against_a_float_one() -> void {
     let n = _binding(c, "n", u.t_int)
     let node = Node.binary(OpKind.Mul, n, Node.float_lit(1.5))
     assert_true(expr(c, node) == u.t_float)
-    # The conversion goes into the tree, so the VM performs one conversion
-    # rather than a type test on every evaluation.
     assert_true(n.kind == NodeKind.Cast)
     assert_true(n.flag("widen"))
 }
@@ -340,7 +310,6 @@ fn test_not_takes_a_condition_rather_than_an_operand() -> void {
     let c = _ctx()
     let u = c.universe
     let node = Node.unary(OpKind.Not, _binding(c, "n", u.t_int))
-    # `not` is a boolean position, so the failure is E0401 and not E0406.
     assert_true(expr(c, node) == u.t_bool)
     assert_eq(_code(c, 0), E0401_CONDITION_NOT_BOOL)
     assert_eq(_message(c, 0), "the condition of `not` must be `bool`, found `int`")
@@ -358,12 +327,6 @@ fn test_a_comparison_chain_is_bool_and_checks_every_operand_once() -> void {
         }
     )
     assert_true(expr(c, node) == u.t_bool)
-    # The operand's own error, and nothing about the links: `binary_result`
-    # answers `bool` for every comparison whatever the operands are — whether
-    # they compare at all is `__eq__`/`__lt__`, which is a member lookup this
-    # table does not do. A chain holds only comparisons, so the E0406 arm of
-    # `_check_chain` is unreachable. Verified against the C front end, which
-    # accepts `1 < 2 < "a"` for the same reason.
     assert_eq(c.bag.items.len(), 1)
     assert_eq(_code(c, 0), E0406_BAD_OPERAND_TYPES)
     assert_eq(_message(c, 0), "operator `+` does not apply to `str` and `int`")
@@ -378,10 +341,7 @@ fn test_a_ternary_joins_its_arms_and_narrows_each_edge() -> void {
         NodeKind.Ternary,
         {"cond": cond, "thenExpr": _use(c, maybe), "elseExpr": Node.int_lit(0)}
     )
-    # `x != null` is true on the then edge and false on the else edge, so the
-    # then arm sees `int` and the join is `int`, not `int?`.
     assert_eq(render(expr(c, node)), "int")
-    # The facts are undone afterwards.
     assert_eq(render(c.symbol_type(maybe)), "int?")
 }
 
@@ -395,7 +355,6 @@ fn test_the_right_operand_of_and_sees_what_the_left_established() -> void {
         _use(c, maybe)
     )
     assert_true(expr(c, node) == u.t_bool)
-    # Without the narrowing the right operand would be `bool?` and E0401.
     assert_eq(c.bag.items.len(), 0)
 }
 
@@ -451,8 +410,6 @@ fn test_a_condition_help_is_written_with_the_condition_own_spelling() -> void {
     condition(c, _binding(c, "found", optional_of(u, u.t_str)), "a ternary")
     assert_eq(c.bag.items[1].help, "test for absence explicitly: `found != null`")
 
-    # Anything larger than a bare name gets a placeholder rather than a guess
-    # at what the reader wrote.
     condition(c, Node.binary(OpKind.Add, Node.int_lit(1), _binding(c, "n", u.t_int)), "a ternary")
     assert_eq(c.bag.items[2].help, "compare explicitly: `n != 0`")
 }
@@ -494,8 +451,6 @@ fn test_a_class_that_declares_iter_is_iterable_with_element_any() -> void {
 fn test_a_class_that_declares_next_is_iterable_too() -> void {
     let c = _ctx()
     let decl = _class(c, "Cursor")
-    # `is_iterable` in `predicate.jai` knows only `iter` and `__iter__`; the
-    # checker adds `__next__` and the `Iterable` trait on top of it.
     decl.members.push(MemberInfo("__next__"))
     assert_true(iterable_element(c, null, decl.ty) == c.universe.t_any)
     assert_eq(c.bag.items.len(), 0)
@@ -526,7 +481,6 @@ fn test_a_constant_subscript_selects_the_tuple_member_it_names() -> void {
     let pair = _symbol(c, "pair", u.intern(TyKind.Tuple, null, [u.t_str, u.t_int]))
     assert_true(expr(c, Node.index(_use(c, pair), Node.int_lit(0))) == u.t_str)
     assert_true(expr(c, Node.index(_use(c, pair), Node.int_lit(1))) == u.t_int)
-    # A negative subscript counts from the end.
     assert_true(expr(c, Node.index(_use(c, pair), Node.int_lit(-1))) == u.t_int)
     assert_eq(c.bag.items.len(), 0)
 }
@@ -721,9 +675,6 @@ fn test_an_unknown_member_names_the_declaration_and_suggests_a_near_miss() -> vo
 fn test_a_member_of_a_class_with_an_unseen_parent_is_dynamic() -> void {
     let c = _ctx()
     let decl = _class(c, "Button")
-    # The parent's declaration is not visible here, so "no member" would be a
-    # guess — and it was a wrong one: every subclass of an imported class lost
-    # the whole inherited surface.
     decl.opaque_super = "Widget"
     let (t, _found) = member(c, Node.member(_binding(c, "b", decl.ty), "paint"))
     assert_true(t == c.universe.t_any)
@@ -736,11 +687,6 @@ fn test_a_plain_dot_on_an_optional_receiver_is_dynamic_and_silent() -> void {
     let decl = _class(c, "Point")
     decl.fields.push(FieldInfo("x", u.t_int, 0, VIS_PUBLIC))
     let (t, _found) = member(c, Node.member(_binding(c, "p", optional_of(u, decl.ty)), "x"))
-    # The E0400 "may be null" arm is written and cannot fire, in this port and
-    # in the C alike: `Point?` is a union, a union carries no declaration, and
-    # the null-declaration escape hatch above the check answers `any` first.
-    # Reproduced rather than corrected — `./jaithon check` on `var p: Point?
-    # = null; p.x` accepts it, so a port that reported would diverge.
     assert_true(t == u.t_any)
     assert_eq(c.bag.items.len(), 0)
 }
@@ -790,7 +736,6 @@ fn test_super_resolves_in_the_parent() -> void {
 
     let node = Node.member(Node(NodeKind.Super), "sides")
     assert_true(expr(c, node) == u.t_int)
-    # `self` and `super` in value position answer the class and its parent.
     assert_true(expr(c, Node(NodeKind.Self)) == derived.ty)
     assert_true(expr(c, Node(NodeKind.Super)) == base.ty)
 }
@@ -798,8 +743,6 @@ fn test_super_resolves_in_the_parent() -> void {
 fn test_a_member_of_a_builtin_container_is_dynamic() -> void {
     let c = _ctx()
     let u = c.universe
-    # Builtin containers carry their methods in the runtime, not in a
-    # declaration, so a load off one is not an unknown member.
     let node = Node.member(_binding(c, "xs", list_of(u, u.t_int)), "push")
     assert_true(expr(c, node) == u.t_any)
     assert_eq(c.bag.items.len(), 0)
@@ -817,7 +760,6 @@ fn test_a_call_of_a_declared_function_binds_against_its_parameters() -> void {
     let node = _call(c, f, [arg(Node.str_lit("x"))])
     assert_true(expr(c, node) == u.t_str)
     assert_eq(_code(c, 0), E0400_TYPE_MISMATCH)
-    # The label names the parameter it bound to, not the position.
     assert_eq(_message(c, 0), "argument `n` of `f`: expected `int`, found `str`")
 }
 
@@ -842,7 +784,6 @@ fn test_a_missing_required_argument_names_the_first_one() -> void {
     )
     expr(c, _call(c, f, []))
     assert_eq(_code(c, 0), E0602_BAD_CALL_ARITY)
-    # The one with a default is not missing.
     assert_eq(_message(c, 0), "`f` is missing 2 required arguments")
     assert_eq(c.bag.items[0].help, "the first one is `a`")
 }
@@ -880,7 +821,6 @@ fn test_a_spread_suppresses_every_arity_complaint() -> void {
     let c = _ctx()
     let u = c.universe
     let f = _function(c, "f", [param("a"), param("b")], fn_of(u, [u.t_int, u.t_int], u.t_int))
-    # Nothing here can know how many values the spread contributes.
     expr(c, _call(c, f, [arg(_binding(c, "xs", list_of(u, u.t_int)), null, true)]))
     assert_eq(c.bag.items.len(), 0)
 }
@@ -904,8 +844,6 @@ fn test_every_argument_is_checked_exactly_once_even_when_it_found_no_home() -> v
     let f = _function(c, "f", [param("n")], fn_of(u, [u.t_int], u.t_int))
     let stray = Node.binary(OpKind.Add, _binding(c, "s", u.t_str), Node.int_lit(1))
     expr(c, _call(c, f, [arg(Node.int_lit(1)), arg(stray)]))
-    # One arity error and one operand error: the argument that overflowed is
-    # still type-checked, and only once.
     assert_eq(c.bag.items.len(), 2)
     assert_eq(_code(c, 0), E0602_BAD_CALL_ARITY)
     assert_eq(_code(c, 1), E0406_BAD_OPERAND_TYPES)
@@ -914,8 +852,6 @@ fn test_every_argument_is_checked_exactly_once_even_when_it_found_no_home() -> v
 fn test_a_call_through_a_value_shows_the_signature_at_its_binding() -> void {
     let c = _ctx()
     let u = c.universe
-    # A parameter of function type denotes no declaration, so the arity is
-    # checked against the type and the label says where the value came from.
     let hook = _symbol(c, "hook", fn_of(u, [u.t_int], u.t_str), SymbolKind.Param)
     let node = Node(NodeKind.Call, {"callee": _use(c, hook), "args": []})
     assert_true(expr(c, node) == u.t_str)
@@ -1033,8 +969,6 @@ fn test_an_optional_call_chain_yields_an_optional_result() -> void {
         {"object": _binding(c, "p", optional_of(u, decl.ty)), "name": "norm"}
     )
     let node = Node(NodeKind.Call, {"callee": callee, "args": []})
-    # Spec §4.2: when `p` is null nothing is called and the call yields null,
-    # so the optional comes off the member load and back onto the result.
     assert_eq(render(expr(c, node)), "float?")
     assert_eq(c.bag.items.len(), 0)
 }

@@ -35,11 +35,6 @@
 
 typedef JAI_VEC(char *) DirList;
 
-/* Two lists, searched after the importing file's own directory: `sUserDirs`
- * (JAITHON_PATH plus whatever jaiModulePathAdd was given) and `sLibDirs` (the
- * installed library). They hold C strings rather than ObjStrings so the path
- * survives being configured before the VM is up; vm.modulePath mirrors both
- * for the collector and for tools that want to show the path. */
 static DirList sUserDirs;
 static DirList sLibDirs;
 static bool    sPathReady;
@@ -54,8 +49,6 @@ static bool dirListHas(const DirList *list, const char *dir) {
 static void dirListAdd(DirList *list, const char *dir) {
     if (dir == NULL || dir[0] == '\0') return;
 
-    /* Absolute form where possible: it makes the duplicate check meaningful
-     * and keeps `..` out of the directory list an error message prints. */
     char absolute[JAI_MAX_PATH];
     const char *entry = jaiPathAbsolute(absolute, sizeof absolute, dir)
                             ? absolute
@@ -75,10 +68,8 @@ static void dirListClear(DirList *list) {
     list->count = 0;
 }
 
-/* vm.modulePath is a mirror: nothing resolves through it, so it is rebuilt
- * wholesale whenever the path changes. */
 static void syncModulePathMirror(void) {
-    if (vm.gc == NULL) return;   /* before jaiVMInit there is nothing to intern */
+    if (vm.gc == NULL) return;
 
     vm.modulePath.count = 0;
     for (int i = 0; i < sUserDirs.count; i++) {
@@ -115,10 +106,6 @@ static int comparePackageNames(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-/* A workspace package owns one import root at <package>/src. The manifest is
- * the marker that distinguishes a package from an arbitrary directory. JSON
- * validation and dependency checks happen before tests and installation; the
- * runtime only needs the filesystem convention during bootstrap. */
 static void addPackageSourceDirs(const char *packagesDir) {
     if (packagesDir == NULL || !jaiPathIsDir(packagesDir)) return;
 
@@ -150,8 +137,6 @@ static void addPackageDirsRelative(const char *base, const char *suffix) {
 }
 
 void jaiModulePathInit(const char *execDir) {
-    /* Idempotent: the derived library directories are recomputed and anything
-     * added by hand in the meantime is kept. */
     dirListClear(&sLibDirs);
     sPathReady = true;
 
@@ -172,10 +157,6 @@ void jaiModulePathInit(const char *execDir) {
         }
     }
 
-    /* `make install` puts the binary in <prefix>/bin and the library in
-     * <prefix>/share/jaithon/lib; a build tree has ./jaithon next to ./lib.
-     * Both layouts are derived from wherever this executable actually is, so a
-     * relocated tree keeps working. */
     char derived[JAI_MAX_PATH];
     if (execDir == NULL || execDir[0] == '\0') {
         const char *exe = jaiExecutablePath();
@@ -194,11 +175,6 @@ void jaiModulePathInit(const char *execDir) {
         addPackageDirsRelative(execDir, "../share/jaithon/packages");
     }
 
-    /* The installed library, which a machine with jaithon already on it always
-     * has. JAITHON_NO_DEFAULT_PATH exists so that a test can tell the tree it
-     * is testing apart from the one that is installed: without it, moving a
-     * source aside proves nothing, because the search quietly finds the
-     * installed copy and the run succeeds for the wrong reason. */
     if (getenv("JAITHON_NO_DEFAULT_PATH") == NULL) {
         addLibDir("/usr/local/share/jaithon/lib");
         addLibDir("/usr/local/share/jaithon");
@@ -225,10 +201,6 @@ void ensurePathReady(void) {
 /* Dotted name -> file                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Path components come from source text, so they must not be able to name
- * anything outside a search directory. Spec §2.1 allows non-ASCII identifiers,
- * so the high half is let through and everything else — separators, `..`,
- * control bytes — is not. */
 static bool isNameByte(char c) {
     unsigned char u = (unsigned char)c;
     if (u >= 0x80) return true;
@@ -236,9 +208,6 @@ static bool isNameByte(char c) {
            (u >= '0' && u <= '9') || u == '_';
 }
 
-/* Split `dotted` into a leading-dot count and a '/'-separated relative path.
- * Reports E0804 and returns false on anything that is not
- * `'.'* ident ('.' ident)*`. */
 static bool splitModuleName(const char *dotted, int *outDots, char *relative,
                             size_t relSize) {
     *outDots = 0;
@@ -272,7 +241,6 @@ static bool splitModuleName(const char *dotted, int *outDots, char *relative,
             relative[pos++] = *p++;
         }
         if (pos == start) {
-            /* An empty component: "a..b", or a trailing dot. */
             return importFailure(E0804_INVALID_MODULE_PATH, vm.cImportError,
                                  "module path '%s' has an empty component",
                                  dotted);
@@ -290,8 +258,6 @@ static bool splitModuleName(const char *dotted, int *outDots, char *relative,
     return true;
 }
 
-/* The name a module is known by. Leading dots are an instruction to the
- * resolver, not part of the identity: `.util` is the module `util`. */
 const char *displayName(const char *dotted) {
     const char *p = dotted;
     while (*p == '.') p++;
@@ -302,8 +268,6 @@ bool isRegularFile(const char *path) {
     return path[0] != '\0' && jaiPathExists(path) && !jaiPathIsDir(path);
 }
 
-/* Absolute, symlink-resolved form of `candidate`, so that two spellings of the
- * same file share one entry in vm.modules. */
 bool storeResolved(char *out, size_t outSize, const char *candidate) {
     if (jaiPathAbsolute(out, outSize, candidate)) return true;
     size_t len = strlen(candidate);
@@ -315,7 +279,6 @@ bool storeResolved(char *out, size_t outSize, const char *candidate) {
     return true;
 }
 
-/* <dir>/std/math.jai, then the package form <dir>/std/math/mod.jai. */
 static bool tryDirectory(const char *dir, const char *relative, char *out,
                          size_t outSize) {
     char leaf[JAI_MAX_PATH];
@@ -342,8 +305,6 @@ static void noteSearched(JaiBuf *searched, int *count, const char *dir) {
     jaiBufAppendStr(searched, dir);
 }
 
-/* Base directory of a relative import: one dot is the importer's directory,
- * each further dot climbs one level. */
 static bool relativeBase(const char *fromDir, int dots, char *out,
                          size_t outSize) {
     const char *start = (fromDir != NULL && fromDir[0] != '\0') ? fromDir : ".";
@@ -434,12 +395,6 @@ bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
     return false;
 }
 
-/* The same search, asked speculatively. `jaiResolveModulePath` reports a miss —
- * as a diagnostic before the VM starts and as a raised ImportError once it is
- * running — because every caller so far was an import that has to fail. The
- * type checker is not: it asks whether a module it can see the name of has a
- * readable source, and a "no" is an answer, not an error. Both channels are
- * therefore restored to what they were. */
 bool jaiResolveModulePathQuiet(const char *dottedName, const char *fromDir,
                                char *out, size_t outSize) {
     JaiDiagBag live = gDiags;

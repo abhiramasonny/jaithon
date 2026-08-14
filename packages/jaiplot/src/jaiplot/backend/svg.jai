@@ -46,9 +46,6 @@ pub fn to_svg(list: DisplayList, width: int, height: int) -> str {
 
     var clips = []
     var body = []
-    # Iterating the typed list rather than the DisplayList itself: a `for` over
-    # a user Iterable erases the element type to `any`, which silently switches
-    # off the exhaustiveness check that makes adding a primitive safe.
     for primitive in list.to_list() {
         match primitive {
             Primitive.PushClip(rect) => {
@@ -107,11 +104,6 @@ fn _text(at: Point, content: str, style: TextStyle) -> str {
         HorizontalAnchor.Middle => "middle",
         HorizontalAnchor.End => "end",
     }
-    # The canvas anchors a run by the top-left of its glyph cell and SVG anchors
-    # by the baseline, so the run is placed in its own rotated frame: translate
-    # to the anchor, turn, then drop the baseline. Computing the baseline in
-    # unrotated space and rotating afterwards would turn that vertical offset
-    # into a horizontal one and slide the label sideways.
     let cell = text_height(content, style.scale)
     let baseline = match style.vertical {
         VerticalAnchor.Top => cell,
@@ -205,8 +197,6 @@ fn _raster(rect: Rect, pixels: list[int], width: int, height: int) -> str {
     let encoded = base64_encode(encode(image).to_list())
     let box = f"x=\"{_number(rect.left())}\" y=\"{_number(rect.bottom())}\""
     let size = f"width=\"{_number(rect.width())}\" height=\"{_number(rect.height())}\""
-    # Nearest-neighbour: an occupancy grid's cells are data, and smoothing them
-    # would invent occupancy that was never measured.
     let rendering = "image-rendering=\"pixelated\""
     return f"<image {box} {size} {rendering} href=\"data:image/png;base64,{encoded}\"/>"
 }
@@ -320,16 +310,12 @@ fn _color_attrs(color: Color, name: str) -> str {
 
 #: The nominal font size that matches the canvas metric at this scale.
 fn _font_size(style: TextStyle) -> float {
-    # The canvas cell is seven pixels tall and six wide including its spacing.
-    # A monospace face at this size advances close enough to six that the
-    # layout's reservation holds.
     return (style.scale * 10).to_float() * 0.7
 }
 
 fn _number(value: float) -> str {
     if not math.is_finite(value) { return "0" }
     let text = format("{:." + str(COORDINATE_PRECISION) + "f}", value)
-    # Trailing zeroes are noise in a coordinate stream this dense.
     if text.contains(".") {
         var trimmed = text
         while trimmed.ends_with("0") { trimmed = trimmed[0:trimmed.len() - 1] }
@@ -342,8 +328,6 @@ fn _number(value: float) -> str {
 
 #: Escape the five characters that cannot appear literally in XML text.
 fn _escape(content: str) -> str {
-    # The ampersand goes first: replacing it after the others would corrupt the
-    # entities they just introduced.
     var out = content.replace("&", "&amp;")
     out = out.replace("<", "&lt;").replace(">", "&gt;")
     return out.replace("\"", "&quot;").replace("'", "&apos;")

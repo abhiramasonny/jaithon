@@ -42,7 +42,6 @@ fn main() -> int {
     for entry in Path(SEED_ROOT).walk() {
         let source = f"{entry}"
         if not source.ends_with(".jai") { continue }
-        # A cache directory holds images, not sources.
         if source.contains("__jaicache__") { continue }
 
         let out = cache_path_for(source)
@@ -50,9 +49,6 @@ fn main() -> int {
         if build_file(source, out).ok() {
             built += 1
         } else {
-            # Not fatal on its own: a file the front end refuses is one the seed
-            # should not carry. `make reseed` checks the fixpoint afterwards,
-            # which is what turns a silent gap into a failure.
             refused += 1
             print(f"seed_touch: {source} did not compile")
         }

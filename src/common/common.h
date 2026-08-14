@@ -42,31 +42,9 @@
 #define JAI_VERSION_PATCH 2
 #define JAI_VERSION_STRING "3.1.2"
 
-/* Bumped whenever bytecode emission changes; invalidates .jaic caches.
- *
- * Raising this is safe and is meant to be routine: the seed is checked against
- * the range below rather than for equality, so an older seed still bootstraps
- * the newer binary and `make reseed` then brings it up to date. See the note
- * above `deserialize` in serialize.c for why equality deadlocked. */
 #define JAI_COMPILER_VERSION 19u
-
-/* The oldest emission this binary can still EXECUTE, and so the oldest seed it
- * will bootstrap from. Opcodes are append-only (see OP_COUNT in chunk.h), so
- * anything this VM has ever emitted it can still run, and this only has to move
- * for a change append-only cannot express -- renumbering an opcode, or widening
- * an operand.
- *
- * Moving it is a two-release migration, not a one-line edit: the release that
- * introduces the break has to read BOTH formats so the seed can be regenerated
- * across it, and the release after that drops the old reader. Setting it equal
- * to JAI_COMPILER_VERSION without doing that is how the bootstrap wedges.
- * JAITHON_SEED_ANY=1 is the way out if it happens anyway. */
 #define JAI_SEED_MIN_VERSION 18u
 
-/* A floor above the ceiling accepts no seed at all, which is a tree that cannot
- * build itself by construction rather than by accident. Caught here, where the
- * two numbers are next to each other, instead of as a missing front end an hour
- * later. */
 _Static_assert(JAI_SEED_MIN_VERSION <= JAI_COMPILER_VERSION,
                "JAI_SEED_MIN_VERSION is above JAI_COMPILER_VERSION: no seed "
                "can satisfy that range, so nothing could ever bootstrap");
@@ -110,14 +88,6 @@ JAI_NORETURN void jaiPanic(const char *file, int line, const char *fmt, ...)
 /* Allocation                                                          */
 /* ------------------------------------------------------------------ */
 
-/* The single allocation chokepoint. All heap traffic goes through here so the
- * GC can account for it and so out-of-memory is handled in one place.
- *
- *   jaiRealloc(NULL, 0,       n) -> allocate n bytes
- *   jaiRealloc(p,    old,     n) -> resize
- *   jaiRealloc(p,    old,     0) -> free, returns NULL
- *
- * Never returns NULL for a nonzero size; it panics instead. */
 void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize);
 
 #define JAI_ALLOC(type, count)                                                 \
@@ -133,16 +103,8 @@ void *jaiRealloc(void *ptr, size_t oldSize, size_t newSize);
 
 void *jaiCalloc(size_t elemSize, size_t count);
 char *jaiStrdup(const char *s);
-/* Copies exactly `n` bytes and appends a terminator; see jaiArenaMemdup on
- * why this is not `strndup`. Callers pass `n` on to whatever reads the copy. */
 char *jaiMemdup(const char *s, size_t n);
 
-/* Bytes currently handed out by jaiRealloc. This is the number the collector
- * compares against its threshold, and it is read on the interpreter's loop
- * back edge, so it is a plain global rather than something reached through a
- * call or mirrored into the GC by a hook: the mirror was a second counter
- * maintained on every single allocation to hold exactly the same value, and
- * removing it was 3.5% of tests/bench/dict_ops. Written only by jaiRealloc. */
 extern size_t jaiHeapBytes;
 static inline size_t jaiAllocatedBytes(void) { return jaiHeapBytes; }
 
@@ -150,22 +112,6 @@ static inline size_t jaiAllocatedBytes(void) { return jaiHeapBytes; }
 /* The small-object fast path, exposed                                 */
 /* ------------------------------------------------------------------ */
 
-/* memory.c owns the bins and the slab and is still the only place that calls
- * malloc/realloc/free. What is published here is the half of `jaiRealloc(NULL,
- * 0, n)` that touches neither: pop a bin, or bump the slab cursor. The slab
- * *refill*, which is the only part that reaches libc, stays out of line in
- * memory.c behind jaiSlabRefill.
- *
- * This exists because the JIT's allocation site is a leaf that must not call
- * anything, and because a call per object was measurably a tenth of a program
- * that only allocates. Every invariant the bins already depended on still
- * holds and is unchanged: a block's size class is derived from the same exact
- * size on both sides, a slab block never reaches free()/realloc(), and nothing
- * here is ever returned to libc.
- *
- * A caller that uses this rather than jaiRealloc takes on exactly one duty:
- * `size` must be one the bins serve (0 < size <= JAI_SMALL_MAX), which
- * jaiSmallServes answers. */
 #define JAI_SMALL_GRAIN   16u
 #define JAI_SMALL_MAX     512u
 #define JAI_SMALL_CLASSES (JAI_SMALL_MAX / JAI_SMALL_GRAIN)
@@ -174,18 +120,12 @@ extern void  *jaiSmallBin[JAI_SMALL_CLASSES + 1];
 extern char  *jaiSlabNext;
 extern size_t jaiSlabLeft;
 
-/* Hands back a fresh JAI_SLAB_BYTES slab with at least `need` bytes in it,
- * having binned whatever tail the old one had left. Out of line: it is the
- * one path here that calls malloc. */
 void jaiSlabRefill(size_t need);
 
-/* True when `size` is a request jaiSmallNew can serve. */
 JAI_INLINE bool jaiSmallServes(size_t size) {
     return size != 0 && size <= JAI_SMALL_MAX;
 }
 
-/* jaiRealloc(NULL, 0, size) for a size jaiSmallServes accepts, with the
- * accounting jaiRealloc would have done. Never NULL. */
 JAI_INLINE void *jaiSmallNew(size_t size) {
     unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
     void *p = jaiSmallBin[cls];
@@ -206,41 +146,17 @@ JAI_INLINE void *jaiSmallNew(size_t size) {
     return p;
 }
 
-/* The other half of the same pair: the bin push of jaiRealloc(ptr, size, 0),
- * without its byte accounting.
- *
- * This buys nothing wherever LTO can already see jaiRealloc -- it inlines this
- * exact sequence into jaiFreeObject, and putting it in the source there
- * measured as pure code growth. It exists for the one caller LTO cannot help:
- * the GC sweep, whose cost is the *call* to jaiFreeObject and not what
- * jaiFreeObject then does.
- *
- * The accounting is split off because it is a load and a store of one global
- * on a loop that runs once per corpse, and every iteration has to wait for the
- * previous one's store to forward -- a loop-carried dependency through memory
- * on a loop with millions of iterations and no other serial chain in it.
- * Nothing reads the counter between the start and end of a collection, so the
- * sweep sums what it frees in a register and calls jaiHeapAccountFreed once.
- *
- * The duty is jaiSmallNew's, unchanged: `size` must be the exact size the
- * block was allocated with, and one jaiSmallServes accepts. */
 JAI_INLINE void jaiSmallDeleteUnaccounted(void *p, size_t size) {
     unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
     *(void **)p = jaiSmallBin[cls];
     jaiSmallBin[cls] = p;
 }
 
-/* jaiRealloc(ptr, size, 0) for a size the bins serve, accounting included. */
 JAI_INLINE void jaiSmallDelete(void *p, size_t size) {
-    /* The clamp jaiRealloc's accountDelta applies, for the same reason: a
-     * caller that misreports size must not wrap the counter to near SIZE_MAX
-     * and convince the collector it can never free enough. */
     jaiHeapBytes = size > jaiHeapBytes ? 0 : jaiHeapBytes - size;
     jaiSmallDeleteUnaccounted(p, size);
 }
 
-/* Subtracts `total` from the live count with the same clamp, for a caller that
- * batched it. */
 JAI_INLINE void jaiHeapAccountFreed(size_t total) {
     jaiHeapBytes = total > jaiHeapBytes ? 0 : jaiHeapBytes - total;
 }
@@ -261,12 +177,8 @@ typedef struct {
 void  jaiArenaInit(JaiArena *arena, size_t blockSize);
 void *jaiArenaAlloc(JaiArena *arena, size_t size);
 void *jaiArenaAllocZeroed(JaiArena *arena, size_t size);
-/* Copies exactly `n` bytes and appends a terminator. Deliberately not
- * `strndup`: a Jaithon string is length-prefixed and may hold an embedded NUL
- * (`"a\0b"`), so stopping at one both shortens the text and leaves the
- * caller's recorded length pointing past the allocation. */
 char *jaiArenaMemdup(JaiArena *arena, const char *s, size_t n);
-void  jaiArenaReset(JaiArena *arena);   /* keeps blocks, resets offsets */
+void  jaiArenaReset(JaiArena *arena);
 void  jaiArenaFree(JaiArena *arena);
 
 #define JAI_ARENA_NEW(arena, type)                                             \
@@ -297,7 +209,6 @@ void   jaiBufWriteU32(JaiBuf *b, uint32_t v);
 void   jaiBufWriteU64(JaiBuf *b, uint64_t v);
 void   jaiBufWriteI16(JaiBuf *b, int16_t v);
 void   jaiBufWriteF64(JaiBuf *b, double v);
-/* Detach the buffer contents as a NUL-terminated heap string; resets `b`. */
 char  *jaiBufTakeCString(JaiBuf *b, size_t *outLen);
 
 /* ------------------------------------------------------------------ */
@@ -344,23 +255,15 @@ char  *jaiBufTakeCString(JaiBuf *b, size_t *outLen);
 uint64_t jaiHashBytes(const void *data, size_t len);   /* FNV-1a 64 */
 uint64_t jaiHashU64(uint64_t x);                       /* splitmix64 finaliser */
 uint32_t jaiCrc32(const void *data, size_t len);
-/* The portable table implementation. jaiCrc32 uses the ARMv8 CRC32
- * instructions where the target has them and falls back to this everywhere
- * else; the two must be one function, which tests/vm/crc32_equiv.c asserts. */
 uint32_t jaiCrc32Table(const void *data, size_t len);
 
 /* ------------------------------------------------------------------ */
 /* UTF-8                                                               */
 /* ------------------------------------------------------------------ */
 
-/* Decode one scalar at `s`; writes its byte length to *outLen.
- * Returns -1 and *outLen = 1 on invalid input. */
 int32_t jaiUtf8Decode(const char *s, const char *end, int *outLen);
-/* Encode `cp` into `out` (>= 4 bytes). Returns bytes written, 0 if invalid. */
 int     jaiUtf8Encode(int32_t cp, char *out);
-/* Number of scalars in [s, s+len). */
 size_t  jaiUtf8Length(const char *s, size_t len);
-/* Byte offset of scalar index `i`, or len if out of range. */
 size_t  jaiUtf8Offset(const char *s, size_t len, size_t i);
 bool    jaiUtf8Validate(const char *s, size_t len);
 
@@ -368,20 +271,16 @@ bool    jaiUtf8Validate(const char *s, size_t len);
 /* Files and paths                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Reads a whole file. Returns NULL on failure. Caller frees with jaiRealloc. */
 char *jaiReadFile(const char *path, size_t *outLen);
 bool  jaiWriteFile(const char *path, const void *data, size_t len);
 bool  jaiPathExists(const char *path);
 bool  jaiPathIsDir(const char *path);
 bool  jaiMakeDirs(const char *path);
-/* Joins with '/', normalising duplicate separators. Writes into `out`. */
 void  jaiPathJoin(char *out, size_t outSize, const char *a, const char *b);
 void  jaiPathDirname(char *out, size_t outSize, const char *path);
 void  jaiPathBasename(char *out, size_t outSize, const char *path);
-/* Absolute, symlink-resolved path. Returns false if the path does not exist. */
 bool  jaiPathAbsolute(char *out, size_t outSize, const char *path);
 
-/* Monotonic seconds since an arbitrary epoch; for timing. */
 double jaiClockMonotonic(void);
 
 #endif /* JAI_COMMON_H */

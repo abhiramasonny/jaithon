@@ -52,7 +52,6 @@
 /* Scalars and byte offsets                                             */
 /* ------------------------------------------------------------------ */
 
-/* Byte offset of scalar `index`; clamped to the byte length when past the end. */
 size_t jaiStrByteOffsetOf(ObjString *s, size_t index) {
     const size_t length = (size_t)s->length;
 
@@ -62,8 +61,6 @@ size_t jaiStrByteOffsetOf(ObjString *s, size_t index) {
     return jaiUtf8Offset(s->chars, length, index);
 }
 
-/* Scalar index of a byte offset that sits on a scalar boundary. Shared with
- * builtins_str_search.c. */
 size_t scalarIndexOf(ObjString *s, size_t offset) {
     if ((size_t)jaiStringScalarCount(s) == (size_t)s->length)
         return offset;
@@ -71,9 +68,6 @@ size_t scalarIndexOf(ObjString *s, size_t offset) {
     return jaiUtf8Length(s->chars, offset);
 }
 
-/* Resolves an optional [start, end) scalar window: negatives count from the
- * end, out-of-range bounds clamp, and an inverted window comes back empty.
- * Shared with builtins_str_search.c. */
 void resolveWindow(ObjString *s, int64_t start, int64_t end,
                    size_t *outStart, size_t *outEnd) {
     const size_t byteLength = (size_t)s->length;
@@ -103,8 +97,6 @@ void resolveWindow(ObjString *s, int64_t start, int64_t end,
     *outEnd = jaiUtf8Offset(s->chars, byteLength, (size_t)end);
 }
 
-/* First occurrence of `needle` in `hay`, or NULL. memchr narrows the scan to
- * the candidate starts, which is what makes the naive loop acceptable. */
 const char *jaiStrFindBytes(const char *hay, size_t hayLen,
                             const char *needle, size_t needleLen) {
     if (needleLen == 0) return hay;
@@ -135,8 +127,6 @@ const char *jaiStrFindBytes(const char *hay, size_t hayLen,
     return NULL;
 }
 
-/* Last occurrence of `needle` in `hay`, or NULL. Shared with
- * builtins_str_search.c (rfind) and builtins_str_split.c (rsplit). */
 const char *rfindBytes(const char *hay, size_t hayLen,
                        const char *needle, size_t needleLen) {
     if (needleLen == 0) return hay + hayLen;
@@ -175,9 +165,6 @@ const char *rfindBytes(const char *hay, size_t hayLen,
 /* Native plumbing                                                      */
 /* ------------------------------------------------------------------ */
 
-/* A bound native receives the receiver as args[0] and argc counts it, so every
- * method body reads its declared arguments from args[1] onwards. Shared with
- * every str method file through builtins_str_methods.h. */
 bool strReceiver(int argc, Value *args, const char *method, ObjString **out) {
     if (argc >= 1 && args != NULL) {
         const Value self = args[0];
@@ -195,7 +182,6 @@ bool strReceiver(int argc, Value *args, const char *method, ObjString **out) {
                     "str.%s() needs a str receiver, got nothing", method);
 }
 
-/* Turns a finished buffer into a str Value, consuming the buffer either way. */
 bool jaiStrTakeBuf(JaiBuf *buf, Value *out) {
     size_t length = 0;
     char *chars = jaiBufTakeCString(buf, &length);
@@ -223,16 +209,12 @@ bool jaiStrWantInt(Value v, const char *method, const char *what,
                     what, jaiTypeNameStatic(v));
 }
 
-/* An absent or null argument falls back; anything else must be an int. */
 bool jaiStrOptInt(int argc, Value *args, int slot, const char *method,
                    const char *what, int64_t fallback, int64_t *out) {
     if (argc <= slot || IS_NULL(args[slot])) { *out = fallback; return true; }
     return jaiStrWantInt(args[slot], method, what, out);
 }
 
-/* An absent or null argument yields NULL, which every caller reads as "use the
- * default character set". Shared with builtins_str_case.c and
- * builtins_str_split.c. */
 bool optStr(int argc, Value *args, int slot, const char *method,
            const char *what, ObjString **out) {
     if (argc <= slot || IS_NULL(args[slot])) {
@@ -243,8 +225,6 @@ bool optStr(int argc, Value *args, int slot, const char *method,
     return jaiStrWantStr(args[slot], method, what, out);
 }
 
-/* jaiListNew and jaiBytesNew take an int; text long enough to overflow one
- * simply starts with no reservation and grows. */
 int jaiStrCapacityFor(size_t n) { return n > (size_t)INT32_MAX ? 0 : (int)n; }
 
 /* ------------------------------------------------------------------ */
@@ -307,8 +287,6 @@ static const JaiStrMethodEntry kStrMethods[] = {
 static uint64_t gStrHashes[JAI_COUNT_OF(kStrMethods)];
 static uint8_t  gStrLengths[JAI_COUNT_OF(kStrMethods)];
 
-/* 40-ish methods at a 64-slot capacity keeps probing short while staying tiny.
- * Slots hold method-index + 1 so zero remains the empty marker. */
 #define STR_METHOD_INDEX_CAP 64u
 static uint16_t gStrSlots[STR_METHOD_INDEX_CAP];
 static bool     gStrIndexReady;
@@ -453,7 +431,6 @@ static bool primStrGet(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* A null bound means "the natural end", which is what makes s[a:] work. */
 bool jaiStrSliceBound(Value v, const char *name, int64_t fallback,
                            int64_t *out) {
     if (IS_NULL(v)) { *out = fallback; return true; }
@@ -496,8 +473,6 @@ static bool primStrCmp(int argc, Value *args, Value *out) {
         return true;
     }
 
-    /* UTF-8 byte order is scalar order, so memcmp gives the code-point
-     * ordering the language specifies without decoding anything. */
     size_t shared = a->length < b->length ? a->length : b->length;
     int cmp = shared > 0 ? memcmp(a->chars, b->chars, shared) : 0;
     if (cmp == 0) cmp = (a->length < b->length) ? -1 : (a->length > b->length);
@@ -521,8 +496,6 @@ static bool primStrFind(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The `__prim__` namespace object. It is looked up rather than assumed so that
- * whichever primitive group registers first creates it and the rest join in. */
 static ObjModule *primNamespace(void) {
     ObjString *name = jaiStringInternC("__prim__");
     if (name == NULL || vm.builtins == NULL) return NULL;
@@ -543,10 +516,6 @@ static ObjModule *primNamespace(void) {
     return m;
 }
 
-/* Registers one primitive under both spellings the rest of the tree might use:
- * a member of the `__prim__` module, which is how `__prim__.str_cmp(a, b)` in
- * lib/std resolves, and a builtins global with the dotted name, for a front end
- * that folds the whole path into one identifier. */
 void jaiStrDefinePrim(ObjModule *ns, const char *name, JaiNativeFn fn,
                        int minArity, int maxArity) {
     if (ns != NULL) {
@@ -578,8 +547,5 @@ void jaiRegisterStringPrimitives(void) {
     jaiStrDefinePrim(ns, "str_encode",         primStrEncode,         1, 1);
     jaiStrDefinePrim(ns, "str_decode",         primStrDecode,         1, 1);
 
-    /* The bytes primitives are registered from here rather than from their own
-     * entry point: Appendix C lists them beside the str ones and runtime.h
-     * declares one registrar for the pair. */
     jaiBytesRegisterPrimitives(ns);
 }

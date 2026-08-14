@@ -42,7 +42,6 @@ pub fn compare_types(a: Type?, b: Type?) -> int {
     return 0
 }
 
-# Flattening is why `(int | str) | float` interns as `int | str | float`.
 fn _collect(out: list[Type], t: Type?) -> void {
     if t == null { return }
     if t.kind == TyKind.Union {
@@ -66,7 +65,6 @@ pub fn union_of(u: Universe, members: list[Type?]) -> Type {
         live.push(member)
     }
 
-    # Insertion sort, as the C does, so ties break the same way every run.
     var sorted: list[Type] = []
     for member in live {
         var at = sorted.len()
@@ -76,7 +74,6 @@ pub fn union_of(u: Universe, members: list[Type?]) -> Type {
         sorted.insert(at, member)
     }
 
-    # The sort makes equal members adjacent, so one comparison each is complete.
     var unique: list[Type] = []
     for member in sorted {
         if unique.len() > 0 and compare_types(unique[unique.len() - 1], member) == 0 {

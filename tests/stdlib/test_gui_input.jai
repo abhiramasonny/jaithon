@@ -31,14 +31,6 @@ from std.gui.input import Key, Keyboard
 
 from std.test import assert_eq, assert_true, assert_false
 
-# Every key `Key` names, paired with the macOS virtual keycode that produces
-# it, in the order `lib/std/gui/input.jai` lists them. The HID id is never
-# written down here: each row asserts against `Key.code()`, so this table
-# checks the native layer against the library's own numbers rather than
-# against a third copy of them.
-#
-# One row per `Key` variant. A key added to `Key` without a row here fails
-# `test_the_translation_covers_every_named_key_exactly_once`.
 let _PLATFORM_KEYS: list[tuple[int, Key]] = [
     # Letters. AppKit numbers them by 1984 keyboard position, not alphabetically.
     (0, Key.A),
@@ -169,15 +161,6 @@ const _PLATFORM_ESCAPE = 53
 const _EVENT_KEY_DOWN = 1
 const _EVENT_KEY_UP = 2
 
-# True when the native layer has a keycode table at all, which is to say when
-# this build has a window system. Everywhere else every code translates to 0
-# and there is nothing here to assert.
-#
-# Deliberately the weakest question that separates the two: whether *some* code
-# translates to *something*, never whether it translates correctly. A guard
-# phrased as `gui_key_from_platform(53) == Key.Escape.code()` reads better and
-# is worthless — a build whose table was wrong would answer "unsupported" and
-# skip every test that would have caught it. This one skips only the stub.
 fn _translation_is_supported() -> bool {
     for (platform_code, _key) in _PLATFORM_KEYS {
         if __prim__.gui_key_from_platform(platform_code) != 0 { return true }
@@ -185,10 +168,6 @@ fn _translation_is_supported() -> bool {
     return false
 }
 
-# Push one key transition through the native path a real key event takes and
-# return what came back out, decoded exactly as `std.gui.Window.poll` decodes
-# it. This is the whole point of the file: `platform_code` goes in as the
-# window system's own number and `Event` comes out carrying a HID id.
 fn _inject(platform_code: int, down: bool, repeat: bool) -> list[Event] {
     let events: list[Event] = []
     for raw in __prim__.gui_test_key_event(platform_code, down, repeat) {
@@ -210,9 +189,6 @@ fn test_every_named_key_translates_from_its_platform_keycode() -> void {
 }
 
 fn test_the_translation_covers_every_named_key_exactly_once() -> void {
-    # Two keys sharing a HID id, or one named twice, would leave some other key
-    # with no row at all — and a row-by-row check cannot see a missing row.
-    # `Key` has 104 variants, so 104 distinct ids is the whole enum covered.
     let ids: set[int] = set()
     for (_platform_code, key) in _PLATFORM_KEYS { ids.add(key.code()) }
     assert_eq(ids.len(), _PLATFORM_KEYS.len())
@@ -226,15 +202,10 @@ fn test_no_two_keys_share_a_platform_keycode() -> void {
 }
 
 fn test_a_platform_keycode_naming_no_key_translates_to_nothing() -> void {
-    # HID usage 0 is the reserved "no event" id and `Key.from_code(0)` is null,
-    # so 0 is how the native layer says "this build names no such key".
     assert_true(Key.from_code(0) is null)
-    # The fn key, the volume keys and the JIS-only keys are real macOS keycodes
-    # that `Key` does not name.
     assert_eq(__prim__.gui_key_from_platform(63), 0)  # fn
     assert_eq(__prim__.gui_key_from_platform(72), 0)  # volume up
     assert_eq(__prim__.gui_key_from_platform(93), 0)  # JIS yen
-    # And nothing outside the table's range may index it.
     assert_eq(__prim__.gui_key_from_platform(-1), 0)
     assert_eq(__prim__.gui_key_from_platform(1000000), 0)
 }
@@ -243,9 +214,6 @@ fn test_a_synthesised_key_press_arrives_as_the_key_it_names() -> void {
     if not _translation_is_supported() { return }
     let keyboard = Keyboard()
 
-    # macOS reports Escape as 53. Untranslated it would reach `Key.from_code`
-    # as 53, which names Backquote — and before the table existed it reached
-    # nothing at all, because `Keyboard.update` drops a code no key names.
     keyboard.update(_inject(_PLATFORM_ESCAPE, true, false))
     assert_true(keyboard.just_pressed(Key.Escape))
     assert_true(keyboard.is_down(Key.Escape))
@@ -257,9 +225,6 @@ fn test_a_synthesised_key_press_arrives_as_the_key_it_names() -> void {
 }
 
 fn test_every_key_snake_reads_survives_the_round_trip() -> void {
-    # The keys `examples/snake.jai` binds, which is what the missing table
-    # actually broke: the arrows, WASD, Q and R. Each is pressed and released
-    # so nothing stays stuck down for the next assertion.
     if not _translation_is_supported() { return }
     let keyboard = Keyboard()
     let bound: list[tuple[int, Key]] = [
@@ -292,10 +257,6 @@ fn test_an_auto_repeat_is_reported_as_a_repeat_not_a_press() -> void {
 }
 
 fn test_the_polled_key_state_is_indexed_by_hid_usage_id() -> void {
-    # `gui_key_down` and the array behind it are the other consumer of the
-    # translation, and a table applied only on the event path would leave them
-    # answering questions about macOS numbers. macOS W is 13, which is `Key.J`
-    # in HID — so an untranslated array reports J held and W not.
     if not _translation_is_supported() { return }
     let pressed = __prim__.gui_test_key_event(13, true, false)
     assert_eq(pressed.len(), 1)
@@ -308,8 +269,6 @@ fn test_the_polled_key_state_is_indexed_by_hid_usage_id() -> void {
 }
 
 fn test_an_unnamed_platform_key_reaches_neither_the_queue_nor_the_state() -> void {
-    # The fn key names no `Key`, so it must be dropped in the native layer
-    # rather than recorded at index 0, where nothing would ever clear it.
     if not _translation_is_supported() { return }
     let events = __prim__.gui_test_key_event(63, true, false)
     assert_eq(events.len(), 0)

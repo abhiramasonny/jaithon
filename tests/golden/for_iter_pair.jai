@@ -29,7 +29,6 @@ print(keys)
 print(values)
 
 # --- a list of tuples, and a list of lists ----------------------------------
-# OP_UNPACK accepted both, so the fused form has to as well.
 var seen: list[str] = []
 for (name, n) in [("x", 1), ("y", 2)] { seen.push(f"{name}={n}") }
 for (name, n) in [["p", 7], ["q", 8]] { seen.push(f"{name}={n}") }
@@ -41,8 +40,6 @@ for (i, s) in ["a", "b", "c"].enumerate() { enumerated.push(f"{i}{s}") }
 print(enumerated)
 
 # --- the loop variables really are separate slots ---------------------------
-# Both are read after the loop, so a fused form that wrote one slot twice, or
-# wrote them in the wrong order, cannot pass here.
 var lastKey = ""
 var lastVal = 0
 for (k, v) in d.items() {
@@ -60,8 +57,6 @@ for (_k1, v1) in d.items() {
 print(cross)
 
 # --- shapes the window must NOT match ---------------------------------------
-# Three targets keep UNPACK 3. A rest target is UNPACK 2 with a rest index, not
-# 255, and still has a list to build, so the window has to test that byte too.
 var triples = 0
 for (a, b, c) in [(1, 2, 3), (4, 5, 6)] { triples += a * 100 + b * 10 + c }
 print(triples)
@@ -102,9 +97,6 @@ print(b.made)
 print([f"{k}{v}" for (k, v) in d.items()])
 
 # --- errors: word for word what UNPACK 2 raised ------------------------------
-# Through an untyped parameter, so the checker cannot answer these statically
-# and the runtime has to -- which is the whole point: the fused opcode is the
-# last thing that sees the value.
 fn hide(x) { return x }
 
 try {
@@ -131,8 +123,6 @@ try {
     print(e.message)
 }
 
-# The first entry binds; the second is the one that raises. Both slots must
-# still hold what the first pass put there.
 var partialA = ""
 var partialB = 0
 try {
@@ -169,10 +159,6 @@ for (_k, _v) in empty.items() { never += 1 }
 print(never)
 
 # --- hot enough to reach the compiled tier -----------------------------------
-# The JIT arm steps the list inline and guards the element's object type, its
-# arity and both component tags before writing anything, so a mixed list deopts
-# rather than storing a float's bits under an int's tag. `mixed` is what makes
-# that reachable: the sampled element is (int, int) and the second is not.
 fn total_pairs(xs: list[tuple[int, int]]) -> int {
     var t = 0
     for (a, b) in xs { t += a * b }
@@ -204,11 +190,6 @@ let mixed = [(1, 2), (3, 4.5), (5, 6)]
 print(spin_any(mixed, 4000))
 
 # --- the compiled arm's guards, failing for a real reason --------------------
-# `sum_pairs` compiles against a sample that is a 2-tuple of ints. Handed a list
-# of 2-element LISTS it must deopt at the element's object-type guard and hand
-# the whole loop back -- and the interpreter, which accepts a list there just as
-# UNPACK did, has to see every element, not every element but the first. The
-# guard sits before anything is written for exactly that reason.
 fn sum_pairs(xs) -> int {
     var t = 0
     for (a, b) in xs { t = t + a * b }

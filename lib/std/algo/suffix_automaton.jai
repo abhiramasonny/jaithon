@@ -21,8 +21,6 @@ pub class SuffixAutomaton {
     var transitions: list[dict[str, int]]
     var link: list[int]
     var length: list[int]
-    # 1 for a state a character created, 0 for a clone: the occurrences a state
-    # owns before anything is summed up the suffix-link tree.
     var owned: list[int]
     var counts: list[int]
     var last: int
@@ -59,10 +57,6 @@ pub class SuffixAutomaton {
             if self.length[p] + 1 == self.length[q] {
                 self.link[current] = q
             } else {
-                # `q` stands for occurrences both longer and shorter than
-                # length[p] + 1, and only the shorter ones may follow `p`. It
-                # splits into a clone carrying those and the original keeping
-                # the rest.
                 let clone = self._new_state(self.length[p] + 1, 0)
                 self.transitions[clone] = {k: v for (k, v) in self.transitions[q].items()}
                 self.link[clone] = self.link[q]
@@ -200,8 +194,6 @@ pub class SuffixAutomaton {
     }
 }
 
-# Duplicated in every sibling file that needs O(1) random access into a string
-# rather than repeated O(n) slicing: too small to be worth a shared import for.
 fn _chars(text: str) -> list[str] {
     let out: list[str] = []
     for ch in text { out.push(ch) }

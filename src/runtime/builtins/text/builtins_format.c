@@ -18,7 +18,7 @@
 
 typedef struct {
     int32_t fill;
-    bool    hasFill;     /* an explicit fill outranks the '0' flag */
+    bool    hasFill;
     char    align;       /* 0 for "by type" */
     char    sign;
     bool    alt;
@@ -49,8 +49,6 @@ static bool parseSpec(const char *spec, size_t len, FormatSpec *fs,
     fs->type = 0;
 
     size_t i = 0;
-    /* The fill scalar is only a fill when an alignment follows it, so that a
-     * lone `<` still reads as an alignment rather than as a fill. */
     if (len > 0) {
         int fillLen = 1;
         int32_t cp = jaiUtf8Decode(spec, spec + len, &fillLen);
@@ -79,7 +77,6 @@ static bool parseSpec(const char *spec, size_t len, FormatSpec *fs,
     if (i < len && spec[i] == '0') { fs->zero = true; i++; }
 
     while (i < len && spec[i] >= '0' && spec[i] <= '9') {
-        /* Beyond the maximum string length the field could never be built. */
         if (fs->width > (int64_t)UINT32_MAX) {
             return specError(where, spec, len, "width is too large");
         }
@@ -94,8 +91,6 @@ static bool parseSpec(const char *spec, size_t len, FormatSpec *fs,
         }
         fs->precision = 0;
         while (i < len && spec[i] >= '0' && spec[i] <= '9') {
-            /* A precision beyond this is a typo, not an intent: snprintf would
-             * happily try to materialise gigabytes of digits. */
             if (fs->precision > 100000) {
                 return specError(where, spec, len, "precision is too large");
             }
@@ -127,9 +122,6 @@ static bool typeIsFloat(char t) {
            t == 'G' || t == '%';
 }
 
-/* Groups `head` characters of `digits` from the right, every `groupSize`
- * chars; caller sets `head` since only it knows whether a trailing 'e' is a
- * hex digit or the start of an exponent. */
 static void appendGrouped(JaiBuf *out, const char *digits, size_t n,
                           size_t head, char sep, int groupSize) {
     if (sep == 0 || groupSize <= 0 || head == 0) {
@@ -151,8 +143,6 @@ static void appendGrouped(JaiBuf *out, const char *digits, size_t n,
     jaiBufAppend(out, digits + head, n - head);
 }
 
-/* Writes sign, base prefix and grouped magnitude into `body`; *headLen counts
- * the sign and prefix, which is where '=' alignment inserts its padding. */
 static void assembleNumber(JaiBuf *body, size_t *headLen, bool negative,
                            const char *prefix, const char *digits,
                            size_t digitLen, size_t groupable,
@@ -165,8 +155,6 @@ static void assembleNumber(JaiBuf *body, size_t *headLen, bool negative,
     appendGrouped(body, digits, digitLen, groupable, fs->group, groupSize);
 }
 
-/* The integer part of a rendered decimal number: everything before the point,
- * the exponent or a trailing '%'. */
 static size_t decimalRun(const char *s, size_t n) {
     size_t i = 0;
     while (i < n && s[i] >= '0' && s[i] <= '9') i++;
@@ -187,7 +175,6 @@ static void appendRadix(JaiBuf *out, uint64_t magnitude, int base, bool upper) {
     while (n > 0) jaiBufPush(out, (uint8_t)tmp[--n]);
 }
 
-/* Magnitude of an int64 without overflowing on INT64_MIN. */
 static uint64_t magnitudeOf(int64_t v) {
     return v < 0 ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
 }
@@ -235,7 +222,6 @@ static bool renderInteger(JaiBuf *body, size_t *headLen, int64_t value,
     return true;
 }
 
-/* *zeroPad is cleared for nan/inf, else zero padding would produce "0000-inf". */
 static void renderDouble(JaiBuf *body, size_t *headLen, double value,
                          const FormatSpec *fs, bool *zeroPad) {
     char type = fs->type ? fs->type : 'g';
@@ -247,7 +233,6 @@ static void renderDouble(JaiBuf *body, size_t *headLen, double value,
         const char *text = isnan(magnitude) ? (upper ? "NAN" : "nan")
                                             : (upper ? "INF" : "inf");
         *zeroPad = false;
-        /* NaN carries no sign in Jaithon's own str(), so neither does this. */
         FormatSpec bare = *fs;
         bare.group = 0;
         assembleNumber(body, headLen, negative && !isnan(magnitude), NULL, text,
@@ -273,7 +258,6 @@ static void renderDouble(JaiBuf *body, size_t *headLen, double value,
     jaiBufFree(&digits);
 }
 
-/* str()/repr() of a value, honouring `.precision` as a maximum length. */
 static bool renderText(JaiBuf *body, Value value, const FormatSpec *fs,
                        const char *where, const char *spec, size_t specLen) {
     if (fs->sign != '-' || fs->alt || fs->group != 0) {
@@ -304,7 +288,6 @@ static bool renderText(JaiBuf *body, Value value, const FormatSpec *fs,
     return true;
 }
 
-/* Pads `body` into `out` to the spec's width, counting scalars. */
 static bool padInto(JaiBuf *out, const JaiBuf *body, size_t headLen,
                     const FormatSpec *fs, bool numeric, bool zeroPad,
                     const char *where) {
@@ -315,7 +298,6 @@ static bool padInto(JaiBuf *out, const JaiBuf *body, size_t headLen,
     }
     size_t pad = (size_t)fs->width - scalars;
 
-    /* '0' is a shorthand for a '0' fill, so an explicit fill overrides it. */
     int32_t fill = (zeroPad && !fs->hasFill) ? '0' : fs->fill;
     char align = fs->align;
     if (align == 0) align = (numeric && zeroPad) ? '=' : (numeric ? '>' : '<');
@@ -348,14 +330,11 @@ static bool padInto(JaiBuf *out, const JaiBuf *body, size_t headLen,
     return true;
 }
 
-/* The whole engine for one value. `where` names the caller in diagnostics. */
 bool jaiFormatValue(JaiBuf *out, Value value, const char *spec,
                         size_t specLen, const char *where) {
     FormatSpec fs;
     if (!parseSpec(spec, specLen, &fs, where)) return false;
 
-    /* An int under a float type is promoted; a float under an int type is not
-     * demoted, because silently truncating is never what the spec asked for. */
     bool numeric = false;
     if (typeIsInteger(fs.type)) {
         if (!IS_INT(value) && !IS_BOOL(value)) {
@@ -386,8 +365,6 @@ bool jaiFormatValue(JaiBuf *out, Value value, const char *spec,
     } else if (typeIsFloat(fs.type)) {
         renderDouble(&body, &headLen, jaiAsDouble(value), &fs, &zeroPad);
     } else if (IS_FLOAT(value)) {
-        /* Default spec on a float: the shortest round-tripping form, then the
-         * ordinary sign, grouping and padding on top of it. */
         ObjString *text = jaiValueToStr(value);
         if (text == NULL) {
             ok = false;
@@ -412,8 +389,6 @@ bool jaiFormatValue(JaiBuf *out, Value value, const char *spec,
 /* str.format                                                          */
 /* ------------------------------------------------------------------ */
 
-/* `{name}` resolves against the dict arguments, searched left to right — a
- * native can't see the caller's bindings, hence no other namespace here. */
 static bool namedArgument(Value *args, int argc, const char *name, size_t len,
                           Value *out) {
     ObjString *key = jaiStringIntern(name, len);
@@ -517,8 +492,6 @@ bool jaiFormatTemplate(ObjString *tmpl, Value *args, int argc, Value *out,
     return jaiStrTakeBuf(&result, out);
 }
 
-/* An f-string hole may hold a value of any type, so this isn't a str method —
- * jaiBuiltinMethod offers it for every receiver instead. */
 static bool valueDunderFormat(int argc, Value *args, Value *out) {
     ObjString *spec;
     if (argc < 2) {

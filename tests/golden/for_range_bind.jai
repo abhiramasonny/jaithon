@@ -14,9 +14,6 @@
 #: under JAITHON_JIT_DEOPT_STRESS=1.
 
 # --- the bounds themselves --------------------------------------------------
-# An off-by-one in `end` shows here and almost nowhere else. Inclusive and
-# exclusive differ by exactly the last element, and the empty forms have to
-# produce no iterations rather than one or 2^64.
 fn total(lo: int, hi: int) -> int {
     var t = 0
     for i in lo..hi { t = t + i }
@@ -54,22 +51,15 @@ print(
 print([count(0, 5), count(0, 0), count(5, 0), count(-3, 3)])
 print([count_inclusive(0, 5), count_inclusive(0, 0), count_inclusive(5, 0), count_inclusive(-3, 3)])
 
-# The whole 64-bit range, at both ends. `end` is computed wrapping, so an
-# inclusive range ending at the largest int has to stop rather than wrap round
-# and start again; one that begins at the smallest has to start there.
 const INT_MAX = 9223372036854775807
 const INT_MIN = (-9223372036854775808)
 var big: list[int] = []
 for i in INT_MAX - 2..=INT_MAX { big.push(i - INT_MAX) }
 for i in INT_MIN..INT_MIN + 3 { big.push(i - INT_MIN) }
-for i in INT_MAX..=INT_MIN { big.push(999) }  # empty: hi < lo
+for i in INT_MAX..=INT_MIN { big.push(999) }
 print(big)
 
 # --- leaving early ----------------------------------------------------------
-# `break` and `continue` unwind the operand stack to a depth the emitter alone
-# knows, and the fused loop's depth is one shallower than the general one's. A
-# marker value sits under each loop so that a pop of the wrong size corrupts
-# something printable rather than going unnoticed.
 fn early(stop_at: int) -> str {
     let marker = "under"
     var seen: list[int] = []
@@ -84,7 +74,6 @@ print(early(7))
 print(early(0))
 print(early(100))
 
-# Two levels, both fused, leaving from the inner one.
 fn nested_break() -> str {
     let marker = -1
     var acc: list[int] = []
@@ -99,8 +88,6 @@ fn nested_break() -> str {
 }
 print(nested_break())
 
-# `return` from inside, at both nesting levels, leaving the frame rather than
-# the loop.
 fn returns_from_inside() -> int {
     for i in 0..10 {
         for j in 0..10 {
@@ -112,9 +99,6 @@ fn returns_from_inside() -> int {
 print(returns_from_inside())
 
 # --- protected regions ------------------------------------------------------
-# `break` out of a `try` inlines the `finally` chain first and then pops, and
-# the unwinder restores the stack itself on the exception path: two separate
-# routes out of the same loop.
 fn protected() -> str {
     var log: list[str] = []
     for i in 0..5 {
@@ -162,17 +146,12 @@ fn escaping() -> str {
 print(escaping())
 
 # --- the loop variable ------------------------------------------------------
-# One closure per iteration over the loop variable's own slot: OP_CLOSE_UPVALUE
-# still has to detach each iteration's binding even though the loop's counter
-# now lives beside it in the frame.
 var made: list[fn() -> int] = []
 for i in 0..4 { made.push(fn() -> int { return i * i }) }
 var squares: list[int] = []
 for f in made { squares.push(f()) }
 print(squares)
 
-# The loop variable's slot reused afterwards by something of another kind,
-# which is what the slot coalescer does with the hidden counter as well.
 fn reused() -> str {
     var out: list[str] = []
     for i in 0..3 { out.push(f"i{i}") }
@@ -183,8 +162,6 @@ fn reused() -> str {
 print(reused())
 
 # --- bounds that are not literals -------------------------------------------
-# Both ends are ordinary expressions, evaluated once at entry. A bound that
-# changes under the loop must not change the number of iterations.
 fn moving_bound() -> str {
     var n = 4
     var seen: list[int] = []
@@ -203,8 +180,6 @@ fn call_bounds(xs: list[int]) -> int {
 }
 print(call_bounds([1, 2, 3, 4, 5]))
 
-# A range reaching the loop through a variable keeps the general lowering, and
-# has to keep agreeing with the fused one.
 fn via_variable(lo: int, hi: int) -> int {
     let r = lo..hi
     var t = 0
@@ -213,10 +188,6 @@ fn via_variable(lo: int, hi: int) -> int {
 }
 print([via_variable(0, 5), via_variable(5, 0), via_variable(-3, 3)])
 
-# And hot enough to be compiled, which is the only remaining gate on the range
-# arms of OP_BUILD_RANGE, OP_GET_ITER and OP_FOR_ITER_BIND: every `for i in a..b`
-# written out at the loop now goes the fused way instead, so tests/golden/
-# jit_osr_range_bias and jit_nested_range_start no longer reach them either.
 fn hot_via_variable(n: int) -> int {
     let outer = 0..n
     var t = 0
@@ -228,8 +199,6 @@ fn hot_via_variable(n: int) -> int {
 }
 print(hot_via_variable(300))
 
-# A non-int bound raises the same TypeError, with the same words, as
-# OP_BUILD_RANGE always did.
 fn bad_bound(hi) -> str {
     try {
         for i in 0..hi { print(i) }
@@ -242,10 +211,6 @@ print(bad_bound(2.5))
 print(bad_bound("nine"))
 
 # --- hot enough to compile --------------------------------------------------
-# The arms above run interpreted at these sizes. These run long enough for the
-# function tier and the OSR tier to take them, so the compiled loop counter,
-# the compiled exit branch and the deopt that hands the loop back are all
-# exercised — and under JAITHON_JIT_DEOPT_STRESS every guard inside them fails.
 fn hot_sum(n: int) -> int {
     var t = 0
     for i in 0..n {
@@ -267,14 +232,10 @@ fn hot_early(n: int) -> int {
 }
 print(hot_early(400))
 
-# An OSR entry: one loop, entered once, running long enough to be compiled from
-# the middle. The counter has to survive the handover in both directions.
 var osr = 0
 for i in 0..2_000_000 { osr = osr + i % 7 }
 print(osr)
 
-# The loop variable taking a value the body then uses as a float, so the
-# compiled arm's kind adoption has something to disagree with.
 fn floaty(n: int) -> float {
     var t = 0.0
     for i in 1..n { t = t + 1.0 / float(i) }
@@ -283,12 +244,6 @@ fn floaty(n: int) -> float {
 print(f"{floaty(100000):.6f}")
 
 # --- labels, last in the file on purpose ------------------------------------
-# `labelled` leaves two fused loops at once and skips the rest of an outer body;
-# `mixed` nests a fused loop inside a general one and then the other way round,
-# so the two unwind conventions meet at every break and a labelled break crosses
-# from one to the other. They are last because `jaithon fmt` deletes the comment
-# run that follows a function containing a labelled loop, and a comment between
-# these two would be eaten by it.
 fn labelled() -> str {
     let marker = "keep"
     var acc: list[int] = []

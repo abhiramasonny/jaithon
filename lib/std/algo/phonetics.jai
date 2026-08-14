@@ -83,11 +83,7 @@ pub fn metaphone(word: str) -> str {
     if n == 0 { return "" }
     let out: list[str] = []
     var index = 0
-    # Where the word's first sound begins. Dropping a silent first letter moves
-    # it, so that the `E` of "aero" is still an initial vowel and survives.
     var first_sound = 0
-    # Silent first letters, which no later rule can catch because they are
-    # silent only at the very start.
     let opening = n >= 2 ? letters[0] + letters[1] : ""
     if opening == "AE" or opening == "GN" or opening == "KN" or opening == "PN" or opening == "WR" {
         index = 1
@@ -104,7 +100,6 @@ pub fn metaphone(word: str) -> str {
         let next = _at(letters, index + 1)
         let after = _at(letters, index + 2)
         let before = _at(letters, index - 1)
-        # A doubled letter says nothing twice, except CC as in "accident".
         if ch != "C" and before == ch {
             index += 1
             continue
@@ -119,7 +114,6 @@ pub fn metaphone(word: str) -> str {
             } elif next == "H" {
                 out.push("X")
             } elif next == "I" or next == "E" or next == "Y" {
-                # SC before a front vowel is a single S, as in "science".
                 if before != "S" { out.push("S") }
             } else {
                 out.push("K")
@@ -133,7 +127,6 @@ pub fn metaphone(word: str) -> str {
             }
         } elif ch == "G" {
             if next == "H" {
-                # GH speaks only at the end of a word or before a vowel.
                 if index + 1 == n - 1 or _is_vowel(after) { out.push("K") } else { index += 1 }
             } elif next == "I" or next == "E" or next == "Y" {
                 out.push("J")
@@ -180,7 +173,6 @@ pub fn metaphone(word: str) -> str {
         } elif ch == "V" {
             out.push("F")
         } elif ch == "W" or ch == "Y" {
-            # A semivowel is only heard when a vowel follows it.
             if _is_vowel(next) { out.push(ch) }
         } elif ch == "X" {
             out.push("KS")
@@ -208,8 +200,6 @@ fn _at(letters: list[str], index: int) -> str {
     return letters[index]
 }
 
-# Guards against the empty string that `_at` returns past either end: "" is a
-# substring of every string, so `"" in "AEIOU"` would be true.
 fn _is_vowel(ch: str) -> bool {
     return ch.len() == 1 and ch in "AEIOU"
 }

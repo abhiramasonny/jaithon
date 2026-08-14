@@ -452,7 +452,6 @@ class _LineIndex {
     }
 }
 
-# Doc blocks keyed by the line they document, which is the line after the block.
 fn _doc_blocks(comments: list[Comment]) -> dict[int, DocComment] {
     let blocks: dict[int, DocComment] = {}
     var run: list[Comment] = []
@@ -500,15 +499,10 @@ fn _doc_of(run: list[Comment]) -> DocComment {
         }
         if open { fence.push(text) }
     }
-    # An unclosed fence still becomes an example — running it is the only way
-    # to catch that it was never closed.
     if open and fence.len() > 0 { examples.push(Example(fence, fence_line, runnable)) }
     return DocComment("\n".join(body).strip(), examples)
 }
 
-# The doc block standing above the first declaration, not documenting it — a
-# block further down documents something private; no leading block means no
-# module doc, never the wrong one.
 fn _module_doc(blocks: dict[int, DocComment], claimed: set[int], first: int) -> DocComment? {
     var best: DocComment? = null
     var best_line = 0
@@ -528,8 +522,6 @@ fn _entry_of(node: Node, blocks: dict[int, DocComment], line_of: _LineIndex) -> 
     if kind is null { return null }
     if node.visibility() != Visibility.Public { return null }
     let line = line_of.of(node.span.start)
-    # A `VarDecl` has no `name` field at all — it binds a pattern, which may be
-    # a tuple — and asking for one raises rather than answering null.
     let name = if node.has("name") { node.opt_text("name") } else { _pattern_name(node) }
     if name is null { return null }
     return Entry(
@@ -598,8 +590,6 @@ fn _members_of(node: Node, blocks: dict[int, DocComment], line_of: _LineIndex) -
     for group in ["methods", "getters", "setters"] {
         if not node.has(group) { continue }
         for method in node.child_list(group) {
-            # A trait's requirements are public by definition: they are the
-            # contract the trait exists to state.
             if method.visibility() != Visibility.Public and node.kind != NodeKind.TraitDecl {
                 continue
             }
@@ -625,8 +615,6 @@ fn _entry_summary(entry: Entry) -> str {
     return doc.summary
 }
 
-# Variants are names, not signatures — a heading and fenced block each would
-# be chrome around one word, so they're listed instead.
 fn _variants_of(entry: Entry) -> list[Entry] {
     return [member for member in entry.members if member.kind == "variant"]
 }
@@ -680,8 +668,6 @@ fn _markdown_entry(entry: Entry, links: dict[str, str], level: int) -> list[str]
     return out
 }
 
-# `prefix` is the anchor of the declaration this is nested in, so two
-# classes' `init` methods get different ids and links land correctly.
 fn _html_entry(entry: Entry, links: dict[str, str], level: int, prefix: str) -> list[str] {
     let tag = f"h{min(level, 6)}"
     let anchor = if prefix.len() == 0 { entry.anchor() } else { prefix + "-" + entry.anchor() }
@@ -718,14 +704,10 @@ fn _html_entry(entry: Entry, links: dict[str, str], level: int, prefix: str) -> 
     return out
 }
 
-# The id a member gets on its page — must match what `search_index` uses
-# for the same member.
 fn _member_anchor(entry: Entry, member: Entry) -> str {
     return entry.anchor() + "-" + member.anchor()
 }
 
-# In first-use order. `own` is excluded: a link from `class Heap` to
-# `class Heap` tells the reader nothing they didn't just read.
 fn _referenced_types(signature: str, links: dict[str, str], own: str) -> list[str] {
     let found: list[str] = []
     let seen: set[str] = set()
@@ -777,8 +759,6 @@ fn _identifiers(text: str) -> list[str] {
     return words
 }
 
-# Fenced blocks become <pre>, everything else a paragraph — a doc comment is
-# prose and a code sample, not a full document.
 fn _html_block(markdown: str) -> str {
     let out: list[str] = []
     var paragraph: list[str] = []
@@ -821,9 +801,6 @@ fn _html_paragraph(lines: list[str]) -> str {
     return "<p>" + _inline_code(escape_html(" ".join(lines))) + "</p>"
 }
 
-# Only backtick code spans are handled — nothing else in Markdown's inline
-# syntax appears often enough in `lib/` to be worth it, and guessing wrong
-# inside a signature would be worse than not trying.
 fn _inline_code(escaped: str) -> str {
     let parts = escaped.split("`")
     if parts.len() < 3 { return escaped }
@@ -832,7 +809,6 @@ fn _inline_code(escaped: str) -> str {
         if index % 2 == 0 {
             out.push(part)
         } elif index == parts.len() - 1 {
-            # An odd backtick opens nothing, so it's text — print it back.
             out.push("`" + part)
         } else {
             out.push("<code>" + part + "</code>")
@@ -848,8 +824,6 @@ fn _html_head(title: str) -> str {
         "</head><body>"
 }
 
-# Every page carries the whole module list (a few kilobytes), so a reader
-# can get from one module's page to another without going back to the index.
 fn _html_sidebar(modules: list[ModuleDoc], current: str) -> str {
     let out: list[str] = [
         "<nav class=\"sidebar\"><a class=\"home\" href=\"index.html\">" +
@@ -864,8 +838,6 @@ fn _html_sidebar(modules: list[ModuleDoc], current: str) -> str {
     return "".join(out)
 }
 
-# JSON inside a <script> element: the only sequence that can end the element
-# early is `</`, and escaping the slash is invisible to a JSON parser.
 fn _script_json(json: str) -> str {
     return json.replace("</", "<\\/")
 }
@@ -946,8 +918,6 @@ fn _records_of(modules: list[ModuleDoc], extension: str) -> list[any] {
     return records
 }
 
-# The same records without the two fields a search box never reads — a
-# signature apiece would treble the index page for text nothing displays.
 fn _brief_records(records: list[any]) -> list[any] {
     return [{"mod": record["mod"], "name": record["name"], "kind": record["kind"], "summary": record["summary"], "page": record["page"], "anchor": record["anchor"]} for record in records]
 }

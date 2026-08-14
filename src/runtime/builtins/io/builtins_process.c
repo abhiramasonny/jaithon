@@ -31,10 +31,6 @@
 
 /* --- os_spawn ------------------------------------------------------ */
 
-/* A NUL-terminated argv (or "K=V" environment) built out of Jaithon strings.
- * Each entry points into the ObjString it came from, so the strings must stay
- * rooted for as long as the array is used — they are, being the native's own
- * arguments and the dict reachable from them. */
 typedef struct {
     const char **items;
     int          count;      /* entries, not counting the NULL terminator */
@@ -46,9 +42,6 @@ static void cstrVecFree(CStrVec *v) {
     v->count = 0;
 }
 
-/* A NUL inside an argument would silently truncate it at the exec boundary,
- * where there is no length to carry, so it is refused here rather than
- * half-honoured. */
 static bool checkExecText(ObjString *s, const char *what) {
     if (memchr(s->chars, '\0', s->length) != NULL)
         return jaiThrow(vm.cValueError, "os_spawn(): %s contains a NUL byte", what);
@@ -77,8 +70,6 @@ static bool argvFromList(ObjList *list, CStrVec *out) {
     return true;
 }
 
-/* The child's environment as "K=V" strings. The joined text is owned by this
- * vector, since neither half exists as one string anywhere else. */
 typedef struct {
     CStrVec  vec;
     char   **owned;
@@ -152,9 +143,6 @@ static bool spawnOption(ObjDict *options, const char *key, Value *out) {
     return jaiDictGet(options, OBJ_VAL(name), out) && !IS_NULL(*out);
 }
 
-/* The pid of the child a `wait`/`poll`/`signal` callable belongs to travels as
- * the bound receiver, which is why these are ObjBound over an int rather than
- * closures: the VM already passes a bound receiver as args[0]. */
 static bool nOsWait(int argc, Value *args, Value *out) {
     (void)argc;
     int64_t pid;
@@ -181,7 +169,7 @@ static bool nOsPoll(int argc, Value *args, Value *out) {
     if (errno != 0)
         return jaiThrow(vm.cOSError, "poll(): cannot poll process %lld: %s",
                         (long long)pid, strerror(errno));
-    *out = NULL_VAL;      /* still running */
+    *out = NULL_VAL;
     return true;
 }
 
@@ -207,8 +195,6 @@ static Value boundToPid(int pid, JaiNativeFn fn, const char *name,
     return OBJ_VAL(bound);
 }
 
-/* One end of a child's pipe as a `file`, so std.io.File can adopt it. Closing
- * the File closes the descriptor, which is what the class documents. */
 static ObjFile *fileFromFd(int fd, const char *mode, const char *label) {
     FILE *stream = fdopen(fd, mode);
     if (stream == NULL) { (void)close(fd); return NULL; }
@@ -220,11 +206,6 @@ static ObjFile *fileFromFd(int fd, const char *mode, const char *label) {
 }
 
 static bool spawnStreamResult(const JaiSpawnResult *spawned, Value *out) {
-    /* Each wrapper is rooted before the next one allocates, and each is
-     * created only if the one before it succeeded — so `wrapped` is both the
-     * number of roots to pop and the number of descriptors already owned by an
-     * ObjFile, which the collector closes for us. Everything past it is a raw
-     * descriptor nothing owns yet. */
     const int fd[3] = { spawned->stdinFd, spawned->stdoutFd, spawned->stderrFd };
     static const char *const mode[3] = { "w", "r", "r" };
     static const char *const label[3] = { "<stdin>", "<stdout>", "<stderr>" };
@@ -233,7 +214,7 @@ static bool spawnStreamResult(const JaiSpawnResult *spawned, Value *out) {
     int wrapped = 0;
     while (wrapped < 3) {
         file[wrapped] = fileFromFd(fd[wrapped], mode[wrapped], label[wrapped]);
-        if (file[wrapped] == NULL) break;      /* it closed fd[wrapped] itself */
+        if (file[wrapped] == NULL) break;
         jaiGCPushRoot(OBJ_VAL(file[wrapped]));
         wrapped++;
     }
@@ -263,7 +244,6 @@ static bool spawnStreamResult(const JaiSpawnResult *spawned, Value *out) {
     return true;
 }
 
-/* __prim__.os_spawn(argv, options) — spec Appendix C. */
 static bool nOsSpawn(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *command;
@@ -329,8 +309,6 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
     if (hasEnv) envVecFree(&env);
 
     if (status == JAI_SPAWN_EXEC) {
-        /* ENOENT here is "the program is not on PATH", which lib/std/os.jai
-         * documents as FileNotFoundError; anything else is an OSError. */
         if (failure == ENOENT || failure == ENOTDIR)
             return jaiThrow(vm.cFileNotFoundError,
                             "os_spawn(): no such program: %s", programCopy);

@@ -1,11 +1,4 @@
 // Names the compiler knows without being told.
-//
-// Builtin functions, methods on primitive receivers and the exception
-// hierarchy are all registered in C, so no `.jai` file declares them and the
-// analyser cannot find them by parsing. The tables here mirror
-// src/runtime/builtins/builtins.c, builtins_core.c and errors.c. Hover and completion
-// use them; nothing depends on them being exhaustive, and a name that has
-// drifted simply stops being offered.
 
 const KEYWORDS = [
     'and', 'as', 'assert', 'break', 'case', 'catch', 'class', 'const', 'continue',
@@ -61,15 +54,6 @@ const FUNCTIONS = {
     bytes: { signature: 'bytes(values = []) -> bytes', doc: 'Build a byte string.' },
 };
 
-/**
- * Methods on primitive receivers.
- *
- * Only a fallback: `refresh` replaces these by asking the running VM what each
- * type actually answers to. The tables in builtins.c that this mirrors are the
- * names `dir` *probes*, not the ones that exist — `list` lists thirteen methods
- * here that no build implements — so the live answer is the correct one and
- * this is what is used until it arrives.
- */
 const FALLBACK_METHODS = {
     str: ['at', 'capitalize', 'center', 'chars', 'code_at', 'contains', 'count',
           'encode', 'ends_with', 'find', 'format', 'index', 'is_alnum', 'is_alpha',
@@ -140,13 +124,6 @@ let METHODS = { ...FALLBACK_METHODS };
 let EXCEPTION_MEMBERS = [...FALLBACK_EXCEPTION_MEMBERS];
 let live = false;
 
-/**
- * Ask the VM which methods each primitive receiver answers to.
- *
- * `dir` probes the real dispatch table, so this is the only account of the
- * builtin surface that cannot drift: a method the build does not implement
- * stops being offered the moment you rebuild. One process, about 6 ms.
- */
 const PROBE = '{"int": dir(0), "float": dir(0.0), "str": dir(""), "list": dir([]), '
     + '"dict": dir({}), "set": dir(set()), "tuple": dir((1, 2)), "range": dir(0..1), '
     + '"bytes": dir(bytes()), "Iterator": dir([].iter()), "Error": dir(Error(""))}';

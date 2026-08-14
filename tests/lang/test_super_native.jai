@@ -55,8 +55,6 @@ class Holder {
 }
 
 fn test_a_callable_field_is_still_a_plain_call() -> void {
-    # `h.f(4)` looks like a method call and is not one: the field goes in slot
-    # zero and gets no receiver, which is the case the fix must not disturb.
     let h = Holder(|x| x * 3)
     assert_eq(h.f(4), 12)
 }

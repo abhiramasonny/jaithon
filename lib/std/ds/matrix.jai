@@ -217,7 +217,6 @@ pub class Matrix {
         for row in 0..self.rows {
             let line = self.cells[row]
             let out = result.cells[row]
-            # Walking `other` row-by-row matches its row-major layout.
             for inner in 0..self.columns {
                 let factor = line[inner]
                 if factor == 0.0 { continue }
@@ -321,8 +320,6 @@ pub class Matrix {
                 let carry = permutation[pivot]
                 permutation[pivot] = permutation[best]
                 permutation[best] = carry
-                # Multipliers already stored in `lower` belong to these rows,
-                # so they move too.
                 for column in 0..pivot {
                     let held = lower.cells[pivot][column]
                     lower.cells[pivot][column] = lower.cells[best][column]

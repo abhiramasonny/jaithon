@@ -64,7 +64,6 @@ def main():
         if a != b:
             problems.append(f"row {i}: chunk.c {a} != emit.jai {b}")
 
-    # spec/BYTECODE.md names opcodes without the OP_ prefix.
     for name, _, _ in c:
         if name[3:] not in spec:
             problems.append(f"spec/BYTECODE.md does not document {name}")

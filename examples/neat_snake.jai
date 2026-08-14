@@ -556,7 +556,6 @@ class Trainer {
         self.species_count = groups.len()
         let next: list[Genome] = []
 
-        # Preserve the best member of every species.
         for group in groups {
             var champion = group.members[0]
             for member in group.members {

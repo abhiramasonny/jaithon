@@ -63,8 +63,6 @@ pub fn narrow(u: Universe, t: Type?, by: Type?, positive: bool) -> Type? {
     return if is_subtype(u, t, by) { u.t_never } else { t }
 }
 
-# The order of the two tests is observable: generics erase, so `Box[int]` and
-# `Box[str]` are each a subtype of the other. Keep first, so `m` survives.
 fn _narrow_member(u: Universe, m: Type, by: Type) -> Type? {
     if is_subtype(u, m, by) { return m }
     if is_subtype(u, by, m) { return by }

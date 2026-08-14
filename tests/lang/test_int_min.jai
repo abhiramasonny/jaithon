@@ -18,8 +18,6 @@ fn test_every_base_spells_the_same_int_min() -> void {
     assert_eq((-0x8000_0000_0000_0000), m)
     assert_eq((-0o1000000000000000000000), m)
     assert_eq((-0b1000000000000000000000000000000000000000000000000000000000000000), m)
-    # A bare hex/octal/binary literal is a bit pattern, so it reaches INT_MIN
-    # without the sign at all.
     assert_eq(0x8000000000000000, m)
 }
 
@@ -31,11 +29,10 @@ fn test_int_min_behaves_like_an_int() -> void {
     assert_eq(m // 2, -4611686018427387904)
     assert_true(m < 0)
     assert_eq(~m, 9223372036854775807)
-    assert_eq(m -% 1, 9223372036854775807)  # wrapping ops take it like any int
+    assert_eq(m -% 1, 9223372036854775807)
 }
 
 fn test_negating_int_min_still_raises() -> void {
-    # -INT_MIN is not representable, so only the literal form is special.
     let m = (-9223372036854775808)
     assert_throws(OverflowError, || -m)
     assert_throws(OverflowError, || 0 - m)
@@ -44,12 +41,10 @@ fn test_negating_int_min_still_raises() -> void {
 }
 
 fn test_prefix_minus_stays_unambiguous() -> void {
-    # `a -1` is a subtraction: `a` ends an operand, so the `-` is binary.
     let a = 10
     assert_eq(a - 1, 9)
     assert_eq(a - 1, 9)
     assert_eq([a - 1], [9])
-    # `- x` is a negation of a name, literal folding or not.
     let x = 3
     assert_eq(-x, -3)
     assert_eq(-x, -3)

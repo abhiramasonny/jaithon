@@ -86,7 +86,6 @@ pub fn fibonacci(n: int) -> int {
     if n == 0 { return 0 }
     var previous = 0
     var current = 1
-    # Stops at F(n), not F(n + 1) — F(93) would overflow.
     for _ in 1..n {
         let next = previous + current
         previous = current
@@ -163,7 +162,6 @@ pub fn longest_common_subsequence[T](a: list[T], b: list[T]) -> list[T] {
 pub fn longest_increasing_subsequence(xs: list[int], strict: bool = true) -> list[int] {
     let n = xs.len()
     if n == 0 { return [] }
-    # pile_top[k]/pile_values[k]: index/value of the smallest tail among length-(k+1) subsequences.
     let pile_top: list[int] = []
     let pile_values: list[int] = []
     let parent = [-1 for _ in 0..n]
@@ -551,7 +549,6 @@ pub fn max_submatrix(grid: list[list[int]]) -> Submatrix {
             throw ValueError(f"row {r} has {grid[r].len()} columns, expected {columns}")
         }
     }
-    # Seeded with the top-left cell (a valid block), so every replacement below is a strict improvement.
     var best = Submatrix(grid[0][0], 0, 0, 1, 1)
     for top in 0..rows {
         let column_sums = [0 for _ in 0..columns]
@@ -733,7 +730,6 @@ pub fn palindrome_partitioning(text: str) -> list[str] {
     let cuts = [0 for _ in 0..=n]
     let start_of = [0 for _ in 0..=n]
     for stop in 1..=n {
-        # Seeded with peeling off the last character alone — always a valid (palindrome) split.
         cuts[stop] = cuts[stop - 1] + 1
         start_of[stop] = stop - 1
         for start in 0..stop - 1 {
@@ -788,7 +784,6 @@ pub fn catalan(n: int) -> int {
 #: fib(50)    # 12586269025
 #: ```
 pub fn memoize_recursive(body: fn(fn(any) -> any, any) -> any) -> fn(any) -> any {
-    # `var`, not `let` — the closure below must capture the cell, patched to the real entry point next.
     var recurse: fn(any) -> any = |argument| argument
     recurse = memoize(fn(argument: any) -> any { return body(recurse, argument) })
     return recurse
@@ -801,7 +796,6 @@ fn _mat2_fib_power(exponent: int) -> list[int] {
     while remaining > 0 {
         if remaining & 1 == 1 { result = _mat2_multiply(result, base) }
         remaining >>= 1
-        # Skips the final squaring — keeps every intermediate entry at or below F(92).
         if remaining > 0 { base = _mat2_multiply(base, base) }
     }
     return result
@@ -893,7 +887,6 @@ fn _subset_indices(reachable: list[list[bool]], xs: list[int], target: int) -> l
     var remaining = target
     var i = xs.len()
     while i > 0 {
-        # Element i - 1 is needed exactly when the sum was out of reach without it.
         if not reachable[i - 1][remaining] {
             picked.push(i - 1)
             remaining -= xs[i - 1]

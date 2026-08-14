@@ -149,8 +149,6 @@ pub class PoseCloud: Series {
             let high = (bucket + 1).to_float() / WEIGHT_BUCKETS.to_float()
             let placed = self._place(frame, low * heaviest, high * heaviest + 1e-12)
             if placed.len() == 0 { continue }
-            # The faintest bucket still has to be visible, or a filter that has
-            # not converged looks empty rather than uncertain.
             let strength = 0.25 + 0.75 * (bucket + 1).to_float() / WEIGHT_BUCKETS.to_float()
             let paint = Paint.solid(self.base.with_alpha(self.opacity * strength))
             out.push(self._batch(placed, oriented, paint, frame))
@@ -440,8 +438,6 @@ pub class Grid: Series {
         var pixels = []
         let span = self.high - self.low
         for row in 0..self.rows {
-            # Row zero is the bottom of the data, and a pixel buffer starts at
-            # the top, so the rows are emitted in reverse.
             let source = (self.rows - 1 - row) * self.columns
             for column in 0..self.columns {
                 pixels.push(self._shade(self.cells[source + column], span))

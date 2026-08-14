@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# sum(jaiOpCounts) must equal vm.instructionCount.
-#
-# The per-opcode histogram and the total counter are incremented in different
-# places -- jaiOpCounts in the dispatch macros, instructionCount in the VM
-# struct -- so the two agreeing is the only evidence that no dispatch path
-# skips the histogram. VM_NEXT_HINT skipped it for five sites, and loop_sum's
-# OP_LOOP reported zero against a true 14.28% of the run.
-#
-# Requires the histogram to be printed unfiltered: jaiVMPrintStats used to
-# suppress any opcode at or below tot/200, which makes the sum meaningless.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

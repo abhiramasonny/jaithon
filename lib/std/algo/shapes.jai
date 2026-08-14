@@ -407,9 +407,6 @@ pub class Circle: Printable {
         }
         if separation > self.radius + other.radius + tolerance { return [] }
         if separation < math.fabs(self.radius - other.radius) - tolerance { return [] }
-        # Project onto the centre line: `along` is the distance from this
-        # centre to the chord, `half_chord` the distance from the chord's
-        # midpoint to each intersection.
         let along = (separation * separation + self.radius * self.radius - other.radius * other.radius) /
             (2.0 * separation)
         let squared = self.radius * self.radius - along * along

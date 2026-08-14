@@ -12,7 +12,6 @@ print(greet("Ada"))
 print(greet("Alan", "Hi"))
 print(greet(name: "Grace", greeting: "Hey"))
 
-# Defaults are evaluated per call, so a mutable default is not shared.
 fn collect(item: int, into: list[int] = []) -> list[int] {
     into.push(item)
     return into
@@ -37,7 +36,6 @@ fn factorial(n: int) -> int {
 }
 print(factorial(10))
 
-# Mutual recursion — declarations are hoisted, so order does not matter.
 fn is_even(n: int) -> bool {
     if n == 0 { return true }
     return is_odd(n - 1)
@@ -50,7 +48,6 @@ fn is_odd(n: int) -> bool {
 print(is_even(10))
 print(is_odd(10))
 
-# Closures capture by reference for `var`, by value for `let`.
 fn make_counter() -> fn() -> int {
     var count = 0
     return fn() -> int {

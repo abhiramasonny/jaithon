@@ -88,8 +88,6 @@ pub fn linspace(start: float, stop: float, count: int) -> list[float] {
 #: arange(2.0, 2.0, 0.5)     # []
 #: ```
 pub fn arange(start: float, stop: float, step: float) -> list[float] {
-    # First, because everything below compares: an ordered comparison against a
-    # NaN raises `TypeError`, and the caller deserves to hear which argument.
     if not is_finite(start) or not is_finite(stop) or not is_finite(step) {
         throw ValueError(f"arange needs finite bounds, got start={start}, stop={stop}, step={step}")
     }
@@ -97,9 +95,6 @@ pub fn arange(start: float, stop: float, step: float) -> list[float] {
         throw ValueError("step must be non-zero, got 0.0")
     }
     let span = stop - start
-    # A zero span is an empty result rather than an error — `range(3, 3)` is
-    # empty too. What is an error is a step that points away from `stop`, which
-    # is `start` itself failing the same test every element has to pass.
     if span != 0.0 and not _is_before(start, stop, step) {
         throw ValueError(f"step {step} never reaches stop {stop} from start {start}")
     }
@@ -249,10 +244,6 @@ pub fn extent(values: list[float], pad_fraction: float = 0.05) -> tuple[float, f
 #: percentile([1.0, 2.0, 3.0, 4.0], 100.0)    # 4.0
 #: ```
 pub fn percentile(values: list[float], p: float) -> float {
-    # The NaN test leads and `or` short-circuits past the rest. An ordered
-    # comparison against NaN raises rather than answering false, so `p < 0.0`
-    # on its own would report `TypeError` where the caller's mistake deserves
-    # the `ValueError` every other bad `p` gets.
     if math.is_nan(p) or p < 0.0 or p > 100.0 {
         throw ValueError(f"p must be a percentage in [0, 100], got {p}")
     }
@@ -299,7 +290,6 @@ pub fn finite_only(values: list[float]) -> list[float] {
     return values.filter(is_finite)
 }
 
-# Whether `value` is still short of `stop` in the direction `step` travels.
 fn _is_before(value: float, stop: float, step: float) -> bool {
     if step > 0.0 { return value < stop }
     return value > stop

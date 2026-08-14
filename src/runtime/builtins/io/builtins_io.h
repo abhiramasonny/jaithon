@@ -13,34 +13,19 @@
 
 /* --- errno -> exception ---------------------------------------------- */
 
-/* `what` reads as a verb phrase: "cannot open", "cannot read from". Spec
- * §7.2 gives IOError exactly two subclasses; these two throw the right one
- * for a given errno, so one errno always produces one exception class and
- * every message names the path(s) involved. */
 bool jaiIOThrowErrno(int err, const char *what, const char *path);
 bool jaiIOThrowErrno2(int err, const char *what, const char *from,
                       const char *to);
 
 /* --- paths ------------------------------------------------------------- */
 
-/* A NUL-terminated pointer for a syscall.
- *
- * A string can be a view into a shared append buffer, in which case the byte
- * after it belongs to a later concatenation rather than being a terminator --
- * and `dir + "/" + name` is exactly how paths get built. Costs nothing for an
- * ordinary string; copies only for a view that a later append ran past. Pass
- * the same `tmp` to jaiIOPathDone when the call is finished. */
 const char *jaiIOPathCStr(ObjString *path, char **tmp);
 void jaiIOPathDone(char *tmp);
 
-/* Rejects an empty path or one containing a NUL byte -- either would reach
- * libc as something other than the path the caller wrote. */
 bool jaiIOCheckPath(ObjString *path, const char *fnName);
 
 /* --- dict building ------------------------------------------------------ */
 
-/* Every primitive that answers with a record builds it this way, so the keys
- * are interned once and the dict is rooted for the whole construction. */
 void jaiIODictPut(ObjDict *dict, const char *key, Value value);
 
 #endif /* JAI_BUILTINS_IO_H */

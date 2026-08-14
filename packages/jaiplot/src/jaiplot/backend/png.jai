@@ -31,13 +31,6 @@ pub fn encode(image: Image, level: int = 6) -> bytes {
     let height = image.height()
     let pixels = image.pixels()
 
-    # Each scanline is prefixed with its filter type. Zero -- no filtering --
-    # is chosen because deflate already finds the repetition in a chart's flat
-    # areas, and a predictor would cost a pass over every pixel to save little.
-    #
-    # The packing is native: a 900x900 figure is three and a quarter million
-    # bytes, and building that as a Jaithon list of boxed integers costs more
-    # than compressing the result does.
     let raw = __prim__.canvas_scanlines(pixels, width, height)
 
     var out = [byte for byte in SIGNATURE]

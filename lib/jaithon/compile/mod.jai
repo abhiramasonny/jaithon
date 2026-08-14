@@ -104,15 +104,9 @@ pub fn compile_source(
     let resolution = resolve(program, bag)
     result.resolution = resolution
 
-    # The checker rewrites the tree in place -- folding constants and
-    # wrapping casts for runtime guards or int -> float widening -- which the
-    # emitter turns into OP_TYPE_GUARD / OP_TO_FLOAT.
     let checked = check_program(Universe(), program, resolution, bag, opt_level > 0, path)
     result.types = checked
 
-    # The optimiser is passed in rather than imported: it reads
-    # `jaithon.compile.emit`, so importing it from there would be circular.
-    # See `_no_optimize` in that file.
     let body = emit(
         program,
         resolution,
@@ -210,15 +204,6 @@ pub fn compile_repl(
     strict: bool = false,
     late_globals: bool = true
 ) -> Compiled {
-    # `late_globals`: a name an already-running module defined is invisible to
-    # this compilation's symbol table, so `__prim__.eval` and the prompt want
-    # it deferred rather than E0200; compiling a module's own source doesn't.
-    # `:disasm` compiles without running, so what it declares must not reach
-    # the session.
-
-    # A prompt's path is a label like `<repl:4>` that names no directory, so
-    # `from m import T` needs `source_dir` to find `m` -- the label itself
-    # still appears in diagnostics and tracebacks.
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
 
@@ -281,8 +266,6 @@ pub fn compile_repl(
     return result
 }
 
-# Two warnings don't apply to a prompt: a binding is unused until the next
-# line uses it, and every import exists to be used interactively.
 fn _drop_prompt_noise(bag: DiagnosticBag) -> void {
     var kept: list[Diagnostic] = []
     var warnings = 0
@@ -298,8 +281,6 @@ fn _drop_prompt_noise(bag: DiagnosticBag) -> void {
     bag.warning_count = warnings
 }
 
-# Every input of one session compiles as this module, so a traceback names the
-# prompt rather than the file the input happened to be labelled with.
 const _REPL_MODULE_NAME = "__repl__"
 
 #: The syntax tree of `text`, as `jaithon ast` prints it.
@@ -411,8 +392,6 @@ pub fn write_bytes(path: str, data: list[int]) -> void {
     __prim__.io_close(handle)
 }
 
-# Every global the emitter marked with OP_EXPORT is part of the module's
-# interface, and the container records the same list (§7).
 fn _exported_names(body: FuncProto) -> list[str] {
     var names: list[str] = []
     var offset = 0

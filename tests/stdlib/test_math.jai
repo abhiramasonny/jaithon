@@ -34,7 +34,7 @@ fn test_rounding_family_agrees_on_the_hard_cases() -> void {
     assert_near(math.floor(-1.5), -2.0)
     assert_near(math.ceil(-1.5), -1.0)
     assert_near(math.trunc(-1.5), -1.0)
-    assert_near(math.round(-1.5), -2.0)  # away from zero, not to even
+    assert_near(math.round(-1.5), -2.0)
     assert_near(math.round(1.5), 2.0)
     assert_near(math.round(2.5), 3.0)
     assert_near(math.round_to(3.14159, 2), 3.14)
@@ -53,7 +53,7 @@ fn test_sqrt_and_roots_reject_what_they_cannot_answer() -> void {
     assert_near(math.sqrt(9.0), 3.0)
     assert_near(math.sqrt(0.0), 0.0)
     assert_throws(ValueError, || math.sqrt(-1.0))
-    assert_near(math.cbrt(-8.0), -2.0)  # odd root of a negative is real
+    assert_near(math.cbrt(-8.0), -2.0)
     assert_near(math.nth_root(16.0, 4), 2.0)
 }
 
@@ -70,8 +70,6 @@ fn test_log1p_and_expm1_keep_precision_near_zero() -> void {
     let tiny = 1e-15
     assert_near(math.log1p(tiny), tiny, 1e-24)
     assert_near(math.expm1(tiny), tiny, 1e-24)
-    # The naive spelling loses most of the value at this magnitude, which is
-    # the whole reason log1p exists.
     assert_true(math.fabs(math.ln(1.0 + tiny) - tiny) > 1e-24)
 }
 

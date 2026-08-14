@@ -1,14 +1,4 @@
-/* builtins_reflect.c — compile, eval, exec, globals, and the build-id
- * primitive eval needs to stamp what it compiles (spec Appendix C).
- *
- * Split out of builtins_io.c, which explains what else moved and why. This
- * group is self-contained: it shares no helper with the files that stayed or
- * moved alongside it, because it is the one primitive family here that talks
- * to the front end rather than to the operating system.
- *
- * The reflection primitives all go through jaiCompileSource, so `eval`, the
- * REPL and lib/jaithon/compile see exactly one front end.
- */
+/* Compile, eval, exec, globals, and build-id reflection primitives. */
 
 #include "runtime/runtime.h"
 
@@ -20,8 +10,6 @@
  * which is what stops the checker warning that it is never read. */
 static const char kEvalSlot[] = "__jai_eval";
 
-/* A native runs on the caller's frame, so the caller's module is the top one.
- * That is what makes eval() and globals() see the names the caller sees. */
 static ObjModule *callerModule(void) {
     if (vm.frameCount > 0 && vm.frames[vm.frameCount - 1].module != NULL)
         return vm.frames[vm.frameCount - 1].module;
@@ -36,10 +24,6 @@ static CodegenOptions reflectOptions(void) {
     return opts;
 }
 
-/* A compile error inside a running program cannot be printed — the caller is
- * mid-expression and expects an exception — so the first diagnostic becomes
- * the message and the bag is emptied rather than left to leak into whatever
- * flushes it next. */
 static bool throwCompileError(const char *fnName) {
     char message[512];
     const JaiDiag *first = NULL;
@@ -47,8 +31,6 @@ static bool throwCompileError(const char *fnName) {
         if (gDiags.diags.data[i].severity == JAI_SEV_ERROR)
             first = &gDiags.diags.data[i];
     }
-    /* With --warnings-as-errors the failure may be recorded as a warning; it
-     * is still the reason the compile produced nothing. */
     if (first == NULL && gDiags.diags.count > 0) first = &gDiags.diags.data[0];
     if (first != NULL) {
         snprintf(message, sizeof message, "%s(): %s: %s", fnName,
@@ -61,8 +43,6 @@ static bool throwCompileError(const char *fnName) {
     return jaiThrow(vm.cParseError, "%s", message);
 }
 
-/* Compile a fragment as a module body of `module`. Returns NULL with the
- * exception already raised. */
 static ObjFunction *compileFragment(const char *source, size_t length,
                                     const char *path, ObjModule *module,
                                     const char *fnName) {
@@ -76,9 +56,6 @@ static ObjFunction *compileFragment(const char *source, size_t length,
     return fn;
 }
 
-/* Runs a fragment by calling it like any other closure. jaiVMRunModule is not
- * an option here: it resets the value stack, which the native's own caller is
- * still standing on. */
 static bool runFragment(ObjFunction *fn, Value *out) {
     Value ignored;
     if (out == NULL) out = &ignored;
@@ -116,10 +93,6 @@ static bool nReflectCompile(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* An expression is evaluated by binding it to a module-level name and reading
- * that name back: the module body is the only thing the code generator emits,
- * and a body discards the value of an expression statement. The binding is
- * removed afterwards so eval leaves no trace in the module. */
 static bool nReflectEval(int argc, Value *args, Value *out) {
     (void)argc;
     ObjString *source;
@@ -150,23 +123,13 @@ static bool nReflectEval(int argc, Value *args, Value *out) {
     Value value = NULL_VAL;
     if (module != NULL) {
         (void)jaiModuleGet(module, slot, &value);
-        /* Deleting a name can take a class or a callable away, so compiled
-         * forms have to be retired. The table's own keyVersion covers the
-         * cached slot addresses and OP_FORMAT's negative cache; removeEntry
-         * bumps it, so there is nothing to do for those here. */
         if (jaiTableDelete(&module->globals, OBJ_VAL(slot))) module->version++;
     }
     *out = value;
     return true;
 }
 
-/* The namespace a two-argument `exec` runs in: a module of its own, made on
- * first use and kept in vm.modules so that a later call sees what an earlier
- * one bound. jaithon.tool.test needs this — running a test file in the runner's
- * own namespace lets an `import std.str as str` in that file shadow the
- * runner's `str`, and the runner then fails inside its own reporting code. */
 static ObjModule *execNamespace(ObjString *name) {
-    /* vm.modules is keyed by pointer and `name` is whatever the caller passed. */
     name = jaiStringCanonical(name);
     Value existing;
     if (jaiTableGetInterned(&vm.modules, name, &existing) && IS_MODULE(existing))
@@ -227,10 +190,6 @@ static bool nReflectGlobals(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The §7 `buildId` this binary writes into every .jaic and demands back out of
- * one. It is a hash of the C sources, so the self-hosted front end cannot
- * derive it and has to be told; a `.jaic` it writes without this stamp is
- * rejected by the reader with the header otherwise perfectly well formed. */
 static bool nReflectBuildId(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;

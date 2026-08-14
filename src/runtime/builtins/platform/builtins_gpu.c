@@ -1,7 +1,5 @@
 /* builtins_gpu.c — __prim__.gpu_*, the surface std.gpu is written over.
- * Buffers and kernels are integer handles rather than GC objects, since the
- * collector can't trace into the device and a finaliser can't free it
- * predictably -- std.gpu frees both explicitly via `defer` (see handles.h). */
+ * Buffers and kernels are integer handles (not GC objects) for device memory. */
 
 #include "runtime/runtime.h"
 #include "runtime/handles.h"
@@ -42,8 +40,6 @@ static bool requireKernel(Value v, int index, const char *fnName,
     return true;
 }
 
-/* Returns NULL both after raising (a non-number element) and for an empty
- * list -- every caller filters count == 0 first. */
 static double *numbersOf(ObjList *list, const char *fnName, int index) {
     if (list->count == 0) return NULL;
     double *values = JAI_ALLOC(double, list->count);
@@ -150,7 +146,6 @@ static bool nGpuBufferUpload(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gpu_buffer_upload_u8(buffer, bytes, source_offset, count, dest_offset, scale) */
 static bool nGpuBufferUploadU8(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *b;
@@ -226,8 +221,6 @@ static bool nGpuBufferFree(int argc, Value *args, Value *out) {
     GpuBuffer *b;
     if (!requireBuffer(args[0], 1, "gpu_buffer_free", &b)) return false;
 
-    /* Retire the handle before the memory goes, so a stale handle is a clean
-     * error instead of a double free. */
     jaiHandleRelease(AS_INT(args[0]));
     jaiGpuFree(b->buffer);
     JAI_FREE(GpuBuffer, b);
@@ -264,7 +257,6 @@ static bool nGpuMaxThreadsPerGroup(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gpu_dispatch[_async](kernel, buffer_handles, scalars, threads, group_size) */
 static bool dispatchKernel(Value *args, Value *out, bool async) {
     const char *name = async ? "gpu_dispatch_async" : "gpu_dispatch";
     JaiGpuKernel *kernel;
@@ -302,8 +294,6 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
     if (scalarList->count > 0) scalars = JAI_ALLOC(uint32_t, scalarList->count);
     for (int i = 0; i < scalarList->count; i++) {
         int64_t scalar;
-        /* Each binds as a `constant uint&`, so anything that is not a
-         * non-negative 32-bit value would arrive silently wrapped. */
         if (!jaiArgInt(scalarList->items[i], 3, name, &scalar) ||
             scalar < 0 || scalar > UINT32_MAX) {
             if (buffers != NULL)
@@ -414,7 +404,6 @@ static bool nGpuVectorMul(int argc, Value *args, Value *out) {
     return elementwise(args, out, "gpu_vector_mul", jaiGpuVectorMul);
 }
 
-/* gpu_matmul(a, b, m, k, n): a is m by k, b is k by n, both row-major. */
 static bool nGpuMatMul(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *a, *b;

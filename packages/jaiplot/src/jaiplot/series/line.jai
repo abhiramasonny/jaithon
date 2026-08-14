@@ -225,9 +225,6 @@ pub class Step: Series {
             for index in 1..run.len() {
                 let previous = run[index - 1]
                 let current = run[index]
-                # The corner is taken at the later x with the earlier y when the
-                # value holds until the next sample, and the other way when it
-                # changes on arrival.
                 let corner = if self.after {
                     Point(current.x, previous.y)
                 } else {

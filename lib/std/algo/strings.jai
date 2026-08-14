@@ -72,8 +72,6 @@ pub enum DiffOp {
 #: palindrome_radii("aba")   # [0, 1, 0, 3, 0, 1, 0]
 #: ```
 pub fn palindrome_radii(text: str) -> list[int] {
-    # Interleaving a separator that cannot occur in the input makes every
-    # palindrome odd-length, which collapses the two cases into one.
     let scan: list[int] = [-1]
     for ch in text {
         scan.push(ord(ch))
@@ -84,9 +82,6 @@ pub fn palindrome_radii(text: str) -> list[int] {
     var center = 0
     var right = 0
     for i in 0..width {
-        # Inside the rightmost palindrome found so far, the mirror position
-        # already answers this one — up to the point where it would reach past
-        # the edge, which is the only part that has to be tested.
         if i < right { radii[i] = min(right - i, radii[2 * center - i]) }
         while i - radii[i] - 1 >= 0 and
             i + radii[i] + 1 < width and
@@ -141,8 +136,6 @@ pub fn z_function(text: str) -> list[int] {
     let z = [0 for _ in 0..n]
     if n == 0 { return z }
     z[0] = n
-    # [left, right) is the match with the furthest right edge seen so far; a
-    # position inside it starts from its mirror instead of from zero.
     var left = 0
     var right = 0
     for i in 1..n {
@@ -176,7 +169,6 @@ pub fn prefix_function(text: str) -> list[int] {
     let n = chars.len()
     let border = [0 for _ in 0..n]
     for i in 1..n {
-        # Fall back through shorter and shorter borders until one extends.
         var length = border[i - 1]
         while length > 0 and chars[i] != chars[length] { length = border[length - 1] }
         if chars[i] == chars[length] { length += 1 }
@@ -205,8 +197,6 @@ pub fn least_rotation_index(text: str) -> int {
         let here = codes[j]
         var i = failure[j - best - 1]
         while i != -1 and here != codes[best + i + 1] {
-            # The candidate starting at `best` has just lost to one starting
-            # inside the part already matched; that later start takes over.
             if here < codes[best + i + 1] { best = j - i - 1 }
             i = failure[i]
         }
@@ -258,8 +248,6 @@ pub fn diff(before: list[str], after: list[str]) -> list[DiffOp] {
     let n = before.len()
     let m = after.len()
     let bound = n + m
-    # Diagonal k = x - y runs from -bound to bound; one spare slot at each end
-    # keeps the k - 1 and k + 1 probes in range without a bounds test.
     let offset = bound + 1
     let furthest = [0 for _ in 0..2 * bound + 3]
     let trace: list[list[int]] = []
@@ -269,10 +257,6 @@ pub fn diff(before: list[str], after: list[str]) -> list[DiffOp] {
         trace.push([value for value in furthest])
         var k = -depth
         while k <= depth {
-            # Step from the better of the two neighbouring diagonals — down is
-            # an insertion, right is a deletion — then run the diagonal as far
-            # as the two sides agree. Everything free is taken greedily, which
-            # is what makes the whole edit script optimal.
             var x = 0
             if k == -depth or k != depth and furthest[k - 1 + offset] < furthest[k + 1 + offset] {
                 x = furthest[k + 1 + offset]

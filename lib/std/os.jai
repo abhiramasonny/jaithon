@@ -310,8 +310,6 @@ pub fn home_dir() -> str {
 pub fn temp_dir() -> str {
     let named = ((env("TMPDIR") ?? env("TMP")) ?? env("TEMP")) ?? "/tmp"
     var text = if named.len() == 0 { "/tmp" } else { named }
-    # `TMPDIR` conventionally ends in a separator; drop it so that callers can
-    # join onto the result without thinking about it.
     while text.len() > 1 and text[text.len() - 1] == "/" { text = text[0:text.len() - 1] }
     return text
 }
@@ -325,8 +323,6 @@ pub fn temp_dir() -> str {
 pub fn platform() -> str {
     let cached = _platform_name
     if cached is not null { return cached }
-    # Fresh binding, not a store into `cached` -- a store ends the narrowing
-    # fact (spec §2.1).
     let detected = _detect_platform()
     _platform_name = detected
     return detected
@@ -343,8 +339,6 @@ pub fn cpu_count() -> int { return __prim__.cpu_count() }
 pub fn hostname() -> str {
     let cached = _host_name
     if cached is not null { return cached }
-    # Fresh binding, not a store into `cached` -- a store ends the narrowing
-    # fact (spec §2.1).
     let detected = _uname("-n")
     _host_name = detected
     return detected
@@ -357,8 +351,6 @@ pub fn hostname() -> str {
 pub fn username() -> str {
     let cached = _user_name
     if cached is not null { return cached }
-    # Fresh binding, not a store into `cached` -- a store ends the narrowing
-    # fact (spec §2.1).
     let detected = _detect_username()
     _user_name = detected
     return detected
@@ -372,8 +364,6 @@ pub fn username() -> str {
 pub fn pid() -> int {
     let cached = _process_id
     if cached is not null { return cached }
-    # Fresh binding, not a store into `cached` -- a store ends the narrowing
-    # fact (spec §2.1).
     let detected = _detect_pid()
     _process_id = detected
     return detected
@@ -507,8 +497,6 @@ fn _detect_username() -> str {
     return result.stdout.strip()
 }
 
-# There is no primitive that reports this process's own id, but a child shell
-# knows its parent's, and `os_spawn` makes the shell a direct child.
 fn _detect_pid() -> int {
     let result = run([_SHELL, "-c", "echo $PPID"])
     let parsed = result.stdout.strip().to_int()

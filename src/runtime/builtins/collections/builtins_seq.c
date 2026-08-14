@@ -25,8 +25,6 @@ Value jaiSeqOptArg(int argc, Value *args, int index) {
     return index < argc ? args[index] : NULL_VAL;
 }
 
-/* Reachable only when a bound method outlives the value it was bound to in a
- * way the VM cannot see. */
 bool jaiSeqReceiverError(const char *fnName, const char *expected, Value got) {
     return jaiThrow(vm.cTypeError, "%s() needs a %s receiver, not %s", fnName,
                     expected, jaiTypeNameStatic(got));
@@ -62,8 +60,6 @@ static inline bool selfIter(Value *args, const char *fnName,
     return true;
 }
 
-/* A concrete index into a sequence of `count` items, negatives counting from
- * the end. */
 bool jaiSeqIndexArg(Value v, int index, const char *fnName, int count,
                      int *out) {
     int64_t raw;
@@ -80,15 +76,11 @@ bool jaiSeqIndexArg(Value v, int index, const char *fnName, int count,
 /* Shared operations                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Equality that reports a raising __eq__ instead of reading its failure as
- * "not equal". */
 bool jaiSeqEqualsChecked(Value a, Value b, bool *equal) {
     *equal = jaiValuesEqual(a, b);
     return !vm.hasException;
 }
 
-/* Hashing can fail only for the mutable containers, composites that may
- * contain one, or an instance with no (or a raising) __hash__. */
 static inline bool hashMayFail(Value v) {
     if (!IS_OBJ(v)) return false;
 
@@ -105,11 +97,6 @@ static inline bool hashMayFail(Value v) {
     }
 }
 
-/* Keys/elements must be non-null (table.c reserves null for an empty slot,
- * so a null here would corrupt a probe) and must hash. Checked here rather
- * than left to the table, since the table's "false" means both "already
- * present" and "does not hash"; only types whose hash can actually fail are
- * probed, so a user __hash__ isn't run twice for int/str/bool/float. */
 bool jaiSeqHashableKey(Value key, const char *fnName, const char *role) {
     if (IS_NULL(key)) {
         return jaiThrow(vm.cTypeError, "%s(): a %s cannot be null", fnName, role);
@@ -124,8 +111,6 @@ bool jaiSeqHashableKey(Value key, const char *fnName, const char *role) {
                     role, jaiTypeNameStatic(key));
 }
 
-/* NULL means an exception is pending. Result is unrooted — root it before
- * allocating again. */
 ObjList *jaiSeqCollectIterable(Value v) {
     Value iterVal;
     if (!jaiGetIter(v, &iterVal)) return NULL;
@@ -139,8 +124,6 @@ ObjList *jaiSeqCollectIterable(Value v) {
     jaiGCPushRoot(iterVal);
     ObjIter *const it = AS_ITER(iterVal);
 
-    /* Reserving when the source has a cheap, stable size only changes
-     * allocation; iteration still goes through the canonical iterator. */
     int capacity = 0;
     if (IS_TUPLE(v)) {
         const uint32_t n = AS_TUPLE(v)->count;
@@ -167,8 +150,6 @@ ObjList *jaiSeqCollectIterable(Value v) {
     return vm.hasException ? NULL : result;
 }
 
-/* `xs.iter()` is the explicit spelling of what `for x in xs` does implicitly;
- * one implementation serves every container. */
 bool jaiSeqValueIter(int argc, Value *args, Value *out) {
     (void)argc;
     return jaiGetIter(args[0], out);
@@ -331,8 +312,6 @@ static bool tupleToList(int argc, Value *args, Value *out) {
 /* range                                                                */
 /* ------------------------------------------------------------------ */
 
-/* The last value a range yields (length must be nonzero). Unsigned arithmetic
- * because start + (n-1)*step is exact but its intermediates need not be. */
 static inline int64_t rangeLast(ObjRange *r, int64_t length) {
     const uint64_t offset =
         (uint64_t)(length - 1) * (uint64_t)r->step;
@@ -347,8 +326,6 @@ static bool rangeLen(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Only an int can be a member; anything else is simply absent rather than an
- * error, so `x in r` stays usable on a heterogeneous value. */
 static bool rangeContains(int argc, Value *args, Value *out) {
     (void)argc;
 
@@ -447,7 +424,6 @@ static bool rangeStop(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Starts at the last element and walks back, inclusively, to the original start. */
 static bool rangeReversed(int argc, Value *args, Value *out) {
     (void)argc;
     ObjRange *self;
@@ -463,8 +439,6 @@ static bool rangeReversed(int argc, Value *args, Value *out) {
         *out = OBJ_VAL(jaiRangeNew(last, last, 1, true));
         return true;
     }
-    /* -step of INT64_MIN has no room to exist, and nothing else in the
-     * language can represent that sequence, so this errors instead. */
     if (self->step == INT64_MIN) {
         return jaiThrow(vm.cOverflowError,
                         "range.reversed(): step %lld cannot be negated",
@@ -478,8 +452,6 @@ static bool rangeReversed(int argc, Value *args, Value *out) {
 /* iterator                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Exhaustion is `null`, matching the Iterator trait in std.core; a raising
- * __next__ is propagated instead. */
 static bool iterNextMethod(int argc, Value *args, Value *out) {
     (void)argc;
     ObjIter *self;
@@ -495,8 +467,6 @@ static bool iterNextMethod(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Iterators are pulled, not sliced, so take() materialises: at most `n`
- * elements, fewer if the source ends first. */
 static bool iterTake(int argc, Value *args, Value *out) {
     (void)argc;
 
@@ -512,8 +482,6 @@ static bool iterTake(int argc, Value *args, Value *out) {
                         (long long)n);
     }
 
-    /* Reserve modest requests exactly; do not let a huge take() against a
-     * short/lazy iterator cause a huge speculative allocation. */
     const int capacity = n <= 256 ? (int)n : 0;
     ObjList *result = jaiListNew(capacity);
     jaiGCPushRoot(OBJ_VAL(result));
@@ -540,7 +508,6 @@ static bool iterTake(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* drop advances the iterator and hands it back, so it can be chained. */
 static bool iterDrop(int argc, Value *args, Value *out) {
     (void)argc;
 

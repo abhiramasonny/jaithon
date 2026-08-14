@@ -28,11 +28,6 @@ const SOURCE_RE = /^\s*(\d+)\s\|(.*)$/;
 const MARKER_RE = /^\s*\|\s*(\^+|-+)(?:\s+(.*?))?\s*$/;
 const TRAILER_RE = /^(help|note):\s*(.*)$/;
 
-/**
- * Display column -> UTF-16 index. The compiler counts one column per codepoint
- * and advances tabs to the next multiple of four, so the inverse has to walk
- * the same line the same way.
- */
 function displayColumnToUtf16(line, column) {
     let col = 0;
     let index = 0;
@@ -44,13 +39,6 @@ function displayColumnToUtf16(line, column) {
     return index;
 }
 
-/**
- * Split the compiler's output into diagnostics.
- *
- * Spans carry the source line as the compiler printed it, with tabs already
- * expanded. That is enough to place a caret on its own, and is replaced by the
- * real line when the file is open — see `rangeOf`.
- */
 function parse(text) {
     const out = [];
     let current = null;
@@ -85,8 +73,6 @@ function parse(text) {
         const arrow = ARROW_RE.exec(line);
         if (arrow) {
             file = arrow[1];
-            // The first arrow anchors the diagnostic; a later one opens a block
-            // for another file, whose markers become related information.
             if (current.file === null) {
                 current.file = file;
                 current.line = Number(arrow[2]);
@@ -130,11 +116,6 @@ function parse(text) {
     return out;
 }
 
-/**
- * The range a span covers. `lineText` is the file's real line when it can be
- * had; without it the compiler's tab-expanded copy is used, which agrees for
- * every line that does not contain a tab.
- */
 function rangeOf(span, lineText) {
     const text = lineText !== undefined && lineText !== null ? lineText : span.sourceText;
     const line = Math.max(0, span.line - 1);
@@ -143,7 +124,6 @@ function rangeOf(span, lineText) {
     return new vscode.Range(line, start, line, Math.max(end, start + 1));
 }
 
-/** The text of `line` (1-based) in an open document, or null. */
 function openLine(fsPath, line) {
     for (const doc of vscode.workspace.textDocuments) {
         if (doc.uri.fsPath !== fsPath) continue;
@@ -190,8 +170,6 @@ function toVSCode(diag, resolvePath) {
     }
     if (related.length) item.relatedInformation = related;
 
-    // An unused binding should fade rather than shout: the whole content of the
-    // warning is that the code does nothing.
     const tags = [];
     if (diag.code === 'W0101') tags.push(vscode.DiagnosticTag.Unnecessary);
     if (/\bdeprecated\b/i.test(diag.message)) tags.push(vscode.DiagnosticTag.Deprecated);
@@ -208,9 +186,9 @@ function toVSCode(diag, resolvePath) {
 class Checker {
     constructor(collection) {
         this.collection = collection;
-        this.pending = new Map();     // uri -> timer
-        this.running = new Map();     // uri -> CancellationTokenSource
-        this.owned = new Map();       // uri -> the uris its last run wrote to
+        this.pending = new Map();
+        this.running = new Map();
+        this.owned = new Map();
         this.emitter = new vscode.EventEmitter();
         this.onDidCheck = this.emitter.event;
     }
@@ -221,7 +199,6 @@ class Checker {
         this.emitter.dispose();
     }
 
-    /** Schedule a check, coalescing keystrokes into a single compiler run. */
     schedule(document, delay) {
         if (document.languageId !== 'jaithon') return;
         const key = document.uri.toString();
@@ -254,8 +231,6 @@ class Checker {
         this.running.delete(key);
         if (result.spawnFailed) return [];
 
-        // The mirror is what the compiler quotes; map it back so the squiggle
-        // lands on the buffer the user is actually editing.
         const mirrored = path.resolve(snapshot.path);
         const resolvePath = (quoted) => {
             if (!quoted) return document.uri.fsPath;

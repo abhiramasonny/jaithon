@@ -17,9 +17,7 @@ fn cut(s: str, n: int) -> int {
     var t = 0
     var i = 0
     while i < n {
-        # Every operand form the flags byte can encode.
         t = t + s[1:4].len() + s[:3].len() + s[2:].len() + s[:].len()
-        # Clamped: past the end, and from before the start.
         t = t + s[3:99].len() + s[-2:].len()
         i = i + 1
     }
@@ -38,7 +36,6 @@ fn first(xs: any, n: int) -> int {
 
 print(cut("abcdefgh", 200000))
 
-# Compiled holding a str, re-entered holding a list, then a str again.
 print(first("abcdefgh", 200000))
 print(first([1, 2, 3, 4], 200000))
 print(first("abcdefgh", 200000))

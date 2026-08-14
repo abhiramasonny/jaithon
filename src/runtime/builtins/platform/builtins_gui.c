@@ -22,9 +22,6 @@ typedef struct {
     int        slot;        /* index into gKeepAlive */
 } GuiWindow;
 
-/* Every live window's pixel list, kept as a permanent GC root rather than a
- * published name: as `__prim__.gui_buffers` it was reachable from Jaithon, and
- * clearing it there freed buffers the native window still drew into. */
 static ObjList *gKeepAlive;
 
 static bool requireGui(const char *fnName) {
@@ -49,8 +46,6 @@ static bool nGuiAvailable(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_window_open(width, height, title, target_fps = 0): std.gui paces itself
- * and opens uncapped; target_fps exists for callers who want native pacing. */
 static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
     if (!requireGui("gui_window_open")) return false;
 
@@ -78,8 +73,6 @@ static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
         return jaiThrow(vm.cRuntimeError,
                         "gui_window_open(): the window could not be created");
 
-    /* Allocating can collect; the window is not GC-visible and not a GC object
-     * either, so only the list itself is at risk, and it's rooted below. */
     int64_t count = width * height;
     ObjList *pixels = jaiListNew((int)count);
     jaiGCPushRoot(OBJ_VAL(pixels));
@@ -144,7 +137,7 @@ static bool nGuiPresent(int argc, Value *args, Value *out) {
     uint32_t *target = jaiWindowPixels(w->window, &bufferWidth, &bufferHeight);
     if (target == NULL) {
         *out = NULL_VAL;
-        return true;                    /* already closed; nothing to show */
+        return true;
     }
 
     int64_t needed = (int64_t)bufferWidth * bufferHeight;
@@ -316,8 +309,6 @@ static bool nGuiKeyDown(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_key_from_platform(platform_code) -> hid_code: USB HID id for a native
- * keycode (0 if unnamed); exists to check the table against `Key.code()` headless. */
 static bool nGuiKeyFromPlatform(int argc, Value *args, Value *out) {
     (void)argc;
     int64_t code;
@@ -328,11 +319,6 @@ static bool nGuiKeyFromPlatform(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_test_key_event(platform_code, down, repeat = false) -> list[record]:
- * test-only, feeds one synthetic key event through the native path and returns
- * it in `gui_drain_events`'s record format -- the only way to prove a platform
- * keycode reaches Jaithon as the right `Key` with no real GUI (see
- * tests/stdlib/test_gui_input.jai). Touches only a native scratch window. */
 static bool nGuiTestKeyEvent(int argc, Value *args, Value *out) {
     int64_t code;
     bool down = false, repeat = false;
@@ -353,9 +339,6 @@ static bool nGuiTestKeyEvent(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* gui_test_key_state() -> list[int]: test-only; the HID ids the scratch
- * window's polled arrays currently report down, proving those arrays are
- * indexed by HID id and not the platform's own number. */
 static bool nGuiTestKeyState(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;

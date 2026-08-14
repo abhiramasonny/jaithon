@@ -1,12 +1,4 @@
-/* cli_usage.c — the `--help` and `--version` text.
- *
- * Pure formatting: neither function touches JaiCliOptions, the diagnostic
- * bag, or any of the other CLI-internal state, which is what makes this the
- * easiest section of the old main.c to lift out whole. jaiCliPrintUsage and
- * jaiCliPrintVersion are declared in cli.h because main() calls them directly
- * for `-h`/`-v`/`help`/`version` before the rest of the CLI machinery (VM
- * init, module path, prelude) is even set up.
- */
+// cli_usage.c — the `--help` and `--version` text.
 #include "cli/cli_internal.h"
 
 #include "native/native.h"

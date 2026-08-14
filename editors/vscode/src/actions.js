@@ -9,11 +9,6 @@ const { byteOffsetAt } = require('./navigation');
 
 // ---------------------------------------------------------------------------
 // Formatting
-//
-// `jaithon fmt` rewrites a file in place and takes no options, so formatting is
-// a round trip through a scratch copy. The result is trimmed to the lines that
-// actually changed: replacing the whole document would move every cursor,
-// folding state and decoration in the file for the sake of one re-indented line.
 // ---------------------------------------------------------------------------
 
 let scratchTick = 0;
@@ -26,17 +21,14 @@ async function formatted(document, token) {
                                       { cwd: path.dirname(document.uri.fsPath), document, token });
         if (result.spawnFailed) return null;
         const text = fs.readFileSync(scratch, 'utf8');
-        // A parse error leaves the file untouched and reports on stderr; there
-        // is nothing to apply, and overwriting with the original is not an edit.
         return text === document.getText() ? null : text;
     } catch {
         return null;
     } finally {
-        try { fs.unlinkSync(scratch); } catch { /* never written */ }
+        try { fs.unlinkSync(scratch); } catch { }
     }
 }
 
-/** One replacement covering exactly the run of lines that differ. */
 function minimalEdit(document, next) {
     const previous = document.getText();
     if (previous === next) return [];
@@ -74,9 +66,6 @@ function formattingProvider() {
 function rangeFormattingProvider() {
     return {
         async provideDocumentRangeFormattingEdits(document, range, options, token) {
-            // The formatter is canonical and whole-file; the honest thing to do
-            // for a selection is to format everything and hand back only the
-            // part of the result that falls inside it.
             const next = await formatted(document, token);
             if (next === null) return [];
             return minimalEdit(document, next).filter((edit) => edit.range.intersection(range));
@@ -90,7 +79,6 @@ function rangeFormattingProvider() {
 
 const DID_YOU_MEAN = /did you mean `([^`]+)`/;
 
-/** Where a new import belongs: after the last one, else above the first code. */
 function importAnchor(document) {
     let line = 0;
     for (let index = 0; index < document.lineCount; index++) {
@@ -104,7 +92,6 @@ function importAnchor(document) {
 const EXPORT_RE = (name) =>
     new RegExp(`^\\s*pub\\s+(?:static\\s+)?(fn|class|trait|enum|type|const|let|var)\\s+${name}(?![A-Za-z0-9_])`, 'm');
 
-/** Modules that export `name`, as dotted paths. */
 async function exporters(workspace, document, name, token) {
     const out = [];
     const pattern = EXPORT_RE(name);
@@ -122,7 +109,6 @@ async function exporters(workspace, document, name, token) {
     return out;
 }
 
-/** Turn a file path back into the dotted name an import would spell. */
 function dottedNameFor(fsPath, document) {
     for (const dir of tool.searchPath(document, path.dirname(document.uri.fsPath))) {
         const relative = path.relative(dir, fsPath);
@@ -206,7 +192,6 @@ async function refactors(workspace, analysis, document, range, token) {
     const symbol = hit?.symbol
         || (hit?.ref ? (await workspace.definitionOf(analysis, hit.ref, token))?.symbol : null);
 
-    // The checker already knows the type; writing it down is a pure annotation.
     if (symbol && ['variable', 'parameter'].includes(symbol.kind)
         && !symbol.declaredType && symbol.type && symbol.type !== 'any'
         && !symbol.type.startsWith('module ')) {
@@ -232,7 +217,6 @@ async function refactors(workspace, analysis, document, range, token) {
         }
     }
 
-    // A class that names a trait owes it every method the trait declares.
     const owner = symbol && symbol.members !== undefined ? symbol : null;
     if (owner && (owner.traits || []).length) {
         const missing = [];
@@ -289,8 +273,6 @@ function organizeImports(analysis, document) {
         sorted.join('\n'));
     return action;
 }
-
-// ---------------------------------------------------------------------------
 
 function register(context, workspace) {
     const selector = { language: 'jaithon', scheme: 'file' };

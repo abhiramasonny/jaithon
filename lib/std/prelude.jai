@@ -7,7 +7,3 @@ from std.core import Cloneable, Default, Container, Ordering, cmp
 
 export { Iterable, Iterator, Comparable, Hashable, Printable, Cloneable }
 export { Default, Container, Ordering, cmp }
-
-# The exception hierarchy (spec §5.4) is registered by the runtime directly in
-# builtins, so it must not be re-exported here — `export` only names declarations
-# of *this* module.

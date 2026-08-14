@@ -27,7 +27,6 @@
 #: therefore only ever proves the INTERPRETER's answer for the
 #: runtime-built-string case; that is a real hole in this file's compiled-tier
 #: coverage, not a heat problem, and no marker or warm-up closes it.
-# jit-compiles: scan, is_open
 from std.test import assert_eq
 
 #: Interned one-character strings, straight out of the shared table.

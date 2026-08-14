@@ -23,7 +23,6 @@ pub class NamedTupleType {
             position[field] = index
         }
         self.name = name
-        # Copy, so a later change to the caller's list cannot desync `position`.
         self.fields = fields[0:fields.len()]
         self.position = position
     }
@@ -125,8 +124,6 @@ pub class NamedTuple {
     }
 
     fn __hash__(self) -> int {
-        # FNV-1a over the element hashes; the wrapping multiply keeps it from
-        # raising OverflowError the way plain `*` would.
         var digest = 1469598103934665603
         for value in self.values {
             digest = (digest ^ hash(value)) *% 1099511628211

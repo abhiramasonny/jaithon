@@ -10,7 +10,6 @@ if n > 10 {
     print("small")
 }
 
-# `if` is an expression when both arms produce a value.
 let label = if n % 2 == 0 { "even" } else { "odd" }
 print(label)
 
@@ -98,7 +97,6 @@ print(describe(404))
 print(describe(503))
 print(describe(100))
 
-# match over a destructured sequence
 fn head_tail(xs: list[int]) -> str {
     return match xs {
         [] => "empty",

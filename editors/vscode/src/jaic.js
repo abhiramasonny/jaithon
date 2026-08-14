@@ -20,9 +20,6 @@ function escapeHtml(text) {
 }
 
 function render(fsPath, text) {
-    // Colour the things worth picking out at a glance: header and comment
-    // lines, the `== name ==` function banners, opcode mnemonics, the constant
-    // pool indices, and jump targets.
     const highlighted = escapeHtml(text)
         .replace(/^(==.*==)$/gm, '<span class="fn">$1</span>')
         .replace(/^(;.*)$/gm, '<span class="cmt">$1</span>')
@@ -69,9 +66,6 @@ function register(context) {
                 if (result.spawnFailed) {
                     body = 'jaithon not found.\n\nSet "jaithon.path", or build it with \'make\'.';
                 } else {
-                    // disasm writes the listing to stdout and any complaint to
-                    // stderr; show both, since a version mismatch is reported on
-                    // stderr but the header still prints.
                     body = `${result.stdout || ''}${result.stderr || ''}`;
                     if (!body.trim()) body = '(empty image)';
                 }

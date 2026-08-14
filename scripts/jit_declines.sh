@@ -1,24 +1,5 @@
 #!/usr/bin/env bash
-# The JIT's decline census, collapsed to distinct reasons.
-#
-# `JAI_JIT_WHY=1` prints once per compile ATTEMPT and the tier retries a site
-# every time it gets hot again, so the raw output massively overcounts: 114
-# lines once collapsed to 9 distinct sites (docs/roadmap.md §7). Collapsing is
-# not optional, it is the whole measurement.
-#
-# Run WARM. A cold __jaicache__ makes the self-hosted front end compile itself
-# inside the run, and the compiler's own declines then swamp the benchmark's --
-# 343 distinct sites cold against 11 warm, and the two sets barely overlap.
-#
-# This is a coverage gate, NOT a speed one. roadmap.md §7 is explicit that "a
-# change that clears a decline is not a speedup"; what it catches is coverage
-# going backwards, which is how OP_CMP_LOCAL_CONST_LT silently cost every
-# function that contained it.
-#
-#   scripts/jit_declines.sh            # print the census
-#   scripts/jit_declines.sh capture       # add to the baseline (never shrinks)
-#   scripts/jit_declines.sh capture fresh # start the baseline over
-#   scripts/jit_declines.sh check      # fail if a NEW reason appeared
+# JIT decline census: capture reasons, check against baseline.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,7 +9,6 @@ JAITHON="${JAITHON:-$ROOT/jaithon}"
 BASELINE="$ROOT/tests/bench/jit_declines.baseline"
 
 census() {
-    # Warm every cache first, or the front end's own compilation dominates.
     for f in "$ROOT"/tests/bench/*/*.jai; do
         "$JAITHON" run "$f" >/dev/null 2>&1
     done
@@ -41,16 +21,6 @@ census() {
       | sort -u
 }
 
-# The census is NOT deterministic. Which sites the tier offers to the compiler
-# is driven by a wall-clock sampler, so a marginal site is attempted on some
-# runs and not others: three consecutive runs of the SAME binary gave 20, 20 and
-# 21 reasons, differing by `more live values than there are callee-saved
-# registers` from heat_2d's OSR head. A single-run capture therefore produces a
-# baseline that the very next check fails against.
-#
-# So capture takes the UNION of several runs. That is the honest baseline: a
-# reason that can appear is a reason that does appear. It does not weaken the
-# ratchet, which only ever fails on a reason that is new to the union.
 CAPTURE_RUNS=${CAPTURE_RUNS:-3}
 
 case "${1:-show}" in
@@ -58,18 +28,6 @@ show)
     census
     ;;
 capture)
-    # Unions with the EXISTING baseline, and never shrinks it unless you ask.
-    #
-    # The asymmetry is the whole point. A line that stays but no longer occurs
-    # costs a benign "no longer occurs (good)" note. A line that is DROPPED
-    # because this capture's runs happened not to see it hands the next person
-    # a gate that fails the first time the sampler behaves differently -- and
-    # `more live values than there are callee-saved registers` (heat_2d's OSR
-    # head) is exactly such a line: it appeared in 1 of 3 runs when this was
-    # written. An agent caught a capture silently dropping it and put it back
-    # by hand.
-    #
-    # `capture fresh` starts over, for when reasons are genuinely retired.
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
     for _i in $(seq "$CAPTURE_RUNS"); do census >> "$tmp"; done
     if [[ "${2:-}" != fresh && -f "$BASELINE" ]]; then
@@ -89,8 +47,6 @@ check)
     fi
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
     census > "$tmp"
-    # Only NEW reasons fail. A reason that disappeared is coverage improving,
-    # which should not need a commit to the baseline to be allowed.
     new=$(comm -13 "$BASELINE" "$tmp")
     gone=$(comm -23 "$BASELINE" "$tmp")
     [[ -n "$gone" ]] && { echo "note: these declines no longer occur (good):";

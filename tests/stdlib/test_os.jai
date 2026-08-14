@@ -31,8 +31,6 @@ fn test_the_two_streams_stay_apart() -> void {
 }
 
 fn test_stdin_is_written_and_then_closed() -> void {
-    # `cat` only ends when its input does, so this also proves the write end
-    # is closed rather than left open.
     assert_eq(run(["cat"], stdin_text: "piped\n").stdout, "piped\n")
 }
 
@@ -83,8 +81,6 @@ fn test_spawn_talks_to_a_running_child() -> void {
     child.close_stdin()
     assert_eq(child.read_line(), "got ping")
     assert_eq(child.wait(), 7)
-    # Waiting twice answers from the remembered status rather than waiting for
-    # a process that has already been reaped.
     assert_eq(child.wait(), 7)
     assert_eq(child.poll(), 7)
     assert_false(child.is_running())

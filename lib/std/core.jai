@@ -437,9 +437,6 @@ pub class Pair[A, B]: Comparable, Hashable, Printable {
     pub fn hash(self) -> int {
         let first_hash = hash(self.first)
         let second_hash = hash(self.second)
-        # Plain xor would collide Pair(a, b) with Pair(b, a); the fold is a
-        # bijection (spends no entropy) built from `>>` alone since `<<` here
-        # would raise OverflowError once a hash occupies its top bits.
         return first_hash ^ second_hash ^ second_hash >> 13
     }
 
@@ -566,8 +563,6 @@ pub fn always(value: any) -> fn() -> any { return || value }
 #: unconditionally instead of testing it for null on every iteration.
 pub fn noop() -> void { }
 
-# Private lazy adapters returned by `Iterator`'s default methods; their
-# methods implement ones already documented on the trait, so no docs here.
 class MapIter[T, U]: Iterator[U], Iterable[U] {
     let source: Iterator[T]
     let transform: fn(T) -> U
@@ -640,8 +635,6 @@ class DropIter[T]: Iterator[T], Iterable[T] {
     }
 
     pub fn next(self) -> T? {
-        # The skip is done on the first call, not in init, so that constructing
-        # the adapter stays free and the source is not touched until asked.
         while self.remaining > 0 {
             self.remaining -= 1
             if self.source.next() is null {
@@ -794,8 +787,6 @@ fn _cmp_number(a: any, b: any) -> int {
     if __prim__.lt(a, b) { return -1 }
     if __prim__.lt(b, a) { return 1 }
     if __prim__.eq(a, b) { return 0 }
-    # Neither ordered nor equal: at least one side is NaN. Sorting a list with a
-    # NaN in it must still terminate with a consistent order, so NaN goes last.
     let a_is_nan = not __prim__.eq(a, a)
     let b_is_nan = not __prim__.eq(b, b)
     if a_is_nan and b_is_nan { return 0 }

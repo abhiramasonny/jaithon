@@ -71,8 +71,6 @@ pub class Random {
     var state1: int
     var state2: int
     var state3: int
-    # The Marsaglia polar method makes two normal deviates at a time; the second
-    # is kept here so that half of all `gauss` calls cost nothing.
     var spare: float?
 
     #: Create a generator seeded from system entropy.
@@ -115,8 +113,6 @@ pub class Random {
         self.state1 = second
         self.state2 = third
         self.state3 = fourth
-        # An all-zero state is the one fixed point of the generator, and it
-        # emits nothing but zeros forever.
         if first == 0 and second == 0 and third == 0 and fourth == 0 { self.state0 = 1 }
         self.spare = null
     }
@@ -193,8 +189,6 @@ pub class Random {
         if low >= high {
             throw ValueError(f"int_range expects low < high, got low={low}, high={high}")
         }
-        # Computed with wrapping arithmetic so that a span wider than an int,
-        # such as int_range(INT_MIN, INT_MAX), stays exact as a bit pattern.
         let span = high -% low -% 1
         let mask = _smear(span)
         loop {
@@ -216,9 +210,6 @@ pub class Random {
             throw ValueError(f"float_range expects finite bounds, got [{low}, {high})")
         }
         loop {
-            # `low + span * u` can round up onto `high` even though `u < 1.0`,
-            # once the span is large enough that one ulp of the product exceeds
-            # the gap. Redrawing keeps the interval genuinely half-open.
             let value = low + (high - low) * self.next_float()
             if value < high { return value }
         }
@@ -553,8 +544,6 @@ pub class Random {
             if us >= 0.07 and v <= boundary { return int(candidate) }
             if candidate < 0.0 { continue }
             if us < 0.013 and v > us { continue }
-            # The acceptance test takes ln(v), which has no value at zero; the
-            # limit there is minus infinity, so a zero always accepts.
             if v <= 0.0 { return int(candidate) }
             let accept = candidate * log_mean - mean - _log_gamma(candidate + 1.0)
             if ln(v * inverse_alpha / (a / (us * us) + b)) <= accept { return int(candidate) }
@@ -647,14 +636,11 @@ pub class Random {
         }
         let pivot = 1 + trials // 2
         let split = self.beta(float(pivot), float(trials + 1 - pivot))
-        # `split` is where the pivot-th smallest of `trials` uniforms landed;
-        # only the branch that `probability` falls into needs to be drawn.
         if split >= probability { return self._binomial(pivot - 1, probability / split) }
         return pivot + self._binomial(trials - pivot, (probability - split) / (1.0 - split))
     }
 }
 
-# Seeded from system entropy at import; call `seed` for a reproducible run.
 let _DEFAULT = Random()
 
 #: Return the shared generator the module-level functions draw from.

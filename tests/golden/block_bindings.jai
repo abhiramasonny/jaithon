@@ -22,7 +22,7 @@ fn escape_from_if(c: bool) -> fn() -> int {
         var a = 1
         g = fn() -> int { return a }
     }
-    var b = 99  # takes the slot `a` held
+    var b = 99
     print(b)
     return g
 }
@@ -39,7 +39,7 @@ fn nested() -> list[fn() -> int] {
             var inner = 2
             out.push(|| outer + inner)
         }
-        var filler = 900  # takes the slot `inner` held
+        var filler = 900
         print(filler)
         out.push(|| outer)
         outer = 10
@@ -201,7 +201,7 @@ fn nested_in_loop() -> list[fn() -> int] {
             var v = i + 1
             out.push(|| v)
         }
-        var reuse = -1  # takes the slot `v` held
+        var reuse = -1
         print(reuse)
     }
     return out

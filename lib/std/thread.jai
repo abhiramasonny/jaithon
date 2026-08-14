@@ -183,7 +183,6 @@ pub class Channel: Iterable[any] {
     pub fn send(self, value: any) -> void {
         var spins = 0
         loop {
-            # `defer` unlocks at function exit, not loop-body end, so every path out unlocks by hand here.
             self.lock.lock()
             if self.closed {
                 self.lock.unlock()
@@ -289,7 +288,6 @@ pub class Channel: Iterable[any] {
 
     fn _pop(self) -> any {
         let value = self.slots[self.head]
-        # Drop the reference so a received value is not kept alive by the ring.
         self.slots[self.head] = null
         self.head = (self.head + 1) % self.capacity
         self.count -= 1
@@ -522,8 +520,6 @@ pub fn parallel_reduce(
     return total
 }
 
-# Exceptions cannot cross a native thread boundary, so the guard below turns
-# one into a value and `unwrap` turns it back.
 class _Outcome {
     let value: any
     let error: Error?

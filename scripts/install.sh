@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
 # Install Jaithon.
-#
-#   scripts/install.sh              -> /usr/local
-#   PREFIX=~/.local scripts/install.sh
-#
-# Installs the binary, standard library, and workspace packages below
-# $PREFIX/share/jaithon. The binary resolves both source roots relative to its
-# own path, so a relocated install keeps working.
 
 set -euo pipefail
 

@@ -230,7 +230,6 @@ pub class Point2: Printable {
     fn __hash__(self) -> int {
         let x_hash = hash(self.x)
         let y_hash = hash(self.y)
-        # Rotate before mixing so that (a, b) and (b, a) do not collide.
         return x_hash ^ (y_hash << 13 | y_hash >> 51 & 0x1FFF)
     }
 

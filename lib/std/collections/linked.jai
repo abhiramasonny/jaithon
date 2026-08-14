@@ -577,8 +577,6 @@ pub class DoublyLinkedList[T]: Iterable[T] {
         }
     }
 
-    # Splice `node` out. The node keeps `attached` unchanged so that the move
-    # operations can relink it without a window in which it looks detached.
     fn _unlink(self, node: DoublyNode[T]) -> void {
         let previous = node.prev
         let following = node.next

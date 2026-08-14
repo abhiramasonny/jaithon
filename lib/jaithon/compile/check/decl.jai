@@ -57,15 +57,12 @@ pub const SELF_NAME: str = "Self"
 
 const _NOT_FOUND: int = -1
 
-# `jaithon.ast.Visibility` as the `int` that `FieldInfo` and `MemberInfo` hold.
 let _VISIBILITY_ORDINAL: dict[Visibility, int] = {
     Visibility.Private: VIS_PRIVATE,
     Visibility.Protected: VIS_PROTECTED,
     Visibility.Public: VIS_PUBLIC,
 }
 
-# `jaiChkIsAny`, `jaiChkIsNever`, `jaiChkIsVoid`, `jaiChkOrAny` and
-# `jaiChkDeclType`, respelled because `expr.jai` keeps its copies private.
 fn _is_any(t: Type?) -> bool {
     if t is null { return true }
     return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
@@ -89,8 +86,6 @@ fn _decl_type(c: Ctx, decl: TypeDecl?) -> Type {
     return decl.ty ?? c.universe.t_any
 }
 
-# `jaiChkTypeDeclOf`. Interning attaches the declaration, so the field is the
-# answer; the C searches its registry instead.
 fn _type_decl_of(t: Type?) -> TypeDecl? {
     if t is null { return null }
     if not t.is_named() { return null }
@@ -185,8 +180,6 @@ pub fn register_decl(c: Ctx, node: Node?) -> TypeDecl? {
     return d
 }
 
-# An override may widen what it accepts and narrow what it returns, so one
-# direction of the test is all `typeFits` ever asks.
 fn _type_fits(c: Ctx, sub: Type?, super_ty: Type?) -> bool {
     if sub is null or super_ty is null { return true }
     if _is_any(sub) or _is_any(super_ty) { return true }
@@ -194,8 +187,6 @@ fn _type_fits(c: Ctx, sub: Type?, super_ty: Type?) -> bool {
     return is_subtype(c.universe, sub, super_ty)
 }
 
-# `signatureCompatible`. `why` is the clause the diagnostic reads out, null when
-# `ok`.
 fn _signature_compatible(c: Ctx, sub: Type?, super_ty: Type?) -> (bool, str?) {
     if sub is null or super_ty is null { return (true, null) }
     if _is_any(sub) or _is_any(super_ty) { return (true, null) }
@@ -207,7 +198,6 @@ fn _signature_compatible(c: Ctx, sub: Type?, super_ty: Type?) -> (bool, str?) {
     if sub.arg_count() != super_ty.arg_count() {
         return (false, "the parameter counts differ")
     }
-    # Parameters are contravariant, so the argument order is reversed here.
     for (position, accepted) in sub.args.enumerate() {
         if not _type_fits(c, super_ty.args[position], accepted) {
             return (false, "a parameter type is not general enough")
@@ -219,8 +209,6 @@ fn _signature_compatible(c: Ctx, sub: Type?, super_ty: Type?) -> (bool, str?) {
     return (true, null)
 }
 
-# `class MapIter[T, U]: Iterator[U]` on `trait Iterator[T]` binds the trait's own
-# `T` to `U`, so its `fn next(self) -> T?` requires `-> U?` here.
 fn _trait_binding_of(c: Ctx, trait_decl: TypeDecl, ref: TypeExpr) -> list[Type] {
     var values: list[Type] = []
     let node = trait_decl.node
@@ -228,12 +216,9 @@ fn _trait_binding_of(c: Ctx, trait_decl: TypeDecl, ref: TypeExpr) -> list[Type] 
     if ref.kind != TypeKind.Generic { return values }
 
     let generics = node.records("generics")
-    # A wrong argument count is already E0407 from `resolve_ast_type`.
     if generics.len() <= 0 or generics.len() != ref.args.len() { return values }
 
     for (position, written) in ref.args.enumerate() {
-        # An argument that resolved to nothing binds the parameter to itself:
-        # `substitute` takes a `dict[str, Type]` and cannot express the C's null.
         let resolved = c.resolve_ast_type(c, written)
         values.push(resolved ?? generic_param(c.universe, _record_name(generics[position])))
     }
@@ -252,8 +237,6 @@ fn _binding_map(trait_decl: TypeDecl, binding: list[Type]) -> dict[str, Type] {
     return out
 }
 
-# `Self` is substituted first, so a requirement written `-> Self` becomes the
-# implementer's own type (§7.2); a trait extending a trait leaves it abstract.
 fn _apply_trait_binding(
     c: Ctx,
     owner: TypeDecl,
@@ -279,8 +262,6 @@ fn _render_trait_ref(trait_decl: TypeDecl, binding: list[Type]) -> str {
     return f"{trait_decl.name}[{args}]"
 }
 
-# Spec §7 makes `self` an explicit first parameter, so a help quoting the bare
-# `fn` type would send the reader straight into E0703.
 fn _render_required_method(name: str, trait_fn: Node?, required: Type?) -> str {
     var params: list[dict[str, any]] = []
     var skip = 0
@@ -318,8 +299,6 @@ fn _render_required_method(name: str, trait_fn: Node?, required: Type?) -> str {
     return "".join(out)
 }
 
-# `jaiChkFindAccessorIndex` then `jaiChkFindMemberIndex`, over the one list this
-# port keeps: accessor-exact first, then whichever accessor carries the name.
 fn _own_index(d: TypeDecl, name: str, want_setter: bool, fallback: bool) -> int {
     for (index, member) in d.members.enumerate() {
         if member.name == name and member.is_setter == want_setter { return index }
@@ -331,8 +310,6 @@ fn _own_index(d: TypeDecl, name: str, want_setter: bool, fallback: bool) -> int 
     return _NOT_FOUND
 }
 
-# The same question of an ancestor. `nominal.jai`'s walks are where the members
-# the C would have copied down actually live.
 fn _inherited_pick(decl: TypeDecl?, name: str, want_setter: bool, fallback: bool) -> MemberInfo? {
     if decl is null { return null }
     let accessor = find_accessor(decl, name, want_setter)
@@ -341,8 +318,6 @@ fn _inherited_pick(decl: TypeDecl?, name: str, want_setter: bool, fallback: bool
     return find_member(decl, name)
 }
 
-# What the C's flat member array would hold for `name`: own text, then the
-# superclass chain, then the traits in written order.
 fn _provided_member(c: Ctx, d: TypeDecl, name: str, want_setter: bool) -> MemberInfo? {
     let own = _own_index(d, name, want_setter, true)
     if own != _NOT_FOUND { return d.members[own] }
@@ -371,8 +346,6 @@ fn _provided_member(c: Ctx, d: TypeDecl, name: str, want_setter: bool) -> Member
     return null
 }
 
-# One past the highest instance slot the ancestors hold. The C reads it off the
-# copied prefix; nothing is copied here, so the chain is walked for it.
 fn _next_slot(parent: TypeDecl?) -> int {
     var next = 0
     var at = parent
@@ -387,13 +360,10 @@ fn _next_slot(parent: TypeDecl?) -> int {
     return next
 }
 
-# `addField`, answering the next free slot rather than advancing an out-parameter.
 fn _add_field(c: Ctx, d: TypeDecl, record: dict[str, any], next_slot: int) -> int {
     let name = _record_name(record)
     if name is null { return next_slot }
 
-    # `find_field` walks the superclass chain, so redeclaring a parent's field is
-    # caught here exactly as the C catches it in the copied prefix.
     if find_field(d, name) is not null {
         let diag = c.error(
             E0709_DUPLICATE_MEMBER,
@@ -426,7 +396,6 @@ fn _add_field(c: Ctx, d: TypeDecl, record: dict[str, any], next_slot: int) -> in
     return out
 }
 
-# `memberTypeOf`. A property's type is what it reads or writes.
 fn _member_type_of(c: Ctx, fn_node: Node, is_getter: bool, is_setter: bool) -> Type? {
     if is_getter { return declared_return_type(c, fn_node, true) }
     if is_setter {
@@ -440,8 +409,6 @@ fn _member_type_of(c: Ctx, fn_node: Node, is_getter: bool, is_setter: bool) -> T
     return signature_of(c, fn_node, true)
 }
 
-# `own_from` is where this declaration's own text starts: zero for a class or
-# enum, the end of restated supertrait requirements for a trait.
 fn _install_member(
     c: Ctx,
     d: TypeDecl,
@@ -464,7 +431,6 @@ fn _install_member(
     }
     c.set_type(fn_node, ty)
 
-    # Spec §7.1. Properties take no `self` at all.
     if not is_getter and not is_setter {
         if not is_static and self_skip_of(fn_node) == 0 {
             c.error(
@@ -502,8 +468,6 @@ fn _install_member(
         return
     }
 
-    # `init` is not an override: it is reached through `super(...)` and never
-    # through dynamic dispatch, so a subclass may take different arguments.
     if existing == _NOT_FOUND and not is_init_method(fn_node) {
         let overridden = _inherited_pick(d.superclass, name, is_setter, not is_setter)
         if overridden is not null {
@@ -524,8 +488,6 @@ fn _install_member(
         }
     }
 
-    # A trait's members are public whether or not `pub` is written: §7.1's
-    # "private unless pub" governs classes alone.
     var vis = VIS_PUBLIC
     if not d.is_trait { vis = _node_visibility(fn_node) }
 
@@ -542,8 +504,6 @@ fn _install_member(
     if existing == _NOT_FOUND { d.members.push(info) } else { d.members[existing] = info }
 }
 
-# `verifyTraits`. An abstract class is exempt, and so is a trait: neither is the
-# implementing type.
 fn _verify_traits(c: Ctx, d: TypeDecl) -> void {
     if d.is_abstract or d.is_trait { return }
 
@@ -552,7 +512,7 @@ fn _verify_traits(c: Ctx, d: TypeDecl) -> void {
         if index < d.trait_bindings.len() { binding = d.trait_bindings[index] }
 
         for requirement in trait_decl.members {
-            if not requirement.is_abstract { continue }  # has a default body
+            if not requirement.is_abstract { continue }
             let name = requirement.name
             let required = _apply_trait_binding(c, d, trait_decl, binding, requirement.ty)
             let provided = _provided_member(c, d, name, requirement.is_setter)
@@ -587,11 +547,8 @@ fn _verify_traits(c: Ctx, d: TypeDecl) -> void {
             let declared_at = requirement.node
             if declared_at is not null { diag.label(declared_at.span, "required here") }
 
-            # After substitution the requirement no longer reads like the trait
-            # body, so say where the substituted form came from.
             if required == requirement.ty { continue }
             let declared = render(requirement.ty)
-            # With no trait arguments only `Self` can have been substituted.
             if binding.len() == 0 {
                 diag.with_note(
                     f"`{name}` is declared `{declared}` in `{trait_decl.name}`, " +
@@ -608,8 +565,6 @@ fn _verify_traits(c: Ctx, d: TypeDecl) -> void {
     }
 }
 
-# Answers `(decl, opaque_name)`: the declaration when this unit can see one,
-# otherwise the name of a trait or class that resolved to no declaration here.
 fn _resolve_decl_reference(
     c: Ctx,
     ref: TypeExpr,
@@ -621,8 +576,6 @@ fn _resolve_decl_reference(
     let target = _type_decl_of(t)
 
     if target is null {
-        # A trait or class reached through the prelude or an import has a type but
-        # no declaration to lay out here. It is opaque, not wrong (spec §9).
         var opaque = false
         if t is not null {
             opaque = if want_trait { t.kind == TyKind.Trait } else { t.kind == TyKind.Class }
@@ -649,8 +602,6 @@ fn _resolve_decl_reference(
         return (null, null)
     }
 
-    # Through `Ctx`, not the function below: calling straight through kept the
-    # current scope and falsely reported E0402 for `Iterator`'s `Peekable[T]`.
     c.layout_decl(c, target)
     return (target, null)
 }
@@ -667,8 +618,6 @@ fn _layout_class(c: Ctx, d: TypeDecl, node: Node) -> void {
         let (found, opaque) = _resolve_decl_reference(c, written_super, false, d)
         parent = found
         opaque_parent = opaque
-        # A named parent that produced no declaration is one this unit cannot
-        # enumerate, and its members are not this unit's to deny.
         if parent is null and opaque_parent is null { opaque_parent = written_super.name }
     }
     d.superclass = parent
@@ -677,7 +626,6 @@ fn _layout_class(c: Ctx, d: TypeDecl, node: Node) -> void {
     for ref in node.type_list("traits") {
         let (trait_decl, named_opaque) = _resolve_decl_reference(c, ref, true, d)
         var opaque = named_opaque
-        # Same rule as the superclass above, and for the same reason.
         if trait_decl is null and opaque is null { opaque = ref.name }
         if opaque is not null { d.opaque_traits.push(opaque) }
         if trait_decl is null { continue }
@@ -692,8 +640,6 @@ fn _layout_class(c: Ctx, d: TypeDecl, node: Node) -> void {
     for getter in node.child_list("getters") { _install_member(c, d, getter, true, false, 0) }
     for setter in node.child_list("setters") { _install_member(c, d, setter, false, true, 0) }
 
-    # Before anything can conclude the class is abstract: otherwise an
-    # unimplemented requirement makes it abstract instead of reporting E0705.
     _verify_traits(c, d)
     c.type_name_restore(mark)
 }
@@ -713,8 +659,6 @@ fn _layout_trait(c: Ctx, d: TypeDecl, node: Node) -> void {
         d.traits.push(super_decl)
     }
 
-    # The one place this port copies: `verify_traits` enumerates `trait.members`
-    # rather than walking, so an unrestated requirement would never be checked.
     for (index, super_decl) in d.traits.enumerate() {
         var binding: list[Type] = []
         if index < d.trait_bindings.len() { binding = d.trait_bindings[index] }
@@ -753,8 +697,6 @@ fn _layout_enum(c: Ctx, d: TypeDecl, node: Node) -> void {
         let name = _record_name(record)
         if name is null { continue }
 
-        # A unit variant is a value of the enum, a payload variant the
-        # constructor for one. `slot` carries the tag.
         var ty = own
         let params = _record_params(record)
         if params.len() > 0 {
@@ -914,7 +856,6 @@ pub fn check_body(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> 
         if body.kind == NodeKind.Block {
             c.check_block(c, body)
         } else {
-            # A lambda's body is its return value.
             if not _is_any(ret) { c.apply_context(c, body, ret) }
             let got = value(c, body)
             if annotated {
@@ -940,8 +881,6 @@ pub fn check_body(c: Ctx, fn_node: Node?, owner: TypeDecl?, is_method: bool) -> 
     c.type_name_restore(name_mark)
 }
 
-# E0601: an annotated non-void function must not fall off the end. A generator
-# returns through `yield`, so it is exempt.
 fn _check_falls_off_end(c: Ctx, fn_node: Node, body: Node?, ret: Type?, annotated: bool) -> void {
     if body is null or body.kind != NodeKind.Block { return }
     if fn_node.flag("isGenerator") or not annotated { return }
@@ -969,8 +908,6 @@ pub fn check_function(c: Ctx, fn_node: Node?) -> void {
     check_body(c, fn_node, null, false)
 }
 
-# `super(...)` must open the constructor when the parent declares one, so that a
-# subclass can never observe a half-initialised parent (spec §7.1).
 fn _check_super_init_position(c: Ctx, d: TypeDecl, init: Node) -> void {
     let parent = d.superclass
     if parent is null { return }
@@ -1006,8 +943,6 @@ fn _check_super_init_position(c: Ctx, d: TypeDecl, init: Node) -> void {
 }
 
 fn _check_class_body(c: Ctx, node: Node) -> void {
-    # A declaration whose name another one already held was never registered
-    # against this node, so `decl_for_node` answers null and the body is skipped.
     let d = c.decl_for_node(node)
     if d is null { return }
     c.layout_decl(c, d)
@@ -1057,7 +992,7 @@ fn _check_trait_body(c: Ctx, node: Node) -> void {
     c.current_class = d
 
     for method in node.child_list("methods") {
-        if method.child("body") is null { continue }  # a requirement, not a body
+        if method.child("body") is null { continue }
         check_body(c, method, d, true)
     }
 
@@ -1129,8 +1064,6 @@ pub fn check_decl(c: Ctx, node: Node?) -> void {
     }
 }
 
-# An unannotated `var` initialised to null would otherwise be pinned to the null
-# type and reject every later assignment.
 fn _widen_inferred(u: Universe, kind: DeclKind, t: Type?) -> Type {
     if t is null { return u.t_any }
     if kind == DeclKind.Var and (t.kind == TyKind.Null or t.kind == TyKind.Never) { return u.t_any }
@@ -1138,7 +1071,6 @@ fn _widen_inferred(u: Universe, kind: DeclKind, t: Type?) -> Type {
     return t
 }
 
-# The declaration's own symbol, or the one its `PatBind` leaf carries.
 fn _decl_symbol(c: Ctx, node: Node) -> Symbol? {
     let own = c.resolution.symbol_of(node)
     if own is not null { return own }
@@ -1147,8 +1079,6 @@ fn _decl_symbol(c: Ctx, node: Node) -> Symbol? {
     return c.resolution.symbol_of(pattern)
 }
 
-# The folded value is kept in `Ctx.consts` under the binding's name so every use
-# can inline it — where `fold.jai` and `expr.jai` look for it.
 fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
     let init = node.child("init")
     if init is null {

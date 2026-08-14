@@ -38,13 +38,13 @@ print(y)
 print(7 + 3)
 print(7 - 3)
 print(7 * 3)
-print(7 / 2)    # int / int -> float
-print(7 // 2)   # floor division
-print(-7 // 2)  # floors toward negative infinity
+print(7 / 2)
+print(7 // 2)
+print(-7 // 2)
 print(7 % 3)
-print(-7 % 3)  # sign follows the divisor, like Python
+print(-7 % 3)
 print(2 ** 10)
-print(2 ** 3 ** 2)  # right-associative: 2 ** 9
+print(2 ** 3 ** 2)
 
 # --- bitwise ----------------------------------------------------------------
 print(0b1100 & 0b1010)
@@ -61,8 +61,8 @@ print(3 > 4)
 print(1 == 1.0)
 print("a" != "b")
 print(1 < 2 and 2 < 3)
-print(1 < 2 < 3)    # chained, b evaluated once
-print(3 < 2 < 100)  # short-circuits to false
+print(1 < 2 < 3)
+print(3 < 2 < 100)
 
 # --- logical ----------------------------------------------------------------
 print(true and false)

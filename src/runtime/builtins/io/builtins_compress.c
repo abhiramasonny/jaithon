@@ -3,15 +3,12 @@
 #include "runtime/builtins/builtins.h"
 #include "runtime/runtime.h"
 
-/* DEFLATE fills a byte LSB-first but a Huffman code is written MSB-first, so
- * writerCode reverses one before handing it over; getting this backwards
- * produces a stream that looks plausible and decodes to nothing. */
 typedef struct {
     uint8_t *bytes;
     size_t   count;
     size_t   capacity;
     uint32_t bits;
-    int      bitCount;    /* how many of them are live, always 0-7 between calls */
+    int      bitCount;
 } BitWriter;
 
 static void writerReserve(BitWriter *writer, size_t extra) {
@@ -22,15 +19,11 @@ static void writerReserve(BitWriter *writer, size_t extra) {
     writer->capacity = capacity;
 }
 
-/* Callers other than writerBits place a byte-aligned field (a stored block's
- * header, the zlib wrapper) and must have flushed the partial byte first. */
 static void writerPush(BitWriter *writer, uint8_t byte) {
     writerReserve(writer, 1);
     writer->bytes[writer->count++] = byte;
 }
 
-/* Never called with more than 16 bits, which is what keeps the accumulator
- * from overflowing while a partial byte (up to 7 bits) is still pending. */
 static void writerBits(BitWriter *writer, uint32_t value, int count) {
     writer->bits |= (value & ((1u << count) - 1u)) << writer->bitCount;
     writer->bitCount += count;
@@ -41,7 +34,6 @@ static void writerBits(BitWriter *writer, uint32_t value, int count) {
     }
 }
 
-/* A stored block and the zlib trailer must both start on a byte boundary. */
 static void writerAlign(BitWriter *writer) {
     if (writer->bitCount == 0) return;
     writerPush(writer, (uint8_t)(writer->bits & 0xFFu));
@@ -62,7 +54,6 @@ static void writeSymbol(BitWriter *writer, int symbol) {
     else                    writerCode(writer, 0xC0u + (uint32_t)(symbol - 280), 8);
 }
 
-/* Length codes 257-285 and distance codes 0-29, as the RFC tabulates them. */
 static const int kLengthBase[29] = {
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51,
     59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
@@ -104,10 +95,6 @@ static void writeMatch(BitWriter *writer, int length, int64_t distance) {
 #define MIN_MATCH   3
 #define MAX_MATCH   258
 
-/* head[hash]: most recent position with that hash, or -1. prev[pos & MASK]:
- * previous position sharing it. A slot is only overwritten a full window
- * later, so any entry still in-window is current -- the distance check below
- * is enough on its own to reject a stale one. */
 typedef struct {
     int32_t head[HASH_SIZE];
     int32_t prev[WINDOW_SIZE];
@@ -118,9 +105,6 @@ static uint32_t hashAt(const uint8_t *data) {
                       (uint32_t)data[2]) & (HASH_SIZE - 1u);
 }
 
-/* Returns the prior position for this hash (the search start point) -- the
- * chain must not begin with `position` itself, or the first match found is
- * the string against itself at distance zero, which DEFLATE has no code for. */
 static int32_t tableInsert(MatchTable *table, const uint8_t *data, int64_t length,
                            int64_t position) {
     if (position + MIN_MATCH > length) return -1;
@@ -131,8 +115,6 @@ static int32_t tableInsert(MatchTable *table, const uint8_t *data, int64_t lengt
     return previous;
 }
 
-/* Longest match at `position`, or 0 if none is worth coding. `chainLimit` and
- * `niceLength` are the two knobs the compression level tunes. */
 static int findMatch(const MatchTable *table, const uint8_t *data, int64_t length,
                      int64_t position, int64_t candidate, int chainLimit,
                      int niceLength, int64_t *outDistance) {
@@ -147,8 +129,6 @@ static int findMatch(const MatchTable *table, const uint8_t *data, int64_t lengt
 
     for (int chain = 0; chain < chainLimit && candidate >= oldest; chain++) {
         const uint8_t *there = data + candidate;
-        /* Cheapest test first: reject on the byte that would have to beat the
-         * best match so far before comparing anything else. */
         if (there[best] == here[best] && there[0] == here[0] && there[1] == here[1]) {
             int64_t matched = 0;
             while (matched < maxLength && there[matched] == here[matched]) matched++;
@@ -166,21 +146,18 @@ static int findMatch(const MatchTable *table, const uint8_t *data, int64_t lengt
     return best;
 }
 
-/* Cost of writeStoredBlocks: five header bytes per block plus the data. */
 static size_t storedSize(size_t length) {
     size_t blocks = length == 0 ? 1 : (length + 65534) / 65535;
     return blocks * 5 + length;
 }
 
-/* Blocks are capped at 65535 bytes (the 16-bit length field). An empty input
- * still emits one empty block -- a zlib stream needs at least one. */
 static void writeStoredBlocks(BitWriter *writer, const uint8_t *data, size_t length) {
     size_t offset = 0;
     do {
         size_t chunk = length - offset;
         if (chunk > 65535) chunk = 65535;
         writerBits(writer, (offset + chunk == length) ? 1u : 0u, 1);
-        writerBits(writer, 0u, 2);                     /* BTYPE 00, stored */
+        writerBits(writer, 0u, 2);
         writerAlign(writer);
         writerPush(writer, (uint8_t)(chunk & 0xFFu));
         writerPush(writer, (uint8_t)((chunk >> 8) & 0xFFu));
@@ -195,23 +172,19 @@ static void writeStoredBlocks(BitWriter *writer, const uint8_t *data, size_t len
     } while (offset < length);
 }
 
-/* Level 1 takes the first match it sees; level 9 walks up to 4096 candidates
- * and defers each to check whether the next position does better. */
 static const int  kChainLimit[10] = {0, 4, 8, 16, 32, 64, 128, 256, 1024, 4096};
 static const int  kNiceLength[10] = {0, 16, 24, 32, 48, 64, 128, 192, 258, 258};
 static const bool kUseLazy[10] = {
     false, false, false, false, true, true, true, true, true, true,
 };
 
-/* Levels 1-9: one fixed-Huffman block over the whole input. Splitting into
- * several blocks only pays for a dynamic code, which this does not emit. */
 static void writeFixedBlock(BitWriter *writer, const uint8_t *data, int64_t length,
                             int level) {
-    writerBits(writer, 1u, 1);                         /* BFINAL */
-    writerBits(writer, 1u, 2);                         /* BTYPE 01, fixed */
+    writerBits(writer, 1u, 1);
+    writerBits(writer, 1u, 2);
 
     MatchTable *table = JAI_ALLOC(MatchTable, 1);
-    memset(table->head, 0xFF, sizeof table->head);     /* -1 in every slot */
+    memset(table->head, 0xFF, sizeof table->head);
     memset(table->prev, 0xFF, sizeof table->prev);
 
     int chainLimit = kChainLimit[level];
@@ -219,7 +192,7 @@ static void writeFixedBlock(BitWriter *writer, const uint8_t *data, int64_t leng
     bool useLazy = kUseLazy[level];
 
     int64_t position = 0;
-    int     heldLength = 0;          /* a match found at position - 1, not yet emitted */
+    int     heldLength = 0;
     int64_t heldDistance = 0;
     bool    holding = false;
 
@@ -231,8 +204,6 @@ static void writeFixedBlock(BitWriter *writer, const uint8_t *data, int64_t leng
 
         if (holding) {
             if (found > heldLength) {
-                /* One byte later buys a longer match, so the held byte is
-                 * worth more as a literal than as the start of the shorter one. */
                 writeSymbol(writer, data[position - 1]);
                 heldLength = found;
                 heldDistance = distance;
@@ -267,16 +238,12 @@ static void writeFixedBlock(BitWriter *writer, const uint8_t *data, int64_t leng
         position++;
     }
 
-    /* A held match is >= 3 bytes, so the loop can never actually end while one
-     * is held; emitting it anyway keeps that argument off the critical path. */
     if (holding) writeMatch(writer, heldLength, heldDistance);
 
-    writeSymbol(writer, 256);                          /* end of block */
+    writeSymbol(writer, 256);
     JAI_FREE(MatchTable, table);
 }
 
-/* 5552 is the most bytes that can be summed before the second accumulator can
- * overflow 32 bits, which is what lets the modulo happen once per block. */
 #define ADLER_BASE  65521u
 #define ADLER_BLOCK 5552u
 
@@ -302,8 +269,6 @@ static bool compressArgBytes(Value v, int index, const char *fnName, ObjBytes **
     return true;
 }
 
-/* deflate(data, level) -> bytes: a complete zlib stream (RFC 1950 header +
- * DEFLATE stream + big-endian Adler-32), exactly what a PNG IDAT chunk holds. */
 static bool nDeflate(int argc, Value *args, Value *out) {
     (void)argc;
     ObjBytes *data;
@@ -316,11 +281,8 @@ static bool nDeflate(int argc, Value *args, Value *out) {
                         (long long)level);
     }
 
-    /* FLEVEL is advisory — a decompressor ignores it — but FCHECK is not: the
-     * two header bytes read as a big-endian number have to be a multiple of
-     * 31. */
     uint32_t flevel = level == 0 ? 0u : (level < 6 ? 1u : (level == 6 ? 2u : 3u));
-    uint32_t header = (0x78u << 8) | (flevel << 6);    /* deflate, 32 KB window */
+    uint32_t header = (0x78u << 8) | (flevel << 6);
     header += 31u - (header % 31u);
 
     BitWriter writer = {NULL, 0, 0, 0, 0};
@@ -333,8 +295,6 @@ static bool nDeflate(int argc, Value *args, Value *out) {
     } else {
         writeFixedBlock(&writer, data->data, (int64_t)data->length, (int)level);
         writerAlign(&writer);
-        /* Data with no matches comes out ~5% larger under the fixed code (half
-         * its literals are nine bits); fall back to stored if that happens. */
         if (writer.count - blockStart > storedSize(data->length)) {
             writer.count = blockStart;
             writeStoredBlocks(&writer, data->data, data->length);
@@ -350,13 +310,11 @@ static bool nDeflate(int argc, Value *args, Value *out) {
 
     ObjBytes *result = jaiBytesNew(writer.bytes, writer.count);
     JAI_FREE_ARRAY(uint8_t, writer.bytes, writer.capacity);
-    if (result == NULL) return false;                  /* too long; already raised */
+    if (result == NULL) return false;
     *out = OBJ_VAL(result);
     return true;
 }
 
-/* adler32(data) -> int: RFC 1950's zlib-trailer checksum -- two 16-bit sums
- * modulo 65521, packed high then low. */
 static bool nAdler32(int argc, Value *args, Value *out) {
     (void)argc;
     ObjBytes *data;
@@ -366,8 +324,6 @@ static bool nAdler32(int argc, Value *args, Value *out) {
 }
 
 
-/* crc32(data): PNG's per-chunk CRC-32, table-driven and native for the same
- * reason adler32 is -- a bit-at-a-time Jaithon loop would dominate runtime. */
 static uint32_t sCrcTable[256];
 static bool sCrcReady = false;
 

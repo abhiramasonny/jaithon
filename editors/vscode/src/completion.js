@@ -38,8 +38,6 @@ function itemFor(symbol, sortGroup) {
     if (symbol.doc) item.documentation = new vscode.MarkdownString(symbol.doc);
     item.sortText = `${sortGroup}${symbol.name}`;
 
-    // Calling something is the reason to name it, so put the cursor between the
-    // parentheses when there is an argument to write and past them when not.
     if (['function', 'method'].includes(symbol.kind)) {
         const takesArguments = (symbol.params || []).some((param) => param.name !== 'self');
         item.insertText = new vscode.SnippetString(`${symbol.name}(${takesArguments ? '$0' : ''})`);
@@ -51,17 +49,14 @@ function itemFor(symbol, sortGroup) {
 // Reading backwards from the cursor
 // ---------------------------------------------------------------------------
 
-/** The `.` the cursor is completing a member of, or -1. */
 function memberDot(line, character) {
     let index = character - 1;
     while (index >= 0 && /[A-Za-z0-9_]/.test(line[index])) index--;
     if (index < 0 || line[index] !== '.') return -1;
-    // A float literal is not a receiver.
     if (index > 0 && /[0-9]/.test(line[index - 1]) && !/[A-Za-z_)\]]/.test(line[index - 1])) return -1;
     return index;
 }
 
-/** Start of the postfix chain ending just before `end`: `a.b(c).d` -> index of `a`. */
 function chainStart(line, end) {
     let index = end;
     let depth = 0;
@@ -98,8 +93,6 @@ function enclosingCall(text, offset) {
         if (ch === '(') { depth--; continue; }
         if (ch === ',' && depth === 0) { commas++; continue; }
         if (ch === '\n' && depth === 0) {
-            // A call can wrap, but an unclosed paren on a previous line is the
-            // only reason to keep scanning past one.
             continue;
         }
     }
@@ -112,8 +105,6 @@ function enclosingCall(text, offset) {
 
 function dottedModules(document, fromFile) {
     const out = new Map();
-    // Symlinked library directories are followed, so the walk is keyed by real
-    // path: a link that points at one of its own ancestors must not loop.
     const seen = new Set();
 
     const visit = (dir, prefix, depth) => {
@@ -251,8 +242,6 @@ async function memberCompletions(workspace, analysis, line, position, dotColumn,
         }
     }
 
-    // Methods the runtime provides for the receiver's type, which no `.jai`
-    // file declares.
     for (const name of builtins.methodsFor(type)) {
         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Method);
         item.detail = `${baseTypeName(type) || type}.${name}()`;
@@ -267,8 +256,6 @@ function scopeCompletions(analysis, offset) {
     const out = [];
     const seen = new Set();
 
-    // Innermost scope outwards, so a local shadows the module-level name it
-    // hides and sorts above it.
     let scopeId = analysis.moduleScope;
     for (const scope of analysis.scopes) {
         if (offset < scope.start || offset > scope.end) continue;
@@ -291,8 +278,6 @@ function scopeCompletions(analysis, offset) {
 
     const enclosing = analysis.enclosing(offset);
 
-    // Directly inside a class body, the useful thing to write next is usually
-    // one of the methods that gives the class its behaviour under an operator.
     if (enclosing && enclosing.members !== undefined) {
         for (const name of builtins.DUNDERS) {
             if (analysis.memberNamed(enclosing, name)) continue;
@@ -304,7 +289,6 @@ function scopeCompletions(analysis, offset) {
         }
     }
 
-    // Inside a method, `self.` is how you reach a field; offer those too.
     if (enclosing && enclosing.container !== null) {
         for (const member of analysis.membersOf(analysis.symbols[enclosing.container])) {
             if (seen.has(`self.${member.name}`)) continue;
@@ -365,7 +349,6 @@ function signatureHelpProvider(workspace) {
             const column = call.open - document.offsetAt(new vscode.Position(line, 0));
             const lineText = document.lineAt(line).text;
 
-            // The callee is the name immediately left of the paren.
             const nameEnd = column;
             let nameStart = nameEnd;
             while (nameStart > 0 && /[A-Za-z0-9_]/.test(lineText[nameStart - 1])) nameStart--;
@@ -407,7 +390,6 @@ function signatureHelpProvider(workspace) {
             }
 
             let symbol = resolved.symbol;
-            // `Point(3, 4)` runs `Point.init`.
             if (symbol.members !== undefined) {
                 const init = resolved.analysis.memberNamed(symbol, 'init');
                 if (!init) return null;

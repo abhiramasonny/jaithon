@@ -113,9 +113,6 @@ pub const VIS_PUBLIC: int = 2
 #: parameters, so a port that kept binding would report errors the C does not.
 pub const MAX_ARGS: int = 255
 
-# The type an already-checked element contributes to a container's join. `value`
-# reports `any` for a void expression but records `void`, so re-reading the tree
-# has to normalise the same way.
 fn _element_type(c: Ctx, node: Node?) -> Type {
     if node is null { return c.universe.t_any }
     let t = c.type_of(node)
@@ -123,8 +120,6 @@ fn _element_type(c: Ctx, node: Node?) -> Type {
     return t ?? c.universe.t_any
 }
 
-# The contextual type `apply_context` stamped on a container literal, if it is
-# the right shape. Consumed, so a stale hint cannot leak into a later literal.
 fn _take_container_context(c: Ctx, node: Node, want: TyKind, arity: int) -> Type? {
     let hint = c.type_of(node)
     c.clear_type(node)
@@ -149,7 +144,6 @@ pub fn condition(c: Ctx, node: Node?, where: str) -> void {
     if help is not null { d.with_help(help) }
 }
 
-# Written with the condition's own spelling, so the help is a line to paste.
 fn _condition_help(t: Type?, node: Node?) -> str? {
     if t is null { return null }
     if is_optional(t) or t.kind == TyKind.Null {
@@ -176,8 +170,6 @@ pub fn iterable_element(c: Ctx, node: Node?, t: Type?) -> Type {
     let u = c.universe
     if is_any(t) or is_never(t) { return u.t_any }
 
-    # Lay the declaration out first: an imported one that has not been would
-    # answer "no members, no traits" and be reported as not iterable.
     let iter_decl = type_decl_of(t)
     if iter_decl is not null { c.layout_decl(c, iter_decl) }
 
@@ -198,8 +190,6 @@ pub fn iterable_element(c: Ctx, node: Node?, t: Type?) -> Type {
     return u.t_any
 }
 
-# An unknown shape is assumed iterable. `opaque_traits` is consulted alongside
-# `traits` because a class implementing an imported `Iterable` names it there.
 fn _class_is_iterable(decl: TypeDecl?) -> bool {
     if decl is null { return true }
     if find_member(decl, "__iter__") is not null { return true }
@@ -229,10 +219,8 @@ pub fn value(c: Ctx, node: Node?) -> Type {
 fn _check_ident(c: Ctx, node: Node) -> Type {
     let u = c.universe
     let symbol = c.resolution.symbol_of(node)
-    # The resolver already reported the undefined name; do not pile on.
     if symbol is null { return u.t_any }
 
-    # A folded `const` is inlined at its use site (spec §3).
     if c.fold_constants and symbol.mutability == DeclKind.Const and symbol.name in c.consts {
         let folded = const_eval(node, null, c.consts)
         if not folded.is_none() {
@@ -242,10 +230,6 @@ fn _check_ident(c: Ctx, node: Node) -> Type {
         }
     }
 
-    # Classes and enums may be referenced before their layout pass ran. The test
-    # is on the resolved type, not only the symbol kind: this front end has no
-    # runtime symbol registration, so `ValueError` would answer `any`. Locals and
-    # parameters stay excluded, so a binding that shadows a class name wins.
     if c.symbol_type(symbol) is null and symbol.kind != SymbolKind.Local {
         if symbol.kind != SymbolKind.Param {
             let named = c.lookup_type_name(c, symbol.name)
@@ -258,18 +242,12 @@ fn _check_ident(c: Ctx, node: Node) -> Type {
     return c.symbol_type(symbol) ?? u.t_any
 }
 
-# Numeric fusion (spec §2.2): when an unannotated literal position mixes an exact
-# `int` with an exact `float`, every int node is converted in place. Nothing is
-# returned — the caller joins by re-reading the recorded types, so a node that
-# failed to convert leaves the join a union rather than a lie.
 fn _fuse_numeric(c: Ctx, nodes: list[Node]) -> void {
     let u = c.universe
     var has_int = false
     var has_float = false
     for node in nodes {
         let t = c.type_of(node)
-        # `widen_target` is the exact-int test: it resolves to null for `int?`,
-        # `any`, `never` and `list[int]` alike.
         if widen_target(u, t, u.t_float) is not null { has_int = true }
         if t == u.t_float { has_float = true }
     }
@@ -310,7 +288,6 @@ fn _check_sequence_literal(c: Ctx, node: Node) -> Type {
     let shape = if node.kind == NodeKind.SetLit { TyKind.Set } else { TyKind.List }
     let want = _take_container_context(c, node, shape, 1)
 
-    # Annotated: each element is checked against the declared element type.
     if want is not null {
         for item in items {
             let got = value(c, item)
@@ -326,13 +303,6 @@ fn _check_sequence_literal(c: Ctx, node: Node) -> Type {
         return want
     }
 
-    # Unannotated: check, fuse, then join by re-reading the tree. Folding the join
-    # as we went would make the result order-dependent — `[1, "a", 2.0]` would
-    # never see the int and the float as a pair.
-    #
-    # A set literal is deliberately not fused: a number in a hash position decides
-    # which elements are the same element, so converting one can merge two members
-    # that were distinct above 2^53.
     for item in items { value(c, item) }
     if node.kind == NodeKind.ListLit { _fuse_numeric(c, items) }
 
@@ -377,9 +347,6 @@ fn _check_dict_literal(c: Ctx, node: Node) -> Type {
         return want
     }
 
-    # Unannotated: check, fuse the values, then join by re-reading the tree — see
-    # `_check_sequence_literal`. Keys are a hash position and are left alone. Key
-    # then value, entry by entry, is the order the C reports two errors in.
     for (position, key) in keys.enumerate() {
         value(c, key)
         if position < values.len() { value(c, values[position]) }
@@ -399,8 +366,6 @@ fn _check_dict_literal(c: Ctx, node: Node) -> Type {
     return dict_of(u, key_type ?? u.t_any, value_type ?? u.t_any)
 }
 
-# One int, one float: the int side widens and the expression is float, with the
-# conversion in the tree rather than left to the VM.
 fn _widen_numeric_mix(c: Ctx, node: Node, op: OpKind, left: Type, right: Type) -> (Type, Type) {
     let u = c.universe
     if not widens_operands(op) { return (left, right) }
@@ -419,7 +384,6 @@ fn _check_binary(c: Ctx, node: Node) -> Type {
     let checked_left = value(c, node.child("left"))
     let checked_right = value(c, node.child("right"))
 
-    # Identity never constrains its operands: `x is Circle`, or `x is y`.
     if op == OpKind.Is or op == OpKind.IsNot { return u.t_bool }
 
     let (left, right) = _widen_numeric_mix(c, node, op, checked_left, checked_right)
@@ -450,7 +414,6 @@ fn _check_logical(c: Ctx, node: Node) -> Type {
     let left = node.child("left")
     condition(c, left, what)
 
-    # The right operand of `and` sees the facts the left operand established.
     let mark = c.narrow_mark()
     let facts = c.collect_facts(left, op == OpKind.Or)
     c.narrow_apply(facts, false)
@@ -554,9 +517,6 @@ fn _check_index(c: Ctx, node: Node) -> Type {
     let object = node.child("object")
     let subscript = node.child("index")
 
-    # `Box[int](21)` applies type arguments; erasure makes the result the bare
-    # declared type. The resolver settled which reading the brackets have — it is
-    # the only pass that can (spec §8).
     if c.resolution.is_type_args(node) {
         let base = value(c, object)
         c.set_type(subscript, u.t_any)
@@ -579,12 +539,9 @@ fn _check_index(c: Ctx, node: Node) -> Type {
     let subscript_type = value(c, subscript)
     if is_any(target) or is_never(target) { return u.t_any }
 
-    # `__getitem__` is a member, so the declaration has to be laid out first.
     let index_decl = type_decl_of(target)
     if index_decl is not null { c.layout_decl(c, index_decl) }
 
-    # A constant subscript answers with the member it selects: `pair[0]` on
-    # `(str, int)` is a `str`. A computed index keeps the join.
     if target.kind == TyKind.Tuple {
         let key = const_eval(subscript, null, c.consts)
         if key.kind == ConstKind.Int {
@@ -630,7 +587,6 @@ fn _check_index(c: Ctx, node: Node) -> Type {
     return u.t_any
 }
 
-# The names whose brackets mean a generic instantiation rather than a subscript.
 fn _names_a_type(c: Ctx, symbol: Symbol) -> bool {
     if is_type_symbol(symbol.kind) or symbol.kind == SymbolKind.TypeAlias { return true }
     return c.ident_type_decl(symbol) is not null
@@ -735,8 +691,6 @@ pub fn static_target_decl(c: Ctx, object: Node?) -> TypeDecl? {
     return decl
 }
 
-# Resolve `name` against a declared type. `static_access` distinguishes
-# `Account.count` from `account.count`; enum variants live in the field list.
 fn _lookup_member(
     c: Ctx,
     site: Node,
@@ -777,13 +731,9 @@ fn _lookup_member(
             )
             if owner is not null { d.label(owner.span, "declared here") }
         }
-        # Reaching a trait's default method through a concrete receiver means
-        # `Self` is that receiver. Unsubstituted, the call guarded `Self -> Cents`.
         return (_substitute_self(c, found.ty, decl) ?? u.t_any, found.node)
     }
 
-    # A parent this unit cannot see may well declare the member: saying "no
-    # member" cost every subclass of an imported class its inherited surface.
     if inherits_opaquely(decl) { return (u.t_any, null) }
 
     let got = render(decl.ty)
@@ -801,16 +751,11 @@ fn _lookup_member(
 #: one — the C's `AstNode **outDecl`, which is what lets a call through a method
 #: be bound against a real parameter list. Null for a field or a dynamic load.
 #: `?.` narrows `null` off the receiver and puts it back on the result.
-# `Self` inside an inherited signature, bound to the type that inherited it.
 fn _substitute_self(c: Ctx, ty: Type?, decl: TypeDecl?) -> Type? {
     if ty is null or decl is null { return ty }
     let concrete = decl.ty
-    # Not inside the trait itself: there `Self` is still the open parameter, and
-    # substituting turned `fn(int) -> Self` into `fn(int) -> Scalable`.
     if concrete is null or decl.is_trait { return ty }
     if not mentions_generic_param(ty) { return ty }
-    # Spelled out rather than imported: `decl.jai` owns `SELF_NAME` and imports
-    # this file for `Ctx`, so taking it from there would close a cycle.
     return substitute(c.universe, ty, {"Self": concrete})
 }
 
@@ -836,8 +781,6 @@ pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
 
     var target = value(c, object)
 
-    # `import m` binds a module object and `m.f` is resolved by name at run time.
-    # The signature loader knows what `m` declares, so the call is still checked.
     if c.is_module(c, object) {
         let (result, decl_node) = c.module_member(c, object, name)
         return (if optional { optional_of(u, result) } else { result }, decl_node)
@@ -849,7 +792,6 @@ pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
     }
     if is_any(target) or is_never(target) { return (u.t_any, null) }
 
-    # Builtin containers, modules and Error classes carry methods in the runtime.
     let decl = type_decl_of(target)
     if decl is null { return (u.t_any, null) }
     c.layout_decl(c, decl)
@@ -868,8 +810,6 @@ pub fn member(c: Ctx, node: Node) -> (Type, Node?) {
     return (if optional { optional_of(u, result) } else { result }, decl_node)
 }
 
-# What is known about the thing being called. `CalleeInfo` in the C, filled in
-# by `_check_call` and read by `_check_args`.
 class CalleeInfo {
     #: The function declaration, when the callee is statically known.
     pub var decl: Node?
@@ -921,12 +861,6 @@ fn _binding_word(kind: SymbolKind) -> str {
     }
 }
 
-# The function declaration this name *denotes*, or null. `Symbol.decl` is the
-# node that DECLARES the symbol, which for a parameter or for `self` is the
-# enclosing `fn`, so only the resolver's back-link says which binding names the
-# function. `Symbol.importedDecl` is followed first: a `Fn` type carries arity
-# and nothing else, so every default argument reads as required and a keyword
-# argument has no name to be checked against, which is what E0603 needs.
 fn _denoted_function_decl(c: Ctx, symbol: Symbol?) -> Node? {
     if symbol is null { return null }
     let imported = c.imported_decl(symbol)
@@ -976,7 +910,6 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
     let arity_code = if info.named { E0602_BAD_CALL_ARITY } else { E0600_ARITY_MISMATCH }
     let name = info.name ?? "this callable"
 
-    # Per-argument expected type and bound parameter name, for the final pass.
     let tracked = if arg_count < MAX_ARGS { arg_count } else { MAX_ARGS }
     var targets: list[Type?] = []
     var bound: list[str?] = []
@@ -1033,8 +966,6 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
         if param_count > 0 { params = written[info.self_skip:] }
     }
 
-    # Resolved once, up front: a declaration in another module has to be read in
-    # *its* namespace, while the loop below reports in this file's.
     var param_types: list[Type] = []
     if declared and param_count <= MAX_ARGS {
         let saved = c.enter_foreign(c.origin_of_node(decl_node))
@@ -1176,7 +1107,6 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
                 call.span,
                 f"`{name}` takes {want} argument{plural} but {arg_count} {were} given"
             )
-            # Show the signature that was actually checked, at its binding.
             let binding_span = info.binding_span
             let binding_what = info.binding_what ?? "binding"
             if info.binding_what is not null and binding_span is not null {
@@ -1202,7 +1132,6 @@ fn _check_args(c: Ctx, call: Node, info: CalleeInfo) -> void {
         }
     }
 
-    # One difference from the C: it truncates this label into a 96-byte buffer.
     for (position, given) in args.enumerate() {
         let held = arg_value(given)
         if position >= tracked {
@@ -1263,7 +1192,6 @@ fn _check_call(c: Ctx, node: Node) -> Type {
     let callee = node.child("callee")
     if callee is null { return u.t_any }
 
-    # ClassName(...) constructs; there is no `new`.
     if callee.kind == NodeKind.Ident {
         let decl = c.ident_type_decl(c.resolution.symbol_of(callee))
         if decl is not null and not decl.is_enum {
@@ -1291,8 +1219,6 @@ fn _check_call(c: Ctx, node: Node) -> Type {
 
     var callee_decl: Node? = null
     var fn_type: Type? = null
-    # `a?.m(x)` short-circuits the whole call, not just the member load (spec
-    # §4.2), so the optional is taken off the callee and put back on the result.
     let opt_chain = callee.kind == NodeKind.OptMember
 
     if callee.kind == NodeKind.Member or opt_chain {
@@ -1304,8 +1230,6 @@ fn _check_call(c: Ctx, node: Node) -> Type {
             if present is not null { fn_type = present }
         }
         c.set_type(callee, fn_type)
-        # `m.Thing(...)` after `import m` names a class: the member load yielded
-        # the declaration itself, so this is construction and not a call.
         if c.is_module(c, callee.child("object")) {
             let class_decl = type_decl_of(fn_type)
             if class_decl is not null and not class_decl.is_enum {
@@ -1327,13 +1251,10 @@ fn _check_call(c: Ctx, node: Node) -> Type {
     if callee.kind == NodeKind.Ident {
         info.name = callee.opt_text("name")
         info.named = true
-        # A name that denotes no declaration is a value being called; its binding
-        # is recorded so an arity error can show the signature it checked.
         let symbol = c.resolution.symbol_of(callee)
         if callee_decl is null and symbol is not null {
             info.binding_span = symbol.decl_span
             info.binding_what = _binding_word(symbol.kind)
-            # Members are copied down during layout, so one lookup covers all.
             let enclosing = c.current_class
             if enclosing is not null and _is_frame_binding(symbol.kind) {
                 if find_member(enclosing, symbol.name) is not null {
@@ -1384,7 +1305,6 @@ fn _check_call(c: Ctx, node: Node) -> Type {
     return u.t_any
 }
 
-# The three symbol kinds that occupy a frame slot and so can shadow a method.
 fn _is_frame_binding(kind: SymbolKind) -> bool {
     if kind == SymbolKind.Param or kind == SymbolKind.Local { return true }
     return kind == SymbolKind.Upvalue
@@ -1420,7 +1340,6 @@ fn _check_comprehension(c: Ctx, node: Node) -> Type {
     if key_node is not null { key_type = value(c, key_node) }
     c.narrow_restore(mark)
 
-    # Annotated: report the element that does not fit, not the whole literal.
     if want is not null {
         if key_node is not null {
             let _key_ok = c.require_assignable(
@@ -1482,8 +1401,6 @@ fn _check_if_expr(c: Ctx, node: Node) -> Type {
 
 fn _check_cast(c: Ctx, node: Node) -> Type {
     let u = c.universe
-    # A cast this checker inserted carries its target in the type table: a
-    # Jaithon `TypeExpr` has no `resolved` field for `wrapInCast` to fill in.
     let want = c.resolve_ast_type(c, node.type_field("target")) ?? c.type_of(node)
     value(c, node.child("operand"))
     return want ?? u.t_any
@@ -1507,7 +1424,6 @@ pub fn expr(c: Ctx, node: Node?) -> Type {
 
         NodeKind.Ident => {
             t = _check_ident(c, node)
-            # `_check_ident` may have folded the node into a literal.
             if node.kind != NodeKind.Ident { return c.type_of(node) ?? u.t_any }
         }
 
@@ -1555,7 +1471,6 @@ pub fn expr(c: Ctx, node: Node?) -> Type {
             t = u.t_any
         }
 
-        # A block in expression position is a lambda body or an `if` arm.
         NodeKind.Block => {
             c.check_block(c, node)
             t = u.t_any

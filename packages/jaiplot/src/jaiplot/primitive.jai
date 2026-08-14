@@ -309,8 +309,6 @@ fn _text_style(style: TextStyle) -> str {
 #: type is already obvious from the field it sits in.
 fn _variant(value: any) -> str {
     let text = str(value)
-    # `find` reports absence as -1 rather than null, and a -1 fed to a slice
-    # counts from the end instead of failing, so this has to be a comparison.
     let dot = text.find(".")
     if dot < 0 { return text }
     return text[dot + 1:]

@@ -63,8 +63,6 @@ fn test_levenshtein_is_a_metric() -> void {
     assert_eq(str.levenshtein("kitten", "sitting"), 3)
     assert_eq(str.levenshtein("", "abc"), 3)
     assert_eq(str.levenshtein("abc", "abc"), 0)
-    # Symmetry, and the triangle inequality on a case that would catch a
-    # transposed loop bound.
     assert_eq(str.levenshtein("flaw", "lawn"), str.levenshtein("lawn", "flaw"))
     assert_true(str.levenshtein("a", "c") <= str.levenshtein("a", "b") + str.levenshtein("b", "c"))
 }
@@ -84,7 +82,6 @@ fn test_jaro_and_jaro_winkler_agree_at_the_extremes() -> void {
     assert_near(str.jaro("abc", "abc"), 1.0)
     assert_near(str.jaro("abc", "xyz"), 0.0)
     assert_near(str.jaro_winkler("abc", "abc"), 1.0)
-    # A shared prefix can only help.
     assert_true(str.jaro_winkler("martha", "marhta") >= str.jaro("martha", "marhta"))
 }
 

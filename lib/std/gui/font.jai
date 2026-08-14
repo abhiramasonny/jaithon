@@ -19,11 +19,6 @@ pub const GLYPH_SPACING = 1
 #: Baseline-to-baseline distance for `text` with a newline in it.
 pub const LINE_HEIGHT = 9
 
-# The 5x7 font, five column bytes per glyph, covering ASCII 32 to 126 in order.
-# Bit 0 of a column is its top pixel and bit 6 its bottom, so column 0x5F —
-# every row but the sixth — is the stem and dot of an exclamation mark. This is
-# the classic 5x7 cell used by LCD character generators, chosen because every
-# glyph is legible at one pixel per dot with no anti-aliasing to smear it.
 pub let _GLYPHS: list[int] = [
     0x00, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x5F, 0x00, 0x00,   #   !
     0x00, 0x07, 0x00, 0x07, 0x00,  0x14, 0x7F, 0x14, 0x7F, 0x14,   # " #

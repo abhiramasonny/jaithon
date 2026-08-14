@@ -30,7 +30,7 @@ fn test_a_mutable_container_is_not_a_key() -> void {
     var d = {}
     let key = [1, 2]
     assert_throws(TypeError, fn() { d[key] = "one" })
-    assert_eq(d.len(), 0)  # the write must not have half happened
+    assert_eq(d.len(), 0)
 
     assert_throws(TypeError, fn() { d[{"a": 1}] = "two" })
     assert_throws(TypeError, fn() { d[{1, 2}] = "three" })
@@ -79,7 +79,7 @@ fn test_every_legal_key_kind_still_works() -> void {
     d[Colour.Red] = "enum"
     d[Point(1, 2)] = "instance"
     assert_eq(d.len(), 8)
-    assert_eq(d[Point(1, 2)], "instance")  # __hash__ and __eq__ agree
+    assert_eq(d[Point(1, 2)], "instance")
     assert_eq(d[Colour.Red], "enum")
 }
 

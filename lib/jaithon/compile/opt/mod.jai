@@ -37,9 +37,6 @@ pub fn optimize(proto: FuncProto, level: int = 2) -> void {
     _optimize_function(proto, level, 0)
 }
 
-# Nested functions live in the constant pool, so optimising from here reaches
-# them even from a caller that only visits the module body. A record never
-# names itself, but a malformed pool could, so the identity test stays.
 fn _optimize_nested(proto: FuncProto, level: int, depth: int) -> void {
     for value in proto.chunk.constants {
         if value.tag != ConstTag.Func { continue }
@@ -68,15 +65,10 @@ fn _optimize_function(proto: FuncProto, level: int, depth: int) -> void {
     if code == null { return }
     let slots_before = proto.max_slots
 
-    # Unreachable code is removed at every level: spec §8 disables passes 3-7
-    # under --O0, not pass 2.
     var changes = mark_unreachable(code)
     if changes > 0 { compact(code) }
 
     if level > 0 {
-        # Fusing exposes new windows and deleting exposes new fusions, so run
-        # the byte-level passes to a fixpoint before the ones that depend on the
-        # final instruction stream.
         for _round in 0..FIXPOINT_ROUNDS {
             var round = peephole_on(code)
             if round > 0 { compact(code) }
@@ -99,14 +91,6 @@ fn _optimize_function(proto: FuncProto, level: int, depth: int) -> void {
             }
         }
 
-        # Coalescing runs last so it sees the final locals, including the ones
-        # hoisting just introduced -- running it earlier would leave a hoisted
-        # slot unpacked until the next call, disagreeing with the pipeline
-        # about frame size.
-        #
-        # A defer thunk is exempt: its slot numbers are the defining frame's, so
-        # renumbering against its own (empty) parameter list would read the
-        # wrong local.
         if not is_defer_thunk(proto) { changes += coalesce_slots_on(code) }
     }
 

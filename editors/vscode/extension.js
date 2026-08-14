@@ -1,10 +1,4 @@
 // Jaithon VS Code extension.
-//
-// There is no reimplemented parser here, and no language server either. The
-// compiler already produces positioned diagnostics, a canonical formatter, a
-// JSON syntax tree and a dump of every type the checker inferred, so the whole
-// job is to run it and index what it says. Everything the editor offers is one
-// of those four answers turned into a VS Code provider; see src/analysis.js.
 
 const vscode = require('vscode');
 const tool = require('./src/tool');
@@ -169,10 +163,6 @@ function registerCommands(context) {
 
 // ---------------------------------------------------------------------------
 // Tasks
-//
-// Every one of these is a thing you would otherwise type; declaring them means
-// Ctrl+Shift+B builds, and the problem matcher puts the compiler's own output
-// in the Problems panel with the same spans the editor shows inline.
 // ---------------------------------------------------------------------------
 
 const TASKS = [
@@ -254,8 +244,6 @@ function activate(context) {
         }),
     );
 
-    // Files changed outside the editor — a rebuild, a branch switch — invalidate
-    // the index, since a definition may now live somewhere else.
     const watcher = vscode.workspace.createFileSystemWatcher('**/*.jai');
     context.subscriptions.push(
         watcher,
@@ -267,8 +255,6 @@ function activate(context) {
     vscode.workspace.textDocuments.forEach((document) => checker.schedule(document, 0));
     updateStatus(vscode.window.activeTextEditor?.document);
 
-    // Ask the compiler which methods its primitive types actually answer to.
-    // Until it replies the bundled tables stand in, so nothing waits on this.
     builtins.refresh(tool, output);
 }
 

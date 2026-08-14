@@ -306,8 +306,6 @@ pub class Parser {
         self.counts[self.counts.len() - 1] += 1
     }
 
-    # `build` is false when the caller only wants the input validated and the
-    # position advanced, so a skipped subtree costs no container allocations.
     fn _read(self, depth: int, build: bool) -> any {
         self._skip_whitespace()
         if self.index >= self.length {
@@ -476,8 +474,6 @@ pub class Parser {
         return chr(0x10000 + (first - 0xD800 << 10) + (second - 0xDC00))
     }
 
-    # Accumulated digit by digit rather than through `to_int`, which trims
-    # whitespace and accepts a sign: "\u 12f" and "\u+123" would slip through.
     fn _scan_hex4(self) -> int {
         if self.index + 4 > self.length {
             throw self._error("a '\\u' escape needs four hexadecimal digits")
@@ -533,9 +529,6 @@ pub class Parser {
         let literal = self.text[start:self.index]
         if not is_float {
             let whole = to_int(literal)
-            # An integer too large for 64 bits becomes a float rather than an
-            # error: it is valid JSON, and refusing it would reject documents
-            # every other implementation accepts.
             if whole is not null { return whole }
         }
         let value = to_float(literal)
@@ -587,7 +580,6 @@ pub class Parser {
 
     fn _column(self) -> int { return self.index - self.line_start + 1 }
 
-    # Built only on the error path, so the scan itself pays nothing for it.
     fn _error(self, message: str) -> ParseError {
         let line = self.line
         let column = self._column()
@@ -970,8 +962,6 @@ fn _fit(value: any, expected: any, name: str) -> any {
         throw TypeError(_mismatch(name, expected, value))
     }
     if isinstance(value, expected) { return value }
-    # Whether `expected` means float is asked of `expected` rather than assumed,
-    # so that a float-like type of the caller's own promotes an int too.
     if isinstance(value, int) and isinstance(0.0, expected) { return float(value) }
     if isinstance(value, dict) { return to_class(expected, value) }
     throw TypeError(_mismatch(name, expected, value))
@@ -1016,9 +1006,6 @@ fn _show(ch: str) -> str {
     return "'" + ch + "'"
 }
 
-# Minified JSON is one enormous line, so an excerpt of the whole line would be
-# unreadable and would push the caret off the screen. Keep a window around the
-# offending column instead, and report where the caret lands inside it.
 fn _window(source: str, column: int) -> tuple[str, int] {
     let width = 72
     if source.len() <= width { return (source, column) }

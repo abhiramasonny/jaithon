@@ -37,7 +37,6 @@ fn _method(name: str) -> MemberInfo {
     return MemberInfo(name)
 }
 
-# `class Cat(Mammal(Animal))`, returned outermost first.
 fn _chain(names: list[str]) -> list[TypeDecl] {
     let built = [_decl(name) for name in names]
     for i in range(0, built.len() - 1) {
@@ -64,8 +63,6 @@ fn test_subclassing_does_not_run_backwards() -> void {
 }
 
 fn test_two_declarations_of_one_name_are_two_classes() -> void {
-    # Identity is the object. A second `Animal` is a second declaration, which
-    # is what makes two modules able to declare the same name.
     assert_false(is_subclass_of(_decl("Animal"), _decl("Animal")))
 }
 
@@ -77,8 +74,6 @@ fn test_a_missing_declaration_is_never_a_subclass() -> void {
 }
 
 fn test_a_trait_is_not_a_superclass() -> void {
-    # The narrowness is the point: `is_subclass_of` is what a class-typed slot
-    # asks, and it must not accept a value over a trait the two have in common.
     let drawable = _trait("Drawable")
     let widget = _decl("Widget")
     widget.traits = [drawable]
@@ -120,9 +115,6 @@ fn test_implementing_is_reflexive_and_otherwise_earned() -> void {
 }
 
 fn test_visibility_asks_the_same_closure_under_its_own_name() -> void {
-    # `inherits_from` and `implements_trait` are one relation: the C reaches it
-    # as `jaiTypeDeclIsSubclassOf` for a `prot` member and as `declImplements`
-    # for a trait requirement. Both axes count for both spellings.
     let drawable = _trait("Drawable")
     let line = _chain(["Button", "Widget"])
     line[1].traits = [drawable]
@@ -150,8 +142,6 @@ fn test_an_invisible_trait_is_inherited_like_a_visible_one() -> void {
 }
 
 fn test_a_name_nobody_wrote_is_not_matched() -> void {
-    # Narrower than "any class satisfies it": the class still had to name the
-    # trait in its header, and the requirements are enforced at run time.
     let widget = _decl("Widget")
     assert_false(names_opaque_trait(widget, "Drawable"))
     assert_false(names_opaque_trait(null, "Drawable"))
@@ -163,8 +153,6 @@ fn test_satisfying_a_trait_prefers_the_declaration() -> void {
     let drawable = _trait("Drawable")
     let widget = _decl("Widget")
     widget.traits = [drawable]
-    # The declaration is visible, so the name is never consulted — a class that
-    # only wrote the name would not pass here.
     let seen = named(u, TyKind.Trait, "Drawable", drawable)
     assert_true(satisfies_trait(widget, seen))
     assert_false(satisfies_trait(_decl("Label"), seen))
@@ -188,8 +176,6 @@ fn test_an_invisible_parent_is_visible_as_a_gap() -> void {
     named_trait.opaque_traits = ["Drawable"]
     assert_true(inherits_opaquely(named_trait))
 
-    # And one found further up: the members this unit cannot enumerate are
-    # still inherited by everything below them.
     let line = _chain(["Toggle", "Button", "Widget"])
     line[2].opaque_super = "Control"
     assert_true(inherits_opaquely(line[0]))
@@ -219,8 +205,6 @@ fn test_a_field_is_found_on_an_ancestor() -> void {
 }
 
 fn test_a_field_is_not_looked_for_in_traits() -> void {
-    # A trait declares members and never fields, so the field walk has one axis.
-    # The state below is one layout cannot produce, which is why it is the test.
     let drawable = _trait("Drawable")
     drawable.fields = [_field("pixels", 0)]
     let widget = _decl("Widget")
@@ -251,8 +235,6 @@ fn test_an_override_wins_over_what_it_overrides() -> void {
 }
 
 fn test_the_declaration_is_searched_before_its_traits() -> void {
-    # A class that writes a method of its own overrides the trait default of
-    # the same name, so the class's copy has to be the one the walk reaches.
     let drawable = _trait("Drawable")
     let default_body = _method("describe")
     let overriding = _method("describe")
@@ -264,8 +246,6 @@ fn test_the_declaration_is_searched_before_its_traits() -> void {
 }
 
 fn test_a_trait_is_searched_before_the_superclass() -> void {
-    # Own, then traits in written order, then the superclass. The order is the
-    # C's in `declFindMember` and it decides which of two defaults is reached.
     let first = _trait("Styled")
     let second = _trait("Drawable")
     let from_trait = _method("describe")
@@ -276,15 +256,11 @@ fn test_a_trait_is_searched_before_the_superclass() -> void {
     line[0].traits = [first, second]
     assert_true(find_member(line[0], "describe") == from_trait)
 
-    # And with the trait silent, the superclass answers.
     line[0].traits = [second]
     assert_true(find_member(line[0], "describe") == from_parent)
 }
 
 fn test_a_member_that_has_not_been_checked_yet_is_still_found() -> void {
-    # A null `ty` means the member exists and its signature has not been
-    # computed. That is a different fact from the member being absent, which is
-    # why the lookup answers with the `MemberInfo` and not with its type.
     let animal = _decl("Animal")
     animal.members = [_method("speak")]
     let found = find_member(animal, "speak")
@@ -305,14 +281,9 @@ fn test_a_getter_and_a_setter_share_one_name() -> void {
     box.members = [getter, setter]
     assert_true(find_accessor(box, "width", false) == getter)
     assert_true(find_accessor(box, "width", true) == setter)
-    # Plain lookup takes whichever was declared first, which is why the C asks
-    # for the getter explicitly before falling back to it.
     assert_true(find_member(box, "width") == getter)
     assert_true(find_accessor(box, "height", true) is null)
 
-    # A write-only property: the read side finds nothing, which is exactly the
-    # `mi < 0` that sends the C's `lookupMember` back to a plain lookup. The
-    # fallback is the caller's, so it must be a null here and not the setter.
     let write_only = _decl("Gauge")
     write_only.members = [MemberInfo("level", null, 0, false, false, true)]
     assert_true(find_accessor(write_only, "level", false) is null)
@@ -337,13 +308,6 @@ fn test_the_owner_is_the_topmost_declaration_that_has_it() -> void {
 }
 
 fn test_a_trait_default_is_owned_by_the_class_that_implements_it() -> void {
-    # `trait Drawable`, `class Widget(Drawable)`, `class Button(Widget)`. The C
-    # copies the default into Widget during layout and then down into Button, so
-    # `jaiChkOwnerOfMember(Button, "describe")` walks the superclass chain and
-    # answers Widget. Nothing has copied anything here, so the trait axis has to
-    # be consulted at each link or the answer is Button — a class that neither
-    # wrote the method nor named the trait, and the one a `prot` default would
-    # then be measured against.
     let drawable = _trait("Drawable")
     drawable.members = [_method("describe")]
     let line = _chain(["Toggle", "Button", "Widget"])
@@ -351,8 +315,6 @@ fn test_a_trait_default_is_owned_by_the_class_that_implements_it() -> void {
     assert_true(owner_of_member(line[1], "describe") == line[2])
     assert_true(owner_of_member(line[0], "describe") == line[2])
 
-    # The trait is never itself the owner, and a class that implements it is its
-    # own owner because the walk starts at the superclass.
     assert_true(owner_of_member(line[2], "describe") == line[2])
 }
 
@@ -365,11 +327,6 @@ fn test_the_owner_of_a_name_nobody_declares_is_the_one_asked() -> void {
 }
 
 fn test_the_two_depth_caps_differ_by_exactly_one() -> void {
-    # `declIsSubclassOf` loops while `depth < MAX_DECL_DEPTH` and so tests 32
-    # declarations; the recursive walk gives up on `depth > MAX_DECL_DEPTH`
-    # from a first call at depth 0 and so reaches 33. The off-by-one is the C's
-    # and is reproduced rather than tidied, because tidying it would move an
-    # answer the other front end still gives.
     let line = _chain([f"D{i}" for i in range(0, 40)])
     assert_true(is_subclass_of(line[0], line[31]))
     assert_false(is_subclass_of(line[0], line[32]))
@@ -378,7 +335,6 @@ fn test_the_two_depth_caps_differ_by_exactly_one() -> void {
 }
 
 fn test_a_lookup_stops_at_the_cap_too() -> void {
-    # The last declaration a recursive walk reads is the thirty-third, `line[32]`.
     let line = _chain([f"D{i}" for i in range(0, 40)])
     line[32].fields = [_field("near")]
     line[33].fields = [_field("far")]
@@ -391,11 +347,6 @@ fn test_a_lookup_stops_at_the_cap_too() -> void {
 }
 
 fn test_every_uncapped_walk_reaches_exactly_as_far() -> void {
-    # The C caps none of these, so the number is this port's to choose — but the
-    # five have to choose the same one. `inherits_opaquely` one link shallower
-    # than `find_member` is `E0410` reported about a parent the lookup had just
-    # read and could not enumerate; an owner one link shallower than `find_field`
-    # measures a `prot` field against the wrong class.
     let last = _chain([f"D{i}" for i in range(0, 40)])
     last[32].opaque_super = "Control"
     last[32].opaque_traits = ["Drawable"]
@@ -408,7 +359,6 @@ fn test_every_uncapped_walk_reaches_exactly_as_far() -> void {
     assert_true(owner_of_field(last[0], "edge") == last[32])
     assert_true(owner_of_member(last[0], "edge") == last[32])
 
-    # And one past it, all five give up together.
     let past = _chain([f"D{i}" for i in range(0, 40)])
     past[33].opaque_traits = ["Drawable"]
     past[33].fields = [_field("edge")]
@@ -422,9 +372,6 @@ fn test_every_uncapped_walk_reaches_exactly_as_far() -> void {
 }
 
 fn test_a_cyclic_hierarchy_answers_instead_of_hanging() -> void {
-    # Layout rejects a cycle with `E0706`, but these relations are also asked
-    # about declarations that layout has not reached yet, and the cap is what
-    # makes the wrong answer a `false` rather than a hung compiler.
     let odd = _decl("Odd")
     let even = _decl("Even")
     odd.superclass = even
@@ -437,7 +384,6 @@ fn test_a_cyclic_hierarchy_answers_instead_of_hanging() -> void {
     assert_true(find_field(odd, "legs") is null)
     assert_true(find_member(odd, "speak") is null)
     assert_true(owner_of_field(odd, "legs") == odd)
-    # The cycle is still a hierarchy, so the reachable answers stay true.
     assert_true(is_subclass_of(odd, even))
 }
 

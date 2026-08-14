@@ -14,17 +14,13 @@ from .cross_module.shapes import Box as Crate, Ink, scaled
 
 fn opaque(side: int) -> any { return Crate(side) }
 
-# `any -> Crate` needs a runtime guard, and the guard's operand is the name
-# this module resolves against its own globals.
 let held: Crate = opaque(3)
 print(held.area())
 
-# `factor` has a default in the module that declares it.
 let bigger = scaled(held)
 print(bigger.area())
 print(scaled(held, 3).area())
 
-# The variant order is the declaration's, which lives in the other file.
 fn describe(ink: Ink) -> str {
     return match ink {
         Ink.Solid => "solid",

@@ -20,9 +20,9 @@ fn test_map_and_filter_are_lazy() -> void {
         return n * 2
     }
     let chain = iter.iter([1, 2, 3, 4]).map(bump)
-    assert_eq(touched, 0)  # nothing ran on construction
+    assert_eq(touched, 0)
     assert_eq(chain.take(2).collect(), [2, 4])
-    assert_eq(touched, 2)  # and only what was asked for
+    assert_eq(touched, 2)
 }
 
 fn test_take_and_drop_clamp_rather_than_raise() -> void {

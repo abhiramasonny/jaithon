@@ -48,10 +48,6 @@ def module_name_for(jaic_path, root):
         return None
     parts[-1] = parts[-1][: -len(".jaic")]
 
-    # `mod.jai` is a package's body, not a module inside it: the directory
-    # `lib/jaithon/compile` is imported as `jaithon.compile`, and that is the
-    # name the importer looks the seed up under. Keying it `jaithon.compile.mod`
-    # left every package in the seed unreachable.
     if parts[-1] == "mod" and len(parts) > 1:
         parts.pop()
 
@@ -128,10 +124,6 @@ def main():
     images = collect(root, subtrees)
 
     if manifest is not None:
-        # An explicit list, and a missing entry is an error rather than a
-        # smaller seed. The seed is the only bootstrap: a module quietly left
-        # out of it does not degrade anything, it makes the next build unable
-        # to compile at all, and it would do so on someone else's machine.
         wanted = read_manifest(manifest)
         missing = [m for m in wanted if m not in images]
         if missing:
@@ -160,19 +152,11 @@ def main():
 
     total = sum(len(v) for v in images.values())
 
-    # The payload goes into a file of its own. A C file holding megabytes of
-    # data is not source, and the two encodings tried before this -- a byte
-    # array at six characters per byte, base64 at four per three -- were both
-    # paying a text tax to smuggle binary through a compiler that never needed
-    # to see it. boot/seed_blob.S pulls this straight in with .incbin.
     bin_path = os.path.join(os.path.dirname(out_path) or ".", "seed.bin")
     packed = []
     offset = 0
     with open(bin_path, "wb") as bf:
         for module, blob in images.items():
-            # Per module rather than one stream over all of them: measured, a
-            # single stream is 1% smaller, and per-module is what lets a module
-            # be inflated only if something imports it.
             z = zlib.compress(blob, 9)
             bf.write(z)
             packed.append((module, offset, len(z), len(blob)))

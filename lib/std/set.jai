@@ -30,8 +30,6 @@ pub fn union[T](sets: list[set[T]]) -> set[T] {
 #: ```
 pub fn intersection[T](sets: list[set[T]]) -> set[T] {
     if sets.len() == 0 { throw ValueError("intersection of no sets is undefined") }
-    # Walking the smallest member keeps the cost proportional to it rather than
-    # to the largest set.
     var smallest = sets[0]
     for part in sets {
         if part.len() < smallest.len() { smallest = part }
