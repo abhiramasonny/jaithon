@@ -822,9 +822,11 @@ fn _build_branch_at() -> dict[int, int] {
     table[opcode(Op.JumpIfCmpFalse)] = 1
     # After the u8 comparison, the u16 slot and the u24 constant index.
     table[opcode(Op.JumpIfCmpLocalK)] = 6
-    table[opcode(Op.MatchSeq)] = 2
-    for op in [Op.MatchConst, Op.MatchConstPop, Op.MatchType, Op.MatchFields] { table[opcode(op)] = 3 }
-    table[opcode(Op.MatchRange)] = 7
+    for op in [Op.MatchSeq, Op.MatchSeqPop] { table[opcode(op)] = 2 }
+    for op in [Op.MatchConst, Op.MatchConstPop, Op.MatchType, Op.MatchTypePop, Op.MatchFields] {
+        table[opcode(op)] = 3
+    }
+    for op in [Op.MatchRange, Op.MatchRangePop] { table[opcode(op)] = 7 }
     return table
 }
 

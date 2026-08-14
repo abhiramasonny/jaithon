@@ -188,7 +188,11 @@
     /* `MATCH_CONST; POP` fused (§3.3) */                                     \
     X(OP_MATCH_CONST_POP,      5, -1)                                         \
     /* `SWAP; POP` fused (§3.3) */                                            \
-    X(OP_SWAP_POP,             0, -1)
+    X(OP_SWAP_POP,             0, -1)                                         \
+    /* `MATCH_TYPE; POP` / `MATCH_RANGE; POP` / `MATCH_SEQ; POP` fused (§3.3) */\
+    X(OP_MATCH_TYPE_POP,       5, -1)                                         \
+    X(OP_MATCH_RANGE_POP,      9, -1)                                         \
+    X(OP_MATCH_SEQ_POP,        4, -1)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

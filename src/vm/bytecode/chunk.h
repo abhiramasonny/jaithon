@@ -288,6 +288,16 @@ typedef enum {
      * the peephole discovers opportunistically. */
     OP_SWAP_POP,
 
+    /* `MATCH_TYPE; POP` / `MATCH_RANGE; POP` / `MATCH_SEQ; POP` fused (§3.3):
+     * the same success-path shape as MATCH_CONST_POP, for a pattern's other
+     * three peek-and-branch tests. All three, like MATCH_CONST_POP, are
+     * emitted directly by the match compiler at fixed sites -- a declared-
+     * type binding, a numeric range pattern, an enum/class receiver-type
+     * check, and a tuple/list pattern's length check -- never synthesised. */
+    OP_MATCH_TYPE_POP,       /* u24 K, i16 J */
+    OP_MATCH_RANGE_POP,      /* u24 K, u24 K, u8 inclusive, i16 J */
+    OP_MATCH_SEQ_POP,        /* u8 count, u8 restFlag, i16 J */
+
     OP_COUNT
 } OpCode;
 
