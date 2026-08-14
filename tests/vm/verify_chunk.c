@@ -446,6 +446,31 @@ static void caseMatchSeqPopBaseline(void) {
     expectOpCount(fn, OP_MATCH_SEQ_POP, 1, "one MATCH_SEQ_POP for the list-shape arm");
 }
 
+/* `slotOperands` (verify.c) once had no case for OP_ADD_BIND/OP_SUB_BIND/
+ * OP_MUL_BIND -- their own u16 slot operand went unchecked, so a malformed
+ * `.jaic` naming a slot past `maxSlots` passed verification and the VM would
+ * later write out of the frame (`slots[slot] = ...`, vm.c). SUB_BIND stands
+ * in for its two siblings: they share this one case in the switch, so one
+ * out-of-range instance covers the whole family. */
+static void caseSubBindSlotOutOfRange(void) {
+    ObjFunction *body =
+        compile("fn f(n: int) -> int {\n"
+                "    var a = n + 1\n"
+                "    var b = a - 1\n"
+                "    var c = 0\n"
+                "    c = a - b\n"
+                "    return c\n"
+                "}\n"
+                "print(f(3))\n");
+    ObjFunction *fn = nestedFunction(body, "f");
+    expectValid(fn, "sub-bind baseline");
+
+    int at = findOp(&fn->chunk, OP_SUB_BIND, 0);
+    if (at < 0) { printf("  SKIP no OP_SUB_BIND emitted\n"); return; }
+    jaiChunkPatchU16(&fn->chunk, at + 1, fn->maxSlots);
+    expectRejected(fn, "sub-bind slot equal to maxSlots", "local slot");
+}
+
 int main(void) {
     jaiDiagInit(&gDiags);
     gDiags.colorOutput = false;
@@ -473,6 +498,7 @@ int main(void) {
     caseMatchTypePopEdgesDisagree();
     caseMatchRangePopBaseline();
     caseMatchSeqPopBaseline();
+    caseSubBindSlotOutOfRange();
 
     printf("%d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

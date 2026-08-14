@@ -93,6 +93,9 @@ static int slotOperands(uint8_t op, int *out) {
     case OP_INC_LOCAL:
     case OP_CMP_LOCAL_CONST_LT:
     case OP_GET_FIELD_LOCAL:
+    case OP_ADD_BIND:
+    case OP_SUB_BIND:
+    case OP_MUL_BIND:
         out[0] = 0;
         return 1;
     case OP_FOR_ITER_BIND:
