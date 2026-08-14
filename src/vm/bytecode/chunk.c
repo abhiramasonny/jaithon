@@ -182,7 +182,9 @@
     X(OP_ITER_RANGE,           5, -2)                                          \
     X(OP_FOR_RANGE_BIND,       8,  0)                                          \
     /* `GET_LOCAL; <int k>; SUB` fused (§3.3) */                               \
-    X(OP_SUB_INT_CONST,        4, +1)
+    X(OP_SUB_INT_CONST,        4, +1)                                         \
+    /* `POP; RETURN_NULL` fused (§3.3) */                                     \
+    X(OP_POP_RETURN_NULL,      0, -1)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

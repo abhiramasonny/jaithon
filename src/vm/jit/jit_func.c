@@ -5717,6 +5717,48 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_POP_RETURN_NULL: {
+            /* POP's half: forget a deferred/borrowed entry rather than settle
+             * it, same as plain OP_POP -- nothing reads a value being thrown
+             * away. */
+            unsigned r;
+            if (e->depth > 0 && holdsRegister(e->stack[e->depth - 1]) &&
+                e->valueDepth > 0) {
+                unsigned idx = e->valueDepth - 1;
+                e->kPend   &= ~(1u << idx);
+                e->xBorrow &= ~(1u << idx);
+            }
+            if (!popValue(e, &r, NULL)) return false;
+
+            /* RETURN_NULL's half, unchanged. */
+            if (e->osr) {
+                e->whyNot = "a return inside an OSR loop";
+                return false;
+            }
+            if ((fn->flags & FN_INIT) == 0) {
+                if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
+                e->sawReturn  = true;
+                e->returnKind = SLOT_NULL;
+                emit(e, jaiA64MovzX(0, 0, 0));
+                emitEpilogue(e, 0);
+                off += 1;
+                break;
+            }
+            if (!localInRange(e, 0) || e->localKind[0] != SLOT_INST) return false;
+            e->usesSlot0 = true;
+            if (e->sawReturn && e->returnKind != SLOT_INST) return false;
+            e->sawReturn  = true;
+            e->returnKind = SLOT_INST;
+            e->returnShape = e->localShape[0];
+            {
+                unsigned src = localIn(e, 0, 0);
+                if (src != 0) emit(e, jaiA64MovX(0, src));
+            }
+            emitEpilogue(e, 0);
+            off += 1;
+            break;
+        }
+
         case OP_GET_UPVALUE: {
             unsigned index = code[off + 1];
             if (index >= (unsigned)fn->upvalueCount) return false;

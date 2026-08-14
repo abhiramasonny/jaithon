@@ -267,6 +267,12 @@ typedef enum {
      * naming `-`, rather than being rewritten as addition by a negative. */
     OP_SUB_INT_CONST,        /* u16 S, i16 */
 
+    /* `POP; RETURN_NULL` fused (§3.3): a discarded expression-statement right
+     * before an implicit void return. RETURN_NULL contributes no stack effect
+     * of its own (it never touches this frame's operand stack), so the fused
+     * effect is exactly POP's. */
+    OP_POP_RETURN_NULL,
+
     OP_COUNT
 } OpCode;
 

@@ -252,6 +252,17 @@ fn _rewrite_stack_ops(code: Code, index: int) -> bool {
         return false
     }
 
+    if head.op == opcode(Op.Pop) {
+        let window = window_of(code, index, 2)
+        if window.len() == 2 and
+            window_clean(code, window) and
+            code.data[window[1]].op == opcode(Op.ReturnNull) {
+            set_instr(head, opcode(Op.PopReturnNull), [])
+            kill(code, window[1])
+            return true
+        }
+    }
+
     if head.op != opcode(Op.Pop) and head.op != opcode(Op.PopN) { return false }
 
     var total = if head.op == opcode(Op.Pop) { 1 } else { head.operands[0] }

@@ -161,27 +161,31 @@ fn test_a_popn_absorbs_the_pop_after_it() -> void {
     assert_eq(proto.chunk.code, _one_u8(Op.PopN, 255) + _one(Op.ReturnNull))
 }
 
+#: The PopN merge itself is still refused -- `PopN(255)` cannot absorb another
+#: Pop -- but the trailing `Pop; ReturnNull` is its own independent window and
+#: fuses regardless, so one change lands and it is not the merge.
 fn test_a_merge_that_would_overflow_the_u8_count_is_refused() -> void {
     let code = _one_u8(Op.PopN, 255) + _one(Op.Pop) + _one(Op.ReturnNull)
-    let expected = _one_u8(Op.PopN, 255) + _one(Op.Pop) + _one(Op.ReturnNull)
+    let expected = _one_u8(Op.PopN, 255) + _one(Op.PopReturnNull)
     let proto = _proto(code)
-    assert_eq(peephole(proto), 0)
+    assert_eq(peephole(proto), 1)
     assert_eq(proto.chunk.code, expected)
 }
 
+#: The two Pops still never merge into a PopN -- the jump lands on the second
+#: one, and `window_clean` refuses a rewrite that would consume a target. That
+#: second Pop is still free to fuse with the ReturnNull after it, though:
+#: `set_instr` rewrites it in place and keeps its position, so the jump still
+#: lands on a live instruction (now PopReturnNull) either way.
 fn test_a_branch_target_stops_a_pop_run_from_merging() -> void {
     let code = _one(Op.Null) +
         _jump(Op.JumpIfFalse, 1) +
         _one(Op.Pop) +
         _one(Op.Pop) +
         _one(Op.ReturnNull)
-    let expected = _one(Op.Null) +
-        _jump(Op.JumpIfFalse, 1) +
-        _one(Op.Pop) +
-        _one(Op.Pop) +
-        _one(Op.ReturnNull)
+    let expected = _one(Op.Null) + _jump(Op.JumpIfFalse, 1) + _one(Op.Pop) + _one(Op.PopReturnNull)
     let proto = _proto(code)
-    assert_eq(peephole(proto), 0)
+    assert_eq(peephole(proto), 1)
     assert_eq(proto.chunk.code, expected)
 }
 
@@ -204,6 +208,32 @@ fn test_dup_followed_by_bind_becomes_set_local() -> void {
     let proto = _proto(code)
     assert_eq(peephole(proto), 1)
     assert_eq(proto.chunk.code, _one(Op.Null) + _one_u16(Op.SetLocal, 1) + _one(Op.ReturnNull))
+}
+
+fn test_pop_followed_by_return_null_fuses() -> void {
+    let code = _one(Op.Pop) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 1)
+    assert_eq(proto.chunk.code, _one(Op.PopReturnNull))
+}
+
+#: The rule is scoped to a bare Pop; PopN's own multi-value discard has no
+#: fused counterpart and is left alone.
+fn test_popn_does_not_fuse_with_return_null() -> void {
+    let code = _one_u8(Op.PopN, 2) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 0)
+    assert_eq(proto.chunk.code, code)
+}
+
+#: A jump landing directly on ReturnNull, skipping the Pop, must stop the
+#: fusion -- rewriting the Pop in place and killing ReturnNull would leave
+#: that edge's target resolving past the return entirely.
+fn test_a_branch_target_on_return_null_stops_the_fusion() -> void {
+    let code = _one(Op.Null) + _jump(Op.JumpIfTrue, 1) + _one(Op.Pop) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 0)
+    assert_eq(proto.chunk.code, code)
 }
 
 fn test_compaction_moves_a_deleted_target_marker_to_its_survivor() -> void {

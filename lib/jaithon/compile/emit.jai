@@ -172,6 +172,7 @@ pub enum Op {
     IterRange,
     ForRangeBind,
     SubIntConst,
+    PopReturnNull,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -331,6 +332,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.IterRange, "OP_ITER_RANGE", 5, -2),
     OpSpec(Op.ForRangeBind, "OP_FOR_RANGE_BIND", 8, 0),
     OpSpec(Op.SubIntConst, "OP_SUB_INT_CONST", 4, 1),
+    OpSpec(Op.PopReturnNull, "OP_POP_RETURN_NULL", 0, -1),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,

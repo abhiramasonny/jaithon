@@ -65,6 +65,7 @@ bool jaiOpFallsThrough(uint8_t op) {
     case OP_LOOP:
     case OP_RETURN:
     case OP_RETURN_NULL:
+    case OP_POP_RETURN_NULL:
     case OP_THROW:
     case OP_RERAISE:
     case OP_HALT:

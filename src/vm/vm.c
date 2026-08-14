@@ -3714,6 +3714,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_TAIL_CALL]          = &&L_OP_TAIL_CALL,
         [OP_RETURN]             = &&L_OP_RETURN,
         [OP_RETURN_NULL]        = &&L_OP_RETURN_NULL,
+        [OP_POP_RETURN_NULL]    = &&L_OP_POP_RETURN_NULL,
         [OP_CLOSURE]            = &&L_OP_CLOSURE,
         [OP_BUILD_LIST]         = &&L_OP_BUILD_LIST,
         [OP_BUILD_DICT]         = &&L_OP_BUILD_DICT,
@@ -5317,6 +5318,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
         goto opReturn;
 
     VM_CASE(OP_RETURN_NULL):
+        retval = NULL_VAL;
+        goto opReturn;
+
+    VM_CASE(OP_POP_RETURN_NULL):
+        DROP(1);
         retval = NULL_VAL;
         goto opReturn;
 
