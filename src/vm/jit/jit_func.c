@@ -853,10 +853,21 @@ static bool localTagInFrame(const Emit *e, unsigned slot) {
 }
 
 /* Per-access instruction savings from giving `slot` a register instead of a frame home, accumulated
- * by the accessors during the measuring pass and weighted by loop nesting. Zero-saving slots are excluded outright, not just ranked last -- otherwise a tie-break could hand a register to a slot the loop never touches, paying a prologue write for nothing. */
+ * by the accessors during the measuring pass and weighted by loop nesting. Zero-saving slots are excluded outright, not just ranked last -- otherwise a tie-break could hand a register to a slot the loop never touches, paying a prologue write for nothing.
+ *
+ * Both tiers feed this, but with their OWN instruction counts, which is why the
+ * numbers at the call sites differ rather than the mechanism. A function-tier
+ * frame home is a bare payload word for every slot the plan will consider (only
+ * a dynamic slot stores a tag, and a dynamic slot never gets a register), so a
+ * write costs one `str` there and makes a weak case for a register -- weak
+ * enough that a float write makes none at all, see localOutFp. An OSR home is
+ * the INTERPRETER's own Value slot, so the same write stores tag and payload
+ * both and costs three; in OSR a write is worth as much as two reads. Ranking
+ * OSR on the function tier's numbers would therefore under-rank exactly the
+ * write-heavy loop variables OSR exists to speed up. */
 static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
                          unsigned saveFp) {
-    if (!e->measuring || e->osr || e->inlining) return;
+    if (!e->measuring || e->inlining) return;
     if (slot > JIT_MAX_SLOTS) return;
     unsigned w = 1u;
     if (e->loopDepth != NULL && e->curOffset < e->loopDepthCount) {
@@ -905,6 +916,11 @@ static unsigned localTagFor(const Emit *e, unsigned slot) {
  * Only the payload moves -- a local's kind is fixed for the whole function, so the tag is never restored. */
 static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
     if (e->osr) {
+        /* An X home answers with no instruction at all, an FP home costs the
+         * `fmov` below and memory costs the `ldr` -- so an X register saves
+         * one here and an FP register saves nothing, exactly as in the
+         * function tier's arm. */
+        noteSlotCost(e, slot, 1u, 0u);
         if (e->slotXReg[slot] != 0) return e->slotXReg[slot];
         if (e->slotFpReg[slot] != 0) {
             emit(e, jaiA64FmovXD(scratch, e->slotFpReg[slot]));
@@ -1119,6 +1135,11 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
     xHomeWritten(e, e->osr ? e->slotXReg[slot]
                            : (e->spilled ? 0u : localReg(e, slot)));
     if (e->osr) {
+        /* The memory arm below is three instructions -- the tag built, the tag
+         * stored, the payload stored -- against one `mov` into an X home or one
+         * `fmov` into an FP home. Two saved either way, so a write votes for a
+         * register without voting for a bank; the reads pick the bank. */
+        noteSlotCost(e, slot, 2u, 2u);
         if (e->slotFpReg[slot] != 0) fpReleaseHome(e, e->slotFpReg[slot]);
         if (e->slotXReg[slot] != 0) {
             if (src != e->slotXReg[slot]) {
@@ -1162,6 +1183,9 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
  * collapses `ldr x; fmov d,x` to one `ldr d`, and the store side likewise) -- only for a fixed-kind local; a dynamic one has a tag to check and goes the ordinary (X) way. */
 static void localInFp(Emit *e, unsigned slot, unsigned dst) {
     if (e->osr) {
+        /* Mirrors the function tier's charge for the same read: the FP home is
+         * the one that pays, and an X home is worth no more than the load. */
+        noteSlotCost(e, slot, 0u, 1u);
         if (e->slotFpReg[slot] != 0) {
             /* Both banks, so the numbers never collide: a local's home is
              * v8..v15 and the operand stack's is v16 up. */
@@ -1198,6 +1222,11 @@ static void localInFp(Emit *e, unsigned slot, unsigned dst) {
 static void localOutFp(Emit *e, unsigned slot, unsigned src) {
     noteSlotWrite(e, slot);
     if (e->osr) {
+        /* Unlike the function tier's float write just below -- which is one
+         * instruction into any of the three homes and so charges nothing --
+         * the OSR memory arm here writes the tag as well, so this write really
+         * does buy two, the same as localOut's. */
+        noteSlotCost(e, slot, 2u, 2u);
         if (e->slotFpReg[slot] != 0) {
             fpReleaseHome(e, e->slotFpReg[slot]);
             if (src != e->slotFpReg[slot]) {
@@ -8716,8 +8745,31 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count);
 
 /* Greedy: most instructions-saved first, across BOTH register banks at once (an int slot read 4x in
  * a loop outranks a float slot read 2x, different pools, but comparing them in one order keeps that meaningful when only one pool runs out -- see noteSlotCost). Three exclusions: a zero-saving slot is skipped outright, not just ranked last (else a tie-break could pay a prologue write for nothing); a dynamic slot keeps its frame home, since only the frame has anywhere to put a run-time tag; a wrong guess costs an `fmov`, never a wrong answer, since only fmov/ldr/str ever touch a home. */
-static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
+/* Both tiers plan through this, on the same ledgers (see noteSlotCost). What is
+ * still per-tier is named here rather than duplicated:
+ *
+ *   `skip`     slots the caller has already ruled out for reasons the ledgers
+ *              cannot see -- OSR passes the ones captured by reference by a
+ *              closure, which must stay in memory whatever they save, and the
+ *              ones its probe found to be dynamic. NULL for the function tier,
+ *              whose dynamic slots are in e->dynamicLocal already.
+ *   xBase      OSR's callee-saved window opens ABOVE the registers the loop
+ *              head reserved for its iterator; the function tier's opens at
+ *              x19. Matches regBase, which the operand stack is numbered from.
+ *   the FP gate  the function tier lets the two ledgers pick the bank, because
+ *              jitArgIn marshals every incoming argument and an FP home there
+ *              only ever sees a clean value. OSR's homes are the interpreter's
+ *              own slots and its prologue fills an FP home with a full-width
+ *              `ldr d`; for a SLOT_BOOL that loads the seven bytes above a
+ *              one-byte `strb`, which is the garbage-high-byte bug the OSR
+ *              prologue's X arm narrows against. Only a float may take an FP
+ *              home there.
+ *   `strandedOut`  counted for the OSR census: slots that earned a register and
+ *              found none left, which is what a wider bank would buy. */
+static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
+                              const bool *skip, unsigned *strandedOut) {
     unsigned availFp = JIT_FP_MAX_SAVED;
+    unsigned xBase = e->osr ? osrReserved(e) : 0u;
     unsigned top = e->base + e->locals;
     if (top > JIT_MAX_SLOTS + 1u) top = JIT_MAX_SLOTS + 1u;
     while (availX > 0 || availFp > 0) {
@@ -8726,7 +8778,9 @@ static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
         for (unsigned slot = e->base; slot < top; slot++) {
             if (e->slotXReg[slot] != 0 || e->slotFpReg[slot] != 0) continue;
             if (e->dynamicLocal[slot]) continue;
-            if (availFp > 0 && m->slotSaveFp[slot] > bestGain) {
+            if (skip != NULL && skip[slot]) continue;
+            bool fpOk = !e->osr || m->localKind[slot] == SLOT_FLOAT;
+            if (availFp > 0 && fpOk && m->slotSaveFp[slot] > bestGain) {
                 bestGain = m->slotSaveFp[slot];
                 bestSlot = slot;
                 bestFp   = true;
@@ -8743,9 +8797,18 @@ static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
                 (uint8_t)(JIT_FP_FIRST_SAVED + e->fpLocals++);
             availFp--;
         } else {
-            e->slotXReg[bestSlot] = (uint8_t)(JIT_FIRST_SAVED + e->xLocals++);
+            e->slotXReg[bestSlot] =
+                (uint8_t)(JIT_FIRST_SAVED + xBase + e->xLocals++);
             availX--;
         }
+    }
+    if (strandedOut == NULL) return;
+    for (unsigned slot = e->base; slot < top; slot++) {
+        if (e->slotXReg[slot] != 0 || e->slotFpReg[slot] != 0) continue;
+        if (e->dynamicLocal[slot]) continue;
+        if (skip != NULL && skip[slot]) continue;
+        if (m->slotSaveX[slot] == 0 && m->slotSaveFp[slot] == 0) continue;
+        (*strandedOut)++;
     }
 }
 
@@ -8923,7 +8986,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         if (saved > JIT_MAX_SAVED) {
             e.whyNot = "the operand stack alone exceeds the registers";
         } else {
-            planSlotRegisters(&e, &body, JIT_MAX_SAVED - saved);
+            planSlotRegisters(&e, &body, JIT_MAX_SAVED - saved, NULL, NULL);
             saved += e.xLocals;
         }
     }
@@ -9772,46 +9835,50 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                                                   : probe.maxValue);
             unsigned availX = overhead < JIT_MAX_SAVED
                                   ? JIT_MAX_SAVED - overhead : 0u;
-            unsigned availFp = JIT_FP_MAX_SAVED;
-            /* Busiest first, and only slots the body names. A slot whose kind
-             * varies at run time keeps its tag check and stays in memory. */
-            uint8_t order[JIT_MAX_SLOTS + 1];
+            /* Ranked by what a register SAVES, on the same ledgers and through
+             * the same planner as the function tier -- not by how often the
+             * body names the slot, which is what this used to do. Both counts
+             * are weighted by loop nesting the same way, so the difference is
+             * not "flat versus weighted": it is that one pooled counter had to
+             * answer two questions it cannot tell apart. It could not say which
+             * BANK a slot wants (a float read costs an `ldr d` from memory and
+             * an `fmov` from an X home, so the two banks are not worth the same
+             * to it), and it could not say that a WRITE is worth twice a read
+             * here, because an OSR slot's memory home is the interpreter's own
+             * Value and takes the tag as well as the payload. A loop variable
+             * assigned every iteration is exactly the case both mistakes fell
+             * on, which is the case OSR exists for.
+             *
+             * The slots the ledgers cannot rule out on their own are handed
+             * over as `skip`: one captured by reference by a closure, which is
+             * aliased by an ObjUpvalue pointing into the VM's slot array and so
+             * must stay in memory whatever it saves (see chunkByRefCaptures);
+             * one the probe found dynamic, which keeps its run-time tag and has
+             * nowhere but the frame to put it; and, when the chunk would not
+             * decode at all, every slot -- the by-reference scan is what makes
+             * a register safe here, so failing it means registers for nobody.
+             *
+             * `slotUse` stays in that mask rather than being retired for the
+             * ledgers, so the set of slots this can place is the old one
+             * narrowed, never widened. The two disagree in one direction only:
+             * slotUse goes uncounted past JIT_MAX_DEPTH_MAP (a chunk over 8KB),
+             * where the ledgers still count at weight 1, so retiring it would
+             * hand registers to slots in a region no gate has ever planned for.
+             * Whatever the ledgers rank last is dropped by the zero-gain
+             * exclusion anyway, which is the accurate half of the old test:
+             * slotUse counts localInRange, a bounds CHECK made at more sites
+             * than actually read or write the slot. */
             bool byRef[JIT_MAX_SLOTS + 1];
             bool decoded = chunkByRefCaptures(&fn->chunk, byRef, e.locals);
-            unsigned n = 0;
-            for (unsigned i = 0; decoded && i < e.locals; i++) {
-                if (probe.slotUse[i] == 0) continue;
-                if (probe.dynamicLocal[i]) continue;
-                /* Captured by reference (see chunkByRefCaptures): stays in memory, since a register copy would be different storage from what the closure reads/writes. */
-                if (byRef[i]) continue;
-                order[n++] = (uint8_t)i;
+            bool skip[JIT_MAX_SLOTS + 1];
+            for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+                skip[i] = !decoded || i >= e.locals || byRef[i] ||
+                          probe.dynamicLocal[i] || probe.slotUse[i] == 0;
             }
-            for (unsigned i = 0; i + 1 < n; i++) {
-                unsigned best = i;
-                for (unsigned j = i + 1; j < n; j++) {
-                    if (probe.slotUse[order[j]] > probe.slotUse[order[best]]) {
-                        best = j;
-                    }
-                }
-                uint8_t t = order[i]; order[i] = order[best]; order[best] = t;
-            }
-            for (unsigned i = 0; i < n; i++) {
-                unsigned slot = order[i];
-                if (probe.localKind[slot] == SLOT_FLOAT && availFp > 0) {
-                    e.slotFpReg[slot] =
-                        (uint8_t)(JIT_FP_FIRST_SAVED + e.fpLocals++);
-                    availFp--;
-                } else if (availX > 0) {
-                    e.slotXReg[slot] = (uint8_t)(JIT_FIRST_SAVED +
-                                                 osrReserved(&e) + e.xLocals++);
-                    availX--;
-                } else {
-                    /* Wanted one and there was none left. This is the number a
-                     * wider bank would buy, and it is 0 far more often than the
-                     * decline census suggests -- so it is worth reporting. */
-                    probeStranded++;
-                }
-            }
+            /* `probeStranded` is the count of slots that earned a register and
+             * found none left -- what a wider bank would buy, and 0 far more
+             * often than the decline census suggests. */
+            planSlotRegisters(&e, &probe, availX, skip, &probeStranded);
 
             /* What planHoists needs: where each slot was written, where it was
              * subscripted, where the body can destroy a caller-saved register,
