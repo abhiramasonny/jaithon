@@ -863,6 +863,7 @@ static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
 
 static void branchOnDeopt(Emit *e, unsigned cond);
 static void fpReleaseHome(Emit *e, unsigned reg);
+static void emitConst64(Emit *e, unsigned rd, int64_t value);
 
 /* Every kind but SLOT_MAYBE_INST has a tag fixed at compile time; that one reads it off the payload (null vs non-null). */
 static void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
@@ -944,6 +945,29 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
             emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
             emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(Obj, type)));
             emit(e, jaiA64SubsXImm(31, scratch, OBJ_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+        } else if (e->localKind[slot] == SLOT_INST) {
+            /* Same hazard, for a slot that took two different classes: a tag
+             * of VAL_OBJ says "an instance", not "an instance of THIS class",
+             * so the object type and its class shape are both confirmed here
+             * before a consumer reads a field at an offset only this class
+             * has. JIT_SCRATCH_D is free at every call site that can carry a
+             * SLOT_INST-kinded dynamic local through this helper (audited:
+             * OP_GET_LOCAL, OP_GET_LOCAL2, the init-returns-self arms of
+             * OP_RETURN_NULL/OP_POP_RETURN_NULL, emitRootFill's root loop).
+             * `scratch` keeps the instance pointer as the base throughout --
+             * loading FROM it doesn't clobber it -- until it is chained into
+             * the class pointer and then the shapeId, since nothing after
+             * this needs the original pointer back (the unconditional reload
+             * below restores it for the return regardless). */
+            emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_D, scratch, (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
+            branchOnDeopt(e, JAI_A64_NE);
+            emit(e, jaiA64LdrX(scratch, scratch, (unsigned)offsetof(ObjInstance, klass)));
+            emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(ObjClass, shapeId)));
+            emitConst64(e, JIT_SCRATCH_D, (int64_t)e->localShape[slot]);
+            emit(e, jaiA64SubsXReg(31, scratch, JIT_SCRATCH_D));
             branchOnDeopt(e, JAI_A64_NE);
         }
     }
