@@ -7545,8 +7545,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
             if (kind == SLOT_INST) {
-                /* The tag says "an object", not "an object of this class". */
+                /* The tag says "an object", not "an object of this class" --
+                 * and not even "an instance" yet: VAL_OBJ is every heap
+                 * object, so a list holding an instance beside a string must
+                 * have its object type confirmed before `klass` is read,
+                 * exactly as OP_FOR_ITER_BIND's SLOT_INST arms already do.
+                 * Without this, a list whose sampled element is an instance
+                 * but a later element is (say) a string reads that string's
+                 * header bytes as an ObjInstance's `klass` pointer and
+                 * segfaults dereferencing it -- not merely a wrong answer. */
                 emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                branchOnDeopt(e, JAI_A64_NE);
                 emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
                                    (unsigned)offsetof(ObjInstance, klass)));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
