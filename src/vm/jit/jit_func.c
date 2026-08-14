@@ -7479,6 +7479,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emitConst64(e, JIT_SCRATCH_A, (int64_t)elemShape);
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
                 branchOnDeopt(e, JAI_A64_NE);
+            } else if (kind == SLOT_LIST) {
+                /* "an object" is not "a list": every SLOT_LIST consumer reads the header with no check of
+                 * its own, so the object type is confirmed here, once, before the kind is handed out --
+                 * same contract, same check, as OP_GET_FIELD_LOCAL's SLOT_LIST arm. Without this a
+                 * heterogeneous list (`[[1, 2], "not a list"]`) passes the generic VAL_OBJ tag check on
+                 * either element and reads the second one's bytes through ObjList's field offsets. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                branchOnDeopt(e, JAI_A64_NE);
             }
 
             unsigned d1, d2;
