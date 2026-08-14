@@ -216,7 +216,11 @@ static void caseUnbalancedJoin(void) {
 /* A pop from a stack that does not hold enough: the POP after a call becomes an
  * ADD, which wants two operands where only the call's result is live. */
 static void caseStackUnderflow(void) {
-    ObjFunction *fn = compile("print(1)\n");
+    /* A second statement, so the first call's OP_POP is not immediately
+     * followed by the module's own implicit epilogue -- the two would
+     * otherwise fuse into a single OP_POP_RETURN_NULL, leaving no standalone
+     * OP_POP for this case to find. */
+    ObjFunction *fn = compile("print(1)\nprint(2)\n");
     expectValid(fn, "underflow baseline");
 
     int at = findOp(&fn->chunk, OP_POP, 0);
@@ -363,6 +367,41 @@ static void caseBlockCloseShape(void) {
     expectOpCount(fn, OP_CLOSE_UPVALUE, 1, "a loop body is not closed twice");
 }
 
+/* OP_MATCH_CONST_POP has a different net stack effect on each of its two
+ * edges -- -1 falling through (the arm matched, the subject is popped), 0 on
+ * the taken jump (no match, the subject stays for the next arm's own test).
+ * A real match statement over literal patterns is the baseline; it must
+ * verify exactly like any other chunk the front end produces. */
+static void caseMatchConstPopBaseline(void) {
+    ObjFunction *fn =
+        compile("let n = 2\n"
+                "print(match n { 0 => \"zero\", 1 => \"one\", _ => \"many\" })\n");
+    expectValid(fn, "match over literal patterns");
+    expectOpCount(fn, OP_MATCH_CONST_POP, 2, "one MATCH_CONST_POP per literal arm");
+}
+
+/* Redirect a MATCH_CONST_POP's no-match jump to land exactly where its own
+ * fall-through does. The fall-through edge arrives one value shallower (the
+ * subject just got popped); the redirected jump edge still carries the
+ * unpopped depth the taken path is supposed to have. Two edges into one
+ * offset that disagree by exactly the asymmetry this opcode exists for --
+ * if `jaiOpBranchOperandAt` or the depth switch ever mis-modelled either
+ * edge, this is what would stop catching it. */
+static void caseMatchConstPopEdgesDisagree(void) {
+    ObjFunction *fn =
+        compile("let n = 2\n"
+                "print(match n { 0 => \"zero\", 1 => \"one\", _ => \"many\" })\n");
+
+    int at = findOp(&fn->chunk, OP_MATCH_CONST_POP, 0);
+    if (at < 0) { printf("  SKIP no OP_MATCH_CONST_POP emitted\n"); return; }
+    /* The jump displacement is relative to the byte after the whole
+     * instruction (see chunk.c's own note on this), so 0 retargets the
+     * no-match edge onto the very instruction fall-through already reaches. */
+    jaiChunkPatchI16(&fn->chunk, at + 1 + 3, 0);
+    expectRejected(fn, "MATCH_CONST_POP edges redirected to the same offset",
+                   "disagrees with depth");
+}
+
 int main(void) {
     jaiDiagInit(&gDiags);
     gDiags.colorOutput = false;
@@ -384,6 +423,8 @@ int main(void) {
     caseBadExceptionEntry();
     caseBadUpvalue();
     caseBlockCloseShape();
+    caseMatchConstPopBaseline();
+    caseMatchConstPopEdgesDisagree();
 
     printf("%d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

@@ -3753,6 +3753,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_MATCH_EXC]          = &&L_OP_MATCH_EXC,
         [OP_GET_EXC]            = &&L_OP_GET_EXC,
         [OP_MATCH_CONST]        = &&L_OP_MATCH_CONST,
+        [OP_MATCH_CONST_POP]    = &&L_OP_MATCH_CONST_POP,
         [OP_MATCH_RANGE]        = &&L_OP_MATCH_RANGE,
         [OP_MATCH_TYPE]         = &&L_OP_MATCH_TYPE,
         [OP_MATCH_SEQ]          = &&L_OP_MATCH_SEQ,
@@ -6292,6 +6293,21 @@ static JaiRunResult runLoop(int baseFrameCount) {
         if (vm.hasException) goto vmThrow;
         LOAD_STATE();
         if (!equal) ip += offset;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MATCH_CONST_POP): {
+        Value expected = READ_CONST();
+        int16_t offset = READ_I16();
+        SAVE_STATE();
+        bool equal = jaiValuesEqual(PEEK(0), expected);
+        if (vm.hasException) goto vmThrow;
+        LOAD_STATE();
+        if (equal) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
         VM_NEXT();
     }
 

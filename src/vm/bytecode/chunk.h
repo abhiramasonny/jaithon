@@ -273,6 +273,14 @@ typedef enum {
      * effect is exactly POP's. */
     OP_POP_RETURN_NULL,
 
+    /* `MATCH_CONST; POP` fused (§3.3): a literal match-arm's own success path
+     * (subject equals the arm's constant), emitted directly by the match
+     * compiler rather than synthesised by the peephole -- the pattern is
+     * always exactly this shape, not something that only sometimes lands
+     * adjacent. The no-match path is unchanged: MATCH_CONST's own jump,
+     * still peeking, still leaving the subject for the next arm's test. */
+    OP_MATCH_CONST_POP,      /* u24 K, i16 J */
+
     OP_COUNT
 } OpCode;
 
