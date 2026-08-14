@@ -84,6 +84,7 @@ static int slotOperands(uint8_t op, int *out) {
     case OP_BIND:
     case OP_CLOSE_UPVALUE:
     case OP_ADD_INT_CONST:
+    case OP_SUB_INT_CONST:
     case OP_INC_LOCAL:
     case OP_CMP_LOCAL_CONST_LT:
     case OP_GET_FIELD_LOCAL:

@@ -262,6 +262,11 @@ typedef enum {
     OP_ITER_RANGE,           /* u8 inclusive, u16 C, u16 E */
     OP_FOR_RANGE_BIND,       /* i16 J, u16 S, u16 C, u16 E */
 
+    /* `GET_LOCAL S; <int k>; SUB` fused (§3.3). Kept distinct from
+     * ADD_INT_CONST so overflow diagnostics and user-defined subtraction keep
+     * naming `-`, rather than being rewritten as addition by a negative. */
+    OP_SUB_INT_CONST,        /* u16 S, i16 */
+
     OP_COUNT
 } OpCode;
 

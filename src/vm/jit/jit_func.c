@@ -4644,6 +4644,30 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_SUB_INT_CONST: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int16_t  imm  = jaiReadI16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            {
+                unsigned dst = pushReg(e) - 1;
+                unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
+                if (imm >= 0 && imm <= 4095) {
+                    emit(e, jaiA64SubsXImm(dst, cur, (unsigned)imm));
+                } else if (imm < 0 && imm >= -4095) {
+                    emit(e, jaiA64AddsXImm(dst, cur, (unsigned)(-(int)imm)));
+                } else {
+                    emitConst64(e, JIT_SCRATCH_A, imm);
+                    emit(e, jaiA64SubsXReg(dst, cur, JIT_SCRATCH_A));
+                }
+            }
+            branchOnOverflow(e, 1u, JAI_A64_VS);
+            off += 5;
+            break;
+        }
+
         case OP_MUL_BIND: {
             unsigned slot = jaiReadU16(code + off + 1);
             if (!localInRange(e, slot)) return false;
