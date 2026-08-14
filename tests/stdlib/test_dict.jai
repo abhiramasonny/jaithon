@@ -1,6 +1,6 @@
-#: `std.dict` — the reshaping helpers over `dict[K, V]`, plus the built-in
+#: `std.dict_ops` — the reshaping helpers over `dict[K, V]`, plus the built-in
 #: dict's own contract about insertion order and missing keys.
-import std.dict as dict
+import std.dict_ops as dict
 
 from std.test import assert_eq, assert_true, assert_throws
 

@@ -1,5 +1,7 @@
 #: The `jaithon` subcommands, written in Jaithon.
 #:
+#: Facade: imports and re-exports every sibling module in this directory.
+#:
 #: They live beside `std` rather than inside it, because no user program
 #: imports them — a language whose tools cannot be written in it has not
 #: finished being a language.
