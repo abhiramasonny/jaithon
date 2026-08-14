@@ -21,7 +21,7 @@ from std.gui.color import rgb
 from std.gui.image import Image
 from std.gui.path import Cap, Join, Path, Winding
 
-from ..geom import Point, Rect, pose_outline
+from ..geom import Point, Rect, cross_arms, pose_outline
 from ..metrics import text_height, text_width
 from ..primitive import DisplayList, Primitive
 from ..style import HorizontalAnchor, LineCap, LineJoin, MarkerShape, Paint
@@ -156,7 +156,7 @@ fn _marker(
     let radius = size * 0.5
     if shape == MarkerShape.Plus or shape == MarkerShape.Cross {
         let stroke = Stroke(fill.color(), width: max(1.0, size * 0.22))
-        for arm in _cross_arms(at, radius, shape == MarkerShape.Cross) {
+        for arm in cross_arms(at, radius, shape == MarkerShape.Cross) {
             _polyline(canvas, arm, stroke)
         }
         return
@@ -205,20 +205,6 @@ fn _marker_points(at: Point, radius: float, shape: MarkerShape) -> list[Point] {
         points.push(Point(at.x + radius * math.cos(angle), at.y + radius * math.sin(angle)))
     }
     return points
-}
-
-fn _cross_arms(at: Point, radius: float, diagonal: bool) -> list[list[Point]] {
-    if diagonal {
-        let reach = radius * 0.7071
-        return [
-            [Point(at.x - reach, at.y - reach), Point(at.x + reach, at.y + reach)],
-            [Point(at.x - reach, at.y + reach), Point(at.x + reach, at.y - reach)],
-        ]
-    }
-    return [
-        [Point(at.x - radius, at.y), Point(at.x + radius, at.y)],
-        [Point(at.x, at.y - radius), Point(at.x, at.y + radius)],
-    ]
 }
 
 #: A batch of identical markers.

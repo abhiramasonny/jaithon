@@ -8,6 +8,7 @@ from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
 from jaithon.compile.check.modsig import absolute, default_search_path, dirname
+from jaithon.compile.check.modsig import read_source
 from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type, TypeDecl
@@ -523,22 +524,11 @@ pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null)
 }
 
 fn _parse_quietly(path: str) -> Node? {
-    let text = _read_text(path)
+    let text = read_source(path)
     if text is null { return null }
     let tree = parse(text, 0)
     if tree is null or tree.kind != NodeKind.Program { return null }
     return tree
-}
-
-fn _read_text(path: str) -> str? {
-    try {
-        let handle = __prim__.io_open(path, "rb")
-        let raw = __prim__.io_read(handle, -1)
-        __prim__.io_close(handle)
-        return __prim__.str_decode(raw)
-    } catch _failure: Error {
-        return null
-    }
 }
 
 fn _own_imports(program: Node) -> list[SigImport] {

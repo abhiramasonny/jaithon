@@ -417,6 +417,30 @@ pub fn pose_outline(at: Point, radius: float, angle: float) -> list[Point] {
     ]
 }
 
+#: The two line segments of a plus or a diagonal cross marker.
+#:
+#: `diagonal` picks the two strokes: the axis-aligned horizontal and vertical
+#: bars of a `Plus`, or the two corner-to-corner diagonals of a `Cross`. Shared
+#: by the SVG and raster backends, which stroke the returned segments rather
+#: than fill them.
+#:
+#: ```
+#: cross_arms(Point(0.0, 0.0), 2.0, false).len()      # 2
+#: ```
+pub fn cross_arms(at: Point, radius: float, diagonal: bool) -> list[list[Point]] {
+    if diagonal {
+        let reach = radius * 0.7071
+        return [
+            [Point(at.x - reach, at.y - reach), Point(at.x + reach, at.y + reach)],
+            [Point(at.x - reach, at.y + reach), Point(at.x + reach, at.y - reach)],
+        ]
+    }
+    return [
+        [Point(at.x - radius, at.y), Point(at.x + radius, at.y)],
+        [Point(at.x, at.y - radius), Point(at.x, at.y + radius)],
+    ]
+}
+
 #: Signed span from `low` to `high`, rejecting the values that would poison
 #: every coordinate downstream.
 #:

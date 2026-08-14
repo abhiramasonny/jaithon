@@ -198,54 +198,17 @@ pub class DisplayList: Iterable[Primitive] {
 #: ```
 pub fn describe(primitive: Primitive) -> str {
     return match primitive {
-        Primitive.Polyline(points, stroke) => _show_polyline(points, stroke),
-        Primitive.Polygon(points, fill, edge) => _show_polygon(points, fill, edge),
-        Primitive.Text(at, content, style) => _show_text(at, content, style),
-        Primitive.Marker(at, shape, size, fill, edge) => _show_marker(at, shape, size, fill, edge),
-        Primitive.Points(points, shape, size, fill) => _show_points(points, shape, size, fill),
-        Primitive.Poses(points, angles, size, fill) => _show_poses(points, angles, size, fill),
-        Primitive.Segments(points, stroke) => _show_segments(points, stroke),
-        Primitive.Raster(rect, _pixels, width, height) => _show_raster(rect, width, height),
-        Primitive.PushClip(rect) => _show_clip(rect),
+        Primitive.Polyline(points, stroke) => f"Polyline [{_points(points)}] {_stroke(stroke)}",
+        Primitive.Polygon(points, fill, edge) => f"Polygon [{_points(points)}] fill={_paint(fill)} edge={_optional_stroke(edge)}",
+        Primitive.Text(at, content, style) => f"Text {_point(at)} {_quote(content)} {_text_style(style)}",
+        Primitive.Marker(at, shape, size, fill, edge) => f"Marker {_point(at)} {_variant(shape)} size={_number(size)} fill={_paint(fill)} edge={_optional_stroke(edge)}",
+        Primitive.Points(points, shape, size, fill) => f"Points x{points.len()} {_variant(shape)} size={_number(size)} fill={_paint(fill)} {_bounds(points)}",
+        Primitive.Poses(points, angles, size, fill) => f"Poses x{points.len()} angles={angles.len()} size={_number(size)} fill={_paint(fill)} {_bounds(points)}",
+        Primitive.Segments(points, stroke) => f"Segments x{points.len() // 2} {_stroke(stroke)} {_bounds(points)}",
+        Primitive.Raster(rect, _pixels, width, height) => f"Raster {width}x{height} at {_number(rect.left())},{_number(rect.bottom())} {_number(rect.width())}x{_number(rect.height())}",
+        Primitive.PushClip(rect) => f"PushClip {_number(rect.left())},{_number(rect.bottom())} {_number(rect.width())}x{_number(rect.height())}",
         Primitive.PopClip => "PopClip",
     }
-}
-
-fn _show_polyline(points: list[Point], stroke: Stroke) -> str {
-    return f"Polyline [{_points(points)}] {_stroke(stroke)}"
-}
-
-fn _show_polygon(points: list[Point], fill: Paint, edge: Stroke?) -> str {
-    return f"Polygon [{_points(points)}] fill={_paint(fill)} edge={_optional_stroke(edge)}"
-}
-
-fn _show_text(at: Point, content: str, style: TextStyle) -> str {
-    return f"Text {_point(at)} {_quote(content)} {_text_style(style)}"
-}
-
-fn _show_marker(at: Point, shape: MarkerShape, size: float, fill: Paint, edge: Stroke?) -> str {
-    let body = f"{_variant(shape)} size={_number(size)}"
-    return f"Marker {_point(at)} {body} fill={_paint(fill)} edge={_optional_stroke(edge)}"
-}
-
-fn _show_points(points: list[Point], shape: MarkerShape, size: float, fill: Paint) -> str {
-    let body = f"{_variant(shape)} size={_number(size)} fill={_paint(fill)}"
-    return f"Points x{points.len()} {body} {_bounds(points)}"
-}
-
-fn _show_poses(points: list[Point], angles: list[float], size: float, fill: Paint) -> str {
-    let body = f"size={_number(size)} fill={_paint(fill)}"
-    return f"Poses x{points.len()} angles={angles.len()} {body} {_bounds(points)}"
-}
-
-fn _show_segments(points: list[Point], stroke: Stroke) -> str {
-    return f"Segments x{points.len() // 2} {_stroke(stroke)} {_bounds(points)}"
-}
-
-fn _show_raster(rect: Rect, width: int, height: int) -> str {
-    let origin = f"{_number(rect.left())},{_number(rect.bottom())}"
-    let size = f"{_number(rect.width())}x{_number(rect.height())}"
-    return f"Raster {width}x{height} at {origin} {size}"
 }
 
 #: The bounding box of a batch, so a snapshot stays short but still changes when
@@ -256,11 +219,6 @@ fn _bounds(points: list[Point]) -> str {
     let low = f"{_number(box.left())},{_number(box.bottom())}"
     let high = f"{_number(box.right())},{_number(box.top())}"
     return f"[{low} {high}]"
-}
-
-fn _show_clip(rect: Rect) -> str {
-    let origin = f"{_number(rect.left())},{_number(rect.bottom())}"
-    return f"PushClip {origin} {_number(rect.width())}x{_number(rect.height())}"
 }
 
 #: Format one float at `RENDER_PRECISION`, without a signed zero.

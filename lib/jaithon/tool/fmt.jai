@@ -1529,7 +1529,7 @@ fn _dedent_continuations(text: str, column: int) -> str {
     return "\n".join(out)
 }
 
-fn _utf8_length(code_point: int) -> int {
+pub fn _utf8_length(code_point: int) -> int {
     if code_point < 0x80 { return 1 }
     if code_point < 0x800 { return 2 }
     if code_point < 0x10000 { return 3 }
@@ -1852,11 +1852,11 @@ fn _split_top_level(text: str) -> list[str] {
     return parts
 }
 
-fn _is_ident_start(character: str) -> bool {
+pub fn _is_ident_start(character: str) -> bool {
     return character == "_" or character.lower() != character.upper()
 }
 
-fn _is_ident_part(character: str) -> bool {
+pub fn _is_ident_part(character: str) -> bool {
     return _is_ident_start(character) or character >= "0" and character <= "9"
 }
 

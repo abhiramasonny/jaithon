@@ -738,6 +738,10 @@ pub fn is_void(c: Ctx, t: Type?) -> bool {
     return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
 }
 
+pub fn or_any(c: Ctx, t: Type?) -> Type {
+    return t ?? c.universe.t_any
+}
+
 pub fn span_of(node: Node?) -> Span {
     if node is null { return Span.none() }
     return node.span
