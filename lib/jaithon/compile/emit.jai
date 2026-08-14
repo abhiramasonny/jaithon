@@ -174,6 +174,7 @@ pub enum Op {
     SubIntConst,
     PopReturnNull,
     MatchConstPop,
+    SwapPop,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -335,6 +336,7 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.SubIntConst, "OP_SUB_INT_CONST", 4, 1),
     OpSpec(Op.PopReturnNull, "OP_POP_RETURN_NULL", 0, -1),
     OpSpec(Op.MatchConstPop, "OP_MATCH_CONST_POP", 5, -1),
+    OpSpec(Op.SwapPop, "OP_SWAP_POP", 0, -1),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
@@ -1705,8 +1707,7 @@ pub class Emitter {
         )
         if super_name != null {
             self._op(Op.Inherit, span)
-            self._op(Op.Swap, span)
-            self._op(Op.Pop, span)
+            self._op(Op.SwapPop, span)
         }
 
         for trait_type in node.type_list("traits") {
@@ -2720,8 +2721,7 @@ pub class Emitter {
         if tag >= 0 {
             self._get_local(slot, span)
             self._op(Op.EnumTag, span)
-            self._op(Op.Swap, span)
-            self._op(Op.Pop, span)
+            self._op(Op.SwapPop, span)
             self._chunk().write_op(Op.MatchConstPop, span)
             self._chunk().write_u24(self._chunk().add_constant(Const(ConstTag.Int, tag)))
             misses.push(self._reserve_jump())
@@ -2730,8 +2730,7 @@ pub class Emitter {
         for (index, element) in pattern.child_list("subPatterns").enumerate() {
             self._get_local(slot, span)
             self._op_u8(Op.EnumField, index, span)
-            self._op(Op.Swap, span)
-            self._op(Op.Pop, span)
+            self._op(Op.SwapPop, span)
             self._sub_pattern(element, misses, span)
         }
     }

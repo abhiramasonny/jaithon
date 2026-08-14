@@ -281,6 +281,13 @@ typedef enum {
      * still peeking, still leaving the subject for the next arm's test. */
     OP_MATCH_CONST_POP,      /* u24 K, i16 J */
 
+    /* `SWAP; POP` fused (§3.3): discard what is under the top, keep the top.
+     * Every occurrence is emitted directly by the compiler at one of a
+     * handful of fixed sites (class-inheritance setup, an enum pattern's tag
+     * check and each of its payload-field extractions) -- never something
+     * the peephole discovers opportunistically. */
+    OP_SWAP_POP,
+
     OP_COUNT
 } OpCode;
 
