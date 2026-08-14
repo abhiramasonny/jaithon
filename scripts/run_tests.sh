@@ -10,6 +10,15 @@ VERBOSE=0
 GC_STRESS=1
 FORMAT=0
 FILTER=""
+# Bare --gc-stress collects on every allocation and is quadratic; a golden
+# left at the default ran 600s+ without finishing. Every golden gets this
+# cadence unless it names its own via `#: gc-stress-every: N`. Chosen by
+# measurement (scratchpad census, 2026-08-14), not the ~50 a first guess
+# suggested: at N=50 one golden (set_field_kinds, JIT-only) blows up 300x in
+# allocation count -- confirmed absent under JAITHON_NO_JIT=1 and at every
+# N<=20 tried. 20 was then re-validated across all 46 goldens with no golden
+# collecting fewer than 57 times, so coverage is not gutted.
+DEFAULT_GC_STRESS_EVERY=20
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -19,6 +28,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
+        -*)
+            echo "error: unknown flag: $1" >&2
+            exit 1 ;;
         *) FILTER="$1"; shift ;;
     esac
 done
@@ -145,8 +157,7 @@ for src in "$ROOT"/tests/golden/*.jai; do
     fi
     run_golden "$name" "$src" "$expected"
     gc_every="$(sed -n 's/^#: *gc-stress-every: *\([0-9][0-9]*\).*/\1/p' "$src" | head -1)"
-    gc_flag="--gc-stress"
-    [[ -n "$gc_every" ]] && gc_flag="--gc-stress=$gc_every"
+    gc_flag="--gc-stress=${gc_every:-$DEFAULT_GC_STRESS_EVERY}"
     [[ $GC_STRESS -eq 1 ]] && run_golden "$name (gc-stress)" "$src" "$expected" "$gc_flag"
     run_golden "$name (deopt-stress)" "$src" "$expected" "" \
         JAITHON_JIT_DEOPT_STRESS=1
