@@ -26,8 +26,10 @@ docs/
 .vscode/ipch/
 compile_commands.json
 .cache/
-build-*/
-jaithon-*
+/build-*/
+/jaithon-opstats
+/jaithon-stats
+/jaithon-table-opt
 
 # JAI_JIT_DUMP artefacts
 jit_*.bin
@@ -35,6 +37,4 @@ jit_*.bin
 # Working notes
 spec/
 
-# Working notes: kept on disk, deliberately never tracked.
-docs/superpowers
 __pycache__/
