@@ -5836,14 +5836,54 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             SlotKind kind;
             unsigned tag;
+            uint32_t seenShape = 0;
+            ObjClass *seenClass = NULL;
             if (IS_INT(seen))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(seen)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
-            else return false;
+            else if (IS_BOOL(seen))  { kind = SLOT_BOOL;  tag = VAL_BOOL; }
+            else if (IS_LIST(seen))  { kind = SLOT_LIST;  tag = VAL_OBJ; }
+            else if (rawObjValue(seen)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
+            else if (IS_INSTANCE(seen) && AS_INSTANCE(seen)->klass != NULL) {
+                /* Same reasoning as every other raw-object read site in this
+                 * tier: nothing about an upvalue makes its capture special,
+                 * it is read the same way a global or a field is. A closure
+                 * over a str/list/dict/instance never compiled before this. */
+                kind = SLOT_INST; tag = VAL_OBJ;
+                seenClass = AS_INSTANCE(seen)->klass;
+                seenShape = seenClass->shapeId;
+            } else return false;
 
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
             branchOnDeopt(e, JAI_A64_NE);
-            if (!pushValue(e, kind, 0, NULL)) return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            if (kind == SLOT_LIST) {
+                /* "an object" is not "a list": same contract as every other
+                 * SLOT_LIST arm in this tier. JIT_SCRATCH_A holds the
+                 * upvalue's location and must survive to the load below. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, OBJ_LIST));
+                branchOnDeopt(e, JAI_A64_NE);
+            } else if (kind == SLOT_INST) {
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, OBJ_INSTANCE));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(ObjInstance, klass)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(ObjClass, shapeId)));
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)seenShape);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+            }
+            if (!pushValue3(e, kind, seenShape, seenClass, seen, -1)) return false;
+            if (kind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            } else {
+                emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            }
             off += 2;
             break;
         }
