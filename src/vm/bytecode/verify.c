@@ -38,13 +38,16 @@ int jaiOpBranchOperandAt(uint8_t op) {
     case OP_JUMP_IF_CMP_LOCAL_K:
         return 6;   /* after the u8 comparison, the u16 slot and the u24 K */
     case OP_MATCH_SEQ:
+    case OP_MATCH_SEQ_POP:
         return 2;
     case OP_MATCH_CONST:
     case OP_MATCH_CONST_POP:
     case OP_MATCH_TYPE:
+    case OP_MATCH_TYPE_POP:
     case OP_MATCH_FIELDS:
         return 3;
     case OP_MATCH_RANGE:
+    case OP_MATCH_RANGE_POP:
         return 7;
     default:
         return -1;

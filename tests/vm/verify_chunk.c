@@ -402,6 +402,50 @@ static void caseMatchConstPopEdgesDisagree(void) {
                    "disagrees with depth");
 }
 
+/* MATCH_TYPE_POP, MATCH_RANGE_POP and MATCH_SEQ_POP share MATCH_CONST_POP's
+ * exact asymmetric shape and the same jaiOpBranchOperandAt/depth-switch
+ * machinery -- one baseline each proves every site actually emits its fused
+ * form, and one negative case (mirroring caseMatchConstPopEdgesDisagree)
+ * proves the shared mechanism catches a real edge disagreement for a second
+ * opcode, not just the one it was written against. */
+static void caseMatchTypePopBaseline(void) {
+    ObjFunction *fn =
+        compile("enum Shape { Circle(r: int), Point }\n"
+                "let s = Shape.Point\n"
+                "print(match s { Shape.Point => \"pt\", _ => \"other\" })\n");
+    expectValid(fn, "match over an enum's own type check");
+    expectOpCount(fn, OP_MATCH_TYPE_POP, 1, "one MATCH_TYPE_POP for the tag<0 variant check");
+}
+
+static void caseMatchTypePopEdgesDisagree(void) {
+    ObjFunction *fn =
+        compile("enum Shape { Circle(r: int), Point }\n"
+                "let s = Shape.Point\n"
+                "print(match s { Shape.Point => \"pt\", _ => \"other\" })\n");
+
+    int at = findOp(&fn->chunk, OP_MATCH_TYPE_POP, 0);
+    if (at < 0) { printf("  SKIP no OP_MATCH_TYPE_POP emitted\n"); return; }
+    jaiChunkPatchI16(&fn->chunk, at + 1 + 3, 0);
+    expectRejected(fn, "MATCH_TYPE_POP edges redirected to the same offset",
+                   "disagrees with depth");
+}
+
+static void caseMatchRangePopBaseline(void) {
+    ObjFunction *fn =
+        compile("let n = 5\n"
+                "print(match n { 0..=9 => \"digit\", _ => \"other\" })\n");
+    expectValid(fn, "match over a range pattern");
+    expectOpCount(fn, OP_MATCH_RANGE_POP, 1, "one MATCH_RANGE_POP for the range arm");
+}
+
+static void caseMatchSeqPopBaseline(void) {
+    ObjFunction *fn =
+        compile("let v: any = [1, 2]\n"
+                "print(match v { [a, b] => a + b, _ => 0 })\n");
+    expectValid(fn, "match over a fixed-length list pattern");
+    expectOpCount(fn, OP_MATCH_SEQ_POP, 1, "one MATCH_SEQ_POP for the list-shape arm");
+}
+
 int main(void) {
     jaiDiagInit(&gDiags);
     gDiags.colorOutput = false;
@@ -425,6 +469,10 @@ int main(void) {
     caseBlockCloseShape();
     caseMatchConstPopBaseline();
     caseMatchConstPopEdgesDisagree();
+    caseMatchTypePopBaseline();
+    caseMatchTypePopEdgesDisagree();
+    caseMatchRangePopBaseline();
+    caseMatchSeqPopBaseline();
 
     printf("%d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

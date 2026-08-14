@@ -175,6 +175,9 @@ pub enum Op {
     PopReturnNull,
     MatchConstPop,
     SwapPop,
+    MatchTypePop,
+    MatchRangePop,
+    MatchSeqPop,
 }
 
 #: Stack effect of an instruction whose net change depends on its operands.
@@ -337,6 +340,9 @@ let _OPS: list[OpSpec] = [
     OpSpec(Op.PopReturnNull, "OP_POP_RETURN_NULL", 0, -1),
     OpSpec(Op.MatchConstPop, "OP_MATCH_CONST_POP", 5, -1),
     OpSpec(Op.SwapPop, "OP_SWAP_POP", 0, -1),
+    OpSpec(Op.MatchTypePop, "OP_MATCH_TYPE_POP", 5, -1),
+    OpSpec(Op.MatchRangePop, "OP_MATCH_RANGE_POP", 9, -1),
+    OpSpec(Op.MatchSeqPop, "OP_MATCH_SEQ_POP", 4, -1),
 ]
 
 #: Most parts one `OP_FORMAT` can join; `JAI_FMT_MAX_PARTS` in `src/vm/value.h`,
@@ -2560,10 +2566,9 @@ pub class Emitter {
             let declared = pattern.type_field("type")
             if declared != null {
                 self._get_local(slot, span)
-                self._chunk().write_op(Op.MatchType, span)
+                self._chunk().write_op(Op.MatchTypePop, span)
                 self._chunk().write_u24(self._string(declared.name ?? "any"))
                 misses.push(self._reserve_jump())
-                self._op(Op.Pop, span)
             }
             let symbol = self.resolution.symbol_of(pattern)
             if symbol == null and pattern.opt_text("name") == null { return }
@@ -2579,12 +2584,11 @@ pub class Emitter {
             misses.push(self._reserve_jump())
         } elif kind == NodeKind.PatRange {
             self._get_local(slot, span)
-            self._chunk().write_op(Op.MatchRange, span)
+            self._chunk().write_op(Op.MatchRangePop, span)
             self._chunk().write_u24(self._literal_constant(pattern.child("lo")))
             self._chunk().write_u24(self._literal_constant(pattern.child("hi")))
             self._chunk().write_byte(if pattern.flag("inclusive") { 1 } else { 0 })
             misses.push(self._reserve_jump())
-            self._op(Op.Pop, span)
         } elif kind == NodeKind.PatOr {
             self._test_or(pattern, slot, misses)
         } elif kind == NodeKind.PatTuple or kind == NodeKind.PatList {
@@ -2673,11 +2677,10 @@ pub class Emitter {
         let tail = if has_rest { count - rest - 1 } else { 0 }
 
         self._get_local(slot, span)
-        self._chunk().write_op(Op.MatchSeq, span)
+        self._chunk().write_op(Op.MatchSeqPop, span)
         self._chunk().write_byte(if fixed > 255 { 255 } else { fixed })
         self._chunk().write_byte(if has_rest { 1 } else { 0 })
         misses.push(self._reserve_jump())
-        self._op(Op.Pop, span)
 
         for (index, element) in elements.enumerate() {
             if has_rest and index == rest {
@@ -2709,14 +2712,13 @@ pub class Emitter {
         let tag = self._variant_tag(pattern)
 
         self._get_local(slot, span)
-        self._chunk().write_op(Op.MatchType, span)
+        self._chunk().write_op(Op.MatchTypePop, span)
         if tag < 0 {
             self._chunk().write_u24(self._string(f"{owner ?? "?"}.{variant ?? "?"}"))
         } else {
             self._chunk().write_u24(self._string(owner ?? "any"))
         }
         misses.push(self._reserve_jump())
-        self._op(Op.Pop, span)
 
         if tag >= 0 {
             self._get_local(slot, span)
@@ -2740,10 +2742,9 @@ pub class Emitter {
         let sub_patterns = pattern.child_list("subPatterns")
 
         self._get_local(slot, span)
-        self._chunk().write_op(Op.MatchType, span)
+        self._chunk().write_op(Op.MatchTypePop, span)
         self._chunk().write_u24(self._string(pattern.opt_text("typeName") ?? "any"))
         misses.push(self._reserve_jump())
-        self._op(Op.Pop, span)
         if sub_patterns.len() == 0 { return }
 
         var names: list[Const] = []

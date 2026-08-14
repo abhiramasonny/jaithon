@@ -3755,6 +3755,9 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_MATCH_CONST]        = &&L_OP_MATCH_CONST,
         [OP_MATCH_CONST_POP]    = &&L_OP_MATCH_CONST_POP,
         [OP_SWAP_POP]           = &&L_OP_SWAP_POP,
+        [OP_MATCH_TYPE_POP]     = &&L_OP_MATCH_TYPE_POP,
+        [OP_MATCH_RANGE_POP]    = &&L_OP_MATCH_RANGE_POP,
+        [OP_MATCH_SEQ_POP]      = &&L_OP_MATCH_SEQ_POP,
         [OP_MATCH_RANGE]        = &&L_OP_MATCH_RANGE,
         [OP_MATCH_TYPE]         = &&L_OP_MATCH_TYPE,
         [OP_MATCH_SEQ]          = &&L_OP_MATCH_SEQ,
@@ -6337,10 +6340,44 @@ static JaiRunResult runLoop(int baseFrameCount) {
         VM_NEXT();
     }
 
+    VM_CASE(OP_MATCH_RANGE_POP): {
+        Value low = READ_CONST();
+        Value high = READ_CONST();
+        bool inclusive = READ_BYTE() != 0;
+        int16_t offset = READ_I16();
+        Value subject = PEEK(0);
+
+        int cmpLow = 0, cmpHigh = 0;
+        SAVE_STATE();
+        bool ordered = jaiValueCompare(subject, low, &cmpLow) &&
+                       jaiValueCompare(subject, high, &cmpHigh);
+        if (vm.hasException) goto vmThrow;
+        LOAD_STATE();
+        bool inside = ordered && cmpLow >= 0 &&
+                      (inclusive ? cmpHigh <= 0 : cmpHigh < 0);
+        if (inside) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
+        VM_NEXT();
+    }
+
     VM_CASE(OP_MATCH_TYPE): {
         Value typeConstant = READ_CONST();
         int16_t offset = READ_I16();
         if (!valueMatchesType(PEEK(0), typeConstant)) ip += offset;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MATCH_TYPE_POP): {
+        Value typeConstant = READ_CONST();
+        int16_t offset = READ_I16();
+        if (valueMatchesType(PEEK(0), typeConstant)) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
         VM_NEXT();
     }
 
@@ -6357,6 +6394,26 @@ static JaiRunResult runLoop(int baseFrameCount) {
         bool matched = length >= 0 &&
                        (hasRest ? (length >= count) : (length == count));
         if (!matched) ip += offset;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MATCH_SEQ_POP): {
+        int count = READ_BYTE();
+        bool hasRest = READ_BYTE() != 0;
+        int16_t offset = READ_I16();
+        Value subject = PEEK(0);
+
+        int length = -1;
+        if (IS_LIST(subject))       length = AS_LIST(subject)->count;
+        else if (IS_TUPLE(subject)) length = (int)AS_TUPLE(subject)->count;
+
+        bool matched = length >= 0 &&
+                       (hasRest ? (length >= count) : (length == count));
+        if (matched) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
         VM_NEXT();
     }
 
