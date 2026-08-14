@@ -464,7 +464,14 @@ typedef struct {
     bool      stackAscii[JIT_MAX_STACK];
 
     /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
-     * can have changed it (the body can't call) -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses. */
+     * can have changed it -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses.
+     *
+     * "Nothing can have changed it" was once true because the body could not
+     * call at all. It can now, so the claim is only as good as its
+     * invalidations, and there are four (see forgetFieldKinds and
+     * forgetFieldKindsOfLocal): another store to the same field slot
+     * (recordFieldStore), a call, an offset a branch can land on, and a write
+     * to the local the entry names. */
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
     SlotKind  localKind[JIT_MAX_SLOTS + 1];
@@ -1022,10 +1029,51 @@ static void xHomeWritten(Emit *e, unsigned reg) {
     }
 }
 
+/* Retires every field-kind memo (Emit::known, written by recordFieldStore and
+ * read by knownFieldKind). An entry says "a store THIS body emitted put kind K
+ * in that field, and nothing since has put another kind there" -- which holds
+ * only while this walk is the only thing that can have run, and only along the
+ * fall-through edge that made it. Two things end that, and neither is a store
+ * the walk can see:
+ *
+ *   * a call. The callee reaches the same object through the argument it was
+ *     handed, through a global or upvalue, or as the receiver it was invoked
+ *     on, and `o.v = "s"` in there leaves the memo claiming SLOT_INT -- so the
+ *     read after the call skips its tag guard and hands a consumer an
+ *     ObjString pointer as an integer, or an integer as a pointer to
+ *     dereference. Hooked in noteScratchClobber, which every call out passes
+ *     through.
+ *
+ *   * an offset something other than fall-through can reach. The store may sit
+ *     on the arm a branch skipped (`if c { o.v = 7 }` then a read), and a back
+ *     edge re-enters above stores further down the body (a read at a loop top
+ *     whose second iteration meets the kind the bottom of the body stored).
+ *     Hooked in the walk, on the same offsetIsBranchTarget test the ASCII
+ *     proofs above it use, and for the same reason.
+ *
+ * Clearing all of them rather than one is deliberate: a call can write any
+ * field of any object it can reach, so there is nothing narrower to say. */
+static void forgetFieldKinds(Emit *e) { e->knownCount = 0; }
+
+/* The narrower one: an entry names a LOCAL, so writing that local retires it.
+ * The slot may now hold a different object entirely -- `b.v = 7; b = c; b.v`
+ * read c's field at b's recorded kind before this existed. */
+static void forgetFieldKindsOfLocal(Emit *e, unsigned slot) {
+    unsigned out = 0;
+    for (unsigned i = 0; i < e->knownCount; i++) {
+        if (e->known[i].local == (int)slot) continue;
+        e->known[out++] = e->known[i];
+    }
+    e->knownCount = out;
+}
+
 /* Every write to a local goes through localOut or localOutFp, so recording it
  * in those two places is what makes "this slot does not change inside that
  * loop" a fact about the emitter rather than a re-reading of the bytecode. */
 static void noteSlotWrite(Emit *e, unsigned slot) {
+    /* Above the range check on purpose: the memo is keyed on the same slot
+     * numbers, so a slot too high to record is still one to retire. */
+    if (e->knownCount != 0) forgetFieldKindsOfLocal(e, slot);
     if (slot > JIT_MAX_SLOTS) return;
     if (!e->measuring) {
         /* The real pass writing a slot the measuring pass said this loop never
@@ -1263,6 +1311,12 @@ static unsigned valueBankRoom(const Emit *e) {
  * value read out of a register a helper overwrote. */
 static void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
+    /* The one place every call out passes through, which makes it the one
+     * place a field-kind memo can be retired at all of them; see
+     * forgetFieldKinds. The sites that reach here without running user code
+     * (a list grow, an instance allocation) only over-retire, which costs the
+     * tag guard the read would have emitted anyway. */
+    forgetFieldKinds(e);
     if (e->measuring) {
         /* An inlined body's offsets are the CALLEE's, so they say nothing
          * about where in the caller this sits; `inlIp` is the caller's own
@@ -1597,7 +1651,11 @@ static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
     return pushValue3(e, kind, shape, klass, NULL_VAL, -1);
 }
 
-/* The kind a field is known to hold, or SLOT_SELF for "not known". */
+/* The kind a field is known to hold, or SLOT_SELF for "not known". Trusting an
+ * answer here is skipping a tag guard, so what makes it safe is not this
+ * lookup but the four things that retire an entry: recordFieldStore below,
+ * plus forgetFieldKinds (a call, a branch target) and forgetFieldKindsOfLocal
+ * (a write to the local named). */
 static SlotKind knownFieldKind(const Emit *e, int local, uint16_t field) {
     if (local < 0) return SLOT_SELF;
     for (unsigned i = 0; i < e->knownCount; i++) {
@@ -4335,6 +4393,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         if (anyAsciiProof(e) &&
             offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
             clearAsciiProofs(e);
+        }
+        /* A field-kind memo is good along the same one edge, and goes for the
+         * same reason -- see forgetFieldKinds. `fn` is whichever body is being
+         * walked, so an inlined one is measured against its own chunk. */
+        if (e->knownCount != 0 &&
+            offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
+            forgetFieldKinds(e);
         }
         /* Settles any deferred entry BEFORE the offset map records the instruction start, so a branch landing
  * here (arriving with everything in its own register) skips the settle and only the fall-through pays -- both paths then agree, which a join requires. Forward branches are known here; backward ones checked at the end. */
