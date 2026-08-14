@@ -8303,12 +8303,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->selfSlow[si].roots     = selfRoots;
             e->selfSlow[si].resultReg = resultReg;
             e->selfSlow[si].stub      = -1;
-            /* This body is its own callee, and it checks the tag only: -1 is
-             * "no type check", and it has to be said rather than left to the
-             * zeroed struct, where 0 is OBJ_STRING. */
+            /* This body is its own callee, but its own returns are not the
+             * only way the deopt continuation can answer: `emitUnarmedDeopt`
+             * can skip a run of instructions whose own `return`s never reach
+             * `mergeReturnKind`'s walk, so `e->returnKind` is not proven to
+             * bound every value this path can actually hand back. VAL_OBJ is
+             * every heap object, so trusting a SLOT_LIST/SLOT_INST tag alone
+             * risks the same wrong-object-shape read `emitDirectCall`'s
+             * sibling stub (just above) already guards against; -1 is
+             * "no type check", used for every other kind, and said explicitly
+             * rather than left to the zeroed struct, where 0 is OBJ_STRING. */
             e->selfSlow[si].callee    = NULL;
-            e->selfSlow[si].retType   = -1;
-            e->selfSlow[si].retShape  = 0;
+            e->selfSlow[si].retType   = e->returnKind == SLOT_INST ? (int)OBJ_INSTANCE
+                                       : e->returnKind == SLOT_LIST ? (int)OBJ_LIST
+                                                                     : -1;
+            e->selfSlow[si].retShape  = e->returnKind == SLOT_INST ? e->returnShape : 0;
             if (!deoptRecordAt(e, (uint32_t)off, false,
                                &e->selfSlow[si].deoptBail)) {
                 return false;
