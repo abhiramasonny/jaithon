@@ -17,7 +17,7 @@ fn test_every_sort_agrees_on_the_same_input() -> void {
     assert_eq(sort.tim_sort(source), want)
     assert_eq(sort.counting_sort(source), want)
     assert_eq(sort.radix_sort(source), want)
-    assert_eq(source, [5, 3, 8, 1, 9, 2, 7])  # none of them mutate
+    assert_eq(source, [5, 3, 8, 1, 9, 2, 7])
 }
 
 fn test_sorts_handle_empty_and_single_inputs() -> void {
@@ -41,8 +41,6 @@ fn test_radix_and_counting_sort_accept_negatives() -> void {
 }
 
 fn test_merge_sort_is_stable() -> void {
-    # Equal keys must come out in input order; an unstable sort passes the
-    # ordering check above and fails this one.
     let pairs = [(1, "a"), (0, "b"), (1, "c"), (0, "d")]
     let sorted = sort.merge_sort(pairs, |x, y| sort.natural_order(x[0], y[0]))
     assert_eq(sorted, [(0, "b"), (0, "d"), (1, "a"), (1, "c")])
@@ -114,7 +112,6 @@ fn test_bounds_bracket_a_run_of_equal_keys() -> void {
     assert_eq(search.lower_bound(xs, 2), 1)
     assert_eq(search.upper_bound(xs, 2), 4)
     assert_eq(search.equal_range(xs, 2), (1, 4))
-    # A key that is not there gives an empty range at the insertion point.
     assert_eq(search.lower_bound(xs, 0), 0)
     assert_eq(search.upper_bound(xs, 9), 5)
     assert_eq(search.equal_range(xs, 4), (5, 5))
@@ -159,5 +156,5 @@ fn test_z_algorithm_reports_prefix_matches() -> void {
 fn test_aho_corasick_finds_every_pattern_at_once() -> void {
     let hits = search.aho_corasick("ahishers", ["he", "she", "hers", "his"])
     assert_true(hits.len() == 4)
-    assert_true((1, 3) in hits)  # "his" at index 1
+    assert_true((1, 3) in hits)
 }

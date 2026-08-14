@@ -14,7 +14,7 @@ fn test_counter_never_stores_a_zero() -> void {
     assert_eq(counts.get("absent"), 0)
     counts.add("b", -1)
     assert_eq(counts.get("b"), 0)
-    assert_eq(counts.len(), 1)  # the zero entry is gone
+    assert_eq(counts.len(), 1)
 }
 
 fn test_counter_total_and_most_common() -> void {
@@ -22,7 +22,7 @@ fn test_counter_total_and_most_common() -> void {
     assert_eq(counts.total(), 6)
     assert_eq(counts.most_common(2), [("a", 3), ("b", 2)])
     assert_eq(counts.most_common(0), [])
-    assert_eq(counts.most_common(99).len(), 3)  # clamped, not padded
+    assert_eq(counts.most_common(99).len(), 3)
 }
 
 fn test_counter_subtract_may_go_negative() -> void {
@@ -46,7 +46,7 @@ fn test_bag_counts_multiplicity_and_refuses_to_go_negative() -> void {
     assert_eq(bag.count_of("a"), 2)
     assert_eq(bag.count_of("absent"), 0)
     assert_throws(KeyError, || bag.remove("a", 5))
-    assert_eq(bag.discard("a", 5), 2)  # discard removes what it can
+    assert_eq(bag.discard("a", 5), 2)
     assert_eq(bag.count_of("a"), 0)
     assert_false(bag.is_empty())
 }
@@ -77,10 +77,8 @@ fn test_heap_takes_its_own_ordering() -> void {
 
 fn test_heap_push_pop_is_not_pop_then_push() -> void {
     let heap = Heap[int].from_list([2, 3])
-    # push_pop of a value smaller than the top returns it untouched.
     assert_eq(heap.push_pop(1), 1)
     assert_eq(heap.sorted(), [2, 3])
-    # replace always yields the old top, whatever is pushed.
     assert_eq(heap.replace(9), 2)
     assert_eq(heap.sorted(), [3, 9])
 }

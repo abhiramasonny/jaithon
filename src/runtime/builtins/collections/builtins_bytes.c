@@ -6,8 +6,6 @@
 
 #include "vm/gc.h"
 
-/* A bound native receives the receiver as args[0] and argc counts it, so every
- * body below reads its declared arguments from args[1] onwards. */
 static bool bytesReceiver(int argc, Value *args, const char *method,
                           ObjBytes **out) {
     if (argc >= 1 && args != NULL && IS_BYTES(args[0])) {
@@ -225,8 +223,6 @@ static bool bytesRepeat(int argc, Value *args, Value *out) {
                         "length", (long long)times);
     }
 
-    /* Allocated empty and filled in place: jaiBytesNew is the only allocation,
-     * and `b` survives it because the receiver is a stack root. */
     size_t total = (size_t)times * b->length;
     ObjBytes *result = jaiBytesNew(NULL, total);
     if (result == NULL) return false;
@@ -290,8 +286,6 @@ static bool primBytesNew(int argc, Value *args, Value *out) {
     ObjList *list;
     if (!jaiArgList(args[0], 0, "bytes_new", &list)) return false;
 
-    /* Validated before allocating, so a bad item cannot leave a half-filled
-     * object behind for the collector to walk. */
     for (int i = 0; i < list->count; i++) {
         if (!IS_INT(list->items[i]) || AS_INT(list->items[i]) < 0 ||
             AS_INT(list->items[i]) > 255) {

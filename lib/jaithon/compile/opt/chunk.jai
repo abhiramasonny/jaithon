@@ -269,7 +269,7 @@ pub fn set_slot(instruction: Instr, at: int, slot: int) -> void {
 #: They are filled in by the call sequence, so their numbering is part of the
 #: calling convention and can never move.
 pub fn reserved_slots(proto: FuncProto) -> int {
-    var params = proto.arity  # already counts the defaulted parameters
+    var params = proto.arity
     if proto.flags & FN_VARIADIC != 0 { params += 1 }
     if proto.flags & FN_KWREST != 0 { params += 1 }
     if proto.param_names.len() > params { params = proto.param_names.len() }
@@ -324,8 +324,6 @@ pub fn decode(proto: FuncProto) -> Code? {
     if chunk.code.len() == 0 { return null }
 
     let code = Code(proto)
-    # NO_INDEX for a non-boundary offset; chunk.code.len() maps to count(), one
-    # past the end.
     var offset_index: list[int] = [NO_INDEX for _slot in 0..chunk.code.len() + 1]
 
     var line = 0
@@ -340,8 +338,6 @@ pub fn decode(proto: FuncProto) -> Code? {
         if op == opcode(Op.Closure) { operand_count = closure_operand_bytes(chunk, offset) }
         if operand_count < 0 or offset + 1 + operand_count > chunk.code.len() { return null }
 
-        # Sorted and covering each row up to the next, so walking it alongside
-        # the decode matches jaiChunkSpanAt's binary search for less work.
         while line < chunk.lines.len() and chunk.lines[line].offset <= offset {
             span_start = chunk.lines[line].span_start
             span_end = chunk.lines[line].span_end
@@ -371,9 +367,6 @@ pub fn decode(proto: FuncProto) -> Code? {
         code.data[index].is_target = true
     }
 
-    # Marking start/end as targets stops a peephole window from straddling a
-    # region edge -- a fused instruction half inside a protected region can't
-    # be described by (start, end) at all.
     for entry in chunk.exceptions {
         let start = _index_of_offset(offset_index, entry.start)
         let end = _index_of_offset(offset_index, entry.end)
@@ -534,8 +527,6 @@ pub fn splice_before(code: Code, at: list[int], runs: list[list[Instr]]) -> bool
             for instruction in runs[pending] { out.push(instruction) }
             pending += 1
         }
-        # The original instruction maps past its own prefix, which is what
-        # keeps an incoming edge landing on it and not on the inserted run.
         map[index] = out.len()
         out.push(code.data[index])
     }
@@ -577,15 +568,11 @@ pub fn mark_unreachable(code: Code) -> int {
     _seed(code, reached, work, 0)
     for entry in code.defaults { _seed(code, reached, work, entry) }
 
-    # Reaching a handler can make another region's body reachable, so the drain
-    # and the region test alternate until a round adds nothing.
     var settled = false
     while not settled {
         while work.len() > 0 {
             let index = work.pop()
             let instruction = code.data[index]
-            # Includes the address PUSH_HANDLER/PUSH_FINALLY only register:
-            # control can go there later, but only if this instruction runs.
             if instruction.target >= 0 { _seed(code, reached, work, instruction.target) }
             if op_falls_through(instruction.op) {
                 let following = next_live(code, index)
@@ -633,8 +620,6 @@ pub fn compact(code: Code) -> void {
     }
     if dead_count == 0 { return }
 
-    # Compacting costs as much as a decode, so a single hole isn't worth it --
-    # only rewrite once a constant fraction of the list is garbage.
     if dead_count * 8 < code.count() { return }
 
     let total = code.count()
@@ -655,9 +640,6 @@ pub fn compact(code: Code) -> void {
         kept.push(instruction)
     }
 
-    # Refreshed exactly as `rebuild` would lay it out: `_retarget_fits` measures
-    # branches against `new_offset`, and a stale value would make the
-    # peephole's reach test answer from a layout that no longer exists.
     var offset = 0
     for instruction in kept {
         instruction.new_offset = offset
@@ -686,8 +668,6 @@ pub fn rebuild(code: Code) -> bool {
     }
     if live_count == 0 { return false }
 
-    # Current i16 operands converge in 2 rounds; the loop guards against a
-    # narrower encoding later silently leaving offsets stale.
     var total = 0
     var settled = false
     var round = 0
@@ -706,9 +686,6 @@ pub fn rebuild(code: Code) -> bool {
     }
     if not settled { return false }
 
-    # Resolve branches before allocating, so an unrepresentable jump (e.g. one
-    # hoisting pushed near the i16 limit) leaves the chunk untouched -- a
-    # program that compiles at -O0 must never fail to compile at -O2.
     for instruction in code.data {
         if instruction.dead or instruction.branch_at < 0 { continue }
         let landing = live_at_or_after(code, instruction.target)
@@ -733,8 +710,6 @@ pub fn rebuild(code: Code) -> bool {
             write_u16_at(bytes, instruction.new_offset + 1 + instruction.branch_at, delta & 0xFFFF)
         }
 
-        # One line entry per run of instructions sharing a span, matching what
-        # recordSpan in src/vm/bytecode/chunk.c would have produced during emission.
         let rows = lines.len()
         if rows == 0 or
             lines[rows - 1].span_start != instruction.span_start or
@@ -772,8 +747,6 @@ pub fn rebuild(code: Code) -> bool {
         kept_handler.push(code.exception_handler[region])
     }
     code.chunk.exceptions = kept
-    # The recorded indices have to shrink with the table they describe, or a
-    # later pass in the same decode reads a region that is no longer there.
     code.exception_start = kept_start
     code.exception_end = kept_end
     code.exception_handler = kept_handler
@@ -808,15 +781,7 @@ fn _build_branch_at() -> dict[int, int] {
         Op.ForIter,
         Op.ForIterBind,
         Op.ForIterPair,
-        # Branches past the ordinary `INVOKE items; GET_ITER` when its receiver
-        # turns out to be a dict. The optimiser rebuilds chunks and re-resolves
-        # every branch, so an unregistered one is not merely unoptimised: the
-        # rebuild loses whatever followed the loop. That is what a missing entry
-        # here looks like — a chunk that simply stops.
         Op.GetIterItems,
-        # `for x in a..b`'s loop head. Unlike its three neighbours above it pops
-        # nothing on the exhausted edge, because a range loop keeps nothing on
-        # the operand stack in the first place.
         Op.ForRangeBind,
         Op.PushFinally,
         Op.PushHandler,
@@ -849,9 +814,6 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.IncLocal,
         Op.CmpLocalConstLt,
         Op.GetFieldLocal,
-        # Any fused opcode carrying a slot must be listed here, or the coalescer
-        # renumbers its readers but not this writer (real miscompile: `line`
-        # stored to slot 4 while every read moved to slot 3).
         Op.AddBind,
         Op.SubBind,
         Op.MulBind,
@@ -859,10 +821,6 @@ fn _build_slot_operands() -> dict[int, list[int]] {
     for op in leading { table[opcode(op)] = [0] }
     table[opcode(Op.ForIterBind)] = [2]     # the slot follows the i16 jump
     table[opcode(Op.ForIterPair)] = [2, 4]  # both slots follow the i16 jump
-    # The counter and the end follow the u8 inclusive flag; the loop variable,
-    # the counter and the end follow the i16 jump. Missing here, the coalescer
-    # would renumber the loop variable and leave the range loop reading and
-    # writing a slot nothing else refers to.
     table[opcode(Op.IterRange)] = [1, 3]
     table[opcode(Op.ForRangeBind)] = [2, 4, 6]
     table[opcode(Op.JumpIfCmpLocalK)] = [1]  # the slot follows the u8 comparison

@@ -66,18 +66,10 @@ pub class Ctx {
     var symbol_types: dict[int, Type]
     var decls_by_name: dict[str, TypeDecl]
     var decls_by_node: dict[int, TypeDecl]
-    # Every registered declaration in registration order, this file's and the
-    # imported ones. A list, not a map: layout walks it by index and may append.
     var decl_order: list[TypeDecl]
-    # `id(TypeDecl)` of everything in `decl_order`, so registering twice is cheap.
     var decl_seen: set[int]
-    # `id(TypeDecl)` to the name it answers to here when an import renamed it;
-    # `DeclEntry.alias` in the C.
     var decl_aliases: dict[int, str]
-    # id(Symbol) -> the declaration node another module holds for it. The C's
-    # `Symbol.importedDecl`; a Jaithon `Symbol` has no such field.
     var imported_decls: dict[int, Node]
-    # id(TypeExpr) -> the semantic type it resolved to; the C's AstType.resolved.
     var resolved_types: dict[int, Type]
     #: The signature loader, so a qualified member can be resolved against the
     #: module it came from. Null when nothing set one, and then `m.f` is `any`.
@@ -223,7 +215,6 @@ pub class Ctx {
     #: be reached by a bare name.
     pub fn register_decl(self, decl: TypeDecl, visible: bool = true, binding: str? = null) -> void {
         let name = binding ?? decl.name
-        # A name this file already declares wins; a genuine clash is E0302.
         if visible and name not in self.decls_by_name {
             self.decls_by_name[name] = decl
             if name != decl.name { self.decl_aliases[id(decl)] = name }
@@ -356,8 +347,6 @@ pub class Ctx {
     pub fn ident_type_decl(self, symbol: Symbol?) -> TypeDecl? {
         if symbol is null { return null }
         if is_type_symbol(symbol.kind) { return self.decl_named(symbol.name) }
-        # An imported binding keeps the resolver's kind — it occupies a local or a
-        # global slot — so what it names comes from the declaration on the symbol.
         let imported = self.imported_decl(symbol)
         if imported is not null {
             if imported.kind == NodeKind.ClassDecl or
@@ -486,7 +475,6 @@ pub class Ctx {
                 self._collect_facts(cond.child("right"), negate, out)
             }
 
-            # `isinstance(x, T)` is the call form of `x is T` and narrows alike.
             NodeKind.Call => {
                 let callee = cond.child("callee")
                 if callee is null or callee.kind != NodeKind.Ident { return }
@@ -523,8 +511,6 @@ pub class Ctx {
         out: list[NarrowFact]
     ) -> void {
         if op == OpKind.Is or op == OpKind.IsNot {
-            # `null` is a unit type with one value (§2.1), so `x is null` narrows
-            # as `x == null`. It is not an identifier, so `_type_operand` misses it.
             var target: Type? = null
             if _is_null_literal(rhs) {
                 target = self.universe.t_null
@@ -549,8 +535,6 @@ pub class Ctx {
         }
     }
 
-    # Narrowing a `var` is still sound within a scope: an assignment to it is
-    # checked against the declared type and then ends the fact.
     fn _narrow_target(self, node: Node?) -> Symbol? {
         if node is null or node.kind != NodeKind.Ident { return null }
         let symbol = self.resolution.symbol_of(node)
@@ -558,8 +542,6 @@ pub class Ctx {
         return symbol
     }
 
-    # The right operand of `is` names a type when it is a bare identifier bound
-    # to a class, trait or enum; anything else is an identity comparison.
     fn _type_operand(self, node: Node?) -> Type? {
         if node is null or node.kind != NodeKind.Ident { return null }
         let symbol = self.resolution.symbol_of(node)
@@ -568,8 +550,6 @@ pub class Ctx {
             if known is not null { return known }
             return self.lookup_type_name(self, symbol.name) ?? self.universe.t_any
         }
-        # `str`, `int`, `list`... name types as well as being bound as builtin
-        # conversion functions (spec §9), so the type reading wins.
         if symbol is not null and symbol.kind != SymbolKind.Builtin { return null }
         return self.lookup_type_name(self, node.opt_text("name"))
     }
@@ -584,8 +564,6 @@ fn _is_null_literal(node: Node?) -> bool {
     return node is not null and node.kind == NodeKind.NullLit
 }
 
-# A port of `jaiChkRequireAssignable` in src/sema/check.c, where the `any -> T`
-# guard and the `int -> float` conversion enter the tree.
 fn _default_require_assignable(
     c: Ctx,
     node: Node?,
@@ -597,7 +575,6 @@ fn _default_require_assignable(
     if target is null or source is null { return true }
     if is_never(source) { return true }
 
-    # §2.2's widening first: it is the one assignment whose value changes.
     let widen = widen_target(c.universe, source, target)
     if widen is not null {
         if node is not null { c.widen_to_float(c, node, widen) }
@@ -612,7 +589,6 @@ fn _default_require_assignable(
 
     let want = render(target)
     let got = render(source)
-    # float to int loses information, so it stays an error and keeps E0411.
     let narrowing = target.kind == TyKind.Int and source.kind == TyKind.Float
     let span = span_of(node)
     let reported = if narrowing { E0411_INT_FLOAT_MIX } else { code }
@@ -627,14 +603,11 @@ fn _default_require_assignable(
     return false
 }
 
-# A port of `jaiChkApplyContext`. Only literal shapes are rewritten; a variable
-# keeps its type and produces E0411 as it should.
 fn _default_apply_context(c: Ctx, node: Node?, expected: Type?) -> void {
     if node is null or expected is null { return }
 
     if _union_wants_float(expected) {
         if _retype_int_literal(c, node) { return }
-        # Arithmetic over literals is still a literal: `let x: float = 1 + 2`.
         if node.kind == NodeKind.Binary and is_arithmetic_context(node.op()) {
             c.apply_context(c, node.child("left"), expected)
             c.apply_context(c, node.child("right"), expected)
@@ -648,11 +621,8 @@ fn _default_apply_context(c: Ctx, node: Node?, expected: Type?) -> void {
         return
     }
 
-    # Container literals adopt the expected type itself, not just the element
-    # context: without it `list[Shape] = [Circle(), Square()]` infers a union.
     match expected.kind {
         TyKind.List | TyKind.Set => {
-            # A comprehension builds a fresh container and takes the annotation.
             if node.kind == NodeKind.Comprehension {
                 c.set_type(node, expected)
                 return
@@ -683,8 +653,6 @@ fn _default_apply_context(c: Ctx, node: Node?, expected: Type?) -> void {
             for (position, item) in items.enumerate() {
                 c.apply_context(c, item, expected.args[position])
             }
-            # Stamped for the same reason a list literal is: each member is then
-            # checked against the position it is going into, not as a whole.
             c.set_type(node, expected)
         }
 
@@ -692,21 +660,16 @@ fn _default_apply_context(c: Ctx, node: Node?, expected: Type?) -> void {
     }
 }
 
-# A port of `jaiChkWidenToFloat`. An int literal becomes a float literal; anything
-# else gets §2.2's conversion node, which the emitter turns into `OP_TO_FLOAT`.
 fn _default_widen_to_float(c: Ctx, node: Node?, to: Type) -> void {
     if node is null { return }
     if _retype_int_literal(c, node) { return }
     _wrap_in_cast(c, node, to, true)
 }
 
-# `checker.jai` supplies this; until then every annotation reads as `any`.
 fn _default_resolve_ast_type(c: Ctx, written: TypeExpr?) -> Type? {
     return null
 }
 
-# The type-name scope stack, then the registry: the first two of the four things
-# `jaiChkLookupTypeName` consults. `checker.jai` adds the other two.
 fn _default_lookup_type_name(c: Ctx, name: str?) -> Type? {
     let scoped = c.scoped_type_name(name)
     if scoped is not null { return scoped }
@@ -761,8 +724,6 @@ fn _default_module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
     return (c.universe.t_any, null)
 }
 
-# `jaiChkIsAny`. Statically unknown: `any` by construction, and an unsubstituted
-# generic parameter because generics are erased (spec §6.1).
 pub fn is_any(t: Type?) -> bool {
     if t is null { return true }
     return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
@@ -772,8 +733,6 @@ pub fn is_never(t: Type?) -> bool {
     return t is not null and t.kind == TyKind.Never
 }
 
-# `void` is `null` under the name a return position uses, so `t_void == t_null`
-# and this is always false, in the C too. Ported because E0409 is.
 pub fn is_void(c: Ctx, t: Type?) -> bool {
     if t is null { return false }
     return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
@@ -784,22 +743,17 @@ pub fn span_of(node: Node?) -> Span {
     return node.span
 }
 
-# `jaiChkDeclType`: the type a declaration declares, or `any` when it has none.
 pub fn decl_type(c: Ctx, decl: TypeDecl?) -> Type {
     if decl is null { return c.universe.t_any }
     return decl.ty ?? c.universe.t_any
 }
 
-# `jaiChkTypeDeclOf`: the declaration behind a class, trait or enum type.
-# Interning already attached it here, so the field is the answer.
 pub fn type_decl_of(t: Type?) -> TypeDecl? {
     if t is null { return null }
     if not t.is_named() { return null }
     return t.decl
 }
 
-# One half of §2.2's implicit conversion: respelling an int literal as a float
-# literal. Decides only whether a conversion node is needed, not whether one happens.
 fn _retype_int_literal(c: Ctx, node: Node?) -> bool {
     if node is null { return false }
 
@@ -828,14 +782,12 @@ fn _union_wants_float(t: Type?) -> bool {
     if t.kind != TyKind.Union { return false }
     var has_float = false
     for member in t.args {
-        # int is a better fit, so the union takes the value as it is.
         if member.kind == TyKind.Int { return false }
         if member.kind == TyKind.Float { has_float = true }
     }
     return has_float
 }
 
-# The seven operators `jaiChkApplyContext` recurses through.
 pub fn is_arithmetic_context(op: OpKind) -> bool {
     match op {
         OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div => { return true }
@@ -844,8 +796,6 @@ pub fn is_arithmetic_context(op: OpKind) -> bool {
     }
 }
 
-# Does `t` mention an unsubstituted generic parameter anywhere? Such a type has
-# no runtime shape after erasure, so it cannot be guarded against.
 fn _mentions_generic_param(t: Type?) -> bool {
     if t is null { return false }
     if t.kind == TyKind.GenericParam { return true }
@@ -876,15 +826,11 @@ pub fn runtime_type_name(c: Ctx?, t: Type?) -> str? {
         TyKind.Range => { return "range" }
         TyKind.Fn => { return "fn" }
         TyKind.Module => { return "module" }
-        # A union has no single runtime name: the C answers NULL and its caller
-        # emits a tuple of the members' names, which `_guard_target` builds.
         TyKind.Union => { return null }
         _ => { return _binding_name(c, t) }
     }
 }
 
-# The name a nominal type answers to in the file being checked: what the registry
-# says it is bound as, and otherwise the qualified name's last component.
 fn _binding_name(c: Ctx?, t: Type) -> str {
     if c is not null {
         let bound = c.binding_name(t)
@@ -901,8 +847,6 @@ fn _binding_name(c: Ctx?, t: Type) -> str {
 #: check into a wrong rejection.
 pub const MAX_UNION_GUARD: int = 32
 
-# What a cast records as the thing to check against: a plain name, or a `Union`
-# type expression of one name per member, which the emitter turns into a tuple.
 fn _guard_target(c: Ctx, to: Type) -> TypeExpr {
     let name = runtime_type_name(c, to)
     if name is not null { return TypeExpr.named(name) }
@@ -918,26 +862,17 @@ fn _guard_target(c: Ctx, to: Type) -> TypeExpr {
 
 fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     if node is null or to is null or node.kind == NodeKind.Cast { return }
-    # Erased: a guard would look up a class named `T`.
     if not widen and _mentions_generic_param(to) { return }
 
     let inner = Node(node.kind, node.fields, node.span)
     c.set_type(inner, c.type_of(node))
-    # The resolver keys symbols on node identity, and the operand is a *new* node:
-    # without re-binding, a wrapped identifier loses its symbol and reads undefined.
     c.resolution.bind(inner, c.resolution.symbol_of(node))
-    # And the scope, for the same reason: a wrapped lambda that loses its scope
-    # loses its capture list, and compiled to a closure over nothing.
     let scope = c.resolution.scope_of(node)
     if scope is not null { c.resolution.set_scope(inner, scope) }
-    # `Resolution` keys four tables on node identity; the operand has to carry
-    # all four or the emitter silently emits a different program.
     let base = c.resolution.capture_base_of(node)
     if base != -1 { c.resolution.set_capture_base(inner, base) }
     if c.resolution.is_type_args(node) { c.resolution.set_type_args(inner) }
 
-    # `widen` goes on the node, not only into the side table: the emitter reads
-    # it to choose between `OP_TO_FLOAT` and `OP_TYPE_GUARD`.
     let cast = Node(
         NodeKind.Cast,
         {"operand": inner, "target": _guard_target(c, to), "widen": widen},

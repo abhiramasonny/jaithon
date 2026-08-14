@@ -228,7 +228,6 @@ pub fn counting_sort[T](items: list[T], key: fn(T) -> int = _int_key) -> list[T]
     for value in keys {
         counts[value - lowest] += 1
     }
-    # Counts become starting offsets; each element takes the next free slot of its key — stable.
     var running = 0
     for offset in 0..span {
         let occurrences = counts[offset]
@@ -557,8 +556,6 @@ fn _floor_log2(n: int) -> int {
 }
 
 fn _key_byte(key: int, pass: int) -> int {
-    # Flipping the sign bit of the top byte maps two's-complement order onto
-    # unsigned byte order, so negatives sort below zero without a second pass.
     if pass == RADIX_PASSES - 1 { return key >> 56 & 0xFF ^ 0x80 }
     return key >> 8 * pass & 0xFF
 }
@@ -608,7 +605,6 @@ fn _merge_adjacent[T](
         }
         write += 1
     }
-    # Whatever is left in the right half is already where it belongs.
     while i < left_length {
         a[write] = buffer[i]
         i += 1
@@ -700,7 +696,6 @@ fn _quick_range[T](
         }
         depth -= 1
         let pivot = _partition(a, lo, hi, cmp)
-        # Recurses into the smaller side, iterates the larger — bounds the call stack to O(log n).
         if pivot - lo < hi - pivot - 1 {
             _quick_range(a, lo, pivot, cmp, depth)
             lo = pivot + 1
@@ -732,7 +727,6 @@ fn _count_run[T](a: list[T], lo: int, hi: int, cmp: Comparator[T]) -> int {
     if lo + 1 >= hi { return hi - lo }
     var run_end = lo + 1
     if cmp(a[run_end], a[lo]) < 0 {
-        # Only a *strictly* descending run may be reversed — equal neighbours reversing would break stability.
         while run_end + 1 < hi and cmp(a[run_end + 1], a[run_end]) < 0 { run_end += 1 }
         _reverse_range(a, lo, run_end + 1)
     } else {
@@ -763,7 +757,6 @@ fn _binary_insertion[T](a: list[T], lo: int, hi: int, start: int, cmp: Comparato
         var right = position
         while left < right {
             let mid = left + (right - left) // 2
-            # `>` keeps the search to the right of equals, so ties stay put.
             if cmp(value, a[mid]) < 0 { right = mid } else { left = mid + 1 }
         }
         var hole = position
@@ -821,8 +814,6 @@ fn _merge_collapse[T](
             must_merge = true
         }
         if not must_merge { return }
-        # Merging the middle pair keeps the new run's neighbours closer in size;
-        # matches the published algorithm exactly (this test implies the invariant above is violated too).
         if index > 0 and lengths[index - 1] < lengths[index + 1] { index -= 1 }
         _merge_runs_at(a, buffer, starts, lengths, index, cmp)
     }

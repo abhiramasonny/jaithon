@@ -53,9 +53,6 @@ pub fn show(figure: Figure, title: str = "jaiplot") -> void {
     let canvas = Canvas(window)
     let input = Input(window)
 
-    # The view is kept as limit overrides on the first set of axes. Panning and
-    # zooming write here and the figure is rendered again, which is what makes a
-    # zoomed axis re-tick rather than magnify.
     let axes = panels[0]
     let (home_x_low, home_x_high, home_y_low, home_y_high) = axes.limits()
     var view = _View(home_x_low, home_x_high, home_y_low, home_y_high)
@@ -238,9 +235,6 @@ pub fn animate(
     let canvas = Canvas(window)
     let input = Input(window)
 
-    # A frozen figure draws its background once into an image and blits it
-    # each frame. For a filter running over a fixed map that is the map, the
-    # grid and every label -- most of the frame, redrawn for nothing.
     let cached = _background(figure)
 
     var frame = 0

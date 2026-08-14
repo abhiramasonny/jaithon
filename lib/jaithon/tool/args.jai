@@ -39,7 +39,6 @@ pub class Argument {
     pub fn init(self, text: str) {
         var name = ""
         var value: str? = null
-        # `-` (stdin) and `--` (end-of-options) are conventions, not option names.
         if text.starts_with("-") and text != "-" and text != "--" {
             let equals = text.find("=")
             if equals < 0 {
@@ -109,8 +108,6 @@ pub class Arguments {
     #: reader.value_of(reader.next())    # "docs"
     #: ```
     pub fn value_of(self, argument: Argument?) -> str? {
-        # Takes `Argument?` because the documented call is `value_of(next())`;
-        # nothing to look up once the args are exhausted.
         if argument is null { return null }
         let inline = argument.value
         if inline is not null { return inline }

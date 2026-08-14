@@ -47,8 +47,6 @@ fn assert_series_near(actual: list[float], expected: list[float], tolerance: flo
 pub fn test_linspace_hits_both_endpoints_exactly() -> void {
     let values = linspace(0.0, 1.0, 5)
     assert_eq(values.len(), 5)
-    # Exactness at the ends matters: an axis drawn from a drifted endpoint puts
-    # its last tick a fraction of a pixel outside the frame.
     assert_true(values[0] == 0.0)
     assert_true(values[4] == 1.0)
     assert_series_near(values, [0.0, 0.25, 0.5, 0.75, 1.0])
@@ -184,8 +182,6 @@ pub fn test_transform_round_trips() -> void {
 
 pub fn test_transform_flips_the_vertical_axis() -> void {
     let transform = Transform(Rect(0.0, 0.0, 1.0, 1.0), Rect(0.0, 0.0, 10.0, 10.0))
-    # Data y grows upward and device y downward, so the data bottom lands at the
-    # largest device y.
     assert_near(transform.apply(0.0, 0.0).y, 10.0)
     assert_near(transform.apply(0.0, 1.0).y, 0.0)
 }
@@ -265,8 +261,6 @@ pub fn test_colour_round_trips_through_hex() -> void {
 }
 
 pub fn test_colour_mixing_is_gamma_correct() -> void {
-    # Interpolating in sRGB bytes would give 128 here, which reads far too dark
-    # for a halfway point between black and white.
     let middle = Color.from_rgb(0, 0, 0).lerp(Color.from_rgb(255, 255, 255), 0.5)
     assert_true(middle.red() > 180)
     assert_true(middle.red() < 195)
@@ -297,7 +291,6 @@ pub fn test_a_series_of_mismatched_lengths_is_rejected() -> void {
 }
 
 pub fn test_a_bar_chart_includes_its_baseline() -> void {
-    # Bars drawn from a raised baseline misrepresent the ratios between them.
     let bars = Bar([0.0, 1.0, 2.0], [3.0, 7.0, 5.0])
     let box = bars.extent() ?? Rect(0.0, 0.0, 0.0, 0.0)
     assert_near(box.bottom(), 0.0)
@@ -328,8 +321,6 @@ pub fn test_an_explicit_colour_survives_the_cycle() -> void {
     let axes = figure.axes()
     let red = Color.from_hex("#ff0000")
     let line = axes.line([0.0, 1.0], [0.0, 1.0], color: red)
-    # `add` offers the next cycle colour; a series given one explicitly must
-    # keep it, which is what makes an explicit colour stick.
     assert_eq(line.extent() == null, false)
     assert_true(figure.render().len() > 0)
 }
@@ -366,8 +357,6 @@ pub fn test_the_plot_area_matches_what_render_lays_out() -> void {
     let axes = figure.axes()
     axes.line([0.0, 1.0], [0.0, 1.0])
     let plot = axes.plot_area(figure.device())
-    # The spine is drawn on exactly this rectangle, so a mismatch here would
-    # put the window backend's cursor readout on the wrong data.
     let document = to_svg(figure.render(), 400, 300)
     let corner = f"{int(plot.left())},{int(plot.bottom())}"
     assert_true(document.contains(corner))
@@ -400,8 +389,6 @@ pub fn test_the_raster_backend_draws_without_a_window() -> void {
     assert_eq(image.width(), 160)
     assert_eq(image.height(), 120)
 
-    # Something must actually have been drawn: a blank white buffer would pass
-    # every other assertion here.
     var ink = 0
     for pixel in image.pixels() {
         if red_of(pixel) < 250 { ink += 1 }
@@ -423,7 +410,6 @@ pub fn test_filling_a_path_anti_aliases_its_edge() -> void {
             if value > 0 and value < 255 { partial += 1 }
         }
     }
-    # A hard-edged fill would produce none of these.
     assert_true(partial > 0)
 }
 
@@ -449,8 +435,6 @@ pub fn test_a_translucent_stroke_does_not_darken_at_its_joins() -> void {
     zigzag.line_to(20.0, 10.0)
     zigzag.line_to(36.0, 54.0)
     canvas.stroke_path(zigzag, 0x80FFFFFF, width: 6.0)
-    # The whole stroke is one filled path, so the pixels where two segments
-    # overlap are written once rather than composited twice.
     assert_eq(red_of(canvas.get_pixel(20, 12)), red_of(canvas.get_pixel(12, 21)))
 }
 
@@ -460,7 +444,6 @@ pub fn test_png_carries_the_signature_and_the_expected_chunks() -> void {
     for (index, byte) in signature.enumerate() {
         assert_eq(data[index], byte)
     }
-    # IHDR follows the signature immediately: four length bytes then the tag.
     assert_eq(data[12], ord("I"))
     assert_eq(data[13], ord("H"))
     assert_eq(data[14], ord("D"))
@@ -499,8 +482,6 @@ pub fn test_a_series_can_be_re_fed_without_losing_its_styling() -> void {
     let box = line.extent() ?? Rect(0.0, 0.0, 0.0, 0.0)
     assert_near(box.top(), 7.0)
     assert_near(box.right(), 2.0)
-    # The label is what a legend keys on, so losing it would drop the series
-    # out of the legend halfway through an animation.
     assert_eq(line.label() ?? "", "moving")
 }
 
@@ -526,8 +507,6 @@ pub fn test_successive_frames_differ() -> void {
     let first = figure.render().render()
     line.set_data([0.0, 1.0, 2.0], [0.0, -1.0, 0.0])
     let second = figure.render().render()
-    # Re-feeding must actually reach the display list; an animation whose
-    # frames were identical would look like a still image.
     assert_ne(first, second)
 }
 
@@ -556,8 +535,6 @@ pub fn test_a_pose_cloud_batches_its_particles() -> void {
     }
     let cloud = axes.poses(xs, ys, headings: headings)
     assert_eq(cloud.len(), 500)
-    # One primitive for the whole cloud, not one per particle: at this count the
-    # per-primitive cost is the entire frame budget.
     let list = figure.render()
     var batches = 0
     for primitive in list.to_list() {
@@ -588,7 +565,6 @@ pub fn test_a_weighted_cloud_splits_into_opacity_buckets() -> void {
             _ => { }
         }
     }
-    # Several batches, one per opacity bucket, rather than one flat cloud.
     assert_true(batches > 1)
 }
 
@@ -625,8 +601,6 @@ pub fn test_a_grid_rejects_a_cell_count_that_does_not_match() -> void {
 pub fn test_a_grid_becomes_one_raster_the_right_way_up() -> void {
     let figure = Figure(width: 200, height: 160)
     let axes = figure.axes()
-    # Row zero is the bottom in data space but the last row of a pixel buffer,
-    # so a grid drawn without flipping comes out upside down.
     let _grid = axes.grid_of([0.0, 0.0, 1.0, 1.0], 2, 2, Rect(0.0, 0.0, 2.0, 2.0))
     var found = false
     for primitive in figure.render().to_list() {
@@ -635,7 +609,6 @@ pub fn test_a_grid_becomes_one_raster_the_right_way_up() -> void {
                 assert_eq(width, 2)
                 assert_eq(height, 2)
                 assert_eq(pixels.len(), 4)
-                # The top pixel row carries the high-valued cells.
                 assert_ne(pixels[0], pixels[2])
                 found = true
             }
@@ -671,8 +644,6 @@ pub fn test_freezing_splits_the_layers() -> void {
 
     assert_true(figure.is_frozen())
     let (background, foreground) = figure.render_layers()
-    # The background carries the furniture and the map; the foreground only the
-    # cloud, which is what an animation redraws.
     assert_true(background.len() > foreground.len())
     assert_eq(foreground.render(), figure.render_dynamic().render())
     assert_true(figure.render_dynamic().len() > 0)

@@ -149,7 +149,7 @@ typedef enum {
     W0106_UNUSED_PARAMETER,
 } JaiDiagCode;
 
-const char *jaiDiagCodeString(JaiDiagCode code);   /* "E0301" */
+const char *jaiDiagCodeString(JaiDiagCode code);
 JaiDiagCode jaiDiagCodeFromString(const char *text);
 bool        jaiDiagCodeIsWarning(JaiDiagCode code);
 
@@ -217,4 +217,4 @@ typedef struct {
 void jaiPrintTraceback(FILE *out, const JaiFrameInfo *frames, int count,
                        const char *excType, const char *excMessage, bool color);
 
-#endif /* JAI_DIAG_H */
+#endif

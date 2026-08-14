@@ -13,25 +13,10 @@
 #: ```
 import std.math
 
-# Limbs are little-endian base-2**31 digits, each stored in a plain `int`.
-#
-# 2**32 is the traditional limb base, but it cannot be used here: Jaithon's
-# `int` is *signed* 64-bit and raises `OverflowError` rather than wrapping, and
-# the schoolbook inner step `out[i+j] + a[i]*b[j] + carry` reaches
-# (2**32-1)**2 + 2**33 - 1, which is just above 2**64 and so needs an unsigned
-# accumulator that this language does not have. With 2**31 the same step peaks
-# below 2**62.01, which leaves two whole bits of headroom inside a signed 64-bit
-# int. Knuth's algorithm D needs exactly the same property for its trial
-# quotient `(u[j+n]*BASE + u[j+n-1]) // v[n-1]`, whose numerator is below 2**62,
-# and for the `qhat * v[n-2]` correction test, which is below 2**62 as well.
 const SHIFT: int = 31
 const BASE: int = 2147483648
 const MASK: int = 2147483647
 
-# Below this many limbs the recursion overhead of Karatsuba (three recursive
-# products plus six linear passes) costs more than the n**2 inner loop it
-# replaces. 32 limbs is ~1000 bits, which is where the crossover sits for an
-# interpreted inner loop; a C implementation would set it lower.
 const KARATSUBA_THRESHOLD: int = 32
 
 const DIGITS: str = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -335,8 +320,6 @@ pub class BigInt {
     pub fn to_str(self, base: int = 10) -> str {
         if base < 2 or base > 36 { throw ValueError(f"base must be in 2..=36, got {base}") }
         if self.signum == 0 { return "0" }
-        # Peel off as many digits per division as fit in one limb, so a value of
-        # n limbs costs n**2 / chunk_digits limb divisions rather than n**2.
         let (chunk_digits, chunk_base) = _chunk_for(base)
         var parts: list[str] = []
         var rest = [limb for limb in self.limbs]
@@ -381,8 +364,6 @@ pub class BigInt {
     pub fn to_float(self) -> float {
         if self.signum == 0 { return 0.0 }
         let length = self.limbs.len()
-        # Three limbs are 93 bits, comfortably more than a float's 53, so the
-        # result is off by at most one rounding of the discarded tail.
         var mantissa = 0.0
         var taken = 0
         var index = length - 1
@@ -405,14 +386,11 @@ pub class BigInt {
         return _cmp_limbs(self.limbs, that.limbs) * self.signum
     }
 
-    # -2**63 is the one int that abs() cannot express, so to_int() spots its
-    # magnitude, 2 * 2**62, as a limb pattern instead of computing it.
     fn _is_two_to_the_63(self) -> bool {
         if self.limbs.len() != 3 { return false }
         return self.limbs[0] == 0 and self.limbs[1] == 0 and self.limbs[2] == 2
     }
 
-    # True when bit `index` of the magnitude is set.
     fn _bit(self, index: int) -> bool {
         let limb = index // SHIFT
         if limb >= self.limbs.len() { return false }
@@ -484,8 +462,6 @@ pub class BigInt {
     }
 
     fn __hash__(self) -> int {
-        # `BigInt(n) == n` holds, so every value that fits in an int has to hash
-        # like one. Two limbs are 62 bits, and -2**63 is the one wider case.
         if self.limbs.len() <= 2 { return hash(self.to_int()) }
         if self.signum < 0 and self._is_two_to_the_63() { return hash(math.INT_MIN) }
         return hash(self.to_str(36))
@@ -541,7 +517,6 @@ fn _digit_value(character: str) -> int {
     return -1
 }
 
-# Largest power of `base` below BASE, as (digit count, power).
 fn _chunk_for(base: int) -> tuple[int, int] {
     var count = 0
     var power = 1
@@ -596,7 +571,6 @@ fn _add_limbs(a: list[int], b: list[int]) -> list[int] {
     return out
 }
 
-# Requires magnitude(a) >= magnitude(b).
 fn _sub_limbs(a: list[int], b: list[int]) -> list[int] {
     var out: list[int] = []
     var borrow = 0
@@ -687,8 +661,6 @@ fn _mul_limbs(a: list[int], b: list[int]) -> list[int] {
     let b_high = _slice_trim(b, half, b.len())
     let low = _mul_limbs(a_low, b_low)
     let high = _mul_limbs(a_high, b_high)
-    # (a_low + a_high)(b_low + b_high) - low - high is never negative, so the
-    # middle term needs no sign tracking.
     let middle = _mul_limbs(_add_limbs(a_low, a_high), _add_limbs(b_low, b_high))
     let cross = _sub_limbs(_sub_limbs(middle, low), high)
     return _add_limbs(_add_limbs(low, _shift_limbs(cross, half)), _shift_limbs(high, 2 * half))
@@ -720,8 +692,6 @@ fn _mul_school(a: list[int], b: list[int]) -> list[int] {
     return out
 }
 
-# Knuth, TAOCP volume 2, algorithm 4.3.1D. Both arguments are trimmed
-# magnitudes and the divisor is non-zero; the result is truncated, not floored.
 fn _divmod_limbs(u: list[int], v: list[int]) -> tuple[list[int], list[int]] {
     let n = v.len()
     if n == 1 {
@@ -731,8 +701,6 @@ fn _divmod_limbs(u: list[int], v: list[int]) -> tuple[list[int], list[int]] {
         return (quotient, remainder_limbs)
     }
     if _cmp_limbs(u, v) < 0 { return ([], [limb for limb in u]) }
-    # D1: scale so the leading divisor limb is at least BASE/2, which is what
-    # bounds the trial quotient below to at most two too large.
     let scale = BASE // (v[n - 1] + 1)
     var un = if scale > 1 { _mul_small(u, scale) } else { [limb for limb in u] }
     let vn = if scale > 1 { _mul_small(v, scale) } else { [limb for limb in v] }
@@ -742,7 +710,6 @@ fn _divmod_limbs(u: list[int], v: list[int]) -> tuple[list[int], list[int]] {
     for _step in 0..m + 1 { quotient.push(0) }
     var j = m
     while j >= 0 {
-        # D3: estimate the next quotient limb from the top two dividend limbs.
         let numerator = un[j + n] * BASE + un[j + n - 1]
         var qhat = numerator // vn[n - 1]
         var rhat = numerator % vn[n - 1]
@@ -756,7 +723,6 @@ fn _divmod_limbs(u: list[int], v: list[int]) -> tuple[list[int], list[int]] {
                 correcting = false
             }
         }
-        # D4: subtract qhat * divisor from the current window.
         var borrow = 0
         var carry = 0
         for i in 0..n {
@@ -773,8 +739,6 @@ fn _divmod_limbs(u: list[int], v: list[int]) -> tuple[list[int], list[int]] {
         }
         let top_difference = un[j + n] - carry - borrow
         if top_difference < 0 {
-            # D6: qhat was one too large (this happens for about 2 in 2**31
-            # random divisors), so add the divisor back and fix the estimate.
             un[j + n] = top_difference + BASE
             qhat -= 1
             var addend_carry = 0

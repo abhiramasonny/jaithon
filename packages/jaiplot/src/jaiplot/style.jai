@@ -18,8 +18,6 @@
 import std.math
 from std.gui.color import rgba, red_of, green_of, blue_of, alpha_of
 
-# The sRGB transfer function, IEC 61966-2-1: a short linear toe below the
-# cutoff, a 2.4 power curve above it.
 const SRGB_LINEAR_CUTOFF = 0.04045
 const SRGB_ENCODED_CUTOFF = 0.0031308
 const SRGB_SLOPE = 12.92
@@ -706,9 +704,6 @@ pub class Theme {
     }
 }
 
-# Every nibble after the `#`, in order. The message quotes the whole string
-# rather than the one bad character, because "#12g456" is far easier to spot
-# than "g".
 fn _hex_digits(text: str) -> list[int] {
     if not text.starts_with("#") {
         throw ValueError(f"hex colour must be #rgb, #rrggbb or #rrggbbaa, got {text}")
@@ -724,7 +719,6 @@ fn _hex_digits(text: str) -> list[int] {
     return digits
 }
 
-# Decode a 0-255 sRGB channel to linear light.
 fn _linear_channel(channel: int) -> float {
     let encoded = float(channel) / 255.0
     if encoded <= SRGB_LINEAR_CUTOFF {
@@ -733,7 +727,6 @@ fn _linear_channel(channel: int) -> float {
     return ((encoded + SRGB_OFFSET) / (1.0 + SRGB_OFFSET)) ** SRGB_GAMMA
 }
 
-# Encode linear light back to a 0-255 sRGB channel.
 fn _encode_channel(linear: float) -> int {
     let level = math.clamp(linear, 0.0, 1.0)
     if level <= SRGB_ENCODED_CUTOFF {

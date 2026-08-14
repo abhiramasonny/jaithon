@@ -1,8 +1,3 @@
-# Mutating a container while a `for` is walking it is a RuntimeError, not a
-# silently wrong traversal. Two distinct faults: a resize, which invalidates
-# the iterator's bounds, and an in-place store, which does not — the second is
-# only visible because every container carries a version counter.
-
 # --- lists: resize --------------------------------------------------------
 let grow = [1, 2, 3]
 try {
@@ -18,8 +13,6 @@ try {
     print(f"shrink: {e.message}")
 }
 
-# A pop paired with a push leaves the count where it started, so the count
-# alone cannot witness it.
 let churn = [1, 2, 3]
 try {
     for _x in churn {
@@ -89,25 +82,21 @@ try {
 }
 
 # --- what stays legal -----------------------------------------------------
-# Reading is free, and so is mutating a *different* container.
 let source = [1, 2, 3]
 let sink: list[int] = []
 for x in source { sink.push(x * 2) }
 print(f"copied: {sink}")
 
-# A snapshot is the supported way to edit while walking.
 let live = [1, 2, 3, 4]
 for x in live.copy() {
     if x % 2 == 0 { live.remove(x) }
 }
 print(f"filtered: {live}")
 
-# Mutating after the loop has finished is fine.
 for _x in live { }
 live.push(5)
 print(f"after: {live}")
 
-# Immutable sources have nothing to witness and never raise.
 let t = (1, 2, 3)
 var total = 0
 for x in t { total = total + x }

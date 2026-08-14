@@ -37,9 +37,6 @@ fn _substitute(u: Universe, t: Type, bindings: dict[str, Type]) -> Type {
         return dict_of(u, key, value)
     }
 
-    # An alias is its own answer, where the C's `TY_ALIAS` answers the
-    # substituted target. Nothing constructs an alias type (`kinds.jai`), so the
-    # branch has no input; `test_an_alias_is_answered_unchanged` pins that.
     let rebuilds = t.kind == TyKind.Tuple or
         t.kind == TyKind.Fn or
         t.kind == TyKind.Union or
@@ -54,7 +51,6 @@ fn _substitute(u: Universe, t: Type, bindings: dict[str, Type]) -> Type {
         args.push(replaced)
     }
 
-    # Only a function's `ret` is a type of its own; on an alias it is the target.
     var returns = t.ret
     if t.kind == TyKind.Fn {
         let written = t.ret
@@ -70,7 +66,6 @@ fn _substitute(u: Universe, t: Type, bindings: dict[str, Type]) -> Type {
     if t.kind == TyKind.Tuple { return tuple_of(u, args) }
     if t.kind == TyKind.Fn { return fn_of(u, args, returns, t.fn_flags) }
     if t.kind == TyKind.Union {
-        # `union_of`, not `intern`: `T | int` under `{T: int}` becomes `int`.
         var members: list[Type?] = []
         for member in args { members.push(member) }
         return union_of(u, members)

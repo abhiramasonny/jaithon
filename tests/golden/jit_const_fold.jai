@@ -19,9 +19,9 @@ fn divs(x: int) -> int {
     acc = acc +% x // 2  # power of two: one asr
     acc = acc +% x // 8
     acc = acc +% x // 1024
-    acc = acc +% x // 1   # shift of zero
-    acc = acc +% x // 3   # not a power of two: guards fold, sdiv stays
-    acc = acc +% x // -2  # negative: no shift is exact for this
+    acc = acc +% x // 1  # shift of zero
+    acc = acc +% x // 3
+    acc = acc +% x // -2
     return acc
 }
 
@@ -29,9 +29,9 @@ fn mods(x: int) -> int {
     var acc = 0
     acc = acc +% x % 2
     acc = acc +% x % 8
-    acc = acc +% x % 1           # always zero
-    acc = acc +% x % 5           # not a power of two
-    acc = acc +% x % -4          # negative modulus floors the other way
+    acc = acc +% x % 1  # always zero
+    acc = acc +% x % 5
+    acc = acc +% x % -4
     acc = acc +% x % 2147483648  # 2**31 -- an OP_CONST, not an OP_INT
     return acc
 }
@@ -71,15 +71,10 @@ fn drive(n: int) -> int {
 
 print(drive(20000))
 
-# A zero divisor still has to reach the interpreter's error, and a literal one
-# is exactly the case where the guard is no longer emitted -- so the fold must
-# not be reached for it at all.
 var caught = 0
 try { print(1 // 0) } catch _e { caught = 1 }
 print(caught)
 
-# The same arithmetic at module scope, which is the OSR tier rather than the
-# whole-function one.
 var osr = 0
 var j = 0
 while j < 60000 {
@@ -89,7 +84,6 @@ while j < 60000 {
 }
 print(osr)
 
-# The ends of the range, where flooring and truncation disagree the most.
 let intMin = -9223372036854775807 - 1
 print(divs(intMin))
 print(mods(intMin))

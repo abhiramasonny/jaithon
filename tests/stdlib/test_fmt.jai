@@ -21,9 +21,6 @@ from std.test import assert_eq, assert_true
 from jaithon.tool.fmt import check_report, first_difference, format_source, is_formatted
 from jaithon.tool.fmt import migrate2, scan_comments
 
-# A comment in every position the grammar allows one: before a declaration,
-# trailing a statement, alone inside an empty block, between match arms, inside
-# an argument list, as a `#:` doc comment, and as a nesting `#* ... *#` block.
 const _EVERY_POSITION: str = """#: Module doc comment.
 #:
 #: Second paragraph of the module doc.
@@ -118,8 +115,6 @@ fn test_the_every_position_file_is_already_canonical() -> void {
     assert_true(is_formatted(_EVERY_POSITION, "every_position.jai"))
 }
 
-# The shapes the printer treats specially. Each is formatted twice, and the two
-# results must agree — see `test_formatting_is_idempotent`.
 let _CORPUS: list[str] = [
     "let x = 1\n",
     "let x=1+2\n",
@@ -140,16 +135,12 @@ let _CORPUS: list[str] = [
     "while a and b { step() }\n",
     "match v {\n    0 => \"zero\",\n    _ => \"many\",\n}\n",
     "try {\n    risky()\n} catch error: ValueError {\n    recover()\n}\n",
-    # A call that has to break one argument to a line.
     "let value = compute(first_argument_name, second_argument_name, third_argument_name, " +
         "fourth_argument)\n",
-    # An operator chain that has to break after its operator.
     "let ok = math.fabs(self.xxxxxx - other.xxxxxx) <= tol and " +
         "math.fabs(self.yyyyyy - other.yyyyyy) <= tol\n",
-    # A signature whose return type is what pushes it past the limit.
     "pub fn knapsack_unbounded(weights: list[int], values: list[int], capacity: int) " +
         "-> tuple[int, list[int]] {\n    return (0, [])\n}\n",
-    # Grouping brackets that a chain break must not drop.
     "let along = (separation * separation + self.radius * self.radius - other.radius " +
         "* other.radius) / (2.0 * separation)\n",
 ]
@@ -173,7 +164,6 @@ fn test_formatting_the_every_position_file_is_idempotent() -> void {
 fn test_generic_arguments_keep_their_spelling() -> void {
     assert_true(is_formatted("let pair = Foo[K, V]()\n", "d.jai"))
     assert_true(is_formatted("let deque = Deque[tuple[int, int]]()\n", "d.jai"))
-    # A one-element tuple is not the same subscript, so it keeps its brackets.
     assert_true(is_formatted("let one = xs[(index,)]\n", "d.jai"))
 }
 
@@ -196,7 +186,6 @@ fn test_enum_variant_without_payload_stays_bare() -> void {
 fn test_int_min_literal_keeps_its_brackets() -> void {
     assert_true(is_formatted("let low = -(-9223372036854775808)\n", "d.jai"))
     assert_true(is_formatted("let sum = 1 - (-9223372036854775808)\n", "d.jai"))
-    # Every other negative literal is a unary minus and needs only a space.
     assert_true(is_formatted("let negated = - -5\n", "d.jai"))
     assert_true(is_formatted("let plain = -5\n", "d.jai"))
 }
@@ -275,7 +264,6 @@ fn test_migrate2_rewrites_the_whole_table() -> void {
     assert_eq(migrate2("var n = _alen(a)\n"), "var n = a.len()\n")
     assert_eq(migrate2("var n = arrayLen(a)\n"), "var n = a.len()\n")
     assert_eq(migrate2("import ds/array\n"), "import std.ds\n")
-    # A `namespace` has no mechanical answer, so it is marked and not guessed.
     assert_true(migrate2("namespace M\n").contains("TODO(migrate2)"))
 }
 

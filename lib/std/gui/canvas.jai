@@ -300,8 +300,6 @@ pub class Canvas {
             self.fill_rect(x, y, width, height, color)
             return
         }
-        # Each corner row gets one span, and the straight middle gets the rest,
-        # so every pixel of the shape is written exactly once.
         for row in 0..corner {
             let above = corner - row
             let reach = math.isqrt(corner * corner - above * above)
@@ -388,8 +386,6 @@ pub class Canvas {
                 decision += slope_x - slope_y + square_y
             }
         }
-        # Re-seed the decision variable for the second region, at the midpoint
-        # between the current pixel and the one diagonally inside it.
         let next_x = x + 0.5
         let inside_y = float(y - 1)
         decision = square_y * next_x * next_x + square_x * inside_y * inside_y
@@ -517,9 +513,6 @@ pub class Canvas {
             for point in points {
                 let (x0, y0) = previous
                 let (x1, y1) = point
-                # A half-open test on the endpoints: an edge counts when it
-                # spans the row, which makes a shared vertex cross once, not
-                # twice, and drops horizontal edges entirely.
                 if (y0 > row) != (y1 > row) {
                     let along = float(row - y0) / float(y1 - y0)
                     crossings.push(x0 + along * (x1 - x0))
@@ -617,8 +610,6 @@ pub class Canvas {
     ) -> void {
         if radius <= 0 { throw ValueError(f"radius must be positive, got {radius}") }
         let sweep = end_angle - start_angle
-        # One segment per pixel of arc length keeps the polyline within half a
-        # pixel of the true circle at every radius.
         let count = max(int(math.fabs(sweep) * radius), 1)
         var previous_x = center_x + int(math.round(radius * math.cos(start_angle)))
         var previous_y = center_y + int(math.round(radius * math.sin(start_angle)))
@@ -787,10 +778,6 @@ pub class Canvas {
     #: ```
     pub fn fill_path(self, path: Path, color: int, winding: Winding = Winding.NonZero) -> void {
         if color >> 24 & 0xFF == 0 { return }
-        # Almost everything a chart draws is an axis-aligned rectangle: every
-        # gridline, tick, spine, bar, background and legend panel. Their coverage
-        # is a product of two independent overlaps rather than something to
-        # sample, so they skip the scanline machinery entirely.
         let box = _axis_aligned_rect(path)
         if box != null {
             let (left, top, right, bottom) = box
@@ -819,12 +806,6 @@ pub class Canvas {
 
         let share = 255.0 / SUBSAMPLES.to_float()
 
-        # An active edge list. Testing every edge at every sub-scanline is
-        # quadratic in the shape's complexity, and a stroked series is thousands
-        # of edges over hundreds of rows -- millions of tests for a picture where
-        # only a handful of edges cross any given row. Sorting once by the top of
-        # each edge and carrying a window down the shape makes the work
-        # proportional to what actually crosses the scanline.
         let ordered = edges.sorted(|edge| edge.y0)
         var pending = 0
         var active = []
@@ -840,11 +821,6 @@ pub class Canvas {
             active = [edge for edge in active if edge.y1 > row_top]
             if active.len() == 0 { continue }
 
-            # Gather every sub-scanline first so the coverage buffer can be cut
-            # to the width this row actually needs. Sizing it to the whole shape
-            # instead would allocate a float per pixel of the bounding box on
-            # every row, which for a curve spanning the plot is most of the cost
-            # of the frame and nearly all of it wasted on empty space.
             var samples = []
             var row_left = 0.0
             var row_right = 0.0
@@ -871,11 +847,6 @@ pub class Canvas {
             let window_right = min(int(math.ceil(row_right)), last_column)
             if window_left > window_right { continue }
 
-            # A row whose sub-scanlines each cover one interval -- a rectangle,
-            # a bar, a legend panel, a marker, the figure background -- has a
-            # solid middle with a fringe of at most one pixel on each side. The
-            # middle is written with a single native call, which is the
-            # difference between a chart that animates and one that does not.
             var intervals = []
             var single = true
             for hits in samples {
@@ -888,11 +859,6 @@ pub class Canvas {
                 if self._solid_row(row, intervals, window_left, window_right, color) { continue }
             }
 
-            # A curve crosses one row in several places, so the row's extent is
-            # wide while the ink on it is a few pixels at each crossing. Working
-            # per cluster of overlapping spans keeps the per-pixel cost
-            # proportional to the ink rather than to the distance between the
-            # leftmost and rightmost crossing.
             var flat = []
             for spans in intervals {
                 for interval in spans { flat.push(interval) }
@@ -906,8 +872,6 @@ pub class Canvas {
             var cluster_end = closing
             for index in 1..ordered_spans.len() {
                 let (start, end) = ordered_spans[index]
-                # Within a pixel counts as touching: two spans that close on the
-                # same pixel share its coverage and must be blended together.
                 if start <= cluster_end + 1.0 {
                     cluster_end = max(cluster_end, end)
                 } else {
@@ -960,7 +924,6 @@ pub class Canvas {
         let last_column = min(int(math.ceil(right)) - 1, self.clip_right)
         if first_row > last_row or first_column > last_column { return }
 
-        # Horizontal coverage is the same on every row, so it is built once.
         var columns = []
         for column in first_column..=last_column {
             let low = max(left, column.to_float())
@@ -1107,15 +1070,6 @@ pub class Canvas {
     ) -> void {
         if width <= 0.0 or color >> 24 & 0xFF == 0 { return }
 
-        # An opaque stroke can be laid down one segment at a time, because
-        # writing an opaque pixel twice is the same as writing it once. Each
-        # segment is then a convex quad and goes straight to the native filler,
-        # instead of the whole run becoming one large non-convex ring whose
-        # every scanline meets most of the path.
-        #
-        # A translucent one cannot: the overlaps at the joins would composite
-        # twice and show as dark knots, which is the bug the single-ring form
-        # exists to avoid.
         if color >> 24 & 0xFF == 255 and dash.len() == 0 {
             self._stroke_segments(path, color, width, cap, join)
             return
@@ -1246,8 +1200,6 @@ pub class Canvas {
                 if bits >> row & 1 == 0 { continue }
                 let local_x = advance + column * scale
                 let local_y = row * scale
-                # Anticlockwise on screen, where y grows downward: one turn
-                # sends +x upward and +y rightward.
                 let (dx, dy) = match turns {
                     1 => (local_y, -local_x),
                     2 => (-local_x, -local_y),
@@ -1294,8 +1246,6 @@ pub class Canvas {
 
         let solid_from = max(int(math.ceil(widest_start)), window_left)
         let solid_to = min(int(math.floor(narrow_end)) - 1, window_right)
-        # Below a handful of pixels the bookkeeping costs more than the loop it
-        # replaces, so a narrow run is left to the general path.
         if solid_to - solid_from < 4 { return false }
 
         let alpha = color >> 24 & 0xFF
@@ -1376,9 +1326,6 @@ pub class Canvas {
         let stop = min(right, self.clip_right)
         if start > stop { return }
         let base = y * self.width
-        # Every filled primitive funnels through here, so this run is the one
-        # place worth handing to the native layer: a whole row of pixels per
-        # call instead of one interpreted store each.
         if alpha == 255 {
             __prim__.canvas_fill_span(self.buffer, base + start, stop - start + 1, color)
             return
@@ -1387,8 +1334,6 @@ pub class Canvas {
         __prim__.canvas_blend_span(self.buffer, base + start, coverage, color)
     }
 
-    # The eight reflections of one midpoint step, each written once so that a
-    # translucent outline is not doubled where the octants meet.
     fn _octants(self, center_x: int, center_y: int, x: int, y: int, color: int) -> void {
         self._quadrants(center_x, center_y, x, y, color)
         if x != y { self._quadrants(center_x, center_y, y, x, color) }
@@ -1423,16 +1368,11 @@ fn _corner_radius(width: int, height: int, radius: int) -> int {
     return min(radius, min(width, height) // 2)
 }
 
-# x on the edge lo (y0, x0) to (y1, x1) at row `y`. A horizontal edge has no
-# single answer, so it reports its first endpoint, which is what makes the flat
-# top and flat bottom of a triangle come out with the right span.
 fn _interpolate(y0: int, x0: int, y1: int, x1: int, y: int) -> int {
     if y1 == y0 { return x0 }
     return x0 + (x1 - x0) * (y - y0) // (y1 - y0)
 }
 
-# Segments enough that the polyline stays within about half a pixel of the
-# curve: the control polygon is an upper bound on the curve's length.
 fn _curve_steps(points: list[tuple[int, int]]) -> int {
     var length = 0.0
     for index in 1..points.len() {

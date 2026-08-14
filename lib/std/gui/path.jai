@@ -162,9 +162,6 @@ class _Edge {
     pub let direction: int
 
     pub fn init(self, x0: float, y0: float, x1: float, y1: float) {
-        # Edges are stored top to bottom so a scanline test is one comparison,
-        # and the direction that was lost in the swap is kept for the winding
-        # count.
         if y0 <= y1 {
             self.x0 = x0
             self.y0 = y0
@@ -197,7 +194,6 @@ pub fn _axis_aligned_rect(path: Path) -> tuple[float, float, float, float]? {
     if runs.len() != 1 { return null }
     let run = runs[0]
     let count = run.len() // 2
-    # Four corners, or five when `close` repeated the first.
     if count != 4 and count != 5 { return null }
     if count == 5 {
         if run[0] != run[8] or run[1] != run[9] { return null }
@@ -213,7 +209,6 @@ pub fn _axis_aligned_rect(path: Path) -> tuple[float, float, float, float]? {
         top = min(top, run[index * 2 + 1])
         bottom = max(bottom, run[index * 2 + 1])
     }
-    # Every corner must sit on the box, and every edge must be axis aligned.
     for index in 0..4 {
         let x = run[index * 2]
         let y = run[index * 2 + 1]
@@ -243,8 +238,6 @@ pub fn _edges_of(path: Path) -> list[_Edge] {
             let y0 = run[index * 2 + 1]
             let x1 = run[next * 2]
             let y1 = run[next * 2 + 1]
-            # A horizontal edge contributes no crossing and would only divide by
-            # zero, so it is dropped rather than special-cased downstream.
             if y0 != y1 { edges.push(_Edge(x0, y0, x1, y1)) }
         }
     }
@@ -258,8 +251,6 @@ pub fn _edges_of(path: Path) -> list[_Edge] {
 pub fn _crossings(edges: list[_Edge], y: float) -> list[tuple[float, int]] {
     var hits = []
     for edge in edges {
-        # Half-open in y: a vertex shared by two edges is counted once, so
-        # abutting shapes neither double-cover nor leave a seam.
         if y >= edge.y0 and y < edge.y1 { hits.push((edge.crossing(y), edge.direction)) }
     }
     hits.sort(|entry| entry[0])
@@ -390,8 +381,6 @@ pub fn _dashed(run: list[float], dash: list[float]) -> list[list[float]] {
             }
             travelled += step
             remaining -= step
-            # Floating point will not land exactly on zero, and a pattern that
-            # never advanced would spin here for ever.
             if remaining <= 1e-9 {
                 if on and current.len() >= 4 { pieces.push(current) }
                 if on { current = [] }
@@ -432,9 +421,6 @@ pub fn _outline_run(outline: Path, run: list[float], width: float, cap: Cap, joi
 
     if join != Join.Bevel and count > 2 {
         for vertex in 1..count - 1 {
-            # A join only has a wedge to fill when the path actually turns. A
-            # sampled curve turns by a fraction of a degree between samples, so
-            # this is rare and the ring covers the rest.
             if _turns_visibly(extended, vertex, half) {
                 _add_disc(outline, extended[vertex * 2], extended[vertex * 2 + 1], half)
             }
@@ -544,7 +530,6 @@ pub fn _turns_visibly(run: list[float], vertex: int, half: float) -> bool {
 
     let cosine = (ax * bx + ay * by) / (first * second)
     let clamped = max(-1.0, min(1.0, cosine))
-    # cos(turn/2) from cos(turn), avoiding an arccos and a second cosine.
     let half_cosine = math.sqrt(max(0.0, (1.0 + clamped) * 0.5))
     return half * (1.0 - half_cosine) > 0.25
 }

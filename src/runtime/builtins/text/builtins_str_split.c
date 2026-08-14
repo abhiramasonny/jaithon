@@ -1,17 +1,4 @@
-/* builtins_str_split.c — split, rsplit, splitlines, join, replace, and
- * format: the str methods that cut a string into pieces or assemble one
- * from pieces.
- *
- * split()/rsplit() and join() are natural opposites of each other, and
- * replace() is a find-then-splice that shares jaiStrFindBytes with split's
- * separator mode; splitlines() is split()'s line-oriented cousin. format()
- * belongs here rather than in its own file because it is a one-line
- * dispatch into builtins_format.c's template engine — nothing about it is
- * separable on its own.
- *
- * builtins_str.c keeps the method table and the plumbing every method file
- * calls through builtins_str_methods.h.
- */
+/* String methods for splitting, joining, replacing, and formatting. */
 
 #include "runtime/builtins/text/builtins_str_methods.h"
 
@@ -19,9 +6,6 @@
 
 #include <string.h>
 
-/* Appends one substring to a list under construction. The list is rooted by
- * the caller, so the new string is reachable the moment it exists. Shared
- * with builtins_str_convert.c's chars(). */
 bool pushSlice(ObjList *list, const char *chars, size_t length) {
     ObjString *piece = jaiStringNew(chars, length);
     if (piece == NULL) return false;
@@ -33,7 +17,6 @@ bool pushSlice(ObjList *list, const char *chars, size_t length) {
 /* split / rsplit                                                       */
 /* ------------------------------------------------------------------ */
 
-/* split()/rsplit() with no separator: fields are the runs of non-whitespace. */
 static bool splitWhitespace(ObjString *s, int64_t maxsplit, bool fromRight,
                             Value *out) {
     ObjList *list = jaiListNew(0);
@@ -243,8 +226,6 @@ bool strRsplit(int argc, Value *args, Value *out) {
 /* splitlines                                                           */
 /* ------------------------------------------------------------------ */
 
-/* Byte length of the line terminator starting at `p`, or 0. Recognises the
- * whole Unicode set so that text from any platform round-trips. */
 static inline size_t lineBreakAt(const char *p, const char *end) {
     const unsigned char c = (unsigned char)*p;
 
@@ -295,7 +276,6 @@ bool strSplitlines(int argc, Value *args, Value *out) {
         p += brk;
         lineStart = p;
     }
-    /* A trailing terminator ends the last line; it does not start a new one. */
     if (ok && lineStart < end) ok = pushSlice(list, lineStart, (size_t)(end - lineStart));
     jaiGCPopRoot();
     if (!ok) return false;
@@ -319,9 +299,6 @@ static inline bool joinItem(JaiBuf *buf, Value item, int index) {
     return true;
 }
 
-/* A list or tuple can be measured before it is copied, so the result is one
- * exactly-sized allocation written once. Everything else has to go through a
- * growable buffer, because an iterator's length is not known until it ends. */
 static bool joinSized(ObjString *sep, const Value *items, int count,
                       Value *out) {
     const size_t sepLength = (size_t)sep->length;
@@ -441,7 +418,6 @@ bool strReplace(int argc, Value *args, Value *out) {
     int64_t done = 0;
 
     if (old->length == 0) {
-        /* An empty match sits between every pair of scalars, and at both ends. */
         const char *p = s->chars;
         const char *end = p + s->length;
         jaiBufAppend(&buf, replacement->chars, replacement->length);

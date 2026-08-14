@@ -10,7 +10,6 @@ print(geometry.rect_area(3.0, 4.0))
 print(UNIT)
 print(geometry.scaled(2.5))
 
-# Importing the same module twice does not re-run its body.
 import .modules_demo.counter
 print(tally.bump())
 print(tally.bump())

@@ -78,8 +78,6 @@ pub fn text_box(at: Point, content: str, style: TextStyle) -> Rect {
         HorizontalAnchor.Middle => at.x - width * 0.5,
         HorizontalAnchor.End => at.x - width,
     }
-    # `Baseline` sits on the bottom of the glyph cell rather than below it,
-    # because the bitmap font has no descenders to leave room for.
     let top = match style.vertical {
         VerticalAnchor.Top => at.y,
         VerticalAnchor.Middle => at.y - height * 0.5,

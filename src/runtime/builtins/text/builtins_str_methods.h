@@ -23,38 +23,25 @@
 
 /* --- shared plumbing (defined in builtins_str.c) -------------------- */
 
-/* A bound native receives the receiver as args[0]; every method below reads
- * its declared arguments from args[1] onwards. */
 bool strReceiver(int argc, Value *args, const char *method, ObjString **out);
 
-/* An absent or null argument yields NULL, read as "use the default set". */
 bool optStr(int argc, Value *args, int slot, const char *method,
            const char *what, ObjString **out);
 
-/* Resolves an optional [start, end) scalar window: negatives count from the
- * end, out-of-range bounds clamp, an inverted window comes back empty. */
 void resolveWindow(ObjString *s, int64_t start, int64_t end,
                    size_t *outStart, size_t *outEnd);
 
-/* Scalar index of a byte offset that sits on a scalar boundary. */
 size_t scalarIndexOf(ObjString *s, size_t offset);
 
-/* Last occurrence of `needle` in `hay`, or NULL — jaiStrFindBytes's mirror. */
 const char *rfindBytes(const char *hay, size_t hayLen, const char *needle,
                        size_t needleLen);
 
 /* --- shared plumbing (defined in builtins_str_case.c) --------------- */
 
-/* True for any Unicode scalar that isSpaceCp treats as whitespace. Shared
- * with split's whitespace-mode split()/rsplit(), which draws the same
- * boundary strip() does. */
 bool isSpaceCp(int32_t c);
 
 /* --- shared plumbing (defined in builtins_str_split.c) --------------- */
 
-/* Appends one substring to a list under construction as a fresh str. The
- * list is rooted by the caller. Shared with convert's chars(), which is
- * "split on every scalar boundary" in every way that matters here. */
 bool pushSlice(ObjList *list, const char *chars, size_t length);
 
 /* --- str methods defined in builtins_str_case.c ---------------------- */
@@ -110,10 +97,6 @@ bool strToStr(int argc, Value *args, Value *out);
 
 /* --- __prim__ functions defined in builtins_str_convert.c --------------- */
 
-/* jaiRegisterStringPrimitives (builtins_str.c) binds these four alongside the
- * ones it defines itself; they live in builtins_str_convert.c because each is
- * a codepoint or bytes conversion, the same concern as str's own chars(),
- * code_points() and to_bytes(). */
 bool primStrFromCodepoint(int argc, Value *args, Value *out);
 bool primStrToCodepoint(int argc, Value *args, Value *out);
 bool primStrEncode(int argc, Value *args, Value *out);

@@ -82,8 +82,6 @@ pub fn is_indexable(
     }
 }
 
-# `joinAll` in the C. The fold's cap must fire per step, and the `never` seed
-# relies on `join`'s `Never` arm: without it a wide-union member trips the cap.
 fn _join_all(u: Universe, members: list[Type], join: fn(Universe, Type?, Type?) -> Type) -> Type {
     var result: Type = u.t_never
     for member in members { result = join(u, result, member) }

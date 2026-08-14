@@ -1,20 +1,10 @@
 /* builtins_str_search.c — the search/match str methods: find, rfind, index,
- * count, starts_with, ends_with, contains.
- *
- * Every one of these resolves an optional [start, end) window with
- * resolveWindow (builtins_str.c) and then does one byte-level scan with
- * jaiStrFindBytes or rfindBytes — there is no state here beyond the window
- * math, which is why the whole group fits in one small file.
- *
- * builtins_str.c keeps the method table and the plumbing every method file
- * calls through builtins_str_methods.h.
- */
+ * count, starts_with, ends_with, contains. */
 
 #include "runtime/builtins/text/builtins_str_methods.h"
 
 #include <string.h>
 
-/* Shared body for find/rfind/index: returns the scalar index or -1. */
 static bool searchIn(int argc, Value *args, const char *method, bool fromRight,
                      int64_t *outIndex) {
     ObjString *s, *sub;
@@ -70,7 +60,6 @@ bool strCount(int argc, Value *args, Value *out) {
     size_t from, to;
     resolveWindow(s, start, end, &from, &to);
     if (sub->length == 0) {
-        /* The empty string sits at every scalar boundary in the window. */
         const size_t totalScalars = (size_t)jaiStringScalarCount(s);
         const size_t scalars =
             totalScalars == (size_t)s->length
@@ -87,7 +76,7 @@ bool strCount(int argc, Value *args, Value *out) {
                                     sub->length);
         if (hit == NULL) break;
         found++;
-        pos = (size_t)(hit - s->chars) + sub->length;   /* non-overlapping */
+        pos = (size_t)(hit - s->chars) + sub->length;
     }
     *out = INT_VAL(found);
     return true;

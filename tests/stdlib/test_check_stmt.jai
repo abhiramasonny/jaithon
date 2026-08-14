@@ -46,17 +46,12 @@ from jaithon.compile.symbol import Symbol, SymbolKind
 # ------------------------------------------------------------------
 # Fixtures
 # ------------------------------------------------------------------
-
-# `install` is part of the file under test: without it an expression cannot
-# reach a statement, and half of what is asserted below runs through that seam.
 fn _ctx() -> Ctx {
     let c = Ctx(Universe())
     install(c)
     return c
 }
 
-# A `resolve_ast_type` that knows the four scalars and the registered classes,
-# so an annotation is worth writing at all. `checker.jai` supplies the real one.
 fn _annotated() -> Ctx {
     let c = _ctx()
     c.resolve_ast_type = _named_types
@@ -81,8 +76,6 @@ fn _symbol(c: Ctx, name: str, ty: Type?, kind: SymbolKind = SymbolKind.Local) ->
     return symbol
 }
 
-# A fresh use of `symbol`, bound the way the resolver would have bound it. Two
-# uses share one symbol, which is what narrowing needs.
 fn _use(c: Ctx, symbol: Symbol) -> Node {
     let node = Node.ident(symbol.name)
     c.resolution.bind(node, symbol)
@@ -118,8 +111,6 @@ fn _enum(c: Ctx, name: str) -> TypeDecl {
     return decl
 }
 
-# A variant is a field whose type is the `Fn` that builds it, so its parameters
-# are the fields a pattern destructures. A payload-free variant has no type.
 fn _variant(c: Ctx, decl: TypeDecl, name: str, payload: list[Type]) -> void {
     var ty: Type? = null
     if payload.len() > 0 { ty = fn_of(c.universe, payload, decl.ty) }
@@ -131,8 +122,6 @@ fn _no_payload() -> list[Type] {
     return []
 }
 
-# `TypeDecl.ty` is optional because a declaration exists before it is interned;
-# every fixture here interns one, so this is the unwrap.
 fn _ty(decl: TypeDecl) -> Type {
     let t = decl.ty
     if t is null { throw ValueError(f"the `{decl.name}` fixture interned no type") }
@@ -151,7 +140,6 @@ fn _help(c: Ctx, at: int) -> str? {
     return c.bag.items[at].help
 }
 
-# `x != null`, the condition every narrowing test is built from.
 fn _not_null(c: Ctx, symbol: Symbol) -> Node {
     return Node.binary(OpKind.Ne, _use(c, symbol), Node.null_lit())
 }
@@ -185,8 +173,6 @@ fn test_an_annotated_bind_pattern_takes_the_annotation() -> void {
 }
 
 fn test_an_unresolvable_annotation_reads_as_any() -> void {
-    # The default `resolve_ast_type` answers null, and `jaiChkOrAny` turns that
-    # into `any` rather than falling back to the subject.
     let c = _ctx()
     let pat = Node.bind("n", TypeExpr.named("Whatever"))
     pattern(c, pat, c.universe.t_str)
@@ -208,7 +194,6 @@ fn test_one_name_bound_twice_in_a_pattern_is_reported_once() -> void {
     assert_eq(c.bag.items.len(), 1)
     assert_eq(_code(c, 0), E0503_DUPLICATE_BINDING_IN_PATTERN)
     assert_eq(_message(c, 0), "`x` is bound twice in the same pattern")
-    # The second points back at the first.
     assert_eq(c.bag.items[0].labels[0][1], "first bound here")
 }
 
@@ -221,7 +206,6 @@ fn test_underscore_may_be_bound_as_often_as_it_likes() -> void {
 
 fn test_each_or_alternative_binds_in_its_own_scope() -> void {
     let c = _ctx()
-    # `A(x) | B(x)` binds the same name twice by design.
     let pat = _seq(NodeKind.PatOr, [Node.bind("x"), Node.bind("x")])
     pattern(c, pat, c.universe.t_int)
     assert_eq(c.bag.items.len(), 0)
@@ -265,8 +249,6 @@ fn test_a_rest_element_suppresses_the_tuple_arity_check() -> void {
     let pat = _seq(NodeKind.PatTuple, [Node.bind("a"), rest], 1)
     pattern(c, pat, tuple_of(u, [u.t_int, u.t_str, u.t_str]))
     assert_eq(c.bag.items.len(), 0)
-    # `...rest` collects the remainder, so it is a list of elements — and for a
-    # tuple the element is asked for with no position, which is `any`.
     assert_eq(render(c.type_of(rest)), "list[any]")
 }
 
@@ -303,7 +285,6 @@ fn test_a_literal_pattern_that_can_never_match_is_reported() -> void {
 fn test_a_literal_pattern_that_fits_either_way_is_accepted() -> void {
     let c = _ctx()
     let u = c.universe
-    # `1` against `int?` fits one way; that is enough.
     let pat = Node(NodeKind.PatLiteral, {"value": Node.int_lit(1)})
     pattern(c, pat, optional_of(u, u.t_int))
     assert_eq(c.bag.items.len(), 0)
@@ -354,8 +335,6 @@ fn test_a_class_pattern_sees_inherited_fields_parents_first() -> void {
     let second = Node.bind("b")
     let pat = Node(NodeKind.PatClass, {"typeName": "Circle", "subPatterns": [first, second]})
     pattern(c, pat, _ty(derived))
-    # `layoutClassFields` in the C copies a parent's entries in ahead of the
-    # child's, and that order is what a positional pattern indexes.
     assert_eq(c.bag.items.len(), 0)
     assert_eq(render(c.type_of(first)), "int")
     assert_eq(render(c.type_of(second)), "float")
@@ -449,7 +428,6 @@ fn test_a_class_pattern_naming_an_unknown_type_is_reported() -> void {
     pattern(c, pat, c.universe.t_int)
     assert_eq(_code(c, 0), E0402_UNKNOWN_TYPE)
     assert_eq(_message(c, 0), "unknown type `Nowhere` in pattern")
-    # The sub-patterns are still walked, so a name inside one is still bound.
     assert_eq(render(c.type_of(inner)), "any")
 }
 
@@ -516,8 +494,6 @@ fn test_a_static_member_is_not_a_variant() -> void {
     let c = _ctx()
     let decl = _enum(c, "Colour")
     _variant(c, decl, "Red", _no_payload())
-    # Past `variant_count` the field list holds statics, which a pattern cannot
-    # match: the C tests the index against `variantCount` for exactly this.
     decl.fields.push(FieldInfo("DEFAULT", c.universe.t_int))
     let pat = Node(NodeKind.PatEnum, {"typeName": "Colour", "variantName": "DEFAULT"})
     pattern(c, pat, _ty(decl))
@@ -530,7 +506,6 @@ fn test_an_enum_pattern_finds_its_declaration_through_the_subject() -> void {
     decl.is_enum = true
     decl.ty = named(c.universe, TyKind.Enum, "Colour", decl)
     _variant(c, decl, "Red", _no_payload())
-    # Deliberately not registered: the subject is the only route to it.
     let pat = Node(NodeKind.PatEnum, {"typeName": "Colour", "variantName": "Red"})
     pattern(c, pat, _ty(decl))
     assert_eq(c.bag.items.len(), 0)
@@ -541,7 +516,6 @@ fn test_an_enum_pattern_finds_its_declaration_through_the_subject() -> void {
 # ------------------------------------------------------------------
 fn test_an_expression_in_pattern_position_keeps_its_own_type() -> void {
     let c = _ctx()
-    # A destructuring assignment target reuses expression nodes.
     let target = _binding(c, "n", c.universe.t_int)
     pattern(c, target, c.universe.t_str)
     assert_eq(render(c.type_of(target)), "int")
@@ -605,8 +579,6 @@ fn test_an_unknown_subject_is_not_evidence_of_a_missing_arm() -> void {
         ),
     ]
     let node = Node(NodeKind.MatchExpr, {"subject": Node.ident("mystery"), "arms": arms})
-    # Nothing was reported for the coverage, so the arms are taken at their word
-    # here too rather than infecting the result with `| null`.
     assert_eq(render(match_expr(c, node, false)), "str")
 }
 
@@ -683,10 +655,6 @@ fn test_only_a_catch_all_is_subsumed_by_a_catch_all() -> void {
     ]
     let node = Node(NodeKind.Match, {"subject": Node.int_lit(1), "arms": arms})
     match_expr(c, node, true)
-    # `patternCovered` consults `sawCatchAll` only for a wildcard or a binding;
-    # every other shape is asked about its own kind of coverage, so a literal
-    # after a catch-all goes unreported. That is the C's behaviour and not an
-    # oversight of this port.
     assert_eq(c.bag.items.len(), 0)
 }
 
@@ -715,7 +683,6 @@ fn test_a_guarded_arm_does_not_cover_its_pattern() -> void {
     let arms = [guarded, match_arm(Node.bind("y"), Node.int_lit(1))]
     let node = Node(NodeKind.Match, {"subject": Node.int_lit(1), "arms": arms})
     match_expr(c, node, true)
-    # The guard may be false, so the second arm is still reachable.
     assert_eq(c.bag.items.len(), 0)
 }
 
@@ -829,9 +796,6 @@ fn test_an_arm_body_cannot_leak_a_narrowing_into_the_next_arm() -> void {
     let c = _ctx()
     let u = c.universe
     let symbol = _symbol(c, "v", optional_of(u, u.t_int))
-    # A bare `if` whose `then` diverges deliberately leaves its else-edge facts
-    # applied for whatever follows; the arm's own restore is what stops that
-    # from being the next arm.
     let guard = Node.if_stmt(_is_null(c, symbol), Node.block([Node.return_stmt()]))
     let after = _use(c, symbol)
     let arms = [
@@ -850,10 +814,6 @@ fn test_a_pattern_binding_rebinds_its_symbol_outright() -> void {
     let pat = Node.bind("v")
     c.resolution.bind(pat, symbol)
     pattern(c, pat, u.t_str)
-    # A binding is a declaration, not a fact: it writes `Symbol.type` directly
-    # and the narrowing save stack never sees it, so no `narrow_restore` undoes
-    # it. Nothing outer is clobbered in practice because the resolver gives a
-    # pattern its own symbol in its own scope.
     assert_eq(render(c.symbol_type(symbol)), "str")
 }
 
@@ -876,7 +836,6 @@ fn test_an_unannotated_var_initialised_to_null_is_any() -> void {
     let c = _ctx()
     let node = Node.var_decl(DeclKind.Var, Node.bind("v"), null, Node.null_lit())
     stmt(c, node)
-    # Pinning it to `null` would reject every later assignment.
     assert_eq(render(c.type_of(node)), "any")
 }
 
@@ -892,7 +851,6 @@ fn test_an_annotation_wins_over_the_initialiser() -> void {
     let node = Node.var_decl(DeclKind.Let, Node.bind("x"), TypeExpr.named("float"), Node.int_lit(1))
     stmt(c, node)
     assert_eq(render(c.type_of(node)), "float")
-    # §2.2: the int literal is respelled rather than reported.
     assert_eq(c.bag.items.len(), 0)
     assert_true(node.child("init")?.kind == NodeKind.FloatLit)
 }
@@ -922,8 +880,6 @@ fn test_a_const_is_folded_and_kept_for_its_uses() -> void {
     c.resolution.bind(node, symbol)
     stmt(c, node)
     assert_eq(c.bag.items.len(), 0)
-    # The initialiser became the literal, and the value is where a use can find
-    # it: `Ctx.consts` is this port's `Symbol.constValue`.
     assert_true(init.kind == NodeKind.IntLit)
     assert_eq(init.number("intLit"), 5)
     assert_eq(const_eval(c.consts["K"]).as_int(), 5)
@@ -962,12 +918,9 @@ fn test_a_const_with_no_initialiser_is_reported() -> void {
 
 fn test_an_overflowing_const_reports_rather_than_falling_silent() -> void {
     let c = _ctx()
-    # A `const` is the one place a failed fold is worth E0900: elsewhere the VM
-    # raises at run time and the checker leaves the expression alone.
     let init = Node.binary(OpKind.Pow, Node.int_lit(2), Node.int_lit(70))
     stmt(c, Node.var_decl(DeclKind.Const, Node.bind("K"), null, init))
     assert_eq(_code(c, 0), "E0900")
-    # And E0303 is not piled on top of it.
     assert_eq(c.bag.items.len(), 1)
 }
 
@@ -981,10 +934,7 @@ fn test_a_store_is_checked_against_the_declaration_not_the_narrowing() -> void {
     let after = _use(c, symbol)
     let then = Node.block([Node.assign(_use(c, symbol), Node.null_lit()), Node.expr_stmt(after)])
     stmt(c, Node.if_stmt(_not_null(c, symbol), then))
-    # Inside `if v != null` the binding reads `int`, but the store is into the
-    # `int?` the declaration promised, so it is legal...
     assert_eq(c.bag.items.len(), 0)
-    # ...and it ends the fact.
     assert_eq(render(c.type_of(after)), "int?")
 }
 
@@ -1251,7 +1201,6 @@ fn test_the_false_edge_of_a_disjunction_narrows_both_operands() -> void {
         Node.block([Node.expr_stmt(a_use), Node.expr_stmt(b_use)])
     )
     stmt(c, node)
-    # `a or b` proves nothing when true, but `not (a or b)` proves both parts.
     assert_eq(render(c.type_of(a_use)), "int")
     assert_eq(render(c.type_of(b_use)), "str")
 }
@@ -1264,7 +1213,6 @@ fn test_a_diverging_guard_narrows_the_rest_of_the_block() -> void {
     let guard = Node.if_stmt(_is_null(c, symbol), Node.block([Node.return_stmt()]))
     block(c, Node.block([guard, Node.expr_stmt(after)]))
     assert_eq(render(c.type_of(after)), "int")
-    # The block put the declaration back when it ended.
     assert_eq(render(c.symbol_type(symbol)), "int?")
 }
 
@@ -1349,8 +1297,6 @@ fn test_a_for_body_cannot_leak_a_narrowing_past_the_loop() -> void {
     let guard = Node.if_stmt(_is_null(c, symbol), Node.block([Node.return_stmt()]))
     let over = _binding(c, "xs", list_of(u, u.t_str))
     let after = _use(c, symbol)
-    # The loop body is a bare `if`, so nothing but `check_for`'s own restore
-    # stands between its else-edge facts and the statement after the loop.
     let iteration = Node.for_stmt(Node.bind("i"), over, guard)
     block(c, Node.block([iteration, Node.expr_stmt(after)]))
     assert_eq(render(c.type_of(after)), "int?")
@@ -1505,7 +1451,6 @@ fn test_is_init_method_names_only_the_constructor() -> void {
     assert_true(is_init_method(Node.fn_decl("init", [], Node.block([]))))
     assert_false(is_init_method(Node.fn_decl("area", [], Node.block([]))))
     assert_false(is_init_method(null))
-    # A lambda has no name at all, so it is never one either.
     assert_false(is_init_method(Node(NodeKind.Lambda, {"name": "init"})))
 }
 
@@ -1515,7 +1460,6 @@ fn test_an_unannotated_result_is_any_and_a_constructor_is_void() -> void {
     assert_true(declared_return_type(c, plain, false) == c.universe.t_any)
     let ctor = Node.fn_decl("init", [param("self")], Node.block([]))
     assert_true(declared_return_type(c, ctor, true) == c.universe.t_void)
-    # Only as a method: a free function called `init` returns `any`.
     assert_true(declared_return_type(c, ctor, false) == c.universe.t_any)
 }
 
@@ -1531,7 +1475,6 @@ fn test_a_method_signature_drops_its_receiver() -> void {
     let params = [param("self"), param("n", TypeExpr.named("int"))]
     let node = Node.fn_decl("scale", params, Node.block([]), TypeExpr.named("int"))
     assert_eq(render(function_type(c, node, true)), "fn(int) -> int")
-    # As a free function the receiver is just another parameter.
     assert_eq(render(function_type(c, node, false)), "fn(any, int) -> int")
 }
 
@@ -1627,8 +1570,6 @@ fn test_a_generic_bound_is_resolved_with_the_parameter_in_scope() -> void {
     }
     c.resolve_ast_type = record
     push_generics(c, [{"name": "T", "bound": TypeExpr.named("Comparable"), "span": Span.none()}])
-    # `[T: Comparable[T]]` has to see itself, so the parameters go in first and
-    # the bounds are resolved afterwards.
     assert_eq(seen, ["Comparable"])
     assert_eq(render(c.scoped_type_name("T")), "T")
 }
@@ -1704,7 +1645,6 @@ fn test_install_lets_an_expression_reach_a_match() -> void {
     let c = _ctx()
     let arms = [match_arm(Node.bind("other"), Node.str_lit("x"))]
     let node = Node(NodeKind.MatchExpr, {"subject": Node.int_lit(1), "arms": arms})
-    # Without `install` the default answers `any` and checks nothing.
     assert_eq(render(expr(c, node)), "str")
 }
 
@@ -1739,7 +1679,6 @@ fn test_install_types_and_checks_a_lambda_in_expression_position() -> void {
         }
     )
     assert_eq(render(expr(c, node)), "fn(int) -> str")
-    # And the body went through `function`, not merely the signature.
     assert_eq(_code(c, 0), E0408_RETURN_TYPE_MISMATCH)
 }
 

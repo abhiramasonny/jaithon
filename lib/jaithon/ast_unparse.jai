@@ -22,8 +22,6 @@ from jaithon.ast import CompKind, DeclKind, Node, NodeKind, OpKind, TypeExpr, Ty
 from jaithon.ast import is_expression, is_pattern, kind_name, op_text
 from std.str import StringBuilder, escape, quote, repeat
 
-# Typed reads of a sub-structure's fields. Private copies of ast.jai's own
-# `_flag`/`_text_at`/`_node_at`/`_type_at` -- see the file comment above.
 fn _flag(record: dict[str, any], name: str) -> bool {
     let value: bool = record.get(name, false)
     return value
@@ -44,9 +42,6 @@ fn _type_at(record: dict[str, any], name: str) -> TypeExpr? {
     return value
 }
 
-# Precedence levels, from §4.1 of the language spec. A child is parenthesised
-# exactly when its level is below the level its position requires, which is what
-# makes `to_source` round-trip without wrapping everything in brackets.
 const _P_ATOM = 17
 const _P_POSTFIX = 16
 const _P_POW = 15
@@ -182,7 +177,6 @@ class _Printer {
         self.out.push(text)
     }
 
-    # A blank line stays blank: the indent is only written once something else is.
     fn line(self) -> void {
         self.out.push("\n")
         self.indent_pending = true
@@ -216,8 +210,6 @@ class _Printer {
         self.emit("}")
     }
 
-    # A branch is a block in every tree the parser builds; anything else still
-    # has to print inside braces to parse back as one statement.
     fn body(self, node: Node?) -> void {
         if node is null {
             self.emit("{}")
@@ -362,8 +354,6 @@ class _Printer {
         self.expr(node.child("value"), _P_LOWEST)
     }
 
-    # `elif` is an else branch that is itself an `if`; `else { if ... }` keeps
-    # its block and so keeps its braces.
     fn conditional(self, node: Node) -> void {
         self.emit("if ")
         self.expr(node.child("cond"), _P_LOWEST)
@@ -524,8 +514,6 @@ class _Printer {
         self.emit("}")
     }
 
-    # Members are separated by a blank line; `written` says whether anything is
-    # above them already.
     fn members(self, nodes: list[Node], keyword: str, written: bool) -> bool {
         var any_written = written
         for member in nodes {
@@ -600,22 +588,12 @@ class _Printer {
 
     fn expr(self, node: Node?, min_precedence: int) -> void {
         if node is null { return }
-        # A sign-leading literal is one token, not an operator and a number
-        # (§1.6: `-9223372036854775808` is the only one, since every other
-        # negative literal parses as `-` applied to a positive one). Let any
-        # operator stand in front of it and that minus binds to the operator
-        # instead, leaving digits that overflow `int`: `- -9223372036854775808`
-        # and `1 - -9223372036854775808` are both rejected. Brackets are the
-        # only spelling that survives in every position, so it always wears
-        # them.
         let wrap = _precedence(node) < min_precedence or _is_signed_literal(node)
         if wrap { self.emit("(") }
         self.bare_expr(node)
         if wrap { self.emit(")") }
     }
 
-    # `1.foo` would lex as a float, so an integer receiver keeps its brackets
-    # even though its precedence says it needs none.
     fn receiver(self, node: Node?) -> void {
         if node is not null and node.kind == NodeKind.IntLit {
             self.emit("(")
@@ -660,10 +638,6 @@ class _Printer {
             NodeKind.Index => {
                 self.receiver(node.child("object"))
                 self.emit("[")
-                # `a[x, y]` parses to a tuple index, and the two spell the same
-                # tree — but `Dict[K, V]` is how a generic instantiation is
-                # written, so print the bare list and not `Dict[(K, V)]`. A
-                # one-element tuple keeps its brackets: `a[x,]` is not `a[x]`.
                 let subscript = node.child("index")
                 if subscript is not null and
                     subscript.kind == NodeKind.TupleLit and
@@ -693,7 +667,6 @@ class _Printer {
             }
             NodeKind.IfExpr => { self.conditional(node) }
             NodeKind.Match | NodeKind.MatchExpr => { self.match_node(node) }
-            # The checker inserts casts; they have no syntax of their own.
             NodeKind.Cast => { self.bare_expr(node.require("operand")) }
             NodeKind.Yield => {
                 self.emit("yield")
@@ -727,14 +700,12 @@ class _Printer {
             if index > 0 { self.emit(", ") }
             self.expr(item, _P_LOWEST)
         }
-        # `(x)` is just `x`; a one-element tuple needs its trailing comma.
         if tuple_comma and items.len() == 1 { self.emit(",") }
         self.emit(close)
     }
 
     fn set_lit(self, node: Node) -> void {
         let items = node.child_list("items")
-        # `{}` is the empty dict, so the empty set has to be spelled as a call.
         if items.len() == 0 {
             self.emit("set()")
             return
@@ -764,8 +735,6 @@ class _Printer {
             return
         }
         self.emit(op_text(op))
-        # `- -x`: without the space the two signs would read as one token. A
-        # sign-leading *literal* needs no space here — `expr` brackets it.
         if _leads_with_sign(operand) { self.emit(" ") }
         self.expr(operand, _P_UNARY)
     }
@@ -774,17 +743,11 @@ class _Printer {
         let op = node.op()
         let level = _OP_PRECEDENCE[op]
         if op == OpKind.Pow {
-            # `**` is the one right-associative binary operator, and its left
-            # operand may only be a postfix expression.
             self.expr(node.child("left"), _P_POSTFIX)
             self.emit(" ** ")
             self.expr(node.child("right"), _P_UNARY)
             return
         }
-        # Comparison is chained, not left-associative (§4.2): printing the left
-        # operand of `(a > b) != c` without its brackets would re-parse as the
-        # three-operand chain `a > b and b != c`, a different program. Every
-        # other level is left-associative and needs no bracket on the left.
         let left_level = if level == _P_COMPARE { level + 1 } else { level }
         self.expr(node.child("left"), left_level)
         self.emit(" " + op_text(op) + " ")
@@ -858,7 +821,6 @@ class _Printer {
             self.emit(" for ")
             self.pattern(_node_at(clause, "pattern"))
             self.emit(" in ")
-            # A ternary iterable would swallow the clause's own `if`.
             self.expr(_node_at(clause, "iterable"), _P_COALESCE)
             for condition in clause.get("conditions", []) {
                 self.emit(" if ")
@@ -984,8 +946,6 @@ fn _is_block_decl(node: Node) -> bool {
     return node.kind in _BLOCK_DECLARATIONS
 }
 
-# Whether a class pattern named its fields, `Point{x: a}`, rather than matching
-# them positionally, `Point(a)`.
 fn _has_field_names(names: list[str?]) -> bool {
     for name in names {
         if name is not null { return true }
@@ -1009,17 +969,11 @@ fn _type_source(type_expr: TypeExpr?) -> str {
     return type_expr.to_source()
 }
 
-# True when `node` renders as a `-` or `+` applied to something, so that a
-# prefix `-` or `+` in front of it needs a space to stay a token of its own.
 fn _leads_with_sign(node: Node?) -> bool {
     if node is null or node.kind != NodeKind.Unary { return false }
     return node.op() == OpKind.Neg or node.op() == OpKind.Pos
 }
 
-# A literal whose own text opens with a sign. `expr` brackets one wherever it
-# appears, because a space in front is not enough: the sign has to stay part of
-# the token. `freeze_literals` rewrites a literal into an `Ident` holding its
-# spelling, so that shape counts too.
 fn _is_signed_literal(node: Node?) -> bool {
     if node is null { return false }
     match node.kind {
@@ -1040,7 +994,6 @@ fn _float_source(value: float) -> str {
     return text + ".0"
 }
 
-# The literal chunks of an f-string carry their braces doubled.
 fn _fstring_chunk(text: str) -> str {
     let out = StringBuilder()
     for character in text {
@@ -1055,8 +1008,6 @@ fn _fstring_chunk(text: str) -> str {
     return out.build()
 }
 
-# The parser rewrites `{x:.2f}` into `x.__format__(".2f")`; recover the spec so
-# that the hole prints the way it was written.
 fn _format_spec(node: Node) -> str? {
     if node.kind != NodeKind.Call { return null }
     let callee = node.child("callee")

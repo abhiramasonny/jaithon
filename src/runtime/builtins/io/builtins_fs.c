@@ -13,9 +13,6 @@
  * path.
  */
 
-/* Feature macros must precede every include: setenv, getcwd and chdir are
- * POSIX, not C11, and _DARWIN_C_SOURCE puts back what asking for POSIX takes
- * away on macOS. */
 #if !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
@@ -60,7 +57,7 @@ static bool environSnapshot(Value *out) {
     bool ok = true;
     for (char **entry = environ; ok && entry != NULL && *entry != NULL; entry++) {
         const char *equals = strchr(*entry, '=');
-        if (equals == NULL) continue;    /* not a NAME=VALUE binding */
+        if (equals == NULL) continue;
         size_t nameLen = (size_t)(equals - *entry);
 
         ObjString *key = jaiStringNew(*entry, nameLen);
@@ -83,8 +80,6 @@ static bool environSnapshot(Value *out) {
     return true;
 }
 
-/* os_env() is the whole environment, os_env(name) reads one variable, and
- * os_env(name, value) writes it — with a null value removing it. */
 static bool nOsEnv(int argc, Value *args, Value *out) {
     if (argc == 0) return environSnapshot(out);
 
@@ -123,10 +118,6 @@ static bool nOsEnv(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The command line is not something libc hands back portably, so the CLI
- * publishes it as the builtin global `__argv__` — the same list spec §8.4
- * hands to main(). Until it does, the executable path is all there is to
- * report truthfully. */
 static bool nOsArgv(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -160,20 +151,6 @@ static bool nOsArgv(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* __prim__.module_path() -> list[str]
- *
- * The directories an import resolves against, exactly as this binary resolves
- * them: JAITHON_PATH, whatever -I added, and the library directories derived
- * from the executable's own location. `vm.modulePath` already mirrors all of
- * that for reflection (src/runtime/modules/module.c:152).
- *
- * The self-hosted front end needs it to resolve an import the same way the C
- * front end does. Without it, it was reduced to guessing from the importing
- * file's ancestors — which cannot find `lib` from `tests/lang`, and which no
- * heuristic fixes in general, because the answer depends on where the binary
- * was installed rather than on where the source sits. Two front ends that
- * disagree about where a module lives disagree about everything downstream of
- * it. */
 static bool nModulePath(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
@@ -303,8 +280,6 @@ static bool nIoMkdir(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* remove() unlinks a file and removes an empty directory, which is exactly the
- * pair a caller means by "remove this path". */
 static bool nIoRemove(int argc, Value *args, Value *out) {
     (void)argc;
     ObjString *path;
@@ -343,13 +318,6 @@ static bool nIoRename(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* io_stat answers null for a path that is not there rather than raising:
- * Path.exists() is written over it, and an exception is not an answer to
- * "is anything here". lstat by default, because the spec's four kinds include
- * "link" and a symlink has to be distinguishable from what it points at; the
- * second argument asks for stat instead, which is what "is a directory here"
- * means — `/tmp` is a link to `/private/tmp` on macOS and answering "link" to
- * `Path("/tmp").is_dir()` made every tool that writes under it fail. */
 static bool nIoStat(int argc, Value *args, Value *out) {
     ObjString *path;
     if (!jaiArgString(args[0], 1, "io_stat", &path)) return false;
@@ -432,12 +400,6 @@ void jaiRegisterOSPrimitives(void) {
     jaiDefineNative("__prim__.os_chdir",    nOsChdir,    1, 1);
     jaiDefineNative("__prim__.os_platform", nOsPlatform, 0, 0);
 
-    /* The filesystem group is `io_*` in Appendix C, not `os_*`: `os_` is env,
-     * argv, exit, cwd, chdir and the platform name; `os_spawn` is registered
-     * by builtins_process.c's jaiRegisterProcessPrimitives instead, alongside
-     * the rest of the child-process machinery it belongs with. `exists` and
-     * `is_dir` are not primitives — std.io derives both from io_stat, and it
-     * derives path joining and the temp directory the same way. */
     jaiDefineNative("__prim__.io_listdir", nIoListdir, 1, 1);
     jaiDefineNative("__prim__.io_mkdir",   nIoMkdir,   1, 2);
     jaiDefineNative("__prim__.io_remove",  nIoRemove,  1, 1);

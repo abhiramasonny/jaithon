@@ -250,7 +250,6 @@ pub class UI {
         self.canvas.fill_rounded_rect(x, box_y, CHECKBOX_SIZE, CHECKBOX_SIZE, 3, face)
         self.canvas.rounded_rect(x, box_y, CHECKBOX_SIZE, CHECKBOX_SIZE, 3, self.theme.border)
         if result {
-            # A tick, drawn as two thick strokes so it reads at 16 pixels.
             let left = x + 4
             let middle = x + 7
             let right = x + 12
@@ -318,7 +317,6 @@ pub class UI {
         let inner_width = width - 2 * _PADDING
         if hovering and self.input.mouse.just_pressed(MouseButton.Left) {
             self.focused = id
-            # Put the caret at the nearest character boundary to the click.
             let column = (self.input.mouse.x() - inner_x + _ADVANCE // 2) // _ADVANCE
             self.caret = min(max(column, 0), value.len())
         }
@@ -329,7 +327,6 @@ pub class UI {
         self.canvas.fill_rounded_rect(x, y, width, WIDGET_HEIGHT, 4, face)
         let outline = if focused { self.theme.accent } else { self.theme.border }
         self.canvas.rounded_rect(x, y, width, WIDGET_HEIGHT, 4, outline)
-        # Keep the caret on screen by sliding the whole string left.
         let caret_offset = self.caret * _ADVANCE
         let scroll = if focused { max(caret_offset - inner_width, 0) } else { 0 }
         let text_y = y + (WIDGET_HEIGHT - GLYPH_HEIGHT) // 2
@@ -362,8 +359,6 @@ pub class UI {
         return inside
     }
 
-    # One frame of editing for the focused field. Every key that moves or
-    # deletes honours auto-repeat, so holding one down keeps going.
     fn _edit(self, value: str) -> str {
         var result = value
         var caret = min(self.caret, result.len())

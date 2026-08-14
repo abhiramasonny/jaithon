@@ -27,7 +27,6 @@ function symbolKind(symbol) {
     return SYMBOL_KIND[symbol.kind] ?? vscode.SymbolKind.Variable;
 }
 
-/** Byte offset of a document position, measured against the analysed text. */
 function byteOffsetAt(analysis, position) {
     const starts = analysis.offsets.lineStarts;
     if (position.line >= starts.length) return analysis.offsets.byte(analysis.text.length);
@@ -56,7 +55,6 @@ function definitionProvider(workspace) {
             if (!context || !context.hit) return null;
             const { analysis, hit } = context;
 
-            // A module name or an import path opens the file it names.
             const modulePath = hit.ref?.modulePath || hit.symbol?.modulePath;
             if (modulePath && (hit.ref?.kind === 'module-path' || hit.symbol?.kind === 'module')) {
                 const file = workspace.moduleFile(modulePath, analysis.fsPath);
@@ -96,7 +94,6 @@ function typeDefinitionProvider(workspace) {
     };
 }
 
-/** Classes that extend a class, or implement a trait. */
 function implementationProvider(workspace) {
     return {
         async provideImplementation(document, position, token) {
@@ -107,8 +104,6 @@ function implementationProvider(workspace) {
             const target = hit.symbol || (await workspace.definitionOf(analysis, hit.ref, token))?.symbol;
             if (!target) return null;
 
-            // A method on a trait is implemented by the same method on every
-            // class that lists the trait; a type is implemented by its subtypes.
             const owner = target.kind === 'method' && target.container !== null
                 ? analysis.symbols[target.container] : target;
             if (!owner || owner.members === undefined) return null;
@@ -136,14 +131,7 @@ function implementationProvider(workspace) {
 // References and rename
 // ---------------------------------------------------------------------------
 
-/**
- * Every use of `symbol`. A name is only followed into other files when it can
- * escape its own — anything local stays local, which keeps the common case to
- * one parse.
- */
 async function referencesTo(workspace, home, symbol, token) {
-    // An alias is this module's own name for something. Its uses are uses of
-    // the alias, and they stay put when the thing it names is renamed.
     if (symbol.kind === 'import' && symbol.aliased) {
         return home.refs
             .filter((ref) => ref.name === symbol.name && ref.kind === 'value'
@@ -164,8 +152,6 @@ async function referencesTo(workspace, home, symbol, token) {
 
         for (const ref of analysis.refs) {
             if (ref.name !== symbol.name) continue;
-            // `bench_main` in `import main as bench_main` resolves through to
-            // `main`, but writing the new name there would break the import.
             const bound = ref.kind === 'value' ? analysis.lookup(ref.name, ref.scope) : null;
             if (bound && bound.aliased && bound.index !== symbol.index) continue;
 
@@ -175,8 +161,6 @@ async function referencesTo(workspace, home, symbol, token) {
             out.push({ analysis, start: ref.start, end: ref.end });
         }
         for (const other of analysis.symbols) {
-            // A plain `import` of the name is a use of it too. An aliased one
-            // carries a reference of its own for the name it imports.
             if (other.kind !== 'import' || other.aliased || other.name !== symbol.name) continue;
             const followed = await workspace.follow(analysis, other, token);
             if (followed && followed.analysis.fsPath === home.fsPath
@@ -208,11 +192,6 @@ function referenceProvider(workspace) {
     };
 }
 
-/**
- * What renaming here should actually move. Everything follows an import
- * through to the declaration it names, except an alias: `bench_main` is this
- * module's own name, and renaming it must not touch the module it came from.
- */
 function renameTarget(analysis, hit) {
     if (hit.symbol) return { analysis, symbol: hit.symbol };
     if (hit.ref?.kind !== 'value') return null;
@@ -336,8 +315,6 @@ function documentSymbolProvider(workspace) {
                 if (parent) parent.children.push(item); else roots.push(item);
             }
 
-            // Module-level `let`/`var`/`const` are part of the outline too, but
-            // only at the top: a local in a function body is noise.
             for (const symbol of analysis.symbols) {
                 if (symbol.kind !== 'variable' || symbol.scope !== analysis.moduleScope) continue;
                 roots.push(new vscode.DocumentSymbol(
@@ -352,9 +329,6 @@ function documentSymbolProvider(workspace) {
     };
 }
 
-// Cmd+T is asked to answer on every keystroke over the whole tree, so it reads
-// declaration lines with a regex rather than parsing hundreds of files. The
-// shape it matches is exactly what the formatter guarantees.
 const DECLARATION_RE =
     /^([ \t]*)(?:(pub|prot)\s+)?(?:(static)\s+)?(fn|class|trait|enum|type|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)/;
 
@@ -433,8 +407,6 @@ function foldingProvider(workspace) {
                 });
             }
 
-            // Comment runs and the import block fold on text alone, so they keep
-            // working while the file does not parse.
             let commentStart = -1;
             let importStart = -1;
             for (let line = 0; line < document.lineCount; line++) {
@@ -460,7 +432,6 @@ function foldingProvider(workspace) {
     };
 }
 
-/** Expand-selection walks out through the tree rather than through brackets. */
 function selectionRangeProvider(workspace) {
     return {
         async provideSelectionRanges(document, positions, token) {

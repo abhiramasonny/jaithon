@@ -33,8 +33,6 @@ pub fn superinstructions(proto: FuncProto) -> int {
 #: decode is the caller's job.
 pub fn superinstructions_on(code: Code) -> int {
     var changes = 0
-    # Every fusion deletes at least one instruction, so the scan drains on its
-    # own; the guard is insurance against a future rule that does not.
     var guard = 8 * code.count() + 64
     var index = first_live(code)
     while index >= 0 and guard > 0 {
@@ -44,32 +42,17 @@ pub fn superinstructions_on(code: Code) -> int {
             continue
         }
         changes += 1
-        # The window head always survives a fusion, so backing up one lets the
-        # closed hole open a window for the instruction in front of it (chains
-        # GET_LOCAL2 into ADD_LOCALS).
         let back = prev_live(code, index)
         if back >= 0 { index = back }
     }
     return changes
 }
 
-# Greedy longest match at one instruction. The window is decoded once, four
-# deep, and every rule below tests a prefix of it: `n` is how much of it exists
-# and `window_clean`'s third argument is how much of it the rule rewrites.
 fn _fuse_at(code: Code, index: int) -> bool {
     let w = window_of(code, index, 4)
     let n = w.len()
     let head = code.data[index]
 
-    # GET_LOCAL a; <int k>; ADD; BIND a  ->  INC_LOCAL a, k.
-    #
-    # Matches BIND, not SET_LOCAL;POP (the emitter never emits that for a
-    # store-and-discard) -- `i += 1`, the hottest pair measured, went unfused
-    # until this matched it.
-    #
-    # SUB is not folded in as INC_LOCAL a, -k: for non-numbers both raise, but
-    # INC_LOCAL's slow path only adds, so `y -= 1` on a str used to report the
-    # wrong operator in its error. Folding `-=` back in needs an operator byte.
     if n >= 4 and head.op == opcode(Op.GetLocal) and window_clean(code, w, 4) {
         let arith = code.data[w[2]]
         let store = code.data[w[3]]
@@ -85,8 +68,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
-    # ADD_INT_CONST a, k; BIND a  ->  INC_LOCAL a, k. Catches the increment left
-    # behind when the three-instruction form fused first.
     if n >= 2 and head.op == opcode(Op.AddIntConst) and window_clean(code, w, 2) {
         let store = code.data[w[1]]
         let delta = read_i16(head.operands, 2)
@@ -97,18 +78,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
-    # A local compared against a constant, branched on:
-    #
-    #     GET_LOCAL a; <const k>; <cmp>; JUMP_IF_FALSE J
-    #     GET_LOCAL a; <const k>; JUMP_IF_CMP_FALSE cmp, J
-    #     CMP_LOCAL_CONST_LT a, k; JUMP_IF_FALSE J
-    #
-    # all collapse to JUMP_IF_CMP_LOCAL_K cmp, a, k, J. Three rules catch the
-    # same shape at three fixpoint stages, since a rule that only matched the
-    # raw form would miss a window whose head is reached in a later round.
-    #
-    # K is a pool index, not an immediate, because OP_CMP_LOCAL_CONST_LT's
-    # immediate form can't express e.g. `i < 5_000_000`.
     if n >= 4 and
         head.op == opcode(Op.GetLocal) and
         window_clean(code, w, 4) and
@@ -164,14 +133,10 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
-    # GET_LOCAL a; GET_FIELD k, c  ->  GET_FIELD_LOCAL a, k, c. `self.x`: the
-    # most frequently executed pair in the benchmark suite by a wide margin, and
-    # the most frequent one statically too.
     if n >= 2 and
         head.op == opcode(Op.GetLocal) and
         window_clean(code, w, 2) and
         code.data[w[1]].op == opcode(Op.GetField) {
-        # The u16 slot, then GET_FIELD's own u24 name and u16 cache verbatim.
         set_instr(
             head,
             opcode(Op.GetFieldLocal),
@@ -181,25 +146,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         return true
     }
 
-    # FOR_ITER J; UNPACK 2 255; BIND a; BIND b  ->  FOR_ITER_PAIR J, a, b.
-    #
-    # `for (a, b) in <anything>` lowers to exactly these four, whatever the
-    # receiver is — a dict's items, a list of tuples, `enumerate`, a user
-    # iterator. Matching the BYTECODE rather than the loop pattern is what makes
-    # one rule cover all of them: the emitter has no checker types (see its own
-    # note) and cannot tell a dict from a user class that defines `items()`,
-    # while this window is the same shape either way.
-    #
-    # `UNPACK 2` pushes right to left, so the leftmost target is on top and the
-    # FIRST `BIND` takes it. That is where the slots come from — reading them
-    # off the two BINDs rather than off the pattern, which is not in source
-    # order relative to the slots the resolver assigns.
-    #
-    # Only the exact `2, no rest` form: `for (a, *rest) in xs` has a rest index
-    # and must keep building its list.
-    #
-    # Longest match first, so it is tested ahead of FOR_ITER; BIND — which
-    # cannot match this window anyway, since w[1] is the UNPACK.
     if n >= 4 and
         head.op == opcode(Op.ForIter) and
         window_clean(code, w, 4) and
@@ -212,19 +158,15 @@ fn _fuse_at(code: Code, index: int) -> bool {
         set_instr(
             head,
             opcode(Op.ForIterPair),
-            # The first u16 is patched by `rebuild` from `target`.
-            u16_bytes(0)
-                + u16_bytes(slot_of(code.data[w[2]], 0))
-                + u16_bytes(slot_of(code.data[w[3]], 0))
+            u16_bytes(0) +
+                u16_bytes(slot_of(code.data[w[2]], 0)) +
+                u16_bytes(slot_of(code.data[w[3]], 0))
         )
         head.target = target
         kill_all(code, [w[1], w[2], w[3]])
         return true
     }
 
-    # FOR_ITER J; BIND a  ->  FOR_ITER_BIND J, a. The loop variable goes straight
-    # to its slot. The jump operand keeps byte index 0, so `rebuild` resolves the
-    # branch with no special case.
     if n >= 2 and
         head.op == opcode(Op.ForIter) and
         window_clean(code, w, 2) and
@@ -233,7 +175,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         set_instr(
             head,
             opcode(Op.ForIterBind),
-            # The first u16 is patched by `rebuild` from `target`.
             u16_bytes(0) + u16_bytes(slot_of(code.data[w[1]], 0))
         )
         head.target = target
@@ -241,8 +182,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         return true
     }
 
-    # <cmp>; JUMP_IF_FALSE J  ->  JUMP_IF_CMP_FALSE cmp, J. Only the popping form
-    # fuses: the *_KEEP jumps leave the bool behind for `and`/`or`.
     if n >= 2 and
         _is_comparison(head.op) and
         window_clean(code, w, 2) and
@@ -258,7 +197,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         let second = code.data[w[1]]
         let third = code.data[w[2]].op
 
-        # GET_LOCAL a; GET_LOCAL b; ADD  ->  ADD_LOCALS a, b
         if second.op == opcode(Op.GetLocal) and third == opcode(Op.Add) {
             _make_slot_pair(head, opcode(Op.AddLocals), slot_of(head, 0), slot_of(second, 0))
             kill_all(code, [w[1], w[2]])
@@ -267,13 +205,11 @@ fn _fuse_at(code: Code, index: int) -> bool {
 
         let value = _pushed_int(code, second)
         if value != null and fits_i16(value) {
-            # GET_LOCAL a; <int k>; ADD  ->  ADD_INT_CONST a, k
             if third == opcode(Op.Add) {
                 _make_slot_imm16(head, opcode(Op.AddIntConst), slot_of(head, 0), value)
                 kill_all(code, [w[1], w[2]])
                 return true
             }
-            # GET_LOCAL a; <int k>; LT  ->  CMP_LOCAL_CONST_LT a, k
             if third == opcode(Op.Lt) {
                 _make_slot_imm16(head, opcode(Op.CmpLocalConstLt), slot_of(head, 0), value)
                 kill_all(code, [w[1], w[2]])
@@ -282,13 +218,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
-    # <int k>; MOD  ->  MOD_INT_CONST k, wherever the pair appears: the divisor
-    # is an immediate and no slot is involved, so this fires after a GET_LOCAL2
-    # as readily as after a GET_LOCAL. `loop_sum` computes `i % 7` every
-    # iteration, one of its eight dispatches.
-    #
-    # k == 0 is left alone: the fused form treats the divisor as known-good, and
-    # division by zero has to keep reporting itself from OP_MOD.
     if n >= 2 and window_clean(code, w, 2) and code.data[w[1]].op == opcode(Op.Mod) {
         let divisor = _pushed_int(code, head)
         if divisor != null and divisor != 0 and fits_i16(divisor) {
@@ -298,9 +227,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
-    # ADD; BIND a  ->  ADD_BIND a. The pair's net stack effect is unchanged, so
-    # neither operand's origin matters. It removes the push-then-pop between
-    # them, which every accumulating `x += ...` performs.
     if n >= 2 and window_clean(code, w, 2) and code.data[w[1]].op == opcode(Op.Bind) {
         let fused = _bind_fused_form(head.op)
         if fused != null {
@@ -310,8 +236,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         }
     }
 
-    # GET_LOCAL2 a, b; ADD  ->  ADD_LOCALS a, b. The operand pair is already the
-    # right shape, so only the opcode byte changes.
     if n >= 2 and
         head.op == opcode(Op.GetLocal2) and
         window_clean(code, w, 2) and
@@ -321,10 +245,6 @@ fn _fuse_at(code: Code, index: int) -> bool {
         return true
     }
 
-    # GET_LOCAL a; GET_LOCAL b  ->  GET_LOCAL2 a, b, and GET_LOCAL a; DUP, which
-    # pushes the same slot twice and is therefore GET_LOCAL2 a, a. The DUP form
-    # is how a compound field assignment (`b.vx -= …`) starts, which makes it 6%
-    # of every instruction nbody executes.
     if n >= 2 and head.op == opcode(Op.GetLocal) and window_clean(code, w, 2) {
         let second = code.data[w[1]]
         if second.op == opcode(Op.GetLocal) or second.op == opcode(Op.Dup) {
@@ -346,15 +266,10 @@ fn _build_comparisons() -> dict[int, bool] {
     return table
 }
 
-# True when `op` leaves exactly one bool on the stack for every input, which is
-# what lets OP_JUMP_IF_CMP_FALSE swallow the jump's own bool check.
 fn _is_comparison(op: int) -> bool {
     return _COMPARISONS.get(op, false)
 }
 
-# The integer an instruction pushes, for the fused forms that fold a constant
-# into their operand. Both the immediate and the pool encodings qualify; null
-# means the instruction pushes something else, or nothing.
 fn _pushed_int(code: Code, instruction: Instr) -> int? {
     if instruction.op == opcode(Op.Int) { return read_i16(instruction.operands, 0) }
     if instruction.op != opcode(Op.Const) { return null }
@@ -365,10 +280,6 @@ fn _pushed_int(code: Code, instruction: Instr) -> int? {
     return value.value
 }
 
-# The pool index of the constant `instruction` pushes, for the fused forms that
-# name a constant by index rather than folding it into an immediate. `OP_INT`
-# carries its value inline and so may have to be interned first, which is the
-# one thing in this pass that can grow the constant pool.
 fn _const_index_of(code: Code, instruction: Instr) -> int {
     if instruction.op == opcode(Op.Const) {
         let index = read_u24(instruction.operands, 0)
@@ -381,13 +292,6 @@ fn _const_index_of(code: Code, instruction: Instr) -> int {
     return NO_INDEX
 }
 
-# u16 slot, i16 immediate: the shape of ADD_INT_CONST and CMP_LOCAL_CONST_LT.
-# A bare i16 immediate: the shape of MOD_INT_CONST.
-# The fused `<binop>; BIND a` form of `op`, or null when there is none.
-#
-# Every opcode answered here must also be in the coalescer's slot-operand table
-# (`_build_slot_operands` in chunk.jai), or it renumbers readers but not this
-# fused writer -- a miscompile three steps removed from its cause.
 fn _bind_fused_form(op: int) -> int? {
     if op == opcode(Op.Add) { return opcode(Op.AddBind) }
     if op == opcode(Op.Sub) { return opcode(Op.SubBind) }
@@ -403,19 +307,14 @@ fn _make_slot_imm16(instruction: Instr, op: int, slot: int, immediate: int) -> v
     set_instr(instruction, op, u16_bytes(slot) + u16_bytes(immediate))
 }
 
-# u16, u16: the shape of GET_LOCAL2 and ADD_LOCALS.
 fn _make_slot_pair(instruction: Instr, op: int, a: int, b: int) -> void {
     set_instr(instruction, op, u16_bytes(a) + u16_bytes(b))
 }
 
-# u16 slot, i8 delta.
 fn _make_inc_local(instruction: Instr, slot: int, delta: int) -> void {
     set_instr(instruction, opcode(Op.IncLocal), u16_bytes(slot) + [delta & 0xFF])
 }
 
-# The branch operand is left zero and `target` carried on the `Instr`, which is
-# what `rebuild` resolves branches from; the encoder needs no special case
-# because `branch_operand_at` already knows where the i16 sits.
 fn _make_jump_if_cmp_local_k(
     instruction: Instr,
     comparison: int,

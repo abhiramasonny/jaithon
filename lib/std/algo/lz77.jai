@@ -3,14 +3,8 @@
 #: The other classic answer to the compression problem `std.algo.bwt` and
 #: `std.algo.huffman` solve together — a back-reference into what was already
 #: written, rather than a rearrangement of the alphabet.
-
-# Shortest match LZ77 will encode as a back-reference: a two-character match
-# costs more to store than the literals it replaces.
 const MIN_MATCH = 3
 
-# Back-references examined per position. Bounding the hash chain is what keeps
-# compression linear on input like "aaaa..." where every position is a
-# candidate; raising it buys a slightly better ratio for a lot of time.
 const MAX_CHAIN = 64
 
 #: A single LZ77 instruction: copy, then emit one literal.
@@ -93,8 +87,6 @@ pub fn lz77_compress(text: str, window: int = 4096, max_length: int = 18) -> lis
             best_length = 0
             best_distance = 0
         }
-        # Index every position the token covers, the one the literal consumes
-        # included, or a later match would never see inside this copy.
         let covered = min(position + max(best_length, 1), n)
         for j in position..covered {
             if j + MIN_MATCH <= n {
@@ -126,8 +118,6 @@ pub fn lz77_decompress(tokens: list[LZ77Token]) -> str {
                 throw ValueError(f"distance must be in 1..={out.len()}, got {token.distance}")
             }
             let start = out.len() - token.distance
-            # Reading through the tail as it grows is deliberate: that is how a
-            # distance shorter than the length encodes a repeating run.
             for offset in 0..token.length { out.push(out[start + offset]) }
         }
         if token.literal.len() > 0 { out.push(token.literal) }
@@ -135,8 +125,6 @@ pub fn lz77_decompress(tokens: list[LZ77Token]) -> str {
     return "".join(out)
 }
 
-# Duplicated in every sibling file that needs O(1) random access into a string
-# rather than repeated O(n) slicing: too small to be worth a shared import for.
 fn _chars(text: str) -> list[str] {
     let out: list[str] = []
     for ch in text { out.push(ch) }

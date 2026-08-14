@@ -27,7 +27,6 @@
 #: reliably in practice, so each of their callers below adds a warm-up that
 #: gives the sampler more total on-function time before the assertions that
 #: matter run. count_self_matches needed no change.
-# jit-compiles: count_matches, count_self_matches, char_in_else, branch_on_flag
 from std.test import assert_eq, assert_true, assert_false
 
 #: Big enough that the sampler notices. Nothing forces a compile: a 4kHz timer

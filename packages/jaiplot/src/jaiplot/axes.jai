@@ -555,9 +555,6 @@ pub class Axes {
             return _fallback(scale)
         }
         if lower == upper {
-            # A constant series has no range to divide by. Widening it around
-            # the value keeps the line visible in the middle of the axes rather
-            # than raising from a zero-extent transform.
             let reach = if math.fabs(lower) > 0.0 { math.fabs(lower) * 0.5 } else { 1.0 }
             lower -= reach
             upper += reach
@@ -589,7 +586,6 @@ pub class Axes {
         if self.x_text != null { bottom += text_height(self.x_text ?? "", 1) + LABEL_GAP }
         if self.title_text != null { top += text_height(self.title_text ?? "", 2) + LABEL_GAP }
 
-        # Device y grows downward, so the visual top is the smaller coordinate.
         return Rect(
             device.left() + left,
             device.bottom() + top,
@@ -716,8 +712,6 @@ pub class Axes {
 
         let y_label = self.y_text
         if y_label != null {
-            # One quarter turn anticlockwise, so the label reads bottom to top
-            # the way a y axis label conventionally does.
             let style = TextStyle(
                 self.theme.text,
                 scale: 1,

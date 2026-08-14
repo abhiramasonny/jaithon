@@ -12,8 +12,6 @@ fn ne_form(value: int?) -> int {
     return -1
 }
 
-# `null` is a unit type, so `is null` is the null identity test and narrows
-# exactly as `== null` does.
 fn is_not_form(value: int?) -> int {
     if value is not null { return double(value) }
     return -1
@@ -67,8 +65,6 @@ class Countdown {
     }
 }
 
-# The drain loop: `value` is `int` inside the body, yet the store at the end
-# puts a fresh `int?` back into it.
 fn drain(source: Countdown) -> int {
     var total = 0
     var value = source.next()
@@ -79,8 +75,6 @@ fn drain(source: Countdown) -> int {
     return total
 }
 
-# A store ends the fact: the second guard is doing real work, not reading a
-# stale narrowing left over from the first.
 fn first_two(source: Countdown) -> int {
     var value = source.next()
     if value is null { return -1 }
@@ -96,11 +90,6 @@ print(first_two(Countdown(1)))
 print(first_two(Countdown(0)))
 
 # --- the same forms with a generic inner type -------------------------------
-#
-# A union of {T, null} must narrow to T exactly as {int, null} narrows to int.
-# These are declared and never called: instantiating a generic from
-# non-generic code is not supported yet, so what they contribute is the check
-# itself — the file does not run at all if one of them stops narrowing.
 class Slot[T] {
     var value: T?
     var last: T?

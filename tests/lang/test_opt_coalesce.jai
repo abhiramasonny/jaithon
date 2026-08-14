@@ -54,10 +54,6 @@ class Outcome {
 }
 
 fn test_a_dead_local_gives_up_its_number() -> void {
-    # Three bindings in a row, each dead by the time the next is written. The
-    # whole chain collapses onto the first one's number and the window shrinks
-    # by exactly the two slots that disappeared, keeping the emitter's
-    # temporaries headroom.
     let result = coalesce(
         "fn f(n: int) -> int {\n" +
             "    let a = n + 1\n" +
@@ -97,11 +93,6 @@ fn test_a_dead_local_gives_up_its_number() -> void {
 }
 
 fn test_one_number_hosts_several_tenants_in_turn() -> void {
-    # `keep` is read at the end, so it holds slot 2 throughout; the four short
-    # bindings under it take slot 3 one after another. This is the shape the
-    # pass used to miscompile: a number that has taken a second tenant reads as
-    # free at the first tenant's end unless the *furthest* tenant is tracked.
-    # See the `jaiOptCoalesceSlots` entry in ROADMAP.md.
     let result = coalesce(
         "fn f(n: int) -> int {\n" +
             "    let keep = n + 1\n" +
@@ -138,11 +129,6 @@ fn test_one_number_hosts_several_tenants_in_turn() -> void {
 }
 
 fn test_a_back_edge_keeps_two_loop_locals_apart() -> void {
-    # The three bindings before the loop collapse onto slot 2, which then stays
-    # live across the whole loop because `total` is read after it. The loop
-    # variable and the body's binding land on 3 and 4 and stay apart: read
-    # linearly the body's binding starts after the loop variable's last read,
-    # and only the back edge says they are both live for the whole iteration.
     let result = coalesce(
         "fn f(xs: list[int]) -> int {\n" +
             "    let seed = xs.len()\n" +
@@ -181,11 +167,6 @@ fn test_a_back_edge_keeps_two_loop_locals_apart() -> void {
 }
 
 fn test_a_captured_slot_is_pinned() -> void {
-    # Identical local structure to the case below, and the only difference is
-    # that the closure captures the first and the last of them. A captured slot
-    # is aliased by an open upvalue that is closed by stack position, so neither
-    # its number nor anything else's number may move onto it: nothing at all
-    # coalesces here.
     let captured = coalesce(
         "fn f(n: int) -> fn() -> int {\n" +
             "    var held = n + 1\n" +
@@ -224,10 +205,6 @@ fn test_a_captured_slot_is_pinned() -> void {
 }
 
 fn test_a_defer_frame_is_left_exactly_as_it_was() -> void {
-    # A deferred closure runs at frame exit and reads slots in an order that has
-    # no relation to this pass's linear scan, so the whole frame is abandoned
-    # rather than renumbered. Same three bindings as the first case, which
-    # coalesces two of them.
     let result = coalesce(
         "fn f(n: int) -> int {\n" +
             "    let a = n + 1\n" +
@@ -256,11 +233,6 @@ fn test_a_defer_frame_is_left_exactly_as_it_was() -> void {
 }
 
 fn test_a_slot_live_into_a_guarded_region_is_pinned() -> void {
-    # `a` and `b` die before the `try` and share slot 2. `c` is read inside the
-    # protected region, and a handler may be entered from the middle of that
-    # region with definitions skipped, so it keeps its own number and so does
-    # the catch binding above it. The window does not shrink: the top slot is
-    # still the top slot.
     let result = coalesce(
         "fn f(n: int) -> int {\n" +
             "    let a = n + 1\n" +
@@ -293,9 +265,6 @@ fn test_a_slot_live_into_a_guarded_region_is_pinned() -> void {
 }
 
 fn test_parameters_are_never_renumbered() -> void {
-    # The callee slot and every parameter are filled in by the call sequence, so
-    # their numbering is part of the calling convention. Only the locals above
-    # them move.
     let result = coalesce(
         "fn f(p: int, q: int, r: int) -> int {\n" +
             "    let a = p + q\n" +
@@ -324,8 +293,6 @@ fn test_parameters_are_never_renumbered() -> void {
 }
 
 fn test_a_frame_with_nothing_above_the_parameters_is_untouched() -> void {
-    # `slot_count <= reserved`: there is no candidate at all and the pass leaves
-    # before allocating anything.
     let result = coalesce("fn f(n: int) -> int {\n    return n + 1\n}\n")
     assert_eq(result.moved, 0)
     assert_eq(result.slots_after, result.slots_before)
@@ -334,10 +301,6 @@ fn test_a_frame_with_nothing_above_the_parameters_is_untouched() -> void {
 }
 
 # --- helpers ----------------------------------------------------------------
-
-# Compile `source` with dead-code elimination only, then coalesce the first
-# function record in the module's constant pool. `source` always declares
-# exactly one top-level function, which is that record.
 fn coalesce(source: str) -> Outcome {
     let built = compile_source(source, "<test_opt_coalesce>", false, 0, 0)
     assert_eq(built.ok(), true, built.report())
@@ -367,9 +330,6 @@ fn _first_function(body: FuncProto) -> FuncProto {
     return body
 }
 
-# Every slot operand of every live instruction, in code order. This is the whole
-# of what coalescing may change in a chunk, so comparing two traces plus the
-# byte length is a complete statement about the pass's effect.
 fn _slot_trace(proto: FuncProto) -> list[str] {
     var out: list[str] = []
     let code = decode(proto)

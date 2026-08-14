@@ -13,7 +13,6 @@ pub fn rect_area(w: float, h: float) -> float {
     return w * h
 }
 
-# Not exported: private to this module.
 fn _internal_scale(v: float) -> float {
     return v * 2.0
 }

@@ -221,10 +221,6 @@ pub class Deque[T]: Iterable[T] {
         return (self.start + offset) % self.capacity
     }
 
-    # Make room for one more element. The backing list is kept exactly
-    # `capacity` long so that every ring index addresses an existing slot; the
-    # padding beyond the live window is filled with `value`, which is about to
-    # be stored anyway and so keeps nothing extra alive.
     fn _reserve(self, value: T) -> void {
         if self.count < self.capacity { return }
         let grown = if self.capacity == 0 { MIN_CAPACITY } else { self.capacity * 2 }
@@ -238,9 +234,6 @@ pub class Deque[T]: Iterable[T] {
         self.capacity = grown
     }
 
-    # A vacated slot still references the element that was popped, which would
-    # keep it alive for as long as the deque is. Overwrite it with a live
-    # element, or drop the buffer once nothing is left.
     fn _release(self, index: int) -> void {
         if self.count == 0 {
             self.clear()
@@ -437,11 +430,6 @@ pub class CircularBuffer[T]: Iterable[T] {
         return (self.start + offset) % self.limit
     }
 
-    # The backing list grows only at its end, so a write target is either an
-    # existing slot or exactly one past the end. That holds because elements
-    # enter only at the back: every live index was written before, and the next
-    # write index either follows the highest one used or wraps into the prefix
-    # already allocated.
     fn _store(self, index: int, value: T) -> void {
         if index == self.slots.len() {
             self.slots.push(value)
@@ -450,9 +438,6 @@ pub class CircularBuffer[T]: Iterable[T] {
         }
     }
 
-    # A vacated slot still references the element that was popped, which would
-    # keep it alive for as long as the buffer is. Overwrite it with a live
-    # element, or drop the backing list once nothing is left.
     fn _release(self, index: int) -> void {
         if self.count == 0 {
             self.slots = []

@@ -115,7 +115,6 @@ pub class SigLoader {
     var _cache: dict[str, ModuleSig]
     var _by_file: dict[int, ModuleSig]
     var _next_file_id: int
-    # Paths on the current re-export walk, kept here so `ModuleSig` stays data.
     var _visiting: list[str]
 
     #: Build a loader. `first_file_id` leaves 0 to the file being checked.
@@ -142,7 +141,6 @@ pub class SigLoader {
         let sig = ModuleSig(resolved, dotted, self._next_file_id)
         self._next_file_id += 1
 
-        # No bag: a syntax error two modules away must not reach the checked file.
         let program = parse(text, sig.file_id)
         sig.program = program
         if program != null and program.kind == NodeKind.Program {
@@ -367,7 +365,6 @@ fn _add_package_dirs(dirs: list[str], packages_dir: str) -> void {
     }
 }
 
-# `isNameByte`. Spec §2.1 allows non-ASCII identifiers, so 0x80 and up passes.
 fn _is_name_char(character: str) -> bool {
     let point = ord(character)
     if point >= 0x80 { return true }
@@ -377,8 +374,6 @@ fn _is_name_char(character: str) -> bool {
     return point == 0x5f                                # _
 }
 
-# `jaiPathJoin`, `jaiPathDirname` and `jaiPathAbsolute` from src/common/memory.c,
-# not `std.io.Path`: the search rule holds only if paths compose the same way.
 fn _join(left: str, right: str) -> str {
     let head = if right.starts_with("/") { "" } else { left }
     var raw = head
@@ -433,7 +428,6 @@ fn _absolute(path: str) -> str {
     return "/" + "/".join(parts)
 }
 
-# `io_stat` follows the link here, as `stat` does in `isRegularFile`.
 fn _is_regular_file(path: str) -> bool {
     if path == "" { return false }
     let info = __prim__.io_stat(path, true)
@@ -448,7 +442,6 @@ fn _is_dir(path: str) -> bool {
     return info["kind"] == "dir"
 }
 
-# A module the checker cannot open has no signatures; the importer reports it.
 fn _read_source(path: str) -> str? {
     try {
         let handle = __prim__.io_open(path, "rb")

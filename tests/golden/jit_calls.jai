@@ -4,10 +4,6 @@
 #: so what is checked here is that each of those checks still happens.
 
 # --- a guard inside an inlined body resumes at the CALL ----------------------
-# `q` is straight-line arithmetic, so it is emitted in place. Its divide has a
-# zero check, and when that fires the interpreter has to pick up at the call
-# with the callee and its arguments still on its stack -- not part-way through
-# a body it never entered.
 fn q(a: int, b: int) -> int { return a // b }
 
 fn divides(n: int, d: int) -> int {
@@ -23,8 +19,6 @@ print(caught)
 print(divides(20000, 3))
 
 # --- a callee that raises, reached by a direct branch ------------------------
-# `bump` has a loop, so it is called rather than inlined. Its overflow is a
-# real exception and must propagate rather than be retried.
 fn bump(a: int) -> int {
     var r = a
     var k = 0

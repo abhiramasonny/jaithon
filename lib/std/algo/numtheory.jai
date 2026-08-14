@@ -178,8 +178,6 @@ pub fn divisors(n: int) -> list[int] {
             var power = 1
             for step in 0..=exponent {
                 grown.push(divisor * power)
-                # Guarded so the last step never forms prime**(exponent + 1),
-                # which can overflow even when n itself does not.
                 if step < exponent { power *= prime }
             }
         }
@@ -391,8 +389,6 @@ pub fn discrete_log(base: int, target: int, modulus: int) -> int? {
     }
     if wanted == 1 { return 0 }
     let stride = isqrt(modulus - 1) + 1
-    # Baby steps: target * base**j for j in 0..stride, keeping the largest j per
-    # value so that the first giant step to hit the table gives the least x.
     let baby: dict[int, int] = {}
     var value = wanted
     for j in 0..stride {
@@ -611,8 +607,6 @@ pub fn rational_approximation(value: float, max_denominator: int) -> tuple[int, 
     if magnitude >= 9.223372036854776e18 {
         throw ValueError(f"value must fit in an int, got {value}")
     }
-    # Doubling is exact in binary floating point, so this recovers the fraction
-    # the double actually denotes, capped where the denominator would overflow.
     var scaled = magnitude
     var denominator = 1
     while scaled != float(int(scaled)) and
@@ -691,8 +685,6 @@ pub fn nth_prime(k: int) -> int {
 pub fn prime_count(limit: int) -> int {
     if limit < 2 { return 0 }
     let root = isqrt(limit)
-    # Every distinct value of limit // i, descending: the large ones first, then
-    # every integer below limit // root down to 1.
     let keys: list[int] = []
     for i in 1..=root { keys.push(limit // i) }
     var smaller = keys[keys.len() - 1] - 1
@@ -700,8 +692,6 @@ pub fn prime_count(limit: int) -> int {
         keys.push(smaller)
         smaller -= 1
     }
-    # counts[v] starts as the count of integers in 2..=v and ends as the count
-    # of primes in 2..=v.
     let counts: dict[int, int] = {}
     for key in keys { counts[key] = key - 1 }
     for p in 2..=root {
@@ -724,8 +714,6 @@ fn _normalize(value: int, modulus: int) -> int {
 }
 
 fn _addmod(a: int, b: int, modulus: int) -> int {
-    # Both arguments are already reduced, so `modulus - b` is positive and the
-    # sum below is only formed when it is known to stay under the modulus.
     if a >= modulus - b { return a - (modulus - b) }
     return a + b
 }
@@ -733,11 +721,7 @@ fn _addmod(a: int, b: int, modulus: int) -> int {
 fn _mulmod(a: int, b: int, modulus: int) -> int {
     var addend = _normalize(a, modulus)
     var multiplier = _normalize(b, modulus)
-    # Below the limit both factors are under 2**31.5, so the product is an
-    # ordinary int multiply.
     if modulus <= MULMOD_FAST_LIMIT { return addend * multiplier % modulus }
-    # Otherwise Russian-peasant doubling: every intermediate is a sum of two
-    # reduced residues, so no 128-bit product is ever needed. O(log b) additions.
     var result = 0
     while multiplier > 0 {
         if multiplier & 1 == 1 { result = _addmod(result, addend, modulus) }
@@ -760,7 +744,6 @@ fn _split_into(n: int, factors: list[int]) -> void {
 
 fn _pollard_rho(n: int) -> int {
     if n % 2 == 0 { return 2 }
-    # Retries with a different polynomial constant when the cycle collapses onto n itself.
     var constant = 1
     loop {
         let divisor = _brent_cycle(n, constant)
@@ -784,8 +767,6 @@ fn _brent_cycle(n: int, constant: int) -> int {
         var done = 0
         while done < range_size and divisor == 1 {
             trail = y
-            # Accumulate |x - y| into one product and take a single gcd per
-            # batch: that is Brent's saving over Pollard's original loop.
             for _ in 0..min(batch, range_size - done) {
                 y = _addmod(_mulmod(y, y, n), shift, n)
                 product = _mulmod(product, _abs_difference(x, y), n)
@@ -796,8 +777,6 @@ fn _brent_cycle(n: int, constant: int) -> int {
         range_size *= 2
     }
     if divisor == n {
-        # The batch hid the real factor, so replay the last stretch one step at
-        # a time.
         divisor = 1
         while divisor == 1 {
             trail = _addmod(_mulmod(trail, trail, n), shift, n)
@@ -832,9 +811,6 @@ fn _limit_denominator(numerator: int, denominator: int, max_denominator: int) ->
         bottom = remainder
         if bottom == 0 { return (best_numerator, best_denominator) }
     }
-    # Deciding between the two straddling candidates needs 2 * bottom *
-    # far_denominator vs denominator, which can overflow an int, so it's done in
-    # float — wrong only when the two are exactly equidistant.
     let reach = (max_denominator - previous_denominator) // best_denominator
     let far_denominator = previous_denominator + reach * best_denominator
     if 2.0 * float(bottom) * float(far_denominator) <= float(denominator) {

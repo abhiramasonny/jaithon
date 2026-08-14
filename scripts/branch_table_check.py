@@ -60,19 +60,16 @@ def jai_table(names):
     body = text.split("fn _build_branch_at()", 1)[1].split("\nfn ", 1)[0]
     table = {}
 
-    # The `leading` list, all of which are offset 0.
     lead = re.search(r"let leading = \[(.*?)\]", body, re.S)
     if lead:
         for enum in re.findall(r"Op\.(\w+)", lead.group(1)):
             if enum in names:
                 table[names[enum]] = 0
 
-    # `table[opcode(Op.X)] = N`
     for enum, off in re.findall(r"table\[opcode\(Op\.(\w+)\)\]\s*=\s*(-?\d+)", body):
         if enum in names:
             table[names[enum]] = int(off)
 
-    # `for op in [Op.A, Op.B] { table[opcode(op)] = N }`
     for group, off in re.findall(
             r"for op in \[(.*?)\]\s*\{\s*table\[opcode\(op\)\]\s*=\s*(-?\d+)", body, re.S):
         for enum in re.findall(r"Op\.(\w+)", group):

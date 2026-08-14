@@ -72,13 +72,11 @@ pub class Summary: Printable {
         self.observations += 1
         let delta = value - self.running_mean
         self.running_mean += delta / self.observations
-        # Second factor uses the *updated* mean — the correct increment to squared_deviations.
         self.squared_deviations += delta * (value - self.running_mean)
         if self.observations == 1 {
             self.lowest = value
             self.highest = value
         } else {
-            # Written out, not `min`/`max`, to avoid clashing with this class's own methods.
             if value < self.lowest { self.lowest = value }
             if value > self.highest { self.highest = value }
         }
@@ -358,8 +356,6 @@ pub fn correlation(xs: list[float], ys: list[float]) -> float {
     if sxx == 0.0 or syy == 0.0 {
         throw ValueError("correlation is undefined when either series is constant")
     }
-    # Rounding can push a perfect correlation a hair past 1.0, and a
-    # correlation outside [-1, 1] breaks everything downstream.
     return math.clamp(sxy / math.sqrt(sxx * syy), -1.0, 1.0)
 }
 
@@ -587,8 +583,6 @@ pub fn linear_regression(xs: list[float], ys: list[float]) -> LinearFit {
     let slope = sxy / sxx
     var r_squared = 1.0
     if syy > 0.0 {
-        # Residual sum of squares, which algebra reduces to syy - slope * sxy.
-        # Rounding can make that a hair negative for a perfect fit.
         r_squared = 1.0 - max(syy - slope * sxy, 0.0) / syy
     }
     return LinearFit(slope, mean_y - slope * mean_x, r_squared)
@@ -705,8 +699,6 @@ pub fn freedman_diaconis_bins(values: list[float]) -> int {
     let span = ordered[count - 1] - ordered[0]
     if span <= 0.0 { return 1 }
     let middle_half = _quantile_of_sorted(ordered, 0.75) - _quantile_of_sorted(ordered, 0.25)
-    # `cbrt`, not `x ** (1.0/3.0)`: 1/3 isn't exactly representable, so the power
-    # form undershoots (e.g. cbrt(8) -> 1.9999999999999998) and inflates the bin count.
     let width = 2.0 * middle_half / math.cbrt(float(count))
     if width <= 0.0 {
         return max(1, int(math.ceil(math.log2(float(count)))) + 1)
@@ -886,7 +878,6 @@ fn _ranks(values: list[float]) -> list[float] {
         while last + 1 < count and values[order[last + 1]] == values[order[position]] {
             last += 1
         }
-        # Ranks are 1-based: midpoint of `position..=last` plus one.
         let shared = (position + last) / 2.0 + 1.0
         for tied in position..=last { ranks[order[tied]] = shared }
         position = last + 1

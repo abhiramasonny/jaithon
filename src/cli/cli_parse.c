@@ -22,7 +22,6 @@ int          gIncludeCount;
 ColorMode    gColorMode = COLOR_AUTO;
 bool         gStrict;
 
-/* Parse-time-only storage: never read outside this file. */
 static void **gArgStorage;      /* one slab backing all argv pointer arrays */
 static int    gArgSlots;        /* capacity of inputs[] and scriptArgv[] */
 
@@ -33,10 +32,6 @@ static int    gArgSlots;        /* capacity of inputs[] and scriptArgv[] */
 static bool commandFromName(const char *name, JaiCommand *out) {
     if (name == NULL || out == NULL) return false;
 
-    /*
-     * argc parsing happens once, but this is cheaper than walking thirteen
-     * strcmp() calls and keeps the common shorthand/file case short.
-     */
     const size_t n = strlen(name);
 
     switch (n) {
@@ -116,8 +111,6 @@ static bool commandFromName(const char *name, JaiCommand *out) {
     return false;
 }
 
-/* `--eval` is spelled as an option rather than a command, because
- * `jaithon eval` is not a thing to type. */
 static const char *commandName(JaiCommand command) {
     switch (command) {
     case CMD_RUN:     return "run";
@@ -142,7 +135,6 @@ static const char *commandName(JaiCommand command) {
 /* Options                                                              */
 /* ------------------------------------------------------------------ */
 
-/* Match `--name` or `--name=VALUE`. *outValue is NULL for the bare form. */
 static inline bool optionIs(const char *arg, const char *name, size_t n,
                             const char **outValue) {
     if (strncmp(arg, name, n) != 0) return false;
@@ -159,7 +151,6 @@ static inline bool optionIs(const char *arg, const char *name, size_t n,
     return false;
 }
 
-/* The value of a two-word option; advances past it. NULL when it is missing. */
 static const char *takeValue(int argc, char **argv, int *i, const char *flag) {
     if (*i + 1 >= argc) {
         cliError("option `%s` needs a value", flag);
@@ -201,7 +192,6 @@ static bool parseEmit(const char *text, ParseState *st) {
     return true;
 }
 
-/* Commands whose implementation lives in lib/jaithon/tool and owns its own flags. */
 static inline bool commandIsTool(JaiCommand command) {
     switch (command) {
     case CMD_FMT:
@@ -214,7 +204,6 @@ static inline bool commandIsTool(JaiCommand command) {
     }
 }
 
-/* Parse one option. `*i` indexes the option and is advanced past its value. */
 static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
     JaiCliOptions *out = st->out;
     const char *arg = argv[*i];
@@ -224,10 +213,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         st->forced = CMD_HELP;
         return true;
     }
-    /* `-v` after a tool command is the tool's own short option — every one of
-     * them reads it as `--verbose` — so it is forwarded rather than claimed
-     * here. `jaithon -v`, `jaithon --version` and `jaithon version` all still
-     * print the version. */
     if (strcmp(arg, "--version") == 0 ||
         (strcmp(arg, "-v") == 0 && !(st->haveCommand && commandIsTool(out->command)))) {
         st->forced = CMD_VERSION;
@@ -249,10 +234,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
     if (strcmp(arg, "--gc-stress") == 0)   { out->gcStress = true;
                                              out->gcStressEvery = 1;
                                              return true; }
-    /* --gc-stress=N collects every Nth allocation. N=1 is the old behaviour and
-     * is quadratic; a larger N is what makes stressing a whole test suite
-     * affordable while still collecting at far more points than the live-bytes
-     * threshold ever would. */
     if (strncmp(arg, "--gc-stress=", 12) == 0) {
         char *end = NULL;
         long n = strtol(arg + 12, &end, 10);
@@ -283,10 +264,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
     if (optionIs(arg, "--front", 7, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--front");
         if (value == NULL) return false;
-        /* `jai` is the only front end. `c` is still recognised so that a
-         * command line carrying it gets an answer rather than "unknown
-         * option": it named a compiler that no longer exists, and silently
-         * running the other one would be the one outcome worse than failing. */
         if (strcmp(value, "jai") == 0) {
             out->run.selfHosted = true;
             return true;
@@ -307,10 +284,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
         if (value == NULL) value = takeValue(argc, argv, i, "--emit");
         return value != NULL && parseEmit(value, st);
     }
-    /* --eval names what to run rather than where to find it, so it is the
-     * command as much as `run` is, and claiming it here is what makes
-     * `jaithon --eval EXPR file.jai` say that the file has no place on that
-     * command line instead of quietly running the file. */
     if (optionIs(arg, "--eval", 6, &value)) {
         if (value == NULL) value = takeValue(argc, argv, i, "--eval");
         if (value == NULL) return false;
@@ -368,7 +341,6 @@ static bool parseOption(int argc, char **argv, int *i, ParseState *st) {
 /* What a command accepts                                               */
 /* ------------------------------------------------------------------ */
 
-/* Commands that consume their positional arguments as source paths. */
 static inline bool commandTakesInputs(JaiCommand command) {
     switch (command) {
     case CMD_REPL:
@@ -394,8 +366,6 @@ static inline bool commandTakesOutput(JaiCommand command) {
     }
 }
 
-/* Commands for which "no paths given" is an error rather than "use the
- * current directory". */
 static inline bool commandNeedsInput(JaiCommand command) {
     switch (command) {
     case CMD_RUN:
@@ -462,20 +432,16 @@ bool jaiCliParse(int argc, char **argv, JaiCliOptions *out) {
                 out->command = named;
                 continue;
             }
-            /* `jaithon file.jai` is shorthand for `jaithon run file.jai`. */
             out->command = CMD_RUN;
             out->inputs[out->inputCount++] = arg;
             continue;
         }
 
-        /* Everything after the script name belongs to the script. */
         if (out->command == CMD_RUN && out->inputCount >= 1) {
             out->scriptArgv[out->scriptArgc++] = arg;
             continue;
         }
         out->inputs[out->inputCount++] = arg;
-        /* A tool's paths also go in the forwarding list, in place, so that the
-         * tool sees the command line the user actually wrote. */
         if (commandIsTool(out->command) && out->toolArgCount < gArgSlots) {
             out->toolArgs[out->toolArgCount++] = arg;
         }

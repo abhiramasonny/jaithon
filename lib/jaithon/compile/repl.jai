@@ -109,8 +109,6 @@ class _Text {
         return low
     }
 
-    # 1-based line and column; columns count scalars, not bytes, so text
-    # above U+007F before the bracket still lines up correctly.
     pub fn position_at(self, offset: int) -> tuple[int, int] {
         let limit = self.index_of_byte(offset)
         var line = 1
@@ -165,7 +163,7 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
         }
 
         let closer = _closer_text(token.kind)
-        if closer is null { continue }  # interpolation braces are not tokens
+        if closer is null { continue }
 
         if stack.len() == 0 or _closer_for(stack[stack.len() - 1][0]) != closer {
             out.mismatched = true
@@ -185,8 +183,6 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
     }
 
     if stack.len() > 0 {
-        # Name the outermost bracket -- the construct the user is being asked
-        # to finish.
         out.incomplete = true
         out.open = OpenKind.Bracket
         out.opener = stack[0][0]
@@ -247,7 +243,7 @@ fn _unterminated_literal_continues(
         last = diagnostic
     }
 
-    if last is null {  # block comments only
+    if last is null {
         out.open = OpenKind.Comment
         out.opener = "#"
         let first = bag.items[0].span
@@ -265,10 +261,6 @@ fn _unterminated_literal_continues(
         if found < 0 { return false }
         opener = found
     } else {
-        # The literal must reach the end of input; the buffer always ends in
-        # the newline the prompt appended, which the span stops short of by
-        # one. An f-string needs no such test: the lexer only leaves a
-        # triple-quoted one open when it runs out of input.
         if span.end + 1 < text.byte_length() { return false }
     }
     if not _is_triple_quote_at(text, opener) { return false }
@@ -301,8 +293,6 @@ pub fn scan(source: str) -> Scan {
     if not lexer.had_error {
         _scan_brackets(tokens, text, out)
         if not out.incomplete and not out.mismatched {
-            # Brackets balance, so the only thing left that can hold the input
-            # open is a line ending on a token the next one continues.
             let parser = Parser(Lexer(source, -1, DiagnosticBag()))
             let (_, incomplete) = parser.parse_repl_line()
             if incomplete {

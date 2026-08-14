@@ -37,10 +37,6 @@
 #: `gui_available`, `gui_window_open`, `gui_window_close`, `gui_poll`,
 #: `gui_drain_events`, `gui_present`, `gui_pixels`, `gui_set_title`,
 #: `time_mono_seconds` and `sleep`.
-
-# Event tags, as the native layer writes them into each raw event record. They
-# are matched with `==` rather than in a `match`, because a bare identifier in
-# pattern position binds instead of comparing.
 const _EVENT_CLOSE = 0
 const _EVENT_KEY_DOWN = 1
 const _EVENT_KEY_UP = 2
@@ -52,9 +48,7 @@ const _EVENT_WHEEL = 7
 const _EVENT_RESIZE = 8
 const _EVENT_FOCUS = 9
 
-# How much of the new frame rate a smoothed reading takes on. Low enough that
-# one slow frame does not make the counter jump, high enough to follow a real
-# change within a few frames.
+# Smoothing factor for FPS reading, balancing stability and responsiveness.
 const _FPS_SMOOTHING: float = 0.1
 
 #: A surface `std.gui.canvas` can draw into.
@@ -142,8 +136,6 @@ pub class Window: PixelTarget {
         self.frame_events = []
         self.open = true
         self.frame_start = __prim__.time_mono_seconds()
-        # Report the target frame time before the first `present` has measured
-        # anything, so time-based animation does not jump on frame one.
         self.last_delta = if target_fps > 0 { 1.0 / target_fps } else { 0.0 }
         self.smoothed_fps = 0.0
         self.frame_index = 0
@@ -264,9 +256,6 @@ pub class Window: PixelTarget {
 #: which case `Window` raises rather than hanging.
 pub fn is_available() -> bool { return __prim__.gui_available() }
 
-# One raw event record from the native layer: a tag followed by that tag's
-# payload. An unrecognised tag yields null and is dropped, so a native layer
-# that grows a new event kind does not break an older library.
 fn _decode(raw: list[any]) -> Event? {
     let tag = raw[0]
     if tag == _EVENT_CLOSE { return Event.Close }

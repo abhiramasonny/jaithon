@@ -156,8 +156,6 @@ pub enum Op {
     AssertFail,
     TypeGuard,
     Halt,
-    # This enum's order is the on-disk encoding; new opcodes append at the end,
-    # never insert, or old `.jaic` files misdecode.
     GetFieldLocal,
     ForIterBind,
     JumpIfCmpFalse,
@@ -193,8 +191,6 @@ class OpSpec {
     }
 }
 
-# From the JAI_OPCODES table in src/vm/bytecode/chunk.c. OP_CLOSURE is variable-length,
-# recorded as -1 operand bytes.
 let _OPS: list[OpSpec] = [
     OpSpec(Op.Nop, "OP_NOP", 0, 0),
     OpSpec(Op.Const, "OP_CONST", 3, 1),
@@ -470,7 +466,7 @@ pub class Chunk {
     #: Apply a stack effect the opcode table could not.
     pub fn adjust(self, delta: int) -> void {
         self.depth += delta
-        if self.depth < 0 { self.depth = 0 }  # only reachable after an error
+        if self.depth < 0 { self.depth = 0 }
         if self.depth > self.max_depth { self.max_depth = self.depth }
     }
 
@@ -539,8 +535,6 @@ pub class Chunk {
         let offset = self.here()
         if span != null and span.is_known() {
             let rows = self.lines.len()
-            # Compares both ends, matching src/vm/bytecode/chunk.c's recordSpan: keying on
-            # start alone previously made the line table come out too short.
             let same = rows > 0 and
                 self.lines[rows - 1].span_start == span.start and
                 self.lines[rows - 1].span_end == span.end
@@ -582,8 +576,6 @@ pub class Chunk {
     }
 }
 
-# Null when two equal values must stay distinct: two functions with identical
-# code are still two functions.
 fn _const_key(value: Const) -> str? {
     match value.tag {
         ConstTag.Null => { return "n" }
@@ -594,15 +586,10 @@ fn _const_key(value: Const) -> str? {
         ConstTag.Type => { return f"t{value.value}" }
         ConstTag.Bytes => { return f"y{value.value}" }
         ConstTag.Tuple => {
-            # Null the moment a member has no key of its own: `constEqual` falls
-            # back to object identity for a function, so a tuple holding one is
-            # shared only with itself.
             var parts: list[str] = []
             for item in value.value {
                 let key = _const_key(item)
                 if key is null { return null }
-                # Length-prefixed, so that `("a", "b")` and `("ab",)` cannot
-                # land on one entry: a member's key is arbitrary text.
                 parts.push(f"{key.len()}:{key}")
             }
             return "p" + "".join(parts)
@@ -839,13 +826,9 @@ pub class Emitter {
     #: Lower `program` and return the module body's function record.
     pub fn compile_program(self, program: Node, module_name: str? = null) -> FuncProto {
         let proto = FuncProto(module_name ?? "__main__", 0, 0)
-        # Imported enums go in first so that a name this file also declares
-        # wins, which is the order the C's registry has them in.
         for name in self.imported_enums.keys() { self.enums[name] = self.imported_enums[name] }
         self._index_enums(program.child_list("stmts"))
         self.stack.push(FnCtx(proto, self.resolution.slot_count(program)))
-        # Top-level `fn` declarations bind ahead of the rest (STYLE §8 ordering),
-        # so a statement may call a function declared below it.
         let stmts = program.child_list("stmts")
         for statement in stmts {
             if statement.kind == NodeKind.FnDecl { self._stmt(statement) }
@@ -859,8 +842,6 @@ pub class Emitter {
         return proto
     }
 
-    # Frame size is locals + stack high-water mark. This is where the C's
-    # jaiCgFinishFunction calls jaiOptimize: once per function, after frame size is final.
     fn _finish(self) -> void {
         let ctx = self._ctx()
         ctx.proto.max_slots = ctx.max_slot + ctx.proto.chunk.max_depth
@@ -917,7 +898,6 @@ pub class Emitter {
 
     fn _set_depth(self, value: int) -> void { self._chunk().set_depth(value) }
 
-    # POPN carries a u8, so a single value is POP instead.
     fn _pop_n(self, count: int, span: Span) -> void {
         var left = count
         while left > 0 {
@@ -970,8 +950,6 @@ pub class Emitter {
         return operand
     }
 
-    # A jump offset is measured from the end of its instruction: the byte after
-    # the operand for every jump but PUSH_HANDLER, whose i16 comes before a u24.
     fn _patch(self, operand: int) -> void {
         self._patch_from(operand, operand + 2)
     }
@@ -1003,7 +981,6 @@ pub class Emitter {
     }
 
     fn _load_symbol(self, symbol: Symbol?, name: str, span: Span) -> void {
-        # A missing symbol is the recovery path: a late-bound global, as in a REPL.
         if symbol == null {
             self._op_cached(Op.GetGlobal, self._string(name), span)
             return
@@ -1013,7 +990,6 @@ pub class Emitter {
         } elif symbol.kind == SymbolKind.Upvalue {
             self._op_u8(Op.GetUpvalue, if symbol.slot < 0 { 0 } else { symbol.slot }, span)
         } elif symbol.kind == SymbolKind.Field {
-            # An unqualified field name inside a method is `self.name`.
             self._op_u16(Op.GetLocal, 0, span)
             self._op_cached(Op.GetField, self._string(symbol.name), span)
         } else {
@@ -1038,7 +1014,6 @@ pub class Emitter {
             self._op_u8(Op.SetUpvalue, if symbol.slot < 0 { 0 } else { symbol.slot }, span)
             self._op(Op.Pop, span)
         } else {
-            # A field: SET_FIELD wants (object, value) and the value is on top.
             self._op_u16(Op.GetLocal, 0, span)
             self._op(Op.Swap, span)
             self._op_cached(Op.SetField, self._string(symbol.name), span)
@@ -1071,7 +1046,6 @@ pub class Emitter {
             self._chunk().write_byte(elements.len())
             self._chunk().write_byte(if rest < 0 { 255 } else { rest })
             self._adjust(elements.len() - 1)
-            # UNPACK pushes right to left, so element 0 is on top.
             for element in elements { self._bind_pattern(element, span) }
         } else {
             self._unsupported(pattern.span, "this pattern in a binding position")
@@ -1105,8 +1079,6 @@ pub class Emitter {
             NodeKind.NullLit => { self._op(Op.Null, span) }
             NodeKind.FString => { self._fstring(node) }
             NodeKind.Ident => { self._load_name(node, node.text("name")) }
-            # Slot 0 is this frame's receiver; a nested function has none, so the
-            # resolver binds this node to the enclosing method's captured `self`.
             NodeKind.Self | NodeKind.Super => {
                 let captured = self.resolution.symbol_of(node)
                 if captured == null {
@@ -1166,8 +1138,6 @@ pub class Emitter {
             NodeKind.Call => { self._call(node) }
             NodeKind.Index => {
                 self._expr(node.child("object"))
-                # Generics are erased (spec §6.1): `Box[int]` *is* `Box`, so
-                # there is nothing to evaluate and nothing to subscript.
                 if not self.resolution.is_type_args(node) {
                     self._expr(node.child("index"))
                     self._op(Op.GetIndex, span)
@@ -1206,8 +1176,6 @@ pub class Emitter {
             NodeKind.Cast => {
                 self._expr(node.child("operand"))
                 if node.flag("widen") {
-                    # An int the checker proved is an int: one conversion, no
-                    # test (spec §2.2).
                     self._op(Op.ToFloat, span)
                 } else {
                     let target = node.type_field("target")
@@ -1234,8 +1202,6 @@ pub class Emitter {
         }
     }
 
-    # Never a runtime eval (spec §1.7). The literal mask keeps a program that
-    # rebinds global `str` from getting it called on literal parts, only on holes.
     fn _fstring(self, node: Node) -> void {
         let span = node.span
         let parts = node.child_list("parts")
@@ -1263,7 +1229,6 @@ pub class Emitter {
             return
         }
 
-        # More holes than the mask holds: fall back to one join.
         self._op_k(Op.Const, self._string(""), span)
         for part in parts { self._fstring_part(part) }
         self._op_u16(Op.BuildList, parts.len(), span)
@@ -1292,8 +1257,6 @@ pub class Emitter {
         self._patch(short_circuit)
     }
 
-    # `a < b <= c` evaluates `b` once: it is stashed in a temporary between the
-    # two comparisons, which keeps every short-circuit edge at one bool deep.
     fn _chain(self, node: Node) -> void {
         let span = node.span
         let operands = node.child_list("operands")
@@ -1350,8 +1313,6 @@ pub class Emitter {
         return flags
     }
 
-    # `tail` selects TAIL_CALL for the plain positional case. It also suppresses
-    # the INVOKE fusion, because INVOKE has no tail form.
     fn _call(self, node: Node, tail: bool = false) -> void {
         let span = node.span
         let callee = node.require("callee")
@@ -1370,7 +1331,6 @@ pub class Emitter {
             }
         }
 
-        # `super(a)` and `super.m(a)` fuse into SUPER_INVOKE, receiver in slot 0.
         if callee.kind == NodeKind.Super {
             self._super_call(node, "init", positional, span)
             return
@@ -1380,8 +1340,6 @@ pub class Emitter {
             return
         }
 
-        # `obj.m(a)` fuses into INVOKE, which carries the method cache. An
-        # `Enum.Variant(a)` is a static member, so this reaches it too.
         if callee.kind == NodeKind.Member and keywords.len() == 0 and spread == null and not tail {
             self._expr(callee.require("object"))
             self._each_expr(positional)
@@ -1389,15 +1347,12 @@ pub class Emitter {
             return
         }
 
-        # `a?.m(x)` yields null *without calling* when `a` is null (spec §4.2),
-        # so the guard skips the arguments and the call, not just the load.
         var opt_skip = -1
         var is_tail = tail
         if callee.kind == NodeKind.OptMember {
             self._expr(callee.require("object"))
             opt_skip = self._emit_jump(Op.JumpIfNull, span)
             self._op_cached(Op.GetField, self._string(callee.text("name")), span)
-            # The frame has to survive to the patch target below.
             is_tail = false
         } else {
             self._expr(callee)
@@ -1406,8 +1361,6 @@ pub class Emitter {
         self._each_expr(positional)
         if spread != null {
             self._expr(spread)
-            # The operand counts every slot the call consumes, the splat list
-            # included (BYTECODE.md §3.5).
             self._op_u8(Op.CallSpread, positional.len() + 1, span)
             self._adjust(-(positional.len() + 1))
             if opt_skip >= 0 { self._patch(opt_skip) }
@@ -1454,8 +1407,6 @@ pub class Emitter {
         self._adjust(-argc)
     }
 
-    # A block in expression position yields its final expression statement. The
-    # exit close comes after the value: it may be a closure over a block binding.
     fn _block_expr(self, node: Node) -> void {
         let close_at = self.resolution.capture_base_of(node)
         let saved = self._enter_close_scope(close_at)
@@ -1480,9 +1431,6 @@ pub class Emitter {
             self._expr(last.child("expr"))
             return
         }
-        # `if`/`match` at a block's tail are its value: emitting them as
-        # statements plus a null push made every such block evaluate to null. A
-        # bare `if` is left alone — no value on the untaken path.
         if last.kind == NodeKind.Match or
             last.kind == NodeKind.If and last.child("elseBranch") != null {
             self._branch_value(last, last.span)
@@ -1492,8 +1440,6 @@ pub class Emitter {
         self._op(Op.Null, node.span)
     }
 
-    # A branch isn't always an expression node: a block yields its tail, and an
-    # `elif` chain built in statement position arrives as `If`.
     fn _branch_value(self, branch: Node?, span: Span) -> void {
         if branch == null {
             self._op(Op.Null, span)
@@ -1523,7 +1469,6 @@ pub class Emitter {
         self._expr(branch)
     }
 
-    # The accumulator is built first; the element lands `clauses + 1` above it.
     fn _comprehension(self, node: Node) -> void {
         let span = node.span
         let clauses = node.records("clauses")
@@ -1545,21 +1490,12 @@ pub class Emitter {
         var exits: list[int] = []
         var before_iter: list[int] = []
         var skips: list[list[int]] = []
-        # Which clauses used the range lowering below: their exit is patched
-        # like `_for_range`'s (`_patch_from(., . + 8)`, not the ordinary
-        # two-byte `_patch`), and they own temps that must be freed on the
-        # way out, in the same reverse order this loop already closes in.
         var is_range: list[bool] = []
         var range_temps: list[int] = []
         for clause in clauses {
             before_iter.push(self._depth())
             let iterable: Node = clause["iterable"]
             let pattern: Node = clause["pattern"]
-            # `for x in a..b`: the same lowering `_for_range` gives the
-            # statement form, and it declines for exactly the same reasons —
-            # reused via `_range_bind_slot` rather than re-derived, since a
-            # range reached through a variable, a destructuring pattern or a
-            # global loop variable all fall back to the general path below.
             if iterable.kind == NodeKind.Range and self._range_bind_slot(pattern, false) >= 0 {
                 is_range.push(true)
                 let wildcard = pattern.kind == NodeKind.PatWildcard
@@ -1583,21 +1519,6 @@ pub class Emitter {
             } else {
                 is_range.push(false)
                 range_temps.push(0)
-                # Plain `for` only, not comprehension clauses: a clause's jumps are
-                # tracked by the comprehension itself, and threading another branch
-                # through that bookkeeping broke `{k: v for (v, k) in d.items()}`.
-                #
-                # `_items_iterable` is safe here even though it plants its own
-                # branch (`OP_GET_ITER_ITEMS`'s skip jump): that jump is opened
-                # and patched entirely inside the call, before `starts`/`exits`
-                # start tracking this clause, so it never threads through the
-                # comprehension's own bookkeeping. Reused from `_for` rather
-                # than re-derived, so a clause declines the lazy-pair path for
-                # exactly the same reasons a `for` statement does — same shape
-                # match on `X.items()`, same run-time decision, so a user class
-                # with its own `items()` still gets that method called. Either
-                # way this leaves exactly one iterator on the stack, so the
-                # accumulator's peek index still counts one push per clause.
                 if _is_items_call(iterable) {
                     self._items_iterable(iterable, span)
                 } else {
@@ -1606,7 +1527,7 @@ pub class Emitter {
                 }
                 starts.push(self._chunk().here())
                 exits.push(self._emit_jump(Op.ForIter, span))
-                self._adjust(1)  # the loop value, on the fall-through
+                self._adjust(1)
                 self._bind_pattern(pattern, span)
             }
             var failures: list[int] = []
@@ -1618,9 +1539,6 @@ pub class Emitter {
             skips.push(failures)
         }
 
-        # The accumulator's peek index, below one iterator per clause that
-        # pushed one — a range clause pushed nothing, so `self._depth()`
-        # already reflects only the clauses that did.
         if kind == CompKind.Dict {
             self._expr(node.child("keyExpr"))
             self._expr(node.child("element"))
@@ -1635,18 +1553,10 @@ pub class Emitter {
 
         var index = clauses.len() - 1
         while index >= 0 {
-            # A filter that fails continues its own clause, not an inner one.
             self._patch_all(skips[index])
             self._loop_back(starts[index], span)
-            # Both paths land back at this clause's own depth: FOR_ITER drops
-            # the exhausted iterator; a range clause never put anything on the
-            # operand stack to begin with, so this is a no-op there rather
-            # than an assumed one.
             self._set_depth(before_iter[index])
             if is_range[index] {
-                # The displacement is measured from the end of the
-                # instruction, six bytes past its own operand rather than the
-                # usual zero — same as `_for_range`'s `OP_FOR_RANGE_BIND` patch.
                 self._patch_from(exits[index], exits[index] + 8)
                 self._free_temps(range_temps[index])
             } else {
@@ -1667,8 +1577,6 @@ pub class Emitter {
         let scope = self.resolution.scope_of(node)
         if scope == null { return }
         for upvalue in scope.upvalues {
-            # bit 0: the source is a local of the enclosing frame rather than
-            # one of its upvalues. bit 1: capture by value (spec §6's `let`).
             var how = if upvalue.is_local { 1 } else { 0 }
             if upvalue.by_value { how = how | 2 }
             self._chunk().write_byte(how)
@@ -1705,13 +1613,10 @@ pub class Emitter {
             }
         }
 
-        # A lambda still gets a name (`<anonymous>`, matching the C's
-        # setFunctionNames): the name is a pool constant (§5), so null diverges.
         let proto = FuncProto((name ?? node.opt_text("name")) ?? "<anonymous>", arity, flags)
         proto.upvalue_count = if scope == null { 0 } else { scope.upvalues.len() }
         proto.param_names = names
 
-        # The frame holds slot 0 and every parameter even with no body resolved.
         var locals = self.resolution.slot_count(node)
         if locals < node.records("params").len() + 1 {
             locals = node.records("params").len() + 1
@@ -1738,9 +1643,6 @@ pub class Emitter {
         return self._chunk().add_constant(Const(ConstTag.Func, proto))
     }
 
-    # Thunks (spec §5 `defaultOffsets`) can't fall through into each other: a
-    # keyword call may default any hole (`f(a, c: 3)` defaults only `b`), so the
-    # VM runs each thunk on its own.
     fn _default_thunks(self, proto: FuncProto, defaults: list[Node], node: Node) -> void {
         if defaults.len() == 0 { return }
         let to_body = self._emit_jump(Op.Jump, node.span)
@@ -1749,14 +1651,11 @@ pub class Emitter {
             let depth = self._depth()
             self._expr(default_value)
             self._op(Op.Return, default_value.span)
-            # A thunk is entered directly, so its stack effect is not the body's.
             self._set_depth(depth)
         }
         self._patch(to_body)
     }
 
-    # `self.field = <default>` for every instance field that declares one, run
-    # before the body of `init` so an explicit assignment can override it.
     fn _field_defaults(self, fields: list[any]) -> void {
         for field in fields {
             if field["defaultValue"] == null or field["isStatic"] { continue }
@@ -1767,12 +1666,6 @@ pub class Emitter {
         }
     }
 
-    # The spec constant OP_CLASS reads is the 6-tuple the VM's
-    # `classSpecInstantiate` decodes:
-    #     (INT kind, STR name, STR|NULL superName, BOOL isAbstract,
-    #      TUPLE required, TUPLE variants)
-    # `required` holds a trait's (name, arity) pairs flattened and `variants` an
-    # enum's (name, TUPLE fieldNames) pairs.
     fn _class_spec(
         self,
         kind: int,
@@ -1805,7 +1698,7 @@ pub class Emitter {
             span
         )
         if super_name != null {
-            self._op(Op.Inherit, span)  # peek(1) = super, peek(0) = subclass
+            self._op(Op.Inherit, span)
             self._op(Op.Swap, span)
             self._op(Op.Pop, span)
         }
@@ -1814,8 +1707,6 @@ pub class Emitter {
             self._op_k(Op.ImplTrait, self._string(trait_type.name ?? ""), span)
         }
 
-        # A class's own type parameters are ordinary `Name` types here, so the
-        # kind mapping has to be told which names are not concrete.
         var type_params: list[str] = []
         for generic in node.records("generics") {
             let generic_name = generic["name"]
@@ -1824,8 +1715,6 @@ pub class Emitter {
 
         let fields = node.records("fields")
         for field in fields {
-            # bits 0-1 visibility, bit 2 static, bit 3 immutable,
-            # bits 4-7 the declared kind
             var bits = _visibility_code(field["visibility"]) & 0x3
             if field["isStatic"] { bits = bits | 4 }
             if field["isLet"] { bits = bits | 8 }
@@ -1835,8 +1724,6 @@ pub class Emitter {
             self._chunk().write_byte(bits)
         }
 
-        # A static initialiser runs once, here, with the class still on the
-        # stack; an instance field's default belongs to the constructor.
         for field in fields {
             if not field["isStatic"] or field["defaultValue"] == null { continue }
             let field_span: Span = field["span"]
@@ -1875,8 +1762,6 @@ pub class Emitter {
         }
 
         if needs_init {
-            # No declared `init` but a field has a default: synthesise one whose
-            # only body is the default prologue.
             let synthetic = Node(NodeKind.FnDecl, {"name": "init"}, span)
             let index = self._function_constant(synthetic, "init", FN_METHOD, fields)
             self._op_k(Op.Closure, index, span)
@@ -1900,10 +1785,7 @@ pub class Emitter {
         self._emit_closure(method, index)
         self._chunk().write_op(Op.Method, span)
         self._chunk().write_u24(self._string(name))
-        # FN_INIT is bit 8 and does not survive the u8 operand; the VM recovers
-        # it from the method name.
         self._chunk().write_byte(combined & 0xFF)
-        # Visibility has a byte of its own: the flags byte is full.
         self._chunk().write_byte(_visibility_code(method.visibility()))
     }
 
@@ -1930,8 +1812,6 @@ pub class Emitter {
         let span = node.span
         let name = node.text("name")
 
-        # A required method has no body, so it cannot be a METHOD: it travels in
-        # the spec constant as a (name, arity) pair.
         var required: list[Const] = []
         for method in node.child_list("methods") {
             if method.child("body") != null { continue }
@@ -1968,11 +1848,6 @@ pub class Emitter {
             NodeKind.VarDecl => {
                 self._expr(node.child("init"))
                 let pattern = node.child("pattern")
-                # `list[int]` is otherwise a compile-time fact only: a container
-                # reaching a function through `any` can be mutated with no
-                # diagnostic, because with an `any` receiver the checker does
-                # not know what it was declared to hold. Stamp it on the value
-                # so the mutation sites can check.
                 if pattern != null and pattern.kind == NodeKind.PatBind {
                     let packed = _container_kind_code(node.type_field("declaredType"))
                     if packed != 0 {
@@ -1981,8 +1856,6 @@ pub class Emitter {
                     }
                 }
                 self._bind_pattern(pattern, span)
-                # A `pub let` inside a function body is a mistake, but the C
-                # exports it anyway. A destructuring pattern exports nothing: no single name to carry.
                 let symbol = self.resolution.symbol_of(node)
                 if symbol != null and
                     symbol.visibility == Visibility.Public and
@@ -1992,8 +1865,6 @@ pub class Emitter {
                 }
             }
             NodeKind.Assign => { self._assign(node) }
-            # A block's bindings die here so the next sibling reuses their
-            # slots; closures over them are detached on the way out (spec §5.2).
             NodeKind.Block => {
                 let close_at = self.resolution.capture_base_of(node)
                 let saved = self._enter_close_scope(close_at)
@@ -2039,9 +1910,6 @@ pub class Emitter {
             NodeKind.For => { self._for(node) }
             NodeKind.Match => { self._match(node, false) }
             NodeKind.Break | NodeKind.Continue => { self._jump(node) }
-            # Close comes after the value (which may itself close over the slot)
-            # and before RETURN's frame-wide close, which runs after defers that
-            # still borrow these slots.
             NodeKind.Return => {
                 let value = node.child("value")
                 if value == null {
@@ -2050,11 +1918,7 @@ pub class Emitter {
                     self._run_defers(span)
                     self._op(Op.ReturnNull, span)
                 } elif self._can_tail_call(value) {
-                    # No close: `_can_tail_call` rules out a finally chain and
-                    # defers, and TAIL_CALL closes the frame before reusing it.
                     self._call(value, true)
-                    # TAIL_CALL reuses the frame for a closure callee; a native
-                    # one leaves its result behind, so RETURN is still needed.
                     self._op(Op.Return, span)
                 } else {
                     self._expr(value)
@@ -2070,17 +1934,11 @@ pub class Emitter {
             }
             NodeKind.Try => { self._try(node) }
             NodeKind.Defer => {
-                # The deferred block runs on this frame, so it needs no capture
-                # list: its GET_LOCALs address the parent's slots.
                 let parent = self._ctx()
-                # `defer` is the name jaiFunctionIsDeferThunk recognizes a thunk
-                # by, keeping it out of the "defer requires a callable" check and slot coalescing.
                 let proto = FuncProto("defer", 0, 0)
                 proto.upvalue_count = parent.proto.upvalue_count
                 self.stack.push(FnCtx(proto, parent.next_temp))
                 self._ctx().max_slot = parent.max_slot
-                # Never tail-call out of a deferred block: its frame is already
-                # being torn down.
                 self._ctx().protect_depth = 1
                 self._stmt(node.child("body"))
                 self._op(Op.ReturnNull, span)
@@ -2127,7 +1985,6 @@ pub class Emitter {
             }
             NodeKind.ModuleDecl => { }
             _ => {
-                # Every remaining kind is an expression used for its effect.
                 self._expr(node)
                 self._op(Op.Pop, span)
             }
@@ -2150,8 +2007,6 @@ pub class Emitter {
             }
             self._store_symbol(self.resolution.symbol_of(target), target.text("name"), span, false)
         } elif target.kind == NodeKind.Member {
-            # Intern the field name before the object: otherwise `p.chunk.a = v`
-            # pools `chunk` first here vs `a` first in the C — a `make bootstrap` divergence.
             let field = self._string(target.text("name"))
             self._expr(target.child("object"))
             if compound {
@@ -2188,7 +2043,6 @@ pub class Emitter {
         }
     }
 
-    # `while` and `loop`: the iteration-ending close belongs at the body's end.
     fn _body_of_loop(
         self,
         node: Node,
@@ -2202,7 +2056,6 @@ pub class Emitter {
         self._close_iteration(base, node.span)
     }
 
-    # A loop frame, plus the watermark update an enclosing `try` needs.
     fn _enter_loop(
         self,
         label: str?,
@@ -2218,8 +2071,6 @@ pub class Emitter {
         }
     }
 
-    # The statements of a loop body, without the block's own exit close: every
-    # path out closes at the loop's base, never higher than the body's.
     fn _loop_body(self, body: Node?) -> void {
         if body == null { return }
         if body.kind != NodeKind.Block {
@@ -2235,21 +2086,15 @@ pub class Emitter {
         self._patch_all(frame.breaks)
     }
 
-    # Detaches open upvalues at/above `base` (spec §5.2, §6) so closures over
-    # those slots keep their values before the slots are reused. -1 emits
-    # nothing, the common case.
     fn _close_scope(self, base: int, span: Span) -> void {
         if base < 0 { return }
         self._op_u16(Op.CloseUpvalue, base, span)
     }
 
-    # Per-iteration bindings (spec §5.2): closing at the lowest captured slot
-    # makes the next iteration's OP_CLOSURE allocate fresh cells.
     fn _close_iteration(self, base: int, span: Span) -> void {
         self._close_scope(base, span)
     }
 
-    # Returns the previous `close_base`; the caller restores it when the scope ends.
     fn _enter_close_scope(self, base: int) -> int {
         let ctx = self._ctx()
         let saved = ctx.close_base
@@ -2262,7 +2107,6 @@ pub class Emitter {
         return saved
     }
 
-    # `return` leaves every block and iteration at once: close at the lowest base.
     fn _return_close_base(self) -> int {
         var base = self._ctx().close_base
         let loops = self._close_base_through(0)
@@ -2270,8 +2114,6 @@ pub class Emitter {
         return base
     }
 
-    # Inline copies of every `finally` entered inside the loop at `index`,
-    # innermost first. Only the explicit break/continue/return edges need them.
     fn _finally_chain_for_loop(self, index: int) -> void {
         let ctx = self._ctx()
         var position = ctx.finallys.len() - 1
@@ -2281,9 +2123,6 @@ pub class Emitter {
         }
     }
 
-    # Reuses the frame only when nothing else must run after: defers, an
-    # enclosing `try`/`finally`, and generators rule it out. `super`, spread and
-    # keyword calls are out too — SUPER_INVOKE, CALL_SPREAD and CALL_KW have no tail form.
     fn _can_tail_call(self, value: Node) -> bool {
         if value.kind != NodeKind.Call { return false }
         let ctx = self._ctx()
@@ -2304,8 +2143,6 @@ pub class Emitter {
         return true
     }
 
-    # OP_RETURN runs this frame's defers itself; RUN_DEFERS is what makes them
-    # run *here*, before an enclosing `finally` copy (the order of spec §3.8).
     fn _run_defers(self, span: Span) -> void {
         if self._ctx().has_defer { self._op(Op.RunDefers, span) }
     }
@@ -2319,7 +2156,6 @@ pub class Emitter {
         }
     }
 
-    # One close at the lowest base covers every loop level left at once.
     fn _close_base_through(self, target: int) -> int {
         let loops = self._ctx().loops
         var base = -1
@@ -2389,9 +2225,6 @@ pub class Emitter {
         if self._range_bind_slot(pattern, false) < 0 { return false }
         let span = node.span
         let base = self._depth()
-        # Two temporaries, and a third only for `for _ in a..b`, which has no
-        # symbol to bind into. Every range loop is one nesting level of frame,
-        # and the frame is what the compiled tier spends its registers on.
         let wildcard = pattern != null and pattern.kind == NodeKind.PatWildcard
         let counter = self._alloc_temp()
         let end = self._alloc_temp()
@@ -2411,8 +2244,6 @@ pub class Emitter {
         self._chunk().write_u16(counter)
         self._chunk().write_u16(end)
 
-        # Nothing of this loop's is on the operand stack, so `break` and
-        # `continue` both unwind to `base` and neither has anything to drop.
         let capture_base = self.resolution.capture_base_of(node)
         self._enter_loop(node.opt_text("label"), start, capture_base, base, base)
         self._loop_body(node.child("body"))
@@ -2440,15 +2271,14 @@ pub class Emitter {
         }
         let start = self._chunk().here()
         let exit = self._emit_jump(Op.ForIter, span)
-        self._adjust(1)  # the element, on the fall-through path
-        # `continue` keeps the iterator (depth base+1); `break` drops it (base).
+        self._adjust(1)
         let capture_base = self.resolution.capture_base_of(node)
         self._enter_loop(node.opt_text("label"), start, capture_base, base + 1, base)
         self._bind_pattern(node.child("pattern"), span)
         self._loop_body(node.child("body"))
         self._close_iteration(capture_base, span)
         self._loop_back(start, span)
-        self._set_depth(base)  # FOR_ITER pops the exhausted iterator
+        self._set_depth(base)
         self._patch(exit)
         self._close_loop()
     }
@@ -2467,23 +2297,18 @@ pub class Emitter {
         let frame = loops[index]
         self._finally_chain_for_loop(index)
         let saved = self._depth()
-        # The inner loop's iterator and any enclosing temporaries go here.
         var want = frame.continue_depth
         if node.kind == NodeKind.Break { want = frame.break_depth }
         self._pop_n(saved - want, node.span)
-        # A closure made in this iteration must not go on aliasing the slot.
         self._close_iteration(self._close_base_through(index), node.span)
         if node.kind == NodeKind.Break {
             frame.breaks.push(self._emit_jump(Op.Jump, node.span))
         } else {
             self._loop_back(frame.continue_target, node.span)
         }
-        # Code after the jump is unreachable but still has to be emitted.
         self._set_depth(saved)
     }
 
-    # `PUSH_HANDLER` carries the branch offset *and* a type constant, so its
-    # jump site ends after both operands, which is the base `_patch_from` gets.
     fn _push_handler(self, type_const: int, span: Span) -> int {
         self._chunk().write_op(Op.PushHandler, span)
         let operand = self._chunk().here()
@@ -2492,10 +2317,6 @@ pub class Emitter {
         return operand
     }
 
-    # Matches on the type *name* as a plain STR: the tag-9 TYPE descriptor has
-    # no value representation and the reader refuses it. A union carries a
-    # tuple of names (matches `jaiCgTypeGuardConst`, src/codegen/codegen.c); a
-    # str there was wrong and `make bootstrap` caught it.
     fn _type_guard_const(self, caught: TypeExpr?) -> int {
         if caught is not null and caught.kind == TypeKind.Union {
             var names: list[Const] = []
@@ -2514,25 +2335,17 @@ pub class Emitter {
         let catches = node.records("catches")
         let base = self._depth()
 
-        # A table handler assumes depth 0 (temporaries discarded). A live `for`
-        # iterator or a `finally` forces PUSH_HANDLER instead — a `finally`
-        # because the unwinder tries dynamic handlers before the table, so a
-        # table clause there would never fire.
         let dynamic = catches.len() > 0 and (base > 0 or finally_block != null)
 
         var finally_entry = -1
         if finally_block != null {
             finally_entry = self._emit_jump(Op.PushFinally, span)
-            # A `return`, `break` or `continue` leaving the region jumps past
-            # END_FINALLY, so each of those edges inlines its own copy.
             ctx.finallys.push(finally_block)
             ctx.finally_loop_depth.push(ctx.loops.len())
         }
         var dispatch_entry = -1
         if dynamic { dispatch_entry = self._push_handler(self._string("any"), span) }
 
-        # An exception skips every block close in the guarded region: the
-        # unwinder jumps straight to the handler, reusing the body's binding slots.
         let saved_deep = ctx.deep_close_base
         ctx.deep_close_base = -1
 
@@ -2589,17 +2402,11 @@ pub class Emitter {
             self._patch_all(done)
             self._patch(finally_entry)
 
-            # One catch-all entry spans body and handlers, registered after the
-            # typed entries so the VM's first-match scan still prefers those.
             self._chunk().exceptions.push(
                 ExceptionEntry(guarded_start, catches_end, self._chunk().here(), CATCH_ALL)
             )
-            # The entry covers the handlers too, so the close is the whole
-            # region's. On the normal edge it is a no-op.
             self._close_scope(ctx.deep_close_base, span)
 
-            # Both the normal edge above and the unwinder land here. END_FINALLY
-            # resumes a pending unwind and otherwise falls through.
             ctx.protect_depth += 1
             self._stmt(finally_block)
             ctx.protect_depth -= 1
@@ -2609,14 +2416,12 @@ pub class Emitter {
             self._patch_all(done)
         }
 
-        # An outer `try` has to close what this one opened as well.
         if saved_deep >= 0 and (ctx.deep_close_base < 0 or saved_deep < ctx.deep_close_base) {
             ctx.deep_close_base = saved_deep
         }
         self._set_depth(base)
     }
 
-    # Entered by the unwinder with the stack already restored to `base`.
     fn _catch_dispatch(self, catches: list[any], base: int, done: list[int], span: Span) -> void {
         var entries: list[list[int]] = []
         self._set_depth(base)
@@ -2676,8 +2481,6 @@ pub class Emitter {
         self._op(Op.Pop, span)
     }
 
-    # The subject is bound to a temp that every test re-reads, which is what
-    # makes the miss invariant hold: a failing test always leaves exactly one value pushed.
     fn _match(self, node: Node, as_expression: bool) -> void {
         let span = node.span
         let base = self._depth()
@@ -2739,8 +2542,6 @@ pub class Emitter {
         self._free_temps(1)
     }
 
-    # Test the value in `slot`, leaving nothing behind on success. Every failure
-    # path jumps to an offset appended to `misses` with one value pushed.
     fn _pattern_in_slot(self, pattern: Node?, slot: int, misses: list[int]) -> void {
         if pattern == null { return }
         let span = pattern.span
@@ -2788,7 +2589,6 @@ pub class Emitter {
         }
     }
 
-    # A sub-pattern on the value on top: parked so every test addresses a slot.
     fn _sub_pattern(self, sub: Node?, misses: list[int], span: Span) -> void {
         if sub == null or sub.kind == NodeKind.PatWildcard {
             self._op(Op.Pop, span)
@@ -2831,7 +2631,6 @@ pub class Emitter {
         }
     }
 
-    # Only the last alternative's failures escape to the enclosing pattern.
     fn _test_or(self, pattern: Node, slot: int, misses: list[int]) -> void {
         let alternatives = pattern.child_list("elems")
         if alternatives.len() == 0 { return }
@@ -2864,7 +2663,6 @@ pub class Emitter {
         let fixed = if has_rest { count - 1 } else { count }
         let tail = if has_rest { count - rest - 1 } else { 0 }
 
-        # With a rest the count is a minimum; without one it is the exact length.
         self._get_local(slot, span)
         self._chunk().write_op(Op.MatchSeq, span)
         self._chunk().write_byte(if fixed > 255 { 255 } else { fixed })
@@ -2874,7 +2672,6 @@ pub class Emitter {
 
         for (index, element) in elements.enumerate() {
             if has_rest and index == rest {
-                # value[rest : -tail], or value[rest:] when the rest is last.
                 self._get_local(slot, span)
                 self._emit_int(rest, span)
                 var flags = 1
@@ -2905,8 +2702,6 @@ pub class Emitter {
         self._get_local(slot, span)
         self._chunk().write_op(Op.MatchType, span)
         if tag < 0 {
-            # Declared in another module, so its tag numbering isn't visible
-            # here; MATCH_TYPE resolves the dotted name at run time instead (BYTECODE.md §3.9).
             self._chunk().write_u24(self._string(f"{owner ?? "?"}.{variant ?? "?"}"))
         } else {
             self._chunk().write_u24(self._string(owner ?? "any"))
@@ -2915,8 +2710,6 @@ pub class Emitter {
         self._op(Op.Pop, span)
 
         if tag >= 0 {
-            # ENUM_TAG peeks, so drop the enum value and test the tag alone:
-            # that keeps the one-extra-value miss invariant.
             self._get_local(slot, span)
             self._op(Op.EnumTag, span)
             self._op(Op.Swap, span)
@@ -2947,8 +2740,6 @@ pub class Emitter {
         self._op(Op.Pop, span)
         if sub_patterns.len() == 0 { return }
 
-        # MATCH_FIELDS destructures in one step: its constant is a tuple of field
-        # names, it peeks the object, and on success pushes one value per name.
         var names: list[Const] = []
         for index in range(sub_patterns.len()) {
             names.push(Const(ConstTag.Str, _field_name(pattern, index)))
@@ -2957,9 +2748,8 @@ pub class Emitter {
         self._chunk().write_op(Op.MatchFields, span)
         self._chunk().write_u24(self._chunk().add_constant(Const(ConstTag.Tuple, names)))
         misses.push(self._reserve_jump())
-        self._adjust(sub_patterns.len())  # the success path pushes one per field
+        self._adjust(sub_patterns.len())
 
-        # Fields come off last-first; park them so sub-patterns compile in order.
         var temps: list[int] = []
         for _index in range(sub_patterns.len()) { temps.push(0) }
         var index = sub_patterns.len() - 1
@@ -2968,7 +2758,7 @@ pub class Emitter {
             self._bind_local(temps[index], span)
             index -= 1
         }
-        self._op(Op.Pop, span)  # the object MATCH_FIELDS left under
+        self._op(Op.Pop, span)
 
         for (position, element) in sub_patterns.enumerate() {
             self._pattern_in_slot(element, temps[position], misses)
@@ -2976,8 +2766,6 @@ pub class Emitter {
         self._free_temps(sub_patterns.len())
     }
 
-    # Declaration order of `Enum.Variant` (the tag ENUM_TAG pushes), or -1 when
-    # declared elsewhere — not an error: `_test_enum` falls back to dotted MATCH_TYPE.
     fn _variant_tag(self, pattern: Node) -> int {
         let name = pattern.opt_text("variantName")
         let owner = pattern.opt_text("typeName")
@@ -2991,7 +2779,6 @@ pub class Emitter {
     }
 }
 
-# Not a binding of this frame: a global, and every class, trait and enum.
 fn _symbol_is_global_like(symbol: Symbol) -> bool {
     let kind = symbol.kind
     return not (kind == SymbolKind.Local or kind == SymbolKind.Param or kind == SymbolKind.Upvalue or kind == SymbolKind.Field)
@@ -3028,9 +2815,6 @@ fn _field_kind_code(declared: TypeExpr?, type_params: list[str]) -> int {
         if n == "list" { return 5 }
         if n == "dict" { return 6 }
         if n == "any" { return 0 }
-        # A class or trait name. Not `instance` yet: telling a class name from
-        # an alias or an enum needs the checker, which does not run here, and
-        # an enum value is not an instance.
         return 0
     }
 
@@ -3041,7 +2825,6 @@ fn _field_kind_code(declared: TypeExpr?, type_params: list[str]) -> int {
         return 0
     }
 
-    # Optional, Union, Fn, Tuple, Infer.
     return 0
 }
 
@@ -3093,7 +2876,6 @@ fn _is_items_call(iterable: Node?) -> bool {
     let target: Node = callee
     if target.kind != NodeKind.Member { return false }
     if target.opt_text("name") != "items" { return false }
-    # `super.items()` binds to slot 0 and has its own lowering.
     let receiver = target.child("object")
     if receiver == null { return false }
     let recv: Node = receiver
@@ -3139,9 +2921,6 @@ fn _assert_message(node: Node, source: str?) -> str {
 
     let cond = node.child("cond")
     if source != null and cond != null and cond.span.is_known() {
-        # Span is a BYTE offset (as in the C), but Jaithon slices strings by
-        # scalar — wrong past a multi-byte char. Bytes have no slice either
-        # (`raw[start:stop]` raises `TypeError`), so take bytes one at a time.
         let raw = __prim__.str_encode(source)
         let start = cond.span.start
         var stop = cond.span.end
@@ -3159,9 +2938,6 @@ fn _assert_message(node: Node, source: str?) -> str {
     return "assertion failed"
 }
 
-# Drops the last scalar if the cut landed mid-character: `str_decode` refuses
-# invalid UTF-8, so the longest valid prefix is the only faithful answer (the C
-# truncates at a byte and prints mojibake).
 fn _decoded(raw: list[int]) -> str {
     var length = raw.len()
     while length > 0 {
@@ -3231,7 +3007,4 @@ pub fn emit(
     return emitter.compile_program(program, module_name)
 }
 
-# `jaithon.compile.opt` can't be imported here (circular import, E0801), so the
-# driver is handed in and run where jaiCgFinishFunction calls jaiOptimize —
-# once per function, not once over the module, since slot coalescing isn't idempotent.
 fn _no_optimize(proto: FuncProto, level: int) -> void { }

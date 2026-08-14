@@ -26,10 +26,6 @@ from jaithon.compile.token import keyword_lookup, kind_name, kind_text
 #: How deep f-string interpolations may nest before `E0009`.
 pub const MAX_INTERPOLATION_DEPTH: int = 8
 
-# Bracket-stack markers; every kind but `_BRK_BRACE_BLOCK` suppresses newlines
-# (§1.3), since it alone did not open an expression. An interpolation pushes
-# `_BRK_INTERP` or-ed with the string's flavour bits, so a nested f-string
-# lexes on this same stack with no recursion needed.
 const _BRK_PAREN = 1
 const _BRK_BRACKET = 2
 const _BRK_BRACE_BLOCK = 3
@@ -122,13 +118,10 @@ pub class Lexer {
         self.pos = 0
         self.line = 1
         self.at_line_start = true
-        # A leading byte-order mark is not source text.
         if self.length > 0 and self.chars[0] == "\u{FEFF}" { self.pos = 1 }
 
         while self.pos < self.length { self._scan_token() }
 
-        # An interpolation still open at EOF gets a synthetic empty `FStringEnd`,
-        # so the parser always sees a balanced START/END sequence.
         if self.interp_depth > 0 {
             self._error(
                 Code.E0008_UNTERMINATED_INTERPOLATION,
@@ -179,8 +172,6 @@ pub class Lexer {
         return Span(self.file_id, self.offsets[start], self.offsets[end])
     }
 
-    # Byte offsets only ever land on scalar boundaries, so a binary search over
-    # the offset table is exact.
     fn _scalar_index(self, byte_offset: int) -> int {
         var low = 0
         var high = self.offsets.len() - 1
@@ -239,9 +230,6 @@ pub class Lexer {
         return self.brackets.len() > 0 and self._bracket_top() != _BRK_BRACE_BLOCK
     }
 
-    # `import *` is the one place `*` ends a statement, not an expression —
-    # without this, the newline after it is swallowed as an operator
-    # continuation and two consecutive `from x import *` lines fail to parse.
     fn _ends_wildcard_import(self) -> bool {
         let count = self.tokens.len()
         if count < 2 { return false }
@@ -262,20 +250,12 @@ pub class Lexer {
         self.at_line_start = true
     }
 
-    # Ambiguity resolves to BLOCK: mistaking a block for an expression swallows
-    # its statement-separating newlines, while the reverse only leaves harmless
-    # NEWLINE tokens the parser skips. So only an unmistakable expression
-    # position opens an expression.
     fn _brace_opens_expression(self) -> bool {
         let previous = self._last_kind()
         if _is_operator(previous) { return true }
         if previous == TokenKind.LBrace {
-            # `{{` — inherit from the brace we are already inside.
             return self._bracket_top_is_expression()
         }
-        # `?` is deliberately absent (as in `_is_continuation`): it's the
-        # optional-type suffix, so including it would misparse
-        # `fn f() -> int? { ... }` as an expression brace.
         return match previous {
             TokenKind.Comma | TokenKind.Colon | TokenKind.LParen | TokenKind.LBracket => true,
             TokenKind.QuestionQuestion => true,
@@ -397,8 +377,6 @@ pub class Lexer {
             ok = digits_ok
             text = digits
 
-            # A `.` belongs to the number only when a digit follows it, so
-            # `0..10` is INT DOTDOT INT and `1.foo` is INT DOT IDENT.
             if ok and self._peek() == "." and _is_digit(self._peek_at(1)) {
                 is_float = true
                 self.pos += 1
@@ -426,15 +404,10 @@ pub class Lexer {
             self._push(TokenKind.Float, start, self.pos, value)
             return
         }
-        # A literal that does not fit was already reported; it lexes as 0 so that
-        # the parser still sees a well-formed token stream.
         var value = 0
         var flags = 0
         if ok {
             value = self._parse_int_text(text, base, start) ?? 0
-            # Only 9223372036854775808 is the magnitude of the smallest `int`;
-            # recognising the sign+magnitude pair here saves the parser a
-            # second read of the digits.
             if value == _INT_MIN and self._is_negated_literal() {
                 flags = TokenFlags.NEG_MAGNITUDE
             }
@@ -469,10 +442,6 @@ pub class Lexer {
         return value
     }
 
-    # The smallest int's magnitude is admitted only right after a prefix `-`,
-    # decided by token kind rather than whitespace — keeping `a -1` a
-    # subtraction, `- x` a negation, and disqualifying `--9223372036854775808`
-    # (not a valid `int`).
     fn _is_negated_literal(self) -> bool {
         let count = self.tokens.len()
         if count == 0 or self.tokens[count - 1].kind != TokenKind.Minus { return false }
@@ -481,8 +450,6 @@ pub class Lexer {
         return before != TokenKind.Minus and not _ends_operand(before)
     }
 
-    # A letter or digit glued to the end of a literal is never valid: there are
-    # no literal suffixes, so `2f` and `0b102` are typos, not two tokens.
     fn _reject_number_suffix(self, base: int, start: int) -> bool {
         let character = self._peek()
         if character == "" { return true }
@@ -512,8 +479,6 @@ pub class Lexer {
         if to_index > from_index { out.push(self.source[from_index:to_index]) }
     }
 
-    # Returns false when the escape was rejected; the backslash is always
-    # consumed regardless, so the caller still makes progress.
     fn _scan_escape(self, out: StringBuilder) -> bool {
         let escape_start = self.pos
         self.pos += 1
@@ -523,8 +488,6 @@ pub class Lexer {
 
         if character == "x" { return self._scan_hex_escape(out, escape_start) }
         if character == "u" { return self._scan_unicode_escape(out, escape_start) }
-        # Checked by membership, not the cooked string's length: `\0` cooks to
-        # a NUL-only string, so length would ask the wrong question.
         if character in _SIMPLE_ESCAPES {
             out.push(_SIMPLE_ESCAPES[character])
             return true
@@ -536,7 +499,7 @@ pub class Lexer {
             f"unknown escape sequence `\\{character}`",
             help: "valid escapes are \\n \\t \\r \\\\ \\\" \\' \\0 \\xNN \\u{...}"
         )
-        out.push(character)  # recover as if the backslash were absent
+        out.push(character)
         return false
     }
 
@@ -557,7 +520,7 @@ pub class Lexer {
             value = value * 16 + digit
             self.pos += 1
         }
-        out.push(chr(value))  # \xNN names a scalar, encoded as UTF-8
+        out.push(chr(value))
         return true
     }
 
@@ -644,7 +607,7 @@ pub class Lexer {
             }
 
             if character == "\r" and self._peek_at(1) == "\n" {
-                self._flush(out, run_start, self.pos)  # §1.1: the \r of a CRLF is dropped
+                self._flush(out, run_start, self.pos)
                 self.pos += 1
                 run_start = self.pos
                 continue
@@ -652,8 +615,6 @@ pub class Lexer {
 
             if character == "\n" {
                 if not flavor.triple {
-                    # Leave the newline for the main loop so that the next line
-                    # still lexes as statements.
                     self._flush(out, run_start, self.pos)
                     self._error(
                         _unterminated_code(flavor),
@@ -671,7 +632,7 @@ pub class Lexer {
 
             if character == "\\" {
                 if flavor.raw {
-                    self.pos += 1  # raw strings keep the backslash
+                    self.pos += 1
                     continue
                 }
                 self._flush(out, run_start, self.pos)
@@ -734,15 +695,11 @@ pub class Lexer {
     fn _resume_fstring(self, flavor: _StrFlavor, token_start: int) -> void {
         let out = StringBuilder()
         let (stop, saw_escape) = self._scan_string_chunk(flavor, out, token_start)
-        # A broken chunk still ends the f-string, so the parser sees a balanced
-        # START ... END sequence and can keep going.
         let kind = stop == _ChunkStop.Interp ? TokenKind.FStringMid : TokenKind.FStringEnd
         self._push(kind, token_start, self.pos, out.build(), _string_flags(flavor, saw_escape))
         if stop == _ChunkStop.Interp { self._open_interpolation(flavor) }
     }
 
-    # The cursor sits on the opening quote; `token_start` is the start of the
-    # token, which for a prefixed literal is the `r` or `f`.
     fn _scan_string_literal(self, token_start: int, raw: bool, interp: bool) -> void {
         let quote = self.chars[self.pos]
         let triple = self._peek_at(1) == quote and self._peek_at(2) == quote
@@ -765,15 +722,12 @@ pub class Lexer {
         }
     }
 
-    # A `:` at an interpolation's top level starts a format spec (§1.7): it's
-    # data, not Jaithon source (`.2f` would not lex as a number), so it's
-    # captured whole as one string token for `std.fmt`.
     fn _scan_format_spec(self) -> void {
         let start = self.pos
         var depth = 0
         while self.pos < self.length {
             let character = self.chars[self.pos]
-            if character == "\n" { break }  # unterminated; reported at the `}`
+            if character == "\n" { break }
             if character == "{" {
                 depth += 1
             } elif character == "}" {
@@ -806,8 +760,6 @@ pub class Lexer {
         self.pos = self._ident_run_end(start)
         let text = self.source[start:self.pos]
 
-        # String prefixes `r`, `f` and their combination, only when the quote is
-        # adjacent, so `r "x"` stays an identifier followed by a string.
         if text.len() <= 2 and (self._peek() == "\"" or self._peek() == "'") {
             var raw = false
             var interp = false
@@ -828,8 +780,6 @@ pub class Lexer {
             }
         }
 
-        # `__foo__` is reserved for the implementation (§1.4), but rejecting it
-        # is the parser's call: the standard library declares such names.
         var kind = keyword_lookup(text)
         if kind == TokenKind.Ident and text == "_" { kind = TokenKind.Underscore }
         self._push(kind, start, self.pos)
@@ -843,10 +793,6 @@ pub class Lexer {
         }
     }
 
-    # `'name` is a label, `'text'` a string; the grammar decides: a label is
-    # only declared as `'name:` at a statement start, or used after
-    # `break`/`continue` — everything else starting with `'` is a string, so
-    # `'single quotes'` isn't misread as a label.
     fn _scan_quote_or_label(self) -> void {
         let start = self.pos
         let after = start + 1
@@ -876,10 +822,6 @@ pub class Lexer {
     }
 
     # --- punctuation and operators ---------------------------------------
-
-    # Pop only on a match — a stray closer is the parser's problem (E0107);
-    # popping blindly would corrupt the newline-suppression state of
-    # enclosing brackets.
     fn _pop_bracket(self, expected: int) -> void {
         if self.brackets.len() > 0 and self._bracket_top() == expected {
             self.brackets.pop()
@@ -895,8 +837,6 @@ pub class Lexer {
 
     fn _close_brace(self, start: int) -> void {
         if self._bracket_top_is_interp() {
-            # Closes an interpolation (no token emitted); `f"{}"` must be caught
-            # here since it's otherwise indistinguishable from no interpolation.
             let last = self._last_kind()
             if last == TokenKind.FStringStart or last == TokenKind.FStringMid {
                 self._error(
@@ -912,7 +852,6 @@ pub class Lexer {
             self._resume_fstring(_flavor_from_marker(marker), start)
             return
         }
-        # §1.3: a NEWLINE immediately before `}` is discarded.
         if self.tokens.len() > 0 and self._last_kind() == TokenKind.Newline {
             self.tokens.pop()
         }
@@ -962,8 +901,6 @@ pub class Lexer {
         self._push(kind, start, self.pos)
     }
 
-    # Everything whose kind is decided by the characters alone. `}`, `:` and `!`
-    # are handled by the caller because they do more than emit a token.
     fn _punct_kind(self, character: str) -> TokenKind? {
         if character == "(" {
             self.brackets.push(_BRK_PAREN)
@@ -1072,7 +1009,7 @@ pub class Lexer {
             character == "\r" or
             character == "\u{B}" or
             character == "\u{C}" {
-            self.pos += 1  # §1.1: a lone \r is discarded, the \n terminates
+            self.pos += 1
             return
         }
         if character == "\n" {
@@ -1177,8 +1114,6 @@ fn _base_of(prefix: str) -> int {
     return 0
 }
 
-# Assumes `digits`' leading zeros are already stripped: length alone decides
-# whether it fits the 64-bit `int`.
 fn _fits_in_int(digits: str, base: int, negated: bool) -> bool {
     let count = digits.len()
     if base == 16 { return count <= 16 }
@@ -1186,7 +1121,6 @@ fn _fits_in_int(digits: str, base: int, negated: bool) -> bool {
     if base == 2 { return count <= 64 }
     if count < 19 { return true }
     if count > 19 { return false }
-    # Same length, so a lexicographic comparison is a numeric one.
     if digits <= "9223372036854775807" { return true }
     return negated and digits == "9223372036854775808"
 }
@@ -1198,17 +1132,12 @@ fn _utf8_length(code: int) -> int {
     return 4
 }
 
-# Non-ASCII scalars that behave as separators rather than letters. Source is not
-# allowed to smuggle these into identifiers, where they would be invisible.
 fn _is_unicode_space(code: int) -> bool {
     if code == 0x00A0 or code == 0x1680 or code == 0x3000 or code == 0xFEFF { return true }
     if code >= 0x2000 and code <= 0x200D { return true }
     return code == 0x2028 or code == 0x2029 or code == 0x202F or code == 0x205F
 }
 
-# Approximates XID_Start/XID_Continue (§1.4) rather than using real XID
-# tables (~10KB, unneeded here): accepts any scalar >= 0x80 except space-like
-# and General Punctuation ranges, still rejecting pasted-in smart quotes.
 fn _is_unicode_ident(code: int) -> bool {
     if code < 0x80 { return false }
     if _is_unicode_space(code) { return false }
@@ -1217,7 +1146,6 @@ fn _is_unicode_ident(code: int) -> bool {
     return true
 }
 
-# Every operator token, `Plus` through `ShrEq` in token.h order.
 fn _is_operator(kind: TokenKind) -> bool {
     return match kind {
         TokenKind.Plus | TokenKind.Minus | TokenKind.Star | TokenKind.Slash => true,
@@ -1234,10 +1162,6 @@ fn _is_operator(kind: TokenKind) -> bool {
     }
 }
 
-# Tokens after which a newline can't end a statement: §1.3's list plus `..`,
-# `..=`, and `{` (harmless for blocks, since the grammar already allows
-# `"{" { NEWLINE }`, and it keeps multi-line dict/set literals working). `?`
-# is deliberately absent — `let x: int?` ends a statement with it.
 fn _is_continuation(kind: TokenKind) -> bool {
     if _is_operator(kind) { return true }
     return match kind {
@@ -1296,8 +1220,6 @@ pub fn dump_tokens(source: str, file_id: int = 0) -> str {
     let lexer = Lexer(source, file_id, DiagnosticBag())
     let tokens = lexer.tokenize()
 
-    # Tokens are in source order, so one cursor walk computes every position;
-    # columns count scalars, not bytes (spec 1.1).
     let chars = [character for character in source]
     var offsets: list[int] = []
     var byte_offset = 0

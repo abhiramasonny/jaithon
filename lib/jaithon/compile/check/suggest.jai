@@ -18,15 +18,11 @@ pub const SUGGEST_NO_MATCH: int = 4
 # `JAI_SUGGEST_MAX_LEN`: past this a name is not compared at all.
 const SUGGEST_MAX_LEN: int = 64
 
-# `jaiNameDistance` in src/common/diag.c: a bounded Damerau-Levenshtein, three
-# rows because a transposition looks back two. The C compares bytes and this
-# compares scalars, which agree over ASCII.
 pub fn name_distance(a: str, b: str, max_distance: int) -> int {
     if max_distance < 0 { return max_distance + 1 }
     let la = a.len()
     let lb = b.len()
     if la > SUGGEST_MAX_LEN or lb > SUGGEST_MAX_LEN { return max_distance + 1 }
-    # The length gap alone is already a lower bound on the distance.
     let gap = if la > lb { la - lb } else { lb - la }
     if gap > max_distance { return max_distance + 1 }
 
@@ -51,7 +47,6 @@ pub fn name_distance(a: str, b: str, max_distance: int) -> int {
             var d = prev[column] + 1
             if cur[column - 1] + 1 < d { d = cur[column - 1] + 1 }
             if prev[column - 1] + cost < d { d = prev[column - 1] + cost }
-            # Adjacent transposition costs one, not two.
             if row > 1 and column > 1 {
                 let swapped = a[row - 1] == b[column - 2] and a[row - 2] == b[column - 1]
                 if swapped and prev2[column - 2] + 1 < d { d = prev2[column - 2] + 1 }
@@ -60,7 +55,6 @@ pub fn name_distance(a: str, b: str, max_distance: int) -> int {
             if d < best { best = d }
             column += 1
         }
-        # Every remaining row can only add to the running minimum.
         if best > max_distance { return max_distance + 1 }
         var at = 0
         while at <= lb {

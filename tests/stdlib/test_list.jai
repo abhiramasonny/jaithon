@@ -107,8 +107,6 @@ fn test_unzip_undoes_a_pair_list() -> void {
 }
 
 fn test_scan_reports_every_intermediate_state() -> void {
-    # `initial` comes first, so the result is one longer than the input and
-    # its last element is the whole fold.
     assert_eq(list.scan([1, 2, 3], 0, |acc, x| acc + x), [0, 1, 3, 6])
     assert_eq(list.scan([], 0, |acc, x| acc + x), [0])
 }

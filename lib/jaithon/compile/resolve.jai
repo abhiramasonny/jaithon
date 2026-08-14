@@ -128,8 +128,6 @@ pub class Resolver {
         self._push(ScopeKind.Module)
 
         self._block_contents(program.child_list("stmts"))
-        # Field slots need every class in the program, including those whose
-        # superclass is declared further down.
         for info in self.classes { self._assign_field_slots(info) }
 
         self._pop()
@@ -164,8 +162,6 @@ pub class Resolver {
         }
     }
 
-    # Functions, classes, traits, enums and parameters never warn: they are part
-    # of an interface even when this file never mentions them again.
     fn _report_unused(self, symbol: Symbol) -> void {
         if symbol.is_used or symbol.name.starts_with("_") { return }
         if symbol.visibility == Visibility.Public { return }
@@ -197,8 +193,6 @@ pub class Resolver {
     fn _alloc_slot(self, span: Span) -> int {
         let owner = self._current_fn()
         if owner.next_slot >= MAX_LOCALS {
-            # Report once, on the declaration that crosses the line, then keep
-            # handing out the same slot so the rest of the pass still runs.
             if owner.next_slot == MAX_LOCALS {
                 self.bag.error(
                     SemaCode.E0208_TOO_MANY_LOCALS,
@@ -251,14 +245,10 @@ pub class Resolver {
         symbol.depth = scope.depth
         if symbol.is_slotted() { symbol.slot = self._alloc_slot(span) }
         scope.names[name] = symbol
-        # A duplicate replaces the earlier binding for lookup, but is not listed
-        # twice for the unused-binding walk.
         if not duplicate and not is_discard { scope.order.push(symbol) }
         return symbol
     }
 
-    # Innermost slotted binding of this name outside the current scope, ignoring
-    # class bodies. Only used to decide whether a declaration shadows (W0103).
     fn _find_shadowed(self, name: str) -> Symbol? {
         var index = self.scopes.len() - 2
         while index >= 0 {
@@ -272,7 +262,6 @@ pub class Resolver {
         return null
     }
 
-    # Module-level bindings are globals (spec §8); everything else gets a slot.
     fn _binding_kind(self) -> SymbolKind {
         if self._current().kind == ScopeKind.Module { return SymbolKind.Global }
         return SymbolKind.Local
@@ -306,9 +295,6 @@ pub class Resolver {
         return owner.upvalues.len() - 1
     }
 
-    # Crafting Interpreters' resolveUpvalue: the function just inside the
-    # owner captures the local; each function after it recaptures the
-    # upvalue of the one before.
     fn _capture(self, owner_index: int, slot: int, by_value: bool, span: Span) -> int {
         var index = self._add_upvalue(self.functions[owner_index + 1], slot, true, by_value, span)
         var level = owner_index + 2
@@ -330,11 +316,6 @@ pub class Resolver {
         return symbol.decl == null or symbol.decl.kind != NodeKind.FnDecl
     }
 
-    # Spec §5.2: each iteration declares its bindings afresh, so two closures
-    # from different iterations must not share a cell. A by-value capture is
-    # already a snapshot; a by-reference one closes at the iteration boundary
-    # instead, owned by the *innermost* enclosing loop (which runs before any
-    # outer iteration boundary).
     fn _mark_captured_in_loop(self, scope_index: int, slot: int) -> void {
         if slot < 0 { return }
         var index = scope_index
@@ -346,7 +327,6 @@ pub class Resolver {
                 }
                 return
             }
-            # Parameters and function-level locals outlive no iteration.
             if scope.kind == ScopeKind.Function or scope.kind == ScopeKind.Module {
                 return
             }
@@ -354,11 +334,6 @@ pub class Resolver {
         }
     }
 
-    # Same argument, one block down: block-scoped slots are reused by sibling
-    # blocks, so an escaped closure aliasing a dead slot would silently read
-    # the wrong value. Only the declaring scope records the close, innermost
-    # first; slots declared straight in a loop or function scope are covered
-    # by the iteration close and by OP_RETURN instead.
     fn _mark_captured_in_block(self, scope_index: int, slot: int) -> void {
         if slot < 0 { return }
         let scope = self.scopes[scope_index]
@@ -368,8 +343,6 @@ pub class Resolver {
         }
     }
 
-    # One upvalue symbol per (function, index), so the emitter can produce
-    # GET_UPVALUE from the symbol alone.
     fn _upvalue_alias(self, symbol: Symbol, index: int) -> Symbol {
         let owner = self._current_fn()
         for alias in owner.aliases {
@@ -415,17 +388,10 @@ pub class Resolver {
                 }
             }
             if name in scope.pending and name not in scope.cleared {
-                # Within the current function this is unambiguously a read
-                # before declaration; across a function boundary the closure
-                # may legitimately run later, so keep looking.
                 if scope.fn_index == current_fn {
                     self._use_before_decl(name, span, scope.pending[name])
                     return null
                 }
-                # A module-level binding is initialised by the module body,
-                # which runs before any function declared above it can be
-                # called (spec §3) — only a same-block read is premature, so
-                # this stays unresolved and the emitter loads a global.
                 if scope.kind == ScopeKind.Module {
                     cross_module = true
                 } elif cross_fn == null {
@@ -464,8 +430,6 @@ pub class Resolver {
         diag.label(decl_span, f"`{name}` is declared here, later in this scope")
     }
 
-    # A name that cannot be resolved statically but is still legal: REPL globals
-    # and anything a wildcard import may have brought in.
     fn _deferred_global(self, name: str, span: Span) -> Symbol {
         let root = self.scopes[0]
         let existing = root.names.get(name, null)
@@ -483,16 +447,10 @@ pub class Resolver {
         self.out.bind(node, self.resolve_name(node.text("name"), node.span, mark_used))
     }
 
-    # Whether an `Index` node's brackets held type arguments, not a subscript.
-    # Only the symbol table can tell, so the parser leaves both spellings as
-    # `Index` and this decides.
     fn _is_generic_instantiation(self, node: Node) -> bool {
         let object = node.child("object")
         if object == null { return false }
 
-        # `m.Box[int]` after `import m`: a module member resolves by name at
-        # run time, so only the brackets can decide generic-ness here, same
-        # as for a directly imported name.
         if object.kind == NodeKind.Member {
             let base = object.child("object")
             if base == null or base.kind != NodeKind.Ident { return false }
@@ -517,11 +475,11 @@ pub class Resolver {
             if _names_a_type(symbol.kind) { return true }
             return _is_import_binding(symbol)
         }
-        if node.kind == NodeKind.Index {  # list[T], tuple[K, V]
+        if node.kind == NodeKind.Index {
             return self._type_argument_like(node.child("object"), depth + 1) and
                 self._type_argument_like(node.child("index"), depth + 1)
         }
-        if node.kind == NodeKind.TupleLit {  # `Pair[A, B]`'s shape
+        if node.kind == NodeKind.TupleLit {
             let items = node.child_list("items")
             for item in items {
                 if not self._type_argument_like(item, depth + 1) { return false }
@@ -541,8 +499,6 @@ pub class Resolver {
         return null
     }
 
-    # A name used only in a type annotation binds in the checker, not here, but
-    # it must not be reported as unused either.
     fn _mark_type_used(self, declared: TypeExpr?) -> Symbol? {
         return self._mark_named_type(declared?.name)
     }
@@ -580,8 +536,6 @@ pub class Resolver {
         return symbol
     }
 
-    # A declaration that lives in a frame gets its slot at hoist time: a
-    # mutually recursive sibling may capture it before the statement is reached.
     fn _slot_hoisted(self, symbol: Symbol?, span: Span) -> void {
         if symbol == null { return }
         if self._current().kind == ScopeKind.Module { return }
@@ -656,14 +610,11 @@ pub class Resolver {
                     }
                 }
             } elif kind == NodeKind.VarDecl {
-                # Not hoisted, only remembered, so that a read above the
-                # declaration is E0201 rather than a bind to an outer name.
                 self._pattern_names(node.child("pattern"), false)
             }
         }
     }
 
-    # `clear` marks the names as declared once their statement is reached.
     fn _pattern_names(self, pattern: Node?, clear: bool) -> void {
         if pattern == null { return }
         let kind = pattern.kind
@@ -697,8 +648,6 @@ pub class Resolver {
         decl: Node?,
         or_alternative: bool
     ) -> Symbol {
-        # Every arm of an or-pattern binds the same names: the first arm
-        # declares them and the rest reuse those symbols.
         if or_alternative {
             let existing = self._current().names.get(name, null)
             if existing != null { return existing }
@@ -746,8 +695,6 @@ pub class Resolver {
                 self._pattern(element, declare, mutability, decl, position > 0 or or_alternative)
             }
         } elif kind == NodeKind.PatClass or kind == NodeKind.PatEnum {
-            # The type name must exist; whether the variant does is the
-            # checker's business.
             self._mark_named_type(pattern.opt_text("typeName"))
             for element in pattern.child_list("subPatterns") {
                 self._pattern(element, declare, mutability, decl, or_alternative)
@@ -803,8 +750,6 @@ pub class Resolver {
             receiver.decl = node
             receiver.is_initialized = true
             receiver.is_used = true
-            # `self` occupies slot 0, so declared parameters still start at 1:
-            # the receiver is not an extra slot.
             scope_fn.next_slot = 1
             scope_fn.local_count = 1
             self.self_ok = true
@@ -839,8 +784,6 @@ pub class Resolver {
         var index = first_param
         while index < params.len() {
             let param = params[index]
-            # Defaults are re-evaluated per call inside the callee frame, so they
-            # see the parameters declared before them.
             self._node(param["defaultValue"])
             let symbol = self.declare(param["name"], SymbolKind.Param, param["span"], DeclKind.Var)
             symbol.decl = node
@@ -854,8 +797,6 @@ pub class Resolver {
             if node.flag("isExprBody") or body.kind != NodeKind.Block {
                 self._node(body)
             } else {
-                # The body shares the function scope: parameters and top-level
-                # body locals are one contiguous run of slots.
                 self._block_contents(body.child_list("stmts"))
             }
         }
@@ -889,8 +830,6 @@ pub class Resolver {
         symbol.decl = method
         symbol.visibility = method.visibility()
         symbol.is_initialized = true
-        # Members are reached through the class, never by bare name, so "unused"
-        # would mean nothing here.
         symbol.is_used = true
         self.out.bind(method, symbol)
     }
@@ -921,7 +860,6 @@ pub class Resolver {
                 )
             )
         }
-        # The superclass and the trait list live in the enclosing scope.
         let superclass = node.type_field("superclass")
         let super_symbol = self._mark_type_used(superclass)
         for trait_type in node.type_list("traits") { self._mark_type_used(trait_type) }
@@ -943,10 +881,8 @@ pub class Resolver {
         }
         for method in node.child_list("methods") { self._declare_member(method, false) }
         for getter in node.child_list("getters") { self._declare_member(getter, false) }
-        # A property's getter and setter share one member name.
         for setter in node.child_list("setters") { self._declare_member(setter, true) }
 
-        # Field defaults run before any method body, and without `self`.
         let saved_self = self.self_ok
         self.self_ok = false
         for field in node.records("fields") { self._node(field["defaultValue"]) }
@@ -1015,8 +951,6 @@ pub class Resolver {
         self._pop()
     }
 
-    # Instance-field slots run parents first, in declaration order, so that a
-    # subclass's inline caches stay valid for inherited fields (§6).
     fn _assign_field_slots(self, info: ClassInfo) -> void {
         if info.state == 2 { return }
         if info.state == 1 {
@@ -1037,7 +971,6 @@ pub class Resolver {
         let parent = self._find_class_info(info.super_symbol)
         if parent != null {
             self._assign_field_slots(parent)
-            # The recursion may have closed this class out through a cycle.
             if info.state == 2 { return }
             base = parent.total
         }
@@ -1089,7 +1022,6 @@ pub class Resolver {
             )
         }
 
-        # From here on the name is declared, so a later read is a normal bind.
         let pattern = node.child("pattern")
         self._pattern_names(pattern, true)
         self._pattern(pattern, true, decl_kind, node, false)
@@ -1107,7 +1039,7 @@ pub class Resolver {
     fn _assign_target(self, node: Node?, compound: bool) -> void {
         if node == null { return }
         if node.kind != NodeKind.Ident {
-            self._node(node)  # member, index and slice targets bind the object
+            self._node(node)
             return
         }
         self._ident(node, compound)
@@ -1151,8 +1083,6 @@ pub class Resolver {
     }
 
     fn _for(self, node: Node) -> void {
-        # The iterable is evaluated in the enclosing scope, before the loop
-        # variable exists.
         self._node(node.child("iterable"))
         let label = node.opt_text("label")
         self.loop_labels.push(label)
@@ -1253,7 +1183,6 @@ pub class Resolver {
         }
     }
 
-    # Is the current function a real `fn` rather than the module body?
     fn _in_function_body(self) -> bool {
         return self._current_fn().decl.kind != NodeKind.Program
     }
@@ -1272,11 +1201,6 @@ pub class Resolver {
             NodeKind.FString => { self._each(node.child_list("parts")) }
             NodeKind.Ident => { self._ident(node, true) }
             NodeKind.Self => {
-                # A nested function has no receiver in slot 0, but the
-                # enclosing method's `self` is an ordinary `let` that closures
-                # capture (spec §6) — resolving it as that name reuses the
-                # upvalue machinery instead of inventing a second one. Only
-                # `self` with no enclosing method at all is an error.
                 if not self.self_ok {
                     let captured = self.resolve_name("self", node.span, true)
                     if captured != null {
@@ -1324,12 +1248,6 @@ pub class Resolver {
                 for argument in node.records("args") { self._node(argument["value"]) }
             }
             NodeKind.Index => {
-                # `Box[int](0)`/`Pair[A, B](a, b)` parse as Index since only the
-                # symbol table (not the parser) can tell a generic type apart;
-                # once resolved, a class/trait/enum/alias receiver means the
-                # brackets held *type* arguments and must not be resolved as
-                # values — generics are erased at run time (spec §6.1), so the
-                # checker reads them off the tree instead.
                 self._node(node.child("object"))
                 if self._is_generic_instantiation(node) {
                     self.out.set_type_args(node)
@@ -1433,13 +1351,10 @@ pub class Resolver {
             NodeKind.EnumDecl => { self._enum_decl(node) }
             NodeKind.Export => { self._export(node) }
             _ => { self._pattern(node, false, DeclKind.Let, null, false) }
-            # A pattern reached through the generic walk is a read, not a
-            # binding.
         }
     }
 }
 
-# The built-in type names, which are spelled like identifiers but name types.
 let _TYPE_WORDS: set[str] = {
     "any",
     "void",
@@ -1465,8 +1380,6 @@ fn _names_a_type(kind: SymbolKind) -> bool {
         kind == SymbolKind.GenericParam
 }
 
-# An `import m` or `from m import X` binding: what it names is decided at run
-# time, so the brackets after it are the only evidence available here.
 fn _is_import_binding(symbol: Symbol?) -> bool {
     if symbol == null { return false }
     if symbol.kind == SymbolKind.Module { return true }

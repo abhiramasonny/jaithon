@@ -76,9 +76,6 @@ fn advance(bodies: list[Body], dt: float) -> float {
             if bj.tag > 0 { seen = bj }
         }
     }
-    # A second loop over the same list, bound from an iterator rather than an
-    # index: that is what makes this slot disagree with itself and stay in the
-    # frame with a tag while everything around it takes a register.
     for b in bodies {
         b.x += dt * b.w
         b.y += dt * b.z
@@ -105,8 +102,6 @@ fn build(k: int) -> list[Body] {
 }
 
 fn main() -> int {
-    # Fresh bodies every round, so the loop above allocates while the compiled
-    # body is holding floats in d8..d15.
     var total = 0.0
     for _round in 0..400 {
         let bodies = build(5)

@@ -51,8 +51,6 @@ fn negative_start(n: int) -> int {
     return acc
 }
 
-# 5000 does not fit the 12-bit immediate an `add` takes, so the constant has to
-# be materialised. It is still small enough to be an OP_INT literal.
 fn wide_literal(n: int) -> int {
     var acc = 0
     for _i in 0..n {
@@ -61,7 +59,6 @@ fn wide_literal(n: int) -> int {
     return acc
 }
 
-# The start is a runtime value, so nothing about it is known at compile time.
 fn runtime_start(n: int) -> int {
     var acc = 0
     for i in 0..n {
@@ -108,11 +105,6 @@ fn returned(n: int) -> int {
     return acc
 }
 
-# An inner body with a guard in it. Under JAITHON_JIT_DEOPT_STRESS every one of
-# those guards fails, so the interpreter picks this inner loop up from the very
-# ObjIter the compiled form has been writing -- which is what says the index
-# left behind is the zero-based one the interpreter expects and not the biased
-# value the fast path yields.
 fn guarded_inner(n: int) -> int {
     var xs = []
     for i in 0..40 { xs.push(i * 2) }

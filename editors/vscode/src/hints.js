@@ -55,8 +55,6 @@ function hoverProvider(workspace) {
                     return new vscode.Hover(markdown, analysis.offsets.range(hit.start, hit.end));
                 }
 
-                // Not declared in any file the workspace can see: the runtime
-                // registers it, so answer from the builtin tables instead.
                 const name = hit.ref?.name || hit.symbol?.name;
                 const builtin = builtins.FUNCTIONS[name];
                 if (builtin && hit.ref?.kind !== 'member') {
@@ -74,8 +72,6 @@ function hoverProvider(workspace) {
                 }
             }
 
-            // Anything else the checker gave a type gets that type. This is what
-            // makes hovering the middle of an expression useful.
             const narrowest = analysis.narrowestType(offset);
             if (!narrowest) return null;
             markdown.appendMarkdown(fence(narrowest.type));
@@ -133,8 +129,6 @@ function inlayHintProvider(workspace) {
                     const params = await parametersOf(workspace, analysis, call, token);
                     if (!params) continue;
                     call.args.forEach((arg, index) => {
-                        // A named argument already says what it binds to, and a
-                        // literal is the only case where the name adds anything.
                         if (arg.name || index >= params.length) return;
                         const param = params[index];
                         if (!param || param.isVariadic || param.name === 'self') return;
@@ -152,11 +146,6 @@ function inlayHintProvider(workspace) {
     };
 }
 
-/**
- * A hint has to be worth the room it takes. `any` says nothing, and a type
- * still carrying an unbound parameter — `list[T]` where no `T` is in scope —
- * is the checker showing its working rather than an answer.
- */
 function worthHinting(type) {
     if (!type || type === 'any' || type.startsWith('module ')) return false;
     return !/(^|[^A-Za-z0-9_])[A-Z][0-9]?([^A-Za-z0-9_]|$)/.test(type);
@@ -167,7 +156,6 @@ function isLiteral(node) {
                     'AST_NULL_LIT', 'AST_UNARY'].includes(node.kind);
 }
 
-/** The parameter list of whatever a call's callee resolves to. */
 async function parametersOf(workspace, analysis, call, token) {
     const callee = call.callee;
     if (!callee || !callee.span) return null;
@@ -181,7 +169,6 @@ async function parametersOf(workspace, analysis, call, token) {
     if (!found) return null;
     const { symbol } = found;
     if (symbol.params) return symbol.params.filter((param) => param.name !== 'self');
-    // Constructing a class calls its `init`.
     if (symbol.members !== undefined) {
         const init = found.analysis.memberNamed(symbol, 'init');
         if (init?.params) return init.params.filter((param) => param.name !== 'self');
@@ -252,11 +239,6 @@ function codeLensProvider(workspace) {
 
 // ---------------------------------------------------------------------------
 // Semantic tokens
-//
-// TextMate colours a file by shape; this colours it by what the compiler
-// decided each name actually is. A class and a variable that happen to be
-// spelled alike stop looking alike, and a call through a variable holding a
-// function stops being painted as a call to a function of that name.
 // ---------------------------------------------------------------------------
 
 const TOKEN_TYPES = [
@@ -295,14 +277,6 @@ function modifiersOf(symbol, declaration) {
     return out;
 }
 
-/**
- * Method or property.
- *
- * The checker types a member access with the type of what it yields, so a
- * function type settles it. When no type information is available — the
- * compiler currently offers none — fall back to whether the access is being
- * called, which is what the reader is going by anyway.
- */
 function memberToken(analysis, ref) {
     const span = ref.node?.span;
     const accessed = span ? analysis.typeAt(span.start, span.end) : null;
@@ -312,20 +286,11 @@ function memberToken(analysis, ref) {
     return after ? 'method' : 'property';
 }
 
-/**
- * Resolve within this file. Names that come from another module are resolved
- * once per file by the caller and handed in as `imported`, because an import
- * that names a class must not be painted as a variable — two types written
- * side by side would come out two different colours.
- */
 function classify(analysis, ref, imported) {
-    // An import line reads as one thing, so the name being imported is coloured
-    // like the path it comes from rather than guessed at.
     if (ref.kind === 'module-path' || ref.kind === 'imported') {
         return { type: 'namespace', modifiers: [] };
     }
 
-    // A named argument labels a parameter, and reads best as one.
     if (ref.kind === 'argument') return { type: 'parameter', modifiers: [] };
 
     if (ref.kind === 'variant') {
@@ -347,8 +312,6 @@ function classify(analysis, ref, imported) {
 
     const symbol = analysis.lookup(ref.name, ref.scope);
     if (symbol) {
-        // An import stands for a declaration elsewhere; paint it as whatever
-        // that declaration is, not as the local binding that names it.
         if (symbol.kind === 'import') {
             const resolved = imported?.get(symbol.name);
             if (resolved) return { type: resolved, modifiers: [] };
@@ -394,8 +357,6 @@ function semanticTokenProvider(workspace) {
                              encodeModifiers(modifiers));
             };
 
-            // What each imported name really is, resolved once per file rather
-            // than once per use: there are far fewer imports than references.
             const imported = new Map();
             for (const symbol of analysis.symbols) {
                 if (symbol.kind !== 'import' || imported.has(symbol.name)) continue;
@@ -422,7 +383,6 @@ function semanticTokenProvider(workspace) {
                 if (classified) emissions.push({ start: ref.start, end: ref.end, ...classified });
             }
 
-            // The builder demands source order, and the two lists interleave.
             emissions.sort((a, b) => a.start - b.start);
             let previousEnd = -1;
             for (const item of emissions) {

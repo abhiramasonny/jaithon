@@ -51,7 +51,6 @@ class Grams: Scalable {
     pub fn show(self) -> str { return f"{self.mass}g" }
 }
 
-# The annotations are the point: each is checked, and neither is `any`.
 let doubled: Cents = Cents(7).twice()
 print(doubled.show())
 
@@ -118,10 +117,6 @@ let quad: Ticks = Ticks(2).quadruple()
 print(quad.n)
 
 # --- std.core's Comparable is now written in terms of `Self` -----------------
-#
-# `max` used to be declared `-> any` because a trait had no way to say "the
-# implementing type"; it says `-> Self` now, so the annotation below is a real
-# check rather than a dynamic one.
 let later: Duration = Duration.from_seconds(5.0).max(Duration.from_seconds(3.0))
 let sooner: Duration = Duration.from_seconds(5.0).min(Duration.from_seconds(3.0))
 print(later.to_str())

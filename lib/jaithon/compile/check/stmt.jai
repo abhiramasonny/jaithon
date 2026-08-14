@@ -107,9 +107,6 @@ pub const MAX_TRACKED_VARIANTS: int = 256
 #: How many sequence lengths a `match` tracks, the width of the C's bitset.
 pub const MAX_TRACKED_LENGTHS: int = 64
 
-# `jaiChkIsAny` and the five below it are file-private in `expr.jai` and so
-# cannot be imported. Duplicating two lines is cheaper than widening that file's
-# surface for one caller.
 fn _is_any(t: Type?) -> bool {
     if t is null { return true }
     return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
@@ -119,9 +116,6 @@ fn _is_never(t: Type?) -> bool {
     return t is not null and t.kind == TyKind.Never
 }
 
-# `void` is `null` under the name a return position uses, so this is always
-# false in both front ends. It starts reporting the day either universe gives
-# `void` an identity of its own.
 fn _is_void(c: Ctx, t: Type?) -> bool {
     if t is null { return false }
     return t == c.universe.t_void and c.universe.t_void != c.universe.t_null
@@ -147,12 +141,6 @@ fn _span_of(node: Node?) -> Span {
     return node.span
 }
 
-# `d->fields` as the C holds it: a parent's entries first, then the
-# declaration's own, which is the order `FieldInfo.slot` numbers.
-# `layoutClassFields` in `src/sema/check_decl.c` writes that order into the
-# child; nothing copies into a Jaithon `TypeDecl`, so the chain is walked here.
-# Capped at `MAX_DECL_DEPTH` because this is also asked about declarations still
-# being laid out, whose cycles layout has not rejected yet.
 fn _layout_fields(decl: TypeDecl?) -> list[FieldInfo] {
     return _collect_fields(decl, 0)
 }
@@ -164,9 +152,6 @@ fn _collect_fields(decl: TypeDecl?, depth: int) -> list[FieldInfo] {
     return out
 }
 
-# The index and not just the entry, because an enum's variants are its first
-# `variant_count` fields and that is the only thing distinguishing a variant
-# from a static member.
 fn _field_index(decl: TypeDecl?, name: str?) -> int {
     if decl is null or name is null { return -1 }
     for (position, field) in _layout_fields(decl).enumerate() {
@@ -187,9 +172,6 @@ fn _field_name(pat: Node, at: int) -> str? {
     return names[at]
 }
 
-# The C's `BindSet`. Each alternative of an `or` pattern gets a fresh one: the
-# alternatives bind the same names by design, and colliding them would report
-# every `A(x) | B(x)` as a duplicate.
 class _BindSet {
     #: The names bound so far, capped at `MAX_BINDS`.
     pub var names: list[str]
@@ -205,7 +187,6 @@ class _BindSet {
 
 fn _record_binding(c: Ctx, binds: _BindSet?, name: str?, span: Span) -> void {
     if binds is null or name is null { return }
-    # The C tests only the first byte, so every `_`-prefixed name discards.
     if name.starts_with("_") { return }
     for (position, bound) in binds.names.enumerate() {
         if bound == name {
@@ -223,8 +204,6 @@ fn _record_binding(c: Ctx, binds: _BindSet?, name: str?, span: Span) -> void {
     binds.spans.push(span)
 }
 
-# The element type of a sequence subject; a tuple answers per position, and
-# `index` of -1 asks for the whole of it.
 fn _sequence_element(c: Ctx, subject: Type?, index: int) -> Type {
     let u = c.universe
     if subject is null { return u.t_any }
@@ -264,7 +243,6 @@ fn _pattern_sequence(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> voi
         if position == rest {
             elem = list_of(c.universe, _sequence_element(c, subject, -1))
         } else {
-            # Everything past the rest has an unknowable position in a tuple.
             let index = if rest >= 0 and position > rest { -1 } else { position }
             elem = _sequence_element(c, subject, index)
         }
@@ -280,8 +258,6 @@ fn _pattern_enum(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
 
     var decl = c.decl_named(type_name)
     if decl is null {
-        # `match colour { Colour.Red => ... }` names a type the subject already
-        # supplies, whether or not the registry has it under that name.
         let from_subject = _type_decl_of(subject)
         if from_subject is not null and from_subject.name == type_name { decl = from_subject }
     }
@@ -312,8 +288,6 @@ fn _pattern_enum(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
         return
     }
 
-    # A variant's payload is stored as the `Fn` that builds it, so its
-    # parameters are the fields the pattern destructures.
     let payload = _layout_fields(decl)[vi].ty
     let is_fn = payload is not null and payload.kind == TyKind.Fn
     let arity = if is_fn { payload.arg_count() } else { 0 }
@@ -360,7 +334,6 @@ fn _pattern_class(c: Ctx, pat: Node, subject: Type?, binds: _BindSet?) -> void {
     }
     c.layout_decl(c, decl)
 
-    # An enum written without a variant is a whole-enum pattern.
     if decl.is_enum and count == 0 { return }
 
     let fields = _layout_fields(decl)
@@ -494,8 +467,6 @@ pub fn pattern(c: Ctx, pat: Node?, subject: Type) -> void {
     _pattern_walk(c, pat, subject, _BindSet())
 }
 
-# The C's `Coverage`, with its two fixed-size arrays replaced by sets and the
-# caps kept as explicit tests: the caps are observable and the sizes are not.
 class _Coverage {
     #: Whether some arm binds unconditionally.
     pub var saw_catch_all: bool
@@ -526,8 +497,6 @@ class _Coverage {
     }
 }
 
-# Only an arm that binds unconditionally covers its shape; `[1, x]` still falls
-# through for a list of two whose head is not 1.
 fn _pattern_is_irrefutable(pat: Node?) -> bool {
     if pat is null { return false }
     return pat.kind == NodeKind.PatWildcard or pat.kind == NodeKind.PatBind
@@ -542,8 +511,6 @@ fn _sequence_arm_is_irrefutable(pat: Node) -> bool {
     return true
 }
 
-# `ConstValue.__eq__` would call two `None`s equal and the C's switch answers
-# false, so the rule is written out rather than relied upon.
 fn _same_const(a: ConstValue, b: ConstValue) -> bool {
     if a.kind != b.kind { return false }
     if a.kind == ConstKind.None { return false }
@@ -573,8 +540,6 @@ fn _pattern_covered(c: Ctx, pat: Node?, enum_decl: TypeDecl?, cov: _Coverage) ->
             if enum_decl is null or variant_name is null { return false }
             let vi = _field_index(enum_decl, variant_name)
             if vi < 0 or vi >= MAX_TRACKED_VARIANTS { return false }
-            # Only a payload-free variant is fully covered by an earlier arm; a
-            # payload arm may have narrowed on its sub-patterns.
             return vi in cov.variants and pat.child_list("subPatterns").len() == 0
         }
 
@@ -606,8 +571,6 @@ fn _cover_pattern(c: Ctx, pat: Node?, enum_decl: TypeDecl?, cov: _Coverage) -> v
                 }
                 return
             }
-            # Past the cap the C stops recording, so a later duplicate of an
-            # untracked literal is never reported unreachable.
             if cov.literals.len() >= MAX_TRACKED_LITERALS { return }
             cov.literals.push(v)
         }
@@ -623,7 +586,7 @@ fn _cover_pattern(c: Ctx, pat: Node?, enum_decl: TypeDecl?, cov: _Coverage) -> v
             if not _sequence_arm_is_irrefutable(pat) { return }
             var fixed = pat.child_list("elems").len()
             if pat.number("restIndex") >= 0 {
-                fixed -= 1  # `...rest` matches zero or more
+                fixed -= 1
                 if fixed < cov.covered_from { cov.covered_from = fixed }
             } elif fixed < MAX_TRACKED_LENGTHS {
                 cov.covered_lengths.add(fixed)
@@ -747,7 +710,6 @@ pub fn match_expr(c: Ctx, node: Node?, is_statement_position: bool) -> Type {
             result = if result is null { body } else { join(u, result, body) }
         }
 
-        # A guarded arm does not cover its pattern: the guard may be false.
         if arm_guard is null { _cover_pattern(c, arm_pattern, enum_decl, cov) }
     }
 
@@ -761,8 +723,6 @@ pub fn match_expr(c: Ctx, node: Node?, is_statement_position: bool) -> Type {
     return if total { result } else { optional_of(u, result) }
 }
 
-# `declSymbol`: the C reads `AST_VAR_DECL.symbol` and falls back to the
-# pattern's. `resolve.jai` binds the symbol to both nodes for a plain binding.
 fn _decl_symbol(c: Ctx, node: Node) -> Symbol? {
     let own = c.resolution.symbol_of(node)
     if own is not null { return own }
@@ -771,8 +731,6 @@ fn _decl_symbol(c: Ctx, node: Node) -> Symbol? {
     return null
 }
 
-# An unannotated `var` initialised to null would otherwise be pinned to the
-# null type and reject every later assignment; the binding is dynamic.
 fn _widen_inferred(c: Ctx, kind: DeclKind, t: Type?) -> Type {
     let u = c.universe
     if t is null { return u.t_any }
@@ -790,8 +748,6 @@ fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
         return
     }
 
-    # Passing the bag is the C's `gJaiCheck.constRequired`: here and only here
-    # is a failed fold worth E0900 or E0901.
     let before = c.bag.error_count
     let v = const_eval(init, c.bag, c.consts)
 
@@ -807,11 +763,6 @@ fn _fold_const_decl(c: Ctx, node: Node, symbol: Symbol?) -> void {
         return
     }
 
-    # Keep the folded value where every use can inline it. A Jaithon `Symbol`
-    # has no `isConstFolded`/`constValue`, so `Ctx.consts` is the stand-in,
-    # keyed by name rather than identity. Both rewrites are dumped, as in the C:
-    # the synthetic literal produces a `fold` record of its own at the
-    # initialiser's span before the initialiser produces the second.
     let literal = Node.null_lit().with_span(init.span)
     c.set_type(literal, const_replace(c.universe, literal, v))
     c.set_type(init, const_replace(c.universe, init, v))
@@ -856,8 +807,6 @@ fn _check_var_decl(c: Ctx, node: Node) -> void {
     if kind == DeclKind.Const { _fold_const_decl(c, node, symbol) }
 }
 
-# The literal conversion has to happen before the value is typed, or an int
-# literal in a float field would be reported and then silently converted.
 fn _check_stored_value(c: Ctx, source: Node?, want: Type?) -> void {
     if want is not null and not _is_any(want) { c.apply_context(c, source, want) }
     let got = value(c, source)
@@ -882,7 +831,6 @@ fn _check_field_assign(c: Ctx, node: Node, target: Node) -> void {
     let static_access = found is not null
     if found is null { found = _type_decl_of(value(c, object)) }
     if found is null {
-        # An `any` receiver, a module or a builtin: checked at run time.
         c.set_type(target, u.t_any)
         value(c, source)
         return
@@ -905,8 +853,6 @@ fn _check_field_assign(c: Ctx, node: Node, target: Node) -> void {
             )
             if owner is not null { d.label(owner.span, "declared here") }
         }
-        # A `let` field is settable from inside its own class — that is what
-        # `init` is for — and nowhere else.
         if field.is_let and not static_access and c.current_class != decl {
             let d = c.error(
                 E0301_ASSIGN_TO_IMMUTABLE,
@@ -946,21 +892,16 @@ fn _check_field_assign(c: Ctx, node: Node, target: Node) -> void {
 
 fn _check_compound_assign(c: Ctx, node: Node, target: Node, source: Node) -> void {
     let u = c.universe
-    # A compound assignment reads the target first, so it is typed as an
-    # operand of the operator before it is typed as a destination.
     let current = expr(c, target)
     var rhs = value(c, source)
     if _is_any(current) or _is_any(rhs) or _is_never(current) or _is_never(rhs) { return }
 
     let op = node.op()
-    # `x += n` widens an int operand to a float target, as `x = x + n` would.
     if widens_operands(op) and current.kind == TyKind.Float and rhs.kind == TyKind.Int {
         c.widen_to_float(c, source, u.t_float)
         rhs = u.t_float
     }
 
-    # The other direction cannot: the result writes back into the target, and a
-    # float does not fit an int.
     if widens_operands(op) and current.kind == TyKind.Int and rhs.kind == TyKind.Float {
         let word = op_text(op)
         let d = c.error(
@@ -1054,8 +995,6 @@ fn _check_assign(c: Ctx, node: Node) -> void {
         NodeKind.Ident => {
             var want = expr(c, target)
             let symbol = c.resolution.symbol_of(target)
-            # The destination is the declaration, not the flow-narrowed view: in
-            # `if v != null { ... }` a `v = maybeNull()` is still a legal store.
             if symbol is not null and c.symbol_type(symbol) is not null {
                 want = _or_any(c, c.declared_type(symbol))
             }
@@ -1074,7 +1013,6 @@ fn _check_assign(c: Ctx, node: Node) -> void {
         }
 
         _ => {
-            # Destructuring assignment: `(a, b) = point`.
             if is_pattern(target.kind) {
                 let got = value(c, source)
                 pattern(c, target, got)
@@ -1099,8 +1037,6 @@ pub fn block(c: Ctx, node: Node?) -> void {
     var warned = false
 
     for statement in node.child_list("stmts") {
-        # Declarations are hoisted by the resolver, so only real statements
-        # after a diverging one are dead.
         if diverged and not warned and not is_declaration(statement.kind) {
             c.warn(
                 W0102_UNREACHABLE_CODE,
@@ -1121,9 +1057,6 @@ fn _check_if(c: Ctx, node: Node) -> void {
     condition(c, cond, "an `if`")
 
     let facts = c.collect_facts(cond, false)
-    # The false edge is collected separately rather than by inverting the true
-    # edge: `a or b` yields nothing when true, but `not (a or b)` yields both
-    # facts, which is the `if x is null or x <= 0 { return }` guard.
     let else_facts = c.collect_facts(cond, true)
 
     let then_branch = node.child("thenBranch")
@@ -1141,8 +1074,6 @@ fn _check_if(c: Ctx, node: Node) -> void {
         return
     }
 
-    # `if x == null { return }` narrows everything after it: the facts stay
-    # applied and the enclosing block restores them when it ends.
     if then_branch is not null and always_diverges(then_branch) {
         c.narrow_apply(else_facts, false)
     }
@@ -1171,9 +1102,6 @@ fn _check_for(c: Ctx, node: Node) -> void {
     let mark = c.narrow_mark()
     pattern(c, node.child("pattern"), elem)
 
-    # The C types `AstNode.forLoop.iterSymbol` here. The Jaithon `For` schema
-    # has no such field and `resolve.jai` creates no such symbol, so there is
-    # nothing to type and this is where that step would go.
     let body = node.child("body")
     if body is not null { stmt(c, body) }
     c.narrow_restore(mark)
@@ -1295,7 +1223,6 @@ pub fn stmt(c: Ctx, node: Node?) -> void {
     match node.kind {
         NodeKind.Block | NodeKind.Program => { block(c, node) }
 
-        # The only place a `void` value is allowed: nothing consumes it.
         NodeKind.ExprStmt => {
             let inner = node.child("expr")
             if inner is not null { expr(c, inner) }
@@ -1317,9 +1244,6 @@ pub fn stmt(c: Ctx, node: Node?) -> void {
             if body is not null { stmt(c, body) }
         }
 
-        # Loop nesting and labels are the resolver's business (E0203, E0204);
-        # what these two contribute here is divergence, which
-        # `ast.always_diverges` answers.
         NodeKind.Break | NodeKind.Continue => { }
 
         _ => {
@@ -1551,7 +1475,6 @@ pub fn install(c: Ctx) -> void {
     c.function_type = _lambda_type
 }
 
-# A lambda is never a method and has no owner: the two-argument case `Ctx` wants.
 fn _check_lambda(c: Ctx, fn_node: Node?) -> void {
     function(c, fn_node, null, false)
 }

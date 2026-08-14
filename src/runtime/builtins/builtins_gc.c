@@ -16,8 +16,6 @@ static size_t heapBytes(void) {
     return jaiAllocatedBytes();
 }
 
-/* An explicit collect runs even when the collector is disabled: disabling it
- * means "do not collect behind my back", not "refuse to collect". */
 static bool nGcCollect(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;

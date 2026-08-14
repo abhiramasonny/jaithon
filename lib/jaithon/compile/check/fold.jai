@@ -212,7 +212,6 @@ pub fn render_const(value: ConstValue) -> str {
     }
 }
 
-# The six kinds `jaiChkTryFold` fires for, in the C's order.
 fn _is_foldable(kind: NodeKind) -> bool {
     match kind {
         NodeKind.Unary | NodeKind.Binary | NodeKind.Logical => { return true }
@@ -221,15 +220,11 @@ fn _is_foldable(kind: NodeKind) -> bool {
     }
 }
 
-# Building the literal through `Node` is what drops the old kind's fields; a
-# hand-written dict would leave them behind for `to_json` to trip over.
 fn _become(node: Node, literal: Node) -> void {
     node.kind = literal.kind
     node.fields = literal.fields
 }
 
-# `hops` counts *only* substitutions of one constant for another, so a `consts`
-# dict that refers to itself cannot loop forever. It is not a nesting depth.
 fn _eval(node: Node?, bag: DiagnosticBag?, consts: dict[str, Node], hops: int) -> ConstValue {
     if node is null { return ConstValue.none() }
 
@@ -247,7 +242,6 @@ fn _eval(node: Node?, bag: DiagnosticBag?, consts: dict[str, Node], hops: int) -
             return _eval(consts[name], bag, consts, hops + 1)
         }
 
-        # A cast of a constant is that constant; the checker already allowed it.
         NodeKind.Cast => { return _eval(node.child("operand"), bag, consts, hops) }
 
         NodeKind.Unary => { return _fold_unary(node, bag, consts, hops) }
@@ -346,7 +340,6 @@ fn _combine(
 fn _fold_chain(node: Node, bag: DiagnosticBag?, consts: dict[str, Node], hops: int) -> ConstValue {
     let operands = node.child_list("operands")
     let ops: list[OpKind] = node.get("ops")
-    # Only the C's parser guarantees one more operand than operators.
     if ops.len() < 1 or operands.len() != ops.len() + 1 { return ConstValue.none() }
 
     for (index, op) in ops.enumerate() {
@@ -388,8 +381,6 @@ fn _fold_int_binary(bag: DiagnosticBag?, op: OpKind, a: int, b: int, span: Span)
             return ConstValue.of_float(float(a) / float(b))
         }
 
-        # Jaithon's `//` and `%` already floor; the C needs `ifloordiv`/`imod`
-        # because C division truncates. Only the trapping cases need a guard.
         OpKind.FloorDiv => {
             if b == 0 { return _divide_by_zero(bag, span, op) }
             if a == INT_MIN and b == -1 { return _overflow(bag, span, op) }
@@ -402,7 +393,6 @@ fn _fold_int_binary(bag: DiagnosticBag?, op: OpKind, a: int, b: int, span: Span)
         }
 
         OpKind.Pow => {
-            # A negative exponent has no int result, so the VM decides it.
             if b < 0 { return ConstValue.none() }
             let (ok, power) = _ipow(a, b)
             if not ok { return _overflow(bag, span, op) }
@@ -515,8 +505,6 @@ fn _sub_overflow(a: int, b: int) -> (bool, int) {
     return (false, a - b)
 }
 
-# `*%` truncates `a * b` to 64 bits, so recovering `b` from it is exact exactly
-# when nothing was lost. `a == -1` is special either way: `INT_MIN // -1` traps.
 fn _mul_overflow(a: int, b: int) -> (bool, int) {
     if a == 0 or b == 0 { return (false, 0) }
     if a == -1 {
@@ -532,8 +520,6 @@ fn _mul_overflow(a: int, b: int) -> (bool, int) {
     return (false, wrapped)
 }
 
-# Exponentiation by squaring. The squaring is guarded by `e > 0` so that a
-# square nothing reads cannot report an overflow: `2 ** 63` would fail on one.
 fn _ipow(base: int, exp: int) -> (bool, int) {
     var b = base
     var e = exp
@@ -572,7 +558,6 @@ fn _divide_by_zero(bag: DiagnosticBag?, span: Span, op: OpKind) -> ConstValue {
     )
 }
 
-# E0900 rather than a code of its own, as in the C.
 fn _negative_shift(bag: DiagnosticBag?, span: Span, op: OpKind) -> ConstValue {
     return _fail(
         bag,
@@ -582,7 +567,6 @@ fn _negative_shift(bag: DiagnosticBag?, span: Span, op: OpKind) -> ConstValue {
     )
 }
 
-# The three escapes a dump line cannot carry raw; a tab goes through as itself.
 fn _quote(text: str) -> str {
     let out = StringBuilder()
     out.push("\"")

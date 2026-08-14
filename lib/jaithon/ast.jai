@@ -197,9 +197,6 @@ pub enum TypeKind { Name, Generic, Optional, Union, Fn, Tuple, Infer }
 # ------------------------------------------------------------------
 # Name tables
 # ------------------------------------------------------------------
-
-# Parallel to `_KINDS`; both are in C declaration order and the asserts below
-# are this module's version of the C `_Static_assert` on the same tables.
 let _KIND_NAMES: list[str] = [
     "AST_INT_LIT",
     "AST_FLOAT_LIT",
@@ -347,7 +344,6 @@ let _KINDS: list[NodeKind] = [
 let _KIND_INDEX: dict[NodeKind, int] = {kind: index for (index, kind) in _KINDS.enumerate()}
 let _KIND_BY_NAME: dict[str, NodeKind] = {name: kind for (name, kind) in zip(_KIND_NAMES, _KINDS)}
 
-# Group boundaries in `_KINDS`, matching the C category table.
 const _FIRST_STATEMENT = 34
 const _FIRST_DECLARATION = 50
 const _FIRST_PATTERN = 59
@@ -465,17 +461,11 @@ let _OP_SOURCE: list[str] = [
 let _OP_INDEX: dict[OpKind, int] = {op: index for (index, op) in _OPS.enumerate()}
 let _OP_BY_NAME: dict[str, OpKind] = {name: op for (name, op) in zip(_OP_NAMES, _OPS)}
 
-# `is` through `not in` are the comparison operators, as in `jaiOpKindIsComparison`.
 const _FIRST_COMPARISON = 16
 const _LAST_COMPARISON = 25
 
 assert _OP_NAMES.len() == _OPS.len(), "the operator tables have different lengths"
 assert _OP_SOURCE.len() == _OPS.len(), "the operator source table has the wrong length"
-
-# `Visibility`/`DeclKind`/`CompKind`/`TypeKind` each have a C-name table too
-# (`_VISIBILITY_NAMES` and its seven siblings), but nothing here reads them --
-# only `to_sexp` and the JSON codec do, so those tables moved to
-# ast_encode.jai with the code that uses them.
 
 #: Return the C enum name of `kind`, the spelling used in the JSON encoding.
 #:
@@ -558,8 +548,6 @@ pub fn is_pattern(kind: NodeKind) -> bool {
 # ------------------------------------------------------------------
 # Field schema
 # ------------------------------------------------------------------
-
-# List tags and the tag of their elements. Everything else is a scalar.
 pub let _ELEMENT_TAG: dict[str, str] = {
     "nodes": "node",
     "strs": "str",
@@ -576,7 +564,6 @@ pub let _ELEMENT_TAG: dict[str, str] = {
     "item[]": "item",
 }
 
-# The C sub-structures, keyed by the element tag above, in emission order.
 pub let _RECORDS: dict[str, list[tuple[str, str]]] = {
     "param": [
         ("name", "str"),
@@ -689,14 +676,6 @@ fn _build_schemas() -> list[list[tuple[str, str]]] {
         [("cond", "node"), ("thenBranch", "node"), ("elseBranch", "node")]
     )
     define([NodeKind.Match, NodeKind.MatchExpr], [("subject", "node"), ("arms", "arm[]")])
-    # `widen` marks §2.2's int-to-float conversion, as it does on the C's
-    # `AST_CAST` (src/lang/ast.h:277). It is the one field here the C does not
-    # serialise — neither its text dump nor its JSON emits it — so a node read
-    # back from the C carries the default, which is correct: only a checker
-    # inserts a cast, and a C-produced tree has already had its casts turned
-    # into bytecode. The emitter needs it because it is the whole difference
-    # between `OP_TO_FLOAT` and `OP_TYPE_GUARD`, and without it the self-hosted
-    # front end cannot emit either correctly.
     define([NodeKind.Cast], [("operand", "node"), ("target", "type"), ("widen", "bool")])
     define([NodeKind.Yield, NodeKind.Await, NodeKind.ThrowExpr], [("operand", "node")])
     define([NodeKind.Block, NodeKind.Program], [("stmts", "nodes")])
@@ -809,7 +788,6 @@ pub fn record_fields(tag: str) -> list[tuple[str, str]] {
     return fields
 }
 
-# The value a field holds when the encoder left it out or a builder omitted it.
 pub fn _default_field(name: str, tag: str) -> any {
     # A sequence pattern with no `...rest` has restIndex -1; 0 would claim the
     # first element is the rest.
@@ -941,7 +919,6 @@ pub class Span {
     }
 }
 
-# Bytes in the UTF-8 encoding of one scalar value.
 fn _utf8_length(character: str) -> int {
     let code = ord(character)
     if code < 0x80 { return 1 }
@@ -950,7 +927,6 @@ fn _utf8_length(character: str) -> int {
     return 4
 }
 
-# Character index of a byte offset, so that byte spans can slice a `str`.
 fn _char_index(source: str, offset: int) -> int {
     var byte = 0
     var index = 0
@@ -1408,7 +1384,6 @@ fn _record(tag: str, values: dict[str, any]) -> dict[str, any] {
     return record
 }
 
-# Typed reads of a sub-structure's fields, the counterpart of the builders below.
 fn _flag(record: dict[str, any], name: str) -> bool {
     let value: bool = record.get(name, false)
     return value
@@ -1513,20 +1488,12 @@ pub fn import_item(name: str, alias: str? = null) -> dict[str, any] {
 # Traversal
 # ------------------------------------------------------------------
 
-# `Visitor`, the per-kind dispatch base class, used to live here too. It
-# moved to ast_visitor.jai: nothing in this tree imports it, and unlike
-# `children_of` below it never touches `_ELEMENT_TAG` or `_RECORDS`, so it had
-# no reason to stay.
-
 #: Every direct child of `node`, in the order the C `jaiAstWalk` visits them.
 #:
 #: Null children are dropped, exactly as the C walk skips them.
 pub fn children_of(node: Node) -> list[Node] {
     let out: list[Node] = []
 
-    # Two orders differ from the field order and both matter to a rewriting
-    # pass: a dict literal alternates key and value, and a comprehension's key
-    # expression is visited before its element.
     if node.kind == NodeKind.DictLit {
         let keys = node.child_list("keys")
         let values = node.child_list("values")
@@ -1633,8 +1600,6 @@ pub fn is_assignable(node: Node) -> bool {
         NodeKind.Ident | NodeKind.Member | NodeKind.Index | NodeKind.Slice | NodeKind.PatBind | NodeKind.PatWildcard => {
             return true
         }
-        # `x?.y = v` has no meaning: the point of `?.` is that it may reach no
-        # object at all.
         NodeKind.OptMember => { return false }
         NodeKind.TupleLit | NodeKind.ListLit => { return _all_assignable(node.child_list("items")) }
         NodeKind.PatTuple | NodeKind.PatList => { return _all_assignable(node.child_list("elems")) }
@@ -1665,8 +1630,6 @@ pub fn always_diverges(node: Node) -> bool {
         NodeKind.Return | NodeKind.Throw | NodeKind.ThrowExpr | NodeKind.Break | NodeKind.Continue => {
             return true
         }
-        # Once one statement diverges the rest of the block is unreachable, so
-        # the block diverges too.
         NodeKind.Block | NodeKind.Program => {
             for stmt in node.child_list("stmts") {
                 if always_diverges(stmt) { return true }
@@ -1679,7 +1642,6 @@ pub fn always_diverges(node: Node) -> bool {
             if alternative is null { return false }
             return always_diverges(node.require("thenBranch")) and always_diverges(alternative)
         }
-        # `loop` and `while true` run forever unless something breaks out.
         NodeKind.Loop => { return not _loop_has_break(node) }
         NodeKind.While => {
             let cond = node.child("cond")
@@ -1687,7 +1649,6 @@ pub fn always_diverges(node: Node) -> bool {
             if not cond.flag("boolLit") { return false }
             return not _loop_has_break(node)
         }
-        # A `for` may iterate zero times, so it can always fall through.
         NodeKind.For => { return false }
         NodeKind.Match | NodeKind.MatchExpr => {
             let arms = node.records("arms")
@@ -1699,8 +1660,6 @@ pub fn always_diverges(node: Node) -> bool {
             }
             return true
         }
-        # A `finally` that diverges wins outright; otherwise the body and every
-        # handler have to diverge.
         NodeKind.Try => {
             let ensure = node.child("finallyBlock")
             if ensure is not null and always_diverges(ensure) { return true }
@@ -1724,7 +1683,6 @@ fn _is_function_kind(kind: NodeKind) -> bool {
     return kind == NodeKind.FnDecl or kind == NodeKind.Lambda or kind == NodeKind.AnonFn
 }
 
-# Whether any `break` inside this loop's body binds to this loop.
 fn _loop_has_break(node: Node) -> bool {
     let label = node.opt_text("label")
     let body = node.child("body")
@@ -1733,8 +1691,6 @@ fn _loop_has_break(node: Node) -> bool {
     var found = false
 
     fn enter(current: Node) -> bool {
-        # Control never crosses a function or type boundary, so a `break` down
-        # there cannot be ours.
         if _is_function_kind(current.kind) or
             current.kind == NodeKind.ClassDecl or
             current.kind == NodeKind.TraitDecl or
@@ -1748,7 +1704,6 @@ fn _loop_has_break(node: Node) -> bool {
         if current.kind == NodeKind.Break {
             let target = current.opt_text("label")
             if target is null {
-                # Unlabelled: it binds to the innermost enclosing loop.
                 if depth == 0 { found = true }
             } elif label is not null and target == label {
                 found = true

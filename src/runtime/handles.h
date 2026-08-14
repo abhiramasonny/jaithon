@@ -18,15 +18,11 @@ typedef enum {
     HANDLE_GPU_KERNEL,
 } HandleKind;
 
-/* Reuses the lowest free slot, so open/close loops don't grow the table. */
 int64_t jaiHandleAdd(HandleKind kind, void *ptr);
 
-/* `index` is the 1-based argument position, as the caller wrote the call. */
 bool jaiHandleGet(Value v, int index, HandleKind kind, const char *fnName,
                   void **out);
 
-/* Release before destroying what the handle points at — a later use then gets
- * a clean "not live" error, not a use-after-free. */
 void jaiHandleRelease(int64_t id);
 
 #endif /* JAI_HANDLES_H */

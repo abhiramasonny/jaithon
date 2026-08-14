@@ -1,22 +1,4 @@
-/* module_methods.c — native methods on module objects (mod.get, .has, ...).
- *
- * Independent of module.c's loading/import machinery: everything here runs
- * *after* a module already exists, dispatched by the VM's member-access path
- * for a receiver that is a module rather than an instance (jaiModuleMethod is
- * the entry point, declared in methods.h alongside the other builtin method
- * tables). None of it touches the search path, the cache, or the bootstrap
- * window's state — it only reads the ObjModule the caller handed it, so it
- * shares no private state with the rest of module loading and belongs on its
- * own.
- *
- * `mod.thing` is resolved by the VM directly, so what reaches here is the
- * reflective path: dir(), and any C caller that asks the built-in method
- * tables about a module receiver. Both need the same answer the VM would
- * give, which is why the export rule is repeated rather than approximated: a
- * module with no explicit exports exposes everything, because restricting an
- * un-annotated module would make it unusable rather than encapsulated
- * (spec §8.2).
- */
+/* module_methods.c — native methods on module objects independent of loading. */
 
 #include <stdlib.h>
 
@@ -24,8 +6,6 @@
 #include "runtime/methods.h"
 
 static bool moduleExposes(ObjModule *m, ObjString *name, Value *out) {
-    /* Reflective: `name` came from the caller, and a module table is keyed by
-     * pointer. */
     name = jaiStringCanonical(name);
     if (!jaiModuleGet(m, name, out)) return false;
     return m->exports.count == 0 || jaiModuleIsExported(m, name);
@@ -66,8 +46,6 @@ static bool nModuleHas(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* get(name, default = null): the reflective read, so a missing name is a value
- * rather than an exception — a caller who wants the raise uses `mod.name`. */
 static bool nModuleGet(int argc, Value *args, Value *out) {
     ObjModule *m;
     ObjString *name;
@@ -89,8 +67,6 @@ static int compareNames(const void *a, const void *b) {
          : left->length > right->length ? 1 : 0;
 }
 
-/* Sorted, because a hash table's order is an implementation detail and a
- * program that prints `members()` should not change output between runs. */
 static bool nModuleMembers(int argc, Value *args, Value *out) {
     (void)argc;
     ObjModule *m;
@@ -126,13 +102,10 @@ bool jaiModuleMethod(Value receiver, ObjString *name, Value *out) {
     if (!IS_MODULE(receiver) || name == NULL) return false;
     ObjModule *m = AS_MODULE(receiver);
 
-    /* A member the module exports outranks the introspection helpers: a module
-     * defining `get` means its own `get` everywhere it is named. */
     if (moduleExposes(m, name, out)) return true;
 
     const char *text = name->chars;
 
-/* Arities count the receiver, which the VM passes as args[0]. */
 #define MODULE_METHOD(label, fn, minArity, maxArity)                           \
     if (strcmp(text, (label)) == 0) {                                          \
         *out = jaiBindNative(receiver, (label), (fn), (minArity), (maxArity),  \
@@ -148,9 +121,6 @@ bool jaiModuleMethod(Value receiver, ObjString *name, Value *out) {
 
 #undef MODULE_METHOD
 
-    /* Present but private. Saying "no such member" would send the reader
-     * looking for a typo, so this is E0802's wording, the same one the VM and
-     * `from ... import` raise. */
     Value hidden;
     if (jaiModuleGet(m, name, &hidden))
         return jaiThrow(vm.cImportError, "'%s' is not exported by module '%s'",

@@ -56,8 +56,6 @@ fn test_vector_add_matches_elementwise_addition() -> void {
     let b = ramp(N, 0.5)
     let got = gpu.vector_add(a, b)
     assert_len(got, N)
-    # Spot checks rather than every element: a wrong kernel is wrong in blocks,
-    # and the four-lane form makes the ends the interesting part.
     for i in [0, 1, 2, 3, 4, 5, 1000, 65535, N - 3, N - 2, N - 1] {
         assert_true(close(got[i], a[i] + b[i], 1e-6), f"add at {i}")
     }

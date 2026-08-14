@@ -6,17 +6,17 @@ class Vault {
 
     fn init(self, code: int) { self.code = code }
 
-    fn unlock(self) -> int {  # private: no `pub`
+    fn unlock(self) -> int {
         return self.code
     }
 
     prot fn hint(self) -> str { return "starts with a digit" }
 
-    static fn issued() -> int {  # private static
+    static fn issued() -> int {
         return 1
     }
 
-    pub fn open(self) -> int {  # from inside: allowed
+    pub fn open(self) -> int {
         return self.unlock()
     }
 
@@ -26,7 +26,7 @@ class Vault {
 class Deposit extends Vault {
     fn init(self) { super(99) }
 
-    pub fn nudge(self) -> str {  # protected: subclass ok
+    pub fn nudge(self) -> str {
         return self.hint()
     }
 }
@@ -37,7 +37,7 @@ fn call_hint(target: any) { return target.hint() }
 
 fn call_issued(target: any) { return target.issued() }
 
-fn read_unlock(target: any) { return target.unlock }  # read, do not call
+fn read_unlock(target: any) { return target.unlock }
 
 # --- from inside the declaring class ---------------------------------------
 let v = Vault(4)
@@ -52,7 +52,6 @@ try { print(call_hint(v)) } catch e: AttributeError { print(e.message) }
 try { print(call_issued(Vault)) } catch e: AttributeError { print(e.message) }
 try { print(call_unlock(Deposit())) } catch e: AttributeError { print(e.message) }
 
-# Reading the method without calling it is the same access.
 try { print(read_unlock(v)) } catch e: AttributeError { print(e.message) }
 
 # --- an override that adds `pub` widens ------------------------------------

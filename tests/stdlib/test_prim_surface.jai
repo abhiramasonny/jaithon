@@ -151,7 +151,7 @@ fn test_os_spawn_runs_a_program_and_captures_its_output() -> void {
 fn test_a_condition_variable_can_be_made_and_freed() -> void {
     let cond = __prim__.cond_new()
     assert_eq(__prim__.type_of(cond), "int")
-    __prim__.cond_signal(cond)  # no waiter: a no-op, not an error
+    __prim__.cond_signal(cond)
     __prim__.cond_broadcast(cond)
     __prim__.cond_free(cond)
 }

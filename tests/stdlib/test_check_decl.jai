@@ -45,11 +45,6 @@ from jaithon.compile.symbol import Symbol, SymbolKind
 # ------------------------------------------------------------------
 # Fixtures
 # ------------------------------------------------------------------
-
-# The `resolve_ast_type` `checker.jai` will supply, cut down to what these tests
-# need: the scoped names a declaration pushed, the registry, the scalars, and the
-# four written shapes. Without one every header name would read as opaque and
-# nothing about inheritance could be observed at all.
 fn _resolver(c: Ctx, written: TypeExpr?) -> Type? {
     if written is null { return null }
     let u = c.universe
@@ -140,8 +135,6 @@ fn _label(c: Ctx, at: int, index: int) -> str? {
     return c.bag.items[at].labels[index][1]
 }
 
-# A function declaration with every knob the checker reads. `Node.fn_decl`
-# insists on a body, and a trait requirement is exactly the one that has none.
 fn _fn(
     name: str,
     params: list[dict[str, any]] = [],
@@ -216,8 +209,6 @@ fn _enum(name: str, variants: list[dict[str, any]] = [], methods: list[Node] = [
     return Node(NodeKind.EnumDecl, {"name": name, "variants": variants, "methods": methods})
 }
 
-# Register `node` and answer the declaration, without the optional every caller
-# would otherwise have to unwrap.
 fn _declare(c: Ctx, node: Node) -> TypeDecl {
     return register_decl(c, node) ?? TypeDecl("?", node.span)
 }
@@ -246,9 +237,7 @@ fn test_registering_a_class_interns_its_type_and_records_the_flags() -> void {
     assert_false(point.is_abstract)
     assert_eq(render(point.ty), "Point")
     assert_true(point.ty is not null and point.ty.kind == TyKind.Class)
-    # The type carries the declaration back, which is what `_type_decl_of` reads.
     assert_true(point.ty is not null and point.ty.decl == point)
-    # And the node's own type is stamped, which is the C's `node->type`.
     assert_true(c.type_of(node) == point.ty)
 }
 
@@ -276,10 +265,7 @@ fn test_a_second_declaration_of_one_name_answers_the_first() -> void {
     let second = register_decl(c, shadow)
 
     assert_true(second == first)
-    # E0302 is the resolver's to report, so nothing is raised here...
     assert_len(c.bag.items, 0)
-    # ...and the shadowing node is not registered, which is how `check_decl`
-    # knows to skip its body: the C's `d->decl != node`.
     assert_true(c.decl_for_node(shadow) is null)
 }
 
@@ -318,8 +304,6 @@ fn test_a_generic_bound_is_resolved_with_the_parameters_in_scope() -> void {
     let c = _ctx()
     _declare(c, _trait("Comparable"))
     let mark = c.type_name_mark()
-    # `[T: Comparable[T]]` has to see its own `T`, which is why the bounds are a
-    # second pass. An unresolvable bound would be `resolve_ast_type`'s to report.
     push_generics(c, [generic("T", TypeExpr.generic("Comparable", [TypeExpr.named("T")]))])
     assert_eq(render(c.scoped_type_name("T")), "T")
     c.type_name_restore(mark)
@@ -372,7 +356,6 @@ fn test_a_static_field_occupies_no_slot() -> void {
 
     assert_eq(counter.fields[0].slot, -1)
     assert_true(counter.fields[0].is_static)
-    # The instance field still starts at zero: a static one is not in the layout.
     assert_eq(counter.fields[1].slot, 0)
 }
 
@@ -394,12 +377,9 @@ fn test_a_subclass_numbers_its_fields_after_its_parents_without_copying_them() -
         )
     )
 
-    # Parents first, so an inherited field keeps its slot and a subclass's inline
-    # caches stay valid — but the parent's fields are *not* in the child's list.
     assert_len(derived.fields, 1)
     assert_eq(derived.fields[0].name, "c")
     assert_eq(derived.fields[0].slot, 2)
-    # The inherited answer is walked for, which is `nominal.jai`'s contract.
     assert_true(derived.find_field("a") is null)
     assert_eq(find_field(derived, "a")?.slot, 0)
 }
@@ -484,7 +464,6 @@ fn test_a_method_becomes_a_member_carrying_its_signature() -> void {
     assert_len(point.members, 1)
     let scale = point.members[0]
     assert_eq(scale.name, "scale")
-    # `self` is dropped from the signature: it is the receiver, not a parameter.
     assert_eq(render(scale.ty), "fn(float) -> int")
     assert_eq(scale.visibility, VIS_PUBLIC)
     assert_false(scale.is_abstract)
@@ -500,8 +479,6 @@ fn test_a_method_with_no_body_is_abstract() -> void {
 
 fn test_a_traits_members_are_public_whether_or_not_pub_is_written() -> void {
     let c = _ctx()
-    # §7.2 makes traits types, through which a private member could never be
-    # reached, so "private unless pub" governs classes and not traits.
     let shape = _laid(c, _trait("Shape", [_fn("area", [_self()], TypeExpr.named("float"))]))
     assert_eq(shape.members[0].visibility, VIS_PUBLIC)
 
@@ -600,8 +577,6 @@ fn test_a_superclass_that_this_unit_can_see_is_linked() -> void {
 
 fn test_a_superclass_this_unit_cannot_see_is_opaque_rather_than_absent() -> void {
     let c = _ctx()
-    # Nothing named `Imported` is registered, so `resolve_ast_type` answers null.
-    # The parent's members exist and are not this unit's to deny.
     let derived = _laid(c, _class("Derived", superclass: TypeExpr.named("Imported")))
 
     assert_true(derived.superclass is null)
@@ -776,8 +751,6 @@ fn test_an_override_that_widens_the_return_is_reported() -> void {
 
 fn test_init_is_not_an_override() -> void {
     let c = _ctx()
-    # A constructor belongs to its own class and is reached through `super(...)`,
-    # never through dynamic dispatch, so a subclass may take other arguments.
     _declare(c, _class("Base", methods: [_method("init", [_self(), param("n")])]))
     _laid(
         c,
@@ -789,9 +762,6 @@ fn test_init_is_not_an_override() -> void {
 
 fn test_an_unannotated_parameter_fits_whatever_the_parent_declared() -> void {
     let c = _ctx()
-    # `any` is statically unknown on either side, and a guess there would be a
-    # diagnostic about nothing. The arity still has to match: an unwritten type
-    # is unknown, an unwritten parameter is absent.
     _declare(
         c,
         _class(
@@ -835,8 +805,6 @@ fn test_an_unimplemented_requirement_is_reported_with_the_declaration_to_write()
     assert_eq(_code(c, 0), E0705_TRAIT_NOT_IMPLEMENTED)
     assert_eq(_message(c, 0), "`Circle` does not implement `area` required by trait `Shape`")
     assert_eq(_label(c, 0, 0), "required here")
-    # The declaration the author has to write, not merely its type: §7 makes
-    # `self` explicit, so a help quoting the bare `fn` type would land in E0703.
     assert_eq(_help(c, 0), "add `fn area(self, scale: float) -> float` to `Circle`")
 }
 
@@ -846,7 +814,6 @@ fn test_a_trait_default_satisfies_its_own_requirement() -> void {
     let circle = _laid(c, _class("Circle", traits: [TypeExpr.named("Shape")]))
 
     assert_len(c.bag.items, 0)
-    # Nothing was copied into the class; the default is reached through the walk.
     assert_len(circle.members, 0)
     assert_eq(render(find_member(circle, "area")?.ty), "fn() -> float")
 }
@@ -871,7 +838,6 @@ fn test_an_implementation_with_the_wrong_signature_is_reported() -> void {
             "`Shape` requires `fn() -> float`: the return type is not compatible"
     )
     assert_eq(_label(c, 0, 0), "required here")
-    # No substitution fired, so there is nothing to explain about the form.
     assert_true(_note(c, 0) is null)
 }
 
@@ -893,8 +859,6 @@ fn test_a_requirement_written_self_becomes_the_implementers_own_type() -> void {
         "`Bad` implements `twice` as `fn() -> int`, but trait " +
             "`Doubler` requires `fn() -> Bad`: the return type is not compatible"
     )
-    # With no trait arguments the only substitution that can have fired is
-    # `Self`, so the note names it rather than repeating the trait.
     assert_eq(_note(c, 0), "`twice` is declared `fn() -> Self` in `Doubler`, where `Self` is `Bad`")
 }
 
@@ -1008,9 +972,6 @@ fn test_an_inherited_requirement_is_verified_against_the_implementer() -> void {
 }
 
 fn test_the_first_trait_that_carries_a_name_is_the_one_that_answers_for_it() -> void {
-    # `class C: A, B` where `B` defaults a method `A` requires. The C builds one
-    # flat member array, trait by trait, and the first arrival wins the slot — so
-    # the written order of the header decides, and it decides here too.
     let satisfied = _ctx()
     _laid(satisfied, _trait("Needs", [_fn("area", [_self()], TypeExpr.named("float"))]))
     _laid(satisfied, _trait("Has", [_method("area", [_self()], TypeExpr.named("float"))]))
@@ -1048,7 +1009,6 @@ fn test_a_requirement_satisfied_by_the_superclass_is_not_reported() -> void {
 
 fn test_an_opaque_trait_imposes_no_requirement_this_unit_can_check() -> void {
     let c = _ctx()
-    # Its contract was checked where it was declared and is enforced at run time.
     _laid(c, _class("Printer", traits: [TypeExpr.named("Printable")]))
     assert_len(c.bag.items, 0)
 }
@@ -1072,7 +1032,6 @@ fn test_unit_variants_are_values_and_payload_variants_are_constructors() -> void
     assert_eq(shape.variant_count, 2)
     assert_eq(render(shape.fields[0].ty), "Shape")
     assert_eq(render(shape.fields[1].ty), "fn(float) -> Shape")
-    # `slot` carries the tag, and every variant is static and public.
     assert_eq(shape.fields[0].slot, 0)
     assert_eq(shape.fields[1].slot, 1)
     assert_true(shape.fields[1].is_static)
@@ -1121,8 +1080,6 @@ fn test_a_method_signature_drops_the_receiver_and_a_function_does_not() -> void 
 
 fn test_a_static_method_keeps_every_parameter() -> void {
     let c = _ctx()
-    # `self_skip_of` answers zero for a static declaration, so nothing is
-    # dropped even when the author wrote `self` — E0707 has already said so.
     let node = _method("make", [param("n", TypeExpr.named("int"))], is_static: true)
     assert_eq(render(signature_of(c, node, true)), "fn(int) -> any")
 }
@@ -1158,7 +1115,6 @@ fn test_a_generic_parameter_is_in_scope_while_the_signature_resolves() -> void {
     )
 
     assert_eq(render(signature_of(c, node, false)), "fn(T) -> T")
-    # And it is unwound again: the parameter does not leak past the signature.
     assert_true(c.scoped_type_name("T") is null)
 }
 
@@ -1207,10 +1163,8 @@ fn test_a_variadic_binds_a_list_and_a_kwrest_binds_a_dict() -> void {
     c.resolution.bind(opts, opts_symbol)
     check_body(c, node, null, false)
 
-    # The type in the signature is not the type of the binding inside the body.
     assert_eq(render(c.symbol_type(rest_symbol)), "list[int]")
     assert_eq(render(c.symbol_type(opts_symbol)), "dict[str, str]")
-    # The flags are part of the rendered signature, and the binding types are not.
     assert_eq(render(signature_of(c, node, false)), "fn(...int, **str) -> any")
 }
 
@@ -1341,7 +1295,6 @@ fn test_a_field_default_widens_an_int_literal_into_a_float() -> void {
     check_decl(c, node)
 
     assert_len(c.bag.items, 0)
-    # §2.2's conversion happens in the tree, not at run time.
     assert_eq(literal.kind, NodeKind.FloatLit)
 }
 
@@ -1352,7 +1305,6 @@ fn test_a_shadowed_declarations_body_is_not_checked() -> void {
     let _second = register_decl(c, shadow)
     check_decl(c, shadow)
 
-    # The C's `d->decl != node`: the name belongs to the first declaration.
     assert_len(c.bag.items, 0)
 }
 
@@ -1406,8 +1358,6 @@ fn test_a_parent_with_no_init_imposes_no_ordering() -> void {
 
 fn test_a_trait_requirement_has_no_body_to_check() -> void {
     let c = _ctx()
-    # A requirement is a declaration and not a definition, so E0601 would be
-    # about a body nobody wrote.
     let node = _trait("Shape", [_fn("area", [_self()], TypeExpr.named("int"))])
     _declare(c, node)
     check_decl(c, node)
@@ -1436,7 +1386,6 @@ fn test_a_variant_payloads_default_is_evaluated() -> void {
     check_decl(c, node)
 
     assert_len(c.bag.items, 0)
-    # It was walked, so the constant folder saw it.
     assert_eq(default_value.kind, NodeKind.IntLit)
     assert_eq(default_value.number("intLit"), 3)
 }
@@ -1504,12 +1453,10 @@ fn test_an_unannotated_binding_infers_its_initialiser() -> void {
 
 fn test_an_unannotated_var_bound_to_null_is_dynamic() -> void {
     let c = _ctx()
-    # Pinned to the null type it would reject every later assignment.
     let variable = Node.var_decl(DeclKind.Var, Node.bind("x"), null, Node.null_lit())
     check_var_decl(c, variable)
     assert_eq(render(c.type_of(variable)), "any")
 
-    # A `let` cannot be reassigned, so nothing is gained by widening it.
     let binding = Node.var_decl(DeclKind.Let, Node.bind("x"), null, Node.null_lit())
     check_var_decl(c, binding)
     assert_eq(render(c.type_of(binding)), "null")
@@ -1545,7 +1492,6 @@ fn test_a_const_is_folded_and_recorded_for_its_uses() -> void {
     assert_len(c.bag.items, 0)
     assert_eq(init.kind, NodeKind.IntLit)
     assert_eq(init.number("intLit"), 42)
-    # A Jaithon `Symbol` has no `constValue`, so the folded literal is kept here.
     assert_eq(c.consts["K"].number("intLit"), 42)
 }
 
@@ -1571,7 +1517,6 @@ fn test_a_const_with_no_initialiser_is_reported() -> void {
 
 fn test_a_fold_that_overflowed_reports_once_and_not_twice() -> void {
     let c = _ctx()
-    # E0900 is the fold's, and E0303 would only repeat it in worse words.
     let over = Node.binary(OpKind.Pow, Node.int_lit(2), Node.int_lit(70))
     check_var_decl(c, Node.var_decl(DeclKind.Const, Node.bind("K"), null, over))
 

@@ -29,42 +29,32 @@
 #define REPL_HISTORY_MAX 1000
 
 typedef enum {
-    REPL_EXEC,     /* run it; echo the value of a bare expression  */
-    REPL_QUIET,    /* run it; never echo (:load, :time's own timer) */
-    REPL_TYPE,     /* run it; report the type of a bare expression  */
-    REPL_AST,      /* print the syntax tree, do not run             */
-    REPL_DISASM,   /* print the bytecode, do not run                */
+    REPL_EXEC,
+    REPL_QUIET,
+    REPL_TYPE,
+    REPL_AST,
+    REPL_DISASM,
 } ReplAction;
 
 static struct {
     ObjModule     *module;      /* kept alive by vm.modules, a GC root */
-    JaiBuf         pending;     /* lines accumulated for an unfinished input */
+    JaiBuf         pending;
     CodegenOptions codegen;
-    /* The class, trait and enum names this session has declared, so that a
-     * later line can use them as types. See "Types declared at the prompt". */
-    int            inputCount;  /* names the source files: <repl:1>, <repl:2> */
+    int            inputCount;
     bool           interactive;
     bool           strict;
     bool           quit;
-    bool           failed;      /* an input did not run, or threw. See jaiReplRun. */
+    bool           failed;
 } gRepl;
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Something the user asked for did not happen: a diagnostic stopped an input
- * before it ran, an exception escaped one that did, or end of input arrived
- * with a statement still half typed. The session carries on regardless, so
- * this is remembered rather than acted on; jaiReplRun turns it into the exit
- * status. A warning is not one of these, and does not reach here unless the
- * session was asked to treat warnings as errors. */
 static inline void replNoteFailure(void) { gRepl.failed = true; }
 
 static void replError(const char *fmt, ...) JAI_PRINTF(1, 2);
 
-/* REPL usage problems go through the diagnostic renderer too, so they look
- * like every other error the user sees. */
 static void replError(const char *fmt, ...) {
     char message[512];
     va_list args;
@@ -76,9 +66,6 @@ static void replError(const char *fmt, ...) {
     replNoteFailure();
 }
 
-/* Render and clear the bag, dropping the two warnings that only make sense for
- * a whole file: at a prompt every binding is unused until the next line uses
- * it, and every import is there to be used interactively. */
 static bool replFlushDiags(void) {
     bool hadErrors = jaiDiagHasErrors(&gDiags);
     if (hadErrors) replNoteFailure();   /* an input with an error never runs */
@@ -113,7 +100,6 @@ static void freeLine(char *line) {
 /* The two natives the REPL injects                                     */
 /* ------------------------------------------------------------------ */
 
-/* `expr` at the prompt is compiled as `__repl_echo__(expr)`. */
 static bool replEcho(int argc, Value *args, Value *out) {
     (void)argc;
     *out = NULL_VAL;
@@ -126,7 +112,6 @@ static bool replEcho(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* `:type expr` is compiled as `__repl_type__(expr)`. */
 static bool replTypeOf(int argc, Value *args, Value *out) {
     (void)argc;
     *out = NULL_VAL;
@@ -144,22 +129,6 @@ static void defineHelper(ObjModule *module, const char *name, JaiNativeFn fn) {
     jaiModuleSet(module, key, OBJ_VAL(native));
     jaiPopRoots(2);
 }
-
-/* ------------------------------------------------------------------ */
-/* Types declared at the prompt                                         */
-/* ------------------------------------------------------------------ */
-
-/* A class survives to the next line as a value like any other binding, but an
- * annotation is not a value: `fn make() -> Point` asks the checker for a type
- * named `Point`, and the declaration that could answer went away with the tree
- * of the line that introduced it.
- *
- * That list used to live here, in the C resolver's built-in registry. It now
- * lives in the `ReplSession` the front end keeps (lib/jaithon/compile/mod.jai),
- * because the registry is part of `src/sema` and the session is not. Forgetting
- * it is `:reset`, and `jaiFrontEndReplForget` is the whole of what that takes.
- */
-
 
 /* ------------------------------------------------------------------ */
 /* The persistent module                                                */
@@ -207,9 +176,6 @@ static void replReset(void) {
     jaiFrontEndReplForget();
     gRepl.pending.count = 0;
 
-    /* :reset forgets the bindings, not the session: replInit installs the
-     * defaults, but -O0 and --strict came from the command line and outlive
-     * every module this session builds. */
     CodegenOptions codegen = gRepl.codegen;
     bool strict = gRepl.strict;
     (void)replInit();
@@ -221,21 +187,10 @@ static void replReset(void) {
 /* Deciding whether more input is needed                                */
 /* ------------------------------------------------------------------ */
 
-/* Whether the buffer is a whole input is a question about syntax, so the front
- * end answers it. Nothing is registered and no diagnostic escapes: a line
- * still being typed must not reach the source table, and the compile that
- * follows a complete input produces the real diagnostics with real spans.
- *
- * A front end that cannot be reached leaves the verdict zeroed, which reads as
- * "complete" -- the compile below then says why, which beats a prompt hanging
- * on a line nothing can finish. */
 static void replScan(const char *source, size_t length, JaiReplScan *out) {
     (void)jaiFrontEndReplScan(source, length, out);
 }
 
-/* A closer that matches nothing is reported here rather than left to the
- * compiler: the parser's own "needs more input" test sees the same unbalanced
- * count and would ask for a line that cannot fix it. */
 static void replReportMismatch(const JaiReplScan *scan) {
     if (scan->opener != '\0') {
         replError("`%c` at line %d, column %d does not close the `%c` opened at line %d",
@@ -247,18 +202,12 @@ static void replReportMismatch(const JaiReplScan *scan) {
     }
 }
 
-/* Ask the same question about the input being typed. Only the rare paths need
- * it, abandoning a line and end of input, so lexing the buffer again there is
- * cheaper than carrying the last verdict around. */
 static bool scanPending(JaiReplScan *out) {
     if (gRepl.pending.count == 0) return false;
     replScan((const char *)gRepl.pending.data, gRepl.pending.count, out);
     return true;
 }
 
-/* End of input with a half-typed statement in hand. Dropping it without a word
- * is how a piped session loses its last function whole, so name what was left
- * open. */
 static void replReportUnclosed(void) {
     JaiReplScan scan;
     if (!scanPending(&scan)) return;
@@ -284,7 +233,6 @@ static void replReportUnclosed(void) {
 /* ------------------------------------------------------------------ */
 /* Compiling and running one input                                      */
 
-/* Nested functions live in the enclosing chunk's constant pool. */
 static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
     if (fn == NULL || depth > 32) return;
     const char *name = fn->name != NULL ? fn->name->chars : "<anonymous>";
@@ -296,7 +244,6 @@ static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
     }
 }
 
-/* Print the syntax tree for one input, the way `jaithon ast` prints it. */
 static void replPrintTree(const char *source, size_t length, int fileId) {
     ObjString *dump = jaiFrontEndAstText(source, length, "<repl>", fileId, false);
 
@@ -315,9 +262,6 @@ static void replPrintTree(const char *source, size_t length, int fileId) {
     jaiPopRoot();
 }
 
-/* Compile one complete input against the persistent module and act on it.
- * Diagnostics and uncaught exceptions are reported here; the session always
- * continues afterwards. */
 static void replExecuteOwned(char *owned, size_t length, ReplAction action,
                               bool wholeFile, const char *label) {
     if (!replInit()) {
@@ -402,9 +346,6 @@ static const char *nextLabel(void) {
 /* Meta-commands                                                        */
 /* ------------------------------------------------------------------ */
 
-/* One of three lists that have to say the same thing: this one, the dispatch in
- * replMeta, and the text metaHelp prints. tests/repl/meta_help.repl pins that
- * text, so a command reaches the completer and the user together or not at all. */
 static const char *const kMetaCommands[] = {
     ":help", ":quit", ":clear", ":vars", ":type", ":ast",
     ":disasm", ":time", ":load", ":reset", ":cancel",
@@ -431,11 +372,6 @@ static void metaHelp(void) {
         stdout);
 }
 
-/* The escape sequence means something to a terminal and nothing to a pipe or a
- * file, where it is seven bytes of noise in the middle of the transcript. The
- * screen being cleared is the one stdout writes to, so that stream is asked as
- * well: a session driven from a keyboard can still have its output redirected,
- * and a session driven from a pipe has nobody watching a screen to clear. */
 static void metaClear(void) {
     if (gRepl.interactive && isatty(STDOUT_FILENO)) fputs("\033[2J\033[H", stdout);
 }
@@ -583,10 +519,6 @@ static bool firstWordIs(const char *s, const char *word) {
     return s[n] == '\0' || s[n] == ' ' || s[n] == '\t' || s[n] == '\r';
 }
 
-/* The meta-commands that stay meta at the continuation prompt. Each one ends
- * the input being typed, so appending it as source instead would leave the
- * session with no way out at all where readline is not linked in and Ctrl-C
- * therefore does nothing. */
 static bool isCancelCommand(const char *trimmed) {
     if (*trimmed != ':') return false;
     const char *command = skipSpace(trimmed + 1);
@@ -594,11 +526,6 @@ static bool isCancelCommand(const char *trimmed) {
            firstWordIs(command, "reset");
 }
 
-/* The meta-command a line names, or NULL. The other eight do not end the input
- * being typed, so at the `... ` prompt they cannot run — but they must not
- * become source either: spliced into the buffer, `:vars` used to fail to parse
- * and take the half-typed input down with it, reporting `expected an
- * expression, found :` about a line the user never meant as code. */
 static const char *metaCommandNamed(const char *trimmed) {
     if (*trimmed != ':') return NULL;
     const char *command = skipSpace(trimmed + 1);
@@ -608,10 +535,6 @@ static const char *metaCommandNamed(const char *trimmed) {
     return NULL;
 }
 
-/* A blank line at the `... ` prompt means "forget it" only when nothing but a
- * trailing operator is holding the input open. Inside a bracket, a string or a
- * comment a blank line is part of what is being typed, and a pasted block that
- * contains one has to arrive intact. */
 static bool blankLineAbandons(void) {
     JaiReplScan scan;
     if (!scanPending(&scan)) return false;
@@ -651,7 +574,6 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
 
     const size_t lineLen = strlen(line);
 
-    /* Reserve once for text + newline + uncounted NUL sentinel. */
     jaiBufReserve(&gRepl.pending, lineLen + 2);
     memcpy(gRepl.pending.data + gRepl.pending.count, line, lineLen);
     gRepl.pending.count += lineLen;
@@ -675,10 +597,6 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
         return false;
     }
 
-    /*
-     * Detach the exact completed buffer and transfer it to the source registry.
-     * This removes the old jaiMemdup() allocation + full input copy.
-     */
     size_t ownedLength = 0;
     char *owned = jaiBufTakeCString(&gRepl.pending, &ownedLength);
 
@@ -692,9 +610,7 @@ bool jaiReplFeed(const char *line, bool *outIncomplete) {
 
 #ifdef JAI_HAVE_READLINE
 
-/* readline owns what it hands back and releases it with libc free(), and it
- * frees the completion matches the same way. Those buffers are the only ones
- * in Jaithon that do not come from jaiRealloc. */
+/* readline uses malloc/free, not jaiRealloc */
 static char *readlineOwnedCopy(const char *s) {
     size_t size = strlen(s) + 1;
     char *copy = (char *)malloc(size);
@@ -759,7 +675,6 @@ static char *completionGenerator(const char *text, int state) {
 static char **replCompletion(const char *text, int start, int end) {
     (void)start;
     (void)end;
-    /* `:load` wants paths, so leave that one to readline's filename default. */
     if (rl_line_buffer != NULL && strncmp(rl_line_buffer, ":load", 5) == 0) {
         return NULL;
     }
@@ -793,10 +708,6 @@ static void historySave(void) {
 
 static volatile sig_atomic_t sPromptInterrupted;
 
-/* Ctrl-C at the prompt abandons the line rather than leaving half a statement
- * behind for the next one. This handler is installed only while readline is
- * waiting, so the VM keeps its own SIGINT — the one that stops a running
- * program at the next safepoint — for everything else. */
 static void promptInterrupt(int signum) {
     (void)signum;
     sPromptInterrupted = 1;
@@ -807,7 +718,6 @@ static void promptInterrupt(int signum) {
 
 #endif /* JAI_HAVE_READLINE */
 
-/* True once, when the last prompt was cut short by Ctrl-C. */
 static bool takePromptInterrupt(void) {
 #ifdef JAI_HAVE_READLINE
     if (sPromptInterrupted) {
@@ -818,7 +728,6 @@ static bool takePromptInterrupt(void) {
     return false;
 }
 
-/* Read one line without its terminator, or NULL at end of input. */
 static char *readInputLine(const char *prompt) {
 #ifdef JAI_HAVE_READLINE
     if (gRepl.interactive) {
@@ -890,19 +799,12 @@ static char *readInputLine(const char *prompt) {
 /* The loop                                                             */
 /* ------------------------------------------------------------------ */
 
-/* What a session takes from the command line. Split out of jaiReplRun because
- * `--eval` is one input rather than a session: it has no loop to enter, but it
- * is the same evaluator and must answer -O0 and --release the same way, or the
- * flags are accepted and silently ignored. */
 void jaiReplConfigure(const JaiCliOptions *opts) {
     if (opts == NULL || !replInit()) return;
     gRepl.codegen = opts->run.codegen;
     gRepl.codegen.debugInfo = true;   /* tracebacks are the point of a REPL */
 }
 
-/* Whether any input has failed since the process started, by the rule on
- * replNoteFailure. jaiReplRun turns it into the status of a piped session;
- * `--eval` reads it directly, because there the one input *is* the run. */
 bool jaiReplFailed(void) { return gRepl.failed; }
 
 int jaiReplRun(const JaiCliOptions *opts) {
@@ -930,10 +832,6 @@ int jaiReplRun(const JaiCliOptions *opts) {
         const char *prompt = gRepl.pending.count > 0 ? REPL_CONTINUE : REPL_PROMPT;
         char *line = readInputLine(prompt);
         if (line == NULL) {
-            /* End of input with something half typed: say what was left open
-             * before dropping it. At a terminal that is Ctrl-D, and the
-             * session continues on the next prompt; in a pipe there is no
-             * next prompt, so the loop ends here. */
             if (gRepl.pending.count > 0) {
                 replReportUnclosed();
                 gRepl.pending.count = 0;
@@ -962,17 +860,7 @@ int jaiReplRun(const JaiCliOptions *opts) {
 #endif
 
     jaiBufFree(&gRepl.pending);
-    gRepl.module = NULL;   /* vm.modules still owns it; freed with the VM */
+    gRepl.module = NULL;
 
-    /* A session driven by a pipe or a file is a program that was run, and a
-     * program that could not run part of what it was given did not succeed:
-     * without this, `jaithon repl < script` is unusable in a shell that tests
-     * its status, and useless as a check in CI.
-     *
-     * At a terminal the status reports the session rather than the transcript,
-     * and the session is what the person at the keyboard chose to end. Every
-     * error was printed as it happened and answered by typing the next line,
-     * so a typo an hour ago is not a verdict on `:quit`, and a shell prompt
-     * that shows the last status would carry it there for no reason. */
     return !gRepl.interactive && gRepl.failed ? 1 : 0;
 }

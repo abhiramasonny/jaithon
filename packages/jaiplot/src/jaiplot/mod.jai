@@ -55,7 +55,6 @@ pub let FORMATS: list[str] = ["svg", "png", "ppm"]
 #: jaiplot.render_svg(figure).starts_with("<svg")     # true
 #: ```
 pub fn save(figure: Figure, path: str) -> void {
-    # `rfind` reports absence as -1, not null.
     let dot = path.rfind(".")
     if dot < 0 {
         throw ValueError(f"cannot tell the format of {path}: it has no extension")

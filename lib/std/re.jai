@@ -37,10 +37,6 @@
 #: word.is_match("hello world")          # true
 #: word.find_all("hello world").len()    # 2
 #: ```
-
-# A repeat bound above this, or a program that expands past MAX_PROGRAM
-# instructions, is refused: the simulation is linear in the program size, so an
-# unbounded expansion is an unbounded match cost.
 const MAX_REPEAT = 1000
 const MAX_PROGRAM = 20000
 
@@ -353,10 +349,6 @@ pub class Regex {
         var matched: list[int] = []
         var position = start
         loop {
-            # A fresh thread joins at the back (lowest priority) until
-            # something matches, so the earliest-started match always wins —
-            # "leftmost". Injecting here instead of restarting the search per
-            # position is what keeps an unanchored search linear.
             if matched.len() == 0 {
                 let fresh = [-1 for _ in 0..self.slot_count]
                 self._add_thread(
@@ -390,10 +382,6 @@ pub class Regex {
                     }
                 } elif instruction.op == OP_MATCH {
                     matched = thread.slots
-                    # Everything after this is lower priority and a
-                    # backtracking engine would never reach it either —
-                    # cutting it here is what makes the result
-                    # leftmost-*first*, not leftmost-longest.
                     break
                 }
                 index += 1
@@ -443,8 +431,6 @@ pub class Regex {
                 stack.push(Thread(instruction.y, thread.slots))
                 stack.push(Thread(instruction.x, thread.slots))
             } elif instruction.op == OP_SAVE {
-                # Copy before writing: several live threads share one slot
-                # list, and only this one is recording a group boundary.
                 let updated = [value for value in thread.slots]
                 updated[instruction.x] = position
                 stack.push(Thread(thread.program_counter + 1, updated))
@@ -705,7 +691,6 @@ class Parser {
         if ch in _CLASS_ESCAPES {
             let node = Node(NODE_CHAR)
             let set = CharClass()
-            # The uppercase spelling is the negated one: \D, \W, \S.
             set.add_predicate(_CLASS_ESCAPES[ch], ch != ch.lower())
             node.char_set = set
             return node
@@ -729,7 +714,6 @@ class Parser {
         loop {
             let ch = self._peek()
             if ch == "" { throw self._error("unterminated character class") }
-            # A ']' in first position is the character, not the terminator.
             if ch == "]" and not first {
                 self.index += 1
                 break
@@ -745,14 +729,11 @@ class Parser {
                     set.add_predicate(_CLASS_ESCAPES[escaped], escaped != escaped.lower())
                     continue
                 }
-                # Inside a class \b is a backspace; a boundary would be
-                # meaningless here.
                 low = escaped == "b" ? 8 : self._escape_code(escaped)
             } else {
                 self.index += 1
                 low = ord(ch)
             }
-            # A '-' before the closing bracket is itself a character.
             if self._peek() == "-" and self._peek_at(1) != "]" and self._peek_at(1) != "" {
                 self.index += 1
                 var high = 0
@@ -781,9 +762,6 @@ class Parser {
 
     fn _escape_code(self, ch: str) -> int {
         if ch in _CONTROL_ESCAPES { return _CONTROL_ESCAPES[ch] }
-        # Escaped punctuation is that punctuation, which is what makes
-        # `std.str.escape_regex` work. An escaped letter or digit that means
-        # nothing is a typo, and passing it through as a literal would hide it.
         if _is_alphanumeric(ch) { throw self._error(f"unknown escape '\\{ch}'") }
         return ord(ch)
     }
@@ -919,8 +897,6 @@ fn _compile_alternate(program: list[Instruction], node: Node) -> void {
 fn _compile_repeat(program: list[Instruction], node: Node) -> void {
     let body = node.children[0]
     if node.high < 0 {
-        # `a{3,}` is `aa` followed by `a+`: the last required copy is the one
-        # the loop repeats, so only low - 1 copies are emitted ahead of it.
         let required = node.low > 0 ? node.low - 1 : 0
         for _ in 0..required { _compile_node(program, body) }
         _compile_loop(program, body, node.lazy, node.low == 0)
@@ -992,9 +968,6 @@ fn _expand(hit: Match, replacement: str) -> str {
             index += 2
             continue
         }
-        # Digits are taken only while they still name an existing group, so
-        # "$12" is group 12 with twelve groups, group 1 followed by "2" with
-        # fewer.
         var group = 0
         var scan = index + 1
         while scan < chars.len() and

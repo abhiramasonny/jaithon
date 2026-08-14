@@ -41,9 +41,6 @@ pub fn peephole(proto: FuncProto) -> int {
 #: the `Code`; this is the entry point a normal compile runs, and the wrapper
 #: above is for callers holding only a proto.
 pub fn peephole_on(code: Code) -> int {
-    # Rewriting strands blocks, and removing a stranded block puts new
-    # neighbours next to each other, so the two feed each other until neither
-    # has anything left to do.
     var changes = 0
     for _round in 0..SETTLE_ROUNDS {
         let before = changes
@@ -56,9 +53,6 @@ pub fn peephole_on(code: Code) -> int {
 
 fn _scan(code: Code) -> int {
     var changes = 0
-    # Every rewrite but the retarget removes an instruction, and the retarget is
-    # idempotent, so this terminates; the guard is insurance against a future
-    # rule that is not.
     var guard = 8 * code.count() + 64
     var index = first_live(code)
     while index >= 0 and guard > 0 {
@@ -69,8 +63,6 @@ fn _scan(code: Code) -> int {
         }
         changes += 1
         if not code.data[index].dead { continue }
-        # Back up one: deleting an instruction can make its neighbours adjacent
-        # and open a pattern that spans the hole.
         let resume = prev_live(code, index)
         index = if resume >= 0 { resume } else { next_live(code, index) }
     }
@@ -85,19 +77,12 @@ fn _rewrite_at(code: Code, index: int) -> bool {
 }
 
 # ---- control flow ----------------------------------------------------- #
-
-# The three branch rewrites, in the order `rewriteBranchAt` tries them: a JUMP
-# onto the instruction after it, a branch onto a JUMP, and a conditional whose
-# only job is to skip a JUMP. At most one of them fires per call.
 fn _rewrite_branch(code: Code, index: int) -> bool {
     let instruction = code.data[index]
     if instruction.target < 0 { return false }
 
     let follow = next_live(code, index)
 
-    # JUMP to the next instruction is a no-op. Deleting it is safe even when it
-    # is itself a target: every edge into it simply lands on the instruction it
-    # would have jumped to.
     if instruction.op == opcode(Op.Jump) and
         follow >= 0 and
         live_at_or_after(code, instruction.target) == follow {
@@ -105,7 +90,6 @@ fn _rewrite_branch(code: Code, index: int) -> bool {
         return true
     }
 
-    # JUMP to a JUMP: go straight to the final target.
     if op_branch_is_edge(instruction.op) and instruction.op != opcode(Op.Loop) {
         let resolved = _chase_jump(code, instruction.target)
         if resolved < code.count() and
@@ -118,8 +102,6 @@ fn _rewrite_branch(code: Code, index: int) -> bool {
         }
     }
 
-    # JUMP_IF_FALSE over a lone JUMP: invert the test and take the JUMP's
-    # target. The head keeps its position, so an edge into it is unaffected.
     if _is_conditional_jump(instruction.op) and follow >= 0 {
         let over = code.data[follow]
         let after = next_live(code, follow)
@@ -128,10 +110,6 @@ fn _rewrite_branch(code: Code, index: int) -> bool {
             not over.is_target and
             after >= 0 and
             live_at_or_after(code, instruction.target) == after {
-            # `count()` here means everything past the JUMP's target is deleted;
-            # the C reads/writes one past its array's end in this case, and
-            # refusing matches every input where that read is defined, since
-            # `rebuild` rejects a branch off the end anyway.
             let landing = live_at_or_after(code, over.target)
             if landing < code.count() and _retarget_fits(code, index, landing) {
                 instruction.op = _inverted_jump(instruction.op)
@@ -145,10 +123,6 @@ fn _rewrite_branch(code: Code, index: int) -> bool {
     return false
 }
 
-# Follow a chain of unconditional JUMPs to its end. LOOP is never followed: it
-# is the GC and interrupt safepoint (spec §10), and jumping over one would let a
-# tight loop run uninterrupted. The step bound makes a jump cycle terminate;
-# landing anywhere inside such a cycle is equivalent anyway.
 fn _chase_jump(code: Code, target: int) -> int {
     var at = live_at_or_after(code, target)
     var steps = 0
@@ -163,21 +137,12 @@ fn _chase_jump(code: Code, target: int) -> int {
     return at
 }
 
-# Bytes between a branch and its target in the current layout. Deletions only
-# pull the two closer, so a value that fits now still fits after re-encoding;
-# rewrites that would overflow i16 are rejected here rather than aborting the
-# whole pass in `rebuild`.
 fn _retarget_fits(code: Code, at: int, landing: int) -> bool {
     let here = code.data[at].new_offset + code.data[at].size()
     return fits_i16(code.data[landing].new_offset - here)
 }
 
 # ---- conditions ------------------------------------------------------- #
-
-# A constant condition in front of a conditional jump. Both rewrites delete the
-# push, whose effect the jump cancelled, and either delete the jump or demote it
-# to an unconditional one, never the other way round, so the code only ever
-# shrinks.
 fn _rewrite_const_condition(code: Code, index: int) -> bool {
     let window = window_of(code, index, 2)
     if window.len() < 2 or not window_clean(code, window) { return false }
@@ -187,8 +152,6 @@ fn _rewrite_const_condition(code: Code, index: int) -> bool {
     let jump = code.data[window[1]]
     if jump.target < 0 { return false }
 
-    # The KEEP forms leave the value on the stack, so only the never-taken case
-    # can be simplified, and only the jump goes.
     if jump.op == opcode(Op.JumpIfFalseKeep) or jump.op == opcode(Op.JumpIfTrueKeep) {
         let keep_taken = if jump.op == opcode(Op.JumpIfFalseKeep) { not value } else { value }
         if keep_taken { return false }
@@ -210,21 +173,11 @@ fn _rewrite_const_condition(code: Code, index: int) -> bool {
         kill(code, window[1])
         return true
     }
-    # Reuse the jump's slot: OP_JUMP is the same width as the conditional it
-    # replaces, so nothing downstream moves.
     jump.op = opcode(Op.Jump)
     kill(code, window[0])
     return true
 }
 
-# NOT feeding a conditional jump: invert the jump instead. Both instructions
-# change meaning for an incoming edge, so neither may be a branch target.
-#
-# Erasing the NOT looks free since the jump checks its condition is a bool too,
-# but the two report the failure differently ("operand of 'not'" vs.
-# "condition") and a program can catch and read that message. So the rewrite
-# waits for a producer that is a bool by construction, where the check can
-# never fire and which instruction would have run it stops mattering.
 fn _rewrite_not_jump(code: Code, index: int) -> bool {
     let window = window_of(code, index, 2)
     if window.len() < 2 { return false }
@@ -237,14 +190,11 @@ fn _rewrite_not_jump(code: Code, index: int) -> bool {
 
     let producer = prev_live(code, window[0])
     if producer < 0 or not _pushes_bool(code.data[producer].op) { return false }
-    # An edge landing on the producer runs the NOT; one landing between it and
-    # the NOT does not exist, since the NOT is not a target.
     jump.op = _inverted_jump(jump.op)
     kill(code, window[0])
     return true
 }
 
-# The boolean an instruction pushes, or null when it is not a constant push.
 fn _pushed_bool(code: Code, instruction: Instr) -> bool? {
     if instruction.op == opcode(Op.True) { return true }
     if instruction.op == opcode(Op.False) { return false }
@@ -257,8 +207,6 @@ fn _pushed_bool(code: Code, instruction: Instr) -> bool? {
 }
 
 # ---- stack traffic ---------------------------------------------------- #
-
-# POP;POP;… -> POPN n, and DUP;POP -> nothing.
 fn _rewrite_stack_ops(code: Code, index: int) -> bool {
     let head = code.data[index]
 
@@ -309,14 +257,8 @@ fn _rewrite_stack_ops(code: Code, index: int) -> bool {
 }
 
 # ---- opcode tables ---------------------------------------------------- #
-
-# The four conditional jumps and their opposites. One table serves both
-# `isConditionalJump` and `invertedJump`: the ops that have an opposite are
-# exactly the ops that branch on a condition.
 let _INVERTED: dict[int, int] = _build_inverted()
 
-# Instructions whose result is a bool whatever their operands were. Any of them
-# satisfies OP_NOT's operand check on its own.
 let _PUSHES_BOOL: dict[int, bool] = _build_pushes_bool()
 
 fn _build_inverted() -> dict[int, int] {

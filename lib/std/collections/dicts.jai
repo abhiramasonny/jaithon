@@ -581,10 +581,6 @@ pub class FrozenDict[K, V]: Iterable[K] {
     #: values can still be built and compared; only hashing it fails.
     fn __hash__(self) -> int {
         if self.hash_ready { return self.hash_value }
-        # Combine entries with xor so the result cannot depend on iteration
-        # order, after mixing key into value so that {a: b} and {b: a} differ.
-        # The multiplications wrap: a hash that raised OverflowError would be
-        # useless.
         var combined = 0
         for (key, value) in self.entries.items() {
             combined = combined ^ (hash(key) *% 1000003 ^ hash(value))
@@ -599,8 +595,6 @@ pub class FrozenDict[K, V]: Iterable[K] {
         return f"FrozenDict({self.entries})"
     }
 
-    # Take ownership of an already-private dictionary, skipping the defensive
-    # copy that `init` makes.
     static fn _wrap(entries: dict[K, V]) -> FrozenDict[K, V] {
         let result = FrozenDict[K, V]({})
         result.entries = entries

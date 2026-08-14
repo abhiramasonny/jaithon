@@ -1,18 +1,4 @@
 // The language service.
-//
-// There is no reimplemented parser here. `jaithon ast --json` gives a syntax
-// tree with a byte span on every node, and everything the editor offers —
-// definitions, references, rename, hover, completion — is that answer indexed.
-//
-// It once had a second source. `jaithon check --dump-sema` gave the type the
-// checker assigned to each span, which is what answered member access: the
-// receiver's type came from the checker rather than from a guess. That option
-// belonged to the C front end, which no longer exists, so the sema index is
-// empty and member access falls back to what the syntax tree alone can say.
-// Reviving it means teaching the self-hosted front end to emit the same dump.
-//
-// What this file does add is lexical scoping, because the AST does not record
-// which declaration a name resolved to.
 
 const vscode = require('vscode');
 const fs = require('fs');
@@ -22,10 +8,6 @@ const tool = require('./tool');
 
 // ---------------------------------------------------------------------------
 // Offsets
-//
-// AST spans are byte offsets; VS Code positions are UTF-16. They agree for
-// ASCII, which is the overwhelmingly common case, so the conversion table is
-// only built when a file actually needs one.
 // ---------------------------------------------------------------------------
 
 class Offsets {
@@ -102,12 +84,6 @@ function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * A declaration node's span covers its modifiers and often its whole body, so
- * the identifier has to be found inside it. Searching for the name as a whole
- * word from the front of the declaration lands on the declared name, because
- * the only thing that precedes it is `pub`, `static`, `fn`, `class` and friends.
- */
 function locateName(text, from, to, name) {
     if (!name) return null;
     const region = text.slice(from, to);
@@ -117,7 +93,6 @@ function locateName(text, from, to, name) {
     return { start, end: start + name.length };
 }
 
-/** Every node beneath `node`, including itself, in source order. */
 function walk(node, visit) {
     if (Array.isArray(node)) {
         for (const item of node) walk(item, visit);
@@ -213,8 +188,6 @@ class FileAnalysis {
 
     addSymbol(spec) {
         const symbol = { index: this.symbols.length, container: null, ...spec };
-        // The sema dump is keyed by whole-node spans; a pattern bind is the one
-        // declaration whose name span is a node of its own.
         symbol.type = symbol.type
             || this.typeAt(symbol.start, symbol.end)
             || this.typeAt(symbol.fullStart, symbol.fullEnd);
@@ -228,14 +201,13 @@ class FileAnalysis {
         return this.types.get(`${start}:${end}`) || null;
     }
 
-    /** Contiguous `#:` lines immediately above `byteOffset`. */
     docAbove(byteOffset) {
         const line = this.offsets.lineOf(this.offsets.char(byteOffset));
         const out = [];
         for (let i = line - 1; i >= 0; i--) {
             const text = this.offsets.lineText(i).trim();
             if (text.startsWith('#:')) { out.unshift(text.slice(2).replace(/^ /, '')); continue; }
-            if (text === '' && out.length === 0) continue;   // one blank line is allowed
+            if (text === '' && out.length === 0) continue;
             break;
         }
         return out.length ? out.join('\n') : null;
@@ -245,7 +217,6 @@ class FileAnalysis {
         return node && node.span ? node.span : { start: 0, end: 0 };
     }
 
-    /** Pass one: create scopes and declare every name they introduce. */
     declare(node, scopeId, container) {
         if (Array.isArray(node)) {
             for (const item of node) this.declare(item, scopeId, container);
@@ -253,8 +224,6 @@ class FileAnalysis {
         }
         if (!node || typeof node !== 'object') return;
         if (typeof node.kind !== 'string') {
-            // Call arguments, match arms, dict entries: wrappers around nodes
-            // that carry no kind of their own but hold declarations all the same.
             for (const key of Object.keys(node)) {
                 if (key === 'span') continue;
                 this.declare(node[key], scopeId, container);
@@ -278,9 +247,6 @@ class FileAnalysis {
             case 'AST_FN_DECL': case 'AST_LAMBDA': case 'AST_ANON_FN': {
                 const at = node.name ? this.findName(start, this.span(node.body).start || end, node.name) : null;
                 const fnScope = this.pushScope(scopeId, start, end, 'function');
-                // A function declared inside a class, trait or enum is a method,
-                // and belongs to that type's member scope rather than to the one
-                // it was written in.
                 const owner = container === undefined || container === null
                     ? null : this.symbols[container];
                 const isMethod = Boolean(owner && owner.members !== undefined);
@@ -308,8 +274,6 @@ class FileAnalysis {
 
                 for (const param of node.params || []) {
                     const pspan = this.span(param);
-                    // A variadic's span opens on the `...`, so the name has to
-                    // be found rather than assumed to sit at the front.
                     const nameAt = this.findName(pspan.start, pspan.end, param.name)
                         || { start: pspan.start, end: pspan.start + Buffer.byteLength(param.name, 'utf8') };
                     this.addSymbol({
@@ -330,9 +294,6 @@ class FileAnalysis {
                 const kind = node.kind === 'AST_CLASS_DECL' ? 'class'
                            : node.kind === 'AST_TRAIT_DECL' ? 'trait' : 'enum';
                 const at = this.findName(start, end, node.name);
-                // Type parameters are visible throughout the declaration, so
-                // they need a lexical scope wrapping it; the member scope, which
-                // `self.x` reaches and a bare name does not, sits inside that.
                 const outer = (node.generics || []).length
                     ? this.pushScope(scopeId, start, end, 'generics') : scopeId;
                 const members = this.pushScope(outer, start, end, kind, false);
@@ -373,8 +334,6 @@ class FileAnalysis {
                 for (const variant of node.variants || []) {
                     const vspan = this.span(variant);
                     const params = (variant.params || []).map(renderParam).join(', ');
-                    // A variant's payload names are its own, not the enum's:
-                    // they get a scope so that `Enum.` does not offer them.
                     const payload = this.pushScope(outer, vspan.start, vspan.end, 'variant', false);
                     const variantSymbol = this.addSymbol({
                         name: variant.name, kind: 'variant',
@@ -413,7 +372,6 @@ class FileAnalysis {
 
             case 'AST_TYPE_DECL': {
                 const at = this.findName(start, end, node.name);
-                // `type Comparator[T] = fn(T, T) -> int` binds T over the alias.
                 const aliasScope = (node.generics || []).length
                     ? this.pushScope(scopeId, start, end, 'generics') : scopeId;
                 const alias = this.addSymbol({
@@ -531,8 +489,6 @@ class FileAnalysis {
 
             case 'AST_IMPORT': {
                 const bound = node.alias || node.path.split('.').filter(Boolean).pop();
-                // `import std.math as math` binds the name after `as`, not the
-                // identical last component of the path before it.
                 let searchFrom = start;
                 if (node.alias) {
                     const marker = this.text.indexOf(' as ', this.offsets.char(start));
@@ -572,10 +528,6 @@ class FileAnalysis {
                     });
                     record.items.push(symbol.index);
 
-                    // With an alias, the name on the left is a use of the other
-                    // module's declaration and the name on the right is this
-                    // module's own. Only the left one moves when that
-                    // declaration is renamed.
                     if (item.alias) {
                         this.refs.push({
                             name: item.name, kind: 'imported', modulePath: node.path,
@@ -599,14 +551,6 @@ class FileAnalysis {
         }
     }
 
-    /**
-     * Locate a declared name inside a byte range, in byte offsets.
-     *
-     * Spans from the compiler are byte offsets and `this.text` is a JS string,
-     * so the two only agree while a file stays ASCII. One em dash in a doc
-     * comment shifts every later span, and a name searched for in the wrong
-     * window is simply not found.
-     */
     findName(fromByte, toByte, name) {
         const at = locateName(this.text, this.offsets.char(fromByte), this.offsets.char(toByte), name);
         return at ? { start: this.offsets.byte(at.start), end: this.offsets.byte(at.end) } : null;
@@ -626,7 +570,6 @@ class FileAnalysis {
         }
     }
 
-    /** Makes the dotted path in an import statement clickable. */
     addModulePathRef(modulePath, start, end, scopeId) {
         const at = this.text.indexOf(modulePath, this.offsets.char(start));
         if (at < 0 || at > this.offsets.char(end)) return;
@@ -669,8 +612,6 @@ class FileAnalysis {
                     });
                     break;
                 case 'AST_EXPORT': {
-                    // `export { a, b }` holds bare names, so a rename that skips
-                    // them silently breaks the module's surface.
                     let cursor = start;
                     for (const name of child.names || []) {
                         const at = this.findName(cursor, end, name);
@@ -684,8 +625,6 @@ class FileAnalysis {
                     break;
                 }
                 case 'AST_CALL':
-                    // `greet(name: "Ada")` — the label is not a node of its own,
-                    // but it starts the argument's span.
                     for (const arg of child.args || []) {
                         if (!arg.name || !arg.span) continue;
                         this.refs.push({
@@ -722,7 +661,6 @@ class FileAnalysis {
                         start, end: start + typeLength,
                         kind: 'type', scope: scopeFor(start), node: child,
                     });
-                    // `Token.Plus => …` names the variant as well as the enum.
                     if (child.variantName) {
                         const at = this.findName(start + typeLength, end, child.variantName);
                         if (at) {
@@ -742,7 +680,6 @@ class FileAnalysis {
         });
     }
 
-    /** Walk the lexical chain for `name`, starting at `scopeId`. */
     lookup(name, scopeId) {
         let scope = this.scopes[scopeId];
         while (scope) {
@@ -755,7 +692,6 @@ class FileAnalysis {
         return null;
     }
 
-    /** Members declared directly on a class, trait or enum symbol. */
     membersOf(symbol) {
         if (!symbol || symbol.members === undefined) return [];
         const scope = this.scopes[symbol.members];
@@ -768,7 +704,6 @@ class FileAnalysis {
         return index === undefined ? null : this.symbols[index];
     }
 
-    /** The declaration whose body encloses `byteOffset`, innermost first. */
     enclosing(byteOffset) {
         let best = null;
         for (const symbol of this.symbols) {
@@ -780,7 +715,6 @@ class FileAnalysis {
         return best;
     }
 
-    /** The declaration or reference the cursor is inside. */
     at(byteOffset) {
         for (const symbol of this.symbols) {
             if (byteOffset >= symbol.start && byteOffset <= symbol.end && symbol.end > symbol.start) {
@@ -795,7 +729,6 @@ class FileAnalysis {
         return null;
     }
 
-    /** Type the checker gave the smallest node covering `byteOffset`. */
     narrowestType(byteOffset) {
         let best = null;
         for (const key of this.types.keys()) {
@@ -813,12 +746,6 @@ class FileAnalysis {
 // Cross-file
 // ---------------------------------------------------------------------------
 
-/**
- * Reduce a checker type to the name it is really about: `list[int]` to `list`,
- * `Point?` to `Point`, `fn() -> Point` to `Point`. A type from another module
- * is qualified — `helpers.Box` — and the qualifier is kept separately, because
- * it says which file to look in.
- */
 function splitTypeName(type) {
     if (!type) return null;
     let text = type.trim();
@@ -879,11 +806,6 @@ class Workspace {
         }
     }
 
-    /**
-     * Analyse a file, reusing the last result while its content is unchanged.
-     * Returns null when the file does not parse — callers fall back to whatever
-     * they can do without a tree rather than showing nothing.
-     */
     async analyze(target, token) {
         const document = target.uri ? target : this.documentFor(target);
         const fsPath = document ? document.uri.fsPath : target;
@@ -898,8 +820,6 @@ class Workspace {
 
         const job = this.run(fsPath, document, token).then((analysis) => {
             this.inflight.delete(pendingKey);
-            // Keep the previous tree when this revision does not parse, so that
-            // navigation survives a half-typed line.
             if (!analysis) return cached ? cached.analysis : null;
             this.cache.set(fsPath, { key, analysis });
             return analysis;
@@ -929,12 +849,6 @@ class Workspace {
             ['ast', '--json', '--color=never', ...include, snapshot.path],
             { cwd: snapshot.dir, document, token });
 
-        /* No sema dump: `--dump-sema` was a C front end option and the compiler
-         * no longer accepts it, so asking for one failed on every keystroke.
-         * Everything downstream already treats the dump as optional -- the
-         * types it carried simply go unanswered, and hovers fall back to what
-         * the AST alone can say. Restoring them means the self-hosted front end
-         * growing an equivalent dump, not calling this flag again. */
         const semaText = '';
         snapshot.dispose();
 
@@ -956,15 +870,10 @@ class Workspace {
         return new FileAnalysis(fsPath, text, ast, types);
     }
 
-    /** The file a dotted import path names, resolved as the compiler would. */
     moduleFile(modulePath, fromFile) {
         return tool.resolveModule(modulePath, fromFile, this.documentFor(fromFile));
     }
 
-    /**
-     * Resolve a reference to its declaration, following imports into other
-     * files. Returns `{analysis, symbol}` or null.
-     */
     async definitionOf(analysis, ref, token) {
         if (!ref) return null;
 
@@ -979,8 +888,6 @@ class Workspace {
             return found ? { analysis: other, symbol: found } : null;
         }
 
-        // A variant in a pattern names its enum explicitly, so there is nothing
-        // to infer: `Token.Plus` is `Plus` on `Token`.
         if (ref.kind === 'variant') {
             const owner = await this.typeSymbol(analysis, ref.owner, token);
             if (!owner) return null;
@@ -993,11 +900,6 @@ class Workspace {
         return this.follow(analysis, local, token);
     }
 
-    /**
-     * An `import`ed name stands for a declaration in another file — and that
-     * file may itself be re-exporting it, as `std.collections` does, so the
-     * hop repeats until it lands on something that is not an import.
-     */
     async follow(analysis, symbol, token) {
         let current = { analysis, symbol };
         const seen = new Set();
@@ -1019,14 +921,6 @@ class Workspace {
         return current;
     }
 
-    /**
-     * The one member of that name declared anywhere this file can see.
-     *
-     * Used only when the receiver's type is unknown, which it always is while
-     * the compiler exposes no type information. Answering from the name alone
-     * is a guess, so it is only made when the workspace offers exactly one
-     * candidate — a wrong jump is worse than none.
-     */
     async memberByName(analysis, name, token) {
         const found = [];
         const consider = (other, symbol) => {
@@ -1113,18 +1007,12 @@ class Workspace {
         return null;
     }
 
-    /** Every `.jai` file in the workspace, respecting the exclude setting. */
     async files(token) {
         const exclude = tool.config().get('excludeGlob') || '**/{__jaicache__,node_modules,build,.git}/**';
         const found = await vscode.workspace.findFiles('**/*.jai', exclude, 4000, token);
         return found.map((uri) => uri.fsPath);
     }
 
-    /**
-     * Files that could mention `name`. Reading bytes is far cheaper than
-     * parsing, so a textual pre-filter keeps a workspace-wide rename to the
-     * handful of files that can possibly be involved.
-     */
     async candidates(name, token) {
         const all = await this.files(token);
         const needle = new RegExp(`(?:^|[^A-Za-z0-9_])${escapeRegExp(name)}(?![A-Za-z0-9_])`);

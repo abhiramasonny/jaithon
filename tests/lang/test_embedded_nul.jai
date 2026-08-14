@@ -24,8 +24,6 @@ fn test_the_bytes_are_the_ones_written() -> void {
     assert_eq("a\0b".bytes(), [97, 0, 98])
     assert_eq("\0z".bytes(), [0, 122])
     assert_eq("a\0".bytes(), [97, 0])
-    # The byte after a NUL is not the terminator: reading it as one is what
-    # made `"a\0b"` cook to `[97, 0, 0]`.
     assert_eq("a\0b".bytes()[2], 98)
 }
 

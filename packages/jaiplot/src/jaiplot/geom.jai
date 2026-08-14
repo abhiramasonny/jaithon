@@ -353,8 +353,6 @@ pub class Transform {
     pub fn apply(self, x: float, y: float) -> Point {
         let unit_x = (self.x_forward(x) - self.x_low) / self.x_span
         let unit_y = (self.y_forward(y) - self.y_low) / self.y_span
-        # The data bottom belongs at the largest device y, so the fraction is
-        # subtracted from `top()` rather than added to `bottom()`.
         return Point(
             self.device.left() + unit_x * self.device_width,
             self.device.top() - unit_y * self.device_height

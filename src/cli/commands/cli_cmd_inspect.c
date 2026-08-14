@@ -11,7 +11,6 @@
 #include "vm/bytecode/chunk.h"
 #include "vm/bytecode/serialize.h"
 
-/* Open --out, or stdout when it was not given. */
 static FILE *openOutput(const JaiCliOptions *opts, FILE **outOpened) {
     *outOpened = NULL;
     if (opts->output == NULL) return stdout;
@@ -26,8 +25,6 @@ static FILE *openOutput(const JaiCliOptions *opts, FILE **outOpened) {
     return f;
 }
 
-/* Nested functions live in the enclosing chunk's constant pool, so walking the
- * constants reaches every function the file compiled to. */
 static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
     if (fn == NULL || depth > 32) return;
 
@@ -55,14 +52,6 @@ static void disassembleTree(FILE *out, const ObjFunction *fn, int depth) {
 }
 
 
-/* ------------------------------------------------------------------ */
-/* Disassembling a .jaic image                                          */
-/* ------------------------------------------------------------------ */
-
-/* A .jaic is bytecode, not source, so `disasm` has to recognise it rather than
- * hand it to the lexer — which used to report `unexpected control character
- * U+0000` on the header. The layout is spec/BYTECODE.md 7; only the fixed
- * prefix is decoded here, and jaiDeserializeModule validates the rest. */
 static inline bool imageIsJaic(const uint8_t *data, size_t size) {
     return size >= 4 && memcmp(data, JAIC_MAGIC, 4) == 0;
 }
@@ -78,9 +67,6 @@ static inline uint64_t imageU64(const uint8_t *p) {
     return (uint64_t)imageU32(p) | ((uint64_t)imageU32(p + 4) << 32);
 }
 
-/* Print the header, then the code. Returns false only when the image cannot be
- * read at all; a version or build mismatch is reported and the body is still
- * attempted, because refusing to show a stale image is unhelpful in a viewer. */
 static bool disassembleImage(FILE *out, const char *path, const uint8_t *data,
                              size_t size) {
     /* magic(4) version(2) flags(2) compiler(4) buildId(4) srcHash(8)
@@ -121,9 +107,6 @@ static bool disassembleImage(FILE *out, const char *path, const uint8_t *data,
     if (module == NULL) { cliError("%s: out of memory", path); return false; }
     jaiPushRoot(OBJ_VAL(module));
 
-    /* Pass the image's own source hash so the check is a no-op: the point here
-     * is to look at what the file contains, not to decide whether it is a
-     * usable cache entry for some source file. */
     ObjFunction *body = jaiDeserializeModule(data, size, module, srcHash);
     if (body == NULL) {
         jaiPopRoot();
@@ -195,8 +178,7 @@ int cmdDisasm(const JaiCliOptions *opts) {
     return status;
 }
 
-/* Parse one file for `ast` and `tokens`; the source buffer is handed to the
- * diagnostic registry, which owns it until jaiSourceFreeAll. */
+/* The source buffer is handed to the diagnostic registry, which owns it until jaiSourceFreeAll. */
 int cmdParseOnly(const JaiCliOptions *opts, bool tokensOnly) {
     FILE *opened = NULL;
     FILE *out = openOutput(opts, &opened);
@@ -238,7 +220,6 @@ int cmdParseOnly(const JaiCliOptions *opts, bool tokensOnly) {
         ObjString *dump = jaiFrontEndAstText(source, length, path, fileId,
                                              opts->jsonOutput);
         if (dump == NULL) {
-            /* The front end threw: it said why, and there is no tree to print. */
             jaiClearException();
             status = 1;
         } else {
@@ -246,8 +227,6 @@ int cmdParseOnly(const JaiCliOptions *opts, bool tokensOnly) {
                 fprintf(out, "; %s\n", path);
             }
             fwrite(dump->chars, 1, dump->length, out);
-            /* Both forms end in a newline, as `jaiAstPrint` and `jaiAstToJson`
-             * did: a dump that runs into the next one is not readable. */
             fputc('\n', out);
         }
         if (cliFlush()) status = 1;

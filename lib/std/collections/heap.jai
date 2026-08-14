@@ -321,8 +321,6 @@ pub class IndexedHeap[K, P]: Iterable[K] {
         }
         let index = self.index_of[key]
         self.priorities[index] = priority
-        # Only one of the two can move the element, but which one depends on
-        # whether the new priority is better or worse than the old.
         if self._sift_up(index) == index { self._sift_down(index) }
     }
 
@@ -416,9 +414,6 @@ pub class IndexedHeap[K, P]: Iterable[K] {
         return f"IndexedHeap({self.sorted()})"
     }
 
-    # Swap the last entry into `index` and drop the tail, leaving the element
-    # formerly at `index` out of the heap and every position map entry correct.
-    # The caller restores the invariant at `index`.
     fn _detach(self, index: int) -> void {
         let last = self.keys.len() - 1
         let key = self.keys[index]
@@ -428,8 +423,6 @@ pub class IndexedHeap[K, P]: Iterable[K] {
         self.index_of.remove(key)
     }
 
-    # Returns the index the element came to rest at, so callers can tell
-    # whether a following sift down would act on the same element.
     fn _sift_up(self, from_index: int) -> int {
         var index = from_index
         while index > 0 {
@@ -482,8 +475,6 @@ pub class IndexedHeap[K, P]: Iterable[K] {
 #: merge([[1, 4, 7], [2, 3], [5]])      # [1, 2, 3, 4, 5, 7]
 #: ```
 pub fn merge[T](sources: list[list[T]], less: fn(T, T) -> bool = |a, b| a < b) -> list[T] {
-    # Entries are (value, source index, offset); the source index breaks ties so
-    # that equal values leave in source order.
     let heap = Heap[tuple[T, int, int]](
         |a, b| less(a[0], b[0]) or not less(b[0], a[0]) and a[1] < b[1]
     )
@@ -513,8 +504,6 @@ pub fn merge[T](sources: list[list[T]], less: fn(T, T) -> bool = |a, b| a < b) -
 #: ```
 pub fn nlargest[T](count: int, items: list[T], less: fn(T, T) -> bool = |a, b| a < b) -> list[T] {
     if count <= 0 { return [] }
-    # A min-heap of the best candidates: its top is the weakest one kept, and
-    # `push_pop` admits an incoming element only when it beats that.
     let heap = Heap[T](less)
     for item in items {
         if heap.len() < count { heap.push(item) } else { heap.push_pop(item) }
@@ -529,7 +518,6 @@ pub fn nlargest[T](count: int, items: list[T], less: fn(T, T) -> bool = |a, b| a
 #: ```
 pub fn nsmallest[T](count: int, items: list[T], less: fn(T, T) -> bool = |a, b| a < b) -> list[T] {
     if count <= 0 { return [] }
-    # The mirror of `nlargest`: a max-heap whose top is the largest kept.
     let heap = Heap[T](|a, b| less(b, a))
     for item in items {
         if heap.len() < count { heap.push(item) } else { heap.push_pop(item) }

@@ -27,7 +27,7 @@ for k in 0..3 {
     readers.push(|| cell)
     writers.push(fn() { cell = -1 })
 }
-writers[1]()  # reaches iteration 1's cell and no other
+writers[1]()
 print(readers.map(|f| f()))
 
 # --- a destructuring pattern binds several names, all per-iteration ---------

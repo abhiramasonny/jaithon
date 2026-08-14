@@ -50,18 +50,13 @@ pub fn binary_result(
     right: Type?,
     join: fn(Universe, Type?, Type?) -> Type = join_types
 ) -> Type? {
-    # The C resolves an alias off each operand first. Not ported: nothing in
-    # either front end builds an alias type. See `TyKind.Alias` in `kinds.jai`.
     let l = left ?? u.t_any
     let r = right ?? u.t_any
 
-    # Comparability is the caller's `__eq__`/`__lt__` lookup, so these answer
-    # before the `any` rule below.
     match op {
         OpKind.Eq | OpKind.Ne | OpKind.Lt | OpKind.Le | OpKind.Gt | OpKind.Ge => { return u.t_bool }
         OpKind.Is | OpKind.IsNot | OpKind.In | OpKind.NotIn => { return u.t_bool }
 
-        # No truthiness (spec §5.1): `if items` is an error, `if items.len() > 0` is not.
         OpKind.And | OpKind.Or => {
             let l_ok = l.is_kind(TyKind.Bool) or l.is_kind(TyKind.Any)
             let r_ok = r.is_kind(TyKind.Bool) or r.is_kind(TyKind.Any)
@@ -75,8 +70,6 @@ pub fn binary_result(
 
     let both_int = l.is_kind(TyKind.Int) and r.is_kind(TyKind.Int)
     let both_float = l.is_kind(TyKind.Float) and r.is_kind(TyKind.Float)
-    # An int widens to float (spec §2.5), so a mixed pair takes the same row as two
-    # floats. Not the wrapping or bitwise forms: those are 64-bit int operations.
     let mixed = _is_mixed_numeric(l, r)
     let any_float = both_float or mixed
 
@@ -107,7 +100,6 @@ pub fn binary_result(
             if l.is_kind(TyKind.Int) and r.is_kind(TyKind.List) { return r }
         }
 
-        # `int / int` is float (BYTECODE.md §3.3); `//` is the int division.
         OpKind.Div => { if both_int or any_float { return u.t_float } }
 
         OpKind.FloorDiv | OpKind.Mod => {
@@ -116,7 +108,6 @@ pub fn binary_result(
         }
 
         OpKind.Pow => {
-            # A negative exponent raises ValueError at run time; the type stays int.
             if both_int { return u.t_int }
             if any_float { return u.t_float }
         }
@@ -124,18 +115,15 @@ pub fn binary_result(
         OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => { if both_int { return u.t_int } }
 
         OpKind.Band | OpKind.Bor | OpKind.Bxor | OpKind.Shl | OpKind.Shr => {
-            # Answering here, not falling out of the match, is what blocks overloading.
             if both_int { return u.t_int }
             return null
         }
 
-        # No core type defines `@`, and `arith_dunder` has no entry for it either.
         OpKind.MatMul => { }
 
         _ => { return null }
     }
 
-    # Only the left operand: there is no reflected `__radd__`, so `1 + money` fails.
     if l.is_named() { return _overload_result(u, l, arith_dunder(op)) }
     return null
 }
@@ -154,7 +142,6 @@ pub fn unary_result(u: Universe, op: OpKind, operand: Type?) -> Type? {
         }
 
         OpKind.Pos => {
-            # `+x` has no dunder: the C front end gives a class no hook for it.
             if t.is_kind(TyKind.Int) or t.is_kind(TyKind.Float) or t.is_kind(TyKind.Any) {
                 return t
             }
@@ -180,7 +167,6 @@ fn _is_mixed_numeric(a: Type, b: Type) -> bool {
     return a.is_kind(TyKind.Float) and b.is_kind(TyKind.Int)
 }
 
-# The C's `overloadResult`.
 fn _overload_result(u: Universe, t: Type, dunder: str?) -> Type? {
     let name = dunder
     if name == null { return null }
@@ -189,15 +175,11 @@ fn _overload_result(u: Universe, t: Type, dunder: str?) -> Type? {
     let member = _find_member(decl, name, 0)
     if member == null { return null }
 
-    # Signature unchecked or not a function: `any` beats an error that vanishes next pass.
     let signature = member.ty
     if signature == null or signature.kind != TyKind.Fn { return u.t_any }
     return signature.ret ?? u.t_any
 }
 
-# The C's `declFindMember`, not `TypeDecl.find_member`: it walks the traits and
-# the superclass chain as well as the own list, in that order, so an inherited
-# overload is found and an override wins. A null `ty` still counts as found.
 fn _find_member(d: TypeDecl?, name: str, depth: int) -> MemberInfo? {
     if d == null or depth > MAX_DECL_DEPTH { return null }
     let own = d.find_member(name)
@@ -209,8 +191,6 @@ fn _find_member(d: TypeDecl?, name: str, depth: int) -> MemberInfo? {
     return _find_member(d.superclass, name, depth + 1)
 }
 
-# Null for a hand-built `Type` with no argument, so the join sees null rather
-# than an index error. Every list the universe builds has exactly one argument.
 fn _element(t: Type) -> Type? {
     return if t.arg_count() > 0 { t.args[0] } else { null }
 }

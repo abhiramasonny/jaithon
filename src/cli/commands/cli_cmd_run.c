@@ -38,34 +38,6 @@ int cmdCheck(const JaiCliOptions *opts) {
 /* --eval                                                               */
 /* ------------------------------------------------------------------ */
 
-/* One input, evaluated by the REPL, and then exit.
- *
- * jaiReplFeed is the door a typed line goes through, so `--eval EXPR` answers
- * exactly as `>>> EXPR` does: a statement runs and shows nothing, a bare
- * expression echoes its value, and a null value shows nothing either, because
- * null is the absence of a result rather than a result worth printing.
- * `--eval 'print(1)'` prints `1` and not the null that `print` returned.
- * Sharing the door is the point: two evaluators that agreed today would not
- * agree for long.
- *
- * The session around the door is carried by the other two entry points, for
- * the same reason: `jaithon --eval EXPR` and `printf 'EXPR\n' | jaithon repl`
- * have to answer alike or the flag is a second evaluator after all.
- * jaiReplConfigure hands the command line in, so -O0 and --release mean here
- * what they mean there instead of being accepted and ignored; jaiReplFailed
- * reads the verdict back out, because a diagnostic or an escaping exception is
- * reported by the REPL to stderr and then cleared from the bag and the module
- * state, and that flag is all that is left of it.
- *
- * An input that never ran because it is not a whole one is this command's own
- * failure rather than the session's — the prompt would have asked for the rest
- * of it — so it is reported here and joins the same status.
- *
- * The argument is fed a line at a time, because that door takes a line and a
- * shell hands over whatever was between the quotes. Handing it the whole thing
- * at once reads it as one input, so `--eval $'fn f() { ... }\nf()'` reported
- * `unexpected \`f\` after the statement` for a script the same three lines
- * typed at the prompt run happily. */
 int cmdEval(const JaiCliOptions *opts) {
     bool incomplete = false;
     jaiReplConfigure(opts);

@@ -79,8 +79,6 @@ fn _panel(box: Rect, theme: Theme) -> Primitive {
         Point(box.right(), box.top()),
         Point(box.left(), box.top()),
     ]
-    # Slightly transparent: enough to hide a gridline, little enough that a
-    # series running underneath is still visible as context.
     let fill = Paint.solid(theme.background.with_alpha(0.88))
     return Primitive.Polygon(corners, fill, Stroke(theme.spine, width: 1.0))
 }

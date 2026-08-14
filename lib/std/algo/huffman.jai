@@ -18,8 +18,6 @@ from std.algo.sort import sort_by, natural_order
 
 pub class HuffmanCode {
     var codes: dict[str, str]
-    # Indexed by code length: the numeric value of a code of that length maps
-    # back to its symbol. Decoding is then one dict probe per bit.
     var by_length: list[dict[int, str]]
 
     #: Build the code for a symbol-to-frequency table.
@@ -42,9 +40,6 @@ pub class HuffmanCode {
             }
         }
         let lengths = _huffman_lengths(alphabet, frequencies)
-        # Canonical assignment: add one, then shift left by the growth in
-        # length. The code stays prefix-free because a longer code always
-        # extends a value one past every shorter one.
         var value = 0
         var previous = 0
         for symbol in sort_by(alphabet, |a, b| _by_length_then_symbol(lengths, a, b)) {
@@ -93,8 +88,6 @@ pub class HuffmanCode {
             if bit != "0" and bit != "1" { throw ValueError(f"expected a bit, got '{bit}'") }
             value = value * 2 + (bit == "1" ? 1 : 0)
             length += 1
-            # The code is prefix-free, so the first value that is a code is the
-            # only one it can be: no lookahead and no backtracking.
             if length < self.by_length.len() and value in self.by_length[length] {
                 out.push(self.by_length[length][value])
                 value = 0

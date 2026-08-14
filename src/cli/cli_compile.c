@@ -1,24 +1,11 @@
-/* cli_compile.c — compiling one file into a module body.
- *
- * Both `build` and `disasm` need to turn a source path into a compiled
- * ObjFunction before they can do their own, different things with it
- * (serialize it to a .jaic, or walk it printing bytecode). This is that
- * shared step: naming the module, choosing the C or self-hosted front end,
- * and handing back a rooted function or a rendered diagnostic.
- */
+/* cli_compile.c — shared step to compile a source path into an ObjFunction. */
 #include "cli/cli_internal.h"
 
 #include "runtime/modules/frontend.h"
 #include "vm/bytecode/serialize.h"
 
-/* --front=jai, for the compile paths that are handed codegen options rather
- * than the whole invocation. */
 bool gSelfHosted;
 
-/* jaiCompileSource takes a const buffer, so it registers its own copy with the
- * diagnostic engine. Should a front end ever hand this exact buffer to
- * jaiSourceAdd instead, freeing it here would leave the registry dangling — so
- * check before letting go of it. */
 static void releaseSource(char *source, size_t length, const ObjModule *module) {
     if (module != NULL) {
         const JaiSourceFile *file = jaiSourceGet(module->sourceFileId);
@@ -27,10 +14,6 @@ static void releaseSource(char *source, size_t length, const ObjModule *module) 
     JAI_FREE_ARRAY(char, source, length + 1);
 }
 
-/* Compile `path` into a module body. On success the module and the body are
- * both left on the GC root stack (module pushed first) and the caller pops two
- * roots once it is done with them. On failure nothing is rooted and the
- * diagnostics have already been rendered. */
 ObjFunction *compileOwnedSource(const char *path,
                                 char *source, size_t length,
                                 const CodegenOptions *codegen,
@@ -44,11 +27,6 @@ ObjFunction *compileOwnedSource(const char *path,
         snprintf(absolute, sizeof absolute, "%s", path);
     }
 
-    /*
-     * build needs the source hash and the self-hosted front end needs the same
-     * hash. Compute it from the exact buffer being compiled, never by reopening
-     * the file after compilation.
-     */
     uint64_t sourceHash = 0;
     if (gSelfHosted || outSourceHash != NULL)
         sourceHash = jaiSourceHash(source, length);
@@ -70,10 +48,6 @@ ObjFunction *compileOwnedSource(const char *path,
     ObjFunction *body;
 
     if (gSelfHosted) {
-        /*
-         * The self-hosted bridge does not register the source itself, so give
-         * ownership to the diagnostic registry before compiling it.
-         */
         const int fileId = jaiSourceAdd(absolute, source, length);
         module->sourceFileId = fileId;
 

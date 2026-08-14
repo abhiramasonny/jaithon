@@ -56,9 +56,6 @@ const _MAX_SAMPLES = 200
 const _MAX_BATCH = 10_000_000
 const _BASELINE_VERSION = 1
 
-# Whole-program samples cost a process, so the counts are far smaller. Five
-# matches `scripts/run_bench.sh`'s RUNS — the least a median means anything
-# over.
 const _MIN_PROGRAM_SAMPLES = 5
 const _MAX_PROGRAM_SAMPLES = 50
 
@@ -122,7 +119,6 @@ fn _declares_main_in(program: Node) -> bool {
 #: budget affords, never fewer than ten (a stddev over three samples isn't a
 #: measurement) and never more than two hundred.
 pub fn calibrate(body: fn() -> any, budget: float) -> tuple[int, int] {
-    # One untimed call pays for whatever the first call has to build.
     body()
     let start = Instant.now()
     body()
@@ -196,11 +192,6 @@ pub fn shell_quote(argument: str) -> str {
     return "'" + argument.replace("'", "'\\''") + "'"
 }
 
-# Times the whole process, matching how `scripts/run_bench.sh` measures it.
-#
-# `run` starts the program directly, with no shell: the argument list can't
-# be re-parsed, and stderr arrives separately rather than interleaved into
-# the failure output.
 fn _time_process(command: list[str]) -> float {
     let start = Instant.now()
     let finished = run(command)
@@ -425,7 +416,6 @@ pub fn main(args: list[str]) -> int {
     try {
         paths = expand_paths(options.paths)
     } catch error: FileNotFoundError {
-        # The default root is only a default — say so plainly, not with a traceback.
         print_err(f"jaithon bench: {error.message}")
         return 1
     }

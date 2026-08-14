@@ -43,17 +43,13 @@ pub fn widen_target(u: Universe, source: Type?, target: Type?) -> Type? {
 
     var found: Type? = null
     for member in target.args {
-        # `union_of` cannot build an `any` member; an interned union can.
         if member.kind == TyKind.Int or member.kind == TyKind.Any { return null }
         if member.kind == TyKind.Float { found = member }
     }
     return found
 }
 
-# The C's `assignableInto`. The widening in `assignable` is not part of the
-# relation and must not be reachable from an element or a return type.
 fn _assignable_into(source: Type?, target: Type?) -> (bool, bool) {
-    # An unknown operand was already reported upstream; do not cascade.
     if source is null or target is null { return (true, false) }
     if source == target { return (true, false) }
     if target.kind == TyKind.Any { return (true, false) }
@@ -68,8 +64,6 @@ fn _assignable_into(source: Type?, target: Type?) -> (bool, bool) {
     if source.kind == TyKind.GenericParam { return (true, true) }
 
     match source.kind {
-        # The C's rule, not an omission of the port: a generic instantiation
-        # compares as its declaration, so `Box[int]` fits `Box[str]`.
         TyKind.Class | TyKind.Enum => {
             if target.kind == TyKind.Class {
                 return (is_subclass_of(source.decl, target.decl), false)
@@ -103,8 +97,6 @@ fn _union_source_into(source: Type, target: Type) -> (bool, bool) {
     return (true, guard)
 }
 
-# An unguarded member wins over a guarded one, so this cannot stop at the first
-# fit: members are sorted by kind ordinal, not in the order a caller wrote them.
 fn _into_union_target(source: Type, target: Type) -> (bool, bool) {
     var guarded = false
     for member in target.args {
@@ -116,8 +108,6 @@ fn _into_union_target(source: Type, target: Type) -> (bool, bool) {
     return (guarded, guarded)
 }
 
-# Invariant, not covariant: these are mutable, so `list[Circle]` fitting
-# `list[Shape]` would let a `Square` back through. `any` is exempt (spec §2.2).
 fn _container_into(source: Type, target: Type) -> (bool, bool) {
     if target.kind != source.kind { return (false, false) }
     if source.arg_count() != target.arg_count() { return (false, false) }
@@ -128,7 +118,6 @@ fn _container_into(source: Type, target: Type) -> (bool, bool) {
         if element == wanted { continue }
 
         if _is_erased(element) or _is_erased(wanted) {
-            # A `GenericParam` element never guards, though a top-level `T` does.
             if element.kind == TyKind.Any and wanted.kind != TyKind.Any { guard = true }
             continue
         }
@@ -145,7 +134,6 @@ fn _container_into(source: Type, target: Type) -> (bool, bool) {
     return (true, guard)
 }
 
-# Tuples are immutable, so element-wise covariance is sound.
 fn _tuple_into(source: Type, target: Type) -> (bool, bool) {
     if target.kind != TyKind.Tuple { return (false, false) }
     if source.arg_count() != target.arg_count() { return (false, false) }
@@ -159,7 +147,6 @@ fn _tuple_into(source: Type, target: Type) -> (bool, bool) {
     return (true, guard)
 }
 
-# Exact in the flags: `fn(a, ...rest)` reads one list where `fn(a, b)` reads two.
 fn _fn_into(source: Type, target: Type) -> (bool, bool) {
     if target.kind != TyKind.Fn { return (false, false) }
     if source.arg_count() != target.arg_count() { return (false, false) }

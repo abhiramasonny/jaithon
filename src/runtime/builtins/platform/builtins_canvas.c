@@ -15,14 +15,11 @@
 /* Compositing                                                          */
 /* ------------------------------------------------------------------ */
 
-/* `_over` in lib/std/gui/canvas.jai: rounded, not truncated, so compositing an
- * opaque white gives back exactly white. */
 static uint32_t canvasOver(uint32_t source, uint32_t destination,
                            uint32_t alpha, uint32_t inverse) {
     return (source * alpha + destination * inverse + 127u) / 255u;
 }
 
-/* `blend` in lib/std/gui/canvas.jai, byte for byte — must match exactly. */
 static uint32_t canvasBlend(uint32_t destination, uint32_t source) {
     uint32_t alpha = (source >> 24) & 0xFFu;
     if (alpha == 255u) return source;
@@ -56,8 +53,6 @@ static bool canvasArgColor(Value v, int index, const char *fnName, uint32_t *out
     return true;
 }
 
-/* Checked as two comparisons against the length, not one against
- * `offset + count`, so overflow of the sum can't smuggle a bad access past this. */
 static bool canvasCheckSpan(const ObjList *pixels, int64_t offset, int64_t count,
                             const char *fnName) {
     if (count < 0) {
@@ -74,8 +69,6 @@ static bool canvasCheckSpan(const ObjList *pixels, int64_t offset, int64_t count
     return true;
 }
 
-/* The length checks come before the width*height product so the product
- * itself cannot overflow (a list holds at most INT_MAX values). */
 static bool canvasCheckShape(const ObjList *pixels, int64_t width, int64_t height,
                              const char *fnName, const char *role) {
     if (width <= 0 || height <= 0) {
@@ -94,7 +87,6 @@ static bool canvasCheckShape(const ObjList *pixels, int64_t width, int64_t heigh
     return true;
 }
 
-/* Same overflow-safe bounds test as canvasCheckSpan, for a rectangle. */
 static bool canvasCheckRect(int64_t x, int64_t y, int64_t width, int64_t height,
                             int64_t bufferWidth, int64_t bufferHeight,
                             const char *fnName, const char *role) {
@@ -116,8 +108,6 @@ static bool canvasCheckRect(int64_t x, int64_t y, int64_t width, int64_t height,
     return true;
 }
 
-/* Checked fully before any write, so a stray non-int is a clean error rather
- * than a half-drawn image. */
 static bool canvasCheckRectValues(const ObjList *pixels, int64_t bufferWidth,
                                   int64_t x, int64_t y, int64_t width, int64_t height,
                                   const char *fnName, const char *role) {
@@ -145,8 +135,6 @@ static uint32_t canvasPixelAt(const ObjList *pixels, int64_t index) {
 /* Spans                                                                */
 /* ------------------------------------------------------------------ */
 
-/* canvas_fill_span(pixels, offset, count, color) — straight store: a
- * translucent colour replaces what was there rather than tinting it. */
 static bool nCanvasFillSpan(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels;
@@ -166,8 +154,6 @@ static bool nCanvasFillSpan(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_write_span(pixels, offset, source) — straight store like
- * canvas_fill_span: the source is a picture, not a tint. */
 static bool nCanvasWriteSpan(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels, *source;
@@ -193,9 +179,6 @@ static bool nCanvasWriteSpan(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_scanlines(pixels, width, height) — packs ARGB pixels into PNG raw
- * scanlines (filter byte + RGBA per row); native to avoid boxing millions of
- * ints in Jaithon. */
 static bool nCanvasScanlines(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels;
@@ -254,10 +237,6 @@ static bool nCanvasScanlines(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_fill_convex(pixels, width, height, points, color, clipLeft, clipTop,
- * clipRight, clipBottom) — anti-aliased convex-polygon fill; `points` is a
- * flat list of alternating x,y in device pixels. Convexity is required: each
- * scanline must cross the outline exactly twice (min/max span, no sort/pair). */
 static bool nCanvasFillConvex(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels, *points;
@@ -412,9 +391,6 @@ static bool nCanvasFillConvex(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_blend_span(pixels, offset, coverage, color) — composites color's
- * alpha scaled by each 0-255 coverage weight; weight 255 reproduces exactly
- * what an opaque write would have. */
 static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pixels, *coverage;
@@ -477,10 +453,6 @@ static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
 /* Rectangles                                                           */
 /* ------------------------------------------------------------------ */
 
-/* canvas_blit_scaled(dst, dst_width, src, src_width, src_height,
- * sx, sy, sw, sh, dx, dy, dw, dh) — nearest-neighbour scaled blit, composited
- * (not replaced) onto dst. src and dst may be the same buffer, but
- * overlapping rects then read pixels this call has already written. */
 static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
     (void)argc;
     const char *fnName = "canvas_blit_scaled";
@@ -521,7 +493,6 @@ static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
     if (!canvasCheckRect(dx, dy, dw, dh, dstWidth, dstHeight, fnName, "destination"))
         return false;
 
-    /* Checked after the bounds, so an empty rect outside the buffer still errors. */
     if (sw == 0 || sh == 0 || dw == 0 || dh == 0) {
         *out = NULL_VAL;
         return true;
@@ -549,10 +520,6 @@ static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* canvas_downsample_box(dst, src, width, height, factor) — box-reduces src by
- * factor; colours are averaged weighted by their own alpha (premultiplied),
- * because a plain average of transparent pixels drags soft edges toward
- * black. Trailing rows/columns past the last whole block are dropped. */
 static bool nCanvasDownsampleBox(int argc, Value *args, Value *out) {
     (void)argc;
     const char *fnName = "canvas_downsample_box";

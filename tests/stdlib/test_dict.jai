@@ -7,10 +7,10 @@ from std.test import assert_eq, assert_true, assert_throws
 fn test_builtin_dict_keeps_insertion_order() -> void {
     let entries = {"b": 1, "a": 2, "c": 3}
     assert_eq(entries.keys(), ["b", "a", "c"])
-    entries["b"] = 9  # updating must not reorder
+    entries["b"] = 9
     assert_eq(entries.keys(), ["b", "a", "c"])
     entries.remove("a")
-    entries["a"] = 4  # reinserting appends
+    entries["a"] = 4
     assert_eq(entries.keys(), ["b", "c", "a"])
 }
 
@@ -127,7 +127,6 @@ fn test_a_long_key_survives_being_hashed_after_it_was_stored() -> void {
     let entries: dict[str, int] = {}
     entries[long_key] = 1
 
-    # Forcing the hash after the insert is what used to move the key.
     let equal_copy = "0 AST_COMPREHENSION" + " some padding text"
     assert_true(equal_copy in entries)
 
@@ -138,9 +137,6 @@ fn test_a_long_key_survives_being_hashed_after_it_was_stored() -> void {
 }
 
 fn test_long_keys_do_not_all_collide() -> void {
-    # Every un-interned string hashing to 0 also meant every long key landed in
-    # one bucket, so a dict of them probed linearly. Correctness first, but the
-    # count is the thing that made it visible.
     let entries: dict[str, int] = {}
     for index in range(500) {
         entries[f"a fairly long key that passes the intern limit {index}"] = index

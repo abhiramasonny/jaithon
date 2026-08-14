@@ -1,7 +1,4 @@
-/* handles.c — the one handle table, shared by std.thread, std.gui and std.gpu.
- * A handle from one subsystem must never resolve inside another: the kind
- * check below is what makes passing a mutex to gpu_dispatch an error instead
- * of a crash. */
+/* handles.c — the one handle table, shared by std.thread, std.gui and std.gpu. */
 
 #include "runtime/handles.h"
 

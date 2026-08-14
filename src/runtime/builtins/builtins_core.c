@@ -12,13 +12,10 @@
 
 // Small shared helpers
 
-// Cached on the VM, not a static, since the REPL creates the VM lazily.
 static ObjString *dunderName(ObjString *cached, const char *text) {
     return cached != NULL ? cached : jaiStringInternC(text);
 }
 
-/* False with no exception pending: `v` has no length. False with one pending:
- * __len__ threw. */
 static bool valueLength(Value v, int64_t *out) {
     if (!IS_OBJ(v)) return false;
     switch (OBJ_TYPE(v)) {
@@ -52,8 +49,6 @@ static bool valueLength(Value v, int64_t *out) {
     }
 }
 
-/* NULL means the exception is pending. The result is unrooted -- root it
- * before allocating again. */
 static ObjList *collectIterable(Value v) {
     Value iterVal;
     if (!jaiGetIter(v, &iterVal)) return NULL;
@@ -164,7 +159,6 @@ static ParseResult parseIntText(const char *s, size_t len, int base, int64_t *ou
 }
 
 static ParseResult parseFloatText(const char *s, size_t len, double *out) {
-    /* strtod needs a NUL-terminated run without '_' separators. */
     char stackBuf[64];
     char *buf = stackBuf;
     bool heap = false;
@@ -200,8 +194,6 @@ static ParseResult parseFloatText(const char *s, size_t len, double *out) {
 
 // Stable sort over an index permutation
 
-/* Values stay in GC-visible lists; only indices are raw C ints, so GC during a
- * user key/__lt__ call cannot invalidate anything here. */
 static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                              bool reverse, const char *fnName) {
     for (int width = 1; width < n; width *= 2) {
@@ -215,8 +207,6 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
                                     fnName, &order))
                     return false;
                 if (reverse) order = -order;
-                /* Take from the right half only when it is strictly smaller:
-                 * that is what makes the sort stable. */
                 scratch[k++] = order < 0 ? idx[b++] : idx[a++];
             }
             while (a < mid) scratch[k++] = idx[a++];
@@ -227,8 +217,6 @@ static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
     return true;
 }
 
-/* `items` must be rooted by the caller; `keys` is `items` itself when there is
- * no key function. */
 static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
                            const char *fnName) {
     int n = items->count;
@@ -290,7 +278,6 @@ static bool nInput(int argc, Value *args, Value *out) {
         jaiBufFree(&line);
         return jaiThrow(vm.cIOError, "input(): end of input");
     }
-    /* A CRLF line ending leaves the CR behind; it is not part of the text. */
     if (line.count > 0 && line.data[line.count - 1] == '\r') line.count--;
 
     ObjString *text = jaiStringNew(line.data != NULL ? (const char *)line.data : "",
@@ -354,7 +341,6 @@ static bool floatToInt(double d, int64_t *out) {
     if (isinf(d)) return jaiThrow(vm.cOverflowError,
                                   "cannot convert float infinity to int");
     double truncated = trunc(d);
-    /* 2^63 is exactly representable, so the upper bound is a strict one. */
     if (truncated >= 9223372036854775808.0 || truncated < -9223372036854775808.0)
         return jaiThrow(vm.cOverflowError, "float %g is out of range for int", d);
     *out = (int64_t)truncated;
@@ -466,8 +452,6 @@ static bool nBoolConv(int argc, Value *args, Value *out) {
         return true;
     }
     if (vm.hasException) return false;
-    /* There is no truthiness in Jaithon (spec §2.6): a value that is neither a
-     * number nor sized has no truth value to convert. */
     return jaiThrow(vm.cTypeError, "bool(): '%s' has no truth value",
                     jaiTypeNameStatic(v));
 }
@@ -480,8 +464,6 @@ static bool nId(int argc, Value *args, Value *out) {
     case VAL_BOOL:  *out = INT_VAL(AS_BOOL(v) ? 1 : 2); return true;
     case VAL_INT:   *out = INT_VAL(AS_INT(v)); return true;
     case VAL_FLOAT: {
-        /* Identity of a float is its bit pattern: two floats are the same value
-         * exactly when their bits agree. */
         double d = AS_FLOAT(v);
         uint64_t bits;
         memcpy(&bits, &d, sizeof bits);
@@ -677,8 +659,6 @@ static bool nEnumerate(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Held in a list of lists (not raw arrays) so zip()/map() stay GC-reachable
- * while walking them in lockstep. */
 static ObjList *collectAll(int argc, Value *args, int from, int *outShortest) {
     ObjList *holder = jaiListNew(argc - from);
     jaiGCPushRoot(OBJ_VAL(holder));
@@ -792,7 +772,6 @@ static bool nFilter(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* any() and all() take bools, not truthy values: there is no truthiness. */
 static bool quantify(int argc, Value *args, Value *out, bool wantAny) {
     (void)argc;
     const char *fnName = wantAny ? "any" : "all";
@@ -857,8 +836,6 @@ static bool nOrd(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Type tokens are classes/traits/enums (structural match) or native/str type
- * names like `int`/`list` (match by name). */
 bool jaiBuiltinMatchesType(Value v, Value t, bool *matched) {
     if (IS_CLASS(t)) {
         *matched = IS_INSTANCE(v) && jaiClassIsSubclassOf(AS_INSTANCE(v)->klass, AS_CLASS(t));
@@ -983,8 +960,6 @@ static bool nDir(int argc, Value *args, Value *out) {
     jaiGCPopRoot();
     if (sorted == NULL) return false;
 
-    /* Inherited methods can be listed twice (own table plus copied-down parent
-     * entry); after sorting the duplicates are adjacent. */
     jaiGCPushRoot(OBJ_VAL(sorted));
     ObjList *unique = jaiListNew(sorted->count);
     jaiGCPushRoot(OBJ_VAL(unique));
@@ -1008,8 +983,6 @@ static bool nAssertEq(int argc, Value *args, Value *out) {
         return true;
     }
 
-    /* Both renderings stay rooted until the throw: building the exception
-     * allocates, and a collection must not free text still being formatted. */
     ObjString *actual = jaiValueToRepr(args[0]);
     if (actual == NULL) return false;
     jaiGCPushRoot(OBJ_VAL(actual));
@@ -1237,8 +1210,6 @@ void jaiRegisterCoreBuiltins(void) {
     jaiDefineNative("ord",        nOrd,        1,  1);
     jaiDefineNative("isinstance", nIsInstance, 2,  2);
 
-    /* The same native under a second name: lib/std reaches it as a primitive
-     * and a program reaches it as `isinstance`. */
     jaiDefineNative("__prim__.is_instance", nIsInstance, 2, 2);
 
     jaiDefineNative("callable",   nCallable,   1,  1);
@@ -1246,15 +1217,11 @@ void jaiRegisterCoreBuiltins(void) {
     jaiDefineNative("assert_eq",  nAssertEq,   2,  3);
     jaiDefineNative("exit",       nExit,       0,  1);
 
-    /* The container type names double as conversions, so that `set()` builds an
-     * empty set (spec §5.5) and `isinstance(x, list)` has something to name. */
     jaiDefineNative("list",  nListConv,  0, 1);
     jaiDefineNative("dict",  nDictConv,  0, 1);
     jaiDefineNative("set",   nSetConv,   0, 1);
     jaiDefineNative("tuple", nTupleConv, 0, 1);
     jaiDefineNative("bytes", nBytesConv, 0, 1);
 
-    /* Appendix C operators register from here too, so runtime.h keeps a single
-     * registrar for the whole builtin namespace. */
     jaiRegisterOperatorPrimitives();
 }

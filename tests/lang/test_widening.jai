@@ -25,7 +25,6 @@ fn test_the_result_of_a_mixed_operator_is_float() -> void {
     assert_eq(type_of(n * 2.0), "float")
     assert_eq(type_of(n // 2.0), "float")
     assert_eq(type_of(n ** 2.0), "float")
-    # And a pair of ints is still an int, except under `/`.
     assert_eq(type_of(n + 1), "int")
     assert_eq(type_of(n // 2), "int")
     assert_eq(type_of(n / 2), "float")
@@ -35,7 +34,6 @@ fn test_a_widened_int_keeps_its_value() -> void {
     let n = 7
     assert_eq(n + 0.0, 7.0)
     assert_eq(float(n), n + 0.0)
-    # Floor division and modulo still follow the divisor once widened.
     assert_eq(-7 // 2.0, -4.0)
     assert_eq(-7 % 3.0, 2.0)
 }
@@ -123,8 +121,6 @@ fn test_widening_into_a_field() -> void {
 }
 
 fn test_widening_on_the_dynamic_path() -> void {
-    # `any` defers the whole decision to run time, and the rule there is the
-    # same rule.
     let n: any = 3
     let x: any = 1.5
     assert_eq(n + x, 4.5)
@@ -153,8 +149,6 @@ fn test_widening_does_not_disturb_comparison_or_hashing() -> void {
 }
 
 fn test_bitwise_does_not_widen() -> void {
-    # The checker rejects `3 & 2.0` outright, so `any` is the only way to get a
-    # float as far as the opcode.
     let x: any = 2.0
     assert_throws(TypeError, || x & 1)
     assert_throws(TypeError, || x | 1)
@@ -165,8 +159,6 @@ fn test_bitwise_does_not_widen() -> void {
 }
 
 fn test_the_wrapping_operators_do_not_widen() -> void {
-    # `+%` answers a question about 64-bit overflow. A float has no answer to
-    # it, so a mixed pair is a type error rather than a silent conversion.
     let x: any = 2.0
     let n: any = 1
     assert_throws(TypeError, || n +% x)
@@ -175,9 +167,6 @@ fn test_the_wrapping_operators_do_not_widen() -> void {
 }
 
 fn test_a_huge_int_widens_to_the_nearest_double() -> void {
-    # Above 2^53 a double cannot hold every integer, and the conversion is
-    # silent: it rounds, exactly as it does in the languages this rule comes
-    # from (spec §2.5).
     let exact = 9007199254740993  # 2**53 + 1
     assert_eq(exact + 0.0, 9007199254740992.0)
     assert_true(exact + 0.0 == 9007199254740992.0)

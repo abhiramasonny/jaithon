@@ -192,8 +192,6 @@ pub class Test {
         try {
             after()
         } catch error: Error {
-            # A teardown failure after the body already failed is usually the
-            # same fault reported twice, so the first message wins.
             if not outcome.is_failure() {
                 outcome = Outcome.Errored
                 message = f"teardown raised {type_of(error)}: {error.message}"
@@ -583,8 +581,6 @@ pub fn assert_near(
     message: str = ""
 ) -> void {
     if tolerance < 0.0 { throw ValueError(f"tolerance must be non-negative, got {tolerance}") }
-    # NaN vs anything is correctly "not equal", but the message must say so
-    # rather than show a difference that's itself NaN.
     if actual != actual or expected != expected {
         throw AssertionError(
             _explain(f"expected {expected} within {tolerance}, got {actual}", message)
@@ -704,8 +700,6 @@ pub fn describe(name: str, body: fn() -> any) -> Suite {
     let suite = Suite(name)
     let enclosing = _current
     _current = suite
-    # Restored even on a raise, so one broken describe can't leak later tests
-    # into the wrong suite.
     defer { _current = enclosing }
     body()
     _suites.push(suite)

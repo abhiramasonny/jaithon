@@ -25,9 +25,6 @@ from jaithon.compile.check.universe import instantiate, list_of, named, set_of
 from jaithon.compile.check.universe import tuple_of
 from jaithon.ast import Span
 
-# `substitute` answers an optional because it accepts one. Nothing below hands
-# it null, so unwrapping once here keeps the assertions about types rather than
-# about optionals.
 fn _sub(u: Universe, t: Type, bindings: dict[str, Type]) -> Type {
     let out = substitute(u, t, bindings)
     if out is not null { return out }
@@ -47,12 +44,6 @@ fn test_an_unbound_parameter_is_left_alone() -> void {
 }
 
 fn test_a_nameless_parameter_matches_nothing() -> void {
-    # The C cannot build this type at all: `jaiTypeGenericParam` goes through
-    # `jaiTypeNamed`, which answers `any` for a null name, so a nameless
-    # parameter there *is* `any` and `nameEquals(NULL, NULL)` is never reached
-    # from one. `universe.named` does not carry that rule, so this port can
-    # build one and `substitute` has to say what it does with it. A dict key is
-    # never null, so nothing matches and the parameter is its own answer.
     let u = Universe()
     let nameless = generic_param(u, null)
     assert_true(_sub(u, nameless, {"T": u.t_int}) == nameless)
@@ -64,10 +55,6 @@ fn test_null_in_is_null_out() -> void {
 }
 
 fn test_an_empty_mapping_answers_the_type_itself() -> void {
-    # The C's `count <= 0` guard. Walking would reach the same answer, since no
-    # name can match, so this is a fast path rather than a rule of its own —
-    # what it buys is that applying an empty binding set costs nothing instead
-    # of costing a full traversal.
     let u = Universe()
     let empty: dict[str, Type] = {}
     let t = list_of(u, generic_param(u, "T"))
@@ -83,16 +70,6 @@ fn test_a_type_with_nothing_to_replace_is_the_same_object() -> void {
 }
 
 fn test_the_early_out_answers_the_argument() -> void {
-    # Built by hand rather than interned, because that is the one input for
-    # which the two possible answers differ: with the early-out these are the
-    # objects handed in, and without it the walk would rebuild and hand back
-    # this universe's own `list[str]`, `set[str]`, `dict[str, int]` and `(str)`
-    # instead, adopting a stranger on the way. The universe's count says which
-    # happened — nine is the primitives and nothing else.
-    #
-    # All four shapes are here because the early-out is written four times:
-    # each container compares its own elements, while a tuple, a function, a
-    # union and a nominal type share one `changed` flag.
     let u = Universe()
     let bindings = {"T": u.t_int}
     let foreign_list = Type(TyKind.List, null, [u.t_str])
@@ -113,20 +90,12 @@ fn test_a_named_type_with_no_arguments_is_untouched() -> void {
 }
 
 fn test_a_module_is_its_own_answer() -> void {
-    # The C's `default:` arm, which nothing else here reaches. A module type
-    # carries a name and no arguments, so there is nothing to descend into.
     let u = Universe()
     let os = named(u, TyKind.Module, "os")
     assert_true(_sub(u, os, {"T": u.t_int}) == os)
 }
 
 fn test_an_instantiation_with_nothing_to_replace_is_the_same_object() -> void {
-    # The 0-argument case above never reaches the `changed` flag. This one
-    # does: the arguments are walked, none moves, and the answer has to be the
-    # object handed in rather than a fresh `instantiate` of the same parts.
-    # Substitution runs once per member per trait implementation, and a
-    # rebuild here would re-intern and re-hash a type to be told nothing
-    # changed.
     let u = Universe()
     let base = named(u, TyKind.Class, "Box")
     let box_str = instantiate(u, base, [u.t_str])
@@ -191,9 +160,6 @@ fn test_a_changed_return_alone_is_enough_to_rebuild() -> void {
 }
 
 fn test_a_function_that_declared_no_return_still_declares_none() -> void {
-    # A null `ret` means no return type was written, which renders `any`. It is
-    # not the same as a written `-> void`, and substituting must not turn one
-    # into the other.
     let u = Universe()
     let before = fn_of(u, [generic_param(u, "T")], null)
     let after = _sub(u, before, {"T": u.t_int})
@@ -202,8 +168,6 @@ fn test_a_function_that_declared_no_return_still_declares_none() -> void {
 }
 
 fn test_the_function_flags_survive_substitution() -> void {
-    # Flags are part of the intern key, so dropping them would not produce a
-    # wrong-looking type — it would quietly produce a different one.
     let u = Universe()
     let param = generic_param(u, "T")
     let flags = FN_VARIADIC | FN_KWREST
@@ -216,9 +180,6 @@ fn test_the_function_flags_survive_substitution() -> void {
 }
 
 fn test_a_union_is_renormalised_after_substitution() -> void {
-    # `T | int` under `{T: int}` is not a two-member union of one type: it
-    # collapses, and only re-running normalisation makes it collapse. This is
-    # why the union branch rebuilds through `union_of` and not through `intern`.
     let u = Universe()
     let members: list[Type?] = [generic_param(u, "T"), u.t_int]
     let before = union_of(u, members)
@@ -251,9 +212,6 @@ fn test_a_generic_instantiation_keeps_its_name() -> void {
 }
 
 fn test_a_generic_instantiation_keeps_its_declaration() -> void {
-    # `decl` is not part of the intern key, so it is not carried across by the
-    # table: the substitution has to hand it over, and a `Box[int]` with no
-    # declaration has no fields and no members.
     let u = Universe()
     let declaration = TypeDecl("Box", Span.none())
     let base = named(u, TyKind.Class, "Box", declaration)
@@ -274,10 +232,6 @@ fn test_a_trait_and_an_enum_substitute_the_same_way() -> void {
 }
 
 fn test_self_is_a_generic_parameter_like_any_other() -> void {
-    # A trait requirement written `-> Self` becomes the implementer's own type
-    # when the trait's members are installed on it (spec §7.2). `Self` is
-    # spelled as a generic parameter precisely so that this file is all it
-    # takes to do that, with no rule of its own.
     let u = Universe()
     let implementer = named(u, TyKind.Class, "Counter")
     let requirement = fn_of(u, [], generic_param(u, "Self"))
@@ -285,11 +239,6 @@ fn test_self_is_a_generic_parameter_like_any_other() -> void {
 }
 
 fn test_an_alias_is_answered_unchanged() -> void {
-    # The C resolves an alias to its target and substitutes there. Nothing in
-    # either front end constructs an alias — the kind exists for ordinal
-    # fidelity — so no alias ever reaches the universe and there is no target
-    # to resolve. This one is built by hand because it cannot be interned, and
-    # the assertion pins the decision rather than describing a live path.
     let u = Universe()
     let alias = Type(TyKind.Alias, "Id", [], generic_param(u, "T"))
     assert_true(substitute(u, alias, {"T": u.t_int}) == alias)
@@ -319,18 +268,11 @@ fn test_mentions_reads_a_return_type_only_on_a_function() -> void {
     let u = Universe()
     let param = generic_param(u, "T")
     assert_true(mentions_generic_param(fn_of(u, [u.t_bool], param)))
-    # On an alias `ret` is the target, and whether the target mentions a
-    # parameter is a fact about the target rather than about the alias. The C
-    # keys this on the kind for that reason, which is not an oversight.
     let alias = Type(TyKind.Alias, "Id", [], param)
     assert_false(mentions_generic_param(alias))
 }
 
 fn test_a_guard_is_refused_exactly_while_a_parameter_is_unsubstituted() -> void {
-    # This is the question the C asks before wrapping a node in a cast.
-    # Generics are erased, so a guard against `T` would compile to a lookup of
-    # a class named `T`, and there is none; once `T` is bound the type has a
-    # run-time shape again and the guard can be emitted.
     let u = Universe()
     let erased = list_of(u, generic_param(u, "T"))
     assert_true(mentions_generic_param(erased))

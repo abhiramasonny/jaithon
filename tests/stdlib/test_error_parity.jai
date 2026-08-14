@@ -75,8 +75,6 @@ fn test_every_error_file_is_rejected_with_the_right_code() -> void {
         assert_eq(actual, expected, f"{name}")
         checked += 1
     }
-    # A directory walk that silently found nothing would pass every assertion
-    # above without testing anything.
     assert_true(checked >= 30, f"only {checked} error files were checked")
 }
 

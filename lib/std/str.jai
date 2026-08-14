@@ -32,7 +32,6 @@ let _HTML_ESCAPES: dict[str, str] = {
     "'": "&#39;",
 }
 
-# Accented letters `to_ascii` folds, as two parallel strings of equal length.
 let _ACCENT_FROM = "àáâãäåçèéêëìíîïñòóôõöùúûüýÿÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝŸ"
 let _ACCENT_TO = "aaaaaaceeeeiiiinooooouuuuyyAAAAAACEEEEIIIINOOOOOUUUUYY"
 
@@ -425,8 +424,6 @@ pub fn damerau_levenshtein(a: str, b: str) -> int {
         table[0][column + 1] = far
         table[1][column + 1] = column
     }
-    # Last row in which each character of `a` was seen, and, per row, the last
-    # column that matched. Together they locate the transposition to undo.
     let last_row: dict[str, int] = {}
     for row in 1..=rows {
         var last_column = 0
@@ -892,8 +889,6 @@ pub fn to_int(text: str, base: int = 10) -> int? {
         index = 1
     }
     if index >= trimmed.len() { return null }
-    # Accumulate towards the negative end: it holds one more value than the
-    # positive end, so "-9223372036854775808" parses like any other input.
     var value = 0
     try {
         while index < trimmed.len() {
@@ -1018,8 +1013,6 @@ fn _is_upper(ch: str) -> bool { return ch != ch.lower() }
 
 fn _is_lower(ch: str) -> bool { return ch != ch.upper() }
 
-# A character belongs to a word when it is a digit, a cased letter, or a CJK
-# scalar. CJK has no case distinction, so testing for one would discard it.
 fn _is_word_char(ch: str) -> bool {
     if _is_digit(ch) { return true }
     if ch.lower() != ch.upper() { return true }

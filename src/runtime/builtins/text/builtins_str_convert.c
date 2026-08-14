@@ -121,8 +121,6 @@ int jaiStrDigitValue(char c) {
     return -1;
 }
 
-/* Integer syntax of spec §2.3: an optional sign, an optional base prefix, and
- * digits that may be separated by single underscores. */
 static ParseStatus parseIntText(const char *s, size_t len, int base,
                                 int64_t *out) {
     size_t i = 0, end = len;
@@ -156,7 +154,6 @@ static ParseStatus parseIntText(const char *s, size_t len, int base,
         negative ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
     const uint64_t radix = (uint64_t)base;
 
-    /* One division/modulo per parse instead of one division per digit. */
     const uint64_t cutoff = limit / radix;
     const uint64_t cutlim = limit % radix;
 
@@ -195,8 +192,6 @@ static ParseStatus parseIntText(const char *s, size_t len, int base,
     return PARSE_OK;
 }
 
-/* strtod over a copy with the underscores removed; the copy also guarantees
- * the NUL that strtod needs. */
 static ParseStatus parseFloatText(const char *s, size_t len, double *out) {
     size_t i = 0, end = len;
 
@@ -208,8 +203,6 @@ static ParseStatus parseFloatText(const char *s, size_t len, double *out) {
     const char *const finish = s + end;
     const size_t span = end - i;
 
-    /* ObjString text is NUL-terminated. The overwhelmingly common case has no
-     * underscores, so let strtod read it directly without making a copy. */
     if (memchr(start, '_', span) == NULL) {
         char *stop = NULL;
         const double value = strtod(start, &stop);
@@ -286,7 +279,6 @@ bool strParseFloat(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* The forgiving pair: null instead of an exception, for `text.to_int() ?? 0`. */
 bool strToInt(int argc, Value *args, Value *out) {
     ObjString *s;
     if (!strReceiver(argc, args, "to_int", &s)) return false;

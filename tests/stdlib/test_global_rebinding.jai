@@ -31,7 +31,6 @@ fn _caller(n: int) -> int {
 }
 
 fn test_a_rebound_global_retires_the_compiled_form() -> void {
-    # Warm `_caller` until the tier compiles it against `_one`.
     var warm = 0
     var k = 0
     while k < 400 {
@@ -42,8 +41,6 @@ fn test_a_rebound_global_retires_the_compiled_form() -> void {
 
     _bound = _two
 
-    # A long call keeps the compiled form hot across the rebinding, so the
-    # answer below comes from compiled code rather than from a fallback.
     let _hot = _caller(2_000_000)
 
     assert_eq(_caller(3), 1000003, "after rebinding: 0+1+2 plus _two()")

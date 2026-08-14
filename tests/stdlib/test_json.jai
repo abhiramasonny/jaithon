@@ -10,7 +10,7 @@ fn test_scalars_parse_to_the_matching_type() -> void {
     assert_eq(json.parse("1"), 1)
     assert_eq(type_of(json.parse("1")), "int")
     assert_near(json.parse("1.5"), 1.5)
-    assert_eq(type_of(json.parse("1.0")), "float")  # the dot decides, not the value
+    assert_eq(type_of(json.parse("1.0")), "float")
     assert_eq(json.parse("\"text\""), "text")
     assert_true(json.parse("true"))
     assert_false(json.parse("false"))
@@ -60,7 +60,6 @@ fn test_stringify_is_compact_by_default() -> void {
 fn test_stringify_indent_and_sort_keys() -> void {
     assert_eq(json.stringify([1, 2], 2), "[\n  1,\n  2\n]")
     assert_eq(json.stringify({"b": 1, "a": 2}, 0, true), "{\"a\":2,\"b\":1}")
-    # Without sort_keys the members keep insertion order.
     assert_eq(json.stringify({"b": 1, "a": 2}), "{\"b\":1,\"a\":2}")
 }
 
@@ -110,8 +109,6 @@ fn test_get_path_probes_without_raising() -> void {
 }
 
 fn test_deeply_nested_input_is_bounded() -> void {
-    # The depth limit exists so that a hostile document cannot exhaust the
-    # C stack; one level past it must raise rather than crash.
     let too_deep = "[".repeat(json.MAX_DEPTH + 1) + "]".repeat(json.MAX_DEPTH + 1)
     assert_throws(Error, || json.parse(too_deep))
 }

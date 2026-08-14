@@ -22,14 +22,12 @@ try {
     print(f"ParseError: {e.message}")
 }
 
-# A subclass is caught by its parent's handler.
 try {
     throw FileNotFoundError("no such file: /nope")
 } catch e: IOError {
     print(f"caught as IOError: {e.message}")
 }
 
-# Multiple types on one clause.
 fn risky(which: int) -> void {
     if which == 0 { throw IndexError("bad index") }
     throw KeyError("bad key")
@@ -43,7 +41,6 @@ for which in 0..2 {
     }
 }
 
-# Catch-all, then rethrow.
 fn outer() -> str {
     try {
         throw RuntimeError("inner failure")

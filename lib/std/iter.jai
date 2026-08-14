@@ -70,7 +70,6 @@ pub class Iter[T]: Iterable[T], Iterator[T] {
         return self
     }
 
-    # The VM drives `for x in it` through these two, ending on StopIteration.
     fn __iter__(self) -> Iter[T] {
         return self
     }
@@ -1125,7 +1124,6 @@ pub class Windows[T] extends Iter[list[T]] {
             self.done = true
             return null
         }
-        # The buffer is a ring: overwrite the oldest slot instead of shifting.
         self.buffer[self.start] = value
         self.start = (self.start + 1) % self.size
         return self._snapshot()
@@ -1377,7 +1375,6 @@ pub class Permutations[T] extends Iter[list[T]] {
         while i >= 0 {
             self.cycles[i] -= 1
             if self.cycles[i] == 0 {
-                # Rotate indices[i..n] one place left and restart that digit.
                 let moved = self.indices[i]
                 var j = i
                 while j < self.n - 1 {
@@ -1435,7 +1432,6 @@ pub class Combinations[T] extends Iter[list[T]] {
             self.first = false
             return self._emit()
         }
-        # Find the rightmost index that is not already at its ceiling.
         var i = self.k - 1
         while i >= 0 and self.indices[i] == i + self.n - self.k { i -= 1 }
         if i < 0 {

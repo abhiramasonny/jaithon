@@ -2,15 +2,12 @@
 from std.test import assert_eq, assert_true, assert_false, assert_throws
 
 fn test_int_and_float_are_distinct() -> void {
-    # Widening is a conversion the compiler inserts, not a merging of the two
-    # types: an int is still an int wherever nothing asked for a float. What
-    # widening does is in test_widening.jai.
     assert_eq(type_of(1), "int")
     assert_eq(type_of(1.0), "float")
-    assert_eq(type_of(1 / 1), "float")  # division always yields float
+    assert_eq(type_of(1 / 1), "float")
     assert_eq(type_of(3 // 2), "int")
     assert_eq(type_of(1 + 1), "int")
-    assert_eq(type_of(1 + 1.0), "float")  # mixed: the int widens
+    assert_eq(type_of(1 + 1.0), "float")
     assert_eq(1 + 1.0, 2.0)
 }
 
@@ -18,7 +15,6 @@ fn test_numeric_equality_crosses_types() -> void {
     assert_true(1 == 1.0)
     assert_true(0 == 0.0)
     assert_false(1 == 1.5)
-    # Equal numbers must hash equally or dict lookups break.
     assert_eq(hash(2), hash(2.0))
 }
 
@@ -97,10 +93,6 @@ fn test_bitwise_is_int_only() -> void {
     assert_eq(~0, -1)
     assert_eq(1 << 62, 4611686018427387904)
     assert_eq(-8 >> 1, -4)
-    # Arithmetic widens an int against a float; the bitwise operators do not,
-    # and a float operand is a compile error where the checker can see it. So
-    # the runtime rule is exercised through `any`, which is the only way a
-    # float can reach `&` at all.
     let not_an_int: any = 1.0
     assert_throws(TypeError, || not_an_int & 1)
 }

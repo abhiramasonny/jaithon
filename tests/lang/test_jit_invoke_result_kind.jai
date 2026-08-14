@@ -36,7 +36,6 @@
 #: `warm_labels` below calls it with n=64 instead -- purely to buy the sampler
 #: more time in the one function that matters, not a change to what is
 #: asserted.
-# jit-compiles: sum_boxes, sum_labels, drive
 from std.test import assert_eq, assert_near, assert_throws
 
 class Box {

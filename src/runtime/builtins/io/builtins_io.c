@@ -51,8 +51,6 @@
  *     before any syscall sees it.
  */
 
-/* Feature macros must precede every include: fseeko is POSIX, not C11, and
- * _DARWIN_C_SOURCE puts back what asking for POSIX takes away on macOS. */
 #if !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
@@ -74,9 +72,6 @@
 /* errno -> exception                                                   */
 /* ------------------------------------------------------------------ */
 
-/* Spec §7.2 gives IOError exactly two subclasses, and these are the two errno
- * values that mean them. Everything else is an IOError with its own text: an
- * exhaustive errno table would be a list of synonyms for "the call failed". */
 static ObjClass *classForErrno(int err) {
     switch (err) {
     case ENOENT: return vm.cFileNotFoundError;
@@ -117,9 +112,6 @@ void jaiIOPathDone(char *tmp) { free(tmp); }
 bool jaiIOCheckPath(ObjString *path, const char *fnName) {
     if (path->length == 0)
         return jaiThrow(vm.cValueError, "%s(): the path is empty", fnName);
-    /* Bounded by the length rather than by a terminator: a string may be a
-     * view into a shared append buffer, in which case the byte after it
-     * belongs to a later concatenation and strlen would run on past. */
     if (memchr(path->chars, '\0', path->length) != NULL)
         return jaiThrow(vm.cValueError, "%s(): the path contains a NUL byte",
                         fnName);
@@ -130,9 +122,6 @@ bool jaiIOCheckPath(ObjString *path, const char *fnName) {
 /* Streams                                                              */
 /* ------------------------------------------------------------------ */
 
-/* A resolved I/O target: a `file` value, or one of the standard streams named
- * by descriptor number. `file` is NULL for the latter, which is what decides
- * whether a read yields str or bytes and whether closing is even allowed. */
 typedef struct {
     FILE       *handle;
     ObjFile    *file;
@@ -237,8 +226,6 @@ static bool readCountInto(Stream *s, size_t want, JaiBuf *buf, const char *what)
     return !streamError(s, buf, what);
 }
 
-/* A binary file yields bytes and a text file yields str; a standard stream has
- * no mode of its own and is text. */
 static bool isBinary(const Stream *s) {
     return s->file != NULL && s->file->binary;
 }
@@ -250,12 +237,11 @@ static bool makePiece(const Stream *s, const char *data, size_t length,
         return true;
     }
     ObjString *text = jaiStringNew(data, length);
-    if (text == NULL) return false;      /* over the length limit; it threw */
+    if (text == NULL) return false;
     *out = OBJ_VAL(text);
     return true;
 }
 
-/* Consumes `buf` either way. */
 static bool finishRead(const Stream *s, JaiBuf *buf, Value *out) {
     if (isBinary(s)) {
         ObjBytes *bytes = jaiBytesNew(buf->data, buf->count);
@@ -276,8 +262,6 @@ static bool finishRead(const Stream *s, JaiBuf *buf, Value *out) {
 /* io_open                                                              */
 /* ------------------------------------------------------------------ */
 
-/* Exactly the modes of the specification. "rb+" and friends are absent on
- * purpose: one spelling per mode, as everywhere else in the language. */
 static const char *const kFileModes[] = {
     "r", "w", "a", "rb", "wb", "ab", "r+", "w+", "a+",
 };
@@ -312,8 +296,6 @@ static bool nIoOpen(int argc, Value *args, Value *out) {
     if (handle == NULL)
         return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot open", path->chars);
 
-    /* `path` is a native argument, so it is on the value stack and rooted for
-     * the allocation inside jaiFileNew. */
     *out = OBJ_VAL(jaiFileNew(handle, path, mode));
     return true;
 }
@@ -328,7 +310,6 @@ static bool nIoRead(int argc, Value *args, Value *out) {
     if (!resolveStream(args[0], 1, "read", &s)) return false;
     if (!requireReadable(&s, "read")) return false;
 
-    /* A negative or absent count means "the rest of the stream". */
     int64_t count = -1;
     if (argc >= 2 && !IS_NULL(args[1]) &&
         !jaiArgInt(args[1], 2, "read", &count))
@@ -341,10 +322,6 @@ static bool nIoRead(int argc, Value *args, Value *out) {
                                         "cannot read from");
     if (!ok) return false;
 
-    /* Always bytes, whatever the mode: `io_read` is the raw primitive and
-     * std.io decodes with `str_decode` (Appendix C). A count is a byte count, so
-     * decoding here could also split a multi-byte sequence — which is exactly
-     * the boundary std.io's readers are written to handle. */
     ObjBytes *raw = jaiBytesNew(buf.data, buf.count);
     jaiBufFree(&buf);
     if (raw == NULL) return false;
@@ -352,9 +329,6 @@ static bool nIoRead(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Returns null at end of input rather than an empty line, so that a read loop
- * ends on `null` and an empty line stays distinguishable from EOF. The
- * terminator is not part of the line. */
 static bool nIoReadLine(int argc, Value *args, Value *out) {
     (void)argc;
     Stream s;
@@ -376,13 +350,10 @@ static bool nIoReadLine(int argc, Value *args, Value *out) {
         *out = NULL_VAL;
         return true;
     }
-    /* A CRLF ending leaves the CR behind; it is not part of the text. */
     if (buf.count > 0 && buf.data[buf.count - 1] == '\r') buf.count--;
     return finishRead(&s, &buf, out);
 }
 
-/* Splits what is left of the stream on '\n'. A final newline terminates the
- * last line rather than starting an empty one. */
 static bool readLinesInto(Stream *s, ObjList *lines) {
     JaiBuf buf;
     jaiBufInit(&buf);
@@ -400,8 +371,6 @@ static bool readLinesInto(Stream *s, ObjList *lines) {
         if (end > start && data[end - 1] == '\r') end--;
 
         Value line;
-        /* The buffer is raw memory, not a heap object, so allocating a string
-         * per line cannot move or free it. */
         ok = makePiece(s, data + start, end - start, &line);
         if (ok) {
             jaiGCPushRoot(line);
@@ -465,8 +434,6 @@ static bool nIoWrite(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Closing twice is not an error: an explicit close next to a `defer` that also
- * closes is a normal shape, and the second one has nothing left to do. */
 static bool nIoClose(int argc, Value *args, Value *out) {
     (void)argc;
     ObjFile *file;
@@ -479,8 +446,6 @@ static bool nIoClose(int argc, Value *args, Value *out) {
     }
 
     FILE *handle = file->handle;
-    /* Mark it closed before the fclose: even a failing fclose releases the
-     * handle, so the collector must never touch it again. */
     file->handle = NULL;
     file->closed = true;
 
@@ -553,8 +518,6 @@ static bool nIoFlush(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* C reports end of file only after a read has run into it, so this answers
- * "did the last read reach the end", not "is there anything left". */
 static bool nIoEof(int argc, Value *args, Value *out) {
     (void)argc;
     Stream s;
@@ -567,9 +530,6 @@ static bool nIoEof(int argc, Value *args, Value *out) {
 /* File methods                                                         */
 /* ------------------------------------------------------------------ */
 
-/* `f.lines()` and `f.iter()` materialise the remaining lines and hand back a
- * list iterator: the iterator protocol has no file kind, and a lazy line
- * iterator would have to keep a raw FILE* alive inside a GC object. */
 static bool nFileLines(int argc, Value *args, Value *out) {
     Value lines;
     if (!nIoReadLines(argc, args, &lines)) return false;
@@ -624,7 +584,6 @@ bool jaiFileMethod(Value receiver, ObjString *name, Value *out) {
     if (!IS_FILE(receiver) || name == NULL) return false;
     const char *text = name->chars;
 
-/* Arities count the receiver, which the VM passes as args[0]. */
 #define FILE_METHOD(label, fn, minArity, maxArity)                             \
     if (strcmp(text, (label)) == 0) {                                          \
         *out = jaiBindNative(receiver, (label), (fn), (minArity), (maxArity),  \
@@ -651,9 +610,6 @@ bool jaiFileMethod(Value receiver, ObjString *name, Value *out) {
     return false;
 }
 
-/* Line reading, `tell` and the end-of-stream flag are methods of the `file`
- * type rather than primitives: each is either derivable from io_read or, in
- * the case of tell, exactly `io_seek(handle, 0, SEEK_CURRENT)`. */
 void jaiRegisterIOPrimitives(void) {
     jaiDefineNative("__prim__.io_open",  nIoOpen,  1, 2);
     jaiDefineNative("__prim__.io_read",  nIoRead,  1, 2);
@@ -667,8 +623,6 @@ void jaiRegisterIOPrimitives(void) {
 /* Dict building                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Shared with builtins_fs.c (io_stat), builtins_process.c (os_spawn's
- * result) and builtins_gc.c (gc_stats) through builtins_io.h. */
 void jaiIODictPut(ObjDict *dict, const char *key, Value value) {
     jaiGCPushRoot(OBJ_VAL(dict));
     jaiGCPushRoot(value);

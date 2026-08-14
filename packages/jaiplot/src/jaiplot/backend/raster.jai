@@ -48,9 +48,6 @@ pub fn render_image(list: DisplayList, width: int, height: int) -> Image {
 #: through and leave the canvas clipped to something arbitrary.
 pub fn draw(list: DisplayList, canvas: Canvas) -> void {
     list.validate()
-    # Iterating the typed list rather than the DisplayList itself: a `for` over
-    # a user Iterable erases the element type to `any`, which silently switches
-    # off the exhaustiveness check that makes adding a primitive safe.
     for primitive in list.to_list() {
         match primitive {
             Primitive.Polyline(points, stroke) => _polyline(canvas, points, stroke),
@@ -108,8 +105,6 @@ fn _polygon(canvas: Canvas, points: list[Point], fill: Paint, edge: Stroke?) -> 
     }
     if edge == null { return }
     if not edge.is_visible() { return }
-    # The outline is stroked as a closed run: the first point is repeated so the
-    # last edge is drawn rather than left as a gap.
     var ring = [point for point in points]
     ring.push(points[0])
     _polyline(canvas, ring, edge)
@@ -121,9 +116,6 @@ fn _text(canvas: Canvas, at: Point, content: str, style: TextStyle) -> void {
     let height = text_height(content, style.scale)
     let turns = style.quarter_turns % 4
 
-    # The canvas draws a run from its top-left cell corner, so every other
-    # anchor is that corner shifted. A turned run swaps which axis each shift
-    # applies to, which is why the offsets are resolved before the turn.
     let along = match style.horizontal {
         HorizontalAnchor.Start => 0.0,
         HorizontalAnchor.Middle => -width * 0.5,
@@ -206,7 +198,6 @@ fn _marker_points(at: Point, radius: float, shape: MarkerShape) -> list[Point] {
         }
         return points
     }
-    # A circle, as a polygon fine enough that its facets fall below one pixel.
     var points = []
     let steps = max(8, min(32, int(radius * 4.0)))
     for index in 0..steps {
@@ -286,11 +277,6 @@ fn _segments(canvas: Canvas, points: list[Point], stroke: Stroke) -> void {
     let packed = stroke.color.packed()
     let half = stroke.width * 0.5
 
-    # Each segment is filled as its own quad rather than all of them being
-    # stroked as one path. A laser scan radiates, so a single path spans the
-    # whole sweep and every scanline through it meets most of the rays -- the
-    # cost of one ray becomes the cost of the bundle. Filled one at a time, each
-    # ray only pays for the few pixels it covers.
     if stroke.dash.len() == 0 {
         var index = 0
         while index + 1 < points.len() {
@@ -317,7 +303,6 @@ fn _segments(canvas: Canvas, points: list[Point], stroke: Stroke) -> void {
         return
     }
 
-    # A dash pattern has to walk the segment, which the stroker already does.
     var index = 0
     while index + 1 < points.len() {
         let path = Path()

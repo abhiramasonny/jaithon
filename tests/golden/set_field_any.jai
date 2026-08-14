@@ -22,23 +22,14 @@ try {
     print(f"caught: {e.message}")
 }
 
-# The field must be unchanged: the guard rejects before it stores.
 print(p.x)
 
-# The same write with a correct value still succeeds through the same path.
 poison(p, 2.5)
 print(p.x)
 
-# An int is accepted by a float field (LANGUAGE.md §2.5). Note it is stored as
-# an int: the `any` path emits no OP_TO_FLOAT, because the checker never saw a
-# float on the target side.
 poison(p, 3)
 print(p.x)
 
-# The inline cache must be guarded too, not just the slow path. Every write
-# above went through `poison`, so its cache is now warm and pointing straight
-# at the slot -- a poisoned write here takes the fast path and never reaches
-# jaiSetProperty. This is the case a guard on the slow path alone would miss.
 try {
     poison(p, "still not a float")
     print("NOT REACHED (cached)")

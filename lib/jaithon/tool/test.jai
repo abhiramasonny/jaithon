@@ -167,8 +167,6 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
             body.push("")
             continue
         }
-        # An example's own import goes at the top of the program, not inside
-        # the wrapper, so what a reader types matches what the example shows.
         if _is_import(code) {
             own.push(code)
             continue
@@ -182,9 +180,6 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
         }
     }
 
-    # Scans `body`, after comments have become assertions — a name that only
-    # appeared in an expected-value comment is now real code, not text the
-    # tokenizer would skip.
     let used = _names_used(body)
     let bound: set[str] = set()
     let head: list[str] = []
@@ -192,8 +187,6 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
         head.push("from std.test import assert_eq")
         bound.add("assert_eq")
     }
-    # The example's own imports go first, so a name it asks for wins over the
-    # module's import of the same name.
     for (statement, names) in _import_bindings(mod, own, used) {
         head.push(statement)
         for name in names { bound.add(name) }
@@ -204,9 +197,6 @@ pub fn example_program(mod: ModuleDoc, imports: list[str], example: Example) -> 
         head.push(statement)
         for name in names { bound.add(name) }
     }
-    # Only if the module is importable under its own name: `module_name_of`
-    # gives a dotted path for files under `lib/` and a bare stem otherwise,
-    # and importing from a bare stem is `E0800`.
     if mod.name.contains(".") {
         let surface: list[str] = []
         for entry in mod.entries {
@@ -280,10 +270,6 @@ pub fn main(args: list[str]) -> int {
 }
 
 # --- Running -----------------------------------------------------------------
-
-# Whether `text` is one expression, so it can be asserted against — a prose
-# comment like `# true: a file with an error has no tree` must not become an
-# assertion.
 fn _is_expression(text: str) -> bool {
     let program = parse(text, 0, DiagnosticBag())
     if program is null { return false }
@@ -314,9 +300,6 @@ fn _run_examples(
         let name = f"{owner} (line {example.line})"
         if not _matches(suite, name, filter) { continue }
         let program = example_program(mod, imports, example)
-        # Its own namespace, same reason as `run_file`: e.g. `std.json`'s
-        # example imports `parse`, which run in this namespace would rebind
-        # the runner's own `parse` and crash a later example in `_is_expression`.
         let namespace = f"<doc {mod.name}:{example.line}>"
         let result = Test(name, fn() -> any { return __prim__.exec(program, namespace) }).run(suite)
         if verbose { print("  " + result.to_str()) }
@@ -347,21 +330,11 @@ fn _examples_of(mod: ModuleDoc) -> list[tuple[str, Example]] {
     return found
 }
 
-# Every identifier an example mentions, found by tokenizing rather than
-# substring search, so a name inside a string or comment isn't mistaken for a
-# use of it.
-#
-# A lexical error costs only the tokens after it: an example that doesn't lex
-# won't compile either, so the runner still reports that failure, not a
-# missing-import red herring.
 fn _names_used(lines: list[str]) -> set[str] {
     let used: set[str] = set()
     var previous = TokenKind.Eof
     let lexer = Lexer("\n".join(lines) + "\n", 0, DiagnosticBag())
     for token in lexer.tokenize() {
-        # `summary.mean()` isn't a use of the free function `mean` — a name
-        # after a dot is a member access, and importing it would be an unused
-        # import.
         let member = previous == TokenKind.Dot or previous == TokenKind.QuestionDot
         if token.kind == TokenKind.Ident and not member { used.add(token.text) }
         previous = token.kind
@@ -373,10 +346,6 @@ fn _is_import(code: str) -> bool {
     return code.starts_with("import ") or code.starts_with("from ")
 }
 
-# The module's import statements, cut down to the names `used` mentions.
-#
-# The cut is per name, not per statement: `from std.iter import iter, cycle`
-# is one statement, and using only `iter` must still not import `cycle`.
 fn _import_bindings(
     mod: ModuleDoc,
     imports: list[str],
@@ -415,11 +384,6 @@ fn _import_bindings(
     return bindings
 }
 
-# A relative import path, spelled absolutely — the example doesn't run in
-# the module's file, so a leading dot has nothing to be relative to.
-#
-# A `mod.jai` file *is* its package, so one leading dot names a child of it;
-# any other file is a module inside a package, so one dot means a sibling.
 fn _absolute_path(path: str, mod: ModuleDoc) -> str {
     if not path.starts_with(".") { return path }
     var depth = 0
@@ -500,9 +464,6 @@ class _Options {
             }
         }
         options.usage_error = reader.error
-        # Two different defaults: `--doc` examples are what `jaithon doc`
-        # publishes from `lib`, not `tests` — pointed at `tests` this found
-        # nothing for a tree of seven hundred examples.
         if options.paths.len() == 0 {
             options.paths = if options.doc { ["lib"] } else { ["tests"] }
         }

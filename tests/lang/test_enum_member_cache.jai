@@ -33,8 +33,6 @@ fn pick(e) {
 }
 
 fn test_one_site_keeps_six_enums_apart() -> void {
-    # Four ways of cache and six enums, so this walks monomorphic to
-    # polymorphic to megamorphic in a single call.
     assert_eq(f"{pick(Color)}", "Color.Red")
     assert_eq(f"{pick(Fruit)}", "Fruit.Red")
     assert_eq(f"{pick(Mood)}", "Mood.Red")
@@ -93,7 +91,6 @@ fn unit_of(e) {
 fn test_payload_constructors_stay_with_their_own_enum() -> void {
     assert_eq(constructor_of(Shape)(3).describe(), "circle 3")
     assert_eq(constructor_of(Blob)(4).describe(), "blob")
-    # Again, now that both ways are warm.
     assert_eq(constructor_of(Shape)(9).describe(), "circle 9")
     assert_eq(constructor_of(Blob)(1).describe(), "blob")
 }
@@ -105,8 +102,6 @@ fn test_unit_variants_stay_with_their_own_enum() -> void {
 }
 
 fn test_a_method_is_reachable_through_the_same_site() -> void {
-    # Methods and variants share one lookup, so a cache that memoised the
-    # variant path must not shadow the method path.
     assert_eq(Shape.Dot.describe(), "dot")
     assert_eq(Blob.Dot.describe(), "blob")
 }

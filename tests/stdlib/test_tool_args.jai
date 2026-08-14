@@ -10,7 +10,6 @@ fn test_a_path_is_not_a_flag() -> void {
     assert_false(Argument("lib/std").is_flag())
     assert_eq(Argument("lib/std").name, "")
     assert_true(Argument("lib/std").value is null)
-    # `-` is stdin by convention and `--` ends the options; neither names one.
     assert_false(Argument("-").is_flag())
     assert_false(Argument("--").is_flag())
 }
@@ -20,9 +19,7 @@ fn test_both_spellings_split_to_the_same_name() -> void {
     assert_eq(Argument("--out=docs").name, "--out")
     assert_true(Argument("--out").value is null)
     assert_eq(Argument("--out=docs").value, "docs")
-    # An empty value is a value, and not the same as no value at all.
     assert_eq(Argument("--out=").value, "")
-    # Only the first `=` splits: the rest belongs to the value.
     assert_eq(Argument("--filter=a=b").value, "a=b")
 }
 
@@ -43,11 +40,9 @@ fn test_a_missing_value_is_a_usage_error() -> void {
     assert_true(empty.value_of(empty.next()) is null)
     assert_eq(empty.error, "--out needs a value")
 
-    # A forgotten value, not a search for the text `--verbose`.
     let flag = Arguments(["--filter", "--verbose"])
     assert_true(flag.value_of(flag.next()) is null)
     assert_eq(flag.error, "--filter needs a value")
-    # The option that was mistaken for a value is still there to be parsed.
     assert_eq(flag.next().name, "--verbose")
 }
 

@@ -61,7 +61,6 @@ pub class Duration: Comparable, Printable {
     #: Duration(1_500_000_000).to_str()    # "1.5s"
     #: ```
     pub fn init(self, nanos: int) {
-        # Excludes INT64_MIN so `negate`/`absolute` stay total (no unrepresentable magnitude).
         if nanos == _NANOS_MIN {
             throw OverflowError(f"duration of {_NANOS_MIN}ns has no representable magnitude")
         }
@@ -959,8 +958,6 @@ fn _fraction_nanos(digits: str) -> int {
     return value
 }
 
-# Howard Hinnant's civil-calendar algorithm (floor division). `days` counts from
-# 1970-01-01; 719468 is the day count from 0000-03-01, the era start it's built on.
 fn _days_from_civil(year: int, month: int, day: int) -> int {
     let shifted = if month <= 2 { year - 1 } else { year }
     let era = _floor_div(shifted, 400)
@@ -985,8 +982,6 @@ fn _civil_from_days(days: int) -> tuple[int, int, int] {
     return (year, month, day)
 }
 
-# Correct whether `//` floors or truncates. Callers always pass a positive
-# divisor, which is what makes the one-sided correction sufficient.
 fn _floor_div(value: int, divisor: int) -> int {
     let quotient = value // divisor
     if quotient * divisor > value { return quotient - 1 }

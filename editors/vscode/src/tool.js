@@ -1,9 +1,4 @@
 // Talking to the `jaithon` binary.
-//
-// Everything the extension knows about a program it learns by running the real
-// compiler, so this module is the only place that spawns it. It owns binary
-// resolution, the module search path, and the temporary mirror that lets an
-// unsaved buffer be analysed by a tool that only takes file paths.
 
 const vscode = require('vscode');
 const fs = require('fs');
@@ -27,10 +22,6 @@ function workspaceDir(document) {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
 }
 
-// The setting wins, with ${workspaceFolder} expanded because VS Code does not
-// substitute variables in arbitrary string settings. Otherwise prefer a binary
-// built in the workspace over one on PATH, so working on the compiler tests the
-// compiler you just built.
 function binary(document) {
     const root = workspaceDir(document);
     const configured = config().get('path');
@@ -51,7 +42,6 @@ function binary(document) {
 
 let missingBinaryReported = false;
 
-/** After the path setting changes, the complaint is worth making again. */
 function resetBinaryWarning() {
     missingBinaryReported = false;
 }
@@ -96,7 +86,7 @@ function run(args, options = {}) {
         );
         if (token) {
             token.onCancellationRequested(() => {
-                try { child.kill(); } catch { /* already gone */ }
+                try { child.kill(); } catch { }
             });
         }
     });
@@ -104,11 +94,6 @@ function run(args, options = {}) {
 
 // ---------------------------------------------------------------------------
 // Search path
-//
-// Mirrors src/runtime/modules/module.c: the importing file's own directory first, then
-// JAITHON_PATH and -I, then the library directories derived from the binary's
-// location. Reproduced here so that go-to-definition follows an import to the
-// same file the compiler would have loaded.
 // ---------------------------------------------------------------------------
 
 function extraSearchDirs(document) {
@@ -134,7 +119,7 @@ function libraryDirs(document) {
                 fs.accessSync(candidate, fs.constants.X_OK);
                 base = dir;
                 break;
-            } catch { /* keep looking */ }
+            } catch { }
         }
     }
     if (base) {
@@ -152,7 +137,6 @@ function libraryDirs(document) {
     return dirs.filter((dir) => { try { return fs.statSync(dir).isDirectory(); } catch { return false; } });
 }
 
-/** Every directory an import is searched in, in the order the compiler uses. */
 function searchPath(document, fileDir) {
     const seen = new Set();
     const out = [];
@@ -166,7 +150,6 @@ function searchPath(document, fileDir) {
     return out;
 }
 
-/** `-I` arguments for every directory a checked file might import from. */
 function includeArgs(document, fileDir) {
     const args = [];
     for (const dir of [fileDir, workspaceDir(document), ...extraSearchDirs(document)]) {
@@ -175,11 +158,6 @@ function includeArgs(document, fileDir) {
     return args;
 }
 
-/**
- * Resolve a dotted module path the way src/runtime/modules/module.c does: `std.math`
- * becomes `<dir>/std/math.jai`, falling back to the package form
- * `<dir>/std/math/mod.jai`. Leading dots count up from the importing file.
- */
 function resolveModule(dotted, fromFile, document) {
     let dots = 0;
     while (dots < dotted.length && dotted[dots] === '.') dots++;
@@ -199,7 +177,7 @@ function resolveModule(dotted, fromFile, document) {
         for (const candidate of [path.join(dir, `${relative}.jai`), path.join(dir, relative, 'mod.jai')]) {
             try {
                 if (fs.statSync(candidate).isFile()) return candidate;
-            } catch { /* next candidate */ }
+            } catch { }
         }
     }
     return null;
@@ -207,11 +185,6 @@ function resolveModule(dotted, fromFile, document) {
 
 // ---------------------------------------------------------------------------
 // Temporary mirrors
-//
-// `check`, `ast` and `fmt` all read from disk, so analysing an unsaved buffer
-// means writing it somewhere first. The mirror keeps the original basename —
-// diagnostics quote the path, and a stable name keeps the mapping back to the
-// real URI trivial — and `-I` restores the imports the moved file lost.
 // ---------------------------------------------------------------------------
 
 let mirrorRoot = null;
@@ -223,12 +196,6 @@ function mirrorDir() {
     return mirrorRoot;
 }
 
-/**
- * A path holding `document`'s current text. Saved and unmodified documents are
- * used in place, which is both faster and exact; only a dirty buffer is copied.
- *
- * @returns {{path: string, mirrored: boolean, dir: string, dispose: () => void}}
- */
 function snapshot(document) {
     const real = document.uri.fsPath;
     const dir = path.dirname(real);
@@ -247,13 +214,13 @@ function snapshot(document) {
         path: target,
         mirrored: true,
         dir,
-        dispose() { try { fs.unlinkSync(target); } catch { /* gone already */ } },
+        dispose() { try { fs.unlinkSync(target); } catch { } },
     };
 }
 
 function cleanup() {
     if (!mirrorRoot) return;
-    try { fs.rmSync(mirrorRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(mirrorRoot, { recursive: true, force: true }); } catch { }
     mirrorRoot = null;
 }
 

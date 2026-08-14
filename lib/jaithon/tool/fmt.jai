@@ -251,8 +251,6 @@ pub fn unplaceable_comments(source: str, path: str) -> list[Comment] {
     return lost
 }
 
-# The printer's raw result: text and unused comments. Both callers need both
-# halves, and the work is too slow to do twice.
 fn _format(source: str, path: str) -> tuple[str, list[Comment]] {
     let text = _Source(source)
     let program = freeze_literals(parse_module(source, path), source)
@@ -420,8 +418,6 @@ pub fn expand_paths(inputs: list[str], keep: fn(Path) -> bool = _every_file) -> 
 pub fn tail_arguments(args: list[str], command: str) -> list[str] {
     if args.len() == 0 { return args }
     if args[0] == command { return args[1:args.len()] }
-    # Only the tool's own script path is dropped here — any other `.jai`
-    # argument is a file the caller asked for.
     if args[0].ends_with("/" + command + ".jai") { return args[1:args.len()] }
     return args
 }
@@ -453,8 +449,6 @@ pub fn main(args: list[str]) -> int {
         try {
             let (formatted, lost) = _format(input, path)
             if lost.len() > 0 {
-                # A comment with nowhere to go freezes this file until the
-                # printer is taught where it belongs.
                 print_err(
                     f"{path}:{lost[0].line}: the formatter cannot place " +
                         f"{lost.len()} comment(s); the file is left unchanged"
@@ -464,7 +458,6 @@ pub fn main(args: list[str]) -> int {
             }
         } catch error: ParseError {
             if options.migrate {
-                # The rewrite is still worth keeping even if formatting failed.
                 print_err(f"{path}: migrated but not formatted: {error.message}")
                 if not options.check and not options.diff { write_file(path, input) }
             } else {
@@ -488,8 +481,6 @@ pub fn main(args: list[str]) -> int {
     return 0
 }
 
-# The default filter of `expand_paths`: skips diagnostic fixtures, which don't
-# parse on purpose and would otherwise report as formatter failures.
 fn _every_file(path: Path) -> bool { return not is_diagnostic_fixture(path) }
 
 #: Report whether `path` is a diagnostic fixture: a file whose first line reads
@@ -517,12 +508,6 @@ fn _first_line_of(source: str) -> str {
 }
 
 # --- The source text ---------------------------------------------------------
-
-# A file plus the two indexes the printer needs over it.
-#
-# `jaithon.ast` spans are byte offsets but Jaithon strings are indexed by
-# scalar, so every span goes through `scalar_index` first. These tables answer
-# what `Span.line_column` computes in O(n) per call, in O(log n) instead.
 class _Source {
     pub let text: str
     pub let offsets: list[int]  # byte offset of each scalar, plus one past the end
@@ -586,9 +571,6 @@ class _Source {
 }
 
 # --- Comment bookkeeping -----------------------------------------------------
-
-# The comment list with a consumption mark: every comment is emitted exactly
-# once, and `format_source` can check at the end that none were missed.
 class _Trivia {
     pub let items: list[Comment]
     pub let used: list[bool]
@@ -628,7 +610,6 @@ class _Trivia {
         return null
     }
 
-    # Consume everything a verbatim-copied statement already carries.
     pub fn consume_within(self, first: int, last: int) -> void {
         var index = self.cursor
         while index < self.items.len() and self.items[index].line <= last {
@@ -647,8 +628,6 @@ class _Trivia {
         return false
     }
 
-    # Like `any_within` but ignores the comment on `last` itself — counting it
-    # drove every commented one-line statement down the verbatim path forever.
     pub fn any_inside(self, first: int, last: int) -> bool {
         var index = self.cursor
         while index < self.items.len() and self.items[index].line <= last {
@@ -678,8 +657,6 @@ class _Trivia {
     }
 }
 
-# One physical output line, tagged with the depth that decides which trailing-
-# comment alignment run it belongs to.
 class _Line {
     pub let text: str
     pub var comment: str?
@@ -692,8 +669,6 @@ class _Line {
     }
 }
 
-# One member of a class or enum body. `node` is a `Node` for a method/getter/
-# setter but a field record (dict) for a field — tagged by `role`.
 class _Member {
     pub let role: str
     pub let node: any
@@ -757,8 +732,6 @@ class _Printer {
 
     pub fn column(self) -> int { return self.depth * _INDENT.len() }
 
-    # Aligns each run of consecutive trailing comments sharing a depth into
-    # one column.
     pub fn render(self) -> list[str] {
         pub let text: list[str] = []
         var index = 0
@@ -802,8 +775,6 @@ class _Printer {
             self.comments(leading)
             self.last_line = start
             let end = self.src.line_of(statement.span.end)
-            # A verbatim copy already carries its trailing comment — asking
-            # again would print it twice.
             if not self.statement(statement, start, end) {
                 let trailing = self.trivia.take_trailing(end)
                 if trailing is not null { self.attach(trailing) }
@@ -821,11 +792,7 @@ class _Printer {
         }
     }
 
-    # Prints one statement; returns true when it was copied verbatim (so it
-    # already carries the comments in its span).
     pub fn statement(self, node: Node, start: int, end: int) -> bool {
-        # A comment inside an expression has nowhere to go when reprinted, so
-        # the statement is copied verbatim instead.
         if not _has_block(node) and self.trivia.any_inside(start, end) {
             self.trivia.consume_within(start, end)
             self.emit(_dedent_block(self.src, start, end))
@@ -838,8 +805,6 @@ class _Printer {
             return false
         }
 
-        # A block written on one line stays on one line (`spec/STYLE.md` §10);
-        # exploding it would rewrite most of the library for nothing.
         if start == end {
             let probe = _Printer(self.src, _Trivia([]))
             probe.block_statement(node)
@@ -853,7 +818,6 @@ class _Printer {
         return false
     }
 
-    # Statements with no block of their own; null for everything else.
     pub fn simple_statement(self, node: Node) -> str? {
         let column = self.column()
         match node.kind {
@@ -887,8 +851,6 @@ class _Printer {
         }
     }
 
-    # `head { ... }` on one line, or null when the body does not fit that shape.
-    #
     # Printed by a throwaway printer holding no comments — safe because the
     # caller has already established this construct spans one source line.
     pub fn collapse_body(self, head: str, body: Node?) -> str? {
@@ -1028,9 +990,6 @@ class _Printer {
         self.emit("}")
     }
 
-    # Arms are records rather than statements, so `statements` never sees them;
-    # without this, a comment here would drift to the end of the block or be
-    # dropped entirely.
     pub fn arms(self, node: Node) -> void {
         self.last_line = self.src.line_of(node.span.start)
         for arm in node.records("arms") {
@@ -1075,8 +1034,6 @@ class _Printer {
                     "fn " +
                     (node.opt_text("name") ?? "") +
                     self.generics(node.records("generics"))
-                # The return type and opening ` {` land on the same line as the
-                # parameters, so both count toward `LINE_WIDTH` too.
                 return head +
                     self.params(node.records("params"), self.column() + head.len(), arrow.len() + 2) +
                     arrow
@@ -1147,8 +1104,6 @@ class _Printer {
         self.emit("}")
     }
 
-    # A payload-less variant is written bare (`None`, never `None()`), so
-    # `params` — which answers "()" for an empty list — can't be reused as is.
     pub fn variant(self, entry: dict[str, any]) -> str {
         let payload = entry["params"]
         if payload.len() == 0 { return entry["name"] }
@@ -1161,8 +1116,6 @@ class _Printer {
         let open = self.src.line_of(node.span.start)
         let close = self.src.line_of(node.span.end)
         let flat = self.signature(node) + " { " + ", ".join(variants) + " }"
-        # Collapsing onto one line has nowhere to put a comment between
-        # variants, so a commented enum keeps its lines.
         if methods.len() == 0 and
             self.column() + flat.len() <= LINE_WIDTH and
             not flat.contains("\n") and
@@ -1194,8 +1147,6 @@ class _Printer {
         self.emit("}")
     }
 
-    # Class and enum bodies keep source order, though the tree splits members
-    # into one list per kind.
     pub fn members(self, owner: Node, entries: list[_Member]) -> void {
         self.last_line = self.src.line_of(owner.span.start)
         for (index, member) in _by_position(entries).enumerate() {
@@ -1218,7 +1169,6 @@ class _Printer {
         self.comments(self.trivia.take_leading(self.src.line_of(owner.span.end)))
     }
 
-    # Print one member and return the source line it ended on.
     pub fn member(self, member: _Member, start: int) -> int {
         if member.role == "field" {
             let field = member.node
@@ -1275,8 +1225,6 @@ class _Printer {
         return "[" + ", ".join(parts) + "]"
     }
 
-    # `reserve` is what the caller will print after the closing paren and still
-    # on that line, and so has to fit inside the limit too.
     pub fn params(self, params: list[dict[str, any]], column: int, reserve: int = 0) -> str {
         if params.len() == 0 { return "()" }
         let parts: list[str] = []
@@ -1300,15 +1248,10 @@ class _Printer {
     }
 
     # --- expressions --------------------------------------------------------
-
-    # `to_source` is the canonical renderer — it owns precedence, parentheses
-    # and spelling. This wrapper only knows about the column limit.
     pub fn expr(self, node: Node?, column: int) -> str {
         if node is null { return "" }
         let flat = to_source(node)
         if flat.contains("\n") {
-            # `to_source` always opens a block for an `if`/`match` expression;
-            # this wrapper folds it back when it fits (`spec/STYLE.md` §10).
             let folded = _collapse(flat.split("\n"))
             if folded is not null and column + folded.len() <= LINE_WIDTH { return folded }
             return flat
@@ -1317,8 +1260,6 @@ class _Printer {
         return self.broken(node, column, flat) ?? flat
     }
 
-    # One item per line. `flat` is the same node rendered on one line, so any
-    # parentheses a low-precedence callee needs are already resolved there.
     pub fn broken(self, node: Node, column: int, flat: str) -> str? {
         match node.kind {
             NodeKind.Call => {
@@ -1333,7 +1274,6 @@ class _Printer {
                 }
                 let rendered = to_source(node.require("callee"))
                 let callee = if flat.starts_with(rendered + "(") { rendered } else { "(" + rendered + ")" }
-                # No trailing comma — the §15 grammar for `args` doesn't admit one.
                 return callee + "(\n" + ",\n".join([_indent_block(part) for part in parts]) + "\n)"
             }
             NodeKind.ListLit => { return self.spread_items(node, "[", "]", column) }
@@ -1357,8 +1297,6 @@ class _Printer {
     pub fn spread_items(self, node: Node, open: str, close: str, column: int) -> str? {
         let items = node.child_list("items")
         if items.len() == 0 { return null }
-        # `(x,)` is a one-element tuple and `(x)` is not, and the comma cannot
-        # survive the break, so a one-element tuple stays on its line.
         if close == ")" and items.len() == 1 { return null }
         let parts = [self.expr(item, column + 4) for item in items]
         let comma = if close == ")" { "" } else { "," }
@@ -1370,9 +1308,6 @@ class _Printer {
             close
     }
 
-    # A block inside an expression, rendered by its own printer so its comments
-    # follow the same rules; the lines return relatively indented, which `emit`
-    # shifts into place.
     pub fn nested_block(self, block: Node) -> str {
         let inner = _Printer(self.src, self.trivia)
         inner.depth = 1
@@ -1406,8 +1341,6 @@ fn _method_members(node: Node) -> list[_Member] {
     return [_Member("method", method, method.span.start) for method in node.child_list("methods")]
 }
 
-# Insertion sort: a class body holds a handful of members, the input is four
-# already-sorted runs, and stability keeps co-located members in source order.
 fn _by_position(entries: list[_Member]) -> list[_Member] {
     let ordered = [entry for entry in entries]
     var index = 1
@@ -1424,10 +1357,6 @@ fn _by_position(entries: list[_Member]) -> list[_Member] {
     return ordered
 }
 
-# An operator chain broken after each operator, continuations indented a step.
-#
-# Splits the rendered text, not the tree: re-rendering an operand alone would
-# lose the parens that keep `(a+b)/c` different from `a+b/c`.
 fn _broken_chain(node: Node, flat: str) -> str? {
     let pieces = _split_operator(flat, op_text(node.op()))
     if pieces.len() < 2 { return null }
@@ -1438,10 +1367,6 @@ fn _broken_chain(node: Node, flat: str) -> str? {
     return out
 }
 
-# Cut `text` at every ` op ` sitting outside brackets and outside a string.
-#
-# A binary operator is always rendered with a space on each side, and a unary
-# one never is, so the spaces alone tell the two apart: `a - -b` holds one ` - `.
 fn _split_operator(text: str, operator: str) -> list[str] {
     let needle = " " + operator + " "
     let chars = [character for character in text]
@@ -1479,11 +1404,6 @@ fn _matches_at(chars: list[str], index: int, needle: str) -> bool {
     return true
 }
 
-# Fold a printed block onto one line, or refuse when it can't (a body of more
-# than one statement has no separator but the newline).
-#
-# ["if c {", "    return 1", "}"]  ->  "if c { return 1 }"
-# ["if c {", "    a()", "    b()", "}"]  ->  null
 fn _collapse(lines: list[str]) -> str? {
     if lines.len() < 2 { return null }
     var out = ""
@@ -1580,7 +1500,6 @@ fn _lines_of(text: str) -> list[str] {
     return lines
 }
 
-# The source of a statement, shifted to column zero, for verbatim copying.
 fn _dedent_block(src: _Source, first: int, last: int) -> str {
     let lines: list[str] = []
     for line in first..=last { lines.push(src.line_text(line)) }
@@ -1617,7 +1536,6 @@ fn _utf8_length(code_point: int) -> int {
     return 4
 }
 
-# Advance past a string literal, returning the position after its closing quote.
 fn _skip_string(
     chars: list[str],
     start: int,
@@ -1662,10 +1580,8 @@ fn _skip_string(
 }
 
 # --- The diff ----------------------------------------------------------------
-
-# One line of a diff, tagged with what happened to it.
 class _EditOp {
-    pub let tag: str  # " ", "-" or "+"
+    pub let tag: str
     pub let text: str
     pub let old_line: int
     pub let new_line: int
@@ -1678,7 +1594,6 @@ class _EditOp {
     }
 }
 
-# Hunks are the runs of edits, each padded with DIFF_CONTEXT unchanged lines.
 fn _hunks(old: list[str], new: list[str]) -> list[list[str]] {
     var head = 0
     while head < old.len() and head < new.len() and old[head] == new[head] { head += 1 }
@@ -1713,13 +1628,10 @@ fn _hunks(old: list[str], new: list[str]) -> list[list[str]] {
     return hunks
 }
 
-# Longest common subsequence over whole lines. The shared prefix and suffix are
-# trimmed by the caller, so the quadratic middle is only the changed region.
 fn _edit_ops(left: list[str], right: list[str]) -> list[_EditOp] {
     let n = left.len()
     let m = right.len()
     let ops: list[_EditOp] = []
-    # Past this size a whole-file replacement is cheaper to print than the table.
     if n * m > 4_000_000 {
         for (index, text) in left.enumerate() { ops.push(_EditOp("-", text, index, 0)) }
         for (index, text) in right.enumerate() { ops.push(_EditOp("+", text, 0, index)) }
@@ -1785,8 +1697,6 @@ fn _render_hunk(ops: list[_EditOp], first: int, last: int, offset: int) -> list[
 }
 
 # --- The Jaithon 2 rewrite ---------------------------------------------------
-
-# The word-for-word half of the §16 table.
 let _MIGRATE_WORDS: dict[str, str] = {"eq": "==", "func": "fn", "elseif": "elif"}
 
 fn _migrate_line(body: str) -> str {
@@ -1813,7 +1723,6 @@ fn _migrate_line(body: str) -> str {
     return _migrate_block_words(_rewrite_code(body))
 }
 
-# `then do`, `do` and `else` become braces.
 fn _migrate_block_words(text: str) -> str {
     var out = text
     if out.ends_with(" then do") {
@@ -1829,7 +1738,6 @@ fn _migrate_block_words(text: str) -> str {
     return out
 }
 
-# Token-level rewrites, applied only outside strings.
 fn _rewrite_code(text: str) -> str {
     let out = StringBuilder()
     let chars = [character for character in text]
@@ -1859,7 +1767,6 @@ fn _rewrite_code(text: str) -> str {
     return out.build()
 }
 
-# Rewrite the identifier starting at `index` and return where to carry on.
 fn _rewrite_word(out: StringBuilder, chars: list[str], index: int) -> int {
     var end = index
     while end < chars.len() and _is_ident_part(chars[end]) { end += 1 }
@@ -1889,7 +1796,6 @@ fn _rewrite_word(out: StringBuilder, chars: list[str], index: int) -> int {
     return end
 }
 
-# The operand a postfix `!` applied to, peeled off the end of what was emitted.
 fn _split_factorial_operand(text: str) -> tuple[str, str] {
     let end = text.len()
     if end == 0 { return ("", "0") }
@@ -1912,7 +1818,6 @@ fn _split_factorial_operand(text: str) -> tuple[str, str] {
     return (text[0:index], text[index:end])
 }
 
-# The text inside the parentheses starting at `open`, and the index after them.
 fn _call_argument(chars: list[str], open: int) -> tuple[int, str] {
     var index = open
     while index < chars.len() and chars[index] == " " { index += 1 }

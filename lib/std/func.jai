@@ -256,14 +256,6 @@ pub class Lazy[T] {
     }
 }
 
-# A least-recently-used cache with a fixed capacity, backing `memoize`.
-#
-# Parallel slot lists plus a doubly linked recency order (`newer`/`older`)
-# keep lookup, insertion and eviction O(1) without removing dict entries.
-# `index_of` can name a recycled slot, so `find` re-checks the slot's own
-# key; the map rebuilds once it holds twice the live entries.
-#
-# `find` and `value_at` are separate so a cached null is still a hit.
 class _LruCache {
     let capacity: int
     let keys: list[any] = []
@@ -602,7 +594,6 @@ pub fn fixed_point[T](
 #: ```
 pub fn recursive(builder: fn(any) -> any) -> any {
     var target: any = null
-    # The wrapper reads `target` at call time, once `builder` has returned and the binding holds the finished function.
     target = builder(fn(...args: any) -> any { return target(...args) })
     return target
 }

@@ -40,8 +40,6 @@ bool jaiFrontEndCall0(Value v, const char *name, Value *out) {
 
 bool jaiFrontEndInvoke(const char *module, const char *name, int argc,
                        Value *args, Value *out) {
-    /* This module is part of the compiler, so the seed may serve the import;
-     * the call below is ordinary Jaithon code. */
     ObjModule *owner = jaiImportFrontEndModule(module);
     if (owner == NULL) {
         jaiClearException();
@@ -59,14 +57,12 @@ bool jaiFrontEndInvoke(const char *module, const char *name, int argc,
     jaiPopRoot();
 
     if (!ok) {
-        /* A front end that raises is a bug; report the traceback. */
         jaiReportUncaught(vm.pendingException);
         jaiClearException();
     }
     return ok;
 }
 
-/* Every opener/closer the scan reports is one ASCII byte. */
 static char firstChar(Value v) {
     if (!IS_STRING(v)) return '\0';
     ObjString *s = AS_STRING(v);
@@ -111,8 +107,6 @@ bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out) {
     out->closerLine = intField(produced, "closer_line");
     out->closerCol  = intField(produced, "closer_col");
 
-    /* `open` is a Jaithon enum with no C spelling; a missing accessor fails
-     * the whole scan rather than silently reporting JAI_REPL_OPEN_NONE. */
     Value ordinal = NULL_VAL;
     bool gotOrdinal = jaiFrontEndCall0(produced, "open_ordinal", &ordinal) &&
                       IS_INT(ordinal);
@@ -132,8 +126,6 @@ bool jaiFrontEndReplScan(const char *source, size_t length, JaiReplScan *out) {
 
 #define JAI_FRONT_END_MODULE "jaithon.compile"
 
-/* Jaithon has no writable bytes type, so the front end returns the image as a
- * list of byte-sized ints. */
 static ObjBytes *imageBytes(Value compiled) {
     Value field;
     if (!jaiFrontEndField(compiled, "image", &field) || !IS_LIST(field)) {
@@ -157,8 +149,6 @@ static ObjBytes *imageBytes(Value compiled) {
     return bytes;
 }
 
-/* Made once and held for the process: a prompt is one conversation, nothing
- * about it is per-input. */
 static Value sSession = NULL_VAL;
 static bool  sSessionTried;
 
@@ -232,8 +222,6 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
         *outWasExpression = boolField(produced, "repl_expression");
     }
 
-    /* Diagnostics first: an input can be rejected with an image already
-     * empty. Into the bag, not stderr, so the driver renders them uniformly. */
     (void)jaiFrontEndTransferDiagnostics(produced);
 
     ObjBytes *image = imageBytes(produced);
@@ -260,10 +248,6 @@ ObjFunction *jaiFrontEndReplCompile(const char *source, size_t length,
 /* ------------------------------------------------------------------ */
 /* Diagnostics                                                          */
 /* ------------------------------------------------------------------ */
-
-/* Diagnostics are rebuilt as `JaiDiag` in the bag the driver already flushes,
- * rather than printed via `Compiled.report` (a flat line per diagnostic, no
- * excerpt/caret/help): `jaiDiagRender` then renders both front ends alike. */
 
 static JaiSpan spanFrom(Value v) {
     JaiSpan span = JAI_SPAN_NONE;
@@ -300,12 +284,10 @@ static void transferOne(Value diagnostic) {
         primary = spanFrom(spanValue);
     }
 
-    /* Severity comes off the code, not the record's own field: reading a
-     * Jaithon enum from C costs a call, and the code says the same thing. */
     JaiDiag *d = (codeText != NULL && codeText[0] == 'W')
                      ? jaiDiagWarn(code, primary, "%s", message)
                      : jaiDiagError(code, primary, "%s", message);
-    if (d == NULL) return;   /* the bag is full, or warnings are suppressed */
+    if (d == NULL) return;
 
     Value labels;
     if (jaiFrontEndField(diagnostic, "labels", &labels) && IS_LIST(labels)) {
@@ -350,8 +332,6 @@ bool jaiFrontEndTransferDiagnostics(Value compiled) {
 /* Dumps                                                                */
 /* ------------------------------------------------------------------ */
 
-/* Both ask the front end, not a C lexer/parser: a dump of a tree the compiler
- * does not build would describe a program nothing runs. */
 static ObjString *dumpText(const char *module, const char *entry,
                            const char *source, size_t length, int fileId,
                            bool wantsJson) {

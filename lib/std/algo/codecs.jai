@@ -102,7 +102,6 @@ pub fn base64_encode(data: list[int]) -> str {
     let out: list[str] = []
     let n = data.len()
     var index = 0
-    # Three bytes are 24 bits, which is exactly four six-bit digits.
     while index + 2 < n {
         let chunk = data[index] << 16 | data[index + 1] << 8 | data[index + 2]
         out.push(_base64_digit(chunk >> 18))
@@ -259,8 +258,6 @@ pub fn fnv1a(data: list[int]) -> int {
     return hash
 }
 
-# Duplicated in every sibling file that needs O(1) random access into a string
-# rather than repeated O(n) slicing: too small to be worth a shared import for.
 fn _chars(text: str) -> list[str] {
     let out: list[str] = []
     for ch in text { out.push(ch) }

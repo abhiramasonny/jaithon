@@ -493,7 +493,6 @@ pub fn weighted_choice[T](xs: list[T], weights: list[float], rng: Rng? = null) -
         target -= weights[index]
         if target < 0.0 { return xs[index] }
     }
-    # Reachable only when rounding leaves `target` at exactly the total.
     return xs[xs.len() - 1]
 }
 
@@ -585,7 +584,6 @@ fn _choose[T](xs: list[T], k: int, start: int, current: list[T], result: list[li
         return
     }
     for index in start..xs.len() {
-        # Stop as soon as too few elements remain to finish this combination.
         if xs.len() - index < k - current.len() { break }
         current.push(xs[index])
         _choose(xs, k, index + 1, current, result)
@@ -636,7 +634,6 @@ fn _merge[T](left: list[T], right: list[T], less: Less[T]) -> list[T] {
     var left_index = 0
     var right_index = 0
     while left_index < left.len() and right_index < right.len() {
-        # Strict `<` keeps equal elements in original order, which is what makes this stable.
         if less(right[right_index], left[left_index]) {
             out.push(right[right_index])
             right_index += 1
@@ -658,7 +655,6 @@ fn _below(bound: int, sampler: Rng) -> int {
 
 fn _default_below(bound: int) -> int {
     if bound <= 0 { throw ValueError(f"bound must be positive, got {bound}") }
-    # Rejects the short final block of the 63-bit range so every residue is equally reachable.
     let ceiling = _INT_MAX - (_INT_MAX % bound + 1) % bound
     loop {
         let draw = __prim__.random_u64() & _INT_MAX

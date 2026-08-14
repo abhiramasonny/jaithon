@@ -30,8 +30,6 @@ pub fn dead_code(proto: FuncProto) -> int {
 
     var removed = mark_unreachable(code)
 
-    # False is a capacity verdict, not a diagnosis: the chunk is left as it
-    # was, so a program that compiles at `--O0` cannot fail at `--O2`.
     if removed > 0 and not rebuild(code) { removed = 0 }
     return removed
 }

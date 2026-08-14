@@ -17,23 +17,10 @@ static inline void toolPush(ObjList *args, const char *text) {
     args->version++;
 }
 
-/* Build the list[str] handed to a tool's main().
- *
- * The rule is that the tool sees the command line the user wrote. The few
- * flags the CLI understands for itself and still has to pass on are re-emitted
- * in exactly the spelling the tool's usage line advertises — never folded into
- * a `--name=value` word the tool would then have to guess at — and everything
- * else is forwarded verbatim, in order. No path is invented either: `jaithon
- * doc` with no paths must reach `jaithon.tool.doc` with no paths, so that the
- * tool's own documented default (`lib` for doc, `tests` for test, `tests/bench`
- * for bench) is what applies, rather than a `.` from here that would send bench
- * walking the whole tree. */
 static ObjList *toolArguments(const JaiCliOptions *opts) {
     ObjList *args = jaiListNew(opts->toolArgCount + 4);
     jaiPushRoot(OBJ_VAL(args));
 
-    /* `--check` and `--json` are spelled the same on both sides; a tool that
-     * does not know one says so rather than having it silently dropped. */
     if (opts->fmtCheck)   toolPush(args, "--check");
     if (opts->jsonOutput) toolPush(args, "--json");
     if (opts->output != NULL) {

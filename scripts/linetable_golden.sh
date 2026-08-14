@@ -1,31 +1,6 @@
 #!/usr/bin/env bash
 # The line table must answer identically before and after a change to how it is
 # encoded.
-#
-# `jaithon disasm` with JAI_DISASM_SPANS=1 prints the raw `span..spanEnd` that
-# jaiChunkSpanAt returns for EVERY instruction offset of EVERY function in a
-# file, nested functions included -- exactly the probe an encoding change has to
-# survive. Line numbers would not do: they are lossy, and two distinct spans on
-# one source line collapse to the same digits.
-#
-# There is no differential oracle in this tree (spec/BYTECODE.md §11), so this
-# golden IS the oracle. Capture before changing the encoding, compare after.
-#
-# The golden stores one hash per file rather than the whole dump: the dump is
-# 13.5 MB over ~204,000 instructions, which does not belong in git, and a hash
-# still names the file that diverged. Re-run with `dump <file>` to see what
-# changed inside it.
-#
-# The hash covers the dump FROM THE SECOND LINE ON. `disasm`'s first line echoes
-# the path it was handed, which is absolute and rooted at $ROOT -- so every hash
-# used to depend on where the tree happened to be checked out, and this gate was
-# unconditionally red in a git worktree, on a pristine tree, with no span having
-# moved. Dropping that one line is enough: verified by disassembling the same
-# file by absolute and by relative path and comparing the rest byte for byte.
-#
-#   scripts/linetable_golden.sh capture       # write tests/golden/linetable.golden
-#   scripts/linetable_golden.sh check         # compare against it
-#   scripts/linetable_golden.sh dump <file>   # raw spans for one file
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,9 +9,6 @@ export JAI_DISASM_SPANS=1
 JAITHON="${JAITHON:-$ROOT/jaithon}"
 GOLDEN="$ROOT/tests/golden/linetable.golden"
 
-# A fixed corpus, sorted so the manifest is stable. Deliberately broad: the
-# whole standard library and the compiler itself, which between them exercise
-# every construct the emitter can produce.
 corpus() {
     { find "$ROOT/lib" -name '*.jai'
       find "$ROOT/tests/golden" -name '*.jai'

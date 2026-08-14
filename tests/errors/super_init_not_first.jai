@@ -1,6 +1,4 @@
 # expect: E0708
-# super(...) must be the first statement of init.
-
 class Base {
     pub var n: int
     fn init(self, n: int) { self.n = n }

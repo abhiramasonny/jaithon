@@ -143,9 +143,6 @@ print(Counter.starting_at(41).read())
 print(Counter().read())
 
 # --- shifts discard rather than overflow ------------------------------------
-
-# The two halves of a 64-bit constant, which is the reason this matters: the
-# full value is above INT_MAX and has no signed literal.
 let SPLIT_MIX_GAMMA = 0x9E3779B9 << 32 | 0x7F4A7C15
 
 print(SPLIT_MIX_GAMMA)

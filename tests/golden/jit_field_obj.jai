@@ -39,8 +39,6 @@ class Doc {
         self.label = "unset"
     }
 
-    # A str field read, indexed and compared once per iteration: json_parse's
-    # scanner, and the shape that declined every method of its Parser.
     pub fn spaces(self, n: int) -> int {
         var c = 0
         var i = 0
@@ -51,8 +49,6 @@ class Doc {
         return c
     }
 
-    # The same read bound to a local first, so a SLOT_OBJ *local* is live
-    # across every guard in the loop.
     pub fn spaces_via_local(self, n: int) -> int {
         let s = self.text
         var c = 0
@@ -64,7 +60,6 @@ class Doc {
         return c
     }
 
-    # A list field pushed to, then iterated and indexed.
     pub fn fill(self, n: int) -> void {
         var i = 0
         while i < n {
@@ -89,7 +84,6 @@ class Doc {
         return t
     }
 
-    # An object STORED into a field, in a loop, so the store compiles too.
     pub fn relabel(self, n: int) -> int {
         var i = 0
         while i < n {
@@ -100,8 +94,6 @@ class Doc {
     }
 }
 
-# A field with no declared object type, so the tier has only the value it
-# happened to observe -- and the second call arrives holding a different one.
 class Loose {
     pub var v: any
 
@@ -141,15 +133,12 @@ print(d.words[0])
 print(d.words[199999])
 print(d.tags)
 
-# Compiled holding a str, then re-entered holding a list, then a str again.
 let a = Loose("abcd")
 let b = Loose([1, 2, 3])
 print(measure(a, 200000))
 print(measure(b, 200000))
 print(measure(a, 200000))
 
-# The same, for the arm that reads a list header directly: a string reaching it
-# without an OBJ_LIST check would read `length`/`chars` as `count`/`items`.
 let c = Loose([7, 8, 9, 10])
 print(walk_it(c, 100000))
 print(walk_it(a, 100000))
