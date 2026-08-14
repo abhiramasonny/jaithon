@@ -476,8 +476,8 @@ pub class Axes {
         if not furniture { return list }
 
         self._draw_spines(list, plot)
-        self._draw_x_ticks(list, frame, plot, x_ticks, x_labels)
-        self._draw_y_ticks(list, frame, plot, y_ticks, y_labels)
+        self._draw_ticks(list, frame, plot, x_ticks, x_labels, true)
+        self._draw_ticks(list, frame, plot, y_ticks, y_labels, false)
         self._draw_labels(list, device, plot)
 
         if self.legend_on {
@@ -629,57 +629,44 @@ pub class Axes {
         list.push(Primitive.Polyline(frame_points, spine))
     }
 
-    fn _draw_x_ticks(
+    #: Draw one axis's ticks and their labels.
+    #:
+    #: `horizontal` picks the x axis (ticks along the top of `plot`, labels
+    #: centred beneath) or the y axis (ticks along the left of `plot`, labels
+    #: end-anchored beside them) -- the two used to be separate functions that
+    #: differed only in these mechanical choices.
+    fn _draw_ticks(
         self,
         list: DisplayList,
         frame: Frame,
         plot: Rect,
         ticks: list[float],
-        labels: list[str]
+        labels: list[str],
+        horizontal: bool
     ) -> void {
         let mark = Stroke(self.theme.spine, width: 1.0)
-        let style = TextStyle(
-            self.theme.text,
-            scale: 1,
-            horizontal: HorizontalAnchor.Middle,
-            vertical: VerticalAnchor.Top
-        )
-        for (index, value) in ticks.enumerate() {
-            let placed = frame.place(value, frame.data.bottom())
-            if placed == null { continue }
-            let foot = plot.top()
-            let ends = [Point(placed.x, foot), Point(placed.x, foot + TICK_LENGTH)]
-            list.push(Primitive.Polyline(ends, mark))
-            if index < labels.len() {
-                let at = Point(placed.x, foot + TICK_LENGTH + LABEL_GAP)
-                list.push(Primitive.Text(at, labels[index], style))
-            }
+        let style = if horizontal {
+            TextStyle(self.theme.text, scale: 1, horizontal: HorizontalAnchor.Middle, vertical: VerticalAnchor.Top)
+        } else {
+            TextStyle(self.theme.text, scale: 1, horizontal: HorizontalAnchor.End, vertical: VerticalAnchor.Middle)
         }
-    }
-
-    fn _draw_y_ticks(
-        self,
-        list: DisplayList,
-        frame: Frame,
-        plot: Rect,
-        ticks: list[float],
-        labels: list[str]
-    ) -> void {
-        let mark = Stroke(self.theme.spine, width: 1.0)
-        let style = TextStyle(
-            self.theme.text,
-            scale: 1,
-            horizontal: HorizontalAnchor.End,
-            vertical: VerticalAnchor.Middle
-        )
         for (index, value) in ticks.enumerate() {
-            let placed = frame.place(frame.data.left(), value)
+            let placed = if horizontal {
+                frame.place(value, frame.data.bottom())
+            } else {
+                frame.place(frame.data.left(), value)
+            }
             if placed == null { continue }
-            let edge = plot.left()
-            let ends = [Point(edge - TICK_LENGTH, placed.y), Point(edge, placed.y)]
+
+            let (ends, at) = if horizontal {
+                let foot = plot.top()
+                ([Point(placed.x, foot), Point(placed.x, foot + TICK_LENGTH)], Point(placed.x, foot + TICK_LENGTH + LABEL_GAP))
+            } else {
+                let edge = plot.left()
+                ([Point(edge - TICK_LENGTH, placed.y), Point(edge, placed.y)], Point(edge - TICK_LENGTH - LABEL_GAP, placed.y))
+            }
             list.push(Primitive.Polyline(ends, mark))
             if index < labels.len() {
-                let at = Point(edge - TICK_LENGTH - LABEL_GAP, placed.y)
                 list.push(Primitive.Text(at, labels[index], style))
             }
         }

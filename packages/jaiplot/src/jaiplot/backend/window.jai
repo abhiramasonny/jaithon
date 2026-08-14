@@ -27,7 +27,7 @@ from ..axes import Axes
 from ..figure import Figure
 from ..frame import Frame
 from .png import encode
-from .raster import draw
+from .raster import draw, render_image
 
 #: How much one wheel notch scales the view.
 #:
@@ -190,15 +190,9 @@ fn _draw_readout(canvas: Canvas, figure: Figure, readout: str) -> void {
 fn _snapshot(figure: Figure, axes: Axes, view: _View) -> bool {
     let _applied = axes.set_xlim(view.x_low, view.x_high)
     let _also = axes.set_ylim(view.y_low, view.y_high)
-    let image = _render_offscreen(figure)
+    let image = render_image(figure.render(), figure.width, figure.height)
     io.write_bytes("jaiplot.png", encode(image))
     return true
-}
-
-fn _render_offscreen(figure: Figure) -> Image {
-    let image = Image(figure.width, figure.height, rgb(255, 255, 255))
-    draw(figure.render(), Canvas(image))
-    return image
 }
 
 #: Run `figure` as an animation, calling `update` before each frame.

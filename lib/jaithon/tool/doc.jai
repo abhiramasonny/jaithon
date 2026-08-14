@@ -15,8 +15,8 @@ from std.io import Path, print_err, read_file
 from std.json import stringify
 from std.str import escape_html, repeat
 from .args import Arguments
-from .fmt import Comment, expand_paths, freeze_literals, parse_module, render_signature
-from .fmt import scan_comments, tail_arguments
+from .fmt import Comment, _is_ident_part, _is_ident_start, _utf8_length, expand_paths
+from .fmt import freeze_literals, parse_module, render_signature, scan_comments, tail_arguments
 
 #: The default directory `jaithon doc` writes into.
 pub const DEFAULT_OUTPUT: str = "docs/api"
@@ -963,21 +963,6 @@ fn _by_line(entries: list[Entry]) -> list[Entry] {
         index += 1
     }
     return ordered
-}
-
-fn _is_ident_start(character: str) -> bool {
-    return character == "_" or character.lower() != character.upper()
-}
-
-fn _is_ident_part(character: str) -> bool {
-    return _is_ident_start(character) or character >= "0" and character <= "9"
-}
-
-fn _utf8_length(code_point: int) -> int {
-    if code_point < 0x80 { return 1 }
-    if code_point < 0x800 { return 2 }
-    if code_point < 0x10000 { return 3 }
-    return 4
 }
 
 class _Options {
