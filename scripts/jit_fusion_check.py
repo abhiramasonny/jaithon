@@ -57,6 +57,7 @@ BASELINE = ROOT / "tests/vm/jit_unarmed.baseline"
 FUSED = [
     "OP_ADD_INT_CONST",
     "OP_SUB_INT_CONST",
+    "OP_POP_RETURN_NULL",
     "OP_INC_LOCAL",
     "OP_CMP_LOCAL_CONST_LT",
     "OP_GET_LOCAL2",
