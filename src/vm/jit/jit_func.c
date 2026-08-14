@@ -7739,6 +7739,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 cType = OBJ_LIST; sliceKind = SLOT_LIST;
             } else if (e->stack[cidx] == SLOT_OBJ && IS_STRING(cseen)) {
                 cType = OBJ_STRING; sliceKind = SLOT_OBJ;
+            } else if (e->stack[cidx] == SLOT_OBJ && IS_TUPLE(cseen)) {
+                /* `jitGetSlice` is a thin wrapper over `jaiSliceGet`, which
+                 * already handles a tuple container exactly like a list or a
+                 * string -- only this arm's own type guard was narrower than
+                 * what the call it makes actually supports. */
+                cType = OBJ_TUPLE; sliceKind = SLOT_OBJ;
             } else {
                 e->whyNot = "slicing a container this tier does not model";
                 return false;
