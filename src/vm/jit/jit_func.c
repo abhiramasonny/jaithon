@@ -3586,6 +3586,15 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
         emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
         branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    } else if (rk == SLOT_LIST) {
+        /* Same hazard as SLOT_INST above: a callee entered with another
+         * specialisation runs interpreted and may return any type, so
+         * VAL_OBJ alone does not prove the payload is a list before
+         * downstream code reads ObjList's fields off it unguarded. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
     }
     e->wroteHeap = true;
     return true;
@@ -6385,6 +6394,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                        (unsigned)offsetof(ObjClass, shapeId)));
                     emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
                     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+                } else if (rkind == SLOT_LIST) {
+                    /* Same hazard as SLOT_INST above: a method entered with
+                     * another specialisation runs interpreted and may
+                     * return any type, so VAL_OBJ alone does not prove the
+                     * payload is a list before ObjList's fields get read
+                     * off it unguarded downstream. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                     branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
                 }
 
