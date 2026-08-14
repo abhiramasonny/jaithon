@@ -6763,6 +6763,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     ObjClass *ecl = NULL;
                     if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
                     else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
+                    else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
+                    else if (IS_LIST(sample))  { ek = SLOT_LIST;  etag = VAL_OBJ; }
+                    else if (rawObjValue(sample)) { ek = SLOT_OBJ; etag = VAL_OBJ; }
                     else if (IS_INSTANCE(sample) && AS_INSTANCE(sample)->klass) {
                         ek = SLOT_INST; etag = VAL_OBJ;
                         ecl = AS_INSTANCE(sample)->klass;
@@ -6842,16 +6845,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         emitConst64(e, JIT_SCRATCH_D, (int64_t)esh);
                         emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_D));
                         branchOnDeopt(e, JAI_A64_NE);
+                    } else if (ek == SLOT_LIST) {
+                        /* Same contract as OP_GET_INDEX's own SLOT_LIST arm:
+                         * VAL_OBJ is every heap object, not specifically a
+                         * list, so the object type is confirmed here, once,
+                         * before a SLOT_LIST consumer trusts it with no check
+                         * of its own. JIT_SCRATCH_A still holds the index and
+                         * must survive to the store below. */
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C, 8));
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(Obj, type)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_LIST));
+                        branchOnDeopt(e, JAI_A64_NE);
                     }
 
                     /* Past the last guard: advance, then bind. The advance goes
                      * first because localOut may use JIT_SCRATCH_C/D for the
                      * tag and the index has to be stored out of a register the
-                     * write cannot touch. */
+                     * write cannot touch. One byte for a bool: see the note in
+                     * OP_GET_INDEX -- `strb` is what BOOL_VAL compiles to, so
+                     * the rest of the payload word is stale. */
                     emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_A, 1));
                     emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
                                        (unsigned)offsetof(ObjIter, index)));
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    if (ek == SLOT_BOOL) {
+                        emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    } else {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    }
                     localOut(e, fslot, JIT_SCRATCH_A);
                     /* The index store is a heap write, as the call-out this
                      * replaced was: a bail after it would re-run the loop from
@@ -6942,6 +6963,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
                 else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
                 else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
+                else if (IS_LIST(sample))  { ek = SLOT_LIST;  etag = VAL_OBJ; }
+                else if (rawObjValue(sample)) { ek = SLOT_OBJ; etag = VAL_OBJ; }
                 else if (IS_INSTANCE(sample) &&
                          AS_INSTANCE(sample)->klass != NULL) {
                     /* The object type is checked before the class is read,
@@ -7001,6 +7024,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                        (unsigned)offsetof(ObjClass, shapeId)));
                     emitConst64(e, JIT_SCRATCH_A, (int64_t)esh);
                     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                    branchOnDeopt(e, JAI_A64_NE);
+                } else if (ek == SLOT_LIST) {
+                    /* Same contract as OP_GET_INDEX's own SLOT_LIST arm: VAL_OBJ
+                     * is every heap object, not specifically a list, so the
+                     * object type is confirmed here, once, before a SLOT_LIST
+                     * consumer trusts it with no check of its own. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                     branchOnDeopt(e, JAI_A64_NE);
                 }
 
