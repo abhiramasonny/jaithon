@@ -262,6 +262,50 @@ typedef enum {
     OP_ITER_RANGE,           /* u8 inclusive, u16 C, u16 E */
     OP_FOR_RANGE_BIND,       /* i16 J, u16 S, u16 C, u16 E */
 
+    /* `GET_LOCAL S; <int k>; SUB` fused (§3.3). Kept distinct from
+     * ADD_INT_CONST so overflow diagnostics and user-defined subtraction keep
+     * naming `-`, rather than being rewritten as addition by a negative. */
+    OP_SUB_INT_CONST,        /* u16 S, i16 */
+
+    /* `POP; RETURN_NULL` fused (§3.3): a discarded expression-statement right
+     * before an implicit void return. RETURN_NULL contributes no stack effect
+     * of its own (it never touches this frame's operand stack), so the fused
+     * effect is exactly POP's. */
+    OP_POP_RETURN_NULL,
+
+    /* `MATCH_CONST; POP` fused (§3.3): a literal match-arm's own success path
+     * (subject equals the arm's constant), emitted directly by the match
+     * compiler rather than synthesised by the peephole -- the pattern is
+     * always exactly this shape, not something that only sometimes lands
+     * adjacent. The no-match path is unchanged: MATCH_CONST's own jump,
+     * still peeking, still leaving the subject for the next arm's test. */
+    OP_MATCH_CONST_POP,      /* u24 K, i16 J */
+
+    /* `SWAP; POP` fused (§3.3): discard what is under the top, keep the top.
+     * Every occurrence is emitted directly by the compiler at one of a
+     * handful of fixed sites (class-inheritance setup, an enum pattern's tag
+     * check and each of its payload-field extractions) -- never something
+     * the peephole discovers opportunistically. */
+    OP_SWAP_POP,
+
+    /* `MATCH_TYPE; POP` / `MATCH_RANGE; POP` / `MATCH_SEQ; POP` fused (§3.3):
+     * the same success-path shape as MATCH_CONST_POP, for a pattern's other
+     * three peek-and-branch tests. All three, like MATCH_CONST_POP, are
+     * emitted directly by the match compiler at fixed sites -- a declared-
+     * type binding, a numeric range pattern, an enum/class receiver-type
+     * check, and a tuple/list pattern's length check -- never synthesised. */
+    OP_MATCH_TYPE_POP,       /* u24 K, i16 J */
+    OP_MATCH_RANGE_POP,      /* u24 K, u24 K, u8 inclusive, i16 J */
+    OP_MATCH_SEQ_POP,        /* u8 count, u8 restFlag, i16 J */
+
+    /* `GET_LOCAL S; <int k>; MUL` fused (§3.3): the same shape as
+     * ADD_INT_CONST/SUB_INT_CONST, extended to multiplication. Overflow still
+     * raises exactly as unfused `*` does -- the fusion only skips the two
+     * extra dispatches, never the check. (DIV has no sibling here: int/int
+     * division answers a float, spec §3.3, so it does not fit this
+     * same-type-in-same-type-out template the way ADD/SUB/MUL do.) */
+    OP_MUL_INT_CONST,        /* u16 S, i16 */
+
     OP_COUNT
 } OpCode;
 

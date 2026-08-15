@@ -12,8 +12,9 @@
 #: The pass alternates its scan with `mark_unreachable`, so a rewrite that
 #: strands a block settles into more than one change; the counts asserted here
 #: are the settled totals.
-from std.test import assert_eq
+from std.test import assert_eq, assert_true
 from jaithon.compile.emit import FuncProto, Op, opcode
+from jaithon.compile.opt.chunk import compact, decode, kill
 from jaithon.compile.opt.peephole import peephole
 
 fn _one(op: Op) -> list[int] {
@@ -26,6 +27,10 @@ fn _jump(op: Op, delta: int) -> list[int] {
 
 fn _one_u8(op: Op, value: int) -> list[int] {
     return [opcode(op), value & 0xFF]
+}
+
+fn _one_u16(op: Op, value: int) -> list[int] {
+    return [opcode(op), value & 0xFF, value >> 8 & 0xFF]
 }
 
 fn _proto(code: list[int]) -> FuncProto {
@@ -94,8 +99,8 @@ fn test_an_always_taken_constant_condition_becomes_a_jump() -> void {
 fn test_a_keep_form_only_loses_the_jump() -> void {
     let code = _one(Op.False) + _jump(Op.JumpIfTrueKeep, 1) + _one(Op.Pop) + _one(Op.ReturnNull)
     let proto = _proto(code)
-    assert_eq(peephole(proto), 1)
-    assert_eq(proto.chunk.code, _one(Op.False) + _one(Op.Pop) + _one(Op.ReturnNull))
+    assert_eq(peephole(proto), 2)
+    assert_eq(proto.chunk.code, _one(Op.ReturnNull))
 }
 
 fn test_a_taken_keep_form_is_left_alone() -> void {
@@ -145,10 +150,8 @@ fn test_not_is_kept_when_its_operand_is_not_a_bool() -> void {
 fn test_a_run_of_pops_becomes_one_popn() -> void {
     let code = _one(Op.Null) + _one(Op.Null) + _one(Op.Pop) + _one(Op.Pop) + _one(Op.ReturnNull)
     let proto = _proto(code)
-    assert_eq(peephole(proto), 1)
-
-    let expected = _one(Op.Null) + _one(Op.Null) + _one_u8(Op.PopN, 2) + _one(Op.ReturnNull)
-    assert_eq(proto.chunk.code, expected)
+    assert_eq(peephole(proto), 2)
+    assert_eq(proto.chunk.code, _one(Op.ReturnNull))
 }
 
 fn test_a_popn_absorbs_the_pop_after_it() -> void {
@@ -158,27 +161,31 @@ fn test_a_popn_absorbs_the_pop_after_it() -> void {
     assert_eq(proto.chunk.code, _one_u8(Op.PopN, 255) + _one(Op.ReturnNull))
 }
 
+#: The PopN merge itself is still refused -- `PopN(255)` cannot absorb another
+#: Pop -- but the trailing `Pop; ReturnNull` is its own independent window and
+#: fuses regardless, so one change lands and it is not the merge.
 fn test_a_merge_that_would_overflow_the_u8_count_is_refused() -> void {
     let code = _one_u8(Op.PopN, 255) + _one(Op.Pop) + _one(Op.ReturnNull)
-    let expected = _one_u8(Op.PopN, 255) + _one(Op.Pop) + _one(Op.ReturnNull)
+    let expected = _one_u8(Op.PopN, 255) + _one(Op.PopReturnNull)
     let proto = _proto(code)
-    assert_eq(peephole(proto), 0)
+    assert_eq(peephole(proto), 1)
     assert_eq(proto.chunk.code, expected)
 }
 
+#: The two Pops still never merge into a PopN -- the jump lands on the second
+#: one, and `window_clean` refuses a rewrite that would consume a target. That
+#: second Pop is still free to fuse with the ReturnNull after it, though:
+#: `set_instr` rewrites it in place and keeps its position, so the jump still
+#: lands on a live instruction (now PopReturnNull) either way.
 fn test_a_branch_target_stops_a_pop_run_from_merging() -> void {
     let code = _one(Op.Null) +
         _jump(Op.JumpIfFalse, 1) +
         _one(Op.Pop) +
         _one(Op.Pop) +
         _one(Op.ReturnNull)
-    let expected = _one(Op.Null) +
-        _jump(Op.JumpIfFalse, 1) +
-        _one(Op.Pop) +
-        _one(Op.Pop) +
-        _one(Op.ReturnNull)
+    let expected = _one(Op.Null) + _jump(Op.JumpIfFalse, 1) + _one(Op.Pop) + _one(Op.PopReturnNull)
     let proto = _proto(code)
-    assert_eq(peephole(proto), 0)
+    assert_eq(peephole(proto), 1)
     assert_eq(proto.chunk.code, expected)
 }
 
@@ -187,6 +194,66 @@ fn test_dup_followed_by_pop_disappears() -> void {
     let proto = _proto(code)
     assert_eq(peephole(proto), 1)
     assert_eq(proto.chunk.code, _one(Op.Null) + _one(Op.ReturnNull))
+}
+
+fn test_set_local_followed_by_pop_becomes_bind() -> void {
+    let code = _one(Op.Null) + _one_u16(Op.SetLocal, 1) + _one(Op.Pop) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 1)
+    assert_eq(proto.chunk.code, _one(Op.Null) + _one_u16(Op.Bind, 1) + _one(Op.ReturnNull))
+}
+
+fn test_dup_followed_by_bind_becomes_set_local() -> void {
+    let code = _one(Op.Null) + _one(Op.Dup) + _one_u16(Op.Bind, 1) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 1)
+    assert_eq(proto.chunk.code, _one(Op.Null) + _one_u16(Op.SetLocal, 1) + _one(Op.ReturnNull))
+}
+
+fn test_pop_followed_by_return_null_fuses() -> void {
+    let code = _one(Op.Pop) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 1)
+    assert_eq(proto.chunk.code, _one(Op.PopReturnNull))
+}
+
+#: The rule is scoped to a bare Pop; PopN's own multi-value discard has no
+#: fused counterpart and is left alone.
+fn test_popn_does_not_fuse_with_return_null() -> void {
+    let code = _one_u8(Op.PopN, 2) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 0)
+    assert_eq(proto.chunk.code, code)
+}
+
+#: A jump landing directly on ReturnNull, skipping the Pop, must stop the
+#: fusion -- rewriting the Pop in place and killing ReturnNull would leave
+#: that edge's target resolving past the return entirely.
+fn test_a_branch_target_on_return_null_stops_the_fusion() -> void {
+    let code = _one(Op.Null) + _jump(Op.JumpIfTrue, 1) + _one(Op.Pop) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 0)
+    assert_eq(proto.chunk.code, code)
+}
+
+fn test_compaction_moves_a_deleted_target_marker_to_its_survivor() -> void {
+    let proto = _proto(_jump(Op.Jump, 0) + _one(Op.Nop) + _one(Op.ReturnNull))
+    let code = decode(proto)
+    if code == null {
+        assert_true(false)
+        return
+    }
+    kill(code, 1)
+    compact(code)
+    assert_eq(code.data[0].target, 1)
+    assert_true(code.data[1].is_target)
+}
+
+fn test_an_unused_pure_push_is_removed_with_its_pop() -> void {
+    let code = _one_u16(Op.Int, 42) + _one(Op.Pop) + _one(Op.ReturnNull)
+    let proto = _proto(code)
+    assert_eq(peephole(proto), 1)
+    assert_eq(proto.chunk.code, _one(Op.ReturnNull))
 }
 
 fn test_a_loop_is_never_chased_through_or_retargeted() -> void {

@@ -20,7 +20,9 @@ fn test_numeric_equality_crosses_types() -> void {
 
 fn test_integer_overflow_raises() -> void {
     let big = 9_223_372_036_854_775_807
+    let small = (-9_223_372_036_854_775_808)
     assert_throws(OverflowError, || big + 1)
+    assert_throws(OverflowError, || small - 1)
     assert_throws(OverflowError, || big * 2)
 }
 

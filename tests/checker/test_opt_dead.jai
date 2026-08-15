@@ -73,11 +73,23 @@ fn test_the_implicit_epilogue_after_a_return_is_deleted() -> void {
     assert_eq(f.chunk.code, [opcode(Op.Int), 1, 0, opcode(Op.Return)])
 }
 
+#: The peephole's `POP; RETURN_NULL` fusion only runs at -O1 and above, so
+#: this is the one case in this file where -O0's op list is not the other
+#: levels' -- everywhere else the pass under test has nothing to fuse.
 fn test_a_body_that_can_fall_off_the_end_keeps_its_epilogue() -> void {
-    assert_ops_at_every_level(
-        "fn f() -> void {\n    print(1)\n}\n",
-        ["OP_GET_GLOBAL", "OP_INT", "OP_CALL", "OP_POP", "OP_RETURN_NULL"]
+    let source = "fn f() -> void {\n    print(1)\n}\n"
+    assert_eq(
+        ops_of(function_in(source, "f", 0)),
+        ["OP_GET_GLOBAL", "OP_INT", "OP_CALL", "OP_POP", "OP_RETURN_NULL"],
+        "at -O0"
     )
+    for level in 1..4 {
+        assert_eq(
+            ops_of(function_in(source, "f", level)),
+            ["OP_GET_GLOBAL", "OP_INT", "OP_CALL", "OP_POP_RETURN_NULL"],
+            f"at -O{level}"
+        )
+    }
 }
 
 fn test_an_empty_body_is_a_bare_epilogue() -> void {

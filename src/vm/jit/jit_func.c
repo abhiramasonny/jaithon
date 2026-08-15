@@ -464,7 +464,14 @@ typedef struct {
     bool      stackAscii[JIT_MAX_STACK];
 
     /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
-     * can have changed it (the body can't call) -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses. */
+     * can have changed it -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses.
+     *
+     * "Nothing can have changed it" was once true because the body could not
+     * call at all. It can now, so the claim is only as good as its
+     * invalidations, and there are four (see forgetFieldKinds and
+     * forgetFieldKindsOfLocal): another store to the same field slot
+     * (recordFieldStore), a call, an offset a branch can land on, and a write
+     * to the local the entry names. */
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
     SlotKind  localKind[JIT_MAX_SLOTS + 1];
@@ -846,10 +853,21 @@ static bool localTagInFrame(const Emit *e, unsigned slot) {
 }
 
 /* Per-access instruction savings from giving `slot` a register instead of a frame home, accumulated
- * by the accessors during the measuring pass and weighted by loop nesting. Zero-saving slots are excluded outright, not just ranked last -- otherwise a tie-break could hand a register to a slot the loop never touches, paying a prologue write for nothing. */
+ * by the accessors during the measuring pass and weighted by loop nesting. Zero-saving slots are excluded outright, not just ranked last -- otherwise a tie-break could hand a register to a slot the loop never touches, paying a prologue write for nothing.
+ *
+ * Both tiers feed this, but with their OWN instruction counts, which is why the
+ * numbers at the call sites differ rather than the mechanism. A function-tier
+ * frame home is a bare payload word for every slot the plan will consider (only
+ * a dynamic slot stores a tag, and a dynamic slot never gets a register), so a
+ * write costs one `str` there and makes a weak case for a register -- weak
+ * enough that a float write makes none at all, see localOutFp. An OSR home is
+ * the INTERPRETER's own Value slot, so the same write stores tag and payload
+ * both and costs three; in OSR a write is worth as much as two reads. Ranking
+ * OSR on the function tier's numbers would therefore under-rank exactly the
+ * write-heavy loop variables OSR exists to speed up. */
 static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
                          unsigned saveFp) {
-    if (!e->measuring || e->osr || e->inlining) return;
+    if (!e->measuring || e->inlining) return;
     if (slot > JIT_MAX_SLOTS) return;
     unsigned w = 1u;
     if (e->loopDepth != NULL && e->curOffset < e->loopDepthCount) {
@@ -863,6 +881,7 @@ static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
 
 static void branchOnDeopt(Emit *e, unsigned cond);
 static void fpReleaseHome(Emit *e, unsigned reg);
+static void emitConst64(Emit *e, unsigned rd, int64_t value);
 
 /* Every kind but SLOT_MAYBE_INST has a tag fixed at compile time; that one reads it off the payload (null vs non-null). */
 static void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
@@ -897,6 +916,11 @@ static unsigned localTagFor(const Emit *e, unsigned slot) {
  * Only the payload moves -- a local's kind is fixed for the whole function, so the tag is never restored. */
 static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
     if (e->osr) {
+        /* An X home answers with no instruction at all, an FP home costs the
+         * `fmov` below and memory costs the `ldr` -- so an X register saves
+         * one here and an FP register saves nothing, exactly as in the
+         * function tier's arm. */
+        noteSlotCost(e, slot, 1u, 0u);
         if (e->slotXReg[slot] != 0) return e->slotXReg[slot];
         if (e->slotFpReg[slot] != 0) {
             emit(e, jaiA64FmovXD(scratch, e->slotFpReg[slot]));
@@ -928,6 +952,69 @@ static unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         emit(e, jaiA64LdrW(scratch, 31, localFrameOff(e, slot)));
         emit(e, jaiA64SubsXImm(31, scratch, localTagFor(e, slot)));
         branchOnDeopt(e, JAI_A64_NE);
+
+        /* VAL_OBJ is shared by SLOT_LIST, SLOT_OBJ and SLOT_INST alike (see
+         * localTagFor), so the tag check above cannot tell a list from a dict
+         * a sibling write left in this slot -- confirmed the same way
+         * OP_GET_INDEX's own SLOT_LIST arm does, once, before a consumer
+         * trusts it with no check of its own. Chained through `scratch`
+         * alone (no second register): the payload is reloaded fresh into it,
+         * then `Obj.type` is loaded from that address back into the same
+         * register -- valid on this encoder elsewhere (e.g. the
+         * OP_GET_INDEX/OP_SET_INDEX list arms chain JIT_SCRATCH_C the same
+         * way), and it never needs the pointer again afterward, since the
+         * unconditional reload below re-reads it from the frame regardless. */
+        if (e->localKind[slot] == SLOT_LIST) {
+            emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
+            emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, scratch, OBJ_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+        } else if (e->localKind[slot] == SLOT_INST ||
+                   e->localKind[slot] == SLOT_MAYBE_INST) {
+            /* Same hazard, for a slot that took two different classes: a tag
+             * of VAL_OBJ says "an instance", not "an instance of THIS class",
+             * so the object type and its class shape are both confirmed here
+             * before a consumer reads a field at an offset only this class
+             * has. JIT_SCRATCH_D is free at every call site that can carry an
+             * instance-kinded dynamic local through this helper (audited:
+             * OP_GET_LOCAL, OP_GET_LOCAL2, OP_GET_FIELD_LOCAL's two reads of
+             * its receiver, the init-returns-self arms of
+             * OP_RETURN_NULL/OP_POP_RETURN_NULL, emitRootFill's root loop --
+             * every other site names a scalar kind and cannot reach here).
+             * `scratch` keeps the instance pointer as the base throughout --
+             * loading FROM it doesn't clobber it -- until it is chained into
+             * the class pointer and then the shapeId, since nothing after
+             * this needs the original pointer back (the unconditional reload
+             * below restores it for the return regardless).
+             *
+             * SLOT_MAYBE_INST shares the arm rather than going unchecked: it
+             * is a kind a dynamic slot really does take, both from the
+             * nullable-parameter seed and from any OP_BIND of a nullable
+             * instance field, and its tag is the same VAL_OBJ, so without
+             * this a `Bird` left in the slot by a sibling write was read at
+             * `Dog`'s field offsets. What it does NOT share is the pointer
+             * being known non-null. A null cannot be chased and cannot be
+             * jumped over either -- every branch this file emits leaves the
+             * block for a stub -- so it deopts, and the interpreter finishes
+             * the instruction. That costs one deopt on a value the tier could
+             * in principle have carried, which is the price of not letting a
+             * guard load off address zero. (The prologue's own tag write is
+             * payload-dependent for the same reason, so a null argument is
+             * usually already stopped by the tag check above.) */
+            emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
+            if (e->localKind[slot] == SLOT_MAYBE_INST) {
+                emit(e, jaiA64SubsXImm(31, scratch, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
+            emit(e, jaiA64LdrW(JIT_SCRATCH_D, scratch, (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
+            branchOnDeopt(e, JAI_A64_NE);
+            emit(e, jaiA64LdrX(scratch, scratch, (unsigned)offsetof(ObjInstance, klass)));
+            emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(ObjClass, shapeId)));
+            emitConst64(e, JIT_SCRATCH_D, (int64_t)e->localShape[slot]);
+            emit(e, jaiA64SubsXReg(31, scratch, JIT_SCRATCH_D));
+            branchOnDeopt(e, JAI_A64_NE);
+        }
     }
     emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
     return scratch;
@@ -958,10 +1045,51 @@ static void xHomeWritten(Emit *e, unsigned reg) {
     }
 }
 
+/* Retires every field-kind memo (Emit::known, written by recordFieldStore and
+ * read by knownFieldKind). An entry says "a store THIS body emitted put kind K
+ * in that field, and nothing since has put another kind there" -- which holds
+ * only while this walk is the only thing that can have run, and only along the
+ * fall-through edge that made it. Two things end that, and neither is a store
+ * the walk can see:
+ *
+ *   * a call. The callee reaches the same object through the argument it was
+ *     handed, through a global or upvalue, or as the receiver it was invoked
+ *     on, and `o.v = "s"` in there leaves the memo claiming SLOT_INT -- so the
+ *     read after the call skips its tag guard and hands a consumer an
+ *     ObjString pointer as an integer, or an integer as a pointer to
+ *     dereference. Hooked in noteScratchClobber, which every call out passes
+ *     through.
+ *
+ *   * an offset something other than fall-through can reach. The store may sit
+ *     on the arm a branch skipped (`if c { o.v = 7 }` then a read), and a back
+ *     edge re-enters above stores further down the body (a read at a loop top
+ *     whose second iteration meets the kind the bottom of the body stored).
+ *     Hooked in the walk, on the same offsetIsBranchTarget test the ASCII
+ *     proofs above it use, and for the same reason.
+ *
+ * Clearing all of them rather than one is deliberate: a call can write any
+ * field of any object it can reach, so there is nothing narrower to say. */
+static void forgetFieldKinds(Emit *e) { e->knownCount = 0; }
+
+/* The narrower one: an entry names a LOCAL, so writing that local retires it.
+ * The slot may now hold a different object entirely -- `b.v = 7; b = c; b.v`
+ * read c's field at b's recorded kind before this existed. */
+static void forgetFieldKindsOfLocal(Emit *e, unsigned slot) {
+    unsigned out = 0;
+    for (unsigned i = 0; i < e->knownCount; i++) {
+        if (e->known[i].local == (int)slot) continue;
+        e->known[out++] = e->known[i];
+    }
+    e->knownCount = out;
+}
+
 /* Every write to a local goes through localOut or localOutFp, so recording it
  * in those two places is what makes "this slot does not change inside that
  * loop" a fact about the emitter rather than a re-reading of the bytecode. */
 static void noteSlotWrite(Emit *e, unsigned slot) {
+    /* Above the range check on purpose: the memo is keyed on the same slot
+     * numbers, so a slot too high to record is still one to retire. */
+    if (e->knownCount != 0) forgetFieldKindsOfLocal(e, slot);
     if (slot > JIT_MAX_SLOTS) return;
     if (!e->measuring) {
         /* The real pass writing a slot the measuring pass said this loop never
@@ -1007,6 +1135,11 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
     xHomeWritten(e, e->osr ? e->slotXReg[slot]
                            : (e->spilled ? 0u : localReg(e, slot)));
     if (e->osr) {
+        /* The memory arm below is three instructions -- the tag built, the tag
+         * stored, the payload stored -- against one `mov` into an X home or one
+         * `fmov` into an FP home. Two saved either way, so a write votes for a
+         * register without voting for a bank; the reads pick the bank. */
+        noteSlotCost(e, slot, 2u, 2u);
         if (e->slotFpReg[slot] != 0) fpReleaseHome(e, e->slotFpReg[slot]);
         if (e->slotXReg[slot] != 0) {
             if (src != e->slotXReg[slot]) {
@@ -1050,6 +1183,9 @@ static void localOut(Emit *e, unsigned slot, unsigned src) {
  * collapses `ldr x; fmov d,x` to one `ldr d`, and the store side likewise) -- only for a fixed-kind local; a dynamic one has a tag to check and goes the ordinary (X) way. */
 static void localInFp(Emit *e, unsigned slot, unsigned dst) {
     if (e->osr) {
+        /* Mirrors the function tier's charge for the same read: the FP home is
+         * the one that pays, and an X home is worth no more than the load. */
+        noteSlotCost(e, slot, 0u, 1u);
         if (e->slotFpReg[slot] != 0) {
             /* Both banks, so the numbers never collide: a local's home is
              * v8..v15 and the operand stack's is v16 up. */
@@ -1086,6 +1222,11 @@ static void localInFp(Emit *e, unsigned slot, unsigned dst) {
 static void localOutFp(Emit *e, unsigned slot, unsigned src) {
     noteSlotWrite(e, slot);
     if (e->osr) {
+        /* Unlike the function tier's float write just below -- which is one
+         * instruction into any of the three homes and so charges nothing --
+         * the OSR memory arm here writes the tag as well, so this write really
+         * does buy two, the same as localOut's. */
+        noteSlotCost(e, slot, 2u, 2u);
         if (e->slotFpReg[slot] != 0) {
             fpReleaseHome(e, e->slotFpReg[slot]);
             if (src != e->slotFpReg[slot]) {
@@ -1199,6 +1340,12 @@ static unsigned valueBankRoom(const Emit *e) {
  * value read out of a register a helper overwrote. */
 static void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
+    /* The one place every call out passes through, which makes it the one
+     * place a field-kind memo can be retired at all of them; see
+     * forgetFieldKinds. The sites that reach here without running user code
+     * (a list grow, an instance allocation) only over-retire, which costs the
+     * tag guard the read would have emitted anyway. */
+    forgetFieldKinds(e);
     if (e->measuring) {
         /* An inlined body's offsets are the CALLEE's, so they say nothing
          * about where in the caller this sits; `inlIp` is the caller's own
@@ -1533,7 +1680,11 @@ static bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass) {
     return pushValue3(e, kind, shape, klass, NULL_VAL, -1);
 }
 
-/* The kind a field is known to hold, or SLOT_SELF for "not known". */
+/* The kind a field is known to hold, or SLOT_SELF for "not known". Trusting an
+ * answer here is skipping a tag guard, so what makes it safe is not this
+ * lookup but the four things that retire an entry: recordFieldStore below,
+ * plus forgetFieldKinds (a call, a branch target) and forgetFieldKindsOfLocal
+ * (a write to the local named). */
 static SlotKind knownFieldKind(const Emit *e, int local, uint16_t field) {
     if (local < 0) return SLOT_SELF;
     for (unsigned i = 0; i < e->knownCount; i++) {
@@ -3544,6 +3695,15 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
         emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
         branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    } else if (rk == SLOT_LIST) {
+        /* Same hazard as SLOT_INST above: a callee entered with another
+         * specialisation runs interpreted and may return any type, so
+         * VAL_OBJ alone does not prove the payload is a list before
+         * downstream code reads ObjList's fields off it unguarded. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
     }
     e->wroteHeap = true;
     return true;
@@ -4263,6 +4423,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
             clearAsciiProofs(e);
         }
+        /* A field-kind memo is good along the same one edge, and goes for the
+         * same reason -- see forgetFieldKinds. `fn` is whichever body is being
+         * walked, so an inlined one is measured against its own chunk. */
+        if (e->knownCount != 0 &&
+            offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
+            forgetFieldKinds(e);
+        }
         /* Settles any deferred entry BEFORE the offset map records the instruction start, so a branch landing
  * here (arriving with everything in its own register) skips the settle and only the fall-through pays -- both paths then agree, which a join requires. Forward branches are known here; backward ones checked at the end. */
         if (anyDeferred(e)) {
@@ -4640,6 +4807,58 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
             }
             branchOnOverflow(e, 0u, JAI_A64_VS);
+            off += 5;
+            break;
+        }
+
+        case OP_SUB_INT_CONST: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int16_t  imm  = jaiReadI16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            {
+                unsigned dst = pushReg(e) - 1;
+                unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
+                if (imm >= 0 && imm <= 4095) {
+                    emit(e, jaiA64SubsXImm(dst, cur, (unsigned)imm));
+                } else if (imm < 0 && imm >= -4095) {
+                    emit(e, jaiA64AddsXImm(dst, cur, (unsigned)(-(int)imm)));
+                } else {
+                    emitConst64(e, JIT_SCRATCH_A, imm);
+                    emit(e, jaiA64SubsXReg(dst, cur, JIT_SCRATCH_A));
+                }
+            }
+            branchOnOverflow(e, 1u, JAI_A64_VS);
+            off += 5;
+            break;
+        }
+
+        case OP_MUL_INT_CONST: {
+            unsigned slot = jaiReadU16(code + off + 1);
+            int16_t  imm  = jaiReadI16(code + off + 3);
+            if (!localInRange(e, slot)) return false;
+            if (e->localKind[slot] != SLOT_INT) return false;
+            if (slot == 0) e->usesSlot0 = true;
+            if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            unsigned dst = pushReg(e) - 1;
+            unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
+            unsigned rt = ovfDest(e, dst);
+            /* MUL has no immediate form on this encoder, so the constant goes
+             * into JIT_SCRATCH_D -- left free by `cur` and `rt` above, so it
+             * cannot collide with either even when ovfDest hands back
+             * JIT_SCRATCH_B inside a `try`. Same overflow test as plain
+             * OP_MUL: the product overflows exactly when smulh's high half is
+             * not the low half's sign bit replicated, and it shares that
+             * arm's overflow-stub slot (2, the `*` message) since it is the
+             * same operator. */
+            emitConst64(e, JIT_SCRATCH_D, imm);
+            emit(e, jaiA64SmulhX(JIT_SCRATCH_A, cur, JIT_SCRATCH_D));
+            emit(e, jaiA64MulX(rt, cur, JIT_SCRATCH_D));
+            emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rt, 63));
+            branchOnOverflow(e, 2u, JAI_A64_NE);
+            if (rt != dst) emit(e, jaiA64MovX(dst, rt));
             off += 5;
             break;
         }
@@ -5693,6 +5912,48 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_POP_RETURN_NULL: {
+            /* POP's half: forget a deferred/borrowed entry rather than settle
+             * it, same as plain OP_POP -- nothing reads a value being thrown
+             * away. */
+            unsigned r;
+            if (e->depth > 0 && holdsRegister(e->stack[e->depth - 1]) &&
+                e->valueDepth > 0) {
+                unsigned idx = e->valueDepth - 1;
+                e->kPend   &= ~(1u << idx);
+                e->xBorrow &= ~(1u << idx);
+            }
+            if (!popValue(e, &r, NULL)) return false;
+
+            /* RETURN_NULL's half, unchanged. */
+            if (e->osr) {
+                e->whyNot = "a return inside an OSR loop";
+                return false;
+            }
+            if ((fn->flags & FN_INIT) == 0) {
+                if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
+                e->sawReturn  = true;
+                e->returnKind = SLOT_NULL;
+                emit(e, jaiA64MovzX(0, 0, 0));
+                emitEpilogue(e, 0);
+                off += 1;
+                break;
+            }
+            if (!localInRange(e, 0) || e->localKind[0] != SLOT_INST) return false;
+            e->usesSlot0 = true;
+            if (e->sawReturn && e->returnKind != SLOT_INST) return false;
+            e->sawReturn  = true;
+            e->returnKind = SLOT_INST;
+            e->returnShape = e->localShape[0];
+            {
+                unsigned src = localIn(e, 0, 0);
+                if (src != 0) emit(e, jaiA64MovX(0, src));
+            }
+            emitEpilogue(e, 0);
+            off += 1;
+            break;
+        }
+
         case OP_GET_UPVALUE: {
             unsigned index = code[off + 1];
             if (index >= (unsigned)fn->upvalueCount) return false;
@@ -5728,14 +5989,54 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             SlotKind kind;
             unsigned tag;
+            uint32_t seenShape = 0;
+            ObjClass *seenClass = NULL;
             if (IS_INT(seen))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(seen)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
-            else return false;
+            else if (IS_BOOL(seen))  { kind = SLOT_BOOL;  tag = VAL_BOOL; }
+            else if (IS_LIST(seen))  { kind = SLOT_LIST;  tag = VAL_OBJ; }
+            else if (rawObjValue(seen)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
+            else if (IS_INSTANCE(seen) && AS_INSTANCE(seen)->klass != NULL) {
+                /* Same reasoning as every other raw-object read site in this
+                 * tier: nothing about an upvalue makes its capture special,
+                 * it is read the same way a global or a field is. A closure
+                 * over a str/list/dict/instance never compiled before this. */
+                kind = SLOT_INST; tag = VAL_OBJ;
+                seenClass = AS_INSTANCE(seen)->klass;
+                seenShape = seenClass->shapeId;
+            } else return false;
 
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
             branchOnDeopt(e, JAI_A64_NE);
-            if (!pushValue(e, kind, 0, NULL)) return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            if (kind == SLOT_LIST) {
+                /* "an object" is not "a list": same contract as every other
+                 * SLOT_LIST arm in this tier. JIT_SCRATCH_A holds the
+                 * upvalue's location and must survive to the load below. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, OBJ_LIST));
+                branchOnDeopt(e, JAI_A64_NE);
+            } else if (kind == SLOT_INST) {
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, OBJ_INSTANCE));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(ObjInstance, klass)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(ObjClass, shapeId)));
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)seenShape);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+            }
+            if (!pushValue3(e, kind, seenShape, seenClass, seen, -1)) return false;
+            if (kind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            } else {
+                emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
+            }
             off += 2;
             break;
         }
@@ -6238,6 +6539,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
                     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
                     branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+                } else if (rkind == SLOT_LIST) {
+                    /* Same hazard as SLOT_INST above: a method entered with
+                     * another specialisation runs interpreted and may
+                     * return any type, so VAL_OBJ alone does not prove the
+                     * payload is a list before ObjList's fields get read
+                     * off it unguarded downstream. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
                 }
 
                 e->wroteHeap = true;
@@ -6697,6 +7008,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     ObjClass *ecl = NULL;
                     if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
                     else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
+                    else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
+                    else if (IS_LIST(sample))  { ek = SLOT_LIST;  etag = VAL_OBJ; }
+                    else if (rawObjValue(sample)) { ek = SLOT_OBJ; etag = VAL_OBJ; }
                     else if (IS_INSTANCE(sample) && AS_INSTANCE(sample)->klass) {
                         ek = SLOT_INST; etag = VAL_OBJ;
                         ecl = AS_INSTANCE(sample)->klass;
@@ -6776,16 +7090,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         emitConst64(e, JIT_SCRATCH_D, (int64_t)esh);
                         emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_D));
                         branchOnDeopt(e, JAI_A64_NE);
+                    } else if (ek == SLOT_LIST) {
+                        /* Same contract as OP_GET_INDEX's own SLOT_LIST arm:
+                         * VAL_OBJ is every heap object, not specifically a
+                         * list, so the object type is confirmed here, once,
+                         * before a SLOT_LIST consumer trusts it with no check
+                         * of its own. JIT_SCRATCH_A still holds the index and
+                         * must survive to the store below. */
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C, 8));
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(Obj, type)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_LIST));
+                        branchOnDeopt(e, JAI_A64_NE);
                     }
 
                     /* Past the last guard: advance, then bind. The advance goes
                      * first because localOut may use JIT_SCRATCH_C/D for the
                      * tag and the index has to be stored out of a register the
-                     * write cannot touch. */
+                     * write cannot touch. One byte for a bool: see the note in
+                     * OP_GET_INDEX -- `strb` is what BOOL_VAL compiles to, so
+                     * the rest of the payload word is stale. */
                     emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_A, 1));
                     emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
                                        (unsigned)offsetof(ObjIter, index)));
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    if (ek == SLOT_BOOL) {
+                        emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    } else {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    }
                     localOut(e, fslot, JIT_SCRATCH_A);
                     /* The index store is a heap write, as the call-out this
                      * replaced was: a bail after it would re-run the loop from
@@ -6876,6 +7208,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
                 else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
                 else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
+                else if (IS_LIST(sample))  { ek = SLOT_LIST;  etag = VAL_OBJ; }
+                else if (rawObjValue(sample)) { ek = SLOT_OBJ; etag = VAL_OBJ; }
                 else if (IS_INSTANCE(sample) &&
                          AS_INSTANCE(sample)->klass != NULL) {
                     /* The object type is checked before the class is read,
@@ -6935,6 +7269,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                        (unsigned)offsetof(ObjClass, shapeId)));
                     emitConst64(e, JIT_SCRATCH_A, (int64_t)esh);
                     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                    branchOnDeopt(e, JAI_A64_NE);
+                } else if (ek == SLOT_LIST) {
+                    /* Same contract as OP_GET_INDEX's own SLOT_LIST arm: VAL_OBJ
+                     * is every heap object, not specifically a list, so the
+                     * object type is confirmed here, once, before a SLOT_LIST
+                     * consumer trusts it with no check of its own. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                     branchOnDeopt(e, JAI_A64_NE);
                 }
 
@@ -7365,9 +7709,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 kind = SLOT_LIST;
                 tag = VAL_OBJ;
             }
-            else if (IS_STRING(elem)) {
-                /* A list of strings, held opaquely: the interned compare and `s[i]` each check OBJ_STRING for
-                 * themselves, same contract as any SLOT_OBJ local (sample specialises, guard confirms). `str_search` builds text out of `chunks[seed %% 8]` and declined that whole loop forty times over before this. */
+            else if (rawObjValue(elem)) {
+                /* A list of strings, dicts, sets, or tuples, held raw: the same contract as a SLOT_OBJ
+                 * global or field (sample specialises, the tag guard below confirms, every consumer
+                 * re-checks Obj.type for itself). `str_search` builds text out of `chunks[seed %% 8]` and
+                 * declined that whole loop forty times over before the string case alone was admitted;
+                 * widened from IS_STRING to rawObjValue so every other raw-holdable element kind gets the
+                 * same treatment rather than only strings. */
                 kind = SLOT_OBJ;
                 tag = VAL_OBJ;
             }
@@ -7400,14 +7748,37 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
             if (kind == SLOT_INST) {
-                /* The tag says "an object", not "an object of this class". */
+                /* The tag says "an object", not "an object of this class" --
+                 * and not even "an instance" yet: VAL_OBJ is every heap
+                 * object, so a list holding an instance beside a string must
+                 * have its object type confirmed before `klass` is read,
+                 * exactly as OP_FOR_ITER_BIND's SLOT_INST arms already do.
+                 * Without this, a list whose sampled element is an instance
+                 * but a later element is (say) a string reads that string's
+                 * header bytes as an ObjInstance's `klass` pointer and
+                 * segfaults dereferencing it -- not merely a wrong answer. */
                 emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                branchOnDeopt(e, JAI_A64_NE);
                 emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
                                    (unsigned)offsetof(ObjInstance, klass)));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
                                    (unsigned)offsetof(ObjClass, shapeId)));
                 emitConst64(e, JIT_SCRATCH_A, (int64_t)elemShape);
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                branchOnDeopt(e, JAI_A64_NE);
+            } else if (kind == SLOT_LIST) {
+                /* "an object" is not "a list": every SLOT_LIST consumer reads the header with no check of
+                 * its own, so the object type is confirmed here, once, before the kind is handed out --
+                 * same contract, same check, as OP_GET_FIELD_LOCAL's SLOT_LIST arm. Without this a
+                 * heterogeneous list (`[[1, 2], "not a list"]`) passes the generic VAL_OBJ tag check on
+                 * either element and reads the second one's bytes through ObjList's field offsets. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                 branchOnDeopt(e, JAI_A64_NE);
             }
 
@@ -7531,6 +7902,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 cType = OBJ_LIST; sliceKind = SLOT_LIST;
             } else if (e->stack[cidx] == SLOT_OBJ && IS_STRING(cseen)) {
                 cType = OBJ_STRING; sliceKind = SLOT_OBJ;
+            } else if (e->stack[cidx] == SLOT_OBJ && IS_TUPLE(cseen)) {
+                /* `jitGetSlice` is a thin wrapper over `jaiSliceGet`, which
+                 * already handles a tuple container exactly like a list or a
+                 * string -- only this arm's own type guard was narrower than
+                 * what the call it makes actually supports. */
+                cType = OBJ_TUPLE; sliceKind = SLOT_OBJ;
             } else {
                 e->whyNot = "slicing a container this tier does not model";
                 return false;
@@ -8070,12 +8447,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->selfSlow[si].roots     = selfRoots;
             e->selfSlow[si].resultReg = resultReg;
             e->selfSlow[si].stub      = -1;
-            /* This body is its own callee, and it checks the tag only: -1 is
-             * "no type check", and it has to be said rather than left to the
-             * zeroed struct, where 0 is OBJ_STRING. */
+            /* This body is its own callee, but its own returns are not the
+             * only way the deopt continuation can answer: `emitUnarmedDeopt`
+             * can skip a run of instructions whose own `return`s never reach
+             * `mergeReturnKind`'s walk, so `e->returnKind` is not proven to
+             * bound every value this path can actually hand back. VAL_OBJ is
+             * every heap object, so trusting a SLOT_LIST/SLOT_INST tag alone
+             * risks the same wrong-object-shape read `emitDirectCall`'s
+             * sibling stub (just above) already guards against; -1 is
+             * "no type check", used for every other kind, and said explicitly
+             * rather than left to the zeroed struct, where 0 is OBJ_STRING. */
             e->selfSlow[si].callee    = NULL;
-            e->selfSlow[si].retType   = -1;
-            e->selfSlow[si].retShape  = 0;
+            e->selfSlow[si].retType   = e->returnKind == SLOT_INST ? (int)OBJ_INSTANCE
+                                       : e->returnKind == SLOT_LIST ? (int)OBJ_LIST
+                                                                     : -1;
+            e->selfSlow[si].retShape  = e->returnKind == SLOT_INST ? e->returnShape : 0;
             if (!deoptRecordAt(e, (uint32_t)off, false,
                                &e->selfSlow[si].deoptBail)) {
                 return false;
@@ -8359,8 +8745,31 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count);
 
 /* Greedy: most instructions-saved first, across BOTH register banks at once (an int slot read 4x in
  * a loop outranks a float slot read 2x, different pools, but comparing them in one order keeps that meaningful when only one pool runs out -- see noteSlotCost). Three exclusions: a zero-saving slot is skipped outright, not just ranked last (else a tie-break could pay a prologue write for nothing); a dynamic slot keeps its frame home, since only the frame has anywhere to put a run-time tag; a wrong guess costs an `fmov`, never a wrong answer, since only fmov/ldr/str ever touch a home. */
-static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
+/* Both tiers plan through this, on the same ledgers (see noteSlotCost). What is
+ * still per-tier is named here rather than duplicated:
+ *
+ *   `skip`     slots the caller has already ruled out for reasons the ledgers
+ *              cannot see -- OSR passes the ones captured by reference by a
+ *              closure, which must stay in memory whatever they save, and the
+ *              ones its probe found to be dynamic. NULL for the function tier,
+ *              whose dynamic slots are in e->dynamicLocal already.
+ *   xBase      OSR's callee-saved window opens ABOVE the registers the loop
+ *              head reserved for its iterator; the function tier's opens at
+ *              x19. Matches regBase, which the operand stack is numbered from.
+ *   the FP gate  the function tier lets the two ledgers pick the bank, because
+ *              jitArgIn marshals every incoming argument and an FP home there
+ *              only ever sees a clean value. OSR's homes are the interpreter's
+ *              own slots and its prologue fills an FP home with a full-width
+ *              `ldr d`; for a SLOT_BOOL that loads the seven bytes above a
+ *              one-byte `strb`, which is the garbage-high-byte bug the OSR
+ *              prologue's X arm narrows against. Only a float may take an FP
+ *              home there.
+ *   `strandedOut`  counted for the OSR census: slots that earned a register and
+ *              found none left, which is what a wider bank would buy. */
+static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
+                              const bool *skip, unsigned *strandedOut) {
     unsigned availFp = JIT_FP_MAX_SAVED;
+    unsigned xBase = e->osr ? osrReserved(e) : 0u;
     unsigned top = e->base + e->locals;
     if (top > JIT_MAX_SLOTS + 1u) top = JIT_MAX_SLOTS + 1u;
     while (availX > 0 || availFp > 0) {
@@ -8369,7 +8778,9 @@ static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
         for (unsigned slot = e->base; slot < top; slot++) {
             if (e->slotXReg[slot] != 0 || e->slotFpReg[slot] != 0) continue;
             if (e->dynamicLocal[slot]) continue;
-            if (availFp > 0 && m->slotSaveFp[slot] > bestGain) {
+            if (skip != NULL && skip[slot]) continue;
+            bool fpOk = !e->osr || m->localKind[slot] == SLOT_FLOAT;
+            if (availFp > 0 && fpOk && m->slotSaveFp[slot] > bestGain) {
                 bestGain = m->slotSaveFp[slot];
                 bestSlot = slot;
                 bestFp   = true;
@@ -8386,9 +8797,18 @@ static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX) {
                 (uint8_t)(JIT_FP_FIRST_SAVED + e->fpLocals++);
             availFp--;
         } else {
-            e->slotXReg[bestSlot] = (uint8_t)(JIT_FIRST_SAVED + e->xLocals++);
+            e->slotXReg[bestSlot] =
+                (uint8_t)(JIT_FIRST_SAVED + xBase + e->xLocals++);
             availX--;
         }
+    }
+    if (strandedOut == NULL) return;
+    for (unsigned slot = e->base; slot < top; slot++) {
+        if (e->slotXReg[slot] != 0 || e->slotFpReg[slot] != 0) continue;
+        if (e->dynamicLocal[slot]) continue;
+        if (skip != NULL && skip[slot]) continue;
+        if (m->slotSaveX[slot] == 0 && m->slotSaveFp[slot] == 0) continue;
+        (*strandedOut)++;
     }
 }
 
@@ -8566,7 +8986,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         if (saved > JIT_MAX_SAVED) {
             e.whyNot = "the operand stack alone exceeds the registers";
         } else {
-            planSlotRegisters(&e, &body, JIT_MAX_SAVED - saved);
+            planSlotRegisters(&e, &body, JIT_MAX_SAVED - saved, NULL, NULL);
             saved += e.xLocals;
         }
     }
@@ -8633,8 +9053,22 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * point, so reading them here would take whatever the struct was
              * zeroed to. */
             if (localTagInFrame(&e, slot)) {
-                emit(&e, jaiA64MovzX(JIT_SCRATCH_D,
-                                     localTagFor(&body, slot), 0));
+                unsigned tag = localTagFor(&body, slot);
+                /* Payload-dependent for every object-ish kind, exactly as
+                 * localOut writes one: a null argument arrives as a zero
+                 * payload (jitArgIn's SLOT_MAYBE_INST arm), and a constant
+                 * VAL_OBJ over it would leave the frame claiming an object at
+                 * address zero -- which localIn's guard would then trust as
+                 * far as `Obj.type`, and which a deopt copies out verbatim as
+                 * OBJ_VAL(NULL) for the interpreter to trip over. The other
+                 * VAL_OBJ kinds cannot be null (jitArgIn refuses), so for
+                 * them the csel below only ever picks the same VAL_OBJ. */
+                if (tag == VAL_OBJ) {
+                    emitTagFor(&e, SLOT_MAYBE_INST, i, JIT_SCRATCH_D,
+                               JIT_SCRATCH_C);
+                } else {
+                    emit(&e, jaiA64MovzX(JIT_SCRATCH_D, tag, 0));
+                }
                 emit(&e, jaiA64StrW(JIT_SCRATCH_D, 31, localFrameOff(&e, slot)));
             }
             emit(&e, jaiA64StrX(i, 31, localFrameOff(&e, slot) + 8));
@@ -9401,46 +9835,50 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                                                   : probe.maxValue);
             unsigned availX = overhead < JIT_MAX_SAVED
                                   ? JIT_MAX_SAVED - overhead : 0u;
-            unsigned availFp = JIT_FP_MAX_SAVED;
-            /* Busiest first, and only slots the body names. A slot whose kind
-             * varies at run time keeps its tag check and stays in memory. */
-            uint8_t order[JIT_MAX_SLOTS + 1];
+            /* Ranked by what a register SAVES, on the same ledgers and through
+             * the same planner as the function tier -- not by how often the
+             * body names the slot, which is what this used to do. Both counts
+             * are weighted by loop nesting the same way, so the difference is
+             * not "flat versus weighted": it is that one pooled counter had to
+             * answer two questions it cannot tell apart. It could not say which
+             * BANK a slot wants (a float read costs an `ldr d` from memory and
+             * an `fmov` from an X home, so the two banks are not worth the same
+             * to it), and it could not say that a WRITE is worth twice a read
+             * here, because an OSR slot's memory home is the interpreter's own
+             * Value and takes the tag as well as the payload. A loop variable
+             * assigned every iteration is exactly the case both mistakes fell
+             * on, which is the case OSR exists for.
+             *
+             * The slots the ledgers cannot rule out on their own are handed
+             * over as `skip`: one captured by reference by a closure, which is
+             * aliased by an ObjUpvalue pointing into the VM's slot array and so
+             * must stay in memory whatever it saves (see chunkByRefCaptures);
+             * one the probe found dynamic, which keeps its run-time tag and has
+             * nowhere but the frame to put it; and, when the chunk would not
+             * decode at all, every slot -- the by-reference scan is what makes
+             * a register safe here, so failing it means registers for nobody.
+             *
+             * `slotUse` stays in that mask rather than being retired for the
+             * ledgers, so the set of slots this can place is the old one
+             * narrowed, never widened. The two disagree in one direction only:
+             * slotUse goes uncounted past JIT_MAX_DEPTH_MAP (a chunk over 8KB),
+             * where the ledgers still count at weight 1, so retiring it would
+             * hand registers to slots in a region no gate has ever planned for.
+             * Whatever the ledgers rank last is dropped by the zero-gain
+             * exclusion anyway, which is the accurate half of the old test:
+             * slotUse counts localInRange, a bounds CHECK made at more sites
+             * than actually read or write the slot. */
             bool byRef[JIT_MAX_SLOTS + 1];
             bool decoded = chunkByRefCaptures(&fn->chunk, byRef, e.locals);
-            unsigned n = 0;
-            for (unsigned i = 0; decoded && i < e.locals; i++) {
-                if (probe.slotUse[i] == 0) continue;
-                if (probe.dynamicLocal[i]) continue;
-                /* Captured by reference (see chunkByRefCaptures): stays in memory, since a register copy would be different storage from what the closure reads/writes. */
-                if (byRef[i]) continue;
-                order[n++] = (uint8_t)i;
+            bool skip[JIT_MAX_SLOTS + 1];
+            for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+                skip[i] = !decoded || i >= e.locals || byRef[i] ||
+                          probe.dynamicLocal[i] || probe.slotUse[i] == 0;
             }
-            for (unsigned i = 0; i + 1 < n; i++) {
-                unsigned best = i;
-                for (unsigned j = i + 1; j < n; j++) {
-                    if (probe.slotUse[order[j]] > probe.slotUse[order[best]]) {
-                        best = j;
-                    }
-                }
-                uint8_t t = order[i]; order[i] = order[best]; order[best] = t;
-            }
-            for (unsigned i = 0; i < n; i++) {
-                unsigned slot = order[i];
-                if (probe.localKind[slot] == SLOT_FLOAT && availFp > 0) {
-                    e.slotFpReg[slot] =
-                        (uint8_t)(JIT_FP_FIRST_SAVED + e.fpLocals++);
-                    availFp--;
-                } else if (availX > 0) {
-                    e.slotXReg[slot] = (uint8_t)(JIT_FIRST_SAVED +
-                                                 osrReserved(&e) + e.xLocals++);
-                    availX--;
-                } else {
-                    /* Wanted one and there was none left. This is the number a
-                     * wider bank would buy, and it is 0 far more often than the
-                     * decline census suggests -- so it is worth reporting. */
-                    probeStranded++;
-                }
-            }
+            /* `probeStranded` is the count of slots that earned a register and
+             * found none left -- what a wider bank would buy, and 0 far more
+             * often than the decline census suggests. */
+            planSlotRegisters(&e, &probe, availX, skip, &probeStranded);
 
             /* What planHoists needs: where each slot was written, where it was
              * subscripted, where the body can destroy a caller-saved register,

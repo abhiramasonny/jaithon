@@ -184,8 +184,7 @@ pub fn write_u24_at(bytes: list[int], at: int, value: int) -> void {
 #: Byte index of the `i16` branch operand inside `op`'s operand run, or
 #: `NO_INDEX` when the instruction carries no code address.
 #:
-#: `branchOperandAt` in `src/codegen/optimize.c`; keep the two in step with
-#: `src/vm/bytecode/chunk.h`.
+#: `jaiOpBranchOperandAt` in `src/vm/bytecode/verify.c`; keep the two in step.
 pub fn branch_operand_at(op: int) -> int {
     return _BRANCH_AT.get(op, NO_INDEX)
 }
@@ -247,9 +246,16 @@ pub fn closure_descriptor_slot(instruction: Instr, which: int) -> int {
 #: Byte offsets of the `u16` local-slot operands of `op`, in operand-run
 #: coordinates. Empty when `op` names no slot.
 #:
-#: `slotOperands` in `src/codegen/optimize.c`. `OP_CLOSURE` is not here: its
-#: slots live in a variable-length descriptor run, reached through
-#: `closure_descriptor_slot`.
+#: Every opcode with a slot operand belongs in `_build_slot_operands` below
+#: (`coalesce.jai`'s slot renumbering, live-range scan, and the fresh-slot
+#: picker in `hoist.jai` all read this table) AND in `slotOperands` in
+#: `src/vm/bytecode/verify.c` (the bounds check). Missing either one is
+#: silent: the C side under-checks a malformed `.jaic`; the Jai side leaves
+#: the opcode's own operand unrenumbered while every other reference to the
+#: same variable moves, so a fused opcode with an unregistered slot operand
+#: can end up reading a different, wrong (and possibly unwritten) local
+#: after coalescing. `OP_CLOSURE` is not here: its slots live in a
+#: variable-length descriptor run, reached through `closure_descriptor_slot`.
 pub fn slot_operands(op: int) -> list[int] {
     return _SLOT_OPERANDS.get(op, [])
 }
@@ -451,7 +457,15 @@ pub fn window_of(code: Code, index: int, want: int) -> list[int] {
 pub fn window_clean(code: Code, window: list[int], want: int = NO_INDEX) -> bool {
     let last = if want < 0 or want > window.len() { window.len() } else { want }
     for position in 1..last {
-        if code.data[window[position]].is_target { return false }
+        # A target on an instruction deleted by an earlier rewrite lands on
+        # the next live instruction. Check the dead gap as well as that live
+        # instruction, or a later fusion can accidentally consume a loop
+        # header whose target marker stayed on the deleted instruction.
+        var at = window[position]
+        while at > window[position - 1] {
+            if code.data[at].is_target { return false }
+            at -= 1
+        }
     }
     return true
 }
@@ -659,6 +673,30 @@ pub fn compact(code: Code) -> void {
     for (row, entry) in code.defaults.enumerate() {
         if entry >= 0 and entry <= total { code.defaults[row] = mapping[entry] }
     }
+
+    # `is_target` is derived state. A branch aimed at a deleted instruction is
+    # remapped above to the next survivor, so carrying the old flags forward
+    # leaves that survivor looking like ordinary fall-through code. The next
+    # fixpoint round may then fuse across a live loop header. Rebuild every
+    # marker from the remapped edges before another pass sees the compacted
+    # list.
+    for instruction in code.data { instruction.is_target = false }
+    for instruction in code.data {
+        if instruction.target >= 0 and instruction.target < code.count() {
+            code.data[instruction.target].is_target = true
+        }
+    }
+    for row in 0..code.exception_count() {
+        let start = code.exception_start[row]
+        let end = code.exception_end[row]
+        let handler = code.exception_handler[row]
+        if start >= 0 and start < code.count() { code.data[start].is_target = true }
+        if end >= 0 and end < code.count() { code.data[end].is_target = true }
+        if handler >= 0 and handler < code.count() { code.data[handler].is_target = true }
+    }
+    for entry in code.defaults {
+        if entry >= 0 and entry < code.count() { code.data[entry].is_target = true }
+    }
 }
 
 pub fn rebuild(code: Code) -> bool {
@@ -790,15 +828,26 @@ fn _build_branch_at() -> dict[int, int] {
     table[opcode(Op.JumpIfCmpFalse)] = 1
     # After the u8 comparison, the u16 slot and the u24 constant index.
     table[opcode(Op.JumpIfCmpLocalK)] = 6
-    table[opcode(Op.MatchSeq)] = 2
-    for op in [Op.MatchConst, Op.MatchType, Op.MatchFields] { table[opcode(op)] = 3 }
-    table[opcode(Op.MatchRange)] = 7
+    for op in [Op.MatchSeq, Op.MatchSeqPop] { table[opcode(op)] = 2 }
+    for op in [Op.MatchConst, Op.MatchConstPop, Op.MatchType, Op.MatchTypePop, Op.MatchFields] {
+        table[opcode(op)] = 3
+    }
+    for op in [Op.MatchRange, Op.MatchRangePop] { table[opcode(op)] = 7 }
     return table
 }
 
 fn _build_terminators() -> dict[int, bool] {
     var table: dict[int, bool] = {}
-    let ops = [Op.Jump, Op.Loop, Op.Return, Op.ReturnNull, Op.Throw, Op.Reraise, Op.Halt]
+    let ops = [
+        Op.Jump,
+        Op.Loop,
+        Op.Return,
+        Op.ReturnNull,
+        Op.PopReturnNull,
+        Op.Throw,
+        Op.Reraise,
+        Op.Halt,
+    ]
     for op in ops { table[opcode(op)] = true }
     return table
 }
@@ -811,12 +860,14 @@ fn _build_slot_operands() -> dict[int, list[int]] {
         Op.Bind,
         Op.CloseUpvalue,
         Op.AddIntConst,
+        Op.SubIntConst,
         Op.IncLocal,
         Op.CmpLocalConstLt,
         Op.GetFieldLocal,
         Op.AddBind,
         Op.SubBind,
         Op.MulBind,
+        Op.MulIntConst,
     ]
     for op in leading { table[opcode(op)] = [0] }
     table[opcode(Op.ForIterBind)] = [2]     # the slot follows the i16 jump

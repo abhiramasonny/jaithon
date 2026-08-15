@@ -69,8 +69,7 @@ fn test_one_global_moves_to_a_pre_header() -> void {
     assert_eq(hoist_globals(proto), 1)
 
     let expected = _get_global(7, 1) +
-        _local(Op.SetLocal, 2) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 2) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 7) +
         _local(Op.GetLocal, 2) +
@@ -101,11 +100,9 @@ fn test_two_globals_take_a_slot_each_and_a_repeat_shares_one() -> void {
     assert_eq(hoist_globals(proto), 2)
 
     let expected = _get_global(7, 3) +
-        _local(Op.SetLocal, 2) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 2) +
         _get_global(9, 4) +
-        _local(Op.SetLocal, 3) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 3) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 15) +
         _local(Op.GetLocal, 2) +
@@ -130,10 +127,7 @@ fn test_a_loop_takes_eight_globals_a_round() -> void {
     var loads: list[int] = []
     var reads: list[int] = []
     for which in 0..9 {
-        loads = loads +
-            _get_global(100 + which, 9 + which) +
-            _local(Op.SetLocal, 2 + which) +
-            _one(Op.Pop)
+        loads = loads + _get_global(100 + which, 9 + which) + _local(Op.Bind, 2 + which)
         reads = reads + _local(Op.GetLocal, 2 + which) + _one(Op.Pop)
     }
     let expected = loads +
@@ -162,8 +156,7 @@ fn test_two_sibling_loops_are_both_taken_in_one_round() -> void {
     assert_eq(hoist_globals(proto), 2)
 
     let expected = _get_global(7, 2) +
-        _local(Op.SetLocal, 2) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 2) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 7) +
         _local(Op.GetLocal, 2) +
@@ -171,8 +164,7 @@ fn test_two_sibling_loops_are_both_taken_in_one_round() -> void {
         _jump(Op.Loop, -13) +
         _one(Op.Nop) +
         _get_global(9, 3) +
-        _local(Op.SetLocal, 3) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 3) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 7) +
         _local(Op.GetLocal, 3) +
@@ -194,11 +186,9 @@ fn test_a_nested_loop_is_hoisted_into_the_outer_pre_header() -> void {
     assert_eq(hoist_globals(proto), 2)
 
     let expected = _get_global(7, 2) +
-        _local(Op.SetLocal, 2) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 2) +
         _get_global(9, 3) +
-        _local(Op.SetLocal, 3) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 3) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 20) +
         _local(Op.GetLocal, 2) +
@@ -255,8 +245,7 @@ fn test_a_header_below_the_top_of_the_code_is_still_hoisted() -> void {
 
     let expected = _one(Op.Nop) +
         _get_global(7, 1) +
-        _local(Op.SetLocal, 2) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 2) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 7) +
         _local(Op.GetLocal, 2) +
@@ -272,8 +261,7 @@ fn test_a_hoisted_slot_never_lands_on_a_parameter() -> void {
     assert_eq(hoist_globals(proto), 1)
 
     let expected = _get_global(7, 1) +
-        _local(Op.SetLocal, 4) +
-        _one(Op.Pop) +
+        _local(Op.Bind, 4) +
         _local(Op.GetLocal, 1) +
         _jump(Op.JumpIfFalse, 7) +
         _local(Op.GetLocal, 4) +
