@@ -192,16 +192,52 @@ fn test_a_delta_wider_than_i8_stops_at_add_int_const() -> void {
     )
 }
 
-fn test_subtraction_is_never_folded_into_an_increment() -> void {
-    let code = _op16(Op.GetLocal, 1) +
-        _op16(Op.Int, 1) +
-        _one(Op.Sub) +
-        _op16(Op.Bind, 1) +
-        _one(Op.ReturnNull)
-    let proto = _proto(code)
-    superinstructions(proto)
-    assert_true(not proto.chunk.code.contains(opcode(Op.IncLocal)))
-    assert_true(not proto.chunk.code.contains(opcode(Op.AddIntConst)))
+fn test_a_local_minus_an_immediate_folds_without_changing_the_operator() -> void {
+    let proto = _proto(
+        _op16(Op.GetLocal, 1) + _op16(Op.Int, 1) + _one(Op.Sub) + _one(Op.ReturnNull)
+    )
+    assert_eq(superinstructions(proto), 1)
+    assert_eq(proto.chunk.code, [opcode(Op.SubIntConst)] + _u16(1) + _u16(1) + _one(Op.ReturnNull))
+}
+
+fn test_a_pooled_subtrahend_folds_the_same_way() -> void {
+    let proto = _proto_with_ints(
+        _op16(Op.GetLocal, 2) +
+            [opcode(Op.Const)] +
+            _u24(0) +
+            _one(Op.Sub) +
+            _one(Op.ReturnNull),
+        [-30000]
+    )
+    assert_eq(superinstructions(proto), 1)
+    assert_eq(
+        proto.chunk.code,
+        [opcode(Op.SubIntConst)] + _u16(2) + _u16(-30000) + _one(Op.ReturnNull)
+    )
+}
+
+fn test_a_local_times_an_immediate_folds_into_the_operand() -> void {
+    let proto = _proto(
+        _op16(Op.GetLocal, 1) + _op16(Op.Int, 7) + _one(Op.Mul) + _one(Op.ReturnNull)
+    )
+    assert_eq(superinstructions(proto), 1)
+    assert_eq(proto.chunk.code, [opcode(Op.MulIntConst)] + _u16(1) + _u16(7) + _one(Op.ReturnNull))
+}
+
+fn test_a_pooled_multiplicand_folds_the_same_way() -> void {
+    let proto = _proto_with_ints(
+        _op16(Op.GetLocal, 2) +
+            [opcode(Op.Const)] +
+            _u24(0) +
+            _one(Op.Mul) +
+            _one(Op.ReturnNull),
+        [-30000]
+    )
+    assert_eq(superinstructions(proto), 1)
+    assert_eq(
+        proto.chunk.code,
+        [opcode(Op.MulIntConst)] + _u16(2) + _u16(-30000) + _one(Op.ReturnNull)
+    )
 }
 
 fn test_a_field_read_off_a_local_keeps_its_name_and_cache() -> void {

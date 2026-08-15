@@ -3683,6 +3683,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_NOT]                = &&L_OP_NOT,
         [OP_CONCAT]             = &&L_OP_CONCAT,
         [OP_ADD_INT_CONST]      = &&L_OP_ADD_INT_CONST,
+        [OP_SUB_INT_CONST]      = &&L_OP_SUB_INT_CONST,
         [OP_MOD_INT_CONST]      = &&L_OP_MOD_INT_CONST,
         [OP_ADD_BIND]           = &&L_OP_ADD_BIND,
         [OP_SUB_BIND]           = &&L_OP_SUB_BIND,
@@ -3713,6 +3714,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_TAIL_CALL]          = &&L_OP_TAIL_CALL,
         [OP_RETURN]             = &&L_OP_RETURN,
         [OP_RETURN_NULL]        = &&L_OP_RETURN_NULL,
+        [OP_POP_RETURN_NULL]    = &&L_OP_POP_RETURN_NULL,
         [OP_CLOSURE]            = &&L_OP_CLOSURE,
         [OP_BUILD_LIST]         = &&L_OP_BUILD_LIST,
         [OP_BUILD_DICT]         = &&L_OP_BUILD_DICT,
@@ -3751,6 +3753,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
         [OP_MATCH_EXC]          = &&L_OP_MATCH_EXC,
         [OP_GET_EXC]            = &&L_OP_GET_EXC,
         [OP_MATCH_CONST]        = &&L_OP_MATCH_CONST,
+        [OP_MATCH_CONST_POP]    = &&L_OP_MATCH_CONST_POP,
+        [OP_SWAP_POP]           = &&L_OP_SWAP_POP,
+        [OP_MATCH_TYPE_POP]     = &&L_OP_MATCH_TYPE_POP,
+        [OP_MATCH_RANGE_POP]    = &&L_OP_MATCH_RANGE_POP,
+        [OP_MATCH_SEQ_POP]      = &&L_OP_MATCH_SEQ_POP,
+        [OP_MUL_INT_CONST]      = &&L_OP_MUL_INT_CONST,
         [OP_MATCH_RANGE]        = &&L_OP_MATCH_RANGE,
         [OP_MATCH_TYPE]         = &&L_OP_MATCH_TYPE,
         [OP_MATCH_SEQ]          = &&L_OP_MATCH_SEQ,
@@ -3843,6 +3851,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
         Value top = stackTop[-1];
         stackTop[-1] = stackTop[-2];
         stackTop[-2] = top;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_SWAP_POP): {
+        stackTop[-2] = stackTop[-1];
+        stackTop--;
         VM_NEXT();
     }
 
@@ -4332,6 +4346,48 @@ static JaiRunResult runLoop(int baseFrameCount) {
         SAVE_STATE();
         Value result;
         if (!arithmetic(OP_ADD, local, INT_VAL(imm), &result)) goto vmThrow;
+        LOAD_STATE();
+        PUSH(result);
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_SUB_INT_CONST): {
+        uint16_t slot = READ_U16();
+        int16_t imm = READ_I16();
+        Value local = slots[slot];
+        if (JAI_LIKELY(IS_INT(local))) {
+            int64_t r;
+            if (JAI_UNLIKELY(__builtin_sub_overflow(AS_INT(local),
+                                                    (int64_t)imm, &r))) {
+                THROW(vm.cOverflowError,
+                      "integer overflow in '-'; use '-%%' to wrap");
+            }
+            PUSH(INT_VAL(r));
+            VM_NEXT();
+        }
+        SAVE_STATE();
+        Value result;
+        if (!arithmetic(OP_SUB, local, INT_VAL(imm), &result)) goto vmThrow;
+        LOAD_STATE();
+        PUSH(result);
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MUL_INT_CONST): {
+        uint16_t slot = READ_U16();
+        int16_t imm = READ_I16();
+        Value local = slots[slot];
+        if (JAI_LIKELY(IS_INT(local))) {
+            int64_t r;
+            if (JAI_UNLIKELY(__builtin_mul_overflow(AS_INT(local), (int64_t)imm, &r))) {
+                THROW(vm.cOverflowError, "integer overflow in '*'; use '*%%' to wrap");
+            }
+            PUSH(INT_VAL(r));
+            VM_NEXT();
+        }
+        SAVE_STATE();
+        Value result;
+        if (!arithmetic(OP_MUL, local, INT_VAL(imm), &result)) goto vmThrow;
         LOAD_STATE();
         PUSH(result);
         VM_NEXT();
@@ -5294,6 +5350,11 @@ static JaiRunResult runLoop(int baseFrameCount) {
         goto opReturn;
 
     VM_CASE(OP_RETURN_NULL):
+        retval = NULL_VAL;
+        goto opReturn;
+
+    VM_CASE(OP_POP_RETURN_NULL):
+        DROP(1);
         retval = NULL_VAL;
         goto opReturn;
 
@@ -6266,6 +6327,21 @@ static JaiRunResult runLoop(int baseFrameCount) {
         VM_NEXT();
     }
 
+    VM_CASE(OP_MATCH_CONST_POP): {
+        Value expected = READ_CONST();
+        int16_t offset = READ_I16();
+        SAVE_STATE();
+        bool equal = jaiValuesEqual(PEEK(0), expected);
+        if (vm.hasException) goto vmThrow;
+        LOAD_STATE();
+        if (equal) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
+        VM_NEXT();
+    }
+
     VM_CASE(OP_MATCH_RANGE): {
         Value low = READ_CONST();
         Value high = READ_CONST();
@@ -6285,10 +6361,44 @@ static JaiRunResult runLoop(int baseFrameCount) {
         VM_NEXT();
     }
 
+    VM_CASE(OP_MATCH_RANGE_POP): {
+        Value low = READ_CONST();
+        Value high = READ_CONST();
+        bool inclusive = READ_BYTE() != 0;
+        int16_t offset = READ_I16();
+        Value subject = PEEK(0);
+
+        int cmpLow = 0, cmpHigh = 0;
+        SAVE_STATE();
+        bool ordered = jaiValueCompare(subject, low, &cmpLow) &&
+                       jaiValueCompare(subject, high, &cmpHigh);
+        if (vm.hasException) goto vmThrow;
+        LOAD_STATE();
+        bool inside = ordered && cmpLow >= 0 &&
+                      (inclusive ? cmpHigh <= 0 : cmpHigh < 0);
+        if (inside) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
+        VM_NEXT();
+    }
+
     VM_CASE(OP_MATCH_TYPE): {
         Value typeConstant = READ_CONST();
         int16_t offset = READ_I16();
         if (!valueMatchesType(PEEK(0), typeConstant)) ip += offset;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MATCH_TYPE_POP): {
+        Value typeConstant = READ_CONST();
+        int16_t offset = READ_I16();
+        if (valueMatchesType(PEEK(0), typeConstant)) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
         VM_NEXT();
     }
 
@@ -6305,6 +6415,26 @@ static JaiRunResult runLoop(int baseFrameCount) {
         bool matched = length >= 0 &&
                        (hasRest ? (length >= count) : (length == count));
         if (!matched) ip += offset;
+        VM_NEXT();
+    }
+
+    VM_CASE(OP_MATCH_SEQ_POP): {
+        int count = READ_BYTE();
+        bool hasRest = READ_BYTE() != 0;
+        int16_t offset = READ_I16();
+        Value subject = PEEK(0);
+
+        int length = -1;
+        if (IS_LIST(subject))       length = AS_LIST(subject)->count;
+        else if (IS_TUPLE(subject)) length = (int)AS_TUPLE(subject)->count;
+
+        bool matched = length >= 0 &&
+                       (hasRest ? (length >= count) : (length == count));
+        if (matched) {
+            DROP(1);
+        } else {
+            ip += offset;
+        }
         VM_NEXT();
     }
 

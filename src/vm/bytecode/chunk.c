@@ -180,7 +180,21 @@
     X(OP_FOR_ITER_PAIR,        6,  0)                                          \
     /* `for x in a..b` with neither an ObjRange nor an ObjIter built (§3.4) */ \
     X(OP_ITER_RANGE,           5, -2)                                          \
-    X(OP_FOR_RANGE_BIND,       8,  0)
+    X(OP_FOR_RANGE_BIND,       8,  0)                                          \
+    /* `GET_LOCAL; <int k>; SUB` fused (§3.3) */                               \
+    X(OP_SUB_INT_CONST,        4, +1)                                         \
+    /* `POP; RETURN_NULL` fused (§3.3) */                                     \
+    X(OP_POP_RETURN_NULL,      0, -1)                                          \
+    /* `MATCH_CONST; POP` fused (§3.3) */                                     \
+    X(OP_MATCH_CONST_POP,      5, -1)                                         \
+    /* `SWAP; POP` fused (§3.3) */                                            \
+    X(OP_SWAP_POP,             0, -1)                                         \
+    /* `MATCH_TYPE; POP` / `MATCH_RANGE; POP` / `MATCH_SEQ; POP` fused (§3.3) */\
+    X(OP_MATCH_TYPE_POP,       5, -1)                                         \
+    X(OP_MATCH_RANGE_POP,      9, -1)                                         \
+    X(OP_MATCH_SEQ_POP,        4, -1)                                         \
+    /* `GET_LOCAL; <int k>; MUL` fused (§3.3) */                             \
+    X(OP_MUL_INT_CONST,        4, +1)
 
 #define X_NAME(op, operands, effect)     #op,
 #define X_OPERANDS(op, operands, effect) (int8_t)(operands),

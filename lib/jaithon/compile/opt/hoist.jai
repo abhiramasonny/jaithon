@@ -247,14 +247,13 @@ fn _preheader(header: Instr, plan: HoistPlan) -> list[Instr] {
         )
         run.push(
             Instr(
-                opcode(Op.SetLocal),
+                opcode(Op.Bind),
                 u16_bytes(plan.slots[which]),
                 0,
                 header.span_start,
                 header.span_end
             )
         )
-        run.push(Instr(opcode(Op.Pop), [], 0, header.span_start, header.span_end))
     }
     return run
 }

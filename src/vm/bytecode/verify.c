@@ -38,12 +38,16 @@ int jaiOpBranchOperandAt(uint8_t op) {
     case OP_JUMP_IF_CMP_LOCAL_K:
         return 6;   /* after the u8 comparison, the u16 slot and the u24 K */
     case OP_MATCH_SEQ:
+    case OP_MATCH_SEQ_POP:
         return 2;
     case OP_MATCH_CONST:
+    case OP_MATCH_CONST_POP:
     case OP_MATCH_TYPE:
+    case OP_MATCH_TYPE_POP:
     case OP_MATCH_FIELDS:
         return 3;
     case OP_MATCH_RANGE:
+    case OP_MATCH_RANGE_POP:
         return 7;
     default:
         return -1;
@@ -65,6 +69,7 @@ bool jaiOpFallsThrough(uint8_t op) {
     case OP_LOOP:
     case OP_RETURN:
     case OP_RETURN_NULL:
+    case OP_POP_RETURN_NULL:
     case OP_THROW:
     case OP_RERAISE:
     case OP_HALT:
@@ -84,9 +89,14 @@ static int slotOperands(uint8_t op, int *out) {
     case OP_BIND:
     case OP_CLOSE_UPVALUE:
     case OP_ADD_INT_CONST:
+    case OP_SUB_INT_CONST:
     case OP_INC_LOCAL:
     case OP_CMP_LOCAL_CONST_LT:
     case OP_GET_FIELD_LOCAL:
+    case OP_ADD_BIND:
+    case OP_SUB_BIND:
+    case OP_MUL_BIND:
+    case OP_MUL_INT_CONST:
         out[0] = 0;
         return 1;
     case OP_FOR_ITER_BIND:
