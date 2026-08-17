@@ -52,9 +52,6 @@ fn test_backward_accumulates_gradients_through_a_hand_built_diamond_graph() -> v
     let a = jt.Tensor([2], [3.0, 4.0], requires_grad: true)
     let left = jt.Tensor([2])
     let right = jt.Tensor([2])
-    # backward() requires a scalar (size-one) root. out's own value is never
-    # read below -- only its .creator and .grad matter -- so [1] is just a
-    # placeholder shape that satisfies that requirement.
     let out = jt.Tensor([1])
     left.creator = GradNode([a], |upstream| [jt.Tensor([2], upstream.download())])
     right.creator = GradNode([a], |upstream| [jt.Tensor([2], upstream.download())])
@@ -80,8 +77,6 @@ fn test_backward_seeds_the_root_gradient_when_the_caller_never_sets_it() -> void
     if not jt.is_available() { return }
     let x = jt.Tensor([1], [5.0], requires_grad: true)
     let out = jt.Tensor([1])
-    # out.grad is deliberately left unset -- backward() must seed it to
-    # ones(out.shape) itself rather than silently walking a null upstream.
     out.creator = GradNode([x], |upstream| [jt.Tensor([1], upstream.download())])
     let intermediates = out.backward()
     let grad = x.grad

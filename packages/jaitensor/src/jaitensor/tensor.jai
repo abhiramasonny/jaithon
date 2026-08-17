@@ -32,8 +32,8 @@ pub class Tensor {
     pub var grad: Tensor?
     #: The op that produced this tensor, or `null` for a leaf.
     pub var creator: GradNode?
-    # `pub` only so the top-level graph-walk helpers below can reach it from
-    # outside the class; not meaningful outside `backward()`'s traversal.
+    #: Whether `backward()`'s topological walk has already visited this tensor.
+    #: `pub` only so the free function `visit_for_backward` can reach it.
     pub var topo_mark: bool
 
     #: Allocate a tensor, optionally initialized from host values.
