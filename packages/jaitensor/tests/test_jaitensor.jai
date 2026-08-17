@@ -563,6 +563,39 @@ fn test_dense_forward_matches_a_hand_computed_affine_plus_relu() -> void {
     layer.free()
 }
 
+fn test_a_tiny_sequential_models_loss_decreases_over_training_steps() -> void {
+    if not jt.is_available() { return }
+    let features = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+    let labels = [0, 1, 1, 0]
+    let data = jt.Dataset.from_flat(features, labels, 2)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(8, activation: jt.Activation.Tanh),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(jt.Adam(learning_rate: 0.05), loss: jt.SparseCategoricalCrossentropy())
+    let history = model.fit(data, epochs: 30, batch_size: 4, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_fit_leaves_no_leftover_gradient_on_any_parameter_between_batches() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data()
+    defer { data.free() }
+    let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.1))
+    model.fit(data, epochs: 2, batch_size: 64, verbose: false, plot_path: null)
+    for layer in model.layers {
+        for parameter in layer.parameters() {
+            assert_true(parameter.grad is null)
+        }
+    }
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()
