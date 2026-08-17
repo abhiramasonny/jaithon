@@ -12,16 +12,22 @@ from .tensor import Tensor
 #: downcasts to a concrete type — so a future layer kind (Conv2d, etc.)
 #: plugs in by implementing this trait, nothing in `model.jai` changes.
 pub trait Layer {
+    #: Turn one batch's input into this layer's output.
     fn forward(self, x: Tensor) -> Tensor
 
+    #: This layer's trainable tensors, in a stable order.
     fn parameters(self) -> list[Tensor]
 
+    #: Allocate this layer's parameters for a known input width.
     fn build(self, input_units: int, rng: Random) -> void
 
+    #: Width of this layer's output.
     fn output_width(self) -> int
 
+    #: Release this layer's parameters.
     fn free(self) -> void
 
+    #: Whether `Sequential.predict` should apply softmax after this layer.
     fn wants_softmax_output(self) -> bool { return false }
 }
 

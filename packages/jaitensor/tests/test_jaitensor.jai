@@ -659,6 +659,19 @@ fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     assert_eq(model.predict_classes(data.features).len(), 128)
 }
 
+fn test_predict_returns_a_detached_tensor_with_no_creator() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data()
+    defer { data.free() }
+    let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
+    defer { model.free() }
+    model.compile(jt.SGD())
+    let probabilities = model.predict(data.features)
+    defer { probabilities.free() }
+    assert_true(not probabilities.requires_grad)
+    assert_true(probabilities.creator is null)
+}
+
 fn test_adam_trains_sigmoid_and_tanh_layers() -> void {
     if not jt.is_available() { return }
     let data = separable_data()
