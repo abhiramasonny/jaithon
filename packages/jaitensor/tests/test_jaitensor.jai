@@ -172,6 +172,28 @@ fn test_matrix_activation_and_classification_operations() -> void {
     assert_eq(hot.download(), [0.0, 0.0, 1.0])
 }
 
+fn test_add_broadcasts_a_trailing_suffix_shape() -> void {
+    if not jt.is_available() { return }
+    let batched = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let bias = jt.Tensor([3], [10.0, 20.0, 30.0])
+    let result = jt.add(batched, bias)
+    assert_eq(result.download(), [11.0, 22.0, 33.0, 14.0, 25.0, 36.0])
+    batched.free()
+    bias.free()
+    result.free()
+}
+
+fn test_add_rejects_a_shape_that_is_not_a_trailing_suffix() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([2, 3], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    let b = jt.Tensor([4], [0.0, 0.0, 0.0, 0.0])
+    var raised = false
+    try { jt.add(a, b) } catch e: ValueError { raised = true }
+    assert raised
+    a.free()
+    b.free()
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()

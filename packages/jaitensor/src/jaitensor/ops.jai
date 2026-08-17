@@ -112,27 +112,68 @@ kernel void one_hot_rows(device const float* indices [[buffer(0)]],
     uint column = id % depth;
     output[id] = int(indices[row]) == int(column) ? 1.0f : 0.0f;
 }
+
+kernel void broadcast_add(device const float* a [[buffer(0)]],
+                          device const float* b [[buffer(1)]],
+                          device float* output [[buffer(2)]],
+                          constant uint& inner [[buffer(3)]],
+                          constant uint& total [[buffer(4)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= total) return;
+    output[id] = a[id] + b[id % inner];
+}
 """
+
+var _kernel_cache: dict[str, Kernel] = {}
+
+fn cached_kernel(source: str, entry: str) -> Kernel {
+    let key = entry + "\n" + source
+    let existing = _kernel_cache.get(key, null)
+    if existing is not null { return existing }
+    let kernel = Kernel.compile(source, entry)
+    _kernel_cache[key] = kernel
+    return kernel
+}
 
 fn binary(a: Tensor, b: Tensor, operation: int) -> Tensor {
     if not a.same_shape(b) { throw ValueError(f"tensor shapes differ: {a.shape} and {b.shape}") }
     let output = Tensor(a.shape)
-    let kernel = Kernel.compile(SOURCE, "binary_op")
-    defer { kernel.free() }
-    kernel.dispatch([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size, operation])
+    let kernel = cached_kernel(SOURCE, "binary_op")
+    kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size, operation])
     return output
 }
 
 fn unary(input: Tensor, operation: int) -> Tensor {
     let output = Tensor(input.shape)
-    let kernel = Kernel.compile(SOURCE, "unary_op")
-    defer { kernel.free() }
-    kernel.dispatch([input.buffer(), output.buffer()], input.size, [input.size, operation])
+    let kernel = cached_kernel(SOURCE, "unary_op")
+    kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [input.size, operation])
     return output
 }
 
-#: Elementwise sum of equal-shaped tensors.
-pub fn add(a: Tensor, b: Tensor) -> Tensor { return binary(a, b, 0) }
+fn is_trailing_suffix(small: list[int], large: list[int]) -> bool {
+    if small.len() > large.len() { return false }
+    let offset = large.len() - small.len()
+    for index in 0..small.len() {
+        if small[index] != large[offset + index] { return false }
+    }
+    return true
+}
+
+fn broadcast_add(a: Tensor, b: Tensor) -> Tensor {
+    let output = Tensor(a.shape)
+    let kernel = cached_kernel(SOURCE, "broadcast_add")
+    kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [b.size, a.size])
+    return output
+}
+
+#: Elementwise sum of equal-shaped tensors, or of `a` with a `b` whose shape
+#: is a trailing suffix of `a`'s (for example `[units]` against `[batch,
+#: units]`).
+pub fn add(a: Tensor, b: Tensor) -> Tensor {
+    if a.same_shape(b) { return binary(a, b, 0) }
+    if is_trailing_suffix(b.shape, a.shape) { return broadcast_add(a, b) }
+    throw ValueError(f"cannot broadcast {b.shape} against {a.shape}")
+}
 
 #: Elementwise difference of equal-shaped tensors.
 pub fn subtract(a: Tensor, b: Tensor) -> Tensor { return binary(a, b, 1) }
@@ -147,10 +188,9 @@ pub fn divide(a: Tensor, b: Tensor) -> Tensor { return binary(a, b, 3) }
 pub fn scale(input: Tensor, value: float) -> Tensor {
     let output = Tensor(input.shape)
     let scalar = gpu.Buffer.of([value])
-    let kernel = Kernel.compile(SOURCE, "scalar_mul")
+    let kernel = cached_kernel(SOURCE, "scalar_mul")
     defer { scalar.free() }
-    defer { kernel.free() }
-    kernel.dispatch([input.buffer(), scalar, output.buffer()], input.size, [input.size])
+    kernel.dispatch_async([input.buffer(), scalar, output.buffer()], input.size, [input.size])
     return output
 }
 
@@ -160,9 +200,8 @@ pub fn reshape(input: Tensor, shape: list[int]) -> Tensor {
         throw ValueError(f"cannot reshape {input.shape} into {shape}")
     }
     let output = Tensor(shape)
-    let kernel = Kernel.compile(SOURCE, "unary_op")
-    defer { kernel.free() }
-    kernel.dispatch([input.buffer(), output.buffer()], input.size, [input.size, 0])
+    let kernel = cached_kernel(SOURCE, "unary_op")
+    kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [input.size, 0])
     return output
 }
 
@@ -178,9 +217,8 @@ pub fn matmul(a: Tensor, b: Tensor) -> Tensor {
     let inner = a.shape[1]
     let columns = b.shape[1]
     let output = Tensor([rows, columns])
-    let kernel = Kernel.compile(SOURCE, "matrix_mul")
-    defer { kernel.free() }
-    kernel.dispatch(
+    let kernel = cached_kernel(SOURCE, "matrix_mul")
+    kernel.dispatch_async(
         [a.buffer(), b.buffer(), output.buffer()],
         rows * columns,
         [rows, inner, columns]
@@ -194,9 +232,8 @@ pub fn transpose(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor([columns, rows])
-    let kernel = Kernel.compile(SOURCE, "matrix_transpose")
-    defer { kernel.free() }
-    kernel.dispatch([input.buffer(), output.buffer()], input.size, [rows, columns])
+    let kernel = cached_kernel(SOURCE, "matrix_transpose")
+    kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [rows, columns])
     return output
 }
 
@@ -221,9 +258,8 @@ pub fn softmax(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor(input.shape)
-    let kernel = Kernel.compile(SOURCE, "row_softmax")
-    defer { kernel.free() }
-    kernel.dispatch([input.buffer(), output.buffer()], rows, [rows, columns])
+    let kernel = cached_kernel(SOURCE, "row_softmax")
+    kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
     return output
 }
 
@@ -236,9 +272,8 @@ pub fn argmax(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor([rows])
-    let kernel = Kernel.compile(SOURCE, "row_argmax")
-    defer { kernel.free() }
-    kernel.dispatch([input.buffer(), output.buffer()], rows, [rows, columns])
+    let kernel = cached_kernel(SOURCE, "row_argmax")
+    kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
     return output
 }
 
@@ -248,8 +283,7 @@ pub fn one_hot(indices: Tensor, depth: int) -> Tensor {
     if depth <= 0 { throw ValueError(f"depth must be positive, got {depth}") }
     let rows = indices.shape[0]
     let output = Tensor([rows, depth])
-    let kernel = Kernel.compile(SOURCE, "one_hot_rows")
-    defer { kernel.free() }
-    kernel.dispatch([indices.buffer(), output.buffer()], rows * depth, [rows, depth])
+    let kernel = cached_kernel(SOURCE, "one_hot_rows")
+    kernel.dispatch_async([indices.buffer(), output.buffer()], rows * depth, [rows, depth])
     return output
 }
