@@ -756,7 +756,8 @@ fn test_adam_step_moments_persist_and_affect_a_second_step() -> void {
     optimizer.step([parameter])
     let first_moment_next = beta1 * converged_first_moment + (1.0 - beta1) * 3.0
     let second_moment_next = beta2 * converged_second_moment + (1.0 - beta2) * 3.0 * 3.0
-    let expected_value = value_before - 0.001 * first_moment_next / (math.sqrt(second_moment_next) + epsilon)
+    let expected_value = value_before -
+        0.001 * first_moment_next / (math.sqrt(second_moment_next) + epsilon)
     assert math.fabs(parameter.download()[0] - expected_value) < 1e-6
 
     next_grad.free()
