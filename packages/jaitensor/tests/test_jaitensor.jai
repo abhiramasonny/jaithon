@@ -519,6 +519,34 @@ fn test_softmax_backward_with_nonuniform_upstream_matches_numerical_gradients() 
     total.free()
 }
 
+fn test_sparse_categorical_crossentropy_forward_and_backward_match_hand_computation() -> void {
+    if not jt.is_available() { return }
+    let logits = jt.Tensor([2, 2], [1.0, 2.0, 0.5, 0.5], requires_grad: true)
+    let labels = jt.Tensor([2], [1.0, 0.0])
+    let loss_fn = jt.SparseCategoricalCrossentropy(from_logits: true)
+    let loss = loss_fn.forward(logits, labels)
+    let e0 = math.exp(1.0)
+    let e1 = math.exp(2.0)
+    let sample0 = math.log(e0 + e1) - 2.0
+    let sample1 = math.log(math.exp(0.5) + math.exp(0.5)) - 0.5
+    let expected_loss = (sample0 + sample1) / 2.0
+    assert math.fabs(loss.download()[0] - expected_loss) < 1e-4
+    let intermediates = loss.backward()
+    let grad = logits.grad
+    if grad is null { throw AssertionError("expected logits.grad to be set after backward()") }
+    let p0 = e0 / (e0 + e1)
+    let p1 = e1 / (e0 + e1)
+    let expected_grad = [p0 / 2.0, (p1 - 1.0) / 2.0, -0.5 / 2.0, 0.5 / 2.0]
+    let analytic = grad.download()
+    for index in 0..4 {
+        assert math.fabs(analytic[index] - expected_grad[index]) < 1e-4
+    }
+    for tensor in intermediates { tensor.free() }
+    logits.free()
+    labels.free()
+    loss.free()
+}
+
 fn test_dense_forward_matches_a_hand_computed_affine_plus_relu() -> void {
     if not jt.is_available() { return }
     let layer = jt.Dense(2, activation: jt.Activation.Relu)
