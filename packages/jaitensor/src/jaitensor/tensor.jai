@@ -23,13 +23,29 @@ pub class Tensor {
     pub let size: int
     let storage: Buffer
     var freed: bool
+    #: Whether this tensor should accumulate a gradient when `backward()`
+    #: reaches it. Set directly on a leaf, or by `attach_creator` when an op
+    #: records how to differentiate a value built from one.
+    pub var requires_grad: bool
+    #: The gradient accumulated by the most recent `backward()` call, or
+    #: `null` before one has run.
+    pub var grad: Tensor?
+    #: The op that produced this tensor, or `null` for a leaf.
+    pub var creator: GradNode?
+    # `pub` only so the top-level graph-walk helpers below can reach it from
+    # outside the class; not meaningful outside `backward()`'s traversal.
+    pub var topo_mark: bool
 
     #: Allocate a tensor, optionally initialized from host values.
-    pub fn init(self, shape: list[int], values: list[float]? = null) {
+    pub fn init(self, shape: list[int], values: list[float]? = null, requires_grad: bool = false) {
         self.shape = [dimension for dimension in shape]
         self.size = element_count(shape)
         self.storage = gpu.Buffer(self.size)
         self.freed = false
+        self.requires_grad = requires_grad
+        self.grad = null
+        self.creator = null
+        self.topo_mark = false
         if values is not null {
             if values.len() != self.size {
                 self.storage.free()
@@ -113,6 +129,74 @@ pub class Tensor {
         gpu.synchronize()
         self.storage.free()
         self.freed = true
+        let gradient = self.grad
+        if gradient is not null and not gradient.freed {
+            gradient.free()
+            self.grad = null
+        }
+    }
+
+    #: Record how to differentiate this tensor. Every op that builds a
+    #: `GradNode` calls this instead of setting `.creator` directly — it
+    #: sets `requires_grad` too, so the *next* op downstream sees this
+    #: tensor as differentiable and keeps recording instead of the chain
+    #: silently stopping one op after the first.
+    pub fn attach_creator(self, node: GradNode) -> void {
+        self.creator = node
+        self.requires_grad = true
+    }
+
+    #: Compute gradients of every tensor this scalar tensor depends on.
+    #:
+    #: Accumulates into each dependency's `.grad`. Returns every non-leaf,
+    #: non-root tensor the graph built — still valid, not yet freed — so the
+    #: caller can free them after its own next `gpu.synchronize()` instead
+    #: of forcing one here.
+    pub fn backward(self) -> list[Tensor] {
+        if self.size != 1 {
+            throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
+        }
+        let order = self._topo_order()
+        var index = order.len() - 1
+        while index >= 0 {
+            let tensor = order[index]
+            let node = tensor.creator
+            let upstream = tensor.grad
+            if node is not null and upstream is not null {
+                let grads = node.apply(upstream)
+                for (position, input) in node.inputs.enumerate() {
+                    accumulate_grad(input, grads[position])
+                }
+            }
+            index -= 1
+        }
+        return self._collect_intermediates(order)
+    }
+
+    #: Every non-leaf, non-self tensor a forward-only graph built, without
+    #: running backward. For a graph nothing will ever call `.backward()`
+    #: on (evaluation, prediction outside training) — parameters still have
+    #: `requires_grad: true` regardless of training/evaluating, so the graph
+    #: gets built either way, and either way something has to free it.
+    pub fn discard_graph(self) -> list[Tensor] {
+        return self._collect_intermediates(self._topo_order())
+    }
+
+    fn _topo_order(self) -> list[Tensor] {
+        var order: list[Tensor] = []
+        visit_for_backward(self, order)
+        return order
+    }
+
+    fn _collect_intermediates(self, order: list[Tensor]) -> list[Tensor] {
+        var intermediates: list[Tensor] = []
+        for tensor in order {
+            tensor.topo_mark = false
+            if tensor.creator is not null and tensor is not self {
+                intermediates.push(tensor)
+            }
+        }
+        return intermediates
     }
 
     #: Whether `free` has released the device storage.
@@ -125,7 +209,65 @@ pub class Tensor {
     fn __str__(self) -> str { return f"Tensor(shape={self.shape}, device={gpu.device_name()})" }
 }
 
-export { element_count }
+#: One recorded op in the autograd graph.
+#:
+#: `inputs` are the tensors an op consumed; `backward_fn` maps an upstream
+#: gradient to one gradient per input, same order as `inputs`. Never
+#: returns one of its own `inputs` by reference — always a fresh tensor.
+pub class GradNode {
+    pub let inputs: list[Tensor]
+    let backward_fn: fn(Tensor) -> list[Tensor]
+
+    pub fn init(self, inputs: list[Tensor], backward_fn: fn(Tensor) -> list[Tensor]) {
+        self.inputs = inputs
+        self.backward_fn = backward_fn
+    }
+
+    pub fn apply(self, upstream: Tensor) -> list[Tensor] { return self.backward_fn(upstream) }
+}
+
+let _GRAD_ADD_SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+kernel void grad_add(device const float* a [[buffer(0)]],
+                     device const float* b [[buffer(1)]],
+                     device float* output [[buffer(2)]],
+                     constant uint& count [[buffer(3)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id < count) { output[id] = a[id] + b[id]; }
+}
+"""
+
+fn raw_grad_add(a: Tensor, b: Tensor) -> Tensor {
+    let output = Tensor(a.shape)
+    let kernel = gpu.Kernel.compile(_GRAD_ADD_SOURCE, "grad_add")
+    kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
+    return output
+}
+
+fn visit_for_backward(tensor: Tensor, order: list[Tensor]) -> void {
+    if tensor.topo_mark { return }
+    tensor.topo_mark = true
+    let node = tensor.creator
+    if node is not null {
+        for input in node.inputs { visit_for_backward(input, order) }
+    }
+    order.push(tensor)
+}
+
+fn accumulate_grad(target: Tensor, contribution: Tensor) -> void {
+    let existing = target.grad
+    if existing is null {
+        target.grad = contribution
+    } else {
+        let combined = raw_grad_add(existing, contribution)
+        existing.free()
+        contribution.free()
+        target.grad = combined
+    }
+}
+
+export { element_count, GradNode }
 
 #: Construct a constant GPU tensor from flat row-major values.
 pub fn constant(values: list[float], shape: list[int]) -> Tensor { return Tensor(shape, values) }
