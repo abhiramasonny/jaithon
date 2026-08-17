@@ -356,12 +356,15 @@ pub fn matmul(a: Tensor, b: Tensor) -> Tensor {
     }
     let output = raw_matmul(a, b)
     if a.requires_grad or b.requires_grad {
-        output.attach_creator(
-            GradNode(
-                [a, b],
-                |upstream| [raw_matmul(upstream, raw_transpose(b)), raw_matmul(raw_transpose(a), upstream)]
-            )
-        )
+        output.attach_creator(GradNode([a, b], fn(upstream: Tensor) -> list[Tensor] {
+            let b_transposed = raw_transpose(b)
+            let grad_a = raw_matmul(upstream, b_transposed)
+            b_transposed.free()
+            let a_transposed = raw_transpose(a)
+            let grad_b = raw_matmul(a_transposed, upstream)
+            a_transposed.free()
+            return [grad_a, grad_b]
+        }))
     }
     return output
 }

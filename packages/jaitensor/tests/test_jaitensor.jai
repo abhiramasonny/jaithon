@@ -374,6 +374,25 @@ fn test_matmul_backward_matches_numerical_gradients() -> void {
     total.free()
 }
 
+fn test_matmul_backward_succeeds_across_many_repeated_calls() -> void {
+    if not jt.is_available() { return }
+    for _index in 0..40 {
+        let a = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0], requires_grad: true)
+        let b = jt.Tensor([2, 2], [0.5, -0.5, 1.5, 2.5], requires_grad: true)
+        let product = jt.matmul(a, b)
+        let total = reduce_to_scalar_for_test(product)
+        let intermediates = total.backward()
+        let a_grad = a.grad
+        let b_grad = b.grad
+        if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+        if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+        for tensor in intermediates { tensor.free() }
+        a.free()
+        b.free()
+        total.free()
+    }
+}
+
 fn test_scale_transpose_reshape_backward_match_numerical_gradients() -> void {
     if not jt.is_available() { return }
     fn loss_of(values: list[float]) -> float {
