@@ -5,7 +5,7 @@ from std.io import read_file, write_file
 from std.random import Random
 from std.time import Instant
 from .data import Dataset
-from .layers import Activation, Dense, Layer
+from .layers import Layer
 from .losses import Loss, SparseCategoricalCrossentropy
 from .ops import argmax, softmax
 from .optimizers import Optimizer, SGD
@@ -76,9 +76,13 @@ pub class History {
 
 #: A stack of layers trained by general reverse-mode autodiff.
 #:
-#: Each batch is one fence: forward, loss, backward, and the optimizer step
-#: all queue via `dispatch_async`, then one `gpu.synchronize()` reads back
-#: that batch's loss and frees its intermediates before the next batch.
+#: Forward, loss, backward, and the optimizer step all queue via
+#: `dispatch_async`; one `gpu.synchronize()` per batch reads back that
+#: batch's loss and frees its intermediates before the next batch. Slicing
+#: the dataset and counting correct predictions each add their own small
+#: sync on top of that — not the single fence the phrase "one fence per
+#: batch" suggests on its own, but still a small, bounded number, nowhere
+#: near a fence per op.
 pub class Sequential {
     #: Layers in forward order.
     pub let layers: list[Layer]
@@ -224,18 +228,17 @@ pub class Sequential {
     pub fn set_weights(self, values: list[list[float]]) -> void {
         self._check_live()
         if self.input_units == 0 { throw RuntimeError("build the model before setting weights") }
+        var expected = 0
+        for layer in self.layers { expected += layer.parameters().len() }
+        if values.len() != expected {
+            throw ValueError(f"got {values.len()} weight arrays, expected {expected}")
+        }
         var index = 0
         for layer in self.layers {
             for parameter in layer.parameters() {
-                if index >= values.len() {
-                    throw ValueError(f"got {values.len()} weight arrays, expected more")
-                }
                 parameter.upload(values[index])
                 index += 1
             }
-        }
-        if index != values.len() {
-            throw ValueError(f"got {values.len()} weight arrays, expected {index}")
         }
     }
 
@@ -268,9 +271,9 @@ pub class Sequential {
 
     #: Number of trainable values across every layer's parameters.
     pub fn parameter_count(self) -> int {
+        if self.input_units == 0 { return 0 }
         var count = 0
         for layer in self.layers {
-            if self.input_units == 0 { continue }
             for parameter in layer.parameters() { count += parameter.size }
         }
         return count
