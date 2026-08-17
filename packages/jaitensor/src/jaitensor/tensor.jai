@@ -148,14 +148,18 @@ pub class Tensor {
 
     #: Compute gradients of every tensor this scalar tensor depends on.
     #:
-    #: Accumulates into each dependency's `.grad`. Returns every non-leaf,
-    #: non-root tensor the graph built — still valid, not yet freed — so the
-    #: caller can free them after its own next `gpu.synchronize()` instead
-    #: of forcing one here.
+    #: Seeds `self.grad` to `ones(self.shape)` first if it isn't already
+    #: set, so a plain `loss.backward()` works without the caller manually
+    #: pre-seeding the root gradient. Then accumulates into each
+    #: dependency's `.grad`. Returns every non-leaf, non-root tensor the
+    #: graph built — still valid, not yet freed — so the caller can free
+    #: them after its own next `gpu.synchronize()` instead of forcing one
+    #: here.
     pub fn backward(self) -> list[Tensor] {
         if self.size != 1 {
             throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
         }
+        if self.grad is null { self.grad = Tensor.ones(self.shape) }
         let order = self._topo_order()
         var index = order.len() - 1
         while index >= 0 {
