@@ -57,7 +57,7 @@ fn kernel_for_update() -> Kernel {
 }
 
 fn state_for(parameter: Tensor) -> ParameterState {
-    let key = parameter.buffer().handle_of()
+    let key = parameter.id
     let existing = _states.get(key, null)
     if existing is not null { return existing }
     let state = ParameterState(parameter.size)
@@ -66,7 +66,7 @@ fn state_for(parameter: Tensor) -> ParameterState {
 }
 
 fn next_step(parameter: Tensor) -> int {
-    let key = parameter.buffer().handle_of()
+    let key = parameter.id
     let previous = _steps.get(key, 0)
     let updated = previous + 1
     _steps[key] = updated
