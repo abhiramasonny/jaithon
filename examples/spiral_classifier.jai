@@ -3,13 +3,13 @@
 #: The example generates its own data. It exercises Adam, tanh layers, logits,
 #: validation history, tensor softmax and argmax operations, batched prediction,
 #: weight persistence, and jaiplot. Outputs go under the ignored `data` folder.
+#: Bare-imported (no `jt` alias like mnist_gpu.jai) pending a compiler fix for a bug where mixing an aliased and bare import of one module breaks trait-coercion type-checking at runtime.
 #:
 #:     jaithon run examples/spiral_classifier.jai
 #:     jaithon run examples/spiral_classifier.jai -- 120 data/spiral-demo
-import jaitensor as jt
 import jaiplot
 import std.math
-from jaitensor import Adam, Dataset, History, Sequential, SparseCategoricalCrossentropy
+from jaitensor import Activation, Adam, Dataset, Dense, History, Sequential, SparseCategoricalCrossentropy, argmax, device_name, is_available, softmax
 from jaiplot import Color, Figure, Rect
 from std.io import Path
 from std.random import Random
@@ -38,11 +38,11 @@ fn spiral_rows(
 }
 
 fn classifier() -> Sequential {
-    return jt.Sequential(
+    return Sequential(
         [
-            jt.Dense(64, activation: jt.Activation.Tanh),
-            jt.Dense(64, activation: jt.Activation.Tanh),
-            jt.Dense(CLASSES, activation: jt.Activation.Linear),
+            Dense(64, activation: Activation.Tanh),
+            Dense(64, activation: Activation.Tanh),
+            Dense(CLASSES, activation: Activation.Linear),
         ]
     )
 }
@@ -129,7 +129,7 @@ fn main(args: list[str]) -> int {
     let output = Path(if args.len() > 2 { args[2] } else { "data/spiral-classifier" })
     output.mkdir(parents: true, exist_ok: true)
 
-    if not jt.is_available() { throw RuntimeError("spiral training needs a GPU") }
+    if not is_available() { throw RuntimeError("spiral training needs a GPU") }
     let (train_rows, train_labels) = spiral_rows(300, 0.18, 41)
     let (validation_rows, validation_labels) = spiral_rows(100, 0.22, 92)
     let (test_rows, test_labels) = spiral_rows(100, 0.22, 117)
@@ -140,7 +140,7 @@ fn main(args: list[str]) -> int {
     defer { validation.free() }
     defer { test.free() }
 
-    print(f"GPU: {jt.device_name()}")
+    print(f"GPU: {device_name()}")
     print(f"training on {train.samples} generated spiral points")
     let model = classifier()
     defer { model.free() }
@@ -163,8 +163,8 @@ fn main(args: list[str]) -> int {
     restored.load_weights(weights_path.to_str())
 
     let logits = restored.predict(validation.features)
-    let probabilities = jt.softmax(logits)
-    let predicted = jt.argmax(probabilities)
+    let probabilities = softmax(logits)
+    let predicted = argmax(probabilities)
     defer { logits.free() }
     defer { probabilities.free() }
     defer { predicted.free() }

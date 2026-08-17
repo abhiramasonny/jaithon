@@ -2,7 +2,34 @@
 import std.math
 from std.gpu import Buffer
 from std.random import Random
+from .ops import add, matmul, relu, sigmoid, tanh
 from .tensor import Tensor
+
+#: Something `Sequential` can stack: turns an input tensor into an output
+#: tensor, and reports the tensors it owns that training should update.
+#:
+#: `Sequential` only ever calls trait methods on a `Layer` — never
+#: downcasts to a concrete type — so a future layer kind (Conv2d, etc.)
+#: plugs in by implementing this trait, nothing in `model.jai` changes.
+pub trait Layer {
+    #: Turn one batch's input into this layer's output.
+    fn forward(self, x: Tensor) -> Tensor
+
+    #: This layer's trainable tensors, in a stable order.
+    fn parameters(self) -> list[Tensor]
+
+    #: Allocate this layer's parameters for a known input width.
+    fn build(self, input_units: int, rng: Random) -> void
+
+    #: Width of this layer's output.
+    fn output_width(self) -> int
+
+    #: Release this layer's parameters.
+    fn free(self) -> void
+
+    #: Whether `Sequential.predict` should apply softmax after this layer.
+    fn wants_softmax_output(self) -> bool { return false }
+}
 
 #: Activation applied by a dense layer.
 pub enum Activation {
@@ -19,7 +46,7 @@ pub enum Activation {
 }
 
 #: A fully connected layer, compatible with `Sequential`.
-pub class Dense {
+pub class Dense: Layer {
     #: Number of output units.
     pub let units: int
     #: Function applied after the affine transform.
@@ -52,9 +79,39 @@ pub class Dense {
             3.0 / float(input_units)
         })
         let values = [rng.float_range(-limit, limit) for _index in 0..input_units * self.units]
-        self.weights_value = Tensor([input_units, self.units], values)
+        self.weights_value = Tensor([input_units, self.units], values, requires_grad: true)
         self.bias_value = Tensor.zeros([self.units])
+        self.bias_value.requires_grad = true
     }
+
+    #: Run one batch through this layer's affine transform and activation.
+    pub fn forward(self, x: Tensor) -> Tensor {
+        let weights = self.weights_value
+        let bias = self.bias_value
+        if weights is null or bias is null { throw RuntimeError("Dense layer has not been built") }
+        let affine = add(matmul(x, weights), bias)
+        return match self.activation {
+            Activation.Linear => affine,
+            Activation.Relu => relu(affine),
+            Activation.Sigmoid => sigmoid(affine),
+            Activation.Tanh => tanh(affine),
+            Activation.Softmax => affine,
+        }
+    }
+
+    #: This layer's trainable tensors, in the order `get_weights` reports them.
+    pub fn parameters(self) -> list[Tensor] {
+        let weights = self.weights_value
+        let bias = self.bias_value
+        if weights is null or bias is null { throw RuntimeError("Dense layer has not been built") }
+        return [weights, bias]
+    }
+
+    #: Width of this layer's output — what the next layer's `build` needs.
+    pub fn output_width(self) -> int { return self.units }
+
+    #: Whether `Sequential.predict` should apply softmax after this layer.
+    pub fn wants_softmax_output(self) -> bool { return self.activation == Activation.Softmax }
 
     #: Return the row-major `[input_units, units]` parameter buffer.
     pub fn weights(self) -> Buffer {
