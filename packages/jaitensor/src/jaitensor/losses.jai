@@ -129,20 +129,26 @@ pub class SparseCategoricalCrossentropy: Loss {
         finalize_kernel.dispatch_async([partials.buffer(), mean.buffer()], 1, [groups, batch])
         sample_loss.free()
         partials.free()
+        delta.free()
         if prediction.requires_grad {
             mean.attach_creator(GradNode([prediction], fn(upstream: Tensor) -> list[Tensor] {
-                let grad = Tensor(delta.shape)
+                let recomputed_delta = Tensor([batch, classes])
+                let discarded_loss = Tensor([batch])
+                defer {
+                    discarded_loss.free()
+                }
+                let recompute_kernel = cached("sample_loss_and_delta")
+                recompute_kernel.dispatch_async([prediction.buffer(), target.buffer(), recomputed_delta.buffer(), discarded_loss.buffer()], batch, [batch, classes])
+                let grad = Tensor(recomputed_delta.shape)
                 let scale_kernel = cached("scale_by_upstream")
                 let factor_buffer = gpu.Buffer.of([1.0 / float(batch)])
                 defer {
                     factor_buffer.free()
                 }
-                scale_kernel.dispatch_async([delta.buffer(), grad.buffer(), factor_buffer], delta.size, [delta.size])
-                delta.free()
+                scale_kernel.dispatch_async([recomputed_delta.buffer(), grad.buffer(), factor_buffer], recomputed_delta.size, [recomputed_delta.size])
+                recomputed_delta.free()
                 return [grad]
             }))
-        } else {
-            delta.free()
         }
         return mean
     }
