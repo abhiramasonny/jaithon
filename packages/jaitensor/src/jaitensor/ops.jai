@@ -153,6 +153,23 @@ kernel void reduce_leading(device const float* upstream [[buffer(0)]],
     for (uint row = 0; row < outer; ++row) total += upstream[row * inner + id];
     grad_small[id] = total;
 }
+
+kernel void unary_backward_op(device const float* saved [[buffer(0)]],
+                              device const float* upstream [[buffer(1)]],
+                              device float* grad_input [[buffer(2)]],
+                              constant uint& count [[buffer(3)]],
+                              constant uint& operation [[buffer(4)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float s = saved[id];
+    float u = upstream[id];
+    if (operation == 0) grad_input[id] = u;
+    else if (operation == 1) grad_input[id] = s > 0.0f ? u : 0.0f;
+    else if (operation == 2) grad_input[id] = u * s * (1.0f - s);
+    else if (operation == 3) grad_input[id] = u * (1.0f - s * s);
+    else if (operation == 4) grad_input[id] = u * s;
+    else grad_input[id] = u / s;
+}
 """
 
 var _kernel_cache: dict[str, Kernel] = {}
@@ -344,20 +361,61 @@ pub fn transpose(input: Tensor) -> Tensor {
     return output
 }
 
+fn unary_backward(saved: Tensor, upstream: Tensor, operation: int) -> Tensor {
+    let grad_input = Tensor(saved.shape)
+    let kernel = cached_kernel(SOURCE, "unary_backward_op")
+    kernel.dispatch_async(
+        [saved.buffer(), upstream.buffer(), grad_input.buffer()],
+        saved.size,
+        [saved.size, operation]
+    )
+    return grad_input
+}
+
 #: Elementwise rectified linear activation.
-pub fn relu(input: Tensor) -> Tensor { return unary(input, 1) }
+pub fn relu(input: Tensor) -> Tensor {
+    let output = unary(input, 1)
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [unary_backward(output, upstream, 1)]))
+    }
+    return output
+}
 
 #: Elementwise logistic sigmoid activation.
-pub fn sigmoid(input: Tensor) -> Tensor { return unary(input, 2) }
+pub fn sigmoid(input: Tensor) -> Tensor {
+    let output = unary(input, 2)
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [unary_backward(output, upstream, 2)]))
+    }
+    return output
+}
 
 #: Elementwise hyperbolic tangent activation.
-pub fn tanh(input: Tensor) -> Tensor { return unary(input, 3) }
+pub fn tanh(input: Tensor) -> Tensor {
+    let output = unary(input, 3)
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [unary_backward(output, upstream, 3)]))
+    }
+    return output
+}
 
 #: Elementwise exponential.
-pub fn exp(input: Tensor) -> Tensor { return unary(input, 4) }
+pub fn exp(input: Tensor) -> Tensor {
+    let output = unary(input, 4)
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [unary_backward(output, upstream, 4)]))
+    }
+    return output
+}
 
 #: Elementwise natural logarithm.
-pub fn log(input: Tensor) -> Tensor { return unary(input, 5) }
+pub fn log(input: Tensor) -> Tensor {
+    let output = unary(input, 5)
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [unary_backward(input, upstream, 5)]))
+    }
+    return output
+}
 
 #: Normalize each row of a rank-two tensor into a probability distribution.
 pub fn softmax(input: Tensor) -> Tensor {

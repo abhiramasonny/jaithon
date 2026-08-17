@@ -370,6 +370,51 @@ fn test_scale_transpose_reshape_backward_match_numerical_gradients() -> void {
     total.free()
 }
 
+fn test_relu_sigmoid_tanh_exp_log_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_with(name: str, x: list[float]) -> float {
+        let a = jt.Tensor([3], x)
+        let activated = match name {
+            "relu" => jt.relu(a),
+            "sigmoid" => jt.sigmoid(a),
+            "tanh" => jt.tanh(a),
+            "exp" => jt.exp(a),
+            _ => jt.log(a),
+        }
+        let total = reduce_to_scalar_for_test(activated)
+        let result = total.download()[0]
+        a.free()
+        activated.free()
+        total.free()
+        return result
+    }
+    let names = ["relu", "sigmoid", "tanh", "exp", "log"]
+    let x = [0.6, 1.4, 2.2]
+    for name in names {
+        let a = jt.Tensor([3], x, requires_grad: true)
+        let activated = match name {
+            "relu" => jt.relu(a),
+            "sigmoid" => jt.sigmoid(a),
+            "tanh" => jt.tanh(a),
+            "exp" => jt.exp(a),
+            _ => jt.log(a),
+        }
+        let total = reduce_to_scalar_for_test(activated)
+        let intermediates = total.backward()
+        let grad = a.grad
+        if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+        let analytic = grad.download()
+        for index in 0..3 {
+            fn wrapped(values: list[float]) -> float { return loss_with(name, values) }
+            let expected = numerical_grad(wrapped, x, index)
+            assert math.fabs(analytic[index] - expected) < 1e-2
+        }
+        for tensor in intermediates { tensor.free() }
+        a.free()
+        total.free()
+    }
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()
