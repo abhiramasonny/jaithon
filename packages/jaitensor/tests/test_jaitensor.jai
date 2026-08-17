@@ -615,6 +615,19 @@ fn test_fit_leaves_no_leftover_gradient_on_any_parameter_between_batches() -> vo
     }
 }
 
+fn test_fit_rejects_a_label_outside_the_models_class_count() -> void {
+    if not jt.is_available() { return }
+    let data = jt.Dataset.from_flat([0.0, 0.0, 0.0, 1.0], [0, 5], 2)
+    defer { data.free() }
+    let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
+    defer { model.free() }
+    model.compile(jt.SGD())
+    let _error = assert_throws(ValueError, fn() -> any {
+        model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
+        return null
+    })
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()

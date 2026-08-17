@@ -299,14 +299,28 @@ pub class Sequential {
         self._check_live()
         if epochs <= 0 { throw ValueError(f"epochs must be positive, got {epochs}") }
         if batch_size <= 0 { throw ValueError(f"batch_size must be positive, got {batch_size}") }
-        if self.optimizer_value is null or self.loss_value is null {
+        let loss = self.loss_value
+        if self.optimizer_value is null or loss is null {
             throw RuntimeError("call model.compile() before fit or evaluate")
         }
         self._build(dataset.feature_count)
+        let last = self.layers[self.layers.len() - 1]
+        if loss.is_from_logits() and last.wants_softmax_output() {
+            throw ValueError("from_logits needs a final layer that does not apply softmax itself")
+        }
+        if not loss.is_from_logits() and not last.wants_softmax_output() {
+            throw ValueError("the final layer must apply softmax, or the loss must set from_logits")
+        }
+        for index in 0..self.layers.len() - 1 {
+            if self.layers[index].wants_softmax_output() {
+                throw ValueError("softmax is only supported on the final layer")
+            }
+        }
+        let classes = last.output_width()
         for label in dataset.labels.download() {
             let value = int(label)
-            if label != float(value) or value < 0 {
-                throw ValueError(f"label {label} is not a non-negative integer class")
+            if label != float(value) or value < 0 or value >= classes {
+                throw ValueError(f"label {label} is outside the model's {classes} classes")
             }
         }
     }
