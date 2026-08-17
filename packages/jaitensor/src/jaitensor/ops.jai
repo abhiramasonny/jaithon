@@ -269,8 +269,10 @@ pub fn scale(input: Tensor, value: float) -> Tensor {
     let output = Tensor(input.shape)
     let scalar = gpu.Buffer.of([value])
     let kernel = cached_kernel(SOURCE, "scalar_mul")
-    defer { scalar.free() }
     kernel.dispatch_async([input.buffer(), scalar, output.buffer()], input.size, [input.size])
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [scale(upstream, value)]))
+    }
     return output
 }
 
@@ -282,17 +284,14 @@ pub fn reshape(input: Tensor, shape: list[int]) -> Tensor {
     let output = Tensor(shape)
     let kernel = cached_kernel(SOURCE, "unary_op")
     kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [input.size, 0])
+    if input.requires_grad {
+        let original_shape = input.shape
+        output.attach_creator(GradNode([input], |upstream| [reshape(upstream, original_shape)]))
+    }
     return output
 }
 
-#: Matrix product of two rank-two tensors.
-pub fn matmul(a: Tensor, b: Tensor) -> Tensor {
-    if a.rank() != 2 or b.rank() != 2 {
-        throw ValueError(f"matmul needs rank-two tensors, got {a.shape} and {b.shape}")
-    }
-    if a.shape[1] != b.shape[0] {
-        throw ValueError(f"matmul inner dimensions differ: {a.shape} and {b.shape}")
-    }
+fn raw_matmul(a: Tensor, b: Tensor) -> Tensor {
     let rows = a.shape[0]
     let inner = a.shape[1]
     let columns = b.shape[1]
@@ -306,14 +305,42 @@ pub fn matmul(a: Tensor, b: Tensor) -> Tensor {
     return output
 }
 
-#: Transpose a rank-two tensor.
-pub fn transpose(input: Tensor) -> Tensor {
-    if input.rank() != 2 { throw ValueError(f"transpose needs rank two, got {input.shape}") }
+fn raw_transpose(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor([columns, rows])
     let kernel = cached_kernel(SOURCE, "matrix_transpose")
     kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [rows, columns])
+    return output
+}
+
+#: Matrix product of two rank-two tensors.
+pub fn matmul(a: Tensor, b: Tensor) -> Tensor {
+    if a.rank() != 2 or b.rank() != 2 {
+        throw ValueError(f"matmul needs rank-two tensors, got {a.shape} and {b.shape}")
+    }
+    if a.shape[1] != b.shape[0] {
+        throw ValueError(f"matmul inner dimensions differ: {a.shape} and {b.shape}")
+    }
+    let output = raw_matmul(a, b)
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(
+            GradNode(
+                [a, b],
+                |upstream| [raw_matmul(upstream, raw_transpose(b)), raw_matmul(raw_transpose(a), upstream)]
+            )
+        )
+    }
+    return output
+}
+
+#: Transpose a rank-two tensor.
+pub fn transpose(input: Tensor) -> Tensor {
+    if input.rank() != 2 { throw ValueError(f"transpose needs rank two, got {input.shape}") }
+    let output = raw_transpose(input)
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [raw_transpose(upstream)]))
+    }
     return output
 }
 
