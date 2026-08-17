@@ -35,6 +35,12 @@ pub class Tensor {
     #: Whether `backward()`'s topological walk has already visited this tensor.
     #: `pub` only so the free function `visit_for_backward` can reach it.
     pub var topo_mark: bool
+    #: A process-lifetime-unique identifier assigned from a monotonic
+    #: counter at construction and never reused — stable even after this
+    #: tensor's GPU buffer handle is freed and recycled by a later
+    #: allocation. Used to key state (e.g. per-parameter optimizer state)
+    #: that must not silently attach to an unrelated tensor.
+    pub let id: int
 
     #: Allocate a tensor, optionally initialized from host values.
     pub fn init(self, shape: list[int], values: list[float]? = null, requires_grad: bool = false) {
@@ -46,6 +52,7 @@ pub class Tensor {
         self.grad = null
         self.creator = null
         self.topo_mark = false
+        self.id = next_tensor_id()
         if values is not null {
             if values.len() != self.size {
                 self.storage.free()
@@ -247,6 +254,14 @@ fn raw_grad_add(a: Tensor, b: Tensor) -> Tensor {
     let kernel = gpu.Kernel.compile(_GRAD_ADD_SOURCE, "grad_add")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     return output
+}
+
+var _next_tensor_id: int = 0
+
+fn next_tensor_id() -> int {
+    let id = _next_tensor_id
+    _next_tensor_id += 1
+    return id
 }
 
 fn visit_for_backward(tensor: Tensor, order: list[Tensor]) -> void {

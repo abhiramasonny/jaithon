@@ -723,6 +723,24 @@ fn test_optimizer_step_requires_every_parameter_to_have_a_gradient() -> void {
     parameter.free()
 }
 
+fn test_optimizer_step_state_does_not_leak_to_a_new_parameter_reusing_a_freed_handle() -> void {
+    if not jt.is_available() { return }
+    let optimizer = jt.SGD(learning_rate: 0.1, momentum: 0.9)
+
+    let stale_parameter = jt.Tensor([1], [5.0], requires_grad: true)
+    stale_parameter.grad = jt.Tensor([1], [2.0])
+    optimizer.step([stale_parameter])
+    stale_parameter.free()
+
+    let fresh_parameter = jt.Tensor([1], [1.0], requires_grad: true)
+    fresh_parameter.grad = jt.Tensor([1], [0.5])
+    optimizer.step([fresh_parameter])
+    let expected = 1.0 - 0.1 * 0.5
+    assert math.fabs(fresh_parameter.download()[0] - expected) < 1e-5
+
+    fresh_parameter.free()
+}
+
 fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _rate = assert_throws(ValueError, || jt.SGD(learning_rate: 0.0))
     let _momentum = assert_throws(ValueError, || jt.SGD(momentum: 1.0))
