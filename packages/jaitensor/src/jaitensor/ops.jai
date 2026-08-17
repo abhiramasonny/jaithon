@@ -170,6 +170,20 @@ kernel void unary_backward_op(device const float* saved [[buffer(0)]],
     else if (operation == 4) grad_input[id] = u * s;
     else grad_input[id] = u / s;
 }
+
+kernel void softmax_backward(device const float* output [[buffer(0)]],
+                             device const float* upstream [[buffer(1)]],
+                             device float* grad_input [[buffer(2)]],
+                             constant uint& rows [[buffer(3)]],
+                             constant uint& columns [[buffer(4)]],
+                             uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    uint base = row * columns;
+    float dot = 0.0f;
+    for (uint column = 0; column < columns; ++column) dot += upstream[base + column] * output[base + column];
+    for (uint column = 0; column < columns; ++column)
+        grad_input[base + column] = output[base + column] * (upstream[base + column] - dot);
+}
 """
 
 var _kernel_cache: dict[str, Kernel] = {}
@@ -425,6 +439,14 @@ pub fn softmax(input: Tensor) -> Tensor {
     let output = Tensor(input.shape)
     let kernel = cached_kernel(SOURCE, "row_softmax")
     kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            let grad_input = Tensor(input.shape)
+            let backward_kernel = cached_kernel(SOURCE, "softmax_backward")
+            backward_kernel.dispatch_async([output.buffer(), upstream.buffer(), grad_input.buffer()], rows, [rows, columns])
+            return [grad_input]
+        }))
+    }
     return output
 }
 

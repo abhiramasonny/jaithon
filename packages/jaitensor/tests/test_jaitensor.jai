@@ -415,6 +415,71 @@ fn test_relu_sigmoid_tanh_exp_log_backward_match_numerical_gradients() -> void {
     }
 }
 
+fn test_softmax_backward_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([1, 3], values)
+        let activated = jt.softmax(a)
+        let total = reduce_to_scalar_for_test(activated)
+        let result = total.download()[0]
+        a.free()
+        activated.free()
+        total.free()
+        return result
+    }
+    let x = [0.2, 1.5, -0.7]
+    let a = jt.Tensor([1, 3], x, requires_grad: true)
+    let activated = jt.softmax(a)
+    let total = reduce_to_scalar_for_test(activated)
+    let intermediates = total.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    let analytic = grad.download()
+    for index in 0..3 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    total.free()
+}
+
+fn test_softmax_backward_with_nonuniform_upstream_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([1, 3], values)
+        let activated = jt.softmax(a)
+        let weights = jt.Tensor([1, 3], [1.0, 2.0, 3.0])
+        let weighted = jt.multiply(activated, weights)
+        let total = reduce_to_scalar_for_test(weighted)
+        let result = total.download()[0]
+        a.free()
+        activated.free()
+        weights.free()
+        weighted.free()
+        total.free()
+        return result
+    }
+    let x = [0.2, 1.5, -0.7]
+    let a = jt.Tensor([1, 3], x, requires_grad: true)
+    let activated = jt.softmax(a)
+    let weights = jt.Tensor([1, 3], [1.0, 2.0, 3.0])
+    let weighted = jt.multiply(activated, weights)
+    let total = reduce_to_scalar_for_test(weighted)
+    let intermediates = total.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    let analytic = grad.download()
+    for index in 0..3 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    weights.free()
+    total.free()
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()
