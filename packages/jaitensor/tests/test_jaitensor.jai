@@ -260,6 +260,44 @@ fn test_add_and_multiply_backward_match_numerical_gradients() -> void {
     total.free()
 }
 
+fn test_subtract_and_divide_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2], [values[0], values[1]])
+        let b = jt.Tensor([2], [values[2], values[3]])
+        let diff = jt.subtract(a, b)
+        let quotient = jt.divide(diff, a)
+        let total = reduce_to_scalar_for_test(quotient)
+        let result = total.download()[0]
+        a.free()
+        b.free()
+        diff.free()
+        quotient.free()
+        total.free()
+        return result
+    }
+    let x = [2.0, -1.0, 0.5, 3.0]
+    let a = jt.Tensor([2], [x[0], x[1]], requires_grad: true)
+    let b = jt.Tensor([2], [x[2], x[3]], requires_grad: true)
+    let diff = jt.subtract(a, b)
+    let quotient = jt.divide(diff, a)
+    let total = reduce_to_scalar_for_test(quotient)
+    let intermediates = total.backward()
+    let a_grad = a.grad
+    let b_grad = b.grad
+    if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+    let analytic = a_grad.download() + b_grad.download()
+    for index in 0..4 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    b.free()
+    total.free()
+}
+
 fn test_broadcasting_add_backward_matches_numerical_gradients() -> void {
     if not jt.is_available() { return }
     fn loss_of(values: list[float]) -> float {

@@ -299,6 +299,7 @@ pub fn divide(a: Tensor, b: Tensor) -> Tensor {
 pub fn scale(input: Tensor, value: float) -> Tensor {
     let output = Tensor(input.shape)
     let scalar = gpu.Buffer.of([value])
+    defer { scalar.free() }
     let kernel = cached_kernel(SOURCE, "scalar_mul")
     kernel.dispatch_async([input.buffer(), scalar, output.buffer()], input.size, [input.size])
     if input.requires_grad {
