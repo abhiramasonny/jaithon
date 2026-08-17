@@ -1,8 +1,9 @@
 #: GPU tensor operations, generic datasets, optimizers, and model lifecycle.
 import jaitensor as jt
+import std.math
 import std.os
 from jaitensor import Dataset
-from jaitensor.tensor import GradNode
+from jaitensor.tensor import GradNode, Tensor
 from std.io import Path, read_file
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 
@@ -11,6 +12,33 @@ fn assert_values_near(actual: list[float], expected: list[float], tolerance: flo
     for (index, value) in actual.enumerate() {
         assert_near(value, expected[index], tolerance)
     }
+}
+
+fn numerical_grad(
+    f: fn(list[float]) -> float,
+    x: list[float],
+    index: int,
+    eps: float = 1e-3
+) -> float {
+    var plus = [value for value in x]
+    var minus = [value for value in x]
+    plus[index] += eps
+    minus[index] -= eps
+    return (f(plus) - f(minus)) / (2.0 * eps)
+}
+
+fn reduce_to_scalar_for_test(t: Tensor) -> Tensor {
+    let values = t.download()
+    var total = 0.0
+    for value in values { total += value }
+    let scalar = jt.Tensor([1], [total], requires_grad: t.requires_grad)
+    if t.requires_grad {
+        scalar.creator = GradNode([t], fn(upstream: Tensor) -> list[Tensor] {
+            let value = upstream.download()[0]
+            return [jt.Tensor(t.shape, [value for _index in 0..t.size])]
+        })
+    }
+    return scalar
 }
 
 fn separable_data(repeats: int = 32) -> Dataset {
@@ -192,6 +220,84 @@ fn test_add_rejects_a_shape_that_is_not_a_trailing_suffix() -> void {
     assert raised
     a.free()
     b.free()
+}
+
+fn test_add_and_multiply_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2], [values[0], values[1]])
+        let b = jt.Tensor([2], [values[2], values[3]])
+        let sum = jt.add(a, b)
+        let product = jt.multiply(sum, a)
+        let total = reduce_to_scalar_for_test(product)
+        let result = total.download()[0]
+        a.free()
+        b.free()
+        sum.free()
+        product.free()
+        total.free()
+        return result
+    }
+    let x = [2.0, -1.0, 0.5, 3.0]
+    let a = jt.Tensor([2], [x[0], x[1]], requires_grad: true)
+    let b = jt.Tensor([2], [x[2], x[3]], requires_grad: true)
+    let sum = jt.add(a, b)
+    let product = jt.multiply(sum, a)
+    let total = reduce_to_scalar_for_test(product)
+    let intermediates = total.backward()
+    let a_grad = a.grad
+    let b_grad = b.grad
+    if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+    let analytic = a_grad.download() + b_grad.download()
+    for index in 0..4 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    b.free()
+    total.free()
+}
+
+fn test_broadcasting_add_backward_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let batched = jt.Tensor(
+            [2, 3],
+            [values[0], values[1], values[2], values[3], values[4], values[5]]
+        )
+        let bias = jt.Tensor([3], [values[6], values[7], values[8]])
+        let result = jt.add(batched, bias)
+        let total = reduce_to_scalar_for_test(result)
+        let value = total.download()[0]
+        batched.free()
+        bias.free()
+        result.free()
+        total.free()
+        return value
+    }
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.5, -1.0, 2.0]
+    let batched = jt.Tensor([2, 3], [x[0], x[1], x[2], x[3], x[4], x[5]], requires_grad: true)
+    let bias = jt.Tensor([3], [x[6], x[7], x[8]], requires_grad: true)
+    let result = jt.add(batched, bias)
+    let total = reduce_to_scalar_for_test(result)
+    let intermediates = total.backward()
+    let batched_grad = batched.grad
+    let bias_grad = bias.grad
+    if batched_grad is null {
+        throw AssertionError("expected batched.grad to be set after backward()")
+    }
+    if bias_grad is null { throw AssertionError("expected bias.grad to be set after backward()") }
+    let analytic = batched_grad.download() + bias_grad.download()
+    for index in 0..9 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    batched.free()
+    bias.free()
+    total.free()
 }
 
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {

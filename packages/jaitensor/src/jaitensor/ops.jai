@@ -1,7 +1,7 @@
 #: GPU tensor operations that keep their inputs and results on the device.
 import std.gpu as gpu
 from std.gpu import Kernel
-from .tensor import Tensor, element_count
+from .tensor import GradNode, Tensor, element_count
 
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
@@ -122,6 +122,37 @@ kernel void broadcast_add(device const float* a [[buffer(0)]],
     if (id >= total) return;
     output[id] = a[id] + b[id % inner];
 }
+
+kernel void binary_backward_op(device const float* a [[buffer(0)]],
+                               device const float* b [[buffer(1)]],
+                               device const float* upstream [[buffer(2)]],
+                               device float* grad_a [[buffer(3)]],
+                               device float* grad_b [[buffer(4)]],
+                               constant uint& count [[buffer(5)]],
+                               constant uint& operation [[buffer(6)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float u = upstream[id];
+    if (operation == 0) { grad_a[id] = u; grad_b[id] = u; }
+    else if (operation == 1) { grad_a[id] = u; grad_b[id] = -u; }
+    else if (operation == 2) { grad_a[id] = u * b[id]; grad_b[id] = u * a[id]; }
+    else {
+        float bv = b[id];
+        grad_a[id] = u / bv;
+        grad_b[id] = -u * a[id] / (bv * bv);
+    }
+}
+
+kernel void reduce_leading(device const float* upstream [[buffer(0)]],
+                           device float* grad_small [[buffer(1)]],
+                           constant uint& outer [[buffer(2)]],
+                           constant uint& inner [[buffer(3)]],
+                           uint id [[thread_position_in_grid]]) {
+    if (id >= inner) return;
+    float total = 0.0f;
+    for (uint row = 0; row < outer; ++row) total += upstream[row * inner + id];
+    grad_small[id] = total;
+}
 """
 
 var _kernel_cache: dict[str, Kernel] = {}
@@ -166,23 +197,72 @@ fn broadcast_add(a: Tensor, b: Tensor) -> Tensor {
     return output
 }
 
+fn binary_backward(a: Tensor, b: Tensor, upstream: Tensor, operation: int) -> list[Tensor] {
+    let grad_a = Tensor(a.shape)
+    let grad_b = Tensor(b.shape)
+    let kernel = cached_kernel(SOURCE, "binary_backward_op")
+    kernel.dispatch_async(
+        [a.buffer(), b.buffer(), upstream.buffer(), grad_a.buffer(), grad_b.buffer()],
+        a.size,
+        [a.size, operation]
+    )
+    return [grad_a, grad_b]
+}
+
+fn reduce_leading(upstream: Tensor, small_shape: list[int]) -> Tensor {
+    let inner = element_count(small_shape)
+    let outer = upstream.size // inner
+    let output = Tensor(small_shape)
+    let kernel = cached_kernel(SOURCE, "reduce_leading")
+    kernel.dispatch_async([upstream.buffer(), output.buffer()], inner, [outer, inner])
+    return output
+}
+
 #: Elementwise sum of equal-shaped tensors, or of `a` with a `b` whose shape
 #: is a trailing suffix of `a`'s (for example `[units]` against `[batch,
 #: units]`).
 pub fn add(a: Tensor, b: Tensor) -> Tensor {
-    if a.same_shape(b) { return binary(a, b, 0) }
-    if is_trailing_suffix(b.shape, a.shape) { return broadcast_add(a, b) }
-    throw ValueError(f"cannot broadcast {b.shape} against {a.shape}")
+    let broadcasting = not a.same_shape(b)
+    if broadcasting and not is_trailing_suffix(b.shape, a.shape) {
+        throw ValueError(f"cannot broadcast {b.shape} against {a.shape}")
+    }
+    let output = if broadcasting { broadcast_add(a, b) } else { binary(a, b, 0) }
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(GradNode([a, b], |upstream| if broadcasting {
+            [unary(upstream, 0), reduce_leading(upstream, b.shape)]
+        } else {
+            binary_backward(a, b, upstream, 0)
+        }))
+    }
+    return output
 }
 
 #: Elementwise difference of equal-shaped tensors.
-pub fn subtract(a: Tensor, b: Tensor) -> Tensor { return binary(a, b, 1) }
+pub fn subtract(a: Tensor, b: Tensor) -> Tensor {
+    let output = binary(a, b, 1)
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 1)))
+    }
+    return output
+}
 
 #: Elementwise product of equal-shaped tensors.
-pub fn multiply(a: Tensor, b: Tensor) -> Tensor { return binary(a, b, 2) }
+pub fn multiply(a: Tensor, b: Tensor) -> Tensor {
+    let output = binary(a, b, 2)
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 2)))
+    }
+    return output
+}
 
 #: Elementwise quotient of equal-shaped tensors.
-pub fn divide(a: Tensor, b: Tensor) -> Tensor { return binary(a, b, 3) }
+pub fn divide(a: Tensor, b: Tensor) -> Tensor {
+    let output = binary(a, b, 3)
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 3)))
+    }
+    return output
+}
 
 #: Multiply every element by one host scalar.
 pub fn scale(input: Tensor, value: float) -> Tensor {
