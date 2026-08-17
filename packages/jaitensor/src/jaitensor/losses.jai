@@ -9,6 +9,13 @@ pub trait Loss {
     #: Return the scalar loss for this batch, recording a `GradNode` on
     #: `prediction` when it requires a gradient.
     fn forward(self, prediction: Tensor, target: Tensor) -> Tensor
+
+    #: Whether this loss expects the final layer to hand it raw logits
+    #: instead of an already-normalized distribution (e.g. softmax output).
+    #: `Sequential._prepare` checks this against the final layer's
+    #: `wants_softmax_output()` to catch a model/loss mismatch before
+    #: training starts.
+    fn is_from_logits(self) -> bool { return false }
 }
 
 let SOURCE = """#include <metal_stdlib>
@@ -152,4 +159,7 @@ pub class SparseCategoricalCrossentropy: Loss {
         }
         return mean
     }
+
+    #: Whether this loss was configured for raw logits — see `from_logits`.
+    pub fn is_from_logits(self) -> bool { return self.from_logits }
 }
