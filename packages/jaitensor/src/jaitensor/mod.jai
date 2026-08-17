@@ -20,8 +20,8 @@
 #: ```
 import std.gpu as gpu
 from .data import Dataset
-from .layers import Activation, Dense
-from .losses import SparseCategoricalCrossentropy
+from .layers import Activation, Dense, Layer
+from .losses import Loss, SparseCategoricalCrossentropy
 from .model import History, Metrics, Sequential
 from .ops import add, argmax, divide, exp, log, matmul, multiply, one_hot
 from .ops import relu, reshape, scale, sigmoid, softmax, subtract, tanh, transpose
@@ -30,7 +30,7 @@ from .plots import save_history_plot
 from .tensor import Tensor, constant, fill, ones, zeros
 
 export { Tensor, constant, zeros, ones, fill, Dataset }
-export { Activation, Dense, Optimizer, SGD, Adam, SparseCategoricalCrossentropy }
+export { Activation, Dense, Layer, Optimizer, SGD, Adam, Loss, SparseCategoricalCrossentropy }
 export { History, Metrics, Sequential }
 export { save_history_plot }
 export { add, subtract, multiply, divide, scale, reshape, matmul, transpose }
