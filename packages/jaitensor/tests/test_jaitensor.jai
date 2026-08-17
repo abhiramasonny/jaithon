@@ -76,6 +76,22 @@ fn test_backward_accumulates_gradients_through_a_hand_built_diamond_graph() -> v
     out.free()
 }
 
+fn test_backward_seeds_the_root_gradient_when_the_caller_never_sets_it() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([1], [5.0], requires_grad: true)
+    let out = jt.Tensor([1])
+    # out.grad is deliberately left unset -- backward() must seed it to
+    # ones(out.shape) itself rather than silently walking a null upstream.
+    out.creator = GradNode([x], |upstream| [jt.Tensor([1], upstream.download())])
+    let intermediates = out.backward()
+    let grad = x.grad
+    if grad is null { throw AssertionError("expected x.grad to be set after backward()") }
+    assert_eq(grad.download(), [1.0])
+    assert_eq(intermediates.len(), 0)
+    x.free()
+    out.free()
+}
+
 fn test_dataset_constructors_are_format_agnostic() -> void {
     if not jt.is_available() { return }
     let rows = jt.Dataset.from_tensor_slices([[1.0, 2.0], [3.0, 4.0]], [4, 7])
