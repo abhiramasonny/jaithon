@@ -300,6 +300,76 @@ fn test_broadcasting_add_backward_matches_numerical_gradients() -> void {
     total.free()
 }
 
+fn test_matmul_backward_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2, 2], [values[0], values[1], values[2], values[3]])
+        let b = jt.Tensor([2, 2], [values[4], values[5], values[6], values[7]])
+        let product = jt.matmul(a, b)
+        let total = reduce_to_scalar_for_test(product)
+        let result = total.download()[0]
+        a.free()
+        b.free()
+        product.free()
+        total.free()
+        return result
+    }
+    let x = [1.0, 2.0, 3.0, 4.0, 0.5, -0.5, 1.5, 2.5]
+    let a = jt.Tensor([2, 2], [x[0], x[1], x[2], x[3]], requires_grad: true)
+    let b = jt.Tensor([2, 2], [x[4], x[5], x[6], x[7]], requires_grad: true)
+    let product = jt.matmul(a, b)
+    let total = reduce_to_scalar_for_test(product)
+    let intermediates = total.backward()
+    let a_grad = a.grad
+    let b_grad = b.grad
+    if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+    let analytic = a_grad.download() + b_grad.download()
+    for index in 0..8 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    b.free()
+    total.free()
+}
+
+fn test_scale_transpose_reshape_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2, 3], values)
+        let scaled = jt.scale(a, 1.5)
+        let transposed = jt.transpose(scaled)
+        let reshaped = jt.reshape(transposed, [6])
+        let total = reduce_to_scalar_for_test(reshaped)
+        let result = total.download()[0]
+        a.free()
+        scaled.free()
+        transposed.free()
+        reshaped.free()
+        total.free()
+        return result
+    }
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let a = jt.Tensor([2, 3], x, requires_grad: true)
+    let scaled = jt.scale(a, 1.5)
+    let transposed = jt.transpose(scaled)
+    let reshaped = jt.reshape(transposed, [6])
+    let total = reduce_to_scalar_for_test(reshaped)
+    let intermediates = total.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    let analytic = grad.download()
+    for index in 0..6 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    total.free()
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()
