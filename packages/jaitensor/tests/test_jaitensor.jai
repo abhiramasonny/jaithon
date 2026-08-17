@@ -2,6 +2,7 @@
 import jaitensor as jt
 import std.os
 from jaitensor import Dataset
+from jaitensor.tensor import GradNode
 from std.io import Path, read_file
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 
@@ -44,6 +45,35 @@ fn test_tensor_constructors_shape_helpers_and_round_trip() -> void {
     assert_eq(ones.download(), [1.0, 1.0, 1.0])
     assert_eq(full.download(), [2.5, 2.5])
     let _error = assert_throws(IndexError, || tensor.dim(2))
+}
+
+fn test_backward_accumulates_gradients_through_a_hand_built_diamond_graph() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([2], [3.0, 4.0], requires_grad: true)
+    let left = jt.Tensor([2])
+    let right = jt.Tensor([2])
+    # backward() requires a scalar (size-one) root. out's own value is never
+    # read below -- only its .creator and .grad matter -- so [1] is just a
+    # placeholder shape that satisfies that requirement.
+    let out = jt.Tensor([1])
+    left.creator = GradNode([a], |upstream| [jt.Tensor([2], upstream.download())])
+    right.creator = GradNode([a], |upstream| [jt.Tensor([2], upstream.download())])
+    out.creator = GradNode(
+        [left, right],
+        |upstream| [jt.Tensor([2], upstream.download()), jt.Tensor([2], upstream.download())]
+    )
+    out.grad = jt.Tensor.ones([2])
+    let intermediates = out.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    assert_eq(grad.download(), [2.0, 2.0])
+    assert_eq(intermediates.len(), 2)
+    for tensor in intermediates {
+        assert not tensor.is_freed()
+        tensor.free()
+    }
+    a.free()
+    out.free()
 }
 
 fn test_dataset_constructors_are_format_agnostic() -> void {
