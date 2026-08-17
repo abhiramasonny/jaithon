@@ -8,7 +8,7 @@ from .data import Dataset
 from .layers import Layer
 from .losses import Loss, SparseCategoricalCrossentropy
 from .ops import argmax, softmax
-from .optimizers import Optimizer, SGD
+from .optimizers import Optimizer, SGD, reset_state
 from .plots import save_history_plot
 from .tensor import Tensor
 
@@ -76,13 +76,14 @@ pub class History {
 
 #: A stack of layers trained by general reverse-mode autodiff.
 #:
-#: Forward, loss, backward, and the optimizer step all queue via
-#: `dispatch_async`; one `gpu.synchronize()` per batch reads back that
-#: batch's loss and frees its intermediates before the next batch. Slicing
-#: the dataset and counting correct predictions each add their own small
-#: sync on top of that — not the single fence the phrase "one fence per
-#: batch" suggests on its own, but still a small, bounded number, nowhere
-#: near a fence per op.
+#: Forward, loss, and the optimizer step queue via `dispatch_async`, but
+#: this is not one fence per batch in practice: `Tensor.free()`
+#: synchronizes before releasing device memory, and a batch frees many
+#: tensors — dataset slicing, loss/gradient scratch, matmul's
+#: backward-closure transposes, the zeroed gradients — so a real batch
+#: drives on the order of one fence per op, not a handful. Correctness
+#: never depends on fence count; this is a known, unresolved performance
+#: cost, not a defect in what gets computed.
 pub class Sequential {
     #: Layers in forward order.
     pub let layers: list[Layer]
@@ -102,6 +103,12 @@ pub class Sequential {
     }
 
     #: Configure the optimizer and loss used by `fit`/`evaluate`.
+    #:
+    #: Recompiling a model that has already been built resets that
+    #: optimizer's per-parameter state (momentum, second moment, step
+    #: count) — otherwise a later `compile()` with a different optimizer
+    #: would silently reinterpret the previous optimizer's state as its
+    #: own.
     pub fn compile(
         self,
         optimizer: Optimizer = SGD(),
@@ -109,6 +116,7 @@ pub class Sequential {
     ) -> void {
         self._check_live()
         if not gpu.is_available() { throw RuntimeError("jaitensor needs a GPU") }
+        if self.input_units != 0 { reset_state(self._parameters()) }
         self.optimizer_value = optimizer
         self.loss_value = loss
     }
@@ -180,10 +188,13 @@ pub class Sequential {
     #: Run a feature matrix through the model and return device predictions.
     #:
     #: Runs `features` through in one pass rather than chunking by
-    #: `batch_size` — see this plan's Task 6 note on why, and on the same
-    #: tradeoff in `_slice_features`/`_slice_labels`. `batch_size` is still
-    #: validated for call-site compatibility with code written against
-    #: today's chunked version.
+    #: `batch_size` — chunking would need a device-side slice view this
+    #: package doesn't have yet, so the whole input is processed at once.
+    #: `batch_size` is still validated for call-site compatibility with
+    #: code written against a chunked version. The returned tensor is
+    #: detached (see `Tensor.detach`): it never carries a live gradient
+    #: graph, since this method already freed that graph's intermediates
+    #: before returning.
     pub fn predict(self, features: Tensor, batch_size: int = 2048) -> Tensor {
         self._check_live()
         if batch_size <= 0 { throw ValueError(f"batch_size must be positive, got {batch_size}") }
@@ -197,6 +208,7 @@ pub class Sequential {
         let intermediates = raw.discard_graph()
         gpu.synchronize()
         for tensor in intermediates { tensor.free() }
+        raw.detach()
         let last = self.layers[self.layers.len() - 1]
         if not last.wants_softmax_output() { return raw }
         let probabilities = softmax(raw)

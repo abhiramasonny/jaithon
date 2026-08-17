@@ -3,6 +3,7 @@
 #: The example generates its own data. It exercises Adam, tanh layers, logits,
 #: validation history, tensor softmax and argmax operations, batched prediction,
 #: weight persistence, and jaiplot. Outputs go under the ignored `data` folder.
+#: Bare-imported (no `jt` alias like mnist_gpu.jai) pending a compiler fix for a bug where mixing an aliased and bare import of one module breaks trait-coercion type-checking at runtime.
 #:
 #:     jaithon run examples/spiral_classifier.jai
 #:     jaithon run examples/spiral_classifier.jai -- 120 data/spiral-demo

@@ -42,11 +42,33 @@ class ParameterState {
         self.first_moment = Buffer.of([0.0 for _index in 0..size])
         self.second_moment = Buffer.of([0.0 for _index in 0..size])
     }
+
+    pub fn free(self) -> void {
+        self.first_moment.free()
+        self.second_moment.free()
+    }
 }
 
 var _states: dict[int, ParameterState] = {}
 var _steps: dict[int, int] = {}
 var _update_kernel: Kernel? = null
+
+#: Clear every given parameter's optimizer state (momentum, second moment,
+#: step count).
+#:
+#: `Sequential.compile` calls this so recompiling an already-built model
+#: with a different optimizer starts clean, instead of silently
+#: reinterpreting the previous optimizer's state as its own — `_states`/
+#: `_steps` are keyed by `Tensor.id`, which doesn't change across a
+#: recompile, so nothing else would ever reset them.
+pub fn reset_state(parameters: list[Tensor]) -> void {
+    for parameter in parameters {
+        let state = _states.get(parameter.id, null)
+        if state is not null { state.free() }
+        _states.remove(parameter.id)
+        _steps.remove(parameter.id)
+    }
+}
 
 fn kernel_for_update() -> Kernel {
     let existing = _update_kernel

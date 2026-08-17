@@ -1,6 +1,6 @@
 #: GPU-resident tensors.
 import std.gpu as gpu
-from std.gpu import Buffer
+from std.gpu import Buffer, Kernel
 
 fn element_count(shape: list[int]) -> int {
     if shape.len() == 0 { throw ValueError("a tensor needs at least one dimension") }
@@ -143,6 +143,17 @@ pub class Tensor {
         }
     }
 
+    #: Return this tensor, no longer part of any autograd graph.
+    #:
+    #: Clears `.creator` and `.requires_grad`, so an op consuming this
+    #: tensor afterward never attaches a graph reaching back through
+    #: intermediates that may already be freed.
+    pub fn detach(self) -> Tensor {
+        self.creator = null
+        self.requires_grad = false
+        return self
+    }
+
     #: Record how to differentiate this tensor. Every op that builds a
     #: `GradNode` calls this instead of setting `.creator` directly — it
     #: sets `requires_grad` too, so the *next* op downstream sees this
@@ -249,9 +260,18 @@ kernel void grad_add(device const float* a [[buffer(0)]],
 }
 """
 
+var _grad_add_kernel: Kernel? = null
+
 fn raw_grad_add(a: Tensor, b: Tensor) -> Tensor {
     let output = Tensor(a.shape)
-    let kernel = gpu.Kernel.compile(_GRAD_ADD_SOURCE, "grad_add")
+    let existing = _grad_add_kernel
+    let kernel = if existing is not null {
+        existing
+    } else {
+        let compiled = Kernel.compile(_GRAD_ADD_SOURCE, "grad_add")
+        _grad_add_kernel = compiled
+        compiled
+    }
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     return output
 }

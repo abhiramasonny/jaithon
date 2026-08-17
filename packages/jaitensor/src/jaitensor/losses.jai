@@ -114,6 +114,9 @@ pub class SparseCategoricalCrossentropy: Loss {
         }
         let batch = prediction.shape[0]
         let classes = prediction.shape[1]
+        if target.size != batch {
+            throw ValueError(f"loss needs {batch} labels, got {target.size}")
+        }
         let delta = Tensor([batch, classes])
         let sample_loss = Tensor([batch])
         let sample_kernel = cached("sample_loss_and_delta")
