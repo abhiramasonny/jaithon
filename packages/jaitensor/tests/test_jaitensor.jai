@@ -5,6 +5,7 @@ import std.os
 from jaitensor import Dataset
 from jaitensor.tensor import GradNode, Tensor
 from std.io import Path, read_file
+from std.random import Random
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
@@ -516,6 +517,22 @@ fn test_softmax_backward_with_nonuniform_upstream_matches_numerical_gradients() 
     a.free()
     weights.free()
     total.free()
+}
+
+fn test_dense_forward_matches_a_hand_computed_affine_plus_relu() -> void {
+    if not jt.is_available() { return }
+    let layer = jt.Dense(2, activation: jt.Activation.Relu)
+    let rng = Random.with_seed(1)
+    layer.build(3, rng)
+    layer.set_weights([1.0, 0.0, 0.0, 1.0, -1.0, 1.0], [0.5, -0.5])
+    let x = jt.Tensor([1, 3], [1.0, 2.0, 3.0])
+    let y = layer.forward(x)
+    assert_eq(y.download(), [0.0, 4.5])
+    let intermediates = y.discard_graph()
+    for tensor in intermediates { tensor.free() }
+    x.free()
+    y.free()
+    layer.free()
 }
 
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
