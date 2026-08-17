@@ -635,6 +635,94 @@ fn test_weights_round_trip_through_memory_and_json() -> void {
     assert_eq(restored.predict_classes(data.features), source.predict_classes(data.features))
 }
 
+fn test_sgd_step_momentum_persists_and_affects_a_second_step() -> void {
+    if not jt.is_available() { return }
+    let start = 2.0
+    let parameter = jt.Tensor([1], [start], requires_grad: true)
+    let optimizer = jt.SGD(learning_rate: 0.1, momentum: 0.5)
+
+    let first_grad = jt.Tensor([1], [1.0])
+    parameter.grad = first_grad
+    optimizer.step([parameter])
+    let value_1 = parameter.download()[0]
+    let velocity_1 = (start - value_1) / 0.1
+
+    first_grad.free()
+    let second_grad = jt.Tensor([1], [2.0])
+    parameter.grad = second_grad
+    optimizer.step([parameter])
+    let velocity_2 = 0.5 * velocity_1 + 2.0
+    let expected_value_2 = value_1 - 0.1 * velocity_2
+    assert math.fabs(parameter.download()[0] - expected_value_2) < 1e-5
+
+    second_grad.free()
+}
+
+fn test_sgd_step_matches_the_textbook_update_on_one_parameter() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([2], [1.0, -1.0], requires_grad: true)
+    parameter.grad = jt.Tensor([2], [0.5, 2.0])
+    let optimizer = jt.SGD(learning_rate: 0.1)
+    optimizer.step([parameter])
+    let updated = parameter.download()
+    assert math.fabs(updated[0] - (1.0 - 0.1 * 0.5)) < 1e-5
+    assert math.fabs(updated[1] - (-1.0 - 0.1 * 2.0)) < 1e-5
+    parameter.free()
+}
+
+fn test_adam_step_moments_persist_and_affect_a_second_step() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [0.0], requires_grad: true)
+    let beta1 = 0.5
+    let beta2 = 0.5
+    let epsilon = 1e-7
+    let optimizer = jt.Adam(learning_rate: 0.001, beta1: beta1, beta2: beta2, epsilon: epsilon)
+
+    let warmup_grad = jt.Tensor([1], [1.0])
+    parameter.grad = warmup_grad
+    for _index in 0..40 { optimizer.step([parameter]) }
+    warmup_grad.free()
+    let value_before = parameter.download()[0]
+    let converged_first_moment = 1.0
+    let converged_second_moment = 1.0
+
+    let next_grad = jt.Tensor([1], [3.0])
+    parameter.grad = next_grad
+    optimizer.step([parameter])
+    let first_moment_next = beta1 * converged_first_moment + (1.0 - beta1) * 3.0
+    let second_moment_next = beta2 * converged_second_moment + (1.0 - beta2) * 3.0 * 3.0
+    let expected_value = value_before - 0.001 * first_moment_next / (math.sqrt(second_moment_next) + epsilon)
+    assert math.fabs(parameter.download()[0] - expected_value) < 1e-6
+
+    next_grad.free()
+}
+
+fn test_adam_step_matches_the_textbook_first_step_update_on_one_parameter() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [0.0], requires_grad: true)
+    parameter.grad = jt.Tensor([1], [1.0])
+    let optimizer = jt.Adam(learning_rate: 0.001, beta1: 0.9, beta2: 0.999, epsilon: 1e-7)
+    optimizer.step([parameter])
+    let first_moment = 0.1
+    let second_moment = 0.001
+    let corrected_first = first_moment / (1.0 - 0.9)
+    let corrected_second = second_moment / (1.0 - 0.999)
+    let expected = 0.0 - 0.001 * corrected_first / (math.sqrt(corrected_second) + 1e-7)
+    assert math.fabs(parameter.download()[0] - expected) < 1e-6
+    parameter.free()
+}
+
+fn test_optimizer_step_requires_every_parameter_to_have_a_gradient() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [1.0], requires_grad: true)
+    let optimizer = jt.SGD()
+    let _error = assert_throws(RuntimeError, fn() -> any {
+        optimizer.step([parameter])
+        return null
+    })
+    parameter.free()
+}
+
 fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _rate = assert_throws(ValueError, || jt.SGD(learning_rate: 0.0))
     let _momentum = assert_throws(ValueError, || jt.SGD(momentum: 1.0))
