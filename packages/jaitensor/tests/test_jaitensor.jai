@@ -1,8 +1,11 @@
 #: GPU tensor operations, generic datasets, optimizers, and model lifecycle.
 import jaitensor as jt
+import std.math
 import std.os
 from jaitensor import Dataset
+from jaitensor.tensor import GradNode, Tensor
 from std.io import Path, read_file
+from std.random import Random
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
@@ -10,6 +13,33 @@ fn assert_values_near(actual: list[float], expected: list[float], tolerance: flo
     for (index, value) in actual.enumerate() {
         assert_near(value, expected[index], tolerance)
     }
+}
+
+fn numerical_grad(
+    f: fn(list[float]) -> float,
+    x: list[float],
+    index: int,
+    eps: float = 1e-3
+) -> float {
+    var plus = [value for value in x]
+    var minus = [value for value in x]
+    plus[index] += eps
+    minus[index] -= eps
+    return (f(plus) - f(minus)) / (2.0 * eps)
+}
+
+fn reduce_to_scalar_for_test(t: Tensor) -> Tensor {
+    let values = t.download()
+    var total = 0.0
+    for value in values { total += value }
+    let scalar = jt.Tensor([1], [total], requires_grad: t.requires_grad)
+    if t.requires_grad {
+        scalar.creator = GradNode([t], fn(upstream: Tensor) -> list[Tensor] {
+            let value = upstream.download()[0]
+            return [jt.Tensor(t.shape, [value for _index in 0..t.size])]
+        })
+    }
+    return scalar
 }
 
 fn separable_data(repeats: int = 32) -> Dataset {
@@ -44,6 +74,46 @@ fn test_tensor_constructors_shape_helpers_and_round_trip() -> void {
     assert_eq(ones.download(), [1.0, 1.0, 1.0])
     assert_eq(full.download(), [2.5, 2.5])
     let _error = assert_throws(IndexError, || tensor.dim(2))
+}
+
+fn test_backward_accumulates_gradients_through_a_hand_built_diamond_graph() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([2], [3.0, 4.0], requires_grad: true)
+    let left = jt.Tensor([2])
+    let right = jt.Tensor([2])
+    let out = jt.Tensor([1])
+    left.creator = GradNode([a], |upstream| [jt.Tensor([2], upstream.download())])
+    right.creator = GradNode([a], |upstream| [jt.Tensor([2], upstream.download())])
+    out.creator = GradNode(
+        [left, right],
+        |upstream| [jt.Tensor([2], upstream.download()), jt.Tensor([2], upstream.download())]
+    )
+    out.grad = jt.Tensor.ones([2])
+    let intermediates = out.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    assert_eq(grad.download(), [2.0, 2.0])
+    assert_eq(intermediates.len(), 2)
+    for tensor in intermediates {
+        assert not tensor.is_freed()
+        tensor.free()
+    }
+    a.free()
+    out.free()
+}
+
+fn test_backward_seeds_the_root_gradient_when_the_caller_never_sets_it() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([1], [5.0], requires_grad: true)
+    let out = jt.Tensor([1])
+    out.creator = GradNode([x], |upstream| [jt.Tensor([1], upstream.download())])
+    let intermediates = out.backward()
+    let grad = x.grad
+    if grad is null { throw AssertionError("expected x.grad to be set after backward()") }
+    assert_eq(grad.download(), [1.0])
+    assert_eq(intermediates.len(), 0)
+    x.free()
+    out.free()
 }
 
 fn test_dataset_constructors_are_format_agnostic() -> void {
@@ -131,6 +201,433 @@ fn test_matrix_activation_and_classification_operations() -> void {
     assert_eq(hot.download(), [0.0, 0.0, 1.0])
 }
 
+fn test_add_broadcasts_a_trailing_suffix_shape() -> void {
+    if not jt.is_available() { return }
+    let batched = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let bias = jt.Tensor([3], [10.0, 20.0, 30.0])
+    let result = jt.add(batched, bias)
+    assert_eq(result.download(), [11.0, 22.0, 33.0, 14.0, 25.0, 36.0])
+    batched.free()
+    bias.free()
+    result.free()
+}
+
+fn test_add_rejects_a_shape_that_is_not_a_trailing_suffix() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([2, 3], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    let b = jt.Tensor([4], [0.0, 0.0, 0.0, 0.0])
+    var raised = false
+    try { jt.add(a, b) } catch e: ValueError { raised = true }
+    assert raised
+    a.free()
+    b.free()
+}
+
+fn test_add_and_multiply_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2], [values[0], values[1]])
+        let b = jt.Tensor([2], [values[2], values[3]])
+        let sum = jt.add(a, b)
+        let product = jt.multiply(sum, a)
+        let total = reduce_to_scalar_for_test(product)
+        let result = total.download()[0]
+        a.free()
+        b.free()
+        sum.free()
+        product.free()
+        total.free()
+        return result
+    }
+    let x = [2.0, -1.0, 0.5, 3.0]
+    let a = jt.Tensor([2], [x[0], x[1]], requires_grad: true)
+    let b = jt.Tensor([2], [x[2], x[3]], requires_grad: true)
+    let sum = jt.add(a, b)
+    let product = jt.multiply(sum, a)
+    let total = reduce_to_scalar_for_test(product)
+    let intermediates = total.backward()
+    let a_grad = a.grad
+    let b_grad = b.grad
+    if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+    let analytic = a_grad.download() + b_grad.download()
+    for index in 0..4 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    b.free()
+    total.free()
+}
+
+fn test_subtract_and_divide_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2], [values[0], values[1]])
+        let b = jt.Tensor([2], [values[2], values[3]])
+        let diff = jt.subtract(a, b)
+        let quotient = jt.divide(diff, a)
+        let total = reduce_to_scalar_for_test(quotient)
+        let result = total.download()[0]
+        a.free()
+        b.free()
+        diff.free()
+        quotient.free()
+        total.free()
+        return result
+    }
+    let x = [2.0, -1.0, 0.5, 3.0]
+    let a = jt.Tensor([2], [x[0], x[1]], requires_grad: true)
+    let b = jt.Tensor([2], [x[2], x[3]], requires_grad: true)
+    let diff = jt.subtract(a, b)
+    let quotient = jt.divide(diff, a)
+    let total = reduce_to_scalar_for_test(quotient)
+    let intermediates = total.backward()
+    let a_grad = a.grad
+    let b_grad = b.grad
+    if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+    let analytic = a_grad.download() + b_grad.download()
+    for index in 0..4 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    b.free()
+    total.free()
+}
+
+fn test_broadcasting_add_backward_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let batched = jt.Tensor(
+            [2, 3],
+            [values[0], values[1], values[2], values[3], values[4], values[5]]
+        )
+        let bias = jt.Tensor([3], [values[6], values[7], values[8]])
+        let result = jt.add(batched, bias)
+        let total = reduce_to_scalar_for_test(result)
+        let value = total.download()[0]
+        batched.free()
+        bias.free()
+        result.free()
+        total.free()
+        return value
+    }
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.5, -1.0, 2.0]
+    let batched = jt.Tensor([2, 3], [x[0], x[1], x[2], x[3], x[4], x[5]], requires_grad: true)
+    let bias = jt.Tensor([3], [x[6], x[7], x[8]], requires_grad: true)
+    let result = jt.add(batched, bias)
+    let total = reduce_to_scalar_for_test(result)
+    let intermediates = total.backward()
+    let batched_grad = batched.grad
+    let bias_grad = bias.grad
+    if batched_grad is null {
+        throw AssertionError("expected batched.grad to be set after backward()")
+    }
+    if bias_grad is null { throw AssertionError("expected bias.grad to be set after backward()") }
+    let analytic = batched_grad.download() + bias_grad.download()
+    for index in 0..9 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    batched.free()
+    bias.free()
+    total.free()
+}
+
+fn test_matmul_backward_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2, 2], [values[0], values[1], values[2], values[3]])
+        let b = jt.Tensor([2, 2], [values[4], values[5], values[6], values[7]])
+        let product = jt.matmul(a, b)
+        let total = reduce_to_scalar_for_test(product)
+        let result = total.download()[0]
+        a.free()
+        b.free()
+        product.free()
+        total.free()
+        return result
+    }
+    let x = [1.0, 2.0, 3.0, 4.0, 0.5, -0.5, 1.5, 2.5]
+    let a = jt.Tensor([2, 2], [x[0], x[1], x[2], x[3]], requires_grad: true)
+    let b = jt.Tensor([2, 2], [x[4], x[5], x[6], x[7]], requires_grad: true)
+    let product = jt.matmul(a, b)
+    let total = reduce_to_scalar_for_test(product)
+    let intermediates = total.backward()
+    let a_grad = a.grad
+    let b_grad = b.grad
+    if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+    let analytic = a_grad.download() + b_grad.download()
+    for index in 0..8 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    b.free()
+    total.free()
+}
+
+fn test_matmul_backward_succeeds_across_many_repeated_calls() -> void {
+    if not jt.is_available() { return }
+    for _index in 0..40 {
+        let a = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0], requires_grad: true)
+        let b = jt.Tensor([2, 2], [0.5, -0.5, 1.5, 2.5], requires_grad: true)
+        let product = jt.matmul(a, b)
+        let total = reduce_to_scalar_for_test(product)
+        let intermediates = total.backward()
+        let a_grad = a.grad
+        let b_grad = b.grad
+        if a_grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+        if b_grad is null { throw AssertionError("expected b.grad to be set after backward()") }
+        for tensor in intermediates { tensor.free() }
+        a.free()
+        b.free()
+        total.free()
+    }
+}
+
+fn test_scale_transpose_reshape_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([2, 3], values)
+        let scaled = jt.scale(a, 1.5)
+        let transposed = jt.transpose(scaled)
+        let reshaped = jt.reshape(transposed, [6])
+        let total = reduce_to_scalar_for_test(reshaped)
+        let result = total.download()[0]
+        a.free()
+        scaled.free()
+        transposed.free()
+        reshaped.free()
+        total.free()
+        return result
+    }
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let a = jt.Tensor([2, 3], x, requires_grad: true)
+    let scaled = jt.scale(a, 1.5)
+    let transposed = jt.transpose(scaled)
+    let reshaped = jt.reshape(transposed, [6])
+    let total = reduce_to_scalar_for_test(reshaped)
+    let intermediates = total.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    let analytic = grad.download()
+    for index in 0..6 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    total.free()
+}
+
+fn test_relu_sigmoid_tanh_exp_log_backward_match_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_with(name: str, x: list[float]) -> float {
+        let a = jt.Tensor([3], x)
+        let activated = match name {
+            "relu" => jt.relu(a),
+            "sigmoid" => jt.sigmoid(a),
+            "tanh" => jt.tanh(a),
+            "exp" => jt.exp(a),
+            _ => jt.log(a),
+        }
+        let total = reduce_to_scalar_for_test(activated)
+        let result = total.download()[0]
+        a.free()
+        activated.free()
+        total.free()
+        return result
+    }
+    let names = ["relu", "sigmoid", "tanh", "exp", "log"]
+    let x = [0.6, 1.4, 2.2]
+    for name in names {
+        let a = jt.Tensor([3], x, requires_grad: true)
+        let activated = match name {
+            "relu" => jt.relu(a),
+            "sigmoid" => jt.sigmoid(a),
+            "tanh" => jt.tanh(a),
+            "exp" => jt.exp(a),
+            _ => jt.log(a),
+        }
+        let total = reduce_to_scalar_for_test(activated)
+        let intermediates = total.backward()
+        let grad = a.grad
+        if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+        let analytic = grad.download()
+        for index in 0..3 {
+            fn wrapped(values: list[float]) -> float { return loss_with(name, values) }
+            let expected = numerical_grad(wrapped, x, index)
+            assert math.fabs(analytic[index] - expected) < 1e-2
+        }
+        for tensor in intermediates { tensor.free() }
+        a.free()
+        total.free()
+    }
+}
+
+fn test_softmax_backward_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([1, 3], values)
+        let activated = jt.softmax(a)
+        let total = reduce_to_scalar_for_test(activated)
+        let result = total.download()[0]
+        a.free()
+        activated.free()
+        total.free()
+        return result
+    }
+    let x = [0.2, 1.5, -0.7]
+    let a = jt.Tensor([1, 3], x, requires_grad: true)
+    let activated = jt.softmax(a)
+    let total = reduce_to_scalar_for_test(activated)
+    let intermediates = total.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    let analytic = grad.download()
+    for index in 0..3 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    total.free()
+}
+
+fn test_softmax_backward_with_nonuniform_upstream_matches_numerical_gradients() -> void {
+    if not jt.is_available() { return }
+    fn loss_of(values: list[float]) -> float {
+        let a = jt.Tensor([1, 3], values)
+        let activated = jt.softmax(a)
+        let weights = jt.Tensor([1, 3], [1.0, 2.0, 3.0])
+        let weighted = jt.multiply(activated, weights)
+        let total = reduce_to_scalar_for_test(weighted)
+        let result = total.download()[0]
+        a.free()
+        activated.free()
+        weights.free()
+        weighted.free()
+        total.free()
+        return result
+    }
+    let x = [0.2, 1.5, -0.7]
+    let a = jt.Tensor([1, 3], x, requires_grad: true)
+    let activated = jt.softmax(a)
+    let weights = jt.Tensor([1, 3], [1.0, 2.0, 3.0])
+    let weighted = jt.multiply(activated, weights)
+    let total = reduce_to_scalar_for_test(weighted)
+    let intermediates = total.backward()
+    let grad = a.grad
+    if grad is null { throw AssertionError("expected a.grad to be set after backward()") }
+    let analytic = grad.download()
+    for index in 0..3 {
+        let expected = numerical_grad(loss_of, x, index)
+        assert math.fabs(analytic[index] - expected) < 1e-2
+    }
+    for tensor in intermediates { tensor.free() }
+    a.free()
+    weights.free()
+    total.free()
+}
+
+fn test_sparse_categorical_crossentropy_forward_and_backward_match_hand_computation() -> void {
+    if not jt.is_available() { return }
+    let logits = jt.Tensor([2, 2], [1.0, 2.0, 0.5, 0.5], requires_grad: true)
+    let labels = jt.Tensor([2], [1.0, 0.0])
+    let loss_fn = jt.SparseCategoricalCrossentropy(from_logits: true)
+    let loss = loss_fn.forward(logits, labels)
+    let e0 = math.exp(1.0)
+    let e1 = math.exp(2.0)
+    let sample0 = math.log(e0 + e1) - 2.0
+    let sample1 = math.log(math.exp(0.5) + math.exp(0.5)) - 0.5
+    let expected_loss = (sample0 + sample1) / 2.0
+    assert math.fabs(loss.download()[0] - expected_loss) < 1e-4
+    let intermediates = loss.backward()
+    let grad = logits.grad
+    if grad is null { throw AssertionError("expected logits.grad to be set after backward()") }
+    let p0 = e0 / (e0 + e1)
+    let p1 = e1 / (e0 + e1)
+    let expected_grad = [p0 / 2.0, (p1 - 1.0) / 2.0, -0.5 / 2.0, 0.5 / 2.0]
+    let analytic = grad.download()
+    for index in 0..4 {
+        assert math.fabs(analytic[index] - expected_grad[index]) < 1e-4
+    }
+    for tensor in intermediates { tensor.free() }
+    logits.free()
+    labels.free()
+    loss.free()
+}
+
+fn test_dense_forward_matches_a_hand_computed_affine_plus_relu() -> void {
+    if not jt.is_available() { return }
+    let layer = jt.Dense(2, activation: jt.Activation.Relu)
+    let rng = Random.with_seed(1)
+    layer.build(3, rng)
+    layer.set_weights([1.0, 0.0, 0.0, 1.0, -1.0, 1.0], [0.5, -0.5])
+    let x = jt.Tensor([1, 3], [1.0, 2.0, 3.0])
+    let y = layer.forward(x)
+    assert_eq(y.download(), [0.0, 4.5])
+    let intermediates = y.discard_graph()
+    for tensor in intermediates { tensor.free() }
+    x.free()
+    y.free()
+    layer.free()
+}
+
+fn test_a_tiny_sequential_models_loss_decreases_over_training_steps() -> void {
+    if not jt.is_available() { return }
+    let features = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+    let labels = [0, 1, 1, 0]
+    let data = jt.Dataset.from_flat(features, labels, 2)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(8, activation: jt.Activation.Tanh),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(jt.Adam(learning_rate: 0.05), loss: jt.SparseCategoricalCrossentropy())
+    let history = model.fit(data, epochs: 30, batch_size: 4, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_fit_leaves_no_leftover_gradient_on_any_parameter_between_batches() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data()
+    defer { data.free() }
+    let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.1))
+    model.fit(data, epochs: 2, batch_size: 64, verbose: false, plot_path: null)
+    for layer in model.layers {
+        for parameter in layer.parameters() {
+            assert_true(parameter.grad is null)
+        }
+    }
+}
+
+fn test_fit_rejects_a_label_outside_the_models_class_count() -> void {
+    if not jt.is_available() { return }
+    let data = jt.Dataset.from_flat([0.0, 0.0, 0.0, 1.0], [0, 5], 2)
+    defer { data.free() }
+    let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
+    defer { model.free() }
+    model.compile(jt.SGD())
+    let _error = assert_throws(ValueError, fn() -> any {
+        model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
+        return null
+    })
+}
+
 fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     if not jt.is_available() { return }
     let data = separable_data()
@@ -160,6 +657,19 @@ fn test_sequential_sgd_predicts_and_reports_validation_metrics() -> void {
     defer { probabilities.free() }
     assert_eq(probabilities.shape, [128, 2])
     assert_eq(model.predict_classes(data.features).len(), 128)
+}
+
+fn test_predict_returns_a_detached_tensor_with_no_creator() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data()
+    defer { data.free() }
+    let model = jt.Sequential([jt.Dense(2, activation: jt.Activation.Softmax)])
+    defer { model.free() }
+    model.compile(jt.SGD())
+    let probabilities = model.predict(data.features)
+    defer { probabilities.free() }
+    assert_true(not probabilities.requires_grad)
+    assert_true(probabilities.creator is null)
 }
 
 fn test_adam_trains_sigmoid_and_tanh_layers() -> void {
@@ -201,6 +711,113 @@ fn test_weights_round_trip_through_memory_and_json() -> void {
     restored.load_weights(path.to_str())
     assert_eq(restored.get_weights(), weights)
     assert_eq(restored.predict_classes(data.features), source.predict_classes(data.features))
+}
+
+fn test_sgd_step_momentum_persists_and_affects_a_second_step() -> void {
+    if not jt.is_available() { return }
+    let start = 2.0
+    let parameter = jt.Tensor([1], [start], requires_grad: true)
+    let optimizer = jt.SGD(learning_rate: 0.1, momentum: 0.5)
+
+    let first_grad = jt.Tensor([1], [1.0])
+    parameter.grad = first_grad
+    optimizer.step([parameter])
+    let value_1 = parameter.download()[0]
+    let velocity_1 = (start - value_1) / 0.1
+
+    first_grad.free()
+    let second_grad = jt.Tensor([1], [2.0])
+    parameter.grad = second_grad
+    optimizer.step([parameter])
+    let velocity_2 = 0.5 * velocity_1 + 2.0
+    let expected_value_2 = value_1 - 0.1 * velocity_2
+    assert math.fabs(parameter.download()[0] - expected_value_2) < 1e-5
+
+    second_grad.free()
+}
+
+fn test_sgd_step_matches_the_textbook_update_on_one_parameter() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([2], [1.0, -1.0], requires_grad: true)
+    parameter.grad = jt.Tensor([2], [0.5, 2.0])
+    let optimizer = jt.SGD(learning_rate: 0.1)
+    optimizer.step([parameter])
+    let updated = parameter.download()
+    assert math.fabs(updated[0] - (1.0 - 0.1 * 0.5)) < 1e-5
+    assert math.fabs(updated[1] - (-1.0 - 0.1 * 2.0)) < 1e-5
+    parameter.free()
+}
+
+fn test_adam_step_moments_persist_and_affect_a_second_step() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [0.0], requires_grad: true)
+    let beta1 = 0.5
+    let beta2 = 0.5
+    let epsilon = 1e-7
+    let optimizer = jt.Adam(learning_rate: 0.001, beta1: beta1, beta2: beta2, epsilon: epsilon)
+
+    let warmup_grad = jt.Tensor([1], [1.0])
+    parameter.grad = warmup_grad
+    for _index in 0..40 { optimizer.step([parameter]) }
+    warmup_grad.free()
+    let value_before = parameter.download()[0]
+    let converged_first_moment = 1.0
+    let converged_second_moment = 1.0
+
+    let next_grad = jt.Tensor([1], [3.0])
+    parameter.grad = next_grad
+    optimizer.step([parameter])
+    let first_moment_next = beta1 * converged_first_moment + (1.0 - beta1) * 3.0
+    let second_moment_next = beta2 * converged_second_moment + (1.0 - beta2) * 3.0 * 3.0
+    let expected_value = value_before -
+        0.001 * first_moment_next / (math.sqrt(second_moment_next) + epsilon)
+    assert math.fabs(parameter.download()[0] - expected_value) < 1e-6
+
+    next_grad.free()
+}
+
+fn test_adam_step_matches_the_textbook_first_step_update_on_one_parameter() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [0.0], requires_grad: true)
+    parameter.grad = jt.Tensor([1], [1.0])
+    let optimizer = jt.Adam(learning_rate: 0.001, beta1: 0.9, beta2: 0.999, epsilon: 1e-7)
+    optimizer.step([parameter])
+    let first_moment = 0.1
+    let second_moment = 0.001
+    let corrected_first = first_moment / (1.0 - 0.9)
+    let corrected_second = second_moment / (1.0 - 0.999)
+    let expected = 0.0 - 0.001 * corrected_first / (math.sqrt(corrected_second) + 1e-7)
+    assert math.fabs(parameter.download()[0] - expected) < 1e-6
+    parameter.free()
+}
+
+fn test_optimizer_step_requires_every_parameter_to_have_a_gradient() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [1.0], requires_grad: true)
+    let optimizer = jt.SGD()
+    let _error = assert_throws(RuntimeError, fn() -> any {
+        optimizer.step([parameter])
+        return null
+    })
+    parameter.free()
+}
+
+fn test_optimizer_step_state_does_not_leak_to_a_new_parameter_reusing_a_freed_handle() -> void {
+    if not jt.is_available() { return }
+    let optimizer = jt.SGD(learning_rate: 0.1, momentum: 0.9)
+
+    let stale_parameter = jt.Tensor([1], [5.0], requires_grad: true)
+    stale_parameter.grad = jt.Tensor([1], [2.0])
+    optimizer.step([stale_parameter])
+    stale_parameter.free()
+
+    let fresh_parameter = jt.Tensor([1], [1.0], requires_grad: true)
+    fresh_parameter.grad = jt.Tensor([1], [0.5])
+    optimizer.step([fresh_parameter])
+    let expected = 1.0 - 0.1 * 0.5
+    assert math.fabs(fresh_parameter.download()[0] - expected) < 1e-5
+
+    fresh_parameter.free()
 }
 
 fn test_optimizer_configuration_rejects_invalid_values() -> void {
