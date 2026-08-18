@@ -152,13 +152,27 @@ pub class Buffer {
 
     #: Allocate `count` float slots on the device, with undefined contents.
     #:
-    #: Raises `RuntimeError` when no device is available.
-    pub fn init(self, count: int) {
+    #: Raises `RuntimeError` when no device is available. Pass `handle` to
+    #: adopt an existing native buffer (used by `view`).
+    pub fn init(self, count: int, handle: int = -1) {
         if count <= 0 { throw ValueError(f"buffer count must be positive, got {count}") }
-        _require_device("allocate a Buffer")
         self.count = count
-        self.handle = __prim__.gpu_buffer_new(count)
         self.freed = false
+        if handle < 0 {
+            _require_device("allocate a Buffer")
+            self.handle = __prim__.gpu_buffer_new(count)
+        } else {
+            self.handle = handle
+        }
+    }
+
+    #: A window into this buffer. Freeing the view does not free the parent.
+    pub fn view(self, offset: int, count: int) -> Buffer {
+        self._check_live()
+        if offset < 0 or count <= 0 or offset + count > self.count {
+            throw ValueError(f"view of {count} values at {offset} exceeds capacity {self.count}")
+        }
+        return Buffer(count, __prim__.gpu_buffer_view(self.handle, offset, count))
     }
 
     #: Allocate a buffer holding `values`.
@@ -296,10 +310,10 @@ pub class Kernel {
 
     #: Queue a kernel without waiting for it to finish.
     #:
-    #: Async dispatches execute in submission order. Call `synchronize` before
-    #: downloading, uploading to, or freeing any buffer used by queued work.
-    #: This is useful for a sequence of dependent kernels such as a neural
-    #: network training step: enqueue the whole step, then pay for one fence.
+    #: Async dispatches execute in submission order. Call `flush` to commit
+    #: queued kernels so the GPU can start, and `synchronize` before
+    #: downloading. In-flight command buffers retain their Metal resources, so
+    #: a buffer may be `free`d after it has been encoded.
     pub fn dispatch_async(
         self,
         buffers: list[Buffer],
@@ -330,6 +344,16 @@ pub class Kernel {
     }
 
     fn __str__(self) -> str { return f"Kernel({self.entry})" }
+}
+
+#: Commit queued async kernels so the GPU can start them, without waiting.
+#:
+#: Returns immediately when no work is queued. A bounded number of command
+#: buffers may stay in flight; this call waits only when that bound is hit,
+#: and only for the oldest already-running buffer.
+pub fn flush() -> void {
+    _require_device("flush")
+    __prim__.gpu_flush()
 }
 
 #: Wait until every asynchronously dispatched kernel has completed.

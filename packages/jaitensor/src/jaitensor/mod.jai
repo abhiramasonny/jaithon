@@ -23,8 +23,8 @@ from .data import Dataset
 from .layers import Activation, Dense, Layer
 from .losses import Loss, SparseCategoricalCrossentropy
 from .model import History, Metrics, Sequential
-from .ops import add, argmax, divide, exp, log, matmul, multiply, one_hot
-from .ops import relu, reshape, scale, sigmoid, softmax, subtract, tanh, transpose
+from .ops import add, add_correct_into, add_scaled_into, argmax, divide, exp, log, matmul, multiply, one_hot
+from .ops import relu, reshape, scale, sigmoid, slice_flat, softmax, subtract, tanh, transpose
 from .optimizers import Adam, Optimizer, SGD
 from .plots import save_history_plot
 from .tensor import Tensor, constant, fill, ones, zeros
@@ -34,7 +34,8 @@ export { Activation, Dense, Layer, Optimizer, SGD, Adam, Loss, SparseCategorical
 export { History, Metrics, Sequential }
 export { save_history_plot }
 export { add, subtract, multiply, divide, scale, reshape, matmul, transpose }
-export { relu, sigmoid, tanh, exp, log, softmax, argmax, one_hot }
+export { relu, sigmoid, tanh, exp, log, softmax, argmax, one_hot, slice_flat }
+export { add_correct_into, add_scaled_into }
 
 #: Whether the machine has a GPU backend that jaitensor can use.
 pub fn is_available() -> bool { return gpu.is_available() }

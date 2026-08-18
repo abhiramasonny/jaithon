@@ -173,6 +173,15 @@ fn test_upload_u8_expands_and_scales_without_a_boxed_host_list() -> void {
     assert_eq(buffer.download(), [0.0, 63.5, 127.5])
 }
 
+fn test_buffer_view_reads_a_window_without_freeing_the_parent() -> void {
+    if not gpu.is_available() { return }
+    let buffer = gpu.Buffer.of([1.0, 2.0, 3.0, 4.0])
+    defer { buffer.free() }
+    let viewed = buffer.view(1, 2)
+    defer { viewed.free() }
+    assert_eq(viewed.download(), [2.0, 3.0])
+}
+
 fn test_async_dispatches_are_ordered_and_synchronize_once() -> void {
     if not gpu.is_available() { return }
     let add_one = gpu.Kernel.compile(ASYNC_SOURCE, "add_one")
@@ -187,4 +196,17 @@ fn test_async_dispatches_are_ordered_and_synchronize_once() -> void {
     twice.dispatch_async([values], 3)
     gpu.synchronize()
     assert_eq(values.download(), [4.0, 6.0, 8.0])
+}
+
+fn test_flush_commits_async_work_before_synchronize() -> void {
+    if not gpu.is_available() { return }
+    let add_one = gpu.Kernel.compile(ASYNC_SOURCE, "add_one")
+    let values = gpu.Buffer.of([1.0, 2.0, 3.0])
+    defer { gpu.synchronize() }
+    defer { add_one.free() }
+    defer { values.free() }
+    add_one.dispatch_async([values], 3)
+    gpu.flush()
+    gpu.synchronize()
+    assert_eq(values.download(), [2.0, 3.0, 4.0])
 }

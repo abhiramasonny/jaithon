@@ -6,9 +6,9 @@ from std.random import Random
 from std.time import Instant
 from .data import Dataset
 from .layers import Layer
-from .losses import Loss, SparseCategoricalCrossentropy
-from .ops import argmax, softmax
-from .optimizers import Optimizer, SGD, reset_state
+from .ops import add_correct_into, argmax, softmax, warmup_kernels as warmup_ops
+from .optimizers import Optimizer, SGD, reset_state, prepare_state, warmup_kernels as warmup_opt
+from .losses import Loss, SparseCategoricalCrossentropy, warmup_kernels as warmup_loss
 from .plots import save_history_plot
 from .tensor import Tensor
 
@@ -76,14 +76,10 @@ pub class History {
 
 #: A stack of layers trained by general reverse-mode autodiff.
 #:
-#: Forward, loss, and the optimizer step queue via `dispatch_async`, but
-#: this is not one fence per batch in practice: `Tensor.free()`
-#: synchronizes before releasing device memory, and a batch frees many
-#: tensors — dataset slicing, loss/gradient scratch, matmul's
-#: backward-closure transposes, the zeroed gradients — so a real batch
-#: drives on the order of one fence per op, not a handful. Correctness
-#: never depends on fence count; this is a known, unresolved performance
-#: cost, not a defect in what gets computed.
+#: Forward, loss, and the optimizer step queue via `dispatch_async`. Each
+#: batch is `gpu.flush()`ed so the GPU can run while the next batch is
+#: encoded. Metrics stay on device until the epoch ends, so a training
+#: epoch pays one fence rather than one per op.
 pub class Sequential {
     #: Layers in forward order.
     pub let layers: list[Layer]
@@ -91,6 +87,7 @@ pub class Sequential {
     var loss_value: Loss?
     var input_units: int
     var freed: bool
+    var cached_parameters: list[Tensor]?
 
     #: Create an uncompiled model from a non-empty layer list.
     pub fn init(self, layers: list[Layer]) {
@@ -100,6 +97,7 @@ pub class Sequential {
         self.loss_value = null
         self.input_units = 0
         self.freed = false
+        self.cached_parameters = null
     }
 
     #: Configure the optimizer and loss used by `fit`/`evaluate`.
@@ -133,6 +131,7 @@ pub class Sequential {
         plot_path: str? = "data/jaitensor-training.svg"
     ) -> History {
         self._prepare(dataset, epochs, batch_size)
+        self._ensure_grads()
         let history = History()
 
         for epoch in 1..=epochs {
@@ -170,6 +169,7 @@ pub class Sequential {
             history.plot(plot_path)
             if verbose { print(f"training plot: {plot_path}") }
         }
+        self._clear_grad()
         return history
     }
 
@@ -307,6 +307,7 @@ pub class Sequential {
         if self.freed { return }
         gpu.synchronize()
         for layer in self.layers { layer.free() }
+        self.cached_parameters = null
         self.freed = true
     }
 
@@ -338,6 +339,13 @@ pub class Sequential {
                 throw ValueError(f"label {label} is outside the model's {classes} classes")
             }
         }
+        warmup_ops()
+        warmup_loss()
+        warmup_opt()
+        let optimizer = self.optimizer_value
+        if optimizer is not null {
+            prepare_state(self._parameters(), optimizer.settings())
+        }
     }
 
     fn _build(self, inputs: int) -> void {
@@ -368,16 +376,20 @@ pub class Sequential {
         let optimizer = self.optimizer_value
         if loss_fn is null or optimizer is null { throw RuntimeError("model is not compiled") }
 
-        var total_loss = 0.0
-        var total_correct = 0.0
+        let total_loss = Tensor.zeros([1])
+        let total_correct = Tensor.zeros([1])
+        defer { total_loss.free() }
+        defer { total_correct.free() }
+        let flush_every = if self.parameter_count() >= 1000000 { 2 } else { 1 }
         var start = 0
+        var batches = 0
         while start < dataset.samples {
             let count = min(batch_size, dataset.samples - start)
             let batch_features = self._slice_features(dataset, start, count)
             let batch_labels = self._slice_labels(dataset, start, count)
 
             let prediction = self._forward(batch_features)
-            let loss = loss_fn.forward(prediction, batch_labels)
+            let loss = loss_fn.forward(prediction, batch_labels, total_loss, count)
             let intermediates = if training {
                 let graph = loss.backward()
                 optimizer.step(self._parameters())
@@ -385,55 +397,60 @@ pub class Sequential {
             } else {
                 loss.discard_graph()
             }
-            gpu.synchronize()
-            total_loss += loss.download()[0] * float(count)
-            total_correct += self._count_correct(prediction, batch_labels)
+            add_correct_into(prediction, batch_labels, total_correct)
 
             loss.free()
             batch_features.free()
             batch_labels.free()
             for tensor in intermediates { tensor.free() }
-            if training { self._zero_grad() }
             start += count
+            batches += 1
+            if batches % flush_every == 0 or start >= dataset.samples { gpu.flush() }
         }
+        let loss_values = total_loss.download()
+        let correct_values = total_correct.download()
         return Metrics(
-            total_loss / float(dataset.samples),
-            100.0 * total_correct / float(dataset.samples)
+            loss_values[0] / float(dataset.samples),
+            100.0 * correct_values[0] / float(dataset.samples)
         )
     }
 
     fn _slice_features(self, dataset: Dataset, start: int, count: int) -> Tensor {
         let width = dataset.feature_count
-        let all_values = dataset.features.download()
-        let slice = all_values[start * width:(start + count) * width]
-        return Tensor([count, width], slice)
+        return dataset.features.view(start * width, [count, width])
     }
 
     fn _slice_labels(self, dataset: Dataset, start: int, count: int) -> Tensor {
-        let all_values = dataset.labels.download()
-        let slice = all_values[start:start + count]
-        return Tensor([count], slice)
-    }
-
-    fn _count_correct(self, prediction: Tensor, labels: Tensor) -> float {
-        let predicted = argmax(prediction)
-        defer { predicted.free() }
-        let predicted_values = predicted.download()
-        let label_values = labels.download()
-        var correct = 0.0
-        for index in 0..predicted_values.len() {
-            if int(predicted_values[index]) == int(label_values[index]) { correct += 1.0 }
-        }
-        return correct
+        return dataset.labels.view(start, [count])
     }
 
     fn _parameters(self) -> list[Tensor] {
+        let cached = self.cached_parameters
+        if cached is not null { return cached }
         var parameters: list[Tensor] = []
         for layer in self.layers { parameters.extend(layer.parameters()) }
+        self.cached_parameters = parameters
         return parameters
     }
 
+    fn _ensure_grads(self) -> void {
+        for parameter in self._parameters() {
+            if parameter.grad is null {
+                let gradient = Tensor(parameter.shape)
+                gradient.zero_()
+                parameter.grad = gradient
+            }
+        }
+    }
+
     fn _zero_grad(self) -> void {
+        for parameter in self._parameters() {
+            let gradient = parameter.grad
+            if gradient is not null { gradient.zero_() }
+        }
+    }
+
+    fn _clear_grad(self) -> void {
         for parameter in self._parameters() {
             let gradient = parameter.grad
             if gradient is not null {

@@ -91,12 +91,14 @@ int           jaiGpuMaxThreadsPerGroup(JaiGpuKernel *k);
  * `groupSize` 0 means the widest group the kernel supports. */
 bool          jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                              const uint32_t *scalars, int scalarCount,
-                             int threads, int groupSize);
+                             int threads, int groupSize, const size_t *byteOffsets);
 /* Queue work without waiting. Commands submitted to the same device execute
  * in order; jaiGpuSynchronize waits for every queued dispatch. */
 bool          jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                                   const uint32_t *scalars, int scalarCount,
-                                  int threads, int groupSize);
+                                  int threads, int groupSize, const size_t *byteOffsets);
+/* Commit queued async work so the GPU can start; does not wait. */
+bool          jaiGpuFlush(void);
 bool          jaiGpuSynchronize(void);
 /* Built-in kernels used by std.gpu when no custom source is supplied. */
 bool jaiGpuVectorAdd(const double *a, const double *b, double *out, size_t n);

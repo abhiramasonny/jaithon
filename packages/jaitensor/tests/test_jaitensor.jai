@@ -212,6 +212,412 @@ fn test_add_broadcasts_a_trailing_suffix_shape() -> void {
     result.free()
 }
 
+fn test_slice_flat_copies_a_device_range() -> void {
+    if not jt.is_available() { return }
+    let source = jt.Tensor([4, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    defer { source.free() }
+    let sliced = jt.slice_flat(source, 3, [2, 3])
+    defer { sliced.free() }
+    assert_eq(sliced.shape, [2, 3])
+    assert_eq(sliced.download(), [4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+    assert_true(not sliced.requires_grad)
+    assert_true(sliced.creator is null)
+    let _error = assert_throws(ValueError, || jt.slice_flat(source, 10, [2, 3]))
+}
+
+fn test_tensor_view_reads_a_parent_range_without_copying() -> void {
+    if not jt.is_available() { return }
+    let source = jt.Tensor([4, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    defer { source.free() }
+    let viewed = source.view(3, [2, 3])
+    defer { viewed.free() }
+    assert_eq(viewed.shape, [2, 3])
+    assert_eq(viewed.download(), [4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+    let _error = assert_throws(ValueError, || source.view(10, [2, 3]))
+}
+
+fn test_device_metric_kernels_accumulate_loss_and_correct_counts() -> void {
+    if not jt.is_available() { return }
+    let logits = jt.Tensor([2, 3], [0.0, 2.0, 1.0, 4.0, 0.0, 1.0])
+    let labels = jt.Tensor([2], [1.0, 0.0])
+    let correct = jt.zeros([1])
+    let loss_total = jt.zeros([1])
+    let mean = jt.Tensor([1], [0.5])
+    defer { logits.free() }
+    defer { labels.free() }
+    defer { correct.free() }
+    defer { loss_total.free() }
+    defer { mean.free() }
+    jt.add_correct_into(logits, labels, correct)
+    jt.add_scaled_into(mean, loss_total, 4)
+    assert_values_near(correct.download(), [2.0])
+    assert_values_near(loss_total.download(), [2.0])
+}
+
+fn test_tiled_matmul_matches_cpu_on_ragged_tiles() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([17, 19], [float(i * 3 % 11) for i in 0..17 * 19])
+    let b = jt.Tensor([19, 18], [float(i * 5 % 7) for i in 0..19 * 18])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..17 {
+        for column in 0..18 {
+            var want = 0.0
+            for k in 0..19 {
+                want += a_vals[row * 19 + k] * b_vals[k * 18 + column]
+            }
+            assert_near(got[row * 18 + column], want, 1e-3)
+        }
+    }
+}
+
+fn test_staged_64_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 64
+    let inner = 1024
+    let columns = 64
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_wide_nn2_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 128
+    let inner = 80
+    let columns = 2048
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_staged_64_transposed_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let m = 64
+    let k = 1024
+    let n = 64
+    let a_tn = jt.Tensor([k, m], [float(i * 3 % 11) for i in 0..k * m])
+    let b_tn = jt.Tensor([k, n], [float(i * 5 % 7) for i in 0..k * n])
+    defer { a_tn.free() }
+    defer { b_tn.free() }
+    let tn = jt.matmul(a_tn, b_tn, trans_a: true)
+    defer { tn.free() }
+    let a_nt = jt.Tensor([m, k], [float(i * 3 % 11) for i in 0..m * k])
+    let b_nt = jt.Tensor([n, k], [float(i * 5 % 7) for i in 0..n * k])
+    defer { a_nt.free() }
+    defer { b_nt.free() }
+    let nt = jt.matmul(a_nt, b_nt, trans_b: true)
+    defer { nt.free() }
+    let a_tn_vals = a_tn.download()
+    let b_tn_vals = b_tn.download()
+    let a_nt_vals = a_nt.download()
+    let b_nt_vals = b_nt.download()
+    let tn_got = tn.download()
+    let nt_got = nt.download()
+    for row in 0..m {
+        for column in 0..n {
+            var want_tn = 0.0
+            var want_nt = 0.0
+            for inner in 0..k {
+                want_tn += a_tn_vals[inner * m + row] * b_tn_vals[inner * n + column]
+                want_nt += a_nt_vals[row * k + inner] * b_nt_vals[column * k + inner]
+            }
+            assert_near(tn_got[row * n + column], want_tn, 5e-3)
+            assert_near(nt_got[row * n + column], want_nt, 5e-3)
+        }
+    }
+}
+
+fn test_staged_64_matmul_covers_row_remainder() -> void {
+    if not jt.is_available() { return }
+    let rows = 80
+    let inner = 1024
+    let columns = 64
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_staged_64_matmul_covers_l_remainder() -> void {
+    if not jt.is_available() { return }
+    let rows = 80
+    let inner = 1024
+    let columns = 100
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_staged_64_matmul_ragged_k_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 64
+    let inner = 784
+    let columns = 1024
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_mma_ragged_k_transposed_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let m = 64
+    let k = 100
+    let n = 64
+    let a_nt = jt.Tensor([m, k], [float(i * 3 % 11) for i in 0..m * k])
+    let b_nt = jt.Tensor([n, k], [float(i * 5 % 7) for i in 0..n * k])
+    defer { a_nt.free() }
+    defer { b_nt.free() }
+    let nt = jt.matmul(a_nt, b_nt, trans_b: true)
+    defer { nt.free() }
+    let a_vals = a_nt.download()
+    let b_vals = b_nt.download()
+    let got = nt.download()
+    for row in 0..m {
+        for column in 0..n {
+            var want = 0.0
+            for inner in 0..k {
+                want += a_vals[row * k + inner] * b_vals[column * k + inner]
+            }
+            assert_near(got[row * n + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_aligned_256_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 64
+    let inner = 256
+    let columns = 256
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) / 11.0 for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) / 7.0 - 0.5 for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_fused_64_relu_affine_backward_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let batch = 64
+    let inputs = 1024
+    let units = 64
+    let x_vals = [float(i * 3 % 11) / 11.0 for i in 0..batch * inputs]
+    let w_vals = [float(i * 5 % 7) / 7.0 - 0.5 for i in 0..inputs * units]
+    let b_vals = [float(i % 5) / 5.0 - 0.4 for i in 0..units]
+    let layer = jt.Dense(units, activation: jt.Activation.Relu)
+    let rng = Random.with_seed(1)
+    layer.build(inputs, rng)
+    layer.set_weights(w_vals, b_vals)
+    defer { layer.free() }
+    let x = jt.Tensor([batch, inputs], x_vals, requires_grad: true)
+    defer { x.free() }
+    let y = layer.forward(x)
+    defer { y.free() }
+    let total = reduce_to_scalar_for_test(y)
+    defer { total.free() }
+    let intermediates = total.backward()
+    defer {
+        for tensor in intermediates { tensor.free() }
+    }
+    let params = layer.parameters()
+    let grad_w = params[0].grad
+    let grad_b = params[1].grad
+    let grad_x = x.grad
+    if grad_w is null or grad_b is null or grad_x is null {
+        throw AssertionError("expected fused relu affine grads")
+    }
+    let gw = grad_w.download()
+    let gb = grad_b.download()
+    let gx = grad_x.download()
+    var d_aff = [0.0 for _i in 0..batch * units]
+    for row in 0..batch {
+        for unit in 0..units {
+            var aff = b_vals[unit]
+            for k in 0..inputs {
+                aff += x_vals[row * inputs + k] * w_vals[k * units + unit]
+            }
+            d_aff[row * units + unit] = if aff > 0.0 { 1.0 } else { 0.0 }
+        }
+    }
+    for unit in 0..units {
+        var want_b = 0.0
+        for row in 0..batch { want_b += d_aff[row * units + unit] }
+        assert_near(gb[unit], want_b, 5e-3)
+    }
+    for k in 0..inputs {
+        for unit in 0..units {
+            var want_w = 0.0
+            for row in 0..batch {
+                want_w += x_vals[row * inputs + k] * d_aff[row * units + unit]
+            }
+            assert_near(gw[k * units + unit], want_w, 5e-3)
+        }
+    }
+    for row in 0..batch {
+        for k in 0..inputs {
+            var want_x = 0.0
+            for unit in 0..units {
+                want_x += d_aff[row * units + unit] * w_vals[k * units + unit]
+            }
+            assert_near(gx[row * inputs + k], want_x, 5e-3)
+        }
+    }
+}
+
+fn test_staged_128_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 128
+    let inner = 1024
+    let columns = 128
+    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 5e-3)
+        }
+    }
+}
+
+fn test_staged_128_transposed_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let m = 128
+    let k = 1024
+    let n = 128
+    let a_tn = jt.Tensor([k, m], [float(i * 3 % 11) for i in 0..k * m])
+    let b_tn = jt.Tensor([k, n], [float(i * 5 % 7) for i in 0..k * n])
+    defer { a_tn.free() }
+    defer { b_tn.free() }
+    let tn = jt.matmul(a_tn, b_tn, trans_a: true)
+    defer { tn.free() }
+    let a_nt = jt.Tensor([m, k], [float(i * 3 % 11) for i in 0..m * k])
+    let b_nt = jt.Tensor([n, k], [float(i * 5 % 7) for i in 0..n * k])
+    defer { a_nt.free() }
+    defer { b_nt.free() }
+    let nt = jt.matmul(a_nt, b_nt, trans_b: true)
+    defer { nt.free() }
+    let a_tn_vals = a_tn.download()
+    let b_tn_vals = b_tn.download()
+    let a_nt_vals = a_nt.download()
+    let b_nt_vals = b_nt.download()
+    let tn_got = tn.download()
+    let nt_got = nt.download()
+    for row in 0..m {
+        for column in 0..n {
+            var want_tn = 0.0
+            var want_nt = 0.0
+            for inner in 0..k {
+                want_tn += a_tn_vals[inner * m + row] * b_tn_vals[inner * n + column]
+                want_nt += a_nt_vals[row * k + inner] * b_nt_vals[column * k + inner]
+            }
+            assert_near(tn_got[row * n + column], want_tn, 5e-3)
+            assert_near(nt_got[row * n + column], want_nt, 5e-3)
+        }
+    }
+}
+
 fn test_add_rejects_a_shape_that_is_not_a_trailing_suffix() -> void {
     if not jt.is_available() { return }
     let a = jt.Tensor([2, 3], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])

@@ -1,14 +1,22 @@
 #: Loss functions.
 import std.gpu as gpu
-from std.gpu import Kernel
+from std.gpu import Buffer, Kernel
 from .tensor import Tensor, GradNode
 
 #: Something a `Sequential` can train against: turns a prediction and a
 #: target into one scalar tensor, differentiable back into `prediction`.
 pub trait Loss {
     #: Return the scalar loss for this batch, recording a `GradNode` on
-    #: `prediction` when it requires a gradient.
-    fn forward(self, prediction: Tensor, target: Tensor) -> Tensor
+    #: `prediction` when it requires a gradient. `loss_acc` receives
+    #: `mean * acc_weight` when both are provided, so the training loop can
+    #: skip a second scalar kernel.
+    fn forward(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        loss_acc: Tensor? = null,
+        acc_weight: int = 0
+    ) -> Tensor
 
     #: Whether this loss expects the final layer to hand it raw logits
     #: instead of an already-normalized distribution (e.g. softmax output).
@@ -25,8 +33,9 @@ kernel void sample_loss_and_delta(device const float* logits [[buffer(0)]],
                                   device const float* labels [[buffer(1)]],
                                   device float* delta [[buffer(2)]],
                                   device float* sample_loss [[buffer(3)]],
-                                  constant uint& batch [[buffer(4)]],
-                                  constant uint& classes [[buffer(5)]],
+                                  device const float* inv_batch [[buffer(4)]],
+                                  constant uint& batch [[buffer(5)]],
+                                  constant uint& classes [[buffer(6)]],
                                   uint sample [[thread_position_in_grid]]) {
     if (sample >= batch) return;
     uint base = sample * classes;
@@ -35,9 +44,11 @@ kernel void sample_loss_and_delta(device const float* logits [[buffer(0)]],
     float total = 0.0f;
     for (uint digit = 0; digit < classes; ++digit) total += exp(logits[base + digit] - peak);
     uint answer = uint(labels[sample]);
+    float scale = inv_batch[0];
     for (uint digit = 0; digit < classes; ++digit) {
         float probability = exp(logits[base + digit] - peak) / total;
-        delta[base + digit] = probability - (digit == answer ? 1.0f : 0.0f);
+        float d = probability - (digit == answer ? 1.0f : 0.0f);
+        delta[base + digit] = d * scale;
     }
     sample_loss[sample] = peak + log(total) - logits[base + answer];
 }
@@ -62,27 +73,26 @@ kernel void reduce_mean_partial(device const float* values [[buffer(0)]],
 
 kernel void finalize_mean(device const float* partials [[buffer(0)]],
                           device float* mean [[buffer(1)]],
-                          constant uint& partial_count [[buffer(2)]],
-                          constant uint& batch [[buffer(3)]],
+                          device float* epoch_total [[buffer(2)]],
+                          constant uint& partial_count [[buffer(3)]],
+                          constant uint& batch [[buffer(4)]],
+                          constant uint& weight [[buffer(5)]],
                           uint id [[thread_position_in_grid]]) {
     if (id != 0) return;
     float total = 0.0f;
     for (uint i = 0; i < partial_count; ++i) total += partials[i];
-    mean[0] = total / float(batch);
+    float value = total / float(batch);
+    mean[0] = value;
+    if (weight != 0) epoch_total[0] += value * float(weight);
 }
 
-kernel void scale_by_upstream(device const float* delta [[buffer(0)]],
-                              device float* grad [[buffer(1)]],
-                              device const float* factor [[buffer(2)]],
-                              constant uint& count [[buffer(3)]],
-                              uint id [[thread_position_in_grid]]) {
-    if (id < count) grad[id] = delta[id] * factor[0];
-}
 """
 
 const _GROUP = 256
 
 var _kernel_cache: dict[str, Kernel] = {}
+var _scale_batch = 0
+var _scale_buffer: Buffer? = null
 
 fn cached(entry: str) -> Kernel {
     let existing = _kernel_cache.get(entry, null)
@@ -90,6 +100,25 @@ fn cached(entry: str) -> Kernel {
     let kernel = Kernel.compile(SOURCE, entry)
     _kernel_cache[entry] = kernel
     return kernel
+}
+
+fn scale_buffer_for(batch: int) -> Buffer {
+    let existing = _scale_buffer
+    if existing is not null {
+        if _scale_batch == batch { return existing }
+        existing.free()
+    }
+    let created = Buffer.of([1.0 / float(batch)])
+    _scale_buffer = created
+    _scale_batch = batch
+    return created
+}
+
+#: Compile loss kernels before the first timed training step.
+pub fn warmup_kernels() -> void {
+    cached("sample_loss_and_delta")
+    cached("reduce_mean_partial")
+    cached("finalize_mean")
 }
 
 #: Softmax cross-entropy against one integer class per sample.
@@ -108,7 +137,13 @@ pub class SparseCategoricalCrossentropy: Loss {
     #: back into `prediction`. `prediction` is treated as raw logits either
     #: way — the fused kernel computes softmax internally either way, for
     #: the same numerically-stable log-sum-exp reason today's kernel does.
-    pub fn forward(self, prediction: Tensor, target: Tensor) -> Tensor {
+    pub fn forward(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        loss_acc: Tensor? = null,
+        acc_weight: int = 0
+    ) -> Tensor {
         if prediction.rank() != 2 {
             throw ValueError(f"loss needs rank-two predictions, got {prediction.shape}")
         }
@@ -121,7 +156,13 @@ pub class SparseCategoricalCrossentropy: Loss {
         let sample_loss = Tensor([batch])
         let sample_kernel = cached("sample_loss_and_delta")
         sample_kernel.dispatch_async(
-            [prediction.buffer(), target.buffer(), delta.buffer(), sample_loss.buffer()],
+            [
+                prediction.buffer(),
+                target.buffer(),
+                delta.buffer(),
+                sample_loss.buffer(),
+                scale_buffer_for(batch),
+            ],
             batch,
             [batch, classes]
         )
@@ -136,29 +177,19 @@ pub class SparseCategoricalCrossentropy: Loss {
         )
         let mean = Tensor([1])
         let finalize_kernel = cached("finalize_mean")
-        finalize_kernel.dispatch_async([partials.buffer(), mean.buffer()], 1, [groups, batch])
+        let acc_buffer = if loss_acc is not null { loss_acc.buffer() } else { mean.buffer() }
+        let weight = if loss_acc is not null { acc_weight } else { 0 }
+        finalize_kernel.dispatch_async(
+            [partials.buffer(), mean.buffer(), acc_buffer],
+            1,
+            [groups, batch, weight]
+        )
         sample_loss.free()
         partials.free()
-        delta.free()
         if prediction.requires_grad {
-            mean.attach_creator(GradNode([prediction], fn(upstream: Tensor) -> list[Tensor] {
-                let recomputed_delta = Tensor([batch, classes])
-                let discarded_loss = Tensor([batch])
-                defer {
-                    discarded_loss.free()
-                }
-                let recompute_kernel = cached("sample_loss_and_delta")
-                recompute_kernel.dispatch_async([prediction.buffer(), target.buffer(), recomputed_delta.buffer(), discarded_loss.buffer()], batch, [batch, classes])
-                let grad = Tensor(recomputed_delta.shape)
-                let scale_kernel = cached("scale_by_upstream")
-                let factor_buffer = gpu.Buffer.of([1.0 / float(batch)])
-                defer {
-                    factor_buffer.free()
-                }
-                scale_kernel.dispatch_async([recomputed_delta.buffer(), grad.buffer(), factor_buffer], recomputed_delta.size, [recomputed_delta.size])
-                recomputed_delta.free()
-                return [grad]
-            }))
+            mean.attach_creator(GradNode([prediction], |upstream| [delta], extras: [delta]))
+        } else {
+            delta.free()
         }
         return mean
     }

@@ -14,6 +14,8 @@
 typedef struct {
     JaiGpuBuffer *buffer;
     int64_t       count;      /* float slots, not bytes */
+    int64_t       origin;     /* element offset into `buffer` */
+    bool          owned;
 } GpuBuffer;
 
 static bool requireGpu(const char *fnName) {
@@ -103,7 +105,33 @@ static bool nGpuBufferNew(int argc, Value *args, Value *out) {
     GpuBuffer *record = JAI_ALLOC_ZEROED(GpuBuffer, 1);
     record->buffer = buffer;
     record->count = count;
+    record->origin = 0;
+    record->owned = true;
 
+    *out = INT_VAL(jaiHandleAdd(HANDLE_GPU_BUFFER, record));
+    return true;
+}
+
+static bool nGpuBufferView(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *parent;
+    if (!requireBuffer(args[0], 1, "gpu_buffer_view", &parent)) return false;
+
+    int64_t offset, count;
+    if (!jaiArgInt(args[1], 2, "gpu_buffer_view", &offset)) return false;
+    if (!jaiArgInt(args[2], 3, "gpu_buffer_view", &count)) return false;
+    if (offset < 0 || count <= 0 || offset > parent->count ||
+        count > parent->count - offset)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_view(): %lld floats at %lld exceed the "
+                        "buffer's %lld", (long long)count, (long long)offset,
+                        (long long)parent->count);
+
+    GpuBuffer *record = JAI_ALLOC_ZEROED(GpuBuffer, 1);
+    record->buffer = parent->buffer;
+    record->count = count;
+    record->origin = parent->origin + offset;
+    record->owned = false;
     *out = INT_VAL(jaiHandleAdd(HANDLE_GPU_BUFFER, record));
     return true;
 }
@@ -139,7 +167,7 @@ static bool nGpuBufferUpload(int argc, Value *args, Value *out) {
         narrowed[i] = (float)jaiAsDouble(values->items[i]);
     }
     jaiGpuUpload(b->buffer, narrowed, (size_t)values->count * sizeof(float),
-                 (size_t)offset * sizeof(float));
+                 (size_t)(b->origin + offset) * sizeof(float));
     JAI_FREE_ARRAY(float, narrowed, values->count);
 
     *out = NULL_VAL;
@@ -177,7 +205,7 @@ static bool nGpuBufferUploadU8(int argc, Value *args, Value *out) {
                         (long long)count, (long long)destOffset, (long long)b->count);
     if (count > 0)
         jaiGpuUploadU8(b->buffer, bytes->data + sourceOffset, (size_t)count,
-                       (size_t)destOffset, (float)scale);
+                       (size_t)(b->origin + destOffset), (float)scale);
     *out = NULL_VAL;
     return true;
 }
@@ -204,7 +232,7 @@ static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
 
     float *raw = JAI_ALLOC(float, wanted);
     jaiGpuDownload(b->buffer, raw, (size_t)wanted * sizeof(float),
-                   (size_t)offset * sizeof(float));
+                   (size_t)(b->origin + offset) * sizeof(float));
 
     ObjList *list = jaiListNew((int)wanted);
     jaiGCPushRoot(OBJ_VAL(list));
@@ -222,7 +250,7 @@ static bool nGpuBufferFree(int argc, Value *args, Value *out) {
     if (!requireBuffer(args[0], 1, "gpu_buffer_free", &b)) return false;
 
     jaiHandleRelease(AS_INT(args[0]));
-    jaiGpuFree(b->buffer);
+    if (b->owned) jaiGpuFree(b->buffer);
     JAI_FREE(GpuBuffer, b);
 
     *out = NULL_VAL;
@@ -279,15 +307,23 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
                         (long long)groupSize);
 
     JaiGpuBuffer **buffers = NULL;
-    if (handles->count > 0) buffers = JAI_ALLOC(JaiGpuBuffer *, handles->count);
+    size_t *offsets = NULL;
+    if (handles->count > 0) {
+        buffers = JAI_ALLOC(JaiGpuBuffer *, handles->count);
+        offsets = JAI_ALLOC(size_t, handles->count);
+    }
     for (int i = 0; i < handles->count; i++) {
         void *ptr;
         if (!jaiHandleGet(handles->items[i], 2, HANDLE_GPU_BUFFER, name, &ptr)) {
             if (buffers != NULL)
                 JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
+            if (offsets != NULL)
+                JAI_FREE_ARRAY(size_t, offsets, handles->count);
             return false;
         }
-        buffers[i] = ((GpuBuffer *)ptr)->buffer;
+        GpuBuffer *record = (GpuBuffer *)ptr;
+        buffers[i] = record->buffer;
+        offsets[i] = (size_t)record->origin * sizeof(float);
     }
 
     uint32_t *scalars = NULL;
@@ -298,6 +334,8 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
             scalar < 0 || scalar > UINT32_MAX) {
             if (buffers != NULL)
                 JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
+            if (offsets != NULL)
+                JAI_FREE_ARRAY(size_t, offsets, handles->count);
             JAI_FREE_ARRAY(uint32_t, scalars, scalarList->count);
             if (vm.hasException) return false;
             return jaiThrow(vm.cValueError,
@@ -308,10 +346,13 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
 
     bool ok = async
         ? jaiGpuDispatchAsync(kernel, buffers, handles->count, scalars,
-                              scalarList->count, (int)threads, (int)groupSize)
+                              scalarList->count, (int)threads, (int)groupSize,
+                              offsets)
         : jaiGpuDispatch(kernel, buffers, handles->count, scalars,
-                         scalarList->count, (int)threads, (int)groupSize);
+                         scalarList->count, (int)threads, (int)groupSize,
+                         offsets);
     if (buffers != NULL) JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
+    if (offsets != NULL) JAI_FREE_ARRAY(size_t, offsets, handles->count);
     if (scalars != NULL) JAI_FREE_ARRAY(uint32_t, scalars, scalarList->count);
 
     if (!ok)
@@ -330,6 +371,17 @@ static bool nGpuDispatch(int argc, Value *args, Value *out) {
 static bool nGpuDispatchAsync(int argc, Value *args, Value *out) {
     (void)argc;
     return dispatchKernel(args, out, true);
+}
+
+static bool nGpuFlush(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    if (!requireGpu("gpu_flush")) return false;
+    if (!jaiGpuFlush())
+        return jaiThrow(vm.cRuntimeError,
+                        "gpu_flush(): queued GPU work did not complete");
+    *out = NULL_VAL;
+    return true;
 }
 
 static bool nGpuSynchronize(int argc, Value *args, Value *out) {
@@ -473,6 +525,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_device_name", nGpuDeviceName,  0, 0);
 
     jaiDefineNative("__prim__.gpu_buffer_new",      nGpuBufferNew,      1, 1);
+    jaiDefineNative("__prim__.gpu_buffer_view",     nGpuBufferView,     3, 3);
     jaiDefineNative("__prim__.gpu_buffer_upload",   nGpuBufferUpload,   3, 3);
     jaiDefineNative("__prim__.gpu_buffer_upload_u8", nGpuBufferUploadU8, 6, 6);
     jaiDefineNative("__prim__.gpu_buffer_download", nGpuBufferDownload, 3, 3);
@@ -482,6 +535,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_max_threads_per_group", nGpuMaxThreadsPerGroup, 1, 1);
     jaiDefineNative("__prim__.gpu_dispatch",              nGpuDispatch,           5, 5);
     jaiDefineNative("__prim__.gpu_dispatch_async",        nGpuDispatchAsync,      5, 5);
+    jaiDefineNative("__prim__.gpu_flush",                 nGpuFlush,              0, 0);
     jaiDefineNative("__prim__.gpu_synchronize",           nGpuSynchronize,        0, 0);
     jaiDefineNative("__prim__.gpu_kernel_free",           nGpuKernelFree,         1, 1);
 
