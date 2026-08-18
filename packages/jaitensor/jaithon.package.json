@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "jaitensor",
   "version": "0.1.0",
-  "description": "GPU tensor operations and neural-network training for Jaithon",
+  "description": "GPU-first training: tensors, Sequential models, conv/attention, mixed precision",
   "source": "src",
   "dependencies": {
     "jaiplot": "^0.1.0"

@@ -419,10 +419,15 @@ pub fn main(args: list[str]) -> int {
         print_err(f"jaithon bench: {error.message}")
         return 1
     }
+    var want_jaitensor = false
+    for asked in options.paths {
+        if asked.contains("jaitensor") { want_jaitensor = true }
+    }
 
     let baseline = Baseline.load(options.baseline)
     let results: list[BenchmarkResult] = []
     for path in paths {
+        if not want_jaitensor and path.contains("/jaitensor/") { continue }
         results.extend(run_file(path, options.filter, options.budget))
     }
     if results.len() == 0 {

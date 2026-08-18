@@ -21,7 +21,8 @@ src/
 └── vm/
     ├── bytecode/       chunks, verification, and `.jaic` serialization
     ├── jit/            code arena and arm64 JIT
-    └── object/         heap object implementations
+    ├── object/         heap object implementations
+    └── trace/          `@trace` sessions (op names, shapes, replay)
 ```
 
 The files at `vm/` hold the interpreter, values, tables, and garbage collector.

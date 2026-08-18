@@ -85,6 +85,8 @@ fn _resolver(c: Ctx, written: TypeExpr?) -> Type? {
             for member in written.args { members.push(_resolver(c, member) ?? u.t_any) }
             return tuple_of(u, members)
         }
+
+        TypeKind.Const => { return u.intern(TyKind.Int, written.name) }
     }
 }
 

@@ -51,7 +51,7 @@ static uintptr_t stackLimit(void) {
 /* Slots the compile-time model can describe, not the register budget: a declared frame can be wider
  * than what it touches; only the second (measuring) pass is held to JIT_MAX_SAVED. */
 #define JIT_MAX_SLOTS   64u
-#define JIT_MAX_ARITY    4u   /* arguments arrive in x0..x3 */
+#define JIT_MAX_ARITY    8u   /* arguments arrive in x0..x7 */
 /* Deopt stubs dominate this size: each writes out every local and live stack entry. `merge` silently needed 512 -- hence the diagnostics. */
 #define JIT_MAX_INSTS 20000u
 #define JIT_MAX_FIXUPS 6000u
@@ -9041,7 +9041,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         if (!e.spilled) {
             emit(&e, jaiA64MovX(JIT_FIRST_SAVED + i, i));
         } else if (e.slotXReg[slot] != 0) {
-            /* Arguments arrive in x0..x3 and homes start at x19, so no
+            /* Arguments arrive in x0..x7 and homes start at x19, so no
              * destination here can be a later argument's source. */
             emit(&e, jaiA64MovX(e.slotXReg[slot], i));
         } else if (e.slotFpReg[slot] != 0) {
@@ -10502,6 +10502,10 @@ typedef JitResult (*Fn1)(int64_t);
 typedef JitResult (*Fn2)(int64_t, int64_t);
 typedef JitResult (*Fn3)(int64_t, int64_t, int64_t);
 typedef JitResult (*Fn4)(int64_t, int64_t, int64_t, int64_t);
+typedef JitResult (*Fn5)(int64_t, int64_t, int64_t, int64_t, int64_t);
+typedef JitResult (*Fn6)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+typedef JitResult (*Fn7)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+typedef JitResult (*Fn8)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
 /* One incoming argument, converted from the Value the interpreter holds to the
  * raw payload the compiled prologue expects, with every check the compiled
@@ -10634,14 +10638,18 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     }
 
     unsigned arity = fn->jitArgCount;
-    int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
     /* Unrolled rather than a loop over `int64_t a[JIT_MAX_ARITY]` -- measured, not tidiness: an array of
-     * four int64 makes clang add a stack-protector prologue/epilogue and sends every argument out to the frame and back on its way to the register the call reads it from. This function sits on the path of every interpreted call into a compiled body, so both costs are paid per call. */
+     * int64 makes clang add a stack-protector prologue/epilogue and sends every argument out to the frame and back on its way to the register the call reads it from. This function sits on the path of every interpreted call into a compiled body, so both costs are paid per call. */
     if (arity > JIT_MAX_ARITY) return JAI_JIT_DECLINED;
     if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0)) return JAI_JIT_DECLINED;
     if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1)) return JAI_JIT_DECLINED;
     if (arity > 2 && !jitArgIn(closure, slotBase, 2, &a2)) return JAI_JIT_DECLINED;
     if (arity > 3 && !jitArgIn(closure, slotBase, 3, &a3)) return JAI_JIT_DECLINED;
+    if (arity > 4 && !jitArgIn(closure, slotBase, 4, &a4)) return JAI_JIT_DECLINED;
+    if (arity > 5 && !jitArgIn(closure, slotBase, 5, &a5)) return JAI_JIT_DECLINED;
+    if (arity > 6 && !jitArgIn(closure, slotBase, 6, &a6)) return JAI_JIT_DECLINED;
+    if (arity > 7 && !jitArgIn(closure, slotBase, 7, &a7)) return JAI_JIT_DECLINED;
 
     JitResult r;
     switch (arity) {
@@ -10649,7 +10657,11 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     case 1: r = ((Fn1)(uintptr_t)fn->jitFunc)(a0); break;
     case 2: r = ((Fn2)(uintptr_t)fn->jitFunc)(a0, a1); break;
     case 3: r = ((Fn3)(uintptr_t)fn->jitFunc)(a0, a1, a2); break;
-    default: r = ((Fn4)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3); break;
+    case 4: r = ((Fn4)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3); break;
+    case 5: r = ((Fn5)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3, a4); break;
+    case 6: r = ((Fn6)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3, a4, a5); break;
+    case 7: r = ((Fn7)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3, a4, a5, a6); break;
+    default: r = ((Fn8)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3, a4, a5, a6, a7); break;
     }
     return jitResultOut(fn, r, slotBase);
 }

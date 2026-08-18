@@ -14,7 +14,7 @@ from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, list_of
-from jaithon.compile.check.universe import named, set_of, tuple_of
+from jaithon.compile.check.universe import instantiate, named, set_of, tuple_of
 from jaithon.compile.diag import DiagnosticBag
 from jaithon.compile.parser import parse
 from jaithon.compile.symbol import Resolution
@@ -191,6 +191,11 @@ fn _builtin_generic(c: Ctx, t: TypeExpr) -> (bool, Type) {
     return (true, tuple_of(c.universe, members))
 }
 
+fn _is_tensor_name(name: str?) -> bool {
+    if name == null { return false }
+    return name == "Tensor" or name.ends_with(".Tensor")
+}
+
 fn _generic_arity(d: TypeDecl?) -> int {
     if d == null { return 0 }
     let node = d.node
@@ -229,12 +234,18 @@ pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
             if handled[0] {
                 result = handled[1]
             } else {
-                for argument in t.args { let _ = resolve_ast_type(c, argument) }
                 let base = lookup_type_name(c, t.name)
                 if base == null {
                     c.error(E0402_UNKNOWN_TYPE, t.span, f"unknown type `{t.name ?? "?"}`")
                     result = c.universe.t_any
+                } elif _is_tensor_name(t.name) {
+                    var args: list[Type] = []
+                    for argument in t.args {
+                        args.push(resolve_ast_type(c, argument) ?? c.universe.t_any)
+                    }
+                    result = instantiate(c.universe, base, args)
                 } else {
+                    for argument in t.args { let _ = resolve_ast_type(c, argument) }
                     let want = _generic_arity(base.decl)
                     let given = t.args.len()
                     if base.decl != null and want != given {
@@ -266,6 +277,9 @@ pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
             var members: list[Type] = []
             for argument in t.args { members.push(resolve_ast_type(c, argument) ?? c.universe.t_any) }
             result = tuple_of(c.universe, members)
+        }
+        TypeKind.Const => {
+            result = c.universe.intern(TyKind.Int, t.name)
         }
     }
 

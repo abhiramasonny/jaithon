@@ -266,6 +266,8 @@ typedef enum {
     FN_GETTER    = 1 << 6,
     FN_SETTER    = 1 << 7,
     FN_INIT      = 1 << 8,
+    FN_TRACE       = 1 << 9,
+    FN_GPU_KERNEL  = 1 << 10,
 } FunctionFlags;
 
 /* One entry of a function's exception table. */
@@ -378,8 +380,8 @@ struct ObjFunction {
     /* What the compiled form was specialised to: the kind of each parameter,
      * the class shape where that kind is an instance, and the kind it returns.
      * The entry guard re-checks every one on every call. */
-    uint8_t     jitParamKind[4];
-    uint32_t    jitParamShape[4];
+    uint8_t     jitParamKind[8];
+    uint32_t    jitParamShape[8];
     uint8_t     jitReturnKind;
     uint32_t    jitReturnShape;   /* class shape when the kind is an instance */
     uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */

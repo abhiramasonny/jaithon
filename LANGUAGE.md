@@ -75,6 +75,26 @@ print(temperature)          # 20.0
 A float never silently becomes an int, because that would lose the fraction.
 Write `int(x)` when you want to truncate.
 
+A type argument can be an integer literal. The checker keeps it as a constant,
+which is how a tensor names its shape:
+
+```jai
+fn logits(x: Tensor[float, 32, 10]) -> Tensor[float, 32, 10] {
+    return x
+}
+```
+
+`Tensor` is a class (`jaitensor.Tensor` or an import alias), not a builtin.
+User generics normally drop their arguments; the checker keeps them when the
+name is `Tensor`. Two written shapes have to agree, including the dtype in the
+first slot. Bare `Tensor` still assigns both ways, which is the escape hatch
+when the rank is not known yet. Storage is float32, so write `float` there.
+
+```jai
+let a: Tensor[float, 2, 3] = t
+let b: Tensor[float, 2, 4] = a    # type error: dims 3 and 4
+```
+
 ## Strings
 
 ```jai
@@ -223,6 +243,56 @@ fn make_counter() -> fn() -> int {
     }
 }
 ```
+
+A function can carry `@name` decorators. They are part of the function object,
+not comments.
+
+`@trace` is for hot numerical kernels. The JIT compiles that function after 8
+calls instead of 64. While it runs, `std.trace.record_op` can record op names
+and shapes; a later call with the same sequence of shapes sets
+`std.trace.is_replay()`. The outermost `@trace` function owns the graph.
+`is_replay()` is a flag for libraries to skip rebuilding a plan; it does not
+skip the interpreter by itself. A tail call from a traced function does not
+reuse the frame, so the trace session is still closed on return.
+
+```jai
+import std.trace as trace
+
+@trace
+fn step(x: Tensor, w: Tensor) -> Tensor {
+    trace.record_op("matmul", x.shape)
+    return matmul(x, w)
+}
+```
+
+`@gpu_kernel` and `@mps_graph` are the same flag. They mark a function as a
+device kernel. `std.gpu.is_gpu_kernel(f)` is how you ask. Compiling Metal still
+goes through `gpu.Kernel.compile(source, entry)` with MSL source — the Jaithon
+body is not lowered to Metal yet.
+
+```jai
+import std.gpu as gpu
+
+const SAXPY = """
+#include <metal_stdlib>
+using namespace metal;
+kernel void saxpy(device float *x [[buffer(0)]],
+                  device float *y [[buffer(1)]],
+                  constant int &n [[buffer(2)]],
+                  uint i [[thread_position_in_grid]]) {
+    if (i < uint(n)) y[i] = y[i] + x[i];
+}
+"""
+
+@gpu_kernel
+fn saxpy(x: gpu.Buffer, y: gpu.Buffer) -> void {
+    let k = gpu.Kernel.compile(SAXPY, "saxpy")
+    k.dispatch([x, y], x.count, scalars: [x.count])
+}
+```
+
+A name that is not `trace`, `gpu_kernel`, or `mps_graph` is stored and
+currently ignored.
 
 ## Classes
 
@@ -382,6 +452,84 @@ A leading dot imports relative to the current file:
 import .helpers
 from .helpers import format_row
 ```
+
+## GPU
+
+`std.gpu` is the language's GPU: device buffers, Metal kernels, and the vector
+ops most programs want. Every operation also has a CPU path for when there is
+no device.
+
+A `Buffer` holds float32 slots on the device. Device memory is not garbage
+collected; call `free` (usually from `defer`). `set_device` has to run before
+the first buffer or kernel is created. After that the process keeps that
+device.
+
+```jai
+import std.gpu as gpu
+
+if gpu.is_available() {
+    gpu.set_device(0)
+    let buf = gpu.Buffer(1024)
+    defer { buf.free() }
+    gpu.set_mixed_precision(true)
+}
+```
+
+`gpu.device_count()` is how many Metal devices the process can see. Mixed
+precision runs GEMM and fused MLP graphs in float16 and writes float32.
+Storage stays float32.
+
+`Kernel.compile` interns by source and entry name. Freeing an interned kernel
+and compiling the same source again recompiles it.
+
+## Machine learning
+
+Training is ordinary Jaithon. `jaitensor` is a workspace package written in
+`.jai`: GPU-resident tensors, autograd, Keras-style `Sequential` models, and
+the ops a CNN or attention block needs. It queues Metal through `std.gpu` and
+marks its hot kernels `@trace`.
+
+```jai
+import jaitensor as jt
+
+let data = jt.Dataset.from_rows([[0.0, 1.0], [1.0, 0.0]], [0, 1])
+defer { data.free() }
+
+let model = jt.Sequential([
+    jt.Dense(128, activation: jt.Activation.Relu),
+    jt.Dense(10, activation: jt.Activation.Softmax),
+])
+defer { model.free() }
+
+model.compile(jt.Adam(), mixed_precision: true)
+model.fit(data, epochs: 5, batch_size: 2048, shuffle: true)
+```
+
+Images are NHWC. Layers include `Dense`, `Conv2d`, `Flatten`, `BatchNorm2d`,
+`GroupNorm2d`, `LayerNorm`, `MultiHeadAttention`, `Dropout`, `Embedding`,
+`MaxPool2d`, and `AvgPool2d`. Activations include ReLU, GELU, SiLU, and leaky
+ReLU. `DataLoader` can shuffle by gathering rows on the GPU. `fit(..., shuffle:
+true)` uses that path. Tensor ops cover the PyTorch-style surface: `abs`,
+`sum`/`mean`, `clamp`, `cat`, pooling, `dropout`, `mse`, `eye`, `flip`, nearest
+upsample, `tril`, and `binary_cross_entropy_with_logits`. `Embedding` gathers
+rows and scatters gradients back into the table. `MultiHeadAttention` with
+`heads > 1` uses a tiled flash kernel on long sequences (`head_dim <= 64`)
+so the score matrix never hits device memory; other shapes use MMA/MPS GEMM.
+
+A tensor that you allocate yourself needs `free`. Models and datasets free the
+tensors they own.
+
+The VM is single-threaded. Closures cannot run on `std.thread` workers, so the
+loader overlaps the next gather with GPU work on the same Metal queue rather
+than on a host prefetch thread.
+
+`set_device` / `device_count` pick which GPU later allocations use. There is
+no built-in all-reduce.
+
+Worked examples: [`mnist_gpu.jai`](examples/mnist_gpu.jai),
+[`fashion_mnist.jai`](examples/fashion_mnist.jai),
+[`spiral_classifier.jai`](examples/spiral_classifier.jai). The type and
+runtime contracts are in [`ml.md`](ml.md).
 
 ## Running it
 

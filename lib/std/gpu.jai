@@ -6,11 +6,15 @@
 #: raise `RuntimeError` without one, but every operation below picks CPU or
 #: GPU itself and never does.
 #:
-#: A device buffer holds 32-bit floats (Metal's only option), so `upload` and
-#: `download` round through that; the CPU path computes in double precision
-#: with Neumaier compensation and is *more* accurate, not just different —
-#: never compare the two paths for exact equality, only with a tolerance such
-#: as `math.approx_eq`.
+#: A device buffer holds 32-bit floats. Mixed precision (`set_mixed_precision`)
+#: runs GEMM and fused MLP graphs in float16 and writes float32; storage is
+#: still float32. `upload` and `download` round through float32. The CPU path
+#: computes in double precision with Neumaier compensation and is *more*
+#: accurate, not just different — never compare the two paths for exact
+#: equality, only with a tolerance such as `math.approx_eq`.
+#:
+#: Call `set_device` before the first buffer or kernel. Device memory is not
+#: garbage collected; `free` a `Buffer` when you are done.
 #:
 #: The CPU/GPU crossover is roughly a hundred thousand elements for elementwise
 #: work and far lower for `matmul`, whose CPU cost is cubic. `gpu_dispatch` runs
@@ -23,6 +27,58 @@
 #: reduce_sum([1.0, 2.0, 3.0])           # 6.0
 #: ```
 import std.math
+
+let _FILL_SOURCE = """#include <metal_stdlib>
+using namespace metal;
+kernel void fill_bits(device float* output [[buffer(0)]],
+                      constant uint& count [[buffer(1)]],
+                      constant uint& bits [[buffer(2)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id < count) output[id] = as_type<float>(bits);
+}
+
+kernel void fill_uniform(device float* output [[buffer(0)]],
+                         constant uint& count [[buffer(1)]],
+                         constant uint& low_bits [[buffer(2)]],
+                         constant uint& high_bits [[buffer(3)]],
+                         constant uint& seed_lo [[buffer(4)]],
+                         constant uint& seed_hi [[buffer(5)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    ulong seed = ((ulong)seed_hi << 32) | (ulong)seed_lo;
+    if (seed == 0ul) seed = 0x9E3779B97F4A7C15ul;
+    ulong state = seed + ((ulong)id + 1ul) * 0x9E3779B97F4A7C15ul;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    float low = as_type<float>(low_bits);
+    float high = as_type<float>(high_bits);
+    float u = (float)((state >> 40) & 0xFFFFFFul) * (1.0f / 16777216.0f);
+    output[id] = low + (high - low) * u;
+}
+"""
+
+fn _f32_bits(value: float) -> int {
+    if value != value { return 0x7FC00000 }
+    var mag = value
+    var sign = 0
+    if mag < 0.0 {
+        sign = 1
+        mag = -mag
+    }
+    if mag == 0.0 { return sign << 31 }
+    if mag >= 3.4028234663852886e38 { return (sign << 31) | 0x7F800000 }
+    if mag <= 1.401298464324817e-45 { return sign << 31 }
+    let split = __prim__.f64_frexp(mag)
+    let biased = split[1] + 126
+    if biased <= 0 {
+        let frac = int(__prim__.f64_ldexp(mag, 149))
+        return (sign << 31) | (frac & 0x7FFFFF)
+    }
+    if biased >= 255 { return (sign << 31) | 0x7F800000 }
+    let frac = int((split[0] * 2.0 - 1.0) * 8388608.0 + 0.5)
+    return (sign << 31) | (biased << 23) | (frac & 0x7FFFFF)
+}
 
 #: Inputs shorter than this are computed on the CPU even when a GPU exists.
 #:
@@ -139,6 +195,31 @@ pub fn device_name() -> str {
     return __prim__.gpu_device_name()
 }
 
+#: How many Metal devices the process can see.
+pub fn device_count() -> int { return __prim__.gpu_device_count() }
+
+#: Select the Metal device used by later allocations. Must be called before
+#: the first buffer or kernel is created.
+pub fn set_device(index: int) -> void {
+    __prim__.gpu_set_device(index)
+}
+
+#: Compute GEMM and fused MLP graphs in float16, storing results in float32.
+pub fn set_mixed_precision(enabled: bool) -> void {
+    __prim__.gpu_set_mixed_precision(enabled)
+}
+
+#: Whether mixed-precision compute is currently enabled.
+pub fn mixed_precision() -> bool { return __prim__.gpu_mixed_precision() }
+
+#: `@gpu_kernel` / `@mps_graph` function flag (see `jaithon.compile.emit`).
+pub const FN_GPU_KERNEL: int = 1024
+
+#: Whether `target` was compiled with `@gpu_kernel` or `@mps_graph`.
+pub fn is_gpu_kernel(target: any) -> bool {
+    return __prim__.function_has_flag(target, FN_GPU_KERNEL)
+}
+
 #: A block of 32-bit floats in device memory.
 #:
 #: Free it when done: device memory isn't garbage collected, so a leak here
@@ -215,6 +296,40 @@ pub class Buffer {
         __prim__.gpu_buffer_upload_u8(self.handle, data, source_offset, wanted, offset, scale)
     }
 
+    #: Fill every slot with a uniform sample in `[low, high)` on the device.
+    pub fn fill_uniform(self, low: float, high: float, seed: int) -> void {
+        self._check_live()
+        if not low < high {
+            throw ValueError(f"fill_uniform expects low < high, got [{low}, {high})")
+        }
+        let seed_lo = seed & 0xFFFFFFFF
+        let seed_hi = (seed >> 32) & 0xFFFFFFFF
+        let kernel = Kernel.compile(_FILL_SOURCE, "fill_uniform")
+        kernel.dispatch_async(
+            [self],
+            self.count,
+            [self.count, _f32_bits(low), _f32_bits(high), seed_lo, seed_hi]
+        )
+    }
+
+    #: Fill every slot with 0 on the device, without a host list.
+    pub fn fill_zero(self) -> void {
+        self._check_live()
+        let kernel = Kernel.compile(_FILL_SOURCE, "fill_bits")
+        kernel.dispatch_async([self], self.count, [self.count, 0])
+    }
+
+    #: Fill every slot with `value` on the device, without a host list.
+    pub fn fill(self, value: float) -> void {
+        self._check_live()
+        if value == 0.0 {
+            self.fill_zero()
+            return
+        }
+        let kernel = Kernel.compile(_FILL_SOURCE, "fill_bits")
+        kernel.dispatch_async([self], self.count, [self.count, _f32_bits(value)])
+    }
+
     #: Read `count` values back, starting at `offset`.
     #:
     #: A null `count` reads to the end of the buffer.
@@ -279,7 +394,12 @@ pub class Kernel {
     pub static fn compile(source: str, entry: str) -> Kernel {
         _require_device(f"compile the kernel {entry}")
         if entry.len() == 0 { throw ValueError("kernel entry name must not be empty") }
-        return Kernel(entry, __prim__.gpu_compile(source, entry))
+        let key = entry + "\n" + source
+        let existing = _kernel_intern.get(key, null)
+        if existing is not null and not existing.freed { return existing }
+        let kernel = Kernel(entry, __prim__.gpu_compile(source, entry))
+        _kernel_intern[key] = kernel
+        return kernel
     }
 
     #: The largest threadgroup this kernel can be dispatched with.
@@ -346,6 +466,8 @@ pub class Kernel {
     fn __str__(self) -> str { return f"Kernel({self.entry})" }
 }
 
+var _kernel_intern: dict[str, Kernel] = {}
+
 #: Commit queued async kernels so the GPU can start them, without waiting.
 #:
 #: Returns immediately when no work is queued. A bounded number of command
@@ -363,6 +485,457 @@ pub fn flush() -> void {
 pub fn synchronize() -> void {
     _require_device("synchronize")
     __prim__.gpu_synchronize()
+}
+
+#: Queue a device-buffer matrix product without waiting.
+#:
+#: `trans_a` / `trans_b` read `a` or `b` as transposed. Row bytes of each
+#: physical matrix must be a multiple of 16 (width divisible by 4). Used by
+#: jaitensor for GEMMs large enough that Metal Performance Shaders wins.
+pub fn matmul_async(
+    a: Buffer,
+    b: Buffer,
+    output: Buffer,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> void {
+    _require_device("matmul_async")
+    if rows < 0 or inner < 0 or columns < 0 {
+        throw ValueError(
+            f"matmul_async dimensions must be non-negative, got {rows}x{inner}x{columns}"
+        )
+    }
+    __prim__.gpu_matmul_buffers(
+        a.handle_of(),
+        b.handle_of(),
+        output.handle_of(),
+        rows,
+        inner,
+        columns,
+        trans_a,
+        trans_b
+    )
+}
+
+#: Packed multi-head attention. Q/K/V/out are `[seq, heads*hd]`.
+#:
+#: Returns false when the device has no fused SDPA path so callers can
+#: fall back to a Metal kernel.
+pub fn mha_async(
+    query: Buffer,
+    key: Buffer,
+    value: Buffer,
+    output: Buffer,
+    seq: int,
+    heads: int,
+    hd: int,
+    scale: float
+) -> bool {
+    _require_device("mha_async")
+    if seq <= 0 or heads <= 0 or hd <= 0 {
+        throw ValueError(f"mha_async dimensions must be positive, got {seq}x{heads}x{hd}")
+    }
+    if not (scale > 0.0) {
+        throw ValueError("mha_async scale must be positive")
+    }
+    return __prim__.gpu_mha_buffers(
+        query.handle_of(),
+        key.handle_of(),
+        value.handle_of(),
+        output.handle_of(),
+        seq,
+        heads,
+        hd,
+        scale
+    )
+}
+
+#: Queue an NHWC 2D convolution without waiting.
+#:
+#: Weights are HWIO `[kh, kw, cin, cout]`. `bias` is optional `cout` values.
+pub fn conv2d_async(
+    input: Buffer,
+    weights: Buffer,
+    output: Buffer,
+    n: int,
+    height: int,
+    width: int,
+    cin: int,
+    cout: int,
+    kh: int,
+    kw: int,
+    stride_h: int = 1,
+    stride_w: int = 1,
+    pad_h: int = 0,
+    pad_w: int = 0,
+    bias: Buffer? = null
+) -> void {
+    _require_device("conv2d_async")
+    if n <= 0 or height <= 0 or width <= 0 or cin <= 0 or cout <= 0 or kh <= 0 or kw <= 0 {
+        throw ValueError("conv2d_async dimensions must be positive")
+    }
+    if stride_h <= 0 or stride_w <= 0 {
+        throw ValueError("conv2d_async stride must be positive")
+    }
+    let bias_handle = if bias is null { null } else { bias.handle_of() }
+    __prim__.gpu_conv2d_buffers(
+        input.handle_of(),
+        weights.handle_of(),
+        bias_handle,
+        output.handle_of(),
+        n,
+        height,
+        width,
+        cin,
+        cout,
+        kh,
+        kw,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w
+    )
+}
+
+#: Fused two-layer ReLU MLP SGD step on device buffers.
+#:
+#: Updates `w1`/`b1`/`w2`/`b2` in place, adds the batch's total softmax
+#: cross-entropy into `loss_acc`, and adds the correct-class count into
+#: `correct_acc`.
+pub fn mlp_sgd_step(
+    x: Buffer,
+    w1: Buffer,
+    b1: Buffer,
+    w2: Buffer,
+    b2: Buffer,
+    labels: Buffer,
+    loss_acc: Buffer,
+    batch: int,
+    inputs: int,
+    hidden: int,
+    classes: int,
+    learning_rate: float,
+    correct_acc: Buffer? = null
+) -> void {
+    _require_device("mlp_sgd_step")
+    if batch <= 0 or inputs <= 0 or hidden <= 0 or classes <= 0 {
+        throw ValueError(
+            f"mlp_sgd_step dimensions must be positive, got {batch}x{inputs}x{hidden}x{classes}"
+        )
+    }
+    if learning_rate <= 0.0 {
+        throw ValueError(f"mlp_sgd_step learning_rate must be positive, got {learning_rate}")
+    }
+    let correct_handle = if correct_acc is null { null } else { correct_acc.handle_of() }
+    __prim__.gpu_mlp_sgd_step(
+        x.handle_of(),
+        w1.handle_of(),
+        b1.handle_of(),
+        w2.handle_of(),
+        b2.handle_of(),
+        labels.handle_of(),
+        loss_acc.handle_of(),
+        correct_handle,
+        batch,
+        inputs,
+        hidden,
+        classes,
+        learning_rate
+    )
+}
+
+#: Run every full batch of a two-layer fused SGD epoch without returning to
+#: the VM between steps. Drops a ragged trailing batch. Returns samples used.
+pub fn mlp_sgd_epoch(
+    x: Buffer,
+    w1: Buffer,
+    b1: Buffer,
+    w2: Buffer,
+    b2: Buffer,
+    labels: Buffer,
+    loss_acc: Buffer,
+    samples: int,
+    batch: int,
+    inputs: int,
+    hidden: int,
+    classes: int,
+    learning_rate: float,
+    flush_every: int = 4,
+    correct_acc: Buffer? = null
+) -> int {
+    _require_device("mlp_sgd_epoch")
+    if samples <= 0 or batch <= 0 or inputs <= 0 or hidden <= 0 or classes <= 0 or
+        flush_every <= 0 {
+        throw ValueError("mlp_sgd_epoch dimensions must be positive")
+    }
+    if learning_rate <= 0.0 {
+        throw ValueError(f"mlp_sgd_epoch learning_rate must be positive, got {learning_rate}")
+    }
+    let correct_handle = if correct_acc is null { null } else { correct_acc.handle_of() }
+    return __prim__.gpu_mlp_sgd_epoch(
+        x.handle_of(),
+        w1.handle_of(),
+        b1.handle_of(),
+        w2.handle_of(),
+        b2.handle_of(),
+        labels.handle_of(),
+        loss_acc.handle_of(),
+        correct_handle,
+        samples,
+        batch,
+        inputs,
+        hidden,
+        classes,
+        learning_rate,
+        flush_every
+    )
+}
+
+#: Fused two-layer ReLU MLP forward and backward into gradient buffers.
+#:
+#: Writes batch-mean parameter gradients into `g1`/`gb1`/`g2`/`gb2`, adds
+#: the batch's total softmax cross-entropy into `loss_acc`, and optionally
+#: adds the correct-class count into `correct_acc`.
+pub fn mlp_bwd_step(
+    x: Buffer,
+    w1: Buffer,
+    b1: Buffer,
+    w2: Buffer,
+    b2: Buffer,
+    labels: Buffer,
+    g1: Buffer,
+    gb1: Buffer,
+    g2: Buffer,
+    gb2: Buffer,
+    loss_acc: Buffer,
+    batch: int,
+    inputs: int,
+    hidden: int,
+    classes: int,
+    correct_acc: Buffer? = null
+) -> void {
+    _require_device("mlp_bwd_step")
+    if batch <= 0 or inputs <= 0 or hidden <= 0 or classes <= 0 {
+        throw ValueError(
+            f"mlp_bwd_step dimensions must be positive, got {batch}x{inputs}x{hidden}x{classes}"
+        )
+    }
+    let correct_handle = if correct_acc is null { null } else { correct_acc.handle_of() }
+    __prim__.gpu_mlp_bwd_step(
+        x.handle_of(),
+        w1.handle_of(),
+        b1.handle_of(),
+        w2.handle_of(),
+        b2.handle_of(),
+        labels.handle_of(),
+        g1.handle_of(),
+        gb1.handle_of(),
+        g2.handle_of(),
+        gb2.handle_of(),
+        loss_acc.handle_of(),
+        correct_handle,
+        batch,
+        inputs,
+        hidden,
+        classes
+    )
+}
+
+#: Fused three-hidden-layer ReLU MLP SGD step on device buffers.
+pub fn mlp3_sgd_step(
+    x: Buffer,
+    w1: Buffer,
+    b1: Buffer,
+    w2: Buffer,
+    b2: Buffer,
+    w3: Buffer,
+    b3: Buffer,
+    w4: Buffer,
+    b4: Buffer,
+    labels: Buffer,
+    loss_acc: Buffer,
+    batch: int,
+    inputs: int,
+    hidden: int,
+    classes: int,
+    learning_rate: float,
+    correct_acc: Buffer? = null,
+    hidden2: int = 0,
+    hidden3: int = 0
+) -> void {
+    _require_device("mlp3_sgd_step")
+    let h2 = if hidden2 == 0 { hidden } else { hidden2 }
+    let h3 = if hidden3 == 0 { hidden } else { hidden3 }
+    if batch <= 0 or inputs <= 0 or hidden <= 0 or h2 <= 0 or h3 <= 0 or classes <= 0 {
+        throw ValueError(
+            f"mlp3_sgd_step dimensions must be positive, got {batch}x{inputs}x{hidden}/{h2}/{h3}x{classes}"
+        )
+    }
+    if learning_rate <= 0.0 {
+        throw ValueError(f"mlp3_sgd_step learning_rate must be positive, got {learning_rate}")
+    }
+    let correct_handle = if correct_acc is null { null } else { correct_acc.handle_of() }
+    __prim__.gpu_mlp3_sgd_step(
+        x.handle_of(),
+        w1.handle_of(),
+        b1.handle_of(),
+        w2.handle_of(),
+        b2.handle_of(),
+        w3.handle_of(),
+        b3.handle_of(),
+        w4.handle_of(),
+        b4.handle_of(),
+        labels.handle_of(),
+        loss_acc.handle_of(),
+        correct_handle,
+        batch,
+        inputs,
+        hidden,
+        h2,
+        h3,
+        classes,
+        learning_rate
+    )
+}
+
+#: Run every full batch of a three-hidden-layer fused SGD epoch in native code.
+pub fn mlp3_sgd_epoch(
+    x: Buffer,
+    w1: Buffer,
+    b1: Buffer,
+    w2: Buffer,
+    b2: Buffer,
+    w3: Buffer,
+    b3: Buffer,
+    w4: Buffer,
+    b4: Buffer,
+    labels: Buffer,
+    loss_acc: Buffer,
+    samples: int,
+    batch: int,
+    inputs: int,
+    hidden: int,
+    classes: int,
+    learning_rate: float,
+    flush_every: int = 4,
+    correct_acc: Buffer? = null,
+    hidden2: int = 0,
+    hidden3: int = 0
+) -> int {
+    _require_device("mlp3_sgd_epoch")
+    let h2 = if hidden2 == 0 { hidden } else { hidden2 }
+    let h3 = if hidden3 == 0 { hidden } else { hidden3 }
+    if samples <= 0 or batch <= 0 or inputs <= 0 or hidden <= 0 or h2 <= 0 or h3 <= 0 or
+        classes <= 0 or flush_every <= 0 {
+        throw ValueError("mlp3_sgd_epoch dimensions must be positive")
+    }
+    if learning_rate <= 0.0 {
+        throw ValueError(f"mlp3_sgd_epoch learning_rate must be positive, got {learning_rate}")
+    }
+    let correct_handle = if correct_acc is null { null } else { correct_acc.handle_of() }
+    return __prim__.gpu_mlp3_sgd_epoch(
+        x.handle_of(),
+        w1.handle_of(),
+        b1.handle_of(),
+        w2.handle_of(),
+        b2.handle_of(),
+        w3.handle_of(),
+        b3.handle_of(),
+        w4.handle_of(),
+        b4.handle_of(),
+        labels.handle_of(),
+        loss_acc.handle_of(),
+        correct_handle,
+        samples,
+        batch,
+        inputs,
+        hidden,
+        h2,
+        h3,
+        classes,
+        learning_rate,
+        flush_every
+    )
+}
+
+#: Fused three-hidden-layer ReLU MLP forward and backward into gradient buffers.
+pub fn mlp3_bwd_step(
+    x: Buffer,
+    w1: Buffer,
+    b1: Buffer,
+    w2: Buffer,
+    b2: Buffer,
+    w3: Buffer,
+    b3: Buffer,
+    w4: Buffer,
+    b4: Buffer,
+    labels: Buffer,
+    g1: Buffer,
+    gb1: Buffer,
+    g2: Buffer,
+    gb2: Buffer,
+    g3: Buffer,
+    gb3: Buffer,
+    g4: Buffer,
+    gb4: Buffer,
+    loss_acc: Buffer,
+    batch: int,
+    inputs: int,
+    hidden: int,
+    classes: int,
+    correct_acc: Buffer? = null,
+    hidden2: int = 0,
+    hidden3: int = 0
+) -> void {
+    _require_device("mlp3_bwd_step")
+    let h2 = if hidden2 == 0 { hidden } else { hidden2 }
+    let h3 = if hidden3 == 0 { hidden } else { hidden3 }
+    if batch <= 0 or inputs <= 0 or hidden <= 0 or h2 <= 0 or h3 <= 0 or classes <= 0 {
+        throw ValueError(
+            f"mlp3_bwd_step dimensions must be positive, got {batch}x{inputs}x{hidden}/{h2}/{h3}x{classes}"
+        )
+    }
+    let correct_handle = if correct_acc is null { null } else { correct_acc.handle_of() }
+    __prim__.gpu_mlp3_bwd_step(
+        x.handle_of(),
+        w1.handle_of(),
+        b1.handle_of(),
+        w2.handle_of(),
+        b2.handle_of(),
+        w3.handle_of(),
+        b3.handle_of(),
+        w4.handle_of(),
+        b4.handle_of(),
+        labels.handle_of(),
+        g1.handle_of(),
+        gb1.handle_of(),
+        g2.handle_of(),
+        gb2.handle_of(),
+        g3.handle_of(),
+        gb3.handle_of(),
+        g4.handle_of(),
+        gb4.handle_of(),
+        loss_acc.handle_of(),
+        correct_handle,
+        batch,
+        inputs,
+        hidden,
+        h2,
+        h3,
+        classes
+    )
+}
+
+#: True when every class-index label in the buffer is an integer in `[0, classes)`.
+pub fn labels_valid(labels: Buffer, count: int, classes: int) -> bool {
+    _require_device("labels_valid")
+    if count < 0 or classes <= 0 {
+        throw ValueError(f"labels_valid needs a non-negative count and positive classes")
+    }
+    return __prim__.gpu_labels_valid(labels.handle_of(), count, classes)
 }
 
 var _pipelines: dict[str, Kernel] = {}

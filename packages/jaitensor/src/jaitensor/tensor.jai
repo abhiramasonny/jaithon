@@ -94,20 +94,23 @@ pub class Tensor {
 
     #: Allocate a zero-filled tensor.
     pub static fn zeros(shape: list[int]) -> Tensor {
-        let size = element_count(shape)
-        return Tensor(shape, [0.0 for _index in 0..size])
+        let tensor = Tensor(shape)
+        tensor.storage.fill_zero()
+        return tensor
     }
 
     #: Allocate a tensor filled with ones.
     pub static fn ones(shape: list[int]) -> Tensor {
-        let size = element_count(shape)
-        return Tensor(shape, [1.0 for _index in 0..size])
+        let tensor = Tensor(shape)
+        tensor.storage.fill(1.0)
+        return tensor
     }
 
     #: Allocate a tensor with every element set to `value`.
     pub static fn full(shape: list[int], value: float) -> Tensor {
-        let size = element_count(shape)
-        return Tensor(shape, [value for _index in 0..size])
+        let tensor = Tensor(shape)
+        tensor.storage.fill(value)
+        return tensor
     }
 
     #: Expand unsigned bytes directly into a GPU tensor.
@@ -129,11 +132,14 @@ pub class Tensor {
     }
 
     #: Replace all tensor values from the host.
+    #:
+    #: Waits for queued kernels first so a GPU fill cannot race the memcpy.
     pub fn upload(self, values: list[float]) -> void {
         self._check_live()
         if values.len() != self.size {
             throw ValueError(f"tensor upload has {values.len()} values, expected {self.size}")
         }
+        gpu.synchronize()
         self.storage.upload(values)
     }
 

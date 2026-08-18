@@ -26,6 +26,10 @@ fn _render(out: list[str], t: Type?, depth: int) -> void {
     }
 
     if t.kind in PRIMITIVE_SPELLING {
+        if t.name is not null and t.name.len() > 0 {
+            out.push(t.name)
+            return
+        }
         out.push(PRIMITIVE_SPELLING[t.kind])
         return
     }

@@ -123,7 +123,7 @@ typedef enum {
 
 /* Flag bits an ObjFunction may carry. Anything else is a newer compiler's
  * output that this reader would silently misinterpret. */
-#define JAIC_KNOWN_FN_FLAGS ((uint32_t)0xFFu | (uint32_t)FN_INIT)
+#define JAIC_KNOWN_FN_FLAGS ((uint32_t)0xFFu | (uint32_t)FN_INIT | (uint32_t)FN_TRACE | (uint32_t)FN_GPU_KERNEL)
 
 /* ------------------------------------------------------------------ */
 /* Reading: bounds-checked cursor                                       */
@@ -559,7 +559,7 @@ static bool writeFunction(JaiBuf *b, JaiBuf *sidecar, StrTab *st,
     if (ok) {
         jaiBufWriteU32(b, nameIndex);
         jaiBufPush(b, fn->arity);
-        jaiBufPush(b, (uint8_t)(fn->flags & 0xFFu));
+        jaiBufWriteU16(b, (uint16_t)(fn->flags & 0xFFFFu));
         jaiBufWriteU16(b, fn->maxSlots);
         jaiBufWriteU16(b, fn->upvalueCount);
 
@@ -962,7 +962,7 @@ static ObjFunction *readFunction(Cursor *c, ObjModule *module, int depth) {
 
     uint32_t nameIndex = curU32(c);
     uint8_t arity = curU8(c);
-    uint8_t flags = curU8(c);
+    uint32_t flags = c->version >= JAIC_VERSION_FNFLAGS16 ? curU16(c) : curU8(c);
     uint16_t maxSlots = curU16(c);
     uint16_t upvalueCount = curU16(c);
     if (c->bad || upvalueCount > JAI_MAX_UPVALUES) goto fail;
@@ -1112,6 +1112,11 @@ static ObjFunction *readFunction(Cursor *c, ObjModule *module, int depth) {
     }
 
     if (!rebuildCaches(&fn->chunk)) goto fail;
+    if ((fn->flags & FN_TRACE) && fn->chunk.caches != NULL) {
+        for (int i = 0; i < fn->chunk.cacheCount; i++) {
+            fn->chunk.caches[i].obsBudget = JAI_IC_OBS_BUDGET_TRACE;
+        }
+    }
 
     jaiGCPopRoots(roots);
     return fn;

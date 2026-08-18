@@ -65,6 +65,9 @@ fn _assignable_into(source: Type?, target: Type?) -> (bool, bool) {
 
     match source.kind {
         TyKind.Class | TyKind.Enum => {
+            if _is_tensor_type(source) and _is_tensor_type(target) {
+                return _tensor_into(source, target)
+            }
             if target.kind == TyKind.Class {
                 return (is_subclass_of(source.decl, target.decl), false)
             }
@@ -167,6 +170,23 @@ fn _fn_into(source: Type, target: Type) -> (bool, bool) {
 
 fn _is_erased(t: Type) -> bool {
     return t.kind == TyKind.Any or t.kind == TyKind.GenericParam
+}
+
+fn _is_tensor_type(t: Type?) -> bool {
+    if t is null or t.kind != TyKind.Class { return false }
+    let name = t.name
+    if name is null { return false }
+    return name == "Tensor" or name.ends_with(".Tensor")
+}
+
+fn _tensor_into(source: Type, target: Type) -> (bool, bool) {
+    if not _is_tensor_type(source) or not _is_tensor_type(target) { return (false, false) }
+    if source.arg_count() == 0 or target.arg_count() == 0 { return (true, false) }
+    if source.arg_count() != target.arg_count() { return (false, false) }
+    for (position, argument) in source.args.enumerate() {
+        if argument != target.args[position] { return (false, false) }
+    }
+    return (true, false)
 }
 
 fn _is_structural(kind: TyKind) -> bool {

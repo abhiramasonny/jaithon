@@ -13,8 +13,11 @@
  * compiled by a newer compiler is otherwise served stale.
  * 11: top-level `fn` declarations are hoisted ahead of top-level statements.
  * 12: the line table is LTV1 (delta+LEB128) instead of 12-byte records.
- * 13: string constants are K_STRREF indices into one module string table. */
-#define JAIC_VERSION     13
+ * 13: string constants are K_STRREF indices into one module string table.
+ * 14: function flags are u16 (FN_TRACE and future high bits). */
+#define JAIC_VERSION     14
+
+#define JAIC_VERSION_FNFLAGS16 14
 
 /* Oldest container the reader accepts.
  *

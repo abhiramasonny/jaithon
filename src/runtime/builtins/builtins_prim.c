@@ -8,6 +8,8 @@
 #include "runtime/runtime.h"
 
 #include "vm/gc.h"
+#include "vm/object/object.h"
+#include "vm/trace/trace.h"
 
 bool jaiBuiltinAddI64(int64_t a, int64_t b, int64_t *out) {
     if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return false;
@@ -416,6 +418,83 @@ static bool nPrimTraceback(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nPrimTraceActive(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    *out = BOOL_VAL(jaiTraceIsActive());
+    return true;
+}
+
+static bool nPrimTraceReplay(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    *out = BOOL_VAL(jaiTraceReplay());
+    return true;
+}
+
+static bool nPrimTraceRunId(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    *out = INT_VAL((int64_t)jaiTraceRunId());
+    return true;
+}
+
+static bool nPrimTraceRecordOp(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjString *name;
+    if (!jaiArgString(args[0], 1, "trace_record_op", &name)) return false;
+
+    int shape[4];
+    int shape_len = 0;
+    if (argc >= 2 && IS_LIST(args[1])) {
+        ObjList *list = AS_LIST(args[1]);
+        shape_len = (int)list->count;
+        if (shape_len > 4) shape_len = 4;
+        for (int i = 0; i < shape_len; i++) {
+            if (!IS_INT(list->items[i])) {
+                return jaiThrow(vm.cTypeError,
+                                "trace_record_op(): shape entries must be int");
+            }
+            shape[i] = (int)AS_INT(list->items[i]);
+        }
+    }
+    *out = BOOL_VAL(jaiTraceRecordOp(name->chars, shape, shape_len));
+    return true;
+}
+
+static bool nPrimFunctionHasFlag(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjFunction *fn = NULL;
+    Value target = args[0];
+    while (IS_BOUND(target)) target = AS_BOUND(target)->method;
+    if (IS_CLOSURE(target)) fn = AS_CLOSURE(target)->fn;
+    else if (IS_FUNCTION(target)) fn = AS_FUNCTION(target);
+    else {
+        return jaiThrow(vm.cTypeError,
+                        "function_has_flag(): expected a function");
+    }
+
+    int64_t bit;
+    if (!jaiArgInt(args[1], 2, "function_has_flag", &bit)) return false;
+    *out = BOOL_VAL((fn->flags & (uint32_t)bit) != 0);
+    return true;
+}
+
+static bool nPrimFunctionFlags(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjFunction *fn = NULL;
+    Value target = args[0];
+    while (IS_BOUND(target)) target = AS_BOUND(target)->method;
+    if (IS_CLOSURE(target)) fn = AS_CLOSURE(target)->fn;
+    else if (IS_FUNCTION(target)) fn = AS_FUNCTION(target);
+    else {
+        return jaiThrow(vm.cTypeError,
+                        "function_flags(): expected a function");
+    }
+    *out = INT_VAL((int64_t)fn->flags);
+    return true;
+}
+
 void jaiRegisterOperatorPrimitives(void) {
     jaiDefineNative("__prim__.add",      nPrimAdd,      2, 2);
     jaiDefineNative("__prim__.sub",      nPrimSub,      2, 2);
@@ -451,4 +530,10 @@ void jaiRegisterOperatorPrimitives(void) {
     jaiDefineNative("__prim__.raise",             nPrimRaise,            1, 1);
     jaiDefineNative("__prim__.current_exception", nPrimCurrentException, 0, 0);
     jaiDefineNative("__prim__.traceback",         nPrimTraceback,        0, 0);
+    jaiDefineNative("__prim__.trace_active",      nPrimTraceActive,      0, 0);
+    jaiDefineNative("__prim__.trace_replay",      nPrimTraceReplay,      0, 0);
+    jaiDefineNative("__prim__.trace_run_id",      nPrimTraceRunId,       0, 0);
+    jaiDefineNative("__prim__.trace_record_op",   nPrimTraceRecordOp,    1, 2);
+    jaiDefineNative("__prim__.function_has_flag", nPrimFunctionHasFlag,    2, 2);
+    jaiDefineNative("__prim__.function_flags",    nPrimFunctionFlags,     1, 1);
 }

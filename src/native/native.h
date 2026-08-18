@@ -70,6 +70,10 @@ typedef struct JaiGpuKernel JaiGpuKernel;
 
 bool          jaiGpuAvailable(void);
 const char   *jaiGpuDeviceName(void);
+int           jaiGpuDeviceCount(void);
+bool          jaiGpuSetDevice(int index);
+void          jaiGpuSetMixedPrecision(bool enabled);
+bool          jaiGpuMixedPrecision(void);
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes);
 void          jaiGpuFree(JaiGpuBuffer *b);
 /* `offset` is a byte offset into the device buffer, so std.gpu can move a slice
@@ -79,6 +83,9 @@ void          jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes,
 /* Expand unsigned bytes directly into float slots, applying `scale`. */
 void          jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                              size_t offset, float scale);
+void          jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
+                                float low, float high, uint64_t seed);
+void          jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
                              size_t offset);
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
@@ -100,6 +107,130 @@ bool          jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int c
 /* Commit queued async work so the GPU can start; does not wait. */
 bool          jaiGpuFlush(void);
 bool          jaiGpuSynchronize(void);
+/* Device-buffer GEMM via Metal Performance Shaders. Encodes onto the async
+ * command buffer (ending any open compute encoder). `transA` / `transB` treat
+ * the physical buffers as transposed. Offsets are bytes into each buffer. */
+bool          jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset,
+                                  JaiGpuBuffer *b, size_t bOffset,
+                                  JaiGpuBuffer *out, size_t outOffset,
+                                  uint32_t m, uint32_t k, uint32_t n,
+                                  bool transA, bool transB);
+/* Packed multi-head attention: Q/K/V/out are `[seq, heads*hd]` row-major. */
+bool          jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff,
+                              JaiGpuBuffer *k, size_t kOff,
+                              JaiGpuBuffer *v, size_t vOff,
+                              JaiGpuBuffer *out, size_t outOff,
+                              uint32_t seq, uint32_t heads, uint32_t hd,
+                              float scale);
+/* NHWC input, HWIO weights, optional bias. Output is NHWC. */
+bool          jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
+                                  JaiGpuBuffer *weights, size_t weightsOffset,
+                                  JaiGpuBuffer *bias, size_t biasOffset,
+                                  JaiGpuBuffer *out, size_t outOffset,
+                                  uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                  uint32_t cout, uint32_t kh, uint32_t kw,
+                                  uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
+/* Two-layer ReLU + linear MLP: one fused SGD step. Updates weights in place
+ * and adds the batch's total cross-entropy and correct-class count into
+ * lossAcc / correctAcc. */
+bool          jaiGpuMlpSgdStep(JaiGpuBuffer *x, size_t xOff,
+                               JaiGpuBuffer *w1, size_t w1Off,
+                               JaiGpuBuffer *b1, size_t b1Off,
+                               JaiGpuBuffer *w2, size_t w2Off,
+                               JaiGpuBuffer *b2, size_t b2Off,
+                               JaiGpuBuffer *labels, size_t labOff,
+                               JaiGpuBuffer *lossAcc, size_t lossOff,
+                               JaiGpuBuffer *correctAcc, size_t correctOff,
+                               uint32_t batch, uint32_t inputs, uint32_t hidden,
+                               uint32_t classes, float lr);
+/* Walk a rank-two feature matrix in native code so the VM is not entered
+ * between fused SGD steps. Drops a ragged trailing batch. Returns how many
+ * samples were consumed. */
+bool          jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff,
+                                JaiGpuBuffer *w1, size_t w1Off,
+                                JaiGpuBuffer *b1, size_t b1Off,
+                                JaiGpuBuffer *w2, size_t w2Off,
+                                JaiGpuBuffer *b2, size_t b2Off,
+                                JaiGpuBuffer *labels, size_t labOff,
+                                JaiGpuBuffer *lossAcc, size_t lossOff,
+                                JaiGpuBuffer *correctAcc, size_t correctOff,
+                                uint32_t samples, uint32_t batch, uint32_t inputs,
+                                uint32_t hidden, uint32_t classes, float lr,
+                                uint32_t flushEvery, uint32_t *processed);
+/* Two-layer ReLU MLP: fused forward + backward into gradient buffers. */
+bool          jaiGpuMlpBwdStep(JaiGpuBuffer *x, size_t xOff,
+                               JaiGpuBuffer *w1, size_t w1Off,
+                               JaiGpuBuffer *b1, size_t b1Off,
+                               JaiGpuBuffer *w2, size_t w2Off,
+                               JaiGpuBuffer *b2, size_t b2Off,
+                               JaiGpuBuffer *labels, size_t labOff,
+                               JaiGpuBuffer *gW1, size_t gW1Off,
+                               JaiGpuBuffer *gB1, size_t gB1Off,
+                               JaiGpuBuffer *gW2, size_t gW2Off,
+                               JaiGpuBuffer *gB2, size_t gB2Off,
+                               JaiGpuBuffer *lossAcc, size_t lossOff,
+                               JaiGpuBuffer *correctAcc, size_t correctOff,
+                               uint32_t batch, uint32_t inputs, uint32_t hidden,
+                               uint32_t classes);
+/* Three hidden ReLU layers plus a linear head: fused SGD step. */
+bool          jaiGpuMlp3SgdStep(JaiGpuBuffer *x, size_t xOff,
+                                JaiGpuBuffer *w1, size_t w1Off,
+                                JaiGpuBuffer *b1, size_t b1Off,
+                                JaiGpuBuffer *w2, size_t w2Off,
+                                JaiGpuBuffer *b2, size_t b2Off,
+                                JaiGpuBuffer *w3, size_t w3Off,
+                                JaiGpuBuffer *b3, size_t b3Off,
+                                JaiGpuBuffer *w4, size_t w4Off,
+                                JaiGpuBuffer *b4, size_t b4Off,
+                                JaiGpuBuffer *labels, size_t labOff,
+                                JaiGpuBuffer *lossAcc, size_t lossOff,
+                                JaiGpuBuffer *correctAcc, size_t correctOff,
+                                uint32_t batch, uint32_t inputs,
+                                uint32_t hidden1, uint32_t hidden2, uint32_t hidden3,
+                                uint32_t classes, float lr);
+bool          jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff,
+                                 JaiGpuBuffer *w1, size_t w1Off,
+                                 JaiGpuBuffer *b1, size_t b1Off,
+                                 JaiGpuBuffer *w2, size_t w2Off,
+                                 JaiGpuBuffer *b2, size_t b2Off,
+                                 JaiGpuBuffer *w3, size_t w3Off,
+                                 JaiGpuBuffer *b3, size_t b3Off,
+                                 JaiGpuBuffer *w4, size_t w4Off,
+                                 JaiGpuBuffer *b4, size_t b4Off,
+                                 JaiGpuBuffer *labels, size_t labOff,
+                                 JaiGpuBuffer *lossAcc, size_t lossOff,
+                                 JaiGpuBuffer *correctAcc, size_t correctOff,
+                                 uint32_t samples, uint32_t batch, uint32_t inputs,
+                                 uint32_t hidden1, uint32_t hidden2, uint32_t hidden3,
+                                 uint32_t classes, float lr, uint32_t flushEvery,
+                                 uint32_t *processed);
+/* Three hidden ReLU layers plus a linear head: fused forward/backward. */
+bool          jaiGpuMlp3BwdStep(JaiGpuBuffer *x, size_t xOff,
+                                JaiGpuBuffer *w1, size_t w1Off,
+                                JaiGpuBuffer *b1, size_t b1Off,
+                                JaiGpuBuffer *w2, size_t w2Off,
+                                JaiGpuBuffer *b2, size_t b2Off,
+                                JaiGpuBuffer *w3, size_t w3Off,
+                                JaiGpuBuffer *b3, size_t b3Off,
+                                JaiGpuBuffer *w4, size_t w4Off,
+                                JaiGpuBuffer *b4, size_t b4Off,
+                                JaiGpuBuffer *labels, size_t labOff,
+                                JaiGpuBuffer *gW1, size_t gW1Off,
+                                JaiGpuBuffer *gB1, size_t gB1Off,
+                                JaiGpuBuffer *gW2, size_t gW2Off,
+                                JaiGpuBuffer *gB2, size_t gB2Off,
+                                JaiGpuBuffer *gW3, size_t gW3Off,
+                                JaiGpuBuffer *gB3, size_t gB3Off,
+                                JaiGpuBuffer *gW4, size_t gW4Off,
+                                JaiGpuBuffer *gB4, size_t gB4Off,
+                                JaiGpuBuffer *lossAcc, size_t lossOff,
+                                JaiGpuBuffer *correctAcc, size_t correctOff,
+                                uint32_t batch, uint32_t inputs,
+                                uint32_t hidden1, uint32_t hidden2, uint32_t hidden3,
+                                uint32_t classes);
+/* Scan class-index labels in a shared buffer; no GPU round-trip. */
+bool          jaiGpuLabelsValid(JaiGpuBuffer *labels, size_t offset,
+                                uint32_t count, uint32_t classes);
 /* Built-in kernels used by std.gpu when no custom source is supplied. */
 bool jaiGpuVectorAdd(const double *a, const double *b, double *out, size_t n);
 bool jaiGpuVectorMul(const double *a, const double *b, double *out, size_t n);

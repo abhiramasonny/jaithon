@@ -214,5 +214,15 @@
     "prefix": "region",
     "body": ["# region ${1:name}", "$0", "# endregion"],
     "description": "Foldable region"
+  },
+  "trace": {
+    "prefix": "@trace",
+    "body": ["@trace", "fn ${1:name}(${2:params}) -> ${3:void} {", "\t$0", "}"],
+    "description": "Traced function (lower JIT threshold)"
+  },
+  "gpu kernel": {
+    "prefix": "@gpu_kernel",
+    "body": ["@gpu_kernel", "fn ${1:name}(${2:params}) -> ${3:void} {", "\t$0", "}"],
+    "description": "Device-kernel marker"
   }
 }

@@ -8,6 +8,10 @@ import threading
 import time
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[3]
+MLP_JAI = REPO / "tests" / "bench" / "jaitensor" / "mlp.jai"
+MLP_PY = REPO / "tests" / "bench" / "jaitensor" / "mlp.py"
+
 KEYS = (
     "Device Utilization %",
     "Renderer Utilization %",
@@ -223,7 +227,7 @@ def run_logged(name: str, command: list[str], env: dict[str, str] | None = None)
     sampler.start()
     proc = subprocess.run(
         command,
-        cwd=str(Path(__file__).resolve().parents[1]),
+        cwd=str(REPO),
         env=merged,
         capture_output=True,
         text=True,
@@ -245,15 +249,16 @@ def run_logged(name: str, command: list[str], env: dict[str, str] | None = None)
     return parsed
 
 
-def run_workload(repo: Path, python: str, epochs: str, spec: dict) -> dict:
+def run_workload(python: str, epochs: str, spec: dict) -> dict:
     name = spec["name"]
-    jaithon_cmd = [str(repo / "jaithon"), "examples/bench_mlp.jai", name]
-    pytorch_cmd = [python, str(repo / "examples" / "bench_mlp.py"), name]
-    jaithon_env = {"JAITHON_PATH": str(repo / "lib")}
+    jaithon_cmd = [str(REPO / "jaithon"), str(MLP_JAI), name]
+    pytorch_cmd = [python, str(MLP_PY), name]
+    jaithon_env = {"JAITHON_PATH": str(REPO / "lib"), "JAITENSOR_VERBOSE": "1"}
+    pytorch_env = {"JAITENSOR_VERBOSE": "1"}
     print(f"warming jaitensor {name} (1 epoch)...", flush=True)
     subprocess.run(
         jaithon_cmd + ["1"],
-        cwd=str(repo),
+        cwd=str(REPO),
         env={**os.environ, **jaithon_env},
         check=True,
         capture_output=True,
@@ -262,7 +267,8 @@ def run_workload(repo: Path, python: str, epochs: str, spec: dict) -> dict:
     print(f"warming pytorch {name} (1 epoch)...", flush=True)
     subprocess.run(
         pytorch_cmd + ["1"],
-        cwd=str(repo),
+        cwd=str(REPO),
+        env={**os.environ, **pytorch_env},
         check=True,
         capture_output=True,
         text=True,
@@ -271,7 +277,7 @@ def run_workload(repo: Path, python: str, epochs: str, spec: dict) -> dict:
     jaithon = run_logged(f"jaitensor-{name}", jaithon_cmd + [epochs], env=jaithon_env)
     time.sleep(1.0)
     print(f"running pytorch {name}...", flush=True)
-    pytorch = run_logged(f"pytorch-{name}", pytorch_cmd + [epochs])
+    pytorch = run_logged(f"pytorch-{name}", pytorch_cmd + [epochs], env=pytorch_env)
     j_sps = jaithon.get("samples_per_second") or 0.0
     p_sps = pytorch.get("samples_per_second") or 0.0
     speedup = round(j_sps / p_sps, 2) if p_sps else None
@@ -295,7 +301,6 @@ def run_workload(repo: Path, python: str, epochs: str, spec: dict) -> dict:
 
 
 def main() -> int:
-    repo = Path(__file__).resolve().parents[1]
     epochs = sys.argv[1] if len(sys.argv) > 1 else "8"
     python = sys.argv[2] if len(sys.argv) > 2 else sys.executable
     names = sys.argv[3:] or [item["name"] for item in WORKLOADS]
@@ -306,11 +311,11 @@ def main() -> int:
     idle = sample_for(2.0, 0.12)
     results = {}
     for spec in wanted:
-        results[spec["name"]] = run_workload(repo, python, epochs, spec)
+        results[spec["name"]] = run_workload(python, epochs, spec)
         time.sleep(1.0)
     payload = {
         "machine": "Apple M2 Max",
-        "hparams": "SGD lr=0.08, batch=512, 8 epochs, no shuffle, CrossEntropy on logits",
+        "hparams": "SGD lr=0.08, batch=512 (2048 when width>=1024, depth>=3, or CIFAR; 1024 at width>=8192), AMP at width>=1024, 8 epochs, no shuffle, CrossEntropy on logits",
         "note": "Each workload uses matching Sequential / nn.Sequential models. ioreg Device Utilization % is whole-chip.",
         "idle": {
             "device": summarize(idle, "Device Utilization %"),
@@ -319,7 +324,7 @@ def main() -> int:
         },
         "workloads": results,
     }
-    out = repo / "data" / "bench-mlp.json"
+    out = REPO / "data" / "bench-mlp.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2))
     print(f"wrote {out}")

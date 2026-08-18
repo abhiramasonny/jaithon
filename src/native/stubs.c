@@ -108,6 +108,23 @@ const char *jaiGpuDeviceName(void) {
     return "none";
 }
 
+int jaiGpuDeviceCount(void) {
+    return 0;
+}
+
+bool jaiGpuSetDevice(int index) {
+    (void)index;
+    return false;
+}
+
+void jaiGpuSetMixedPrecision(bool enabled) {
+    (void)enabled;
+}
+
+bool jaiGpuMixedPrecision(void) {
+    return false;
+}
+
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
     (void)bytes;
     return NULL;
@@ -131,6 +148,22 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
     (void)count;
     (void)offset;
     (void)scale;
+}
+
+void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
+                       float low, float high, uint64_t seed) {
+    (void)b;
+    (void)elementOffset;
+    (void)count;
+    (void)low;
+    (void)high;
+    (void)seed;
+}
+
+void jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    (void)b;
+    (void)elementOffset;
+    (void)count;
 }
 
 void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
@@ -185,6 +218,225 @@ bool jaiGpuFlush(void) {
 }
 
 bool jaiGpuSynchronize(void) {
+    return false;
+}
+
+bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
+                         size_t bOffset, JaiGpuBuffer *out, size_t outOffset,
+                         uint32_t m, uint32_t k, uint32_t n, bool transA,
+                         bool transB) {
+    (void)a;
+    (void)aOffset;
+    (void)b;
+    (void)bOffset;
+    (void)out;
+    (void)outOffset;
+    (void)m;
+    (void)k;
+    (void)n;
+    (void)transA;
+    (void)transB;
+    return false;
+}
+
+bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
+                     JaiGpuBuffer *v, size_t vOff, JaiGpuBuffer *out, size_t outOff,
+                     uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
+    (void)q;
+    (void)qOff;
+    (void)k;
+    (void)kOff;
+    (void)v;
+    (void)vOff;
+    (void)out;
+    (void)outOff;
+    (void)seq;
+    (void)heads;
+    (void)hd;
+    (void)scale;
+    return false;
+}
+
+bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
+                         JaiGpuBuffer *weights, size_t weightsOffset,
+                         JaiGpuBuffer *bias, size_t biasOffset,
+                         JaiGpuBuffer *out, size_t outOffset,
+                         uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                         uint32_t cout, uint32_t kh, uint32_t kw,
+                         uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    (void)input;
+    (void)inputOffset;
+    (void)weights;
+    (void)weightsOffset;
+    (void)bias;
+    (void)biasOffset;
+    (void)out;
+    (void)outOffset;
+    (void)n;
+    (void)h;
+    (void)w;
+    (void)cin;
+    (void)cout;
+    (void)kh;
+    (void)kw;
+    (void)sh;
+    (void)sw;
+    (void)ph;
+    (void)pw;
+    return false;
+}
+
+bool jaiGpuMlpSgdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                      JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                      JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,
+                      JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                      size_t correctOff, uint32_t batch, uint32_t inputs, uint32_t hidden,
+                      uint32_t classes, float lr) {
+    (void)x;
+    (void)xOff;
+    (void)w1;
+    (void)w1Off;
+    (void)b1;
+    (void)b1Off;
+    (void)w2;
+    (void)w2Off;
+    (void)b2;
+    (void)b2Off;
+    (void)labels;
+    (void)labOff;
+    (void)lossAcc;
+    (void)lossOff;
+    (void)correctAcc;
+    (void)correctOff;
+    (void)batch;
+    (void)inputs;
+    (void)hidden;
+    (void)classes;
+    (void)lr;
+    return false;
+}
+
+bool jaiGpuMlpBwdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                      JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                      JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,
+                      JaiGpuBuffer *gW1, size_t gW1Off, JaiGpuBuffer *gB1, size_t gB1Off,
+                      JaiGpuBuffer *gW2, size_t gW2Off, JaiGpuBuffer *gB2, size_t gB2Off,
+                      JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                      size_t correctOff, uint32_t batch, uint32_t inputs, uint32_t hidden,
+                      uint32_t classes) {
+    (void)x;
+    (void)xOff;
+    (void)w1;
+    (void)w1Off;
+    (void)b1;
+    (void)b1Off;
+    (void)w2;
+    (void)w2Off;
+    (void)b2;
+    (void)b2Off;
+    (void)labels;
+    (void)labOff;
+    (void)gW1;
+    (void)gW1Off;
+    (void)gB1;
+    (void)gB1Off;
+    (void)gW2;
+    (void)gW2Off;
+    (void)gB2;
+    (void)gB2Off;
+    (void)lossAcc;
+    (void)lossOff;
+    (void)correctAcc;
+    (void)correctOff;
+    (void)batch;
+    (void)inputs;
+    (void)hidden;
+    (void)classes;
+    return false;
+}
+
+bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,
+                       JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                       size_t correctOff, uint32_t samples, uint32_t batch,
+                       uint32_t inputs, uint32_t hidden, uint32_t classes, float lr,
+                       uint32_t flushEvery, uint32_t *processed) {
+    (void)x; (void)xOff; (void)w1; (void)w1Off; (void)b1; (void)b1Off;
+    (void)w2; (void)w2Off; (void)b2; (void)b2Off; (void)labels; (void)labOff;
+    (void)lossAcc; (void)lossOff; (void)correctAcc; (void)correctOff;
+    (void)samples; (void)batch; (void)inputs; (void)hidden; (void)classes;
+    (void)lr; (void)flushEvery;
+    if (processed != NULL) *processed = 0;
+    return false;
+}
+
+bool jaiGpuMlp3SgdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *w3, size_t w3Off,
+                       JaiGpuBuffer *b3, size_t b3Off, JaiGpuBuffer *w4, size_t w4Off,
+                       JaiGpuBuffer *b4, size_t b4Off, JaiGpuBuffer *labels, size_t labOff,
+                       JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                       size_t correctOff,                        uint32_t batch, uint32_t inputs, uint32_t hidden1,
+                       uint32_t hidden2, uint32_t hidden3, uint32_t classes, float lr) {
+    (void)x; (void)xOff; (void)w1; (void)w1Off; (void)b1; (void)b1Off;
+    (void)w2; (void)w2Off; (void)b2; (void)b2Off; (void)w3; (void)w3Off;
+    (void)b3; (void)b3Off; (void)w4; (void)w4Off; (void)b4; (void)b4Off;
+    (void)labels; (void)labOff; (void)lossAcc; (void)lossOff; (void)correctAcc;
+    (void)correctOff; (void)batch; (void)inputs; (void)hidden1; (void)hidden2;
+    (void)hidden3; (void)classes; (void)lr;
+    return false;
+}
+
+bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                        JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                        JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *w3, size_t w3Off,
+                        JaiGpuBuffer *b3, size_t b3Off, JaiGpuBuffer *w4, size_t w4Off,
+                        JaiGpuBuffer *b4, size_t b4Off, JaiGpuBuffer *labels, size_t labOff,
+                        JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                        size_t correctOff, uint32_t samples, uint32_t batch,
+                        uint32_t inputs, uint32_t hidden1, uint32_t hidden2,
+                        uint32_t hidden3, uint32_t classes, float lr,
+                        uint32_t flushEvery, uint32_t *processed) {
+    (void)x; (void)xOff; (void)w1; (void)w1Off; (void)b1; (void)b1Off;
+    (void)w2; (void)w2Off; (void)b2; (void)b2Off; (void)w3; (void)w3Off;
+    (void)b3; (void)b3Off; (void)w4; (void)w4Off; (void)b4; (void)b4Off;
+    (void)labels; (void)labOff; (void)lossAcc; (void)lossOff; (void)correctAcc;
+    (void)correctOff; (void)samples; (void)batch; (void)inputs; (void)hidden1;
+    (void)hidden2; (void)hidden3; (void)classes; (void)lr; (void)flushEvery;
+    if (processed != NULL) *processed = 0;
+    return false;
+}
+
+bool jaiGpuMlp3BwdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *w3, size_t w3Off,
+                       JaiGpuBuffer *b3, size_t b3Off, JaiGpuBuffer *w4, size_t w4Off,
+                       JaiGpuBuffer *b4, size_t b4Off, JaiGpuBuffer *labels, size_t labOff,
+                       JaiGpuBuffer *gW1, size_t gW1Off, JaiGpuBuffer *gB1, size_t gB1Off,
+                       JaiGpuBuffer *gW2, size_t gW2Off, JaiGpuBuffer *gB2, size_t gB2Off,
+                       JaiGpuBuffer *gW3, size_t gW3Off, JaiGpuBuffer *gB3, size_t gB3Off,
+                       JaiGpuBuffer *gW4, size_t gW4Off, JaiGpuBuffer *gB4, size_t gB4Off,
+                       JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                       size_t correctOff, uint32_t batch, uint32_t inputs, uint32_t hidden1,
+                       uint32_t hidden2, uint32_t hidden3, uint32_t classes) {
+    (void)x; (void)xOff; (void)w1; (void)w1Off; (void)b1; (void)b1Off;
+    (void)w2; (void)w2Off; (void)b2; (void)b2Off; (void)w3; (void)w3Off;
+    (void)b3; (void)b3Off; (void)w4; (void)w4Off; (void)b4; (void)b4Off;
+    (void)labels; (void)labOff; (void)gW1; (void)gW1Off; (void)gB1; (void)gB1Off;
+    (void)gW2; (void)gW2Off; (void)gB2; (void)gB2Off; (void)gW3; (void)gW3Off;
+    (void)gB3; (void)gB3Off; (void)gW4; (void)gW4Off; (void)gB4; (void)gB4Off;
+    (void)lossAcc; (void)lossOff; (void)correctAcc; (void)correctOff;
+    (void)batch; (void)inputs; (void)hidden1; (void)hidden2; (void)hidden3; (void)classes;
+    return false;
+}
+
+bool jaiGpuLabelsValid(JaiGpuBuffer *labels, size_t offset, uint32_t count,
+                       uint32_t classes) {
+    (void)labels;
+    (void)offset;
+    (void)count;
+    (void)classes;
     return false;
 }
 
