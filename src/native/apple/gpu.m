@@ -146,7 +146,15 @@ static id<MTLComputePipelineState> gMatMul;
 static id<MTLComputePipelineState> gReduceSum;
 static id<MTLCommandBuffer> gAsyncCommands;
 static id<MTLComputeCommandEncoder> gAsyncEncoder;
+static NSMutableArray<id<MTLCommandBuffer>> *gInFlight;
+static NSMutableDictionary<NSString *, id<MTLLibrary>> *gSourceLibraries;
 static bool                        gBuiltinsReady;
+
+#define JAI_GPU_MAX_IN_FLIGHT 16
+
+static void ensureInFlight(void) {
+    if (gInFlight == nil) gInFlight = [[NSMutableArray alloc] init];
+}
 
 static bool ensureDevice(void) {
     static dispatch_once_t once;
@@ -315,7 +323,17 @@ JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
         }
 
         NSError *error = nil;
-        id<MTLLibrary> library = [gDevice newLibraryWithSource:text options:nil error:&error];
+        id<MTLLibrary> library = nil;
+        @synchronized(gQueue) {
+            if (gSourceLibraries == nil) {
+                gSourceLibraries = [[NSMutableDictionary alloc] init];
+            }
+            library = gSourceLibraries[text];
+            if (library == nil) {
+                library = [gDevice newLibraryWithSource:text options:nil error:&error];
+                if (library != nil) gSourceLibraries[text] = library;
+            }
+        }
         if (library == nil) {
             /* The Metal front end packs its whole diagnostic listing — file,
              * line, caret — into the localised description. */
@@ -411,7 +429,8 @@ int jaiGpuMaxThreadsPerGroup(JaiGpuKernel *k) {
 
 static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                            const uint32_t *scalars, int scalarCount,
-                           int threads, int groupSize, bool wait) {
+                           int threads, int groupSize, const size_t *byteOffsets,
+                           bool wait) {
     if (k == NULL || k->pipeline == NULL || threads <= 0) return false;
     if (count < 0 || (count > 0 && buffers == NULL)) return false;
     if (scalarCount < 0 || (scalarCount > 0 && scalars == NULL)) return false;
@@ -429,6 +448,8 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                 if (gAsyncCommands == nil) {
                     gAsyncCommands = [gQueue commandBuffer];
                     if (gAsyncCommands == nil) return false;
+                }
+                if (gAsyncEncoder == nil) {
                     gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
                     if (gAsyncEncoder == nil) {
                         gAsyncCommands = nil;
@@ -439,7 +460,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                 [gAsyncEncoder setComputePipelineState:pipeline];
                 for (int i = 0; i < count; i++)
                     [gAsyncEncoder setBuffer:(__bridge id<MTLBuffer>)buffers[i]->buffer
-                                      offset:0
+                                      offset:byteOffsets != NULL ? byteOffsets[i] : 0
                                      atIndex:(NSUInteger)i];
                 for (int i = 0; i < scalarCount; i++)
                     [gAsyncEncoder setBytes:&scalars[i]
@@ -462,7 +483,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
         [encoder setComputePipelineState:pipeline];
         for (int i = 0; i < count; i++) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)buffers[i]->buffer
-                        offset:0
+                        offset:byteOffsets != NULL ? byteOffsets[i] : 0
                        atIndex:(NSUInteger)i];
         }
         /* setBytes is the cheap path for an argument this small; it is exactly
@@ -484,32 +505,56 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
 
 bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                     const uint32_t *scalars, int scalarCount,
-                    int threads, int groupSize) {
+                    int threads, int groupSize, const size_t *byteOffsets) {
     return dispatchKernel(k, buffers, count, scalars, scalarCount,
-                          threads, groupSize, true);
+                          threads, groupSize, byteOffsets, true);
 }
 
 bool jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                          const uint32_t *scalars, int scalarCount,
-                         int threads, int groupSize) {
+                         int threads, int groupSize, const size_t *byteOffsets) {
     return dispatchKernel(k, buffers, count, scalars, scalarCount,
-                          threads, groupSize, false);
+                          threads, groupSize, byteOffsets, false);
+}
+
+bool jaiGpuFlush(void) {
+    if (!ensureDevice()) return false;
+    @autoreleasepool {
+        id<MTLCommandBuffer> oldest = nil;
+        @synchronized(gQueue) {
+            if (gAsyncCommands != nil) {
+                [gAsyncEncoder endEncoding];
+                [gAsyncCommands commit];
+                ensureInFlight();
+                [gInFlight addObject:gAsyncCommands];
+                gAsyncEncoder = nil;
+                gAsyncCommands = nil;
+            }
+            if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
+                oldest = gInFlight[0];
+                [gInFlight removeObjectAtIndex:0];
+            }
+        }
+        if (oldest == nil) return true;
+        [oldest waitUntilCompleted];
+        return [oldest status] == MTLCommandBufferStatusCompleted;
+    }
 }
 
 bool jaiGpuSynchronize(void) {
-    if (!ensureDevice()) return false;
+    if (!jaiGpuFlush()) return false;
     @autoreleasepool {
-        id<MTLCommandBuffer> commands;
+        NSArray<id<MTLCommandBuffer>> *pending;
         @synchronized(gQueue) {
-            if (gAsyncCommands == nil) return true;
-            [gAsyncEncoder endEncoding];
-            commands = gAsyncCommands;
-            gAsyncEncoder = nil;
-            gAsyncCommands = nil;
-            [commands commit];
+            if (gInFlight == nil || gInFlight.count == 0) return true;
+            pending = [gInFlight copy];
+            [gInFlight removeAllObjects];
         }
-        [commands waitUntilCompleted];
-        return [commands status] == MTLCommandBufferStatusCompleted;
+        for (id<MTLCommandBuffer> commands in pending) {
+            [commands waitUntilCompleted];
+            if ([commands status] != MTLCommandBufferStatusCompleted) return false;
+        }
+        return true;
     }
 }
 

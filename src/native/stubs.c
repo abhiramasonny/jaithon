@@ -161,7 +161,7 @@ int jaiGpuMaxThreadsPerGroup(JaiGpuKernel *k) {
 
 bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                     const uint32_t *scalars, int scalarCount,
-                    int threads, int groupSize) {
+                    int threads, int groupSize, const size_t *byteOffsets) {
     (void)k;
     (void)buffers;
     (void)count;
@@ -169,13 +169,19 @@ bool jaiGpuDispatch(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
     (void)scalarCount;
     (void)threads;
     (void)groupSize;
+    (void)byteOffsets;
     return false;
 }
 
 bool jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                          const uint32_t *scalars, int scalarCount,
-                         int threads, int groupSize) {
-    return jaiGpuDispatch(k, buffers, count, scalars, scalarCount, threads, groupSize);
+                         int threads, int groupSize, const size_t *byteOffsets) {
+    return jaiGpuDispatch(k, buffers, count, scalars, scalarCount, threads,
+                          groupSize, byteOffsets);
+}
+
+bool jaiGpuFlush(void) {
+    return true;
 }
 
 bool jaiGpuSynchronize(void) {

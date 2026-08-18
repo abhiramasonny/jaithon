@@ -32,26 +32,51 @@ kernel void parameter_update(device float* value [[buffer(0)]],
         value[id] -= settings[0] * corrected_first / (sqrt(corrected_second) + settings[3]);
     }
 }
+
+kernel void parameter_update_sgd(device float* value [[buffer(0)]],
+                                 device const float* gradient [[buffer(1)]],
+                                 device const float* settings [[buffer(2)]],
+                                 constant uint& count [[buffer(3)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id < count) value[id] -= settings[0] * gradient[id];
+}
+
+kernel void parameter_update_sgd4(device float* value [[buffer(0)]],
+                                  device const float* gradient [[buffer(1)]],
+                                  device const float* settings [[buffer(2)]],
+                                  constant uint& count [[buffer(3)]],
+                                  uint id [[thread_position_in_grid]]) {
+    uint i = id * 4;
+    if (i >= count) return;
+    *((device float4*)(value + i)) -= settings[0] * *((device const float4*)(gradient + i));
+}
 """
 
 class ParameterState {
     pub let first_moment: Buffer
     pub let second_moment: Buffer
 
+    pub var settings: Buffer?
+
     pub fn init(self, size: int) {
         self.first_moment = Buffer.of([0.0 for _index in 0..size])
         self.second_moment = Buffer.of([0.0 for _index in 0..size])
+        self.settings = null
     }
 
     pub fn free(self) -> void {
         self.first_moment.free()
         self.second_moment.free()
+        let settings = self.settings
+        if settings is not null { settings.free() }
     }
 }
 
 var _states: dict[int, ParameterState] = {}
 var _steps: dict[int, int] = {}
 var _update_kernel: Kernel? = null
+var _sgd_kernel: Kernel? = null
+var _sgd4_kernel: Kernel? = null
 
 #: Clear every given parameter's optimizer state (momentum, second moment,
 #: step count).
@@ -78,6 +103,29 @@ fn kernel_for_update() -> Kernel {
     return kernel
 }
 
+fn kernel_for_sgd() -> Kernel {
+    let existing = _sgd_kernel
+    if existing is not null { return existing }
+    let kernel = Kernel.compile(SOURCE, "parameter_update_sgd")
+    _sgd_kernel = kernel
+    return kernel
+}
+
+fn kernel_for_sgd4() -> Kernel {
+    let existing = _sgd4_kernel
+    if existing is not null { return existing }
+    let kernel = Kernel.compile(SOURCE, "parameter_update_sgd4")
+    _sgd4_kernel = kernel
+    return kernel
+}
+
+#: Compile optimizer kernels before the first timed training step.
+pub fn warmup_kernels() -> void {
+    let _kernel = kernel_for_update()
+    let _sgd = kernel_for_sgd()
+    let _sgd4 = kernel_for_sgd4()
+}
+
 fn state_for(parameter: Tensor) -> ParameterState {
     let key = parameter.id
     let existing = _states.get(key, null)
@@ -95,14 +143,46 @@ fn next_step(parameter: Tensor) -> int {
     return updated
 }
 
+#: Allocate optimizer buffers before the first timed step.
+pub fn prepare_state(parameters: list[Tensor], settings: list[float]) -> void {
+    for parameter in parameters {
+        let state = state_for(parameter)
+        if state.settings is null { state.settings = Buffer.of(settings) }
+    }
+}
+
 fn apply_update(parameter: Tensor, settings: list[float], kind: int) -> void {
     let gradient = parameter.grad
     if gradient is null {
         throw RuntimeError("optimizer.step() needs every parameter to have a gradient")
     }
     let state = state_for(parameter)
-    let settings_buffer = Buffer.of(settings)
-    defer { settings_buffer.free() }
+    let existing_settings = state.settings
+    let settings_buffer = if existing_settings is null {
+        let created = Buffer.of(settings)
+        state.settings = created
+        created
+    } else {
+        existing_settings
+    }
+    if kind == 0 and settings[1] == 0.0 {
+        if parameter.size % 4 == 0 {
+            let kernel = kernel_for_sgd4()
+            kernel.dispatch_async(
+                [parameter.buffer(), gradient.buffer(), settings_buffer],
+                parameter.size // 4,
+                [parameter.size]
+            )
+        } else {
+            let kernel = kernel_for_sgd()
+            kernel.dispatch_async(
+                [parameter.buffer(), gradient.buffer(), settings_buffer],
+                parameter.size,
+                [parameter.size]
+            )
+        }
+        return
+    }
     let step = next_step(parameter)
     let kernel = kernel_for_update()
     kernel.dispatch_async(

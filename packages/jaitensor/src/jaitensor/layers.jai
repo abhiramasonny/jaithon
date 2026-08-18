@@ -2,7 +2,7 @@
 import std.math
 from std.gpu import Buffer
 from std.random import Random
-from .ops import add, matmul, relu, sigmoid, tanh
+from .ops import dense_affine
 from .tensor import Tensor
 
 #: Something `Sequential` can stack: turns an input tensor into an output
@@ -89,14 +89,8 @@ pub class Dense: Layer {
         let weights = self.weights_value
         let bias = self.bias_value
         if weights is null or bias is null { throw RuntimeError("Dense layer has not been built") }
-        let affine = add(matmul(x, weights), bias)
-        return match self.activation {
-            Activation.Linear => affine,
-            Activation.Relu => relu(affine),
-            Activation.Sigmoid => sigmoid(affine),
-            Activation.Tanh => tanh(affine),
-            Activation.Softmax => affine,
-        }
+        let affine = dense_affine(x, weights, bias, self.activation_code())
+        return affine
     }
 
     #: This layer's trainable tensors, in the order `get_weights` reports them.

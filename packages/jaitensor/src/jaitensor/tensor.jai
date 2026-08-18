@@ -43,16 +43,35 @@ pub class Tensor {
     pub let id: int
 
     #: Allocate a tensor, optionally initialized from host values.
-    pub fn init(self, shape: list[int], values: list[float]? = null, requires_grad: bool = false) {
+    #:
+    #: Pass `storage` to wrap an existing buffer (a view). The tensor does
+    #: not own that buffer; `free` only releases the view handle.
+    pub fn init(
+        self,
+        shape: list[int],
+        values: list[float]? = null,
+        requires_grad: bool = false,
+        storage: Buffer? = null
+    ) {
         self.shape = [dimension for dimension in shape]
         self.size = element_count(shape)
-        self.storage = gpu.Buffer(self.size)
         self.freed = false
         self.requires_grad = requires_grad
         self.grad = null
         self.creator = null
         self.topo_mark = false
         self.id = next_tensor_id()
+        if storage is not null {
+            if values is not null {
+                throw ValueError("a storage-backed tensor cannot also take host values")
+            }
+            if storage.count != self.size {
+                throw ValueError(f"storage has {storage.count} values, expected {self.size}")
+            }
+            self.storage = storage
+            return
+        }
+        self.storage = gpu.Buffer(self.size)
         if values is not null {
             if values.len() != self.size {
                 self.storage.free()
@@ -61,6 +80,16 @@ pub class Tensor {
             }
             self.storage.upload(values)
         }
+    }
+
+    #: A window into this tensor. Freeing the view does not free the parent.
+    pub fn view(self, start: int, shape: list[int]) -> Tensor {
+        self._check_live()
+        let n = element_count(shape)
+        if start < 0 or start + n > self.size {
+            throw ValueError(f"view offset {start} and size {n} run past tensor size {self.size}")
+        }
+        return Tensor(shape, storage: self.storage.view(start, n))
     }
 
     #: Allocate a zero-filled tensor.
@@ -130,10 +159,19 @@ pub class Tensor {
     #: Whether this tensor and `other` have identical dimensions.
     pub fn same_shape(self, other: Tensor) -> bool { return self.shape == other.shape }
 
+    #: Set every value to 0 on the device, keeping this tensor's buffer.
+    pub fn zero_(self) -> void {
+        self._check_live()
+        fill_zero_buffer(self)
+    }
+
     #: Release this tensor's device memory. Freeing twice is harmless.
+    #:
+    #: Does not wait for the GPU. In-flight command buffers keep the Metal
+    #: buffer alive until they complete; call `download()` or
+    #: `gpu.synchronize()` before reading values back.
     pub fn free(self) -> void {
         if self.freed { return }
-        gpu.synchronize()
         self.storage.free()
         self.freed = true
         let gradient = self.grad
@@ -171,19 +209,20 @@ pub class Tensor {
     #: pre-seeding the root gradient. Then accumulates into each
     #: dependency's `.grad`. Returns every non-leaf, non-root tensor the
     #: graph built — still valid, not yet freed — so the caller can free
-    #: them after its own next `gpu.synchronize()` instead of forcing one
-    #: here.
+    #: them after encoding the rest of the step. `Tensor.free` no longer
+    #: fences; `gpu.flush()` or `gpu.synchronize()` commits the work.
     pub fn backward(self) -> list[Tensor] {
         if self.size != 1 {
             throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
         }
-        if self.grad is null { self.grad = Tensor.ones(self.shape) }
+        let seeded = self.grad
+        let root_upstream = if seeded is not null { seeded } else { unit_scalar() }
         let order = self._topo_order()
         var index = order.len() - 1
         while index >= 0 {
             let tensor = order[index]
             let node = tensor.creator
-            let upstream = tensor.grad
+            let upstream = if tensor is self { root_upstream } else { tensor.grad }
             if node is not null and upstream is not null {
                 let grads = node.apply(upstream)
                 for (position, input) in node.inputs.enumerate() {
@@ -214,8 +253,10 @@ pub class Tensor {
         var intermediates: list[Tensor] = []
         for tensor in order {
             tensor.topo_mark = false
-            if tensor.creator is not null and tensor is not self {
-                intermediates.push(tensor)
+            let node = tensor.creator
+            if node is not null {
+                if tensor is not self { intermediates.push(tensor) }
+                for extra in node.extras { intermediates.push(extra) }
             }
         }
         return intermediates
@@ -238,11 +279,18 @@ pub class Tensor {
 #: returns one of its own `inputs` by reference — always a fresh tensor.
 pub class GradNode {
     pub let inputs: list[Tensor]
+    pub let extras: list[Tensor]
     let backward_fn: fn(Tensor) -> list[Tensor]
 
-    pub fn init(self, inputs: list[Tensor], backward_fn: fn(Tensor) -> list[Tensor]) {
+    pub fn init(
+        self,
+        inputs: list[Tensor],
+        backward_fn: fn(Tensor) -> list[Tensor],
+        extras: list[Tensor] = []
+    ) {
         self.inputs = inputs
         self.backward_fn = backward_fn
+        self.extras = extras
     }
 
     pub fn apply(self, upstream: Tensor) -> list[Tensor] { return self.backward_fn(upstream) }
@@ -258,9 +306,24 @@ kernel void grad_add(device const float* a [[buffer(0)]],
                      uint id [[thread_position_in_grid]]) {
     if (id < count) { output[id] = a[id] + b[id]; }
 }
+
+kernel void grad_add_into(device const float* source [[buffer(0)]],
+                          device float* dest [[buffer(1)]],
+                          constant uint& count [[buffer(2)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id < count) dest[id] += source[id];
+}
+
+kernel void fill_zero(device float* output [[buffer(0)]],
+                      constant uint& count [[buffer(1)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id < count) output[id] = 0.0f;
+}
 """
 
 var _grad_add_kernel: Kernel? = null
+var _grad_add_into_kernel: Kernel? = null
+var _fill_zero_kernel: Kernel? = null
 
 fn raw_grad_add(a: Tensor, b: Tensor) -> Tensor {
     let output = Tensor(a.shape)
@@ -276,7 +339,40 @@ fn raw_grad_add(a: Tensor, b: Tensor) -> Tensor {
     return output
 }
 
+fn raw_grad_add_into(dest: Tensor, source: Tensor) -> void {
+    let existing = _grad_add_into_kernel
+    let kernel = if existing is not null {
+        existing
+    } else {
+        let compiled = Kernel.compile(_GRAD_ADD_SOURCE, "grad_add_into")
+        _grad_add_into_kernel = compiled
+        compiled
+    }
+    kernel.dispatch_async([source.buffer(), dest.buffer()], dest.size, [dest.size])
+}
+
+fn fill_zero_buffer(tensor: Tensor) -> void {
+    let existing = _fill_zero_kernel
+    let kernel = if existing is not null {
+        existing
+    } else {
+        let compiled = Kernel.compile(_GRAD_ADD_SOURCE, "fill_zero")
+        _fill_zero_kernel = compiled
+        compiled
+    }
+    kernel.dispatch_async([tensor.buffer()], tensor.size, [tensor.size])
+}
+
 var _next_tensor_id: int = 0
+var _unit_scalar: Tensor? = null
+
+fn unit_scalar() -> Tensor {
+    let existing = _unit_scalar
+    if existing is not null and not existing.is_freed() { return existing }
+    let created = Tensor.ones([1])
+    _unit_scalar = created
+    return created
+}
 
 fn next_tensor_id() -> int {
     let id = _next_tensor_id
@@ -298,11 +394,11 @@ fn accumulate_grad(target: Tensor, contribution: Tensor) -> void {
     let existing = target.grad
     if existing is null {
         target.grad = contribution
+    } elif existing is contribution {
+        return
     } else {
-        let combined = raw_grad_add(existing, contribution)
-        existing.free()
+        raw_grad_add_into(existing, contribution)
         contribution.free()
-        target.grad = combined
     }
 }
 
