@@ -12,6 +12,12 @@
  * enough the counter costs nothing on cold code and low enough a benchmark
  * reaches it. */
 #define JAI_JIT_THRESHOLD 64
+#define JAI_JIT_TRACE_THRESHOLD 8
+
+static inline uint32_t jaiJitThreshold(const ObjFunction *fn) {
+    if (fn != NULL && (fn->flags & FN_TRACE) != 0) return JAI_JIT_TRACE_THRESHOLD;
+    return JAI_JIT_THRESHOLD;
+}
 
 /* An inline cache's observation window is meant to close before the tier first
  * asks what a site returns; a window that outlived the threshold would hand the
@@ -20,6 +26,8 @@
  * this constant, so the two are tied here. */
 _Static_assert(JAI_IC_OBS_BUDGET <= JAI_JIT_THRESHOLD,
                "an inline cache must settle before the tier reads it");
+_Static_assert(JAI_IC_OBS_BUDGET_TRACE <= JAI_JIT_TRACE_THRESHOLD,
+               "a traced function's caches must settle before it compiles");
 
 /* DECLINED: nothing touched, interpreter should run the call. ERROR: compiled
  * code called out, the callee raised, and those effects already happened, so

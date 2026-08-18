@@ -495,6 +495,10 @@ pub class Parser {
         if self._match(TokenKind.KwNull) {
             return _type(TypeKind.Name, self._span_since(start_index), name: "null")
         }
+        if self._check(TokenKind.Int) {
+            let token = self._advance()
+            return _type(TypeKind.Const, self._span_since(start_index), name: token.text)
+        }
 
         if not self._check(TokenKind.Ident) {
             self._error_at(
@@ -2220,6 +2224,7 @@ pub class Parser {
                 "isExprBody": is_expr_body,
                 "isGenerator": is_generator,
                 "isAsync": false,
+                "decorators": [],
             }
         )
     }
@@ -2328,6 +2333,8 @@ pub class Parser {
             self._skip_newlines()
             while not self._check(TokenKind.RBrace) and not self._check(TokenKind.Eof) {
                 let before = self.current
+                let decorators = self._parse_decorators()
+                let member_start = if decorators.len() > 0 { before } else { self.current }
                 let member_visibility = self._parse_member_visibility()
                 let member_static = self._match(TokenKind.KwStatic)
 
@@ -2345,11 +2352,14 @@ pub class Parser {
                     let method = self._parse_fn_rest(
                         member_visibility,
                         member_static,
-                        self.current,
+                        member_start,
                         true,
                         false
                     )
-                    if method != null { methods.push(method) }
+                    if method != null {
+                        if decorators.len() > 0 { method.set("decorators", decorators) }
+                        methods.push(method)
+                    }
                 } elif self._ident_text(0, "get") and self._kind_at(1) == TokenKind.Ident {
                     let getter = self._parse_accessor(member_visibility, member_static, false)
                     if getter != null { getters.push(getter) }
@@ -2395,6 +2405,19 @@ pub class Parser {
         if self._match(TokenKind.KwPub) { return Visibility.Public }
         if self._match(TokenKind.KwProt) { return Visibility.Protected }
         return Visibility.Private
+    }
+
+    #: Read `@name` decorators that precede a function declaration.
+    fn _parse_decorators(self) -> list[str] {
+        var decorators: list[str] = []
+        while self._check(TokenKind.At) {
+            self._advance()
+            let name = self._expect_ident_name("a decorator name")
+            if name == null { break }
+            decorators.push(name)
+            self._skip_newlines()
+        }
+        return decorators
     }
 
     fn _parse_field(self, visibility: Visibility, is_static: bool) -> dict[str, any]? {
@@ -2699,6 +2722,8 @@ pub class Parser {
     }
 
     fn _parse_declaration(self) -> Node? {
+        let decorator_start = self.current
+        let decorators = self._parse_decorators()
         let start_index = self.current
         var visibility = Visibility.Private
         var saw_visibility = false
@@ -2720,7 +2745,10 @@ pub class Parser {
             return self._parse_var_decl(visibility, start_index)
         }
         if kind == TokenKind.KwFn and self._kind_at(1) == TokenKind.Ident {
-            return self._parse_fn_rest(visibility, is_static, start_index, true, false)
+            let fn_start = if decorators.len() > 0 { decorator_start } else { start_index }
+            let decl = self._parse_fn_rest(visibility, is_static, fn_start, true, false)
+            if decl != null and decorators.len() > 0 { decl.set("decorators", decorators) }
+            return decl
         }
         if kind == TokenKind.KwImport or
             kind == TokenKind.KwFrom or

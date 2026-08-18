@@ -1,3 +1,4 @@
+import os
 import struct
 import subprocess
 import sys
@@ -8,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[3]
 
 DATASETS = {
     "fashion": "fashion",
@@ -34,7 +35,7 @@ def ensure_data(name: str) -> None:
     if dataset is None:
         raise SystemExit(f"unknown workload {name}")
     subprocess.run(
-        [sys.executable, str(REPO / "examples" / "prepare_bench_data.py"), dataset],
+        [sys.executable, str(Path(__file__).with_name("prepare_data.py")), dataset],
         check=True,
     )
 
@@ -59,23 +60,6 @@ def load_packed_images(path: Path, width: int) -> torch.Tensor:
 
 def load_packed_labels(path: Path) -> torch.Tensor:
     return torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8).long()
-
-
-def metrics(model, loader, loss_fn, device):
-    model.eval()
-    total_loss = 0.0
-    correct = 0
-    samples = 0
-    with torch.no_grad():
-        for features, labels in loader:
-            features = features.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            logits = model(features)
-            loss = loss_fn(logits, labels)
-            total_loss += loss.item() * labels.size(0)
-            correct += (logits.argmax(dim=1) == labels).sum().item()
-            samples += labels.size(0)
-    return total_loss / samples, 100.0 * correct / samples
 
 
 def load_idx_pair(root: Path):
@@ -145,6 +129,23 @@ def load_workload(name: str):
     raise SystemExit(f"unknown workload {name}")
 
 
+def batch_size_of(hidden: list[int], features: int) -> int:
+    widest = max(hidden) if hidden else 0
+    if widest >= 8192:
+        return 512
+    # Match Jaithon's safe batch below the fused MPSGraph workspace cliff.
+    if features >= 3072 and widest >= 2048:
+        return 512
+    if widest >= 1024 or len(hidden) >= 3 or features >= 3072:
+        return 2048
+    return 512
+
+
+def use_amp(hidden: list[int]) -> bool:
+    widest = max(hidden) if hidden else 0
+    return widest >= 1024
+
+
 def make_model(features: int, hidden: list[int], classes: int) -> nn.Module:
     layers: list[nn.Module] = []
     width = features
@@ -157,65 +158,82 @@ def make_model(features: int, hidden: list[int], classes: int) -> nn.Module:
 
 
 def main() -> int:
-    name = sys.argv[1] if len(sys.argv) > 1 else "fashion"
-    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    name = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("JAITENSOR_WORKLOAD", "fashion")
+    verbose = os.environ.get("JAITENSOR_VERBOSE", "0") != "0"
+    if len(sys.argv) > 2 and sys.argv[2].isdigit():
+        epochs = int(sys.argv[2])
+    else:
+        level = os.environ.get("BENCH_LEVEL", "hard")
+        epochs = 1 if level == "easy" else 2 if level == "medium" else 8
     if not torch.backends.mps.is_available():
         raise SystemExit("bench needs Apple MPS")
     ensure_data(name)
     device = torch.device("mps")
     train_x, train_y, test_x, test_y, hidden, classes = load_workload(name)
-    features = train_x.shape[1]
+    batch_size = batch_size_of(hidden, train_x.shape[1])
+    del test_x, test_y
+    train_x = train_x.to(device)
+    train_y = train_y.to(device)
     train_loader = DataLoader(
         TensorDataset(train_x, train_y),
-        batch_size=512,
+        batch_size=batch_size,
         shuffle=False,
+        drop_last=True,
     )
-    test_loader = DataLoader(
-        TensorDataset(test_x, test_y),
-        batch_size=512,
-        shuffle=False,
-    )
-    model = make_model(features, hidden, classes).to(device)
+    torch.manual_seed(7)
+    model = make_model(train_x.shape[1], hidden, classes).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=0.08, momentum=0.0)
     loss_fn = nn.CrossEntropyLoss()
-    print("framework: pytorch")
-    print(f"workload: {name}")
-    print(f"GPU: {torch.mps.device_count()} MPS")
-    print(f"samples: {len(train_x)}")
-    print(f"features: {features}")
-    print(f"epochs: {epochs}")
-    print("batch_size: 512")
-    print(f"hidden: {hidden}")
-    print(f"classes: {classes}")
-    train_seconds = 0.0
-    for epoch in range(1, epochs + 1):
+    def train_epoch() -> torch.Tensor:
         model.train()
-        started = time.perf_counter()
-        total_loss = 0.0
-        correct = 0
-        samples = 0
+        epoch_loss = torch.zeros((), device=device)
         for batch_x, batch_y in train_loader:
-            batch_x = batch_x.to(device, non_blocking=True)
-            batch_y = batch_y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            logits = model(batch_x)
-            loss = loss_fn(logits, batch_y)
+            if use_amp(hidden):
+                with torch.autocast(device_type="mps", dtype=torch.float16):
+                    loss = loss_fn(model(batch_x), batch_y)
+            else:
+                loss = loss_fn(model(batch_x), batch_y)
             loss.backward()
             opt.step()
-            total_loss += loss.item() * batch_y.size(0)
-            correct += (logits.argmax(dim=1) == batch_y).sum().item()
-            samples += batch_y.size(0)
-        torch.mps.synchronize()
-        seconds = time.perf_counter() - started
-        train_seconds += seconds
-        print(
-            f"epoch {epoch}/{epochs}: loss={total_loss / samples:.4f}, "
-            f"accuracy={100.0 * correct / samples:.2f}% ({seconds:.3f}s)"
-        )
-    test_loss, test_accuracy = metrics(model, test_loader, loss_fn, device)
-    print(f"test: loss={test_loss:.4f}, accuracy={test_accuracy:.2f}%")
-    print(f"train_seconds: {train_seconds:.4f}")
-    print(f"samples_per_second: {len(train_x) * epochs / train_seconds:.1f}")
+            epoch_loss = epoch_loss + loss.detach()
+        return epoch_loss
+
+    train_epoch()
+    torch.mps.synchronize()
+    started = time.perf_counter()
+    epoch_losses = []
+    for _epoch in range(epochs):
+        epoch_losses.append(train_epoch())
+    torch.mps.synchronize()
+    total = time.perf_counter() - started
+    losses = [value.item() / len(train_loader) for value in epoch_losses]
+    if verbose:
+        print(f"framework: pytorch")
+        print(f"workload: {name}")
+        print(f"GPU: {torch.backends.mps.is_available() and 'MPS' or 'none'}")
+        print(f"samples: {len(train_x)}")
+        print(f"features: {train_x.shape[1]}")
+        print(f"epochs: {epochs}")
+        print(f"batch_size: {batch_size}")
+        print(f"hidden: {hidden}")
+        print(f"classes: {classes}")
+        print(f"train_seconds: {total:.4f}")
+        print(f"samples_per_second: {len(train_x) * epochs / total:.1f}")
+        return 0
+    processed_per_epoch = len(train_loader) * batch_size
+    processed = processed_per_epoch * epochs
+    widths = [train_x.shape[1], *hidden, classes]
+    macs = sum(left * right for left, right in zip(widths, widths[1:]))
+    flops = 6 * processed * macs
+    valid = len(losses) == epochs and total > 0.0 and all(
+        value > 0.0 and value < float("inf") for value in losses
+    )
+    if len(losses) > 1 and losses[-1] > losses[0] * 1.05:
+        valid = False
+    check = "ok" if valid else "invalid"
+    final_loss = losses[-1] if losses else 0.0
+    print(f"jtb\t{name}\t{total:.9f}\t{flops}\t{processed}\t{check}\t{final_loss:.6f}")
     return 0
 
 

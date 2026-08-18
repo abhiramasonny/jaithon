@@ -65,7 +65,15 @@ let WILDCARDS = ["f64_", "bytes_", "mutex_", "cond_", "atomic_", "gpu_", "gui_",
 #: because `lib/std/time.jai` still calls it. It is the one name the runtime
 #: publishes that Appendix C does not, and it goes when that call is repointed
 #: — which is why this is a subset test and not an equality test.
-let TOLERATED = ["time_sleep"]
+let TOLERATED = [
+    "time_sleep",
+    "function_flags",
+    "function_has_flag",
+    "trace_active",
+    "trace_record_op",
+    "trace_replay",
+    "trace_run_id",
+]
 
 fn covered_by_a_wildcard(name: str) -> bool {
     for prefix in WILDCARDS {

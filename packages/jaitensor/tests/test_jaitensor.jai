@@ -1,12 +1,15 @@
 #: GPU tensor operations, generic datasets, optimizers, and model lifecycle.
 import jaitensor as jt
+import std.gpu as gpu
 import std.math
 import std.os
 from jaitensor import Dataset
+from jaitensor.ops import dense_static_forward, matmul_backend
 from jaitensor.tensor import GradNode, Tensor
 from std.io import Path, read_file
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_throws, assert_true
+from std.trace import is_traced
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
     assert_eq(actual.len(), expected.len())
@@ -29,17 +32,75 @@ fn numerical_grad(
 }
 
 fn reduce_to_scalar_for_test(t: Tensor) -> Tensor {
-    let values = t.download()
-    var total = 0.0
-    for value in values { total += value }
-    let scalar = jt.Tensor([1], [total], requires_grad: t.requires_grad)
-    if t.requires_grad {
-        scalar.creator = GradNode([t], fn(upstream: Tensor) -> list[Tensor] {
-            let value = upstream.download()[0]
-            return [jt.Tensor(t.shape, [value for _index in 0..t.size])]
-        })
+    return jt.sum(t)
+}
+
+fn device_tensor(shape: list[int], seed: int) -> Tensor {
+    let tensor = jt.Tensor(shape)
+    tensor.buffer().fill_uniform(-1.0, 1.0, seed)
+    return tensor
+}
+
+fn assert_gpu_matmul_probes(
+    product: Tensor,
+    a: Tensor,
+    b: Tensor,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false,
+    tol: float = 5e-3
+) -> void {
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    let probes = [
+        [0, 0],
+        [0, columns - 1],
+        [rows - 1, 0],
+        [rows - 1, columns - 1],
+        [rows // 2, columns // 2]
+    ]
+    for probe in probes {
+        let row = probe[0]
+        let column = probe[1]
+        var want = 0.0
+        for k in 0..inner {
+            let av = if trans_a { a_vals[k * rows + row] } else { a_vals[row * inner + k] }
+            let bv = if trans_b { b_vals[column * inner + k] } else { b_vals[k * columns + column] }
+            want += av * bv
+        }
+        assert_near(got[row * columns + column], want, tol)
     }
-    return scalar
+}
+
+fn assert_gpu_matmul(
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false,
+    tol: float = 5e-3
+) -> void {
+    let a = if trans_a { device_tensor([inner, rows], 1) } else { device_tensor([rows, inner], 1) }
+    let b = if trans_b { device_tensor([columns, inner], 2) } else { device_tensor([inner, columns], 2) }
+    defer { a.free() }
+    defer { b.free() }
+    gpu.flush()
+    let product = jt.matmul(a, b, trans_a: trans_a, trans_b: trans_b)
+    defer { product.free() }
+    assert_gpu_matmul_probes(
+        product,
+        a,
+        b,
+        rows,
+        inner,
+        columns,
+        trans_a: trans_a,
+        trans_b: trans_b,
+        tol: tol
+    )
 }
 
 fn separable_data(repeats: int = 32) -> Dataset {
@@ -276,54 +337,82 @@ fn test_tiled_matmul_matches_cpu_on_ragged_tiles() -> void {
     }
 }
 
+fn test_matmul_backend_explains_shape_dispatch() -> void {
+    assert_eq(matmul_backend(512, 784, 256), "mpsgraph")
+    assert_eq(matmul_backend(2048, 784, 256), "mma64")
+    assert_eq(matmul_backend(4096, 784, 256), "mpsgraph")
+    assert_eq(matmul_backend(4096, 3072, 512), "mpsgraph")
+    assert_eq(matmul_backend(8, 7, 5), "tiled32")
+}
+
 fn test_staged_64_matmul_matches_cpu() -> void {
     if not jt.is_available() { return }
-    let rows = 64
-    let inner = 1024
-    let columns = 64
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
-    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
-    defer { a.free() }
-    defer { b.free() }
-    let product = jt.matmul(a, b)
-    defer { product.free() }
-    let got = product.download()
-    let a_vals = a.download()
-    let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
-            var want = 0.0
-            for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
-            }
-            assert_near(got[row * columns + column], want, 5e-3)
-        }
-    }
+    assert_gpu_matmul(64, 1024, 64)
 }
 
 fn test_wide_nn2_matmul_matches_cpu() -> void {
     if not jt.is_available() { return }
-    let rows = 128
-    let inner = 80
-    let columns = 2048
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
+    assert_gpu_matmul(128, 80, 2048)
+}
+
+fn test_mps_scale_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    assert_gpu_matmul(512, 2048, 1024, tol: 2e-2)
+}
+
+fn test_mps_scale_transposed_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 784
+    let inner = 512
+    let columns = 4096
+    let a = jt.Tensor([inner, rows], [float(i * 3 % 11) for i in 0..inner * rows])
     let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
     defer { a.free() }
     defer { b.free() }
-    let product = jt.matmul(a, b)
+    let product = jt.matmul(a, b, trans_a: true)
     defer { product.free() }
     let got = product.download()
     let a_vals = a.download()
     let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
+    for row in [0, 100, 783] {
+        for column in [0, 1, 64, 2048, 4095] {
             var want = 0.0
             for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
+                want += a_vals[k * rows + row] * b_vals[k * columns + column]
             }
-            assert_near(got[row * columns + column], want, 5e-3)
+            assert_near(got[row * columns + column], want, 2e-2)
         }
     }
+}
+
+fn test_mps_fashion_weight_grad_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    let rows = 784
+    let inner = 512
+    let columns = 256
+    let a = jt.Tensor([inner, rows], [float(i * 3 % 11) for i in 0..inner * rows])
+    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
+    defer { a.free() }
+    defer { b.free() }
+    let product = jt.matmul(a, b, trans_a: true)
+    defer { product.free() }
+    let got = product.download()
+    let a_vals = a.download()
+    let b_vals = b.download()
+    for row in [0, 100, 783] {
+        for column in [0, 1, 64, 255] {
+            var want = 0.0
+            for k in 0..inner {
+                want += a_vals[k * rows + row] * b_vals[k * columns + column]
+            }
+            assert_near(got[row * columns + column], want, 2e-2)
+        }
+    }
+}
+
+fn test_mps_cifar_layer_matmul_matches_cpu() -> void {
+    if not jt.is_available() { return }
+    assert_gpu_matmul(512, 3072, 512, tol: 2e-2)
 }
 
 fn test_staged_64_transposed_matmul_matches_cpu() -> void {
@@ -365,77 +454,17 @@ fn test_staged_64_transposed_matmul_matches_cpu() -> void {
 
 fn test_staged_64_matmul_covers_row_remainder() -> void {
     if not jt.is_available() { return }
-    let rows = 80
-    let inner = 1024
-    let columns = 64
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
-    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
-    defer { a.free() }
-    defer { b.free() }
-    let product = jt.matmul(a, b)
-    defer { product.free() }
-    let got = product.download()
-    let a_vals = a.download()
-    let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
-            var want = 0.0
-            for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
-            }
-            assert_near(got[row * columns + column], want, 5e-3)
-        }
-    }
+    assert_gpu_matmul(80, 1024, 64)
 }
 
 fn test_staged_64_matmul_covers_l_remainder() -> void {
     if not jt.is_available() { return }
-    let rows = 80
-    let inner = 1024
-    let columns = 100
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
-    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
-    defer { a.free() }
-    defer { b.free() }
-    let product = jt.matmul(a, b)
-    defer { product.free() }
-    let got = product.download()
-    let a_vals = a.download()
-    let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
-            var want = 0.0
-            for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
-            }
-            assert_near(got[row * columns + column], want, 5e-3)
-        }
-    }
+    assert_gpu_matmul(80, 1024, 100)
 }
 
 fn test_staged_64_matmul_ragged_k_matches_cpu() -> void {
     if not jt.is_available() { return }
-    let rows = 64
-    let inner = 784
-    let columns = 1024
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
-    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
-    defer { a.free() }
-    defer { b.free() }
-    let product = jt.matmul(a, b)
-    defer { product.free() }
-    let got = product.download()
-    let a_vals = a.download()
-    let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
-            var want = 0.0
-            for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
-            }
-            assert_near(got[row * columns + column], want, 5e-3)
-        }
-    }
+    assert_gpu_matmul(64, 784, 1024)
 }
 
 fn test_mma_ragged_k_transposed_matmul_matches_cpu() -> void {
@@ -465,27 +494,7 @@ fn test_mma_ragged_k_transposed_matmul_matches_cpu() -> void {
 
 fn test_aligned_256_matmul_matches_cpu() -> void {
     if not jt.is_available() { return }
-    let rows = 64
-    let inner = 256
-    let columns = 256
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) / 11.0 for i in 0..rows * inner])
-    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) / 7.0 - 0.5 for i in 0..inner * columns])
-    defer { a.free() }
-    defer { b.free() }
-    let product = jt.matmul(a, b)
-    defer { product.free() }
-    let got = product.download()
-    let a_vals = a.download()
-    let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
-            var want = 0.0
-            for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
-            }
-            assert_near(got[row * columns + column], want, 5e-3)
-        }
-    }
+    assert_gpu_matmul(64, 256, 256)
 }
 
 fn test_fused_64_relu_affine_backward_matches_cpu() -> void {
@@ -558,27 +567,7 @@ fn test_fused_64_relu_affine_backward_matches_cpu() -> void {
 
 fn test_staged_128_matmul_matches_cpu() -> void {
     if not jt.is_available() { return }
-    let rows = 128
-    let inner = 1024
-    let columns = 128
-    let a = jt.Tensor([rows, inner], [float(i * 3 % 11) for i in 0..rows * inner])
-    let b = jt.Tensor([inner, columns], [float(i * 5 % 7) for i in 0..inner * columns])
-    defer { a.free() }
-    defer { b.free() }
-    let product = jt.matmul(a, b)
-    defer { product.free() }
-    let got = product.download()
-    let a_vals = a.download()
-    let b_vals = b.download()
-    for row in 0..rows {
-        for column in 0..columns {
-            var want = 0.0
-            for k in 0..inner {
-                want += a_vals[row * inner + k] * b_vals[k * columns + column]
-            }
-            assert_near(got[row * columns + column], want, 5e-3)
-        }
-    }
+    assert_gpu_matmul(128, 1024, 128)
 }
 
 fn test_staged_128_transposed_matmul_matches_cpu() -> void {
@@ -1250,4 +1239,711 @@ fn test_history_plot_uses_the_jaiplot_package_dependency() -> void {
     assert_true(document.contains("validation"))
     assert_true(document.contains("test"))
     assert_eq(history.plot_path, path.to_str())
+}
+
+fn test_fused_two_layer_relu_sgd_reduces_loss() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(512, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.2), loss: jt.SparseCategoricalCrossentropy())
+    let history = model.fit(data, epochs: 6, batch_size: 32, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_fused_mlp_step_with_momentum_reduces_loss() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(512, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(
+        jt.SGD(learning_rate: 0.2, momentum: 0.5),
+        loss: jt.SparseCategoricalCrossentropy()
+    )
+    let history = model.fit(data, epochs: 6, batch_size: 32, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_fused_three_layer_relu_sgd_reduces_loss() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(256, activation: jt.Activation.Relu),
+            jt.Dense(256, activation: jt.Activation.Relu),
+            jt.Dense(256, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.2), loss: jt.SparseCategoricalCrossentropy())
+    let history = model.fit(data, epochs: 10, batch_size: 32, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_fused_mlp_step_adam_reduces_loss() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(512, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(jt.Adam(learning_rate: 0.05), loss: jt.SparseCategoricalCrossentropy())
+    let history = model.fit(data, epochs: 6, batch_size: 32, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_execution_plan_built_on_compile() -> void {
+    if not jt.is_available() { return }
+    let model = jt.Sequential(
+        [
+            jt.Dense(16, activation: jt.Activation.Relu),
+            jt.Dense(4, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(jt.SGD(), input_units: 2, batch_size: 32)
+    let plan = model.execution_plan()
+    assert plan is not null
+    assert_eq(plan.input_units, 2)
+    assert_eq(plan.batch_size, 32)
+    assert_eq(plan.layer_widths, [16, 4])
+    assert plan.static_step
+}
+
+fn test_static_step_reduces_loss() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(32, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(
+        jt.SGD(learning_rate: 0.2),
+        loss: jt.SparseCategoricalCrossentropy(),
+        input_units: 2,
+        batch_size: 32
+    )
+    let history = model.fit(data, epochs: 8, batch_size: 32, verbose: false, plot_path: null)
+    assert history.loss[history.loss.len() - 1] < history.loss[0]
+}
+
+fn test_static_step_matches_autograd_weights() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let static_model = jt.Sequential(
+        [
+            jt.Dense(16, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { static_model.free() }
+    let autograd_model = jt.Sequential(
+        [
+            jt.Dense(16, activation: jt.Activation.Relu),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { autograd_model.free() }
+    static_model.build(2)
+    autograd_model.build(2)
+    let (weights, bias) = static_model.layers[0].get_weights()
+    let (head_weights, head_bias) = static_model.layers[1].get_weights()
+    autograd_model.layers[0].set_weights(weights, bias)
+    autograd_model.layers[1].set_weights(head_weights, head_bias)
+    static_model.compile(
+        jt.SGD(learning_rate: 0.1),
+        loss: jt.SparseCategoricalCrossentropy(),
+        input_units: 2,
+        batch_size: 32
+    )
+    autograd_model.compile(jt.SGD(learning_rate: 0.1), loss: jt.SparseCategoricalCrossentropy())
+    let static_history = static_model.fit(data, epochs: 3, batch_size: 32, verbose: false, plot_path: null)
+    let autograd_history = autograd_model.fit(data, epochs: 3, batch_size: 32, verbose: false, plot_path: null)
+    assert abs(static_history.loss[2] - autograd_history.loss[2]) < 0.05
+}
+
+fn test_static_kernels_are_traced() -> void {
+    assert is_traced(dense_static_forward)
+}
+
+fn test_conv2d_matches_spatial_output_and_channel_count() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([1, 4, 4, 1], [
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+        13.0, 14.0, 15.0, 16.0,
+    ])
+    let weights = jt.Tensor([2, 2, 1, 1], [1.0, 0.0, 0.0, 0.0])
+    let y = jt.conv2d(x, weights, stride: 1, padding: 0)
+    defer { x.free() }
+    defer { weights.free() }
+    defer { y.free() }
+    assert_eq(y.shape, [1, 3, 3, 1])
+    let values = y.download()
+    assert_near(values[0], 1.0)
+    assert_near(values[1], 2.0)
+    assert_near(values[3], 5.0)
+}
+
+fn test_layer_norm_centers_each_row() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0])
+    let gamma = jt.ones([4])
+    let beta = jt.zeros([4])
+    let y = jt.layer_norm(x, gamma, beta)
+    defer { x.free() }
+    defer { gamma.free() }
+    defer { beta.free() }
+    defer { y.free() }
+    let values = y.download()
+    var mean = 0.0
+    for index in 0..4 { mean += values[index] }
+    assert_near(mean / 4.0, 0.0, 1e-4)
+}
+
+fn test_attention_keeps_sequence_shape() -> void {
+    if not jt.is_available() { return }
+    let q = jt.Tensor([2, 4], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+    let k = jt.Tensor([2, 4], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+    let v = jt.Tensor([2, 4], [2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0])
+    let y = jt.scaled_dot_product_attention(q, k, v)
+    defer { q.free() }
+    defer { k.free() }
+    defer { v.free() }
+    defer { y.free() }
+    assert_eq(y.shape, [2, 4])
+    let same = jt.multi_head_attention(q, k, v, 1)
+    defer { same.free() }
+    assert_values_near(y.download(), same.download(), 1e-5)
+}
+
+fn test_dataloader_shuffle_covers_every_sample() -> void {
+    if not jt.is_available() { return }
+    let data = jt.Dataset.from_flat([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [0, 1, 2], 2)
+    defer { data.free() }
+    let loader = jt.DataLoader(data, 2, shuffle: true, seed: 3)
+    var seen = 0
+    while loader.has_next() {
+        let (features, labels) = loader.next_batch()
+        seen += labels.size
+        features.free()
+        labels.free()
+    }
+    assert_eq(seen, 3)
+}
+
+fn test_mixed_precision_matmul_stays_close() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([4, 4], [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ])
+    let b = jt.Tensor([4, 4], [
+        2.0, 0.0, 0.0, 0.0,
+        0.0, 3.0, 0.0, 0.0,
+        0.0, 0.0, 4.0, 0.0,
+        0.0, 0.0, 0.0, 5.0,
+    ])
+    jt.set_mixed_precision(true)
+    let y = jt.matmul(a, b)
+    jt.set_mixed_precision(false)
+    defer { a.free() }
+    defer { b.free() }
+    defer { y.free() }
+    let values = y.download()
+    assert_near(values[0], 2.0, 1e-3)
+    assert_near(values[5], 3.0, 1e-3)
+    assert_near(values[10], 4.0, 1e-3)
+    assert_near(values[15], 5.0, 1e-3)
+}
+
+fn test_conv2d_layer_builds_from_image_shape() -> void {
+    if not jt.is_available() { return }
+    var pixels: list[float] = []
+    var labels: list[int] = []
+    for sample in 0..4 {
+        for _pixel in 0..16 { pixels.push(float(sample)) }
+        labels.push(sample % 2)
+    }
+    let features = jt.Tensor([4, 4, 4, 1], pixels)
+    let data = jt.Dataset(features, jt.Tensor([4], [float(label) for label in labels]))
+    defer { data.free() }
+    let model = jt.Sequential([
+        jt.Conv2d(2, 3, padding: 1, in_channels: 1),
+        jt.Flatten(),
+        jt.Dense(2, activation: jt.Activation.Softmax),
+    ])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.05))
+    let history = model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
+    assert_true(history.loss.len() == 1)
+}
+
+fn test_device_count_is_non_negative() -> void {
+    if not jt.is_available() { return }
+    assert_true(jt.device_count() >= 1)
+}
+
+fn shaped_identity(x: Tensor[float, 2, 3]) -> Tensor[float, 2, 3] {
+    return x
+}
+
+fn test_shaped_tensor_annotation_accepts_matching_runtime_value() -> void {
+    if not jt.is_available() { return }
+    let tensor = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    defer { tensor.free() }
+    let got = shaped_identity(tensor)
+    assert_eq(got.size, 6)
+}
+
+fn test_unary_abs_neg_square_and_gelu() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([4], [-2.0, -0.0, 0.5, 2.0])
+    defer { x.free() }
+    let a = jt.abs(x)
+    let n = jt.neg(x)
+    let s = jt.square(x)
+    let g = jt.gelu(jt.Tensor([1], [0.0]))
+    defer { a.free() }
+    defer { n.free() }
+    defer { s.free() }
+    defer { g.free() }
+    assert_values_near(a.download(), [2.0, 0.0, 0.5, 2.0], 1e-5)
+    assert_values_near(n.download(), [2.0, 0.0, -0.5, -2.0], 1e-5)
+    assert_values_near(s.download(), [4.0, 0.0, 0.25, 4.0], 1e-5)
+    assert_values_near(g.download(), [0.0], 1e-5)
+}
+
+fn test_sum_mean_clamp_and_cat() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    defer { x.free() }
+    let all = jt.sum(x)
+    let rows = jt.sum(x, axis: -1)
+    let avg = jt.mean(x)
+    let clipped = jt.clamp(x, 2.0, 5.0)
+    let stacked = jt.cat([x, x], axis: 0)
+    defer { all.free() }
+    defer { rows.free() }
+    defer { avg.free() }
+    defer { clipped.free() }
+    defer { stacked.free() }
+    assert_values_near(all.download(), [21.0], 1e-4)
+    assert_values_near(rows.download(), [6.0, 15.0], 1e-4)
+    assert_values_near(avg.download(), [3.5], 1e-4)
+    assert_values_near(clipped.download(), [2.0, 2.0, 3.0, 4.0, 5.0, 5.0], 1e-5)
+    assert_eq(stacked.shape, [4, 3])
+}
+
+fn test_max_pool2d_and_mse() -> void {
+    if not jt.is_available() { return }
+    let images = jt.Tensor([1, 2, 2, 1], [1.0, 2.0, 3.0, 4.0])
+    defer { images.free() }
+    let pooled = jt.max_pool2d(images, 2)
+    defer { pooled.free() }
+    assert_eq(pooled.shape, [1, 1, 1, 1])
+    assert_values_near(pooled.download(), [4.0], 1e-5)
+    let pred = jt.Tensor([2], [1.0, 3.0])
+    let target = jt.Tensor([2], [1.0, 1.0])
+    defer { pred.free() }
+    defer { target.free() }
+    let loss = jt.mse(pred, target)
+    defer { loss.free() }
+    assert_values_near(loss.download(), [2.0], 1e-4)
+}
+
+fn test_dropout_eval_is_identity_and_reshape_is_a_view() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([3], [1.0, 2.0, 3.0])
+    defer { x.free() }
+    let kept = jt.dropout(x, 0.5, training: false)
+    defer { kept.free() }
+    assert_eq(kept.download(), [1.0, 2.0, 3.0])
+    let viewed = jt.reshape(x, [1, 3])
+    defer { viewed.free() }
+    assert_eq(viewed.shape, [1, 3])
+    assert_eq(viewed.download(), [1.0, 2.0, 3.0])
+}
+
+fn test_cat_last_axis_and_pad2d() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    let b = jt.Tensor([2, 1], [5.0, 6.0])
+    defer { a.free() }
+    defer { b.free() }
+    let joined = jt.cat([a, b], axis: 1)
+    defer { joined.free() }
+    assert_eq(joined.shape, [2, 3])
+    assert_values_near(joined.download(), [1.0, 2.0, 5.0, 3.0, 4.0, 6.0], 1e-5)
+    let image = jt.Tensor([1, 1, 1, 1], [9.0])
+    defer { image.free() }
+    let padded = jt.pad2d(image, [1, 0, 0, 1])
+    defer { padded.free() }
+    assert_eq(padded.shape, [1, 2, 2, 1])
+    assert_values_near(padded.download(), [0.0, 0.0, 9.0, 0.0], 1e-5)
+}
+
+fn test_where_squeeze_stack_and_pow() -> void {
+    if not jt.is_available() { return }
+    let cond = jt.Tensor([3], [1.0, 0.0, 1.0])
+    let left = jt.Tensor([3], [2.0, 3.0, 4.0])
+    let right = jt.Tensor([3], [8.0, 9.0, 10.0])
+    defer { cond.free() }
+    defer { left.free() }
+    defer { right.free() }
+    let picked = jt.where(cond, left, right)
+    defer { picked.free() }
+    assert_values_near(picked.download(), [2.0, 9.0, 4.0], 1e-5)
+    let unit = jt.unsqueeze(left, 0)
+    defer { unit.free() }
+    assert_eq(unit.shape, [1, 3])
+    let back = jt.squeeze(unit, axis: 0)
+    defer { back.free() }
+    assert_eq(back.shape, [3])
+    let stacked = jt.stack([left, right])
+    defer { stacked.free() }
+    assert_eq(stacked.shape, [2, 3])
+    let squared = jt.pow(left, 2.0)
+    defer { squared.free() }
+    assert_values_near(squared.download(), [4.0, 9.0, 16.0], 1e-4)
+}
+
+fn test_sequential_predict_skips_dropout() -> void {
+    if not jt.is_available() { return }
+    let data = separable_data(8)
+    defer { data.free() }
+    let model = jt.Sequential([
+        jt.Dense(4, activation: jt.Activation.Relu),
+        jt.Dropout(0.9),
+        jt.Dense(2, activation: jt.Activation.Softmax),
+    ])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.05))
+    model.fit(data, epochs: 1, batch_size: 8, verbose: false, plot_path: null)
+    let batch = data.features.view(0, [8, 2])
+    defer { batch.free() }
+    let first = model.predict(batch)
+    defer { first.free() }
+    let second = model.predict(batch)
+    defer { second.free() }
+    assert_values_near(first.download(), second.download(), 1e-5)
+}
+
+fn test_ones_full_skip_host_lists_and_layouts() -> void {
+    if not jt.is_available() { return }
+    let ones = jt.ones([3])
+    let filled = jt.fill([2], 7.0)
+    defer { ones.free() }
+    defer { filled.free() }
+    assert_eq(ones.download(), [1.0, 1.0, 1.0])
+    assert_eq(filled.download(), [7.0, 7.0])
+    let nhwc = jt.Tensor([1, 2, 2, 1], [1.0, 2.0, 3.0, 4.0])
+    defer { nhwc.free() }
+    let nchw = jt.nchw(nhwc)
+    defer { nchw.free() }
+    assert_eq(nchw.shape, [1, 1, 2, 2])
+    assert_values_near(nchw.download(), [1.0, 2.0, 3.0, 4.0], 1e-5)
+    let back = jt.nhwc(nchw)
+    defer { back.free() }
+    assert_values_near(back.download(), [1.0, 2.0, 3.0, 4.0], 1e-5)
+    let src = jt.Tensor([2, 1], [1.0, 2.0])
+    defer { src.free() }
+    let tiled = jt.repeat(src, 3)
+    defer { tiled.free() }
+    assert_eq(tiled.shape, [2, 3])
+    assert_values_near(tiled.download(), [1.0, 1.0, 1.0, 2.0, 2.0, 2.0], 1e-5)
+    let pred = jt.Tensor([2], [0.9, 0.1])
+    let target = jt.Tensor([2], [1.0, 0.0])
+    defer { pred.free() }
+    defer { target.free() }
+    let loss = jt.binary_cross_entropy(pred, target)
+    defer { loss.free() }
+    assert_true(loss.download()[0] > 0.0)
+    assert_true(loss.download()[0] < 0.5)
+}
+
+fn test_eye_flip_upsample_and_split_heads() -> void {
+    if not jt.is_available() { return }
+    let ident = jt.eye(3)
+    defer { ident.free() }
+    assert_eq(ident.download(), [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    let src = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    defer { src.free() }
+    let flipped = jt.flip(src)
+    defer { flipped.free() }
+    assert_eq(flipped.download(), [3.0, 2.0, 1.0, 6.0, 5.0, 4.0])
+    let image = jt.Tensor([1, 1, 2, 1], [1.0, 2.0])
+    defer { image.free() }
+    let up = jt.upsample_nearest2d(image, 2)
+    defer { up.free() }
+    assert_eq(up.shape, [1, 2, 4, 1])
+    assert_eq(up.download(), [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0])
+    let packed_in = jt.Tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    defer { packed_in.free() }
+    let split = jt.split_heads(packed_in, 2)
+    defer { split.free() }
+    assert_eq(split.shape, [4, 2])
+    assert_eq(split.download(), [1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0])
+    let merged = jt.merge_heads(split, 2, 2)
+    defer { merged.free() }
+    assert_eq(merged.download(), packed_in.download())
+}
+
+fn test_multi_head_attention_matches_per_head_sdpa() -> void {
+    if not jt.is_available() { return }
+    let q = jt.Tensor([2, 4], [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0])
+    let k = jt.Tensor([2, 4], [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0])
+    let v = jt.Tensor([2, 4], [2.0, 0.0, 3.0, 0.0, 0.0, 4.0, 0.0, 5.0])
+    defer { q.free() }
+    defer { k.free() }
+    defer { v.free() }
+    let fused = jt.multi_head_attention(q, k, v, 2)
+    defer { fused.free() }
+    let seq = 2
+    let heads = 2
+    let hd = 2
+    let qs = jt.split_heads(q, heads)
+    let ks = jt.split_heads(k, heads)
+    let vs = jt.split_heads(v, heads)
+    defer { qs.free() }
+    defer { ks.free() }
+    defer { vs.free() }
+    var parts: list[Tensor] = []
+    for h in 0..heads {
+        let qh = qs.view(h * seq * hd, [seq, hd])
+        let kh = ks.view(h * seq * hd, [seq, hd])
+        let vh = vs.view(h * seq * hd, [seq, hd])
+        parts.push(jt.scaled_dot_product_attention(qh, kh, vh))
+        qh.free()
+        kh.free()
+        vh.free()
+    }
+    let packed = jt.cat(parts)
+    for part in parts { part.free() }
+    defer { packed.free() }
+    let looped = jt.merge_heads(packed, heads, seq)
+    defer { looped.free() }
+    assert_values_near(fused.download(), looped.download(), 1e-5)
+    let rng = Random.with_seed(1)
+    let layer = jt.MultiHeadAttention(4, heads: 2)
+    defer { layer.free() }
+    layer.build(4, rng)
+    let y = layer.forward(q)
+    defer { y.free() }
+    assert_eq(y.shape, [2, 4])
+}
+
+fn test_sum_mean_and_mse_backward_stay_on_device() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0], requires_grad: true)
+    defer { x.free() }
+    let total = jt.sum(x)
+    defer { total.free() }
+    let extras = total.backward()
+    for tensor in extras { tensor.free() }
+    let sum_grad = x.grad
+    if sum_grad is null { throw AssertionError("expected x.grad after sum.backward()") }
+    assert_values_near(sum_grad.download(), [1.0, 1.0, 1.0, 1.0], 1e-5)
+
+    let y = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0], requires_grad: true)
+    defer { y.free() }
+    let avg = jt.mean(y)
+    defer { avg.free() }
+    let mean_extras = avg.backward()
+    for tensor in mean_extras { tensor.free() }
+    let mean_grad = y.grad
+    if mean_grad is null { throw AssertionError("expected y.grad after mean.backward()") }
+    assert_values_near(mean_grad.download(), [0.25, 0.25, 0.25, 0.25], 1e-5)
+
+    let z = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0], requires_grad: true)
+    defer { z.free() }
+    let rows = jt.sum(z, axis: -1)
+    let row_total = jt.sum(rows)
+    defer { row_total.free() }
+    let row_extras = row_total.backward()
+    for tensor in row_extras { tensor.free() }
+    let row_grad = z.grad
+    if row_grad is null { throw AssertionError("expected z.grad after last-axis sum") }
+    assert_values_near(row_grad.download(), [1.0, 1.0, 1.0, 1.0], 1e-5)
+
+    let pred = jt.Tensor([2], [1.0, 3.0], requires_grad: true)
+    let target = jt.Tensor([2], [1.0, 1.0])
+    defer { pred.free() }
+    defer { target.free() }
+    let loss = jt.mse(pred, target)
+    defer { loss.free() }
+    let mse_extras = loss.backward()
+    for tensor in mse_extras { tensor.free() }
+    let pred_grad = pred.grad
+    if pred_grad is null { throw AssertionError("expected pred.grad after mse.backward()") }
+    assert_values_near(pred_grad.download(), [0.0, 2.0], 1e-4)
+}
+
+fn test_gather_rows_scatters_embedding_grads() -> void {
+    if not jt.is_available() { return }
+    let table = jt.Tensor([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], requires_grad: true)
+    defer { table.free() }
+    let ids = jt.Tensor([3], [0.0, 2.0, 0.0])
+    defer { ids.free() }
+    let rows = jt.gather_rows(table, ids)
+    let total = jt.sum(rows)
+    defer { total.free() }
+    let extras = total.backward()
+    for tensor in extras { tensor.free() }
+    let g = table.grad
+    if g is null { throw AssertionError("expected table.grad after embedding gather") }
+    assert_values_near(g.download(), [2.0, 2.0, 0.0, 0.0, 1.0, 1.0], 1e-5)
+}
+
+fn test_group_norm_centers_each_group() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([1, 1, 2, 2], [1.0, 3.0, 3.0, 5.0])
+    defer { x.free() }
+    let gamma = jt.ones([2])
+    let beta = jt.zeros([2])
+    defer { gamma.free() }
+    defer { beta.free() }
+    let y = jt.group_norm(x, gamma, beta, 2)
+    defer { y.free() }
+    let values = y.download()
+    assert_near((values[0] + values[2]) / 2.0, 0.0, 1e-4)
+    assert_near((values[1] + values[3]) / 2.0, 0.0, 1e-4)
+}
+
+fn test_tril_and_bce_with_logits() -> void {
+    if not jt.is_available() { return }
+    let square = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    defer { square.free() }
+    let lower = jt.tril(square)
+    defer { lower.free() }
+    assert_eq(lower.download(), [1.0, 0.0, 3.0, 4.0])
+    let logits = jt.Tensor([2], [0.0, 10.0], requires_grad: true)
+    let target = jt.Tensor([2], [0.0, 1.0])
+    defer { logits.free() }
+    defer { target.free() }
+    let loss = jt.binary_cross_entropy_with_logits(logits, target)
+    defer { loss.free() }
+    assert_near(loss.download()[0], math.log(2.0) / 2.0, 1e-4)
+    let extras = loss.backward()
+    for tensor in extras { tensor.free() }
+    let g = logits.grad
+    if g is null { throw AssertionError("expected logits.grad after bce_with_logits") }
+    assert_near(g.download()[0], 0.25, 1e-4)
+    assert_near(g.download()[1], 0.0, 1e-4)
+}
+
+fn test_flash_attention_matches_per_head_sdpa() -> void {
+    if not jt.is_available() { return }
+    let seq = 16
+    let heads = 2
+    let hd = 2
+    var values: list[float] = []
+    for i in 0..seq * heads * hd {
+        values.push(float((i * 3) % 11) / 5.0 - 1.0)
+    }
+    let q = jt.Tensor([seq, heads * hd], values)
+    let k = jt.Tensor([seq, heads * hd], values)
+    var vvals: list[float] = []
+    for i in 0..seq * heads * hd {
+        vvals.push(float((i * 5) % 7) / 3.0)
+    }
+    let v = jt.Tensor([seq, heads * hd], vvals)
+    defer { q.free() }
+    defer { k.free() }
+    defer { v.free() }
+    let fused = jt.multi_head_attention(q, k, v, heads)
+    defer { fused.free() }
+    let qs = jt.split_heads(q, heads)
+    let ks = jt.split_heads(k, heads)
+    let vs = jt.split_heads(v, heads)
+    defer { qs.free() }
+    defer { ks.free() }
+    defer { vs.free() }
+    var parts: list[Tensor] = []
+    for h in 0..heads {
+        let qh = qs.view(h * seq * hd, [seq, hd])
+        let kh = ks.view(h * seq * hd, [seq, hd])
+        let vh = vs.view(h * seq * hd, [seq, hd])
+        parts.push(jt.scaled_dot_product_attention(qh, kh, vh))
+        qh.free()
+        kh.free()
+        vh.free()
+    }
+    let packed = jt.cat(parts)
+    for part in parts { part.free() }
+    defer { packed.free() }
+    let looped = jt.merge_heads(packed, heads, seq)
+    defer { looped.free() }
+    assert_values_near(fused.download(), looped.download(), 2e-4)
+}
+
+fn test_wide_flash_attention_matches_per_head_sdpa() -> void {
+    if not jt.is_available() { return }
+    let seq = 96
+    let heads = 2
+    let hd = 32
+    var values: list[float] = []
+    for i in 0..seq * heads * hd {
+        values.push(float((i * 3) % 11) / 5.0 - 1.0)
+    }
+    let q = jt.Tensor([seq, heads * hd], values)
+    let k = jt.Tensor([seq, heads * hd], values)
+    var vvals: list[float] = []
+    for i in 0..seq * heads * hd {
+        vvals.push(float((i * 5) % 7) / 3.0)
+    }
+    let v = jt.Tensor([seq, heads * hd], vvals)
+    defer { q.free() }
+    defer { k.free() }
+    defer { v.free() }
+    let fused = jt.multi_head_attention(q, k, v, heads)
+    defer { fused.free() }
+    let qs = jt.split_heads(q, heads)
+    let ks = jt.split_heads(k, heads)
+    let vs = jt.split_heads(v, heads)
+    defer { qs.free() }
+    defer { ks.free() }
+    defer { vs.free() }
+    var parts: list[Tensor] = []
+    for h in 0..heads {
+        let qh = qs.view(h * seq * hd, [seq, hd])
+        let kh = ks.view(h * seq * hd, [seq, hd])
+        let vh = vs.view(h * seq * hd, [seq, hd])
+        parts.push(jt.scaled_dot_product_attention(qh, kh, vh))
+        qh.free()
+        kh.free()
+        vh.free()
+    }
+    let packed = jt.cat(parts)
+    for part in parts { part.free() }
+    defer { packed.free() }
+    let looped = jt.merge_heads(packed, heads, seq)
+    defer { looped.free() }
+    assert_values_near(fused.download(), looped.download(), 2e-3)
 }

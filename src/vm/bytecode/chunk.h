@@ -401,8 +401,12 @@ typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
  * 64 is JAI_JIT_THRESHOLD -- the point at which the tier first looks at a
  * function -- so a site inside a loop is settled well before anything reads it,
  * and a site reached once per call is settled on the entry that compiles.
- * chunk.h cannot include jit.h, so this is checked against it in jit.h. */
+ * chunk.h cannot include jit.h, so this is checked against it in jit.h.
+ *
+ * FN_TRACE functions compile at JAI_JIT_TRACE_THRESHOLD (8), so their caches
+ * close on the same budget: otherwise the tier would read a half-formed record. */
 #define JAI_IC_OBS_BUDGET 64u
+#define JAI_IC_OBS_BUDGET_TRACE 8u
 
 JAI_INLINE uint8_t jaiFeedbackKind(Value v) {
     return IS_OBJ(v) ? (uint8_t)(JAI_FB_OBJ + (unsigned)OBJ_TYPE(v))

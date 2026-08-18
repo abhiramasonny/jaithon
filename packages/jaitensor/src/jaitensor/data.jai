@@ -1,4 +1,6 @@
 #: Generic datasets kept resident on the GPU.
+from std.random import Random
+from .ops import gather_rows
 from .tensor import Tensor
 
 #: A feature matrix and sparse integer labels on the GPU.
@@ -15,12 +17,22 @@ pub class Dataset {
     pub let samples: int
     #: Number of input values per example.
     pub let feature_count: int
+    #: Spatial `[H, W, C]` when `features` is NHWC, otherwise `null`.
+    pub let image_shape: list[int]?
     var freed: bool
 
     #: Pair a feature matrix with one label per row.
     pub fn init(self, features: Tensor, labels: Tensor) {
-        if features.shape.len() != 2 {
-            throw ValueError(f"features must have shape [samples, features], got {features.shape}")
+        if features.shape.len() == 2 {
+            self.feature_count = features.shape[1]
+            self.image_shape = null
+        } elif features.shape.len() == 4 {
+            self.feature_count = features.shape[1] * features.shape[2] * features.shape[3]
+            self.image_shape = [features.shape[1], features.shape[2], features.shape[3]]
+        } else {
+            throw ValueError(
+                f"features must have shape [samples, features] or NHWC, got {features.shape}"
+            )
         }
         if labels.shape.len() != 1 or labels.shape[0] != features.shape[0] {
             throw ValueError(
@@ -30,7 +42,6 @@ pub class Dataset {
         self.features = features
         self.labels = labels
         self.samples = features.shape[0]
-        self.feature_count = features.shape[1]
         self.freed = false
     }
 
@@ -125,5 +136,85 @@ pub class Dataset {
         self.features.free()
         self.labels.free()
         self.freed = true
+    }
+}
+
+#: Minibatch iterator that can shuffle and gather the next batch on the GPU
+#: while the current step is still running.
+pub class DataLoader {
+    pub let dataset: Dataset
+    pub let batch_size: int
+    pub let shuffle: bool
+    var order: Tensor?
+    var cursor: int
+    var rng: Random
+
+    pub fn init(self, dataset: Dataset, batch_size: int, shuffle: bool = false, seed: int = 0) {
+        if batch_size <= 0 { throw ValueError(f"batch_size must be positive, got {batch_size}") }
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.order = null
+        self.cursor = 0
+        self.rng = Random.with_seed(seed)
+        self.reset()
+    }
+
+    #: Rebuild the sample order for a new epoch.
+    pub fn reset(self) -> void {
+        self.cursor = 0
+        let previous = self.order
+        if previous is not null { previous.free() }
+        if not self.shuffle {
+            self.order = null
+            return
+        }
+        var perm: list[float] = []
+        for index in 0..self.dataset.samples { perm.push(float(index)) }
+        var i = perm.len() - 1
+        while i > 0 {
+            let j = int(self.rng.next_float() * float(i + 1))
+            let bound = if j < 0 { 0 } elif j > i { i } else { j }
+            let tmp = perm[i]
+            perm[i] = perm[bound]
+            perm[bound] = tmp
+            i -= 1
+        }
+        self.order = Tensor([perm.len()], perm)
+    }
+
+    #: Whether another minibatch remains in this epoch.
+    pub fn has_next(self) -> bool { return self.cursor < self.dataset.samples }
+
+    #: Gather the next minibatch onto new device tensors. Caller frees them.
+    pub fn next_batch(self) -> tuple[Tensor, Tensor] {
+        if not self.has_next() { throw ValueError("DataLoader is exhausted; call reset()") }
+        let count = min(self.batch_size, self.dataset.samples - self.cursor)
+        let start = self.cursor
+        self.cursor += count
+        let order = self.order
+        if order is null {
+            let width = self.dataset.feature_count
+            if self.dataset.features.rank() == 4 {
+                let shape = self.dataset.image_shape
+                if shape is null { throw RuntimeError("NHWC dataset missing image_shape") }
+                return (
+                    self.dataset.features.view(start * width, [count, shape[0], shape[1], shape[2]]),
+                    self.dataset.labels.view(start, [count])
+                )
+            }
+            return (
+                self.dataset.features.view(start * width, [count, width]),
+                self.dataset.labels.view(start, [count])
+            )
+        }
+        let indices = order.view(start, [count])
+        let rows = self.dataset.features
+        var source = rows
+        if rows.rank() == 4 {
+            source = Tensor([rows.shape[0], self.dataset.feature_count], storage: rows.buffer())
+        }
+        let gathered = gather_rows(source, indices)
+        return (gathered, self.dataset.labels.view(start, [count]))
     }
 }

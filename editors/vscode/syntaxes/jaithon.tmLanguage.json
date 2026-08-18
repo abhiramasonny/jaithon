@@ -7,6 +7,7 @@
     { "include": "#comments" },
     { "include": "#strings" },
     { "include": "#numbers" },
+    { "include": "#decorators" },
     { "include": "#declarations" },
     { "include": "#annotations" },
     { "include": "#keywords" },
@@ -396,6 +397,15 @@
       ]
     },
 
+    "decorators": {
+      "comment": "`@trace`, `@gpu_kernel`, `@mps_graph` sit on the line before `fn`.",
+      "match": "(@)([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.definition.annotation.jaithon" },
+        "2": { "name": "entity.name.function.decorator.jaithon" }
+      }
+    },
+
     "annotations": {
       "comment": "A return type, which is the one annotation that needs no enclosing context to recognise. Generic brackets nest, so `]` only ends it at the top level.",
       "begin": "(->)",
@@ -428,6 +438,7 @@
           "name": "support.type.primitive.jaithon",
           "match": "\\b(int|float|bool|str|bytes|any|void|never|null|list|dict|set|tuple|range)\\b"
         },
+        { "name": "constant.numeric.integer.jaithon", "match": "\\b[0-9][0-9_]*\\b" },
         { "name": "storage.type.function.jaithon", "match": "\\bfn\\b" },
         { "name": "support.class.error.jaithon", "match": "\\b(Error|AssertionError|ArithmeticError|DivisionByZeroError|OverflowError|LookupError|IndexError|KeyError|NameError|TypeError|ValueError|ParseError|AttributeError|IOError|FileNotFoundError|PermissionError|OSError|RuntimeError|RecursionError|StopIteration|ImportError)\\b" },
         { "name": "entity.name.type.jaithon", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" },

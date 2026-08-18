@@ -36,7 +36,10 @@ pub let MAGIC: list[int] = [0x4A, 0x41, 0x49, 0x43]
 #:
 #: Must equal `JAIC_VERSION` in `src/vm/bytecode/serialize.h` — one number split across
 #: two languages.
-pub const VERSION: int = 13
+pub const VERSION: int = 14
+
+#: First container version whose function records carry u16 flags.
+pub const VERSION_FNFLAGS16: int = 14
 
 #: Oldest container this reader accepts. Must equal `JAIC_VERSION_MIN` in
 #: `src/vm/bytecode/serialize.h`.
@@ -60,7 +63,7 @@ pub const VERSION_STRTAB: int = 13
 #: `JAI_COMPILER_VERSION`, recorded so that a new compiler ignores old caches.
 #:
 #: Must equal `JAI_COMPILER_VERSION` in `src/common/common.h`.
-pub const COMPILER_VERSION: int = 25
+pub const COMPILER_VERSION: int = 26
 
 #: The `buildId` the running binary stamps into a `.jaic` and demands back.
 #:
@@ -649,7 +652,11 @@ fn _write_function(out: Writer, strings: StrTab, proto: FuncProto, depth: int) -
 
     out.u32(name_index)
     out.u8(proto.arity)
-    out.u8(proto.flags & 0xFF)
+    if VERSION >= VERSION_FNFLAGS16 {
+        out.u16(proto.flags & 0xFFFF)
+    } else {
+        out.u8(proto.flags & 0xFF)
+    }
     out.u16(proto.max_slots)
     out.u16(proto.upvalue_count)
 
@@ -961,7 +968,7 @@ fn _read_function(reader: Reader, depth: int) -> FuncProto? {
     if depth > MAX_DEPTH { return null }
     let name_index = reader.u32()
     let arity = reader.u8()
-    let flags = reader.u8()
+    let flags = if reader.version >= VERSION_FNFLAGS16 { reader.u16() } else { reader.u8() }
     let max_slots = reader.u16()
     let upvalue_count = reader.u16()
     if reader.bad or upvalue_count > 255 { return null }

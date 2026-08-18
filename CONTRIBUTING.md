@@ -10,6 +10,7 @@
 | Heap objects | `src/vm/object/` |
 | Bytecode and `.jaic` images | `src/vm/bytecode/` |
 | arm64 JIT | `src/vm/jit/` |
+| `@trace` sessions | `src/vm/trace/` |
 | Builtins | `src/runtime/builtins/` |
 | Imports and compiler boot | `src/runtime/modules/` |
 | Platform implementations | `src/native/apple/` and `src/native/posix/` |
@@ -78,7 +79,9 @@ jaithon fmt --check .    # CI gate; non-zero if anything is unformatted
 
 ## Adding a language feature
 
-1. Write the specification change first, in `spec/LANGUAGE.md`.
+1. Write the specification change first. What a person writing `.jai` needs to
+   know goes in `LANGUAGE.md`. Type rules, bytecode flags, and GPU lifetime
+   rules also go in `spec/`.
 2. Add a golden test showing it working and an error test showing it failing.
 3. Lexer --> parser --> AST --> resolver --> checker --> codegen --> VM, in that order. Each stage should compile and its own tests pass before you start the next.
 4. Implement compiler changes in `lib/jaithon/compile/` and VM changes under `src/vm/`.

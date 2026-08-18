@@ -50,6 +50,7 @@ let _TYPE_KIND_NAMES: dict[TypeKind, str] = {
     TypeKind.Fn: "TYPE_FN",
     TypeKind.Tuple: "TYPE_TUPLE",
     TypeKind.Infer: "TYPE_INFER",
+    TypeKind.Const: "TYPE_CONST",
 }
 
 let _VISIBILITY_BY_NAME: dict[str, Visibility] = {name: value for (value, name) in _VISIBILITY_NAMES.items()}
@@ -141,6 +142,7 @@ fn _type_text(written: TypeExpr?) -> str {
         TypeKind.Fn => { return f"fn({_type_list(written.args)}) -> {_type_text(written.inner)}" }
         TypeKind.Tuple => { return f"({_type_list(written.args)})" }
         TypeKind.Infer => { return "_" }
+        TypeKind.Const => { return written.name ?? "0" }
     }
 }
 

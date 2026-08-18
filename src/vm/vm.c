@@ -18,6 +18,7 @@
 
 #include "vm/vm.h"
 #include "vm/jit/jit.h"
+#include "vm/trace/trace.h"
 
 #include "vm/gc.h"
 #include "vm/object/object.h"
@@ -1195,6 +1196,8 @@ static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) 
 static CallOutcome callClosure(ObjClosure *closure, int argc) {
     Value *slotBase = vm.stackTop - argc - 1;
     ObjFunction *fn = closure->fn;
+    bool traced = (fn->flags & FN_TRACE) != 0;
+    if (traced) jaiTraceEnter(fn);
 
     /* Ahead of bindCallArgs on purpose. Compiled code never reads the VM
      * stack, so clearing a frame window it will not look at, and growing the
@@ -1203,23 +1206,41 @@ static CallOutcome callClosure(ObjClosure *closure, int argc) {
      * what the tier had to give. */
     if (fn->jitFunc != NULL && argc == (int)fn->arity) {
         JaiJitOutcome outcome = jaiJitEnterFunc(closure, slotBase);
-        if (outcome == JAI_JIT_DONE) return CALL_DONE;
+        if (outcome == JAI_JIT_DONE) {
+            if (traced) jaiTraceLeave(fn);
+            return CALL_DONE;
+        }
         /* An exception from a call the compiled body made: the effects up to
          * it already happened, so this is not a decline. */
-        if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
+        if (outcome == JAI_JIT_ERROR) {
+            if (traced) jaiTraceLeave(fn);
+            return CALL_ERROR;
+        }
         if (outcome == JAI_JIT_DEOPT) {
             /* A guard failed part-way in. The interpreter takes over from that
              * exact instruction, holding what the compiled body held, so the
              * work already done is neither lost nor repeated. */
-            if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
-            if (!pushFrame(closure, slotBase)) return CALL_ERROR;
-            if (!jaiJitApplyDeopt(closure, slotBase)) return CALL_ERROR;
+            if (!bindCallArgs(closure, argc, slotBase)) {
+                if (traced) jaiTraceLeave(fn);
+                return CALL_ERROR;
+            }
+            if (!pushFrame(closure, slotBase)) {
+                if (traced) jaiTraceLeave(fn);
+                return CALL_ERROR;
+            }
+            if (!jaiJitApplyDeopt(closure, slotBase)) {
+                if (traced) jaiTraceLeave(fn);
+                return CALL_ERROR;
+            }
             return CALL_FRAME;
         }
     }
 
-    if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
-    if (fn->entryCount < JAI_JIT_THRESHOLD) {
+    if (!bindCallArgs(closure, argc, slotBase)) {
+        if (traced) jaiTraceLeave(fn);
+        return CALL_ERROR;
+    }
+    if (fn->entryCount < jaiJitThreshold(fn)) {
         fn->entryCount++;
     } else if (!fn->jitRefused && jaiJitEnabled()) {
         /* Every verdict, not just DONE. The body that just compiled may have
@@ -1228,16 +1249,31 @@ static CallOutcome callClosure(ObjClosure *closure, int argc) {
          * see jaiJitEnter. bindCallArgs is already done, which is the one
          * thing the branch above this has to do for itself. */
         JaiJitOutcome outcome = jaiJitEnter(closure, slotBase);
-        if (outcome == JAI_JIT_DONE) return CALL_DONE;
-        if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
+        if (outcome == JAI_JIT_DONE) {
+            if (traced) jaiTraceLeave(fn);
+            return CALL_DONE;
+        }
+        if (outcome == JAI_JIT_ERROR) {
+            if (traced) jaiTraceLeave(fn);
+            return CALL_ERROR;
+        }
         if (outcome == JAI_JIT_DEOPT) {
-            if (!pushFrame(closure, slotBase)) return CALL_ERROR;
-            if (!jaiJitApplyDeopt(closure, slotBase)) return CALL_ERROR;
+            if (!pushFrame(closure, slotBase)) {
+                if (traced) jaiTraceLeave(fn);
+                return CALL_ERROR;
+            }
+            if (!jaiJitApplyDeopt(closure, slotBase)) {
+                if (traced) jaiTraceLeave(fn);
+                return CALL_ERROR;
+            }
             return CALL_FRAME;
         }
     }
 
-    if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+    if (!pushFrame(closure, slotBase)) {
+        if (traced) jaiTraceLeave(fn);
+        return CALL_ERROR;
+    }
     return CALL_FRAME;
 }
 
@@ -2596,6 +2632,7 @@ static void popFrameForUnwind(void) {
     closeUpvalues(frame->base);
     if (vm.handlers.count > frame->handlerBase) vm.handlers.count = frame->handlerBase;
     if (vm.defers.count > frame->deferBase) vm.defers.count = frame->deferBase;
+    if (frame->closure->fn->flags & FN_TRACE) jaiTraceLeave(frame->closure->fn);
     vm.stackTop = frame->base;
     vm.frameCount--;
 }
@@ -5261,11 +5298,17 @@ static JaiRunResult runLoop(int baseFrameCount) {
 
         /* Reuse the window only for the straightforward shape; anything with
          * defaults, a variadic tail, or a non-closure callee goes through the
-         * ordinary path, which is correct if less frugal. */
+         * ordinary path, which is correct if less frugal.
+         *
+         * `@trace` callers also take the slow path: reusing this frame would
+         * skip OP_RETURN's jaiTraceLeave, and leaving before the tail callee
+         * runs would drop the session while `return trace.is_replay()` still
+         * needs it. */
         if (IS_CLOSURE(callee) && AS_CLOSURE(callee)->fn->defaultCount == 0 &&
             !(AS_CLOSURE(callee)->fn->flags & (FN_VARIADIC | FN_KWREST)) &&
             AS_CLOSURE(callee)->fn->arity == argc &&
-            !(fn->flags & FN_INIT)) {
+            !(fn->flags & FN_INIT) &&
+            !(fn->flags & FN_TRACE)) {
             ObjClosure *target = AS_CLOSURE(callee);
 
             /* A tail call reuses this frame instead of going through
@@ -5295,7 +5338,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
                     stackTop = vm.stackTop;   /* opReturn saves this back */
                     goto opReturn;
                 }
-            } else if (tfn->entryCount < JAI_JIT_THRESHOLD) {
+            } else if (tfn->entryCount < jaiJitThreshold(tfn)) {
                 tfn->entryCount++;
             } else if (!tfn->jitRefused && jaiJitEnabled()) {
                 /* Same three-way answer the jitFunc branch above already
@@ -5376,7 +5419,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
          * one already-hot load and a not-taken branch: entryCount saturates at
          * the compile threshold and never moves again. See
          * ObjFunction::obsReturnKind for why this is per callee, not per site. */
-        if (JAI_UNLIKELY(fn->entryCount < JAI_JIT_THRESHOLD)) {
+        if (JAI_UNLIKELY(fn->entryCount < jaiJitThreshold(fn))) {
             uint32_t shape = 0;
             if (IS_INSTANCE(retval) && AS_INSTANCE(retval)->klass != NULL) {
                 shape = AS_INSTANCE(retval)->klass->shapeId;
@@ -5414,6 +5457,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         closeUpvalues(frame->base);
         vm.handlers.count = frame->handlerBase;
         vm.defers.count = frame->deferBase;
+        if (fn->flags & FN_TRACE) jaiTraceLeave(fn);
         vm.frameCount--;
         vm.stackTop = frame->base;
         *vm.stackTop++ = retval;
@@ -6702,6 +6746,7 @@ void jaiVMInit(void) {
 
     jaiMethodCacheInit();
     memset(sMegaCache, 0, sizeof sMegaCache);
+    jaiTraceInit();
 
     vm.pendingException = NULL_VAL;
     vm.hasException = false;

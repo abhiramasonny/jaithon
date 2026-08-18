@@ -3,6 +3,7 @@
 
 #include "runtime/runtime.h"
 #include "runtime/handles.h"
+#include <limits.h>
 #include <math.h>
 
 #include "native/native.h"
@@ -78,6 +79,43 @@ static bool nGpuDeviceName(int argc, Value *args, Value *out) {
     (void)args;
     const char *name = jaiGpuDeviceName();
     *out = OBJ_VAL(jaiStringInternC(name != NULL ? name : "none"));
+    return true;
+}
+
+static bool nGpuDeviceCount(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    *out = INT_VAL(jaiGpuDeviceCount());
+    return true;
+}
+
+static bool nGpuSetDevice(int argc, Value *args, Value *out) {
+    (void)argc;
+    int64_t index;
+    if (!jaiArgInt(args[0], 1, "gpu_set_device", &index)) return false;
+    if (index < 0 || index > INT_MAX)
+        return jaiThrow(vm.cValueError, "gpu_set_device(): index out of range");
+    if (!jaiGpuSetDevice((int)index))
+        return jaiThrow(vm.cRuntimeError,
+                        "gpu_set_device(): no device at %lld, or the GPU is already in use",
+                        (long long)index);
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuSetMixedPrecision(int argc, Value *args, Value *out) {
+    (void)argc;
+    bool enabled;
+    if (!jaiArgBool(args[0], 1, "gpu_set_mixed_precision", &enabled)) return false;
+    jaiGpuSetMixedPrecision(enabled);
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuMixedPrecision(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    *out = BOOL_VAL(jaiGpuMixedPrecision());
     return true;
 }
 
@@ -206,6 +244,33 @@ static bool nGpuBufferUploadU8(int argc, Value *args, Value *out) {
     if (count > 0)
         jaiGpuUploadU8(b->buffer, bytes->data + sourceOffset, (size_t)count,
                        (size_t)(b->origin + destOffset), (float)scale);
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuBufferFillUniform(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *b;
+    if (!requireBuffer(args[0], 1, "gpu_buffer_fill_uniform", &b)) return false;
+    double low, high;
+    int64_t seed;
+    if (!jaiArgNumber(args[1], 2, "gpu_buffer_fill_uniform", &low)) return false;
+    if (!jaiArgNumber(args[2], 3, "gpu_buffer_fill_uniform", &high)) return false;
+    if (!jaiArgInt(args[3], 4, "gpu_buffer_fill_uniform", &seed)) return false;
+    if (!(low < high))
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_fill_uniform(): low must be less than high");
+    jaiGpuFillUniform(b->buffer, (size_t)b->origin, (size_t)b->count,
+                      (float)low, (float)high, (uint64_t)seed);
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuBufferFillZero(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *b;
+    if (!requireBuffer(args[0], 1, "gpu_buffer_fill_zero", &b)) return false;
+    jaiGpuFillZero(b->buffer, (size_t)b->origin, (size_t)b->count);
     *out = NULL_VAL;
     return true;
 }
@@ -498,6 +563,461 @@ static bool nGpuMatMul(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGpuMatMulBuffers(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *a, *b, *result;
+    if (!requireBuffer(args[0], 1, "gpu_matmul_buffers", &a)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_matmul_buffers", &b)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_matmul_buffers", &result)) return false;
+
+    int64_t m, k, n;
+    bool transA, transB;
+    if (!jaiArgInt(args[3], 4, "gpu_matmul_buffers", &m)) return false;
+    if (!jaiArgInt(args[4], 5, "gpu_matmul_buffers", &k)) return false;
+    if (!jaiArgInt(args[5], 6, "gpu_matmul_buffers", &n)) return false;
+    if (!jaiArgBool(args[6], 7, "gpu_matmul_buffers", &transA)) return false;
+    if (!jaiArgBool(args[7], 8, "gpu_matmul_buffers", &transB)) return false;
+    if (m < 0 || k < 0 || n < 0 || m > UINT32_MAX || k > UINT32_MAX || n > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_matmul_buffers(): dimensions must fit in uint32, got "
+                        "%lldx%lldx%lld", (long long)m, (long long)k, (long long)n);
+
+    bool ok = jaiGpuMatMulBuffers(
+        a->buffer, (size_t)a->origin * sizeof(float),
+        b->buffer, (size_t)b->origin * sizeof(float),
+        result->buffer, (size_t)result->origin * sizeof(float),
+        (uint32_t)m, (uint32_t)k, (uint32_t)n, transA, transB);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_matmul_buffers(): the kernel failed");
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuMhaBuffers(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *q, *k, *v, *result;
+    if (!requireBuffer(args[0], 1, "gpu_mha_buffers", &q)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mha_buffers", &k)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mha_buffers", &v)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mha_buffers", &result)) return false;
+
+    int64_t seq, heads, hd;
+    double scale;
+    if (!jaiArgInt(args[4], 5, "gpu_mha_buffers", &seq)) return false;
+    if (!jaiArgInt(args[5], 6, "gpu_mha_buffers", &heads)) return false;
+    if (!jaiArgInt(args[6], 7, "gpu_mha_buffers", &hd)) return false;
+    if (!jaiArgNumber(args[7], 8, "gpu_mha_buffers", &scale)) return false;
+    if (seq <= 0 || heads <= 0 || hd <= 0 ||
+        seq > UINT32_MAX || heads > UINT32_MAX || hd > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_mha_buffers(): dimensions must be positive uint32, "
+                        "got %lldx%lldx%lld",
+                        (long long)seq, (long long)heads, (long long)hd);
+    if (!(scale > 0.0) || scale > 1e6)
+        return jaiThrow(vm.cValueError, "gpu_mha_buffers(): scale is invalid");
+
+    bool ok = jaiGpuMhaPacked(
+        q->buffer, (size_t)q->origin * sizeof(float),
+        k->buffer, (size_t)k->origin * sizeof(float),
+        v->buffer, (size_t)v->origin * sizeof(float),
+        result->buffer, (size_t)result->origin * sizeof(float),
+        (uint32_t)seq, (uint32_t)heads, (uint32_t)hd, (float)scale);
+    *out = BOOL_VAL(ok);
+    return true;
+}
+
+static bool nGpuConv2dBuffers(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *input, *weights, *result, *bias = NULL;
+    if (!requireBuffer(args[0], 1, "gpu_conv2d_buffers", &input)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_conv2d_buffers", &weights)) return false;
+    if (!IS_NULL(args[2])) {
+        if (!requireBuffer(args[2], 3, "gpu_conv2d_buffers", &bias)) return false;
+    }
+    if (!requireBuffer(args[3], 4, "gpu_conv2d_buffers", &result)) return false;
+
+    int64_t dims[11];
+    for (int i = 0; i < 11; i++) {
+        if (!jaiArgInt(args[4 + i], 5 + i, "gpu_conv2d_buffers", &dims[i])) return false;
+        if (dims[i] < 0 || dims[i] > UINT32_MAX)
+            return jaiThrow(vm.cValueError,
+                            "gpu_conv2d_buffers(): dimension %d must fit in uint32",
+                            i);
+    }
+
+    bool ok = jaiGpuConv2dBuffers(
+        input->buffer, (size_t)input->origin * sizeof(float),
+        weights->buffer, (size_t)weights->origin * sizeof(float),
+        bias != NULL ? bias->buffer : NULL,
+        bias != NULL ? (size_t)bias->origin * sizeof(float) : 0,
+        result->buffer, (size_t)result->origin * sizeof(float),
+        (uint32_t)dims[0], (uint32_t)dims[1], (uint32_t)dims[2], (uint32_t)dims[3],
+        (uint32_t)dims[4], (uint32_t)dims[5], (uint32_t)dims[6],
+        (uint32_t)dims[7], (uint32_t)dims[8], (uint32_t)dims[9], (uint32_t)dims[10]);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_conv2d_buffers(): the kernel failed");
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuMlpSgdStep(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *x, *w1, *b1, *w2, *b2, *labels, *lossAcc, *correctAcc;
+    if (!requireBuffer(args[0], 1, "gpu_mlp_sgd_step", &x)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mlp_sgd_step", &w1)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mlp_sgd_step", &b1)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mlp_sgd_step", &w2)) return false;
+    if (!requireBuffer(args[4], 5, "gpu_mlp_sgd_step", &b2)) return false;
+    if (!requireBuffer(args[5], 6, "gpu_mlp_sgd_step", &labels)) return false;
+    if (!requireBuffer(args[6], 7, "gpu_mlp_sgd_step", &lossAcc)) return false;
+    correctAcc = NULL;
+    if (!IS_NULL(args[7])) {
+        if (!requireBuffer(args[7], 8, "gpu_mlp_sgd_step", &correctAcc)) return false;
+    }
+
+    int64_t batch, inputs, hidden, classes;
+    double lr;
+    if (!jaiArgInt(args[8], 9, "gpu_mlp_sgd_step", &batch)) return false;
+    if (!jaiArgInt(args[9], 10, "gpu_mlp_sgd_step", &inputs)) return false;
+    if (!jaiArgInt(args[10], 11, "gpu_mlp_sgd_step", &hidden)) return false;
+    if (!jaiArgInt(args[11], 12, "gpu_mlp_sgd_step", &classes)) return false;
+    if (!jaiArgNumber(args[12], 13, "gpu_mlp_sgd_step", &lr)) return false;
+    if (batch <= 0 || inputs <= 0 || hidden <= 0 || classes <= 0 ||
+        batch > UINT32_MAX || inputs > UINT32_MAX || hidden > UINT32_MAX ||
+        classes > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_mlp_sgd_step(): dimensions must be positive uint32, "
+                        "got %lldx%lldx%lldx%lld",
+                        (long long)batch, (long long)inputs, (long long)hidden,
+                        (long long)classes);
+    if (!(lr > 0.0) || lr > 1e6)
+        return jaiThrow(vm.cValueError, "gpu_mlp_sgd_step(): learning rate is invalid");
+
+    bool ok = jaiGpuMlpSgdStep(
+        x->buffer, (size_t)x->origin * sizeof(float),
+        w1->buffer, (size_t)w1->origin * sizeof(float),
+        b1->buffer, (size_t)b1->origin * sizeof(float),
+        w2->buffer, (size_t)w2->origin * sizeof(float),
+        b2->buffer, (size_t)b2->origin * sizeof(float),
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        lossAcc->buffer, (size_t)lossAcc->origin * sizeof(float),
+        correctAcc != NULL ? correctAcc->buffer : NULL,
+        correctAcc != NULL ? (size_t)correctAcc->origin * sizeof(float) : 0,
+        (uint32_t)batch, (uint32_t)inputs, (uint32_t)hidden, (uint32_t)classes,
+        (float)lr);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_mlp_sgd_step(): the kernel failed");
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuMlpSgdEpoch(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *x, *w1, *b1, *w2, *b2, *labels, *lossAcc, *correctAcc;
+    if (!requireBuffer(args[0], 1, "gpu_mlp_sgd_epoch", &x)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mlp_sgd_epoch", &w1)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mlp_sgd_epoch", &b1)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mlp_sgd_epoch", &w2)) return false;
+    if (!requireBuffer(args[4], 5, "gpu_mlp_sgd_epoch", &b2)) return false;
+    if (!requireBuffer(args[5], 6, "gpu_mlp_sgd_epoch", &labels)) return false;
+    if (!requireBuffer(args[6], 7, "gpu_mlp_sgd_epoch", &lossAcc)) return false;
+    correctAcc = NULL;
+    if (!IS_NULL(args[7])) {
+        if (!requireBuffer(args[7], 8, "gpu_mlp_sgd_epoch", &correctAcc)) return false;
+    }
+    int64_t samples, batch, inputs, hidden, classes, flushEvery;
+    double lr;
+    if (!jaiArgInt(args[8], 9, "gpu_mlp_sgd_epoch", &samples)) return false;
+    if (!jaiArgInt(args[9], 10, "gpu_mlp_sgd_epoch", &batch)) return false;
+    if (!jaiArgInt(args[10], 11, "gpu_mlp_sgd_epoch", &inputs)) return false;
+    if (!jaiArgInt(args[11], 12, "gpu_mlp_sgd_epoch", &hidden)) return false;
+    if (!jaiArgInt(args[12], 13, "gpu_mlp_sgd_epoch", &classes)) return false;
+    if (!jaiArgNumber(args[13], 14, "gpu_mlp_sgd_epoch", &lr)) return false;
+    if (!jaiArgInt(args[14], 15, "gpu_mlp_sgd_epoch", &flushEvery)) return false;
+    if (samples <= 0 || batch <= 0 || inputs <= 0 || hidden <= 0 || classes <= 0 ||
+        flushEvery <= 0 || samples > UINT32_MAX || batch > UINT32_MAX ||
+        inputs > UINT32_MAX || hidden > UINT32_MAX || classes > UINT32_MAX ||
+        flushEvery > UINT32_MAX)
+        return jaiThrow(vm.cValueError, "gpu_mlp_sgd_epoch(): dimensions are invalid");
+    if (!(lr > 0.0) || lr > 1e6)
+        return jaiThrow(vm.cValueError, "gpu_mlp_sgd_epoch(): learning rate is invalid");
+    uint32_t processed = 0;
+    bool ok = jaiGpuMlpSgdEpoch(
+        x->buffer, (size_t)x->origin * sizeof(float),
+        w1->buffer, (size_t)w1->origin * sizeof(float),
+        b1->buffer, (size_t)b1->origin * sizeof(float),
+        w2->buffer, (size_t)w2->origin * sizeof(float),
+        b2->buffer, (size_t)b2->origin * sizeof(float),
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        lossAcc->buffer, (size_t)lossAcc->origin * sizeof(float),
+        correctAcc != NULL ? correctAcc->buffer : NULL,
+        correctAcc != NULL ? (size_t)correctAcc->origin * sizeof(float) : 0,
+        (uint32_t)samples, (uint32_t)batch, (uint32_t)inputs, (uint32_t)hidden,
+        (uint32_t)classes, (float)lr, (uint32_t)flushEvery, &processed);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_mlp_sgd_epoch(): the kernel failed");
+    *out = INT_VAL((int64_t)processed);
+    return true;
+}
+
+static bool nGpuMlpBwdStep(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *x, *w1, *b1, *w2, *b2, *labels, *gW1, *gB1, *gW2, *gB2, *lossAcc, *correctAcc;
+    if (!requireBuffer(args[0], 1, "gpu_mlp_bwd_step", &x)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mlp_bwd_step", &w1)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mlp_bwd_step", &b1)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mlp_bwd_step", &w2)) return false;
+    if (!requireBuffer(args[4], 5, "gpu_mlp_bwd_step", &b2)) return false;
+    if (!requireBuffer(args[5], 6, "gpu_mlp_bwd_step", &labels)) return false;
+    if (!requireBuffer(args[6], 7, "gpu_mlp_bwd_step", &gW1)) return false;
+    if (!requireBuffer(args[7], 8, "gpu_mlp_bwd_step", &gB1)) return false;
+    if (!requireBuffer(args[8], 9, "gpu_mlp_bwd_step", &gW2)) return false;
+    if (!requireBuffer(args[9], 10, "gpu_mlp_bwd_step", &gB2)) return false;
+    if (!requireBuffer(args[10], 11, "gpu_mlp_bwd_step", &lossAcc)) return false;
+    correctAcc = NULL;
+    if (!IS_NULL(args[11])) {
+        if (!requireBuffer(args[11], 12, "gpu_mlp_bwd_step", &correctAcc)) return false;
+    }
+
+    int64_t batch, inputs, hidden, classes;
+    if (!jaiArgInt(args[12], 13, "gpu_mlp_bwd_step", &batch)) return false;
+    if (!jaiArgInt(args[13], 14, "gpu_mlp_bwd_step", &inputs)) return false;
+    if (!jaiArgInt(args[14], 15, "gpu_mlp_bwd_step", &hidden)) return false;
+    if (!jaiArgInt(args[15], 16, "gpu_mlp_bwd_step", &classes)) return false;
+    if (batch <= 0 || inputs <= 0 || hidden <= 0 || classes <= 0 ||
+        batch > UINT32_MAX || inputs > UINT32_MAX || hidden > UINT32_MAX ||
+        classes > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_mlp_bwd_step(): dimensions must be positive uint32, "
+                        "got %lldx%lldx%lldx%lld",
+                        (long long)batch, (long long)inputs, (long long)hidden,
+                        (long long)classes);
+
+    bool ok = jaiGpuMlpBwdStep(
+        x->buffer, (size_t)x->origin * sizeof(float),
+        w1->buffer, (size_t)w1->origin * sizeof(float),
+        b1->buffer, (size_t)b1->origin * sizeof(float),
+        w2->buffer, (size_t)w2->origin * sizeof(float),
+        b2->buffer, (size_t)b2->origin * sizeof(float),
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        gW1->buffer, (size_t)gW1->origin * sizeof(float),
+        gB1->buffer, (size_t)gB1->origin * sizeof(float),
+        gW2->buffer, (size_t)gW2->origin * sizeof(float),
+        gB2->buffer, (size_t)gB2->origin * sizeof(float),
+        lossAcc->buffer, (size_t)lossAcc->origin * sizeof(float),
+        correctAcc != NULL ? correctAcc->buffer : NULL,
+        correctAcc != NULL ? (size_t)correctAcc->origin * sizeof(float) : 0,
+        (uint32_t)batch, (uint32_t)inputs, (uint32_t)hidden, (uint32_t)classes);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_mlp_bwd_step(): the kernel failed");
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuMlp3SgdStep(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *x, *w1, *b1, *w2, *b2, *w3, *b3, *w4, *b4, *labels, *lossAcc, *correctAcc;
+    if (!requireBuffer(args[0], 1, "gpu_mlp3_sgd_step", &x)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mlp3_sgd_step", &w1)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mlp3_sgd_step", &b1)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mlp3_sgd_step", &w2)) return false;
+    if (!requireBuffer(args[4], 5, "gpu_mlp3_sgd_step", &b2)) return false;
+    if (!requireBuffer(args[5], 6, "gpu_mlp3_sgd_step", &w3)) return false;
+    if (!requireBuffer(args[6], 7, "gpu_mlp3_sgd_step", &b3)) return false;
+    if (!requireBuffer(args[7], 8, "gpu_mlp3_sgd_step", &w4)) return false;
+    if (!requireBuffer(args[8], 9, "gpu_mlp3_sgd_step", &b4)) return false;
+    if (!requireBuffer(args[9], 10, "gpu_mlp3_sgd_step", &labels)) return false;
+    if (!requireBuffer(args[10], 11, "gpu_mlp3_sgd_step", &lossAcc)) return false;
+    correctAcc = NULL;
+    if (!IS_NULL(args[11])) {
+        if (!requireBuffer(args[11], 12, "gpu_mlp3_sgd_step", &correctAcc)) return false;
+    }
+    int64_t batch, inputs, hidden1, hidden2, hidden3, classes;
+    double lr;
+    if (!jaiArgInt(args[12], 13, "gpu_mlp3_sgd_step", &batch)) return false;
+    if (!jaiArgInt(args[13], 14, "gpu_mlp3_sgd_step", &inputs)) return false;
+    if (!jaiArgInt(args[14], 15, "gpu_mlp3_sgd_step", &hidden1)) return false;
+    if (!jaiArgInt(args[15], 16, "gpu_mlp3_sgd_step", &hidden2)) return false;
+    if (!jaiArgInt(args[16], 17, "gpu_mlp3_sgd_step", &hidden3)) return false;
+    if (!jaiArgInt(args[17], 18, "gpu_mlp3_sgd_step", &classes)) return false;
+    if (!jaiArgNumber(args[18], 19, "gpu_mlp3_sgd_step", &lr)) return false;
+    if (batch <= 0 || inputs <= 0 || hidden1 <= 0 || hidden2 <= 0 || hidden3 <= 0 ||
+        classes <= 0 || batch > UINT32_MAX || inputs > UINT32_MAX ||
+        hidden1 > UINT32_MAX || hidden2 > UINT32_MAX || hidden3 > UINT32_MAX ||
+        classes > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_mlp3_sgd_step(): dimensions must be positive uint32");
+    if (!(lr > 0.0) || lr > 1e6)
+        return jaiThrow(vm.cValueError, "gpu_mlp3_sgd_step(): learning rate is invalid");
+    bool ok = jaiGpuMlp3SgdStep(
+        x->buffer, (size_t)x->origin * sizeof(float),
+        w1->buffer, (size_t)w1->origin * sizeof(float),
+        b1->buffer, (size_t)b1->origin * sizeof(float),
+        w2->buffer, (size_t)w2->origin * sizeof(float),
+        b2->buffer, (size_t)b2->origin * sizeof(float),
+        w3->buffer, (size_t)w3->origin * sizeof(float),
+        b3->buffer, (size_t)b3->origin * sizeof(float),
+        w4->buffer, (size_t)w4->origin * sizeof(float),
+        b4->buffer, (size_t)b4->origin * sizeof(float),
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        lossAcc->buffer, (size_t)lossAcc->origin * sizeof(float),
+        correctAcc != NULL ? correctAcc->buffer : NULL,
+        correctAcc != NULL ? (size_t)correctAcc->origin * sizeof(float) : 0,
+        (uint32_t)batch, (uint32_t)inputs, (uint32_t)hidden1, (uint32_t)hidden2,
+        (uint32_t)hidden3, (uint32_t)classes, (float)lr);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_mlp3_sgd_step(): the kernel failed");
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuMlp3SgdEpoch(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *x, *w1, *b1, *w2, *b2, *w3, *b3, *w4, *b4, *labels, *lossAcc, *correctAcc;
+    if (!requireBuffer(args[0], 1, "gpu_mlp3_sgd_epoch", &x)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mlp3_sgd_epoch", &w1)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mlp3_sgd_epoch", &b1)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mlp3_sgd_epoch", &w2)) return false;
+    if (!requireBuffer(args[4], 5, "gpu_mlp3_sgd_epoch", &b2)) return false;
+    if (!requireBuffer(args[5], 6, "gpu_mlp3_sgd_epoch", &w3)) return false;
+    if (!requireBuffer(args[6], 7, "gpu_mlp3_sgd_epoch", &b3)) return false;
+    if (!requireBuffer(args[7], 8, "gpu_mlp3_sgd_epoch", &w4)) return false;
+    if (!requireBuffer(args[8], 9, "gpu_mlp3_sgd_epoch", &b4)) return false;
+    if (!requireBuffer(args[9], 10, "gpu_mlp3_sgd_epoch", &labels)) return false;
+    if (!requireBuffer(args[10], 11, "gpu_mlp3_sgd_epoch", &lossAcc)) return false;
+    correctAcc = NULL;
+    if (!IS_NULL(args[11])) {
+        if (!requireBuffer(args[11], 12, "gpu_mlp3_sgd_epoch", &correctAcc)) return false;
+    }
+    int64_t samples, batch, inputs, hidden1, hidden2, hidden3, classes, flushEvery;
+    double lr;
+    if (!jaiArgInt(args[12], 13, "gpu_mlp3_sgd_epoch", &samples)) return false;
+    if (!jaiArgInt(args[13], 14, "gpu_mlp3_sgd_epoch", &batch)) return false;
+    if (!jaiArgInt(args[14], 15, "gpu_mlp3_sgd_epoch", &inputs)) return false;
+    if (!jaiArgInt(args[15], 16, "gpu_mlp3_sgd_epoch", &hidden1)) return false;
+    if (!jaiArgInt(args[16], 17, "gpu_mlp3_sgd_epoch", &hidden2)) return false;
+    if (!jaiArgInt(args[17], 18, "gpu_mlp3_sgd_epoch", &hidden3)) return false;
+    if (!jaiArgInt(args[18], 19, "gpu_mlp3_sgd_epoch", &classes)) return false;
+    if (!jaiArgNumber(args[19], 20, "gpu_mlp3_sgd_epoch", &lr)) return false;
+    if (!jaiArgInt(args[20], 21, "gpu_mlp3_sgd_epoch", &flushEvery)) return false;
+    if (samples <= 0 || batch <= 0 || inputs <= 0 || hidden1 <= 0 || hidden2 <= 0 ||
+        hidden3 <= 0 || classes <= 0 || flushEvery <= 0 || samples > UINT32_MAX ||
+        batch > UINT32_MAX || inputs > UINT32_MAX || hidden1 > UINT32_MAX ||
+        hidden2 > UINT32_MAX || hidden3 > UINT32_MAX || classes > UINT32_MAX ||
+        flushEvery > UINT32_MAX)
+        return jaiThrow(vm.cValueError, "gpu_mlp3_sgd_epoch(): dimensions are invalid");
+    if (!(lr > 0.0) || lr > 1e6)
+        return jaiThrow(vm.cValueError, "gpu_mlp3_sgd_epoch(): learning rate is invalid");
+    uint32_t processed = 0;
+    bool ok = jaiGpuMlp3SgdEpoch(
+        x->buffer, (size_t)x->origin * sizeof(float),
+        w1->buffer, (size_t)w1->origin * sizeof(float),
+        b1->buffer, (size_t)b1->origin * sizeof(float),
+        w2->buffer, (size_t)w2->origin * sizeof(float),
+        b2->buffer, (size_t)b2->origin * sizeof(float),
+        w3->buffer, (size_t)w3->origin * sizeof(float),
+        b3->buffer, (size_t)b3->origin * sizeof(float),
+        w4->buffer, (size_t)w4->origin * sizeof(float),
+        b4->buffer, (size_t)b4->origin * sizeof(float),
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        lossAcc->buffer, (size_t)lossAcc->origin * sizeof(float),
+        correctAcc != NULL ? correctAcc->buffer : NULL,
+        correctAcc != NULL ? (size_t)correctAcc->origin * sizeof(float) : 0,
+        (uint32_t)samples, (uint32_t)batch, (uint32_t)inputs, (uint32_t)hidden1,
+        (uint32_t)hidden2, (uint32_t)hidden3, (uint32_t)classes, (float)lr,
+        (uint32_t)flushEvery, &processed);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_mlp3_sgd_epoch(): the kernel failed");
+    *out = INT_VAL((int64_t)processed);
+    return true;
+}
+
+static bool nGpuMlp3BwdStep(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *x, *w1, *b1, *w2, *b2, *w3, *b3, *w4, *b4, *labels;
+    GpuBuffer *gW1, *gB1, *gW2, *gB2, *gW3, *gB3, *gW4, *gB4, *lossAcc, *correctAcc;
+    if (!requireBuffer(args[0], 1, "gpu_mlp3_bwd_step", &x)) return false;
+    if (!requireBuffer(args[1], 2, "gpu_mlp3_bwd_step", &w1)) return false;
+    if (!requireBuffer(args[2], 3, "gpu_mlp3_bwd_step", &b1)) return false;
+    if (!requireBuffer(args[3], 4, "gpu_mlp3_bwd_step", &w2)) return false;
+    if (!requireBuffer(args[4], 5, "gpu_mlp3_bwd_step", &b2)) return false;
+    if (!requireBuffer(args[5], 6, "gpu_mlp3_bwd_step", &w3)) return false;
+    if (!requireBuffer(args[6], 7, "gpu_mlp3_bwd_step", &b3)) return false;
+    if (!requireBuffer(args[7], 8, "gpu_mlp3_bwd_step", &w4)) return false;
+    if (!requireBuffer(args[8], 9, "gpu_mlp3_bwd_step", &b4)) return false;
+    if (!requireBuffer(args[9], 10, "gpu_mlp3_bwd_step", &labels)) return false;
+    if (!requireBuffer(args[10], 11, "gpu_mlp3_bwd_step", &gW1)) return false;
+    if (!requireBuffer(args[11], 12, "gpu_mlp3_bwd_step", &gB1)) return false;
+    if (!requireBuffer(args[12], 13, "gpu_mlp3_bwd_step", &gW2)) return false;
+    if (!requireBuffer(args[13], 14, "gpu_mlp3_bwd_step", &gB2)) return false;
+    if (!requireBuffer(args[14], 15, "gpu_mlp3_bwd_step", &gW3)) return false;
+    if (!requireBuffer(args[15], 16, "gpu_mlp3_bwd_step", &gB3)) return false;
+    if (!requireBuffer(args[16], 17, "gpu_mlp3_bwd_step", &gW4)) return false;
+    if (!requireBuffer(args[17], 18, "gpu_mlp3_bwd_step", &gB4)) return false;
+    if (!requireBuffer(args[18], 19, "gpu_mlp3_bwd_step", &lossAcc)) return false;
+    correctAcc = NULL;
+    if (!IS_NULL(args[19])) {
+        if (!requireBuffer(args[19], 20, "gpu_mlp3_bwd_step", &correctAcc)) return false;
+    }
+    int64_t batch, inputs, hidden1, hidden2, hidden3, classes;
+    if (!jaiArgInt(args[20], 21, "gpu_mlp3_bwd_step", &batch)) return false;
+    if (!jaiArgInt(args[21], 22, "gpu_mlp3_bwd_step", &inputs)) return false;
+    if (!jaiArgInt(args[22], 23, "gpu_mlp3_bwd_step", &hidden1)) return false;
+    if (!jaiArgInt(args[23], 24, "gpu_mlp3_bwd_step", &hidden2)) return false;
+    if (!jaiArgInt(args[24], 25, "gpu_mlp3_bwd_step", &hidden3)) return false;
+    if (!jaiArgInt(args[25], 26, "gpu_mlp3_bwd_step", &classes)) return false;
+    if (batch <= 0 || inputs <= 0 || hidden1 <= 0 || hidden2 <= 0 || hidden3 <= 0 ||
+        classes <= 0 || batch > UINT32_MAX || inputs > UINT32_MAX ||
+        hidden1 > UINT32_MAX || hidden2 > UINT32_MAX || hidden3 > UINT32_MAX ||
+        classes > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_mlp3_bwd_step(): dimensions must be positive uint32");
+    bool ok = jaiGpuMlp3BwdStep(
+        x->buffer, (size_t)x->origin * sizeof(float),
+        w1->buffer, (size_t)w1->origin * sizeof(float),
+        b1->buffer, (size_t)b1->origin * sizeof(float),
+        w2->buffer, (size_t)w2->origin * sizeof(float),
+        b2->buffer, (size_t)b2->origin * sizeof(float),
+        w3->buffer, (size_t)w3->origin * sizeof(float),
+        b3->buffer, (size_t)b3->origin * sizeof(float),
+        w4->buffer, (size_t)w4->origin * sizeof(float),
+        b4->buffer, (size_t)b4->origin * sizeof(float),
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        gW1->buffer, (size_t)gW1->origin * sizeof(float),
+        gB1->buffer, (size_t)gB1->origin * sizeof(float),
+        gW2->buffer, (size_t)gW2->origin * sizeof(float),
+        gB2->buffer, (size_t)gB2->origin * sizeof(float),
+        gW3->buffer, (size_t)gW3->origin * sizeof(float),
+        gB3->buffer, (size_t)gB3->origin * sizeof(float),
+        gW4->buffer, (size_t)gW4->origin * sizeof(float),
+        gB4->buffer, (size_t)gB4->origin * sizeof(float),
+        lossAcc->buffer, (size_t)lossAcc->origin * sizeof(float),
+        correctAcc != NULL ? correctAcc->buffer : NULL,
+        correctAcc != NULL ? (size_t)correctAcc->origin * sizeof(float) : 0,
+        (uint32_t)batch, (uint32_t)inputs, (uint32_t)hidden1, (uint32_t)hidden2,
+        (uint32_t)hidden3, (uint32_t)classes);
+    if (!ok)
+        return jaiThrow(vm.cRuntimeError, "gpu_mlp3_bwd_step(): the kernel failed");
+    *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuLabelsValid(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *labels;
+    if (!requireBuffer(args[0], 1, "gpu_labels_valid", &labels)) return false;
+    int64_t count, classes;
+    if (!jaiArgInt(args[1], 2, "gpu_labels_valid", &count)) return false;
+    if (!jaiArgInt(args[2], 3, "gpu_labels_valid", &classes)) return false;
+    if (count < 0 || classes <= 0 || count > UINT32_MAX || classes > UINT32_MAX)
+        return jaiThrow(vm.cValueError,
+                        "gpu_labels_valid(): count and classes must fit in uint32");
+    *out = BOOL_VAL(jaiGpuLabelsValid(
+        labels->buffer, (size_t)labels->origin * sizeof(float),
+        (uint32_t)count, (uint32_t)classes));
+    return true;
+}
+
 static bool nGpuReduceSum(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *values;
@@ -523,11 +1043,17 @@ static bool nGpuReduceSum(int argc, Value *args, Value *out) {
 void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_available",   nGpuAvailable,   0, 0);
     jaiDefineNative("__prim__.gpu_device_name", nGpuDeviceName,  0, 0);
+    jaiDefineNative("__prim__.gpu_device_count", nGpuDeviceCount, 0, 0);
+    jaiDefineNative("__prim__.gpu_set_device", nGpuSetDevice, 1, 1);
+    jaiDefineNative("__prim__.gpu_set_mixed_precision", nGpuSetMixedPrecision, 1, 1);
+    jaiDefineNative("__prim__.gpu_mixed_precision", nGpuMixedPrecision, 0, 0);
 
     jaiDefineNative("__prim__.gpu_buffer_new",      nGpuBufferNew,      1, 1);
     jaiDefineNative("__prim__.gpu_buffer_view",     nGpuBufferView,     3, 3);
     jaiDefineNative("__prim__.gpu_buffer_upload",   nGpuBufferUpload,   3, 3);
     jaiDefineNative("__prim__.gpu_buffer_upload_u8", nGpuBufferUploadU8, 6, 6);
+    jaiDefineNative("__prim__.gpu_buffer_fill_uniform", nGpuBufferFillUniform, 4, 4);
+    jaiDefineNative("__prim__.gpu_buffer_fill_zero", nGpuBufferFillZero, 1, 1);
     jaiDefineNative("__prim__.gpu_buffer_download", nGpuBufferDownload, 3, 3);
     jaiDefineNative("__prim__.gpu_buffer_free",     nGpuBufferFree,     1, 1);
 
@@ -542,5 +1068,15 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_vector_add", nGpuVectorAdd, 2, 2);
     jaiDefineNative("__prim__.gpu_vector_mul", nGpuVectorMul, 2, 2);
     jaiDefineNative("__prim__.gpu_matmul",     nGpuMatMul,    5, 5);
+    jaiDefineNative("__prim__.gpu_matmul_buffers", nGpuMatMulBuffers, 8, 8);
+    jaiDefineNative("__prim__.gpu_mha_buffers", nGpuMhaBuffers, 8, 8);
+    jaiDefineNative("__prim__.gpu_conv2d_buffers", nGpuConv2dBuffers, 15, 15);
+    jaiDefineNative("__prim__.gpu_mlp_sgd_step", nGpuMlpSgdStep, 13, 13);
+    jaiDefineNative("__prim__.gpu_mlp_sgd_epoch", nGpuMlpSgdEpoch, 15, 15);
+    jaiDefineNative("__prim__.gpu_mlp_bwd_step", nGpuMlpBwdStep, 16, 16);
+    jaiDefineNative("__prim__.gpu_mlp3_sgd_step", nGpuMlp3SgdStep, 19, 19);
+    jaiDefineNative("__prim__.gpu_mlp3_sgd_epoch", nGpuMlp3SgdEpoch, 21, 21);
+    jaiDefineNative("__prim__.gpu_mlp3_bwd_step", nGpuMlp3BwdStep, 26, 26);
+    jaiDefineNative("__prim__.gpu_labels_valid", nGpuLabelsValid, 3, 3);
     jaiDefineNative("__prim__.gpu_reduce_sum", nGpuReduceSum, 1, 1);
 }

@@ -1,5 +1,5 @@
 /* gpu.m — Metal compute: device buffers, kernels compiled from MSL, and the
- * four built-in operations std.gpu falls back on when no source is supplied.
+ * five built-in operations std.gpu falls back on when no source is supplied.
  *
  * MSL has no `double`: buffers hold float32, built-ins round going in and
  * widen coming out; the CPU paths stay double, so GPU and CPU agree to a
@@ -13,9 +13,13 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <string.h>
 
 #include "native/native.h"
 
@@ -52,8 +56,8 @@ static const char kBuiltinSource[] =
     "                         device const float *b [[buffer(1)]],\n"
     "                         device float *out [[buffer(2)]],\n"
     "                         constant uint &n [[buffer(3)]],\n"
-    "                         uint thread [[thread_position_in_grid]]) {\n"
-    "    uint base = thread * JAI_VECTOR_LANES;\n"
+    "                         uint tid [[thread_position_in_grid]]) {\n"
+    "    uint base = tid * JAI_VECTOR_LANES;\n"
     "    if (base >= n) return;\n"
     "    out[base] = a[base] + b[base];\n"
     "    if (base + 1 < n) out[base + 1] = a[base + 1] + b[base + 1];\n"
@@ -65,8 +69,8 @@ static const char kBuiltinSource[] =
     "                         device const float *b [[buffer(1)]],\n"
     "                         device float *out [[buffer(2)]],\n"
     "                         constant uint &n [[buffer(3)]],\n"
-    "                         uint thread [[thread_position_in_grid]]) {\n"
-    "    uint base = thread * JAI_VECTOR_LANES;\n"
+    "                         uint tid [[thread_position_in_grid]]) {\n"
+    "    uint base = tid * JAI_VECTOR_LANES;\n"
     "    if (base >= n) return;\n"
     "    out[base] = a[base] * b[base];\n"
     "    if (base + 1 < n) out[base + 1] = a[base + 1] * b[base + 1];\n"
@@ -132,11 +136,62 @@ static const char kBuiltinSource[] =
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "    }\n"
     "    if (lid == 0) partials[wid] = scratch[0];\n"
+    "}\n"
+    "\n"
+    "kernel void jaiExpandU8(device const uchar *src [[buffer(0)]],\n"
+    "                        device float *dst [[buffer(1)]],\n"
+    "                        constant uint &n [[buffer(2)]],\n"
+    "                        constant float &scale [[buffer(3)]],\n"
+    "                        uint tid [[thread_position_in_grid]]) {\n"
+    "    if (tid >= n) return;\n"
+    "    dst[tid] = (float)src[tid] * scale;\n"
+    "}\n"
+    "\n"
+    "kernel void jaiSplitHeads(device const float *input [[buffer(0)]],\n"
+    "                          device float *output [[buffer(1)]],\n"
+    "                          constant uint &seq [[buffer(2)]],\n"
+    "                          constant uint &heads [[buffer(3)]],\n"
+    "                          constant uint &hd [[buffer(4)]],\n"
+    "                          uint id [[thread_position_in_grid]]) {\n"
+    "    uint vecs = hd / 4;\n"
+    "    uint count = heads * seq * vecs;\n"
+    "    if (id >= count) return;\n"
+    "    uint d4 = id % vecs;\n"
+    "    uint s = (id / vecs) % seq;\n"
+    "    uint h = id / (vecs * seq);\n"
+    "    uint dim = heads * hd;\n"
+    "    device const float4 *in4 =\n"
+    "        (device const float4 *)(input + s * dim + h * hd);\n"
+    "    device float4 *out4 =\n"
+    "        (device float4 *)(output + (h * seq + s) * hd);\n"
+    "    out4[d4] = in4[d4];\n"
+    "}\n"
+    "\n"
+    "kernel void jaiMergeHeads(device const float *input [[buffer(0)]],\n"
+    "                          device float *output [[buffer(1)]],\n"
+    "                          constant uint &seq [[buffer(2)]],\n"
+    "                          constant uint &heads [[buffer(3)]],\n"
+    "                          constant uint &hd [[buffer(4)]],\n"
+    "                          uint id [[thread_position_in_grid]]) {\n"
+    "    uint vecs = hd / 4;\n"
+    "    uint count = heads * seq * vecs;\n"
+    "    if (id >= count) return;\n"
+    "    uint d4 = id % vecs;\n"
+    "    uint s = (id / vecs) % seq;\n"
+    "    uint h = id / (vecs * seq);\n"
+    "    uint dim = heads * hd;\n"
+    "    device const float4 *in4 =\n"
+    "        (device const float4 *)(input + (h * seq + s) * hd);\n"
+    "    device float4 *out4 =\n"
+    "        (device float4 *)(output + s * dim + h * hd);\n"
+    "    out4[d4] = in4[d4];\n"
     "}\n";
 
 static id<MTLDevice>       gDevice;
 static id<MTLCommandQueue> gQueue;
 static bool                gDeviceReady;
+static int                 gPreferredDevice = -1;
+static bool                gMixedPrecision;
 static bool                gNonUniformThreadgroups;
 static size_t              gMaxBufferLength;
 
@@ -144,11 +199,40 @@ static id<MTLComputePipelineState> gVectorAdd;
 static id<MTLComputePipelineState> gVectorMul;
 static id<MTLComputePipelineState> gMatMul;
 static id<MTLComputePipelineState> gReduceSum;
+static id<MTLComputePipelineState> gExpandU8;
+static id<MTLComputePipelineState> gSplitHeads;
+static id<MTLComputePipelineState> gMergeHeads;
+static id<MTLComputePipelineState> gFlashAttn32;
+static id<MTLComputePipelineState> gFlashAttn64;
+static id<MTLComputePipelineState> gFlashPack;
+static id<MTLBuffer> gMhaHalfScratch;
+static size_t gMhaHalfCap;
 static id<MTLCommandBuffer> gAsyncCommands;
 static id<MTLComputeCommandEncoder> gAsyncEncoder;
 static NSMutableArray<id<MTLCommandBuffer>> *gInFlight;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *gSourceLibraries;
 static bool                        gBuiltinsReady;
+static id<MTLBuffer> gMlpScratchW1, gMlpScratchB1, gMlpScratchW2, gMlpScratchB2;
+static id<MTLBuffer> gMlpScratchAcc, gMlpScratchCorrect;
+static size_t gMlpCapW1, gMlpCapB1, gMlpCapW2, gMlpCapB2, gMlpCapAcc, gMlpCapCorrect;
+static int gMlpSide;
+static int gMlpAccSide;
+static JaiGpuBuffer *gMlpLiveW1, *gMlpLiveB1, *gMlpLiveW2, *gMlpLiveB2;
+static JaiGpuBuffer *gMlpLiveAcc;
+static size_t gMlpLiveW1Off, gMlpLiveB1Off, gMlpLiveW2Off, gMlpLiveB2Off;
+static size_t gMlpLiveAccOff;
+static size_t gMlpLiveW1Bytes, gMlpLiveB1Bytes, gMlpLiveW2Bytes, gMlpLiveB2Bytes;
+static id<MTLBuffer> gMlp3ScratchW[4];
+static id<MTLBuffer> gMlp3ScratchB[4];
+static size_t gMlp3CapW[4];
+static size_t gMlp3CapB[4];
+static int gMlp3Side;
+static JaiGpuBuffer *gMlp3LiveW[4];
+static JaiGpuBuffer *gMlp3LiveB[4];
+static size_t gMlp3LiveWOff[4];
+static size_t gMlp3LiveBOff[4];
+static size_t gMlp3LiveWBytes[4];
+static size_t gMlp3LiveBBytes[4];
 
 #define JAI_GPU_MAX_IN_FLIGHT 16
 
@@ -161,7 +245,14 @@ static bool ensureDevice(void) {
 
     dispatch_once(&once, ^{
         @autoreleasepool {
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            id<MTLDevice> device = nil;
+            if (gPreferredDevice >= 0) {
+                NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+                if (devices != nil && gPreferredDevice < (int)devices.count) {
+                    device = devices[(NSUInteger)gPreferredDevice];
+                }
+            }
+            if (device == nil) device = MTLCreateSystemDefaultDevice();
             if (device == nil) return;
 
             id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -198,9 +289,10 @@ static bool ensureBuiltins(void) {
             if (library == nil) return;
 
             NSArray<NSString *> *names =
-                @[@"jaiVectorAdd", @"jaiVectorMul", @"jaiMatMul", @"jaiReduceSum"];
-            id<MTLComputePipelineState> built[4] = {nil, nil, nil, nil};
-            for (NSUInteger i = 0; i < 4; i++) {
+                @[@"jaiVectorAdd", @"jaiVectorMul", @"jaiMatMul", @"jaiReduceSum",
+                  @"jaiExpandU8", @"jaiSplitHeads", @"jaiMergeHeads"];
+            id<MTLComputePipelineState> built[7] = {nil, nil, nil, nil, nil, nil, nil};
+            for (NSUInteger i = 0; i < 7; i++) {
                 id<MTLFunction> fn = [library newFunctionWithName:names[i]];
                 if (fn == nil) return;
                 built[i] = [gDevice newComputePipelineStateWithFunction:fn error:&error];
@@ -211,10 +303,306 @@ static bool ensureBuiltins(void) {
             gVectorMul = built[1];
             gMatMul = built[2];
             gReduceSum = built[3];
+            gExpandU8 = built[4];
+            gSplitHeads = built[5];
+            gMergeHeads = built[6];
             gBuiltinsReady = true;
         }
     });
     return gBuiltinsReady;
+}
+
+/* Tiled FlashAttention-2 with simdgroup 8x8 MMA. Reads packed [seq, heads*hd]
+ * directly so long sequences stay compute-bound instead of paying graph
+ * transposes. Falls back to MPSGraph SDPA when the library does not compile. */
+static const char kFlashAttnSource[] =
+    "#include <metal_stdlib>\n"
+    "#include <metal_simdgroup_matrix>\n"
+    "using namespace metal;\n"
+    "\n"
+    "/* Packed [seq, heads*hd] float → BHSD [heads, seq, hd] half. One pass over\n"
+    " * Q, K, and V so the prefill kernel streams contiguous half K/V instead of\n"
+    " * converting fp32 on every tile. */\n"
+    "kernel void jaiPackMhaHalf(device const float *Q [[buffer(0)]],\n"
+    "                           device const float *K [[buffer(1)]],\n"
+    "                           device const float *V [[buffer(2)]],\n"
+    "                           device half *Qh [[buffer(3)]],\n"
+    "                           device half *Kh [[buffer(4)]],\n"
+    "                           device half *Vh [[buffer(5)]],\n"
+    "                           constant uint &seq [[buffer(6)]],\n"
+    "                           constant uint &heads [[buffer(7)]],\n"
+    "                           constant uint &hd [[buffer(8)]],\n"
+    "                           uint id [[thread_position_in_grid]]) {\n"
+    "    uint vecs = hd / 4u;\n"
+    "    uint count = heads * seq * vecs;\n"
+    "    if (id >= count) return;\n"
+    "    uint d4 = id % vecs;\n"
+    "    uint s = (id / vecs) % seq;\n"
+    "    uint h = id / (vecs * seq);\n"
+    "    uint packed = s * (heads * hd) + h * hd + d4 * 4u;\n"
+    "    uint bhsd = (h * seq + s) * hd + d4 * 4u;\n"
+    "    float4 q = *reinterpret_cast<device const float4 *>(Q + packed);\n"
+    "    float4 k = *reinterpret_cast<device const float4 *>(K + packed);\n"
+    "    float4 v = *reinterpret_cast<device const float4 *>(V + packed);\n"
+    "    *reinterpret_cast<device half4 *>(Qh + bhsd) = half4(q);\n"
+    "    *reinterpret_cast<device half4 *>(Kh + bhsd) = half4(k);\n"
+    "    *reinterpret_cast<device half4 *>(Vh + bhsd) = half4(v);\n"
+    "}\n"
+    "\n"
+    "inline uint2 frag_coord(uint lane) {\n"
+    "    uint qid = lane / 4u;\n"
+    "    uint row = (qid & 4u) + ((lane / 2u) % 4u);\n"
+    "    uint col = (qid & 2u) * 2u + (lane % 2u) * 2u;\n"
+    "    return uint2(col, row);\n"
+    "}\n"
+    "\n"
+    "#define PV_D(ACC, S, KOFF, DOFF) \\\n"
+    "    simdgroup_load(vmat, KVs + (KOFF) * LDV + (DOFF), LDV); \\\n"
+    "    simdgroup_multiply_accumulate(ACC, S, vmat, ACC);\n"
+    "\n"
+    "#define PV_K(S, KOFF, HD_) \\\n"
+    "    PV_D(a0, S, KOFF, 0) \\\n"
+    "    PV_D(a1, S, KOFF, 8) \\\n"
+    "    PV_D(a2, S, KOFF, 16) \\\n"
+    "    PV_D(a3, S, KOFF, 24) \\\n"
+    "    if ((HD_) > 32) { \\\n"
+    "        PV_D(a4, S, KOFF, 32) \\\n"
+    "        PV_D(a5, S, KOFF, 40) \\\n"
+    "        PV_D(a6, S, KOFF, 48) \\\n"
+    "        PV_D(a7, S, KOFF, 56) \\\n"
+    "    }\n"
+    "\n"
+    "#define PREFILL_KERNEL(NAME, HD) \\\n"
+    "kernel void NAME(device const half *Q [[buffer(0)]], \\\n"
+    "                 device const half *K [[buffer(1)]], \\\n"
+    "                 device const half *V [[buffer(2)]], \\\n"
+    "                 device float *Y [[buffer(3)]], \\\n"
+    "                 constant uint &seq [[buffer(4)]], \\\n"
+    "                 constant uint &heads [[buffer(5)]], \\\n"
+    "                 constant float &scale [[buffer(6)]], \\\n"
+    "                 uint lid [[thread_index_in_threadgroup]], \\\n"
+    "                 uint2 tgpig [[threadgroup_position_in_grid]], \\\n"
+    "                 uint sgitg [[simdgroup_index_in_threadgroup]]) { \\\n"
+    "    constexpr uint BR = 64; \\\n"
+    "    constexpr uint BC = 32; \\\n"
+    "    constexpr uint LDQ = HD + 8; \\\n"
+    "    constexpr uint LDK = BC + 8; \\\n"
+    "    constexpr uint LDV = HD + 8; \\\n"
+    "    constexpr uint KV0 = LDK * HD; \\\n"
+    "    constexpr uint KV1 = BC * LDV; \\\n"
+    "    constexpr uint KVN = KV0 > KV1 ? KV0 : KV1; \\\n"
+    "    constexpr uint Q_TCOLS = 4; \\\n"
+    "    constexpr uint Q_NREADS = HD / Q_TCOLS; \\\n"
+    "    constexpr uint KV_TCOLS = 8; \\\n"
+    "    constexpr uint KV_NREADS = HD / KV_TCOLS; \\\n"
+    "    const uint q0 = tgpig.x * BR; \\\n"
+    "    const uint head = tgpig.y; \\\n"
+    "    const uint dim = heads * HD; \\\n"
+    "    const uint qbase = head * HD; \\\n"
+    "    const uint head_off = head * seq * HD; \\\n"
+    "    const uint row0 = sgitg * 8; \\\n"
+    "    const uint lane = lid & 31u; \\\n"
+    "    const uint2 coord = frag_coord(lane); \\\n"
+    "    const float scale2 = scale * 1.4426950408889634f; \\\n"
+    "    threadgroup half Qs[BR * LDQ]; \\\n"
+    "    threadgroup half KVs[KVN]; \\\n"
+    "    const uint qrow_l = lid / Q_TCOLS; \\\n"
+    "    const uint qd0 = (lid % Q_TCOLS) * Q_NREADS; \\\n"
+    "    const uint kvrow_l = lid / KV_TCOLS; \\\n"
+    "    const uint kvd0 = (lid % KV_TCOLS) * KV_NREADS; \\\n"
+    "    { \\\n"
+    "        uint qrow = q0 + qrow_l; \\\n"
+    "        threadgroup half *dst = Qs + qrow_l * LDQ + qd0; \\\n"
+    "        if (qrow < seq) { \\\n"
+    "            device const half *src = Q + head_off + qrow * HD + qd0; \\\n"
+    "            _Pragma(\"clang loop unroll(full)\") \\\n"
+    "            for (uint j = 0; j < Q_NREADS; j += 4) { \\\n"
+    "                half4 v = *reinterpret_cast<device const half4 *>(src + j); \\\n"
+    "                dst[j + 0] = half(float(v.x) * scale2); \\\n"
+    "                dst[j + 1] = half(float(v.y) * scale2); \\\n"
+    "                dst[j + 2] = half(float(v.z) * scale2); \\\n"
+    "                dst[j + 3] = half(float(v.w) * scale2); \\\n"
+    "            } \\\n"
+    "        } else { \\\n"
+    "            _Pragma(\"clang loop unroll(full)\") \\\n"
+    "            for (uint j = 0; j < Q_NREADS; ++j) dst[j] = half(0.0f); \\\n"
+    "        } \\\n"
+    "    } \\\n"
+    "    simdgroup_float8x8 a0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a4 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a5 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a6 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    simdgroup_float8x8 a7 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "    float m_i = -INFINITY; \\\n"
+    "    float l_i = 0.0f; \\\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    "    for (uint k0 = 0; k0 < seq; k0 += BC) { \\\n"
+    "        { \\\n"
+    "            uint kabs = k0 + kvrow_l; \\\n"
+    "            if (kabs < seq) { \\\n"
+    "                device const half *src = K + head_off + kabs * HD + kvd0; \\\n"
+    "                _Pragma(\"clang loop unroll(full)\") \\\n"
+    "                for (uint j = 0; j < KV_NREADS; j += 4) { \\\n"
+    "                    half4 v = *reinterpret_cast<device const half4 *>(src + j); \\\n"
+    "                    KVs[(kvd0 + j + 0) * LDK + kvrow_l] = v.x; \\\n"
+    "                    KVs[(kvd0 + j + 1) * LDK + kvrow_l] = v.y; \\\n"
+    "                    KVs[(kvd0 + j + 2) * LDK + kvrow_l] = v.z; \\\n"
+    "                    KVs[(kvd0 + j + 3) * LDK + kvrow_l] = v.w; \\\n"
+    "                } \\\n"
+    "            } else { \\\n"
+    "                _Pragma(\"clang loop unroll(full)\") \\\n"
+    "                for (uint j = 0; j < KV_NREADS; ++j) { \\\n"
+    "                    KVs[(kvd0 + j) * LDK + kvrow_l] = half(0.0f); \\\n"
+    "                } \\\n"
+    "            } \\\n"
+    "        } \\\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    "        simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "        simdgroup_float8x8 s1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "        simdgroup_float8x8 s2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "        simdgroup_float8x8 s3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \\\n"
+    "        _Pragma(\"clang loop unroll(full)\") \\\n"
+    "        for (uint d = 0; d < HD; d += 8) { \\\n"
+    "            simdgroup_half8x8 qmat; \\\n"
+    "            simdgroup_load(qmat, Qs + row0 * LDQ + d, LDQ); \\\n"
+    "            simdgroup_half8x8 kmat; \\\n"
+    "            simdgroup_load(kmat, KVs + d * LDK + 0, LDK); \\\n"
+    "            simdgroup_multiply_accumulate(s0, qmat, kmat, s0); \\\n"
+    "            simdgroup_load(kmat, KVs + d * LDK + 8, LDK); \\\n"
+    "            simdgroup_multiply_accumulate(s1, qmat, kmat, s1); \\\n"
+    "            simdgroup_load(kmat, KVs + d * LDK + 16, LDK); \\\n"
+    "            simdgroup_multiply_accumulate(s2, qmat, kmat, s2); \\\n"
+    "            simdgroup_load(kmat, KVs + d * LDK + 24, LDK); \\\n"
+    "            simdgroup_multiply_accumulate(s3, qmat, kmat, s3); \\\n"
+    "        } \\\n"
+    "        thread auto &e0 = s0.thread_elements(); \\\n"
+    "        thread auto &e1 = s1.thread_elements(); \\\n"
+    "        thread auto &e2 = s2.thread_elements(); \\\n"
+    "        thread auto &e3 = s3.thread_elements(); \\\n"
+    "        const uint k_lim = (k0 + BC <= seq) ? BC : (seq - k0); \\\n"
+    "        const uint c0 = coord.x; \\\n"
+    "        if (c0 + 0 >= k_lim) e0[0] = -INFINITY; \\\n"
+    "        if (c0 + 1 >= k_lim) e0[1] = -INFINITY; \\\n"
+    "        if (c0 + 8 >= k_lim) e1[0] = -INFINITY; \\\n"
+    "        if (c0 + 9 >= k_lim) e1[1] = -INFINITY; \\\n"
+    "        if (c0 + 16 >= k_lim) e2[0] = -INFINITY; \\\n"
+    "        if (c0 + 17 >= k_lim) e2[1] = -INFINITY; \\\n"
+    "        if (c0 + 24 >= k_lim) e3[0] = -INFINITY; \\\n"
+    "        if (c0 + 25 >= k_lim) e3[1] = -INFINITY; \\\n"
+    "        float tilemax = max(max(e0[0], e0[1]), max(e1[0], e1[1])); \\\n"
+    "        tilemax = max(tilemax, max(max(e2[0], e2[1]), max(e3[0], e3[1]))); \\\n"
+    "        tilemax = max(tilemax, simd_shuffle_xor(tilemax, 1)); \\\n"
+    "        tilemax = max(tilemax, simd_shuffle_xor(tilemax, 8)); \\\n"
+    "        float newm = max(m_i, tilemax); \\\n"
+    "        float alpha = (newm == -INFINITY) ? 1.0f : fast::exp2(m_i - newm); \\\n"
+    "        m_i = newm; \\\n"
+    "        e0[0] = (e0[0] == -INFINITY) ? 0.0f : fast::exp2(e0[0] - m_i); \\\n"
+    "        e0[1] = (e0[1] == -INFINITY) ? 0.0f : fast::exp2(e0[1] - m_i); \\\n"
+    "        e1[0] = (e1[0] == -INFINITY) ? 0.0f : fast::exp2(e1[0] - m_i); \\\n"
+    "        e1[1] = (e1[1] == -INFINITY) ? 0.0f : fast::exp2(e1[1] - m_i); \\\n"
+    "        e2[0] = (e2[0] == -INFINITY) ? 0.0f : fast::exp2(e2[0] - m_i); \\\n"
+    "        e2[1] = (e2[1] == -INFINITY) ? 0.0f : fast::exp2(e2[1] - m_i); \\\n"
+    "        e3[0] = (e3[0] == -INFINITY) ? 0.0f : fast::exp2(e3[0] - m_i); \\\n"
+    "        e3[1] = (e3[1] == -INFINITY) ? 0.0f : fast::exp2(e3[1] - m_i); \\\n"
+    "        float lpart = e0[0] + e0[1] + e1[0] + e1[1] + e2[0] + e2[1] + e3[0] + e3[1]; \\\n"
+    "        lpart += simd_shuffle_xor(lpart, 1); \\\n"
+    "        lpart += simd_shuffle_xor(lpart, 8); \\\n"
+    "        l_i = l_i * alpha + lpart; \\\n"
+    "        { thread auto &ae = a0.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "        { thread auto &ae = a1.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "        { thread auto &ae = a2.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "        { thread auto &ae = a3.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "        if (HD > 32) { \\\n"
+    "            { thread auto &ae = a4.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "            { thread auto &ae = a5.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "            { thread auto &ae = a6.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "            { thread auto &ae = a7.thread_elements(); ae[0] *= alpha; ae[1] *= alpha; } \\\n"
+    "        } \\\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    "        { \\\n"
+    "            uint vabs = k0 + kvrow_l; \\\n"
+    "            threadgroup half *dst = KVs + kvrow_l * LDV + kvd0; \\\n"
+    "            if (vabs < seq) { \\\n"
+    "                device const half *src = V + head_off + vabs * HD + kvd0; \\\n"
+    "                _Pragma(\"clang loop unroll(full)\") \\\n"
+    "                for (uint j = 0; j < KV_NREADS; j += 4) { \\\n"
+    "                    half4 v = *reinterpret_cast<device const half4 *>(src + j); \\\n"
+    "                    dst[j + 0] = v.x; \\\n"
+    "                    dst[j + 1] = v.y; \\\n"
+    "                    dst[j + 2] = v.z; \\\n"
+    "                    dst[j + 3] = v.w; \\\n"
+    "                } \\\n"
+    "            } else { \\\n"
+    "                _Pragma(\"clang loop unroll(full)\") \\\n"
+    "                for (uint j = 0; j < KV_NREADS; ++j) dst[j] = half(0.0f); \\\n"
+    "            } \\\n"
+    "        } \\\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    "        simdgroup_half8x8 vmat; \\\n"
+    "        PV_K(s0, 0, HD) \\\n"
+    "        PV_K(s1, 8, HD) \\\n"
+    "        PV_K(s2, 16, HD) \\\n"
+    "        PV_K(s3, 24, HD) \\\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    "    } \\\n"
+    "    const uint out_row = q0 + row0 + coord.y; \\\n"
+    "    const uint out_col = coord.x; \\\n"
+    "    const float inv = (l_i > 0.0f && m_i != -INFINITY) ? (1.0f / l_i) : 0.0f; \\\n"
+    "    if (out_row < seq) { \\\n"
+    "        device float *dst = Y + out_row * dim + qbase + out_col; \\\n"
+    "        { thread auto &e = a0.thread_elements(); dst[0] = e[0] * inv; dst[1] = e[1] * inv; } \\\n"
+    "        { thread auto &e = a1.thread_elements(); dst[8] = e[0] * inv; dst[9] = e[1] * inv; } \\\n"
+    "        { thread auto &e = a2.thread_elements(); dst[16] = e[0] * inv; dst[17] = e[1] * inv; } \\\n"
+    "        { thread auto &e = a3.thread_elements(); dst[24] = e[0] * inv; dst[25] = e[1] * inv; } \\\n"
+    "        if (HD > 32) { \\\n"
+    "            { thread auto &e = a4.thread_elements(); dst[32] = e[0] * inv; dst[33] = e[1] * inv; } \\\n"
+    "            { thread auto &e = a5.thread_elements(); dst[40] = e[0] * inv; dst[41] = e[1] * inv; } \\\n"
+    "            { thread auto &e = a6.thread_elements(); dst[48] = e[0] * inv; dst[49] = e[1] * inv; } \\\n"
+    "            { thread auto &e = a7.thread_elements(); dst[56] = e[0] * inv; dst[57] = e[1] * inv; } \\\n"
+    "        } \\\n"
+    "    } \\\n"
+    "}\n"
+    "\n"
+    "PREFILL_KERNEL(jaiPrefill32, 32)\n"
+    "PREFILL_KERNEL(jaiPrefill64, 64)\n"
+    "\n";
+static bool ensureFlashAttn(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!ensureDevice()) return;
+        @autoreleasepool {
+            NSError *error = nil;
+            MTLCompileOptions *opts = [MTLCompileOptions new];
+            if (@available(macOS 15.0, *)) {
+                opts.mathMode = MTLMathModeFast;
+            }
+            id<MTLLibrary> library = [gDevice newLibraryWithSource:@(kFlashAttnSource)
+                                                           options:opts
+                                                             error:&error];
+            if (library == nil) return;
+            MTLComputePipelineDescriptor *desc = [MTLComputePipelineDescriptor new];
+            desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            id<MTLFunction> fn32 = [library newFunctionWithName:@"jaiPrefill32"];
+            id<MTLFunction> fn64 = [library newFunctionWithName:@"jaiPrefill64"];
+            id<MTLFunction> fnPack = [library newFunctionWithName:@"jaiPackMhaHalf"];
+            if (fn32 == nil || fn64 == nil || fnPack == nil) return;
+            desc.computeFunction = fn32;
+            gFlashAttn32 = [gDevice newComputePipelineStateWithDescriptor:desc
+                                                                  options:MTLPipelineOptionNone
+                                                               reflection:nil
+                                                                    error:&error];
+            desc.computeFunction = fn64;
+            gFlashAttn64 = [gDevice newComputePipelineStateWithDescriptor:desc
+                                                                  options:MTLPipelineOptionNone
+                                                               reflection:nil
+                                                                    error:&error];
+            gFlashPack = [gDevice newComputePipelineStateWithFunction:fnPack error:&error];
+        }
+    });
+    return gFlashAttn32 != nil && gFlashAttn64 != nil && gFlashPack != nil;
 }
 
 bool jaiGpuAvailable(void) {
@@ -232,6 +620,32 @@ const char *jaiGpuDeviceName(void) {
         }
     });
     return name[0] != '\0' ? name : "none";
+}
+
+int jaiGpuDeviceCount(void) {
+    @autoreleasepool {
+        NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+        return devices != nil ? (int)devices.count : 0;
+    }
+}
+
+bool jaiGpuSetDevice(int index) {
+    if (gDeviceReady) return false;
+    if (index < 0) return false;
+    @autoreleasepool {
+        NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+        if (devices == nil || index >= (int)devices.count) return false;
+        gPreferredDevice = index;
+        return true;
+    }
+}
+
+void jaiGpuSetMixedPrecision(bool enabled) {
+    gMixedPrecision = enabled;
+}
+
+bool jaiGpuMixedPrecision(void) {
+    return gMixedPrecision;
 }
 
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
@@ -274,17 +688,97 @@ void jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset)
     memcpy((uint8_t *)[buffer contents] + offset, src, bytes);
 }
 
+static void encodeDispatch(id<MTLComputeCommandEncoder> encoder,
+                           id<MTLComputePipelineState> pipeline,
+                           NSUInteger threads, NSUInteger groupSize);
+
 void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                     size_t offset, float scale) {
     if (b == NULL || b->buffer == NULL || src == NULL || count == 0) return;
-    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
-    float *destination = (float *)[buffer contents] + offset;
-    for (size_t i = 0; i < count; i++) destination[i] = (float)src[i] * scale;
+    const size_t start = offset * sizeof(float);
+    const size_t bytes = count * sizeof(float);
+    if (start > b->bytes || bytes > b->bytes - start) return;
+    if (count < JAI_GPU_MIN_WORK || count > UINT32_MAX || !ensureDevice() ||
+        !ensureBuiltins() || gExpandU8 == nil) {
+        float *destination =
+            (float *)((__bridge id<MTLBuffer>)b->buffer).contents + offset;
+        for (size_t i = 0; i < count; i++) destination[i] = (float)src[i] * scale;
+        return;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> dest = (__bridge id<MTLBuffer>)b->buffer;
+        id<MTLBuffer> staging = [gDevice newBufferWithBytes:src
+                                                     length:count
+                                                    options:MTLResourceStorageModeShared];
+        if (staging == nil) {
+            float *destination = (float *)[dest contents] + offset;
+            for (size_t i = 0; i < count; i++) destination[i] = (float)src[i] * scale;
+            return;
+        }
+        uint32_t n = (uint32_t)count;
+        float scaleValue = scale;
+        @synchronized(gQueue) {
+            if (gAsyncCommands == nil) {
+                gAsyncCommands = [gQueue commandBuffer];
+                if (gAsyncCommands == nil) {
+                    float *destination = (float *)[dest contents] + offset;
+                    for (size_t i = 0; i < count; i++) {
+                        destination[i] = (float)src[i] * scale;
+                    }
+                    return;
+                }
+            }
+            if (gAsyncEncoder == nil) {
+                gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
+                if (gAsyncEncoder == nil) {
+                    float *destination = (float *)[dest contents] + offset;
+                    for (size_t i = 0; i < count; i++) {
+                        destination[i] = (float)src[i] * scale;
+                    }
+                    return;
+                }
+            }
+            [gAsyncEncoder setComputePipelineState:gExpandU8];
+            [gAsyncEncoder setBuffer:staging offset:0 atIndex:0];
+            [gAsyncEncoder setBuffer:dest offset:start atIndex:1];
+            [gAsyncEncoder setBytes:&n length:sizeof(n) atIndex:2];
+            [gAsyncEncoder setBytes:&scaleValue length:sizeof(scaleValue) atIndex:3];
+            encodeDispatch(gAsyncEncoder, gExpandU8, (NSUInteger)count, 256);
+        }
+    }
+}
+
+void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
+                       float low, float high, uint64_t seed) {
+    if (b == NULL || b->buffer == NULL || count == 0) return;
+    const size_t start = elementOffset * sizeof(float);
+    const size_t bytes = count * sizeof(float);
+    if (start > b->bytes || bytes > b->bytes - start) return;
+    float *destination =
+        (float *)((__bridge id<MTLBuffer>)b->buffer).contents + elementOffset;
+    uint64_t state = seed != 0 ? seed : 0x9E3779B97F4A7C15ull;
+    const float scale = (high - low) * (1.0f / 16777216.0f);
+    for (size_t i = 0; i < count; i++) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        destination[i] = low + scale * (float)((uint32_t)(state >> 40));
+    }
+}
+
+void jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    if (b == NULL || b->buffer == NULL || count == 0) return;
+    const size_t start = elementOffset * sizeof(float);
+    const size_t bytes = count * sizeof(float);
+    if (start > b->bytes || bytes > b->bytes - start) return;
+    memset((uint8_t *)((__bridge id<MTLBuffer>)b->buffer).contents + start, 0, bytes);
 }
 
 void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     if (b == NULL || b->buffer == NULL || dst == NULL || bytes == 0) return;
     if (offset > b->bytes || bytes > b->bytes - offset) return;
+    jaiGpuSynchronize();
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
@@ -517,11 +1011,75 @@ bool jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                           threads, groupSize, byteOffsets, false);
 }
 
+static bool commitMlpAccLocked(void);
+static bool commitMlpWeightsLocked(void);
+static bool commitMlp3WeightsLocked(void);
+static bool blitMany(__unsafe_unretained id<MTLBuffer> *srcs, JaiGpuBuffer **dsts,
+                    const size_t *offs, const size_t *bytes, int count);
+
+static bool commitMlpAccLocked(void) {
+    if (gMlpAccSide == 0 || gMlpLiveAcc == NULL) {
+        gMlpAccSide = 0;
+        return true;
+    }
+    __unsafe_unretained id<MTLBuffer> srcs[] = {gMlpScratchAcc};
+    JaiGpuBuffer *dsts[] = {gMlpLiveAcc};
+    size_t offs[] = {gMlpLiveAccOff};
+    size_t sizes[] = {sizeof(float)};
+    if (!blitMany(srcs, dsts, offs, sizes, 1)) return false;
+    gMlpAccSide = 0;
+    return true;
+}
+
+static bool commitMlpWeightsLocked(void) {
+    if (gMlpSide == 0) return true;
+    if (gMlpLiveW1 == NULL || gMlpLiveB1 == NULL || gMlpLiveW2 == NULL ||
+        gMlpLiveB2 == NULL) {
+        gMlpSide = 0;
+        return true;
+    }
+    __unsafe_unretained id<MTLBuffer> srcs[] = {
+        gMlpScratchW1, gMlpScratchB1, gMlpScratchW2, gMlpScratchB2
+    };
+    JaiGpuBuffer *dsts[] = {
+        gMlpLiveW1, gMlpLiveB1, gMlpLiveW2, gMlpLiveB2
+    };
+    size_t offs[] = {
+        gMlpLiveW1Off, gMlpLiveB1Off, gMlpLiveW2Off, gMlpLiveB2Off
+    };
+    size_t sizes[] = {
+        gMlpLiveW1Bytes, gMlpLiveB1Bytes, gMlpLiveW2Bytes, gMlpLiveB2Bytes
+    };
+    if (!blitMany(srcs, dsts, offs, sizes, 4)) return false;
+    gMlpSide = 0;
+    return true;
+}
+
+static bool flushAsyncLocked(id<MTLCommandBuffer> *oldestOut) {
+    if (oldestOut != NULL) *oldestOut = nil;
+    if (gAsyncCommands != nil) {
+        [gAsyncEncoder endEncoding];
+        [gAsyncCommands commit];
+        ensureInFlight();
+        [gInFlight addObject:gAsyncCommands];
+        gAsyncEncoder = nil;
+        gAsyncCommands = nil;
+    }
+    if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
+        if (oldestOut != NULL) {
+            *oldestOut = gInFlight[0];
+            [gInFlight removeObjectAtIndex:0];
+        }
+    }
+    return true;
+}
+
 bool jaiGpuFlush(void) {
     if (!ensureDevice()) return false;
     @autoreleasepool {
         id<MTLCommandBuffer> oldest = nil;
         @synchronized(gQueue) {
+            if (!commitMlpAccLocked()) return false;
             if (gAsyncCommands != nil) {
                 [gAsyncEncoder endEncoding];
                 [gAsyncCommands commit];
@@ -542,6 +1100,15 @@ bool jaiGpuFlush(void) {
 }
 
 bool jaiGpuSynchronize(void) {
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            if (!commitMlpAccLocked()) return false;
+            if (!commitMlpWeightsLocked()) return false;
+            if (gMlp3Side != 0) {
+                if (!commitMlp3WeightsLocked()) return false;
+            }
+        }
+    }
     if (!jaiGpuFlush()) return false;
     @autoreleasepool {
         NSArray<id<MTLCommandBuffer>> *pending;
@@ -556,6 +1123,2213 @@ bool jaiGpuSynchronize(void) {
         }
         return true;
     }
+}
+
+static NSMutableDictionary<NSString *, id> *gMpsGraphs;
+
+static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset, NSArray<NSNumber *> *shape) {
+    NSUInteger count = 1;
+    for (NSNumber *dim in shape) count *= dim.unsignedIntegerValue;
+    const size_t bytes = (size_t)count * sizeof(float);
+    if (offset + bytes > b->bytes) return nil;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->buffer;
+    if (offset == 0) {
+        return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf
+                                                       shape:shape
+                                                    dataType:MPSDataTypeFloat32];
+    }
+    MPSNDArrayDescriptor *desc =
+        [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32 shape:shape];
+    if (desc == nil) return nil;
+    MPSNDArray *array = [[MPSNDArray alloc] initWithBuffer:buf offset:offset descriptor:desc];
+    if (array == nil) return nil;
+    return [[MPSGraphTensorData alloc] initWithMPSNDArray:array];
+}
+
+static MPSGraphTensorData *graphDataDesc(JaiGpuBuffer *b, size_t offset, size_t bytes,
+                                         MPSNDArrayDescriptor *desc,
+                                         NSArray<NSNumber *> *shape) {
+    if (offset == 0) return graphData(b, 0, shape);
+    if (desc == nil || b == NULL || b->buffer == NULL) return nil;
+    if (offset + bytes > b->bytes) return nil;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->buffer;
+    MPSNDArray *array = [[MPSNDArray alloc] initWithBuffer:buf offset:offset descriptor:desc];
+    if (array == nil) return nil;
+    return [[MPSGraphTensorData alloc] initWithMPSNDArray:array];
+}
+
+static bool prefetchBatchFeeds(JaiGpuBuffer *x, size_t xOff, size_t xStride, size_t xBytes,
+                               MPSNDArrayDescriptor *xDesc, NSArray<NSNumber *> *xShape,
+                               JaiGpuBuffer *labels, size_t labOff, size_t labStride,
+                               size_t labBytes, MPSNDArrayDescriptor *yDesc,
+                               NSArray<NSNumber *> *yShape, uint32_t steps,
+                               NSMutableArray<MPSGraphTensorData *> *batchX,
+                               NSMutableArray<MPSGraphTensorData *> *batchY) {
+    for (uint32_t i = 0; i < steps; i++) {
+        MPSGraphTensorData *dx =
+            graphDataDesc(x, xOff + (size_t)i * xStride, xBytes, xDesc, xShape);
+        MPSGraphTensorData *dy =
+            graphDataDesc(labels, labOff + (size_t)i * labStride, labBytes, yDesc, yShape);
+        if (dx == nil || dy == nil) return false;
+        [batchX addObject:dx];
+        [batchY addObject:dy];
+    }
+    return true;
+}
+
+static bool ensureAsyncCommandBuffer(void) {
+    if (gAsyncEncoder != nil) {
+        [gAsyncEncoder endEncoding];
+        gAsyncEncoder = nil;
+    }
+    if (gAsyncCommands == nil) {
+        gAsyncCommands = [gQueue commandBuffer];
+        if (gAsyncCommands == nil) return false;
+    }
+    return true;
+}
+
+static bool encodeGraphOnAsync(MPSGraph *graph,
+                               NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds,
+                               NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results) {
+    if (!ensureAsyncCommandBuffer()) return false;
+    MPSCommandBuffer *mps =
+        [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
+    if (mps == nil) return false;
+    static MPSGraphExecutionDescriptor *execDesc;
+    static dispatch_once_t execOnce;
+    dispatch_once(&execOnce, ^{
+        execDesc = [MPSGraphExecutionDescriptor new];
+        if (@available(macOS 12.3, *)) {
+            MPSGraphCompilationDescriptor *comp = [MPSGraphCompilationDescriptor new];
+            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+            execDesc.compilationDescriptor = comp;
+        }
+    });
+    [graph encodeToCommandBuffer:mps
+                           feeds:feeds
+                targetOperations:nil
+               resultsDictionary:results
+             executionDescriptor:execDesc];
+    gAsyncCommands = mps.rootCommandBuffer;
+    gAsyncEncoder = nil;
+    return gAsyncCommands != nil;
+}
+
+static id<MTLBuffer> growScratch(id<MTLBuffer> existing, size_t *cap, size_t bytes) {
+    if (existing != nil && *cap >= bytes) return existing;
+    *cap = bytes;
+    return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+}
+
+static bool blitMany(__unsafe_unretained id<MTLBuffer> *srcs, JaiGpuBuffer **dsts,
+                    const size_t *offs, const size_t *bytes, int count) {
+    if (count <= 0) return true;
+    for (int i = 0; i < count; i++) {
+        if (srcs[i] == nil || dsts[i] == NULL || dsts[i]->buffer == NULL) return false;
+        if (offs[i] + bytes[i] > dsts[i]->bytes) return false;
+    }
+    if (!ensureAsyncCommandBuffer()) return false;
+    id<MTLBlitCommandEncoder> blit = [gAsyncCommands blitCommandEncoder];
+    if (blit == nil) return false;
+    for (int i = 0; i < count; i++) {
+        [blit copyFromBuffer:srcs[i]
+                sourceOffset:0
+                    toBuffer:(__bridge id<MTLBuffer>)dsts[i]->buffer
+           destinationOffset:offs[i]
+                        size:bytes[i]];
+    }
+    [blit endEncoding];
+    return true;
+}
+
+static MPSGraphTensor *ampMatMul(MPSGraph *graph, MPSGraphTensor *a, MPSGraphTensor *b,
+                                 NSString *name) {
+    if (!gMixedPrecision) {
+        return [graph matrixMultiplicationWithPrimaryTensor:a secondaryTensor:b name:name];
+    }
+    MPSGraphTensor *a16 = [graph castTensor:a toType:MPSDataTypeFloat16
+                                       name:[name stringByAppendingString:@"_a16"]];
+    MPSGraphTensor *b16 = [graph castTensor:b toType:MPSDataTypeFloat16
+                                       name:[name stringByAppendingString:@"_b16"]];
+    MPSGraphTensor *c16 = [graph matrixMultiplicationWithPrimaryTensor:a16
+                                                     secondaryTensor:b16
+                                                                name:[name stringByAppendingString:@"_c16"]];
+    return [graph castTensor:c16 toType:MPSDataTypeFloat32 name:name];
+}
+
+static MPSGraphTensorData *graphDataMTL(id<MTLBuffer> buf, NSArray<NSNumber *> *shape) {
+    if (buf == nil) return nil;
+    return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf
+                                                   shape:shape
+                                                dataType:MPSDataTypeFloat32];
+}
+
+static NSArray *cachedMpsGraph(uint32_t m, uint32_t k, uint32_t n, bool transA,
+                               bool transB) {
+    if (gMpsGraphs == nil) gMpsGraphs = [[NSMutableDictionary alloc] init];
+    NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%d:%d:%d", m, k, n, transA, transB,
+                     gMixedPrecision ? 1 : 0];
+    NSArray *cached = gMpsGraphs[key];
+    if (cached != nil) return cached;
+
+    MPSGraph *graph = [[MPSGraph alloc] init];
+    graph.options = MPSGraphOptionsNone;
+    MPSGraphTensor *rawA = [graph
+        placeholderWithShape:@[ @(transA ? k : m), @(transA ? m : k) ]
+                    dataType:MPSDataTypeFloat32
+                        name:@"A"];
+    MPSGraphTensor *rawB = [graph
+        placeholderWithShape:@[ @(transB ? n : k), @(transB ? k : n) ]
+                    dataType:MPSDataTypeFloat32
+                        name:@"B"];
+    MPSGraphTensor *left = transA
+        ? [graph transposeTensor:rawA permutation:@[ @1, @0 ] name:@"AT"]
+        : rawA;
+    MPSGraphTensor *right = transB
+        ? [graph transposeTensor:rawB permutation:@[ @1, @0 ] name:@"BT"]
+        : rawB;
+    MPSGraphTensor *product =
+        ampMatMul(graph, left, right, @"C");
+    cached = @[ graph, rawA, rawB, product ];
+    gMpsGraphs[key] = cached;
+    return cached;
+}
+
+bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
+                         size_t bOffset, JaiGpuBuffer *out, size_t outOffset,
+                         uint32_t m, uint32_t k, uint32_t n, bool transA,
+                         bool transB) {
+    if (a == NULL || b == NULL || out == NULL) return false;
+    if (a->buffer == NULL || b->buffer == NULL || out->buffer == NULL) return false;
+    if (m == 0 || n == 0) return true;
+    if (k == 0) return false;
+    if (!ensureDevice()) return false;
+
+    const NSUInteger aRows = transA ? k : m;
+    const NSUInteger aCols = transA ? m : k;
+    const NSUInteger bRows = transB ? n : k;
+    const NSUInteger bCols = transB ? k : n;
+    const NSUInteger aRowBytes = aCols * sizeof(float);
+    const NSUInteger bRowBytes = bCols * sizeof(float);
+    const NSUInteger cRowBytes = (NSUInteger)n * sizeof(float);
+    if (aRowBytes % 16 != 0 || bRowBytes % 16 != 0 || cRowBytes % 16 != 0) {
+        return false;
+    }
+    const size_t aBytes = (size_t)aRows * aRowBytes;
+    const size_t bBytes = (size_t)bRows * bRowBytes;
+    const size_t cBytes = (size_t)m * cRowBytes;
+    if (aOffset + aBytes > a->bytes || bOffset + bBytes > b->bytes ||
+        outOffset + cBytes > out->bytes) {
+        return false;
+    }
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            NSArray *cached = cachedMpsGraph(m, k, n, transA, transB);
+            if (cached == nil || cached.count != 4) return false;
+            MPSGraph *graph = cached[0];
+            MPSGraphTensor *rawA = cached[1];
+            MPSGraphTensor *rawB = cached[2];
+            MPSGraphTensor *product = cached[3];
+
+            MPSGraphTensorData *dataA = graphData(a, aOffset, @[ @(aRows), @(aCols) ]);
+            MPSGraphTensorData *dataB = graphData(b, bOffset, @[ @(bRows), @(bCols) ]);
+            MPSGraphTensorData *dataC = graphData(out, outOffset, @[ @(m), @(n) ]);
+            if (dataA == nil || dataB == nil || dataC == nil) return false;
+
+            NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
+                [@{product : dataC} mutableCopy];
+            if (!encodeGraphOnAsync(graph, @{rawA : dataA, rawB : dataB}, results)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+static NSMutableDictionary<NSString *, NSArray *> *gMhaGraphs;
+
+static bool encodeFlashAttn(id<MTLBuffer> qBuf, size_t qOff,
+                            id<MTLBuffer> kBuf, size_t kOff,
+                            id<MTLBuffer> vBuf, size_t vOff,
+                            id<MTLBuffer> yBuf, size_t outOff,
+                            uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
+    id<MTLComputePipelineState> pipe = hd == 32 ? gFlashAttn32 : hd == 64 ? gFlashAttn64 : nil;
+    if (pipe == nil || gFlashPack == nil) return false;
+    const size_t halfBytes = (size_t)seq * (size_t)heads * (size_t)hd * sizeof(uint16_t);
+    gMhaHalfScratch = growScratch(gMhaHalfScratch, &gMhaHalfCap, halfBytes * 3u);
+    if (gMhaHalfScratch == nil) return false;
+    if (gAsyncCommands == nil) {
+        gAsyncCommands = [gQueue commandBuffer];
+        if (gAsyncCommands == nil) return false;
+    }
+    if (gAsyncEncoder == nil) {
+        gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
+        if (gAsyncEncoder == nil) return false;
+    }
+    [gAsyncEncoder setComputePipelineState:gFlashPack];
+    [gAsyncEncoder setBuffer:qBuf offset:qOff atIndex:0];
+    [gAsyncEncoder setBuffer:kBuf offset:kOff atIndex:1];
+    [gAsyncEncoder setBuffer:vBuf offset:vOff atIndex:2];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:0 atIndex:3];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes atIndex:4];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes * 2u atIndex:5];
+    [gAsyncEncoder setBytes:&seq length:sizeof(seq) atIndex:6];
+    [gAsyncEncoder setBytes:&heads length:sizeof(heads) atIndex:7];
+    [gAsyncEncoder setBytes:&hd length:sizeof(hd) atIndex:8];
+    const NSUInteger packThreads = (NSUInteger)heads * seq * (hd / 4u);
+    encodeDispatch(gAsyncEncoder, gFlashPack, packThreads, 256);
+    [gAsyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [gAsyncEncoder setComputePipelineState:pipe];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:0 atIndex:0];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes atIndex:1];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes * 2u atIndex:2];
+    [gAsyncEncoder setBuffer:yBuf offset:outOff atIndex:3];
+    [gAsyncEncoder setBytes:&seq length:sizeof(seq) atIndex:4];
+    [gAsyncEncoder setBytes:&heads length:sizeof(heads) atIndex:5];
+    [gAsyncEncoder setBytes:&scale length:sizeof(scale) atIndex:6];
+    const uint32_t qTiles = (seq + 63u) / 64u;
+    [gAsyncEncoder dispatchThreadgroups:MTLSizeMake(qTiles, heads, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    return true;
+}
+
+static NSArray *cachedPackedMhaGraph(uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
+    if (seq == 0 || heads == 0 || hd == 0) return nil;
+    if (gMhaGraphs == nil) gMhaGraphs = [[NSMutableDictionary alloc] init];
+    NSString *key = [NSString stringWithFormat:@"mha-packed:%u:%u:%u:%.8f:%d",
+                     seq, heads, hd, scale, gMixedPrecision ? 1 : 0];
+    NSArray *cached = gMhaGraphs[key];
+    if (cached != nil) return cached;
+    if (@available(macOS 15.0, *)) {
+        MPSGraph *graph = [MPSGraph new];
+        graph.options = MPSGraphOptionsNone;
+        NSArray *packed = @[ @1, @(seq), @(heads), @(hd) ];
+        MPSGraphTensor *q = [graph placeholderWithShape:packed
+                                               dataType:MPSDataTypeFloat32
+                                                   name:@"Q"];
+        MPSGraphTensor *k = [graph placeholderWithShape:packed
+                                               dataType:MPSDataTypeFloat32
+                                                   name:@"K"];
+        MPSGraphTensor *v = [graph placeholderWithShape:packed
+                                               dataType:MPSDataTypeFloat32
+                                                   name:@"V"];
+        MPSGraphTensor *qt = [graph transposeTensor:q permutation:@[ @0, @2, @1, @3 ]
+                                               name:@"Qt"];
+        MPSGraphTensor *kt = [graph transposeTensor:k permutation:@[ @0, @2, @1, @3 ]
+                                               name:@"Kt"];
+        MPSGraphTensor *vt = [graph transposeTensor:v permutation:@[ @0, @2, @1, @3 ]
+                                               name:@"Vt"];
+        MPSGraphTensor *qIn = qt;
+        MPSGraphTensor *kIn = kt;
+        MPSGraphTensor *vIn = vt;
+        if (gMixedPrecision) {
+            qIn = [graph castTensor:qt toType:MPSDataTypeFloat16 name:@"Q16"];
+            kIn = [graph castTensor:kt toType:MPSDataTypeFloat16 name:@"K16"];
+            vIn = [graph castTensor:vt toType:MPSDataTypeFloat16 name:@"V16"];
+        }
+        MPSGraphTensor *ctx =
+            [graph scaledDotProductAttentionWithQueryTensor:qIn
+                                                  keyTensor:kIn
+                                                valueTensor:vIn
+                                                      scale:scale
+                                                       name:@"sdpa"];
+        if (gMixedPrecision) {
+            ctx = [graph castTensor:ctx toType:MPSDataTypeFloat32 name:@"C32"];
+        }
+        MPSGraphTensor *ct = [graph transposeTensor:ctx permutation:@[ @0, @2, @1, @3 ]
+                                               name:@"Ct"];
+        cached = @[ graph, q, k, v, ct ];
+        gMhaGraphs[key] = cached;
+        return cached;
+    }
+    return nil;
+}
+
+bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
+                     JaiGpuBuffer *v, size_t vOff, JaiGpuBuffer *out, size_t outOff,
+                     uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
+    if (q == NULL || k == NULL || v == NULL || out == NULL) return false;
+    if (q->buffer == NULL || k->buffer == NULL || v->buffer == NULL ||
+        out->buffer == NULL) {
+        return false;
+    }
+    if (seq == 0 || heads == 0 || hd == 0) return false;
+    if (!isfinite(scale) || scale <= 0.0f) return false;
+    const size_t bytes = (size_t)seq * (size_t)heads * (size_t)hd * sizeof(float);
+    if (qOff + bytes > q->bytes || kOff + bytes > k->bytes ||
+        vOff + bytes > v->bytes || outOff + bytes > out->bytes) {
+        return false;
+    }
+    if (!ensureDevice()) return false;
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            if ((hd == 32 || hd == 64) && ensureFlashAttn()) {
+                id<MTLBuffer> qBuf = (__bridge id<MTLBuffer>)q->buffer;
+                id<MTLBuffer> kBuf = (__bridge id<MTLBuffer>)k->buffer;
+                id<MTLBuffer> vBuf = (__bridge id<MTLBuffer>)v->buffer;
+                id<MTLBuffer> yBuf = (__bridge id<MTLBuffer>)out->buffer;
+                if (encodeFlashAttn(qBuf, qOff, kBuf, kOff, vBuf, vOff, yBuf, outOff,
+                                    seq, heads, hd, scale)) {
+                    return true;
+                }
+            }
+            NSArray *packed = cachedPackedMhaGraph(seq, heads, hd, scale);
+            if (packed != nil && packed.count == 5) {
+                NSArray *shape = @[ @1, @(seq), @(heads), @(hd) ];
+                MPSGraphTensorData *dq = graphData(q, qOff, shape);
+                MPSGraphTensorData *dk = graphData(k, kOff, shape);
+                MPSGraphTensorData *dv = graphData(v, vOff, shape);
+                MPSGraphTensorData *dy = graphData(out, outOff, shape);
+                if (dq != nil && dk != nil && dv != nil && dy != nil) {
+                    NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
+                        [@{packed[4] : dy} mutableCopy];
+                    if (encodeGraphOnAsync(packed[0],
+                                           @{packed[1] : dq, packed[2] : dk, packed[3] : dv},
+                                           results)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+}
+
+bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
+                         JaiGpuBuffer *weights, size_t weightsOffset,
+                         JaiGpuBuffer *bias, size_t biasOffset,
+                         JaiGpuBuffer *out, size_t outOffset,
+                         uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                         uint32_t cout, uint32_t kh, uint32_t kw,
+                         uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    if (input == NULL || weights == NULL || out == NULL) return false;
+    if (input->buffer == NULL || weights->buffer == NULL || out->buffer == NULL) return false;
+    if (n == 0 || h == 0 || w == 0 || cin == 0 || cout == 0 || kh == 0 || kw == 0) return false;
+    if (sh == 0 || sw == 0) return false;
+    if (!ensureDevice()) return false;
+    if (h + 2 * ph < kh || w + 2 * pw < kw) return false;
+    const uint32_t outH = (h + 2 * ph - kh) / sh + 1;
+    const uint32_t outW = (w + 2 * pw - kw) / sw + 1;
+    const size_t inBytes = (size_t)n * h * w * cin * sizeof(float);
+    const size_t wBytes = (size_t)kh * kw * cin * cout * sizeof(float);
+    const size_t outBytes = (size_t)n * outH * outW * cout * sizeof(float);
+    if (inputOffset + inBytes > input->bytes || weightsOffset + wBytes > weights->bytes ||
+        outOffset + outBytes > out->bytes) {
+        return false;
+    }
+    /* MPSNDArray rejects user buffers smaller than its internal alignment
+     * quantum; fall back to the Metal im2col path for tiny activations. */
+    if (input->bytes < 512 || weights->bytes < 512 || out->bytes < 512) return false;
+    if (bias != NULL) {
+        if (bias->buffer == NULL) return false;
+        if (biasOffset + (size_t)cout * sizeof(float) > bias->bytes) return false;
+    }
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            static NSMutableDictionary<NSString *, NSArray *> *graphs;
+            if (graphs == nil) graphs = [[NSMutableDictionary alloc] init];
+            NSString *key = [NSString stringWithFormat:
+                @"conv:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%d",
+                n, h, w, cin, cout, kh, kw, sh, sw, ph, pw,
+                bias != NULL ? 1 : 0, gMixedPrecision ? 1 : 0];
+            NSArray *cached = graphs[key];
+            if (cached == nil) {
+                MPSGraph *graph = [[MPSGraph alloc] init];
+                graph.options = MPSGraphOptionsNone;
+                MPSGraphTensor *src = [graph placeholderWithShape:@[ @(n), @(h), @(w), @(cin) ]
+                                                         dataType:MPSDataTypeFloat32
+                                                             name:@"X"];
+                MPSGraphTensor *filt = [graph placeholderWithShape:@[ @(kh), @(kw), @(cin), @(cout) ]
+                                                          dataType:MPSDataTypeFloat32
+                                                              name:@"W"];
+                MPSGraphConvolution2DOpDescriptor *desc =
+                    [MPSGraphConvolution2DOpDescriptor
+                        descriptorWithStrideInX:sw
+                                      strideInY:sh
+                                 dilationRateInX:1
+                                 dilationRateInY:1
+                                         groups:1
+                                    paddingLeft:pw
+                                   paddingRight:pw
+                                     paddingTop:ph
+                                  paddingBottom:ph
+                                   paddingStyle:MPSGraphPaddingStyleExplicit
+                                     dataLayout:MPSGraphTensorNamedDataLayoutNHWC
+                                  weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
+                MPSGraphTensor *conv = [graph convolution2DWithSourceTensor:src
+                                                              weightsTensor:filt
+                                                                 descriptor:desc
+                                                                       name:@"conv"];
+                MPSGraphTensor *product = conv;
+                MPSGraphTensor *biasT = nil;
+                if (bias != NULL) {
+                    biasT = [graph placeholderWithShape:@[ @(cout) ]
+                                               dataType:MPSDataTypeFloat32
+                                                   name:@"b"];
+                    product = [graph additionWithPrimaryTensor:conv
+                                               secondaryTensor:[graph reshapeTensor:biasT
+                                                                          withShape:@[ @1, @1, @1, @(cout) ]
+                                                                               name:@"br"]
+                                                          name:@"convb"];
+                }
+                NSMutableArray *built = [@[ graph, src, filt, product ] mutableCopy];
+                if (biasT != nil) [built addObject:biasT];
+                cached = built;
+                graphs[key] = cached;
+            }
+
+            MPSGraph *graph = cached[0];
+            MPSGraphTensor *src = cached[1];
+            MPSGraphTensor *filt = cached[2];
+            MPSGraphTensor *product = cached[3];
+            MPSGraphTensorData *dataX = graphData(input, inputOffset,
+                                                  @[ @(n), @(h), @(w), @(cin) ]);
+            MPSGraphTensorData *dataW = graphData(weights, weightsOffset,
+                                                  @[ @(kh), @(kw), @(cin), @(cout) ]);
+            MPSGraphTensorData *dataY = graphData(out, outOffset,
+                                                  @[ @(n), @(outH), @(outW), @(cout) ]);
+            if (dataX == nil || dataW == nil || dataY == nil) return false;
+            NSMutableDictionary *feeds = [@{src : dataX, filt : dataW} mutableCopy];
+            if (bias != NULL) {
+                if (cached.count < 5) return false;
+                MPSGraphTensorData *dataB = graphData(bias, biasOffset, @[ @(cout) ]);
+                if (dataB == nil) return false;
+                feeds[cached[4]] = dataB;
+            }
+            NSMutableDictionary *results = [@{product : dataY} mutableCopy];
+            if (!encodeGraphOnAsync(graph, feeds, results)) return false;
+        }
+        return true;
+    }
+}
+
+static NSMutableDictionary<NSString *, NSArray *> *gMlpGraphs;
+static NSMutableDictionary<NSString *, MPSGraphExecutable *> *gMlpExecutables;
+
+static NSString *mlpCacheKey(uint32_t B, uint32_t inFeatures, uint32_t H, uint32_t C,
+                             float lr, bool trackCorrect) {
+    return [NSString stringWithFormat:@"%u:%u:%u:%u:%.8f:%d:%d",
+            B, inFeatures, H, C, lr, trackCorrect ? 1 : 0, gMixedPrecision ? 1 : 0];
+}
+
+static MPSGraphShapedType *mlpShapedType(NSArray<NSNumber *> *shape) {
+    return [[MPSGraphShapedType alloc] initWithShape:shape dataType:MPSDataTypeFloat32];
+}
+
+static MPSGraphTensorShapedTypeDictionary *mlpFeedTypes(NSArray *cached, bool trackCorrect,
+                                                          uint32_t B, uint32_t inFeatures,
+                                                          uint32_t H, uint32_t C) {
+    NSMutableDictionary *feeds = [@{
+        cached[1] : mlpShapedType(@[ @(B), @(inFeatures) ]),
+        cached[2] : mlpShapedType(@[ @(inFeatures), @(H) ]),
+        cached[3] : mlpShapedType(@[ @(H) ]),
+        cached[4] : mlpShapedType(@[ @(H), @(C) ]),
+        cached[5] : mlpShapedType(@[ @(C) ]),
+        cached[6] : mlpShapedType(@[ @(B) ]),
+        cached[7] : mlpShapedType(@[ @1 ]),
+    } mutableCopy];
+    if (trackCorrect) feeds[cached[8]] = mlpShapedType(@[ @1 ]);
+    return feeds;
+}
+
+static MPSGraphExecutable *cachedMlpExecutable(NSArray *cached, bool trackCorrect,
+                                               uint32_t B, uint32_t inFeatures, uint32_t H,
+                                               uint32_t C, float lr) {
+    if (@available(macOS 12.0, *)) {
+        if (gMlpExecutables == nil) {
+            gMlpExecutables = [[NSMutableDictionary alloc] init];
+        }
+        NSString *key = mlpCacheKey(B, inFeatures, H, C, lr, trackCorrect);
+        MPSGraphExecutable *exec = gMlpExecutables[key];
+        if (exec != nil) return exec;
+
+        MPSGraph *graph = cached[0];
+        const int wBase = trackCorrect ? 9 : 8;
+        const int targetCount = trackCorrect ? 6 : 5;
+        NSMutableArray *targets =
+            [NSMutableArray arrayWithCapacity:(NSUInteger)targetCount];
+        for (int i = 0; i < targetCount; i++) {
+            [targets addObject:cached[wBase + i]];
+        }
+
+        MPSGraphCompilationDescriptor *comp = nil;
+        if (@available(macOS 12.3, *)) {
+            comp = [MPSGraphCompilationDescriptor new];
+            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+        }
+        exec = [graph compileWithDevice:nil
+                                  feeds:mlpFeedTypes(cached, trackCorrect, B, inFeatures, H, C)
+                          targetTensors:targets
+                       targetOperations:nil
+                  compilationDescriptor:comp];
+        if (exec == nil) return nil;
+        exec.options = MPSGraphOptionsNone;
+        gMlpExecutables[key] = exec;
+        return exec;
+    }
+    return nil;
+}
+
+static NSMutableArray<MPSGraphTensorData *> *mlpMapArray(
+    NSArray<MPSGraphTensor *> *tensors,
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *map) {
+    if (tensors == nil || map == nil) return nil;
+    NSMutableArray<MPSGraphTensorData *> *out =
+        [NSMutableArray arrayWithCapacity:tensors.count];
+    for (MPSGraphTensor *tensor in tensors) {
+        MPSGraphTensorData *data = map[tensor];
+        if (data == nil) return nil;
+        [out addObject:data];
+    }
+    return out;
+}
+
+static bool encodeMlpExecutableOnAsyncArrays(
+    MPSGraphExecutable *exec,
+    NSArray<MPSGraphTensorData *> *inputs,
+    NSArray<MPSGraphTensorData *> *results) {
+    if (exec == nil || inputs == nil || results == nil) return false;
+    if (!ensureAsyncCommandBuffer()) return false;
+    MPSCommandBuffer *mps =
+        [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
+    if (mps == nil) return false;
+    if (@available(macOS 12.0, *)) {
+        [exec encodeToCommandBuffer:mps
+                         inputsArray:inputs
+                        resultsArray:results
+                 executionDescriptor:nil];
+    } else {
+        return false;
+    }
+    gAsyncCommands = mps.rootCommandBuffer;
+    gAsyncEncoder = nil;
+    return gAsyncCommands != nil;
+}
+
+static bool encodeMlpExecutableOnAsync(
+    MPSGraphExecutable *exec,
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feedMap,
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *resultMap) {
+    if (exec == nil || exec.feedTensors == nil || exec.targetTensors == nil) return false;
+    NSMutableArray<MPSGraphTensorData *> *inputs = mlpMapArray(exec.feedTensors, feedMap);
+    NSMutableArray<MPSGraphTensorData *> *results = mlpMapArray(exec.targetTensors, resultMap);
+    if (inputs == nil || results == nil) return false;
+    return encodeMlpExecutableOnAsyncArrays(exec, inputs, results);
+}
+
+static bool encodeEpochBatch(
+    MPSGraphExecutable *exec,
+    MPSGraph *graph,
+    NSMutableDictionary *feeds,
+    NSMutableDictionary *results,
+    MPSGraphTensor *xTensor,
+    MPSGraphTensor *yTensor,
+    MPSGraphTensorData *dx,
+    MPSGraphTensorData *dy,
+    NSMutableArray<MPSGraphTensorData *> *__strong *inputsCache,
+    NSArray<MPSGraphTensorData *> *__strong *resultsCache) {
+    feeds[xTensor] = dx;
+    feeds[yTensor] = dy;
+    if (exec != nil && exec.feedTensors != nil && exec.targetTensors != nil) {
+        if (*inputsCache == nil) {
+            *inputsCache = mlpMapArray(exec.feedTensors, feeds);
+            *resultsCache = mlpMapArray(exec.targetTensors, results);
+            if (*inputsCache == nil || *resultsCache == nil) return false;
+            return encodeMlpExecutableOnAsyncArrays(exec, *inputsCache, *resultsCache);
+        }
+        const NSUInteger xIdx = [exec.feedTensors indexOfObjectIdenticalTo:xTensor];
+        const NSUInteger yIdx = [exec.feedTensors indexOfObjectIdenticalTo:yTensor];
+        if (xIdx == NSNotFound || yIdx == NSNotFound) {
+            return encodeMlpExecutableOnAsync(exec, feeds, results);
+        }
+        NSMutableArray<MPSGraphTensorData *> *inputs = [*inputsCache mutableCopy];
+        [inputs replaceObjectAtIndex:xIdx withObject:dx];
+        [inputs replaceObjectAtIndex:yIdx withObject:dy];
+        *inputsCache = inputs;
+        return encodeMlpExecutableOnAsyncArrays(exec, inputs, *resultsCache);
+    }
+    return encodeGraphOnAsync(graph, feeds, results);
+}
+
+static NSArray *cachedMlpGraph(uint32_t B, uint32_t inFeatures, uint32_t H, uint32_t C,
+                               float lr, bool trackCorrect) {
+    if (gMlpGraphs == nil) gMlpGraphs = [[NSMutableDictionary alloc] init];
+    NSString *key = mlpCacheKey(B, inFeatures, H, C, lr, trackCorrect);
+    NSArray *cached = gMlpGraphs[key];
+    if (cached != nil) return cached;
+
+    MPSGraph *graph = [[MPSGraph alloc] init];
+    graph.options = MPSGraphOptionsNone;
+    MPSGraphTensor *x = [graph placeholderWithShape:@[ @(B), @(inFeatures) ] dataType:MPSDataTypeFloat32 name:@"X"];
+    MPSGraphTensor *w1 = [graph placeholderWithShape:@[ @(inFeatures), @(H) ] dataType:MPSDataTypeFloat32 name:@"W1"];
+    MPSGraphTensor *b1 = [graph placeholderWithShape:@[ @(H) ] dataType:MPSDataTypeFloat32 name:@"b1"];
+    MPSGraphTensor *w2 = [graph placeholderWithShape:@[ @(H), @(C) ] dataType:MPSDataTypeFloat32 name:@"W2"];
+    MPSGraphTensor *b2 = [graph placeholderWithShape:@[ @(C) ] dataType:MPSDataTypeFloat32 name:@"b2"];
+    MPSGraphTensor *labels = [graph placeholderWithShape:@[ @(B) ] dataType:MPSDataTypeFloat32 name:@"y"];
+    MPSGraphTensor *acc = [graph placeholderWithShape:@[ @1 ] dataType:MPSDataTypeFloat32 name:@"acc"];
+    MPSGraphTensor *correctAcc = trackCorrect
+        ? [graph placeholderWithShape:@[ @1 ] dataType:MPSDataTypeFloat32 name:@"corr"]
+        : nil;
+
+    MPSGraphTensor *b1r = [graph reshapeTensor:b1 withShape:@[ @1, @(H) ] name:@"b1r"];
+    MPSGraphTensor *hpre = [graph additionWithPrimaryTensor:ampMatMul(graph, x, w1, @"XW1")
+                                           secondaryTensor:b1r
+                                                      name:@"Hpre"];
+    MPSGraphTensor *hidden = [graph reLUWithTensor:hpre name:@"H"];
+    MPSGraphTensor *b2r = [graph reshapeTensor:b2 withShape:@[ @1, @(C) ] name:@"b2r"];
+    MPSGraphTensor *logits = [graph additionWithPrimaryTensor:ampMatMul(graph, hidden, w2, @"HW2")
+                                            secondaryTensor:b2r
+                                                       name:@"logits"];
+    MPSGraphTensor *idx = [graph castTensor:labels toType:MPSDataTypeInt32 name:@"idx"];
+    MPSGraphTensor *onehot = [graph oneHotWithIndicesTensor:idx
+                                                      depth:C
+                                                   dataType:MPSDataTypeFloat32
+                                                       name:@"oh"];
+    MPSGraphTensor *loss = [graph softMaxCrossEntropyWithSourceTensor:logits
+                                                        labelsTensor:onehot
+                                                                axis:1
+                                                       reductionType:MPSGraphLossReductionTypeSum
+                                                                name:@"loss"];
+    MPSGraphTensor *accOut = [graph additionWithPrimaryTensor:acc secondaryTensor:loss name:@"accOut"];
+    MPSGraphTensor *correctOut = nil;
+    if (trackCorrect) {
+        MPSGraphTensor *pred = [graph reshapeTensor:[graph reductionArgMaximumWithTensor:logits
+                                                                                   axis:1
+                                                                                   name:@"pred"]
+                                          withShape:@[ @(B) ]
+                                               name:@"pred1"];
+        MPSGraphTensor *hits = [graph castTensor:[graph equalWithPrimaryTensor:pred
+                                                               secondaryTensor:idx
+                                                                          name:@"hits"]
+                                          toType:MPSDataTypeFloat32
+                                            name:@"hitsF"];
+        MPSGraphTensor *nCorrect = [graph reshapeTensor:[graph reductionSumWithTensor:hits
+                                                                                axes:@[ @0 ]
+                                                                                name:@"nC"]
+                                              withShape:@[ @1 ]
+                                                   name:@"nC1"];
+        correctOut = [graph additionWithPrimaryTensor:correctAcc
+                                     secondaryTensor:nCorrect
+                                                name:@"cOut"];
+    }
+    MPSGraphTensor *ones = [graph constantWithScalar:1.0 shape:@[ @1 ] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *dlogits = [graph softMaxCrossEntropyGradientWithIncomingGradientTensor:ones
+                                                                              sourceTensor:logits
+                                                                              labelsTensor:onehot
+                                                                                      axis:1
+                                                                             reductionType:MPSGraphLossReductionTypeSum
+                                                                                      name:@"dlogits"];
+    MPSGraphTensor *invB = [graph constantWithScalar:1.0 / (double)B dataType:MPSDataTypeFloat32];
+    dlogits = [graph multiplicationWithPrimaryTensor:dlogits secondaryTensor:invB name:@"dlogitsMean"];
+
+    MPSGraphTensor *w2t = [graph transposeTensor:w2 permutation:@[ @1, @0 ] name:@"W2T"];
+    MPSGraphTensor *dH = ampMatMul(graph, dlogits, w2t, @"dH");
+    MPSGraphTensor *dHpre = [graph reLUGradientWithIncomingGradient:dH sourceTensor:hpre name:@"dHpre"];
+    MPSGraphTensor *ht = [graph transposeTensor:hidden permutation:@[ @1, @0 ] name:@"HT"];
+    MPSGraphTensor *dW2 = ampMatMul(graph, ht, dlogits, @"dW2");
+    MPSGraphTensor *db2 = [graph reshapeTensor:[graph reductionSumWithTensor:dlogits axis:0 name:@"db2s"]
+                                     withShape:@[ @(C) ]
+                                          name:@"db2"];
+    MPSGraphTensor *xt = [graph transposeTensor:x permutation:@[ @1, @0 ] name:@"XT"];
+    MPSGraphTensor *dW1 = ampMatMul(graph, xt, dHpre, @"dW1");
+    MPSGraphTensor *db1 = [graph reshapeTensor:[graph reductionSumWithTensor:dHpre axis:0 name:@"db1s"]
+                                     withShape:@[ @(H) ]
+                                          name:@"db1"];
+    MPSGraphTensor *lrT = [graph constantWithScalar:(double)lr dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *w1Out = [graph subtractionWithPrimaryTensor:w1
+                                               secondaryTensor:[graph multiplicationWithPrimaryTensor:dW1 secondaryTensor:lrT name:@"lrW1"]
+                                                          name:@"W1n"];
+    MPSGraphTensor *b1Out = [graph subtractionWithPrimaryTensor:b1
+                                               secondaryTensor:[graph multiplicationWithPrimaryTensor:db1 secondaryTensor:lrT name:@"lrB1"]
+                                                          name:@"b1n"];
+    MPSGraphTensor *w2Out = [graph subtractionWithPrimaryTensor:w2
+                                               secondaryTensor:[graph multiplicationWithPrimaryTensor:dW2 secondaryTensor:lrT name:@"lrW2"]
+                                                          name:@"W2n"];
+    MPSGraphTensor *b2Out = [graph subtractionWithPrimaryTensor:b2
+                                               secondaryTensor:[graph multiplicationWithPrimaryTensor:db2 secondaryTensor:lrT name:@"lrB2"]
+                                                          name:@"b2n"];
+
+    cached = trackCorrect
+        ? @[
+            graph, x, w1, b1, w2, b2, labels, acc, correctAcc,
+            w1Out, b1Out, w2Out, b2Out, accOut, correctOut
+        ]
+        : @[
+            graph, x, w1, b1, w2, b2, labels, acc,
+            w1Out, b1Out, w2Out, b2Out, accOut
+        ];
+    gMlpGraphs[key] = cached;
+    (void)cachedMlpExecutable(cached, trackCorrect, B, inFeatures, H, C, lr);
+    return cached;
+}
+
+static NSMutableDictionary<NSString *, NSArray *> *gMlpBwdGraphs;
+static NSMutableDictionary<NSString *, MPSGraphExecutable *> *gMlpBwdExecutables;
+
+static NSString *mlpBwdCacheKey(uint32_t B, uint32_t inFeatures, uint32_t H, uint32_t C,
+                                bool trackCorrect) {
+    return [NSString stringWithFormat:@"bwd:%u:%u:%u:%u:%d:%d",
+            B, inFeatures, H, C, trackCorrect ? 1 : 0, gMixedPrecision ? 1 : 0];
+}
+
+static MPSGraphExecutable *cachedMlpBwdExecutable(NSArray *cached, bool trackCorrect,
+                                                  uint32_t B, uint32_t inFeatures, uint32_t H,
+                                                  uint32_t C) {
+    if (@available(macOS 12.0, *)) {
+        if (gMlpBwdExecutables == nil) {
+            gMlpBwdExecutables = [[NSMutableDictionary alloc] init];
+        }
+        NSString *key = mlpBwdCacheKey(B, inFeatures, H, C, trackCorrect);
+        MPSGraphExecutable *exec = gMlpBwdExecutables[key];
+        if (exec != nil) return exec;
+
+        MPSGraph *graph = cached[0];
+        const int wBase = trackCorrect ? 9 : 8;
+        const int targetCount = trackCorrect ? 6 : 5;
+        NSMutableArray *targets =
+            [NSMutableArray arrayWithCapacity:(NSUInteger)targetCount];
+        for (int i = 0; i < targetCount; i++) {
+            [targets addObject:cached[wBase + i]];
+        }
+
+        MPSGraphCompilationDescriptor *comp = nil;
+        if (@available(macOS 12.3, *)) {
+            comp = [MPSGraphCompilationDescriptor new];
+            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+        }
+        exec = [graph compileWithDevice:nil
+                                  feeds:mlpFeedTypes(cached, trackCorrect, B, inFeatures, H, C)
+                          targetTensors:targets
+                       targetOperations:nil
+                  compilationDescriptor:comp];
+        if (exec == nil) return nil;
+        exec.options = MPSGraphOptionsNone;
+        gMlpBwdExecutables[key] = exec;
+        return exec;
+    }
+    return nil;
+}
+
+static NSArray *cachedMlpBwdGraph(uint32_t B, uint32_t inFeatures, uint32_t H, uint32_t C,
+                                  bool trackCorrect) {
+    if (gMlpBwdGraphs == nil) gMlpBwdGraphs = [[NSMutableDictionary alloc] init];
+    NSString *key = mlpBwdCacheKey(B, inFeatures, H, C, trackCorrect);
+    NSArray *cached = gMlpBwdGraphs[key];
+    if (cached != nil) return cached;
+
+    MPSGraph *graph = [[MPSGraph alloc] init];
+    graph.options = MPSGraphOptionsNone;
+    MPSGraphTensor *x = [graph placeholderWithShape:@[ @(B), @(inFeatures) ] dataType:MPSDataTypeFloat32 name:@"X"];
+    MPSGraphTensor *w1 = [graph placeholderWithShape:@[ @(inFeatures), @(H) ] dataType:MPSDataTypeFloat32 name:@"W1"];
+    MPSGraphTensor *b1 = [graph placeholderWithShape:@[ @(H) ] dataType:MPSDataTypeFloat32 name:@"b1"];
+    MPSGraphTensor *w2 = [graph placeholderWithShape:@[ @(H), @(C) ] dataType:MPSDataTypeFloat32 name:@"W2"];
+    MPSGraphTensor *b2 = [graph placeholderWithShape:@[ @(C) ] dataType:MPSDataTypeFloat32 name:@"b2"];
+    MPSGraphTensor *labels = [graph placeholderWithShape:@[ @(B) ] dataType:MPSDataTypeFloat32 name:@"y"];
+    MPSGraphTensor *acc = [graph placeholderWithShape:@[ @1 ] dataType:MPSDataTypeFloat32 name:@"acc"];
+    MPSGraphTensor *correctAcc = trackCorrect
+        ? [graph placeholderWithShape:@[ @1 ] dataType:MPSDataTypeFloat32 name:@"corr"]
+        : nil;
+
+    MPSGraphTensor *b1r = [graph reshapeTensor:b1 withShape:@[ @1, @(H) ] name:@"b1r"];
+    MPSGraphTensor *hpre = [graph additionWithPrimaryTensor:ampMatMul(graph, x, w1, @"XW1")
+                                           secondaryTensor:b1r
+                                                      name:@"Hpre"];
+    MPSGraphTensor *hidden = [graph reLUWithTensor:hpre name:@"H"];
+    MPSGraphTensor *b2r = [graph reshapeTensor:b2 withShape:@[ @1, @(C) ] name:@"b2r"];
+    MPSGraphTensor *logits = [graph additionWithPrimaryTensor:ampMatMul(graph, hidden, w2, @"HW2")
+                                            secondaryTensor:b2r
+                                                       name:@"logits"];
+    MPSGraphTensor *idx = [graph castTensor:labels toType:MPSDataTypeInt32 name:@"idx"];
+    MPSGraphTensor *onehot = [graph oneHotWithIndicesTensor:idx
+                                                      depth:C
+                                                   dataType:MPSDataTypeFloat32
+                                                       name:@"oh"];
+    MPSGraphTensor *loss = [graph softMaxCrossEntropyWithSourceTensor:logits
+                                                        labelsTensor:onehot
+                                                                axis:1
+                                                       reductionType:MPSGraphLossReductionTypeSum
+                                                                name:@"loss"];
+    MPSGraphTensor *accOut = [graph additionWithPrimaryTensor:acc secondaryTensor:loss name:@"accOut"];
+    MPSGraphTensor *correctOut = nil;
+    if (trackCorrect) {
+        MPSGraphTensor *pred = [graph reshapeTensor:[graph reductionArgMaximumWithTensor:logits
+                                                                                   axis:1
+                                                                                   name:@"pred"]
+                                          withShape:@[ @(B) ]
+                                               name:@"pred1"];
+        MPSGraphTensor *hits = [graph castTensor:[graph equalWithPrimaryTensor:pred
+                                                               secondaryTensor:idx
+                                                                          name:@"hits"]
+                                          toType:MPSDataTypeFloat32
+                                            name:@"hitsF"];
+        MPSGraphTensor *nCorrect = [graph reshapeTensor:[graph reductionSumWithTensor:hits
+                                                                                axes:@[ @0 ]
+                                                                                name:@"nC"]
+                                              withShape:@[ @1 ]
+                                                   name:@"nC1"];
+        correctOut = [graph additionWithPrimaryTensor:correctAcc
+                                     secondaryTensor:nCorrect
+                                                name:@"cOut"];
+    }
+    MPSGraphTensor *ones = [graph constantWithScalar:1.0 shape:@[ @1 ] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *dlogits = [graph softMaxCrossEntropyGradientWithIncomingGradientTensor:ones
+                                                                              sourceTensor:logits
+                                                                              labelsTensor:onehot
+                                                                                      axis:1
+                                                                             reductionType:MPSGraphLossReductionTypeSum
+                                                                                      name:@"dlogits"];
+    MPSGraphTensor *invB = [graph constantWithScalar:1.0 / (double)B dataType:MPSDataTypeFloat32];
+    dlogits = [graph multiplicationWithPrimaryTensor:dlogits secondaryTensor:invB name:@"dlogitsMean"];
+
+    MPSGraphTensor *w2t = [graph transposeTensor:w2 permutation:@[ @1, @0 ] name:@"W2T"];
+    MPSGraphTensor *dH = ampMatMul(graph, dlogits, w2t, @"dH");
+    MPSGraphTensor *dHpre = [graph reLUGradientWithIncomingGradient:dH sourceTensor:hpre name:@"dHpre"];
+    MPSGraphTensor *ht = [graph transposeTensor:hidden permutation:@[ @1, @0 ] name:@"HT"];
+    MPSGraphTensor *dW2 = ampMatMul(graph, ht, dlogits, @"dW2");
+    MPSGraphTensor *db2 = [graph reshapeTensor:[graph reductionSumWithTensor:dlogits axis:0 name:@"db2s"]
+                                     withShape:@[ @(C) ]
+                                          name:@"db2"];
+    MPSGraphTensor *xt = [graph transposeTensor:x permutation:@[ @1, @0 ] name:@"XT"];
+    MPSGraphTensor *dW1 = ampMatMul(graph, xt, dHpre, @"dW1");
+    MPSGraphTensor *db1 = [graph reshapeTensor:[graph reductionSumWithTensor:dHpre axis:0 name:@"db1s"]
+                                     withShape:@[ @(H) ]
+                                          name:@"db1"];
+
+    cached = trackCorrect
+        ? @[
+            graph, x, w1, b1, w2, b2, labels, acc, correctAcc,
+            dW1, db1, dW2, db2, accOut, correctOut
+        ]
+        : @[
+            graph, x, w1, b1, w2, b2, labels, acc,
+            dW1, db1, dW2, db2, accOut
+        ];
+    gMlpBwdGraphs[key] = cached;
+    (void)cachedMlpBwdExecutable(cached, trackCorrect, B, inFeatures, H, C);
+    return cached;
+}
+
+bool jaiGpuMlpBwdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                      JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                      JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,
+                      JaiGpuBuffer *gW1, size_t gW1Off, JaiGpuBuffer *gB1, size_t gB1Off,
+                      JaiGpuBuffer *gW2, size_t gW2Off, JaiGpuBuffer *gB2, size_t gB2Off,
+                      JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                      size_t correctOff, uint32_t B, uint32_t inFeatures, uint32_t H,
+                      uint32_t C) {
+    if (x == NULL || w1 == NULL || b1 == NULL || w2 == NULL || b2 == NULL ||
+        labels == NULL || gW1 == NULL || gB1 == NULL || gW2 == NULL || gB2 == NULL ||
+        lossAcc == NULL) {
+        return false;
+    }
+    const bool trackCorrect = correctAcc != NULL;
+    if (B == 0 || inFeatures == 0 || H == 0 || C == 0) return false;
+    if (!ensureDevice()) return false;
+
+    const size_t accBytes = sizeof(float);
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            NSArray *cached = cachedMlpBwdGraph(B, inFeatures, H, C, trackCorrect);
+            const NSUInteger expected = trackCorrect ? 15u : 13u;
+            if (cached == nil || cached.count != expected) return false;
+            MPSGraph *graph = cached[0];
+            gMlpScratchAcc = growScratch(gMlpScratchAcc, &gMlpCapAcc, accBytes);
+            if (trackCorrect) {
+                gMlpScratchCorrect = growScratch(gMlpScratchCorrect, &gMlpCapCorrect, accBytes);
+            }
+            NSArray *w1Shape = @[ @(inFeatures), @(H) ];
+            NSArray *b1Shape = @[ @(H) ];
+            NSArray *w2Shape = @[ @(H), @(C) ];
+            NSArray *b2Shape = @[ @(C) ];
+            MPSGraphTensorData *dx = graphData(x, xOff, @[ @(B), @(inFeatures) ]);
+            MPSGraphTensorData *dw1 = graphData(w1, w1Off, w1Shape);
+            MPSGraphTensorData *db1 = graphData(b1, b1Off, b1Shape);
+            MPSGraphTensorData *dw2 = graphData(w2, w2Off, w2Shape);
+            MPSGraphTensorData *db2 = graphData(b2, b2Off, b2Shape);
+            MPSGraphTensorData *dy = graphData(labels, labOff, @[ @(B) ]);
+            const bool accFromLive = !trackCorrect && gMlpAccSide == 0;
+            MPSGraphTensorData *dacc = trackCorrect
+                ? graphData(lossAcc, lossOff, @[ @1 ])
+                : (accFromLive ? graphData(lossAcc, lossOff, @[ @1 ])
+                               : graphDataMTL(gMlpScratchAcc, @[ @1 ]));
+            MPSGraphTensorData *dcorr = trackCorrect
+                ? graphData(correctAcc, correctOff, @[ @1 ])
+                : nil;
+            const int wBase = trackCorrect ? 9 : 8;
+            MPSGraphTensorData *rgW1 = graphData(gW1, gW1Off, w1Shape);
+            MPSGraphTensorData *rgB1 = graphData(gB1, gB1Off, b1Shape);
+            MPSGraphTensorData *rgW2 = graphData(gW2, gW2Off, w2Shape);
+            MPSGraphTensorData *rgB2 = graphData(gB2, gB2Off, b2Shape);
+            MPSGraphTensorData *racc = trackCorrect
+                ? graphDataMTL(gMlpScratchAcc, @[ @1 ])
+                : (accFromLive ? graphDataMTL(gMlpScratchAcc, @[ @1 ])
+                               : graphData(lossAcc, lossOff, @[ @1 ]));
+            MPSGraphTensorData *rcorr = trackCorrect
+                ? graphDataMTL(gMlpScratchCorrect, @[ @1 ])
+                : nil;
+            if (dx == nil || dw1 == nil || db1 == nil || dw2 == nil || db2 == nil ||
+                dy == nil || dacc == nil || rgW1 == nil || rgB1 == nil ||
+                rgW2 == nil || rgB2 == nil || racc == nil) {
+                return false;
+            }
+            if (trackCorrect && (dcorr == nil || rcorr == nil)) return false;
+            NSMutableDictionary *feeds = [@{
+                cached[1] : dx,  cached[2] : dw1, cached[3] : db1,
+                cached[4] : dw2, cached[5] : db2, cached[6] : dy,
+                cached[7] : dacc
+            } mutableCopy];
+            if (trackCorrect) feeds[cached[8]] = dcorr;
+            NSMutableDictionary *results = [@{
+                cached[wBase + 0] : rgW1, cached[wBase + 1] : rgB1,
+                cached[wBase + 2] : rgW2, cached[wBase + 3] : rgB2,
+                cached[wBase + 4] : racc
+            } mutableCopy];
+            if (trackCorrect) results[cached[wBase + 5]] = rcorr;
+            MPSGraphExecutable *exec =
+                cachedMlpBwdExecutable(cached, trackCorrect, B, inFeatures, H, C);
+            if (exec == nil ||
+                !encodeMlpExecutableOnAsync(exec, feeds, results)) {
+                if (!encodeGraphOnAsync(graph, feeds, results)) return false;
+            }
+            if (trackCorrect) {
+                __unsafe_unretained id<MTLBuffer> accSrcs[] = {
+                    gMlpScratchAcc, gMlpScratchCorrect
+                };
+                JaiGpuBuffer *accDsts[] = {lossAcc, correctAcc};
+                size_t accOffs[] = {lossOff, correctOff};
+                size_t accSizes[] = {accBytes, accBytes};
+                if (!blitMany(accSrcs, accDsts, accOffs, accSizes, 2)) return false;
+            }
+            gMlpLiveAcc = lossAcc;
+            gMlpLiveAccOff = lossOff;
+            if (!trackCorrect) {
+                gMlpAccSide = accFromLive ? 1 : 0;
+            }
+        }
+        return true;
+    }
+}
+
+static NSMutableDictionary<NSString *, NSArray *> *gMlp3Graphs;
+static NSMutableDictionary<NSString *, MPSGraphExecutable *> *gMlp3Executables;
+static NSMutableDictionary<NSString *, NSArray *> *gMlp3BwdGraphs;
+static NSMutableDictionary<NSString *, MPSGraphExecutable *> *gMlp3BwdExecutables;
+
+static NSString *mlp3CacheKey(uint32_t B, uint32_t inFeatures, uint32_t H1, uint32_t H2,
+                              uint32_t H3, uint32_t C, float lr, bool trackCorrect) {
+    return [NSString stringWithFormat:@"3:%u:%u:%u:%u:%u:%u:%.8f:%d:%d",
+            B, inFeatures, H1, H2, H3, C, lr, trackCorrect ? 1 : 0, gMixedPrecision ? 1 : 0];
+}
+
+static NSString *mlp3BwdCacheKey(uint32_t B, uint32_t inFeatures, uint32_t H1, uint32_t H2,
+                                   uint32_t H3, uint32_t C, bool trackCorrect) {
+    return [NSString stringWithFormat:@"3bwd:%u:%u:%u:%u:%u:%u:%d:%d",
+            B, inFeatures, H1, H2, H3, C, trackCorrect ? 1 : 0, gMixedPrecision ? 1 : 0];
+}
+
+static MPSGraphTensorShapedTypeDictionary *mlp3FeedTypes(NSArray *cached, bool trackCorrect,
+                                                           uint32_t B, uint32_t inFeatures,
+                                                           uint32_t H1, uint32_t H2, uint32_t H3,
+                                                           uint32_t C) {
+    NSMutableDictionary *feeds = [@{
+        cached[1] : mlpShapedType(@[ @(B), @(inFeatures) ]),
+        cached[2] : mlpShapedType(@[ @(inFeatures), @(H1) ]),
+        cached[3] : mlpShapedType(@[ @(H1) ]),
+        cached[4] : mlpShapedType(@[ @(H1), @(H2) ]),
+        cached[5] : mlpShapedType(@[ @(H2) ]),
+        cached[6] : mlpShapedType(@[ @(H2), @(H3) ]),
+        cached[7] : mlpShapedType(@[ @(H3) ]),
+        cached[8] : mlpShapedType(@[ @(H3), @(C) ]),
+        cached[9] : mlpShapedType(@[ @(C) ]),
+        cached[10] : mlpShapedType(@[ @(B) ]),
+        cached[11] : mlpShapedType(@[ @1 ]),
+    } mutableCopy];
+    if (trackCorrect) feeds[cached[12]] = mlpShapedType(@[ @1 ]);
+    return feeds;
+}
+
+static MPSGraphExecutable *cachedMlp3Executable(NSArray *cached, bool trackCorrect,
+                                                uint32_t B, uint32_t inFeatures, uint32_t H1,
+                                                uint32_t H2, uint32_t H3, uint32_t C, float lr) {
+    if (@available(macOS 12.0, *)) {
+        if (gMlp3Executables == nil) {
+            gMlp3Executables = [[NSMutableDictionary alloc] init];
+        }
+        NSString *key = mlp3CacheKey(B, inFeatures, H1, H2, H3, C, lr, trackCorrect);
+        MPSGraphExecutable *exec = gMlp3Executables[key];
+        if (exec != nil) return exec;
+
+        MPSGraph *graph = cached[0];
+        const int wBase = trackCorrect ? 13 : 12;
+        const int targetCount = trackCorrect ? 10 : 9;
+        NSMutableArray *targets =
+            [NSMutableArray arrayWithCapacity:(NSUInteger)targetCount];
+        for (int i = 0; i < targetCount; i++) {
+            [targets addObject:cached[wBase + i]];
+        }
+
+        MPSGraphCompilationDescriptor *comp = nil;
+        if (@available(macOS 12.3, *)) {
+            comp = [MPSGraphCompilationDescriptor new];
+            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+        }
+        exec = [graph compileWithDevice:nil
+                                  feeds:mlp3FeedTypes(cached, trackCorrect, B, inFeatures,
+                                                      H1, H2, H3, C)
+                          targetTensors:targets
+                       targetOperations:nil
+                  compilationDescriptor:comp];
+        if (exec == nil) return nil;
+        exec.options = MPSGraphOptionsNone;
+        gMlp3Executables[key] = exec;
+        return exec;
+    }
+    return nil;
+}
+
+static MPSGraphExecutable *cachedMlp3BwdExecutable(NSArray *cached, bool trackCorrect,
+                                                   uint32_t B, uint32_t inFeatures, uint32_t H1,
+                                                   uint32_t H2, uint32_t H3, uint32_t C) {
+    if (@available(macOS 12.0, *)) {
+        if (gMlp3BwdExecutables == nil) {
+            gMlp3BwdExecutables = [[NSMutableDictionary alloc] init];
+        }
+        NSString *key = mlp3BwdCacheKey(B, inFeatures, H1, H2, H3, C, trackCorrect);
+        MPSGraphExecutable *exec = gMlp3BwdExecutables[key];
+        if (exec != nil) return exec;
+
+        MPSGraph *graph = cached[0];
+        const int wBase = trackCorrect ? 13 : 12;
+        const int targetCount = trackCorrect ? 10 : 9;
+        NSMutableArray *targets =
+            [NSMutableArray arrayWithCapacity:(NSUInteger)targetCount];
+        for (int i = 0; i < targetCount; i++) {
+            [targets addObject:cached[wBase + i]];
+        }
+
+        MPSGraphCompilationDescriptor *comp = nil;
+        if (@available(macOS 12.3, *)) {
+            comp = [MPSGraphCompilationDescriptor new];
+            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+        }
+        exec = [graph compileWithDevice:nil
+                                  feeds:mlp3FeedTypes(cached, trackCorrect, B, inFeatures,
+                                                      H1, H2, H3, C)
+                          targetTensors:targets
+                       targetOperations:nil
+                  compilationDescriptor:comp];
+        if (exec == nil) return nil;
+        exec.options = MPSGraphOptionsNone;
+        gMlp3BwdExecutables[key] = exec;
+        return exec;
+    }
+    return nil;
+}
+
+static NSArray *buildMlp3GraphArrays(MPSGraph *graph, MPSGraphTensor *accOut,
+                                     MPSGraphTensor *correctOut, MPSGraphTensor *dW1,
+                                     MPSGraphTensor *db1, MPSGraphTensor *dW2,
+                                     MPSGraphTensor *db2, MPSGraphTensor *dW3,
+                                     MPSGraphTensor *db3, MPSGraphTensor *dW4,
+                                     MPSGraphTensor *db4, MPSGraphTensor *w1Out,
+                                     MPSGraphTensor *b1Out, MPSGraphTensor *w2Out,
+                                     MPSGraphTensor *b2Out, MPSGraphTensor *w3Out,
+                                     MPSGraphTensor *b3Out, MPSGraphTensor *w4Out,
+                                     MPSGraphTensor *b4Out, MPSGraphTensor *x,
+                                     MPSGraphTensor *w1, MPSGraphTensor *b1,
+                                     MPSGraphTensor *w2, MPSGraphTensor *b2,
+                                     MPSGraphTensor *w3, MPSGraphTensor *b3,
+                                     MPSGraphTensor *w4, MPSGraphTensor *b4,
+                                     MPSGraphTensor *labels, MPSGraphTensor *acc,
+                                     MPSGraphTensor *correctAcc, bool trackCorrect,
+                                     bool sgdUpdate) {
+    if (trackCorrect) {
+        if (sgdUpdate) {
+            return @[
+                graph, x, w1, b1, w2, b2, w3, b3, w4, b4, labels, acc, correctAcc,
+                w1Out, b1Out, w2Out, b2Out, w3Out, b3Out, w4Out, b4Out, accOut, correctOut
+            ];
+        }
+        return @[
+            graph, x, w1, b1, w2, b2, w3, b3, w4, b4, labels, acc, correctAcc,
+            dW1, db1, dW2, db2, dW3, db3, dW4, db4, accOut, correctOut
+        ];
+    }
+    if (sgdUpdate) {
+        return @[
+            graph, x, w1, b1, w2, b2, w3, b3, w4, b4, labels, acc,
+            w1Out, b1Out, w2Out, b2Out, w3Out, b3Out, w4Out, b4Out, accOut
+        ];
+    }
+    return @[
+        graph, x, w1, b1, w2, b2, w3, b3, w4, b4, labels, acc,
+        dW1, db1, dW2, db2, dW3, db3, dW4, db4, accOut
+    ];
+}
+
+static NSArray *cachedMlp3GraphCore(uint32_t B, uint32_t inFeatures, uint32_t H1, uint32_t H2,
+                                    uint32_t H3, uint32_t C, float lr, bool trackCorrect,
+                                    bool sgdUpdate, NSMutableDictionary *store, NSString *key) {
+    NSArray *cached = store[key];
+    if (cached != nil) return cached;
+
+    MPSGraph *graph = [[MPSGraph alloc] init];
+    graph.options = MPSGraphOptionsNone;
+    MPSGraphTensor *x = [graph placeholderWithShape:@[ @(B), @(inFeatures) ] dataType:MPSDataTypeFloat32 name:@"X"];
+    MPSGraphTensor *w1 = [graph placeholderWithShape:@[ @(inFeatures), @(H1) ] dataType:MPSDataTypeFloat32 name:@"W1"];
+    MPSGraphTensor *b1 = [graph placeholderWithShape:@[ @(H1) ] dataType:MPSDataTypeFloat32 name:@"b1"];
+    MPSGraphTensor *w2 = [graph placeholderWithShape:@[ @(H1), @(H2) ] dataType:MPSDataTypeFloat32 name:@"W2"];
+    MPSGraphTensor *b2 = [graph placeholderWithShape:@[ @(H2) ] dataType:MPSDataTypeFloat32 name:@"b2"];
+    MPSGraphTensor *w3 = [graph placeholderWithShape:@[ @(H2), @(H3) ] dataType:MPSDataTypeFloat32 name:@"W3"];
+    MPSGraphTensor *b3 = [graph placeholderWithShape:@[ @(H3) ] dataType:MPSDataTypeFloat32 name:@"b3"];
+    MPSGraphTensor *w4 = [graph placeholderWithShape:@[ @(H3), @(C) ] dataType:MPSDataTypeFloat32 name:@"W4"];
+    MPSGraphTensor *b4 = [graph placeholderWithShape:@[ @(C) ] dataType:MPSDataTypeFloat32 name:@"b4"];
+    MPSGraphTensor *labels = [graph placeholderWithShape:@[ @(B) ] dataType:MPSDataTypeFloat32 name:@"y"];
+    MPSGraphTensor *acc = [graph placeholderWithShape:@[ @1 ] dataType:MPSDataTypeFloat32 name:@"acc"];
+    MPSGraphTensor *correctAcc = trackCorrect
+        ? [graph placeholderWithShape:@[ @1 ] dataType:MPSDataTypeFloat32 name:@"corr"]
+        : nil;
+
+    MPSGraphTensor *b1r = [graph reshapeTensor:b1 withShape:@[ @1, @(H1) ] name:@"b1r"];
+    MPSGraphTensor *h1pre = [graph additionWithPrimaryTensor:ampMatMul(graph, x, w1, @"XW1")
+                                           secondaryTensor:b1r
+                                                      name:@"H1pre"];
+    MPSGraphTensor *h1 = [graph reLUWithTensor:h1pre name:@"H1"];
+    MPSGraphTensor *b2r = [graph reshapeTensor:b2 withShape:@[ @1, @(H2) ] name:@"b2r"];
+    MPSGraphTensor *h2pre = [graph additionWithPrimaryTensor:ampMatMul(graph, h1, w2, @"H1W2")
+                                           secondaryTensor:b2r
+                                                      name:@"H2pre"];
+    MPSGraphTensor *h2 = [graph reLUWithTensor:h2pre name:@"H2"];
+    MPSGraphTensor *b3r = [graph reshapeTensor:b3 withShape:@[ @1, @(H3) ] name:@"b3r"];
+    MPSGraphTensor *h3pre = [graph additionWithPrimaryTensor:ampMatMul(graph, h2, w3, @"H2W3")
+                                           secondaryTensor:b3r
+                                                      name:@"H3pre"];
+    MPSGraphTensor *h3 = [graph reLUWithTensor:h3pre name:@"H3"];
+    MPSGraphTensor *b4r = [graph reshapeTensor:b4 withShape:@[ @1, @(C) ] name:@"b4r"];
+    MPSGraphTensor *logits = [graph additionWithPrimaryTensor:ampMatMul(graph, h3, w4, @"H3W4")
+                                            secondaryTensor:b4r
+                                                       name:@"logits"];
+    MPSGraphTensor *idx = [graph castTensor:labels toType:MPSDataTypeInt32 name:@"idx"];
+    MPSGraphTensor *onehot = [graph oneHotWithIndicesTensor:idx
+                                                      depth:C
+                                                   dataType:MPSDataTypeFloat32
+                                                       name:@"oh"];
+    MPSGraphTensor *loss = [graph softMaxCrossEntropyWithSourceTensor:logits
+                                                        labelsTensor:onehot
+                                                                axis:1
+                                                       reductionType:MPSGraphLossReductionTypeSum
+                                                                name:@"loss"];
+    MPSGraphTensor *accOut = [graph additionWithPrimaryTensor:acc secondaryTensor:loss name:@"accOut"];
+    MPSGraphTensor *correctOut = nil;
+    if (trackCorrect) {
+        MPSGraphTensor *pred = [graph reshapeTensor:[graph reductionArgMaximumWithTensor:logits
+                                                                                   axis:1
+                                                                                   name:@"pred"]
+                                          withShape:@[ @(B) ]
+                                               name:@"pred1"];
+        MPSGraphTensor *hits = [graph castTensor:[graph equalWithPrimaryTensor:pred
+                                                               secondaryTensor:idx
+                                                                          name:@"hits"]
+                                          toType:MPSDataTypeFloat32
+                                            name:@"hitsF"];
+        MPSGraphTensor *nCorrect = [graph reshapeTensor:[graph reductionSumWithTensor:hits
+                                                                                axes:@[ @0 ]
+                                                                                name:@"nC"]
+                                              withShape:@[ @1 ]
+                                                   name:@"nC1"];
+        correctOut = [graph additionWithPrimaryTensor:correctAcc
+                                     secondaryTensor:nCorrect
+                                                name:@"cOut"];
+    }
+    MPSGraphTensor *ones = [graph constantWithScalar:1.0 shape:@[ @1 ] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *dlogits = [graph softMaxCrossEntropyGradientWithIncomingGradientTensor:ones
+                                                                              sourceTensor:logits
+                                                                              labelsTensor:onehot
+                                                                                      axis:1
+                                                                             reductionType:MPSGraphLossReductionTypeSum
+                                                                                      name:@"dlogits"];
+    MPSGraphTensor *invB = [graph constantWithScalar:1.0 / (double)B dataType:MPSDataTypeFloat32];
+    dlogits = [graph multiplicationWithPrimaryTensor:dlogits secondaryTensor:invB name:@"dlogitsMean"];
+
+    MPSGraphTensor *w4t = [graph transposeTensor:w4 permutation:@[ @1, @0 ] name:@"W4T"];
+    MPSGraphTensor *dH3 = ampMatMul(graph, dlogits, w4t, @"dH3");
+    MPSGraphTensor *dH3pre = [graph reLUGradientWithIncomingGradient:dH3 sourceTensor:h3pre name:@"dH3pre"];
+    MPSGraphTensor *h3t = [graph transposeTensor:h3 permutation:@[ @1, @0 ] name:@"H3T"];
+    MPSGraphTensor *dW4 = ampMatMul(graph, h3t, dlogits, @"dW4");
+    MPSGraphTensor *db4 = [graph reshapeTensor:[graph reductionSumWithTensor:dlogits axis:0 name:@"db4s"]
+                                     withShape:@[ @(C) ]
+                                          name:@"db4"];
+    MPSGraphTensor *w3t = [graph transposeTensor:w3 permutation:@[ @1, @0 ] name:@"W3T"];
+    MPSGraphTensor *dH2 = ampMatMul(graph, dH3pre, w3t, @"dH2");
+    MPSGraphTensor *dH2pre = [graph reLUGradientWithIncomingGradient:dH2 sourceTensor:h2pre name:@"dH2pre"];
+    MPSGraphTensor *h2t = [graph transposeTensor:h2 permutation:@[ @1, @0 ] name:@"H2T"];
+    MPSGraphTensor *dW3 = ampMatMul(graph, h2t, dH3pre, @"dW3");
+    MPSGraphTensor *db3 = [graph reshapeTensor:[graph reductionSumWithTensor:dH3pre axis:0 name:@"db3s"]
+                                     withShape:@[ @(H3) ]
+                                          name:@"db3"];
+    MPSGraphTensor *w2t = [graph transposeTensor:w2 permutation:@[ @1, @0 ] name:@"W2T"];
+    MPSGraphTensor *dH1 = ampMatMul(graph, dH2pre, w2t, @"dH1");
+    MPSGraphTensor *dH1pre = [graph reLUGradientWithIncomingGradient:dH1 sourceTensor:h1pre name:@"dH1pre"];
+    MPSGraphTensor *h1t = [graph transposeTensor:h1 permutation:@[ @1, @0 ] name:@"H1T"];
+    MPSGraphTensor *dW2 = ampMatMul(graph, h1t, dH2pre, @"dW2");
+    MPSGraphTensor *db2 = [graph reshapeTensor:[graph reductionSumWithTensor:dH2pre axis:0 name:@"db2s"]
+                                     withShape:@[ @(H2) ]
+                                          name:@"db2"];
+    MPSGraphTensor *xt = [graph transposeTensor:x permutation:@[ @1, @0 ] name:@"XT"];
+    MPSGraphTensor *dW1 = ampMatMul(graph, xt, dH1pre, @"dW1");
+    MPSGraphTensor *db1 = [graph reshapeTensor:[graph reductionSumWithTensor:dH1pre axis:0 name:@"db1s"]
+                                     withShape:@[ @(H1) ]
+                                          name:@"db1"];
+
+    MPSGraphTensor *w1Out = nil;
+    MPSGraphTensor *b1Out = nil;
+    MPSGraphTensor *w2Out = nil;
+    MPSGraphTensor *b2Out = nil;
+    MPSGraphTensor *w3Out = nil;
+    MPSGraphTensor *b3Out = nil;
+    MPSGraphTensor *w4Out = nil;
+    MPSGraphTensor *b4Out = nil;
+    if (sgdUpdate) {
+        MPSGraphTensor *lrT = [graph constantWithScalar:(double)lr dataType:MPSDataTypeFloat32];
+        w1Out = [graph subtractionWithPrimaryTensor:w1
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:dW1 secondaryTensor:lrT name:@"lrW1"]
+                                             name:@"W1n"];
+        b1Out = [graph subtractionWithPrimaryTensor:b1
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:db1 secondaryTensor:lrT name:@"lrB1"]
+                                             name:@"b1n"];
+        w2Out = [graph subtractionWithPrimaryTensor:w2
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:dW2 secondaryTensor:lrT name:@"lrW2"]
+                                             name:@"W2n"];
+        b2Out = [graph subtractionWithPrimaryTensor:b2
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:db2 secondaryTensor:lrT name:@"lrB2"]
+                                             name:@"b2n"];
+        w3Out = [graph subtractionWithPrimaryTensor:w3
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:dW3 secondaryTensor:lrT name:@"lrW3"]
+                                             name:@"W3n"];
+        b3Out = [graph subtractionWithPrimaryTensor:b3
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:db3 secondaryTensor:lrT name:@"lrB3"]
+                                             name:@"b3n"];
+        w4Out = [graph subtractionWithPrimaryTensor:w4
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:dW4 secondaryTensor:lrT name:@"lrW4"]
+                                             name:@"W4n"];
+        b4Out = [graph subtractionWithPrimaryTensor:b4
+                                  secondaryTensor:[graph multiplicationWithPrimaryTensor:db4 secondaryTensor:lrT name:@"lrB4"]
+                                             name:@"b4n"];
+    }
+
+    cached = buildMlp3GraphArrays(
+        graph, accOut, correctOut, dW1, db1, dW2, db2, dW3, db3, dW4, db4,
+        w1Out, b1Out, w2Out, b2Out, w3Out, b3Out, w4Out, b4Out,
+        x, w1, b1, w2, b2, w3, b3, w4, b4, labels, acc, correctAcc,
+        trackCorrect, sgdUpdate);
+    store[key] = cached;
+    if (sgdUpdate) {
+        (void)cachedMlp3Executable(cached, trackCorrect, B, inFeatures, H1, H2, H3, C, lr);
+    } else {
+        (void)cachedMlp3BwdExecutable(cached, trackCorrect, B, inFeatures, H1, H2, H3, C);
+    }
+    return cached;
+}
+
+static NSArray *cachedMlp3Graph(uint32_t B, uint32_t inFeatures, uint32_t H1, uint32_t H2,
+                                uint32_t H3, uint32_t C, float lr, bool trackCorrect) {
+    if (gMlp3Graphs == nil) gMlp3Graphs = [[NSMutableDictionary alloc] init];
+    NSString *key = mlp3CacheKey(B, inFeatures, H1, H2, H3, C, lr, trackCorrect);
+    return cachedMlp3GraphCore(B, inFeatures, H1, H2, H3, C, lr, trackCorrect, true, gMlp3Graphs, key);
+}
+
+static NSArray *cachedMlp3BwdGraph(uint32_t B, uint32_t inFeatures, uint32_t H1, uint32_t H2,
+                                   uint32_t H3, uint32_t C, bool trackCorrect) {
+    if (gMlp3BwdGraphs == nil) gMlp3BwdGraphs = [[NSMutableDictionary alloc] init];
+    NSString *key = mlp3BwdCacheKey(B, inFeatures, H1, H2, H3, C, trackCorrect);
+    return cachedMlp3GraphCore(B, inFeatures, H1, H2, H3, C, 0.0f, trackCorrect, false, gMlp3BwdGraphs, key);
+}
+
+static bool mlp3WeightBytes(uint32_t inFeatures, uint32_t H1, uint32_t H2, uint32_t H3,
+                            uint32_t C, size_t wBytes[4], size_t bBytes[4]) {
+    wBytes[0] = (size_t)inFeatures * (size_t)H1 * sizeof(float);
+    wBytes[1] = (size_t)H1 * (size_t)H2 * sizeof(float);
+    wBytes[2] = (size_t)H2 * (size_t)H3 * sizeof(float);
+    wBytes[3] = (size_t)H3 * (size_t)C * sizeof(float);
+    bBytes[0] = (size_t)H1 * sizeof(float);
+    bBytes[1] = (size_t)H2 * sizeof(float);
+    bBytes[2] = (size_t)H3 * sizeof(float);
+    bBytes[3] = (size_t)C * sizeof(float);
+    return true;
+}
+
+static bool mlp3LiveMatches(JaiGpuBuffer *w[4], JaiGpuBuffer *b[4], size_t wOff[4],
+                            size_t bOff[4]) {
+    for (int i = 0; i < 4; i++) {
+        if (w[i] != gMlp3LiveW[i] || b[i] != gMlp3LiveB[i] ||
+            wOff[i] != gMlp3LiveWOff[i] || bOff[i] != gMlp3LiveBOff[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool commitMlp3WeightsLocked(void) {
+    if (gMlp3Side == 0) return true;
+    __unsafe_unretained id<MTLBuffer> srcs[8];
+    JaiGpuBuffer *dsts[8];
+    size_t offs[8];
+    size_t sizes[8];
+    for (int i = 0; i < 4; i++) {
+        srcs[i * 2] = gMlp3ScratchW[i];
+        srcs[i * 2 + 1] = gMlp3ScratchB[i];
+        dsts[i * 2] = gMlp3LiveW[i];
+        dsts[i * 2 + 1] = gMlp3LiveB[i];
+        offs[i * 2] = gMlp3LiveWOff[i];
+        offs[i * 2 + 1] = gMlp3LiveBOff[i];
+        sizes[i * 2] = gMlp3LiveWBytes[i];
+        sizes[i * 2 + 1] = gMlp3LiveBBytes[i];
+    }
+    if (!blitMany(srcs, dsts, offs, sizes, 8)) return false;
+    gMlp3Side = 0;
+    return true;
+}
+
+static bool encodeMlp3Step(
+    NSArray *cached,
+    bool trackCorrect,
+    bool sgdUpdate,
+    uint32_t B,
+    uint32_t inFeatures,
+    uint32_t H1,
+    uint32_t H2,
+    uint32_t H3,
+    uint32_t C,
+    float lr,
+    JaiGpuBuffer *x,
+    size_t xOff,
+    JaiGpuBuffer *w[4],
+    size_t wOff[4],
+    JaiGpuBuffer *b[4],
+    size_t bOff[4],
+    JaiGpuBuffer *labels,
+    size_t labOff,
+    JaiGpuBuffer *lossAcc,
+    size_t lossOff,
+    JaiGpuBuffer *correctAcc,
+    size_t correctOff,
+    JaiGpuBuffer *gW[4],
+    size_t gWOff[4],
+    JaiGpuBuffer *gB[4],
+    size_t gBOff[4]) {
+    const NSUInteger expected = trackCorrect ? 23u : 21u;
+    if (cached == nil || cached.count != expected) return false;
+    MPSGraph *graph = cached[0];
+    size_t wBytes[4];
+    size_t bBytes[4];
+    mlp3WeightBytes(inFeatures, H1, H2, H3, C, wBytes, bBytes);
+    const size_t accBytes = sizeof(float);
+    const bool fromLive = sgdUpdate && gMlp3Side == 0;
+    gMlpScratchAcc = growScratch(gMlpScratchAcc, &gMlpCapAcc, accBytes);
+    if (trackCorrect) {
+        gMlpScratchCorrect = growScratch(gMlpScratchCorrect, &gMlpCapCorrect, accBytes);
+    }
+    if (sgdUpdate) {
+        for (int i = 0; i < 4; i++) {
+            gMlp3ScratchW[i] = growScratch(gMlp3ScratchW[i], &gMlp3CapW[i], wBytes[i]);
+            gMlp3ScratchB[i] = growScratch(gMlp3ScratchB[i], &gMlp3CapB[i], bBytes[i]);
+        }
+    }
+    NSArray *w1Shape = @[ @(inFeatures), @(H1) ];
+    NSArray *w2Shape = @[ @(H1), @(H2) ];
+    NSArray *w3Shape = @[ @(H2), @(H3) ];
+    NSArray *w4Shape = @[ @(H3), @(C) ];
+    NSArray *b1Shape = @[ @(H1) ];
+    NSArray *b2Shape = @[ @(H2) ];
+    NSArray *b3Shape = @[ @(H3) ];
+    NSArray *cVec = @[ @(C) ];
+    NSArray *wShapes[4] = {w1Shape, w2Shape, w3Shape, w4Shape};
+    NSArray *bShapes[4] = {b1Shape, b2Shape, b3Shape, cVec};
+    MPSGraphTensorData *dx = graphData(x, xOff, @[ @(B), @(inFeatures) ]);
+    MPSGraphTensorData *dy = graphData(labels, labOff, @[ @(B) ]);
+    const bool accFromLive = !trackCorrect && gMlpAccSide == 0;
+    MPSGraphTensorData *dacc = trackCorrect
+        ? graphData(lossAcc, lossOff, @[ @1 ])
+        : (accFromLive ? graphData(lossAcc, lossOff, @[ @1 ])
+                       : graphDataMTL(gMlpScratchAcc, @[ @1 ]));
+    MPSGraphTensorData *dcorr = trackCorrect
+        ? graphData(correctAcc, correctOff, @[ @1 ])
+        : nil;
+    MPSGraphTensorData *dws[4];
+    MPSGraphTensorData *dbs[4];
+    MPSGraphTensorData *rws[4];
+    MPSGraphTensorData *rbs[4];
+    for (int i = 0; i < 4; i++) {
+        dws[i] = sgdUpdate && fromLive
+            ? graphData(w[i], wOff[i], wShapes[i])
+            : (sgdUpdate ? graphDataMTL(gMlp3ScratchW[i], wShapes[i])
+                         : graphData(w[i], wOff[i], wShapes[i]));
+        dbs[i] = sgdUpdate && fromLive
+            ? graphData(b[i], bOff[i], bShapes[i])
+            : (sgdUpdate ? graphDataMTL(gMlp3ScratchB[i], bShapes[i])
+                         : graphData(b[i], bOff[i], bShapes[i]));
+        if (sgdUpdate) {
+            rws[i] = fromLive ? graphDataMTL(gMlp3ScratchW[i], wShapes[i])
+                              : graphData(w[i], wOff[i], wShapes[i]);
+            rbs[i] = fromLive ? graphDataMTL(gMlp3ScratchB[i], bShapes[i])
+                              : graphData(b[i], bOff[i], bShapes[i]);
+        } else {
+            rws[i] = graphData(gW[i], gWOff[i], wShapes[i]);
+            rbs[i] = graphData(gB[i], gBOff[i], bShapes[i]);
+        }
+        if (dws[i] == nil || dbs[i] == nil || rws[i] == nil || rbs[i] == nil) return false;
+    }
+    if (dx == nil || dy == nil || dacc == nil) return false;
+    if (trackCorrect && (dcorr == nil)) return false;
+    NSMutableDictionary *feeds = [NSMutableDictionary dictionaryWithCapacity:12];
+    feeds[cached[1]] = dx;
+    for (int i = 0; i < 4; i++) {
+        feeds[cached[2 + i * 2]] = dws[i];
+        feeds[cached[3 + i * 2]] = dbs[i];
+    }
+    feeds[cached[10]] = dy;
+    feeds[cached[11]] = dacc;
+    if (trackCorrect) feeds[cached[12]] = dcorr;
+    const int wBase = trackCorrect ? 13 : 12;
+    NSMutableDictionary *results = [NSMutableDictionary dictionaryWithCapacity:10];
+    for (int i = 0; i < 4; i++) {
+        results[cached[wBase + i * 2]] = rws[i];
+        results[cached[wBase + i * 2 + 1]] = rbs[i];
+    }
+    MPSGraphTensorData *racc = trackCorrect
+        ? graphDataMTL(gMlpScratchAcc, @[ @1 ])
+        : (accFromLive ? graphDataMTL(gMlpScratchAcc, @[ @1 ])
+                       : graphData(lossAcc, lossOff, @[ @1 ]));
+    MPSGraphTensorData *rcorr = trackCorrect
+        ? graphDataMTL(gMlpScratchCorrect, @[ @1 ])
+        : nil;
+    if (racc == nil) return false;
+    results[cached[wBase + 8]] = racc;
+    if (trackCorrect) {
+        if (rcorr == nil) return false;
+        results[cached[wBase + 9]] = rcorr;
+    }
+    MPSGraphExecutable *exec = sgdUpdate
+        ? cachedMlp3Executable(cached, trackCorrect, B, inFeatures, H1, H2, H3, C, lr)
+        : cachedMlp3BwdExecutable(cached, trackCorrect, B, inFeatures, H1, H2, H3, C);
+    if (exec == nil || !encodeMlpExecutableOnAsync(exec, feeds, results)) {
+        if (!encodeGraphOnAsync(graph, feeds, results)) return false;
+    }
+    if (trackCorrect) {
+        __unsafe_unretained id<MTLBuffer> accSrcs[] = {
+            gMlpScratchAcc, gMlpScratchCorrect
+        };
+        JaiGpuBuffer *accDsts[] = {lossAcc, correctAcc};
+        size_t accOffs[] = {lossOff, correctOff};
+        size_t accSizes[] = {accBytes, accBytes};
+        if (!blitMany(accSrcs, accDsts, accOffs, accSizes, 2)) return false;
+    }
+    gMlpLiveAcc = lossAcc;
+    gMlpLiveAccOff = lossOff;
+    if (!trackCorrect) {
+        gMlpAccSide = accFromLive ? 1 : 0;
+    }
+    if (sgdUpdate) {
+        for (int i = 0; i < 4; i++) {
+            gMlp3LiveW[i] = w[i];
+            gMlp3LiveB[i] = b[i];
+            gMlp3LiveWOff[i] = wOff[i];
+            gMlp3LiveBOff[i] = bOff[i];
+            gMlp3LiveWBytes[i] = wBytes[i];
+            gMlp3LiveBBytes[i] = bBytes[i];
+        }
+        gMlp3Side = fromLive ? 1 : 0;
+    }
+    return true;
+}
+
+bool jaiGpuMlp3SgdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *w3, size_t w3Off,
+                       JaiGpuBuffer *b3, size_t b3Off, JaiGpuBuffer *w4, size_t w4Off,
+                       JaiGpuBuffer *b4, size_t b4Off, JaiGpuBuffer *labels, size_t labOff,
+                       JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                       size_t correctOff, uint32_t B, uint32_t inFeatures, uint32_t H1,
+                       uint32_t H2, uint32_t H3, uint32_t C, float lr) {
+    JaiGpuBuffer *w[4] = {w1, w2, w3, w4};
+    JaiGpuBuffer *b[4] = {b1, b2, b3, b4};
+    size_t wOff[4] = {w1Off, w2Off, w3Off, w4Off};
+    size_t bOff[4] = {b1Off, b2Off, b3Off, b4Off};
+    if (x == NULL || w1 == NULL || b1 == NULL || w2 == NULL || b2 == NULL ||
+        w3 == NULL || b3 == NULL || w4 == NULL || b4 == NULL ||
+        labels == NULL || lossAcc == NULL) {
+        return false;
+    }
+    const bool trackCorrect = correctAcc != NULL;
+    if (B == 0 || inFeatures == 0 || H1 == 0 || H2 == 0 || H3 == 0 || C == 0) return false;
+    if (!ensureDevice()) return false;
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            if (gMlp3Side != 0 && !mlp3LiveMatches(w, b, wOff, bOff)) {
+                if (!commitMlp3WeightsLocked()) return false;
+            }
+            NSArray *cached = cachedMlp3Graph(B, inFeatures, H1, H2, H3, C, lr, trackCorrect);
+            if (!encodeMlp3Step(
+                    cached, trackCorrect, true, B, inFeatures, H1, H2, H3, C, lr,
+                    x, xOff, w, wOff, b, bOff, labels, labOff, lossAcc, lossOff,
+                    correctAcc, correctOff, NULL, NULL, NULL, NULL)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+bool jaiGpuMlp3BwdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *w3, size_t w3Off,
+                       JaiGpuBuffer *b3, size_t b3Off, JaiGpuBuffer *w4, size_t w4Off,
+                       JaiGpuBuffer *b4, size_t b4Off, JaiGpuBuffer *labels, size_t labOff,
+                       JaiGpuBuffer *gW1, size_t gW1Off, JaiGpuBuffer *gB1, size_t gB1Off,
+                       JaiGpuBuffer *gW2, size_t gW2Off, JaiGpuBuffer *gB2, size_t gB2Off,
+                       JaiGpuBuffer *gW3, size_t gW3Off, JaiGpuBuffer *gB3, size_t gB3Off,
+                       JaiGpuBuffer *gW4, size_t gW4Off, JaiGpuBuffer *gB4, size_t gB4Off,
+                       JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                       size_t correctOff, uint32_t B, uint32_t inFeatures, uint32_t H1,
+                       uint32_t H2, uint32_t H3, uint32_t C) {
+    JaiGpuBuffer *w[4] = {w1, w2, w3, w4};
+    JaiGpuBuffer *b[4] = {b1, b2, b3, b4};
+    JaiGpuBuffer *gW[4] = {gW1, gW2, gW3, gW4};
+    JaiGpuBuffer *gB[4] = {gB1, gB2, gB3, gB4};
+    size_t wOff[4] = {w1Off, w2Off, w3Off, w4Off};
+    size_t bOff[4] = {b1Off, b2Off, b3Off, b4Off};
+    size_t gWOff[4] = {gW1Off, gW2Off, gW3Off, gW4Off};
+    size_t gBOff[4] = {gB1Off, gB2Off, gB3Off, gB4Off};
+    if (x == NULL || w1 == NULL || b1 == NULL || w2 == NULL || b2 == NULL ||
+        w3 == NULL || b3 == NULL || w4 == NULL || b4 == NULL ||
+        labels == NULL || gW1 == NULL || gB1 == NULL || gW2 == NULL || gB2 == NULL ||
+        gW3 == NULL || gB3 == NULL || gW4 == NULL || gB4 == NULL || lossAcc == NULL) {
+        return false;
+    }
+    const bool trackCorrect = correctAcc != NULL;
+    if (B == 0 || inFeatures == 0 || H1 == 0 || H2 == 0 || H3 == 0 || C == 0) return false;
+    if (!ensureDevice()) return false;
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            NSArray *cached = cachedMlp3BwdGraph(B, inFeatures, H1, H2, H3, C, trackCorrect);
+            if (!encodeMlp3Step(
+                    cached, trackCorrect, false, B, inFeatures, H1, H2, H3, C, 0.0f,
+                    x, xOff, w, wOff, b, bOff, labels, labOff, lossAcc, lossOff,
+                    correctAcc, correctOff, gW, gWOff, gB, gBOff)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+bool jaiGpuMlpSgdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                      JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                      JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,
+                      JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                      size_t correctOff, uint32_t B, uint32_t inFeatures, uint32_t H,
+                      uint32_t C, float lr) {
+    if (x == NULL || w1 == NULL || b1 == NULL || w2 == NULL || b2 == NULL ||
+        labels == NULL || lossAcc == NULL) {
+        return false;
+    }
+    const bool trackCorrect = correctAcc != NULL;
+    if (B == 0 || inFeatures == 0 || H == 0 || C == 0) return false;
+    if (!ensureDevice()) return false;
+
+    const size_t w1Bytes = (size_t)inFeatures * (size_t)H * sizeof(float);
+    const size_t b1Bytes = (size_t)H * sizeof(float);
+    const size_t w2Bytes = (size_t)H * (size_t)C * sizeof(float);
+    const size_t b2Bytes = (size_t)C * sizeof(float);
+    const size_t accBytes = sizeof(float);
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            if (gMlpSide != 0 && (w1 != gMlpLiveW1 || b1 != gMlpLiveB1 ||
+                                  w2 != gMlpLiveW2 || b2 != gMlpLiveB2 ||
+                                  w1Off != gMlpLiveW1Off || b1Off != gMlpLiveB1Off ||
+                                  w2Off != gMlpLiveW2Off || b2Off != gMlpLiveB2Off)) {
+                __unsafe_unretained id<MTLBuffer> commitSrcs[] = {
+                    gMlpScratchW1, gMlpScratchB1, gMlpScratchW2, gMlpScratchB2
+                };
+                JaiGpuBuffer *commitDsts[] = {gMlpLiveW1, gMlpLiveB1, gMlpLiveW2, gMlpLiveB2};
+                size_t commitOffs[] = {
+                    gMlpLiveW1Off, gMlpLiveB1Off, gMlpLiveW2Off, gMlpLiveB2Off
+                };
+                size_t commitSizes[] = {
+                    gMlpLiveW1Bytes, gMlpLiveB1Bytes, gMlpLiveW2Bytes, gMlpLiveB2Bytes
+                };
+                if (!blitMany(commitSrcs, commitDsts, commitOffs, commitSizes, 4)) {
+                    return false;
+                }
+                gMlpSide = 0;
+            }
+            NSArray *cached = cachedMlpGraph(B, inFeatures, H, C, lr, trackCorrect);
+            const NSUInteger expected = trackCorrect ? 15u : 13u;
+            if (cached == nil || cached.count != expected) return false;
+            MPSGraph *graph = cached[0];
+            gMlpScratchW1 = growScratch(gMlpScratchW1, &gMlpCapW1, w1Bytes);
+            gMlpScratchB1 = growScratch(gMlpScratchB1, &gMlpCapB1, b1Bytes);
+            gMlpScratchW2 = growScratch(gMlpScratchW2, &gMlpCapW2, w2Bytes);
+            gMlpScratchB2 = growScratch(gMlpScratchB2, &gMlpCapB2, b2Bytes);
+            gMlpScratchAcc = growScratch(gMlpScratchAcc, &gMlpCapAcc, accBytes);
+            if (trackCorrect) {
+                gMlpScratchCorrect = growScratch(gMlpScratchCorrect, &gMlpCapCorrect, accBytes);
+            }
+            const bool fromLive = gMlpSide == 0;
+            NSArray *w1Shape = @[ @(inFeatures), @(H) ];
+            NSArray *b1Shape = @[ @(H) ];
+            NSArray *w2Shape = @[ @(H), @(C) ];
+            NSArray *b2Shape = @[ @(C) ];
+            MPSGraphTensorData *dx = graphData(x, xOff, @[ @(B), @(inFeatures) ]);
+            MPSGraphTensorData *dw1 = fromLive ? graphData(w1, w1Off, w1Shape)
+                                               : graphDataMTL(gMlpScratchW1, w1Shape);
+            MPSGraphTensorData *db1 = fromLive ? graphData(b1, b1Off, b1Shape)
+                                               : graphDataMTL(gMlpScratchB1, b1Shape);
+            MPSGraphTensorData *dw2 = fromLive ? graphData(w2, w2Off, w2Shape)
+                                               : graphDataMTL(gMlpScratchW2, w2Shape);
+            MPSGraphTensorData *db2 = fromLive ? graphData(b2, b2Off, b2Shape)
+                                               : graphDataMTL(gMlpScratchB2, b2Shape);
+            MPSGraphTensorData *dy = graphData(labels, labOff, @[ @(B) ]);
+            const bool accFromLive = !trackCorrect && gMlpAccSide == 0;
+            MPSGraphTensorData *dacc = trackCorrect
+                ? graphData(lossAcc, lossOff, @[ @1 ])
+                : (accFromLive ? graphData(lossAcc, lossOff, @[ @1 ])
+                               : graphDataMTL(gMlpScratchAcc, @[ @1 ]));
+            MPSGraphTensorData *dcorr = trackCorrect
+                ? graphData(correctAcc, correctOff, @[ @1 ])
+                : nil;
+            MPSGraphTensorData *rw1 = fromLive ? graphDataMTL(gMlpScratchW1, w1Shape)
+                                               : graphData(w1, w1Off, w1Shape);
+            MPSGraphTensorData *rb1 = fromLive ? graphDataMTL(gMlpScratchB1, b1Shape)
+                                               : graphData(b1, b1Off, b1Shape);
+            MPSGraphTensorData *rw2 = fromLive ? graphDataMTL(gMlpScratchW2, w2Shape)
+                                               : graphData(w2, w2Off, w2Shape);
+            MPSGraphTensorData *rb2 = fromLive ? graphDataMTL(gMlpScratchB2, b2Shape)
+                                               : graphData(b2, b2Off, b2Shape);
+            MPSGraphTensorData *racc = trackCorrect
+                ? graphDataMTL(gMlpScratchAcc, @[ @1 ])
+                : (accFromLive ? graphDataMTL(gMlpScratchAcc, @[ @1 ])
+                               : graphData(lossAcc, lossOff, @[ @1 ]));
+            MPSGraphTensorData *rcorr = trackCorrect
+                ? graphDataMTL(gMlpScratchCorrect, @[ @1 ])
+                : nil;
+            if (dx == nil || dw1 == nil || db1 == nil || dw2 == nil || db2 == nil ||
+                dy == nil || dacc == nil || rw1 == nil || rb1 == nil ||
+                rw2 == nil || rb2 == nil || racc == nil) {
+                return false;
+            }
+            if (trackCorrect && (dcorr == nil || rcorr == nil)) return false;
+            NSMutableDictionary *feeds = [@{
+                cached[1] : dx,  cached[2] : dw1, cached[3] : db1,
+                cached[4] : dw2, cached[5] : db2, cached[6] : dy,
+                cached[7] : dacc
+            } mutableCopy];
+            if (trackCorrect) feeds[cached[8]] = dcorr;
+            const int wBase = trackCorrect ? 9 : 8;
+            NSMutableDictionary *results = [@{
+                cached[wBase + 0] : rw1, cached[wBase + 1] : rb1,
+                cached[wBase + 2] : rw2, cached[wBase + 3] : rb2,
+                cached[wBase + 4] : racc
+            } mutableCopy];
+            if (trackCorrect) results[cached[wBase + 5]] = rcorr;
+            MPSGraphExecutable *exec =
+                cachedMlpExecutable(cached, trackCorrect, B, inFeatures, H, C, lr);
+            if (exec == nil ||
+                !encodeMlpExecutableOnAsync(exec, feeds, results)) {
+                if (!encodeGraphOnAsync(graph, feeds, results)) return false;
+            }
+            if (trackCorrect) {
+                __unsafe_unretained id<MTLBuffer> accSrcs[] = {
+                    gMlpScratchAcc, gMlpScratchCorrect
+                };
+                JaiGpuBuffer *accDsts[] = {lossAcc, correctAcc};
+                size_t accOffs[] = {lossOff, correctOff};
+                size_t accSizes[] = {accBytes, accBytes};
+                if (!blitMany(accSrcs, accDsts, accOffs, accSizes, 2)) return false;
+            }
+            gMlpLiveAcc = lossAcc;
+            gMlpLiveAccOff = lossOff;
+            if (!trackCorrect) {
+                gMlpAccSide = accFromLive ? 1 : 0;
+            }
+            gMlpLiveW1 = w1;
+            gMlpLiveB1 = b1;
+            gMlpLiveW2 = w2;
+            gMlpLiveB2 = b2;
+            gMlpLiveW1Off = w1Off;
+            gMlpLiveB1Off = b1Off;
+            gMlpLiveW2Off = w2Off;
+            gMlpLiveB2Off = b2Off;
+            gMlpLiveW1Bytes = w1Bytes;
+            gMlpLiveB1Bytes = b1Bytes;
+            gMlpLiveW2Bytes = w2Bytes;
+            gMlpLiveB2Bytes = b2Bytes;
+            gMlpSide = fromLive ? 1 : 0;
+        }
+        return true;
+    }
+}
+
+bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,
+                       JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                       size_t correctOff, uint32_t samples, uint32_t batch,
+                       uint32_t inputs, uint32_t hidden, uint32_t classes, float lr,
+                       uint32_t flushEvery, uint32_t *processed) {
+    if (processed != NULL) *processed = 0;
+    if (batch == 0 || samples < batch) return true;
+    if (flushEvery == 0) flushEvery = 1;
+    const uint32_t steps = samples / batch;
+    const size_t xStride = (size_t)batch * (size_t)inputs * sizeof(float);
+    const size_t labStride = (size_t)batch * sizeof(float);
+    const size_t xBytes = xStride;
+    const size_t labBytes = labStride;
+    if (x == NULL || labels == NULL || w1 == NULL || b1 == NULL || w2 == NULL ||
+        b2 == NULL || lossAcc == NULL) {
+        return false;
+    }
+    if (xOff + (size_t)steps * xStride > x->bytes) return false;
+    if (labOff + (size_t)steps * labStride > labels->bytes) return false;
+    const bool trackCorrect = correctAcc != NULL;
+    if (trackCorrect && (correctAcc->buffer == NULL)) return false;
+
+    const size_t w1Bytes = (size_t)inputs * (size_t)hidden * sizeof(float);
+    const size_t b1Bytes = (size_t)hidden * sizeof(float);
+    const size_t w2Bytes = (size_t)hidden * (size_t)classes * sizeof(float);
+    const size_t b2Bytes = (size_t)classes * sizeof(float);
+    const size_t accBytes = sizeof(float);
+
+    @autoreleasepool {
+        NSArray *cached = nil;
+        MPSGraphExecutable *exec = nil;
+        MPSGraph *graph = nil;
+        NSArray *w1Shape = nil;
+        NSArray *b1Shape = nil;
+        NSArray *w2Shape = nil;
+        NSArray *b2Shape = nil;
+        NSArray *xShape = nil;
+        NSArray *yShape = nil;
+        NSArray *accShape = nil;
+        MPSNDArrayDescriptor *xDesc = nil;
+        MPSNDArrayDescriptor *yDesc = nil;
+        MPSGraphTensorData *liveW1 = nil, *scratchW1 = nil;
+        MPSGraphTensorData *liveB1 = nil, *scratchB1 = nil;
+        MPSGraphTensorData *liveW2 = nil, *scratchW2 = nil;
+        MPSGraphTensorData *liveB2 = nil, *scratchB2 = nil;
+        MPSGraphTensorData *liveAcc = nil, *scratchAcc = nil;
+        MPSGraphTensorData *liveCorr = nil, *scratchCorr = nil;
+        NSMutableDictionary *feedsA = nil, *feedsB = nil;
+        NSMutableDictionary *resultsA = nil, *resultsB = nil;
+        NSMutableArray<MPSGraphTensorData *> *inputsA = nil, *inputsB = nil;
+        NSArray<MPSGraphTensorData *> *execResultsA = nil, *execResultsB = nil;
+        const int wBase = trackCorrect ? 9 : 8;
+
+        @synchronized(gQueue) {
+            if (gMlpSide != 0 && (w1 != gMlpLiveW1 || b1 != gMlpLiveB1 ||
+                                  w2 != gMlpLiveW2 || b2 != gMlpLiveB2 ||
+                                  w1Off != gMlpLiveW1Off || b1Off != gMlpLiveB1Off ||
+                                  w2Off != gMlpLiveW2Off || b2Off != gMlpLiveB2Off)) {
+                __unsafe_unretained id<MTLBuffer> commitSrcs[] = {
+                    gMlpScratchW1, gMlpScratchB1, gMlpScratchW2, gMlpScratchB2
+                };
+                JaiGpuBuffer *commitDsts[] = {gMlpLiveW1, gMlpLiveB1, gMlpLiveW2, gMlpLiveB2};
+                size_t commitOffs[] = {
+                    gMlpLiveW1Off, gMlpLiveB1Off, gMlpLiveW2Off, gMlpLiveB2Off
+                };
+                size_t commitSizes[] = {
+                    gMlpLiveW1Bytes, gMlpLiveB1Bytes, gMlpLiveW2Bytes, gMlpLiveB2Bytes
+                };
+                if (!blitMany(commitSrcs, commitDsts, commitOffs, commitSizes, 4)) {
+                    return false;
+                }
+                gMlpSide = 0;
+            }
+            cached = cachedMlpGraph(batch, inputs, hidden, classes, lr, trackCorrect);
+            const NSUInteger expected = trackCorrect ? 15u : 13u;
+            if (cached == nil || cached.count != expected) return false;
+            graph = cached[0];
+            exec = cachedMlpExecutable(cached, trackCorrect, batch, inputs, hidden, classes, lr);
+            gMlpScratchW1 = growScratch(gMlpScratchW1, &gMlpCapW1, w1Bytes);
+            gMlpScratchB1 = growScratch(gMlpScratchB1, &gMlpCapB1, b1Bytes);
+            gMlpScratchW2 = growScratch(gMlpScratchW2, &gMlpCapW2, w2Bytes);
+            gMlpScratchB2 = growScratch(gMlpScratchB2, &gMlpCapB2, b2Bytes);
+            gMlpScratchAcc = growScratch(gMlpScratchAcc, &gMlpCapAcc, accBytes);
+            if (trackCorrect) {
+                gMlpScratchCorrect = growScratch(gMlpScratchCorrect, &gMlpCapCorrect, accBytes);
+            }
+            w1Shape = @[ @(inputs), @(hidden) ];
+            b1Shape = @[ @(hidden) ];
+            w2Shape = @[ @(hidden), @(classes) ];
+            b2Shape = @[ @(classes) ];
+            xShape = @[ @(batch), @(inputs) ];
+            yShape = @[ @(batch) ];
+            accShape = @[ @1 ];
+            xDesc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32 shape:xShape];
+            yDesc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32 shape:yShape];
+            liveW1 = graphData(w1, w1Off, w1Shape);
+            liveB1 = graphData(b1, b1Off, b1Shape);
+            liveW2 = graphData(w2, w2Off, w2Shape);
+            liveB2 = graphData(b2, b2Off, b2Shape);
+            scratchW1 = graphDataMTL(gMlpScratchW1, w1Shape);
+            scratchB1 = graphDataMTL(gMlpScratchB1, b1Shape);
+            scratchW2 = graphDataMTL(gMlpScratchW2, w2Shape);
+            scratchB2 = graphDataMTL(gMlpScratchB2, b2Shape);
+            liveAcc = graphData(lossAcc, lossOff, accShape);
+            scratchAcc = graphDataMTL(gMlpScratchAcc, accShape);
+            if (trackCorrect) {
+                liveCorr = graphData(correctAcc, correctOff, accShape);
+                scratchCorr = graphDataMTL(gMlpScratchCorrect, accShape);
+            }
+            if (liveW1 == nil || liveB1 == nil || liveW2 == nil || liveB2 == nil ||
+                scratchW1 == nil || scratchB1 == nil || scratchW2 == nil ||
+                scratchB2 == nil || liveAcc == nil || scratchAcc == nil) {
+                return false;
+            }
+            if (trackCorrect && (liveCorr == nil || scratchCorr == nil)) return false;
+
+            feedsA = [NSMutableDictionary dictionaryWithCapacity:8];
+            feedsB = [NSMutableDictionary dictionaryWithCapacity:8];
+            resultsA = [NSMutableDictionary dictionaryWithCapacity:6];
+            resultsB = [NSMutableDictionary dictionaryWithCapacity:6];
+            feedsA[cached[2]] = liveW1;
+            feedsA[cached[3]] = liveB1;
+            feedsA[cached[4]] = liveW2;
+            feedsA[cached[5]] = liveB2;
+            feedsB[cached[2]] = scratchW1;
+            feedsB[cached[3]] = scratchB1;
+            feedsB[cached[4]] = scratchW2;
+            feedsB[cached[5]] = scratchB2;
+            resultsA[cached[wBase + 0]] = scratchW1;
+            resultsA[cached[wBase + 1]] = scratchB1;
+            resultsA[cached[wBase + 2]] = scratchW2;
+            resultsA[cached[wBase + 3]] = scratchB2;
+            resultsB[cached[wBase + 0]] = liveW1;
+            resultsB[cached[wBase + 1]] = liveB1;
+            resultsB[cached[wBase + 2]] = liveW2;
+            resultsB[cached[wBase + 3]] = liveB2;
+            if (trackCorrect) {
+                feedsA[cached[7]] = liveAcc;
+                feedsB[cached[7]] = liveAcc;
+                feedsA[cached[8]] = liveCorr;
+                feedsB[cached[8]] = liveCorr;
+                resultsA[cached[wBase + 4]] = scratchAcc;
+                resultsB[cached[wBase + 4]] = scratchAcc;
+                resultsA[cached[wBase + 5]] = scratchCorr;
+                resultsB[cached[wBase + 5]] = scratchCorr;
+            } else {
+                feedsA[cached[7]] = liveAcc;
+                feedsB[cached[7]] = scratchAcc;
+                resultsA[cached[wBase + 4]] = scratchAcc;
+                resultsB[cached[wBase + 4]] = liveAcc;
+            }
+            gMlpLiveW1 = w1;
+            gMlpLiveB1 = b1;
+            gMlpLiveW2 = w2;
+            gMlpLiveB2 = b2;
+            gMlpLiveW1Off = w1Off;
+            gMlpLiveB1Off = b1Off;
+            gMlpLiveW2Off = w2Off;
+            gMlpLiveB2Off = b2Off;
+            gMlpLiveW1Bytes = w1Bytes;
+            gMlpLiveB1Bytes = b1Bytes;
+            gMlpLiveW2Bytes = w2Bytes;
+            gMlpLiveB2Bytes = b2Bytes;
+            gMlpLiveAcc = lossAcc;
+            gMlpLiveAccOff = lossOff;
+        }
+
+        NSMutableArray<MPSGraphTensorData *> *batchX =
+            [NSMutableArray arrayWithCapacity:steps];
+        NSMutableArray<MPSGraphTensorData *> *batchY =
+            [NSMutableArray arrayWithCapacity:steps];
+        if (!prefetchBatchFeeds(x, xOff, xStride, xBytes, xDesc, xShape, labels, labOff,
+                                labStride, labBytes, yDesc, yShape, steps, batchX, batchY)) {
+            return false;
+        }
+
+        for (uint32_t i = 0; i < steps; i++) {
+            @synchronized(gQueue) {
+                const bool fromLive = gMlpSide == 0;
+                NSMutableDictionary *feeds = fromLive ? feedsA : feedsB;
+                NSMutableDictionary *results = fromLive ? resultsA : resultsB;
+                if (!encodeEpochBatch(
+                        exec, graph, feeds, results, cached[1], cached[6],
+                        batchX[i], batchY[i],
+                        fromLive ? &inputsA : &inputsB,
+                        fromLive ? &execResultsA : &execResultsB)) {
+                    return false;
+                }
+                if (trackCorrect) {
+                    __unsafe_unretained id<MTLBuffer> accSrcs[] = {
+                        gMlpScratchAcc, gMlpScratchCorrect
+                    };
+                    JaiGpuBuffer *accDsts[] = {lossAcc, correctAcc};
+                    size_t accOffs[] = {lossOff, correctOff};
+                    size_t accSizes[] = {accBytes, accBytes};
+                    if (!blitMany(accSrcs, accDsts, accOffs, accSizes, 2)) return false;
+                } else {
+                    gMlpAccSide = fromLive ? 1 : 0;
+                }
+                gMlpSide = fromLive ? 1 : 0;
+            }
+            if ((i + 1) % flushEvery == 0 || i + 1 == steps) {
+                id<MTLCommandBuffer> oldest = nil;
+                @synchronized(gQueue) {
+                    if (!flushAsyncLocked(&oldest)) return false;
+                }
+                if (oldest != nil) {
+                    [oldest waitUntilCompleted];
+                    if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
+                }
+            }
+        }
+        @synchronized(gQueue) {
+            /* Keep weight and accumulator ping-pong state aligned across epoch
+             * calls.  Otherwise an odd number of batches leaves weights in the
+             * scratch set while commitMlpAccLocked resets only the accumulator
+             * to live, and the next epoch reads the previous scratch loss. */
+            if (!trackCorrect && !commitMlpWeightsLocked()) return false;
+            if (!commitMlpAccLocked()) return false;
+            id<MTLCommandBuffer> oldest = nil;
+            if (!flushAsyncLocked(&oldest)) return false;
+            (void)oldest;
+        }
+    }
+    if (processed != NULL) *processed = steps * batch;
+    return true;
+}
+
+bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
+                        JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
+                        JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *w3, size_t w3Off,
+                        JaiGpuBuffer *b3, size_t b3Off, JaiGpuBuffer *w4, size_t w4Off,
+                        JaiGpuBuffer *b4, size_t b4Off, JaiGpuBuffer *labels, size_t labOff,
+                        JaiGpuBuffer *lossAcc, size_t lossOff, JaiGpuBuffer *correctAcc,
+                        size_t correctOff, uint32_t samples, uint32_t batch,
+                        uint32_t inputs, uint32_t hidden1, uint32_t hidden2,
+                        uint32_t hidden3, uint32_t classes, float lr,
+                        uint32_t flushEvery, uint32_t *processed) {
+    if (processed != NULL) *processed = 0;
+    if (batch == 0 || samples < batch) return true;
+    if (flushEvery == 0) flushEvery = 1;
+    const uint32_t steps = samples / batch;
+    const size_t xStride = (size_t)batch * (size_t)inputs * sizeof(float);
+    const size_t labStride = (size_t)batch * sizeof(float);
+    const size_t xBytes = xStride;
+    const size_t labBytes = labStride;
+    if (x == NULL || labels == NULL || w1 == NULL || b1 == NULL || w2 == NULL ||
+        b2 == NULL || w3 == NULL || b3 == NULL || w4 == NULL || b4 == NULL ||
+        lossAcc == NULL) {
+        return false;
+    }
+    if (xOff + (size_t)steps * xStride > x->bytes) return false;
+    if (labOff + (size_t)steps * labStride > labels->bytes) return false;
+    const bool trackCorrect = correctAcc != NULL;
+    JaiGpuBuffer *w[4] = {w1, w2, w3, w4};
+    JaiGpuBuffer *b[4] = {b1, b2, b3, b4};
+    size_t wOff[4] = {w1Off, w2Off, w3Off, w4Off};
+    size_t bOff[4] = {b1Off, b2Off, b3Off, b4Off};
+    size_t wBytes[4];
+    size_t bBytes[4];
+    mlp3WeightBytes(inputs, hidden1, hidden2, hidden3, classes, wBytes, bBytes);
+    const size_t accBytes = sizeof(float);
+    const int wBase = trackCorrect ? 13 : 12;
+
+    @autoreleasepool {
+        NSArray *cached = nil;
+        MPSGraphExecutable *exec = nil;
+        MPSGraph *graph = nil;
+        NSArray *xShape = nil;
+        NSArray *yShape = nil;
+        NSArray *accShape = nil;
+        MPSNDArrayDescriptor *xDesc = nil;
+        MPSNDArrayDescriptor *yDesc = nil;
+        MPSGraphTensorData *liveW[4] = {nil, nil, nil, nil};
+        MPSGraphTensorData *scratchW[4] = {nil, nil, nil, nil};
+        MPSGraphTensorData *liveB[4] = {nil, nil, nil, nil};
+        MPSGraphTensorData *scratchB[4] = {nil, nil, nil, nil};
+        MPSGraphTensorData *liveAcc = nil, *scratchAcc = nil;
+        MPSGraphTensorData *liveCorr = nil, *scratchCorr = nil;
+        NSMutableDictionary *feedsA = nil, *feedsB = nil;
+        NSMutableDictionary *resultsA = nil, *resultsB = nil;
+        NSMutableArray<MPSGraphTensorData *> *inputsA = nil, *inputsB = nil;
+        NSArray<MPSGraphTensorData *> *execResultsA = nil, *execResultsB = nil;
+
+        @synchronized(gQueue) {
+            if (gMlp3Side != 0 && !mlp3LiveMatches(w, b, wOff, bOff)) {
+                if (!commitMlp3WeightsLocked()) return false;
+            }
+            cached = cachedMlp3Graph(batch, inputs, hidden1, hidden2, hidden3, classes, lr,
+                                     trackCorrect);
+            const NSUInteger expected = trackCorrect ? 23u : 21u;
+            if (cached == nil || cached.count != expected) return false;
+            graph = cached[0];
+            exec = cachedMlp3Executable(cached, trackCorrect, batch, inputs, hidden1, hidden2,
+                                        hidden3, classes, lr);
+            gMlpScratchAcc = growScratch(gMlpScratchAcc, &gMlpCapAcc, accBytes);
+            if (trackCorrect) {
+                gMlpScratchCorrect = growScratch(gMlpScratchCorrect, &gMlpCapCorrect, accBytes);
+            }
+            NSArray *wShapes[4] = {
+                @[ @(inputs), @(hidden1) ],
+                @[ @(hidden1), @(hidden2) ],
+                @[ @(hidden2), @(hidden3) ],
+                @[ @(hidden3), @(classes) ]
+            };
+            NSArray *bShapes[4] = {
+                @[ @(hidden1) ], @[ @(hidden2) ], @[ @(hidden3) ], @[ @(classes) ]
+            };
+            for (int i = 0; i < 4; i++) {
+                gMlp3ScratchW[i] = growScratch(gMlp3ScratchW[i], &gMlp3CapW[i], wBytes[i]);
+                gMlp3ScratchB[i] = growScratch(gMlp3ScratchB[i], &gMlp3CapB[i], bBytes[i]);
+                liveW[i] = graphData(w[i], wOff[i], wShapes[i]);
+                liveB[i] = graphData(b[i], bOff[i], bShapes[i]);
+                scratchW[i] = graphDataMTL(gMlp3ScratchW[i], wShapes[i]);
+                scratchB[i] = graphDataMTL(gMlp3ScratchB[i], bShapes[i]);
+                if (liveW[i] == nil || liveB[i] == nil || scratchW[i] == nil ||
+                    scratchB[i] == nil) {
+                    return false;
+                }
+            }
+            xShape = @[ @(batch), @(inputs) ];
+            yShape = @[ @(batch) ];
+            accShape = @[ @1 ];
+            xDesc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32 shape:xShape];
+            yDesc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32 shape:yShape];
+            liveAcc = graphData(lossAcc, lossOff, accShape);
+            scratchAcc = graphDataMTL(gMlpScratchAcc, accShape);
+            if (liveAcc == nil || scratchAcc == nil) return false;
+            if (trackCorrect) {
+                liveCorr = graphData(correctAcc, correctOff, accShape);
+                scratchCorr = graphDataMTL(gMlpScratchCorrect, accShape);
+                if (liveCorr == nil || scratchCorr == nil) return false;
+            }
+            feedsA = [NSMutableDictionary dictionaryWithCapacity:12];
+            feedsB = [NSMutableDictionary dictionaryWithCapacity:12];
+            resultsA = [NSMutableDictionary dictionaryWithCapacity:10];
+            resultsB = [NSMutableDictionary dictionaryWithCapacity:10];
+            for (int i = 0; i < 4; i++) {
+                feedsA[cached[2 + i * 2]] = liveW[i];
+                feedsA[cached[3 + i * 2]] = liveB[i];
+                feedsB[cached[2 + i * 2]] = scratchW[i];
+                feedsB[cached[3 + i * 2]] = scratchB[i];
+                resultsA[cached[wBase + i * 2]] = scratchW[i];
+                resultsA[cached[wBase + i * 2 + 1]] = scratchB[i];
+                resultsB[cached[wBase + i * 2]] = liveW[i];
+                resultsB[cached[wBase + i * 2 + 1]] = liveB[i];
+            }
+            if (trackCorrect) {
+                feedsA[cached[11]] = liveAcc;
+                feedsB[cached[11]] = liveAcc;
+                feedsA[cached[12]] = liveCorr;
+                feedsB[cached[12]] = liveCorr;
+                resultsA[cached[wBase + 8]] = scratchAcc;
+                resultsB[cached[wBase + 8]] = scratchAcc;
+                resultsA[cached[wBase + 9]] = scratchCorr;
+                resultsB[cached[wBase + 9]] = scratchCorr;
+            } else {
+                feedsA[cached[11]] = liveAcc;
+                feedsB[cached[11]] = scratchAcc;
+                resultsA[cached[wBase + 8]] = scratchAcc;
+                resultsB[cached[wBase + 8]] = liveAcc;
+            }
+            for (int i = 0; i < 4; i++) {
+                gMlp3LiveW[i] = w[i];
+                gMlp3LiveB[i] = b[i];
+                gMlp3LiveWOff[i] = wOff[i];
+                gMlp3LiveBOff[i] = bOff[i];
+                gMlp3LiveWBytes[i] = wBytes[i];
+                gMlp3LiveBBytes[i] = bBytes[i];
+            }
+            gMlpLiveAcc = lossAcc;
+            gMlpLiveAccOff = lossOff;
+        }
+
+        NSMutableArray<MPSGraphTensorData *> *batchX =
+            [NSMutableArray arrayWithCapacity:steps];
+        NSMutableArray<MPSGraphTensorData *> *batchY =
+            [NSMutableArray arrayWithCapacity:steps];
+        if (!prefetchBatchFeeds(x, xOff, xStride, xBytes, xDesc, xShape, labels, labOff,
+                                labStride, labBytes, yDesc, yShape, steps, batchX, batchY)) {
+            return false;
+        }
+
+        for (uint32_t i = 0; i < steps; i++) {
+            @synchronized(gQueue) {
+                const bool fromLive = gMlp3Side == 0;
+                NSMutableDictionary *feeds = fromLive ? feedsA : feedsB;
+                NSMutableDictionary *results = fromLive ? resultsA : resultsB;
+                if (!encodeEpochBatch(
+                        exec, graph, feeds, results, cached[1], cached[10],
+                        batchX[i], batchY[i],
+                        fromLive ? &inputsA : &inputsB,
+                        fromLive ? &execResultsA : &execResultsB)) {
+                    return false;
+                }
+                if (trackCorrect) {
+                    __unsafe_unretained id<MTLBuffer> accSrcs[] = {
+                        gMlpScratchAcc, gMlpScratchCorrect
+                    };
+                    JaiGpuBuffer *accDsts[] = {lossAcc, correctAcc};
+                    size_t accOffs[] = {lossOff, correctOff};
+                    size_t accSizes[] = {accBytes, accBytes};
+                    if (!blitMany(accSrcs, accDsts, accOffs, accSizes, 2)) return false;
+                } else {
+                    gMlpAccSide = fromLive ? 1 : 0;
+                }
+                gMlp3Side = fromLive ? 1 : 0;
+            }
+            if ((i + 1) % flushEvery == 0 || i + 1 == steps) {
+                id<MTLCommandBuffer> oldest = nil;
+                @synchronized(gQueue) {
+                    if (!flushAsyncLocked(&oldest)) return false;
+                }
+                if (oldest != nil) {
+                    [oldest waitUntilCompleted];
+                    if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
+                }
+            }
+        }
+        @synchronized(gQueue) {
+            if (!trackCorrect && !commitMlp3WeightsLocked()) return false;
+            if (!commitMlpAccLocked()) return false;
+            id<MTLCommandBuffer> oldest = nil;
+            if (!flushAsyncLocked(&oldest)) return false;
+            (void)oldest;
+        }
+    }
+    if (processed != NULL) *processed = steps * batch;
+    return true;
+}
+
+bool jaiGpuLabelsValid(JaiGpuBuffer *labels, size_t offset, uint32_t count,
+                       uint32_t classes) {
+    if (count == 0) return true;
+    if (labels == NULL || labels->buffer == NULL) return false;
+    if ((offset % sizeof(float)) != 0) return false;
+    const size_t bytes = (size_t)count * sizeof(float);
+    if (offset + bytes > labels->bytes) return false;
+    if (!jaiGpuSynchronize()) return false;
+    const float *values =
+        (const float *)((__bridge id<MTLBuffer>)labels->buffer).contents +
+        offset / sizeof(float);
+    for (uint32_t i = 0; i < count; i++) {
+        const float value = values[i];
+        const int index = (int)value;
+        if (value != (float)index || index < 0 || (uint32_t)index >= classes) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Neumaier variant of Kahan summation — also captures the low bits dropped

@@ -3,7 +3,9 @@
 #   make            release build -> ./jaithon
 #   make debug      -O0 -g, assertions, GC stress available
 #   make test       build + run the full test suite
-#   make bench      build + run benchmarks (LEVEL=easy|medium|hard, default hard)
+#   make bench              language benches vs python3/c++/java
+#   make bench jaitensor     GPU/ML benches vs PyTorch MPS
+#                           (LEVEL=easy|medium|hard, default hard)
 #   make fixpoint-check  compile each source twice and compare the images
 #   make install    install to $(PREFIX)
 #   make clean      remove build artifacts
@@ -72,7 +74,9 @@ LIBS     += -lz
 
 ifeq ($(UNAME_S),Darwin)
   LIBS   += -framework Cocoa -framework Metal -framework QuartzCore \
-            -framework MetalKit -framework Foundation
+            -framework MetalKit -framework Foundation \
+            -framework MetalPerformanceShaders \
+            -framework MetalPerformanceShadersGraph
 endif
 
 # --- readline probe ---------------------------------------------------------
@@ -325,7 +329,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench install uninstall \
+.PHONY: all debug release test verify-test bench jaitensor install uninstall \
         clean distclean fmt fmt-check check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -643,7 +647,10 @@ jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arm64
 
 bench: $(TARGET)
-	@LEVEL="$(LEVEL)" ./scripts/run_bench.sh
+	@LEVEL="$(LEVEL)" ./scripts/run_bench.sh $(filter jaitensor,$(MAKECMDGOALS))
+
+jaitensor:
+	@:
 #: Regenerate boot/seed.c from the images the front end currently needs.
 #:
 #: Runs the compiler once to populate __jaicache__, embeds what it finds, then
@@ -764,4 +771,4 @@ distclean: clean
 	@echo "  CLEAN   removed every build tree, binary and generated artefact"
 
 help:
-	@echo "targets: all debug release test bench package-check fixpoint-check reseed check fmt install clean"
+	@echo "targets: all debug release test bench [jaitensor] package-check fixpoint-check reseed check fmt install clean"

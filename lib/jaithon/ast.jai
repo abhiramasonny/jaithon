@@ -192,7 +192,8 @@ pub enum DeclKind { Let, Var, Const }
 pub enum CompKind { List, Dict, Set, Generator }
 
 #: The shape of a type expression, mirroring the C `AstTypeKind`.
-pub enum TypeKind { Name, Generic, Optional, Union, Fn, Tuple, Infer }
+#: `Const` is an integer literal in type position (`Tensor[float, 2, 3]`).
+pub enum TypeKind { Name, Generic, Optional, Union, Fn, Tuple, Infer, Const }
 
 # ------------------------------------------------------------------
 # Name tables
@@ -551,6 +552,7 @@ pub fn is_pattern(kind: NodeKind) -> bool {
 pub let _ELEMENT_TAG: dict[str, str] = {
     "nodes": "node",
     "strs": "str",
+    "str[]": "str",
     "types": "type",
     "ops": "op",
     "param[]": "param",
@@ -664,6 +666,7 @@ fn _build_schemas() -> list[list[tuple[str, str]]] {
             ("isExprBody", "bool"),
             ("isGenerator", "bool"),
             ("isAsync", "bool"),
+            ("decorators", "str[]"),
         ]
     )
     define(
@@ -953,7 +956,7 @@ fn _char_index(source: str, offset: int) -> int {
 #: TypeExpr.optional(TypeExpr.named("str")).to_source()            # "str?"
 #: ```
 pub class TypeExpr {
-    #: Which of the seven shapes this type has.
+    #: Which kind of type expression this is.
     pub let kind: TypeKind
     #: The identifier of a `Name` or `Generic` type, null otherwise.
     pub let name: str?
@@ -1038,6 +1041,7 @@ pub class TypeExpr {
             }
             TypeKind.Tuple => { return "(" + ", ".join(self._arg_sources()) + ")" }
             TypeKind.Infer => { return "" }
+            TypeKind.Const => { return self.name ?? "0" }
         }
     }
 

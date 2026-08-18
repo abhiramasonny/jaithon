@@ -210,3 +210,28 @@ fn test_flush_commits_async_work_before_synchronize() -> void {
     gpu.synchronize()
     assert_eq(values.download(), [2.0, 3.0, 4.0])
 }
+
+fn test_fill_uniform_stays_in_range_on_the_device() -> void {
+    if not gpu.is_available() { return }
+    let values = gpu.Buffer(N)
+    defer { values.free() }
+    values.fill_uniform(-1.0, 1.0, 42)
+    gpu.synchronize()
+    let got = values.download()
+    assert_len(got, N)
+    var saw_low = false
+    var saw_high = false
+    for i in [0, 1, 2, 3, 1000, 65535, N - 1] {
+        assert_true(got[i] >= -1.0 and got[i] < 1.0, f"uniform at {i}")
+        if got[i] < 0.0 { saw_low = true }
+        if got[i] > 0.0 { saw_high = true }
+    }
+    assert_true(saw_low and saw_high)
+    let again = gpu.Buffer(N)
+    defer { again.free() }
+    again.fill_uniform(-1.0, 1.0, 42)
+    gpu.synchronize()
+    let copied = again.download()
+    assert_true(close(copied[0], got[0], 1e-6))
+    assert_true(close(copied[N - 1], got[N - 1], 1e-6))
+}

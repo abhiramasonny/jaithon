@@ -117,9 +117,26 @@ fn load(path: str) -> str {
 # comphressons and lazy iterators.
 let squares = [x ** 2 for x in 0..10 if x % 2 == 0]
 let first_ten = iter(source).map(parse).filter(is_valid).take(10).collect()
+
+# ML Training
+import jaitensor as jt
+
+@trace
+fn logits(x: Tensor[float, 32, 10]) -> Tensor[float, 32, 10] {
+    return x
+}
+
+let model = jt.Sequential([
+    jt.Conv2d(16, 3, padding: 1),
+    jt.Flatten(),
+    jt.Dense(10, activation: jt.Activation.Softmax),
+])
+model.compile(jt.Adam(), mixed_precision: true)
+model.fit(data, epochs: 5, batch_size: 512, shuffle: true)
 ```
 
-more idepth file -> [`LANGUAGE.md`](LANGUAGE.md).
+more idepth file -> [`LANGUAGE.md`](LANGUAGE.md). The ML type and runtime
+contracts are in [`spec/ml.md`](ml.md).
 
 Also you can checkout the examples directory.
 
@@ -134,11 +151,12 @@ from an installed `share/jaithon/packages` directory.
 `jaiplot` is a library for Matplotlib-style figures and axes with file and window
 backends.
 
-`jaitensor` provides Metal-resident float32 tensors and a Keras-style API.
-It includes common tensor math, format-independent datasets, dense models,
-ReLU/sigmoid/tanh/softmax activations, momentum SGD, Adam, validation,
-prediction, and JSON weight files. The examples cover
-[`MNIST`](examples/mnist_gpu.jai) and a
+`jaitensor` is GPU-first training: Metal-resident tensors, autograd, and a
+Keras-style `Sequential` API. Dense, conv, norm, and attention layers, mixed
+precision compute, a GPU `DataLoader`, SGD and Adam, validation, prediction,
+and JSON weight files. The examples cover
+[`MNIST`](examples/mnist_gpu.jai),
+[`Fashion-MNIST`](examples/fashion_mnist.jai), and a
 [`nonlinear spiral classifier`](examples/spiral_classifier.jai).
 
 ## Errors
@@ -180,7 +198,8 @@ These are what the codes mean:
 source --> lexer --> parser --> resolver --> type checker --> codegen --> VM
             |         │           │              │               │         │
           tokens     AST      symbols +      types +          bytecode   values
-                               slots          casts           + caches   + GC
+                               slots          shapes          + JIT      + GC
+                                              + casts         + @trace   + GPU
 ```
 
 ## Contributing

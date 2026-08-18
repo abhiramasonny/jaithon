@@ -21,7 +21,7 @@ from jaithon.compile.check.render import render
 from jaithon.compile.check.ty import Type, TypeDecl
 from jaithon.compile.check.union import optional_of, union_of
 from jaithon.compile.check.universe import Universe, dict_of, fn_of, generic_param
-from jaithon.compile.check.universe import list_of, named, set_of, tuple_of
+from jaithon.compile.check.universe import instantiate, list_of, named, set_of, tuple_of
 
 let FREE: (bool, bool) = (true, false)
 let GUARDED: (bool, bool) = (true, true)
@@ -432,4 +432,16 @@ fn test_is_assignable_drops_the_guard_and_is_subtype_rejects_it() -> void {
     assert_true(is_subtype(u, u.t_int, generic_param(u, "T")))
     assert_false(is_assignable(u, animal, dog))
     assert_false(is_subtype(u, animal, dog))
+}
+
+fn test_shaped_tensor_types_reject_conflicting_dims() -> void {
+    let u = Universe()
+    let decl = _decl("Tensor")
+    let bare = named(u, TyKind.Class, "Tensor", decl)
+    let two_by_three = instantiate(u, bare, [u.t_float, u.intern(TyKind.Int, "2"), u.intern(TyKind.Int, "3")])
+    let two_by_four = instantiate(u, bare, [u.t_float, u.intern(TyKind.Int, "2"), u.intern(TyKind.Int, "4")])
+    assert_eq(assignable(u, two_by_three, two_by_three), FREE)
+    assert_eq(assignable(u, two_by_three, bare), FREE)
+    assert_eq(assignable(u, bare, two_by_three), FREE)
+    assert_eq(assignable(u, two_by_three, two_by_four), REJECTED)
 }

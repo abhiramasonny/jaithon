@@ -13,7 +13,34 @@ Each benchmark lives in its own subdirectory, named for the benchmark:
     tests/bench/loop_sum/LoopSum.java        java column     (optional, CamelCase name)
 
 Run with `make bench`, or `RUNS=3 scripts/run_bench.sh` for a quicker pass.
-Columns whose toolchain is missing disappear; benchmarks without a port show
+GPU/ML training benches live under `tests/bench/jaitensor/` and are **not**
+part of that table — run them with `make bench jaitensor`. The jaitensor
+suite compares jaitensor against a 1:1 PyTorch MPS copy on fifteen MLP
+workloads plus per-shape GEMM and attention microbenches. Each program warms
+its GPU graph, records only the synchronized device-work interval, and emits
+the exact work it executed. The table reports the **median of 5** and the
+coefficient of variation (override with `RUNS=`), rather than selecting the
+fastest process. MLP GFLOPS is `6ND` over full batches actually processed;
+GEMM is `2MNK` per multiply and attention counts QK plus PV. The `route` column
+shows Jaithon's selected GEMM family.
+
+Every timed run also checks values derived from its GPU output. GEMM checks
+finite, bounded, nonzero result samples; attention additionally checks the
+softmax convex bound; MLP requires finite positive loss that does not diverge.
+`result: ok` therefore describes computed values, not matching metadata.
+
+The PyTorch GEMM peer intentionally avoids `out=` inside autocast: PyTorch
+implements `out=` matmul as float32, bypassing autocast. It also disables the
+cross-call autocast cache because Jaithon's float32 buffers are recast on each
+dispatch (as changing activations and weights are during training). Both peers
+therefore expose the same float32-storage, float16-compute, float32-result
+contract.
+Set `JAITENSOR_PYTHON` to a PyTorch install with MPS (defaults to
+`/tmp/jaitensor-bench/bin/python` when present). Use
+`LEVEL=easy|medium|hard` to shorten epochs/repeats.
+`tests/bench/jaitensor/gpu_util.py` is a separate ioreg sampler for
+utilization JSON — not part of `make bench jaitensor`. Columns whose
+toolchain is missing disappear; benchmarks without a port show
 `—`. C++ and Java are compiled once outside the timed runs, because the table is
 about how fast the program runs and not how fast it builds.
 

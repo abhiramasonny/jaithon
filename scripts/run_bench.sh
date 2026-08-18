@@ -6,6 +6,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-build}"
 JAITHON="$ROOT/jaithon"
+SUITE="${1:-}"
+
+if [[ -n "$SUITE" && "$SUITE" != "jaitensor" ]]; then
+    echo "error: unknown bench suite '$SUITE' (expected jaitensor)" >&2
+    exit 2
+fi
+
 RUNS=${RUNS:-5}
 
 if [[ ! -x "$JAITHON" ]]; then
@@ -42,7 +49,7 @@ start = time.perf_counter()
 done = subprocess.run(cmd, capture_output=True)
 elapsed = (time.perf_counter() - start) * 1000
 with open(os.environ["BENCH_CAP"], "wb") as f:
-    f.write(done.stdout + done.stderr)
+    f.write(done.stdout)
 sys.stdout.write(f"{elapsed:.1f}\n")
 PY
 )
@@ -58,8 +65,11 @@ case "$LEVEL" in
     *) echo "error: LEVEL must be easy, medium or hard, got '$LEVEL'" >&2; exit 2 ;;
 esac
 export BENCH_LEVEL="$LEVEL"
+export JAITHON_PATH="${JAITHON_PATH:-$ROOT/lib}"
 
-printf '%s%s build, %s, best of %s%s\n' "$DIM" "$BUILD_KIND" "$LEVEL" "$RUNS" "$RESET"
+if [[ "$SUITE" != "jaitensor" ]]; then
+    printf '%s%s build, %s, best of %s%s\n' "$DIM" "$BUILD_KIND" "$LEVEL" "$RUNS" "$RESET"
+fi
 
 HAVE_CXX=0; command -v c++ >/dev/null 2>&1 && HAVE_CXX=1
 HAVE_JAVA=0; command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1 && HAVE_JAVA=1
@@ -81,16 +91,58 @@ build_all() {
         (( ${#jsrcs[@]} )) && javac -d "$BENCH_BUILD/classes" "${jsrcs[@]}" 2>/dev/null
     fi
 }
+
+jaitensor_python() {
+    if [[ -n "${JAITENSOR_PYTHON:-}" ]]; then
+        printf '%s' "$JAITENSOR_PYTHON"
+        return
+    fi
+    if [[ -x /tmp/jaitensor-bench/bin/python ]]; then
+        printf '%s' /tmp/jaitensor-bench/bin/python
+        return
+    fi
+    printf '%s' python3
+}
+
+print_header() {
+    printf '%s%-22s %10s %10s %10s %10s %10s   %s%s\n' "$BOLD" "benchmark" "jaithon" "python3" "c++" "java" "speedup" "result" "$RESET"
+    printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
+}
+
+print_totals() {
+    printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
+    if [[ $total_p -gt 0 ]]; then
+        printf '%stotal%s %*s %8sms %9sms %10s %10s %10s\n' "$BOLD" "$RESET" 16 "" "$total_j" "$total_p" "" "" \
+            "$(python3 -c "print(f'{$total_p/max($total_j,1):.2f}x')")"
+    fi
+}
+
+total_j=0; total_p=0
+
+if [[ "$SUITE" == "jaitensor" ]]; then
+    py="$(jaitensor_python)"
+    if ! "$py" -c "import torch" >/dev/null 2>&1; then
+        py=""
+    fi
+    exec python3 "$ROOT/tests/bench/jaitensor/run_suite.py" \
+        --root "$ROOT" \
+        --jaithon "$JAITHON" \
+        --python "$py" \
+        --level "$LEVEL" \
+        --runs "$RUNS" \
+        --build-kind "$BUILD_KIND"
+fi
+
 printf '%sbuilding ports...%s\r' "$DIM" "$RESET"
 build_all
 printf '                     \r'
 
-printf '%s%-22s %10s %10s %10s %10s %10s   %s%s\n' "$BOLD" "benchmark" "jaithon" "python3" "c++" "java" "speedup" "result" "$RESET"
-printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
+print_header
 
 shopt -s nullglob
-total_j=0; total_p=0
 for src in "$ROOT"/tests/bench/*/*.jai; do
+    dir="$(basename "$(dirname "$src")")"
+    [[ "$dir" == "jaitensor" ]] && continue
     name="$(basename "$src" .jai)"
     py="${src%.jai}.py"
 
@@ -110,7 +162,6 @@ for src in "$ROOT"/tests/bench/*/*.jai; do
     fi
 
     jms_java="—"
-    # Java classes are CamelCase: loop_sum -> LoopSum.
     cls="$(python3 -c "import sys; print(''.join(w.capitalize() for w in sys.argv[1].split('_')))" "$name")"
     jsrc="$ROOT/tests/bench/$name/$cls.java"
     if [[ $HAVE_JAVA -eq 1 && -f "$jsrc" && -f "$BENCH_BUILD/classes/$cls.class" ]]; then
@@ -136,8 +187,4 @@ for src in "$ROOT"/tests/bench/*/*.jai; do
     fi
 done
 
-printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────"
-if [[ $total_p -gt 0 ]]; then
-    printf '%stotal%s %*s %8sms %9sms %10s %10s %10s\n' "$BOLD" "$RESET" 16 "" "$total_j" "$total_p" "" "" \
-        "$(python3 -c "print(f'{$total_p/max($total_j,1):.2f}x')")"
-fi
+print_totals

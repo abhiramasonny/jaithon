@@ -19,6 +19,8 @@ pub const FN_GENERATOR: int = 16
 pub const FN_ASYNC: int = 32
 pub const FN_GETTER: int = 64
 pub const FN_SETTER: int = 128
+pub const FN_TRACE: int = 512
+pub const FN_GPU_KERNEL: int = 1024
 
 #: Largest constant index a `u24` operand can hold.
 pub const MAX_CONSTANTS: int = 16777216
@@ -1613,6 +1615,17 @@ pub class Emitter {
         if node.flag("isStatic") { flags = flags | FN_STATIC }
         if node.flag("isGenerator") { flags = flags | FN_GENERATOR }
         if node.flag("isAsync") { flags = flags | FN_ASYNC }
+        if node.has("decorators") {
+            let decorators = node.get("decorators")
+            if decorators is not null {
+                for decorator in decorators {
+                    if decorator == "trace" { flags = flags | FN_TRACE }
+                    if decorator == "gpu_kernel" or decorator == "mps_graph" {
+                        flags = flags | FN_GPU_KERNEL
+                    }
+                }
+            }
+        }
 
         var names: list[str] = []
         var defaults: list[Node] = []

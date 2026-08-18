@@ -4,11 +4,12 @@ import std.json as json
 from std.io import read_file, write_file
 from std.random import Random
 from std.time import Instant
-from .data import Dataset
+from .data import DataLoader, Dataset
 from .layers import Layer
-from .ops import add_correct_into, argmax, softmax, warmup_kernels as warmup_ops
+from .ops import add_correct_into, argmax, copy_into, softmax, warmup_kernels as warmup_ops
 from .optimizers import Optimizer, SGD, reset_state, prepare_state, warmup_kernels as warmup_opt
-from .losses import Loss, SparseCategoricalCrossentropy, warmup_kernels as warmup_loss
+from .losses import Loss, SparseCategoricalCrossentropy, sparse_ce_with_delta, warmup_kernels as warmup_loss
+from .plan import ExecutionPlan
 from .plots import save_history_plot
 from .tensor import Tensor
 
@@ -34,7 +35,8 @@ pub class History {
     pub let loss: list[float]
     #: Percentage accuracy after each training epoch.
     pub let accuracy: list[float]
-    #: Wall-clock training duration of each epoch.
+    #: Wall-clock training duration of each epoch. Fully asynchronous fused
+    #: fits report the synchronized total amortized across their epochs.
     pub let seconds: list[float]
     #: Validation loss after each epoch, empty when no validation data was given.
     pub let val_loss: list[float]
@@ -88,6 +90,11 @@ pub class Sequential {
     var input_units: int
     var freed: bool
     var cached_parameters: list[Tensor]?
+    var fused_sgd: bool
+    var fused_mlp_step: bool
+    var plan_value: ExecutionPlan?
+    var mixed_precision: bool
+    var shuffle_batches: bool
 
     #: Create an uncompiled model from a non-empty layer list.
     pub fn init(self, layers: list[Layer]) {
@@ -98,6 +105,11 @@ pub class Sequential {
         self.input_units = 0
         self.freed = false
         self.cached_parameters = null
+        self.fused_sgd = false
+        self.fused_mlp_step = false
+        self.plan_value = null
+        self.mixed_precision = false
+        self.shuffle_batches = false
     }
 
     #: Configure the optimizer and loss used by `fit`/`evaluate`.
@@ -110,14 +122,30 @@ pub class Sequential {
     pub fn compile(
         self,
         optimizer: Optimizer = SGD(),
-        loss: Loss = SparseCategoricalCrossentropy()
+        loss: Loss = SparseCategoricalCrossentropy(),
+        input_units: int = 0,
+        batch_size: int = 0,
+        mixed_precision: bool = false
     ) -> void {
         self._check_live()
         if not gpu.is_available() { throw RuntimeError("jaitensor needs a GPU") }
         if self.input_units != 0 { reset_state(self._parameters()) }
         self.optimizer_value = optimizer
         self.loss_value = loss
+        self.mixed_precision = mixed_precision
+        gpu.set_mixed_precision(mixed_precision)
+        if input_units > 0 {
+            self._build(input_units)
+            if batch_size > 0 {
+                self._refresh_execution_plan(batch_size)
+            } else {
+                self.plan_value = null
+            }
+        }
     }
+
+    #: Return the shape-specialized execution plan, if `compile` traced one.
+    pub fn execution_plan(self) -> ExecutionPlan? { return self.plan_value }
 
     #: Train for `epochs`, returning loss and accuracy histories.
     pub fn fit(
@@ -128,35 +156,41 @@ pub class Sequential {
         verbose: bool = true,
         validation_data: Dataset? = null,
         test_data: Dataset? = null,
-        plot_path: str? = "data/jaitensor-training.svg"
+        plot_path: str? = "data/jaitensor-training.svg",
+        shuffle: bool = false
     ) -> History {
+        self.shuffle_batches = shuffle
         self._prepare(dataset, epochs, batch_size)
-        self._ensure_grads()
+        if not self.fused_sgd { self._ensure_grads() }
         let history = History()
 
-        for epoch in 1..=epochs {
-            let started = Instant.now()
-            let metrics = self._run_epoch(dataset, batch_size, true)
-            let seconds = started.elapsed().to_seconds()
-            history.loss.push(metrics.loss)
-            history.accuracy.push(metrics.accuracy)
-            history.seconds.push(seconds)
-            let validation = if validation_data is null {
-                null
-            } else {
-                self.evaluate(validation_data, batch_size: batch_size)
-            }
-            if validation is not null {
-                history.val_loss.push(validation.loss)
-                history.val_accuracy.push(validation.accuracy)
-            }
-            if verbose {
-                let suffix = if validation is null {
-                    ""
+        if self.fused_sgd and not verbose and validation_data is null {
+            self._fit_fused_async(dataset, epochs, batch_size, history)
+        } else {
+            for epoch in 1..=epochs {
+                let started = Instant.now()
+                let metrics = self._run_epoch(dataset, batch_size, true)
+                let seconds = started.elapsed().to_seconds()
+                history.loss.push(metrics.loss)
+                history.accuracy.push(metrics.accuracy)
+                history.seconds.push(seconds)
+                let validation = if validation_data is null {
+                    null
                 } else {
-                    f", val_loss={validation.loss:.4f}, " + f"val_accuracy={validation.accuracy:.2f}%"
+                    self.evaluate(validation_data, batch_size: batch_size)
                 }
-                print(f"epoch {epoch}/{epochs}: {metrics}{suffix} ({seconds:.3f}s)")
+                if validation is not null {
+                    history.val_loss.push(validation.loss)
+                    history.val_accuracy.push(validation.accuracy)
+                }
+                if verbose {
+                    let suffix = if validation is null {
+                        ""
+                    } else {
+                        f", val_loss={validation.loss:.4f}, " + f"val_accuracy={validation.accuracy:.2f}%"
+                    }
+                    print(f"epoch {epoch}/{epochs}: {metrics}{suffix} ({seconds:.3f}s)")
+                }
             }
         }
         if test_data is not null {
@@ -204,7 +238,7 @@ pub class Sequential {
             )
         }
         self._build(features.shape[1])
-        let raw = self._forward(features)
+        let raw = self._forward(features, training: false)
         let intermediates = raw.discard_graph()
         gpu.synchronize()
         for tensor in intermediates { tensor.free() }
@@ -319,7 +353,7 @@ pub class Sequential {
         if self.optimizer_value is null or loss is null {
             throw RuntimeError("call model.compile() before fit or evaluate")
         }
-        self._build(dataset.feature_count)
+        self._build_from_dataset(dataset)
         let last = self.layers[self.layers.len() - 1]
         if loss.is_from_logits() and last.wants_softmax_output() {
             throw ValueError("from_logits needs a final layer that does not apply softmax itself")
@@ -333,19 +367,49 @@ pub class Sequential {
             }
         }
         let classes = last.output_width()
-        for label in dataset.labels.download() {
-            let value = int(label)
-            if label != float(value) or value < 0 or value >= classes {
-                throw ValueError(f"label {label} is outside the model's {classes} classes")
-            }
+        if not gpu.labels_valid(dataset.labels.buffer(), dataset.samples, classes) {
+            throw ValueError(f"a label is outside the model's {classes} classes")
         }
-        warmup_ops()
-        warmup_loss()
-        warmup_opt()
+        self.fused_sgd = self._can_fuse_sgd()
+        self.fused_mlp_step = self._can_fuse_mlp_step()
+        self._refresh_execution_plan(batch_size)
+        if not self.fused_sgd and not self.fused_mlp_step {
+            warmup_ops()
+            warmup_loss()
+            warmup_opt()
+        }
         let optimizer = self.optimizer_value
-        if optimizer is not null {
+        if optimizer is not null and not self.fused_sgd {
             prepare_state(self._parameters(), optimizer.settings())
         }
+    }
+
+    fn _build_from_dataset(self, dataset: Dataset) -> void {
+        let image = dataset.image_shape
+        if image is not null {
+            self._build_shape(image)
+            return
+        }
+        self._build(dataset.feature_count)
+    }
+
+    fn _build_shape(self, shape: list[int]) -> void {
+        if shape.len() == 0 { throw ValueError("input shape must not be empty") }
+        var n = 1
+        for dimension in shape { n *= dimension }
+        if self.input_units != 0 {
+            if self.input_units != n {
+                throw ValueError(f"model expects {self.input_units} features, got {n}")
+            }
+            return
+        }
+        let rng = Random.with_seed(7)
+        var current = shape
+        for layer in self.layers {
+            layer.build_from_shape(current, rng)
+            current = layer.output_shape()
+        }
+        self.input_units = n
     }
 
     fn _build(self, inputs: int) -> void {
@@ -365,9 +429,11 @@ pub class Sequential {
         self.input_units = inputs
     }
 
-    fn _forward(self, x: Tensor) -> Tensor {
+    fn _forward(self, x: Tensor, training: bool = true) -> Tensor {
         var current = x
-        for layer in self.layers { current = layer.forward(current) }
+        for layer in self.layers {
+            current = if training { layer.forward(current) } else { layer.eval_forward(current) }
+        }
         return current
     }
 
@@ -375,20 +441,40 @@ pub class Sequential {
         let loss_fn = self.loss_value
         let optimizer = self.optimizer_value
         if loss_fn is null or optimizer is null { throw RuntimeError("model is not compiled") }
+        if training and self.fused_sgd {
+            return self._run_fused_epoch(dataset, batch_size, optimizer.settings()[0])
+        }
+        if training and self.fused_mlp_step {
+            return self._run_fused_bwd_epoch(dataset, batch_size)
+        }
+        if self._static_step_active(batch_size) {
+            return self._run_static_epoch(dataset, batch_size, training)
+        }
 
         let total_loss = Tensor.zeros([1])
         let total_correct = Tensor.zeros([1])
         defer { total_loss.free() }
         defer { total_correct.free() }
-        let flush_every = if self.parameter_count() >= 1000000 { 2 } else { 1 }
+        let flush_every = 8
         var start = 0
         var batches = 0
+        let loader = if self.shuffle_batches { DataLoader(dataset, batch_size, shuffle: true) } else { null }
         while start < dataset.samples {
-            let count = min(batch_size, dataset.samples - start)
-            let batch_features = self._slice_features(dataset, start, count)
-            let batch_labels = self._slice_labels(dataset, start, count)
+            var count = min(batch_size, dataset.samples - start)
+            var batch_features: Tensor
+            var batch_labels: Tensor
+            if loader is not null {
+                if not loader.has_next() { break }
+                let (features, labels) = loader.next_batch()
+                batch_features = features
+                batch_labels = labels
+                count = batch_features.shape[0]
+            } else {
+                batch_features = self._slice_features(dataset, start, count)
+                batch_labels = self._slice_labels(dataset, start, count)
+            }
 
-            let prediction = self._forward(batch_features)
+            let prediction = self._forward(batch_features, training: training)
             let loss = loss_fn.forward(prediction, batch_labels, total_loss, count)
             let intermediates = if training {
                 let graph = loss.backward()
@@ -415,8 +501,396 @@ pub class Sequential {
         )
     }
 
+    fn _flush_every(self) -> int {
+        let widths = self._fused_hidden_widths()
+        var widest = 0
+        for width in widths {
+            if width > widest { widest = width }
+        }
+        if widest >= 4096 { return 1 }
+        if widest >= 1024 { return 2 }
+        return 4
+    }
+
+    fn _fused_relu_layers(self) -> int {
+        if self.layers.len() < 2 { return 0 }
+        if not self.layers[self.layers.len() - 1].is_classification_head() { return 0 }
+        let hidden = self.layers.len() - 1
+        if hidden != 1 and hidden != 3 { return 0 }
+        for index in 0..hidden {
+            if not self.layers[index].is_relu_dense() { return 0 }
+        }
+        return hidden
+    }
+
+    fn _fused_hidden_widths(self) -> list[int] {
+        let hidden = self._fused_relu_layers()
+        if hidden == 0 { return [] }
+        var widths: list[int] = []
+        for index in 0..hidden {
+            let width = self.layers[index].output_width()
+            if width < 256 { return [] }
+            widths.push(width)
+        }
+        return widths
+    }
+
+    fn _fused_uniform_hidden(self) -> int {
+        let widths = self._fused_hidden_widths()
+        if widths.len() == 0 { return 0 }
+        let width = widths[0]
+        for index in 1..widths.len() {
+            if widths[index] != width { return 0 }
+        }
+        return width
+    }
+
+    fn _can_fuse_sgd(self) -> bool {
+        let hidden_layers = self._fused_relu_layers()
+        if hidden_layers != 1 and hidden_layers != 3 { return false }
+        if self._fused_hidden_widths().len() != hidden_layers { return false }
+        let loss = self.loss_value
+        if loss is null or not loss.is_sparse_categorical() { return false }
+        let optimizer = self.optimizer_value
+        if optimizer is null or optimizer.kind() != 0 { return false }
+        let settings = optimizer.settings()
+        return settings.len() >= 2 and settings[1] == 0.0
+    }
+
+    fn _can_fuse_mlp_step(self) -> bool {
+        if self._can_fuse_sgd() { return false }
+        let hidden_layers = self._fused_relu_layers()
+        if hidden_layers != 1 and hidden_layers != 3 { return false }
+        if self._fused_hidden_widths().len() != hidden_layers { return false }
+        let loss = self.loss_value
+        if loss is null or not loss.is_sparse_categorical() { return false }
+        let optimizer = self.optimizer_value
+        if optimizer is null { return false }
+        let kind = optimizer.kind()
+        if kind != 0 and kind != 1 { return false }
+        return true
+    }
+
+    fn _fit_fused_async(
+        self,
+        dataset: Dataset,
+        epochs: int,
+        batch_size: int,
+        history: History
+    ) -> void {
+        let optimizer = self.optimizer_value
+        if optimizer is null { throw RuntimeError("model is not compiled") }
+        let learning_rate = optimizer.settings()[0]
+        let total_loss = Tensor.zeros([1])
+        let epoch_loss = Tensor.zeros([epochs])
+        defer { total_loss.free() }
+        defer { epoch_loss.free() }
+        var processed = 0
+        let started = Instant.now()
+        for epoch in 1..=epochs {
+            processed = self._fused_train(
+                dataset,
+                batch_size,
+                learning_rate,
+                total_loss,
+                flush_each_epoch: false
+            )
+            let loss_slot = epoch_loss.view(epoch - 1, [1])
+            copy_into(total_loss, loss_slot)
+            loss_slot.free()
+            total_loss.zero_()
+        }
+        let losses = epoch_loss.download()
+        let seconds_per_epoch = started.elapsed().to_seconds() / float(epochs)
+        for index in 0..epochs {
+            history.loss.push(losses[index] / float(processed))
+            history.accuracy.push(0.0)
+            history.seconds.push(seconds_per_epoch)
+        }
+    }
+
+    fn _run_fused_epoch(self, dataset: Dataset, batch_size: int, learning_rate: float) -> Metrics {
+        let total_loss = Tensor.zeros([1])
+        let total_correct = Tensor.zeros([1])
+        defer { total_loss.free() }
+        defer { total_correct.free() }
+        let processed = self._fused_train(
+            dataset,
+            batch_size,
+            learning_rate,
+            total_loss,
+            total_correct
+        )
+        let loss_values = total_loss.download()
+        let correct_values = total_correct.download()
+        return Metrics(
+            loss_values[0] / float(processed),
+            100.0 * correct_values[0] / float(processed)
+        )
+    }
+
+    fn _fused_train(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        learning_rate: float,
+        total_loss: Tensor,
+        total_correct: Tensor? = null,
+        flush_each_epoch: bool = false
+    ) -> int {
+        let hidden_layers = self._fused_relu_layers()
+        let head = self.layers[self.layers.len() - 1]
+        let inputs = self.input_units
+        let widths = self._fused_hidden_widths()
+        let classes = head.output_width()
+        let parameters = self._parameters()
+        let expected = (hidden_layers + 1) * 2
+        if parameters.len() != expected {
+            throw RuntimeError(f"fused SGD needs {hidden_layers + 1} dense layers with weights and bias")
+        }
+        if widths.len() != hidden_layers {
+            throw RuntimeError("fused SGD missing hidden widths")
+        }
+        let flush_every = if flush_each_epoch { 0x7fffffff } else { self._flush_every() }
+        let correct = if total_correct is null {
+            null
+        } else {
+            total_correct.buffer()
+        }
+        if dataset.features.rank() == 2 {
+            if hidden_layers == 1 {
+                return gpu.mlp_sgd_epoch(
+                    dataset.features.buffer(),
+                    parameters[0].buffer(),
+                    parameters[1].buffer(),
+                    parameters[2].buffer(),
+                    parameters[3].buffer(),
+                    dataset.labels.buffer(),
+                    total_loss.buffer(),
+                    dataset.samples,
+                    batch_size,
+                    inputs,
+                    widths[0],
+                    classes,
+                    learning_rate,
+                    flush_every: flush_every,
+                    correct_acc: correct
+                )
+            }
+            return gpu.mlp3_sgd_epoch(
+                dataset.features.buffer(),
+                parameters[0].buffer(),
+                parameters[1].buffer(),
+                parameters[2].buffer(),
+                parameters[3].buffer(),
+                parameters[4].buffer(),
+                parameters[5].buffer(),
+                parameters[6].buffer(),
+                parameters[7].buffer(),
+                dataset.labels.buffer(),
+                total_loss.buffer(),
+                dataset.samples,
+                batch_size,
+                inputs,
+                widths[0],
+                classes,
+                learning_rate,
+                flush_every: flush_every,
+                correct_acc: correct,
+                hidden2: widths[1],
+                hidden3: widths[2]
+            )
+        }
+        var start = 0
+        var batches = 0
+        var processed = 0
+        while start < dataset.samples {
+            let count = min(batch_size, dataset.samples - start)
+            if count != batch_size and processed > 0 { break }
+            let batch_features = self._slice_features(dataset, start, count)
+            let batch_labels = self._slice_labels(dataset, start, count)
+            let correct = if total_correct is null {
+                null
+            } else {
+                total_correct.buffer()
+            }
+            if hidden_layers == 1 {
+                gpu.mlp_sgd_step(
+                    batch_features.buffer(),
+                    parameters[0].buffer(),
+                    parameters[1].buffer(),
+                    parameters[2].buffer(),
+                    parameters[3].buffer(),
+                    batch_labels.buffer(),
+                    total_loss.buffer(),
+                    count,
+                    inputs,
+                    widths[0],
+                    classes,
+                    learning_rate,
+                    correct_acc: correct
+                )
+            } else {
+                gpu.mlp3_sgd_step(
+                    batch_features.buffer(),
+                    parameters[0].buffer(),
+                    parameters[1].buffer(),
+                    parameters[2].buffer(),
+                    parameters[3].buffer(),
+                    parameters[4].buffer(),
+                    parameters[5].buffer(),
+                    parameters[6].buffer(),
+                    parameters[7].buffer(),
+                    batch_labels.buffer(),
+                    total_loss.buffer(),
+                    count,
+                    inputs,
+                    widths[0],
+                    classes,
+                    learning_rate,
+                    correct_acc: correct,
+                    hidden2: widths[1],
+                    hidden3: widths[2]
+                )
+            }
+            batch_features.free()
+            batch_labels.free()
+            start += count
+            processed += count
+            batches += 1
+            if flush_each_epoch {
+                if start >= dataset.samples { gpu.flush() }
+            } elif batches % flush_every == 0 or start >= dataset.samples {
+                gpu.flush()
+            }
+        }
+        return processed
+    }
+
+    fn _run_fused_bwd_epoch(self, dataset: Dataset, batch_size: int) -> Metrics {
+        let optimizer = self.optimizer_value
+        if optimizer is null { throw RuntimeError("model is not compiled") }
+        let total_loss = Tensor.zeros([1])
+        let total_correct = Tensor.zeros([1])
+        defer { total_loss.free() }
+        defer { total_correct.free() }
+        let processed = self._fused_bwd_train(
+            dataset,
+            batch_size,
+            optimizer,
+            total_loss,
+            total_correct
+        )
+        let loss_values = total_loss.download()
+        let correct_values = total_correct.download()
+        return Metrics(
+            loss_values[0] / float(processed),
+            100.0 * correct_values[0] / float(processed)
+        )
+    }
+
+    fn _fused_bwd_train(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        optimizer: Optimizer,
+        total_loss: Tensor,
+        total_correct: Tensor? = null
+    ) -> int {
+        let hidden_layers = self._fused_relu_layers()
+        let head = self.layers[self.layers.len() - 1]
+        let inputs = self.input_units
+        let widths = self._fused_hidden_widths()
+        let classes = head.output_width()
+        let parameters = self._parameters()
+        let expected = (hidden_layers + 1) * 2
+        if parameters.len() != expected {
+            throw RuntimeError(f"fused MLP step needs {hidden_layers + 1} dense layers with weights and bias")
+        }
+        if widths.len() != hidden_layers {
+            throw RuntimeError("fused MLP step missing hidden widths")
+        }
+        let flush_every = self._flush_every()
+        var start = 0
+        var batches = 0
+        var processed = 0
+        while start < dataset.samples {
+            let count = min(batch_size, dataset.samples - start)
+            if count != batch_size and processed > 0 { break }
+            let batch_features = self._slice_features(dataset, start, count)
+            let batch_labels = self._slice_labels(dataset, start, count)
+            let correct = if total_correct is null {
+                null
+            } else {
+                total_correct.buffer()
+            }
+            if hidden_layers == 1 {
+                gpu.mlp_bwd_step(
+                    batch_features.buffer(),
+                    parameters[0].buffer(),
+                    parameters[1].buffer(),
+                    parameters[2].buffer(),
+                    parameters[3].buffer(),
+                    batch_labels.buffer(),
+                    parameters[0].grad.buffer(),
+                    parameters[1].grad.buffer(),
+                    parameters[2].grad.buffer(),
+                    parameters[3].grad.buffer(),
+                    total_loss.buffer(),
+                    count,
+                    inputs,
+                    widths[0],
+                    classes,
+                    correct_acc: correct
+                )
+            } else {
+                gpu.mlp3_bwd_step(
+                    batch_features.buffer(),
+                    parameters[0].buffer(),
+                    parameters[1].buffer(),
+                    parameters[2].buffer(),
+                    parameters[3].buffer(),
+                    parameters[4].buffer(),
+                    parameters[5].buffer(),
+                    parameters[6].buffer(),
+                    parameters[7].buffer(),
+                    batch_labels.buffer(),
+                    parameters[0].grad.buffer(),
+                    parameters[1].grad.buffer(),
+                    parameters[2].grad.buffer(),
+                    parameters[3].grad.buffer(),
+                    parameters[4].grad.buffer(),
+                    parameters[5].grad.buffer(),
+                    parameters[6].grad.buffer(),
+                    parameters[7].grad.buffer(),
+                    total_loss.buffer(),
+                    count,
+                    inputs,
+                    widths[0],
+                    classes,
+                    correct_acc: correct,
+                    hidden2: widths[1],
+                    hidden3: widths[2]
+                )
+            }
+            optimizer.step(parameters)
+            batch_features.free()
+            batch_labels.free()
+            start += count
+            processed += count
+            batches += 1
+            if batches % flush_every == 0 or start >= dataset.samples { gpu.flush() }
+        }
+        return processed
+    }
+
     fn _slice_features(self, dataset: Dataset, start: int, count: int) -> Tensor {
         let width = dataset.feature_count
+        if dataset.features.rank() == 4 {
+            let shape = dataset.image_shape
+            if shape is null { throw RuntimeError("NHWC dataset missing image_shape") }
+            return dataset.features.view(start * width, [count, shape[0], shape[1], shape[2]])
+        }
         return dataset.features.view(start * width, [count, width])
     }
 
@@ -448,6 +922,158 @@ pub class Sequential {
             let gradient = parameter.grad
             if gradient is not null { gradient.zero_() }
         }
+    }
+
+    fn _refresh_execution_plan(self, batch_size: int) -> void {
+        if self.input_units == 0 { return }
+        let loss = self.loss_value
+        var static_step = loss is not null and
+            loss.is_sparse_categorical() and
+            not loss.is_from_logits()
+        if static_step {
+            for layer in self.layers {
+                if not layer.supports_static() {
+                    static_step = false
+                    break
+                }
+            }
+        }
+        var layer_widths: list[int] = []
+        for layer in self.layers { layer_widths.push(layer.output_width()) }
+        self.plan_value = ExecutionPlan(
+            self.input_units,
+            batch_size,
+            layer_widths,
+            static_step
+        )
+    }
+
+    fn _static_step_active(self, batch_size: int) -> bool {
+        let _ = batch_size
+        if self.fused_sgd or self.fused_mlp_step { return false }
+        let loss = self.loss_value
+        if loss is null or not loss.is_sparse_categorical() or loss.is_from_logits() {
+            return false
+        }
+        for layer in self.layers {
+            if not layer.supports_static() { return false }
+        }
+        return true
+    }
+
+    @trace
+    fn _static_forward(self, x: Tensor) -> list[Tensor] {
+        var activations: list[Tensor] = []
+        var current = x
+        for layer in self.layers {
+            current = layer.static_forward(current)
+            activations.push(current)
+        }
+        return activations
+    }
+
+    @trace
+    fn _static_backward(
+        self,
+        batch_features: Tensor,
+        activations: list[Tensor],
+        delta: Tensor
+    ) -> void {
+        var upstream = delta
+        var index = self.layers.len() - 1
+        while index >= 0 {
+            let layer = self.layers[index]
+            let input = if index == 0 { batch_features } else { activations[index - 1] }
+            let output = activations[index]
+            let d_input = layer.static_backward(input, output, upstream)
+            if upstream is not delta { upstream.free() }
+            upstream = d_input
+            index -= 1
+        }
+        delta.free()
+        upstream.free()
+    }
+
+    @trace
+    fn _static_train_batch(
+        self,
+        batch_features: Tensor,
+        batch_labels: Tensor,
+        total_loss: Tensor,
+        count: int
+    ) -> list[Tensor] {
+        let optimizer = self.optimizer_value
+        if optimizer is null { throw RuntimeError("model is not compiled") }
+        let activations = self._static_forward(batch_features)
+        let prediction = activations[activations.len() - 1]
+        self._zero_grad()
+        let (loss, delta) = sparse_ce_with_delta(
+            prediction,
+            batch_labels,
+            total_loss,
+            count
+        )
+        self._static_backward(batch_features, activations, delta)
+        optimizer.step(self._parameters())
+        loss.free()
+        return activations
+    }
+
+    fn _run_static_epoch(self, dataset: Dataset, batch_size: int, training: bool) -> Metrics {
+        let loss_fn = self.loss_value
+        let optimizer = self.optimizer_value
+        if loss_fn is null or optimizer is null { throw RuntimeError("model is not compiled") }
+
+        let total_loss = Tensor.zeros([1])
+        let total_correct = Tensor.zeros([1])
+        defer { total_loss.free() }
+        defer { total_correct.free() }
+        let flush_every = 8
+        var start = 0
+        var batches = 0
+        let loader = if self.shuffle_batches { DataLoader(dataset, batch_size, shuffle: true) } else { null }
+        while start < dataset.samples {
+            var count = min(batch_size, dataset.samples - start)
+            var batch_features: Tensor
+            var batch_labels: Tensor
+            if loader is not null {
+                if not loader.has_next() { break }
+                let (features, labels) = loader.next_batch()
+                batch_features = features
+                batch_labels = labels
+                count = batch_features.shape[0]
+            } else {
+                batch_features = self._slice_features(dataset, start, count)
+                batch_labels = self._slice_labels(dataset, start, count)
+            }
+            let activations = if training {
+                self._static_train_batch(batch_features, batch_labels, total_loss, count)
+            } else {
+                self._static_forward(batch_features)
+            }
+            let prediction = activations[activations.len() - 1]
+
+            if not training {
+                let loss = loss_fn.forward(prediction, batch_labels, total_loss, count)
+                let graph = loss.discard_graph()
+                loss.free()
+                for tensor in graph { tensor.free() }
+            }
+            add_correct_into(prediction, batch_labels, total_correct)
+
+            batch_features.free()
+            batch_labels.free()
+            for activation in activations { activation.free() }
+            start += count
+            batches += 1
+            if batches % flush_every == 0 or start >= dataset.samples { gpu.flush() }
+        }
+        let loss_values = total_loss.download()
+        let correct_values = total_correct.download()
+        return Metrics(
+            loss_values[0] / float(dataset.samples),
+            100.0 * correct_values[0] / float(dataset.samples)
+        )
     }
 
     fn _clear_grad(self) -> void {
