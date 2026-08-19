@@ -25,7 +25,7 @@ from jaicv.imgproc.geometric import pyr_down, pyr_up, remap, resize, warp_affine
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE, BORDER_WRAP
 from jaicv.core.types import INTER_AREA, INTER_CUBIC, INTER_LANCZOS4, INTER_LINEAR, INTER_NEAREST
-from jaicv.core.types import CV_32F, Point, Point2f, Scalar, Size
+from jaicv.core.types import CV_32F, Point, Point2f, Rect, Scalar, Size
 from jaicv.imgproc.filter import blur, box_filter, filter_2d, gaussian_blur
 from jaicv.imgproc.filter import get_gaussian_kernel, laplacian, median_blur, scharr, sobel
 from jaicv.imgproc.threshold import adaptive_threshold, threshold
@@ -44,6 +44,12 @@ from jaicv.imgproc.shape import approx_poly_dp, arc_length, bounding_rect, conto
 from jaicv.imgproc.shape import convex_hull, fit_ellipse, fit_line, hu_moments
 from jaicv.imgproc.shape import is_contour_convex, min_area_rect, min_enclosing_circle
 from jaicv.imgproc.shape import moments, point_polygon_test
+from jaicv.imgproc.segmentation import connected_components, connected_components_with_stats
+from jaicv.imgproc.segmentation import distance_transform, flood_fill, integral
+from jaicv.imgproc.segmentation import DIST_C, DIST_L1, DIST_L2
+from jaicv.imgproc.hist import calc_back_project, calc_hist, compare_hist, equalize_hist, CLAHE
+from jaicv.imgproc.hist import HISTCMP_BHATTACHARYYA, HISTCMP_CHISQR, HISTCMP_CHISQR_ALT
+from jaicv.imgproc.hist import HISTCMP_CORREL, HISTCMP_INTERSECT, HISTCMP_KL_DIV
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -135,6 +141,8 @@ fn tolerance_for(name: str, args: list[str]) -> float {
         return 1e-4
     }
     if name == "getGaussianKernel" { return 1e-5 }
+    if name == "distanceTransform" { return 1e-4 }
+    if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
     if name == "minAreaRect" or
@@ -424,8 +432,155 @@ fn run_shape(item: Case) -> Mat {
     throw ValueError(f"no jaicv binding for {item.name}")
 }
 
+let SEGMENT_NAMES = [
+    "floodFill",
+    "floodFillStats",
+    "connectedComponents",
+    "connectedComponentsStats",
+    "connectedComponentsCentroids",
+    "distanceTransform",
+    "integral",
+]
+
+let HIST_NAMES = [
+    "calcHist1D",
+    "calcHist1DMasked",
+    "calcHist2D",
+    "equalizeHist",
+    "clahe",
+    "compareHist",
+    "calcBackProject",
+]
+
+fn distance_named(name: str) -> int {
+    if name == "L1" { return DIST_L1 }
+    if name == "L2" { return DIST_L2 }
+    if name == "C" { return DIST_C }
+    throw ValueError(f"no jaicv distance for {name}")
+}
+
+fn run_segmentation(item: Case) -> Mat {
+    let args = item.args
+    if item.name == "floodFill" or item.name == "floodFillStats" {
+        let canvas = item.source.clone()
+        let lo = float(args[3])
+        let up = float(args[4])
+        let (count, box) = flood_fill(
+            canvas,
+            Point(int(args[1]), int(args[2])),
+            Scalar(255.0, 255.0, 255.0),
+            Scalar(lo, lo, lo, lo),
+            Scalar(up, up, up, up),
+            int(args[5])
+        )
+        if item.name == "floodFill" { return canvas }
+        return Mat.from_list(
+            1,
+            5,
+            CV_MAKETYPE(4, 1),
+            [float(count), float(box.x), float(box.y), float(box.width), float(box.height)]
+        )
+    }
+    if item.name == "connectedComponents" {
+        let (_count, labels) = connected_components(item.source, int(args[1]))
+        return labels
+    }
+    if item.name == "connectedComponentsStats" or item.name == "connectedComponentsCentroids" {
+        let (count, _labels, stats, centroids) = connected_components_with_stats(
+            item.source,
+            int(args[1])
+        )
+        var values: list[float] = []
+        if item.name == "connectedComponentsStats" {
+            for entry in stats {
+                values.push(float(entry.box.x))
+                values.push(float(entry.box.y))
+                values.push(float(entry.box.width))
+                values.push(float(entry.box.height))
+                values.push(float(entry.area))
+            }
+            return Mat.from_list(count, 5, CV_MAKETYPE(4, 1), values)
+        }
+        for centre in centroids {
+            values.push(centre.x)
+            values.push(centre.y)
+        }
+        return Mat.from_list(count, 2, CV_MAKETYPE(5, 1), values)
+    }
+    if item.name == "distanceTransform" {
+        return distance_transform(item.source, distance_named(args[1]), int(args[2]))
+    }
+    if item.name == "integral" { return integral(item.source) }
+    throw ValueError(f"no jaicv binding for {item.name}")
+}
+
+fn histogram_method(name: str) -> int {
+    if name == "CORREL" { return HISTCMP_CORREL }
+    if name == "CHISQR" { return HISTCMP_CHISQR }
+    if name == "INTERSECT" { return HISTCMP_INTERSECT }
+    if name == "BHATTACHARYYA" { return HISTCMP_BHATTACHARYYA }
+    if name == "CHISQR_ALT" { return HISTCMP_CHISQR_ALT }
+    if name == "KL_DIV" { return HISTCMP_KL_DIV }
+    throw ValueError(f"no jaicv histogram comparison for {name}")
+}
+
+fn run_hist(item: Case) -> Mat {
+    let args = item.args
+    if item.name == "calcHist1D" {
+        return calc_hist([item.source], [0], null, [int(args[1])], [0.0, 256.0])
+    }
+    if item.name == "calcHist1DMasked" {
+        let mask = Mat.zeros(item.source.rows, item.source.cols, item.source.type_())
+        mask.roi(Rect(5, 4, 11, 8)).set_to(Scalar(255.0, 0.0, 0.0))
+        return calc_hist([item.source], [0], mask, [int(args[1])], [0.0, 256.0])
+    }
+    if item.name == "calcHist2D" {
+        return calc_hist(
+            [item.source],
+            [0, 1],
+            null,
+            [int(args[1]), int(args[2])],
+            [0.0, 256.0, 0.0, 256.0]
+        )
+    }
+    if item.name == "equalizeHist" { return equalize_hist(item.source) }
+    if item.name == "clahe" {
+        let tiles = int(args[2])
+        return CLAHE(float(args[1]), Size(tiles, tiles)).apply(item.source)
+    }
+    if item.name == "compareHist" {
+        let shifted = Mat.zeros(item.source.rows, item.source.cols, item.source.type_())
+        let source = item.source.to_list()
+        var rolled: list[float] = []
+        for y in 0..item.source.rows {
+            for x in 0..item.source.cols {
+                rolled.push(
+                    source[y * item.source.cols + (x + item.source.cols - 3) % item.source.cols]
+                )
+            }
+        }
+        let other = Mat.from_list(item.source.rows, item.source.cols, item.source.type_(), rolled)
+        let _unused = shifted
+        let a = calc_hist([item.source], [0], null, [32], [0.0, 256.0])
+        let b = calc_hist([other], [0], null, [32], [0.0, 256.0])
+        return Mat.from_list(
+            1,
+            1,
+            CV_MAKETYPE(5, 1),
+            [compare_hist(a, b, histogram_method(args[0]))]
+        )
+    }
+    if item.name == "calcBackProject" {
+        let hist = calc_hist([item.source], [0], null, [int(args[1])], [0.0, 180.0])
+        return calc_back_project([item.source], [0], hist, [0.0, 180.0], 1.0)
+    }
+    throw ValueError(f"no jaicv binding for {item.name}")
+}
+
 fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
+    if SEGMENT_NAMES.contains(item.name) { return run_segmentation(item) }
+    if HIST_NAMES.contains(item.name) { return run_hist(item) }
     if SHAPE_NAMES.contains(item.name) { return run_shape(item) }
     if item.name == "findContours" or item.name == "contourHierarchy" { return run_contours(item) }
     if item.name == "cvtColor" { return cvt_color(item.source, colour_code(item.args[0])) }

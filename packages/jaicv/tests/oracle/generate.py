@@ -417,6 +417,89 @@ def write_shape(handle) -> None:
             case(handle, "fitLine", head, image, line.astype(np.float32))
 
 
+def write_segmentation(handle) -> None:
+    gradient = np.zeros((20, 24), np.uint8)
+    for y in range(20):
+        for x in range(24):
+            gradient[y, x] = (x * 6 + y * 3) % 256
+    blocks = np.zeros((20, 24), np.uint8)
+    blocks[2:9, 3:11] = 200
+    blocks[12:18, 6:20] = 120
+    blocks[4:7, 15:22] = 200
+
+    for seed, lo, up, flags in (((5, 5), 0, 0, 4), ((5, 5), 20, 20, 4),
+                                ((5, 5), 20, 20, 8), ((12, 3), 30, 30, 4)):
+        for tag, image in (("gradient", gradient), ("blocks", blocks)):
+            filled = image.copy()
+            count, _, _, rect = cv2.floodFill(filled, None, seed, 255, lo, up, flags)
+            case(handle, "floodFill", f"{tag} {seed[0]} {seed[1]} {lo} {up} {flags}", image, filled)
+            case(handle, "floodFillStats", f"{tag} {seed[0]} {seed[1]} {lo} {up} {flags}", image,
+                 np.array([[count, rect[0], rect[1], rect[2], rect[3]]], np.int32))
+
+    rng = np.random.default_rng(91)
+    speckle = (rng.random((18, 22)) < 0.45).astype(np.uint8) * 255
+    for tag, image in (("blocks", blocks), ("speckle", speckle)):
+        for conn in (4, 8):
+            count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                image, connectivity=conn)
+            case(handle, "connectedComponents", f"{tag} {conn}", image, labels.astype(np.int32))
+            case(handle, "connectedComponentsStats", f"{tag} {conn}", image, stats.astype(np.int32))
+            case(handle, "connectedComponentsCentroids", f"{tag} {conn}", image,
+                 centroids.astype(np.float32))
+
+    for tag, image in (("blocks", blocks), ("speckle", speckle)):
+        for dname, dist in (("L1", cv2.DIST_L1), ("L2", cv2.DIST_L2), ("C", cv2.DIST_C)):
+            for msize in (3, 5):
+                out = cv2.distanceTransform(image, dist, msize)
+                case(handle, "distanceTransform", f"{tag} {dname} {msize}", image, out)
+        case(handle, "integral", tag, image, cv2.integral(image).astype(np.float32))
+
+
+def write_hist(handle) -> None:
+    rng = np.random.default_rng(93)
+    gray = rng.integers(20, 210, size=(16, 20), dtype=np.uint8)
+    colour = rng.integers(0, 256, size=(16, 20, 3), dtype=np.uint8)
+    mask = np.zeros((16, 20), np.uint8)
+    mask[4:12, 5:16] = 255
+
+    case(handle, "calcHist1D", "gray 256", gray,
+         cv2.calcHist([gray], [0], None, [256], [0, 256]).reshape(256, 1))
+    case(handle, "calcHist1D", "gray 32", gray,
+         cv2.calcHist([gray], [0], None, [32], [0, 256]).reshape(32, 1))
+    case(handle, "calcHist1DMasked", "gray 16", gray,
+         cv2.calcHist([gray], [0], mask, [16], [0, 256]).reshape(16, 1))
+    case(handle, "calcHist2D", "colour 8 8", colour,
+         cv2.calcHist([colour], [0, 1], None, [8, 8], [0, 256, 0, 256]))
+    case(handle, "equalizeHist", "gray", gray, cv2.equalizeHist(gray))
+
+    flat = np.zeros((16, 20), np.uint8)
+    flat[:] = 90
+    case(handle, "equalizeHist", "flat", flat, cv2.equalizeHist(flat))
+    dark = gray.copy()
+    dark[dark > 120] = 120
+    case(handle, "equalizeHist", "dark", dark, cv2.equalizeHist(dark))
+
+    for clip in (2.0, 4.0, 40.0):
+        for tiles in (2, 4):
+            engine = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tiles, tiles))
+            case(handle, "clahe", f"gray {clip} {tiles}", gray, engine.apply(gray))
+
+    hist_a = cv2.calcHist([gray], [0], None, [32], [0, 256])
+    hist_b = cv2.calcHist([np.roll(gray, 3, axis=1)], [0], None, [32], [0, 256])
+    methods = {"CORREL": cv2.HISTCMP_CORREL, "CHISQR": cv2.HISTCMP_CHISQR,
+               "INTERSECT": cv2.HISTCMP_INTERSECT,
+               "BHATTACHARYYA": cv2.HISTCMP_BHATTACHARYYA,
+               "CHISQR_ALT": cv2.HISTCMP_CHISQR_ALT, "KL_DIV": cv2.HISTCMP_KL_DIV}
+    for name, method in methods.items():
+        case(handle, "compareHist", name, gray,
+             np.array([[cv2.compareHist(hist_a, hist_b, method)]], np.float32))
+
+    hue = cv2.cvtColor(colour, cv2.COLOR_BGR2HSV)[:, :, 0]
+    hue_hist = cv2.calcHist([hue], [0], None, [16], [0, 180])
+    case(handle, "calcBackProject", "hue 16", hue,
+         cv2.calcBackProject([hue], [0], hue_hist, [0, 180], 1).astype(np.uint8))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -428,6 +511,8 @@ def main() -> int:
         write_drawing(handle)
         write_contours(handle)
         write_shape(handle)
+        write_segmentation(handle)
+        write_hist(handle)
     print(f"wrote {OUT}")
     return 0
 
