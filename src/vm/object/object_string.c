@@ -368,8 +368,11 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
     }
     if (total == 0) return jaiStringIntern("", 0);
 
-    if (total <= JAI_INTERN_MAX) {
-        /* Byte at a time rather than memcpy per run. The runs an f-string
+    if (runtimeInternable(total)) {
+        /* Short enough to be worth a probe, so it is staged where the probe
+         * can hash it before anything is allocated.
+         *
+         * Byte at a time rather than memcpy per run. The runs an f-string
          * produces are one to five bytes each -- `f"k{i}"` is a one-byte
          * literal and four digits -- and at that length the call into
          * _platform_memmove costs several times the copy. Two of them per
@@ -385,15 +388,27 @@ ObjString *jaiStringFromParts(const char *const *runs, const uint32_t *lens,
         return jaiStringNew(buf, total);
     }
 
-    /* allocString may collect, but it collects *before* it allocates and the
+    /* Nothing is going to probe for this one -- it is over JAI_INTERN_MAX, or
+     * the intern table is already at its soft cap -- so there is nothing to
+     * hash and the staging buffer would be a copy for its own sake. The runs
+     * go straight into the string. tests/bench/string_build builds two million
+     * thirteen-byte keys and all but the first thirty-two thousand take this
+     * path; before, every one of them was copied twice.
+     *
+     * allocString may collect, but it collects *before* it allocates and the
      * runs belong to the caller's roots, so they are still there afterwards.
-     * Over JAI_INTERN_MAX nothing will probe for this, so the hash is left to
-     * jaiStringHash. */
+     * The hash is left to jaiStringHash. */
     ObjString *s = allocString(total);
     char *dst = s->chars;
     for (int i = 0; i < count; ++i) {
         const uint32_t len = lens[i];
-        if (len != 0) {
+        if (len == 0) continue;
+        /* Same trade as above, and the same reason: a run this short is
+         * cheaper copied here than handed to memcpy. */
+        if (len <= 8) {
+            const char *const src = runs[i];
+            for (uint32_t j = 0; j < len; ++j) *dst++ = src[j];
+        } else {
             memcpy(dst, runs[i], len);
             dst += len;
         }
