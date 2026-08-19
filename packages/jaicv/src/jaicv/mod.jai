@@ -170,6 +170,8 @@ from .calib3d.transform import init_undistort_rectify_map, project_points, refin
 from .calib3d.transform import rodrigues, triangulate_points, undistort_points
 from .calib3d.transform import LMEDS, RANSAC
 
+from .calib3d.stereo import reproject_image_to_3d, stereo_rectify
+from .calib3d.stereo import StereoBM, StereoSGBM, STEREO_NO_MATCH
 from .calib3d.epipolar import compute_correspond_epilines, decompose_essential_mat
 from .calib3d.epipolar import find_essential_mat, find_fundamental_mat, recover_pose
 from .calib3d.epipolar import undistort_to_normalised, FM_8POINT, FM_LMEDS, FM_RANSAC
@@ -372,6 +374,7 @@ export { estimate_affine_2d, estimate_affine_partial_2d, find_homography }
 export { compute_correspond_epilines, decompose_essential_mat, find_essential_mat }
 export { find_fundamental_mat, recover_pose, undistort_to_normalised }
 export { FM_8POINT, FM_LMEDS, FM_RANSAC }
+export { reproject_image_to_3d, stereo_rectify, StereoBM, StereoSGBM, STEREO_NO_MATCH }
 export { svd }
 export { get_optimal_new_camera_matrix, init_undistort_rectify_map, project_points }
 export { refine_homography, rodrigues, triangulate_points, undistort_points }

@@ -61,6 +61,7 @@ from jaicv.calib3d.transform import find_homography, project_points, rodrigues
 from jaicv.calib3d.transform import RANSAC
 from jaicv.calib3d.epipolar import compute_correspond_epilines, find_essential_mat
 from jaicv.calib3d.epipolar import find_fundamental_mat, recover_pose, FM_8POINT
+from jaicv.calib3d.stereo import stereo_rectify
 from jaicv.calib3d.transform import triangulate_points, undistort_points
 from jaicv.core.types import Point3f
 from jaicv.calib3d.calibrate import calibrate_camera, find_chessboard_corners
@@ -1001,6 +1002,8 @@ let CALIB_NAMES = [
     "findEssentialMat",
     "computeCorrespondEpilines",
     "recoverPose",
+    "stereoRectifyR1",
+    "stereoRectifyR2",
     "findHomographyRansacMask",
     "estimateAffine2D",
     "estimateAffinePartial2D",
@@ -1188,6 +1191,39 @@ fn run_calib(item: Case) -> Mat {
             Mat.from_list(1, 3, CV_MAKETYPE(5, 1), translation.to_list()),
             item.expected
         )
+    }
+    if item.name.starts_with("stereoRectify") {
+        let camera = Mat.from_list(
+            3,
+            3,
+            CV_MAKETYPE(5, 1),
+            [500.0, 0.0, 320.0, 0.0, 500.0, 240.0, 0.0, 0.0, 1.0]
+        )
+        let vector = if item.args[0] == "aligned" {
+            [0.0, 0.0, 0.0]
+        } elif item.args[0] == "smallTurn" {
+            [0.01, 0.02, -0.015]
+        } else {
+            [0.05, -0.09, 0.03]
+        }
+        let (r1, r2, _p1, _p2, _q, _a, _b) = stereo_rectify(
+            camera,
+            [],
+            camera,
+            [],
+            Size(640, 480),
+            rodrigues(
+                Mat.from_list(3, 1, CV_MAKETYPE(5, 1), vector)
+            ),
+            Mat.from_list(
+                3,
+                1,
+                CV_MAKETYPE(5, 1),
+                [-0.12, 0.01, -0.004]
+            )
+        )
+        if item.name == "stereoRectifyR1" { return r1 }
+        return r2
     }
     if item.name == "findHomographyRansac" {
         let (source, target) = ransac_pair()
