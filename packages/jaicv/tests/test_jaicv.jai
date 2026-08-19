@@ -366,7 +366,7 @@ fn test_an_uncompressed_video_round_trips_exactly() -> void {
     assert_near(clip.get(CAP_PROP_FPS), 12.0, 1e-6)
 
     var seen = 0
-    while true {
+    loop {
         let (ok, frame) = clip.read()
         if not ok { break }
         assert_eq(frame.rows, size.height)
@@ -414,7 +414,7 @@ fn test_a_motion_jpeg_video_round_trips_within_its_quantisation() -> void {
     let clip = VideoCapture(path)
     assert_eq(int(clip.get(CAP_PROP_FRAME_COUNT)), 5)
     var seen = 0
-    while true {
+    loop {
         let (ok, frame) = clip.read()
         if not ok { break }
         assert_eq(frame.rows, size.height)

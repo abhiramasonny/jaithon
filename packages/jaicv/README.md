@@ -6,7 +6,7 @@ Computer vision with OpenCV's API, on the GPU.
 import jaicv as cv
 
 let camera = cv.VideoCapture(0)
-while true {
+loop {
     let (ok, frame) = camera.read()
     if not ok { break }
     let gray = cv.cvt_color(frame, cv.COLOR_BGR2GRAY)

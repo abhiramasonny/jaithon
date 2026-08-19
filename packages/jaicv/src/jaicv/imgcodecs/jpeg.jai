@@ -350,35 +350,43 @@ pub class Component {
     }
 }
 
-fn idct_8x8(block: list[float], out: list[float]) -> void {
+#: The separable DCT basis, `DCT_BASIS[u * 8 + x] = Cu * cos((2x+1)u*pi/16)`,
+#: with the 1/sqrt(2) normalisation of the zeroth term folded in. Both
+#: transforms below index this instead of calling `math.cos`, which is what
+#: made them cost milliseconds a block.
+let DCT_BASIS = [
+    (if index // 8 == 0 { 0.70710678118654752 } else { 1.0 }) *
+        math.cos(float(2 * (index % 8) + 1) * float(index // 8) * math.PI / 16.0)
+    for index in 0..64
+]
+
+#: `scratch` is the caller's, not a local: a fresh 64-element list an inner
+#: transform allocates is one allocation a block -- thousands a frame -- and
+#: the JIT cannot see the element kind of a list the body itself built, so a
+#: local scratch also left the whole function running interpreted.
+fn idct_8x8(block: list[float], out: list[float],
+            scratch: list[float]) -> void {
     #: A separable float IDCT: rows first, then columns. Slower than the
     #: integer approximations a production encoder uses and exact enough that
     #: the result never differs from a reference decoder by more than a unit.
-    var temporary = [0.0 for _index in 0..64]
     for u in 0..8 {
         for x in 0..8 {
             var total = 0.0
             for v in 0..8 {
                 let coefficient = block[v * 8 + u]
                 if coefficient == 0.0 { continue }
-                let scale = if v == 0 { 0.70710678118654752 } else { 1.0 }
-                total += scale *
-                    coefficient *
-                    math.cos(float(2 * x + 1) * float(v) * math.PI / 16.0)
+                total += coefficient * DCT_BASIS[v * 8 + x]
             }
-            temporary[x * 8 + u] = total * 0.5
+            scratch[x * 8 + u] = total * 0.5
         }
     }
     for y in 0..8 {
         for x in 0..8 {
             var total = 0.0
             for u in 0..8 {
-                let coefficient = temporary[y * 8 + u]
+                let coefficient = scratch[y * 8 + u]
                 if coefficient == 0.0 { continue }
-                let scale = if u == 0 { 0.70710678118654752 } else { 1.0 }
-                total += scale *
-                    coefficient *
-                    math.cos(float(2 * x + 1) * float(u) * math.PI / 16.0)
+                total += coefficient * DCT_BASIS[u * 8 + x]
             }
             out[y * 8 + x] = total * 0.5
         }
@@ -540,6 +548,7 @@ fn scan(
     let reader = BitReader(data, start)
     var block = [0.0 for _index in 0..64]
     var pixels = [0.0 for _index in 0..64]
+    var dct_scratch = [0.0 for _index in 0..64]
     var since_restart = 0
 
     for mcu_y in 0..mcus_down {
@@ -556,7 +565,7 @@ fn scan(
                 for by in 0..component.v {
                     for bx in 0..component.h {
                         decode_block(reader, component, quant, dc_tables, ac_tables, block)
-                        idct_8x8(block, pixels)
+                        idct_8x8(block, pixels, dct_scratch)
                         let origin_x = (mcu_x * component.h + bx) * 8
                         let origin_y = (mcu_y * component.v + by) * 8
                         for y in 0..8 {
@@ -1160,20 +1169,28 @@ fn magnitude_of(value: int) -> int {
     return size
 }
 
-fn fdct_8x8(block: list[float], out: list[float]) -> void {
+#: `scratch` is the caller's, not a local: a fresh 64-element list an inner
+#: transform allocates is one allocation a block -- thousands a frame -- and
+#: the JIT cannot see the element kind of a list the body itself built, so a
+#: local scratch also left the whole function running interpreted.
+fn fdct_8x8(block: list[float], out: list[float],
+            scratch: list[float]) -> void {
+    #: Separable, matching `idct_8x8`: a column pass into a scratch block and
+    #: then a row pass. Doing it as the literal double sum of the standard's
+    #: definition costs 4096 multiply-adds and 8192 cosines a block; this
+    #: costs 1024 multiply-adds and no cosines.
+    for v in 0..8 {
+        for x in 0..8 {
+            var total = 0.0
+            for y in 0..8 { total += block[y * 8 + x] * DCT_BASIS[v * 8 + y] }
+            scratch[v * 8 + x] = total
+        }
+    }
     for v in 0..8 {
         for u in 0..8 {
             var total = 0.0
-            for y in 0..8 {
-                for x in 0..8 {
-                    total += block[y * 8 + x] *
-                        math.cos(float(2 * x + 1) * float(u) * math.PI / 16.0) *
-                        math.cos(float(2 * y + 1) * float(v) * math.PI / 16.0)
-                }
-            }
-            let cu = if u == 0 { 0.70710678118654752 } else { 1.0 }
-            let cv = if v == 0 { 0.70710678118654752 } else { 1.0 }
-            out[v * 8 + u] = total * cu * cv * 0.25
+            for x in 0..8 { total += scratch[v * 8 + x] * DCT_BASIS[u * 8 + x] }
+            out[v * 8 + u] = total * 0.25
         }
     }
 }
@@ -1199,7 +1216,7 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
     }
     let luma_quant = scaled_table(STANDARD_LUMA_QUANT, quality)
     let chroma_quant = scaled_table(STANDARD_CHROMA_QUANT, quality)
-    let values = image.to_list()
+    let values = image.values()
     let width = image.cols
     let height = image.rows
 
@@ -1259,56 +1276,62 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
 
     let writer = BitWriter()
     var predictors = [0, 0, 0]
-    var block = [0.0 for _index in 0..64]
+    #: One scratch block a component, filled by a single pass over the pixels.
+    #: Converting inside the per-component loop instead ran the colour
+    #: transform, the edge clamp and the address arithmetic three times for
+    #: every pixel in the image.
+    var planes = [[0.0 for _index in 0..64] for _component in 0..3]
     var coefficients = [0.0 for _index in 0..64]
+    var dct_scratch = [0.0 for _index in 0..64]
+    var levels = [0 for _index in 0..64]
 
     let blocks_across = (width + 7) // 8
     let blocks_down = (height + 7) // 8
     for by in 0..blocks_down {
         for bx in 0..blocks_across {
-            for component in 0..channels {
-                for y in 0..8 {
-                    for x in 0..8 {
-                        let sy = min(by * 8 + y, height - 1)
-                        let sx = min(bx * 8 + x, width - 1)
-                        let base = (sy * width + sx) * channels
-                        var sample = 0.0
-                        if channels == 1 {
-                            sample = values[base]
-                        } else {
-                            let blue = values[base]
-                            let green = values[base + 1]
-                            let red = values[base + 2]
-                            if component == 0 {
-                                sample = 0.299 * red + 0.587 * green + 0.114 * blue
-                            } elif component == 1 {
-                                sample = 128.0 - 0.168736 * red - 0.331264 * green + 0.5 * blue
-                            } else {
-                                sample = 128.0 + 0.5 * red - 0.418688 * green - 0.081312 * blue
-                            }
-                        }
-                        block[y * 8 + x] = sample - 128.0
+            for y in 0..8 {
+                let sy = min(by * 8 + y, height - 1)
+                let row = sy * width
+                for x in 0..8 {
+                    let sx = min(bx * 8 + x, width - 1)
+                    let base = (row + sx) * channels
+                    let cell = y * 8 + x
+                    if channels == 1 {
+                        planes[0][cell] = values[base] - 128.0
+                    } else {
+                        let blue = values[base]
+                        let green = values[base + 1]
+                        let red = values[base + 2]
+                        planes[0][cell] =
+                            0.299 * red + 0.587 * green + 0.114 * blue - 128.0
+                        planes[1][cell] =
+                            -0.168736 * red - 0.331264 * green + 0.5 * blue
+                        planes[2][cell] =
+                            0.5 * red - 0.418688 * green - 0.081312 * blue
                     }
                 }
-                fdct_8x8(block, coefficients)
+            }
+            for component in 0..channels {
+                fdct_8x8(planes[component], coefficients, dct_scratch)
                 let quant = if component == 0 { luma_quant } else { chroma_quant }
                 let dc_codes = if component == 0 { dc_luma } else { dc_chroma }
                 let ac_codes = if component == 0 { ac_luma } else { ac_chroma }
 
-                var levels: list[int] = []
                 for index in 0..64 {
                     let position = ZIGZAG[index]
                     let scaled = coefficients[position] / float(quant[position])
                     #: Round away from zero. `floor(x - 0.5)` for a negative
                     #: sends a coefficient of -1e-17 to -1, which turned every
                     #: flat block into noise and every file into ten times the
-                    #: bytes it needed.
-                    let rounded = if scaled >= 0.0 {
-                        math.floor(scaled + 0.5)
+                    #: bytes it needed. `int()` truncates toward zero, so it is
+                    #: already the floor on one side and the ceiling on the
+                    #: other -- and unlike `math.floor` it is a single JIT
+                    #: instruction rather than a call the tier declines.
+                    levels[index] = if scaled >= 0.0 {
+                        int(scaled + 0.5)
                     } else {
-                        math.ceil(scaled - 0.5)
+                        int(scaled - 0.5)
                     }
-                    levels.push(int(rounded))
                 }
 
                 let difference = levels[0] - predictors[component]

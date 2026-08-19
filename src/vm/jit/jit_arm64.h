@@ -123,6 +123,7 @@ uint32_t jaiA64FsqrtD(unsigned rd, unsigned rn);
 /* fcmp Dn, Dm -- flags only, no destination; b.mi is less-than and b.gt is
  * greater-than, the pair that stays false when either operand is a nan */
 uint32_t jaiA64FcmpD(unsigned rn, unsigned rm);
+uint32_t jaiA64FcmpDZero(unsigned rn);
 /* fmov Dd, Dn -- register to register */
 uint32_t jaiA64FmovDD(unsigned rd, unsigned rn);
 /* fmov Dd, Xn -- the general register's 64 bits, reinterpreted; NOT a convert */
@@ -144,6 +145,10 @@ uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset);
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
 
 /* Condition codes, named for the ones this uses. */
+/* The zero register. As the destination of a `subs` it turns the
+ * subtraction into a bare compare; as an operand it reads zero. */
+#define JAI_A64_XZR 31u
+
 #define JAI_A64_EQ 0u
 #define JAI_A64_NE 1u
 #define JAI_A64_MI 4u   /* negative -- after fcmp this is the less-than arm */

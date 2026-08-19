@@ -7,7 +7,7 @@
 #: let (ok, frame) = camera.read()
 #:
 #: let clip = VideoCapture("recording.avi")
-#: while true {
+#: loop {
 #:     let (ok, frame) = clip.read()
 #:     if not ok { break }
 #: }

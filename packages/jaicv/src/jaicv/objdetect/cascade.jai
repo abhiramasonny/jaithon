@@ -203,7 +203,7 @@ pub class CascadeClassifier {
             for weak in stage.weak {
                 if weak.nodes.len() == 0 { continue }
                 var index = 0
-                while true {
+                loop {
                     let node = weak.nodes[index]
                     let value = self.feature_value(integral, stride, x, y, node.feature) * normalise
                     index = if value < node.threshold { node.left } else { node.right }
@@ -255,7 +255,7 @@ pub class CascadeClassifier {
 
         var found: list[Rect] = []
         var factor = 1.0
-        while true {
+        loop {
             let width = int(float(image.cols) / factor + 0.5)
             let height = int(float(image.rows) / factor + 0.5)
             if width < self.window.width or height < self.window.height { break }

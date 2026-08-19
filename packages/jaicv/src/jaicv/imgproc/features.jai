@@ -659,7 +659,7 @@ pub fn hough_lines_p(
     var alive = image.to_list()
     var out: list[HoughSegment] = []
 
-    while true {
+    loop {
         let remaining = Mat.from_list(rows, cols, image.type_(), alive)
         let lines = hough_lines(remaining, rho, theta, threshold, 1)
         if lines.len() == 0 { break }

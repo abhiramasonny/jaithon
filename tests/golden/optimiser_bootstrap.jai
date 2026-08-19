@@ -69,7 +69,7 @@ fn branches(a, b) {
     if not a { r = r + 1 }
     if true { r = r + 10 }
     if false { r = r + 100 }
-    while true {
+    loop {
         r = r + 1
         if r > 5 { break }
     }

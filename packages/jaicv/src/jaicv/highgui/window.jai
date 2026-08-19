@@ -16,7 +16,7 @@
 #: import jaicv as cv
 #:
 #: let camera = cv.VideoCapture(0)
-#: while true {
+#: loop {
 #:     let (ok, frame) = camera.read()
 #:     if not ok { break }
 #:     cv.imshow("camera", frame)
@@ -282,7 +282,7 @@ fn move_trackbar(pane: Pane, x: int) -> void {
 pub fn wait_key(delay: int = 0) -> int {
     if not gui.is_available() { return -1 }
     let started = Instant.now()
-    while true {
+    loop {
         var any_open = false
         for name in _order {
             let pane = _panes.get(name, null)

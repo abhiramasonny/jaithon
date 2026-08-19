@@ -290,7 +290,7 @@ pub class Writer {
     #: "continues", so a small value costs one byte instead of four.
     pub fn uleb(self, value: int) -> void {
         var v = value
-        while true {
+        loop {
             var byte = v & 0x7F
             v = v >> 7
             if v != 0 { byte = byte | 0x80 }
@@ -875,7 +875,7 @@ pub fn read_module(data: list[int], expected_hash: int? = null) -> Module? {
 #:     sleb128  span_end - span           (against its OWN span)
 fn _uleb(out: list[int], value: int) -> void {
     var v = value
-    while true {
+    loop {
         var byte = v & 0x7F
         v = v >> 7
         if v != 0 { byte = byte | 0x80 }

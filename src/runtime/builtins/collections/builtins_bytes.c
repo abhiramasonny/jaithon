@@ -1,5 +1,7 @@
 /* builtins_bytes.c — the `bytes` method table and `__prim__.bytes_*` surface (spec Appendix C); every index/length/window here counts bytes, not codepoints. */
 
+#include <math.h>
+
 #include "runtime/builtins/text/builtins_str.h"
 #include "runtime/methods.h"
 #include "runtime/runtime.h"
@@ -382,7 +384,61 @@ static bool primBytesFromHex(int argc, Value *args, Value *out) {
     *out = OBJ_VAL(b);
     return true;
 }
+/* Clamp and round a list of floats into bytes, in one pass.
+ *
+ * Written in Jaithon this is a multiply, a NaN test, a `math.floor`, an `int`
+ * and two compares per element, and the call to `math.floor` is what stops the
+ * loop compiling: a 640x480 image took thirty-nine milliseconds, which is a
+ * twenty-five frame ceiling on writing video before anything is encoded.
+ *
+ * `scale` multiplies before the clamp, which is what a caller holding
+ * normalised floats wants. A NaN becomes zero rather than whatever the cast
+ * would have produced. */
+static bool primBytesQuantise(int argc, Value *args, Value *out) {
+    (void)argc;
+    if (!IS_LIST(args[0])) {
+        return jaiThrow(vm.cTypeError, "bytes_quantise(): expected a list, got %s",
+                        jaiTypeNameStatic(args[0]));
+    }
+    double scale = 1.0;
+    if (argc > 1 && !IS_NULL(args[1])) {
+        if (IS_INT(args[1])) scale = (double)AS_INT(args[1]);
+        else if (IS_FLOAT(args[1])) scale = AS_FLOAT(args[1]);
+        else {
+            return jaiThrow(vm.cTypeError, "bytes_quantise(): scale must be a number");
+        }
+    }
+
+    ObjList *items = AS_LIST(args[0]);
+    const size_t n = (size_t)items->count;
+    ObjBytes *result = jaiBytesNew(NULL, n);
+    if (result == NULL) return false;
+    uint8_t *dst = result->data;
+
+    for (size_t i = 0; i < n; i++) {
+        Value item = items->items[i];
+        double value;
+        if (IS_FLOAT(item)) value = AS_FLOAT(item);
+        else if (IS_INT(item)) value = (double)AS_INT(item);
+        else {
+            return jaiThrow(vm.cTypeError,
+                            "bytes_quantise(): element %zu is %s, not a number",
+                            i, jaiTypeNameStatic(item));
+        }
+        value *= scale;
+        /* NaN fails every comparison, so it lands here and nowhere else. */
+        if (!(value == value)) { dst[i] = 0; continue; }
+        double rounded = floor(value + 0.5);
+        if (rounded <= 0.0) dst[i] = 0;
+        else if (rounded >= 255.0) dst[i] = 255;
+        else dst[i] = (uint8_t)rounded;
+    }
+    *out = OBJ_VAL(result);
+    return true;
+}
+
 void jaiBytesRegisterPrimitives(ObjModule *ns) {
+    jaiStrDefinePrim(ns, "bytes_quantise", primBytesQuantise, 1, 2);
     jaiStrDefinePrim(ns, "bytes_new",      primBytesNew,      1, 1);
     jaiStrDefinePrim(ns, "bytes_len",      primBytesLen,      1, 1);
     jaiStrDefinePrim(ns, "bytes_get",      primBytesGet,      2, 2);

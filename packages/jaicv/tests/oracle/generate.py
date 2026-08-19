@@ -600,7 +600,7 @@ def cascade_reference_detect(img, width, height, features, stages, scale_factor)
     import math
     found = []
     factor = 1.0
-    while True:
+    loop:
         w = int(img.shape[1] / factor + 0.5)
         h = int(img.shape[0] / factor + 0.5)
         if w < width or h < height:
