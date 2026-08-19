@@ -75,9 +75,24 @@ pub class Hierarchy: Printable {
 let STEP_Y = [0, 1, 1, 1, 0, -1, -1, -1]
 let STEP_X = [1, 1, 0, -1, -1, -1, 0, 1]
 
+#: The inverse of `STEP_Y`/`STEP_X`, indexed by `(dy + 1) * 3 + (dx + 1)`.
+#: The centre cell is -1 because no step stands still.
+let STEP_INDEX = [5, 6, 7, 4, -1, 0, 3, 2, 1]
+
+#: The lookup with no check that the step is a real one. `follow` uses this
+#: because every step it takes is to a pixel it has just found adjacent.
+#: Keeping the check out of the traversal matters twice over: it runs once a
+#: boundary pixel, and reading `ValueError` for the throw is a global the JIT
+#: tier has no slot for -- so the check alone left the whole loop interpreted.
+fn step_index(dy: int, dx: int) -> int {
+    return STEP_INDEX[(dy + 1) * 3 + dx + 1]
+}
+
+#: The checked form, for a caller that has not established the step is one.
 fn direction_of(dy: int, dx: int) -> int {
-    for index in 0..8 {
-        if STEP_Y[index] == dy and STEP_X[index] == dx { return index }
+    if dy >= -1 and dy <= 1 and dx >= -1 and dx <= 1 {
+        let index = step_index(dy, dx)
+        if index >= 0 { return index }
     }
     throw ValueError(f"({dy}, {dx}) is not a step to a neighbouring pixel")
 }
@@ -142,7 +157,7 @@ fn follow(
         #: Step 3.3: from where we came, look clockwise round the current pixel
         #: for the next set neighbour, remembering whether the pixel to the
         #: east was one of the ones looked at.
-        let back = direction_of(previous_y - current_y, previous_x - current_x)
+        let back = step_index(previous_y - current_y, previous_x - current_x)
         var next_y = 0
         var next_x = 0
         var saw_east = false
