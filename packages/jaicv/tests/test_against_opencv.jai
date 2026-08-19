@@ -58,6 +58,7 @@ from jaicv.features2d.detect import fast
 from jaicv.objdetect.cascade import CascadeClassifier
 from jaicv.calib3d.transform import estimate_affine_2d, estimate_affine_partial_2d
 from jaicv.calib3d.transform import find_homography, project_points, rodrigues
+from jaicv.calib3d.transform import RANSAC
 from jaicv.calib3d.transform import triangulate_points, undistort_points
 from jaicv.core.types import Point3f
 from jaicv.calib3d.calibrate import calibrate_camera, find_chessboard_corners
@@ -992,6 +993,8 @@ let CALIB_NAMES = [
     "rodriguesForward",
     "rodriguesBack",
     "findHomography",
+    "findHomographyRansac",
+    "findHomographyRansacMask",
     "estimateAffine2D",
     "estimateAffinePartial2D",
     "projectPoints",
@@ -1022,6 +1025,31 @@ fn mapped_by(matrix: list[float], perspective: bool) -> list[Point2f] {
         out.push(Point2f(x / w, y / w))
     }
     return out
+}
+
+#: The correspondence set the RANSAC cases use: the seven points every other
+#: calibration case shares, five more, and two of the twelve moved far enough
+#: that they cannot belong to any fit.
+fn ransac_pair() -> tuple[list[Point2f], list[Point2f]] {
+    var source: list[Point2f] = []
+    for point in CALIB_SOURCE { source.push(point) }
+    source.push(Point2f(30.0, 85.0))
+    source.push(Point2f(75.0, 25.0))
+    source.push(Point2f(50.0, 15.0))
+    source.push(Point2f(15.0, 45.0))
+    source.push(Point2f(85.0, 50.0))
+
+    let m = [1.05, 0.08, -6.0, -0.04, 0.96, 4.0, 0.0002, -0.0003, 1.0]
+    var target: list[Point2f] = []
+    for point in source {
+        let x = m[0] * point.x + m[1] * point.y + m[2]
+        let y = m[3] * point.x + m[4] * point.y + m[5]
+        let w = m[6] * point.x + m[7] * point.y + m[8]
+        target.push(Point2f(x / w, y / w))
+    }
+    target[3] = Point2f(target[3].x + 40.0, target[3].y - 35.0)
+    target[8] = Point2f(target[8].x - 30.0, target[8].y + 45.0)
+    return (source, target)
 }
 
 fn camera_of() -> Mat {
@@ -1055,6 +1083,23 @@ fn run_calib(item: Case) -> Mat {
         let target = mapped_by([1.05, 0.08, -6.0, -0.04, 0.96, 4.0, 0.0002, -0.0003, 1.0], true)
         let (h, _inliers) = find_homography(CALIB_SOURCE, target)
         return h
+    }
+    if item.name == "findHomographyRansac" {
+        let (source, target) = ransac_pair()
+        let (h, _inliers) = find_homography(source, target, method: RANSAC, ransac_threshold: 3.0)
+        #: OpenCV scales its answer so the last element is one, and this does
+        #: not promise to; the homography is the same projective map either way.
+        let flat = h.to_list()
+        var scaled: list[float] = []
+        for value in flat { scaled.push(value / flat[8]) }
+        return Mat.from_list(3, 3, CV_MAKETYPE(5, 1), scaled)
+    }
+    if item.name == "findHomographyRansacMask" {
+        let (source, target) = ransac_pair()
+        let (_h, inliers) = find_homography(source, target, method: RANSAC, ransac_threshold: 3.0)
+        var values: list[float] = []
+        for flag in inliers { values.push(if flag { 1.0 } else { 0.0 }) }
+        return Mat.from_list(1, values.len(), CV_MAKETYPE(5, 1), values)
     }
     if item.name == "estimateAffine2D" {
         let target = mapped_by([1.1, -0.15, 7.0, 0.2, 0.95, -4.0], false)

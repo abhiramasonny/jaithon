@@ -678,6 +678,24 @@ def write_calib(handle) -> None:
     h, _ = cv2.findHomography(src, dst, 0)
     case(handle, "findHomography", "direct", blank, h.astype(np.float32))
 
+    # RANSAC, with two correspondences moved far enough that no fit can hold
+    # them. `findHomography(src, dst)` defaults to method 0, so every case
+    # above this one exercised the exact four-point path and the robust one --
+    # which is what anybody matching two photographs actually calls -- was
+    # never run against OpenCV at all.
+    ransac_src = np.vstack([src, np.array([[30.0, 85.0], [75.0, 25.0], [50.0, 15.0],
+                                           [15.0, 45.0], [85.0, 50.0]], np.float32)])
+    ransac_ones = np.hstack([ransac_src, np.ones((len(ransac_src), 1), np.float32)])
+    ransac_mapped = (h_true @ ransac_ones.T).T
+    ransac_dst = (ransac_mapped[:, :2] / ransac_mapped[:, 2:3]).astype(np.float32)
+    ransac_dst[3] += [40.0, -35.0]
+    ransac_dst[8] += [-30.0, 45.0]
+    hr, mask = cv2.findHomography(ransac_src, ransac_dst, cv2.RANSAC, 3.0)
+    case(handle, "findHomographyRansac", "outliers", blank,
+         (hr / hr[2, 2]).astype(np.float32))
+    case(handle, "findHomographyRansacMask", "outliers", blank,
+         mask.reshape(1, -1).astype(np.float32))
+
     affine_true = np.array([[1.1, -0.15, 7.0], [0.2, 0.95, -4.0]])
     affine_dst = (affine_true @ ones.T).T.astype(np.float32)
     a, _ = cv2.estimateAffine2D(src, affine_dst, method=cv2.LMEDS)
