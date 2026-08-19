@@ -588,10 +588,17 @@ var _memo: Plan? = null
 #: A training step asks for the same handful of shapes on every batch, so the
 #: plan lookup is memoised on the shape itself: a full lookup builds a cache key
 #: string, and doing that per dispatch cost more than encoding the kernel.
+#:
+#: Wrapping arithmetic throughout. A mixed hash of three dimensions masked to 48
+#: bits, multiplied again, is past 2^63 for any `rows` past a few hundred
+#: thousand -- and `conv-wide`'s backward pass asks for exactly that shape, so
+#: with `*` the whole benchmark died on an OverflowError raised from inside the
+#: plan lookup. Nothing about a hash wants trapping arithmetic. `&` binds looser
+#: than `+%`, so each line masks its whole mix.
 fn memo_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> int {
     const MASK = 0xFFFFFFFFFFFF
-    var key = rows * 6291469 + inner & MASK
-    key = key * 6291469 + columns & MASK
+    var key = rows *% 6291469 +% inner & MASK
+    key = key *% 6291469 +% columns & MASK
     key = key * 2 + (if trans_a { 1 } else { 0 })
     return key * 2 + (if trans_b { 1 } else { 0 })
 }
