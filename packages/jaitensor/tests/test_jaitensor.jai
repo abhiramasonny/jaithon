@@ -1514,6 +1514,56 @@ fn test_conv2d_layer_builds_from_image_shape() -> void {
     assert_true(history.loss.len() == 1)
 }
 
+fn test_pooling_reports_its_pooled_shape_to_the_next_layer() -> void {
+    if not jt.is_available() { return }
+    #: `Sequential` sizes each layer from the shape the one before it reports.
+    #: A pool that reported its input shape sized the Dense head as if nothing
+    #: had been pooled, and the model failed on its first forward with a matmul
+    #: shape error instead of at build time.
+    var pixels: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..4 {
+        for _pixel in 0..64 { pixels.push(float(sample) * 0.1) }
+        labels.push(float(sample % 2))
+    }
+    let features = jt.Tensor([4, 8, 8, 1], pixels)
+    let data = jt.Dataset(features, jt.Tensor([4], labels))
+    defer { data.free() }
+    let model = jt.Sequential([
+        jt.Conv2d(2, 3, padding: 1, in_channels: 1),
+        jt.MaxPool2d(2),
+        jt.Flatten(),
+        jt.Dense(2, activation: jt.Activation.Softmax),
+    ])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.05))
+    let history = model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
+    assert_true(history.loss.len() == 1)
+}
+
+fn test_average_pooling_reports_its_pooled_shape_too() -> void {
+    if not jt.is_available() { return }
+    var pixels: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..4 {
+        for _pixel in 0..64 { pixels.push(float(sample) * 0.1) }
+        labels.push(float(sample % 2))
+    }
+    let features = jt.Tensor([4, 8, 8, 1], pixels)
+    let data = jt.Dataset(features, jt.Tensor([4], labels))
+    defer { data.free() }
+    let model = jt.Sequential([
+        jt.Conv2d(2, 3, padding: 1, in_channels: 1),
+        jt.AvgPool2d(2),
+        jt.Flatten(),
+        jt.Dense(2, activation: jt.Activation.Softmax),
+    ])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.05))
+    let history = model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
+    assert_true(history.loss.len() == 1)
+}
+
 fn test_device_count_is_non_negative() -> void {
     if not jt.is_available() { return }
     assert_true(jt.device_count() >= 1)
