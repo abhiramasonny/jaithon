@@ -203,6 +203,7 @@ void jaiRegisterAllBuiltins(void) {
     jaiRegisterGCPrimitives();
     jaiRegisterReflectPrimitives();
     jaiRegisterGuiPrimitives();
+    jaiRegisterCameraPrimitives();
     jaiRegisterGpuPrimitives();
 }
 

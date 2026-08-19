@@ -46,6 +46,7 @@ void jaiRegisterThreadPrimitives(void);
 void jaiRegisterGCPrimitives(void);
 void jaiRegisterReflectPrimitives(void); /* compile, eval, exec, ast           */
 void jaiRegisterGuiPrimitives(void);
+void jaiRegisterCameraPrimitives(void);
 void jaiRegisterGpuPrimitives(void);
 void jaiRegisterAllBuiltins(void);
 

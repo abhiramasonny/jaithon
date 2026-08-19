@@ -3,6 +3,8 @@
 #include "runtime/builtins/builtins.h"
 #include "runtime/runtime.h"
 
+#include <zlib.h>
+
 typedef struct {
     uint8_t *bytes;
     size_t   count;
@@ -352,8 +354,74 @@ static bool nCrc32(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* The decoder is zlib's. Writing one here would mean a Huffman decoder, a
+ * sliding window and a stored-block path in C for no gain: -lz is already on
+ * the link line for the seed's images, so PNG input costs nothing but this
+ * wrapper. */
+static bool nInflate(int argc, Value *args, Value *out) {
+    ObjBytes *data;
+    if (!compressArgBytes(args[0], 1, "inflate", &data)) return false;
+
+    int64_t hint = 0;
+    if (argc > 1 && !IS_NULL(args[1])) {
+        if (!jaiArgInt(args[1], 2, "inflate", &hint)) return false;
+        if (hint < 0) return jaiThrow(vm.cValueError,
+                                      "inflate(): the size hint must not be negative");
+    }
+
+    size_t capacity = hint > 0 ? (size_t)hint : (data->length * 4u + 1024u);
+    uint8_t *buffer = JAI_GROW_ARRAY(uint8_t, NULL, 0, capacity);
+    if (buffer == NULL) return jaiThrow(vm.cRuntimeError, "inflate(): out of memory");
+
+    z_stream stream;
+    memset(&stream, 0, sizeof stream);
+    stream.next_in = (Bytef *)data->data;
+    stream.avail_in = (uInt)data->length;
+    /* 47 = 15 window bits plus the flag that accepts either a zlib or a gzip
+     * header, so a caller does not have to know which one it holds. */
+    if (inflateInit2(&stream, 47) != Z_OK) {
+        JAI_FREE_ARRAY(uint8_t, buffer, capacity);
+        return jaiThrow(vm.cRuntimeError, "inflate(): the decoder would not start");
+    }
+
+    size_t produced = 0;
+    for (;;) {
+        stream.next_out = buffer + produced;
+        stream.avail_out = (uInt)(capacity - produced);
+        int status = inflate(&stream, Z_NO_FLUSH);
+        produced = capacity - stream.avail_out;
+        if (status == Z_STREAM_END) break;
+        if (status == Z_BUF_ERROR || (status == Z_OK && stream.avail_out == 0)) {
+            size_t grown = capacity * 2u;
+            uint8_t *bigger = JAI_GROW_ARRAY(uint8_t, buffer, capacity, grown);
+            if (bigger == NULL) {
+                inflateEnd(&stream);
+                JAI_FREE_ARRAY(uint8_t, buffer, capacity);
+                return jaiThrow(vm.cRuntimeError, "inflate(): out of memory");
+            }
+            buffer = bigger;
+            capacity = grown;
+            continue;
+        }
+        if (status != Z_OK) {
+            inflateEnd(&stream);
+            JAI_FREE_ARRAY(uint8_t, buffer, capacity);
+            return jaiThrow(vm.cValueError, "inflate(): the stream is not valid deflate data");
+        }
+        if (stream.avail_in == 0 && stream.avail_out > 0) break;
+    }
+    inflateEnd(&stream);
+
+    ObjBytes *result = jaiBytesNew(buffer, produced);
+    JAI_FREE_ARRAY(uint8_t, buffer, capacity);
+    if (result == NULL) return false;
+    *out = OBJ_VAL(result);
+    return true;
+}
+
 void jaiRegisterCompressPrimitives(void) {
     jaiDefineNative("__prim__.deflate",  nDeflate,  2, 2);
+    jaiDefineNative("__prim__.inflate",  nInflate,  1, 2);
     jaiDefineNative("__prim__.crc32",   nCrc32,   1, 1);
     jaiDefineNative("__prim__.adler32",  nAdler32,  1, 1);
 }

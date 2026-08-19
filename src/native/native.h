@@ -11,6 +11,23 @@ extern "C" {
 #endif
 
 typedef struct JaiWindow JaiWindow;
+typedef struct JaiCamera JaiCamera;
+
+/* Video capture. Frames arrive as packed BGRA, the layout Core Video hands
+ * over and the one an image type expands in a single pass. */
+/* 1 granted, 0 not yet asked, -1 refused, -2 not allowed on this machine. */
+int         jaiCameraPermission(void);
+int         jaiCameraDeviceCount(void);
+bool        jaiCameraDeviceName(int index, char *buffer, size_t capacity);
+/* `width`/`height`/`fps` of zero mean "whatever the device prefers". Returns
+ * NULL when there is no camera, or when the user refused access. */
+JaiCamera  *jaiCameraOpen(int index, int width, int height, double fps);
+void        jaiCameraClose(JaiCamera *camera);
+bool        jaiCameraSize(JaiCamera *camera, int *width, int *height);
+/* Blocks until a frame newer than the last one read arrives, or the timeout
+ * passes; a negative timeout waits forever. */
+bool        jaiCameraRead(JaiCamera *camera, uint8_t *destination, size_t capacity,
+                          int *width, int *height, double timeoutSeconds);
 
 bool        jaiGuiAvailable(void);
 JaiWindow  *jaiWindowOpen(int width, int height, const char *title, int targetFPS);
