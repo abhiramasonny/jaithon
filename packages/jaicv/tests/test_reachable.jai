@@ -1,0 +1,600 @@
+#: Every exported entry point, called once.
+#:
+#: `test_against_opencv.jai` compares what a function computes; this asks the
+#: cheaper question first -- does it run at all -- of the part of the library
+#: that comparison does not reach. Of jaicv's exports, more than half had no
+#: caller in any test: the recorded cases cover what OpenCV was asked to
+#: record, and a function nobody recorded is a function nobody ran.
+#:
+#: That is not a hypothetical gap. `find_homography` with `RANSAC` -- OpenCV's
+#: own default, and what anybody matching two photographs calls -- raised
+#: `OverflowError` on its second sampled correspondence for as long as it had
+#: existed, because the oracle only ever recorded `method=0`. The same shape of
+#: bug took out AVI reading. Both were found by writing this file.
+#:
+#: So the contract here is deliberately weak and deliberately wide: every
+#: function is called with arguments it should accept, and what is asserted is
+#: that it returns, and that what comes back has the size, depth and channel
+#: count it promised. Anything stronger belongs in the oracle, where there is
+#: something to compare against.
+#:
+#: What is left out, and why: `highgui` needs a window server, so `imshow`,
+#: `wait_key`, the trackbars and the mouse callbacks cannot be reached from a
+#: test run. Reading a camera needs a camera. Everything else the module
+#: exports is called below.
+import std.math
+import std.gpu as gpu
+from std.io import Path
+from std.os import temp_dir
+from std.test import assert_eq, assert_true
+from jaicv.core.mat import cached_kernel, f32_bits, touch, Mat
+from jaicv.core.types import CV_8U, CV_8UC1, CV_8UC2, CV_8UC3, CV_8UC4, CV_32FC1, CV_32SC1
+from jaicv.core.types import depth_is_integer, depth_max, depth_min
+from jaicv.core.types import CV_MAKETYPE, CV_MAT_CN, Point, Point2f, Rect, RotatedRect
+from jaicv.core.types import Scalar, Size, Size2f
+from jaicv.core.arith import binary_op, bitwise_and, bitwise_or, bitwise_xor, scalar_op
+from jaicv.core.arith import abs_mat, add_weighted, convert_scale_abs, exp_mat, log_mat
+from jaicv.core.arith import max_mat, min_mat, pow_mat, scale_add, sqrt_mat, unary_op
+from jaicv.core.arith import OP_ADD, UN_SQRT
+from jaicv.core.arith import cart_to_polar, magnitude, phase, polar_to_cart
+from jaicv.imgproc.misc import accumulate, accumulate_product, accumulate_square
+from jaicv.imgproc.misc import accumulate_weighted
+from jaicv.core.misc import border_interpolate, check_range, eigen, find_non_zero
+from jaicv.core.misc import insert_channel
+from jaicv.core.misc import mahalanobis, min_max_idx, mul_transposed, patch_nans
+from jaicv.core.misc import randn, randu, set_identity, set_rng_seed
+from jaicv.core.stats import channel_stats, mean, mean_std_dev, mean_value
+from jaicv.core.stats import min_max, reduce, trace
+from jaicv.core.types import NORM_HAMMING, REDUCE_SUM
+from jaicv.core.linalg import inverse, levenberg_marquardt, null_space, symmetric_eigen
+from jaicv.core.dft import dft, mul_spectrums, DFT_COMPLEX_OUTPUT
+from jaicv.imgcodecs.codecs import imread, imwrite, have_image_reader, have_image_writer
+from jaicv.imgproc.color import cvt_color, cvt_color_nv12, cvt_color_yuy2
+from jaicv.imgproc.color import COLOR_Lab2RGB, COLOR_RGB2Lab, COLOR_RGB2YCrCb
+from jaicv.imgproc.color import COLOR_YCrCb2RGB, COLOR_GRAY2BGR
+from jaicv.imgproc.filter import bilateral_filter, get_derivative_kernels, sep_filter_2d
+from jaicv.imgproc.filter import sqr_box_filter
+from jaicv.imgproc.threshold import histogram_256, otsu_threshold, threshold
+from jaicv.imgproc.threshold import triangle_threshold, THRESH_BINARY
+from jaicv.imgproc.edges import canny
+from jaicv.imgproc.geometric import crop, get_rotation_matrix_2d, invert3, invert_transform
+from jaicv.imgproc.geometric import resize, solve_dense
+from jaicv.imgproc.drawing import clip_line, ellipse_2_poly, ellipse_rotated
+from jaicv.imgproc.drawing import line_points, rectangle, rectangle_rect
+from jaicv.imgproc.contours import draw_contours, find_contours, RETR_EXTERNAL
+from jaicv.imgproc.shape import box_points, convex_hull_indices, match_shapes
+from jaicv.imgproc.shape import moments_f, moments_image
+from jaicv.imgproc.segmentation import colour_labels, connected_components, watershed
+from jaicv.imgproc.hist import create_clahe
+from jaicv.imgproc.features import corner_sub_pix, good_features_to_track, hough_circles
+from jaicv.imgproc.features import hough_lines_p
+from jaicv.imgproc.misc import pyr_mean_shift_filtering
+from jaicv.features2d.detect import BFMatcher, ORB, SimpleBlobDetector
+from jaicv.features2d.detect import SimpleBlobDetectorParams, draw_keypoints, draw_matches
+from jaicv.objdetect.cascade import group_rectangles
+from jaicv.objdetect.hog import HOGDescriptor
+from jaicv.objdetect.xml import parse_xml
+from jaicv.calib3d.transform import find_homography, get_optimal_new_camera_matrix
+from jaicv.calib3d.transform import init_undistort_rectify_map, refine_homography
+from jaicv.calib3d.calibrate import draw_chessboard_corners
+from jaicv.video.optflow import calc_optical_flow_farneback, calc_optical_flow_pyr_lk
+from jaicv.video.optflow import flow_to_colour, polynomial_expansion
+from jaicv.video.background import create_background_subtractor_knn
+from jaicv.video.background import create_background_subtractor_mog2
+from jaicv.video.track import cam_shift, mean_shift, KalmanFilter
+from jaicv.photo.denoise import detail_enhance, edge_preserving_filter
+from jaicv.photo.denoise import fast_nl_means_denoising, fast_nl_means_denoising_colored
+from jaicv.photo.denoise import inpaint, stylization
+from jaicv.ml.models import ann_mlp_create, d_trees_create, k_nearest_create
+from jaicv.ml.models import logistic_regression_create, normal_bayes_classifier_create
+from jaicv.ml.models import r_trees_create, svm_create
+from jaicv.videoio.capture import device_count, device_name, device_names, permission
+from jaicv.videoio.capture import PERMISSION_GRANTED, PERMISSION_UNAVAILABLE
+from jaicv.dnn.blob import blob_from_images, images_from_blob, net_from
+from jaicv.dnn.blob import nms_boxes_batched, Runnable
+
+fn have_gpu() -> bool { return gpu.is_available() }
+
+#: A disc on a flat field: something with an edge, a corner-free interior and a
+#: connected component, so contours, flow, thresholds and blobs all have
+#: something real to find.
+fn disc() -> Mat {
+    var values: list[float] = []
+    for index in 0..64 * 64 {
+        let x = index % 64
+        let y = index // 64
+        values.push(if (x - 20) * (x - 20) + (y - 30) * (y - 30) < 100 { 220.0 } else { 30.0 })
+    }
+    return Mat.from_list(64, 64, CV_8UC1, values)
+}
+
+#: The same disc moved sideways, for anything that compares two frames.
+fn shifted(base: Mat, dx: int) -> Mat {
+    let flat = base.to_list()
+    var values: list[float] = []
+    for y in 0..base.rows {
+        for x in 0..base.cols {
+            values.push(flat[y * base.cols + min(max(x - dx, 0), base.cols - 1)])
+        }
+    }
+    return Mat.from_list(base.rows, base.cols, base.type_(), values)
+}
+
+fn assert_shape(result: Mat, rows: int, cols: int, channels: int) -> void {
+    assert_eq(result.rows, rows)
+    assert_eq(result.cols, cols)
+    assert_eq(result.channels(), channels)
+}
+
+fn test_core_arithmetic_and_statistics_run() -> void {
+    if not have_gpu() { return }
+    let g = disc()
+    let c = cvt_color(g, COLOR_GRAY2BGR)
+    let f = g.convert_to(CV_32FC1, 1.0 / 255.0, 0.0)
+
+    assert_shape(abs_mat(f), 64, 64, 1)
+    assert_shape(add_weighted(g, 0.5, g, 0.5, 1.0), 64, 64, 1)
+    assert_shape(bitwise_and(g, g), 64, 64, 1)
+    assert_shape(bitwise_or(g, g), 64, 64, 1)
+    assert_shape(bitwise_xor(g, g), 64, 64, 1)
+    assert_shape(binary_op(g, g, OP_ADD), 64, 64, 1)
+    assert_shape(scalar_op(g, Scalar(10.0, 0.0, 0.0), OP_ADD), 64, 64, 1)
+    assert_shape(unary_op(f, UN_SQRT), 64, 64, 1)
+    assert_shape(convert_scale_abs(f, 255.0, 0.0), 64, 64, 1)
+    assert_shape(exp_mat(f), 64, 64, 1)
+    assert_shape(log_mat(add_weighted(f, 1.0, f, 0.0, 1.0)), 64, 64, 1)
+    assert_shape(max_mat(g, g), 64, 64, 1)
+    assert_shape(min_mat(g, g), 64, 64, 1)
+    assert_shape(pow_mat(f, 2.0), 64, 64, 1)
+    assert_shape(scale_add(f, 2.0, f), 64, 64, 1)
+    assert_shape(sqrt_mat(f), 64, 64, 1)
+    assert_shape(magnitude(f, f), 64, 64, 1)
+    assert_shape(phase(f, f), 64, 64, 1)
+    assert_shape(patch_nans(f, 0.0), 64, 64, 1)
+    assert_shape(insert_channel(g, c, 1), 64, 64, 3)
+    assert_shape(reduce(f, 0, REDUCE_SUM), 1, 64, 1)
+
+    let running = Mat.zeros(64, 64, CV_32FC1)
+    assert_shape(accumulate(f, running), 64, 64, 1)
+    assert_shape(accumulate_square(f, running), 64, 64, 1)
+    assert_shape(accumulate_product(f, f, running), 64, 64, 1)
+    assert_shape(accumulate_weighted(f, running, 0.1), 64, 64, 1)
+
+    assert_eq(depth_max(CV_8U), 255.0)
+    assert_eq(depth_min(CV_8U), 0.0)
+    assert_true(depth_is_integer(CV_8U))
+    assert_true(moments_image(g).m00 > 0.0)
+
+    let (px, py) = cart_to_polar(f, f)
+    assert_shape(px, 64, 64, 1)
+    assert_shape(py, 64, 64, 1)
+    let (bx, by) = polar_to_cart(f, f)
+    assert_shape(bx, 64, 64, 1)
+    assert_shape(by, 64, 64, 1)
+
+    assert_true(check_range(f))
+    assert_true(mean_value(c) > 0.0)
+    let (low, high) = min_max(f)
+    assert_true(high >= low)
+    let (lo2, hi2, at_lo, at_hi) = min_max_idx(f)
+    assert_true(hi2 >= lo2)
+    assert_true(at_lo.x >= 0 and at_hi.x >= 0)
+    let (averages, deviations) = mean_std_dev(c)
+    assert_true(averages[0] > 0.0)
+    assert_true(deviations[0] >= 0.0)
+    let (mean_one, dev_one, total, counted) = channel_stats(c, 1)
+    assert_true(dev_one >= 0.0 and counted > 0 and total >= 0.0 and mean_one >= 0.0)
+    assert_true(find_non_zero(g).len() > 0)
+    assert_true(mean(c)[0] > 0.0)
+}
+
+fn test_core_linear_algebra_and_transforms_run() -> void {
+    if not have_gpu() { return }
+    let f = disc().convert_to(CV_32FC1, 1.0 / 255.0, 0.0)
+    let symmetric = Mat.from_list(3, 3, CV_32FC1, [4.0, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0])
+
+    let (eigenvalues, vectors) = eigen(symmetric)
+    assert_eq(eigenvalues.len(), 3)
+    assert_shape(vectors, 3, 3, 1)
+    let (svalues, svectors) = symmetric_eigen(symmetric)
+    assert_eq(svalues.len(), 3)
+    assert_shape(svectors, 3, 3, 1)
+    assert_shape(inverse(symmetric), 3, 3, 1)
+    assert_true(math.fabs(trace(symmetric)[0] - 9.0) < 1e-4)
+    assert_shape(mul_transposed(f, true), 64, 64, 1)
+    assert_eq(null_space(Mat.from_list(2, 3, CV_32FC1, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])).len(), 3)
+    assert_true(
+        mahalanobis(Mat.from_list(1, 3, CV_32FC1, [1.0, 2.0, 3.0]), Mat.from_list(1, 3, CV_32FC1, [2.0, 1.0, 4.0]), inverse(symmetric)) >=
+            0.0
+    )
+    assert_eq(solve_dense([[2.0, 1.0], [1.0, 3.0]], [5.0, 10.0]).len(), 2)
+    assert_eq(invert3([[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0]]).len(), 3)
+    assert_shape(
+        invert_transform(get_rotation_matrix_2d(Point2f(32.0, 32.0), 20.0, 1.0), false),
+        2,
+        3,
+        1
+    )
+    assert_shape(set_identity(Size(4, 4), CV_32FC1), 4, 4, 1)
+
+    #: A straight line fitted to points on one, which any working
+    #: Levenberg-Marquardt recovers in a couple of steps.
+    let xs = [0.0, 1.0, 2.0, 3.0, 4.0]
+    let residual = fn(parameters: list[float]) -> list[float] {
+        var out: list[float] = []
+        for index in 0..xs.len() {
+            out.push(parameters[0] * xs[index] + parameters[1] - (2.0 * xs[index] + 1.0))
+        }
+        return out
+    }
+    let jacobian = fn(_parameters: list[float]) -> Mat {
+        var values: list[float] = []
+        for index in 0..xs.len() {
+            values.push(xs[index])
+            values.push(1.0)
+        }
+        return Mat.from_list(xs.len(), 2, CV_32FC1, values)
+    }
+    let fitted = levenberg_marquardt(residual, jacobian, [0.0, 0.0])
+    assert_true(math.fabs(fitted[0] - 2.0) < 1e-3)
+    assert_true(math.fabs(fitted[1] - 1.0) < 1e-3)
+
+    set_rng_seed(7)
+    assert_shape(randu(Size(8, 8), CV_32FC1, 0.0, 1.0), 8, 8, 1)
+    assert_shape(randn(Size(8, 8), CV_32FC1, 0.0, 1.0), 8, 8, 1)
+
+    let spectrum = dft(f, DFT_COMPLEX_OUTPUT)
+    assert_shape(mul_spectrums(spectrum, spectrum), 64, 64, 2)
+}
+
+fn test_imgproc_run() -> void {
+    if not have_gpu() { return }
+    let g = disc()
+    let c = cvt_color(g, COLOR_GRAY2BGR)
+    let f = g.convert_to(CV_32FC1, 1.0 / 255.0, 0.0)
+    let row = Mat.from_list(3, 1, CV_32FC1, [1.0, 2.0, 1.0])
+    let (_used, mask) = threshold(g, 128.0, 255.0, THRESH_BINARY)
+    let (contours, _hierarchy) = find_contours(mask, RETR_EXTERNAL)
+    assert_true(contours.len() > 0)
+
+    assert_shape(bilateral_filter(c, 5, 30.0, 30.0), 64, 64, 3)
+    assert_shape(sep_filter_2d(g, -1, row, row), 64, 64, 1)
+    assert_shape(sqr_box_filter(f, -1, Size(3, 3)), 64, 64, 1)
+    assert_shape(crop(c, Rect(4, 4, 20, 20)), 20, 20, 3)
+    assert_shape(create_clahe(2.0, Size(8, 8)).apply(g), 64, 64, 1)
+    assert_shape(pyr_mean_shift_filtering(c, 8.0, 16.0), 64, 64, 3)
+    assert_shape(
+        colour_labels(connected_components(mask)[1], connected_components(mask)[0]),
+        64,
+        64,
+        3
+    )
+    assert_eq(histogram_256(g).len(), 256)
+    assert_true(otsu_threshold(g) > 0.0)
+    assert_true(triangle_threshold(g) > 0.0)
+
+    let (dx, dy) = get_derivative_kernels(1, 0, 3)
+    assert_eq(dx.rows * dx.cols, 3)
+    assert_eq(dy.rows * dy.cols, 3)
+
+    assert_true(border_interpolate(-3, 64, 4) >= 0)
+    assert_eq(box_points(RotatedRect(Point2f(20.0, 20.0), Size2f(10.0, 6.0), 30.0)).len(), 4)
+    let (visible, _a, _b) = clip_line(Size(64, 64), Point(-5, -5), Point(80, 80))
+    assert_true(visible)
+    assert_true(line_points(Size(64, 64), Point(-5, -5), Point(80, 80)).len() > 0)
+    assert_true(ellipse_2_poly(Point(32, 32), Size(20, 10), 30, 0, 360, 10).len() > 0)
+    assert_shape(
+        ellipse_rotated(
+            c,
+            RotatedRect(Point2f(32.0, 32.0), Size2f(20.0, 10.0), 30.0),
+            Scalar(255.0, 0.0, 0.0)
+        ),
+        64,
+        64,
+        3
+    )
+    assert_shape(rectangle_rect(c, Rect(4, 4, 20, 20), Scalar(0.0, 255.0, 0.0), 2), 64, 64, 3)
+    assert_shape(draw_contours(c, contours, -1, Scalar(0.0, 0.0, 255.0), 1), 64, 64, 3)
+
+    assert_true(match_shapes(contours[0], contours[0]) < 1e-6)
+    assert_true(
+        convex_hull_indices([Point(0, 0), Point(10, 0), Point(10, 10), Point(5, 5), Point(0, 10)]).len() >=
+            3
+    )
+    assert_true(
+        moments_f([Point2f(0.0, 0.0), Point2f(10.0, 0.0), Point2f(10.0, 10.0), Point2f(0.0, 10.0)]).m00 !=
+            0.0
+    )
+
+    assert_true(good_features_to_track(g, 20, 0.01, 5.0).len() >= 0)
+    assert_eq(corner_sub_pix(g, [Point2f(20.0, 20.0)], Size(3, 3)).len(), 1)
+    assert_true(hough_circles(g, 1.0, 10.0, 100.0, 30.0, 5, 20).len() >= 0)
+    assert_true(hough_lines_p(canny(g, 50.0, 150.0), 1.0, 0.017453292, 20, 10.0, 5.0).len() >= 0)
+
+    var markers = Mat.zeros(64, 64, CV_32SC1)
+    rectangle(markers, Point(2, 2), Point(10, 10), Scalar(1.0, 0.0, 0.0), -1)
+    rectangle(markers, Point(40, 40), Point(60, 60), Scalar(2.0, 0.0, 0.0), -1)
+    assert_shape(watershed(c, markers), 64, 64, 1)
+
+    let luma = Mat.from_list(16, 16, CV_8UC1, [128.0 for _index in 0..256])
+    let chroma = Mat.from_list(8, 8, CV_8UC2, [128.0 for _index in 0..128])
+    assert_shape(cvt_color_nv12(luma, chroma), 16, 16, 3)
+    assert_shape(
+        cvt_color_yuy2(Mat.from_list(16, 8, CV_8UC4, [128.0 for _index in 0..512])),
+        16,
+        16,
+        3
+    )
+}
+
+fn test_imgcodecs_touch_the_filesystem() -> void {
+    if not have_gpu() { return }
+    assert_true(have_image_reader("png"))
+    assert_true(have_image_writer("bmp"))
+    let path = Path(temp_dir()).join("jaicv_reachable.png").to_str()
+    assert_true(imwrite(path, cvt_color(disc(), COLOR_GRAY2BGR)))
+    assert_shape(imread(path), 64, 64, 3)
+    Path(path).remove()
+}
+
+fn test_features2d_and_objdetect_run() -> void {
+    if not have_gpu() { return }
+    let a = disc()
+    let b = shifted(a, 3)
+    let ca = cvt_color(a, COLOR_GRAY2BGR)
+    let cb = cvt_color(b, COLOR_GRAY2BGR)
+
+    let orb = ORB(60)
+    let (first, first_desc) = orb.detect_and_compute(a)
+    let (second, second_desc) = orb.detect_and_compute(b)
+    let matcher = BFMatcher(NORM_HAMMING, true)
+    let matches = matcher.match_(first_desc, second_desc)
+    assert_true(matcher.knn_match(first_desc, second_desc, 2).len() == first.len())
+    assert_shape(draw_keypoints(ca, first), 64, 64, 3)
+    assert_eq(draw_matches(ca, first, cb, second, matches).cols, 128)
+    assert_true(SimpleBlobDetector(SimpleBlobDetectorParams()).detect(a).len() >= 0)
+
+    let grouped = group_rectangles(
+        [Rect(0, 0, 10, 10), Rect(1, 1, 10, 10), Rect(2, 2, 10, 10)],
+        1,
+        0.2
+    )
+    assert_true(grouped.len() <= 3)
+
+    let hog = HOGDescriptor(Size(32, 64), Size(16, 16), Size(8, 8), Size(8, 8), 9)
+    let descriptor = hog.compute(resize(a, size: Size(32, 64)))
+    assert_eq(descriptor.len(), hog.get_descriptor_size())
+    var plane: list[float] = []
+    for _index in 0..descriptor.len() + 1 { plane.push(0.001) }
+    hog.set_svm_detector(plane)
+    assert_true(hog.detect(resize(a, size: Size(48, 80)), win_stride: Size(16, 16)).len() >= 0)
+
+    let node = parse_xml("<opencv_storage><stageNum>2</stageNum></opencv_storage>")
+    assert_eq(node.name, "opencv_storage")
+}
+
+fn test_calib3d_run() -> void {
+    if not have_gpu() { return }
+    let camera = Mat.from_list(3, 3, CV_32FC1, [50.0, 0.0, 32.0, 0.0, 50.0, 32.0, 0.0, 0.0, 1.0])
+    let distortion = [-0.2, 0.05, 0.001, -0.001, 0.0]
+    let refreshed = get_optimal_new_camera_matrix(camera, distortion, Size(64, 64), 0.0)
+    assert_shape(refreshed, 3, 3, 1)
+    let (map_x, map_y) = init_undistort_rectify_map(camera, distortion, refreshed, Size(64, 64))
+    assert_shape(map_x, 64, 64, 1)
+    assert_shape(map_y, 64, 64, 1)
+
+    var source: list[Point2f] = []
+    var target: list[Point2f] = []
+    for index in 0..8 {
+        let x = float(index % 4) * 10.0
+        let y = float(index // 4) * 10.0
+        source.push(Point2f(x, y))
+        target.push(Point2f(x * 1.2 + 2.0, y * 1.1 - 1.0))
+    }
+    let (homography, inliers) = find_homography(source, target)
+    assert_eq(inliers.len(), source.len())
+    assert_shape(refine_homography(homography, source, target), 3, 3, 1)
+
+    var corners: list[Point2f] = []
+    for index in 0..12 {
+        corners.push(Point2f(float(index % 4) * 10.0 + 5.0, float(index // 4) * 10.0 + 5.0))
+    }
+    assert_shape(
+        draw_chessboard_corners(cvt_color(disc(), COLOR_GRAY2BGR), Size(4, 3), corners, true),
+        64,
+        64,
+        3
+    )
+}
+
+fn test_video_run() -> void {
+    if not have_gpu() { return }
+    let a = disc()
+    let b = shifted(a, 3)
+    let ca = cvt_color(a, COLOR_GRAY2BGR)
+    let cb = cvt_color(b, COLOR_GRAY2BGR)
+
+    let flow = calc_optical_flow_farneback(a, b)
+    assert_shape(flow, 64, 64, 2)
+    assert_shape(flow_to_colour(flow), 64, 64, 3)
+    assert_shape(polynomial_expansion(a, 5, 1.2), 64, 64, 5)
+    let (moved, found, errors) = calc_optical_flow_pyr_lk(
+        a,
+        b,
+        [Point2f(20.0, 30.0), Point2f(25.0, 35.0)]
+    )
+    assert_eq(moved.len(), 2)
+    assert_eq(found.len(), 2)
+    assert_eq(errors.len(), 2)
+
+    let (steps, settled) = mean_shift(a, Rect(10, 20, 20, 20))
+    assert_true(steps >= 0 and settled.width > 0)
+    let (turned, boxed) = cam_shift(a, Rect(10, 20, 20, 20))
+    assert_true(boxed.width > 0 and turned.size.width >= 0.0)
+
+    let mog2 = create_background_subtractor_mog2()
+    for _round in 0..6 { assert_shape(mog2.apply(ca), 64, 64, 1) }
+    assert_shape(mog2.apply(cb), 64, 64, 1)
+    let knn = create_background_subtractor_knn()
+    for _round in 0..6 { assert_shape(knn.apply(ca), 64, 64, 1) }
+    assert_shape(knn.apply(cb), 64, 64, 1)
+
+    let filter = KalmanFilter(4, 2, 0)
+    for _round in 0..5 {
+        assert_shape(filter.predict(), 4, 1, 1)
+        assert_shape(filter.correct(Mat.from_list(2, 1, CV_32FC1, [1.0, 2.0])), 4, 1, 1)
+    }
+}
+
+fn test_photo_run() -> void {
+    if not have_gpu() { return }
+    let a = disc()
+    let ca = cvt_color(a, COLOR_GRAY2BGR)
+    assert_shape(fast_nl_means_denoising(a, 3.0, 3, 7), 64, 64, 1)
+    assert_shape(fast_nl_means_denoising_colored(ca, 3.0, 3.0, 3, 7), 64, 64, 3)
+    assert_shape(edge_preserving_filter(ca), 64, 64, 3)
+    assert_shape(detail_enhance(ca), 64, 64, 3)
+    assert_shape(stylization(ca), 64, 64, 3)
+
+    var mask = Mat.zeros(64, 64, CV_8UC1)
+    rectangle(mask, Point(30, 30), Point(36, 36), Scalar(255.0, 0.0, 0.0), -1)
+    assert_shape(inpaint(ca, mask, 3.0), 64, 64, 3)
+}
+
+#: Three clusters in three dimensions, well enough separated that every model
+#: has something learnable and none of them has to be accurate for this to mean
+#: something -- what is asked is that they train and predict at all.
+fn labelled_cloud() -> tuple[Mat, Mat, Mat] {
+    var features: list[float] = []
+    var labels: list[float] = []
+    var binary: list[float] = []
+    var state = 12345
+    for index in 0..120 {
+        state = (state *% 1103515245 +% 12345) % 2147483648
+        let cluster = index % 3
+        let jitter = float(state % 100) / 100.0 - 0.5
+        features.push(float(cluster) * 3.0 + jitter)
+        features.push(float(cluster) * -2.0 + jitter)
+        features.push(jitter)
+        labels.push(float(cluster))
+        binary.push(if cluster > 0 { 1.0 } else { 0.0 })
+    }
+    return (
+        Mat.from_list(120, 3, CV_32FC1, features),
+        Mat.from_list(120, 1, CV_32FC1, labels),
+        Mat.from_list(120, 1, CV_32FC1, binary)
+    )
+}
+
+fn test_ml_models_train_and_predict() -> void {
+    if not have_gpu() { return }
+    let (samples, labels, binary) = labelled_cloud()
+
+    let neighbours = k_nearest_create(3)
+    assert_true(neighbours.train(samples, labels))
+    assert_shape(neighbours.predict(samples), 120, 1, 1)
+
+    let bayes = normal_bayes_classifier_create()
+    assert_true(bayes.train(samples, labels))
+    assert_shape(bayes.predict(samples), 120, 1, 1)
+
+    let svm = svm_create()
+    assert_true(svm.train(samples, binary))
+    assert_shape(svm.predict(samples), 120, 1, 1)
+
+    let logistic = logistic_regression_create()
+    assert_true(logistic.train(samples, binary))
+    assert_shape(logistic.predict(samples), 120, 1, 1)
+    assert_shape(logistic.predict_proba(samples), 120, 1, 1)
+
+    let tree = d_trees_create()
+    assert_true(tree.train(samples, labels))
+    assert_shape(tree.predict(samples), 120, 1, 1)
+
+    let forest = r_trees_create()
+    assert_true(forest.train(samples, labels))
+    assert_shape(forest.predict(samples), 120, 1, 1)
+
+    let network = ann_mlp_create()
+    network.set_layer_sizes([3, 8, 1])
+    assert_true(network.train(samples, binary))
+    assert_shape(network.predict(samples), 120, 1, 1)
+}
+
+fn test_dnn_helpers_run() -> void {
+    if not have_gpu() { return }
+    let ca = cvt_color(disc(), COLOR_GRAY2BGR)
+    let cb = cvt_color(shifted(disc(), 3), COLOR_GRAY2BGR)
+    let blob = blob_from_images([ca, cb], 1.0 / 255.0, Size(32, 32))
+    assert_eq(images_from_blob(blob, 3, Size(32, 32)).len(), 2)
+    let net = net_from(Doubler())
+    assert_true(not net.empty())
+    net.set_input_params(1.0 / 255.0, Size(32, 32))
+    net.set_input_image(ca)
+    assert_true(net.forward().rows > 0)
+
+    let kept = nms_boxes_batched(
+        [Rect(0, 0, 10, 10), Rect(1, 1, 10, 10), Rect(40, 40, 10, 10)],
+        [0.9, 0.8, 0.7],
+        [0, 0, 1],
+        0.5,
+        0.4
+    )
+    assert_true(kept.len() >= 1 and kept.len() <= 3)
+}
+
+#: Something for `Net` to front: the adapter is what is being checked, not
+#: whatever runs behind it.
+class Doubler: Runnable {
+    pub fn init(self) { }
+
+    pub fn run(self, blob: Mat) -> Mat { return blob }
+}
+
+#: The colour codes that name RGB rather than BGR order. Every pair is its own
+#: inverse to within the rounding the conversion does, which is what makes them
+#: worth a case of their own rather than only a mention in the export list.
+fn test_rgb_colour_codes_round_trip() -> void {
+    if not have_gpu() { return }
+    let rgb = cvt_color(disc(), COLOR_GRAY2BGR)
+    for (forward, back) in [(COLOR_RGB2Lab, COLOR_Lab2RGB), (COLOR_RGB2YCrCb, COLOR_YCrCb2RGB)] {
+        let there = cvt_color(rgb, forward)
+        assert_shape(there, 64, 64, 3)
+        let here = cvt_color(there, back)
+        assert_shape(here, 64, 64, 3)
+        let before = rgb.to_list()
+        let after = here.to_list()
+        for index in 0..before.len() { assert_true(math.fabs(after[index] - before[index]) <= 3.0) }
+    }
+}
+
+#: The device-buffer plumbing under `Mat`. `touch` marks a buffer changed and
+#: `cached_kernel` hands back the same compiled kernel twice; neither has a
+#: visible result, so what is asked of them is that they run and agree.
+fn test_gpu_plumbing_runs() -> void {
+    if not have_gpu() { return }
+    assert_eq(f32_bits(1.5), 0x3FC00000)
+    assert_eq(f32_bits(0.0), 0)
+    let image = disc()
+    touch(image.storage)
+    assert_shape(image, 64, 64, 1)
+    #: An entry point in the core shader library, asked for twice: the second
+    #: call must hand back the pipeline the first compiled rather than compile
+    #: it again.
+    let once = cached_kernel("mat_fill")
+    let twice = cached_kernel("mat_fill")
+    assert_true(once is twice)
+}
+
+#: A camera need not be attached; what must hold is that asking costs nothing
+#: and raises nothing, because a program that opens a camera asks these first.
+fn test_camera_enumeration_answers_without_a_camera() -> void {
+    if not have_gpu() { return }
+    let count = device_count()
+    assert_true(count >= 0)
+    assert_eq(device_names().len(), count)
+    if count > 0 { assert_true(device_name(0) is not null) }
+    assert_true(device_name(count + 5) is null)
+    let state = permission()
+    assert_true(state >= PERMISSION_UNAVAILABLE and state <= PERMISSION_GRANTED)
+}
