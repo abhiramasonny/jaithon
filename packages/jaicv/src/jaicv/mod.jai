@@ -120,6 +120,14 @@ from .imgproc.hist import equalize_hist, CLAHE
 from .imgproc.hist import HISTCMP_BHATTACHARYYA, HISTCMP_CHISQR, HISTCMP_CHISQR_ALT
 from .imgproc.hist import HISTCMP_CORREL, HISTCMP_INTERSECT, HISTCMP_KL_DIV
 
+from .imgproc.features import corner_harris, corner_min_eigen_val, corner_sub_pix
+from .imgproc.features import good_features_to_track, hough_circles, hough_lines
+from .imgproc.features import hough_lines_p, match_template
+from .imgproc.features import HoughCircle, HoughLine, HoughSegment
+from .imgproc.features import HOUGH_GRADIENT, HOUGH_PROBABILISTIC, HOUGH_STANDARD
+from .imgproc.features import TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED
+from .imgproc.features import TM_SQDIFF, TM_SQDIFF_NORMED
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -224,6 +232,13 @@ export { FLOODFILL_FIXED_RANGE, FLOODFILL_MASK_ONLY }
 export { calc_back_project, calc_hist, compare_hist, create_clahe, equalize_hist, CLAHE }
 export { HISTCMP_BHATTACHARYYA, HISTCMP_CHISQR, HISTCMP_CHISQR_ALT }
 export { HISTCMP_CORREL, HISTCMP_INTERSECT, HISTCMP_KL_DIV }
+
+export { corner_harris, corner_min_eigen_val, corner_sub_pix, good_features_to_track }
+export { hough_circles, hough_lines, hough_lines_p, match_template }
+export { HoughCircle, HoughLine, HoughSegment }
+export { HOUGH_GRADIENT, HOUGH_PROBABILISTIC, HOUGH_STANDARD }
+export { TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED }
+export { TM_SQDIFF, TM_SQDIFF_NORMED }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

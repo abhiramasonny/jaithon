@@ -50,6 +50,10 @@ from jaicv.imgproc.segmentation import DIST_C, DIST_L1, DIST_L2
 from jaicv.imgproc.hist import calc_back_project, calc_hist, compare_hist, equalize_hist, CLAHE
 from jaicv.imgproc.hist import HISTCMP_BHATTACHARYYA, HISTCMP_CHISQR, HISTCMP_CHISQR_ALT
 from jaicv.imgproc.hist import HISTCMP_CORREL, HISTCMP_INTERSECT, HISTCMP_KL_DIV
+from jaicv.imgproc.features import corner_harris, corner_min_eigen_val, hough_lines
+from jaicv.imgproc.features import match_template
+from jaicv.imgproc.features import TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED
+from jaicv.imgproc.features import TM_SQDIFF, TM_SQDIFF_NORMED
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -142,6 +146,9 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     }
     if name == "getGaussianKernel" { return 1e-5 }
     if name == "distanceTransform" { return 1e-4 }
+    if name == "matchTemplate" or name == "matchTemplateColour" { return 5e-3 }
+    if name == "cornerHarris" or name == "cornerMinEigenVal" { return 1e-5 }
+    if name == "houghLines" { return 1e-4 }
     if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
@@ -577,8 +584,61 @@ fn run_hist(item: Case) -> Mat {
     throw ValueError(f"no jaicv binding for {item.name}")
 }
 
+let FEATURE_NAMES = [
+    "matchTemplate",
+    "matchTemplateColour",
+    "cornerHarris",
+    "cornerMinEigenVal",
+    "houghLines",
+]
+
+fn template_method(name: str) -> int {
+    if name == "SQDIFF" { return TM_SQDIFF }
+    if name == "SQDIFF_NORMED" { return TM_SQDIFF_NORMED }
+    if name == "CCORR" { return TM_CCORR }
+    if name == "CCORR_NORMED" { return TM_CCORR_NORMED }
+    if name == "CCOEFF" { return TM_CCOEFF }
+    if name == "CCOEFF_NORMED" { return TM_CCOEFF_NORMED }
+    throw ValueError(f"no jaicv template method for {name}")
+}
+
+fn run_features(item: Case) -> Mat {
+    let args = item.args
+    if item.name == "matchTemplate" {
+        return match_template(
+            item.source,
+            item.source.roi(Rect(10, 8, 7, 6)),
+            template_method(args[1])
+        )
+    }
+    if item.name == "matchTemplateColour" {
+        return match_template(
+            item.source,
+            item.source.roi(Rect(7, 5, 8, 6)),
+            template_method(args[1])
+        )
+    }
+    if item.name == "cornerHarris" {
+        return corner_harris(item.source, int(args[0]), int(args[1]), 0.04)
+    }
+    if item.name == "cornerMinEigenVal" {
+        return corner_min_eigen_val(item.source, int(args[0]), int(args[1]))
+    }
+    if item.name == "houghLines" {
+        let lines = hough_lines(item.source, 1.0, math.PI / 180.0, int(args[2]))
+        var values: list[float] = []
+        for line in lines {
+            values.push(line.rho)
+            values.push(line.theta)
+        }
+        return Mat.from_list(lines.len(), 2, CV_MAKETYPE(5, 1), values)
+    }
+    throw ValueError(f"no jaicv binding for {item.name}")
+}
+
 fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
+    if FEATURE_NAMES.contains(item.name) { return run_features(item) }
     if SEGMENT_NAMES.contains(item.name) { return run_segmentation(item) }
     if HIST_NAMES.contains(item.name) { return run_hist(item) }
     if SHAPE_NAMES.contains(item.name) { return run_shape(item) }
@@ -833,6 +893,29 @@ fn rotated_like(expected: Mat, produced: Mat) -> Mat {
     return produced
 }
 
+#: How far a case is allowed to drift, in proportion to the largest value in
+#: it rather than to each value on its own.
+#:
+#: A template-matching sum runs to hundreds of thousands and both sides
+#: accumulate it in float32, so what is left over is association order over
+#: numbers that size. `TM_CCOEFF` then subtracts two such sums, and the drift
+#: rides on what went into the subtraction, not on the small number that comes
+#: out — which is why this is measured against the case's own scale.
+fn relative_tolerance_for(name: str) -> float {
+    if name == "matchTemplate" or name == "matchTemplateColour" { return 1e-5 }
+    return 0.0
+}
+
+fn case_scale(name: str, want: list[float]) -> float {
+    if relative_tolerance_for(name) == 0.0 { return 0.0 }
+    var peak = 0.0
+    for value in want {
+        let size = math.fabs(value)
+        if size > peak { peak = size }
+    }
+    return peak
+}
+
 fn compare(item: Case, produced: Mat) -> tuple[float, int] {
     let want = item.expected.to_list()
     let got = produced.to_list()
@@ -841,16 +924,17 @@ fn compare(item: Case, produced: Mat) -> tuple[float, int] {
             f"{item.name} {item.args} produced {got.len()} values, OpenCV gave {want.len()}"
         )
     }
+    let slack = relative_tolerance_for(item.name) * case_scale(item.name, want)
     var worst = 0.0
     var worst_at = 0
     for index in 0..want.len() {
-        let drift = math.fabs(got[index] - want[index])
+        let drift = math.fabs(got[index] - want[index]) - slack
         if drift > worst {
             worst = drift
             worst_at = index
         }
     }
-    return (worst, worst_at)
+    return (max(worst, 0.0), worst_at)
 }
 
 fn test_every_recorded_case_matches_opencv() -> void {
@@ -881,9 +965,10 @@ fn test_every_recorded_case_matches_opencv() -> void {
         if worst > allowed {
             let want = item.expected.to_list()
             let got = produced.to_list()
+            let slack = relative_tolerance_for(item.name) * case_scale(item.name, want)
             var differing = 0
             for index in 0..want.len() {
-                if math.fabs(got[index] - want[index]) > allowed { differing += 1 }
+                if math.fabs(got[index] - want[index]) - slack > allowed { differing += 1 }
             }
             var painted = 0
             let source = item.source.to_list()
