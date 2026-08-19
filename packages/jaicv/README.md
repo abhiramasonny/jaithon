@@ -72,8 +72,26 @@ down next to the tolerance. In short:
   coverage from distance rather than from OpenCV's slope tables; ORB and BRIEF
   use a generated sampling pattern rather than OpenCV's learned table, so their
   descriptors compare against each other but not against OpenCV's; Farneback
-  flow follows the paper rather than OpenCV's tuning; the colour maps written
-  as formulas match, the ones OpenCV ships as tables do not.
+  flow follows the paper rather than OpenCV's tuning.
+- **Exact**: `emd` agrees with OpenCV's to the last printed digit on every
+  ground distance and on unequal total weights, which it should — the
+  transportation problem has one optimum and both solve it exactly.
+- **Exact**: every one of the twenty-two colour maps, on all 256 levels, for
+  one- and three-channel input alike. They are OpenCV's own tables, recorded
+  from it by `tools/colormaps_to_jai.py` rather than written out as formulas,
+  which is what makes them exact — OpenCV interpolates sixty-four control
+  points even for the maps that have a formula behind them, so a formula lands
+  a level away nearly everywhere and nowhere near at all on `RAINBOW`, `PINK`
+  and `HOT`. The one divergence is depth: OpenCV refuses anything but 8-bit,
+  where this rounds and clamps whatever it is given into the 0..255 the tables
+  are indexed by.
+- **Same segments, quieter on noise**: the line segment detector returns the
+  same segments OpenCV's does, endpoint for endpoint to a tenth of a pixel, on
+  rectangles, diagonals and triangles, and switches from finding nothing to
+  finding everything at the same contrast OpenCV does. On an image of pure
+  random noise OpenCV returns a dozen segments and this returns none — the
+  a-contrario test exists to reject exactly that, so the difference is in this
+  one's favour, but it is a difference.
 - **Same size, different letters**: `put_text` draws the public-domain Hershey
   fonts. OpenCV draws re-derived tables of its own — measured against every
   font in the Hershey distribution, no face of OpenCV's matches on glyph
@@ -119,8 +137,8 @@ Named so that nobody has to find out by trying:
   rectified border — the `alpha` parameter, which is not here.
 - **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;
   `Net` is the adapter, not a runtime.
-- **imgproc**: GrabCut, `EMD`, line segment detection, the Viridis family of
-  colour maps.
+- **imgproc**: GrabCut. Earth mover's distance, line segment detection and
+  the whole colour-map set are here now.
 - **videoio**: any container other than AVI, and any codec inside one other
   than motion JPEG and the uncompressed forms. `VideoCapture` takes a path as
   well as a camera index, indexes the file when it opens and decodes a frame

@@ -354,18 +354,17 @@ pub class Component {
 #: with the 1/sqrt(2) normalisation of the zeroth term folded in. Both
 #: transforms below index this instead of calling `math.cos`, which is what
 #: made them cost milliseconds a block.
-let DCT_BASIS = [
-    (if index // 8 == 0 { 0.70710678118654752 } else { 1.0 }) *
-        math.cos(float(2 * (index % 8) + 1) * float(index // 8) * math.PI / 16.0)
-    for index in 0..64
-]
+let DCT_BASIS = [(if index // 8 == 0 {
+    0.70710678118654752
+} else {
+    1.0
+}) * math.cos(float(2 * (index % 8) + 1) * float(index // 8) * math.PI / 16.0) for index in 0..64]
 
 #: `scratch` is the caller's, not a local: a fresh 64-element list an inner
 #: transform allocates is one allocation a block -- thousands a frame -- and
 #: the JIT cannot see the element kind of a list the body itself built, so a
 #: local scratch also left the whole function running interpreted.
-fn idct_8x8(block: list[float], out: list[float],
-            scratch: list[float]) -> void {
+fn idct_8x8(block: list[float], out: list[float], scratch: list[float]) -> void {
     #: A separable float IDCT: rows first, then columns. Slower than the
     #: integer approximations a production encoder uses and exact enough that
     #: the result never differs from a reference decoder by more than a unit.
@@ -587,8 +586,14 @@ fn scan(
                 let component = components[slot]
                 for by in 0..component.v {
                     for bx in 0..component.h {
-                        decode_block(reader, component, quant_tables[slot],
-                                     block_dc[slot], block_ac[slot], block)
+                        decode_block(
+                            reader,
+                            component,
+                            quant_tables[slot],
+                            block_dc[slot],
+                            block_ac[slot],
+                            block
+                        )
                         idct_8x8(block, pixels, dct_scratch)
                         let origin_x = (mcu_x * component.h + bx) * 8
                         let origin_y = (mcu_y * component.v + by) * 8
@@ -1205,8 +1210,7 @@ fn magnitude_of(value: int) -> int {
 #: transform allocates is one allocation a block -- thousands a frame -- and
 #: the JIT cannot see the element kind of a list the body itself built, so a
 #: local scratch also left the whole function running interpreted.
-fn fdct_8x8(block: list[float], out: list[float],
-            scratch: list[float]) -> void {
+fn fdct_8x8(block: list[float], out: list[float], scratch: list[float]) -> void {
     #: Read once into a local. A global is a module lookup on every read, and
     #: the inner loops below read this 1024 times a block.
     let basis = DCT_BASIS
@@ -1354,12 +1358,9 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
                         let blue = values[base]
                         let green = values[base + 1]
                         let red = values[base + 2]
-                        luma_plane[cell] =
-                            0.299 * red + 0.587 * green + 0.114 * blue - 128.0
-                        cb_plane[cell] =
-                            -0.168736 * red - 0.331264 * green + 0.5 * blue
-                        cr_plane[cell] =
-                            0.5 * red - 0.418688 * green - 0.081312 * blue
+                        luma_plane[cell] = 0.299 * red + 0.587 * green + 0.114 * blue - 128.0
+                        cb_plane[cell] = -0.168736 * red - 0.331264 * green + 0.5 * blue
+                        cr_plane[cell] = 0.5 * red - 0.418688 * green - 0.081312 * blue
                     }
                 }
             }

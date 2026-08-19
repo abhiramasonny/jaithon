@@ -91,7 +91,6 @@ def main() -> int:
         "#: decodes these once and caches the result.",
         "#:",
         "#: Do not edit by hand.",
-        "",
         f"pub let FIRST_CHAR = {FIRST_CHAR}",
         f"pub let GLYPH_COUNT = {GLYPH_COUNT}",
         "",
@@ -105,10 +104,7 @@ def main() -> int:
 
     lines.append("#: Indexed by the `FONT_HERSHEY_*` face numbers.")
     lines.append("pub fn face_glyphs(face: int) -> list[str] {")
-    lines.append("    let tables = [")
-    for _face, stem in FACES:
-        lines.append(f"        {stem.upper()},")
-    lines.append("    ]")
+    lines.append("    let tables = [" + ", ".join(stem.upper() for _f, stem in FACES) + "]")
     lines.append("    if face < 0 or face >= tables.len() { return tables[0] }")
     lines.append("    return tables[face]")
     lines.append("}")

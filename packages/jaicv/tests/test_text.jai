@@ -6,7 +6,6 @@
 #: is the part porting code depends on -- that a capital is the same number of
 #: pixels tall at the same `font_scale` -- and those numbers are written out
 #: below rather than computed, so a change to the metrics fails here.
-
 import jaicv as cv
 from jaicv import Mat, Point, Scalar
 from std.test import assert_eq, assert_true
@@ -50,16 +49,20 @@ fn test_cap_height_matches_opencv() -> void {
         let drawn = cap_height(FACES[index], 1.0)
         #: One pixel of slack: the cap line lands between two rows for some
         #: faces, and which way it rounds is not worth pinning.
-        assert_true(abs(drawn - CAP_PIXELS[index]) <= 1,
-                    f"face {FACES[index]} drew a capital {drawn} tall, OpenCV draws {CAP_PIXELS[index]}")
+        assert_true(
+            abs(drawn - CAP_PIXELS[index]) <= 1,
+            f"face {FACES[index]} drew a capital {drawn} tall, OpenCV draws {CAP_PIXELS[index]}"
+        )
     }
 }
 
 fn test_cap_height_scales() -> void {
     let single = cap_height(cv.FONT_HERSHEY_SIMPLEX, 1.0)
     let double = cap_height(cv.FONT_HERSHEY_SIMPLEX, 2.0)
-    assert_true(abs(double - 2 * single) <= 2,
-                f"doubling the scale drew {double} against {single} at one")
+    assert_true(
+        abs(double - 2 * single) <= 2,
+        f"doubling the scale drew {double} against {single} at one"
+    )
 }
 
 fn test_text_size_bounds_the_ink() -> void {
@@ -87,12 +90,12 @@ fn test_text_size_bounds_the_ink() -> void {
         assert_true(right >= left, "the text drew nothing")
         #: The reported box runs from `org.y - height + baseline` to
         #: `org.y + baseline`, and the ink has to sit inside it.
-        assert_true(top >= org.y - size.height + baseline - 1,
-                    f"face {face} drew above its reported box")
-        assert_true(bottom <= org.y + baseline + 1,
-                    f"face {face} drew below its reported box")
-        assert_true(right <= org.x + size.width + 1,
-                    f"face {face} drew past its reported width")
+        assert_true(
+            top >= org.y - size.height + baseline - 1,
+            f"face {face} drew above its reported box"
+        )
+        assert_true(bottom <= org.y + baseline + 1, f"face {face} drew below its reported box")
+        assert_true(right <= org.x + size.width + 1, f"face {face} drew past its reported width")
     }
 }
 
@@ -100,8 +103,11 @@ fn test_size_grows_with_the_string() -> void {
     let (one, _b1) = cv.get_text_size("M", cv.FONT_HERSHEY_SIMPLEX, 1.0, 1)
     let (two, _b2) = cv.get_text_size("MM", cv.FONT_HERSHEY_SIMPLEX, 1.0, 1)
     let (three, _b3) = cv.get_text_size("MMM", cv.FONT_HERSHEY_SIMPLEX, 1.0, 1)
-    assert_eq(two.width - one.width, three.width - two.width,
-              "every copy of a letter should advance the same distance")
+    assert_eq(
+        two.width - one.width,
+        three.width - two.width,
+        "every copy of a letter should advance the same distance"
+    )
     assert_eq(one.height, three.height, "a longer string of capitals is no taller")
 }
 
@@ -129,8 +135,15 @@ fn test_italic_leans_right_and_is_wider() -> void {
 
     #: The top of a slanted letter sits to the right of its foot.
     var image = Mat.zeros(80, 120, cv.CV_8UC1)
-    cv.put_text(image, "H", Point(20, 60), cv.FONT_HERSHEY_SIMPLEX | cv.FONT_ITALIC,
-                1.5, Scalar(255.0), 1)
+    cv.put_text(
+        image,
+        "H",
+        Point(20, 60),
+        cv.FONT_HERSHEY_SIMPLEX | cv.FONT_ITALIC,
+        1.5,
+        Scalar(255.0),
+        1
+    )
     #: The left edge of the topmost inked row against the left edge of the
     #: bottom one: on a slanted face the top of the stem stands to the right
     #: of its foot.
@@ -147,15 +160,27 @@ fn test_italic_leans_right_and_is_wider() -> void {
             bottom_left = row_left
         }
     }
-    assert_true(top_left > bottom_left,
-                f"the top ({top_left}) should lean right of the foot ({bottom_left})")
+    assert_true(
+        top_left > bottom_left,
+        f"the top ({top_left}) should lean right of the foot ({bottom_left})"
+    )
 }
 
 fn test_bottom_left_origin_flips_the_text() -> void {
     var upright = Mat.zeros(120, 200, cv.CV_8UC1)
     var flipped = Mat.zeros(120, 200, cv.CV_8UC1)
     cv.put_text(upright, "Ap", Point(20, 60), cv.FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255.0), 1)
-    cv.put_text(flipped, "Ap", Point(20, 60), cv.FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255.0), 1, cv.LINE_8, true)
+    cv.put_text(
+        flipped,
+        "Ap",
+        Point(20, 60),
+        cv.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        Scalar(255.0),
+        1,
+        cv.LINE_8,
+        true
+    )
     let a = upright.values()
     let b = flipped.values()
     var a_top = 120
@@ -175,10 +200,11 @@ fn test_every_printable_character_draws() -> void {
     #: decoded short. Space is the only one that legitimately draws nothing.
     for code in 33..127 {
         var image = Mat.zeros(120, 120, cv.CV_8UC1)
-        cv.put_text(image, chr(code), Point(30, 80), cv.FONT_HERSHEY_SIMPLEX, 2.0,
-                    Scalar(255.0), 1)
-        assert_true(int(cv.count_non_zero(image)) > 0,
-                    f"character {code} ({chr(code)}) drew nothing")
+        cv.put_text(image, chr(code), Point(30, 80), cv.FONT_HERSHEY_SIMPLEX, 2.0, Scalar(255.0), 1)
+        assert_true(
+            int(cv.count_non_zero(image)) > 0,
+            f"character {code} ({chr(code)}) drew nothing"
+        )
     }
     var blank = Mat.zeros(120, 120, cv.CV_8UC1)
     cv.put_text(blank, " ", Point(30, 80), cv.FONT_HERSHEY_SIMPLEX, 2.0, Scalar(255.0), 1)
@@ -190,8 +216,10 @@ fn test_thickness_adds_ink() -> void {
     var thick = Mat.zeros(80, 200, cv.CV_8UC1)
     cv.put_text(thin, "WWW", Point(10, 55), cv.FONT_HERSHEY_SIMPLEX, 1.2, Scalar(255.0), 1)
     cv.put_text(thick, "WWW", Point(10, 55), cv.FONT_HERSHEY_SIMPLEX, 1.2, Scalar(255.0), 3)
-    assert_true(int(cv.count_non_zero(thick)) > int(cv.count_non_zero(thin)),
-                "a thicker stroke should lay down more ink")
+    assert_true(
+        int(cv.count_non_zero(thick)) > int(cv.count_non_zero(thin)),
+        "a thicker stroke should lay down more ink"
+    )
 }
 
 fn test_rejects_a_scale_or_thickness_of_zero() -> void {
@@ -212,11 +240,18 @@ fn test_rejects_a_scale_or_thickness_of_zero() -> void {
 
 fn test_colour_reaches_every_channel() -> void {
     var image = Mat.zeros(80, 200, cv.CV_8UC3)
-    cv.put_text(image, "RGB", Point(10, 55), cv.FONT_HERSHEY_SIMPLEX, 1.2,
-                Scalar(20.0, 130.0, 240.0), 2)
+    cv.put_text(
+        image,
+        "RGB",
+        Point(10, 55),
+        cv.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        Scalar(20.0, 130.0, 240.0),
+        2
+    )
     let values = image.values()
     var found = false
-    for index in 0..(80 * 200) {
+    for index in 0..80 * 200 {
         let blue = values[index * 3]
         let green = values[index * 3 + 1]
         let red = values[index * 3 + 2]

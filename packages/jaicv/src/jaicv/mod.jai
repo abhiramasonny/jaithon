@@ -103,6 +103,11 @@ from .imgproc.text import FONT_HERSHEY_DUPLEX, FONT_HERSHEY_PLAIN, FONT_HERSHEY_
 from .imgproc.text import FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SCRIPT_SIMPLEX
 from .imgproc.text import FONT_HERSHEY_TRIPLEX, FONT_ITALIC
 
+from .imgproc.lsd import create_line_segment_detector, LineSegmentDetector
+from .imgproc.lsd import LSD_REFINE_ADV, LSD_REFINE_NONE, LSD_REFINE_STD
+
+from .imgproc.emd import emd, DIST_USER
+
 from .imgproc.contours import draw_contours, find_contours, Hierarchy
 from .imgproc.contours import CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE
 from .imgproc.contours import RETR_CCOMP, RETR_EXTERNAL, RETR_LIST, RETR_TREE
@@ -224,6 +229,10 @@ from .imgproc.misc import phase_correlate, pyr_mean_shift_filtering
 from .imgproc.misc import COLORMAP_AUTUMN, COLORMAP_BONE, COLORMAP_COOL, COLORMAP_HOT
 from .imgproc.misc import COLORMAP_HSV, COLORMAP_JET, COLORMAP_OCEAN, COLORMAP_PINK
 from .imgproc.misc import COLORMAP_RAINBOW, COLORMAP_SPRING, COLORMAP_SUMMER, COLORMAP_WINTER
+from .imgproc.misc import COLORMAP_CIVIDIS, COLORMAP_DEEPGREEN, COLORMAP_INFERNO
+from .imgproc.misc import COLORMAP_MAGMA, COLORMAP_PARULA, COLORMAP_PLASMA
+from .imgproc.misc import COLORMAP_TURBO, COLORMAP_TWILIGHT, COLORMAP_TWILIGHT_SHIFTED
+from .imgproc.misc import COLORMAP_VIRIDIS
 
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
@@ -314,6 +323,9 @@ export { rectangle, rectangle_rect }
 export { CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT }
 export { MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR }
 export { MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP }
+export { create_line_segment_detector, LineSegmentDetector }
+export { LSD_REFINE_ADV, LSD_REFINE_NONE, LSD_REFINE_STD }
+export { emd, DIST_USER }
 export { get_text_size, put_text }
 export { FONT_HERSHEY_COMPLEX, FONT_HERSHEY_COMPLEX_SMALL, FONT_HERSHEY_DUPLEX }
 export { FONT_HERSHEY_PLAIN, FONT_HERSHEY_SIMPLEX, FONT_HERSHEY_TRIPLEX }
@@ -429,6 +441,9 @@ export { pyr_mean_shift_filtering }
 export { COLORMAP_AUTUMN, COLORMAP_BONE, COLORMAP_COOL, COLORMAP_HOT }
 export { COLORMAP_HSV, COLORMAP_JET, COLORMAP_OCEAN, COLORMAP_PINK }
 export { COLORMAP_RAINBOW, COLORMAP_SPRING, COLORMAP_SUMMER, COLORMAP_WINTER }
+export { COLORMAP_CIVIDIS, COLORMAP_DEEPGREEN, COLORMAP_INFERNO, COLORMAP_MAGMA }
+export { COLORMAP_PARULA, COLORMAP_PLASMA, COLORMAP_TURBO, COLORMAP_TWILIGHT }
+export { COLORMAP_TWILIGHT_SHIFTED, COLORMAP_VIRIDIS }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

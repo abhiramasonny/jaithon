@@ -14,7 +14,6 @@
 #: decodes these once and caches the result.
 #:
 #: Do not edit by hand.
-
 pub let FIRST_CHAR = 32
 pub let GLYPH_COUNT = 96
 
@@ -713,16 +712,7 @@ pub let SCRIPTC = [
 
 #: Indexed by the `FONT_HERSHEY_*` face numbers.
 pub fn face_glyphs(face: int) -> list[str] {
-    let tables = [
-        FUTURAL,
-        FUTURAL,
-        FUTURAM,
-        ROWMAND,
-        ROWMANT,
-        ROWMANS,
-        SCRIPTS,
-        SCRIPTC,
-    ]
+    let tables = [FUTURAL, FUTURAL, FUTURAM, ROWMAND, ROWMANT, ROWMANS, SCRIPTS, SCRIPTC]
     if face < 0 or face >= tables.len() { return tables[0] }
     return tables[face]
 }
