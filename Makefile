@@ -753,7 +753,7 @@ fmt: $(TARGET)
 fmt-check: $(TARGET)
 	@./$(TARGET) fmt --check lib tests examples packages
 
-# Whether formatting a file changes the PROGRAM, which is the question
+# Whether printing a file changes the PROGRAM, which is the question
 # `fmt --check` does not ask: a file can be canonical and still have had
 # something removed on the way there. Parses every source in the tree, formats
 # it, parses it again, and compares the trees. It exists because the printer

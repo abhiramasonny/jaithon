@@ -13,20 +13,39 @@
 #: `ast_encode` has to print everything that changes what a program does -- a
 #: field it leaves out is a field this cannot see.
 #:
+#: The compact printer is checked the same way. `ast_unparse.to_source` is what
+#: `jaithon ast` and the REPL print with, and it is a different body of code
+#: from the formatter: it lost decorators too, and separately. Writing a tree
+#: out and reading it back must give the same tree.
+#:
+#: The JSON encoding is NOT checked here, though it is the same class of
+#: question. Encoding and decoding four hundred trees is thirty seconds on its
+#: own -- more than everything else in this file put together -- and
+#: `test_ast_encode` already round-trips the shapes it carries. Run it by hand
+#: if the encoder changes.
+#:
 #: Files that do not parse are counted and skipped: the error-message tests are
 #: meant not to parse, and this is not the gate for them.
 from jaithon.ast_encode import to_sexp
+from jaithon.ast_unparse import to_source
 from jaithon.compile.diag import DiagnosticBag
+from jaithon.ast import Node
 from jaithon.compile.parser import parse
 from jaithon.tool.fmt import format_source
 from std.io import Path, read_file
 
 let ROOTS = ["lib", "tests", "packages", "examples", "scripts"]
 
-fn tree_of(source: str) -> str? {
+fn parse_of(source: str) -> Node? {
     let bag = DiagnosticBag()
     let node = parse(source, 0, bag)
     if node is null or bag.has_errors() { return null }
+    return node
+}
+
+fn tree_of(source: str) -> str? {
+    let node = parse_of(source)
+    if node is null { return null }
     return to_sexp(node)
 }
 
@@ -41,9 +60,16 @@ fn main() -> int {
             if not name.ends_with(".jai") { continue }
             if name.contains("__jaicache__") { continue }
             let source = read_file(name)
-            let before = tree_of(source)
-            if before is null {
+            let parsed = parse_of(source)
+            if parsed is null {
                 skipped += 1
+                continue
+            }
+            let before = to_sexp(parsed)
+            let printed = tree_of(to_source(parsed))
+            if printed is null or printed != before {
+                changed += 1
+                print(f"UNPARSE LOST       {name}")
                 continue
             }
             var formatted = source
