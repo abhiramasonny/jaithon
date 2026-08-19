@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "name": "jaicv",
+  "version": "0.1.0",
+  "description": "OpenCV-compatible computer vision: Mat, imgproc, codecs, camera capture, features, calibration",
+  "source": "src"
+}

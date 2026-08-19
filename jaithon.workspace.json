@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "members": [
+    "packages/jaicv",
     "packages/jaiplot",
     "packages/jaitensor"
   ]
