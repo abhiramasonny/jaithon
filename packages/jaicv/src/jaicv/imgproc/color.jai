@@ -589,28 +589,11 @@ pub fn cvt_color(src: Mat, code: int, dst_channels: int = 0) -> Mat {
     let scale = if depth == CV_32F { 1.0 } else { 1.0 / 255.0 }
     let hue_scale = if depth == CV_32F { 1.0 } else { 0.5 }
     let alpha = if depth == CV_32F { 1.0 } else { 255.0 }
-    kernel_for("cvt_color").dispatch_async(
-        [src.storage, out.storage],
-        count,
-        [
-            count,
-            src.cols,
-            src.channels(),
-            out_cn,
-            src.offset,
-            src.step_,
-            out.offset,
-            out.step_,
-            recipe.family,
-            recipe.swap_rb,
-            f32_bits(scale),
-            f32_bits(hue_scale),
-            f32_bits(alpha),
-            f32_bits(depth_min(depth)),
-            f32_bits(depth_max(depth)),
-            if depth_is_integer(depth) { 1 } else { 0 },
-        ]
-    )
+    kernel_for("cvt_color").dispatch_async([src.storage, out.storage], count, [count, src.cols, src.channels(), out_cn, src.offset, src.step_, out.offset, out.step_, recipe.family, recipe.swap_rb, f32_bits(scale), f32_bits(hue_scale), f32_bits(alpha), f32_bits(depth_min(depth)), f32_bits(depth_max(depth)), if depth_is_integer(depth) {
+        1
+    } else {
+        0
+    }])
     out.invalidate()
     return out
 }
@@ -628,21 +611,11 @@ pub fn cvt_color_nv12(
     let out = Mat(luma.rows, luma.cols, CV_MAKETYPE(CV_8U, 3))
     let count = luma.rows * luma.cols
     if count == 0 { return out }
-    kernel_for("cvt_nv12").dispatch_async(
-        [luma.storage, chroma.storage, out.storage],
-        count,
-        [
-            count,
-            luma.cols,
-            luma.step_,
-            chroma.step_,
-            3,
-            out.offset,
-            out.step_,
-            swap_rb,
-            if full_range { 1 } else { 0 },
-        ]
-    )
+    kernel_for("cvt_nv12").dispatch_async([luma.storage, chroma.storage, out.storage], count, [count, luma.cols, luma.step_, chroma.step_, 3, out.offset, out.step_, swap_rb, if full_range {
+        1
+    } else {
+        0
+    }])
     out.invalidate()
     return out
 }

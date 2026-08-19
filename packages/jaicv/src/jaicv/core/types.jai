@@ -29,7 +29,7 @@ pub fn CV_MAKETYPE(depth: int, channels: int) -> int {
     if channels < 1 or channels > 512 {
         throw ValueError(f"channel count must be 1..512, got {channels}")
     }
-    return (depth & _DEPTH_MASK) + ((channels - 1) << _CHANNEL_SHIFT)
+    return (depth & _DEPTH_MASK) + (channels - 1 << _CHANNEL_SHIFT)
 }
 
 #: The depth half of a type code.
@@ -103,7 +103,7 @@ pub class Point: Printable {
     pub fn __sub__(self, other: Point) -> Point { return Point(self.x - other.x, self.y - other.y) }
 
     pub fn __eq__(self, other: any) -> bool {
-        if not (other is Point) { return false }
+        if not other is Point { return false }
         return self.x == other.x and self.y == other.y
     }
 
@@ -139,7 +139,7 @@ pub class Point2f: Printable {
     }
 
     pub fn __eq__(self, other: any) -> bool {
-        if not (other is Point2f) { return false }
+        if not other is Point2f { return false }
         return self.x == other.x and self.y == other.y
     }
 
@@ -218,7 +218,7 @@ pub class Size: Printable {
     pub fn empty(self) -> bool { return self.width <= 0 or self.height <= 0 }
 
     pub fn __eq__(self, other: any) -> bool {
-        if not (other is Size) { return false }
+        if not other is Size { return false }
         return self.width == other.width and self.height == other.height
     }
 
@@ -287,7 +287,7 @@ pub class Rect: Printable {
     }
 
     pub fn __eq__(self, other: any) -> bool {
-        if not (other is Rect) { return false }
+        if not other is Rect { return false }
         return self.x == other.x and
             self.y == other.y and
             self.width == other.width and
@@ -410,7 +410,7 @@ pub class Scalar: Printable {
     }
 
     pub fn __eq__(self, other: any) -> bool {
-        if not (other is Scalar) { return false }
+        if not other is Scalar { return false }
         return self.v0 == other.v0 and
             self.v1 == other.v1 and
             self.v2 == other.v2 and

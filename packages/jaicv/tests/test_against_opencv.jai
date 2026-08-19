@@ -306,7 +306,10 @@ fn run_case(item: Case) -> Mat {
         )
     }
     if item.name == "getStructuringElement" {
-        return get_structuring_element(shape_named(item.args[0]), Size(int(item.args[1]), int(item.args[1])))
+        return get_structuring_element(
+            shape_named(item.args[0]),
+            Size(int(item.args[1]), int(item.args[1]))
+        )
     }
     if item.name == "erode" {
         return erode(item.source, element: structuring_case(item.args))

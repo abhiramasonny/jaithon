@@ -374,7 +374,7 @@ fn warp(
     border_value: Scalar
 ) -> Mat {
     src.flush()
-    let inverse = if (flags & WARP_INVERSE_MAP) != 0 {
+    let inverse = if flags & WARP_INVERSE_MAP != 0 {
         matrix
     } else {
         invert_transform(matrix, perspective)
@@ -383,22 +383,11 @@ fn warp(
     let out = Mat(size.height, size.width, src.flags)
     let count = size.height * size.width * src.channels()
     if count == 0 { return out }
-    var scalars = [
-        count,
-        src.rows,
-        src.cols,
-        src.channels(),
-        src.offset,
-        src.step_,
-        size.width,
-        out.offset,
-        out.step_,
-        inverse.offset,
-        if perspective { 1 } else { 0 },
-        interpolation_code(flags),
-        border_mode,
-        f32_bits(border_value[0]),
-    ]
+    var scalars = [count, src.rows, src.cols, src.channels(), src.offset, src.step_, size.width, out.offset, out.step_, inverse.offset, if perspective {
+        1
+    } else {
+        0
+    }, interpolation_code(flags), border_mode, f32_bits(border_value[0])]
     for value in saturation_args(out.flags) { scalars.push(value) }
     kernel_for("geo_warp").dispatch_async(
         [src.storage, out.storage, inverse.storage],
@@ -661,7 +650,7 @@ pub fn solve_dense(rows: list[list[float]], right: list[float]) -> list[float] {
     while column < width and pivot_row < n {
         var best = pivot_row
         var best_size = math.fabs(matrix[pivot_row][column])
-        for candidate in (pivot_row + 1)..n {
+        for candidate in pivot_row + 1..n {
             let size = math.fabs(matrix[candidate][column])
             if size > best_size {
                 best = candidate
@@ -676,12 +665,12 @@ pub fn solve_dense(rows: list[list[float]], right: list[float]) -> list[float] {
         matrix[pivot_row] = matrix[best]
         matrix[best] = swap
         let leading = matrix[pivot_row][column]
-        for index in column..(width + 1) { matrix[pivot_row][index] /= leading }
+        for index in column..width + 1 { matrix[pivot_row][index] /= leading }
         for other in 0..n {
             if other == pivot_row { continue }
             let factor = matrix[other][column]
             if factor == 0.0 { continue }
-            for index in column..(width + 1) {
+            for index in column..width + 1 {
                 matrix[other][index] -= factor * matrix[pivot_row][index]
             }
         }

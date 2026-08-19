@@ -288,7 +288,7 @@ pub fn mean_std_dev(src: Mat, mask: Mat? = null) -> tuple[Scalar, Scalar] {
     }
     return (
         Scalar(averages[0], averages[1], averages[2], averages[3]),
-        Scalar(deviations[0], deviations[1], deviations[2], deviations[3]),
+        Scalar(deviations[0], deviations[1], deviations[2], deviations[3])
     )
 }
 
@@ -346,7 +346,10 @@ pub fn norm(src: Mat, other: Mat? = null, norm_type: int = NORM_L2, mask: Mat? =
     var target = src
     if other is not null {
         let wide = CV_MAKETYPE(CV_32F, src.channels())
-        target = unary_op(binary_op(src.convert_to(wide), other.convert_to(wide), OP_SUBTRACT), UN_ABS)
+        target = unary_op(
+            binary_op(src.convert_to(wide), other.convert_to(wide), OP_SUBTRACT),
+            UN_ABS
+        )
     }
     var l1 = 0.0
     var l2 = 0.0
@@ -406,29 +409,14 @@ pub fn reduce(src: Mat, dim: int, op: int = REDUCE_SUM, dtype: int = -1) -> Mat 
     let cn = src.channels()
     let out_rows = if dim == 0 { 1 } else { src.rows }
     let out_cols = if dim == 0 { src.cols } else { 1 }
-    let target_type = if dtype >= 0 {
-        CV_MAKETYPE(dtype, cn)
-    } else {
-        CV_MAKETYPE(CV_32F, cn)
-    }
+    let target_type = if dtype >= 0 { CV_MAKETYPE(dtype, cn) } else { CV_MAKETYPE(CV_32F, cn) }
     let out = Mat(out_rows, out_cols, target_type)
     let count = out_rows * out_cols * cn
     if count == 0 { return out }
     kernel_for("stats_reduce_axis").dispatch_async(
         [src.storage, out.storage],
         count,
-        [
-            count,
-            src.rows,
-            src.cols,
-            cn,
-            src.offset,
-            src.step_,
-            out.offset,
-            out.step_,
-            dim,
-            op,
-        ]
+        [count, src.rows, src.cols, cn, src.offset, src.step_, out.offset, out.step_, dim, op]
     )
     out.invalidate()
     return out

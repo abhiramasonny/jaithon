@@ -268,7 +268,7 @@ var _generations: dict[int, int] = {}
 #: the buffer handle, which every window of an allocation shares.
 pub fn touch(storage: Buffer) -> void {
     let key = storage.handle_of()
-    _generations[key] = (_generations.get(key, 0) + 1) & 0x3FFFFFFF
+    _generations[key] = _generations.get(key, 0) + 1 & 0x3FFFFFFF
 }
 
 fn generation_of(storage: Buffer) -> int { return _generations.get(storage.handle_of(), 0) }
@@ -359,7 +359,7 @@ pub class Mat: Printable {
     pub static fn eye(rows: int, cols: int, type_code: int) -> Mat {
         let channels = CV_MAT_CN(type_code)
         var values: list[float] = []
-        for _index in 0..(rows * cols * channels) { values.push(0.0) }
+        for _index in 0..rows * cols * channels { values.push(0.0) }
         let limit = min(rows, cols)
         for index in 0..limit {
             for channel in 0..channels { values[(index * cols + index) * channels + channel] = 1.0 }
@@ -368,12 +368,7 @@ pub class Mat: Printable {
     }
 
     #: Build from row-major values, one per channel per pixel.
-    pub static fn from_list(
-        rows: int,
-        cols: int,
-        type_code: int,
-        values: list[float]
-    ) -> Mat {
+    pub static fn from_list(rows: int, cols: int, type_code: int, values: list[float]) -> Mat {
         let channels = CV_MAT_CN(type_code)
         if values.len() != rows * cols * channels {
             throw ValueError(

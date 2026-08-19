@@ -357,11 +357,7 @@ pub fn get_gaussian_kernel(ksize: int, sigma: float) -> Mat {
         let table = _SMALL_GAUSSIANS[(ksize - 1) // 2]
         return Mat.from_list(ksize, 1, CV_MAKETYPE(CV_32F, 1), [value for value in table])
     }
-    let width = if sigma > 0.0 {
-        sigma
-    } else {
-        0.3 * (float(ksize - 1) * 0.5 - 1.0) + 0.8
-    }
+    let width = if sigma > 0.0 { sigma } else { 0.3 * (float(ksize - 1) * 0.5 - 1.0) + 0.8 }
     let scale = -0.5 / (width * width)
     var values: list[float] = []
     var total = 0.0
@@ -544,7 +540,7 @@ fn _binomial(order: int) -> list[float] {
     var row = [1.0]
     for _step in 0..order {
         var next: list[float] = [1.0]
-        for index in 0..(row.len() - 1) { next.push(row[index] + row[index + 1]) }
+        for index in 0..row.len() - 1 { next.push(row[index] + row[index + 1]) }
         next.push(1.0)
         row = next
     }
@@ -553,7 +549,7 @@ fn _binomial(order: int) -> list[float] {
 
 fn _differentiate(row: list[float]) -> list[float] {
     var next: list[float] = [-row[0]]
-    for index in 0..(row.len() - 1) { next.push(row[index] - row[index + 1]) }
+    for index in 0..row.len() - 1 { next.push(row[index] - row[index + 1]) }
     next.push(row[row.len() - 1])
     return next
 }
@@ -569,7 +565,7 @@ pub fn sobel(
     delta: float = 0.0,
     border_mode: int = BORDER_DEFAULT
 ) -> Mat {
-    if dx < 0 or dy < 0 or (dx == 0 and dy == 0) {
+    if dx < 0 or dy < 0 or dx == 0 and dy == 0 {
         throw ValueError("sobel needs a non-zero derivative order")
     }
     let (row, column) = get_derivative_kernels(dx, dy, ksize)

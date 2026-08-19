@@ -665,24 +665,11 @@ fn _compare(a: Mat, b: Mat, value: float, scalar_rhs: bool, op: int, dst: Mat?) 
     let out = destination_for(a, dst, CV_MAKETYPE(CV_8U, a.channels()))
     let count = a.rows * a.cols * a.channels()
     if count == 0 { return out }
-    kernel_for("arith_compare").dispatch_async(
-        [a.storage, b.storage, out.storage],
-        count,
-        [
-            count,
-            a.cols,
-            a.channels(),
-            a.offset,
-            a.step_,
-            b.offset,
-            b.step_,
-            out.offset,
-            out.step_,
-            op,
-            if scalar_rhs { 1 } else { 0 },
-            f32_bits(value),
-        ]
-    )
+    kernel_for("arith_compare").dispatch_async([a.storage, b.storage, out.storage], count, [count, a.cols, a.channels(), a.offset, a.step_, b.offset, b.step_, out.offset, out.step_, op, if scalar_rhs {
+        1
+    } else {
+        0
+    }, f32_bits(value)])
     out.invalidate()
     return out
 }
@@ -794,24 +781,15 @@ fn _polar(a: Mat, b: Mat, degrees: bool, inverse: bool) -> tuple[Mat, Mat] {
     let second = Mat(a.rows, a.cols, CV_MAKETYPE(CV_32F, 1))
     let count = a.rows * a.cols
     if count == 0 { return (first, second) }
-    kernel_for("arith_polar").dispatch_async(
-        [a.storage, b.storage, first.storage, second.storage],
-        count,
-        [
-            count,
-            a.cols,
-            a.offset,
-            a.step_,
-            b.offset,
-            b.step_,
-            first.offset,
-            first.step_,
-            second.offset,
-            second.step_,
-            if degrees { 1 } else { 0 },
-            if inverse { 1 } else { 0 },
-        ]
-    )
+    kernel_for("arith_polar").dispatch_async([a.storage, b.storage, first.storage, second.storage], count, [count, a.cols, a.offset, a.step_, b.offset, b.step_, first.offset, first.step_, second.offset, second.step_, if degrees {
+        1
+    } else {
+        0
+    }, if inverse {
+        1
+    } else {
+        0
+    }])
     first.invalidate()
     second.invalidate()
     return (first, second)
