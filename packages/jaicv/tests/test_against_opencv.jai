@@ -55,6 +55,7 @@ from jaicv.imgproc.features import match_template
 from jaicv.imgproc.features import TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED
 from jaicv.imgproc.features import TM_SQDIFF, TM_SQDIFF_NORMED
 from jaicv.features2d.detect import fast
+from jaicv.objdetect.cascade import CascadeClassifier
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -653,8 +654,34 @@ fn run_fast(item: Case) -> Mat {
     return Mat.from_list(found.len(), 3, CV_MAKETYPE(5, 1), values)
 }
 
+var _cascade: CascadeClassifier? = null
+
+fn cascade_for() -> CascadeClassifier {
+    let existing = _cascade
+    if existing is not null { return existing }
+    let made = CascadeClassifier("packages/jaicv/tests/oracle/synthetic_cascade.xml")
+    _cascade = made
+    return made
+}
+
+fn run_cascade(item: Case) -> Mat {
+    #: With no minimum neighbour count the grouping step is skipped, so this
+    #: compares the raw window-by-window decisions rather than the clustering
+    #: on top of them.
+    let found = cascade_for().detect_multi_scale(item.source, float(item.args[0]), 0)
+    var values: list[float] = []
+    for box in found {
+        values.push(float(box.x))
+        values.push(float(box.y))
+        values.push(float(box.width))
+        values.push(float(box.height))
+    }
+    return Mat.from_list(found.len(), 4, CV_MAKETYPE(4, 1), values)
+}
+
 fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
+    if item.name == "cascadeDetect" { return run_cascade(item) }
     if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }
     if SEGMENT_NAMES.contains(item.name) { return run_segmentation(item) }
@@ -856,6 +883,13 @@ fn run_case(item: Case) -> Mat {
 #: is short and the boundary is most of it: 75 of 288. Everything else is far
 #: under — a filled ellipse differs in nine elements out of 867.
 fn budget_for(item: Case, painted: int) -> int {
+    #: A cascade decides each window by comparing a response against a fixed
+    #: threshold, and the response is read out of an image this shrank on the
+    #: device while the reference shrank it on the host. Those two agree to
+    #: within a grey level, which is enough to move a window sitting right on
+    #: its threshold from one side to the other. Over two hundred windows one
+    #: or two do.
+    if item.name == "cascadeDetect" { return max(painted // 50, 4) }
     if not uses_fixed_point(item) { return 0 }
     return painted // 3
 }
