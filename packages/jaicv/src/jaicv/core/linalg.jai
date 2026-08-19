@@ -222,6 +222,115 @@ pub fn null_space(a: Mat) -> list[float] {
     return out
 }
 
+#: Singular value decomposition, as `(u, s, vt)` with `a = u diag(s) vt`.
+#:
+#: Built on `symmetric_eigen` rather than on a bidiagonalisation: the right
+#: singular vectors are the eigenvectors of `aᵀa` and the singular values the
+#: square roots of its eigenvalues, and `u` follows by projection. That is the
+#: textbook route and it squares the condition number, which for the sizes this
+#: is asked about — a three by three essential matrix, a nine-column design —
+#: costs half the digits of a double and leaves plenty.
+#:
+#: The columns come back in decreasing order of singular value. A column whose
+#: singular value is zero has no direction to project, so it is filled by
+#: completing the basis, which is what makes `u` orthogonal even for a matrix
+#: that is not full rank — the case every essential matrix is.
+pub fn svd(a: Mat) -> tuple[Mat, list[float], Mat] {
+    let rows = a.rows
+    let columns = a.cols
+    if rows < columns {
+        #: Decompose the transpose and swap the two sides back, so the
+        #: eigenproblem is always over the shorter dimension.
+        let (u, s, vt) = svd(transpose(a))
+        return (transpose(vt), s, transpose(u))
+    }
+    let (eigenvalues, vectors) = symmetric_eigen(matmul(transpose(a), a))
+    var singular: list[float] = []
+    for value in eigenvalues { singular.push(math.sqrt(max(value, 0.0))) }
+
+    #: `symmetric_eigen` hands back its vectors a ROW each, which is OpenCV's
+    #: convention and already the transpose this wants. Reading it the other
+    #: way round rebuilds the matrix correctly and leaves `u` not orthogonal,
+    #: which is the sort of wrong that only shows up two functions later.
+    let vt_values = vectors.to_list()
+    let source = a.to_list()
+    var u: list[float] = []
+    for _index in 0..rows * columns { u.push(0.0) }
+
+    #: Relative, not absolute. A singular value a millionth of the largest is
+    #: the square root of an eigenvalue that float32 could not tell from zero,
+    #: and dividing by it does not recover a direction -- it amplifies the
+    #: noise into one. Such a value is reported as the zero it is, which is
+    #: also what makes a rank test on the result mean anything.
+    let floor = singular[0] * 1e-6
+    var established: list[bool] = []
+    for _index in 0..columns { established.push(false) }
+    for column in 0..columns {
+        if singular[column] <= floor {
+            singular[column] = 0.0
+            continue
+        }
+        var projected: list[float] = []
+        var length = 0.0
+        for row in 0..rows {
+            var total = 0.0
+            for k in 0..columns {
+                total += source[row * columns + k] * vt_values[column * columns + k]
+            }
+            let value = total / singular[column]
+            projected.push(value)
+            length += value * value
+        }
+        #: The projection must come out a unit vector. When it does not, the
+        #: singular value it divided by was noise rather than a length -- which
+        #: is what happens to a matrix BUILT to be rank deficient, where the
+        #: eigenvalue that should be zero is a rounding error whose square root
+        #: is large enough to pass any threshold set ahead of time. The column
+        #: is completed below instead. `find_essential_mat` produces exactly
+        #: such a matrix, and without this its translation came back as noise.
+        length = math.sqrt(length)
+        if math.fabs(length - 1.0) > 1e-3 {
+            singular[column] = 0.0
+            continue
+        }
+        for row in 0..rows { u[row * columns + column] = projected[row] }
+        established[column] = true
+    }
+
+    #: A direction the matrix sends to nothing has nothing to project, so the
+    #: column is completed instead: a trial axis, orthogonalised against every
+    #: column already established, twice — once is not enough in float32 when
+    #: the axis nearly lies in the span already.
+    for column in 0..columns {
+        if established[column] { continue }
+        for axis in 0..rows {
+            var candidate: list[float] = []
+            for row in 0..rows { candidate.push(if row == axis { 1.0 } else { 0.0 }) }
+            for _pass in 0..2 {
+                for other in 0..columns {
+                    if not established[other] { continue }
+                    var dot = 0.0
+                    for row in 0..rows { dot += candidate[row] * u[row * columns + other] }
+                    for row in 0..rows { candidate[row] -= dot * u[row * columns + other] }
+                }
+            }
+            var length = 0.0
+            for value in candidate { length += value * value }
+            length = math.sqrt(length)
+            if length < 1e-3 { continue }
+            for row in 0..rows { u[row * columns + column] = candidate[row] / length }
+            established[column] = true
+            break
+        }
+    }
+
+    return (
+        Mat.from_list(rows, columns, CV_MAKETYPE(CV_32F, 1), u),
+        singular,
+        Mat.from_list(columns, columns, CV_MAKETYPE(CV_32F, 1), vt_values)
+    )
+}
+
 #: Fit parameters by Levenberg-Marquardt.
 #:
 #: `residual` returns how far the current parameters are from fitting, one
