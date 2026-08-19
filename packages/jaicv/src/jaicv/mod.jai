@@ -109,6 +109,17 @@ from .imgproc.shape import moments_image, point_polygon_test, Moments
 from .imgproc.shape import CONTOURS_MATCH_I1, CONTOURS_MATCH_I2, CONTOURS_MATCH_I3
 from .imgproc.shape import DIST_FAIR, DIST_HUBER, DIST_L1, DIST_L2, DIST_WELSCH
 
+from .imgproc.segmentation import colour_labels, connected_components
+from .imgproc.segmentation import connected_components_with_stats, distance_transform
+from .imgproc.segmentation import flood_fill, integral, watershed, ComponentStats
+from .imgproc.segmentation import DIST_C, DIST_MASK_3, DIST_MASK_5
+from .imgproc.segmentation import FLOODFILL_FIXED_RANGE, FLOODFILL_MASK_ONLY
+
+from .imgproc.hist import calc_back_project, calc_hist, compare_hist, create_clahe
+from .imgproc.hist import equalize_hist, CLAHE
+from .imgproc.hist import HISTCMP_BHATTACHARYYA, HISTCMP_CHISQR, HISTCMP_CHISQR_ALT
+from .imgproc.hist import HISTCMP_CORREL, HISTCMP_INTERSECT, HISTCMP_KL_DIV
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -204,6 +215,15 @@ export { is_contour_convex, match_shapes, min_area_rect, min_enclosing_circle }
 export { moments, moments_f, moments_image, point_polygon_test, Moments }
 export { CONTOURS_MATCH_I1, CONTOURS_MATCH_I2, CONTOURS_MATCH_I3 }
 export { DIST_FAIR, DIST_HUBER, DIST_L1, DIST_L2, DIST_WELSCH }
+
+export { colour_labels, connected_components, connected_components_with_stats }
+export { distance_transform, flood_fill, integral, watershed, ComponentStats }
+export { DIST_C, DIST_MASK_3, DIST_MASK_5 }
+export { FLOODFILL_FIXED_RANGE, FLOODFILL_MASK_ONLY }
+
+export { calc_back_project, calc_hist, compare_hist, create_clahe, equalize_hist, CLAHE }
+export { HISTCMP_BHATTACHARYYA, HISTCMP_CHISQR, HISTCMP_CHISQR_ALT }
+export { HISTCMP_CORREL, HISTCMP_INTERSECT, HISTCMP_KL_DIV }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
