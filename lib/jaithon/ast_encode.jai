@@ -460,6 +460,15 @@ fn _print_body(out: StringBuilder, node: Node, child: int) -> void {
         NodeKind.FnDecl => {
             _name_attr(out, "name", node.opt_text("name"))
             _type_attr(out, "returns", node.type_field("returnType"))
+            #: Decorators change what a function IS -- `@trace` puts it in the
+            #: traced tier, `@gpu_kernel` makes it a kernel -- so a printed
+            #: tree that omits them shows two different functions as the same
+            #: one. It did: `jaithon ast` printed them alike, and so any check
+            #: that compares trees was blind to a tool dropping one.
+            for (index, decorator) in node.get("decorators").enumerate() {
+                _emit(out, if index == 0 { " decorators=" } else { "," })
+                _emit(out, decorator)
+            }
             let vis = node.visibility()
             if vis != Visibility.Private { _emit(out, f" vis={_VISIBILITY_NAMES[vis]}") }
             if node.flag("isStatic") { _emit(out, " static") }
