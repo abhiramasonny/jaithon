@@ -224,7 +224,8 @@ bool jaiGpuSynchronize(void) {
 bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
                          size_t bOffset, JaiGpuBuffer *out, size_t outOffset,
                          uint32_t m, uint32_t k, uint32_t n, bool transA,
-                         bool transB) {
+                         bool transB, bool useHalf) {
+    (void)useHalf;
     (void)a;
     (void)aOffset;
     (void)b;

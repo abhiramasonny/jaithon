@@ -571,12 +571,13 @@ static bool nGpuMatMulBuffers(int argc, Value *args, Value *out) {
     if (!requireBuffer(args[2], 3, "gpu_matmul_buffers", &result)) return false;
 
     int64_t m, k, n;
-    bool transA, transB;
+    bool transA, transB, useHalf;
     if (!jaiArgInt(args[3], 4, "gpu_matmul_buffers", &m)) return false;
     if (!jaiArgInt(args[4], 5, "gpu_matmul_buffers", &k)) return false;
     if (!jaiArgInt(args[5], 6, "gpu_matmul_buffers", &n)) return false;
     if (!jaiArgBool(args[6], 7, "gpu_matmul_buffers", &transA)) return false;
     if (!jaiArgBool(args[7], 8, "gpu_matmul_buffers", &transB)) return false;
+    if (!jaiArgBool(args[8], 9, "gpu_matmul_buffers", &useHalf)) return false;
     if (m < 0 || k < 0 || n < 0 || m > UINT32_MAX || k > UINT32_MAX || n > UINT32_MAX)
         return jaiThrow(vm.cValueError,
                         "gpu_matmul_buffers(): dimensions must fit in uint32, got "
@@ -586,7 +587,7 @@ static bool nGpuMatMulBuffers(int argc, Value *args, Value *out) {
         a->buffer, (size_t)a->origin * sizeof(float),
         b->buffer, (size_t)b->origin * sizeof(float),
         result->buffer, (size_t)result->origin * sizeof(float),
-        (uint32_t)m, (uint32_t)k, (uint32_t)n, transA, transB);
+        (uint32_t)m, (uint32_t)k, (uint32_t)n, transA, transB, useHalf);
     if (!ok)
         return jaiThrow(vm.cRuntimeError, "gpu_matmul_buffers(): the kernel failed");
     *out = NULL_VAL;
@@ -1068,7 +1069,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_vector_add", nGpuVectorAdd, 2, 2);
     jaiDefineNative("__prim__.gpu_vector_mul", nGpuVectorMul, 2, 2);
     jaiDefineNative("__prim__.gpu_matmul",     nGpuMatMul,    5, 5);
-    jaiDefineNative("__prim__.gpu_matmul_buffers", nGpuMatMulBuffers, 8, 8);
+    jaiDefineNative("__prim__.gpu_matmul_buffers", nGpuMatMulBuffers, 9, 9);
     jaiDefineNative("__prim__.gpu_mha_buffers", nGpuMhaBuffers, 8, 8);
     jaiDefineNative("__prim__.gpu_conv2d_buffers", nGpuConv2dBuffers, 15, 15);
     jaiDefineNative("__prim__.gpu_mlp_sgd_step", nGpuMlpSgdStep, 13, 13);

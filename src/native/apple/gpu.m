@@ -1262,11 +1262,8 @@ static bool blitMany(__unsafe_unretained id<MTLBuffer> *srcs, JaiGpuBuffer **dst
     return true;
 }
 
-static MPSGraphTensor *ampMatMul(MPSGraph *graph, MPSGraphTensor *a, MPSGraphTensor *b,
-                                 NSString *name) {
-    if (!gMixedPrecision) {
-        return [graph matrixMultiplicationWithPrimaryTensor:a secondaryTensor:b name:name];
-    }
+static MPSGraphTensor *ampMatMulForced(MPSGraph *graph, MPSGraphTensor *a, MPSGraphTensor *b,
+                                       NSString *name) {
     MPSGraphTensor *a16 = [graph castTensor:a toType:MPSDataTypeFloat16
                                        name:[name stringByAppendingString:@"_a16"]];
     MPSGraphTensor *b16 = [graph castTensor:b toType:MPSDataTypeFloat16
@@ -1277,6 +1274,14 @@ static MPSGraphTensor *ampMatMul(MPSGraph *graph, MPSGraphTensor *a, MPSGraphTen
     return [graph castTensor:c16 toType:MPSDataTypeFloat32 name:name];
 }
 
+static MPSGraphTensor *ampMatMul(MPSGraph *graph, MPSGraphTensor *a, MPSGraphTensor *b,
+                                 NSString *name) {
+    if (!gMixedPrecision) {
+        return [graph matrixMultiplicationWithPrimaryTensor:a secondaryTensor:b name:name];
+    }
+    return ampMatMulForced(graph, a, b, name);
+}
+
 static MPSGraphTensorData *graphDataMTL(id<MTLBuffer> buf, NSArray<NSNumber *> *shape) {
     if (buf == nil) return nil;
     return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf
@@ -1285,10 +1290,10 @@ static MPSGraphTensorData *graphDataMTL(id<MTLBuffer> buf, NSArray<NSNumber *> *
 }
 
 static NSArray *cachedMpsGraph(uint32_t m, uint32_t k, uint32_t n, bool transA,
-                               bool transB) {
+                               bool transB, bool useHalf) {
     if (gMpsGraphs == nil) gMpsGraphs = [[NSMutableDictionary alloc] init];
     NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%d:%d:%d", m, k, n, transA, transB,
-                     gMixedPrecision ? 1 : 0];
+                     useHalf ? 1 : 0];
     NSArray *cached = gMpsGraphs[key];
     if (cached != nil) return cached;
 
@@ -1308,8 +1313,18 @@ static NSArray *cachedMpsGraph(uint32_t m, uint32_t k, uint32_t n, bool transA,
     MPSGraphTensor *right = transB
         ? [graph transposeTensor:rawB permutation:@[ @1, @0 ] name:@"BT"]
         : rawB;
-    MPSGraphTensor *product =
-        ampMatMul(graph, left, right, @"C");
+    /* Whether to cast is the caller's to decide rather than the global
+     * mixed-precision flag's. Inside a fused graph the cast is free: the
+     * tensors it wraps never leave the graph, so MPSGraph folds the conversion
+     * into the producer. Standing alone, both ends are the caller's float32
+     * buffers, so casting means materialising a half copy of A, of B, and of
+     * the whole m-by-n result and converting it back — which on a large output
+     * costs more than the faster multiply saves, and on a small one does not.
+     * Which way round it falls depends on the shape, so jaitensor measures
+     * both and asks for the one that won. */
+    MPSGraphTensor *product = useHalf
+        ? ampMatMulForced(graph, left, right, @"C")
+        : [graph matrixMultiplicationWithPrimaryTensor:left secondaryTensor:right name:@"C"];
     cached = @[ graph, rawA, rawB, product ];
     gMpsGraphs[key] = cached;
     return cached;
@@ -1318,7 +1333,7 @@ static NSArray *cachedMpsGraph(uint32_t m, uint32_t k, uint32_t n, bool transA,
 bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
                          size_t bOffset, JaiGpuBuffer *out, size_t outOffset,
                          uint32_t m, uint32_t k, uint32_t n, bool transA,
-                         bool transB) {
+                         bool transB, bool useHalf) {
     if (a == NULL || b == NULL || out == NULL) return false;
     if (a->buffer == NULL || b->buffer == NULL || out->buffer == NULL) return false;
     if (m == 0 || n == 0) return true;
@@ -1345,7 +1360,7 @@ bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
 
     @autoreleasepool {
         @synchronized(gQueue) {
-            NSArray *cached = cachedMpsGraph(m, k, n, transA, transB);
+            NSArray *cached = cachedMpsGraph(m, k, n, transA, transB, useHalf);
             if (cached == nil || cached.count != 4) return false;
             MPSGraph *graph = cached[0];
             MPSGraphTensor *rawA = cached[1];

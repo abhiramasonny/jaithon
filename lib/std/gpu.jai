@@ -500,6 +500,13 @@ pub fn synchronize() -> void {
 #: `trans_a` / `trans_b` read `a` or `b` as transposed. Row bytes of each
 #: physical matrix must be a multiple of 16 (width divisible by 4). Used by
 #: jaitensor for GEMMs large enough that Metal Performance Shaders wins.
+#:
+#: `half` runs the product in half precision, converting on the way in and back
+#: on the way out. Whether that is a gain depends on the shape — the conversion
+#: touches the whole of the result, so a product with a large output and a
+#: short inner dimension spends more on converting than it saves on
+#: multiplying — which is why it is asked for per call rather than taken from
+#: the device-wide mixed-precision setting.
 pub fn matmul_async(
     a: Buffer,
     b: Buffer,
@@ -508,7 +515,8 @@ pub fn matmul_async(
     inner: int,
     columns: int,
     trans_a: bool = false,
-    trans_b: bool = false
+    trans_b: bool = false,
+    half: bool = false
 ) -> void {
     _require_device("matmul_async")
     if rows < 0 or inner < 0 or columns < 0 {
@@ -524,7 +532,8 @@ pub fn matmul_async(
         inner,
         columns,
         trans_a,
-        trans_b
+        trans_b,
+        half
     )
 }
 
