@@ -495,10 +495,16 @@ pub fn emd(
 
     var reported = lower_bound
     let totals_match = math.fabs(total1 - total2) < WEIGHT_EPSILON * total1
+    #: Refused whatever the weights come to, as OpenCV refuses it: the bound is
+    #: a distance between centres of mass, and a caller-supplied cost matrix
+    #: says nothing about where the clusters are. Testing this inside the
+    #: matching-totals branch let the combination through silently whenever the
+    #: signatures weighed different amounts, and echoed the caller's own bound
+    #: back as though it had been checked.
+    if lower_bound != 0.0 and dist_type == DIST_USER {
+        throw ValueError("a lower bound is a distance, so it cannot go with DIST_USER")
+    }
     if lower_bound != 0.0 and totals_match {
-        if dist_type == DIST_USER {
-            throw ValueError("a lower bound is a distance, so it cannot go with DIST_USER")
-        }
         #: The centres of mass are as far apart as the cheapest schedule has to
         #: move the average gram, so no transport plan can beat that — which is
         #: what makes this a bound worth testing before paying for the simplex.

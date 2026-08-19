@@ -73,9 +73,17 @@ down next to the tolerance. In short:
   use a generated sampling pattern rather than OpenCV's learned table, so their
   descriptors compare against each other but not against OpenCV's; Farneback
   flow follows the paper rather than OpenCV's tuning.
-- **Exact**: `emd` agrees with OpenCV's to the last printed digit on every
-  ground distance and on unequal total weights, which it should — the
-  transportation problem has one optimum and both solve it exactly.
+- **Exact**: `grab_cut` reproduces OpenCV's segmentation pixel for pixel —
+  intersection-over-union 1.0000 and every pixel agreeing, on a flat rectangle
+  over noise and on a textured ellipse over noise, at three and at four
+  iterations. The mixture models, the smoothness term and the min cut all have
+  to agree for that to happen, so it is a stronger check than it looks.
+- **Within float32**: `emd` finds the same optimum OpenCV's does — the
+  transportation problem has one — but not the same digits, because OpenCV
+  carries its costs and flows in float32 and this carries them in float64.
+  Over sixty random signature pairs across all three ground distances and
+  both equal and unequal total weights, the worst disagreement is 4.7e-7
+  relative, 5.2e-7 absolute.
 - **Exact**: every one of the twenty-two colour maps, on all 256 levels, for
   one- and three-channel input alike. They are OpenCV's own tables, recorded
   from it by `tools/colormaps_to_jai.py` rather than written out as formulas,
@@ -137,8 +145,8 @@ Named so that nobody has to find out by trying:
   rectified border — the `alpha` parameter, which is not here.
 - **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;
   `Net` is the adapter, not a runtime.
-- **imgproc**: GrabCut. Earth mover's distance, line segment detection and
-  the whole colour-map set are here now.
+- **imgproc**: guided filter, superpixels and structured edge detection, which
+  are OpenCV's contrib module rather than its core.
 - **videoio**: any container other than AVI, and any codec inside one other
   than motion JPEG and the uncompressed forms. `VideoCapture` takes a path as
   well as a camera index, indexes the file when it opens and decodes a frame

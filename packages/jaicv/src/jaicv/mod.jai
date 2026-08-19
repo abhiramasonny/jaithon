@@ -108,6 +108,10 @@ from .imgproc.lsd import LSD_REFINE_ADV, LSD_REFINE_NONE, LSD_REFINE_STD
 
 from .imgproc.emd import emd, DIST_USER
 
+from .imgproc.grabcut import grab_cut
+from .imgproc.grabcut import GC_BGD, GC_EVAL, GC_EVAL_FREEZE_MODEL, GC_FGD
+from .imgproc.grabcut import GC_INIT_WITH_MASK, GC_INIT_WITH_RECT, GC_PR_BGD, GC_PR_FGD
+
 from .imgproc.contours import draw_contours, find_contours, Hierarchy
 from .imgproc.contours import CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE
 from .imgproc.contours import RETR_CCOMP, RETR_EXTERNAL, RETR_LIST, RETR_TREE
@@ -326,6 +330,8 @@ export { MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP }
 export { create_line_segment_detector, LineSegmentDetector }
 export { LSD_REFINE_ADV, LSD_REFINE_NONE, LSD_REFINE_STD }
 export { emd, DIST_USER }
+export { grab_cut, GC_BGD, GC_EVAL, GC_EVAL_FREEZE_MODEL, GC_FGD }
+export { GC_INIT_WITH_MASK, GC_INIT_WITH_RECT, GC_PR_BGD, GC_PR_FGD }
 export { get_text_size, put_text }
 export { FONT_HERSHEY_COMPLEX, FONT_HERSHEY_COMPLEX_SMALL, FONT_HERSHEY_DUPLEX }
 export { FONT_HERSHEY_PLAIN, FONT_HERSHEY_SIMPLEX, FONT_HERSHEY_TRIPLEX }
