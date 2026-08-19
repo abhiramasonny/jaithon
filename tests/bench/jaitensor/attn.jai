@@ -54,20 +54,9 @@ fn main() -> int {
     warmup_k.free()
     warmup_v.free()
     let shapes = if level == "easy" {
-        [
-            ("attn-256", 256, 256, 8),
-            ("attn-512", 512, 512, 8),
-            ("attn-1024", 1024, 512, 8),
-        ]
+        [("attn-256", 256, 256, 8), ("attn-512", 512, 512, 8), ("attn-1024", 1024, 512, 8)]
     } else {
-        [
-            ("attn-256", 256, 256, 8),
-            ("attn-512", 512, 512, 8),
-            ("attn-1024", 1024, 512, 8),
-            ("attn-1024-wide", 1024, 1024, 16),
-            ("attn-2048", 2048, 1024, 16),
-            ("attn-4096", 4096, 1024, 16),
-        ]
+        [("attn-256", 256, 256, 8), ("attn-512", 512, 512, 8), ("attn-1024", 1024, 512, 8), ("attn-1024-wide", 1024, 1024, 16), ("attn-2048", 2048, 1024, 16), ("attn-4096", 4096, 1024, 16)]
     }
     for (name, seq, dim, heads) in shapes {
         let (seconds, valid) = time_attn(seq, dim, heads, repeats)

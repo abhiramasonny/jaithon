@@ -61,7 +61,7 @@ fn assert_gpu_matmul_probes(
         [0, columns - 1],
         [rows - 1, 0],
         [rows - 1, columns - 1],
-        [rows // 2, columns // 2]
+        [rows // 2, columns // 2],
     ]
     for probe in probes {
         let row = probe[0]
@@ -85,7 +85,11 @@ fn assert_gpu_matmul(
     tol: float = 5e-3
 ) -> void {
     let a = if trans_a { device_tensor([inner, rows], 1) } else { device_tensor([rows, inner], 1) }
-    let b = if trans_b { device_tensor([columns, inner], 2) } else { device_tensor([inner, columns], 2) }
+    let b = if trans_b {
+        device_tensor([columns, inner], 2)
+    } else {
+        device_tensor([inner, columns], 2)
+    }
     defer { a.free() }
     defer { b.free() }
     gpu.flush()
@@ -1389,8 +1393,20 @@ fn test_static_step_matches_autograd_weights() -> void {
         batch_size: 32
     )
     autograd_model.compile(jt.SGD(learning_rate: 0.1), loss: jt.SparseCategoricalCrossentropy())
-    let static_history = static_model.fit(data, epochs: 3, batch_size: 32, verbose: false, plot_path: null)
-    let autograd_history = autograd_model.fit(data, epochs: 3, batch_size: 32, verbose: false, plot_path: null)
+    let static_history = static_model.fit(
+        data,
+        epochs: 3,
+        batch_size: 32,
+        verbose: false,
+        plot_path: null
+    )
+    let autograd_history = autograd_model.fit(
+        data,
+        epochs: 3,
+        batch_size: 32,
+        verbose: false,
+        plot_path: null
+    )
     assert abs(static_history.loss[2] - autograd_history.loss[2]) < 0.05
 }
 
@@ -1400,12 +1416,27 @@ fn test_static_kernels_are_traced() -> void {
 
 fn test_conv2d_matches_spatial_output_and_channel_count() -> void {
     if not jt.is_available() { return }
-    let x = jt.Tensor([1, 4, 4, 1], [
-        1.0, 2.0, 3.0, 4.0,
-        5.0, 6.0, 7.0, 8.0,
-        9.0, 10.0, 11.0, 12.0,
-        13.0, 14.0, 15.0, 16.0,
-    ])
+    let x = jt.Tensor(
+        [1, 4, 4, 1],
+        [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            9.0,
+            10.0,
+            11.0,
+            12.0,
+            13.0,
+            14.0,
+            15.0,
+            16.0,
+        ]
+    )
     let weights = jt.Tensor([2, 2, 1, 1], [1.0, 0.0, 0.0, 0.0])
     let y = jt.conv2d(x, weights, stride: 1, padding: 0)
     defer { x.free() }
@@ -1467,18 +1498,14 @@ fn test_dataloader_shuffle_covers_every_sample() -> void {
 
 fn test_mixed_precision_matmul_stays_close() -> void {
     if not jt.is_available() { return }
-    let a = jt.Tensor([4, 4], [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
-    ])
-    let b = jt.Tensor([4, 4], [
-        2.0, 0.0, 0.0, 0.0,
-        0.0, 3.0, 0.0, 0.0,
-        0.0, 0.0, 4.0, 0.0,
-        0.0, 0.0, 0.0, 5.0,
-    ])
+    let a = jt.Tensor(
+        [4, 4],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    )
+    let b = jt.Tensor(
+        [4, 4],
+        [2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0]
+    )
     jt.set_mixed_precision(true)
     let y = jt.matmul(a, b)
     jt.set_mixed_precision(false)
@@ -1503,11 +1530,13 @@ fn test_conv2d_layer_builds_from_image_shape() -> void {
     let features = jt.Tensor([4, 4, 4, 1], pixels)
     let data = jt.Dataset(features, jt.Tensor([4], [float(label) for label in labels]))
     defer { data.free() }
-    let model = jt.Sequential([
-        jt.Conv2d(2, 3, padding: 1, in_channels: 1),
-        jt.Flatten(),
-        jt.Dense(2, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential(
+        [
+            jt.Conv2d(2, 3, padding: 1, in_channels: 1),
+            jt.Flatten(),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
     defer { model.free() }
     model.compile(jt.SGD(learning_rate: 0.05))
     let history = model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
@@ -1529,12 +1558,14 @@ fn test_pooling_reports_its_pooled_shape_to_the_next_layer() -> void {
     let features = jt.Tensor([4, 8, 8, 1], pixels)
     let data = jt.Dataset(features, jt.Tensor([4], labels))
     defer { data.free() }
-    let model = jt.Sequential([
-        jt.Conv2d(2, 3, padding: 1, in_channels: 1),
-        jt.MaxPool2d(2),
-        jt.Flatten(),
-        jt.Dense(2, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential(
+        [
+            jt.Conv2d(2, 3, padding: 1, in_channels: 1),
+            jt.MaxPool2d(2),
+            jt.Flatten(),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
     defer { model.free() }
     model.compile(jt.SGD(learning_rate: 0.05))
     let history = model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
@@ -1552,12 +1583,14 @@ fn test_average_pooling_reports_its_pooled_shape_too() -> void {
     let features = jt.Tensor([4, 8, 8, 1], pixels)
     let data = jt.Dataset(features, jt.Tensor([4], labels))
     defer { data.free() }
-    let model = jt.Sequential([
-        jt.Conv2d(2, 3, padding: 1, in_channels: 1),
-        jt.AvgPool2d(2),
-        jt.Flatten(),
-        jt.Dense(2, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential(
+        [
+            jt.Conv2d(2, 3, padding: 1, in_channels: 1),
+            jt.AvgPool2d(2),
+            jt.Flatten(),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
     defer { model.free() }
     model.compile(jt.SGD(learning_rate: 0.05))
     let history = model.fit(data, epochs: 1, batch_size: 2, verbose: false, plot_path: null)
@@ -1579,14 +1612,14 @@ fn test_conv2d_on_a_batch_slice_reads_that_slice() -> void {
     let channels = 2
     let stride = side * side * channels
     var values: list[float] = []
-    for index in 0..(3 * batch * stride) {
-        values.push(float((index * 7) % 13) * 0.05 - 0.3)
+    for index in 0..3 * batch * stride {
+        values.push(float(index * 7 % 13) * 0.05 - 0.3)
     }
     let all = jt.Tensor([3 * batch, side, side, channels], values)
     defer { all.free() }
     var weight_values: list[float] = []
-    for index in 0..(3 * 3 * channels * 8) {
-        weight_values.push(float((index * 5) % 9) * 0.05 - 0.2)
+    for index in 0..3 * 3 * channels * 8 {
+        weight_values.push(float(index * 5 % 9) * 0.05 - 0.2)
     }
     let weights = jt.Tensor([3, 3, channels, 8], weight_values)
     defer { weights.free() }
@@ -1625,12 +1658,14 @@ fn test_a_convolution_actually_trains() -> void {
     let data = jt.Dataset(jt.Tensor([batch, 8, 8, 1], pixels), jt.Tensor([batch], labels))
     defer { data.free() }
     let conv = jt.Conv2d(4, 3, padding: 1, in_channels: 1, activation: jt.Activation.Relu)
-    let model = jt.Sequential([
-        conv,
-        jt.MaxPool2d(2),
-        jt.Flatten(),
-        jt.Dense(2, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential(
+        [
+            conv,
+            jt.MaxPool2d(2),
+            jt.Flatten(),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
     defer { model.free() }
     model.compile(jt.SGD(learning_rate: 0.2))
     model.fit(data, epochs: 1, batch_size: 8, verbose: false, plot_path: null)
@@ -1654,17 +1689,13 @@ fn conv_drift_after(samples: int, batch_size: int) -> float {
     var pixels: list[float] = []
     var labels: list[float] = []
     for _sample in 0..samples {
-        for index in 0..64 { pixels.push(float((index * 7) % 11) * 0.1 - 0.5) }
+        for index in 0..64 { pixels.push(float(index * 7 % 11) * 0.1 - 0.5) }
         labels.push(0.0)
     }
     let data = jt.Dataset(jt.Tensor([samples, 8, 8, 1], pixels), jt.Tensor([samples], labels))
     defer { data.free() }
     let conv = jt.Conv2d(4, 3, padding: 1, in_channels: 1, activation: jt.Activation.Relu)
-    let model = jt.Sequential([
-        conv,
-        jt.Flatten(),
-        jt.Dense(2, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential([conv, jt.Flatten(), jt.Dense(2, activation: jt.Activation.Softmax)])
     defer { model.free() }
     #: Small enough that the parameters barely move, so every batch sees the
     #: same gradient and the totals are comparable.
@@ -1832,11 +1863,13 @@ fn test_sequential_predict_skips_dropout() -> void {
     if not jt.is_available() { return }
     let data = separable_data(8)
     defer { data.free() }
-    let model = jt.Sequential([
-        jt.Dense(4, activation: jt.Activation.Relu),
-        jt.Dropout(0.9),
-        jt.Dense(2, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential(
+        [
+            jt.Dense(4, activation: jt.Activation.Relu),
+            jt.Dropout(0.9),
+            jt.Dense(2, activation: jt.Activation.Softmax),
+        ]
+    )
     defer { model.free() }
     model.compile(jt.SGD(learning_rate: 0.05))
     model.fit(data, epochs: 1, batch_size: 8, verbose: false, plot_path: null)
@@ -2059,13 +2092,13 @@ fn test_flash_attention_matches_per_head_sdpa() -> void {
     let hd = 2
     var values: list[float] = []
     for i in 0..seq * heads * hd {
-        values.push(float((i * 3) % 11) / 5.0 - 1.0)
+        values.push(float(i * 3 % 11) / 5.0 - 1.0)
     }
     let q = jt.Tensor([seq, heads * hd], values)
     let k = jt.Tensor([seq, heads * hd], values)
     var vvals: list[float] = []
     for i in 0..seq * heads * hd {
-        vvals.push(float((i * 5) % 7) / 3.0)
+        vvals.push(float(i * 5 % 7) / 3.0)
     }
     let v = jt.Tensor([seq, heads * hd], vvals)
     defer { q.free() }
@@ -2104,13 +2137,13 @@ fn test_wide_flash_attention_matches_per_head_sdpa() -> void {
     let hd = 32
     var values: list[float] = []
     for i in 0..seq * heads * hd {
-        values.push(float((i * 3) % 11) / 5.0 - 1.0)
+        values.push(float(i * 3 % 11) / 5.0 - 1.0)
     }
     let q = jt.Tensor([seq, heads * hd], values)
     let k = jt.Tensor([seq, heads * hd], values)
     var vvals: list[float] = []
     for i in 0..seq * heads * hd {
-        vvals.push(float((i * 5) % 7) / 3.0)
+        vvals.push(float(i * 5 % 7) / 3.0)
     }
     let v = jt.Tensor([seq, heads * hd], vvals)
     defer { q.free() }

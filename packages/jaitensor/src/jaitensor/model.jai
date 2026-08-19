@@ -458,7 +458,11 @@ pub class Sequential {
         let flush_every = 8
         var start = 0
         var batches = 0
-        let loader = if self.shuffle_batches { DataLoader(dataset, batch_size, shuffle: true) } else { null }
+        let loader = if self.shuffle_batches {
+            DataLoader(dataset, batch_size, shuffle: true)
+        } else {
+            null
+        }
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)
             var batch_features: Tensor
@@ -647,17 +651,15 @@ pub class Sequential {
         let parameters = self._parameters()
         let expected = (hidden_layers + 1) * 2
         if parameters.len() != expected {
-            throw RuntimeError(f"fused SGD needs {hidden_layers + 1} dense layers with weights and bias")
+            throw RuntimeError(
+                f"fused SGD needs {hidden_layers + 1} dense layers with weights and bias"
+            )
         }
         if widths.len() != hidden_layers {
             throw RuntimeError("fused SGD missing hidden widths")
         }
         let flush_every = if flush_each_epoch { 0x7fffffff } else { self._flush_every() }
-        let correct = if total_correct is null {
-            null
-        } else {
-            total_correct.buffer()
-        }
+        let correct = if total_correct is null { null } else { total_correct.buffer() }
         if dataset.features.rank() == 2 {
             if hidden_layers == 1 {
                 return gpu.mlp_sgd_epoch(
@@ -710,11 +712,7 @@ pub class Sequential {
             if count != batch_size and processed > 0 { break }
             let batch_features = self._slice_features(dataset, start, count)
             let batch_labels = self._slice_labels(dataset, start, count)
-            let correct = if total_correct is null {
-                null
-            } else {
-                total_correct.buffer()
-            }
+            let correct = if total_correct is null { null } else { total_correct.buffer() }
             if hidden_layers == 1 {
                 gpu.mlp_sgd_step(
                     batch_features.buffer(),
@@ -806,7 +804,9 @@ pub class Sequential {
         let parameters = self._parameters()
         let expected = (hidden_layers + 1) * 2
         if parameters.len() != expected {
-            throw RuntimeError(f"fused MLP step needs {hidden_layers + 1} dense layers with weights and bias")
+            throw RuntimeError(
+                f"fused MLP step needs {hidden_layers + 1} dense layers with weights and bias"
+            )
         }
         if widths.len() != hidden_layers {
             throw RuntimeError("fused MLP step missing hidden widths")
@@ -820,11 +820,7 @@ pub class Sequential {
             if count != batch_size and processed > 0 { break }
             let batch_features = self._slice_features(dataset, start, count)
             let batch_labels = self._slice_labels(dataset, start, count)
-            let correct = if total_correct is null {
-                null
-            } else {
-                total_correct.buffer()
-            }
+            let correct = if total_correct is null { null } else { total_correct.buffer() }
             if hidden_layers == 1 {
                 gpu.mlp_bwd_step(
                     batch_features.buffer(),
@@ -941,12 +937,7 @@ pub class Sequential {
         }
         var layer_widths: list[int] = []
         for layer in self.layers { layer_widths.push(layer.output_width()) }
-        self.plan_value = ExecutionPlan(
-            self.input_units,
-            batch_size,
-            layer_widths,
-            static_step
-        )
+        self.plan_value = ExecutionPlan(self.input_units, batch_size, layer_widths, static_step)
     }
 
     fn _static_step_active(self, batch_size: int) -> bool {
@@ -1008,12 +999,7 @@ pub class Sequential {
         let activations = self._static_forward(batch_features)
         let prediction = activations[activations.len() - 1]
         self._zero_grad()
-        let (loss, delta) = sparse_ce_with_delta(
-            prediction,
-            batch_labels,
-            total_loss,
-            count
-        )
+        let (loss, delta) = sparse_ce_with_delta(prediction, batch_labels, total_loss, count)
         self._static_backward(batch_features, activations, delta)
         optimizer.step(self._parameters())
         loss.free()
@@ -1032,7 +1018,11 @@ pub class Sequential {
         let flush_every = 8
         var start = 0
         var batches = 0
-        let loader = if self.shuffle_batches { DataLoader(dataset, batch_size, shuffle: true) } else { null }
+        let loader = if self.shuffle_batches {
+            DataLoader(dataset, batch_size, shuffle: true)
+        } else {
+            null
+        }
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)
             var batch_features: Tensor

@@ -1635,17 +1635,17 @@ fn f32_bits(value: float) -> int {
         mag = -mag
     }
     if mag == 0.0 { return sign << 31 }
-    if mag >= 3.4028234663852886e38 { return (sign << 31) | 0x7F800000 }
+    if mag >= 3.4028234663852886e38 { return sign << 31 | 0x7F800000 }
     if mag <= 1.401298464324817e-45 { return sign << 31 }
     let split = __prim__.f64_frexp(mag)
     let biased = split[1] + 126
     if biased <= 0 {
         let frac = int(__prim__.f64_ldexp(mag, 149))
-        return (sign << 31) | (frac & 0x7FFFFF)
+        return sign << 31 | frac & 0x7FFFFF
     }
-    if biased >= 255 { return (sign << 31) | 0x7F800000 }
+    if biased >= 255 { return sign << 31 | 0x7F800000 }
     let frac = int((split[0] * 2.0 - 1.0) * 8388608.0 + 0.5)
-    return (sign << 31) | (biased << 23) | (frac & 0x7FFFFF)
+    return sign << 31 | biased << 23 | frac & 0x7FFFFF
 }
 
 #: The compiled pipeline for one entry point in this module's shader library.
@@ -1931,10 +1931,7 @@ pub fn matmul(
     if out is null and (a.requires_grad or b.requires_grad) {
         output.attach_creator(GradNode([a, b], fn(upstream: Tensor) -> list[Tensor] {
             if trans_a and trans_b {
-                return [
-                    raw_matmul(b, upstream, trans_a: true, trans_b: true),
-                    raw_matmul(upstream, a, trans_a: true, trans_b: true),
-                ]
+                return [raw_matmul(b, upstream, trans_a: true, trans_b: true), raw_matmul(upstream, a, trans_a: true, trans_b: true)]
             }
             if trans_a {
                 return [raw_matmul(b, upstream, trans_b: true), raw_matmul(a, upstream)]
@@ -2051,12 +2048,7 @@ pub fn dense_affine(x: Tensor, weights: Tensor, bias: Tensor, activation: int) -
 
 #: Dense forward without autograd graph construction.
 @trace
-pub fn dense_static_forward(
-    x: Tensor,
-    weights: Tensor,
-    bias: Tensor,
-    activation: int
-) -> Tensor {
+pub fn dense_static_forward(x: Tensor, weights: Tensor, bias: Tensor, activation: int) -> Tensor {
     if activation < 0 or activation > 3 {
         throw ValueError(f"dense_affine activation must be 0..3, got {activation}")
     }
@@ -2255,11 +2247,7 @@ pub fn clamp(input: Tensor, lo: float, hi: float) -> Tensor {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(input.shape)
             let k = cached_kernel("clamp_backward")
-            k.dispatch_async(
-                [input.buffer(), upstream.buffer(), g.buffer()],
-                input.size,
-                [input.size, f32_bits(lo), f32_bits(hi)]
-            )
+            k.dispatch_async([input.buffer(), upstream.buffer(), g.buffer()], input.size, [input.size, f32_bits(lo), f32_bits(hi)])
             return [g]
         }))
     }
@@ -2309,11 +2297,7 @@ pub fn minimum(a: Tensor, b: Tensor) -> Tensor {
 fn broadcast_scalar(source: Tensor, shape: list[int]) -> Tensor {
     let output = Tensor(shape)
     let kernel = cached_kernel("fill_from_scalar")
-    kernel.dispatch_async(
-        [source.buffer(), output.buffer()],
-        output.size,
-        [output.size]
-    )
+    kernel.dispatch_async([source.buffer(), output.buffer()], output.size, [output.size])
     return output
 }
 
@@ -2323,11 +2307,7 @@ fn expand_last(reduced: Tensor, columns: int) -> Tensor {
     shape.push(columns)
     let output = Tensor(shape)
     let kernel = cached_kernel("broadcast_last")
-    kernel.dispatch_async(
-        [reduced.buffer(), output.buffer()],
-        output.size,
-        [reduced.size, columns]
-    )
+    kernel.dispatch_async([reduced.buffer(), output.buffer()], output.size, [reduced.size, columns])
     return output
 }
 
@@ -2343,7 +2323,9 @@ pub fn sum(input: Tensor, axis: int? = null) -> Tensor {
             [input.size],
             group_size: 256
         )
-        let output = if groups == 1 { partials } else {
+        let output = if groups == 1 {
+            partials
+        } else {
             let total = sum(partials)
             partials.free()
             total
@@ -2397,7 +2379,9 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
         for i in 0..rank {
             if i == resolved { continue }
             if part.shape[i] != parts[0].shape[i] {
-                throw ValueError(f"cat shape mismatch at axis {i}: {part.shape} vs {parts[0].shape}")
+                throw ValueError(
+                    f"cat shape mismatch at axis {i}: {part.shape} vs {parts[0].shape}"
+                )
             }
         }
         along += part.shape[resolved]
@@ -2431,11 +2415,7 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
                 let back = cached_kernel("copy_range")
                 for (index, shape) in shapes.enumerate() {
                     let grad = Tensor(shape)
-                    back.dispatch_async(
-                        [upstream.buffer(), grad.buffer()],
-                        grad.size,
-                        [offsets[index], 0, grad.size]
-                    )
+                    back.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, [offsets[index], 0, grad.size])
                     grads.push(grad)
                 }
                 return grads
@@ -2465,11 +2445,7 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
             for (index, shape) in shapes.enumerate() {
                 let grad = Tensor(shape)
                 let width = shape[resolved]
-                take.dispatch_async(
-                    [upstream.buffer(), grad.buffer()],
-                    outer * width,
-                    [outer, width, along, starts[index]]
-                )
+                take.dispatch_async([upstream.buffer(), grad.buffer()], outer * width, [outer, width, along, starts[index]])
                 grads.push(grad)
             }
             return grads
@@ -2479,22 +2455,12 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
 }
 
 #: NHWC max pooling.
-pub fn max_pool2d(
-    input: Tensor,
-    kernel_size: int,
-    stride: int = 0,
-    padding: int = 0
-) -> Tensor {
+pub fn max_pool2d(input: Tensor, kernel_size: int, stride: int = 0, padding: int = 0) -> Tensor {
     return _pool2d(input, kernel_size, stride, padding, true)
 }
 
 #: NHWC average pooling (ignores padded holes).
-pub fn avg_pool2d(
-    input: Tensor,
-    kernel_size: int,
-    stride: int = 0,
-    padding: int = 0
-) -> Tensor {
+pub fn avg_pool2d(input: Tensor, kernel_size: int, stride: int = 0, padding: int = 0) -> Tensor {
     return _pool2d(input, kernel_size, stride, padding, false)
 }
 
@@ -2521,27 +2487,10 @@ fn _pool2d(input: Tensor, kernel_size: int, stride: int, padding: int, is_max: b
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let grad = Tensor([n, h, w, c])
-            let scalars = [
-                n,
-                h,
-                w,
-                c,
-                kernel_size,
-                kernel_size,
-                step,
-                step,
-                padding,
-                padding,
-                oh,
-                ow,
-            ]
+            let scalars = [n, h, w, c, kernel_size, kernel_size, step, step, padding, padding, oh, ow]
             if is_max {
                 let back = cached_kernel("max_pool2d_backward_nhwc")
-                back.dispatch_async(
-                    [input.buffer(), upstream.buffer(), grad.buffer()],
-                    grad.size,
-                    scalars
-                )
+                back.dispatch_async([input.buffer(), upstream.buffer(), grad.buffer()], grad.size, scalars)
             } else {
                 let back = cached_kernel("avg_pool2d_backward_nhwc")
                 back.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, scalars)
@@ -2571,11 +2520,7 @@ pub fn dropout(input: Tensor, p: float = 0.5, training: bool = true) -> Tensor {
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(input.shape)
-            kernel.dispatch_async(
-                [upstream.buffer(), noise.buffer(), g.buffer()],
-                input.size,
-                [input.size, f32_bits(keep), f32_bits(1.0 / keep)]
-            )
+            kernel.dispatch_async([upstream.buffer(), noise.buffer(), g.buffer()], input.size, [input.size, f32_bits(keep), f32_bits(1.0 / keep)])
             return [g]
         }, extras: [noise]))
     } else {
@@ -2626,11 +2571,7 @@ pub fn pow(input: Tensor, exponent: float) -> Tensor {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let lowered = Tensor(input.shape)
             let inner = cached_kernel("pow_scalar")
-            inner.dispatch_async(
-                [input.buffer(), lowered.buffer()],
-                input.size,
-                [input.size, f32_bits(exponent - 1.0)]
-            )
+            inner.dispatch_async([input.buffer(), lowered.buffer()], input.size, [input.size, f32_bits(exponent - 1.0)])
             let chained = multiply(upstream, lowered)
             lowered.free()
             let grad = scale(chained, exponent)
@@ -2713,11 +2654,7 @@ pub fn pad2d(input: Tensor, pad: list[int]) -> Tensor {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let grad = Tensor([n, h, w, c])
             let crop = cached_kernel("crop2d_nhwc")
-            crop.dispatch_async(
-                [upstream.buffer(), grad.buffer()],
-                grad.size,
-                [n, h, w, c, top, left, padded_h, padded_w]
-            )
+            crop.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, [n, h, w, c, top, left, padded_h, padded_w])
             return [grad]
         }))
     }
@@ -2790,11 +2727,7 @@ pub fn repeat(input: Tensor, times: int, axis: int = -1) -> Tensor {
     }
     let output = Tensor(shape)
     let kernel = cached_kernel("repeat_last")
-    kernel.dispatch_async(
-        [input.buffer(), output.buffer()],
-        output.size,
-        [rows, inner, times]
-    )
+    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [rows, inner, times])
     if input.requires_grad {
         let original = input.shape
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
@@ -2823,11 +2756,7 @@ pub fn binary_cross_entropy(prediction: Tensor, target: Tensor) -> Tensor {
         per.attach_creator(GradNode([prediction], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(prediction.shape)
             let backward_kernel = cached_kernel("bce_prob_backward")
-            backward_kernel.dispatch_async(
-                [prediction.buffer(), target.buffer(), upstream.buffer(), g.buffer()],
-                prediction.size,
-                [prediction.size]
-            )
+            backward_kernel.dispatch_async([prediction.buffer(), target.buffer(), upstream.buffer(), g.buffer()], prediction.size, [prediction.size])
             return [g]
         }))
     }
@@ -2852,11 +2781,7 @@ pub fn binary_cross_entropy_with_logits(logits: Tensor, target: Tensor) -> Tenso
         per.attach_creator(GradNode([logits], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(logits.shape)
             let backward_kernel = cached_kernel("bce_logits_backward")
-            backward_kernel.dispatch_async(
-                [logits.buffer(), target.buffer(), upstream.buffer(), g.buffer()],
-                logits.size,
-                [logits.size]
-            )
+            backward_kernel.dispatch_async([logits.buffer(), target.buffer(), upstream.buffer(), g.buffer()], logits.size, [logits.size])
             return [g]
         }))
     }
@@ -2872,11 +2797,7 @@ pub fn tril(input: Tensor) -> Tensor {
     let cols = input.shape[1]
     let output = Tensor(input.shape)
     let kernel = cached_attn_kernel("tril_square")
-    kernel.dispatch_async(
-        [input.buffer(), output.buffer()],
-        output.size,
-        [rows, cols]
-    )
+    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [rows, cols])
     if input.requires_grad {
         output.attach_creator(GradNode([input], |upstream| [tril(upstream)]))
     }
@@ -2903,11 +2824,7 @@ pub fn flip(input: Tensor, axis: int = -1) -> Tensor {
     let rows = input.size // inner
     let output = Tensor(input.shape)
     let kernel = cached_kernel("flip_last")
-    kernel.dispatch_async(
-        [input.buffer(), output.buffer()],
-        output.size,
-        [rows, inner]
-    )
+    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [rows, inner])
     if input.requires_grad {
         output.attach_creator(GradNode([input], |upstream| [flip(upstream, axis: axis)]))
     }
@@ -2937,11 +2854,7 @@ pub fn upsample_nearest2d(input: Tensor, scale: int) -> Tensor {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let grad = Tensor([n, h, w, c])
             let back = cached_kernel("upsample_nearest2d_backward_nhwc")
-            back.dispatch_async(
-                [upstream.buffer(), grad.buffer()],
-                grad.size,
-                [n, h, w, c, scale, scale, out_h, out_w]
-            )
+            back.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, [n, h, w, c, scale, scale, out_h, out_w])
             return [grad]
         }))
     }
@@ -2962,11 +2875,7 @@ pub fn split_heads(input: Tensor, heads: int) -> Tensor {
     let hd = dim // heads
     let output = Tensor([heads * seq, hd])
     let kernel = cached_attn_kernel("split_heads")
-    kernel.dispatch_async(
-        [input.buffer(), output.buffer()],
-        output.size,
-        [seq, heads, hd]
-    )
+    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [seq, heads, hd])
     if input.requires_grad {
         output.attach_creator(GradNode([input], |upstream| [merge_heads(upstream, heads, seq)]))
     }
@@ -2987,11 +2896,7 @@ pub fn merge_heads(packed: Tensor, heads: int, seq: int) -> Tensor {
     let hd = packed.shape[1]
     let output = Tensor([seq, heads * hd])
     let kernel = cached_attn_kernel("merge_heads")
-    kernel.dispatch_async(
-        [packed.buffer(), output.buffer()],
-        packed.size,
-        [seq, heads, hd]
-    )
+    kernel.dispatch_async([packed.buffer(), output.buffer()], packed.size, [seq, heads, hd])
     if packed.requires_grad {
         output.attach_creator(GradNode([packed], |upstream| [split_heads(upstream, heads)]))
     }
@@ -3059,11 +2964,7 @@ pub fn slice_flat(source: Tensor, source_offset: int, shape: list[int]) -> Tenso
         output.attach_creator(GradNode([source], fn(upstream: Tensor) -> list[Tensor] {
             let grad = Tensor.zeros(whole)
             let kernel = cached_kernel("copy_range")
-            kernel.dispatch_async(
-                [upstream.buffer(), grad.buffer()],
-                n,
-                [0, source_offset, n]
-            )
+            kernel.dispatch_async([upstream.buffer(), grad.buffer()], n, [0, source_offset, n])
             return [grad]
         }))
     }
@@ -3154,34 +3055,22 @@ pub fn conv2d(
         let rows = n * out_h * out_w
         let col = Tensor([rows, k])
         let kernel = cached_kernel("im2col_nhwc")
-        kernel.dispatch_async(
-            [input.buffer(), col.buffer()],
-            rows * k,
-            [n, h, w, cin, kh, kw, stride, stride, padding, padding]
-        )
+        kernel.dispatch_async([input.buffer(), col.buffer()], rows * k, [n, h, w, cin, kh, kw, stride, stride, padding, padding])
         let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
         let flat_out = Tensor([rows, cout], storage: output.buffer())
-        raw_matmul(col, flat_w, bias: bias, epilogue: if bias is null { 0 } else { 1 }, out: flat_out)
+        raw_matmul(col, flat_w, bias: bias, epilogue: if bias is null {
+            0
+        } else {
+            1
+        }, out: flat_out)
         col.free()
     }
     try {
-        gpu.conv2d_async(
-            input.buffer(),
-            weights.buffer(),
-            output.buffer(),
-            n,
-            h,
-            w,
-            cin,
-            cout,
-            kh,
-            kw,
-            stride_h: stride,
-            stride_w: stride,
-            pad_h: padding,
-            pad_w: padding,
-            bias: if bias is null { null } else { bias.buffer() }
-        )
+        gpu.conv2d_async(input.buffer(), weights.buffer(), output.buffer(), n, h, w, cin, cout, kh, kw, stride_h: stride, stride_w: stride, pad_h: padding, pad_w: padding, bias: if bias is null {
+            null
+        } else {
+            bias.buffer()
+        })
     } catch _error: RuntimeError {
         by_im2col()
     }
@@ -3320,54 +3209,32 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     let output = Tensor(input.shape)
     let kernel = cached_kernel("batch_norm_forward")
     kernel.dispatch_async(
-        [input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
+        [
+            input.buffer(),
+            mean.buffer(),
+            variance.buffer(),
+            gamma.buffer(),
+            beta.buffer(),
+            output.buffer(),
+        ],
         input.size,
         [input.size, channels]
     )
     if input.requires_grad or gamma.requires_grad or beta.requires_grad {
-        output.attach_creator(
-            GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
-                let sum_dy = Tensor([channels])
-                let sum_dy_xhat = Tensor([channels])
-                let grad_gamma = Tensor([channels])
-                let grad_beta = Tensor([channels])
-                let sums = cached_kernel("norm_channel_sums")
-                sums.dispatch_async(
-                    [
-                        input.buffer(),
-                        mean.buffer(),
-                        variance.buffer(),
-                        gamma.buffer(),
-                        upstream.buffer(),
-                        sum_dy.buffer(),
-                        sum_dy_xhat.buffer(),
-                        grad_gamma.buffer(),
-                        grad_beta.buffer(),
-                    ],
-                    channels,
-                    [nspatial, channels]
-                )
-                let grad_input = Tensor(input.shape)
-                let back = cached_kernel("norm_channel_backward")
-                back.dispatch_async(
-                    [
-                        input.buffer(),
-                        mean.buffer(),
-                        variance.buffer(),
-                        gamma.buffer(),
-                        upstream.buffer(),
-                        sum_dy.buffer(),
-                        sum_dy_xhat.buffer(),
-                        grad_input.buffer(),
-                    ],
-                    input.size,
-                    [input.size, channels, nspatial]
-                )
-                sum_dy.free()
-                sum_dy_xhat.free()
-                return [grad_input, grad_gamma, grad_beta]
-            }, extras: [mean, variance])
-        )
+        output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+            let sum_dy = Tensor([channels])
+            let sum_dy_xhat = Tensor([channels])
+            let grad_gamma = Tensor([channels])
+            let grad_beta = Tensor([channels])
+            let sums = cached_kernel("norm_channel_sums")
+            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels, [nspatial, channels])
+            let grad_input = Tensor(input.shape)
+            let back = cached_kernel("norm_channel_backward")
+            back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial])
+            sum_dy.free()
+            sum_dy_xhat.free()
+            return [grad_input, grad_gamma, grad_beta]
+        }, extras: [mean, variance]))
         return output
     }
     mean.free()
@@ -3393,31 +3260,16 @@ pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     )
     if input.requires_grad or gamma.requires_grad or beta.requires_grad {
         let rows = input.shape[0]
-        output.attach_creator(
-            GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
-                let grad_input = Tensor(input.shape)
-                let back = cached_kernel("layer_norm_backward")
-                back.dispatch_async(
-                    [input.buffer(), gamma.buffer(), upstream.buffer(), grad_input.buffer()],
-                    rows,
-                    [rows, width]
-                )
-                let grad_gamma = Tensor([width])
-                let grad_beta = Tensor([width])
-                let params = cached_kernel("layer_norm_params_backward")
-                params.dispatch_async(
-                    [
-                        input.buffer(),
-                        upstream.buffer(),
-                        grad_gamma.buffer(),
-                        grad_beta.buffer(),
-                    ],
-                    width,
-                    [rows, width]
-                )
-                return [grad_input, grad_gamma, grad_beta]
-            })
-        )
+        output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+            let grad_input = Tensor(input.shape)
+            let back = cached_kernel("layer_norm_backward")
+            back.dispatch_async([input.buffer(), gamma.buffer(), upstream.buffer(), grad_input.buffer()], rows, [rows, width])
+            let grad_gamma = Tensor([width])
+            let grad_beta = Tensor([width])
+            let params = cached_kernel("layer_norm_params_backward")
+            params.dispatch_async([input.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], width, [rows, width])
+            return [grad_input, grad_gamma, grad_beta]
+        }))
     }
     return output
 }
@@ -3453,19 +3305,18 @@ pub fn scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor) -
 #: stays packed, Q/K/V stream through half SRAM, and QK/PV use simdgroup MMA.
 #: MPSGraph SDPA is the fallback when the kernel cannot run. Last resort is
 #: GEMM. Scale is `1 / sqrt(head_dim)`.
-pub fn multi_head_attention(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    heads: int
-) -> Tensor {
+pub fn multi_head_attention(query: Tensor, key: Tensor, value: Tensor, heads: int) -> Tensor {
     if heads == 1 { return scaled_dot_product_attention(query, key, value) }
     if query.rank() != 2 or key.rank() != 2 or value.rank() != 2 {
         throw ValueError("multi_head_attention needs rank-two Q, K, V")
     }
-    if heads <= 0 { throw ValueError(f"multi_head_attention needs a positive head count, got {heads}") }
+    if heads <= 0 {
+        throw ValueError(f"multi_head_attention needs a positive head count, got {heads}")
+    }
     if query.shape != key.shape or query.shape != value.shape {
-        throw ValueError(f"multi_head_attention Q/K/V shape mismatch: {query.shape} {key.shape} {value.shape}")
+        throw ValueError(
+            f"multi_head_attention Q/K/V shape mismatch: {query.shape} {key.shape} {value.shape}"
+        )
     }
     let seq = query.shape[0]
     let dim = query.shape[1]
@@ -3647,65 +3498,34 @@ pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Te
     let output = Tensor(input.shape)
     let kernel = cached_kernel("group_norm_forward")
     kernel.dispatch_async(
-        [input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
+        [
+            input.buffer(),
+            mean.buffer(),
+            variance.buffer(),
+            gamma.buffer(),
+            beta.buffer(),
+            output.buffer(),
+        ],
         output.size,
         [output.size, spatial, c, groups]
     )
     if input.requires_grad or gamma.requires_grad or beta.requires_grad {
-        output.attach_creator(
-            GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
-                let sum_dy = Tensor([slots])
-                let sum_dy_xhat = Tensor([slots])
-                let sums = cached_kernel("group_norm_sums")
-                sums.dispatch_async(
-                    [
-                        input.buffer(),
-                        mean.buffer(),
-                        variance.buffer(),
-                        gamma.buffer(),
-                        upstream.buffer(),
-                        sum_dy.buffer(),
-                        sum_dy_xhat.buffer(),
-                    ],
-                    slots,
-                    [n, spatial, c, groups]
-                )
-                let grad_input = Tensor(input.shape)
-                let back = cached_kernel("group_norm_backward")
-                back.dispatch_async(
-                    [
-                        input.buffer(),
-                        mean.buffer(),
-                        variance.buffer(),
-                        gamma.buffer(),
-                        upstream.buffer(),
-                        sum_dy.buffer(),
-                        sum_dy_xhat.buffer(),
-                        grad_input.buffer(),
-                    ],
-                    input.size,
-                    [input.size, spatial, c, groups]
-                )
-                let grad_gamma = Tensor([c])
-                let grad_beta = Tensor([c])
-                let params = cached_kernel("channel_params_backward")
-                params.dispatch_async(
-                    [
-                        input.buffer(),
-                        mean.buffer(),
-                        variance.buffer(),
-                        upstream.buffer(),
-                        grad_gamma.buffer(),
-                        grad_beta.buffer(),
-                    ],
-                    c,
-                    [n * spatial, c, spatial, groups]
-                )
-                sum_dy.free()
-                sum_dy_xhat.free()
-                return [grad_input, grad_gamma, grad_beta]
-            }, extras: [mean, variance])
-        )
+        output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+            let sum_dy = Tensor([slots])
+            let sum_dy_xhat = Tensor([slots])
+            let sums = cached_kernel("group_norm_sums")
+            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer()], slots, [n, spatial, c, groups])
+            let grad_input = Tensor(input.shape)
+            let back = cached_kernel("group_norm_backward")
+            back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, spatial, c, groups])
+            let grad_gamma = Tensor([c])
+            let grad_beta = Tensor([c])
+            let params = cached_kernel("channel_params_backward")
+            params.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], c, [n * spatial, c, spatial, groups])
+            sum_dy.free()
+            sum_dy_xhat.free()
+            return [grad_input, grad_gamma, grad_beta]
+        }, extras: [mean, variance]))
         return output
     }
     mean.free()

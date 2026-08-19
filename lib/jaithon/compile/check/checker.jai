@@ -278,9 +278,7 @@ pub fn resolve_ast_type(c: Ctx, t: TypeExpr?) -> Type? {
             for argument in t.args { members.push(resolve_ast_type(c, argument) ?? c.universe.t_any) }
             result = tuple_of(c.universe, members)
         }
-        TypeKind.Const => {
-            result = c.universe.intern(TyKind.Int, t.name)
-        }
+        TypeKind.Const => { result = c.universe.intern(TyKind.Int, t.name) }
     }
 
     let answer = result ?? c.universe.t_any

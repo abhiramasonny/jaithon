@@ -77,7 +77,7 @@ fn run(name: str, width: int, samples: int, batch_size: int, epochs: int, verbos
     )
     gpu.synchronize()
     let seconds = started.elapsed().to_seconds()
-    let processed = (samples // batch_size) * batch_size * epochs
+    let processed = samples // batch_size * batch_size * epochs
     let flops = 6 * processed * macs_per_sample(width)
     var valid = history.loss.len() == epochs and seconds > 0.0
     for value in history.loss {
@@ -87,7 +87,11 @@ fn run(name: str, width: int, samples: int, batch_size: int, epochs: int, verbos
         valid = false
     }
     let check = if valid { "ok" } else { "invalid" }
-    let final_loss = if history.loss.len() == 0 { 0.0 } else { history.loss[history.loss.len() - 1] }
+    let final_loss = if history.loss.len() == 0 {
+        0.0
+    } else {
+        history.loss[history.loss.len() - 1]
+    }
     print(f"jtb\t{name}\t{seconds:.9f}\t{flops}\t{processed}\t{check}\t{final_loss:.6f}")
 }
 

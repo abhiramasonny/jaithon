@@ -231,13 +231,7 @@ fn main(args: list[str]) -> int {
     )
     # Warm graph compilation, allocator pools and command submission before
     # collecting steady-state samples, as the microbenchmarks do.
-    model.fit(
-        train,
-        epochs: 1,
-        batch_size: batch_size,
-        verbose: false,
-        plot_path: null
-    )
+    model.fit(train, epochs: 1, batch_size: batch_size, verbose: false, plot_path: null)
     gpu.synchronize()
     let started = Instant.now()
     let history = model.fit(
@@ -255,7 +249,7 @@ fn main(args: list[str]) -> int {
         print(f"samples_per_second: {float(train.samples * epochs) / measured_seconds:.1f}")
         return 0
     }
-    let processed_per_epoch = (train.samples // batch_size) * batch_size
+    let processed_per_epoch = train.samples // batch_size * batch_size
     let processed = processed_per_epoch * epochs
     var macs = 0
     var previous = train.feature_count
@@ -277,7 +271,11 @@ fn main(args: list[str]) -> int {
     }
     if not math.is_finite(measured_seconds) or measured_seconds <= 0.0 { valid = false }
     let check = if valid { "ok" } else { "invalid" }
-    let final_loss = if history.loss.len() == 0 { 0.0 } else { history.loss[history.loss.len() - 1] }
+    let final_loss = if history.loss.len() == 0 {
+        0.0
+    } else {
+        history.loss[history.loss.len() - 1]
+    }
     print(f"jtb\t{name}\t{measured_seconds:.9f}\t{flops}\t{processed}\t{check}\t{final_loss:.6f}")
     return 0
 }
