@@ -36,8 +36,7 @@ pub const PERMISSION_DENIED = -1
 pub const PERMISSION_UNAVAILABLE = -2
 
 #: What to tell someone whose camera will not open.
-pub let PERMISSION_HELP =
-    "macOS grants camera access per application, and a command-line binary " +
+pub let PERMISSION_HELP = "macOS grants camera access per application, and a command-line binary " +
     "has no bundle to attribute the request to. Add the terminal (or the " +
     "jaithon binary) under System Settings > Privacy & Security > Camera, " +
     "then run again."

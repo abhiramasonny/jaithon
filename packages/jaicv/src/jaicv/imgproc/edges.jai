@@ -161,24 +161,11 @@ pub fn canny(
     let out = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_8U, 1))
     let count = src.rows * src.cols
     if count == 0 { return out }
-    kernel_for("canny_suppress").dispatch_async(
-        [dx.storage, dy.storage, labels.storage],
-        count,
-        [
-            count,
-            src.rows,
-            src.cols,
-            dx.offset,
-            dx.step_,
-            dy.offset,
-            dy.step_,
-            labels.offset,
-            labels.step_,
-            if l2_gradient { 1 } else { 0 },
-            f32_bits(low),
-            f32_bits(high),
-        ]
-    )
+    kernel_for("canny_suppress").dispatch_async([dx.storage, dy.storage, labels.storage], count, [count, src.rows, src.cols, dx.offset, dx.step_, dy.offset, dy.step_, labels.offset, labels.step_, if l2_gradient {
+        1
+    } else {
+        0
+    }, f32_bits(low), f32_bits(high)])
     labels.invalidate()
 
     #: Weak edges join a chain one ring at a time, so the pass count bounds how

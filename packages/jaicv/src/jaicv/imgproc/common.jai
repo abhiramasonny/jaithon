@@ -182,11 +182,11 @@ inline float sample_at(device const float* src, float y, float x, uint channel,
 #: lowest value, highest value, and whether rounding applies at all.
 pub fn saturation_args(type_code: int) -> list[int] {
     let depth = CV_MAT_DEPTH(type_code)
-    return [
-        f32_bits(depth_min(depth)),
-        f32_bits(depth_max(depth)),
-        if depth_is_integer(depth) { 1 } else { 0 },
-    ]
+    return [f32_bits(depth_min(depth)), f32_bits(depth_max(depth)), if depth_is_integer(depth) {
+        1
+    } else {
+        0
+    }]
 }
 
 #: Append `extra` to `base`, the way each module builds its dispatch scalars.

@@ -171,25 +171,11 @@ fn rank_filter(
         let out = Mat(current.rows, current.cols, current.flags)
         let count = current.rows * current.cols * current.channels()
         if count == 0 { return out }
-        var scalars = [
-            count,
-            current.rows,
-            current.cols,
-            current.channels(),
-            current.offset,
-            current.step_,
-            out.offset,
-            out.step_,
-            element.rows,
-            element.cols,
-            anchor_y,
-            anchor_x,
-            element.offset,
-            element.step_,
-            if dilate { 1 } else { 0 },
-            border_mode,
-            f32_bits(border_value[0]),
-        ]
+        var scalars = [count, current.rows, current.cols, current.channels(), current.offset, current.step_, out.offset, out.step_, element.rows, element.cols, anchor_y, anchor_x, element.offset, element.step_, if dilate {
+            1
+        } else {
+            0
+        }, border_mode, f32_bits(border_value[0])]
         for value in saturation_args(out.flags) { scalars.push(value) }
         kernel_for("morph_rank").dispatch_async(
             [current.storage, out.storage, element.storage],

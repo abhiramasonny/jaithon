@@ -190,7 +190,7 @@ pub fn triangle_threshold(src: Mat) -> float {
     while right > 0 and counts[right] == 0 { right -= 1 }
     if left >= right { return float(left) }
     var peak = left
-    for index in left..(right + 1) {
+    for index in left..right + 1 {
         if counts[index] > counts[peak] { peak = index }
     }
     #: The method assumes the long tail is to the right of the peak; when it is
@@ -214,10 +214,8 @@ pub fn triangle_threshold(src: Mat) -> float {
     #: which is what the method maximises.
     var best = -1.0
     var best_level = peak
-    for index in peak..(right + 1) {
-        let numerator = math.fabs(
-            (values[index] - height) * span + height * float(index - peak)
-        )
+    for index in peak..right + 1 {
+        let numerator = math.fabs((values[index] - height) * span + height * float(index - peak))
         let score = numerator / math.sqrt(span * span + height * height)
         if score > best {
             best = score
@@ -232,17 +230,12 @@ pub fn triangle_threshold(src: Mat) -> float {
 #:
 #: With `THRESH_OTSU` or `THRESH_TRIANGLE` in the mode, the level is chosen
 #: from the image and the `thresh` argument is ignored.
-pub fn threshold(
-    src: Mat,
-    thresh: float,
-    max_value: float,
-    mode: int
-) -> tuple[float, Mat] {
+pub fn threshold(src: Mat, thresh: float, max_value: float, mode: int) -> tuple[float, Mat] {
     src.flush()
     var level = thresh
-    if (mode & THRESH_OTSU) != 0 {
+    if mode & THRESH_OTSU != 0 {
         level = otsu_threshold(src)
-    } elif (mode & THRESH_TRIANGLE) != 0 {
+    } elif mode & THRESH_TRIANGLE != 0 {
         level = triangle_threshold(src)
     }
     let plain = mode & 7
