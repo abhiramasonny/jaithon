@@ -201,6 +201,14 @@ from .core.misc import repeat, rotate, set_identity, set_rng_seed, solve_poly
 from .core.misc import sort, sort_idx, vconcat
 from .core.misc import ROTATE_180, ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE
 
+from .imgproc.misc import accumulate, accumulate_product, accumulate_square
+from .imgproc.misc import accumulate_weighted, apply_color_map, create_hanning_window
+from .imgproc.misc import get_rect_sub_pix, intersect_convex_convex, min_enclosing_triangle
+from .imgproc.misc import phase_correlate, pyr_mean_shift_filtering
+from .imgproc.misc import COLORMAP_AUTUMN, COLORMAP_BONE, COLORMAP_COOL, COLORMAP_HOT
+from .imgproc.misc import COLORMAP_HSV, COLORMAP_JET, COLORMAP_OCEAN, COLORMAP_PINK
+from .imgproc.misc import COLORMAP_RAINBOW, COLORMAP_SPRING, COLORMAP_SUMMER, COLORMAP_WINTER
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -379,6 +387,14 @@ export { extract_channel, find_non_zero, hconcat, insert_channel, mahalanobis }
 export { min_max_idx, mul_transposed, patch_nans, randn, randu, repeat, rotate }
 export { set_identity, set_rng_seed, solve_poly, sort, sort_idx, vconcat }
 export { ROTATE_180, ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE }
+
+export { accumulate, accumulate_product, accumulate_square, accumulate_weighted }
+export { apply_color_map, create_hanning_window, get_rect_sub_pix }
+export { intersect_convex_convex, min_enclosing_triangle, phase_correlate }
+export { pyr_mean_shift_filtering }
+export { COLORMAP_AUTUMN, COLORMAP_BONE, COLORMAP_COOL, COLORMAP_HOT }
+export { COLORMAP_HSV, COLORMAP_JET, COLORMAP_OCEAN, COLORMAP_PINK }
+export { COLORMAP_RAINBOW, COLORMAP_SPRING, COLORMAP_SUMMER, COLORMAP_WINTER }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

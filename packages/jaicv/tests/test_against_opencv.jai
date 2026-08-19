@@ -67,6 +67,10 @@ from jaicv.core.dft import DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from jaicv.core.cluster import PCA
 from jaicv.core.linalg import matmul as linalg_matmul, transpose as linalg_transpose
 from jaicv.dnn.blob import blob_from_image, nms_boxes
+from jaicv.imgproc.misc import apply_color_map, create_hanning_window, get_rect_sub_pix
+from jaicv.imgproc.misc import intersect_convex_convex, min_enclosing_triangle, phase_correlate
+from jaicv.imgproc.misc import COLORMAP_AUTUMN, COLORMAP_COOL, COLORMAP_JET, COLORMAP_SPRING
+from jaicv.imgproc.misc import COLORMAP_SUMMER, COLORMAP_WINTER
 from jaicv.core.misc import calc_covar_matrix, determinant, extract_channel, hconcat
 from jaicv.core.misc import repeat, rotate, solve_poly, sort, sort_idx, vconcat
 from jaicv.core.misc import ROTATE_180, ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE
@@ -195,6 +199,19 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     if name == "determinant" or name == "solvePoly" { return 1e-3 }
     if name == "calcCovarMatrix" or name == "covarMean" { return 1e-4 }
     if MISC_NAMES.contains(name) { return 0.0 }
+    #: A colour map written as its formula rather than as OpenCV's table of
+    #: sixty-four control points lands within a level of it.
+    if name == "applyColorMap" { return 1.0 }
+    #: OpenCV interpolates a sub-pixel patch through fixed-point weights, so
+    #: a value halfway between two levels rounds a level either way.
+    if name == "getRectSubPix" { return 0.51 }
+    if name == "createHanningWindow" { return 1e-4 }
+    #: Both find the same peak in the same cell; what differs is the sub-pixel
+    #: refinement over the five by five around it, where OpenCV sums in double
+    #: over a surface it built in double and this sums over one built in float.
+    #: A third of a pixel on a peak one pixel wide is the size of that.
+    if name == "phaseCorrelate" { return 0.5 }
+    if name == "intersectConvexConvex" or name == "minEnclosingTriangle" { return 1e-3 }
     if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
@@ -718,6 +735,65 @@ fn run_cascade(item: Case) -> Mat {
     return Mat.from_list(found.len(), 4, CV_MAKETYPE(4, 1), values)
 }
 
+let IMGPROC_MISC_NAMES = [
+    "applyColorMap",
+    "getRectSubPix",
+    "createHanningWindow",
+    "phaseCorrelate",
+    "intersectConvexConvex",
+    "minEnclosingTriangle",
+]
+
+fn colour_map_named(name: str) -> int {
+    if name == "AUTUMN" { return COLORMAP_AUTUMN }
+    if name == "COOL" { return COLORMAP_COOL }
+    if name == "SPRING" { return COLORMAP_SPRING }
+    if name == "SUMMER" { return COLORMAP_SUMMER }
+    if name == "WINTER" { return COLORMAP_WINTER }
+    if name == "JET" { return COLORMAP_JET }
+    throw ValueError(f"no jaicv colour map for {name}")
+}
+
+let SQUARE_CORNERS = [
+    Point2f(0.0, 0.0),
+    Point2f(10.0, 0.0),
+    Point2f(10.0, 10.0),
+    Point2f(0.0, 10.0),
+]
+
+fn run_imgproc_misc(item: Case) -> Mat {
+    let args = item.args
+    if item.name == "applyColorMap" {
+        return apply_color_map(item.source, colour_map_named(args[0]))
+    }
+    if item.name == "getRectSubPix" {
+        return get_rect_sub_pix(item.source, Size(7, 5), Point2f(float(args[0]), float(args[1])))
+    }
+    if item.name == "createHanningWindow" { return create_hanning_window(Size(16, 12)) }
+    if item.name == "phaseCorrelate" {
+        let moved = warp_affine(
+            item.source,
+            Mat.from_list(2, 3, CV_MAKETYPE(5, 1), [1.0, 0.0, 5.0, 0.0, 1.0, -3.0]),
+            Size(item.source.cols, item.source.rows)
+        )
+        let window = create_hanning_window(Size(item.source.cols, item.source.rows))
+        let (shift, _response) = phase_correlate(item.source, moved, window)
+        return Mat.from_list(1, 2, CV_MAKETYPE(5, 1), [shift.x, shift.y])
+    }
+    if item.name == "intersectConvexConvex" {
+        let other = [Point2f(5.0, 5.0), Point2f(15.0, 5.0), Point2f(15.0, 15.0), Point2f(5.0, 15.0)]
+        let (_shape, area) = intersect_convex_convex(SQUARE_CORNERS, other)
+        return Mat.from_list(1, 1, CV_MAKETYPE(5, 1), [area])
+    }
+    let points = if args[0] == "square" {
+        SQUARE_CORNERS
+    } else {
+        [Point2f(0.0, 0.0), Point2f(12.0, 2.0), Point2f(9.0, 11.0), Point2f(2.0, 7.0)]
+    }
+    let (_corners, area) = min_enclosing_triangle(points)
+    return Mat.from_list(1, 1, CV_MAKETYPE(5, 1), [area])
+}
+
 let MISC_NAMES = [
     "hconcat",
     "vconcat",
@@ -1109,6 +1185,7 @@ fn run_case(item: Case) -> Mat {
     if TRANSFORM_NAMES.contains(item.name) { return run_transform(item) }
     if DNN_NAMES.contains(item.name) { return run_dnn(item) }
     if MISC_NAMES.contains(item.name) { return run_misc(item) }
+    if IMGPROC_MISC_NAMES.contains(item.name) { return run_imgproc_misc(item) }
     if item.name == "cascadeDetect" { return run_cascade(item) }
     if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }
