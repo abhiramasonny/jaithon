@@ -191,6 +191,9 @@ from .ml.models import NormalBayesClassifier, RTrees, SVM
 from .ml.models import COL_SAMPLE, ROW_SAMPLE, SVM_C_SVC, SVM_EPS_SVR
 from .ml.models import SVM_LINEAR, SVM_POLY, SVM_RBF
 
+from .dnn.blob import blob_from_image, blob_from_images, images_from_blob
+from .dnn.blob import net_from, nms_boxes, nms_boxes_batched, Net, Runnable
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -360,6 +363,9 @@ export { ANN_MLP, DTrees, KNearest, LogisticRegression }
 export { NormalBayesClassifier, RTrees, SVM }
 export { COL_SAMPLE, ROW_SAMPLE, SVM_C_SVC, SVM_EPS_SVR }
 export { SVM_LINEAR, SVM_POLY, SVM_RBF }
+
+export { blob_from_image, blob_from_images, images_from_blob }
+export { net_from, nms_boxes, nms_boxes_batched, Net, Runnable }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

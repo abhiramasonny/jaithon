@@ -803,6 +803,29 @@ def write_transform(handle) -> None:
     case(handle, "pcaBasis", "clusters", samples, outer.astype(np.float32))
 
 
+def write_dnn(handle) -> None:
+    rng = np.random.default_rng(191)
+    image = rng.integers(0, 256, size=(20, 24, 3), dtype=np.uint8)
+    for scale, size, mean, swap in ((1.0, (0, 0), (0, 0, 0), False),
+                                    (1.0 / 255.0, (12, 10), (0, 0, 0), False),
+                                    (1.0, (16, 16), (104.0, 117.0, 123.0), True),
+                                    (0.5, (8, 8), (10.0, 20.0, 30.0), False)):
+        blob = cv2.dnn.blobFromImage(image, scale, size, mean, swap, False)
+        rows = blob.shape[1]
+        cols = blob.shape[2] * blob.shape[3]
+        tag = f"{scale} {size[0]} {size[1]} {mean[0]} {mean[1]} {mean[2]} {1 if swap else 0}"
+        case(handle, "blobFromImage", tag, image, blob.reshape(rows, cols).astype(np.float32))
+
+    boxes = [[10, 10, 30, 30], [12, 12, 30, 30], [60, 60, 20, 20],
+             [61, 59, 22, 21], [100, 10, 15, 40], [11, 9, 31, 32]]
+    scores = [0.9, 0.75, 0.8, 0.6, 0.55, 0.5]
+    for score_threshold, nms_threshold in ((0.0, 0.3), (0.6, 0.5), (0.0, 0.1)):
+        kept = cv2.dnn.NMSBoxes(boxes, scores, score_threshold, nms_threshold)
+        rows = np.array(list(kept), np.int32).reshape(-1, 1)
+        case(handle, "nmsBoxes", f"{score_threshold} {nms_threshold}",
+             np.zeros((4, 4), np.uint8), rows)
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -822,6 +845,7 @@ def main() -> int:
         write_calib(handle)
         write_calibrate(handle)
         write_transform(handle)
+        write_dnn(handle)
     print(f"wrote {OUT}")
     return 0
 
