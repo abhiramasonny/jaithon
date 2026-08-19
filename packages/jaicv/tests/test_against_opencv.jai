@@ -19,6 +19,13 @@ from jaicv.imgproc.color import COLOR_BGR2Lab, COLOR_BGR2RGB, COLOR_BGR2XYZ, COL
 from jaicv.imgproc.color import COLOR_BGR2YUV, COLOR_BGRA2BGR, COLOR_GRAY2BGR, COLOR_HLS2BGR
 from jaicv.imgproc.color import COLOR_HSV2BGR, COLOR_Lab2BGR, COLOR_RGB2GRAY, COLOR_XYZ2BGR
 from jaicv.imgproc.color import COLOR_YCrCb2BGR, COLOR_YUV2BGR
+from jaicv.imgproc.geometric import copy_make_border, get_affine_transform
+from jaicv.imgproc.geometric import get_perspective_transform, get_rotation_matrix_2d
+from jaicv.imgproc.geometric import pyr_down, pyr_up, remap, resize, warp_affine, warp_perspective
+from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
+from jaicv.core.types import BORDER_REPLICATE, BORDER_WRAP
+from jaicv.core.types import INTER_AREA, INTER_CUBIC, INTER_LANCZOS4, INTER_LINEAR, INTER_NEAREST
+from jaicv.core.types import Point2f, Scalar, Size
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -103,13 +110,98 @@ fn colour_code(name: str) -> int {
 #: differently. Every recorded case is inside that, including Lab, which goes
 #: through a cube root on both sides.
 fn tolerance_for(name: str, args: list[str]) -> float {
+    #: A transform matrix is float, so it is compared as float.
+    if name == "getRotationMatrix2D" or
+        name == "getPerspectiveTransform" or
+        name == "getAffineTransform" {
+        return 1e-4
+    }
     let _unused = args
-    if name == "cvtColor" { return 1.0 }
     return 1.0
 }
 
+fn interpolation_named(name: str) -> int {
+    if name == "NEAREST" { return INTER_NEAREST }
+    if name == "LINEAR" { return INTER_LINEAR }
+    if name == "CUBIC" { return INTER_CUBIC }
+    if name == "AREA" { return INTER_AREA }
+    if name == "LANCZOS4" { return INTER_LANCZOS4 }
+    throw ValueError(f"no jaicv interpolation for {name}")
+}
+
+fn border_named(name: str) -> int {
+    if name == "CONSTANT" { return BORDER_CONSTANT }
+    if name == "REPLICATE" { return BORDER_REPLICATE }
+    if name == "REFLECT" { return BORDER_REFLECT }
+    if name == "REFLECT_101" { return BORDER_REFLECT_101 }
+    if name == "WRAP" { return BORDER_WRAP }
+    throw ValueError(f"no jaicv border for {name}")
+}
+
+let QUAD_SOURCE = [Point2f(0.0, 0.0), Point2f(9.0, 0.0), Point2f(9.0, 7.0), Point2f(0.0, 7.0)]
+let QUAD_TARGET = [Point2f(1.0, 1.0), Point2f(8.0, 0.5), Point2f(9.0, 6.0), Point2f(0.5, 7.0)]
+
+fn rotation_case() -> Mat { return get_rotation_matrix_2d(Point2f(4.5, 3.5), 27.0, 1.3) }
+
 fn run_case(item: Case) -> Mat {
     if item.name == "cvtColor" { return cvt_color(item.source, colour_code(item.args[0])) }
+    if item.name == "resize" {
+        return resize(
+            item.source,
+            size: Size(int(item.args[1]), int(item.args[2])),
+            interpolation: interpolation_named(item.args[0])
+        )
+    }
+    if item.name == "pyrDown" { return pyr_down(item.source) }
+    if item.name == "pyrUp" { return pyr_up(item.source) }
+    if item.name == "copyMakeBorder" {
+        return copy_make_border(
+            item.source,
+            int(item.args[1]),
+            int(item.args[2]),
+            int(item.args[3]),
+            int(item.args[4]),
+            border_mode: border_named(item.args[0])
+        )
+    }
+    if item.name == "warpAffine" {
+        return warp_affine(item.source, rotation_case(), Size(10, 8))
+    }
+    if item.name == "warpPerspective" {
+        return warp_perspective(
+            item.source,
+            get_perspective_transform(QUAD_SOURCE, QUAD_TARGET),
+            Size(10, 8)
+        )
+    }
+    if item.name == "getRotationMatrix2D" { return rotation_case() }
+    if item.name == "getPerspectiveTransform" {
+        return get_perspective_transform(QUAD_SOURCE, QUAD_TARGET)
+    }
+    if item.name == "getAffineTransform" {
+        var source: list[Point2f] = []
+        var target: list[Point2f] = []
+        for index in 0..3 {
+            source.push(QUAD_SOURCE[index])
+            target.push(QUAD_TARGET[index])
+        }
+        return get_affine_transform(source, target)
+    }
+    if item.name == "remap" {
+        var xs: list[float] = []
+        var ys: list[float] = []
+        for y in 0..8 {
+            for x in 0..10 {
+                xs.push(float(9 - x))
+                ys.push(float(y))
+            }
+        }
+        return remap(
+            item.source,
+            Mat.from_list(8, 10, CV_MAKETYPE(5, 1), xs),
+            Mat.from_list(8, 10, CV_MAKETYPE(5, 1), ys)
+        )
+    }
     throw ValueError(f"no jaicv binding for {item.name}")
 }
 
