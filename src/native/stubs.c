@@ -495,6 +495,51 @@ bool jaiGpuMatMul(const double *a, const double *b, double *out,
     return true;
 }
 
+int jaiCameraPermission(void) {
+    return -2;
+}
+
+int jaiCameraDeviceCount(void) {
+    return 0;
+}
+
+bool jaiCameraDeviceName(int index, char *buffer, size_t capacity) {
+    (void)index;
+    (void)buffer;
+    (void)capacity;
+    return false;
+}
+
+JaiCamera *jaiCameraOpen(int index, int width, int height, double fps) {
+    (void)index;
+    (void)width;
+    (void)height;
+    (void)fps;
+    return NULL;
+}
+
+void jaiCameraClose(JaiCamera *camera) {
+    (void)camera;
+}
+
+bool jaiCameraSize(JaiCamera *camera, int *width, int *height) {
+    (void)camera;
+    (void)width;
+    (void)height;
+    return false;
+}
+
+bool jaiCameraRead(JaiCamera *camera, uint8_t *destination, size_t capacity,
+                   int *width, int *height, double timeoutSeconds) {
+    (void)camera;
+    (void)destination;
+    (void)capacity;
+    (void)width;
+    (void)height;
+    (void)timeoutSeconds;
+    return false;
+}
+
 bool jaiGpuReduceSum(const double *a, size_t n, double *out) {
     if (a == NULL || out == NULL) return false;
     *out = compensatedSum(a, n);

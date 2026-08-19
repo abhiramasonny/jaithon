@@ -76,7 +76,8 @@ ifeq ($(UNAME_S),Darwin)
   LIBS   += -framework Cocoa -framework Metal -framework QuartzCore \
             -framework MetalKit -framework Foundation \
             -framework MetalPerformanceShaders \
-            -framework MetalPerformanceShadersGraph
+            -framework MetalPerformanceShadersGraph \
+            -framework AVFoundation -framework CoreMedia -framework CoreVideo
 endif
 
 # --- readline probe ---------------------------------------------------------
