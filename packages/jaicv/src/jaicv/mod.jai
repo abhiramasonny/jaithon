@@ -97,6 +97,18 @@ from .imgproc.drawing import CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT
 from .imgproc.drawing import MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR
 from .imgproc.drawing import MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP
 
+from .imgproc.contours import draw_contours, find_contours, Hierarchy
+from .imgproc.contours import CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE
+from .imgproc.contours import RETR_CCOMP, RETR_EXTERNAL, RETR_LIST, RETR_TREE
+
+from .imgproc.shape import approx_poly_dp, arc_length, bounding_rect, box_points
+from .imgproc.shape import contour_area, convex_hull, convex_hull_indices, fit_ellipse
+from .imgproc.shape import fit_line, hu_moments, is_contour_convex, match_shapes
+from .imgproc.shape import min_area_rect, min_enclosing_circle, moments, moments_f
+from .imgproc.shape import moments_image, point_polygon_test, Moments
+from .imgproc.shape import CONTOURS_MATCH_I1, CONTOURS_MATCH_I2, CONTOURS_MATCH_I3
+from .imgproc.shape import DIST_FAIR, DIST_HUBER, DIST_L1, DIST_L2, DIST_WELSCH
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -181,6 +193,17 @@ export { rectangle, rectangle_rect }
 export { CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT }
 export { MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR }
 export { MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP }
+
+export { draw_contours, find_contours, Hierarchy }
+export { CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE }
+export { RETR_CCOMP, RETR_EXTERNAL, RETR_LIST, RETR_TREE }
+
+export { approx_poly_dp, arc_length, bounding_rect, box_points, contour_area }
+export { convex_hull, convex_hull_indices, fit_ellipse, fit_line, hu_moments }
+export { is_contour_convex, match_shapes, min_area_rect, min_enclosing_circle }
+export { moments, moments_f, moments_image, point_polygon_test, Moments }
+export { CONTOURS_MATCH_I1, CONTOURS_MATCH_I2, CONTOURS_MATCH_I3 }
+export { DIST_FAIR, DIST_HUBER, DIST_L1, DIST_L2, DIST_WELSCH }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

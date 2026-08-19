@@ -8,6 +8,7 @@ digits to round-trip a float32.
 from __future__ import annotations
 
 import sys
+import zlib
 from pathlib import Path
 
 import cv2
@@ -79,7 +80,9 @@ COLOR_CODES = {
 def write_colour(handle) -> None:
     for name, code in COLOR_CODES.items():
         channels = 1 if name.startswith("GRAY") else (4 if name.startswith("BGRA") else 3)
-        source = ramp(6, 7, channels, seed=hash(name) % 9999)
+        # A stable seed: Python's hash() is salted per process, so using it
+        # here made the recorded inputs change on every regeneration.
+        source = ramp(6, 7, channels, seed=zlib.crc32(name.encode()) % 9999)
         case(handle, "cvtColor", name, source, cv2.cvtColor(source, code))
 
 
@@ -302,6 +305,118 @@ def write_drawing(handle) -> None:
                       cv2.drawMarker(m, (16, 13), COLOUR, k, s, 1, cv2.LINE_8))
 
 
+def contour_shapes():
+    shapes = []
+    a = np.zeros((22, 26), np.uint8)
+    a[4:16, 5:20] = 255
+    a[7:12, 9:16] = 0
+    a[9:10, 11:13] = 255
+    shapes.append(("nested", a))
+
+    b = np.zeros((20, 24), np.uint8)
+    cv2.circle(b, (7, 8), 5, 255, -1)
+    cv2.circle(b, (17, 13), 4, 255, -1)
+    cv2.circle(b, (7, 8), 2, 0, -1)
+    b[0, 0] = 255
+    b[19, 23] = 255
+    shapes.append(("blobs", b))
+
+    rng = np.random.default_rng(77)
+    shapes.append(("speckle", (rng.random((18, 21)) < 0.42).astype(np.uint8) * 255))
+
+    d = np.zeros((16, 18), np.uint8)
+    d[2:14, 2:4] = 255
+    d[2:4, 2:16] = 255
+    d[12:14, 2:16] = 255
+    shapes.append(("bars", d))
+    return shapes
+
+
+CONTOUR_MODES = {"EXTERNAL": cv2.RETR_EXTERNAL, "LIST": cv2.RETR_LIST,
+                 "CCOMP": cv2.RETR_CCOMP, "TREE": cv2.RETR_TREE}
+CONTOUR_METHODS = {"NONE": cv2.CHAIN_APPROX_NONE, "SIMPLE": cv2.CHAIN_APPROX_SIMPLE}
+
+
+def write_contours(handle) -> None:
+    for tag, image in contour_shapes():
+        for mname, mode in CONTOUR_MODES.items():
+            for cname, method in CONTOUR_METHODS.items():
+                found, hier = cv2.findContours(image, mode, method)
+                rows = []
+                for ci, contour in enumerate(found):
+                    for pi, point in enumerate(contour):
+                        rows.append([ci, pi, int(point[0][0]), int(point[0][1])])
+                points = np.array(rows, np.int32).reshape(-1, 4)
+                case(handle, "findContours", f"{tag} {mname} {cname}", image, points)
+                tree = np.array(hier[0] if hier is not None else [], np.int32).reshape(-1, 4)
+                case(handle, "contourHierarchy", f"{tag} {mname} {cname}", image, tree)
+
+
+def shape_contours():
+    out = []
+    for tag, image in contour_shapes():
+        found, _ = cv2.findContours(image, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        for index, contour in enumerate(found):
+            if len(contour) < 6:
+                continue
+            out.append((tag, image, index, contour))
+    return out
+
+
+def write_shape(handle) -> None:
+    for tag, image, index, contour in shape_contours():
+        head = f"{tag} {index}"
+        m = cv2.moments(contour)
+        keys = ["m00", "m10", "m01", "m20", "m11", "m02", "m30", "m21", "m12", "m03",
+                "mu20", "mu11", "mu02", "mu30", "mu21", "mu12", "mu03",
+                "nu20", "nu11", "nu02", "nu30", "nu21", "nu12", "nu03"]
+        case(handle, "moments", head, image,
+             np.array([[m[k] for k in keys]], np.float32))
+        case(handle, "huMoments", head, image,
+             cv2.HuMoments(m).reshape(1, 7).astype(np.float32))
+        case(handle, "contourArea", head, image,
+             np.array([[cv2.contourArea(contour)]], np.float32))
+        case(handle, "arcLengthClosed", head, image,
+             np.array([[cv2.arcLength(contour, True)]], np.float32))
+        case(handle, "arcLengthOpen", head, image,
+             np.array([[cv2.arcLength(contour, False)]], np.float32))
+        x, y, w, h = cv2.boundingRect(contour)
+        case(handle, "boundingRect", head, image, np.array([[x, y, w, h]], np.int32))
+        case(handle, "isContourConvex", head, image,
+             np.array([[1 if cv2.isContourConvex(contour) else 0]], np.int32))
+        hull = cv2.convexHull(contour)
+        case(handle, "convexHull", head, image,
+             np.array([[int(p[0][0]), int(p[0][1])] for p in hull], np.int32).reshape(-1, 2))
+        for eps in (1.0, 3.0):
+            approx = cv2.approxPolyDP(contour, eps, True)
+            case(handle, "approxPolyDP", f"{head} {eps}", image,
+                 np.array([[int(p[0][0]), int(p[0][1])] for p in approx], np.int32).reshape(-1, 2))
+        (cxr, cyr), (wr, hr), ar = cv2.minAreaRect(contour)
+        case(handle, "minAreaRect", head, image,
+             np.array([[cxr, cyr, wr, hr, ar]], np.float32))
+        (ccx, ccy), rad = cv2.minEnclosingCircle(contour)
+        case(handle, "minEnclosingCircle", head, image,
+             np.array([[ccx, ccy, rad]], np.float32))
+        rows, cols = image.shape
+        grid = np.zeros((rows, cols), np.float32)
+        for yy in range(rows):
+            for xx in range(cols):
+                grid[yy, xx] = cv2.pointPolygonTest(contour, (float(xx), float(yy)), True)
+        case(handle, "pointPolygonTest", head, image, grid)
+        # A round blob has no long axis, so neither fitEllipse's angle nor
+        # fitLine's direction is determined for it and comparing them would be
+        # comparing noise. Only shapes with a clear axis are recorded.
+        spread = np.cov(contour.reshape(-1, 2).astype(np.float64).T)
+        eigen = np.sort(np.linalg.eigvalsh(spread))
+        elongated = eigen[0] > 1e-9 and eigen[1] / eigen[0] > 1.3
+        if len(contour) >= 5 and elongated:
+            (ecx, ecy), (ew, eh), ea = cv2.fitEllipse(contour)
+            case(handle, "fitEllipse", head, image,
+                 np.array([[ecx, ecy, ew, eh, ea]], np.float32))
+            line = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01).reshape(1, 4)
+            case(handle, "fitLine", head, image, line.astype(np.float32))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -311,6 +426,8 @@ def main() -> int:
         write_morph(handle)
         write_edges(handle)
         write_drawing(handle)
+        write_contours(handle)
+        write_shape(handle)
     print(f"wrote {OUT}")
     return 0
 
