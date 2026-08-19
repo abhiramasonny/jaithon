@@ -170,11 +170,15 @@ from .calib3d.transform import init_undistort_rectify_map, project_points, refin
 from .calib3d.transform import rodrigues, triangulate_points, undistort_points
 from .calib3d.transform import LMEDS, RANSAC
 
+from .calib3d.epipolar import compute_correspond_epilines, decompose_essential_mat
+from .calib3d.epipolar import find_essential_mat, find_fundamental_mat, recover_pose
+from .calib3d.epipolar import undistort_to_normalised, FM_8POINT, FM_LMEDS, FM_RANSAC
 from .calib3d.calibrate import calibrate_camera, draw_chessboard_corners
 from .calib3d.calibrate import find_chessboard_corners, solve_pnp, undistort
 from .calib3d.calibrate import SOLVEPNP_ITERATIVE
 
 from .core.linalg import identity, inverse, levenberg_marquardt, null_space, symmetric_eigen
+from .core.linalg import svd
 
 from .core.dft import dct, dft, get_optimal_dft_size, idft, mul_spectrums
 from .core.dft import DFT_COMPLEX_OUTPUT, DFT_INVERSE, DFT_REAL_OUTPUT, DFT_ROWS, DFT_SCALE
@@ -365,6 +369,10 @@ export { alignment_centres, decode_grid, encode_grid, qr_encode }
 export { smallest_version, version_size, QRCode, QRCodeDetector }
 
 export { estimate_affine_2d, estimate_affine_partial_2d, find_homography }
+export { compute_correspond_epilines, decompose_essential_mat, find_essential_mat }
+export { find_fundamental_mat, recover_pose, undistort_to_normalised }
+export { FM_8POINT, FM_LMEDS, FM_RANSAC }
+export { svd }
 export { get_optimal_new_camera_matrix, init_undistort_rectify_map, project_points }
 export { refine_homography, rodrigues, triangulate_points, undistort_points }
 export { LMEDS, RANSAC }

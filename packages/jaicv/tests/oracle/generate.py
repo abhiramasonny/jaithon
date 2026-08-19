@@ -705,6 +705,53 @@ def write_calib(handle) -> None:
     p2, _ = cv2.estimateAffinePartial2D(src, sim_dst, method=cv2.LMEDS)
     case(handle, "estimateAffinePartial2D", "direct", blank, p2.astype(np.float32))
 
+    # Two views of one scene, which is what the epipolar functions are for.
+    # Every one of them was added with no OpenCV case at all: this section
+    # recorded single-view geometry only, and a fundamental matrix that
+    # disagrees with OpenCV's by a factor is still a fundamental matrix, so
+    # nothing but a recorded comparison would have said.
+    epi_camera = np.array([[520.0, 0.0, 320.0], [0.0, 515.0, 240.0], [0.0, 0.0, 1.0]])
+    epi_rvec = np.array([0.03, 0.12, -0.02])
+    epi_t = np.array([0.9, -0.15, 0.08])
+    epi_t = epi_t / np.linalg.norm(epi_t)
+    epi_world = rng.uniform(-1.5, 1.5, size=(40, 3))
+    epi_world[:, 2] += 6.0
+    epi_first, _ = cv2.projectPoints(epi_world, np.zeros(3), np.zeros(3), epi_camera, None)
+    epi_second, _ = cv2.projectPoints(epi_world, epi_rvec, epi_t, epi_camera, None)
+    epi_first = epi_first.reshape(-1, 2).astype(np.float32)
+    epi_second = epi_second.reshape(-1, 2).astype(np.float32)
+    case(handle, "epipolarPoints", "first", blank, epi_first)
+    case(handle, "epipolarPoints", "second", blank, epi_second)
+
+    epi_f, _ = cv2.findFundamentalMat(epi_first, epi_second, cv2.FM_8POINT)
+    epi_f = epi_f / np.abs(epi_f).max()
+    case(handle, "findFundamentalMat", "eightPoint", blank, epi_f.astype(np.float32))
+
+    epi_e = epi_camera.T @ epi_f @ epi_camera
+    u, s, vt = np.linalg.svd(epi_e)
+    mean = (s[0] + s[1]) / 2.0
+    epi_e = u @ np.diag([mean, mean, 0.0]) @ vt
+    epi_e = epi_e / np.abs(epi_e).max()
+    case(handle, "findEssentialMat", "fromFundamental", blank, epi_e.astype(np.float32))
+
+    epi_lines = cv2.computeCorrespondEpilines(
+        epi_first[:8].reshape(-1, 1, 2), 1, epi_f
+    ).reshape(-1, 3)
+    case(handle, "computeCorrespondEpilines", "firstImage", blank,
+         epi_lines.astype(np.float32))
+    epi_lines2 = cv2.computeCorrespondEpilines(
+        epi_second[:8].reshape(-1, 1, 2), 2, epi_f
+    ).reshape(-1, 3)
+    case(handle, "computeCorrespondEpilines", "secondImage", blank,
+         epi_lines2.astype(np.float32))
+
+    # The pose the motion was built from, which is what `recover_pose` must find
+    # up to the sign of the translation.
+    epi_r, _ = cv2.Rodrigues(epi_rvec)
+    case(handle, "recoverPose", "rotation", blank, epi_r.astype(np.float32))
+    case(handle, "recoverPose", "translation", blank,
+         epi_t.reshape(1, 3).astype(np.float32))
+
     camera = np.array([[520.0, 0.0, 320.0], [0.0, 515.0, 240.0], [0.0, 0.0, 1.0]])
     for coeffs in ([0.0, 0.0, 0.0, 0.0, 0.0], [-0.28, 0.09, 0.001, -0.002, 0.0]):
         dist = np.array(coeffs, np.float64)

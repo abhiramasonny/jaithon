@@ -59,6 +59,8 @@ from jaicv.objdetect.cascade import CascadeClassifier
 from jaicv.calib3d.transform import estimate_affine_2d, estimate_affine_partial_2d
 from jaicv.calib3d.transform import find_homography, project_points, rodrigues
 from jaicv.calib3d.transform import RANSAC
+from jaicv.calib3d.epipolar import compute_correspond_epilines, find_essential_mat
+from jaicv.calib3d.epipolar import find_fundamental_mat, recover_pose, FM_8POINT
 from jaicv.calib3d.transform import triangulate_points, undistort_points
 from jaicv.core.types import Point3f
 from jaicv.calib3d.calibrate import calibrate_camera, find_chessboard_corners
@@ -994,6 +996,11 @@ let CALIB_NAMES = [
     "rodriguesBack",
     "findHomography",
     "findHomographyRansac",
+    "epipolarPoints",
+    "findFundamentalMat",
+    "findEssentialMat",
+    "computeCorrespondEpilines",
+    "recoverPose",
     "findHomographyRansacMask",
     "estimateAffine2D",
     "estimateAffinePartial2D",
@@ -1052,6 +1059,30 @@ fn ransac_pair() -> tuple[list[Point2f], list[Point2f]] {
     return (source, target)
 }
 
+#: The two views the epipolar cases share: forty world points seen from the
+#: origin and again after a small rotation and a sideways move. Built the same
+#: way the generator builds them, so the two sides are comparing the same
+#: geometry rather than the same numbers.
+fn epipolar_views() -> tuple[list[Point2f], list[Point2f]] {
+    var first: list[Point2f] = []
+    var second: list[Point2f] = []
+    for point in EPIPOLAR_FIRST { first.push(point) }
+    for point in EPIPOLAR_SECOND { second.push(point) }
+    return (first, second)
+}
+
+var EPIPOLAR_FIRST: list[Point2f] = []
+var EPIPOLAR_SECOND: list[Point2f] = []
+
+fn epipolar_camera() -> Mat {
+    return Mat.from_list(
+        3,
+        3,
+        CV_MAKETYPE(5, 1),
+        [520.0, 0.0, 320.0, 0.0, 515.0, 240.0, 0.0, 0.0, 1.0]
+    )
+}
+
 fn camera_of() -> Mat {
     return Mat.from_list(
         3,
@@ -1064,6 +1095,26 @@ fn camera_of() -> Mat {
 fn distortion_of(tag: str) -> list[float] {
     if tag == "clean" { return [0.0, 0.0, 0.0, 0.0, 0.0] }
     return [-0.28, 0.09, 0.001, -0.002, 0.0]
+}
+
+#: A fundamental matrix, an essential matrix, an epipolar line and a
+#: translation are each defined only up to sign: negating one describes the
+#: same geometry. OpenCV picks a sign from its own arithmetic and this picks one
+#: from its own, so the comparison is made against whichever sign is closer.
+fn signed_like(computed: Mat, expected: Mat) -> Mat {
+    let got = computed.to_list()
+    let want = expected.to_list()
+    if got.len() != want.len() { return computed }
+    var same = 0.0
+    var flipped = 0.0
+    for index in 0..got.len() {
+        same += math.fabs(got[index] - want[index])
+        flipped += math.fabs(got[index] + want[index])
+    }
+    if same <= flipped { return computed }
+    var negated: list[float] = []
+    for value in got { negated.push(-value) }
+    return Mat.from_list(computed.rows, computed.cols, computed.flags, negated)
 }
 
 fn run_calib(item: Case) -> Mat {
@@ -1083,6 +1134,60 @@ fn run_calib(item: Case) -> Mat {
         let target = mapped_by([1.05, 0.08, -6.0, -0.04, 0.96, 4.0, 0.0002, -0.0003, 1.0], true)
         let (h, _inliers) = find_homography(CALIB_SOURCE, target)
         return h
+    }
+    if item.name == "epipolarPoints" {
+        #: Not a computation of ours: the recorded points ARE the input to
+        #: every case below, so they are stored where those cases can reach
+        #: them and handed straight back. Comparing them to themselves is what
+        #: proves the two sides start from the same views.
+        var values: list[float] = []
+        let flat = item.expected.to_list()
+        var points: list[Point2f] = []
+        for index in 0..item.expected.rows {
+            let x = flat[index * 2]
+            let y = flat[index * 2 + 1]
+            points.push(Point2f(x, y))
+            values.push(x)
+            values.push(y)
+        }
+        if item.args[0] == "first" { EPIPOLAR_FIRST = points } else { EPIPOLAR_SECOND = points }
+        return Mat.from_list(item.expected.rows, 2, CV_MAKETYPE(5, 1), values)
+    }
+    if item.name == "findFundamentalMat" {
+        let (first, second) = epipolar_views()
+        let (matrix, _mask) = find_fundamental_mat(first, second, FM_8POINT)
+        return signed_like(matrix, item.expected)
+    }
+    if item.name == "findEssentialMat" {
+        let (first, second) = epipolar_views()
+        let (matrix, _mask) = find_essential_mat(first, second, epipolar_camera(), FM_8POINT)
+        return signed_like(matrix, item.expected)
+    }
+    if item.name == "computeCorrespondEpilines" {
+        let (first, second) = epipolar_views()
+        let (fundamental, _mask) = find_fundamental_mat(first, second, FM_8POINT)
+        let which = if item.args[0] == "firstImage" { 1 } else { 2 }
+        let source = if which == 1 { first } else { second }
+        var probes: list[Point2f] = []
+        for index in 0..8 { probes.push(source[index]) }
+        var values: list[float] = []
+        for line in compute_correspond_epilines(probes, which, fundamental) {
+            values.push(line.x)
+            values.push(line.y)
+            values.push(line.z)
+        }
+        return signed_like(Mat.from_list(8, 3, CV_MAKETYPE(5, 1), values), item.expected)
+    }
+    if item.name == "recoverPose" {
+        let (first, second) = epipolar_views()
+        let camera = epipolar_camera()
+        let (essential, _mask) = find_essential_mat(first, second, camera, FM_8POINT)
+        let (rotation, translation, _front) = recover_pose(essential, first, second, camera)
+        if item.args[0] == "rotation" { return rotation }
+        return signed_like(
+            Mat.from_list(1, 3, CV_MAKETYPE(5, 1), translation.to_list()),
+            item.expected
+        )
     }
     if item.name == "findHomographyRansac" {
         let (source, target) = ransac_pair()

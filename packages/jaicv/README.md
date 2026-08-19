@@ -76,14 +76,14 @@ down next to the tolerance. In short:
 
 | Area | What it covers |
 | --- | --- |
-| `core` | `Mat` with views and ROIs, arithmetic, statistics, `merge`/`split`, linear algebra, DFT and DCT, k-means, PCA, sorting, random fills |
+| `core` | `Mat` with views and ROIs, arithmetic, statistics, `merge`/`split`, linear algebra including SVD, DFT and DCT, k-means, PCA, sorting, random fills |
 | `imgproc` | colour conversion, resize and warping, filtering, thresholding, morphology, Canny, drawing, contours, shape analysis, segmentation, histograms, template matching, corners, Hough, colour maps, phase correlation, mean-shift filtering |
 | `imgcodecs` | PNG, BMP, PNM, and JPEG, reading and writing, with `imread`/`imwrite`/`imencode`/`imdecode` |
 | `videoio` | camera capture through AVFoundation, and AVI reading and writing, MJPEG or uncompressed |
 | `highgui` | `imshow`, `wait_key`, windows, mouse callbacks, trackbars |
 | `features2d` | FAST, ORB, BRIEF, blob detection, brute-force matching, keypoint and match drawing |
 | `objdetect` | cascade classification, reading OpenCV's own trained XML; histograms of oriented gradients; QR codes, read and written, every version and correction level |
-| `calib3d` | Rodrigues, homography, affine estimation, projection, distortion, triangulation, `solve_pnp`, `calibrate_camera`, chessboard detection |
+| `calib3d` | Rodrigues, homography, affine estimation, projection, distortion, triangulation, `solve_pnp`, `calibrate_camera`, chessboard detection, fundamental and essential matrices, pose recovery, epipolar lines |
 | `video` | Lucas-Kanade and Farneback optical flow, MOG2 and KNN background subtraction, mean shift, CamShift, Kalman |
 | `photo` | non-local means denoising, inpainting, edge-preserving smoothing |
 | `ml` | nearest neighbours, naive Bayes, support vector machine, logistic regression, decision trees, random forest, multilayer perceptron |
@@ -98,8 +98,10 @@ Named so that nobody has to find out by trying:
   coefficients of OpenCV's pre-trained people detector — `HOGDescriptor`
   computes the descriptor and takes a detector, but does not ship one. A kanji
   QR segment comes back as its Shift-JIS bytes rather than as text.
-- **calib3d**: fisheye, stereo rectification and matching, `find_essential_mat`
-  and pose recovery, circle-grid patterns.
+- **calib3d**: fisheye, stereo rectification and matching, circle-grid
+  patterns. `find_fundamental_mat` and `find_essential_mat` fit by the
+  normalised eight-point algorithm inside RANSAC, so eight correspondences are
+  needed where OpenCV's seven- and five-point minimal solvers need fewer.
 - **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;
   `Net` is the adapter, not a runtime.
 - **imgproc**: GrabCut, `EMD`, line segment detection, the Viridis family of
