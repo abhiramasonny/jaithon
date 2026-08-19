@@ -215,6 +215,8 @@ from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
 from .imgcodecs.codecs import IMREAD_GRAYSCALE, IMREAD_UNCHANGED
 from .imgcodecs.codecs import IMWRITE_JPEG_QUALITY, IMWRITE_PNG_COMPRESSION
 
+from .videoio.writer import fourcc, VideoWriter
+
 from .videoio.capture import VideoCapture, device_count, device_name, device_names
 from .videoio.capture import permission, PERMISSION_HELP
 from .videoio.capture import CAP_PROP_CHANNEL, CAP_PROP_FPS, CAP_PROP_FRAME_HEIGHT
@@ -399,6 +401,8 @@ export { COLORMAP_RAINBOW, COLORMAP_SPRING, COLORMAP_SUMMER, COLORMAP_WINTER }
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
 export { IMWRITE_JPEG_QUALITY, IMWRITE_PNG_COMPRESSION }
+
+export { fourcc, VideoWriter }
 
 export { VideoCapture, device_count, device_name, device_names, permission, PERMISSION_HELP }
 export { CAP_PROP_CHANNEL, CAP_PROP_FPS, CAP_PROP_FRAME_HEIGHT }
