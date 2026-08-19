@@ -93,7 +93,34 @@ def parse_records(stdout: str, command: list[str]) -> list[Record]:
     return records
 
 
-def sample_command(command: list[str], runs: int, cwd: Path, level: str) -> tuple[list[str], dict[str, Samples]]:
+def progress(text: str) -> None:
+    """Say what is running, on stderr, in place.
+
+    The suite takes seven minutes on this machine and used to print nothing at
+    all until the table -- so the only thing distinguishing it from a hang was
+    knowing that it takes seven minutes. Stderr rather than stdout so the table
+    still pipes cleanly, and a carriage return rather than a newline so a
+    terminal shows one line rather than three hundred.
+    """
+    if not sys.stderr.isatty():
+        return
+    sys.stderr.write("\r\033[K" + text)
+    sys.stderr.flush()
+
+
+def progress_done() -> None:
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+
+def sample_command(
+    command: list[str],
+    runs: int,
+    cwd: Path,
+    level: str,
+    label: str = "",
+) -> tuple[list[str], dict[str, Samples]]:
     env = os.environ.copy()
     env["BENCH_LEVEL"] = level
     env["JAITENSOR_VERBOSE"] = "0"
@@ -103,6 +130,8 @@ def sample_command(command: list[str], runs: int, cwd: Path, level: str) -> tupl
     expected_names: list[str] | None = None
 
     for _run in range(runs):
+        if label:
+            progress(f"  {label} (run {_run + 1} of {runs})")
         done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
         if done.returncode != 0:
             output = (done.stdout + done.stderr).strip() or "<no output>"
@@ -234,16 +263,18 @@ def collect_side(executable: str, root: Path, level: str, runs: int, jaithon: bo
     order: list[str] = []
     samples: dict[str, Samples] = {}
     bench_root = root / "tests" / "bench" / "jaitensor"
+    side = "jaithon" if jaithon else "pytorch"
     for workload in WORKLOADS:
         program = bench_root / ("mlp.jai" if jaithon else "mlp.py")
         command = [executable, "run", str(program), workload] if jaithon else [executable, str(program), workload]
-        found_order, found = sample_command(command, runs, root, level)
+        found_order, found = sample_command(command, runs, root, level, f"{side} {workload}")
         merge_samples(order, samples, found_order, found)
     for stem in ("conv", "gemm", "attn"):
         program = bench_root / f"{stem}.{'jai' if jaithon else 'py'}"
         command = [executable, "run", str(program)] if jaithon else [executable, str(program)]
-        found_order, found = sample_command(command, runs, root, level)
+        found_order, found = sample_command(command, runs, root, level, f"{side} {stem}")
         merge_samples(order, samples, found_order, found)
+    progress_done()
     return order, samples
 
 

@@ -4,7 +4,9 @@
 #   make debug      -O0 -g, assertions, GC stress available
 #   make test       build + run the full test suite
 #   make bench              language benches vs python3/c++/java
-#   make bench jaitensor     GPU/ML benches vs PyTorch MPS
+#   make bench jaitensor     GPU/ML benches vs PyTorch MPS (~7 min: twenty
+#                            workloads, five runs a side, and a PyTorch process
+#                            start for each -- it reports progress on stderr)
 #                           (LEVEL=easy|medium|hard, default hard)
 #   make fixpoint-check  compile each source twice and compare the images
 #   make install    install to $(PREFIX)
@@ -406,6 +408,7 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 	@$(BUILD)/field_natives
 	@$(BUILD)/invoke_result_kind
 	@./scripts/run_tests.sh
+	@./scripts/bench_smoke.sh
 	@$(MAKE) --no-print-directory fmt-roundtrip
 	@$(MAKE) --no-print-directory gc-stress-test
 
@@ -426,13 +429,22 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 # where the live-bytes threshold collects at tens.
 .PHONY: gc-stress-test
 gc-stress-test: $(TARGET)
-	@out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
-	          --gc-stress=$(GC_STRESS_EVERY) \
-	          tests/lang tests/stdlib tests/checker \
-	          packages/jaiplot/tests packages/jaitensor/tests 2>&1); \
-	  status=$$?; \
-	  if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
-	  printf '%s\n' "$$out" | tail -1
+# ONE INVOCATION PER DIRECTORY, not one for all five.
+#
+# The collector walks the live set, and running the suites together keeps every
+# module of every suite alive for the whole run -- so each of the thousands of
+# collections walks five suites' worth of heap instead of one. The work is the
+# product of the two, and splitting it turns a product back into a sum:
+# measured on an idle machine, 463s together against 144s apart, for the same
+# tests under the same cadence.
+	@for suite in tests/lang tests/stdlib tests/checker \
+	              packages/jaiplot/tests packages/jaitensor/tests; do \
+	    out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
+	             --gc-stress=$(GC_STRESS_EVERY) "$$suite" 2>&1); \
+	    status=$$?; \
+	    if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
+	    printf '%s  %s\n' "$$(printf '%s\n' "$$out" | tail -1)" "$$suite"; \
+	  done
 	@out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
 	          --gc-stress=$(JAICV_GC_STRESS_EVERY) \
 	          packages/jaicv/tests/test_reachable.jai \
@@ -765,6 +777,12 @@ fmt-check: $(TARGET)
 # The comparison is only as good as what `ast_encode` prints: a field it leaves
 # out is a field this cannot see. That is why decorators had to be added there
 # before this gate could catch them.
+# Every benchmark, run once at the smallest level. See the script for why it
+# is here: they are programs no gate ran, and one of them was broken.
+.PHONY: bench-smoke
+bench-smoke: $(TARGET)
+	@./scripts/bench_smoke.sh
+
 .PHONY: fmt-roundtrip
 fmt-roundtrip: $(TARGET)
 	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/fmt_roundtrip.jai
