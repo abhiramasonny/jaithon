@@ -533,8 +533,9 @@ var _memo: Plan? = null
 #: plan lookup is memoised on the shape itself: a full lookup builds a cache key
 #: string, and doing that per dispatch cost more than encoding the kernel.
 fn memo_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> int {
-    var key = rows * 6291469 + inner
-    key = key * 6291469 + columns
+    const MASK = 0xFFFFFFFFFFFF
+    var key = rows * 6291469 + inner & MASK
+    key = key * 6291469 + columns & MASK
     key = key * 2 + (if trans_a { 1 } else { 0 })
     return key * 2 + (if trans_b { 1 } else { 0 })
 }

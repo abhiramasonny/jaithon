@@ -151,6 +151,19 @@ pub fn prepare_state(parameters: list[Tensor], settings: list[float]) -> void {
     }
 }
 
+#: Clear every parameter's accumulated gradient, in place.
+#:
+#: `Optimizer.step` reads `.grad` and leaves it alone, so a training loop has
+#: to reset it between batches — otherwise the batches sum and the effective
+#: step grows without bound. Zeroing rather than dropping keeps the buffer, so
+#: the backward pass that follows writes into memory it already has.
+pub fn zero_grad(parameters: list[Tensor]) -> void {
+    for parameter in parameters {
+        let gradient = parameter.grad
+        if gradient is not null { gradient.zero_() }
+    }
+}
+
 fn apply_update(parameter: Tensor, settings: list[float], kind: int) -> void {
     let gradient = parameter.grad
     if gradient is null {
