@@ -87,7 +87,7 @@ class Parser:
         if self.src[self.at] == "]":
             self.at += 1
             return node
-        while True:
+        loop:
             node.items.append(self.value())
             self.skip()
             c = self.src[self.at]
@@ -103,7 +103,7 @@ class Parser:
         if self.src[self.at] == "}":
             self.at += 1
             return node
-        while True:
+        loop:
             self.skip()
             key = self.text()
             self.skip()

@@ -422,7 +422,7 @@ fn fill_edges(painter: Painter, unsorted: list[PolyEdge]) -> void {
         var previous = head
         var current = head.next
         var draw = false
-        while true {
+        loop {
             let waiting = next_edge < total and edges[next_edge].y0 == y
             if current is null and not waiting { break }
             let live = current
@@ -555,7 +555,7 @@ fn fill_convex(painter: Painter, points: list[Point], line_type: int, shift: int
             let di = direction[side]
             var xs = 0
             var ty = 0
-            while true {
+            loop {
                 ty = points[idx].y + delta >> shift
                 if ty > y or remaining == 0 { break }
                 xs = points[idx].x

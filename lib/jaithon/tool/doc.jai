@@ -981,7 +981,7 @@ class _Options {
     pub static fn parse(args: list[str]) -> _Options {
         let options = _Options()
         let reader = Arguments(args)
-        while true {
+        loop {
             let argument = reader.next()
             if argument is null { break }
             if not argument.is_flag() {

@@ -210,6 +210,12 @@ uint32_t jaiA64FcmpD(unsigned rn, unsigned rm) {
     return 0x1e602000u | (rm << 16) | (rn << 5);
 }
 
+/* FCMP Dn, #0.0 -- the zero literal is part of the encoding, so comparing
+ * against it needs no register and no constant to materialise. */
+uint32_t jaiA64FcmpDZero(unsigned rn) {
+    return 0x1e602008u | (rn << 5);
+}
+
 /* fmov Dd, Dn -- opcode 0 of the one-source group: the plain register move. */
 uint32_t jaiA64FmovDD(unsigned rd, unsigned rn) {
     return 0x1e604000u | (rn << 5) | rd;

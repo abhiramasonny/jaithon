@@ -219,7 +219,7 @@ pub class HOGDescriptor {
 
         var found: list[Rect] = []
         var factor = 1.0
-        while true {
+        loop {
             let width = int(float(image.cols) / factor + 0.5)
             let height = int(float(image.rows) / factor + 0.5)
             if width < self.win_size.width or height < self.win_size.height { break }

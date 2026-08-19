@@ -1774,6 +1774,18 @@ static bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
     return true;
 }
 
+/* Removes the callee entry a builtin leaves under its result. That entry holds
+ * no register, so copying the result's entry down over it and shortening the
+ * stack leaves the result on top, still in the register it was computed into. */
+static void dropCalleeEntry(Emit *e) {
+    e->stack[e->depth - 2]      = e->stack[e->depth - 1];
+    e->stackShape[e->depth - 2] = 0;
+    e->stackClass[e->depth - 2] = NULL;
+    e->stackSeen[e->depth - 2]  = NULL_VAL;
+    e->stackLocal[e->depth - 2] = -1;
+    e->depth--;
+}
+
 /* Depth and the kind of every entry, in one word. Registers are assigned from
  * the depth and instructions are chosen from the kinds, so a join reached with
  * either one different is a join this tier cannot compile. */
@@ -5651,6 +5663,46 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
 
+            /* The same instruction over floats: `if coefficient == 0.0`, the
+             * early-out every numeric kernel opens its inner loop with. Only
+             * the integer form was emitted, so a single float guard declined
+             * the whole loop around it -- which is what left the JPEG inverse
+             * DCT interpreted.
+             *
+             * fcmp's answers are not the signed-integer ones (an unordered
+             * result has to come out false both ways), so the conditions are
+             * the ones OP_JUMP_IF_CMP_FALSE's float arm uses, and an actual
+             * NaN operand resumes in the interpreter. */
+            if (e->localKind[slot] == SLOT_FLOAT && IS_FLOAT(k) &&
+                AS_FLOAT(k) == AS_FLOAT(k)) {
+                switch (cmp) {
+                case OP_LT: cond = JAI_A64_GE; break;
+                case OP_LE: cond = JAI_A64_GT; break;
+                case OP_GT: cond = JAI_A64_LS; break;
+                case OP_GE: cond = JAI_A64_MI; break;
+                case OP_EQ: cond = JAI_A64_NE; break;
+                case OP_NE: cond = JAI_A64_EQ; break;
+                default: return false;
+                }
+                if (slot == 0) e->usesSlot0 = true;
+                settleAll(e);          /* nanToDeopt records */
+                localInFp(e, slot, JIT_FSCRATCH_A);
+                if (AS_FLOAT(k) == 0.0) {
+                    emit(e, jaiA64FcmpDZero(JIT_FSCRATCH_A));
+                } else {
+                    int64_t bits;
+                    double kd = AS_FLOAT(k);
+                    memcpy(&bits, &kd, sizeof bits);
+                    emitConst64(e, JIT_SCRATCH_A, bits);
+                    emit(e, jaiA64FmovDX(JIT_FSCRATCH_B, JIT_SCRATCH_A));
+                    emit(e, jaiA64FcmpD(JIT_FSCRATCH_A, JIT_FSCRATCH_B));
+                }
+                nanToDeopt(e);
+                branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
+                off += 9;
+                break;
+            }
+
             if (e->localKind[slot] != SLOT_INT) return false;
             if (slot == 0) e->usesSlot0 = true;
             if (!IS_INT(k)) return false;
@@ -7798,6 +7850,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 1;
                 break;
             }
+            /* `buf[i]` on a `bytes`: a length-guarded byte load, and the
+             * result is a plain int, so nothing is allocated. Every binary
+             * format in the language is read one byte at a time through this
+             * -- the JPEG bit reader is a `bytes` index and nothing else --
+             * and without it the whole function around one declined. */
+            if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_INT &&
+                e->stack[e->depth - 2] == SLOT_OBJ &&
+                IS_BYTES(e->stackSeen[e->depth - 2])) {
+                unsigned rIdx = pushReg(e) - 1;
+                unsigned rBuf = valueXReg(e, e->valueDepth - 2);
+
+                /* Really a bytes, and not something else this object slot
+                 * happened to hold when the body was compiled. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rBuf,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_BYTES));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rBuf,
+                                   (unsigned)offsetof(ObjBytes, length)));
+                emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                    false);
+
+                /* The payload is inline after the header, so the base needs no
+                 * load of its own -- unlike a string, which holds a pointer. */
+                emit(e, jaiA64AddX(JIT_SCRATCH_C, rBuf, JIT_SCRATCH_B));
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                      (unsigned)offsetof(ObjBytes, data)));
+
+                unsigned dByte1, dByte2;
+                if (!popValue(e, &dByte1, NULL)) return false;
+                if (!popValue(e, &dByte2, NULL)) return false;
+                if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_A));
+                off += 1;
+                break;
+            }
             /* Index normalised as jaiNormalizeIndex does it, one unsigned compare covering both ends. Out of
              * range, or an element not the kind seen at compile time, goes back to the interpreter -- reading an element has no effect, so resuming at this instruction is always sound. */
             if (e->depth < 2) return false;
@@ -8298,13 +8387,60 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stack[e->depth - argc - 1] == SLOT_NATIVE) {
                 /* `float(i)`/`int(x)` are one instruction each, so they're emitted rather than called -- what
                  * `spectral`/`matrix_mul` have in their inner loops, and the whole body was declined for want of them. Every other builtin still declines: a call needs a result kind known without running anything, and only these two have one. */
-                if (argc != 1) { e->whyNot = "builtin arity"; return false; }
-                Value cv = e->stackSeen[e->depth - 2];
+                if (argc != 1 && argc != 2) {
+                    e->whyNot = "builtin arity"; return false;
+                }
+                Value cv = e->stackSeen[e->depth - argc - 1];
                 ObjNative *nat = IS_NATIVE(cv) ? AS_NATIVE(cv) : NULL;
                 const char *nm = nat != NULL && nat->name != NULL
                                      ? nat->name->chars : "";
+                /* `min`/`max` of two ints are a compare and a csel, and image
+                 * code reaches for them per pixel -- the JPEG block reader
+                 * calls `min` twice a sample, so declining them left the whole
+                 * body interpreted. Only the two-argument integer form is
+                 * emitted: the float form throws on a NaN operand (see
+                 * compareDoubles), which a bare fcsel would silently swallow,
+                 * and the one-argument form takes an iterable. */
+                bool isMin = strcmp(nm, "min") == 0;
+                bool isMax = strcmp(nm, "max") == 0;
+                if (argc == 2) {
+                    if (!isMin && !isMax) {
+                        e->whyNot = "a builtin with no known result kind";
+                        return false;
+                    }
+                    if (e->stack[e->depth - 1] != SLOT_INT ||
+                        e->stack[e->depth - 2] != SLOT_INT) {
+                        e->whyNot = "a builtin with no known result kind";
+                        return false;
+                    }
+                    unsigned rb, ra2;
+                    if (!popValue(e, &rb, NULL)) return false;
+                    if (!popValue(e, &ra2, NULL)) return false;
+                    if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+                    unsigned rd = pushReg(e) - 1;
+                    /* `min(a, b)` keeps `a` unless `b` is STRICTLY smaller
+                     * (extremum() only replaces on a nonzero order), so the
+                     * compare is of b against a and the condition is strict. */
+                    emit(e, jaiA64SubsX(JAI_A64_XZR, rb, ra2));
+                    emit(e, jaiA64CselX(rd, rb, ra2,
+                                        isMax ? JAI_A64_GT : JAI_A64_LT));
+                    dropCalleeEntry(e);
+                    off += 2;
+                    break;
+                }
                 SlotKind ak = e->stack[e->depth - 1];
                 unsigned ar = pushReg(e) - 1;
+                if (strcmp(nm, "abs") == 0 && ak == SLOT_INT) {
+                    /* `subs` off zero both negates and reports the one input
+                     * abs() rejects: only INT64_MIN overflows the negation, and
+                     * the interpreter raises the OverflowError on re-entry. */
+                    emit(e, jaiA64SubsX(JIT_SCRATCH_A, JAI_A64_XZR, ar));
+                    branchOnDeoptInstStart(e, JAI_A64_VS);
+                    emit(e, jaiA64CselX(ar, ar, JIT_SCRATCH_A, JAI_A64_MI));
+                    dropCalleeEntry(e);
+                    off += 2;
+                    break;
+                }
                 bool toFloat = strcmp(nm, "float") == 0;
                 bool toInt   = strcmp(nm, "int") == 0;
                 if (toFloat && ak == SLOT_INT) {
@@ -8325,14 +8461,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->whyNot = "a builtin with no known result kind";
                     return false;
                 }
-                /* The result stays in the argument's register. Dropping the
-                 * callee entry, which holds none, leaves it on top. */
-                e->stack[e->depth - 2]      = toFloat ? SLOT_FLOAT : SLOT_INT;
-                e->stackShape[e->depth - 2] = 0;
-                e->stackClass[e->depth - 2] = NULL;
-                e->stackSeen[e->depth - 2]  = NULL_VAL;
-                e->stackLocal[e->depth - 2] = -1;
-                e->depth--;
+                /* The result stays in the argument's register. */
+                e->stack[e->depth - 1] = toFloat ? SLOT_FLOAT : SLOT_INT;
+                dropCalleeEntry(e);
                 off += 2;
                 break;
             }

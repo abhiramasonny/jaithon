@@ -501,14 +501,13 @@ pub class Mat: Printable {
     #: Every element clamped and rounded into bytes, the layout an encoder or a
     #: display expects.
     pub fn to_bytes(self, scale: float = 1.0) -> bytes {
-        var out: list[int] = []
-        for value in self.ensure_host() {
-            var scaled = value * scale
-            if scaled != scaled { scaled = 0.0 }
-            let rounded = int(math.floor(scaled + 0.5))
-            out.push(if rounded < 0 { 0 } elif rounded > 255 { 255 } else { rounded })
-        }
-        return bytes(out)
+        #: One primitive rather than a loop. Written here it was a multiply, a
+        #: NaN test, a `math.floor`, an `int` and two compares an element, and
+        #: the call to `math.floor` is what stopped the loop compiling: a
+        #: 640x480 frame took thirty-nine milliseconds, which put a
+        #: twenty-five frame ceiling on writing video before a single frame was
+        #: encoded. The same work in C is a third of a millisecond.
+        return __prim__.bytes_quantise(self.ensure_host(), scale)
     }
 
     #: One channel of one pixel.

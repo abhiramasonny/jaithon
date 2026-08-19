@@ -198,7 +198,7 @@ pub fn idft(src: Mat, flags: int = 0, nonzero_rows: int = 0) -> Mat {
 pub fn get_optimal_dft_size(size: int) -> int {
     if size <= 1 { return 1 }
     var candidate = size
-    while true {
+    loop {
         var remaining = candidate
         for factor in [2, 3, 5] {
             while remaining % factor == 0 { remaining = remaining // factor }

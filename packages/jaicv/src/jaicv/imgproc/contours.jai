@@ -138,7 +138,7 @@ fn follow(
     var current_y = start_y
     var current_x = start_x
     var points: list[Point] = []
-    while true {
+    loop {
         #: Step 3.3: from where we came, look clockwise round the current pixel
         #: for the next set neighbour, remembering whether the pixel to the
         #: east was one of the ones looked at.
