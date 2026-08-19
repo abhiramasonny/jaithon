@@ -438,6 +438,21 @@ class _Printer {
     }
 
     fn function(self, node: Node, keyword: str) -> void {
+        #: Decorators come first, each on its own line, exactly as they were
+        #: written. Dropping them was silent and it changed what the program
+        #: does: `@trace` is what puts a function in the traced tier and
+        #: `@gpu_kernel` is what makes one a kernel at all, so a formatting
+        #: pass over jaitensor turned its hot paths back into ordinary
+        #: functions and only one test noticed.
+        if node.has("decorators") {
+            let decorators = node.get("decorators")
+            if decorators is not null {
+                for decorator in decorators {
+                    self.emit(f"@{decorator}")
+                    self.line()
+                }
+            }
+        }
         self.visibility(node.visibility())
         if node.flag("isStatic") { self.emit("static ") }
         self.emit(keyword)

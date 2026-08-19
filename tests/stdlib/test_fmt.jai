@@ -280,3 +280,87 @@ fn test_migrate2_leaves_strings_and_comments_alone() -> void {
     assert_eq(migrate2("print \"a eq b\"\n"), "print(\"a eq b\")\n")
     assert_eq(migrate2("# a eq b, 2 ^ 3\n"), "# a eq b, 2 ^ 3\n")
 }
+
+#: A decorator is part of the program, not decoration.
+#:
+#: The formatter never wrote them, so every pass over a file silently deleted
+#: every one: `@trace` is what puts a function in the traced tier and
+#: `@gpu_kernel` is what makes one a kernel at all. A single `jaithon fmt` over
+#: jaitensor turned its hot paths back into ordinary functions, and one test in
+#: the whole tree noticed -- by asserting `is_traced`, which is not a thing most
+#: code can assert about itself.
+fn test_decorators_survive_formatting() -> void {
+    let source = """@gpu_kernel
+pub fn kernel_like(x: int) -> int {
+    return x
+}
+
+pub class Holder {
+    pub var n: int
+
+    pub fn init(self) { self.n = 0 }
+
+    @trace
+    pub fn hot(self, x: int) -> int {
+        return x + self.n
+    }
+}
+
+@trace
+fn also_traced(x: float) -> float {
+    return x * 2.0
+}
+"""
+    let once = format_source(source, "decorators.jai")
+    assert_eq(once, source)
+    assert_eq(format_source(once, "decorators.jai"), once)
+    assert_true(is_formatted(source, "decorators.jai"))
+}
+
+#: Two decorators on one function, and one on a function whose body is an
+#: expression rather than a block -- both shapes the printer reaches by a
+#: different path.
+fn test_several_decorators_and_a_short_body() -> void {
+    let source = """@trace
+@gpu_kernel
+pub fn both(x: int) -> int { return x }
+"""
+    let once = format_source(source, "two.jai")
+    assert_true(once.contains("@trace"))
+    assert_true(once.contains("@gpu_kernel"))
+    assert_eq(format_source(once, "two.jai"), once)
+}
+
+#: The lines inside a triple-quoted string are the program's data.
+#:
+#: The printer indented every output line to the current depth, and a string
+#: literal spanning lines arrives as one rendered expression with real newlines
+#: in it -- so its second and later lines were indented too, and the string
+#: silently gained four characters a line. A program that formatted cleanly
+#: printed something different afterwards.
+fn test_a_multi_line_string_is_not_re_indented() -> void {
+    let source = """fn main() -> int {
+    let s = \"\"\"alpha
+beta
+\"\"\"
+    print(s.len())
+    return 0
+}
+"""
+    let once = format_source(source, "literal.jai")
+    assert_eq(once, source)
+    assert_true(is_formatted(source, "literal.jai"))
+
+    #: Nested one level deeper, where the wrong indent would be eight spaces.
+    let nested = """fn main() -> int {
+    if true {
+        let s = \"\"\"alpha
+beta
+\"\"\"
+        print(s.len())
+    }
+    return 0
+}
+"""
+    assert_eq(format_source(nested, "nested.jai"), nested)
+}

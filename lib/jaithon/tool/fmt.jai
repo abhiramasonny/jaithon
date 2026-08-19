@@ -657,6 +657,22 @@ class _Trivia {
     }
 }
 
+#: How many triple-quote marks a line opens or closes. Odd means the line
+#: changes which side of a multi-line string the next line is on.
+fn _triple_quotes(piece: str) -> int {
+    var found = 0
+    var at = 0
+    while at + 3 <= piece.len() {
+        if piece[at:at + 3] == "\"\"\"" {
+            found += 1
+            at += 3
+        } else {
+            at += 1
+        }
+    }
+    return found
+}
+
 class _Line {
     pub let text: str
     pub var comment: str?
@@ -700,11 +716,36 @@ class _Printer {
     # --- output ------------------------------------------------------------
     pub fn emit(self, text: str) -> void {
         let prefix = repeat(_INDENT, self.depth)
+        var inside_literal = false
         for piece in text.split("\n") {
-            let trimmed = _strip_end(piece)
-            let full = if trimmed.len() == 0 { "" } else { prefix + trimmed }
-            self.out.push(_Line(full, self.depth))
+            if inside_literal {
+                #: A line inside a triple-quoted string is the program's DATA,
+                #: not its layout. Indenting it changes what the string holds:
+                #: `"""alpha\nbeta\n"""` came back four characters longer with
+                #: `beta` no longer at the start of its line, and nothing said
+                #: so. Written through with no prefix and no trailing trim.
+                self.out.push(_Line(piece, 0))
+            } else {
+                let trimmed = _strip_end(piece)
+                let full = if trimmed.len() == 0 { "" } else { prefix + trimmed }
+                self.out.push(_Line(full, self.depth))
+            }
+            if _triple_quotes(piece) % 2 == 1 { inside_literal = not inside_literal }
         }
+    }
+
+    #: A function's decorators, each on its own line ahead of its signature.
+    #:
+    #: They are not part of the signature and were not written at all, so
+    #: formatting a file deleted every one of them -- silently, and with
+    #: consequences: `@trace` is what puts a function in the traced tier and
+    #: `@gpu_kernel` is what makes one a kernel. A pass over jaitensor turned
+    #: its hot paths back into ordinary functions and exactly one test noticed.
+    pub fn decorators(self, node: Node) -> void {
+        if not node.has("decorators") { return }
+        let names = node.get("decorators")
+        if names is null { return }
+        for name in names { self.emit(f"@{name}") }
     }
 
     pub fn header(self, text: str, line: int) -> void {
@@ -915,6 +956,7 @@ class _Printer {
                 self.emit("}")
             }
             NodeKind.FnDecl => {
+                self.decorators(node)
                 self.header(self.signature(node) + " {", line)
                 self.body(node.child("body"))
                 self.emit("}")
@@ -1191,6 +1233,7 @@ class _Printer {
         }
 
         let node = member.node
+        self.decorators(node)
         let head = match member.role {
             "getter" => _visibility(node.visibility()) + "get " + node.text("name") + "() -> " + _type_source(node.type_field("returnType")),
             "setter" => _visibility(node.visibility()) + "set " + node.text("name") + self.params(node.records("params"), self.column()),
