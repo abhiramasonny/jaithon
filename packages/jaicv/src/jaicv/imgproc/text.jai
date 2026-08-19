@@ -12,7 +12,6 @@
 #: size OpenCV draws its own, which is what layout code ported from OpenCV
 #: actually depends on. Cap height at `font_scale` 1.0 matches OpenCV's to the
 #: pixel for every face; the individual letters do not.
-
 import std.math
 
 from ..core.mat import Mat
@@ -62,8 +61,7 @@ class Font {
     pub var right: list[int]
     pub var coords: list[int]
 
-    pub fn init(self, starts: list[int], left: list[int], right: list[int],
-                coords: list[int]) {
+    pub fn init(self, starts: list[int], left: list[int], right: list[int], coords: list[int]) {
         self.starts = starts
         self.left = left
         self.right = right

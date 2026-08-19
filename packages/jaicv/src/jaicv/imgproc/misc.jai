@@ -12,6 +12,8 @@ import std.math
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scalar, Size
 from ..core.dft import dft, idft, mul_spectrums, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
+from .color import cvt_color, COLOR_BGR2GRAY
+from .colormap_data import COLORMAP_COUNT, COLORMAP_LEVELS, COLORMAP_TABLE
 from .geometric import remap
 
 #: Red through yellow to white.
@@ -38,106 +40,68 @@ pub const COLORMAP_HSV = 9
 pub const COLORMAP_PINK = 10
 #: Black through red and yellow to white.
 pub const COLORMAP_HOT = 11
+#: MATLAB's default: dark blue through teal to yellow.
+pub const COLORMAP_PARULA = 12
+#: Black through purple and red to pale yellow.
+pub const COLORMAP_MAGMA = 13
+#: Black through purple and orange to pale yellow.
+pub const COLORMAP_INFERNO = 14
+#: Dark blue through magenta to yellow.
+pub const COLORMAP_PLASMA = 15
+#: Dark purple through green to yellow.
+pub const COLORMAP_VIRIDIS = 16
+#: Viridis rebuilt to survive colour-blind vision: dark blue through grey to
+#: yellow, with no green in it.
+pub const COLORMAP_CIVIDIS = 17
+#: Cyclic: pale at both ends, dark in the middle, so a wrapping quantity joins
+#: up rather than jumping.
+pub const COLORMAP_TWILIGHT = 18
+#: Twilight started half a turn round, dark at the ends and pale in the middle.
+pub const COLORMAP_TWILIGHT_SHIFTED = 19
+#: Jet's sweep with its brightness evened out, so it has no false edges.
+pub const COLORMAP_TURBO = 20
+#: Black through green to white.
+pub const COLORMAP_DEEPGREEN = 21
 
-fn clamp_unit(value: float) -> float {
-    if value < 0.0 { return 0.0 }
-    if value > 1.0 { return 1.0 }
-    return value
-}
-
-fn colour_at(map_id: int, t: float) -> tuple[float, float, float] {
-    #: Each of these is the formula the map is defined by rather than a table
-    #: of samples, so they hold at any resolution.
-    if map_id == COLORMAP_AUTUMN { return (1.0, t, 0.0) }
-    if map_id == COLORMAP_WINTER { return (0.0, t, 1.0 - t * 0.5) }
-    if map_id == COLORMAP_SUMMER { return (t, 0.5 + t * 0.5, 0.4) }
-    if map_id == COLORMAP_SPRING { return (1.0, t, 1.0 - t) }
-    if map_id == COLORMAP_COOL { return (t, 1.0 - t, 1.0) }
-    if map_id == COLORMAP_BONE {
-        let r = if t < 0.75 { t * 7.0 / 8.0 } else { t * 11.0 / 8.0 - 3.0 / 8.0 }
-        let g = if t < 0.375 {
-            t * 7.0 / 8.0
-        } elif t < 0.75 {
-            t * 29.0 / 24.0 - 1.0 / 8.0
-        } else {
-            t * 7.0 / 8.0 + 1.0 / 8.0
-        }
-        let b = if t < 0.375 { t * 29.0 / 24.0 } else { t * 7.0 / 8.0 + 1.0 / 8.0 }
-        return (clamp_unit(r), clamp_unit(g), clamp_unit(b))
-    }
-    if map_id == COLORMAP_HOT {
-        let r = clamp_unit(t * 3.0)
-        let g = clamp_unit(t * 3.0 - 1.0)
-        let b = clamp_unit(t * 3.0 - 2.0)
-        return (r, g, b)
-    }
-    if map_id == COLORMAP_OCEAN {
-        let r = clamp_unit(t * 3.0 - 2.0)
-        let g = clamp_unit(t * 1.5 - 0.5)
-        return (r, g, t)
-    }
-    if map_id == COLORMAP_PINK {
-        let r = math.sqrt(clamp_unit(t * 2.0 / 3.0 + 1.0 / 3.0))
-        let g = math.sqrt(clamp_unit(if t < 0.5 {
-            t * 2.0 / 3.0
-        } else {
-            t * 4.0 / 3.0 - 1.0 / 3.0
-        }))
-        let b = math.sqrt(clamp_unit(if t < 0.75 { t * 2.0 / 3.0 } else { t * 2.0 - 1.0 }))
-        return (r, g, b)
-    }
-    if map_id == COLORMAP_HSV or map_id == COLORMAP_RAINBOW {
-        let hue = if map_id == COLORMAP_HSV { t * 6.0 } else { (1.0 - t) * 4.0 }
-        let sector = int(hue) % 6
-        let fraction = hue - float(int(hue))
-        let rising = fraction
-        let falling = 1.0 - fraction
-        if sector == 0 { return (1.0, rising, 0.0) }
-        if sector == 1 { return (falling, 1.0, 0.0) }
-        if sector == 2 { return (0.0, 1.0, rising) }
-        if sector == 3 { return (0.0, falling, 1.0) }
-        if sector == 4 { return (rising, 0.0, 1.0) }
-        return (1.0, 0.0, falling)
-    }
-    #: Jet: the four ramps that make blue rise, then green, then red, with each
-    #: falling as the next comes up.
-    let r = clamp_unit(min(4.0 * t - 1.5, -4.0 * t + 4.5))
-    let g = clamp_unit(min(4.0 * t - 0.5, -4.0 * t + 3.5))
-    let b = clamp_unit(min(4.0 * t + 0.5, -4.0 * t + 2.5))
-    return (r, g, b)
-}
-
-#: Give a single-channel image false colour.
+#: Give an image false colour.
 #:
-#: `map_id` is one of the `COLORMAP_` constants. Each of these is written as
-#: the formula that defines the map rather than as a table of samples, which
-#: is worth knowing because OpenCV ships some of them as tables: `AUTUMN`,
-#: `COOL`, `SPRING`, `SUMMER` and `WINTER` come out identical to OpenCV's and
-#: `JET` to within a level, while `BONE`, `HOT`, `OCEAN`, `PINK`, `HSV` and
-#: `RAINBOW` follow the same shape but not the same sixty-four control points.
-#: The perceptual maps OpenCV also offers — Viridis and its family — are
-#: measured data with no formula behind them and are not here at all.
+#: `map_id` is one of the `COLORMAP_` constants, and every one of the
+#: twenty-two agrees with OpenCV exactly, on all 256 levels. The tables in
+#: `colormap_data.jai` are OpenCV's own, recorded from it by
+#: `tools/colormaps_to_jai.py`, and reading them is the only thing that makes
+#: that true: OpenCV builds even the maps that have a formula behind them by
+#: interpolating sixty-four control points, so writing the formula out instead
+#: lands a level away nearly everywhere, and nowhere near at all on `RAINBOW`,
+#: `PINK` and `HOT`.
+#:
+#: A three-channel image is converted to grey first, as OpenCV does. The one
+#: place this is not OpenCV's behaviour is depth: OpenCV refuses anything but
+#: 8-bit outright, while this rounds and clamps whatever it is given into the
+#: 0..255 the tables are indexed by, so a float or 16-bit `Mat` maps rather
+#: than raising.
 pub fn apply_color_map(src: Mat, map_id: int = COLORMAP_JET) -> Mat {
     src.flush()
-    if src.channels() != 1 { throw ValueError("a colour map needs a single-channel Mat") }
-    var table: list[float] = []
-    for level in 0..256 {
-        let (r, g, b) = colour_at(map_id, float(level) / 255.0)
-        table.push(math.floor(b * 255.0 + 0.5))
-        table.push(math.floor(g * 255.0 + 0.5))
-        table.push(math.floor(r * 255.0 + 0.5))
+    if map_id < 0 or map_id >= COLORMAP_COUNT {
+        throw ValueError(f"no colour map has id {map_id}")
     }
-    let values = src.to_list()
+    let channels = src.channels()
+    if channels != 1 and channels != 3 {
+        throw ValueError(f"a colour map needs a one- or three-channel Mat, not {channels}")
+    }
+    let grey = if channels == 3 { cvt_color(src, COLOR_BGR2GRAY) } else { src }
+    let base = map_id * COLORMAP_LEVELS * 3
+    let values = grey.values()
     var out: list[float] = []
     for value in values {
         var level = int(value + 0.5)
         if level < 0 { level = 0 }
-        if level > 255 { level = 255 }
-        out.push(table[level * 3])
-        out.push(table[level * 3 + 1])
-        out.push(table[level * 3 + 2])
+        if level > COLORMAP_LEVELS - 1 { level = COLORMAP_LEVELS - 1 }
+        let at = base + level * 3
+        out.push(float(COLORMAP_TABLE[at]))
+        out.push(float(COLORMAP_TABLE[at + 1]))
+        out.push(float(COLORMAP_TABLE[at + 2]))
     }
-    return Mat.from_list(src.rows, src.cols, CV_MAKETYPE(CV_8U, 3), out)
+    return Mat.from_list(grey.rows, grey.cols, CV_MAKETYPE(CV_8U, 3), out)
 }
 
 #: A patch of an image, centred anywhere, not only on a pixel.
