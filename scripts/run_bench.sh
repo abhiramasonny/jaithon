@@ -13,7 +13,7 @@ if [[ -n "$SUITE" && "$SUITE" != "jaitensor" ]]; then
     exit 2
 fi
 
-RUNS=${RUNS:-5}
+RUNS=${RUNS:-3}
 
 if [[ ! -x "$JAITHON" ]]; then
     echo "error: $JAITHON not built. Run 'make' first." >&2
