@@ -17,7 +17,7 @@ from jaitensor.layers import Activate, Activation, BatchNorm2d, Embedding
 from jaitensor.layers import GroupNorm2d, Layer, LayerNorm
 from jaitensor.losses import BinaryCrossentropy, MeanSquaredError
 from jaitensor.model import Metrics
-from jaitensor.ops import avg_pool2d, batch_norm, leaky_relu, maximum, minimum
+from jaitensor.ops import avg_pool2d, batch_norm, conv2d, leaky_relu, maximum, minimum
 from jaitensor.ops import permute, rsqrt, silu
 from jaitensor.plots import save_history_plot
 from jaitensor.optimizers import zero_grad
@@ -305,4 +305,173 @@ fn test_a_history_plot_is_written() -> void {
     )
     assert_true(path.exists())
     path.remove()
+}
+
+#: The convolution's three gradients against a central difference of the same
+#: convolution.
+#:
+#: All three take a different route from the arithmetic above: the input's and
+#: the weights' are the device's own convolution-gradient primitives, with an
+#: im2col pair as the fallback, and the bias's is a reduction over the leading
+#: axes that is split when there are far more rows than columns -- which for a
+#: convolution there always are. Each was a place a wrong answer could hide and
+#: still train to a plausible loss.
+fn conv_loss(
+    shape: list[int],
+    wshape: list[int],
+    values: list[float],
+    which: int
+) -> fn(list[float]) -> float {
+    return fn(x: list[float]) -> float {
+        var input_values: list[float] = []
+        var weight_values: list[float] = []
+        var bias_values: list[float] = []
+        let input_count = element_count_of(shape)
+        let weight_count = element_count_of(wshape)
+        for index in 0..input_count {
+            input_values.push(if which == 0 {
+                x[index]
+            } else {
+                values[index]
+            })
+        }
+        for index in 0..weight_count {
+            let at = input_count + index
+            weight_values.push(if which == 1 {
+                x[at]
+            } else {
+                values[at]
+            })
+        }
+        for index in 0..wshape[3] {
+            let at = input_count + weight_count + index
+            bias_values.push(if which == 2 {
+                x[at]
+            } else {
+                values[at]
+            })
+        }
+        let input = Tensor(shape, input_values)
+        let weights = Tensor(wshape, weight_values)
+        let bias = Tensor([wshape[3]], bias_values)
+        let output = conv2d(input, weights, bias: bias, padding: 1)
+        let total = jt.sum(output)
+        let result = total.download()[0]
+        input.free()
+        weights.free()
+        bias.free()
+        output.free()
+        total.free()
+        return result
+    }
+}
+
+fn element_count_of(shape: list[int]) -> int {
+    var total = 1
+    for size in shape { total *= size }
+    return total
+}
+
+fn test_convolution_gradients_match_numerical_ones() -> void {
+    if not jt.is_available() { return }
+    let shape = [2, 5, 5, 3]
+    let wshape = [3, 3, 3, 4]
+    let input_count = element_count_of(shape)
+    let weight_count = element_count_of(wshape)
+    var values: list[float] = []
+    for index in 0..input_count { values.push(float(index * 37 % 17) * 0.1 - 0.8) }
+    for index in 0..weight_count { values.push(float(index * 23 % 11) * 0.05 - 0.25) }
+    for index in 0..wshape[3] { values.push(float(index) * 0.1 - 0.15) }
+
+    var input_values: list[float] = []
+    for index in 0..input_count { input_values.push(values[index]) }
+    var weight_values: list[float] = []
+    for index in 0..weight_count { weight_values.push(values[input_count + index]) }
+    var bias_values: list[float] = []
+    for index in 0..wshape[3] { bias_values.push(values[input_count + weight_count + index]) }
+
+    let input = Tensor(shape, input_values, requires_grad: true)
+    let weights = Tensor(wshape, weight_values, requires_grad: true)
+    let bias = Tensor([wshape[3]], bias_values, requires_grad: true)
+    let output = conv2d(input, weights, bias: bias, padding: 1)
+    let total = jt.sum(output)
+    let intermediates = total.backward()
+
+    let input_grad = input.grad
+    let weight_grad = weights.grad
+    let bias_grad = bias.grad
+    if input_grad is null or weight_grad is null or bias_grad is null {
+        throw AssertionError("conv2d must set all three gradients")
+    }
+    let analytic_input = input_grad.download()
+    let analytic_weights = weight_grad.download()
+    let analytic_bias = bias_grad.download()
+
+    #: Every third element of the input and the weights, and every element of
+    #: the bias, which is small enough to check whole.
+    let input_fn = conv_loss(shape, wshape, values, 0)
+    var index = 0
+    while index < input_count {
+        assert_near(analytic_input[index], numerical_grad(input_fn, values, index), 1e-2)
+        index += 3
+    }
+    let weight_fn = conv_loss(shape, wshape, values, 1)
+    index = 0
+    while index < weight_count {
+        assert_near(
+            analytic_weights[index],
+            numerical_grad(weight_fn, values, input_count + index),
+            1e-2
+        )
+        index += 3
+    }
+    let bias_fn = conv_loss(shape, wshape, values, 2)
+    for slot in 0..wshape[3] {
+        assert_near(
+            analytic_bias[slot],
+            numerical_grad(bias_fn, values, input_count + weight_count + slot),
+            1e-2
+        )
+    }
+
+    for tensor in intermediates { tensor.free() }
+    input.free()
+    weights.free()
+    bias.free()
+    total.free()
+}
+
+#: The split reduction against the plain one, at the shape that triggers it: a
+#: convolution's bias gradient is a handful of columns over a hundred thousand
+#: rows, and the split path is only taken there, so nothing else in the suite
+#: would notice if it summed the wrong chunk.
+fn test_a_wide_reduction_sums_the_same_as_a_narrow_one() -> void {
+    if not jt.is_available() { return }
+    let inner = 8
+    let outer = 20000
+    var values: list[float] = []
+    for index in 0..outer * inner { values.push(float(index % 13) * 0.25 - 1.5) }
+    let wide = Tensor([outer, inner], values, requires_grad: true)
+    let total = jt.sum(wide)
+    let intermediates = total.backward()
+    for tensor in intermediates { tensor.free() }
+
+    #: The reduction itself, through the bias gradient of a dense layer whose
+    #: batch is the tall axis.
+    let features = Tensor([outer, inner], values)
+    let weights = Tensor([inner, 1], [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    let bias = Tensor([1], [0.0], requires_grad: true)
+    let product = jt.add(jt.matmul(features, weights), bias)
+    let sum = jt.sum(product)
+    let more = sum.backward()
+    let gradient = bias.grad
+    if gradient is null { throw AssertionError("expected a bias gradient") }
+    assert_near(gradient.download()[0], float(outer), 1e-2)
+    for tensor in more { tensor.free() }
+    features.free()
+    weights.free()
+    bias.free()
+    sum.free()
+    wide.free()
+    total.free()
 }

@@ -661,6 +661,45 @@ static bool nGpuConv2dBuffers(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* Shared by both convolution gradients: they take the same eleven dimensions
+ * and differ only in which buffer is the second input and which primitive
+ * runs, so one argument decoder covers them. */
+static bool convGradBuiltin(Value *args, Value *out, const char *name, bool weightsGrad) {
+    GpuBuffer *grad, *other, *result;
+    if (!requireBuffer(args[0], 1, name, &grad)) return false;
+    if (!requireBuffer(args[1], 2, name, &other)) return false;
+    if (!requireBuffer(args[2], 3, name, &result)) return false;
+
+    int64_t dims[11];
+    for (int i = 0; i < 11; i++) {
+        if (!jaiArgInt(args[3 + i], 4 + i, name, &dims[i])) return false;
+        if (dims[i] < 0 || dims[i] > UINT32_MAX)
+            return jaiThrow(vm.cValueError, "%s(): dimension %d must fit in uint32",
+                            name, i);
+    }
+
+    bool ok = (weightsGrad ? jaiGpuConv2dWeightsGradBuffers
+                           : jaiGpuConv2dDataGradBuffers)(
+        grad->buffer, (size_t)grad->origin * sizeof(float),
+        other->buffer, (size_t)other->origin * sizeof(float),
+        result->buffer, (size_t)result->origin * sizeof(float),
+        (uint32_t)dims[0], (uint32_t)dims[1], (uint32_t)dims[2], (uint32_t)dims[3],
+        (uint32_t)dims[4], (uint32_t)dims[5], (uint32_t)dims[6],
+        (uint32_t)dims[7], (uint32_t)dims[8], (uint32_t)dims[9], (uint32_t)dims[10]);
+    *out = BOOL_VAL(ok);
+    return true;
+}
+
+static bool nGpuConv2dDataGrad(int argc, Value *args, Value *out) {
+    (void)argc;
+    return convGradBuiltin(args, out, "gpu_conv2d_data_grad", false);
+}
+
+static bool nGpuConv2dWeightsGrad(int argc, Value *args, Value *out) {
+    (void)argc;
+    return convGradBuiltin(args, out, "gpu_conv2d_weights_grad", true);
+}
+
 static bool nGpuMlpSgdStep(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *x, *w1, *b1, *w2, *b2, *labels, *lossAcc, *correctAcc;
@@ -1072,6 +1111,8 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_matmul_buffers", nGpuMatMulBuffers, 9, 9);
     jaiDefineNative("__prim__.gpu_mha_buffers", nGpuMhaBuffers, 8, 8);
     jaiDefineNative("__prim__.gpu_conv2d_buffers", nGpuConv2dBuffers, 15, 15);
+    jaiDefineNative("__prim__.gpu_conv2d_data_grad", nGpuConv2dDataGrad, 14, 14);
+    jaiDefineNative("__prim__.gpu_conv2d_weights_grad", nGpuConv2dWeightsGrad, 14, 14);
     jaiDefineNative("__prim__.gpu_mlp_sgd_step", nGpuMlpSgdStep, 13, 13);
     jaiDefineNative("__prim__.gpu_mlp_sgd_epoch", nGpuMlpSgdEpoch, 15, 15);
     jaiDefineNative("__prim__.gpu_mlp_bwd_step", nGpuMlpBwdStep, 16, 16);

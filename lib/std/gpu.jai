@@ -67,17 +67,17 @@ fn _f32_bits(value: float) -> int {
         mag = -mag
     }
     if mag == 0.0 { return sign << 31 }
-    if mag >= 3.4028234663852886e38 { return (sign << 31) | 0x7F800000 }
+    if mag >= 3.4028234663852886e38 { return sign << 31 | 0x7F800000 }
     if mag <= 1.401298464324817e-45 { return sign << 31 }
     let split = __prim__.f64_frexp(mag)
     let biased = split[1] + 126
     if biased <= 0 {
         let frac = int(__prim__.f64_ldexp(mag, 149))
-        return (sign << 31) | (frac & 0x7FFFFF)
+        return sign << 31 | frac & 0x7FFFFF
     }
-    if biased >= 255 { return (sign << 31) | 0x7F800000 }
+    if biased >= 255 { return sign << 31 | 0x7F800000 }
     let frac = int((split[0] * 2.0 - 1.0) * 8388608.0 + 0.5)
-    return (sign << 31) | (biased << 23) | (frac & 0x7FFFFF)
+    return sign << 31 | biased << 23 | frac & 0x7FFFFF
 }
 
 #: Inputs shorter than this are computed on the CPU even when a GPU exists.
@@ -303,7 +303,7 @@ pub class Buffer {
             throw ValueError(f"fill_uniform expects low < high, got [{low}, {high})")
         }
         let seed_lo = seed & 0xFFFFFFFF
-        let seed_hi = (seed >> 32) & 0xFFFFFFFF
+        let seed_hi = seed >> 32 & 0xFFFFFFFF
         let kernel = Kernel.compile(_FILL_SOURCE, "fill_uniform")
         kernel.dispatch_async(
             [self],
@@ -555,7 +555,7 @@ pub fn mha_async(
     if seq <= 0 or heads <= 0 or hd <= 0 {
         throw ValueError(f"mha_async dimensions must be positive, got {seq}x{heads}x{hd}")
     }
-    if not (scale > 0.0) {
+    if not scale > 0.0 {
         throw ValueError("mha_async scale must be positive")
     }
     return __prim__.gpu_mha_buffers(
@@ -602,6 +602,97 @@ pub fn conv2d_async(
         input.handle_of(),
         weights.handle_of(),
         bias_handle,
+        output.handle_of(),
+        n,
+        height,
+        width,
+        cin,
+        cout,
+        kh,
+        kw,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w
+    )
+}
+
+#: The convolution's gradient with respect to its input.
+#:
+#: `grad` is the gradient arriving at the output, `weights` the filter the
+#: forward pass used, and `output` receives a tensor the shape of the input.
+#: The dimensions are the FORWARD pass's, so the same numbers describe both
+#: directions. False means this device or this shape has no such primitive and
+#: the caller should fall back to its own.
+pub fn conv2d_data_grad_async(
+    grad: Buffer,
+    weights: Buffer,
+    output: Buffer,
+    n: int,
+    height: int,
+    width: int,
+    cin: int,
+    cout: int,
+    kh: int,
+    kw: int,
+    stride_h: int = 1,
+    stride_w: int = 1,
+    pad_h: int = 0,
+    pad_w: int = 0
+) -> bool {
+    _require_device("conv2d_data_grad_async")
+    if n <= 0 or height <= 0 or width <= 0 or cin <= 0 or cout <= 0 or kh <= 0 or kw <= 0 {
+        throw ValueError("conv2d_data_grad_async dimensions must be positive")
+    }
+    if stride_h <= 0 or stride_w <= 0 {
+        throw ValueError("conv2d_data_grad_async stride must be positive")
+    }
+    return __prim__.gpu_conv2d_data_grad(
+        grad.handle_of(),
+        weights.handle_of(),
+        output.handle_of(),
+        n,
+        height,
+        width,
+        cin,
+        cout,
+        kh,
+        kw,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w
+    )
+}
+
+#: The same convolution's gradient with respect to its weights. `output`
+#: receives a tensor the shape of the filter.
+pub fn conv2d_weights_grad_async(
+    grad: Buffer,
+    input: Buffer,
+    output: Buffer,
+    n: int,
+    height: int,
+    width: int,
+    cin: int,
+    cout: int,
+    kh: int,
+    kw: int,
+    stride_h: int = 1,
+    stride_w: int = 1,
+    pad_h: int = 0,
+    pad_w: int = 0
+) -> bool {
+    _require_device("conv2d_weights_grad_async")
+    if n <= 0 or height <= 0 or width <= 0 or cin <= 0 or cout <= 0 or kh <= 0 or kw <= 0 {
+        throw ValueError("conv2d_weights_grad_async dimensions must be positive")
+    }
+    if stride_h <= 0 or stride_w <= 0 {
+        throw ValueError("conv2d_weights_grad_async stride must be positive")
+    }
+    return __prim__.gpu_conv2d_weights_grad(
+        grad.handle_of(),
+        input.handle_of(),
         output.handle_of(),
         n,
         height,
@@ -684,8 +775,7 @@ pub fn mlp_sgd_epoch(
     correct_acc: Buffer? = null
 ) -> int {
     _require_device("mlp_sgd_epoch")
-    if samples <= 0 or batch <= 0 or inputs <= 0 or hidden <= 0 or classes <= 0 or
-        flush_every <= 0 {
+    if samples <= 0 or batch <= 0 or inputs <= 0 or hidden <= 0 or classes <= 0 or flush_every <= 0 {
         throw ValueError("mlp_sgd_epoch dimensions must be positive")
     }
     if learning_rate <= 0.0 {
@@ -845,8 +935,14 @@ pub fn mlp3_sgd_epoch(
     _require_device("mlp3_sgd_epoch")
     let h2 = if hidden2 == 0 { hidden } else { hidden2 }
     let h3 = if hidden3 == 0 { hidden } else { hidden3 }
-    if samples <= 0 or batch <= 0 or inputs <= 0 or hidden <= 0 or h2 <= 0 or h3 <= 0 or
-        classes <= 0 or flush_every <= 0 {
+    if samples <= 0 or
+        batch <= 0 or
+        inputs <= 0 or
+        hidden <= 0 or
+        h2 <= 0 or
+        h3 <= 0 or
+        classes <= 0 or
+        flush_every <= 0 {
         throw ValueError("mlp3_sgd_epoch dimensions must be positive")
     }
     if learning_rate <= 0.0 {
