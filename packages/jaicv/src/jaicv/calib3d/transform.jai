@@ -197,7 +197,7 @@ pub fn find_homography(
     for _round in 0..rounds {
         var picks: list[int] = []
         while picks.len() < 4 {
-            state = state * 6364136223846793 + 1442695040888963 & 0xFFFFFFFFFFFF
+            state = state *% 6364136223846793 +% 1442695040888963 & 0xFFFFFFFFFFFF
             let pick = (state >> 8) % count
             if picks.contains(pick) { continue }
             picks.push(pick)
