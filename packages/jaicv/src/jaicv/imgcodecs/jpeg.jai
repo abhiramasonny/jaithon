@@ -545,6 +545,28 @@ fn scan(
         component.predictor = 0
     }
 
+    #: Resolved once, not once a block. The lookup and its null check ran for
+    #: every 8x8 block of every component -- thousands a frame -- and the JIT
+    #: cannot settle a local that is sometimes null, so doing it inside
+    #: `decode_block` also left that whole function interpreted.
+    var quant_tables: list[list[int]] = []
+    var block_dc: list[HuffmanTable] = []
+    var block_ac: list[HuffmanTable] = []
+    for component in components {
+        let table = quant.get(component.quant, null)
+        if table is null {
+            throw ValueError("this JPEG names a quantisation table it never defined")
+        }
+        let dc = dc_tables.get(component.dc_table, null)
+        let ac = ac_tables.get(component.ac_table, null)
+        if dc is null or ac is null {
+            throw ValueError("this JPEG names a Huffman table it never defined")
+        }
+        quant_tables.push(table)
+        block_dc.push(dc)
+        block_ac.push(ac)
+    }
+
     let reader = BitReader(data, start)
     var block = [0.0 for _index in 0..64]
     var pixels = [0.0 for _index in 0..64]
@@ -561,10 +583,12 @@ fn scan(
                 for component in components { component.predictor = 0 }
                 since_restart = 0
             }
-            for component in components {
+            for slot in 0..components.len() {
+                let component = components[slot]
                 for by in 0..component.v {
                     for bx in 0..component.h {
-                        decode_block(reader, component, quant, dc_tables, ac_tables, block)
+                        decode_block(reader, component, quant_tables[slot],
+                                     block_dc[slot], block_ac[slot], block)
                         idct_8x8(block, pixels, dct_scratch)
                         let origin_x = (mcu_x * component.h + bx) * 8
                         let origin_y = (mcu_y * component.v + by) * 8
@@ -601,22 +625,17 @@ fn skip_restart(reader: BitReader) -> void {
     }
 }
 
+#: The tables are resolved by the caller, once a scan rather than once a
+#: block; see the note where they are built.
 fn decode_block(
     reader: BitReader,
     component: Component,
-    quant: dict[int, list[int]],
-    dc_tables: dict[int, HuffmanTable],
-    ac_tables: dict[int, HuffmanTable],
+    table: list[int],
+    dc: HuffmanTable,
+    ac: HuffmanTable,
     block: list[float]
 ) -> void {
     for index in 0..64 { block[index] = 0.0 }
-    let table = quant.get(component.quant, null)
-    if table is null { throw ValueError("this JPEG names a quantisation table it never defined") }
-    let dc = dc_tables.get(component.dc_table, null)
-    let ac = ac_tables.get(component.ac_table, null)
-    if dc is null or ac is null {
-        throw ValueError("this JPEG names a Huffman table it never defined")
-    }
 
     let length = reader.decode(dc)
     let difference = reader.extend(reader.receive(length), length)
@@ -675,8 +694,10 @@ fn upsample_axis(
                 length - 1
             }, lane, width, horizontal)]
             if factor == 2 {
-                let first = math.floor((3.0 * here + previous + 2.0) * 0.25)
-                let second = math.floor((3.0 * here + following + 1.0) * 0.25)
+                #: Every sample reaching here came out of `clamp255`, so both
+                #: weighted sums are non-negative and truncation is the floor.
+                let first = float(int((3.0 * here + previous + 2.0) * 0.25))
+                let second = float(int((3.0 * here + following + 1.0) * 0.25))
                 out[pick(index * 2, lane, out_width, horizontal)] = first
                 out[pick(index * 2 + 1, lane, out_width, horizontal)] = second
                 continue
@@ -754,10 +775,13 @@ fn sample(component: Component, x: int, y: int, max_h: int, max_v: int) -> float
 }
 
 fn clamp255(value: float) -> float {
-    let whole = math.floor(value + 0.5)
-    if whole < 0.0 { return 0.0 }
-    if whole > 255.0 { return 255.0 }
-    return whole
+    #: Clamping first leaves only a non-negative argument to round, and for
+    #: one of those `int()` truncates to the same whole number `math.floor`
+    #: returns -- but as a single JIT instruction rather than a call, which
+    #: this tier declines. Every decoded sample passes through here.
+    if value <= 0.0 { return 0.0 }
+    if value >= 255.0 { return 255.0 }
+    return float(int(value + 0.5))
 }
 
 fn scaled_table(base: list[int], quality: int) -> list[int] {
