@@ -77,7 +77,7 @@ down next to the tolerance. In short:
 | `videoio` | camera capture through AVFoundation, and AVI writing with MJPEG or uncompressed frames |
 | `highgui` | `imshow`, `wait_key`, windows, mouse callbacks, trackbars |
 | `features2d` | FAST, ORB, BRIEF, blob detection, brute-force matching, keypoint and match drawing |
-| `objdetect` | cascade classification, reading OpenCV's own trained XML |
+| `objdetect` | cascade classification, reading OpenCV's own trained XML; histograms of oriented gradients |
 | `calib3d` | Rodrigues, homography, affine estimation, projection, distortion, triangulation, `solve_pnp`, `calibrate_camera`, chessboard detection |
 | `video` | Lucas-Kanade and Farneback optical flow, MOG2 and KNN background subtraction, mean shift, CamShift, Kalman |
 | `photo` | non-local means denoising, inpainting, edge-preserving smoothing |
@@ -89,7 +89,9 @@ down next to the tolerance. In short:
 Named so that nobody has to find out by trying:
 
 - **Codecs**: TIFF, WebP, JPEG 2000, EXR, GIF. PNG interlacing.
-- **objdetect**: HOG, QR and barcode reading, the DNN face detector.
+- **objdetect**: QR and barcode reading, the DNN face detector, and the
+  coefficients of OpenCV's pre-trained people detector — `HOGDescriptor`
+  computes the descriptor and takes a detector, but does not ship one.
 - **calib3d**: fisheye, stereo rectification and matching, `find_essential_mat`
   and pose recovery, circle-grid patterns.
 - **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;

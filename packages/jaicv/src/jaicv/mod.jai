@@ -155,6 +155,7 @@ from .highgui.window import EVENT_MBUTTONUP, EVENT_MOUSEMOVE, EVENT_MOUSEWHEEL
 from .highgui.window import EVENT_RBUTTONDOWN, EVENT_RBUTTONUP
 from .highgui.window import WINDOW_AUTOSIZE, WINDOW_KEEPRATIO, WINDOW_NORMAL
 
+from .objdetect.hog import HOGDescriptor, HOG_SIGNED, HOG_UNSIGNED
 from .objdetect.cascade import group_rectangles, CascadeClassifier
 from .objdetect.cascade import CASCADE_DO_CANNY_PRUNING, CASCADE_DO_ROUGH_SEARCH
 from .objdetect.cascade import CASCADE_FIND_BIGGEST_OBJECT, CASCADE_SCALE_IMAGE
@@ -349,6 +350,7 @@ export { EVENT_RBUTTONDOWN, EVENT_RBUTTONUP }
 export { WINDOW_AUTOSIZE, WINDOW_KEEPRATIO, WINDOW_NORMAL }
 
 export { group_rectangles, CascadeClassifier }
+export { HOGDescriptor, HOG_SIGNED, HOG_UNSIGNED }
 export { CASCADE_DO_CANNY_PRUNING, CASCADE_DO_ROUGH_SEARCH }
 export { CASCADE_FIND_BIGGEST_OBJECT, CASCADE_SCALE_IMAGE }
 export { parse_xml, Node }
