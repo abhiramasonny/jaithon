@@ -83,9 +83,52 @@ def write_colour(handle) -> None:
         case(handle, "cvtColor", name, source, cv2.cvtColor(source, code))
 
 
+def write_geometric(handle) -> None:
+    source = ramp(8, 10, 3, seed=11)
+    gray = ramp(8, 10, 1, seed=12)
+    for name, flag in (("NEAREST", cv2.INTER_NEAREST), ("LINEAR", cv2.INTER_LINEAR),
+                       ("CUBIC", cv2.INTER_CUBIC), ("AREA", cv2.INTER_AREA),
+                       ("LANCZOS4", cv2.INTER_LANCZOS4)):
+        case(handle, "resize", f"{name} 5 4",
+             source, cv2.resize(source, (5, 4), interpolation=flag))
+        case(handle, "resize", f"{name} 20 16",
+             source, cv2.resize(source, (20, 16), interpolation=flag))
+    case(handle, "pyrDown", "-", source, cv2.pyrDown(source))
+    case(handle, "pyrUp", "-", source, cv2.pyrUp(source))
+    for name, mode in (("CONSTANT", cv2.BORDER_CONSTANT),
+                       ("REPLICATE", cv2.BORDER_REPLICATE),
+                       ("REFLECT", cv2.BORDER_REFLECT),
+                       ("REFLECT_101", cv2.BORDER_REFLECT_101),
+                       ("WRAP", cv2.BORDER_WRAP)):
+        case(handle, "copyMakeBorder", f"{name} 2 3 1 4", source,
+             cv2.copyMakeBorder(source, 2, 3, 1, 4, mode, value=(0, 0, 0)))
+
+    matrix = cv2.getRotationMatrix2D((4.5, 3.5), 27.0, 1.3).astype(np.float32)
+    case(handle, "warpAffine", "rot27", source,
+         cv2.warpAffine(source, matrix, (10, 8), flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)))
+    src_pts = np.float32([[0, 0], [9, 0], [9, 7], [0, 7]])
+    dst_pts = np.float32([[1, 1], [8, 0.5], [9, 6], [0.5, 7]])
+    persp = cv2.getPerspectiveTransform(src_pts, dst_pts).astype(np.float32)
+    case(handle, "warpPerspective", "quad", source,
+         cv2.warpPerspective(source, persp, (10, 8), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)))
+    case(handle, "getRotationMatrix2D", "4.5 3.5 27 1.3", gray, matrix)
+    case(handle, "getPerspectiveTransform", "quad", gray, persp)
+    affine = cv2.getAffineTransform(src_pts[:3], dst_pts[:3]).astype(np.float32)
+    case(handle, "getAffineTransform", "tri", gray, affine)
+
+    map_x = np.tile(np.arange(10, dtype=np.float32)[::-1], (8, 1))
+    map_y = np.tile(np.arange(8, dtype=np.float32).reshape(-1, 1), (1, 10))
+    remapped = cv2.remap(source, map_x, map_y, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    case(handle, "remap", "flipx", source, remapped)
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
+        write_geometric(handle)
     print(f"wrote {OUT}")
     return 0
 

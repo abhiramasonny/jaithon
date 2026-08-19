@@ -187,6 +187,7 @@ inline float3 rgb_to_hsv(float3 bgr, float hue_scale) {
         else hue = 60.0f * ((r - g) / span + 4.0f);
     }
     if (hue < 0.0f) hue += 360.0f;
+    if (hue >= 360.0f) hue -= 360.0f;
     float saturation = high <= 0.0f ? 0.0f : span / high;
     return float3(hue * hue_scale, saturation, high);
 }
@@ -224,6 +225,7 @@ inline float3 rgb_to_hls(float3 bgr, float hue_scale) {
         else if (high == g) hue = 60.0f * ((b - r) / span + 2.0f);
         else hue = 60.0f * ((r - g) / span + 4.0f);
         if (hue < 0.0f) hue += 360.0f;
+        if (hue >= 360.0f) hue -= 360.0f;
     }
     return float3(hue * hue_scale, lightness, saturation);
 }
@@ -348,7 +350,11 @@ kernel void cvt_color(device const float* src [[buffer(0)]],
     }
     if (code == 7u) {                            /* to HSV */
         float3 hsv = rgb_to_hsv(float3(b, g, r), hue_scale);
-        put(dst, dbase, hsv.x, low, high, integral);
+        /* A hue a hair under 360 rounds up to the top of the scale, which is
+         * the same angle as zero; OpenCV stores zero. */
+        float hue = hsv.x;
+        if (integral != 0u && rint(hue) >= 360.0f * hue_scale) hue = 0.0f;
+        put(dst, dbase, hue, low, high, integral);
         put(dst, dbase + 1u, hsv.y / scale, low, high, integral);
         put(dst, dbase + 2u, hsv.z / scale, low, high, integral);
         return;
@@ -362,7 +368,9 @@ kernel void cvt_color(device const float* src [[buffer(0)]],
     }
     if (code == 9u) {                            /* to HLS */
         float3 hls = rgb_to_hls(float3(b, g, r), hue_scale);
-        put(dst, dbase, hls.x, low, high, integral);
+        float hue = hls.x;
+        if (integral != 0u && rint(hue) >= 360.0f * hue_scale) hue = 0.0f;
+        put(dst, dbase, hue, low, high, integral);
         put(dst, dbase + 1u, hls.y / scale, low, high, integral);
         put(dst, dbase + 2u, hls.z / scale, low, high, integral);
         return;
