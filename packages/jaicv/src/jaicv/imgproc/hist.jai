@@ -132,7 +132,7 @@ pub fn calc_hist(
         }
     }
     var planes: list[list[float]] = []
-    for image in images { planes.push(image.to_list()) }
+    for image in images { planes.push(image.values()) }
     var mask_values: list[float] = []
     let mask_image = mask
     if mask_image is not null {
@@ -291,7 +291,7 @@ pub fn calc_back_project(
     let rows = images[0].rows
     let cols = images[0].cols
     var planes: list[list[float]] = []
-    for image in images { planes.push(image.to_list()) }
+    for image in images { planes.push(image.values()) }
     let counts = hist.to_list()
 
     var out: list[float] = []
@@ -344,7 +344,7 @@ pub fn equalize_hist(image: Mat) -> Mat {
         table.push(mapped)
     }
 
-    let source = image.to_list()
+    let source = image.values()
     var out: list[float] = []
     for value in source {
         var index = int(value)
@@ -397,7 +397,7 @@ pub class CLAHE {
         }
         let lut_scale = 255.0 / float(area)
 
-        let source = image.to_list()
+        let source = image.values()
         var tables: list[list[float]] = []
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {

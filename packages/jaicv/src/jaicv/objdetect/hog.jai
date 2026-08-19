@@ -94,7 +94,7 @@ pub class HOGDescriptor {
         let rows = window.rows
         let cols = window.cols
         let cn = window.channels()
-        let values = window.to_list()
+        let values = window.values()
         var magnitude: list[float] = []
         var direction: list[float] = []
         let turn = if self.signed_gradient == HOG_SIGNED { 360.0 } else { 180.0 }

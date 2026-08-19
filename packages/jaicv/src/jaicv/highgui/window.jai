@@ -139,7 +139,7 @@ fn ensure_window(pane: Pane, width: int, height: int) -> Window? {
 fn packed(image: Mat) -> list[int] {
     #: One `0xAARRGGBB` int per pixel, which is what the back buffer holds.
     let cn = image.channels()
-    let values = image.to_list()
+    let values = image.values()
     var out: list[int] = []
     let count = image.rows * image.cols
     for index in 0..count {

@@ -86,7 +86,7 @@ pub fn blob_from_images(
                 prepared = resize(image, size: Size(width, height))
             }
         }
-        let values = prepared.to_list()
+        let values = prepared.values()
         for channel in 0..cn {
             #: The blob is planar, so one channel is written out whole before
             #: the next begins.
@@ -103,7 +103,7 @@ pub fn blob_from_images(
 
 #: Take the images back out of a blob.
 pub fn images_from_blob(blob: Mat, channels: int, size: Size) -> list[Mat] {
-    let values = blob.to_list()
+    let values = blob.values()
     let per_image = channels * size.width * size.height
     if per_image == 0 { throw ValueError("a blob needs a positive size") }
     let count = values.len() // per_image

@@ -350,7 +350,7 @@ pub class StereoBM {
         volume.invalidate()
         volume.flush()
         return winners(
-            volume.to_list(),
+            volume.values(),
             rows,
             cols,
             self.num_disparities,
@@ -465,7 +465,7 @@ pub class StereoSGBM {
         aggregated.invalidate()
         aggregated.flush()
         return winners(
-            aggregated.to_list(),
+            aggregated.values(),
             rows,
             cols,
             self.num_disparities,
@@ -490,7 +490,7 @@ pub fn reproject_image_to_3d(
 ) -> list[Point3f] {
     if q.rows != 4 or q.cols != 4 { throw ValueError("the reprojection matrix is four by four") }
     disparity.flush()
-    let m = q.to_list()
+    let m = q.values()
     let values = disparity.to_list()
     var out: list[Point3f] = []
     for y in 0..disparity.rows {
@@ -543,7 +543,7 @@ pub fn stereo_rectify(
         throw ValueError("the relative rotation is three by three")
     }
     let _unused = (dist1, dist2)
-    let t = translation.to_list()
+    let t = translation.values()
     if t.len() != 3 { throw ValueError("the relative translation has three components") }
 
     #: Half the rotation each way, so neither camera is turned further than it
@@ -558,7 +558,7 @@ pub fn stereo_rectify(
     #: The baseline in the intermediate frame. Camera two's centre in camera
     #: one's frame is `-Rᵀ T`, and `half` of that is `-half⁻¹ T` because `R` is
     #: `half²`.
-    let inv = half_inv.to_list()
+    let inv = half_inv.values()
     var turned: list[float] = []
     for row in 0..3 {
         turned.push(-(inv[row * 3] * t[0] + inv[row * 3 + 1] * t[1] + inv[row * 3 + 2] * t[2]))
@@ -604,8 +604,8 @@ pub fn stereo_rectify(
     let r2 = matmul(align, half_inv)
 
     #: One focal length and one principal point for both, so the rows line up.
-    let k1 = camera1.to_list()
-    let k2 = camera2.to_list()
+    let k1 = camera1.values()
+    let k2 = camera2.values()
     let fx = (k1[0] + k2[0]) / 2.0
     let fy = (k1[4] + k2[4]) / 2.0
     let cx = (k1[2] + k2[2]) / 2.0
@@ -647,7 +647,7 @@ pub fn stereo_rectify(
 
 #: The rotation that is half of `rotation`, by halving its Rodrigues vector.
 fn half_rotation(rotation: Mat) -> Mat {
-    let m = rotation.to_list()
+    let m = rotation.values()
     let trace = m[0] + m[4] + m[8]
     var angle = math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0)))
     if angle < 1e-9 {

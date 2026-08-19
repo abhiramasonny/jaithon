@@ -170,15 +170,29 @@ pub fn canny(
 
     #: Weak edges join a chain one ring at a time, so the pass count bounds how
     #: far a chain can reach; a counter says when a pass changed nothing.
+    #:
+    #: The counter is read every eighth pass, not every pass. Reading it is a
+    #: round trip to the device and back, and the passes themselves are a
+    #: single cheap kernel over the image -- so asking after each one spent
+    #: almost the whole of Canny waiting: eighteen milliseconds at VGA, of
+    #: which the arithmetic was a fraction. Promotion only ever turns a weak
+    #: edge strong, so a few passes past convergence change nothing and cost
+    #: only their own dispatch.
     let changed = Buffer(1)
     let promote = kernel_for("canny_promote")
-    for _pass in 0..MAX_HYSTERESIS_PASSES {
+    let CHECK_EVERY = 8
+    var pass_number = 0
+    while pass_number < MAX_HYSTERESIS_PASSES {
         changed.fill_zero()
-        promote.dispatch(
-            [labels.storage, changed],
-            count,
-            [count, src.rows, src.cols, labels.offset, labels.step_]
-        )
+        let block = min(CHECK_EVERY, MAX_HYSTERESIS_PASSES - pass_number)
+        for _step in 0..block {
+            promote.dispatch_async(
+                [labels.storage, changed],
+                count,
+                [count, src.rows, src.cols, labels.offset, labels.step_]
+            )
+        }
+        pass_number += block
         if changed.download()[0] == 0.0 { break }
     }
     changed.free()

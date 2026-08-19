@@ -36,7 +36,7 @@ fn matrix_of(values: list[float], rows: int, cols: int) -> Mat {
 #: is OpenCV's `Rodrigues`, and the round trip is exact to the precision of the
 #: trigonometry.
 pub fn rodrigues(source: Mat) -> Mat {
-    let values = source.to_list()
+    let values = source.values()
     if source.rows * source.cols == 3 {
         let x = values[0]
         let y = values[1]
@@ -148,7 +148,7 @@ fn homography_from(source: list[Point2f], target: list[Point2f]) -> Mat {
     let h = null_space(matrix_of(rows, count * 2, 9))
     let normalised = matrix_of(h, 3, 3)
     let denormalised = matmul(matmul(inverse(tt), normalised), ts)
-    let flat = denormalised.to_list()
+    let flat = denormalised.values()
     if math.fabs(flat[8]) < 1e-12 { return denormalised }
     return scale(denormalised, 1.0 / flat[8])
 }
@@ -214,7 +214,7 @@ pub fn find_homography(
         } catch ValueError {
             continue
         }
-        let flat = candidate.to_list()
+        let flat = candidate.values()
         var agreed: list[bool] = []
         var agreement = 0
         for index in 0..count {
@@ -265,7 +265,7 @@ pub fn estimate_affine_2d(source: list[Point2f], target: list[Point2f]) -> Mat {
         matrix_of(rows, count * 2, 6),
         matrix_of(right, count * 2, 1)
     )
-    return matrix_of(solution.to_list(), 2, 3)
+    return matrix_of(solution.values(), 2, 3)
 }
 
 #: The best rotation, scale, and shift — no shear — carrying one set of points
@@ -287,7 +287,7 @@ pub fn estimate_affine_partial_2d(source: list[Point2f], target: list[Point2f]) 
         matrix_of(rows, count * 2, 4),
         matrix_of(right, count * 2, 1)
     )
-    let v = solution.to_list()
+    let v = solution.values()
     return matrix_of([v[0], -v[1], v[2], v[1], v[0], v[3]], 2, 3)
 }
 
@@ -317,9 +317,9 @@ pub fn project_points(
     camera_matrix: Mat,
     dist_coeffs: list[float] = []
 ) -> list[Point2f] {
-    let r = rodrigues(rvec).to_list()
-    let t = tvec.to_list()
-    let k = camera_matrix.to_list()
+    let r = rodrigues(rvec).values()
+    let t = tvec.values()
+    let k = camera_matrix.values()
     var out: list[Point2f] = []
     for point in object_points {
         let cx = r[0] * point.x + r[1] * point.y + r[2] * point.z + t[0]
@@ -346,9 +346,9 @@ pub fn init_undistort_rectify_map(
     new_camera_matrix: Mat,
     size: Size
 ) -> tuple[Mat, Mat] {
-    let k = camera_matrix.to_list()
-    let n = new_camera_matrix.to_list()
-    let inverse_new = inverse(new_camera_matrix).to_list()
+    let k = camera_matrix.values()
+    let n = new_camera_matrix.values()
+    let inverse_new = inverse(new_camera_matrix).values()
     var map_x: list[float] = []
     var map_y: list[float] = []
     let _unused = n
@@ -380,7 +380,7 @@ pub fn undistort_points(
     dist_coeffs: list[float],
     new_camera_matrix: Mat? = null
 ) -> list[Point2f] {
-    let k = camera_matrix.to_list()
+    let k = camera_matrix.values()
     var out: list[Point2f] = []
     for point in points {
         let x0 = (point.x - k[2]) / k[0]
@@ -397,7 +397,7 @@ pub fn undistort_points(
             out.push(Point2f(x, y))
             continue
         }
-        let n = target.to_list()
+        let n = target.values()
         out.push(Point2f(n[0] * x + n[1] * y + n[2], n[4] * y + n[5]))
     }
     return out
@@ -411,7 +411,7 @@ pub fn get_optimal_new_camera_matrix(
     size: Size,
     alpha: float = 0.0
 ) -> Mat {
-    let k = camera_matrix.to_list()
+    let k = camera_matrix.values()
     #: The straightened corners of the image bound what is worth keeping; the
     #: inner rectangle is what stays valid and the outer one is everything.
     var corners: list[Point2f] = []
@@ -464,8 +464,8 @@ pub fn triangulate_points(
     first_points: list[Point2f],
     second_points: list[Point2f]
 ) -> list[list[float]] {
-    let p1 = first.to_list()
-    let p2 = second.to_list()
+    let p1 = first.values()
+    let p2 = second.values()
     var out: list[list[float]] = []
     for index in 0..first_points.len() {
         let a = first_points[index]
@@ -490,7 +490,7 @@ pub fn refine_homography(
     target: list[Point2f],
     iterations: int = 30
 ) -> Mat {
-    let flat = h.to_list()
+    let flat = h.values()
     var start: list[float] = []
     for index in 0..8 { start.push(flat[index] / flat[8]) }
 

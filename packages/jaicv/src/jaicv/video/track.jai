@@ -18,8 +18,8 @@ from ..core.types import CV_32F, CV_MAKETYPE, Point2f, Rect, RotatedRect, Size2f
 
 fn matmul(a: Mat, b: Mat) -> Mat {
     if a.cols != b.rows { throw ValueError(f"cannot multiply {a} by {b}") }
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     var out: list[float] = []
     for row in 0..a.rows {
         for column in 0..b.cols {
@@ -34,7 +34,7 @@ fn matmul(a: Mat, b: Mat) -> Mat {
 }
 
 fn transpose_of(a: Mat) -> Mat {
-    let values = a.to_list()
+    let values = a.values()
     var out: list[float] = []
     for column in 0..a.cols {
         for row in 0..a.rows { out.push(values[row * a.cols + column]) }
@@ -43,16 +43,16 @@ fn transpose_of(a: Mat) -> Mat {
 }
 
 fn add_of(a: Mat, b: Mat) -> Mat {
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     var out: list[float] = []
     for index in 0..left.len() { out.push(left[index] + right[index]) }
     return Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 1), out)
 }
 
 fn subtract_of(a: Mat, b: Mat) -> Mat {
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     var out: list[float] = []
     for index in 0..left.len() { out.push(left[index] - right[index]) }
     return Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 1), out)
@@ -69,7 +69,7 @@ fn identity_of(size: int) -> Mat {
 fn invert_of(a: Mat) -> Mat {
     if a.rows != a.cols { throw ValueError("only a square matrix can be inverted") }
     let n = a.rows
-    let source = a.to_list()
+    let source = a.values()
     #: Gauss-Jordan with partial pivoting, on the matrix and an identity side
     #: by side; what is left where the identity was is the inverse.
     var work: list[list[float]] = []
@@ -239,7 +239,7 @@ pub fn mean_shift(
 ) -> tuple[int, Rect] {
     if probability.channels() != 1 { throw ValueError("mean shift needs a single-channel Mat") }
     probability.flush()
-    let values = probability.to_list()
+    let values = probability.values()
     let rows = probability.rows
     let cols = probability.cols
     var current = clamp_window(window, rows, cols)
@@ -295,7 +295,7 @@ pub fn cam_shift(
     for _round in 0..iterations {
         let (_steps, settled) = mean_shift(probability, current, iterations, epsilon)
         current = settled
-        let values = probability.to_list()
+        let values = probability.values()
         var m00 = 0.0
         var m10 = 0.0
         var m01 = 0.0
@@ -328,7 +328,7 @@ pub fn cam_shift(
         current = grown
     }
 
-    let values = probability.to_list()
+    let values = probability.values()
     var m00 = 0.0
     var m10 = 0.0
     var m01 = 0.0

@@ -51,7 +51,7 @@ pub fn hconcat(parts: list[Mat]) -> Mat {
         width += part.cols
     }
     var planes: list[list[float]] = []
-    for part in parts { planes.push(part.to_list()) }
+    for part in parts { planes.push(part.values()) }
     var out: list[float] = []
     for y in 0..rows {
         for index in 0..parts.len() {
@@ -140,7 +140,7 @@ pub fn insert_channel(source: Mat, target: Mat, index: int) -> Mat {
     if source.rows != target.rows or source.cols != target.cols {
         throw ValueError("both have to be the same size")
     }
-    let plane = source.to_list()
+    let plane = source.values()
     var values = target.to_list()
     for at in 0..target.rows * target.cols { values[at * cn + index] = plane[at] }
     return Mat.from_list(target.rows, target.cols, target.type_(), values)
@@ -419,11 +419,11 @@ pub fn calc_covar_matrix(samples: Mat, normalise: bool = true) -> tuple[Mat, Mat
 #: How far apart two vectors are, measured in the units the data itself varies
 #: in rather than in raw distance.
 pub fn mahalanobis(a: Mat, b: Mat, inverse_covariance: Mat) -> float {
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     if left.len() != right.len() { throw ValueError("both vectors have to be the same length") }
     let width = left.len()
-    let precision = inverse_covariance.to_list()
+    let precision = inverse_covariance.values()
     var total = 0.0
     for i in 0..width {
         var row = 0.0

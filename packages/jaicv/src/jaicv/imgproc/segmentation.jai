@@ -268,7 +268,7 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
         throw ValueError(f"connectivity {connectivity} is neither four nor eight")
     }
     image.flush()
-    let (count, labels) = label_pass(image.to_list(), image.rows, image.cols, connectivity)
+    let (count, labels) = label_pass(image.values(), image.rows, image.cols, connectivity)
     var values: list[float] = []
     for label in labels { values.push(float(label)) }
     return (count, Mat.from_list(image.rows, image.cols, CV_MAKETYPE(CV_32S, 1), values))
@@ -365,7 +365,7 @@ pub fn distance_transform(
     let knight = weights[2]
     let wide = mask_size == DIST_MASK_5 and distance_type == DIST_L2
 
-    let source = image.to_list()
+    let source = image.values()
     let far = 1e10
     var out: list[float] = []
     for value in source { out.push(if value == 0.0 { 0.0 } else { far }) }
@@ -434,7 +434,7 @@ pub fn integral(image: Mat) -> Mat {
     let cn = image.channels()
     let rows = image.rows
     let cols = image.cols
-    let source = image.to_list()
+    let source = image.values()
     var out: list[float] = []
     for _index in 0..(rows + 1) * (cols + 1) * cn { out.push(0.0) }
     for y in 0..rows {
@@ -476,7 +476,7 @@ pub fn watershed(image: Mat, markers: Mat) -> Mat {
     let rows = image.rows
     let cols = image.cols
     let cn = image.channels()
-    let pixels = image.to_list()
+    let pixels = image.values()
     let labels = markers.edit()
 
     #: One bucket per possible gradient, so taking the flattest pixel next is a

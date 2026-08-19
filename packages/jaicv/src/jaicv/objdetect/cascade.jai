@@ -315,7 +315,7 @@ fn rect_sum(integral: list[float], stride: int, x: int, y: int, width: int, heig
 fn integrals(image: Mat) -> tuple[list[float], list[float]] {
     let rows = image.rows
     let cols = image.cols
-    let values = image.to_list()
+    let values = image.values()
     let stride = cols + 1
     var plain: list[float] = []
     var squared: list[float] = []

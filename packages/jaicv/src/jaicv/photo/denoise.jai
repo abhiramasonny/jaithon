@@ -302,8 +302,8 @@ pub fn edge_preserving_filter(
 #: Sharpen the fine detail of a photograph without amplifying its noise.
 pub fn detail_enhance(src: Mat, sigma_s: float = 10.0, sigma_r: float = 0.15) -> Mat {
     let smoothed = edge_preserving_filter(src, sigma_s, sigma_r)
-    let original = src.to_list()
-    let base = smoothed.to_list()
+    let original = src.values()
+    let base = smoothed.values()
     var out: list[float] = []
     for index in 0..original.len() {
         #: What the smoother removed is the detail; putting more of it back

@@ -9752,20 +9752,37 @@ static bool isInstructionStart(const Chunk *c, uint32_t top) {
     return false;
 }
 
-static uint32_t findLoopEnd(const Chunk *c, uint32_t top) {
+/* Where the loop whose head is `top` ends: after its LAST back edge, not its
+ * first.
+ *
+ * A loop has one back edge for the ordinary path off the bottom and one more
+ * for every `continue`, and a `continue` comes FIRST -- it is written near the
+ * top of the body, which is the point of it. Stopping at the first meant the
+ * compiled region was the prefix before the `continue` and everything after it
+ * ran interpreted, so the more often the `continue` was SKIPPED the slower the
+ * loop got: measured over three hundred thousand elements, 0.25ms when every
+ * iteration took the `continue` against 7.6ms when none did, for the same loop
+ * written with an `if` in 0.29ms.
+ *
+ * Only this loop's own back edges name `top`: an inner loop's name the inner
+ * head, and a later loop's name its own. So the last one is this loop's bottom
+ * however many `continue`s are between. */
+static uint32_t findLoopEnd(const Chunk *c, uint32_t top, bool wholeBody) {
+    uint32_t end = 0;
     for (int off = (int)top; off < c->count;) {
         uint8_t op = c->code[off];
         int len = instructionLength(c, off);
-        if (len <= 0) return 0;
+        if (len <= 0) return end;
         if (op == OP_LOOP) {
             int16_t jump = jaiReadI16(c->code + off + 1);
             if ((uint32_t)((int32_t)(off + 3) + jump) == top) {
-                return (uint32_t)(off + 3);
+                end = (uint32_t)(off + 3);
+                if (!wholeBody) return end;
             }
         }
         off += len;
     }
-    return 0;
+    return end;
 }
 
 /* How many loops enclose each byte, so slots can be ranked by heat: every OP_LOOP is a back edge, the
@@ -9802,11 +9819,11 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
 
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        uint8_t iterKind, Value elemSample, bool elemMixed,
-                       bool noInline) {
+                       bool wholeBody, bool noInline) {
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
     if (!isInstructionStart(&fn->chunk, top)) return false;
-    uint32_t end = findLoopEnd(&fn->chunk, top);
+    uint32_t end = findLoopEnd(&fn->chunk, top, wholeBody);
     if (end == 0 || end <= top) return false;
     /* The entry re-checks every slot, so this is the size of that record --
      * nbody's advance declares nineteen. */
@@ -10563,10 +10580,25 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         if (miss < JAI_OSR_MAX && fn->osrMissAttempts[miss] >= 5 * JAI_OSR_MAX) {
             return 0;   /* this head is spent; other heads are not */
         }
+        /* The whole body first, then just the part before the first
+         * `continue`.
+         *
+         * A body that reaches past a `continue` is the one worth having --
+         * without it the tail runs interpreted and a loop whose `continue`
+         * rarely fires is twenty times slower than the same loop written with
+         * an `if`. But the tail can also hold something the tier will not
+         * compile, an uncompiled callee most often, and then the whole loop
+         * declines and NOTHING is compiled. tests/bench's contour follower is
+         * exactly that shape. So the prefix stays as the fallback: some of the
+         * loop compiled beats none of it. */
         if (!compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, false) &&
+                        elemMixed, true, false) &&
             !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, true)) {
+                        elemMixed, true, true) &&
+            !compileOsr(closure, top, frame->slots, iterKind, elemSample,
+                        elemMixed, false, false) &&
+            !compileOsr(closure, top, frame->slots, iterKind, elemSample,
+                        elemMixed, false, true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
             if (miss == fn->osrMissCount && miss < JAI_OSR_MAX) {

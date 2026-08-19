@@ -480,7 +480,23 @@ pub class Mat: Printable {
     }
 
     #: Every element in row-major order, channels interleaved.
+    #: A COPY of every element, in row-major order.
+    #:
+    #: The copy is not free -- at VGA it is five milliseconds against one and a
+    #: third for the download it protects -- so anything inside this library
+    #: that only reads should call `values` instead. This stays copying because
+    #: it is the public accessor and a caller who mutates what it hands back
+    #: would corrupt the mirror every later read comes from.
     pub fn to_list(self) -> list[float] { return [value for value in self.ensure_host()] }
+
+    #: The live host mirror itself, without the copy. READ ONLY.
+    #:
+    #: Writing through this corrupts the cache that every later read shares --
+    #: `edit` is the way to change pixels. It exists because copying is most of
+    #: what reading an image cost: a 640x480 `to_list` was seven milliseconds,
+    #: of which five and a half were the copy, and every host-side algorithm in
+    #: this library begins with one.
+    pub fn values(self) -> list[float] { return self.ensure_host() }
 
     #: Every element clamped and rounded into bytes, the layout an encoder or a
     #: display expects.
