@@ -545,6 +545,26 @@ def write_features(handle) -> None:
              np.array(rows, np.float32).reshape(-1, 2))
 
 
+def write_features2d(handle) -> None:
+    rng = np.random.default_rng(131)
+    noisy = rng.integers(0, 256, size=(30, 36), dtype=np.uint8)
+    shapes = np.zeros((30, 36), np.uint8)
+    cv2.rectangle(shapes, (5, 5), (16, 18), 255, -1)
+    cv2.rectangle(shapes, (21, 9), (32, 24), 200, -1)
+    cv2.circle(shapes, (12, 24), 4, 120, -1)
+    blurred = cv2.GaussianBlur(noisy, (5, 5), 0)
+
+    for tag, image in (("noisy", noisy), ("shapes", shapes), ("blurred", blurred)):
+        for threshold in (10, 20, 40):
+            for nonmax in (True, False):
+                detector = cv2.FastFeatureDetector_create(threshold, nonmax,
+                                                          cv2.FAST_FEATURE_DETECTOR_TYPE_9_16)
+                found = detector.detect(image, None)
+                rows = [[k.pt[0], k.pt[1], k.response] for k in found]
+                case(handle, "fast", f"{tag} {threshold} {1 if nonmax else 0}", image,
+                     np.array(rows, np.float32).reshape(-1, 3))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -559,6 +579,7 @@ def main() -> int:
         write_segmentation(handle)
         write_hist(handle)
         write_features(handle)
+        write_features2d(handle)
     print(f"wrote {OUT}")
     return 0
 

@@ -128,6 +128,13 @@ from .imgproc.features import HOUGH_GRADIENT, HOUGH_PROBABILISTIC, HOUGH_STANDAR
 from .imgproc.features import TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED
 from .imgproc.features import TM_SQDIFF, TM_SQDIFF_NORMED
 
+from .features2d.detect import draw_keypoints, draw_matches, fast
+from .features2d.detect import BFMatcher, BRIEF, DMatch, KeyPoint, ORB
+from .features2d.detect import SimpleBlobDetector, SimpleBlobDetectorParams
+from .features2d.detect import DRAW_MATCHES_FLAGS_DEFAULT, DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
+from .features2d.detect import FAST_FEATURE_DETECTOR_TYPE_5_8, FAST_FEATURE_DETECTOR_TYPE_7_12
+from .features2d.detect import FAST_FEATURE_DETECTOR_TYPE_9_16, ORB_FAST_SCORE, ORB_HARRIS_SCORE
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -239,6 +246,13 @@ export { HoughCircle, HoughLine, HoughSegment }
 export { HOUGH_GRADIENT, HOUGH_PROBABILISTIC, HOUGH_STANDARD }
 export { TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED }
 export { TM_SQDIFF, TM_SQDIFF_NORMED }
+
+export { draw_keypoints, draw_matches, fast }
+export { BFMatcher, BRIEF, DMatch, KeyPoint, ORB }
+export { SimpleBlobDetector, SimpleBlobDetectorParams }
+export { DRAW_MATCHES_FLAGS_DEFAULT, DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS }
+export { FAST_FEATURE_DETECTOR_TYPE_5_8, FAST_FEATURE_DETECTOR_TYPE_7_12 }
+export { FAST_FEATURE_DETECTOR_TYPE_9_16, ORB_FAST_SCORE, ORB_HARRIS_SCORE }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
