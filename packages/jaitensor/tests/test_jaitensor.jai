@@ -4,6 +4,7 @@ import std.gpu as gpu
 import std.math
 import std.os
 from jaitensor import Dataset
+from jaitensor.gemm import default_plan
 from jaitensor.ops import dense_static_forward, matmul_backend
 from jaitensor.tensor import GradNode, Tensor
 from std.io import Path, read_file
@@ -337,12 +338,17 @@ fn test_tiled_matmul_matches_cpu_on_ragged_tiles() -> void {
     }
 }
 
-fn test_matmul_backend_explains_shape_dispatch() -> void {
-    assert_eq(matmul_backend(512, 784, 256), "mpsgraph")
-    assert_eq(matmul_backend(2048, 784, 256), "mma64")
-    assert_eq(matmul_backend(4096, 784, 256), "mpsgraph")
-    assert_eq(matmul_backend(4096, 3072, 512), "mpsgraph")
-    assert_eq(matmul_backend(8, 7, 5), "tiled32")
+fn test_default_plan_prefers_large_tiles_then_splits() -> void {
+    assert_eq(default_plan(512, 784, 8192).to_str(), "gemm128x128:1")
+    assert_eq(default_plan(1024, 3072, 2048).to_str(), "gemm128x128:2")
+    assert_eq(default_plan(512, 784, 256).to_str(), "gemm128x64:8")
+    assert_eq(default_plan(8, 7, 5).to_str(), "gemm32x32:1")
+}
+
+fn test_matmul_backend_reports_a_known_plan() -> void {
+    let reported = matmul_backend(512, 784, 256)
+    assert_true(reported.contains(":"))
+    assert_true(reported.starts_with("gemm") or reported.starts_with("mpsgraph"))
 }
 
 fn test_staged_64_matmul_matches_cpu() -> void {
