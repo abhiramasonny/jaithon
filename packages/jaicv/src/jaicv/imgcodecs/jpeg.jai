@@ -1136,19 +1136,27 @@ let AC_CHROMA_VALUES = [
 ]
 
 #: Code and length for every symbol a canonical Huffman table defines.
-fn build_codes(counts: list[int], values: list[int]) -> dict[int, tuple[int, int]] {
-    var table: dict[int, tuple[int, int]] = {}
+#: The canonical Huffman codes as two flat lists indexed by symbol, rather than
+#: a dict of tuples. A symbol is a byte, so 256 entries cover every table the
+#: standard defines, and a lookup becomes one indexed read instead of a hash
+#: probe and a tuple unpack -- which the coefficient loop below did for every
+#: symbol it wrote. A length of zero means the table does not define that
+#: symbol; `code` is meaningless there.
+fn build_codes(counts: list[int], values: list[int]) -> tuple[list[int], list[int]] {
+    var code_of = [0 for _index in 0..256]
+    var length_of = [0 for _index in 0..256]
     var code = 0
     var index = 0
     for length in 0..16 {
         for _step in 0..counts[length] {
-            table[values[index]] = (code, length + 1)
+            code_of[values[index]] = code
+            length_of[values[index]] = length + 1
             code += 1
             index += 1
         }
         code = code << 1
     }
-    return table
+    return (code_of, length_of)
 }
 
 class BitWriter {
@@ -1199,22 +1207,28 @@ fn magnitude_of(value: int) -> int {
 #: local scratch also left the whole function running interpreted.
 fn fdct_8x8(block: list[float], out: list[float],
             scratch: list[float]) -> void {
+    #: Read once into a local. A global is a module lookup on every read, and
+    #: the inner loops below read this 1024 times a block.
+    let basis = DCT_BASIS
     #: Separable, matching `idct_8x8`: a column pass into a scratch block and
     #: then a row pass. Doing it as the literal double sum of the standard's
     #: definition costs 4096 multiply-adds and 8192 cosines a block; this
     #: costs 1024 multiply-adds and no cosines.
     for v in 0..8 {
+        let row = v * 8
         for x in 0..8 {
             var total = 0.0
-            for y in 0..8 { total += block[y * 8 + x] * DCT_BASIS[v * 8 + y] }
-            scratch[v * 8 + x] = total
+            for y in 0..8 { total += block[y * 8 + x] * basis[row + y] }
+            scratch[row + x] = total
         }
     }
     for v in 0..8 {
+        let row = v * 8
         for u in 0..8 {
             var total = 0.0
-            for x in 0..8 { total += scratch[v * 8 + x] * DCT_BASIS[u * 8 + x] }
-            out[v * 8 + u] = total * 0.25
+            let urow = u * 8
+            for x in 0..8 { total += scratch[row + x] * basis[urow + x] }
+            out[row + u] = total * 0.25
         }
     }
 }
@@ -1240,6 +1254,13 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
     }
     let luma_quant = scaled_table(STANDARD_LUMA_QUANT, quality)
     let chroma_quant = scaled_table(STANDARD_CHROMA_QUANT, quality)
+    #: The divisors in zigzag order, already inverted and already floats. The
+    #: quantise loop below runs 64 times a block and thousands of times an
+    #: image; leaving it to divide meant a division and an int-to-float
+    #: conversion at every one of them, which measured as the single most
+    #: expensive phase of encoding.
+    let luma_recip = [1.0 / float(luma_quant[ZIGZAG[i]]) for i in 0..64]
+    let chroma_recip = [1.0 / float(chroma_quant[ZIGZAG[i]]) for i in 0..64]
     let values = image.values()
     let width = image.cols
     let height = image.rows
@@ -1293,10 +1314,10 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
     scan_header.push(0)
     segment(out, 0xDA, scan_header)
 
-    let dc_luma = build_codes(DC_LUMA_COUNTS, DC_LUMA_VALUES)
-    let ac_luma = build_codes(AC_LUMA_COUNTS, AC_LUMA_VALUES)
-    let dc_chroma = build_codes(DC_CHROMA_COUNTS, DC_CHROMA_VALUES)
-    let ac_chroma = build_codes(AC_CHROMA_COUNTS, AC_CHROMA_VALUES)
+    let (dc_luma_code, dc_luma_len) = build_codes(DC_LUMA_COUNTS, DC_LUMA_VALUES)
+    let (ac_luma_code, ac_luma_len) = build_codes(AC_LUMA_COUNTS, AC_LUMA_VALUES)
+    let (dc_chroma_code, dc_chroma_len) = build_codes(DC_CHROMA_COUNTS, DC_CHROMA_VALUES)
+    let (ac_chroma_code, ac_chroma_len) = build_codes(AC_CHROMA_COUNTS, AC_CHROMA_VALUES)
 
     let writer = BitWriter()
     var predictors = [0, 0, 0]
@@ -1308,6 +1329,13 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
     var coefficients = [0.0 for _index in 0..64]
     var dct_scratch = [0.0 for _index in 0..64]
     var levels = [0 for _index in 0..64]
+    #: Locals, not globals and not a list of lists: each of these is read once
+    #: a pixel or once a coefficient, and a module lookup or an outer index at
+    #: that rate costs more than the arithmetic it feeds.
+    let zigzag = ZIGZAG
+    var luma_plane = planes[0]
+    var cb_plane = planes[1]
+    var cr_plane = planes[2]
 
     let blocks_across = (width + 7) // 8
     let blocks_down = (height + 7) // 8
@@ -1321,29 +1349,30 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
                     let base = (row + sx) * channels
                     let cell = y * 8 + x
                     if channels == 1 {
-                        planes[0][cell] = values[base] - 128.0
+                        luma_plane[cell] = values[base] - 128.0
                     } else {
                         let blue = values[base]
                         let green = values[base + 1]
                         let red = values[base + 2]
-                        planes[0][cell] =
+                        luma_plane[cell] =
                             0.299 * red + 0.587 * green + 0.114 * blue - 128.0
-                        planes[1][cell] =
+                        cb_plane[cell] =
                             -0.168736 * red - 0.331264 * green + 0.5 * blue
-                        planes[2][cell] =
+                        cr_plane[cell] =
                             0.5 * red - 0.418688 * green - 0.081312 * blue
                     }
                 }
             }
             for component in 0..channels {
                 fdct_8x8(planes[component], coefficients, dct_scratch)
-                let quant = if component == 0 { luma_quant } else { chroma_quant }
-                let dc_codes = if component == 0 { dc_luma } else { dc_chroma }
-                let ac_codes = if component == 0 { ac_luma } else { ac_chroma }
+                let recip = if component == 0 { luma_recip } else { chroma_recip }
+                let dc_code = if component == 0 { dc_luma_code } else { dc_chroma_code }
+                let dc_len = if component == 0 { dc_luma_len } else { dc_chroma_len }
+                let ac_code = if component == 0 { ac_luma_code } else { ac_chroma_code }
+                let ac_len = if component == 0 { ac_luma_len } else { ac_chroma_len }
 
                 for index in 0..64 {
-                    let position = ZIGZAG[index]
-                    let scaled = coefficients[position] / float(quant[position])
+                    let scaled = coefficients[zigzag[index]] * recip[index]
                     #: Round away from zero. `floor(x - 0.5)` for a negative
                     #: sends a coefficient of -1e-17 to -1, which turned every
                     #: flat block into noise and every file into ten times the
@@ -1361,8 +1390,7 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
                 let difference = levels[0] - predictors[component]
                 predictors[component] = levels[0]
                 let dc_size = magnitude_of(difference)
-                let (dc_code, dc_length) = dc_codes[dc_size]
-                writer.write(dc_code, dc_length)
+                writer.write(dc_code[dc_size], dc_len[dc_size])
                 if dc_size > 0 {
                     let encoded = if difference < 0 {
                         difference + (1 << dc_size) - 1
@@ -1380,21 +1408,17 @@ pub fn encode(image: Mat, quality: int = 95) -> bytes {
                         continue
                     }
                     while run > 15 {
-                        let (code, length) = ac_codes[0xF0]
-                        writer.write(code, length)
+                        writer.write(ac_code[0xF0], ac_len[0xF0])
                         run -= 16
                     }
                     let size = magnitude_of(level)
-                    let (code, length) = ac_codes[run * 16 + size]
-                    writer.write(code, length)
+                    let symbol = run * 16 + size
+                    writer.write(ac_code[symbol], ac_len[symbol])
                     let encoded = if level < 0 { level + (1 << size) - 1 } else { level }
                     writer.write(encoded, size)
                     run = 0
                 }
-                if run > 0 {
-                    let (code, length) = ac_codes[0]
-                    writer.write(code, length)
-                }
+                if run > 0 { writer.write(ac_code[0], ac_len[0]) }
             }
         }
     }
