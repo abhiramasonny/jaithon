@@ -199,9 +199,9 @@ let LANCZOS_Q = [
     80916.6278952,
     36308.2951477,
     8687.24529705,
-    601.642200279,
-    21.2699512244,
-    -0.0011407480,
+    1168.92649479,
+    83.8676043424,
+    2.50662827511,
 ]
 
 #: `log(Gamma(x))` by Lanczos' series, which is the accurate one below 15.
@@ -854,8 +854,13 @@ pub class LineSegmentDetector {
                 if not kept { continue }
                 rect = tightened
             }
+            #: The paper's own implementation calls `rect_improve` for every
+            #: region whatever refinement was asked for, and only the density
+            #: cut above is conditional. Reserving it for `LSD_REFINE_ADV`
+            #: matched neither reference: OpenCV skips validation entirely
+            #: below `ADV`, and the paper improves at every setting.
             var log_nfa = 0.0
-            if self.refine >= LSD_REFINE_ADV {
+            if self.refine >= LSD_REFINE_STD {
                 let (improved_nfa, improved) = scan.improve(rect, self.log_eps)
                 log_nfa = improved_nfa
                 rect = improved
@@ -905,16 +910,19 @@ pub class LineSegmentDetector {
         size: Size,
         lines1: list[list[float]],
         lines2: list[list[float]],
-        image: Mat
+        image: Mat? = null
     ) -> tuple[int, Mat] {
-        let extent = if image.empty() { size } else { image.size() }
+        #: OpenCV's `image` defaults to no array, and a caller who only wants
+        #: the disagreement count should not have to build one to ask.
+        let onto = if image is null { Mat.zeros(0, 0, CV_8UC3) } else { image }
+        let extent = if onto.empty() { size } else { onto.size() }
         if extent.empty() {
             throw ValueError(f"compare_segments needs a size with area, got {extent}")
         }
-        var canvas = if image.empty() {
+        var canvas = if onto.empty() {
             Mat.zeros(extent.height, extent.width, CV_8UC3)
         } else {
-            image
+            onto
         }
         if canvas.channels() != 3 {
             throw ValueError("compare_segments draws into a three-channel Mat")
