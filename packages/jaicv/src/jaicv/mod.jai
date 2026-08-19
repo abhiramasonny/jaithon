@@ -90,6 +90,13 @@ from .imgproc.morph import MORPH_OPEN, MORPH_RECT, MORPH_TOPHAT
 
 from .imgproc.edges import canny
 
+from .imgproc.drawing import arrowed_line, circle, clip_line, draw_marker, ellipse
+from .imgproc.drawing import ellipse_2_poly, ellipse_rotated, fill_convex_poly, fill_poly
+from .imgproc.drawing import line, line_points, polylines, rectangle, rectangle_rect
+from .imgproc.drawing import CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT
+from .imgproc.drawing import MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR
+from .imgproc.drawing import MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -167,6 +174,13 @@ export { MORPH_ELLIPSE, MORPH_ERODE, MORPH_GRADIENT, MORPH_HITMISS }
 export { MORPH_OPEN, MORPH_RECT, MORPH_TOPHAT }
 
 export { canny }
+
+export { arrowed_line, circle, clip_line, draw_marker, ellipse, ellipse_2_poly }
+export { ellipse_rotated, fill_convex_poly, fill_poly, line, line_points, polylines }
+export { rectangle, rectangle_rect }
+export { CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT }
+export { MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR }
+export { MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
