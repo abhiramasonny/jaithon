@@ -148,6 +148,14 @@ and dependency manifest. Jaithon finds workspace packages from a checkout and
 from an installed `share/jaithon/packages` directory.
 
 
+`jaicv` is computer vision with OpenCV's API, on the GPU: `Mat` on a Metal
+buffer, imgproc, codecs, camera capture and AVI writing, windows, contours and
+shape analysis, features, optical flow and background subtraction, calibration,
+denoising, and classical machine learning. Around seven hundred recorded cases
+are replayed against the real OpenCV to keep it honest; see
+[`packages/jaicv/README.md`](packages/jaicv/README.md) for what matches exactly
+and what does not.
+
 `jaiplot` is a library for Matplotlib-style figures and axes with file and window
 backends.
 

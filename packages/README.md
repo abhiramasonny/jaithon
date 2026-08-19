@@ -24,4 +24,5 @@ declare exact versions or caret ranges in `dependencies`. Run
 members, duplicate names, unresolved versions, and dependency cycles.
 
 `jaitensor` is GPU-first training on `std.gpu`. `jaiplot` is Matplotlib-style
-figures. See the root [`README.md`](../README.md) for what each one covers.
+figures. `jaicv` is computer vision with OpenCV's API. See the root
+[`README.md`](../README.md) for what each one covers.
