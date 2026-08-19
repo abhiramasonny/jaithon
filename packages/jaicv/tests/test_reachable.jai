@@ -73,6 +73,8 @@ from jaicv.features2d.detect import BFMatcher, ORB, SimpleBlobDetector
 from jaicv.features2d.detect import SimpleBlobDetectorParams, draw_keypoints, draw_matches
 from jaicv.objdetect.cascade import group_rectangles
 from jaicv.objdetect.hog import HOGDescriptor
+from jaicv.objdetect.galois import gf_div, gf_exp, gf_inv, gf_mul, rs_correct
+from jaicv.objdetect.qr import function_map, mask_bit, decode_format, decode_version
 from jaicv.objdetect.xml import parse_xml
 from jaicv.calib3d.transform import find_homography, get_optimal_new_camera_matrix
 from jaicv.calib3d.transform import init_undistort_rectify_map, refine_homography
@@ -597,4 +599,94 @@ fn test_camera_enumeration_answers_without_a_camera() -> void {
     assert_true(device_name(count + 5) is null)
     let state = permission()
     assert_true(state >= PERMISSION_UNAVAILABLE and state <= PERMISSION_GRANTED)
+}
+
+#: The field the QR reader corrects in, checked against its own definition:
+#: every non-zero element times its inverse is one, and the generator's powers
+#: cycle with period 255 and hit every non-zero element exactly once.
+fn test_the_galois_field_is_a_field() -> void {
+    var seen: list[bool] = []
+    for _index in 0..256 { seen.push(false) }
+    for power in 0..255 {
+        let value = gf_exp(power)
+        assert_true(value != 0)
+        assert_true(not seen[value])
+        seen[value] = true
+        assert_eq(gf_mul(value, gf_inv(value)), 1)
+        assert_eq(gf_div(value, value), 1)
+    }
+    assert_eq(gf_exp(255), gf_exp(0))
+    assert_eq(gf_mul(0, 123), 0)
+    assert_eq(gf_mul(1, 123), 123)
+}
+
+#: A block with parity computed by the same field, corrupted up to the limit
+#: and past it. Recovering is the easy half; refusing is the half that matters,
+#: because a reader that hands back a plausible wrong string is worse than one
+#: that hands back nothing.
+fn test_reed_solomon_corrects_up_to_its_limit_and_refuses_past_it() -> void {
+    let ec = 10
+    var data: list[int] = []
+    for index in 0..9 { data.push(index + 1) }
+    #: Parity for [1..9] with ten check bytes, computed with the standard
+    #: generator; the decoder is what is under test, so this is a constant
+    #: rather than something this file also derives.
+    let parity = [113, 25, 236, 154, 55, 111, 174, 237, 174, 170]
+    var clean: list[int] = []
+    for value in data { clean.push(value) }
+    for value in parity { clean.push(value) }
+
+    var untouched = [value for value in clean]
+    assert_true(rs_correct(untouched, ec))
+    assert_eq(untouched, clean)
+
+    for errors in 1..6 {
+        var block = [value for value in clean]
+        for index in 0..errors { block[index * 3] = block[index * 3] ^ (index + 1) * 37 % 251 + 1 }
+        assert_true(rs_correct(block, ec))
+        assert_eq(block, clean)
+    }
+
+    var beyond = [value for value in clean]
+    for index in 0..6 { beyond[index * 3] = beyond[index * 3] ^ (index + 1) * 37 % 251 + 1 }
+    assert_true(not rs_correct(beyond, ec))
+}
+
+#: The two BCH words a symbol carries, and the mask table, checked against the
+#: values the standard prints rather than against this file's own encoder.
+fn test_the_qr_information_words_decode() -> void {
+    #: Version 7's version word, and version 40's, from the standard's table.
+    assert_eq(decode_version(0x07C94), 7)
+    assert_eq(decode_version(0x28C69), 40)
+    #: One bit flipped is inside what the code corrects; five is not.
+    assert_eq(decode_version(0x07C94 ^ 0x40), 7)
+    assert_true(decode_version(0x07C94 ^ 0x3F0F) is null)
+
+    #: The all-zero five-bit format word is level M with mask 0, so what the
+    #: symbol actually stores is the standard's masking constant itself. M
+    #: rather than L because the two error-correction bits are numbered by
+    #: capacity and encoded by something else, which is the whole reason the
+    #: reader carries a table between them.
+    let format = decode_format(0x5412)
+    if format is null { throw AssertionError("the standard's own format word decodes") }
+    assert_eq(format[0], 1)
+    assert_eq(format[1], 0)
+
+    #: The mask expressions, at a handful of places where all eight differ.
+    assert_true(mask_bit(0, 0, 0))
+    assert_true(mask_bit(1, 2, 5))
+    assert_true(not mask_bit(1, 3, 5))
+    assert_true(mask_bit(2, 4, 6))
+    assert_true(not mask_bit(2, 4, 7))
+    assert_true(mask_bit(3, 2, 4))
+    assert_true(mask_bit(4, 0, 0))
+    assert_true(mask_bit(5, 0, 3))
+    assert_true(mask_bit(6, 1, 1))
+    assert_true(mask_bit(7, 0, 0))
+
+    #: The map is memoised, so the second ask must be the same object and the
+    #: caller must not be able to change what the next one sees.
+    assert_true(function_map(5) is function_map(5))
+    assert_true(function_map(5)[0][0])
+    assert_true(not function_map(5)[9][9])
 }

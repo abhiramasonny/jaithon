@@ -59,6 +59,11 @@ down next to the tolerance. In short:
 - **Within a fit**: calibration and pose, which agree on the answer to a
   thousandth of a pixel of reprojection error but split it slightly differently
   between the principal point and the last distortion term.
+- **Better than OpenCV's**: `QRCodeDetector` reads every symbol OpenCV 5.0.0's
+  encoder produces from version 1 to 40 — including the ones OpenCV's own
+  detector cannot — and OpenCV reads what this writes. The one disagreement is
+  OpenCV's: its encoder puts version 21's last alignment centre at module 92
+  where the standard says 94.
 - **Documented differences**: a stroke wider than one pixel and a filled
   ellipse disagree on a boundary pixel here and there; `LINE_AA` computes
   coverage from distance rather than from OpenCV's slope tables; ORB and BRIEF
@@ -77,7 +82,7 @@ down next to the tolerance. In short:
 | `videoio` | camera capture through AVFoundation, and AVI reading and writing, MJPEG or uncompressed |
 | `highgui` | `imshow`, `wait_key`, windows, mouse callbacks, trackbars |
 | `features2d` | FAST, ORB, BRIEF, blob detection, brute-force matching, keypoint and match drawing |
-| `objdetect` | cascade classification, reading OpenCV's own trained XML; histograms of oriented gradients |
+| `objdetect` | cascade classification, reading OpenCV's own trained XML; histograms of oriented gradients; QR codes, read and written, every version and correction level |
 | `calib3d` | Rodrigues, homography, affine estimation, projection, distortion, triangulation, `solve_pnp`, `calibrate_camera`, chessboard detection |
 | `video` | Lucas-Kanade and Farneback optical flow, MOG2 and KNN background subtraction, mean shift, CamShift, Kalman |
 | `photo` | non-local means denoising, inpainting, edge-preserving smoothing |
@@ -89,9 +94,10 @@ down next to the tolerance. In short:
 Named so that nobody has to find out by trying:
 
 - **Codecs**: TIFF, WebP, JPEG 2000, EXR, GIF. PNG interlacing.
-- **objdetect**: QR and barcode reading, the DNN face detector, and the
+- **objdetect**: barcodes, micro QR, the DNN face detector, and the
   coefficients of OpenCV's pre-trained people detector — `HOGDescriptor`
-  computes the descriptor and takes a detector, but does not ship one.
+  computes the descriptor and takes a detector, but does not ship one. A kanji
+  QR segment comes back as its Shift-JIS bytes rather than as text.
 - **calib3d**: fisheye, stereo rectification and matching, `find_essential_mat`
   and pose recovery, circle-grid patterns.
 - **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;

@@ -159,6 +159,9 @@ from .objdetect.hog import HOGDescriptor, HOG_SIGNED, HOG_UNSIGNED
 from .objdetect.cascade import group_rectangles, CascadeClassifier
 from .objdetect.cascade import CASCADE_DO_CANNY_PRUNING, CASCADE_DO_ROUGH_SEARCH
 from .objdetect.cascade import CASCADE_FIND_BIGGEST_OBJECT, CASCADE_SCALE_IMAGE
+from .objdetect.galois import gf_div, gf_exp, gf_inv, gf_mul, rs_correct
+from .objdetect.qr import alignment_centres, decode_grid, encode_grid, qr_encode
+from .objdetect.qr import smallest_version, version_size, QRCode, QRCodeDetector
 from .objdetect.xml import parse_xml, Node
 
 from .calib3d.transform import estimate_affine_2d, estimate_affine_partial_2d
@@ -357,6 +360,9 @@ export { HOGDescriptor, HOG_SIGNED, HOG_UNSIGNED }
 export { CASCADE_DO_CANNY_PRUNING, CASCADE_DO_ROUGH_SEARCH }
 export { CASCADE_FIND_BIGGEST_OBJECT, CASCADE_SCALE_IMAGE }
 export { parse_xml, Node }
+export { gf_div, gf_exp, gf_inv, gf_mul, rs_correct }
+export { alignment_centres, decode_grid, encode_grid, qr_encode }
+export { smallest_version, version_size, QRCode, QRCodeDetector }
 
 export { estimate_affine_2d, estimate_affine_partial_2d, find_homography }
 export { get_optimal_new_camera_matrix, init_undistort_rectify_map, project_points }
