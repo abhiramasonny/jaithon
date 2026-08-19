@@ -74,13 +74,22 @@ down next to the tolerance. In short:
   descriptors compare against each other but not against OpenCV's; Farneback
   flow follows the paper rather than OpenCV's tuning; the colour maps written
   as formulas match, the ones OpenCV ships as tables do not.
+- **Same size, different letters**: `put_text` draws the public-domain Hershey
+  fonts. OpenCV draws re-derived tables of its own — measured against every
+  font in the Hershey distribution, no face of OpenCV's matches on glyph
+  widths, missing by about a unit and a half a glyph with no exact matches at
+  all — so the letterforms here are not OpenCV's and cannot be. What does
+  match is the part layout code depends on: a capital is the same number of
+  pixels tall at the same `font_scale` for every face, so text occupies the
+  same band of the image. Strings come out roughly a tenth wider, because
+  Hershey's own glyphs are.
 
 ## What is here
 
 | Area | What it covers |
 | --- | --- |
 | `core` | `Mat` with views and ROIs, arithmetic, statistics, `merge`/`split`, linear algebra including SVD, DFT and DCT, k-means, PCA, sorting, random fills |
-| `imgproc` | colour conversion, resize and warping, filtering, thresholding, morphology, Canny, drawing, contours, shape analysis, segmentation, histograms, template matching, corners, Hough, colour maps, phase correlation, mean-shift filtering |
+| `imgproc` | colour conversion, resize and warping, filtering, thresholding, morphology, Canny, drawing, contours, shape analysis, segmentation, histograms, template matching, corners, Hough, colour maps, phase correlation, mean-shift filtering; vector text in the Hershey fonts |
 | `imgcodecs` | PNG, BMP, PNM, and JPEG, reading and writing, with `imread`/`imwrite`/`imencode`/`imdecode` |
 | `videoio` | camera capture through AVFoundation, and AVI reading and writing, MJPEG or uncompressed |
 | `highgui` | `imshow`, `wait_key`, windows, mouse callbacks, trackbars |

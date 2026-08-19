@@ -97,6 +97,12 @@ from .imgproc.drawing import CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT
 from .imgproc.drawing import MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR
 from .imgproc.drawing import MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP
 
+from .imgproc.text import get_text_size, put_text
+from .imgproc.text import FONT_HERSHEY_COMPLEX, FONT_HERSHEY_COMPLEX_SMALL
+from .imgproc.text import FONT_HERSHEY_DUPLEX, FONT_HERSHEY_PLAIN, FONT_HERSHEY_SIMPLEX
+from .imgproc.text import FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SCRIPT_SIMPLEX
+from .imgproc.text import FONT_HERSHEY_TRIPLEX, FONT_ITALIC
+
 from .imgproc.contours import draw_contours, find_contours, Hierarchy
 from .imgproc.contours import CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE
 from .imgproc.contours import RETR_CCOMP, RETR_EXTERNAL, RETR_LIST, RETR_TREE
@@ -308,6 +314,10 @@ export { rectangle, rectangle_rect }
 export { CAP_END, CAP_START, MAX_THICKNESS, XY_ONE, XY_SHIFT }
 export { MARKER_CROSS, MARKER_DIAMOND, MARKER_SQUARE, MARKER_STAR }
 export { MARKER_TILTED_CROSS, MARKER_TRIANGLE_DOWN, MARKER_TRIANGLE_UP }
+export { get_text_size, put_text }
+export { FONT_HERSHEY_COMPLEX, FONT_HERSHEY_COMPLEX_SMALL, FONT_HERSHEY_DUPLEX }
+export { FONT_HERSHEY_PLAIN, FONT_HERSHEY_SIMPLEX, FONT_HERSHEY_TRIPLEX }
+export { FONT_HERSHEY_SCRIPT_COMPLEX, FONT_HERSHEY_SCRIPT_SIMPLEX, FONT_ITALIC }
 
 export { draw_contours, find_contours, Hierarchy }
 export { CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE }
