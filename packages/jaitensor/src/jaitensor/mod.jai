@@ -18,19 +18,19 @@
 #: ```
 import std.gpu as gpu
 from .data import Dataset, DataLoader
-from .layers import Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Dropout, Embedding, Flatten, GroupNorm2d, Layer, LayerNorm, MaxPool2d, MultiHeadAttention
+from .layers import Activate, Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Dropout, Embedding, Flatten, GroupNorm2d, Layer, LayerNorm, MaxPool2d, MultiHeadAttention
 from .losses import Loss, BinaryCrossentropy, MeanSquaredError, SparseCategoricalCrossentropy
 from .model import History, Metrics, Sequential
 from .plan import ExecutionPlan
 from .ops import add, add_correct_into, add_scaled_into, abs as abs_op, argmax, avg_pool2d, batch_norm, cat, clamp, conv2d, divide, dropout, exp, gather_rows, gelu, layer_norm, leaky_relu, log, matmul, maximum, mean, minimum, mse, multiply, neg, one_hot
 from .ops import relu, reshape, rsqrt, scale, scaled_dot_product_attention, sigmoid, silu, slice_flat, softmax, sqrt, square, squeeze, stack, subtract, sum as reduce_sum, tanh, transpose, unsqueeze, where, max_pool2d, pad2d, permute, pow, repeat, nchw, nhwc, binary_cross_entropy, binary_cross_entropy_with_logits, eye, flip, upsample_nearest2d, split_heads, merge_heads, multi_head_attention, group_norm, tril
-from .optimizers import Adam, Optimizer, SGD
+from .optimizers import Adam, Optimizer, SGD, zero_grad
 from .plots import save_history_plot
 from .tensor import Tensor, constant, fill, ones, zeros
 
 export { Tensor, constant, zeros, ones, fill, Dataset, DataLoader }
-export { Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Dropout, Embedding, Flatten, GroupNorm2d, Layer, LayerNorm, MaxPool2d, MultiHeadAttention }
-export { Optimizer, SGD, Adam, Loss, BinaryCrossentropy, MeanSquaredError, SparseCategoricalCrossentropy }
+export { Activate, Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Dropout, Embedding, Flatten, GroupNorm2d, Layer, LayerNorm, MaxPool2d, MultiHeadAttention }
+export { Optimizer, SGD, Adam, zero_grad, Loss, BinaryCrossentropy, MeanSquaredError, SparseCategoricalCrossentropy }
 export { History, Metrics, Sequential, ExecutionPlan }
 export { save_history_plot }
 export { add, subtract, multiply, divide, scale, reshape, matmul, transpose, conv2d, cat }

@@ -1564,6 +1564,141 @@ fn test_average_pooling_reports_its_pooled_shape_too() -> void {
     assert_true(history.loss.len() == 1)
 }
 
+fn test_conv2d_on_a_batch_slice_reads_that_slice() -> void {
+    if not jt.is_available() { return }
+    #: An `MPSNDArray` pads its innermost dimension to a sixteen-byte row, so a
+    #: windowed feed misreads a packed buffer whenever that dimension is not a
+    #: multiple of four floats. Three-channel NHWC images are exactly that
+    #: shape, and every batch after the first convolved the wrong pixels — a
+    #: model that trained on batch zero forever and looked merely untrainable.
+    #: Two channels here so the row stays unaligned; the copy is the reference.
+    #: Every operand has to clear the 512-byte floor the native path declines
+    #: below, or the fallback runs and the window is never exercised.
+    let batch = 16
+    let side = 8
+    let channels = 2
+    let stride = side * side * channels
+    var values: list[float] = []
+    for index in 0..(3 * batch * stride) {
+        values.push(float((index * 7) % 13) * 0.05 - 0.3)
+    }
+    let all = jt.Tensor([3 * batch, side, side, channels], values)
+    defer { all.free() }
+    var weight_values: list[float] = []
+    for index in 0..(3 * 3 * channels * 8) {
+        weight_values.push(float((index * 5) % 9) * 0.05 - 0.2)
+    }
+    let weights = jt.Tensor([3, 3, channels, 8], weight_values)
+    defer { weights.free() }
+    for slice in 1..3 {
+        let window = all.view(slice * batch * stride, [batch, side, side, channels])
+        let copied = jt.Tensor([batch, side, side, channels], window.download())
+        let from_window = jt.conv2d(window, weights, padding: 1).download()
+        let from_copy = jt.conv2d(copied, weights, padding: 1).download()
+        for index in 0..from_copy.len() {
+            assert_near(from_window[index], from_copy[index], 1e-4)
+        }
+        window.free()
+        copied.free()
+    }
+}
+
+fn test_a_convolution_actually_trains() -> void {
+    if not jt.is_available() { return }
+    #: Conv2d recorded no gradient at all until its backward pass existed, and
+    #: `Flatten` handed the head a view with no creator, so the graph stopped
+    #: at the first dense layer. Both are invisible from the outside: the model
+    #: runs, the loss moves a little as the head fits, and the filters never
+    #: change. This asserts the filters move.
+    let batch = 16
+    var pixels: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..batch {
+        let kind = sample % 2
+        for row in 0..8 {
+            for column in 0..8 {
+                pixels.push(if kind == 0 { float(row) * 0.1 } else { float(column) * 0.1 })
+            }
+        }
+        labels.push(float(kind))
+    }
+    let data = jt.Dataset(jt.Tensor([batch, 8, 8, 1], pixels), jt.Tensor([batch], labels))
+    defer { data.free() }
+    let conv = jt.Conv2d(4, 3, padding: 1, in_channels: 1, activation: jt.Activation.Relu)
+    let model = jt.Sequential([
+        conv,
+        jt.MaxPool2d(2),
+        jt.Flatten(),
+        jt.Dense(2, activation: jt.Activation.Softmax),
+    ])
+    defer { model.free() }
+    model.compile(jt.SGD(learning_rate: 0.2))
+    model.fit(data, epochs: 1, batch_size: 8, verbose: false, plot_path: null)
+    let before = conv.parameters()[0].download()
+    let history = model.fit(data, epochs: 6, batch_size: 8, verbose: false, plot_path: null)
+    let after = conv.parameters()[0].download()
+    var moved = 0.0
+    for index in 0..before.len() {
+        let step = if after[index] > before[index] {
+            after[index] - before[index]
+        } else {
+            before[index] - after[index]
+        }
+        if step > moved { moved = step }
+    }
+    assert_true(moved > 1e-4)
+    assert_true(history.loss[5] < history.loss[0])
+}
+
+fn conv_drift_after(samples: int, batch_size: int) -> float {
+    var pixels: list[float] = []
+    var labels: list[float] = []
+    for _sample in 0..samples {
+        for index in 0..64 { pixels.push(float((index * 7) % 11) * 0.1 - 0.5) }
+        labels.push(0.0)
+    }
+    let data = jt.Dataset(jt.Tensor([samples, 8, 8, 1], pixels), jt.Tensor([samples], labels))
+    defer { data.free() }
+    let conv = jt.Conv2d(4, 3, padding: 1, in_channels: 1, activation: jt.Activation.Relu)
+    let model = jt.Sequential([
+        conv,
+        jt.Flatten(),
+        jt.Dense(2, activation: jt.Activation.Softmax),
+    ])
+    defer { model.free() }
+    #: Small enough that the parameters barely move, so every batch sees the
+    #: same gradient and the totals are comparable.
+    model.compile(jt.SGD(learning_rate: 1e-6))
+    #: One whole-batch pass first, so the layers are built and both variants
+    #: start from the same weights.
+    model.fit(data, epochs: 1, batch_size: samples, verbose: false, plot_path: null)
+    let before = conv.parameters()[0].download()
+    model.fit(data, epochs: 1, batch_size: batch_size, verbose: false, plot_path: null)
+    let after = conv.parameters()[0].download()
+    var total = 0.0
+    for index in 0..before.len() {
+        let step = after[index] - before[index]
+        total += step * step
+    }
+    return math.sqrt(total)
+}
+
+fn test_gradients_do_not_carry_between_batches() -> void {
+    if not jt.is_available() { return }
+    #: `Optimizer.step` reads `.grad` and leaves it alone; the training loop is
+    #: what resets it. Without that reset, an op whose backward allocates a
+    #: fresh gradient summed its batches, so four identical batches moved the
+    #: filters by one, two, three and four gradients instead of one each —
+    #: ten steps of drift against four. The two dense ops that write their
+    #: gradient in place were immune, so every existing model hid it.
+    let one_batch = conv_drift_after(4, 4)
+    let four_batches = conv_drift_after(4, 1)
+    assert_true(one_batch > 0.0)
+    let ratio = four_batches / one_batch
+    assert_true(ratio > 3.5)
+    assert_true(ratio < 4.5)
+}
+
 fn test_device_count_is_non_negative() -> void {
     if not jt.is_available() { return }
     assert_true(jt.device_count() >= 1)

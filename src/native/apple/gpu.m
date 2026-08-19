@@ -1127,6 +1127,23 @@ bool jaiGpuSynchronize(void) {
 
 static NSMutableDictionary<NSString *, id> *gMpsGraphs;
 
+/* An MPSNDArray pads its innermost dimension out to a 16-byte row, so a packed
+ * buffer read through one is misread whenever that dimension is not a multiple
+ * of four floats. The whole-buffer initialiser has no such padding, which is
+ * why offset zero is always safe and only a windowed feed can go wrong.
+ *
+ * NHWC activations with three channels are exactly that shape: twelve bytes a
+ * row. Every batch after the first read the wrong pixels, silently -- the first
+ * batch of an epoch trains on the right data and no later one does, so a
+ * convolution over RGB images looked like a model that would not learn rather
+ * than like a bug. Declining here sends the caller to its own kernels, which
+ * address the buffer directly. */
+static bool ndarrayWindowIsPacked(NSArray<NSNumber *> *shape) {
+    if (shape.count == 0) return false;
+    NSUInteger innermost = shape.lastObject.unsignedIntegerValue;
+    return (innermost * sizeof(float)) % 16 == 0;
+}
+
 static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset, NSArray<NSNumber *> *shape) {
     NSUInteger count = 1;
     for (NSNumber *dim in shape) count *= dim.unsignedIntegerValue;
@@ -1138,6 +1155,7 @@ static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset, NSArray<NSN
                                                        shape:shape
                                                     dataType:MPSDataTypeFloat32];
     }
+    if (!ndarrayWindowIsPacked(shape)) return nil;
     MPSNDArrayDescriptor *desc =
         [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32 shape:shape];
     if (desc == nil) return nil;
@@ -1151,6 +1169,7 @@ static MPSGraphTensorData *graphDataDesc(JaiGpuBuffer *b, size_t offset, size_t 
                                          NSArray<NSNumber *> *shape) {
     if (offset == 0) return graphData(b, 0, shape);
     if (desc == nil || b == NULL || b->buffer == NULL) return nil;
+    if (!ndarrayWindowIsPacked(shape)) return nil;
     if (offset + bytes > b->bytes) return nil;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->buffer;
     MPSNDArray *array = [[MPSNDArray alloc] initWithBuffer:buf offset:offset descriptor:desc];

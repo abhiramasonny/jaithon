@@ -477,6 +477,7 @@ pub class Sequential {
             let prediction = self._forward(batch_features, training: training)
             let loss = loss_fn.forward(prediction, batch_labels, total_loss, count)
             let intermediates = if training {
+                self._zero_grad()
                 let graph = loss.backward()
                 optimizer.step(self._parameters())
                 graph

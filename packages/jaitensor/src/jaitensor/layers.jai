@@ -4,6 +4,7 @@ from std.gpu import Buffer
 from std.random import Random
 from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, dense_static_forward
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
+from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
 from .tensor import Tensor
 
@@ -274,7 +275,7 @@ pub class Flatten: Layer {
 
     pub fn forward(self, x: Tensor) -> Tensor {
         let batch = x.shape[0]
-        return Tensor([batch, x.size // batch], storage: x.buffer().view(0, x.size))
+        return reshape(x, [batch, x.size // batch])
     }
 
     pub fn parameters(self) -> list[Tensor] { return [] }
@@ -286,12 +287,70 @@ pub class Flatten: Layer {
     fn __str__(self) -> str { return f"Flatten({self.width})" }
 }
 
+#: Apply one of the `Activation` shapes to a tensor.
+pub fn activate(x: Tensor, kind: Activation) -> Tensor {
+    return match kind {
+        Activation.Linear => x,
+        Activation.Relu => relu(x),
+        Activation.Sigmoid => sigmoid(x),
+        Activation.Tanh => tanh(x),
+        Activation.Softmax => softmax(x),
+        Activation.Gelu => gelu(x),
+        Activation.Silu => silu(x),
+        Activation.LeakyRelu => leaky_relu(x),
+    }
+}
+
+#: A standalone activation, for the places a layer has no `activation` of its
+#: own — after a pool, a norm, or a residual add.
+pub class Activate: Layer {
+    #: Function this layer applies.
+    pub let activation: Activation
+    var last_shape: list[int]
+    var width: int
+
+    pub fn init(self, activation: Activation) {
+        self.activation = activation
+        self.last_shape = []
+        self.width = 0
+    }
+
+    pub fn build(self, input_units: int, rng: Random) -> void {
+        let _ = rng
+        self.width = input_units
+    }
+
+    pub fn build_from_shape(self, shape: list[int], rng: Random) -> void {
+        let _ = rng
+        self.last_shape = [d for d in shape]
+        var n = 1
+        for dimension in shape { n *= dimension }
+        self.width = n
+    }
+
+    pub fn forward(self, x: Tensor) -> Tensor { return activate(x, self.activation) }
+
+    pub fn parameters(self) -> list[Tensor] { return [] }
+
+    pub fn output_width(self) -> int { return self.width }
+
+    pub fn output_shape(self) -> list[int] { return [d for d in self.last_shape] }
+
+    pub fn wants_softmax_output(self) -> bool { return self.activation == Activation.Softmax }
+
+    pub fn free(self) -> void { }
+
+    fn __str__(self) -> str { return f"Activate({self.activation})" }
+}
+
 #: 2D convolution over NHWC tensors.
 pub class Conv2d: Layer {
     pub let out_channels: int
     pub let kernel_size: int
     pub let stride: int
     pub let padding: int
+    #: Function applied after the convolution.
+    pub let activation: Activation
     pub var in_channels: int
     pub var in_height: int
     pub var in_width: int
@@ -304,7 +363,8 @@ pub class Conv2d: Layer {
         kernel_size: int,
         stride: int = 1,
         padding: int = 0,
-        in_channels: int = 0
+        in_channels: int = 0,
+        activation: Activation = Activation.Linear
     ) {
         if out_channels <= 0 or kernel_size <= 0 {
             throw ValueError("Conv2d out_channels and kernel_size must be positive")
@@ -315,6 +375,7 @@ pub class Conv2d: Layer {
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.activation = activation
         self.in_channels = in_channels
         self.in_height = 0
         self.in_width = 0
@@ -355,7 +416,17 @@ pub class Conv2d: Layer {
             throw ValueError("Conv2d in_channels must be set before build")
         }
         let fan = self.kernel_size * self.kernel_size * self.in_channels
-        let limit = math.sqrt(6.0 / float(fan + self.out_channels))
+        #: The same scheme `Dense` uses: He for a ReLU layer, unit-variance
+        #: otherwise. The old form divided by `fan + out_channels`, which mixes
+        #: a per-position fan-in with a channel count — the fan-out of a
+        #: convolution is `kernel * kernel * out_channels`, so the limit came
+        #: out too large and a stack of convolutions started well past the
+        #: stable region.
+        let limit = math.sqrt(if self.activation == Activation.Relu {
+            6.0 / float(fan)
+        } else {
+            3.0 / float(fan)
+        })
         self.weights_value = Tensor(
             [self.kernel_size, self.kernel_size, self.in_channels, self.out_channels],
             requires_grad: true
@@ -374,12 +445,13 @@ pub class Conv2d: Layer {
             if self.in_height <= 0 or self.in_width <= 0 {
                 throw ValueError("Conv2d needs a known spatial size for flat inputs")
             }
-            input = Tensor(
-                [x.shape[0], self.in_height, self.in_width, self.in_channels],
-                storage: x.buffer()
+            input = reshape(
+                x,
+                [x.shape[0], self.in_height, self.in_width, self.in_channels]
             )
         }
-        return conv2d(input, weights, bias: bias, stride: self.stride, padding: self.padding)
+        let output = conv2d(input, weights, bias: bias, stride: self.stride, padding: self.padding)
+        return activate(output, self.activation)
     }
 
     pub fn parameters(self) -> list[Tensor] {
@@ -413,6 +485,8 @@ pub class Conv2d: Layer {
         self.weights_value = null
         self.bias_value = null
     }
+
+    pub fn wants_softmax_output(self) -> bool { return self.activation == Activation.Softmax }
 
     fn __str__(self) -> str {
         return f"Conv2d({self.in_channels}->{self.out_channels}, k={self.kernel_size})"

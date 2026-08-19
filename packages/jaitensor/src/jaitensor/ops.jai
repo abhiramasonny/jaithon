@@ -241,6 +241,445 @@ kernel void copy_offset(device const float* source [[buffer(0)]],
     if (id < count) output[id] = source[source_offset + id];
 }
 
+kernel void col2im_nhwc(device const float* col [[buffer(0)]],
+                        device float* grad [[buffer(1)]],
+                        constant uint& N [[buffer(2)]],
+                        constant uint& H [[buffer(3)]],
+                        constant uint& W [[buffer(4)]],
+                        constant uint& C [[buffer(5)]],
+                        constant uint& KH [[buffer(6)]],
+                        constant uint& KW [[buffer(7)]],
+                        constant uint& SH [[buffer(8)]],
+                        constant uint& SW [[buffer(9)]],
+                        constant uint& PH [[buffer(10)]],
+                        constant uint& PW [[buffer(11)]],
+                        uint id [[thread_position_in_grid]]) {
+    uint count = N * H * W * C;
+    if (id >= count) return;
+    uint outH = (H + 2 * PH - KH) / SH + 1;
+    uint outW = (W + 2 * PW - KW) / SW + 1;
+    uint K = KH * KW * C;
+    uint c = id % C;
+    uint iw = (id / C) % W;
+    uint ih = (id / (C * W)) % H;
+    uint n = id / (C * W * H);
+    float total = 0.0f;
+    for (uint kh = 0; kh < KH; ++kh) {
+        int top = int(ih) + int(PH) - int(kh);
+        if (top < 0 || uint(top) % SH != 0) continue;
+        uint oh = uint(top) / SH;
+        if (oh >= outH) continue;
+        for (uint kw = 0; kw < KW; ++kw) {
+            int left = int(iw) + int(PW) - int(kw);
+            if (left < 0 || uint(left) % SW != 0) continue;
+            uint ow = uint(left) / SW;
+            if (ow >= outW) continue;
+            uint row = (n * outH + oh) * outW + ow;
+            total += col[row * K + (kh * KW + kw) * C + c];
+        }
+    }
+    grad[id] = total;
+}
+
+kernel void max_pool2d_backward_nhwc(device const float* input [[buffer(0)]],
+                                     device const float* upstream [[buffer(1)]],
+                                     device float* grad [[buffer(2)]],
+                                     constant uint& N [[buffer(3)]],
+                                     constant uint& H [[buffer(4)]],
+                                     constant uint& W [[buffer(5)]],
+                                     constant uint& C [[buffer(6)]],
+                                     constant uint& KH [[buffer(7)]],
+                                     constant uint& KW [[buffer(8)]],
+                                     constant uint& SH [[buffer(9)]],
+                                     constant uint& SW [[buffer(10)]],
+                                     constant uint& PH [[buffer(11)]],
+                                     constant uint& PW [[buffer(12)]],
+                                     constant uint& OH [[buffer(13)]],
+                                     constant uint& OW [[buffer(14)]],
+                                     uint id [[thread_position_in_grid]]) {
+    uint count = N * H * W * C;
+    if (id >= count) return;
+    uint c = id % C;
+    uint iw = (id / C) % W;
+    uint ih = (id / (C * W)) % H;
+    uint n = id / (C * W * H);
+    float here = input[id];
+    float total = 0.0f;
+    for (uint kh = 0; kh < KH; ++kh) {
+        int top = int(ih) + int(PH) - int(kh);
+        if (top < 0 || uint(top) % SH != 0) continue;
+        uint oh = uint(top) / SH;
+        if (oh >= OH) continue;
+        for (uint kw = 0; kw < KW; ++kw) {
+            int left = int(iw) + int(PW) - int(kw);
+            if (left < 0 || uint(left) % SW != 0) continue;
+            uint ow = uint(left) / SW;
+            if (ow >= OW) continue;
+            float peak = -3.402823e+38f;
+            uint best = 0xffffffffu;
+            for (uint wh = 0; wh < KH; ++wh) {
+                for (uint ww = 0; ww < KW; ++ww) {
+                    int sh = int(oh * SH) - int(PH) + int(wh);
+                    int sw = int(ow * SW) - int(PW) + int(ww);
+                    if (sh < 0 || sw < 0 || sh >= int(H) || sw >= int(W)) continue;
+                    uint slot = ((n * H + uint(sh)) * W + uint(sw)) * C + c;
+                    float v = input[slot];
+                    if (v > peak) { peak = v; best = slot; }
+                }
+            }
+            if (best == id && peak == here)
+                total += upstream[((n * OH + oh) * OW + ow) * C + c];
+        }
+    }
+    grad[id] = total;
+}
+
+kernel void avg_pool2d_backward_nhwc(device const float* upstream [[buffer(0)]],
+                                     device float* grad [[buffer(1)]],
+                                     constant uint& N [[buffer(2)]],
+                                     constant uint& H [[buffer(3)]],
+                                     constant uint& W [[buffer(4)]],
+                                     constant uint& C [[buffer(5)]],
+                                     constant uint& KH [[buffer(6)]],
+                                     constant uint& KW [[buffer(7)]],
+                                     constant uint& SH [[buffer(8)]],
+                                     constant uint& SW [[buffer(9)]],
+                                     constant uint& PH [[buffer(10)]],
+                                     constant uint& PW [[buffer(11)]],
+                                     constant uint& OH [[buffer(12)]],
+                                     constant uint& OW [[buffer(13)]],
+                                     uint id [[thread_position_in_grid]]) {
+    uint count = N * H * W * C;
+    if (id >= count) return;
+    uint c = id % C;
+    uint iw = (id / C) % W;
+    uint ih = (id / (C * W)) % H;
+    uint n = id / (C * W * H);
+    float total = 0.0f;
+    for (uint kh = 0; kh < KH; ++kh) {
+        int top = int(ih) + int(PH) - int(kh);
+        if (top < 0 || uint(top) % SH != 0) continue;
+        uint oh = uint(top) / SH;
+        if (oh >= OH) continue;
+        for (uint kw = 0; kw < KW; ++kw) {
+            int left = int(iw) + int(PW) - int(kw);
+            if (left < 0 || uint(left) % SW != 0) continue;
+            uint ow = uint(left) / SW;
+            if (ow >= OW) continue;
+            uint seen = 0;
+            for (uint wh = 0; wh < KH; ++wh) {
+                for (uint ww = 0; ww < KW; ++ww) {
+                    int sh = int(oh * SH) - int(PH) + int(wh);
+                    int sw = int(ow * SW) - int(PW) + int(ww);
+                    if (sh < 0 || sw < 0 || sh >= int(H) || sw >= int(W)) continue;
+                    seen += 1;
+                }
+            }
+            if (seen > 0)
+                total += upstream[((n * OH + oh) * OW + ow) * C + c] / float(seen);
+        }
+    }
+    grad[id] = total;
+}
+
+kernel void crop2d_nhwc(device const float* input [[buffer(0)]],
+                        device float* output [[buffer(1)]],
+                        constant uint& N [[buffer(2)]],
+                        constant uint& H [[buffer(3)]],
+                        constant uint& W [[buffer(4)]],
+                        constant uint& C [[buffer(5)]],
+                        constant uint& PT [[buffer(6)]],
+                        constant uint& PL [[buffer(7)]],
+                        constant uint& IH [[buffer(8)]],
+                        constant uint& IW [[buffer(9)]],
+                        uint id [[thread_position_in_grid]]) {
+    uint count = N * H * W * C;
+    if (id >= count) return;
+    uint c = id % C;
+    uint w = (id / C) % W;
+    uint h = (id / (C * W)) % H;
+    uint n = id / (C * W * H);
+    output[id] = input[((n * IH + h + PT) * IW + w + PL) * C + c];
+}
+
+kernel void upsample_nearest2d_backward_nhwc(device const float* upstream [[buffer(0)]],
+                                             device float* grad [[buffer(1)]],
+                                             constant uint& N [[buffer(2)]],
+                                             constant uint& H [[buffer(3)]],
+                                             constant uint& W [[buffer(4)]],
+                                             constant uint& C [[buffer(5)]],
+                                             constant uint& SH [[buffer(6)]],
+                                             constant uint& SW [[buffer(7)]],
+                                             constant uint& OH [[buffer(8)]],
+                                             constant uint& OW [[buffer(9)]],
+                                             uint id [[thread_position_in_grid]]) {
+    uint count = N * H * W * C;
+    if (id >= count) return;
+    uint c = id % C;
+    uint w = (id / C) % W;
+    uint h = (id / (C * W)) % H;
+    uint n = id / (C * W * H);
+    float total = 0.0f;
+    for (uint dh = 0; dh < SH; ++dh) {
+        uint oh = h * SH + dh;
+        if (oh >= OH) continue;
+        for (uint dw = 0; dw < SW; ++dw) {
+            uint ow = w * SW + dw;
+            if (ow >= OW) continue;
+            total += upstream[((n * OH + oh) * OW + ow) * C + c];
+        }
+    }
+    grad[id] = total;
+}
+
+kernel void repeat_last_backward(device const float* upstream [[buffer(0)]],
+                                 device float* grad [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]],
+                                 constant uint& inner [[buffer(3)]],
+                                 constant uint& times [[buffer(4)]],
+                                 uint id [[thread_position_in_grid]]) {
+    uint count = rows * inner;
+    if (id >= count) return;
+    uint col = id % inner;
+    uint row = id / inner;
+    float total = 0.0f;
+    for (uint t = 0; t < times; ++t) total += upstream[row * inner * times + t * inner + col];
+    grad[id] = total;
+}
+
+kernel void take_strided_rows(device const float* source [[buffer(0)]],
+                              device float* dest [[buffer(1)]],
+                              constant uint& rows [[buffer(2)]],
+                              constant uint& dst_width [[buffer(3)]],
+                              constant uint& src_width [[buffer(4)]],
+                              constant uint& src_col [[buffer(5)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= rows * dst_width) return;
+    uint r = id / dst_width;
+    uint c = id % dst_width;
+    dest[id] = source[r * src_width + src_col + c];
+}
+
+kernel void select_backward(device const float* a [[buffer(0)]],
+                            device const float* b [[buffer(1)]],
+                            device const float* upstream [[buffer(2)]],
+                            device float* grad [[buffer(3)]],
+                            constant uint& count [[buffer(4)]],
+                            constant uint& want_max [[buffer(5)]],
+                            constant uint& side [[buffer(6)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    bool a_wins = want_max != 0u ? a[id] >= b[id] : a[id] <= b[id];
+    bool mine = side == 0u ? a_wins : !a_wins;
+    grad[id] = mine ? upstream[id] : 0.0f;
+}
+
+kernel void layer_norm_backward(device const float* input [[buffer(0)]],
+                                device const float* gamma [[buffer(1)]],
+                                device const float* upstream [[buffer(2)]],
+                                device float* grad [[buffer(3)]],
+                                constant uint& rows [[buffer(4)]],
+                                constant uint& width [[buffer(5)]],
+                                uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    uint base = row * width;
+    float total = 0.0f;
+    for (uint i = 0; i < width; ++i) total += input[base + i];
+    float m = total / float(width);
+    float sq = 0.0f;
+    for (uint i = 0; i < width; ++i) {
+        float d = input[base + i] - m;
+        sq += d * d;
+    }
+    float inv = rsqrt(sq / float(width) + 1e-5f);
+    float sum_dy = 0.0f;
+    float sum_dy_xhat = 0.0f;
+    for (uint i = 0; i < width; ++i) {
+        float dy = upstream[base + i] * gamma[i];
+        sum_dy += dy;
+        sum_dy_xhat += dy * (input[base + i] - m) * inv;
+    }
+    float scale = 1.0f / float(width);
+    for (uint i = 0; i < width; ++i) {
+        float dy = upstream[base + i] * gamma[i];
+        float xhat = (input[base + i] - m) * inv;
+        grad[base + i] = inv * (dy - scale * sum_dy - scale * xhat * sum_dy_xhat);
+    }
+}
+
+kernel void layer_norm_params_backward(device const float* input [[buffer(0)]],
+                                       device const float* upstream [[buffer(1)]],
+                                       device float* grad_gamma [[buffer(2)]],
+                                       device float* grad_beta [[buffer(3)]],
+                                       constant uint& rows [[buffer(4)]],
+                                       constant uint& width [[buffer(5)]],
+                                       uint i [[thread_position_in_grid]]) {
+    if (i >= width) return;
+    float g = 0.0f;
+    float b = 0.0f;
+    for (uint row = 0; row < rows; ++row) {
+        uint base = row * width;
+        float total = 0.0f;
+        for (uint j = 0; j < width; ++j) total += input[base + j];
+        float m = total / float(width);
+        float sq = 0.0f;
+        for (uint j = 0; j < width; ++j) {
+            float d = input[base + j] - m;
+            sq += d * d;
+        }
+        float inv = rsqrt(sq / float(width) + 1e-5f);
+        float dy = upstream[base + i];
+        g += dy * (input[base + i] - m) * inv;
+        b += dy;
+    }
+    grad_gamma[i] = g;
+    grad_beta[i] = b;
+}
+
+kernel void norm_channel_backward(device const float* input [[buffer(0)]],
+                                  device const float* mean [[buffer(1)]],
+                                  device const float* variance [[buffer(2)]],
+                                  device const float* gamma [[buffer(3)]],
+                                  device const float* upstream [[buffer(4)]],
+                                  device const float* sum_dy [[buffer(5)]],
+                                  device const float* sum_dy_xhat [[buffer(6)]],
+                                  device float* grad [[buffer(7)]],
+                                  constant uint& count [[buffer(8)]],
+                                  constant uint& channels [[buffer(9)]],
+                                  constant uint& nspatial [[buffer(10)]],
+                                  uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = id % channels;
+    float inv = rsqrt(variance[c] + 1e-5f);
+    float xhat = (input[id] - mean[c]) * inv;
+    float dy = upstream[id] * gamma[c];
+    float scale = 1.0f / float(nspatial);
+    grad[id] = inv * (dy - scale * sum_dy[c] - scale * xhat * sum_dy_xhat[c]);
+}
+
+kernel void norm_channel_sums(device const float* input [[buffer(0)]],
+                              device const float* mean [[buffer(1)]],
+                              device const float* variance [[buffer(2)]],
+                              device const float* gamma [[buffer(3)]],
+                              device const float* upstream [[buffer(4)]],
+                              device float* sum_dy [[buffer(5)]],
+                              device float* sum_dy_xhat [[buffer(6)]],
+                              device float* grad_gamma [[buffer(7)]],
+                              device float* grad_beta [[buffer(8)]],
+                              constant uint& nspatial [[buffer(9)]],
+                              constant uint& channels [[buffer(10)]],
+                              uint c [[thread_position_in_grid]]) {
+    if (c >= channels) return;
+    float inv = rsqrt(variance[c] + 1e-5f);
+    float dy_total = 0.0f;
+    float dy_xhat = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    for (uint i = 0; i < nspatial; ++i) {
+        uint slot = i * channels + c;
+        float xhat = (input[slot] - mean[c]) * inv;
+        float up = upstream[slot];
+        float dy = up * gamma[c];
+        dy_total += dy;
+        dy_xhat += dy * xhat;
+        g += up * xhat;
+        b += up;
+    }
+    sum_dy[c] = dy_total;
+    sum_dy_xhat[c] = dy_xhat;
+    grad_gamma[c] = g;
+    grad_beta[c] = b;
+}
+
+kernel void group_norm_backward(device const float* input [[buffer(0)]],
+                                device const float* mean [[buffer(1)]],
+                                device const float* variance [[buffer(2)]],
+                                device const float* gamma [[buffer(3)]],
+                                device const float* upstream [[buffer(4)]],
+                                device const float* sum_dy [[buffer(5)]],
+                                device const float* sum_dy_xhat [[buffer(6)]],
+                                device float* grad [[buffer(7)]],
+                                constant uint& count [[buffer(8)]],
+                                constant uint& spatial [[buffer(9)]],
+                                constant uint& C [[buffer(10)]],
+                                constant uint& groups [[buffer(11)]],
+                                uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = id % C;
+    uint n = id / (C * spatial);
+    uint gs = C / groups;
+    uint g = c / gs;
+    uint slot = n * groups + g;
+    float inv = rsqrt(variance[slot] + 1e-5f);
+    float xhat = (input[id] - mean[slot]) * inv;
+    float dy = upstream[id] * gamma[c];
+    float scale = 1.0f / float(spatial * gs);
+    grad[id] = inv * (dy - scale * sum_dy[slot] - scale * xhat * sum_dy_xhat[slot]);
+}
+
+kernel void group_norm_sums(device const float* input [[buffer(0)]],
+                            device const float* mean [[buffer(1)]],
+                            device const float* variance [[buffer(2)]],
+                            device const float* gamma [[buffer(3)]],
+                            device const float* upstream [[buffer(4)]],
+                            device float* sum_dy [[buffer(5)]],
+                            device float* sum_dy_xhat [[buffer(6)]],
+                            constant uint& N [[buffer(7)]],
+                            constant uint& spatial [[buffer(8)]],
+                            constant uint& C [[buffer(9)]],
+                            constant uint& groups [[buffer(10)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= N * groups) return;
+    uint gs = C / groups;
+    uint n = id / groups;
+    uint g = id % groups;
+    float inv = rsqrt(variance[id] + 1e-5f);
+    float dy_total = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint hw = 0; hw < spatial; ++hw) {
+        uint base = (n * spatial + hw) * C + g * gs;
+        for (uint k = 0; k < gs; ++k) {
+            float xhat = (input[base + k] - mean[id]) * inv;
+            float dy = upstream[base + k] * gamma[g * gs + k];
+            dy_total += dy;
+            dy_xhat += dy * xhat;
+        }
+    }
+    sum_dy[id] = dy_total;
+    sum_dy_xhat[id] = dy_xhat;
+}
+
+kernel void channel_params_backward(device const float* input [[buffer(0)]],
+                                    device const float* mean [[buffer(1)]],
+                                    device const float* variance [[buffer(2)]],
+                                    device const float* upstream [[buffer(3)]],
+                                    device float* grad_gamma [[buffer(4)]],
+                                    device float* grad_beta [[buffer(5)]],
+                                    constant uint& nspatial [[buffer(6)]],
+                                    constant uint& channels [[buffer(7)]],
+                                    constant uint& spatial [[buffer(8)]],
+                                    constant uint& groups [[buffer(9)]],
+                                    uint c [[thread_position_in_grid]]) {
+    if (c >= channels) return;
+    uint gs = groups == 0u ? 0u : channels / groups;
+    float g = 0.0f;
+    float b = 0.0f;
+    for (uint i = 0; i < nspatial; ++i) {
+        uint slot = i * channels + c;
+        uint pick = c;
+        if (groups != 0u) {
+            uint n = i / spatial;
+            pick = n * groups + c / gs;
+        }
+        float inv = rsqrt(variance[pick] + 1e-5f);
+        float xhat = (input[slot] - mean[pick]) * inv;
+        g += upstream[slot] * xhat;
+        b += upstream[slot];
+    }
+    grad_gamma[c] = g;
+    grad_beta[c] = b;
+}
+
 kernel void add_scaled_into(device const float* value [[buffer(0)]],
                             device float* total [[buffer(1)]],
                             constant uint& weight [[buffer(2)]],
@@ -1441,10 +1880,19 @@ pub fn matmul(
     }
     let output = raw_matmul(a, b, trans_a: trans_a, trans_b: trans_b, out: out)
     if out is null and (a.requires_grad or b.requires_grad) {
-        if trans_a or trans_b {
-            throw ValueError("transposed matmul does not attach gradients")
-        }
         output.attach_creator(GradNode([a, b], fn(upstream: Tensor) -> list[Tensor] {
+            if trans_a and trans_b {
+                return [
+                    raw_matmul(b, upstream, trans_a: true, trans_b: true),
+                    raw_matmul(upstream, a, trans_a: true, trans_b: true),
+                ]
+            }
+            if trans_a {
+                return [raw_matmul(b, upstream, trans_b: true), raw_matmul(a, upstream)]
+            }
+            if trans_b {
+                return [raw_matmul(upstream, b), raw_matmul(upstream, a, trans_a: true)]
+            }
             return [raw_matmul(upstream, b, trans_b: true), raw_matmul(a, upstream, trans_a: true)]
         }))
     }
@@ -1768,12 +2216,31 @@ pub fn clamp(input: Tensor, lo: float, hi: float) -> Tensor {
     return output
 }
 
+#: Route an upstream gradient to whichever side of a min/max comparison won.
+fn select_grads(a: Tensor, b: Tensor, upstream: Tensor, want_max: int) -> list[Tensor] {
+    let kernel = cached_kernel("select_backward")
+    var grads: list[Tensor] = []
+    for side in 0..2 {
+        let grad = Tensor(a.shape)
+        kernel.dispatch_async(
+            [a.buffer(), b.buffer(), upstream.buffer(), grad.buffer()],
+            a.size,
+            [a.size, want_max, side]
+        )
+        grads.push(grad)
+    }
+    return grads
+}
+
 #: Elementwise maximum of equal-shaped tensors.
 pub fn maximum(a: Tensor, b: Tensor) -> Tensor {
     if not a.same_shape(b) { throw ValueError(f"tensor shapes differ: {a.shape} and {b.shape}") }
     let output = Tensor(a.shape)
     let kernel = cached_kernel("maximum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 1)))
+    }
     return output
 }
 
@@ -1783,6 +2250,9 @@ pub fn minimum(a: Tensor, b: Tensor) -> Tensor {
     let output = Tensor(a.shape)
     let kernel = cached_kernel("minimum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
+    if a.requires_grad or b.requires_grad {
+        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 0)))
+    }
     return output
 }
 
@@ -1889,8 +2359,14 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
     let output = Tensor(out_shape)
     var cursor = 0
     let kernel = cached_kernel("copy_range")
+    var wants_grad = false
+    for part in parts {
+        if part.requires_grad { wants_grad = true }
+    }
     if resolved == 0 {
+        var offsets: list[int] = []
         for part in parts {
+            offsets.push(cursor)
             kernel.dispatch_async(
                 [part.buffer(), output.buffer()],
                 part.size,
@@ -1898,19 +2374,56 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
             )
             cursor += part.size
         }
+        if wants_grad {
+            let shapes = [part.shape for part in parts]
+            output.attach_creator(GradNode(parts, fn(upstream: Tensor) -> list[Tensor] {
+                var grads: list[Tensor] = []
+                let back = cached_kernel("copy_range")
+                for (index, shape) in shapes.enumerate() {
+                    let grad = Tensor(shape)
+                    back.dispatch_async(
+                        [upstream.buffer(), grad.buffer()],
+                        grad.size,
+                        [offsets[index], 0, grad.size]
+                    )
+                    grads.push(grad)
+                }
+                return grads
+            }))
+        }
         return output
     }
     let outer = parts[0].size // parts[0].shape[resolved]
     var prefix = 0
+    var starts: list[int] = []
     let strided = cached_kernel("copy_strided_rows")
     for part in parts {
         let width = part.shape[resolved]
+        starts.push(prefix)
         strided.dispatch_async(
             [part.buffer(), output.buffer()],
             outer * width,
             [outer, width, along, prefix]
         )
         prefix += width
+    }
+    if wants_grad {
+        let shapes = [part.shape for part in parts]
+        output.attach_creator(GradNode(parts, fn(upstream: Tensor) -> list[Tensor] {
+            var grads: list[Tensor] = []
+            let take = cached_kernel("take_strided_rows")
+            for (index, shape) in shapes.enumerate() {
+                let grad = Tensor(shape)
+                let width = shape[resolved]
+                take.dispatch_async(
+                    [upstream.buffer(), grad.buffer()],
+                    outer * width,
+                    [outer, width, along, starts[index]]
+                )
+                grads.push(grad)
+            }
+            return grads
+        }))
     }
     return output
 }
@@ -1955,6 +2468,37 @@ fn _pool2d(input: Tensor, kernel_size: int, stride: int, padding: int, is_max: b
         n * oh * ow * c,
         [n, h, w, c, kernel_size, kernel_size, step, step, padding, padding, oh, ow]
     )
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            let grad = Tensor([n, h, w, c])
+            let scalars = [
+                n,
+                h,
+                w,
+                c,
+                kernel_size,
+                kernel_size,
+                step,
+                step,
+                padding,
+                padding,
+                oh,
+                ow,
+            ]
+            if is_max {
+                let back = cached_kernel("max_pool2d_backward_nhwc")
+                back.dispatch_async(
+                    [input.buffer(), upstream.buffer(), grad.buffer()],
+                    grad.size,
+                    scalars
+                )
+            } else {
+                let back = cached_kernel("avg_pool2d_backward_nhwc")
+                back.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, scalars)
+            }
+            return [grad]
+        }))
+    }
     return output
 }
 
@@ -2028,6 +2572,22 @@ pub fn pow(input: Tensor, exponent: float) -> Tensor {
         input.size,
         [input.size, f32_bits(exponent)]
     )
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            let lowered = Tensor(input.shape)
+            let inner = cached_kernel("pow_scalar")
+            inner.dispatch_async(
+                [input.buffer(), lowered.buffer()],
+                input.size,
+                [input.size, f32_bits(exponent - 1.0)]
+            )
+            let chained = multiply(upstream, lowered)
+            lowered.free()
+            let grad = scale(chained, exponent)
+            chained.free()
+            return [grad]
+        }))
+    }
     return output
 }
 
@@ -2095,6 +2655,22 @@ pub fn pad2d(input: Tensor, pad: list[int]) -> Tensor {
         output.size,
         [n, h, w, c, pad[0], pad[1], pad[2], pad[3]]
     )
+    if input.requires_grad {
+        let padded_h = h + pad[0] + pad[1]
+        let padded_w = w + pad[2] + pad[3]
+        let top = pad[0]
+        let left = pad[2]
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            let grad = Tensor([n, h, w, c])
+            let crop = cached_kernel("crop2d_nhwc")
+            crop.dispatch_async(
+                [upstream.buffer(), grad.buffer()],
+                grad.size,
+                [n, h, w, c, top, left, padded_h, padded_w]
+            )
+            return [grad]
+        }))
+    }
     return output
 }
 
@@ -2108,6 +2684,9 @@ pub fn nchw(input: Tensor) -> Tensor {
     let output = Tensor([n, c, h, w])
     let kernel = cached_kernel("nhwc_to_nchw")
     kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [n, h, w, c])
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [nhwc(upstream)]))
+    }
     return output
 }
 
@@ -2121,6 +2700,9 @@ pub fn nhwc(input: Tensor) -> Tensor {
     let output = Tensor([n, h, w, c])
     let kernel = cached_kernel("nchw_to_nhwc")
     kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [n, c, h, w])
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [nchw(upstream)]))
+    }
     return output
 }
 
@@ -2163,6 +2745,15 @@ pub fn repeat(input: Tensor, times: int, axis: int = -1) -> Tensor {
         output.size,
         [rows, inner, times]
     )
+    if input.requires_grad {
+        let original = input.shape
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            let grad = Tensor(original)
+            let back = cached_kernel("repeat_last_backward")
+            back.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, [rows, inner, times])
+            return [grad]
+        }))
+    }
     return output
 }
 
@@ -2236,6 +2827,9 @@ pub fn tril(input: Tensor) -> Tensor {
         output.size,
         [rows, cols]
     )
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [tril(upstream)]))
+    }
     return output
 }
 
@@ -2264,6 +2858,9 @@ pub fn flip(input: Tensor, axis: int = -1) -> Tensor {
         output.size,
         [rows, inner]
     )
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [flip(upstream, axis: axis)]))
+    }
     return output
 }
 
@@ -2286,6 +2883,18 @@ pub fn upsample_nearest2d(input: Tensor, scale: int) -> Tensor {
         output.size,
         [n, h, w, c, scale, scale, out_h, out_w]
     )
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            let grad = Tensor([n, h, w, c])
+            let back = cached_kernel("upsample_nearest2d_backward_nhwc")
+            back.dispatch_async(
+                [upstream.buffer(), grad.buffer()],
+                grad.size,
+                [n, h, w, c, scale, scale, out_h, out_w]
+            )
+            return [grad]
+        }))
+    }
     return output
 }
 
@@ -2308,6 +2917,9 @@ pub fn split_heads(input: Tensor, heads: int) -> Tensor {
         output.size,
         [seq, heads, hd]
     )
+    if input.requires_grad {
+        output.attach_creator(GradNode([input], |upstream| [merge_heads(upstream, heads, seq)]))
+    }
     return output
 }
 
@@ -2330,6 +2942,9 @@ pub fn merge_heads(packed: Tensor, heads: int, seq: int) -> Tensor {
         packed.size,
         [seq, heads, hd]
     )
+    if packed.requires_grad {
+        output.attach_creator(GradNode([packed], |upstream| [split_heads(upstream, heads)]))
+    }
     return output
 }
 
@@ -2388,7 +3003,21 @@ pub fn slice_flat(source: Tensor, source_offset: int, shape: list[int]) -> Tenso
                 f"run past source size {source.size}"
         )
     }
-    return source.view(source_offset, shape)
+    let output = source.view(source_offset, shape)
+    if source.requires_grad {
+        let whole = source.shape
+        output.attach_creator(GradNode([source], fn(upstream: Tensor) -> list[Tensor] {
+            let grad = Tensor.zeros(whole)
+            let kernel = cached_kernel("copy_range")
+            kernel.dispatch_async(
+                [upstream.buffer(), grad.buffer()],
+                n,
+                [0, source_offset, n]
+            )
+            return [grad]
+        }))
+    }
+    return output
 }
 
 #: Copy `source` into `dest`. Both must have the same number of elements.
@@ -2470,6 +3099,21 @@ pub fn conv2d(
         throw ValueError(f"conv2d bias has {bias.size} values, expected {cout}")
     }
     let output = Tensor([n, out_h, out_w, cout])
+    let by_im2col = fn() -> void {
+        let k = kh * kw * cin
+        let rows = n * out_h * out_w
+        let col = Tensor([rows, k])
+        let kernel = cached_kernel("im2col_nhwc")
+        kernel.dispatch_async(
+            [input.buffer(), col.buffer()],
+            rows * k,
+            [n, h, w, cin, kh, kw, stride, stride, padding, padding]
+        )
+        let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
+        let flat_out = Tensor([rows, cout], storage: output.buffer())
+        raw_matmul(col, flat_w, bias: bias, epilogue: if bias is null { 0 } else { 1 }, out: flat_out)
+        col.free()
+    }
     try {
         gpu.conv2d_async(
             input.buffer(),
@@ -2488,23 +3132,76 @@ pub fn conv2d(
             pad_w: padding,
             bias: if bias is null { null } else { bias.buffer() }
         )
-        return output
     } catch _error: RuntimeError {
+        by_im2col()
+    }
+    attach_conv_grad(input, weights, bias, output, stride, padding)
+    return output
+}
+
+#: Backward for `conv2d`, as im2col plus two products.
+#:
+#: The columns are rebuilt here rather than kept from the forward pass: a
+#: `[batch * out_h * out_w, kh * kw * cin]` matrix is tens of megabytes for an
+#: ordinary layer, and the forward may not have built one at all when the
+#: native convolution took the work.
+fn attach_conv_grad(
+    input: Tensor,
+    weights: Tensor,
+    bias: Tensor?,
+    output: Tensor,
+    stride: int,
+    padding: int
+) -> void {
+    let wants_bias = bias is not null and bias.requires_grad
+    if not (input.requires_grad or weights.requires_grad or wants_bias) { return }
+    var inputs = [input, weights]
+    if wants_bias { inputs.push(bias) }
+    let n = input.shape[0]
+    let h = input.shape[1]
+    let w = input.shape[2]
+    let cin = input.shape[3]
+    let kh = weights.shape[0]
+    let kw = weights.shape[1]
+    let cout = weights.shape[3]
+    let out_h = output.shape[1]
+    let out_w = output.shape[2]
+    output.attach_creator(GradNode(inputs, fn(upstream: Tensor) -> list[Tensor] {
         let k = kh * kw * cin
         let rows = n * out_h * out_w
+        let flat_up = Tensor([rows, cout], storage: upstream.buffer().view(0, rows * cout))
         let col = Tensor([rows, k])
-        let kernel = cached_kernel("im2col_nhwc")
-        kernel.dispatch_async(
+        let im2col = cached_kernel("im2col_nhwc")
+        im2col.dispatch_async(
             [input.buffer(), col.buffer()],
             rows * k,
             [n, h, w, cin, kh, kw, stride, stride, padding, padding]
         )
-        let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
-        let flat_out = Tensor([rows, cout], storage: output.buffer())
-        raw_matmul(col, flat_w, bias: bias, epilogue: if bias is null { 0 } else { 1 }, out: flat_out)
+        let grad_flat_w = raw_matmul(col, flat_up, trans_a: true)
         col.free()
-        return output
-    }
+        let grad_weights = Tensor(
+            [kh, kw, cin, cout],
+            storage: grad_flat_w.buffer().view(0, k * cout)
+        )
+        let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
+        let grad_col = raw_matmul(flat_up, flat_w, trans_b: true)
+        let grad_input = Tensor([n, h, w, cin])
+        let col2im = cached_kernel("col2im_nhwc")
+        col2im.dispatch_async(
+            [grad_col.buffer(), grad_input.buffer()],
+            grad_input.size,
+            [n, h, w, cin, kh, kw, stride, stride, padding, padding]
+        )
+        grad_col.free()
+        var grads = [grad_input, grad_weights]
+        if wants_bias {
+            let grad_bias = Tensor([cout])
+            let reduce = cached_kernel("reduce_leading")
+            reduce.dispatch_async([flat_up.buffer(), grad_bias.buffer()], cout, [rows, cout])
+            grads.push(grad_bias)
+        }
+        return grads
+    }))
 }
 
 #: Channel-last batch normalization using per-channel mean and variance of `x`.
@@ -2532,6 +3229,52 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
         input.size,
         [input.size, channels]
     )
+    if input.requires_grad or gamma.requires_grad or beta.requires_grad {
+        output.attach_creator(
+            GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+                let sum_dy = Tensor([channels])
+                let sum_dy_xhat = Tensor([channels])
+                let grad_gamma = Tensor([channels])
+                let grad_beta = Tensor([channels])
+                let sums = cached_kernel("norm_channel_sums")
+                sums.dispatch_async(
+                    [
+                        input.buffer(),
+                        mean.buffer(),
+                        variance.buffer(),
+                        gamma.buffer(),
+                        upstream.buffer(),
+                        sum_dy.buffer(),
+                        sum_dy_xhat.buffer(),
+                        grad_gamma.buffer(),
+                        grad_beta.buffer(),
+                    ],
+                    channels,
+                    [nspatial, channels]
+                )
+                let grad_input = Tensor(input.shape)
+                let back = cached_kernel("norm_channel_backward")
+                back.dispatch_async(
+                    [
+                        input.buffer(),
+                        mean.buffer(),
+                        variance.buffer(),
+                        gamma.buffer(),
+                        upstream.buffer(),
+                        sum_dy.buffer(),
+                        sum_dy_xhat.buffer(),
+                        grad_input.buffer(),
+                    ],
+                    input.size,
+                    [input.size, channels, nspatial]
+                )
+                sum_dy.free()
+                sum_dy_xhat.free()
+                return [grad_input, grad_gamma, grad_beta]
+            }, extras: [mean, variance])
+        )
+        return output
+    }
     mean.free()
     variance.free()
     return output
@@ -2553,6 +3296,34 @@ pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
         input.shape[0],
         [input.shape[0], width]
     )
+    if input.requires_grad or gamma.requires_grad or beta.requires_grad {
+        let rows = input.shape[0]
+        output.attach_creator(
+            GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+                let grad_input = Tensor(input.shape)
+                let back = cached_kernel("layer_norm_backward")
+                back.dispatch_async(
+                    [input.buffer(), gamma.buffer(), upstream.buffer(), grad_input.buffer()],
+                    rows,
+                    [rows, width]
+                )
+                let grad_gamma = Tensor([width])
+                let grad_beta = Tensor([width])
+                let params = cached_kernel("layer_norm_params_backward")
+                params.dispatch_async(
+                    [
+                        input.buffer(),
+                        upstream.buffer(),
+                        grad_gamma.buffer(),
+                        grad_beta.buffer(),
+                    ],
+                    width,
+                    [rows, width]
+                )
+                return [grad_input, grad_gamma, grad_beta]
+            })
+        )
+    }
     return output
 }
 
@@ -2568,6 +3339,9 @@ pub fn scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor) -
         throw ValueError("key/value sequence mismatch")
     }
     let factor = 1.0 / math.sqrt(float(query.shape[1]))
+    if query.requires_grad or key.requires_grad or value.requires_grad {
+        return matmul(softmax(scale(matmul(query, key, trans_b: true), factor)), value)
+    }
     let scores = raw_matmul(query, key, trans_b: true)
     let scaled = scale(scores, factor)
     scores.free()
@@ -2605,6 +3379,9 @@ pub fn multi_head_attention(
     }
     let hd = dim // heads
     let factor = 1.0 / math.sqrt(float(hd))
+    if query.requires_grad or key.requires_grad or value.requires_grad {
+        return mha_by_ops(query, key, value, heads, seq, hd, factor)
+    }
     let output = Tensor(query.shape)
     if gpu.mha_async(
         query.buffer(),
@@ -2642,6 +3419,35 @@ pub fn multi_head_attention(
     }
     output.free()
     return mha_by_gemm(query, key, value, heads, seq, hd, factor)
+}
+
+#: Multi-head attention built from differentiable ops.
+#:
+#: The fused kernels above never materialise the attention probabilities, so
+#: there is nothing for a backward pass to read; a graph that needs gradients
+#: gets this composition instead. Nothing is freed eagerly here — every
+#: intermediate belongs to the graph until `backward` collects it.
+fn mha_by_ops(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    heads: int,
+    seq: int,
+    hd: int,
+    factor: float
+) -> Tensor {
+    let qs = split_heads(query, heads)
+    let ks = split_heads(key, heads)
+    let vs = split_heads(value, heads)
+    var parts: list[Tensor] = []
+    for h in 0..heads {
+        let qh = slice_flat(qs, h * seq * hd, [seq, hd])
+        let kh = slice_flat(ks, h * seq * hd, [seq, hd])
+        let vh = slice_flat(vs, h * seq * hd, [seq, hd])
+        let probs = softmax(scale(matmul(qh, kh, trans_b: true), factor))
+        parts.push(matmul(probs, vh))
+    }
+    return merge_heads(cat(parts), heads, seq)
 }
 
 fn mha_by_gemm(
@@ -2750,6 +3556,63 @@ pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Te
         output.size,
         [output.size, spatial, c, groups]
     )
+    if input.requires_grad or gamma.requires_grad or beta.requires_grad {
+        output.attach_creator(
+            GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+                let sum_dy = Tensor([slots])
+                let sum_dy_xhat = Tensor([slots])
+                let sums = cached_kernel("group_norm_sums")
+                sums.dispatch_async(
+                    [
+                        input.buffer(),
+                        mean.buffer(),
+                        variance.buffer(),
+                        gamma.buffer(),
+                        upstream.buffer(),
+                        sum_dy.buffer(),
+                        sum_dy_xhat.buffer(),
+                    ],
+                    slots,
+                    [n, spatial, c, groups]
+                )
+                let grad_input = Tensor(input.shape)
+                let back = cached_kernel("group_norm_backward")
+                back.dispatch_async(
+                    [
+                        input.buffer(),
+                        mean.buffer(),
+                        variance.buffer(),
+                        gamma.buffer(),
+                        upstream.buffer(),
+                        sum_dy.buffer(),
+                        sum_dy_xhat.buffer(),
+                        grad_input.buffer(),
+                    ],
+                    input.size,
+                    [input.size, spatial, c, groups]
+                )
+                let grad_gamma = Tensor([c])
+                let grad_beta = Tensor([c])
+                let params = cached_kernel("channel_params_backward")
+                params.dispatch_async(
+                    [
+                        input.buffer(),
+                        mean.buffer(),
+                        variance.buffer(),
+                        upstream.buffer(),
+                        grad_gamma.buffer(),
+                        grad_beta.buffer(),
+                    ],
+                    c,
+                    [n * spatial, c, spatial, groups]
+                )
+                sum_dy.free()
+                sum_dy_xhat.free()
+                return [grad_input, grad_gamma, grad_beta]
+            }, extras: [mean, variance])
+        )
+        return output
+    }
     mean.free()
     variance.free()
     return output
