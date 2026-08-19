@@ -59,6 +59,14 @@ LIBS     := -lm -lpthread
 EXTRA_CFLAGS  ?=
 # Collector cadence for `make gc-stress-test`. See that target for the numbers.
 GC_STRESS_EVERY ?= 5000
+# jaicv's own cadence, ten times coarser. Its tests train seven models, denoise,
+# and run two optical flows, so they allocate far harder than the language
+# suites: at N=5000 the two files take 97s against 15s at N=50000, and 15s is
+# what fits in a gate that finishes in two minutes. `test_against_opencv.jai` is
+# left out of the stress leg entirely -- 704 recorded cases replayed under a
+# collector is four and a half minutes on its own, and every op it exercises is
+# reached by test_reachable.jai as well.
+JAICV_GC_STRESS_EVERY ?= 50000
 # Loop repetitions before `make kind-fuzz` changes a kind. Must exceed the
 # tier's hotness threshold or nothing under test ever compiles.
 KIND_FUZZ_WARM ?= 3000
@@ -421,6 +429,13 @@ gc-stress-test: $(TARGET)
 	          --gc-stress=$(GC_STRESS_EVERY) \
 	          tests/lang tests/stdlib tests/checker \
 	          packages/jaiplot/tests packages/jaitensor/tests 2>&1); \
+	  status=$$?; \
+	  if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
+	  printf '%s\n' "$$out" | tail -1
+	@out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
+	          --gc-stress=$(JAICV_GC_STRESS_EVERY) \
+	          packages/jaicv/tests/test_reachable.jai \
+	          packages/jaicv/tests/test_jaicv.jai 2>&1); \
 	  status=$$?; \
 	  if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; exit $$status; fi; \
 	  printf '%s\n' "$$out" | tail -1
