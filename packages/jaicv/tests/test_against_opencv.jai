@@ -25,7 +25,17 @@ from jaicv.imgproc.geometric import pyr_down, pyr_up, remap, resize, warp_affine
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE, BORDER_WRAP
 from jaicv.core.types import INTER_AREA, INTER_CUBIC, INTER_LANCZOS4, INTER_LINEAR, INTER_NEAREST
-from jaicv.core.types import Point2f, Scalar, Size
+from jaicv.core.types import CV_32F, Point, Point2f, Scalar, Size
+from jaicv.imgproc.filter import blur, box_filter, filter_2d, gaussian_blur
+from jaicv.imgproc.filter import get_gaussian_kernel, laplacian, median_blur, scharr, sobel
+from jaicv.imgproc.threshold import adaptive_threshold, threshold
+from jaicv.imgproc.threshold import ADAPTIVE_THRESH_GAUSSIAN_C, ADAPTIVE_THRESH_MEAN_C
+from jaicv.imgproc.threshold import THRESH_BINARY, THRESH_BINARY_INV, THRESH_OTSU
+from jaicv.imgproc.threshold import THRESH_TOZERO, THRESH_TOZERO_INV, THRESH_TRUNC
+from jaicv.imgproc.morph import dilate, erode, get_structuring_element, morphology_ex
+from jaicv.imgproc.morph import MORPH_BLACKHAT, MORPH_CLOSE, MORPH_CROSS, MORPH_ELLIPSE
+from jaicv.imgproc.morph import MORPH_GRADIENT, MORPH_OPEN, MORPH_RECT, MORPH_TOPHAT
+from jaicv.imgproc.edges import canny
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -116,6 +126,19 @@ fn tolerance_for(name: str, args: list[str]) -> float {
         name == "getAffineTransform" {
         return 1e-4
     }
+    if name == "getGaussianKernel" { return 1e-5 }
+    #: A mask or a structuring element only ever holds two values, so a
+    #: one-unit tolerance would hide a wrong pixel entirely: these are exact.
+    if name == "getStructuringElement" or
+        name == "threshold" or
+        name == "thresholdOtsu" or
+        name == "adaptiveThreshold" or
+        name == "Canny" {
+        return 0.0
+    }
+    #: A float derivative is exact arithmetic on both sides; the drift that is
+    #: left is float32 association order.
+    if name == "Sobel" or name == "Scharr" or name == "Laplacian" { return 1e-3 }
     let _unused = args
     return 1.0
 }
@@ -142,6 +165,17 @@ let QUAD_SOURCE = [Point2f(0.0, 0.0), Point2f(9.0, 0.0), Point2f(9.0, 7.0), Poin
 let QUAD_TARGET = [Point2f(1.0, 1.0), Point2f(8.0, 0.5), Point2f(9.0, 6.0), Point2f(0.5, 7.0)]
 
 fn rotation_case() -> Mat { return get_rotation_matrix_2d(Point2f(4.5, 3.5), 27.0, 1.3) }
+
+fn shape_named(name: str) -> int {
+    if name == "RECT" { return MORPH_RECT }
+    if name == "CROSS" { return MORPH_CROSS }
+    return MORPH_ELLIPSE
+}
+
+fn structuring_case(args: list[str]) -> Mat {
+    let size = int(args[1])
+    return get_structuring_element(shape_named(args[0]), Size(size, size))
+}
 
 fn run_case(item: Case) -> Mat {
     if item.name == "cvtColor" { return cvt_color(item.source, colour_code(item.args[0])) }
@@ -186,6 +220,122 @@ fn run_case(item: Case) -> Mat {
             target.push(QUAD_TARGET[index])
         }
         return get_affine_transform(source, target)
+    }
+    if item.name == "blur" {
+        return blur(item.source, Size(int(item.args[0]), int(item.args[1])))
+    }
+    if item.name == "GaussianBlur" {
+        return gaussian_blur(
+            item.source,
+            Size(int(item.args[0]), int(item.args[1])),
+            float(item.args[2])
+        )
+    }
+    if item.name == "medianBlur" { return median_blur(item.source, int(item.args[0])) }
+    if item.name == "boxFilter" {
+        return box_filter(
+            item.source,
+            -1,
+            Size(int(item.args[0]), int(item.args[1])),
+            normalize: false
+        )
+    }
+    if item.name == "filter2D" {
+        if item.args[0] == "sharpen" {
+            let weights = Mat.from_list(
+                3,
+                3,
+                CV_MAKETYPE(CV_32F, 1),
+                [0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0]
+            )
+            return filter_2d(item.source, -1, weights)
+        }
+        var values: list[float] = []
+        for index in 0..25 { values.push((float(index) - 12.0) / 40.0) }
+        return filter_2d(item.source, -1, Mat.from_list(5, 5, CV_MAKETYPE(CV_32F, 1), values))
+    }
+    if item.name == "Sobel" {
+        return sobel(
+            item.source,
+            CV_32F,
+            int(item.args[0]),
+            int(item.args[1]),
+            ksize: int(item.args[2])
+        )
+    }
+    if item.name == "Scharr" {
+        return scharr(item.source, CV_32F, int(item.args[0]), int(item.args[1]))
+    }
+    if item.name == "Laplacian" { return laplacian(item.source, CV_32F, ksize: 1) }
+    if item.name == "getGaussianKernel" {
+        return get_gaussian_kernel(int(item.args[0]), float(item.args[1]))
+    }
+    if item.name == "threshold" {
+        let modes = {
+            "BINARY": THRESH_BINARY,
+            "BINARY_INV": THRESH_BINARY_INV,
+            "TRUNC": THRESH_TRUNC,
+            "TOZERO": THRESH_TOZERO,
+            "TOZERO_INV": THRESH_TOZERO_INV,
+        }
+        let (_level, out) = threshold(
+            item.source,
+            float(item.args[1]),
+            float(item.args[2]),
+            modes[item.args[0]]
+        )
+        return out
+    }
+    if item.name == "thresholdOtsu" {
+        let (_level, out) = threshold(item.source, 0.0, 255.0, THRESH_BINARY | THRESH_OTSU)
+        return out
+    }
+    if item.name == "adaptiveThreshold" {
+        let method = if item.args[0] == "MEAN" {
+            ADAPTIVE_THRESH_MEAN_C
+        } else {
+            ADAPTIVE_THRESH_GAUSSIAN_C
+        }
+        return adaptive_threshold(
+            item.source,
+            255.0,
+            method,
+            THRESH_BINARY,
+            int(item.args[1]),
+            float(item.args[2])
+        )
+    }
+    if item.name == "getStructuringElement" {
+        return get_structuring_element(shape_named(item.args[0]), Size(int(item.args[1]), int(item.args[1])))
+    }
+    if item.name == "erode" {
+        return erode(item.source, element: structuring_case(item.args))
+    }
+    if item.name == "dilate" {
+        return dilate(item.source, element: structuring_case(item.args))
+    }
+    if item.name == "morphologyEx" {
+        let ops = {
+            "OPEN": MORPH_OPEN,
+            "CLOSE": MORPH_CLOSE,
+            "GRADIENT": MORPH_GRADIENT,
+            "TOPHAT": MORPH_TOPHAT,
+            "BLACKHAT": MORPH_BLACKHAT,
+        }
+        return morphology_ex(
+            item.source,
+            ops[item.args[0]],
+            element: get_structuring_element(MORPH_RECT, Size(3, 3))
+        )
+    }
+    if item.name == "Canny" {
+        return canny(
+            item.source,
+            float(item.args[0]),
+            float(item.args[1]),
+            aperture_size: int(item.args[2]),
+            l2_gradient: item.args[3] == "1"
+        )
     }
     if item.name == "remap" {
         var xs: list[float] = []
@@ -232,7 +382,9 @@ fn test_every_recorded_case_matches_opencv() -> void {
     let cases = load_cases(path)
     assert_true(cases.len() > 0)
     var failures: list[str] = []
+    var compared = 0
     for item in cases {
+        compared += 1
         let produced = run_case(item)
         if produced.rows != item.expected.rows or produced.cols != item.expected.cols {
             failures.push(f"{item.name} {item.args}: shape {produced} vs {item.expected}")
@@ -256,6 +408,9 @@ fn test_every_recorded_case_matches_opencv() -> void {
             )
         }
     }
+    #: A silently skipped case is worse than a failing one, so the count the
+    #: file holds is asserted rather than assumed.
+    assert_true(compared == cases.len())
     if failures.len() > 0 {
         var report = f"{failures.len()} of {cases.len()} cases disagree with OpenCV:"
         for line in failures { report = report + "\n  " + line }

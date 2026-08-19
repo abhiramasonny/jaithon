@@ -125,10 +125,96 @@ def write_geometric(handle) -> None:
     case(handle, "remap", "flipx", source, remapped)
 
 
+def write_filter(handle) -> None:
+    source = ramp(9, 11, 3, seed=21)
+    gray = ramp(9, 11, 1, seed=22)
+    for k in (3, 5, 7):
+        case(handle, "blur", f"{k} {k}", source, cv2.blur(source, (k, k)))
+        case(handle, "GaussianBlur", f"{k} {k} 0", source,
+             cv2.GaussianBlur(source, (k, k), 0))
+        case(handle, "GaussianBlur", f"{k} {k} 1.7", source,
+             cv2.GaussianBlur(source, (k, k), 1.7))
+        case(handle, "medianBlur", f"{k}", source, cv2.medianBlur(source, k))
+    case(handle, "boxFilter", "3 3 nonorm", gray,
+         cv2.boxFilter(gray, -1, (3, 3), normalize=False))
+
+    weights = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], np.float32)
+    case(handle, "filter2D", "sharpen", source, cv2.filter2D(source, -1, weights))
+    weights5 = (np.arange(25, dtype=np.float32).reshape(5, 5) - 12.0) / 40.0
+    case(handle, "filter2D", "ramp5", gray, cv2.filter2D(gray, -1, weights5))
+
+    for k in (1, 3, 5, 7):
+        for dx, dy in ((1, 0), (0, 1), (2, 0), (1, 1)):
+            if k == 1 and (dx > 1 or dy > 1):
+                continue
+            out = cv2.Sobel(gray, cv2.CV_32F, dx, dy, ksize=k)
+            case(handle, "Sobel", f"{dx} {dy} {k}", gray, out)
+    case(handle, "Scharr", "1 0", gray, cv2.Scharr(gray, cv2.CV_32F, 1, 0))
+    case(handle, "Scharr", "0 1", gray, cv2.Scharr(gray, cv2.CV_32F, 0, 1))
+    case(handle, "Laplacian", "1", gray, cv2.Laplacian(gray, cv2.CV_32F, ksize=1))
+    case(handle, "getGaussianKernel", "5 1.2",
+         gray, cv2.getGaussianKernel(5, 1.2).astype(np.float32))
+    case(handle, "getGaussianKernel", "7 0",
+         gray, cv2.getGaussianKernel(7, 0).astype(np.float32))
+
+
+def write_threshold(handle) -> None:
+    gray = ramp(9, 11, 1, seed=31)
+    bimodal = np.where(ramp(12, 12, 1, seed=32) > 128, 210, 40).astype(np.uint8)
+    for name, mode in (("BINARY", cv2.THRESH_BINARY), ("BINARY_INV", cv2.THRESH_BINARY_INV),
+                       ("TRUNC", cv2.THRESH_TRUNC), ("TOZERO", cv2.THRESH_TOZERO),
+                       ("TOZERO_INV", cv2.THRESH_TOZERO_INV)):
+        _, out = cv2.threshold(gray, 120, 255, mode)
+        case(handle, "threshold", f"{name} 120 255", gray, out)
+    level, out = cv2.threshold(bimodal, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    case(handle, "thresholdOtsu", f"{level}", bimodal, out)
+    for method, mname in ((cv2.ADAPTIVE_THRESH_MEAN_C, "MEAN"),
+                          (cv2.ADAPTIVE_THRESH_GAUSSIAN_C, "GAUSSIAN")):
+        out = cv2.adaptiveThreshold(gray, 255, method, cv2.THRESH_BINARY, 5, 3)
+        case(handle, "adaptiveThreshold", f"{mname} 5 3", gray, out)
+
+
+def write_morph(handle) -> None:
+    gray = ramp(10, 12, 1, seed=41)
+    colour = ramp(10, 12, 3, seed=42)
+    for shape, sname in ((cv2.MORPH_RECT, "RECT"), (cv2.MORPH_CROSS, "CROSS"),
+                         (cv2.MORPH_ELLIPSE, "ELLIPSE")):
+        for k in (3, 5):
+            element = cv2.getStructuringElement(shape, (k, k))
+            case(handle, "getStructuringElement", f"{sname} {k}", gray, element)
+            case(handle, "erode", f"{sname} {k}", gray,
+                 cv2.erode(gray, element, borderType=cv2.BORDER_REPLICATE))
+            case(handle, "dilate", f"{sname} {k}", gray,
+                 cv2.dilate(gray, element, borderType=cv2.BORDER_REPLICATE))
+    element = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    for op, oname in ((cv2.MORPH_OPEN, "OPEN"), (cv2.MORPH_CLOSE, "CLOSE"),
+                      (cv2.MORPH_GRADIENT, "GRADIENT"), (cv2.MORPH_TOPHAT, "TOPHAT"),
+                      (cv2.MORPH_BLACKHAT, "BLACKHAT")):
+        case(handle, "morphologyEx", f"{oname}", colour,
+             cv2.morphologyEx(colour, op, element, borderType=cv2.BORDER_REPLICATE))
+
+
+def write_edges(handle) -> None:
+    rng = np.random.default_rng(51)
+    gray = np.zeros((24, 28), np.uint8)
+    gray[6:18, 8:20] = 200
+    gray[10:14, 12:16] = 60
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    noisy = np.clip(gray.astype(np.int16) + rng.integers(-8, 9, gray.shape), 0, 255).astype(np.uint8)
+    for lo, hi in ((50, 150), (80, 200), (30, 90)):
+        case(handle, "Canny", f"{lo} {hi} 3 0", noisy, cv2.Canny(noisy, lo, hi, apertureSize=3))
+        case(handle, "Canny", f"{lo} {hi} 3 1", noisy,
+             cv2.Canny(noisy, lo, hi, apertureSize=3, L2gradient=True))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
         write_geometric(handle)
+        write_filter(handle)
+        write_threshold(handle)
+        write_morph(handle)
+        write_edges(handle)
     print(f"wrote {OUT}")
     return 0
 
