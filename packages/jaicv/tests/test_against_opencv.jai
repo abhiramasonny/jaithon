@@ -54,6 +54,7 @@ from jaicv.imgproc.features import corner_harris, corner_min_eigen_val, hough_li
 from jaicv.imgproc.features import match_template
 from jaicv.imgproc.features import TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED
 from jaicv.imgproc.features import TM_SQDIFF, TM_SQDIFF_NORMED
+from jaicv.features2d.detect import fast
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -77,7 +78,12 @@ fn parse_mat(fields: list[str]) -> Mat {
     let cols = int(fields[2])
     let type_code = int(fields[3])
     var values: list[float] = []
-    for index in 4..fields.len() { values.push(float(fields[index])) }
+    #: A case with nothing in it writes a trailing space, so the split leaves
+    #: an empty field behind; that is the only empty field there ever is.
+    for index in 4..fields.len() {
+        if fields[index].len() == 0 { continue }
+        values.push(float(fields[index]))
+    }
     return Mat.from_list(rows, cols, type_code, values)
 }
 
@@ -636,8 +642,20 @@ fn run_features(item: Case) -> Mat {
     throw ValueError(f"no jaicv binding for {item.name}")
 }
 
+fn run_fast(item: Case) -> Mat {
+    let found = fast(item.source, int(item.args[1]), int(item.args[2]) != 0)
+    var values: list[float] = []
+    for point in found {
+        values.push(point.pt.x)
+        values.push(point.pt.y)
+        values.push(point.response)
+    }
+    return Mat.from_list(found.len(), 3, CV_MAKETYPE(5, 1), values)
+}
+
 fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
+    if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }
     if SEGMENT_NAMES.contains(item.name) { return run_segmentation(item) }
     if HIST_NAMES.contains(item.name) { return run_hist(item) }
