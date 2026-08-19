@@ -108,9 +108,16 @@ pub class VideoWriter {
         for value in le32(0) { header.push(value) }
         for value in tag("AVI ") { header.push(value) }
 
+        #: A LIST's size counts its four-character type and everything after
+        #: it. `hdrl` holds its type, the 56-byte `avih` chunk with its header,
+        #: and the whole `strl` list: 4 + (8 + 56) + (8 + 4 + 8 + 56 + 8 + 40).
+        #: Declaring it four bytes short -- which this did -- puts every reader
+        #: that walks the tree four bytes into the middle of `movi`'s header,
+        #: where it finds no chunk and stops, so the file opened, reported its
+        #: size and rate correctly, and held no frames.
         var hdrl: list[int] = []
         for value in tag("LIST") { hdrl.push(value) }
-        for value in le32(4 + 8 + 56 + 4 + 4 + 8 + 56 + 8 + 40) { hdrl.push(value) }
+        for value in le32(4 + 8 + 56 + 8 + 4 + 8 + 56 + 8 + 40) { hdrl.push(value) }
         for value in tag("hdrl") { hdrl.push(value) }
 
         for value in tag("avih") { hdrl.push(value) }

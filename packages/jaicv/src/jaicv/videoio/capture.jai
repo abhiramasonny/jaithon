@@ -1,20 +1,40 @@
-#: `VideoCapture` — frames from a camera, with OpenCV's method names.
+#: `VideoCapture` — frames from a camera or a video file, with OpenCV's method
+#: names.
 #:
 #: ```
 #: let camera = VideoCapture(0)
 #: if not camera.is_opened() { throw RuntimeError(camera.why()) }
 #: let (ok, frame) = camera.read()
+#:
+#: let clip = VideoCapture("recording.avi")
+#: while true {
+#:     let (ok, frame) = clip.read()
+#:     if not ok { break }
+#: }
 #: ```
+#:
+#: A number opens a camera and a string opens a file, which is the distinction
+#: OpenCV draws too. The file case reads AVI; see `reader.jai` for what that
+#: covers and `writer.jai` for the other direction.
 #:
 #: macOS gates camera access per application. A command-line binary has no
 #: bundle for the system to attribute the request to, so the first `open` may
 #: be refused without a prompt; `permission()` says which of those happened and
-#: `PERMISSION_HELP` says what to do about it.
+#: `PERMISSION_HELP` says what to do about it. A file needs none of it.
 import std.math
 from std.gpu import Kernel
 from ..core.mat import Mat, merge
 from ..core.types import CV_8U, CV_MAKETYPE, Size
+from .reader import AviReader
 
+#: How far into the file the next frame is, in milliseconds.
+pub const CAP_PROP_POS_MSEC = 0
+#: How far into the file the next frame is, as a fraction between zero and one.
+pub const CAP_PROP_POS_AVI_RATIO = 2
+#: The four-character code naming the codec, packed into an int.
+pub const CAP_PROP_FOURCC = 6
+#: How many frames the file holds. Zero for a camera, which has no end.
+pub const CAP_PROP_FRAME_COUNT = 7
 #: Frame width, in pixels.
 pub const CAP_PROP_FRAME_WIDTH = 3
 #: Frame height, in pixels.
@@ -41,6 +61,17 @@ pub let PERMISSION_HELP = "macOS grants camera access per application, and a com
     "jaithon binary) under System Settings > Privacy & Security > Camera, " +
     "then run again."
 
+#: Pack a four-character code back into the int `CAP_PROP_FOURCC` reports,
+#: which is the same packing `fourcc` in `writer.jai` does from four strings.
+fn fourcc_of(code: str) -> int {
+    var packed = 0
+    for index in 0..4 {
+        let byte = if index < code.len() { ord(code[index]) } else { 32 }
+        packed = packed | byte << index * 8
+    }
+    return packed
+}
+
 #: Whether the camera has been granted access, and whether it has been asked.
 pub fn permission() -> int { return __prim__.camera_permission() }
 
@@ -60,29 +91,40 @@ pub fn device_names() -> list[str] {
     return names
 }
 
-#: A live camera, read frame by frame.
+#: A camera or a video file, read frame by frame.
 pub class VideoCapture {
     var handle: int
+    var file: AviReader?
     var requested: Size
     var requested_fps: float
     var frames: int
     var reason: str
     var grabbed: Mat?
 
-    #: Open camera `index`. A zero width, height or rate lets the device pick.
-    pub fn init(self, index: int = 0, width: int = 0, height: int = 0, fps: float = 0.0) {
+    #: Open camera `source`, or the video file `source` names.
+    #:
+    #: A zero width, height or rate lets a camera pick; a file ignores all
+    #: three, since what it holds was decided when it was written.
+    pub fn init(self, source: any = 0, width: int = 0, height: int = 0, fps: float = 0.0) {
         self.requested = Size(width, height)
         self.requested_fps = fps
         self.frames = 0
         self.reason = ""
         self.grabbed = null
         self.handle = -1
-        self.open(index, width: width, height: height, fps: fps)
+        self.file = null
+        self.open(source, width: width, height: height, fps: fps)
     }
 
-    #: Open, or reopen on a different device. Returns whether it worked.
-    pub fn open(self, index: int, width: int = 0, height: int = 0, fps: float = 0.0) -> bool {
+    #: Open, or reopen on a different source. Returns whether it worked.
+    pub fn open(self, source: any, width: int = 0, height: int = 0, fps: float = 0.0) -> bool {
         self.release()
+        if source is str { return self.open_file(source) }
+        if not source is int {
+            self.reason = "a capture opens a camera index or a file path"
+            return false
+        }
+        let index = source
         if device_count() == 0 {
             self.reason = "no camera is attached"
             return false
@@ -105,8 +147,27 @@ pub class VideoCapture {
         return false
     }
 
+    #: A video file. Failure is reported the same way a camera's is -- through
+    #: `is_opened` and `why` -- rather than by raising, because a caller that
+    #: wrote `VideoCapture(path)` in place of `VideoCapture(0)` should not have
+    #: to change how it handles the failure.
+    fn open_file(self, path: str) -> bool {
+        try {
+            let reader = AviReader(path)
+            self.file = reader
+            self.requested = Size(reader.width, reader.height)
+            self.requested_fps = reader.fps
+            self.reason = ""
+            return true
+        } catch e: Error {
+            self.file = null
+            self.reason = str(e)
+            return false
+        }
+    }
+
     #: Whether frames can be read.
-    pub fn is_opened(self) -> bool { return self.handle >= 0 }
+    pub fn is_opened(self) -> bool { return self.handle >= 0 or self.file is not null }
 
     #: Why the last `open` failed, or the empty string when it did not.
     pub fn why(self) -> str { return self.reason }
@@ -116,6 +177,15 @@ pub class VideoCapture {
     #: Returns `(false, empty)` when the camera is closed or no frame arrived
     #: within `timeout` seconds.
     pub fn read(self, timeout: float = 5.0) -> tuple[bool, Mat] {
+        let clip = self.file
+        if clip is not null {
+            if self.frames >= clip.frame_count() {
+                return (false, Mat(0, 0, CV_MAKETYPE(CV_8U, 3)))
+            }
+            let frame = clip.frame(self.frames)
+            self.frames += 1
+            return (true, frame)
+        }
         if self.handle < 0 { return (false, Mat(0, 0, CV_MAKETYPE(CV_8U, 3))) }
         let frame = __prim__.camera_read(self.handle, timeout)
         if frame is null { return (false, Mat(0, 0, CV_MAKETYPE(CV_8U, 3))) }
@@ -135,6 +205,9 @@ pub class VideoCapture {
 
     #: Read the next frame with its alpha channel left on.
     pub fn read_bgra(self, timeout: float = 5.0) -> tuple[bool, Mat] {
+        if self.file is not null {
+            throw RuntimeError("a video file has no alpha channel to keep")
+        }
         if self.handle < 0 { return (false, Mat(0, 0, CV_MAKETYPE(CV_8U, 4))) }
         let frame = __prim__.camera_read(self.handle, timeout)
         if frame is null { return (false, Mat(0, 0, CV_MAKETYPE(CV_8U, 4))) }
@@ -163,6 +236,24 @@ pub class VideoCapture {
         if property == CAP_PROP_POS_FRAMES { return float(self.frames) }
         if property == CAP_PROP_FPS { return self.requested_fps }
         if property == CAP_PROP_CHANNEL { return 3.0 }
+        let clip = self.file
+        if clip is not null {
+            if property == CAP_PROP_FRAME_WIDTH { return float(clip.width) }
+            if property == CAP_PROP_FRAME_HEIGHT { return float(clip.height) }
+            if property == CAP_PROP_FRAME_COUNT { return float(clip.frame_count()) }
+            if property == CAP_PROP_FOURCC { return float(fourcc_of(clip.codec)) }
+            if property == CAP_PROP_POS_MSEC {
+                if clip.fps <= 0.0 { return 0.0 }
+                return float(self.frames) * 1000.0 / clip.fps
+            }
+            if property == CAP_PROP_POS_AVI_RATIO {
+                let total = clip.frame_count()
+                if total == 0 { return 0.0 }
+                return float(self.frames) / float(total)
+            }
+            return 0.0
+        }
+        if property == CAP_PROP_FRAME_COUNT { return 0.0 }
         if self.handle < 0 { return 0.0 }
         let size = __prim__.camera_size(self.handle)
         if size is null { return 0.0 }
@@ -174,6 +265,24 @@ pub class VideoCapture {
     #: Set one of the `CAP_PROP_` properties. Size and rate take effect by
     #: reopening the device, which is the only way AVFoundation offers.
     pub fn set(self, property: int, value: float) -> bool {
+        let clip = self.file
+        if clip is not null {
+            #: Seeking a file is setting which frame comes next, and the reader
+            #: indexed every one of them when it opened, so it costs nothing.
+            #: A camera has no frames to go back to and refuses.
+            if property == CAP_PROP_POS_FRAMES {
+                let at = int(value)
+                if at < 0 or at > clip.frame_count() { return false }
+                self.frames = at
+                return true
+            }
+            if property == CAP_PROP_POS_AVI_RATIO {
+                if value < 0.0 or value > 1.0 { return false }
+                self.frames = int(value * float(clip.frame_count()))
+                return true
+            }
+            return false
+        }
         if property == CAP_PROP_FRAME_WIDTH {
             self.requested = Size(int(value), self.requested.height)
         } elif property == CAP_PROP_FRAME_HEIGHT {
@@ -188,17 +297,25 @@ pub class VideoCapture {
 
     #: The size of the frames arriving, once one has.
     pub fn frame_size(self) -> Size? {
+        let clip = self.file
+        if clip is not null { return clip.frame_size() }
         if self.handle < 0 { return null }
         let size = __prim__.camera_size(self.handle)
         if size is null { return null }
         return Size(size[0], size[1])
     }
 
-    #: Stop the capture and free the device.
+    #: Stop the capture and free the device or close the file.
     pub fn release(self) -> void {
+        let clip = self.file
+        if clip is not null {
+            clip.release()
+            self.file = null
+        }
+        self.grabbed = null
+        self.frames = 0
         if self.handle < 0 { return }
         __prim__.camera_close(self.handle)
         self.handle = -1
-        self.grabbed = null
     }
 }

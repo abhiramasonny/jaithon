@@ -389,8 +389,20 @@ fn idct_8x8(block: list[float], out: list[float]) -> void {
 pub fn decode(data: bytes) -> Mat {
     if not looks_like(data) { throw ValueError("this is not a JPEG") }
     var quant: dict[int, list[int]] = {}
-    var dc_tables: dict[int, HuffmanTable] = {}
-    var ac_tables: dict[int, HuffmanTable] = {}
+    #: Seeded with the tables of the standard's Annex K. A conforming JPEG
+    #: sends its own DHT and overwrites all four before the scan, so this
+    #: changes nothing for one; a motion-JPEG frame out of an AVI usually sends
+    #: no DHT at all, because the tables are the same in every frame and the
+    #: format leaves them implied. Without this such a frame decodes to
+    #: whatever the missing table would have said, which is nothing.
+    var dc_tables: dict[int, HuffmanTable] = {
+        0: HuffmanTable(DC_LUMA_COUNTS, DC_LUMA_VALUES),
+        1: HuffmanTable(DC_CHROMA_COUNTS, DC_CHROMA_VALUES),
+    }
+    var ac_tables: dict[int, HuffmanTable] = {
+        0: HuffmanTable(AC_LUMA_COUNTS, AC_LUMA_VALUES),
+        1: HuffmanTable(AC_CHROMA_COUNTS, AC_CHROMA_VALUES),
+    }
     var components: list[Component] = []
     var frame_width = 0
     var frame_height = 0
