@@ -168,6 +168,23 @@ kernel void reduce_leading4(device const float* upstream [[buffer(0)]],
     *((device float4*)(grad_small + col)) = total;
 }
 
+kernel void reduce_leading_split(device const float* upstream [[buffer(0)]],
+                                 device float* partials [[buffer(1)]],
+                                 constant uint& outer [[buffer(2)]],
+                                 constant uint& inner [[buffer(3)]],
+                                 constant uint& chunks [[buffer(4)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id >= inner * chunks) return;
+    uint col = id % inner;
+    uint chunk = id / inner;
+    uint per = (outer + chunks - 1u) / chunks;
+    uint start = chunk * per;
+    uint stop = min(start + per, outer);
+    float total = 0.0f;
+    for (uint row = start; row < stop; ++row) total += upstream[row * inner + col];
+    partials[chunk * inner + col] = total;
+}
+
 kernel void unary_backward_op(device const float* saved [[buffer(0)]],
                               device const float* upstream [[buffer(1)]],
                               device float* grad_input [[buffer(2)]],
@@ -1710,6 +1727,38 @@ fn reduce_leading(upstream: Tensor, small_shape: list[int], out: Tensor? = null)
     } else {
         Tensor(small_shape)
     }
+    #: One thread a column reads every row of that column, which is fine while
+    #: the columns outnumber the rows -- a dense layer's bias gradient is a
+    #: hundred rows against a thousand columns. A convolution's is the other way
+    #: round: thirty-two columns against a hundred and thirty thousand rows, so
+    #: thirty-two threads did four million serial reads while the rest of the
+    #: GPU sat idle, and it cost twelve times the whole rest of the layer.
+    #: Splitting the rows first gives the machine something to do.
+    let SPLIT_ROWS = 4096
+    if outer > SPLIT_ROWS and inner * 64 < outer {
+        let chunks = min(256, (outer + SPLIT_ROWS - 1) // SPLIT_ROWS)
+        let partials = Tensor([chunks * inner])
+        cached_kernel("reduce_leading_split").dispatch_async(
+            [upstream.buffer(), partials.buffer()],
+            inner * chunks,
+            [outer, inner, chunks]
+        )
+        if inner % 4 == 0 {
+            cached_kernel("reduce_leading4").dispatch_async(
+                [partials.buffer(), output.buffer()],
+                inner // 4,
+                [chunks, inner]
+            )
+        } else {
+            cached_kernel("reduce_leading").dispatch_async(
+                [partials.buffer(), output.buffer()],
+                inner,
+                [chunks, inner]
+            )
+        }
+        partials.free()
+        return output
+    }
     if inner % 4 == 0 {
         let kernel = cached_kernel("reduce_leading4")
         kernel.dispatch_async([upstream.buffer(), output.buffer()], inner // 4, [outer, inner])
@@ -2050,6 +2099,7 @@ pub fn warmup_kernels() -> void {
     cached_kernel("unary_backward_relu4")
     cached_kernel("reduce_leading")
     cached_kernel("reduce_leading4")
+    cached_kernel("reduce_leading_split")
     cached_kernel("add_scaled_into")
     cached_kernel("add_correct_into")
     cached_kernel("im2col_nhwc")
@@ -3170,36 +3220,81 @@ fn attach_conv_grad(
         let k = kh * kw * cin
         let rows = n * out_h * out_w
         let flat_up = Tensor([rows, cout], storage: upstream.buffer().view(0, rows * cout))
-        let col = Tensor([rows, k])
-        let im2col = cached_kernel("im2col_nhwc")
-        im2col.dispatch_async(
-            [input.buffer(), col.buffer()],
-            rows * k,
-            [n, h, w, cin, kh, kw, stride, stride, padding, padding]
-        )
-        let grad_flat_w = raw_matmul(col, flat_up, trans_a: true)
-        col.free()
-        let grad_weights = Tensor(
-            [kh, kw, cin, cout],
-            storage: grad_flat_w.buffer().view(0, k * cout)
-        )
-        let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
-        let grad_col = raw_matmul(flat_up, flat_w, trans_b: true)
+        let grad_weights = Tensor([kh, kw, cin, cout])
         let grad_input = Tensor([n, h, w, cin])
-        let col2im = cached_kernel("col2im_nhwc")
-        col2im.dispatch_async(
-            [grad_col.buffer(), grad_input.buffer()],
-            grad_input.size,
-            [n, h, w, cin, kh, kw, stride, stride, padding, padding]
-        )
-        grad_col.free()
-        var grads = [grad_input, grad_weights]
-        if wants_bias {
-            let grad_bias = Tensor([cout])
-            let reduce = cached_kernel("reduce_leading")
-            reduce.dispatch_async([flat_up.buffer(), grad_bias.buffer()], cout, [rows, cout])
-            grads.push(grad_bias)
+
+        #: The device's own convolution gradients when it has them. The im2col
+        #: pair below computes the same two tensors, and does it by building a
+        #: `[n * out_h * out_w, kh * kw * cin]` matrix twice per step: a
+        #: hundred and fifty megabytes allocated, filled and dropped on every
+        #: batch of a sixty-four-channel layer. Either may be declined on its
+        #: own -- a shape MPS will not take, or no device at all -- so each is
+        #: asked for separately and each has its own fallback.
+        var have_weights_grad = false
+        var have_input_grad = false
+        try {
+            have_weights_grad = gpu.conv2d_weights_grad_async(
+                upstream.buffer(),
+                input.buffer(),
+                grad_weights.buffer(),
+                n,
+                h,
+                w,
+                cin,
+                cout,
+                kh,
+                kw,
+                stride_h: stride,
+                stride_w: stride,
+                pad_h: padding,
+                pad_w: padding
+            )
+            have_input_grad = gpu.conv2d_data_grad_async(
+                upstream.buffer(),
+                weights.buffer(),
+                grad_input.buffer(),
+                n,
+                h,
+                w,
+                cin,
+                cout,
+                kh,
+                kw,
+                stride_h: stride,
+                stride_w: stride,
+                pad_h: padding,
+                pad_w: padding
+            )
+        } catch _error: RuntimeError {
+            have_weights_grad = false
+            have_input_grad = false
         }
+
+        if not have_weights_grad {
+            let col = Tensor([rows, k])
+            let im2col = cached_kernel("im2col_nhwc")
+            im2col.dispatch_async(
+                [input.buffer(), col.buffer()],
+                rows * k,
+                [n, h, w, cin, kh, kw, stride, stride, padding, padding]
+            )
+            let flat_gw = Tensor([k, cout], storage: grad_weights.buffer())
+            raw_matmul(col, flat_up, trans_a: true, out: flat_gw)
+            col.free()
+        }
+        if not have_input_grad {
+            let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
+            let grad_col = raw_matmul(flat_up, flat_w, trans_b: true)
+            let col2im = cached_kernel("col2im_nhwc")
+            col2im.dispatch_async(
+                [grad_col.buffer(), grad_input.buffer()],
+                grad_input.size,
+                [n, h, w, cin, kh, kw, stride, stride, padding, padding]
+            )
+            grad_col.free()
+        }
+        var grads = [grad_input, grad_weights]
+        if wants_bias { grads.push(reduce_leading(flat_up, [cout])) }
         return grads
     }))
 }

@@ -150,6 +150,21 @@ bool          jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                   uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
                                   uint32_t cout, uint32_t kh, uint32_t kw,
                                   uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
+/* The same convolution's two gradients, taken by the same primitives the
+ * forward pass uses. Both return false for a shape MPS will not take, and the
+ * caller falls back to its own im2col. */
+bool          jaiGpuConv2dDataGradBuffers(JaiGpuBuffer *grad, size_t gradOffset,
+                                  JaiGpuBuffer *weights, size_t weightsOffset,
+                                  JaiGpuBuffer *out, size_t outOffset,
+                                  uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                  uint32_t cout, uint32_t kh, uint32_t kw,
+                                  uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
+bool          jaiGpuConv2dWeightsGradBuffers(JaiGpuBuffer *grad, size_t gradOffset,
+                                  JaiGpuBuffer *input, size_t inputOffset,
+                                  JaiGpuBuffer *out, size_t outOffset,
+                                  uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                  uint32_t cout, uint32_t kh, uint32_t kw,
+                                  uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
 /* Two-layer ReLU + linear MLP: one fused SGD step. Updates weights in place
  * and adds the batch's total cross-entropy and correct-class count into
  * lossAcc / correctAcc. */

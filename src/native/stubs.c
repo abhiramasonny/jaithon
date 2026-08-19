@@ -287,6 +287,52 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
     return false;
 }
 
+static bool stubConvGradient(JaiGpuBuffer *grad, size_t gradOffset,
+                             JaiGpuBuffer *other, size_t otherOffset,
+                             JaiGpuBuffer *out, size_t outOffset,
+                             uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                             uint32_t cout, uint32_t kh, uint32_t kw,
+                             uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    (void)grad;
+    (void)gradOffset;
+    (void)other;
+    (void)otherOffset;
+    (void)out;
+    (void)outOffset;
+    (void)n;
+    (void)h;
+    (void)w;
+    (void)cin;
+    (void)cout;
+    (void)kh;
+    (void)kw;
+    (void)sh;
+    (void)sw;
+    (void)ph;
+    (void)pw;
+    return false;
+}
+
+bool jaiGpuConv2dDataGradBuffers(JaiGpuBuffer *grad, size_t gradOffset,
+                                 JaiGpuBuffer *weights, size_t weightsOffset,
+                                 JaiGpuBuffer *out, size_t outOffset,
+                                 uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                 uint32_t cout, uint32_t kh, uint32_t kw,
+                                 uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    return stubConvGradient(grad, gradOffset, weights, weightsOffset, out, outOffset,
+                            n, h, w, cin, cout, kh, kw, sh, sw, ph, pw);
+}
+
+bool jaiGpuConv2dWeightsGradBuffers(JaiGpuBuffer *grad, size_t gradOffset,
+                                    JaiGpuBuffer *input, size_t inputOffset,
+                                    JaiGpuBuffer *out, size_t outOffset,
+                                    uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                    uint32_t cout, uint32_t kh, uint32_t kw,
+                                    uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    return stubConvGradient(grad, gradOffset, input, inputOffset, out, outOffset,
+                            n, h, w, cin, cout, kh, kw, sh, sw, ph, pw);
+}
+
 bool jaiGpuMlpSgdStep(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1Off,
                       JaiGpuBuffer *b1, size_t b1Off, JaiGpuBuffer *w2, size_t w2Off,
                       JaiGpuBuffer *b2, size_t b2Off, JaiGpuBuffer *labels, size_t labOff,

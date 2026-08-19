@@ -1532,6 +1532,50 @@ bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
     }
 }
 
+/* A graph compiled once and kept, rather than re-encoded per call.
+ *
+ * MPSGraph's own `encodeToCommandBuffer` re-plans the graph every time. For a
+ * matmul that is lost in the multiply; for a convolution it is milliseconds of
+ * CPU per encode, and a training step encodes three of them per layer. The
+ * fused MLP path has compiled its graph since it was written for exactly this
+ * reason -- `cachedMlpExecutable` -- and convolution had not, which is most of
+ * why tests/bench/jaitensor's conv workloads were an order of magnitude behind
+ * their peer with the arithmetic already on the same primitives.
+ *
+ * Returns nil when the graph will not compile, and every caller falls back to
+ * encoding the graph directly. */
+static MPSGraphExecutable *compiledGraph(MPSGraph *graph,
+                                         NSArray<MPSGraphTensor *> *feeds,
+                                         NSArray<NSArray<NSNumber *> *> *shapes,
+                                         NSArray<MPSGraphTensor *> *targets) {
+    if (graph == nil || feeds == nil || shapes == nil || targets == nil) return nil;
+    if (feeds.count != shapes.count) return nil;
+    if (@available(macOS 12.0, *)) {
+        NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *types =
+            [NSMutableDictionary dictionaryWithCapacity:feeds.count];
+        for (NSUInteger i = 0; i < feeds.count; i++) {
+            types[feeds[i]] = [[MPSGraphShapedType alloc] initWithShape:shapes[i]
+                                                              dataType:MPSDataTypeFloat32];
+        }
+        MPSGraphCompilationDescriptor *comp = nil;
+        if (@available(macOS 12.3, *)) {
+            comp = [MPSGraphCompilationDescriptor new];
+            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+        }
+        return [graph compileWithDevice:nil
+                                  feeds:types
+                          targetTensors:targets
+                       targetOperations:nil
+                  compilationDescriptor:comp];
+    }
+    return nil;
+}
+
+static bool encodeMlpExecutableOnAsync(
+    MPSGraphExecutable *exec,
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feedMap,
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *resultMap);
+
 bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                          JaiGpuBuffer *weights, size_t weightsOffset,
                          JaiGpuBuffer *bias, size_t biasOffset,
@@ -1612,6 +1656,15 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                 }
                 NSMutableArray *built = [@[ graph, src, filt, product ] mutableCopy];
                 if (biasT != nil) [built addObject:biasT];
+                NSMutableArray *feeds = [@[ src, filt ] mutableCopy];
+                NSMutableArray *shapes = [@[ @[ @(n), @(h), @(w), @(cin) ],
+                                             @[ @(kh), @(kw), @(cin), @(cout) ] ] mutableCopy];
+                if (biasT != nil) {
+                    [feeds addObject:biasT];
+                    [shapes addObject:@[ @(cout) ]];
+                }
+                MPSGraphExecutable *exec = compiledGraph(graph, feeds, shapes, @[ product ]);
+                [built addObject:(exec != nil ? (id)exec : (id)[NSNull null])];
                 cached = built;
                 graphs[key] = cached;
             }
@@ -1635,10 +1688,161 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                 feeds[cached[4]] = dataB;
             }
             NSMutableDictionary *results = [@{product : dataY} mutableCopy];
+            id last = cached[cached.count - 1];
+            if ([last isKindOfClass:[MPSGraphExecutable class]]) {
+                if (encodeMlpExecutableOnAsync((MPSGraphExecutable *)last, feeds, results)) {
+                    return true;
+                }
+            }
             if (!encodeGraphOnAsync(graph, feeds, results)) return false;
         }
         return true;
     }
+}
+
+/* The two convolution gradients, from the same MPSGraph the forward pass uses.
+ *
+ * jaitensor's own backward is im2col plus two products, which rebuilds a
+ * [batch * outH * outW, kh * kw * cin] matrix per step: for the second layer of
+ * tests/bench/jaitensor's conv-wide that is a hundred and fifty megabytes
+ * allocated, filled and thrown away on every batch, and it is why convolution
+ * was the one part of the library an order of magnitude behind its peer. These
+ * hand the work to the same primitives PyTorch reaches, and the im2col path
+ * stays as the fallback for a shape MPS will not take.
+ *
+ * `mode` picks which gradient: 0 the one with respect to the input, 1 the one
+ * with respect to the weights. They differ only in which tensor is the second
+ * input and what shape comes out, so one graph builder covers both and there is
+ * one place to keep the descriptor in step with the forward pass. */
+static bool convGradient(int mode,
+                         JaiGpuBuffer *grad, size_t gradOffset,
+                         JaiGpuBuffer *other, size_t otherOffset,
+                         JaiGpuBuffer *out, size_t outOffset,
+                         uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                         uint32_t cout, uint32_t kh, uint32_t kw,
+                         uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    if (grad == NULL || other == NULL || out == NULL) return false;
+    if (grad->buffer == NULL || other->buffer == NULL || out->buffer == NULL) return false;
+    if (n == 0 || h == 0 || w == 0 || cin == 0 || cout == 0 || kh == 0 || kw == 0) return false;
+    if (sh == 0 || sw == 0) return false;
+    if (!ensureDevice()) return false;
+    if (h + 2 * ph < kh || w + 2 * pw < kw) return false;
+
+    const uint32_t outH = (h + 2 * ph - kh) / sh + 1;
+    const uint32_t outW = (w + 2 * pw - kw) / sw + 1;
+    const size_t gradBytes = (size_t)n * outH * outW * cout * sizeof(float);
+    const size_t inBytes = (size_t)n * h * w * cin * sizeof(float);
+    const size_t wBytes = (size_t)kh * kw * cin * cout * sizeof(float);
+    const size_t otherBytes = mode == 0 ? wBytes : inBytes;
+    const size_t resultBytes = mode == 0 ? inBytes : wBytes;
+    if (gradOffset + gradBytes > grad->bytes) return false;
+    if (otherOffset + otherBytes > other->bytes) return false;
+    if (outOffset + resultBytes > out->bytes) return false;
+    /* Same alignment quantum the forward pass respects. */
+    if (grad->bytes < 512 || other->bytes < 512 || out->bytes < 512) return false;
+
+    @autoreleasepool {
+        @synchronized(gQueue) {
+            static NSMutableDictionary<NSString *, NSArray *> *graphs;
+            if (graphs == nil) graphs = [[NSMutableDictionary alloc] init];
+            NSString *key = [NSString stringWithFormat:
+                @"convgrad:%d:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+                mode, n, h, w, cin, cout, kh, kw, sh, sw, ph, pw];
+            NSArray *cached = graphs[key];
+            if (cached == nil) {
+                MPSGraph *graph = [[MPSGraph alloc] init];
+                graph.options = MPSGraphOptionsNone;
+                NSArray *gradShape = @[ @(n), @(outH), @(outW), @(cout) ];
+                NSArray *srcShape = @[ @(n), @(h), @(w), @(cin) ];
+                NSArray *filtShape = @[ @(kh), @(kw), @(cin), @(cout) ];
+                MPSGraphTensor *dy = [graph placeholderWithShape:gradShape
+                                                        dataType:MPSDataTypeFloat32
+                                                            name:@"dY"];
+                MPSGraphTensor *second =
+                    [graph placeholderWithShape:(mode == 0 ? filtShape : srcShape)
+                                       dataType:MPSDataTypeFloat32
+                                           name:@"other"];
+                MPSGraphConvolution2DOpDescriptor *desc =
+                    [MPSGraphConvolution2DOpDescriptor
+                        descriptorWithStrideInX:sw
+                                      strideInY:sh
+                                 dilationRateInX:1
+                                 dilationRateInY:1
+                                         groups:1
+                                    paddingLeft:pw
+                                   paddingRight:pw
+                                     paddingTop:ph
+                                  paddingBottom:ph
+                                   paddingStyle:MPSGraphPaddingStyleExplicit
+                                     dataLayout:MPSGraphTensorNamedDataLayoutNHWC
+                                  weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
+                MPSGraphTensor *result = nil;
+                if (mode == 0) {
+                    result = [graph convolution2DDataGradientWithIncomingGradientTensor:dy
+                                                                         weightsTensor:second
+                                                                           outputShape:srcShape
+                                                          forwardConvolutionDescriptor:desc
+                                                                                  name:@"dX"];
+                } else {
+                    result = [graph convolution2DWeightsGradientWithIncomingGradientTensor:dy
+                                                                             sourceTensor:second
+                                                                              outputShape:filtShape
+                                                             forwardConvolutionDescriptor:desc
+                                                                                     name:@"dW"];
+                }
+                if (result == nil) return false;
+                NSArray *feedShapes = mode == 0
+                    ? @[ gradShape, filtShape ]
+                    : @[ gradShape, srcShape ];
+                MPSGraphExecutable *exec =
+                    compiledGraph(graph, @[ dy, second ], feedShapes, @[ result ]);
+                cached = @[ graph, dy, second, result,
+                            (exec != nil ? (id)exec : (id)[NSNull null]) ];
+                graphs[key] = cached;
+            }
+
+            MPSGraphTensorData *dataG = graphData(grad, gradOffset,
+                                                  @[ @(n), @(outH), @(outW), @(cout) ]);
+            MPSGraphTensorData *dataO =
+                graphData(other, otherOffset,
+                          mode == 0 ? @[ @(kh), @(kw), @(cin), @(cout) ]
+                                    : @[ @(n), @(h), @(w), @(cin) ]);
+            MPSGraphTensorData *dataR =
+                graphData(out, outOffset,
+                          mode == 0 ? @[ @(n), @(h), @(w), @(cin) ]
+                                    : @[ @(kh), @(kw), @(cin), @(cout) ]);
+            if (dataG == nil || dataO == nil || dataR == nil) return false;
+            NSMutableDictionary *feeds = [@{cached[1] : dataG, cached[2] : dataO} mutableCopy];
+            NSMutableDictionary *results = [@{cached[3] : dataR} mutableCopy];
+            if ([cached[4] isKindOfClass:[MPSGraphExecutable class]]) {
+                if (encodeMlpExecutableOnAsync((MPSGraphExecutable *)cached[4], feeds, results)) {
+                    return true;
+                }
+            }
+            if (!encodeGraphOnAsync(cached[0], feeds, results)) return false;
+        }
+        return true;
+    }
+}
+
+bool jaiGpuConv2dDataGradBuffers(JaiGpuBuffer *grad, size_t gradOffset,
+                                 JaiGpuBuffer *weights, size_t weightsOffset,
+                                 JaiGpuBuffer *out, size_t outOffset,
+                                 uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                 uint32_t cout, uint32_t kh, uint32_t kw,
+                                 uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    return convGradient(0, grad, gradOffset, weights, weightsOffset, out, outOffset,
+                        n, h, w, cin, cout, kh, kw, sh, sw, ph, pw);
+}
+
+bool jaiGpuConv2dWeightsGradBuffers(JaiGpuBuffer *grad, size_t gradOffset,
+                                    JaiGpuBuffer *input, size_t inputOffset,
+                                    JaiGpuBuffer *out, size_t outOffset,
+                                    uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
+                                    uint32_t cout, uint32_t kh, uint32_t kw,
+                                    uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    return convGradient(1, grad, gradOffset, input, inputOffset, out, outOffset,
+                        n, h, w, cin, cout, kh, kw, sh, sw, ph, pw);
 }
 
 static NSMutableDictionary<NSString *, NSArray *> *gMlpGraphs;
