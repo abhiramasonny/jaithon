@@ -172,6 +172,12 @@ from .calib3d.calibrate import SOLVEPNP_ITERATIVE
 
 from .core.linalg import identity, inverse, levenberg_marquardt, null_space, symmetric_eigen
 
+from .core.dft import dct, dft, get_optimal_dft_size, idft, mul_spectrums
+from .core.dft import DFT_COMPLEX_OUTPUT, DFT_INVERSE, DFT_REAL_OUTPUT, DFT_ROWS, DFT_SCALE
+
+from .core.cluster import kmeans, PCA
+from .core.cluster import KMEANS_PP_CENTERS, KMEANS_RANDOM_CENTERS, KMEANS_USE_INITIAL_LABELS
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -323,6 +329,12 @@ export { calibrate_camera, draw_chessboard_corners, find_chessboard_corners }
 export { solve_pnp, undistort, SOLVEPNP_ITERATIVE }
 
 export { identity, inverse, levenberg_marquardt, null_space, symmetric_eigen }
+
+export { dct, dft, get_optimal_dft_size, idft, mul_spectrums }
+export { DFT_COMPLEX_OUTPUT, DFT_INVERSE, DFT_REAL_OUTPUT, DFT_ROWS, DFT_SCALE }
+
+export { kmeans, PCA }
+export { KMEANS_PP_CENTERS, KMEANS_RANDOM_CENTERS, KMEANS_USE_INITIAL_LABELS }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

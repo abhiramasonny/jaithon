@@ -62,6 +62,10 @@ from jaicv.calib3d.transform import triangulate_points, undistort_points
 from jaicv.core.types import Point3f
 from jaicv.calib3d.calibrate import calibrate_camera, find_chessboard_corners
 from jaicv.calib3d.calibrate import solve_pnp, undistort
+from jaicv.core.dft import dct, dft, get_optimal_dft_size, idft
+from jaicv.core.dft import DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
+from jaicv.core.cluster import PCA
+from jaicv.core.linalg import matmul as linalg_matmul, transpose as linalg_transpose
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -178,6 +182,7 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     #: chessboard, where a pixel either side of an edge differs by the whole
     #: range, that shows up as a few levels along every edge.
     if name == "undistort" { return 4.0 }
+    if TRANSFORM_NAMES.contains(name) { return 1e-4 }
     if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
@@ -701,6 +706,26 @@ fn run_cascade(item: Case) -> Mat {
     return Mat.from_list(found.len(), 4, CV_MAKETYPE(4, 1), values)
 }
 
+let TRANSFORM_NAMES = ["dft", "idft", "dct", "getOptimalDFTSize", "pcaMean", "pcaBasis"]
+
+fn run_transform(item: Case) -> Mat {
+    if item.name == "dft" { return dft(item.source, DFT_COMPLEX_OUTPUT) }
+    if item.name == "idft" {
+        return idft(dft(item.source, DFT_COMPLEX_OUTPUT), DFT_SCALE | DFT_REAL_OUTPUT)
+    }
+    if item.name == "dct" { return dct(item.source) }
+    if item.name == "getOptimalDFTSize" {
+        var values: list[float] = []
+        for n in 1..41 { values.push(float(get_optimal_dft_size(n))) }
+        return Mat.from_list(1, 40, CV_MAKETYPE(5, 1), values)
+    }
+    let analysis = PCA(item.source, 2)
+    if item.name == "pcaMean" { return analysis.mean }
+    #: Comparing the basis directly would compare the sign each side happened
+    #: to pick; the outer product does not carry one.
+    return linalg_matmul(linalg_transpose(analysis.eigenvectors), analysis.eigenvectors)
+}
+
 let CALIBRATE_NAMES = ["findChessboardCorners", "solvePnP", "calibrateCamera", "undistort"]
 
 fn calibration_grid() -> list[Point3f] {
@@ -984,6 +1009,7 @@ fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
     if CALIB_NAMES.contains(item.name) { return run_calib(item) }
     if CALIBRATE_NAMES.contains(item.name) { return run_calibrate(item) }
+    if TRANSFORM_NAMES.contains(item.name) { return run_transform(item) }
     if item.name == "cascadeDetect" { return run_cascade(item) }
     if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }

@@ -773,6 +773,36 @@ def write_calibrate(handle) -> None:
          cv2.undistort(scene, small_camera, small_dist))
 
 
+def write_transform(handle) -> None:
+    rng = np.random.default_rng(171)
+    for rows, cols in ((1, 8), (1, 12), (4, 6), (5, 5), (6, 10), (1, 7)):
+        signal = rng.standard_normal((rows, cols)).astype(np.float32)
+        spectrum = cv2.dft(signal, flags=cv2.DFT_COMPLEX_OUTPUT)
+        case(handle, "dft", f"{rows} {cols}", signal, spectrum)
+        back = cv2.idft(spectrum, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
+        case(handle, "idft", f"{rows} {cols}", signal, back.reshape(rows, cols).astype(np.float32))
+
+    for rows, cols in ((4, 8), (6, 6)):
+        signal = rng.standard_normal((rows, cols)).astype(np.float32)
+        case(handle, "dct", f"{rows} {cols}", signal, cv2.dct(signal))
+
+    blank = np.zeros((4, 4), np.uint8)
+    sizes = np.array([[float(cv2.getOptimalDFTSize(n)) for n in range(1, 41)]], np.float32)
+    case(handle, "getOptimalDFTSize", "1to40", blank, sizes)
+
+    samples = np.vstack([
+        rng.normal(0.0, 0.35, size=(30, 2)) + np.array([0.0, 0.0]),
+        rng.normal(0.0, 0.35, size=(30, 2)) + np.array([5.0, 5.0]),
+        rng.normal(0.0, 0.35, size=(30, 2)) + np.array([5.0, 0.0]),
+    ]).astype(np.float32)
+    mean, vectors = cv2.PCACompute(samples, mean=None)
+    case(handle, "pcaMean", "clusters", samples, mean.astype(np.float32))
+    # An eigenvector is only defined up to its sign, so the recorded value is
+    # the outer product, which is not.
+    outer = vectors.T @ vectors
+    case(handle, "pcaBasis", "clusters", samples, outer.astype(np.float32))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -791,6 +821,7 @@ def main() -> int:
         write_cascade(handle)
         write_calib(handle)
         write_calibrate(handle)
+        write_transform(handle)
     print(f"wrote {OUT}")
     return 0
 
