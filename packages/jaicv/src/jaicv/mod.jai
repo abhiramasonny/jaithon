@@ -194,6 +194,13 @@ from .ml.models import SVM_LINEAR, SVM_POLY, SVM_RBF
 from .dnn.blob import blob_from_image, blob_from_images, images_from_blob
 from .dnn.blob import net_from, nms_boxes, nms_boxes_batched, Net, Runnable
 
+from .core.misc import border_interpolate, calc_covar_matrix, check_range, determinant
+from .core.misc import eigen, extract_channel, find_non_zero, hconcat, insert_channel
+from .core.misc import mahalanobis, min_max_idx, mul_transposed, patch_nans, randn, randu
+from .core.misc import repeat, rotate, set_identity, set_rng_seed, solve_poly
+from .core.misc import sort, sort_idx, vconcat
+from .core.misc import ROTATE_180, ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -366,6 +373,12 @@ export { SVM_LINEAR, SVM_POLY, SVM_RBF }
 
 export { blob_from_image, blob_from_images, images_from_blob }
 export { net_from, nms_boxes, nms_boxes_batched, Net, Runnable }
+
+export { border_interpolate, calc_covar_matrix, check_range, determinant, eigen }
+export { extract_channel, find_non_zero, hconcat, insert_channel, mahalanobis }
+export { min_max_idx, mul_transposed, patch_nans, randn, randu, repeat, rotate }
+export { set_identity, set_rng_seed, solve_poly, sort, sort_idx, vconcat }
+export { ROTATE_180, ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
