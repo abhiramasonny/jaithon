@@ -414,6 +414,33 @@ fn element_type() -> str {
     return if gpu.mixed_precision() { "half" } else { "float" }
 }
 
+var _forced_read = false
+var _forced: Plan? = null
+
+fn forced_plan() -> Plan? {
+    if _forced_read { return _forced }
+    _forced_read = true
+    let text = env("JAITENSOR_GEMM_PLAN")
+    if text is not null { _forced = plan_from_text(text) }
+    return _forced
+}
+
+var _autotune = -1
+
+fn autotune_enabled() -> bool {
+    if _autotune < 0 { _autotune = if (env("JAITENSOR_AUTOTUNE") ?? "1") != "0" { 1 } else { 0 } }
+    return _autotune == 1
+}
+
+var _verbose = -1
+
+fn autotune_verbose() -> bool {
+    if _verbose < 0 {
+        _verbose = if (env("JAITENSOR_AUTOTUNE_VERBOSE") ?? "0") != "0" { 1 } else { 0 }
+    }
+    return _verbose == 1
+}
+
 #: How one shape is routed: a tile configuration and a K split, or MPSGraph.
 pub class Plan {
     #: `"mpsgraph"` or the kernel entry point that runs the product.
@@ -485,10 +512,6 @@ var _cache: dict[str, Plan] = {}
 var _cache_loaded = false
 var _cache_dirty = false
 
-fn autotune_enabled() -> bool {
-    return (env("JAITENSOR_AUTOTUNE") ?? "1") != "0"
-}
-
 fn cache_path() -> Path {
     let override = env("JAITENSOR_GEMM_CACHE")
     if override is not null { return Path(override) }
@@ -498,10 +521,26 @@ fn cache_path() -> Path {
 fn shape_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> str {
     let a_flag = if trans_a { 1 } else { 0 }
     let b_flag = if trans_b { 1 } else { 0 }
-    return f"{gpu.device_name()}\t{element_type()}\t{rows}\t{inner}\t{columns}\t{a_flag}\t{b_flag}"
+    let prefix = f"{gpu.device_name()}\t{element_type()}"
+    return f"{prefix}\t{rows}\t{inner}\t{columns}\t{a_flag}\t{b_flag}"
 }
 
-fn plan_from_text(text: str) -> Plan? {
+var _memo_key = 0
+var _memo_amp = false
+var _memo: Plan? = null
+
+#: A training step asks for the same handful of shapes on every batch, so the
+#: plan lookup is memoised on the shape itself: a full lookup builds a cache key
+#: string, and doing that per dispatch cost more than encoding the kernel.
+fn memo_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> int {
+    var key = rows * 6291469 + inner
+    key = key * 6291469 + columns
+    key = key * 2 + (if trans_a { 1 } else { 0 })
+    return key * 2 + (if trans_b { 1 } else { 0 })
+}
+
+#: Read back what `Plan.to_str` wrote, or null when the text names no plan.
+pub fn plan_from_text(text: str) -> Plan? {
     let parts = text.split(":")
     if parts.len() != 2 { return null }
     let splits = int(parts[1])
@@ -716,7 +755,7 @@ fn autotune(
     trans_a: bool,
     trans_b: bool
 ) -> Plan {
-    let verbose = (env("JAITENSOR_AUTOTUNE_VERBOSE") ?? "0") != "0"
+    let verbose = autotune_verbose()
     var best = default_plan(rows, inner, columns)
     var best_seconds = 0.0
     var measured = false
@@ -760,28 +799,39 @@ pub fn plan_for(
     trans_a: bool,
     trans_b: bool
 ) -> Plan {
-    let forced = env("JAITENSOR_GEMM_PLAN")
+    let forced = forced_plan()
     if forced is not null {
-        let plan = plan_from_text(forced)
-        if plan is not null {
-            if plan.config < 0 and mps_possible(rows, inner, columns, trans_a, trans_b) {
-                return plan
-            }
-            if config_allowed(CONFIGS[plan.config], rows, inner, columns) { return plan }
+        if forced.config < 0 and mps_possible(rows, inner, columns, trans_a, trans_b) {
+            return forced
         }
+        if forced.config >= 0 and config_allowed(CONFIGS[forced.config], rows, inner, columns) {
+            return forced
+        }
+    }
+    let key_bits = memo_key(rows, inner, columns, trans_a, trans_b)
+    let amp = gpu.mixed_precision()
+    let remembered = _memo
+    if remembered is not null and _memo_key == key_bits and _memo_amp == amp {
+        return remembered
     }
     load_cache()
     let key = shape_key(rows, inner, columns, trans_a, trans_b)
     let cached = _cache.get(key, null)
-    if cached is not null { return cached }
-    if not autotune_enabled() or rows * inner * columns < TUNE_MIN_WORK {
-        let plan = default_plan(rows, inner, columns)
-        _cache[key] = plan
-        return plan
+    if cached is not null {
+        _memo_key = key_bits
+        _memo_amp = amp
+        _memo = cached
+        return cached
     }
-    let plan = autotune(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+    var plan = default_plan(rows, inner, columns)
+    if autotune_enabled() and rows * inner * columns >= TUNE_MIN_WORK {
+        plan = autotune(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+        _cache_dirty = true
+    }
     _cache[key] = plan
-    _cache_dirty = true
+    _memo_key = key_bits
+    _memo_amp = amp
+    _memo = plan
     store_cache()
     return plan
 }

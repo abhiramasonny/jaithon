@@ -394,11 +394,19 @@ pub class Kernel {
     pub static fn compile(source: str, entry: str) -> Kernel {
         _require_device(f"compile the kernel {entry}")
         if entry.len() == 0 { throw ValueError("kernel entry name must not be empty") }
-        let key = entry + "\n" + source
-        let existing = _kernel_intern.get(key, null)
+        #: Nested rather than keyed on `entry + source`: building that key
+        #: copies and rehashes the whole shader library on every call, which
+        #: for a 36 KB one costs more than eighty microseconds -- an order of
+        #: magnitude more than encoding the dispatch it precedes.
+        var byEntry = _kernel_intern.get(entry, null)
+        if byEntry is null {
+            byEntry = {}
+            _kernel_intern[entry] = byEntry
+        }
+        let existing = byEntry.get(source, null)
         if existing is not null and not existing.freed { return existing }
         let kernel = Kernel(entry, __prim__.gpu_compile(source, entry))
-        _kernel_intern[key] = kernel
+        byEntry[source] = kernel
         return kernel
     }
 
@@ -466,7 +474,7 @@ pub class Kernel {
     fn __str__(self) -> str { return f"Kernel({self.entry})" }
 }
 
-var _kernel_intern: dict[str, Kernel] = {}
+var _kernel_intern: dict[str, dict[str, Kernel]] = {}
 
 #: Commit queued async kernels so the GPU can start them, without waiting.
 #:
