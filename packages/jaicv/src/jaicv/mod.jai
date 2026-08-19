@@ -146,6 +146,15 @@ from .video.background import FOREGROUND_VALUE, SHADOW_VALUE
 
 from .video.track import cam_shift, mean_shift, KalmanFilter
 
+from .highgui.window import create_trackbar, destroy_all_windows, destroy_window
+from .highgui.window import get_trackbar_pos, get_window_image_rect, imshow, named_window
+from .highgui.window import set_mouse_callback, set_trackbar_pos, set_window_title
+from .highgui.window import wait_key, wait_key_ex, window_is_open
+from .highgui.window import EVENT_LBUTTONDOWN, EVENT_LBUTTONUP, EVENT_MBUTTONDOWN
+from .highgui.window import EVENT_MBUTTONUP, EVENT_MOUSEMOVE, EVENT_MOUSEWHEEL
+from .highgui.window import EVENT_RBUTTONDOWN, EVENT_RBUTTONUP
+from .highgui.window import WINDOW_AUTOSIZE, WINDOW_KEEPRATIO, WINDOW_NORMAL
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -274,6 +283,14 @@ export { BackgroundSubtractorKNN, BackgroundSubtractorMOG2 }
 export { FOREGROUND_VALUE, SHADOW_VALUE }
 
 export { cam_shift, mean_shift, KalmanFilter }
+
+export { create_trackbar, destroy_all_windows, destroy_window, get_trackbar_pos }
+export { get_window_image_rect, imshow, named_window, set_mouse_callback }
+export { set_trackbar_pos, set_window_title, wait_key, wait_key_ex, window_is_open }
+export { EVENT_LBUTTONDOWN, EVENT_LBUTTONUP, EVENT_MBUTTONDOWN }
+export { EVENT_MBUTTONUP, EVENT_MOUSEMOVE, EVENT_MOUSEWHEEL }
+export { EVENT_RBUTTONDOWN, EVENT_RBUTTONUP }
+export { WINDOW_AUTOSIZE, WINDOW_KEEPRATIO, WINDOW_NORMAL }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
