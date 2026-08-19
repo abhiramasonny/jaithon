@@ -8088,8 +8088,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
             /* A plain function, resolved now and pinned by the same
-             * module-version check. Only one that has itself compiled, since
-             * its return kind is the only way to type the result. */
+             * module-version check. Only one that has itself compiled.
+             *
+             * The stated reason is the return kind, and that reason alone no
+             * longer holds: `emitGlobalCall` learned to fall back on what the
+             * interpreter has watched the callee return. The check is kept
+             * anyway, because dropping it MISCOMPILES. It was tried: every
+             * mutually recursive group declines here -- `value`, `object`,
+             * `array`, `integer` and `walk` are the whole of
+             * tests/bench/json_parse's parser and not one of them ever
+             * compiles -- and admitting them makes the self-hosted parser
+             * unable to parse, with tests/stdlib reporting "expected a newline
+             * after this statement" on ordinary source. Whatever the descriptor
+             * path assumes about a callee that has compiled, it is not only the
+             * return kind, and it is not written down. Do not remove this
+             * without finding out what. */
             Value gv;
             ObjFunction *gfn = globalFunction(closure, nameIdx, &gv);
             if (gfn == NULL || gfn->jitFunc == NULL) {
