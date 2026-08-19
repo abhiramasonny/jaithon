@@ -38,6 +38,12 @@ from jaicv.imgproc.morph import MORPH_GRADIENT, MORPH_OPEN, MORPH_RECT, MORPH_TO
 from jaicv.imgproc.edges import canny
 from jaicv.imgproc.drawing import arrowed_line, circle, draw_marker, ellipse, fill_convex_poly
 from jaicv.imgproc.drawing import fill_poly, line, polylines, rectangle
+from jaicv.imgproc.contours import find_contours, CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE
+from jaicv.imgproc.contours import RETR_CCOMP, RETR_EXTERNAL, RETR_LIST, RETR_TREE
+from jaicv.imgproc.shape import approx_poly_dp, arc_length, bounding_rect, contour_area
+from jaicv.imgproc.shape import convex_hull, fit_ellipse, fit_line, hu_moments
+from jaicv.imgproc.shape import is_contour_convex, min_area_rect, min_enclosing_circle
+from jaicv.imgproc.shape import moments, point_polygon_test
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -129,6 +135,15 @@ fn tolerance_for(name: str, args: list[str]) -> float {
         return 1e-4
     }
     if name == "getGaussianKernel" { return 1e-5 }
+    if name == "moments" or name == "huMoments" { return 1e-3 }
+    if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
+    if name == "minAreaRect" or
+        name == "minEnclosingCircle" or
+        name == "fitEllipse" or
+        name == "fitLine" or
+        name == "pointPolygonTest" {
+        return 1e-3
+    }
     #: A mask or a structuring element only ever holds two values, so a
     #: one-unit tolerance would hide a wrong pixel entirely: these are exact.
     if name == "getStructuringElement" or
@@ -285,8 +300,134 @@ fn run_drawing(item: Case) -> Mat {
     throw ValueError(f"no jaicv binding for {item.name}")
 }
 
+fn retrieval_named(name: str) -> int {
+    if name == "EXTERNAL" { return RETR_EXTERNAL }
+    if name == "LIST" { return RETR_LIST }
+    if name == "CCOMP" { return RETR_CCOMP }
+    if name == "TREE" { return RETR_TREE }
+    throw ValueError(f"no jaicv retrieval mode for {name}")
+}
+
+fn chain_named(name: str) -> int {
+    if name == "NONE" { return CHAIN_APPROX_NONE }
+    if name == "SIMPLE" { return CHAIN_APPROX_SIMPLE }
+    throw ValueError(f"no jaicv chain approximation for {name}")
+}
+
+fn run_contours(item: Case) -> Mat {
+    let mode = retrieval_named(item.args[1])
+    let method = chain_named(item.args[2])
+    let (contours, hierarchy) = find_contours(item.source, mode, method)
+    var values: list[float] = []
+    var rows = 0
+    if item.name == "findContours" {
+        for index in 0..contours.len() {
+            let contour = contours[index]
+            for at in 0..contour.len() {
+                values.push(float(index))
+                values.push(float(at))
+                values.push(float(contour[at].x))
+                values.push(float(contour[at].y))
+                rows += 1
+            }
+        }
+    } else {
+        for node in hierarchy {
+            for field in node.to_list() { values.push(float(field)) }
+            rows += 1
+        }
+    }
+    return Mat.from_list(rows, 4, CV_MAKETYPE(4, 1), values)
+}
+
+let SHAPE_NAMES = [
+    "moments",
+    "huMoments",
+    "contourArea",
+    "arcLengthClosed",
+    "arcLengthOpen",
+    "boundingRect",
+    "isContourConvex",
+    "convexHull",
+    "approxPolyDP",
+    "minAreaRect",
+    "minEnclosingCircle",
+    "pointPolygonTest",
+    "fitEllipse",
+    "fitLine",
+]
+
+fn contour_of(item: Case) -> list[Point] {
+    let (contours, _hierarchy) = find_contours(item.source, RETR_LIST, CHAIN_APPROX_NONE)
+    return contours[int(item.args[1])]
+}
+
+fn row_of(values: list[float]) -> Mat {
+    return Mat.from_list(1, values.len(), CV_MAKETYPE(5, 1), values)
+}
+
+fn points_mat(points: list[Point]) -> Mat {
+    var values: list[float] = []
+    for point in points {
+        values.push(float(point.x))
+        values.push(float(point.y))
+    }
+    return Mat.from_list(points.len(), 2, CV_MAKETYPE(4, 1), values)
+}
+
+fn run_shape(item: Case) -> Mat {
+    let contour = contour_of(item)
+    if item.name == "moments" { return row_of(moments(contour).to_list()) }
+    if item.name == "huMoments" { return row_of(hu_moments(moments(contour))) }
+    if item.name == "contourArea" { return row_of([contour_area(contour)]) }
+    if item.name == "arcLengthClosed" { return row_of([arc_length(contour, true)]) }
+    if item.name == "arcLengthOpen" { return row_of([arc_length(contour, false)]) }
+    if item.name == "boundingRect" {
+        let box = bounding_rect(contour)
+        return Mat.from_list(
+            1,
+            4,
+            CV_MAKETYPE(4, 1),
+            [float(box.x), float(box.y), float(box.width), float(box.height)]
+        )
+    }
+    if item.name == "isContourConvex" {
+        let convex = if is_contour_convex(contour) { 1.0 } else { 0.0 }
+        return Mat.from_list(1, 1, CV_MAKETYPE(4, 1), [convex])
+    }
+    if item.name == "convexHull" { return points_mat(convex_hull(contour)) }
+    if item.name == "approxPolyDP" {
+        return points_mat(approx_poly_dp(contour, float(item.args[2]), true))
+    }
+    if item.name == "minAreaRect" {
+        let box = min_area_rect(contour)
+        return row_of([box.center.x, box.center.y, box.size.width, box.size.height, box.angle])
+    }
+    if item.name == "minEnclosingCircle" {
+        let (centre, radius) = min_enclosing_circle(contour)
+        return row_of([centre.x, centre.y, radius])
+    }
+    if item.name == "pointPolygonTest" {
+        var values: list[float] = []
+        for y in 0..item.source.rows {
+            for x in 0..item.source.cols {
+                values.push(point_polygon_test(contour, Point2f(float(x), float(y)), true))
+            }
+        }
+        return Mat.from_list(item.source.rows, item.source.cols, CV_MAKETYPE(5, 1), values)
+    }
+    if item.name == "fitEllipse" {
+        let box = fit_ellipse(contour)
+        return row_of([box.center.x, box.center.y, box.size.width, box.size.height, box.angle])
+    }
+    if item.name == "fitLine" { return row_of(fit_line(contour)) }
+    throw ValueError(f"no jaicv binding for {item.name}")
+}
+
 fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
+    if SHAPE_NAMES.contains(item.name) { return run_shape(item) }
+    if item.name == "findContours" or item.name == "contourHierarchy" { return run_contours(item) }
     if item.name == "cvtColor" { return cvt_color(item.source, colour_code(item.args[0])) }
     if item.name == "resize" {
         return resize(
@@ -503,6 +644,40 @@ fn stroke_thickness(item: Case) -> int {
     return 0
 }
 
+#: Turn a hull so it starts where OpenCV's does.
+#:
+#: A convex hull is a ring, and both sides walk it the same way; which vertex
+#: is written first follows from the scan that built it, and OpenCV's and
+#: jaicv's scans differ. Rotating to the same start compares the rings.
+fn rotated_like(expected: Mat, produced: Mat) -> Mat {
+    if produced.rows != expected.rows or produced.rows == 0 { return produced }
+    let want = expected.to_list()
+    let got = produced.to_list()
+    let width = produced.cols
+    for offset in 0..produced.rows {
+        var same = true
+        for row in 0..produced.rows {
+            for column in 0..width {
+                if got[(row + offset) % produced.rows * width + column] !=
+                    want[row * width + column] {
+                    same = false
+                    break
+                }
+            }
+            if not same { break }
+        }
+        if not same { continue }
+        var values: list[float] = []
+        for row in 0..produced.rows {
+            for column in 0..width {
+                values.push(got[(row + offset) % produced.rows * width + column])
+            }
+        }
+        return Mat.from_list(produced.rows, width, produced.type_(), values)
+    }
+    return produced
+}
+
 fn compare(item: Case, produced: Mat) -> tuple[float, int] {
     let want = item.expected.to_list()
     let got = produced.to_list()
@@ -533,7 +708,7 @@ fn test_every_recorded_case_matches_opencv() -> void {
     var compared = 0
     for item in cases {
         compared += 1
-        let produced = run_case(item)
+        var produced = run_case(item)
         if produced.rows != item.expected.rows or produced.cols != item.expected.cols {
             failures.push(f"{item.name} {item.args}: shape {produced} vs {item.expected}")
             continue
@@ -545,6 +720,7 @@ fn test_every_recorded_case_matches_opencv() -> void {
             )
             continue
         }
+        if item.name == "convexHull" { produced = rotated_like(item.expected, produced) }
         let (worst, worst_at) = compare(item, produced)
         let allowed = tolerance_for(item.name, item.args)
         if worst > allowed {
