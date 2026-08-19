@@ -174,6 +174,7 @@ unit_args+=(
     "$ROOT/tests/lang"
     "$ROOT/tests/stdlib"
     "$ROOT/tests/checker"
+    "$ROOT/packages/jaicv/tests"
     "$ROOT/packages/jaiplot/tests"
     "$ROOT/packages/jaitensor/tests"
 )
