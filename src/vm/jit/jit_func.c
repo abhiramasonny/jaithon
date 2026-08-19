@@ -2036,6 +2036,16 @@ static bool modelAgreesWithChunk(const Emit *e, uint32_t off) {
     return want < 0 || want == (int)e->depth;
 }
 
+/* Names the opcode whose arm let the borrow through. Which arm it was is the
+ * whole question when this fires, and without the name the message only says
+ * where the loop started. */
+static const char *borrowWhyFor(const Emit *e) {
+    static char why[80];
+    snprintf(why, sizeof why, "a float borrow reached %s's guard",
+             jaiOpName((OpCode)e->lastOp));
+    return why;
+}
+
 /* Take the record without emitting the branch to it. The model is what it is
  * at this moment, so a site whose *code* is emitted later -- a self-call's
  * cold block, which lives with the stubs -- still has to record here. */
@@ -2044,7 +2054,13 @@ static bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
     /* Assertion, not the fix: a deopt stub writes every entry out of fpRegAt, so nothing may still be
      * borrowing a local's register here. Releasing HERE (rather than at the top of the instruction) was tried and is wrong -- a guard can sit inside a span an earlier branch skips (emitBoundsNormalise's does), so the fmov landed on a not-taken path and matrix_mul read `sum` from a register nothing had written. Declines rather than miscompiles if fpBorrowSurvives let something through it shouldn't have. */
     if (e->fpBorrow != 0) {
-        e->whyNot = "a float borrow reached a guard";
+        /* Names the opcode: which arm let the borrow through is the whole
+         * question, and without it the message only says where the loop
+         * started. */
+        static char borrowWhy[80];
+        snprintf(borrowWhy, sizeof borrowWhy, "a float borrow reached %s's guard",
+                 jaiOpName((OpCode)e->lastOp));
+        e->whyNot = borrowWhy;
         e->failed = true;
         return false;
     }
@@ -2100,7 +2116,7 @@ static void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
 static void branchOnDeopt(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     if (e->fpBorrow != 0) {          /* see deoptRecordAt */
-        e->whyNot = "a float borrow reached a guard";
+        e->whyNot = borrowWhyFor(e);
         e->failed = true;
         return;
     }
@@ -2156,7 +2172,7 @@ static void branchOnDeopt(Emit *e, unsigned cond) {
 static void branchOnDeoptInstStart(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     if (e->fpBorrow != 0) {          /* see deoptRecordAt */
-        e->whyNot = "a float borrow reached a guard";
+        e->whyNot = borrowWhyFor(e);
         e->failed = true;
         return;
     }
@@ -2665,6 +2681,74 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
      * else, which is exactly SLOT_OBJ. The tag guard below is the whole of
      * what makes that sound: whatever object comes back, it is an object. */
     *k = SLOT_OBJ; *tag = VAL_OBJ;
+    return true;
+}
+
+/* The store half of `list.push` and of a comprehension's append: they differ
+ * only in where the list sits on the stack and in what is left behind, so the
+ * bounds check, the grow fixup and the two stores live here. Returns false
+ * with `whyNot` set when the value's kind has no tag to store.
+ *
+ * Appending is a bounds check and two stores -- a descriptor+native round trip
+ * costs far more than the work itself (list_ops spent all its time on the
+ * call). A full list goes out to the `grow` stubs' realloc helper and comes
+ * straight back; see there for why this used to be a deopt and what it cost. */
+static bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal) {
+    unsigned vtag = vk == SLOT_INT   ? VAL_INT
+                  : vk == SLOT_FLOAT ? VAL_FLOAT
+                  : vk == SLOT_BOOL  ? VAL_BOOL
+                  : (vk == SLOT_INST || vk == SLOT_LIST ||
+                     vk == SLOT_OBJ)  ? VAL_OBJ
+                                      : 0xffffffffu;
+    if (vtag == 0xffffffffu) {
+        e->whyNot = "pushing a kind the tier cannot store";
+        return false;
+    }
+
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                       (unsigned)offsetof(ObjList, count)));
+    emit(e, jaiA64LdrW(JIT_SCRATCH_B, rList,
+                       (unsigned)offsetof(ObjList, capacity)));
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+    if (e->growCount >= JIT_MAX_GROW) {
+        e->whyNot = "more list pushes than the tier tracks";
+        return false;
+    }
+    /* jitListGrow can raise, and the stub routes that to the exception exit
+     * (see emitGrowStubs). */
+    if (!raiseExitAllowed(e, "a list growth inside a try")) return false;
+
+    noteScratchClobber(e);
+    unsigned gi = e->growCount++;
+    e->grow[gi].listReg  = rList;
+    e->grow[gi].valReg   = rVal;
+    e->grow[gi].tag      = vtag;
+    e->grow[gi].countReg = JIT_SCRATCH_A;
+    e->grow[gi].stub     = -1;
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_GROW - gi;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(JAI_A64_GE, 0));
+    e->grow[gi].returnTo = (int)e->count;
+
+    emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
+                       (unsigned)offsetof(ObjList, items)));
+    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_A, 4));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_D, vtag, 0));
+    emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
+    emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+    emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+    emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                       (unsigned)offsetof(ObjList, count)));
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                       (unsigned)offsetof(ObjList, version)));
+    emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+    emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                       (unsigned)offsetof(ObjList, version)));
+    e->wroteHeap = true;
     return true;
 }
 
@@ -5235,6 +5319,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 case OP_NE: cond = JAI_A64_EQ; break;
                 default: return false;
                 }
+                /* Released BEFORE the operands are read, so `fpOperand`
+                 * answers out of the bank: this arm is on the borrow
+                 * whitelist, so an operand can still be held in a local's own
+                 * d register here, and nanToDeopt records -- which
+                 * deoptRecordAt asserts nothing may be borrowing at. Costs one
+                 * fmov when a borrow is live, against declining the entire
+                 * loop, which is what `for v in xs { if v != 0.0 ... }` used
+                 * to do. Sound at this point because nothing has branched yet.
+                 */
+                fpReleaseAll(e);
                 unsigned db = fpOperand(e, e->valueDepth - 1);
                 unsigned da = fpOperand(e, e->valueDepth - 2);
                 settleAll(e);          /* nanToDeopt records */
@@ -5685,7 +5779,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 default: return false;
                 }
                 if (slot == 0) e->usesSlot0 = true;
+                /* This arm reads a LOCAL, so unlike the stack-operand compare
+                 * it never pops the entries that are borrowing -- and a borrow
+                 * still live when nanToDeopt records is what deoptRecordAt
+                 * asserts against. Releasing at the top of the instruction is
+                 * sound here because nothing has branched yet. */
                 settleAll(e);          /* nanToDeopt records */
+                fpReleaseAll(e);
                 localInFp(e, slot, JIT_FSCRATCH_A);
                 if (AS_FLOAT(k) == 0.0) {
                     emit(e, jaiA64FcmpDZero(JIT_FSCRATCH_A));
@@ -6413,6 +6513,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        /* A list comprehension's append. It is the same two stores `push`
+         * makes, but it was the one list write with no arm at all, so every
+         * comprehension in the language -- `[0 for _i in 0..n]`, the way this
+         * codebase preallocates -- left its loop running interpreted. */
+        case OP_LIST_APPEND: {
+            unsigned back = jaiReadU16(code + off + 1);
+            if (e->depth < back + 1u) {
+                e->whyNot = "an append reaching past the model"; return false;
+            }
+            unsigned lidx = e->depth - 1u - back;
+            if (e->stack[lidx] != SLOT_LIST) {
+                e->whyNot = "an append to an entry the tier does not know is a list";
+                return false;
+            }
+            if (!emitListStore(e, e->stack[e->depth - 1],
+                               valueXReg(e, valueIndexOf(e, lidx)),
+                               pushReg(e) - 1)) {
+                return false;
+            }
+            /* The value is consumed; the target stays where it was. */
+            unsigned dropAppend;
+            if (!popValue(e, &dropAppend, NULL)) return false;
+            off += 3;
+            break;
+        }
+
         case OP_INVOKE: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             unsigned argc    = code[off + 4];
@@ -6430,72 +6556,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                        "push") == 0) {
                 /* Appending to a list is a bounds check and two stores -- a descriptor+native round trip costs far
                  * more than the work itself (list_ops spent all its time on the call). A full list goes out to the `grow` stubs' realloc helper and comes straight back; see there for why this used to be a deopt and what that cost. */
-                SlotKind vk = e->stack[e->depth - 1];
-                unsigned vtag = vk == SLOT_INT   ? VAL_INT
-                              : vk == SLOT_FLOAT ? VAL_FLOAT
-                              : vk == SLOT_BOOL  ? VAL_BOOL
-                              : (vk == SLOT_INST || vk == SLOT_LIST ||
-                                 vk == SLOT_OBJ)  ? VAL_OBJ
-                                                  : 0xffffffffu;
-                if (vtag == 0xffffffffu) {
-                    e->whyNot = "pushing a kind the tier cannot store";
+                if (!emitListStore(e, e->stack[e->depth - 1],
+                                   valueXReg(e, e->valueDepth - 2),
+                                   pushReg(e) - 1)) {
                     return false;
                 }
-                unsigned rVal  = pushReg(e) - 1;
-                unsigned rList = valueXReg(e, e->valueDepth - 2);
-
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                                   (unsigned)offsetof(ObjList, count)));
-                emit(e, jaiA64LdrW(JIT_SCRATCH_B, rList,
-                                   (unsigned)offsetof(ObjList, capacity)));
-                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
-                if (e->growCount >= JIT_MAX_GROW) {
-                    e->whyNot = "more list pushes than the tier tracks";
-                    return false;
-                }
-                /* jitListGrow can raise, and the stub routes that to the
-                 * exception exit (see emitGrowStubs). */
-                if (!raiseExitAllowed(e, "a list growth inside a try")) {
-                    return false;
-                }
-                {
-                    noteScratchClobber(e);
-                    unsigned gi = e->growCount++;
-                    e->grow[gi].listReg  = rList;
-                    e->grow[gi].valReg   = rVal;
-                    e->grow[gi].tag      = vtag;
-                    e->grow[gi].countReg = JIT_SCRATCH_A;
-                    e->grow[gi].stub     = -1;
-                    if (e->fixupCount >= JIT_MAX_FIXUPS) {
-                        e->failed = true;
-                        return false;
-                    }
-                    e->fixups[e->fixupCount].instIndex    = (int)e->count;
-                    e->fixups[e->fixupCount].targetOffset = FIXUP_GROW - gi;
-                    e->fixups[e->fixupCount].conditional  = true;
-                    e->fixups[e->fixupCount].depth        = -1;
-                    e->fixupCount++;
-                    emit(e, jaiA64BCond(JAI_A64_GE, 0));
-                    e->grow[gi].returnTo = (int)e->count;
-                }
-
-                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
-                                   (unsigned)offsetof(ObjList, items)));
-                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_SCRATCH_A, 4));
-                emit(e, jaiA64MovzX(JIT_SCRATCH_D, vtag, 0));
-                emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
-                emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
-                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
-                emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
-                                   (unsigned)offsetof(ObjList, count)));
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                                   (unsigned)offsetof(ObjList, version)));
-                emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
-                emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
-                                   (unsigned)offsetof(ObjList, version)));
-                e->wroteHeap = true;
-
                 /* push returns the list, which is the receiver entry already
                  * sitting under the argument. */
                 unsigned drop;
