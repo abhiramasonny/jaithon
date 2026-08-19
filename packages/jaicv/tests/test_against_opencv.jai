@@ -67,6 +67,10 @@ from jaicv.core.dft import DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from jaicv.core.cluster import PCA
 from jaicv.core.linalg import matmul as linalg_matmul, transpose as linalg_transpose
 from jaicv.dnn.blob import blob_from_image, nms_boxes
+from jaicv.core.misc import calc_covar_matrix, determinant, extract_channel, hconcat
+from jaicv.core.misc import repeat, rotate, solve_poly, sort, sort_idx, vconcat
+from jaicv.core.misc import ROTATE_180, ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE
+from jaicv.core.types import SORT_DESCENDING, SORT_EVERY_COLUMN, SORT_EVERY_ROW
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -188,6 +192,9 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     #: disagreement with OpenCV, scaled by whatever the blob scales by.
     if name == "blobFromImage" { return float(args[0]) + 1e-4 }
     if name == "nmsBoxes" { return 0.0 }
+    if name == "determinant" or name == "solvePoly" { return 1e-3 }
+    if name == "calcCovarMatrix" or name == "covarMean" { return 1e-4 }
+    if MISC_NAMES.contains(name) { return 0.0 }
     if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
@@ -711,6 +718,62 @@ fn run_cascade(item: Case) -> Mat {
     return Mat.from_list(found.len(), 4, CV_MAKETYPE(4, 1), values)
 }
 
+let MISC_NAMES = [
+    "hconcat",
+    "vconcat",
+    "repeat",
+    "rotate",
+    "extractChannel",
+    "sortRows",
+    "sortCols",
+    "sortIdxRows",
+    "determinant",
+    "calcCovarMatrix",
+    "covarMean",
+    "solvePoly",
+]
+
+fn run_misc(item: Case) -> Mat {
+    let args = item.args
+    if item.name == "hconcat" {
+        return hconcat([item.source, item.source.roi(Rect(0, 0, 3, item.source.rows))])
+    }
+    if item.name == "vconcat" {
+        return vconcat([item.source, item.source.roi(Rect(0, 0, item.source.cols, 2))])
+    }
+    if item.name == "repeat" { return repeat(item.source, 2, 3) }
+    if item.name == "rotate" {
+        let code = if args[0] == "CW" {
+            ROTATE_90_CLOCKWISE
+        } elif args[0] == "HALF" {
+            ROTATE_180
+        } else {
+            ROTATE_90_COUNTERCLOCKWISE
+        }
+        return rotate(item.source, code)
+    }
+    if item.name == "extractChannel" { return extract_channel(item.source, int(args[0])) }
+    if item.name == "sortRows" {
+        let flags = if args[0] == "desc" {
+            SORT_EVERY_ROW | SORT_DESCENDING
+        } else {
+            SORT_EVERY_ROW
+        }
+        return sort(item.source, flags)
+    }
+    if item.name == "sortCols" { return sort(item.source, SORT_EVERY_COLUMN) }
+    if item.name == "sortIdxRows" { return sort_idx(item.source, SORT_EVERY_ROW) }
+    if item.name == "determinant" {
+        return Mat.from_list(1, 1, CV_MAKETYPE(5, 1), [determinant(item.source)])
+    }
+    if item.name == "calcCovarMatrix" or item.name == "covarMean" {
+        let (covariance, mean) = calc_covar_matrix(item.source)
+        return if item.name == "covarMean" { mean } else { covariance }
+    }
+    let roots = solve_poly([-6.0, 11.0, -6.0, 1.0])
+    return Mat.from_list(1, roots.len(), CV_MAKETYPE(5, 1), roots)
+}
+
 let DNN_NAMES = ["blobFromImage", "nmsBoxes"]
 
 let NMS_BOXES = [
@@ -1045,6 +1108,7 @@ fn run_case(item: Case) -> Mat {
     if CALIBRATE_NAMES.contains(item.name) { return run_calibrate(item) }
     if TRANSFORM_NAMES.contains(item.name) { return run_transform(item) }
     if DNN_NAMES.contains(item.name) { return run_dnn(item) }
+    if MISC_NAMES.contains(item.name) { return run_misc(item) }
     if item.name == "cascadeDetect" { return run_cascade(item) }
     if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }
@@ -1386,10 +1450,17 @@ fn test_every_recorded_case_matches_opencv() -> void {
             for index in 0..want.len() {
                 if math.fabs(got[index] - want[index]) - slack > allowed { differing += 1 }
             }
-            var painted = 0
+            #: How much of the answer is not simply the input carried through,
+            #: which is what a budget is measured against. An operation whose
+            #: output is a different shape from its input has no such carried
+            #: part, so the whole of it counts.
             let source = item.source.to_list()
-            for index in 0..want.len() {
-                if want[index] != source[index] { painted += 1 }
+            var painted = want.len()
+            if source.len() == want.len() {
+                painted = 0
+                for index in 0..want.len() {
+                    if want[index] != source[index] { painted += 1 }
+                }
             }
             let budget = budget_for(item, painted)
             if differing > budget {

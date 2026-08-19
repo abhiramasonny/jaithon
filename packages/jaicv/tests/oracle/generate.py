@@ -826,6 +826,53 @@ def write_dnn(handle) -> None:
              np.zeros((4, 4), np.uint8), rows)
 
 
+def write_misc(handle) -> None:
+    rng = np.random.default_rng(211)
+    a = rng.integers(0, 200, size=(4, 5), dtype=np.uint8)
+    # The second part is a slice of the first, so the Jaithon side can build
+    # the same pair from the one input the case records.
+    b = a[:, :3].copy()
+    c = a[:2, :].copy()
+    case(handle, "hconcat", "pair", a, cv2.hconcat([a, b]))
+    case(handle, "vconcat", "pair", a, cv2.vconcat([a, c]))
+    case(handle, "repeat", "2 3", a, cv2.repeat(a, 2, 3))
+    for name, code in (("CW", cv2.ROTATE_90_CLOCKWISE), ("HALF", cv2.ROTATE_180),
+                       ("CCW", cv2.ROTATE_90_COUNTERCLOCKWISE)):
+        case(handle, "rotate", name, a, cv2.rotate(a, code))
+
+    colour = rng.integers(0, 200, size=(4, 5, 3), dtype=np.uint8)
+    for channel in range(3):
+        case(handle, "extractChannel", f"{channel}", colour,
+             cv2.extractChannel(colour, channel))
+
+    values = rng.standard_normal((5, 6)).astype(np.float32)
+    case(handle, "sortRows", "asc", values, cv2.sort(values, cv2.SORT_EVERY_ROW))
+    case(handle, "sortRows", "desc", values,
+         cv2.sort(values, cv2.SORT_EVERY_ROW | cv2.SORT_DESCENDING))
+    case(handle, "sortCols", "asc", values, cv2.sort(values, cv2.SORT_EVERY_COLUMN))
+    case(handle, "sortIdxRows", "asc", values,
+         cv2.sortIdx(values, cv2.SORT_EVERY_ROW).astype(np.int32))
+
+    square = rng.standard_normal((4, 4)).astype(np.float64)
+    square = square + 4.0 * np.eye(4)
+    case(handle, "determinant", "four", square.astype(np.float32),
+         np.array([[cv2.determinant(square)]], np.float32))
+
+    samples = rng.standard_normal((30, 3)).astype(np.float64) * np.array([2.0, 0.5, 1.0])
+    covariance, mean = cv2.calcCovarMatrix(
+        samples, None, cv2.COVAR_NORMAL | cv2.COVAR_ROWS | cv2.COVAR_SCALE)
+    case(handle, "calcCovarMatrix", "scaled", samples.astype(np.float32),
+         (covariance * (len(samples) / (len(samples) - 1.0))).astype(np.float32))
+    case(handle, "covarMean", "scaled", samples.astype(np.float32),
+         mean.reshape(1, 3).astype(np.float32))
+
+    poly = np.array([-6.0, 11.0, -6.0, 1.0], np.float64)
+    roots = cv2.solvePoly(poly)[1].reshape(-1, 2)
+    real = np.sort(roots[np.abs(roots[:, 1]) < 1e-6, 0])
+    case(handle, "solvePoly", "cubic", np.zeros((4, 4), np.uint8),
+         real.reshape(1, -1).astype(np.float32))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -846,6 +893,7 @@ def main() -> int:
         write_calibrate(handle)
         write_transform(handle)
         write_dnn(handle)
+        write_misc(handle)
     print(f"wrote {OUT}")
     return 0
 
