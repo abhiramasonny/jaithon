@@ -455,7 +455,16 @@ pub class Sequential {
         let total_correct = Tensor.zeros([1])
         defer { total_loss.free() }
         defer { total_correct.free() }
-        let flush_every = 8
+        #: Every batch, not every eighth.
+        #:
+        #: Holding work back was meant to keep the queue full and it does the
+        #: opposite: an unflushed command buffer grows, every intermediate it
+        #: names stays alive because nothing has finished with it, and the
+        #: encoding cost climbs faster than the saved submissions. Measured on
+        #: tests/bench/jaitensor's conv workloads at every level: 2.37s against
+        #: 2.42s on conv-small and 3.23s against 3.35s on conv-wide, and 2.7x
+        #: against not flushing at all. Never slower at any cadence tried.
+        let flush_every = 1
         var start = 0
         var batches = 0
         let loader = if self.shuffle_batches {
