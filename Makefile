@@ -339,7 +339,7 @@ ifneq ($(BUILD_GOAL),)
 endif
 
 .PHONY: all debug release test verify-test bench jaitensor install uninstall \
-        clean distclean fmt fmt-check check help
+        clean distclean fmt fmt-check fmt-roundtrip check help
 
 # `all` must be the default goal: the recursive release and debug targets below
 # invoke make with no goal, so whatever make picks is what a bare `make`, a
@@ -406,6 +406,7 @@ test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $
 	@$(BUILD)/field_natives
 	@$(BUILD)/invoke_result_kind
 	@./scripts/run_tests.sh
+	@$(MAKE) --no-print-directory fmt-roundtrip
 	@$(MAKE) --no-print-directory gc-stress-test
 
 # The unit suites under a collector that runs every N allocations.
@@ -751,6 +752,22 @@ fmt: $(TARGET)
 # rest of the suite put together; `run_tests.sh --format` runs it inline.
 fmt-check: $(TARGET)
 	@./$(TARGET) fmt --check lib tests examples packages
+
+# Whether formatting a file changes the PROGRAM, which is the question
+# `fmt --check` does not ask: a file can be canonical and still have had
+# something removed on the way there. Parses every source in the tree, formats
+# it, parses it again, and compares the trees. It exists because the printer
+# shipped two silent losses -- it never wrote decorators, so every format
+# deleted `@trace` and `@gpu_kernel` and turned jaitensor's hot paths back into
+# ordinary functions, and it indented the inside of triple-quoted strings, so a
+# formatted program's data grew four characters a line.
+#
+# The comparison is only as good as what `ast_encode` prints: a field it leaves
+# out is a field this cannot see. That is why decorators had to be added there
+# before this gate could catch them.
+.PHONY: fmt-roundtrip
+fmt-roundtrip: $(TARGET)
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/fmt_roundtrip.jai
 
 install: package-check $(TARGET)
 	@install -d $(DESTDIR)$(PREFIX)/bin
