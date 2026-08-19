@@ -135,6 +135,17 @@ from .features2d.detect import DRAW_MATCHES_FLAGS_DEFAULT, DRAW_MATCHES_FLAGS_DR
 from .features2d.detect import FAST_FEATURE_DETECTOR_TYPE_5_8, FAST_FEATURE_DETECTOR_TYPE_7_12
 from .features2d.detect import FAST_FEATURE_DETECTOR_TYPE_9_16, ORB_FAST_SCORE, ORB_HARRIS_SCORE
 
+from .video.optflow import calc_optical_flow_farneback, calc_optical_flow_pyr_lk
+from .video.optflow import flow_to_colour, polynomial_expansion
+from .video.optflow import OPTFLOW_FARNEBACK_GAUSSIAN, OPTFLOW_USE_INITIAL_FLOW
+
+from .video.background import create_background_subtractor_knn
+from .video.background import create_background_subtractor_mog2
+from .video.background import BackgroundSubtractorKNN, BackgroundSubtractorMOG2
+from .video.background import FOREGROUND_VALUE, SHADOW_VALUE
+
+from .video.track import cam_shift, mean_shift, KalmanFilter
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -253,6 +264,16 @@ export { SimpleBlobDetector, SimpleBlobDetectorParams }
 export { DRAW_MATCHES_FLAGS_DEFAULT, DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS }
 export { FAST_FEATURE_DETECTOR_TYPE_5_8, FAST_FEATURE_DETECTOR_TYPE_7_12 }
 export { FAST_FEATURE_DETECTOR_TYPE_9_16, ORB_FAST_SCORE, ORB_HARRIS_SCORE }
+
+export { calc_optical_flow_farneback, calc_optical_flow_pyr_lk }
+export { flow_to_colour, polynomial_expansion }
+export { OPTFLOW_FARNEBACK_GAUSSIAN, OPTFLOW_USE_INITIAL_FLOW }
+
+export { create_background_subtractor_knn, create_background_subtractor_mog2 }
+export { BackgroundSubtractorKNN, BackgroundSubtractorMOG2 }
+export { FOREGROUND_VALUE, SHADOW_VALUE }
+
+export { cam_shift, mean_shift, KalmanFilter }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
