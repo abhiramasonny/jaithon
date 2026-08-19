@@ -4,7 +4,7 @@ import std.gpu as gpu
 import std.math
 import std.os
 from jaitensor import Dataset
-from jaitensor.gemm import default_plan
+from jaitensor.gemm import default_plan, plan_from_text
 from jaitensor.ops import dense_static_forward, matmul_backend
 from jaitensor.tensor import GradNode, Tensor
 from std.io import Path, read_file
@@ -346,9 +346,12 @@ fn test_default_plan_prefers_large_tiles_then_splits() -> void {
 }
 
 fn test_matmul_backend_reports_a_known_plan() -> void {
+    #: Whatever the tuner has decided for this machine, the reported route has
+    #: to name a plan the dispatcher can read back.
     let reported = matmul_backend(512, 784, 256)
-    assert_true(reported.contains(":"))
-    assert_true(reported.starts_with("gemm") or reported.starts_with("mpsgraph"))
+    let parsed = plan_from_text(reported)
+    assert_true(parsed is not null)
+    assert_eq(parsed.to_str(), reported)
 }
 
 fn test_staged_64_matmul_matches_cpu() -> void {

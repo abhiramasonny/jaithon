@@ -1192,26 +1192,42 @@ fn f32_bits(value: float) -> int {
     return (sign << 31) | (biased << 23) | (frac & 0x7FFFFF)
 }
 
-pub fn cached_kernel(source: str, entry: str) -> Kernel {
-    let key = entry + "\n" + source
-    let existing = _kernel_cache.get(key, null)
+#: The compiled pipeline for one entry point in this module's shader library.
+#:
+#: Keyed by the entry name alone: there is exactly one `SOURCE`, and building a
+#: key that included it meant concatenating and hashing 36 KB on every single
+#: dispatch — 88 microseconds of host time per elementwise op, against 6 for
+#: the dispatch itself.
+pub fn cached_kernel(entry: str) -> Kernel {
+    let existing = _kernel_cache.get(entry, null)
     if existing is not null { return existing }
-    let kernel = Kernel.compile(source, entry)
-    _kernel_cache[key] = kernel
+    let kernel = Kernel.compile(SOURCE, entry)
+    _kernel_cache[entry] = kernel
+    return kernel
+}
+
+var _attn_cache: dict[str, Kernel] = {}
+
+#: The same, for the attention shader library.
+fn cached_attn_kernel(entry: str) -> Kernel {
+    let existing = _attn_cache.get(entry, null)
+    if existing is not null { return existing }
+    let kernel = Kernel.compile(ATTN_SOURCE, entry)
+    _attn_cache[entry] = kernel
     return kernel
 }
 
 fn binary(a: Tensor, b: Tensor, operation: int) -> Tensor {
     if not a.same_shape(b) { throw ValueError(f"tensor shapes differ: {a.shape} and {b.shape}") }
     let output = Tensor(a.shape)
-    let kernel = cached_kernel(SOURCE, "binary_op")
+    let kernel = cached_kernel("binary_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size, operation])
     return output
 }
 
 fn unary(input: Tensor, operation: int) -> Tensor {
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "unary_op")
+    let kernel = cached_kernel("unary_op")
     kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [input.size, operation])
     return output
 }
@@ -1227,7 +1243,7 @@ fn is_trailing_suffix(small: list[int], large: list[int]) -> bool {
 
 fn broadcast_add(a: Tensor, b: Tensor) -> Tensor {
     let output = Tensor(a.shape)
-    let kernel = cached_kernel(SOURCE, "broadcast_add")
+    let kernel = cached_kernel("broadcast_add")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [b.size, a.size])
     return output
 }
@@ -1235,7 +1251,7 @@ fn broadcast_add(a: Tensor, b: Tensor) -> Tensor {
 fn binary_backward(a: Tensor, b: Tensor, upstream: Tensor, operation: int) -> list[Tensor] {
     let grad_a = Tensor(a.shape)
     let grad_b = Tensor(b.shape)
-    let kernel = cached_kernel(SOURCE, "binary_backward_op")
+    let kernel = cached_kernel("binary_backward_op")
     kernel.dispatch_async(
         [a.buffer(), b.buffer(), upstream.buffer(), grad_a.buffer(), grad_b.buffer()],
         a.size,
@@ -1256,10 +1272,10 @@ fn reduce_leading(upstream: Tensor, small_shape: list[int], out: Tensor? = null)
         Tensor(small_shape)
     }
     if inner % 4 == 0 {
-        let kernel = cached_kernel(SOURCE, "reduce_leading4")
+        let kernel = cached_kernel("reduce_leading4")
         kernel.dispatch_async([upstream.buffer(), output.buffer()], inner // 4, [outer, inner])
     } else {
-        let kernel = cached_kernel(SOURCE, "reduce_leading")
+        let kernel = cached_kernel("reduce_leading")
         kernel.dispatch_async([upstream.buffer(), output.buffer()], inner, [outer, inner])
     }
     return output
@@ -1314,7 +1330,7 @@ pub fn divide(a: Tensor, b: Tensor) -> Tensor {
 #: Multiply every element by one host scalar.
 pub fn scale(input: Tensor, value: float) -> Tensor {
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "scalar_mul_bits")
+    let kernel = cached_kernel("scalar_mul_bits")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         input.size,
@@ -1399,7 +1415,7 @@ fn raw_transpose(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor([columns, rows])
-    let kernel = cached_kernel(SOURCE, "matrix_transpose")
+    let kernel = cached_kernel("matrix_transpose")
     kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [rows, columns])
     return output
 }
@@ -1448,7 +1464,7 @@ pub fn transpose(input: Tensor) -> Tensor {
 fn unary_backward(saved: Tensor, upstream: Tensor, operation: int) -> Tensor {
     let grad_input = Tensor(saved.shape)
     if operation == 1 and saved.size % 4 == 0 {
-        let kernel = cached_kernel(SOURCE, "unary_backward_relu4")
+        let kernel = cached_kernel("unary_backward_relu4")
         kernel.dispatch_async(
             [saved.buffer(), upstream.buffer(), grad_input.buffer()],
             saved.size // 4,
@@ -1456,7 +1472,7 @@ fn unary_backward(saved: Tensor, upstream: Tensor, operation: int) -> Tensor {
         )
         return grad_input
     }
-    let kernel = cached_kernel(SOURCE, "unary_backward_op")
+    let kernel = cached_kernel("unary_backward_op")
     kernel.dispatch_async(
         [saved.buffer(), upstream.buffer(), grad_input.buffer()],
         saved.size,
@@ -1582,17 +1598,17 @@ var _warmed = false
 pub fn warmup_kernels() -> void {
     if _warmed { return }
     gemm.warmup()
-    cached_kernel(SOURCE, "unary_backward_op")
-    cached_kernel(SOURCE, "unary_backward_relu4")
-    cached_kernel(SOURCE, "reduce_leading")
-    cached_kernel(SOURCE, "reduce_leading4")
-    cached_kernel(SOURCE, "add_scaled_into")
-    cached_kernel(SOURCE, "add_correct_into")
-    cached_kernel(SOURCE, "im2col_nhwc")
-    cached_kernel(SOURCE, "batch_norm_forward")
-    cached_kernel(SOURCE, "moments_channel")
-    cached_kernel(SOURCE, "layer_norm_forward")
-    cached_kernel(SOURCE, "gather_rows")
+    cached_kernel("unary_backward_op")
+    cached_kernel("unary_backward_relu4")
+    cached_kernel("reduce_leading")
+    cached_kernel("reduce_leading4")
+    cached_kernel("add_scaled_into")
+    cached_kernel("add_correct_into")
+    cached_kernel("im2col_nhwc")
+    cached_kernel("batch_norm_forward")
+    cached_kernel("moments_channel")
+    cached_kernel("layer_norm_forward")
+    cached_kernel("gather_rows")
     let wide = Tensor([64, 1024])
     let wide_w = Tensor([1024, 64])
     let wide_out = raw_matmul(wide, wide_w)
@@ -1731,7 +1747,7 @@ pub fn leaky_relu(input: Tensor) -> Tensor {
 pub fn clamp(input: Tensor, lo: float, hi: float) -> Tensor {
     if lo > hi { throw ValueError(f"clamp lo {lo} is greater than hi {hi}") }
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "clamp_op")
+    let kernel = cached_kernel("clamp_op")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         input.size,
@@ -1740,7 +1756,7 @@ pub fn clamp(input: Tensor, lo: float, hi: float) -> Tensor {
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(input.shape)
-            let k = cached_kernel(SOURCE, "clamp_backward")
+            let k = cached_kernel("clamp_backward")
             k.dispatch_async(
                 [input.buffer(), upstream.buffer(), g.buffer()],
                 input.size,
@@ -1756,7 +1772,7 @@ pub fn clamp(input: Tensor, lo: float, hi: float) -> Tensor {
 pub fn maximum(a: Tensor, b: Tensor) -> Tensor {
     if not a.same_shape(b) { throw ValueError(f"tensor shapes differ: {a.shape} and {b.shape}") }
     let output = Tensor(a.shape)
-    let kernel = cached_kernel(SOURCE, "maximum_op")
+    let kernel = cached_kernel("maximum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     return output
 }
@@ -1765,14 +1781,14 @@ pub fn maximum(a: Tensor, b: Tensor) -> Tensor {
 pub fn minimum(a: Tensor, b: Tensor) -> Tensor {
     if not a.same_shape(b) { throw ValueError(f"tensor shapes differ: {a.shape} and {b.shape}") }
     let output = Tensor(a.shape)
-    let kernel = cached_kernel(SOURCE, "minimum_op")
+    let kernel = cached_kernel("minimum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     return output
 }
 
 fn broadcast_scalar(source: Tensor, shape: list[int]) -> Tensor {
     let output = Tensor(shape)
-    let kernel = cached_kernel(SOURCE, "fill_from_scalar")
+    let kernel = cached_kernel("fill_from_scalar")
     kernel.dispatch_async(
         [source.buffer(), output.buffer()],
         output.size,
@@ -1786,7 +1802,7 @@ fn expand_last(reduced: Tensor, columns: int) -> Tensor {
     for dimension in reduced.shape { shape.push(dimension) }
     shape.push(columns)
     let output = Tensor(shape)
-    let kernel = cached_kernel(SOURCE, "broadcast_last")
+    let kernel = cached_kernel("broadcast_last")
     kernel.dispatch_async(
         [reduced.buffer(), output.buffer()],
         output.size,
@@ -1800,7 +1816,7 @@ pub fn sum(input: Tensor, axis: int? = null) -> Tensor {
     if axis is null {
         let groups = (input.size + 255) // 256
         let partials = Tensor([groups])
-        let kernel = cached_kernel(SOURCE, "reduce_sum_all")
+        let kernel = cached_kernel("reduce_sum_all")
         kernel.dispatch_async(
             [input.buffer(), partials.buffer()],
             groups * 256,
@@ -1828,7 +1844,7 @@ pub fn sum(input: Tensor, axis: int? = null) -> Tensor {
     var out_shape: list[int] = []
     for i in 0..resolved { out_shape.push(input.shape[i]) }
     let output = Tensor(out_shape)
-    let kernel = cached_kernel(SOURCE, "reduce_sum_rows")
+    let kernel = cached_kernel("reduce_sum_rows")
     kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
@@ -1872,7 +1888,7 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
     }
     let output = Tensor(out_shape)
     var cursor = 0
-    let kernel = cached_kernel(SOURCE, "copy_range")
+    let kernel = cached_kernel("copy_range")
     if resolved == 0 {
         for part in parts {
             kernel.dispatch_async(
@@ -1886,7 +1902,7 @@ pub fn cat(parts: list[Tensor], axis: int = 0) -> Tensor {
     }
     let outer = parts[0].size // parts[0].shape[resolved]
     var prefix = 0
-    let strided = cached_kernel(SOURCE, "copy_strided_rows")
+    let strided = cached_kernel("copy_strided_rows")
     for part in parts {
         let width = part.shape[resolved]
         strided.dispatch_async(
@@ -1933,7 +1949,7 @@ fn _pool2d(input: Tensor, kernel_size: int, stride: int, padding: int, is_max: b
     if oh <= 0 or ow <= 0 { throw ValueError("pool2d produced an empty spatial size") }
     let output = Tensor([n, oh, ow, c])
     let entry = if is_max { "max_pool2d_nhwc" } else { "avg_pool2d_nhwc" }
-    let kernel = cached_kernel(SOURCE, entry)
+    let kernel = cached_kernel(entry)
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         n * oh * ow * c,
@@ -1952,7 +1968,7 @@ pub fn dropout(input: Tensor, p: float = 0.5, training: bool = true) -> Tensor {
     noise.buffer().fill_uniform(0.0, 1.0, input.size + 1)
     let output = Tensor(input.shape)
     let keep = 1.0 - p
-    let kernel = cached_kernel(SOURCE, "dropout_apply")
+    let kernel = cached_kernel("dropout_apply")
     kernel.dispatch_async(
         [input.buffer(), noise.buffer(), output.buffer()],
         input.size,
@@ -1994,7 +2010,7 @@ pub fn where(cond: Tensor, a: Tensor, b: Tensor) -> Tensor {
         throw ValueError(f"where needs matching shapes, got {cond.shape}, {a.shape}, {b.shape}")
     }
     let output = Tensor(a.shape)
-    let kernel = cached_kernel(SOURCE, "where_op")
+    let kernel = cached_kernel("where_op")
     kernel.dispatch_async(
         [cond.buffer(), a.buffer(), b.buffer(), output.buffer()],
         a.size,
@@ -2006,7 +2022,7 @@ pub fn where(cond: Tensor, a: Tensor, b: Tensor) -> Tensor {
 #: Raise each element to a host exponent.
 pub fn pow(input: Tensor, exponent: float) -> Tensor {
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "pow_scalar")
+    let kernel = cached_kernel("pow_scalar")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         input.size,
@@ -2073,7 +2089,7 @@ pub fn pad2d(input: Tensor, pad: list[int]) -> Tensor {
     let w = input.shape[2]
     let c = input.shape[3]
     let output = Tensor([n, h + pad[0] + pad[1], w + pad[2] + pad[3], c])
-    let kernel = cached_kernel(SOURCE, "pad2d_nhwc")
+    let kernel = cached_kernel("pad2d_nhwc")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         output.size,
@@ -2090,7 +2106,7 @@ pub fn nchw(input: Tensor) -> Tensor {
     let w = input.shape[2]
     let c = input.shape[3]
     let output = Tensor([n, c, h, w])
-    let kernel = cached_kernel(SOURCE, "nhwc_to_nchw")
+    let kernel = cached_kernel("nhwc_to_nchw")
     kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [n, h, w, c])
     return output
 }
@@ -2103,7 +2119,7 @@ pub fn nhwc(input: Tensor) -> Tensor {
     let h = input.shape[2]
     let w = input.shape[3]
     let output = Tensor([n, h, w, c])
-    let kernel = cached_kernel(SOURCE, "nchw_to_nhwc")
+    let kernel = cached_kernel("nchw_to_nhwc")
     kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [n, c, h, w])
     return output
 }
@@ -2141,7 +2157,7 @@ pub fn repeat(input: Tensor, times: int, axis: int = -1) -> Tensor {
         shape.push(if i == resolved { inner * times } else { input.shape[i] })
     }
     let output = Tensor(shape)
-    let kernel = cached_kernel(SOURCE, "repeat_last")
+    let kernel = cached_kernel("repeat_last")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         output.size,
@@ -2156,7 +2172,7 @@ pub fn binary_cross_entropy(prediction: Tensor, target: Tensor) -> Tensor {
         throw ValueError(f"bce shape mismatch: {prediction.shape} vs {target.shape}")
     }
     let per = Tensor(prediction.shape)
-    let kernel = cached_kernel(SOURCE, "bce_sample")
+    let kernel = cached_kernel("bce_sample")
     kernel.dispatch_async(
         [prediction.buffer(), target.buffer(), per.buffer()],
         prediction.size,
@@ -2165,7 +2181,7 @@ pub fn binary_cross_entropy(prediction: Tensor, target: Tensor) -> Tensor {
     if prediction.requires_grad {
         per.attach_creator(GradNode([prediction], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(prediction.shape)
-            let backward_kernel = cached_kernel(SOURCE, "bce_prob_backward")
+            let backward_kernel = cached_kernel("bce_prob_backward")
             backward_kernel.dispatch_async(
                 [prediction.buffer(), target.buffer(), upstream.buffer(), g.buffer()],
                 prediction.size,
@@ -2185,7 +2201,7 @@ pub fn binary_cross_entropy_with_logits(logits: Tensor, target: Tensor) -> Tenso
         throw ValueError(f"bce_with_logits shape mismatch: {logits.shape} vs {target.shape}")
     }
     let per = Tensor(logits.shape)
-    let kernel = cached_kernel(SOURCE, "bce_logits_sample")
+    let kernel = cached_kernel("bce_logits_sample")
     kernel.dispatch_async(
         [logits.buffer(), target.buffer(), per.buffer()],
         logits.size,
@@ -2194,7 +2210,7 @@ pub fn binary_cross_entropy_with_logits(logits: Tensor, target: Tensor) -> Tenso
     if logits.requires_grad {
         per.attach_creator(GradNode([logits], fn(upstream: Tensor) -> list[Tensor] {
             let g = Tensor(logits.shape)
-            let backward_kernel = cached_kernel(SOURCE, "bce_logits_backward")
+            let backward_kernel = cached_kernel("bce_logits_backward")
             backward_kernel.dispatch_async(
                 [logits.buffer(), target.buffer(), upstream.buffer(), g.buffer()],
                 logits.size,
@@ -2214,7 +2230,7 @@ pub fn tril(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let cols = input.shape[1]
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(ATTN_SOURCE, "tril_square")
+    let kernel = cached_attn_kernel("tril_square")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         output.size,
@@ -2227,7 +2243,7 @@ pub fn tril(input: Tensor) -> Tensor {
 pub fn eye(n: int) -> Tensor {
     if n <= 0 { throw ValueError(f"eye needs a positive size, got {n}") }
     let output = Tensor([n, n])
-    let kernel = cached_kernel(SOURCE, "eye_fill")
+    let kernel = cached_kernel("eye_fill")
     kernel.dispatch_async([output.buffer()], output.size, [n])
     return output
 }
@@ -2242,7 +2258,7 @@ pub fn flip(input: Tensor, axis: int = -1) -> Tensor {
     let inner = input.shape[resolved]
     let rows = input.size // inner
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "flip_last")
+    let kernel = cached_kernel("flip_last")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         output.size,
@@ -2264,7 +2280,7 @@ pub fn upsample_nearest2d(input: Tensor, scale: int) -> Tensor {
     let out_h = h * scale
     let out_w = w * scale
     let output = Tensor([n, out_h, out_w, c])
-    let kernel = cached_kernel(SOURCE, "upsample_nearest2d_nhwc")
+    let kernel = cached_kernel("upsample_nearest2d_nhwc")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         output.size,
@@ -2286,7 +2302,7 @@ pub fn split_heads(input: Tensor, heads: int) -> Tensor {
     }
     let hd = dim // heads
     let output = Tensor([heads * seq, hd])
-    let kernel = cached_kernel(ATTN_SOURCE, "split_heads")
+    let kernel = cached_attn_kernel("split_heads")
     kernel.dispatch_async(
         [input.buffer(), output.buffer()],
         output.size,
@@ -2308,7 +2324,7 @@ pub fn merge_heads(packed: Tensor, heads: int, seq: int) -> Tensor {
     }
     let hd = packed.shape[1]
     let output = Tensor([seq, heads * hd])
-    let kernel = cached_kernel(ATTN_SOURCE, "merge_heads")
+    let kernel = cached_attn_kernel("merge_heads")
     kernel.dispatch_async(
         [packed.buffer(), output.buffer()],
         packed.size,
@@ -2322,12 +2338,12 @@ pub fn softmax(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "row_softmax")
+    let kernel = cached_kernel("row_softmax")
     kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let grad_input = Tensor(input.shape)
-            let backward_kernel = cached_kernel(SOURCE, "softmax_backward")
+            let backward_kernel = cached_kernel("softmax_backward")
             backward_kernel.dispatch_async([output.buffer(), upstream.buffer(), grad_input.buffer()], rows, [rows, columns])
             return [grad_input]
         }))
@@ -2344,7 +2360,7 @@ pub fn argmax(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
     let output = Tensor([rows])
-    let kernel = cached_kernel(SOURCE, "row_argmax")
+    let kernel = cached_kernel("row_argmax")
     kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
     return output
 }
@@ -2355,7 +2371,7 @@ pub fn one_hot(indices: Tensor, depth: int) -> Tensor {
     if depth <= 0 { throw ValueError(f"depth must be positive, got {depth}") }
     let rows = indices.shape[0]
     let output = Tensor([rows, depth])
-    let kernel = cached_kernel(SOURCE, "one_hot_rows")
+    let kernel = cached_kernel("one_hot_rows")
     kernel.dispatch_async([indices.buffer(), output.buffer()], rows * depth, [rows, depth])
     return output
 }
@@ -2380,7 +2396,7 @@ pub fn copy_into(source: Tensor, dest: Tensor) -> void {
     if source.size != dest.size {
         throw ValueError(f"copy_into size mismatch: {source.size} vs {dest.size}")
     }
-    let kernel = cached_kernel(SOURCE, "copy_offset")
+    let kernel = cached_kernel("copy_offset")
     kernel.dispatch_async([source.buffer(), dest.buffer()], dest.size, [0, dest.size])
 }
 
@@ -2390,7 +2406,7 @@ pub fn add_scaled_into(value: Tensor, total: Tensor, weight: int) -> void {
         throw ValueError("add_scaled_into needs scalar tensors")
     }
     if weight < 0 { throw ValueError(f"weight must be non-negative, got {weight}") }
-    let kernel = cached_kernel(SOURCE, "add_scaled_into")
+    let kernel = cached_kernel("add_scaled_into")
     kernel.dispatch_async([value.buffer(), total.buffer()], 1, [weight])
 }
 
@@ -2405,7 +2421,7 @@ pub fn add_correct_into(logits: Tensor, labels: Tensor, total: Tensor) -> void {
     if labels.size != batch {
         throw ValueError(f"add_correct_into needs {batch} labels, got {labels.size}")
     }
-    let kernel = cached_kernel(SOURCE, "add_correct_into")
+    let kernel = cached_kernel("add_correct_into")
     kernel.dispatch_async(
         [logits.buffer(), labels.buffer(), total.buffer()],
         batch,
@@ -2476,7 +2492,7 @@ pub fn conv2d(
         let k = kh * kw * cin
         let rows = n * out_h * out_w
         let col = Tensor([rows, k])
-        let kernel = cached_kernel(SOURCE, "im2col_nhwc")
+        let kernel = cached_kernel("im2col_nhwc")
         kernel.dispatch_async(
             [input.buffer(), col.buffer()],
             rows * k,
@@ -2502,14 +2518,14 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     let nspatial = input.shape[0] * input.shape[1] * input.shape[2]
     let mean = Tensor([channels])
     let variance = Tensor([channels])
-    let moments = cached_kernel(SOURCE, "moments_channel")
+    let moments = cached_kernel("moments_channel")
     moments.dispatch_async(
         [input.buffer(), mean.buffer(), variance.buffer()],
         channels,
         [nspatial, channels]
     )
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "batch_norm_forward")
+    let kernel = cached_kernel("batch_norm_forward")
     kernel.dispatch_async(
         [input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
         input.size,
@@ -2530,7 +2546,7 @@ pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
         throw ValueError("layer_norm gamma/beta must match the last dimension")
     }
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "layer_norm_forward")
+    let kernel = cached_kernel("layer_norm_forward")
     kernel.dispatch_async(
         [input.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
         input.shape[0],
@@ -2603,7 +2619,7 @@ pub fn multi_head_attention(
     }
     if seq >= 16 and hd >= 32 and hd <= 64 {
         let q_tiles = (seq + 15) // 16
-        let kernel = cached_kernel(ATTN_SOURCE, "flash_mha_wide")
+        let kernel = cached_attn_kernel("flash_mha_wide")
         kernel.dispatch_async(
             [query.buffer(), key.buffer(), value.buffer(), output.buffer()],
             q_tiles * heads * 256,
@@ -2614,7 +2630,7 @@ pub fn multi_head_attention(
     }
     if seq >= 16 and hd <= 64 {
         let q_tiles = (seq + 15) // 16
-        let kernel = cached_kernel(ATTN_SOURCE, "flash_mha")
+        let kernel = cached_attn_kernel("flash_mha")
         kernel.dispatch_async(
             [query.buffer(), key.buffer(), value.buffer(), output.buffer()],
             q_tiles * heads * 256,
@@ -2675,7 +2691,7 @@ pub fn gather_rows(source: Tensor, indices: Tensor) -> Tensor {
     }
     let width = source.shape[1]
     let output = Tensor([indices.size, width])
-    let kernel = cached_kernel(SOURCE, "gather_rows")
+    let kernel = cached_kernel("gather_rows")
     kernel.dispatch_async(
         [source.buffer(), indices.buffer(), output.buffer()],
         output.size,
@@ -2691,7 +2707,7 @@ pub fn gather_rows(source: Tensor, indices: Tensor) -> Tensor {
 
 fn scatter_add_rows(upstream: Tensor, indices: Tensor, vocab: int, width: int) -> Tensor {
     let dest = Tensor.zeros([vocab, width])
-    let kernel = cached_kernel(SOURCE, "scatter_add_rows")
+    let kernel = cached_kernel("scatter_add_rows")
     kernel.dispatch_async(
         [upstream.buffer(), indices.buffer(), dest.buffer()],
         upstream.size,
@@ -2720,14 +2736,14 @@ pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Te
     let slots = n * groups
     let mean = Tensor([slots])
     let variance = Tensor([slots])
-    let moments = cached_kernel(SOURCE, "moments_group")
+    let moments = cached_kernel("moments_group")
     moments.dispatch_async(
         [input.buffer(), mean.buffer(), variance.buffer()],
         slots,
         [n, spatial, c, groups]
     )
     let output = Tensor(input.shape)
-    let kernel = cached_kernel(SOURCE, "group_norm_forward")
+    let kernel = cached_kernel("group_norm_forward")
     kernel.dispatch_async(
         [input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
         output.size,
