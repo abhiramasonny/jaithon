@@ -29,7 +29,9 @@ stopped: OP_LT
 stopped: a local was given two different kinds
 stopped: add-bind of a kind that is neither int nor float
 stopped: an unpinned receiver's result kind
+stopped: builtin arity
 stopped: callee is not a compiled global function
 stopped: callee's return kind not usable
 stopped: loop variable took two kinds
 stopped: more live values than there are callee-saved registers
+stopped: too many roots

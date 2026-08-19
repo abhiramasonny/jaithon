@@ -189,7 +189,7 @@ pub fn fast(image: Mat, threshold: int = 10, nonmax_suppression: bool = true) ->
     image.flush()
     let rows = image.rows
     let cols = image.cols
-    let values = image.to_list()
+    let values = image.values()
     var scores: list[int] = []
     for _index in 0..rows * cols { scores.push(0) }
 
@@ -449,7 +449,7 @@ pub class ORB {
     pub fn compute(self, image: Mat, keypoints: list[KeyPoint]) -> tuple[list[KeyPoint], Mat] {
         image.flush()
         let smoothed = gaussian_blur(image, Size(7, 7), 2.0)
-        let values = smoothed.to_list()
+        let values = smoothed.values()
         let radius = self.patch_size // 2
         for point in keypoints {
             point.angle = patch_angle(values, image.rows, image.cols, point, radius)
@@ -488,7 +488,7 @@ pub class BRIEF {
     pub fn compute(self, image: Mat, keypoints: list[KeyPoint]) -> tuple[list[KeyPoint], Mat] {
         image.flush()
         let smoothed = gaussian_blur(image, Size(7, 7), 2.0)
-        let values = smoothed.to_list()
+        let values = smoothed.values()
         let described = describe(
             values,
             image.rows,
@@ -558,8 +558,8 @@ pub class BFMatcher {
         if query.cols != train.cols {
             throw ValueError("both sets of descriptors have to be the same width")
         }
-        let a = query.to_list()
-        let b = train.to_list()
+        let a = query.values()
+        let b = train.values()
         let width = query.cols
 
         var out: list[DMatch] = []
@@ -613,8 +613,8 @@ pub class BFMatcher {
         if query.cols != train.cols {
             throw ValueError("both sets of descriptors have to be the same width")
         }
-        let a = query.to_list()
-        let b = train.to_list()
+        let a = query.values()
+        let b = train.values()
         let width = query.cols
         var out: list[list[DMatch]] = []
         for i in 0..query.rows {
@@ -745,7 +745,7 @@ pub class SimpleBlobDetector {
 }
 
 fn subtract_from(binary: Mat) -> Mat {
-    let values = binary.to_list()
+    let values = binary.values()
     var out: list[float] = []
     for value in values { out.push(255.0 - value) }
     return Mat.from_list(binary.rows, binary.cols, binary.type_(), out)
@@ -794,7 +794,7 @@ pub fn draw_keypoints(
 }
 
 fn to_colour(image: Mat) -> Mat {
-    let values = image.to_list()
+    let values = image.values()
     var out: list[float] = []
     for value in values {
         out.push(value)

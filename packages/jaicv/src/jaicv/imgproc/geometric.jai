@@ -695,7 +695,7 @@ pub fn solve_dense(rows: list[list[float]], right: list[float]) -> list[float] {
 
 #: The inverse of a 2x3 affine or 3x3 perspective transform.
 pub fn invert_transform(matrix: Mat, perspective: bool) -> Mat {
-    let values = matrix.to_list()
+    let values = matrix.values()
     if not perspective {
         let determinant = values[0] * values[4] - values[1] * values[3]
         if math.fabs(determinant) < 1e-12 {
@@ -750,7 +750,7 @@ pub fn invert3(m: list[list[float]]) -> list[list[float]] {
 
 #: Apply a 3x3 perspective transform to a list of points.
 pub fn perspective_transform(points: list[Point2f], matrix: Mat) -> list[Point2f] {
-    let m = matrix.to_list()
+    let m = matrix.values()
     var out: list[Point2f] = []
     for point in points {
         let w = m[6] * point.x + m[7] * point.y + m[8]

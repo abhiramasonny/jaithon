@@ -106,7 +106,7 @@ fn eight_point(first: list[Point2f], second: list[Point2f]) -> Mat {
 }
 
 fn epipolar_error(matrix: Mat, first: Point2f, second: Point2f) -> float {
-    let f = matrix.to_list()
+    let f = matrix.values()
     let x = float(first.x)
     let y = float(first.y)
     let u = float(second.x)
@@ -139,7 +139,7 @@ fn fit_denormalised(first: list[Point2f], second: list[Point2f], picks: list[int
 }
 
 fn scale_to_unit(matrix: Mat) -> Mat {
-    let values = matrix.to_list()
+    let values = matrix.values()
     var largest = 0.0
     for value in values { largest = max(largest, math.fabs(value)) }
     if largest < 1e-20 { return matrix }
@@ -290,7 +290,7 @@ pub fn decompose_essential_mat(essential: Mat) -> tuple[Mat, Mat, Mat] {
     let w = mat3([0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
     let first = matmul(matmul(u, w), vt)
     let second = matmul(matmul(u, transpose(w)), vt)
-    let columns = u.to_list()
+    let columns = u.values()
     let translation = Mat.from_list(
         3,
         1,
@@ -301,7 +301,7 @@ pub fn decompose_essential_mat(essential: Mat) -> tuple[Mat, Mat, Mat] {
 }
 
 fn determinant3(m: Mat) -> float {
-    let v = m.to_list()
+    let v = m.values()
     return v[0] * (v[4] * v[8] - v[5] * v[7]) - v[1] * (v[3] * v[8] - v[5] * v[6]) +
         v[2] * (v[3] * v[7] - v[4] * v[6])
 }
@@ -324,21 +324,21 @@ fn triangulate_one(left: list[float], right: list[float], a: Point2f, b: Point2f
     for column in 0..4 { rows.push(u * right[8 + column] - right[column]) }
     for column in 0..4 { rows.push(v * right[8 + column] - right[4 + column]) }
     let (_u, _s, vt) = svd(Mat.from_list(4, 4, CV_MAKETYPE(CV_32F, 1), rows))
-    let flat = vt.to_list()
+    let flat = vt.values()
     let w = flat[3 * 4 + 3]
     if math.fabs(w) < 1e-20 { return Point3f(0.0, 0.0, 0.0) }
     return Point3f(flat[12] / w, flat[13] / w, flat[14] / w)
 }
 
 fn projection_of(rotation: Mat, translation: Mat, camera: Mat) -> list[float] {
-    let r = rotation.to_list()
-    let t = translation.to_list()
+    let r = rotation.values()
+    let t = translation.values()
     var rt: list[float] = []
     for row in 0..3 {
         for column in 0..3 { rt.push(r[row * 3 + column]) }
         rt.push(t[row])
     }
-    let k = camera.to_list()
+    let k = camera.values()
     var out: list[float] = []
     for row in 0..3 {
         for column in 0..4 {
@@ -387,7 +387,7 @@ pub fn recover_pose(
         for value in translation.to_list() { moved.push(value * sign) }
         let shifted = Mat.from_list(3, 1, CV_MAKETYPE(CV_32F, 1), moved)
         let right = projection_of(rotation, shifted, camera_matrix)
-        let r = rotation.to_list()
+        let r = rotation.values()
 
         var front: list[bool] = []
         var kept = 0
@@ -428,7 +428,7 @@ pub fn compute_correspond_epilines(
         throw ValueError("which_image is 1 or 2")
     }
     let f = if which_image == 1 { fundamental } else { transpose(fundamental) }
-    let m = f.to_list()
+    let m = f.values()
     var out: list[Point3f] = []
     for point in points {
         let x = float(point.x)
@@ -449,7 +449,7 @@ pub fn compute_correspond_epilines(
 #: The camera matrix's inverse, applied to image points: what a pinhole camera
 #: saw, in the units the essential matrix works in.
 pub fn undistort_to_normalised(points: list[Point2f], camera_matrix: Mat) -> list[Point2f] {
-    let inv = inverse(camera_matrix).to_list()
+    let inv = inverse(camera_matrix).values()
     var out: list[Point2f] = []
     for point in points {
         let x = float(point.x)

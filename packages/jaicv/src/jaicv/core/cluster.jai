@@ -69,7 +69,7 @@ pub fn kmeans(
     let samples = data.rows
     let width = data.cols * data.channels()
     if samples < k { throw ValueError(f"{samples} samples cannot make {k} groups") }
-    let values = data.to_list()
+    let values = data.values()
 
     var state = if seed == 0 { 1 } else { seed }
     var best_labels: list[int] = []
@@ -214,7 +214,7 @@ pub class PCA {
         if samples < 2 {
             throw ValueError("a principal component analysis needs at least two samples")
         }
-        let values = data.to_list()
+        let values = data.values()
 
         var centre: list[float] = []
         for index in 0..width {
@@ -241,7 +241,7 @@ pub class PCA {
         let kept = if components > 0 { min(components, width) } else { width }
         var rows: list[float] = []
         var values_kept: list[float] = []
-        let flat = vectors.to_list()
+        let flat = vectors.values()
         for index in 0..kept {
             values_kept.push(found[index])
             for column in 0..width { rows.push(flat[index * width + column]) }
@@ -255,7 +255,7 @@ pub class PCA {
     #: Map samples into the kept basis.
     pub fn project(self, data: Mat) -> Mat {
         let width = self.mean.cols
-        let values = data.to_list()
+        let values = data.values()
         let centre = self.mean.to_list()
         var centred: list[float] = []
         for sample in 0..data.rows {
@@ -272,7 +272,7 @@ pub class PCA {
         let restored = matmul(data, self.eigenvectors)
         let width = self.mean.cols
         let centre = self.mean.to_list()
-        let values = restored.to_list()
+        let values = restored.values()
         var out: list[float] = []
         for sample in 0..restored.rows {
             for index in 0..width { out.push(values[sample * width + index] + centre[index]) }

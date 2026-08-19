@@ -163,7 +163,7 @@ fn pose_from_dlt(
     image_points: list[Point2f],
     camera_matrix: Mat
 ) -> tuple[list[float], list[float]] {
-    let k = inverse(camera_matrix).to_list()
+    let k = inverse(camera_matrix).values()
     var rows: list[float] = []
     for index in 0..object_points.len() {
         let point = object_points[index]
@@ -264,7 +264,7 @@ fn intrinsics_from(homographies: list[Mat]) -> Mat {
     #: of B in closed form because B is what a Cholesky factor squares to.
     var rows: list[float] = []
     for h in homographies {
-        let m = h.to_list()
+        let m = h.values()
         let h1 = [m[0], m[3], m[6]]
         let h2 = [m[1], m[4], m[7]]
         for value in constraint(h1, h2) { rows.push(value) }
@@ -334,7 +334,7 @@ pub fn calibrate_camera(
     let _unused = image_size
 
     var parameters: list[float] = []
-    let k = camera.to_list()
+    let k = camera.values()
     parameters.push(k[0])
     parameters.push(k[4])
     parameters.push(k[2])

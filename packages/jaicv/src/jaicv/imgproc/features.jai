@@ -227,7 +227,7 @@ pub fn match_template(image: Mat, templ: Mat, method: int = TM_CCOEFF_NORMED) ->
     let area = float(templ.rows * templ.cols)
     var sums = [0.0, 0.0, 0.0, 0.0]
     var energy = 0.0
-    let flat = templ.to_list()
+    let flat = templ.values()
     for index in 0..flat.len() {
         sums[index % cn] += flat[index]
         energy += flat[index] * flat[index]
@@ -784,8 +784,8 @@ pub fn hough_circles(
     let smoothed = blur(image, Size(3, 3))
     let dx = sobel(smoothed, CV_32F, 1, 0, ksize: 3)
     let dy = sobel(smoothed, CV_32F, 0, 1, ksize: 3)
-    let gradient_x = dx.to_list()
-    let gradient_y = dy.to_list()
+    let gradient_x = dx.values()
+    let gradient_y = dy.values()
 
     let rows = image.rows
     let cols = image.cols

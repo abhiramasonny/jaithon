@@ -1465,7 +1465,7 @@ pub class QRCodeDetector {
             image
         } else {
             var values: list[float] = []
-            let flat = image.to_list()
+            let flat = image.values()
             let cn = image.channels()
             for index in 0..image.rows * image.cols {
                 let b = flat[index * cn]

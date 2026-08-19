@@ -17,8 +17,8 @@ from ..core.types import CV_32F, CV_MAKETYPE
 #: Matrix product.
 pub fn matmul(a: Mat, b: Mat) -> Mat {
     if a.cols != b.rows { throw ValueError(f"cannot multiply {a} by {b}") }
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     var out: list[float] = []
     for row in 0..a.rows {
         for column in 0..b.cols {
@@ -53,8 +53,8 @@ pub fn identity(size: int) -> Mat {
 
 #: Elementwise sum.
 pub fn add(a: Mat, b: Mat) -> Mat {
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     var out: list[float] = []
     for index in 0..left.len() { out.push(left[index] + right[index]) }
     return Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 1), out)
@@ -62,8 +62,8 @@ pub fn add(a: Mat, b: Mat) -> Mat {
 
 #: Elementwise difference.
 pub fn subtract(a: Mat, b: Mat) -> Mat {
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     var out: list[float] = []
     for index in 0..left.len() { out.push(left[index] - right[index]) }
     return Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 1), out)
@@ -80,7 +80,7 @@ pub fn scale(a: Mat, factor: float) -> Mat {
 pub fn inverse(a: Mat) -> Mat {
     if a.rows != a.cols { throw ValueError("only a square matrix can be inverted") }
     let n = a.rows
-    let source = a.to_list()
+    let source = a.values()
     var work: list[list[float]] = []
     for row in 0..n {
         var line: list[float] = []
@@ -135,7 +135,7 @@ pub fn solve_least_squares(a: Mat, b: Mat) -> Mat {
 pub fn symmetric_eigen(a: Mat) -> tuple[list[float], Mat] {
     if a.rows != a.cols { throw ValueError("only a square matrix has eigenvectors here") }
     let n = a.rows
-    let source = a.to_list()
+    let source = a.values()
     var m: list[list[float]] = []
     for row in 0..n {
         var line: list[float] = []
@@ -216,7 +216,7 @@ pub fn null_space(a: Mat) -> list[float] {
     let normal = matmul(transpose(a), a)
     let (_values, vectors) = symmetric_eigen(normal)
     let n = normal.rows
-    let flat = vectors.to_list()
+    let flat = vectors.values()
     var out: list[float] = []
     for column in 0..n { out.push(flat[(n - 1) * n + column]) }
     return out
@@ -252,8 +252,8 @@ pub fn svd(a: Mat) -> tuple[Mat, list[float], Mat] {
     #: convention and already the transpose this wants. Reading it the other
     #: way round rebuilds the matrix correctly and leaves `u` not orthogonal,
     #: which is the sort of wrong that only shows up two functions later.
-    let vt_values = vectors.to_list()
-    let source = a.to_list()
+    let vt_values = vectors.values()
+    let source = a.values()
     var u: list[float] = []
     for _index in 0..rows * columns { u.push(0.0) }
 

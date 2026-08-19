@@ -218,8 +218,8 @@ pub fn mul_spectrums(a: Mat, b: Mat, flags: int = 0, conjugate: bool = false) ->
     if a.rows != b.rows or a.cols != b.cols {
         throw ValueError("two spectra have to be the same size")
     }
-    let left = a.to_list()
-    let right = b.to_list()
+    let left = a.values()
+    let right = b.values()
     let left_complex = CV_MAT_CN(a.type_()) == 2
     let right_complex = CV_MAT_CN(b.type_()) == 2
     var out: list[float] = []

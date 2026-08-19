@@ -238,7 +238,7 @@ pub class NormalBayesClassifier {
             var score = -1e300
             for index in 0..self.labels.len() {
                 let centre = self.means[index]
-                let precision = self.inverses[index].to_list()
+                let precision = self.inverses[index].values()
                 let width = centre.len()
                 var quadratic = 0.0
                 for i in 0..width {

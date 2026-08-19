@@ -181,8 +181,8 @@ fn sample(values: list[float], rows: int, cols: int, cn: int, y: int, x: int, c:
 }
 
 fn combine(target: Mat, source: Mat, weight: float, keep: float) -> Mat {
-    let a = target.to_list()
-    let b = source.to_list()
+    let a = target.values()
+    let b = source.values()
     if a.len() != b.len() { throw ValueError("both have to be the same size") }
     var out: list[float] = []
     for index in 0..a.len() { out.push(a[index] * keep + b[index] * weight) }
@@ -202,8 +202,8 @@ pub fn accumulate_square(src: Mat, total: Mat) -> Mat {
 
 #: Add the product of two images into a running total.
 pub fn accumulate_product(first: Mat, second: Mat, total: Mat) -> Mat {
-    let a = first.to_list()
-    let b = second.to_list()
+    let a = first.values()
+    let b = second.values()
     var product: list[float] = []
     for index in 0..a.len() { product.push(a[index] * b[index]) }
     return combine(total, Mat.from_list(first.rows, first.cols, total.type_(), product), 1.0, 1.0)
@@ -247,9 +247,9 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
     var b = second
     let taper = window
     if taper is not null {
-        let wa = a.to_list()
-        let wb = b.to_list()
-        let w = taper.to_list()
+        let wa = a.values()
+        let wb = b.values()
+        let w = taper.values()
         var pa: list[float] = []
         var pb: list[float] = []
         for index in 0..wa.len() {

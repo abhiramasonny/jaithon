@@ -344,7 +344,7 @@ pub fn find_contours(
         throw ValueError(f"chain approximation {method} is not one jaicv implements")
     }
     image.flush()
-    let found = trace_all(image.to_list(), image.rows, image.cols)
+    let found = trace_all(image.values(), image.rows, image.cols)
 
     var chosen: list[Border] = []
     if mode == RETR_EXTERNAL {

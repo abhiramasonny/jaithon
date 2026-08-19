@@ -236,7 +236,7 @@ pub fn moments_f(contour: list[Point2f]) -> Moments {
 pub fn moments_image(image: Mat, binary: bool = false) -> Moments {
     if image.channels() != 1 { throw ValueError("image moments need a single-channel Mat") }
     image.flush()
-    let values = image.to_list()
+    let values = image.values()
     var m00 = 0.0
     var m10 = 0.0
     var m01 = 0.0
