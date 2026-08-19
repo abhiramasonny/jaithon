@@ -207,6 +207,101 @@ def write_edges(handle) -> None:
              cv2.Canny(noisy, lo, hi, apertureSize=3, L2gradient=True))
 
 
+COLOUR = (10, 200, 90)
+
+
+def canvas(channels: int = 3, rows: int = 26, cols: int = 32) -> np.ndarray:
+    if channels == 1:
+        return np.zeros((rows, cols), np.uint8)
+    return np.zeros((rows, cols, channels), np.uint8)
+
+
+def paint(handle, name: str, args: str, source: np.ndarray, draw) -> None:
+    out = source.copy()
+    draw(out)
+    case(handle, name, args, source, out)
+
+
+def write_drawing(handle) -> None:
+    base = canvas()
+    grey = canvas(1)
+    lines = [(2, 3, 28, 20), (28, 3, 2, 20), (5, 22, 25, 2), (0, 0, 31, 25),
+             (4, 12, 27, 12), (16, 1, 16, 24), (-8, 5, 40, 18), (10, -6, 20, 30)]
+    for x1, y1, x2, y2 in lines:
+        for thickness in (1, 2, 3, 5):
+            for lt, ltn in ((cv2.LINE_8, 8), (cv2.LINE_4, 4)):
+                if thickness > 1 and ltn == 4:
+                    continue
+                paint(handle, "drawLine", f"{x1} {y1} {x2} {y2} {thickness} {ltn}", base,
+                      lambda m, a=(x1, y1), b=(x2, y2), t=thickness, l=lt:
+                          cv2.line(m, a, b, COLOUR, t, l))
+    for thickness in (1, 3):
+        paint(handle, "drawLine", f"3 4 20 15 {thickness} 8", grey,
+              lambda m, t=thickness: cv2.line(m, (3, 4), (20, 15), (200, 0, 0), t, cv2.LINE_8))
+
+    rects = [(3, 3, 26, 20), (0, 0, 31, 25), (10, 8, 12, 10), (-5, -4, 20, 14)]
+    for x1, y1, x2, y2 in rects:
+        for thickness in (1, 2, 4, -1):
+            paint(handle, "drawRect", f"{x1} {y1} {x2} {y2} {thickness} 8", base,
+                  lambda m, a=(x1, y1), b=(x2, y2), t=thickness:
+                      cv2.rectangle(m, a, b, COLOUR, t, cv2.LINE_8))
+
+    for cx, cy in ((16, 13), (3, 3), (30, 24)):
+        for radius in (0, 1, 2, 5, 9, 14):
+            for thickness in (1, -1, 3):
+                paint(handle, "drawCircle", f"{cx} {cy} {radius} {thickness} 8", base,
+                      lambda m, c=(cx, cy), r=radius, t=thickness:
+                          cv2.circle(m, c, r, COLOUR, t, cv2.LINE_8))
+
+    ellipses = [(16, 13, 12, 7, 0, 0, 360), (16, 13, 12, 7, 30, 0, 360),
+                (16, 13, 10, 10, 0, 0, 180), (16, 13, 9, 5, 45, 30, 300),
+                (16, 13, 2, 2, 0, 0, 360), (8, 8, 14, 4, 120, 0, 360)]
+    for cx, cy, ax, ay, angle, start, end in ellipses:
+        for thickness in (1, 2, -1):
+            paint(handle, "drawEllipse",
+                  f"{cx} {cy} {ax} {ay} {angle} {start} {end} {thickness} 8", base,
+                  lambda m, c=(cx, cy), a=(ax, ay), an=angle, s=start, e=end, t=thickness:
+                      cv2.ellipse(m, c, a, an, s, e, COLOUR, t, cv2.LINE_8))
+
+    polys = {
+        "tri": [(4, 3), (28, 8), (12, 22)],
+        "quad": [(3, 4), (27, 2), (29, 21), (6, 23)],
+        "concave": [(2, 2), (29, 4), (16, 12), (29, 23), (3, 21)],
+        "star": [(16, 1), (20, 10), (30, 11), (22, 17), (25, 24),
+                 (16, 19), (7, 24), (10, 17), (2, 11), (12, 10)],
+    }
+    for tag, pts in polys.items():
+        flat = " ".join(f"{x} {y}" for x, y in pts)
+        array = np.array([pts], np.int32)
+        for closed in (0, 1):
+            for thickness in (1, 2):
+                paint(handle, "drawPolylines",
+                      f"{closed} {thickness} 8 {len(pts)} {flat}", base,
+                      lambda m, a=array, c=bool(closed), t=thickness:
+                          cv2.polylines(m, a, c, COLOUR, t, cv2.LINE_8))
+        paint(handle, "drawFillPoly", f"{len(pts)} {flat}", base,
+              lambda m, a=array: cv2.fillPoly(m, a, COLOUR, cv2.LINE_8))
+        if tag != "concave" and tag != "star":
+            paint(handle, "drawFillConvexPoly", f"{len(pts)} {flat}", base,
+                  lambda m, p=np.array(pts, np.int32):
+                      cv2.fillConvexPoly(m, p, COLOUR, cv2.LINE_8))
+
+    arrows = [(4, 4, 26, 18, 1), (26, 20, 5, 6, 2)]
+    for x1, y1, x2, y2, thickness in arrows:
+        paint(handle, "drawArrow", f"{x1} {y1} {x2} {y2} {thickness} 8 10", base,
+              lambda m, a=(x1, y1), b=(x2, y2), t=thickness:
+                  cv2.arrowedLine(m, a, b, COLOUR, t, cv2.LINE_8, 0, 0.1))
+
+    markers = [(cv2.MARKER_CROSS, 0), (cv2.MARKER_TILTED_CROSS, 1), (cv2.MARKER_STAR, 2),
+               (cv2.MARKER_DIAMOND, 3), (cv2.MARKER_SQUARE, 4),
+               (cv2.MARKER_TRIANGLE_UP, 5), (cv2.MARKER_TRIANGLE_DOWN, 6)]
+    for marker, code in markers:
+        for size in (7, 12):
+            paint(handle, "drawMarker", f"16 13 {code} {size} 1 8", base,
+                  lambda m, k=marker, s=size:
+                      cv2.drawMarker(m, (16, 13), COLOUR, k, s, 1, cv2.LINE_8))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -215,6 +310,7 @@ def main() -> int:
         write_threshold(handle)
         write_morph(handle)
         write_edges(handle)
+        write_drawing(handle)
     print(f"wrote {OUT}")
     return 0
 

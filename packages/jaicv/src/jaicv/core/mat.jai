@@ -531,6 +531,17 @@ pub class Mat: Printable {
         for channel in 0..min(cn, 4) { self.set_at(y, x, colour[channel], channel: channel) }
     }
 
+    #: The live host mirror, for a caller that writes many pixels at once.
+    #:
+    #: Writes through the returned list land in the mirror and reach the device
+    #: on the next `flush`. Rasterising a shape through `set_at` would re-check
+    #: the mirror once per pixel; the drawing module takes the list once.
+    pub fn edit(self) -> list[float] {
+        let values = self.ensure_host()
+        self.pending = true
+        return values
+    }
+
     #: Push buffered `set_at` writes back to the device.
     pub fn flush(self) -> void {
         if not self.pending { return }
