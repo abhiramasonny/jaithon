@@ -873,6 +873,43 @@ def write_misc(handle) -> None:
          real.reshape(1, -1).astype(np.float32))
 
 
+def write_imgproc_misc(handle) -> None:
+    ramp = np.arange(256, dtype=np.uint8).reshape(1, 256)
+    for name, cid in (("AUTUMN", cv2.COLORMAP_AUTUMN), ("COOL", cv2.COLORMAP_COOL),
+                      ("SPRING", cv2.COLORMAP_SPRING), ("SUMMER", cv2.COLORMAP_SUMMER),
+                      ("WINTER", cv2.COLORMAP_WINTER), ("JET", cv2.COLORMAP_JET)):
+        case(handle, "applyColorMap", name, ramp, cv2.applyColorMap(ramp, cid))
+
+    rng = np.random.default_rng(233)
+    gray = rng.integers(0, 256, size=(20, 24), dtype=np.uint8)
+    for cx, cy in ((10.5, 8.25), (3.0, 3.0), (19.75, 15.5)):
+        patch = cv2.getRectSubPix(gray, (7, 5), (cx, cy))
+        case(handle, "getRectSubPix", f"{cx} {cy}", gray, patch.astype(np.float32))
+
+    case(handle, "createHanningWindow", "16 12", np.zeros((4, 4), np.uint8),
+         cv2.createHanningWindow((16, 12), cv2.CV_32F))
+
+    texture = cv2.GaussianBlur(
+        (rng.random((64, 64)) * 255).astype(np.uint8), (7, 7), 2).astype(np.float32)
+    moved = cv2.warpAffine(texture, np.float32([[1, 0, 5], [0, 1, -3]]), (64, 64))
+    window = cv2.createHanningWindow((64, 64), cv2.CV_32F)
+    shift, response = cv2.phaseCorrelate(texture, moved, window)
+    case(handle, "phaseCorrelate", "shifted", texture,
+         np.array([[shift[0], shift[1]]], np.float32))
+
+    square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]], np.float32)
+    other = np.array([[5.0, 5.0], [15.0, 5.0], [15.0, 15.0], [5.0, 15.0]], np.float32)
+    area, _ = cv2.intersectConvexConvex(square, other)
+    case(handle, "intersectConvexConvex", "squares", np.zeros((4, 4), np.uint8),
+         np.array([[area]], np.float32))
+
+    for tag, pts in (("square", square),
+                     ("blob", np.array([[0.0, 0.0], [12.0, 2.0], [9.0, 11.0], [2.0, 7.0]], np.float32))):
+        tri_area, _ = cv2.minEnclosingTriangle(pts)
+        case(handle, "minEnclosingTriangle", tag, np.zeros((4, 4), np.uint8),
+             np.array([[tri_area]], np.float32))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -894,6 +931,7 @@ def main() -> int:
         write_transform(handle)
         write_dnn(handle)
         write_misc(handle)
+        write_imgproc_misc(handle)
     print(f"wrote {OUT}")
     return 0
 
