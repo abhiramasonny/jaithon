@@ -500,6 +500,51 @@ def write_hist(handle) -> None:
          cv2.calcBackProject([hue], [0], hue_hist, [0, 180], 1).astype(np.uint8))
 
 
+def write_features(handle) -> None:
+    rng = np.random.default_rng(101)
+    scene = rng.integers(0, 256, size=(24, 30), dtype=np.uint8)
+    scene[8:14, 10:17] = np.array([[10, 200, 30, 40, 250, 60, 70],
+                                   [80, 90, 100, 110, 120, 130, 140],
+                                   [150, 160, 170, 180, 190, 200, 210],
+                                   [20, 30, 40, 50, 60, 70, 80],
+                                   [220, 230, 240, 250, 5, 15, 25],
+                                   [35, 45, 55, 65, 75, 85, 95]], np.uint8)
+    patch = scene[8:14, 10:17].copy()
+    colour = rng.integers(0, 256, size=(24, 30, 3), dtype=np.uint8)
+    colour_patch = colour[5:11, 7:15].copy()
+
+    methods = {"SQDIFF": cv2.TM_SQDIFF, "SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED,
+               "CCORR": cv2.TM_CCORR, "CCORR_NORMED": cv2.TM_CCORR_NORMED,
+               "CCOEFF": cv2.TM_CCOEFF, "CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED}
+    for name, method in methods.items():
+        case(handle, "matchTemplate", f"gray {name}", scene,
+             cv2.matchTemplate(scene, patch, method))
+        case(handle, "matchTemplateColour", f"colour {name}", colour,
+             cv2.matchTemplate(colour, colour_patch, method))
+
+    shapes = np.zeros((26, 32), np.uint8)
+    cv2.rectangle(shapes, (4, 4), (14, 16), 255, -1)
+    cv2.rectangle(shapes, (18, 8), (28, 20), 255, 2)
+    for block in (2, 3, 5):
+        for aperture in (3, 5):
+            case(handle, "cornerHarris", f"{block} {aperture}", shapes,
+                 cv2.cornerHarris(shapes, block, aperture, 0.04))
+            # cornerMinEigenVal's third positional argument is `dst`, not the
+            # aperture, so the aperture has to be named or it silently stays 3.
+            case(handle, "cornerMinEigenVal", f"{block} {aperture}", shapes,
+                 cv2.cornerMinEigenVal(shapes, block, ksize=aperture))
+
+    lines_image = np.zeros((40, 48), np.uint8)
+    cv2.line(lines_image, (2, 5), (45, 5), 255, 1)
+    cv2.line(lines_image, (6, 2), (6, 37), 255, 1)
+    cv2.line(lines_image, (3, 36), (44, 9), 255, 1)
+    for threshold in (18, 25):
+        found = cv2.HoughLines(lines_image, 1, np.pi / 180, threshold)
+        rows = [] if found is None else [[float(l[0][0]), float(l[0][1])] for l in found]
+        case(handle, "houghLines", f"1 180 {threshold}", lines_image,
+             np.array(rows, np.float32).reshape(-1, 2))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -513,6 +558,7 @@ def main() -> int:
         write_shape(handle)
         write_segmentation(handle)
         write_hist(handle)
+        write_features(handle)
     print(f"wrote {OUT}")
     return 0
 
