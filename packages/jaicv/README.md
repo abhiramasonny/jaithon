@@ -59,6 +59,9 @@ down next to the tolerance. In short:
 - **Within a fit**: calibration and pose, which agree on the answer to a
   thousandth of a pixel of reprojection error but split it slightly differently
   between the principal point and the last distortion term.
+- **As accurate**: `StereoBM` and `StereoSGBM` recover a known disparity on a
+  rectified pair as closely as OpenCV's do, including the same gradual
+  transition across a depth step that a square window produces.
 - **Better than OpenCV's**: `QRCodeDetector` reads every symbol OpenCV 5.0.0's
   encoder produces from version 1 to 40 — including the ones OpenCV's own
   detector cannot — and OpenCV reads what this writes. The one disagreement is
@@ -83,7 +86,7 @@ down next to the tolerance. In short:
 | `highgui` | `imshow`, `wait_key`, windows, mouse callbacks, trackbars |
 | `features2d` | FAST, ORB, BRIEF, blob detection, brute-force matching, keypoint and match drawing |
 | `objdetect` | cascade classification, reading OpenCV's own trained XML; histograms of oriented gradients; QR codes, read and written, every version and correction level |
-| `calib3d` | Rodrigues, homography, affine estimation, projection, distortion, triangulation, `solve_pnp`, `calibrate_camera`, chessboard detection, fundamental and essential matrices, pose recovery, epipolar lines |
+| `calib3d` | Rodrigues, homography, affine estimation, projection, distortion, triangulation, `solve_pnp`, `calibrate_camera`, chessboard detection, fundamental and essential matrices, pose recovery, epipolar lines, stereo rectification, block and semi-global matching, reprojection to 3D |
 | `video` | Lucas-Kanade and Farneback optical flow, MOG2 and KNN background subtraction, mean shift, CamShift, Kalman |
 | `photo` | non-local means denoising, inpainting, edge-preserving smoothing |
 | `ml` | nearest neighbours, naive Bayes, support vector machine, logistic regression, decision trees, random forest, multilayer perceptron |
@@ -98,10 +101,13 @@ Named so that nobody has to find out by trying:
   coefficients of OpenCV's pre-trained people detector — `HOGDescriptor`
   computes the descriptor and takes a detector, but does not ship one. A kanji
   QR segment comes back as its Shift-JIS bytes rather than as text.
-- **calib3d**: fisheye, stereo rectification and matching, circle-grid
-  patterns. `find_fundamental_mat` and `find_essential_mat` fit by the
-  normalised eight-point algorithm inside RANSAC, so eight correspondences are
-  needed where OpenCV's seven- and five-point minimal solvers need fewer.
+- **calib3d**: fisheye and circle-grid patterns. `find_fundamental_mat` and
+  `find_essential_mat` fit by the normalised eight-point algorithm inside
+  RANSAC, so eight correspondences are needed where OpenCV's seven- and
+  five-point minimal solvers need fewer. `stereo_rectify` computes the same
+  rotations OpenCV does but keeps the cameras' own principal point, where
+  OpenCV recomputes one by fitting the largest usable rectangle inside the
+  rectified border — the `alpha` parameter, which is not here.
 - **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;
   `Net` is the adapter, not a runtime.
 - **imgproc**: GrabCut, `EMD`, line segment detection, the Viridis family of

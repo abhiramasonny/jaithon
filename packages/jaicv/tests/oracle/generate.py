@@ -752,6 +752,33 @@ def write_calib(handle) -> None:
     case(handle, "recoverPose", "translation", blank,
          epi_t.reshape(1, 3).astype(np.float32))
 
+    # Rectification, for a pair whose relative rotation is small and whose
+    # baseline is mostly sideways -- which is every real stereo rig. The
+    # rotations are what has to agree; `P2` and `Q` follow from them and the
+    # focal length, and they are recorded too because a sign error in either
+    # reprojects the scene behind the camera.
+    stereo_k = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]])
+    stereo_d = np.zeros((5, 1))
+    stereo_t = np.array([[-0.12], [0.01], [-0.004]])
+    for tag, rv in (("aligned", [0.0, 0.0, 0.0]),
+                    ("smallTurn", [0.01, 0.02, -0.015]),
+                    ("largeTurn", [0.05, -0.09, 0.03])):
+        stereo_r, _ = cv2.Rodrigues(np.array(rv))
+        sr1, sr2, sp1, sp2, sq, _r1, _r2 = cv2.stereoRectify(
+            stereo_k, stereo_d, stereo_k, stereo_d, (640, 480), stereo_r, stereo_t
+        )
+        # Only the rotations. `P2` and `Q` carry a principal point OpenCV
+        # recomputes by projecting the image border and fitting the largest
+        # usable rectangle inside it -- the `alpha` machinery, which jaicv does
+        # not have -- so its centre drifts by a few pixels where jaicv keeps
+        # the cameras' own. The rotations are what rectification IS, and
+        # test_stereo.jai checks the rest by the property that matters: that a
+        # correspondence lands on the same row and reprojects to the right
+        # depth.
+        del sp1, sp2, sq, _r1, _r2
+        case(handle, "stereoRectifyR1", tag, blank, sr1.astype(np.float32))
+        case(handle, "stereoRectifyR2", tag, blank, sr2.astype(np.float32))
+
     camera = np.array([[520.0, 0.0, 320.0], [0.0, 515.0, 240.0], [0.0, 0.0, 1.0]])
     for coeffs in ([0.0, 0.0, 0.0, 0.0, 0.0], [-0.28, 0.09, 0.001, -0.002, 0.0]):
         dist = np.array(coeffs, np.float64)
