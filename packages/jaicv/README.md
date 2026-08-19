@@ -117,8 +117,12 @@ JAITHON_PATH=lib ./jaithon test packages/jaicv/tests/
 ```
 
 `test_jaicv.jai` holds what can be checked without OpenCV — `Mat` semantics,
-arithmetic, codec round trips, clustering. `test_against_opencv.jai` replays
-the recorded cases. Regenerate those with OpenCV installed:
+arithmetic, codec round trips, video round trips, clustering.
+`test_reachable.jai` calls every exported entry point once and checks the shape
+of what comes back; it exists because more than half the library had no caller
+in any test, and two functions turned out to raise on their first real use.
+`test_against_opencv.jai` replays the recorded cases. Regenerate those with
+OpenCV installed:
 
 ```bash
 python packages/jaicv/tests/oracle/generate.py
