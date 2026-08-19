@@ -4454,6 +4454,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
             }
         }
+        /* Above the offset map for the same reason the deferred settle is:
+         * branchTo empties the FP bank before it records a fixup, so an edge
+         * arriving here holds every entry in its own X register -- and must
+         * not run the fall-through's `fmov x, d` over a d register it never
+         * wrote. `if flag { a[i] } else { a[0] }` is the shape: one arm ends
+         * at the jump with its value in X, the other flows into the OP_ADD
+         * and leaves it in the bank. Settled here, both edges agree. */
+        if (e->fpLive != 0 && !e->inlining) {
+            for (unsigned f = 0; f < e->fixupCount; f++) {
+                if (e->fixups[f].targetOffset != (uint32_t)off) continue;
+                fpSyncAll(e);
+                break;
+            }
+        }
         /* Above the offset map on purpose: a back edge to `off` must land on
          * the loop head, not on the loads that were hoisted out of it. */
         emitHoistsAt(e, (uint32_t)off);
@@ -4477,20 +4491,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         e->instClean = (e->kPend == 0 && e->xBorrow == 0 && e->fpBorrow == 0);
 
         if (e->fpLive != 0) {
-            bool joinsHere = false;
-            for (unsigned f = 0; f < e->fixupCount && !joinsHere; f++) {
-                joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
-            }
-            /* Inside an inlined body the offsets are the callee's, so a
-             * caller fixup that happens to name the same number is not a join
-             * here at all -- and there are no branches in an inlined body for
-             * one to be. */
-            if (e->inlining) joinsHere = false;
-            /* An inlined OP_RETURN is not a sync point: the only entry that outlives it is the result, and
-             * inlineGlobalCall carries that one across in the bank. Everything under it is discarded unread. */
+            /* A join already settled above, so anything still live here is on
+             * a single edge. An inlined OP_RETURN is not a sync point either:
+             * the only entry that outlives it is the result, and
+             * inlineGlobalCall carries that one across in the bank. Everything
+             * under it is discarded unread. */
             if (e->inlining && op == OP_RETURN) {
                 /* handled below */
-            } else if (!fpFastOp(op) || joinsHere || e->inProtected) {
+            } else if (!fpFastOp(op) || e->inProtected) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < 64) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
