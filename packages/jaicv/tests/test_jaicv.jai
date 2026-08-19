@@ -14,6 +14,8 @@ from jaicv.core.types import CMP_GT, Point, Range, Rect, Scalar, Size, type_to_s
 from jaicv.core.arith import add, absdiff, bitwise_not, compare_scalar, divide, in_range
 from jaicv.core.arith import lut, multiply, subtract
 from jaicv.core.stats import count_non_zero, mean, min_max_loc, norm, sum_mat
+from jaicv.core.cluster import kmeans, PCA
+from jaicv.core.dft import dft, idft, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from jaicv.imgcodecs.codecs import imdecode, imencode, sniff
 from jaicv.imgcodecs.codecs import IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED
 from jaicv.imgproc.geometric import get_perspective_transform, perspective_transform
@@ -260,4 +262,58 @@ fn test_a_range_covers_a_half_open_span() -> void {
 fn test_a_size_reports_its_area() -> void {
     assert_eq(Size(4, 5).area(), 20)
     assert_true(Size(0, 5).empty())
+}
+
+fn test_kmeans_finds_clusters_that_are_there() -> void {
+    if not have_gpu() { return }
+    var values: list[float] = []
+    let centres = [[0.0, 0.0], [8.0, 1.0], [3.0, 9.0]]
+    for group in 0..3 {
+        for index in 0..12 {
+            let jitter = float(index * 37 % 11) / 40.0 - 0.125
+            values.push(centres[group][0] + jitter)
+            values.push(centres[group][1] - jitter)
+        }
+    }
+    let samples = Mat.from_list(36, 2, CV_32FC1, values)
+    let (compactness, labels, found) = kmeans(samples, 3, 5)
+    assert_true(compactness < 2.0, f"the groups should be tight, got {compactness}")
+    assert_eq(found.rows, 3)
+
+    #: Every sample of a group has to land in the same group as the rest of it,
+    #: whichever number that group ended up with.
+    let assigned = labels.to_list()
+    for group in 0..3 {
+        let first = assigned[group * 12]
+        for index in 0..12 { assert_eq(assigned[group * 12 + index], first) }
+    }
+    assert_true(assigned[0] != assigned[12])
+    assert_true(assigned[12] != assigned[24])
+}
+
+fn test_a_transform_and_its_inverse_return_the_signal() -> void {
+    if not have_gpu() { return }
+    var values: list[float] = []
+    for index in 0..24 { values.push(float(index * 53 % 29) - 14.0) }
+    let signal = Mat.from_list(4, 6, CV_32FC1, values)
+    let spectrum = dft(signal, DFT_COMPLEX_OUTPUT)
+    assert_eq(spectrum.channels(), 2)
+    let back = idft(spectrum, DFT_SCALE | DFT_REAL_OUTPUT).to_list()
+    for index in 0..values.len() { assert_near(back[index], values[index], 1e-3) }
+}
+
+fn test_principal_components_line_up_with_the_spread() -> void {
+    if not have_gpu() { return }
+    var values: list[float] = []
+    for index in 0..40 {
+        let t = float(index) * 0.25 - 5.0
+        #: A cloud along the line y = 2x, so the first component has to point
+        #: that way whatever sign it comes back with.
+        values.push(t)
+        values.push(2.0 * t)
+    }
+    let analysis = PCA(Mat.from_list(40, 2, CV_32FC1, values), 1)
+    let direction = analysis.eigenvectors.to_list()
+    let ratio = direction[1] / direction[0]
+    assert_near(ratio, 2.0, 1e-6)
 }
