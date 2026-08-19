@@ -178,6 +178,19 @@ from .core.dft import DFT_COMPLEX_OUTPUT, DFT_INVERSE, DFT_REAL_OUTPUT, DFT_ROWS
 from .core.cluster import kmeans, PCA
 from .core.cluster import KMEANS_PP_CENTERS, KMEANS_RANDOM_CENTERS, KMEANS_USE_INITIAL_LABELS
 
+from .photo.denoise import detail_enhance, edge_preserving_filter
+from .photo.denoise import fast_nl_means_denoising, fast_nl_means_denoising_colored
+from .photo.denoise import inpaint, stylization
+from .photo.denoise import INPAINT_NS, INPAINT_TELEA, NORMCONV_FILTER, RECURS_FILTER
+
+from .ml.models import ann_mlp_create, d_trees_create, k_nearest_create
+from .ml.models import logistic_regression_create, normal_bayes_classifier_create
+from .ml.models import r_trees_create, svm_create
+from .ml.models import ANN_MLP, DTrees, KNearest, LogisticRegression
+from .ml.models import NormalBayesClassifier, RTrees, SVM
+from .ml.models import COL_SAMPLE, ROW_SAMPLE, SVM_C_SVC, SVM_EPS_SVR
+from .ml.models import SVM_LINEAR, SVM_POLY, SVM_RBF
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -335,6 +348,18 @@ export { DFT_COMPLEX_OUTPUT, DFT_INVERSE, DFT_REAL_OUTPUT, DFT_ROWS, DFT_SCALE }
 
 export { kmeans, PCA }
 export { KMEANS_PP_CENTERS, KMEANS_RANDOM_CENTERS, KMEANS_USE_INITIAL_LABELS }
+
+export { detail_enhance, edge_preserving_filter, fast_nl_means_denoising }
+export { fast_nl_means_denoising_colored, inpaint, stylization }
+export { INPAINT_NS, INPAINT_TELEA, NORMCONV_FILTER, RECURS_FILTER }
+
+export { ann_mlp_create, d_trees_create, k_nearest_create }
+export { logistic_regression_create, normal_bayes_classifier_create }
+export { r_trees_create, svm_create }
+export { ANN_MLP, DTrees, KNearest, LogisticRegression }
+export { NormalBayesClassifier, RTrees, SVM }
+export { COL_SAMPLE, ROW_SAMPLE, SVM_C_SVC, SVM_EPS_SVR }
+export { SVM_LINEAR, SVM_POLY, SVM_RBF }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }
