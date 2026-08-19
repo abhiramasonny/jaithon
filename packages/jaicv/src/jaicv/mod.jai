@@ -160,6 +160,18 @@ from .objdetect.cascade import CASCADE_DO_CANNY_PRUNING, CASCADE_DO_ROUGH_SEARCH
 from .objdetect.cascade import CASCADE_FIND_BIGGEST_OBJECT, CASCADE_SCALE_IMAGE
 from .objdetect.xml import parse_xml, Node
 
+from .calib3d.transform import estimate_affine_2d, estimate_affine_partial_2d
+from .calib3d.transform import find_homography, get_optimal_new_camera_matrix
+from .calib3d.transform import init_undistort_rectify_map, project_points, refine_homography
+from .calib3d.transform import rodrigues, triangulate_points, undistort_points
+from .calib3d.transform import LMEDS, RANSAC
+
+from .calib3d.calibrate import calibrate_camera, draw_chessboard_corners
+from .calib3d.calibrate import find_chessboard_corners, solve_pnp, undistort
+from .calib3d.calibrate import SOLVEPNP_ITERATIVE
+
+from .core.linalg import identity, inverse, levenberg_marquardt, null_space, symmetric_eigen
+
 from .imgcodecs.codecs import have_image_reader, have_image_writer, imdecode, imencode
 from .imgcodecs.codecs import imread, imwrite, sniff
 from .imgcodecs.codecs import IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR
@@ -301,6 +313,16 @@ export { group_rectangles, CascadeClassifier }
 export { CASCADE_DO_CANNY_PRUNING, CASCADE_DO_ROUGH_SEARCH }
 export { CASCADE_FIND_BIGGEST_OBJECT, CASCADE_SCALE_IMAGE }
 export { parse_xml, Node }
+
+export { estimate_affine_2d, estimate_affine_partial_2d, find_homography }
+export { get_optimal_new_camera_matrix, init_undistort_rectify_map, project_points }
+export { refine_homography, rodrigues, triangulate_points, undistort_points }
+export { LMEDS, RANSAC }
+
+export { calibrate_camera, draw_chessboard_corners, find_chessboard_corners }
+export { solve_pnp, undistort, SOLVEPNP_ITERATIVE }
+
+export { identity, inverse, levenberg_marquardt, null_space, symmetric_eigen }
 
 export { have_image_reader, have_image_writer, imdecode, imencode, imread, imwrite, sniff }
 export { IMREAD_ANYCOLOR, IMREAD_ANYDEPTH, IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED }

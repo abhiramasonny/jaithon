@@ -656,6 +656,123 @@ def write_cascade(handle) -> None:
              np.array(rows, np.int32).reshape(-1, 4))
 
 
+def write_calib(handle) -> None:
+    rng = np.random.default_rng(151)
+    blank = np.zeros((4, 4), np.uint8)
+
+    for rv in ([0.1, -0.2, 0.35], [0.0, 0.0, 0.0], [1.2, 0.0, 0.0], [0.3, 0.4, 0.5]):
+        vector = np.array(rv, np.float64).reshape(3, 1)
+        matrix, _ = cv2.Rodrigues(vector)
+        case(handle, "rodriguesForward", " ".join(repr(v) for v in rv), blank,
+             matrix.astype(np.float32))
+        back, _ = cv2.Rodrigues(matrix)
+        case(handle, "rodriguesBack", " ".join(repr(v) for v in rv), blank,
+             back.reshape(1, 3).astype(np.float32))
+
+    src = np.array([[10.0, 12.0], [90.0, 8.0], [95.0, 70.0], [5.0, 75.0],
+                    [40.0, 30.0], [60.0, 55.0], [20.0, 60.0]], np.float32)
+    h_true = np.array([[1.05, 0.08, -6.0], [-0.04, 0.96, 4.0], [0.0002, -0.0003, 1.0]])
+    ones = np.hstack([src, np.ones((len(src), 1), np.float32)])
+    mapped = (h_true @ ones.T).T
+    dst = (mapped[:, :2] / mapped[:, 2:3]).astype(np.float32)
+    h, _ = cv2.findHomography(src, dst, 0)
+    case(handle, "findHomography", "direct", blank, h.astype(np.float32))
+
+    affine_true = np.array([[1.1, -0.15, 7.0], [0.2, 0.95, -4.0]])
+    affine_dst = (affine_true @ ones.T).T.astype(np.float32)
+    a, _ = cv2.estimateAffine2D(src, affine_dst, method=cv2.LMEDS)
+    case(handle, "estimateAffine2D", "direct", blank, a.astype(np.float32))
+    similarity = np.array([[0.9, -0.3, 5.0], [0.3, 0.9, -2.0]])
+    sim_dst = (similarity @ ones.T).T.astype(np.float32)
+    p2, _ = cv2.estimateAffinePartial2D(src, sim_dst, method=cv2.LMEDS)
+    case(handle, "estimateAffinePartial2D", "direct", blank, p2.astype(np.float32))
+
+    camera = np.array([[520.0, 0.0, 320.0], [0.0, 515.0, 240.0], [0.0, 0.0, 1.0]])
+    for coeffs in ([0.0, 0.0, 0.0, 0.0, 0.0], [-0.28, 0.09, 0.001, -0.002, 0.0]):
+        dist = np.array(coeffs, np.float64)
+        objects = rng.uniform(-1.0, 1.0, size=(12, 3))
+        objects[:, 2] += 6.0
+        rvec = np.array([0.05, -0.12, 0.2], np.float64).reshape(3, 1)
+        tvec = np.array([0.3, -0.2, 4.0], np.float64).reshape(3, 1)
+        projected, _ = cv2.projectPoints(objects, rvec, tvec, camera, dist)
+        tag = "clean" if coeffs[0] == 0.0 else "distorted"
+        case(handle, "projectPoints", tag,
+             objects.reshape(-1, 3).astype(np.float32),
+             projected.reshape(-1, 2).astype(np.float32))
+
+        grid = np.array([[x * 40.0 + 20.0, y * 40.0 + 20.0]
+                         for y in range(6) for x in range(8)], np.float64)
+        undone = cv2.undistortPoints(grid.reshape(-1, 1, 2), camera, dist)
+        case(handle, "undistortPoints", tag, grid.reshape(-1, 2).astype(np.float32),
+             undone.reshape(-1, 2).astype(np.float32))
+
+    proj1 = camera @ np.hstack([np.eye(3), np.zeros((3, 1))])
+    r2, _ = cv2.Rodrigues(np.array([0.02, 0.3, -0.05]))
+    proj2 = camera @ np.hstack([r2, np.array([[-1.5], [0.1], [0.2]])])
+    world = rng.uniform(-1.0, 1.0, size=(10, 3))
+    world[:, 2] += 7.0
+    p1p = (proj1 @ np.hstack([world, np.ones((10, 1))]).T).T
+    p2p = (proj2 @ np.hstack([world, np.ones((10, 1))]).T).T
+    x1 = (p1p[:, :2] / p1p[:, 2:3]).astype(np.float32)
+    x2 = (p2p[:, :2] / p2p[:, 2:3]).astype(np.float32)
+    tri = cv2.triangulatePoints(proj1, proj2, x1.T, x2.T).T
+    tri = tri / tri[:, 3:4]
+    case(handle, "triangulatePoints", "pair", world.reshape(-1, 3).astype(np.float32),
+         tri[:, :3].astype(np.float32))
+
+
+def chessboard_image(squares_x=9, squares_y=7, side=30, margin=20):
+    inner = np.zeros((squares_y * side, squares_x * side), np.uint8)
+    for r in range(squares_y):
+        for c in range(squares_x):
+            if (r + c) % 2 == 0:
+                inner[r * side:(r + 1) * side, c * side:(c + 1) * side] = 255
+    board = np.full((squares_y * side + 2 * margin, squares_x * side + 2 * margin), 255, np.uint8)
+    board[margin:margin + squares_y * side, margin:margin + squares_x * side] = inner
+    return board
+
+
+def write_calibrate(handle) -> None:
+    board = chessboard_image()
+    found, corners = cv2.findChessboardCorners(board, (8, 6))
+    assert found
+    case(handle, "findChessboardCorners", "synthetic", board,
+         corners.reshape(-1, 2).astype(np.float32))
+
+    camera = np.array([[520.0, 0.0, 320.0], [0.0, 515.0, 240.0], [0.0, 0.0, 1.0]])
+    grid = np.array([[float(x), float(y), 0.0] for y in range(6) for x in range(8)])
+    poses = [([0.02, -0.05, 0.01], [-3.5, -2.5, 22.0]),
+             ([0.25, 0.12, -0.08], [-4.0, -2.0, 25.0]),
+             ([-0.18, 0.3, 0.05], [-3.0, -3.0, 20.0]),
+             ([0.1, -0.28, 0.12], [-3.6, -2.4, 24.0]),
+             ([-0.3, -0.1, -0.15], [-3.2, -2.8, 21.0])]
+    for coeffs, tag in (([0.0] * 5, "clean"), ([-0.2, 0.05, 0.0005, -0.001, 0.0], "distorted")):
+        dist = np.array(coeffs, np.float64)
+        object_points = []
+        image_points = []
+        for rv, tv in poses:
+            projected, _ = cv2.projectPoints(grid, np.array(rv), np.array(tv), camera, dist)
+            object_points.append(grid.astype(np.float32))
+            image_points.append(projected.reshape(-1, 2).astype(np.float32))
+
+        ok, rvec, tvec = cv2.solvePnP(grid, image_points[1], camera, dist)
+        assert ok
+        case(handle, "solvePnP", tag, np.zeros((4, 4), np.uint8),
+             np.concatenate([rvec.reshape(1, 3), tvec.reshape(1, 3)]).astype(np.float32))
+
+        err, k, d, _rv, _tv = cv2.calibrateCamera(
+            object_points, image_points, (640, 480), None, None)
+        case(handle, "calibrateCamera", tag, np.zeros((4, 4), np.uint8),
+             np.concatenate([k.reshape(1, 9), d.reshape(1, -1)[:, :5]], axis=1).astype(np.float32))
+
+    scene = chessboard_image(6, 5, 40, 30)
+    scene = cv2.resize(scene, (200, 160))
+    small_camera = np.array([[150.0, 0.0, 100.0], [0.0, 150.0, 80.0], [0.0, 0.0, 1.0]])
+    small_dist = np.array([-0.25, 0.08, 0.001, -0.0015, 0.0])
+    case(handle, "undistort", "board", scene,
+         cv2.undistort(scene, small_camera, small_dist))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -672,6 +789,8 @@ def main() -> int:
         write_features(handle)
         write_features2d(handle)
         write_cascade(handle)
+        write_calib(handle)
+        write_calibrate(handle)
     print(f"wrote {OUT}")
     return 0
 

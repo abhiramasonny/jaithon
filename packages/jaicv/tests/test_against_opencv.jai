@@ -56,6 +56,12 @@ from jaicv.imgproc.features import TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCO
 from jaicv.imgproc.features import TM_SQDIFF, TM_SQDIFF_NORMED
 from jaicv.features2d.detect import fast
 from jaicv.objdetect.cascade import CascadeClassifier
+from jaicv.calib3d.transform import estimate_affine_2d, estimate_affine_partial_2d
+from jaicv.calib3d.transform import find_homography, project_points, rodrigues
+from jaicv.calib3d.transform import triangulate_points, undistort_points
+from jaicv.core.types import Point3f
+from jaicv.calib3d.calibrate import calibrate_camera, find_chessboard_corners
+from jaicv.calib3d.calibrate import solve_pnp, undistort
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -156,6 +162,22 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     if name == "matchTemplate" or name == "matchTemplateColour" { return 5e-3 }
     if name == "cornerHarris" or name == "cornerMinEigenVal" { return 1e-5 }
     if name == "houghLines" { return 1e-4 }
+    if CALIB_NAMES.contains(name) { return 1e-3 }
+    #: A calibration is a fit, and two fits that agree to five decimals on
+    #: parameters running to hundreds have found the same camera.
+    if name == "findChessboardCorners" { return 1e-2 }
+    if name == "solvePnP" { return 1e-4 }
+    #: Both fits reproject the corners to within a thousandth of a pixel, so
+    #: they have found the same camera; where they differ is in how they split
+    #: that agreement between the principal point and the last distortion term,
+    #: which a target lying in one plane barely distinguishes. Half a pixel on
+    #: a five-hundred-pixel focal length is the size of that ambiguity.
+    if name == "calibrateCamera" { return 0.5 }
+    #: OpenCV's `undistort` rounds its sampling coordinates to a thirty-second
+    #: of a pixel before it resamples; this keeps them in float. On a
+    #: chessboard, where a pixel either side of an edge differs by the whole
+    #: range, that shows up as a few levels along every edge.
+    if name == "undistort" { return 4.0 }
     if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
@@ -679,8 +701,289 @@ fn run_cascade(item: Case) -> Mat {
     return Mat.from_list(found.len(), 4, CV_MAKETYPE(4, 1), values)
 }
 
+let CALIBRATE_NAMES = ["findChessboardCorners", "solvePnP", "calibrateCamera", "undistort"]
+
+fn calibration_grid() -> list[Point3f] {
+    var out: list[Point3f] = []
+    for y in 0..6 {
+        for x in 0..8 { out.push(Point3f(float(x), float(y), 0.0)) }
+    }
+    return out
+}
+
+let CALIB_POSES = [
+    [0.02, -0.05, 0.01, -3.5, -2.5, 22.0],
+    [0.25, 0.12, -0.08, -4.0, -2.0, 25.0],
+    [-0.18, 0.3, 0.05, -3.0, -3.0, 20.0],
+    [0.1, -0.28, 0.12, -3.6, -2.4, 24.0],
+    [-0.3, -0.1, -0.15, -3.2, -2.8, 21.0],
+]
+
+fn run_calibrate(item: Case) -> Mat {
+    if item.name == "findChessboardCorners" {
+        let (found, corners) = find_chessboard_corners(item.source, Size(8, 6))
+        if not found { return Mat.from_list(0, 2, CV_MAKETYPE(5, 1), []) }
+        var values: list[float] = []
+        for point in corners {
+            values.push(point.x)
+            values.push(point.y)
+        }
+        return Mat.from_list(corners.len(), 2, CV_MAKETYPE(5, 1), values)
+    }
+    if item.name == "undistort" {
+        let camera = Mat.from_list(
+            3,
+            3,
+            CV_MAKETYPE(5, 1),
+            [150.0, 0.0, 100.0, 0.0, 150.0, 80.0, 0.0, 0.0, 1.0]
+        )
+        return undistort(item.source, camera, [-0.25, 0.08, 0.001, -0.0015, 0.0])
+    }
+
+    let camera = camera_of()
+    #: The calibration cases were recorded with their own lens, which is a
+    #: gentler one than the projection cases use.
+    let dist = if item.args[0] == "clean" {
+        [0.0, 0.0, 0.0, 0.0, 0.0]
+    } else {
+        [-0.2, 0.05, 0.0005, -0.001, 0.0]
+    }
+    let grid = calibration_grid()
+    if item.name == "solvePnP" {
+        let pose = CALIB_POSES[1]
+        let seen = project_points(
+            grid,
+            Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [pose[0], pose[1], pose[2]]),
+            Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [pose[3], pose[4], pose[5]]),
+            camera,
+            dist
+        )
+        let (_ok, rvec, tvec) = solve_pnp(grid, seen, camera, dist)
+        var values: list[float] = []
+        for value in rvec.to_list() { values.push(value) }
+        for value in tvec.to_list() { values.push(value) }
+        return Mat.from_list(2, 3, CV_MAKETYPE(5, 1), values)
+    }
+
+    var objects: list[list[Point3f]] = []
+    var images: list[list[Point2f]] = []
+    for pose in CALIB_POSES {
+        objects.push(grid)
+        images.push(
+            project_points(
+                grid,
+                Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [pose[0], pose[1], pose[2]]),
+                Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [pose[3], pose[4], pose[5]]),
+                camera,
+                dist
+            )
+        )
+    }
+    let (_error, found_camera, found_dist, _rvecs, _tvecs) = calibrate_camera(
+        objects,
+        images,
+        Size(640, 480)
+    )
+    var values: list[float] = []
+    for value in found_camera.to_list() { values.push(value) }
+    for value in found_dist { values.push(value) }
+    return Mat.from_list(1, 14, CV_MAKETYPE(5, 1), values)
+}
+
+let CALIB_NAMES = [
+    "rodriguesForward",
+    "rodriguesBack",
+    "findHomography",
+    "estimateAffine2D",
+    "estimateAffinePartial2D",
+    "projectPoints",
+    "undistortPoints",
+    "triangulatePoints",
+]
+
+let CALIB_SOURCE = [
+    Point2f(10.0, 12.0),
+    Point2f(90.0, 8.0),
+    Point2f(95.0, 70.0),
+    Point2f(5.0, 75.0),
+    Point2f(40.0, 30.0),
+    Point2f(60.0, 55.0),
+    Point2f(20.0, 60.0),
+]
+
+fn mapped_by(matrix: list[float], perspective: bool) -> list[Point2f] {
+    var out: list[Point2f] = []
+    for point in CALIB_SOURCE {
+        let x = matrix[0] * point.x + matrix[1] * point.y + matrix[2]
+        let y = matrix[3] * point.x + matrix[4] * point.y + matrix[5]
+        if not perspective {
+            out.push(Point2f(x, y))
+            continue
+        }
+        let w = matrix[6] * point.x + matrix[7] * point.y + matrix[8]
+        out.push(Point2f(x / w, y / w))
+    }
+    return out
+}
+
+fn camera_of() -> Mat {
+    return Mat.from_list(
+        3,
+        3,
+        CV_MAKETYPE(5, 1),
+        [520.0, 0.0, 320.0, 0.0, 515.0, 240.0, 0.0, 0.0, 1.0]
+    )
+}
+
+fn distortion_of(tag: str) -> list[float] {
+    if tag == "clean" { return [0.0, 0.0, 0.0, 0.0, 0.0] }
+    return [-0.28, 0.09, 0.001, -0.002, 0.0]
+}
+
+fn run_calib(item: Case) -> Mat {
+    if item.name == "rodriguesForward" {
+        var values: list[float] = []
+        for piece in item.args { values.push(float(piece)) }
+        return rodrigues(Mat.from_list(3, 1, CV_MAKETYPE(5, 1), values))
+    }
+    if item.name == "rodriguesBack" {
+        var values: list[float] = []
+        for piece in item.args { values.push(float(piece)) }
+        let matrix = rodrigues(Mat.from_list(3, 1, CV_MAKETYPE(5, 1), values))
+        let back = rodrigues(matrix)
+        return Mat.from_list(1, 3, CV_MAKETYPE(5, 1), back.to_list())
+    }
+    if item.name == "findHomography" {
+        let target = mapped_by([1.05, 0.08, -6.0, -0.04, 0.96, 4.0, 0.0002, -0.0003, 1.0], true)
+        let (h, _inliers) = find_homography(CALIB_SOURCE, target)
+        return h
+    }
+    if item.name == "estimateAffine2D" {
+        let target = mapped_by([1.1, -0.15, 7.0, 0.2, 0.95, -4.0], false)
+        return estimate_affine_2d(CALIB_SOURCE, target)
+    }
+    if item.name == "estimateAffinePartial2D" {
+        let target = mapped_by([0.9, -0.3, 5.0, 0.3, 0.9, -2.0], false)
+        return estimate_affine_partial_2d(CALIB_SOURCE, target)
+    }
+    if item.name == "projectPoints" {
+        var objects: list[Point3f] = []
+        let flat = item.source.to_list()
+        for index in 0..item.source.rows {
+            objects.push(Point3f(flat[index * 3], flat[index * 3 + 1], flat[index * 3 + 2]))
+        }
+        let projected = project_points(
+            objects,
+            Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [0.05, -0.12, 0.2]),
+            Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [0.3, -0.2, 4.0]),
+            camera_of(),
+            distortion_of(item.args[0])
+        )
+        var values: list[float] = []
+        for point in projected {
+            values.push(point.x)
+            values.push(point.y)
+        }
+        return Mat.from_list(projected.len(), 2, CV_MAKETYPE(5, 1), values)
+    }
+    if item.name == "undistortPoints" {
+        var grid: list[Point2f] = []
+        let flat = item.source.to_list()
+        for index in 0..item.source.rows {
+            grid.push(Point2f(flat[index * 2], flat[index * 2 + 1]))
+        }
+        let straight = undistort_points(grid, camera_of(), distortion_of(item.args[0]))
+        var values: list[float] = []
+        for point in straight {
+            values.push(point.x)
+            values.push(point.y)
+        }
+        return Mat.from_list(straight.len(), 2, CV_MAKETYPE(5, 1), values)
+    }
+    if item.name == "triangulatePoints" { return run_triangulate(item) }
+    throw ValueError(f"no jaicv binding for {item.name}")
+}
+
+fn run_triangulate(item: Case) -> Mat {
+    let camera = camera_of()
+    let identity = Mat.from_list(
+        3,
+        4,
+        CV_MAKETYPE(5, 1),
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    )
+    let first = matmul_small(camera, identity)
+    let rotation = rodrigues(Mat.from_list(3, 1, CV_MAKETYPE(5, 1), [0.02, 0.3, -0.05])).to_list()
+    let pose = Mat.from_list(
+        3,
+        4,
+        CV_MAKETYPE(5, 1),
+        [
+            rotation[0],
+            rotation[1],
+            rotation[2],
+            -1.5,
+            rotation[3],
+            rotation[4],
+            rotation[5],
+            0.1,
+            rotation[6],
+            rotation[7],
+            rotation[8],
+            0.2,
+        ]
+    )
+    let second = matmul_small(camera, pose)
+
+    let flat = item.source.to_list()
+    var one: list[Point2f] = []
+    var two: list[Point2f] = []
+    let p1 = first.to_list()
+    let p2 = second.to_list()
+    for index in 0..item.source.rows {
+        let x = flat[index * 3]
+        let y = flat[index * 3 + 1]
+        let z = flat[index * 3 + 2]
+        one.push(projected_by(p1, x, y, z))
+        two.push(projected_by(p2, x, y, z))
+    }
+    let points = triangulate_points(first, second, one, two)
+    var values: list[float] = []
+    for point in points {
+        values.push(point[0] / point[3])
+        values.push(point[1] / point[3])
+        values.push(point[2] / point[3])
+    }
+    return Mat.from_list(points.len(), 3, CV_MAKETYPE(5, 1), values)
+}
+
+fn projected_by(p: list[float], x: float, y: float, z: float) -> Point2f {
+    let u = p[0] * x + p[1] * y + p[2] * z + p[3]
+    let v = p[4] * x + p[5] * y + p[6] * z + p[7]
+    let w = p[8] * x + p[9] * y + p[10] * z + p[11]
+    return Point2f(u / w, v / w)
+}
+
+fn matmul_small(a: Mat, b: Mat) -> Mat {
+    let left = a.to_list()
+    let right = b.to_list()
+    var out: list[float] = []
+    for row in 0..a.rows {
+        for column in 0..b.cols {
+            var total = 0.0
+            for index in 0..a.cols {
+                total += left[row * a.cols + index] * right[index * b.cols + column]
+            }
+            out.push(total)
+        }
+    }
+    return Mat.from_list(a.rows, b.cols, CV_MAKETYPE(5, 1), out)
+}
+
 fn run_case(item: Case) -> Mat {
     if item.name.starts_with("draw") { return run_drawing(item) }
+    if CALIB_NAMES.contains(item.name) { return run_calib(item) }
+    if CALIBRATE_NAMES.contains(item.name) { return run_calibrate(item) }
     if item.name == "cascadeDetect" { return run_cascade(item) }
     if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }
