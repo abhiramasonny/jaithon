@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<opencv_storage>
+<cascade>
+  <stageType>BOOST</stageType>
+  <featureType>HAAR</featureType>
+  <height>12</height>
+  <width>12</width>
+  <stageParams>
+    <boostType>GAB</boostType>
+    <minHitRate>9.9500000476837158e-01</minHitRate>
+    <maxFalseAlarm>5.0000000000000000e-01</maxFalseAlarm>
+    <weightTrimRate>9.4999999999999996e-01</weightTrimRate>
+    <maxDepth>1</maxDepth>
+    <maxWeakCount>100</maxWeakCount>
+  </stageParams>
+  <featureParams>
+    <maxCatCount>0</maxCatCount>
+    <featSize>1</featSize>
+    <mode>BASIC</mode>
+  </featureParams>
+  <stageNum>2</stageNum>
+  <stages>
+    <_>
+      <maxWeakCount>1</maxWeakCount>
+      <stageThreshold>-0.5</stageThreshold>
+      <weakClassifiers>
+        <_>
+          <internalNodes>0 -1 0 0.5</internalNodes>
+          <leafValues>-1.0 1.0</leafValues>
+        </_>
+      </weakClassifiers>
+    </_>
+    <_>
+      <maxWeakCount>2</maxWeakCount>
+      <stageThreshold>-0.4</stageThreshold>
+      <weakClassifiers>
+        <_>
+          <internalNodes>0 -1 2 0.4</internalNodes>
+          <leafValues>-1.0 1.0</leafValues>
+        </_>
+        <_>
+          <internalNodes>0 -1 1 -0.9</internalNodes>
+          <leafValues>1.0 -1.0</leafValues>
+        </_>
+      </weakClassifiers>
+    </_>
+  </stages>
+  <features>
+    <_>
+      <rects>
+          <_>0 0 12 12 -1.0</_>
+          <_>3 3 6 6 4.0</_>
+      </rects>
+      <tilted>0</tilted>
+    </_>
+    <_>
+      <rects>
+          <_>0 0 12 6 -1.0</_>
+          <_>0 0 12 3 2.0</_>
+      </rects>
+      <tilted>0</tilted>
+    </_>
+    <_>
+      <rects>
+          <_>2 2 8 8 -1.0</_>
+          <_>4 4 4 4 4.0</_>
+      </rects>
+      <tilted>0</tilted>
+    </_>
+  </features>
+</cascade>
+</opencv_storage>

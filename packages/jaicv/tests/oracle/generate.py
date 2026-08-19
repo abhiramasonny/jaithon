@@ -565,6 +565,97 @@ def write_features2d(handle) -> None:
                      np.array(rows, np.float32).reshape(-1, 3))
 
 
+# OpenCV 5 dropped CascadeClassifier, so there is no reference in cv2 to
+# compare the cascade detector against. What follows is an independent
+# implementation of the same published algorithm, written against numpy rather
+# than against jaicv's kernels, and the cases it records check that jaicv's XML
+# reading, integral arithmetic, scan order, and tree evaluation all agree with
+# it. It is a weaker guarantee than the rest of this file and is labelled as
+# such where it is read.
+def cascade_reference_load(path):
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    node = root.find("cascade")
+    width = int(node.findtext("width"))
+    height = int(node.findtext("height"))
+    features = []
+    for entry in node.find("features"):
+        rects = []
+        for rect in entry.find("rects"):
+            v = [float(t) for t in rect.text.split()]
+            rects.append((int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4]))
+        features.append(rects)
+    stages = []
+    for entry in node.find("stages"):
+        weaks = []
+        for weak in entry.find("weakClassifiers"):
+            nodes = [float(t) for t in weak.findtext("internalNodes").split()]
+            leaves = [float(t) for t in weak.findtext("leafValues").split()]
+            weaks.append((nodes, leaves))
+        stages.append((float(entry.findtext("stageThreshold")), weaks))
+    return width, height, features, stages
+
+
+def cascade_reference_detect(img, width, height, features, stages, scale_factor):
+    import math
+    found = []
+    factor = 1.0
+    while True:
+        w = int(img.shape[1] / factor + 0.5)
+        h = int(img.shape[0] / factor + 0.5)
+        if w < width or h < height:
+            break
+        level = img if factor == 1.0 else cv2.resize(img, (w, h))
+        ii = cv2.integral(level.astype(np.float64))
+        ii2 = cv2.integral(level.astype(np.float64) ** 2)
+
+        def rs(t, x, y, rw, rh):
+            return t[y + rh, x + rw] - t[y, x + rw] - t[y + rh, x] + t[y, x]
+
+        step = 1 if factor > 2.0 else 2
+        sw = int(width * factor + 0.5)
+        sh = int(height * factor + 0.5)
+        for y in range(0, h - height + 1, step):
+            for x in range(0, w - width + 1, step):
+                area = (width - 2) * (height - 2)
+                s = rs(ii, x + 1, y + 1, width - 2, height - 2)
+                q = rs(ii2, x + 1, y + 1, width - 2, height - 2)
+                nf = area * q - s * s
+                if nf <= 0:
+                    continue
+                inv = 1.0 / math.sqrt(nf)
+                ok = True
+                for threshold, weaks in stages:
+                    vote = 0.0
+                    for nodes, leaves in weaks:
+                        left, right, fi, thr = int(nodes[0]), int(nodes[1]), int(nodes[2]), nodes[3]
+                        val = sum(wt * rs(ii, x + rx, y + ry, rw, rh)
+                                  for (rx, ry, rw, rh, wt) in features[fi]) * inv
+                        vote += leaves[-(left if val < thr else right)]
+                    if vote < threshold:
+                        ok = False
+                        break
+                if ok:
+                    found.append([int(x * factor + 0.5), int(y * factor + 0.5), sw, sh])
+        factor *= scale_factor
+    return found
+
+
+def write_cascade(handle) -> None:
+    rng = np.random.default_rng(5)
+    scene = np.full((60, 80), 40, np.uint8)
+    scene = np.clip(scene.astype(np.int16) + rng.integers(-8, 9, scene.shape), 0, 255).astype(np.uint8)
+    for (cx, cy, r) in ((20, 20, 4), (55, 38, 4), (66, 12, 4)):
+        cv2.rectangle(scene, (cx - r, cy - r), (cx + r, cy + r), 220, -1)
+
+    path = Path(__file__).resolve().parent / "synthetic_cascade.xml"
+    width, height, features, stages = cascade_reference_load(str(path))
+    for factor in (1.1, 1.3):
+        rows = cascade_reference_detect(scene, width, height, features, stages, factor)
+        case(handle, "cascadeDetect", f"{factor}", scene,
+             np.array(rows, np.int32).reshape(-1, 4))
+
+
 def main() -> int:
     with OUT.open("w") as handle:
         write_colour(handle)
@@ -580,6 +671,7 @@ def main() -> int:
         write_hist(handle)
         write_features(handle)
         write_features2d(handle)
+        write_cascade(handle)
     print(f"wrote {OUT}")
     return 0
 
