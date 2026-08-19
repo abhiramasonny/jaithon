@@ -43,7 +43,7 @@ fn time_shape(
     gpu.synchronize()
     let elapsed = started.elapsed().to_seconds()
     let product = outs[(repeats - 1) % wave]
-    let offsets = [0, (rows // 2) * columns + columns // 2, rows * columns - 1]
+    let offsets = [0, rows // 2 * columns + columns // 2, rows * columns - 1]
     var nonzero = false
     var valid = true
     for offset in offsets {

@@ -438,8 +438,16 @@ fn test_shaped_tensor_types_reject_conflicting_dims() -> void {
     let u = Universe()
     let decl = _decl("Tensor")
     let bare = named(u, TyKind.Class, "Tensor", decl)
-    let two_by_three = instantiate(u, bare, [u.t_float, u.intern(TyKind.Int, "2"), u.intern(TyKind.Int, "3")])
-    let two_by_four = instantiate(u, bare, [u.t_float, u.intern(TyKind.Int, "2"), u.intern(TyKind.Int, "4")])
+    let two_by_three = instantiate(
+        u,
+        bare,
+        [u.t_float, u.intern(TyKind.Int, "2"), u.intern(TyKind.Int, "3")]
+    )
+    let two_by_four = instantiate(
+        u,
+        bare,
+        [u.t_float, u.intern(TyKind.Int, "2"), u.intern(TyKind.Int, "4")]
+    )
     assert_eq(assignable(u, two_by_three, two_by_three), FREE)
     assert_eq(assignable(u, two_by_three, bare), FREE)
     assert_eq(assignable(u, bare, two_by_three), FREE)

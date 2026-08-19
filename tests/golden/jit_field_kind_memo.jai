@@ -178,17 +178,17 @@ fn bump(c: any) -> int {
     return c.v
 }
 
-let arg_box      = Box(0)
-let global_box   = Box(0)
-let invoke_box   = Box(0)
+let arg_box = Box(0)
+let global_box = Box(0)
+let invoke_box = Box(0)
 let compound_box = Box(0)
 let compound_int_box = Box(0)
-let branch_box   = Box("skipped")
-let edge_box     = Box(0)
-let rebound_box  = Box(0)
-let other_box    = Box("other")
-let flip_box     = Box("")
-let counter      = Box(0)
+let branch_box = Box("skipped")
+let edge_box = Box(0)
+let rebound_box = Box(0)
+let other_box = Box("other")
+let flip_box = Box("")
+let counter = Box(0)
 shared = global_box
 
 var a1: any = null

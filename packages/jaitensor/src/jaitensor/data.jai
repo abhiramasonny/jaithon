@@ -199,7 +199,10 @@ pub class DataLoader {
                 let shape = self.dataset.image_shape
                 if shape is null { throw RuntimeError("NHWC dataset missing image_shape") }
                 return (
-                    self.dataset.features.view(start * width, [count, shape[0], shape[1], shape[2]]),
+                    self.dataset.features.view(
+                        start * width,
+                        [count, shape[0], shape[1], shape[2]]
+                    ),
                     self.dataset.labels.view(start, [count])
                 )
             }

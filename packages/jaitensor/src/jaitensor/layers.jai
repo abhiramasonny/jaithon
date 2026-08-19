@@ -180,14 +180,7 @@ pub class Dense: Layer {
         let weights = self.weights_value
         let bias = self.bias_value
         if weights is null or bias is null { throw RuntimeError("Dense layer has not been built") }
-        return dense_static_backward(
-            x,
-            weights,
-            bias,
-            output,
-            upstream,
-            self.activation_code()
-        )
+        return dense_static_backward(x, weights, bias, output, upstream, self.activation_code())
     }
 
     #: Return the row-major `[input_units, units]` parameter buffer.
@@ -428,7 +421,12 @@ pub class Conv2d: Layer {
             3.0 / float(fan)
         })
         self.weights_value = Tensor(
-            [self.kernel_size, self.kernel_size, self.in_channels, self.out_channels],
+            [
+                self.kernel_size,
+                self.kernel_size,
+                self.in_channels,
+                self.out_channels,
+            ],
             requires_grad: true
         )
         self.weights_value.buffer().fill_uniform(-limit, limit, rng.next_int())
@@ -445,10 +443,7 @@ pub class Conv2d: Layer {
             if self.in_height <= 0 or self.in_width <= 0 {
                 throw ValueError("Conv2d needs a known spatial size for flat inputs")
             }
-            input = reshape(
-                x,
-                [x.shape[0], self.in_height, self.in_width, self.in_channels]
-            )
+            input = reshape(x, [x.shape[0], self.in_height, self.in_width, self.in_channels])
         }
         let output = conv2d(input, weights, bias: bias, stride: self.stride, padding: self.padding)
         return activate(output, self.activation)
@@ -637,7 +632,9 @@ pub class GroupNorm2d: Layer {
         self.beta_value = null
     }
 
-    fn __str__(self) -> str { return f"GroupNorm2d(groups={self.groups}, channels={self.output_width()})" }
+    fn __str__(self) -> str {
+        return f"GroupNorm2d(groups={self.groups}, channels={self.output_width()})"
+    }
 }
 
 #: Layer normalization over the last axis of a rank-two tensor.
@@ -701,7 +698,9 @@ pub class MultiHeadAttention: Layer {
     var wo_value: Tensor?
 
     pub fn init(self, dim: int, heads: int = 1) {
-        if dim <= 0 or heads <= 0 { throw ValueError("MultiHeadAttention dim/heads must be positive") }
+        if dim <= 0 or heads <= 0 {
+            throw ValueError("MultiHeadAttention dim/heads must be positive")
+        }
         if dim % heads != 0 { throw ValueError("MultiHeadAttention dim must divide heads") }
         self.dim = dim
         self.heads = heads
