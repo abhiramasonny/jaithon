@@ -218,10 +218,13 @@ from .imgcodecs.codecs import IMWRITE_JPEG_QUALITY, IMWRITE_PNG_COMPRESSION
 
 from .videoio.writer import fourcc, VideoWriter
 
+from .videoio.reader import AviReader
 from .videoio.capture import VideoCapture, device_count, device_name, device_names
 from .videoio.capture import permission, PERMISSION_HELP
 from .videoio.capture import CAP_PROP_CHANNEL, CAP_PROP_FPS, CAP_PROP_FRAME_HEIGHT
+from .videoio.capture import CAP_PROP_FRAME_COUNT, CAP_PROP_FOURCC
 from .videoio.capture import CAP_PROP_FRAME_WIDTH, CAP_PROP_POS_FRAMES
+from .videoio.capture import CAP_PROP_POS_AVI_RATIO, CAP_PROP_POS_MSEC
 from .videoio.capture import PERMISSION_DENIED, PERMISSION_GRANTED
 from .videoio.capture import PERMISSION_UNAVAILABLE, PERMISSION_UNDECIDED
 
@@ -406,9 +409,12 @@ export { IMWRITE_JPEG_QUALITY, IMWRITE_PNG_COMPRESSION }
 
 export { fourcc, VideoWriter }
 
-export { VideoCapture, device_count, device_name, device_names, permission, PERMISSION_HELP }
+export { AviReader, VideoCapture, device_count, device_name, device_names }
+export { permission, PERMISSION_HELP }
 export { CAP_PROP_CHANNEL, CAP_PROP_FPS, CAP_PROP_FRAME_HEIGHT }
+export { CAP_PROP_FRAME_COUNT, CAP_PROP_FOURCC }
 export { CAP_PROP_FRAME_WIDTH, CAP_PROP_POS_FRAMES }
+export { CAP_PROP_POS_AVI_RATIO, CAP_PROP_POS_MSEC }
 export { PERMISSION_DENIED, PERMISSION_GRANTED, PERMISSION_UNAVAILABLE, PERMISSION_UNDECIDED }
 
 #: Whether this machine has the GPU jaicv needs.

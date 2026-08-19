@@ -5,7 +5,8 @@
 #: `test_against_opencv.jai`.
 import std.gpu as gpu
 import std.math
-from std.io import Path
+from std.io import Path, write_bytes
+from std.os import temp_dir
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaicv.core.mat import Mat, flip, merge
 from jaicv.core.types import CV_8UC1, CV_8UC3, CV_8UC4, CV_16UC3, CV_32FC1, CV_32FC3
@@ -19,6 +20,11 @@ from jaicv.core.dft import dft, idft, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_S
 from jaicv.imgcodecs.codecs import imdecode, imencode, sniff
 from jaicv.imgcodecs.codecs import IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED
 from jaicv.imgproc.geometric import get_perspective_transform, perspective_transform
+from jaicv.imgproc.drawing import rectangle
+from jaicv.videoio.capture import VideoCapture, CAP_PROP_FRAME_COUNT, CAP_PROP_FPS
+from jaicv.videoio.capture import CAP_PROP_FRAME_HEIGHT, CAP_PROP_FRAME_WIDTH
+from jaicv.videoio.capture import CAP_PROP_POS_FRAMES
+from jaicv.videoio.writer import fourcc, VideoWriter
 from jaicv.core.types import Point2f
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -316,4 +322,121 @@ fn test_principal_components_line_up_with_the_spread() -> void {
     let direction = analysis.eigenvectors.to_list()
     let ratio = direction[1] / direction[0]
     assert_near(ratio, 2.0, 1e-6)
+}
+
+#: Five frames with a bar that moves and brightens, so a reader that dropped
+#: one, repeated one or reordered them shows it in the pixels rather than only
+#: in the count.
+fn clip_frames(size: Size) -> list[Mat] {
+    var frames: list[Mat] = []
+    for n in 0..5 {
+        let frame = Mat.zeros(size.height, size.width, CV_8UC3)
+        rectangle(
+            frame,
+            Point(2 + n * 4, 2),
+            Point(20 + n * 4, 24),
+            Scalar(20.0 * float(n), 200.0, 40.0),
+            -1
+        )
+        frames.push(frame)
+    }
+    return frames
+}
+
+fn write_clip(path: str, codec: int, size: Size, frames: list[Mat]) -> void {
+    let writer = VideoWriter(path, codec, 12.0, size)
+    for frame in frames { writer.write(frame) }
+    writer.release()
+}
+
+#: The uncompressed codec stores the pixels as they were, so the round trip is
+#: exact and any disagreement is a container bug rather than a codec one.
+fn test_an_uncompressed_video_round_trips_exactly() -> void {
+    if not have_gpu() { return }
+    let size = Size(48, 32)
+    let frames = clip_frames(size)
+    let path = Path(temp_dir()).join("jaicv_video_raw.avi").to_str()
+    write_clip(path, 0, size, frames)
+
+    let clip = VideoCapture(path)
+    assert_true(clip.is_opened())
+    assert_eq(int(clip.get(CAP_PROP_FRAME_COUNT)), 5)
+    assert_eq(int(clip.get(CAP_PROP_FRAME_WIDTH)), size.width)
+    assert_eq(int(clip.get(CAP_PROP_FRAME_HEIGHT)), size.height)
+    assert_near(clip.get(CAP_PROP_FPS), 12.0, 1e-6)
+
+    var seen = 0
+    while true {
+        let (ok, frame) = clip.read()
+        if not ok { break }
+        assert_eq(frame.rows, size.height)
+        assert_eq(frame.cols, size.width)
+        assert_eq(frame.channels(), 3)
+        assert_eq(frame.to_list(), frames[seen].to_list())
+        seen += 1
+    }
+    assert_eq(seen, 5)
+    clip.release()
+    Path(path).remove()
+}
+
+#: Seeking is what an indexed reader buys over a streaming one, so it is
+#: checked against the frame that was written rather than only for a `true`.
+fn test_a_video_can_be_seeked_by_frame() -> void {
+    if not have_gpu() { return }
+    let size = Size(32, 24)
+    let frames = clip_frames(size)
+    let path = Path(temp_dir()).join("jaicv_video_seek.avi").to_str()
+    write_clip(path, 0, size, frames)
+
+    let clip = VideoCapture(path)
+    for wanted in [3, 0, 4, 1] {
+        assert_true(clip.set(CAP_PROP_POS_FRAMES, float(wanted)))
+        let (ok, frame) = clip.read()
+        assert_true(ok)
+        assert_eq(frame.to_list(), frames[wanted].to_list())
+        assert_eq(int(clip.get(CAP_PROP_POS_FRAMES)), wanted + 1)
+    }
+    assert_true(not clip.set(CAP_PROP_POS_FRAMES, 99.0))
+    clip.release()
+    Path(path).remove()
+}
+
+#: Motion JPEG is lossy, so this asks only that every frame arrives, is the
+#: right shape, and is near what went in.
+fn test_a_motion_jpeg_video_round_trips_within_its_quantisation() -> void {
+    if not have_gpu() { return }
+    let size = Size(48, 32)
+    let frames = clip_frames(size)
+    let path = Path(temp_dir()).join("jaicv_video_mjpg.avi").to_str()
+    write_clip(path, fourcc("M", "J", "P", "G"), size, frames)
+
+    let clip = VideoCapture(path)
+    assert_eq(int(clip.get(CAP_PROP_FRAME_COUNT)), 5)
+    var seen = 0
+    while true {
+        let (ok, frame) = clip.read()
+        if not ok { break }
+        assert_eq(frame.rows, size.height)
+        assert_eq(frame.cols, size.width)
+        let want = mean(frames[seen])
+        let got = mean(frame)
+        for channel in 0..3 { assert_near(got[channel], want[channel], 6.0) }
+        seen += 1
+    }
+    assert_eq(seen, 5)
+    clip.release()
+    Path(path).remove()
+}
+
+fn test_opening_something_that_is_not_a_video_reports_rather_than_raises() -> void {
+    if not have_gpu() { return }
+    let path = Path(temp_dir()).join("jaicv_video_not.avi").to_str()
+    write_bytes(path, bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]))
+    let clip = VideoCapture(path)
+    assert_true(not clip.is_opened())
+    assert_true(clip.why().len() > 0)
+    let (ok, _frame) = clip.read()
+    assert_true(not ok)
+    Path(path).remove()
 }

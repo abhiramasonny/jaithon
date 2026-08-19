@@ -74,7 +74,7 @@ down next to the tolerance. In short:
 | `core` | `Mat` with views and ROIs, arithmetic, statistics, `merge`/`split`, linear algebra, DFT and DCT, k-means, PCA, sorting, random fills |
 | `imgproc` | colour conversion, resize and warping, filtering, thresholding, morphology, Canny, drawing, contours, shape analysis, segmentation, histograms, template matching, corners, Hough, colour maps, phase correlation, mean-shift filtering |
 | `imgcodecs` | PNG, BMP, PNM, and JPEG, reading and writing, with `imread`/`imwrite`/`imencode`/`imdecode` |
-| `videoio` | camera capture through AVFoundation, and AVI writing with MJPEG or uncompressed frames |
+| `videoio` | camera capture through AVFoundation, and AVI reading and writing, MJPEG or uncompressed |
 | `highgui` | `imshow`, `wait_key`, windows, mouse callbacks, trackbars |
 | `features2d` | FAST, ORB, BRIEF, blob detection, brute-force matching, keypoint and match drawing |
 | `objdetect` | cascade classification, reading OpenCV's own trained XML; histograms of oriented gradients |
@@ -98,7 +98,10 @@ Named so that nobody has to find out by trying:
   `Net` is the adapter, not a runtime.
 - **imgproc**: GrabCut, `EMD`, line segment detection, the Viridis family of
   colour maps.
-- **videoio**: reading a video file, and any container other than AVI.
+- **videoio**: any container other than AVI, and any codec inside one other
+  than motion JPEG and the uncompressed forms. `VideoCapture` takes a path as
+  well as a camera index, indexes the file when it opens and decodes a frame
+  when it is asked for, so seeking by frame is exact and costs nothing.
 
 ## Camera access
 
