@@ -126,12 +126,15 @@ bool          jaiGpuFlush(void);
 bool          jaiGpuSynchronize(void);
 /* Device-buffer GEMM via Metal Performance Shaders. Encodes onto the async
  * command buffer (ending any open compute encoder). `transA` / `transB` treat
- * the physical buffers as transposed. Offsets are bytes into each buffer. */
+ * the physical buffers as transposed. Offsets are bytes into each buffer.
+ * `useHalf` runs the product in half precision, casting on the way in and back
+ * on the way out; whether that is faster depends on the shape, so the caller
+ * decides rather than a global flag. */
 bool          jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset,
                                   JaiGpuBuffer *b, size_t bOffset,
                                   JaiGpuBuffer *out, size_t outOffset,
                                   uint32_t m, uint32_t k, uint32_t n,
-                                  bool transA, bool transB);
+                                  bool transA, bool transB, bool useHalf);
 /* Packed multi-head attention: Q/K/V/out are `[seq, heads*hd]` row-major. */
 bool          jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff,
                               JaiGpuBuffer *k, size_t kOff,

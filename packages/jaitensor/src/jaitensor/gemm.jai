@@ -134,9 +134,28 @@ kernel void NAME(device const float* a [[buffer(0)]],
         }
     }
 
+    device float* dest = output + slice * rows * columns;
+
+    /* A tile that lies wholly inside the matrix and has no epilogue to apply
+     * can go straight from the accumulators to memory. The path below it exists
+     * for the bias and the activation, which are per element and so have to see
+     * the values one at a time; routing every tile through it costs two
+     * barriers and a threadgroup round trip per row of fragments, and on a
+     * short inner dimension that is a large share of the whole kernel. */
+    const bool whole = tile_row + BM <= rows && tile_col + BN <= columns;
+    if (whole && (epilogue == 0u || splits != 1u)) {
+        for (uint i = 0; i < TM; ++i) {
+            const uint r = tile_row + sg_m * TM * 8u + i * 8u;
+            for (uint j = 0; j < TN; ++j) {
+                const uint c = tile_col + sg_n * TN * 8u + j * 8u;
+                simdgroup_store(acc[i][j], dest + r * columns + c, columns);
+            }
+        }
+        return;
+    }
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup float* scratch = pool + sgitg * 8u * SGW;
-    device float* dest = output + slice * rows * columns;
     const uint lane = lid % 32u;
     for (uint i = 0; i < TM; ++i) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -244,8 +263,20 @@ kernel void NAME(device const float* a [[buffer(0)]],
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
 _KLOOPS_
-    threadgroup float* scratch = pool + sgitg * 8u * SGW;
     device float* dest = output + slice * rows * columns;
+
+    /* Straight from the accumulators when there is no epilogue to apply, for
+     * the same reason the staged kernel does it: the threadgroup round trip
+     * below exists only so that a bias and an activation can see one value at
+     * a time. */
+    if (epilogue == 0u || splits != 1u) {
+        for (uint i = 0; i < TM; ++i)
+            for (uint j = 0; j < TN; ++j)
+                simdgroup_store(acc[i][j], dest + (row0 + i * 8u) * columns + col0 + j * 8u, columns);
+        return;
+    }
+
+    threadgroup float* scratch = pool + sgitg * 8u * SGW;
     const uint lane = lid % 32u;
     for (uint i = 0; i < TM; ++i) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -344,6 +375,11 @@ let CONFIGS = [
     Config("gemm64x64", true, 64, 64, 16, 2, 2),
     Config("gemm64x32", true, 64, 32, 16, 2, 1),
     Config("gemm32x32", true, 32, 32, 16, 1, 1),
+    #: The same tiles again over a deeper step. A staged kernel pays two
+    #: barriers per step whatever the step is, so doubling `BK` halves what
+    #: the barriers cost — at the price of twice the threadgroup memory, which
+    #: is what keeps this from simply replacing the family above it.
+    Config("gemm128x128k32", true, 128, 128, 32, 4, 4),
     Config("direct128x64", false, 128, 64, 8, 8, 2),
     Config("direct64x128", false, 64, 128, 8, 4, 4),
     Config("direct64x64", false, 64, 64, 8, 4, 2),
@@ -366,6 +402,9 @@ let TUNE_MIN_WORK = 4194304
 #: A candidate is timed over enough repeats to run for at least this long, so
 #: dispatch overhead cannot decide the winner for a short kernel.
 let TUNE_MIN_SECONDS = 0.004
+
+#: How many times each candidate is timed; the fastest reading is kept.
+let TUNE_ROUNDS = 3
 
 #: Ceiling on those repeats, so tuning a slow candidate stays bounded.
 let TUNE_MAX_REPEATS = 64
@@ -462,6 +501,13 @@ pub class Plan {
 
 let MPS_PLAN = Plan("mpsgraph", -1, 1)
 
+#: The same graph asked to run in half precision.
+#:
+#: Whether the conversion pays depends on the shape rather than on any rule
+#: worth writing down: it costs a pass over A, over B, and twice over the
+#: result, and it saves on the multiply. Both are timed and the winner kept.
+let MPS16_PLAN = Plan("mpsgraph16", -2, 1)
+
 fn mps_possible(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> bool {
     if not gpu.is_available() { return false }
     let a_columns = if trans_a { rows } else { inner }
@@ -518,10 +564,20 @@ fn cache_path() -> Path {
     return Path(home_dir()).join(".cache", "jaithon", "gemm-plans.tsv")
 }
 
+#: Bumped whenever the kernels or the tile configurations change.
+#:
+#: A cached plan is a measurement of a set of candidates that no longer exists
+#: once that set changes, and nothing would ever re-measure it: the entry is
+#: found, believed, and used forever. Making the epoch part of the key retires
+#: every old entry the first time a changed build runs, which costs one tuning
+#: pass and is the only thing that keeps a stale answer from outliving the
+#: kernel it was about.
+let TUNE_EPOCH = 2
+
 fn shape_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> str {
     let a_flag = if trans_a { 1 } else { 0 }
     let b_flag = if trans_b { 1 } else { 0 }
-    let prefix = f"{gpu.device_name()}\t{element_type()}"
+    let prefix = f"{gpu.device_name()}\tv{TUNE_EPOCH}\t{element_type()}"
     return f"{prefix}\t{rows}\t{inner}\t{columns}\t{a_flag}\t{b_flag}"
 }
 
@@ -546,6 +602,7 @@ pub fn plan_from_text(text: str) -> Plan? {
     if parts.len() != 2 { return null }
     let splits = int(parts[1])
     if parts[0] == "mpsgraph" { return MPS_PLAN }
+    if parts[0] == "mpsgraph16" { return MPS16_PLAN }
     for (index, config) in CONFIGS.enumerate() {
         if config.entry == parts[0] { return Plan(config.entry, index, splits) }
     }
@@ -622,7 +679,17 @@ fn encode(
     epilogue: int
 ) -> void {
     if plan.config < 0 {
-        gpu.matmul_async(a, b, output, rows, inner, columns, trans_a: trans_a, trans_b: trans_b)
+        gpu.matmul_async(
+            a,
+            b,
+            output,
+            rows,
+            inner,
+            columns,
+            trans_a: trans_a,
+            trans_b: trans_b,
+            half: plan.config == -2
+        )
         if epilogue != 0 {
             let kernel = kernel_for(element_type(), "split_reduce")
             kernel.dispatch_async(
@@ -666,7 +733,10 @@ fn encode(
 
 fn candidates(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> list[Plan] {
     var found: list[Plan] = []
-    if mps_possible(rows, inner, columns, trans_a, trans_b) { found.push(MPS_PLAN) }
+    if mps_possible(rows, inner, columns, trans_a, trans_b) {
+        found.push(MPS_PLAN)
+        if gpu.mixed_precision() { found.push(MPS16_PLAN) }
+    }
     for (index, config) in CONFIGS.enumerate() {
         if not config_allowed(config, rows, inner, columns) { continue }
         for splits in SPLIT_CANDIDATES {
@@ -741,6 +811,29 @@ fn measure(
             trans_b,
             repeats
         )
+    }
+
+    #: The fastest of several timings rather than one timing. Noise on a GPU
+    #: only ever adds time — another program's work, a clock that has not
+    #: settled, a queue that was not empty — so the smallest reading is the
+    #: closest to what the kernel actually costs. One reading each let a
+    #: candidate fifteen per cent slower win whichever run it happened to be
+    #: measured on a quiet moment.
+    for _again in 1..TUNE_ROUNDS {
+        let again = run_repeats(
+            plan,
+            a,
+            b,
+            output,
+            bias,
+            rows,
+            inner,
+            columns,
+            trans_a,
+            trans_b,
+            repeats
+        )
+        if again < seconds { seconds = again }
     }
     return seconds / float(repeats)
 }
