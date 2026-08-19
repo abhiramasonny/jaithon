@@ -2,7 +2,7 @@
 import std.math
 from std.gpu import Buffer
 from std.random import Random
-from .ops import conv2d, dense_affine, dense_static_backward, dense_static_forward
+from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, dense_static_forward
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
 from .tensor import Tensor
@@ -781,6 +781,21 @@ pub class Embedding: Layer {
 }
 
 #: NHWC max pooling window.
+#: What a pooling window leaves of an NHWC `[height, width, channels]` shape.
+#:
+#: `Sequential` builds each layer from the one before it reports, so a pool that
+#: reported its input shape sized every later layer as if it had not pooled at
+#: all — a `Conv2d`/`MaxPool2d` stack failed on its first forward with a matmul
+#: shape error rather than at build time.
+fn pooled_shape(shape: list[int], kernel_size: int, stride: int, padding: int) -> list[int] {
+    if shape.len() != 3 { return [d for d in shape] }
+    return [
+        conv2d_out_dim(shape[0], kernel_size, stride, padding),
+        conv2d_out_dim(shape[1], kernel_size, stride, padding),
+        shape[2],
+    ]
+}
+
 pub class MaxPool2d: Layer {
     pub let kernel_size: int
     pub let stride: int
@@ -802,7 +817,7 @@ pub class MaxPool2d: Layer {
 
     pub fn build_from_shape(self, shape: list[int], rng: Random) -> void {
         let _ = rng
-        self.last_shape = [d for d in shape]
+        self.last_shape = pooled_shape(shape, self.kernel_size, self.stride, self.padding)
     }
 
     pub fn forward(self, x: Tensor) -> Tensor {
@@ -848,7 +863,7 @@ pub class AvgPool2d: Layer {
 
     pub fn build_from_shape(self, shape: list[int], rng: Random) -> void {
         let _ = rng
-        self.last_shape = [d for d in shape]
+        self.last_shape = pooled_shape(shape, self.kernel_size, self.stride, self.padding)
     }
 
     pub fn forward(self, x: Tensor) -> Tensor {

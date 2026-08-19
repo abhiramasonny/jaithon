@@ -2429,7 +2429,8 @@ pub fn add_correct_into(logits: Tensor, labels: Tensor, total: Tensor) -> void {
     )
 }
 
-fn conv2d_out_dim(size: int, kernel: int, stride: int, padding: int) -> int {
+#: Output extent of one spatial axis under a convolution or pooling window.
+pub fn conv2d_out_dim(size: int, kernel: int, stride: int, padding: int) -> int {
     return (size + 2 * padding - kernel) // stride + 1
 }
 
