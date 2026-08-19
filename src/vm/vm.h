@@ -176,6 +176,13 @@ bool jaiFinishJitDeopt1(ObjClosure *closure, Value *base, int frameBase,
 bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,
                      Value *out);
 
+/* The same call for a caller holding the receiver at args[0] and no idea what
+ * class it is, which is what the compiled tier has at a site whose receiver
+ * varies. Answers from the shared megamorphic table, and raises rather than
+ * returning false when there is no such method. */
+bool jaiInvokeMethodByName(ObjString *name, Value *argsWithReceiver, int count,
+                           Value *out);
+
 /* Field access honouring visibility and properties. */
 bool jaiGetProperty(Value receiver, ObjString *name, Value *out);
 bool jaiSetProperty(Value receiver, ObjString *name, Value value);

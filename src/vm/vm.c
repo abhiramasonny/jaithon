@@ -1731,6 +1731,66 @@ bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,
     return true;
 }
 
+/* Invoke by name on a receiver whose class the caller could not pin.
+ *
+ * The compiled tier resolves a method while it emits when the receiver's class
+ * is fixed, which is nearly every call site. A loop over a list holding several
+ * implementations of one trait is where it is not, and before this such a loop
+ * declined outright and ran interpreted. The shared megamorphic table answers
+ * here for the reason it answers in OP_INVOKE: one table sized for the whole
+ * program makes the ninth class cost what the fifth does.
+ *
+ * Only a hit in `klass->methods` is cached, checked against that table's
+ * version, so nothing has to remember to invalidate this -- the same contract
+ * the interpreter's megamorphic arm keeps, and statics and trait defaults
+ * simply take the general path below.
+ *
+ * Raises rather than returning a bare false for a missing method: the caller is
+ * compiled code with no name or receiver left to build a message from. */
+bool jaiInvokeMethodByName(ObjString *name, Value *argsWithReceiver, int count,
+                           Value *out) {
+    if (name == NULL || count < 1) return false;
+    const Value receiver = argsWithReceiver[0];
+
+    if (IS_INSTANCE(receiver)) {
+        ObjClass *klass = AS_INSTANCE(receiver)->klass;
+        if (klass != NULL) {
+            MegaEntry *me = &sMegaCache[megaSlot(klass, name)];
+            if (me->klass == klass && me->name == name &&
+                me->tableVersion == klass->methods.version) {
+                vm.icHits++;
+                if (me->recheck && !methodPermitted(klass, name, true)) {
+                    return false;
+                }
+                return jaiCallMethodWithReceiver(me->method, argsWithReceiver,
+                                                 count, out);
+            }
+            Value found;
+            if (jaiTableGetInterned(&klass->methods, name, &found)) {
+                MethodInfo mi;
+                vm.icMisses++;
+                me->klass        = klass;
+                me->name         = name;
+                me->method       = found;
+                me->tableVersion = klass->methods.version;
+                me->recheck      = jaiClassRestrictedMethod(klass, name, &mi);
+                if (me->recheck && !methodPermitted(klass, name, true)) {
+                    return false;
+                }
+                return jaiCallMethodWithReceiver(found, argsWithReceiver, count,
+                                                 out);
+            }
+        }
+    }
+
+    if (jaiInvokeMethod(receiver, name, count - 1, argsWithReceiver + 1, out)) {
+        return true;
+    }
+    if (vm.hasException) return false;
+    return jaiThrow(vm.cAttributeError, "'%s' object has no method '%s'",
+                    jaiTypeNameStatic(receiver), name->chars);
+}
+
 /* ------------------------------------------------------------------ */
 /* Operators                                                            */
 /* ------------------------------------------------------------------ */

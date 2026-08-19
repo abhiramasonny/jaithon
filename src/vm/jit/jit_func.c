@@ -189,6 +189,17 @@ static int jitInvokeMethod(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
+/* Receiver whose class the model could not pin. The method NAME travels in the
+ * descriptor's callee slot -- there is no method Value to put there -- and the
+ * resolve happens per call against the shared megamorphic table. */
+static int jitInvokeByName(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    bool ok = jaiInvokeMethodByName(AS_STRING(d->callee), d->args,
+                                    (int)d->argc, &d->result);
+    jaiGCPopRootRange();
+    return ok ? 0 : 1;
+}
+
 static int jitInvokeNative(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiInvokeNativeWithReceiver(d->callee, d->args, (int)d->argc,
@@ -525,6 +536,10 @@ typedef struct {
     bool      hasIter;
     uint8_t   iterKind;   /* 1 a unit-step range, 2 a list, 3 a dict-items view */
     Value     elemSample;
+    /* The sampled element's class is one of several the list holds, so the
+     * loop variable is an instance of no particular class. Set by the driver,
+     * which is the only place the whole list is in hand. */
+    bool      elemMixed;
     /* Per-slot register assignment. Historically one flag gated the whole loop on a budget check that
      * almost nothing passed, so most loops ran fully in memory. Three things fixed it: only NAMED slots take a register; a float slot takes v8..v15 instead of an X register; overflow slots stay in the frame (busiest slots win, weighted by loop nesting) rather than all-or-nothing. */
     uint8_t   slotXReg[JIT_MAX_SLOTS + 1];   /* x19..x28, or 0 for none */
@@ -2639,6 +2654,33 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
      * what makes that sound: whatever object comes back, it is an object. */
     *k = SLOT_OBJ; *tag = VAL_OBJ;
     return true;
+}
+
+/* What an OP_INVOKE site has been observed to return, merged over every way its
+ * inline cache holds.
+ *
+ * For a site whose receiver class the model cannot pin there is no callee to
+ * ask -- but the interpreter watched the same site run, and eight
+ * implementations of one trait method that all return an int agree on that
+ * much. Ways that recorded nothing are skipped rather than merged: NONE
+ * against a real kind is MIXED, which would throw away the evidence the other
+ * ways did gather.
+ *
+ * A PREDICTION. The tag guard the caller emits after the call is the whole of
+ * what makes it sound; a way that later returns something else deoptimises. */
+static bool siteInvokeResultKind(const Chunk *chunk, uint16_t cacheIdx,
+                                 SlotKind *k, unsigned *tag) {
+    if (chunk->caches == NULL || (int)cacheIdx >= chunk->cacheCount) {
+        return false;
+    }
+    const InlineCache *ic = &chunk->caches[cacheIdx];
+    uint8_t merged = JAI_FB_NONE;
+    for (int w = 0; w < ic->count && w < JAI_IC_WAYS; w++) {
+        if (ic->resultKind[w] == JAI_FB_NONE) continue;
+        merged = jaiFeedbackMerge(merged, ic->resultKind[w]);
+    }
+    if (merged == JAI_FB_NONE || merged == JAI_FB_MIXED) return false;
+    return feedbackSlotKind(merged, k, tag);
 }
 
 /* The same test feedbackSlotKind applies to a call's result, as a predicate on a Value: is this a heap
@@ -6424,10 +6466,57 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * the instruction AFTER the call -- the call has happened and
                  * must not happen twice. */
                 ObjClass *rcls = e->stackClass[ridx];
-                if (rcls == NULL) return false;
                 if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
                 Value mname = fn->chunk.constants.data[nameIdx];
                 if (!IS_STRING(mname)) return false;
+
+                /* An instance whose class the model could not pin -- what
+                 * `for op in ops` produces when the list holds more than one
+                 * implementation of a trait. There is no method to resolve
+                 * here, so the name goes out instead and jitInvokeByName
+                 * resolves per call. Declining instead was worth 2.4x on the
+                 * two-class form of tests/bench/poly_dispatch, entirely
+                 * because the loop around it then ran interpreted. */
+                if (rcls == NULL) {
+                    SlotKind rkind;
+                    unsigned rtag;
+                    const bool discarded =
+                        (off + 7 < count && code[off + 7] == OP_POP);
+                    const bool havePrediction =
+                        siteInvokeResultKind(&fn->chunk,
+                                             jaiReadU16(code + off + 5),
+                                             &rkind, &rtag);
+                    if (!havePrediction && !discarded) {
+                        e->whyNot = "an unpinned receiver's result kind";
+                        return false;
+                    }
+                    if (!emitDescriptor(e, mname, ridx, argc + 1,
+                                        (void *)&jitInvokeByName)) {
+                        return false;
+                    }
+                    for (unsigned i = 0; i <= argc; i++) {
+                        unsigned r;
+                        if (!popValue(e, &r, NULL)) return false;
+                    }
+                    e->wroteHeap = true;
+                    if (!havePrediction) {
+                        off += 8;          /* the OP_POP this consumed */
+                        break;
+                    }
+                    if (!pushValue(e, rkind, 0, NULL)) return false;
+                    unsigned rat = e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, rtag));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+                    if (rkind == SLOT_BOOL) {
+                        emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
+                    } else {
+                        emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+                    }
+                    off += 7;
+                    break;
+                }
                 Value method;
                 if (!jaiClassFindMethod(rcls, AS_STRING(mname), &method)) {
                     return false;
@@ -7231,6 +7320,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->whyNot = "list element kind unknown";
                     return false;
                 }
+                /* The list holds more than one class, so the loop variable is
+                 * an instance of no particular one. Two classes are not two
+                 * KINDS -- the representation is the same untagged pointer --
+                 * so the slot widens rather than the compile failing, and the
+                 * call sites inside dispatch by name. Only sound at THIS
+                 * instruction: an OSR body is walked from its loop head, so
+                 * nothing has been emitted against the class being dropped. */
+                if (ek == SLOT_INST && e->elemMixed) {
+                    esh = 0;
+                    ecl = NULL;
+                    e->localTyped[slot] = false;
+                }
                 if (!adoptLocalKindSeen(e, slot, ek, esh, ecl, sample)) {
                     e->whyNot = "loop variable took two kinds";
                     return false;
@@ -7271,13 +7372,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                        (unsigned)offsetof(Obj, type)));
                     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
                     branchOnDeopt(e, JAI_A64_NE);
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
-                                       (unsigned)offsetof(ObjInstance, klass)));
-                    emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
-                                       (unsigned)offsetof(ObjClass, shapeId)));
-                    emitConst64(e, JIT_SCRATCH_A, (int64_t)esh);
-                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
-                    branchOnDeopt(e, JAI_A64_NE);
+                    /* The class is checked only when one was pinned. A widened
+                     * slot has no class to check against, and that it is an
+                     * instance at all -- which the guard above settles -- is
+                     * everything a by-name call needs of it. */
+                    if (esh != 0) {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(ObjInstance, klass)));
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(ObjClass, shapeId)));
+                        emitConst64(e, JIT_SCRATCH_A, (int64_t)esh);
+                        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                        branchOnDeopt(e, JAI_A64_NE);
+                    }
                 } else if (ek == SLOT_LIST) {
                     /* Same contract as OP_GET_INDEX's own SLOT_LIST arm: VAL_OBJ
                      * is every heap object, not specifically a list, so the
@@ -9681,7 +9788,8 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
 }
 
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
-                       uint8_t iterKind, Value elemSample, bool noInline) {
+                       uint8_t iterKind, Value elemSample, bool elemMixed,
+                       bool noInline) {
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
     if (!isInstructionStart(&fn->chunk, top)) return false;
@@ -9707,6 +9815,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.hasIter = hasIter;
     e.iterKind = iterKind;
     e.elemSample = elemSample;
+    e.elemMixed  = elemMixed;
     e.osrTop = top;
     e.osrEnd = end;
     e.base = 0;
@@ -9764,6 +9873,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         memset(&probe, 0, sizeof probe);
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
         probe.iterKind = iterKind; probe.elemSample = elemSample;
+        probe.elemMixed = elemMixed;
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
@@ -10356,6 +10466,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     ObjIter *iter = NULL;
     uint8_t iterKind = 0;
     Value elemSample = NULL_VAL;
+    bool  elemMixed = false;
     if (hasIter) {
         if (vm.stackTop <= frame->slots) return 0;
         Value it = vm.stackTop[-1];
@@ -10395,6 +10506,23 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             if (at < 0 || at >= src->count) return 0;
             elemSample = src->items[at];
             iterKind = 2;
+            /* Whether the list holds one class or several. One sample cannot
+             * say, and getting it wrong is not merely a slower loop: a form
+             * compiled pinned to the sampled class fails its own entry guard
+             * on every later class, so the loop runs interpreted for the rest
+             * of the program with no second chance to notice. Capped because
+             * this runs per compile attempt and a list can be enormous; past
+             * the cap the pinned form is compiled as before and deoptimises if
+             * it was wrong, which is where this started. */
+            if (IS_INSTANCE(elemSample)) {
+                const ObjClass *first = AS_INSTANCE(elemSample)->klass;
+                int scan = src->count < 1024 ? src->count : 1024;
+                for (int i = 0; i < scan; i++) {
+                    Value v = src->items[i];
+                    if (!IS_INSTANCE(v)) continue;
+                    if (AS_INSTANCE(v)->klass != first) { elemMixed = true; break; }
+                }
+            }
         } else {
             return 0;
         }
@@ -10423,9 +10551,9 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             return 0;   /* this head is spent; other heads are not */
         }
         if (!compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        false) &&
+                        elemMixed, false) &&
             !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        true)) {
+                        elemMixed, true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
             if (miss == fn->osrMissCount && miss < JAI_OSR_MAX) {
