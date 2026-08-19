@@ -66,6 +66,7 @@ from jaicv.core.dft import dct, dft, get_optimal_dft_size, idft
 from jaicv.core.dft import DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from jaicv.core.cluster import PCA
 from jaicv.core.linalg import matmul as linalg_matmul, transpose as linalg_transpose
+from jaicv.dnn.blob import blob_from_image, nms_boxes
 import std.gpu as gpu
 
 #: One recorded call: the operation, its arguments, the input, and what OpenCV
@@ -183,6 +184,10 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     #: range, that shows up as a few levels along every edge.
     if name == "undistort" { return 4.0 }
     if TRANSFORM_NAMES.contains(name) { return 1e-4 }
+    #: A blob that had to resize its image inherits `resize`'s one-unit
+    #: disagreement with OpenCV, scaled by whatever the blob scales by.
+    if name == "blobFromImage" { return float(args[0]) + 1e-4 }
+    if name == "nmsBoxes" { return 0.0 }
     if name == "connectedComponentsCentroids" or name == "compareHist" { return 1e-4 }
     if name == "moments" or name == "huMoments" { return 1e-3 }
     if name == "contourArea" or name == "arcLengthClosed" or name == "arcLengthOpen" { return 1e-3 }
@@ -706,6 +711,35 @@ fn run_cascade(item: Case) -> Mat {
     return Mat.from_list(found.len(), 4, CV_MAKETYPE(4, 1), values)
 }
 
+let DNN_NAMES = ["blobFromImage", "nmsBoxes"]
+
+let NMS_BOXES = [
+    Rect(10, 10, 30, 30),
+    Rect(12, 12, 30, 30),
+    Rect(60, 60, 20, 20),
+    Rect(61, 59, 22, 21),
+    Rect(100, 10, 15, 40),
+    Rect(11, 9, 31, 32),
+]
+let NMS_SCORES = [0.9, 0.75, 0.8, 0.6, 0.55, 0.5]
+
+fn run_dnn(item: Case) -> Mat {
+    let args = item.args
+    if item.name == "blobFromImage" {
+        return blob_from_image(
+            item.source,
+            float(args[0]),
+            Size(int(args[1]), int(args[2])),
+            Scalar(float(args[3]), float(args[4]), float(args[5])),
+            int(args[6]) != 0
+        )
+    }
+    let kept = nms_boxes(NMS_BOXES, NMS_SCORES, float(args[0]), float(args[1]))
+    var values: list[float] = []
+    for index in kept { values.push(float(index)) }
+    return Mat.from_list(kept.len(), 1, CV_MAKETYPE(4, 1), values)
+}
+
 let TRANSFORM_NAMES = ["dft", "idft", "dct", "getOptimalDFTSize", "pcaMean", "pcaBasis"]
 
 fn run_transform(item: Case) -> Mat {
@@ -1010,6 +1044,7 @@ fn run_case(item: Case) -> Mat {
     if CALIB_NAMES.contains(item.name) { return run_calib(item) }
     if CALIBRATE_NAMES.contains(item.name) { return run_calibrate(item) }
     if TRANSFORM_NAMES.contains(item.name) { return run_transform(item) }
+    if DNN_NAMES.contains(item.name) { return run_dnn(item) }
     if item.name == "cascadeDetect" { return run_cascade(item) }
     if item.name == "fast" { return run_fast(item) }
     if FEATURE_NAMES.contains(item.name) { return run_features(item) }
