@@ -92,16 +92,29 @@ build_all() {
     fi
 }
 
+# The peer interpreter, which needs torch. Tried in order; the search matters
+# because a peer that is merely absent shows up as an em dash in every row
+# rather than as an error, and a whole session can be spent optimising against
+# nothing. `bench_peer_note` below says so out loud when none is found.
 jaitensor_python() {
     if [[ -n "${JAITENSOR_PYTHON:-}" ]]; then
         printf '%s' "$JAITENSOR_PYTHON"
         return
     fi
-    if [[ -x /tmp/jaitensor-bench/bin/python ]]; then
-        printf '%s' /tmp/jaitensor-bench/bin/python
-        return
-    fi
-    printf '%s' python3
+    local candidate
+    for candidate in /tmp/jaitensor-bench/bin/python "$HOME/.venvs/scratch/bin/python" python3; do
+        if [[ "$candidate" == python3 ]]; then
+            command -v python3 >/dev/null 2>&1 || continue
+            candidate="$(command -v python3)"
+        elif [[ ! -x "$candidate" ]]; then
+            continue
+        fi
+        if "$candidate" -c "import torch" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return
+        fi
+    done
+    printf '%s' ""
 }
 
 print_header() {
@@ -121,8 +134,10 @@ total_j=0; total_p=0
 
 if [[ "$SUITE" == "jaitensor" ]]; then
     py="$(jaitensor_python)"
-    if ! "$py" -c "import torch" >/dev/null 2>&1; then
-        py=""
+    if [[ -z "$py" ]]; then
+        printf '%s\n' \
+            "note: no python with torch was found, so the peer column will be empty." \
+            "      Set JAITENSOR_PYTHON to one that has it to get a comparison." >&2
     fi
     exec python3 "$ROOT/tests/bench/jaitensor/run_suite.py" \
         --root "$ROOT" \

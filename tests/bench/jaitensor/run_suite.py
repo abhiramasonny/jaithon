@@ -221,8 +221,14 @@ def render(
         jtime = left.median
         ptime = right.median if right is not None else 0.0
         speed = f"{ptime / jtime:.2f}x" if right is not None else "—"
-        route = left.detail.rsplit("/", 1)[-1] if "/" in left.detail else (
-            "attention" if name.startswith("attn-") else "fused-mlp"
+        # An em dash when the workload does not report one. It used to fall
+        # back to "fused-mlp", which is a real route the conv benchmarks do not
+        # take -- and reading that column as fact sent one investigation after
+        # the wrong kernel entirely.
+        route = (
+            left.detail.rsplit("/", 1)[-1] if "/" in left.detail
+            else "attention" if name.startswith("attn-")
+            else "\u2014"
         )
         print(
             f"{name:<24} {duration(jtime):>9} "
