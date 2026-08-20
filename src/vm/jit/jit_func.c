@@ -5263,6 +5263,68 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        /* `x is null` and `x is not null`, which is how every optional in
+         * this language is tested. `valueIsTest` against a null target is
+         * plain identity, so the whole question is whether the subject's tag
+         * is VAL_NULL -- and the tier already represents a null instance as a
+         * zero in the register, so for the kind that actually occurs it is a
+         * compare and a `cset`.
+         *
+         * Worth an arm on its own: without one the operator fell to the
+         * unarmed-opcode deopt a few instructions into the body, and a body
+         * that compiles and then immediately bails is SLOWER than one that was
+         * never compiled -- measured at 212 ms against the interpreter's
+         * 162 ms on a guard doing nothing else. It was the only construct
+         * found that made the tier a net loss. */
+        case OP_IS:
+        case OP_IS_NOT: {
+            if (e->depth < 2) return false;
+            /* Only against a literal null. `x is SomeClass` is a type test
+             * that goes through valueMatchesType, and nothing here would be
+             * right for it. */
+            if (e->stack[e->depth - 1] != SLOT_NULL) {
+                /* `x is SomeClass` is a type test through valueMatchesType
+                 * and nothing here would be right for it. It declines rather
+                 * than taking the unarmed deopt it used to: that path leaves
+                 * the operand model a slot deeper than the bytecode, and a
+                 * body that compiles only to bail at the same instruction on
+                 * every iteration is slower than one never compiled anyway. */
+                e->whyNot = "an `is` against something other than null";
+                return false;
+            }
+            SlotKind sk = e->stack[e->depth - 2];
+            bool wantNull = (op == OP_IS);
+            unsigned dropNull, dropSubject;
+
+            if (sk == SLOT_MAYBE_INST) {
+                unsigned rs = xHeldIn(e, e->valueDepth - 2);
+                emit(e, jaiA64SubsXImm(31, rs, 0));
+                if (!popValueRaw(e, &dropNull, NULL)) return false;
+                if (!popValueRaw(e, &dropSubject, NULL)) return false;
+                if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+                emit(e, jaiA64CsetX(pushReg(e) - 1,
+                                    wantNull ? JAI_A64_EQ : JAI_A64_NE));
+            } else if (sk == SLOT_INT || sk == SLOT_FLOAT || sk == SLOT_BOOL ||
+                       sk == SLOT_INST || sk == SLOT_LIST || sk == SLOT_OBJ) {
+                /* None of these kinds can hold a null, so the answer is known
+                 * here and the compare never runs. */
+                if (!popValueRaw(e, &dropNull, NULL)) return false;
+                if (!popValueRaw(e, &dropSubject, NULL)) return false;
+                if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+                emit(e, jaiA64MovzX(pushReg(e) - 1, wantNull ? 0u : 1u, 0));
+            } else if (sk == SLOT_NULL) {
+                if (!popValueRaw(e, &dropNull, NULL)) return false;
+                if (!popValueRaw(e, &dropSubject, NULL)) return false;
+                if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+                emit(e, jaiA64MovzX(pushReg(e) - 1, wantNull ? 1u : 0u, 0));
+            } else {
+                e->whyNot = "an `is null` on a kind with no null representation";
+                return false;
+            }
+            off += 1;
+            break;
+        }
+
         case OP_JUMP_IF_FALSE:
         case OP_JUMP_IF_TRUE:
         case OP_JUMP_IF_FALSE_KEEP:

@@ -15,10 +15,12 @@ stopped : a builtin whose result kind has not been observed
 stopped : a global of a kind the tier has no slot for
 stopped : a local was given two different kinds
 stopped : a parameter is sometimes null
+stopped : an `is` against something other than null
 stopped : an invoke on an object with nothing to look at
 stopped : callee is not a compiled global function
 stopped : callee's return kind not usable
 stopped : iterating a list with nothing to look at
+stopped : iterating something other than a list or range
 stopped : loop variable took two kinds
 stopped: OP_CALL
 stopped: OP_FOR_ITER_PAIR
