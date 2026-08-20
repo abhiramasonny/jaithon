@@ -277,6 +277,37 @@ fn test_convolution_gradients() -> void {
     bias.free()
 }
 
+#: `conv2d`'s fused ReLU epilogue (`activation: 1`), which routes through the
+#: native conv+bias+activation graph on the forward pass and a masked
+#: upstream on the backward one instead of the ops-level `relu` on top of a
+#: separate `conv2d` call above -- its own path through both directions, so
+#: `spread`'s sign-alternating values are wrong here: `positive` on every
+#: input keeps every pre-activation sum away from ReLU's kink, which
+#: `spread`'s cancellation cannot promise.
+fn test_convolution_relu_gradients() -> void {
+    if not have_gpu() { return }
+    let weights = Tensor([3, 3, 2, 2], positive(36))
+    let bias = Tensor([2], [0.2, 0.15])
+    check(fn(x: Tensor) -> Tensor {
+        return conv2d(x, weights, bias: bias, padding: 1, activation: 1)
+    }, [1, 4, 4, 2], positive(32))
+    weights.free()
+    bias.free()
+
+    let image = Tensor([1, 4, 4, 2], positive(32))
+    let bias2 = Tensor([2], [0.2, 0.15])
+    check(fn(w: Tensor) -> Tensor {
+        return conv2d(image, w, bias: bias2, padding: 1, activation: 1)
+    }, [3, 3, 2, 2], positive(36))
+    let weights2 = Tensor([3, 3, 2, 2], positive(36))
+    check(fn(b: Tensor) -> Tensor {
+        return conv2d(image, weights2, bias: b, padding: 1, activation: 1)
+    }, [2], [0.2, 0.15])
+    image.free()
+    bias2.free()
+    weights2.free()
+}
+
 #: The weights' and bias's own gradients, which the input-side cases above do
 #: not touch: `check` perturbs whatever tensor it is given, and a wrong weight
 #: gradient with a right input gradient trains just as wrongly.

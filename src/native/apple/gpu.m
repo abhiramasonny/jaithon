@@ -23,6 +23,23 @@
 
 #include "native/native.h"
 
+#include <stdlib.h>
+static _Atomic long gDispatchTraceKernel = 0;
+static _Atomic long gDispatchTraceGraph = 0;
+static int gDispatchTraceOn = -1;
+static void dispatchTraceDump(void) {
+    fprintf(stderr, "JAI_GPU_DISPATCH_TRACE kernel=%ld graph=%ld total=%ld\n",
+            gDispatchTraceKernel, gDispatchTraceGraph, gDispatchTraceKernel + gDispatchTraceGraph);
+}
+static void dispatchTraceTick(int isGraph) {
+    if (gDispatchTraceOn < 0) {
+        gDispatchTraceOn = getenv("JAI_GPU_DISPATCH_TRACE") != NULL ? 1 : 0;
+        if (gDispatchTraceOn) atexit(dispatchTraceDump);
+    }
+    if (!gDispatchTraceOn) return;
+    if (isGraph) gDispatchTraceGraph++; else gDispatchTraceKernel++;
+}
+
 /* Below this much arithmetic the upload, encode and queue wait cost more than
  * the work. Mirrors MIN_GPU_ELEMENTS in lib/std/gpu.jai. */
 #define JAI_GPU_MIN_WORK 4096
@@ -927,6 +944,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                            bool wait) {
     if (k == NULL || k->pipeline == NULL || threads <= 0) return false;
     if (count < 0 || (count > 0 && buffers == NULL)) return false;
+    dispatchTraceTick(0);
     if (scalarCount < 0 || (scalarCount > 0 && scalars == NULL)) return false;
     if (groupSize < 0) return false;
     if (!ensureDevice()) return false;
@@ -1211,6 +1229,7 @@ static bool ensureAsyncCommandBuffer(void) {
 static bool encodeGraphOnAsync(MPSGraph *graph,
                                NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds,
                                NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results) {
+    dispatchTraceTick(1);
     if (!ensureAsyncCommandBuffer()) return false;
     MPSCommandBuffer *mps =
         [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
@@ -1582,7 +1601,8 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                          JaiGpuBuffer *out, size_t outOffset,
                          uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
                          uint32_t cout, uint32_t kh, uint32_t kw,
-                         uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+                         uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw,
+                         uint32_t activation) {
     if (input == NULL || weights == NULL || out == NULL) return false;
     if (input->buffer == NULL || weights->buffer == NULL || out->buffer == NULL) return false;
     if (n == 0 || h == 0 || w == 0 || cin == 0 || cout == 0 || kh == 0 || kw == 0) return false;
@@ -1611,9 +1631,9 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
             static NSMutableDictionary<NSString *, NSArray *> *graphs;
             if (graphs == nil) graphs = [[NSMutableDictionary alloc] init];
             NSString *key = [NSString stringWithFormat:
-                @"conv:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%d",
+                @"conv:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%d:%u",
                 n, h, w, cin, cout, kh, kw, sh, sw, ph, pw,
-                bias != NULL ? 1 : 0, gMixedPrecision ? 1 : 0];
+                bias != NULL ? 1 : 0, gMixedPrecision ? 1 : 0, activation];
             NSArray *cached = graphs[key];
             if (cached == nil) {
                 MPSGraph *graph = [[MPSGraph alloc] init];
@@ -1653,6 +1673,15 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                                                           withShape:@[ @1, @1, @1, @(cout) ]
                                                                                name:@"br"]
                                                           name:@"convb"];
+                }
+                /* Folding the activation into the same compiled graph as the
+                 * convolution and its bias means the epilogue costs nothing
+                 * beyond what the graph compiler already fuses on its own --
+                 * one dispatch for conv+bias+activation instead of the
+                 * elementwise kernel jaitensor would otherwise launch
+                 * separately over the whole output. */
+                if (activation == 1) {
+                    product = [graph reLUWithTensor:product name:@"convrelu"];
                 }
                 NSMutableArray *built = [@[ graph, src, filt, product ] mutableCopy];
                 if (biasT != nil) [built addObject:biasT];
@@ -1931,6 +1960,7 @@ static bool encodeMlpExecutableOnAsyncArrays(
     NSArray<MPSGraphTensorData *> *inputs,
     NSArray<MPSGraphTensorData *> *results) {
     if (exec == nil || inputs == nil || results == nil) return false;
+    dispatchTraceTick(1);
     if (!ensureAsyncCommandBuffer()) return false;
     MPSCommandBuffer *mps =
         [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];

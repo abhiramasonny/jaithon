@@ -445,6 +445,19 @@ pub class Conv2d: Layer {
             }
             input = reshape(x, [x.shape[0], self.in_height, self.in_width, self.in_channels])
         }
+        #: ReLU folds into the convolution's own dispatch (see `ops.conv2d`),
+        #: so the common case never launches a second elementwise kernel over
+        #: the feature map. Every other activation still runs as its own op.
+        if self.activation == Activation.Relu {
+            return conv2d(
+                input,
+                weights,
+                bias: bias,
+                stride: self.stride,
+                padding: self.padding,
+                activation: 1
+            )
+        }
         let output = conv2d(input, weights, bias: bias, stride: self.stride, padding: self.padding)
         return activate(output, self.activation)
     }
