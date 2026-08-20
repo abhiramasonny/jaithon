@@ -142,14 +142,16 @@ bool          jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff,
                               JaiGpuBuffer *out, size_t outOff,
                               uint32_t seq, uint32_t heads, uint32_t hd,
                               float scale);
-/* NHWC input, HWIO weights, optional bias. Output is NHWC. */
+/* NHWC input, HWIO weights, optional bias. Output is NHWC. `activation` fuses
+ * an elementwise epilogue into the same graph dispatch: 0 none, 1 ReLU. */
 bool          jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                   JaiGpuBuffer *weights, size_t weightsOffset,
                                   JaiGpuBuffer *bias, size_t biasOffset,
                                   JaiGpuBuffer *out, size_t outOffset,
                                   uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
                                   uint32_t cout, uint32_t kh, uint32_t kw,
-                                  uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
+                                  uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw,
+                                  uint32_t activation);
 /* The same convolution's two gradients, taken by the same primitives the
  * forward pass uses. Both return false for a shape MPS will not take, and the
  * caller falls back to its own im2col. */

@@ -3015,13 +3015,20 @@ pub fn conv2d_out_dim(size: int, kernel: int, stride: int, padding: int) -> int 
 }
 
 #: NHWC 2D convolution. Weights are HWIO `[kh, kw, cin, cout]`.
+#:
+#: `activation` fuses an elementwise epilogue into the convolution's own
+#: dispatch instead of a separate pass over the output: 0 none, 1 ReLU. A
+#: fused activation needs `bias` -- the epilogue that carries it always adds
+#: one, so there is nowhere to route "activation but no bias" -- which
+#: `Conv2d.forward` never hits since every convolution layer owns a bias.
 @trace
 pub fn conv2d(
     input: Tensor,
     weights: Tensor,
     bias: Tensor? = null,
     stride: int = 1,
-    padding: int = 0
+    padding: int = 0,
+    activation: int = 0
 ) -> Tensor {
     if input.rank() != 4 {
         throw ValueError(f"conv2d needs NHWC input, got {input.shape}")
@@ -3041,6 +3048,12 @@ pub fn conv2d(
     let cout = weights.shape[3]
     if stride <= 0 { throw ValueError(f"conv2d stride must be positive, got {stride}") }
     if padding < 0 { throw ValueError(f"conv2d padding must be non-negative, got {padding}") }
+    if activation < 0 or activation > 1 {
+        throw ValueError(f"conv2d activation must be 0 or 1, got {activation}")
+    }
+    if activation != 0 and bias is null {
+        throw ValueError("conv2d needs a bias to fuse an activation")
+    }
     let out_h = conv2d_out_dim(h, kh, stride, padding)
     let out_w = conv2d_out_dim(w, kw, stride, padding)
     if out_h <= 0 or out_w <= 0 {
@@ -3058,11 +3071,14 @@ pub fn conv2d(
         kernel.dispatch_async([input.buffer(), col.buffer()], rows * k, [n, h, w, cin, kh, kw, stride, stride, padding, padding])
         let flat_w = Tensor([k, cout], storage: weights.buffer().view(0, k * cout))
         let flat_out = Tensor([rows, cout], storage: output.buffer())
-        raw_matmul(col, flat_w, bias: bias, epilogue: if bias is null {
+        let epilogue = if bias is null {
             0
+        } elif activation == 1 {
+            2
         } else {
             1
-        }, out: flat_out)
+        }
+        raw_matmul(col, flat_w, bias: bias, epilogue: epilogue, out: flat_out)
         col.free()
     }
     try {
@@ -3070,11 +3086,11 @@ pub fn conv2d(
             null
         } else {
             bias.buffer()
-        })
+        }, activation: activation)
     } catch _error: RuntimeError {
         by_im2col()
     }
-    attach_conv_grad(input, weights, bias, output, stride, padding)
+    attach_conv_grad(input, weights, bias, output, stride, padding, activation)
     return output
 }
 
@@ -3090,7 +3106,8 @@ fn attach_conv_grad(
     bias: Tensor?,
     output: Tensor,
     stride: int,
-    padding: int
+    padding: int,
+    activation: int
 ) -> void {
     let wants_bias = bias is not null and bias.requires_grad
     if not (input.requires_grad or weights.requires_grad or wants_bias) { return }
@@ -3105,7 +3122,13 @@ fn attach_conv_grad(
     let cout = weights.shape[3]
     let out_h = output.shape[1]
     let out_w = output.shape[2]
-    output.attach_creator(GradNode(inputs, fn(upstream: Tensor) -> list[Tensor] {
+    output.attach_creator(GradNode(inputs, fn(raw_upstream: Tensor) -> list[Tensor] {
+        #: `output` already carries the fused activation, so its own gradient
+        #: is masked here before any of the convolution math below sees it --
+        #: the same rewrite `dense_affine` does for its epilogue, and the
+        #: reason `conv2d` only fuses an activation whose backward needs
+        #: nothing but the (already-available) forward output.
+        let upstream = if activation == 1 { unary_backward(output, raw_upstream, 1) } else { raw_upstream }
         let k = kh * kw * cin
         let rows = n * out_h * out_w
         let flat_up = Tensor([rows, cout], storage: upstream.buffer().view(0, rows * cout))
@@ -3184,6 +3207,7 @@ fn attach_conv_grad(
         }
         var grads = [grad_input, grad_weights]
         if wants_bias { grads.push(reduce_leading(flat_up, [cout])) }
+        if activation == 1 { upstream.free() }
         return grads
     }))
 }
