@@ -8409,6 +8409,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     /* Distinguish the two, because the census reads these and
                      * "a global of a kind the tier has no slot for" is a very
                      * different backlog item from an uncompiled callee. */
+                    /* Interpreted from here rather than the whole function
+                     * declined. The case that matters is a global read on a
+                     * branch that never runs: `throw ValueError(...)` in an
+                     * argument check is the shape, there are hundreds of them
+                     * in lib/std alone, and declining for one cost 110 ms
+                     * against 14 ms for the same function guarded by a plain
+                     * `return`. The unarmed path already exists for exactly
+                     * this -- see emitUnarmedDeopt. */
+                    if (!e->osr && emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
+                        break;
+                    }
+                    if (e->failed) return false;
                     e->whyNot =
                         (gslot != NULL && !IS_CLOSURE(gvv) &&
                          !IS_CLASS(gvv) && !IS_NATIVE(gvv))
