@@ -26,8 +26,10 @@ stopped: OP_GET_EXC
 stopped: OP_GET_INDEX
 stopped: OP_INVOKE
 stopped: OP_LT
+stopped: a builtin with no known result kind
 stopped: a local was given two different kinds
 stopped: add-bind of a kind that is neither int nor float
+stopped: an append reaching past the model
 stopped: an unpinned receiver's result kind
 stopped: builtin arity
 stopped: callee is not a compiled global function

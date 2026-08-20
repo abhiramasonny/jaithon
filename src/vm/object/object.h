@@ -279,6 +279,9 @@ typedef struct {
 } ExceptionEntry;
 
 #define JAI_OSR_MAX 4
+/* Consecutive entry-guard failures on one loop head before it is left to
+ * the interpreter. */
+#define JAI_OSR_GIVE_UP 8
 
 /* Instance-typed slots one compiled loop may pin a class shape on. A (slot,
  * shape) pair list rather than a shape beside every kind: 40 shapes per form
@@ -317,6 +320,12 @@ typedef struct {
     uint8_t   shapeSlot[JAI_OSR_SHAPES];
     uint32_t  shapeId[JAI_OSR_SHAPES];
     uint8_t   shapeCount;
+    /* Consecutive entry-guard failures on THIS head. It was once one counter
+     * for the whole function, and eight failures on any single head switched
+     * back-edge entry off for every compiled loop in it. Which head lost that
+     * race varied per process, so an ORB run came out at either 312 ms or
+     * 570 ms depending on nothing the program did. */
+    uint8_t   declines;
 } JaiOsrForm;
 
 struct ObjFunction {
@@ -422,7 +431,6 @@ struct ObjFunction {
      * After a few in a row the back edge stops trying and the timer tick is
      * the only way back in. */
     bool        osrHot;
-    uint8_t     osrDeclines;
     /* Set once the tier has looked at this function and refused it. Without it
      * every call past the threshold pays a call into jaiJitEnter to be told no
      * again -- 2.6% of `check lib/std`, on a workload the tier does not help at

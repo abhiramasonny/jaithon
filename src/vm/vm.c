@@ -2843,19 +2843,27 @@ static bool safepoint(void) {
         ObjFunction *f = top->closure->fn;
         if (f->osrHot) {
             uint32_t at = (uint32_t)(top->ip - f->chunk.code);
-            bool compiled = false;
+            JaiOsrForm *form = NULL;
             for (unsigned i = 0; i < f->osrCount; i++) {
-                if (f->osrForms[i].top == at) { compiled = true; break; }
+                if (f->osrForms[i].top == at) { form = &f->osrForms[i]; break; }
             }
-            if (compiled) {
+            /* Given up on per HEAD: a guard that keeps failing on one loop
+             * says nothing about the other loops in the same body. */
+            if (form != NULL && form->declines < JAI_OSR_GIVE_UP) {
                 uint32_t resumeAt = 0;
                 int outcome = jaiJitEnterOsr(top->closure, at, &resumeAt);
                 if (outcome == 2) return false;
                 if (outcome == 1) {
                     top->ip = f->chunk.code + resumeAt;
-                    f->osrDeclines = 0;
-                } else if (++f->osrDeclines >= 8) {
-                    f->osrHot = false;
+                    form->declines = 0;
+                } else if (++form->declines >= JAI_OSR_GIVE_UP) {
+                    /* Stop paying the back-edge check only once every head has
+                     * been given up on. */
+                    bool any = false;
+                    for (unsigned i = 0; i < f->osrCount; i++) {
+                        if (f->osrForms[i].declines < JAI_OSR_GIVE_UP) { any = true; break; }
+                    }
+                    f->osrHot = any;
                 }
             }
         }
