@@ -10664,7 +10664,6 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     fn->osrCount++;
     fn->osrHot = true;
-    fn->osrDeclines = 0;
     fn->jitOsrModuleVersion = fn->module != NULL ? fn->module->version : 0;
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
