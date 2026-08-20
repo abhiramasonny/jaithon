@@ -234,7 +234,15 @@ static void *compileLoop(const LoopShape *shape) {
     w[toBailWrite]    = jaiA64BCond(JAI_A64_VS, bailWrite - toBailWrite);
 
     uint8_t *entry = jaiCodeArenaWrite(arena, w, (size_t)n * sizeof w[0]);
-    if (entry == NULL) return NULL;
+    if (entry == NULL) {
+        /* Seal before giving up. The unseal above took the execute bit off
+         * every function already in the arena, and the write fails exactly
+         * when the arena is full -- so returning here without re-sealing
+         * leaves the whole back catalogue unexecutable. See `arenaEmit` in
+         * jit_func.c for what that looked like when it happened. */
+        jaiCodeArenaSeal(arena);
+        return NULL;
+    }
     if (getenv("JAI_JIT_TRACE")) {
         fprintf(stderr, "[jit] loop entry %p (mod 64 = %u)\n", (void *)entry,
                 (unsigned)((uintptr_t)entry & 63u));

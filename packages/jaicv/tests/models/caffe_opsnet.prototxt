@@ -1,0 +1,201 @@
+name: "opsnet"
+input: "data"
+input_shape {
+  dim: 2
+  dim: 4
+  dim: 6
+  dim: 6
+}
+layer {
+  name: "lrn1"
+  type: "LRN"
+  bottom: "data"
+  top: "lrn1"
+  lrn_param {
+    local_size: 3
+    alpha: 0.0002
+    beta: 0.7
+    k: 1.5
+  }
+}
+layer {
+  name: "pavg"
+  type: "Pooling"
+  bottom: "lrn1"
+  top: "pavg"
+  pooling_param {
+    pool: AVE
+    kernel_size: 3
+    stride: 2
+    pad: 1
+  }
+}
+layer {
+  name: "conv_s"
+  type: "Convolution"
+  bottom: "data"
+  top: "conv_s"
+  convolution_param {
+    num_output: 4
+    bias_term: false
+    group: 2
+    kernel_h: 2
+    kernel_w: 2
+  }
+}
+layer {
+  name: "pmax"
+  type: "Pooling"
+  bottom: "conv_s"
+  top: "pmax"
+  pooling_param {
+    pool: MAX
+    kernel_size: 3
+    stride: 3
+    pad: 1
+  }
+}
+layer {
+  name: "deconv"
+  type: "Deconvolution"
+  bottom: "pmax"
+  top: "deconv"
+  convolution_param {
+    num_output: 2
+    kernel_size: 2
+    stride: 2
+  }
+}
+layer {
+  name: "cat"
+  type: "Concat"
+  bottom: "pavg"
+  bottom: "deconv"
+  top: "cat"
+  concat_param {
+    axis: 1
+  }
+}
+layer {
+  name: "sig"
+  type: "Sigmoid"
+  bottom: "cat"
+  top: "sig"
+}
+layer {
+  name: "tan"
+  type: "TanH"
+  bottom: "sig"
+  top: "tan"
+}
+layer {
+  name: "pw"
+  type: "Power"
+  bottom: "tan"
+  top: "pw"
+  power_param {
+    power: 2.0
+    scale: 0.5
+    shift: 0.25
+  }
+}
+layer {
+  name: "drop"
+  type: "Dropout"
+  bottom: "pw"
+  top: "pw"
+  dropout_param {
+    dropout_ratio: 0.4
+  }
+}
+layer {
+  name: "scal"
+  type: "Scale"
+  bottom: "pw"
+  top: "scal"
+  scale_param {
+    bias_term: true
+  }
+}
+layer {
+  name: "bi"
+  type: "Bias"
+  bottom: "scal"
+  top: "bi"
+}
+layer {
+  name: "flat"
+  type: "Flatten"
+  bottom: "bi"
+  top: "flat"
+  flatten_param {
+    axis: 1
+  }
+}
+layer {
+  name: "resh"
+  type: "Reshape"
+  bottom: "bi"
+  top: "resh"
+  reshape_param {
+    shape {
+      dim: 0
+      dim: 6
+      dim: -1
+    }
+  }
+}
+layer {
+  name: "fan"
+  type: "Split"
+  bottom: "flat"
+  top: "fan_a"
+  top: "fan_b"
+}
+layer {
+  name: "elu"
+  type: "ELU"
+  bottom: "fan_a"
+  top: "elu"
+  elu_param {
+    alpha: 0.7
+  }
+}
+layer {
+  name: "absv"
+  type: "AbsVal"
+  bottom: "fan_b"
+  top: "absv"
+}
+layer {
+  name: "bnll"
+  type: "BNLL"
+  bottom: "resh"
+  top: "bnll"
+}
+layer {
+  name: "pre"
+  type: "PReLU"
+  bottom: "tan"
+  top: "pre"
+}
+layer {
+  name: "cut"
+  type: "Slice"
+  bottom: "cat"
+  top: "cut_a"
+  top: "cut_b"
+  slice_param {
+    slice_point: 2
+    axis: 1
+  }
+}
+layer {
+  name: "leaky"
+  type: "ReLU"
+  bottom: "cut_a"
+  top: "leaky"
+  relu_param {
+    negative_slope: 0.125
+  }
+}

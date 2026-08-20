@@ -1,0 +1,85 @@
+name: "eltnet"
+layer {
+  name: "input"
+  type: "Input"
+  top: "a"
+  top: "b"
+  top: "c"
+  input_param {
+    shape {
+      dim: 2
+      dim: 2
+      dim: 3
+      dim: 3
+    }
+    shape {
+      dim: 2
+      dim: 2
+      dim: 3
+      dim: 3
+    }
+    shape {
+      dim: 2
+      dim: 2
+      dim: 3
+      dim: 3
+    }
+  }
+}
+layer {
+  name: "e_sum"
+  type: "Eltwise"
+  bottom: "a"
+  bottom: "b"
+  bottom: "c"
+  top: "e_sum"
+  eltwise_param {
+    operation: SUM
+  }
+}
+layer {
+  name: "e_coeff"
+  type: "Eltwise"
+  bottom: "a"
+  bottom: "b"
+  bottom: "c"
+  top: "e_coeff"
+  eltwise_param {
+    operation: SUM
+    coeff: 1.5
+    coeff: -2.0
+    coeff: 0.25
+  }
+}
+layer {
+  name: "e_prod"
+  type: "Eltwise"
+  bottom: "a"
+  bottom: "b"
+  bottom: "c"
+  top: "e_prod"
+  eltwise_param {
+    operation: PROD
+  }
+}
+layer {
+  name: "e_max"
+  type: "Eltwise"
+  bottom: "a"
+  bottom: "b"
+  bottom: "c"
+  top: "e_max"
+  eltwise_param {
+    operation: MAX
+  }
+}
+layer {
+  name: "e_two"
+  type: "Eltwise"
+  bottom: "a"
+  bottom: "b"
+  top: "e_two"
+  eltwise_param {
+    operation: PROD
+  }
+}
