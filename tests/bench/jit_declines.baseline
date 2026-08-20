@@ -11,6 +11,8 @@ stopped : OP_INVOKE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_JUMP_IF_FALSE
 stopped : OP_LT
+stopped : OP_RETURN
+stopped : OP_RETURN_NULL
 stopped : a builtin whose result kind has not been observed
 stopped : a global of a kind the tier has no slot for
 stopped : a local was given two different kinds

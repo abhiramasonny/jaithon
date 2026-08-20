@@ -9145,7 +9145,14 @@ static bool eligible(ObjFunction *fn) {
      * with no arguments reaches here too and declines on its opcodes. */
     if (fn->arity > JIT_MAX_ARITY) why = "arity";
     else if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > JIT_MAX_SLOTS) why = "maxSlots";
-    else if (fn->defaultCount != 0) why = "defaults";
+    /* Defaults used to make a function categorically ineligible, which ruled
+     * out most library code -- an API designed with optional arguments was
+     * uncompilable by construction. It is safe because every entry already
+     * requires the arguments to have been supplied in full: callClosure and
+     * the one-argument path both test `argc == fn->arity`, and OP_TAIL_CALL
+     * reuses its window only for a callee with no defaults at all. A call that
+     * omits one therefore never reaches compiled code; it fills the defaults
+     * and runs interpreted, exactly as before. */
     else if (fn->flags & (FN_VARIADIC | FN_KWREST)) why = "flags";
 
     else if (fn->module == NULL) why = "no module";
