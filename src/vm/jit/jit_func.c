@@ -9136,6 +9136,36 @@ static void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
     }
 }
 
+/* Writes a body into the arena and seals it again, or seals and reports
+ * failure.
+ *
+ * The sealing is the point. `jaiCodeArenaUnseal` turns the WHOLE arena back to
+ * read-write, which takes the execute bit off every function already compiled
+ * into it -- so an early return between the unseal and the seal leaves the
+ * tier's entire back catalogue unexecutable, and the next call into any of it
+ * dies with KERN_PROTECTION_FAILURE inside `callClosure`. That is not
+ * hypothetical: the write fails exactly when the 1 MB arena is full, which a
+ * long enough run reaches, and it produced an intermittent SIGBUS in the test
+ * suite that moved around as unrelated changes altered how much got compiled.
+ * Every exit from here re-seals. */
+static uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
+                          unsigned count) {
+    while ((arena->used & 31u) != 0) {
+        uint32_t pad = jaiA64Nop();
+        if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) {
+            jaiCodeArenaSeal(arena);
+            return NULL;
+        }
+    }
+    uint8_t *entry = jaiCodeArenaWrite(arena, code, count * sizeof code[0]);
+    if (entry == NULL) {
+        jaiCodeArenaSeal(arena);
+        return NULL;
+    }
+    if (!jaiCodeArenaSeal(arena)) return NULL;
+    return entry;
+}
+
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *dynamic, bool *needDynamic,
                             const bool *nullable, bool *needNullable,
@@ -9808,7 +9838,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * the recursive-call fixups above are relative to the function's own
      * start, which is where the arena is about to place it. */
     if (!jaiCodeArenaUnseal(arena)) return false;
-    /* 32-align the entry, which is two things at once.
+    /* The entry is 32-aligned, which is two things at once.
      *
      * The literal pool's alignment is what it looks, as the 8-align this
      * replaced already gave. And every body now starts at a fixed offset
@@ -9819,13 +9849,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * and matrix_mul +/-18.9% and list_ops +/-15.4% were both observed between
      * binaries with identical dynamic instruction counts. The cost is at most
      * 28 wasted bytes per compiled body in a 1 MB arena. */
-    while ((arena->used & 31u) != 0) {
-        uint32_t pad = jaiA64Nop();
-        if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) return false;
-    }
-    uint8_t *entry = jaiCodeArenaWrite(arena, e.code, e.count * sizeof e.code[0]);
+    uint8_t *entry = arenaEmit(arena, e.code, e.count);
     if (entry == NULL) return false;
-    if (!jaiCodeArenaSeal(arena)) return false;
 
     /* The tier's whole bail protocol rests on partial execution being invisible. Field writes end that:
      * a body that stores to an instance and then bails would have the store applied again by the interpreted re-run. Nothing in the suite hits this, but "hard to construct" isn't the standard a compiled tier gets to work to. */
@@ -10602,13 +10627,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
     if (!jaiCodeArenaUnseal(arena)) return false;
     /* Same 32-alignment as the function tier above, for the same two reasons. */
-    while ((arena->used & 31u) != 0) {
-        uint32_t pad = jaiA64Nop();
-        if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) return false;
-    }
-    uint8_t *entry = jaiCodeArenaWrite(arena, e.code, e.count * sizeof e.code[0]);
+    uint8_t *entry = arenaEmit(arena, e.code, e.count);
     if (entry == NULL) return false;
-    if (!jaiCodeArenaSeal(arena)) return false;
 
     if (fn->osrCount >= JAI_OSR_MAX) return false;
     JaiOsrForm *form = &fn->osrForms[fn->osrCount];

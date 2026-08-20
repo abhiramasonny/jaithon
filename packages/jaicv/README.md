@@ -73,6 +73,17 @@ down next to the tolerance. In short:
   use a generated sampling pattern rather than OpenCV's learned table, so their
   descriptors compare against each other but not against OpenCV's; Farneback
   flow follows the paper rather than OpenCV's tuning.
+- **Runs the same numbers**: `read_net_from_onnx` imports a network exported by
+  PyTorch and `run_graph` reproduces PyTorch's own output. A non-square
+  residual CNN — convolution, batch norm, ReLU, a skip connection, pooling,
+  flatten, a linear layer and softmax on a 9x15 input — agrees to every printed
+  digit. Non-square on purpose: a square test cannot catch an NCHW/OIHW
+  transposition, which is the failure mode an importer actually has.
+  `read_net_from_tensorflow` and `read_net_from_caffe` map onto the same
+  operator vocabulary and the same executor, and `read_torch_state_dict` reads
+  a `.pt` straight — every tensor of a checkpoint, including non-contiguous
+  views, zero-dimensional and empty tensors, and int64, uint8, bool and
+  float64, matches what torch reports.
 - **Exact**: `grab_cut` reproduces OpenCV's segmentation pixel for pixel —
   intersection-over-union 1.0000 and every pixel agreeing, on a flat rectangle
   over noise and on a textured ellipse over noise, at three and at four
@@ -125,7 +136,7 @@ down next to the tolerance. In short:
 | `video` | Lucas-Kanade and Farneback optical flow, MOG2 and KNN background subtraction, mean shift, CamShift, Kalman |
 | `photo` | non-local means denoising, inpainting, edge-preserving smoothing |
 | `ml` | nearest neighbours, naive Bayes, support vector machine, logistic regression, decision trees, random forest, multilayer perceptron |
-| `dnn` | `blob_from_image`, non-maximum suppression, and a `Net` that fronts a jaitensor model |
+| `dnn` | `blob_from_image`, non-maximum suppression, a `Net` that fronts a jaitensor model, a protobuf reader, a graph executor over ~68 ONNX operators, and importers for ONNX, Caffe, TensorFlow frozen graphs and PyTorch checkpoints |
 
 ## What is not here
 
@@ -143,8 +154,8 @@ Named so that nobody has to find out by trying:
   rotations OpenCV does but keeps the cameras' own principal point, where
   OpenCV recomputes one by fitting the largest usable rectangle inside the
   rectified border — the `alpha` parameter, which is not here.
-- **dnn**: reading ONNX or Caffe. A network is built and run in jaitensor;
-  `Net` is the adapter, not a runtime.
+- **dnn**: a pretrained model zoo. The importers below read the files; nobody
+  ships you the weights.
 - **imgproc**: guided filter, superpixels and structured edge detection, which
   are OpenCV's contrib module rather than its core.
 - **videoio**: any container other than AVI, and any codec inside one other

@@ -1,0 +1,123 @@
+name: "extranet"
+input: "data"
+input_shape {
+  dim: 1
+  dim: 4
+  dim: 4
+  dim: 4
+}
+layer {
+  name: "gpool"
+  type: "Pooling"
+  bottom: "data"
+  top: "gpool"
+  pooling_param {
+    pool: AVE
+    global_pooling: true
+  }
+}
+layer {
+  name: "pfloor"
+  type: "Pooling"
+  bottom: "data"
+  top: "pfloor"
+  pooling_param {
+    pool: MAX
+    kernel_size: 3
+    stride: 2
+    round_mode: FLOOR
+  }
+}
+layer {
+  name: "gflat"
+  type: "Reshape"
+  bottom: "gpool"
+  top: "gflat"
+  reshape_param {
+    shape {
+      dim: 1
+      dim: 4
+    }
+  }
+}
+layer {
+  name: "scal2"
+  type: "Scale"
+  bottom: "data"
+  bottom: "gflat"
+  top: "scal2"
+  scale_param {
+    axis: 0
+    bias_term: true
+  }
+}
+layer {
+  name: "flat2"
+  type: "Flatten"
+  bottom: "data"
+  top: "flat2"
+  flatten_param {
+    axis: 1
+    end_axis: 2
+  }
+}
+layer {
+  name: "resh2"
+  type: "Reshape"
+  bottom: "data"
+  top: "resh2"
+  reshape_param {
+    shape {
+      dim: 2
+      dim: 2
+    }
+    axis: 1
+    num_axes: 1
+  }
+}
+layer {
+  name: "ip2"
+  type: "InnerProduct"
+  bottom: "data"
+  top: "ip2"
+  inner_product_param {
+    num_output: 3
+    bias_term: false
+    transpose: true
+  }
+}
+layer {
+  name: "relu_ip"
+  type: "ReLU"
+  bottom: "ip2"
+  top: "ip2"
+}
+layer {
+  name: "ip3"
+  type: "InnerProduct"
+  bottom: "data"
+  top: "ip3"
+  inner_product_param {
+    num_output: 2
+    axis: 2
+  }
+}
+layer {
+  name: "cat2"
+  type: "Concat"
+  bottom: "data"
+  bottom: "scal2"
+  top: "cat2"
+  concat_param {
+    concat_dim: 1
+  }
+}
+layer {
+  name: "pre2"
+  type: "PReLU"
+  bottom: "data"
+  top: "pre2"
+  prelu_param {
+    channel_shared: true
+  }
+}

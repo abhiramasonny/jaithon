@@ -1,0 +1,49 @@
+name: "bnnet"
+input: "data"
+input_dim: 2
+input_dim: 3
+input_dim: 4
+input_dim: 4
+layer {
+  name: "bn1"
+  type: "BatchNorm"
+  bottom: "data"
+  top: "bn1"
+  batch_norm_param {
+    use_global_stats: true
+    eps: 1e-05
+  }
+}
+layer {
+  name: "scale1"
+  type: "Scale"
+  bottom: "bn1"
+  top: "bn1"
+  scale_param {
+    bias_term: true
+  }
+}
+layer {
+  name: "relu1"
+  type: "ReLU"
+  bottom: "bn1"
+  top: "bn1"
+}
+layer {
+  name: "bn2"
+  type: "BatchNorm"
+  bottom: "bn1"
+  top: "bn2"
+  batch_norm_param {
+    eps: 0.001
+  }
+}
+layer {
+  name: "bn3"
+  type: "BatchNorm"
+  bottom: "bn2"
+  top: "bn3"
+  batch_norm_param {
+    eps: 1.0
+  }
+}

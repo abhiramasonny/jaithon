@@ -218,6 +218,12 @@ from .ml.models import SVM_LINEAR, SVM_POLY, SVM_RBF
 
 from .dnn.blob import blob_from_image, blob_from_images, images_from_blob
 from .dnn.blob import net_from, nms_boxes, nms_boxes_batched, Net, Runnable
+from .dnn.graph import run_graph, Attr, Graph, GraphNode
+from .dnn.onnx import read_net_from_onnx, read_net_from_onnx_as_net
+from .dnn.onnx import read_net_from_onnx_bytes, read_onnx_engine
+from .dnn.caffe import read_net_from_caffe, read_net_from_caffe_bytes
+from .dnn.tensorflow import read_net_from_tensorflow, read_net_from_tensorflow_bytes
+from .dnn.torch import read_torch_state_dict, read_torch_state_dict_bytes, TorchTensor
 
 from .core.misc import border_interpolate, calc_covar_matrix, check_range, determinant
 from .core.misc import eigen, extract_channel, find_non_zero, hconcat, insert_channel
@@ -433,6 +439,11 @@ export { SVM_LINEAR, SVM_POLY, SVM_RBF }
 
 export { blob_from_image, blob_from_images, images_from_blob }
 export { net_from, nms_boxes, nms_boxes_batched, Net, Runnable }
+export { run_graph, Attr, Graph, GraphNode }
+export { read_net_from_onnx, read_net_from_onnx_as_net, read_net_from_onnx_bytes }
+export { read_onnx_engine, read_net_from_caffe, read_net_from_caffe_bytes }
+export { read_net_from_tensorflow, read_net_from_tensorflow_bytes }
+export { read_torch_state_dict, read_torch_state_dict_bytes, TorchTensor }
 
 export { border_interpolate, calc_covar_matrix, check_range, determinant, eigen }
 export { extract_channel, find_non_zero, hconcat, insert_channel, mahalanobis }
