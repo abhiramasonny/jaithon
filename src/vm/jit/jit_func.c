@@ -5879,6 +5879,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * the tag guard below says "an object", the sample says which type it was, and every consumer
              * (index, invoke, compare) re-checks Obj.type for itself before it does anything type-specific.
              * Refusing this declined the whole enclosing FUNCTION, which is most object-oriented code. */
+            /* A bool field. Most classes carry one, and without this arm the
+             * whole enclosing function declined -- `_check_live` in jaicv's
+             * cascade is a method whose only field read is a bool, and it cost
+             * 107 ms against 11.8 ms for the byte-identical method over an int
+             * field. The load below is a `ldrb`, because BOOL_VAL writes only
+             * the union's one-byte member. */
+            else if (IS_BOOL(fieldVal)) { kind = SLOT_BOOL; tag = VAL_BOOL; }
             else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
             else return false;
 
@@ -5967,6 +5974,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     unsigned idx = e->valueDepth - 1;
                     emit(e, jaiA64LdrD(fpRegAt(e, idx), recv, base + 8));
                     fpClaim(e, idx);
+                } else if (kind == SLOT_BOOL) {
+                    /* One byte: BOOL_VAL writes only the union's `boolean`
+                     * member, so the seven above it are whatever the field
+                     * held before, and every SLOT_BOOL consumer tests the
+                     * whole register. */
+                    emit(e, jaiA64LdrByte(pushReg(e) - 1, recv, base + 8));
                 } else {
                     emit(e, jaiA64LdrX(pushReg(e) - 1, recv, base + 8));
                 }
@@ -6273,6 +6286,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * rather than declining the enclosing function, and a list earns
              * the stronger kind at the price of an OBJ_LIST check. */
             else if (IS_LIST(fieldVal))     { kind = SLOT_LIST; tag = VAL_OBJ; }
+            /* A bool field. Most classes carry one, and without this arm the
+             * whole enclosing function declined -- `_check_live` in jaicv's
+             * cascade is a method whose only field read is a bool, and it cost
+             * 107 ms against 11.8 ms for the byte-identical method over an int
+             * field. The load below is a `ldrb`, because BOOL_VAL writes only
+             * the union's one-byte member. */
+            else if (IS_BOOL(fieldVal)) { kind = SLOT_BOOL; tag = VAL_BOOL; }
             else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ;  tag = VAL_OBJ; }
             else return false;
 
@@ -6314,6 +6334,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned idx = e->valueDepth - 1;
                 emit(e, jaiA64LdrD(fpRegAt(e, idx), rr, fbase + 8));
                 fpClaim(e, idx);
+            } else if (kind == SLOT_BOOL) {
+                /* One byte, for the reason given at the local-receiver arm. */
+                emit(e, jaiA64LdrByte(pushReg(e) - 1, rr, fbase + 8));
             } else {
                 emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
             }
