@@ -3740,16 +3740,10 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
 /* A call to a global function that has itself compiled. Its return kind types
  * the result; the tag that actually comes back is checked, and a surprise
  * deopts to the instruction after the call, since the call has happened. */
-/* `calleeOverride` names the callee when it is not what sits under the
- * arguments -- a module-qualified call puts the MODULE there and resolves the
- * function from its name, so the entry to drop afterwards holds a register
- * where a plain global call's does not. Everything between is identical, which
- * is why this takes a parameter rather than being copied. */
 static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
-                           uint32_t callOff, uint32_t after,
-                           Value calleeOverride) {
+                           uint32_t callOff, uint32_t after) {
     unsigned cidx = e->depth - argc - 1;
-    Value cv = IS_NULL(calleeOverride) ? e->stackSeen[cidx] : calleeOverride;
+    Value cv = e->stackSeen[cidx];
     if (!IS_CLOSURE(cv)) { e->whyNot = "callee vanished"; return false; }
     ObjFunction *cfn = AS_CLOSURE(cv)->fn;
 
@@ -3804,17 +3798,8 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         unsigned r;
         if (!popValue(e, &r, NULL)) return false;
     }
-    if (e->depth == 0) return false;
-    if (holdsRegister(e->stack[e->depth - 1])) {
-        /* A module receiver occupies a register; dropping it by shortening
-         * the model alone would leave every later entry a register out. */
-        unsigned dropRecv;
-        if (!popValue(e, &dropRecv, NULL)) return false;
-    } else if (e->stack[e->depth - 1] == SLOT_FUNC) {
-        e->depth--;
-    } else {
-        return false;
-    }
+    if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_FUNC) return false;
+    e->depth--;
     if (!pushValue(e, rk, rshape, rcls)) return false;
 
     unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
@@ -6870,38 +6855,6 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
 
-            /* `math.floor(x)` and every other module-qualified call. The
-             * receiver is a module, so the name is resolved against it here
-             * and the call goes out exactly as a plain global call does --
-             * the only difference is that the entry under the arguments holds
-             * a register, which `emitGlobalCall` now accounts for.
-             *
-             * Worth an arm because this is the commonest way ordinary Jaithon
-             * names a function: every `std.*` call in every package went
-             * through it, and declining took the whole enclosing loop with
-             * it. */
-            if (rk == SLOT_OBJ && IS_MODULE(e->stackSeen[ridx])) {
-                if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
-                Value mname = fn->chunk.constants.data[nameIdx];
-                if (!IS_STRING(mname)) return false;
-                Value member;
-                if (!jaiModuleGet(AS_MODULE(e->stackSeen[ridx]),
-                                  AS_STRING(mname), &member)) {
-                    e->whyNot = "a module member the tier cannot see";
-                    return false;
-                }
-                if (!IS_CLOSURE(member)) {
-                    e->whyNot = "a module member that is not a function";
-                    return false;
-                }
-                if (!emitGlobalCall(e, fn, argc, (uint32_t)off,
-                                    (uint32_t)(off + 7), member)) {
-                    return false;
-                }
-                off += 7;
-                break;
-            }
-
             if (rk == SLOT_OBJ) {
                 /* Built-in method on a receiver typed only as "some object" (dict/string/set/tuple). Three things:
                  * WHICH METHOD -- from the observed receiver, like the SLOT_LIST arm below (a builtin is a function of receiver-type + name). THAT IT'S STILL THAT TYPE -- SLOT_OBJ pins nothing (`for x in [d, "s"]` mixes types), so the object type is guarded before anything is consumed; a miss resumes with receiver+args untouched. WHAT COMES BACK -- predicted via InlineCache::resultKind (no per-call-site feedback existed before), and the tag guard after the call is what makes the prediction sound, deopting to the instruction AFTER the call since it already happened. */
@@ -8588,7 +8541,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 if (e->failed) return false;
                 if (!emitGlobalCall(e, fn, argc, (uint32_t)off,
-                                    (uint32_t)(off + 2), NULL_VAL)) return false;
+                                    (uint32_t)(off + 2))) return false;
                 off += 2;
                 break;
             }
@@ -8980,7 +8933,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else if (e->depth >= argc + 1u &&
                        e->stack[e->depth - argc - 1] == SLOT_FUNC) {
                 if (!emitGlobalCall(e, fn, argc, (uint32_t)off,
-                                    (uint32_t)(off + 2), NULL_VAL)) return false;
+                                    (uint32_t)(off + 2))) return false;
             } else {
                 e->whyNot = "tail callee is neither a class nor a compiled function";
                 return false;
