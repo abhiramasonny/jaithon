@@ -569,6 +569,49 @@ bool jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeight, int input
     return false;
 }
 
+/* A whole GRU as one operation.
+ *
+ * The gates are ordered z, r, h, which is the order ONNX writes them in, so
+ * unlike the LSTM nothing has to be permuted. Only the variant that applies
+ * the reset before the recurrent weights is compiled: the other moves the
+ * recurrent bias inside the reset while the input bias stays outside, and this
+ * operation takes a single bias for both. */
+int jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWeight,
+                int bias, int initState, int reverse) {
+    MPSGraphTensor *x = tensorAt(b, source);
+    MPSGraphTensor *r = tensorAt(b, recurrentWeight);
+    MPSGraphTensor *w = tensorAt(b, inputWeight);
+    if (x == nil || r == nil || w == nil) return -1;
+    if (@available(macOS 13.0, *)) {
+        @autoreleasepool {
+            MPSGraph *g = (__bridge MPSGraph *)b->graph;
+            MPSGraphGRUDescriptor *d = [MPSGraphGRUDescriptor descriptor];
+            if (d == nil) return -1;
+            d.reverse = reverse != 0;
+            d.bidirectional = NO;
+            d.training = NO;
+            /* All three left at their defaults, which is what agrees with
+             * onnxruntime on every case the oracle records. `flipZ` in
+             * particular reads from its documentation as though ONNX would
+             * want it on; it does not, and the tests are the authority. */
+            d.resetGateFirst = NO;
+            d.resetAfter = NO;
+            d.flipZ = NO;
+            NSArray<MPSGraphTensor *> *made =
+                [g GRUWithSourceTensor:x
+                       recurrentWeight:r
+                           inputWeight:w
+                                  bias:tensorAt(b, bias)
+                             initState:tensorAt(b, initState)
+                            descriptor:d
+                                  name:nil];
+            if (made == nil || made.count < 1) return -1;
+            return record(b, made[0]);
+        }
+    }
+    return -1;
+}
+
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                               const int *outputs, int outputCount) {
     if (b == NULL || inputs == NULL || outputs == NULL) return NULL;

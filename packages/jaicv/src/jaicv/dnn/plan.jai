@@ -616,6 +616,8 @@ fn emit(state: Build, node: GraphNode) -> bool {
 
     if node.op == "LSTM" { return emit_lstm(state, node) }
 
+    if node.op == "GRU" { return emit_gru(state, node) }
+
     if node.op == "MatMul" {
         #: Only the shapes that line up without broadcasting, and for the same
         #: reason as `Gemm`: a mismatch here is fatal rather than refusable.
@@ -833,6 +835,73 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
             [1, 1, 1]
         )
         state.ids[node.outputs[2]] = __prim__.graph_reshape(b, cut, [1, batch, hidden])
+    }
+    return true
+}
+
+#: ONNX `GRU` as the platform's single operation.
+#:
+#: Only the default reset variant: with `linear_before_reset` the recurrent
+#: bias moves inside the reset gate while the input bias stays outside, and the
+#: operation takes one bias for both. The interpreter has that case.
+fn emit_gru(state: Build, node: GraphNode) -> bool {
+    let b = state.builder
+    if node.outputs.len() == 0 { return false }
+    if attr_str(node, "direction", "forward") != "forward" { return false }
+    if node.attrs.get("activations", null) is not null { return false }
+    if node.attrs.get("clip", null) is not null { return false }
+    if attr_int(node, "layout", 0) != 0 { return false }
+    if attr_int(node, "linear_before_reset", 0) != 0 { return false }
+    if node.inputs.len() > 4 and node.inputs[4].len() > 0 { return false }
+
+    let x = state.shape_of(node.inputs[0])
+    if x is null or x.len() != 3 { return false }
+    let steps = x[0]
+    let batch = x[1]
+    let w_shape = state.shape_of(node.inputs[1])
+    let r_shape = state.shape_of(node.inputs[2])
+    if w_shape is null or r_shape is null { return false }
+    if w_shape.len() != 3 or r_shape.len() != 3 { return false }
+    let hidden = r_shape[2]
+    if w_shape[1] != 3 * hidden { return false }
+
+    #: One direction, so the leading axis is dropped rather than sliced.
+    let w = __prim__.graph_reshape(b, state.id_of(node.inputs[1]), [3 * hidden, w_shape[2]])
+    let r = __prim__.graph_reshape(b, state.id_of(node.inputs[2]), [3 * hidden, hidden])
+
+    var bias = -1
+    if node.inputs.len() > 3 and node.inputs[3].len() > 0 {
+        let given = state.numbers_of(node.inputs[3])
+        if given is null { return false }
+        #: Both biases land outside the reset in this variant, so their sum is
+        #: the single bias the operation takes.
+        var summed = __prim__.list_filled(3 * hidden, 0.0)
+        for index in 0..3 * hidden { summed[index] = given[index] + given[3 * hidden + index] }
+        bias = __prim__.graph_constant(b, summed, [3 * hidden])
+    }
+    var start = -1
+    if node.inputs.len() > 5 and node.inputs[5].len() > 0 {
+        start = __prim__.graph_reshape(b, state.id_of(node.inputs[5]), [batch, hidden])
+    }
+
+    let all_state = __prim__.graph_gru(b, state.id_of(node.inputs[0]), r, w, bias, start, 0)
+    if all_state < 0 { return false }
+    if node.outputs[0].len() > 0 {
+        state.ids[node.outputs[0]] = __prim__.graph_reshape(
+            b,
+            all_state,
+            [steps, 1, batch, hidden]
+        )
+    }
+    if node.outputs.len() > 1 and node.outputs[1].len() > 0 {
+        let cut = __prim__.graph_slice(
+            b,
+            all_state,
+            [steps - 1, 0, 0],
+            [steps, batch, hidden],
+            [1, 1, 1]
+        )
+        state.ids[node.outputs[1]] = __prim__.graph_reshape(b, cut, [1, batch, hidden])
     }
     return true
 }
