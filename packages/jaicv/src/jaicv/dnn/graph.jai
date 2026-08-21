@@ -858,7 +858,13 @@ pub class GraphNode {
 
 #: A whole network: the nodes, the names fed in, the names read out, and the
 #: weights that came with the file.
+#: Numbers the graphs, so that a compiled form can be kept for one without
+#: holding a reference that would keep it alive.
+var _next_graph_id = 0
+
 pub class Graph {
+    #: This graph's own number, stable for its lifetime.
+    pub let id: int
     pub var nodes: list[GraphNode]
     pub var inputs: list[str]
     pub var outputs: list[str]
@@ -872,6 +878,8 @@ pub class Graph {
         outputs: list[str] = [],
         initializers: dict[str, Tensor] = {}
     ) {
+        _next_graph_id += 1
+        self.id = _next_graph_id
         self.nodes = [node for node in nodes]
         self.inputs = [name for name in inputs]
         self.outputs = [name for name in outputs]
