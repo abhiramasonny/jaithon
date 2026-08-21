@@ -743,7 +743,8 @@ fn emit(state: Build, node: GraphNode) -> bool {
     if node.op == "Resize" or node.op == "Upsample" {
         let want = state.shape_of(out)
         if want is null or want.len() != 4 { return false }
-        if attr_str(node, "mode", "nearest") != "nearest" { return false }
+        let sampling = attr_str(node, "mode", "nearest")
+        if sampling != "nearest" and sampling != "linear" { return false }
         #: Only the coordinate rules that map exactly are compiled. Half-pixel
         #: sampling is left to the interpreter rather than approximated, since
         #: being one pixel out is the kind of difference that survives a test
@@ -756,19 +757,22 @@ fn emit(state: Build, node: GraphNode) -> bool {
             corners = 0
         } elif placing == "align_corners" {
             corners = 1
+        } elif placing == "half_pixel" {
+            center = 1
         } else {
             return false
         }
         let rounding = ROUNDING_CODES.get(attr_str(node, "nearest_mode", "round_prefer_floor"), -1)
-        if rounding < 0 { return false }
-        state.ids[out] = __prim__.graph_resize_nearest(
+        if rounding < 0 and sampling == "nearest" { return false }
+        state.ids[out] = __prim__.graph_resize(
             b,
             state.id_of(node.inputs[0]),
             want[2],
             want[3],
-            rounding,
+            max(rounding, 0),
             center,
-            corners
+            corners,
+            if sampling == "linear" { 1 } else { 0 }
         )
         return true
     }

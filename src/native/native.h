@@ -175,8 +175,8 @@ int              jaiGraphArgExtreme(JaiGraphBuilder *b, int x, int axis, int lar
 int              jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis);
 /* `rounding` is 0 round-prefer-ceil, 1 round-prefer-floor, 2 ceil, 3 floor;
  * `center` and `corners` say how the source coordinate is derived. */
-int              jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
-                                       int rounding, int center, int corners);
+int              jaiGraphResize(JaiGraphBuilder *b, int x, int height, int width,
+                                int rounding, int center, int corners, int bilinear);
 int              jaiGraphGather(JaiGraphBuilder *b, int data, int indices, int axis);
 int              jaiGraphMatmul(JaiGraphBuilder *b, int left, int right);
 /* `kind` 0 sum, 1 mean, 2 maximum, 3 minimum. */

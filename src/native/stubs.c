@@ -660,8 +660,8 @@ int jaiGraphArgExtreme(JaiGraphBuilder *b, int x, int axis, int largest) {
     (void)b; (void)x; (void)axis; (void)largest; return -1;
 }
 int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) { (void)b; (void)x; (void)axis; return -1; }
-int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int h, int w, int r, int c, int a) {
-    (void)b; (void)x; (void)h; (void)w; (void)r; (void)c; (void)a; return -1;
+int jaiGraphResize(JaiGraphBuilder *b, int x, int h, int w, int r, int c, int a, int bi) {
+    (void)b; (void)x; (void)h; (void)w; (void)r; (void)c; (void)a; (void)bi; return -1;
 }
 int jaiGraphGather(JaiGraphBuilder *b, int d, int i, int axis) {
     (void)b; (void)d; (void)i; (void)axis; return -1;

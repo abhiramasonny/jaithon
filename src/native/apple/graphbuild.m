@@ -518,12 +518,13 @@ int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) {
  * source coordinate is derived, which is what ONNX calls the coordinate
  * transformation mode. The caller maps its own spelling onto these and
  * refuses what it cannot map, because guessing here would be a silent
- * difference of one pixel rather than an error. */
-int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
-                          int rounding, int center, int corners) {
+ * difference of one pixel rather than an error. `bilinear` picks between
+ * the two samplings, and `rounding` means nothing for the smooth one. */
+int jaiGraphResize(JaiGraphBuilder *b, int x, int height, int width,
+                   int rounding, int center, int corners, int bilinear) {
     MPSGraphTensor *in = tensorAt(b, x);
     if (in == nil || height <= 0 || width <= 0) return -1;
-    if (rounding < 0 || rounding > 3) return -1;
+    if (!bilinear && (rounding < 0 || rounding > 3)) return -1;
     @autoreleasepool {
         MPSGraph *g = (__bridge MPSGraph *)b->graph;
         if (@available(macOS 13.0, *)) {
@@ -533,6 +534,14 @@ int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
             MPSGraphTensor *size = [g constantWithData:data
                                                  shape:@[ @2 ]
                                               dataType:MPSDataTypeInt32];
+            if (bilinear) {
+                return record(b, [g resizeBilinearWithTensor:in
+                                                  sizeTensor:size
+                                                centerResult:center != 0
+                                                alignCorners:corners != 0
+                                                      layout:MPSGraphTensorNamedDataLayoutNCHW
+                                                        name:nil]);
+            }
             return record(b, [g resizeNearestWithTensor:in
                                              sizeTensor:size
                                     nearestRoundingMode:(MPSGraphResizeNearestRoundingMode)rounding
