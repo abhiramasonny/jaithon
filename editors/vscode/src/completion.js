@@ -12,7 +12,7 @@ const path = require('path');
 const tool = require('./tool');
 const builtins = require('./builtins');
 const { baseTypeName, moduleOfType } = require('./analysis');
-const { byteOffsetAt } = require('./navigation');
+const { byteOffsetAt, scopeIdAt } = require('./navigation');
 
 const ITEM_KIND = {
     function: vscode.CompletionItemKind.Function,
@@ -202,9 +202,19 @@ function receiverType(analysis, lineNumber, lineText, dotColumn) {
     const startByte = byteOffsetAt(analysis, new vscode.Position(lineNumber, start));
     const dotByte = byteOffsetAt(analysis, new vscode.Position(lineNumber, dotColumn));
 
-    return analysis.types.get(`${startByte}:${dotByte}`)
-        || analysis.narrowestType(Math.max(startByte, dotByte - 1))?.type
-        || null;
+    const checked = analysis.types.get(`${startByte}:${dotByte}`)
+        || analysis.narrowestType(Math.max(startByte, dotByte - 1))?.type;
+    if (checked) return checked;
+
+    // No checker type is ever available yet (no --dump-sema equivalent). A
+    // bare identifier naming an import still resolves syntactically: it IS
+    // its module, no inference needed.
+    const identifier = lineText.slice(start, dotColumn);
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+        const symbol = analysis.lookup(identifier, scopeIdAt(analysis, startByte));
+        if (symbol?.kind === 'module') return `module ${symbol.modulePath}`;
+    }
+    return null;
 }
 
 async function memberCompletions(workspace, analysis, line, position, dotColumn, token) {
@@ -411,15 +421,6 @@ function signatureHelpProvider(workspace) {
             return help;
         },
     };
-}
-
-function scopeIdAt(analysis, offset) {
-    let best = analysis.moduleScope;
-    for (const scope of analysis.scopes) {
-        if (offset < scope.start || offset > scope.end) continue;
-        if (analysis.scopes[best].start <= scope.start) best = scope.id;
-    }
-    return best;
 }
 
 // ---------------------------------------------------------------------------

@@ -512,6 +512,11 @@ class FileAnalysis {
 
             case 'AST_FROM_IMPORT': {
                 const record = { path: node.path, node, symbol: null, items: [] };
+                // A top-level `from` import is an unconditional re-export in
+                // Jaithon (spec: ModuleSig.reexports, lib/jaithon/compile/check/modsig.jai)
+                // -- there is no `pub from` syntax to opt in with. One nested
+                // in a function or class body is just a local import.
+                const reexported = scopeId === this.moduleScope;
                 for (const item of node.items || []) {
                     const ispan = this.span(item);
                     const bound = item.alias || item.name;
@@ -525,6 +530,7 @@ class FileAnalysis {
                         doc: null, scope: scopeId, container: container ?? null,
                         modulePath: node.path, importedName: item.name,
                         aliased: Boolean(item.alias),
+                        visibility: reexported ? 'pub' : null,
                     });
                     record.items.push(symbol.index);
 
@@ -637,10 +643,20 @@ class FileAnalysis {
                 case 'AST_MEMBER': case 'AST_OPT_MEMBER': {
                     const objectSpan = this.span(child.object);
                     const nameLength = Buffer.byteLength(child.name || '', 'utf8');
+                    // No checker type is ever available (Workspace.run: there
+                    // is no --dump-sema equivalent yet), but `x.y` where `x` is
+                    // a bare `import x as name` still has a syntactically known
+                    // receiver -- the import symbol names its own module
+                    // directly, no inference needed.
+                    let receiver = this.typeAt(objectSpan.start, objectSpan.end);
+                    if (!receiver && child.object?.kind === 'AST_IDENT') {
+                        const bound = this.lookup(child.object.name, scopeFor(objectSpan.start));
+                        if (bound?.kind === 'module') receiver = `module ${bound.modulePath}`;
+                    }
                     this.refs.push({
                         name: child.name, start: end - nameLength, end, kind: 'member',
                         scope: scopeFor(start), node: child,
-                        receiver: this.typeAt(objectSpan.start, objectSpan.end),
+                        receiver,
                     });
                     break;
                 }
