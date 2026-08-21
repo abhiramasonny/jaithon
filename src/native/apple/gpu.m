@@ -689,6 +689,9 @@ bool jaiGpuMixedPrecision(void) {
  * `JAITHON_GPU_POOL=0` turns it off, and `JAITHON_GPU_POISON=1` fills every
  * recycled buffer with a signalling NaN, so anything that quietly relied on a
  * fresh allocation arriving zeroed fails loudly instead of occasionally. */
+/* MPS rejects a user buffer below its own alignment quantum. */
+#define JAI_GPU_MIN_BYTES 256
+
 #define JAI_POOL_MAX_ENTRIES 512
 #define JAI_POOL_MAX_BYTES   (1536u * 1024u * 1024u)
 
@@ -795,7 +798,13 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
             }
         }
         if (buffer == nil) {
-            buffer = [gDevice newBufferWithLength:bytes
+            /* Never smaller than MPS's own minimum. Several of its primitives
+             * refuse a user buffer under a quantum of theirs, and a tensor of
+             * four floats is a real thing to ask for; the allocation is
+             * rounded up while `bytes` stays the size that was asked for, so
+             * every bounds check still measures the real extent. */
+            const size_t least = bytes < JAI_GPU_MIN_BYTES ? JAI_GPU_MIN_BYTES : bytes;
+            buffer = [gDevice newBufferWithLength:least
                                           options:MTLResourceStorageModeShared];
         }
         if (buffer == nil) return NULL;

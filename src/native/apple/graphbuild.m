@@ -182,11 +182,18 @@ int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) {
                 break;
             }
             case 15: out = [g truncateWithTensor:in name:nil]; break;
-            /* A cast to boolean, which ONNX writes as one and zero. */
-            case 16: out = [g notEqualWithPrimaryTensor:in
-                                       secondaryTensor:[g constantWithScalar:0.0
-                                                                    dataType:in.dataType]
-                                                  name:nil]; break;
+            /* A cast to boolean, which ONNX writes as one and zero. The
+             * comparison yields a boolean tensor, and every tensor that
+             * leaves here is float, so it is cast back. */
+            case 16: {
+                MPSGraphTensor *flag =
+                    [g notEqualWithPrimaryTensor:in
+                                 secondaryTensor:[g constantWithScalar:0.0
+                                                              dataType:in.dataType]
+                                            name:nil];
+                out = [g castTensor:flag toType:MPSDataTypeFloat32 name:nil];
+                break;
+            }
             default: return -1;
         }
         return record(b, out);
@@ -260,7 +267,8 @@ int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
 }
 
 /* `p` is kernel y, kernel x, stride y, stride x, pad top, pad bottom,
- * pad left, pad right. `kind` 0 is maximum, 1 is average. */
+ * pad left, pad right, ceil mode, and whether the padding counts toward an
+ * average. `kind` 0 is maximum, 1 is average. */
 int jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind) {
     MPSGraphTensor *in = tensorAt(b, x);
     if (in == nil || p == NULL) return -1;
@@ -280,6 +288,12 @@ int jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind) {
                                                         paddingStyle:MPSGraphPaddingStyleExplicit
                                                           dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
         if (d == nil) return -1;
+        if (@available(macOS 12.0, *)) {
+            d.ceilMode = p[8] != 0;
+            d.includeZeroPadToAverage = p[9] != 0;
+        } else if (p[8] != 0) {
+            return -1;
+        }
         MPSGraphTensor *out = kind == 0
             ? [g maxPooling2DWithSourceTensor:in descriptor:d name:nil]
             : [g avgPooling2DWithSourceTensor:in descriptor:d name:nil];

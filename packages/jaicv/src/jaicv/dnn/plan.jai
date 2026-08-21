@@ -294,7 +294,18 @@ fn emit(state: Build, node: GraphNode) -> bool {
         state.ids[out] = __prim__.graph_pool(
             b,
             state.id_of(node.inputs[0]),
-            [window[0], window[1], strides[0], strides[1], pads[0], pads[2], pads[1], pads[3]],
+            [
+                window[0],
+                window[1],
+                strides[0],
+                strides[1],
+                pads[0],
+                pads[2],
+                pads[1],
+                pads[3],
+                attr_int(node, "ceil_mode", 0),
+                attr_int(node, "count_include_pad", 0),
+            ],
             if node.op == "MaxPool" { 0 } else { 1 }
         )
         return true
@@ -423,6 +434,16 @@ fn emit(state: Build, node: GraphNode) -> bool {
     }
 
     if node.op == "Gemm" {
+        #: Checked before it is built, because MPS stops the process on a
+        #: matrix product whose inner dimensions disagree rather than
+        #: refusing it -- so anything not certain to line up is left to the
+        #: interpreter.
+        let a = state.shape_of(node.inputs[0])
+        let w = state.shape_of(node.inputs[1])
+        if a is null or w is null or a.len() != 2 or w.len() != 2 { return false }
+        let inner_a = if attr_int(node, "transA", 0) != 0 { a[0] } else { a[1] }
+        let inner_b = if attr_int(node, "transB", 0) != 0 { w[1] } else { w[0] }
+        if inner_a != inner_b { return false }
         let c = if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
             state.id_of(node.inputs[2])
         } else {
@@ -488,6 +509,36 @@ fn emit(state: Build, node: GraphNode) -> bool {
     }
 
     if node.op == "MatMul" {
+        #: Only the shapes that line up without broadcasting, and for the same
+        #: reason as `Gemm`: a mismatch here is fatal rather than refusable.
+        let a = state.shape_of(node.inputs[0])
+        let w = state.shape_of(node.inputs[1])
+        let want = state.shape_of(out)
+        if a is null or w is null or want is null { return false }
+        if a.len() < 2 or w.len() < 2 { return false }
+        if a[a.len() - 1] != w[w.len() - 2] { return false }
+
+        #: A matrix applied across leading dimensions -- which is what a
+        #: linear layer over a batch of tokens is -- is flattened into one
+        #: product and shaped back. Doing it here rather than relying on the
+        #: framework to broadcast keeps it to the one case that is certainly
+        #: right.
+        if w.len() == 2 and a.len() > 2 {
+            var rows = 1
+            for axis in 0..a.len() - 1 { rows *= a[axis] }
+            let flat = __prim__.graph_reshape(
+                b,
+                state.id_of(node.inputs[0]),
+                [rows, a[a.len() - 1]]
+            )
+            let product = __prim__.graph_matmul(b, flat, state.id_of(node.inputs[1]))
+            state.ids[out] = __prim__.graph_reshape(b, product, dims_of(want))
+            return true
+        }
+        if w.len() != a.len() { return false }
+        for axis in 0..a.len() - 2 {
+            if a[axis] != w[axis] { return false }
+        }
         state.ids[out] = __prim__.graph_matmul(
             b,
             state.id_of(node.inputs[0]),
@@ -751,7 +802,15 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
 
     var out_shapes: list[list[int]] = []
     for index in 0..graph.outputs.len() {
-        out_shapes.push(__prim__.graph_plan_output_shape(plan, index))
+        let shape = __prim__.graph_plan_output_shape(plan, index)
+        #: A shape the compiler could not settle, or a scalar -- there is no
+        #: rank-zero tensor here to receive one. Either way the interpreter
+        #: should have this graph.
+        if shape.len() == 0 {
+            __prim__.graph_plan_free(plan)
+            return null
+        }
+        out_shapes.push(shape)
     }
     var in_shapes: list[list[int]] = []
     for name in graph.inputs {
