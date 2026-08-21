@@ -1344,7 +1344,7 @@ fn host_ints(input: Tensor) -> list[int] {
     return values
 }
 
-fn normalize_axis(axis: int, rank: int, what: str) -> int {
+pub fn normalize_axis(axis: int, rank: int, what: str) -> int {
     let resolved = if axis < 0 { rank + axis } else { axis }
     if resolved < 0 or resolved >= rank {
         throw ValueError(f"{what} names axis {axis}, which is outside rank {rank}")
@@ -1352,7 +1352,7 @@ fn normalize_axis(axis: int, rank: int, what: str) -> int {
     return resolved
 }
 
-fn attr_int(node: GraphNode, name: str, fallback: int) -> int {
+pub fn attr_int(node: GraphNode, name: str, fallback: int) -> int {
     let found = node.attrs.get(name, null)
     if found is null { return fallback }
     if found.kind != "int" {
@@ -1371,7 +1371,7 @@ fn attr_float(node: GraphNode, name: str, fallback: float) -> float {
     return found.f
 }
 
-fn attr_str(node: GraphNode, name: str, fallback: str) -> str {
+pub fn attr_str(node: GraphNode, name: str, fallback: str) -> str {
     let found = node.attrs.get(name, null)
     if found is null { return fallback }
     if found.kind != "str" {
@@ -1380,7 +1380,7 @@ fn attr_str(node: GraphNode, name: str, fallback: str) -> str {
     return found.s
 }
 
-fn attr_ints(node: GraphNode, name: str, fallback: list[int]) -> list[int] {
+pub fn attr_ints(node: GraphNode, name: str, fallback: list[int]) -> list[int] {
     let found = node.attrs.get(name, null)
     if found is null { return fallback }
     if found.kind != "ints" {
@@ -3350,7 +3350,17 @@ pub fn implemented_operators() -> list[str] {
 #: Raises `ValueError` naming the node for an operator that is not
 #: implemented, for a missing feed, and for every shape the operators
 #: themselves refuse.
-pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
+pub fn run_graph(
+    graph: Graph,
+    feeds: dict[str, Tensor],
+    shapes: dict[str, list[int]]? = null,
+    capture: dict[str, list[float]]? = null
+) -> dict[str, Tensor] {
+    #: `shapes` and `capture`, when given, are filled with every value's shape
+    #: and with the values of the names already present in `capture`. That is
+    #: what the plan compiler needs to know before it can build a graph: what
+    #: shape everything is, and what the shape arithmetic worked out to. It
+    #: costs two dictionary writes a node and is null on every other path.
     if graph.outputs.len() == 0 {
         throw ValueError("this graph names no outputs, so there is nothing to run it for")
     }
@@ -3359,6 +3369,9 @@ pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
     var mine: dict[str, bool] = {}
     for (name, weight) in graph.initializers.items() { values[name] = weight }
     for (name, fed) in feeds.items() { values[name] = fed }
+    if shapes is not null {
+        for (name, held) in values.items() { shapes[name] = held.shape }
+    }
     for name in graph.inputs {
         if values.get(name, null) is null {
             throw ValueError(f"the graph input {name} was not fed")
@@ -3435,6 +3448,10 @@ pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
                 }
                 values[name] = tensor
                 mine[name] = true
+                if shapes is not null { shapes[name] = tensor.shape }
+                if capture is not null and capture.get(name, null) is not null {
+                    capture[name] = tensor.download()
+                }
             }
             for (slot, name) in node.inputs.enumerate() {
                 if not owned_input[slot] or last_read.get(name, -1) != index { continue }

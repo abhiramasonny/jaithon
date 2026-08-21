@@ -238,6 +238,15 @@ int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
                                                           name:nil];
         MPSGraphTensor *shift = tensorAt(b, bias);
         if (shift != nil) {
+            /* A convolution's bias is one value a channel, and the channel is
+             * the second axis -- so it is widened to `[1, C, 1, 1]` rather
+             * than left rank one, which would try to line up with the width
+             * and not broadcast at all. */
+            if (shift.shape.count == 1) {
+                shift = [g reshapeTensor:shift
+                               withShape:@[ @1, shift.shape[0], @1, @1 ]
+                                    name:nil];
+            }
             out = [g additionWithPrimaryTensor:out secondaryTensor:shift name:nil];
         }
         return record(b, out);
@@ -333,19 +342,33 @@ int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) {
     }
 }
 
-int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width) {
+/* `rounding` is MPSGraph's own enumeration: 0 round-prefer-ceil, 1
+ * round-prefer-floor, 2 ceil, 3 floor. `center` and `corners` are how the
+ * source coordinate is derived, which is what ONNX calls the coordinate
+ * transformation mode. The caller maps its own spelling onto these and
+ * refuses what it cannot map, because guessing here would be a silent
+ * difference of one pixel rather than an error. */
+int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
+                          int rounding, int center, int corners) {
     MPSGraphTensor *in = tensorAt(b, x);
     if (in == nil || height <= 0 || width <= 0) return -1;
+    if (rounding < 0 || rounding > 3) return -1;
     @autoreleasepool {
         MPSGraph *g = (__bridge MPSGraph *)b->graph;
-        if (@available(macOS 12.0, *)) {
-            return record(b, [g resizeTensor:in
-                                       size:@[ @(height), @(width) ]
-                                       mode:MPSGraphResizeNearest
-                               centerResult:NO
-                               alignCorners:NO
-                                     layout:MPSGraphTensorNamedDataLayoutNCHW
-                                       name:nil]);
+        if (@available(macOS 13.0, *)) {
+            const int32_t wanted[2] = {(int32_t)height, (int32_t)width};
+            NSData *data = [NSData dataWithBytes:wanted length:sizeof(wanted)];
+            [(__bridge NSMutableArray *)b->held addObject:data];
+            MPSGraphTensor *size = [g constantWithData:data
+                                                 shape:@[ @2 ]
+                                              dataType:MPSDataTypeInt32];
+            return record(b, [g resizeNearestWithTensor:in
+                                             sizeTensor:size
+                                    nearestRoundingMode:(MPSGraphResizeNearestRoundingMode)rounding
+                                           centerResult:center != 0
+                                           alignCorners:corners != 0
+                                                 layout:MPSGraphTensorNamedDataLayoutNCHW
+                                                   name:nil]);
         }
         return -1;
     }

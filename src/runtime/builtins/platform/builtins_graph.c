@@ -294,12 +294,16 @@ static bool nGraphSoftmax(int argc, Value *args, Value *out) {
 static bool nGraphResize(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
-    int64_t x, height, width;
+    int64_t x, height, width, rounding, center, corners;
     if (!requireBuilder(args[0], 1, "graph_resize_nearest", &builder)) return false;
     if (!jaiArgInt(args[1], 2, "graph_resize_nearest", &x)) return false;
     if (!jaiArgInt(args[2], 3, "graph_resize_nearest", &height)) return false;
     if (!jaiArgInt(args[3], 4, "graph_resize_nearest", &width)) return false;
-    *out = INT_VAL(jaiGraphResizeNearest(builder, (int)x, (int)height, (int)width));
+    if (!jaiArgInt(args[4], 5, "graph_resize_nearest", &rounding)) return false;
+    if (!jaiArgInt(args[5], 6, "graph_resize_nearest", &center)) return false;
+    if (!jaiArgInt(args[6], 7, "graph_resize_nearest", &corners)) return false;
+    *out = INT_VAL(jaiGraphResizeNearest(builder, (int)x, (int)height, (int)width,
+                                         (int)rounding, (int)center, (int)corners));
     return true;
 }
 
@@ -480,7 +484,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_transpose",      nGraphTranspose,      3, 3);
     jaiDefineNative("__prim__.graph_slice",          nGraphSlice,          5, 5);
     jaiDefineNative("__prim__.graph_softmax",        nGraphSoftmax,        3, 3);
-    jaiDefineNative("__prim__.graph_resize_nearest", nGraphResize,         4, 4);
+    jaiDefineNative("__prim__.graph_resize_nearest", nGraphResize,         7, 7);
     jaiDefineNative("__prim__.graph_matmul",         nGraphMatmul,         3, 3);
     jaiDefineNative("__prim__.graph_reduce",         nGraphReduce,         4, 4);
     jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);

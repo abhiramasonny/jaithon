@@ -160,7 +160,10 @@ int              jaiGraphTranspose(JaiGraphBuilder *b, int x, const int32_t *per
 int              jaiGraphSlice(JaiGraphBuilder *b, int x, const int32_t *starts,
                                const int32_t *ends, const int32_t *steps, int rank);
 int              jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis);
-int              jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width);
+/* `rounding` is 0 round-prefer-ceil, 1 round-prefer-floor, 2 ceil, 3 floor;
+ * `center` and `corners` say how the source coordinate is derived. */
+int              jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
+                                       int rounding, int center, int corners);
 int              jaiGraphMatmul(JaiGraphBuilder *b, int left, int right);
 /* `kind` 0 sum, 1 mean, 2 maximum, 3 minimum. */
 int              jaiGraphReduce(JaiGraphBuilder *b, int x, const int32_t *axes,
