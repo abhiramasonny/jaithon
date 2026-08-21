@@ -80,9 +80,10 @@ static bool bytesToList(int argc, Value *args, Value *out) {
     ObjBytes *b;
     if (!bytesReceiver(argc, args, "to_list", &b)) return false;
     ObjList *list = jaiListNew(jaiStrCapacityFor(b->length));
-    jaiGCPushRoot(OBJ_VAL(list));
-    for (uint32_t i = 0; i < b->length; i++) jaiListPush(list, INT_VAL(b->data[i]));
-    jaiGCPopRoot();
+    if (list == NULL || !jaiListReserveExact(list, (int)b->length)) return false;
+    for (uint32_t i = 0; i < b->length; i++) list->items[i] = INT_VAL(b->data[i]);
+    list->count = (int)b->length;
+    list->version++;
     *out = OBJ_VAL(list);
     return true;
 }

@@ -185,6 +185,14 @@ Value    jaiListPop(ObjList *list);
 void     jaiListInsert(ObjList *list, int index, Value v);
 Value    jaiListRemove(ObjList *list, int index);
 void     jaiListReserve(ObjList *list, int capacity);
+/* Room for exactly `count` elements, ready to be written through `items`.
+ *
+ * The alternative is pushing them one at a time, which re-checks capacity per
+ * element; over the millions a downloaded image or tensor runs to, that check
+ * is most of the cost. False means the reserve did not fit, and the caller
+ * should give up rather than write past the end. Roots the list across the
+ * reserve, since growing the backing array can collect. */
+bool     jaiListReserveExact(ObjList *list, int count);
 /* Records a mutation the list functions above did not perform: an in-place
  * store through `items`, a sort, or a direct write to `count`. Any such site
  * on a list the program can already reach must call this, or a live iterator

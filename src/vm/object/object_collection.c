@@ -80,6 +80,15 @@ void jaiListReserve(ObjList *list, int capacity) {
     list->capacity = capacity;
 }
 
+bool jaiListReserveExact(ObjList *list, int count) {
+    if (count < 0) return false;
+    if (count == 0) return true;
+    jaiGCPushRoot(OBJ_VAL(list));
+    jaiListReserve(list, count);
+    jaiGCPopRoot();
+    return list->capacity >= count;
+}
+
 /* Grows to hold one more item, keeping `pending` (the value about to be
  * stored, which may be the only reference to a fresh object) alive. */
 static bool listGrowFor(ObjList *list, Value pending) {
