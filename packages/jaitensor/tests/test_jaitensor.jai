@@ -2202,3 +2202,35 @@ fn test_wide_flash_attention_matches_per_head_sdpa() -> void {
     defer { looped.free() }
     assert_values_near(fused.download(), looped.download(), 2e-3)
 }
+
+#: `amax` is the companion to `argmax`: where `argmax` says which element of a
+#: row is largest, `amax` says what it is. A detector wants both, and working
+#: the value out on the host afterwards means downloading everything the
+#: reduction was there to avoid.
+fn test_amax_reduces_the_last_axis_and_the_whole_tensor() -> void {
+    if not jt.is_available() { return }
+    let values = [3.0, -1.0, 2.5, 0.0, -4.0, -0.5, 7.25, 1.0, 6.0, 6.0, -2.0, 5.5]
+    let x = Tensor([3, 4], values)
+    let along = jt.amax(x, axis: -1).download()
+    assert_eq(along.len(), 3)
+    assert_near(along[0], 3.0, 1e-6)
+    assert_near(along[1], 7.25, 1e-6)
+    assert_near(along[2], 6.0, 1e-6)
+
+    #: A tie keeps the first, the same rule `argmax` follows.
+    let where = jt.argmax(x).download()
+    assert_eq(int(where[2]), 0)
+
+    let whole = jt.amax(x).download()
+    assert_eq(whole.len(), 1)
+    assert_near(whole[0], 7.25, 1e-6)
+
+    #: A single column is still a reduction, of one element each.
+    let column = Tensor([4, 1], [1.0, 2.0, 3.0, 4.0])
+    let each = jt.amax(column, axis: -1).download()
+    assert_eq(each, [1.0, 2.0, 3.0, 4.0])
+
+    let _refused = assert_throws(ValueError, || jt.amax(x, axis: 0))
+    x.free()
+    column.free()
+}
