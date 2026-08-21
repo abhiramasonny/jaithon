@@ -139,6 +139,43 @@ void               *jaiGpuBufferHandle(JaiGpuBuffer *b);
  * passed as void so that only the Objective-C files need the types. */
 bool                jaiGpuEncodeExecutable(void *executable, void *inputs, void *results);
 
+/* A CoreML model, which is the only way to reach the neural accelerator.
+ *
+ * It is not faster than a graph compiled for the GPU -- every network measured
+ * runs quicker there. It is separate silicon, and the two overlap almost
+ * perfectly, so its use is running a model at the same time as GPU work rather
+ * than instead of it. `units` is MLComputeUnits: 0 CPU, 1 CPU and GPU, 2 all,
+ * 3 CPU and the neural accelerator. */
+typedef struct JaiCoreMLModel JaiCoreMLModel;
+/* A prediction already under way on another thread. Start one, queue GPU work,
+ * then wait: the two run at once, which is the whole reason to use the
+ * accelerator rather than the GPU. */
+typedef struct JaiCoreMLTicket JaiCoreMLTicket;
+
+JaiCoreMLModel *jaiCoreMLOpen(const char *path, int units, char *errBuf, size_t errSize);
+void            jaiCoreMLClose(JaiCoreMLModel *model);
+/* How many inputs (`outputs` zero) or outputs (non-zero) the model declares. */
+int             jaiCoreMLCount(JaiCoreMLModel *model, int outputs);
+const char     *jaiCoreMLName(JaiCoreMLModel *model, int outputs, int index);
+/* The declared shape's rank, filling `dims`, or -1 when it has none fixed. */
+int             jaiCoreMLShape(JaiCoreMLModel *model, int outputs, int index,
+                               int64_t *dims, int room);
+/* Shapes are laid end to end, `ranks[i]` dimensions each. */
+JaiCoreMLTicket *jaiCoreMLStart(JaiCoreMLModel *model,
+                                JaiGpuBuffer **ins, const size_t *inOffsets,
+                                const int64_t *inShapes, const int *inRanks,
+                                JaiGpuBuffer **outs, const size_t *outOffsets,
+                                const int64_t *outShapes, const int *outRanks,
+                                char *errBuf, size_t errSize);
+/* Waits, reports whether it worked, and frees the ticket either way. */
+bool            jaiCoreMLWait(JaiCoreMLTicket *ticket, char *errBuf, size_t errSize);
+bool            jaiCoreMLRun(JaiCoreMLModel *model,
+                             JaiGpuBuffer **ins, const size_t *inOffsets,
+                             const int64_t *inShapes, const int *inRanks,
+                             JaiGpuBuffer **outs, const size_t *outOffsets,
+                             const int64_t *outShapes, const int *outRanks,
+                             char *errBuf, size_t errSize);
+
 typedef struct JaiGraphBuilder JaiGraphBuilder;
 typedef struct JaiGraphPlan JaiGraphPlan;
 

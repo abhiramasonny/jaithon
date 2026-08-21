@@ -49,6 +49,7 @@ void jaiRegisterGuiPrimitives(void);
 void jaiRegisterCameraPrimitives(void);
 void jaiRegisterGpuPrimitives(void);
 void jaiRegisterGraphPrimitives(void);
+void jaiRegisterCoreMLPrimitives(void);
 /* Declared here rather than pulling native.h in: runtime.h is included
  * everywhere, and the platform header is not. */
 struct JaiGpuBuffer;

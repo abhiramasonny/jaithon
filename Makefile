@@ -87,7 +87,8 @@ ifeq ($(UNAME_S),Darwin)
             -framework MetalKit -framework Foundation \
             -framework MetalPerformanceShaders \
             -framework MetalPerformanceShadersGraph \
-            -framework AVFoundation -framework CoreMedia -framework CoreVideo
+            -framework AVFoundation -framework CoreMedia -framework CoreVideo \
+            -framework CoreML
 endif
 
 # --- readline probe ---------------------------------------------------------
