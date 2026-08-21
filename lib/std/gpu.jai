@@ -233,15 +233,21 @@ pub class Buffer {
 
     #: Allocate `count` float slots on the device, with undefined contents.
     #:
+    #: `count` may be zero. A tensor with an empty axis is a real thing -- an
+    #: exported model slices one out whenever a range comes up empty -- and it
+    #: has to be passable to the same code as any other. One slot is allocated
+    #: behind it so that binding it to a kernel is still legal; nothing reads
+    #: that slot, because every loop over it runs zero times.
+    #:
     #: Raises `RuntimeError` when no device is available. Pass `handle` to
     #: adopt an existing native buffer (used by `view`).
     pub fn init(self, count: int, handle: int = -1) {
-        if count <= 0 { throw ValueError(f"buffer count must be positive, got {count}") }
+        if count < 0 { throw ValueError(f"buffer count cannot be negative, got {count}") }
         self.count = count
         self.freed = false
         if handle < 0 {
             _require_device("allocate a Buffer")
-            self.handle = __prim__.gpu_buffer_new(count)
+            self.handle = __prim__.gpu_buffer_new(max(count, 1))
         } else {
             self.handle = handle
         }
@@ -464,8 +470,11 @@ pub class Kernel {
         group_size: int = 0
     ) -> void {
         self._check_live()
-        if threads <= 0 { throw ValueError(f"threads must be positive, got {threads}") }
+        if threads < 0 { throw ValueError(f"threads cannot be negative, got {threads}") }
         if group_size < 0 { throw ValueError(f"group_size must be non-negative, got {group_size}") }
+        #: Nothing to run over is not an error, it is nothing to run: an empty
+        #: tensor reaches the same code an occupied one does.
+        if threads == 0 { return }
         let handles = buffers.map(|buffer| buffer.handle_of())
         let width = if group_size > 0 { group_size } else { self.max_group_size() }
         __prim__.gpu_dispatch_async(self.handle, handles, scalars, threads, width)

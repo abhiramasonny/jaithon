@@ -2,11 +2,19 @@
 import std.gpu as gpu
 from std.gpu import Buffer, Kernel
 
+#: How many elements a shape holds.
+#:
+#: A dimension of zero is allowed and makes the whole tensor empty. Exported
+#: graphs produce those -- a slice whose range comes up empty is the usual way
+#: -- and an empty tensor has to travel through the same code as any other; the
+#: loops over it simply run no times. A negative dimension is still a mistake.
 fn element_count(shape: list[int]) -> int {
     if shape.len() == 0 { throw ValueError("a tensor needs at least one dimension") }
     var size = 1
     for dimension in shape {
-        if dimension <= 0 { throw ValueError(f"tensor dimensions must be positive, got {shape}") }
+        if dimension < 0 {
+            throw ValueError(f"tensor dimensions cannot be negative, got {shape}")
+        }
         size *= dimension
     }
     return size
