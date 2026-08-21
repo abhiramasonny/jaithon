@@ -229,8 +229,22 @@ pub class Tensor {
         if self.size != 1 {
             throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
         }
+        #: Shaped like the loss, not merely sized like it. A loss that came
+        #: out of a matrix product is `[1, 1]` rather than `[1]`, and seeding
+        #: the wrong rank hands the first operator's backward an upstream it
+        #: cannot index. The one-element case keeps the shared scalar, which
+        #: is every loss a reduction produced and so nearly all of them.
         let seeded = self.grad
-        let root_upstream = if seeded is not null { seeded } else { unit_scalar() }
+        var own_seed: Tensor? = null
+        if seeded is null and self.shape != [1] { own_seed = Tensor.ones(self.shape) }
+        let made = own_seed
+        let root_upstream = if seeded is not null {
+            seeded
+        } elif made is not null {
+            made
+        } else {
+            unit_scalar()
+        }
         let order = self._topo_order()
         var index = order.len() - 1
         while index >= 0 {
@@ -245,7 +259,10 @@ pub class Tensor {
             }
             index -= 1
         }
-        return self._collect_intermediates(order)
+        let collected = self._collect_intermediates(order)
+        let temporary = own_seed
+        if temporary is not null { temporary.free() }
+        return collected
     }
 
     #: Every non-leaf, non-self tensor a forward-only graph built, without
