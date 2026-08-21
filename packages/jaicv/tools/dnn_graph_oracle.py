@@ -479,6 +479,35 @@ def build_cases():
         {"fmod": 1},
     )
 
+    # Recurrence. The weights are [directions, 4H, ...] with the gates ordered
+    # i, o, f, c, and the bias holds the input set followed by the recurrent
+    # one. `None` stands in for an optional input the case leaves out.
+    def lstm(name, seq, batch, inp, hid, direction="forward", bias=True, state=False, **attrs):
+        d = 2 if direction == "bidirectional" else 1
+        pieces = [
+            spread(seq, batch, inp, seed=160),
+            spread(d, 4 * hid, inp, low=-0.6, high=0.6, seed=161),
+            spread(d, 4 * hid, hid, low=-0.6, high=0.6, seed=162),
+        ]
+        pieces.append(spread(d, 8 * hid, low=-0.4, high=0.4, seed=163) if bias else None)
+        pieces.append(None)
+        if state:
+            pieces.append(spread(d, batch, hid, low=-0.5, high=0.5, seed=164))
+            pieces.append(spread(d, batch, hid, low=-0.5, high=0.5, seed=165))
+        case(
+            "recurrent", name, "LSTM", pieces,
+            {"hidden_size": hid, "direction": direction, **attrs},
+            outputs=3, opset=14,
+        )
+
+    lstm("lstm_plain", 5, 2, 3, 4, bias=False)
+    lstm("lstm_bias", 6, 3, 4, 5)
+    lstm("lstm_initial_state", 4, 2, 3, 4, state=True)
+    lstm("lstm_reverse", 5, 2, 3, 4, direction="reverse")
+    lstm("lstm_bidirectional", 5, 2, 3, 4, direction="bidirectional")
+    lstm("lstm_clipped", 5, 2, 3, 4, clip=0.5)
+    lstm("lstm_single_step", 1, 1, 2, 3)
+
     # Normalisation.
     case(
         "norm",

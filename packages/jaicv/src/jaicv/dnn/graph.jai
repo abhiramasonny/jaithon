@@ -314,6 +314,47 @@ kernel void binary_ex(device const float* a [[buffer(0)]],
     output[id] = r;
 }
 
+/* One LSTM timestep's gates, cell and hidden state.
+ *
+ * `gates` already holds `Xt W' + H(t-1) R' + b` for the whole batch, so all
+ * that is left is the four activations and the two state updates -- as one
+ * kernel rather than the dozen elementwise passes writing it out of jaitensor
+ * pieces would take, which matters because this runs once per timestep.
+ *
+ * ONNX orders the gates i, o, f, c along the row, and that is the order here.
+ */
+kernel void lstm_gates(device const float* gates [[buffer(0)]],
+                       device const float* cell_in [[buffer(1)]],
+                       device float* cell_out [[buffer(2)]],
+                       device float* hidden_out [[buffer(3)]],
+                       constant uint& count [[buffer(4)]],
+                       constant uint& hidden [[buffer(5)]],
+                       constant uint& clip_bits [[buffer(6)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint row = id / hidden;
+    uint col = id - row * hidden;
+    uint base = row * 4u * hidden;
+    float gi = gates[base + col];
+    float go = gates[base + hidden + col];
+    float gf = gates[base + 2u * hidden + col];
+    float gc = gates[base + 3u * hidden + col];
+    float clip = as_type<float>(clip_bits);
+    if (clip > 0.0f) {
+        gi = clamp(gi, -clip, clip);
+        go = clamp(go, -clip, clip);
+        gf = clamp(gf, -clip, clip);
+        gc = clamp(gc, -clip, clip);
+    }
+    float i = 1.0f / (1.0f + exp(-gi));
+    float o = 1.0f / (1.0f + exp(-go));
+    float f = 1.0f / (1.0f + exp(-gf));
+    float g = tanh(gc);
+    float c = f * cell_in[id] + i * g;
+    cell_out[id] = c;
+    hidden_out[id] = o * tanh(c);
+}
+
 /* Layer normalisation over the trailing axes, one threadgroup a row.
  *
  * A transformer runs one of these before every attention and every feed
@@ -2287,6 +2328,213 @@ fn op_layer_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [output, jt.reshape(mean, moment_shape), jt.reshape(inv_std, moment_shape)]
 }
 
+#: One direction of an LSTM, from `[seq, batch, input]` to `[seq, batch, H]`.
+#:
+#: `x_gates` already holds every timestep's `Xt W' + b`, because that half does
+#: not depend on the recurrence and so is one matrix product for the whole
+#: sequence rather than one per step. What is left per step is the recurrent
+#: product and the gates.
+fn lstm_direction(
+    x_gates: Tensor,
+    recurrent: Tensor,
+    initial_h: Tensor,
+    initial_c: Tensor,
+    steps: int,
+    batch: int,
+    hidden: int,
+    clip: float,
+    reverse: bool
+) -> tuple[Tensor, Tensor, Tensor] {
+    #: `steps` owns every hidden state it produces, because they are also the
+    #: output sequence. The cell state is not kept, so each new one replaces
+    #: and frees the one before -- except the caller's, which the caller frees.
+    var state_h = initial_h
+    var state_c = initial_c
+    var own_cell = false
+    var produced: list[Tensor] = []
+    for index in 0..steps {
+        let step = if reverse { steps - 1 - index } else { index }
+        let at = slice_axis(x_gates, 0, step * batch, batch)
+        let recurred = jt.matmul(state_h, recurrent, trans_b: true)
+        let gates = jt.add(at, recurred)
+        at.free()
+        recurred.free()
+
+        let next_c = jt.Tensor([batch, hidden])
+        let next_h = jt.Tensor([batch, hidden])
+        kernel_for("lstm_gates").dispatch_async(
+            [gates.buffer(), state_c.buffer(), next_c.buffer(), next_h.buffer()],
+            batch * hidden,
+            [batch * hidden, hidden, f32_bits(clip)]
+        )
+        gates.free()
+        if own_cell { state_c.free() }
+        state_c = next_c
+        own_cell = true
+        state_h = next_h
+        produced.push(next_h)
+    }
+
+    #: A reversed pass produces its steps back to front, and the output is
+    #: indexed by time whichever way it was walked.
+    var ordered = produced
+    if reverse {
+        ordered = []
+        for index in 0..produced.len() { ordered.push(produced[produced.len() - 1 - index]) }
+    }
+    var rows: list[Tensor] = []
+    for part in ordered { rows.push(copy_of(part, [1, batch, hidden])) }
+    let sequence = if rows.len() == 1 {
+        rows[0]
+    } else {
+        concat_along(rows, 0, "an LSTM's output sequence")
+    }
+    if rows.len() > 1 {
+        for row in rows { row.free() }
+    }
+    let final_h = copy_of(state_h, [batch, hidden])
+    let final_c = copy_of(state_c, [batch, hidden])
+    for part in produced { part.free() }
+    if own_cell { state_c.free() }
+    return (sequence, final_h, final_c)
+}
+
+#: ONNX `LSTM`.
+#:
+#: Weights arrive as `[directions, 4H, input]` and `[directions, 4H, H]` with
+#: the gates ordered i, o, f, c, and the bias as `[directions, 8H]` holding the
+#: input biases and then the recurrent ones. Outputs are the whole sequence
+#: `[seq, directions, batch, H]` and the final hidden and cell states.
+fn op_lstm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let x = need(ins, 0, node)
+    let w = need(ins, 1, node)
+    let r = need(ins, 2, node)
+    let bias = maybe(ins, 3)
+    if maybe(ins, 4) is not null {
+        throw ValueError(
+            f"{node.label()} gives per-sequence lengths, which this executor does not read; " +
+                "every sequence in the batch has to be the same length"
+        )
+    }
+    if maybe(ins, 7) is not null {
+        throw ValueError(f"{node.label()} has peephole weights, which this executor does not apply")
+    }
+    if node.attrs.get("activations", null) is not null {
+        throw ValueError(
+            f"{node.label()} names its own activations; this executor uses the sigmoid and " +
+                "tanh the operator defaults to"
+        )
+    }
+    if attr_int(node, "layout", 0) != 0 {
+        throw ValueError(f"{node.label()} uses the batch-first layout, which this executor does not read")
+    }
+    if attr_int(node, "input_forget", 0) != 0 {
+        throw ValueError(f"{node.label()} couples its input and forget gates, which this executor does not")
+    }
+    if x.rank() != 3 { throw ValueError(f"{node.label()} needs a 3-D input, got {x.shape}") }
+    if w.rank() != 3 or r.rank() != 3 {
+        throw ValueError(f"{node.label()} needs 3-D weights, got {w.shape} and {r.shape}")
+    }
+    let steps = x.shape[0]
+    let batch = x.shape[1]
+    let input_size = x.shape[2]
+    let directions = w.shape[0]
+    let hidden = attr_int(node, "hidden_size", r.shape[2])
+    let facing = attr_str(node, "direction", "forward")
+    let wanted = if facing == "bidirectional" { 2 } else { 1 }
+    if directions != wanted or r.shape[0] != directions {
+        throw ValueError(f"{node.label()} is {facing} but carries {directions} directions of weights")
+    }
+    if w.shape[1] != 4 * hidden or r.shape[1] != 4 * hidden or r.shape[2] != hidden {
+        throw ValueError(f"{node.label()} has weights {w.shape} and {r.shape} for {hidden} hidden units")
+    }
+    if w.shape[2] != input_size {
+        throw ValueError(f"{node.label()} has weights {w.shape} for {input_size} inputs")
+    }
+    let clip = attr_float(node, "clip", 0.0)
+
+    let flat_x = copy_of(x, [steps * batch, input_size])
+    var sequences: list[Tensor] = []
+    var last_h: list[Tensor] = []
+    var last_c: list[Tensor] = []
+    for direction in 0..directions {
+        let wd = taken(slice_axis(w, 0, direction, 1), [4 * hidden, input_size])
+        let rd = taken(slice_axis(r, 0, direction, 1), [4 * hidden, hidden])
+        #: Every timestep's input half at once: it does not depend on the
+        #: recurrence, so it is one product for the sequence rather than one
+        #: for each step of it.
+        var x_gates = jt.matmul(flat_x, wd, trans_b: true)
+        wd.free()
+        if bias is not null {
+            #: `[directions, 8H]` is the input biases followed by the recurrent
+            #: ones, and both land on the same gates.
+            let row = taken(slice_axis(bias, 0, direction, 1), [8 * hidden])
+            let wb = taken(slice_axis(row, 0, 0, 4 * hidden), [4 * hidden])
+            let rb = taken(slice_axis(row, 0, 4 * hidden, 4 * hidden), [4 * hidden])
+            let both = jt.add(wb, rb)
+            let shifted = jt.add(x_gates, both)
+            x_gates.free()
+            x_gates = shifted
+            row.free()
+            wb.free()
+            rb.free()
+            both.free()
+        }
+        let given_h = maybe(ins, 5)
+        let given_c = maybe(ins, 6)
+        let start_h = if given_h is null {
+            jt.Tensor.zeros([batch, hidden])
+        } else {
+            taken(slice_axis(given_h, 0, direction, 1), [batch, hidden])
+        }
+        let start_c = if given_c is null {
+            jt.Tensor.zeros([batch, hidden])
+        } else {
+            taken(slice_axis(given_c, 0, direction, 1), [batch, hidden])
+        }
+        let (sequence, final_h, final_c) = lstm_direction(
+            x_gates,
+            rd,
+            start_h,
+            start_c,
+            steps,
+            batch,
+            hidden,
+            clip,
+            facing == "reverse" or direction == 1
+        )
+        x_gates.free()
+        rd.free()
+        start_h.free()
+        start_c.free()
+        sequences.push(copy_of(sequence, [steps, 1, batch, hidden]))
+        sequence.free()
+        last_h.push(copy_of(final_h, [1, batch, hidden]))
+        last_c.push(copy_of(final_c, [1, batch, hidden]))
+        final_h.free()
+        final_c.free()
+    }
+    flat_x.free()
+
+    let all_y = if sequences.len() == 1 { sequences[0] } else { concat_along(sequences, 1, node.label()) }
+    let all_h = if last_h.len() == 1 { last_h[0] } else { concat_along(last_h, 0, node.label()) }
+    let all_c = if last_c.len() == 1 { last_c[0] } else { concat_along(last_c, 0, node.label()) }
+    if sequences.len() > 1 {
+        for part in sequences { part.free() }
+        for part in last_h { part.free() }
+        for part in last_c { part.free() }
+    }
+    return [all_y, all_h, all_c]
+}
+
+#: `copy_of` on a freshly cut slice, freeing the slice. Slicing allocates, and
+#: every use of it here wants the copy and not the cut.
+fn taken(cut: Tensor, shape: list[int]) -> Tensor {
+    let kept = copy_of(cut, shape)
+    cut.free()
+    return kept
+}
+
 fn op_instance_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let x = need(ins, 0, node)
     let scale = need(ins, 1, node)
@@ -2724,6 +2972,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["BatchNormalization"] = op_batch_norm
     _handlers["InstanceNormalization"] = op_instance_norm
     _handlers["LayerNormalization"] = op_layer_norm
+    _handlers["LSTM"] = op_lstm
     _handlers["LRN"] = op_lrn
     _handlers["Dropout"] = op_dropout
     _handlers["Identity"] = op_identity
