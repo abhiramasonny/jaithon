@@ -26,6 +26,17 @@ function activeDocument({ quiet } = {}) {
     return editor.document;
 }
 
+/** The workspace folder to run a workspace-wide command in: the active
+ * document's folder in a multi-root workspace, falling back to the first. */
+function targetFolder() {
+    const active = vscode.window.activeTextEditor?.document;
+    if (active) {
+        const owning = vscode.workspace.getWorkspaceFolder(active.uri);
+        if (owning) return owning;
+    }
+    return vscode.workspace.workspaceFolders?.[0];
+}
+
 function terminal() {
     return vscode.window.terminals.find((item) => item.name === 'Jaithon')
         || vscode.window.createTerminal('Jaithon');
@@ -92,25 +103,27 @@ function registerCommands(context) {
     });
 
     command('jaithon.checkWorkspace', async () => {
-        const folder = vscode.workspace.workspaceFolders?.[0];
+        const folder = targetFolder();
         if (!folder) return;
         runInTerminal(['check', `"${folder.uri.fsPath}"`]);
     });
 
     command('jaithon.test', () => {
-        const folder = vscode.workspace.workspaceFolders?.[0];
+        const folder = targetFolder();
         runInTerminal(['test', folder ? `"${folder.uri.fsPath}"` : '']);
     });
 
-    command('jaithon.testFile', async (uri) => {
+    command('jaithon.testFile', async (uri, testName) => {
         const document = uri ? await vscode.workspace.openTextDocument(uri) : activeDocument();
         if (!document) return;
         await document.save();
-        runInTerminal(['test', `"${document.uri.fsPath}"`], document);
+        const args = ['test', `"${document.uri.fsPath}"`];
+        if (testName) args.push(`--filter=${testName}`);
+        runInTerminal(args, document);
     });
 
     command('jaithon.bench', () => {
-        const folder = vscode.workspace.workspaceFolders?.[0];
+        const folder = targetFolder();
         runInTerminal(['bench', folder ? `"${folder.uri.fsPath}"` : '']);
     });
 

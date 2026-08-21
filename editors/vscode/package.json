@@ -183,7 +183,23 @@
       ],
       "commandPalette": [
         {
+          "command": "jaithon.check",
+          "when": "resourceLangId == jaithon"
+        },
+        {
           "command": "jaithon.testFile",
+          "when": "resourceLangId == jaithon"
+        },
+        {
+          "command": "jaithon.disasm",
+          "when": "resourceLangId == jaithon"
+        },
+        {
+          "command": "jaithon.ast",
+          "when": "resourceLangId == jaithon"
+        },
+        {
+          "command": "jaithon.tokens",
           "when": "resourceLangId == jaithon"
         },
         {
