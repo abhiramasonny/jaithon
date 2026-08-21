@@ -265,7 +265,8 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                          uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
                          uint32_t cout, uint32_t kh, uint32_t kw,
                          uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw,
-                         uint32_t activation) {
+                         uint32_t activation, uint32_t layout) {
+    (void)layout;
     (void)input;
     (void)inputOffset;
     (void)weights;

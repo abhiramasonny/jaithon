@@ -570,11 +570,15 @@ pub fn mha_async(
     )
 }
 
-#: Queue an NHWC 2D convolution without waiting.
+#: Queue a 2D convolution without waiting.
 #:
-#: Weights are HWIO `[kh, kw, cin, cout]`. `bias` is optional `cout` values.
+#: `layout` says how the caller has its data arranged: 0 is NHWC activations
+#: with HWIO `[kh, kw, cin, cout]` weights, 1 is NCHW with OIHW
+#: `[cout, cin, kh, kw]`. The output comes back in the same layout as the
+#: input. `bias` is optional `cout` values either way.
+#:
 #: `activation` fuses an elementwise epilogue into the same dispatch: 0 none,
-#: 1 ReLU. Fusing here means one graph execution covers conv, bias and
+#: 1 ReLU, 2 SiLU. Fusing here means one graph execution covers conv, bias and
 #: activation instead of a second full pass over the output.
 pub fn conv2d_async(
     input: Buffer,
@@ -592,7 +596,8 @@ pub fn conv2d_async(
     pad_h: int = 0,
     pad_w: int = 0,
     bias: Buffer? = null,
-    activation: int = 0
+    activation: int = 0,
+    layout: int = 0
 ) -> void {
     _require_device("conv2d_async")
     if n <= 0 or height <= 0 or width <= 0 or cin <= 0 or cout <= 0 or kh <= 0 or kw <= 0 {
@@ -601,8 +606,11 @@ pub fn conv2d_async(
     if stride_h <= 0 or stride_w <= 0 {
         throw ValueError("conv2d_async stride must be positive")
     }
-    if activation < 0 or activation > 1 {
-        throw ValueError("conv2d_async activation must be 0 or 1")
+    if activation < 0 or activation > 2 {
+        throw ValueError("conv2d_async activation must be 0, 1 or 2")
+    }
+    if layout < 0 or layout > 1 {
+        throw ValueError("conv2d_async layout must be 0 or 1")
     }
     let bias_handle = if bias is null { null } else { bias.handle_of() }
     __prim__.gpu_conv2d_buffers(
@@ -621,7 +629,8 @@ pub fn conv2d_async(
         stride_w,
         pad_h,
         pad_w,
-        activation
+        activation,
+        layout
     )
 }
 

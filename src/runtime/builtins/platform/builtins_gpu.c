@@ -628,7 +628,6 @@ static bool nGpuMhaBuffers(int argc, Value *args, Value *out) {
 }
 
 static bool nGpuConv2dBuffers(int argc, Value *args, Value *out) {
-    (void)argc;
     GpuBuffer *input, *weights, *result, *bias = NULL;
     if (!requireBuffer(args[0], 1, "gpu_conv2d_buffers", &input)) return false;
     if (!requireBuffer(args[1], 2, "gpu_conv2d_buffers", &weights)) return false;
@@ -637,8 +636,12 @@ static bool nGpuConv2dBuffers(int argc, Value *args, Value *out) {
     }
     if (!requireBuffer(args[3], 4, "gpu_conv2d_buffers", &result)) return false;
 
-    int64_t dims[12];
-    for (int i = 0; i < 12; i++) {
+    /* Thirteen when the caller picks a data layout, twelve when it takes the
+     * NHWC/HWIO default -- every caller that predates the NCHW path. */
+    int64_t dims[13];
+    dims[12] = 0;
+    const int given = argc - 4;
+    for (int i = 0; i < given; i++) {
         if (!jaiArgInt(args[4 + i], 5 + i, "gpu_conv2d_buffers", &dims[i])) return false;
         if (dims[i] < 0 || dims[i] > UINT32_MAX)
             return jaiThrow(vm.cValueError,
@@ -655,7 +658,7 @@ static bool nGpuConv2dBuffers(int argc, Value *args, Value *out) {
         (uint32_t)dims[0], (uint32_t)dims[1], (uint32_t)dims[2], (uint32_t)dims[3],
         (uint32_t)dims[4], (uint32_t)dims[5], (uint32_t)dims[6],
         (uint32_t)dims[7], (uint32_t)dims[8], (uint32_t)dims[9], (uint32_t)dims[10],
-        (uint32_t)dims[11]);
+        (uint32_t)dims[11], (uint32_t)dims[12]);
     if (!ok)
         return jaiThrow(vm.cRuntimeError, "gpu_conv2d_buffers(): the kernel failed");
     *out = NULL_VAL;
@@ -1111,7 +1114,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_matmul",     nGpuMatMul,    5, 5);
     jaiDefineNative("__prim__.gpu_matmul_buffers", nGpuMatMulBuffers, 9, 9);
     jaiDefineNative("__prim__.gpu_mha_buffers", nGpuMhaBuffers, 8, 8);
-    jaiDefineNative("__prim__.gpu_conv2d_buffers", nGpuConv2dBuffers, 16, 16);
+    jaiDefineNative("__prim__.gpu_conv2d_buffers", nGpuConv2dBuffers, 16, 17);
     jaiDefineNative("__prim__.gpu_conv2d_data_grad", nGpuConv2dDataGrad, 14, 14);
     jaiDefineNative("__prim__.gpu_conv2d_weights_grad", nGpuConv2dWeightsGrad, 14, 14);
     jaiDefineNative("__prim__.gpu_mlp_sgd_step", nGpuMlpSgdStep, 13, 13);
