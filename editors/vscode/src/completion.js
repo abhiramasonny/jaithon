@@ -217,14 +217,33 @@ function receiverType(analysis, lineNumber, lineText, dotColumn) {
     return null;
 }
 
+/**
+ * receiverType()'s chain-aware twin: the file `a.b.c` names when `a` alone
+ * would resolve (via receiverType()) but the fuller chain wouldn't, because
+ * it has no checker type and no AST node yet for the segment being typed.
+ * Text-driven, so it works mid-edit; every segment must be a clean
+ * identifier, or this isn't a plain module chain and bails out.
+ */
+async function chainModuleFile(workspace, analysis, lineNumber, lineText, dotColumn, token) {
+    const start = chainStart(lineText, dotColumn);
+    const segments = lineText.slice(start, dotColumn).split('.');
+    if (segments.length < 2 || !segments.every((s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s))) return null;
+
+    const startByte = byteOffsetAt(analysis, new vscode.Position(lineNumber, start));
+    return workspace.moduleOfChain(analysis, startByte, segments[0], segments.slice(1), token);
+}
+
 async function memberCompletions(workspace, analysis, line, position, dotColumn, token) {
     const type = receiverType(analysis, position.line, line, dotColumn);
     const out = [];
 
     const moduleName = moduleOfType(type);
-    if (moduleName) {
-        const file = workspace.moduleFile(moduleName, analysis.fsPath);
-        const other = file ? await workspace.analyze(file, token) : null;
+    let moduleFsPath = moduleName ? workspace.moduleFile(moduleName, analysis.fsPath) : null;
+    if (!moduleFsPath && !type) {
+        moduleFsPath = await chainModuleFile(workspace, analysis, position.line, line, dotColumn, token);
+    }
+    if (moduleFsPath) {
+        const other = await workspace.analyze(moduleFsPath, token);
         if (other) {
             for (const symbol of other.symbols) {
                 if (symbol.scope !== other.moduleScope || symbol.visibility !== 'pub') continue;
@@ -376,9 +395,12 @@ function signatureHelpProvider(workspace) {
                     if (member) resolved = { analysis: owner.analysis, symbol: member };
                 }
                 const moduleName = moduleOfType(type);
-                if (!resolved && moduleName) {
-                    const file = workspace.moduleFile(moduleName, analysis.fsPath);
-                    const other = file ? await workspace.analyze(file, token) : null;
+                let moduleFsPath = moduleName ? workspace.moduleFile(moduleName, analysis.fsPath) : null;
+                if (!resolved && !moduleFsPath && !type) {
+                    moduleFsPath = await chainModuleFile(workspace, analysis, line, lineText, dot, token);
+                }
+                if (!resolved && moduleFsPath) {
+                    const other = await workspace.analyze(moduleFsPath, token);
                     const found = other && other.lookup(name, other.moduleScope);
                     if (found) resolved = { analysis: other, symbol: found };
                 }

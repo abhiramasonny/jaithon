@@ -139,39 +139,15 @@ fn ensure_window(pane: Pane, width: int, height: int) -> Window? {
 fn packed(image: Mat) -> list[int] {
     #: One `0xAARRGGBB` int per pixel, which is what the back buffer holds.
     #:
-    #: Sized up front rather than appended to. Growing it a pixel at a time
-    #: cost about 18 ms a 720p frame -- nine hundred thousand appends -- which
-    #: was most of what a camera preview spent per frame and held the whole
-    #: loop near 13 fps whatever it was showing.
-    let cn = image.channels()
-    let values = image.values()
-    let count = image.rows * image.cols
-    var out = __prim__.list_filled(count, 0)
-    for index in 0..count {
-        var b = 0
-        var g = 0
-        var r = 0
-        var a = 255
-        if cn == 1 {
-            b = clamp_byte(values[index])
-            g = b
-            r = b
-        } else {
-            b = clamp_byte(values[index * cn])
-            g = clamp_byte(values[index * cn + 1])
-            r = clamp_byte(values[index * cn + 2])
-            if cn >= 4 { a = clamp_byte(values[index * cn + 3]) }
-        }
-        out[index] = a << 24 | r << 16 | g << 8 | b
-    }
-    return out
-}
-
-fn clamp_byte(value: float) -> int {
-    let rounded = int(value + 0.5)
-    if rounded < 0 { return 0 }
-    if rounded > 255 { return 255 }
-    return rounded
+    #: The rounding, clamping and shifting is one primitive rather than a loop
+    #: here. As Jaithon it ran nine hundred thousand iterations and three and a
+    #: half million calls for a single 720p frame -- about 18 ms, more than
+    #: everything else a camera preview did per frame put together, and what
+    #: held the loop near 13 fps whatever it was showing.
+    #: `to_bytes` rather than `values`: the device narrows the pixels on the
+    #: way out, so nothing here ever builds a list of 2.8 million floats to
+    #: read one byte out of each.
+    return __prim__.list_pack_argb(image.to_bytes(), image.channels())
 }
 
 fn draw_trackbars(pane: Pane, canvas: Canvas) -> void {

@@ -801,6 +801,34 @@ void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
 }
 
+void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
+                      size_t offset, float scale) {
+    if (b == NULL || b->buffer == NULL || dst == NULL || count == 0) return;
+    const size_t start = offset * sizeof(float);
+    const size_t bytes = count * sizeof(float);
+    if (start > b->bytes || bytes > b->bytes - start) return;
+    jaiGpuSynchronize();
+
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
+    /* Indexed as floats rather than stepped as bytes and cast: `start` is a
+     * whole number of them, and the byte cast only makes the compiler warn
+     * about an alignment that is already guaranteed. */
+    const float *source = (const float *)[buffer contents] + offset;
+    /* Rounds half up and clamps, matching what a display expects and what the
+     * Jaithon loop this replaces did. A NaN fails `> 0.0f` and lands on zero
+     * rather than an undefined cast. */
+    const float factor = scale != 0.0f ? 1.0f / scale : 1.0f;
+    for (size_t i = 0; i < count; i++) {
+        const float value = source[i] * factor;
+        if (!(value > 0.0f)) {
+            dst[i] = 0u;
+            continue;
+        }
+        const float rounded = value + 0.5f;
+        dst[i] = rounded > 255.0f ? 255u : (uint8_t)rounded;
+    }
+}
+
 static void writeError(char *buf, size_t size, const char *fmt, ...) JAI_PRINTF(3, 4);
 
 static void writeError(char *buf, size_t size, const char *fmt, ...) {
