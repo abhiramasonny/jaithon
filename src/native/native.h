@@ -185,6 +185,10 @@ int              jaiGraphGemm(JaiGraphBuilder *b, int left, int right, int c,
 bool             jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeight,
                               int inputWeight, int bias, int initState, int initCell,
                               int reverse, int *out);
+/* A whole GRU as one operation; gates ordered z, r, h. `bias` and
+ * `initState` may be -1. Returns the state sequence `[T, N, H]`. */
+int              jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight,
+                             int inputWeight, int bias, int initState, int reverse);
 JaiGraphPlan    *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                                  const int *outputs, int outputCount);
 int              jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index);
