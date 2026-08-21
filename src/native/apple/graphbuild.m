@@ -325,6 +325,52 @@ int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
     }
 }
 
+/* A transposed convolution, taking the same nine parameters as the forward
+ * one it undoes plus the shape it has to produce. The weights are in the
+ * forward layout, OIHW, which is not the layout ONNX writes them in -- the
+ * caller swaps the two channel axes before it gets here. */
+int jaiGraphConvTranspose(JaiGraphBuilder *b, int x, int w, int bias,
+                          const int32_t *p, const int64_t *shape) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    MPSGraphTensor *filt = tensorAt(b, w);
+    if (in == nil || filt == nil || p == NULL || shape == NULL) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        MPSGraphConvolution2DOpDescriptor *d =
+            [MPSGraphConvolution2DOpDescriptor
+                descriptorWithStrideInX:(NSUInteger)p[1]
+                              strideInY:(NSUInteger)p[0]
+                        dilationRateInX:(NSUInteger)p[7]
+                        dilationRateInY:(NSUInteger)p[6]
+                                 groups:(NSUInteger)p[8]
+                            paddingLeft:(NSUInteger)p[4]
+                           paddingRight:(NSUInteger)p[5]
+                             paddingTop:(NSUInteger)p[2]
+                          paddingBottom:(NSUInteger)p[3]
+                           paddingStyle:MPSGraphPaddingStyleExplicit
+                             dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                          weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+        if (d == nil) return -1;
+        MPSGraphTensor *out =
+            [g convolutionTranspose2DWithSourceTensor:in
+                                        weightsTensor:filt
+                                          outputShape:shapeOf(shape, 4)
+                                           descriptor:d
+                                                 name:nil];
+        if (out == nil) return -1;
+        MPSGraphTensor *shift = tensorAt(b, bias);
+        if (shift != nil) {
+            if (shift.shape.count == 1) {
+                shift = [g reshapeTensor:shift
+                               withShape:@[ @1, shift.shape[0], @1, @1 ]
+                                    name:nil];
+            }
+            out = [g additionWithPrimaryTensor:out secondaryTensor:shift name:nil];
+        }
+        return record(b, out);
+    }
+}
+
 /* `p` is kernel y, kernel x, stride y, stride x, pad top, pad bottom,
  * pad left, pad right, ceil mode, and whether the padding counts toward an
  * average. `kind` 0 is maximum, 1 is average. */

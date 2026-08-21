@@ -200,6 +200,26 @@ static bool nGraphConv(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGraphConvTranspose(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t x, w, bias;
+    int32_t params[9];
+    int64_t *shape = NULL;
+    int rank = 0;
+    if (!requireBuilder(args[0], 1, "graph_conv_transpose", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_conv_transpose", &x)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_conv_transpose", &w)) return false;
+    if (!jaiArgInt(args[3], 4, "graph_conv_transpose", &bias)) return false;
+    if (!narrow(args[4], 5, "graph_conv_transpose", 9, params)) return false;
+    if (!intsOf(args[5], 6, "graph_conv_transpose", &shape, &rank)) return false;
+    int id = -1;
+    if (rank == 4) id = jaiGraphConvTranspose(builder, (int)x, (int)w, (int)bias, params, shape);
+    freeInts(shape, rank);
+    *out = INT_VAL(id);
+    return true;
+}
+
 static bool nGraphPool(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -662,6 +682,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_leaky_relu",     nGraphLeakyRelu,      3, 3);
     jaiDefineNative("__prim__.graph_binary",         nGraphBinary,         4, 4);
     jaiDefineNative("__prim__.graph_conv",           nGraphConv,           5, 5);
+    jaiDefineNative("__prim__.graph_conv_transpose", nGraphConvTranspose,  6, 6);
     jaiDefineNative("__prim__.graph_pool",           nGraphPool,           4, 4);
     jaiDefineNative("__prim__.graph_select",         nGraphSelect,         4, 4);
     jaiDefineNative("__prim__.graph_concat",         nGraphConcat,         3, 3);

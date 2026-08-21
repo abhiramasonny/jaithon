@@ -155,6 +155,10 @@ int              jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op)
  * dilation y, dilation x, groups. `bias` may be -1. */
 int              jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias,
                               const int32_t *p);
+/* The same nine parameters as the forward convolution, plus the shape to
+ * produce. Weights in the forward layout, OIHW. */
+int              jaiGraphConvTranspose(JaiGraphBuilder *b, int x, int w, int bias,
+                                       const int32_t *p, const int64_t *shape);
 /* `p`: kernel y, kernel x, stride y, stride x, pad top, pad bottom, pad left,
  * pad right, ceil mode, pad counts toward an average. `kind` 0 max, 1 mean. */
 int              jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind);
