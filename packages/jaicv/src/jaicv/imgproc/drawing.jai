@@ -161,7 +161,12 @@ pub class Painter {
     }
 
     #: Push everything written back to the device.
-    pub fn finish(self) -> void { self.image.flush() }
+    #: Leaves the edits in the host mirror rather than uploading them.
+    #:
+    #: `Mat.buffer` pushes them the moment anything reads the device, so a
+    #: sequence of primitives -- the boxes and labels an overlay is made of --
+    #: pays for one upload between them all instead of one each.
+    pub fn finish(self) -> void { self.image.mark_edited() }
 }
 
 #: Clip a segment to a `width x height` rectangle.

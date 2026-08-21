@@ -437,8 +437,51 @@ static bool primBytesQuantise(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `list_filled(count, value)` -- a list of `count` copies of `value`.
+ *
+ * The idiom this replaces is `[0.0 for _slot in 0..n]`, which every
+ * preallocation in jaicv and jaitensor is written as. That goes through the
+ * comprehension's append path one element at a time and costs about 16 ns an
+ * element -- 19 ms to size the 1.2-million-float buffer one 640x640 blob
+ * needs, which was more than the convolution that consumed it. Reserving the
+ * capacity once and writing straight into it is a memset in all but name.
+ *
+ * A negative count is refused rather than clamped: it always means the caller
+ * computed a size wrongly, and a silent empty list hides that. */
+static bool primListFilled(int argc, Value *args, Value *out) {
+    (void)argc;
+    int64_t count;
+    if (!jaiStrWantInt(args[0], "list_filled", "the count", &count)) return false;
+    if (count < 0) {
+        return jaiThrow(vm.cValueError,
+                        "list_filled(): a count cannot be negative, got %lld",
+                        (long long)count);
+    }
+    if (count > INT32_MAX) {
+        return jaiThrow(vm.cValueError,
+                        "list_filled(): %lld is more elements than a list holds",
+                        (long long)count);
+    }
+
+    Value fill = argc > 1 ? args[1] : INT_VAL(0);
+    ObjList *list = jaiListNew((int)count);
+    if (list == NULL) return false;
+    /* Rooted across the reserve: growing the backing array can collect. */
+    jaiGCPushRoot(OBJ_VAL(list));
+    jaiListReserve(list, (int)count);
+    jaiGCPopRoot();
+    if (count > 0 && list->capacity < (int)count) return false;
+
+    for (int64_t i = 0; i < count; i++) list->items[i] = fill;
+    list->count = (int)count;
+    list->version++;
+    *out = OBJ_VAL(list);
+    return true;
+}
+
 void jaiBytesRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "bytes_quantise", primBytesQuantise, 1, 2);
+    jaiStrDefinePrim(ns, "list_filled",    primListFilled,    1, 2);
     jaiStrDefinePrim(ns, "bytes_new",      primBytesNew,      1, 1);
     jaiStrDefinePrim(ns, "bytes_len",      primBytesLen,      1, 1);
     jaiStrDefinePrim(ns, "bytes_get",      primBytesGet,      2, 2);
