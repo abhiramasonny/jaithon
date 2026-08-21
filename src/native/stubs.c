@@ -659,6 +659,12 @@ int jaiGraphGemm(JaiGraphBuilder *b, int l, int r, int c, int tl, int tr,
     (void)b; (void)l; (void)r; (void)c; (void)tl; (void)tr; (void)alpha; (void)beta;
     return -1;
 }
+bool jaiGraphLstm(JaiGraphBuilder *b, int s, int r, int w, int bias,
+                  int state, int cell, int reverse, int *out) {
+    (void)b; (void)s; (void)r; (void)w; (void)bias; (void)state; (void)cell;
+    (void)reverse; (void)out;
+    return false;
+}
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *in, int inCount,
                               const int *out, int outCount) {
     (void)b; (void)in; (void)inCount; (void)out; (void)outCount; return NULL;

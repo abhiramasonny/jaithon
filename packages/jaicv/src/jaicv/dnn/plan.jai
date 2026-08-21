@@ -200,19 +200,33 @@ class Build {
     pub var shapes: dict[str, list[int]]
     pub var constants: dict[str, list[float]]
     pub var known: dict[str, bool]
+    pub var weights: dict[str, Tensor]
 
     pub fn init(
         self,
         builder: int,
         shapes: dict[str, list[int]],
         constants: dict[str, list[float]],
-        known: dict[str, bool]
+        known: dict[str, bool],
+        weights: dict[str, Tensor]
     ) {
         self.builder = builder
         self.ids = {}
         self.shapes = shapes
         self.constants = constants
         self.known = known
+        self.weights = weights
+    }
+
+    #: A value's numbers, whether they were folded or are simply a weight too
+    #: large to have been worth folding. Some operators have to rearrange their
+    #: weights at compile time and so need the numbers either way.
+    pub fn numbers_of(self, name: str) -> list[float]? {
+        let folded = self.constants.get(name, null)
+        if folded is not null { return folded }
+        let weight = self.weights.get(name, null)
+        if weight is null { return null }
+        return weight.download()
     }
 
     #: The builder id for a value, making a constant for it the first time a
@@ -508,6 +522,8 @@ fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
+    if node.op == "LSTM" { return emit_lstm(state, node) }
+
     if node.op == "MatMul" {
         #: Only the shapes that line up without broadcasting, and for the same
         #: reason as `Gemm`: a mismatch here is fatal rather than refusable.
@@ -594,6 +610,139 @@ fn emit(state: Build, node: GraphNode) -> bool {
     }
 
     return false
+}
+
+#: One direction's worth of an ONNX weight block, with the gates put into the
+#: order the platform's own LSTM wants.
+#:
+#: ONNX orders them i, o, f, z along the first axis and the operation orders
+#: them i, f, z, o, so the blocks move `[0, 2, 3, 1]`. Doing it here, on the
+#: initializer's numbers, means it happens once at compile time instead of
+#: being a transpose in the graph.
+fn regated(values: list[float], direction: int, hidden: int, width: int) -> list[float] {
+    let block = hidden * width
+    let base = direction * 4 * block
+    var out = __prim__.list_filled(4 * block, 0.0)
+    var at = 0
+    for source in [0, 2, 3, 1] {
+        for index in 0..block { out[at + index] = values[base + source * block + index] }
+        at += block
+    }
+    return out
+}
+
+#: ONNX `LSTM` as the platform's single operation.
+#:
+#: Only what maps exactly: one direction, no peepholes, no per-sequence
+#: lengths, the default activations. Anything else is left to the interpreter,
+#: which implements the whole operator.
+fn emit_lstm(state: Build, node: GraphNode) -> bool {
+    let b = state.builder
+    if node.outputs.len() == 0 { return false }
+    #: Forward only. Both other directions are correct in the interpreter, and
+    #: the platform's own operation indexes a reversed pass differently enough
+    #: that compiling one gave a different answer -- not a difference worth
+    #: guessing at for an operator that already runs.
+    if attr_str(node, "direction", "forward") != "forward" { return false }
+    if node.attrs.get("activations", null) is not null { return false }
+    #: The operation has no gate clamp, and ignoring one that a file asks for
+    #: would quietly change the answer.
+    if node.attrs.get("clip", null) is not null { return false }
+    if attr_int(node, "layout", 0) != 0 or attr_int(node, "input_forget", 0) != 0 { return false }
+    if node.inputs.len() > 4 and node.inputs[4].len() > 0 { return false }
+    if node.inputs.len() > 7 and node.inputs[7].len() > 0 { return false }
+
+    let x = state.shape_of(node.inputs[0])
+    if x is null or x.len() != 3 { return false }
+    let steps = x[0]
+    let batch = x[1]
+    let input_size = x[2]
+    let weights = state.numbers_of(node.inputs[1])
+    let recurrent = state.numbers_of(node.inputs[2])
+    #: The weights have to be numbers here, since the gates are reordered.
+    if weights is null or recurrent is null { return false }
+    let w_shape = state.shape_of(node.inputs[1])
+    if w_shape is null or w_shape.len() != 3 { return false }
+    let hidden = w_shape[1] // 4
+    if hidden <= 0 or w_shape[1] != 4 * hidden { return false }
+
+    let w = __prim__.graph_constant(
+        b,
+        regated(weights, 0, hidden, input_size),
+        [4 * hidden, input_size]
+    )
+    let r = __prim__.graph_constant(
+        b,
+        regated(recurrent, 0, hidden, hidden),
+        [4 * hidden, hidden]
+    )
+
+    #: ONNX carries an input bias and a recurrent one; the operation takes a
+    #: single bias added to the same gates, so their sum is the same thing.
+    var bias = -1
+    if node.inputs.len() > 3 and node.inputs[3].len() > 0 {
+        let given = state.numbers_of(node.inputs[3])
+        if given is null { return false }
+        var summed = __prim__.list_filled(4 * hidden, 0.0)
+        for index in 0..4 * hidden { summed[index] = given[index] + given[4 * hidden + index] }
+        bias = __prim__.graph_constant(b, regated(summed, 0, hidden, 1), [4 * hidden])
+    }
+
+    #: The initial state and cell arrive as `[1, N, H]` and are wanted `[N, H]`.
+    var start_state = -1
+    var start_cell = -1
+    if node.inputs.len() > 5 and node.inputs[5].len() > 0 {
+        start_state = __prim__.graph_reshape(b, state.id_of(node.inputs[5]), [batch, hidden])
+    }
+    if node.inputs.len() > 6 and node.inputs[6].len() > 0 {
+        start_cell = __prim__.graph_reshape(b, state.id_of(node.inputs[6]), [batch, hidden])
+    }
+
+    let made = __prim__.graph_lstm(
+        b,
+        state.id_of(node.inputs[0]),
+        r,
+        w,
+        bias,
+        start_state,
+        start_cell,
+        0
+    )
+    if made.len() != 2 { return false }
+    let all_state = made[0]
+    let all_cell = made[1]
+
+    #: `Y` is every timestep with a direction axis put back in; `Y_h` and `Y_c`
+    #: are the last step, which for a reversed pass is the first one produced.
+    if node.outputs[0].len() > 0 {
+        state.ids[node.outputs[0]] = __prim__.graph_reshape(
+            b,
+            all_state,
+            [steps, 1, batch, hidden]
+        )
+    }
+    let last = steps - 1
+    if node.outputs.len() > 1 and node.outputs[1].len() > 0 {
+        let cut = __prim__.graph_slice(
+            b,
+            all_state,
+            [last, 0, 0],
+            [last + 1, batch, hidden],
+            [1, 1, 1]
+        )
+        state.ids[node.outputs[1]] = __prim__.graph_reshape(b, cut, [1, batch, hidden])
+    }
+    if node.outputs.len() > 2 and node.outputs[2].len() > 0 {
+        let cut = __prim__.graph_slice(
+            b,
+            all_cell,
+            [last, 0, 0],
+            [last + 1, batch, hidden],
+            [1, 1, 1]
+        )
+        state.ids[node.outputs[2]] = __prim__.graph_reshape(b, cut, [1, batch, hidden])
+    }
+    return true
 }
 
 #: A `Slice` node's per-axis bounds, resolved against the input's real shape.
@@ -723,7 +872,7 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     for name in oversized { wanted.remove(name) }
 
     let builder = __prim__.graph_new()
-    var state = Build(builder, shapes, wanted, known)
+    var state = Build(builder, shapes, wanted, known, graph.initializers)
 
     #: Weights too large to fold are still constants in the graph, just ones
     #: whose numbers are handed over rather than reasoned about.

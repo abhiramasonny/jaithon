@@ -499,6 +499,48 @@ int jaiGraphGemm(JaiGraphBuilder *b, int left, int right, int c,
     }
 }
 
+/* A whole LSTM as one operation, rather than a loop over its timesteps.
+ *
+ * `source` is `[T, N, I]`, `recurrentWeight` `[4H, H]`, `inputWeight` `[4H, I]`
+ * and `bias` `[4H]`, with the gates ordered i, f, z, o -- which is not the
+ * order an ONNX file writes them in, so the caller permutes the weights before
+ * it gets here. `initState` and `initCell` are `[N, H]` and may be -1.
+ *
+ * Fills `out` with the state and cell sequences, both `[T, N, H]`. Returns
+ * false when the operation could not be built. */
+bool jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWeight,
+                  int bias, int initState, int initCell, int reverse, int *out) {
+    MPSGraphTensor *x = tensorAt(b, source);
+    MPSGraphTensor *r = tensorAt(b, recurrentWeight);
+    MPSGraphTensor *w = tensorAt(b, inputWeight);
+    if (x == nil || r == nil || w == nil || out == NULL) return false;
+    if (@available(macOS 13.0, *)) {
+        @autoreleasepool {
+            MPSGraph *g = (__bridge MPSGraph *)b->graph;
+            MPSGraphLSTMDescriptor *d = [MPSGraphLSTMDescriptor descriptor];
+            if (d == nil) return false;
+            d.reverse = reverse != 0;
+            d.bidirectional = NO;
+            d.produceCell = YES;
+            d.training = NO;
+            NSArray<MPSGraphTensor *> *made =
+                [g LSTMWithSourceTensor:x
+                        recurrentWeight:r
+                            inputWeight:w
+                                   bias:tensorAt(b, bias)
+                              initState:tensorAt(b, initState)
+                               initCell:tensorAt(b, initCell)
+                             descriptor:d
+                                   name:nil];
+            if (made == nil || made.count < 2) return false;
+            out[0] = record(b, made[0]);
+            out[1] = record(b, made[1]);
+            return out[0] >= 0 && out[1] >= 0;
+        }
+    }
+    return false;
+}
+
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                               const int *outputs, int outputCount) {
     if (b == NULL || inputs == NULL || outputs == NULL) return NULL;
