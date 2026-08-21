@@ -144,7 +144,7 @@ static bool nGraphBinary(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* Nine parameters for a convolution and eight for a pooling, both narrowed
+/* Nine parameters for a convolution and ten for a pooling, both narrowed
  * from the list the caller passes. A short list is a caller mistake rather
  * than a graph the device declines, so it raises. */
 static bool narrow(Value v, int index, const char *fnName, int wanted, int32_t *slots) {
@@ -179,10 +179,10 @@ static bool nGraphPool(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
     int64_t x, kind;
-    int32_t params[8];
+    int32_t params[10];
     if (!requireBuilder(args[0], 1, "graph_pool", &builder)) return false;
     if (!jaiArgInt(args[1], 2, "graph_pool", &x)) return false;
-    if (!narrow(args[2], 3, "graph_pool", 8, params)) return false;
+    if (!narrow(args[2], 3, "graph_pool", 10, params)) return false;
     if (!jaiArgInt(args[3], 4, "graph_pool", &kind)) return false;
     *out = INT_VAL(jaiGraphPool(builder, (int)x, params, (int)kind));
     return true;

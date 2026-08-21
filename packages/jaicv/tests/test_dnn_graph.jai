@@ -16,6 +16,7 @@
 from std.io import Path
 from std.test import assert_contains, assert_eq, assert_throws, assert_true
 from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, run_graph
+from jaicv.dnn.plan import Plan, compile_plan
 from jaitensor import Tensor
 
 #: One tensor out of the oracle file: `<tag> <rank> <dims...> <values...>`.
@@ -189,6 +190,101 @@ fn worst_difference(item: Case) -> float {
     for (_name, tensor) in produced.items() { tensor.free() }
     for (_name, tensor) in feeds.items() { tensor.free() }
     return worst
+}
+
+#: The same case, run through the compiled graph rather than the interpreter.
+#:
+#: A negative number means the compiler declined it, which is allowed -- the
+#: interpreter answers then, and the whole point of the fallback is that a
+#: graph it cannot express still runs. What is not allowed is compiling it and
+#: getting a different answer, which is what this catches.
+fn compiled_difference(item: Case) -> float {
+    var names: list[str] = []
+    var declared: list[str] = []
+    var feeds: dict[str, Tensor] = {}
+    for (index, feed) in item.feeds.enumerate() {
+        if feed is null {
+            names.push("")
+            continue
+        }
+        let name = f"in{index}"
+        names.push(name)
+        declared.push(name)
+        feeds[name] = feed.upload()
+    }
+    var outs: list[str] = []
+    for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
+    let graph = Graph(
+        nodes: [
+            GraphNode(item.op, name: item.name, inputs: names, outputs: outs, attrs: item.attrs),
+        ],
+        inputs: declared,
+        outputs: outs
+    )
+    var plan: Plan? = null
+    try {
+        plan = compile_plan(graph, feeds)
+    } catch _failure: Error {
+        plan = null
+    }
+    let built = plan
+    if built is null {
+        for (_name, tensor) in feeds.items() { tensor.free() }
+        return -1.0
+    }
+    let produced = built.run(feeds)
+    var worst = 0.0
+    for (slot, want) in item.wants.enumerate() {
+        let got = produced[outs[slot]]
+        assert_eq(got.shape, want.shape, f"{item.name} compiled to the wrong shape")
+        let values = got.download()
+        for index in 0..values.len() {
+            let expected = want.values[index]
+            let gap = abs(values[index] - expected) / max(1.0, abs(expected))
+            if gap > worst { worst = gap }
+        }
+    }
+    for (_name, tensor) in produced.items() { tensor.free() }
+    for (_name, tensor) in feeds.items() { tensor.free() }
+    built.free()
+    return worst
+}
+
+#: Every case the compiler accepts has to give the reference answer.
+fn check_compiled(group: str, tolerance: float) -> int {
+    var compiled = 0
+    for item in cases_in(group) {
+        let gap = compiled_difference(item)
+        if gap < 0.0 { continue }
+        compiled += 1
+        assert_true(
+            gap <= tolerance,
+            f"{item.op} case {item.name}, compiled, is off the reference by {gap}"
+        )
+    }
+    return compiled
+}
+
+#: The compiled graph against the same references the interpreter is held to.
+#:
+#: Counted as well as checked: if a change quietly stopped the compiler taking
+#: anything at all, every case would be skipped and the test would pass while
+#: testing nothing.
+fn test_the_compiled_graph_matches_onnxruntime() -> void {
+    var compiled = 0
+    for (group, tolerance) in [
+        ("elementwise", 1e-6),
+        ("broadcast", 1e-6),
+        ("shape", 1e-6),
+        ("window", 5e-6),
+        ("linear", 1e-6),
+        ("norm", 1e-5),
+        ("reduce", 1e-6),
+        ("resample", 3e-6),
+    ] {
+        compiled += check_compiled(group, tolerance)
+    }
+    assert_true(compiled >= 40, f"only {compiled} cases compiled, which is too few to mean much")
 }
 
 fn check_group(group: str, tolerance: float) -> void {

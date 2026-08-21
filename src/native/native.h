@@ -153,7 +153,7 @@ int              jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op)
 int              jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias,
                               const int32_t *p);
 /* `p`: kernel y, kernel x, stride y, stride x, pad top, pad bottom, pad left,
- * pad right. `kind` 0 maximum, 1 average. */
+ * pad right, ceil mode, pad counts toward an average. `kind` 0 max, 1 mean. */
 int              jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind);
 int              jaiGraphConcat(JaiGraphBuilder *b, const int *ids, int count, int axis);
 int              jaiGraphReshape(JaiGraphBuilder *b, int x, const int64_t *dims, int rank);
