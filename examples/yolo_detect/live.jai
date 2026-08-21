@@ -11,11 +11,16 @@
 #:     --record FILE  also write an AVI of what is shown
 #:     --headless     do not open a window (for --video with --record)
 #:
-#: On an M2 Max the network takes about 200 ms a frame, so detecting on every
-#: frame gives roughly 5 fps. `--every 3` runs it on one frame in three and
-#: keeps drawing the last boxes on the two between, which looks far smoother
-#: because the camera keeps delivering at its own rate -- the boxes are then up
-#: to two frames stale, which for anything moving at human speed is invisible.
+#: On an M2 Max a 720p frame costs about 14 ms all in -- roughly 7 for the
+#: network and 7 for everything around it -- so detecting on every frame runs
+#: at about 70 fps and the camera, not the detector, sets the pace. The model
+#: is interpreted on the first frame and compiled after, so the first one is
+#: slower than the rest by a wide margin.
+#:
+#: `--every N` runs the network on one frame in N and keeps drawing the last
+#: boxes on the ones between. It is not needed at this speed, but it is there
+#: for a slower machine or a larger model: the boxes go up to N-1 frames stale,
+#: which for anything moving at human speed is invisible.
 #: Press Esc or q to stop.
 import jaicv as cv
 from jaicv import Mat, Point, Scalar, Size
