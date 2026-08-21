@@ -16,6 +16,8 @@ typedef enum {
     HANDLE_WINDOW,
     HANDLE_GPU_BUFFER,
     HANDLE_GPU_KERNEL,
+    HANDLE_GRAPH_BUILDER,
+    HANDLE_GRAPH_PLAN,
 } HandleKind;
 
 int64_t jaiHandleAdd(HandleKind kind, void *ptr);

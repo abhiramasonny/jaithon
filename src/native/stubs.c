@@ -605,4 +605,59 @@ bool jaiGpuReduceSum(const double *a, size_t n, double *out) {
     return true;
 }
 
+/* No Metal, so no graph compiler either; every entry point refuses and the
+ * caller runs its operators one at a time as it always could. */
+JaiGraphBuilder *jaiGraphNew(void) { return NULL; }
+void jaiGraphFree(JaiGraphBuilder *b) { (void)b; }
+int jaiGraphInput(JaiGraphBuilder *b, const int64_t *dims, int rank) {
+    (void)b; (void)dims; (void)rank; return -1;
+}
+int jaiGraphConstant(JaiGraphBuilder *b, const float *values, const int64_t *dims, int rank) {
+    (void)b; (void)values; (void)dims; (void)rank; return -1;
+}
+int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) { (void)b; (void)x; (void)op; return -1; }
+int jaiGraphBinary(JaiGraphBuilder *b, int l, int r, int op) {
+    (void)b; (void)l; (void)r; (void)op; return -1;
+}
+int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
+    (void)b; (void)x; (void)w; (void)bias; (void)p; return -1;
+}
+int jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind) {
+    (void)b; (void)x; (void)p; (void)kind; return -1;
+}
+int jaiGraphConcat(JaiGraphBuilder *b, const int *ids, int count, int axis) {
+    (void)b; (void)ids; (void)count; (void)axis; return -1;
+}
+int jaiGraphReshape(JaiGraphBuilder *b, int x, const int64_t *dims, int rank) {
+    (void)b; (void)x; (void)dims; (void)rank; return -1;
+}
+int jaiGraphTranspose(JaiGraphBuilder *b, int x, const int32_t *perm, int rank) {
+    (void)b; (void)x; (void)perm; (void)rank; return -1;
+}
+int jaiGraphSlice(JaiGraphBuilder *b, int x, const int32_t *s, const int32_t *e,
+                  const int32_t *t, int rank) {
+    (void)b; (void)x; (void)s; (void)e; (void)t; (void)rank; return -1;
+}
+int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) { (void)b; (void)x; (void)axis; return -1; }
+int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int h, int w) {
+    (void)b; (void)x; (void)h; (void)w; return -1;
+}
+int jaiGraphMatmul(JaiGraphBuilder *b, int l, int r) { (void)b; (void)l; (void)r; return -1; }
+int jaiGraphReduce(JaiGraphBuilder *b, int x, const int32_t *axes, int count, int kind) {
+    (void)b; (void)x; (void)axes; (void)count; (void)kind; return -1;
+}
+JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *in, int inCount,
+                              const int *out, int outCount) {
+    (void)b; (void)in; (void)inCount; (void)out; (void)outCount; return NULL;
+}
+int jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index) { (void)plan; (void)index; return -1; }
+bool jaiGraphPlanOutputShape(JaiGraphPlan *plan, int index, int64_t *dims, int rank) {
+    (void)plan; (void)index; (void)dims; (void)rank; return false;
+}
+bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOff,
+                 JaiGpuBuffer **outs, const size_t *outOff) {
+    (void)plan; (void)ins; (void)inOff; (void)outs; (void)outOff; return false;
+}
+void jaiGraphPlanFree(JaiGraphPlan *plan) { (void)plan; }
+
 #endif /* !__APPLE__ */

@@ -48,6 +48,14 @@ void jaiRegisterReflectPrimitives(void); /* compile, eval, exec, ast           *
 void jaiRegisterGuiPrimitives(void);
 void jaiRegisterCameraPrimitives(void);
 void jaiRegisterGpuPrimitives(void);
+void jaiRegisterGraphPrimitives(void);
+/* Declared here rather than pulling native.h in: runtime.h is included
+ * everywhere, and the platform header is not. */
+struct JaiGpuBuffer;
+/* A `__prim__.gpu_buffer_*` handle as its native buffer and element offset,
+ * so the graph primitives can feed device memory through a compiled plan. */
+bool jaiGpuBufferOf(Value v, int index, const char *fnName,
+                    struct JaiGpuBuffer **buffer, int64_t *origin);
 void jaiRegisterAllBuiltins(void);
 
 bool jaiBuiltinMethod(Value receiver, ObjString *name, Value *out);

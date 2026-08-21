@@ -67,6 +67,7 @@ let WILDCARDS = [
     "cond_",
     "atomic_",
     "gpu_",
+    "graph_",
     "gui_",
     "canvas_",
     "camera_",

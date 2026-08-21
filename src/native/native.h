@@ -112,6 +112,68 @@ void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
  * against a fraction of one for this. */
 void          jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
                                size_t offset, float scale);
+/* Building a whole network as one MPSGraph rather than dispatching each of its
+ * operators separately.
+ *
+ * A builder collects tensors, each identified by the small integer its maker
+ * returned; -1 means the call was refused, and every later call that names it
+ * is refused in turn, so a caller can build a whole graph and check once. A
+ * compile turns the builder into a plan, and a run feeds device buffers
+ * through it. See src/native/apple/graphbuild.m for why this exists. */
+/* The Apple backend's shared Metal objects, for the graph compiler that lives
+ * beside it. Opaque to everything outside src/native/apple. */
+#ifdef __OBJC__
+@protocol MTLDevice;
+@protocol MTLCommandQueue;
+id<MTLDevice>       jaiGpuMetalDevice(void);
+id<MTLCommandQueue> jaiGpuMetalQueue(void);
+#endif
+void               *jaiGpuBufferHandle(JaiGpuBuffer *b);
+/* Encode an MPSGraphExecutable into the shared command buffer. The three
+ * pointers are an MPSGraphExecutable and two NSArrays of MPSGraphTensorData,
+ * passed as void so that only the Objective-C files need the types. */
+bool                jaiGpuEncodeExecutable(void *executable, void *inputs, void *results);
+
+typedef struct JaiGraphBuilder JaiGraphBuilder;
+typedef struct JaiGraphPlan JaiGraphPlan;
+
+JaiGraphBuilder *jaiGraphNew(void);
+void             jaiGraphFree(JaiGraphBuilder *b);
+int              jaiGraphInput(JaiGraphBuilder *b, const int64_t *dims, int rank);
+int              jaiGraphConstant(JaiGraphBuilder *b, const float *values,
+                                  const int64_t *dims, int rank);
+/* 0 relu, 1 sigmoid, 2 tanh, 3 exp, 4 log, 5 sqrt, 6 neg, 7 abs, 8 erf,
+ * 9 silu, 10 floor, 11 ceil, 12 reciprocal, 13 square, 14 rsqrt. */
+int              jaiGraphUnary(JaiGraphBuilder *b, int x, int op);
+/* 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min, 6 pow. */
+int              jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op);
+/* `p`: stride y, stride x, pad top, pad bottom, pad left, pad right,
+ * dilation y, dilation x, groups. `bias` may be -1. */
+int              jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias,
+                              const int32_t *p);
+/* `p`: kernel y, kernel x, stride y, stride x, pad top, pad bottom, pad left,
+ * pad right. `kind` 0 maximum, 1 average. */
+int              jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind);
+int              jaiGraphConcat(JaiGraphBuilder *b, const int *ids, int count, int axis);
+int              jaiGraphReshape(JaiGraphBuilder *b, int x, const int64_t *dims, int rank);
+int              jaiGraphTranspose(JaiGraphBuilder *b, int x, const int32_t *perm, int rank);
+int              jaiGraphSlice(JaiGraphBuilder *b, int x, const int32_t *starts,
+                               const int32_t *ends, const int32_t *steps, int rank);
+int              jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis);
+int              jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width);
+int              jaiGraphMatmul(JaiGraphBuilder *b, int left, int right);
+/* `kind` 0 sum, 1 mean, 2 maximum, 3 minimum. */
+int              jaiGraphReduce(JaiGraphBuilder *b, int x, const int32_t *axes,
+                                int count, int kind);
+JaiGraphPlan    *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
+                                 const int *outputs, int outputCount);
+int              jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index);
+bool             jaiGraphPlanOutputShape(JaiGraphPlan *plan, int index,
+                                         int64_t *dims, int rank);
+bool             jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets,
+                             JaiGpuBuffer **outs, const size_t *outOffsets);
+void             jaiGraphPlanFree(JaiGraphPlan *plan);
+
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
                             char *errBuf, size_t errBufSize);
 /* The kernel is opaque; this is the only way to free one. */
