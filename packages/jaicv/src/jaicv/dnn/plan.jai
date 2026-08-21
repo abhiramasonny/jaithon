@@ -321,6 +321,50 @@ fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
+    if node.op == "ConvTranspose" {
+        let x = state.shape_of(node.inputs[0])
+        let w = state.shape_of(node.inputs[1])
+        let want = state.shape_of(out)
+        if x is null or w is null or want is null { return false }
+        if x.len() != 4 or w.len() != 4 or want.len() != 4 { return false }
+        if attr_int(node, "group", 1) != 1 { return false }
+        #: ONNX writes these `[in, out, kH, kW]`, which is already the layout
+        #: of the forward convolution being undone, so nothing is rearranged.
+        if w[0] != x[1] { return false }
+        let strides = attr_ints(node, "strides", [1, 1])
+        let dilations = attr_ints(node, "dilations", [1, 1])
+        #: The padding a transposed convolution declares is taken off its
+        #: output, and the forward convolution it undoes is the one whose
+        #: input is that output -- so the spatial size to resolve against is
+        #: the result's, not the source's.
+        let pads = resolved_pads(node, [want[2], want[3]], [w[2], w[3]], strides, dilations)
+        if pads is null { return false }
+        let bias = if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
+            state.id_of(node.inputs[2])
+        } else {
+            -1
+        }
+        state.ids[out] = __prim__.graph_conv_transpose(
+            b,
+            state.id_of(node.inputs[0]),
+            state.id_of(node.inputs[1]),
+            bias,
+            [
+                strides[0],
+                strides[1],
+                pads[0],
+                pads[2],
+                pads[1],
+                pads[3],
+                dilations[0],
+                dilations[1],
+                1,
+            ],
+            dims_of(want)
+        )
+        return true
+    }
+
     if node.op == "MaxPool" or node.op == "AveragePool" {
         let x = state.shape_of(node.inputs[0])
         if x is null or x.len() != 4 { return false }
@@ -743,6 +787,29 @@ fn emit(state: Build, node: GraphNode) -> bool {
         } else {
             -1
         }
+        state.ids[out] = __prim__.graph_layer_norm(
+            b,
+            state.id_of(node.inputs[0]),
+            gamma,
+            beta,
+            axes,
+            attr_float(node, "epsilon", 1.0e-5)
+        )
+        return true
+    }
+
+    if node.op == "InstanceNormalization" {
+        #: The same normalisation layer norm uses, over the spatial axes
+        #: instead of the trailing ones, with the scale and shift widened so
+        #: they line up with the channel.
+        let x = state.shape_of(node.inputs[0])
+        if x is null or x.len() < 3 { return false }
+        var axes: list[int] = []
+        for axis in 2..x.len() { axes.push(axis) }
+        var per_channel = [1 for _index in 0..x.len()]
+        per_channel[1] = x[1]
+        let gamma = __prim__.graph_reshape(b, state.id_of(node.inputs[1]), per_channel)
+        let beta = __prim__.graph_reshape(b, state.id_of(node.inputs[2]), per_channel)
         state.ids[out] = __prim__.graph_layer_norm(
             b,
             state.id_of(node.inputs[0]),

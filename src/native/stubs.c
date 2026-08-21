@@ -628,6 +628,10 @@ int jaiGraphBinary(JaiGraphBuilder *b, int l, int r, int op) {
 int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
     (void)b; (void)x; (void)w; (void)bias; (void)p; return -1;
 }
+int jaiGraphConvTranspose(JaiGraphBuilder *b, int x, int w, int bias,
+                          const int32_t *p, const int64_t *shape) {
+    (void)b; (void)x; (void)w; (void)bias; (void)p; (void)shape; return -1;
+}
 int jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind) {
     (void)b; (void)x; (void)p; (void)kind; return -1;
 }
