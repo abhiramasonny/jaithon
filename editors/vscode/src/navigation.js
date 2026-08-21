@@ -33,6 +33,16 @@ function byteOffsetAt(analysis, position) {
     return analysis.offsets.byte(starts[position.line] + position.character);
 }
 
+/** The deepest lexical scope whose extent contains `offset`. */
+function scopeIdAt(analysis, offset) {
+    let best = analysis.moduleScope;
+    for (const scope of analysis.scopes) {
+        if (offset < scope.start || offset > scope.end) continue;
+        if (analysis.scopes[best].start <= scope.start) best = scope.id;
+    }
+    return best;
+}
+
 async function contextAt(workspace, document, position, token) {
     const analysis = await workspace.analyze(document, token);
     if (!analysis) return null;
@@ -547,4 +557,4 @@ function register(context, workspace) {
     );
 }
 
-module.exports = { register, contextAt, byteOffsetAt, referencesTo };
+module.exports = { register, contextAt, byteOffsetAt, referencesTo, scopeIdAt };
