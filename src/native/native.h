@@ -105,6 +105,11 @@ void          jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t co
 void          jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
                              size_t offset);
+/* The buffer's own memory to read from, after everything queued has run, or
+ * NULL when the range does not fit. Storage is shared, so a caller that is
+ * going to walk the values anyway can skip the staging copy entirely. Good
+ * until the next GPU work touches the buffer. */
+const float  *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 /* Narrow float slots straight into unsigned bytes, dividing by `scale` and
  * rounding half up. The inverse of jaiGpuUploadU8, and the way to get pixels
  * back without turning every one of them into a boxed list element -- a 720p

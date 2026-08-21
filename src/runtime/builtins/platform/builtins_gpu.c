@@ -341,23 +341,23 @@ static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
         return true;
     }
 
-    float *raw = JAI_ALLOC(float, wanted);
-    jaiGpuDownload(b->buffer, raw, (size_t)wanted * sizeof(float),
-                   (size_t)(b->origin + offset) * sizeof(float));
+    /* Read where the values already are. Storage is shared, so staging them
+     * into an array first would be an allocation and a copy of the whole
+     * buffer before the loop below even started. */
+    const float *raw = jaiGpuMapRead(b->buffer, (size_t)(b->origin + offset),
+                                     (size_t)wanted);
+    if (raw == NULL)
+        return jaiThrow(vm.cRuntimeError,
+                        "gpu_buffer_download(): the buffer could not be read");
 
     /* Reserved once and written through, rather than pushed a value at a
      * time. The push path re-checks capacity on every element, and a 720p
-     * frame is 2.8 million of them: this took reading one back from the
-     * device from 8.5 ms to 3.5. */
+     * frame is 2.8 million of them. */
     ObjList *list = jaiListNew((int)wanted);
-    if (list == NULL || !jaiListReserveExact(list, (int)wanted)) {
-        JAI_FREE_ARRAY(float, raw, wanted);
-        return false;
-    }
+    if (list == NULL || !jaiListReserveExact(list, (int)wanted)) return false;
     for (int64_t i = 0; i < wanted; i++) list->items[i] = FLOAT_VAL(raw[i]);
     list->count = (int)wanted;
     list->version++;
-    JAI_FREE_ARRAY(float, raw, wanted);
 
     *out = OBJ_VAL(list);
     return true;
