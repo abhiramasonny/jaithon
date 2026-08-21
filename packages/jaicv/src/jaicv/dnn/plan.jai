@@ -27,6 +27,7 @@ import jaitensor as jt
 from jaitensor import Tensor
 from .graph import Graph, GraphNode, attr_int, attr_ints, attr_str
 from .graph import normalize_axis, run_graph
+from std.os import env
 
 #: How many elements a value may hold and still be folded at compile time.
 #: Shape arithmetic deals in a handful of integers; this is loose enough for
@@ -88,6 +89,7 @@ let FOLDABLE = {
 pub class Plan {
     let handle: int
     pub let inputs: list[str]
+    pub let input_shapes: list[list[int]]
     pub let outputs: list[str]
     pub let output_shapes: list[list[int]]
     var freed: bool
@@ -96,14 +98,28 @@ pub class Plan {
         self,
         handle: int,
         inputs: list[str],
+        input_shapes: list[list[int]],
         outputs: list[str],
         output_shapes: list[list[int]]
     ) {
         self.handle = handle
         self.inputs = [name for name in inputs]
+        self.input_shapes = [[d for d in shape] for shape in input_shapes]
         self.outputs = [name for name in outputs]
         self.output_shapes = [[d for d in shape] for shape in output_shapes]
         self.freed = false
+    }
+
+    #: Whether this plan was built for the shapes it is being handed. A plan is
+    #: compiled for one set of sizes and is wrong for any other, so a caller
+    #: that changes them gets the interpreter back rather than a wrong answer.
+    pub fn fits(self, feeds: dict[str, Tensor]) -> bool {
+        for (index, name) in self.inputs.enumerate() {
+            let fed = feeds.get(name, null)
+            if fed is null { return false }
+            if fed.shape != self.input_shapes[index] { return false }
+        }
+        return true
     }
 
     #: Feed the plan and get its outputs, by the names the model gave them.
@@ -609,5 +625,49 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     for index in 0..graph.outputs.len() {
         out_shapes.push(__prim__.graph_plan_output_shape(plan, index))
     }
-    return Plan(plan, graph.inputs, graph.outputs, out_shapes)
+    var in_shapes: list[list[int]] = []
+    for name in graph.inputs {
+        let shape = shapes.get(name, null)
+        in_shapes.push(if shape is null { [] } else { shape })
+    }
+    return Plan(plan, graph.inputs, in_shapes, graph.outputs, out_shapes)
+}
+
+
+#: The plan already compiled for a graph, by the graph's number.
+var _plans: dict[int, Plan] = {}
+var _seen: dict[int, int] = {}
+var _refused: dict[int, bool] = {}
+
+#: Run a model whichever way is faster for it.
+#:
+#: The first call interprets: compiling costs about what a couple of hundred
+#: inferences do, and a model run once should not pay for it. From the second
+#: call on, the graph is compiled and the plan is used for every run after --
+#: which is the shape of every real use, since a detector runs its model on
+#: frame after frame.
+#:
+#: A graph the compiler will not take is remembered as such and interpreted
+#: from then on without trying again. `JAICV_GRAPH_PLAN=0` keeps it on the
+#: interpreter throughout, which is how the two are compared.
+pub fn run_best(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
+    if env("JAICV_GRAPH_PLAN") == "0" { return run_graph(graph, feeds) }
+    let held = _plans.get(graph.id, null)
+    if held is not null {
+        if held.fits(feeds) { return held.run(feeds) }
+        #: The shapes moved, so the plan is no longer about this call.
+        held.free()
+        _plans.remove(graph.id)
+    }
+    if _refused.get(graph.id, false) { return run_graph(graph, feeds) }
+    let seen = _seen.get(graph.id, 0) + 1
+    _seen[graph.id] = seen
+    if seen < 2 { return run_graph(graph, feeds) }
+    let built = compile_plan(graph, feeds)
+    if built is null {
+        _refused[graph.id] = true
+        return run_graph(graph, feeds)
+    }
+    _plans[graph.id] = built
+    return built.run(feeds)
 }

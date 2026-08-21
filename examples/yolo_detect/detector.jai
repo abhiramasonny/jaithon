@@ -15,6 +15,7 @@ import jaicv as cv
 import jaitensor as jt
 from jaicv import Mat, Point, Rect, Scalar, Size
 from jaicv.dnn.graph import run_graph
+from jaicv.dnn.plan import run_best
 from jaicv.dnn.onnx import read_net_from_onnx
 from jaicv.dnn.graph import Graph
 from std.io import Path
@@ -250,7 +251,9 @@ pub fn detect_frame(graph: Graph, image: Mat) -> list[Detection] {
     #: The blob is already on the device, so the tensor shares its storage
     #: rather than making a round trip through the host to say so.
     let input = cv.blob_to_tensor(blob, 3, Size(INPUT, INPUT))
-    let outputs = run_graph(graph, {graph.inputs[0]: input})
+    #: `run_best` interprets the first frame and compiles the model after,
+    #: which for a run of more than one frame is most of the speed.
+    let outputs = run_best(graph, {graph.inputs[0]: input})
     let raw = outputs[graph.outputs[0]].download()
     return decode(raw, scale, pad_x, pad_y, image.cols, image.rows)
 }
