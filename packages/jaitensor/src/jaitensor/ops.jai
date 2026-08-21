@@ -894,20 +894,40 @@ kernel void reduce_sum_rows(device const float* input [[buffer(0)]],
     output[row] = total;
 }
 
+/* Each thread walks the array in strides of the whole grid and keeps a
+ * running total in a register, so the expensive part -- combining the
+ * threadgroup -- happens once per thousands of elements rather than once per
+ * two hundred and fifty-six. The combine itself is a simdgroup reduction and
+ * a sweep over the eight lane totals, which costs one barrier where the
+ * shared-memory tree it replaces cost eight.
+ *
+ * A reduction reads its input and writes almost nothing, so it should run at
+ * whatever the device can read. The version this replaces managed 46 GB/s on
+ * four million floats where an elementwise pass over the same bytes managed
+ * 432. */
 kernel void reduce_sum_all(device const float* input [[buffer(0)]],
                            device float* output [[buffer(1)]],
                            constant uint& count [[buffer(2)]],
+                           constant uint& span [[buffer(3)]],
                            uint gid [[thread_position_in_grid]],
                            uint lid [[thread_index_in_threadgroup]],
-                           uint wid [[threadgroup_position_in_grid]]) {
-    threadgroup float scratch[256];
-    scratch[lid] = (gid < count) ? input[gid] : 0.0f;
+                           uint wid [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint warp [[simdgroup_index_in_threadgroup]]) {
+    float total = 0.0f;
+    for (uint i = gid; i < count; i += span) total += input[i];
+
+    threadgroup float lanes[32];
+    if (lid < 32u) lanes[lid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) scratch[lid] += scratch[lid + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float sum = 0.0f;
+        for (uint j = 0u; j < 32u; j++) sum += lanes[j];
+        output[wid] = sum;
     }
-    if (lid == 0) output[wid] = scratch[0];
 }
 
 kernel void copy_range(device const float* source [[buffer(0)]],
@@ -1805,43 +1825,61 @@ fn reduce_leading(upstream: Tensor, small_shape: list[int], out: Tensor? = null)
     }
     #: One thread a column reads every row of that column, which is fine while
     #: the columns outnumber the rows -- a dense layer's bias gradient is a
-    #: hundred rows against a thousand columns. A convolution's is the other way
-    #: round: thirty-two columns against a hundred and thirty thousand rows, so
-    #: thirty-two threads did four million serial reads while the rest of the
-    #: GPU sat idle, and it cost twelve times the whole rest of the layer.
-    #: Splitting the rows first gives the machine something to do.
-    let SPLIT_ROWS = 4096
-    if outer > SPLIT_ROWS and inner * 64 < outer {
-        let chunks = min(256, (outer + SPLIT_ROWS - 1) // SPLIT_ROWS)
+    #: hundred rows against a thousand columns. A convolution's is the other
+    #: way round: thirty-two columns against a hundred and thirty thousand
+    #: rows, so thirty-two threads did four million serial reads while the rest
+    #: of the GPU sat idle.
+    #:
+    #: Splitting the rows fixes that, but only if it is split far enough. One
+    #: pass with a couple of hundred chunks still left five hundred threads
+    #: running on a machine that wants tens of thousands, and the reduction
+    #: measured a millisecond and a third whatever the layer's size -- the
+    #: signature of work that is waiting rather than reading. So it splits
+    #: repeatedly, each pass turning `outer` rows into `chunks`, until what is
+    #: left is small enough for one thread a column to finish quickly.
+    #:
+    #: The column index is what varies fastest across threads, which is what
+    #: keeps neighbouring threads reading neighbouring addresses.
+    let FINAL_ROWS = 64
+    let TARGET_THREADS = 65536
+    let MIN_ROWS_PER_CHUNK = 8
+    var rows = outer
+    var source = upstream
+    var owned: Tensor? = null
+    while rows > FINAL_ROWS {
+        let chunks = min(
+            max(1, TARGET_THREADS // inner),
+            max(1, rows // MIN_ROWS_PER_CHUNK)
+        )
+        if chunks >= rows { break }
         let partials = Tensor([chunks * inner])
         cached_kernel("reduce_leading_split").dispatch_async(
-            [upstream.buffer(), partials.buffer()],
+            [source.buffer(), partials.buffer()],
             inner * chunks,
-            [outer, inner, chunks]
+            [rows, inner, chunks]
         )
-        if inner % 4 == 0 {
-            cached_kernel("reduce_leading4").dispatch_async(
-                [partials.buffer(), output.buffer()],
-                inner // 4,
-                [chunks, inner]
-            )
-        } else {
-            cached_kernel("reduce_leading").dispatch_async(
-                [partials.buffer(), output.buffer()],
-                inner,
-                [chunks, inner]
-            )
-        }
-        partials.free()
-        return output
+        let previous = owned
+        if previous is not null { previous.free() }
+        owned = partials
+        source = partials
+        rows = chunks
     }
+
     if inner % 4 == 0 {
-        let kernel = cached_kernel("reduce_leading4")
-        kernel.dispatch_async([upstream.buffer(), output.buffer()], inner // 4, [outer, inner])
+        cached_kernel("reduce_leading4").dispatch_async(
+            [source.buffer(), output.buffer()],
+            inner // 4,
+            [rows, inner]
+        )
     } else {
-        let kernel = cached_kernel("reduce_leading")
-        kernel.dispatch_async([upstream.buffer(), output.buffer()], inner, [outer, inner])
+        cached_kernel("reduce_leading").dispatch_async(
+            [source.buffer(), output.buffer()],
+            inner,
+            [rows, inner]
+        )
     }
+    let last = owned
+    if last is not null { last.free() }
     return output
 }
 
@@ -2390,13 +2428,20 @@ fn expand_last(reduced: Tensor, columns: int) -> Tensor {
 #: Sum of every element, or of the last axis when `axis` is `-1`.
 pub fn sum(input: Tensor, axis: int? = null) -> Tensor {
     if axis is null {
-        let groups = (input.size + 255) // 256
+        #: Enough groups to fill the machine and no more. Each one sweeps its
+        #: share of the input in a register, so giving every element its own
+        #: thread would only add threadgroups to combine.
+        let ELEMENTS_PER_GROUP = 2048
+        let groups = min(
+            1024,
+            max(1, (input.size + ELEMENTS_PER_GROUP - 1) // ELEMENTS_PER_GROUP)
+        )
         let partials = Tensor([groups])
         let kernel = cached_kernel("reduce_sum_all")
         kernel.dispatch_async(
             [input.buffer(), partials.buffer()],
             groups * 256,
-            [input.size],
+            [input.size, groups * 256],
             group_size: 256
         )
         let output = if groups == 1 {
