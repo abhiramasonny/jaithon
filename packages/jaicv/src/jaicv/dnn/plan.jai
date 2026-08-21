@@ -1195,9 +1195,10 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
 #: A `Slice` node's per-axis bounds, resolved against the input's real shape.
 #:
 #: ONNX writes an open end as the largest integer there is and allows negative
-#: indices; the builder wants neither, so both are settled here. Only forward
-#: slices are compiled -- a negative step is rare enough that leaving it to the
-#: interpreter costs nothing.
+#: indices; the builder wants neither, so both are settled here. Steps may be
+#: greater than one, and whatever comes out is checked against the shape the
+#: survey saw before any of it is used -- which is what makes compiling the
+#: awkward cases safe rather than hopeful.
 fn slice_bounds(
     state: Build,
     node: GraphNode,
@@ -1220,32 +1221,43 @@ fn slice_bounds(
     } else {
         for index in 0..given_starts.len() { axes.push(index) }
     }
+    var given_steps: list[int] = []
+    for _index in 0..axes.len() { given_steps.push(1) }
     if node.inputs.len() > 4 and node.inputs[4].len() > 0 {
         let given = state.constants.get(node.inputs[4], null)
         if given is null { return null }
-        for value in as_ints(given) {
-            if value != 1 { return null }
-        }
+        given_steps = as_ints(given)
+        if given_steps.len() != axes.len() { return null }
     }
 
     for (slot, raw_axis) in axes.enumerate() {
         let axis = normalize_axis(raw_axis, rank, node.label())
         let width = shape[axis]
+        let step = given_steps[slot]
+        #: Forward only. A negative stride means something different here than
+        #: it does in ONNX -- the operation reads the end as an index from the
+        #: back rather than as one past the beginning, and a reversed slice
+        #: came out empty -- so those go to the interpreter.
+        if step <= 0 { return null }
         var first = int(given_starts[slot])
         var last = int(given_ends[slot])
         if first < 0 { first += width }
         if last < 0 { last += width }
-        if first < 0 { first = 0 }
-        if first > width { first = width }
-        if last < 0 { last = 0 }
-        if last > width { last = width }
+        #: Forward and backward clamp to different ends: walking down, the
+        #: last index reachable is zero and "past the start" is -1.
+        first = min(max(first, 0), width)
+        last = min(max(last, 0), width)
         starts[axis] = first
         ends[axis] = last
+        steps[axis] = step
     }
     #: The survey already knows what came out; if these bounds disagree with
     #: it, something has been read wrongly and the interpreter should have it.
+    #: That check is what makes it safe to compile the awkward cases at all.
     for index in 0..rank {
-        if ends[index] - starts[index] != want[index] { return null }
+        let step = steps[index]
+        let span = (ends[index] - starts[index] + step - 1) // step
+        if max(span, 0) != want[index] { return null }
     }
     return [starts, ends, steps]
 }
