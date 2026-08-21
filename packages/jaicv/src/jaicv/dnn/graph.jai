@@ -307,6 +307,74 @@ kernel void binary_ex(device const float* a [[buffer(0)]],
     output[id] = r;
 }
 
+/* Layer normalisation over the trailing axes, one threadgroup a row.
+ *
+ * A transformer runs one of these before every attention and every feed
+ * forward block, so it is on the critical path dozens of times a forward pass.
+ * A thread a row would leave a couple of hundred threads doing three serial
+ * sweeps each; a threadgroup a row puts the whole machine on it and reduces
+ * with simdgroup sums.
+ *
+ * `mean` and `inv_std` are written unconditionally -- they are one float a row
+ * and ONNX lets a graph ask for them. */
+kernel void layer_norm_rows(device const float* input [[buffer(0)]],
+                            device const float* gamma [[buffer(1)]],
+                            device const float* beta [[buffer(2)]],
+                            device float* output [[buffer(3)]],
+                            device float* mean_out [[buffer(4)]],
+                            device float* inv_out [[buffer(5)]],
+                            constant uint& width [[buffer(6)]],
+                            constant uint& eps_bits [[buffer(7)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    const uint base = row * width;
+    threadgroup float lanes[32];
+    threadgroup float shared_mean;
+    threadgroup float shared_inv;
+
+    float total = 0.0f;
+    for (uint i = lid; i < width; i += GROUP) total += input[base + i];
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_mean = s / float(width);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float m = shared_mean;
+
+    float sq = 0.0f;
+    for (uint i = lid; i < width; i += GROUP) {
+        float d = input[base + i] - m;
+        sq += d * d;
+    }
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sq = simd_sum(sq);
+    if (lane == 0u) lanes[warp] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_inv = rsqrt(s / float(width) + as_type<float>(eps_bits));
+        mean_out[row] = m;
+        inv_out[row] = shared_inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = shared_inv;
+
+    for (uint i = lid; i < width; i += GROUP) {
+        output[base + i] = gamma[i] * (input[base + i] - m) * inv + beta[i];
+    }
+}
+
 kernel void channel_moments_nchw(device const float* input [[buffer(0)]],
                                  device float* mean [[buffer(1)]],
                                  device float* variance [[buffer(2)]],
@@ -2142,6 +2210,60 @@ fn op_batch_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [output]
 }
 
+#: ONNX `LayerNormalization`: normalise each row over the axes from `axis` on.
+#:
+#: Every transformer export -- ViT, CvT, and anything with an attention block
+#: -- opens with one of these, so a graph runner without it cannot load them at
+#: all. The axes from `axis` onward are flattened into one row, which is what
+#: normalising over them means, and the scale and shift run along that row.
+fn op_layer_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let x = need(ins, 0, node)
+    let scale = need(ins, 1, node)
+    let shift = maybe(ins, 2)
+    let rank = x.rank()
+    let raw_axis = attr_int(node, "axis", -1)
+    let axis = if raw_axis < 0 { rank + raw_axis } else { raw_axis }
+    if axis < 0 or axis >= rank {
+        throw ValueError(f"{node.label()} normalises axis {raw_axis} of a rank-{rank} input")
+    }
+    var width = 1
+    for other in axis..rank { width *= x.shape[other] }
+    if width <= 0 { throw ValueError(f"{node.label()} normalises an empty axis of {x.shape}") }
+    let rows = x.size // width
+    if scale.size != width {
+        throw ValueError(f"{node.label()} scales {scale.size} of {width} normalised values")
+    }
+    if shift is not null and shift.size != width {
+        throw ValueError(f"{node.label()} shifts {shift.size} of {width} normalised values")
+    }
+    #: The shift is optional in the operator and not in the kernel, so an
+    #: absent one becomes zeros rather than a second code path.
+    let bias = if shift is not null { shift } else { jt.Tensor.zeros([width]) }
+    let output = jt.Tensor(x.shape)
+    let mean = jt.Tensor([rows])
+    let inv_std = jt.Tensor([rows])
+    kernel_for("layer_norm_rows").dispatch_async(
+        [
+            x.buffer(),
+            scale.buffer(),
+            bias.buffer(),
+            output.buffer(),
+            mean.buffer(),
+            inv_std.buffer(),
+        ],
+        rows * 256,
+        [width, f32_bits(attr_float(node, "epsilon", 1.0e-5))],
+        group_size: 256
+    )
+    if shift is null { bias.free() }
+    #: `Mean` and `InvStdDev` are optional outputs, shaped like the input with
+    #: the normalised axes collapsed to one. The ones a graph does not name are
+    #: dropped by the caller.
+    var moment_shape: list[int] = []
+    for other in 0..rank { moment_shape.push(if other < axis { x.shape[other] } else { 1 }) }
+    return [output, jt.reshape(mean, moment_shape), jt.reshape(inv_std, moment_shape)]
+}
+
 fn op_instance_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let x = need(ins, 0, node)
     let scale = need(ins, 1, node)
@@ -2577,6 +2699,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["GlobalMaxPool"] = op_global_max_pool
     _handlers["BatchNormalization"] = op_batch_norm
     _handlers["InstanceNormalization"] = op_instance_norm
+    _handlers["LayerNormalization"] = op_layer_norm
     _handlers["LRN"] = op_lrn
     _handlers["Dropout"] = op_dropout
     _handlers["Identity"] = op_identity
