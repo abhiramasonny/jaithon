@@ -488,6 +488,37 @@ def build_cases():
         {"size": 3, "alpha": 0.0002, "beta": 0.6, "bias": 1.5},
     )
     case("norm", "lrn_defaults", "LRN", [spread(2, 4, 2, 2, seed=57)], {"size": 5})
+    # Layer normalisation, which every transformer export opens with. The
+    # scale and shift take the shape of the axes being normalised, not their
+    # flattened length, which is what the operator's own checker enforces.
+    case(
+        "norm",
+        "layernorm_last",
+        "LayerNormalization",
+        [spread(4, 16, seed=140), spread(16, seed=141), spread(16, seed=142)],
+        {"epsilon": 1e-5},
+    )
+    case(
+        "norm",
+        "layernorm_tokens",
+        "LayerNormalization",
+        [spread(2, 7, 32, seed=143), spread(32, seed=144), spread(32, seed=145)],
+        {"epsilon": 1e-5},
+    )
+    case(
+        "norm",
+        "layernorm_axis_one",
+        "LayerNormalization",
+        [spread(2, 3, 4, seed=146), spread(3, 4, seed=147), spread(3, 4, seed=148)],
+        {"axis": 1, "epsilon": 1e-3},
+    )
+    case(
+        "norm",
+        "layernorm_no_bias",
+        "LayerNormalization",
+        [spread(3, 8, seed=149), spread(8, seed=150)],
+        {"epsilon": 1e-6},
+    )
 
     # Reductions.
     reduce_in = spread(2, 3, 4, seed=58)
