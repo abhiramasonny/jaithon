@@ -13,6 +13,7 @@
 #: already applied it.
 import jaicv as cv
 import jaitensor as jt
+from jaitensor import Tensor
 from jaicv import Mat, Point, Rect, Scalar, Size
 from jaicv.dnn.graph import run_graph
 from jaicv.dnn.plan import run_best
@@ -76,8 +77,15 @@ pub fn letterbox(image: Mat) -> tuple[Mat, float, int, int] {
 }
 
 #: Turn the raw `1 x 84 x 8400` output into detections, undoing the letterbox.
+#: `1 x 84 x 8400` of raw output into boxes.
+#:
+#: The best class for each of the 8400 cells is found on the device, not here.
+#: Doing it in this loop meant eighty comparisons a cell -- two thirds of a
+#: million of them -- and downloading all 705,600 numbers to make them. The
+#: reduction leaves two arrays of 8400 and the four rows of box geometry, which
+#: is a fourteenth of the numbers and none of the comparisons.
 pub fn decode(
-    raw: list[float],
+    output: Tensor,
     scale: float,
     pad_x: int,
     pad_y: int,
@@ -85,30 +93,33 @@ pub fn decode(
     height: int
 ) -> list[Detection] {
     let rows = 84
-    let cells = raw.len() // rows
+    let cells = output.size // rows
+    #: Rows four onward are the class scores, and they are contiguous, so the
+    #: view costs nothing. Transposed because the reduction runs along the
+    #: last axis and the classes are along the first.
+    let per_class = jt.Tensor(
+        [80, cells],
+        storage: output.buffer().view(4 * cells, 80 * cells)
+    )
+    let by_cell = jt.transpose(per_class)
+    let best_scores = jt.amax(by_cell, axis: -1).download()
+    let best_classes = jt.argmax(by_cell).download()
+    let geometry = jt.Tensor([4, cells], storage: output.buffer().view(0, 4 * cells)).download()
+    by_cell.free()
+
     var boxes: list[Rect] = []
     var scores: list[float] = []
     var classes: list[int] = []
 
     for cell in 0..cells {
-        #: The best class for this cell, found before anything else is
-        #: computed: all but a handful of the 8400 fall below the threshold,
-        #: and the box arithmetic is wasted on them.
-        var best = 0
-        var best_score = raw[4 * cells + cell]
-        for klass in 1..80 {
-            let score = raw[(4 + klass) * cells + cell]
-            if score > best_score {
-                best_score = score
-                best = klass
-            }
-        }
+        let best_score = best_scores[cell]
         if best_score < SCORE_THRESHOLD { continue }
+        let best = int(best_classes[cell])
 
-        let cx = raw[cell]
-        let cy = raw[cells + cell]
-        let w = raw[2 * cells + cell]
-        let h = raw[3 * cells + cell]
+        let cx = geometry[cell]
+        let cy = geometry[cells + cell]
+        let w = geometry[2 * cells + cell]
+        let h = geometry[3 * cells + cell]
 
         #: Out of letterboxed pixels, back into the original's.
         let x0 = (cx - w * 0.5 - float(pad_x)) / scale
@@ -254,8 +265,7 @@ pub fn detect_frame(graph: Graph, image: Mat) -> list[Detection] {
     #: `run_best` interprets the first frame and compiles the model after,
     #: which for a run of more than one frame is most of the speed.
     let outputs = run_best(graph, {graph.inputs[0]: input})
-    let raw = outputs[graph.outputs[0]].download()
-    return decode(raw, scale, pad_x, pad_y, image.cols, image.rows)
+    return decode(outputs[graph.outputs[0]], scale, pad_x, pad_y, image.cols, image.rows)
 }
 
 #: The model, from `YOLO_MODEL` or from beside this file.
