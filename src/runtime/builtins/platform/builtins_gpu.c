@@ -34,6 +34,18 @@ static bool requireBuffer(Value v, int index, const char *fnName,
     return true;
 }
 
+/* A buffer handle as the native buffer and the element offset into it, for
+ * the graph primitives next door -- they need the same two facts and have no
+ * business knowing what a `GpuBuffer` looks like. */
+bool jaiGpuBufferOf(Value v, int index, const char *fnName,
+                    JaiGpuBuffer **buffer, int64_t *origin) {
+    GpuBuffer *held;
+    if (!requireBuffer(v, index, fnName, &held)) return false;
+    *buffer = held->buffer;
+    *origin = held->origin;
+    return true;
+}
+
 static bool requireKernel(Value v, int index, const char *fnName,
                           JaiGpuKernel **out) {
     if (!requireGpu(fnName)) return false;

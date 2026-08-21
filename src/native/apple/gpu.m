@@ -756,6 +756,25 @@ static bool poolGive(void *buffer, size_t bytes) {
     return true;
 }
 
+/* The one device, queue and buffer the rest of the Apple backend shares.
+ *
+ * `graphbuild.m` builds whole networks against the same device and submits to
+ * the same queue, so that its work is ordered against everything else exactly
+ * as any other dispatch would be. */
+id<MTLDevice> jaiGpuMetalDevice(void) {
+    if (!ensureDevice()) return nil;
+    return gDevice;
+}
+
+id<MTLCommandQueue> jaiGpuMetalQueue(void) {
+    if (!ensureDevice()) return nil;
+    return gQueue;
+}
+
+void *jaiGpuBufferHandle(JaiGpuBuffer *b) {
+    return b == NULL ? NULL : b->buffer;
+}
+
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
     if (bytes == 0 || !ensureDevice()) return NULL;
     if (bytes > gMaxBufferLength) return NULL;
@@ -2190,6 +2209,20 @@ static bool encodeMlpExecutableOnAsyncArrays(
     gAsyncCommands = mps.rootCommandBuffer;
     gAsyncEncoder = nil;
     return gAsyncCommands != nil;
+}
+
+/* Encode a compiled executable into the batch everything else is queued on,
+ * for the whole-network compiler next door. Keeping it on the shared command
+ * buffer is what lets a compiled plan sit in the middle of ordinary work
+ * without a fence on either side. */
+bool jaiGpuEncodeExecutable(void *executable, void *inputs, void *results) {
+    if (executable == NULL || inputs == NULL || results == NULL) return false;
+    @synchronized(gQueue) {
+        return encodeMlpExecutableOnAsyncArrays(
+            (__bridge MPSGraphExecutable *)executable,
+            (__bridge NSArray<MPSGraphTensorData *> *)inputs,
+            (__bridge NSArray<MPSGraphTensorData *> *)results);
+    }
 }
 
 static bool encodeMlpExecutableOnAsync(

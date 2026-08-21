@@ -23,6 +23,8 @@ static const char *handleKindName(HandleKind kind) {
     case HANDLE_ATOMIC:     return "atomic";
     case HANDLE_WINDOW:     return "window";
     case HANDLE_GPU_BUFFER: return "GPU buffer";
+    case HANDLE_GRAPH_BUILDER: return "graph builder";
+    case HANDLE_GRAPH_PLAN: return "graph plan";
     case HANDLE_GPU_KERNEL: return "GPU kernel";
     case HANDLE_FREE:       break;
     }
