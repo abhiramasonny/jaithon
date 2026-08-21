@@ -105,6 +105,34 @@ function extraSearchDirs(document) {
     return dirs;
 }
 
+const JAI_PACKAGE_MANIFEST = 'jaithon.package.json';
+
+/**
+ * The `src` dir of every subdirectory of `packagesDir` that has a package
+ * manifest — e.g. `packages/jaicv/jaithon.package.json` makes `jaicv` a
+ * module root at `packages/jaicv/src`. Mirrors addPackageSourceDirs() in
+ * src/runtime/modules/module_path.c, which is how `import jaicv` actually
+ * resolves at runtime.
+ */
+function packageSourceDirs(packagesDir) {
+    let entries;
+    try { entries = fs.readdirSync(packagesDir, { withFileTypes: true }); } catch { return []; }
+
+    const names = entries
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+        .map((entry) => entry.name)
+        .sort();
+
+    const dirs = [];
+    for (const name of names) {
+        const manifest = path.join(packagesDir, name, JAI_PACKAGE_MANIFEST);
+        try {
+            if (fs.statSync(manifest).isFile()) dirs.push(path.join(packagesDir, name, 'src'));
+        } catch { }
+    }
+    return dirs;
+}
+
 function libraryDirs(document) {
     const exe = binary(document);
     const dirs = [];
@@ -127,9 +155,14 @@ function libraryDirs(document) {
                   path.join(base, '..', 'lib'),
                   path.join(base, '..', 'share', 'jaithon', 'lib'),
                   path.join(base, '..', 'share', 'jaithon'));
+        dirs.push(...packageSourceDirs(path.join(base, 'packages')));
+        dirs.push(...packageSourceDirs(path.join(base, '..', 'packages')));
+        dirs.push(...packageSourceDirs(path.join(base, '..', 'share', 'jaithon', 'packages')));
     }
     dirs.push('/usr/local/share/jaithon/lib', '/usr/local/share/jaithon',
               '/opt/homebrew/share/jaithon/lib', '/opt/homebrew/share/jaithon');
+    dirs.push(...packageSourceDirs('/usr/local/share/jaithon/packages'));
+    dirs.push(...packageSourceDirs('/opt/homebrew/share/jaithon/packages'));
 
     for (const entry of (process.env.JAITHON_PATH || '').split(':')) {
         if (entry) dirs.unshift(entry);
