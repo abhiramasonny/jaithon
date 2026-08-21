@@ -631,6 +631,9 @@ int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
 int jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind) {
     (void)b; (void)x; (void)p; (void)kind; return -1;
 }
+int jaiGraphSelect(JaiGraphBuilder *b, int p, int a, int c) {
+    (void)b; (void)p; (void)a; (void)c; return -1;
+}
 int jaiGraphConcat(JaiGraphBuilder *b, const int *ids, int count, int axis) {
     (void)b; (void)ids; (void)count; (void)axis; return -1;
 }

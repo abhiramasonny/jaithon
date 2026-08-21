@@ -148,7 +148,8 @@ int              jaiGraphConstant(JaiGraphBuilder *b, const float *values,
 int              jaiGraphUnary(JaiGraphBuilder *b, int x, int op);
 int              jaiGraphClamp(JaiGraphBuilder *b, int x, float low, float high);
 int              jaiGraphLeakyRelu(JaiGraphBuilder *b, int x, float slope);
-/* 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min, 6 pow. */
+/* 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min, 6 pow, 7 equal, 8 greater,
+ * 9 less, 10 and, 11 or. The comparisons give one and zero as floats. */
 int              jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op);
 /* `p`: stride y, stride x, pad top, pad bottom, pad left, pad right,
  * dilation y, dilation x, groups. `bias` may be -1. */
@@ -157,6 +158,7 @@ int              jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias,
 /* `p`: kernel y, kernel x, stride y, stride x, pad top, pad bottom, pad left,
  * pad right, ceil mode, pad counts toward an average. `kind` 0 max, 1 mean. */
 int              jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind);
+int              jaiGraphSelect(JaiGraphBuilder *b, int predicate, int whenTrue, int whenFalse);
 int              jaiGraphConcat(JaiGraphBuilder *b, const int *ids, int count, int axis);
 int              jaiGraphReshape(JaiGraphBuilder *b, int x, const int64_t *dims, int rank);
 int              jaiGraphTranspose(JaiGraphBuilder *b, int x, const int32_t *perm, int rank);

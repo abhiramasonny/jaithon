@@ -243,9 +243,40 @@ int jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op) {
             case 4: out = [g maximumWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
             case 5: out = [g minimumWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
             case 6: out = [g powerWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
+            /* The comparisons yield boolean tensors and everything that leaves
+             * here is float, so each is cast back to the one and zero ONNX
+             * says it produces. */
+            case 7:  out = [g equalWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
+            case 8:  out = [g greaterThanWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
+            case 9:  out = [g lessThanWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
+            case 10: out = [g logicalANDWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
+            case 11: out = [g logicalORWithPrimaryTensor:a secondaryTensor:c name:nil]; break;
             default: return -1;
         }
+        if (op >= 7 && op <= 11 && out.dataType != MPSDataTypeFloat32) {
+            out = [g castTensor:out toType:MPSDataTypeFloat32 name:nil];
+        }
         return record(b, out);
+    }
+}
+
+/* Pick from `whenTrue` where `predicate` is not zero and from `whenFalse`
+ * elsewhere -- ONNX's `Where`, whose predicate arrives here as a float. */
+int jaiGraphSelect(JaiGraphBuilder *b, int predicate, int whenTrue, int whenFalse) {
+    MPSGraphTensor *p = tensorAt(b, predicate);
+    MPSGraphTensor *yes = tensorAt(b, whenTrue);
+    MPSGraphTensor *no = tensorAt(b, whenFalse);
+    if (p == nil || yes == nil || no == nil) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        MPSGraphTensor *flag =
+            [g notEqualWithPrimaryTensor:p
+                         secondaryTensor:[g constantWithScalar:0.0 dataType:p.dataType]
+                                    name:nil];
+        return record(b, [g selectWithPredicateTensor:flag
+                                  truePredicateTensor:yes
+                                 falsePredicateTensor:no
+                                                 name:nil]);
     }
 }
 
