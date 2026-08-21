@@ -412,6 +412,52 @@ int jaiGraphSlice(JaiGraphBuilder *b, int x, const int32_t *starts,
     }
 }
 
+/* `mode` is 0 constant, 1 reflect, 2 symmetric (ONNX's "edge" is 3). The two
+ * padding arrays hold one value per axis. */
+int jaiGraphPad(JaiGraphBuilder *b, int x, const int32_t *before, const int32_t *after,
+                int rank, int mode, float value) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    if (in == nil || before == NULL || after == NULL || rank <= 0) return -1;
+    if (mode < 0 || mode > 3) return -1;
+    @autoreleasepool {
+        NSMutableArray *left = [NSMutableArray arrayWithCapacity:(NSUInteger)rank];
+        NSMutableArray *right = [NSMutableArray arrayWithCapacity:(NSUInteger)rank];
+        for (int i = 0; i < rank; i++) {
+            if (before[i] < 0 || after[i] < 0) return -1;
+            [left addObject:@(before[i])];
+            [right addObject:@(after[i])];
+        }
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        return record(b, [g padTensor:in
+                      withPaddingMode:(MPSGraphPaddingMode)mode
+                          leftPadding:left
+                         rightPadding:right
+                        constantValue:(double)value
+                                 name:nil]);
+    }
+}
+
+/* `largest` picks between the greatest and the least. The index comes back as
+ * a float, which is what every tensor here is. */
+int jaiGraphArgExtreme(JaiGraphBuilder *b, int x, int axis, int largest) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    if (in == nil) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        if (@available(macOS 12.0, *)) {
+            MPSGraphTensor *out = largest != 0
+                ? [g reductionArgMaximumWithTensor:in axis:axis name:nil]
+                : [g reductionArgMinimumWithTensor:in axis:axis name:nil];
+            if (out == nil) return -1;
+            if (out.dataType != MPSDataTypeFloat32) {
+                out = [g castTensor:out toType:MPSDataTypeFloat32 name:nil];
+            }
+            return record(b, out);
+        }
+        return -1;
+    }
+}
+
 int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) {
     MPSGraphTensor *in = tensorAt(b, x);
     if (in == nil) return -1;

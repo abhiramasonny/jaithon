@@ -647,6 +647,14 @@ int jaiGraphSlice(JaiGraphBuilder *b, int x, const int32_t *s, const int32_t *e,
                   const int32_t *t, int rank) {
     (void)b; (void)x; (void)s; (void)e; (void)t; (void)rank; return -1;
 }
+int jaiGraphPad(JaiGraphBuilder *b, int x, const int32_t *before, const int32_t *after,
+                int rank, int mode, float value) {
+    (void)b; (void)x; (void)before; (void)after; (void)rank; (void)mode; (void)value;
+    return -1;
+}
+int jaiGraphArgExtreme(JaiGraphBuilder *b, int x, int axis, int largest) {
+    (void)b; (void)x; (void)axis; (void)largest; return -1;
+}
 int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) { (void)b; (void)x; (void)axis; return -1; }
 int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int h, int w, int r, int c, int a) {
     (void)b; (void)x; (void)h; (void)w; (void)r; (void)c; (void)a; return -1;
