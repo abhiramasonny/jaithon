@@ -436,7 +436,20 @@ pub class Mat: Printable {
     pub fn data_offset(self) -> int { return self.offset }
 
     #: The allocation this matrix windows. Shared with every view of it.
-    pub fn buffer(self) -> Buffer { return self.storage }
+    #: The device buffer, with any host-side edits pushed to it first.
+    #:
+    #: Flushing HERE rather than at the end of every edit is what makes
+    #: drawing usable: a `line` or a `put_text` writes into the host mirror,
+    #: and eagerly uploading after each one cost a `gpu.synchronize()` plus a
+    #: whole-image upload per primitive -- 1.04 ms for a single line on a
+    #: 640x480 frame. Deferring it means a run of primitives shares one
+    #: upload, taken the moment something actually reads the device. `flush`
+    #: returns immediately when nothing is pending, so this costs a bool test
+    #: on the path that has no edits to push.
+    pub fn buffer(self) -> Buffer {
+        self.flush()
+        return self.storage
+    }
 
     #: Number of elements the underlying allocation holds.
     pub fn buffer_count(self) -> int { return self.storage.count }
@@ -551,6 +564,16 @@ pub class Mat: Printable {
     #: Writes through the returned list land in the mirror and reach the device
     #: on the next `flush`. Rasterising a shape through `set_at` would re-check
     #: the mirror once per pixel; the drawing module takes the list once.
+    #: Say that the host mirror has been written to without pushing it now.
+    #:
+    #: `edit` already sets this, so a caller that went through it and then
+    #: wrote is covered; this exists for a caller that wants to say so
+    #: explicitly after finishing a run of edits.
+    pub fn mark_edited(self) -> void {
+        self.check_live()
+        self.pending = true
+    }
+
     pub fn edit(self) -> list[float] {
         let values = self.ensure_host()
         self.pending = true

@@ -54,7 +54,12 @@ pub fn blob_from_images(
     }
     let cn = images[0].channels()
 
-    var out: list[float] = []
+    #: Sized once and written by index. Growing it with `push` instead costs
+    #: about 25 ms for one 640x640x3 blob -- a million and a quarter appends,
+    #: each one a bounds check and a capacity test -- which was more than the
+    #: convolution that consumes it.
+    var out = __prim__.list_filled(images.len() * cn * width * height, 0.0)
+    var at = 0
     for image in images {
         image.flush()
         var prepared = image
@@ -94,8 +99,9 @@ pub fn blob_from_images(
             if swap_rb and cn >= 3 and (channel == 0 or channel == 2) { source = 2 - channel }
             let offset = mean[min(channel, 3)]
             for index in 0..width * height {
-                out.push((values[index * cn + source] - offset) * scale_factor)
+                out[at + index] = (values[index * cn + source] - offset) * scale_factor
             }
+            at += width * height
         }
     }
     return Mat.from_list(images.len() * cn, width * height, CV_MAKETYPE(CV_32F, 1), out)

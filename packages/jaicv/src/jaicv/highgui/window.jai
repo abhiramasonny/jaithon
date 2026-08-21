@@ -138,10 +138,15 @@ fn ensure_window(pane: Pane, width: int, height: int) -> Window? {
 
 fn packed(image: Mat) -> list[int] {
     #: One `0xAARRGGBB` int per pixel, which is what the back buffer holds.
+    #:
+    #: Sized up front rather than appended to. Growing it a pixel at a time
+    #: cost about 18 ms a 720p frame -- nine hundred thousand appends -- which
+    #: was most of what a camera preview spent per frame and held the whole
+    #: loop near 13 fps whatever it was showing.
     let cn = image.channels()
     let values = image.values()
-    var out: list[int] = []
     let count = image.rows * image.cols
+    var out = __prim__.list_filled(count, 0)
     for index in 0..count {
         var b = 0
         var g = 0
@@ -157,7 +162,7 @@ fn packed(image: Mat) -> list[int] {
             r = clamp_byte(values[index * cn + 2])
             if cn >= 4 { a = clamp_byte(values[index * cn + 3]) }
         }
-        out.push(a << 24 | r << 16 | g << 8 | b)
+        out[index] = a << 24 | r << 16 | g << 8 | b
     }
     return out
 }

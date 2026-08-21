@@ -25,7 +25,7 @@ let SPECIFIED = [
     "eq", "ne", "lt", "le", "gt", "ge",
     # collections
     "list_new", "list_get", "list_set", "list_push", "list_pop", "list_insert",
-    "list_remove", "list_len", "list_slice", "list_concat",
+    "list_remove", "list_len", "list_slice", "list_concat", "list_filled",
     "dict_new", "dict_get", "dict_set", "dict_del", "dict_has", "dict_len",
     "dict_keys", "dict_values",
     "set_new", "set_add", "set_del", "set_has", "set_len",
