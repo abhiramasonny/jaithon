@@ -187,6 +187,12 @@ fn static_values(graph: Graph, order: list[GraphNode]) -> dict[str, bool] {
 #: that way.
 fn dims_of(shape: list[int]) -> list[int] { return [value for value in shape] }
 
+#: A one-element constant, for the operators written as arithmetic against a
+#: fixed number.
+fn scalar(state: Build, value: float) -> int {
+    return __prim__.graph_constant(state.builder, [value], [1])
+}
+
 fn as_ints(values: list[float]) -> list[int] {
     var out: list[int] = []
     for value in values { out.push(int(value)) }
@@ -323,6 +329,95 @@ fn emit(state: Build, node: GraphNode) -> bool {
             ],
             if node.op == "MaxPool" { 0 } else { 1 }
         )
+        return true
+    }
+
+    if node.op == "Elu" {
+        #: `max(x, 0) + alpha * (exp(min(x, 0)) - 1)`, which is the operator
+        #: without needing a branch: above zero the second term is zero, and
+        #: below it the first is.
+        let alpha = attr_float(node, "alpha", 1.0)
+        let x = state.id_of(node.inputs[0])
+        let positive = __prim__.graph_binary(b, x, scalar(state, 0.0), 4)
+        let negative = __prim__.graph_binary(b, x, scalar(state, 0.0), 5)
+        let curved = __prim__.graph_binary(
+            b,
+            __prim__.graph_binary(b, __prim__.graph_unary(b, negative, 3), scalar(state, 1.0), 1),
+            scalar(state, alpha),
+            2
+        )
+        state.ids[out] = __prim__.graph_binary(b, positive, curved, 0)
+        return true
+    }
+
+    if node.op == "PRelu" {
+        #: `max(x, 0) + slope * min(x, 0)`, with the slope broadcasting along
+        #: the channel axis the way the operator says.
+        let x = state.shape_of(node.inputs[0])
+        let slope = state.shape_of(node.inputs[1])
+        if x is null or slope is null { return false }
+        var shaped = state.id_of(node.inputs[1])
+        if slope.len() == 1 and x.len() > 1 and slope[0] == x[1] {
+            var per_channel = [1 for _index in 0..x.len()]
+            per_channel[1] = slope[0]
+            shaped = __prim__.graph_reshape(b, shaped, per_channel)
+        }
+        let value = state.id_of(node.inputs[0])
+        let positive = __prim__.graph_binary(b, value, scalar(state, 0.0), 4)
+        let negative = __prim__.graph_binary(b, value, scalar(state, 0.0), 5)
+        state.ids[out] = __prim__.graph_binary(
+            b,
+            positive,
+            __prim__.graph_binary(b, negative, shaped, 2),
+            0
+        )
+        return true
+    }
+
+    if node.op == "HardSigmoid" {
+        let scaled = __prim__.graph_binary(
+            b,
+            state.id_of(node.inputs[0]),
+            scalar(state, attr_float(node, "alpha", 0.2)),
+            2
+        )
+        let shifted = __prim__.graph_binary(
+            b,
+            scaled,
+            scalar(state, attr_float(node, "beta", 0.5)),
+            0
+        )
+        state.ids[out] = __prim__.graph_clamp(b, shifted, 0.0, 1.0)
+        return true
+    }
+
+    if node.op == "Softplus" {
+        let raised = __prim__.graph_unary(b, state.id_of(node.inputs[0]), 3)
+        let shifted = __prim__.graph_binary(b, raised, scalar(state, 1.0), 0)
+        state.ids[out] = __prim__.graph_unary(b, shifted, 4)
+        return true
+    }
+
+    if node.op == "LogSoftmax" {
+        let x = state.shape_of(node.inputs[0])
+        if x is null { return false }
+        let normalised = __prim__.graph_softmax(
+            b,
+            state.id_of(node.inputs[0]),
+            normalize_axis(attr_int(node, "axis", -1), x.len(), node.label())
+        )
+        state.ids[out] = __prim__.graph_unary(b, normalised, 4)
+        return true
+    }
+
+    if node.op == "Expand" {
+        #: Only where the shape does not actually change, which is what most
+        #: exported graphs use it for. A real expansion is left alone rather
+        #: than assumed to broadcast the way the operator means.
+        let want = state.shape_of(out)
+        let have = state.shape_of(node.inputs[0])
+        if want is null or have is null or have != want { return false }
+        state.ids[out] = state.id_of(node.inputs[0])
         return true
     }
 
