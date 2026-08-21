@@ -3,6 +3,7 @@
 
 #include "runtime/runtime.h"
 #include "runtime/handles.h"
+#include "runtime/parallel.h"
 #include <limits.h>
 #include <math.h>
 
@@ -321,6 +322,21 @@ static bool nGpuBufferFillZero(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* Below this many elements one thread is quicker than waking others. */
+#define JAI_DOWNLOAD_CHUNK 32768
+
+typedef struct {
+    const float *raw;
+    Value       *items;
+} DownloadWork;
+
+/* Widening floats into list elements: three million of them for one frame,
+ * each a sixteen-byte store, and nothing shared between the indices. */
+static void widenRange(void *context, size_t start, size_t end) {
+    const DownloadWork *work = (const DownloadWork *)context;
+    for (size_t i = start; i < end; i++) work->items[i] = FLOAT_VAL(work->raw[i]);
+}
+
 static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *b;
@@ -355,7 +371,8 @@ static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
      * frame is 2.8 million of them. */
     ObjList *list = jaiListNew((int)wanted);
     if (list == NULL || !jaiListReserveExact(list, (int)wanted)) return false;
-    for (int64_t i = 0; i < wanted; i++) list->items[i] = FLOAT_VAL(raw[i]);
+    DownloadWork work = {raw, list->items};
+    jaiParallelChunks((size_t)wanted, JAI_DOWNLOAD_CHUNK, widenRange, &work);
     list->count = (int)wanted;
     list->version++;
 

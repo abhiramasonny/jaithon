@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "native/native.h"
+#include "runtime/parallel.h"
 
 #include <stdlib.h>
 static _Atomic long gDispatchTraceKernel = 0;
@@ -963,6 +964,31 @@ void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
 }
 
+typedef struct {
+    const float *source;
+    uint8_t     *dst;
+    float        factor;
+} JaiNarrowWork;
+
+static void narrowRange(void *context, size_t start, size_t end) {
+    const JaiNarrowWork *work = (const JaiNarrowWork *)context;
+    for (size_t i = start; i < end; i++) {
+        const float value = work->source[i] * work->factor;
+        if (!(value > 0.0f)) {
+            work->dst[i] = 0u;
+            continue;
+        }
+        const float rounded = value + 0.5f;
+        work->dst[i] = rounded > 255.0f ? 255u : (uint8_t)rounded;
+    }
+}
+
+static void jaiParallelNarrow(const float *source, uint8_t *dst, size_t count,
+                              float factor) {
+    JaiNarrowWork work = {source, dst, factor};
+    jaiParallelChunks(count, 32768, narrowRange, &work);
+}
+
 void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
                       size_t offset, float scale) {
     if (b == NULL || b->buffer == NULL || dst == NULL || count == 0) return;
@@ -980,15 +1006,8 @@ void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
      * Jaithon loop this replaces did. A NaN fails `> 0.0f` and lands on zero
      * rather than an undefined cast. */
     const float factor = scale != 0.0f ? 1.0f / scale : 1.0f;
-    for (size_t i = 0; i < count; i++) {
-        const float value = source[i] * factor;
-        if (!(value > 0.0f)) {
-            dst[i] = 0u;
-            continue;
-        }
-        const float rounded = value + 0.5f;
-        dst[i] = rounded > 255.0f ? 255u : (uint8_t)rounded;
-    }
+    /* One frame is millions of these and nothing is shared between them. */
+    jaiParallelNarrow(source, dst, count, factor);
 }
 
 /* The buffer's own memory, ready to read, after everything queued has run.
