@@ -360,3 +360,35 @@ fn test_dropout_is_transparent_when_not_training() -> void {
     if not have_gpu() { return }
     check(fn(x: Tensor) -> Tensor { return jt.dropout(x, 0.5, false) }, [6], spread(6))
 }
+
+#: A loss can be a one-by-one matrix rather than a one-element vector, and
+#: `backward` has to seed the gradient with the shape it actually has.
+#:
+#: The root seed used to be `ones([1])` whatever the loss was, so a loss that
+#: came out of a matrix product -- `ones(1, n) @ squared`, which is how a mean
+#: is written without a reduction -- handed the product's own backward an
+#: upstream of the wrong rank and it failed to index it. The loss still had one
+#: element, so nothing before this noticed.
+fn test_backward_seeds_a_rank_two_loss_with_a_rank_two_gradient() -> void {
+    if not have_gpu() { return }
+    let x = Tensor([3, 1], [2.0, -1.0, 0.5], requires_grad: true)
+    let ones = Tensor([3, 1], [1.0, 1.0, 1.0])
+    let squared = jt.multiply(x, x)
+    #: `[1, 3] @ [3, 1]` is `[1, 1]`: one element, two axes.
+    let loss = jt.matmul(jt.transpose(ones), squared)
+    assert_eq(loss.shape, [1, 1])
+    let junk = loss.backward()
+    let gradient = x.grad
+    assert_true(gradient is not null, "the input should have a gradient")
+    #: d/dx of the sum of squares is twice x.
+    let got = gradient.download()
+    for (index, wanted) in [4.0, -2.0, 1.0].enumerate() {
+        assert_true(
+            abs(got[index] - wanted) < 1e-4,
+            f"gradient {index} is {got[index]}, expected {wanted}"
+        )
+    }
+    for tensor in junk { tensor.free() }
+    x.free()
+    ones.free()
+}
