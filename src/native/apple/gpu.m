@@ -991,6 +991,24 @@ void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
     }
 }
 
+/* The buffer's own memory, ready to read, after everything queued has run.
+ *
+ * Storage is shared, so a download is only a copy because the caller usually
+ * wants one somewhere else. A caller that is going to walk the values anyway
+ * -- turning them into list elements, say -- can read them where they are and
+ * skip a staging array and a copy of the whole thing.
+ *
+ * The pointer is good until the next GPU work touches the buffer. */
+const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    if (b == NULL || b->buffer == NULL) return NULL;
+    const size_t start = elementOffset * sizeof(float);
+    const size_t bytes = count * sizeof(float);
+    if (start > b->bytes || bytes > b->bytes - start) return NULL;
+    jaiGpuSynchronize();
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
+    return (const float *)[buffer contents] + elementOffset;
+}
+
 static void writeError(char *buf, size_t size, const char *fmt, ...) JAI_PRINTF(3, 4);
 
 static void writeError(char *buf, size_t size, const char *fmt, ...) {

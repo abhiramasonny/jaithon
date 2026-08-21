@@ -150,6 +150,10 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
     (void)scale;
 }
 
+const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    (void)b; (void)elementOffset; (void)count; return NULL;
+}
+
 void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
                       size_t offset, float scale) {
     (void)b;
