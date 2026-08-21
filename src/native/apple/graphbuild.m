@@ -200,6 +200,34 @@ int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) {
     }
 }
 
+/* `x` clamped into `[low, high]`, which is what ONNX's Clip is once its
+ * bounds are known -- and they are constants in every model that uses it for
+ * a bounded activation. */
+int jaiGraphClamp(JaiGraphBuilder *b, int x, float low, float high) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    if (in == nil || !(low <= high)) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        MPSGraphTensor *out =
+            [g maximumWithPrimaryTensor:in
+                        secondaryTensor:[g constantWithScalar:(double)low dataType:in.dataType]
+                                   name:nil];
+        out = [g minimumWithPrimaryTensor:out
+                          secondaryTensor:[g constantWithScalar:(double)high dataType:in.dataType]
+                                     name:nil];
+        return record(b, out);
+    }
+}
+
+int jaiGraphLeakyRelu(JaiGraphBuilder *b, int x, float slope) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    if (in == nil) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        return record(b, [g leakyReLUWithTensor:in alpha:(double)slope name:nil]);
+    }
+}
+
 int jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op) {
     MPSGraphTensor *a = tensorAt(b, left);
     MPSGraphTensor *c = tensorAt(b, right);

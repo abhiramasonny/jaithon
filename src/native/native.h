@@ -146,6 +146,8 @@ int              jaiGraphConstant(JaiGraphBuilder *b, const float *values,
  * 9 silu, 10 floor, 11 ceil, 12 reciprocal, 13 square, 14 rsqrt,
  * 15 truncate, 16 not-zero. */
 int              jaiGraphUnary(JaiGraphBuilder *b, int x, int op);
+int              jaiGraphClamp(JaiGraphBuilder *b, int x, float low, float high);
+int              jaiGraphLeakyRelu(JaiGraphBuilder *b, int x, float slope);
 /* 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min, 6 pow. */
 int              jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op);
 /* `p`: stride y, stride x, pad top, pad bottom, pad left, pad right,
