@@ -87,6 +87,18 @@ kernel void row_softmax(device const float* input [[buffer(0)]],
         output[base + column] = exp(input[base + column] - peak) / total;
 }
 
+kernel void row_max(device const float* input [[buffer(0)]],
+                    device float* output [[buffer(1)]],
+                    constant uint& rows [[buffer(2)]],
+                    constant uint& columns [[buffer(3)]],
+                    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    uint base = row * columns;
+    float peak = input[base];
+    for (uint column = 1; column < columns; ++column) peak = max(peak, input[base + column]);
+    output[row] = peak;
+}
+
 kernel void row_argmax(device const float* input [[buffer(0)]],
                        device float* output [[buffer(1)]],
                        constant uint& rows [[buffer(2)]],
@@ -3046,6 +3058,37 @@ pub fn softmax(input: Tensor) -> Tensor {
 #:
 #: Indices use float storage because all Metal buffers in `std.gpu` are
 #: float32. Downloaded values are exact for practical class counts.
+#: The largest value along the last axis, or of the whole tensor.
+#:
+#: The companion to `argmax`, which gives where the largest is but not what it
+#: is. A detector wants both -- the class and its score -- and computing the
+#: value on the host afterwards means downloading everything the reduction was
+#: supposed to save.
+pub fn amax(input: Tensor, axis: int? = null) -> Tensor {
+    if axis is null {
+        let flat = reshape(input, [1, input.size])
+        let whole = amax(flat, axis: 1)
+        flat.free()
+        return whole
+    }
+    let resolved = if axis < 0 { input.rank() + axis } else { axis }
+    if resolved != input.rank() - 1 {
+        throw ValueError("amax reduces all elements or the last axis")
+    }
+    let columns = input.shape[resolved]
+    let rows = input.size // columns
+    var shape: list[int] = []
+    for index in 0..input.rank() - 1 { shape.push(input.shape[index]) }
+    if shape.len() == 0 { shape.push(1) }
+    let output = Tensor(shape)
+    cached_kernel("row_max").dispatch_async(
+        [input.buffer(), output.buffer()],
+        rows,
+        [rows, columns]
+    )
+    return output
+}
+
 pub fn argmax(input: Tensor) -> Tensor {
     if input.rank() != 2 { throw ValueError(f"argmax needs rank two, got {input.shape}") }
     let rows = input.shape[0]
