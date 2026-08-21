@@ -198,10 +198,11 @@ fn worst_difference(item: Case) -> float {
 #: interpreter answers then, and the whole point of the fallback is that a
 #: graph it cannot express still runs. What is not allowed is compiling it and
 #: getting a different answer, which is what this catches.
-fn compiled_difference(item: Case) -> float {
+fn compiled_difference(item: Case, weights_are_constant: bool) -> float {
     var names: list[str] = []
     var declared: list[str] = []
     var feeds: dict[str, Tensor] = {}
+    var fixed: dict[str, Tensor] = {}
     for (index, feed) in item.feeds.enumerate() {
         if feed is null {
             names.push("")
@@ -209,8 +210,15 @@ fn compiled_difference(item: Case) -> float {
         }
         let name = f"in{index}"
         names.push(name)
-        declared.push(name)
-        feeds[name] = feed.upload()
+        #: With `weights_are_constant`, everything after the first input is an
+        #: initializer rather than something fed -- which is what a real model
+        #: looks like, and what lets the compiler fold and reorder weights.
+        if weights_are_constant and index > 0 {
+            fixed[name] = feed.upload()
+        } else {
+            declared.push(name)
+            feeds[name] = feed.upload()
+        }
     }
     var outs: list[str] = []
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
@@ -219,7 +227,8 @@ fn compiled_difference(item: Case) -> float {
             GraphNode(item.op, name: item.name, inputs: names, outputs: outs, attrs: item.attrs),
         ],
         inputs: declared,
-        outputs: outs
+        outputs: outs,
+        initializers: fixed
     )
     var plan: Plan? = null
     try {
@@ -230,6 +239,7 @@ fn compiled_difference(item: Case) -> float {
     let built = plan
     if built is null {
         for (_name, tensor) in feeds.items() { tensor.free() }
+        for (_name, tensor) in fixed.items() { tensor.free() }
         return -1.0
     }
     let produced = built.run(feeds)
@@ -246,6 +256,7 @@ fn compiled_difference(item: Case) -> float {
     }
     for (_name, tensor) in produced.items() { tensor.free() }
     for (_name, tensor) in feeds.items() { tensor.free() }
+    for (_name, tensor) in fixed.items() { tensor.free() }
     built.free()
     return worst
 }
@@ -253,14 +264,19 @@ fn compiled_difference(item: Case) -> float {
 #: Every case the compiler accepts has to give the reference answer.
 fn check_compiled(group: str, tolerance: float) -> int {
     var compiled = 0
-    for item in cases_in(group) {
-        let gap = compiled_difference(item)
-        if gap < 0.0 { continue }
-        compiled += 1
-        assert_true(
-            gap <= tolerance,
-            f"{item.op} case {item.name}, compiled, is off the reference by {gap}"
-        )
+    #: Both ways round: with the operands fed, and with all but the first
+    #: baked in as weights. The second is what a real model looks like and is
+    #: the only shape in which the compiler will fold or reorder anything.
+    for constant in [false, true] {
+        for item in cases_in(group) {
+            let gap = compiled_difference(item, constant)
+            if gap < 0.0 { continue }
+            compiled += 1
+            assert_true(
+                gap <= tolerance,
+                f"{item.op} case {item.name}, compiled, is off the reference by {gap}"
+            )
+        }
     }
     return compiled
 }
@@ -281,6 +297,7 @@ fn test_the_compiled_graph_matches_onnxruntime() -> void {
         ("norm", 1e-5),
         ("reduce", 1e-6),
         ("resample", 3e-6),
+        ("recurrent", 3e-5),
     ] {
         compiled += check_compiled(group, tolerance)
     }

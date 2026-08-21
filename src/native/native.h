@@ -177,6 +177,12 @@ int              jaiGraphLayerNorm(JaiGraphBuilder *b, int x, int gamma, int bet
 int              jaiGraphGemm(JaiGraphBuilder *b, int left, int right, int c,
                               int transposeLeft, int transposeRight,
                               float alpha, float beta);
+/* A whole LSTM as one operation. Gates ordered i, f, z, o; `bias`,
+ * `initState` and `initCell` may be -1. Fills `out` with the state and cell
+ * sequences, both `[T, N, H]`. */
+bool             jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeight,
+                              int inputWeight, int bias, int initState, int initCell,
+                              int reverse, int *out);
 JaiGraphPlan    *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                                  const int *outputs, int outputCount);
 int              jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index);

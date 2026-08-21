@@ -395,6 +395,34 @@ static bool nGraphGemm(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* Returns the two tensor ids as a list, or an empty list when the operation
+ * could not be built -- which the caller reads as "compile this the long way".
+ */
+static bool nGraphLstm(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t slots[7];
+    if (!requireBuilder(args[0], 1, "graph_lstm", &builder)) return false;
+    for (int i = 0; i < 7; i++) {
+        if (!jaiArgInt(args[1 + i], 2 + i, "graph_lstm", &slots[i])) return false;
+    }
+    int made[2] = {-1, -1};
+    const bool ok = jaiGraphLstm(builder, (int)slots[0], (int)slots[1], (int)slots[2],
+                                 (int)slots[3], (int)slots[4], (int)slots[5],
+                                 (int)slots[6], made);
+    ObjList *list = jaiListNew(2);
+    if (list == NULL) return false;
+    if (ok) {
+        if (!jaiListReserveExact(list, 2)) return false;
+        list->items[0] = INT_VAL(made[0]);
+        list->items[1] = INT_VAL(made[1]);
+        list->count = 2;
+        list->version++;
+    }
+    *out = OBJ_VAL(list);
+    return true;
+}
+
 static bool nGraphCompile(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -546,6 +574,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_reduce",         nGraphReduce,         4, 4);
     jaiDefineNative("__prim__.graph_layer_norm",     nGraphLayerNorm,      6, 6);
     jaiDefineNative("__prim__.graph_gemm",           nGraphGemm,           8, 8);
+    jaiDefineNative("__prim__.graph_lstm",           nGraphLstm,           8, 8);
     jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);
     jaiDefineNative("__prim__.graph_plan_output_shape", nGraphPlanOutputShape, 2, 2);
     jaiDefineNative("__prim__.graph_run",            nGraphRun,            3, 3);
