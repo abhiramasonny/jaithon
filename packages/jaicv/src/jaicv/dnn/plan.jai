@@ -24,6 +24,7 @@
 #: as before. Partial compilation would mean handing the compiler fragments,
 #: which is most of the cost and little of the benefit.
 import jaitensor as jt
+import std.math as math
 from jaitensor import Tensor
 from .graph import Graph, GraphNode, attr_float, attr_int, attr_ints, attr_str
 from .graph import normalize_axis, run_graph
@@ -322,6 +323,97 @@ fn emit(state: Build, node: GraphNode) -> bool {
             ],
             if node.op == "MaxPool" { 0 } else { 1 }
         )
+        return true
+    }
+
+    if node.op == "BatchNormalization" {
+        #: Folded rather than emitted. With the statistics fixed, the whole
+        #: operator is `x * k + shift` for a per-channel `k` and `shift`, and
+        #: both can be worked out here -- which is the ordinary way a trained
+        #: network is deployed, and leaves two broadcasts where there was a
+        #: normalisation.
+        let x = state.shape_of(node.inputs[0])
+        if x is null or x.len() < 2 { return false }
+        if node.outputs.len() > 1 { return false }
+        let scale = state.numbers_of(node.inputs[1])
+        let shift = state.numbers_of(node.inputs[2])
+        let mean = state.numbers_of(node.inputs[3])
+        let variance = state.numbers_of(node.inputs[4])
+        if scale is null or shift is null or mean is null or variance is null { return false }
+        let channels = x[1]
+        if scale.len() != channels { return false }
+        let epsilon = attr_float(node, "epsilon", 1.0e-5)
+        var factor = __prim__.list_filled(channels, 0.0)
+        var offset = __prim__.list_filled(channels, 0.0)
+        for index in 0..channels {
+            let inverse = 1.0 / math.sqrt(variance[index] + epsilon)
+            factor[index] = scale[index] * inverse
+            offset[index] = shift[index] - mean[index] * factor[index]
+        }
+        #: Shaped so the channel axis lines up and the rest broadcasts.
+        var per_channel = [1 for _index in 0..x.len()]
+        per_channel[1] = channels
+        let k = __prim__.graph_constant(b, factor, per_channel)
+        let c = __prim__.graph_constant(b, offset, per_channel)
+        let scaled = __prim__.graph_binary(b, state.id_of(node.inputs[0]), k, 2)
+        state.ids[out] = __prim__.graph_binary(b, scaled, c, 0)
+        return true
+    }
+
+    if node.op == "GlobalAveragePool" or node.op == "GlobalMaxPool" {
+        let x = state.shape_of(node.inputs[0])
+        let want = state.shape_of(out)
+        if x is null or want is null or x.len() < 3 { return false }
+        var over: list[int] = []
+        for axis in 2..x.len() { over.push(axis) }
+        let reduced = __prim__.graph_reduce(
+            b,
+            state.id_of(node.inputs[0]),
+            over,
+            if node.op == "GlobalAveragePool" { 1 } else { 2 }
+        )
+        state.ids[out] = __prim__.graph_reshape(b, reduced, dims_of(want))
+        return true
+    }
+
+    if node.op == "Clip" {
+        var low = -3.4028235e38
+        var high = 3.4028235e38
+        #: Bounds are attributes before opset 11 and inputs after it.
+        let by_attr_low = node.attrs.get("min", null)
+        let by_attr_high = node.attrs.get("max", null)
+        if by_attr_low is not null { low = attr_float(node, "min", low) }
+        if by_attr_high is not null { high = attr_float(node, "max", high) }
+        if node.inputs.len() > 1 and node.inputs[1].len() > 0 {
+            let given = state.numbers_of(node.inputs[1])
+            if given is null or given.len() == 0 { return false }
+            low = given[0]
+        }
+        if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
+            let given = state.numbers_of(node.inputs[2])
+            if given is null or given.len() == 0 { return false }
+            high = given[0]
+        }
+        state.ids[out] = __prim__.graph_clamp(b, state.id_of(node.inputs[0]), low, high)
+        return true
+    }
+
+    if node.op == "LeakyRelu" {
+        state.ids[out] = __prim__.graph_leaky_relu(
+            b,
+            state.id_of(node.inputs[0]),
+            attr_float(node, "alpha", 0.01)
+        )
+        return true
+    }
+
+    if node.op == "Sum" or node.op == "Max" or node.op == "Min" {
+        let code = if node.op == "Sum" { 0 } elif node.op == "Max" { 4 } else { 5 }
+        var running = state.id_of(node.inputs[0])
+        for index in 1..node.inputs.len() {
+            running = __prim__.graph_binary(b, running, state.id_of(node.inputs[index]), code)
+        }
+        state.ids[out] = running
         return true
     }
 

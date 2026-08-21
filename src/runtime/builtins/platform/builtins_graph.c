@@ -132,6 +132,31 @@ static bool nGraphUnary(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGraphClamp(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t x;
+    double low, high;
+    if (!requireBuilder(args[0], 1, "graph_clamp", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_clamp", &x)) return false;
+    if (!jaiArgNumber(args[2], 3, "graph_clamp", &low)) return false;
+    if (!jaiArgNumber(args[3], 4, "graph_clamp", &high)) return false;
+    *out = INT_VAL(jaiGraphClamp(builder, (int)x, (float)low, (float)high));
+    return true;
+}
+
+static bool nGraphLeakyRelu(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t x;
+    double slope;
+    if (!requireBuilder(args[0], 1, "graph_leaky_relu", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_leaky_relu", &x)) return false;
+    if (!jaiArgNumber(args[2], 3, "graph_leaky_relu", &slope)) return false;
+    *out = INT_VAL(jaiGraphLeakyRelu(builder, (int)x, (float)slope));
+    return true;
+}
+
 static bool nGraphBinary(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -560,6 +585,8 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_input",          nGraphInput,          2, 2);
     jaiDefineNative("__prim__.graph_constant",       nGraphConstant,       3, 3);
     jaiDefineNative("__prim__.graph_unary",          nGraphUnary,          3, 3);
+    jaiDefineNative("__prim__.graph_clamp",          nGraphClamp,          4, 4);
+    jaiDefineNative("__prim__.graph_leaky_relu",     nGraphLeakyRelu,      3, 3);
     jaiDefineNative("__prim__.graph_binary",         nGraphBinary,         4, 4);
     jaiDefineNative("__prim__.graph_conv",           nGraphConv,           5, 5);
     jaiDefineNative("__prim__.graph_pool",           nGraphPool,           4, 4);

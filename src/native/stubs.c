@@ -616,6 +616,12 @@ int jaiGraphConstant(JaiGraphBuilder *b, const float *values, const int64_t *dim
     (void)b; (void)values; (void)dims; (void)rank; return -1;
 }
 int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) { (void)b; (void)x; (void)op; return -1; }
+int jaiGraphClamp(JaiGraphBuilder *b, int x, float lo, float hi) {
+    (void)b; (void)x; (void)lo; (void)hi; return -1;
+}
+int jaiGraphLeakyRelu(JaiGraphBuilder *b, int x, float slope) {
+    (void)b; (void)x; (void)slope; return -1;
+}
 int jaiGraphBinary(JaiGraphBuilder *b, int l, int r, int op) {
     (void)b; (void)l; (void)r; (void)op; return -1;
 }
