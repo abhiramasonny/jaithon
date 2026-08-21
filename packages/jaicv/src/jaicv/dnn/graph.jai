@@ -316,29 +316,33 @@ kernel void binary_ex(device const float* a [[buffer(0)]],
 
 /* One LSTM timestep's gates, cell and hidden state.
  *
- * `gates` already holds `Xt W' + H(t-1) R' + b` for the whole batch, so all
- * that is left is the four activations and the two state updates -- as one
- * kernel rather than the dozen elementwise passes writing it out of jaitensor
- * pieces would take, which matters because this runs once per timestep.
+ * `input_gates` holds `Xt W' + b` for every timestep at once and is read at
+ * this step's offset; `hidden_gates` is `H(t-1) R'` for this step alone. Both
+ * are summed here rather than beforehand, which saves the slice and the add
+ * that would otherwise be two more dispatches on a path that runs once per
+ * timestep and is limited by how many it takes.
  *
  * ONNX orders the gates i, o, f, c along the row, and that is the order here.
  */
-kernel void lstm_gates(device const float* gates [[buffer(0)]],
-                       device const float* cell_in [[buffer(1)]],
-                       device float* cell_out [[buffer(2)]],
-                       device float* hidden_out [[buffer(3)]],
-                       constant uint& count [[buffer(4)]],
-                       constant uint& hidden [[buffer(5)]],
-                       constant uint& clip_bits [[buffer(6)]],
+kernel void lstm_gates(device const float* input_gates [[buffer(0)]],
+                       device const float* hidden_gates [[buffer(1)]],
+                       device const float* cell_in [[buffer(2)]],
+                       device float* cell_out [[buffer(3)]],
+                       device float* hidden_out [[buffer(4)]],
+                       constant uint& count [[buffer(5)]],
+                       constant uint& hidden [[buffer(6)]],
+                       constant uint& clip_bits [[buffer(7)]],
+                       constant uint& input_base [[buffer(8)]],
                        uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint row = id / hidden;
     uint col = id - row * hidden;
     uint base = row * 4u * hidden;
-    float gi = gates[base + col];
-    float go = gates[base + hidden + col];
-    float gf = gates[base + 2u * hidden + col];
-    float gc = gates[base + 3u * hidden + col];
+    uint from = input_base + base;
+    float gi = input_gates[from + col] + hidden_gates[base + col];
+    float go = input_gates[from + hidden + col] + hidden_gates[base + hidden + col];
+    float gf = input_gates[from + 2u * hidden + col] + hidden_gates[base + 2u * hidden + col];
+    float gc = input_gates[from + 3u * hidden + col] + hidden_gates[base + 3u * hidden + col];
     float clip = as_type<float>(clip_bits);
     if (clip > 0.0f) {
         gi = clamp(gi, -clip, clip);
@@ -362,27 +366,31 @@ kernel void lstm_gates(device const float* gates [[buffer(0)]],
  * ONNX orders the gates z, r, h. */
 kernel void gru_step_linear(device const float* input_gates [[buffer(0)]],
                             device const float* hidden_gates [[buffer(1)]],
-                            device const float* hidden_in [[buffer(2)]],
-                            device float* hidden_out [[buffer(3)]],
-                            constant uint& count [[buffer(4)]],
-                            constant uint& hidden [[buffer(5)]],
-                            constant uint& clip_bits [[buffer(6)]],
+                            device const float* recurrent_bias [[buffer(2)]],
+                            device const float* hidden_in [[buffer(3)]],
+                            device float* hidden_out [[buffer(4)]],
+                            constant uint& count [[buffer(5)]],
+                            constant uint& hidden [[buffer(6)]],
+                            constant uint& clip_bits [[buffer(7)]],
+                            constant uint& input_base [[buffer(8)]],
                             uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint row = id / hidden;
     uint col = id - row * hidden;
     uint base = row * 3u * hidden;
+    uint from = input_base + base;
     float clip = as_type<float>(clip_bits);
-    float gz = input_gates[base + col] + hidden_gates[base + col];
-    float gr = input_gates[base + hidden + col] + hidden_gates[base + hidden + col];
+    float gz = input_gates[from + col] + hidden_gates[base + col] + recurrent_bias[col];
+    float gr = input_gates[from + hidden + col] + hidden_gates[base + hidden + col] +
+               recurrent_bias[hidden + col];
     if (clip > 0.0f) {
         gz = clamp(gz, -clip, clip);
         gr = clamp(gr, -clip, clip);
     }
     float z = 1.0f / (1.0f + exp(-gz));
     float r = 1.0f / (1.0f + exp(-gr));
-    float gh = input_gates[base + 2u * hidden + col] +
-               r * hidden_gates[base + 2u * hidden + col];
+    float gh = input_gates[from + 2u * hidden + col] +
+               r * (hidden_gates[base + 2u * hidden + col] + recurrent_bias[2u * hidden + col]);
     if (clip > 0.0f) gh = clamp(gh, -clip, clip);
     float h = tanh(gh);
     hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
@@ -394,20 +402,24 @@ kernel void gru_step_linear(device const float* input_gates [[buffer(0)]],
  * half that follows. */
 kernel void gru_reset(device const float* input_gates [[buffer(0)]],
                       device const float* hidden_gates [[buffer(1)]],
-                      device const float* hidden_in [[buffer(2)]],
-                      device float* gate_z [[buffer(3)]],
-                      device float* scaled [[buffer(4)]],
-                      constant uint& count [[buffer(5)]],
-                      constant uint& hidden [[buffer(6)]],
-                      constant uint& clip_bits [[buffer(7)]],
+                      device const float* recurrent_bias [[buffer(2)]],
+                      device const float* hidden_in [[buffer(3)]],
+                      device float* gate_z [[buffer(4)]],
+                      device float* scaled [[buffer(5)]],
+                      constant uint& count [[buffer(6)]],
+                      constant uint& hidden [[buffer(7)]],
+                      constant uint& clip_bits [[buffer(8)]],
+                      constant uint& input_base [[buffer(9)]],
                       uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint row = id / hidden;
     uint col = id - row * hidden;
     uint base = row * 3u * hidden;
+    uint from = input_base + base;
     float clip = as_type<float>(clip_bits);
-    float gz = input_gates[base + col] + hidden_gates[base + col];
-    float gr = input_gates[base + hidden + col] + hidden_gates[base + hidden + col];
+    float gz = input_gates[from + col] + hidden_gates[base + col] + recurrent_bias[col];
+    float gr = input_gates[from + hidden + col] + hidden_gates[base + hidden + col] +
+               recurrent_bias[hidden + col];
     if (clip > 0.0f) {
         gz = clamp(gz, -clip, clip);
         gr = clamp(gr, -clip, clip);
@@ -426,12 +438,14 @@ kernel void gru_finish(device const float* input_gates [[buffer(0)]],
                        constant uint& count [[buffer(5)]],
                        constant uint& hidden [[buffer(6)]],
                        constant uint& clip_bits [[buffer(7)]],
+                       constant uint& input_base [[buffer(8)]],
                        uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint row = id / hidden;
     uint col = id - row * hidden;
     float clip = as_type<float>(clip_bits);
-    float gh = input_gates[row * 3u * hidden + 2u * hidden + col] + reset_product[id];
+    float gh = input_gates[input_base + row * 3u * hidden + 2u * hidden + col] +
+               reset_product[id];
     if (clip > 0.0f) gh = clamp(gh, -clip, clip);
     float h = tanh(gh);
     float z = gate_z[id];
@@ -2437,20 +2451,21 @@ fn lstm_direction(
     var produced: list[Tensor] = []
     for index in 0..steps {
         let step = if reverse { steps - 1 - index } else { index }
-        let at = slice_axis(x_gates, 0, step * batch, batch)
         let recurred = jt.matmul(state_h, recurrent, trans_b: true)
-        let gates = jt.add(at, recurred)
-        at.free()
-        recurred.free()
-
         let next_c = jt.Tensor([batch, hidden])
         let next_h = jt.Tensor([batch, hidden])
         kernel_for("lstm_gates").dispatch_async(
-            [gates.buffer(), state_c.buffer(), next_c.buffer(), next_h.buffer()],
+            [
+                x_gates.buffer(),
+                recurred.buffer(),
+                state_c.buffer(),
+                next_c.buffer(),
+                next_h.buffer(),
+            ],
             batch * hidden,
-            [batch * hidden, hidden, f32_bits(clip)]
+            [batch * hidden, hidden, f32_bits(clip), step * batch * 4 * hidden]
         )
-        gates.free()
+        recurred.free()
         if own_cell { state_c.free() }
         state_c = next_c
         own_cell = true
@@ -2615,7 +2630,7 @@ fn gru_direction(
     x_gates: Tensor,
     recurrent: Tensor,
     recurrent_h: Tensor,
-    recurrent_bias: Tensor?,
+    recurrent_bias: Tensor,
     initial_h: Tensor,
     steps: int,
     batch: int,
@@ -2628,23 +2643,20 @@ fn gru_direction(
     var produced: list[Tensor] = []
     for index in 0..steps {
         let step = if reverse { steps - 1 - index } else { index }
-        let at = slice_axis(x_gates, 0, step * batch, batch)
-        let product = jt.matmul(state_h, recurrent, trans_b: true)
-        #: The recurrent bias belongs to this product rather than to the input
-        #: half, because with `linear_before_reset` the reset gate scales it.
-        let recurred = if recurrent_bias is null {
-            product
-        } else {
-            let shifted = jt.add(product, recurrent_bias)
-            product.free()
-            shifted
-        }
+        let recurred = jt.matmul(state_h, recurrent, trans_b: true)
+        let offset = step * batch * 3 * hidden
         let next_h = jt.Tensor([batch, hidden])
         if linear_before_reset {
             kernel_for("gru_step_linear").dispatch_async(
-                [at.buffer(), recurred.buffer(), state_h.buffer(), next_h.buffer()],
+                [
+                    x_gates.buffer(),
+                    recurred.buffer(),
+                    recurrent_bias.buffer(),
+                    state_h.buffer(),
+                    next_h.buffer(),
+                ],
                 batch * hidden,
-                [batch * hidden, hidden, f32_bits(clip)]
+                [batch * hidden, hidden, f32_bits(clip), offset]
             )
         } else {
             #: The reset gate scales the hidden state before the weights see
@@ -2653,32 +2665,32 @@ fn gru_direction(
             let scaled = jt.Tensor([batch, hidden])
             kernel_for("gru_reset").dispatch_async(
                 [
-                    at.buffer(),
+                    x_gates.buffer(),
                     recurred.buffer(),
+                    recurrent_bias.buffer(),
                     state_h.buffer(),
                     gate_z.buffer(),
                     scaled.buffer(),
                 ],
                 batch * hidden,
-                [batch * hidden, hidden, f32_bits(clip)]
+                [batch * hidden, hidden, f32_bits(clip), offset]
             )
             let reset_product = jt.matmul(scaled, recurrent_h, trans_b: true)
             kernel_for("gru_finish").dispatch_async(
                 [
-                    at.buffer(),
+                    x_gates.buffer(),
                     reset_product.buffer(),
                     gate_z.buffer(),
                     state_h.buffer(),
                     next_h.buffer(),
                 ],
                 batch * hidden,
-                [batch * hidden, hidden, f32_bits(clip)]
+                [batch * hidden, hidden, f32_bits(clip), offset]
             )
             gate_z.free()
             scaled.free()
             reset_product.free()
         }
-        at.free()
         recurred.free()
         state_h = next_h
         produced.push(next_h)
@@ -2764,29 +2776,37 @@ fn op_gru(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
         let rh = taken(slice_axis(rd, 0, 2 * hidden, hidden), [hidden, hidden])
         var x_gates = jt.matmul(flat_x, wd, trans_b: true)
         wd.free()
-        var recurrent_bias: Tensor? = null
+        #: Always a real vector, zeros when the node carries none, so the
+        #: kernels have one shape of input rather than two.
+        var recurrent_bias = jt.Tensor.zeros([3 * hidden])
         if bias is not null {
             let row = taken(slice_axis(bias, 0, direction, 1), [6 * hidden])
             let wb = taken(slice_axis(row, 0, 0, 3 * hidden), [3 * hidden])
             let rb = taken(slice_axis(row, 0, 3 * hidden, 3 * hidden), [3 * hidden])
-            #: Without `linear_before_reset` the candidate's recurrent bias is
-            #: outside the reset, so it is a constant and belongs with the
-            #: input half; the recurrent half then carries only z and r.
+            #: Without `linear_before_reset` the candidate's recurrent bias
+            #: falls outside the reset gate, which makes it a constant like the
+            #: input biases -- so it moves to the input half, and the recurrent
+            #: half is left carrying only the update and reset gates.
             var input_bias = wb
             var carried = rb
             if not linear {
-                let zeros = jt.Tensor.zeros([hidden])
                 let head = taken(slice_axis(rb, 0, 0, 2 * hidden), [2 * hidden])
                 let tail = taken(slice_axis(rb, 0, 2 * hidden, hidden), [hidden])
-                carried = concat_along([head, zeros], 0, node.label())
-                input_bias = jt.add(wb, concat_along([jt.Tensor.zeros([2 * hidden]), tail], 0, node.label()))
+                let pad_tail = jt.Tensor.zeros([hidden])
+                let pad_head = jt.Tensor.zeros([2 * hidden])
+                carried = concat_along([head, pad_tail], 0, node.label())
+                let widened = concat_along([pad_head, tail], 0, node.label())
+                input_bias = jt.add(wb, widened)
                 head.free()
                 tail.free()
-                zeros.free()
+                pad_tail.free()
+                pad_head.free()
+                widened.free()
             }
             let shifted = jt.add(x_gates, input_bias)
             x_gates.free()
             x_gates = shifted
+            recurrent_bias.free()
             recurrent_bias = carried
             if input_bias is not wb { input_bias.free() }
             wb.free()
@@ -2816,8 +2836,7 @@ fn op_gru(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
         rd.free()
         rh.free()
         start_h.free()
-        let held = recurrent_bias
-        if held is not null { held.free() }
+        recurrent_bias.free()
         sequences.push(copy_of(sequence, [steps, 1, batch, hidden]))
         sequence.free()
         last_h.push(copy_of(final_h, [1, batch, hidden]))
