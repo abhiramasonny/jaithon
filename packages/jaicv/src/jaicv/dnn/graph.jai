@@ -355,6 +355,89 @@ kernel void lstm_gates(device const float* gates [[buffer(0)]],
     hidden_out[id] = o * tanh(c);
 }
 
+/* One GRU timestep with `linear_before_reset` set: the reset gate scales the
+ * recurrent product after it is formed, so nothing else has to be computed
+ * between the gates and the answer and this finishes the step on its own.
+ *
+ * ONNX orders the gates z, r, h. */
+kernel void gru_step_linear(device const float* input_gates [[buffer(0)]],
+                            device const float* hidden_gates [[buffer(1)]],
+                            device const float* hidden_in [[buffer(2)]],
+                            device float* hidden_out [[buffer(3)]],
+                            constant uint& count [[buffer(4)]],
+                            constant uint& hidden [[buffer(5)]],
+                            constant uint& clip_bits [[buffer(6)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint row = id / hidden;
+    uint col = id - row * hidden;
+    uint base = row * 3u * hidden;
+    float clip = as_type<float>(clip_bits);
+    float gz = input_gates[base + col] + hidden_gates[base + col];
+    float gr = input_gates[base + hidden + col] + hidden_gates[base + hidden + col];
+    if (clip > 0.0f) {
+        gz = clamp(gz, -clip, clip);
+        gr = clamp(gr, -clip, clip);
+    }
+    float z = 1.0f / (1.0f + exp(-gz));
+    float r = 1.0f / (1.0f + exp(-gr));
+    float gh = input_gates[base + 2u * hidden + col] +
+               r * hidden_gates[base + 2u * hidden + col];
+    if (clip > 0.0f) gh = clamp(gh, -clip, clip);
+    float h = tanh(gh);
+    hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
+}
+
+/* The first half of a GRU timestep without `linear_before_reset`: the reset
+ * gate scales the hidden state BEFORE it meets the recurrent weights, so the
+ * step has to stop here and take a second matrix product. `z` is kept for the
+ * half that follows. */
+kernel void gru_reset(device const float* input_gates [[buffer(0)]],
+                      device const float* hidden_gates [[buffer(1)]],
+                      device const float* hidden_in [[buffer(2)]],
+                      device float* gate_z [[buffer(3)]],
+                      device float* scaled [[buffer(4)]],
+                      constant uint& count [[buffer(5)]],
+                      constant uint& hidden [[buffer(6)]],
+                      constant uint& clip_bits [[buffer(7)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint row = id / hidden;
+    uint col = id - row * hidden;
+    uint base = row * 3u * hidden;
+    float clip = as_type<float>(clip_bits);
+    float gz = input_gates[base + col] + hidden_gates[base + col];
+    float gr = input_gates[base + hidden + col] + hidden_gates[base + hidden + col];
+    if (clip > 0.0f) {
+        gz = clamp(gz, -clip, clip);
+        gr = clamp(gr, -clip, clip);
+    }
+    gate_z[id] = 1.0f / (1.0f + exp(-gz));
+    scaled[id] = (1.0f / (1.0f + exp(-gr))) * hidden_in[id];
+}
+
+/* The second half: the candidate from the reset-scaled product, and the
+ * interpolation the update gate asks for. */
+kernel void gru_finish(device const float* input_gates [[buffer(0)]],
+                       device const float* reset_product [[buffer(1)]],
+                       device const float* gate_z [[buffer(2)]],
+                       device const float* hidden_in [[buffer(3)]],
+                       device float* hidden_out [[buffer(4)]],
+                       constant uint& count [[buffer(5)]],
+                       constant uint& hidden [[buffer(6)]],
+                       constant uint& clip_bits [[buffer(7)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint row = id / hidden;
+    uint col = id - row * hidden;
+    float clip = as_type<float>(clip_bits);
+    float gh = input_gates[row * 3u * hidden + 2u * hidden + col] + reset_product[id];
+    if (clip > 0.0f) gh = clamp(gh, -clip, clip);
+    float h = tanh(gh);
+    float z = gate_z[id];
+    hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
+}
+
 /* Layer normalisation over the trailing axes, one threadgroup a row.
  *
  * A transformer runs one of these before every attention and every feed
@@ -2527,6 +2610,230 @@ fn op_lstm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [all_y, all_h, all_c]
 }
 
+#: One direction of a GRU, from `[seq, batch, input]` to `[seq, batch, H]`.
+fn gru_direction(
+    x_gates: Tensor,
+    recurrent: Tensor,
+    recurrent_h: Tensor,
+    recurrent_bias: Tensor?,
+    initial_h: Tensor,
+    steps: int,
+    batch: int,
+    hidden: int,
+    clip: float,
+    reverse: bool,
+    linear_before_reset: bool
+) -> tuple[Tensor, Tensor] {
+    var state_h = initial_h
+    var produced: list[Tensor] = []
+    for index in 0..steps {
+        let step = if reverse { steps - 1 - index } else { index }
+        let at = slice_axis(x_gates, 0, step * batch, batch)
+        let product = jt.matmul(state_h, recurrent, trans_b: true)
+        #: The recurrent bias belongs to this product rather than to the input
+        #: half, because with `linear_before_reset` the reset gate scales it.
+        let recurred = if recurrent_bias is null {
+            product
+        } else {
+            let shifted = jt.add(product, recurrent_bias)
+            product.free()
+            shifted
+        }
+        let next_h = jt.Tensor([batch, hidden])
+        if linear_before_reset {
+            kernel_for("gru_step_linear").dispatch_async(
+                [at.buffer(), recurred.buffer(), state_h.buffer(), next_h.buffer()],
+                batch * hidden,
+                [batch * hidden, hidden, f32_bits(clip)]
+            )
+        } else {
+            #: The reset gate scales the hidden state before the weights see
+            #: it, so this half stops to take a second product.
+            let gate_z = jt.Tensor([batch, hidden])
+            let scaled = jt.Tensor([batch, hidden])
+            kernel_for("gru_reset").dispatch_async(
+                [
+                    at.buffer(),
+                    recurred.buffer(),
+                    state_h.buffer(),
+                    gate_z.buffer(),
+                    scaled.buffer(),
+                ],
+                batch * hidden,
+                [batch * hidden, hidden, f32_bits(clip)]
+            )
+            let reset_product = jt.matmul(scaled, recurrent_h, trans_b: true)
+            kernel_for("gru_finish").dispatch_async(
+                [
+                    at.buffer(),
+                    reset_product.buffer(),
+                    gate_z.buffer(),
+                    state_h.buffer(),
+                    next_h.buffer(),
+                ],
+                batch * hidden,
+                [batch * hidden, hidden, f32_bits(clip)]
+            )
+            gate_z.free()
+            scaled.free()
+            reset_product.free()
+        }
+        at.free()
+        recurred.free()
+        state_h = next_h
+        produced.push(next_h)
+    }
+
+    var ordered = produced
+    if reverse {
+        ordered = []
+        for index in 0..produced.len() { ordered.push(produced[produced.len() - 1 - index]) }
+    }
+    var rows: list[Tensor] = []
+    for part in ordered { rows.push(copy_of(part, [1, batch, hidden])) }
+    let sequence = if rows.len() == 1 {
+        rows[0]
+    } else {
+        concat_along(rows, 0, "a GRU's output sequence")
+    }
+    if rows.len() > 1 {
+        for row in rows { row.free() }
+    }
+    let final_h = copy_of(state_h, [batch, hidden])
+    for part in produced { part.free() }
+    return (sequence, final_h)
+}
+
+#: ONNX `GRU`.
+#:
+#: Weights are `[directions, 3H, input]` and `[directions, 3H, H]` with the
+#: gates ordered z, r, h, and the bias `[directions, 6H]` holds the input set
+#: then the recurrent one. `linear_before_reset` decides whether the reset gate
+#: scales the hidden state before or after the recurrent weights, which are
+#: different answers -- and it decides where the recurrent bias for the
+#: candidate gate belongs, since only one of the two puts it inside the reset.
+fn op_gru(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let x = need(ins, 0, node)
+    let w = need(ins, 1, node)
+    let r = need(ins, 2, node)
+    let bias = maybe(ins, 3)
+    if maybe(ins, 4) is not null {
+        throw ValueError(
+            f"{node.label()} gives per-sequence lengths, which this executor does not read; " +
+                "every sequence in the batch has to be the same length"
+        )
+    }
+    if node.attrs.get("activations", null) is not null {
+        throw ValueError(
+            f"{node.label()} names its own activations; this executor uses the sigmoid and " +
+                "tanh the operator defaults to"
+        )
+    }
+    if attr_int(node, "layout", 0) != 0 {
+        throw ValueError(f"{node.label()} uses the batch-first layout, which this executor does not read")
+    }
+    if x.rank() != 3 { throw ValueError(f"{node.label()} needs a 3-D input, got {x.shape}") }
+    if w.rank() != 3 or r.rank() != 3 {
+        throw ValueError(f"{node.label()} needs 3-D weights, got {w.shape} and {r.shape}")
+    }
+    let steps = x.shape[0]
+    let batch = x.shape[1]
+    let input_size = x.shape[2]
+    let directions = w.shape[0]
+    let hidden = attr_int(node, "hidden_size", r.shape[2])
+    let facing = attr_str(node, "direction", "forward")
+    let wanted = if facing == "bidirectional" { 2 } else { 1 }
+    if directions != wanted or r.shape[0] != directions {
+        throw ValueError(f"{node.label()} is {facing} but carries {directions} directions of weights")
+    }
+    if w.shape[1] != 3 * hidden or r.shape[1] != 3 * hidden or r.shape[2] != hidden {
+        throw ValueError(f"{node.label()} has weights {w.shape} and {r.shape} for {hidden} hidden units")
+    }
+    if w.shape[2] != input_size {
+        throw ValueError(f"{node.label()} has weights {w.shape} for {input_size} inputs")
+    }
+    let clip = attr_float(node, "clip", 0.0)
+    let linear = attr_int(node, "linear_before_reset", 0) != 0
+
+    let flat_x = copy_of(x, [steps * batch, input_size])
+    var sequences: list[Tensor] = []
+    var last_h: list[Tensor] = []
+    for direction in 0..directions {
+        let wd = taken(slice_axis(w, 0, direction, 1), [3 * hidden, input_size])
+        let rd = taken(slice_axis(r, 0, direction, 1), [3 * hidden, hidden])
+        let rh = taken(slice_axis(rd, 0, 2 * hidden, hidden), [hidden, hidden])
+        var x_gates = jt.matmul(flat_x, wd, trans_b: true)
+        wd.free()
+        var recurrent_bias: Tensor? = null
+        if bias is not null {
+            let row = taken(slice_axis(bias, 0, direction, 1), [6 * hidden])
+            let wb = taken(slice_axis(row, 0, 0, 3 * hidden), [3 * hidden])
+            let rb = taken(slice_axis(row, 0, 3 * hidden, 3 * hidden), [3 * hidden])
+            #: Without `linear_before_reset` the candidate's recurrent bias is
+            #: outside the reset, so it is a constant and belongs with the
+            #: input half; the recurrent half then carries only z and r.
+            var input_bias = wb
+            var carried = rb
+            if not linear {
+                let zeros = jt.Tensor.zeros([hidden])
+                let head = taken(slice_axis(rb, 0, 0, 2 * hidden), [2 * hidden])
+                let tail = taken(slice_axis(rb, 0, 2 * hidden, hidden), [hidden])
+                carried = concat_along([head, zeros], 0, node.label())
+                input_bias = jt.add(wb, concat_along([jt.Tensor.zeros([2 * hidden]), tail], 0, node.label()))
+                head.free()
+                tail.free()
+                zeros.free()
+            }
+            let shifted = jt.add(x_gates, input_bias)
+            x_gates.free()
+            x_gates = shifted
+            recurrent_bias = carried
+            if input_bias is not wb { input_bias.free() }
+            wb.free()
+            if carried is not rb { rb.free() }
+            row.free()
+        }
+        let given_h = maybe(ins, 5)
+        let start_h = if given_h is null {
+            jt.Tensor.zeros([batch, hidden])
+        } else {
+            taken(slice_axis(given_h, 0, direction, 1), [batch, hidden])
+        }
+        let (sequence, final_h) = gru_direction(
+            x_gates,
+            rd,
+            rh,
+            recurrent_bias,
+            start_h,
+            steps,
+            batch,
+            hidden,
+            clip,
+            facing == "reverse" or direction == 1,
+            linear
+        )
+        x_gates.free()
+        rd.free()
+        rh.free()
+        start_h.free()
+        let held = recurrent_bias
+        if held is not null { held.free() }
+        sequences.push(copy_of(sequence, [steps, 1, batch, hidden]))
+        sequence.free()
+        last_h.push(copy_of(final_h, [1, batch, hidden]))
+        final_h.free()
+    }
+    flat_x.free()
+
+    let all_y = if sequences.len() == 1 { sequences[0] } else { concat_along(sequences, 1, node.label()) }
+    let all_h = if last_h.len() == 1 { last_h[0] } else { concat_along(last_h, 0, node.label()) }
+    if sequences.len() > 1 {
+        for part in sequences { part.free() }
+        for part in last_h { part.free() }
+    }
+    return [all_y, all_h]
+}
+
 #: `copy_of` on a freshly cut slice, freeing the slice. Slicing allocates, and
 #: every use of it here wants the copy and not the cut.
 fn taken(cut: Tensor, shape: list[int]) -> Tensor {
@@ -2972,6 +3279,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["BatchNormalization"] = op_batch_norm
     _handlers["InstanceNormalization"] = op_instance_norm
     _handlers["LayerNormalization"] = op_layer_norm
+    _handlers["GRU"] = op_gru
     _handlers["LSTM"] = op_lstm
     _handlers["LRN"] = op_lrn
     _handlers["Dropout"] = op_dropout

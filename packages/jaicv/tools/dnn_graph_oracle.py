@@ -508,6 +508,33 @@ def build_cases():
     lstm("lstm_clipped", 5, 2, 3, 4, clip=0.5)
     lstm("lstm_single_step", 1, 1, 2, 3)
 
+    def gru(name, seq, batch, inp, hid, direction="forward", bias=True, state=False, **attrs):
+        d = 2 if direction == "bidirectional" else 1
+        pieces = [
+            spread(seq, batch, inp, seed=170),
+            spread(d, 3 * hid, inp, low=-0.6, high=0.6, seed=171),
+            spread(d, 3 * hid, hid, low=-0.6, high=0.6, seed=172),
+        ]
+        pieces.append(spread(d, 6 * hid, low=-0.4, high=0.4, seed=173) if bias else None)
+        pieces.append(None)
+        if state:
+            pieces.append(spread(d, batch, hid, low=-0.5, high=0.5, seed=174))
+        case(
+            "recurrent", name, "GRU", pieces,
+            {"hidden_size": hid, "direction": direction, **attrs},
+            outputs=2, opset=14,
+        )
+
+    gru("gru_plain", 5, 2, 3, 4, bias=False)
+    gru("gru_bias", 6, 3, 4, 5)
+    gru("gru_initial_state", 4, 2, 3, 4, state=True)
+    gru("gru_reverse", 5, 2, 3, 4, direction="reverse")
+    gru("gru_bidirectional", 5, 2, 3, 4, direction="bidirectional")
+    gru("gru_clipped", 5, 2, 3, 4, clip=0.5)
+    gru("gru_linear_before_reset", 5, 2, 3, 4, linear_before_reset=1)
+    gru("gru_linear_bidirectional", 4, 2, 3, 4, direction="bidirectional", linear_before_reset=1)
+    gru("gru_single_step", 1, 1, 2, 3)
+
     # Normalisation.
     case(
         "norm",
