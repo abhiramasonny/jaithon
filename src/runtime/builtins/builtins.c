@@ -206,6 +206,7 @@ void jaiRegisterAllBuiltins(void) {
     jaiRegisterCameraPrimitives();
     jaiRegisterGpuPrimitives();
     jaiRegisterGraphPrimitives();
+    jaiRegisterCoreMLPrimitives();
 }
 
 /* ------------------------------------------------------------------ */

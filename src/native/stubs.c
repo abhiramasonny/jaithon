@@ -609,6 +609,48 @@ bool jaiGpuReduceSum(const double *a, size_t n, double *out) {
     return true;
 }
 
+/* No CoreML off Apple, so nothing to reach an accelerator with. */
+JaiCoreMLModel *jaiCoreMLOpen(const char *path, int units, char *errBuf, size_t errSize) {
+    (void)path; (void)units;
+    if (errBuf != NULL && errSize > 0) errBuf[0] = '\0';
+    return NULL;
+}
+void jaiCoreMLClose(JaiCoreMLModel *model) { (void)model; }
+int jaiCoreMLCount(JaiCoreMLModel *model, int outputs) { (void)model; (void)outputs; return -1; }
+const char *jaiCoreMLName(JaiCoreMLModel *model, int outputs, int index) {
+    (void)model; (void)outputs; (void)index; return NULL;
+}
+int jaiCoreMLShape(JaiCoreMLModel *model, int outputs, int index, int64_t *dims, int room) {
+    (void)model; (void)outputs; (void)index; (void)dims; (void)room; return -1;
+}
+JaiCoreMLTicket *jaiCoreMLStart(JaiCoreMLModel *model,
+                                JaiGpuBuffer **ins, const size_t *inOffsets,
+                                const int64_t *inShapes, const int *inRanks,
+                                JaiGpuBuffer **outs, const size_t *outOffsets,
+                                const int64_t *outShapes, const int *outRanks,
+                                char *errBuf, size_t errSize) {
+    (void)model; (void)ins; (void)inOffsets; (void)inShapes; (void)inRanks;
+    (void)outs; (void)outOffsets; (void)outShapes; (void)outRanks;
+    if (errBuf != NULL && errSize > 0) errBuf[0] = '\0';
+    return NULL;
+}
+bool jaiCoreMLWait(JaiCoreMLTicket *ticket, char *errBuf, size_t errSize) {
+    (void)ticket;
+    if (errBuf != NULL && errSize > 0) errBuf[0] = '\0';
+    return false;
+}
+bool jaiCoreMLRun(JaiCoreMLModel *model,
+                  JaiGpuBuffer **ins, const size_t *inOffsets,
+                  const int64_t *inShapes, const int *inRanks,
+                  JaiGpuBuffer **outs, const size_t *outOffsets,
+                  const int64_t *outShapes, const int *outRanks,
+                  char *errBuf, size_t errSize) {
+    (void)model; (void)ins; (void)inOffsets; (void)inShapes; (void)inRanks;
+    (void)outs; (void)outOffsets; (void)outShapes; (void)outRanks;
+    if (errBuf != NULL && errSize > 0) errBuf[0] = '\0';
+    return false;
+}
+
 /* No Metal, so no graph compiler either; every entry point refuses and the
  * caller runs its operators one at a time as it always could. */
 JaiGraphBuilder *jaiGraphNew(void) { return NULL; }
