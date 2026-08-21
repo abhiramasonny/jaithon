@@ -4,6 +4,7 @@
 
 #include "runtime/builtins/text/builtins_str.h"
 #include "runtime/methods.h"
+#include "runtime/parallel.h"
 #include "runtime/runtime.h"
 
 #include "vm/gc.h"
@@ -395,6 +396,34 @@ static bool primBytesFromHex(int argc, Value *args, Value *out) {
  * `scale` multiplies before the clamp, which is what a caller holding
  * normalised floats wants. A NaN becomes zero rather than whatever the cast
  * would have produced. */
+/* Below this many elements the loop stays on one thread: a small image is not
+ * worth waking anything for. */
+#define JAI_QUANTISE_CHUNK 32768
+
+typedef struct {
+    const Value *items;
+    uint8_t     *dst;
+    float        factor;
+} QuantiseWork;
+
+/* Single precision and no call to `floor`. The values are float32 to begin
+ * with, and for a positive number truncation IS the floor -- which the clamp
+ * has already established. `!(value > 0.0f)` catches the negatives and the
+ * NaNs together, since a NaN fails every comparison. */
+static void quantiseRange(void *context, size_t start, size_t end) {
+    const QuantiseWork *work = (const QuantiseWork *)context;
+    for (size_t i = start; i < end; i++) {
+        const Value item = work->items[i];
+        float value = IS_FLOAT(item) ? (float)AS_FLOAT(item) : (float)AS_INT(item);
+        value = value * work->factor + 0.5f;
+        if (!(value > 0.0f)) {
+            work->dst[i] = 0;
+            continue;
+        }
+        work->dst[i] = value >= 255.5f ? (uint8_t)255 : (uint8_t)value;
+    }
+}
+
 static bool primBytesQuantise(int argc, Value *args, Value *out) {
     (void)argc;
     if (!IS_LIST(args[0])) {
@@ -416,28 +445,20 @@ static bool primBytesQuantise(int argc, Value *args, Value *out) {
     if (result == NULL) return false;
     uint8_t *dst = result->data;
 
-    /* Single precision and no call to `floor`. The values are float32 to
-     * begin with, and for a positive number truncation IS the floor -- which
-     * the clamp below has already established. `!(value > 0.0f)` catches the
-     * negatives and the NaNs together, since a NaN fails every comparison.
-     *
-     * This runs once per colour channel of every pixel, so a 720p frame is
-     * 2.8 million times; the arithmetic being cheap is the whole point. */
-    const float factor = (float)scale;
+    /* A number that is not one is refused, but finding out costs a pass that
+     * the parallel one below must not take -- it cannot raise from another
+     * thread. Checking first is one cheap read of memory that is about to be
+     * read again anyway. */
     for (size_t i = 0; i < n; i++) {
-        Value item = items->items[i];
-        float value;
-        if (IS_FLOAT(item)) value = (float)AS_FLOAT(item);
-        else if (IS_INT(item)) value = (float)AS_INT(item);
-        else {
+        if (!IS_FLOAT(items->items[i]) && !IS_INT(items->items[i])) {
             return jaiThrow(vm.cTypeError,
                             "bytes_quantise(): element %zu is %s, not a number",
-                            i, jaiTypeNameStatic(item));
+                            i, jaiTypeNameStatic(items->items[i]));
         }
-        value = value * factor + 0.5f;
-        if (!(value > 0.0f)) { dst[i] = 0; continue; }
-        dst[i] = value >= 255.5f ? (uint8_t)255 : (uint8_t)value;
     }
+
+    QuantiseWork work = {items->items, dst, (float)scale};
+    jaiParallelChunks(n, JAI_QUANTISE_CHUNK, quantiseRange, &work);
     *out = OBJ_VAL(result);
     return true;
 }
@@ -514,6 +535,49 @@ static uint32_t packChannel(Value v) {
  * loop it ran nine hundred thousand iterations and three and a half million
  * calls for one 720p frame -- about 18 ms, more than the whole rest of the
  * loop -- and it is the same arithmetic every time, so it belongs here. */
+#define JAI_PACK_CHUNK 16384
+
+typedef struct {
+    const uint8_t *bytes;
+    const Value   *values;
+    Value         *out;
+    int            channels;
+} PackWork;
+
+/* Bytes are already in range, so that path is a shuffle with no arithmetic at
+ * all -- which is the whole reason to hand pixels over as bytes rather than as
+ * a list of floats. */
+static void packRange(void *context, size_t start, size_t end) {
+    const PackWork *work = (const PackWork *)context;
+    const int channels = work->channels;
+    for (size_t pixel = start; pixel < end; pixel++) {
+        uint32_t blue, green, red, alpha = 255u;
+        if (work->bytes != NULL) {
+            const uint8_t *channel = work->bytes + pixel * (size_t)channels;
+            blue = channel[0];
+            green = blue;
+            red = blue;
+            if (channels != 1) {
+                green = channel[1];
+                red = channel[2];
+                if (channels == 4) alpha = channel[3];
+            }
+        } else {
+            const Value *channel = &work->values[pixel * (size_t)channels];
+            blue = packChannel(channel[0]);
+            green = blue;
+            red = blue;
+            if (channels != 1) {
+                green = packChannel(channel[1]);
+                red = packChannel(channel[2]);
+                if (channels == 4) alpha = packChannel(channel[3]);
+            }
+        }
+        work->out[pixel] =
+            INT_VAL((int64_t)((alpha << 24) | (red << 16) | (green << 8) | blue));
+    }
+}
+
 static bool primListPackArgb(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *values = NULL;
@@ -551,39 +615,10 @@ static bool primListPackArgb(int argc, Value *args, Value *out) {
     jaiGCPopRoot();
     if (count > 0 && list->capacity < (int)count) return false;
 
-    /* Bytes are already in range, so that path is a shuffle with no
-     * arithmetic at all -- which is the whole reason to hand pixels over as
-     * bytes rather than as a list of floats. */
-    if (raw != NULL) {
-        for (int64_t pixel = 0; pixel < count; pixel++) {
-            const uint8_t *channel = raw->data + pixel * channels;
-            uint32_t blue = channel[0], green = blue, red = blue, alpha = 255u;
-            if (channels != 1) {
-                green = channel[1];
-                red = channel[2];
-                if (channels == 4) alpha = channel[3];
-            }
-            list->items[pixel] =
-                INT_VAL((int64_t)((alpha << 24) | (red << 16) | (green << 8) | blue));
-        }
-    } else {
-        for (int64_t pixel = 0; pixel < count; pixel++) {
-            const Value *channel = &values->items[pixel * channels];
-            uint32_t blue, green, red, alpha = 255u;
-            if (channels == 1) {
-                blue = packChannel(channel[0]);
-                green = blue;
-                red = blue;
-            } else {
-                blue = packChannel(channel[0]);
-                green = packChannel(channel[1]);
-                red = packChannel(channel[2]);
-                if (channels == 4) alpha = packChannel(channel[3]);
-            }
-            list->items[pixel] =
-                INT_VAL((int64_t)((alpha << 24) | (red << 16) | (green << 8) | blue));
-        }
-    }
+    PackWork work = {raw != NULL ? raw->data : NULL,
+                     values != NULL ? values->items : NULL,
+                     list->items, (int)channels};
+    jaiParallelChunks((size_t)count, JAI_PACK_CHUNK, packRange, &work);
     list->count = (int)count;
     list->version++;
     *out = OBJ_VAL(list);
