@@ -497,6 +497,11 @@ class FileAnalysis {
                     }
                 }
                 const at = this.findName(searchFrom, end, bound);
+                // Like AST_FROM_IMPORT: a top-level `import` is unconditionally
+                // part of this module's namespace at runtime, no `pub` needed
+                // -- confirmed against src/runtime/modules, where a package
+                // that does `import .sub as sub` at its own top level makes
+                // `sub` reachable as `pkg.sub` from outside.
                 const symbol = this.addSymbol({
                     name: bound, kind: 'module',
                     start: at ? at.start : start, end: at ? at.end : start,
@@ -504,6 +509,7 @@ class FileAnalysis {
                     detail: `import ${node.path}${node.alias ? ` as ${node.alias}` : ''}`,
                     doc: null, scope: scopeId, container: container ?? null,
                     modulePath: node.path,
+                    visibility: scopeId === this.moduleScope ? 'pub' : null,
                 });
                 this.imports.push({ path: node.path, node, symbol: symbol.index, items: null });
                 this.addModulePathRef(node.path, start, end, scopeId);
@@ -706,6 +712,16 @@ class FileAnalysis {
             scope = scope.parent === null ? null : this.scopes[scope.parent];
         }
         return null;
+    }
+
+    /** The deepest lexical scope whose extent contains `offset`. */
+    scopeAt(offset) {
+        let best = this.moduleScope;
+        for (const scope of this.scopes) {
+            if (offset < scope.start || offset > scope.end) continue;
+            if (this.scopes[best].start <= scope.start) best = scope.id;
+        }
+        return best;
     }
 
     membersOf(symbol) {
@@ -937,6 +953,66 @@ class Workspace {
         return current;
     }
 
+    /**
+     * One more `.name` step from the module at `fsPath`: the file `name`
+     * denotes there, if it is itself a module. `import`/`from...import` are
+     * both, unconditionally, part of a module's namespace at runtime (spec:
+     * src/runtime/modules), so this needs no checker type.
+     */
+    async stepIntoModule(fsPath, name, token) {
+        const other = fsPath ? await this.analyze(fsPath, token) : null;
+        if (!other) return null;
+        const symbol = other.lookup(name, other.moduleScope);
+        if (!symbol) return null;
+        const followed = await this.follow(other, symbol, token);
+        if (!followed || followed.symbol.kind !== 'module') return null;
+        return this.moduleFile(followed.symbol.modulePath, followed.analysis.fsPath);
+    }
+
+    /**
+     * The file the module-valued expression `node` denotes -- `a`, or a
+     * chain `a.b.c` where every segment but the last is itself a module --
+     * or null if it names something else. `node` is an AST_IDENT or an
+     * AST_MEMBER/AST_OPT_MEMBER chain bottoming out in one.
+     */
+    async moduleOf(analysis, node, token) {
+        if (!node) return null;
+
+        if (node.kind === 'AST_IDENT') {
+            const symbol = analysis.lookup(node.name, analysis.scopeAt((node.span || {}).start));
+            if (!symbol) return null;
+            const followed = await this.follow(analysis, symbol, token);
+            if (!followed || followed.symbol.kind !== 'module') return null;
+            return this.moduleFile(followed.symbol.modulePath, followed.analysis.fsPath);
+        }
+
+        if (node.kind === 'AST_MEMBER' || node.kind === 'AST_OPT_MEMBER') {
+            const innerFile = await this.moduleOf(analysis, node.object, token);
+            return innerFile ? this.stepIntoModule(innerFile, node.name, token) : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * moduleOf()'s text-driven twin, for completion sites where the segment
+     * under the cursor has no AST node yet (the file didn't parse with it in
+     * place). `first` is the chain's head identifier at `offset`, `rest` the
+     * dotted segments after it.
+     */
+    async moduleOfChain(analysis, offset, first, rest, token) {
+        const symbol = analysis.lookup(first, analysis.scopeAt(offset));
+        if (!symbol) return null;
+        const followed = await this.follow(analysis, symbol, token);
+        if (!followed || followed.symbol.kind !== 'module') return null;
+
+        let fsPath = this.moduleFile(followed.symbol.modulePath, followed.analysis.fsPath);
+        for (const name of rest) {
+            fsPath = await this.stepIntoModule(fsPath, name, token);
+        }
+        return fsPath;
+    }
+
     async memberByName(analysis, name, token) {
         const found = [];
         const consider = (other, symbol) => {
@@ -964,17 +1040,22 @@ class Workspace {
     }
 
     async memberDefinition(analysis, ref, token) {
-        if (!ref.receiver) return this.memberByName(analysis, ref.name, token);
-
         const moduleName = moduleOfType(ref.receiver);
-        if (moduleName) {
-            const file = this.moduleFile(moduleName, analysis.fsPath);
-            if (!file) return null;
-            const other = await this.analyze(file, token);
+        let moduleFsPath = moduleName ? this.moduleFile(moduleName, analysis.fsPath) : null;
+        // ref.receiver only ever names one level (it comes from a bare
+        // AST_IDENT). A chain like `p.sub.hello` needs moduleOf() walking
+        // ref.node.object, which carries the whole `p.sub` subtree.
+        if (!moduleFsPath && !ref.receiver && ref.node?.object) {
+            moduleFsPath = await this.moduleOf(analysis, ref.node.object, token);
+        }
+        if (moduleFsPath) {
+            const other = await this.analyze(moduleFsPath, token);
             if (!other) return null;
             const target = other.lookup(ref.name, other.moduleScope);
             return target ? { analysis: other, symbol: target } : null;
         }
+
+        if (!ref.receiver) return this.memberByName(analysis, ref.name, token);
 
         const owner = await this.typeSymbol(analysis, ref.receiver, token);
         if (!owner) return null;

@@ -479,9 +479,116 @@ static bool primListFilled(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* One channel of a pixel, rounded and clamped the way a display wants it.
+ *
+ * `!(value > 0.0)` rather than `value < 0.0` so that a NaN -- which compares
+ * false against everything -- lands on black instead of an undefined cast.
+ * Anything that is not a number lands there too, which is what a caller who
+ * passed one deserves and is cheaper than checking the whole list first. */
+static uint32_t packChannel(Value v) {
+    if (!IS_FLOAT(v) && !IS_INT(v)) return 0u;
+    const double value = IS_FLOAT(v) ? AS_FLOAT(v) : (double)AS_INT(v);
+    if (!(value > 0.0)) return 0u;
+    const double rounded = value + 0.5;
+    if (rounded > 255.0) return 255u;
+    return (uint32_t)rounded;
+}
+
+/* `list_pack_argb(values, channels)` -- interleaved float channels to one
+ * `0xAARRGGBB` int per pixel.
+ *
+ * The pixels come either as a list of floats, which are rounded and clamped
+ * on the way through, or as `bytes` that are already in range -- which is what
+ * `Mat.to_bytes` hands over, and it skips both the boxing and the arithmetic.
+ *
+ * `channels` is 1 for grey, 3 for BGR, 4 for BGRA; anything else is refused.
+ * Grey fans the one value across the three colour channels, and a source
+ * without an alpha channel gets an opaque one.
+ *
+ * This is what stands between a camera and its preview. Written as a Jaithon
+ * loop it ran nine hundred thousand iterations and three and a half million
+ * calls for one 720p frame -- about 18 ms, more than the whole rest of the
+ * loop -- and it is the same arithmetic every time, so it belongs here. */
+static bool primListPackArgb(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *values = NULL;
+    ObjBytes *raw = NULL;
+    int64_t supplied;
+    if (IS_BYTES(args[0])) {
+        raw = AS_BYTES(args[0]);
+        supplied = (int64_t)raw->length;
+    } else if (jaiArgList(args[0], 1, "list_pack_argb", &values)) {
+        supplied = (int64_t)values->count;
+    } else {
+        return false;
+    }
+
+    int64_t channels;
+    if (!jaiStrWantInt(args[1], "list_pack_argb", "the channel count", &channels)) return false;
+    if (channels != 1 && channels != 3 && channels != 4) {
+        return jaiThrow(vm.cValueError,
+                        "list_pack_argb(): channels must be 1, 3 or 4, got %lld",
+                        (long long)channels);
+    }
+    if (supplied % channels != 0) {
+        return jaiThrow(vm.cValueError,
+                        "list_pack_argb(): %lld values is not a whole number of "
+                        "%lld-channel pixels",
+                        (long long)supplied, (long long)channels);
+    }
+
+    const int64_t count = supplied / channels;
+    ObjList *list = jaiListNew((int)count);
+    if (list == NULL) return false;
+    /* Rooted across the reserve: growing the backing array can collect. */
+    jaiGCPushRoot(OBJ_VAL(list));
+    jaiListReserve(list, (int)count);
+    jaiGCPopRoot();
+    if (count > 0 && list->capacity < (int)count) return false;
+
+    /* Bytes are already in range, so that path is a shuffle with no
+     * arithmetic at all -- which is the whole reason to hand pixels over as
+     * bytes rather than as a list of floats. */
+    if (raw != NULL) {
+        for (int64_t pixel = 0; pixel < count; pixel++) {
+            const uint8_t *channel = raw->data + pixel * channels;
+            uint32_t blue = channel[0], green = blue, red = blue, alpha = 255u;
+            if (channels != 1) {
+                green = channel[1];
+                red = channel[2];
+                if (channels == 4) alpha = channel[3];
+            }
+            list->items[pixel] =
+                INT_VAL((int64_t)((alpha << 24) | (red << 16) | (green << 8) | blue));
+        }
+    } else {
+        for (int64_t pixel = 0; pixel < count; pixel++) {
+            const Value *channel = &values->items[pixel * channels];
+            uint32_t blue, green, red, alpha = 255u;
+            if (channels == 1) {
+                blue = packChannel(channel[0]);
+                green = blue;
+                red = blue;
+            } else {
+                blue = packChannel(channel[0]);
+                green = packChannel(channel[1]);
+                red = packChannel(channel[2]);
+                if (channels == 4) alpha = packChannel(channel[3]);
+            }
+            list->items[pixel] =
+                INT_VAL((int64_t)((alpha << 24) | (red << 16) | (green << 8) | blue));
+        }
+    }
+    list->count = (int)count;
+    list->version++;
+    *out = OBJ_VAL(list);
+    return true;
+}
+
 void jaiBytesRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "bytes_quantise", primBytesQuantise, 1, 2);
     jaiStrDefinePrim(ns, "list_filled",    primListFilled,    1, 2);
+    jaiStrDefinePrim(ns, "list_pack_argb", primListPackArgb,  2, 2);
     jaiStrDefinePrim(ns, "bytes_new",      primBytesNew,      1, 1);
     jaiStrDefinePrim(ns, "bytes_len",      primBytesLen,      1, 1);
     jaiStrDefinePrim(ns, "bytes_get",      primBytesGet,      2, 2);

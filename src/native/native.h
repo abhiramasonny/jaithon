@@ -105,6 +105,13 @@ void          jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t co
 void          jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
                              size_t offset);
+/* Narrow float slots straight into unsigned bytes, dividing by `scale` and
+ * rounding half up. The inverse of jaiGpuUploadU8, and the way to get pixels
+ * back without turning every one of them into a boxed list element -- a 720p
+ * frame is 2.8 million floats, and boxing them costs eight milliseconds
+ * against a fraction of one for this. */
+void          jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
+                               size_t offset, float scale);
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
                             char *errBuf, size_t errBufSize);
 /* The kernel is opaque; this is the only way to free one. */

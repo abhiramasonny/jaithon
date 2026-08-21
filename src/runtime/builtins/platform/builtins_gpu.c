@@ -248,6 +248,39 @@ static bool nGpuBufferUploadU8(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `gpu_buffer_download_u8(buffer, offset, count, scale)` -- float slots back
+ * as clamped bytes.
+ *
+ * The inverse of `gpu_buffer_upload_u8`, and the cheap way to read pixels: the
+ * ordinary download hands back a list, which boxes every element, and a 720p
+ * frame is 2.8 million of them. */
+static bool nGpuBufferDownloadU8(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *b;
+    if (!requireBuffer(args[0], 1, "gpu_buffer_download_u8", &b)) return false;
+    int64_t offset, count;
+    double scale;
+    if (!jaiArgInt(args[1], 2, "gpu_buffer_download_u8", &offset)) return false;
+    if (!jaiArgInt(args[2], 3, "gpu_buffer_download_u8", &count)) return false;
+    if (!jaiArgNumber(args[3], 4, "gpu_buffer_download_u8", &scale)) return false;
+    if (!isfinite(scale) || scale == 0.0)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_download_u8(): scale must be finite and non-zero");
+    if (offset < 0 || count < 0 || offset > b->count || count > b->count - offset)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_download_u8(): %lld values at %lld exceed buffer "
+                        "capacity %lld",
+                        (long long)count, (long long)offset, (long long)b->count);
+
+    ObjBytes *bytes = jaiBytesNew(NULL, (size_t)count);
+    if (bytes == NULL) return false;
+    if (count > 0)
+        jaiGpuDownloadU8(b->buffer, bytes->data, (size_t)count,
+                         (size_t)(b->origin + offset), (float)scale);
+    *out = OBJ_VAL(bytes);
+    return true;
+}
+
 static bool nGpuBufferFillUniform(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *b;
@@ -1095,6 +1128,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_buffer_new",      nGpuBufferNew,      1, 1);
     jaiDefineNative("__prim__.gpu_buffer_view",     nGpuBufferView,     3, 3);
     jaiDefineNative("__prim__.gpu_buffer_upload",   nGpuBufferUpload,   3, 3);
+    jaiDefineNative("__prim__.gpu_buffer_download_u8", nGpuBufferDownloadU8, 4, 4);
     jaiDefineNative("__prim__.gpu_buffer_upload_u8", nGpuBufferUploadU8, 6, 6);
     jaiDefineNative("__prim__.gpu_buffer_fill_uniform", nGpuBufferFillUniform, 4, 4);
     jaiDefineNative("__prim__.gpu_buffer_fill_zero", nGpuBufferFillZero, 1, 1);

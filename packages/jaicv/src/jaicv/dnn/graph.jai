@@ -786,13 +786,7 @@ pub class Graph {
 #: be either way round, since multiplication does not care and exporters
 #: disagree.
 fn fuse_activations(order: list[GraphNode], outputs: list[str]) -> list[GraphNode] {
-    var readers: dict[str, int] = {}
-    for node in order {
-        for name in node.inputs {
-            if name.len() > 0 { readers[name] = readers.get(name, 0) + 1 }
-        }
-    }
-    for name in outputs { readers[name] = readers.get(name, 0) + 1 }
+    let readers = count_readers(order, outputs)
 
     #: Which Sigmoid produced each name, so the Mul that follows can find it
     #: without a second sweep.
@@ -837,53 +831,22 @@ fn fuse_activations(order: list[GraphNode], outputs: list[str]) -> list[GraphNod
         if node.op == "Sigmoid" and folded.get(node.outputs[0], false) { continue }
         kept.push(node)
     }
-    return fuse_conv_epilogues(kept, readers)
-}
-
-#: What `conv2d_nchw` calls each activation it can carry itself.
-let CONV_EPILOGUE = {"Relu": 1, "Silu": 2}
-
-#: Fold an activation that follows a convolution into the convolution.
-#:
-#: MPS runs the epilogue inside the same compiled graph as the convolution and
-#: its bias, so it costs a fraction of the separate elementwise kernel -- which
-#: would otherwise read and write the whole output again. On YOLOv8n that is
-#: fifty-seven passes over activation tensors that need not happen.
-#:
-#: Only when the convolution's output goes nowhere else, since folding
-#: rewrites it in place as far as the rest of the graph can tell, and only
-#: when the convolution has a bias: the fused epilogue is attached to the bias
-#: add, so there is nowhere to put one without it.
-fn fuse_conv_epilogues(order: list[GraphNode], readers: dict[str, int]) -> list[GraphNode] {
-    var conv_of: dict[str, GraphNode] = {}
-    var absorbed: dict[str, bool] = {}
-    var kept: list[GraphNode] = []
-    for node in order {
-        if node.op == "Conv" and node.inputs.len() == 3 and node.outputs.len() == 1 {
-            let produced = node.outputs[0]
-            if produced.len() > 0 and readers.get(produced, 0) == 1 {
-                if node.attrs.get("jaicv.fused_activation", null) is null {
-                    conv_of[produced] = node
-                }
-            }
-            kept.push(node)
-            continue
-        }
-        let code = CONV_EPILOGUE.get(node.op, 0)
-        if code != 0 and node.inputs.len() == 1 and node.outputs.len() == 1 {
-            let source = conv_of.get(node.inputs[0], null)
-            if source is not null {
-                source.attrs["jaicv.fused_activation"] = Attr("int", i: code)
-                source.outputs = [node.outputs[0]]
-                absorbed[node.inputs[0]] = true
-                continue
-            }
-        }
-        kept.push(node)
-    }
-    if absorbed.len() == 0 { return order }
     return kept
 }
+
+#: How many places each name is consumed, counting the graph's own outputs as
+#: a reader -- a value the caller asked for is wanted whatever else reads it.
+fn count_readers(order: list[GraphNode], outputs: list[str]) -> dict[str, int] {
+    var readers: dict[str, int] = {}
+    for node in order {
+        for name in node.inputs {
+            if name.len() > 0 { readers[name] = readers.get(name, 0) + 1 }
+        }
+    }
+    for name in outputs { readers[name] = readers.get(name, 0) + 1 }
+    return readers
+}
+
 
 #: Number of elements a shape holds.
 fn volume(shape: list[int]) -> int {
@@ -1901,12 +1864,6 @@ fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let padded = if even { x } else { pad_spatial(x, pads, 0.0) }
     let inner_pad = if even { pads[0] } else { 0 }
 
-    #: `jaicv.fused_activation`, put there by `fuse_activations`: the epilogue
-    #: rides along in the convolution's own dispatch rather than costing a
-    #: second pass over the output. 0 none, 1 ReLU, 2 SiLU, matching
-    #: `conv2d_nchw`. Only with a bias, which is what it fuses onto.
-    let epilogue = if bias is null { 0 } else { attr_int(node, "jaicv.fused_activation", 0) }
-
     #: Everything below stays in the layout the file already uses. ONNX is
     #: NCHW activations and OIHW weights, which is exactly what `conv2d_nchw`
     #: takes, so nothing is transposed on the way in or out -- the round trip
@@ -1938,8 +1895,7 @@ fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
                 slice_w,
                 bias: slice_bias,
                 stride: step,
-                padding: inner_pad,
-                activation: epilogue
+                padding: inner_pad
             )
         )
         if slice_in is not padded { slice_in.free() }

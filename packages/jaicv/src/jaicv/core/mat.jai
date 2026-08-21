@@ -520,6 +520,26 @@ pub class Mat: Printable {
         #: 640x480 frame took thirty-nine milliseconds, which put a
         #: twenty-five frame ceiling on writing video before a single frame was
         #: encoded. The same work in C is a third of a millisecond.
+        self.check_live()
+        let cached = self.host
+        if cached is not null and self.host_generation == generation_of(self.storage) {
+            return __prim__.bytes_quantise(cached, scale)
+        }
+        #: Nothing on the host to narrow, so the device narrows on the way out
+        #: instead of handing over floats to be narrowed here. `ensure_host`
+        #: would build a list first, and a list element costs far more than the
+        #: byte it ends up as: a 720p frame is 2.8 million of them, eight
+        #: milliseconds of boxing for data that was bytes to begin with.
+        #:
+        #: `download_u8` divides where `bytes_quantise` multiplies -- it is the
+        #: inverse of `upload_u8`, which is the pair a reader of `std.gpu`
+        #: expects -- so the reciprocal goes in.
+        if self.is_continuous() and self.offset == 0 {
+            let wanted = self.rows * self.cols * self.channels()
+            if self.storage.count == wanted {
+                return self.storage.download_u8(0, wanted, 1.0 / scale)
+            }
+        }
         return __prim__.bytes_quantise(self.ensure_host(), scale)
     }
 
