@@ -51,6 +51,7 @@ from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE
 from .blob import Net, Runnable
 from .graph import Attr, Graph, GraphNode, is_implemented, run_graph
+from .plan import run_best
 from .protobuf import Field, WIRE_I32, WIRE_I64, WIRE_LEN, WIRE_VARINT, as_bytes, as_double, as_float, as_string, field_by_number, fields_by_number, packed_doubles, packed_fixed32, packed_fixed64, packed_floats, packed_varints, parse_message, parse_nested
 
 #: ModelProto.
@@ -1007,10 +1008,21 @@ pub class OnnxNet: Runnable {
                     "blob_from_image is what lays an image out planar"
             )
         }
-        let values = blob.values()
-        let fed = Tensor(self.resolved_shape(values.len()), values)
+        #: The blob is already on the device, so the tensor shares its
+        #: storage where it can rather than making a round trip through the
+        #: host to say so. A blob that is a view of something larger is copied,
+        #: since a tensor wants the whole of what it is given.
+        let count = blob.rows * blob.cols
+        let fed = if blob.is_continuous() {
+            Tensor(self.resolved_shape(count), storage: blob.buffer().view(blob.offset, count))
+        } else {
+            let values = blob.values()
+            Tensor(self.resolved_shape(values.len()), values)
+        }
         defer { fed.free() }
-        let produced = run_graph(self.graph, {self.input_name: fed})
+        #: `run_best` interprets the first call and compiles the model after,
+        #: which is most of the speed for anything run more than once.
+        let produced = run_best(self.graph, {self.input_name: fed})
         defer {
             for (_name, tensor) in produced.items() { tensor.free() }
         }
