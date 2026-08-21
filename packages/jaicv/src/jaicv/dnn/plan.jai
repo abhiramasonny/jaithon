@@ -53,7 +53,20 @@ let UNARY_CODES = {
     "Sqr": 13,
 }
 
-let BINARY_CODES = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3, "Max": 4, "Min": 5, "Pow": 6}
+let BINARY_CODES = {
+    "Add": 0,
+    "Sub": 1,
+    "Mul": 2,
+    "Div": 3,
+    "Max": 4,
+    "Min": 5,
+    "Pow": 6,
+    "Equal": 7,
+    "Greater": 8,
+    "Less": 9,
+    "And": 10,
+    "Or": 11,
+}
 
 let REDUCE_CODES = {"ReduceSum": 0, "ReduceMean": 1, "ReduceMax": 2, "ReduceMin": 3}
 
@@ -498,6 +511,54 @@ fn emit(state: Build, node: GraphNode) -> bool {
             b,
             state.id_of(node.inputs[0]),
             attr_float(node, "alpha", 0.01)
+        )
+        return true
+    }
+
+    if node.op == "Not" {
+        #: One where the value was zero, which is `x == 0` written as a
+        #: comparison the builder already has.
+        state.ids[out] = __prim__.graph_binary(
+            b,
+            state.id_of(node.inputs[0]),
+            scalar(state, 0.0),
+            7
+        )
+        return true
+    }
+
+    if node.op == "Where" {
+        state.ids[out] = __prim__.graph_select(
+            b,
+            state.id_of(node.inputs[0]),
+            state.id_of(node.inputs[1]),
+            state.id_of(node.inputs[2])
+        )
+        return true
+    }
+
+    if node.op == "Mod" {
+        #: With `fmod` the sign follows the dividend, which is `x - trunc(x/y) * y`;
+        #: without it the sign follows the divisor, which is the same with a
+        #: floor. Neither needs an operator of its own.
+        let x = state.id_of(node.inputs[0])
+        let y = state.id_of(node.inputs[1])
+        let ratio = __prim__.graph_binary(b, x, y, 3)
+        let whole = __prim__.graph_unary(b, ratio, if attr_int(node, "fmod", 0) != 0 { 15 } else { 10 })
+        state.ids[out] = __prim__.graph_binary(b, x, __prim__.graph_binary(b, whole, y, 2), 1)
+        return true
+    }
+
+    if node.op == "Mean" {
+        var running = state.id_of(node.inputs[0])
+        for index in 1..node.inputs.len() {
+            running = __prim__.graph_binary(b, running, state.id_of(node.inputs[index]), 0)
+        }
+        state.ids[out] = __prim__.graph_binary(
+            b,
+            running,
+            scalar(state, float(node.inputs.len())),
+            3
         )
         return true
     }

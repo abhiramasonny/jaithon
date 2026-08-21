@@ -213,6 +213,18 @@ static bool nGraphPool(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGraphSelect(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t predicate, yes, no;
+    if (!requireBuilder(args[0], 1, "graph_select", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_select", &predicate)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_select", &yes)) return false;
+    if (!jaiArgInt(args[3], 4, "graph_select", &no)) return false;
+    *out = INT_VAL(jaiGraphSelect(builder, (int)predicate, (int)yes, (int)no));
+    return true;
+}
+
 static bool nGraphConcat(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -603,6 +615,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_binary",         nGraphBinary,         4, 4);
     jaiDefineNative("__prim__.graph_conv",           nGraphConv,           5, 5);
     jaiDefineNative("__prim__.graph_pool",           nGraphPool,           4, 4);
+    jaiDefineNative("__prim__.graph_select",         nGraphSelect,         4, 4);
     jaiDefineNative("__prim__.graph_concat",         nGraphConcat,         3, 3);
     jaiDefineNative("__prim__.graph_reshape",        nGraphReshape,        3, 3);
     jaiDefineNative("__prim__.graph_transpose",      nGraphTranspose,      3, 3);
