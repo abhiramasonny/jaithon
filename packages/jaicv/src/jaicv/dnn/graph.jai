@@ -42,6 +42,9 @@ import std.math
 import jaitensor as jt
 from jaitensor import Tensor
 from std.gpu import Kernel
+import std.gpu as gpu
+from std.os import env
+from std.time import Instant
 
 #: The deepest tensor the strided kernels index. Rank eight covers every
 #: layout a vision network uses and keeps the per-axis shape and stride inside
@@ -590,6 +593,18 @@ pub class GraphNode {
     pub var inputs: list[str]
     pub var outputs: list[str]
     pub var attrs: dict[str, Attr]
+    #: Work an operator can do once and reuse on every later run of the graph.
+    #:
+    #: A convolution's weights are an initializer, so the layout swap from
+    #: ONNX's `[M, C/g, kH, kW]` to jaitensor's `[kH, kW, C/g, M]` produces the
+    #: same tensor every frame -- redoing it measured 12.5 ms a frame on
+    #: YOLOv8n, a tenth of the whole graph, for a result that never changed.
+    #: `cached` owns its tensors and `free_cached` releases them. `cached_of`
+    #: holds the input each entry was computed from, so a caller who feeds a
+    #: different tensor next time gets a fresh result rather than a stale one;
+    #: those are borrowed, never freed here.
+    pub var cached: dict[str, Tensor]
+    pub var cached_of: dict[str, Tensor]
 
     pub fn init(
         self,
@@ -604,6 +619,16 @@ pub class GraphNode {
         self.inputs = [value for value in inputs]
         self.outputs = [value for value in outputs]
         self.attrs = {key: value for (key, value) in attrs.items()}
+        self.cached = {}
+        self.cached_of = {}
+    }
+
+    #: Drop anything an operator memoised on this node. Only `cached` is
+    #: freed; `cached_of` refers to tensors the graph owns.
+    pub fn free_cached(self) -> void {
+        for (_key, tensor) in self.cached.items() { tensor.free() }
+        self.cached = {}
+        self.cached_of = {}
     }
 
     #: How this node is named in an error. Nodes are often anonymous in an
@@ -625,6 +650,7 @@ pub class Graph {
     pub var inputs: list[str]
     pub var outputs: list[str]
     pub var initializers: dict[str, Tensor]
+    var plan: list[GraphNode]?
 
     pub fn init(
         self,
@@ -637,6 +663,7 @@ pub class Graph {
         self.inputs = [name for name in inputs]
         self.outputs = [name for name in outputs]
         self.initializers = {key: value for (key, value) in initializers.items()}
+        self.plan = null
     }
 
     #: The nodes in an order where every input is produced before it is read.
@@ -718,9 +745,144 @@ pub class Graph {
         return order
     }
 
+    #: The order `run_graph` actually walks: topologically sorted, then
+    #: rewritten by `fuse_activations`.
+    #:
+    #: Held onto because neither step depends on the values flowing through --
+    #: only on the shape of the graph -- and redoing them per frame cost more
+    #: than some of the operators do. A caller who edits `nodes`, `inputs`,
+    #: `outputs` or `initializers` afterwards has to call `invalidate`.
+    pub fn schedule(self) -> list[GraphNode] {
+        let ready = self.plan
+        if ready is not null { return ready }
+        let built = fuse_activations(self.topological(), self.outputs)
+        self.plan = built
+        return built
+    }
+
+    #: Forget the schedule and everything the operators memoised, so the next
+    #: run rebuilds both. Needed after the graph is edited, and harmless
+    #: otherwise.
+    pub fn invalidate(self) -> void {
+        self.plan = null
+        for node in self.nodes { node.free_cached() }
+    }
+
     fn __str__(self) -> str {
         return f"Graph({self.nodes.len()} nodes, in={self.inputs}, out={self.outputs})"
     }
+}
+
+#: Rewrite `Mul(x, Sigmoid(x))` to a single `Silu` node.
+#:
+#: Exporters have no choice but to spell SiLU that way -- ONNX has no operator
+#: for it -- so a detector that uses it as its activation pays for two full
+#: passes over every activation tensor and an intermediate the size of one.
+#: On YOLOv8n that pair was 35% of the graph's warm time.
+#:
+#: The rewrite only fires when the Sigmoid's result goes nowhere else: another
+#: reader, or the graph itself naming it as an output, means the value is
+#: wanted on its own and folding it away would lose it. The Mul's operands may
+#: be either way round, since multiplication does not care and exporters
+#: disagree.
+fn fuse_activations(order: list[GraphNode], outputs: list[str]) -> list[GraphNode] {
+    var readers: dict[str, int] = {}
+    for node in order {
+        for name in node.inputs {
+            if name.len() > 0 { readers[name] = readers.get(name, 0) + 1 }
+        }
+    }
+    for name in outputs { readers[name] = readers.get(name, 0) + 1 }
+
+    #: Which Sigmoid produced each name, so the Mul that follows can find it
+    #: without a second sweep.
+    var sigmoid_of: dict[str, GraphNode] = {}
+    var folded: dict[str, bool] = {}
+    var fused: list[GraphNode] = []
+    for node in order {
+        if node.op == "Sigmoid" and node.inputs.len() == 1 and node.outputs.len() == 1 {
+            let produced = node.outputs[0]
+            if produced.len() > 0 and readers.get(produced, 0) == 1 {
+                sigmoid_of[produced] = node
+            }
+            fused.push(node)
+            continue
+        }
+        if node.op == "Mul" and node.inputs.len() == 2 and node.outputs.len() == 1 {
+            let left = node.inputs[0]
+            let right = node.inputs[1]
+            var source = sigmoid_of.get(right, null)
+            var other = left
+            if source is null {
+                source = sigmoid_of.get(left, null)
+                other = right
+            }
+            if source is not null and source.inputs[0] == other {
+                folded[source.outputs[0]] = true
+                fused.push(
+                    GraphNode(
+                        op: "Silu",
+                        name: node.name,
+                        inputs: [other],
+                        outputs: [node.outputs[0]]
+                    )
+                )
+                continue
+            }
+        }
+        fused.push(node)
+    }
+    var kept: list[GraphNode] = []
+    for node in fused {
+        if node.op == "Sigmoid" and folded.get(node.outputs[0], false) { continue }
+        kept.push(node)
+    }
+    return fuse_conv_epilogues(kept, readers)
+}
+
+#: What `conv2d_nchw` calls each activation it can carry itself.
+let CONV_EPILOGUE = {"Relu": 1, "Silu": 2}
+
+#: Fold an activation that follows a convolution into the convolution.
+#:
+#: MPS runs the epilogue inside the same compiled graph as the convolution and
+#: its bias, so it costs a fraction of the separate elementwise kernel -- which
+#: would otherwise read and write the whole output again. On YOLOv8n that is
+#: fifty-seven passes over activation tensors that need not happen.
+#:
+#: Only when the convolution's output goes nowhere else, since folding
+#: rewrites it in place as far as the rest of the graph can tell, and only
+#: when the convolution has a bias: the fused epilogue is attached to the bias
+#: add, so there is nowhere to put one without it.
+fn fuse_conv_epilogues(order: list[GraphNode], readers: dict[str, int]) -> list[GraphNode] {
+    var conv_of: dict[str, GraphNode] = {}
+    var absorbed: dict[str, bool] = {}
+    var kept: list[GraphNode] = []
+    for node in order {
+        if node.op == "Conv" and node.inputs.len() == 3 and node.outputs.len() == 1 {
+            let produced = node.outputs[0]
+            if produced.len() > 0 and readers.get(produced, 0) == 1 {
+                if node.attrs.get("jaicv.fused_activation", null) is null {
+                    conv_of[produced] = node
+                }
+            }
+            kept.push(node)
+            continue
+        }
+        let code = CONV_EPILOGUE.get(node.op, 0)
+        if code != 0 and node.inputs.len() == 1 and node.outputs.len() == 1 {
+            let source = conv_of.get(node.inputs[0], null)
+            if source is not null {
+                source.attrs["jaicv.fused_activation"] = Attr("int", i: code)
+                source.outputs = [node.outputs[0]]
+                absorbed[node.inputs[0]] = true
+                continue
+            }
+        }
+        kept.push(node)
+    }
+    if absorbed.len() == 0 { return order }
+    return kept
 }
 
 #: Number of elements a shape holds.
@@ -1086,6 +1248,15 @@ fn op_relu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 
 fn op_sigmoid(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [jt.sigmoid(need(ins, 0, node))]
+}
+
+#: `x * sigmoid(x)`, which YOLOv8 and most modern detectors use everywhere.
+#:
+#: No exporter emits this: ONNX has no SiLU, so a file spells it as a Sigmoid
+#: and a Mul. `fuse_activations` spots that pair and rewrites it to this, which
+#: turns two passes over the tensor into one and drops the intermediate.
+fn op_silu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    return [jt.silu(need(ins, 0, node))]
 }
 
 fn op_tanh(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
@@ -1729,24 +1900,30 @@ fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let even = pads[0] == pads[1] and pads[1] == pads[2] and pads[2] == pads[3]
     let padded = if even { x } else { pad_spatial(x, pads, 0.0) }
     let inner_pad = if even { pads[0] } else { 0 }
-    let channel_last = jt.nhwc(padded)
-    if padded is not x { padded.free() }
 
-    #: ONNX weights are `[M, C/g, kH, kW]`; jaitensor's are `[kH, kW, C/g, M]`.
-    let hwio = transpose_to(w, [2, 3, 1, 0])
+    #: `jaicv.fused_activation`, put there by `fuse_activations`: the epilogue
+    #: rides along in the convolution's own dispatch rather than costing a
+    #: second pass over the output. 0 none, 1 ReLU, 2 SiLU, matching
+    #: `conv2d_nchw`. Only with a bias, which is what it fuses onto.
+    let epilogue = if bias is null { 0 } else { attr_int(node, "jaicv.fused_activation", 0) }
+
+    #: Everything below stays in the layout the file already uses. ONNX is
+    #: NCHW activations and OIHW weights, which is exactly what `conv2d_nchw`
+    #: takes, so nothing is transposed on the way in or out -- the round trip
+    #: this used to make was two thirds of what convolution appeared to cost.
     var pieces: list[Tensor] = []
     let out_per_group = out_channels // groups
     for group in 0..groups {
         let slice_in = if groups == 1 {
-            channel_last
+            padded
         } else {
-            slice_axis(channel_last, 3, group * in_per_group, in_per_group)
+            slice_axis(padded, 1, group * in_per_group, in_per_group)
         }
-        let slice_w = if groups == 1 {
-            hwio
-        } else {
-            slice_axis(hwio, 3, group * out_per_group, out_per_group)
-        }
+        #: A group's filters are a contiguous run of OIHW's first axis, and
+        #: they are the same run on every frame, so the slice is kept on the
+        #: node. Ungrouped convolutions -- nearly all of them -- slice nothing
+        #: and hand the initializer straight through.
+        let slice_w = if groups == 1 { w } else { group_weights(node, w, group, out_per_group) }
         var slice_bias: Tensor? = null
         if bias is not null {
             slice_bias = if groups == 1 {
@@ -1756,21 +1933,40 @@ fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             }
         }
         pieces.push(
-            jt.conv2d(slice_in, slice_w, bias: slice_bias, stride: step, padding: inner_pad)
+            jt.conv2d_nchw(
+                slice_in,
+                slice_w,
+                bias: slice_bias,
+                stride: step,
+                padding: inner_pad,
+                activation: epilogue
+            )
         )
-        if slice_in is not channel_last { slice_in.free() }
-        if slice_w is not hwio { slice_w.free() }
+        if slice_in is not padded { slice_in.free() }
         if slice_bias is not null and slice_bias is not bias { slice_bias.free() }
     }
-    hwio.free()
-    channel_last.free()
-    let joined = if pieces.len() == 1 { pieces[0] } else { concat_along(pieces, 3, node.label()) }
-    if joined is not pieces[0] {
+    if padded is not x { padded.free() }
+    let output = if pieces.len() == 1 { pieces[0] } else { concat_along(pieces, 1, node.label()) }
+    if output is not pieces[0] {
         for piece in pieces { piece.free() }
     }
-    let output = jt.nchw(joined)
-    joined.free()
     return [output]
+}
+
+#: One group's filters out of an OIHW weight tensor, memoised on the node.
+#:
+#: The slice depends only on the weights, which are an initializer, so it is
+#: the same tensor every run -- but it is recomputed if the caller ever feeds
+#: different weights under the same name.
+fn group_weights(node: GraphNode, w: Tensor, group: int, out_per_group: int) -> Tensor {
+    let key = f"w{group}"
+    let kept = node.cached.get(key, null)
+    if kept is not null and node.cached_of.get(key, null) is w { return kept }
+    if kept is not null { kept.free() }
+    let cut = slice_axis(w, 0, group * out_per_group, out_per_group)
+    node.cached[key] = cut
+    node.cached_of[key] = w
+    return cut
 }
 
 fn op_conv_transpose(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
@@ -2387,6 +2583,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["PRelu"] = op_prelu
     _handlers["Elu"] = op_elu
     _handlers["Sigmoid"] = op_sigmoid
+    _handlers["Silu"] = op_silu
     _handlers["HardSigmoid"] = op_hard_sigmoid
     _handlers["Tanh"] = op_tanh
     _handlers["Softplus"] = op_softplus
@@ -2478,7 +2675,7 @@ pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
     if graph.outputs.len() == 0 {
         throw ValueError("this graph names no outputs, so there is nothing to run it for")
     }
-    let order = graph.topological()
+    let order = graph.schedule()
     var values: dict[str, Tensor] = {}
     var mine: dict[str, bool] = {}
     for (name, weight) in graph.initializers.items() { values[name] = weight }
@@ -2499,6 +2696,10 @@ pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
     }
 
     let table = handlers()
+    let profiling = env("JAICV_GRAPH_PROFILE") is not null
+    var op_ms: dict[str, float] = {}
+    var op_count: dict[str, int] = {}
+    var produced_slot: list[Tensor] = []
     try {
         for (index, node) in order.enumerate() {
             var ins: list[Tensor?] = []
@@ -2523,7 +2724,24 @@ pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
             }
             let handler = table.get(node.op, null)
             if handler is null { throw ValueError(f"{node.label()} is not implemented") }
-            let produced = handler(node, ins)
+            #: `JAICV_GRAPH_PROFILE=1` totals the wall clock per operator and
+            #: prints the table when the graph finishes. Every op queues GPU
+            #: work rather than waiting for it, so the figures only mean
+            #: anything with a synchronise between them -- which is why the
+            #: profile is off by default rather than merely unprinted.
+            if profiling {
+                gpu.synchronize()
+                let started = Instant.now()
+                let timed = handler(node, ins)
+                gpu.synchronize()
+                let spent_ms = started.elapsed().to_seconds() * 1000.0
+                op_ms[node.op] = op_ms.get(node.op, 0.0) + spent_ms
+                op_count[node.op] = op_count.get(node.op, 0) + 1
+                produced_slot = timed
+            } else {
+                produced_slot = handler(node, ins)
+            }
+            let produced = produced_slot
             if produced.len() < node.outputs.len() {
                 throw ValueError(
                     f"{node.label()} names {node.outputs.len()} outputs and produced " +
@@ -2569,5 +2787,33 @@ pub fn run_graph(graph: Graph, feeds: dict[str, Tensor]) -> dict[str, Tensor] {
             if leftover is not null { leftover.free() }
         }
     }
+    if profiling { report_profile(op_ms, op_count) }
     return results
+}
+
+#: The per-operator totals `JAICV_GRAPH_PROFILE` collected, slowest first.
+fn report_profile(op_ms: dict[str, float], op_count: dict[str, int]) -> void {
+    var names: list[str] = []
+    for name in op_ms.keys() { names.push(name) }
+    #: A plain insertion sort: this runs once at the end of a graph and there
+    #: are a few dozen distinct operators at most.
+    for outer in 1..names.len() {
+        let held = names[outer]
+        var inner = outer - 1
+        while inner >= 0 and op_ms[names[inner]] < op_ms[held] {
+            names[inner + 1] = names[inner]
+            inner -= 1
+        }
+        names[inner + 1] = held
+    }
+    var total = 0.0
+    for name in names { total += op_ms[name] }
+    print(f"[graph] {total:.1f}ms over {names.len()} operator kinds")
+    for name in names {
+        let spent = op_ms[name]
+        print(
+            f"[graph]   {name:<22} {spent:8.2f}ms  {op_count[name]:4} calls  " +
+                f"{spent / total * 100.0:5.1f}%"
+        )
+    }
 }

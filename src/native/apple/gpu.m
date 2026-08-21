@@ -1602,8 +1602,9 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                          uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
                          uint32_t cout, uint32_t kh, uint32_t kw,
                          uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw,
-                         uint32_t activation) {
+                         uint32_t activation, uint32_t layout) {
     if (input == NULL || weights == NULL || out == NULL) return false;
+    if (layout > 1) return false;
     if (input->buffer == NULL || weights->buffer == NULL || out->buffer == NULL) return false;
     if (n == 0 || h == 0 || w == 0 || cin == 0 || cout == 0 || kh == 0 || kw == 0) return false;
     if (sh == 0 || sw == 0) return false;
@@ -1631,17 +1632,22 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
             static NSMutableDictionary<NSString *, NSArray *> *graphs;
             if (graphs == nil) graphs = [[NSMutableDictionary alloc] init];
             NSString *key = [NSString stringWithFormat:
-                @"conv:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%d:%u",
+                @"conv:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%d:%u:%u",
                 n, h, w, cin, cout, kh, kw, sh, sw, ph, pw,
-                bias != NULL ? 1 : 0, gMixedPrecision ? 1 : 0, activation];
+                bias != NULL ? 1 : 0, gMixedPrecision ? 1 : 0, activation, layout];
             NSArray *cached = graphs[key];
             if (cached == nil) {
                 MPSGraph *graph = [[MPSGraph alloc] init];
                 graph.options = MPSGraphOptionsNone;
-                MPSGraphTensor *src = [graph placeholderWithShape:@[ @(n), @(h), @(w), @(cin) ]
+                const bool chw = layout == 1;
+                NSArray *srcShape = chw ? @[ @(n), @(cin), @(h), @(w) ]
+                                        : @[ @(n), @(h), @(w), @(cin) ];
+                NSArray *filtShape = chw ? @[ @(cout), @(cin), @(kh), @(kw) ]
+                                         : @[ @(kh), @(kw), @(cin), @(cout) ];
+                MPSGraphTensor *src = [graph placeholderWithShape:srcShape
                                                          dataType:MPSDataTypeFloat32
                                                              name:@"X"];
-                MPSGraphTensor *filt = [graph placeholderWithShape:@[ @(kh), @(kw), @(cin), @(cout) ]
+                MPSGraphTensor *filt = [graph placeholderWithShape:filtShape
                                                           dataType:MPSDataTypeFloat32
                                                               name:@"W"];
                 MPSGraphConvolution2DOpDescriptor *desc =
@@ -1656,8 +1662,10 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                      paddingTop:ph
                                   paddingBottom:ph
                                    paddingStyle:MPSGraphPaddingStyleExplicit
-                                     dataLayout:MPSGraphTensorNamedDataLayoutNHWC
-                                  weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
+                                     dataLayout:(chw ? MPSGraphTensorNamedDataLayoutNCHW
+                                                     : MPSGraphTensorNamedDataLayoutNHWC)
+                                  weightsLayout:(chw ? MPSGraphTensorNamedDataLayoutOIHW
+                                                     : MPSGraphTensorNamedDataLayoutHWIO)];
                 MPSGraphTensor *conv = [graph convolution2DWithSourceTensor:src
                                                               weightsTensor:filt
                                                                  descriptor:desc
@@ -1668,9 +1676,13 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                     biasT = [graph placeholderWithShape:@[ @(cout) ]
                                                dataType:MPSDataTypeFloat32
                                                    name:@"b"];
+                    /* The bias broadcasts along whichever axis holds the
+                     * channels, so its shape follows the data layout. */
+                    NSArray *biasShape = chw ? @[ @1, @(cout), @1, @1 ]
+                                             : @[ @1, @1, @1, @(cout) ];
                     product = [graph additionWithPrimaryTensor:conv
                                                secondaryTensor:[graph reshapeTensor:biasT
-                                                                          withShape:@[ @1, @1, @1, @(cout) ]
+                                                                          withShape:biasShape
                                                                                name:@"br"]
                                                           name:@"convb"];
                 }
@@ -1682,12 +1694,19 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                  * separately over the whole output. */
                 if (activation == 1) {
                     product = [graph reLUWithTensor:product name:@"convrelu"];
+                } else if (activation == 2) {
+                    /* SiLU: x * sigmoid(x). Every modern detector puts one
+                     * after every convolution, and as a separate jaitensor
+                     * kernel it reads and writes the whole output again. */
+                    product = [graph multiplicationWithPrimaryTensor:product
+                                                     secondaryTensor:[graph sigmoidWithTensor:product
+                                                                                         name:@"convsig"]
+                                                                name:@"convsilu"];
                 }
                 NSMutableArray *built = [@[ graph, src, filt, product ] mutableCopy];
                 if (biasT != nil) [built addObject:biasT];
                 NSMutableArray *feeds = [@[ src, filt ] mutableCopy];
-                NSMutableArray *shapes = [@[ @[ @(n), @(h), @(w), @(cin) ],
-                                             @[ @(kh), @(kw), @(cin), @(cout) ] ] mutableCopy];
+                NSMutableArray *shapes = [@[ srcShape, filtShape ] mutableCopy];
                 if (biasT != nil) {
                     [feeds addObject:biasT];
                     [shapes addObject:@[ @(cout) ]];
@@ -1702,12 +1721,22 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
             MPSGraphTensor *src = cached[1];
             MPSGraphTensor *filt = cached[2];
             MPSGraphTensor *product = cached[3];
-            MPSGraphTensorData *dataX = graphData(input, inputOffset,
-                                                  @[ @(n), @(h), @(w), @(cin) ]);
-            MPSGraphTensorData *dataW = graphData(weights, weightsOffset,
-                                                  @[ @(kh), @(kw), @(cin), @(cout) ]);
-            MPSGraphTensorData *dataY = graphData(out, outOffset,
-                                                  @[ @(n), @(outH), @(outW), @(cout) ]);
+            /* The same shapes the placeholders were built from -- the
+             * buffers hold identical bytes either way, and only how the
+             * dimensions are read off them differs. */
+            const bool feedChw = layout == 1;
+            MPSGraphTensorData *dataX =
+                graphData(input, inputOffset,
+                          feedChw ? @[ @(n), @(cin), @(h), @(w) ]
+                                  : @[ @(n), @(h), @(w), @(cin) ]);
+            MPSGraphTensorData *dataW =
+                graphData(weights, weightsOffset,
+                          feedChw ? @[ @(cout), @(cin), @(kh), @(kw) ]
+                                  : @[ @(kh), @(kw), @(cin), @(cout) ]);
+            MPSGraphTensorData *dataY =
+                graphData(out, outOffset,
+                          feedChw ? @[ @(n), @(cout), @(outH), @(outW) ]
+                                  : @[ @(n), @(outH), @(outW), @(cout) ]);
             if (dataX == nil || dataW == nil || dataY == nil) return false;
             NSMutableDictionary *feeds = [@{src : dataX, filt : dataW} mutableCopy];
             if (bias != NULL) {

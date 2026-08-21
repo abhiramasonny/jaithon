@@ -3094,6 +3094,123 @@ pub fn conv2d(
     return output
 }
 
+#: NCHW 2D convolution. Weights are OIHW `[cout, cin, kh, kw]`.
+#:
+#: The layout every exported model file uses, run without being rearranged
+#: into the one `conv2d` wants. MPS takes NCHW natively, so the transposes
+#: that used to bracket each call -- two over the activations and one over the
+#: weights -- were paying for nothing: on YOLOv8n they were most of the time
+#: the convolution appeared to cost.
+#:
+#: Inference only, in the sense that nothing here attaches a gradient: this is
+#: for running an imported graph forward. Train with `conv2d`.
+#:
+#: `activation` fuses an epilogue into the same dispatch: 0 none, 1 ReLU,
+#: 2 SiLU, and as in `conv2d` a fused activation needs a bias.
+@trace
+pub fn conv2d_nchw(
+    input: Tensor,
+    weights: Tensor,
+    bias: Tensor? = null,
+    stride: int = 1,
+    padding: int = 0,
+    activation: int = 0
+) -> Tensor {
+    if input.rank() != 4 {
+        throw ValueError(f"conv2d_nchw needs NCHW input, got {input.shape}")
+    }
+    if weights.rank() != 4 {
+        throw ValueError(f"conv2d_nchw needs OIHW weights, got {weights.shape}")
+    }
+    let n = input.shape[0]
+    let cin = input.shape[1]
+    let h = input.shape[2]
+    let w = input.shape[3]
+    let cout = weights.shape[0]
+    let kh = weights.shape[2]
+    let kw = weights.shape[3]
+    if weights.shape[1] != cin {
+        throw ValueError(
+            f"conv2d_nchw channel mismatch: input {cin} vs weights {weights.shape[1]}"
+        )
+    }
+    if stride <= 0 { throw ValueError(f"conv2d_nchw stride must be positive, got {stride}") }
+    if padding < 0 {
+        throw ValueError(f"conv2d_nchw padding must be non-negative, got {padding}")
+    }
+    if activation < 0 or activation > 2 {
+        throw ValueError(f"conv2d_nchw activation must be 0, 1 or 2, got {activation}")
+    }
+    if activation != 0 and bias is null {
+        throw ValueError("conv2d_nchw needs a bias to fuse an activation")
+    }
+    if bias is not null and bias.size != cout {
+        throw ValueError(f"conv2d_nchw bias has {bias.size} values, expected {cout}")
+    }
+    let out_h = conv2d_out_dim(h, kh, stride, padding)
+    let out_w = conv2d_out_dim(w, kw, stride, padding)
+    if out_h <= 0 or out_w <= 0 {
+        throw ValueError(f"conv2d_nchw output spatial size is empty: {out_h}x{out_w}")
+    }
+    let output = Tensor([n, cout, out_h, out_w])
+    try {
+        gpu.conv2d_async(
+            input.buffer(),
+            weights.buffer(),
+            output.buffer(),
+            n,
+            h,
+            w,
+            cin,
+            cout,
+            kh,
+            kw,
+            stride_h: stride,
+            stride_w: stride,
+            pad_h: padding,
+            pad_w: padding,
+            bias: if bias is null { null } else { bias.buffer() },
+            activation: activation,
+            layout: 1
+        )
+    } catch _error: RuntimeError {
+        #: A shape MPS will not take. Rather than keep a second NCHW kernel
+        #: alive for it, go the long way round through `conv2d`, which has its
+        #: own im2col fallback -- correct, rare, and slow only when it fires.
+        output.free()
+        let nhwc_in = nhwc(input)
+        #: OIHW to HWIO. `permute` has no kernel for `[2, 3, 1, 0]`, but the
+        #: swap is two it does have: `nhwc` puts the input channel last,
+        #: leaving the output channel as the only axis out of place, and a
+        #: matrix transpose across the flattened rest moves it to the end.
+        #:
+        #: `reshape` shares its argument's storage, so only the two tensors
+        #: that own a buffer -- the `nhwc` and the `transpose` -- are freed,
+        #: and each of those only once the last view onto it is finished with.
+        let ohwi = nhwc(weights)
+        let columns = transpose(reshape(ohwi, [cout, kh * kw * cin]))
+        ohwi.free()
+        let hwio = reshape(columns, [kh, kw, cin, cout])
+        let done = conv2d(
+            nhwc_in,
+            hwio,
+            bias: bias,
+            stride: stride,
+            padding: padding,
+            activation: if activation == 2 { 0 } else { activation }
+        )
+        nhwc_in.free()
+        columns.free()
+        let back = nchw(done)
+        done.free()
+        if activation != 2 { return back }
+        let fused = silu(back)
+        back.free()
+        return fused
+    }
+    return output
+}
+
 #: Backward for `conv2d`, as im2col plus two products.
 #:
 #: The columns are rebuilt here rather than kept from the forward pass: a

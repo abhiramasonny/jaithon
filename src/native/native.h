@@ -142,8 +142,15 @@ bool          jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff,
                               JaiGpuBuffer *out, size_t outOff,
                               uint32_t seq, uint32_t heads, uint32_t hd,
                               float scale);
-/* NHWC input, HWIO weights, optional bias. Output is NHWC. `activation` fuses
- * an elementwise epilogue into the same graph dispatch: 0 none, 1 ReLU. */
+/* Optional bias. `activation` fuses an elementwise epilogue into the same graph
+ * dispatch: 0 none, 1 ReLU, 2 SiLU. `layout` picks how the caller has its data
+ * arranged: 0 is NHWC activations with HWIO weights, 1 is NCHW with OIHW.
+ *
+ * A caller holding NCHW -- which is what every ONNX file carries -- wants 1:
+ * MPS takes that layout natively, so transposing into NHWC and back only to
+ * satisfy this call costs two passes over the activations per convolution and
+ * one over the weights, and buys nothing. Output uses the same layout as the
+ * input either way. */
 bool          jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                   JaiGpuBuffer *weights, size_t weightsOffset,
                                   JaiGpuBuffer *bias, size_t biasOffset,
@@ -151,7 +158,7 @@ bool          jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                   uint32_t n, uint32_t h, uint32_t w, uint32_t cin,
                                   uint32_t cout, uint32_t kh, uint32_t kw,
                                   uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw,
-                                  uint32_t activation);
+                                  uint32_t activation, uint32_t layout);
 /* The same convolution's two gradients, taken by the same primitives the
  * forward pass uses. Both return false for a shape MPS will not take, and the
  * caller falls back to its own im2col. */
