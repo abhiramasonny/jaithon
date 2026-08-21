@@ -216,7 +216,7 @@ from .ml.models import NormalBayesClassifier, RTrees, SVM
 from .ml.models import COL_SAMPLE, ROW_SAMPLE, SVM_C_SVC, SVM_EPS_SVR
 from .ml.models import SVM_LINEAR, SVM_POLY, SVM_RBF
 
-from .dnn.blob import blob_from_image, blob_from_images, images_from_blob
+from .dnn.blob import blob_from_image, blob_from_images, blob_to_tensor, images_from_blob
 from .dnn.blob import net_from, nms_boxes, nms_boxes_batched, Net, Runnable
 from .dnn.graph import run_graph, Attr, Graph, GraphNode
 from .dnn.onnx import read_net_from_onnx, read_net_from_onnx_as_net
@@ -437,7 +437,7 @@ export { NormalBayesClassifier, RTrees, SVM }
 export { COL_SAMPLE, ROW_SAMPLE, SVM_C_SVC, SVM_EPS_SVR }
 export { SVM_LINEAR, SVM_POLY, SVM_RBF }
 
-export { blob_from_image, blob_from_images, images_from_blob }
+export { blob_from_image, blob_from_images, blob_to_tensor, images_from_blob }
 export { net_from, nms_boxes, nms_boxes_batched, Net, Runnable }
 export { run_graph, Attr, Graph, GraphNode }
 export { read_net_from_onnx, read_net_from_onnx_as_net, read_net_from_onnx_bytes }

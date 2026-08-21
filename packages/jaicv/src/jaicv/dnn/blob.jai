@@ -16,9 +16,59 @@
 #: let kept = nms_boxes(boxes, scores, 0.3, 0.45)
 #: ```
 import std.math
-from ..core.mat import Mat
+from std.gpu import Kernel
+from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, Rect, Scalar, Size
 from ..imgproc.geometric import resize
+from jaitensor import Tensor
+
+let SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+/* Interleaved pixels to planar channels, with the mean and the scale applied
+ * on the way. One thread a destination slot, so the writes are contiguous;
+ * the reads stride by the channel count, which is what interleaved means. */
+kernel void blob_planar(device const float* src [[buffer(0)]],
+                        device float* dst [[buffer(1)]],
+                        constant uint& count [[buffer(2)]],
+                        constant uint& cols [[buffer(3)]],
+                        constant uint& cn [[buffer(4)]],
+                        constant uint& src_off [[buffer(5)]],
+                        constant uint& src_step [[buffer(6)]],
+                        constant uint& dst_base [[buffer(7)]],
+                        constant uint& swap_rb [[buffer(8)]],
+                        constant uint& scale_bits [[buffer(9)]],
+                        constant uint& m0 [[buffer(10)]],
+                        constant uint& m1 [[buffer(11)]],
+                        constant uint& m2 [[buffer(12)]],
+                        constant uint& m3 [[buffer(13)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint pixels = count / cn;
+    uint channel = id / pixels;
+    uint pixel = id - channel * pixels;
+    uint source = channel;
+    if (swap_rb != 0u && cn >= 3u && (channel == 0u || channel == 2u)) source = 2u - channel;
+    float mean = as_type<float>(m0);
+    if (channel == 1u) mean = as_type<float>(m1);
+    else if (channel == 2u) mean = as_type<float>(m2);
+    else if (channel >= 3u) mean = as_type<float>(m3);
+    uint y = pixel / cols;
+    uint x = pixel - y * cols;
+    float value = src[src_off + y * src_step + x * cn + source];
+    dst[dst_base + id] = (value - mean) * as_type<float>(scale_bits);
+}
+"""
+
+var _kernels: dict[str, Kernel] = {}
+
+fn kernel_for(entry: str) -> Kernel {
+    let existing = _kernels.get(entry, null)
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(SOURCE, entry)
+    _kernels[entry] = compiled
+    return compiled
+}
 
 #: One image, as a four-dimensional blob laid out `1 x C x H x W`.
 #:
@@ -54,12 +104,17 @@ pub fn blob_from_images(
     }
     let cn = images[0].channels()
 
-    #: Sized once and written by index. Growing it with `push` instead costs
-    #: about 25 ms for one 640x640x3 blob -- a million and a quarter appends,
-    #: each one a bounds check and a capacity test -- which was more than the
-    #: convolution that consumes it.
-    var out = __prim__.list_filled(images.len() * cn * width * height, 0.0)
-    var at = 0
+    #: Built on the device, into a Mat that never touches the host.
+    #:
+    #: The rearrangement is a million and a quarter reads and writes for one
+    #: 640x640 blob. As a loop here that took nine and a half milliseconds --
+    #: more than running the network it feeds -- and then the caller downloaded
+    #: the result and uploaded it again to get a tensor out of it. The kernel
+    #: does the same work where the pixels already are, and what comes back can
+    #: be handed to jaitensor without a copy in either direction.
+    let out = Mat(images.len() * cn, width * height, CV_MAKETYPE(CV_32F, 1))
+    let pixels = width * height
+    var at = out.offset
     for image in images {
         image.flush()
         var prepared = image
@@ -91,20 +146,60 @@ pub fn blob_from_images(
                 prepared = resize(image, size: Size(width, height))
             }
         }
-        let values = prepared.values()
-        for channel in 0..cn {
-            #: The blob is planar, so one channel is written out whole before
-            #: the next begins.
-            var source = channel
-            if swap_rb and cn >= 3 and (channel == 0 or channel == 2) { source = 2 - channel }
-            let offset = mean[min(channel, 3)]
-            for index in 0..width * height {
-                out[at + index] = (values[index * cn + source] - offset) * scale_factor
-            }
-            at += width * height
-        }
+        prepared.flush()
+        kernel_for("blob_planar").dispatch_async(
+            [prepared.storage, out.storage],
+            cn * pixels,
+            [
+                cn * pixels,
+                width,
+                cn,
+                prepared.offset,
+                prepared.step_,
+                at,
+                if swap_rb { 1 } else { 0 },
+                f32_bits(scale_factor),
+                f32_bits(mean[0]),
+                f32_bits(mean[1]),
+                f32_bits(mean[2]),
+                f32_bits(mean[3]),
+            ]
+        )
+        at += cn * pixels
     }
-    return Mat.from_list(images.len() * cn, width * height, CV_MAKETYPE(CV_32F, 1), out)
+    out.invalidate()
+    return out
+}
+
+#: A blob as a jaitensor tensor, sharing the blob's storage.
+#:
+#: `blob_from_image` leaves its result on the device, and a network wants it
+#: there, so nothing needs to move: this wraps the same memory in a `Tensor`
+#: rather than downloading a million floats and uploading them again, which for
+#: a 640x640 blob was four milliseconds each way.
+#:
+#: The tensor is a view, so freeing it leaves the blob's storage alone -- and
+#: the blob has to outlive the tensor, since it owns what both of them read.
+#: `shape` defaults to `N x C x H x W` for a blob of `channels` planes.
+pub fn blob_to_tensor(blob: Mat, channels: int, size: Size) -> Tensor {
+    let pixels = size.width * size.height
+    if pixels <= 0 { throw ValueError(f"a blob needs a positive size, got {size}") }
+    if channels <= 0 { throw ValueError(f"a blob needs at least one channel, got {channels}") }
+    let total = blob.rows * blob.cols
+    if total % (channels * pixels) != 0 {
+        throw ValueError(
+            f"a {blob.rows}x{blob.cols} blob does not hold whole {channels}x{size.height}x" +
+                f"{size.width} images"
+        )
+    }
+    if not blob.is_continuous() {
+        throw ValueError("a blob has to be continuous to be shared with a tensor")
+    }
+    let count = total // (channels * pixels)
+    return Tensor(
+        [count, channels, size.height, size.width],
+        storage: blob.buffer().view(blob.offset, total)
+    )
 }
 
 #: Take the images back out of a blob.
