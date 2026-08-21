@@ -247,7 +247,9 @@ pub fn detect_frame(graph: Graph, image: Mat) -> list[Detection] {
         Scalar(0.0, 0.0, 0.0),
         true
     )
-    let input = jt.Tensor([1, 3, INPUT, INPUT], blob.values())
+    #: The blob is already on the device, so the tensor shares its storage
+    #: rather than making a round trip through the host to say so.
+    let input = cv.blob_to_tensor(blob, 3, Size(INPUT, INPUT))
     let outputs = run_graph(graph, {graph.inputs[0]: input})
     let raw = outputs[graph.outputs[0]].download()
     return decode(raw, scale, pad_x, pad_y, image.cols, image.rows)
