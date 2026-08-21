@@ -74,9 +74,17 @@ static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
                         "gui_window_open(): the window could not be created");
 
     int64_t count = width * height;
+    /* A window's back buffer is one int a pixel, so this is a million-element
+     * fill at 1080p -- worth reserving rather than pushing through. */
     ObjList *pixels = jaiListNew((int)count);
+    if (pixels == NULL || !jaiListReserveExact(pixels, (int)count))
+        return jaiThrow(vm.cRuntimeError,
+                        "gui_window_open(): no room for a %lld-pixel back buffer",
+                        (long long)count);
+    for (int64_t i = 0; i < count; i++) pixels->items[i] = INT_VAL(0);
+    pixels->count = (int)count;
+    pixels->version++;
     jaiGCPushRoot(OBJ_VAL(pixels));
-    for (int64_t i = 0; i < count; i++) jaiListPush(pixels, INT_VAL(0));
 
     /* Reuse a slot a closed window left behind, so open/close in a loop does
      * not grow the keepalive list without bound. */
