@@ -229,6 +229,27 @@ def build_cases():
         "Slice",
         [data, np.array([1], dtype=np.int64), np.array([9223372036854775807], dtype=np.int64), np.array([1], dtype=np.int64)],
     )
+    # A range that comes up empty. Torch's attention exports slice the tail off
+    # a shape and get nothing whenever the tail is not there, then concatenate
+    # the nothing straight back in, so the executor has to carry empties.
+    case(
+        "shape",
+        "slice_empty",
+        "Slice",
+        [
+            data,
+            np.array([3], dtype=np.int64),
+            np.array([9223372036854775807], dtype=np.int64),
+            np.array([1], dtype=np.int64),
+        ],
+    )
+    case(
+        "shape",
+        "concat_with_an_empty",
+        "Concat",
+        [spread(2, 0, 4, seed=151), spread(2, 3, 4, seed=152)],
+        {"axis": 1},
+    )
     case(
         "shape",
         "gather_axis1",
@@ -445,6 +466,18 @@ def build_cases():
     case("linear", "matmul_broadcast", "MatMul", [spread(2, 1, 3, 4, seed=45), spread(4, 5, seed=40)])
     case("linear", "matmul_vector_right", "MatMul", [spread(3, 4, seed=37), spread(4, seed=46)])
     case("linear", "matmul_vector_left", "MatMul", [spread(4, seed=46), spread(4, 5, seed=40)])
+
+    # Remainders. Transformer exports work out head offsets with these.
+    mod_a = np.array([7.0, -7.0, 7.0, -7.0, 5.0], dtype=np.float32)
+    mod_b = np.array([3.0, 3.0, -3.0, -3.0, 5.0], dtype=np.float32)
+    case("elementwise", "mod_fmod", "Mod", [mod_a, mod_b], {"fmod": 1})
+    case(
+        "elementwise",
+        "mod_broadcast",
+        "Mod",
+        [np.array([[8.0, 9.0], [10.0, 11.0]], dtype=np.float32), np.array([3.0], dtype=np.float32)],
+        {"fmod": 1},
+    )
 
     # Normalisation.
     case(

@@ -303,6 +303,13 @@ kernel void binary_ex(device const float* a [[buffer(0)]],
         } else {
             r = pow(x, y);
         }
+    } else if (op == 7) {
+        /* Sign follows the divisor, which is what ONNX's Mod means with
+           `fmod` off and what Python's `%` does. */
+        r = y == 0.0f ? NAN : x - floor(x / y) * y;
+    } else if (op == 8) {
+        /* Sign follows the dividend: C's fmod, which is Mod with `fmod` on. */
+        r = y == 0.0f ? NAN : fmod(x, y);
     } else r = x < 0.0f ? x * y : x;
     output[id] = r;
 }
@@ -1146,7 +1153,8 @@ fn concat_along(parts: list[Tensor], axis: int, what: str) -> Tensor {
             throw ValueError(f"{what} joins ranks {parts[0].shape} and {part.shape}")
         }
         for other in 0..rank {
-            if other != axis and part.shape[other] != parts[0].shape[other] {
+            if other == axis or part.size == 0 { continue }
+            if part.shape[other] != parts[0].shape[other] {
                 throw ValueError(f"{what} cannot join {parts[0].shape} and {part.shape}")
             }
         }
@@ -1155,11 +1163,14 @@ fn concat_along(parts: list[Tensor], axis: int, what: str) -> Tensor {
     var shape = [dimension for dimension in parts[0].shape]
     shape[axis] = width
     let output = Tensor(shape)
+    if output.size == 0 { return output }
     var inner = 1
     for other in axis + 1..rank { inner *= shape[other] }
     var offset = 0
     let kernel = kernel_for("concat_into")
     for part in parts {
+        #: An empty part contributes nothing and moves the offset nowhere.
+        if part.size == 0 { continue }
         kernel.dispatch_async(
             [part.buffer(), output.buffer()],
             part.size,
@@ -1402,6 +1413,18 @@ fn op_div(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 
 fn op_pow(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let combine = |a, b| binary_ex_of(a, b, 5)
+    return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
+}
+
+#: ONNX `Mod`: the remainder, with the sign following whichever operand the
+#: `fmod` attribute says.
+#:
+#: Transformer exports reach for this in the arithmetic that works out head
+#: offsets from a shape, so a graph runner without it stops at the first
+#: attention block.
+fn op_mod(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let code = if attr_int(node, "fmod", 0) != 0 { 8 } else { 7 }
+    let combine = |a, b| binary_ex_of(a, b, code)
     return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
 }
 
@@ -1678,15 +1701,15 @@ fn op_slice(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             #: shows up once the step is steeper than one.
             span = (last - first + step + 1) // step
         }
-        if span <= 0 {
-            throw ValueError(
-                f"{node.label()} slices axis {resolved} down to nothing, and this " +
-                    "executor has no empty tensor to put that in"
-            )
-        }
-        shape[resolved] = span
+        #: A range that comes up empty is a legitimate answer, not a mistake:
+        #: exported graphs slice the tail off a shape and get nothing whenever
+        #: the tail is not there, and then concatenate the nothing back in.
+        shape[resolved] = max(span, 0)
         strides[resolved] = source[resolved] * step
-        base += first * source[resolved]
+        if shape[resolved] > 0 { base += first * source[resolved] }
+    }
+    for dimension in shape {
+        if dimension == 0 { return [Tensor(shape)] }
     }
     return [gather_strided(data, shape, base, strides)]
 }
@@ -2673,6 +2696,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Sub"] = op_sub
     _handlers["Mul"] = op_mul
     _handlers["Div"] = op_div
+    _handlers["Mod"] = op_mod
     _handlers["Pow"] = op_pow
     _handlers["Sqrt"] = op_sqrt
     _handlers["Exp"] = op_exp
