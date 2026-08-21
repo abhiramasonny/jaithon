@@ -143,7 +143,8 @@ int              jaiGraphInput(JaiGraphBuilder *b, const int64_t *dims, int rank
 int              jaiGraphConstant(JaiGraphBuilder *b, const float *values,
                                   const int64_t *dims, int rank);
 /* 0 relu, 1 sigmoid, 2 tanh, 3 exp, 4 log, 5 sqrt, 6 neg, 7 abs, 8 erf,
- * 9 silu, 10 floor, 11 ceil, 12 reciprocal, 13 square, 14 rsqrt. */
+ * 9 silu, 10 floor, 11 ceil, 12 reciprocal, 13 square, 14 rsqrt,
+ * 15 truncate, 16 not-zero. */
 int              jaiGraphUnary(JaiGraphBuilder *b, int x, int op);
 /* 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min, 6 pow. */
 int              jaiGraphBinary(JaiGraphBuilder *b, int left, int right, int op);
@@ -164,10 +165,18 @@ int              jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis);
  * `center` and `corners` say how the source coordinate is derived. */
 int              jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
                                        int rounding, int center, int corners);
+int              jaiGraphGather(JaiGraphBuilder *b, int data, int indices, int axis);
 int              jaiGraphMatmul(JaiGraphBuilder *b, int left, int right);
 /* `kind` 0 sum, 1 mean, 2 maximum, 3 minimum. */
 int              jaiGraphReduce(JaiGraphBuilder *b, int x, const int32_t *axes,
                                 int count, int kind);
+/* Layer normalisation over `axes`; `gamma` and `beta` may be -1. */
+int              jaiGraphLayerNorm(JaiGraphBuilder *b, int x, int gamma, int beta,
+                                   const int32_t *axes, int count, float epsilon);
+/* `alpha * A' B' + beta * C`, with `c` optionally -1. */
+int              jaiGraphGemm(JaiGraphBuilder *b, int left, int right, int c,
+                              int transposeLeft, int transposeRight,
+                              float alpha, float beta);
 JaiGraphPlan    *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                                  const int *outputs, int outputCount);
 int              jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index);

@@ -307,6 +307,18 @@ static bool nGraphResize(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGraphGather(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t data, indices, axis;
+    if (!requireBuilder(args[0], 1, "graph_gather", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_gather", &data)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_gather", &indices)) return false;
+    if (!jaiArgInt(args[3], 4, "graph_gather", &axis)) return false;
+    *out = INT_VAL(jaiGraphGather(builder, (int)data, (int)indices, (int)axis));
+    return true;
+}
+
 static bool nGraphMatmul(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -336,6 +348,50 @@ static bool nGraphReduce(int argc, Value *args, Value *out) {
     *out = INT_VAL(jaiGraphReduce(builder, (int)x, over, count, (int)kind));
     if (over != NULL) JAI_FREE_ARRAY(int32_t, over, (size_t)count);
     freeInts(axes, count);
+    return true;
+}
+
+static bool nGraphLayerNorm(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t x, gamma, beta;
+    int64_t *axes;
+    int count;
+    double epsilon;
+    if (!requireBuilder(args[0], 1, "graph_layer_norm", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_layer_norm", &x)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_layer_norm", &gamma)) return false;
+    if (!jaiArgInt(args[3], 4, "graph_layer_norm", &beta)) return false;
+    if (!intsOf(args[4], 5, "graph_layer_norm", &axes, &count)) return false;
+    if (!jaiArgNumber(args[5], 6, "graph_layer_norm", &epsilon)) {
+        freeInts(axes, count);
+        return false;
+    }
+    int32_t *over = count > 0 ? JAI_ALLOC(int32_t, (size_t)count) : NULL;
+    for (int i = 0; i < count; i++) over[i] = (int32_t)axes[i];
+    *out = INT_VAL(jaiGraphLayerNorm(builder, (int)x, (int)gamma, (int)beta,
+                                     over, count, (float)epsilon));
+    if (over != NULL) JAI_FREE_ARRAY(int32_t, over, (size_t)count);
+    freeInts(axes, count);
+    return true;
+}
+
+static bool nGraphGemm(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t left, right, c, transposeLeft, transposeRight;
+    double alpha, beta;
+    if (!requireBuilder(args[0], 1, "graph_gemm", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_gemm", &left)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_gemm", &right)) return false;
+    if (!jaiArgInt(args[3], 4, "graph_gemm", &c)) return false;
+    if (!jaiArgInt(args[4], 5, "graph_gemm", &transposeLeft)) return false;
+    if (!jaiArgInt(args[5], 6, "graph_gemm", &transposeRight)) return false;
+    if (!jaiArgNumber(args[6], 7, "graph_gemm", &alpha)) return false;
+    if (!jaiArgNumber(args[7], 8, "graph_gemm", &beta)) return false;
+    *out = INT_VAL(jaiGraphGemm(builder, (int)left, (int)right, (int)c,
+                                (int)transposeLeft, (int)transposeRight,
+                                (float)alpha, (float)beta));
     return true;
 }
 
@@ -485,8 +541,11 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_slice",          nGraphSlice,          5, 5);
     jaiDefineNative("__prim__.graph_softmax",        nGraphSoftmax,        3, 3);
     jaiDefineNative("__prim__.graph_resize_nearest", nGraphResize,         7, 7);
+    jaiDefineNative("__prim__.graph_gather",         nGraphGather,         4, 4);
     jaiDefineNative("__prim__.graph_matmul",         nGraphMatmul,         3, 3);
     jaiDefineNative("__prim__.graph_reduce",         nGraphReduce,         4, 4);
+    jaiDefineNative("__prim__.graph_layer_norm",     nGraphLayerNorm,      6, 6);
+    jaiDefineNative("__prim__.graph_gemm",           nGraphGemm,           8, 8);
     jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);
     jaiDefineNative("__prim__.graph_plan_output_shape", nGraphPlanOutputShape, 2, 2);
     jaiDefineNative("__prim__.graph_run",            nGraphRun,            3, 3);

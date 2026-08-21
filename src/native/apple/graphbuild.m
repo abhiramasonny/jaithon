@@ -181,6 +181,12 @@ int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) {
 #pragma clang diagnostic pop
                 break;
             }
+            case 15: out = [g truncateWithTensor:in name:nil]; break;
+            /* A cast to boolean, which ONNX writes as one and zero. */
+            case 16: out = [g notEqualWithPrimaryTensor:in
+                                       secondaryTensor:[g constantWithScalar:0.0
+                                                                    dataType:in.dataType]
+                                                  name:nil]; break;
             default: return -1;
         }
         return record(b, out);
@@ -374,6 +380,27 @@ int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int height, int width,
     }
 }
 
+/* ONNX `Gather`: pick slices of `data` along `axis` at `indices`.
+ *
+ * The indices arrive as float, because that is the only element type this
+ * runtime's tensors have, so they are narrowed to int32 for the operation. */
+int jaiGraphGather(JaiGraphBuilder *b, int data, int indices, int axis) {
+    MPSGraphTensor *values = tensorAt(b, data);
+    MPSGraphTensor *at = tensorAt(b, indices);
+    if (values == nil || at == nil || axis < 0) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        if (at.dataType != MPSDataTypeInt32) {
+            at = [g castTensor:at toType:MPSDataTypeInt32 name:nil];
+        }
+        return record(b, [g gatherWithUpdatesTensor:values
+                                      indicesTensor:at
+                                               axis:(NSUInteger)axis
+                                    batchDimensions:0
+                                               name:nil]);
+    }
+}
+
 int jaiGraphMatmul(JaiGraphBuilder *b, int left, int right) {
     MPSGraphTensor *a = tensorAt(b, left);
     MPSGraphTensor *c = tensorAt(b, right);
@@ -399,6 +426,60 @@ int jaiGraphReduce(JaiGraphBuilder *b, int x, const int32_t *axes, int count, in
             case 2: out = [g reductionMaximumWithTensor:in axes:over name:nil]; break;
             case 3: out = [g reductionMinimumWithTensor:in axes:over name:nil]; break;
             default: return -1;
+        }
+        return record(b, out);
+    }
+}
+
+/* Layer normalisation over the given axes, built from the mean, the variance
+ * and the affine the framework already has. `gamma` and `beta` may be -1.
+ *
+ * Every transformer opens each of its blocks with one of these, so a graph
+ * compiler that cannot express it hands the whole model back to the
+ * interpreter. */
+int jaiGraphLayerNorm(JaiGraphBuilder *b, int x, int gamma, int beta,
+                      const int32_t *axes, int count, float epsilon) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    if (in == nil || axes == NULL || count <= 0) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        NSMutableArray *over = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+        for (int i = 0; i < count; i++) [over addObject:@(axes[i])];
+        MPSGraphTensor *mean = [g meanOfTensor:in axes:over name:nil];
+        MPSGraphTensor *variance = [g varianceOfTensor:in meanTensor:mean axes:over name:nil];
+        return record(b, [g normalizationWithTensor:in
+                                         meanTensor:mean
+                                     varianceTensor:variance
+                                        gammaTensor:tensorAt(b, gamma)
+                                         betaTensor:tensorAt(b, beta)
+                                            epsilon:epsilon
+                                               name:nil]);
+    }
+}
+
+/* ONNX `Gemm`: `alpha * A' B' + beta * C`, with either operand optionally
+ * transposed. `c` may be -1. */
+int jaiGraphGemm(JaiGraphBuilder *b, int left, int right, int c,
+                 int transposeLeft, int transposeRight, float alpha, float beta) {
+    MPSGraphTensor *a = tensorAt(b, left);
+    MPSGraphTensor *w = tensorAt(b, right);
+    if (a == nil || w == nil) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        if (transposeLeft) a = [g transposeTensor:a dimension:0 withDimension:1 name:nil];
+        if (transposeRight) w = [g transposeTensor:w dimension:0 withDimension:1 name:nil];
+        MPSGraphTensor *out = [g matrixMultiplicationWithPrimaryTensor:a secondaryTensor:w name:nil];
+        if (alpha != 1.0f) {
+            MPSGraphTensor *scale = [g constantWithScalar:(double)alpha dataType:MPSDataTypeFloat32];
+            out = [g multiplicationWithPrimaryTensor:out secondaryTensor:scale name:nil];
+        }
+        MPSGraphTensor *shift = tensorAt(b, c);
+        if (shift != nil) {
+            if (beta != 1.0f) {
+                MPSGraphTensor *scale = [g constantWithScalar:(double)beta dataType:MPSDataTypeFloat32];
+                shift = [g multiplicationWithPrimaryTensor:shift secondaryTensor:scale name:nil];
+            }
+            out = [g additionWithPrimaryTensor:out secondaryTensor:shift name:nil];
         }
         return record(b, out);
     }
