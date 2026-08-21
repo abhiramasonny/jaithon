@@ -1228,6 +1228,34 @@ fn test_optimizer_step_state_does_not_leak_to_a_new_parameter_reusing_a_freed_ha
     fresh_parameter.free()
 }
 
+fn test_optimizer_momentum_starts_at_zero_on_a_recycled_device_buffer() -> void {
+    if not jt.is_available() { return }
+    #: A freed buffer goes back to a pool for the next allocation of the same
+    #: size, so a new parameter's momentum is very likely to land on memory a
+    #: previous parameter's momentum used. Zeroing it is a host write, and the
+    #: update that filled it may be encoded and not yet run -- so without a
+    #: wait, the old update lands after the zeroing and the new parameter
+    #: starts with someone else's velocity.
+    #:
+    #: The churn is what makes this deterministic: it leaves buffers of the
+    #: right size in the pool before the parameter under test asks for one.
+    for _round in 0..8 {
+        let scratch = jt.Tensor([1], [3.0], requires_grad: true)
+        scratch.grad = jt.Tensor([1], [1.0])
+        jt.SGD(learning_rate: 0.1, momentum: 0.9).step([scratch])
+        scratch.free()
+    }
+
+    let optimizer = jt.SGD(learning_rate: 0.1, momentum: 0.9)
+    let parameter = jt.Tensor([1], [1.0], requires_grad: true)
+    parameter.grad = jt.Tensor([1], [0.5])
+    optimizer.step([parameter])
+    #: One step from rest moves by the learning rate times the gradient, with
+    #: no velocity term yet.
+    assert math.fabs(parameter.download()[0] - (1.0 - 0.1 * 0.5)) < 1e-5
+    parameter.free()
+}
+
 fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _rate = assert_throws(ValueError, || jt.SGD(learning_rate: 0.0))
     let _momentum = assert_throws(ValueError, || jt.SGD(momentum: 1.0))

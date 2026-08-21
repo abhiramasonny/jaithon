@@ -55,6 +55,10 @@ static void dispatchTraceTick(int isGraph) {
 struct JaiGpuBuffer {
     void  *buffer;   /* id<MTLBuffer>, held at +1 */
     size_t bytes;
+    /* Set when this came out of the recycling pool and the queue has not been
+     * waited on since. Work already queued may still write these bytes, so the
+     * first HOST write has to wait for it -- see hostWriteBarrier. */
+    bool   recycled;
 };
 
 struct JaiGpuKernel {
@@ -665,29 +669,155 @@ bool jaiGpuMixedPrecision(void) {
     return gMixedPrecision;
 }
 
+/* Device buffers a freed tensor left behind, kept for the next allocation of
+ * the same size.
+ *
+ * Every intermediate a network produces -- each activation, each gradient --
+ * allocates a buffer and drops it a moment later, and the next step asks for
+ * exactly the same sizes again. Handing back a fresh `MTLBuffer` each time
+ * costs far more than the arithmetic that follows it: the same elementwise
+ * kernel over four million floats runs at 373 GB/s writing into a buffer it
+ * used before and 80 GB/s writing into a new one, because the new one's pages
+ * are touched for the first time.
+ *
+ * Reuse is safe without any fence. There is one command queue, its command
+ * buffers execute in the order they were committed, and the encoders are the
+ * serial kind with hazard tracking -- so work that writes a recycled buffer is
+ * always behind the work that read it. Contents are whatever the last owner
+ * left, which is what `Buffer` has always promised.
+ *
+ * `JAITHON_GPU_POOL=0` turns it off, and `JAITHON_GPU_POISON=1` fills every
+ * recycled buffer with a signalling NaN, so anything that quietly relied on a
+ * fresh allocation arriving zeroed fails loudly instead of occasionally. */
+#define JAI_POOL_MAX_ENTRIES 512
+#define JAI_POOL_MAX_BYTES   (1536u * 1024u * 1024u)
+
+typedef struct {
+    size_t bytes;
+    void  *buffer;
+} JaiPooledBuffer;
+
+static JaiPooledBuffer gPool[JAI_POOL_MAX_ENTRIES];
+static int             gPoolCount;
+static size_t          gPoolBytes;
+static int             gPoolMode;   /* 0 unknown, 1 on, 2 off */
+static int             gPoolPoison; /* 0 unknown, 1 on, 2 off */
+
+static bool poolEnabled(void) {
+    if (gPoolMode == 0) {
+        const char *setting = getenv("JAITHON_GPU_POOL");
+        gPoolMode = (setting != NULL && strcmp(setting, "0") == 0) ? 2 : 1;
+    }
+    return gPoolMode == 1;
+}
+
+static bool poolPoisons(void) {
+    if (gPoolPoison == 0) {
+        const char *setting = getenv("JAITHON_GPU_POISON");
+        gPoolPoison = (setting != NULL && strcmp(setting, "0") != 0) ? 1 : 2;
+    }
+    return gPoolPoison == 1;
+}
+
+/* The most recently parked buffer of exactly this size, or nil. Newest first,
+ * because that one is likeliest to still be warm. */
+static id<MTLBuffer> poolTake(size_t bytes) {
+    for (int i = gPoolCount - 1; i >= 0; i--) {
+        if (gPool[i].bytes != bytes) continue;
+        id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)gPool[i].buffer;
+        memmove(&gPool[i], &gPool[i + 1],
+                (size_t)(gPoolCount - i - 1) * sizeof(JaiPooledBuffer));
+        gPoolCount--;
+        gPoolBytes -= bytes;
+        return buffer;
+    }
+    return nil;
+}
+
+/* Park a buffer, evicting the oldest when there is no room. Evicting rather
+ * than refusing keeps a workload that cycles through many sizes from filling
+ * the pool with entries it will never ask for again. */
+static bool poolGive(void *buffer, size_t bytes) {
+    if (bytes > JAI_POOL_MAX_BYTES) return false;
+    while (gPoolCount > 0 &&
+           (gPoolCount >= JAI_POOL_MAX_ENTRIES ||
+            gPoolBytes + bytes > JAI_POOL_MAX_BYTES)) {
+        CFBridgingRelease(gPool[0].buffer);
+        gPoolBytes -= gPool[0].bytes;
+        memmove(&gPool[0], &gPool[1],
+                (size_t)(gPoolCount - 1) * sizeof(JaiPooledBuffer));
+        gPoolCount--;
+    }
+    if (gPoolCount >= JAI_POOL_MAX_ENTRIES) return false;
+    gPool[gPoolCount].bytes = bytes;
+    gPool[gPoolCount].buffer = buffer;
+    gPoolCount++;
+    gPoolBytes += bytes;
+    return true;
+}
+
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
     if (bytes == 0 || !ensureDevice()) return NULL;
     if (bytes > gMaxBufferLength) return NULL;
 
     @autoreleasepool {
-        id<MTLBuffer> buffer =
-            [gDevice newBufferWithLength:bytes
-                                 options:MTLResourceStorageModeShared];
-
+        id<MTLBuffer> buffer = nil;
+        bool reused = false;
+        if (poolEnabled()) {
+            @synchronized(gQueue) {
+                buffer = poolTake(bytes);
+            }
+            reused = buffer != nil;
+            if (reused && poolPoisons()) {
+                jaiGpuSynchronize();
+                float *slots = (float *)[buffer contents];
+                const size_t count = bytes / sizeof(float);
+                for (size_t i = 0; i < count; i++) slots[i] = NAN;
+            }
+        }
+        if (buffer == nil) {
+            buffer = [gDevice newBufferWithLength:bytes
+                                          options:MTLResourceStorageModeShared];
+        }
         if (buffer == nil) return NULL;
 
         JaiGpuBuffer *b = JAI_ALLOC(JaiGpuBuffer, 1);
         b->buffer = (__bridge_retained void *)buffer;
         b->bytes = bytes;
+        b->recycled = reused;
         return b;
     }
+}
+
+/* Wait for queued work before the host writes over a recycled buffer.
+ *
+ * Reuse needs no fence between one piece of GPU work and the next -- there is
+ * one queue and it runs in order. The host is not in that order. A buffer
+ * handed back to a new owner may still be the destination of a kernel that has
+ * been encoded and not yet run, and that kernel would land on top of whatever
+ * the new owner wrote: an optimizer's momentum, zeroed by its new parameter
+ * and then filled in again by the previous parameter's update.
+ *
+ * Paid once per recycled buffer, and only by one that the host writes to at
+ * all. Everything that stays on the device -- which is nearly every
+ * intermediate a network produces -- never reaches here. */
+static void hostWriteBarrier(JaiGpuBuffer *b) {
+    if (b == NULL || !b->recycled) return;
+    b->recycled = false;
+    jaiGpuSynchronize();
 }
 
 void jaiGpuFree(JaiGpuBuffer *b) {
     if (b == NULL) return;
 
     @autoreleasepool {
-        CFBridgingRelease(b->buffer);
+        bool parked = false;
+        if (poolEnabled() && b->buffer != NULL && gQueue != nil) {
+            @synchronized(gQueue) {
+                parked = poolGive(b->buffer, b->bytes);
+            }
+        }
+        if (!parked) CFBridgingRelease(b->buffer);
     }
 
     JAI_FREE(JaiGpuBuffer, b);
@@ -700,6 +830,7 @@ void jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset)
     /* A partial copy would look like success and leave the tail stale, so an
      * oversized request copies nothing. Callers bound-check first. */
     if (offset > b->bytes || bytes > b->bytes - offset) return;
+    hostWriteBarrier(b);
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy((uint8_t *)[buffer contents] + offset, src, bytes);
@@ -715,6 +846,9 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
     const size_t start = offset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return;
+    /* Both routes below can write from the host, so the barrier covers the
+     * whole function rather than the fallback alone. */
+    hostWriteBarrier(b);
     if (count < JAI_GPU_MIN_WORK || count > UINT32_MAX || !ensureDevice() ||
         !ensureBuiltins() || gExpandU8 == nil) {
         float *destination =
@@ -1694,10 +1828,27 @@ bool jaiGpuConv2dBuffers(JaiGpuBuffer *input, size_t inputOffset,
                                                      : MPSGraphTensorNamedDataLayoutNHWC)
                                   weightsLayout:(chw ? MPSGraphTensorNamedDataLayoutOIHW
                                                      : MPSGraphTensorNamedDataLayoutHWIO)];
-                MPSGraphTensor *conv = [graph convolution2DWithSourceTensor:src
-                                                              weightsTensor:filt
+                /* Half precision for the multiply-accumulate, single for
+                 * everything around it -- the same split the matmul and the
+                 * attention paths already take when mixed precision is on.
+                 * MPS accumulates a half-precision convolution into single
+                 * internally, so what this trades is the width of the operands
+                 * in memory, which is what a convolution of this size is
+                 * limited by. The cast pair is inside the compiled graph, so
+                 * it costs no dispatch of its own. */
+                MPSGraphTensor *srcIn = src;
+                MPSGraphTensor *filtIn = filt;
+                if (gMixedPrecision) {
+                    srcIn = [graph castTensor:src toType:MPSDataTypeFloat16 name:@"X16"];
+                    filtIn = [graph castTensor:filt toType:MPSDataTypeFloat16 name:@"W16"];
+                }
+                MPSGraphTensor *conv = [graph convolution2DWithSourceTensor:srcIn
+                                                              weightsTensor:filtIn
                                                                  descriptor:desc
                                                                        name:@"conv"];
+                if (gMixedPrecision) {
+                    conv = [graph castTensor:conv toType:MPSDataTypeFloat32 name:@"C32"];
+                }
                 MPSGraphTensor *product = conv;
                 MPSGraphTensor *biasT = nil;
                 if (bias != NULL) {
@@ -1862,16 +2013,22 @@ static bool convGradient(int mode,
                                    paddingStyle:MPSGraphPaddingStyleExplicit
                                      dataLayout:MPSGraphTensorNamedDataLayoutNHWC
                                   weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
+                /* Single precision, deliberately: narrowing the two gradient
+                 * convolutions the way the forward pass is narrowed measured
+                 * two to three per cent SLOWER on every shape tried, and a
+                 * gradient is the worse place to spend accuracy. */
+                MPSGraphTensor *dyIn = dy;
+                MPSGraphTensor *secondIn = second;
                 MPSGraphTensor *result = nil;
                 if (mode == 0) {
-                    result = [graph convolution2DDataGradientWithIncomingGradientTensor:dy
-                                                                         weightsTensor:second
+                    result = [graph convolution2DDataGradientWithIncomingGradientTensor:dyIn
+                                                                         weightsTensor:secondIn
                                                                            outputShape:srcShape
                                                           forwardConvolutionDescriptor:desc
                                                                                   name:@"dX"];
                 } else {
-                    result = [graph convolution2DWeightsGradientWithIncomingGradientTensor:dy
-                                                                             sourceTensor:second
+                    result = [graph convolution2DWeightsGradientWithIncomingGradientTensor:dyIn
+                                                                             sourceTensor:secondIn
                                                                               outputShape:filtShape
                                                              forwardConvolutionDescriptor:desc
                                                                                      name:@"dW"];
