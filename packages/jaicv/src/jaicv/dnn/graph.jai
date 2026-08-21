@@ -1369,7 +1369,7 @@ pub fn attr_int(node: GraphNode, name: str, fallback: int) -> int {
     return found.i
 }
 
-fn attr_float(node: GraphNode, name: str, fallback: float) -> float {
+pub fn attr_float(node: GraphNode, name: str, fallback: float) -> float {
     let found = node.attrs.get(name, null)
     if found is null { return fallback }
     if found.kind == "int" { return float(found.i) }

@@ -642,9 +642,22 @@ int jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis) { (void)b; (void)x; (vo
 int jaiGraphResizeNearest(JaiGraphBuilder *b, int x, int h, int w, int r, int c, int a) {
     (void)b; (void)x; (void)h; (void)w; (void)r; (void)c; (void)a; return -1;
 }
+int jaiGraphGather(JaiGraphBuilder *b, int d, int i, int axis) {
+    (void)b; (void)d; (void)i; (void)axis; return -1;
+}
 int jaiGraphMatmul(JaiGraphBuilder *b, int l, int r) { (void)b; (void)l; (void)r; return -1; }
 int jaiGraphReduce(JaiGraphBuilder *b, int x, const int32_t *axes, int count, int kind) {
     (void)b; (void)x; (void)axes; (void)count; (void)kind; return -1;
+}
+int jaiGraphLayerNorm(JaiGraphBuilder *b, int x, int gamma, int beta,
+                      const int32_t *axes, int count, float epsilon) {
+    (void)b; (void)x; (void)gamma; (void)beta; (void)axes; (void)count; (void)epsilon;
+    return -1;
+}
+int jaiGraphGemm(JaiGraphBuilder *b, int l, int r, int c, int tl, int tr,
+                 float alpha, float beta) {
+    (void)b; (void)l; (void)r; (void)c; (void)tl; (void)tr; (void)alpha; (void)beta;
+    return -1;
 }
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *in, int inCount,
                               const int *out, int outCount) {

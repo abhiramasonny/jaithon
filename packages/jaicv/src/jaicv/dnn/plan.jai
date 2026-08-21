@@ -25,7 +25,7 @@
 #: which is most of the cost and little of the benefit.
 import jaitensor as jt
 from jaitensor import Tensor
-from .graph import Graph, GraphNode, attr_int, attr_ints, attr_str
+from .graph import Graph, GraphNode, attr_float, attr_int, attr_ints, attr_str
 from .graph import normalize_axis, run_graph
 from std.os import env
 
@@ -53,6 +53,12 @@ let UNARY_CODES = {
 }
 
 let BINARY_CODES = {"Add": 0, "Sub": 1, "Mul": 2, "Div": 3, "Max": 4, "Min": 5, "Pow": 6}
+
+let REDUCE_CODES = {"ReduceSum": 0, "ReduceMean": 1, "ReduceMax": 2, "ReduceMin": 3}
+
+#: The ONNX element types, as the importer numbers them.
+let INTEGER_TYPES = [2, 3, 4, 5, 6, 7, 12, 13]
+let FLOAT_TYPES = [1, 10, 11, 16]
 
 #: How a nearest resize picks its source pixel, in the builder's numbering.
 let ROUNDING_CODES = {
@@ -337,6 +343,22 @@ fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
+    if node.op == "Cast" {
+        #: Every tensor here is float, so a cast to a float type is nothing at
+        #: all; a cast to an integer one truncates, and a cast to boolean is
+        #: one where the value was not zero. The same three cases the
+        #: interpreter has.
+        let target = attr_int(node, "to", 1)
+        if target in FLOAT_TYPES {
+            state.ids[out] = state.id_of(node.inputs[0])
+            return true
+        }
+        let code = if target in INTEGER_TYPES { 15 } elif target == 9 { 16 } else { -1 }
+        if code < 0 { return false }
+        state.ids[out] = __prim__.graph_unary(b, state.id_of(node.inputs[0]), code)
+        return true
+    }
+
     if node.op == "Identity" or node.op == "Dropout" {
         state.ids[out] = state.id_of(node.inputs[0])
         return true
@@ -372,6 +394,96 @@ fn emit(state: Build, node: GraphNode) -> bool {
             center,
             corners
         )
+        return true
+    }
+
+    if node.op == "LayerNormalization" {
+        let x = state.shape_of(node.inputs[0])
+        if x is null { return false }
+        let raw = attr_int(node, "axis", -1)
+        let axis = if raw < 0 { x.len() + raw } else { raw }
+        if axis < 0 or axis >= x.len() { return false }
+        var axes: list[int] = []
+        for index in axis..x.len() { axes.push(index) }
+        let gamma = if node.inputs.len() > 1 { state.id_of(node.inputs[1]) } else { -1 }
+        let beta = if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
+            state.id_of(node.inputs[2])
+        } else {
+            -1
+        }
+        state.ids[out] = __prim__.graph_layer_norm(
+            b,
+            state.id_of(node.inputs[0]),
+            gamma,
+            beta,
+            axes,
+            attr_float(node, "epsilon", 1.0e-5)
+        )
+        return true
+    }
+
+    if node.op == "Gemm" {
+        let c = if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
+            state.id_of(node.inputs[2])
+        } else {
+            -1
+        }
+        state.ids[out] = __prim__.graph_gemm(
+            b,
+            state.id_of(node.inputs[0]),
+            state.id_of(node.inputs[1]),
+            c,
+            attr_int(node, "transA", 0),
+            attr_int(node, "transB", 0),
+            attr_float(node, "alpha", 1.0),
+            attr_float(node, "beta", 1.0)
+        )
+        return true
+    }
+
+    if node.op == "ReduceMean" or node.op == "ReduceSum" or node.op == "ReduceMax" or
+        node.op == "ReduceMin" {
+        let x = state.shape_of(node.inputs[0])
+        let want = state.shape_of(out)
+        if x is null or want is null { return false }
+        var axes = attr_ints(node, "axes", [])
+        if axes.len() == 0 and node.inputs.len() > 1 {
+            let given = state.constants.get(node.inputs[1], null)
+            if given is null { return false }
+            axes = as_ints(given)
+        }
+        if axes.len() == 0 {
+            for index in 0..x.len() { axes.push(index) }
+        }
+        var over: list[int] = []
+        for axis in axes { over.push(normalize_axis(axis, x.len(), node.label())) }
+        let kind = REDUCE_CODES.get(node.op, -1)
+        if kind < 0 { return false }
+        let reduced = __prim__.graph_reduce(b, state.id_of(node.inputs[0]), over, kind)
+        #: MPSGraph keeps the reduced axes as ones; ONNX drops them unless
+        #: `keepdims` says otherwise, and the survey already knows which.
+        state.ids[out] = if want.len() == x.len() {
+            reduced
+        } else {
+            __prim__.graph_reshape(b, reduced, dims_of(want))
+        }
+        return true
+    }
+
+    if node.op == "Gather" {
+        let x = state.shape_of(node.inputs[0])
+        let want = state.shape_of(out)
+        if x is null or want is null { return false }
+        let picked = __prim__.graph_gather(
+            b,
+            state.id_of(node.inputs[0]),
+            state.id_of(node.inputs[1]),
+            normalize_axis(attr_int(node, "axis", 0), x.len(), node.label())
+        )
+        #: ONNX drops the axis for a scalar index and keeps it for a vector
+        #: one; the survey already knows which happened, so the result is
+        #: reshaped to whatever it should have been.
+        state.ids[out] = __prim__.graph_reshape(b, picked, dims_of(want))
         return true
     }
 
@@ -600,6 +712,19 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
             ok = false
         }
         if not ok {
+            #: Worth saying which operator stopped it: the answer is still
+            #: right, but a model that falls back is running several times
+            #: slower than it could, and this is the one fact needed to fix it.
+            if env("JAICV_GRAPH_PLAN_REPORT") is not null {
+                var told: list[str] = []
+                for name in node.inputs {
+                    let fixed = state.constants.get(name, null) is not null
+                    let shape = state.shapes.get(name, null)
+                    told.push(f"{name}{if fixed { ' fixed' } else { ' live' }} {shape}")
+                }
+                print(f"[plan] {node.label()} is not one this compiler expresses")
+                for line in told { print(f"[plan]     {line}") }
+            }
             __prim__.graph_free(builder)
             return null
         }
@@ -607,6 +732,9 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
 
     var outputs: list[int] = []
     for name in graph.outputs {
+        if env("JAICV_GRAPH_PLAN_REPORT") is not null and state.id_of(name) < 0 {
+            print(f"[plan] the output {name} has no value in the compiled graph")
+        }
         #: `id_of` rather than a lookup, so that a graph asked for a value the
         #: folding settled at compile time still compiles -- it becomes a
         #: constant in the graph instead of a hole in it.
