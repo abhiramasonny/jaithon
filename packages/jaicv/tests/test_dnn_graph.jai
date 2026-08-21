@@ -215,6 +215,11 @@ fn test_matrix_operators_match_onnxruntime() -> void { check_group("linear", 1e-
 
 fn test_normalization_operators_match_onnxruntime() -> void { check_group("norm", 1e-6) }
 
+#: An LSTM runs its gates a timestep at a time, so the last step carries every
+#: rounding difference of the ones before it -- hence a looser bound than the
+#: single-shot operators get.
+fn test_recurrent_operators_match_onnxruntime() -> void { check_group("recurrent", 2e-5) }
+
 fn test_reductions_match_onnxruntime() -> void { check_group("reduce", 1e-6) }
 
 fn test_resampling_matches_onnxruntime() -> void { check_group("resample", 3e-6) }
