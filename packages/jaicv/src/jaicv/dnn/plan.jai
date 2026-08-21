@@ -70,6 +70,9 @@ let BINARY_CODES = {
 
 let REDUCE_CODES = {"ReduceSum": 0, "ReduceMean": 1, "ReduceMax": 2, "ReduceMin": 3}
 
+#: How a `Pad` fills what it adds, in the builder's numbering.
+let PAD_MODES = {"constant": 0, "reflect": 1, "edge": 3}
+
 #: The ONNX element types, as the importer numbers them.
 let INTEGER_TYPES = [2, 3, 4, 5, 6, 7, 12, 13]
 let FLOAT_TYPES = [1, 10, 11, 16]
@@ -602,6 +605,62 @@ fn emit(state: Build, node: GraphNode) -> bool {
             for index in 0..x.len() { perm.push(x.len() - 1 - index) }
         }
         state.ids[out] = __prim__.graph_transpose(b, state.id_of(node.inputs[0]), perm)
+        return true
+    }
+
+    if node.op == "Pad" {
+        let x = state.shape_of(node.inputs[0])
+        if x is null { return false }
+        let mode = PAD_MODES.get(attr_str(node, "mode", "constant"), -1)
+        if mode < 0 { return false }
+        var pads = attr_ints(node, "pads", [])
+        if pads.len() == 0 and node.inputs.len() > 1 {
+            let given = state.numbers_of(node.inputs[1])
+            if given is null { return false }
+            pads = as_ints(given)
+        }
+        if pads.len() != 2 * x.len() { return false }
+        #: A negative pad is a crop, which this does not do.
+        for value in pads {
+            if value < 0 { return false }
+        }
+        var value = 0.0
+        if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
+            let given = state.numbers_of(node.inputs[2])
+            if given is null or given.len() == 0 { return false }
+            value = given[0]
+        }
+        var before: list[int] = []
+        var after: list[int] = []
+        for axis in 0..x.len() {
+            before.push(pads[axis])
+            after.push(pads[x.len() + axis])
+        }
+        state.ids[out] = __prim__.graph_pad(
+            b,
+            state.id_of(node.inputs[0]),
+            before,
+            after,
+            mode,
+            value
+        )
+        return true
+    }
+
+    if node.op == "ArgMax" or node.op == "ArgMin" {
+        let x = state.shape_of(node.inputs[0])
+        let want = state.shape_of(out)
+        if x is null or want is null { return false }
+        if attr_int(node, "select_last_index", 0) != 0 { return false }
+        let picked = __prim__.graph_arg_extreme(
+            b,
+            state.id_of(node.inputs[0]),
+            normalize_axis(attr_int(node, "axis", 0), x.len(), node.label()),
+            if node.op == "ArgMax" { 1 } else { 0 }
+        )
+        #: The reduced axis stays as a one here and ONNX drops it unless
+        #: `keepdims` says otherwise; the survey knows which happened.
+        state.ids[out] = __prim__.graph_reshape(b, picked, dims_of(want))
         return true
     }
 

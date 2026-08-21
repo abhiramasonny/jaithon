@@ -164,6 +164,10 @@ int              jaiGraphReshape(JaiGraphBuilder *b, int x, const int64_t *dims,
 int              jaiGraphTranspose(JaiGraphBuilder *b, int x, const int32_t *perm, int rank);
 int              jaiGraphSlice(JaiGraphBuilder *b, int x, const int32_t *starts,
                                const int32_t *ends, const int32_t *steps, int rank);
+/* `mode` 0 constant, 1 reflect, 2 symmetric, 3 clamp to edge. */
+int              jaiGraphPad(JaiGraphBuilder *b, int x, const int32_t *before,
+                             const int32_t *after, int rank, int mode, float value);
+int              jaiGraphArgExtreme(JaiGraphBuilder *b, int x, int axis, int largest);
 int              jaiGraphSoftmax(JaiGraphBuilder *b, int x, int axis);
 /* `rounding` is 0 round-prefer-ceil, 1 round-prefer-floor, 2 ceil, 3 floor;
  * `center` and `corners` say how the source coordinate is derived. */
