@@ -416,23 +416,27 @@ static bool primBytesQuantise(int argc, Value *args, Value *out) {
     if (result == NULL) return false;
     uint8_t *dst = result->data;
 
+    /* Single precision and no call to `floor`. The values are float32 to
+     * begin with, and for a positive number truncation IS the floor -- which
+     * the clamp below has already established. `!(value > 0.0f)` catches the
+     * negatives and the NaNs together, since a NaN fails every comparison.
+     *
+     * This runs once per colour channel of every pixel, so a 720p frame is
+     * 2.8 million times; the arithmetic being cheap is the whole point. */
+    const float factor = (float)scale;
     for (size_t i = 0; i < n; i++) {
         Value item = items->items[i];
-        double value;
-        if (IS_FLOAT(item)) value = AS_FLOAT(item);
-        else if (IS_INT(item)) value = (double)AS_INT(item);
+        float value;
+        if (IS_FLOAT(item)) value = (float)AS_FLOAT(item);
+        else if (IS_INT(item)) value = (float)AS_INT(item);
         else {
             return jaiThrow(vm.cTypeError,
                             "bytes_quantise(): element %zu is %s, not a number",
                             i, jaiTypeNameStatic(item));
         }
-        value *= scale;
-        /* NaN fails every comparison, so it lands here and nowhere else. */
-        if (!(value == value)) { dst[i] = 0; continue; }
-        double rounded = floor(value + 0.5);
-        if (rounded <= 0.0) dst[i] = 0;
-        else if (rounded >= 255.0) dst[i] = 255;
-        else dst[i] = (uint8_t)rounded;
+        value = value * factor + 0.5f;
+        if (!(value > 0.0f)) { dst[i] = 0; continue; }
+        dst[i] = value >= 255.5f ? (uint8_t)255 : (uint8_t)value;
     }
     *out = OBJ_VAL(result);
     return true;
