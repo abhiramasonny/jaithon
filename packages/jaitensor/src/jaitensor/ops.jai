@@ -3302,9 +3302,20 @@ fn attach_conv_grad(
     padding: int,
     activation: int
 ) -> void {
+    #: Only the gradients something downstream will read.
+    #:
+    #: The first convolution of a network is fed the batch itself, which is a
+    #: leaf and wants no gradient -- and the gradient with respect to the input
+    #: costs a whole second convolution and an activation-sized allocation to
+    #: produce. Asking for it anyway was about a sixth of what the backward
+    #: pass of a two-layer network did.
+    let wants_input = input.requires_grad
+    let wants_weights = weights.requires_grad
     let wants_bias = bias is not null and bias.requires_grad
-    if not (input.requires_grad or weights.requires_grad or wants_bias) { return }
-    var inputs = [input, weights]
+    if not (wants_input or wants_weights or wants_bias) { return }
+    var inputs: list[Tensor] = []
+    if wants_input { inputs.push(input) }
+    if wants_weights { inputs.push(weights) }
     if wants_bias { inputs.push(bias) }
     let n = input.shape[0]
     let h = input.shape[1]
@@ -3325,8 +3336,10 @@ fn attach_conv_grad(
         let k = kh * kw * cin
         let rows = n * out_h * out_w
         let flat_up = Tensor([rows, cout], storage: upstream.buffer().view(0, rows * cout))
-        let grad_weights = Tensor([kh, kw, cin, cout])
-        let grad_input = Tensor([n, h, w, cin])
+        var grad_weights: Tensor? = null
+        var grad_input: Tensor? = null
+        if wants_weights { grad_weights = Tensor([kh, kw, cin, cout]) }
+        if wants_input { grad_input = Tensor([n, h, w, cin]) }
 
         #: The device's own convolution gradients when it has them. The im2col
         #: pair below computes the same two tensors, and does it by building a
@@ -3335,46 +3348,56 @@ fn attach_conv_grad(
         #: batch of a sixty-four-channel layer. Either may be declined on its
         #: own -- a shape MPS will not take, or no device at all -- so each is
         #: asked for separately and each has its own fallback.
-        var have_weights_grad = false
-        var have_input_grad = false
+        #: Each gradient is asked for on its own: either may be declined for
+        #: a shape MPS will not take, and either may not be wanted at all.
+        var have_weights_grad = not wants_weights
+        var have_input_grad = not wants_input
         try {
-            have_weights_grad = gpu.conv2d_weights_grad_async(
-                upstream.buffer(),
-                input.buffer(),
-                grad_weights.buffer(),
-                n,
-                h,
-                w,
-                cin,
-                cout,
-                kh,
-                kw,
-                stride_h: stride,
-                stride_w: stride,
-                pad_h: padding,
-                pad_w: padding
-            )
-            have_input_grad = gpu.conv2d_data_grad_async(
-                upstream.buffer(),
-                weights.buffer(),
-                grad_input.buffer(),
-                n,
-                h,
-                w,
-                cin,
-                cout,
-                kh,
-                kw,
-                stride_h: stride,
-                stride_w: stride,
-                pad_h: padding,
-                pad_w: padding
-            )
+            if wants_weights {
+                have_weights_grad = gpu.conv2d_weights_grad_async(
+                    upstream.buffer(),
+                    input.buffer(),
+                    grad_weights.buffer(),
+                    n,
+                    h,
+                    w,
+                    cin,
+                    cout,
+                    kh,
+                    kw,
+                    stride_h: stride,
+                    stride_w: stride,
+                    pad_h: padding,
+                    pad_w: padding
+                )
+            }
+            if wants_input {
+                have_input_grad = gpu.conv2d_data_grad_async(
+                    upstream.buffer(),
+                    weights.buffer(),
+                    grad_input.buffer(),
+                    n,
+                    h,
+                    w,
+                    cin,
+                    cout,
+                    kh,
+                    kw,
+                    stride_h: stride,
+                    stride_w: stride,
+                    pad_h: padding,
+                    pad_w: padding
+                )
+            }
         } catch _error: RuntimeError {
-            have_weights_grad = false
-            have_input_grad = false
+            have_weights_grad = not wants_weights
+            have_input_grad = not wants_input
         }
 
+        #: The im2col pair computes the same two tensors when the device
+        #: declines. It builds an `[n * out_h * out_w, kh * kw * cin]` matrix
+        #: to do it -- a hundred and fifty megabytes for a sixty-four-channel
+        #: layer -- which is why it is the fallback and not the path.
         if not have_weights_grad {
             let col = Tensor([rows, k])
             let im2col = cached_kernel("im2col_nhwc")
@@ -3398,7 +3421,11 @@ fn attach_conv_grad(
             )
             grad_col.free()
         }
-        var grads = [grad_input, grad_weights]
+
+        #: Same order as `inputs`, which listed only what wanted a gradient.
+        var grads: list[Tensor] = []
+        if wants_input { grads.push(grad_input) }
+        if wants_weights { grads.push(grad_weights) }
         if wants_bias { grads.push(reduce_leading(flat_up, [cout])) }
         if activation == 1 { upstream.free() }
         return grads
