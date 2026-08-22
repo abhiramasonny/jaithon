@@ -709,12 +709,15 @@ bool jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeight, int input
 /* A whole GRU as one operation.
  *
  * The gates are ordered z, r, h, which is the order ONNX writes them in, so
- * unlike the LSTM nothing has to be permuted. Only the variant that applies
- * the reset before the recurrent weights is compiled: the other moves the
- * recurrent bias inside the reset while the input bias stays outside, and this
- * operation takes a single bias for both. */
+ * unlike the LSTM nothing has to be permuted.
+ *
+ * Both reset variants map. Applying the reset after the recurrent weights --
+ * ONNX's `linear_before_reset`, and what PyTorch exports -- computes the
+ * candidate as `(b2 + h[t-1] R^T) r[t]`, so the candidate gate's recurrent
+ * bias goes in on its own as `secondaryBias` while the update and reset gates
+ * keep both of theirs summed into `bias`. */
 int jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWeight,
-                int bias, int initState, int reverse) {
+                int bias, int initState, int reverse, int resetAfter, int resetBias) {
     MPSGraphTensor *x = tensorAt(b, source);
     MPSGraphTensor *r = tensorAt(b, recurrentWeight);
     MPSGraphTensor *w = tensorAt(b, inputWeight);
@@ -732,7 +735,7 @@ int jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWe
              * particular reads from its documentation as though ONNX would
              * want it on; it does not, and the tests are the authority. */
             d.resetGateFirst = NO;
-            d.resetAfter = NO;
+            d.resetAfter = resetAfter != 0;
             d.flipZ = NO;
             NSArray<MPSGraphTensor *> *made =
                 [g GRUWithSourceTensor:x
@@ -740,6 +743,8 @@ int jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWe
                            inputWeight:w
                                   bias:tensorAt(b, bias)
                              initState:tensorAt(b, initState)
+                                  mask:nil
+                         secondaryBias:tensorAt(b, resetBias)
                             descriptor:d
                                   name:nil];
             if (made == nil || made.count < 1) return -1;
