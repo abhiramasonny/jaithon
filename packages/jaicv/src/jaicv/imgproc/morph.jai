@@ -72,11 +72,22 @@ kernel void morph_box_row(device const float* src [[buffer(0)]],
     uint y = pixel / cols;
     uint x = pixel - y * cols;
     float best = dilate != 0u ? -INFINITY : INFINITY;
-    for (uint kx = 0; kx < element_cols; ++kx) {
-        int sx = int(x) + int(kx) - int(anchor_x);
-        float value = fetch(src, int(y), sx, channel, rows, cols, cn, src_off, src_step,
-                            border, as_type<float>(constant_bits));
-        best = dilate != 0u ? max(best, value) : min(best, value);
+    /* Inside the picture the window is a straight walk and none of the border
+     * arithmetic is reachable; see filter_separable_row for the same split. */
+    int left = int(x) - int(anchor_x);
+    if (left >= 0 && left + int(element_cols) <= int(cols)) {
+        uint at = src_off + uint(y) * src_step + uint(left) * cn + channel;
+        for (uint kx = 0; kx < element_cols; ++kx) {
+            float value = src[at];
+            best = dilate != 0u ? max(best, value) : min(best, value);
+            at += cn;
+        }
+    } else {
+        for (uint kx = 0; kx < element_cols; ++kx) {
+            float value = fetch(src, int(y), left + int(kx), channel, rows, cols, cn,
+                                src_off, src_step, border, as_type<float>(constant_bits));
+            best = dilate != 0u ? max(best, value) : min(best, value);
+        }
     }
     tmp[id] = best;
 }
@@ -104,11 +115,20 @@ kernel void morph_box_col(device const float* tmp [[buffer(0)]],
     uint y = pixel / cols;
     uint x = pixel - y * cols;
     float best = dilate != 0u ? -INFINITY : INFINITY;
-    for (uint ky = 0; ky < element_rows; ++ky) {
-        int sy = int(y) + int(ky) - int(anchor_y);
-        float value = fetch(tmp, sy, int(x), channel, rows, cols, cn, 0u, cols * cn,
-                            border, as_type<float>(constant_bits));
-        best = dilate != 0u ? max(best, value) : min(best, value);
+    int top = int(y) - int(anchor_y);
+    if (top >= 0 && top + int(element_rows) <= int(rows)) {
+        uint at = uint(top) * cols * cn + uint(x) * cn + channel;
+        for (uint ky = 0; ky < element_rows; ++ky) {
+            float value = tmp[at];
+            best = dilate != 0u ? max(best, value) : min(best, value);
+            at += cols * cn;
+        }
+    } else {
+        for (uint ky = 0; ky < element_rows; ++ky) {
+            float value = fetch(tmp, top + int(ky), int(x), channel, rows, cols, cn,
+                                0u, cols * cn, border, as_type<float>(constant_bits));
+            best = dilate != 0u ? max(best, value) : min(best, value);
+        }
     }
     put(dst, dst_off + y * dst_step + x * cn + channel, best,
         as_type<float>(low_bits), as_type<float>(high_bits), integral);
