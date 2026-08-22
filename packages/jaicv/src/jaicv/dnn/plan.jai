@@ -1018,9 +1018,15 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
     #: `[N, 2H]` initial state, `[T, N, 2H]` out -- but feeding it those gave an
     #: answer half a unit off the reference, and neither swapping the two
     #: halves of the channel axis nor turning either of them around in time
-    #: brought it closer. Something about the layout is not what the header
-    #: says, and an operator the interpreter already runs correctly is not
-    #: worth guessing at.
+    #: brought it closer.
+    #:
+    #: Tried twice. The second attempt, laying the directions out with a
+    #: transpose and slicing each pass's last state from that, got MPSGraph to
+    #: fail its own verifier and abort the process rather than return a wrong
+    #: answer -- which is what makes this worth refusing rather than
+    #: approximating: a wrong guess here takes the program down. The
+    #: interpreter runs the operator correctly, so what is lost is speed on a
+    #: model that uses it, not the model.
     let heading = attr_str(node, "direction", "forward")
     if heading != "forward" and heading != "reverse" { return false }
     let backwards = heading == "reverse"
