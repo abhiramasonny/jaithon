@@ -237,10 +237,23 @@ kernel void filter_median(device const float* src [[buffer(0)]],
      * are small enough that counting beats sorting. */
     float window[121];
     uint filled = 0;
-    for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            window[filled++] = fetch(src, int(y) + dy, int(x) + dx, channel,
-                                     rows, cols, cn, src_off, src_step, border, 0.0f);
+    int top = int(y) - radius;
+    int left = int(x) - radius;
+    if (top >= 0 && left >= 0 &&
+        top + int(ksize) <= int(rows) && left + int(ksize) <= int(cols)) {
+        for (uint dy = 0; dy < ksize; ++dy) {
+            uint at = src_off + uint(top + int(dy)) * src_step + uint(left) * cn + channel;
+            for (uint dx = 0; dx < ksize; ++dx) {
+                window[filled++] = src[at];
+                at += cn;
+            }
+        }
+    } else {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                window[filled++] = fetch(src, int(y) + dy, int(x) + dx, channel,
+                                         rows, cols, cn, src_off, src_step, border, 0.0f);
+            }
         }
     }
     uint middle = filled / 2u;
