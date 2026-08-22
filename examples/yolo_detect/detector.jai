@@ -97,10 +97,7 @@ pub fn decode(
     #: Rows four onward are the class scores, and they are contiguous, so the
     #: view costs nothing. Transposed because the reduction runs along the
     #: last axis and the classes are along the first.
-    let per_class = jt.Tensor(
-        [80, cells],
-        storage: output.buffer().view(4 * cells, 80 * cells)
-    )
+    let per_class = jt.Tensor([80, cells], storage: output.buffer().view(4 * cells, 80 * cells))
     let by_cell = jt.transpose(per_class)
     let best_scores = jt.amax(by_cell, axis: -1).download()
     let best_classes = jt.argmax(by_cell).download()
@@ -302,14 +299,7 @@ pub fn start_detect(graph: Graph, image: Mat) -> Pending {
     #: `run_best` interprets the first frame and compiles the model after,
     #: which for a run of more than one frame is most of the speed.
     let outputs = run_best(graph, {graph.inputs[0]: input})
-    return Pending(
-        outputs[graph.outputs[0]],
-        scale,
-        pad_x,
-        pad_y,
-        image.cols,
-        image.rows
-    )
+    return Pending(outputs[graph.outputs[0]], scale, pad_x, pad_y, image.cols, image.rows)
 }
 
 #: Read what `start_detect` queued. This is where the wait happens.

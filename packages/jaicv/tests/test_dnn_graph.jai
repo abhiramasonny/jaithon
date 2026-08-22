@@ -224,7 +224,13 @@ fn compiled_difference(item: Case, weights_are_constant: bool) -> float {
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
     let graph = Graph(
         nodes: [
-            GraphNode(item.op, name: item.name, inputs: names, outputs: outs, attrs: item.attrs),
+            GraphNode(
+                item.op,
+                name: item.name,
+                inputs: names,
+                outputs: outs,
+                attrs: item.attrs
+            ),
         ],
         inputs: declared,
         outputs: outs,

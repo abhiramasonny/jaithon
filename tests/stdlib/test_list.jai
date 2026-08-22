@@ -151,10 +151,7 @@ fn test_is_permutation_ignores_order_but_not_multiplicity() -> void {
 fn test_fill_pattern_repeats_the_pattern_over_the_range() -> void {
     var values = __prim__.list_filled(12, 0.0)
     __prim__.list_fill_pattern(values, 3, 3, [1.0, 2.0, 3.0])
-    assert_eq(
-        values,
-        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
-    )
+    assert_eq(values, [0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0])
 }
 
 fn test_fill_pattern_of_one_element_is_a_plain_run() -> void {
