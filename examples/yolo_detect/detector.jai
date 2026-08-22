@@ -280,8 +280,15 @@ pub class Pending {
 }
 
 #: Queue a frame's network work and come back for it.
+#:
+#: Nothing here waits: `run_best` hands the graph to the device and returns,
+#: and the result is not read until `finish_detect`. A loop that has processor
+#: work of its own -- drawing the frame before this one, writing it out -- can
+#: do it in between and pay the slower of the two rather than their sum.
 pub fn start_detect(graph: Graph, image: Mat) -> Pending {
     let (padded, scale, pad_x, pad_y) = letterbox(image)
+    #: `blob_from_image` does the BGR-to-RGB swap and the 1/255 scaling the
+    #: network expects, and lays the result out as N x C x H x W.
     let blob = cv.blob_from_image(
         padded,
         1.0 / 255.0,
@@ -289,7 +296,11 @@ pub fn start_detect(graph: Graph, image: Mat) -> Pending {
         Scalar(0.0, 0.0, 0.0),
         true
     )
+    #: The blob is already on the device, so the tensor shares its storage
+    #: rather than making a round trip through the host to say so.
     let input = cv.blob_to_tensor(blob, 3, Size(INPUT, INPUT))
+    #: `run_best` interprets the first frame and compiles the model after,
+    #: which for a run of more than one frame is most of the speed.
     let outputs = run_best(graph, {graph.inputs[0]: input})
     return Pending(
         outputs[graph.outputs[0]],
@@ -320,23 +331,7 @@ pub fn finish_detect(pending: Pending) -> list[Detection] {
 #: This waits for the network before returning. A loop that has other work to
 #: do meanwhile should use `start_detect` and `finish_detect` instead.
 pub fn detect_frame(graph: Graph, image: Mat) -> list[Detection] {
-    let (padded, scale, pad_x, pad_y) = letterbox(image)
-    #: `blob_from_image` does the BGR-to-RGB swap and the 1/255 scaling the
-    #: network expects, and lays the result out as N x C x H x W.
-    let blob = cv.blob_from_image(
-        padded,
-        1.0 / 255.0,
-        Size(INPUT, INPUT),
-        Scalar(0.0, 0.0, 0.0),
-        true
-    )
-    #: The blob is already on the device, so the tensor shares its storage
-    #: rather than making a round trip through the host to say so.
-    let input = cv.blob_to_tensor(blob, 3, Size(INPUT, INPUT))
-    #: `run_best` interprets the first frame and compiles the model after,
-    #: which for a run of more than one frame is most of the speed.
-    let outputs = run_best(graph, {graph.inputs[0]: input})
-    return decode(outputs[graph.outputs[0]], scale, pad_x, pad_y, image.cols, image.rows)
+    return finish_detect(start_detect(graph, image))
 }
 
 #: The model, from `YOLO_MODEL` or from beside this file.
