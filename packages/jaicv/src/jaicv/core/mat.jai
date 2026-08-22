@@ -454,6 +454,21 @@ pub class Mat: Printable {
     #: Number of elements the underlying allocation holds.
     pub fn buffer_count(self) -> int { return self.storage.count }
 
+    #: Whether the pixels are already on the host, so that reading or writing
+    #: them there costs nothing.
+    #:
+    #: A caller with both a host and a device way of doing its work uses this
+    #: to pick: building the mirror for a frame that has none costs a download
+    #: and a list of one boxed number per channel per pixel, which for a 720p
+    #: frame is 44 MB and about 2 ms.
+    pub fn has_host_copy(self) -> bool {
+        let cached = self.host
+        return cached is not null and self.host_generation == generation_of(self.storage)
+    }
+
+    #: Whether host-side edits are waiting to be pushed to the device.
+    pub fn has_pending_edits(self) -> bool { return self.pending }
+
     #: Whether `other` has the same shape and type.
     pub fn same_kind(self, other: Mat) -> bool {
         return self.rows == other.rows and self.cols == other.cols and self.flags == other.flags

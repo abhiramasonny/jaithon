@@ -30,7 +30,9 @@
 #: rectangle(frame, Point(10, 10), Point(90, 60), Scalar(0.0, 255.0, 0.0), 2)
 #: circle(frame, Point(50, 35), 12, Scalar(0.0, 0.0, 255.0), FILLED)
 #: ```
+import std.gpu as gpu
 import std.math
+from std.gpu import Buffer, Kernel
 from ..core.mat import Mat
 from ..core.types import depth_is_integer, depth_max, depth_min
 from ..core.types import LINE_4, LINE_8, LINE_AA, Point, Point2f, Rect, RotatedRect, Scalar, Size
@@ -88,14 +90,70 @@ fn from_fixed(point: Point) -> Point {
     return Point(point.x + (XY_ONE >> 1) >> XY_SHIFT, point.y + (XY_ONE >> 1) >> XY_SHIFT)
 }
 
-#: The surface a shape draws onto: an image, its host mirror, and one colour
-#: already saturated into the image's depth.
+#: The one kernel here. Every opaque shape is rows of a single colour, and
+#: this writes a batch of them in one go.
+#:
+#: A thread does one pixel of one row. `widest` is the longest row in the
+#: batch, so a thread's row is `id / widest` and its place along it the
+#: remainder; a row shorter than the widest leaves its late threads with
+#: nothing to do and they return. Rows of a rectangle are all the same length
+#: and none is wasted; a circle wastes the corners of its bounding box; a
+#: letter wastes almost nothing because every row of it is short.
+let SPAN_SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+kernel void fill_spans(device float* image [[buffer(0)]],
+                       device const float* spans [[buffer(1)]],
+                       device const float* colour [[buffer(2)]],
+                       constant uint& count [[buffer(3)]],
+                       constant uint& widest [[buffer(4)]],
+                       constant uint& channels [[buffer(5)]],
+                       constant uint& origin [[buffer(6)]],
+                       constant uint& stride [[buffer(7)]],
+                       uint id [[thread_position_in_grid]]) {
+    uint which = id / widest;
+    if (which >= count) return;
+    uint along = id - which * widest;
+    uint run = (uint)spans[which * 3u + 2u];
+    if (along >= run) return;
+    uint row = (uint)spans[which * 3u];
+    uint x = (uint)spans[which * 3u + 1u] + along;
+    uint base = origin + row * stride + x * channels;
+    for (uint c = 0u; c < channels; c++) image[base + c] = colour[c];
+}
+"""
+
+var _span_kernel: Kernel? = null
+
+fn span_kernel() -> Kernel {
+    let existing = _span_kernel
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(SPAN_SOURCE, "fill_spans")
+    _span_kernel = compiled
+    return compiled
+}
+
+#: How many idle threads a batch may carry before it is cheaper to draw on the
+#: host. A shape whose rows differ wildly in length -- one long row among many
+#: short ones -- would otherwise launch a thread per pixel of the bounding box.
+const SPAN_WASTE_CEILING = 64_000_000
+
+#: The surface a shape draws onto: an image, one colour already saturated into
+#: the image's depth, and either the host mirror or a batch of rows bound for
+#: the device.
 #:
 #: Every primitive below goes through this, so bounds checking and the blend
 #: rule are written once.
+#:
+#: Which side the drawing happens on is decided by where the pixels already
+#: are. An image the host is holding is drawn on there, because it is free. An
+#: image that lives on the device is drawn on there too, because bringing a
+#: 720p frame over costs a download and 44 MB of boxed numbers -- about 2 ms,
+#: against the tens of microseconds the rows cost as one dispatch. Only
+#: `blend`, which has to read what is already in the pixel, gives up and pulls
+#: the image over.
 pub class Painter {
     pub let image: Mat
-    pub let values: list[float]
     pub let rows: int
     pub let cols: int
     pub let cn: int
@@ -103,10 +161,15 @@ pub class Painter {
     pub let high: float
     pub let integral: bool
     pub let colour: list[float]
+    #: The host mirror, once something has needed it.
+    var mirror: list[float]?
+    #: Rows waiting for the device, three numbers each: row, first column, and
+    #: how many pixels.
+    var pending: list[float]
+    var widest: int
 
     pub fn init(self, image: Mat, colour: Scalar) {
         self.image = image
-        self.values = image.edit()
         self.rows = image.rows
         self.cols = image.cols
         self.cn = image.channels()
@@ -117,6 +180,29 @@ pub class Painter {
         var saturated: list[float] = []
         for channel in 0..self.cn { saturated.push(self.saturate(colour[min(channel, 3)])) }
         self.colour = saturated
+        self.pending = []
+        self.widest = 0
+        self.mirror = if self.device_capable() { null } else { image.edit() }
+    }
+
+    #: Whether rows can go to the device at all. An image already on the host,
+    #: or one with edits not yet pushed, is quicker to draw on there; and
+    #: without a device there is nowhere else to go.
+    fn device_capable(self) -> bool {
+        if not gpu.is_available() { return false }
+        if self.image.has_host_copy() or self.image.has_pending_edits() { return false }
+        return self.rows > 0 and self.cols > 0
+    }
+
+    #: The host mirror, pushing any rows already batched first so that what
+    #: comes back includes them.
+    fn on_host(self) -> list[float] {
+        let held = self.mirror
+        if held is not null { return held }
+        self.commit()
+        let values = self.image.edit()
+        self.mirror = values
+        return values
     }
 
     fn saturate(self, value: float) -> float {
@@ -130,8 +216,13 @@ pub class Painter {
     #: Write one pixel opaquely.
     pub fn plot(self, x: int, y: int) -> void {
         if x < 0 or y < 0 or x >= self.cols or y >= self.rows { return }
+        let held = self.mirror
+        if held is null {
+            self.queue(y, x, 1)
+            return
+        }
         let base = (y * self.cols + x) * self.cn
-        for channel in 0..self.cn { self.values[base + channel] = self.colour[channel] }
+        for channel in 0..self.cn { held[base + channel] = self.colour[channel] }
     }
 
     #: Write one pixel with `alpha` of the colour over what is already there.
@@ -142,30 +233,71 @@ pub class Painter {
             self.plot(x, y)
             return
         }
+        #: Reading the pixel back is what forces the image over.
+        let values = self.on_host()
         let base = (y * self.cols + x) * self.cn
         for channel in 0..self.cn {
-            let mixed = self.values[base + channel] * (1.0 - alpha) + self.colour[channel] * alpha
-            self.values[base + channel] = self.saturate(mixed)
+            let mixed = values[base + channel] * (1.0 - alpha) + self.colour[channel] * alpha
+            values[base + channel] = self.saturate(mixed)
         }
     }
 
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
     #:
-    #: One primitive rather than a `plot` a pixel. Every filled shape is made
-    #: of these, and a row written a pixel at a time cost about 11 ns a pixel
-    #: -- a filled rectangle over a 720p frame took 8.2 ms, more than the rest
-    #: of a camera frame put together.
+    #: One primitive or one batched row rather than a `plot` a pixel. Every
+    #: filled shape is made of these, and a row written a pixel at a time cost
+    #: about 11 ns a pixel -- a filled rectangle over a 720p frame took 8.2 ms,
+    #: more than the rest of a camera frame put together.
     pub fn span(self, x1: int, x2: int, y: int) -> void {
         if y < 0 or y >= self.rows { return }
         let start = max(x1, 0)
         let end = min(x2, self.cols - 1)
         if start > end { return }
+        let held = self.mirror
+        if held is null {
+            self.queue(y, start, end - start + 1)
+            return
+        }
         __prim__.list_fill_pattern(
-            self.values,
+            held,
             (y * self.cols + start) * self.cn,
             end - start + 1,
             self.colour
         )
+    }
+
+    #: Hold a row for the device, or give up and go to the host when the batch
+    #: has grown lopsided enough that the idle threads would cost more than
+    #: the download.
+    fn queue(self, y: int, x: int, run: int) -> void {
+        let widest = max(self.widest, run)
+        if (self.pending.len() // 3 + 1) * widest > SPAN_WASTE_CEILING {
+            let values = self.on_host()
+            __prim__.list_fill_pattern(values, (y * self.cols + x) * self.cn, run, self.colour)
+            return
+        }
+        self.widest = widest
+        self.pending.push(float(y))
+        self.pending.push(float(x))
+        self.pending.push(float(run))
+    }
+
+    #: Send the batched rows to the device.
+    fn commit(self) -> void {
+        let count = self.pending.len() // 3
+        if count == 0 { return }
+        let rows_buffer = Buffer.of(self.pending)
+        let colour_buffer = Buffer.of(self.colour)
+        span_kernel().dispatch_async(
+            [self.image.buffer(), rows_buffer, colour_buffer],
+            count * self.widest,
+            [count, self.widest, self.cn, self.image.data_offset(), self.image.step()]
+        )
+        rows_buffer.free()
+        colour_buffer.free()
+        self.pending = []
+        self.widest = 0
+        self.image.invalidate()
     }
 
     #: Push everything written back to the device.
@@ -174,7 +306,13 @@ pub class Painter {
     #: `Mat.buffer` pushes them the moment anything reads the device, so a
     #: sequence of primitives -- the boxes and labels an overlay is made of --
     #: pays for one upload between them all instead of one each.
-    pub fn finish(self) -> void { self.image.mark_edited() }
+    pub fn finish(self) -> void {
+        if self.mirror is null {
+            self.commit()
+            return
+        }
+        self.image.mark_edited()
+    }
 }
 
 #: Clip a segment to a `width x height` rectangle.
