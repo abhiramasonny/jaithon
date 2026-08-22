@@ -44,6 +44,7 @@ def main() -> int:
     colour = picture(3)
     small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     wide = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    square = ((np.arange(1024 * 1024, dtype=np.int64) * 37 % 251).astype(np.float32) / 251.0).reshape(1024, 1024)
 
     run("cvt-gray", repeats, lambda: cv2.cvtColor(colour, cv2.COLOR_BGR2GRAY))
     run("blur-3", repeats, lambda: cv2.GaussianBlur(grey, (3, 3), 0))
@@ -55,6 +56,7 @@ def main() -> int:
     run("erode-15", repeats, lambda: cv2.erode(grey, wide))
     run("resize-half", repeats, lambda: cv2.resize(colour, (WIDTH // 2, HEIGHT // 2)))
     run("pyr-down", repeats, lambda: cv2.pyrDown(grey))
+    run("dft", repeats, lambda: cv2.dft(square, flags=cv2.DFT_COMPLEX_OUTPUT))
     return 0
 
 

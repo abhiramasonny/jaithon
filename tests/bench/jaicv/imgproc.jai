@@ -71,6 +71,10 @@ fn main() -> int {
     let grey = picture(1)
     let colour = picture(3)
     let small = get_structuring_element(MORPH_RECT, Size(3, 3))
+    #: A power of two a side, which is what a transform is given in practice.
+    var square_values: list[float] = []
+    for index in 0..1024 * 1024 { square_values.push(float(index * 37 % 251) / 251.0) }
+    let square = Mat.from_list(1024, 1024, cv.CV_32FC1, square_values)
     let wide = get_structuring_element(MORPH_RECT, Size(15, 15))
 
     run("cvt-gray", repeats, || cv.cvt_color(colour, cv.COLOR_BGR2GRAY))
@@ -83,5 +87,8 @@ fn main() -> int {
     run("erode-15", repeats, || erode(grey, wide))
     run("resize-half", repeats, || cv.resize(colour, Size(WIDTH // 2, HEIGHT // 2)))
     run("pyr-down", repeats, || cv.pyr_down(grey))
+    #: A transform of the whole frame. Here because it used to run on the host
+    #: and cost seconds, which no benchmark would have noticed.
+    run("dft", repeats, || cv.dft(square))
     return 0
 }
