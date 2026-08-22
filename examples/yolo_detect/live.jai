@@ -11,8 +11,8 @@
 #:     --record FILE  also write an AVI of what is shown
 #:     --headless     do not open a window (for --video with --record)
 #:
-#: On an M2 Max a 720p frame costs about 5.2 ms all in, so detecting on every
-#: frame runs at around 193 fps and the camera, not the detector, sets the
+#: On an M2 Max a 720p frame costs about 5.1 ms all in, so detecting on every
+#: frame runs at around 197 fps and the camera, not the detector, sets the
 #: pace. The model is interpreted on the first frame and compiled after, so the
 #: first one is slower than the rest by a wide margin.
 #:
@@ -20,7 +20,7 @@
 #: than one after the other: the loop hands the GPU frame N and then draws
 #: frame N-1 on the processor while it works, so a frame costs the slower of
 #: the two halves instead of their sum. The same loop written one step after
-#: another measures about 6.6 ms. What is on screen is therefore one frame
+#: another measures about 6.5 ms. What is on screen is therefore one frame
 #: behind the camera, which at this rate is under six milliseconds.
 #:
 #: `--every N` runs the network on one frame in N and keeps drawing the last
