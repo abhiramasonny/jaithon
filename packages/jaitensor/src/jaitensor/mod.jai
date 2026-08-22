@@ -22,7 +22,7 @@ from .layers import Activate, Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense,
 from .losses import Loss, BinaryCrossentropy, MeanSquaredError, SparseCategoricalCrossentropy
 from .model import History, Metrics, Sequential
 from .plan import ExecutionPlan
-from .ops import add, add_correct_into, add_scaled_into, abs as abs_op, amax, argmax, avg_pool2d, batch_norm, cat, clamp, conv2d, conv2d_nchw, divide, dropout, exp, gather_rows, gelu, layer_norm, leaky_relu, log, matmul, maximum, mean, minimum, mse, multiply, neg, one_hot
+from .ops import add, add_correct_into, add_scaled_into, abs as abs_op, amax, argmax, avg_pool2d, batch_norm, cat, clamp, conv2d, conv2d_nchw, divide, dropout, exp, gather_rows, gelu, layer_norm, leaky_relu, log, matmul, max_with_index, maximum, mean, minimum, mse, multiply, neg, one_hot
 from .ops import relu, reshape, rsqrt, scale, scaled_dot_product_attention, sigmoid, silu, slice_flat, softmax, sqrt, square, squeeze, stack, subtract, sum as reduce_sum, tanh, transpose, unsqueeze, where, max_pool2d, pad2d, permute, pow, repeat, nchw, nhwc, binary_cross_entropy, binary_cross_entropy_with_logits, eye, flip, upsample_nearest2d, split_heads, merge_heads, multi_head_attention, group_norm, tril
 from .optimizers import Adam, Optimizer, SGD, zero_grad
 from .plots import save_history_plot
@@ -34,7 +34,7 @@ export { Optimizer, SGD, Adam, zero_grad, Loss, BinaryCrossentropy, MeanSquaredE
 export { History, Metrics, Sequential, ExecutionPlan }
 export { save_history_plot }
 export { add, subtract, multiply, divide, scale, reshape, matmul, transpose, conv2d, conv2d_nchw, cat }
-export { relu, sigmoid, tanh, gelu, silu, leaky_relu, exp, log, abs, neg, sqrt, rsqrt, square, softmax, amax, argmax, one_hot, slice_flat }
+export { relu, sigmoid, tanh, gelu, silu, leaky_relu, exp, log, abs, neg, sqrt, rsqrt, square, softmax, amax, argmax, max_with_index, one_hot, slice_flat }
 export { clamp, maximum, minimum, sum, mean, max_pool2d, avg_pool2d, dropout, mse, where, pow, squeeze, unsqueeze, stack, pad2d, permute, repeat, nchw, nhwc, binary_cross_entropy, binary_cross_entropy_with_logits }
 export { batch_norm, layer_norm, group_norm, scaled_dot_product_attention, gather_rows }
 export { eye, flip, upsample_nearest2d, split_heads, merge_heads, multi_head_attention, tril }

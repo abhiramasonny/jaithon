@@ -60,13 +60,13 @@ own `bus.jpg` it finds four people and a bus, which is the published result.
 
 On an M2 Max the network costs about 3.2 ms for one 640x640 input, and a 720p
 frame end to end -- letterbox, network, decode, drawing, display -- costs about
-5.6 ms, so detecting on every frame runs at roughly 178 fps and the camera sets
+5.2 ms, so detecting on every frame runs at roughly 193 fps and the camera sets
 the pace rather than the detector.
 
 That is with the network and the imaging running at the same time. `live.jai`
 hands the GPU frame N and then draws frame N-1 while it works, so a frame costs
 the slower of the two halves instead of their sum: the same loop written one
-step after another measures about 7 ms, or 143 fps. What is on screen is one
+step after another measures about 6.6 ms, or 151 fps. What is on screen is one
 frame behind the camera as a result.
 
 The overlap works because the drawing is done on the processor, writing
