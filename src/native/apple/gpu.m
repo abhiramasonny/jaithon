@@ -1607,8 +1607,8 @@ static bool ndarrayWindowIsPacked(NSArray<NSNumber *> *shape) {
     return (innermost * sizeof(float)) % 16 == 0;
 }
 
-static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset, NSArray<NSNumber *> *shape) {
-    mark(b);
+static MPSGraphTensorData *graphDataAt(JaiGpuBuffer *b, size_t offset,
+                                      NSArray<NSNumber *> *shape) {
     NSUInteger count = 1;
     for (NSNumber *dim in shape) count *= dim.unsignedIntegerValue;
     const size_t bytes = (size_t)count * sizeof(float);
@@ -1626,6 +1626,22 @@ static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset, NSArray<NSN
     MPSNDArray *array = [[MPSNDArray alloc] initWithBuffer:buf offset:offset descriptor:desc];
     if (array == nil) return nil;
     return [[MPSGraphTensorData alloc] initWithMPSNDArray:array];
+}
+
+static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset,
+                                     NSArray<NSNumber *> *shape) {
+    mark(b);
+    return graphDataAt(b, offset, shape);
+}
+
+/* The same window, without marking the buffer: a caller that decides for itself
+ * which batch the work lands in has to mark it then, not now. Hands back an
+ * MPSGraphTensorData at +1 for the caller to take over, or NULL when the window
+ * cannot be addressed. */
+void *jaiGpuTensorDataAt(JaiGpuBuffer *b, size_t offset, void *shape) {
+    if (b == NULL || shape == NULL) return NULL;
+    NSArray<NSNumber *> *dims = (__bridge NSArray<NSNumber *> *)shape;
+    return (__bridge_retained void *)graphDataAt(b, offset, dims);
 }
 
 static MPSGraphTensorData *graphDataDesc(JaiGpuBuffer *b, size_t offset, size_t bytes,

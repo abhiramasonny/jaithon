@@ -250,6 +250,13 @@ void jaiGpuBufferMark(JaiGpuBuffer *b) {
     (void)b;
 }
 
+void *jaiGpuTensorDataAt(JaiGpuBuffer *b, size_t offset, void *shape) {
+    (void)b;
+    (void)offset;
+    (void)shape;
+    return NULL;
+}
+
 bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
                          size_t bOffset, JaiGpuBuffer *out, size_t outOffset,
                          uint32_t m, uint32_t k, uint32_t n, bool transA,

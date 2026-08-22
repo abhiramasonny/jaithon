@@ -348,3 +348,67 @@ fn test_adam_is_carried_through_the_graph() -> void {
     }
     step.free()
 }
+
+#: A batch cut out of a bigger tensor has to train on its own rows.
+#:
+#: The graph is handed a device buffer, and a slice is that buffer with an
+#: origin. Binding it from the start instead trains on the first batch of the
+#: epoch every time -- the reported loss still falls, because it really is
+#: fitting the rows it keeps being shown, so nothing looks wrong until the
+#: model is asked about the rest of the data.
+fn test_a_compiled_step_reads_the_slice_it_was_given() -> void {
+    if not gpu.is_available() { return }
+    let width = 16
+    let rng = Random.with_seed(4)
+    var rows: list[float] = []
+    for index in 0..2 * BATCH * width { rows.push(rng.next_float() * 2.0 - 1.0) }
+    let pool = Tensor([2 * BATCH, width], rows)
+    defer { pool.free() }
+    var answers: list[float] = []
+    for index in 0..BATCH { answers.push(float(index % CLASSES)) }
+    let y = Tensor([BATCH], answers)
+    defer { y.free() }
+
+    #: The same rows twice: once as a window into `pool`, once on their own.
+    let second = pool.view(BATCH * width, [BATCH, width])
+    defer { second.free() }
+    var copied: list[float] = []
+    for slot in 0..BATCH * width { copied.push(rows[BATCH * width + slot]) }
+    let alone = Tensor([BATCH, width], copied)
+    defer { alone.free() }
+
+    let through_view = losses_from(dense_only(6), second, y, [BATCH, width])
+    let on_its_own = losses_from(dense_only(6), alone, y, [BATCH, width])
+    assert_eq(through_view.len(), on_its_own.len())
+    for index in 0..through_view.len() {
+        assert_near(
+            through_view[index],
+            on_its_own[index],
+            1e-5,
+            f"step {index} read different rows through the view"
+        )
+    }
+}
+
+fn dense_only(seed: int) -> list[Layer] {
+    let rng = Random.with_seed(seed)
+    let layers: list[Layer] = [
+        Dense(12, activation: Activation.Relu),
+        Dense(CLASSES, activation: Activation.Linear),
+    ]
+    var current = [16]
+    for layer in layers {
+        layer.build_from_shape(current, rng)
+        current = layer.output_shape()
+    }
+    return layers
+}
+
+fn losses_from(layers: list[Layer], x: Tensor, y: Tensor, shape: list[int]) -> list[float] {
+    let step = compile_step(layers, shape, CLASSES, RATE)
+    assert_true(step is not null, f"would not compile: {refusal()}")
+    var seen: list[float] = []
+    for _iteration in 0..4 { seen.push(step.run(x, y)) }
+    step.free()
+    return seen
+}
