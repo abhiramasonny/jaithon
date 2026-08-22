@@ -478,6 +478,7 @@ pub class ORB {
         }
 
         var ordered: list[KeyPoint] = []
+        var allowed: list[KeyPoint] = []
         for point in found {
             if mask_image is not null {
                 let mx = int(point.pt.x)
@@ -485,10 +486,12 @@ pub class ORB {
                 if mx < 0 or my < 0 or mx >= image.cols or my >= image.rows { continue }
                 if mask_values[my * image.cols + mx] == 0.0 { continue }
             }
-            var at = ordered.len()
-            while at > 0 and point.response > ordered[at - 1].response { at -= 1 }
-            ordered.insert(at, point)
+            allowed.push(point)
         }
+        #: Strongest first. Every level of the pyramid contributes its corners
+        #: here, which on a textured frame is tens of thousands, and placing
+        #: each into a list already in order costs the square of that.
+        ordered = allowed.sort(key: |point| point.response, reverse: true)
         if self.n_features > 0 and ordered.len() > self.n_features {
             var trimmed: list[KeyPoint] = []
             for index in 0..self.n_features { trimmed.push(ordered[index]) }
