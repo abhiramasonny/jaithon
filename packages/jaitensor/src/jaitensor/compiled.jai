@@ -13,13 +13,21 @@
 #: any model whose layers can be expressed.
 #:
 #: A model that cannot be expressed compiles to nothing and the caller keeps
-#: the ordinary path; `reason_uncompilable` says which layer stopped it.
+#: the ordinary path; `refusal` says which layer stopped it.
+#:
+#: One step of this and one step of the ordinary path agree to about a part in
+#: a billion -- the same arithmetic in a different order. Over many steps they
+#: drift apart, as any two orderings of float32 do once a ReLU is in the way:
+#: a value either side of zero takes a different branch and the two runs are
+#: on slightly different trajectories from then on. Both are training the same
+#: model correctly; neither is the reference for the other.
 #:
 #: ```
 #: let step = CompiledStep.of(model, batch_size, learning_rate)
 #: if step is not null { step.run(features, labels) }
 #: ```
 import std.gpu as gpu
+from std.os import env
 from std.gpu import Buffer
 from .layers import Activation, Conv2d, Dense, Flatten, Layer, MaxPool2d
 from .tensor import Tensor
@@ -237,13 +245,16 @@ pub class CompiledStep {
         self.freed = false
     }
 
-    #: One step: the loss over this batch, with every parameter moved.
-    pub fn run(self, features: Tensor, labels: Tensor) -> float {
+    #: One step, leaving the loss on the device.
+    #:
+    #: `scores` receives the batch's logits, which is what an accuracy count
+    #: needs and what the graph is producing anyway. `into` receives the loss.
+    #: Neither is read here: a training loop that read the loss every step
+    #: would wait for the device every step, which costs more than the step.
+    pub fn step_into(self, features: Tensor, labels: Tensor, scores: Tensor, into: Tensor) -> void {
         if self.freed { throw RuntimeError("this CompiledStep has been released") }
         var feeds: list[int] = [features.buffer().handle_of(), labels.buffer().handle_of()]
-        var results: list[int] = []
-        let loss = Tensor([1])
-        results.push(loss.buffer().handle_of())
+        var results: list[int] = [into.buffer().handle_of(), scores.buffer().handle_of()]
         for (index, param) in self.params.enumerate() {
             let own = param.buffer()
             let other = self.shadow[index]
@@ -254,8 +265,17 @@ pub class CompiledStep {
         }
         __prim__.graph_run(self.handle, feeds, results)
         self.live_is_shadow = not self.live_is_shadow
+    }
+
+    #: One step, waiting for the loss. For a caller that wants it now, which a
+    #: training loop should not.
+    pub fn run(self, features: Tensor, labels: Tensor, scores: Tensor? = null) -> float {
+        let logits = scores ?? Tensor([self.batch_size, self.classes])
+        let loss = Tensor([1])
+        self.step_into(features, labels, logits, loss)
         let value = loss.download()[0]
         loss.free()
+        if scores is null { logits.free() }
         return value
     }
 
@@ -287,6 +307,17 @@ var _refusal: str? = null
 
 pub fn refusal() -> str? { return _refusal }
 
+var _allowed = -1
+
+#: `JAITENSOR_COMPILED_STEP=0` keeps every model on the ordinary path, for
+#: telling a difference in speed from a difference in arithmetic.
+fn allowed() -> bool {
+    if _allowed < 0 {
+        _allowed = if (env("JAITENSOR_COMPILED_STEP") ?? "1") == "0" { 0 } else { 1 }
+    }
+    return _allowed == 1
+}
+
 #: Build a compiled step for `layers`, or null when they cannot be expressed.
 #:
 #: `input_shape` is one batch's worth including the batch dimension. Only plain
@@ -298,6 +329,10 @@ pub fn compile_step(
     classes: int,
     learning_rate: float
 ) -> CompiledStep? {
+    if not allowed() {
+        _refusal = "compiled steps are switched off"
+        return null
+    }
     if not gpu.is_available() {
         _refusal = "there is no device to compile for"
         return null
@@ -352,7 +387,7 @@ pub fn compile_step(
 
     var inputs: list[int] = [features, labels]
     for id in state.param_ids { inputs.push(id) }
-    var outputs: list[int] = [loss]
+    var outputs: list[int] = [loss, carried.value]
     for id in updated { outputs.push(id) }
 
     let handle = __prim__.graph_compile(builder, inputs, outputs)

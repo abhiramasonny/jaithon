@@ -6,9 +6,10 @@ from std.random import Random
 from std.time import Instant
 from .data import DataLoader, Dataset
 from .layers import Layer
-from .ops import add_correct_into, argmax, copy_into, softmax, warmup_kernels as warmup_ops
+from .ops import add_correct_into, add_scaled_into, argmax, copy_into, softmax, warmup_kernels as warmup_ops
 from .optimizers import Optimizer, SGD, reset_state, prepare_state, warmup_kernels as warmup_opt
 from .losses import Loss, SparseCategoricalCrossentropy, sparse_ce_with_delta, warmup_kernels as warmup_loss
+from .compiled import CompiledStep, compile_step, refusal as compile_refusal
 from .plan import ExecutionPlan
 from .plots import save_history_plot
 from .tensor import Tensor
@@ -91,6 +92,8 @@ pub class Sequential {
     var freed: bool
     var cached_parameters: list[Tensor]?
     var fused_sgd: bool
+    var compiled_step: CompiledStep?
+    var compiled_for: str
     var fused_mlp_step: bool
     var plan_value: ExecutionPlan?
     var mixed_precision: bool
@@ -106,6 +109,8 @@ pub class Sequential {
         self.freed = false
         self.cached_parameters = null
         self.fused_sgd = false
+        self.compiled_step = null
+        self.compiled_for = ""
         self.fused_mlp_step = false
         self.plan_value = null
         self.mixed_precision = false
@@ -383,6 +388,38 @@ pub class Sequential {
         if optimizer is not null and not self.fused_sgd {
             prepare_state(self._parameters(), optimizer.settings())
         }
+        self._try_compiling(dataset, batch_size, classes)
+    }
+
+    #: Build the whole step as one graph when the model allows it.
+    #:
+    #: Only worth trying for the models the hand-fused paths do not already
+    #: cover, and only for plain SGD: momentum carries state from one step to
+    #: the next, which would have to live inside the graph too.
+    fn _try_compiling(self, dataset: Dataset, batch_size: int, classes: int) -> void {
+        if self.fused_sgd or self.fused_mlp_step { return }
+        let loss = self.loss_value
+        let optimizer = self.optimizer_value
+        if loss is null or not loss.is_sparse_categorical() { return }
+        if optimizer is null or optimizer.kind() != 0 { return }
+        let settings = optimizer.settings()
+        if settings.len() < 2 or settings[1] != 0.0 { return }
+        let image = dataset.image_shape
+        if image is null or image.len() != 3 { return }
+        var shape = [batch_size]
+        for dimension in image { shape.push(dimension) }
+
+        #: Kept between calls when nothing about it has changed. Building the
+        #: graph is the expensive part -- the platform compiles the whole step,
+        #: forward, backward and update together -- and an epoch of a small
+        #: dataset is only a few dozen batches to spread that over. Fitting
+        #: twice used to pay for it twice.
+        let wanted = f"{shape} {classes} {settings[0]}"
+        if self.compiled_step is not null and self.compiled_for == wanted { return }
+        let existing = self.compiled_step
+        if existing is not null { existing.free() }
+        self.compiled_step = compile_step(self.layers, shape, classes, settings[0])
+        self.compiled_for = if self.compiled_step is null { "" } else { wanted }
     }
 
     fn _build_from_dataset(self, dataset: Dataset) -> void {
@@ -447,6 +484,10 @@ pub class Sequential {
         }
         if training and self.fused_mlp_step {
             return self._run_fused_bwd_epoch(dataset, batch_size)
+        }
+        let compiled = self.compiled_step
+        if training and compiled is not null and dataset.samples >= batch_size {
+            return self._run_compiled_epoch(compiled, dataset, batch_size)
         }
         if self._static_step_active(batch_size) {
             return self._run_static_epoch(dataset, batch_size, training)
@@ -1014,6 +1055,64 @@ pub class Sequential {
         optimizer.step(self._parameters())
         loss.free()
         return activations
+    }
+
+    #: One epoch through the compiled step.
+    #:
+    #: The plan is built for one batch size, so a short last batch is left to
+    #: the ordinary path rather than run against a graph that does not fit it.
+    fn _run_compiled_epoch(self, step: CompiledStep, dataset: Dataset, batch_size: int) -> Metrics {
+        let total_correct = Tensor.zeros([1])
+        defer { total_correct.free() }
+        let scores = Tensor([batch_size, step.classes])
+        defer { scores.free() }
+        let batch_loss = Tensor.zeros([1])
+        defer { batch_loss.free() }
+        let total_loss = Tensor.zeros([1])
+        defer { total_loss.free() }
+        var seen = 0
+        var start = 0
+        let loader = if self.shuffle_batches {
+            DataLoader(dataset, batch_size, shuffle: true)
+        } else {
+            null
+        }
+        while start < dataset.samples {
+            var count = min(batch_size, dataset.samples - start)
+            var batch_features: Tensor
+            var batch_labels: Tensor
+            if loader is not null {
+                if not loader.has_next() { break }
+                let (features, labels) = loader.next_batch()
+                batch_features = features
+                batch_labels = labels
+                count = batch_features.shape[0]
+            } else {
+                batch_features = self._slice_features(dataset, start, count)
+                batch_labels = self._slice_labels(dataset, start, count)
+            }
+            if count != batch_size {
+                batch_features.free()
+                batch_labels.free()
+                start += count
+                continue
+            }
+            step.step_into(batch_features, batch_labels, scores, batch_loss)
+            #: Kept on the device and summed there. Reading the loss here would
+            #: wait for the step that produced it, every batch.
+            add_scaled_into(batch_loss, total_loss, count)
+            seen += count
+            add_correct_into(scores, batch_labels, total_correct)
+            batch_features.free()
+            batch_labels.free()
+            start += count
+            gpu.flush()
+        }
+        step.settle()
+        let loss_values = total_loss.download()
+        let correct_values = total_correct.download()
+        let counted = if seen > 0 { float(seen) } else { 1.0 }
+        return Metrics(loss_values[0] / counted, 100.0 * correct_values[0] / counted)
     }
 
     fn _run_static_epoch(self, dataset: Dataset, batch_size: int, training: bool) -> Metrics {
