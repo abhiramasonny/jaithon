@@ -330,15 +330,19 @@ kernel void geo_pyr_up(device const float* src [[buffer(0)]],
         if ((sy2 & 1) != 0) continue;
         int fy = border_index(sy2, up_rows, border);
         if (fy < 0) continue;
+        /* Resolved against the upsampled grid already, so halving lands inside
+         * the source and reading it needs no further border work. Going back
+         * through `fetch` here resolves both axes a second time, per tap. */
+        uint row_base = src_off + uint(fy / 2) * src_step + channel;
+        float run = 0.0f;
         for (int dx = -2; dx <= 2; ++dx) {
             int sx2 = int(x) + dx;
             if ((sx2 & 1) != 0) continue;
             int fx = border_index(sx2, up_cols, border);
             if (fx < 0) continue;
-            total += kPyramidKernel[dy + 2] * kPyramidKernel[dx + 2] *
-                     fetch(src, fy / 2, fx / 2, channel, rows, cols, cn,
-                           src_off, src_step, border, 0.0f);
+            run += kPyramidKernel[dx + 2] * src[row_base + uint(fx / 2) * cn];
         }
+        total += kPyramidKernel[dy + 2] * run;
     }
     put(dst, dst_off + y * dst_step + x * cn + channel, total * 4.0f,
         as_type<float>(low_bits), as_type<float>(high_bits), integral);

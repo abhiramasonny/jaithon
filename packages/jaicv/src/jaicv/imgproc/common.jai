@@ -78,11 +78,25 @@ inline float sample_linear(device const float* src, float y, float x, uint chann
     int x0 = int(floor(x));
     float fy = y - float(y0);
     float fx = x - float(x0);
-    float v00 = fetch(src, y0, x0, channel, rows, cols, cn, off, step, border, constant_value);
-    float v01 = fetch(src, y0, x0 + 1, channel, rows, cols, cn, off, step, border, constant_value);
-    float v10 = fetch(src, y0 + 1, x0, channel, rows, cols, cn, off, step, border, constant_value);
-    float v11 = fetch(src, y0 + 1, x0 + 1, channel, rows, cols, cn, off, step,
-                      border, constant_value);
+    float v00, v01, v10, v11;
+    /* The four corners are one step apart, so when the top-left one is inside
+     * the picture with room to spare they all are, and none of the border
+     * arithmetic applies. `fetch` resolves both axes for each corner: eight
+     * bounds-resolutions per sample, for a bilinear tap that is almost always
+     * in the middle of the picture. */
+    if (y0 >= 0 && x0 >= 0 && y0 + 1 < int(rows) && x0 + 1 < int(cols)) {
+        uint at = off + uint(y0) * step + uint(x0) * cn + channel;
+        v00 = src[at];
+        v01 = src[at + cn];
+        v10 = src[at + step];
+        v11 = src[at + step + cn];
+    } else {
+        v00 = fetch(src, y0, x0, channel, rows, cols, cn, off, step, border, constant_value);
+        v01 = fetch(src, y0, x0 + 1, channel, rows, cols, cn, off, step, border, constant_value);
+        v10 = fetch(src, y0 + 1, x0, channel, rows, cols, cn, off, step, border, constant_value);
+        v11 = fetch(src, y0 + 1, x0 + 1, channel, rows, cols, cn, off, step,
+                    border, constant_value);
+    }
     float top = v00 + (v01 - v00) * fx;
     float bottom = v10 + (v11 - v10) * fx;
     return top + (bottom - top) * fy;
