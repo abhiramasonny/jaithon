@@ -899,4 +899,15 @@ fn test_hough_finds_the_circle_it_was_given() -> void {
     assert_near(found[0].centre.x, centre, 2.0, "the centre is where it was drawn")
     assert_near(found[0].centre.y, centre, 2.0, "the centre is where it was drawn")
     assert_near(found[0].radius, drawn, 2.0, "the radius is what it was drawn at")
+
+    #: Dropped to a threshold where the marginal centres matter. Thirty is what
+    #: the transform finds when the votes land where full precision puts them;
+    #: a vote rounded into the next cell loses some of them, which is what a
+    #: separate multiply and add in the kernel did. Asking for at least thirty
+    #: catches that without pinning the exact number.
+    let marginal = hough_circles(image, 1.0, 10.0, 60.0, 12.0, 5, 35)
+    assert_true(
+        marginal.len() >= 30,
+        f"a looser threshold found {marginal.len()} circles, expected at least 30"
+    )
 }
