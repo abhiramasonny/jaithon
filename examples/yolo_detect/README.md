@@ -60,15 +60,20 @@ own `bus.jpg` it finds four people and a bus, which is the published result.
 
 On an M2 Max the network costs about 3.2 ms for one 640x640 input, and a 720p
 frame end to end -- letterbox, network, decode, drawing, display -- costs about
-7.7 ms, so detecting on every frame runs at roughly 130 fps and the camera sets
+5.6 ms, so detecting on every frame runs at roughly 178 fps and the camera sets
 the pace rather than the detector.
 
-The loop is a straightforward one thing after another. Handing the GPU frame N
-and then drawing frame N-1 while it works was worth about a third once, back
-when the drawing was done on the processor; it is not any more, because the
-drawing now happens on the device as well and lands behind the network in the
-same queue. Overlapping the two again would take a second command queue for
-the display path, which is not written.
+That is with the network and the imaging running at the same time. `live.jai`
+hands the GPU frame N and then draws frame N-1 while it works, so a frame costs
+the slower of the two halves instead of their sum: the same loop written one
+step after another measures about 7 ms, or 143 fps. What is on screen is one
+frame behind the camera as a result.
+
+The overlap works because the drawing is done on the processor, writing
+straight into the frame's own memory -- device storage is shared, so there is
+nothing to copy and nothing to queue. Drawing with a kernel instead was tried
+and is slightly quicker on its own, but it lands on the same queue as the
+network and runs after it, so a frame costs the sum again.
 
 `--every N` is not needed at this rate and is there for a slower machine or a
 larger model.

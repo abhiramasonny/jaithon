@@ -26,7 +26,7 @@ let SPECIFIED = [
     # collections
     "list_new", "list_get", "list_set", "list_push", "list_pop", "list_insert",
     "list_remove", "list_len", "list_slice", "list_concat", "list_filled",
-    "list_pack_argb", "list_fill_pattern",
+    "list_pack_argb",
     "fill_span", "draw_line", "fill_convex",
     "dict_new", "dict_get", "dict_set", "dict_del", "dict_has", "dict_len",
     "dict_keys", "dict_values",
