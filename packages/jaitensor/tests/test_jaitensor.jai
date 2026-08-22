@@ -2492,3 +2492,65 @@ fn test_linear_residual_refuses_a_residual_of_the_wrong_shape() -> void {
     defer { wrong.free() }
     assert_throws(ValueError, || jt.linear_residual(x, w, wrong))
 }
+
+#: A row wider than the threadgroup that reduces it.
+#:
+#: These reductions used to run one thread to a row, so a row of any width was
+#: one thread's serial walk and the width never mattered. Now the group strides
+#: the row, and a row of 1000 takes four passes with a partial per thread to
+#: combine -- which is the case a row of four never reaches.
+fn test_wide_rows_reduce_the_same_as_narrow_ones() -> void {
+    if not jt.is_available() { return }
+    let rows = 3
+    let columns = 1000
+    var values: list[float] = []
+    for row in 0..rows {
+        for column in 0..columns {
+            values.push(float((row * 7 + column * 13) % 101) * 0.01)
+        }
+    }
+    #: One unmistakable peak per row, past where a single group would stop.
+    values[0 * columns + 700] = 9.5
+    values[1 * columns + 999] = 9.5
+    values[2 * columns + 0] = 9.5
+    let x = jt.Tensor([rows, columns], values)
+    defer { x.free() }
+
+    let totals = jt.sum(x, axis: -1).download()
+    let averages = jt.mean(x, axis: -1).download()
+    let peaks = jt.amax(x, axis: -1).download()
+    let where = jt.argmax(x).download()
+    let (also_peaks, also_where) = jt.max_with_index(x)
+    defer { also_peaks.free() }
+    defer { also_where.free() }
+    let peak_values = also_peaks.download()
+    let peak_places = also_where.download()
+
+    let wanted = [700.0, 999.0, 0.0]
+    for row in 0..rows {
+        var total = 0.0
+        for column in 0..columns { total += values[row * columns + column] }
+        assert_near(totals[row], total, total * 1e-5 + 1e-4, f"row {row} total")
+        assert_near(averages[row], total / float(columns), 1e-5, f"row {row} mean")
+        assert_near(peaks[row], 9.5, 1e-6, f"row {row} peak")
+        assert_near(where[row], wanted[row], 1e-6, f"row {row} peak position")
+        assert_near(peak_values[row], 9.5, 1e-6, f"row {row} peak, together")
+        assert_near(peak_places[row], wanted[row], 1e-6, f"row {row} position, together")
+    }
+}
+
+#: Every element equal: the first one wins, whichever thread happened to see it.
+fn test_a_wide_row_of_ties_keeps_the_first() -> void {
+    if not jt.is_available() { return }
+    let columns = 700
+    var values: list[float] = []
+    for _column in 0..columns { values.push(2.5) }
+    let x = jt.Tensor([1, columns], values)
+    defer { x.free() }
+    assert_near(jt.argmax(x).download()[0], 0.0, 1e-6, "a row of ties should keep the first")
+    let (peak, place) = jt.max_with_index(x)
+    defer { peak.free() }
+    defer { place.free() }
+    assert_near(peak.download()[0], 2.5, 1e-6)
+    assert_near(place.download()[0], 0.0, 1e-6, "a row of ties should keep the first")
+}
