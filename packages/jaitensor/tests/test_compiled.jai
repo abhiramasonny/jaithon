@@ -250,3 +250,53 @@ fn test_every_expressible_activation_matches_the_layer() -> void {
         step.free()
     }
 }
+
+#: Momentum, and Nesterov momentum, carried through the graph rather than left
+#: to the ordinary path.
+#:
+#: The velocity lives in the graph as another pair of tensors, fed in and
+#: produced, so a step of it has to land where the optimizer's own kernel lands.
+fn test_momentum_is_carried_through_the_graph() -> void {
+    if not gpu.is_available() { return }
+    for nesterov in [false, true] {
+        let (x, y) = batch()
+        let step = compile_step(
+            convolutional(5),
+            [BATCH, SIDE, SIDE, CHANNELS],
+            CLASSES,
+            RATE,
+            0.9,
+            nesterov
+        )
+        assert_true(step is not null, f"momentum would not compile: {refusal()}")
+        #: More than one step, because a velocity that is not carried looks
+        #: right on the first one and wrong on every one after it.
+        for _iteration in 0..4 { step.run(x, y) }
+        step.settle()
+
+        let layers = convolutional(5)
+        let loss = SparseCategoricalCrossentropy(from_logits: true)
+        let optimizer = SGD(learning_rate: RATE, momentum: 0.9, nesterov: nesterov)
+        var params: list[Tensor] = []
+        for layer in layers {
+            for param in layer.parameters() { params.push(param) }
+        }
+        prepare_state(params, optimizer.settings())
+        for _iteration in 0..4 {
+            var carried = x
+            for layer in layers { carried = layer.forward(carried) }
+            loss.forward(carried, y).backward()
+            optimizer.step(params)
+            for param in params { param.grad = null }
+        }
+
+        for (index, param) in step.params.enumerate() {
+            let got = param.download()
+            let want = params[index].download()
+            for slot in 0..got.len() {
+                assert_near(got[slot], want[slot], 1e-4, f"nesterov {nesterov} parameter {index}")
+            }
+        }
+        step.free()
+    }
+}
