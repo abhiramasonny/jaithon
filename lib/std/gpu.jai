@@ -316,6 +316,24 @@ pub class Buffer {
         return __prim__.gpu_buffer_download_u8(self.handle, offset, wanted, scale)
     }
 
+    #: Read `count` slots back as one `0xAARRGGBB` integer per pixel.
+    #:
+    #: What a window's back buffer holds, in one pass. Narrowing to bytes and
+    #: then packing those is two walks over the frame with a byte string in
+    #: between that nothing else wants.
+    pub fn pack_argb(
+        self,
+        offset: int = 0,
+        count: int? = null,
+        channels: int = 3,
+        scale: float = 1.0
+    ) -> list[int] {
+        self._check_live()
+        if scale == 0.0 { throw ValueError("pack_argb scale must not be zero") }
+        let wanted = count ?? self.count - offset
+        return __prim__.gpu_buffer_pack_argb(self.handle, offset, wanted, channels, scale)
+    }
+
     #: Fill every slot with a uniform sample in `[low, high)` on the device.
     pub fn fill_uniform(self, low: float, high: float, seed: int) -> void {
         self._check_live()

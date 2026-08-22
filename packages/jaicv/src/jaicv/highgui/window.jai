@@ -144,10 +144,18 @@ fn packed(image: Mat) -> list[int] {
     #: half million calls for a single 720p frame -- about 18 ms, more than
     #: everything else a camera preview did per frame put together, and what
     #: held the loop near 13 fps whatever it was showing.
-    #: `to_bytes` rather than `values`: the device narrows the pixels on the
-    #: way out, so nothing here ever builds a list of 2.8 million floats to
-    #: read one byte out of each.
-    return __prim__.list_pack_argb(image.to_bytes(), image.channels())
+    #:
+    #: Read from wherever the pixels already are, and in one pass either way.
+    #: A frame the host is holding is packed out of that; one that is still on
+    #: the device is packed on the way over, rather than narrowed into a byte
+    #: string first and packed from that -- two walks over the frame and a
+    #: 2.8 MB string in between that nothing else wants.
+    let channels = image.channels()
+    if image.has_host_copy() { return __prim__.list_pack_argb(image.values(), channels) }
+    if image.is_continuous() and image.data_offset() == 0 {
+        return image.buffer().pack_argb(0, image.rows * image.cols * channels, channels)
+    }
+    return __prim__.list_pack_argb(image.to_bytes(), channels)
 }
 
 fn draw_trackbars(pane: Pane, canvas: Canvas) -> void {
