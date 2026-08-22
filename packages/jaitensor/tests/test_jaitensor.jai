@@ -2234,3 +2234,32 @@ fn test_amax_reduces_the_last_axis_and_the_whole_tensor() -> void {
     x.free()
     column.free()
 }
+
+#: `max_with_index` agrees with asking for the two separately.
+fn test_max_with_index_matches_amax_and_argmax() -> void {
+    if not jt.is_available() { return }
+    var values: list[float] = []
+    for index in 0..64 * 40 {
+        #: Every row has its peak somewhere different, and negatives so that a
+        #: zero-initialised answer would show.
+        values.push(float(index * 37 % 79 - 40) * 0.25)
+    }
+    let input = Tensor([64, 40], values)
+    defer { input.free() }
+    let (peaks, wheres) = jt.max_with_index(input)
+    defer { peaks.free() }
+    defer { wheres.free() }
+    let apart_values = jt.amax(input, axis: -1)
+    defer { apart_values.free() }
+    let apart_indices = jt.argmax(input)
+    defer { apart_indices.free() }
+    assert_eq(peaks.download(), apart_values.download())
+    assert_eq(wheres.download(), apart_indices.download())
+}
+
+fn test_max_with_index_refuses_anything_but_rank_two() -> void {
+    if not jt.is_available() { return }
+    let flat = Tensor([8])
+    defer { flat.free() }
+    assert_throws(ValueError, || jt.max_with_index(flat))
+}

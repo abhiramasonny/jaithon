@@ -100,8 +100,13 @@ pub fn decode(
     #: last axis and the classes are along the first.
     let per_class = jt.Tensor([80, cells], storage: output.buffer().view(4 * cells, 80 * cells))
     let by_cell = jt.transpose(per_class)
-    let best_scores = jt.amax(by_cell, axis: -1).download()
-    let best_classes = jt.argmax(by_cell).download()
+    #: Both at once. Asked for separately each reads all 8400 by 80 scores to
+    #: work out the same thing, and the second read is the whole of its cost.
+    let (peaks, wheres) = jt.max_with_index(by_cell)
+    let best_scores = peaks.download()
+    let best_classes = wheres.download()
+    peaks.free()
+    wheres.free()
     let geometry = jt.Tensor([4, cells], storage: output.buffer().view(0, 4 * cells)).download()
     by_cell.free()
 
