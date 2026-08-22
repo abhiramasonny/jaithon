@@ -20,7 +20,7 @@ from jaicv.core.dft import dft, idft, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_S
 from jaicv.imgcodecs.codecs import imdecode, imencode, sniff
 from jaicv.imgcodecs.codecs import IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED
 from jaicv.imgproc.geometric import get_perspective_transform, perspective_transform
-from jaicv.imgproc.drawing import rectangle
+from jaicv.imgproc.drawing import circle, fill_poly, line, rectangle
 from jaicv.videoio.capture import VideoCapture, CAP_PROP_FRAME_COUNT, CAP_PROP_FPS
 from jaicv.videoio.capture import CAP_PROP_FRAME_HEIGHT, CAP_PROP_FRAME_WIDTH
 from jaicv.videoio.capture import CAP_PROP_POS_FRAMES
@@ -439,4 +439,41 @@ fn test_opening_something_that_is_not_a_video_reports_rather_than_raises() -> vo
     let (ok, _frame) = clip.read()
     assert_true(not ok)
     Path(path).remove()
+}
+
+#: Drawing puts the same pixels down whether the picture is on the host or
+#: still on the device.
+#:
+#: The two are different code paths: one writes boxed numbers into a host
+#: mirror, the other writes floats straight into the device buffer's own
+#: memory, which is shared. They have to agree exactly, because which one runs
+#: depends only on whether something happened to pull the picture over
+#: earlier -- a difference between them would show up as a frame that looks
+#: subtly wrong only sometimes.
+fn drawn_on(force_host: bool) -> list[float] {
+    var frame = Mat.zeros(90, 120, CV_8UC3)
+    #: Reading the pixels is what settles the picture on the host, and the
+    #: painter draws wherever it finds them.
+    if force_host { let _pull = frame.values() }
+    rectangle(frame, Point(4, 4), Point(40, 30), Scalar(10.0, 200.0, 30.0), -1)
+    rectangle(frame, Point(50, 8), Point(110, 50), Scalar(200.0, 10.0, 30.0), 3)
+    circle(frame, Point(70, 62), 20, Scalar(0.0, 0.0, 255.0), -1)
+    circle(frame, Point(25, 62), 14, Scalar(255.0, 255.0, 0.0), 2)
+    line(frame, Point(0, 0), Point(119, 89), Scalar(255.0, 255.0, 255.0), 1)
+    #: Off the edge at both ends, so the clipping is exercised too.
+    line(frame, Point(-30, 45), Point(150, 20), Scalar(90.0, 90.0, 250.0), 2)
+    fill_poly(frame, [[Point(90, 55), Point(118, 62), Point(100, 88)]], Scalar(40.0, 180.0, 180.0))
+    return frame.values()
+}
+
+fn test_drawing_agrees_wherever_the_pixels_live() -> void {
+    if not gpu.is_available() { return }
+    let on_device = drawn_on(false)
+    let on_host = drawn_on(true)
+    assert_eq(on_device.len(), on_host.len())
+    var differing = 0
+    for index in 0..on_device.len() {
+        if on_device[index] != on_host[index] { differing += 1 }
+    }
+    assert_eq(differing, 0)
 }

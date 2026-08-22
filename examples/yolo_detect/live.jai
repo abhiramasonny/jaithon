@@ -11,11 +11,17 @@
 #:     --record FILE  also write an AVI of what is shown
 #:     --headless     do not open a window (for --video with --record)
 #:
-#: On an M2 Max a 720p frame costs about 7.7 ms all in -- roughly 3 for the
-#: network and 4.6 for the imaging around it -- so detecting on every frame
-#: runs at about 130 fps and the camera, not the detector, sets the pace. The
-#: model is interpreted on the first frame and compiled after, so the first one
-#: is slower than the rest by a wide margin.
+#: On an M2 Max a 720p frame costs about 5.6 ms all in, so detecting on every
+#: frame runs at around 178 fps and the camera, not the detector, sets the
+#: pace. The model is interpreted on the first frame and compiled after, so the
+#: first one is slower than the rest by a wide margin.
+#:
+#: That number is the network and the imaging running at the same time rather
+#: than one after the other: the loop hands the GPU frame N and then draws
+#: frame N-1 on the processor while it works, so a frame costs the slower of
+#: the two halves instead of their sum. The same loop written one step after
+#: another measures about 7 ms. What is on screen is therefore one frame
+#: behind the camera, which at this rate is under six milliseconds.
 #:
 #: `--every N` runs the network on one frame in N and keeps drawing the last
 #: boxes on the ones between. It is not needed at this speed, but it is there
@@ -28,7 +34,7 @@ from jaicv.videoio.writer import VideoWriter
 from std.os import argv, env
 from std.time import Instant
 
-from .detector import Detection, detect_frame, draw, open_model
+from .detector import Detection, Pending, draw, finish_detect, open_model, start_detect
 
 class Options {
     pub var camera: int
@@ -167,22 +173,21 @@ fn main() -> int {
     var found: list[Detection] = []
     var last = Instant.now()
 
-    print("running -- Esc or q to stop")
-    loop {
-        let (ok, frame) = camera.read()
-        if not ok { break }
+    #: The frame the network is working on is not the frame being drawn. The
+    #: one being drawn came from the read before, and its boxes are already in
+    #: `found`.
+    var showing: Mat? = null
+    var stopped = false
 
-        if frames % options.every == 0 {
-            let clock = Instant.now()
-            found = detect_frame(graph, frame)
-            net_ms = clock.elapsed().to_seconds() * 1000.0
-        }
-        draw(frame, found)
+    #: Draw, record and display one frame. Returns false when the viewer asked
+    #: to stop.
+    fn present(frame: Mat, boxes: list[Detection]) -> bool {
+        draw(frame, boxes)
 
         let elapsed = last.elapsed().to_seconds()
         last = Instant.now()
         if elapsed > 0.0 { fps.push(1.0 / elapsed) }
-        banner(frame, fps.mean(), net_ms, found.len(), options.every)
+        banner(frame, fps.mean(), net_ms, boxes.len(), options.every)
 
         let target = options.record
         if target is not null {
@@ -200,13 +205,47 @@ fn main() -> int {
             writer.write(frame)
         }
 
-        if not options.headless {
-            cv.imshow("yolo", frame)
-            let key = cv.wait_key(1)
-            if key == 27 or key == 113 { break }
+        if options.headless { return true }
+        cv.imshow("yolo", frame)
+        let key = cv.wait_key(1)
+        return key != 27 and key != 113
+    }
+
+    print("running -- Esc or q to stop")
+    loop {
+        let (ok, frame) = camera.read()
+        if not ok { break }
+
+        #: Queued, not waited for. Everything between here and `finish_detect`
+        #: runs on the processor while the GPU runs the network.
+        var pending: Pending? = null
+        var clock = Instant.now()
+        if frames % options.every == 0 {
+            pending = start_detect(graph, frame)
+            net_ms = clock.elapsed().to_seconds() * 1000.0
         }
+
+        let earlier = showing
+        if earlier is not null {
+            if not present(earlier, found) {
+                stopped = true
+                break
+            }
+        }
+
+        if pending is not null {
+            clock = Instant.now()
+            found = finish_detect(pending)
+            net_ms += clock.elapsed().to_seconds() * 1000.0
+        }
+        showing = frame
         frames += 1
     }
+
+    #: One frame is always still in hand when the loop ends, and a recording
+    #: that dropped it would be a frame short of what the camera gave.
+    let leftover = showing
+    if not stopped and leftover is not null { present(leftover, found) }
 
     if writer is not null {
         writer.release()
