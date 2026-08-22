@@ -373,31 +373,80 @@ fn test_wide_normalisation_gradients() -> void {
 }
 
 #: The channel normalisations reduce over the batch and every pixel, an axis
-#: that is not the one they write, so their statistics come out of a whole
-#: threadgroup striding it. Their scale and shift gradients were never checked
-#: against a difference quotient at all, at any size.
+#: that is not the one they write, and they do it a block at a time so that
+#: consecutive threads read consecutive floats. Their scale and shift gradients
+#: were never checked against anything.
+#:
+#: Against arithmetic done here rather than a difference quotient: the loss a
+#: quotient can use is a plain sum, and the scale's gradient under that loss is
+#: the sum of a normalised channel, which is zero however the kernel is written.
 fn test_channel_normalisation_parameter_gradients() -> void {
     if not have_gpu() { return }
-    let shape = [2, 8, 8, 4]
-    let count = 2 * 8 * 8 * 4
-    let image = Tensor(shape, spread(count))
-    let gamma = Tensor([4], positive(4))
-    let beta = Tensor([4], [0.2, -0.3, 0.1, 0.4])
+    let n = 4
+    let side = 8
+    let channels = 32
+    let nspatial = n * side * side
+    let count = nspatial * channels
+    var values: list[float] = []
+    var weights: list[float] = []
+    for index in 0..count {
+        values.push(float(index % 211) * 0.01 - 1.05)
+        weights.push(float(index % 97) * 0.02 - 0.96)
+    }
+    var scale: list[float] = []
+    var shift: list[float] = []
+    for channel in 0..channels {
+        scale.push(0.7 + float(channel % 3) * 0.2)
+        shift.push(float(channel % 4) * 0.1 - 0.15)
+    }
+    let x = Tensor([n, side, side, channels], values, requires_grad: true)
+    let gamma = Tensor([channels], scale, requires_grad: true)
+    let beta = Tensor([channels], shift, requires_grad: true)
+    let upstream = Tensor([n, side, side, channels], weights)
+    let held = jt.sum(jt.multiply(batch_norm(x, gamma, beta), upstream))
+    let intermediates = held.backward()
 
-    check(fn(g: Tensor) -> Tensor { return batch_norm(image, g, beta) }, [4], positive(4))
-    check(fn(b: Tensor) -> Tensor {
-        return batch_norm(image, gamma, b)
-    }, [4], [0.2, -0.3, 0.1, 0.4])
-    check(fn(g: Tensor) -> Tensor { return group_norm(image, g, beta, 2) }, [4], positive(4))
-    check(fn(b: Tensor) -> Tensor {
-        return group_norm(image, gamma, b, 2)
-    }, [4], [0.2, -0.3, 0.1, 0.4])
-    check(fn(x: Tensor) -> Tensor { return batch_norm(x, gamma, beta) }, shape, spread(count))
-    check(fn(x: Tensor) -> Tensor { return group_norm(x, gamma, beta, 2) }, shape, spread(count))
-
-    image.free()
+    let got_gamma = gamma.grad
+    let got_beta = beta.grad
+    if got_gamma is null or got_beta is null { throw AssertionError("no parameter gradient") }
+    let analytic_gamma = got_gamma.download()
+    let analytic_beta = got_beta.download()
+    for channel in 0..channels {
+        var total = 0.0
+        for step in 0..nspatial { total += values[step * channels + channel] }
+        let centre = total / float(nspatial)
+        var spread = 0.0
+        for step in 0..nspatial {
+            let gap = values[step * channels + channel] - centre
+            spread += gap * gap
+        }
+        let inverse = 1.0 / math.sqrt(spread / float(nspatial) + 1e-5)
+        var want_gamma = 0.0
+        var want_beta = 0.0
+        for step in 0..nspatial {
+            let up = weights[step * channels + channel]
+            want_gamma += up * (values[step * channels + channel] - centre) * inverse
+            want_beta += up
+        }
+        assert_near(
+            analytic_gamma[channel],
+            want_gamma,
+            max(1e-3, math.fabs(want_gamma) * 2e-3),
+            f"scale gradient for channel {channel}"
+        )
+        assert_near(
+            analytic_beta[channel],
+            want_beta,
+            max(1e-3, math.fabs(want_beta) * 2e-3),
+            f"shift gradient for channel {channel}"
+        )
+    }
+    for tensor in intermediates { tensor.free() }
+    x.free()
     gamma.free()
     beta.free()
+    upstream.free()
+    held.free()
 }
 
 #: `gather_rows` differentiates in its table, not in its indices. A row picked
