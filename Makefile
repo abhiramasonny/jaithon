@@ -4,6 +4,7 @@
 #   make debug      -O0 -g, assertions, GC stress available
 #   make test       build + run the full test suite
 #   make bench              language benches vs python3/c++/java
+#   make bench jaicv         image operations vs OpenCV on the CPU (~2 min)
 #   make bench jaitensor     GPU/ML benches vs PyTorch MPS (~7 min: twenty
 #                            workloads, five runs a side, and a PyTorch process
 #                            start for each -- it reports progress on stderr)
@@ -341,7 +342,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench jaitensor install uninstall \
+.PHONY: all debug release test verify-test bench jaitensor jaicv install uninstall \
         clean distclean fmt fmt-check fmt-roundtrip check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -677,9 +678,12 @@ jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arm64
 
 bench: $(TARGET)
-	@LEVEL="$(LEVEL)" ./scripts/run_bench.sh $(filter jaitensor,$(MAKECMDGOALS))
+	@LEVEL="$(LEVEL)" ./scripts/run_bench.sh $(filter jaitensor jaicv,$(MAKECMDGOALS))
 
 jaitensor:
+	@:
+
+jaicv:
 	@:
 #: Regenerate boot/seed.c from the images the front end currently needs.
 #:
@@ -823,4 +827,4 @@ distclean: clean
 	@echo "  CLEAN   removed every build tree, binary and generated artefact"
 
 help:
-	@echo "targets: all debug release test bench [jaitensor] package-check fixpoint-check reseed check fmt install clean"
+	@echo "targets: all debug release test bench [jaitensor|jaicv] package-check fixpoint-check reseed check fmt install clean"

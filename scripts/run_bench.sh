@@ -8,8 +8,8 @@ BUILD_ROOT="${BUILD_ROOT:-build}"
 JAITHON="$ROOT/jaithon"
 SUITE="${1:-}"
 
-if [[ -n "$SUITE" && "$SUITE" != "jaitensor" ]]; then
-    echo "error: unknown bench suite '$SUITE' (expected jaitensor)" >&2
+if [[ -n "$SUITE" && "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" ]]; then
+    echo "error: unknown bench suite '$SUITE' (expected jaitensor or jaicv)" >&2
     exit 2
 fi
 
@@ -67,7 +67,7 @@ esac
 export BENCH_LEVEL="$LEVEL"
 export JAITHON_PATH="${JAITHON_PATH:-$ROOT/lib}"
 
-if [[ "$SUITE" != "jaitensor" ]]; then
+if [[ "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" ]]; then
     printf '%s%s build, %s, best of %s%s\n' "$DIM" "$BUILD_KIND" "$LEVEL" "$RUNS" "$RESET"
 fi
 
@@ -96,6 +96,28 @@ build_all() {
 # because a peer that is merely absent shows up as an em dash in every row
 # rather than as an error, and a whole session can be spent optimising against
 # nothing. `bench_peer_note` below says so out loud when none is found.
+# The peer for the jaicv suite, which needs cv2 rather than torch.
+jaicv_python() {
+    if [[ -n "${JAICV_PYTHON:-}" ]]; then
+        printf '%s' "$JAICV_PYTHON"
+        return
+    fi
+    local candidate
+    for candidate in "$HOME/.venvs/scratch/bin/python" python3; do
+        if [[ "$candidate" == python3 ]]; then
+            command -v python3 >/dev/null 2>&1 || continue
+            candidate="$(command -v python3)"
+        elif [[ ! -x "$candidate" ]]; then
+            continue
+        fi
+        if "$candidate" -c "import cv2" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return
+        fi
+    done
+    printf '%s' ""
+}
+
 jaitensor_python() {
     if [[ -n "${JAITENSOR_PYTHON:-}" ]]; then
         printf '%s' "$JAITENSOR_PYTHON"
@@ -131,6 +153,20 @@ print_totals() {
 }
 
 total_j=0; total_p=0
+
+if [[ "$SUITE" == "jaicv" ]]; then
+    py="$(jaicv_python)"
+    if [[ -z "$py" ]]; then
+        echo "error: no python with cv2 was found. Set JAICV_PYTHON to one that has it." >&2
+        exit 1
+    fi
+    exec python3 "$ROOT/tests/bench/jaicv/run_suite.py" \
+        --root "$ROOT" \
+        --jaithon "$JAITHON" \
+        --python "$py" \
+        --level "$LEVEL" \
+        --runs "$RUNS"
+fi
 
 if [[ "$SUITE" == "jaitensor" ]]; then
     py="$(jaitensor_python)"
