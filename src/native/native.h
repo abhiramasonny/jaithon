@@ -251,6 +251,11 @@ bool             jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeigh
 int              jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight,
                              int inputWeight, int bias, int initState, int reverse,
                              int resetAfter, int resetBias);
+/* Derivatives of `loss` with respect to each of `wants`, recorded in the
+ * builder. A slot comes back -1 when the loss does not depend on that tensor.
+ * See graphbuild.m. */
+bool             jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants,
+                                   int count, int *out);
 JaiGraphPlan    *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                                  const int *outputs, int outputCount);
 int              jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index);

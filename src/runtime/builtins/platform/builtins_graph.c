@@ -543,6 +543,51 @@ static bool nGraphGru(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `graph_gradients(builder, loss, wants)` -- the derivative of `loss` with
+ * respect to each wanted tensor, as a list of ids. A -1 means the loss does
+ * not depend on that one. */
+static bool nGraphGradients(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t loss;
+    int64_t *wants = NULL;
+    int count = 0;
+    if (!requireBuilder(args[0], 1, "graph_gradients", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_gradients", &loss)) return false;
+    if (!intsOf(args[2], 3, "graph_gradients", &wants, &count)) return false;
+    if (count <= 0) {
+        if (wants != NULL) JAI_FREE_ARRAY(int64_t, wants, (size_t)count);
+        return jaiThrow(vm.cValueError, "graph_gradients(): nothing to differentiate against");
+    }
+
+    int *narrow = JAI_ALLOC(int, (size_t)count);
+    int *found = JAI_ALLOC(int, (size_t)count);
+    for (int i = 0; i < count; i++) narrow[i] = (int)wants[i];
+    const bool ok = jaiGraphGradients(builder, (int)loss, narrow, count, found);
+    JAI_FREE_ARRAY(int64_t, wants, (size_t)count);
+    JAI_FREE_ARRAY(int, narrow, (size_t)count);
+    if (!ok) {
+        JAI_FREE_ARRAY(int, found, (size_t)count);
+        return jaiThrow(vm.cRuntimeError, "graph_gradients(): the graph would not differentiate");
+    }
+
+    ObjList *list = jaiListNew(count);
+    if (list == NULL) {
+        JAI_FREE_ARRAY(int, found, (size_t)count);
+        return false;
+    }
+    if (!jaiListReserveExact(list, count)) {
+        JAI_FREE_ARRAY(int, found, (size_t)count);
+        return false;
+    }
+    for (int i = 0; i < count; i++) list->items[i] = INT_VAL(found[i]);
+    list->count = count;
+    list->version++;
+    JAI_FREE_ARRAY(int, found, (size_t)count);
+    *out = OBJ_VAL(list);
+    return true;
+}
+
 static bool nGraphCompile(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -702,6 +747,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_gemm",           nGraphGemm,           8, 8);
     jaiDefineNative("__prim__.graph_lstm",           nGraphLstm,           8, 8);
     jaiDefineNative("__prim__.graph_gru",            nGraphGru,            9, 9);
+    jaiDefineNative("__prim__.graph_gradients",      nGraphGradients,      3, 3);
     jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);
     jaiDefineNative("__prim__.graph_plan_output_shape", nGraphPlanOutputShape, 2, 2);
     jaiDefineNative("__prim__.graph_run",            nGraphRun,            3, 3);

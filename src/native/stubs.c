@@ -753,6 +753,10 @@ int jaiGraphGru(JaiGraphBuilder *b, int s, int r, int w, int bias, int state, in
     (void)b; (void)s; (void)r; (void)w; (void)bias; (void)state; (void)reverse;
     (void)resetAfter; (void)resetBias; return -1;
 }
+bool jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants, int count,
+                       int *out) {
+    (void)b; (void)loss; (void)wants; (void)count; (void)out; return false;
+}
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *in, int inCount,
                               const int *out, int outCount) {
     (void)b; (void)in; (void)inCount; (void)out; (void)outCount; return NULL;

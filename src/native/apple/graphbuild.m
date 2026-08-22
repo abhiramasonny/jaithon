@@ -754,6 +754,47 @@ int jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWe
     return -1;
 }
 
+/* The derivative of `loss` with respect to each of `wants`, as graph tensors.
+ *
+ * MPSGraph differentiates the graph it already holds, so a whole training step
+ * -- the forward pass, the loss, the gradients and the update that follows
+ * them -- becomes one compiled thing rather than a few hundred dispatches with
+ * the processor between each of them. That is what the fused MLP path does by
+ * hand and why it is eight times PyTorch; this is the same trick for any graph
+ * that can be built here.
+ *
+ * EVERY tensor in `wants` has to be one the loss actually depends on. Asked
+ * for the derivative with respect to something the forward pass never touched,
+ * MPSGraph fails an assertion and takes the process down -- it does not return
+ * nothing and it cannot be asked in advance. A caller building a training step
+ * therefore collects its parameters as it consumes them, rather than listing
+ * what a layer holds. The -1 below is for the case where the differentiation
+ * runs but hands back no entry, which is not the same thing. */
+bool jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants, int count,
+                       int *out) {
+    if (b == NULL || wants == NULL || out == NULL || count <= 0) return false;
+    MPSGraphTensor *target = tensorAt(b, loss);
+    if (target == nil) return false;
+    @autoreleasepool {
+        MPSGraph *graph = (__bridge MPSGraph *)b->graph;
+        NSMutableArray<MPSGraphTensor *> *against = [NSMutableArray new];
+        for (int i = 0; i < count; i++) {
+            MPSGraphTensor *want = tensorAt(b, wants[i]);
+            if (want == nil) return false;
+            [against addObject:want];
+        }
+        NSDictionary<MPSGraphTensor *, MPSGraphTensor *> *found =
+            [graph gradientForPrimaryTensor:target withTensors:against name:nil];
+        if (found == nil) return false;
+        for (int i = 0; i < count; i++) {
+            MPSGraphTensor *want = tensorAt(b, wants[i]);
+            MPSGraphTensor *grad = found[want];
+            out[i] = grad == nil ? -1 : record(b, grad);
+        }
+        return true;
+    }
+}
+
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
                               const int *outputs, int outputCount) {
     if (b == NULL || inputs == NULL || outputs == NULL) return NULL;
