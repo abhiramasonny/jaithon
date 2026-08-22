@@ -839,26 +839,69 @@ kernel void moments_channel(device const float* input [[buffer(0)]],
     variance[c] = sq / float(nspatial) - m * m;
 }
 
+/* A threadgroup to a row, rather than a thread to a row.
+ *
+ * One thread a row leaves the device almost idle -- a 512 by 768 normalisation
+ * is 512 threads where it wants tens of thousands -- and each of them walks
+ * its own row three times over, which no neighbouring thread shares a cache
+ * line with. It measured 1.7 ms against 0.18 for a matrix product over the
+ * same numbers, and two of them sit in every transformer block.
+ *
+ * Here the group strides the row together, so consecutive threads take
+ * consecutive elements, and the two sums come back through simd_sum. */
 kernel void layer_norm_forward(device const float* input [[buffer(0)]],
                                device const float* gamma [[buffer(1)]],
                                device const float* beta [[buffer(2)]],
                                device float* output [[buffer(3)]],
                                constant uint& rows [[buffer(4)]],
                                constant uint& width [[buffer(5)]],
-                               uint row [[thread_position_in_grid]]) {
+                               uint row [[threadgroup_position_in_grid]],
+                               uint lid [[thread_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
-    uint base = row * width;
+    const uint GROUP = 256u;
+    const uint base = row * width;
+    threadgroup float lanes[32];
+    threadgroup float shared_mean;
+    threadgroup float shared_inv;
+
     float total = 0.0f;
-    for (uint i = 0; i < width; ++i) total += input[base + i];
-    float m = total / float(width);
+    for (uint i = lid; i < width; i += GROUP) total += input[base + i];
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_mean = s / float(width);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float m = shared_mean;
+
     float sq = 0.0f;
-    for (uint i = 0; i < width; ++i) {
+    for (uint i = lid; i < width; i += GROUP) {
         float d = input[base + i] - m;
         sq += d * d;
     }
-    float inv = rsqrt(sq / float(width) + 1e-5f);
-    for (uint i = 0; i < width; ++i)
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sq = simd_sum(sq);
+    if (lane == 0u) lanes[warp] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_inv = rsqrt(s / float(width) + 1e-5f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = shared_inv;
+
+    for (uint i = lid; i < width; i += GROUP) {
         output[base + i] = gamma[i] * (input[base + i] - m) * inv + beta[i];
+    }
 }
 
 kernel void gather_rows(device const float* src [[buffer(0)]],
@@ -3629,10 +3672,13 @@ pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     }
     let output = Tensor(input.shape)
     let kernel = cached_kernel("layer_norm_forward")
+    #: A threadgroup of 256 to each row, so the dispatch is that many threads
+    #: per row rather than one.
     kernel.dispatch_async(
         [input.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
-        input.shape[0],
-        [input.shape[0], width]
+        input.shape[0] * 256,
+        [input.shape[0], width],
+        group_size: 256
     )
     if input.requires_grad or gamma.requires_grad or beta.requires_grad {
         let rows = input.shape[0]
