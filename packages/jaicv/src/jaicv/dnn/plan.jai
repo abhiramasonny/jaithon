@@ -1019,11 +1019,12 @@ fn regated(values: list[float], direction: int, hidden: int, width: int) -> list
 fn emit_lstm(state: Build, node: GraphNode) -> bool {
     let b = state.builder
     if node.outputs.len() == 0 { return false }
-    #: Forward only. Both other directions are correct in the interpreter, and
-    #: the platform's own operation indexes a reversed pass differently enough
-    #: that compiling one gave a different answer -- not a difference worth
-    #: guessing at for an operator that already runs.
-    if attr_str(node, "direction", "forward") != "forward" { return false }
+    #: One direction at a time. A reversed pass comes back in the order it ran
+    #: rather than indexed by timestep, which is put right below; bidirectional
+    #: is two passes concatenated and is left to the interpreter.
+    let heading = attr_str(node, "direction", "forward")
+    if heading != "forward" and heading != "reverse" { return false }
+    let backwards = heading == "reverse"
     if node.attrs.get("activations", null) is not null { return false }
     #: The operation has no gate clamp, and ignoring one that a file asks for
     #: would quietly change the answer.
@@ -1086,14 +1087,17 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
         bias,
         start_state,
         start_cell,
-        0
+        if backwards { 1 } else { 0 }
     )
     if made.len() != 2 { return false }
-    let all_state = made[0]
-    let all_cell = made[1]
+    #: Turned back into timestep order for a reversed pass, which then puts the
+    #: last step computed at the front rather than the end.
+    let all_state = if backwards { flipped_time(state, made[0], steps) } else { made[0] }
+    let all_cell = if backwards { flipped_time(state, made[1], steps) } else { made[1] }
+    if all_state < 0 or all_cell < 0 { return false }
 
     #: `Y` is every timestep with a direction axis put back in; `Y_h` and `Y_c`
-    #: are the last step, which for a reversed pass is the first one produced.
+    #: are the last step the pass produced.
     if node.outputs[0].len() > 0 {
         state.ids[node.outputs[0]] = __prim__.graph_reshape(
             b,
@@ -1101,7 +1105,7 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
             [steps, 1, batch, hidden]
         )
     }
-    let last = steps - 1
+    let last = if backwards { 0 } else { steps - 1 }
     if node.outputs.len() > 1 and node.outputs[1].len() > 0 {
         let cut = __prim__.graph_slice(
             b,
@@ -1125,6 +1129,20 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
     return true
 }
 
+#: A `[T, ...]` tensor with its time axis turned around.
+#:
+#: There is no negative-step slice in the builder, so the reversal is a gather
+#: over a constant order, which is what one would compile to anyway.
+fn flipped_time(state: Build, id: int, steps: int) -> int {
+    let order = __prim__.graph_constant(
+        state.builder,
+        [float(steps - 1 - index) for index in 0..steps],
+        [steps]
+    )
+    if order < 0 { return -1 }
+    return __prim__.graph_gather(state.builder, id, order, 0)
+}
+
 #: ONNX `GRU` as the platform's single operation.
 #:
 #: Both reset variants map. `linear_before_reset` -- what PyTorch exports, and
@@ -1135,11 +1153,13 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
 fn emit_gru(state: Build, node: GraphNode) -> bool {
     let b = state.builder
     if node.outputs.len() == 0 { return false }
-    if attr_str(node, "direction", "forward") != "forward" { return false }
+    let heading = attr_str(node, "direction", "forward")
+    if heading != "forward" and heading != "reverse" { return false }
     if node.attrs.get("activations", null) is not null { return false }
     if node.attrs.get("clip", null) is not null { return false }
     if attr_int(node, "layout", 0) != 0 { return false }
     if node.inputs.len() > 4 and node.inputs[4].len() > 0 { return false }
+    let backwards = heading == "reverse"
 
     let x = state.shape_of(node.inputs[0])
     if x is null or x.len() != 3 { return false }
@@ -1190,24 +1210,31 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
         w,
         bias,
         start,
-        0,
+        if backwards { 1 } else { 0 },
         if linear { 1 } else { 0 },
         reset_bias
     )
     if all_state < 0 { return false }
+    #: A reversed pass comes back in the order it ran, last input first. ONNX
+    #: indexes `Y` by the timestep the input came from, so the sequence is
+    #: turned around again -- and the final state, which is the last one
+    #: computed, ends up at the front of what that leaves.
+    let ordered = if backwards { flipped_time(state, all_state, steps) } else { all_state }
+    if ordered < 0 { return false }
     if node.outputs[0].len() > 0 {
         state.ids[node.outputs[0]] = __prim__.graph_reshape(
             b,
-            all_state,
+            ordered,
             [steps, 1, batch, hidden]
         )
     }
     if node.outputs.len() > 1 and node.outputs[1].len() > 0 {
+        let last = if backwards { 0 } else { steps - 1 }
         let cut = __prim__.graph_slice(
             b,
-            all_state,
-            [steps - 1, 0, 0],
-            [steps, batch, hidden],
+            ordered,
+            [last, 0, 0],
+            [last + 1, batch, hidden],
             [1, 1, 1]
         )
         state.ids[node.outputs[1]] = __prim__.graph_reshape(b, cut, [1, batch, hidden])
