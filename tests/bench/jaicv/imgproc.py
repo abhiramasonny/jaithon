@@ -32,7 +32,9 @@ def run(name: str, repeats: int, work) -> None:
     for _ in range(repeats):
         last = work()
     total = time.perf_counter() - started
-    check = "ok" if last is not None and np.isfinite(np.asarray(last).flat[0]) else "invalid"
+    flat = np.asarray(last, dtype=object).ravel() if last is not None else []
+    first = flat[0] if len(flat) else None
+    check = "ok" if first is not None and np.isfinite(np.asarray(first, dtype=np.float64)) else "invalid"
     pixels = repeats * WIDTH * HEIGHT
     print(f"jtb\t{name}\t{total:.9f}\t0\t{pixels}\t{check}\t—")
 
@@ -57,6 +59,9 @@ def main() -> int:
     run("resize-half", repeats, lambda: cv2.resize(colour, (WIDTH // 2, HEIGHT // 2)))
     run("pyr-down", repeats, lambda: cv2.pyrDown(grey))
     run("dft", repeats, lambda: cv2.dft(square, flags=cv2.DFT_COMPLEX_OUTPUT))
+    run("min-max", repeats, lambda: cv2.minMaxLoc(grey))
+    run("norm", repeats, lambda: cv2.norm(grey))
+    run("sum", repeats, lambda: cv2.sumElems(grey))
     return 0
 
 

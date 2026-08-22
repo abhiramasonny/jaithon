@@ -10,6 +10,7 @@ import jaicv as cv
 import std.gpu as gpu
 import std.math
 from jaicv import Mat, Size
+from jaicv.core.stats import min_max_loc, norm, sum_mat
 from jaicv.imgproc.morph import erode, get_structuring_element, MORPH_RECT
 from std.os import env_or
 from std.time import Instant
@@ -34,6 +35,22 @@ fn picture(channels: int) -> Mat {
     }
     let kind = if channels == 1 { cv.CV_32FC1 } else { cv.CV_32FC3 }
     return Mat.from_list(HEIGHT, WIDTH, kind, values)
+}
+
+#: The same timing for the reductions, which hand back a number rather than a
+#: picture and so have nothing to keep alive.
+fn run_scalar(name: str, repeats: int, work: fn() -> float) -> void {
+    for _warm in 0..WARMUP {
+        let _ = work()
+    }
+    gpu.synchronize()
+    let started = Instant.now()
+    var last = 0.0
+    for _r in 0..repeats { last = work() }
+    gpu.synchronize()
+    let seconds = started.elapsed().to_seconds()
+    let check = if math.is_finite(last) { "ok" } else { "invalid" }
+    print(f"jtb\t{name}\t{seconds:.9f}\t0\t{repeats * WIDTH * HEIGHT}\t{check}\t—")
 }
 
 fn run(name: str, repeats: int, work: fn() -> Mat) -> void {
@@ -90,5 +107,11 @@ fn main() -> int {
     #: A transform of the whole frame. Here because it used to run on the host
     #: and cost seconds, which no benchmark would have noticed.
     run("dft", repeats, || cv.dft(square))
+    #: Reductions to a single number. They are here because the fold used to
+    #: happen on the host, and because a benchmark of only elementwise work
+    #: says nothing about the shape that gets wrong.
+    run_scalar("min-max", repeats, || min_max_loc(grey)[0])
+    run_scalar("norm", repeats, || norm(grey))
+    run_scalar("sum", repeats, || sum_mat(grey)[0])
     return 0
 }
