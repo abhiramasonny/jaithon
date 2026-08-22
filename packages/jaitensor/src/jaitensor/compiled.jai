@@ -274,6 +274,13 @@ fn emit_layer_norm(state: Build, layer: any, input: Built) -> Built? {
     return Built(made, input.shape)
 }
 
+#: Batch normalisation is deliberately absent, and it is expressible: it is the
+#: row-wise normalisation over three axes instead of one, and a step built with
+#: it matched the eager one to 6e-8 over eight steps. It is left out because it
+#: is slower. On the `norm` benchmark the whole-graph step took 2.05 s against
+#: the eager path's 1.49 s, and 3.28 s against 2.58 s -- expressing it means the
+#: model compiles, and compiling it replaces kernels that beat the graph's own
+#: normalisation. Worth revisiting only if that stops being true.
 fn emit_layer(state: Build, layer: Layer, input: Built) -> Built? {
     if layer is Dense { return emit_dense(state, layer, input) }
     if layer is Flatten { return emit_flatten(state, layer, input) }
