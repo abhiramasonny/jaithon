@@ -65,5 +65,6 @@ void jaiStrDefinePrim(ObjModule *ns, const char *name, JaiNativeFn fn,
                       int minArity, int maxArity);
 
 void jaiBytesRegisterPrimitives(ObjModule *ns);
+void jaiRasterRegisterPrimitives(ObjModule *ns);
 
 #endif /* JAI_BUILTINS_STR_H */
