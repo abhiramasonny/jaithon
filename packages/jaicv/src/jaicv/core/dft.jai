@@ -16,7 +16,8 @@
 #: let filtered = idft(mul_spectrums(spectrum, kernel), DFT_SCALE | DFT_REAL_OUTPUT)
 #: ```
 import std.math
-from ..core.mat import Mat
+from std.gpu import Buffer, Kernel
+from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, CV_MAT_CN
 
 #: Run the transform the other way.
@@ -29,6 +30,139 @@ pub const DFT_ROWS = 4
 pub const DFT_COMPLEX_OUTPUT = 16
 #: Return one channel, discarding an imaginary part that should be zero.
 pub const DFT_REAL_OUTPUT = 32
+
+let SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+/* One stage of a Stockham autosort transform.
+ *
+ * The classic Cooley-Tukey needs its input bit-reversed; Stockham writes each
+ * stage to a second buffer in an order that leaves the next stage contiguous,
+ * so the two buffers alternate and no permutation pass is needed. After
+ * log2(n) stages the answer is in natural order.
+ *
+ * `base_stride` and `line_stride` are what let the same kernel take both axes:
+ * along a row the elements are one apart and the rows are `cols` apart, and
+ * down a column it is the other way round. Transposing between the two passes
+ * would cost two more passes over the picture for nothing. */
+kernel void dft_stage(device const float* in_real [[buffer(0)]],
+                      device const float* in_imaginary [[buffer(1)]],
+                      device float* out_real [[buffer(2)]],
+                      device float* out_imaginary [[buffer(3)]],
+                      constant uint& count [[buffer(4)]],
+                      constant uint& n [[buffer(5)]],
+                      constant uint& m [[buffer(6)]],
+                      constant uint& base_stride [[buffer(7)]],
+                      constant uint& line_stride [[buffer(8)]],
+                      constant uint& sign_bits [[buffer(9)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    /* Not `half`: that names a type in this language. */
+    uint span = n / 2u;
+    uint line = id / span;
+    uint j = id - line * span;
+    uint k = j & (m - 1u);
+    uint block = j / m;
+    float sign = as_type<float>(sign_bits);
+    float angle = sign * 6.283185307179586f * float(k) / float(2u * m);
+    float wr = cos(angle);
+    float wi = sin(angle);
+    uint lb = line * line_stride;
+    uint i0 = lb + (block * m + k) * base_stride;
+    uint i1 = lb + (block * m + k + span) * base_stride;
+    float ar = in_real[i0];
+    float ai = in_imaginary[i0];
+    float br = in_real[i1];
+    float bi = in_imaginary[i1];
+    float tr = wr * br - wi * bi;
+    float ti = wr * bi + wi * br;
+    uint o0 = lb + (2u * block * m + k) * base_stride;
+    uint o1 = lb + (2u * block * m + k + m) * base_stride;
+    out_real[o0] = ar + tr;
+    out_imaginary[o0] = ai + ti;
+    out_real[o1] = ar - tr;
+    out_imaginary[o1] = ai - ti;
+}
+
+/* Pull a real or complex picture apart into the two planes the stages want. */
+kernel void dft_split(device const float* src [[buffer(0)]],
+                      device float* real [[buffer(1)]],
+                      device float* imaginary [[buffer(2)]],
+                      constant uint& count [[buffer(3)]],
+                      constant uint& cn [[buffer(4)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    real[id] = src[id * cn];
+    imaginary[id] = cn > 1u ? src[id * cn + 1u] : 0.0f;
+}
+
+/* And put them back, scaling on the way out when the flags asked for it. */
+kernel void dft_pack(device const float* real [[buffer(0)]],
+                     device const float* imaginary [[buffer(1)]],
+                     device float* dst [[buffer(2)]],
+                     constant uint& count [[buffer(3)]],
+                     constant uint& cn [[buffer(4)]],
+                     constant uint& scale_bits [[buffer(5)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float scale = as_type<float>(scale_bits);
+    dst[id * cn] = real[id] * scale;
+    if (cn > 1u) dst[id * cn + 1u] = imaginary[id] * scale;
+}
+"""
+
+var _kernels: dict[str, Kernel] = {}
+
+fn kernel_for(entry: str) -> Kernel {
+    let existing = _kernels.get(entry, null)
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(SOURCE, entry)
+    _kernels[entry] = compiled
+    return compiled
+}
+
+#: Whether `n` is a power of two, which is what the staged transform handles.
+fn is_power_of_two(n: int) -> bool { return n > 0 and n & n - 1 == 0 }
+
+#: Transform every line of one axis, in place across a pair of buffers.
+#:
+#: Returns whichever buffer the answer landed in: the stages alternate, so with
+#: an odd number of them it is the scratch one.
+fn stage_axis(
+    real: Buffer,
+    imaginary: Buffer,
+    scratch_real: Buffer,
+    scratch_imaginary: Buffer,
+    lines: int,
+    n: int,
+    base_stride: int,
+    line_stride: int,
+    inverse: bool
+) -> tuple[Buffer, Buffer] {
+    if n <= 1 { return (real, imaginary) }
+    let sign = if inverse { 1.0 } else { -1.0 }
+    let butterflies = lines * (n // 2)
+    var from_real = real
+    var from_imaginary = imaginary
+    var into_real = scratch_real
+    var into_imaginary = scratch_imaginary
+    var m = 1
+    while m < n {
+        kernel_for("dft_stage").dispatch_async(
+            [from_real, from_imaginary, into_real, into_imaginary],
+            butterflies,
+            [butterflies, n, m, base_stride, line_stride, f32_bits(sign)]
+        )
+        let swap_real = from_real
+        let swap_imaginary = from_imaginary
+        from_real = into_real
+        from_imaginary = into_imaginary
+        into_real = swap_real
+        into_imaginary = swap_imaginary
+        m = m * 2
+    }
+    return (from_real, from_imaginary)
+}
 
 fn transform_line(real: list[float], imaginary: list[float], inverse: bool) -> void {
     let n = real.len()
@@ -129,13 +263,98 @@ fn to_complex(src: Mat) -> tuple[list[float], list[float]] {
     return (real, imaginary)
 }
 
+#: The transform on the device, or null when this one has to go on the host.
+#:
+#: Only for power-of-two lengths: the stages are radix two, and a length with
+#: any other factor keeps to the recursive host transform. That is not a small
+#: difference in cost -- the host transform of a 512 by 512 picture takes about
+#: five seconds and this takes about a millisecond -- so `get_optimal_dft_size`
+#: is worth calling, though it still answers with threes and fives, which land
+#: on the slow path.
+fn gpu_dft(src: Mat, flags: int, inverse: bool) -> Mat? {
+    let rows = src.rows
+    let cols = src.cols
+    let cn = CV_MAT_CN(src.type_())
+    if cn != 1 and cn != 2 { return null }
+    if rows < 1 or cols < 1 { return null }
+    if not is_power_of_two(cols) { return null }
+    let rows_only = flags & DFT_ROWS != 0 or rows == 1
+    if not rows_only and not is_power_of_two(rows) { return null }
+    #: A view carries an offset and a row gap; the stages address a packed
+    #: plane, so anything else goes the other way.
+    if src.offset != 0 or src.step_ != cols * cn { return null }
+
+    src.flush()
+    let count = rows * cols
+    let real = Buffer(count)
+    let imaginary = Buffer(count)
+    let scratch_real = Buffer(count)
+    let scratch_imaginary = Buffer(count)
+    kernel_for("dft_split").dispatch_async([src.storage, real, imaginary], count, [count, cn])
+
+    var (held_real, held_imaginary) = stage_axis(
+        real,
+        imaginary,
+        scratch_real,
+        scratch_imaginary,
+        rows,
+        cols,
+        1,
+        cols,
+        inverse
+    )
+    if not rows_only {
+        #: Down a column the elements are `cols` apart and the columns are one
+        #: apart, which is the row pass with its two strides exchanged.
+        let other_real = if held_real is real { scratch_real } else { real }
+        let other_imaginary = if held_imaginary is imaginary {
+            scratch_imaginary
+        } else {
+            imaginary
+        }
+        let (done_real, done_imaginary) = stage_axis(
+            held_real,
+            held_imaginary,
+            other_real,
+            other_imaginary,
+            cols,
+            rows,
+            cols,
+            1,
+            inverse
+        )
+        held_real = done_real
+        held_imaginary = done_imaginary
+    }
+
+    var scale = 1.0
+    if flags & DFT_SCALE != 0 {
+        scale = 1.0 / (if rows_only { float(cols) } else { float(rows * cols) })
+    }
+    let out_cn = if flags & DFT_REAL_OUTPUT != 0 { 1 } else { 2 }
+    let out = Mat(rows, cols, CV_MAKETYPE(CV_32F, out_cn))
+    kernel_for("dft_pack").dispatch_async(
+        [held_real, held_imaginary, out.storage],
+        count,
+        [count, out_cn, f32_bits(scale)]
+    )
+    out.invalidate()
+    real.free()
+    imaginary.free()
+    scratch_real.free()
+    scratch_imaginary.free()
+    return out
+}
+
 #: The discrete Fourier transform of an image.
 pub fn dft(src: Mat, flags: int = 0, nonzero_rows: int = 0) -> Mat {
     let _unused = nonzero_rows
     let rows = src.rows
     let cols = src.cols
-    var (real, imaginary) = to_complex(src)
     let inverse = flags & DFT_INVERSE != 0
+    let staged = gpu_dft(src, flags, inverse)
+    if staged is not null { return staged }
+    var (real, imaginary) = to_complex(src)
 
     for y in 0..rows {
         var line_real: list[float] = []

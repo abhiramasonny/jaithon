@@ -629,3 +629,61 @@ fn test_a_rectangular_morphology_matches_the_window_it_stands_for() -> void {
     source.release()
     element.release()
 }
+
+#: The staged transform against the definition, at a size that reaches it.
+#:
+#: The recorded OpenCV cases are small and not all of them are powers of two,
+#: so they do not settle whether the device path is right -- a length with a
+#: factor of three keeps to the host transform and would pass either way. Eight
+#: by eight is a power of two, so this goes through the stages, and the sum it
+#: is held against is the transform's own definition.
+fn test_the_staged_transform_agrees_with_the_definition() -> void {
+    if not gpu.is_available() { return }
+    let side = 8
+    var pixels: list[float] = []
+    for index in 0..side * side { pixels.push(float(index % 13) * 0.25 - 1.5) }
+    let image = Mat.from_list(side, side, CV_32FC1, pixels)
+    defer { image.release() }
+    let spectrum = dft(image, DFT_COMPLEX_OUTPUT)
+    defer { spectrum.release() }
+    let got = spectrum.to_list()
+
+    for u in 0..side {
+        for v in 0..side {
+            var real = 0.0
+            var imaginary = 0.0
+            for y in 0..side {
+                for x in 0..side {
+                    let angle = -2.0 *
+                        math.PI *
+                        (float(u * y) / float(side) + float(v * x) / float(side))
+                    let sample = pixels[y * side + x]
+                    real += sample * math.cos(angle)
+                    imaginary += sample * math.sin(angle)
+                }
+            }
+            let slot = (u * side + v) * 2
+            assert_near(got[slot], real, 1e-3, f"real part at {u},{v}")
+            assert_near(got[slot + 1], imaginary, 1e-3, f"imaginary part at {u},{v}")
+        }
+    }
+}
+
+#: There and back again, at a size the stages handle, must return the picture.
+fn test_a_staged_transform_inverts() -> void {
+    if not gpu.is_available() { return }
+    let rows = 16
+    let cols = 32
+    var pixels: list[float] = []
+    for index in 0..rows * cols { pixels.push(float(index % 29) * 0.1 - 1.4) }
+    let image = Mat.from_list(rows, cols, CV_32FC1, pixels)
+    defer { image.release() }
+    let spectrum = dft(image, DFT_COMPLEX_OUTPUT)
+    defer { spectrum.release() }
+    let back = idft(spectrum, DFT_SCALE | DFT_REAL_OUTPUT)
+    defer { back.release() }
+    let got = back.to_list()
+    for index in 0..pixels.len() {
+        assert_near(got[index], pixels[index], 1e-4, f"pixel {index} did not survive")
+    }
+}
