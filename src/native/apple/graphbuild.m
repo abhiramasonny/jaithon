@@ -1004,25 +1004,23 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets
     @autoreleasepool {
         NSArray<NSArray<NSNumber *> *> *inShapes = (__bridge NSArray *)plan->inputShapes;
         NSArray<NSArray<NSNumber *> *> *outShapes = (__bridge NSArray *)plan->outputShapes;
+        /* Through the window the caller asked for, not from the start of the
+         * buffer. A sliced batch is a view with an origin, and binding the
+         * whole buffer instead feeds the first batch every time -- training
+         * that reports a falling loss while it fits one batch over and over. */
         NSMutableArray<MPSGraphTensorData *> *feeds = [NSMutableArray new];
         for (int i = 0; i < plan->inputCount; i++) {
-            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)jaiGpuBufferHandle(ins[i]);
-            if (buffer == nil) return false;
-            MPSGraphTensorData *data =
-                [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer
-                                                        shape:inShapes[(NSUInteger)i]
-                                                     dataType:MPSDataTypeFloat32];
+            MPSGraphTensorData *data = (__bridge_transfer MPSGraphTensorData *)
+                jaiGpuTensorDataAt(ins[i], inOffsets[i],
+                                   (__bridge void *)inShapes[(NSUInteger)i]);
             if (data == nil) return false;
             [feeds addObject:data];
         }
         NSMutableArray<MPSGraphTensorData *> *results = [NSMutableArray new];
         for (int i = 0; i < plan->outputCount; i++) {
-            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)jaiGpuBufferHandle(outs[i]);
-            if (buffer == nil) return false;
-            MPSGraphTensorData *data =
-                [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer
-                                                        shape:outShapes[(NSUInteger)i]
-                                                     dataType:MPSDataTypeFloat32];
+            MPSGraphTensorData *data = (__bridge_transfer MPSGraphTensorData *)
+                jaiGpuTensorDataAt(outs[i], outOffsets[i],
+                                   (__bridge void *)outShapes[(NSUInteger)i]);
             if (data == nil) return false;
             [results addObject:data];
         }

@@ -141,6 +141,9 @@ id<MTLDevice>       jaiGpuMetalDevice(void);
 id<MTLCommandQueue> jaiGpuMetalQueue(void);
 #endif
 void               *jaiGpuBufferHandle(JaiGpuBuffer *b);
+/* An MPSGraphTensorData window onto `b`, `offset` bytes in, at +1 and unmarked.
+ * NULL when the window cannot be addressed. `shape` is an NSArray<NSNumber *>. */
+void               *jaiGpuTensorDataAt(JaiGpuBuffer *b, size_t offset, void *shape);
 /* Encode an MPSGraphExecutable into the shared command buffer. The three
  * pointers are an MPSGraphExecutable and two NSArrays of MPSGraphTensorData,
  * passed as void so that only the Objective-C files need the types. */

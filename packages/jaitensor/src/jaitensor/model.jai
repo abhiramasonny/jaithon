@@ -939,6 +939,16 @@ pub class Sequential {
         return processed
     }
 
+    #: The shape one batch of `dataset` arrives in.
+    fn _batch_shape(self, dataset: Dataset, count: int) -> list[int] {
+        if dataset.features.rank() == 4 {
+            let shape = dataset.image_shape
+            if shape is null { throw RuntimeError("NHWC dataset missing image_shape") }
+            return [count, shape[0], shape[1], shape[2]]
+        }
+        return [count, dataset.feature_count]
+    }
+
     fn _slice_features(self, dataset: Dataset, start: int, count: int) -> Tensor {
         let width = dataset.feature_count
         if dataset.features.rank() == 4 {
@@ -1077,6 +1087,12 @@ pub class Sequential {
         defer { batch_loss.free() }
         let total_loss = Tensor.zeros([1])
         defer { total_loss.free() }
+        #: The graph reads a whole buffer, so a batch has to be one. Handing it
+        #: a slice of the dataset would feed whatever the slice was cut from.
+        let staged_features = Tensor(self._batch_shape(dataset, batch_size))
+        defer { staged_features.free() }
+        let staged_labels = Tensor([batch_size])
+        defer { staged_labels.free() }
         var seen = 0
         var start = 0
         let loader = if self.shuffle_batches {
@@ -1104,12 +1120,14 @@ pub class Sequential {
                 start += count
                 continue
             }
-            step.step_into(batch_features, batch_labels, scores, batch_loss)
+            copy_into(batch_features, staged_features)
+            copy_into(batch_labels, staged_labels)
+            step.step_into(staged_features, staged_labels, scores, batch_loss)
             #: Kept on the device and summed there. Reading the loss here would
             #: wait for the step that produced it, every batch.
             add_scaled_into(batch_loss, total_loss, count)
             seen += count
-            add_correct_into(scores, batch_labels, total_correct)
+            add_correct_into(scores, staged_labels, total_correct)
             batch_features.free()
             batch_labels.free()
             start += count
