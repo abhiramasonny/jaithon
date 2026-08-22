@@ -58,7 +58,16 @@ own `bus.jpg` it finds four people and a bus, which is the published result.
 
 ## Speed
 
-About 200 ms a frame for the network on an M2 Max, so roughly 5 fps detecting
-every frame. `--every 3` keeps the display near the camera's own rate. The
-network itself is the floor here; PyTorch runs the same graph in about a third
-of the time, so there is real headroom left in the graph executor.
+On an M2 Max the network costs about 3.2 ms for one 640x640 input, and a 720p
+frame end to end -- letterbox, network, decode, drawing, display -- costs about
+8.5 ms, so detecting on every frame runs at roughly 115 fps and the camera sets
+the pace rather than the detector.
+
+That is with the network and the drawing running at the same time. `live.jai`
+hands the GPU frame N and then draws frame N-1 on the processor while it works,
+so a frame costs the slower of the two halves instead of their sum: the same
+loop written one step after another measures about 11 ms, or 90 fps. What is on
+screen is one frame behind the camera as a result.
+
+`--every N` is not needed at this rate and is there for a slower machine or a
+larger model.
