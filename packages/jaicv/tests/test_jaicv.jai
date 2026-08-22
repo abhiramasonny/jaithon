@@ -731,8 +731,16 @@ fn test_the_neighbours_returned_are_the_nearest_ones() -> void {
     let width = 3
     var values: list[float] = []
     var labels: list[float] = []
+    #: Spread out, so a query's neighbours are distinct points at distinct
+    #: distances. Repeating features instead gives every query a pile of exact
+    #: duplicates, and then any selection that finds `k` of them looks right --
+    #: a bound that compares against the wrong end of the list included.
+    var state = 12345
     for sample in 0..samples {
-        for slot in 0..width { values.push(float((sample * 3 + slot) % 7)) }
+        for _slot in 0..width {
+            state = (state * 1103515245 + 12345) % 2147483648
+            values.push(float(state % 10007) * 0.01)
+        }
         labels.push(float(sample % 5))
     }
     let x = Mat.from_list(samples, width, CV_32FC1, values)
