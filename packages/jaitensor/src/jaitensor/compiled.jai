@@ -40,6 +40,8 @@ const REDUCE_MEAN = 1
 const OP_ADD = 0
 const OP_SUB = 1
 const OP_MUL = 2
+const OP_DIV = 3
+const OP_POW = 6
 
 #: Unary op codes the graph builder takes.
 const UNARY_RELU = 0
@@ -48,6 +50,7 @@ const UNARY_TANH = 2
 const UNARY_EXP = 3
 const UNARY_LOG = 4
 const UNARY_NEGATE = 6
+const UNARY_SQRT = 5
 const UNARY_SILU = 9
 
 #: What the forward pass of one layer became, and the parameters it used.
@@ -263,10 +266,12 @@ pub class CompiledStep {
     let handle: int
     pub let params: list[Tensor]
     var shadow: list[Buffer]
-    #: Momentum's carried velocity, one a parameter, ping-ponged the same way.
-    #: Empty when the optimizer has no momentum to carry.
-    var velocity: list[Buffer]
-    var velocity_shadow: list[Buffer]
+    #: Whatever the optimizer carries from one step to the next -- momentum's
+    #: velocity, or Adam's two moments and its step count -- fed in and
+    #: produced in the same order, ping-ponged the way the parameters are.
+    #: Empty for an optimizer that carries nothing.
+    var carried: list[Buffer]
+    var carried_shadow: list[Buffer]
     var live_is_shadow: bool
     pub let batch_size: int
     pub let classes: int
@@ -277,16 +282,16 @@ pub class CompiledStep {
         handle: int,
         params: list[Tensor],
         shadow: list[Buffer],
-        velocity: list[Buffer],
-        velocity_shadow: list[Buffer],
+        carried: list[Buffer],
+        carried_shadow: list[Buffer],
         batch_size: int,
         classes: int
     ) {
         self.handle = handle
         self.params = params
         self.shadow = shadow
-        self.velocity = velocity
-        self.velocity_shadow = velocity_shadow
+        self.carried = carried
+        self.carried_shadow = carried_shadow
         self.live_is_shadow = false
         self.batch_size = batch_size
         self.classes = classes
@@ -311,9 +316,9 @@ pub class CompiledStep {
             feeds.push(reads.handle_of())
             results.push(writes.handle_of())
         }
-        for index in 0..self.velocity.len() {
-            let own = self.velocity[index]
-            let other = self.velocity_shadow[index]
+        for index in 0..self.carried.len() {
+            let own = self.carried[index]
+            let other = self.carried_shadow[index]
             let reads = if self.live_is_shadow { other } else { own }
             let writes = if self.live_is_shadow { own } else { other }
             feeds.push(reads.handle_of())
@@ -342,8 +347,8 @@ pub class CompiledStep {
         for (index, param) in self.params.enumerate() {
             param.buffer().upload(self.shadow[index].download())
         }
-        for index in 0..self.velocity.len() {
-            self.velocity[index].upload(self.velocity_shadow[index].download())
+        for index in 0..self.carried.len() {
+            self.carried[index].upload(self.carried_shadow[index].download())
         }
         self.live_is_shadow = false
     }
@@ -353,8 +358,8 @@ pub class CompiledStep {
         self.freed = true
         self.settle()
         for buffer in self.shadow { buffer.free() }
-        for buffer in self.velocity { buffer.free() }
-        for buffer in self.velocity_shadow { buffer.free() }
+        for buffer in self.carried { buffer.free() }
+        for buffer in self.carried_shadow { buffer.free() }
         __prim__.graph_plan_free(self.handle)
     }
 }
@@ -391,7 +396,11 @@ pub fn compile_step(
     classes: int,
     learning_rate: float,
     momentum: float = 0.0,
-    nesterov: bool = false
+    nesterov: bool = false,
+    adam: bool = false,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    epsilon: float = 1.0e-7
 ) -> CompiledStep? {
     if not allowed() {
         _refusal = "compiled steps are switched off"
@@ -442,41 +451,120 @@ pub fn compile_step(
     #: comes in as a tensor of its own and goes out updated:
     #: `v = momentum * v + g`, and the step is `v` again, or
     #: `momentum * v + g` when Nesterov is asked for.
-    let carries = momentum != 0.0
+    let b = builder
     var updated: list[int] = []
-    var velocity_ids: list[int] = []
-    var velocity_out: list[int] = []
-    let rate = __prim__.graph_constant(builder, [learning_rate], [1])
-    let decay = __prim__.graph_constant(builder, [momentum], [1])
+    var carried_ids: list[int] = []
+    var carried_out: list[int] = []
+    var carried_sizes: list[list[int]] = []
+    let rate = __prim__.graph_constant(b, [learning_rate], [1])
+
+    #: Adam counts its steps, and the count is the same for every parameter, so
+    #: one counter serves them all. Kept in the graph rather than fed each step:
+    #: writing a scalar from the host every iteration would make the host wait
+    #: for the step that read it last.
+    var beat_next = -1
+    if adam {
+        let beat = __prim__.graph_input(b, [1])
+        carried_ids.push(beat)
+        carried_sizes.push([1])
+        beat_next = __prim__.graph_binary(b, beat, scalar(state, 1.0), OP_ADD)
+        carried_out.push(beat_next)
+    }
+
     for (index, id) in state.param_ids.enumerate() {
         if grads[index] < 0 {
             _refusal = f"parameter {index} got no gradient"
-            __prim__.graph_free(builder)
+            __prim__.graph_free(b)
             return null
         }
-        var move = grads[index]
-        if carries {
-            let previous = __prim__.graph_input(builder, state.params[index].shape)
-            velocity_ids.push(previous)
-            let kept = __prim__.graph_binary(builder, previous, decay, OP_MUL)
-            let fresh = __prim__.graph_binary(builder, kept, grads[index], OP_ADD)
-            velocity_out.push(fresh)
+        let gradient = grads[index]
+        let shape = state.params[index].shape
+        var move = gradient
+
+        if adam {
+            #: first = b1 f + (1 - b1) g and second = b2 s + (1 - b2) g^2, each
+            #: divided by what it would have been had it not started at rest,
+            #: and the step is first / (sqrt(second) + epsilon).
+            let held_first = __prim__.graph_input(b, shape)
+            let held_second = __prim__.graph_input(b, shape)
+            carried_ids.push(held_first)
+            carried_ids.push(held_second)
+            carried_sizes.push(shape)
+            carried_sizes.push(shape)
+
+            let fresh_first = __prim__.graph_binary(
+                b,
+                __prim__.graph_binary(b, held_first, scalar(state, beta1), OP_MUL),
+                __prim__.graph_binary(
+                    b,
+                    gradient,
+                    scalar(state, 1.0 - beta1),
+                    OP_MUL
+                ),
+                OP_ADD
+            )
+            let squared = __prim__.graph_binary(b, gradient, gradient, OP_MUL)
+            let fresh_second = __prim__.graph_binary(
+                b,
+                __prim__.graph_binary(
+                    b,
+                    held_second,
+                    scalar(state, beta2),
+                    OP_MUL
+                ),
+                __prim__.graph_binary(
+                    b,
+                    squared,
+                    scalar(state, 1.0 - beta2),
+                    OP_MUL
+                ),
+                OP_ADD
+            )
+            carried_out.push(fresh_first)
+            carried_out.push(fresh_second)
+
+            let left1 = __prim__.graph_binary(
+                b,
+                scalar(state, 1.0),
+                __prim__.graph_binary(b, scalar(state, beta1), beat_next, OP_POW),
+                OP_SUB
+            )
+            let left2 = __prim__.graph_binary(
+                b,
+                scalar(state, 1.0),
+                __prim__.graph_binary(b, scalar(state, beta2), beat_next, OP_POW),
+                OP_SUB
+            )
+            let corrected_first = __prim__.graph_binary(b, fresh_first, left1, OP_DIV)
+            let corrected_second = __prim__.graph_binary(b, fresh_second, left2, OP_DIV)
+            let root = __prim__.graph_unary(b, corrected_second, UNARY_SQRT)
+            let denominator = __prim__.graph_binary(b, root, scalar(state, epsilon), OP_ADD)
+            move = __prim__.graph_binary(b, corrected_first, denominator, OP_DIV)
+        } elif momentum != 0.0 {
+            let previous = __prim__.graph_input(b, shape)
+            carried_ids.push(previous)
+            carried_sizes.push(shape)
+            let decay = scalar(state, momentum)
+            let kept = __prim__.graph_binary(b, previous, decay, OP_MUL)
+            let fresh = __prim__.graph_binary(b, kept, gradient, OP_ADD)
+            carried_out.push(fresh)
             move = if nesterov {
-                __prim__.graph_binary(builder, __prim__.graph_binary(builder, fresh, decay, OP_MUL), grads[index], OP_ADD)
+                __prim__.graph_binary(b, __prim__.graph_binary(b, fresh, decay, OP_MUL), gradient, OP_ADD)
             } else {
                 fresh
             }
         }
-        let scaled = __prim__.graph_binary(builder, move, rate, OP_MUL)
-        updated.push(__prim__.graph_binary(builder, id, scaled, OP_SUB))
+
+        let scaled = __prim__.graph_binary(b, move, rate, OP_MUL)
+        updated.push(__prim__.graph_binary(b, id, scaled, OP_SUB))
     }
 
     var inputs: list[int] = [features, labels]
     for id in state.param_ids { inputs.push(id) }
-    for id in velocity_ids { inputs.push(id) }
+    for id in carried_ids { inputs.push(id) }
     var outputs: list[int] = [loss, carried.value]
     for id in updated { outputs.push(id) }
-    for id in velocity_out { outputs.push(id) }
+    for id in carried_out { outputs.push(id) }
 
     let handle = __prim__.graph_compile(builder, inputs, outputs)
     if handle < 0 {
@@ -485,27 +573,19 @@ pub fn compile_step(
     }
     var shadow: list[Buffer] = []
     for param in state.params { shadow.push(Buffer(param.size)) }
-    var velocity: list[Buffer] = []
-    var velocity_shadow: list[Buffer] = []
-    if carries {
-        for param in state.params {
-            let first = Buffer(param.size)
-            let second = Buffer(param.size)
-            #: Momentum starts from rest.
-            first.fill_zero()
-            second.fill_zero()
-            velocity.push(first)
-            velocity_shadow.push(second)
-        }
+    #: Everything carried starts at rest, including the step count.
+    var held: list[Buffer] = []
+    var held_shadow: list[Buffer] = []
+    for shape in carried_sizes {
+        var size = 1
+        for dimension in shape { size = size * dimension }
+        let first = Buffer(size)
+        let second = Buffer(size)
+        first.fill_zero()
+        second.fill_zero()
+        held.push(first)
+        held_shadow.push(second)
     }
     _refusal = null
-    return CompiledStep(
-        handle,
-        state.params,
-        shadow,
-        velocity,
-        velocity_shadow,
-        input_shape[0],
-        classes
-    )
+    return CompiledStep(handle, state.params, shadow, held, held_shadow, input_shape[0], classes)
 }

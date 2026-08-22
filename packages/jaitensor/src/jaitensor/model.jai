@@ -401,9 +401,12 @@ pub class Sequential {
         let loss = self.loss_value
         let optimizer = self.optimizer_value
         if loss is null or not loss.is_sparse_categorical() { return }
-        if optimizer is null or optimizer.kind() != 0 { return }
+        if optimizer is null { return }
+        let kind = optimizer.kind()
+        if kind != 0 and kind != 1 { return }
         let settings = optimizer.settings()
-        if settings.len() < 3 { return }
+        if kind == 0 and settings.len() < 3 { return }
+        if kind == 1 and settings.len() < 4 { return }
         let image = dataset.image_shape
         if image is null or image.len() != 3 { return }
         var shape = [batch_size]
@@ -414,18 +417,15 @@ pub class Sequential {
         #: forward, backward and update together -- and an epoch of a small
         #: dataset is only a few dozen batches to spread that over. Fitting
         #: twice used to pay for it twice.
-        let wanted = f"{shape} {classes} {settings[0]} {settings[1]} {settings[2]}"
+        let wanted = f"{shape} {classes} {kind} {settings}"
         if self.compiled_step is not null and self.compiled_for == wanted { return }
         let existing = self.compiled_step
         if existing is not null { existing.free() }
-        self.compiled_step = compile_step(
-            self.layers,
-            shape,
-            classes,
-            settings[0],
-            settings[1],
-            settings[2] > 0.5
-        )
+        self.compiled_step = if kind == 1 {
+            compile_step(self.layers, shape, classes, settings[0], adam: true, beta1: settings[1], beta2: settings[2], epsilon: settings[3])
+        } else {
+            compile_step(self.layers, shape, classes, settings[0], settings[1], settings[2] > 0.5)
+        }
         self.compiled_for = if self.compiled_step is null { "" } else { wanted }
     }
 
