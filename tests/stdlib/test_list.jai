@@ -146,3 +146,34 @@ fn test_is_permutation_ignores_order_but_not_multiplicity() -> void {
     assert_false(list.is_permutation([1, 2, 2], [1, 2]))
     assert_true(list.is_permutation([], []))
 }
+
+#: `list_fill_pattern` writes a pixel over and over into a run of a list.
+fn test_fill_pattern_repeats_the_pattern_over_the_range() -> void {
+    var values = __prim__.list_filled(12, 0.0)
+    __prim__.list_fill_pattern(values, 3, 3, [1.0, 2.0, 3.0])
+    assert_eq(
+        values,
+        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+    )
+}
+
+fn test_fill_pattern_of_one_element_is_a_plain_run() -> void {
+    var values = __prim__.list_filled(5, 9.0)
+    __prim__.list_fill_pattern(values, 1, 3, [7.0])
+    assert_eq(values, [9.0, 7.0, 7.0, 7.0, 9.0])
+}
+
+fn test_fill_pattern_writes_nothing_for_an_empty_run() -> void {
+    var values = __prim__.list_filled(4, 1.0)
+    __prim__.list_fill_pattern(values, 2, 0, [5.0])
+    __prim__.list_fill_pattern(values, 2, 3, [])
+    assert_eq(values, [1.0, 1.0, 1.0, 1.0])
+}
+
+#: Running past the end is a mistake in the caller's arithmetic, not something
+#: to clip quietly.
+fn test_fill_pattern_refuses_a_run_past_the_end() -> void {
+    var values = __prim__.list_filled(6, 0.0)
+    assert_throws(ValueError, || __prim__.list_fill_pattern(values, 4, 2, [1.0, 2.0]))
+    assert_throws(ValueError, || __prim__.list_fill_pattern(values, -1, 1, [1.0]))
+}

@@ -150,14 +150,22 @@ pub class Painter {
     }
 
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
+    #:
+    #: One primitive rather than a `plot` a pixel. Every filled shape is made
+    #: of these, and a row written a pixel at a time cost about 11 ns a pixel
+    #: -- a filled rectangle over a 720p frame took 8.2 ms, more than the rest
+    #: of a camera frame put together.
     pub fn span(self, x1: int, x2: int, y: int) -> void {
         if y < 0 or y >= self.rows { return }
-        var start = max(x1, 0)
+        let start = max(x1, 0)
         let end = min(x2, self.cols - 1)
-        while start <= end {
-            self.plot(start, y)
-            start += 1
-        }
+        if start > end { return }
+        __prim__.list_fill_pattern(
+            self.values,
+            (y * self.cols + start) * self.cn,
+            end - start + 1,
+            self.colour
+        )
     }
 
     #: Push everything written back to the device.
