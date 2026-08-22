@@ -82,18 +82,19 @@ pub fn kmeans(
         let first = state % samples
         for index in 0..width { centres.push(values[first * width + index]) }
 
+        #: How far each sample is from the nearest centre chosen so far, kept
+        #: as centres are added rather than worked out again each time. Redoing
+        #: it means every sample measured against every centre at every step,
+        #: which is the seeding costing `k` times what it needs to -- and for
+        #: the eight groups an image is usually quantised into, that is most of
+        #: the work before the first iteration even starts.
+        var distances: list[float] = []
+        for sample in 0..samples {
+            distances.push(squared_to_centre(values, sample, centres, 0, width))
+        }
         while centres.len() // width < k {
-            var distances: list[float] = []
             var total = 0.0
-            for sample in 0..samples {
-                var nearest = 1e300
-                for centre in 0..centres.len() // width {
-                    let gap = squared_to_centre(values, sample, centres, centre, width)
-                    if gap < nearest { nearest = gap }
-                }
-                distances.push(nearest)
-                total += nearest
-            }
+            for sample in 0..samples { total += distances[sample] }
             var chosen = samples - 1
             if flags & KMEANS_PP_CENTERS != 0 and total > 0.0 {
                 state = next_random(state)
@@ -110,7 +111,12 @@ pub fn kmeans(
                 state = next_random(state)
                 chosen = state % samples
             }
+            let added = centres.len() // width
             for index in 0..width { centres.push(values[chosen * width + index]) }
+            for sample in 0..samples {
+                let gap = squared_to_centre(values, sample, centres, added, width)
+                if gap < distances[sample] { distances[sample] = gap }
+            }
         }
 
         var labels: list[int] = []
