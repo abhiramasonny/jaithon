@@ -263,6 +263,10 @@ pub class CompiledStep {
     let handle: int
     pub let params: list[Tensor]
     var shadow: list[Buffer]
+    #: Momentum's carried velocity, one a parameter, ping-ponged the same way.
+    #: Empty when the optimizer has no momentum to carry.
+    var velocity: list[Buffer]
+    var velocity_shadow: list[Buffer]
     var live_is_shadow: bool
     pub let batch_size: int
     pub let classes: int
@@ -273,12 +277,16 @@ pub class CompiledStep {
         handle: int,
         params: list[Tensor],
         shadow: list[Buffer],
+        velocity: list[Buffer],
+        velocity_shadow: list[Buffer],
         batch_size: int,
         classes: int
     ) {
         self.handle = handle
         self.params = params
         self.shadow = shadow
+        self.velocity = velocity
+        self.velocity_shadow = velocity_shadow
         self.live_is_shadow = false
         self.batch_size = batch_size
         self.classes = classes
@@ -298,6 +306,14 @@ pub class CompiledStep {
         for (index, param) in self.params.enumerate() {
             let own = param.buffer()
             let other = self.shadow[index]
+            let reads = if self.live_is_shadow { other } else { own }
+            let writes = if self.live_is_shadow { own } else { other }
+            feeds.push(reads.handle_of())
+            results.push(writes.handle_of())
+        }
+        for index in 0..self.velocity.len() {
+            let own = self.velocity[index]
+            let other = self.velocity_shadow[index]
             let reads = if self.live_is_shadow { other } else { own }
             let writes = if self.live_is_shadow { own } else { other }
             feeds.push(reads.handle_of())
@@ -326,6 +342,9 @@ pub class CompiledStep {
         for (index, param) in self.params.enumerate() {
             param.buffer().upload(self.shadow[index].download())
         }
+        for index in 0..self.velocity.len() {
+            self.velocity[index].upload(self.velocity_shadow[index].download())
+        }
         self.live_is_shadow = false
     }
 
@@ -334,6 +353,8 @@ pub class CompiledStep {
         self.freed = true
         self.settle()
         for buffer in self.shadow { buffer.free() }
+        for buffer in self.velocity { buffer.free() }
+        for buffer in self.velocity_shadow { buffer.free() }
         __prim__.graph_plan_free(self.handle)
     }
 }
@@ -360,14 +381,17 @@ fn allowed() -> bool {
 
 #: Build a compiled step for `layers`, or null when they cannot be expressed.
 #:
-#: `input_shape` is one batch's worth including the batch dimension. Only plain
-#: SGD is expressed: momentum carries state between steps, which would have to
-#: live in the graph too.
+#: `input_shape` is one batch's worth including the batch dimension. SGD with
+#: or without momentum is expressed; momentum's velocity is carried through the
+#: graph as another pair of tensors, fed in and produced, the same way the
+#: parameters are.
 pub fn compile_step(
     layers: list[Layer],
     input_shape: list[int],
     classes: int,
-    learning_rate: float
+    learning_rate: float,
+    momentum: float = 0.0,
+    nesterov: bool = false
 ) -> CompiledStep? {
     if not allowed() {
         _refusal = "compiled steps are switched off"
@@ -411,24 +435,48 @@ pub fn compile_step(
     }
     let grads = __prim__.graph_gradients(builder, loss, state.param_ids)
 
-    #: `param - rate * gradient`, in the graph, so the update is part of the
-    #: same compiled thing as the pass that produced the gradient.
+    #: The update, in the graph, so it is part of the same compiled thing as
+    #: the pass that produced the gradient.
+    #:
+    #: Without momentum that is `param - rate * gradient`. With it the velocity
+    #: comes in as a tensor of its own and goes out updated:
+    #: `v = momentum * v + g`, and the step is `v` again, or
+    #: `momentum * v + g` when Nesterov is asked for.
+    let carries = momentum != 0.0
     var updated: list[int] = []
+    var velocity_ids: list[int] = []
+    var velocity_out: list[int] = []
+    let rate = __prim__.graph_constant(builder, [learning_rate], [1])
+    let decay = __prim__.graph_constant(builder, [momentum], [1])
     for (index, id) in state.param_ids.enumerate() {
         if grads[index] < 0 {
             _refusal = f"parameter {index} got no gradient"
             __prim__.graph_free(builder)
             return null
         }
-        let rate = __prim__.graph_constant(builder, [learning_rate], [1])
-        let scaled = __prim__.graph_binary(builder, grads[index], rate, OP_MUL)
+        var move = grads[index]
+        if carries {
+            let previous = __prim__.graph_input(builder, state.params[index].shape)
+            velocity_ids.push(previous)
+            let kept = __prim__.graph_binary(builder, previous, decay, OP_MUL)
+            let fresh = __prim__.graph_binary(builder, kept, grads[index], OP_ADD)
+            velocity_out.push(fresh)
+            move = if nesterov {
+                __prim__.graph_binary(builder, __prim__.graph_binary(builder, fresh, decay, OP_MUL), grads[index], OP_ADD)
+            } else {
+                fresh
+            }
+        }
+        let scaled = __prim__.graph_binary(builder, move, rate, OP_MUL)
         updated.push(__prim__.graph_binary(builder, id, scaled, OP_SUB))
     }
 
     var inputs: list[int] = [features, labels]
     for id in state.param_ids { inputs.push(id) }
+    for id in velocity_ids { inputs.push(id) }
     var outputs: list[int] = [loss, carried.value]
     for id in updated { outputs.push(id) }
+    for id in velocity_out { outputs.push(id) }
 
     let handle = __prim__.graph_compile(builder, inputs, outputs)
     if handle < 0 {
@@ -437,6 +485,27 @@ pub fn compile_step(
     }
     var shadow: list[Buffer] = []
     for param in state.params { shadow.push(Buffer(param.size)) }
+    var velocity: list[Buffer] = []
+    var velocity_shadow: list[Buffer] = []
+    if carries {
+        for param in state.params {
+            let first = Buffer(param.size)
+            let second = Buffer(param.size)
+            #: Momentum starts from rest.
+            first.fill_zero()
+            second.fill_zero()
+            velocity.push(first)
+            velocity_shadow.push(second)
+        }
+    }
     _refusal = null
-    return CompiledStep(handle, state.params, shadow, input_shape[0], classes)
+    return CompiledStep(
+        handle,
+        state.params,
+        shadow,
+        velocity,
+        velocity_shadow,
+        input_shape[0],
+        classes
+    )
 }
