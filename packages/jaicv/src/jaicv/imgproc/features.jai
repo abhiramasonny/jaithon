@@ -16,7 +16,7 @@
 #: ```
 import std.math
 from std.core import Printable
-from std.gpu import Kernel
+from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import BORDER_DEFAULT, CV_32F, CV_MAKETYPE, Point, Point2f, Size
 from .common import PRELUDE
@@ -43,6 +43,52 @@ pub const HOUGH_PROBABILISTIC = 1
 pub const HOUGH_GRADIENT = 3
 
 let SOURCE = PRELUDE + """
+/* The Hough vote, a pixel to a thread.
+ *
+ * Every edge pixel votes for every angle, and the votes land wherever the
+ * arithmetic sends them, so the accumulator is shared and the increments are
+ * atomic. On the host the same loop is edge pixels times angles in Jaithon: a
+ * 400 by 400 edge map took half a second there.
+ *
+ * The `+ 0.5` and the floor are kept exactly as the host had them; rounding a
+ * vote into the neighbouring cell would move a line. */
+kernel void hough_accumulate(device const float* src [[buffer(0)]],
+                             device atomic_uint* accumulator [[buffer(1)]],
+                             device const float* table_cos [[buffer(2)]],
+                             device const float* table_sin [[buffer(3)]],
+                             constant uint& count [[buffer(4)]],
+                             constant uint& cols [[buffer(5)]],
+                             constant uint& angles [[buffer(6)]],
+                             constant uint& distances [[buffer(7)]],
+                             constant uint& width [[buffer(8)]],
+                             constant uint& centre [[buffer(9)]],
+                             constant uint& src_off [[buffer(10)]],
+                             constant uint& src_step [[buffer(11)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    /* Through the offset and the row gap, so a view of a bigger picture reads
+     * its own pixels. Taking the storage as packed is what the host did. */
+    if (src[src_off + y * src_step + x] == 0.0f) return;
+    for (uint index = 0u; index < angles; ++index) {
+        int distance = int(floor(float(x) * table_cos[index] + float(y) * table_sin[index] + 0.5f));
+        distance += int(centre);
+        if (distance < 0 || distance >= int(distances)) continue;
+        device atomic_uint *cell = &accumulator[(index + 1u) * width + uint(distance) + 1u];
+        atomic_fetch_add_explicit(cell, 1u, memory_order_relaxed);
+    }
+}
+
+/* The votes are counted as integers and read back as numbers, and a buffer of
+ * one read as the other is a pile of denormals. */
+kernel void hough_collect(device const uint* votes [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant uint& count [[buffer(2)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    out[id] = float(votes[id]);
+}
 /* Every template-matching method is one of six reductions over the same three
  * sums, so one kernel computes all three and the choice is made at the end. */
 kernel void feature_match(device const float* image [[buffer(0)]],
@@ -566,23 +612,26 @@ pub fn hough_lines(
     for _index in 0..(angles + 2) * width { accumulator.push(0) }
     let centre = (distances - 1) // 2
 
-    for y in 0..rows {
-        for x in 0..cols {
-            if values[y * cols + x] == 0.0 { continue }
-            for index in 0..angles {
-                var distance = int(
-                    math.floor(
-                        float(x) * table_cos[index] +
-                            float(y) * table_sin[index] +
-                            0.5
-                    )
-                )
-                distance += centre
-                if distance < 0 or distance >= distances { continue }
-                accumulator[(index + 1) * width + distance + 1] += 1
-            }
-        }
-    }
+    let cells = (angles + 2) * width
+    let votes_buffer = Buffer(cells)
+    votes_buffer.fill_zero()
+    let cos_buffer = Buffer(angles)
+    cos_buffer.upload(table_cos)
+    let sin_buffer = Buffer(angles)
+    sin_buffer.upload(table_sin)
+    kernel_for("hough_accumulate").dispatch_async(
+        [image.storage, votes_buffer, cos_buffer, sin_buffer],
+        rows * cols,
+        [rows * cols, cols, angles, distances, width, centre, image.offset, image.step_]
+    )
+    let counted_buffer = Buffer(cells)
+    kernel_for("hough_collect").dispatch_async([votes_buffer, counted_buffer], cells, [cells])
+    let counted = counted_buffer.download()
+    for index in 0..cells { accumulator[index] = int(counted[index] + 0.5) }
+    counted_buffer.free()
+    votes_buffer.free()
+    cos_buffer.free()
+    sin_buffer.free()
 
     var found: list[HoughLine] = []
     for index in 0..angles {
