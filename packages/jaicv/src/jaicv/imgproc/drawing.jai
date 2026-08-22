@@ -230,6 +230,38 @@ pub class Painter {
         )
     }
 
+    #: Every segment of a run of points, in one call.
+    pub fn strokes(self, points: list[Point], closed: bool, connectivity: int, shift: int) -> void {
+        let count = points.len()
+        if count < 2 { return }
+        var ends: list[int] = []
+        var previous = if closed { points[count - 1] } else { points[0] }
+        let first = if closed { 0 } else { 1 }
+        for index in first..count {
+            let current = points[index]
+            #: A shifted run is in fixed point and has to come back to pixels
+            #: before it is walked, the same rounding `draw_thick` does.
+            let a = if shift > 0 { from_fixed(to_fixed(previous, shift)) } else { previous }
+            let b = if shift > 0 { from_fixed(to_fixed(current, shift)) } else { current }
+            ends.push(a.x)
+            ends.push(a.y)
+            ends.push(b.x)
+            ends.push(b.y)
+            previous = current
+        }
+        __prim__.draw_lines(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            ends,
+            connectivity
+        )
+    }
+
     #: Every row of a convex polygon, in one call. `corners` is the x and y of
     #: each in turn, in fixed point with `shift` fractional bits.
     pub fn fill(self, corners: list[int], shift: int, delta1: int, delta2: int) -> void {
@@ -809,6 +841,14 @@ fn poly_line(
         draw_thick(painter, only, only, thickness, line_type, CAP_START | CAP_END)
         return
     }
+    #: A hairline run has no caps and no quadrilaterals, so the whole thing
+    #: goes over as one batch. A line of text is a few hundred of these strokes
+    #: and handing them over one at a time was most of what drawing it cost.
+    if thickness <= 1 and line_type != LINE_AA {
+        painter.strokes(points, closed, if line_type == LINE_4 { 4 } else { 8 }, shift)
+        return
+    }
+
     #: A closed run caps only the far end of each segment, since the near end
     #: was capped by the segment before it; an open run caps both on the first.
     var caps = if closed { CAP_END } else { CAP_START | CAP_END }
