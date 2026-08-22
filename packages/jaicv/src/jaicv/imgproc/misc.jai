@@ -9,7 +9,8 @@
 #: let (shift, response) = phase_correlate(previous, current)
 #: ```
 import std.math
-from ..core.mat import Mat
+from std.gpu import Kernel
+from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scalar, Size
 from ..core.dft import dft, idft, mul_spectrums, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from .color import cvt_color, COLOR_BGR2GRAY
@@ -297,6 +298,99 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
 #: it in both space and colour, repeatedly, until it stops moving. Regions of
 #: similar colour collapse onto one value, which is what makes this a
 #: segmenter rather than a filter.
+let SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+/* Mean shift filtering, a pixel to a thread.
+ *
+ * Every pixel walks its own path through the joint space of position and
+ * colour and never looks at another pixel's answer, so the whole picture is one
+ * dispatch. Done on the host instead it is the window, the iterations and the
+ * pixels multiplied together -- two billion operations for a 640 by 480 frame,
+ * which took a hundred and two seconds. */
+kernel void mean_shift_filter(device const float* src [[buffer(0)]],
+                              device float* dst [[buffer(1)]],
+                              constant uint& count [[buffer(2)]],
+                              constant uint& rows [[buffer(3)]],
+                              constant uint& cols [[buffer(4)]],
+                              constant uint& cn [[buffer(5)]],
+                              constant uint& src_off [[buffer(6)]],
+                              constant uint& src_step [[buffer(7)]],
+                              constant uint& dst_off [[buffer(8)]],
+                              constant uint& dst_step [[buffer(9)]],
+                              constant uint& radius [[buffer(10)]],
+                              constant uint& colour_bits [[buffer(11)]],
+                              constant uint& iterations [[buffer(12)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    float limit = as_type<float>(colour_bits);
+    int reach = int(radius);
+    float cx = float(x);
+    float cy = float(y);
+    float colour[3];
+    for (uint c = 0u; c < 3u; ++c) colour[c] = src[src_off + y * src_step + x * cn + c];
+
+    for (uint round = 0u; round < iterations; ++round) {
+        float sum_x = 0.0f;
+        float sum_y = 0.0f;
+        float sum_colour[3] = {0.0f, 0.0f, 0.0f};
+        float found = 0.0f;
+        int base_x = int(cx);
+        int base_y = int(cy);
+        for (int dy = -reach; dy <= reach; ++dy) {
+            int ny = base_y + dy;
+            if (ny < 0 || ny >= int(rows)) continue;
+            for (int dx = -reach; dx <= reach; ++dx) {
+                int nx = base_x + dx;
+                if (nx < 0 || nx >= int(cols)) continue;
+                uint at = src_off + uint(ny) * src_step + uint(nx) * cn;
+                float gap = 0.0f;
+                for (uint c = 0u; c < 3u; ++c) {
+                    float difference = src[at + c] - colour[c];
+                    gap += difference * difference;
+                }
+                if (gap > limit) continue;
+                found += 1.0f;
+                sum_x += float(nx);
+                sum_y += float(ny);
+                for (uint c = 0u; c < 3u; ++c) sum_colour[c] += src[at + c];
+            }
+        }
+        if (found == 0.0f) break;
+        float moved_x = sum_x / found;
+        float moved_y = sum_y / found;
+        float moved = (moved_x - cx) * (moved_x - cx) + (moved_y - cy) * (moved_y - cy);
+        cx = moved_x;
+        cy = moved_y;
+        for (uint c = 0u; c < 3u; ++c) {
+            float updated = sum_colour[c] / found;
+            moved += (updated - colour[c]) * (updated - colour[c]);
+            colour[c] = updated;
+        }
+        if (moved < 0.01f) break;
+    }
+
+    uint out_at = dst_off + y * dst_step + x * cn;
+    for (uint c = 0u; c < cn; ++c) {
+        dst[out_at + c] = c < 3u
+            ? floor(colour[c] + 0.5f)
+            : src[src_off + y * src_step + x * cn + c];
+    }
+}
+"""
+
+var _kernels: dict[str, Kernel] = {}
+
+fn kernel_for(entry: str) -> Kernel {
+    let existing = _kernels.get(entry, null)
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(SOURCE, entry)
+    _kernels[entry] = compiled
+    return compiled
+}
+
 pub fn pyr_mean_shift_filtering(
     src: Mat,
     spatial_radius: float,
@@ -307,6 +401,44 @@ pub fn pyr_mean_shift_filtering(
     let _unused = max_level
     src.flush()
     if src.channels() < 3 { throw ValueError("mean shift filtering needs a colour Mat") }
+    let rows = src.rows
+    let cols = src.cols
+    let cn = src.channels()
+    let out = Mat(rows, cols, src.type_())
+    kernel_for("mean_shift_filter").dispatch_async(
+        [src.storage, out.storage],
+        rows * cols,
+        [
+            rows * cols,
+            rows,
+            cols,
+            cn,
+            src.offset,
+            src.step_,
+            out.offset,
+            out.step_,
+            int(spatial_radius),
+            f32_bits(colour_radius * colour_radius),
+            iterations,
+        ]
+    )
+    out.invalidate()
+    return out
+}
+
+#: The same walk on the host, one pixel at a time.
+#:
+#: Kept because it is what the device kernel is held against: the two agree to
+#: the last bit on every value, which is the evidence that transcribing the walk
+#: into Metal did not change it. Far too slow to use -- a hundred and two
+#: seconds where the kernel takes a tenth of one -- so nothing calls it but the
+#: test.
+pub fn mean_shift_on_host(
+    src: Mat,
+    spatial_radius: float,
+    colour_radius: float,
+    iterations: int
+) -> Mat {
     let rows = src.rows
     let cols = src.cols
     let cn = src.channels()

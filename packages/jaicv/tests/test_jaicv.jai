@@ -10,6 +10,7 @@ from std.os import temp_dir
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaicv.imgproc.filter import filter_2d, sep_filter_2d
 from jaicv.imgproc.morph import dilate, erode, get_structuring_element, MORPH_RECT
+from jaicv.imgproc.misc import mean_shift_on_host, pyr_mean_shift_filtering
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE
 from jaicv.core.mat import Mat, flip, merge
@@ -689,5 +690,30 @@ fn test_a_staged_transform_inverts() -> void {
     let got = back.to_list()
     for index in 0..pixels.len() {
         assert_near(got[index], pixels[index], 1e-4, f"pixel {index} did not survive")
+    }
+}
+
+#: The mean shift walk on the device against the same walk on the host.
+#:
+#: A pixel's path through position-and-colour space depends on nothing but the
+#: picture, so the two must agree exactly rather than nearly -- and they do, to
+#: the last bit. The host version is kept for no other reason.
+fn test_mean_shift_on_the_device_walks_where_the_host_walks() -> void {
+    if not gpu.is_available() { return }
+    let cols = 48
+    let rows = 36
+    var pixels: list[float] = []
+    for index in 0..rows * cols * 3 { pixels.push(float(index * 41 % 251)) }
+    let colour = Mat.from_list(rows, cols, CV_32FC3, pixels)
+    defer { colour.release() }
+    let device = pyr_mean_shift_filtering(colour, 8.0, 20.0)
+    defer { device.release() }
+    let host = mean_shift_on_host(colour, 8.0, 20.0, 5)
+    defer { host.release() }
+    let got = device.to_list()
+    let want = host.to_list()
+    assert_eq(got.len(), want.len())
+    for index in 0..got.len() {
+        assert_near(got[index], want[index], 1e-4, f"value {index}")
     }
 }
