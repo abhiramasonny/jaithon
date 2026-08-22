@@ -17,6 +17,7 @@
 #: }
 #: ```
 import std.math
+from std.algo.sort import natural_order, sort_by
 from std.core import Printable
 from ..core.mat import Mat
 from ..core.types import Point, Point2f, Rect, RotatedRect, Scalar, Size2f
@@ -374,15 +375,14 @@ fn cross_sign(o: Point, a: Point, b: Point) -> int {
 }
 
 fn sorted_unique(points: list[Point]) -> list[Point] {
-    var out: list[Point] = []
-    for point in points {
-        var at = out.len()
-        while at > 0 and
-            (point.x < out[at - 1].x or point.x == out[at - 1].x and point.y < out[at - 1].y) {
-            at -= 1
-        }
-        out.insert(at, point)
-    }
+    #: By x, and by y where the x agree. A hull is often asked for over a whole
+    #: contour, which is thousands of points, and inserting each into a list
+    #: already in order costs the square of that.
+    let out = sort_by(points, |a, b| if a.x != b.x {
+        natural_order(a.x, b.x)
+    } else {
+        natural_order(a.y, b.y)
+    })
     var unique: list[Point] = []
     for point in out {
         let count = unique.len()

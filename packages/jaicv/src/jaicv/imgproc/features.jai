@@ -605,12 +605,10 @@ pub fn hough_lines(
         }
     }
 
-    var ordered: list[HoughLine] = []
-    for line in found {
-        var at = ordered.len()
-        while at > 0 and line.votes > ordered[at - 1].votes { at -= 1 }
-        ordered.insert(at, line)
-    }
+    #: Most votes first, sorted rather than inserted one at a time: a busy
+    #: edge map produces thousands of lines, and placing each into an ordered
+    #: list costs the square of that.
+    let ordered = found.sort(key: |line| line.votes, reverse: true)
     if lines_max > 0 and ordered.len() > lines_max {
         var trimmed: list[HoughLine] = []
         for index in 0..lines_max { trimmed.push(ordered[index]) }
