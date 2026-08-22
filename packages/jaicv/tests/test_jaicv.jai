@@ -12,6 +12,7 @@ from jaicv.imgproc.filter import filter_2d, sep_filter_2d
 from jaicv.imgproc.morph import dilate, erode, get_structuring_element, MORPH_RECT
 from jaicv.imgproc.misc import mean_shift_on_host, pyr_mean_shift_filtering
 from jaicv.ml.models import k_nearest_create
+from jaicv.imgproc.features import corner_min_eigen_val, good_features_to_track
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE
 from jaicv.core.mat import Mat, flip, merge
@@ -828,5 +829,45 @@ fn test_kmeans_puts_every_sample_under_its_nearest_centre() -> void {
         }
         labels.release()
         centres.release()
+    }
+}
+
+#: Corners come back strongest first and no closer than they were asked to be.
+#:
+#: The ordering is what the spatial thinning walks, so getting it wrong changes
+#: which corners survive rather than raising an error. It used to be built by
+#: inserting every candidate into a sorted list, which is the same answer at
+#: the square of the cost.
+fn test_good_features_are_ordered_and_spaced() -> void {
+    if not gpu.is_available() { return }
+    let side = 96
+    var values: list[float] = []
+    var state = 99
+    for _index in 0..side * side {
+        state = (state * 1103515245 + 12345) % 2147483648
+        values.push(float(state % 251))
+    }
+    let image = Mat.from_list(side, side, CV_32FC1, values)
+    defer { image.release() }
+    let spacing = 4.0
+    let found = good_features_to_track(image, 40, 0.01, spacing)
+    assert_true(found.len() > 1, "a textured picture has corners in it")
+    assert_true(found.len() <= 40, "no more corners than were asked for")
+    let strength = corner_min_eigen_val(image, 3, 3).to_list()
+    var previous = 1e30
+    for point in found {
+        let here = strength[int(point.y) * side + int(point.x)]
+        assert_true(here <= previous + 1e-4, "corners came back out of order")
+        previous = here
+    }
+    for (index, point) in found.enumerate() {
+        for other in index + 1..found.len() {
+            let dx = point.x - found[other].x
+            let dy = point.y - found[other].y
+            assert_true(
+                dx * dx + dy * dy >= spacing * spacing - 1e-4,
+                f"corners {index} and {other} are closer than {spacing}"
+            )
+        }
     }
 }

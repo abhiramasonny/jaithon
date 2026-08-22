@@ -421,12 +421,11 @@ pub fn good_features_to_track(
         }
     }
 
-    var ordered: list[int] = []
-    for cell in candidates {
-        var at = ordered.len()
-        while at > 0 and values[cell] > values[ordered[at - 1]] { at -= 1 }
-        ordered.insert(at, cell)
-    }
+    #: Strongest first. Inserting each candidate into a sorted list instead
+    #: makes the work grow with the square of how many there are, and on a
+    #: textured frame there are tens of thousands: 640 by 480 took 28 seconds
+    #: that way, nearly all of it shuffling a list along.
+    let ordered = candidates.sort(key: |cell| values[cell], reverse: true)
 
     var kept: list[Point2f] = []
     let squared = min_distance * min_distance
