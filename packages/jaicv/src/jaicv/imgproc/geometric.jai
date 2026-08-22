@@ -179,6 +179,71 @@ kernel void geo_remap(device const float* src [[buffer(0)]],
 /* The 5x5 Gaussian OpenCV builds its pyramid from, applied then decimated. */
 constant float kPyramidKernel[5] = {0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f};
 
+/* The down step's blur, taken one axis at a time.
+ *
+ * The five-tap pyramid kernel is a product of its axes like any other Gaussian,
+ * so the twenty-five samples a destination pixel used to gather are ten. The
+ * horizontal pass decimates as it goes -- it only ever writes the even columns
+ * the result keeps -- so the intermediate is half width and the vertical pass
+ * reads a quarter of what a full-size one would.
+ *
+ * The intermediate is indexed in source rows and destination columns, which is
+ * why it takes `rows` and `out_cols` rather than one pair. */
+kernel void geo_pyr_down_row(device const float* src [[buffer(0)]],
+                             device float* tmp [[buffer(1)]],
+                             constant uint& count [[buffer(2)]],
+                             constant uint& rows [[buffer(3)]],
+                             constant uint& cols [[buffer(4)]],
+                             constant uint& cn [[buffer(5)]],
+                             constant uint& src_off [[buffer(6)]],
+                             constant uint& src_step [[buffer(7)]],
+                             constant uint& out_cols [[buffer(8)]],
+                             constant uint& border [[buffer(9)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint channel = id % cn;
+    uint pixel = id / cn;
+    uint y = pixel / out_cols;
+    uint x = pixel - y * out_cols;
+    int cx = int(x) * 2;
+    float total = 0.0f;
+    for (int dx = -2; dx <= 2; ++dx) {
+        total += kPyramidKernel[dx + 2] *
+                 fetch(src, int(y), cx + dx, channel, rows, cols, cn,
+                       src_off, src_step, border, 0.0f);
+    }
+    tmp[id] = total;
+}
+
+kernel void geo_pyr_down_col(device const float* tmp [[buffer(0)]],
+                             device float* dst [[buffer(1)]],
+                             constant uint& count [[buffer(2)]],
+                             constant uint& rows [[buffer(3)]],
+                             constant uint& out_cols [[buffer(4)]],
+                             constant uint& cn [[buffer(5)]],
+                             constant uint& dst_off [[buffer(6)]],
+                             constant uint& dst_step [[buffer(7)]],
+                             constant uint& border [[buffer(8)]],
+                             constant uint& low_bits [[buffer(9)]],
+                             constant uint& high_bits [[buffer(10)]],
+                             constant uint& integral [[buffer(11)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint channel = id % cn;
+    uint pixel = id / cn;
+    uint y = pixel / out_cols;
+    uint x = pixel - y * out_cols;
+    int cy = int(y) * 2;
+    float total = 0.0f;
+    for (int dy = -2; dy <= 2; ++dy) {
+        total += kPyramidKernel[dy + 2] *
+                 fetch(tmp, cy + dy, int(x), channel, rows, out_cols, cn,
+                       0u, out_cols * cn, border, 0.0f);
+    }
+    put(dst, dst_off + y * dst_step + x * cn + channel, total,
+        as_type<float>(low_bits), as_type<float>(high_bits), integral);
+}
+
 kernel void geo_pyr_down(device const float* src [[buffer(0)]],
                          device float* dst [[buffer(1)]],
                          constant uint& count [[buffer(2)]],
@@ -483,20 +548,27 @@ pub fn pyr_down(src: Mat, size: Size? = null, border_mode: int = BORDER_REFLECT_
     let out = Mat(out_rows, out_cols, src.flags)
     let count = out_rows * out_cols * src.channels()
     if count == 0 { return out }
-    var scalars = [
-        count,
-        src.rows,
-        src.cols,
-        src.channels(),
-        src.offset,
-        src.step_,
-        out_cols,
-        out.offset,
-        out.step_,
-        border_mode,
-    ]
+    #: Source rows by destination columns, packed and float: the two passes
+    #: hand each other unrounded values and the depth is applied at the end.
+    let middle = Mat(src.rows, out_cols, CV_MAKETYPE(CV_32F, src.channels()))
+    kernel_for("geo_pyr_down_row").dispatch_async(
+        [src.storage, middle.storage],
+        src.rows * out_cols * src.channels(),
+        [
+            src.rows * out_cols * src.channels(),
+            src.rows,
+            src.cols,
+            src.channels(),
+            src.offset,
+            src.step_,
+            out_cols,
+            border_mode,
+        ]
+    )
+    var scalars = [count, src.rows, out_cols, src.channels(), out.offset, out.step_, border_mode]
     for value in saturation_args(out.flags) { scalars.push(value) }
-    kernel_for("geo_pyr_down").dispatch_async([src.storage, out.storage], count, scalars)
+    kernel_for("geo_pyr_down_col").dispatch_async([middle.storage, out.storage], count, scalars)
+    middle.release()
     out.invalidate()
     return out
 }
