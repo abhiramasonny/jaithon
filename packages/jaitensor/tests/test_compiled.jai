@@ -601,3 +601,50 @@ fn improvised(seed: int) -> list[Layer] {
     }
     return layers
 }
+
+#: The step still trains when its products are worked out in half precision.
+#:
+#: Every other test here runs with mixed precision off, which is what lets them
+#: hold the compiled step to 1e-5 of the eager one. That leaves the narrowed
+#: path -- the one a benchmark and a real training run both take -- covered by
+#: nothing, so this trains the same model both ways and holds the two together
+#: loosely: half precision moves the loss, and it must not move it much.
+fn test_a_narrowed_step_trains_where_the_wide_one_does() -> void {
+    if not gpu.is_available() { return }
+    let (x, y) = batch()
+    defer { x.free() }
+    defer { y.free() }
+
+    let wide = compile_step(convolutional(5), [BATCH, SIDE, SIDE, CHANNELS], CLASSES, RATE)
+    assert_true(wide is not null, f"would not compile: {refusal()}")
+    var wide_first = 0.0
+    var wide_last = 0.0
+    for step in 0..10 {
+        let value = wide.run(x, y)
+        if step == 0 { wide_first = value }
+        wide_last = value
+    }
+    wide.free()
+
+    gpu.set_mixed_precision(true)
+    let narrow = compile_step(convolutional(5), [BATCH, SIDE, SIDE, CHANNELS], CLASSES, RATE)
+    assert_true(narrow is not null, f"would not compile narrowed: {refusal()}")
+    var narrow_first = 0.0
+    var narrow_last = 0.0
+    for step in 0..10 {
+        let value = narrow.run(x, y)
+        if step == 0 { narrow_first = value }
+        narrow_last = value
+    }
+    narrow.free()
+    gpu.set_mixed_precision(false)
+
+    assert_near(narrow_first, wide_first, 1e-2, "the first loss should barely move")
+    assert_true(narrow_last < narrow_first, "the narrowed step has to be learning")
+    assert_near(
+        narrow_last,
+        wide_last,
+        math.fabs(wide_last) * 0.05 + 1e-3,
+        "ten narrowed steps should land within a few percent of ten wide ones"
+    )
+}

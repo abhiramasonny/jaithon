@@ -684,6 +684,13 @@ int jaiGraphInput(JaiGraphBuilder *b, const int64_t *dims, int rank) {
 int jaiGraphConstant(JaiGraphBuilder *b, const float *values, const int64_t *dims, int rank) {
     (void)b; (void)values; (void)dims; (void)rank; return -1;
 }
+int jaiGraphCast(JaiGraphBuilder *b, int x, int half) {
+    (void)b;
+    (void)x;
+    (void)half;
+    return -1;
+}
+
 int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) { (void)b; (void)x; (void)op; return -1; }
 int jaiGraphClamp(JaiGraphBuilder *b, int x, float lo, float hi) {
     (void)b; (void)x; (void)lo; (void)hi; return -1;

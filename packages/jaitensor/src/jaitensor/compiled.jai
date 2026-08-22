@@ -114,6 +114,26 @@ fn product(shape: list[int]) -> int {
 #:
 #: Softmax is linear here on purpose, and only ever on the last layer, which
 #: `Sequential` enforces: the loss takes logits and does the softmax itself.
+#: The products a step is allowed to work out in half precision.
+#:
+#: Only the convolution and the matrix product: those are where the arithmetic
+#: is, and they are what a framework's autocast narrows too. Everything else --
+#: the normalisations, the loss, the optimiser and the weights themselves --
+#: stays wide, so the values carried between steps never lose a bit.
+#:
+#: Off unless the caller asked for mixed precision, and the equivalence tests
+#: run with it off, which is why they can hold the step to 1e-5 of the eager
+#: path.
+fn narrow(state: Build, value: int) -> int {
+    if not gpu.mixed_precision() { return value }
+    return __prim__.graph_cast(state.builder, value, 1)
+}
+
+fn widen(state: Build, value: int) -> int {
+    if not gpu.mixed_precision() { return value }
+    return __prim__.graph_cast(state.builder, value, 0)
+}
+
 fn emit_activation(state: Build, value: int, activation: Activation) -> int {
     let b = state.builder
     if activation == Activation.Linear or activation == Activation.Softmax { return value }
@@ -162,7 +182,10 @@ fn emit_dense(state: Build, layer: any, input: Built) -> Built? {
     let weights = state.parameter(params[0])
     let bias = state.parameter(params[1])
     let width = params[0].shape[1]
-    let producted = __prim__.graph_matmul(b, input.value, weights)
+    let producted = widen(
+        state,
+        __prim__.graph_matmul(b, narrow(state, input.value), narrow(state, weights))
+    )
     let biased = __prim__.graph_binary(b, producted, bias, OP_ADD)
     let shape = [input.shape[0], width]
     let activated = emit_activation(state, biased, layer.activation)
@@ -199,7 +222,13 @@ fn emit_conv(state: Build, layer: any, input: Built) -> Built? {
     #: channels-last and kernels as height, width, in, out, which is not what
     #: the builder assumes by default.
     let settings = [stride, stride, pad, pad, pad, pad, 1, 1, 1, 1, 1]
-    let made = __prim__.graph_conv(b, input.value, kernel, bias, settings)
+    #: The convolution takes its bias in the same call, so narrowing means
+    #: narrowing all three and widening what comes back.
+    let made = if bias < 0 {
+        widen(state, __prim__.graph_conv(b, narrow(state, input.value), narrow(state, kernel), -1, settings))
+    } else {
+        widen(state, __prim__.graph_conv(b, narrow(state, input.value), narrow(state, kernel), narrow(state, bias), settings))
+    }
     if made < 0 {
         state.refuse("a convolution the platform would not build")
         return null

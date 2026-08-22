@@ -121,6 +121,17 @@ static bool nGraphConstant(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGraphCast(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t x, half;
+    if (!requireBuilder(args[0], 1, "graph_cast", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_cast", &x)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_cast", &half)) return false;
+    *out = INT_VAL(jaiGraphCast(builder, (int)x, (int)half));
+    return true;
+}
+
 static bool nGraphUnary(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
@@ -749,6 +760,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_free",           nGraphFree,           1, 1);
     jaiDefineNative("__prim__.graph_input",          nGraphInput,          2, 2);
     jaiDefineNative("__prim__.graph_constant",       nGraphConstant,       3, 3);
+    jaiDefineNative("__prim__.graph_cast",           nGraphCast,           3, 3);
     jaiDefineNative("__prim__.graph_unary",          nGraphUnary,          3, 3);
     jaiDefineNative("__prim__.graph_clamp",          nGraphClamp,          4, 4);
     jaiDefineNative("__prim__.graph_leaky_relu",     nGraphLeakyRelu,      3, 3);

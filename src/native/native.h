@@ -197,6 +197,7 @@ int              jaiGraphConstant(JaiGraphBuilder *b, const float *values,
 /* 0 relu, 1 sigmoid, 2 tanh, 3 exp, 4 log, 5 sqrt, 6 neg, 7 abs, 8 erf,
  * 9 silu, 10 floor, 11 ceil, 12 reciprocal, 13 square, 14 rsqrt,
  * 15 truncate, 16 not-zero. */
+int              jaiGraphCast(JaiGraphBuilder *b, int x, int half);
 int              jaiGraphUnary(JaiGraphBuilder *b, int x, int op);
 int              jaiGraphClamp(JaiGraphBuilder *b, int x, float low, float high);
 int              jaiGraphLeakyRelu(JaiGraphBuilder *b, int x, float slope);

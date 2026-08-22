@@ -151,6 +151,22 @@ int jaiGraphConstant(JaiGraphBuilder *b, const float *values,
     }
 }
 
+/* A tensor at another precision.
+ *
+ * The graph's placeholders are all float32, so this is how a step asks for its
+ * products to be worked out in half and handed back wide. The gradient of a
+ * cast is a cast, which the framework's own differentiation already knows. */
+int jaiGraphCast(JaiGraphBuilder *b, int x, int half) {
+    MPSGraphTensor *in = tensorAt(b, x);
+    if (in == nil) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        MPSDataType want = half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+        if (in.dataType == want) return x;
+        return record(b, [g castTensor:in toType:want name:nil]);
+    }
+}
+
 int jaiGraphUnary(JaiGraphBuilder *b, int x, int op) {
     MPSGraphTensor *in = tensorAt(b, x);
     if (in == nil) return -1;
