@@ -27,14 +27,20 @@ fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool]
         throwaway.free()
     }
     gpu.synchronize()
-    var live: list[Tensor] = []
+    #: One result stays alive so the work cannot be elided, and each earlier
+    #: one is handed straight back. The peer keeps exactly one too -- Python
+    #: drops the previous on rebinding -- and holding every result instead put
+    #: a working set of tens of megabytes between this side and its cache,
+    #: which is a difference in the harness, not in the operation.
     let started = Instant.now()
-    for _i in 0..repeats {
-        live.push(multi_head_attention(q, k, v, heads))
+    var output = multi_head_attention(q, k, v, heads)
+    for _i in 1..repeats {
+        let made = multi_head_attention(q, k, v, heads)
+        output.free()
+        output = made
     }
     gpu.synchronize()
     let elapsed = started.elapsed().to_seconds()
-    let output = live[live.len() - 1]
     let offsets = [0, output.size // 2, output.size - 1]
     var valid = true
     var nonzero = false
@@ -43,7 +49,7 @@ fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool]
         if not math.is_finite(value) or math.fabs(value) > 1.01 { valid = false }
         if math.fabs(value) > 1e-6 { nonzero = true }
     }
-    for y in live { y.free() }
+    output.free()
     return (elapsed, valid and nonzero)
 }
 

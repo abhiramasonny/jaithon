@@ -63,12 +63,21 @@ fn main() -> int {
         out.free()
     }
     gpu.synchronize()
+    #: One result stays alive so the work cannot be elided, and each earlier
+    #: one is handed straight back. The peer keeps exactly one too -- Python
+    #: drops the previous on rebinding -- and holding every result instead put
+    #: a working set of tens of megabytes between this side and its cache,
+    #: which is a difference in the harness, not in the operation.
     let started = Instant.now()
-    var live: list[Tensor] = []
-    for _r in 0..repeats { live.push(block(x, qw, ow, w1, w2, g1, b1, g2, b2, inner_bias, heads)) }
+    var last = block(x, qw, ow, w1, w2, g1, b1, g2, b2, inner_bias, heads)
+    for _r in 1..repeats {
+        let made = block(x, qw, ow, w1, w2, g1, b1, g2, b2, inner_bias, heads)
+        last.free()
+        last = made
+    }
     gpu.synchronize()
     let seconds = started.elapsed().to_seconds()
-    let check = live[live.len() - 1].buffer().download(0, 1)[0]
+    let check = last.buffer().download(0, 1)[0]
     let flops = float(repeats) *
         (12.0 * float(tokens) * float(dim) * float(dim) + 4.0 * float(tokens) * float(tokens) * float(dim))
     let sane = math.is_finite(check) and math.fabs(check) < 1000.0
