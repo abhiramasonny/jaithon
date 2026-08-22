@@ -10,7 +10,7 @@
 #: ```
 import std.math
 from std.algo.sort import natural_order, sort_by
-from std.gpu import Kernel
+from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scalar, Size
 from ..core.dft import dft, idft, mul_spectrums, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
@@ -93,18 +93,20 @@ pub fn apply_color_map(src: Mat, map_id: int = COLORMAP_JET) -> Mat {
     }
     let grey = if channels == 3 { cvt_color(src, COLOR_BGR2GRAY) } else { src }
     let base = map_id * COLORMAP_LEVELS * 3
-    let values = grey.values()
-    var out: list[float] = []
-    for value in values {
-        var level = int(value + 0.5)
-        if level < 0 { level = 0 }
-        if level > COLORMAP_LEVELS - 1 { level = COLORMAP_LEVELS - 1 }
-        let at = base + level * 3
-        out.push(float(COLORMAP_TABLE[at]))
-        out.push(float(COLORMAP_TABLE[at + 1]))
-        out.push(float(COLORMAP_TABLE[at + 2]))
-    }
-    return Mat.from_list(grey.rows, grey.cols, CV_MAKETYPE(CV_8U, 3), out)
+    var entries: list[float] = []
+    for index in 0..COLORMAP_LEVELS * 3 { entries.push(float(COLORMAP_TABLE[base + index])) }
+    let table = Buffer(entries.len())
+    table.upload(entries)
+    let count = grey.rows * grey.cols
+    let out = Mat(grey.rows, grey.cols, CV_MAKETYPE(CV_8U, 3))
+    kernel_for("colormap_apply").dispatch_async(
+        [grey.storage, table, out.storage],
+        count,
+        [count, COLORMAP_LEVELS, grey.offset, grey.step_, grey.cols]
+    )
+    out.invalidate()
+    table.free()
+    return out
 }
 
 #: A patch of an image, centred anywhere, not only on a pixel.
@@ -290,6 +292,30 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
 #: segmenter rather than a filter.
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
+
+/* A grey picture coloured through a 256-entry table, a pixel to a thread.
+ *
+ * The table is three numbers per level and the picture is millions of pixels,
+ * so the mapping belongs here rather than in a host loop that pushes three
+ * floats per pixel into a list. */
+kernel void colormap_apply(device const float* grey [[buffer(0)]],
+                           device const float* table [[buffer(1)]],
+                           device float* out [[buffer(2)]],
+                           constant uint& count [[buffer(3)]],
+                           constant uint& levels [[buffer(4)]],
+                           constant uint& src_off [[buffer(5)]],
+                           constant uint& src_step [[buffer(6)]],
+                           constant uint& cols [[buffer(7)]],
+                           uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    float value = grey[src_off + y * src_step + x];
+    uint level = uint(clamp(floor(value + 0.5f), 0.0f, float(levels - 1u)));
+    out[id * 3u] = table[level * 3u];
+    out[id * 3u + 1u] = table[level * 3u + 1u];
+    out[id * 3u + 2u] = table[level * 3u + 2u];
+}
 
 /* The cross spectrum reduced to its phase.
  *
