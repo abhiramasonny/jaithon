@@ -34,6 +34,30 @@ pub const DFT_REAL_OUTPUT = 32
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
 
+/* Two spectra multiplied together, a pixel to a thread.
+ *
+ * Either side may be real or complex, and the right one may be conjugated,
+ * which is what a correlation asks for. Done on the host it is a walk over the
+ * whole spectrum and a list of two floats per pixel handed to `Mat.from_list`.
+ */
+kernel void dft_multiply(device const float* left [[buffer(0)]],
+                         device const float* right [[buffer(1)]],
+                         device float* out [[buffer(2)]],
+                         constant uint& count [[buffer(3)]],
+                         constant uint& left_cn [[buffer(4)]],
+                         constant uint& right_cn [[buffer(5)]],
+                         constant uint& conjugate [[buffer(6)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float ar = left[id * left_cn];
+    float ai = left_cn > 1u ? left[id * left_cn + 1u] : 0.0f;
+    float br = right[id * right_cn];
+    float bi = right_cn > 1u ? right[id * right_cn + 1u] : 0.0f;
+    if (conjugate != 0u) bi = -bi;
+    out[id * 2u] = ar * br - ai * bi;
+    out[id * 2u + 1u] = ar * bi + ai * br;
+}
+
 /* One stage of a Stockham autosort transform.
  *
  * The classic Cooley-Tukey needs its input bit-reversed; Stockham writes each
@@ -529,21 +553,17 @@ pub fn mul_spectrums(a: Mat, b: Mat, flags: int = 0, conjugate: bool = false) ->
     if a.rows != b.rows or a.cols != b.cols {
         throw ValueError("two spectra have to be the same size")
     }
-    let left = a.values()
-    let right = b.values()
-    let left_complex = CV_MAT_CN(a.type_()) == 2
-    let right_complex = CV_MAT_CN(b.type_()) == 2
-    var out: list[float] = []
-    for index in 0..a.rows * a.cols {
-        let ar = if left_complex { left[index * 2] } else { left[index] }
-        let ai = if left_complex { left[index * 2 + 1] } else { 0.0 }
-        let br = if right_complex { right[index * 2] } else { right[index] }
-        var bi = if right_complex { right[index * 2 + 1] } else { 0.0 }
-        if conjugate { bi = -bi }
-        out.push(ar * br - ai * bi)
-        out.push(ar * bi + ai * br)
-    }
-    return Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 2), out)
+    a.flush()
+    b.flush()
+    let count = a.rows * a.cols
+    let out = Mat(a.rows, a.cols, CV_MAKETYPE(CV_32F, 2))
+    kernel_for("dft_multiply").dispatch_async([a.storage, b.storage, out.storage], count, [count, CV_MAT_CN(a.type_()), CV_MAT_CN(b.type_()), if conjugate {
+        1
+    } else {
+        0
+    }])
+    out.invalidate()
+    return out
 }
 
 #: The discrete cosine transform of an image, in its second form.

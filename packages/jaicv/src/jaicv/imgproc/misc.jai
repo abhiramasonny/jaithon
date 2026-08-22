@@ -16,7 +16,8 @@ from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scala
 from ..core.dft import dft, idft, mul_spectrums, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from .color import cvt_color, COLOR_BGR2GRAY
 from .colormap_data import COLORMAP_COUNT, COLORMAP_LEVELS, COLORMAP_TABLE
-from .geometric import remap
+from ..core.stats import min_max_loc
+from .geometric import crop, remap
 
 #: Red through yellow to white.
 pub const COLORMAP_AUTUMN = 0
@@ -231,56 +232,44 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
     let cross = mul_spectrums(fa, fb, 0, true)
     #: Dividing by the magnitude leaves only the phase, which is where the
     #: shift lives; the magnitudes carry the content and would swamp it.
-    let values = cross.to_list()
-    var normalised: list[float] = []
-    for index in 0..first.rows * first.cols {
-        let re = values[index * 2]
-        let im = values[index * 2 + 1]
-        let size = math.sqrt(re * re + im * im)
-        if size < 1e-12 {
-            normalised.push(0.0)
-            normalised.push(0.0)
-            continue
-        }
-        normalised.push(re / size)
-        normalised.push(im / size)
-    }
-    let raw = idft(Mat.from_list(first.rows, first.cols, CV_MAKETYPE(CV_32F, 2), normalised), DFT_SCALE | DFT_REAL_OUTPUT).to_list()
+    let cells = first.rows * first.cols
+    let phased = Mat(first.rows, first.cols, CV_MAKETYPE(CV_32F, 2))
+    kernel_for("phase_normalise").dispatch_async([cross.storage, phased.storage], cells, [cells])
+    phased.invalidate()
+    let raw = idft(phased, DFT_SCALE | DFT_REAL_OUTPUT)
 
     #: The surface is shifted so zero lag sits in the middle, which is what
     #: lets the peak be read off as a displacement from the centre and lets a
     #: negative shift be found without wrapping.
     let rows = first.rows
     let cols = first.cols
-    var surface: list[float] = []
-    for _index in 0..rows * cols { surface.push(0.0) }
-    for y in 0..rows {
-        for x in 0..cols {
-            let sy = (y + rows // 2) % rows
-            let sx = (x + cols // 2) % cols
-            surface[sy * cols + sx] = raw[y * cols + x]
-        }
-    }
+    let surface = Mat(rows, cols, CV_MAKETYPE(CV_32F, 1))
+    kernel_for("spectrum_shift").dispatch_async(
+        [raw.storage, surface.storage],
+        cells,
+        [cells, rows, cols]
+    )
+    surface.invalidate()
 
-    var peak = -1e300
-    var peak_at = 0
-    for index in 0..surface.len() {
-        if surface[index] > peak {
-            peak = surface[index]
-            peak_at = index
-        }
-    }
+    #: The peak comes from the device reduction rather than a walk here, and
+    #: only the square around it is read back.
+    let (_low, _high, _low_at, high_at) = min_max_loc(surface)
+    let px = high_at.x
+    let py = high_at.y
 
     #: The peak is one pixel wide but the shift is not, so the centre of mass
     #: of the five by five around it is where the answer really is.
-    let px = peak_at % cols
-    let py = peak_at // cols
+    let from_x = max(px - 2, 0)
+    let from_y = max(py - 2, 0)
+    let to_x = min(px + 3, cols)
+    let to_y = min(py + 3, rows)
+    let patch = crop(surface, Rect(from_x, from_y, to_x - from_x, to_y - from_y)).to_list()
     var weight = 0.0
     var wx = 0.0
     var wy = 0.0
-    for y in max(py - 2, 0)..min(py + 3, rows) {
-        for x in max(px - 2, 0)..min(px + 3, cols) {
-            let value = surface[y * cols + x]
+    for y in from_y..to_y {
+        for x in from_x..to_x {
+            let value = patch[(y - from_y) * (to_x - from_x) + (x - from_x)]
             weight += value
             wx += float(x) * value
             wy += float(y) * value
@@ -301,6 +290,44 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
 #: segmenter rather than a filter.
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
+
+/* The cross spectrum reduced to its phase.
+ *
+ * Dividing by the magnitude leaves only the phase, which is where the shift
+ * lives; the magnitudes carry the content and would swamp it. A pixel to a
+ * thread -- it was a walk over the whole picture on the host. */
+kernel void phase_normalise(device const float* cross [[buffer(0)]],
+                            device float* out [[buffer(1)]],
+                            constant uint& count [[buffer(2)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float re = cross[id * 2u];
+    float im = cross[id * 2u + 1u];
+    float size = sqrt(re * re + im * im);
+    if (size < 1e-12f) {
+        out[id * 2u] = 0.0f;
+        out[id * 2u + 1u] = 0.0f;
+        return;
+    }
+    out[id * 2u] = re / size;
+    out[id * 2u + 1u] = im / size;
+}
+
+/* Zero lag moved to the middle, so the peak reads off as a displacement from
+ * the centre and a negative shift is found without wrapping. */
+kernel void spectrum_shift(device const float* raw [[buffer(0)]],
+                           device float* surface [[buffer(1)]],
+                           constant uint& count [[buffer(2)]],
+                           constant uint& rows [[buffer(3)]],
+                           constant uint& cols [[buffer(4)]],
+                           uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint sy = (y + rows / 2u) % rows;
+    uint sx = (x + cols / 2u) % cols;
+    surface[sy * cols + sx] = raw[id];
+}
 
 /* Mean shift filtering, a pixel to a thread.
  *
