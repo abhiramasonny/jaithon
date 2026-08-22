@@ -2263,3 +2263,31 @@ fn test_max_with_index_refuses_anything_but_rank_two() -> void {
     defer { flat.free() }
     assert_throws(ValueError, || jt.max_with_index(flat))
 }
+
+#: Reducing down the columns gives what transposing and reducing along the rows
+#: gives, which is the pass it exists to avoid.
+fn test_max_with_index_down_the_columns_matches_a_transpose() -> void {
+    if not jt.is_available() { return }
+    var values: list[float] = []
+    for index in 0..24 * 57 { values.push(float(index * 41 % 91 - 45) * 0.125) }
+    let input = Tensor([24, 57], values)
+    defer { input.free() }
+    let (peaks, wheres) = jt.max_with_index(input, axis: 0)
+    defer { peaks.free() }
+    defer { wheres.free() }
+    let flipped = jt.transpose(input)
+    defer { flipped.free() }
+    let (want_peaks, want_wheres) = jt.max_with_index(flipped, axis: -1)
+    defer { want_peaks.free() }
+    defer { want_wheres.free() }
+    assert_eq(peaks.shape, [57])
+    assert_eq(peaks.download(), want_peaks.download())
+    assert_eq(wheres.download(), want_wheres.download())
+}
+
+fn test_max_with_index_refuses_an_axis_it_has_no_kernel_for() -> void {
+    if not jt.is_available() { return }
+    let input = Tensor([4, 5])
+    defer { input.free() }
+    assert_throws(ValueError, || jt.max_with_index(input, axis: 2))
+}

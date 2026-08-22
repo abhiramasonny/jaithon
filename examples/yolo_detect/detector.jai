@@ -96,19 +96,18 @@ pub fn decode(
     let rows = 84
     let cells = output.size // rows
     #: Rows four onward are the class scores, and they are contiguous, so the
-    #: view costs nothing. Transposed because the reduction runs along the
-    #: last axis and the classes are along the first.
+    #: view costs nothing.
     let per_class = jt.Tensor([80, cells], storage: output.buffer().view(4 * cells, 80 * cells))
-    let by_cell = jt.transpose(per_class)
-    #: Both at once. Asked for separately each reads all 8400 by 80 scores to
-    #: work out the same thing, and the second read is the whole of its cost.
-    let (peaks, wheres) = jt.max_with_index(by_cell)
+    #: Down the columns, and both answers at once. Reducing along the rows
+    #: instead would want the classes on the last axis, and transposing to put
+    #: them there is a whole pass over the scores; asking for the best and
+    #: where it is separately reads them all twice over.
+    let (peaks, wheres) = jt.max_with_index(per_class, axis: 0)
     let best_scores = peaks.download()
     let best_classes = wheres.download()
     peaks.free()
     wheres.free()
     let geometry = jt.Tensor([4, cells], storage: output.buffer().view(0, 4 * cells)).download()
-    by_cell.free()
 
     var boxes: list[Rect] = []
     var scores: list[float] = []

@@ -133,6 +133,23 @@ kernel void row_peak(device const float* input [[buffer(0)]],
     indices[row] = float(best);
 }
 
+kernel void column_peak(device const float* input [[buffer(0)]],
+                        device float* values [[buffer(1)]],
+                        device float* indices [[buffer(2)]],
+                        constant uint& rows [[buffer(3)]],
+                        constant uint& columns [[buffer(4)]],
+                        uint column [[thread_position_in_grid]]) {
+    if (column >= columns) return;
+    float peak = input[column];
+    uint best = 0;
+    for (uint row = 1; row < rows; ++row) {
+        float value = input[row * columns + column];
+        if (value > peak) { peak = value; best = row; }
+    }
+    values[column] = peak;
+    indices[column] = float(best);
+}
+
 kernel void one_hot_rows(device const float* indices [[buffer(0)]],
                          device float* output [[buffer(1)]],
                          constant uint& rows [[buffer(2)]],
@@ -3111,25 +3128,37 @@ pub fn argmax(input: Tensor) -> Tensor {
     return output
 }
 
-#: The largest value in each row and where it sits, in one pass.
+#: The largest value along an axis and where it sits, in one pass.
 #:
 #: `amax` and `argmax` each read the whole tensor to work out the same thing,
 #: so asking for both costs twice what it needs to: on the 8400 by 80 class
 #: scores a detector produces per frame, 0.62 ms and 0.65 ms against 0.65 for
 #: the two together. Whoever wants only one of them should still say so.
-pub fn max_with_index(input: Tensor) -> tuple[Tensor, Tensor] {
+#:
+#: Reducing down the columns rather than along the rows is a separate kernel
+#: rather than a transpose and the other one. The transpose is a whole extra
+#: pass over the tensor and an allocation the size of it -- 0.3 ms and 2.7 MB
+#: for those same scores -- and reading a column is no slower: neighbouring
+#: threads take neighbouring elements of each row in turn, which is the access
+#: the device wants.
+pub fn max_with_index(input: Tensor, axis: int = -1) -> tuple[Tensor, Tensor] {
     if input.rank() != 2 {
         throw ValueError(f"max_with_index needs rank two, got {input.shape}")
     }
+    let resolved = if axis < 0 { input.rank() + axis } else { axis }
+    if resolved != 0 and resolved != 1 {
+        throw ValueError(f"max_with_index takes axis 0 or 1, got {axis}")
+    }
     let rows = input.shape[0]
     let columns = input.shape[1]
-    let values = Tensor([rows])
-    let indices = Tensor([rows])
-    cached_kernel("row_peak").dispatch_async(
-        [input.buffer(), values.buffer(), indices.buffer()],
-        rows,
-        [rows, columns]
-    )
+    let kept = if resolved == 1 { rows } else { columns }
+    let values = Tensor([kept])
+    let indices = Tensor([kept])
+    cached_kernel(if resolved == 1 {
+        "row_peak"
+    } else {
+        "column_peak"
+    }).dispatch_async([input.buffer(), values.buffer(), indices.buffer()], kept, [rows, columns])
     return (values, indices)
 }
 
