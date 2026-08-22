@@ -507,6 +507,17 @@ pub class Plan {
 
 let MPS_PLAN = Plan("mpsgraph", -1, 1)
 
+#: `MPSMatrixMultiplication` was tried alongside this and taken out again.
+#:
+#: It is the same arithmetic on the same device and lands within a few percent
+#: either way -- 6% ahead at 1024x3072x768, 7% behind at 512x8192x8192 -- so as
+#: a fourth candidate it should have been free money on the shapes it wins.
+#: It was not: adding it took the whole suite from 1.81x to 1.57x and vit-block
+#: from 0.96x to 0.49x, on shapes where the tuner still chose the graph. One
+#: more candidate is one more plan to time for every shape a model touches, and
+#: the tuning costs more than the few percent is worth. A route has to earn
+#: back what searching for it costs.
+
 #: The same graph asked to run in half precision.
 #:
 #: Whether the conversion pays depends on the shape rather than on any rule
