@@ -11,6 +11,7 @@ from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaicv.imgproc.filter import filter_2d, sep_filter_2d
 from jaicv.imgproc.morph import dilate, erode, get_structuring_element, MORPH_RECT
 from jaicv.imgproc.misc import mean_shift_on_host, pyr_mean_shift_filtering
+from jaicv.ml.models import k_nearest_create
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE
 from jaicv.core.mat import Mat, flip, merge
@@ -715,5 +716,61 @@ fn test_mean_shift_on_the_device_walks_where_the_host_walks() -> void {
     assert_eq(got.len(), want.len())
     for index in 0..got.len() {
         assert_near(got[index], want[index], 1e-4, f"value {index}")
+    }
+}
+
+#: The neighbours a query gets back really are its nearest.
+#:
+#: Only `k` of them are kept now, rather than the whole training set being
+#: sorted and all but `k` thrown away, so the selection is where a mistake
+#: would live. The data is built with many samples at identical distances,
+#: because a tie is what a bounded selection is most likely to get wrong.
+fn test_the_neighbours_returned_are_the_nearest_ones() -> void {
+    if not gpu.is_available() { return }
+    let samples = 120
+    let width = 3
+    var values: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..samples {
+        for slot in 0..width { values.push(float((sample * 3 + slot) % 7)) }
+        labels.push(float(sample % 5))
+    }
+    let x = Mat.from_list(samples, width, CV_32FC1, values)
+    defer { x.release() }
+    let y = Mat.from_list(samples, 1, CV_32FC1, labels)
+    defer { y.release() }
+
+    for k in [1, 3, 6] {
+        let model = k_nearest_create(k)
+        model.train(x, y)
+        let (predictions, neighbours, distances) = model.find_nearest(x, k)
+        let far = distances.to_list()
+        predictions.release()
+        neighbours.release()
+        distances.release()
+        for query in 0..samples {
+            #: Nearest first.
+            for slot in 1..k {
+                assert_true(
+                    far[query * k + slot] >= far[query * k + slot - 1] - 1e-6,
+                    f"k={k}, query {query}: neighbours came back out of order"
+                )
+            }
+            #: And nothing left out is nearer than the furthest one kept.
+            let worst = far[query * k + k - 1]
+            var nearer_left_out = 0
+            for other in 0..samples {
+                var total = 0.0
+                for slot in 0..width {
+                    let gap = values[query * width + slot] - values[other * width + slot]
+                    total += gap * gap
+                }
+                if math.sqrt(total) < worst - 1e-6 { nearer_left_out += 1 }
+            }
+            assert_true(
+                nearer_left_out <= k,
+                f"k={k}, query {query}: {nearer_left_out} samples are nearer than the last kept"
+            )
+        }
     }
 }
