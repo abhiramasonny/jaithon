@@ -124,15 +124,44 @@ kernel void scalar_mul(device const float* input [[buffer(0)]],
     if (id < count) output[id] = input[id] * scalar[0];
 }
 
+/* A transpose through a tile, so that both halves of it are coalesced.
+ *
+ * Read straight and written straight, one of the two has to stride: with a
+ * thread per element, neighbouring threads read neighbouring floats and then
+ * write `rows` apart, and every write in a simdgroup lands on its own cache
+ * line. Staging a 32 by 32 square in threadgroup memory lets each thread read
+ * the row it is nearest and write the column it is nearest, and neither side
+ * strides.
+ *
+ * The tile is 33 wide on purpose. At 32 the elements of a column all fall in
+ * one bank, and the write pass -- which walks a column of the tile -- would
+ * serialise on it. */
 kernel void matrix_transpose(device const float* input [[buffer(0)]],
                              device float* output [[buffer(1)]],
                              constant uint& rows [[buffer(2)]],
                              constant uint& columns [[buffer(3)]],
-                             uint id [[thread_position_in_grid]]) {
-    if (id >= rows * columns) return;
-    uint row = id / columns;
-    uint column = id % columns;
-    output[column * rows + row] = input[id];
+                             constant uint& tiles_across [[buffer(4)]],
+                             uint group [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    const uint TILE = 32u;
+    threadgroup float square[32][33];
+    uint tile_x = group % tiles_across;
+    uint tile_y = group / tiles_across;
+    uint lx = lid % TILE;
+    uint ly = lid / TILE;
+
+    for (uint step = 0u; step < TILE; step += 8u) {
+        uint r = tile_y * TILE + ly + step;
+        uint c = tile_x * TILE + lx;
+        if (r < rows && c < columns) square[ly + step][lx] = input[r * columns + c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 0u; step < TILE; step += 8u) {
+        /* A row of the output is a column of the input. */
+        uint r = tile_x * TILE + ly + step;
+        uint c = tile_y * TILE + lx;
+        if (r < columns && c < rows) output[r * rows + c] = square[lx][ly + step];
+    }
 }
 
 /* A threadgroup to the row, the same shape as the normalisation above and for
@@ -2519,7 +2548,14 @@ fn raw_transpose(input: Tensor) -> Tensor {
     let columns = input.shape[1]
     let output = Tensor([columns, rows])
     let kernel = cached_kernel("matrix_transpose")
-    kernel.dispatch_async([input.buffer(), output.buffer()], input.size, [rows, columns])
+    let across = (columns + 31) // 32
+    let down = (rows + 31) // 32
+    kernel.dispatch_async(
+        [input.buffer(), output.buffer()],
+        across * down * 256,
+        [rows, columns, across],
+        group_size: 256
+    )
     return output
 }
 

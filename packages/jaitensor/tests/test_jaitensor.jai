@@ -2600,3 +2600,35 @@ fn test_the_exports_no_test_reached() -> void {
         assert_near(sums[index], want, 1e-5, f"conv2d_nchw at {index}")
     }
 }
+
+#: Transpose at sizes that do not land on the tile it stages through.
+#:
+#: The kernel reads and writes 32 by 32 squares through threadgroup memory so
+#: that neither pass strides. Every edge of that -- a matrix narrower than one
+#: tile, one taller, one that ends part way through -- is a bounds test the
+#: naive version never had.
+fn test_transpose_handles_every_edge_of_its_tile() -> void {
+    if not jt.is_available() { return }
+    for shape in [[1, 1], [1, 37], [37, 1], [31, 33], [32, 32], [33, 31], [64, 65], [129, 257]] {
+        let rows = shape[0]
+        let cols = shape[1]
+        var values: list[float] = []
+        for index in 0..rows * cols { values.push(float(index) * 0.5 - 3.0) }
+        let x = jt.Tensor([rows, cols], values)
+        let flipped = jt.transpose(x)
+        assert_eq(flipped.shape, [cols, rows], f"{rows}x{cols} came back the wrong shape")
+        let got = flipped.download()
+        for r in 0..rows {
+            for c in 0..cols {
+                assert_near(
+                    got[c * rows + r],
+                    values[r * cols + c],
+                    1e-6,
+                    f"{rows}x{cols} at {r},{c}"
+                )
+            }
+        }
+        x.free()
+        flipped.free()
+    }
+}
