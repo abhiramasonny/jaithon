@@ -39,6 +39,42 @@ static inline float group_total(
     return total;
 }
 
+/* The largest value a threadgroup holds, and the lowest index carrying it.
+ *
+ * The lowest, because a loop that keeps a running best with a strict `>` keeps
+ * the first of any tie, and these reductions replaced such loops. A thread that
+ * drew no elements passes `0xffffffff`, which never wins the minimum. */
+static inline float group_peak(
+    float value,
+    uint index,
+    threadgroup float *lanes,
+    threadgroup float *shared_top,
+    threadgroup atomic_uint *shared_index,
+    uint lid,
+    uint lane,
+    uint warp,
+    thread uint *out_index
+) {
+    const float floor_value = -3.402823e+38f;
+    if (lid < 32u) lanes[lid] = floor_value;
+    if (lid == 0u) atomic_store_explicit(shared_index, 0xffffffffu, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float top = simd_max(value);
+    if (lane == 0u) lanes[warp] = top;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float m = floor_value;
+        for (uint j = 0u; j < 32u; j++) m = max(m, lanes[j]);
+        *shared_top = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float best = *shared_top;
+    if (value == best) atomic_fetch_min_explicit(shared_index, index, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    *out_index = atomic_load_explicit(shared_index, memory_order_relaxed);
+    return best;
+}
+
 kernel void binary_op(device const float* a [[buffer(0)]],
                       device const float* b [[buffer(1)]],
                       device float* output [[buffer(2)]],
@@ -156,28 +192,50 @@ kernel void row_max(device const float* input [[buffer(0)]],
                     device float* output [[buffer(1)]],
                     constant uint& rows [[buffer(2)]],
                     constant uint& columns [[buffer(3)]],
-                    uint row [[thread_position_in_grid]]) {
+                    uint row [[threadgroup_position_in_grid]],
+                    uint lid [[thread_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
+    threadgroup float shared_top;
+    threadgroup atomic_uint shared_index;
     uint base = row * columns;
-    float peak = input[base];
-    for (uint column = 1; column < columns; ++column) peak = max(peak, input[base + column]);
-    output[row] = peak;
+    float peak = -3.402823e+38f;
+    uint best = 0xffffffffu;
+    for (uint column = lid; column < columns; column += GROUP) {
+        float value = input[base + column];
+        if (value > peak) { peak = value; best = column; }
+    }
+    uint chosen = 0u;
+    peak = group_peak(peak, best, lanes, &shared_top, &shared_index, lid, lane, warp, &chosen);
+    if (lid == 0u) output[row] = peak;
 }
 
 kernel void row_argmax(device const float* input [[buffer(0)]],
                        device float* output [[buffer(1)]],
                        constant uint& rows [[buffer(2)]],
                        constant uint& columns [[buffer(3)]],
-                       uint row [[thread_position_in_grid]]) {
+                       uint row [[threadgroup_position_in_grid]],
+                       uint lid [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
+    threadgroup float shared_top;
+    threadgroup atomic_uint shared_index;
     uint base = row * columns;
-    float peak = input[base];
-    uint best = 0;
-    for (uint column = 1; column < columns; ++column) {
+    float peak = -3.402823e+38f;
+    uint best = 0xffffffffu;
+    for (uint column = lid; column < columns; column += GROUP) {
         float value = input[base + column];
         if (value > peak) { peak = value; best = column; }
     }
-    output[row] = float(best);
+    uint chosen = 0u;
+    group_peak(peak, best, lanes, &shared_top, &shared_index, lid, lane, warp, &chosen);
+    if (lid == 0u) output[row] = float(chosen);
 }
 
 kernel void row_peak(device const float* input [[buffer(0)]],
@@ -185,17 +243,27 @@ kernel void row_peak(device const float* input [[buffer(0)]],
                      device float* indices [[buffer(2)]],
                      constant uint& rows [[buffer(3)]],
                      constant uint& columns [[buffer(4)]],
-                     uint row [[thread_position_in_grid]]) {
+                     uint row [[threadgroup_position_in_grid]],
+                     uint lid [[thread_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
+    threadgroup float shared_top;
+    threadgroup atomic_uint shared_index;
     uint base = row * columns;
-    float peak = input[base];
-    uint best = 0;
-    for (uint column = 1; column < columns; ++column) {
+    float peak = -3.402823e+38f;
+    uint best = 0xffffffffu;
+    for (uint column = lid; column < columns; column += GROUP) {
         float value = input[base + column];
         if (value > peak) { peak = value; best = column; }
     }
+    uint chosen = 0u;
+    peak = group_peak(peak, best, lanes, &shared_top, &shared_index, lid, lane, warp, &chosen);
+    if (lid != 0u) return;
     values[row] = peak;
-    indices[row] = float(best);
+    indices[row] = float(chosen);
 }
 
 kernel void column_peak(device const float* input [[buffer(0)]],
@@ -1308,12 +1376,18 @@ kernel void reduce_sum_rows(device const float* input [[buffer(0)]],
                             device float* output [[buffer(1)]],
                             constant uint& rows [[buffer(2)]],
                             constant uint& columns [[buffer(3)]],
-                            uint row [[thread_position_in_grid]]) {
+                            uint row [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
     uint base = row * columns;
     float total = 0.0f;
-    for (uint c = 0; c < columns; ++c) total += input[base + c];
-    output[row] = total;
+    for (uint c = lid; c < columns; c += GROUP) total += input[base + c];
+    total = group_total(total, lanes, lid, lane, warp);
+    if (lid == 0u) output[row] = total;
 }
 
 /* Each thread walks the array in strides of the whole grid and keeps a
@@ -2933,7 +3007,12 @@ pub fn sum(input: Tensor, axis: int? = null) -> Tensor {
     for i in 0..resolved { out_shape.push(input.shape[i]) }
     let output = Tensor(out_shape)
     let kernel = cached_kernel("reduce_sum_rows")
-    kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
+    kernel.dispatch_async(
+        [input.buffer(), output.buffer()],
+        rows * 256,
+        [rows, columns],
+        group_size: 256
+    )
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             return [expand_last(upstream, columns)]
@@ -3541,8 +3620,9 @@ pub fn amax(input: Tensor, axis: int? = null) -> Tensor {
     let output = Tensor(shape)
     cached_kernel("row_max").dispatch_async(
         [input.buffer(), output.buffer()],
-        rows,
-        [rows, columns]
+        rows * 256,
+        [rows, columns],
+        group_size: 256
     )
     return output
 }
@@ -3553,16 +3633,22 @@ pub fn argmax(input: Tensor) -> Tensor {
     let columns = input.shape[1]
     let output = Tensor([rows])
     let kernel = cached_kernel("row_argmax")
-    kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
+    kernel.dispatch_async(
+        [input.buffer(), output.buffer()],
+        rows * 256,
+        [rows, columns],
+        group_size: 256
+    )
     return output
 }
 
 #: The largest value along an axis and where it sits, in one pass.
 #:
 #: `amax` and `argmax` each read the whole tensor to work out the same thing,
-#: so asking for both costs twice what it needs to: on the 8400 by 80 class
-#: scores a detector produces per frame, 0.62 ms and 0.65 ms against 0.65 for
-#: the two together. Whoever wants only one of them should still say so.
+#: so asking for both costs twice what it needs to. Whoever wants only one of
+#: them should still say so. On the 8400 by 80 class scores a detector produces
+#: per frame the pair now costs 0.137 ms, against 0.65 ms when a row was one
+#: thread's serial walk.
 #:
 #: Reducing down the columns rather than along the rows is a separate kernel
 #: rather than a transpose and the other one. The transpose is a whole extra
@@ -3583,11 +3669,22 @@ pub fn max_with_index(input: Tensor, axis: int = -1) -> tuple[Tensor, Tensor] {
     let kept = if resolved == 1 { rows } else { columns }
     let values = Tensor([kept])
     let indices = Tensor([kept])
-    cached_kernel(if resolved == 1 {
-        "row_peak"
+    #: Down a row a threadgroup reduces together; across one, neighbouring
+    #: threads already take neighbouring elements and a thread each is right.
+    if resolved == 1 {
+        cached_kernel("row_peak").dispatch_async(
+            [input.buffer(), values.buffer(), indices.buffer()],
+            kept * 256,
+            [rows, columns],
+            group_size: 256
+        )
     } else {
-        "column_peak"
-    }).dispatch_async([input.buffer(), values.buffer(), indices.buffer()], kept, [rows, columns])
+        cached_kernel("column_peak").dispatch_async(
+            [input.buffer(), values.buffer(), indices.buffer()],
+            kept,
+            [rows, columns]
+        )
+    }
     return (values, indices)
 }
 
