@@ -451,7 +451,18 @@ static bool primFillConvex(int argc, Value *args, Value *out) {
                         flat->count);
     }
     const int count = flat->count / 2;
-    if (count < 3 || count > JAI_MAX_CORNERS || shift < 0 || shift > JAI_XY_SHIFT) {
+    if (shift < 0 || shift > JAI_XY_SHIFT) {
+        return jaiThrow(vm.cValueError, "fill_convex(): a shift of %lld is out of range",
+                        (long long)shift);
+    }
+    /* More corners than there is room for is the caller's arithmetic gone
+     * wrong, and drawing nothing would hide it. Fewer than three is a shape
+     * with no area, which is a thing a caller legitimately asks for. */
+    if (count > JAI_MAX_CORNERS) {
+        return jaiThrow(vm.cValueError, "fill_convex(): %d corners is more than %d",
+                        count, JAI_MAX_CORNERS);
+    }
+    if (count < 3) {
         *out = NULL_VAL;
         return true;
     }
