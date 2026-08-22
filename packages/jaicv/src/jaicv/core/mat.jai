@@ -475,7 +475,10 @@ pub class Mat: Printable {
         if cached is not null and self.host_generation == generation_of(self.storage) {
             return cached
         }
-        gpu.synchronize()
+        #: The download waits for the work that wrote this buffer and leaves
+        #: everything queued behind it running. Draining the queue here instead
+        #: would make reading one frame wait for the next frame's network, so a
+        #: loop that queues ahead would get no overlap at all.
         let width = self.cols * self.channels()
         var values: list[float] = []
         if self.is_continuous() and self.offset == 0 and self.storage.count == self.rows * width {
@@ -609,8 +612,8 @@ pub class Mat: Printable {
             return
         }
         #: An upload lands immediately while queued kernels have not run, so
-        #: anything already encoded would overwrite it.
-        gpu.synchronize()
+        #: anything already encoded against this buffer would overwrite it. The
+        #: upload waits for exactly that and nothing else.
         let width = self.cols * self.channels()
         if self.is_continuous() and self.offset == 0 and self.storage.count == self.rows * width {
             self.storage.upload(values)

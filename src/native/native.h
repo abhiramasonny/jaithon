@@ -269,6 +269,14 @@ bool          jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int c
 /* Commit queued async work so the GPU can start; does not wait. */
 bool          jaiGpuFlush(void);
 bool          jaiGpuSynchronize(void);
+/* Wait only for the queued work that could have written this buffer, leaving
+ * anything queued after it running. Reading a result this way does not stall
+ * on work submitted afterwards, which is what lets a loop overlap the two. */
+bool          jaiGpuWaitFor(JaiGpuBuffer *b);
+/* Declare that work about to be encoded may write this buffer. Only callers
+ * that encode against the MTLBuffer themselves need this; every path inside
+ * the backend already marks what it binds. */
+void          jaiGpuBufferMark(JaiGpuBuffer *b);
 /* Device-buffer GEMM via Metal Performance Shaders. Encodes onto the async
  * command buffer (ending any open compute encoder). `transA` / `transB` treat
  * the physical buffers as transposed. Offsets are bytes into each buffer.

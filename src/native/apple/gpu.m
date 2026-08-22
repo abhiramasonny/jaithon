@@ -60,6 +60,10 @@ struct JaiGpuBuffer {
      * waited on since. Work already queued may still write these bytes, so the
      * first HOST write has to wait for it -- see hostWriteBarrier. */
     bool   recycled;
+    /* The last batch of queued work that could have written these bytes; zero
+     * when none has. Reading the buffer waits for that batch and no further --
+     * see markLocked and jaiGpuWaitFor. */
+    uint64_t lastBatch;
 };
 
 struct JaiGpuKernel {
@@ -258,9 +262,77 @@ static size_t gMlp3LiveBBytes[4];
 
 #define JAI_GPU_MAX_IN_FLIGHT 16
 
+/* Which queued work a given buffer is waiting on.
+ *
+ * Everything the backend queues goes into one command buffer at a time, and
+ * that command buffer is a "batch" with a number. A buffer records the number
+ * of the last batch that could have written it, so reading it back waits for
+ * that batch rather than for the whole queue to drain.
+ *
+ * The distinction is the difference between a pipeline and a stall. A live
+ * loop that queues frame N's network and then reads frame N-1's pixels would,
+ * draining the queue, wait for the network it just started -- which is exactly
+ * the work it was trying to overlap with. Waiting per buffer, it does not.
+ *
+ * Marking a buffer that is only read by a kernel costs nothing but an extra
+ * wait later, so every path that hands a buffer to the GPU marks it. Missing
+ * one would be the other kind of wrong, so `JAITHON_GPU_FINE_SYNC=0` restores
+ * the old drain-everything behaviour for bisecting. */
+static uint64_t gBatchCounter;  /* last batch number handed out */
+static uint64_t gOpenBatch;     /* number of gAsyncCommands, 0 when none open */
+static uint64_t gDoneBatch;     /* every batch at or below this has finished */
+static NSMutableArray<NSNumber *> *gInFlightBatch;
+static int gFineSync;           /* 0 unknown, 1 on, 2 off */
+
+static bool fineSyncEnabled(void) {
+    if (gFineSync == 0) {
+        const char *setting = getenv("JAITHON_GPU_FINE_SYNC");
+        gFineSync = (setting != NULL && strcmp(setting, "0") == 0) ? 2 : 1;
+    }
+    return gFineSync == 1;
+}
+
 static void ensureInFlight(void) {
     if (gInFlight == nil) gInFlight = [[NSMutableArray alloc] init];
+    if (gInFlightBatch == nil) gInFlightBatch = [[NSMutableArray alloc] init];
 }
+
+/* Every site that opens gAsyncCommands calls this, so that a batch number
+ * exists for the work about to be encoded into it. */
+static void beginBatchLocked(void) {
+    gOpenBatch = ++gBatchCounter;
+}
+
+/* Note that whatever is being encoded now may write `b`.
+ *
+ * When nothing is open yet the batch is opened here, so that the number a
+ * buffer records always belongs to a command buffer that will really be
+ * committed -- a number guessed ahead of one would come loose if the work went
+ * somewhere else instead. */
+static void markLocked(JaiGpuBuffer *b) {
+    if (b == NULL || gQueue == nil) return;
+    if (gOpenBatch == 0) {
+        if (gAsyncCommands == nil) {
+            gAsyncCommands = [gQueue commandBuffer];
+            if (gAsyncCommands == nil) return;
+        }
+        beginBatchLocked();
+    }
+    b->lastBatch = gOpenBatch;
+}
+
+bool jaiGpuWaitFor(JaiGpuBuffer *b);
+
+static void mark(JaiGpuBuffer *b) {
+    if (b == NULL || gQueue == nil) return;
+    @synchronized(gQueue) {
+        markLocked(b);
+    }
+}
+
+/* For graphbuild.m and coreml.m, which reach past the JaiGpuBuffer for the
+ * MTLBuffer inside it and encode against that directly. */
+void jaiGpuBufferMark(JaiGpuBuffer *b) { mark(b); }
 
 static bool ensureDevice(void) {
     static dispatch_once_t once;
@@ -697,8 +769,12 @@ bool jaiGpuMixedPrecision(void) {
 #define JAI_POOL_MAX_BYTES   (1536u * 1024u * 1024u)
 
 typedef struct {
-    size_t bytes;
-    void  *buffer;
+    size_t   bytes;
+    void    *buffer;
+    /* Carried across the pool with the memory it belongs to. A recycled buffer
+     * whose previous owner left work queued against it is still waiting on
+     * that work, and the new owner is the one who finds out. */
+    uint64_t lastBatch;
 } JaiPooledBuffer;
 
 static JaiPooledBuffer gPool[JAI_POOL_MAX_ENTRIES];
@@ -725,10 +801,11 @@ static bool poolPoisons(void) {
 
 /* The most recently parked buffer of exactly this size, or nil. Newest first,
  * because that one is likeliest to still be warm. */
-static id<MTLBuffer> poolTake(size_t bytes) {
+static id<MTLBuffer> poolTake(size_t bytes, uint64_t *lastBatch) {
     for (int i = gPoolCount - 1; i >= 0; i--) {
         if (gPool[i].bytes != bytes) continue;
         id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)gPool[i].buffer;
+        if (lastBatch != NULL) *lastBatch = gPool[i].lastBatch;
         memmove(&gPool[i], &gPool[i + 1],
                 (size_t)(gPoolCount - i - 1) * sizeof(JaiPooledBuffer));
         gPoolCount--;
@@ -741,7 +818,7 @@ static id<MTLBuffer> poolTake(size_t bytes) {
 /* Park a buffer, evicting the oldest when there is no room. Evicting rather
  * than refusing keeps a workload that cycles through many sizes from filling
  * the pool with entries it will never ask for again. */
-static bool poolGive(void *buffer, size_t bytes) {
+static bool poolGive(void *buffer, size_t bytes, uint64_t lastBatch) {
     if (bytes > JAI_POOL_MAX_BYTES) return false;
     while (gPoolCount > 0 &&
            (gPoolCount >= JAI_POOL_MAX_ENTRIES ||
@@ -755,6 +832,7 @@ static bool poolGive(void *buffer, size_t bytes) {
     if (gPoolCount >= JAI_POOL_MAX_ENTRIES) return false;
     gPool[gPoolCount].bytes = bytes;
     gPool[gPoolCount].buffer = buffer;
+    gPool[gPoolCount].lastBatch = lastBatch;
     gPoolCount++;
     gPoolBytes += bytes;
     return true;
@@ -786,9 +864,10 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
     @autoreleasepool {
         id<MTLBuffer> buffer = nil;
         bool reused = false;
+        uint64_t carried = 0;
         if (poolEnabled()) {
             @synchronized(gQueue) {
-                buffer = poolTake(bytes);
+                buffer = poolTake(bytes, &carried);
             }
             reused = buffer != nil;
             if (reused && poolPoisons()) {
@@ -814,26 +893,29 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
         b->buffer = (__bridge_retained void *)buffer;
         b->bytes = bytes;
         b->recycled = reused;
+        b->lastBatch = reused ? carried : 0;
         return b;
     }
 }
 
-/* Wait for queued work before the host writes over a recycled buffer.
+/* Wait for queued work before the host writes over a buffer.
  *
- * Reuse needs no fence between one piece of GPU work and the next -- there is
- * one queue and it runs in order. The host is not in that order. A buffer
- * handed back to a new owner may still be the destination of a kernel that has
- * been encoded and not yet run, and that kernel would land on top of whatever
- * the new owner wrote: an optimizer's momentum, zeroed by its new parameter
- * and then filled in again by the previous parameter's update.
+ * One piece of GPU work needs no fence against the next -- there is one queue
+ * and it runs in order. The host is not in that order. A buffer may still be
+ * the destination of a kernel that has been encoded and not yet run, and that
+ * kernel would land on top of whatever the host wrote: an optimizer's
+ * momentum, zeroed by its new parameter and then filled in again by the
+ * previous parameter's update.
  *
- * Paid once per recycled buffer, and only by one that the host writes to at
- * all. Everything that stays on the device -- which is nearly every
- * intermediate a network produces -- never reaches here. */
+ * A buffer with nothing queued against it -- which is most of them, and every
+ * one that has only ever been written from the host -- goes straight through.
+ * The rest wait for their own batch and not for the queue, so a host write to
+ * one buffer does not stall on work belonging to another. */
 static void hostWriteBarrier(JaiGpuBuffer *b) {
-    if (b == NULL || !b->recycled) return;
+    if (b == NULL) return;
+    if (!b->recycled && b->lastBatch == 0) return;
     b->recycled = false;
-    jaiGpuSynchronize();
+    jaiGpuWaitFor(b);
 }
 
 void jaiGpuFree(JaiGpuBuffer *b) {
@@ -843,7 +925,7 @@ void jaiGpuFree(JaiGpuBuffer *b) {
         bool parked = false;
         if (poolEnabled() && b->buffer != NULL && gQueue != nil) {
             @synchronized(gQueue) {
-                parked = poolGive(b->buffer, b->bytes);
+                parked = poolGive(b->buffer, b->bytes, b->lastBatch);
             }
         }
         if (!parked) CFBridgingRelease(b->buffer);
@@ -901,6 +983,7 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
         @synchronized(gQueue) {
             if (gAsyncCommands == nil) {
                 gAsyncCommands = [gQueue commandBuffer];
+                beginBatchLocked();
                 if (gAsyncCommands == nil) {
                     float *destination = (float *)[dest contents] + offset;
                     for (size_t i = 0; i < count; i++) {
@@ -919,6 +1002,7 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                     return;
                 }
             }
+            markLocked(b);
             [gAsyncEncoder setComputePipelineState:gExpandU8];
             [gAsyncEncoder setBuffer:staging offset:0 atIndex:0];
             [gAsyncEncoder setBuffer:dest offset:start atIndex:1];
@@ -935,6 +1019,7 @@ void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return;
+    hostWriteBarrier(b);
     float *destination =
         (float *)((__bridge id<MTLBuffer>)b->buffer).contents + elementOffset;
     uint64_t state = seed != 0 ? seed : 0x9E3779B97F4A7C15ull;
@@ -952,13 +1037,14 @@ void jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return;
+    hostWriteBarrier(b);
     memset((uint8_t *)((__bridge id<MTLBuffer>)b->buffer).contents + start, 0, bytes);
 }
 
 void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     if (b == NULL || b->buffer == NULL || dst == NULL || bytes == 0) return;
     if (offset > b->bytes || bytes > b->bytes - offset) return;
-    jaiGpuSynchronize();
+    jaiGpuWaitFor(b);
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
@@ -995,7 +1081,7 @@ void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
     const size_t start = offset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return;
-    jaiGpuSynchronize();
+    jaiGpuWaitFor(b);
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     /* Indexed as floats rather than stepped as bytes and cast: `start` is a
@@ -1023,7 +1109,7 @@ const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) 
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return NULL;
-    jaiGpuSynchronize();
+    jaiGpuWaitFor(b);
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     return (const float *)[buffer contents] + elementOffset;
 }
@@ -1187,6 +1273,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                 if (gAsyncCommands == nil) {
                     gAsyncCommands = [gQueue commandBuffer];
                     if (gAsyncCommands == nil) return false;
+                    beginBatchLocked();
                 }
                 if (gAsyncEncoder == nil) {
                     gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
@@ -1197,6 +1284,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                 }
 
                 [gAsyncEncoder setComputePipelineState:pipeline];
+                for (int i = 0; i < count; i++) markLocked(buffers[i]);
                 for (int i = 0; i < count; i++)
                     [gAsyncEncoder setBuffer:(__bridge id<MTLBuffer>)buffers[i]->buffer
                                       offset:byteOffsets != NULL ? byteOffsets[i] : 0
@@ -1300,20 +1388,45 @@ static bool commitMlpWeightsLocked(void) {
     return true;
 }
 
-static bool flushAsyncLocked(id<MTLCommandBuffer> *oldestOut) {
-    if (oldestOut != NULL) *oldestOut = nil;
-    if (gAsyncCommands != nil) {
-        [gAsyncEncoder endEncoding];
-        [gAsyncCommands commit];
-        ensureInFlight();
-        [gInFlight addObject:gAsyncCommands];
-        gAsyncEncoder = nil;
-        gAsyncCommands = nil;
+/* Commit whatever is open and file it under its batch number. */
+static void commitOpenLocked(void) {
+    if (gAsyncCommands == nil) return;
+    [gAsyncEncoder endEncoding];
+    [gAsyncCommands commit];
+    ensureInFlight();
+    [gInFlight addObject:gAsyncCommands];
+    [gInFlightBatch addObject:@(gOpenBatch)];
+    gAsyncEncoder = nil;
+    gAsyncCommands = nil;
+    gOpenBatch = 0;
+}
+
+/* Take the front of the queue off the books, returning the batch it holds.
+ * The caller waits for it and then says so with noteDone: batches run in the
+ * order they were committed, so one finishing means every earlier one has. */
+static uint64_t takeFrontLocked(void) {
+    const uint64_t batch = gInFlightBatch[0].unsignedLongLongValue;
+    [gInFlight removeObjectAtIndex:0];
+    [gInFlightBatch removeObjectAtIndex:0];
+    return batch;
+}
+
+static void noteDone(uint64_t batch) {
+    if (gQueue == nil) return;
+    @synchronized(gQueue) {
+        if (gDoneBatch < batch) gDoneBatch = batch;
     }
+}
+
+static bool flushAsyncLocked(id<MTLCommandBuffer> *oldestOut, uint64_t *oldestBatch) {
+    if (oldestOut != NULL) *oldestOut = nil;
+    if (oldestBatch != NULL) *oldestBatch = 0;
+    commitOpenLocked();
     if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
         if (oldestOut != NULL) {
             *oldestOut = gInFlight[0];
-            [gInFlight removeObjectAtIndex:0];
+            const uint64_t batch = takeFrontLocked();
+            if (oldestBatch != NULL) *oldestBatch = batch;
         }
     }
     return true;
@@ -1323,24 +1436,20 @@ bool jaiGpuFlush(void) {
     if (!ensureDevice()) return false;
     @autoreleasepool {
         id<MTLCommandBuffer> oldest = nil;
+        uint64_t oldestBatch = 0;
         @synchronized(gQueue) {
             if (!commitMlpAccLocked()) return false;
-            if (gAsyncCommands != nil) {
-                [gAsyncEncoder endEncoding];
-                [gAsyncCommands commit];
-                ensureInFlight();
-                [gInFlight addObject:gAsyncCommands];
-                gAsyncEncoder = nil;
-                gAsyncCommands = nil;
-            }
+            commitOpenLocked();
             if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
                 oldest = gInFlight[0];
-                [gInFlight removeObjectAtIndex:0];
+                oldestBatch = takeFrontLocked();
             }
         }
         if (oldest == nil) return true;
         [oldest waitUntilCompleted];
-        return [oldest status] == MTLCommandBufferStatusCompleted;
+        if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
+        noteDone(oldestBatch);
+        return true;
     }
 }
 
@@ -1357,17 +1466,68 @@ bool jaiGpuSynchronize(void) {
     if (!jaiGpuFlush()) return false;
     @autoreleasepool {
         NSArray<id<MTLCommandBuffer>> *pending;
+        uint64_t newest = 0;
         @synchronized(gQueue) {
             if (gInFlight == nil || gInFlight.count == 0) return true;
             pending = [gInFlight copy];
+            newest = gInFlightBatch.lastObject.unsignedLongLongValue;
             [gInFlight removeAllObjects];
+            [gInFlightBatch removeAllObjects];
         }
         for (id<MTLCommandBuffer> commands in pending) {
             [commands waitUntilCompleted];
             if ([commands status] != MTLCommandBufferStatusCompleted) return false;
         }
+        noteDone(newest);
         return true;
     }
+}
+
+/* Wait for the work that could have written `b`, and no more than that.
+ *
+ * Everything queued after it stays queued and keeps running while the caller
+ * reads. That is what lets a loop hand the GPU the next frame's network before
+ * reading this frame's result instead of after it.
+ *
+ * The staged MLP weights are the one thing a buffer number cannot describe --
+ * they live in scratch that has to be committed as a set -- so a wait with any
+ * of that outstanding falls back to draining the queue. */
+bool jaiGpuWaitFor(JaiGpuBuffer *b) {
+    if (b == NULL) return true;
+    if (!fineSyncEnabled() || gQueue == nil) return jaiGpuSynchronize();
+
+    uint64_t want = 0;
+    @synchronized(gQueue) {
+        if (gMlpSide != 0 || gMlpAccSide != 0 || gMlp3Side != 0) want = UINT64_MAX;
+        else if (b->lastBatch > gDoneBatch) want = b->lastBatch;
+    }
+    if (want == UINT64_MAX) return jaiGpuSynchronize();
+    if (want == 0) return true;
+
+    @autoreleasepool {
+        NSArray<id<MTLCommandBuffer>> *pending = nil;
+        uint64_t reached = 0;
+        @synchronized(gQueue) {
+            if (gOpenBatch != 0 && gOpenBatch <= want) commitOpenLocked();
+            NSUInteger take = 0;
+            for (NSUInteger i = 0; i < gInFlightBatch.count; i++) {
+                take = i + 1;
+                if (gInFlightBatch[i].unsignedLongLongValue >= want) break;
+            }
+            if (take > 0) {
+                pending = [gInFlight subarrayWithRange:NSMakeRange(0, take)];
+                reached = gInFlightBatch[take - 1].unsignedLongLongValue;
+                [gInFlight removeObjectsInRange:NSMakeRange(0, take)];
+                [gInFlightBatch removeObjectsInRange:NSMakeRange(0, take)];
+            }
+        }
+        for (id<MTLCommandBuffer> commands in pending) {
+            [commands waitUntilCompleted];
+            if ([commands status] != MTLCommandBufferStatusCompleted) return false;
+        }
+        if (reached != 0) noteDone(reached);
+    }
+    return true;
 }
 
 static NSMutableDictionary<NSString *, id> *gMpsGraphs;
@@ -1390,6 +1550,7 @@ static bool ndarrayWindowIsPacked(NSArray<NSNumber *> *shape) {
 }
 
 static MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset, NSArray<NSNumber *> *shape) {
+    mark(b);
     NSUInteger count = 1;
     for (NSNumber *dim in shape) count *= dim.unsignedIntegerValue;
     const size_t bytes = (size_t)count * sizeof(float);
@@ -1449,6 +1610,7 @@ static bool ensureAsyncCommandBuffer(void) {
     if (gAsyncCommands == nil) {
         gAsyncCommands = [gQueue commandBuffer];
         if (gAsyncCommands == nil) return false;
+        beginBatchLocked();
     }
     return true;
 }
@@ -1495,6 +1657,7 @@ static bool blitMany(__unsafe_unretained id<MTLBuffer> *srcs, JaiGpuBuffer **dst
         if (offs[i] + bytes[i] > dsts[i]->bytes) return false;
     }
     if (!ensureAsyncCommandBuffer()) return false;
+    for (int i = 0; i < count; i++) markLocked(dsts[i]);
     id<MTLBlitCommandEncoder> blit = [gAsyncCommands blitCommandEncoder];
     if (blit == nil) return false;
     for (int i = 0; i < count; i++) {
@@ -1643,6 +1806,7 @@ static bool encodeFlashAttn(id<MTLBuffer> qBuf, size_t qOff,
     if (gAsyncCommands == nil) {
         gAsyncCommands = [gQueue commandBuffer];
         if (gAsyncCommands == nil) return false;
+        beginBatchLocked();
     }
     if (gAsyncEncoder == nil) {
         gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
@@ -1753,6 +1917,10 @@ bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
                 id<MTLBuffer> yBuf = (__bridge id<MTLBuffer>)out->buffer;
                 if (encodeFlashAttn(qBuf, qOff, kBuf, kOff, vBuf, vOff, yBuf, outOff,
                                     seq, heads, hd, scale)) {
+                    markLocked(q);
+                    markLocked(k);
+                    markLocked(v);
+                    markLocked(out);
                     return true;
                 }
             }
@@ -3644,12 +3812,14 @@ bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1
             }
             if ((i + 1) % flushEvery == 0 || i + 1 == steps) {
                 id<MTLCommandBuffer> oldest = nil;
+                uint64_t oldestBatch = 0;
                 @synchronized(gQueue) {
-                    if (!flushAsyncLocked(&oldest)) return false;
+                    if (!flushAsyncLocked(&oldest, &oldestBatch)) return false;
                 }
                 if (oldest != nil) {
                     [oldest waitUntilCompleted];
                     if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
+                    noteDone(oldestBatch);
                 }
             }
         }
@@ -3660,9 +3830,9 @@ bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1
              * to live, and the next epoch reads the previous scratch loss. */
             if (!trackCorrect && !commitMlpWeightsLocked()) return false;
             if (!commitMlpAccLocked()) return false;
-            id<MTLCommandBuffer> oldest = nil;
-            if (!flushAsyncLocked(&oldest)) return false;
-            (void)oldest;
+            /* Committed and left on the books: a batch that leaves gInFlight
+             * without being waited for is one no buffer can ever wait for. */
+            if (!flushAsyncLocked(NULL, NULL)) return false;
         }
     }
     if (processed != NULL) *processed = steps * batch;
@@ -3851,21 +4021,23 @@ bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w
             }
             if ((i + 1) % flushEvery == 0 || i + 1 == steps) {
                 id<MTLCommandBuffer> oldest = nil;
+                uint64_t oldestBatch = 0;
                 @synchronized(gQueue) {
-                    if (!flushAsyncLocked(&oldest)) return false;
+                    if (!flushAsyncLocked(&oldest, &oldestBatch)) return false;
                 }
                 if (oldest != nil) {
                     [oldest waitUntilCompleted];
                     if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
+                    noteDone(oldestBatch);
                 }
             }
         }
         @synchronized(gQueue) {
             if (!trackCorrect && !commitMlp3WeightsLocked()) return false;
             if (!commitMlpAccLocked()) return false;
-            id<MTLCommandBuffer> oldest = nil;
-            if (!flushAsyncLocked(&oldest)) return false;
-            (void)oldest;
+            /* Committed and left on the books: a batch that leaves gInFlight
+             * without being waited for is one no buffer can ever wait for. */
+            if (!flushAsyncLocked(NULL, NULL)) return false;
         }
     }
     if (processed != NULL) *processed = steps * batch;

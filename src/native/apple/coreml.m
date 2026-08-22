@@ -26,6 +26,7 @@
 const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 void        *jaiGpuBufferHandle(JaiGpuBuffer *b);
 bool         jaiGpuSynchronize(void);
+bool         jaiGpuWaitFor(JaiGpuBuffer *b);
 
 struct JaiCoreMLModel {
     void *model;    /* MLModel *, +1 */
@@ -142,7 +143,7 @@ static MLMultiArray *wrap(JaiGpuBuffer *buffer, size_t elementOffset, NSArray<NS
     if (writing) {
         id<MTLBuffer> held = (__bridge id<MTLBuffer>)jaiGpuBufferHandle(buffer);
         if (held == nil) return nil;
-        jaiGpuSynchronize();
+        jaiGpuWaitFor(buffer);
         base = (float *)[held contents] + elementOffset;
     } else {
         base = (void *)jaiGpuMapRead(buffer, elementOffset, count);
@@ -233,9 +234,9 @@ static bool prepare(JaiCoreMLModel *model,
         call->counts[i] = wanted;
         walk += outRanks[i];
     }
-    /* The results land in memory the GPU also reads, so anything already
-     * queued has to have finished before they are written. */
-    jaiGpuSynchronize();
+    /* The results land in memory the GPU also reads, so work already queued
+     * against those buffers has to have finished before they are written. */
+    for (int i = 0; i < call->count; i++) jaiGpuWaitFor(outs[i]);
     return true;
 }
 
