@@ -10,7 +10,7 @@ from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
 from jaitensor import Tensor
 from jaitensor.compiled import compile_step, refusal
-from jaitensor.layers import Activation, Conv2d, Dense, Flatten, Layer, MaxPool2d
+from jaitensor.layers import Activation, Conv2d, Dense, Flatten, Layer, LayerNorm, MaxPool2d
 from jaitensor.losses import SparseCategoricalCrossentropy
 from jaitensor.optimizers import SGD, prepare_state
 
@@ -113,14 +113,18 @@ fn test_a_compiled_step_reports_the_same_loss() -> void {
 fn test_a_model_it_cannot_express_is_refused_with_a_reason() -> void {
     if not gpu.is_available() { return }
     let rng = Random.with_seed(1)
-    let layers: list[Layer] = [Flatten(), Dense(CLASSES, activation: Activation.Sigmoid)]
+    let layers: list[Layer] = [
+        Flatten(),
+        LayerNorm(),
+        Dense(CLASSES, activation: Activation.Linear),
+    ]
     var current = [SIDE, SIDE, CHANNELS]
     for layer in layers {
         layer.build_from_shape(current, rng)
         current = layer.output_shape()
     }
     let step = compile_step(layers, [BATCH, SIDE, SIDE, CHANNELS], CLASSES, RATE)
-    assert_true(step is null, "an activation it cannot express should have been refused")
+    assert_true(step is null, "a layer it cannot express should have been refused")
     let why = refusal()
     assert_true(why is not null, "a refusal should say why")
 }
@@ -202,4 +206,47 @@ fn test_fit_takes_the_compiled_path_and_agrees_for_a_step() -> void {
     assert_eq(got.len(), want.len(), "the two paths trained different parameter counts")
     assert_true(got.len() > 0, "the model trained no parameters")
     for index in 0..got.len() { assert_near(got[index], want[index], 1e-5, f"weight {index}") }
+}
+
+#: Every activation the step claims to express gives what the layer gives.
+#:
+#: `activation_code` reports Gelu, Silu and LeakyRelu as linear, because the
+#: layers apply those after the affine part rather than inside it. A step built
+#: from that code alone would quietly train a different model, so this holds
+#: each one against the layer's own forward.
+fn test_every_expressible_activation_matches_the_layer() -> void {
+    if not gpu.is_available() { return }
+    for activation in [
+        Activation.Linear,
+        Activation.Relu,
+        Activation.Sigmoid,
+        Activation.Tanh,
+        Activation.Silu,
+        Activation.LeakyRelu,
+        Activation.Gelu,
+    ] {
+        let rng = Random.with_seed(9)
+        let layers: list[Layer] = [Flatten(), Dense(CLASSES, activation: activation)]
+        var current = [SIDE, SIDE, CHANNELS]
+        for layer in layers {
+            layer.build_from_shape(current, rng)
+            current = layer.output_shape()
+        }
+        let (x, y) = batch()
+        #: A rate of zero, so this compares the forward and nothing else.
+        let step = compile_step(layers, [BATCH, SIDE, SIDE, CHANNELS], CLASSES, 0.0)
+        assert_true(step is not null, f"{activation} would not compile: {refusal()}")
+        let scores = Tensor([BATCH, CLASSES])
+        let held = Tensor([1])
+        step.step_into(x, y, scores, held)
+        let got = scores.download()
+
+        var carried = x
+        for layer in layers { carried = layer.forward(carried) }
+        let want = carried.download()
+        for index in 0..want.len() {
+            assert_near(got[index], want[index], 1e-4, f"{activation} at {index}")
+        }
+        step.free()
+    }
 }
