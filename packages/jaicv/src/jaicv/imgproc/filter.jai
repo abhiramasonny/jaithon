@@ -81,6 +81,23 @@ kernel void filter_2d(device const float* src [[buffer(0)]],
  * neighbourhood twice beats two dispatches through device memory. */
 /* A separable filter, run as the two passes that make it separable.
  *
+ * Two things were tried against this pair and both lost, measured at 1080p in
+ * milliseconds, kernel size against the split:
+ *
+ *   the whole square in one pass   3x3 0.29 / 0.29, 5x5 0.54 / 0.31,
+ *                                  9x9 1.53 / 0.43, 11x11 2.23 / 0.50
+ *   both passes fused, a group     3x3 0.36 / 0.29, 5x5 0.53 / 0.31,
+ *   marching a band of rows with   9x9 0.89 / 0.43, 11x11 1.09 / 0.50
+ *   the row-filtered lines in a
+ *   threadgroup ring
+ *
+ * The square only ever draws level, at 3x3. The fused strip should have won --
+ * it moves two passes over the picture instead of four -- and it loses because
+ * of what it costs to march: two barriers per output row, a band that redoes
+ * `col_len - 1` lines where it meets the next, and a hundred and thirty-odd
+ * groups where the split pair has a thread per pixel. Passes over memory were
+ * not the binding constraint; occupancy was.
+ *
  * This used to sweep the whole `col_len` by `row_len` window per output pixel,
  * which is the work a general 2-D filter does and the work being separable is
  * meant to avoid: a 5 by 5 Gaussian fetched twenty-five samples a pixel where
