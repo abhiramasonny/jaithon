@@ -1007,6 +1007,143 @@ kernel void batch_norm_forward(device const float* input [[buffer(0)]],
     output[id] = gamma[c] * (input[id] - mean[c]) * inv + beta[c];
 }
 
+/* Channel statistics read the way the tensor is laid out.
+ *
+ * A channel's values are every C-th float of an NHWC tensor, so a threadgroup
+ * that owns one channel reads with a stride and every lane of a simdgroup lands
+ * on a different cache line. A threadgroup here owns a contiguous block of the
+ * tensor and all its channels at once: lane `lid` always sees channel
+ * `lid % channels`, because the group is a whole multiple of the channel count
+ * and every block starts on a channel boundary. Consecutive lanes then read
+ * consecutive floats.
+ *
+ * One block cannot cover a whole tensor and leave the GPU busy, so each writes
+ * its own partial and a second pass adds them up. Only for channel counts that
+ * divide the group; `moments_channel` still serves the rest.
+ */
+kernel void channel_partials(device const float* input [[buffer(0)]],
+                             device float* part_total [[buffer(1)]],
+                             device float* part_square [[buffer(2)]],
+                             constant uint& nspatial [[buffer(3)]],
+                             constant uint& channels [[buffer(4)]],
+                             constant uint& rows_each [[buffer(5)]],
+                             uint chunk [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float shared_total[256];
+    threadgroup float shared_square[256];
+    uint first = chunk * rows_each;
+    uint last = min(first + rows_each, nspatial);
+    float total = 0.0f;
+    float square = 0.0f;
+    for (uint f = first * channels + lid; f < last * channels; f += GROUP) {
+        float v = input[f];
+        total += v;
+        square += v * v;
+    }
+    shared_total[lid] = total;
+    shared_square[lid] = square;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid >= channels) return;
+    float a = 0.0f;
+    float b = 0.0f;
+    for (uint j = lid; j < GROUP; j += channels) {
+        a += shared_total[j];
+        b += shared_square[j];
+    }
+    part_total[chunk * channels + lid] = a;
+    part_square[chunk * channels + lid] = b;
+}
+
+/* The second pass: one thread to a channel, over however many blocks ran. */
+kernel void channel_moments_join(device const float* part_total [[buffer(0)]],
+                                 device const float* part_square [[buffer(1)]],
+                                 device float* mean [[buffer(2)]],
+                                 device float* variance [[buffer(3)]],
+                                 constant uint& chunks [[buffer(4)]],
+                                 constant uint& channels [[buffer(5)]],
+                                 constant uint& nspatial [[buffer(6)]],
+                                 uint c [[thread_position_in_grid]]) {
+    if (c >= channels) return;
+    float total = 0.0f;
+    float square = 0.0f;
+    for (uint k = 0; k < chunks; ++k) {
+        total += part_total[k * channels + c];
+        square += part_square[k * channels + c];
+    }
+    float m = total / float(nspatial);
+    mean[c] = m;
+    variance[c] = square / float(nspatial) - m * m;
+}
+
+/* The backward's four sums, read the same coalesced way. */
+kernel void channel_grad_partials(device const float* input [[buffer(0)]],
+                                  device const float* mean [[buffer(1)]],
+                                  device const float* variance [[buffer(2)]],
+                                  device const float* gamma [[buffer(3)]],
+                                  device const float* upstream [[buffer(4)]],
+                                  device float* part_dy [[buffer(5)]],
+                                  device float* part_dy_xhat [[buffer(6)]],
+                                  constant uint& nspatial [[buffer(7)]],
+                                  constant uint& channels [[buffer(8)]],
+                                  constant uint& rows_each [[buffer(9)]],
+                                  uint chunk [[threadgroup_position_in_grid]],
+                                  uint lid [[thread_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float shared_dy[256];
+    threadgroup float shared_xhat[256];
+    uint c = lid % channels;
+    float inv = rsqrt(variance[c] + 1e-5f);
+    float centre = mean[c];
+    uint first = chunk * rows_each;
+    uint last = min(first + rows_each, nspatial);
+    float dy_total = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint f = first * channels + lid; f < last * channels; f += GROUP) {
+        float up = upstream[f];
+        dy_total += up;
+        dy_xhat += up * (input[f] - centre) * inv;
+    }
+    shared_dy[lid] = dy_total;
+    shared_xhat[lid] = dy_xhat;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid >= channels) return;
+    float a = 0.0f;
+    float b = 0.0f;
+    for (uint j = lid; j < GROUP; j += channels) {
+        a += shared_dy[j];
+        b += shared_xhat[j];
+    }
+    part_dy[chunk * channels + lid] = a;
+    part_dy_xhat[chunk * channels + lid] = b;
+}
+
+/* Joins the partials and turns them into what the two consumers want: the
+ * parameter gradients are the raw sums, and the input pass wants them weighted
+ * by gamma. */
+kernel void channel_grad_join(device const float* part_dy [[buffer(0)]],
+                              device const float* part_dy_xhat [[buffer(1)]],
+                              device const float* gamma [[buffer(2)]],
+                              device float* sum_dy [[buffer(3)]],
+                              device float* sum_dy_xhat [[buffer(4)]],
+                              device float* grad_gamma [[buffer(5)]],
+                              device float* grad_beta [[buffer(6)]],
+                              constant uint& chunks [[buffer(7)]],
+                              constant uint& channels [[buffer(8)]],
+                              uint c [[thread_position_in_grid]]) {
+    if (c >= channels) return;
+    float dy = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint k = 0; k < chunks; ++k) {
+        dy += part_dy[k * channels + c];
+        dy_xhat += part_dy_xhat[k * channels + c];
+    }
+    grad_beta[c] = dy;
+    grad_gamma[c] = dy_xhat;
+    sum_dy[c] = dy * gamma[c];
+    sum_dy_xhat[c] = dy_xhat * gamma[c];
+}
+
 kernel void moments_channel(device const float* input [[buffer(0)]],
                             device float* mean [[buffer(1)]],
                             device float* variance [[buffer(2)]],
@@ -3857,6 +3994,18 @@ fn attach_conv_grad(
 }
 
 #: Channel-last batch normalization using per-channel mean and variance of `x`.
+#: Blocks for the coalesced channel reduction, or zero when it does not apply.
+#:
+#: Each block's threads stay on one channel apiece only if the group holds a
+#: whole number of channels, and the split has to be worth making: a couple of
+#: rows a block spends more on joining the partials than the first pass saves.
+fn channel_chunks(nspatial: int, channels: int) -> int {
+    if channels > 256 or 256 % channels != 0 { return 0 }
+    let wanted = min(128, nspatial // 64)
+    if wanted < 2 { return 0 }
+    return wanted
+}
+
 pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     if input.rank() != 4 {
         throw ValueError(f"batch_norm needs NHWC input, got {input.shape}")
@@ -3868,13 +4017,32 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     let nspatial = input.shape[0] * input.shape[1] * input.shape[2]
     let mean = Tensor([channels])
     let variance = Tensor([channels])
-    let moments = cached_kernel("moments_channel")
-    moments.dispatch_async(
-        [input.buffer(), mean.buffer(), variance.buffer()],
-        channels * 256,
-        [nspatial, channels],
-        group_size: 256
-    )
+    let chunks = channel_chunks(nspatial, channels)
+    if chunks > 0 {
+        let rows_each = (nspatial + chunks - 1) // chunks
+        let part_total = Tensor([chunks * channels])
+        let part_square = Tensor([chunks * channels])
+        cached_kernel("channel_partials").dispatch_async(
+            [input.buffer(), part_total.buffer(), part_square.buffer()],
+            chunks * 256,
+            [nspatial, channels, rows_each],
+            group_size: 256
+        )
+        cached_kernel("channel_moments_join").dispatch_async(
+            [part_total.buffer(), part_square.buffer(), mean.buffer(), variance.buffer()],
+            channels,
+            [chunks, channels, nspatial]
+        )
+        part_total.free()
+        part_square.free()
+    } else {
+        cached_kernel("moments_channel").dispatch_async(
+            [input.buffer(), mean.buffer(), variance.buffer()],
+            channels * 256,
+            [nspatial, channels],
+            group_size: 256
+        )
+    }
     let output = Tensor(input.shape)
     let kernel = cached_kernel("batch_norm_forward")
     kernel.dispatch_async(
@@ -3895,8 +4063,18 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
             let sum_dy_xhat = Tensor([channels])
             let grad_gamma = Tensor([channels])
             let grad_beta = Tensor([channels])
-            let sums = cached_kernel("norm_channel_sums")
-            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels * 256, [nspatial, channels], group_size: 256)
+            let split = channel_chunks(nspatial, channels)
+            if split > 0 {
+                let rows_each = (nspatial + split - 1) // split
+                let part_dy = Tensor([split * channels])
+                let part_dy_xhat = Tensor([split * channels])
+                cached_kernel("channel_grad_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer()], split * 256, [nspatial, channels, rows_each], group_size: 256)
+                cached_kernel("channel_grad_join").dispatch_async([part_dy.buffer(), part_dy_xhat.buffer(), gamma.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels, [split, channels])
+                part_dy.free()
+                part_dy_xhat.free()
+            } else {
+                cached_kernel("norm_channel_sums").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels * 256, [nspatial, channels], group_size: 256)
+            }
             let grad_input = Tensor(input.shape)
             let back = cached_kernel("norm_channel_backward")
             back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial])
