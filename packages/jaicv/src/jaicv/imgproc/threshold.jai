@@ -103,19 +103,41 @@ kernel void threshold_adaptive(device const float* src [[buffer(0)]],
 /* The counts live in an ordinary float buffer so the result reads back as a
  * Mat; the atomic add goes through a cast, which is what Metal offers for
  * float accumulation. */
+/* A histogram counted per threadgroup and merged once.
+ *
+ * A thread per pixel, each adding into one of 256 shared bins, is two million
+ * atomic writes contending over a quarter of a kilobyte -- and on device
+ * memory, where an atomic is at its most expensive. Each group counts into its
+ * own bins in threadgroup memory instead and adds those to the picture's at
+ * the end, which turns two million device atomics into sixty-five thousand.
+ *
+ * A fixed grid, strided: the number of groups is what decides how many merges
+ * there are, so it is chosen rather than derived from the pixel count. */
 kernel void threshold_histogram(device const float* src [[buffer(0)]],
                                 device float* histogram [[buffer(1)]],
                                 constant uint& count [[buffer(2)]],
                                 constant uint& cols [[buffer(3)]],
                                 constant uint& src_off [[buffer(4)]],
                                 constant uint& src_step [[buffer(5)]],
-                                uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    uint y = id / cols;
-    uint x = id - y * cols;
-    float value = src[src_off + y * src_step + x];
-    uint slot = uint(clamp(rint(value), 0.0f, 255.0f));
-    atomic_fetch_add_explicit((device atomic<float>*)(histogram + slot), 1.0f,
+                                constant uint& stride [[buffer(6)]],
+                                uint id [[thread_position_in_grid]],
+                                uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint bins[256];
+    atomic_store_explicit(&bins[lid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint at = id; at < count; at += stride) {
+        uint y = at / cols;
+        uint x = at - y * cols;
+        float value = src[src_off + y * src_step + x];
+        uint slot = uint(clamp(rint(value), 0.0f, 255.0f));
+        atomic_fetch_add_explicit(&bins[slot], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint mine = atomic_load_explicit(&bins[lid], memory_order_relaxed);
+    if (mine == 0u) return;
+    atomic_fetch_add_explicit((device atomic<float>*)(histogram + lid), float(mine),
                               memory_order_relaxed);
 }
 """
@@ -137,10 +159,15 @@ pub fn histogram_256(src: Mat) -> list[int] {
     let counts = Mat.zeros(1, 256, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
     if count == 0 { return [0 for _index in 0..256] }
-    kernel_for("threshold_histogram").dispatch(
+    #: Two hundred and fifty-six groups of as many threads, each striding the
+    #: picture: enough to fill the device and few enough that the merge is
+    #: cheap.
+    let threads = 256 * 256
+    kernel_for("threshold_histogram").dispatch_async(
         [src.storage, counts.storage],
-        count,
-        [count, src.cols, src.offset, src.step_]
+        threads,
+        [count, src.cols, src.offset, src.step_, threads],
+        group_size: 256
     )
     var out: list[int] = []
     for value in counts.to_list() { out.push(int(value)) }
