@@ -13,7 +13,7 @@ import numpy as np
 
 WIDTH = 1920
 HEIGHT = 1080
-WARMUP = 12
+WARMUP = 40
 
 
 def picture(channels: int) -> np.ndarray:

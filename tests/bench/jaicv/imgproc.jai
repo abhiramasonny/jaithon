@@ -19,7 +19,13 @@ let HEIGHT = 1080
 
 #: Enough repetitions that the clock is at its working speed before the timed
 #: run starts; see tests/bench/jaitensor/gemm.jai for why that matters.
-let WARMUP = 12
+#:
+#: Forty, not a dozen. The device takes about that many dispatches to reach its
+#: working clock, and at twelve the first operation measured reads three times
+#: slow -- which is a property of the harness, not of the operation. The peer
+#: warms the same number of times; a CPU has no ramp to climb, so it costs
+#: nothing there and keeps the two sides honest.
+let WARMUP = 40
 
 fn picture(channels: int) -> Mat {
     var values: list[float] = []
@@ -37,14 +43,23 @@ fn run(name: str, repeats: int, work: fn() -> Mat) -> void {
     }
     gpu.synchronize()
     let started = Instant.now()
-    var live: list[Mat] = []
-    for _r in 0..repeats { live.push(work()) }
+    #: The latest result stays alive so the work cannot be elided, and every
+    #: earlier one goes back immediately. Holding all thirty means a quarter of
+    #: a gigabyte outstanding and an allocator measured instead of an operation
+    #: -- and the peer holds one, so keeping them all made the two sides answer
+    #: different questions.
+    var last = work()
+    for _r in 1..repeats {
+        let made = work()
+        last.release()
+        last = made
+    }
     gpu.synchronize()
     let seconds = started.elapsed().to_seconds()
     var check = "ok"
-    let sample = live[live.len() - 1].to_list()
+    let sample = last.to_list()
     if sample.len() == 0 or not math.is_finite(sample[0]) { check = "invalid" }
-    for m in live { m.release() }
+    last.release()
     let pixels = repeats * WIDTH * HEIGHT
     print(f"jtb\t{name}\t{seconds:.9f}\t0\t{pixels}\t{check}\t—")
 }
