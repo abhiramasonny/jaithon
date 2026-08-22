@@ -234,6 +234,15 @@ bool jaiGpuSynchronize(void) {
     return false;
 }
 
+bool jaiGpuWaitFor(JaiGpuBuffer *b) {
+    (void)b;
+    return false;
+}
+
+void jaiGpuBufferMark(JaiGpuBuffer *b) {
+    (void)b;
+}
+
 bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
                          size_t bOffset, JaiGpuBuffer *out, size_t outOffset,
                          uint32_t m, uint32_t k, uint32_t n, bool transA,

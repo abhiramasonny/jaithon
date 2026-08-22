@@ -245,9 +245,80 @@ pub fn draw(image: Mat, found: list[Detection]) -> Mat {
     return image
 }
 
+#: A detection that has been started and not yet read.
+#:
+#: Everything up to the network's output is queued work; nothing waits for the
+#: device until `finish` reads the result. Between the two calls the caller can
+#: get on with the previous frame -- drawing its boxes, packing it for the
+#: window -- and that work runs on the processor while the network runs on the
+#: device. A loop written that way costs the slower of the two halves rather
+#: than their sum.
+pub class Pending {
+    pub let output: Tensor
+    pub let scale: float
+    pub let pad_x: int
+    pub let pad_y: int
+    pub let width: int
+    pub let height: int
+
+    pub fn init(
+        self,
+        output: Tensor,
+        scale: float,
+        pad_x: int,
+        pad_y: int,
+        width: int,
+        height: int
+    ) {
+        self.output = output
+        self.scale = scale
+        self.pad_x = pad_x
+        self.pad_y = pad_y
+        self.width = width
+        self.height = height
+    }
+}
+
+#: Queue a frame's network work and come back for it.
+pub fn start_detect(graph: Graph, image: Mat) -> Pending {
+    let (padded, scale, pad_x, pad_y) = letterbox(image)
+    let blob = cv.blob_from_image(
+        padded,
+        1.0 / 255.0,
+        Size(INPUT, INPUT),
+        Scalar(0.0, 0.0, 0.0),
+        true
+    )
+    let input = cv.blob_to_tensor(blob, 3, Size(INPUT, INPUT))
+    let outputs = run_best(graph, {graph.inputs[0]: input})
+    return Pending(
+        outputs[graph.outputs[0]],
+        scale,
+        pad_x,
+        pad_y,
+        image.cols,
+        image.rows
+    )
+}
+
+#: Read what `start_detect` queued. This is where the wait happens.
+pub fn finish_detect(pending: Pending) -> list[Detection] {
+    return decode(
+        pending.output,
+        pending.scale,
+        pending.pad_x,
+        pending.pad_y,
+        pending.width,
+        pending.height
+    )
+}
+
 #: One frame, from image to detections. The graph is passed in rather than
 #: reopened, because loading the 12 MB of weights costs about two seconds and
 #: a camera loop must do it once.
+#:
+#: This waits for the network before returning. A loop that has other work to
+#: do meanwhile should use `start_detect` and `finish_detect` instead.
 pub fn detect_frame(graph: Graph, image: Mat) -> list[Detection] {
     let (padded, scale, pad_x, pad_y) = letterbox(image)
     #: `blob_from_image` does the BGR-to-RGB swap and the 1/255 scaling the

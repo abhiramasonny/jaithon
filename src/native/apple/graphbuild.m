@@ -32,6 +32,7 @@
 id<MTLDevice> jaiGpuMetalDevice(void);
 id<MTLCommandQueue> jaiGpuMetalQueue(void);
 void *jaiGpuBufferHandle(JaiGpuBuffer *b);
+void  jaiGpuBufferMark(JaiGpuBuffer *b);
 
 struct JaiGraphBuilder {
     void *graph;    /* MPSGraph *, +1 */
@@ -884,6 +885,12 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets
             if (data == nil) return false;
             [results addObject:data];
         }
+
+        /* Both routes write the outputs and read the inputs through the same
+         * queue everything else uses, so a later read of either has to know
+         * to wait for this. */
+        for (int i = 0; i < plan->inputCount; i++) jaiGpuBufferMark(ins[i]);
+        for (int i = 0; i < plan->outputCount; i++) jaiGpuBufferMark(outs[i]);
 
         if (plan->route == ROUTE_UNDECIDED) chooseRoute(plan, feeds, results, queue);
 

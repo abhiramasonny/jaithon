@@ -235,3 +235,47 @@ fn test_fill_uniform_stays_in_range_on_the_device() -> void {
     assert_true(close(copied[0], got[0], 1e-6))
     assert_true(close(copied[N - 1], got[N - 1], 1e-6))
 }
+
+#: A host write lands after the work already queued against the same buffer,
+#: not underneath it.
+#:
+#: The queued kernel adds one and the host then uploads zeros, so the buffer
+#: must read back as zeros. With no barrier the upload lands first and the
+#: kernel adds one to it afterwards, reading back as ones -- the same
+#: shape of mistake that had an optimizer's momentum refilled from the previous
+#: parameter's update.
+fn test_a_host_write_waits_for_work_already_queued_against_the_buffer() -> void {
+    if not gpu.is_available() { return }
+    let add_one = gpu.Kernel.compile(ASYNC_SOURCE, "add_one")
+    let values = gpu.Buffer.of([1.0, 2.0, 3.0])
+    defer { gpu.synchronize() }
+    defer { add_one.free() }
+    defer { values.free() }
+
+    add_one.dispatch_async([values], 3)
+    values.upload([0.0, 0.0, 0.0])
+    gpu.synchronize()
+    assert_eq(values.download(), [0.0, 0.0, 0.0])
+}
+
+#: Reading one buffer waits for the work that wrote it and leaves the rest of
+#: the queue alone, so a later read of another buffer still gets its own work.
+#:
+#: The flush puts the two dispatches in separate batches, which is the case
+#: where a read has to retire part of the queue rather than all or none of it.
+fn test_reading_one_buffer_does_not_lose_work_queued_for_another() -> void {
+    if not gpu.is_available() { return }
+    let add_one = gpu.Kernel.compile(ASYNC_SOURCE, "add_one")
+    let first = gpu.Buffer.of([1.0, 2.0, 3.0])
+    let second = gpu.Buffer.of([10.0, 20.0, 30.0])
+    defer { gpu.synchronize() }
+    defer { add_one.free() }
+    defer { first.free() }
+    defer { second.free() }
+
+    add_one.dispatch_async([first], 3)
+    gpu.flush()
+    add_one.dispatch_async([second], 3)
+    assert_eq(first.download(), [2.0, 3.0, 4.0])
+    assert_eq(second.download(), [11.0, 21.0, 31.0])
+}
