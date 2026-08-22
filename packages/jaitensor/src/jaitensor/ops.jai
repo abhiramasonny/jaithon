@@ -1704,10 +1704,18 @@ kernel void upsample_nearest2d_nhwc(device const float* input [[buffer(0)]],
                                     uint id [[thread_position_in_grid]]) {
     uint count = N * OH * OW * C;
     if (id >= count) return;
-    uint c = id % C;
-    uint ow = (id / C) % OW;
-    uint oh = (id / (C * OW)) % OH;
-    uint n = id / (C * OW * OH);
+    /* Unpicked with one division a level and a subtraction for the remainder,
+     * rather than a division and a modulo apiece. The device has no integer
+     * divide -- each one is a short sequence -- and this kernel does nothing
+     * else, so the count of them is the whole cost. */
+    uint rest = id / C;
+    uint c = id - rest * C;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    /* Shifting instead of dividing when the scale is a power of two was tried
+     * here and measured the same, so the branch is not carried. */
     uint ih = oh / SH;
     uint iw = ow / SW;
     output[id] = input[((n * H + ih) * W + iw) * C + c];
