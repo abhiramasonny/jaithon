@@ -1127,9 +1127,11 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
 
 #: ONNX `GRU` as the platform's single operation.
 #:
-#: Only the default reset variant: with `linear_before_reset` the recurrent
-#: bias moves inside the reset gate while the input bias stays outside, and the
-#: operation takes one bias for both. The interpreter has that case.
+#: Both reset variants map. `linear_before_reset` -- what PyTorch exports, and
+#: so what most GRUs in the wild are -- puts the candidate gate's recurrent
+#: bias inside the reset while its input bias stays outside; the operation
+#: takes that one apart as a second bias and the other two gates keep both of
+#: theirs summed together.
 fn emit_gru(state: Build, node: GraphNode) -> bool {
     let b = state.builder
     if node.outputs.len() == 0 { return false }
@@ -1137,7 +1139,6 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
     if node.attrs.get("activations", null) is not null { return false }
     if node.attrs.get("clip", null) is not null { return false }
     if attr_int(node, "layout", 0) != 0 { return false }
-    if attr_int(node, "linear_before_reset", 0) != 0 { return false }
     if node.inputs.len() > 4 and node.inputs[4].len() > 0 { return false }
 
     let x = state.shape_of(node.inputs[0])
@@ -1155,14 +1156,26 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
     let w = __prim__.graph_reshape(b, state.id_of(node.inputs[1]), [3 * hidden, w_shape[2]])
     let r = __prim__.graph_reshape(b, state.id_of(node.inputs[2]), [3 * hidden, hidden])
 
+    let linear = attr_int(node, "linear_before_reset", 0) != 0
     var bias = -1
+    var reset_bias = -1
     if node.inputs.len() > 3 and node.inputs[3].len() > 0 {
         let given = state.numbers_of(node.inputs[3])
         if given is null { return false }
-        #: Both biases land outside the reset in this variant, so their sum is
-        #: the single bias the operation takes.
+        #: The update and reset gates carry both biases outside the reset, so
+        #: their sum is what the operation wants. The candidate gate follows
+        #: them only when the reset comes first; with `linear_before_reset` its
+        #: recurrent half sits inside the reset and travels separately.
         var summed = __prim__.list_filled(3 * hidden, 0.0)
         for index in 0..3 * hidden { summed[index] = given[index] + given[3 * hidden + index] }
+        if linear {
+            var inside = __prim__.list_filled(hidden, 0.0)
+            for index in 0..hidden {
+                summed[2 * hidden + index] = given[2 * hidden + index]
+                inside[index] = given[5 * hidden + index]
+            }
+            reset_bias = __prim__.graph_constant(b, inside, [hidden])
+        }
         bias = __prim__.graph_constant(b, summed, [3 * hidden])
     }
     var start = -1
@@ -1170,7 +1183,17 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
         start = __prim__.graph_reshape(b, state.id_of(node.inputs[5]), [batch, hidden])
     }
 
-    let all_state = __prim__.graph_gru(b, state.id_of(node.inputs[0]), r, w, bias, start, 0)
+    let all_state = __prim__.graph_gru(
+        b,
+        state.id_of(node.inputs[0]),
+        r,
+        w,
+        bias,
+        start,
+        0,
+        if linear { 1 } else { 0 },
+        reset_bias
+    )
     if all_state < 0 { return false }
     if node.outputs[0].len() > 0 {
         state.ids[node.outputs[0]] = __prim__.graph_reshape(
