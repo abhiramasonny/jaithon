@@ -578,6 +578,434 @@ static bool primListFillPattern(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `list_push3(values, a, b, c)` -- append three numbers in one call.
+ *
+ * A rasteriser batching rows for the device appends one of these per row, and
+ * a row of a thin line is one pixel, so this is once per pixel along every
+ * stroke and every letter. Three `push` calls from Jaithon are three bounds
+ * checks and three chances to grow; done here the capacity is settled once.
+ */
+static bool primListPush3(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *values;
+    if (!jaiArgList(args[0], 1, "list_push3", &values)) return false;
+    jaiListReserve(values, values->count + 3);
+    if (values->capacity < values->count + 3) return false;
+    values->items[values->count] = args[1];
+    values->items[values->count + 1] = args[2];
+    values->items[values->count + 2] = args[3];
+    values->count += 3;
+    values->version++;
+    *out = OBJ_VAL(values);
+    return true;
+}
+
+/* The pixels of one clipped, normalised line, in the order a rasteriser walks
+ * them. Mirrors `walk` in jaicv's drawing module exactly, down to the error
+ * term, so a line comes out on the same pixels either way.
+ *
+ * The Jaithon version built a point object per pixel and then wrote them one
+ * at a time. A rectangle two pixels thick over a 720p frame is about four
+ * thousand of those, and at roughly a hundred nanoseconds each the outlines
+ * of a detector's boxes cost more than the network that found them.
+ *
+ * `emit` is what to do with a pixel, which is the only thing that differs
+ * between drawing on the host and batching rows for the device. */
+typedef struct {
+    int x, y;
+    int dx, dy;
+    int majorX, majorY;
+    int minorX, minorY;
+    int connectivity;
+} JaiLineWalk;
+
+static bool lineWalk(const JaiLineWalk *w, bool (*emit)(void *at, int x, int y), void *at) {
+    int x = w->x;
+    int y = w->y;
+    if (w->connectivity == 4) {
+        int err = 0;
+        const int plus = w->dx + w->dx + w->dy + w->dy;
+        const int minus = -(w->dy + w->dy);
+        const int steps = w->dx + w->dy + 1;
+        for (int i = 0; i < steps; i++) {
+            if (!emit(at, x, y)) return false;
+            const bool sideways = err < 0;
+            err += minus + (sideways ? plus : 0);
+            x += sideways ? w->minorX : w->majorX;
+            y += sideways ? w->minorY : w->majorY;
+        }
+        return true;
+    }
+    int err = w->dx - (w->dy + w->dy);
+    const int plus = w->dx + w->dx;
+    const int minus = -(w->dy + w->dy);
+    const int steps = w->dx + 1;
+    for (int i = 0; i < steps; i++) {
+        if (!emit(at, x, y)) return false;
+        const bool diagonal = err < 0;
+        err += minus + (diagonal ? plus : 0);
+        x += w->majorX + (diagonal ? w->minorX : 0);
+        y += w->majorY + (diagonal ? w->minorY : 0);
+    }
+    return true;
+}
+
+/* Read the eight numbers every line primitive here takes, plus the frame it is
+ * being clipped against. */
+static bool readWalk(Value *args, int first, const char *fnName, JaiLineWalk *w,
+                     int64_t *cols, int64_t *rows) {
+    int64_t got[11];
+    for (int i = 0; i < 11; i++) {
+        if (!jaiStrWantInt(args[first + i], fnName, "a coordinate", &got[i])) return false;
+    }
+    w->x = (int)got[0];
+    w->y = (int)got[1];
+    w->dx = (int)got[2];
+    w->dy = (int)got[3];
+    w->majorX = (int)got[4];
+    w->majorY = (int)got[5];
+    w->minorX = (int)got[6];
+    w->minorY = (int)got[7];
+    w->connectivity = (int)got[8];
+    *cols = got[9];
+    *rows = got[10];
+    if (w->dx < 0 || w->dy < 0) {
+        return jaiThrow(vm.cValueError, "%s(): the deltas must not be negative", fnName);
+    }
+    return true;
+}
+
+typedef struct {
+    ObjList *pending;
+    int64_t  cols;
+    int64_t  rows;
+    int      count;
+    bool     full;
+    int64_t  widest;
+} JaiSpanSink;
+
+/* One row of one pixel per point, in the triples the span filler reads. */
+static bool spanSink(void *at, int x, int y) {
+    JaiSpanSink *sink = (JaiSpanSink *)at;
+    if (x < 0 || y < 0 || x >= sink->cols || y >= sink->rows) return true;
+    ObjList *list = sink->pending;
+    jaiListReserve(list, list->count + 3);
+    if (list->capacity < list->count + 3) {
+        sink->full = true;
+        return false;
+    }
+    list->items[list->count] = FLOAT_VAL((double)y);
+    list->items[list->count + 1] = FLOAT_VAL((double)x);
+    list->items[list->count + 2] = FLOAT_VAL(1.0);
+    list->count += 3;
+    sink->count++;
+    return true;
+}
+
+/* `line_spans(pending, x, y, dx, dy, majorX, majorY, minorX, minorY,
+ *  connectivity, cols, rows)` -- append one row per pixel of the line, and
+ *  say how many. */
+static bool primLineSpans(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *pending;
+    if (!jaiArgList(args[0], 1, "line_spans", &pending)) return false;
+    JaiLineWalk walk;
+    int64_t cols, rows;
+    if (!readWalk(args, 1, "line_spans", &walk, &cols, &rows)) return false;
+
+    JaiSpanSink sink = {pending, cols, rows, 0, false, 1};
+    lineWalk(&walk, spanSink, &sink);
+    if (sink.full) return jaiThrow(vm.cRuntimeError, "line_spans(): out of room for the line");
+    pending->version++;
+    *out = INT_VAL(sink.count);
+    return true;
+}
+
+typedef struct {
+    ObjList *values;
+    const Value *colour;
+    int64_t cols;
+    int64_t rows;
+    int     cn;
+} JaiPaintSink;
+
+/* Straight into the host mirror, the same write `plot` makes. */
+static bool paintSink(void *at, int x, int y) {
+    JaiPaintSink *sink = (JaiPaintSink *)at;
+    if (x < 0 || y < 0 || x >= sink->cols || y >= sink->rows) return true;
+    const int64_t base = ((int64_t)y * sink->cols + x) * sink->cn;
+    if (base < 0 || base + sink->cn > sink->values->count) return true;
+    for (int c = 0; c < sink->cn; c++) sink->values->items[base + c] = sink->colour[c];
+    return true;
+}
+
+/* `line_paint(values, colour, cn, x, y, dx, dy, majorX, majorY, minorX,
+ *  minorY, connectivity, cols, rows)` -- write the line into a host mirror. */
+static bool primLinePaint(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *values;
+    ObjList *colour;
+    int64_t channels;
+    if (!jaiArgList(args[0], 1, "line_paint", &values)) return false;
+    if (!jaiArgList(args[1], 2, "line_paint", &colour)) return false;
+    if (!jaiStrWantInt(args[2], "line_paint", "the channel count", &channels)) return false;
+    if (channels <= 0 || channels != colour->count) {
+        return jaiThrow(vm.cValueError,
+                        "line_paint(): %lld channels against a colour of %d",
+                        (long long)channels, colour->count);
+    }
+    JaiLineWalk walk;
+    int64_t cols, rows;
+    if (!readWalk(args, 3, "line_paint", &walk, &cols, &rows)) return false;
+
+    JaiPaintSink sink = {values, colour->items, cols, rows, (int)channels};
+    lineWalk(&walk, paintSink, &sink);
+    values->version++;
+    *out = OBJ_VAL(values);
+    return true;
+}
+
+/* The scanline fill of a convex polygon, in fixed point.
+ *
+ * Mirrors `fill_convex` in jaicv's drawing module: the same two edge chains
+ * walked from the topmost vertex, the same truncating division for the slope,
+ * the same rounding of each end of a row. OpenCV's arithmetic, so the spans
+ * land on OpenCV's pixels.
+ *
+ * Every filled shape and every stroke wider than one pixel is made of these,
+ * and a row of one cost about half a microsecond written in Jaithon -- a
+ * rectangle two pixels thick over a 720p frame is some six hundred rows, which
+ * is most of what drawing a frame of detections cost. */
+#define JAI_XY_SHIFT 16
+#define JAI_XY_ONE   (1 << JAI_XY_SHIFT)
+
+static int64_t truncDiv(int64_t a, int64_t b) {
+    int64_t quotient = a / b;
+    /* C already truncates toward zero, which is what the Jaithon helper's
+     * floor-plus-correction comes to. */
+    return quotient;
+}
+
+typedef struct {
+    const int64_t *xs;
+    const int64_t *ys;
+    int      count;
+    int      shift;
+    int64_t  delta1;
+    int64_t  delta2;
+    int64_t  cols;
+    int64_t  rows;
+} JaiConvexFill;
+
+static void convexFill(const JaiConvexFill *poly,
+                       void (*row)(void *at, int64_t y, int64_t left, int64_t right),
+                       void *at) {
+    const int count = poly->count;
+    if (count < 3) return;
+    const int64_t delta = (int64_t)1 << poly->shift >> 1;
+
+    int64_t xMin = poly->xs[0], xMax = poly->xs[0];
+    int64_t yMin = poly->ys[0], yMax = poly->ys[0];
+    int top = 0;
+    for (int i = 0; i < count; i++) {
+        if (poly->ys[i] < yMin) { yMin = poly->ys[i]; top = i; }
+        if (poly->ys[i] > yMax) yMax = poly->ys[i];
+        if (poly->xs[i] > xMax) xMax = poly->xs[i];
+        if (poly->xs[i] < xMin) xMin = poly->xs[i];
+    }
+    xMin = (xMin + delta) >> poly->shift;
+    xMax = (xMax + delta) >> poly->shift;
+    yMin = (yMin + delta) >> poly->shift;
+    yMax = (yMax + delta) >> poly->shift;
+    if (xMax < 0 || yMax < 0 || xMin >= poly->cols || yMin >= poly->rows) return;
+    if (yMax > poly->rows - 1) yMax = poly->rows - 1;
+
+    int indexOf[2] = {top, top};
+    const int direction[2] = {1, count - 1};
+    int64_t endY[2] = {yMin, yMin};
+    int64_t edgeX[2] = {-JAI_XY_ONE, -JAI_XY_ONE};
+    int64_t edgeDx[2] = {0, 0};
+    int remaining = count;
+
+    for (int64_t y = yMin; y <= yMax; y++) {
+        bool exhausted = false;
+        for (int side = 0; side < 2; side++) {
+            if (y < endY[side]) continue;
+            int idx = indexOf[side];
+            const int di = direction[side];
+            int64_t xs = 0;
+            int64_t ty = 0;
+            for (;;) {
+                ty = (poly->ys[idx] + delta) >> poly->shift;
+                if (ty > y || remaining == 0) break;
+                xs = poly->xs[idx];
+                idx += di;
+                if (idx >= count) idx -= count;
+                remaining--;
+            }
+            if (y >= ty) { exhausted = true; break; }
+            endY[side] = ty;
+            const int64_t start = xs << (JAI_XY_SHIFT - poly->shift);
+            const int64_t finish = poly->xs[idx] << (JAI_XY_SHIFT - poly->shift);
+            edgeDx[side] = truncDiv((finish - start) * 2 + (ty - y), 2 * (ty - y));
+            edgeX[side] = start;
+            indexOf[side] = idx;
+        }
+        if (y >= 0) {
+            const int left = edgeX[0] > edgeX[1] ? 1 : 0;
+            const int right = 1 - left;
+            row(at, y, (edgeX[left] + poly->delta1) >> JAI_XY_SHIFT,
+                (edgeX[right] + poly->delta2) >> JAI_XY_SHIFT);
+        }
+        if (exhausted) return;
+        edgeX[0] += edgeDx[0];
+        edgeX[1] += edgeDx[1];
+    }
+}
+
+/* Clip a row to the frame and hand back what is left, or nothing. */
+static bool rowInside(int64_t cols, int64_t *left, int64_t right, int64_t *run) {
+    if (*left < 0) *left = 0;
+    if (right > cols - 1) right = cols - 1;
+    if (*left > right) return false;
+    *run = right - *left + 1;
+    return true;
+}
+
+static void convexSpanRow(void *at, int64_t y, int64_t left, int64_t right) {
+    JaiSpanSink *sink = (JaiSpanSink *)at;
+    if (sink->full || y < 0 || y >= sink->rows) return;
+    int64_t run;
+    if (!rowInside(sink->cols, &left, right, &run)) return;
+    ObjList *list = sink->pending;
+    jaiListReserve(list, list->count + 3);
+    if (list->capacity < list->count + 3) { sink->full = true; return; }
+    list->items[list->count] = FLOAT_VAL((double)y);
+    list->items[list->count + 1] = FLOAT_VAL((double)left);
+    list->items[list->count + 2] = FLOAT_VAL((double)run);
+    list->count += 3;
+    sink->count++;
+    if (run > sink->widest) sink->widest = run;
+}
+
+static void convexPaintRow(void *at, int64_t y, int64_t left, int64_t right) {
+    JaiPaintSink *sink = (JaiPaintSink *)at;
+    if (y < 0 || y >= sink->rows) return;
+    int64_t run;
+    if (!rowInside(sink->cols, &left, right, &run)) return;
+    int64_t base = ((int64_t)y * sink->cols + left) * sink->cn;
+    if (base < 0 || base + run * sink->cn > sink->values->count) return;
+    for (int64_t i = 0; i < run; i++) {
+        for (int c = 0; c < sink->cn; c++) sink->values->items[base + c] = sink->colour[c];
+        base += sink->cn;
+    }
+}
+
+/* Read the polygon's corners, which arrive as one flat list of x then y. */
+static bool readCorners(Value v, int index, const char *fnName, ObjList **flat, int *count) {
+    if (!jaiArgList(v, index, fnName, flat)) return false;
+    if ((*flat)->count % 2 != 0) {
+        return jaiThrow(vm.cValueError, "%s(): %d numbers is not a list of corners",
+                        fnName, (*flat)->count);
+    }
+    *count = (*flat)->count / 2;
+    return true;
+}
+
+static bool cornersInto(ObjList *flat, int count, int64_t *xs, int64_t *ys,
+                        const char *fnName) {
+    for (int i = 0; i < count; i++) {
+        Value vx = flat->items[i * 2];
+        Value vy = flat->items[i * 2 + 1];
+        if (!IS_INT(vx) || !IS_INT(vy)) {
+            return jaiThrow(vm.cTypeError, "%s(): a corner is not a pair of integers", fnName);
+        }
+        xs[i] = AS_INT(vx);
+        ys[i] = AS_INT(vy);
+    }
+    return true;
+}
+
+#define JAI_CONVEX_MAX_CORNERS 4096
+
+/* `convex_spans(pending, corners, shift, delta1, delta2, cols, rows)` */
+static bool primConvexSpans(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *pending;
+    ObjList *flat;
+    int count;
+    int64_t shift, delta1, delta2, cols, rows;
+    if (!jaiArgList(args[0], 1, "convex_spans", &pending)) return false;
+    if (!readCorners(args[1], 2, "convex_spans", &flat, &count)) return false;
+    if (!jaiStrWantInt(args[2], "convex_spans", "the shift", &shift)) return false;
+    if (!jaiStrWantInt(args[3], "convex_spans", "the near rounding", &delta1)) return false;
+    if (!jaiStrWantInt(args[4], "convex_spans", "the far rounding", &delta2)) return false;
+    if (!jaiStrWantInt(args[5], "convex_spans", "the width", &cols)) return false;
+    if (!jaiStrWantInt(args[6], "convex_spans", "the height", &rows)) return false;
+    if (count < 3 || count > JAI_CONVEX_MAX_CORNERS || shift < 0 || shift > JAI_XY_SHIFT) {
+        *out = INT_VAL(0);
+        return true;
+    }
+
+    int64_t xs[JAI_CONVEX_MAX_CORNERS];
+    int64_t ys[JAI_CONVEX_MAX_CORNERS];
+    if (!cornersInto(flat, count, xs, ys, "convex_spans")) return false;
+
+    JaiConvexFill poly = {xs, ys, count, (int)shift, delta1, delta2, cols, rows};
+    JaiSpanSink sink = {pending, cols, rows, 0, false, 0};
+    convexFill(&poly, convexSpanRow, &sink);
+    if (sink.full) return jaiThrow(vm.cRuntimeError, "convex_spans(): out of room for the shape");
+    pending->version++;
+    ObjList *told = jaiListNew(2);
+    if (told == NULL) return false;
+    if (!jaiListReserveExact(told, 2)) return false;
+    told->items[0] = INT_VAL(sink.count);
+    told->items[1] = INT_VAL(sink.widest);
+    told->count = 2;
+    told->version++;
+    *out = OBJ_VAL(told);
+    return true;
+}
+
+/* `convex_paint(values, colour, cn, corners, shift, delta1, delta2, cols, rows)` */
+static bool primConvexPaint(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *values;
+    ObjList *colour;
+    ObjList *flat;
+    int count;
+    int64_t channels, shift, delta1, delta2, cols, rows;
+    if (!jaiArgList(args[0], 1, "convex_paint", &values)) return false;
+    if (!jaiArgList(args[1], 2, "convex_paint", &colour)) return false;
+    if (!jaiStrWantInt(args[2], "convex_paint", "the channel count", &channels)) return false;
+    if (!readCorners(args[3], 4, "convex_paint", &flat, &count)) return false;
+    if (!jaiStrWantInt(args[4], "convex_paint", "the shift", &shift)) return false;
+    if (!jaiStrWantInt(args[5], "convex_paint", "the near rounding", &delta1)) return false;
+    if (!jaiStrWantInt(args[6], "convex_paint", "the far rounding", &delta2)) return false;
+    if (!jaiStrWantInt(args[7], "convex_paint", "the width", &cols)) return false;
+    if (!jaiStrWantInt(args[8], "convex_paint", "the height", &rows)) return false;
+    if (channels <= 0 || channels != colour->count) {
+        return jaiThrow(vm.cValueError,
+                        "convex_paint(): %lld channels against a colour of %d",
+                        (long long)channels, colour->count);
+    }
+    if (count < 3 || count > JAI_CONVEX_MAX_CORNERS || shift < 0 || shift > JAI_XY_SHIFT) {
+        *out = OBJ_VAL(values);
+        return true;
+    }
+
+    int64_t xs[JAI_CONVEX_MAX_CORNERS];
+    int64_t ys[JAI_CONVEX_MAX_CORNERS];
+    if (!cornersInto(flat, count, xs, ys, "convex_paint")) return false;
+
+    JaiConvexFill poly = {xs, ys, count, (int)shift, delta1, delta2, cols, rows};
+    JaiPaintSink sink = {values, colour->items, cols, rows, (int)channels};
+    convexFill(&poly, convexPaintRow, &sink);
+    values->version++;
+    *out = OBJ_VAL(values);
+    return true;
+}
+
 /* One channel of a pixel, rounded and clamped the way a display wants it.
  *
  * `!(value > 0.0)` rather than `value < 0.0` so that a NaN -- which compares
@@ -703,6 +1131,11 @@ void jaiBytesRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "list_filled",    primListFilled,    1, 2);
     jaiStrDefinePrim(ns, "list_pack_argb", primListPackArgb,  2, 2);
     jaiStrDefinePrim(ns, "list_fill_pattern", primListFillPattern, 4, 4);
+    jaiStrDefinePrim(ns, "list_push3",     primListPush3,     4, 4);
+    jaiStrDefinePrim(ns, "line_spans",     primLineSpans,    12, 12);
+    jaiStrDefinePrim(ns, "line_paint",     primLinePaint,    14, 14);
+    jaiStrDefinePrim(ns, "convex_spans",   primConvexSpans,   7, 7);
+    jaiStrDefinePrim(ns, "convex_paint",   primConvexPaint,   9, 9);
     jaiStrDefinePrim(ns, "bytes_new",      primBytesNew,      1, 1);
     jaiStrDefinePrim(ns, "bytes_len",      primBytesLen,      1, 1);
     jaiStrDefinePrim(ns, "bytes_get",      primBytesGet,      2, 2);
