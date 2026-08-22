@@ -168,10 +168,12 @@ kernel void NAME(device const float* a [[buffer(0)]],
             if (r < rows && c < columns) {
                 float total = scratch[e];
                 if (splits == 1u) {
-                    if (epilogue != 0u) total += bias[c];
+                    if (epilogue == 6u) total += bias[r * columns + c];
+                    else if (epilogue != 0u) total += bias[c];
                     if (epilogue == 2u) total = max(total, 0.0f);
                     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
                     else if (epilogue == 4u) total = tanh(total);
+                    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
                 }
                 dest[r * columns + c] = total;
             }
@@ -288,10 +290,12 @@ _KLOOPS_
             uint c = col0 + e % SGW;
             float total = scratch[e];
             if (splits == 1u) {
-                if (epilogue != 0u) total += bias[c];
+                if (epilogue == 6u) total += bias[r * columns + c];
+                else if (epilogue != 0u) total += bias[c];
                 if (epilogue == 2u) total = max(total, 0.0f);
                 else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
                 else if (epilogue == 4u) total = tanh(total);
+                else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
             }
             dest[r * columns + c] = total;
         }
@@ -311,10 +315,12 @@ kernel void split_reduce(device const float* partials [[buffer(0)]],
     if (id >= count) return;
     float total = 0.0f;
     for (uint s = 0; s < splits; ++s) total += partials[s * count + id];
-    if (epilogue != 0u) total += bias[id % columns];
+    if (epilogue == 6u) total += bias[id];
+    else if (epilogue != 0u) total += bias[id % columns];
     if (epilogue == 2u) total = max(total, 0.0f);
     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
     else if (epilogue == 4u) total = tanh(total);
+    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
     output[id] = total;
 }
 """

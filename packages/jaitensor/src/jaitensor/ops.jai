@@ -2247,6 +2247,47 @@ pub fn dense_affine(x: Tensor, weights: Tensor, bias: Tensor, activation: int) -
     return output
 }
 
+#: `x @ weights + bias` with GELU applied on the way out.
+#:
+#: One kernel rather than two. The separate form writes the whole product to
+#: memory and reads it straight back to shape it -- for a transformer's inner
+#: layer that is a 256 by 3072 tensor written and read for nothing, and a
+#: second dispatch behind it.
+#:
+#: Fused only when nothing here wants a gradient. GELU's derivative is a
+#: function of what went *into* it, and a fused epilogue keeps only what came
+#: out, so training takes the two-step path and keeps the intermediate it needs.
+pub fn linear_gelu(x: Tensor, weights: Tensor, bias: Tensor) -> Tensor {
+    if x.requires_grad or weights.requires_grad or bias.requires_grad {
+        return gelu(dense_affine(x, weights, bias, 0))
+    }
+    return raw_matmul(x, weights, bias: bias, epilogue: 5)
+}
+
+#: `residual + x @ weights`, in one kernel.
+#:
+#: The shape a transformer block ends each half with. Written apart it is a
+#: product into memory and then a pass that reads it, reads the residual and
+#: writes a third tensor -- three times the traffic of the add for an operation
+#: that is only an add, and a dispatch of its own behind the product.
+#:
+#: `residual` has to be the whole output's shape, not a row of it; the epilogue
+#: that adds a vector is the one `dense_affine` uses. Fused only when nothing
+#: wants a gradient, for the same reason `linear_gelu` is.
+pub fn linear_residual(x: Tensor, weights: Tensor, residual: Tensor) -> Tensor {
+    let rows = x.shape[0]
+    let columns = weights.shape[weights.rank() - 1]
+    if residual.rank() != 2 or residual.shape[0] != rows or residual.shape[1] != columns {
+        throw ValueError(
+            f"linear_residual needs a residual of [{rows}, {columns}], got {residual.shape}"
+        )
+    }
+    if x.requires_grad or weights.requires_grad or residual.requires_grad {
+        return add(residual, matmul(x, weights))
+    }
+    return raw_matmul(x, weights, bias: residual, epilogue: 6)
+}
+
 #: Dense forward without autograd graph construction.
 @trace
 pub fn dense_static_forward(x: Tensor, weights: Tensor, bias: Tensor, activation: int) -> Tensor {
