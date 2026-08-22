@@ -110,6 +110,13 @@ void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
  * going to walk the values anyway can skip the staging copy entirely. Good
  * until the next GPU work touches the buffer. */
 const float  *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count);
+/* The same, to write through. Waits for whatever queued work could still write
+ * these bytes, so what the host puts there is not landed on afterwards, and
+ * then hands back the memory itself: storage is shared, so a caller that means
+ * to scribble on a few thousand pixels of a frame need not copy the whole
+ * thing over, change it, and copy it back. Good until the next GPU work
+ * touches the buffer. */
+float        *jaiGpuMapWrite(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 /* Narrow float slots straight into unsigned bytes, dividing by `scale` and
  * rounding half up. The inverse of jaiGpuUploadU8, and the way to get pixels
  * back without turning every one of them into a boxed list element -- a 720p

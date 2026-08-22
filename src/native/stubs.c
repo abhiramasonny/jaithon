@@ -234,6 +234,13 @@ bool jaiGpuSynchronize(void) {
     return false;
 }
 
+float *jaiGpuMapWrite(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    (void)b;
+    (void)elementOffset;
+    (void)count;
+    return NULL;
+}
+
 bool jaiGpuWaitFor(JaiGpuBuffer *b) {
     (void)b;
     return false;

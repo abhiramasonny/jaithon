@@ -548,4 +548,5 @@ void jaiRegisterStringPrimitives(void) {
     jaiStrDefinePrim(ns, "str_decode",         primStrDecode,         1, 1);
 
     jaiBytesRegisterPrimitives(ns);
+    jaiRasterRegisterPrimitives(ns);
 }

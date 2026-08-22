@@ -1160,6 +1160,16 @@ const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) 
     return (const float *)[buffer contents] + elementOffset;
 }
 
+float *jaiGpuMapWrite(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    if (b == NULL || b->buffer == NULL) return NULL;
+    const size_t start = elementOffset * sizeof(float);
+    const size_t bytes = count * sizeof(float);
+    if (start > b->bytes || bytes > b->bytes - start) return NULL;
+    hostWriteBarrier(b);
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
+    return (float *)[buffer contents] + elementOffset;
+}
+
 static void writeError(char *buf, size_t size, const char *fmt, ...) JAI_PRINTF(3, 4);
 
 static void writeError(char *buf, size_t size, const char *fmt, ...) {
