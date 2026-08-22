@@ -16,6 +16,7 @@ from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scala
 from ..core.dft import dft, idft, mul_spectrums, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from .color import cvt_color, COLOR_BGR2GRAY
 from .colormap_data import COLORMAP_COUNT, COLORMAP_LEVELS, COLORMAP_TABLE
+from ..core.arith import add_weighted, binary_op, OP_MULTIPLY
 from ..core.stats import min_max_loc
 from .geometric import crop, remap
 
@@ -149,13 +150,16 @@ fn sample(values: list[float], rows: int, cols: int, cn: int, y: int, x: int, c:
     return values[(yy * cols + xx) * cn + c]
 }
 
+#: `target * keep + source * weight`, which the weighted add already does on
+#: the device. Written out here as a host loop it was a walk over the whole
+#: picture per accumulated frame, which is what these are called once per frame
+#: to do -- 8 ms for a 720p frame, and 31 ms for the squared one.
+#:
+#: The kernel combines in single precision where the loop used double, so a
+#: running average moves in its ninth significant digit. The values were always
+#: stored as float32; only the intermediate was wider.
 fn combine(target: Mat, source: Mat, weight: float, keep: float) -> Mat {
-    let a = target.values()
-    let b = source.values()
-    if a.len() != b.len() { throw ValueError("both have to be the same size") }
-    var out: list[float] = []
-    for index in 0..a.len() { out.push(a[index] * keep + b[index] * weight) }
-    return Mat.from_list(target.rows, target.cols, target.type_(), out)
+    return add_weighted(target, keep, source, weight, 0.0, dtype: target.type_())
 }
 
 #: Add an image into a running total.
@@ -163,19 +167,18 @@ pub fn accumulate(src: Mat, total: Mat) -> Mat { return combine(total, src, 1.0,
 
 #: Add an image's squares into a running total.
 pub fn accumulate_square(src: Mat, total: Mat) -> Mat {
-    let values = src.to_list()
-    var squared: list[float] = []
-    for value in values { squared.push(value * value) }
-    return combine(total, Mat.from_list(src.rows, src.cols, total.type_(), squared), 1.0, 1.0)
+    let squared = binary_op(src, src, OP_MULTIPLY)
+    let out = combine(total, squared, 1.0, 1.0)
+    squared.release()
+    return out
 }
 
 #: Add the product of two images into a running total.
 pub fn accumulate_product(first: Mat, second: Mat, total: Mat) -> Mat {
-    let a = first.values()
-    let b = second.values()
-    var product: list[float] = []
-    for index in 0..a.len() { product.push(a[index] * b[index]) }
-    return combine(total, Mat.from_list(first.rows, first.cols, total.type_(), product), 1.0, 1.0)
+    let product = binary_op(first, second, OP_MULTIPLY)
+    let out = combine(total, product, 1.0, 1.0)
+    product.release()
+    return out
 }
 
 #: Fold an image into a running average that forgets slowly.
