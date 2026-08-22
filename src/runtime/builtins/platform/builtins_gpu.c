@@ -295,6 +295,106 @@ static bool nGpuBufferDownloadU8(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* One pixel, rounded and clamped into the 0xAARRGGBB a window's back buffer
+ * holds. Matches `list_pack_argb`, including that a NaN lands on black rather
+ * than on an undefined cast. */
+static uint32_t packChannelF(float value) {
+    if (!(value > 0.0f)) return 0u;
+    const float rounded = value + 0.5f;
+    return rounded > 255.0f ? 255u : (uint32_t)rounded;
+}
+
+typedef struct {
+    const float *source;
+    Value       *dst;
+    float        factor;
+    int          channels;
+} JaiArgbWork;
+
+static void packArgbRange(void *context, size_t start, size_t end) {
+    const JaiArgbWork *work = (const JaiArgbWork *)context;
+    const float *source = work->source;
+    const float factor = work->factor;
+    const int channels = work->channels;
+    for (size_t i = start; i < end; i++) {
+        const float *pixel = source + i * (size_t)channels;
+        uint32_t r, g, b;
+        if (channels == 1) {
+            r = packChannelF(pixel[0] * factor);
+            g = r;
+            b = r;
+        } else {
+            /* Stored blue first, shown red first. */
+            b = packChannelF(pixel[0] * factor);
+            g = packChannelF(pixel[1] * factor);
+            r = packChannelF(pixel[2] * factor);
+        }
+        work->dst[i] = INT_VAL((int64_t)(0xFF000000u | (r << 16) | (g << 8) | b));
+    }
+}
+
+#define JAI_ARGB_CHUNK 32768
+
+/* `gpu_buffer_pack_argb(buffer, offset, count, channels, scale)` -- device
+ * pixels straight to the one integer a window wants per pixel.
+ *
+ * The two steps this replaces were a download that narrowed the floats into a
+ * byte string and a pass that packed that string into integers: two walks over
+ * a 720p frame and a 2.8 MB string in between, for a result that is neither. */
+static bool nGpuBufferPackArgb(int argc, Value *args, Value *out) {
+    (void)argc;
+    GpuBuffer *b;
+    if (!requireBuffer(args[0], 1, "gpu_buffer_pack_argb", &b)) return false;
+    int64_t offset, count, channels;
+    double scale;
+    if (!jaiArgInt(args[1], 2, "gpu_buffer_pack_argb", &offset)) return false;
+    if (!jaiArgInt(args[2], 3, "gpu_buffer_pack_argb", &count)) return false;
+    if (!jaiArgInt(args[3], 4, "gpu_buffer_pack_argb", &channels)) return false;
+    if (!jaiArgNumber(args[4], 5, "gpu_buffer_pack_argb", &scale)) return false;
+    if (channels != 1 && channels != 3 && channels != 4)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_pack_argb(): channels must be 1, 3 or 4, got %lld",
+                        (long long)channels);
+    if (!isfinite(scale) || scale == 0.0)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_pack_argb(): scale must be finite and non-zero");
+    if (offset < 0 || count < 0 || offset > b->count || count > b->count - offset)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_pack_argb(): %lld values at %lld exceed buffer "
+                        "capacity %lld",
+                        (long long)count, (long long)offset, (long long)b->count);
+    if (count % channels != 0)
+        return jaiThrow(vm.cValueError,
+                        "gpu_buffer_pack_argb(): %lld values is not a whole number of "
+                        "%lld-channel pixels",
+                        (long long)count, (long long)channels);
+
+    const int64_t pixels = count / channels;
+    ObjList *list = jaiListNew((int)pixels);
+    if (list == NULL) return false;
+    if (pixels == 0) {
+        *out = OBJ_VAL(list);
+        return true;
+    }
+    jaiGCPushRoot(OBJ_VAL(list));
+    const bool room = jaiListReserveExact(list, (int)pixels);
+    jaiGCPopRoot();
+    if (!room) return false;
+
+    const float *source = jaiGpuMapRead(b->buffer, (size_t)(b->origin + offset),
+                                        (size_t)count);
+    if (source == NULL)
+        return jaiThrow(vm.cRuntimeError, "gpu_buffer_pack_argb(): the buffer would not map");
+
+    JaiArgbWork work = {source, list->items, scale != 0.0 ? (float)(1.0 / scale) : 1.0f,
+                        (int)channels};
+    jaiParallelChunks((size_t)pixels, JAI_ARGB_CHUNK, packArgbRange, &work);
+    list->count = (int)pixels;
+    list->version++;
+    *out = OBJ_VAL(list);
+    return true;
+}
+
 static bool nGpuBufferFillUniform(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *b;
@@ -1167,6 +1267,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_buffer_view",     nGpuBufferView,     3, 3);
     jaiDefineNative("__prim__.gpu_buffer_upload",   nGpuBufferUpload,   3, 3);
     jaiDefineNative("__prim__.gpu_buffer_download_u8", nGpuBufferDownloadU8, 4, 4);
+    jaiDefineNative("__prim__.gpu_buffer_pack_argb", nGpuBufferPackArgb, 5, 5);
     jaiDefineNative("__prim__.gpu_buffer_upload_u8", nGpuBufferUploadU8, 6, 6);
     jaiDefineNative("__prim__.gpu_buffer_fill_uniform", nGpuBufferFillUniform, 4, 4);
     jaiDefineNative("__prim__.gpu_buffer_fill_zero", nGpuBufferFillZero, 1, 1);

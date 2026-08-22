@@ -18,7 +18,7 @@
 #: so 70 exercises a ragged tile and 64 exercises the exact multiple.
 import std.gpu
 import std.math
-from std.test import assert_eq, assert_true, assert_len
+from std.test import assert_eq, assert_true, assert_len, assert_throws
 
 let N = 100_000  # comfortably past MIN_GPU_ELEMENTS
 
@@ -278,4 +278,31 @@ fn test_reading_one_buffer_does_not_lose_work_queued_for_another() -> void {
     add_one.dispatch_async([second], 3)
     assert_eq(first.download(), [2.0, 3.0, 4.0])
     assert_eq(second.download(), [11.0, 21.0, 31.0])
+}
+
+#: Packing on the way off the device agrees with narrowing to bytes and packing
+#: those, which is the two-pass route it replaces.
+fn test_pack_argb_matches_narrowing_then_packing() -> void {
+    if not gpu.is_available() { return }
+    let pixels = N // 3
+    let values = gpu.Buffer(pixels * 3)
+    defer { values.free() }
+    var raw: list[float] = []
+    for index in 0..pixels * 3 {
+        #: Past both ends as well as between them, so the clamping is exercised.
+        raw.push(float(index % 301) - 20.0)
+    }
+    values.upload(raw)
+    let one_pass = values.pack_argb(0, pixels * 3, 3)
+    let two_pass = __prim__.list_pack_argb(values.download_u8(0, pixels * 3), 3)
+    assert_len(one_pass, pixels)
+    assert_eq(one_pass, two_pass)
+}
+
+fn test_pack_argb_refuses_a_ragged_pixel_count() -> void {
+    if not gpu.is_available() { return }
+    let values = gpu.Buffer(10)
+    defer { values.free() }
+    assert_throws(ValueError, || values.pack_argb(0, 10, 3))
+    assert_throws(ValueError, || values.pack_argb(0, 9, 2))
 }
