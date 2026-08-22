@@ -9,6 +9,7 @@ from std.io import Path, write_bytes
 from std.os import temp_dir
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaicv.imgproc.filter import filter_2d, sep_filter_2d
+from jaicv.imgproc.morph import dilate, erode, get_structuring_element, MORPH_RECT
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE
 from jaicv.core.mat import Mat, flip, merge
@@ -579,4 +580,52 @@ fn test_a_separable_filter_matches_the_square_it_stands_for() -> void {
     row.release()
     column.release()
     whole.release()
+}
+
+#: Erosion and dilation through a solid rectangle, against the window walked
+#: here.
+#:
+#: A solid element is separable -- the least value in a box is the least of the
+#: row minima -- and that is the path a rectangle now takes. An ellipse is not
+#: separable and keeps the square sweep, so both are checked.
+fn test_a_rectangular_morphology_matches_the_window_it_stands_for() -> void {
+    if not gpu.is_available() { return }
+    let rows = 23
+    let cols = 29
+    var pixels: list[float] = []
+    for index in 0..rows * cols { pixels.push(float(index * 61 % 197) * 0.01) }
+    let source = Mat.from_list(rows, cols, CV_32FC1, pixels)
+    let width = 5
+    let height = 3
+    let element = get_structuring_element(MORPH_RECT, Size(width, height))
+    let anchor_x = width // 2
+    let anchor_y = height // 2
+
+    for growing in [false, true] {
+        let got = if growing { dilate(source, element) } else { erode(source, element) }
+        let values = got.to_list()
+        for y in 0..rows {
+            for x in 0..cols {
+                var best = pixels[y * cols + x]
+                for ky in 0..height {
+                    for kx in 0..width {
+                        #: The default border replicates, so a step outside the
+                        #: picture takes the nearest edge.
+                        let sy = min(max(y + ky - anchor_y, 0), rows - 1)
+                        let sx = min(max(x + kx - anchor_x, 0), cols - 1)
+                        let sample = pixels[sy * cols + sx]
+                        if growing {
+                            if sample > best { best = sample }
+                        } elif sample < best {
+                            best = sample
+                        }
+                    }
+                }
+                assert_near(values[y * cols + x], best, 1e-5, f"grow {growing} at {y},{x}")
+            }
+        }
+        got.release()
+    }
+    source.release()
+    element.release()
 }
