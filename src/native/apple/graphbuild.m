@@ -306,8 +306,10 @@ int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
                              paddingTop:(NSUInteger)p[2]
                           paddingBottom:(NSUInteger)p[3]
                            paddingStyle:MPSGraphPaddingStyleExplicit
-                             dataLayout:MPSGraphTensorNamedDataLayoutNCHW
-                          weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+                             dataLayout:(p[9] != 0 ? MPSGraphTensorNamedDataLayoutNHWC
+                                                   : MPSGraphTensorNamedDataLayoutNCHW)
+                          weightsLayout:(p[10] != 0 ? MPSGraphTensorNamedDataLayoutHWIO
+                                                    : MPSGraphTensorNamedDataLayoutOIHW)];
         if (d == nil) return -1;
         MPSGraphTensor *out = [g convolution2DWithSourceTensor:in
                                                  weightsTensor:filt
@@ -315,14 +317,15 @@ int jaiGraphConv(JaiGraphBuilder *b, int x, int w, int bias, const int32_t *p) {
                                                           name:nil];
         MPSGraphTensor *shift = tensorAt(b, bias);
         if (shift != nil) {
-            /* A convolution's bias is one value a channel, and the channel is
-             * the second axis -- so it is widened to `[1, C, 1, 1]` rather
-             * than left rank one, which would try to line up with the width
-             * and not broadcast at all. */
+            /* A convolution's bias is one value a channel, so it is widened
+             * to sit on the channel axis rather than left rank one, which
+             * would try to line up with the width and not broadcast at all.
+             * Which axis that is depends on the layout. */
             if (shift.shape.count == 1) {
-                shift = [g reshapeTensor:shift
-                               withShape:@[ @1, shift.shape[0], @1, @1 ]
-                                    name:nil];
+                NSArray *widened = p[9] != 0
+                    ? @[ @1, @1, @1, shift.shape[0] ]
+                    : @[ @1, shift.shape[0], @1, @1 ];
+                shift = [g reshapeTensor:shift withShape:widened name:nil];
             }
             out = [g additionWithPrimaryTensor:out secondaryTensor:shift name:nil];
         }
@@ -396,7 +399,9 @@ int jaiGraphPool(JaiGraphBuilder *b, int x, const int32_t *p, int kind) {
                                                           paddingTop:(NSUInteger)p[4]
                                                        paddingBottom:(NSUInteger)p[5]
                                                         paddingStyle:MPSGraphPaddingStyleExplicit
-                                                          dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
+                                                          dataLayout:(p[10] != 0
+                                                              ? MPSGraphTensorNamedDataLayoutNHWC
+                                                              : MPSGraphTensorNamedDataLayoutNCHW)];
         if (d == nil) return -1;
         if (@available(macOS 12.0, *)) {
             d.ceilMode = p[8] != 0;
@@ -752,6 +757,47 @@ int jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight, int inputWe
         }
     }
     return -1;
+}
+
+/* One-hot rows from integer-valued indices, `depth` wide.
+ *
+ * Built as its own operation rather than out of comparisons because a
+ * comparison has no derivative and MPSGraph aborts the process when asked to
+ * differentiate through one. */
+int jaiGraphOneHot(JaiGraphBuilder *b, int indices, int depth) {
+    MPSGraphTensor *in = tensorAt(b, indices);
+    if (in == nil || depth <= 0) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        return record(b, [g oneHotWithIndicesTensor:in
+                                              depth:(NSUInteger)depth
+                                           dataType:MPSDataTypeFloat32
+                                            onValue:1.0
+                                           offValue:0.0
+                                               name:nil]);
+    }
+}
+
+/* Softmax cross-entropy against one-hot labels. `reduction` 0 none, 1 sum,
+ * 2 mean.
+ *
+ * The platform's own, rather than a log-softmax and a pick built here: this
+ * one has a derivative, and a hand-built one is exactly the sort of thing that
+ * turns out not to. */
+int jaiGraphSoftmaxCrossEntropy(JaiGraphBuilder *b, int logits, int labels, int axis,
+                                int reduction) {
+    MPSGraphTensor *source = tensorAt(b, logits);
+    MPSGraphTensor *target = tensorAt(b, labels);
+    if (source == nil || target == nil) return -1;
+    if (reduction < 0 || reduction > 2) return -1;
+    @autoreleasepool {
+        MPSGraph *g = (__bridge MPSGraph *)b->graph;
+        return record(b, [g softMaxCrossEntropyWithSourceTensor:source
+                                                   labelsTensor:target
+                                                           axis:axis
+                                                  reductionType:(MPSGraphLossReductionType)reduction
+                                                           name:nil]);
+    }
 }
 
 /* The derivative of `loss` with respect to each of `wants`, as graph tensors.

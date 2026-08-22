@@ -312,6 +312,8 @@ fn emit(state: Build, node: GraphNode) -> bool {
                 dilations[0],
                 dilations[1],
                 attr_int(node, "group", 1),
+                0,
+                0,
             ]
         )
         return true
@@ -368,7 +370,7 @@ fn emit(state: Build, node: GraphNode) -> bool {
         let strides = attr_ints(node, "strides", [1, 1])
         let pads = resolved_pads(node, [x[2], x[3]], window, strides, [1, 1])
         if pads is null { return false }
-        state.ids[out] = __prim__.graph_pool(b, state.id_of(node.inputs[0]), [window[0], window[1], strides[0], strides[1], pads[0], pads[2], pads[1], pads[3], attr_int(node, "ceil_mode", 0), attr_int(node, "count_include_pad", 0)], if node.op == "MaxPool" {
+        state.ids[out] = __prim__.graph_pool(b, state.id_of(node.inputs[0]), [window[0], window[1], strides[0], strides[1], pads[0], pads[2], pads[1], pads[3], attr_int(node, "ceil_mode", 0), attr_int(node, "count_include_pad", 0), 0], if node.op == "MaxPool" {
             0
         } else {
             1
