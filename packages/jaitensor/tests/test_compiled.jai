@@ -124,3 +124,82 @@ fn test_a_model_it_cannot_express_is_refused_with_a_reason() -> void {
     let why = refusal()
     assert_true(why is not null, "a refusal should say why")
 }
+
+#: `Sequential.fit` takes the compiled path for a model that allows it, and one
+#: step of it lands where a step done by hand lands.
+#:
+#: One step rather than many on purpose. The two orderings of float32 drift
+#: apart over an epoch once a ReLU is deciding which side of zero a value falls
+#: on, which is a property of the arithmetic and not a fault in either.
+fn test_fit_takes_the_compiled_path_and_agrees_for_a_step() -> void {
+    if not gpu.is_available() { return }
+    let samples = 32
+    var pixels: list[float] = []
+    for index in 0..samples * SIDE * SIDE * CHANNELS {
+        pixels.push(float(index * 37 % 211 - 105) * 0.01)
+    }
+    var labels: list[float] = []
+    for index in 0..samples { labels.push(float(index % CLASSES)) }
+    let features = Tensor([samples, SIDE, SIDE, CHANNELS], pixels)
+    let targets = Tensor([samples], labels)
+
+    let model = jt.Sequential(
+        [
+            Conv2d(6, 3, padding: 1, in_channels: CHANNELS, activation: Activation.Relu),
+            MaxPool2d(2),
+            Flatten(),
+            Dense(CLASSES, activation: Activation.Linear),
+        ]
+    )
+    model.compile(
+        optimizer: SGD(learning_rate: RATE),
+        loss: SparseCategoricalCrossentropy(from_logits: true)
+    )
+    #: One batch, so exactly one step.
+    model.fit(
+        jt.Dataset(features, targets),
+        epochs: 1,
+        batch_size: samples,
+        verbose: false,
+        plot_path: null
+    )
+    var got: list[float] = []
+    for layer in model.layers {
+        for param in layer.parameters() {
+            for value in param.download() { got.push(value) }
+        }
+    }
+
+    #: The same model built the same way, stepped by hand.
+    let byhand = jt.Sequential(
+        [
+            Conv2d(
+                6,
+                3,
+                padding: 1,
+                in_channels: CHANNELS,
+                activation: Activation.Relu
+            ),
+            MaxPool2d(2),
+            Flatten(),
+            Dense(CLASSES, activation: Activation.Linear),
+        ]
+    )
+    #: Built the way `Sequential` builds, so the two start from the same
+    #: weights, then stepped by hand rather than through `fit`.
+    let rng = Random.with_seed(7)
+    var current = [SIDE, SIDE, CHANNELS]
+    for layer in byhand.layers {
+        layer.build_from_shape(current, rng)
+        current = layer.output_shape()
+    }
+    let eager = eager_steps(byhand.layers, features, targets, 1)
+    var want: list[float] = []
+    for param in eager {
+        for value in param.download() { want.push(value) }
+    }
+
+    assert_eq(got.len(), want.len(), "the two paths trained different parameter counts")
+    assert_true(got.len() > 0, "the model trained no parameters")
+    for index in 0..got.len() { assert_near(got[index], want[index], 1e-5, f"weight {index}") }
+}
