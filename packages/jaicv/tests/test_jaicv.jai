@@ -22,7 +22,8 @@ from jaicv.core.types import CV_MAKETYPE, CV_MAT_CN, CV_MAT_DEPTH, CV_8U, CV_32F
 from jaicv.core.types import CMP_GT, Point, Range, Rect, Scalar, Size, type_to_string
 from jaicv.core.arith import add, absdiff, bitwise_not, compare_scalar, divide, in_range
 from jaicv.core.arith import lut, multiply, subtract
-from jaicv.core.stats import count_non_zero, mean, min_max_loc, norm, sum_mat
+from jaicv.core.stats import count_non_zero, mean, min_max_loc, norm, normalize, sum_mat
+from jaicv.core.types import NORM_L2, NORM_MINMAX
 from jaicv.core.cluster import kmeans, PCA
 from jaicv.core.dft import dft, idft, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from jaicv.imgcodecs.codecs import imdecode, imencode, sniff
@@ -910,4 +911,52 @@ fn test_hough_finds_the_circle_it_was_given() -> void {
         marginal.len() >= 30,
         f"a looser threshold found {marginal.len()} circles, expected at least 30"
     )
+}
+
+#: Rescaling, which nothing called until now.
+#:
+#: `normalize` is exported and reaches no test: `test_against_opencv` only
+#: covers what OpenCV was asked to record, and `test_reachable` calls what it
+#: knows about. Both of its modes are checked here against the definition --
+#: minmax puts the extremes exactly on the bounds it was given, and a norm mode
+#: leaves the picture with the length it asked for.
+fn test_normalize_rescales_both_ways() -> void {
+    if not gpu.is_available() { return }
+    var values: list[float] = []
+    for index in 0..40 { values.push(float(index * 17 % 23) - 7.0) }
+    let source = Mat.from_list(5, 8, CV_32FC1, values)
+    defer { source.release() }
+
+    let spread = normalize(source, 0.0, 100.0, NORM_MINMAX)
+    defer { spread.release() }
+    let got = spread.to_list()
+    var low = got[0]
+    var high = got[0]
+    for value in got {
+        if value < low { low = value }
+        if value > high { high = value }
+    }
+    assert_near(low, 0.0, 1e-4, "the smallest value should land on the lower bound")
+    assert_near(high, 100.0, 1e-4, "the largest should land on the upper one")
+    #: The order has to survive, or it is not the same picture rescaled.
+    for index in 1..got.len() {
+        if values[index] > values[index - 1] {
+            assert_true(got[index] > got[index - 1], f"order changed at {index}")
+        }
+    }
+
+    let unit = normalize(source, 1.0, 0.0, NORM_L2)
+    defer { unit.release() }
+    var total = 0.0
+    for value in unit.to_list() { total += value * value }
+    assert_near(math.sqrt(total), 1.0, 1e-4, "an L2 normalise should leave length one")
+
+    #: A flat picture has nothing to spread, and must not divide by zero.
+    let flat = Mat.from_list(2, 2, CV_32FC1, [3.0, 3.0, 3.0, 3.0])
+    defer { flat.release() }
+    let spread_flat = normalize(flat, 0.0, 1.0, NORM_MINMAX)
+    defer { spread_flat.release() }
+    for value in spread_flat.to_list() {
+        assert_true(math.is_finite(value), "a flat picture must not produce infinities")
+    }
 }

@@ -17,7 +17,7 @@ import std.gpu as gpu
 from std.io import Path
 from std.test import assert_contains, assert_eq, assert_near, assert_throws, assert_true
 from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, run_graph
-from jaicv.dnn.plan import Plan, compile_plan
+from jaicv.dnn.plan import Plan, compile_plan, run_best
 from jaitensor import Tensor
 
 #: One tensor out of the oracle file: `<tag> <rank> <dims...> <values...>`.
@@ -694,5 +694,44 @@ fn test_the_graph_differentiates_itself() -> void {
     let got = produced["dw"].download()
     for index in 0..n {
         assert_near(got[index], 2.0 * xs.download()[index] * ws.download()[index], 1e-5)
+    }
+}
+
+#: `run_best` keeps a compiled plan per graph and reuses it. Both halves of
+#: that are checked here: the reuse, and the throwing away.
+#:
+#: A plan is built for one set of shapes. Handing the same graph a different
+#: input has to rebuild it, and the wrapper that decides is the part no test
+#: reached -- jaitensor had this exact bug on its own compiled step, where a
+#: cached plan was reused for a shape it was not built for.
+fn test_the_cached_plan_answers_what_the_interpreter_answers() -> void {
+    if not gpu.is_available() { return }
+    let graph = Graph(
+        nodes: [
+            GraphNode("Relu", name: "act", inputs: ["x"], outputs: ["h"], attrs: {}),
+            GraphNode("Add", name: "sum", inputs: ["h", "x"], outputs: ["y"], attrs: {}),
+        ],
+        inputs: ["x"],
+        outputs: ["y"]
+    )
+
+    fn feed(rows: int, cols: int) -> Tensor {
+        var values: list[float] = []
+        for index in 0..rows * cols { values.push(float(index % 17) * 0.5 - 4.0) }
+        return Tensor([rows, cols], values)
+    }
+
+    #: Twice at one shape so the second call takes the cached plan, then a
+    #: different shape so it has to be thrown away, then back again.
+    for shape in [[3, 4], [3, 4], [5, 6], [3, 4]] {
+        let x = feed(shape[0], shape[1])
+        let planned = run_best(graph, {"x": x})
+        let plain = run_graph(graph, {"x": x})
+        let got = planned["y"].download()
+        let want = plain["y"].download()
+        assert_eq(got.len(), want.len(), f"{shape} came back the wrong size")
+        for index in 0..got.len() {
+            assert_near(got[index], want[index], 1e-6, f"{shape} differs at {index}")
+        }
     }
 }
