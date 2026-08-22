@@ -17,6 +17,7 @@
 #: ```
 import std.math
 from std.core import Printable
+from std.gpu import Buffer, Kernel
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, NORM_HAMMING, NORM_L1, NORM_L2
 from ..core.types import Point, Point2f, Rect, Scalar, Size
@@ -110,73 +111,6 @@ pub class DMatch: Printable {
 
 #: The sixteen pixels of the Bresenham circle FAST reads, in the order OpenCV
 #: walks them: clockwise from straight up.
-let RING_X = [0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1]
-let RING_Y = [3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1, 0, 1, 2, 3]
-
-fn corner_score(differences: list[int], threshold: int) -> int {
-    #: The score is the largest threshold at which the point would still be a
-    #: corner, found by pushing the bright and dark cases as far as each will
-    #: go. This is OpenCV's `cornerScore`, and its shape — the early `continue`
-    #: before the second half of each run — is what keeps it linear.
-    var brightest = threshold
-    var k = 0
-    while k < 16 {
-        var a = min(differences[k + 1], differences[k + 2])
-        a = min(a, differences[k + 3])
-        if a > brightest {
-            a = min(a, differences[k + 4])
-            a = min(a, differences[k + 5])
-            a = min(a, differences[k + 6])
-            a = min(a, differences[k + 7])
-            a = min(a, differences[k + 8])
-            brightest = max(brightest, min(a, differences[k]))
-            brightest = max(brightest, min(a, differences[k + 9]))
-        }
-        k += 2
-    }
-
-    var darkest = -brightest
-    k = 0
-    while k < 16 {
-        var b = max(differences[k + 1], differences[k + 2])
-        b = max(b, differences[k + 3])
-        b = max(b, differences[k + 4])
-        b = max(b, differences[k + 5])
-        if b < darkest {
-            b = max(b, differences[k + 6])
-            b = max(b, differences[k + 7])
-            b = max(b, differences[k + 8])
-            darkest = min(darkest, max(b, differences[k]))
-            darkest = min(darkest, max(b, differences[k + 9]))
-        }
-        k += 2
-    }
-    return -darkest - 1
-}
-
-fn is_corner(differences: list[int], threshold: int) -> bool {
-    #: Nine in a row all brighter, or nine in a row all darker. The ring is
-    #: walked twice over so a run that wraps is still nine consecutive entries.
-    var run = 0
-    for index in 0..25 {
-        if differences[index] > threshold {
-            run += 1
-            if run >= 9 { return true }
-        } else {
-            run = 0
-        }
-    }
-    run = 0
-    for index in 0..25 {
-        if differences[index] < -threshold {
-            run += 1
-            if run >= 9 { return true }
-        } else {
-            run = 0
-        }
-    }
-    return false
-}
 
 #: Find corners by the FAST test.
 #:
@@ -184,57 +118,175 @@ fn is_corner(differences: list[int], threshold: int) -> bool {
 #: three around it are all brighter, or all darker, than it by more than
 #: `threshold`. With `nonmax_suppression` on, a corner also has to beat all
 #: eight of its neighbours' scores, which thins a cluster down to its peak.
+let FAST_SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+constant int RING_X[16] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
+constant int RING_Y[16] = {3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1, 0, 1, 2, 3};
+
+/* Whether a point is a corner, and by how much, a pixel to a thread.
+ *
+ * Sixteen ring reads and two walks over them, for every pixel of the picture:
+ * on the host that is 300 ms for a 640 by 480 frame, and it is the same work
+ * for every pixel with nothing shared between them.
+ *
+ * Transcribed from the host version rather than rewritten -- the run tests and
+ * the score are OpenCV's, and the early exit in the middle of each run is what
+ * keeps the score linear. */
+kernel void fast_score(device const float* src [[buffer(0)]],
+                       device float* scores [[buffer(1)]],
+                       constant uint& count [[buffer(2)]],
+                       constant uint& rows [[buffer(3)]],
+                       constant uint& cols [[buffer(4)]],
+                       constant uint& src_off [[buffer(5)]],
+                       constant uint& src_step [[buffer(6)]],
+                       constant int& threshold [[buffer(7)]],
+                       constant uint& want_score [[buffer(8)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    scores[id] = 0.0f;
+    if (y < 3u || x < 3u || y + 3u >= rows || x + 3u >= cols) return;
+
+    int differences[25];
+    int centre = int(src[src_off + y * src_step + x]);
+    for (uint index = 0u; index < 16u; ++index) {
+        uint sy = uint(int(y) + RING_Y[index]);
+        uint sx = uint(int(x) + RING_X[index]);
+        differences[index] = centre - int(src[src_off + sy * src_step + sx]);
+    }
+    for (uint index = 16u; index < 25u; ++index) differences[index] = differences[index - 16u];
+
+    bool corner = false;
+    int run = 0;
+    for (uint index = 0u; index < 25u; ++index) {
+        if (differences[index] > threshold) {
+            run += 1;
+            if (run >= 9) { corner = true; break; }
+        } else {
+            run = 0;
+        }
+    }
+    if (!corner) {
+        run = 0;
+        for (uint index = 0u; index < 25u; ++index) {
+            if (differences[index] < -threshold) {
+                run += 1;
+                if (run >= 9) { corner = true; break; }
+            } else {
+                run = 0;
+            }
+        }
+    }
+    if (!corner) return;
+    if (want_score == 0u) {
+        scores[id] = 1.0f;
+        return;
+    }
+
+    int brightest = threshold;
+    for (uint k = 0u; k < 16u; k += 2u) {
+        int a = min(differences[k + 1u], differences[k + 2u]);
+        a = min(a, differences[k + 3u]);
+        if (a > brightest) {
+            a = min(a, differences[k + 4u]);
+            a = min(a, differences[k + 5u]);
+            a = min(a, differences[k + 6u]);
+            a = min(a, differences[k + 7u]);
+            a = min(a, differences[k + 8u]);
+            brightest = max(brightest, min(a, differences[k]));
+            brightest = max(brightest, min(a, differences[k + 9u]));
+        }
+    }
+    int darkest = -brightest;
+    for (uint k = 0u; k < 16u; k += 2u) {
+        int b = max(differences[k + 1u], differences[k + 2u]);
+        b = max(b, differences[k + 3u]);
+        b = max(b, differences[k + 4u]);
+        b = max(b, differences[k + 5u]);
+        if (b < darkest) {
+            b = max(b, differences[k + 6u]);
+            b = max(b, differences[k + 7u]);
+            b = max(b, differences[k + 8u]);
+            darkest = min(darkest, max(b, differences[k]));
+            darkest = min(darkest, max(b, differences[k + 9u]));
+        }
+    }
+    scores[id] = float(-darkest - 1);
+}
+
+/* A corner has to beat all eight of its neighbours, or one bump comes back as
+ * a cluster. Nine reads a pixel over the whole picture, which is another pass
+ * the host does not need to make. */
+kernel void fast_suppress(device const float* scores [[buffer(0)]],
+                          device float* kept [[buffer(1)]],
+                          constant uint& count [[buffer(2)]],
+                          constant uint& rows [[buffer(3)]],
+                          constant uint& cols [[buffer(4)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float here = scores[id];
+    kept[id] = here;
+    if (here == 0.0f) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    if (y < 1u || x < 1u || y + 1u >= rows || x + 1u >= cols) return;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dy == 0 && dx == 0) continue;
+            if (scores[uint(int(id) + dy * int(cols) + dx)] >= here) {
+                kept[id] = 0.0f;
+                return;
+            }
+        }
+    }
+}
+"""
+
+var _fast_kernels: dict[str, Kernel] = {}
+
+fn fast_kernel_for(entry: str) -> Kernel {
+    let existing = _fast_kernels.get(entry, null)
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(FAST_SOURCE, entry)
+    _fast_kernels[entry] = compiled
+    return compiled
+}
+
 pub fn fast(image: Mat, threshold: int = 10, nonmax_suppression: bool = true) -> list[KeyPoint] {
     if image.channels() != 1 { throw ValueError("fast needs a single-channel Mat") }
     image.flush()
     let rows = image.rows
     let cols = image.cols
-    let values = image.values()
-    var scores: list[int] = []
-    for _index in 0..rows * cols { scores.push(0) }
-
-    var differences: list[int] = []
-    for _index in 0..25 { differences.push(0) }
-
-    for y in 3..rows - 3 {
-        for x in 3..cols - 3 {
-            let centre = int(values[y * cols + x])
-            for index in 0..16 {
-                differences[index] = centre -
-                    int(values[(y + RING_Y[index]) * cols + x + RING_X[index]])
-            }
-            for index in 16..25 { differences[index] = differences[index - 16] }
-            if not is_corner(differences, threshold) { continue }
-            #: Without suppression the score is never looked at, and OpenCV
-            #: does not compute it either — it reports a response of zero.
-            scores[y * cols + x] = if nonmax_suppression {
-                corner_score(differences, threshold)
-            } else {
-                1
-            }
-        }
+    #: Without suppression the score is never looked at, and OpenCV does not
+    #: compute it either — it reports a response of zero.
+    var held = Buffer(max(1, rows * cols))
+    fast_kernel_for("fast_score").dispatch_async([image.storage, held], rows * cols, [rows * cols, rows, cols, image.offset, image.step_, threshold, if nonmax_suppression {
+        1
+    } else {
+        0
+    }])
+    if nonmax_suppression {
+        let thinned = Buffer(max(1, rows * cols))
+        fast_kernel_for("fast_suppress").dispatch_async(
+            [held, thinned],
+            rows * cols,
+            [rows * cols, rows, cols]
+        )
+        held.free()
+        held = thinned
     }
+    let scores = held.download()
+    held.free()
 
+    #: One pass to pick up what survived; the thinning has already happened.
     var out: list[KeyPoint] = []
     for y in 3..rows - 3 {
         for x in 3..cols - 3 {
             let score = scores[y * cols + x]
-            if score == 0 { continue }
-            if nonmax_suppression {
-                var peak = true
-                for dy in -1..2 {
-                    for dx in -1..2 {
-                        if dy == 0 and dx == 0 { continue }
-                        if scores[(y + dy) * cols + x + dx] >= score {
-                            peak = false
-                            break
-                        }
-                    }
-                    if not peak { break }
-                }
-                if not peak { continue }
-            }
-            let response = if nonmax_suppression { float(score) } else { 0.0 }
+            if score == 0.0 { continue }
+            let response = if nonmax_suppression { score } else { 0.0 }
             out.push(KeyPoint(Point2f(float(x), float(y)), 7.0, -1.0, response))
         }
     }
