@@ -129,12 +129,25 @@ kernel void filter_separable_row(device const float* src [[buffer(0)]],
     uint y = pixel / cols;
     uint x = pixel - y * cols;
     float run = 0.0f;
-    for (uint kx = 0; kx < row_len; ++kx) {
-        float wx = row_weights[row_off + kx];
-        if (wx == 0.0f) continue;
-        int sx = int(x) + int(kx) - int(anchor_x);
-        run += wx * fetch(src, int(y), sx, channel, rows, cols, cn,
-                          src_off, src_step, border, 0.0f);
+    /* Away from the edges the window is entirely inside the picture, so the
+     * addresses walk forward by `cn` and none of the border arithmetic is
+     * reachable. That arithmetic is two bounds-resolutions a tap, which for a
+     * three-tap blur is most of what the kernel does. */
+    int left = int(x) - int(anchor_x);
+    if (left >= 0 && left + int(row_len) <= int(cols)) {
+        uint at = src_off + uint(y) * src_step + uint(left) * cn + channel;
+        for (uint kx = 0; kx < row_len; ++kx) {
+            run += row_weights[row_off + kx] * src[at];
+            at += cn;
+        }
+    } else {
+        for (uint kx = 0; kx < row_len; ++kx) {
+            float wx = row_weights[row_off + kx];
+            if (wx == 0.0f) continue;
+            int sx = left + int(kx);
+            run += wx * fetch(src, int(y), sx, channel, rows, cols, cn,
+                              src_off, src_step, border, 0.0f);
+        }
     }
     tmp[id] = run;
 }
@@ -163,14 +176,23 @@ kernel void filter_separable_col(device const float* tmp [[buffer(0)]],
     uint y = pixel / cols;
     uint x = pixel - y * cols;
     float total = as_type<float>(delta_bits);
-    for (uint ky = 0; ky < col_len; ++ky) {
-        float wy = col_weights[col_off + ky];
-        if (wy == 0.0f) continue;
-        int sy = int(y) + int(ky) - int(anchor_y);
-        /* The intermediate is packed, so it is its own plane: no offset, a step
-         * of `cols * cn`, and the row border applied to it as to the source. */
-        total += wy * fetch(tmp, sy, int(x), channel, rows, cols, cn,
-                            0u, cols * cn, border, 0.0f);
+    /* The intermediate is packed, so it is its own plane: no offset and a step
+     * of `cols * cn`. Interior rows walk it by whole lines, as the row pass
+     * walks its own by channels. */
+    int top = int(y) - int(anchor_y);
+    if (top >= 0 && top + int(col_len) <= int(rows)) {
+        uint at = uint(top) * cols * cn + uint(x) * cn + channel;
+        for (uint ky = 0; ky < col_len; ++ky) {
+            total += col_weights[col_off + ky] * tmp[at];
+            at += cols * cn;
+        }
+    } else {
+        for (uint ky = 0; ky < col_len; ++ky) {
+            float wy = col_weights[col_off + ky];
+            if (wy == 0.0f) continue;
+            total += wy * fetch(tmp, top + int(ky), int(x), channel, rows, cols, cn,
+                                0u, cols * cn, border, 0.0f);
+        }
     }
     put(dst, dst_off + y * dst_step + x * cn + channel, total,
         as_type<float>(low_bits), as_type<float>(high_bits), integral);
