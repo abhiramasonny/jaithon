@@ -782,3 +782,51 @@ fn test_the_neighbours_returned_are_the_nearest_ones() -> void {
         }
     }
 }
+
+#: Every sample belongs to the centre it is nearest to.
+#:
+#: That is what a k-means labelling means, and it is the property the device
+#: assignment has to preserve. The centres and the totals that move them are
+#: worked out by two kernels now, so a sample landing under the wrong centre --
+#: or a total gathered for the wrong one -- shows up here.
+fn test_kmeans_puts_every_sample_under_its_nearest_centre() -> void {
+    if not gpu.is_available() { return }
+    let samples = 400
+    let width = 4
+    var state = 7
+    var values: list[float] = []
+    for _index in 0..samples * width {
+        state = (state * 1103515245 + 12345) % 2147483648
+        values.push(float(state % 9973) * 0.01)
+    }
+    let data = Mat.from_list(samples, width, CV_32FC1, values)
+    defer { data.release() }
+    for k in [2, 5, 9] {
+        let (score, labels, centres) = kmeans(data, k, 1, 20)
+        let assigned = labels.to_list()
+        let middles = centres.to_list()
+        assert_true(score > 0.0, f"k={k}: a grouping of spread-out samples costs something")
+        for sample in 0..samples {
+            let mine = int(assigned[sample] + 0.5)
+            assert_true(mine >= 0 and mine < k, f"k={k}: sample {sample} names centre {mine}")
+            var to_mine = 0.0
+            for slot in 0..width {
+                let gap = values[sample * width + slot] - middles[mine * width + slot]
+                to_mine += gap * gap
+            }
+            for centre in 0..k {
+                var other = 0.0
+                for slot in 0..width {
+                    let gap = values[sample * width + slot] - middles[centre * width + slot]
+                    other += gap * gap
+                }
+                assert_true(
+                    to_mine <= other + 1e-3,
+                    f"k={k}: sample {sample} sits nearer centre {centre} than its own"
+                )
+            }
+        }
+        labels.release()
+        centres.release()
+    }
+}
