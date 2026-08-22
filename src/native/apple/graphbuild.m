@@ -848,33 +848,41 @@ static void chooseRoute(JaiGraphPlan *plan, NSArray *feeds, NSArray *results,
                         id<MTLCommandQueue> queue) {
     MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)plan->executable;
 
-    /* Best of several, after a warm pass: the first execution of either route
-     * pays for scheduling the ones after it do not, and a single sample of
-     * either is well inside the noise of the other. */
-    const int PROBES = 4;
+    /* Best of several, warmed first and taken in turns.
+     *
+     * Warmed because the GPU does not run at its working speed until it has
+     * been busy for a while: the first few executions of either route measure
+     * the clock coming up rather than the route. In turns because the two are
+     * usually within a few per cent of each other, so a ramp part way through
+     * a run of one route and not the other decides the answer -- one encode
+     * probe that came out at 4.55 ms against its usual 3.18 handed a live loop
+     * to the blocking route and cost it twenty frames a second. Alternating
+     * puts both routes under whatever the clock is doing at the time. */
+    const int WARM = 6;
+    const int PROBES = 6;
     double encoded = INFINITY;
     double ran = INFINITY;
 
-    jaiGpuEncodeExecutable((__bridge void *)executable, (__bridge void *)feeds,
-                           (__bridge void *)results);
-    jaiGpuSynchronize();
-    for (int i = 0; i < PROBES; i++) {
-        NSDate *started = [NSDate date];
+    for (int i = 0; i < WARM; i++) {
         jaiGpuEncodeExecutable((__bridge void *)executable, (__bridge void *)feeds,
                                (__bridge void *)results);
         jaiGpuSynchronize();
-        const double took = -[started timeIntervalSinceNow];
-        if (took < encoded) encoded = took;
-    }
-
-    [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
-                   executionDescriptor:blockingRun()];
-    for (int i = 0; i < PROBES; i++) {
-        NSDate *started = [NSDate date];
         [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
                        executionDescriptor:blockingRun()];
-        const double took = -[started timeIntervalSinceNow];
-        if (took < ran) ran = took;
+    }
+    for (int i = 0; i < PROBES; i++) {
+        NSDate *startedEncode = [NSDate date];
+        jaiGpuEncodeExecutable((__bridge void *)executable, (__bridge void *)feeds,
+                               (__bridge void *)results);
+        jaiGpuSynchronize();
+        const double tookEncode = -[startedEncode timeIntervalSinceNow];
+        if (tookEncode < encoded) encoded = tookEncode;
+
+        NSDate *startedRun = [NSDate date];
+        [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
+                       executionDescriptor:blockingRun()];
+        const double tookRun = -[startedRun timeIntervalSinceNow];
+        if (tookRun < ran) ran = tookRun;
     }
 
     /* Encoding wins ties, and then some.
@@ -886,11 +894,11 @@ static void chooseRoute(JaiGraphPlan *plan, NSArray *feeds, NSArray *results,
      * then draws the frame before it costs the slower of the two halves when
      * the route encodes and their sum when it runs.
      *
-     * Measured on YOLOv8n the two came out at 3.22 and 3.24 ms, close enough
+     * Measured on YOLOv8n the two came out at 3.18 and 3.24 ms, close enough
      * that the probe picked differently from one run to the next and the loop
-     * around it ran at either 118 or 83 frames a second depending. Running has
-     * to be clearly quicker, not incidentally quicker, to be worth giving that
-     * up for. */
+     * around it ran at either 128 or 105 frames a second depending. Running
+     * has to be clearly quicker, not incidentally quicker, to be worth giving
+     * that up for. */
     plan->route = ran < encoded * JAI_GRAPH_RUN_MUST_BEAT ? ROUTE_RUN : ROUTE_ENCODE;
     if (getenv("JAITHON_GRAPH_ROUTE_REPORT") != NULL) {
         fprintf(stderr, "[graph] encode %.2fms  run %.2fms  taking %s\n",
