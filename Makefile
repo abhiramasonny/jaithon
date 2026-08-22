@@ -466,8 +466,8 @@ opcode-check:
 # jaicv's recorded cases cover what OpenCV was asked to record, so an export
 # nobody recorded is an export nobody ran -- that is how `find_homography` with
 # RANSAC shipped raising OverflowError. `test_reachable.jai` closes the gap by
-# calling each one, and this keeps that file complete. Pure text, so it costs
-# nothing to run on every `make test`.
+# calling each one, and this keeps that file complete. jaitensor is held to the
+# same rule. Pure text, so it costs nothing to run on every `make test`.
 .PHONY: exports-check
 exports-check:
 	@python3 scripts/exports_reachable_check.py

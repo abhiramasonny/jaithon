@@ -2554,3 +2554,49 @@ fn test_a_wide_row_of_ties_keeps_the_first() -> void {
     assert_near(peak.download()[0], 2.5, 1e-6)
     assert_near(place.download()[0], 0.0, 1e-6, "a row of ties should keep the first")
 }
+
+#: The four exports no test called directly.
+#:
+#: Three of them are reached through something else -- the activations through
+#: `Dense`, the NCHW convolution through jaicv's imported graphs -- so the gap
+#: was in this suite rather than in the code. `rsqrt` had no caller anywhere,
+#: which is the one worth checking: an unused export is an unverified one.
+fn test_the_exports_no_test_reached() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([2, 3], [4.0, 1.0, 0.25, 16.0, 100.0, 0.0625])
+    defer { x.free() }
+    let roots = jt.rsqrt(x).download()
+    let wanted = [0.5, 1.0, 2.0, 0.25, 0.1, 4.0]
+    for index in 0..wanted.len() {
+        assert_near(roots[index], wanted[index], 1e-5, f"rsqrt at {index}")
+    }
+
+    let mixed = jt.Tensor([2, 3], [-2.0, -0.5, 0.0, 0.5, 2.0, 3.0])
+    defer { mixed.free() }
+    let curved = jt.silu(mixed).download()
+    for (index, value) in [-2.0, -0.5, 0.0, 0.5, 2.0, 3.0].enumerate() {
+        #: x * sigmoid(x), which is what the layer applies.
+        let want = value / (1.0 + math.exp(-value))
+        assert_near(curved[index], want, 1e-5, f"silu at {index}")
+    }
+    #: A hundredth below zero, which is the slope the kernel is written with.
+    let leaky = jt.leaky_relu(mixed).download()
+    for (index, value) in [-2.0, -0.5, 0.0, 0.5, 2.0, 3.0].enumerate() {
+        let want = if value > 0.0 { value } else { value * 0.01 }
+        assert_near(leaky[index], want, 1e-5, f"leaky_relu at {index}")
+    }
+
+    #: One channel, one 2x2 kernel of ones over a 3x3 ramp: each output is the
+    #: sum of the square it covers.
+    let image = jt.Tensor([1, 1, 3, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+    defer { image.free() }
+    let weights = jt.Tensor([1, 1, 2, 2], [1.0, 1.0, 1.0, 1.0])
+    defer { weights.free() }
+    let convolved = jt.conv2d_nchw(image, weights)
+    defer { convolved.free() }
+    assert_eq(convolved.shape, [1, 1, 2, 2])
+    let sums = convolved.download()
+    for (index, want) in [12.0, 16.0, 24.0, 28.0].enumerate() {
+        assert_near(sums[index], want, 1e-5, f"conv2d_nchw at {index}")
+    }
+}
