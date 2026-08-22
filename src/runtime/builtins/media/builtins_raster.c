@@ -307,6 +307,52 @@ static bool primDrawLine(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `draw_lines(target, colour, cn, origin, stride, cols, rows, ends,
+ *  connectivity)` -- a batch of one-wide segments, `ends` holding x1, y1, x2,
+ *  y2 for each in turn.
+ *
+ * A letter is a dozen or so strokes and a line of text a few hundred, and each
+ * one arriving on its own meant reading the surface again for every one of
+ * them. Handing the whole batch over reads it once. */
+static bool primDrawLines(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiSurface surface;
+    if (!readSurface(args, 0, "draw_lines", &surface)) return false;
+    ObjList *ends;
+    int64_t connectivity;
+    if (!jaiArgList(args[7], 8, "draw_lines", &ends)) return false;
+    if (!jaiStrWantInt(args[8], "draw_lines", "the connectivity", &connectivity)) return false;
+    if (connectivity != 4 && connectivity != 8) {
+        return jaiThrow(vm.cValueError, "draw_lines(): connectivity must be 4 or 8, got %lld",
+                        (long long)connectivity);
+    }
+    if (ends->count % 4 != 0) {
+        return jaiThrow(vm.cValueError,
+                        "draw_lines(): %d numbers is not a whole number of segments",
+                        ends->count);
+    }
+
+    const int segments = ends->count / 4;
+    for (int i = 0; i < segments; i++) {
+        int64_t at[4];
+        for (int k = 0; k < 4; k++) {
+            Value v = ends->items[i * 4 + k];
+            if (!IS_INT(v)) {
+                return jaiThrow(vm.cTypeError,
+                                "draw_lines(): segment %d holds a non-integer", i);
+            }
+            at[k] = AS_INT(v);
+        }
+        JaiLineWalk walk;
+        if (clipAndOrient(surface.cols, surface.rows, at[0], at[1], at[2], at[3],
+                          (int)connectivity, &walk)) {
+            lineWalk(&walk, &surface);
+        }
+    }
+    *out = NULL_VAL;
+    return true;
+}
+
 /* The scanline fill of a convex polygon, in fixed point.
  *
  * Mirrors what jaicv's `fill_convex` computed: the same two edge chains walked
@@ -431,5 +477,6 @@ static bool primFillConvex(int argc, Value *args, Value *out) {
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_span",   primFillSpan,   10, 10);
     jaiStrDefinePrim(ns, "draw_line",   primDrawLine,   12, 12);
+    jaiStrDefinePrim(ns, "draw_lines",  primDrawLines,   9, 9);
     jaiStrDefinePrim(ns, "fill_convex", primFillConvex, 11, 11);
 }
