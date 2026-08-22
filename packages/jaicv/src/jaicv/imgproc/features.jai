@@ -970,6 +970,11 @@ pub fn hough_circles(
     #: point as in `good_features_to_track`.
     let ordered = centres.sort(key: |cell| accumulator[cell], reverse: true)
 
+    #: One pair of buffers for every centre rather than a pair each: a busy
+    #: frame produces hundreds of candidates, and allocating and releasing two
+    #: buffers apiece costs more than the votes do.
+    let radius_buffer = Buffer(upper + 1)
+    let radius_counts = Buffer(upper + 1)
     var out: list[HoughCircle] = []
     for cell in ordered {
         let ay = cell // acc_cols
@@ -989,22 +994,18 @@ pub fn hough_circles(
 
         #: The radius is whichever distance the most edge pixels around this
         #: centre agree on.
-        let radius_buffer = Buffer(upper + 1)
         radius_buffer.fill_zero()
         kernel_for("hough_radius_vote").dispatch_async(
             [mask_buffer, radius_buffer],
             rows * cols,
             [rows * cols, cols, lower, upper, f32_bits(cx), f32_bits(cy)]
         )
-        let radius_counts = Buffer(upper + 1)
         kernel_for("hough_collect").dispatch_async(
             [radius_buffer, radius_counts],
             upper + 1,
             [upper + 1]
         )
         let votes = radius_counts.download()
-        radius_buffer.free()
-        radius_counts.free()
         var best = lower
         for radius in lower..upper + 1 {
             if votes[radius] > votes[best] { best = radius }
@@ -1012,6 +1013,8 @@ pub fn hough_circles(
         if votes[best] == 0.0 { continue }
         out.push(HoughCircle(Point2f(cx, cy), float(best), accumulator[cell]))
     }
+    radius_buffer.free()
+    radius_counts.free()
     mask_buffer.free()
     return out
 }
