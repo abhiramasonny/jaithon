@@ -62,6 +62,10 @@ struct JaiGraphPlan {
  * instead, which is how the two are compared. */
 enum { ROUTE_UNDECIDED = 0, ROUTE_ENCODE = 1, ROUTE_RUN = 2 };
 
+/* How much quicker running has to be before it is worth losing the overlap
+ * that encoding allows. See chooseRoute. */
+#define JAI_GRAPH_RUN_MUST_BEAT 0.85
+
 static int forcedRoute(void) {
     const char *setting = getenv("JAITHON_GRAPH_ROUTE");
     if (setting == NULL) return ROUTE_UNDECIDED;
@@ -812,6 +816,29 @@ bool jaiGraphPlanOutputShape(JaiGraphPlan *plan, int index, int64_t *dims, int r
 /* One execution by each route, timed, so the plan can keep the faster. Both
  * wait for the work to land, which is the only way the numbers mean anything;
  * it costs two submissions once in a plan's life. */
+/* Running hands the work to the queue and, left to itself, returns before it
+ * is done -- the results are not in the buffers yet.
+ *
+ * That went unnoticed for as long as every read of a device buffer drained
+ * the whole queue, because the graph submits to the same queue as everything
+ * else and draining it swept the graph's own work up too. Once a read waited
+ * only for the work that wrote the buffer it was reading, an Add over two fed
+ * tensors started coming back with whatever the buffer held before.
+ *
+ * Waiting here rather than tracking the graph's command buffer keeps the
+ * contract of this route what its name says: when it returns, the answer is
+ * there. The route that does not wait is the encoding one, and a caller who
+ * wants the overlap takes that. */
+static MPSGraphExecutableExecutionDescriptor *blockingRun(void) {
+    static MPSGraphExecutableExecutionDescriptor *descriptor;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        descriptor = [MPSGraphExecutableExecutionDescriptor new];
+        descriptor.waitUntilCompleted = YES;
+    });
+    return descriptor;
+}
+
 static void chooseRoute(JaiGraphPlan *plan, NSArray *feeds, NSArray *results,
                         id<MTLCommandQueue> queue) {
     MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)plan->executable;
@@ -836,16 +863,30 @@ static void chooseRoute(JaiGraphPlan *plan, NSArray *feeds, NSArray *results,
     }
 
     [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
-                   executionDescriptor:nil];
+                   executionDescriptor:blockingRun()];
     for (int i = 0; i < PROBES; i++) {
         NSDate *started = [NSDate date];
         [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
-                       executionDescriptor:nil];
+                       executionDescriptor:blockingRun()];
         const double took = -[started timeIntervalSinceNow];
         if (took < ran) ran = took;
     }
 
-    plan->route = ran < encoded ? ROUTE_RUN : ROUTE_ENCODE;
+    /* Encoding wins ties, and then some.
+     *
+     * The two are not interchangeable at equal speed: running submits to the
+     * queue and blocks until the answer is there, while encoding leaves the
+     * work queued and returns, so the caller can do something else while the
+     * GPU gets on with it. A live loop that hands over one frame's network and
+     * then draws the frame before it costs the slower of the two halves when
+     * the route encodes and their sum when it runs.
+     *
+     * Measured on YOLOv8n the two came out at 3.22 and 3.24 ms, close enough
+     * that the probe picked differently from one run to the next and the loop
+     * around it ran at either 118 or 83 frames a second depending. Running has
+     * to be clearly quicker, not incidentally quicker, to be worth giving that
+     * up for. */
+    plan->route = ran < encoded * JAI_GRAPH_RUN_MUST_BEAT ? ROUTE_RUN : ROUTE_ENCODE;
     if (getenv("JAITHON_GRAPH_ROUTE_REPORT") != NULL) {
         fprintf(stderr, "[graph] encode %.2fms  run %.2fms  taking %s\n",
                 encoded * 1000.0, ran * 1000.0,
@@ -886,16 +927,18 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets
             [results addObject:data];
         }
 
-        /* Both routes write the outputs and read the inputs through the same
-         * queue everything else uses, so a later read of either has to know
-         * to wait for this. */
-        for (int i = 0; i < plan->inputCount; i++) jaiGpuBufferMark(ins[i]);
-        for (int i = 0; i < plan->outputCount; i++) jaiGpuBufferMark(outs[i]);
-
         if (plan->route == ROUTE_UNDECIDED) chooseRoute(plan, feeds, results, queue);
 
         MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)plan->executable;
         if (plan->route == ROUTE_ENCODE) {
+            /* Marked here and not a line earlier. The work goes into whatever
+             * batch is open at the moment it is encoded, and choosing the
+             * route drains the queue several times over on the way to a
+             * decision -- a mark taken before that names a batch that has
+             * been and gone, and a later read of the output waits for
+             * nothing and sees whatever the buffer held before. */
+            for (int i = 0; i < plan->inputCount; i++) jaiGpuBufferMark(ins[i]);
+            for (int i = 0; i < plan->outputCount; i++) jaiGpuBufferMark(outs[i]);
             return jaiGpuEncodeExecutable((__bridge void *)executable,
                                           (__bridge void *)feeds,
                                           (__bridge void *)results);
@@ -906,7 +949,7 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets
         [executable runWithMTLCommandQueue:queue
                               inputsArray:feeds
                              resultsArray:results
-                      executionDescriptor:nil];
+                      executionDescriptor:blockingRun()];
         return true;
     }
 }
