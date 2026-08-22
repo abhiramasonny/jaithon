@@ -753,6 +753,13 @@ int jaiGraphGru(JaiGraphBuilder *b, int s, int r, int w, int bias, int state, in
     (void)b; (void)s; (void)r; (void)w; (void)bias; (void)state; (void)reverse;
     (void)resetAfter; (void)resetBias; return -1;
 }
+int jaiGraphOneHot(JaiGraphBuilder *b, int indices, int depth) {
+    (void)b; (void)indices; (void)depth; return -1;
+}
+int jaiGraphSoftmaxCrossEntropy(JaiGraphBuilder *b, int logits, int labels, int axis,
+                                int reduction) {
+    (void)b; (void)logits; (void)labels; (void)axis; (void)reduction; return -1;
+}
 bool jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants, int count,
                        int *out) {
     (void)b; (void)loss; (void)wants; (void)count; (void)out; return false;

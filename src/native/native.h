@@ -251,6 +251,12 @@ bool             jaiGraphLstm(JaiGraphBuilder *b, int source, int recurrentWeigh
 int              jaiGraphGru(JaiGraphBuilder *b, int source, int recurrentWeight,
                              int inputWeight, int bias, int initState, int reverse,
                              int resetAfter, int resetBias);
+/* One-hot rows from integer-valued indices, `depth` wide. */
+int              jaiGraphOneHot(JaiGraphBuilder *b, int indices, int depth);
+/* Softmax cross-entropy against one-hot labels; `reduction` 0 none, 1 sum,
+ * 2 mean. The platform's own, which unlike a hand-built one has a gradient. */
+int              jaiGraphSoftmaxCrossEntropy(JaiGraphBuilder *b, int logits, int labels,
+                                             int axis, int reduction);
 /* Derivatives of `loss` with respect to each of `wants`, recorded in the
  * builder. A slot comes back -1 when the loss does not depend on that tensor.
  * See graphbuild.m. */

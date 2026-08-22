@@ -190,12 +190,12 @@ static bool nGraphConv(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
     int64_t x, w, bias;
-    int32_t params[9];
+    int32_t params[11];
     if (!requireBuilder(args[0], 1, "graph_conv", &builder)) return false;
     if (!jaiArgInt(args[1], 2, "graph_conv", &x)) return false;
     if (!jaiArgInt(args[2], 3, "graph_conv", &w)) return false;
     if (!jaiArgInt(args[3], 4, "graph_conv", &bias)) return false;
-    if (!narrow(args[4], 5, "graph_conv", 9, params)) return false;
+    if (!narrow(args[4], 5, "graph_conv", 11, params)) return false;
     *out = INT_VAL(jaiGraphConv(builder, (int)x, (int)w, (int)bias, params));
     return true;
 }
@@ -224,10 +224,10 @@ static bool nGraphPool(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
     int64_t x, kind;
-    int32_t params[10];
+    int32_t params[11];
     if (!requireBuilder(args[0], 1, "graph_pool", &builder)) return false;
     if (!jaiArgInt(args[1], 2, "graph_pool", &x)) return false;
-    if (!narrow(args[2], 3, "graph_pool", 10, params)) return false;
+    if (!narrow(args[2], 3, "graph_pool", 11, params)) return false;
     if (!jaiArgInt(args[3], 4, "graph_pool", &kind)) return false;
     *out = INT_VAL(jaiGraphPool(builder, (int)x, params, (int)kind));
     return true;
@@ -543,6 +543,31 @@ static bool nGraphGru(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool nGraphOneHot(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t indices, depth;
+    if (!requireBuilder(args[0], 1, "graph_onehot", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_onehot", &indices)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_onehot", &depth)) return false;
+    *out = INT_VAL(jaiGraphOneHot(builder, (int)indices, (int)depth));
+    return true;
+}
+
+static bool nGraphSoftmaxCrossEntropy(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiGraphBuilder *builder;
+    int64_t logits, labels, axis, reduction;
+    if (!requireBuilder(args[0], 1, "graph_softmax_cross_entropy", &builder)) return false;
+    if (!jaiArgInt(args[1], 2, "graph_softmax_cross_entropy", &logits)) return false;
+    if (!jaiArgInt(args[2], 3, "graph_softmax_cross_entropy", &labels)) return false;
+    if (!jaiArgInt(args[3], 4, "graph_softmax_cross_entropy", &axis)) return false;
+    if (!jaiArgInt(args[4], 5, "graph_softmax_cross_entropy", &reduction)) return false;
+    *out = INT_VAL(jaiGraphSoftmaxCrossEntropy(builder, (int)logits, (int)labels,
+                                               (int)axis, (int)reduction));
+    return true;
+}
+
 /* `graph_gradients(builder, loss, wants)` -- the derivative of `loss` with
  * respect to each wanted tensor, as a list of ids. A -1 means the loss does
  * not depend on that one. */
@@ -747,6 +772,8 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_gemm",           nGraphGemm,           8, 8);
     jaiDefineNative("__prim__.graph_lstm",           nGraphLstm,           8, 8);
     jaiDefineNative("__prim__.graph_gru",            nGraphGru,            9, 9);
+    jaiDefineNative("__prim__.graph_onehot",         nGraphOneHot,         3, 3);
+    jaiDefineNative("__prim__.graph_softmax_cross_entropy", nGraphSoftmaxCrossEntropy, 5, 5);
     jaiDefineNative("__prim__.graph_gradients",      nGraphGradients,      3, 3);
     jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);
     jaiDefineNative("__prim__.graph_plan_output_shape", nGraphPlanOutputShape, 2, 2);
