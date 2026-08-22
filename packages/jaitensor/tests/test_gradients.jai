@@ -372,6 +372,34 @@ fn test_wide_normalisation_gradients() -> void {
     beta.free()
 }
 
+#: The channel normalisations reduce over the batch and every pixel, an axis
+#: that is not the one they write, so their statistics come out of a whole
+#: threadgroup striding it. Their scale and shift gradients were never checked
+#: against a difference quotient at all, at any size.
+fn test_channel_normalisation_parameter_gradients() -> void {
+    if not have_gpu() { return }
+    let shape = [2, 8, 8, 4]
+    let count = 2 * 8 * 8 * 4
+    let image = Tensor(shape, spread(count))
+    let gamma = Tensor([4], positive(4))
+    let beta = Tensor([4], [0.2, -0.3, 0.1, 0.4])
+
+    check(fn(g: Tensor) -> Tensor { return batch_norm(image, g, beta) }, [4], positive(4))
+    check(fn(b: Tensor) -> Tensor {
+        return batch_norm(image, gamma, b)
+    }, [4], [0.2, -0.3, 0.1, 0.4])
+    check(fn(g: Tensor) -> Tensor { return group_norm(image, g, beta, 2) }, [4], positive(4))
+    check(fn(b: Tensor) -> Tensor {
+        return group_norm(image, gamma, b, 2)
+    }, [4], [0.2, -0.3, 0.1, 0.4])
+    check(fn(x: Tensor) -> Tensor { return batch_norm(x, gamma, beta) }, shape, spread(count))
+    check(fn(x: Tensor) -> Tensor { return group_norm(x, gamma, beta, 2) }, shape, spread(count))
+
+    image.free()
+    gamma.free()
+    beta.free()
+}
+
 #: `gather_rows` differentiates in its table, not in its indices. A row picked
 #: twice must collect both gradients, which is the case a naive scatter drops.
 fn test_gather_rows_accumulates_repeated_indices() -> void {
