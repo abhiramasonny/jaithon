@@ -12,6 +12,7 @@
 #: let noise = randn(Size(64, 64), CV_32FC1, 0.0, 1.0)
 #: ```
 import std.math
+from std.gpu import Kernel
 from ..core.linalg import inverse, matmul, symmetric_eigen, transpose
 from ..core.mat import Mat, merge
 from ..core.types import CV_32F, CV_64F, CV_MAKETYPE, CV_MAT_CN, CV_MAT_DEPTH
@@ -40,6 +41,124 @@ fn next_random() -> int {
 fn uniform_unit() -> float { return float(next_random() % 1000000007) / 1000000007.0 }
 
 #: Lay matrices side by side.
+let SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+/* One channel of a picture on its own, and the reverse.
+ *
+ * Both are a pure remap of one element to another, which is what makes reading
+ * the whole picture back to do it on the host the wrong shape: splitting a
+ * 720p frame into channels took 33 ms that way. */
+kernel void misc_extract(device const float* src [[buffer(0)]],
+                         device float* dst [[buffer(1)]],
+                         constant uint& count [[buffer(2)]],
+                         constant uint& cols [[buffer(3)]],
+                         constant uint& cn [[buffer(4)]],
+                         constant uint& channel [[buffer(5)]],
+                         constant uint& src_off [[buffer(6)]],
+                         constant uint& src_step [[buffer(7)]],
+                         constant uint& dst_off [[buffer(8)]],
+                         constant uint& dst_step [[buffer(9)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    dst[dst_off + y * dst_step + x] = src[src_off + y * src_step + x * cn + channel];
+}
+
+kernel void misc_insert(device const float* src [[buffer(0)]],
+                        device float* dst [[buffer(1)]],
+                        constant uint& count [[buffer(2)]],
+                        constant uint& cols [[buffer(3)]],
+                        constant uint& cn [[buffer(4)]],
+                        constant uint& channel [[buffer(5)]],
+                        constant uint& src_off [[buffer(6)]],
+                        constant uint& src_step [[buffer(7)]],
+                        constant uint& dst_off [[buffer(8)]],
+                        constant uint& dst_step [[buffer(9)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    dst[dst_off + y * dst_step + x * cn + channel] = src[src_off + y * src_step + x];
+}
+
+/* A quarter or a half turn. `code` is 0 for clockwise, 1 for a half turn and
+ * 2 for anticlockwise, matching what the caller was given. */
+kernel void misc_rotate(device const float* src [[buffer(0)]],
+                        device float* dst [[buffer(1)]],
+                        constant uint& count [[buffer(2)]],
+                        constant uint& rows [[buffer(3)]],
+                        constant uint& cols [[buffer(4)]],
+                        constant uint& cn [[buffer(5)]],
+                        constant uint& code [[buffer(6)]],
+                        constant uint& src_off [[buffer(7)]],
+                        constant uint& src_step [[buffer(8)]],
+                        constant uint& dst_off [[buffer(9)]],
+                        constant uint& dst_step [[buffer(10)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint pixel = id / cn;
+    uint c = id - pixel * cn;
+    uint sy;
+    uint sx;
+    uint dy;
+    uint dx;
+    if (code == 1u) {
+        dy = pixel / cols;
+        dx = pixel - dy * cols;
+        uint source = rows * cols - 1u - pixel;
+        sy = source / cols;
+        sx = source - sy * cols;
+    } else {
+        /* The turned picture is `cols` tall and `rows` wide. */
+        dy = pixel / rows;
+        dx = pixel - dy * rows;
+        if (code == 0u) {
+            sy = rows - 1u - dx;
+            sx = dy;
+        } else {
+            sy = dx;
+            sx = cols - 1u - dy;
+        }
+    }
+    dst[dst_off + dy * dst_step + dx * cn + c] = src[src_off + sy * src_step + sx * cn + c];
+}
+
+/* One picture copied into a block of another, which is what joining side by
+ * side or end to end comes to. */
+kernel void misc_copy_block(device const float* src [[buffer(0)]],
+                            device float* dst [[buffer(1)]],
+                            constant uint& count [[buffer(2)]],
+                            constant uint& cols [[buffer(3)]],
+                            constant uint& cn [[buffer(4)]],
+                            constant uint& src_off [[buffer(5)]],
+                            constant uint& src_step [[buffer(6)]],
+                            constant uint& dst_off [[buffer(7)]],
+                            constant uint& dst_step [[buffer(8)]],
+                            constant uint& at_y [[buffer(9)]],
+                            constant uint& at_x [[buffer(10)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint pixel = id / cn;
+    uint c = id - pixel * cn;
+    uint y = pixel / cols;
+    uint x = pixel - y * cols;
+    dst[dst_off + (at_y + y) * dst_step + (at_x + x) * cn + c] =
+        src[src_off + y * src_step + x * cn + c];
+}
+"""
+
+var _kernels: dict[str, Kernel] = {}
+
+fn kernel_for(entry: str) -> Kernel {
+    let existing = _kernels.get(entry, null)
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(SOURCE, entry)
+    _kernels[entry] = compiled
+    return compiled
+}
+
 pub fn hconcat(parts: list[Mat]) -> Mat {
     if parts.len() == 0 { throw ValueError("there is nothing to join") }
     let rows = parts[0].rows
@@ -50,18 +169,29 @@ pub fn hconcat(parts: list[Mat]) -> Mat {
         if part.channels() != cn { throw ValueError("every part has to have the same channels") }
         width += part.cols
     }
-    var planes: list[list[float]] = []
-    for part in parts { planes.push(part.values()) }
-    var out: list[float] = []
-    for y in 0..rows {
-        for index in 0..parts.len() {
-            let part = parts[index]
-            for x in 0..part.cols {
-                for c in 0..cn { out.push(planes[index][(y * part.cols + x) * cn + c]) }
-            }
-        }
+    let out = Mat(rows, width, parts[0].type_())
+    var at = 0
+    for part in parts {
+        part.flush()
+        kernel_for("misc_copy_block").dispatch_async(
+            [part.storage, out.storage],
+            part.rows * part.cols * cn,
+            [
+                part.rows * part.cols * cn,
+                part.cols,
+                cn,
+                part.offset,
+                part.step_,
+                out.offset,
+                out.step_,
+                0,
+                at,
+            ]
+        )
+        at += part.cols
     }
-    return Mat.from_list(rows, width, parts[0].type_(), out)
+    out.invalidate()
+    return out
 }
 
 #: Stack matrices on top of each other.
@@ -77,11 +207,29 @@ pub fn vconcat(parts: list[Mat]) -> Mat {
         if part.channels() != cn { throw ValueError("every part has to have the same channels") }
         height += part.rows
     }
-    var out: list[float] = []
+    let out = Mat(height, cols, parts[0].type_())
+    var at = 0
     for part in parts {
-        for value in part.to_list() { out.push(value) }
+        part.flush()
+        kernel_for("misc_copy_block").dispatch_async(
+            [part.storage, out.storage],
+            part.rows * part.cols * cn,
+            [
+                part.rows * part.cols * cn,
+                part.cols,
+                cn,
+                part.offset,
+                part.step_,
+                out.offset,
+                out.step_,
+                at,
+                0,
+            ]
+        )
+        at += part.rows
     }
-    return Mat.from_list(height, cols, parts[0].type_(), out)
+    out.invalidate()
+    return out
 }
 
 #: Tile a matrix.
@@ -101,36 +249,31 @@ pub fn rotate(src: Mat, code: int) -> Mat {
     let rows = src.rows
     let cols = src.cols
     let cn = src.channels()
-    let values = src.to_list()
-    var out: list[float] = []
-    if code == ROTATE_180 {
-        for index in 0..rows * cols {
-            let source = rows * cols - 1 - index
-            for c in 0..cn { out.push(values[source * cn + c]) }
-        }
-        return Mat.from_list(rows, cols, src.type_(), out)
-    }
-    for y in 0..cols {
-        for x in 0..rows {
-            let source = if code == ROTATE_90_CLOCKWISE {
-                (rows - 1 - x) * cols + y
-            } else {
-                x * cols + (cols - 1 - y)
-            }
-            for c in 0..cn { out.push(values[source * cn + c]) }
-        }
-    }
-    return Mat.from_list(cols, rows, src.type_(), out)
+    let half = code == ROTATE_180
+    let out = if half { Mat(rows, cols, src.type_()) } else { Mat(cols, rows, src.type_()) }
+    let picked = if half { 1 } elif code == ROTATE_90_CLOCKWISE { 0 } else { 2 }
+    kernel_for("misc_rotate").dispatch_async(
+        [src.storage, out.storage],
+        rows * cols * cn,
+        [rows * cols * cn, rows, cols, cn, picked, src.offset, src.step_, out.offset, out.step_]
+    )
+    out.invalidate()
+    return out
 }
 
 #: One channel of a multi-channel matrix, on its own.
 pub fn extract_channel(src: Mat, index: int) -> Mat {
     let cn = src.channels()
     if index < 0 or index >= cn { throw ValueError(f"there is no channel {index}") }
-    let values = src.to_list()
-    var out: list[float] = []
-    for at in 0..src.rows * src.cols { out.push(values[at * cn + index]) }
-    return Mat.from_list(src.rows, src.cols, CV_MAKETYPE(src.depth(), 1), out)
+    src.flush()
+    let out = Mat(src.rows, src.cols, CV_MAKETYPE(src.depth(), 1))
+    kernel_for("misc_extract").dispatch_async(
+        [src.storage, out.storage],
+        src.rows * src.cols,
+        [src.rows * src.cols, src.cols, cn, index, src.offset, src.step_, out.offset, out.step_]
+    )
+    out.invalidate()
+    return out
 }
 
 #: Put a single-channel matrix into one channel of another.
@@ -140,10 +283,26 @@ pub fn insert_channel(source: Mat, target: Mat, index: int) -> Mat {
     if source.rows != target.rows or source.cols != target.cols {
         throw ValueError("both have to be the same size")
     }
-    let plane = source.values()
-    var values = target.to_list()
-    for at in 0..target.rows * target.cols { values[at * cn + index] = plane[at] }
-    return Mat.from_list(target.rows, target.cols, target.type_(), values)
+    source.flush()
+    #: The other channels come through untouched, so the copy starts from what
+    #: was there and the kernel overwrites only the one asked for.
+    let out = target.clone()
+    kernel_for("misc_insert").dispatch_async(
+        [source.storage, out.storage],
+        target.rows * target.cols,
+        [
+            target.rows * target.cols,
+            target.cols,
+            cn,
+            index,
+            source.offset,
+            source.step_,
+            out.offset,
+            out.step_,
+        ]
+    )
+    out.invalidate()
+    return out
 }
 
 #: One line in order.
