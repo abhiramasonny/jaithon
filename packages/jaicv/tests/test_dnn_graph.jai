@@ -13,8 +13,9 @@
 #: group rather than globally -- a convolution accumulates a hundred products
 #: on the GPU and will never match a CPU sum to the last bit, while `Relu`
 #: should.
+import std.gpu as gpu
 from std.io import Path
-from std.test import assert_contains, assert_eq, assert_throws, assert_true
+from std.test import assert_contains, assert_eq, assert_near, assert_throws, assert_true
 from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, run_graph
 from jaicv.dnn.plan import Plan, compile_plan
 from jaitensor import Tensor
@@ -663,4 +664,35 @@ fn test_end_to_end_network_matches_torch() -> void {
     assert_true(abs(total - 2.0) < 1e-5, f"two softmax rows should sum to two, got {total}")
     probs.free()
     for (_name, tensor) in weights.items() { tensor.free() }
+}
+
+#: The platform differentiates the graph it already holds.
+#:
+#: This is what lets a whole training step -- forward, loss, gradients and the
+#: update after them -- compile into one thing rather than running as a few
+#: hundred separate dispatches with the processor waiting between each.
+fn test_the_graph_differentiates_itself() -> void {
+    if not gpu.is_available() { return }
+    let n = 6
+    let builder = __prim__.graph_new()
+    let x = __prim__.graph_input(builder, [n])
+    let w = __prim__.graph_input(builder, [n])
+    #: loss = sum(x * w * w), whose derivative in w is 2 * x * w.
+    let squared = __prim__.graph_binary(builder, w, w, 2)
+    let scaled = __prim__.graph_binary(builder, x, squared, 2)
+    let loss = __prim__.graph_reduce(builder, scaled, [0], 0)
+    let slots = __prim__.graph_gradients(builder, loss, [w])
+    assert_eq(slots.len(), 1)
+    assert_true(slots[0] >= 0, "no derivative came back")
+
+    let handle = __prim__.graph_compile(builder, [x, w], [slots[0]])
+    assert_true(handle >= 0, "the differentiated graph would not compile")
+    let plan = Plan(handle, ["x", "w"], [[n], [n]], ["dw"], [[n]])
+    let xs = Tensor([n], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let ws = Tensor([n], [0.5, -1.0, 2.0, 0.25, -3.0, 1.5])
+    let produced = plan.run({"x": xs, "w": ws})
+    let got = produced["dw"].download()
+    for index in 0..n {
+        assert_near(got[index], 2.0 * xs.download()[index] * ws.download()[index], 1e-5)
+    }
 }
