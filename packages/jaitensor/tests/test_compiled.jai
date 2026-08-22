@@ -505,3 +505,99 @@ fn padded(seed: int) -> list[Layer] {
     }
     return layers
 }
+
+#: Models built at random, compiled, and held against the eager path.
+#:
+#: The hand-written cases above each pin one thing. What they cannot cover is
+#: the combinations: a step is refused or expressed layer by layer, and a layer
+#: that comes out wrong only in company is exactly the kind of thing that
+#: reaches a model and not a test. An earlier bug had this shape -- dense layers
+#: read their activation from `activation_code`, which reports Gelu, Silu and
+#: LeakyRelu as linear, so those three were silently dropped from the graph and
+#: the step trained a different model without saying so.
+#:
+#: Seeded, so a failure names the model that produced it.
+fn test_models_put_together_at_random_train_where_the_eager_ones_do() -> void {
+    if not gpu.is_available() { return }
+    let (x, y) = batch()
+    defer { x.free() }
+    defer { y.free() }
+    for seed in 1..9 {
+        let step = compile_step(improvised(seed), [BATCH, SIDE, SIDE, CHANNELS], CLASSES, RATE)
+        assert_true(step is not null, f"model {seed} would not compile: {refusal()}")
+        for _iteration in 0..4 { step.run(x, y) }
+        step.settle()
+
+        let want = eager_steps(improvised(seed), x, y, 4)
+        assert_eq(step.params.len(), want.len(), f"model {seed} has a different parameter count")
+        for (index, param) in step.params.enumerate() {
+            let got = param.download()
+            let expected = want[index].download()
+            for slot in 0..got.len() {
+                assert_near(
+                    got[slot],
+                    expected[slot],
+                    2e-4,
+                    f"model {seed}, parameter {index}, slot {slot}"
+                )
+            }
+        }
+        step.free()
+    }
+}
+
+#: A stack drawn from what the step claims to express: convolutions and pools
+#: while the shape is still an image, then a flatten, then the rest.
+fn improvised(seed: int) -> list[Layer] {
+    let rng = Random.with_seed(seed)
+    let choices = [
+        Activation.Linear,
+        Activation.Relu,
+        Activation.Gelu,
+        Activation.Silu,
+        Activation.Tanh,
+        Activation.Sigmoid,
+        Activation.LeakyRelu,
+    ]
+    var layers: list[Layer] = []
+    let convolutions = 1 + int(rng.next_float() * 2.0)
+    for index in 0..convolutions {
+        let filters = 4 + int(rng.next_float() * 5.0)
+        let padded = rng.next_float() < 0.6
+        layers.push(Conv2d(filters, 3, padding: if padded {
+            1
+        } else {
+            0
+        }, in_channels: if index == 0 {
+            CHANNELS
+        } else {
+            0
+        }, activation: choices[int(rng.next_float() * float(choices.len()))]))
+        if rng.next_float() < 0.6 {
+            if rng.next_float() < 0.5 {
+                layers.push(MaxPool2d(2))
+            } else {
+                layers.push(AvgPool2d(2))
+            }
+        }
+    }
+    layers.push(Flatten())
+    if rng.next_float() < 0.5 { layers.push(LayerNorm()) }
+    if rng.next_float() < 0.6 {
+        layers.push(
+            Dense(
+                6 + int(rng.next_float() * 7.0),
+                activation: choices[int(rng.next_float() * float(choices.len()))]
+            )
+        )
+    }
+    layers.push(Dense(CLASSES, activation: Activation.Linear))
+
+    var current = [SIDE, SIDE, CHANNELS]
+    let builder = Random.with_seed(seed + 100)
+    for layer in layers {
+        layer.build_from_shape(current, builder)
+        current = layer.output_shape()
+    }
+    return layers
+}
