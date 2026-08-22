@@ -21,16 +21,19 @@ fn block(
     b1: Tensor,
     g2: Tensor,
     b2: Tensor,
+    inner_bias: Tensor,
     heads: int
 ) -> Tensor {
     let normed = jt.layer_norm(x, g1, b1)
     let q = jt.matmul(normed, qw)
     let attended = jt.multi_head_attention(q, q, q, heads)
-    let projected = jt.matmul(attended, ow)
-    let residual = jt.add(x, projected)
+    #: The projection and the residual it lands on, in one kernel.
+    let residual = jt.linear_residual(attended, ow, x)
     let normed2 = jt.layer_norm(residual, g2, b2)
-    let hidden = jt.gelu(jt.matmul(normed2, w1))
-    return jt.add(residual, jt.matmul(hidden, w2))
+    #: One kernel for the product and the activation together, which is what
+    #: the inner layer of a transformer is.
+    let hidden = jt.linear_gelu(normed2, w1, inner_bias)
+    return jt.linear_residual(hidden, w2, residual)
 }
 
 fn main() -> int {
@@ -52,16 +55,17 @@ fn main() -> int {
     let b1 = Tensor.zeros([dim])
     let g2 = Tensor.full([dim], 1.0)
     let b2 = Tensor.zeros([dim])
+    let inner_bias = Tensor.zeros([dim * 4])
     for t in [x, qw, ow, w1, w2] { t.buffer().fill_uniform(-0.05, 0.05, 3) }
 
     for _w in 0..warmup {
-        let out = block(x, qw, ow, w1, w2, g1, b1, g2, b2, heads)
+        let out = block(x, qw, ow, w1, w2, g1, b1, g2, b2, inner_bias, heads)
         out.free()
     }
     gpu.synchronize()
     let started = Instant.now()
     var live: list[Tensor] = []
-    for _r in 0..repeats { live.push(block(x, qw, ow, w1, w2, g1, b1, g2, b2, heads)) }
+    for _r in 0..repeats { live.push(block(x, qw, ow, w1, w2, g1, b1, g2, b2, inner_bias, heads)) }
     gpu.synchronize()
     let seconds = started.elapsed().to_seconds()
     let check = live[live.len() - 1].buffer().download(0, 1)[0]

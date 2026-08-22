@@ -8,7 +8,7 @@ import torch.nn.functional as F
 WARMUP = 24
 
 
-def block(x, qw, ow, w1, w2, g1, b1, g2, b2, heads):
+def block(x, qw, ow, w1, w2, g1, b1, g2, b2, ib, heads):
     normed = F.layer_norm(x, (x.shape[-1],), g1, b1)
     q = normed @ qw
     seq, dim = q.shape
@@ -18,7 +18,7 @@ def block(x, qw, ow, w1, w2, g1, b1, g2, b2, heads):
     attended = ctx.squeeze(0).permute(1, 0, 2).reshape(seq, dim)
     residual = x + attended @ ow
     normed2 = F.layer_norm(residual, (residual.shape[-1],), g2, b2)
-    return residual + F.gelu(normed2 @ w1) @ w2
+    return residual + F.gelu(normed2 @ w1 + ib) @ w2
 
 
 def main() -> None:
@@ -37,15 +37,16 @@ def main() -> None:
     b1 = torch.zeros(dim, device=d)
     g2 = torch.ones(dim, device=d)
     b2 = torch.zeros(dim, device=d)
+    ib = torch.zeros(dim * 4, device=d)
 
     with torch.autocast(device_type=d, dtype=torch.float16, cache_enabled=False):
         for _ in range(WARMUP):
-            block(x, qw, ow, w1, w2, g1, b1, g2, b2, heads)
+            block(x, qw, ow, w1, w2, g1, b1, g2, b2, ib, heads)
     torch.mps.synchronize()
     started = time.perf_counter()
     with torch.autocast(device_type=d, dtype=torch.float16, cache_enabled=False):
         for _ in range(repeats):
-            out = block(x, qw, ow, w1, w2, g1, b1, g2, b2, heads)
+            out = block(x, qw, ow, w1, w2, g1, b1, g2, b2, ib, heads)
     torch.mps.synchronize()
     seconds = time.perf_counter() - started
     flops = repeats * (12.0 * tokens * dim * dim + 4.0 * tokens * tokens * dim)
