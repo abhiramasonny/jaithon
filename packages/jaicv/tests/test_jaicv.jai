@@ -13,6 +13,7 @@ from jaicv.imgproc.morph import dilate, erode, get_structuring_element, MORPH_RE
 from jaicv.imgproc.misc import mean_shift_on_host, pyr_mean_shift_filtering
 from jaicv.ml.models import k_nearest_create
 from jaicv.imgproc.features import corner_min_eigen_val, good_features_to_track
+from jaicv.imgproc.features import hough_circles
 from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
 from jaicv.core.types import BORDER_REPLICATE
 from jaicv.core.mat import Mat, flip, merge
@@ -870,4 +871,32 @@ fn test_good_features_are_ordered_and_spaced() -> void {
             )
         }
     }
+}
+
+#: A ring in, one circle out, at the size and radius it was drawn.
+#:
+#: The votes are counted on the device now, both for where a centre is and for
+#: how far its edge sits, and a vote landing one accumulator cell over is the
+#: way that goes wrong -- silently, as a circle that is no longer found.
+fn test_hough_finds_the_circle_it_was_given() -> void {
+    if not gpu.is_available() { return }
+    let side = 80
+    let centre = float(side / 2)
+    let drawn = 20.0
+    var values: list[float] = []
+    for y in 0..side {
+        for x in 0..side {
+            let dx = float(x) - centre
+            let dy = float(y) - centre
+            let radius = math.sqrt(dx * dx + dy * dy)
+            values.push(if radius > drawn - 2.0 and radius < drawn + 2.0 { 255.0 } else { 0.0 })
+        }
+    }
+    let image = Mat.from_list(side, side, CV_32FC1, values)
+    defer { image.release() }
+    let found = hough_circles(image, 1.0, 10.0, 100.0, 20.0, 10, 30)
+    assert_eq(found.len(), 1, "one ring should come back as one circle")
+    assert_near(found[0].centre.x, centre, 2.0, "the centre is where it was drawn")
+    assert_near(found[0].centre.y, centre, 2.0, "the centre is where it was drawn")
+    assert_near(found[0].radius, drawn, 2.0, "the radius is what it was drawn at")
 }

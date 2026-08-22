@@ -43,6 +43,87 @@ pub const HOUGH_PROBABILISTIC = 1
 pub const HOUGH_GRADIENT = 3
 
 let SOURCE = PRELUDE + """
+/* The circle vote: every edge pixel walks the gradient both ways, dropping a
+ * vote at each radius for where a centre could be.
+ *
+ * Up to twice the picture's width of radii per edge pixel, which on the host is
+ * hundreds of millions of steps -- 24.7 seconds for a 640 by 480 frame. Each
+ * pixel is independent and the votes are atomic, as in `hough_accumulate`.
+ *
+ * `mask` records which pixels counted as edges, because the radius estimate
+ * later needs to walk exactly those. */
+kernel void hough_circle_vote(device const float* gradient_x [[buffer(0)]],
+                              device const float* gradient_y [[buffer(1)]],
+                              device atomic_uint* accumulator [[buffer(2)]],
+                              device float* mask [[buffer(3)]],
+                              constant uint& count [[buffer(4)]],
+                              constant uint& cols [[buffer(5)]],
+                              constant uint& acc_rows [[buffer(6)]],
+                              constant uint& acc_cols [[buffer(7)]],
+                              constant uint& lower [[buffer(8)]],
+                              constant uint& upper [[buffer(9)]],
+                              constant uint& dp_bits [[buffer(10)]],
+                              constant uint& floor_bits [[buffer(11)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    mask[id] = 0.0f;
+    float gx = gradient_x[id];
+    float gy = gradient_y[id];
+    float strength = sqrt(gx * gx + gy * gy);
+    if (strength < as_type<float>(floor_bits)) return;
+    mask[id] = 1.0f;
+
+    float dp = as_type<float>(dp_bits);
+    uint y = id / cols;
+    uint x = id - y * cols;
+    float ux = gx / strength;
+    float uy = gy / strength;
+    for (uint direction = 0u; direction < 2u; ++direction) {
+        float sign = direction == 0u ? 1.0f : -1.0f;
+        for (uint radius = lower; radius < upper; ++radius) {
+            /* Fused, not `x + u * r`. The host walks these in double and this
+             * in single, and the intermediate rounding of a separate multiply
+             * and add is enough to drop a vote in the neighbouring cell --
+             * which on a marginal threshold loses whole circles. One rounding
+             * instead of two puts the two back in step. */
+            float cx = fma(sign * ux, float(radius), float(x));
+            float cy = fma(sign * uy, float(radius), float(y));
+            int ax = int(cx / dp);
+            int ay = int(cy / dp);
+            if (ax < 0 || ay < 0 || ax >= int(acc_cols) || ay >= int(acc_rows)) break;
+            device atomic_uint *cell = &accumulator[uint(ay) * acc_cols + uint(ax)];
+            atomic_fetch_add_explicit(cell, 1u, memory_order_relaxed);
+        }
+    }
+}
+
+/* Which radius the edge pixels around one centre agree on.
+ *
+ * Run once per surviving centre, over the whole picture, skipping what the
+ * vote pass did not mark as an edge. On the host this is centres times edges,
+ * and with a textured frame that is the larger half of what `hough_circles`
+ * costs. */
+kernel void hough_radius_vote(device const float* mask [[buffer(0)]],
+                              device atomic_uint* votes [[buffer(1)]],
+                              constant uint& count [[buffer(2)]],
+                              constant uint& cols [[buffer(3)]],
+                              constant uint& lower [[buffer(4)]],
+                              constant uint& upper [[buffer(5)]],
+                              constant uint& cx_bits [[buffer(6)]],
+                              constant uint& cy_bits [[buffer(7)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    if (mask[id] == 0.0f) return;
+    float cx = as_type<float>(cx_bits);
+    float cy = as_type<float>(cy_bits);
+    uint ey = id / cols;
+    uint ex = id - ey * cols;
+    float gap = sqrt((float(ex) - cx) * (float(ex) - cx) + (float(ey) - cy) * (float(ey) - cy));
+    int radius = int(gap + 0.5f);
+    if (radius < int(lower) || radius > int(upper)) return;
+    atomic_fetch_add_explicit(&votes[uint(radius)], 1u, memory_order_relaxed);
+}
+
 /* The Hough vote, a pixel to a thread.
  *
  * Every edge pixel votes for every angle, and the votes land wherever the
@@ -844,29 +925,26 @@ pub fn hough_circles(
     let lower = max(min_radius, 1)
     let edge_floor = param1 * 0.5
 
+    let cells = acc_rows * acc_cols
+    let votes_buffer = Buffer(cells)
+    votes_buffer.fill_zero()
+    let mask_buffer = Buffer(rows * cols)
+    kernel_for("hough_circle_vote").dispatch_async(
+        [dx.storage, dy.storage, votes_buffer, mask_buffer],
+        rows * cols,
+        [rows * cols, cols, acc_rows, acc_cols, lower, upper, f32_bits(dp), f32_bits(edge_floor)]
+    )
+    let counted_buffer = Buffer(cells)
+    kernel_for("hough_collect").dispatch_async([votes_buffer, counted_buffer], cells, [cells])
+    let counted = counted_buffer.download()
+    for index in 0..cells { accumulator[index] = int(counted[index] + 0.5) }
+    let flags = mask_buffer.download()
     var edges: list[int] = []
-    for y in 0..rows {
-        for x in 0..cols {
-            let gx = gradient_x[y * cols + x]
-            let gy = gradient_y[y * cols + x]
-            let strength = math.sqrt(gx * gx + gy * gy)
-            if strength < edge_floor { continue }
-            edges.push(y * cols + x)
-            let ux = gx / strength
-            let uy = gy / strength
-            for direction in 0..2 {
-                let sign = if direction == 0 { 1.0 } else { -1.0 }
-                for radius in lower..upper {
-                    let cx = float(x) + sign * ux * float(radius)
-                    let cy = float(y) + sign * uy * float(radius)
-                    let ax = int(cx / dp)
-                    let ay = int(cy / dp)
-                    if ax < 0 or ay < 0 or ax >= acc_cols or ay >= acc_rows { break }
-                    accumulator[ay * acc_cols + ax] += 1
-                }
-            }
-        }
+    for index in 0..rows * cols {
+        if flags[index] != 0.0 { edges.push(index) }
     }
+    votes_buffer.free()
+    counted_buffer.free()
 
     var centres: list[int] = []
     for y in 1..acc_rows - 1 {
@@ -911,24 +989,29 @@ pub fn hough_circles(
 
         #: The radius is whichever distance the most edge pixels around this
         #: centre agree on.
-        var votes: list[int] = []
-        for _index in 0..upper + 1 { votes.push(0) }
-        for edge in edges {
-            let ey = edge // cols
-            let ex = edge - ey * cols
-            let gap = math.sqrt(
-                (float(ex) - cx) * (float(ex) - cx) + (float(ey) - cy) * (float(ey) - cy)
-            )
-            let radius = int(gap + 0.5)
-            if radius < lower or radius > upper { continue }
-            votes[radius] += 1
-        }
+        let radius_buffer = Buffer(upper + 1)
+        radius_buffer.fill_zero()
+        kernel_for("hough_radius_vote").dispatch_async(
+            [mask_buffer, radius_buffer],
+            rows * cols,
+            [rows * cols, cols, lower, upper, f32_bits(cx), f32_bits(cy)]
+        )
+        let radius_counts = Buffer(upper + 1)
+        kernel_for("hough_collect").dispatch_async(
+            [radius_buffer, radius_counts],
+            upper + 1,
+            [upper + 1]
+        )
+        let votes = radius_counts.download()
+        radius_buffer.free()
+        radius_counts.free()
         var best = lower
         for radius in lower..upper + 1 {
             if votes[radius] > votes[best] { best = radius }
         }
-        if votes[best] == 0 { continue }
+        if votes[best] == 0.0 { continue }
         out.push(HoughCircle(Point2f(cx, cy), float(best), accumulator[cell]))
     }
+    mask_buffer.free()
     return out
 }
