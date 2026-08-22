@@ -10,6 +10,35 @@ let BASE_SOURCE = """#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
+/* Total `value` over a whole threadgroup, handing every thread the answer.
+ *
+ * The statistics a normalisation needs are sums over an axis that is not the
+ * one being written: a channel mean runs over the batch and every pixel. Giving
+ * each of those outputs one thread leaves a GPU running a whole tensor's work
+ * on as many threads as there are channels. A threadgroup strides the axis
+ * instead and reduces through this.
+ *
+ * `lanes` must hold 32 floats, and the group must be 1024 threads or fewer, so
+ * that one entry per simdgroup fits. Barriered at both ends, so the same
+ * scratch can carry the next reduction. */
+static inline float group_total(
+    float value,
+    threadgroup float *lanes,
+    uint lid,
+    uint lane,
+    uint warp
+) {
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    value = simd_sum(value);
+    if (lane == 0u) lanes[warp] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint j = 0u; j < 32u; j++) total += lanes[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
 kernel void binary_op(device const float* a [[buffer(0)]],
                       device const float* b [[buffer(1)]],
                       device float* output [[buffer(2)]],
@@ -70,21 +99,57 @@ kernel void matrix_transpose(device const float* input [[buffer(0)]],
     output[column * rows + row] = input[id];
 }
 
+/* A threadgroup to the row, the same shape as the normalisation above and for
+ * the same reason: a thread per row runs a classifier head over as many
+ * threads as the batch has rows, whatever the row's width. */
 kernel void row_softmax(device const float* input [[buffer(0)]],
                         device float* output [[buffer(1)]],
                         constant uint& rows [[buffer(2)]],
                         constant uint& columns [[buffer(3)]],
-                        uint row [[thread_position_in_grid]]) {
+                        uint row [[threadgroup_position_in_grid]],
+                        uint lid [[thread_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
-    uint base = row * columns;
-    float peak = input[base];
-    for (uint column = 1; column < columns; ++column)
-        peak = max(peak, input[base + column]);
+    const uint GROUP = 256u;
+    const uint base = row * columns;
+    const float floor_value = -3.402823e+38f;
+    threadgroup float lanes[32];
+    threadgroup float shared_peak;
+    threadgroup float shared_total;
+
+    float peak = floor_value;
+    for (uint i = lid; i < columns; i += GROUP) peak = max(peak, input[base + i]);
+    if (lid < 32u) lanes[lid] = floor_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    peak = simd_max(peak);
+    if (lane == 0u) lanes[warp] = peak;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float m = floor_value;
+        for (uint j = 0u; j < 32u; j++) m = max(m, lanes[j]);
+        shared_peak = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float m = shared_peak;
+
     float total = 0.0f;
-    for (uint column = 0; column < columns; ++column)
-        total += exp(input[base + column] - peak);
-    for (uint column = 0; column < columns; ++column)
-        output[base + column] = exp(input[base + column] - peak) / total;
+    for (uint i = lid; i < columns; i += GROUP) total += exp(input[base + i] - m);
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_total = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float denominator = shared_total;
+
+    for (uint i = lid; i < columns; i += GROUP)
+        output[base + i] = exp(input[base + i] - m) / denominator;
 }
 
 kernel void row_max(device const float* input [[buffer(0)]],
@@ -288,13 +353,33 @@ kernel void softmax_backward(device const float* output [[buffer(0)]],
                              device float* grad_input [[buffer(2)]],
                              constant uint& rows [[buffer(3)]],
                              constant uint& columns [[buffer(4)]],
-                             uint row [[thread_position_in_grid]]) {
+                             uint row [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
-    uint base = row * columns;
+    const uint GROUP = 256u;
+    const uint base = row * columns;
+    threadgroup float lanes[32];
+    threadgroup float shared_dot;
+
     float dot = 0.0f;
-    for (uint column = 0; column < columns; ++column) dot += upstream[base + column] * output[base + column];
-    for (uint column = 0; column < columns; ++column)
-        grad_input[base + column] = output[base + column] * (upstream[base + column] - dot);
+    for (uint i = lid; i < columns; i += GROUP) dot += upstream[base + i] * output[base + i];
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    dot = simd_sum(dot);
+    if (lane == 0u) lanes[warp] = dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_dot = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shared_dot;
+
+    for (uint i = lid; i < columns; i += GROUP)
+        grad_input[base + i] = output[base + i] * (upstream[base + i] - total);
 }
 
 kernel void copy_offset(device const float* source [[buffer(0)]],
@@ -708,14 +793,19 @@ kernel void norm_channel_sums(device const float* input [[buffer(0)]],
                               device float* grad_beta [[buffer(8)]],
                               constant uint& nspatial [[buffer(9)]],
                               constant uint& channels [[buffer(10)]],
-                              uint c [[thread_position_in_grid]]) {
+                              uint c [[threadgroup_position_in_grid]],
+                              uint lid [[thread_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint warp [[simdgroup_index_in_threadgroup]]) {
     if (c >= channels) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
     float inv = rsqrt(variance[c] + 1e-5f);
     float dy_total = 0.0f;
     float dy_xhat = 0.0f;
     float g = 0.0f;
     float b = 0.0f;
-    for (uint i = 0; i < nspatial; ++i) {
+    for (uint i = lid; i < nspatial; i += GROUP) {
         uint slot = i * channels + c;
         float xhat = (input[slot] - mean[c]) * inv;
         float up = upstream[slot];
@@ -725,6 +815,11 @@ kernel void norm_channel_sums(device const float* input [[buffer(0)]],
         g += up * xhat;
         b += up;
     }
+    dy_total = group_total(dy_total, lanes, lid, lane, warp);
+    dy_xhat = group_total(dy_xhat, lanes, lid, lane, warp);
+    g = group_total(g, lanes, lid, lane, warp);
+    b = group_total(b, lanes, lid, lane, warp);
+    if (lid != 0u) return;
     sum_dy[c] = dy_total;
     sum_dy_xhat[c] = dy_xhat;
     grad_gamma[c] = g;
@@ -768,15 +863,20 @@ kernel void group_norm_sums(device const float* input [[buffer(0)]],
                             constant uint& spatial [[buffer(8)]],
                             constant uint& C [[buffer(9)]],
                             constant uint& groups [[buffer(10)]],
-                            uint id [[thread_position_in_grid]]) {
+                            uint id [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint warp [[simdgroup_index_in_threadgroup]]) {
     if (id >= N * groups) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
     uint gs = C / groups;
     uint n = id / groups;
     uint g = id % groups;
     float inv = rsqrt(variance[id] + 1e-5f);
     float dy_total = 0.0f;
     float dy_xhat = 0.0f;
-    for (uint hw = 0; hw < spatial; ++hw) {
+    for (uint hw = lid; hw < spatial; hw += GROUP) {
         uint base = (n * spatial + hw) * C + g * gs;
         for (uint k = 0; k < gs; ++k) {
             float xhat = (input[base + k] - mean[id]) * inv;
@@ -785,6 +885,9 @@ kernel void group_norm_sums(device const float* input [[buffer(0)]],
             dy_xhat += dy * xhat;
         }
     }
+    dy_total = group_total(dy_total, lanes, lid, lane, warp);
+    dy_xhat = group_total(dy_xhat, lanes, lid, lane, warp);
+    if (lid != 0u) return;
     sum_dy[id] = dy_total;
     sum_dy_xhat[id] = dy_xhat;
 }
@@ -799,12 +902,17 @@ kernel void channel_params_backward(device const float* input [[buffer(0)]],
                                     constant uint& channels [[buffer(7)]],
                                     constant uint& spatial [[buffer(8)]],
                                     constant uint& groups [[buffer(9)]],
-                                    uint c [[thread_position_in_grid]]) {
+                                    uint c [[threadgroup_position_in_grid]],
+                                    uint lid [[thread_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint warp [[simdgroup_index_in_threadgroup]]) {
     if (c >= channels) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
     uint gs = groups == 0u ? 0u : channels / groups;
     float g = 0.0f;
     float b = 0.0f;
-    for (uint i = 0; i < nspatial; ++i) {
+    for (uint i = lid; i < nspatial; i += GROUP) {
         uint slot = i * channels + c;
         uint pick = c;
         if (groups != 0u) {
@@ -816,6 +924,9 @@ kernel void channel_params_backward(device const float* input [[buffer(0)]],
         g += upstream[slot] * xhat;
         b += upstream[slot];
     }
+    g = group_total(g, lanes, lid, lane, warp);
+    b = group_total(b, lanes, lid, lane, warp);
+    if (lid != 0u) return;
     grad_gamma[c] = g;
     grad_beta[c] = b;
 }
@@ -901,15 +1012,23 @@ kernel void moments_channel(device const float* input [[buffer(0)]],
                             device float* variance [[buffer(2)]],
                             constant uint& nspatial [[buffer(3)]],
                             constant uint& channels [[buffer(4)]],
-                            uint c [[thread_position_in_grid]]) {
+                            uint c [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint warp [[simdgroup_index_in_threadgroup]]) {
     if (c >= channels) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
     float total = 0.0f;
     float sq = 0.0f;
-    for (uint i = 0; i < nspatial; ++i) {
+    for (uint i = lid; i < nspatial; i += GROUP) {
         float v = input[i * channels + c];
         total += v;
         sq += v * v;
     }
+    total = group_total(total, lanes, lid, lane, warp);
+    sq = group_total(sq, lanes, lid, lane, warp);
+    if (lid != 0u) return;
     float m = total / float(nspatial);
     mean[c] = m;
     variance[c] = sq / float(nspatial) - m * m;
@@ -1395,15 +1514,20 @@ kernel void moments_group(device const float* input [[buffer(0)]],
                           constant uint& spatial [[buffer(4)]],
                           constant uint& C [[buffer(5)]],
                           constant uint& groups [[buffer(6)]],
-                          uint id [[thread_position_in_grid]]) {
+                          uint id [[threadgroup_position_in_grid]],
+                          uint lid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint warp [[simdgroup_index_in_threadgroup]]) {
     if (id >= N * groups) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
     uint gs = C / groups;
     uint n = id / groups;
     uint g = id % groups;
     uint count = spatial * gs;
     float total = 0.0f;
     float sq = 0.0f;
-    for (uint hw = 0; hw < spatial; ++hw) {
+    for (uint hw = lid; hw < spatial; hw += GROUP) {
         uint base = (n * spatial + hw) * C + g * gs;
         for (uint c = 0; c < gs; ++c) {
             float v = input[base + c];
@@ -1411,6 +1535,9 @@ kernel void moments_group(device const float* input [[buffer(0)]],
             sq += v * v;
         }
     }
+    total = group_total(total, lanes, lid, lane, warp);
+    sq = group_total(sq, lanes, lid, lane, warp);
+    if (lid != 0u) return;
     float m = total / float(count);
     mean[id] = m;
     variance[id] = sq / float(count) - m * m;
@@ -3231,12 +3358,17 @@ pub fn softmax(input: Tensor) -> Tensor {
     let columns = input.shape[1]
     let output = Tensor(input.shape)
     let kernel = cached_kernel("row_softmax")
-    kernel.dispatch_async([input.buffer(), output.buffer()], rows, [rows, columns])
+    kernel.dispatch_async(
+        [input.buffer(), output.buffer()],
+        rows * 256,
+        [rows, columns],
+        group_size: 256
+    )
     if input.requires_grad {
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
             let grad_input = Tensor(input.shape)
             let backward_kernel = cached_kernel("softmax_backward")
-            backward_kernel.dispatch_async([output.buffer(), upstream.buffer(), grad_input.buffer()], rows, [rows, columns])
+            backward_kernel.dispatch_async([output.buffer(), upstream.buffer(), grad_input.buffer()], rows * 256, [rows, columns], group_size: 256)
             return [grad_input]
         }))
     }
@@ -3739,8 +3871,9 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
     let moments = cached_kernel("moments_channel")
     moments.dispatch_async(
         [input.buffer(), mean.buffer(), variance.buffer()],
-        channels,
-        [nspatial, channels]
+        channels * 256,
+        [nspatial, channels],
+        group_size: 256
     )
     let output = Tensor(input.shape)
     let kernel = cached_kernel("batch_norm_forward")
@@ -3763,7 +3896,7 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
             let grad_gamma = Tensor([channels])
             let grad_beta = Tensor([channels])
             let sums = cached_kernel("norm_channel_sums")
-            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels, [nspatial, channels])
+            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels * 256, [nspatial, channels], group_size: 256)
             let grad_input = Tensor(input.shape)
             let back = cached_kernel("norm_channel_backward")
             back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial])
@@ -4069,8 +4202,9 @@ pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Te
     let moments = cached_kernel("moments_group")
     moments.dispatch_async(
         [input.buffer(), mean.buffer(), variance.buffer()],
-        slots,
-        [n, spatial, c, groups]
+        slots * 256,
+        [n, spatial, c, groups],
+        group_size: 256
     )
     let output = Tensor(input.shape)
     let kernel = cached_kernel("group_norm_forward")
@@ -4091,14 +4225,14 @@ pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Te
             let sum_dy = Tensor([slots])
             let sum_dy_xhat = Tensor([slots])
             let sums = cached_kernel("group_norm_sums")
-            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer()], slots, [n, spatial, c, groups])
+            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer()], slots * 256, [n, spatial, c, groups], group_size: 256)
             let grad_input = Tensor(input.shape)
             let back = cached_kernel("group_norm_backward")
             back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, spatial, c, groups])
             let grad_gamma = Tensor([c])
             let grad_beta = Tensor([c])
             let params = cached_kernel("channel_params_backward")
-            params.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], c, [n * spatial, c, spatial, groups])
+            params.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], c * 256, [n * spatial, c, spatial, groups], group_size: 256)
             sum_dy.free()
             sum_dy_xhat.free()
             return [grad_input, grad_gamma, grad_beta]
