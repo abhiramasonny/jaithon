@@ -2291,3 +2291,56 @@ fn test_max_with_index_refuses_an_axis_it_has_no_kernel_for() -> void {
     defer { input.free() }
     assert_throws(ValueError, || jt.max_with_index(input, axis: 2))
 }
+
+#: A row wider than the threadgroup, checked against arithmetic done here.
+#:
+#: The kernel spreads a row across 256 threads and brings the two sums back
+#: through a simd reduction, so a row narrower than that never exercises the
+#: striding or the second stage of the reduction. Widths either side of 256 and
+#: of a warp are the ones that catch a reduction wired up wrongly.
+fn test_layer_norm_matches_arithmetic_over_wide_rows() -> void {
+    if not jt.is_available() { return }
+    for width in [17, 32, 33, 256, 257, 768] {
+        let rows = 3
+        var values: list[float] = []
+        for index in 0..rows * width {
+            values.push(float(index * 31 % 97 - 48) * 0.125)
+        }
+        var scales: list[float] = []
+        var shifts: list[float] = []
+        for index in 0..width {
+            scales.push(1.0 + float(index % 5) * 0.25)
+            shifts.push(float(index % 7) * 0.5 - 1.5)
+        }
+        let x = jt.Tensor([rows, width], values)
+        let gamma = jt.Tensor([width], scales)
+        let beta = jt.Tensor([width], shifts)
+        let y = jt.layer_norm(x, gamma, beta)
+        let got = y.download()
+        for row in 0..rows {
+            var total = 0.0
+            for column in 0..width { total += values[row * width + column] }
+            let mean = total / float(width)
+            var square = 0.0
+            for column in 0..width {
+                let gap = values[row * width + column] - mean
+                square += gap * gap
+            }
+            let inverse = 1.0 / math.sqrt(square / float(width) + 1e-5)
+            for column in 0..width {
+                let centred = values[row * width + column] - mean
+                let want = scales[column] * centred * inverse + shifts[column]
+                assert_near(
+                    got[row * width + column],
+                    want,
+                    1e-3,
+                    f"width {width} at {row},{column}"
+                )
+            }
+        }
+        x.free()
+        gamma.free()
+        beta.free()
+        y.free()
+    }
+}
