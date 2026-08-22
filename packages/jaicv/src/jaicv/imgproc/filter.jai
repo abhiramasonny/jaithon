@@ -79,30 +79,67 @@ kernel void filter_2d(device const float* src [[buffer(0)]],
 /* Separable filtering runs the row pass and the column pass in one kernel:
  * for the window sizes an image filter uses, one dispatch that reads a
  * neighbourhood twice beats two dispatches through device memory. */
-kernel void filter_separable(device const float* src [[buffer(0)]],
-                             device float* dst [[buffer(1)]],
-                             device const float* row_weights [[buffer(2)]],
-                             device const float* col_weights [[buffer(3)]],
-                             constant uint& count [[buffer(4)]],
-                             constant uint& rows [[buffer(5)]],
-                             constant uint& cols [[buffer(6)]],
-                             constant uint& cn [[buffer(7)]],
-                             constant uint& src_off [[buffer(8)]],
-                             constant uint& src_step [[buffer(9)]],
-                             constant uint& dst_off [[buffer(10)]],
-                             constant uint& dst_step [[buffer(11)]],
-                             constant uint& row_len [[buffer(12)]],
-                             constant uint& col_len [[buffer(13)]],
-                             constant uint& anchor_y [[buffer(14)]],
-                             constant uint& anchor_x [[buffer(15)]],
-                             constant uint& row_off [[buffer(16)]],
-                             constant uint& col_off [[buffer(17)]],
-                             constant uint& border [[buffer(18)]],
-                             constant uint& delta_bits [[buffer(19)]],
-                             constant uint& low_bits [[buffer(20)]],
-                             constant uint& high_bits [[buffer(21)]],
-                             constant uint& integral [[buffer(22)]],
-                             uint id [[thread_position_in_grid]]) {
+/* A separable filter, run as the two passes that make it separable.
+ *
+ * This used to sweep the whole `col_len` by `row_len` window per output pixel,
+ * which is the work a general 2-D filter does and the work being separable is
+ * meant to avoid: a 5 by 5 Gaussian fetched twenty-five samples a pixel where
+ * ten will do, and a 15 by 15 fetched two hundred and twenty-five where thirty
+ * will.
+ *
+ * Splitting is exact here rather than approximate. The border modes jaicv
+ * offers -- replicate, reflect, wrap and a zero constant -- each extend the two
+ * axes independently, so extending x and then y lands on the same sample the
+ * two-dimensional fetch did. The intermediate stays float whatever the output
+ * depth, so rounding happens once, at the end, exactly as before. */
+kernel void filter_separable_row(device const float* src [[buffer(0)]],
+                                 device float* tmp [[buffer(1)]],
+                                 device const float* row_weights [[buffer(2)]],
+                                 constant uint& count [[buffer(3)]],
+                                 constant uint& rows [[buffer(4)]],
+                                 constant uint& cols [[buffer(5)]],
+                                 constant uint& cn [[buffer(6)]],
+                                 constant uint& src_off [[buffer(7)]],
+                                 constant uint& src_step [[buffer(8)]],
+                                 constant uint& row_len [[buffer(9)]],
+                                 constant uint& anchor_x [[buffer(10)]],
+                                 constant uint& row_off [[buffer(11)]],
+                                 constant uint& border [[buffer(12)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint channel = id % cn;
+    uint pixel = id / cn;
+    uint y = pixel / cols;
+    uint x = pixel - y * cols;
+    float run = 0.0f;
+    for (uint kx = 0; kx < row_len; ++kx) {
+        float wx = row_weights[row_off + kx];
+        if (wx == 0.0f) continue;
+        int sx = int(x) + int(kx) - int(anchor_x);
+        run += wx * fetch(src, int(y), sx, channel, rows, cols, cn,
+                          src_off, src_step, border, 0.0f);
+    }
+    tmp[id] = run;
+}
+
+kernel void filter_separable_col(device const float* tmp [[buffer(0)]],
+                                 device float* dst [[buffer(1)]],
+                                 device const float* col_weights [[buffer(2)]],
+                                 constant uint& count [[buffer(3)]],
+                                 constant uint& rows [[buffer(4)]],
+                                 constant uint& cols [[buffer(5)]],
+                                 constant uint& cn [[buffer(6)]],
+                                 constant uint& dst_off [[buffer(7)]],
+                                 constant uint& dst_step [[buffer(8)]],
+                                 constant uint& col_len [[buffer(9)]],
+                                 constant uint& anchor_y [[buffer(10)]],
+                                 constant uint& col_off [[buffer(11)]],
+                                 constant uint& border [[buffer(12)]],
+                                 constant uint& delta_bits [[buffer(13)]],
+                                 constant uint& low_bits [[buffer(14)]],
+                                 constant uint& high_bits [[buffer(15)]],
+                                 constant uint& integral [[buffer(16)]],
+                                 uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint channel = id % cn;
     uint pixel = id / cn;
@@ -113,15 +150,10 @@ kernel void filter_separable(device const float* src [[buffer(0)]],
         float wy = col_weights[col_off + ky];
         if (wy == 0.0f) continue;
         int sy = int(y) + int(ky) - int(anchor_y);
-        float run = 0.0f;
-        for (uint kx = 0; kx < row_len; ++kx) {
-            float wx = row_weights[row_off + kx];
-            if (wx == 0.0f) continue;
-            int sx = int(x) + int(kx) - int(anchor_x);
-            run += wx * fetch(src, sy, sx, channel, rows, cols, cn,
-                              src_off, src_step, border, 0.0f);
-        }
-        total += wy * run;
+        /* The intermediate is packed, so it is its own plane: no offset, a step
+         * of `cols * cn`, and the row border applied to it as to the source. */
+        total += wy * fetch(tmp, sy, int(x), channel, rows, cols, cn,
+                            0u, cols * cn, border, 0.0f);
     }
     put(dst, dst_off + y * dst_step + x * cn + channel, total,
         as_type<float>(low_bits), as_type<float>(high_bits), integral);
@@ -316,30 +348,46 @@ pub fn sep_filter_2d(
     let out = Mat(src.rows, src.cols, destination_type(src, ddepth))
     let count = src.rows * src.cols * src.channels()
     if count == 0 { return out }
+    #: Packed and always float, whatever the output depth: the two passes have
+    #: to hand each other unrounded values, and rounding once at the end is what
+    #: the single-pass version did.
+    let middle = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, src.channels()))
+    kernel_for("filter_separable_row").dispatch_async(
+        [src.storage, middle.storage, kernel_x.storage],
+        count,
+        [
+            count,
+            src.rows,
+            src.cols,
+            src.channels(),
+            src.offset,
+            src.step_,
+            row_len,
+            anchor_x,
+            kernel_x.offset,
+            border_mode,
+        ]
+    )
     var scalars = [
         count,
         src.rows,
         src.cols,
         src.channels(),
-        src.offset,
-        src.step_,
         out.offset,
         out.step_,
-        row_len,
         col_len,
         anchor_y,
-        anchor_x,
-        kernel_x.offset,
         kernel_y.offset,
         border_mode,
         f32_bits(delta),
     ]
     for value in saturation_args(out.flags) { scalars.push(value) }
-    kernel_for("filter_separable").dispatch_async(
-        [src.storage, out.storage, kernel_x.storage, kernel_y.storage],
+    kernel_for("filter_separable_col").dispatch_async(
+        [middle.storage, out.storage, kernel_y.storage],
         count,
         scalars
     )
+    middle.release()
     out.invalidate()
     return out
 }
