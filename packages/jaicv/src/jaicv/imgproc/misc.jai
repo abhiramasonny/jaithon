@@ -9,6 +9,7 @@
 #: let (shift, response) = phase_correlate(previous, current)
 #: ```
 import std.math
+from std.algo.sort import natural_order, sort_by
 from std.gpu import Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scalar, Size
@@ -657,14 +658,14 @@ fn convex_of(points: list[Point2f]) -> list[Point2f] {
     #: Andrew's monotone chain, on floats, because the hull is what the search
     #: above walks and the points here are not on whole pixels.
     var sorted: list[Point2f] = []
-    for point in points {
-        var at = sorted.len()
-        while at > 0 and
-            (point.x < sorted[at - 1].x or point.x == sorted[at - 1].x and point.y < sorted[at - 1].y) {
-            at -= 1
-        }
-        sorted.insert(at, point)
-    }
+    #: By x, and by y where the x agree. Inserting each point into a list
+    #: already in order costs the square of how many there are, and a hull is
+    #: often asked for over a whole contour.
+    sorted = sort_by(points, |a, b| if a.x != b.x {
+        natural_order(a.x, b.x)
+    } else {
+        natural_order(a.y, b.y)
+    })
     if sorted.len() < 3 { return sorted }
 
     var lower: list[Point2f] = []
