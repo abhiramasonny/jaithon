@@ -611,6 +611,10 @@ static bool primListPush3(int argc, Value *args, Value *out) {
  *
  * `emit` is what to do with a pixel, which is the only thing that differs
  * between drawing on the host and batching rows for the device. */
+/* Truncating toward zero, which is what jaicv's `trunc_div` computes with its
+ * floor division plus a correction, and what C's `/` already does. */
+static int64_t truncDiv(int64_t a, int64_t b) { return a / b; }
+
 typedef struct {
     int x, y;
     int dx, dy;
@@ -650,28 +654,102 @@ static bool lineWalk(const JaiLineWalk *w, bool (*emit)(void *at, int x, int y),
     return true;
 }
 
-/* Read the eight numbers every line primitive here takes, plus the frame it is
- * being clipped against. */
-static bool readWalk(Value *args, int first, const char *fnName, JaiLineWalk *w,
-                     int64_t *cols, int64_t *rows) {
-    int64_t got[11];
-    for (int i = 0; i < 11; i++) {
+/* Clip a segment to the frame and settle which axis leads, the way jaicv's
+ * `clip_line` and `line_points` do between them.
+ *
+ * Cohen-Sutherland with OpenCV's exact arithmetic, including that the segment
+ * is normalised left to right *after* clipping rather than before -- clipping
+ * first is what makes a line come out the same whichever end the caller names,
+ * and doing it the other way round rounds ties differently on any segment that
+ * runs right to left. Returns false when none of it shows. */
+static bool clipAndOrient(int64_t cols, int64_t rows, int64_t x1, int64_t y1,
+                          int64_t x2, int64_t y2, int connectivity, JaiLineWalk *w) {
+    if (cols <= 0 || rows <= 0) return false;
+    const int64_t right = cols - 1;
+    const int64_t bottom = rows - 1;
+
+    int c1 = (x1 < 0 ? 1 : 0) + (x1 > right ? 2 : 0) + (y1 < 0 ? 4 : 0) + (y1 > bottom ? 8 : 0);
+    int c2 = (x2 < 0 ? 1 : 0) + (x2 > right ? 2 : 0) + (y2 < 0 ? 4 : 0) + (y2 > bottom ? 8 : 0);
+
+    if ((c1 & c2) == 0 && (c1 | c2) != 0) {
+        if (c1 & 12) {
+            const int64_t a = c1 < 8 ? 0 : bottom;
+            x1 += truncDiv((a - y1) * (x2 - x1), y2 - y1);
+            y1 = a;
+            c1 = (x1 < 0 ? 1 : 0) + (x1 > right ? 2 : 0);
+        }
+        if (c2 & 12) {
+            const int64_t a = c2 < 8 ? 0 : bottom;
+            x2 += truncDiv((a - y2) * (x2 - x1), y2 - y1);
+            y2 = a;
+            c2 = (x2 < 0 ? 1 : 0) + (x2 > right ? 2 : 0);
+        }
+        if ((c1 & c2) == 0 && (c1 | c2) != 0) {
+            if (c1) {
+                const int64_t a = c1 == 1 ? 0 : right;
+                y1 += truncDiv((a - x1) * (y2 - y1), x2 - x1);
+                x1 = a;
+                c1 = 0;
+            }
+            if (c2) {
+                const int64_t a = c2 == 1 ? 0 : right;
+                y2 += truncDiv((a - x2) * (y2 - y1), x2 - x1);
+                x2 = a;
+                c2 = 0;
+            }
+        }
+    }
+    if ((c1 | c2) != 0) return false;
+
+    int64_t ax = x1, ay = y1, bx = x2, by = y2;
+    if (bx < ax || (bx == ax && by < ay)) {
+        ax = x2; ay = y2; bx = x1; by = y1;
+    }
+    int64_t dx = bx - ax;
+    int64_t dy = by - ay;
+    const int stepX = dx < 0 ? -1 : 1;
+    const int stepY = dy < 0 ? -1 : 1;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+
+    w->x = (int)ax;
+    w->y = (int)ay;
+    w->connectivity = connectivity;
+    if (dy > dx) {
+        w->dx = (int)dy;
+        w->dy = (int)dx;
+        w->majorX = 0;
+        w->majorY = stepY;
+        w->minorX = stepX;
+        w->minorY = 0;
+    } else {
+        w->dx = (int)dx;
+        w->dy = (int)dy;
+        w->majorX = stepX;
+        w->majorY = 0;
+        w->minorX = 0;
+        w->minorY = stepY;
+    }
+    return true;
+}
+
+/* Read a segment's two ends, the frame, and how the walk is connected.
+ * `shows` comes back false when the segment misses the frame entirely. */
+static bool readSegment(Value *args, int first, const char *fnName, JaiLineWalk *w,
+                        int64_t *cols, int64_t *rows, bool *shows) {
+    int64_t got[7];
+    for (int i = 0; i < 7; i++) {
         if (!jaiStrWantInt(args[first + i], fnName, "a coordinate", &got[i])) return false;
     }
-    w->x = (int)got[0];
-    w->y = (int)got[1];
-    w->dx = (int)got[2];
-    w->dy = (int)got[3];
-    w->majorX = (int)got[4];
-    w->majorY = (int)got[5];
-    w->minorX = (int)got[6];
-    w->minorY = (int)got[7];
-    w->connectivity = (int)got[8];
-    *cols = got[9];
-    *rows = got[10];
-    if (w->dx < 0 || w->dy < 0) {
-        return jaiThrow(vm.cValueError, "%s(): the deltas must not be negative", fnName);
+    *cols = got[4];
+    *rows = got[5];
+    const int64_t connectivity = got[6];
+    if (connectivity != 4 && connectivity != 8) {
+        return jaiThrow(vm.cValueError, "%s(): connectivity must be 4 or 8, got %lld",
+                        fnName, (long long)connectivity);
     }
+    *shows = clipAndOrient(*cols, *rows, got[0], got[1], got[2], got[3],
+                           (int)connectivity, w);
     return true;
 }
 
@@ -702,16 +780,20 @@ static bool spanSink(void *at, int x, int y) {
     return true;
 }
 
-/* `line_spans(pending, x, y, dx, dy, majorX, majorY, minorX, minorY,
- *  connectivity, cols, rows)` -- append one row per pixel of the line, and
- *  say how many. */
+/* `line_spans(pending, x1, y1, x2, y2, cols, rows, connectivity)` -- append
+ *  one row per pixel of the line, and say how many. */
 static bool primLineSpans(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *pending;
     if (!jaiArgList(args[0], 1, "line_spans", &pending)) return false;
     JaiLineWalk walk;
     int64_t cols, rows;
-    if (!readWalk(args, 1, "line_spans", &walk, &cols, &rows)) return false;
+    bool shows;
+    if (!readSegment(args, 1, "line_spans", &walk, &cols, &rows, &shows)) return false;
+    if (!shows) {
+        *out = INT_VAL(0);
+        return true;
+    }
 
     JaiSpanSink sink = {pending, cols, rows, 0, false, 1};
     lineWalk(&walk, spanSink, &sink);
@@ -739,8 +821,8 @@ static bool paintSink(void *at, int x, int y) {
     return true;
 }
 
-/* `line_paint(values, colour, cn, x, y, dx, dy, majorX, majorY, minorX,
- *  minorY, connectivity, cols, rows)` -- write the line into a host mirror. */
+/* `line_paint(values, colour, cn, x1, y1, x2, y2, cols, rows, connectivity)`
+ *  -- write the line into a host mirror. */
 static bool primLinePaint(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *values;
@@ -756,7 +838,12 @@ static bool primLinePaint(int argc, Value *args, Value *out) {
     }
     JaiLineWalk walk;
     int64_t cols, rows;
-    if (!readWalk(args, 3, "line_paint", &walk, &cols, &rows)) return false;
+    bool shows;
+    if (!readSegment(args, 3, "line_paint", &walk, &cols, &rows, &shows)) return false;
+    if (!shows) {
+        *out = OBJ_VAL(values);
+        return true;
+    }
 
     JaiPaintSink sink = {values, colour->items, cols, rows, (int)channels};
     lineWalk(&walk, paintSink, &sink);
@@ -778,13 +865,6 @@ static bool primLinePaint(int argc, Value *args, Value *out) {
  * is most of what drawing a frame of detections cost. */
 #define JAI_XY_SHIFT 16
 #define JAI_XY_ONE   (1 << JAI_XY_SHIFT)
-
-static int64_t truncDiv(int64_t a, int64_t b) {
-    int64_t quotient = a / b;
-    /* C already truncates toward zero, which is what the Jaithon helper's
-     * floor-plus-correction comes to. */
-    return quotient;
-}
 
 typedef struct {
     const int64_t *xs;
@@ -1132,8 +1212,8 @@ void jaiBytesRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "list_pack_argb", primListPackArgb,  2, 2);
     jaiStrDefinePrim(ns, "list_fill_pattern", primListFillPattern, 4, 4);
     jaiStrDefinePrim(ns, "list_push3",     primListPush3,     4, 4);
-    jaiStrDefinePrim(ns, "line_spans",     primLineSpans,    12, 12);
-    jaiStrDefinePrim(ns, "line_paint",     primLinePaint,    14, 14);
+    jaiStrDefinePrim(ns, "line_spans",     primLineSpans,     8, 8);
+    jaiStrDefinePrim(ns, "line_paint",     primLinePaint,    10, 10);
     jaiStrDefinePrim(ns, "convex_spans",   primConvexSpans,   7, 7);
     jaiStrDefinePrim(ns, "convex_paint",   primConvexPaint,   9, 9);
     jaiStrDefinePrim(ns, "bytes_new",      primBytesNew,      1, 1);

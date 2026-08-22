@@ -244,23 +244,19 @@ pub class Painter {
         }
     }
 
-    #: Every pixel of a walked line, in one call.
-    pub fn stroke(self, step: LineWalk, connectivity: int) -> void {
+    #: Every pixel of a one-wide line, clipped and walked in one call.
+    pub fn stroke(self, pt1: Point, pt2: Point, connectivity: int) -> void {
         let held = self.mirror
         if held is null {
             let added = __prim__.line_spans(
                 self.pending,
-                step.x,
-                step.y,
-                step.dx,
-                step.dy,
-                step.major_x,
-                step.major_y,
-                step.minor_x,
-                step.minor_y,
-                connectivity,
+                pt1.x,
+                pt1.y,
+                pt2.x,
+                pt2.y,
                 self.cols,
-                self.rows
+                self.rows,
+                connectivity
             )
             self.queued += added
             if self.widest < 1 { self.widest = 1 }
@@ -270,17 +266,13 @@ pub class Painter {
             held,
             self.colour,
             self.cn,
-            step.x,
-            step.y,
-            step.dx,
-            step.dy,
-            step.major_x,
-            step.major_y,
-            step.minor_x,
-            step.minor_y,
-            connectivity,
+            pt1.x,
+            pt1.y,
+            pt2.x,
+            pt2.y,
             self.cols,
-            self.rows
+            self.rows,
+            connectivity
         )
     }
 
@@ -521,80 +513,20 @@ fn walk(
     return out
 }
 
-#: A one-pixel line, walked in one call rather than a point at a time.
+#: A one-pixel line, drawn in one call rather than a point at a time.
 #:
-#: The clipping and the choice of major axis stay here, because they are done
-#: once and they are the subtle part; only the walk itself, which is one step
-#: per pixel, goes across. Building a point for each of those and then writing
-#: them one by one cost about a hundred nanoseconds a pixel, and the outlines
-#: of a detector's boxes are some four thousand pixels a frame.
+#: Clipping, the choice of major axis and the walk all happen on the other
+#: side. Building a point object for each pixel and then writing them one by
+#: one cost about a hundred nanoseconds a pixel, and a line of text is a few
+#: dozen strokes of them; leaving the clip here cost as much again in the call
+#: around each stroke. `clip_line` and `line_points` stay for callers who want
+#: the pixels themselves, and compute the same thing.
 fn draw_thin_line(painter: Painter, pt1: Point, pt2: Point, line_type: int) -> void {
     if line_type == LINE_AA {
         draw_line_aa(painter, pt1, pt2)
         return
     }
-    let connectivity = if line_type == LINE_4 { 4 } else { 8 }
-    let step = line_walk(Size(painter.cols, painter.rows), pt1, pt2, connectivity)
-    if step is null { return }
-    painter.stroke(step, connectivity)
-}
-
-#: A clipped line reduced to what the walk needs: where it starts, how far it
-#: goes on each axis, and which way each step moves.
-class LineWalk {
-    pub let x: int
-    pub let y: int
-    pub let dx: int
-    pub let dy: int
-    pub let major_x: int
-    pub let major_y: int
-    pub let minor_x: int
-    pub let minor_y: int
-
-    pub fn init(
-        self,
-        x: int,
-        y: int,
-        dx: int,
-        dy: int,
-        major_x: int,
-        major_y: int,
-        minor_x: int,
-        minor_y: int
-    ) {
-        self.x = x
-        self.y = y
-        self.dx = dx
-        self.dy = dy
-        self.major_x = major_x
-        self.major_y = major_y
-        self.minor_x = minor_x
-        self.minor_y = minor_y
-    }
-}
-
-#: Clip a segment and settle its major axis, or `null` when none of it shows.
-#: The arithmetic is `line_points`', so both put a line on the same pixels.
-fn line_walk(size: Size, pt1: Point, pt2: Point, connectivity: int) -> LineWalk? {
-    let (visible, clipped_a, clipped_b) = clip_line(size, pt1, pt2)
-    if not visible { return null }
-
-    var a = clipped_a
-    var b = clipped_b
-    if b.x < a.x or b.x == a.x and b.y < a.y {
-        a = clipped_b
-        b = clipped_a
-    }
-
-    var dx = b.x - a.x
-    var dy = b.y - a.y
-    let step_x = if dx < 0 { -1 } else { 1 }
-    let step_y = if dy < 0 { -1 } else { 1 }
-    if dx < 0 { dx = -dx }
-    if dy < 0 { dy = -dy }
-
-    if dy > dx { return LineWalk(a.x, a.y, dy, dx, 0, step_y, step_x, 0) }
-    return LineWalk(a.x, a.y, dx, dy, step_x, 0, 0, step_y)
+    painter.stroke(pt1, pt2, if line_type == LINE_4 { 4 } else { 8 })
 }
 
 fn draw_line_aa(painter: Painter, pt1: Point, pt2: Point) -> void {
