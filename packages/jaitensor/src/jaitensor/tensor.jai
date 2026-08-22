@@ -141,20 +141,22 @@ pub class Tensor {
 
     #: Replace all tensor values from the host.
     #:
-    #: Waits for queued kernels first so a GPU fill cannot race the memcpy.
+    #: Waits for the queued kernels that write this tensor, so a GPU fill
+    #: cannot race the memcpy. Work queued against anything else keeps running.
     pub fn upload(self, values: list[float]) -> void {
         self._check_live()
         if values.len() != self.size {
             throw ValueError(f"tensor upload has {values.len()} values, expected {self.size}")
         }
-        gpu.synchronize()
         self.storage.upload(values)
     }
 
     #: Copy all values to the host.
+    #:
+    #: Waits for the work that produced this tensor and no more, so reading one
+    #: result does not stall the batch queued behind it.
     pub fn download(self) -> list[float] {
         self._check_live()
-        gpu.synchronize()
         return self.storage.download()
     }
 

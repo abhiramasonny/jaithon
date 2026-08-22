@@ -240,7 +240,8 @@ pub class Sequential {
         self._build(features.shape[1])
         let raw = self._forward(features, training: false)
         let intermediates = raw.discard_graph()
-        gpu.synchronize()
+        #: Freeing parks the buffer for reuse and carries what is queued
+        #: against it along, so the next owner waits rather than this one.
         for tensor in intermediates { tensor.free() }
         raw.detach()
         let last = self.layers[self.layers.len() - 1]
