@@ -62,14 +62,27 @@ kernel void filter_2d(device const float* src [[buffer(0)]],
     uint y = pixel / cols;
     uint x = pixel - y * cols;
     float total = as_type<float>(delta_bits);
-    for (uint ky = 0; ky < kernel_rows; ++ky) {
-        int sy = int(y) + int(ky) - int(anchor_y);
-        for (uint kx = 0; kx < kernel_cols; ++kx) {
-            int sx = int(x) + int(kx) - int(anchor_x);
-            float w = weights[weights_off + ky * kernel_cols + kx];
-            if (w == 0.0f) continue;
-            total += w * fetch(src, sy, sx, channel, rows, cols, cn,
-                               src_off, src_step, border, 0.0f);
+    int top = int(y) - int(anchor_y);
+    int left = int(x) - int(anchor_x);
+    bool inside = top >= 0 && left >= 0 &&
+        top + int(kernel_rows) <= int(rows) && left + int(kernel_cols) <= int(cols);
+    if (inside) {
+        for (uint ky = 0; ky < kernel_rows; ++ky) {
+            uint at = src_off + uint(top + int(ky)) * src_step + uint(left) * cn + channel;
+            for (uint kx = 0; kx < kernel_cols; ++kx) {
+                float w = weights[weights_off + ky * kernel_cols + kx];
+                if (w != 0.0f) total += w * src[at];
+                at += cn;
+            }
+        }
+    } else {
+        for (uint ky = 0; ky < kernel_rows; ++ky) {
+            for (uint kx = 0; kx < kernel_cols; ++kx) {
+                float w = weights[weights_off + ky * kernel_cols + kx];
+                if (w == 0.0f) continue;
+                total += w * fetch(src, top + int(ky), left + int(kx), channel,
+                                   rows, cols, cn, src_off, src_step, border, 0.0f);
+            }
         }
     }
     put(dst, dst_off + y * dst_step + x * cn + channel, total,
