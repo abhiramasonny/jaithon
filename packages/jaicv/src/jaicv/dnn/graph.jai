@@ -1068,7 +1068,6 @@ fn count_readers(order: list[GraphNode], outputs: list[str]) -> dict[str, int] {
     return readers
 }
 
-
 #: Number of elements a shape holds.
 fn volume(shape: list[int]) -> int {
     var total = 1
@@ -2127,13 +2126,7 @@ fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             }
         }
         pieces.push(
-            jt.conv2d_nchw(
-                slice_in,
-                slice_w,
-                bias: slice_bias,
-                stride: step,
-                padding: inner_pad
-            )
+            jt.conv2d_nchw(slice_in, slice_w, bias: slice_bias, stride: step, padding: inner_pad)
         )
         if slice_in is not padded { slice_in.free() }
         if slice_bias is not null and slice_bias is not bias { slice_bias.free() }
@@ -2532,10 +2525,14 @@ fn op_lstm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
         )
     }
     if attr_int(node, "layout", 0) != 0 {
-        throw ValueError(f"{node.label()} uses the batch-first layout, which this executor does not read")
+        throw ValueError(
+            f"{node.label()} uses the batch-first layout, which this executor does not read"
+        )
     }
     if attr_int(node, "input_forget", 0) != 0 {
-        throw ValueError(f"{node.label()} couples its input and forget gates, which this executor does not")
+        throw ValueError(
+            f"{node.label()} couples its input and forget gates, which this executor does not"
+        )
     }
     if x.rank() != 3 { throw ValueError(f"{node.label()} needs a 3-D input, got {x.shape}") }
     if w.rank() != 3 or r.rank() != 3 {
@@ -2549,10 +2546,14 @@ fn op_lstm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let facing = attr_str(node, "direction", "forward")
     let wanted = if facing == "bidirectional" { 2 } else { 1 }
     if directions != wanted or r.shape[0] != directions {
-        throw ValueError(f"{node.label()} is {facing} but carries {directions} directions of weights")
+        throw ValueError(
+            f"{node.label()} is {facing} but carries {directions} directions of weights"
+        )
     }
     if w.shape[1] != 4 * hidden or r.shape[1] != 4 * hidden or r.shape[2] != hidden {
-        throw ValueError(f"{node.label()} has weights {w.shape} and {r.shape} for {hidden} hidden units")
+        throw ValueError(
+            f"{node.label()} has weights {w.shape} and {r.shape} for {hidden} hidden units"
+        )
     }
     if w.shape[2] != input_size {
         throw ValueError(f"{node.label()} has weights {w.shape} for {input_size} inputs")
@@ -2622,7 +2623,11 @@ fn op_lstm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     }
     flat_x.free()
 
-    let all_y = if sequences.len() == 1 { sequences[0] } else { concat_along(sequences, 1, node.label()) }
+    let all_y = if sequences.len() == 1 {
+        sequences[0]
+    } else {
+        concat_along(sequences, 1, node.label())
+    }
     let all_h = if last_h.len() == 1 { last_h[0] } else { concat_along(last_h, 0, node.label()) }
     let all_c = if last_c.len() == 1 { last_c[0] } else { concat_along(last_c, 0, node.label()) }
     if sequences.len() > 1 {
@@ -2750,7 +2755,9 @@ fn op_gru(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
         )
     }
     if attr_int(node, "layout", 0) != 0 {
-        throw ValueError(f"{node.label()} uses the batch-first layout, which this executor does not read")
+        throw ValueError(
+            f"{node.label()} uses the batch-first layout, which this executor does not read"
+        )
     }
     if x.rank() != 3 { throw ValueError(f"{node.label()} needs a 3-D input, got {x.shape}") }
     if w.rank() != 3 or r.rank() != 3 {
@@ -2764,10 +2771,14 @@ fn op_gru(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let facing = attr_str(node, "direction", "forward")
     let wanted = if facing == "bidirectional" { 2 } else { 1 }
     if directions != wanted or r.shape[0] != directions {
-        throw ValueError(f"{node.label()} is {facing} but carries {directions} directions of weights")
+        throw ValueError(
+            f"{node.label()} is {facing} but carries {directions} directions of weights"
+        )
     }
     if w.shape[1] != 3 * hidden or r.shape[1] != 3 * hidden or r.shape[2] != hidden {
-        throw ValueError(f"{node.label()} has weights {w.shape} and {r.shape} for {hidden} hidden units")
+        throw ValueError(
+            f"{node.label()} has weights {w.shape} and {r.shape} for {hidden} hidden units"
+        )
     }
     if w.shape[2] != input_size {
         throw ValueError(f"{node.label()} has weights {w.shape} for {input_size} inputs")
@@ -2852,7 +2863,11 @@ fn op_gru(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     }
     flat_x.free()
 
-    let all_y = if sequences.len() == 1 { sequences[0] } else { concat_along(sequences, 1, node.label()) }
+    let all_y = if sequences.len() == 1 {
+        sequences[0]
+    } else {
+        concat_along(sequences, 1, node.label())
+    }
     let all_h = if last_h.len() == 1 { last_h[0] } else { concat_along(last_h, 0, node.label()) }
     if sequences.len() > 1 {
         for part in sequences { part.free() }

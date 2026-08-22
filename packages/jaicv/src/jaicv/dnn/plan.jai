@@ -78,12 +78,7 @@ let INTEGER_TYPES = [2, 3, 4, 5, 6, 7, 12, 13]
 let FLOAT_TYPES = [1, 10, 11, 16]
 
 #: How a nearest resize picks its source pixel, in the builder's numbering.
-let ROUNDING_CODES = {
-    "round_prefer_ceil": 0,
-    "round_prefer_floor": 1,
-    "ceil": 2,
-    "floor": 3,
-}
+let ROUNDING_CODES = {"round_prefer_ceil": 0, "round_prefer_floor": 1, "ceil": 2, "floor": 3}
 
 #: Operators whose result depends only on the shapes of things, and which are
 #: therefore worth evaluating once at compile time rather than every run.
@@ -189,8 +184,9 @@ fn static_values(graph: Graph, order: list[GraphNode]) -> dict[str, bool] {
         }
         #: `Shape` reads only the shape of its input, so it is constant even
         #: when that input is not -- which is what makes the rest foldable.
-        let constant = node.op == "Shape" or node.op == "Constant" or
-            (all_known and FOLDABLE.get(node.op, false))
+        let constant = node.op == "Shape" or
+            node.op == "Constant" or
+            all_known and FOLDABLE.get(node.op, false)
         if not constant { continue }
         for name in node.outputs {
             if name.len() > 0 { known[name] = true }
@@ -372,23 +368,11 @@ fn emit(state: Build, node: GraphNode) -> bool {
         let strides = attr_ints(node, "strides", [1, 1])
         let pads = resolved_pads(node, [x[2], x[3]], window, strides, [1, 1])
         if pads is null { return false }
-        state.ids[out] = __prim__.graph_pool(
-            b,
-            state.id_of(node.inputs[0]),
-            [
-                window[0],
-                window[1],
-                strides[0],
-                strides[1],
-                pads[0],
-                pads[2],
-                pads[1],
-                pads[3],
-                attr_int(node, "ceil_mode", 0),
-                attr_int(node, "count_include_pad", 0),
-            ],
-            if node.op == "MaxPool" { 0 } else { 1 }
-        )
+        state.ids[out] = __prim__.graph_pool(b, state.id_of(node.inputs[0]), [window[0], window[1], strides[0], strides[1], pads[0], pads[2], pads[1], pads[3], attr_int(node, "ceil_mode", 0), attr_int(node, "count_include_pad", 0)], if node.op == "MaxPool" {
+            0
+        } else {
+            1
+        })
         return true
     }
 
@@ -402,7 +386,12 @@ fn emit(state: Build, node: GraphNode) -> bool {
         let negative = __prim__.graph_binary(b, x, scalar(state, 0.0), 5)
         let curved = __prim__.graph_binary(
             b,
-            __prim__.graph_binary(b, __prim__.graph_unary(b, negative, 3), scalar(state, 1.0), 1),
+            __prim__.graph_binary(
+                b,
+                __prim__.graph_unary(b, negative, 3),
+                scalar(state, 1.0),
+                1
+            ),
             scalar(state, alpha),
             2
         )
@@ -521,12 +510,11 @@ fn emit(state: Build, node: GraphNode) -> bool {
         if x is null or want is null or x.len() < 3 { return false }
         var over: list[int] = []
         for axis in 2..x.len() { over.push(axis) }
-        let reduced = __prim__.graph_reduce(
-            b,
-            state.id_of(node.inputs[0]),
-            over,
-            if node.op == "GlobalAveragePool" { 1 } else { 2 }
-        )
+        let reduced = __prim__.graph_reduce(b, state.id_of(node.inputs[0]), over, if node.op == "GlobalAveragePool" {
+            1
+        } else {
+            2
+        })
         state.ids[out] = __prim__.graph_reshape(b, reduced, dims_of(want))
         return true
     }
@@ -591,7 +579,11 @@ fn emit(state: Build, node: GraphNode) -> bool {
         let x = state.id_of(node.inputs[0])
         let y = state.id_of(node.inputs[1])
         let ratio = __prim__.graph_binary(b, x, y, 3)
-        let whole = __prim__.graph_unary(b, ratio, if attr_int(node, "fmod", 0) != 0 { 15 } else { 10 })
+        let whole = __prim__.graph_unary(b, ratio, if attr_int(node, "fmod", 0) != 0 {
+            15
+        } else {
+            10
+        })
         state.ids[out] = __prim__.graph_binary(b, x, __prim__.graph_binary(b, whole, y, 2), 1)
         return true
     }
@@ -633,7 +625,9 @@ fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
-    if node.op == "Reshape" or node.op == "Squeeze" or node.op == "Unsqueeze" or
+    if node.op == "Reshape" or
+        node.op == "Squeeze" or
+        node.op == "Unsqueeze" or
         node.op == "Flatten" {
         let shape = state.shape_of(out)
         if shape is null { return false }
@@ -696,12 +690,11 @@ fn emit(state: Build, node: GraphNode) -> bool {
         let want = state.shape_of(out)
         if x is null or want is null { return false }
         if attr_int(node, "select_last_index", 0) != 0 { return false }
-        let picked = __prim__.graph_arg_extreme(
-            b,
-            state.id_of(node.inputs[0]),
-            normalize_axis(attr_int(node, "axis", 0), x.len(), node.label()),
-            if node.op == "ArgMax" { 1 } else { 0 }
-        )
+        let picked = __prim__.graph_arg_extreme(b, state.id_of(node.inputs[0]), normalize_axis(attr_int(node, "axis", 0), x.len(), node.label()), if node.op == "ArgMax" {
+            1
+        } else {
+            0
+        })
         #: The reduced axis stays as a one here and ONNX drops it unless
         #: `keepdims` says otherwise; the survey knows which happened.
         state.ids[out] = __prim__.graph_reshape(b, picked, dims_of(want))
@@ -764,16 +757,11 @@ fn emit(state: Build, node: GraphNode) -> bool {
         }
         let rounding = ROUNDING_CODES.get(attr_str(node, "nearest_mode", "round_prefer_floor"), -1)
         if rounding < 0 and sampling == "nearest" { return false }
-        state.ids[out] = __prim__.graph_resize(
-            b,
-            state.id_of(node.inputs[0]),
-            want[2],
-            want[3],
-            max(rounding, 0),
-            center,
-            corners,
-            if sampling == "linear" { 1 } else { 0 }
-        )
+        state.ids[out] = __prim__.graph_resize(b, state.id_of(node.inputs[0]), want[2], want[3], max(rounding, 0), center, corners, if sampling == "linear" {
+            1
+        } else {
+            0
+        })
         return true
     }
 
@@ -854,7 +842,9 @@ fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
-    if node.op == "ReduceMean" or node.op == "ReduceSum" or node.op == "ReduceMax" or
+    if node.op == "ReduceMean" or
+        node.op == "ReduceSum" or
+        node.op == "ReduceMax" or
         node.op == "ReduceMin" {
         let x = state.shape_of(node.inputs[0])
         let want = state.shape_of(out)
@@ -1061,11 +1051,7 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
         regated(weights, 0, hidden, input_size),
         [4 * hidden, input_size]
     )
-    let r = __prim__.graph_constant(
-        b,
-        regated(recurrent, 0, hidden, hidden),
-        [4 * hidden, hidden]
-    )
+    let r = __prim__.graph_constant(b, regated(recurrent, 0, hidden, hidden), [4 * hidden, hidden])
 
     #: ONNX carries an input bias and a recurrent one; the operation takes a
     #: single bias added to the same gates, so their sum is the same thing.
@@ -1088,16 +1074,11 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
         start_cell = __prim__.graph_reshape(b, state.id_of(node.inputs[6]), [batch, hidden])
     }
 
-    let made = __prim__.graph_lstm(
-        b,
-        state.id_of(node.inputs[0]),
-        r,
-        w,
-        bias,
-        start_state,
-        start_cell,
-        if backwards { 1 } else { 0 }
-    )
+    let made = __prim__.graph_lstm(b, state.id_of(node.inputs[0]), r, w, bias, start_state, start_cell, if backwards {
+        1
+    } else {
+        0
+    })
     if made.len() != 2 { return false }
     #: Turned back into timestep order for a reversed pass, which then puts the
     #: last step computed at the front rather than the end.
@@ -1108,11 +1089,7 @@ fn emit_lstm(state: Build, node: GraphNode) -> bool {
     #: `Y` is every timestep with a direction axis put back in; `Y_h` and `Y_c`
     #: are the last step the pass produced.
     if node.outputs[0].len() > 0 {
-        state.ids[node.outputs[0]] = __prim__.graph_reshape(
-            b,
-            all_state,
-            [steps, 1, batch, hidden]
-        )
+        state.ids[node.outputs[0]] = __prim__.graph_reshape(b, all_state, [steps, 1, batch, hidden])
     }
     let last = if backwards { 0 } else { steps - 1 }
     if node.outputs.len() > 1 and node.outputs[1].len() > 0 {
@@ -1212,17 +1189,15 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
         start = __prim__.graph_reshape(b, state.id_of(node.inputs[5]), [batch, hidden])
     }
 
-    let all_state = __prim__.graph_gru(
-        b,
-        state.id_of(node.inputs[0]),
-        r,
-        w,
-        bias,
-        start,
-        if backwards { 1 } else { 0 },
-        if linear { 1 } else { 0 },
-        reset_bias
-    )
+    let all_state = __prim__.graph_gru(b, state.id_of(node.inputs[0]), r, w, bias, start, if backwards {
+        1
+    } else {
+        0
+    }, if linear {
+        1
+    } else {
+        0
+    }, reset_bias)
     if all_state < 0 { return false }
     #: A reversed pass comes back in the order it ran, last input first. ONNX
     #: indexes `Y` by the timestep the input came from, so the sequence is
@@ -1231,11 +1206,7 @@ fn emit_gru(state: Build, node: GraphNode) -> bool {
     let ordered = if backwards { flipped_time(state, all_state, steps) } else { all_state }
     if ordered < 0 { return false }
     if node.outputs[0].len() > 0 {
-        state.ids[node.outputs[0]] = __prim__.graph_reshape(
-            b,
-            ordered,
-            [steps, 1, batch, hidden]
-        )
+        state.ids[node.outputs[0]] = __prim__.graph_reshape(b, ordered, [steps, 1, batch, hidden])
     }
     if node.outputs.len() > 1 and node.outputs[1].len() > 0 {
         let last = if backwards { 0 } else { steps - 1 }
@@ -1270,7 +1241,11 @@ fn slice_bounds(
     var steps = [1 for _index in 0..rank]
 
     let given_starts = state.constants.get(node.inputs[1], null)
-    let given_ends = if node.inputs.len() > 2 { state.constants.get(node.inputs[2], null) } else { null }
+    let given_ends = if node.inputs.len() > 2 {
+        state.constants.get(node.inputs[2], null)
+    } else {
+        null
+    }
     if given_starts is null or given_ends is null { return null }
     var axes: list[int] = []
     if node.inputs.len() > 3 and node.inputs[3].len() > 0 {
@@ -1396,11 +1371,7 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     #: whose numbers are handed over rather than reasoned about.
     for (name, weight) in graph.initializers.items() {
         if state.constants.get(name, null) is not null { continue }
-        state.ids[name] = __prim__.graph_constant(
-            builder,
-            weight.download(),
-            dims_of(weight.shape)
-        )
+        state.ids[name] = __prim__.graph_constant(builder, weight.download(), dims_of(weight.shape))
     }
     var inputs: list[int] = []
     for name in graph.inputs {
@@ -1486,7 +1457,6 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     }
     return Plan(plan, graph.inputs, in_shapes, graph.outputs, out_shapes)
 }
-
 
 #: The plan already compiled for a graph, by the graph's number.
 var _plans: dict[int, Plan] = {}

@@ -1859,10 +1859,7 @@ fn reduce_leading(upstream: Tensor, small_shape: list[int], out: Tensor? = null)
     var source = upstream
     var owned: Tensor? = null
     while rows > FINAL_ROWS {
-        let chunks = min(
-            max(1, TARGET_THREADS // inner),
-            max(1, rows // MIN_ROWS_PER_CHUNK)
-        )
+        let chunks = min(max(1, TARGET_THREADS // inner), max(1, rows // MIN_ROWS_PER_CHUNK))
         if chunks >= rows { break }
         let partials = Tensor([chunks * inner])
         cached_kernel("reduce_leading_split").dispatch_async(
@@ -2444,10 +2441,7 @@ pub fn sum(input: Tensor, axis: int? = null) -> Tensor {
         #: share of the input in a register, so giving every element its own
         #: thread would only add threadgroups to combine.
         let ELEMENTS_PER_GROUP = 2048
-        let groups = min(
-            1024,
-            max(1, (input.size + ELEMENTS_PER_GROUP - 1) // ELEMENTS_PER_GROUP)
-        )
+        let groups = min(1024, max(1, (input.size + ELEMENTS_PER_GROUP - 1) // ELEMENTS_PER_GROUP))
         let partials = Tensor([groups])
         let kernel = cached_kernel("reduce_sum_all")
         kernel.dispatch_async(
@@ -3294,9 +3288,7 @@ pub fn conv2d_nchw(
     let kh = weights.shape[2]
     let kw = weights.shape[3]
     if weights.shape[1] != cin {
-        throw ValueError(
-            f"conv2d_nchw channel mismatch: input {cin} vs weights {weights.shape[1]}"
-        )
+        throw ValueError(f"conv2d_nchw channel mismatch: input {cin} vs weights {weights.shape[1]}")
     }
     if stride <= 0 { throw ValueError(f"conv2d_nchw stride must be positive, got {stride}") }
     if padding < 0 {
@@ -3318,25 +3310,11 @@ pub fn conv2d_nchw(
     }
     let output = Tensor([n, cout, out_h, out_w])
     try {
-        gpu.conv2d_async(
-            input.buffer(),
-            weights.buffer(),
-            output.buffer(),
-            n,
-            h,
-            w,
-            cin,
-            cout,
-            kh,
-            kw,
-            stride_h: stride,
-            stride_w: stride,
-            pad_h: padding,
-            pad_w: padding,
-            bias: if bias is null { null } else { bias.buffer() },
-            activation: activation,
-            layout: 1
-        )
+        gpu.conv2d_async(input.buffer(), weights.buffer(), output.buffer(), n, h, w, cin, cout, kh, kw, stride_h: stride, stride_w: stride, pad_h: padding, pad_w: padding, bias: if bias is null {
+            null
+        } else {
+            bias.buffer()
+        }, activation: activation, layout: 1)
     } catch _error: RuntimeError {
         #: A shape MPS will not take. Rather than keep a second NCHW kernel
         #: alive for it, go the long way round through `conv2d`, which has its
@@ -3355,14 +3333,11 @@ pub fn conv2d_nchw(
         let columns = transpose(reshape(ohwi, [cout, kh * kw * cin]))
         ohwi.free()
         let hwio = reshape(columns, [kh, kw, cin, cout])
-        let done = conv2d(
-            nhwc_in,
-            hwio,
-            bias: bias,
-            stride: stride,
-            padding: padding,
-            activation: if activation == 2 { 0 } else { activation }
-        )
+        let done = conv2d(nhwc_in, hwio, bias: bias, stride: stride, padding: padding, activation: if activation == 2 {
+            0
+        } else {
+            activation
+        })
         nhwc_in.free()
         columns.free()
         let back = nchw(done)

@@ -147,24 +147,11 @@ pub fn blob_from_images(
             }
         }
         prepared.flush()
-        kernel_for("blob_planar").dispatch_async(
-            [prepared.storage, out.storage],
-            cn * pixels,
-            [
-                cn * pixels,
-                width,
-                cn,
-                prepared.offset,
-                prepared.step_,
-                at,
-                if swap_rb { 1 } else { 0 },
-                f32_bits(scale_factor),
-                f32_bits(mean[0]),
-                f32_bits(mean[1]),
-                f32_bits(mean[2]),
-                f32_bits(mean[3]),
-            ]
-        )
+        kernel_for("blob_planar").dispatch_async([prepared.storage, out.storage], cn * pixels, [cn * pixels, width, cn, prepared.offset, prepared.step_, at, if swap_rb {
+            1
+        } else {
+            0
+        }, f32_bits(scale_factor), f32_bits(mean[0]), f32_bits(mean[1]), f32_bits(mean[2]), f32_bits(mean[3])])
         at += cn * pixels
     }
     out.invalidate()
