@@ -5,6 +5,9 @@ import torch
 import torch.nn.functional as F
 
 
+WARMUP = 24
+
+
 def packed_mha(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int) -> torch.Tensor:
     seq, dim = q.shape
     hd = dim // heads
@@ -20,8 +23,12 @@ def time_attn(seq: int, dim: int, heads: int, repeats: int):
     k = torch.randn(seq, dim, device="mps")
     v = torch.randn(seq, dim, device="mps")
     torch.mps.synchronize()
+    # See the note in gemm.jai: the GPU needs to have been busy for a while
+    # before it runs at its working speed, and both sides warm up by the same
+    # rule so the two are comparable.
     with torch.autocast(device_type="mps", dtype=torch.float16, cache_enabled=False):
-        packed_mha(q, k, v, heads)
+        for _ in range(max(repeats, WARMUP)):
+            packed_mha(q, k, v, heads)
     torch.mps.synchronize()
     started = time.perf_counter()
     live = []
