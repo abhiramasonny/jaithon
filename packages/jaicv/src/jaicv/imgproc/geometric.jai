@@ -207,10 +207,18 @@ kernel void geo_pyr_down_row(device const float* src [[buffer(0)]],
     uint x = pixel - y * out_cols;
     int cx = int(x) * 2;
     float total = 0.0f;
-    for (int dx = -2; dx <= 2; ++dx) {
-        total += kPyramidKernel[dx + 2] *
-                 fetch(src, int(y), cx + dx, channel, rows, cols, cn,
-                       src_off, src_step, border, 0.0f);
+    if (cx >= 2 && cx + 2 < int(cols)) {
+        uint at = src_off + uint(y) * src_step + uint(cx - 2) * cn + channel;
+        for (int dx = 0; dx < 5; ++dx) {
+            total += kPyramidKernel[dx] * src[at];
+            at += cn;
+        }
+    } else {
+        for (int dx = -2; dx <= 2; ++dx) {
+            total += kPyramidKernel[dx + 2] *
+                     fetch(src, int(y), cx + dx, channel, rows, cols, cn,
+                           src_off, src_step, border, 0.0f);
+        }
     }
     tmp[id] = total;
 }
@@ -235,10 +243,18 @@ kernel void geo_pyr_down_col(device const float* tmp [[buffer(0)]],
     uint x = pixel - y * out_cols;
     int cy = int(y) * 2;
     float total = 0.0f;
-    for (int dy = -2; dy <= 2; ++dy) {
-        total += kPyramidKernel[dy + 2] *
-                 fetch(tmp, cy + dy, int(x), channel, rows, out_cols, cn,
-                       0u, out_cols * cn, border, 0.0f);
+    if (cy >= 2 && cy + 2 < int(rows)) {
+        uint at = uint(cy - 2) * out_cols * cn + uint(x) * cn + channel;
+        for (int dy = 0; dy < 5; ++dy) {
+            total += kPyramidKernel[dy] * tmp[at];
+            at += out_cols * cn;
+        }
+    } else {
+        for (int dy = -2; dy <= 2; ++dy) {
+            total += kPyramidKernel[dy + 2] *
+                     fetch(tmp, cy + dy, int(x), channel, rows, out_cols, cn,
+                           0u, out_cols * cn, border, 0.0f);
+        }
     }
     put(dst, dst_off + y * dst_step + x * cn + channel, total,
         as_type<float>(low_bits), as_type<float>(high_bits), integral);

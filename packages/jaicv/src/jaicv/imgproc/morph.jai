@@ -167,15 +167,24 @@ kernel void morph_rank(device const float* src [[buffer(0)]],
      * largest, so the two differ only in the starting extreme and the compare. */
     float best = dilate != 0u ? -INFINITY : INFINITY;
     bool seen = false;
+    int top = int(y) - int(anchor_y);
+    int left = int(x) - int(anchor_x);
+    bool inside = top >= 0 && left >= 0 &&
+        top + int(element_rows) <= int(rows) && left + int(element_cols) <= int(cols);
     for (uint ky = 0; ky < element_rows; ++ky) {
+        uint at = src_off + uint(max(top, 0) + int(ky)) * src_step + uint(max(left, 0)) * cn + channel;
         for (uint kx = 0; kx < element_cols; ++kx) {
-            if (element[element_off + ky * element_step + kx] == 0.0f) continue;
-            int sy = int(y) + int(ky) - int(anchor_y);
-            int sx = int(x) + int(kx) - int(anchor_x);
-            float value = fetch(src, sy, sx, channel, rows, cols, cn, src_off, src_step,
-                                border, as_type<float>(constant_bits));
+            if (element[element_off + ky * element_step + kx] == 0.0f) {
+                at += cn;
+                continue;
+            }
+            float value = inside
+                ? src[at]
+                : fetch(src, top + int(ky), left + int(kx), channel, rows, cols, cn,
+                        src_off, src_step, border, as_type<float>(constant_bits));
             best = dilate != 0u ? max(best, value) : min(best, value);
             seen = true;
+            at += cn;
         }
     }
     if (!seen) best = fetch(src, int(y), int(x), channel, rows, cols, cn,
