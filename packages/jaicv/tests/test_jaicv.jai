@@ -477,3 +477,60 @@ fn test_drawing_agrees_wherever_the_pixels_live() -> void {
     }
     assert_eq(differing, 0)
 }
+
+#: Shapes that fall off the picture, or have no area, or are absurdly far
+#: away, put down the same pixels on either surface and none outside it.
+#:
+#: The raster primitives write into a host mirror or into a device buffer's own
+#: memory, and the second has no list bounds behind it -- a coordinate that got
+#: past the clipping would be a stray write into whatever the allocator handed
+#: out next. These are the cases where the clipping has to hold.
+fn awkwardly_drawn(force_host: bool, channels: int) -> list[float] {
+    var frame = Mat.zeros(17, 23, CV_MAKETYPE(CV_8U, channels))
+    if force_host { let _pull = frame.values() }
+    let ink = Scalar(200.0, 30.0, 90.0, 255.0)
+    #: Wholly outside, on each side in turn.
+    rectangle(frame, Point(-90, -90), Point(-40, -40), ink, -1)
+    rectangle(frame, Point(400, 400), Point(500, 500), ink, -1)
+    line(frame, Point(-50, -50), Point(-10, -60), ink, 1)
+    line(frame, Point(90, 3), Point(120, 9), ink, 2)
+    #: Straddling every edge.
+    rectangle(frame, Point(-8, -8), Point(9, 9), ink, -1)
+    rectangle(frame, Point(15, 10), Point(60, 60), ink, 2)
+    line(frame, Point(-40, 8), Point(70, 12), ink, 1)
+    line(frame, Point(11, -30), Point(13, 50), ink, 3)
+    #: No area at all.
+    rectangle(frame, Point(5, 5), Point(5, 5), ink, -1)
+    line(frame, Point(7, 7), Point(7, 7), ink, 1)
+    circle(frame, Point(8, 8), 0, ink, -1)
+    #: Collinear corners, which give the scanline fill nothing to walk.
+    fill_poly(frame, [[Point(2, 2), Point(9, 2), Point(16, 2)]], ink)
+    #: Far enough out that the clipping arithmetic has room to go wrong.
+    line(frame, Point(-100000, -100000), Point(100000, 100000), ink, 1)
+    circle(frame, Point(4, 4), 40000, ink, 1)
+    return frame.values()
+}
+
+fn test_drawing_off_the_edge_agrees_and_stays_inside() -> void {
+    if not gpu.is_available() { return }
+    for channels in [1, 3, 4] {
+        let on_device = awkwardly_drawn(false, channels)
+        let on_host = awkwardly_drawn(true, channels)
+        assert_eq(on_device.len(), 17 * 23 * channels, f"{channels} channels, wrong size")
+        assert_eq(on_device.len(), on_host.len())
+        var differing = 0
+        for index in 0..on_device.len() {
+            if on_device[index] != on_host[index] { differing += 1 }
+        }
+        assert_eq(differing, 0, f"{channels} channels differ between host and device")
+    }
+}
+
+#: A one-pixel picture is the smallest thing every clip has to survive.
+fn test_drawing_on_a_single_pixel() -> void {
+    var frame = Mat.zeros(1, 1, CV_8UC3)
+    rectangle(frame, Point(-5, -5), Point(5, 5), Scalar(10.0, 20.0, 30.0), -1)
+    assert_eq(frame.values(), [10.0, 20.0, 30.0])
+    line(frame, Point(-9, 0), Point(9, 0), Scalar(40.0, 50.0, 60.0), 1)
+    assert_eq(frame.values(), [40.0, 50.0, 60.0])
+}
