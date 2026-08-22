@@ -146,16 +146,13 @@ pub fn insert_channel(source: Mat, target: Mat, index: int) -> Mat {
     return Mat.from_list(target.rows, target.cols, target.type_(), values)
 }
 
+#: One line in order.
+#:
+#: Placing each value into a sorted list makes the work grow with the square of
+#: the line's length, which for a picture's worth of rows is the difference
+#: between milliseconds and minutes.
 fn sorted_line(line: list[float], descending: bool) -> list[float] {
-    var out: list[float] = []
-    for value in line {
-        var at = out.len()
-        while at > 0 and (if descending { value > out[at - 1] } else { value < out[at - 1] }) {
-            at -= 1
-        }
-        out.insert(at, value)
-    }
-    return out
+    return line.sort(reverse: descending)
 }
 
 #: Sort every row, or every column.
@@ -193,40 +190,22 @@ pub fn sort_idx(src: Mat, flags: int = SORT_EVERY_ROW) -> Mat {
     var out: list[float] = []
     for _index in 0..src.rows * src.cols { out.push(0.0) }
 
+    #: Sorting the positions by what sits at them, rather than inserting each
+    #: one into a list already in order -- see `sorted_line` for why.
     if by_column {
         for x in 0..src.cols {
             var order: list[int] = []
-            for y in 0..src.rows {
-                var at = order.len()
-                let value = values[y * src.cols + x]
-                while at > 0 and (if descending {
-                    value > values[order[at - 1] * src.cols + x]
-                } else {
-                    value < values[order[at - 1] * src.cols + x]
-                }) {
-                    at -= 1
-                }
-                order.insert(at, y)
-            }
-            for y in 0..src.rows { out[y * src.cols + x] = float(order[y]) }
+            for y in 0..src.rows { order.push(y) }
+            let ranked = order.sort(key: |y| values[y * src.cols + x], reverse: descending)
+            for y in 0..src.rows { out[y * src.cols + x] = float(ranked[y]) }
         }
         return Mat.from_list(src.rows, src.cols, CV_MAKETYPE(4, 1), out)
     }
     for y in 0..src.rows {
         var order: list[int] = []
-        for x in 0..src.cols {
-            var at = order.len()
-            let value = values[y * src.cols + x]
-            while at > 0 and (if descending {
-                value > values[y * src.cols + order[at - 1]]
-            } else {
-                value < values[y * src.cols + order[at - 1]]
-            }) {
-                at -= 1
-            }
-            order.insert(at, x)
-        }
-        for x in 0..src.cols { out[y * src.cols + x] = float(order[x]) }
+        for x in 0..src.cols { order.push(x) }
+        let ranked = order.sort(key: |x| values[y * src.cols + x], reverse: descending)
+        for x in 0..src.cols { out[y * src.cols + x] = float(ranked[x]) }
     }
     return Mat.from_list(src.rows, src.cols, CV_MAKETYPE(4, 1), out)
 }

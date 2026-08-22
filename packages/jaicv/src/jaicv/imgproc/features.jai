@@ -841,12 +841,9 @@ pub fn hough_circles(
         }
     }
 
-    var ordered: list[int] = []
-    for cell in centres {
-        var at = ordered.len()
-        while at > 0 and accumulator[cell] > accumulator[ordered[at - 1]] { at -= 1 }
-        ordered.insert(at, cell)
-    }
+    #: Strongest first, sorted rather than inserted one at a time -- the same
+    #: point as in `good_features_to_track`.
+    let ordered = centres.sort(key: |cell| accumulator[cell], reverse: true)
 
     var out: list[HoughCircle] = []
     for cell in ordered {
