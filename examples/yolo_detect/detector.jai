@@ -11,6 +11,7 @@
 #: separate objectness row -- v5 had one, v8 does not -- so the class score IS
 #: the confidence, and no sigmoid is needed because the exported graph has
 #: already applied it.
+import std.gpu as gpu
 import jaicv as cv
 import jaitensor as jt
 from jaitensor import Tensor
@@ -299,6 +300,11 @@ pub fn start_detect(graph: Graph, image: Mat) -> Pending {
     #: `run_best` interprets the first frame and compiles the model after,
     #: which for a run of more than one frame is most of the speed.
     let outputs = run_best(graph, {graph.inputs[0]: input})
+    #: Committed here so the GPU starts on it now rather than whenever the
+    #: caller next happens to touch the device. Nothing waits: a flush hands
+    #: the queue over and returns, which is the whole point of coming back for
+    #: the answer later.
+    gpu.flush()
     return Pending(outputs[graph.outputs[0]], scale, pad_x, pad_y, image.cols, image.rows)
 }
 
