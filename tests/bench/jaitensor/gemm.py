@@ -12,6 +12,12 @@ def gemm_batch(level: str) -> int:
     return 4096
 
 
+# Dispatches to run before the clock starts. See the note in gemm.jai: the
+# GPU needs to have been busy for a while before it runs at its working speed,
+# and both sides have to warm up by the same rule to be comparable.
+WARMUP = 24
+
+
 def time_shape(rows: int, inner: int, columns: int, repeats: int, trans_a=False, trans_b=False):
     if trans_a:
         a = torch.randn(inner, rows, device="mps")
@@ -29,7 +35,8 @@ def time_shape(rows: int, inner: int, columns: int, repeats: int, trans_a=False,
     outs = [None] * wave
     torch.mps.synchronize()
     with torch.autocast(device_type="mps", dtype=torch.float16, cache_enabled=False):
-        outs[0] = mul()
+        for i in range(max(repeats, WARMUP)):
+            outs[i % wave] = mul()
     torch.mps.synchronize()
     started = time.perf_counter()
     # Jaithon's float32 buffers are cast for every graph dispatch. Disable

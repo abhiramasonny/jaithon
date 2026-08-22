@@ -5,6 +5,9 @@ import std.math
 from std.os import env_or
 from std.time import Instant
 
+#: Dispatches to run before the clock starts. See gemm.jai.
+let WARMUP = 24
+
 fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool] {
     let q = Tensor([seq, dim])
     let k = Tensor([seq, dim])
@@ -15,9 +18,15 @@ fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool]
     q.buffer().fill_uniform(-1.0, 1.0, 1)
     k.buffer().fill_uniform(-1.0, 1.0, 2)
     v.buffer().fill_uniform(-1.0, 1.0, 3)
-    let first = multi_head_attention(q, k, v, heads)
+    #: The GPU does not run at its working speed until it has been busy for a
+    #: while, and one call is nowhere near enough. See the note in gemm.jai:
+    #: timing the first few dispatches measures the clock coming up rather than
+    #: the kernel. The peer benchmark warms up by the same rule.
+    for _warm in 0..max(repeats, WARMUP) {
+        let throwaway = multi_head_attention(q, k, v, heads)
+        throwaway.free()
+    }
     gpu.synchronize()
-    first.free()
     var live: list[Tensor] = []
     let started = Instant.now()
     for _i in 0..repeats {

@@ -6,6 +6,19 @@ import std.math
 from std.os import env_or
 from std.time import Instant
 
+#: Dispatches to run before the clock starts.
+#:
+#: The GPU does not run at its working speed until it has been busy for a
+#: while, and one warm-up call is nowhere near enough to get it there: the same
+#: 512x784x8192 product measured 11.9 ms on the first eight dispatches and
+#: 6.6 ms by the fortieth, all of it the clock coming up. Timing the first
+#: eight measures the ramp rather than the kernel, and it measured jaitensor
+#: 20 per cent behind PyTorch on shapes where it is in fact 20 per cent ahead.
+#:
+#: The peer benchmark warms up by the same rule, which is the only thing that
+#: makes the two comparable.
+let WARMUP = 24
+
 fn gemm_batch(level: str) -> int {
     if level == "easy" { return 512 }
     if level == "medium" { return 2048 }
@@ -34,7 +47,9 @@ fn time_shape(
     defer {
         for product in outs { product.free() }
     }
-    matmul(a, b, trans_a: trans_a, trans_b: trans_b, out: outs[0])
+    for index in 0..max(repeats, WARMUP) {
+        matmul(a, b, trans_a: trans_a, trans_b: trans_b, out: outs[index % wave])
+    }
     gpu.synchronize()
     let started = Instant.now()
     for index in 0..repeats {
