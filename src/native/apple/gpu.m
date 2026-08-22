@@ -19,6 +19,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "native/native.h"
@@ -280,9 +281,29 @@ static size_t gMlp3LiveBBytes[4];
  * the old drain-everything behaviour for bisecting. */
 static uint64_t gBatchCounter;  /* last batch number handed out */
 static uint64_t gOpenBatch;     /* number of gAsyncCommands, 0 when none open */
-static uint64_t gDoneBatch;     /* every batch at or below this has finished */
+/* Every batch at or below this has finished. Written both by a thread that
+ * waited for one and by Metal's own completion handler on a thread of its
+ * own, so it is an atomic rather than something the queue lock covers -- the
+ * handler must never have to take a lock a waiter might be holding. */
+static _Atomic uint64_t gDoneBatch;
 static NSMutableArray<NSNumber *> *gInFlightBatch;
 static int gFineSync;           /* 0 unknown, 1 on, 2 off */
+
+static uint64_t doneBatch(void) {
+    return atomic_load_explicit(&gDoneBatch, memory_order_acquire);
+}
+
+/* Raise the finished mark to `batch`, never lower it. */
+static void noteDone(uint64_t batch) {
+    uint64_t seen = atomic_load_explicit(&gDoneBatch, memory_order_relaxed);
+    while (seen < batch) {
+        if (atomic_compare_exchange_weak_explicit(&gDoneBatch, &seen, batch,
+                                                  memory_order_release,
+                                                  memory_order_relaxed)) {
+            return;
+        }
+    }
+}
 
 static bool fineSyncEnabled(void) {
     if (gFineSync == 0) {
@@ -801,16 +822,41 @@ static bool poolPoisons(void) {
 
 /* The most recently parked buffer of exactly this size, or nil. Newest first,
  * because that one is likeliest to still be warm. */
+/* Under this, a fresh allocation is cheaper than waiting for a parked buffer
+ * to be free. Metal maps a small buffer in a few microseconds; waiting for a
+ * kernel that is still reading one costs the better part of a millisecond. */
+#define JAI_POOL_WAIT_RATHER_THAN_ALLOCATE (1u * 1024u * 1024u)
+
+/* Hand back a parked buffer of exactly this size, preferring one whose work
+ * has finished.
+ *
+ * Two of the same size are not interchangeable: one may still be the
+ * destination or the source of a kernel that has not run, and its new owner
+ * pays for that the first time it writes from the host -- 176 us against the
+ * 4 us the dispatch it was feeding costs. A run of small buffers, each
+ * uploaded and handed straight to one kernel, is the worst case: recycling the
+ * busy one every time turns the run into a chain of round trips.
+ *
+ * So a small buffer refuses a busy one and lets the caller allocate. The pool
+ * then grows to however many of that size are in flight at once and settles
+ * there, which is the multi-buffering a caller would otherwise have to write.
+ * A large one takes what it is given: the allocation is expensive, and the
+ * wait is small beside the work such a buffer is usually part of. */
 static id<MTLBuffer> poolTake(size_t bytes, uint64_t *lastBatch) {
-    for (int i = gPoolCount - 1; i >= 0; i--) {
-        if (gPool[i].bytes != bytes) continue;
-        id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)gPool[i].buffer;
-        if (lastBatch != NULL) *lastBatch = gPool[i].lastBatch;
-        memmove(&gPool[i], &gPool[i + 1],
-                (size_t)(gPoolCount - i - 1) * sizeof(JaiPooledBuffer));
-        gPoolCount--;
-        gPoolBytes -= bytes;
-        return buffer;
+    const uint64_t settled = doneBatch();
+    const int passes = bytes < JAI_POOL_WAIT_RATHER_THAN_ALLOCATE ? 1 : 2;
+    for (int pass = 0; pass < passes; pass++) {
+        for (int i = gPoolCount - 1; i >= 0; i--) {
+            if (gPool[i].bytes != bytes) continue;
+            if (pass == 0 && gPool[i].lastBatch > settled) continue;
+            id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)gPool[i].buffer;
+            if (lastBatch != NULL) *lastBatch = gPool[i].lastBatch;
+            memmove(&gPool[i], &gPool[i + 1],
+                    (size_t)(gPoolCount - i - 1) * sizeof(JaiPooledBuffer));
+            gPoolCount--;
+            gPoolBytes -= bytes;
+            return buffer;
+        }
     }
     return nil;
 }
@@ -1388,10 +1434,19 @@ static bool commitMlpWeightsLocked(void) {
     return true;
 }
 
-/* Commit whatever is open and file it under its batch number. */
+/* Commit whatever is open and file it under its batch number.
+ *
+ * The completion handler is what lets a batch be known finished without
+ * anyone having waited for it: a buffer whose work is long done can then be
+ * recycled and written to from the host with no wait at all. */
 static void commitOpenLocked(void) {
     if (gAsyncCommands == nil) return;
     [gAsyncEncoder endEncoding];
+    const uint64_t mine = gOpenBatch;
+    [gAsyncCommands addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        noteDone(mine);
+    }];
     [gAsyncCommands commit];
     ensureInFlight();
     [gInFlight addObject:gAsyncCommands];
@@ -1409,13 +1464,6 @@ static uint64_t takeFrontLocked(void) {
     [gInFlight removeObjectAtIndex:0];
     [gInFlightBatch removeObjectAtIndex:0];
     return batch;
-}
-
-static void noteDone(uint64_t batch) {
-    if (gQueue == nil) return;
-    @synchronized(gQueue) {
-        if (gDoneBatch < batch) gDoneBatch = batch;
-    }
 }
 
 static bool flushAsyncLocked(id<MTLCommandBuffer> *oldestOut, uint64_t *oldestBatch) {
@@ -1499,7 +1547,7 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
     uint64_t want = 0;
     @synchronized(gQueue) {
         if (gMlpSide != 0 || gMlpAccSide != 0 || gMlp3Side != 0) want = UINT64_MAX;
-        else if (b->lastBatch > gDoneBatch) want = b->lastBatch;
+        else if (b->lastBatch > doneBatch()) want = b->lastBatch;
     }
     if (want == UINT64_MAX) return jaiGpuSynchronize();
     if (want == 0) return true;
