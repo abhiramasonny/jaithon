@@ -10,7 +10,8 @@ from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
 from jaitensor import Tensor
 from jaitensor.compiled import compile_step, refusal
-from jaitensor.layers import Activation, Conv2d, Dense, Flatten, Layer, LayerNorm, MaxPool2d
+from jaitensor.layers import Activation, AvgPool2d, Conv2d, Dense, Embedding, Flatten, Layer
+from jaitensor.layers import LayerNorm, MaxPool2d
 from jaitensor.losses import SparseCategoricalCrossentropy
 from jaitensor.optimizers import SGD, prepare_state
 
@@ -115,7 +116,7 @@ fn test_a_model_it_cannot_express_is_refused_with_a_reason() -> void {
     let rng = Random.with_seed(1)
     let layers: list[Layer] = [
         Flatten(),
-        LayerNorm(),
+        Embedding(4, 4),
         Dense(CLASSES, activation: Activation.Linear),
     ]
     var current = [SIDE, SIDE, CHANNELS]
@@ -411,4 +412,96 @@ fn losses_from(layers: list[Layer], x: Tensor, y: Tensor, shape: list[int]) -> l
     for _iteration in 0..4 { seen.push(step.run(x, y)) }
     step.free()
     return seen
+}
+
+#: Normalisation and average pooling belong on the compiled path too, and a
+#: model built from them has to train where the eager one trains.
+fn test_a_compiled_step_expresses_normalisation_and_average_pooling() -> void {
+    if not gpu.is_available() { return }
+    let (x, y) = batch()
+    defer { x.free() }
+    defer { y.free() }
+    let step = compile_step(wider(5), [BATCH, SIDE, SIDE, CHANNELS], CLASSES, RATE)
+    assert_true(step is not null, f"would not compile: {refusal()}")
+    for _iteration in 0..8 { step.run(x, y) }
+    step.settle()
+
+    let eager = wider(5)
+    let want = eager_steps(eager, x, y, 8)
+    assert_eq(step.params.len(), want.len())
+    for (index, param) in step.params.enumerate() {
+        let got = param.download()
+        let expected = want[index].download()
+        for slot in 0..got.len() {
+            assert_near(got[slot], expected[slot], 1e-4, f"parameter {index} slot {slot}")
+        }
+    }
+    step.free()
+}
+
+#: A pool that pads is a different pool, and the step has to say so.
+fn test_a_compiled_pool_keeps_its_padding() -> void {
+    if not gpu.is_available() { return }
+    let (x, y) = batch()
+    defer { x.free() }
+    defer { y.free() }
+    let step = compile_step(padded(5), [BATCH, SIDE, SIDE, CHANNELS], CLASSES, RATE)
+    assert_true(step is not null, f"would not compile: {refusal()}")
+    for _iteration in 0..6 { step.run(x, y) }
+    step.settle()
+
+    let want = eager_steps(padded(5), x, y, 6)
+    for (index, param) in step.params.enumerate() {
+        let got = param.download()
+        let expected = want[index].download()
+        for slot in 0..got.len() {
+            assert_near(got[slot], expected[slot], 1e-4, f"parameter {index} slot {slot}")
+        }
+    }
+    step.free()
+}
+
+fn wider(seed: int) -> list[Layer] {
+    let rng = Random.with_seed(seed)
+    let layers: list[Layer] = [
+        Conv2d(
+            6,
+            3,
+            padding: 1,
+            in_channels: CHANNELS,
+            activation: Activation.Relu
+        ),
+        AvgPool2d(2),
+        Flatten(),
+        LayerNorm(),
+        Dense(CLASSES, activation: Activation.Linear),
+    ]
+    var current = [SIDE, SIDE, CHANNELS]
+    for layer in layers {
+        layer.build_from_shape(current, rng)
+        current = layer.output_shape()
+    }
+    return layers
+}
+
+fn padded(seed: int) -> list[Layer] {
+    let rng = Random.with_seed(seed)
+    let layers: list[Layer] = [
+        Conv2d(
+            6,
+            3,
+            padding: 1,
+            in_channels: CHANNELS,
+            activation: Activation.Relu
+        ),
+        MaxPool2d(3, stride: 2, padding: 1),
+        Flatten(),
+        Dense(CLASSES, activation: Activation.Linear),
+    ]
+    var current = [SIDE, SIDE, CHANNELS]
+    for layer in layers {
+        layer.build_from_shape(current, rng)
+        current = layer.output_shape()
+    }
+    return layers
 }
