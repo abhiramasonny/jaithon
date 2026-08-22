@@ -29,7 +29,7 @@
 import std.gpu as gpu
 from std.os import env
 from std.gpu import Buffer
-from .layers import Activation, Conv2d, Dense, Flatten, Layer, MaxPool2d
+from .layers import Activation, AvgPool2d, Conv2d, Dense, Flatten, Layer, LayerNorm, MaxPool2d
 from .tensor import Tensor
 
 #: Reduction kinds the graph builder takes.
@@ -212,25 +212,66 @@ fn emit_conv(state: Build, layer: any, input: Built) -> Built? {
     return Built(activated, shape)
 }
 
-fn emit_pool(state: Build, layer: any, input: Built) -> Built? {
-    if not layer is MaxPool2d { return null }
+#: Both poolings, which differ only in what they do with a window.
+#:
+#: `average` divides by however many real values the window held, which is what
+#: jaitensor's own kernel counts, so padding never counts toward the mean.
+fn emit_pooling(
+    state: Build,
+    input: Built,
+    size: int,
+    stride: int,
+    pad: int,
+    average: bool
+) -> Built? {
     if input.shape.len() != 4 {
         state.refuse("a pool over something that is not an image batch")
         return null
     }
-    let size = layer.kernel_size
-    let stride = layer.stride
     #: kernel y, kernel x, stride y, stride x, pad top, bottom, left, right,
     #: ceil mode, pad counts toward an average, channels last.
-    let settings = [size, size, stride, stride, 0, 0, 0, 0, 0, 0, 1]
-    let made = __prim__.graph_pool(state.builder, input.value, settings, 0)
+    let settings = [size, size, stride, stride, pad, pad, pad, pad, 0, 0, 1]
+    let kind = if average { 1 } else { 0 }
+    let made = __prim__.graph_pool(state.builder, input.value, settings, kind)
     if made < 0 {
         state.refuse("a pool the platform would not build")
         return null
     }
-    let height = (input.shape[1] - size) // stride + 1
-    let width = (input.shape[2] - size) // stride + 1
+    let height = (input.shape[1] + 2 * pad - size) // stride + 1
+    let width = (input.shape[2] + 2 * pad - size) // stride + 1
     return Built(made, [input.shape[0], height, width, input.shape[3]])
+}
+
+fn emit_pool(state: Build, layer: any, input: Built) -> Built? {
+    if not layer is MaxPool2d { return null }
+    return emit_pooling(state, input, layer.kernel_size, layer.stride, layer.padding, false)
+}
+
+fn emit_avg_pool(state: Build, layer: any, input: Built) -> Built? {
+    if not layer is AvgPool2d { return null }
+    return emit_pooling(state, input, layer.kernel_size, layer.stride, layer.padding, true)
+}
+
+#: Normalisation over the last axis, with the same epsilon the kernel uses.
+fn emit_layer_norm(state: Build, layer: any, input: Built) -> Built? {
+    if not layer is LayerNorm { return null }
+    if input.shape.len() != 2 {
+        state.refuse("a normalisation over something that is not a batch of rows")
+        return null
+    }
+    let params = layer.parameters()
+    if params.len() != 2 {
+        state.refuse("a normalisation without both a scale and a shift")
+        return null
+    }
+    let gamma = state.parameter(params[0])
+    let beta = state.parameter(params[1])
+    let made = __prim__.graph_layer_norm(state.builder, input.value, gamma, beta, [1], 1.0e-5)
+    if made < 0 {
+        state.refuse("a normalisation the platform would not build")
+        return null
+    }
+    return Built(made, input.shape)
 }
 
 fn emit_layer(state: Build, layer: Layer, input: Built) -> Built? {
@@ -238,6 +279,8 @@ fn emit_layer(state: Build, layer: Layer, input: Built) -> Built? {
     if layer is Flatten { return emit_flatten(state, layer, input) }
     if layer is Conv2d { return emit_conv(state, layer, input) }
     if layer is MaxPool2d { return emit_pool(state, layer, input) }
+    if layer is AvgPool2d { return emit_avg_pool(state, layer, input) }
+    if layer is LayerNorm { return emit_layer_norm(state, layer, input) }
     state.refuse("a layer this step does not express")
     return null
 }

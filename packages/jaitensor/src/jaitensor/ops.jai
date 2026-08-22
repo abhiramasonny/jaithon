@@ -538,62 +538,138 @@ kernel void select_backward(device const float* a [[buffer(0)]],
     grad[id] = mine ? upstream[id] : 0.0f;
 }
 
+/* A threadgroup to the row, for the same reason the forward takes one: a
+ * thread per row leaves a wide normalisation running on as many threads as
+ * there are rows, which for a batch of images flattened to a few thousand
+ * columns is a hundred-odd threads doing four passes each.
+ *
+ * The mean and the variance come out of one pass here rather than two --
+ * sum(x) and sum(x*x) give both -- so the row is read three times, not four. */
 kernel void layer_norm_backward(device const float* input [[buffer(0)]],
                                 device const float* gamma [[buffer(1)]],
                                 device const float* upstream [[buffer(2)]],
                                 device float* grad [[buffer(3)]],
-                                constant uint& rows [[buffer(4)]],
-                                constant uint& width [[buffer(5)]],
-                                uint row [[thread_position_in_grid]]) {
+                                device float* row_mean [[buffer(4)]],
+                                device float* row_inv [[buffer(5)]],
+                                constant uint& rows [[buffer(6)]],
+                                constant uint& width [[buffer(7)]],
+                                uint row [[threadgroup_position_in_grid]],
+                                uint lid [[thread_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint warp [[simdgroup_index_in_threadgroup]]) {
     if (row >= rows) return;
-    uint base = row * width;
+    const uint GROUP = 256u;
+    const uint base = row * width;
+    const float scale = 1.0f / float(width);
+    threadgroup float lanes_a[32];
+    threadgroup float lanes_b[32];
+    threadgroup float shared_mean;
+    threadgroup float shared_inv;
+    threadgroup float shared_dy;
+    threadgroup float shared_dy_xhat;
+
     float total = 0.0f;
-    for (uint i = 0; i < width; ++i) total += input[base + i];
-    float m = total / float(width);
-    float sq = 0.0f;
-    for (uint i = 0; i < width; ++i) {
-        float d = input[base + i] - m;
-        sq += d * d;
+    float square = 0.0f;
+    for (uint i = lid; i < width; i += GROUP) {
+        float v = input[base + i];
+        total += v;
+        square += v * v;
     }
-    float inv = rsqrt(sq / float(width) + 1e-5f);
+    if (lid < 32u) {
+        lanes_a[lid] = 0.0f;
+        lanes_b[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    square = simd_sum(square);
+    if (lane == 0u) {
+        lanes_a[warp] = total;
+        lanes_b[warp] = square;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float sa = 0.0f;
+        float sb = 0.0f;
+        for (uint j = 0u; j < 32u; j++) {
+            sa += lanes_a[j];
+            sb += lanes_b[j];
+        }
+        float m = sa * scale;
+        float r = rsqrt(sb * scale - m * m + 1e-5f);
+        shared_mean = m;
+        shared_inv = r;
+        /* Handed to the parameter pass, which is spread over columns and so
+         * cannot reduce a row for itself. */
+        row_mean[row] = m;
+        row_inv[row] = r;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float m = shared_mean;
+    const float inv = shared_inv;
+
     float sum_dy = 0.0f;
     float sum_dy_xhat = 0.0f;
-    for (uint i = 0; i < width; ++i) {
+    for (uint i = lid; i < width; i += GROUP) {
         float dy = upstream[base + i] * gamma[i];
         sum_dy += dy;
         sum_dy_xhat += dy * (input[base + i] - m) * inv;
     }
-    float scale = 1.0f / float(width);
-    for (uint i = 0; i < width; ++i) {
+    if (lid < 32u) {
+        lanes_a[lid] = 0.0f;
+        lanes_b[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum_dy = simd_sum(sum_dy);
+    sum_dy_xhat = simd_sum(sum_dy_xhat);
+    if (lane == 0u) {
+        lanes_a[warp] = sum_dy;
+        lanes_b[warp] = sum_dy_xhat;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float sa = 0.0f;
+        float sb = 0.0f;
+        for (uint j = 0u; j < 32u; j++) {
+            sa += lanes_a[j];
+            sb += lanes_b[j];
+        }
+        shared_dy = sa;
+        shared_dy_xhat = sb;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean_dy = shared_dy * scale;
+    const float mean_dy_xhat = shared_dy_xhat * scale;
+
+    for (uint i = lid; i < width; i += GROUP) {
         float dy = upstream[base + i] * gamma[i];
         float xhat = (input[base + i] - m) * inv;
-        grad[base + i] = inv * (dy - scale * sum_dy - scale * xhat * sum_dy_xhat);
+        grad[base + i] = inv * (dy - mean_dy - xhat * mean_dy_xhat);
     }
 }
 
+/* One thread to a column, reading the row statistics the input pass left
+ * behind.
+ *
+ * Each thread used to reduce every row itself to recover that row's mean and
+ * variance, which is the same work repeated once per column: for a row of four
+ * thousand columns it turned a pass over the batch into billions of reads, and
+ * a normalisation whose forward costs 0.03 ms had a backward costing 87 ms. */
 kernel void layer_norm_params_backward(device const float* input [[buffer(0)]],
                                        device const float* upstream [[buffer(1)]],
                                        device float* grad_gamma [[buffer(2)]],
                                        device float* grad_beta [[buffer(3)]],
-                                       constant uint& rows [[buffer(4)]],
-                                       constant uint& width [[buffer(5)]],
+                                       device const float* row_mean [[buffer(4)]],
+                                       device const float* row_inv [[buffer(5)]],
+                                       constant uint& rows [[buffer(6)]],
+                                       constant uint& width [[buffer(7)]],
                                        uint i [[thread_position_in_grid]]) {
     if (i >= width) return;
     float g = 0.0f;
     float b = 0.0f;
     for (uint row = 0; row < rows; ++row) {
         uint base = row * width;
-        float total = 0.0f;
-        for (uint j = 0; j < width; ++j) total += input[base + j];
-        float m = total / float(width);
-        float sq = 0.0f;
-        for (uint j = 0; j < width; ++j) {
-            float d = input[base + j] - m;
-            sq += d * d;
-        }
-        float inv = rsqrt(sq / float(width) + 1e-5f);
         float dy = upstream[base + i];
-        g += dy * (input[base + i] - m) * inv;
+        g += dy * (input[base + i] - row_mean[row]) * row_inv[row];
         b += dy;
     }
     grad_gamma[i] = g;
@@ -3725,12 +3801,41 @@ pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
         let rows = input.shape[0]
         output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
             let grad_input = Tensor(input.shape)
+            #: Written by the input pass and read by the parameter pass, which
+            #: runs after it on the same queue.
+            let row_mean = Tensor([rows])
+            let row_inv = Tensor([rows])
             let back = cached_kernel("layer_norm_backward")
-            back.dispatch_async([input.buffer(), gamma.buffer(), upstream.buffer(), grad_input.buffer()], rows, [rows, width])
+            back.dispatch_async(
+                [
+                    input.buffer(),
+                    gamma.buffer(),
+                    upstream.buffer(),
+                    grad_input.buffer(),
+                    row_mean.buffer(),
+                    row_inv.buffer(),
+                ],
+                rows * 256,
+                [rows, width],
+                group_size: 256
+            )
             let grad_gamma = Tensor([width])
             let grad_beta = Tensor([width])
             let params = cached_kernel("layer_norm_params_backward")
-            params.dispatch_async([input.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], width, [rows, width])
+            params.dispatch_async(
+                [
+                    input.buffer(),
+                    upstream.buffer(),
+                    grad_gamma.buffer(),
+                    grad_beta.buffer(),
+                    row_mean.buffer(),
+                    row_inv.buffer(),
+                ],
+                width,
+                [rows, width]
+            )
+            row_mean.free()
+            row_inv.free()
             return [grad_input, grad_gamma, grad_beta]
         }))
     }

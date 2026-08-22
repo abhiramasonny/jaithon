@@ -345,6 +345,33 @@ fn test_parameter_side_gradients() -> void {
     gamma.free()
 }
 
+#: A row wider than one threadgroup, which is where the normalisation's
+#: backward stops being one thread's work.
+#:
+#: The parameter pass is spread over columns and cannot reduce a row for
+#: itself, so it reads statistics the input pass leaves behind. Four columns
+#: never exercised either the strided loop or that handover.
+fn test_wide_normalisation_gradients() -> void {
+    if not have_gpu() { return }
+    let width = 320
+    let rows = 3
+    let normalised = Tensor([rows, width], spread(rows * width))
+    let gamma = Tensor([width], positive(width))
+    let beta = Tensor([width], spread(width))
+    check(fn(g: Tensor) -> Tensor {
+        return layer_norm(normalised, g, beta)
+    }, [width], positive(width))
+    check(fn(b: Tensor) -> Tensor {
+        return layer_norm(normalised, gamma, b)
+    }, [width], spread(width))
+    check(fn(x: Tensor) -> Tensor {
+        return layer_norm(x, gamma, beta)
+    }, [rows, width], spread(rows * width))
+    normalised.free()
+    gamma.free()
+    beta.free()
+}
+
 #: `gather_rows` differentiates in its table, not in its indices. A row picked
 #: twice must collect both gradients, which is the case a naive scatter drops.
 fn test_gather_rows_accumulates_repeated_indices() -> void {
