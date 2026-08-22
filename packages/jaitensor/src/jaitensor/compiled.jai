@@ -43,9 +43,12 @@ const OP_MUL = 2
 
 #: Unary op codes the graph builder takes.
 const UNARY_RELU = 0
+const UNARY_SIGMOID = 1
+const UNARY_TANH = 2
 const UNARY_EXP = 3
 const UNARY_LOG = 4
 const UNARY_NEGATE = 6
+const UNARY_SILU = 9
 
 #: What the forward pass of one layer became, and the parameters it used.
 #:
@@ -99,6 +102,48 @@ fn product(shape: list[int]) -> int {
     return total
 }
 
+#: A layer's activation, applied to what its affine part produced.
+#:
+#: Switched on the activation itself and not on `activation_code`, which
+#: reports Gelu, Silu and LeakyRelu as linear -- the layers apply those as a
+#: second operation after the affine one, so a step built from the code alone
+#: would drop them and train a different model without saying so.
+#:
+#: Softmax is linear here on purpose, and only ever on the last layer, which
+#: `Sequential` enforces: the loss takes logits and does the softmax itself.
+fn emit_activation(state: Build, value: int, activation: Activation) -> int {
+    let b = state.builder
+    if activation == Activation.Linear or activation == Activation.Softmax { return value }
+    if activation == Activation.Relu { return __prim__.graph_unary(b, value, UNARY_RELU) }
+    if activation == Activation.Sigmoid { return __prim__.graph_unary(b, value, UNARY_SIGMOID) }
+    if activation == Activation.Tanh { return __prim__.graph_unary(b, value, UNARY_TANH) }
+    if activation == Activation.Silu { return __prim__.graph_unary(b, value, UNARY_SILU) }
+    if activation == Activation.LeakyRelu { return __prim__.graph_leaky_relu(b, value, 0.01) }
+    if activation == Activation.Gelu {
+        #: The same tanh approximation `ops.gelu` computes, so the two agree:
+        #: 0.5 x (1 + tanh(0.7978845608 (x + 0.044715 x^3))).
+        let cubed = __prim__.graph_binary(
+            b,
+            __prim__.graph_binary(b, value, value, OP_MUL),
+            value,
+            OP_MUL
+        )
+        let weighted = __prim__.graph_binary(b, cubed, scalar(state, 0.044715), OP_MUL)
+        let inner = __prim__.graph_binary(b, value, weighted, OP_ADD)
+        let scaled = __prim__.graph_binary(b, inner, scalar(state, 0.7978845608), OP_MUL)
+        let curved = __prim__.graph_unary(b, scaled, UNARY_TANH)
+        let shifted = __prim__.graph_binary(b, curved, scalar(state, 1.0), OP_ADD)
+        let halved = __prim__.graph_binary(b, value, scalar(state, 0.5), OP_MUL)
+        return __prim__.graph_binary(b, halved, shifted, OP_MUL)
+    }
+    state.refuse(f"an activation this step cannot express ({activation})")
+    return -1
+}
+
+fn scalar(state: Build, value: float) -> int {
+    return __prim__.graph_constant(state.builder, [value], [1])
+}
+
 #: One layer's forward, as graph operations. Null when it cannot be expressed.
 #:
 #: Each kind gets its own function taking `any` and guarding at the top,
@@ -117,11 +162,9 @@ fn emit_dense(state: Build, layer: any, input: Built) -> Built? {
     let producted = __prim__.graph_matmul(b, input.value, weights)
     let biased = __prim__.graph_binary(b, producted, bias, OP_ADD)
     let shape = [input.shape[0], width]
-    let code = layer.activation_code()
-    if code == 0 { return Built(biased, shape) }
-    if code == 1 { return Built(__prim__.graph_unary(b, biased, UNARY_RELU), shape) }
-    state.refuse(f"a dense activation this step cannot express ({code})")
-    return null
+    let activated = emit_activation(state, biased, layer.activation)
+    if activated < 0 { return null }
+    return Built(activated, shape)
 }
 
 fn emit_flatten(state: Build, layer: any, input: Built) -> Built? {
@@ -161,12 +204,9 @@ fn emit_conv(state: Build, layer: any, input: Built) -> Built? {
     let height = (input.shape[1] + 2 * pad - size) // stride + 1
     let width = (input.shape[2] + 2 * pad - size) // stride + 1
     let shape = [input.shape[0], height, width, params[0].shape[3]]
-    if layer.activation == Activation.Linear { return Built(made, shape) }
-    if layer.activation == Activation.Relu {
-        return Built(__prim__.graph_unary(b, made, UNARY_RELU), shape)
-    }
-    state.refuse(f"a convolution activation this step cannot express ({layer.activation})")
-    return null
+    let activated = emit_activation(state, made, layer.activation)
+    if activated < 0 { return null }
+    return Built(activated, shape)
 }
 
 fn emit_pool(state: Build, layer: any, input: Built) -> Built? {
