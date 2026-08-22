@@ -166,6 +166,7 @@ pub class Painter {
     #: Rows waiting for the device, three numbers each: row, first column, and
     #: how many pixels.
     var pending: list[float]
+    var queued: int
     var widest: int
 
     pub fn init(self, image: Mat, colour: Scalar) {
@@ -181,6 +182,7 @@ pub class Painter {
         for channel in 0..self.cn { saturated.push(self.saturate(colour[min(channel, 3)])) }
         self.colour = saturated
         self.pending = []
+        self.queued = 0
         self.widest = 0
         self.mirror = if self.device_capable() { null } else { image.edit() }
     }
@@ -242,6 +244,77 @@ pub class Painter {
         }
     }
 
+    #: Every pixel of a walked line, in one call.
+    pub fn stroke(self, step: LineWalk, connectivity: int) -> void {
+        let held = self.mirror
+        if held is null {
+            let added = __prim__.line_spans(
+                self.pending,
+                step.x,
+                step.y,
+                step.dx,
+                step.dy,
+                step.major_x,
+                step.major_y,
+                step.minor_x,
+                step.minor_y,
+                connectivity,
+                self.cols,
+                self.rows
+            )
+            self.queued += added
+            if self.widest < 1 { self.widest = 1 }
+            return
+        }
+        __prim__.line_paint(
+            held,
+            self.colour,
+            self.cn,
+            step.x,
+            step.y,
+            step.dx,
+            step.dy,
+            step.major_x,
+            step.major_y,
+            step.minor_x,
+            step.minor_y,
+            connectivity,
+            self.cols,
+            self.rows
+        )
+    }
+
+    #: Every row of a convex polygon, in one call. `corners` is the x and y of
+    #: each in turn, in fixed point with `shift` fractional bits.
+    pub fn fill(self, corners: list[int], shift: int, delta1: int, delta2: int) -> void {
+        let held = self.mirror
+        if held is null {
+            let told = __prim__.convex_spans(
+                self.pending,
+                corners,
+                shift,
+                delta1,
+                delta2,
+                self.cols,
+                self.rows
+            )
+            self.queued += told[0]
+            if told[1] > self.widest { self.widest = told[1] }
+            return
+        }
+        __prim__.convex_paint(
+            held,
+            self.colour,
+            self.cn,
+            corners,
+            shift,
+            delta1,
+            delta2,
+            self.cols,
+            self.rows
+        )
+    }
+
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
     #:
     #: One primitive or one batched row rather than a `plot` a pixel. Every
@@ -270,21 +343,24 @@ pub class Painter {
     #: has grown lopsided enough that the idle threads would cost more than
     #: the download.
     fn queue(self, y: int, x: int, run: int) -> void {
-        let widest = max(self.widest, run)
-        if (self.pending.len() // 3 + 1) * widest > SPAN_WASTE_CEILING {
+        let widest = if run > self.widest { run } else { self.widest }
+        if (self.queued + 1) * widest > SPAN_WASTE_CEILING {
             let values = self.on_host()
             __prim__.list_fill_pattern(values, (y * self.cols + x) * self.cn, run, self.colour)
             return
         }
         self.widest = widest
-        self.pending.push(float(y))
-        self.pending.push(float(x))
-        self.pending.push(float(run))
+        self.queued += 1
+        #: One call rather than three. Every pixel of every thin stroke and
+        #: every letter comes through here, and a row of one of those is a
+        #: single pixel, so the three appends were the whole cost of drawing
+        #: one.
+        __prim__.list_push3(self.pending, float(y), float(x), float(run))
     }
 
     #: Send the batched rows to the device.
     fn commit(self) -> void {
-        let count = self.pending.len() // 3
+        let count = self.queued
         if count == 0 { return }
         let rows_buffer = Buffer.of(self.pending)
         let colour_buffer = Buffer.of(self.colour)
@@ -296,6 +372,7 @@ pub class Painter {
         rows_buffer.free()
         colour_buffer.free()
         self.pending = []
+        self.queued = 0
         self.widest = 0
         self.image.invalidate()
     }
@@ -444,15 +521,80 @@ fn walk(
     return out
 }
 
+#: A one-pixel line, walked in one call rather than a point at a time.
+#:
+#: The clipping and the choice of major axis stay here, because they are done
+#: once and they are the subtle part; only the walk itself, which is one step
+#: per pixel, goes across. Building a point for each of those and then writing
+#: them one by one cost about a hundred nanoseconds a pixel, and the outlines
+#: of a detector's boxes are some four thousand pixels a frame.
 fn draw_thin_line(painter: Painter, pt1: Point, pt2: Point, line_type: int) -> void {
     if line_type == LINE_AA {
         draw_line_aa(painter, pt1, pt2)
         return
     }
     let connectivity = if line_type == LINE_4 { 4 } else { 8 }
-    for point in line_points(Size(painter.cols, painter.rows), pt1, pt2, connectivity) {
-        painter.plot(point.x, point.y)
+    let step = line_walk(Size(painter.cols, painter.rows), pt1, pt2, connectivity)
+    if step is null { return }
+    painter.stroke(step, connectivity)
+}
+
+#: A clipped line reduced to what the walk needs: where it starts, how far it
+#: goes on each axis, and which way each step moves.
+class LineWalk {
+    pub let x: int
+    pub let y: int
+    pub let dx: int
+    pub let dy: int
+    pub let major_x: int
+    pub let major_y: int
+    pub let minor_x: int
+    pub let minor_y: int
+
+    pub fn init(
+        self,
+        x: int,
+        y: int,
+        dx: int,
+        dy: int,
+        major_x: int,
+        major_y: int,
+        minor_x: int,
+        minor_y: int
+    ) {
+        self.x = x
+        self.y = y
+        self.dx = dx
+        self.dy = dy
+        self.major_x = major_x
+        self.major_y = major_y
+        self.minor_x = minor_x
+        self.minor_y = minor_y
     }
+}
+
+#: Clip a segment and settle its major axis, or `null` when none of it shows.
+#: The arithmetic is `line_points`', so both put a line on the same pixels.
+fn line_walk(size: Size, pt1: Point, pt2: Point, connectivity: int) -> LineWalk? {
+    let (visible, clipped_a, clipped_b) = clip_line(size, pt1, pt2)
+    if not visible { return null }
+
+    var a = clipped_a
+    var b = clipped_b
+    if b.x < a.x or b.x == a.x and b.y < a.y {
+        a = clipped_b
+        b = clipped_a
+    }
+
+    var dx = b.x - a.x
+    var dy = b.y - a.y
+    let step_x = if dx < 0 { -1 } else { 1 }
+    let step_y = if dy < 0 { -1 } else { 1 }
+    if dx < 0 { dx = -dx }
+    if dy < 0 { dy = -dy }
+
+    if dy > dx { return LineWalk(a.x, a.y, dy, dx, 0, step_y, step_x, 0) }
+    return LineWalk(a.x, a.y, dx, dy, step_x, 0, 0, step_y)
 }
 
 fn draw_line_aa(painter: Painter, pt1: Point, pt2: Point) -> void {
@@ -683,60 +825,20 @@ fn fill_convex(painter: Painter, points: list[Point], line_type: int, shift: int
         }
     }
 
-    x_min = x_min + delta >> shift
-    x_max = x_max + delta >> shift
-    y_min = y_min + delta >> shift
-    y_max = y_max + delta >> shift
-    if x_max < 0 or y_max < 0 or x_min >= painter.cols or y_min >= painter.rows { return }
-    y_max = min(y_max, painter.rows - 1)
-
-    var index_of = [top, top]
-    let direction = [1, count - 1]
-    var end_y = [y_min, y_min]
-    var edge_x = [-XY_ONE, -XY_ONE]
-    var edge_dx = [0, 0]
-    var remaining = count
-    var y = y_min
-
-    while y <= y_max {
-        var exhausted = false
-        for side in 0..2 {
-            if y < end_y[side] { continue }
-            var idx = index_of[side]
-            let di = direction[side]
-            var xs = 0
-            var ty = 0
-            loop {
-                ty = points[idx].y + delta >> shift
-                if ty > y or remaining == 0 { break }
-                xs = points[idx].x
-                idx += di
-                if idx >= count { idx -= count }
-                remaining -= 1
-            }
-            if y >= ty {
-                #: Both chains have reached the last vertex; this row is the
-                #: bottom of the polygon and still belongs to it.
-                exhausted = true
-                break
-            }
-            end_y[side] = ty
-            let start = xs << XY_SHIFT - shift
-            let finish = points[idx].x << XY_SHIFT - shift
-            edge_dx[side] = trunc_div((finish - start) * 2 + (ty - y), 2 * (ty - y))
-            edge_x[side] = start
-            index_of[side] = idx
-        }
-        if y >= 0 {
-            let left = if edge_x[0] > edge_x[1] { 1 } else { 0 }
-            let right = 1 - left
-            painter.span(edge_x[left] + delta1 >> XY_SHIFT, edge_x[right] + delta2 >> XY_SHIFT, y)
-        }
-        if exhausted { return }
-        edge_x[0] += edge_dx[0]
-        edge_x[1] += edge_dx[1]
-        y += 1
+    #: The scanline walk itself is one call. Every filled shape and every
+    #: stroke wider than a pixel is made of these rows, and a row cost about
+    #: half a microsecond written here -- a box two pixels thick over a 720p
+    #: frame is some six hundred of them. The arithmetic is the same on the
+    #: other side, so the rows land on the same pixels.
+    var flat: list[int] = []
+    for point in points {
+        flat.push(point.x)
+        flat.push(point.y)
     }
+    painter.fill(flat, shift, delta1, delta2)
+    #: `top`, `x_min` and the rest are settled over there too; keeping them
+    #: here would only be a second copy of the same scan.
+    let _unused = [x_min, x_max, y_min, y_max, top, delta]
 }
 
 fn draw_circle(painter: Painter, centre: Point, radius: int, filled: bool, line_type: int) -> void {
