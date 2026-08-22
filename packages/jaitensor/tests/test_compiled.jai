@@ -300,3 +300,51 @@ fn test_momentum_is_carried_through_the_graph() -> void {
         step.free()
     }
 }
+
+#: Adam, with its two moments and its bias correction, carried through the
+#: graph rather than left to the optimizer's own kernel.
+#:
+#: The correction divides by what each moment would have been had it not
+#: started at rest, which depends on how many steps have been taken -- so the
+#: count is carried too. Several steps, because a count that does not advance
+#: looks right on the first and wrong after.
+fn test_adam_is_carried_through_the_graph() -> void {
+    if not gpu.is_available() { return }
+    let (x, y) = batch()
+    let rate = 0.01
+    let step = compile_step(
+        convolutional(5),
+        [BATCH, SIDE, SIDE, CHANNELS],
+        CLASSES,
+        rate,
+        adam: true
+    )
+    assert_true(step is not null, f"adam would not compile: {refusal()}")
+    for _iteration in 0..5 { step.run(x, y) }
+    step.settle()
+
+    let layers = convolutional(5)
+    let loss = SparseCategoricalCrossentropy(from_logits: true)
+    let optimizer = jt.Adam(learning_rate: rate)
+    var params: list[Tensor] = []
+    for layer in layers {
+        for param in layer.parameters() { params.push(param) }
+    }
+    prepare_state(params, optimizer.settings())
+    for _iteration in 0..5 {
+        var carried = x
+        for layer in layers { carried = layer.forward(carried) }
+        loss.forward(carried, y).backward()
+        optimizer.step(params)
+        for param in params { param.grad = null }
+    }
+
+    for (index, param) in step.params.enumerate() {
+        let got = param.download()
+        let want = params[index].download()
+        for slot in 0..got.len() {
+            assert_near(got[slot], want[slot], 1e-4, f"parameter {index} slot {slot}")
+        }
+    }
+    step.free()
+}
