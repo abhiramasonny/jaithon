@@ -23,7 +23,7 @@ from jaicv.core.types import CMP_GT, Point, Range, Rect, Scalar, Size, type_to_s
 from jaicv.core.arith import add, absdiff, bitwise_not, compare_scalar, divide, in_range
 from jaicv.core.arith import lut, multiply, subtract
 from jaicv.core.stats import count_non_zero, mean, min_max_loc, norm, normalize, sum_mat
-from jaicv.core.types import NORM_L2, NORM_MINMAX
+from jaicv.core.types import NORM_INF, NORM_L1, NORM_L2, NORM_L2SQR, NORM_MINMAX
 from jaicv.core.cluster import kmeans, PCA
 from jaicv.core.dft import dft, idft, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DFT_SCALE
 from jaicv.imgcodecs.codecs import imdecode, imencode, sniff
@@ -959,4 +959,46 @@ fn test_normalize_rescales_both_ways() -> void {
     for value in spread_flat.to_list() {
         assert_true(math.is_finite(value), "a flat picture must not produce infinities")
     }
+}
+
+#: Each norm against its definition, because the four now take two paths.
+#:
+#: `norm` used to work out all of them and pick one at the end, which cost a
+#: second reduction over the whole picture for the infinity norm even when
+#: nobody asked for it. Now the infinity norm goes one way and the rest go
+#: another, and a branch that returns the wrong one would be silent.
+fn test_every_norm_matches_its_definition() -> void {
+    if not gpu.is_available() { return }
+    var values: list[float] = []
+    for index in 0..60 { values.push(float(index * 23 % 37) - 18.0) }
+    let source = Mat.from_list(6, 10, CV_32FC1, values)
+    defer { source.release() }
+
+    var l1 = 0.0
+    var squares = 0.0
+    var largest = 0.0
+    for value in values {
+        l1 += math.fabs(value)
+        squares += value * value
+        if math.fabs(value) > largest { largest = math.fabs(value) }
+    }
+    assert_near(norm(source, norm_type: NORM_L1), l1, l1 * 1e-5, "L1")
+    assert_near(norm(source, norm_type: NORM_L2SQR), squares, squares * 1e-5, "L2 squared")
+    assert_near(
+        norm(source, norm_type: NORM_L2),
+        math.sqrt(squares),
+        math.sqrt(squares) * 1e-5,
+        "L2"
+    )
+    assert_near(norm(source, norm_type: NORM_INF), largest, 1e-4, "infinity")
+
+    #: The difference of two pictures, which is the other way it is called.
+    let shifted = Mat.from_list(6, 10, CV_32FC1, [value + 2.0 for value in values])
+    defer { shifted.release() }
+    assert_near(
+        norm(source, shifted, norm_type: NORM_INF),
+        2.0,
+        1e-4,
+        "a constant shift has that infinity norm"
+    )
 }

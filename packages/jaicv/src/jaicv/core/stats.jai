@@ -171,6 +171,93 @@ kernel void stats_reduce_axis(device const float* src [[buffer(0)]],
     if (op == 1u) acc /= float(length);
     dst[d_off + (dim == 0u ? 0u : lane) * d_step + (dim == 0u ? lane : 0u) * cn + channel] = acc;
 }
+/* The partials folded down on the device, so only four numbers come back.
+ *
+ * A 1080p frame is eight thousand groups, and reading all of their partials
+ * back to add them up on the host cost more than the reduction did: 0.5 ms to
+ * sum an eight megabyte picture, against 0.03 ms of actual reading. One more
+ * pass, and the download is four floats.
+ *
+ * A threadgroup to each of the four lanes -- total, absolute, squares, count
+ * -- because they combine independently. */
+kernel void stats_join(device const float* partials [[buffer(0)]],
+                       device float* out [[buffer(1)]],
+                       constant uint& groups [[buffer(2)]],
+                       uint slot [[threadgroup_position_in_grid]],
+                       uint lid [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float lanes[32];
+    float running = 0.0f;
+    for (uint g = lid; g < groups; g += GROUP) running += partials[g * 4u + slot];
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    running = simd_sum(running);
+    if (lane == 0u) lanes[warp] = running;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    float total = 0.0f;
+    for (uint j = 0u; j < 32u; j++) total += lanes[j];
+    out[slot] = total;
+}
+
+/* The same fold for the extremes, which combine by comparison rather than by
+ * adding, and which carry the position the extreme was found at.
+ *
+ * A group that saw nothing -- every element masked out -- marks its positions
+ * negative, and those must not win. */
+kernel void stats_join_extrema(device const float* partials [[buffer(0)]],
+                               device float* out [[buffer(1)]],
+                               constant uint& groups [[buffer(2)]],
+                               uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float best_low[GROUP];
+    threadgroup float best_high[GROUP];
+    threadgroup float low_at[GROUP];
+    threadgroup float high_at[GROUP];
+
+    float my_low = 0.0f;
+    float my_high = 0.0f;
+    float my_low_at = -1.0f;
+    float my_high_at = -1.0f;
+    for (uint g = lid; g < groups; g += GROUP) {
+        float group_low = partials[g * 4u + 0u];
+        float group_high = partials[g * 4u + 1u];
+        float group_low_at = partials[g * 4u + 2u];
+        float group_high_at = partials[g * 4u + 3u];
+        if (group_low_at >= 0.0f && (my_low_at < 0.0f || group_low < my_low)) {
+            my_low = group_low;
+            my_low_at = group_low_at;
+        }
+        if (group_high_at >= 0.0f && (my_high_at < 0.0f || group_high > my_high)) {
+            my_high = group_high;
+            my_high_at = group_high_at;
+        }
+    }
+    best_low[lid] = my_low;
+    best_high[lid] = my_high;
+    low_at[lid] = my_low_at;
+    high_at[lid] = my_high_at;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    float low = 0.0f;
+    float high = 0.0f;
+    float low_where = -1.0f;
+    float high_where = -1.0f;
+    for (uint j = 0u; j < GROUP; j++) {
+        if (low_at[j] >= 0.0f && (low_where < 0.0f || best_low[j] < low)) {
+            low = best_low[j];
+            low_where = low_at[j];
+        }
+        if (high_at[j] >= 0.0f && (high_where < 0.0f || best_high[j] > high)) {
+            high = best_high[j];
+            high_where = high_at[j];
+        }
+    }
+    out[0] = low;
+    out[1] = high;
+    out[2] = low_where;
+    out[3] = high_where;
+}
 """
 
 var _kernels: dict[str, Kernel] = {}
@@ -183,16 +270,36 @@ fn kernel_for(entry: str) -> Kernel {
     return compiled
 }
 
-fn reduce_partials(entry: str, src: Mat, mask: Mat?, channel: int) -> list[float] {
-    src.flush()
+#: The partials, folded to four numbers on the device before they come back.
+#:
+#: `join` names the kernel that combines them -- adding for the sums, comparing
+#: for the extremes. Downloading every group's partial and folding it on the
+#: host is what this replaces: eight thousand of them for a 1080p frame.
+fn reduced(entry: str, join: str, src: Mat, mask: Mat?, channel: int) -> list[float] {
     let count = src.rows * src.cols
     if count == 0 { return [] }
     let groups = (count + GROUP - 1) // GROUP
+    let partials = reduce_buffer(entry, src, mask, channel, groups)
+    let folded = Buffer(4)
+    let lanes = if join == "stats_join" { 4 } else { 1 }
+    #: Both passes queued, so the only wait is the four-float download at the
+    #: end. A blocking dispatch apiece costs two synchronisations per call and
+    #: was most of what a reduction over a 1080p frame took.
+    kernel_for(join).dispatch_async([partials, folded], lanes * GROUP, [groups], group_size: GROUP)
+    let out = folded.download()
+    partials.free()
+    folded.free()
+    return out
+}
+
+fn reduce_buffer(entry: str, src: Mat, mask: Mat?, channel: int, groups: int) -> Buffer {
+    src.flush()
+    let count = src.rows * src.cols
     let partials = Buffer(groups * 4)
     let use_mask = if mask is null { 0 } else { 1 }
     let mask_mat = if mask is null { src } else { mask }
     if mask is not null { mask.flush() }
-    kernel_for(entry).dispatch(
+    kernel_for(entry).dispatch_async(
         [src.storage, mask_mat.storage, partials],
         groups * GROUP,
         [
@@ -208,14 +315,12 @@ fn reduce_partials(entry: str, src: Mat, mask: Mat?, channel: int) -> list[float
         ],
         group_size: GROUP
     )
-    let values = partials.download()
-    partials.free()
-    return values
+    return partials
 }
 
 #: Sum, absolute sum, sum of squares, and non-zero count of one channel.
 pub fn channel_stats(src: Mat, channel: int, mask: Mat? = null) -> tuple[float, float, float, int] {
-    let partials = reduce_partials("stats_reduce", src, mask, channel)
+    let partials = reduced("stats_reduce", "stats_join", src, mask, channel)
     var total = 0.0
     var absolute = 0.0
     var squares = 0.0
@@ -299,7 +404,7 @@ pub fn min_max_loc(src: Mat, mask: Mat? = null) -> tuple[float, float, Point, Po
     if src.channels() != 1 {
         throw ValueError("min_max_loc needs a single-channel Mat; split it first")
     }
-    let partials = reduce_partials("stats_extrema", src, mask, 0)
+    let partials = reduced("stats_extrema", "stats_join_extrema", src, mask, 0)
     var low = 0.0
     var high = 0.0
     var low_at = -1
@@ -351,20 +456,27 @@ pub fn norm(src: Mat, other: Mat? = null, norm_type: int = NORM_L2, mask: Mat? =
             UN_ABS
         )
     }
+    #: Only the norm that was asked for. Working out all three means a second
+    #: reduction over the whole picture for the infinity norm -- and a split
+    #: per channel to feed it -- which doubled what an L2 cost.
+    if norm_type == NORM_INF {
+        var inf = 0.0
+        for channel in 0..target.channels() {
+            let plane = if target.channels() == 1 { target } else { target.split()[channel] }
+            let (low, high) = min_max(plane, mask: mask)
+            inf = max(inf, max(math.fabs(low), math.fabs(high)))
+        }
+        return inf
+    }
     var l1 = 0.0
     var l2 = 0.0
-    var inf = 0.0
     for channel in 0..target.channels() {
         let (_total, absolute, squares, _nonzero) = channel_stats(target, channel, mask: mask)
         l1 += absolute
         l2 += squares
-        let plane = if target.channels() == 1 { target } else { target.split()[channel] }
-        let (low, high) = min_max(plane, mask: mask)
-        inf = max(inf, max(math.fabs(low), math.fabs(high)))
     }
     if norm_type == NORM_L1 { return l1 }
     if norm_type == NORM_L2SQR { return l2 }
-    if norm_type == NORM_INF { return inf }
     return math.sqrt(l2)
 }
 
