@@ -8,6 +8,9 @@ import std.math
 from std.io import Path, write_bytes
 from std.os import temp_dir
 from std.test import assert_eq, assert_near, assert_throws, assert_true
+from jaicv.imgproc.filter import filter_2d, sep_filter_2d
+from jaicv.core.types import BORDER_CONSTANT, BORDER_REFLECT, BORDER_REFLECT_101
+from jaicv.core.types import BORDER_REPLICATE
 from jaicv.core.mat import Mat, flip, merge
 from jaicv.core.types import CV_8UC1, CV_8UC3, CV_8UC4, CV_16UC3, CV_32FC1, CV_32FC3
 from jaicv.core.types import CV_MAKETYPE, CV_MAT_CN, CV_MAT_DEPTH, CV_8U, CV_32F
@@ -533,4 +536,47 @@ fn test_drawing_on_a_single_pixel() -> void {
     assert_eq(frame.values(), [10.0, 20.0, 30.0])
     line(frame, Point(-9, 0), Point(9, 0), Scalar(40.0, 50.0, 60.0), 1)
     assert_eq(frame.values(), [40.0, 50.0, 60.0])
+}
+
+#: A separable filter is two one-dimensional passes, and it has to land where
+#: the two-dimensional filter built from the same outer product lands.
+#:
+#: It once did the whole square window per pixel, which is correct and is the
+#: work being separable exists to avoid. Splitting it means each pass extends
+#: only its own axis, so a border handled on the wrong axis, or the two kernels
+#: swapped, now has somewhere to hide -- an asymmetric kernel and a reflecting
+#: border are what bring both out.
+fn test_a_separable_filter_matches_the_square_it_stands_for() -> void {
+    if not gpu.is_available() { return }
+    let side = 37
+    var pixels: list[float] = []
+    for index in 0..side * side { pixels.push(float(index * 41 % 251) * 0.01 - 1.25) }
+    let source = Mat.from_list(side, side, CV_32FC1, pixels)
+
+    let across = [0.11, -0.27, 0.63, 0.19, -0.08]
+    let down = [-0.31, 0.44, 0.22, 0.07, 0.51, -0.13, 0.29]
+    let row = Mat.from_list(1, across.len(), CV_32FC1, across)
+    let column = Mat.from_list(down.len(), 1, CV_32FC1, down)
+    var square: list[float] = []
+    for vertical in down {
+        for horizontal in across { square.push(vertical * horizontal) }
+    }
+    let whole = Mat.from_list(down.len(), across.len(), CV_32FC1, square)
+
+    for border in [BORDER_REPLICATE, BORDER_REFLECT, BORDER_REFLECT_101, BORDER_CONSTANT] {
+        let apart = sep_filter_2d(source, CV_32F, row, column, border_mode: border)
+        let together = filter_2d(source, CV_32F, whole, border_mode: border)
+        let got = apart.to_list()
+        let want = together.to_list()
+        assert_eq(got.len(), want.len())
+        for index in 0..got.len() {
+            assert_near(got[index], want[index], 1e-4, f"border {border}, pixel {index}")
+        }
+        apart.release()
+        together.release()
+    }
+    source.release()
+    row.release()
+    column.release()
+    whole.release()
 }
