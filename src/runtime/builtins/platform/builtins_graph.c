@@ -532,13 +532,14 @@ static bool nGraphLstm(int argc, Value *args, Value *out) {
 static bool nGraphGru(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
-    int64_t slots[6];
+    int64_t slots[8];
     if (!requireBuilder(args[0], 1, "graph_gru", &builder)) return false;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         if (!jaiArgInt(args[1 + i], 2 + i, "graph_gru", &slots[i])) return false;
     }
     *out = INT_VAL(jaiGraphGru(builder, (int)slots[0], (int)slots[1], (int)slots[2],
-                               (int)slots[3], (int)slots[4], (int)slots[5]));
+                               (int)slots[3], (int)slots[4], (int)slots[5],
+                               (int)slots[6], (int)slots[7]));
     return true;
 }
 
@@ -700,7 +701,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_layer_norm",     nGraphLayerNorm,      6, 6);
     jaiDefineNative("__prim__.graph_gemm",           nGraphGemm,           8, 8);
     jaiDefineNative("__prim__.graph_lstm",           nGraphLstm,           8, 8);
-    jaiDefineNative("__prim__.graph_gru",            nGraphGru,            7, 7);
+    jaiDefineNative("__prim__.graph_gru",            nGraphGru,            9, 9);
     jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);
     jaiDefineNative("__prim__.graph_plan_output_shape", nGraphPlanOutputShape, 2, 2);
     jaiDefineNative("__prim__.graph_run",            nGraphRun,            3, 3);

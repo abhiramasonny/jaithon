@@ -1013,15 +1013,24 @@ fn regated(values: list[float], direction: int, hidden: int, width: int) -> list
 
 #: ONNX `LSTM` as the platform's single operation.
 #:
-#: Only what maps exactly: one direction, no peepholes, no per-sequence
+#: Only what maps exactly: forward or reverse, no peepholes, no per-sequence
 #: lengths, the default activations. Anything else is left to the interpreter,
 #: which implements the whole operator.
 fn emit_lstm(state: Build, node: GraphNode) -> bool {
     let b = state.builder
     if node.outputs.len() == 0 { return false }
     #: One direction at a time. A reversed pass comes back in the order it ran
-    #: rather than indexed by timestep, which is put right below; bidirectional
-    #: is two passes concatenated and is left to the interpreter.
+    #: rather than indexed by timestep, which is put right below.
+    #:
+    #: Bidirectional is left to the interpreter. The operation has a flag for
+    #: it and the shapes its header describes line up with what ONNX carries --
+    #: `[2, 4H, H]` recurrent weights, `[8H, I]` input weights, `[8H]` bias,
+    #: `[N, 2H]` initial state, `[T, N, 2H]` out -- but feeding it those gave an
+    #: answer half a unit off the reference, and neither swapping the two
+    #: halves of the channel axis nor turning either of them around in time
+    #: brought it closer. Something about the layout is not what the header
+    #: says, and an operator the interpreter already runs correctly is not
+    #: worth guessing at.
     let heading = attr_str(node, "direction", "forward")
     if heading != "forward" and heading != "reverse" { return false }
     let backwards = heading == "reverse"
