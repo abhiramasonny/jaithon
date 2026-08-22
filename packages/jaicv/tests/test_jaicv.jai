@@ -639,33 +639,37 @@ fn test_a_rectangular_morphology_matches_the_window_it_stands_for() -> void {
 #: is held against is the transform's own definition.
 fn test_the_staged_transform_agrees_with_the_definition() -> void {
     if not gpu.is_available() { return }
-    let side = 8
-    var pixels: list[float] = []
-    for index in 0..side * side { pixels.push(float(index % 13) * 0.25 - 1.5) }
-    let image = Mat.from_list(side, side, CV_32FC1, pixels)
-    defer { image.release() }
-    let spectrum = dft(image, DFT_COMPLEX_OUTPUT)
-    defer { spectrum.release() }
-    let got = spectrum.to_list()
-
-    for u in 0..side {
-        for v in 0..side {
-            var real = 0.0
-            var imaginary = 0.0
-            for y in 0..side {
-                for x in 0..side {
-                    let angle = -2.0 *
-                        math.PI *
-                        (float(u * y) / float(side) + float(v * x) / float(side))
-                    let sample = pixels[y * side + x]
-                    real += sample * math.cos(angle)
-                    imaginary += sample * math.sin(angle)
+    #: Eight is radix two throughout; the others bring in the three and five
+    #: stages, and give the two axes different factors, so an `m` that does not
+    #: follow the radices already applied shows up here.
+    for shape in [[8, 8], [6, 10], [12, 9], [5, 4]] {
+        let rows = shape[0]
+        let cols = shape[1]
+        var pixels: list[float] = []
+        for index in 0..rows * cols { pixels.push(float(index % 13) * 0.25 - 1.5) }
+        let image = Mat.from_list(rows, cols, CV_32FC1, pixels)
+        let spectrum = dft(image, DFT_COMPLEX_OUTPUT)
+        let got = spectrum.to_list()
+        for u in 0..rows {
+            for v in 0..cols {
+                var real = 0.0
+                var imaginary = 0.0
+                for y in 0..rows {
+                    for x in 0..cols {
+                        let turn = float(u * y) / float(rows) + float(v * x) / float(cols)
+                        let angle = -2.0 * math.PI * turn
+                        let sample = pixels[y * cols + x]
+                        real += sample * math.cos(angle)
+                        imaginary += sample * math.sin(angle)
+                    }
                 }
+                let slot = (u * cols + v) * 2
+                assert_near(got[slot], real, 1e-3, f"{rows}x{cols} real at {u},{v}")
+                assert_near(got[slot + 1], imaginary, 1e-3, f"{rows}x{cols} at {u},{v}")
             }
-            let slot = (u * side + v) * 2
-            assert_near(got[slot], real, 1e-3, f"real part at {u},{v}")
-            assert_near(got[slot + 1], imaginary, 1e-3, f"imaginary part at {u},{v}")
         }
+        spectrum.release()
+        image.release()
     }
 }
 

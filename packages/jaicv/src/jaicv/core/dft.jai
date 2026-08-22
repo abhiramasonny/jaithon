@@ -84,6 +84,67 @@ kernel void dft_stage(device const float* in_real [[buffer(0)]],
     out_imaginary[o1] = ai - ti;
 }
 
+/* The same stage for a radix of three or five.
+ *
+ * The radix-two kernel above is this with `r` fixed at two and the sums
+ * written out; keeping both means the common case does not pay for a loop over
+ * a runtime bound. The two agree by construction:
+ *
+ *   a[u] = x[blk*m + k + u*(n/r)] * exp(sign*2pi*i*u*k/(r*m))
+ *   y[r*blk*m + k + t*m] = sum over u of a[u] * exp(sign*2pi*i*u*t/r)
+ *
+ * `m` is the product of the radices already applied, so the two-three-five
+ * factors of a length can be taken in any order as long as `m` follows. */
+kernel void dft_stage_mixed(device const float* in_real [[buffer(0)]],
+                            device const float* in_imaginary [[buffer(1)]],
+                            device float* out_real [[buffer(2)]],
+                            device float* out_imaginary [[buffer(3)]],
+                            constant uint& count [[buffer(4)]],
+                            constant uint& n [[buffer(5)]],
+                            constant uint& m [[buffer(6)]],
+                            constant uint& radix [[buffer(7)]],
+                            constant uint& base_stride [[buffer(8)]],
+                            constant uint& line_stride [[buffer(9)]],
+                            constant uint& sign_bits [[buffer(10)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint groups = n / radix;
+    uint line = id / groups;
+    uint j = id - line * groups;
+    uint k = j % m;
+    uint block = j / m;
+    float sign = as_type<float>(sign_bits);
+    float tau = 6.283185307179586f;
+    uint lb = line * line_stride;
+
+    float ar[5];
+    float ai[5];
+    for (uint u = 0u; u < radix; ++u) {
+        uint at = lb + (block * m + k + u * groups) * base_stride;
+        float xr = in_real[at];
+        float xi = in_imaginary[at];
+        float angle = sign * tau * float(u) * float(k) / float(radix * m);
+        float wr = cos(angle);
+        float wi = sin(angle);
+        ar[u] = xr * wr - xi * wi;
+        ai[u] = xr * wi + xi * wr;
+    }
+    for (uint t = 0u; t < radix; ++t) {
+        float sr = 0.0f;
+        float si = 0.0f;
+        for (uint u = 0u; u < radix; ++u) {
+            float angle = sign * tau * float(u) * float(t) / float(radix);
+            float wr = cos(angle);
+            float wi = sin(angle);
+            sr += ar[u] * wr - ai[u] * wi;
+            si += ar[u] * wi + ai[u] * wr;
+        }
+        uint at = lb + (radix * block * m + k + t * m) * base_stride;
+        out_real[at] = sr;
+        out_imaginary[at] = si;
+    }
+}
+
 /* Pull a real or complex picture apart into the two planes the stages want. */
 kernel void dft_split(device const float* src [[buffer(0)]],
                       device float* real [[buffer(1)]],
@@ -121,8 +182,23 @@ fn kernel_for(entry: str) -> Kernel {
     return compiled
 }
 
-#: Whether `n` is a power of two, which is what the staged transform handles.
-fn is_power_of_two(n: int) -> bool { return n > 0 and n & n - 1 == 0 }
+#: `n` broken into twos, threes and fives, or null when something else is left.
+#:
+#: Those are the radices the stages implement, and the same ones
+#: `get_optimal_dft_size` pads to, so a length it recommends always lands here.
+fn radices_of(n: int) -> list[int]? {
+    if n < 1 { return null }
+    var left = n
+    var found: list[int] = []
+    for candidate in [2, 3, 5] {
+        while left % candidate == 0 {
+            found.push(candidate)
+            left = left // candidate
+        }
+    }
+    if left != 1 { return null }
+    return found
+}
 
 #: Transform every line of one axis, in place across a pair of buffers.
 #:
@@ -135,31 +211,40 @@ fn stage_axis(
     scratch_imaginary: Buffer,
     lines: int,
     n: int,
+    radices: list[int],
     base_stride: int,
     line_stride: int,
     inverse: bool
 ) -> tuple[Buffer, Buffer] {
     if n <= 1 { return (real, imaginary) }
     let sign = if inverse { 1.0 } else { -1.0 }
-    let butterflies = lines * (n // 2)
     var from_real = real
     var from_imaginary = imaginary
     var into_real = scratch_real
     var into_imaginary = scratch_imaginary
     var m = 1
-    while m < n {
-        kernel_for("dft_stage").dispatch_async(
-            [from_real, from_imaginary, into_real, into_imaginary],
-            butterflies,
-            [butterflies, n, m, base_stride, line_stride, f32_bits(sign)]
-        )
+    for radix in radices {
+        let groups = lines * (n // radix)
+        if radix == 2 {
+            kernel_for("dft_stage").dispatch_async(
+                [from_real, from_imaginary, into_real, into_imaginary],
+                groups,
+                [groups, n, m, base_stride, line_stride, f32_bits(sign)]
+            )
+        } else {
+            kernel_for("dft_stage_mixed").dispatch_async(
+                [from_real, from_imaginary, into_real, into_imaginary],
+                groups,
+                [groups, n, m, radix, base_stride, line_stride, f32_bits(sign)]
+            )
+        }
         let swap_real = from_real
         let swap_imaginary = from_imaginary
         from_real = into_real
         from_imaginary = into_imaginary
         into_real = swap_real
         into_imaginary = swap_imaginary
-        m = m * 2
+        m = m * radix
     }
     return (from_real, from_imaginary)
 }
@@ -265,21 +350,26 @@ fn to_complex(src: Mat) -> tuple[list[float], list[float]] {
 
 #: The transform on the device, or null when this one has to go on the host.
 #:
-#: Only for power-of-two lengths: the stages are radix two, and a length with
-#: any other factor keeps to the recursive host transform. That is not a small
-#: difference in cost -- the host transform of a 512 by 512 picture takes about
-#: five seconds and this takes about a millisecond -- so `get_optimal_dft_size`
-#: is worth calling, though it still answers with threes and fives, which land
-#: on the slow path.
+#: For lengths whose factors are twos, threes and fives, which is exactly what
+#: `get_optimal_dft_size` pads to. Anything with a larger prime keeps to the
+#: recursive host transform, which is not a small difference in cost: the host
+#: takes about five seconds over a 512 by 512 picture and this takes about a
+#: millisecond.
 fn gpu_dft(src: Mat, flags: int, inverse: bool) -> Mat? {
     let rows = src.rows
     let cols = src.cols
     let cn = CV_MAT_CN(src.type_())
     if cn != 1 and cn != 2 { return null }
     if rows < 1 or cols < 1 { return null }
-    if not is_power_of_two(cols) { return null }
+    let column_radices = radices_of(cols)
+    if column_radices is null { return null }
     let rows_only = flags & DFT_ROWS != 0 or rows == 1
-    if not rows_only and not is_power_of_two(rows) { return null }
+    var row_radices: list[int] = []
+    if not rows_only {
+        let found = radices_of(rows)
+        if found is null { return null }
+        row_radices = found
+    }
     #: A view carries an offset and a row gap; the stages address a packed
     #: plane, so anything else goes the other way.
     if src.offset != 0 or src.step_ != cols * cn { return null }
@@ -299,6 +389,7 @@ fn gpu_dft(src: Mat, flags: int, inverse: bool) -> Mat? {
         scratch_imaginary,
         rows,
         cols,
+        column_radices,
         1,
         cols,
         inverse
@@ -319,6 +410,7 @@ fn gpu_dft(src: Mat, flags: int, inverse: bool) -> Mat? {
             other_imaginary,
             cols,
             rows,
+            row_radices,
             cols,
             1,
             inverse
