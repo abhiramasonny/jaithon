@@ -1524,6 +1524,66 @@ fn test_dataloader_shuffle_covers_every_sample() -> void {
     assert_eq(seen, 3)
 }
 
+fn test_dataloader_shuffle_keeps_labels_with_their_rows() -> void {
+    if not jt.is_available() { return }
+    #: Row `i` carries its own answer in its first column, so a batch that
+    #: pairs a row with somebody else's label cannot go unnoticed.
+    let data = jt.Dataset.from_flat(
+        [10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0],
+        [1, 2, 3, 4],
+        2
+    )
+    defer { data.free() }
+    let loader = jt.DataLoader(data, 2, shuffle: true, seed: 3)
+    var seen = 0
+    while loader.has_next() {
+        let (features, labels) = loader.next_batch()
+        let rows = features.download()
+        let answers = labels.download()
+        for index in 0..answers.len() {
+            assert_near(
+                answers[index],
+                rows[index * 2] / 10.0,
+                1e-6,
+                f"row {index} was handed the wrong label"
+            )
+            seen += 1
+        }
+        features.free()
+        labels.free()
+    }
+    assert_eq(seen, 4)
+}
+
+fn test_dataloader_shuffle_keeps_images_shaped() -> void {
+    if not jt.is_available() { return }
+    var pixels: list[float] = []
+    var answers: list[float] = []
+    for sample in 0..4 {
+        for _slot in 0..2 * 2 * 3 { pixels.push(float(sample)) }
+        answers.push(float(sample))
+    }
+    let data = jt.Dataset(jt.Tensor([4, 2, 2, 3], pixels), jt.Tensor([4], answers))
+    defer { data.free() }
+    let loader = jt.DataLoader(data, 2, shuffle: true, seed: 7)
+    while loader.has_next() {
+        let (features, labels) = loader.next_batch()
+        assert_eq(features.shape, [2, 2, 2, 3], "a shuffled image batch lost its shape")
+        let rows = features.download()
+        let picked = labels.download()
+        for index in 0..picked.len() {
+            assert_near(
+                picked[index],
+                rows[index * 12],
+                1e-6,
+                f"image {index} was handed the wrong label"
+            )
+        }
+        features.free()
+        labels.free()
+    }
+}
+
 fn test_mixed_precision_matmul_stays_close() -> void {
     if not jt.is_available() { return }
     let a = jt.Tensor(

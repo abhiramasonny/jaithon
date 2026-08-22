@@ -214,10 +214,19 @@ pub class DataLoader {
         let indices = order.view(start, [count])
         let rows = self.dataset.features
         var source = rows
+        var wanted: list[int]? = null
         if rows.rank() == 4 {
+            let shape = self.dataset.image_shape
+            if shape is null { throw RuntimeError("NHWC dataset missing image_shape") }
             source = Tensor([rows.shape[0], self.dataset.feature_count], storage: rows.buffer())
+            wanted = [count, shape[0], shape[1], shape[2]]
         }
-        let gathered = gather_rows(source, indices)
-        return (gathered, self.dataset.labels.view(start, [count]))
+        let gathered = gather_rows(source, indices, wanted)
+        #: The labels have to move with the rows they belong to. Taking them in
+        #: sample order instead pairs every image with somebody else's answer.
+        let column = self.dataset.labels.view(0, [self.dataset.samples, 1])
+        let picked = gather_rows(column, indices, [count])
+        column.free()
+        return (gathered, picked)
     }
 }

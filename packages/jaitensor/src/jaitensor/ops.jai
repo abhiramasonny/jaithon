@@ -3898,7 +3898,7 @@ fn mha_by_gemm(
 }
 
 #: Gather `indices.len()` rows from a rank-two source.
-pub fn gather_rows(source: Tensor, indices: Tensor) -> Tensor {
+pub fn gather_rows(source: Tensor, indices: Tensor, out_shape: list[int]? = null) -> Tensor {
     if source.rank() != 2 {
         throw ValueError(f"gather_rows needs a rank-two source, got {source.shape}")
     }
@@ -3906,7 +3906,16 @@ pub fn gather_rows(source: Tensor, indices: Tensor) -> Tensor {
         throw ValueError(f"gather_rows needs a rank-one index tensor, got {indices.shape}")
     }
     let width = source.shape[1]
-    let output = Tensor([indices.size, width])
+    var shape = [indices.size, width]
+    if out_shape is not null {
+        if element_count(out_shape) != indices.size * width {
+            throw ValueError(
+                f"gather_rows cannot reshape {indices.size}x{width} rows into {out_shape}"
+            )
+        }
+        shape = out_shape
+    }
+    let output = Tensor(shape)
     let kernel = cached_kernel("gather_rows")
     kernel.dispatch_async(
         [source.buffer(), indices.buffer(), output.buffer()],
