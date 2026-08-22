@@ -133,14 +133,45 @@ pub fn calc_hist(
             throw ValueError("every image in a histogram has to be the same size")
         }
     }
+    let mask_image = mask
+    if mask_image is not null { mask_image.flush() }
+
+    #: Counted on the device when the bins fit in a threadgroup, which is what
+    #: `hist_count` stages them in. Anything bigger, or more than two channels,
+    #: keeps to the walk below.
+    let out_rows = bin_counts[0]
+    let out_cols = if dimensions > 1 { total // bin_counts[0] } else { 1 }
+    if dimensions <= 2 and total <= 1024 {
+        let tally = Mat.from_list(out_rows, out_cols, CV_MAKETYPE(CV_32F, 1), counts)
+        let a = images[image_of[0]]
+        let b = images[image_of[dimensions - 1]]
+        let guard = if mask_image is not null { mask_image } else { a }
+        let threads = 256 * 256
+        kernel_for("hist_count").dispatch_async([a.storage, b.storage, guard.storage, tally.storage], threads, [rows * cols, cols, dimensions, total, threads, if mask_image is null {
+            0
+        } else {
+            1
+        }, a.offset + channel_of[0], a.step_, a.channels(), b.offset + channel_of[dimensions - 1], b.step_, b.channels(), guard.offset, guard.step_, guard.channels(), bin_counts[0], if dimensions > 1 {
+            bin_counts[1]
+        } else {
+            1
+        }, f32_bits(ranges[0]), f32_bits(ranges[1]), f32_bits(if dimensions > 1 {
+            ranges[2]
+        } else {
+            0.0
+        }), f32_bits(if dimensions > 1 {
+            ranges[3]
+        } else {
+            1.0
+        })], group_size: 256)
+        tally.invalidate()
+        return tally
+    }
+
     var planes: list[list[float]] = []
     for image in images { planes.push(image.values()) }
     var mask_values: list[float] = []
-    let mask_image = mask
-    if mask_image is not null {
-        mask_image.flush()
-        mask_values = mask_image.to_list()
-    }
+    if mask_image is not null { mask_values = mask_image.to_list() }
 
     for cell in 0..rows * cols {
         if mask_image is not null and mask_values[cell] == 0.0 { continue }
@@ -158,9 +189,6 @@ pub fn calc_hist(
         }
         if inside { counts[offset] += 1.0 }
     }
-
-    let out_rows = bin_counts[0]
-    let out_cols = if dimensions > 1 { total // bin_counts[0] } else { 1 }
     return Mat.from_list(out_rows, out_cols, CV_MAKETYPE(CV_32F, 1), counts)
 }
 
@@ -292,27 +320,26 @@ pub fn calc_back_project(
 
     let rows = images[0].rows
     let cols = images[0].cols
-    var planes: list[list[float]] = []
-    for image in images { planes.push(image.values()) }
-    let counts = hist.to_list()
+    hist.flush()
 
-    var out: list[float] = []
-    for cell in 0..rows * cols {
-        var offset = 0
-        var inside = true
-        for axis in 0..dimensions {
-            let source = images[image_of[axis]]
-            let value = planes[image_of[axis]][cell * source.channels() + channel_of[axis]]
-            let index = bin_of(value, ranges[axis * 2], ranges[axis * 2 + 1], bin_counts[axis])
-            if index < 0 {
-                inside = false
-                break
-            }
-            offset = offset * bin_counts[axis] + index
-        }
-        out.push(if inside { counts[offset] * scale } else { 0.0 })
-    }
-    return Mat.from_list(rows, cols, CV_MAKETYPE(CV_8U, 1), out)
+    let out = Mat(rows, cols, CV_MAKETYPE(CV_8U, 1))
+    let a = images[image_of[0]]
+    let b = images[image_of[dimensions - 1]]
+    kernel_for("hist_back_project").dispatch_async([a.storage, b.storage, hist.storage, out.storage], rows * cols, [rows * cols, cols, dimensions, f32_bits(scale), a.offset + channel_of[0], a.step_, a.channels(), b.offset + channel_of[dimensions - 1], b.step_, b.channels(), bin_counts[0], if dimensions > 1 {
+        bin_counts[1]
+    } else {
+        1
+    }, f32_bits(ranges[0]), f32_bits(ranges[1]), f32_bits(if dimensions > 1 {
+        ranges[2]
+    } else {
+        0.0
+    }), f32_bits(if dimensions > 1 {
+        ranges[3]
+    } else {
+        1.0
+    }), out.offset, out.step_])
+    out.invalidate()
+    return out
 }
 
 #: Spread an image's values evenly across the range.
@@ -358,6 +385,133 @@ pub fn equalize_hist(image: Mat) -> Mat {
 
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
+
+/* Which bin a value falls in, or -1 when it falls outside the range.
+ * The same rule the host `bin_of` follows. */
+inline int hist_bin(float value, float low, float high, uint bins) {
+    if (high <= low) return -1;
+    if (value < low || value >= high) return -1;
+    int index = int(floor((value - low) * float(bins) / (high - low)));
+    if (index < 0 || index >= int(bins)) return -1;
+    return index;
+}
+
+/* One or two channels counted into a histogram, a pixel to a thread.
+ *
+ * Counted into threadgroup bins and merged once, as in `threshold_histogram`:
+ * a picture's worth of device atomics over a few hundred slots is what makes
+ * the naive version slow, quite apart from it having been on the host. Only
+ * for a histogram small enough to stage; a bigger one keeps to the host.
+ *
+ * Each plane is addressed as `base + y * step + x * cn`, with the channel
+ * already folded into `base` by the caller. */
+kernel void hist_count(device const float* first [[buffer(0)]],
+                       device const float* second [[buffer(1)]],
+                       device const float* mask [[buffer(2)]],
+                       device float* counts [[buffer(3)]],
+                       constant uint& count [[buffer(4)]],
+                       constant uint& cols [[buffer(5)]],
+                       constant uint& dims [[buffer(6)]],
+                       constant uint& total_bins [[buffer(7)]],
+                       constant uint& stride [[buffer(8)]],
+                       constant uint& use_mask [[buffer(9)]],
+                       constant uint& a_base [[buffer(10)]],
+                       constant uint& a_step [[buffer(11)]],
+                       constant uint& a_cn [[buffer(12)]],
+                       constant uint& b_base [[buffer(13)]],
+                       constant uint& b_step [[buffer(14)]],
+                       constant uint& b_cn [[buffer(15)]],
+                       constant uint& m_base [[buffer(16)]],
+                       constant uint& m_step [[buffer(17)]],
+                       constant uint& m_cn [[buffer(18)]],
+                       constant uint& bins_a [[buffer(19)]],
+                       constant uint& bins_b [[buffer(20)]],
+                       constant uint& low_a [[buffer(21)]],
+                       constant uint& high_a [[buffer(22)]],
+                       constant uint& low_b [[buffer(23)]],
+                       constant uint& high_b [[buffer(24)]],
+                       uint id [[thread_position_in_grid]],
+                       uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint bins[1024];
+    for (uint slot = lid; slot < total_bins; slot += 256u) {
+        atomic_store_explicit(&bins[slot], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint at = id; at < count; at += stride) {
+        uint y = at / cols;
+        uint x = at - y * cols;
+        if (use_mask != 0u && mask[m_base + y * m_step + x * m_cn] == 0.0f) continue;
+        float value = first[a_base + y * a_step + x * a_cn];
+        int index = hist_bin(value, as_type<float>(low_a), as_type<float>(high_a), bins_a);
+        if (index < 0) continue;
+        uint offset = uint(index);
+        if (dims > 1u) {
+            float other = second[b_base + y * b_step + x * b_cn];
+            int next = hist_bin(other, as_type<float>(low_b), as_type<float>(high_b), bins_b);
+            if (next < 0) continue;
+            offset = offset * bins_b + uint(next);
+        }
+        atomic_fetch_add_explicit(&bins[offset], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint slot = lid; slot < total_bins; slot += 256u) {
+        uint mine = atomic_load_explicit(&bins[slot], memory_order_relaxed);
+        if (mine == 0u) continue;
+        atomic_fetch_add_explicit((device atomic<float>*)(counts + slot), float(mine),
+                                  memory_order_relaxed);
+    }
+}
+
+/* The histogram read back onto the picture, a pixel to a thread. No atomics
+ * and no size limit: every thread only reads. */
+kernel void hist_back_project(device const float* first [[buffer(0)]],
+                              device const float* second [[buffer(1)]],
+                              device const float* counts [[buffer(2)]],
+                              device float* dst [[buffer(3)]],
+                              constant uint& count [[buffer(4)]],
+                              constant uint& cols [[buffer(5)]],
+                              constant uint& dims [[buffer(6)]],
+                              constant uint& scale_bits [[buffer(7)]],
+                              constant uint& a_base [[buffer(8)]],
+                              constant uint& a_step [[buffer(9)]],
+                              constant uint& a_cn [[buffer(10)]],
+                              constant uint& b_base [[buffer(11)]],
+                              constant uint& b_step [[buffer(12)]],
+                              constant uint& b_cn [[buffer(13)]],
+                              constant uint& bins_a [[buffer(14)]],
+                              constant uint& bins_b [[buffer(15)]],
+                              constant uint& low_a [[buffer(16)]],
+                              constant uint& high_a [[buffer(17)]],
+                              constant uint& low_b [[buffer(18)]],
+                              constant uint& high_b [[buffer(19)]],
+                              constant uint& out_base [[buffer(20)]],
+                              constant uint& out_step [[buffer(21)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint where = out_base + y * out_step + x;
+
+    float value = first[a_base + y * a_step + x * a_cn];
+    int index = hist_bin(value, as_type<float>(low_a), as_type<float>(high_a), bins_a);
+    if (index < 0) {
+        dst[where] = 0.0f;
+        return;
+    }
+    uint offset = uint(index);
+    if (dims > 1u) {
+        float other = second[b_base + y * b_step + x * b_cn];
+        int next = hist_bin(other, as_type<float>(low_b), as_type<float>(high_b), bins_b);
+        if (next < 0) {
+            dst[where] = 0.0f;
+            return;
+        }
+        offset = offset * bins_b + uint(next);
+    }
+    dst[where] = counts[offset] * as_type<float>(scale_bits);
+}
 
 /* One tile's histogram to a threadgroup.
  *
