@@ -720,6 +720,14 @@ fn pick(index: int, lane: int, width: int, horizontal: bool) -> int {
     return index * width + lane
 }
 
+#: The planes put back together as one picture.
+#:
+#: This was moved onto the device once, upsampling by indexing and converting
+#: from YCbCr in one kernel per pixel, and it bought 1.5% of a 720p decode --
+#: about five milliseconds of three hundred and thirty. The colour conversion
+#: is not where the time is. The entropy decode above it is: Huffman coding is
+#: serial by construction, and it is the whole cost. Anything that matters here
+#: has to attack that, or hand the file to a decoder that already has.
 fn assemble(components: list[Component], width: int, height: int, max_h: int, max_v: int) -> Mat {
     for component in components {
         if component.h < max_h {
