@@ -228,6 +228,7 @@ def render(
         route = (
             left.detail.rsplit("/", 1)[-1] if "/" in left.detail
             else "attention" if name.startswith("attn-")
+            else "block" if name.startswith("vit-")
             else "\u2014"
         )
         print(
@@ -275,7 +276,7 @@ def collect_side(executable: str, root: Path, level: str, runs: int, jaithon: bo
         command = [executable, "run", str(program), workload] if jaithon else [executable, str(program), workload]
         found_order, found = sample_command(command, runs, root, level, f"{side} {workload}")
         merge_samples(order, samples, found_order, found)
-    for stem in ("conv", "gemm", "attn"):
+    for stem in ("conv", "gemm", "attn", "vit"):
         program = bench_root / f"{stem}.{'jai' if jaithon else 'py'}"
         command = [executable, "run", str(program)] if jaithon else [executable, str(program)]
         found_order, found = sample_command(command, runs, root, level, f"{side} {stem}")
