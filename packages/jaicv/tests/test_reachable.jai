@@ -26,7 +26,7 @@ import std.math
 import std.gpu as gpu
 from std.io import Path
 from std.os import temp_dir
-from std.test import assert_eq, assert_true
+from std.test import assert_eq, assert_near, assert_true
 from jaicv.core.mat import cached_kernel, f32_bits, touch, Mat
 from jaicv.core.types import CV_8U, CV_8UC1, CV_8UC2, CV_8UC3, CV_8UC4, CV_32FC1, CV_32SC1
 from jaicv.core.types import depth_is_integer, depth_max, depth_min
@@ -42,7 +42,9 @@ from jaicv.imgproc.misc import accumulate_weighted
 from jaicv.core.misc import border_interpolate, check_range, eigen, find_non_zero
 from jaicv.core.misc import insert_channel
 from jaicv.core.misc import mahalanobis, min_max_idx, mul_transposed, patch_nans
+from jaicv.core.linalg import identity
 from jaicv.core.misc import randn, randu, set_identity, set_rng_seed
+from jaicv.dnn.blob import blob_to_tensor
 from jaicv.core.stats import channel_stats, mean, mean_std_dev, mean_value
 from jaicv.core.stats import min_max, reduce, trace
 from jaicv.core.types import NORM_HAMMING, REDUCE_SUM
@@ -689,4 +691,36 @@ fn test_the_qr_information_words_decode() -> void {
     assert_true(function_map(5) is function_map(5))
     assert_true(function_map(5)[0][0])
     assert_true(not function_map(5)[9][9])
+}
+
+#: The two exports the reachability check found with no caller at all.
+#:
+#: `scripts/exports_reachable_check.py` fails the build when that happens
+#: again, which is the only reason this file stays complete.
+fn test_the_last_two_exports_run() -> void {
+    if not gpu.is_available() { return }
+    let unit = identity(4)
+    defer { unit.release() }
+    assert_shape(unit, 4, 4, 1)
+    let diagonal = unit.to_list()
+    for row in 0..4 {
+        for column in 0..4 {
+            let want = if row == column { 1.0 } else { 0.0 }
+            assert_near(diagonal[row * 4 + column], want, 1e-6, f"at {row},{column}")
+        }
+    }
+
+    #: A blob is one row of `channels * height * width` per image; the tensor
+    #: it becomes keeps that shape.
+    var values: list[float] = []
+    for index in 0..2 * 3 * 4 * 5 { values.push(float(index % 19) * 0.25) }
+    let blob = Mat.from_list(2, 3 * 4 * 5, CV_32FC1, values)
+    defer { blob.release() }
+    let tensor = blob_to_tensor(blob, 3, Size(5, 4))
+    assert_eq(tensor.shape, [2, 3, 4, 5], "a blob should keep its shape as a tensor")
+    let held = tensor.download()
+    assert_eq(held.len(), values.len())
+    for index in 0..held.len() {
+        assert_near(held[index], values[index], 1e-6, f"value {index} changed")
+    }
 }

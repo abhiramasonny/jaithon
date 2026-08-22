@@ -342,7 +342,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench jaitensor jaicv install uninstall \
+.PHONY: all debug release test verify-test bench jaitensor jaicv exports-check install uninstall \
         clean distclean fmt fmt-check fmt-roundtrip check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -401,7 +401,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -462,6 +462,15 @@ gc-stress-test: $(TARGET)
 .PHONY: opcode-check
 opcode-check:
 	@python3 scripts/opcode_table_check.py
+
+# jaicv's recorded cases cover what OpenCV was asked to record, so an export
+# nobody recorded is an export nobody ran -- that is how `find_homography` with
+# RANSAC shipped raising OverflowError. `test_reachable.jai` closes the gap by
+# calling each one, and this keeps that file complete. Pure text, so it costs
+# nothing to run on every `make test`.
+.PHONY: exports-check
+exports-check:
+	@python3 scripts/exports_reachable_check.py
 
 # sum(jaiOpCounts) == vm.instructionCount, which is the only evidence that no
 # dispatch path skips the census. VM_NEXT_HINT skipped it and loop_sum's
