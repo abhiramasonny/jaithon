@@ -2337,10 +2337,35 @@ fn f32_bits(value: float) -> int {
 #: key that included it meant concatenating and hashing 36 KB on every single
 #: dispatch — 88 microseconds of host time per elementwise op, against 6 for
 #: the dispatch itself.
+#: The threadgroup width every kernel in this module that reduces an axis
+#: assumes it will get.
+const KERNEL_GROUP = 256
+
+#: Refuse a kernel the device will not run at the width its source assumes.
+#:
+#: The reducing kernels here stride their axis with `i += 256` and are asked
+#: for with a threadgroup of 256, but the dispatch clamps that silently to
+#: whatever the pipeline allows. A kernel whose registers or threadgroup
+#: memory push its limit below 256 would then run, say, 128 threads while the
+#: stride stayed 256 -- and elements 128 to 255 of every row would simply
+#: never be read. A softmax missing half its denominator, a mean over half
+#: its row, no error anywhere. It does not happen on this machine, where all
+#: of them allow 1024, but it is a property of the driver and the device
+#: rather than of this source, so it is checked rather than assumed.
+fn checked(entry: str, kernel: Kernel) -> Kernel {
+    let allowed = kernel.max_group_size()
+    if allowed < KERNEL_GROUP {
+        throw RuntimeError(
+            f"kernel '{entry}' assumes a threadgroup of {KERNEL_GROUP} but this device allows {allowed}"
+        )
+    }
+    return kernel
+}
+
 pub fn cached_kernel(entry: str) -> Kernel {
     let existing = _kernel_cache.get(entry, null)
     if existing is not null { return existing }
-    let kernel = Kernel.compile(SOURCE, entry)
+    let kernel = checked(entry, Kernel.compile(SOURCE, entry))
     _kernel_cache[entry] = kernel
     return kernel
 }
@@ -2351,7 +2376,7 @@ var _attn_cache: dict[str, Kernel] = {}
 fn cached_attn_kernel(entry: str) -> Kernel {
     let existing = _attn_cache.get(entry, null)
     if existing is not null { return existing }
-    let kernel = Kernel.compile(ATTN_SOURCE, entry)
+    let kernel = checked(entry, Kernel.compile(ATTN_SOURCE, entry))
     _attn_cache[entry] = kernel
     return kernel
 }
@@ -4533,6 +4558,17 @@ fn mha_by_gemm(
 }
 
 #: Gather `indices.len()` rows from a rank-two source.
+#: Read whole rows of `source`, one per entry of `indices`.
+#:
+#: The gradient of this scatters back into the table with device atomics, and
+#: a token that occurs twice in a batch has two threads adding to the same
+#: slot. Float addition is not associative, so which order they arrive in
+#: changes the last few bits: two runs from the same seed on the same data
+#: give gradients that agree to about ten digits and not beyond. It is enough
+#: to make a long training run diverge from its own repeat. Other libraries
+#: are the same here for the same reason; making it exact means sorting the
+#: indices and reducing each run of them in order, which costs more than the
+#: reproducibility is usually worth.
 pub fn gather_rows(source: Tensor, indices: Tensor, out_shape: list[int]? = null) -> Tensor {
     if source.rank() != 2 {
         throw ValueError(f"gather_rows needs a rank-two source, got {source.shape}")
