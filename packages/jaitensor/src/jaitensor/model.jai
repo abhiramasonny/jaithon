@@ -479,6 +479,17 @@ pub class Sequential {
             if self.input_units != n {
                 throw ValueError(f"model expects {self.input_units} features, got {n}")
             }
+            #: Same number of values is not the same shape. A model built
+            #: through `build(64)` and then fitted on 8 by 8 by 1 pictures
+            #: matched on the count and returned here with every convolution
+            #: still sized as though its input were a flat row of 64 -- and
+            #: the graph that was then handed to the platform failed its own
+            #: verification and took the process down with it, past any
+            #: `try`. Saying so is the whole fix; rebuilding underneath a
+            #: caller who has already been handed parameters would be worse.
+            if self.input_shape != shape {
+                throw ValueError(f"model was built for input shape {self.input_shape}, got {shape}")
+            }
             return
         }
         let rng = Random.with_seed(7)

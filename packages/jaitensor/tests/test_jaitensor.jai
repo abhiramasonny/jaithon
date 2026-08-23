@@ -1207,6 +1207,40 @@ fn test_a_convolutional_model_survives_a_save_and_a_load() -> void {
 #: of measurements actually has. The first batch starts at offset zero and is
 #: exempt, so a run of fewer than two batches appeared to work while training
 #: on the first batch alone.
+#: A model built for a flat row, then fitted on pictures of the same size.
+#:
+#: Sixty-four values is sixty-four values either way, and the build guard
+#: compared only the count -- so it returned happy with every convolution
+#: still sized for a flat row of 64, and the graph handed to the platform
+#: failed its own verification and took the process down with SIGABRT. Not a
+#: throw: exit 134, no traceback, nothing a `try` could catch.
+fn test_building_flat_then_fitting_pictures_is_refused() -> void {
+    if not jt.is_available() { return }
+    var pixels: list[float] = []
+    var labels: list[float] = []
+    for index in 0..32 {
+        for _slot in 0..64 { pixels.push(float(index % 5) * 0.2) }
+        labels.push(float(index % 3))
+    }
+    let data = jt.Dataset(jt.Tensor([32, 8, 8, 1], pixels), jt.Tensor([32], labels))
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Conv2d(4, 3, padding: 1, in_channels: 1, activation: jt.Activation.Relu),
+            jt.MaxPool2d(2),
+            jt.Flatten(),
+            jt.Dense(3, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(optimizer: jt.SGD(learning_rate: 0.01), loss: jt.SparseCategoricalCrossentropy())
+    model.build(64)
+    assert_throws(
+        ValueError,
+        || model.fit(data, epochs: 1, batch_size: 8, verbose: false, plot_path: null)
+    )
+}
+
 fn test_a_model_trains_on_any_number_of_features() -> void {
     if not jt.is_available() { return }
     for width in [4, 5, 6, 7, 9, 16] {
