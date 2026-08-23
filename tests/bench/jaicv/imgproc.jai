@@ -11,7 +11,11 @@ import std.gpu as gpu
 import std.math
 from jaicv import Mat, Size
 from jaicv.core.stats import min_max_loc, norm, sum_mat
+from jaicv.core.types import Point2f
 from jaicv.imgproc.morph import erode, get_structuring_element, MORPH_RECT
+from jaicv.imgproc.segmentation import connected_components, distance_transform
+from jaicv.photo.denoise import inpaint
+from jaicv.video.optflow import calc_optical_flow_pyr_lk
 from std.os import env_or
 from std.time import Instant
 
@@ -27,6 +31,52 @@ let HEIGHT = 1080
 #: warms the same number of times; a CPU has no ramp to climb, so it costs
 #: nothing there and keeps the two sides honest.
 let WARMUP = 40
+
+#: The same frame as bytes, which is what an edge detector and an inpainter
+#: are given in practice and what OpenCV is fastest on.
+fn byte_picture(rows: int, cols: int) -> Mat {
+    var values: list[float] = []
+    for index in 0..rows * cols { values.push(float(index * 37 % 251)) }
+    return Mat.from_list(rows, cols, cv.CV_8UC1, values)
+}
+
+#: A frame with regions in it rather than a gradient, so that labelling and a
+#: distance transform have something to find.
+fn blobby(rows: int, cols: int) -> Mat {
+    var values: list[float] = []
+    for index in 0..rows * cols {
+        let y = index // cols
+        let x = index - y * cols
+        let cell = (x // 23 + y // 19) % 3
+        values.push(if cell == 0 { 255.0 } else { 0.0 })
+    }
+    return Mat.from_list(rows, cols, cv.CV_8UC1, values)
+}
+
+#: A textured single-channel frame of any size, for the pair the tracker
+#: follows points through. Bytes, because the peer's pyramid builder accepts
+#: nothing else; the values fit either way.
+fn picture_at(rows: int, cols: int) -> Mat {
+    var values: list[float] = []
+    for index in 0..rows * cols {
+        let y = index // cols
+        let x = index - y * cols
+        values.push(float((x * 7 + y * 13) % 211) + float(x * y % 37))
+    }
+    return Mat.from_list(rows, cols, cv.CV_32FC1, values)
+}
+
+#: The same frame moved, which is what the tracker has to recover.
+fn shifted_by(source: Mat, rows: int, cols: int, dx: int, dy: int) -> Mat {
+    let held = source.values()
+    var values: list[float] = []
+    for index in 0..rows * cols {
+        let y = index // cols
+        let x = index - y * cols
+        values.push(held[max(0, y - dy) * cols + max(0, x - dx)])
+    }
+    return Mat.from_list(rows, cols, cv.CV_8UC1, values)
+}
 
 fn picture(channels: int) -> Mat {
     var values: list[float] = []
@@ -113,5 +163,40 @@ fn main() -> int {
     run_scalar("min-max", repeats, || min_max_loc(grey)[0])
     run_scalar("norm", repeats, || norm(grey))
     run_scalar("sum", repeats, || sum_mat(grey)[0])
+
+    #: The rest of a real pipeline. These were all host loops until recently
+    #: -- inpainting a 640 by 480 frame took a second -- and none of them was
+    #: measured against anything, so nothing would have said if they went
+    #: back. An operation nobody times is an operation nobody keeps fast.
+    let bytes_frame = byte_picture(HEIGHT, WIDTH)
+    let regions = blobby(HEIGHT, WIDTH)
+    run("canny", repeats, || cv.canny(bytes_frame, 60.0, 140.0))
+    run("connected-components", repeats, || connected_components(regions)[1])
+    run("distance-transform", repeats, || distance_transform(regions, cv.DIST_L2, cv.DIST_MASK_3))
+    run_scalar("good-features", repeats, fn() -> float {
+        return float(cv.good_features_to_track(grey, 200, 0.01, 6.0).len())
+    })
+
+    #: Inpainting and optical flow at 640 by 480. The peer's inpainter is a
+    #: sequential march inward and takes the best part of a second on a 1080p
+    #: frame, which would make the suite about that one row.
+    let small_rows = 480
+    let small_cols = 640
+    let damaged = byte_picture(small_rows, small_cols)
+    let holes = blobby(small_rows, small_cols)
+    run("inpaint", max(2, repeats // 10), || inpaint(damaged, holes, 3.0, cv.INPAINT_TELEA))
+
+    let first = picture_at(small_rows, small_cols)
+    let second = shifted_by(first, small_rows, small_cols, 2, 1)
+    var tracked: list[Point2f] = []
+    for index in 0..200 {
+        tracked.push(Point2f(float(40 + index * 13 % 540), float(40 + index * 7 % 380)))
+    }
+    #: Each call is long enough on its own; a full thirty would make the
+    #: suite mostly this one row.
+    run_scalar("optical-flow", max(2, repeats // 10), fn() -> float {
+        let (moved, _found, _error) = calc_optical_flow_pyr_lk(first, second, tracked)
+        return moved[0].x
+    })
     return 0
 }
