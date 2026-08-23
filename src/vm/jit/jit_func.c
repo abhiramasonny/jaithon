@@ -10622,6 +10622,31 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     for (unsigned i = 0; i < e.exitCount; i++) {
         e.exitStub[i] = (int)e.count;
         OSR_SYNC_ITER();
+        /* An ordinary way out carries no operand stack of its own, and has to
+         * say so.
+         *
+         * `gDeopt` is one global record, on the reasoning that only one body
+         * can be deoptimising at a time. That holds for a body and its own
+         * stubs; it does not hold across a call. A compiled callee that
+         * deopts part way through this region writes the record, is put back
+         * on its feet by its own return path, and leaves `nstack` behind --
+         * and the C side reads `nstack` after every way out of the region,
+         * not only after a deopt. So a region that had called such a callee
+         * and then finished its loop normally pushed the callee's leftover
+         * operand stack onto this frame's.
+         *
+         * What that cost: `for n in xs` around an inner loop calling a
+         * compiled method left two extra values above the enclosing loop's
+         * iterator, so the next `OP_FOR_ITER_BIND` peeked one of them and
+         * the loop died with "expected an iterator, not 'int'". Only under
+         * `--gc-stress`, which is what made the callee deopt reliably.
+         *
+         * Clearing it here is the narrow fix: every way out of a region now
+         * states its own record rather than inheriting one. */
+        emitConst64(&e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&gDeopt.nstack);
+        emitConst64(&e, JIT_SCRATCH_B, 0);
+        emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
         /* Leaving by the iterator's own exit means it is exhausted, and the
          * interpreter drops it there; any other way out leaves it in place. */
         emitConst64(&e, JIT_SCRATCH_A,
