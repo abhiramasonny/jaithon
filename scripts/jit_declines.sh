@@ -17,7 +17,7 @@ census() {
     done \
       | grep -E 'declined at|stopped' \
       | sed 's/\[jit\] //' \
-      | sed -E 's/^[A-Za-z_<>][A-Za-z0-9_<>.]* //; s/^osr at [0-9]+ //; s/^at [0-9]+ //; s/\(measuring\): /: /' \
+      | sed -E 's/^[A-Za-z_<>][A-Za-z0-9_<>.]* //; s/^osr at [0-9]+ //; s/^at [0-9]+ //; s/\(measuring\): /: /; s/ \(slot [0-9]+\)$//' \
       | sort -u
 }
 

@@ -705,6 +705,11 @@ typedef struct {
      * register a hoisted header owns. */
     unsigned  scratchRoom;
     const char *whyNot;
+    /* Somewhere to build a reason that names a number. `whyNot` is otherwise
+     * always a literal, and "a local was given two different kinds" without
+     * saying which one left the reader to guess -- a poor trade for ninety
+     * bytes that live exactly as long as the emitter does. */
+    char        whyBuf[96];
     uint8_t     lastOp;
     unsigned  descOffset;
     int       exceptionExit;
@@ -2874,6 +2879,19 @@ static bool isClassCallee(const Emit *e, unsigned argc) {
            e->stack[e->depth - argc - 1] == SLOT_CLASS;
 }
 
+/* Which local the tier could not settle on one kind for.
+ *
+ * The reason on its own says a body has such a local but not which, and a
+ * body with twenty of them then has to be read line by line to find it. The
+ * slot number is what the disassembly labels its locals with, so the two can
+ * be put side by side.
+ */
+static const char *kindClash(Emit *e, unsigned slot) {
+    snprintf(e->whyBuf, sizeof e->whyBuf,
+             "a local was given two different kinds (slot %u)", slot);
+    return e->whyBuf;
+}
+
 static bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
                            uint32_t shape, ObjClass *klass);
 static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
@@ -4751,7 +4769,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!adoptLocalKind(e, slot, e->stack[e->depth - 1],
                                 e->stackShape[e->depth - 1],
                                 e->stackClass[e->depth - 1])) {
-                e->whyNot = "a local was given two different kinds";
+                e->whyNot = kindClash(e, slot);
                 return false;
             }
             if (!e->fpOff && !e->dynamicLocal[slot] &&
@@ -4828,7 +4846,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * are already there, one instruction, and a store straight out
                  * of a d register. */
                 if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
-                    e->whyNot = "a local was given two different kinds";
+                    e->whyNot = kindClash(e, slot);
                     return false;
                 }
                 unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
@@ -4848,7 +4866,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &ra, &ka)) return false;
             if (ka != kb) return false;
             if (!adoptLocalKind(e, slot, ka, 0, NULL)) {
-                e->whyNot = "a local was given two different kinds";
+                e->whyNot = kindClash(e, slot);
                 return false;
             }
             unsigned rd = localDest(e, slot);
@@ -5017,7 +5035,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
                 e->stack[e->depth - 2] == SLOT_FLOAT) {
                 if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
-                    e->whyNot = "a local was given two different kinds";
+                    e->whyNot = kindClash(e, slot);
                     return false;
                 }
                 unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
@@ -5037,7 +5055,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &ra, &ka)) return false;
             if (ka != kb) return false;
             if (!adoptLocalKind(e, slot, ka, 0, NULL)) {
-                e->whyNot = "a local was given two different kinds";
+                e->whyNot = kindClash(e, slot);
                 return false;
             }
             unsigned rd = localDest(e, slot);
@@ -5069,7 +5087,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
                 e->stack[e->depth - 2] == SLOT_FLOAT) {
                 if (!adoptLocalKind(e, slot, SLOT_FLOAT, 0, NULL)) {
-                    e->whyNot = "a local was given two different kinds";
+                    e->whyNot = kindClash(e, slot);
                     return false;
                 }
                 unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
@@ -5089,7 +5107,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!popValue(e, &ra, &ka)) return false;
             if (ka != kb) return false;
             if (!adoptLocalKind(e, slot, ka, 0, NULL)) {
-                e->whyNot = "a local was given two different kinds";
+                e->whyNot = kindClash(e, slot);
                 return false;
             }
             unsigned rd = localDest(e, slot);
@@ -5120,7 +5138,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     e->stackShape[e->depth - 1],
                                     e->stackClass[e->depth - 1],
                                     e->stackSeen[e->depth - 1])) {
-                e->whyNot = "a local was given two different kinds";
+                e->whyNot = kindClash(e, slot);
                 return false;
             }
             if (!e->fpOff && !e->dynamicLocal[slot] &&
