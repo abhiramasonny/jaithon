@@ -336,6 +336,9 @@ fn sample(values: list[float], rows: int, cols: int, x: int, y: int) -> float {
     return values[cy * cols + cx]
 }
 
+#: `patch_size` non-zero means the sampling pattern is stretched to whatever
+#: scale each keypoint was found at; zero describes every one at the pattern's
+#: own size, which is what a descriptor with no notion of scale wants.
 fn describe(
     values: list[float],
     rows: int,
@@ -343,7 +346,8 @@ fn describe(
     keypoints: list[KeyPoint],
     pattern: list[int],
     bytes_wide: int,
-    rotate: bool
+    rotate: bool,
+    patch_size: int = 0
 ) -> Mat {
     let bits = bytes_wide * 8
     var out: list[float] = []
@@ -357,6 +361,20 @@ fn describe(
             cosine = math.cos(radians)
             sine = math.sin(radians)
         }
+        #: How much larger the keypoint is than the pattern was drawn for.
+        #:
+        #: The detector already records what scale it found each point at,
+        #: and the description ignored it: every keypoint was read through
+        #: the same 31 by 31 window of the full-resolution image whichever
+        #: level of the pyramid found it. So the descriptors carried no scale
+        #: information at all -- the same point submitted at five octaves came
+        #: back byte-identical -- and matching a picture against a 1.5x
+        #: enlargement of itself got 4 of 122 cross-checked matches right.
+        let stretch = if patch_size > 0 and point.size > 0.0 {
+            point.size / float(patch_size)
+        } else {
+            1.0
+        }
         for byte in 0..bytes_wide {
             var packed = 0
             for bit in 0..8 {
@@ -365,10 +383,10 @@ fn describe(
                 let ay = float(pattern[index + 1])
                 let bx = float(pattern[index + 2])
                 let by = float(pattern[index + 3])
-                let rax = cx + int(math.floor(ax * cosine - ay * sine + 0.5))
-                let ray = cy + int(math.floor(ax * sine + ay * cosine + 0.5))
-                let rbx = cx + int(math.floor(bx * cosine - by * sine + 0.5))
-                let rby = cy + int(math.floor(bx * sine + by * cosine + 0.5))
+                let rax = cx + int(math.floor((ax * cosine - ay * sine) * stretch + 0.5))
+                let ray = cy + int(math.floor((ax * sine + ay * cosine) * stretch + 0.5))
+                let rbx = cx + int(math.floor((bx * cosine - by * sine) * stretch + 0.5))
+                let rby = cy + int(math.floor((bx * sine + by * cosine) * stretch + 0.5))
                 if sample(values, rows, cols, rax, ray) < sample(values, rows, cols, rbx, rby) {
                     packed = packed | 1 << bit
                 }
@@ -501,18 +519,71 @@ pub class ORB {
     }
 
     #: Describe keypoints that have already been found.
+    #:
+    #: Each one is read from the pyramid level it was detected on, not from
+    #: the full-resolution image. That is what makes the descriptor mean the
+    #: same thing at every scale: a corner found two levels up covers four
+    #: times the area, and describing it through the same 31 by 31 window of
+    #: the original picture reads a quarter of the feature and none of its
+    #: surroundings. It did exactly that -- the same point submitted at five
+    #: octaves came back byte-identical, so the descriptors carried no scale
+    #: information at all and matching a picture against a 1.5x enlargement
+    #: of itself got four of a hundred and twenty-two matches right.
+    #:
+    #: Reading a level also gets the blur right. Stretching the sampling
+    #: pattern over the full-resolution image instead picks out single
+    #: aliased pixels where the level has averaged them, which recovers some
+    #: of the loss and not most of it.
     pub fn compute(self, image: Mat, keypoints: list[KeyPoint]) -> tuple[list[KeyPoint], Mat] {
         image.flush()
-        let smoothed = gaussian_blur(image, Size(7, 7), 2.0)
-        let values = smoothed.values()
         let radius = self.patch_size // 2
-        for point in keypoints {
-            point.angle = patch_angle(values, image.rows, image.cols, point, radius)
+        var rows_out: list[float] = []
+        for _index in 0..keypoints.len() * 32 { rows_out.push(0.0) }
+        if keypoints.len() == 0 {
+            return (keypoints, Mat.from_list(0, 32, CV_MAKETYPE(CV_8U, 1), rows_out))
         }
-        return (
-            keypoints,
-            describe(values, image.rows, image.cols, keypoints, self.pattern, 32, true)
-        )
+
+        #: Which levels are actually represented, so a level nobody was found
+        #: on is never built.
+        var levels: list[int] = []
+        for point in keypoints {
+            let level = max(0, point.octave)
+            if not levels.contains(level) { levels.push(level) }
+        }
+
+        for level in levels {
+            var scale = 1.0
+            for _step in 0..level { scale *= self.scale_factor }
+            let width = max(1, int(float(image.cols) / scale))
+            let height = max(1, int(float(image.rows) / scale))
+            let scaled = if level == 0 { image } else { resize(image, size: Size(width, height)) }
+            let smoothed = gaussian_blur(scaled, Size(7, 7), 2.0)
+            let values = smoothed.values()
+
+            #: The same keypoints, placed where they sit on this level.
+            var here: list[KeyPoint] = []
+            var slots: list[int] = []
+            for (index, point) in keypoints.enumerate() {
+                if max(0, point.octave) != level { continue }
+                here.push(
+                    KeyPoint(
+                        Point2f(point.pt.x / scale, point.pt.y / scale),
+                        float(self.patch_size),
+                        point.angle,
+                        point.response,
+                        level
+                    )
+                )
+                slots.push(index)
+            }
+            for point in here { point.angle = patch_angle(values, height, width, point, radius) }
+            let block = describe(values, height, width, here, self.pattern, 32, true).values()
+            for (at, slot) in slots.enumerate() {
+                keypoints[slot].angle = here[at].angle
+                for byte in 0..32 { rows_out[slot * 32 + byte] = block[at * 32 + byte] }
+            }
+        }
+        return (keypoints, Mat.from_list(keypoints.len(), 32, CV_MAKETYPE(CV_8U, 1), rows_out))
     }
 
     #: Find keypoints and describe them in one pass.

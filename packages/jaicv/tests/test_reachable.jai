@@ -59,10 +59,11 @@ from jaicv.imgproc.filter import sqr_box_filter
 from jaicv.imgproc.threshold import histogram_256, otsu_threshold, threshold
 from jaicv.imgproc.threshold import triangle_threshold, THRESH_BINARY
 from jaicv.imgproc.edges import canny
+from std.random import Random
 from jaicv.imgproc.geometric import crop, get_rotation_matrix_2d, invert3, invert_transform
 from jaicv.imgproc.geometric import resize, solve_dense
 from jaicv.imgproc.drawing import clip_line, ellipse_2_poly, ellipse_rotated
-from jaicv.imgproc.drawing import line_points, rectangle, rectangle_rect
+from jaicv.imgproc.drawing import circle, line_points, rectangle, rectangle_rect
 from jaicv.imgproc.contours import draw_contours, find_contours, RETR_EXTERNAL
 from jaicv.imgproc.shape import box_points, convex_hull_indices, match_shapes
 from jaicv.imgproc.shape import moments_f, moments_image
@@ -511,6 +512,57 @@ fn test_a_bayes_classifier_pays_for_a_wide_class() -> void {
 #: all came back with a focal length of 4006 and its principal point at
 #: (4, 4). Only alpha of one, which uses the outer rectangle and was
 #: computed correctly, ever worked.
+#: The same picture, and the same picture twice the size.
+#:
+#: ORB records which pyramid level it found each keypoint on and then
+#: described every one of them through the same 31 by 31 window of the
+#: full-resolution image, so the descriptors carried no scale information at
+#: all: the same point submitted at five octaves came back byte-identical.
+#: Matching a picture against a doubling of itself got five of eighty-four
+#: cross-checked matches geometrically right -- six per cent, which is worse
+#: than the identical-image case by a factor of sixteen and is the entire
+#: reason to use ORB over a plain binary descriptor.
+#:
+#: The texture has to be non-repeating for this to measure anything. A
+#: periodic pattern has features that genuinely recur, so a match to the
+#: wrong period is not the descriptor's fault and the number stays low
+#: whatever is done.
+fn test_orb_matches_across_a_change_of_scale() -> void {
+    if not have_gpu() { return }
+    let rng = Random.with_seed(29)
+    var values: list[float] = []
+    for _index in 0..240 * 320 { values.push(40.0) }
+    let base = Mat.from_list(240, 320, CV_8UC1, values)
+    for _shape in 0..70 {
+        let x = int(rng.float_range(0.0, 320.0))
+        let y = int(rng.float_range(0.0, 240.0))
+        let reach = int(rng.float_range(4.0, 22.0))
+        let tone = Scalar(rng.float_range(70.0, 250.0))
+        if rng.next_float() < 0.5 {
+            circle(base, Point(x, y), reach, tone, -1)
+        } else {
+            rectangle(base, Point(x, y), Point(x + reach, y + reach), tone, -1)
+        }
+    }
+
+    let orb = ORB()
+    let bigger = resize(base, size: Size(640, 480))
+    let (here, described_here) = orb.detect_and_compute(base)
+    let (there, described_there) = orb.detect_and_compute(bigger)
+    let matches = BFMatcher(NORM_HAMMING, true).match_(described_here, described_there)
+    assert_true(matches.len() > 40, f"only {matches.len()} matches at all")
+    var right = 0
+    for pair in matches {
+        let small = here[pair.query_idx].pt
+        let large = there[pair.train_idx].pt
+        let dx = large.x - small.x * 2.0
+        let dy = large.y - small.y * 2.0
+        if math.sqrt(dx * dx + dy * dy) < 6.0 { right += 1 }
+    }
+    let share = float(right) / float(matches.len())
+    assert_true(share > 0.35, f"only {right} of {matches.len()} matches were in the right place")
+}
+
 fn test_an_undistorted_camera_keeps_its_matrix() -> void {
     if not have_gpu() { return }
     let camera = Mat.from_list(
@@ -653,6 +705,7 @@ fn test_video_run() -> void {
     test_canny_answers_the_same_twice()
     test_a_large_symmetric_matrix_is_fully_diagonalised()
     test_an_undistorted_camera_keeps_its_matrix()
+    test_orb_matches_across_a_change_of_scale()
     test_a_bayes_classifier_pays_for_a_wide_class()
     test_canny_follows_a_long_weak_edge()
 
