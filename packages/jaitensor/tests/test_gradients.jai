@@ -451,6 +451,37 @@ fn test_channel_normalisation_parameter_gradients() -> void {
 
 #: `gather_rows` differentiates in its table, not in its indices. A row picked
 #: twice must collect both gradients, which is the case a naive scatter drops.
+#: An index that is not in the table.
+#:
+#: `uint(indices[r])` was used unchecked on both sides of the lookup. Past
+#: the end of the table the forward read whatever was next in the pool, and
+#: a negative index -- which `uint` turns into about four billion rather than
+#: into a complaint -- read somewhere else entirely. The backward did the
+#: same arithmetic to pick an atomic ADD target, so an out-of-vocabulary
+#: token id did not read another tensor, it corrupted one.
+fn test_a_lookup_outside_the_table_reads_and_writes_nothing() -> void {
+    if not have_gpu() { return }
+    let table = Tensor(
+        [4, 3],
+        [1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 100.0, 200.0, 300.0, 7.0, 8.0, 9.0],
+        requires_grad: true
+    )
+    let asked = Tensor([5], [0.0, 3.0, 99.0, -1.0, 2.0])
+    let got = gather_rows(table, asked).download()
+    let wanted = [1.0, 2.0, 3.0, 7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 200.0, 300.0]
+    for (index, value) in wanted.enumerate() { assert_eq(got[index], value) }
+
+    #: And the gradient of the same lookup lands only on the rows that exist.
+    let junk = jt.sum(gather_rows(table, asked)).backward()
+    let gradient = table.grad
+    assert_true(gradient is not null, "the table should have a gradient")
+    let flowed = gradient.download()
+    #: Rows 0, 2 and 3 were each asked for once; row 1 never was.
+    for (index, value) in [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0].enumerate() {
+        assert_eq(flowed[index], value)
+    }
+}
+
 fn test_gather_rows_accumulates_repeated_indices() -> void {
     if not have_gpu() { return }
     let indices = Tensor([4], [2.0, 0.0, 2.0, 1.0])

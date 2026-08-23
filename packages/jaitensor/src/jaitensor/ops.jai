@@ -1350,12 +1350,22 @@ kernel void gather_rows(device const float* src [[buffer(0)]],
                         device float* dst [[buffer(2)]],
                         constant uint& rows [[buffer(3)]],
                         constant uint& width [[buffer(4)]],
+                        constant uint& table [[buffer(5)]],
                         uint id [[thread_position_in_grid]]) {
     if (id >= rows * width) return;
     uint r = id / width;
     uint c = id % width;
-    uint src_row = uint(indices[r]);
-    dst[id] = src[src_row * width + c];
+    float asked = indices[r];
+    /* An index off the end of the table, or a negative one -- which `uint`
+     * turns into four billion rather than into a complaint. Reading there is
+     * whatever happens to be next in the pool. A token id outside the
+     * vocabulary is an ordinary mistake to make, so it reads as zero rather
+     * than as somebody else's memory. */
+    if (!(asked >= 0.0f) || uint(asked) >= table) {
+        dst[id] = 0.0f;
+        return;
+    }
+    dst[id] = src[uint(asked) * width + c];
 }
 
 kernel void scalar_mul_bits(device const float* input [[buffer(0)]],
@@ -1755,13 +1765,18 @@ kernel void scatter_add_rows(device const float* upstream [[buffer(0)]],
                              device float* dest [[buffer(2)]],
                              constant uint& gathered [[buffer(3)]],
                              constant uint& width [[buffer(4)]],
+                             constant uint& table [[buffer(5)]],
                              uint id [[thread_position_in_grid]]) {
     if (id >= gathered * width) return;
     uint r = id / width;
     uint c = id % width;
-    uint src_row = uint(indices[r]);
+    float asked = indices[r];
+    /* The same guard as the read, and it matters more here: this one is a
+     * write, so an index past the end of the table does not read somebody
+     * else's memory, it changes it. */
+    if (!(asked >= 0.0f) || uint(asked) >= table) return;
     atomic_fetch_add_explicit(
-        (device atomic<float>*)(dest + src_row * width + c),
+        (device atomic<float>*)(dest + uint(asked) * width + c),
         upstream[id],
         memory_order_relaxed
     );
@@ -4510,7 +4525,7 @@ pub fn gather_rows(source: Tensor, indices: Tensor, out_shape: list[int]? = null
     kernel.dispatch_async(
         [source.buffer(), indices.buffer(), output.buffer()],
         output.size,
-        [indices.size, width]
+        [indices.size, width, source.shape[0]]
     )
     if source.requires_grad {
         output.attach_creator(GradNode([source], fn(upstream: Tensor) -> list[Tensor] {
@@ -4526,7 +4541,7 @@ fn scatter_add_rows(upstream: Tensor, indices: Tensor, vocab: int, width: int) -
     kernel.dispatch_async(
         [upstream.buffer(), indices.buffer(), dest.buffer()],
         upstream.size,
-        [indices.size, width]
+        [indices.size, width, vocab]
     )
     return dest
 }
