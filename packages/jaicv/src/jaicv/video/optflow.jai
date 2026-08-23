@@ -16,7 +16,7 @@
 #: let flow = calc_optical_flow_farneback(previous, current)
 #: ```
 import std.math
-from std.gpu import Kernel
+from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, Point2f, Size, TermCriteria
 from ..imgproc.common import PRELUDE
@@ -159,6 +159,149 @@ kernel void flow_update(device const float* first [[buffer(0)]],
     flow_out[out_base] = (m22 * r1 - m12 * r2) / determinant;
     flow_out[out_base + 1] = (m11 * r2 - m12 * r1) / determinant;
 }
+
+/* One level of a pyramid copied into its slice of a packed buffer, so the
+ * tracker can reach every level through one binding and an offset. */
+kernel void lk_pack(device const float* src [[buffer(0)]],
+                    device float* dst [[buffer(1)]],
+                    constant uint& count [[buffer(2)]],
+                    constant uint& cols [[buffer(3)]],
+                    constant uint& off [[buffer(4)]],
+                    constant uint& step [[buffer(5)]],
+                    constant uint& base [[buffer(6)]],
+                    uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    dst[base + id] = src[off + y * step + x];
+}
+
+inline float lk_sample(device const float* plane, uint base, uint rows, uint cols,
+                       float x, float y) {
+    float fx = clamp(x, 0.0f, float(cols - 1u));
+    float fy = clamp(y, 0.0f, float(rows - 1u));
+    uint x0 = uint(fx);
+    uint y0 = uint(fy);
+    uint x1 = min(x0 + 1u, cols - 1u);
+    uint y1 = min(y0 + 1u, rows - 1u);
+    float ax = fx - float(x0);
+    float ay = fy - float(y0);
+    float top = plane[base + y0 * cols + x0] * (1.0f - ax)
+              + plane[base + y0 * cols + x1] * ax;
+    float bottom = plane[base + y1 * cols + x0] * (1.0f - ax)
+                 + plane[base + y1 * cols + x1] * ax;
+    return top * (1.0f - ay) + bottom * ay;
+}
+
+/* Lucas-Kanade, a thread to a point.
+ *
+ * Points do not talk to each other, which is the whole reason this belongs on
+ * the device: the host walked them one at a time and a single 21-pixel window
+ * refined over thirty passes and four levels is a hundred and sixty thousand
+ * bilinear samples, so a couple of hundred points cost most of a second. */
+kernel void lk_track(device const float* planes_a [[buffer(0)]],
+                     device const float* planes_b [[buffer(1)]],
+                     device const float* meta [[buffer(2)]],
+                     device const float* points [[buffer(3)]],
+                     device float* out [[buffer(4)]],
+                     constant uint& count [[buffer(5)]],
+                     constant uint& levels [[buffer(6)]],
+                     constant uint& half_x [[buffer(7)]],
+                     constant uint& half_y [[buffer(8)]],
+                     constant uint& iterations [[buffer(9)]],
+                     constant uint& epsilon_bits [[buffer(10)]],
+                     constant uint& window_area [[buffer(11)]],
+                     constant uint& frame_rows [[buffer(12)]],
+                     constant uint& frame_cols [[buffer(13)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float epsilon = as_type<float>(epsilon_bits);
+    float start_x = points[id * 2u + 0u];
+    float start_y = points[id * 2u + 1u];
+    float guess_x = 0.0f;
+    float guess_y = 0.0f;
+    bool alive = true;
+    float residual = 0.0f;
+
+    int level = int(levels) - 1;
+    while (level >= 0) {
+        float scale = float(1u << uint(level));
+        float px = start_x / scale;
+        float py = start_y / scale;
+        uint base = uint(meta[level * 4 + 0]);
+        uint rows = uint(meta[level * 4 + 1]);
+        uint cols = uint(meta[level * 4 + 2]);
+
+        /* The window's own gradient matrix does not change while the point is
+         * being refined, so it is built once per level. */
+        float gxx = 0.0f;
+        float gxy = 0.0f;
+        float gyy = 0.0f;
+        for (int dy = -int(half_y); dy <= int(half_y); ++dy) {
+            for (int dx = -int(half_x); dx <= int(half_x); ++dx) {
+                float sx = px + float(dx);
+                float sy = py + float(dy);
+                float ix = (lk_sample(planes_a, base, rows, cols, sx + 1.0f, sy)
+                          - lk_sample(planes_a, base, rows, cols, sx - 1.0f, sy)) * 0.5f;
+                float iy = (lk_sample(planes_a, base, rows, cols, sx, sy + 1.0f)
+                          - lk_sample(planes_a, base, rows, cols, sx, sy - 1.0f)) * 0.5f;
+                gxx += ix * ix;
+                gxy += ix * iy;
+                gyy += iy * iy;
+            }
+        }
+        float determinant = gxx * gyy - gxy * gxy;
+        if (fabs(determinant) < 1e-6f) {
+            alive = false;
+            level -= 1;
+            guess_x *= 2.0f;
+            guess_y *= 2.0f;
+            continue;
+        }
+
+        for (uint pass = 0u; pass < iterations; ++pass) {
+            float bx = 0.0f;
+            float by = 0.0f;
+            float total = 0.0f;
+            for (int dy = -int(half_y); dy <= int(half_y); ++dy) {
+                for (int dx = -int(half_x); dx <= int(half_x); ++dx) {
+                    float sx = px + float(dx);
+                    float sy = py + float(dy);
+                    float ix = (lk_sample(planes_a, base, rows, cols, sx + 1.0f, sy)
+                              - lk_sample(planes_a, base, rows, cols, sx - 1.0f, sy)) * 0.5f;
+                    float iy = (lk_sample(planes_a, base, rows, cols, sx, sy + 1.0f)
+                              - lk_sample(planes_a, base, rows, cols, sx, sy - 1.0f)) * 0.5f;
+                    float difference = lk_sample(planes_a, base, rows, cols, sx, sy)
+                        - lk_sample(planes_b, base, rows, cols, sx + guess_x, sy + guess_y);
+                    bx += difference * ix;
+                    by += difference * iy;
+                    total += fabs(difference);
+                }
+            }
+            float step_x = (gyy * bx - gxy * by) / determinant;
+            float step_y = (gxx * by - gxy * bx) / determinant;
+            guess_x += step_x;
+            guess_y += step_y;
+            residual = total / float(window_area);
+            if (step_x * step_x + step_y * step_y < epsilon * epsilon) break;
+        }
+
+        level -= 1;
+        if (level >= 0) {
+            guess_x *= 2.0f;
+            guess_y *= 2.0f;
+        }
+    }
+
+    float landed_x = start_x + guess_x;
+    float landed_y = start_y + guess_y;
+    if (landed_x < 0.0f || landed_y < 0.0f) alive = false;
+    if (landed_x > float(frame_cols - 1u) || landed_y > float(frame_rows - 1u)) alive = false;
+    out[id * 4u + 0u] = landed_x;
+    out[id * 4u + 1u] = landed_y;
+    out[id * 4u + 2u] = alive ? 1.0f : 0.0f;
+    out[id * 4u + 3u] = residual;
+}
 """
 
 var _kernels: dict[str, Kernel] = {}
@@ -169,24 +312,6 @@ fn kernel_for(entry: str) -> Kernel {
     let compiled = Kernel.compile(SOURCE, entry)
     _kernels[entry] = compiled
     return compiled
-}
-
-fn sample_bilinear(values: list[float], rows: int, cols: int, x: float, y: float) -> float {
-    var fx = x
-    var fy = y
-    if fx < 0.0 { fx = 0.0 }
-    if fy < 0.0 { fy = 0.0 }
-    if fx > float(cols - 1) { fx = float(cols - 1) }
-    if fy > float(rows - 1) { fy = float(rows - 1) }
-    let x0 = int(fx)
-    let y0 = int(fy)
-    let x1 = min(x0 + 1, cols - 1)
-    let y1 = min(y0 + 1, rows - 1)
-    let ax = fx - float(x0)
-    let ay = fy - float(y0)
-    let top = values[y0 * cols + x0] * (1.0 - ax) + values[y0 * cols + x1] * ax
-    let bottom = values[y1 * cols + x0] * (1.0 - ax) + values[y1 * cols + x1] * ax
-    return top * (1.0 - ay) + bottom * ay
 }
 
 fn shrink(image: Mat, width: int, height: int, scale: float) -> Mat {
@@ -234,104 +359,84 @@ pub fn calc_optical_flow_pyr_lk(
 
     let first = build_pyramid(previous, max_level + 1)
     let second = build_pyramid(current, max_level + 1)
-    var planes_a: list[list[float]] = []
-    var planes_b: list[list[float]] = []
-    for level in 0..first.len() {
-        planes_a.push(first[level].to_list())
-        planes_b.push(second[level].to_list())
+    let levels = first.len()
+    if points.len() == 0 { return ([], [], []) }
+
+    #: Every level of both pyramids into one buffer apiece, with a table of
+    #: where each one starts. A kernel cannot take a list of bindings whose
+    #: length it learns at run time, and the copy is a few tenths of a
+    #: megabyte against the tracking it makes possible.
+    var table: list[float] = []
+    var total = 0
+    for level in 0..levels {
+        table.push(float(total))
+        table.push(float(first[level].rows))
+        table.push(float(first[level].cols))
+        table.push(0.0)
+        total += first[level].rows * first[level].cols
+    }
+    let planes_a = Buffer(total)
+    let planes_b = Buffer(total)
+    let pack = kernel_for("lk_pack")
+    var base = 0
+    for level in 0..levels {
+        let plane_a = first[level]
+        let plane_b = second[level]
+        let count = plane_a.rows * plane_a.cols
+        plane_a.flush()
+        plane_b.flush()
+        pack.dispatch_async(
+            [plane_a.storage, planes_a],
+            count,
+            [count, plane_a.cols, plane_a.offset, plane_a.step_, base]
+        )
+        pack.dispatch_async(
+            [plane_b.storage, planes_b],
+            count,
+            [count, plane_b.cols, plane_b.offset, plane_b.step_, base]
+        )
+        base += count
     }
 
-    let half_x = window.width // 2
-    let half_y = window.height // 2
+    var flattened: list[float] = []
+    for point in points {
+        flattened.push(point.x)
+        flattened.push(point.y)
+    }
+    let table_buffer = Buffer(table.len())
+    table_buffer.upload(table)
+    let points_buffer = Buffer(flattened.len())
+    points_buffer.upload(flattened)
+    let out_buffer = Buffer(points.len() * 4)
+    kernel_for("lk_track").dispatch_async(
+        [planes_a, planes_b, table_buffer, points_buffer, out_buffer],
+        points.len(),
+        [
+            points.len(),
+            levels,
+            window.width // 2,
+            window.height // 2,
+            iterations,
+            f32_bits(epsilon),
+            window.width * window.height,
+            previous.rows,
+            previous.cols,
+        ]
+    )
+    let landed = out_buffer.download()
+    planes_a.free()
+    planes_b.free()
+    table_buffer.free()
+    points_buffer.free()
+    out_buffer.free()
+
     var moved: list[Point2f] = []
     var found: list[bool] = []
     var errors: list[float] = []
-
-    for point in points {
-        var guess_x = 0.0
-        var guess_y = 0.0
-        var alive = true
-        var residual = 0.0
-
-        var level = first.len() - 1
-        while level >= 0 {
-            let scale = float(1 << level)
-            let px = point.x / scale
-            let py = point.y / scale
-            let rows = first[level].rows
-            let cols = first[level].cols
-            let a = planes_a[level]
-            let b = planes_b[level]
-
-            #: The window's own gradient matrix does not change while the
-            #: point is being refined, so it is built once per level.
-            var gxx = 0.0
-            var gxy = 0.0
-            var gyy = 0.0
-            for dy in -half_y..half_y + 1 {
-                for dx in -half_x..half_x + 1 {
-                    let sx = px + float(dx)
-                    let sy = py + float(dy)
-                    let ix = (sample_bilinear(a, rows, cols, sx + 1.0, sy) - sample_bilinear(a, rows, cols, sx - 1.0, sy)) *
-                        0.5
-                    let iy = (sample_bilinear(a, rows, cols, sx, sy + 1.0) - sample_bilinear(a, rows, cols, sx, sy - 1.0)) *
-                        0.5
-                    gxx += ix * ix
-                    gxy += ix * iy
-                    gyy += iy * iy
-                }
-            }
-            let determinant = gxx * gyy - gxy * gxy
-            if math.fabs(determinant) < 1e-6 {
-                alive = false
-                level -= 1
-                guess_x *= 2.0
-                guess_y *= 2.0
-                continue
-            }
-
-            for _pass in 0..iterations {
-                var bx = 0.0
-                var by = 0.0
-                var total = 0.0
-                for dy in -half_y..half_y + 1 {
-                    for dx in -half_x..half_x + 1 {
-                        let sx = px + float(dx)
-                        let sy = py + float(dy)
-                        let ix = (sample_bilinear(a, rows, cols, sx + 1.0, sy) - sample_bilinear(a, rows, cols, sx - 1.0, sy)) *
-                            0.5
-                        let iy = (sample_bilinear(a, rows, cols, sx, sy + 1.0) - sample_bilinear(a, rows, cols, sx, sy - 1.0)) *
-                            0.5
-                        let difference = sample_bilinear(a, rows, cols, sx, sy) -
-                            sample_bilinear(b, rows, cols, sx + guess_x, sy + guess_y)
-                        bx += difference * ix
-                        by += difference * iy
-                        total += math.fabs(difference)
-                    }
-                }
-                let step_x = (gyy * bx - gxy * by) / determinant
-                let step_y = (gxx * by - gxy * bx) / determinant
-                guess_x += step_x
-                guess_y += step_y
-                residual = total / float(window.width * window.height)
-                if step_x * step_x + step_y * step_y < epsilon * epsilon { break }
-            }
-
-            level -= 1
-            if level >= 0 {
-                guess_x *= 2.0
-                guess_y *= 2.0
-            }
-        }
-
-        let landed = Point2f(point.x + guess_x, point.y + guess_y)
-        if landed.x < 0.0 or landed.y < 0.0 { alive = false }
-        if landed.x > float(previous.cols - 1) or landed.y > float(previous.rows - 1) {
-            alive = false
-        }
-        moved.push(landed)
-        found.push(alive)
-        errors.push(residual)
+    for index in 0..points.len() {
+        moved.push(Point2f(landed[index * 4], landed[index * 4 + 1]))
+        found.push(landed[index * 4 + 2] != 0.0)
+        errors.push(landed[index * 4 + 3])
     }
     return (moved, found, errors)
 }

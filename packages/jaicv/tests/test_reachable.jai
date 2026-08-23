@@ -411,6 +411,46 @@ fn test_calib3d_run() -> void {
     )
 }
 
+#: A shift the tracker is told nothing about, which it has to recover.
+#:
+#: Checking only that the right number of points came back says nothing about
+#: whether any of them moved to the right place -- the tracker could return
+#: its input unchanged and pass.
+fn test_optical_flow_finds_the_shift() -> void {
+    if not have_gpu() { return }
+    let dx = 2.5
+    let dy = -1.5
+    var before: list[float] = []
+    var after: list[float] = []
+    for index in 0..160 * 200 {
+        let y = float(index // 200)
+        let x = float(index % 200)
+        before.push(texture_at(x, y))
+        after.push(texture_at(x - dx, y - dy))
+    }
+    let first = Mat.from_list(160, 200, CV_32FC1, before)
+    let second = Mat.from_list(160, 200, CV_32FC1, after)
+    var points: list[Point2f] = []
+    for index in 0..9 {
+        points.push(Point2f(float(60 + index * 13 % 80), float(50 + index * 9 % 60)))
+    }
+    let (moved, found, _errors) = calc_optical_flow_pyr_lk(first, second, points)
+    var tracked = 0
+    for (index, point) in points.enumerate() {
+        if not found[index] { continue }
+        tracked += 1
+        assert_near(moved[index].x - point.x, dx, 0.15)
+        assert_near(moved[index].y - point.y, dy, 0.15)
+    }
+    assert_true(tracked >= 8)
+}
+
+fn texture_at(x: float, y: float) -> float {
+    let blob = math.exp(-((x - 100.0) * (x - 100.0) + (y - 80.0) * (y - 80.0)) / 700.0)
+    let grain = math.sin(x * 0.23) * math.cos(y * 0.19) + math.sin((x + y) * 0.11)
+    return 60.0 + 90.0 * blob + 40.0 * grain
+}
+
 fn test_video_run() -> void {
     if not have_gpu() { return }
     let a = disc()
@@ -430,6 +470,7 @@ fn test_video_run() -> void {
     assert_eq(moved.len(), 2)
     assert_eq(found.len(), 2)
     assert_eq(errors.len(), 2)
+    test_optical_flow_finds_the_shift()
 
     let (steps, settled) = mean_shift(a, Rect(10, 20, 20, 20))
     assert_true(steps >= 0 and settled.width > 0)
