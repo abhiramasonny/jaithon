@@ -197,6 +197,10 @@ class GMM {
     var cov: list[list[float]]
     var inv_cov: list[list[float]]
     var det: list[float]
+    #: `1 / sqrt(det)`, which every density evaluation wants and none of
+    #: them changes. Working it out per pixel per component was a square
+    #: root and a divide a hundred thousand times an iteration.
+    var scale: list[float]
     var sums: list[list[float]]
     var prods: list[list[float]]
     var counts: list[int]
@@ -225,6 +229,9 @@ class GMM {
         }
         self.inv_cov = inv_cov
         self.det = det
+        var scale: list[float] = []
+        for _index in 0..GMM_COMPONENTS { scale.push(0.0) }
+        self.scale = scale
         for ci in 0..GMM_COMPONENTS {
             if self.coefs[ci] > 0.0 { self.refresh(ci) }
         }
@@ -256,6 +263,7 @@ class GMM {
             determinant = cofactor_det(c)
         }
         self.det[ci] = determinant
+        self.scale[ci] = 1.0 / math.sqrt(determinant)
         let inv_d = 1.0 / determinant
         self.inv_cov[ci] = [
             (c[4] * c[8] - c[5] * c[7]) * inv_d,
@@ -276,8 +284,13 @@ class GMM {
     #: the same five components, the missing constant is common to all of
     #: them and never changes which one wins or which side of the cut a
     #: pixel lands on.
-    fn component_density(self, ci: int, color: list[float]) -> float {
-        if self.coefs[ci] <= 0.0 { return 0.0 }
+    #: Everything but the exponential, which is where the arithmetic is.
+    #:
+    #: Split out because a call anywhere in a body stops the tier compiling
+    #: it, and `math.exp` is a call that cannot be written out. Keeping the
+    #: nine multiply-adds and the six list reads in their own body lets those
+    #: compile, and leaves the interpreted part two calls long.
+    fn component_exponent(self, ci: int, color: list[float]) -> float {
         let m = self.mean[ci]
         let d0 = color[0] - m[0]
         let d1 = color[1] - m[1]
@@ -286,8 +299,12 @@ class GMM {
         let a = inv[0] * d0 + inv[1] * d1 + inv[2] * d2
         let b = inv[3] * d0 + inv[4] * d1 + inv[5] * d2
         let e = inv[6] * d0 + inv[7] * d1 + inv[8] * d2
-        let mult = d0 * a + d1 * b + d2 * e
-        return 1.0 / math.sqrt(self.det[ci]) * math.exp(-0.5 * mult)
+        return -0.5 * (d0 * a + d1 * b + d2 * e)
+    }
+
+    fn component_density(self, ci: int, color: list[float]) -> float {
+        if self.coefs[ci] <= 0.0 { return 0.0 }
+        return self.scale[ci] * math.exp(self.component_exponent(ci, color))
     }
 
     #: The mixture density at `color`, weighted by each component's mixing
