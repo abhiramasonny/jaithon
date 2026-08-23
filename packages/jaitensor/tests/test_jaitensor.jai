@@ -1626,10 +1626,11 @@ fn test_an_embedding_takes_a_batch_of_index_rows() -> void {
     )
     defer { model.free() }
     model.compile(optimizer: jt.Adam(learning_rate: 0.02), loss: jt.SparseCategoricalCrossentropy())
-    #: One row of indices becomes `context` lookups laid end to end, so the
-    #: layer after it sees that much width.
-    assert_eq(embedding.output_width(), context * width)
     let history = model.fit(data, epochs: 4, batch_size: 8, verbose: false, plot_path: null)
+    #: One row of indices becomes `context` lookups laid end to end, so the
+    #: layer after it sees that much width. The layer learns this when it is
+    #: built, which is the first time the model is fitted.
+    assert_eq(embedding.output_width(), context * width)
     assert_eq(history.loss.len(), 4)
     for value in history.loss { assert math.is_finite(value) }
     assert history.loss[3] < history.loss[0]
