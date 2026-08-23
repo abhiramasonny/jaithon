@@ -864,7 +864,12 @@ fn gradient_at(
             let ny = y + (if step == 0 { -1 } elif step == 3 { 1 } else { 0 })
             let nx = x + (if step == 1 { -1 } elif step == 2 { 1 } else { 0 })
             if ny < 0 or nx < 0 or ny >= rows or nx >= cols { continue }
-            let gap = math.fabs(pixels[(ny * cols + nx) * cn + channel] - here)
+            #: The magnitude written out rather than called for. `math.fabs`
+            #: is a call, and a call in this loop is what stops the tier
+            #: compiling it -- which left the flood spending most of a
+            #: watershed here.
+            let difference = pixels[(ny * cols + nx) * cn + channel] - here
+            let gap = if difference < 0.0 { -difference } else { difference }
             if gap > steepest { steepest = gap }
         }
     }

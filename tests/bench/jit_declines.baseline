@@ -11,6 +11,7 @@ stopped : OP_INVOKE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_JUMP_IF_FALSE
 stopped : OP_LT
+stopped : OP_NE
 stopped : OP_RETURN
 stopped : OP_RETURN_NULL
 stopped : a builtin whose result kind has not been observed
@@ -38,6 +39,7 @@ stopped: a local was given two different kinds
 stopped: add-bind of a kind that is neither int nor float
 stopped: an `is` against something other than null
 stopped: an append reaching past the model
+stopped: an indirect callee compiled against an older module
 stopped: an unpinned receiver's result kind
 stopped: builtin arity
 stopped: callee is not a compiled global function
