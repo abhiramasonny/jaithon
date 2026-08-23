@@ -460,6 +460,49 @@ fn test_gather_rows_accumulates_repeated_indices() -> void {
 
 #: Not trained through, but it must not corrupt what passes: with `training`
 #: false it is the identity, and its gradient is one.
+#: Training-mode dropout has to draw a different mask each time it is asked.
+#:
+#: The seed was the tensor's own size, a constant for a given shape, so every
+#: step of every epoch dropped exactly the same units and two layers of the
+#: same shape dropped the same ones as each other. Perfectly repeatable, and
+#: therefore never flaky -- it simply was not regularising anything.
+fn test_dropout_draws_a_fresh_mask_each_step() -> void {
+    if not have_gpu() { return }
+    let x = Tensor.ones([4, 32])
+    var seen: list[str] = []
+    for _round in 0..4 {
+        var mask = ""
+        for value in jt.dropout(x, 0.5, true).download() {
+            mask += if value == 0.0 { "." } else { "#" }
+        }
+        assert_true(not seen.contains(mask), "two steps drew the same dropout mask")
+        seen.push(mask)
+    }
+
+    #: A seed asked for by name still repeats, which is what a test needs.
+    var first = ""
+    for value in jt.dropout(x, 0.5, true, 7).download() {
+        first += if value == 0.0 { "." } else { "#" }
+    }
+    var again = ""
+    for value in jt.dropout(x, 0.5, true, 7).download() {
+        again += if value == 0.0 { "." } else { "#" }
+    }
+    assert_eq(first, again)
+
+    #: And it drops roughly what it was asked to.
+    var kept = 0
+    var total = 0
+    for _round in 0..20 {
+        for value in jt.dropout(Tensor.ones([128]), 0.25, true).download() {
+            total += 1
+            if value != 0.0 { kept += 1 }
+        }
+    }
+    let rate = float(kept) / float(total)
+    assert_true(rate > 0.70 and rate < 0.80, f"kept {rate} of the units, wanted about 0.75")
+}
+
 fn test_dropout_is_transparent_when_not_training() -> void {
     if not have_gpu() { return }
     check(fn(x: Tensor) -> Tensor { return jt.dropout(x, 0.5, false) }, [6], spread(6))

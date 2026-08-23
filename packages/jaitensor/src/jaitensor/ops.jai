@@ -3222,14 +3222,32 @@ fn _pool2d(input: Tensor, kernel_size: int, stride: int, padding: int, is_max: b
     return output
 }
 
+#: How many masks have been drawn, so that the next one differs from the last.
+var _dropout_draws = 0
+
 #: Inverted dropout. `p` is the drop probability.
-pub fn dropout(input: Tensor, p: float = 0.5, training: bool = true) -> Tensor {
+#:
+#: `seed` fixes the mask, for a test that wants the same one twice. Left out,
+#: each call draws a fresh one.
+#:
+#: The seed used to be the tensor's own size, which is the same number on
+#: every step -- so the same units were dropped every step of every epoch,
+#: and two layers of the same shape dropped the same ones as each other. That
+#: is not regularisation, it is a fixed pruning mask chosen by the shape, and
+#: being perfectly repeatable it never looked wrong.
+pub fn dropout(input: Tensor, p: float = 0.5, training: bool = true, seed: int? = null) -> Tensor {
     if p < 0.0 or p >= 1.0 { throw ValueError(f"dropout p must be in [0, 1), got {p}") }
     if not training or p == 0.0 {
         return reshape(input, input.shape)
     }
     let noise = Tensor(input.shape)
-    noise.buffer().fill_uniform(0.0, 1.0, input.size + 1)
+    let asked = if seed is null {
+        _dropout_draws += 1
+        _dropout_draws * 2654435761 + input.size
+    } else {
+        seed
+    }
+    noise.buffer().fill_uniform(0.0, 1.0, asked)
     let output = Tensor(input.shape)
     let keep = 1.0 - p
     let kernel = cached_kernel("dropout_apply")
