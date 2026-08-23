@@ -314,6 +314,21 @@ fn emit_layer_norm(state: Build, layer: any, input: Built) -> Built? {
 #: Expressing a layer here is not free to get wrong: it decides whether the
 #: model compiles at all, and compiling this one replaces hand-written kernels
 #: that beat the graph. Worth revisiting only if that stops being true.
+#:
+#: What it costs to leave out, taken apart on the same benchmark at the
+#: medium level (small and wide, seconds):
+#:
+#:   with the normalisation, compiled step allowed     0.500 and 0.860
+#:   with it, compiled step turned off                 0.497 and 0.858
+#:   without it, compiled step allowed                 0.233 and 0.538
+#:   without it, compiled step turned off              0.423 and 0.721
+#:
+#: The first two lines being the same is the whole point: one layer this
+#: cannot express takes the model off the graph entirely. The layer's own
+#: kernels are cheap -- 0.074 and 0.137 of those seconds -- and the route
+#: they cost is dear, 0.190 and 0.183. So an expression of it has to come in
+#: under about three and a half times what the kernels cost to be worth
+#: having, and both of the ones tried came in far above that.
 fn emit_layer(state: Build, layer: Layer, input: Built) -> Built? {
     if layer is Dense { return emit_dense(state, layer, input) }
     if layer is Flatten { return emit_flatten(state, layer, input) }
