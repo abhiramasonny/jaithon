@@ -1197,6 +1197,49 @@ fn test_a_convolutional_model_survives_a_save_and_a_load() -> void {
 #: the tally it was perfectly willing to keep. `History.accuracy` is
 #: documented as the percentage after each epoch and `plot()` draws it, so a
 #: model learning perfectly well showed a flat line along the bottom.
+#: A table whose row length is not a multiple of four.
+#:
+#: The fused kernels take each batch as a window into the dataset, and the
+#: platform's array view pads its innermost dimension out to sixteen bytes --
+#: so it refuses to build a window that starts part way in and whose rows are
+#: five, six, seven or nine floats long. `fit` did not fall back, it threw:
+#: "gpu_mlp_sgd_epoch(): the kernel failed", for most of the widths a table
+#: of measurements actually has. The first batch starts at offset zero and is
+#: exempt, so a run of fewer than two batches appeared to work while training
+#: on the first batch alone.
+fn test_a_model_trains_on_any_number_of_features() -> void {
+    if not jt.is_available() { return }
+    for width in [4, 5, 6, 7, 9, 16] {
+        var features: list[float] = []
+        var labels: list[float] = []
+        var seed = 4
+        for _index in 0..256 {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            let kind = seed % 4
+            for _slot in 0..width { features.push(float(kind) + float(seed % 50) / 200.0) }
+            labels.push(float(kind))
+        }
+        let data = jt.Dataset(jt.Tensor([256, width], features), jt.Tensor([256], labels))
+        let model = jt.Sequential(
+            [
+                jt.Dense(256, activation: jt.Activation.Relu),
+                jt.Dense(4, activation: jt.Activation.Softmax),
+            ]
+        )
+        model.compile(
+            optimizer: jt.SGD(learning_rate: 0.01),
+            loss: jt.SparseCategoricalCrossentropy()
+        )
+        #: More than two batches, so a window at a non-zero offset is really
+        #: asked for.
+        let history = model.fit(data, epochs: 1, batch_size: 64, verbose: false, plot_path: null)
+        assert_eq(history.loss.len(), 1)
+        assert math.is_finite(history.loss[0])
+        model.free()
+        data.free()
+    }
+}
+
 fn test_the_fused_path_reports_the_accuracy_it_reached() -> void {
     if not jt.is_available() { return }
     var features: list[float] = []

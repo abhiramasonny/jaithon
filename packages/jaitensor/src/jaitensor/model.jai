@@ -655,7 +655,22 @@ pub class Sequential {
         return width
     }
 
+    #: Whether a batch can be handed to the fused kernels as a window into
+    #: the dataset rather than copied out of it.
+    #:
+    #: The framework's array view pads its innermost dimension out to sixteen
+    #: bytes, so a window that starts part way into a buffer and whose rows
+    #: are not a multiple of four floats reads the wrong pixels -- and the
+    #: platform refuses to build one rather than doing that. The fused path
+    #: takes windows, so it cannot have such a dataset: five, six, seven or
+    #: nine features and `fit` threw outright, which is most of the widths a
+    #: table of measurements has. The first batch starts at offset zero and
+    #: is exempt, so a run shorter than two batches appeared to work and
+    #: trained on the first batch only.
+    fn _fused_rows_are_windowable(self) -> bool { return self.input_units % 4 == 0 }
+
     fn _can_fuse_sgd(self) -> bool {
+        if not self._fused_rows_are_windowable() { return false }
         let hidden_layers = self._fused_relu_layers()
         if hidden_layers != 1 and hidden_layers != 3 { return false }
         if self._fused_hidden_widths().len() != hidden_layers { return false }
@@ -669,6 +684,7 @@ pub class Sequential {
 
     fn _can_fuse_mlp_step(self) -> bool {
         if self._can_fuse_sgd() { return false }
+        if not self._fused_rows_are_windowable() { return false }
         let hidden_layers = self._fused_relu_layers()
         if hidden_layers != 1 and hidden_layers != 3 { return false }
         if self._fused_hidden_widths().len() != hidden_layers { return false }
