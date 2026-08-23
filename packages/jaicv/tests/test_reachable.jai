@@ -501,6 +501,42 @@ fn test_a_bayes_classifier_pays_for_a_wide_class() -> void {
     }
 }
 
+#: An undistorted camera has nothing to correct, so the answer is the camera.
+#:
+#: The inner rectangle was chosen by the sign of the straightened coordinate
+#: rather than by which edge of the picture the sample came from, and the top
+#: and bottom rows run the full width -- so one of them always landed within
+#: a fraction of a pixel of the principal point and both bounds collapsed
+#: onto zero. A 640 by 480 with a focal length of 500 and no distortion at
+#: all came back with a focal length of 4006 and its principal point at
+#: (4, 4). Only alpha of one, which uses the outer rectangle and was
+#: computed correctly, ever worked.
+fn test_an_undistorted_camera_keeps_its_matrix() -> void {
+    if not have_gpu() { return }
+    let camera = Mat.from_list(
+        3,
+        3,
+        CV_32FC1,
+        [500.0, 0.0, 320.0, 0.0, 500.0, 240.0, 0.0, 0.0, 1.0]
+    )
+    for alpha in [0.0, 0.5, 1.0] {
+        let got = get_optimal_new_camera_matrix(camera, [], Size(640, 480), alpha).values()
+        assert_near(got[0], 500.0, 2.0)
+        assert_near(got[4], 500.0, 2.0)
+        assert_near(got[2], 320.0, 2.0)
+        assert_near(got[5], 240.0, 2.0)
+    }
+
+    #: With barrel distortion the two rectangles differ, and cropping to the
+    #: valid area has to zoom in further than keeping everything does.
+    let barrel = [-0.25, 0.05, 0.0, 0.0, 0.0]
+    let tight = get_optimal_new_camera_matrix(camera, barrel, Size(640, 480), 0.0).values()
+    let loose = get_optimal_new_camera_matrix(camera, barrel, Size(640, 480), 1.0).values()
+    assert_true(tight[0] > loose[0], f"cropping gave {tight[0]}, keeping all gave {loose[0]}")
+    #: And the principal point stays near the middle either way.
+    for value in [tight[2], loose[2]] { assert_near(value, 320.0, 25.0) }
+}
+
 fn test_a_large_symmetric_matrix_is_fully_diagonalised() -> void {
     if not have_gpu() { return }
     var seed = 17
@@ -616,6 +652,7 @@ fn test_video_run() -> void {
     test_optical_flow_finds_the_shift()
     test_canny_answers_the_same_twice()
     test_a_large_symmetric_matrix_is_fully_diagonalised()
+    test_an_undistorted_camera_keeps_its_matrix()
     test_a_bayes_classifier_pays_for_a_wide_class()
     test_canny_follows_a_long_weak_edge()
 

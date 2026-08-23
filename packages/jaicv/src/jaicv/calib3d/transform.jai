@@ -491,11 +491,24 @@ pub fn get_optimal_new_camera_matrix(
     var outer_right = -1e30
     var outer_top = 1e30
     var outer_bottom = -1e30
-    for point in straight {
-        if point.x < 0.0 and point.x > left { left = point.x }
-        if point.x > 0.0 and point.x < right { right = point.x }
-        if point.y < 0.0 and point.y > top { top = point.y }
-        if point.y > 0.0 and point.y < bottom { bottom = point.y }
+    #: Each side of the inner rectangle is bounded by the samples from that
+    #: side of the picture, which is what the four-at-a-time order above
+    #: records: top, bottom, left, right, repeating.
+    #:
+    #: Choosing instead by the SIGN of the straightened coordinate -- the
+    #: nearest negative x for the left, the nearest positive for the right --
+    #: reads the top and bottom rows too, and those run the full width, so one
+    #: of them always lands within a fraction of a pixel of the principal
+    #: point. Both bounds then collapsed onto zero and the inner rectangle
+    #: became a sliver: an undistorted 640 by 480 with fx of 500 came back
+    #: with fx of 4006 and the principal point at (4, 4). Only alpha of one,
+    #: which uses the outer rectangle, was ever right.
+    for (index, point) in straight.enumerate() {
+        let edge = index % 4
+        if edge == 0 and point.y > top { top = point.y }
+        if edge == 1 and point.y < bottom { bottom = point.y }
+        if edge == 2 and point.x > left { left = point.x }
+        if edge == 3 and point.x < right { right = point.x }
         if point.x < outer_left { outer_left = point.x }
         if point.x > outer_right { outer_right = point.x }
         if point.y < outer_top { outer_top = point.y }
