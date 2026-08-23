@@ -1156,6 +1156,52 @@ fn test_sgd_step_matches_the_textbook_update_on_one_parameter() -> void {
     parameter.free()
 }
 
+#: A learning rate that changes between steps has to reach the device.
+#:
+#: The settings buffer was written when a parameter first saw an optimizer
+#: and never again, so the card kept reading the opening rate: a schedule
+#: decaying 1.0, 0.1, 0.01, 0.001 moved the parameter by a whole 1.0 four
+#: times over. Nothing complains, because a loss that is falling too fast is
+#: still falling.
+fn test_a_changing_learning_rate_reaches_the_device() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [0.0], requires_grad: true)
+    var expected = 0.0
+    for rate in [1.0, 0.1, 0.01, 0.001] {
+        let gradient = jt.Tensor([1], [1.0])
+        parameter.grad = gradient
+        jt.SGD(learning_rate: rate).step([parameter])
+        expected -= rate
+        assert math.fabs(parameter.download()[0] - expected) < 1e-6
+        gradient.free()
+    }
+    parameter.free()
+}
+
+#: The same parameter handed to a different kind of optimizer.
+#:
+#: Plain descent keeps three numbers in its settings and Adam six, so a
+#: buffer sized for the first is too short for the second and Adam would read
+#: past the end of it.
+fn test_switching_optimizer_kind_resizes_the_settings() -> void {
+    if not jt.is_available() { return }
+    let parameter = jt.Tensor([1], [0.0], requires_grad: true)
+    let first = jt.Tensor([1], [1.0])
+    parameter.grad = first
+    jt.SGD(learning_rate: 0.1).step([parameter])
+    first.free()
+    let second = jt.Tensor([1], [1.0])
+    parameter.grad = second
+    jt.Adam(learning_rate: 0.1).step([parameter])
+    let landed = parameter.download()[0]
+    #: Adam's first step is the learning rate, near enough, whatever came
+    #: before it.
+    assert math.is_finite(landed)
+    assert math.fabs(landed - (-0.1 - 0.1)) < 1e-3
+    second.free()
+    parameter.free()
+}
+
 fn test_adam_step_moments_persist_and_affect_a_second_step() -> void {
     if not jt.is_available() { return }
     let parameter = jt.Tensor([1], [0.0], requires_grad: true)

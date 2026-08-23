@@ -171,11 +171,26 @@ fn apply_update(parameter: Tensor, settings: list[float], kind: int) -> void {
     }
     let state = state_for(parameter)
     let existing_settings = state.settings
-    let settings_buffer = if existing_settings is null {
+    #: The settings go across on every step, not only the first.
+    #:
+    #: Keeping the buffer and not writing to it again meant the device read
+    #: the first step's numbers for ever: a learning-rate schedule moved the
+    #: parameter by its opening rate at every step and decayed nothing, which
+    #: is silent because the loss still falls. A handful of floats a step is
+    #: not worth the bug.
+    #:
+    #: The length changes when the kind does -- plain descent carries three
+    #: numbers and Adam six -- so a buffer of the wrong size is replaced
+    #: rather than written into.
+    let settings_buffer = if existing_settings is null or existing_settings.count != settings.len() {
+        if existing_settings is not null {
+            existing_settings.free()
+        }
         let created = Buffer.of(settings)
         state.settings = created
         created
     } else {
+        existing_settings.upload(settings)
         existing_settings
     }
     if kind == 0 and settings[1] == 0.0 {
