@@ -89,6 +89,10 @@ pub class Sequential {
     var optimizer_value: Optimizer?
     var loss_value: Loss?
     var input_units: int
+    #: The shape one sample arrives in, which is not the same thing as how
+    #: many numbers are in it: a convolution has to be built from the height,
+    #: width and channels, and cannot recover them from the product.
+    var input_shape: list[int]
     var freed: bool
     var cached_parameters: list[Tensor]?
     var fused_sgd: bool
@@ -109,6 +113,7 @@ pub class Sequential {
         self.optimizer_value = null
         self.loss_value = null
         self.input_units = 0
+        self.input_shape = []
         self.freed = false
         self.cached_parameters = null
         self.fused_sgd = false
@@ -302,9 +307,15 @@ pub class Sequential {
     pub fn save_weights(self, path: str) -> void {
         self._check_live()
         if self.input_units == 0 { throw RuntimeError("build the model before saving weights") }
+        #: The shape as well as the count. A file that recorded only the
+        #: count could not be loaded back into anything with a convolution in
+        #: it: the model was rebuilt down the flat path, every shape-dependent
+        #: layer came out the wrong size, and the load failed on the first
+        #: parameter that did not match.
         let document = {
-            "format": "jaitensor.weights.v1",
+            "format": "jaitensor.weights.v2",
             "input_units": self.input_units,
+            "input_shape": self.input_shape,
             "weights": self.get_weights(),
         }
         write_file(path, json.stringify(document) + "\n")
@@ -314,10 +325,22 @@ pub class Sequential {
     pub fn load_weights(self, path: str) -> void {
         self._check_live()
         let document = json.parse(read_file(path))
-        if document["format"] != "jaitensor.weights.v1" {
-            throw ValueError("unsupported jaitensor weight file")
+        let format = document["format"]
+        #: Version one carried no shape, so it can only be rebuilt flat --
+        #: which is all it was ever able to describe.
+        if format == "jaitensor.weights.v2" {
+            var shape: list[int] = []
+            for dimension in document["input_shape"] { shape.push(int(dimension)) }
+            if shape.len() > 1 {
+                self._build_shape(shape)
+            } else {
+                self._build(int(document["input_units"]))
+            }
+        } elif format == "jaitensor.weights.v1" {
+            self._build(int(document["input_units"]))
+        } else {
+            throw ValueError(f"unsupported jaitensor weight file: {format}")
         }
-        self._build(int(document["input_units"]))
         var values: list[list[float]] = []
         for packed in document["weights"] {
             values.push([float(value) for value in packed])
@@ -459,6 +482,7 @@ pub class Sequential {
             current = layer.output_shape()
         }
         self.input_units = n
+        self.input_shape = shape
     }
 
     fn _build(self, inputs: int) -> void {
@@ -476,6 +500,7 @@ pub class Sequential {
             width = layer.output_width()
         }
         self.input_units = inputs
+        self.input_shape = [inputs]
     }
 
     fn _forward(self, x: Tensor, training: bool = true) -> Tensor {
