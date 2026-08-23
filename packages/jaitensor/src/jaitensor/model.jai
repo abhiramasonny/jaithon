@@ -693,8 +693,17 @@ pub class Sequential {
         let learning_rate = optimizer.settings()[0]
         let total_loss = Tensor.zeros([1])
         let epoch_loss = Tensor.zeros([epochs])
+        #: Counted as well as summed. `_fused_train` has always been willing
+        #: to tally the right answers -- the epoch-at-a-time path passes it
+        #: one -- and this path simply did not, so it pushed a flat zero into
+        #: the history and `plot()` drew a flat zero line for the accuracy of
+        #: a model that was learning perfectly well.
+        let total_correct = Tensor.zeros([1])
+        let epoch_correct = Tensor.zeros([epochs])
         defer { total_loss.free() }
         defer { epoch_loss.free() }
+        defer { total_correct.free() }
+        defer { epoch_correct.free() }
         var processed = 0
         let started = Instant.now()
         for epoch in 1..=epochs {
@@ -703,18 +712,24 @@ pub class Sequential {
                 batch_size,
                 learning_rate,
                 total_loss,
+                total_correct: total_correct,
                 flush_each_epoch: false
             )
             let loss_slot = epoch_loss.view(epoch - 1, [1])
             copy_into(total_loss, loss_slot)
             loss_slot.free()
             total_loss.zero_()
+            let correct_slot = epoch_correct.view(epoch - 1, [1])
+            copy_into(total_correct, correct_slot)
+            correct_slot.free()
+            total_correct.zero_()
         }
         let losses = epoch_loss.download()
+        let corrects = epoch_correct.download()
         let seconds_per_epoch = started.elapsed().to_seconds() / float(epochs)
         for index in 0..epochs {
             history.loss.push(losses[index] / float(processed))
-            history.accuracy.push(0.0)
+            history.accuracy.push(100.0 * corrects[index] / float(processed))
             history.seconds.push(seconds_per_epoch)
         }
     }

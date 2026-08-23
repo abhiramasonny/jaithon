@@ -1190,6 +1190,49 @@ fn test_a_convolutional_model_survives_a_save_and_a_load() -> void {
 #: moment. After five momentum steps at 0.9 that velocity is about 41, and
 #: Adam's opening step moved the parameter by 1.93 where a clean one moves
 #: 0.01. A hundred and ninety times, silently.
+#: The accuracy `fit` reports has to be the accuracy the model has.
+#:
+#: The fused path that runs a whole run of epochs on the device pushed a flat
+#: zero into the history, every epoch, because it never asked the kernel for
+#: the tally it was perfectly willing to keep. `History.accuracy` is
+#: documented as the percentage after each epoch and `plot()` draws it, so a
+#: model learning perfectly well showed a flat line along the bottom.
+fn test_the_fused_path_reports_the_accuracy_it_reached() -> void {
+    if not jt.is_available() { return }
+    var features: list[float] = []
+    var labels: list[float] = []
+    var seed = 4
+    for _index in 0..256 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let kind = seed % 4
+        for _slot in 0..16 { features.push(float(kind) + float(seed % 50) / 200.0) }
+        labels.push(float(kind))
+    }
+    let data = jt.Dataset(jt.Tensor([256, 16], features), jt.Tensor([256], labels))
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(512, activation: jt.Activation.Relu),
+            jt.Dense(4, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(optimizer: jt.SGD(learning_rate: 0.05), loss: jt.SparseCategoricalCrossentropy())
+    #: No validation data and not verbose, which is what selects the path
+    #: that runs every epoch on the device without coming back between them.
+    let history = model.fit(data, epochs: 3, batch_size: 64, verbose: false, plot_path: null)
+    assert_eq(history.accuracy.len(), 3)
+    for value in history.accuracy {
+        assert math.is_finite(value)
+        assert value > 0.0
+        assert value <= 100.0
+    }
+    #: And it agrees with what the model actually scores, near enough that a
+    #: number invented from nowhere would not pass.
+    let measured = model.evaluate(data).accuracy
+    assert math.fabs(history.accuracy[2] - measured) < 15.0
+}
+
 fn test_a_second_kind_of_optimizer_starts_from_nothing() -> void {
     if not jt.is_available() { return }
     let shared = jt.Tensor([1], [0.0], requires_grad: true)
