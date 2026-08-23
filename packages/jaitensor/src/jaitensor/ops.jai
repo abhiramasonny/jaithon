@@ -750,40 +750,52 @@ kernel void layer_norm_backward(device const float* input [[buffer(0)]],
     threadgroup float shared_dy;
     threadgroup float shared_dy_xhat;
 
+    /* The mean first, then the spread about it -- the same two passes the
+     * forward makes, and for the same reason.
+     *
+     * Summing the squares alongside the values and taking `E[x^2] - E[x]^2`
+     * reads the row once instead of twice, and was how this stood. Those two
+     * terms are equal to seven digits once the mean is large beside the
+     * spread, which is exactly the residual stream a normalisation is put
+     * there to tame: at a mean of ten thousand and a spread of one they
+     * cancel to nothing, `rsqrt` is handed a negative, and every one of the
+     * row's gradients comes back NaN while the forward stays finite. A
+     * second read of a row already in cache is the cheaper half of that
+     * trade. */
     float total = 0.0f;
-    float square = 0.0f;
-    for (uint i = lid; i < width; i += GROUP) {
-        float v = input[base + i];
-        total += v;
-        square += v * v;
-    }
     if (lid < 32u) {
         lanes_a[lid] = 0.0f;
         lanes_b[lid] = 0.0f;
     }
+    for (uint i = lid; i < width; i += GROUP) total += input[base + i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     total = simd_sum(total);
-    square = simd_sum(square);
-    if (lane == 0u) {
-        lanes_a[warp] = total;
-        lanes_b[warp] = square;
-    }
+    if (lane == 0u) lanes_a[warp] = total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0u) {
         float sa = 0.0f;
+        for (uint j = 0u; j < 32u; j++) sa += lanes_a[j];
+        shared_mean = sa * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float square = 0.0f;
+    for (uint i = lid; i < width; i += GROUP) {
+        float d = input[base + i] - shared_mean;
+        square += d * d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    square = simd_sum(square);
+    if (lane == 0u) lanes_b[warp] = square;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
         float sb = 0.0f;
-        for (uint j = 0u; j < 32u; j++) {
-            sa += lanes_a[j];
-            sb += lanes_b[j];
-        }
-        float m = sa * scale;
-        float r = rsqrt(sb * scale - m * m + 1e-5f);
-        shared_mean = m;
-        shared_inv = r;
+        for (uint j = 0u; j < 32u; j++) sb += lanes_b[j];
+        shared_inv = rsqrt(sb * scale + 1e-5f);
         /* Handed to the parameter pass, which is spread over columns and so
          * cannot reduce a row for itself. */
-        row_mean[row] = m;
-        row_inv[row] = r;
+        row_mean[row] = shared_mean;
+        row_inv[row] = shared_inv;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float m = shared_mean;

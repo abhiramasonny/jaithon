@@ -473,6 +473,42 @@ fn test_dropout_is_transparent_when_not_training() -> void {
 #: is written without a reduction -- handed the product's own backward an
 #: upstream of the wrong rank and it failed to index it. The loss still had one
 #: element, so nothing before this noticed.
+#: A row whose mean is large beside its spread, which is what a residual
+#: stream drifts into and what a normalisation is put there to tame.
+#:
+#: The backward used to work the spread out as `E[x^2] - E[x]^2`, one pass
+#: over the row instead of two. Those two terms agree to seven digits once
+#: the mean is ten thousand and the spread is one, so the subtraction kept
+#: none of them, `rsqrt` was handed a negative, and every gradient in the row
+#: came back NaN -- while the forward stayed perfectly finite, so nothing
+#: downstream said why the model had stopped learning.
+fn test_layer_norm_gradients_survive_a_large_mean() -> void {
+    if not have_gpu() { return }
+    let width = 64
+    for offset in [0.0, 100.0, 10000.0] {
+        var values: list[float] = []
+        var seed = 11
+        for _index in 0..width {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            values.push(offset + (float(seed % 1000) / 1000.0 - 0.5))
+        }
+        let x = Tensor([1, width], values, requires_grad: true)
+        let gamma = Tensor.ones([width])
+        let beta = Tensor.zeros([width])
+        #: Weighted, so the gradient is not the same number in every slot and
+        #: a wrong one cannot hide behind a right one.
+        var weights: list[float] = []
+        for index in 0..width { weights.push(float(index % 7) - 3.0) }
+        let weighting = Tensor([1, width], weights)
+        let junk = jt.sum(jt.multiply(layer_norm(x, gamma, beta), weighting)).backward()
+        let gradient = x.grad
+        assert_true(gradient is not null, "the input should have a gradient")
+        for (index, value) in gradient.download().enumerate() {
+            assert_true(math.is_finite(value), f"gradient {index} at offset {offset} is {value}")
+        }
+    }
+}
+
 fn test_backward_seeds_a_rank_two_loss_with_a_rank_two_gradient() -> void {
     if not have_gpu() { return }
     let x = Tensor([3, 1], [2.0, -1.0, 0.5], requires_grad: true)
