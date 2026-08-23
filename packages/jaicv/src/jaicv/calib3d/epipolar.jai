@@ -181,7 +181,16 @@ pub fn find_fundamental_mat(
     var state = 0x9E3779B97F4A
     let squared = threshold * threshold
     var best = fit_denormalised(first, second, all)
-    var best_score = -1.0
+    #: Nothing can be worse than this, which is the point.
+    #:
+    #: Least median scores a candidate as minus its median error, so every
+    #: score is negative, and a floor of -1.0 meant that on any set whose
+    #: median Sampson error exceeded one square pixel no candidate ever beat
+    #: it: the fit over all the points was kept, every point stayed marked an
+    #: inlier, and the method quietly did no rejection at all. With fifteen
+    #: outliers in sixty and three pixels of jitter it reported all fifteen
+    #: as inliers. Under that much error it works, which is what hid it.
+    var best_score = -math.INF
     var best_inliers: list[bool] = []
     for _index in 0..count { best_inliers.push(true) }
 

@@ -149,7 +149,17 @@ pub fn symmetric_eigen(a: Mat) -> tuple[list[float], Mat] {
         v.push(line)
     }
 
-    for _sweep in 0..100 {
+    #: Enough rotations for the matrix in hand, not a hundred.
+    #:
+    #: Each turn of this loop zeroes ONE off-diagonal, so a hundred of them
+    #: is a hundred rotations -- not a hundred sweeps. A 12 by 12 has
+    #: sixty-six off-diagonals and classical Jacobi wants six to ten passes
+    #: over them, so a hundred was about a sixth of the work. `pose_from_dlt`
+    #: solves a 12 by 12. The loop still leaves the moment the largest
+    #: off-diagonal is negligible, so this only raises the ceiling for the
+    #: sizes that were reaching it.
+    let sweeps = max(100, 12 * n * (n - 1) // 2)
+    for _sweep in 0..sweeps {
         var largest = 0.0
         var p = 0
         var q = 1

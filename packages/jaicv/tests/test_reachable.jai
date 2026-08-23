@@ -458,6 +458,47 @@ fn texture_at(x: float, y: float) -> float {
 #: way to its fixed point. It was not, and the same picture came back with a
 #: different set of edges each time -- and six percent short of the right one,
 #: because a run of weak edges longer than the pass count never finished.
+#: A matrix big enough that one rotation per turn of the loop is not enough.
+#:
+#: The Jacobi loop zeroes ONE off-diagonal a turn and ran a hundred turns. A
+#: 12 by 12 has sixty-six off-diagonals and wants six to ten passes over all
+#: of them, so a hundred rotations was about a sixth of the work and the
+#: answer came back wrong: the worst residual for a 12 by 12 was 2e-02 and
+#: for a 16 by 16 was 3e-01, against 1e-07 for a 6 by 6. `pose_from_dlt`
+#: solves a 12 by 12, so this reached the pose solver.
+fn test_a_large_symmetric_matrix_is_fully_diagonalised() -> void {
+    if not have_gpu() { return }
+    var seed = 17
+    for n in [3, 6, 12, 16] {
+        #: B transpose B, which is symmetric and has no negative eigenvalue.
+        var b: list[float] = []
+        for _index in 0..n * n {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            b.push(float(seed % 2000) / 1000.0 - 1.0)
+        }
+        var a: list[float] = []
+        for row in 0..n {
+            for column in 0..n {
+                var total = 0.0
+                for k in 0..n { total += b[k * n + row] * b[k * n + column] }
+                a.push(total)
+            }
+        }
+        let (values, vectors) = symmetric_eigen(Mat.from_list(n, n, CV_32FC1, a))
+        let vec = vectors.values()
+        var worst = 0.0
+        for index in 0..n {
+            for row in 0..n {
+                var got = 0.0
+                for column in 0..n { got += a[row * n + column] * vec[index * n + column] }
+                let want = values[index] * vec[index * n + row]
+                worst = max(worst, math.fabs(got - want))
+            }
+        }
+        assert_true(worst < 1e-4, f"{n} by {n} left a residual of {worst}")
+    }
+}
+
 fn test_canny_answers_the_same_twice() -> void {
     if not have_gpu() { return }
     var seed = 424242
@@ -539,6 +580,7 @@ fn test_video_run() -> void {
     assert_eq(errors.len(), 2)
     test_optical_flow_finds_the_shift()
     test_canny_answers_the_same_twice()
+    test_a_large_symmetric_matrix_is_fully_diagonalised()
     test_canny_follows_a_long_weak_edge()
 
     let (steps, settled) = mean_shift(a, Rect(10, 20, 20, 20))
