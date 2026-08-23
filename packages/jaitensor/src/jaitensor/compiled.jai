@@ -29,7 +29,8 @@
 import std.gpu as gpu
 from std.os import env
 from std.gpu import Buffer
-from .layers import Activation, AvgPool2d, Conv2d, Dense, Flatten, Layer, LayerNorm, MaxPool2d
+from .layers import Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Flatten, Layer, LayerNorm
+from .layers import MaxPool2d
 from .tensor import Tensor
 
 #: Reduction kinds the graph builder takes.
@@ -98,6 +99,8 @@ class Build {
         if self.refused is null { self.refused = why }
     }
 }
+
+const BN_GRAPH_DEFAULT = 0
 
 fn product(shape: list[int]) -> int {
     var total = 1
@@ -303,13 +306,108 @@ fn emit_layer_norm(state: Build, layer: any, input: Built) -> Built? {
     return Built(made, input.shape)
 }
 
-#: Batch normalisation is deliberately absent, and it is expressible. Two ways,
-#: both correct to 6e-8 against the eager path over eight steps, both slower on
-#: the `norm` benchmark than not compiling at all:
+#: How to express a batch normalisation, or `0` not to.
+#:
+#: Kept a knob because which of the two shapes the framework likes is not
+#: something to guess at: `1` reduces over the three leading axes of the
+#: NHWC block as it stands, `2` folds those three into one first so the
+#: reduction runs down the rows of a plain matrix.
+fn batch_norm_route() -> int {
+    let text = env("JAITENSOR_BN_GRAPH")
+    if text is null { return BN_GRAPH_DEFAULT }
+    return int(text)
+}
+
+#: Per-channel normalisation over a stack of pictures.
+#:
+#: The layer holds no running average -- it normalises by the batch's own
+#: statistics whether it is training or not -- so there is no state for the
+#: graph to carry forward and the forward pass is the whole of it.
+fn emit_batch_norm(state: Build, layer: any, input: Built) -> Built? {
+    if not layer is BatchNorm2d { return null }
+    let route = batch_norm_route()
+    if route == 0 {
+        state.refuse("a batch normalisation, which is faster left to its kernels")
+        return null
+    }
+    if input.shape.len() != 4 {
+        state.refuse("a batch normalisation over something that is not a stack of pictures")
+        return null
+    }
+    let params = layer.parameters()
+    if params.len() != 2 {
+        state.refuse("a batch normalisation without both a scale and a shift")
+        return null
+    }
+    let gamma = state.parameter(params[0])
+    let beta = state.parameter(params[1])
+    if route == 1 {
+        let made = __prim__.graph_layer_norm(
+            state.builder,
+            input.value,
+            gamma,
+            beta,
+            [0, 1, 2],
+            1.0e-5
+        )
+        if made < 0 {
+            state.refuse("a batch normalisation the platform would not build")
+            return null
+        }
+        return Built(made, input.shape)
+    }
+    #: The three leading axes folded into one. A reduction down the rows of a
+    #: matrix is the shape the framework is tuned for; the same reduction
+    #: written as three axes of a four-dimensional block strides over the
+    #: channel it is summing and never reads two neighbours together.
+    let rows = input.shape[0] * input.shape[1] * input.shape[2]
+    let channels = input.shape[3]
+    let flat = __prim__.graph_reshape(state.builder, input.value, [rows, channels])
+    if flat < 0 {
+        state.refuse("a batch normalisation the platform would not reshape")
+        return null
+    }
+    let made = __prim__.graph_layer_norm(state.builder, flat, gamma, beta, [0], 1.0e-5)
+    if made < 0 {
+        state.refuse("a batch normalisation the platform would not build")
+        return null
+    }
+    let back = __prim__.graph_reshape(state.builder, made, input.shape)
+    if back < 0 {
+        state.refuse("a batch normalisation the platform would not reshape back")
+        return null
+    }
+    return Built(back, input.shape)
+}
+
+#: Batch normalisation is expressible and is left out anyway. Four ways have
+#: been tried now, all correct, all slower on the `norm` benchmark than not
+#: compiling at all. At the hard level (small and wide, seconds):
 #:
 #:   the framework's own normalisation, over three axes    2.05 s and 3.28 s
 #:   mean, variance and the affine built out of primitives 2.02 s and 3.65 s
 #:   not expressing it, so the model stays on its kernels  1.49 s and 2.58 s
+#:
+#: and at the medium level, where `emit_batch_norm` above can still be asked
+#: for either shape with `JAITENSOR_BN_GRAPH`:
+#:
+#:   1, the three leading axes reduced where they lie     0.710 s and 1.195 s
+#:   2, those three folded into one first                 0.691 s and 1.205 s
+#:   0, not expressing it                                 0.527 s and 0.917 s
+#:
+#: Route 2 was the interesting one and it did not pay. A reduction over three
+#: axes of an NHWC block strides over the channel it is summing, so the guess
+#: was that flattening it into a reduction down the rows of a plain matrix --
+#: the shape the framework is tuned for, and the shape the eager kernels had
+#: to be rewritten into for the same reason -- would fix it. It made no
+#: difference, which says the cost is not in the reduction.
+#:
+#: Where it is: the same model with the layer removed entirely compiles to
+#: 0.250 s, so expressing the layer costs 0.44 s of graph against 0.074 s of
+#: kernels. Six times, for a mean and a variance over data the convolution
+#: has just touched. That points at the gradient the framework builds for it
+#: rather than at the forward, and until that is what gets measured there is
+#: no reason to expect a fifth shape of the same expression to be different.
 #:
 #: Expressing a layer here is not free to get wrong: it decides whether the
 #: model compiles at all, and compiling this one replaces hand-written kernels
@@ -336,6 +434,7 @@ fn emit_layer(state: Build, layer: Layer, input: Built) -> Built? {
     if layer is MaxPool2d { return emit_pool(state, layer, input) }
     if layer is AvgPool2d { return emit_avg_pool(state, layer, input) }
     if layer is LayerNorm { return emit_layer_norm(state, layer, input) }
+    if layer is BatchNorm2d { return emit_batch_norm(state, layer, input) }
     state.refuse("a layer this step does not express")
     return null
 }
