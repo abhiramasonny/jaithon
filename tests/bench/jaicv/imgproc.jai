@@ -13,7 +13,7 @@ from jaicv import Mat, Size
 from jaicv.core.stats import min_max_loc, norm, sum_mat
 from jaicv.core.types import Point2f
 from jaicv.imgproc.morph import erode, get_structuring_element, MORPH_RECT
-from jaicv.imgproc.segmentation import connected_components, distance_transform
+from jaicv.imgproc.segmentation import connected_components, distance_transform, integral
 from jaicv.photo.denoise import inpaint
 from jaicv.video.optflow import calc_optical_flow_pyr_lk
 from std.os import env_or
@@ -173,6 +173,7 @@ fn main() -> int {
     run("canny", repeats, || cv.canny(bytes_frame, 60.0, 140.0))
     run("connected-components", repeats, || connected_components(regions)[1])
     run("distance-transform", repeats, || distance_transform(regions, cv.DIST_L2, cv.DIST_MASK_3))
+    run("integral", repeats, || integral(grey))
     run_scalar("good-features", repeats, fn() -> float {
         return float(cv.good_features_to_track(grey, 200, 0.01, 6.0).len())
     })

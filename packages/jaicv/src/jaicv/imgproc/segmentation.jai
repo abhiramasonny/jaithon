@@ -378,6 +378,82 @@ kernel void dt_write(device const float* dist [[buffer(0)]],
     out[d_off + y * d_step + x] = dist[id];
 }
 
+/* The running sum along each row, one threadgroup to a row.
+ *
+ * A prefix sum is a dependent chain, so the trick is to break it into pieces
+ * that are not: each simdgroup sums its own lane run, the eight of them are
+ * stitched together in threadgroup memory, and a carry walks from one block
+ * of 256 to the next. The host loop this replaces walked all two million
+ * pixels one at a time and cost twenty-four milliseconds at 1080p. */
+kernel void integral_rows(device const float* src [[buffer(0)]],
+                          device float* dst [[buffer(1)]],
+                          constant uint& rows [[buffer(2)]],
+                          constant uint& cols [[buffer(3)]],
+                          constant uint& cn [[buffer(4)]],
+                          constant uint& s_off [[buffer(5)]],
+                          constant uint& s_step [[buffer(6)]],
+                          constant uint& d_off [[buffer(7)]],
+                          constant uint& d_step [[buffer(8)]],
+                          uint gid [[threadgroup_position_in_grid]],
+                          uint lid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    uint y = gid / cn;
+    uint channel = gid - y * cn;
+    if (y >= rows) return;
+    threadgroup float warp_total[32];
+    threadgroup float carry;
+    if (lid == 0u) carry = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint base = 0u; base < cols; base += GROUP) {
+        uint at = base + lid;
+        float value = at < cols ? src[s_off + y * s_step + at * cn + channel] : 0.0f;
+        float run = simd_prefix_inclusive_sum(value);
+        if (lid < 32u) warp_total[lid] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 31u) warp_total[warp] = run;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float before = 0.0f;
+        for (uint w = 0u; w < warp; ++w) before += warp_total[w];
+        if (at < cols) {
+            dst[d_off + (y + 1u) * d_step + (at + 1u) * cn + channel] = carry + before + run;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) {
+            float whole = 0.0f;
+            for (uint w = 0u; w < 8u; ++w) whole += warp_total[w];
+            carry += whole;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+/* And then down the columns, a thread apiece.
+ *
+ * Serial down the column and parallel across them, which is the way round
+ * that reads whole rows at a time: neighbouring threads want neighbouring
+ * addresses at every step. */
+kernel void integral_cols(device float* dst [[buffer(0)]],
+                          constant uint& rows [[buffer(1)]],
+                          constant uint& cols [[buffer(2)]],
+                          constant uint& cn [[buffer(3)]],
+                          constant uint& d_off [[buffer(4)]],
+                          constant uint& d_step [[buffer(5)]],
+                          uint id [[thread_position_in_grid]]) {
+    uint wide = (cols + 1u) * cn;
+    if (id >= wide) return;
+    uint x = id / cn;
+    uint channel = id - x * cn;
+    float running = 0.0f;
+    for (uint y = 1u; y <= rows; ++y) {
+        uint at = d_off + y * d_step + x * cn + channel;
+        running += dst[at];
+        dst[at] = running;
+    }
+}
+
 kernel void cc_tally(device const uint* value [[buffer(0)]],
                      device float* out [[buffer(1)]],
                      constant uint& count [[buffer(2)]],
@@ -725,6 +801,10 @@ pub fn distance_transform(
 #: a millisecond and the question costs a seventh of one.
 const DT_BATCH = 24
 
+#: Threads in a row-scanning group. Eight simdgroups, which is what the
+#: stitching below assumes.
+const INTEGRAL_GROUP = 256
+
 #: The running sum of an image, one row and column larger than it.
 #:
 #: `integral[y][x]` holds the sum of everything above and to the left of pixel
@@ -734,22 +814,21 @@ pub fn integral(image: Mat) -> Mat {
     let cn = image.channels()
     let rows = image.rows
     let cols = image.cols
-    let source = image.values()
-    var out: list[float] = []
-    for _index in 0..(rows + 1) * (cols + 1) * cn { out.push(0.0) }
-    for y in 0..rows {
-        for x in 0..cols {
-            for channel in 0..cn {
-                let above = out[(y * (cols + 1) + x + 1) * cn + channel]
-                let leftward = out[((y + 1) * (cols + 1) + x) * cn + channel]
-                let corner = out[(y * (cols + 1) + x) * cn + channel]
-                let here = source[(y * cols + x) * cn + channel]
-                out[((y + 1) * (cols + 1) + x + 1) * cn + channel] = here + above + leftward -
-                    corner
-            }
-        }
-    }
-    return Mat.from_list(rows + 1, cols + 1, CV_MAKETYPE(CV_32F, cn), out)
+    let out = Mat.zeros(rows + 1, cols + 1, CV_MAKETYPE(CV_32F, cn))
+    if rows == 0 or cols == 0 { return out }
+    kernel_for("integral_rows").dispatch_async(
+        [image.storage, out.storage],
+        rows * cn * INTEGRAL_GROUP,
+        [rows, cols, cn, image.offset, image.step_, out.offset, out.step_],
+        group_size: INTEGRAL_GROUP
+    )
+    kernel_for("integral_cols").dispatch_async(
+        [out.storage],
+        (cols + 1) * cn,
+        [rows, cols, cn, out.offset, out.step_]
+    )
+    out.invalidate()
+    return out
 }
 
 #: Grow the marked regions until they meet, and mark where they meet.

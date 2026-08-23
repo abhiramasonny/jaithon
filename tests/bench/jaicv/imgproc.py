@@ -95,6 +95,7 @@ def main() -> int:
     run("canny", repeats, lambda: cv2.Canny(bytes_frame, 60, 140))
     run("connected-components", repeats, lambda: cv2.connectedComponents(regions))
     run("distance-transform", repeats, lambda: cv2.distanceTransform(regions, cv2.DIST_L2, 3))
+    run("integral", repeats, lambda: cv2.integral(grey))
     run(
         "good-features",
         repeats,
