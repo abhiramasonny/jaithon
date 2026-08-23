@@ -437,6 +437,41 @@ fn test_channel_statistics_survive_an_offset_from_zero() -> void {
     }
 }
 
+#: What batch normalisation does when it is predicting, pinned on purpose.
+#:
+#: It has no running average, so it normalises by the batch in front of it
+#: whatever it is doing -- which means a prediction depends on which other
+#: samples came along in the same call. That is a genuine difference from
+#: other libraries and the sort of thing that should not change by accident,
+#: so it is written down here as well as in the layer's own documentation.
+fn test_batch_norm_normalises_by_whatever_batch_it_is_given() -> void {
+    if not have_gpu() { return }
+    let channels = 2
+    var alone: list[float] = []
+    for index in 0..1 * 2 * 2 * channels { alone.push(float(index) * 3.0 + 5.0) }
+    let gamma = Tensor.ones([channels])
+    let beta = Tensor.zeros([channels])
+    let one = batch_norm(Tensor([1, 2, 2, channels], alone), gamma, beta).download()
+
+    #: The same four pixels again, with four more alongside them.
+    var together: list[float] = []
+    for value in alone { together.push(value) }
+    for index in 0..1 * 2 * 2 * channels { together.push(float(index) * 11.0 - 40.0) }
+    let shared = batch_norm(Tensor([2, 2, 2, channels], together), gamma, beta).download()
+
+    var moved = false
+    for index in 0..alone.len() {
+        if math.fabs(one[index] - shared[index]) > 1e-3 { moved = true }
+    }
+    assert_true(moved, "batch norm is supposed to depend on the batch it is given")
+
+    #: And a single sample with nowhere to take a spread comes back as beta,
+    #: which here is zero.
+    let flat = batch_norm(Tensor([1, 1, 1, channels], [4.0, 9.0]), gamma, Tensor([channels], [0.25, 0.75])).download()
+    assert_true(math.fabs(flat[0] - 0.25) < 1e-4, f"got {flat[0]}")
+    assert_true(math.fabs(flat[1] - 0.75) < 1e-4, f"got {flat[1]}")
+}
+
 fn test_channel_normalisation_parameter_gradients() -> void {
     if not have_gpu() { return }
     let n = 4

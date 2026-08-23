@@ -502,6 +502,22 @@ pub class Conv2d: Layer {
 }
 
 #: Per-channel batch normalization over NHWC activations.
+#:
+#: This normalises by the statistics of whatever batch it is handed, and it
+#: does that when predicting as well as when training. It keeps no running
+#: average, which is a real difference from what other libraries do and is
+#: worth knowing before relying on it:
+#:
+#:   - a prediction depends on which other samples share the call, so the
+#:     same input can come back different in a batch of one and a batch of
+#:     thirty-two;
+#:   - a batch of one whose spatial extent is also one has nothing to take a
+#:     spread over, and every channel comes back as `beta`.
+#:
+#: Adding the running average is not a small change -- it is another two
+#: tensors of state, a momentum to choose, and a different answer from every
+#: model already trained against this one -- so it is written down here
+#: rather than done quietly.
 pub class BatchNorm2d: Layer {
     pub let channels: int
     var last_shape: list[int]
