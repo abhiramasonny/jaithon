@@ -262,6 +262,7 @@ static size_t gMlp3LiveWBytes[4];
 static size_t gMlp3LiveBBytes[4];
 
 #define JAI_GPU_MAX_IN_FLIGHT 16
+#define JAI_GPU_AUTO_COMMIT 0
 
 /* Which queued work a given buffer is waiting on.
  *
@@ -281,6 +282,8 @@ static size_t gMlp3LiveBBytes[4];
  * the old drain-everything behaviour for bisecting. */
 static uint64_t gBatchCounter;  /* last batch number handed out */
 static uint64_t gOpenBatch;     /* number of gAsyncCommands, 0 when none open */
+static unsigned gOpenEncoded;   /* dispatches encoded into it since it opened */
+static int gAutoCommit = -1;
 /* Every batch at or below this has finished. Written both by a thread that
  * waited for one and by Metal's own completion handler on a thread of its
  * own, so it is an atomic rather than something the queue lock covers -- the
@@ -311,6 +314,32 @@ static bool fineSyncEnabled(void) {
         gFineSync = (setting != NULL && strcmp(setting, "0") == 0) ? 2 : 1;
     }
     return gFineSync == 1;
+}
+
+static void commitOpenLocked(void);
+static uint64_t takeFrontLocked(void);
+
+/* How many dispatches may pile into one command buffer before it is sent.
+ *
+ * Nothing sends it until somebody waits, so the GPU sits idle for the whole
+ * time the host spends encoding and only then starts -- the two never overlap.
+ * Committing part way lets the card work on the front of a pipeline while the
+ * host is still writing the back of it.
+ *
+ * Off by default, because it is only half a good idea. It is worth 5% on the
+ * jaicv suite, where Jaithon interpreting between dispatches leaves the card
+ * with nothing to do (2.72x to 2.85x against OpenCV at a threshold of eight).
+ * It costs 26% on jaitensor, where the work is already back to back and a
+ * graph split across command buffers loses the overlap MPSGraph arranges
+ * inside one (1.76x to 1.31x against PyTorch MPS). The ML side is the one
+ * that matters, so the default stays zero and the knob stays for tuning. */
+static int autoCommitThreshold(void) {
+    if (gAutoCommit < 0) {
+        const char *setting = getenv("JAITHON_GPU_AUTO_COMMIT");
+        gAutoCommit = setting != NULL ? atoi(setting) : JAI_GPU_AUTO_COMMIT;
+        if (gAutoCommit < 0) gAutoCommit = 0;
+    }
+    return gAutoCommit;
 }
 
 static void ensureInFlight(void) {
@@ -1325,6 +1354,8 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
         id<MTLComputePipelineState> pipeline =
             (__bridge id<MTLComputePipelineState>)k->pipeline;
         if (!wait) {
+            id<MTLCommandBuffer> oldest = nil;
+            uint64_t oldestBatch = 0;
             @synchronized(gQueue) {
                 if (gAsyncCommands == nil) {
                     gAsyncCommands = [gQueue commandBuffer];
@@ -1351,6 +1382,24 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                                     atIndex:(NSUInteger)(count + i)];
                 encodeDispatch(gAsyncEncoder, pipeline, (NSUInteger)threads,
                                (NSUInteger)groupSize);
+                gOpenEncoded++;
+                const int limit = autoCommitThreshold();
+                if (limit > 0 && gOpenEncoded >= (unsigned)limit) {
+                    commitOpenLocked();
+                    if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
+                        oldest = gInFlight[0];
+                        oldestBatch = takeFrontLocked();
+                    }
+                }
+            }
+            /* The wait for the oldest happens outside the lock: it is the
+             * backpressure that keeps the queue from growing without bound,
+             * and holding the lock through it would stop every other thread
+             * from encoding while this one sleeps. */
+            if (oldest != nil) {
+                [oldest waitUntilCompleted];
+                if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
+                noteDone(oldestBatch);
             }
             return true;
         }
@@ -1464,6 +1513,7 @@ static void commitOpenLocked(void) {
     gAsyncEncoder = nil;
     gAsyncCommands = nil;
     gOpenBatch = 0;
+    gOpenEncoded = 0;
 }
 
 /* Take the front of the queue off the books, returning the batch it holds.

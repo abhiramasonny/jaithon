@@ -20,11 +20,13 @@ from .types import REDUCE_AVG, REDUCE_MAX, REDUCE_MIN, REDUCE_SUM
 from .types import Point, Scalar
 
 const GROUP = 256
+const GROUPS = 1024
 
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
 
 constexpr constant uint GROUP = 256;
+constexpr constant uint GROUPS = 1024;
 
 inline uint plane_index(uint id, uint cols, uint cn, uint off, uint step) {
     uint width = cols * cn;
@@ -34,7 +36,17 @@ inline uint plane_index(uint id, uint cols, uint cn, uint off, uint step) {
 }
 
 /* Sums, absolute sums, squares and non-zero counts in one pass: four
- * accumulators cost far less than four dispatches over the same pixels. */
+ * accumulators cost far less than four dispatches over the same pixels.
+ *
+ * A fixed grid, not one thread per pixel. A 1080p frame is eight thousand
+ * groups the other way round, and each of those threads read one float and
+ * then spent eight barriers folding it -- more time in threadgroup memory
+ * than in the picture. Here a thousand groups walk the frame in strides and
+ * accumulate in registers, and the fold happens once per group.
+ *
+ * The packed path reads four floats at a time. It needs the rows to run
+ * together with nothing between them, a single channel, and no mask, which
+ * is what a plain frame is. */
 kernel void stats_reduce(device const float* src [[buffer(0)]],
                          device const float* mask [[buffer(1)]],
                          device float* partials [[buffer(2)]],
@@ -47,46 +59,88 @@ kernel void stats_reduce(device const float* src [[buffer(0)]],
                          constant uint& m_step [[buffer(9)]],
                          constant uint& use_mask [[buffer(10)]],
                          constant uint& channel [[buffer(11)]],
+                         constant uint& span [[buffer(12)]],
+                         constant uint& packed [[buffer(13)]],
+                         constant uint& slot [[buffer(14)]],
+                         constant uint& dense [[buffer(15)]],
                          uint gid [[thread_position_in_grid]],
                          uint lid [[thread_index_in_threadgroup]],
-                         uint wid [[threadgroup_position_in_grid]]) {
-    threadgroup float total[GROUP];
-    threadgroup float absolute[GROUP];
-    threadgroup float squares[GROUP];
-    threadgroup float nonzero[GROUP];
-    float value = 0.0f;
-    bool live = false;
-    if (gid < count) {
-        uint pixel = gid;
-        uint index = off + (pixel / cols) * step + (pixel % cols) * cn + channel;
-        live = true;
-        if (use_mask != 0u) {
-            live = mask[plane_index(pixel, cols, 1u, m_off, m_step)] != 0.0f;
+                         uint wid [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float lanes[4][32];
+    float total = 0.0f;
+    float absolute = 0.0f;
+    float squares = 0.0f;
+    float nonzero = 0.0f;
+    if (packed != 0u) {
+        device const float4* quads = (device const float4*)(src + off);
+        uint wide = count / 4u;
+        for (uint at = gid; at < wide; at += span) {
+            float4 value = quads[at];
+            float4 size = fabs(value);
+            total += value.x + value.y + value.z + value.w;
+            absolute += size.x + size.y + size.z + size.w;
+            squares += dot(value, value);
+            nonzero += float(value.x != 0.0f) + float(value.y != 0.0f)
+                     + float(value.z != 0.0f) + float(value.w != 0.0f);
         }
-        if (live) value = src[index];
+    } else {
+        for (uint pixel = gid; pixel < count; pixel += span) {
+            if (use_mask != 0u
+                && mask[plane_index(pixel, cols, 1u, m_off, m_step)] == 0.0f) continue;
+            uint index = dense != 0u
+                ? off + pixel * cn + channel
+                : off + (pixel / cols) * step + (pixel % cols) * cn + channel;
+            float value = src[index];
+            total += value;
+            absolute += fabs(value);
+            squares += value * value;
+            if (value != 0.0f) nonzero += 1.0f;
+        }
     }
-    total[lid] = live ? value : 0.0f;
-    absolute[lid] = live ? fabs(value) : 0.0f;
-    squares[lid] = live ? value * value : 0.0f;
-    nonzero[lid] = (live && value != 0.0f) ? 1.0f : 0.0f;
+    if (lid < 32u) {
+        lanes[0][lid] = 0.0f;
+        lanes[1][lid] = 0.0f;
+        lanes[2][lid] = 0.0f;
+        lanes[3][lid] = 0.0f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = GROUP / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            total[lid] += total[lid + stride];
-            absolute[lid] += absolute[lid + stride];
-            squares[lid] += squares[lid + stride];
-            nonzero[lid] += nonzero[lid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    absolute = simd_sum(absolute);
+    squares = simd_sum(squares);
+    nonzero = simd_sum(nonzero);
+    if (lane == 0u) {
+        lanes[0][warp] = total;
+        lanes[1][warp] = absolute;
+        lanes[2][warp] = squares;
+        lanes[3][warp] = nonzero;
     }
-    if (lid == 0) {
-        partials[wid * 4u + 0u] = total[0];
-        partials[wid * 4u + 1u] = absolute[0];
-        partials[wid * 4u + 2u] = squares[0];
-        partials[wid * 4u + 3u] = nonzero[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    float4 folded = float4(0.0f);
+    for (uint j = 0u; j < 32u; j++) {
+        folded.x += lanes[0][j];
+        folded.y += lanes[1][j];
+        folded.z += lanes[2][j];
+        folded.w += lanes[3][j];
     }
+    uint base = (slot * GROUPS + wid) * 4u;
+    partials[base + 0u] = folded.x;
+    partials[base + 1u] = folded.y;
+    partials[base + 2u] = folded.z;
+    partials[base + 3u] = folded.w;
 }
 
+/* The extremes, on the same fixed grid.
+ *
+ * The position has to travel with the value, and a `simd_min` on the value
+ * alone loses it. So the value folds first, and then the positions of whoever
+ * matches fold by `simd_min` in their own right -- which picks the earliest
+ * pixel among equals, the tie OpenCV reports.
+ *
+ * A missing position is `INFINITY` rather than a negative, so the same
+ * `simd_min` handles "saw nothing" without a second test. */
 kernel void stats_extrema(device const float* src [[buffer(0)]],
                           device const float* mask [[buffer(1)]],
                           device float* partials [[buffer(2)]],
@@ -99,47 +153,101 @@ kernel void stats_extrema(device const float* src [[buffer(0)]],
                           constant uint& m_step [[buffer(9)]],
                           constant uint& use_mask [[buffer(10)]],
                           constant uint& channel [[buffer(11)]],
+                          constant uint& span [[buffer(12)]],
+                          constant uint& packed [[buffer(13)]],
+                          constant uint& slot [[buffer(14)]],
+                          constant uint& dense [[buffer(15)]],
                           uint gid [[thread_position_in_grid]],
                           uint lid [[thread_index_in_threadgroup]],
-                          uint wid [[threadgroup_position_in_grid]]) {
-    threadgroup float lows[GROUP];
-    threadgroup float highs[GROUP];
-    threadgroup float low_at[GROUP];
-    threadgroup float high_at[GROUP];
-    float value = 0.0f;
-    bool live = false;
-    if (gid < count) {
-        uint index = off + (gid / cols) * step + (gid % cols) * cn + channel;
-        live = true;
-        if (use_mask != 0u) {
-            live = mask[plane_index(gid, cols, 1u, m_off, m_step)] != 0.0f;
+                          uint wid [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float lows[32];
+    threadgroup float highs[32];
+    threadgroup float low_at[32];
+    threadgroup float high_at[32];
+    float my_low = INFINITY;
+    float my_high = -INFINITY;
+    float my_low_at = INFINITY;
+    float my_high_at = INFINITY;
+    if (packed != 0u) {
+        device const float4* quads = (device const float4*)(src + off);
+        uint wide = count / 4u;
+        for (uint at = gid; at < wide; at += span) {
+            float4 value = quads[at];
+            float low = min(min(value.x, value.y), min(value.z, value.w));
+            float high = max(max(value.x, value.y), max(value.z, value.w));
+            if (low <= my_low) {
+                uint which = value.x == low ? 0u : (value.y == low ? 1u : (value.z == low ? 2u : 3u));
+                float where = float(at * 4u + which);
+                if (low < my_low || where < my_low_at) {
+                    my_low = low;
+                    my_low_at = where;
+                }
+            }
+            if (high >= my_high) {
+                uint which = value.x == high ? 0u : (value.y == high ? 1u : (value.z == high ? 2u : 3u));
+                float where = float(at * 4u + which);
+                if (high > my_high || where < my_high_at) {
+                    my_high = high;
+                    my_high_at = where;
+                }
+            }
         }
-        if (live) value = src[index];
+    } else {
+        for (uint pixel = gid; pixel < count; pixel += span) {
+            if (use_mask != 0u
+                && mask[plane_index(pixel, cols, 1u, m_off, m_step)] == 0.0f) continue;
+            uint index = dense != 0u
+                ? off + pixel * cn + channel
+                : off + (pixel / cols) * step + (pixel % cols) * cn + channel;
+            float value = src[index];
+            bool lower = value < my_low;
+            my_low = lower ? value : my_low;
+            my_low_at = lower ? float(pixel) : my_low_at;
+            bool higher = value > my_high;
+            my_high = higher ? value : my_high;
+            my_high_at = higher ? float(pixel) : my_high_at;
+        }
     }
-    lows[lid] = live ? value : INFINITY;
-    highs[lid] = live ? value : -INFINITY;
-    low_at[lid] = live ? float(gid) : -1.0f;
-    high_at[lid] = live ? float(gid) : -1.0f;
+    if (lid < 32u) {
+        lows[lid] = INFINITY;
+        highs[lid] = -INFINITY;
+        low_at[lid] = INFINITY;
+        high_at[lid] = INFINITY;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = GROUP / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            if (lows[lid + stride] < lows[lid]) {
-                lows[lid] = lows[lid + stride];
-                low_at[lid] = low_at[lid + stride];
-            }
-            if (highs[lid + stride] > highs[lid]) {
-                highs[lid] = highs[lid + stride];
-                high_at[lid] = high_at[lid + stride];
-            }
+    float best_low = simd_min(my_low);
+    float best_high = simd_max(my_high);
+    float won_low_at = simd_min(my_low == best_low ? my_low_at : INFINITY);
+    float won_high_at = simd_min(my_high == best_high ? my_high_at : INFINITY);
+    if (lane == 0u) {
+        lows[warp] = best_low;
+        highs[warp] = best_high;
+        low_at[warp] = won_low_at;
+        high_at[warp] = won_high_at;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    float low = INFINITY;
+    float high = -INFINITY;
+    float low_where = INFINITY;
+    float high_where = INFINITY;
+    for (uint j = 0u; j < 32u; j++) {
+        if (low_at[j] < INFINITY && (lows[j] < low || (lows[j] == low && low_at[j] < low_where))) {
+            low = lows[j];
+            low_where = low_at[j];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (high_at[j] < INFINITY && (highs[j] > high || (highs[j] == high && high_at[j] < high_where))) {
+            high = highs[j];
+            high_where = high_at[j];
+        }
     }
-    if (lid == 0) {
-        partials[wid * 4u + 0u] = lows[0];
-        partials[wid * 4u + 1u] = highs[0];
-        partials[wid * 4u + 2u] = low_at[0];
-        partials[wid * 4u + 3u] = high_at[0];
-    }
+    uint base = (slot * GROUPS + wid) * 4u;
+    partials[base + 0u] = low_where < INFINITY ? low : 0.0f;
+    partials[base + 1u] = high_where < INFINITY ? high : 0.0f;
+    partials[base + 2u] = low_where < INFINITY ? low_where : -1.0f;
+    partials[base + 3u] = high_where < INFINITY ? high_where : -1.0f;
 }
 
 kernel void stats_reduce_axis(device const float* src [[buffer(0)]],
@@ -189,7 +297,10 @@ kernel void stats_join(device const float* partials [[buffer(0)]],
                        uint warp [[simdgroup_index_in_threadgroup]]) {
     threadgroup float lanes[32];
     float running = 0.0f;
-    for (uint g = lid; g < groups; g += GROUP) running += partials[g * 4u + slot];
+    uint channel = slot / 4u;
+    uint field = slot - channel * 4u;
+    uint base = channel * GROUPS * 4u + field;
+    for (uint g = lid; g < groups; g += GROUP) running += partials[g * 4u + base];
     if (lid < 32u) lanes[lid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     running = simd_sum(running);
@@ -224,11 +335,15 @@ kernel void stats_join_extrema(device const float* partials [[buffer(0)]],
         float group_high = partials[g * 4u + 1u];
         float group_low_at = partials[g * 4u + 2u];
         float group_high_at = partials[g * 4u + 3u];
-        if (group_low_at >= 0.0f && (my_low_at < 0.0f || group_low < my_low)) {
+        if (group_low_at >= 0.0f
+            && (my_low_at < 0.0f || group_low < my_low
+                || (group_low == my_low && group_low_at < my_low_at))) {
             my_low = group_low;
             my_low_at = group_low_at;
         }
-        if (group_high_at >= 0.0f && (my_high_at < 0.0f || group_high > my_high)) {
+        if (group_high_at >= 0.0f
+            && (my_high_at < 0.0f || group_high > my_high
+                || (group_high == my_high && group_high_at < my_high_at))) {
             my_high = group_high;
             my_high_at = group_high_at;
         }
@@ -244,11 +359,15 @@ kernel void stats_join_extrema(device const float* partials [[buffer(0)]],
     float low_where = -1.0f;
     float high_where = -1.0f;
     for (uint j = 0u; j < GROUP; j++) {
-        if (low_at[j] >= 0.0f && (low_where < 0.0f || best_low[j] < low)) {
+        if (low_at[j] >= 0.0f
+            && (low_where < 0.0f || best_low[j] < low
+                || (best_low[j] == low && low_at[j] < low_where))) {
             low = best_low[j];
             low_where = low_at[j];
         }
-        if (high_at[j] >= 0.0f && (high_where < 0.0f || best_high[j] > high)) {
+        if (high_at[j] >= 0.0f
+            && (high_where < 0.0f || best_high[j] > high
+                || (best_high[j] == high && high_at[j] < high_where))) {
             high = best_high[j];
             high_where = high_at[j];
         }
@@ -270,90 +389,109 @@ fn kernel_for(entry: str) -> Kernel {
     return compiled
 }
 
-#: The partials, folded to four numbers on the device before they come back.
+#: Whether the frame can be read four floats at a time.
 #:
-#: `join` names the kernel that combines them -- adding for the sums, comparing
-#: for the extremes. Downloading every group's partial and folding it on the
-#: host is what this replaces: eight thousand of them for a 1080p frame.
-fn reduced(entry: str, join: str, src: Mat, mask: Mat?, channel: int) -> list[float] {
-    let count = src.rows * src.cols
-    if count == 0 { return [] }
-    let groups = (count + GROUP - 1) // GROUP
-    let partials = reduce_buffer(entry, src, mask, channel, groups)
-    let folded = Buffer(4)
-    let lanes = if join == "stats_join" { 4 } else { 1 }
-    #: Both passes queued, so the only wait is the four-float download at the
-    #: end. A blocking dispatch apiece costs two synchronisations per call and
-    #: was most of what a reduction over a 1080p frame took.
-    kernel_for(join).dispatch_async([partials, folded], lanes * GROUP, [groups], group_size: GROUP)
+#: Needs the rows to run together with nothing between them, one channel, no
+#: mask, and a start that lands on a quad boundary -- a plain frame, which is
+#: the case that matters.
+fn packed_run(src: Mat, mask: Mat?, channel: int) -> int {
+    if mask is not null { return 0 }
+    if src.channels() != 1 or channel != 0 { return 0 }
+    if src.step_ != src.cols { return 0 }
+    if src.offset % 4 != 0 { return 0 }
+    if src.rows * src.cols % 4 != 0 { return 0 }
+    return 1
+}
+
+#: One channel's partials, queued into `slot` of a shared buffer.
+fn reduce_into(
+    entry: str,
+    src: Mat,
+    mask: Mat?,
+    channel: int,
+    slot: int,
+    partials: Buffer
+) -> void {
+    let mask_mat = if mask is null { src } else { mask }
+    kernel_for(entry).dispatch_async([src.storage, mask_mat.storage, partials], GROUPS * GROUP, [src.rows * src.cols, src.cols, src.channels(), src.offset, src.step_, mask_mat.offset, mask_mat.step_, if mask is null {
+        0
+    } else {
+        1
+    }, channel, GROUPS * GROUP, packed_run(src, mask, channel), slot, if src.step_ == src.cols * src.channels() {
+        1
+    } else {
+        0
+    }], group_size: GROUP)
+}
+
+#: Every channel reduced and folded, four numbers each, in one download.
+#:
+#: The channels go into one buffer and one join, because the download is what
+#: costs: an empty dispatch and a wait is 0.14 ms on this machine, so a colour
+#: frame reduced a channel at a time paid that three times over and spent more
+#: on the round trip than on the picture.
+fn reduced(entry: str, join: str, src: Mat, mask: Mat?, channels: list[int]) -> list[float] {
+    if src.rows * src.cols == 0 { return [] }
+    src.flush()
+    if mask is not null { mask.flush() }
+    let partials = Buffer(channels.len() * GROUPS * 4)
+    for (slot, channel) in channels.enumerate() {
+        reduce_into(entry, src, mask, channel, slot, partials)
+    }
+    let folded = Buffer(channels.len() * 4)
+    let lanes = if join == "stats_join" { channels.len() * 4 } else { 1 }
+    #: Everything queued, so the only wait is the short download at the end.
+    kernel_for(join).dispatch_async([partials, folded], lanes * GROUP, [GROUPS], group_size: GROUP)
     let out = folded.download()
     partials.free()
     folded.free()
     return out
 }
 
-fn reduce_buffer(entry: str, src: Mat, mask: Mat?, channel: int, groups: int) -> Buffer {
-    src.flush()
-    let count = src.rows * src.cols
-    let partials = Buffer(groups * 4)
-    let use_mask = if mask is null { 0 } else { 1 }
-    let mask_mat = if mask is null { src } else { mask }
-    if mask is not null { mask.flush() }
-    kernel_for(entry).dispatch_async(
-        [src.storage, mask_mat.storage, partials],
-        groups * GROUP,
-        [
-            count,
-            src.cols,
-            src.channels(),
-            src.offset,
-            src.step_,
-            mask_mat.offset,
-            mask_mat.step_,
-            use_mask,
-            channel,
-        ],
-        group_size: GROUP
-    )
-    return partials
-}
-
 #: Sum, absolute sum, sum of squares, and non-zero count of one channel.
 pub fn channel_stats(src: Mat, channel: int, mask: Mat? = null) -> tuple[float, float, float, int] {
-    let partials = reduced("stats_reduce", "stats_join", src, mask, channel)
-    var total = 0.0
-    var absolute = 0.0
-    var squares = 0.0
-    var nonzero = 0.0
-    var index = 0
-    while index < partials.len() {
-        total += partials[index]
-        absolute += partials[index + 1]
-        squares += partials[index + 2]
-        nonzero += partials[index + 3]
-        index += 4
+    let folded = reduced("stats_reduce", "stats_join", src, mask, [channel])
+    if folded.len() < 4 { return (0.0, 0.0, 0.0, 0) }
+    return (folded[0], folded[1], folded[2], int(folded[3]))
+}
+
+#: The same four numbers for every channel at once, in one round trip.
+fn every_channel_stats(src: Mat, mask: Mat? = null) -> list[list[float]] {
+    var wanted: list[int] = []
+    for channel in 0..src.channels() { wanted.push(channel) }
+    let folded = reduced("stats_reduce", "stats_join", src, mask, wanted)
+    var out: list[list[float]] = []
+    for channel in wanted {
+        if (channel + 1) * 4 > folded.len() {
+            out.push([0.0, 0.0, 0.0, 0.0])
+        } else {
+            out.push(
+                [
+                    folded[channel * 4],
+                    folded[channel * 4 + 1],
+                    folded[channel * 4 + 2],
+                    folded[channel * 4 + 3],
+                ]
+            )
+        }
     }
-    return (total, absolute, squares, int(nonzero))
+    return out
 }
 
 #: Sum of every element, one entry per channel.
 pub fn sum_mat(src: Mat, mask: Mat? = null) -> Scalar {
     var out = [0.0, 0.0, 0.0, 0.0]
-    for channel in 0..min(src.channels(), 4) {
-        let (total, _absolute, _squares, _nonzero) = channel_stats(src, channel, mask: mask)
-        out[channel] = total
+    for (channel, stats) in every_channel_stats(src, mask: mask).enumerate() {
+        if channel < 4 { out[channel] = stats[0] }
     }
     return Scalar(out[0], out[1], out[2], out[3])
 }
 
 #: Number of elements that are not zero, summed over channels.
 pub fn count_non_zero(src: Mat, mask: Mat? = null) -> int {
-    var total = 0
-    for channel in 0..src.channels() {
-        let (_total, _absolute, _squares, nonzero) = channel_stats(src, channel, mask: mask)
-        total += nonzero
-    }
-    return total
+    var total = 0.0
+    for stats in every_channel_stats(src, mask: mask) { total += stats[3] }
+    return int(total)
 }
 
 #: Average of each channel.
@@ -365,9 +503,8 @@ pub fn mean(src: Mat, mask: Mat? = null) -> Scalar {
     }
     if denominator <= 0.0 { return Scalar(0.0, 0.0, 0.0, 0.0) }
     var out = [0.0, 0.0, 0.0, 0.0]
-    for channel in 0..min(src.channels(), 4) {
-        let (total, _absolute, _squares, _nonzero) = channel_stats(src, channel, mask: mask)
-        out[channel] = total / denominator
+    for (channel, stats) in every_channel_stats(src, mask: mask).enumerate() {
+        if channel < 4 { out[channel] = stats[0] / denominator }
     }
     return Scalar(out[0], out[1], out[2], out[3])
 }
@@ -384,8 +521,10 @@ pub fn mean_std_dev(src: Mat, mask: Mat? = null) -> tuple[Scalar, Scalar] {
     }
     var averages = [0.0, 0.0, 0.0, 0.0]
     var deviations = [0.0, 0.0, 0.0, 0.0]
-    for channel in 0..min(src.channels(), 4) {
-        let (total, _absolute, squares, _nonzero) = channel_stats(src, channel, mask: mask)
+    for (channel, stats) in every_channel_stats(src, mask: mask).enumerate() {
+        if channel >= 4 { break }
+        let total = stats[0]
+        let squares = stats[2]
         let average = total / denominator
         let variance = max(0.0, squares / denominator - average * average)
         averages[channel] = average
@@ -404,7 +543,7 @@ pub fn min_max_loc(src: Mat, mask: Mat? = null) -> tuple[float, float, Point, Po
     if src.channels() != 1 {
         throw ValueError("min_max_loc needs a single-channel Mat; split it first")
     }
-    let partials = reduced("stats_extrema", "stats_join_extrema", src, mask, 0)
+    let partials = reduced("stats_extrema", "stats_join_extrema", src, mask, [0])
     var low = 0.0
     var high = 0.0
     var low_at = -1

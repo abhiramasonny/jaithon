@@ -18,6 +18,7 @@ import std.math
 from std.core import Printable
 from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
+from ..core.stats import min_max
 from ..core.types import BORDER_DEFAULT, CV_32F, CV_MAKETYPE, Point, Point2f, Size
 from .common import PRELUDE
 from .filter import blur, box_filter, sobel
@@ -163,6 +164,46 @@ kernel void hough_accumulate(device const float* src [[buffer(0)]],
 
 /* The votes are counted as integers and read back as numbers, and a buffer of
  * one read as the other is a pile of denormals. */
+/* Corners that beat their eight neighbours, written out already compacted.
+ *
+ * The alternative is reading the whole response back and doing the test on the
+ * host, which for a 1080p frame is two million boxed floats and eighteen
+ * million comparisons before any corner has been chosen. Here every pixel
+ * tests itself and only the survivors -- a few thousand at most -- travel. */
+kernel void corner_peaks(device const float* response [[buffer(0)]],
+                         device const float* mask [[buffer(1)]],
+                         device atomic_uint* counter [[buffer(2)]],
+                         device float* cells [[buffer(3)]],
+                         device float* scores [[buffer(4)]],
+                         constant uint& rows [[buffer(5)]],
+                         constant uint& cols [[buffer(6)]],
+                         constant uint& r_off [[buffer(7)]],
+                         constant uint& r_step [[buffer(8)]],
+                         constant uint& m_off [[buffer(9)]],
+                         constant uint& m_step [[buffer(10)]],
+                         constant uint& use_mask [[buffer(11)]],
+                         constant uint& floor_bits [[buffer(12)]],
+                         constant uint& limit [[buffer(13)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= rows * cols) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    if (y == 0u || x == 0u || y + 1u >= rows || x + 1u >= cols) return;
+    float here = response[r_off + y * r_step + x];
+    if (here < as_type<float>(floor_bits)) return;
+    if (use_mask != 0u && mask[m_off + y * m_step + x] == 0.0f) return;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dy == 0 && dx == 0) continue;
+            if (response[r_off + uint(int(y) + dy) * r_step + uint(int(x) + dx)] > here) return;
+        }
+    }
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot >= limit) return;
+    cells[slot] = float(id);
+    scores[slot] = here;
+}
+
 kernel void hough_collect(device const uint* votes [[buffer(0)]],
                           device float* out [[buffer(1)]],
                           constant uint& count [[buffer(2)]],
@@ -506,58 +547,58 @@ pub fn good_features_to_track(
     } else {
         corner_min_eigen_val(image, block_size, 3)
     }
-    let values = response.to_list()
     let rows = response.rows
     let cols = response.cols
-
-    var strongest = 0.0
-    for value in values {
-        if value > strongest { strongest = value }
-    }
+    let (_low, strongest) = min_max(response)
     if strongest <= 0.0 { return [] }
     let floor_value = strongest * quality_level
 
-    var mask_values: list[float] = []
+    response.flush()
     let mask_image = mask
-    if mask_image is not null {
-        mask_image.flush()
-        mask_values = mask_image.to_list()
-    }
-
-    #: A corner has to be at least as strong as all eight of its neighbours, or
-    #: one bump in the response would come back as a cluster of corners.
-    var candidates: list[int] = []
-    for y in 1..rows - 1 {
-        for x in 1..cols - 1 {
-            let cell = y * cols + x
-            let here = values[cell]
-            if here < floor_value { continue }
-            if mask_image is not null and mask_values[cell] == 0.0 { continue }
-            var peak = true
-            for dy in -1..2 {
-                for dx in -1..2 {
-                    if dy == 0 and dx == 0 { continue }
-                    if values[(y + dy) * cols + x + dx] > here {
-                        peak = false
-                        break
-                    }
-                }
-                if not peak { break }
-            }
-            if peak { candidates.push(cell) }
-        }
-    }
+    if mask_image is not null { mask_image.flush() }
+    let plane = if mask_image is null { response } else { mask_image }
+    #: Every pixel could be a peak -- a flat response above the floor makes
+    #: them all one -- so the room set aside is the whole frame.
+    let limit = rows * cols
+    let counter = Buffer(1)
+    counter.fill_zero()
+    let cells = Buffer(limit)
+    let scores = Buffer(limit)
+    kernel_for("corner_peaks").dispatch_async([response.storage, plane.storage, counter, cells, scores], limit, [rows, cols, response.offset, response.step_, plane.offset, plane.step_, if mask_image is null {
+        0
+    } else {
+        1
+    }, f32_bits(floor_value), limit])
+    #: The counter is atomic, so its bits are an integer; read as a float
+    #: straight out of the buffer they come back as a denormal.
+    let counted = Buffer(1)
+    kernel_for("hough_collect").dispatch_async([counter, counted], 1, [1])
+    let found = min(limit, int(counted.download()[0]))
+    counted.free()
+    let candidates = if found == 0 { [] } else { cells.download(count: found) }
+    let strengths = if found == 0 { [] } else { scores.download(count: found) }
+    counter.free()
+    cells.free()
+    scores.free()
 
     #: Strongest first. Inserting each candidate into a sorted list instead
     #: makes the work grow with the square of how many there are, and on a
     #: textured frame there are tens of thousands: 640 by 480 took 28 seconds
     #: that way, nearly all of it shuffling a list along.
-    let ordered = candidates.sort(key: |cell| values[cell], reverse: true)
+    var order: list[int] = []
+    for index in 0..found { order.push(index) }
+    #: Back into raster order first. The device hands its finds back in
+    #: whatever order the threads reached the counter, and the sort below is
+    #: stable, so without this two corners of equal strength are separated
+    #: differently from one run to the next and the same frame answers twice.
+    let raster = order.sort(key: |index| candidates[index])
+    let ordered = raster.sort(key: |index| strengths[index], reverse: true)
 
     var kept: list[Point2f] = []
     let squared = min_distance * min_distance
-    for cell in ordered {
+    for index in ordered {
         if max_corners > 0 and kept.len() >= max_corners { break }
+        let cell = int(candidates[index])
         let y = cell // cols
         let x = cell - y * cols
         var clear = true
