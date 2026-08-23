@@ -119,12 +119,19 @@ kernel void stereo_aggregate(device const float* cost [[buffer(0)]],
         y = step_y > 0 ? 0 : int(rows) - 1;
     } else {
         /* A diagonal starts on the top or bottom edge, then on the left or
-         * right edge for the rest. */
+         * right edge for the rest -- but those two edges share a corner, and
+         * counting it on both sides gave two threads the same start, the
+         * same diagonal, and the same `+=` into the same addresses. That
+         * corner's costs were added twice, and raced while they were: the
+         * same pair of images gave up to 38 differing pixels between runs,
+         * every one of them on a corner diagonal. The vertical edge skips
+         * the row the horizontal edge already began on. */
         if (id < cols) {
             x = int(id);
             y = step_y > 0 ? 0 : int(rows) - 1;
         } else {
-            y = int(id - cols);
+            int along = int(id - cols);
+            y = step_y > 0 ? along + 1 : along;
             x = step_x > 0 ? 0 : int(cols) - 1;
         }
     }
@@ -446,7 +453,10 @@ pub class StereoSGBM {
             steps.push([-1, -1])
         }
         for step in steps {
-            let paths = if step[0] == 0 { rows } elif step[1] == 0 { cols } else { rows + cols }
+            #: One path per start pixel. A diagonal starts along one whole
+            #: edge and all but one of the other -- the corner they share
+            #: belongs to exactly one of them.
+            let paths = if step[0] == 0 { rows } elif step[1] == 0 { cols } else { rows + cols - 1 }
             kernel_for("stereo_aggregate").dispatch_async(
                 [volume.storage, aggregated.storage],
                 paths,

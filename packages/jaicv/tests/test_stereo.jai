@@ -269,3 +269,41 @@ fn test_reprojection_checks_its_matrix() -> void {
     let map = Mat.zeros(4, 4, CV_32FC1)
     assert_throws(ValueError, || reproject_image_to_3d(map, Mat.zeros(3, 3, CV_32FC1)))
 }
+
+#: The same pair of images twice, which has to give the same disparities.
+#:
+#: A diagonal aggregation path starts along one edge and then the other, and
+#: the two edges share a corner. Counting it on both sides gave two threads
+#: the same start, the same diagonal and the same non-atomic `+=` into the
+#: same addresses: up to ninety of twelve thousand pixels differed between
+#: runs of the identical call, by as much as 200 disparity levels. With the
+#: diagonals turned off it was stable, which is what pinned it.
+fn test_semi_global_matching_answers_the_same_twice() -> void {
+    if not have_gpu() { return }
+    var seed = 91
+    let rows = 64
+    let cols = 96
+    var left: list[float] = []
+    var right: list[float] = []
+    for index in 0..rows * cols {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let value = float(seed % 90) + 60.0
+        left.push(value)
+        let y = index // cols
+        let x = index - y * cols
+        right.push(if x >= 6 { left[y * cols + x - 6] } else { value })
+    }
+    let matcher = StereoSGBM(num_disparities: 16, block_size: 5)
+    let one = Mat.from_list(rows, cols, CV_8UC1, left)
+    let other = Mat.from_list(rows, cols, CV_8UC1, right)
+    let first = matcher.compute(one, other).values()
+    var live = 0
+    for value in first {
+        if value > 0.0 { live += 1 }
+    }
+    assert_true(live > rows * cols // 10, "the matcher found almost no disparities")
+    for _round in 0..3 {
+        let again = matcher.compute(one, other).values()
+        for (index, value) in first.enumerate() { assert_eq(again[index], value) }
+    }
+}
