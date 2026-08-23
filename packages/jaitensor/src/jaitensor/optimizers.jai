@@ -57,11 +57,15 @@ class ParameterState {
     pub let second_moment: Buffer
 
     pub var settings: Buffer?
+    #: What was last written into `settings`, so that a step asking for the
+    #: same numbers again need not write them again.
+    pub var written: list[float]
 
     pub fn init(self, size: int) {
         self.first_moment = Buffer.of([0.0 for _index in 0..size])
         self.second_moment = Buffer.of([0.0 for _index in 0..size])
         self.settings = null
+        self.written = []
     }
 
     pub fn free(self) -> void {
@@ -164,6 +168,15 @@ pub fn zero_grad(parameters: list[Tensor]) -> void {
     }
 }
 
+#: Whether two settings lists hold the same numbers.
+fn same_numbers(a: list[float], b: list[float]) -> bool {
+    if a.len() != b.len() { return false }
+    for (index, value) in a.enumerate() {
+        if value != b[index] { return false }
+    }
+    return true
+}
+
 fn apply_update(parameter: Tensor, settings: list[float], kind: int) -> void {
     let gradient = parameter.grad
     if gradient is null {
@@ -188,9 +201,19 @@ fn apply_update(parameter: Tensor, settings: list[float], kind: int) -> void {
         }
         let created = Buffer.of(settings)
         state.settings = created
+        state.written = settings.copy()
         created
     } else {
-        existing_settings.upload(settings)
+        #: Only when they have actually changed. The update kernel reads this
+        #: buffer every step, so writing it from the host means waiting for
+        #: the step before to finish reading it -- a fence per parameter per
+        #: step, which cost eight per cent of the `norm` benchmark when every
+        #: step was writing the same three numbers. A schedule changes them a
+        #: few times in a run; a fixed rate never does.
+        if not same_numbers(state.written, settings) {
+            existing_settings.upload(settings)
+            state.written = settings.copy()
+        }
         existing_settings
     }
     if kind == 0 and settings[1] == 0.0 {
