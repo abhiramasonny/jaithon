@@ -15,10 +15,6 @@ from ..core.types import BORDER_REPLICATE, CV_8U, CV_32F, CV_MAKETYPE
 from .common import PRELUDE, saturation_args
 from .filter import sobel
 
-#: Most passes hysteresis needs before it gives up chasing a chain of weak
-#: edges. Each pass reaches one pixel further along a chain.
-pub const MAX_HYSTERESIS_PASSES = 64
-
 let SOURCE = PRELUDE + """
 kernel void canny_suppress(device const float* dx [[buffer(0)]],
                            device const float* dy [[buffer(1)]],
@@ -84,49 +80,116 @@ kernel void canny_suppress(device const float* dx [[buffer(0)]],
     labels[out_off + y * out_step + x] = magnitude > high ? 2.0f : 1.0f;
 }
 
-kernel void canny_promote(device float* labels [[buffer(0)]],
-                          device float* changed [[buffer(1)]],
-                          constant uint& count [[buffer(2)]],
-                          constant uint& rows [[buffer(3)]],
-                          constant uint& cols [[buffer(4)]],
-                          constant uint& off [[buffer(5)]],
-                          constant uint& step [[buffer(6)]],
-                          uint id [[thread_position_in_grid]]) {
+/* Hysteresis as a joining problem rather than as a spreading one.
+ *
+ * A weak edge survives when it is connected, through other edges, to a strong
+ * one -- so what matters is which edges belong to the same run, and whether
+ * that run holds a strong pixel anywhere. Spreading the answer a ring at a
+ * time takes as many passes as the longest run is long, and a frame of noisy
+ * edges has runs hundreds of pixels long. Naming each run instead, and
+ * letting the names collapse into each other, settles it in a handful.
+ *
+ * Every edge pixel starts as its own run, named for where it is. */
+kernel void canny_seed(device const float* labels [[buffer(0)]],
+                       device uint* runs [[buffer(1)]],
+                       constant uint& count [[buffer(2)]],
+                       constant uint& cols [[buffer(3)]],
+                       constant uint& off [[buffer(4)]],
+                       constant uint& step [[buffer(5)]],
+                       uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint y = id / cols;
     uint x = id - y * cols;
-    if (labels[off + y * step + x] != 1.0f) return;
-    for (int dy = -1; dy <= 1; ++dy) {
-        int sy = int(y) + dy;
-        if (sy < 0 || sy >= int(rows)) continue;
-        for (int dx = -1; dx <= 1; ++dx) {
-            int sx = int(x) + dx;
-            if (sx < 0 || sx >= int(cols)) continue;
-            if (labels[off + uint(sy) * step + uint(sx)] == 2.0f) {
-                labels[off + y * step + x] = 2.0f;
-                atomic_fetch_add_explicit((device atomic<float>*)changed, 1.0f,
-                                          memory_order_relaxed);
-                return;
-            }
-        }
-    }
+    runs[id] = labels[off + y * step + x] != 0.0f ? id + 1u : 0u;
 }
 
-kernel void canny_finish(device const float* labels [[buffer(0)]],
-                         device float* dst [[buffer(1)]],
-                         constant uint& count [[buffer(2)]],
-                         constant uint& cols [[buffer(3)]],
-                         constant uint& src_off [[buffer(4)]],
-                         constant uint& src_step [[buffer(5)]],
-                         constant uint& dst_off [[buffer(6)]],
-                         constant uint& dst_step [[buffer(7)]],
-                         uint id [[thread_position_in_grid]]) {
+/* A pixel that can see a lower-numbered run tells its own run's root. */
+kernel void canny_join(device atomic_uint* runs [[buffer(0)]],
+                       device atomic_uint* changed [[buffer(1)]],
+                       constant uint& count [[buffer(2)]],
+                       constant uint& rows [[buffer(3)]],
+                       constant uint& cols [[buffer(4)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint mine = atomic_load_explicit(&runs[id], memory_order_relaxed);
+    if (mine == 0u) return;
+    int y = int(id / cols);
+    int x = int(id - uint(y) * cols);
+    uint best = mine;
+    for (int dy = -1; dy <= 1; ++dy) {
+        int sy = y + dy;
+        if (sy < 0 || sy >= int(rows)) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            int sx = x + dx;
+            if (sx < 0 || sx >= int(cols)) continue;
+            uint other = atomic_load_explicit(&runs[uint(sy) * cols + uint(sx)],
+                                              memory_order_relaxed);
+            if (other != 0u && other < best) best = other;
+        }
+    }
+    if (best >= mine) return;
+    atomic_fetch_min_explicit(&runs[mine - 1u], best, memory_order_relaxed);
+    atomic_store_explicit(changed, 1u, memory_order_relaxed);
+}
+
+/* Every chain pointed straight at its end. */
+kernel void canny_flatten(device atomic_uint* runs [[buffer(0)]],
+                          constant uint& count [[buffer(1)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint mine = atomic_load_explicit(&runs[id], memory_order_relaxed);
+    if (mine == 0u) return;
+    uint root = mine;
+    for (uint guard = 0u; guard < 64u; ++guard) {
+        uint up = atomic_load_explicit(&runs[root - 1u], memory_order_relaxed);
+        if (up == root || up == 0u) break;
+        root = up;
+    }
+    if (root != mine) atomic_store_explicit(&runs[id], root, memory_order_relaxed);
+}
+
+/* Which runs hold a strong pixel. */
+kernel void canny_mark(device const float* labels [[buffer(0)]],
+                       device const uint* runs [[buffer(1)]],
+                       device atomic_uint* strong [[buffer(2)]],
+                       constant uint& count [[buffer(3)]],
+                       constant uint& cols [[buffer(4)]],
+                       constant uint& off [[buffer(5)]],
+                       constant uint& step [[buffer(6)]],
+                       uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint y = id / cols;
     uint x = id - y * cols;
-    dst[dst_off + y * dst_step + x] =
-        labels[src_off + y * src_step + x] == 2.0f ? 255.0f : 0.0f;
+    if (labels[off + y * step + x] != 2.0f) return;
+    uint run = runs[id];
+    if (run == 0u) return;
+    atomic_store_explicit(&strong[run - 1u], 1u, memory_order_relaxed);
 }
+
+/* An edge is kept when the run it belongs to holds a strong pixel. */
+kernel void canny_tally(device const uint* value [[buffer(0)]],
+                        device float* out [[buffer(1)]],
+                        constant uint& count [[buffer(2)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    out[id] = float(value[id]);
+}
+
+kernel void canny_keep(device const uint* runs [[buffer(0)]],
+                       device const uint* strong [[buffer(1)]],
+                       device float* out [[buffer(2)]],
+                       constant uint& count [[buffer(3)]],
+                       constant uint& cols [[buffer(4)]],
+                       constant uint& d_off [[buffer(5)]],
+                       constant uint& d_step [[buffer(6)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint run = runs[id];
+    out[d_off + y * d_step + x] = (run != 0u && strong[run - 1u] != 0u) ? 255.0f : 0.0f;
+}
+
 """
 
 var _kernels: dict[str, Kernel] = {}
@@ -168,40 +231,54 @@ pub fn canny(
     }, f32_bits(low), f32_bits(high)])
     labels.invalidate()
 
-    #: Weak edges join a chain one ring at a time, so the pass count bounds how
-    #: far a chain can reach; a counter says when a pass changed nothing.
+    #: Which run of connected edges each pixel belongs to, joined until the
+    #: names stop moving.
     #:
-    #: The counter is read every eighth pass, not every pass. Reading it is a
-    #: round trip to the device and back, and the passes themselves are a
-    #: single cheap kernel over the image -- so asking after each one spent
-    #: almost the whole of Canny waiting: eighteen milliseconds at VGA, of
-    #: which the arithmetic was a fraction. Promotion only ever turns a weak
-    #: edge strong, so a few passes past convergence change nothing and cost
-    #: only their own dispatch.
-    let changed = Buffer(1)
-    let promote = kernel_for("canny_promote")
-    let CHECK_EVERY = 8
-    var pass_number = 0
-    while pass_number < MAX_HYSTERESIS_PASSES {
-        changed.fill_zero()
-        let block = min(CHECK_EVERY, MAX_HYSTERESIS_PASSES - pass_number)
-        for _step in 0..block {
-            promote.dispatch_async(
-                [labels.storage, changed],
-                count,
-                [count, src.rows, src.cols, labels.offset, labels.step_]
-            )
-        }
-        pass_number += block
-        if changed.download()[0] == 0.0 { break }
-    }
-    changed.free()
-
-    kernel_for("canny_finish").dispatch_async(
-        [labels.storage, out.storage],
+    #: Spreading the strong label a ring at a time is the obvious way and was
+    #: the way here, with a fixed pass count to bound it. Two things were
+    #: wrong with that. A run longer than the pass count never finished, so
+    #: six percent of the edges of a noisy frame were simply dropped; and the
+    #: passes read and write the same labels, so how far each run had got when
+    #: the count ran out depended on the order the threads happened to run in
+    #: and the same picture answered differently every time. Joining runs by
+    #: their lowest member settles in a handful of rounds instead of hundreds,
+    #: and its fixed point does not care about the order.
+    let runs = Buffer(count)
+    kernel_for("canny_seed").dispatch_async(
+        [labels.storage, runs],
         count,
-        [count, src.cols, labels.offset, labels.step_, out.offset, out.step_]
+        [count, src.cols, labels.offset, labels.step_]
+    )
+    let changed = Buffer(1)
+    let counted = Buffer(1)
+    let join = kernel_for("canny_join")
+    let flatten = kernel_for("canny_flatten")
+    var rounds = 0
+    while rounds < count {
+        rounds += 1
+        changed.fill_zero()
+        join.dispatch_async([runs, changed], count, [count, src.rows, src.cols])
+        flatten.dispatch_async([runs], count, [count])
+        kernel_for("canny_tally").dispatch_async([changed, counted], 1, [1])
+        if counted.download()[0] == 0.0 { break }
+    }
+
+    let strong = Buffer(count)
+    strong.fill_zero()
+    kernel_for("canny_mark").dispatch_async(
+        [labels.storage, runs, strong],
+        count,
+        [count, src.cols, labels.offset, labels.step_]
+    )
+    kernel_for("canny_keep").dispatch_async(
+        [runs, strong, out.storage],
+        count,
+        [count, src.cols, out.offset, out.step_]
     )
     out.invalidate()
+    runs.free()
+    strong.free()
+    changed.free()
+    counted.free()
     return out
 }

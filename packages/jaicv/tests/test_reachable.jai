@@ -451,6 +451,73 @@ fn texture_at(x: float, y: float) -> float {
     return 60.0 + 90.0 * blob + 40.0 * grain
 }
 
+#: The same frame twice, which has to give the same edges twice.
+#:
+#: Hysteresis reads and writes one buffer from every thread at once, so where
+#: it stops depends on the order the threads run in unless it is run all the
+#: way to its fixed point. It was not, and the same picture came back with a
+#: different set of edges each time -- and six percent short of the right one,
+#: because a run of weak edges longer than the pass count never finished.
+fn test_canny_answers_the_same_twice() -> void {
+    if not have_gpu() { return }
+    var seed = 424242
+    var pixels: list[float] = []
+    for _index in 0..200 * 260 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        pixels.push(float(seed % 256))
+    }
+    let frame = Mat.from_list(200, 260, CV_8UC1, pixels)
+    var first = 0.0
+    var lit = 0
+    for round in 0..4 {
+        var digest = 0.0
+        var live = 0
+        for (index, value) in canny(frame, 60.0, 140.0).to_list().enumerate() {
+            digest += value * float(index % 29 + 1)
+            if value != 0.0 { live += 1 }
+        }
+        if round == 0 {
+            first = digest
+            lit = live
+            continue
+        }
+        assert_eq(digest, first)
+        assert_eq(live, lit)
+    }
+    #: A picture of noise has edges everywhere; nothing found would mean the
+    #: run above agreed on being empty.
+    assert_true(lit > 200 * 260 // 10)
+}
+
+#: A weak edge three hundred pixels long, strong only at one end.
+#:
+#: All of it belongs to the answer, because all of it is connected to the
+#: strong end. Chasing that connection one ring a pass, with a bound on the
+#: passes, stopped 228 pixels in and returned 145 of the 602 edge pixels.
+fn test_canny_follows_a_long_weak_edge() -> void {
+    if not have_gpu() { return }
+    let width = 300
+    var pixels: list[float] = []
+    for index in 0..40 * width {
+        let y = index // width
+        let x = index - y * width
+        var value = 0.0
+        if y == 20 { value = if x >= width - 6 { 255.0 } else { 30.0 } }
+        pixels.push(value)
+    }
+    let frame = Mat.from_list(40, width, CV_8UC1, pixels)
+    var live = 0
+    var leftmost = width
+    for (index, value) in canny(frame, 100.0, 500.0).to_list().enumerate() {
+        if value == 0.0 { continue }
+        live += 1
+        let x = index - index // width * width
+        if x < leftmost { leftmost = x }
+    }
+    assert_eq(leftmost, 0)
+    assert_true(live > 500)
+}
+
 fn test_video_run() -> void {
     if not have_gpu() { return }
     let a = disc()
@@ -471,6 +538,8 @@ fn test_video_run() -> void {
     assert_eq(found.len(), 2)
     assert_eq(errors.len(), 2)
     test_optical_flow_finds_the_shift()
+    test_canny_answers_the_same_twice()
+    test_canny_follows_a_long_weak_edge()
 
     let (steps, settled) = mean_shift(a, Rect(10, 20, 20, 20))
     assert_true(steps >= 0 and settled.width > 0)
