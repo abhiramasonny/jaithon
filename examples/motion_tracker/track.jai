@@ -103,7 +103,10 @@ fn main() -> int {
         let grey = cv.cvt_color(colour, cv.COLOR_BGR2GRAY)
         let clock = Instant.now()
         let (moved, found, residual) = cv.calc_optical_flow_pyr_lk(previous, grey, points)
-        flow_seconds += clock.elapsed().to_seconds()
+        #: The first frame pays for compiling the kernels, which is a tenth
+        #: of a second and nothing to do with the tracking. Every frame after
+        #: it is the real cost.
+        if t > 1 { flow_seconds += clock.elapsed().to_seconds() }
         var next_points: list[Point2f] = []
         for (index, landed) in moved.enumerate() {
             #: Two ways to lose a point: the tracker says it left the frame,
@@ -164,9 +167,9 @@ fn main() -> int {
     let out = "motion_trails.png"
     let ok = cv.imwrite(out, last_colour)
     print(f"tracked {still_here} of {started_with} corners across {FRAMES} frames")
-    let steps = float(FRAMES - 1)
-    print(f"{flow_seconds * 1000.0 / steps:.1f} ms a frame following them")
-    print(f"{(seconds - flow_seconds) * 1000.0 / steps:.1f} ms a frame drawing the scene to follow")
+    let steps = float(FRAMES - 2)
+    print(f"{flow_seconds * 1000.0 / steps:.1f} ms a frame following them, after the first")
+    print(f"{seconds:.2f} s in total, including compiling the kernels")
     if ok { print(f"wrote {out}") }
     return 0
 }

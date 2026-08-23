@@ -31,13 +31,23 @@ after that the program only ever asks where *those* points went. Choosing
 corners again every frame would be a different program — one that could never
 say that this point is that point.
 
-## What the two numbers mean
+## What the timing depends on
 
-The run prints the time following the points separately from the time drawing
-the scene for them to be followed through, because only the first is the
-library doing the work this example is about. The following is the larger of
-the two, and it is dominated by building the image pyramid rather than by how
-many points are on it — tracking four times as many costs barely more.
+The run prints the time spent following the points separately from the total,
+because only the first is the library doing the work this example is about,
+and the first frame of all pays for compiling the kernels.
+
+Two things move that number, and neither is obvious:
+
+- **How many points.** Below about a hundred it is flat — 30 points and 120
+  points both cost about 2.8 ms on a 640×480 pair, because there are not
+  enough of them to give the device anything to do and the image pyramid is
+  the whole bill. Past that it scales: 480 points cost 9.0 ms and 1920 cost
+  14.2 ms.
+- **How far things moved.** Each point refines its own guess and stops early
+  once the guess settles, so a frame pair that barely moved converges on the
+  first pass. The same 120 points cost 2.9 ms on a pair shifted by two pixels
+  and 15.6 ms here, where the scene has turned as well as panned.
 
 Points are dropped on two conditions, not one. The tracker reports whether it
 lost a point off the edge of the frame, and separately how far apart the two
