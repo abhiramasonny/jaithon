@@ -27,6 +27,7 @@ from jaitensor.ops import merge_heads, minimum, nchw, neg, nhwc, pad2d, pow as p
 from jaitensor.ops import relu, repeat, reshape, rsqrt, scale, sigmoid, silu, slice_flat
 from jaitensor.ops import softmax, split_heads, sqrt as sqrt_op, square, sum as sum_op
 from jaitensor.ops import tanh as tanh_op, transpose, tril, upsample_nearest2d
+from jaitensor.losses import SparseCategoricalCrossentropy
 from jaitensor.tensor import Tensor
 from std.test import assert_eq, assert_near, assert_true
 
@@ -589,6 +590,36 @@ fn test_gather_rows_accumulates_repeated_indices() -> void {
 #: step of every epoch dropped exactly the same units and two layers of the
 #: same shape dropped the same ones as each other. Perfectly repeatable, and
 #: therefore never flaky -- it simply was not regularising anything.
+#: A loss that has been weighted has to weight its gradient too.
+#:
+#: Sparse cross-entropy is the one loss here whose backward is written out by
+#: hand, around a fused kernel, and it handed its delta straight back without
+#: multiplying by what came down from above. So `scale(loss, 3)` reported
+#: three times the number and moved the parameters by exactly as much as
+#: `loss` did -- every other loss scales properly, which is what makes this
+#: one worth pinning.
+fn test_a_weighted_loss_weights_its_gradient() -> void {
+    if not have_gpu() { return }
+    var plain: list[float] = []
+    var tripled: list[float] = []
+    for weight in [1.0, 3.0] {
+        let prediction = Tensor([1, 3], [0.2, 0.3, 0.5], requires_grad: true)
+        let target = Tensor([1], [2.0])
+        let loss = SparseCategoricalCrossentropy().forward(prediction, target)
+        let junk = scale(loss, weight).backward()
+        let gradient = prediction.grad
+        assert_true(gradient is not null, "the prediction should have a gradient")
+        for value in gradient.download() {
+            if weight == 1.0 { plain.push(value) } else { tripled.push(value) }
+        }
+    }
+    assert_eq(plain.len(), tripled.len())
+    for (index, value) in plain.enumerate() {
+        assert_true(math.fabs(value) > 1e-6, "the unweighted gradient should not be zero")
+        assert_near(tripled[index] / value, 3.0, 1e-4)
+    }
+}
+
 fn test_dropout_draws_a_fresh_mask_each_step() -> void {
     if not have_gpu() { return }
     let x = Tensor.ones([4, 32])

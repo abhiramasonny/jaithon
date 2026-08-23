@@ -2561,6 +2561,24 @@ pub fn scale(input: Tensor, value: float) -> Tensor {
     return output
 }
 
+#: Multiply every element by one number that is itself on the device.
+#:
+#: `scale` takes a host float, which is no use to a backward pass: the number
+#: it wants is the upstream gradient, and fetching that to the host to pass it
+#: back down would mean waiting for the device mid-graph.
+pub fn scale_by(input: Tensor, factor: Tensor) -> Tensor {
+    if factor.size != 1 {
+        throw ValueError(f"scale_by needs a single number, got {factor.shape}")
+    }
+    let output = Tensor(input.shape)
+    cached_kernel("scalar_mul").dispatch_async(
+        [input.buffer(), factor.buffer(), output.buffer()],
+        input.size,
+        [input.size]
+    )
+    return output
+}
+
 #: Reinterpret a tensor as `shape` without copying device memory.
 pub fn reshape(input: Tensor, shape: list[int]) -> Tensor {
     if element_count(shape) != input.size {

@@ -5,6 +5,7 @@ from .tensor import Tensor, GradNode
 from .trace import record_sparse_ce
 from .ops import mse as mse_op, binary_cross_entropy as bce_op
 from .ops import binary_cross_entropy_with_logits as bce_logits_op
+from .ops import scale_by
 
 #: Something a `Sequential` can train against: turns a prediction and a
 #: target into one scalar tensor, differentiable back into `prediction`.
@@ -230,7 +231,16 @@ pub class SparseCategoricalCrossentropy: Loss {
         }
         let (mean, delta) = sparse_ce_with_delta(prediction, target, loss_acc, acc_weight)
         if prediction.requires_grad {
-            mean.attach_creator(GradNode([prediction], |upstream| [delta], extras: [delta]))
+            #: Multiplied by what came down from above, not handed back as
+            #: it stands. Every other loss here composes out of ops that each
+            #: carry the upstream along, so only this one -- whose backward
+            #: is written out by hand around a fused kernel -- dropped it,
+            #: and the effect is that weighting a loss changes the number and
+            #: not the gradient. `scale(loss, 3)` moved the parameters by
+            #: exactly as much as `loss` did.
+            mean.attach_creator(
+                GradNode([prediction], |upstream| [scale_by(delta, upstream)], extras: [delta])
+            )
         } else {
             delta.free()
         }
