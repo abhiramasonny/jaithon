@@ -28,6 +28,10 @@ pub const OPTFLOW_USE_INITIAL_FLOW = 4
 #: Use the flow already in the output as the starting point.
 pub const OPTFLOW_FARNEBACK_GAUSSIAN = 256
 
+#: Threads to a tracked point. One group each, so the window's four hundred
+#: and forty-one positions are shared out rather than walked by one thread.
+const LK_GROUP = 256
+
 let SOURCE = PRELUDE + """
 /* Fit a quadratic to the neighbourhood of every pixel and keep its five
  * coefficients. Farneback's method rests on this: two frames agree on where a
@@ -193,12 +197,37 @@ inline float lk_sample(device const float* plane, uint base, uint rows, uint col
     return top * (1.0f - ay) + bottom * ay;
 }
 
-/* Lucas-Kanade, a thread to a point.
+/* Three sums folded across the threadgroup at once, and handed back to every
+ * thread in it. One pair of barriers for the three, because they are always
+ * wanted together. */
+inline float3 group_sum3(float3 mine, threadgroup float3* lanes,
+                         uint lid, uint lane, uint warp) {
+    if (lid < 32u) lanes[lid] = float3(0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mine.x = simd_sum(mine.x);
+    mine.y = simd_sum(mine.y);
+    mine.z = simd_sum(mine.z);
+    if (lane == 0u) lanes[warp] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float3 total = float3(0.0f);
+    for (uint i = 0u; i < 32u; i++) total += lanes[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
+/* Lucas-Kanade, a threadgroup to a point.
  *
- * Points do not talk to each other, which is the whole reason this belongs on
- * the device: the host walked them one at a time and a single 21-pixel window
- * refined over thirty passes and four levels is a hundred and sixty thousand
- * bilinear samples, so a couple of hundred points cost most of a second. */
+ * A thread apiece is the obvious arrangement and it wastes the device: a
+ * couple of hundred tracked points is a couple of hundred threads, on a card
+ * that wants tens of thousands, and each of those threads walks a 21-pixel
+ * window thirty times over four levels on its own. Spreading one point's
+ * window across a whole group instead gives every thread two of the window's
+ * four hundred and forty-one positions and folds the three sums it needs
+ * across the group.
+ *
+ * Every thread in the group carries the same guess and takes the same
+ * branches -- they are all computed from group-wide sums -- so the barriers
+ * inside the loops are reached by all of them. */
 kernel void lk_track(device const float* planes_a [[buffer(0)]],
                      device const float* planes_b [[buffer(1)]],
                      device const float* meta [[buffer(2)]],
@@ -213,8 +242,13 @@ kernel void lk_track(device const float* planes_a [[buffer(0)]],
                      constant uint& window_area [[buffer(11)]],
                      constant uint& frame_rows [[buffer(12)]],
                      constant uint& frame_cols [[buffer(13)]],
-                     uint id [[thread_position_in_grid]]) {
+                     uint id [[threadgroup_position_in_grid]],
+                     uint lid [[thread_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint warp [[simdgroup_index_in_threadgroup]]) {
     if (id >= count) return;
+    threadgroup float3 lanes[32];
+    const uint GROUP = 256u;
     float epsilon = as_type<float>(epsilon_bits);
     float start_x = points[id * 2u + 0u];
     float start_y = points[id * 2u + 1u];
@@ -222,6 +256,7 @@ kernel void lk_track(device const float* planes_a [[buffer(0)]],
     float guess_y = 0.0f;
     bool alive = true;
     float residual = 0.0f;
+    uint span = (2u * half_x + 1u) * (2u * half_y + 1u);
 
     int level = int(levels) - 1;
     while (level >= 0) {
@@ -234,23 +269,20 @@ kernel void lk_track(device const float* planes_a [[buffer(0)]],
 
         /* The window's own gradient matrix does not change while the point is
          * being refined, so it is built once per level. */
-        float gxx = 0.0f;
-        float gxy = 0.0f;
-        float gyy = 0.0f;
-        for (int dy = -int(half_y); dy <= int(half_y); ++dy) {
-            for (int dx = -int(half_x); dx <= int(half_x); ++dx) {
-                float sx = px + float(dx);
-                float sy = py + float(dy);
-                float ix = (lk_sample(planes_a, base, rows, cols, sx + 1.0f, sy)
-                          - lk_sample(planes_a, base, rows, cols, sx - 1.0f, sy)) * 0.5f;
-                float iy = (lk_sample(planes_a, base, rows, cols, sx, sy + 1.0f)
-                          - lk_sample(planes_a, base, rows, cols, sx, sy - 1.0f)) * 0.5f;
-                gxx += ix * ix;
-                gxy += ix * iy;
-                gyy += iy * iy;
-            }
+        float3 gradient = float3(0.0f);
+        for (uint at = lid; at < span; at += GROUP) {
+            int dy = int(at / (2u * half_x + 1u)) - int(half_y);
+            int dx = int(at % (2u * half_x + 1u)) - int(half_x);
+            float sx = px + float(dx);
+            float sy = py + float(dy);
+            float ix = (lk_sample(planes_a, base, rows, cols, sx + 1.0f, sy)
+                      - lk_sample(planes_a, base, rows, cols, sx - 1.0f, sy)) * 0.5f;
+            float iy = (lk_sample(planes_a, base, rows, cols, sx, sy + 1.0f)
+                      - lk_sample(planes_a, base, rows, cols, sx, sy - 1.0f)) * 0.5f;
+            gradient += float3(ix * ix, ix * iy, iy * iy);
         }
-        float determinant = gxx * gyy - gxy * gxy;
+        gradient = group_sum3(gradient, lanes, lid, lane, warp);
+        float determinant = gradient.x * gradient.z - gradient.y * gradient.y;
         if (fabs(determinant) < 1e-6f) {
             alive = false;
             level -= 1;
@@ -260,29 +292,26 @@ kernel void lk_track(device const float* planes_a [[buffer(0)]],
         }
 
         for (uint pass = 0u; pass < iterations; ++pass) {
-            float bx = 0.0f;
-            float by = 0.0f;
-            float total = 0.0f;
-            for (int dy = -int(half_y); dy <= int(half_y); ++dy) {
-                for (int dx = -int(half_x); dx <= int(half_x); ++dx) {
-                    float sx = px + float(dx);
-                    float sy = py + float(dy);
-                    float ix = (lk_sample(planes_a, base, rows, cols, sx + 1.0f, sy)
-                              - lk_sample(planes_a, base, rows, cols, sx - 1.0f, sy)) * 0.5f;
-                    float iy = (lk_sample(planes_a, base, rows, cols, sx, sy + 1.0f)
-                              - lk_sample(planes_a, base, rows, cols, sx, sy - 1.0f)) * 0.5f;
-                    float difference = lk_sample(planes_a, base, rows, cols, sx, sy)
-                        - lk_sample(planes_b, base, rows, cols, sx + guess_x, sy + guess_y);
-                    bx += difference * ix;
-                    by += difference * iy;
-                    total += fabs(difference);
-                }
+            float3 mismatch = float3(0.0f);
+            for (uint at = lid; at < span; at += GROUP) {
+                int dy = int(at / (2u * half_x + 1u)) - int(half_y);
+                int dx = int(at % (2u * half_x + 1u)) - int(half_x);
+                float sx = px + float(dx);
+                float sy = py + float(dy);
+                float ix = (lk_sample(planes_a, base, rows, cols, sx + 1.0f, sy)
+                          - lk_sample(planes_a, base, rows, cols, sx - 1.0f, sy)) * 0.5f;
+                float iy = (lk_sample(planes_a, base, rows, cols, sx, sy + 1.0f)
+                          - lk_sample(planes_a, base, rows, cols, sx, sy - 1.0f)) * 0.5f;
+                float difference = lk_sample(planes_a, base, rows, cols, sx, sy)
+                    - lk_sample(planes_b, base, rows, cols, sx + guess_x, sy + guess_y);
+                mismatch += float3(difference * ix, difference * iy, fabs(difference));
             }
-            float step_x = (gyy * bx - gxy * by) / determinant;
-            float step_y = (gxx * by - gxy * bx) / determinant;
+            mismatch = group_sum3(mismatch, lanes, lid, lane, warp);
+            float step_x = (gradient.z * mismatch.x - gradient.y * mismatch.y) / determinant;
+            float step_y = (gradient.x * mismatch.y - gradient.y * mismatch.x) / determinant;
             guess_x += step_x;
             guess_y += step_y;
-            residual = total / float(window_area);
+            residual = mismatch.z / float(window_area);
             if (step_x * step_x + step_y * step_y < epsilon * epsilon) break;
         }
 
@@ -293,6 +322,7 @@ kernel void lk_track(device const float* planes_a [[buffer(0)]],
         }
     }
 
+    if (lid != 0u) return;
     float landed_x = start_x + guess_x;
     float landed_y = start_y + guess_y;
     if (landed_x < 0.0f || landed_y < 0.0f) alive = false;
@@ -410,7 +440,7 @@ pub fn calc_optical_flow_pyr_lk(
     let out_buffer = Buffer(points.len() * 4)
     kernel_for("lk_track").dispatch_async(
         [planes_a, planes_b, table_buffer, points_buffer, out_buffer],
-        points.len(),
+        points.len() * LK_GROUP,
         [
             points.len(),
             levels,
@@ -421,7 +451,8 @@ pub fn calc_optical_flow_pyr_lk(
             window.width * window.height,
             previous.rows,
             previous.cols,
-        ]
+        ],
+        group_size: LK_GROUP
     )
     let landed = out_buffer.download()
     planes_a.free()
