@@ -245,6 +245,20 @@ pub fn solve_pnp(
         let (rvec, tvec) = pose_from_homography(h, camera_matrix)
         start = [rvec[0], rvec[1], rvec[2], tvec[0], tvec[1], tvec[2]]
     } else {
+        #: Six, not four. The direct solution has twelve unknowns and each
+        #: point supplies two equations, so four points leave a
+        #: four-dimensional space of answers and five leave two -- and the
+        #: null space hands back an arbitrary member of it, which the
+        #: refinement then polishes into a confident-looking pose that is
+        #: simply wrong. Twenty of thirty-nine random four-point sets came
+        #: back over a pixel out, the worst by 645, and every one of them
+        #: reported success. Four points that lie in a plane are a different
+        #: matter and go through the homography above.
+        if count < 6 {
+            throw ValueError(
+                f"a pose from {count} points that are not coplanar is underdetermined; six are needed"
+            )
+        }
         let (rvec, tvec) = pose_from_dlt(object_points, image_points, camera_matrix)
         start = [rvec[0], rvec[1], rvec[2], tvec[0], tvec[1], tvec[2]]
     }

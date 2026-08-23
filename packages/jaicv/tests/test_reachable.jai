@@ -26,11 +26,11 @@ import std.math
 import std.gpu as gpu
 from std.io import Path
 from std.os import temp_dir
-from std.test import assert_eq, assert_near, assert_true
+from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaicv.core.mat import cached_kernel, f32_bits, touch, Mat
 from jaicv.core.types import CV_8U, CV_8UC1, CV_8UC2, CV_8UC3, CV_8UC4, CV_32FC1, CV_32SC1
 from jaicv.core.types import depth_is_integer, depth_max, depth_min
-from jaicv.core.types import CV_MAKETYPE, CV_MAT_CN, Point, Point2f, Rect, RotatedRect
+from jaicv.core.types import CV_MAKETYPE, CV_MAT_CN, Point, Point2f, Point3f, Rect, RotatedRect
 from jaicv.core.types import Scalar, Size, Size2f
 from jaicv.core.arith import binary_op, bitwise_and, bitwise_or, bitwise_xor, scalar_op
 from jaicv.core.arith import abs_mat, add_weighted, convert_scale_abs, exp_mat, log_mat
@@ -81,7 +81,8 @@ from jaicv.objdetect.qr import function_map, mask_bit, decode_format, decode_ver
 from jaicv.objdetect.xml import parse_xml
 from jaicv.calib3d.transform import find_homography, get_optimal_new_camera_matrix
 from jaicv.calib3d.transform import init_undistort_rectify_map, refine_homography
-from jaicv.calib3d.calibrate import draw_chessboard_corners
+from jaicv.calib3d.calibrate import draw_chessboard_corners, solve_pnp
+from jaicv.calib3d.transform import project_points
 from jaicv.video.optflow import calc_optical_flow_farneback, calc_optical_flow_pyr_lk
 from jaicv.video.optflow import flow_to_colour, polynomial_expansion
 from jaicv.video.background import create_background_subtractor_knn
@@ -527,6 +528,67 @@ fn test_a_bayes_classifier_pays_for_a_wide_class() -> void {
 #: periodic pattern has features that genuinely recur, so a match to the
 #: wrong period is not the descriptor's fault and the number stays low
 #: whatever is done.
+#: Four points that do not lie in a plane cannot fix a pose.
+#:
+#: The direct solution has twelve unknowns and each point gives two
+#: equations, so four points leave a four-dimensional family of answers. The
+#: null space returned an arbitrary member of it and the refinement polished
+#: that into a pose reported as `ok`: twenty of thirty-nine random four-point
+#: sets came back over a pixel out, the worst by 645, all of them claiming
+#: success. Four coplanar points are a different matter -- those go through
+#: the homography and are genuinely enough.
+fn test_a_pose_needs_six_points_off_a_plane() -> void {
+    if not have_gpu() { return }
+    let camera = Mat.from_list(
+        3,
+        3,
+        CV_32FC1,
+        [600.0, 0.0, 320.0, 0.0, 600.0, 240.0, 0.0, 0.0, 1.0]
+    )
+    let cube = [
+        Point3f(0.0, 0.0, 0.0),
+        Point3f(1.0, 0.0, 0.0),
+        Point3f(0.0, 1.0, 0.0),
+        Point3f(0.0, 0.0, 1.0),
+        Point3f(1.0, 1.0, 0.0),
+        Point3f(1.0, 0.0, 1.0),
+        Point3f(0.0, 1.0, 1.0),
+    ]
+    let truth_r = Mat.from_list(3, 1, CV_32FC1, [0.15, -0.25, 0.08])
+    let truth_t = Mat.from_list(3, 1, CV_32FC1, [0.4, -0.2, 6.0])
+    let seen = project_points(cube, truth_r, truth_t, camera, [])
+
+    fn take(
+        points: list[Point3f],
+        seen: list[Point2f],
+        n: int
+    ) -> tuple[list[Point3f], list[Point2f]] {
+        var a: list[Point3f] = []
+        var b: list[Point2f] = []
+        for index in 0..n {
+            a.push(points[index])
+            b.push(seen[index])
+        }
+        return (a, b)
+    }
+
+    for few in [4, 5] {
+        let (objects, images) = take(cube, seen, few)
+        assert_throws(ValueError, || solve_pnp(objects, images, camera, []))
+    }
+
+    #: Six is enough, and the answer has to be the one it was given.
+    let (objects, images) = take(cube, seen, 7)
+    let (ok, rvec, tvec) = solve_pnp(objects, images, camera, [])
+    assert_true(ok, "seven points should be plenty")
+    for (index, wanted) in [0.15, -0.25, 0.08].enumerate() {
+        assert_near(rvec.values()[index], wanted, 0.05)
+    }
+    for (index, wanted) in [0.4, -0.2, 6.0].enumerate() {
+        assert_near(tvec.values()[index], wanted, 0.05)
+    }
+}
+
 fn test_orb_matches_across_a_change_of_scale() -> void {
     if not have_gpu() { return }
     let rng = Random.with_seed(29)
@@ -706,6 +768,7 @@ fn test_video_run() -> void {
     test_a_large_symmetric_matrix_is_fully_diagonalised()
     test_an_undistorted_camera_keeps_its_matrix()
     test_orb_matches_across_a_change_of_scale()
+    test_a_pose_needs_six_points_off_a_plane()
     test_a_bayes_classifier_pays_for_a_wide_class()
     test_canny_follows_a_long_weak_edge()
 
