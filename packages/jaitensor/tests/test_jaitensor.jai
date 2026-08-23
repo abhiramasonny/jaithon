@@ -1555,6 +1555,40 @@ fn test_attention_keeps_sequence_shape() -> void {
     assert_values_near(y.download(), same.download(), 1e-5)
 }
 
+#: Two epochs of the same run have to see the samples in different orders.
+#:
+#: Each of the three epoch bodies built its own loader with the default seed,
+#: so every epoch of a run drew the same permutation -- the samples were
+#: reordered once when training began and then frozen in that order, which is
+#: most of what shuffling is for. Nothing observable went wrong; the model
+#: simply saw the same batches over and over.
+fn test_a_loader_per_epoch_orders_the_samples_differently() -> void {
+    if not jt.is_available() { return }
+    var features: list[float] = []
+    var labels: list[int] = []
+    for index in 0..24 {
+        features.push(float(index))
+        labels.push(index)
+    }
+    let data = jt.Dataset.from_flat(features, labels, 1)
+    defer { data.free() }
+    var seen: list[str] = []
+    for epoch in 1..4 {
+        let loader = jt.DataLoader(data, 6, shuffle: true, seed: epoch)
+        let (batch_features, batch_labels) = loader.next_batch()
+        var order = ""
+        for value in batch_labels.download() { order += f"{int(value)}," }
+        assert not seen.contains(order)
+        seen.push(order)
+        batch_features.free()
+        batch_labels.free()
+        #: And the order tensor goes back, which is the other half of what
+        #: building one of these per epoch used to cost.
+        loader.free()
+        loader.free()
+    }
+}
+
 fn test_dataloader_shuffle_covers_every_sample() -> void {
     if not jt.is_available() { return }
     let data = jt.Dataset.from_flat([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [0, 1, 2], 2)

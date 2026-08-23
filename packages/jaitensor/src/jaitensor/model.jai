@@ -98,6 +98,9 @@ pub class Sequential {
     var plan_value: ExecutionPlan?
     var mixed_precision: bool
     var shuffle_batches: bool
+    #: How many epochs have been run, which is what makes the next one shuffle
+    #: differently from the last.
+    var epochs_run: int
 
     #: Create an uncompiled model from a non-empty layer list.
     pub fn init(self, layers: list[Layer]) {
@@ -115,6 +118,7 @@ pub class Sequential {
         self.plan_value = null
         self.mixed_precision = false
         self.shuffle_batches = false
+        self.epochs_run = 0
     }
 
     #: Configure the optimizer and loss used by `fit`/`evaluate`.
@@ -482,6 +486,19 @@ pub class Sequential {
         return current
     }
 
+    #: A loader for one epoch, ordered differently from the epoch before it.
+    #:
+    #: Each of the three epoch bodies used to build its own with the default
+    #: seed, so every epoch of a run drew the same permutation: the batches
+    #: were reordered once and then frozen, which is most of the point of
+    #: shuffling gone. The loader was not freed either, leaving one order
+    #: tensor behind per epoch.
+    fn _epoch_loader(self, dataset: Dataset, batch_size: int) -> DataLoader? {
+        if not self.shuffle_batches { return null }
+        self.epochs_run += 1
+        return DataLoader(dataset, batch_size, shuffle: true, seed: self.epochs_run)
+    }
+
     fn _run_epoch(self, dataset: Dataset, batch_size: int, training: bool) -> Metrics {
         let loss_fn = self.loss_value
         let optimizer = self.optimizer_value
@@ -516,10 +533,9 @@ pub class Sequential {
         let flush_every = 1
         var start = 0
         var batches = 0
-        let loader = if self.shuffle_batches {
-            DataLoader(dataset, batch_size, shuffle: true)
-        } else {
-            null
+        let loader = self._epoch_loader(dataset, batch_size)
+        defer {
+            if loader is not null { loader.free() }
         }
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)
@@ -1095,10 +1111,9 @@ pub class Sequential {
         defer { staged_labels.free() }
         var seen = 0
         var start = 0
-        let loader = if self.shuffle_batches {
-            DataLoader(dataset, batch_size, shuffle: true)
-        } else {
-            null
+        let loader = self._epoch_loader(dataset, batch_size)
+        defer {
+            if loader is not null { loader.free() }
         }
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)
@@ -1152,10 +1167,9 @@ pub class Sequential {
         let flush_every = 8
         var start = 0
         var batches = 0
-        let loader = if self.shuffle_batches {
-            DataLoader(dataset, batch_size, shuffle: true)
-        } else {
-            null
+        let loader = self._epoch_loader(dataset, batch_size)
+        defer {
+            if loader is not null { loader.free() }
         }
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)

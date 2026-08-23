@@ -183,6 +183,16 @@ pub class DataLoader {
         self.order = Tensor([perm.len()], perm)
     }
 
+    #: Release the sample order. The dataset it reads is not this to free.
+    #:
+    #: Freeing twice is harmless, and so is freeing a loader that never
+    #: shuffled -- there is no order tensor in that case.
+    pub fn free(self) -> void {
+        let held = self.order
+        if held is not null { held.free() }
+        self.order = null
+    }
+
     #: Whether another minibatch remains in this epoch.
     pub fn has_next(self) -> bool { return self.cursor < self.dataset.samples }
 
