@@ -111,45 +111,46 @@ class Border {
     }
 }
 
-fn at(grid: list[int], rows: int, cols: int, y: int, x: int) -> int {
-    if y < 0 or x < 0 or y >= rows or x >= cols { return 0 }
-    return grid[y * cols + x]
-}
-
+#: Walk a border all the way round, from the pixel it was entered at.
+#:
+#: Everything here is in the padded grid's own numbering: a cell is one
+#: index, a step is one addition, and the ring of zeros around the picture
+#: means no step can leave it. The bounds test that took its place ran eight
+#: times a boundary pixel and there are two hundred thousand of those in a
+#: frame of edges.
 fn follow(
     grid: list[int],
-    rows: int,
-    cols: int,
+    offsets: list[int],
+    start_cell: int,
     start_y: int,
     start_x: int,
-    from_y: int,
-    from_x: int,
+    entry: int,
     nbd: int
 ) -> list[Point] {
     #: Step 3.1: look anticlockwise from the pixel the border was entered from
     #: for the first neighbour that is set.
-    let entry = direction_of(from_y - start_y, from_x - start_x)
-    var first_y = 0
-    var first_x = 0
+    var first_cell = 0
+    var first_step = 0
     var have_first = false
     for offset in 1..9 {
         let step = (entry + offset) % 8
-        let y = start_y + STEP_Y[step]
-        let x = start_x + STEP_X[step]
-        if at(grid, rows, cols, y, x) != 0 {
-            first_y = y
-            first_x = x
+        let cell = start_cell + offsets[step]
+        if grid[cell] != 0 {
+            first_cell = cell
+            first_step = step
             have_first = true
             break
         }
     }
     if not have_first {
-        grid[start_y * cols + start_x] = -nbd
+        grid[start_cell] = -nbd
         return [Point(start_x, start_y)]
     }
 
-    var previous_y = first_y
-    var previous_x = first_x
+    #: Which way the pixel we came from lies, kept as a direction rather than
+    #: worked back out of two coordinates every time round.
+    var back = first_step
+    var current_cell = start_cell
     var current_y = start_y
     var current_x = start_x
     var points: list[Point] = []
@@ -157,47 +158,58 @@ fn follow(
         #: Step 3.3: from where we came, look clockwise round the current pixel
         #: for the next set neighbour, remembering whether the pixel to the
         #: east was one of the ones looked at.
-        let back = step_index(previous_y - current_y, previous_x - current_x)
-        var next_y = 0
-        var next_x = 0
+        var next_cell = 0
+        var next_step = 0
         var saw_east = false
         for offset in 1..9 {
             let step = (back - offset) % 8
             let index = if step < 0 { step + 8 } else { step }
             if index == 0 { saw_east = true }
-            let y = current_y + STEP_Y[index]
-            let x = current_x + STEP_X[index]
-            if at(grid, rows, cols, y, x) != 0 {
-                next_y = y
-                next_x = x
+            let cell = current_cell + offsets[index]
+            if grid[cell] != 0 {
+                next_cell = cell
+                next_step = index
                 break
             }
         }
 
         #: Step 3.4: a pixel whose eastern neighbour was examined and is clear
-        #: closes the border on that side.
-        let cell = current_y * cols + current_x
-        if saw_east and at(grid, rows, cols, current_y, current_x + 1) == 0 {
-            grid[cell] = -nbd
-        } elif grid[cell] == 1 {
-            grid[cell] = nbd
+        #: closes the border on that side. East is one cell along, always
+        #: inside the padding.
+        if saw_east and grid[current_cell + 1] == 0 {
+            grid[current_cell] = -nbd
+        } elif grid[current_cell] == 1 {
+            grid[current_cell] = nbd
         }
         points.push(Point(current_x, current_y))
 
-        if next_y == start_y and next_x == start_x and current_y == first_y and current_x == first_x {
-            break
-        }
-        previous_y = current_y
-        previous_x = current_x
-        current_y = next_y
-        current_x = next_x
+        if next_cell == start_cell and current_cell == first_cell { break }
+        back = (next_step + 4) % 8
+        current_cell = next_cell
+        current_y += STEP_Y[next_step]
+        current_x += STEP_X[next_step]
     }
     return points
 }
 
 fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
+    #: A ring of zeros around the picture, so that neither the scan nor the
+    #: walk has to ask whether a neighbour exists. The row length grows by two
+    #: and every cell moves by one row and one column.
+    let stride = cols + 2
     var grid: list[int] = []
-    for value in values { grid.push(if value != 0.0 { 1 } else { 0 }) }
+    for _index in 0..stride { grid.push(0) }
+    for y in 0..rows {
+        let base = y * cols
+        grid.push(0)
+        for x in 0..cols { grid.push(if values[base + x] != 0.0 { 1 } else { 0 }) }
+        grid.push(0)
+    }
+    for _index in 0..stride { grid.push(0) }
+
+    #: The eight steps as single additions in that numbering.
+    var offsets: list[int] = []
+    for step in 0..8 { offsets.push(STEP_Y[step] * stride + STEP_X[step]) }
 
     #: The image is treated as sitting inside a frame border numbered one,
     #: which is a hole border; every top-level shape is a child of it.
@@ -208,11 +220,13 @@ fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
 
     for y in 0..rows {
         var last_nbd = 1
+        let row = (y + 1) * stride + 1
         for x in 0..cols {
-            let here = grid[y * cols + x]
+            let cell = row + x
+            let here = grid[cell]
             if here == 0 { continue }
-            let west = if x == 0 { 0 } else { grid[y * cols + x - 1] }
-            let east = if x == cols - 1 { 0 } else { grid[y * cols + x + 1] }
+            let west = grid[cell - 1]
+            let east = grid[cell + 1]
             let outer = here == 1 and west == 0
             let hole = not outer and here >= 1 and east == 0
             if not outer and not hole {
@@ -220,10 +234,9 @@ fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
                 continue
             }
             nbd += 1
-            var from_y = y
-            var from_x = x - 1
+            var entry = 4
             if not outer {
-                from_x = x + 1
+                entry = 0
                 if here > 1 { last_nbd = here }
             }
             let previous_outer = kind_outer[last_nbd - 1]
@@ -240,11 +253,11 @@ fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
                     kind_parent[last_nbd - 1]
                 }
             }
-            let points = follow(grid, rows, cols, y, x, from_y, from_x, nbd)
+            let points = follow(grid, offsets, cell, y, x, entry, nbd)
             kind_outer.push(outer)
             kind_parent.push(parent)
             found.push(Border(nbd, points, outer, parent))
-            let after = grid[y * cols + x]
+            let after = grid[cell]
             if after != 1 { last_nbd = abs(after) }
         }
     }
