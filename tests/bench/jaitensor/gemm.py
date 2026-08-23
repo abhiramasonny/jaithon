@@ -18,6 +18,43 @@ def gemm_batch(level: str) -> int:
 WARMUP = 24
 
 
+# How long each shape should be timed for, in seconds. See the note in
+# gemm.jai: a fixed repeat count left the small shapes measured over a few
+# milliseconds and the large ones over hundreds, and several swung 7-11%
+# between runs. Both sides calibrate to this same target.
+TARGET_SECONDS = 0.15
+MIN_REPEATS = 40
+MAX_REPEATS = 4096
+
+
+def repeats_for(rows: int, inner: int, columns: int, floor: int, trans_a=False, trans_b=False) -> int:
+    if trans_a:
+        a = torch.randn(inner, rows, device="mps")
+        b = torch.randn(inner, columns, device="mps")
+        mul = lambda: torch.matmul(a.T, b).float()
+    elif trans_b:
+        a = torch.randn(rows, inner, device="mps")
+        b = torch.randn(columns, inner, device="mps")
+        mul = lambda: torch.matmul(a, b.T).float()
+    else:
+        a = torch.randn(rows, inner, device="mps")
+        b = torch.randn(inner, columns, device="mps")
+        mul = lambda: torch.matmul(a, b).float()
+    with torch.autocast(device_type="mps", dtype=torch.float16, cache_enabled=False):
+        for _ in range(WARMUP):
+            mul()
+    torch.mps.synchronize()
+    started = time.perf_counter()
+    with torch.autocast(device_type="mps", dtype=torch.float16, cache_enabled=False):
+        for _ in range(8):
+            mul()
+    torch.mps.synchronize()
+    each = (time.perf_counter() - started) / 8
+    if each <= 0.0:
+        return MAX_REPEATS
+    return max(floor, min(MAX_REPEATS, int(TARGET_SECONDS / each)))
+
+
 def time_shape(rows: int, inner: int, columns: int, repeats: int, trans_a=False, trans_b=False):
     if trans_a:
         a = torch.randn(inner, rows, device="mps")
@@ -78,10 +115,17 @@ def main() -> None:
         ("fashion-xl-W-TN", 784, batch, 4096, True, False),
         ("mnist-xl-L1", batch, 784, 8192, False, False),
     ]:
-        seconds, valid = time_shape(rows, inner, columns, repeats, trans_a, trans_b)
+        counted = repeats_for(
+            rows, inner, columns, max(repeats, MIN_REPEATS), trans_a, trans_b
+        )
+        seconds, valid = time_shape(rows, inner, columns, counted, trans_a, trans_b)
+        # Reported as though it had run `repeats` times; see the note in
+        # gemm.jai. The suite needs the work figure to be a property of the
+        # shape so samples from different runs can be pooled.
+        scaled = seconds / counted * repeats
         flops = 2 * rows * inner * columns * repeats
         check = "ok" if valid else "invalid"
-        print(f"jtb\t{name}\t{seconds:.9f}\t{flops}\t0\t{check}\tamp-f16-f32/mps")
+        print(f"jtb\t{name}\t{scaled:.9f}\t{flops}\t0\t{check}\tamp-f16-f32/mps")
 
 
 if __name__ == "__main__":

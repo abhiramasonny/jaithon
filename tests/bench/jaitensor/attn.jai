@@ -8,6 +8,47 @@ from std.time import Instant
 #: Dispatches to run before the clock starts. See gemm.jai.
 let WARMUP = 24
 
+#: How long each shape should be timed for, in seconds.
+#:
+#: A fixed repeat count times the small shapes for almost no time at all: 24
+#: repeats of `attn-256` is two and a half milliseconds, which is launch and
+#: synchronisation noise with a kernel somewhere inside it, and its run-to-run
+#: spread reached 28% -- enough to move the shape from a win to a loss and
+#: back between two runs of the same binary. Timing every shape for the same
+#: DURATION instead puts them all on the same footing; the peer calibrates
+#: against the same target, so each side measures itself for a sixth of a
+#: second and the comparison is between per-call times.
+let TARGET_SECONDS = 0.15
+let MIN_REPEATS = 24
+let MAX_REPEATS = 4096
+
+#: How many repeats of this shape fill `TARGET_SECONDS`, from a short probe.
+fn repeats_for(seq: int, dim: int, heads: int, floor: int) -> int {
+    let q = Tensor([seq, dim])
+    let k = Tensor([seq, dim])
+    let v = Tensor([seq, dim])
+    defer { q.free() }
+    defer { k.free() }
+    defer { v.free() }
+    for _warm in 0..WARMUP {
+        let throwaway = multi_head_attention(q, k, v, heads)
+        throwaway.free()
+    }
+    gpu.synchronize()
+    let started = Instant.now()
+    for _probe in 0..8 {
+        let throwaway = multi_head_attention(q, k, v, heads)
+        throwaway.free()
+    }
+    gpu.synchronize()
+    let each = started.elapsed().to_seconds() / 8.0
+    if each <= 0.0 { return MAX_REPEATS }
+    let wanted = int(TARGET_SECONDS / each)
+    if wanted < floor { return floor }
+    if wanted > MAX_REPEATS { return MAX_REPEATS }
+    return wanted
+}
+
 fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool] {
     let q = Tensor([seq, dim])
     let k = Tensor([seq, dim])
@@ -74,11 +115,14 @@ fn main() -> int {
         [("attn-256", 256, 256, 8), ("attn-512", 512, 512, 8), ("attn-1024", 1024, 512, 8), ("attn-1024-wide", 1024, 1024, 16), ("attn-2048", 2048, 1024, 16), ("attn-4096", 4096, 1024, 16)]
     }
     for (name, seq, dim, heads) in shapes {
-        let (seconds, valid) = time_attn(seq, dim, heads, repeats)
-        if verbose { print(f"{name}: {seconds / float(repeats):.6f}s") }
+        let counted = repeats_for(seq, dim, heads, max(repeats, MIN_REPEATS))
+        let (seconds, valid) = time_attn(seq, dim, heads, counted)
+        if verbose { print(f"{name}: {seconds / float(counted):.6f}s") }
+        #: Reported as though it had run `repeats` times; see gemm.jai.
+        let scaled = seconds / float(counted) * float(repeats)
         let flops = 4 * seq * seq * dim * repeats
         let check = if valid { "ok" } else { "invalid" }
-        print(f"jtb\t{name}\t{seconds:.9f}\t{flops}\t0\t{check}\tamp-f16-f32")
+        print(f"jtb\t{name}\t{scaled:.9f}\t{flops}\t0\t{check}\tamp-f16-f32")
     }
     return 0
 }

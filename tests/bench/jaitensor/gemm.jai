@@ -25,6 +25,47 @@ fn gemm_batch(level: str) -> int {
     return 4096
 }
 
+#: How long each shape should be timed for, in seconds.
+#:
+#: A fixed repeat count leaves the small shapes measured over a few
+#: milliseconds and the large ones over hundreds, so their run-to-run spreads
+#: are nothing alike -- several shapes here swung by 7 to 11% between runs of
+#: the same binary, which is enough to move a row from a win to a loss. Timing
+#: every shape for the same duration puts them on the same footing. The peer
+#: calibrates against the same target, so each side measures itself for a
+#: sixth of a second and the comparison is between per-call times.
+let TARGET_SECONDS = 0.15
+let MIN_REPEATS = 40
+let MAX_REPEATS = 4096
+
+#: How many repeats of this shape fill `TARGET_SECONDS`, from a short probe.
+fn repeats_for(
+    rows: int,
+    inner: int,
+    columns: int,
+    floor: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    let a = if trans_a { Tensor([inner, rows]) } else { Tensor([rows, inner]) }
+    let b = if trans_b { Tensor([columns, inner]) } else { Tensor([inner, columns]) }
+    let out = Tensor([rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { out.free() }
+    for _warm in 0..WARMUP { matmul(a, b, trans_a: trans_a, trans_b: trans_b, out: out) }
+    gpu.synchronize()
+    let started = Instant.now()
+    for _probe in 0..8 { matmul(a, b, trans_a: trans_a, trans_b: trans_b, out: out) }
+    gpu.synchronize()
+    let each = started.elapsed().to_seconds() / 8.0
+    if each <= 0.0 { return MAX_REPEATS }
+    let wanted = int(TARGET_SECONDS / each)
+    if wanted < floor { return floor }
+    if wanted > MAX_REPEATS { return MAX_REPEATS }
+    return wanted
+}
+
 fn time_shape(
     rows: int,
     inner: int,
@@ -101,18 +142,34 @@ fn main() -> int {
         ("mnist-xl-L1", batch, 784, 8192, false, false),
     ]
     for (name, rows, inner, columns, trans_a, trans_b) in shapes {
+        let counted = repeats_for(
+            rows,
+            inner,
+            columns,
+            max(repeats, MIN_REPEATS),
+            trans_a: trans_a,
+            trans_b: trans_b
+        )
         let (seconds, valid) = time_shape(
             rows,
             inner,
             columns,
-            repeats,
+            counted,
             trans_a: trans_a,
             trans_b: trans_b
         )
+        #: Reported as though it had run `repeats` times, whatever it
+        #: actually ran. The calibration above picks a different count per
+        #: shape and per run, and the suite needs the work figure to be a
+        #: property of the shape -- otherwise every run disagrees with the
+        #: last about how much work a row stands for, and the samples cannot
+        #: be pooled. Scaling keeps the column meaning what it used to.
+        let each = seconds / float(counted)
+        let scaled = each * float(repeats)
         let flops = 2 * rows * inner * columns * repeats
         let check = if valid { "ok" } else { "invalid" }
         let backend = matmul_backend(rows, inner, columns, trans_a: trans_a, trans_b: trans_b)
-        print(f"jtb\t{name}\t{seconds:.9f}\t{flops}\t0\t{check}\tamp-f16-f32/{backend}")
+        print(f"jtb\t{name}\t{scaled:.9f}\t{flops}\t0\t{check}\tamp-f16-f32/{backend}")
     }
     return 0
 }
