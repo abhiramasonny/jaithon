@@ -164,44 +164,129 @@ kernel void hough_accumulate(device const float* src [[buffer(0)]],
 
 /* The votes are counted as integers and read back as numbers, and a buffer of
  * one read as the other is a pile of denormals. */
-/* Corners that beat their eight neighbours, written out already compacted.
- *
- * The alternative is reading the whole response back and doing the test on the
- * host, which for a 1080p frame is two million boxed floats and eighteen
- * million comparisons before any corner has been chosen. Here every pixel
- * tests itself and only the survivors -- a few thousand at most -- travel. */
-kernel void corner_peaks(device const float* response [[buffer(0)]],
-                         device const float* mask [[buffer(1)]],
-                         device atomic_uint* counter [[buffer(2)]],
-                         device float* cells [[buffer(3)]],
-                         device float* scores [[buffer(4)]],
-                         constant uint& rows [[buffer(5)]],
-                         constant uint& cols [[buffer(6)]],
-                         constant uint& r_off [[buffer(7)]],
-                         constant uint& r_step [[buffer(8)]],
-                         constant uint& m_off [[buffer(9)]],
-                         constant uint& m_step [[buffer(10)]],
-                         constant uint& use_mask [[buffer(11)]],
-                         constant uint& floor_bits [[buffer(12)]],
-                         constant uint& limit [[buffer(13)]],
-                         uint id [[thread_position_in_grid]]) {
-    if (id >= rows * cols) return;
+/* Whether a pixel beats its eight neighbours, asked the same way twice: once
+ * to count the survivors and once to place them. */
+inline bool corner_wins(device const float* response, device const float* mask,
+                        uint id, uint rows, uint cols, uint r_off, uint r_step,
+                        uint m_off, uint m_step, uint use_mask, float floor_value) {
+    if (id >= rows * cols) return false;
     uint y = id / cols;
     uint x = id - y * cols;
-    if (y == 0u || x == 0u || y + 1u >= rows || x + 1u >= cols) return;
+    if (y == 0u || x == 0u || y + 1u >= rows || x + 1u >= cols) return false;
     float here = response[r_off + y * r_step + x];
-    if (here < as_type<float>(floor_bits)) return;
-    if (use_mask != 0u && mask[m_off + y * m_step + x] == 0.0f) return;
+    if (here < floor_value) return false;
+    if (use_mask != 0u && mask[m_off + y * m_step + x] == 0.0f) return false;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dy == 0 && dx == 0) continue;
-            if (response[r_off + uint(int(y) + dy) * r_step + uint(int(x) + dx)] > here) return;
+            if (response[r_off + uint(int(y) + dy) * r_step + uint(int(x) + dx)] > here) {
+                return false;
+            }
         }
     }
-    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    return true;
+}
+
+/* How many each threadgroup found. */
+kernel void corner_count(device const float* response [[buffer(0)]],
+                         device const float* mask [[buffer(1)]],
+                         device uint* tallies [[buffer(2)]],
+                         constant uint& rows [[buffer(3)]],
+                         constant uint& cols [[buffer(4)]],
+                         constant uint& r_off [[buffer(5)]],
+                         constant uint& r_step [[buffer(6)]],
+                         constant uint& m_off [[buffer(7)]],
+                         constant uint& m_step [[buffer(8)]],
+                         constant uint& use_mask [[buffer(9)]],
+                         constant uint& floor_bits [[buffer(10)]],
+                         uint id [[thread_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]],
+                         uint wid [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint lanes[32];
+    bool wins = corner_wins(response, mask, id, rows, cols, r_off, r_step,
+                            m_off, m_step, use_mask, as_type<float>(floor_bits));
+    if (lid < 32u) lanes[lid] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint total = simd_sum(wins ? 1u : 0u);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    uint sum = 0u;
+    for (uint j = 0u; j < 32u; j++) sum += lanes[j];
+    tallies[wid] = sum;
+}
+
+/* Where each threadgroup's finds begin, which is everything the groups
+ * before it found. One thread walks the list, because there are a few
+ * thousand of them and the walk is over before a second dispatch would have
+ * started. */
+kernel void corner_scan(device uint* tallies [[buffer(0)]],
+                        device uint* bases [[buffer(1)]],
+                        device float* total [[buffer(2)]],
+                        constant uint& groups [[buffer(3)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id != 0u) return;
+    uint running = 0u;
+    for (uint g = 0u; g < groups; ++g) {
+        bases[g] = running;
+        running += tallies[g];
+    }
+    total[0] = float(running);
+}
+
+/* The finds written where they belong: group by group, and inside a group in
+ * the order the pixels come.
+ *
+ * An atomic counter would be shorter but hands them back in whatever order
+ * the threads reached it, and the sort that follows is stable -- so the same
+ * frame would answer differently twice, and equal-strength corners would be
+ * separated on a coin toss rather than by which came first. */
+kernel void corner_emit(device const float* response [[buffer(0)]],
+                        device const float* mask [[buffer(1)]],
+                        device const uint* bases [[buffer(2)]],
+                        device float* cells [[buffer(3)]],
+                        device float* scores [[buffer(4)]],
+                        constant uint& rows [[buffer(5)]],
+                        constant uint& cols [[buffer(6)]],
+                        constant uint& r_off [[buffer(7)]],
+                        constant uint& r_step [[buffer(8)]],
+                        constant uint& m_off [[buffer(9)]],
+                        constant uint& m_step [[buffer(10)]],
+                        constant uint& use_mask [[buffer(11)]],
+                        constant uint& floor_bits [[buffer(12)]],
+                        constant uint& limit [[buffer(13)]],
+                        uint id [[thread_position_in_grid]],
+                        uint lid [[thread_index_in_threadgroup]],
+                        uint wid [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint lanes[32];
+    threadgroup uint warp_base[32];
+    bool wins = corner_wins(response, mask, id, rows, cols, r_off, r_step,
+                            m_off, m_step, use_mask, as_type<float>(floor_bits));
+    uint rank = simd_prefix_exclusive_sum(wins ? 1u : 0u);
+    uint total = simd_sum(wins ? 1u : 0u);
+    if (lid < 32u) lanes[lid] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        uint running = 0u;
+        for (uint j = 0u; j < 32u; j++) {
+            warp_base[j] = running;
+            running += lanes[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!wins) return;
+    uint slot = bases[wid] + warp_base[warp] + rank;
     if (slot >= limit) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
     cells[slot] = float(id);
-    scores[slot] = here;
+    scores[slot] = response[r_off + y * r_step + x];
 }
 
 kernel void hough_collect(device const uint* votes [[buffer(0)]],
@@ -530,6 +615,10 @@ pub fn corner_min_eigen_val(src: Mat, block_size: int = 3, aperture_size: int = 
 #: the rest are taken in order of strength, skipping any that fall within
 #: `min_distance` of one already taken. `use_harris` picks Harris's response
 #: instead of Shi and Tomasi's.
+#: How many threads a corner-hunting group runs, which is also how the
+#: groups' finds are numbered off against each other.
+const CORNER_GROUP = 256
+
 pub fn good_features_to_track(
     image: Mat,
     max_corners: int,
@@ -560,39 +649,54 @@ pub fn good_features_to_track(
     #: Every pixel could be a peak -- a flat response above the floor makes
     #: them all one -- so the room set aside is the whole frame.
     let limit = rows * cols
-    let counter = Buffer(1)
-    counter.fill_zero()
+    let groups = (limit + CORNER_GROUP - 1) // CORNER_GROUP
+    let opened = if mask_image is null { 0 } else { 1 }
+    let where = [
+        rows,
+        cols,
+        response.offset,
+        response.step_,
+        plane.offset,
+        plane.step_,
+        opened,
+        f32_bits(floor_value),
+    ]
+    let tallies = Buffer(groups)
+    let bases = Buffer(groups)
+    let total = Buffer(1)
+    kernel_for("corner_count").dispatch_async(
+        [response.storage, plane.storage, tallies],
+        groups * CORNER_GROUP,
+        where,
+        group_size: CORNER_GROUP
+    )
+    kernel_for("corner_scan").dispatch_async([tallies, bases, total], 1, [groups])
     let cells = Buffer(limit)
     let scores = Buffer(limit)
-    kernel_for("corner_peaks").dispatch_async([response.storage, plane.storage, counter, cells, scores], limit, [rows, cols, response.offset, response.step_, plane.offset, plane.step_, if mask_image is null {
-        0
-    } else {
-        1
-    }, f32_bits(floor_value), limit])
-    #: The counter is atomic, so its bits are an integer; read as a float
-    #: straight out of the buffer they come back as a denormal.
-    let counted = Buffer(1)
-    kernel_for("hough_collect").dispatch_async([counter, counted], 1, [1])
-    let found = min(limit, int(counted.download()[0]))
-    counted.free()
+    kernel_for("corner_emit").dispatch_async(
+        [response.storage, plane.storage, bases, cells, scores],
+        groups * CORNER_GROUP,
+        where + [limit],
+        group_size: CORNER_GROUP
+    )
+    let found = min(limit, int(total.download()[0]))
     let candidates = if found == 0 { [] } else { cells.download(count: found) }
     let strengths = if found == 0 { [] } else { scores.download(count: found) }
-    counter.free()
+    tallies.free()
+    bases.free()
+    total.free()
     cells.free()
     scores.free()
 
-    #: Strongest first. Inserting each candidate into a sorted list instead
-    #: makes the work grow with the square of how many there are, and on a
-    #: textured frame there are tens of thousands: 640 by 480 took 28 seconds
-    #: that way, nearly all of it shuffling a list along.
+    #: Strongest first, and equal strengths in the order they were found --
+    #: which is raster order, because that is how the device laid them out.
+    #: Inserting each candidate into a sorted list instead makes the work grow
+    #: with the square of how many there are, and on a textured frame there
+    #: are tens of thousands: 640 by 480 took 28 seconds that way, nearly all
+    #: of it shuffling a list along.
     var order: list[int] = []
     for index in 0..found { order.push(index) }
-    #: Back into raster order first. The device hands its finds back in
-    #: whatever order the threads reached the counter, and the sort below is
-    #: stable, so without this two corners of equal strength are separated
-    #: differently from one run to the next and the same frame answers twice.
-    let raster = order.sort(key: |index| candidates[index])
-    let ordered = raster.sort(key: |index| strengths[index], reverse: true)
+    let ordered = order.sort(key: |index| strengths[index], reverse: true)
 
     var kept: list[Point2f] = []
     let squared = min_distance * min_distance
