@@ -466,6 +466,41 @@ fn texture_at(x: float, y: float) -> float {
 #: answer came back wrong: the worst residual for a 12 by 12 was 2e-02 and
 #: for a 16 by 16 was 3e-01, against 1e-07 for a 6 by 6. `pose_from_dlt`
 #: solves a 12 by 12, so this reached the pose solver.
+#: Two classes on the same mean, one a hundred times wider than the other.
+#:
+#: A Gaussian's log density is `log prior - 0.5 log|C| - 0.5 d`, and the
+#: middle term was missing. Without it a wide class always wins: distance to
+#: its centre counts for less and nothing pays for the volume that buys. Every
+#: point but the mean itself went to the wide class, at any distance.
+fn test_a_bayes_classifier_pays_for_a_wide_class() -> void {
+    if not have_gpu() { return }
+    var seed = 5
+    var samples: list[float] = []
+    var labels: list[float] = []
+    for _index in 0..200 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        samples.push((float(seed % 2000) / 1000.0 - 1.0) * 0.1)
+        labels.push(0.0)
+    }
+    for _index in 0..200 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        samples.push((float(seed % 2000) / 1000.0 - 1.0) * 10.0)
+        labels.push(1.0)
+    }
+    let model = normal_bayes_classifier_create()
+    model.train(Mat.from_list(400, 1, CV_32FC1, samples), Mat.from_list(400, 1, CV_32FC1, labels))
+    #: Near the shared mean the narrow class is far likelier.
+    for near in [0.0, 0.001, 0.01, 0.05] {
+        let got = model.predict(Mat.from_list(1, 1, CV_32FC1, [near])).values()[0]
+        assert_eq(int(got), 0)
+    }
+    #: Well outside it, only the wide class can account for the point.
+    for far in [1.0, 3.0, 7.0] {
+        let got = model.predict(Mat.from_list(1, 1, CV_32FC1, [far])).values()[0]
+        assert_eq(int(got), 1)
+    }
+}
+
 fn test_a_large_symmetric_matrix_is_fully_diagonalised() -> void {
     if not have_gpu() { return }
     var seed = 17
@@ -581,6 +616,7 @@ fn test_video_run() -> void {
     test_optical_flow_finds_the_shift()
     test_canny_answers_the_same_twice()
     test_a_large_symmetric_matrix_is_fully_diagonalised()
+    test_a_bayes_classifier_pays_for_a_wide_class()
     test_canny_follows_a_long_weak_edge()
 
     let (steps, settled) = mean_shift(a, Rect(10, 20, 20, 20))

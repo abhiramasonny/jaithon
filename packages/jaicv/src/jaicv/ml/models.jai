@@ -15,7 +15,7 @@
 #: let predicted = model.predict(unseen)
 #: ```
 import std.math
-from ..core.linalg import inverse, matmul, transpose
+from ..core.linalg import inverse, matmul, symmetric_eigen, transpose
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE
 
@@ -237,7 +237,22 @@ pub class NormalBayesClassifier {
             let matrix = Mat.from_list(width, width, CV_MAKETYPE(CV_32F, 1), covariance)
             self.means.push(centre)
             self.inverses.push(inverse(matrix))
-            self.offsets.push(math.log(float(members.len()) / float(rows.len())))
+            #: The spread of the class as well as how often it occurs.
+            #:
+            #: A Gaussian's log density is `log prior - 0.5 log|C| - 0.5 d`,
+            #: and only the last two terms were here. Without the middle one
+            #: a wide class always looks likelier than a narrow one, because
+            #: distance to its centre counts for less and nothing pays for
+            #: the volume that buys: two classes on the same mean, one spread
+            #: a hundred times wider, and every point but the mean itself was
+            #: given to the wide one. The covariance is symmetric and has a
+            #: ridge added, so its eigenvalues are positive and their logs
+            #: sum to the log determinant.
+            let (spread, _axes) = symmetric_eigen(matrix)
+            var log_volume = 0.0
+            for value in spread { log_volume += math.log(max(value, 1e-30)) }
+            let prior = math.log(float(members.len()) / float(rows.len()))
+            self.offsets.push(prior - 0.5 * log_volume)
         }
         return true
     }
