@@ -18,6 +18,7 @@ import std.math
 from std.core import Printable
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_32S, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scalar
+from std.gpu import Buffer, Kernel
 
 #: Fill only where the neighbour's value is close to the seed's.
 pub const FLOODFILL_FIXED_RANGE = 1 << 16
@@ -70,6 +71,238 @@ fn neighbourhood(connectivity: int) -> tuple[list[int], list[int]] {
 #:
 #: Returns the number of pixels filled and the box they occupy, which is what
 #: OpenCV returns as well.
+let SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+/* Where a pixel falls in the order components are first met.
+ *
+ * Four-connected scanning is pixel by pixel, so that is the linear index.
+ * Eight-connected is two by two blocks, because every foreground pixel in
+ * such a block is connected to every other -- which is how OpenCV numbers
+ * them, and the numbering is what a caller sees. */
+inline uint scan_position(uint y, uint x, uint cols, uint connectivity) {
+    if (connectivity == 4u) return y * cols + x;
+    uint blocks = (cols + 1u) / 2u;
+    return ((y / 2u) * blocks + (x / 2u)) * 4u + (y % 2u) * 2u + (x % 2u);
+}
+
+/* Every foreground pixel starts as its own component, named for where it is.
+ * Background keeps zero, which no pixel can be confused with because the
+ * names are one-based. */
+kernel void cc_seed(device const float* src [[buffer(0)]],
+                    device uint* labels [[buffer(1)]],
+                    constant uint& count [[buffer(2)]],
+                    constant uint& cols [[buffer(3)]],
+                    constant uint& off [[buffer(4)]],
+                    constant uint& step [[buffer(5)]],
+                    uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    labels[id] = src[off + y * step + x] != 0.0f ? id + 1u : 0u;
+}
+
+/* One round of joining: a pixel that can see a smaller name than its own
+ * tells its own component's root about it.
+ *
+ * Writing to the root rather than to the neighbour is what makes this
+ * converge -- two halves of a component that meet anywhere pull their whole
+ * chains together, instead of the news travelling one pixel a round. */
+kernel void cc_propagate(device atomic_uint* labels [[buffer(0)]],
+                         device atomic_uint* changed [[buffer(1)]],
+                         constant uint& count [[buffer(2)]],
+                         constant uint& rows [[buffer(3)]],
+                         constant uint& cols [[buffer(4)]],
+                         constant uint& connectivity [[buffer(5)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint mine = atomic_load_explicit(&labels[id], memory_order_relaxed);
+    if (mine == 0u) return;
+    int y = int(id / cols);
+    int x = int(id - uint(y) * cols);
+    uint best = mine;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dy == 0 && dx == 0) continue;
+            if (connectivity == 4u && dy != 0 && dx != 0) continue;
+            int ny = y + dy;
+            int nx = x + dx;
+            if (ny < 0 || nx < 0 || ny >= int(rows) || nx >= int(cols)) continue;
+            uint other = atomic_load_explicit(&labels[uint(ny) * cols + uint(nx)],
+                                              memory_order_relaxed);
+            if (other != 0u && other < best) best = other;
+        }
+    }
+    if (best >= mine) return;
+    atomic_fetch_min_explicit(&labels[mine - 1u], best, memory_order_relaxed);
+    atomic_store_explicit(changed, 1u, memory_order_relaxed);
+}
+
+/* Follow every chain to its end and point straight at it, so the next round
+ * of joining compares roots rather than whatever it was told last. */
+kernel void cc_flatten(device atomic_uint* labels [[buffer(0)]],
+                       constant uint& count [[buffer(1)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint mine = atomic_load_explicit(&labels[id], memory_order_relaxed);
+    if (mine == 0u) return;
+    uint root = mine;
+    for (uint guard = 0u; guard < 64u; ++guard) {
+        uint up = atomic_load_explicit(&labels[root - 1u], memory_order_relaxed);
+        if (up == root || up == 0u) break;
+        root = up;
+    }
+    if (root != mine) atomic_store_explicit(&labels[id], root, memory_order_relaxed);
+}
+
+kernel void cc_reset(device uint* slots [[buffer(0)]],
+                     constant uint& count [[buffer(1)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    slots[id] = 0xFFFFFFFFu;
+}
+
+/* The earliest place each component is met, kept against its root. */
+kernel void cc_first_seen(device const uint* labels [[buffer(0)]],
+                          device atomic_uint* first [[buffer(1)]],
+                          constant uint& count [[buffer(2)]],
+                          constant uint& cols [[buffer(3)]],
+                          constant uint& connectivity [[buffer(4)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint mine = labels[id];
+    if (mine == 0u) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    atomic_fetch_min_explicit(&first[mine - 1u], scan_position(y, x, cols, connectivity),
+                              memory_order_relaxed);
+}
+
+/* One entry per component: which pixel is its root, and where it was first
+ * met. Only these travel to the host, and there are as many of them as there
+ * are components rather than as there are pixels. */
+kernel void cc_collect(device const uint* labels [[buffer(0)]],
+                       device const uint* first [[buffer(1)]],
+                       device atomic_uint* counter [[buffer(2)]],
+                       device float* roots [[buffer(3)]],
+                       device float* seen [[buffer(4)]],
+                       constant uint& count [[buffer(5)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    if (labels[id] != id + 1u) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot >= count) return;
+    roots[slot] = float(id);
+    seen[slot] = float(first[id]);
+}
+
+/* The new numbering scattered back against the roots it belongs to. */
+kernel void cc_assign(device const float* ordered [[buffer(0)]],
+                      device uint* remap [[buffer(1)]],
+                      constant uint& count [[buffer(2)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    remap[uint(ordered[id])] = id + 1u;
+}
+
+kernel void cc_apply(device const uint* labels [[buffer(0)]],
+                     device const uint* remap [[buffer(1)]],
+                     device float* dst [[buffer(2)]],
+                     constant uint& count [[buffer(3)]],
+                     constant uint& cols [[buffer(4)]],
+                     constant uint& d_off [[buffer(5)]],
+                     constant uint& d_step [[buffer(6)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint mine = labels[id];
+    dst[d_off + y * d_step + x] = mine == 0u ? 0.0f : float(remap[mine - 1u]);
+}
+
+/* A sum too wide for one word, carried into a second.
+ *
+ * The x coordinates of every pixel of a 4K frame come to thirty-two billion,
+ * so a single `uint` wraps. The carry costs one predictable branch that is
+ * almost never taken. */
+inline void add_wide(device atomic_uint* slot, uint value) {
+    uint before = atomic_fetch_add_explicit(&slot[0], value, memory_order_relaxed);
+    if (before + value < before) atomic_fetch_add_explicit(&slot[1], 1u, memory_order_relaxed);
+}
+
+/* Extremes start where nothing can beat them: the smallest at the top of the
+ * range and the largest at the bottom. Seeding both ends the same way leaves
+ * whichever comparison points the wrong way untouched for ever. */
+kernel void cc_reset_box(device uint* boxes [[buffer(0)]],
+                         constant uint& count [[buffer(1)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    boxes[id] = (id % 4u) < 2u ? 0xFFFFFFFFu : 0u;
+}
+
+/* Each component's extent and weight, gathered by the pixels themselves.
+ *
+ * A handful of atomics a pixel against a host loop over every pixel of the
+ * frame, which for a 640 by 480 picture was most of what the labelling cost
+ * once the labelling itself moved to the device. */
+kernel void cc_stats(device const float* labels [[buffer(0)]],
+                     device atomic_uint* boxes [[buffer(1)]],
+                     device atomic_uint* sums [[buffer(2)]],
+                     constant uint& count [[buffer(3)]],
+                     constant uint& cols [[buffer(4)]],
+                     constant uint& l_off [[buffer(5)]],
+                     constant uint& l_step [[buffer(6)]],
+                     constant uint& components [[buffer(7)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint label = uint(labels[l_off + y * l_step + x]);
+    if (label >= components) return;
+    device atomic_uint* box = &boxes[label * 4u];
+    atomic_fetch_min_explicit(&box[0], x, memory_order_relaxed);
+    atomic_fetch_min_explicit(&box[1], y, memory_order_relaxed);
+    atomic_fetch_max_explicit(&box[2], x, memory_order_relaxed);
+    atomic_fetch_max_explicit(&box[3], y, memory_order_relaxed);
+    device atomic_uint* sum = &sums[label * 6u];
+    add_wide(&sum[0], 1u);
+    add_wide(&sum[2], x);
+    add_wide(&sum[4], y);
+}
+
+/* A word in two halves, because a float32 cannot carry thirty-two bits of
+ * integer and rounds the top of the range -- which is how an untouched
+ * extreme came back as four billion and one rather than four billion. */
+kernel void cc_split(device const uint* src [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant uint& count [[buffer(2)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint value = src[id];
+    out[id * 2u + 0u] = float(value & 0xFFFFu);
+    out[id * 2u + 1u] = float(value >> 16u);
+}
+
+
+kernel void cc_tally(device const uint* value [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant uint& count [[buffer(2)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    out[id] = float(value[id]);
+}
+"""
+
+var _kernels: dict[str, Kernel] = {}
+
+fn kernel_for(entry: str) -> Kernel {
+    let existing = _kernels.get(entry, null)
+    if existing is not null { return existing }
+    let compiled = Kernel.compile(SOURCE, entry)
+    _kernels[entry] = compiled
+    return compiled
+}
+
 pub fn flood_fill(
     image: Mat,
     seed: Point,
@@ -145,118 +378,6 @@ pub fn flood_fill(
     return (count, Rect(left, top, right - left + 1, bottom - top + 1))
 }
 
-fn scan_order(rows: int, cols: int, connectivity: int) -> list[int] {
-    var order: list[int] = []
-    if connectivity == 4 {
-        for cell in 0..rows * cols { order.push(cell) }
-        return order
-    }
-    for block_y in 0..(rows + 1) // 2 {
-        for block_x in 0..(cols + 1) // 2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let y = block_y * 2 + dy
-                    let x = block_x * 2 + dx
-                    if y < rows and x < cols { order.push(y * cols + x) }
-                }
-            }
-        }
-    }
-    return order
-}
-
-fn find_root(parent: list[int], start: int) -> int {
-    var root = start
-    while parent[root] != root { root = parent[root] }
-    var walk = start
-    while parent[walk] != walk {
-        let next = parent[walk]
-        parent[walk] = root
-        walk = next
-    }
-    return root
-}
-
-fn union_labels(parent: list[int], a: int, b: int) -> void {
-    let ra = find_root(parent, a)
-    let rb = find_root(parent, b)
-    if ra == rb { return }
-    if ra < rb { parent[rb] = ra } else { parent[ra] = rb }
-}
-
-fn label_pass(
-    values: list[float],
-    rows: int,
-    cols: int,
-    connectivity: int
-) -> tuple[int, list[int]] {
-    var provisional: list[int] = []
-    for _index in 0..rows * cols { provisional.push(0) }
-    var parent = [0]
-    var next_label = 1
-
-    for y in 0..rows {
-        for x in 0..cols {
-            let cell = y * cols + x
-            if values[cell] == 0.0 { continue }
-            #: Only the neighbours already visited matter, which for a raster
-            #: scan is the row above and the pixel to the left.
-            var found: list[int] = []
-            if x > 0 and provisional[cell - 1] != 0 { found.push(provisional[cell - 1]) }
-            if y > 0 {
-                if provisional[cell - cols] != 0 { found.push(provisional[cell - cols]) }
-                if connectivity == 8 {
-                    if x > 0 and provisional[cell - cols - 1] != 0 {
-                        found.push(provisional[cell - cols - 1])
-                    }
-                    if x + 1 < cols and provisional[cell - cols + 1] != 0 {
-                        found.push(provisional[cell - cols + 1])
-                    }
-                }
-            }
-            if found.len() == 0 {
-                provisional[cell] = next_label
-                parent.push(next_label)
-                next_label += 1
-                continue
-            }
-            var smallest = found[0]
-            for label in found {
-                if label < smallest { smallest = label }
-            }
-            provisional[cell] = smallest
-            for label in found { union_labels(parent, smallest, label) }
-        }
-    }
-
-    #: Labels are handed out in the order the components are first met, and
-    #: which order that is depends on the connectivity, because OpenCV scans
-    #: differently for each: pixel by pixel for four, and in two by two blocks
-    #: for eight, since every foreground pixel in such a block is connected to
-    #: every other. The partition is the same either way; only the numbering
-    #: moves, and the numbering is what a caller sees.
-    var renumbered: list[int] = []
-    for _index in 0..next_label { renumbered.push(0) }
-    var count = 1
-    for cell in scan_order(rows, cols, connectivity) {
-        if provisional[cell] == 0 { continue }
-        let root = find_root(parent, provisional[cell])
-        if renumbered[root] != 0 { continue }
-        renumbered[root] = count
-        count += 1
-    }
-
-    var labels: list[int] = []
-    for cell in 0..rows * cols {
-        if provisional[cell] == 0 {
-            labels.push(0)
-            continue
-        }
-        labels.push(renumbered[find_root(parent, provisional[cell])])
-    }
-    return (count, labels)
-}
-
 #: Label each connected run of non-zero pixels.
 #:
 #: Returns how many labels there are, counting the background as one, and an
@@ -268,10 +389,92 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
         throw ValueError(f"connectivity {connectivity} is neither four nor eight")
     }
     image.flush()
-    let (count, labels) = label_pass(image.values(), image.rows, image.cols, connectivity)
-    var values: list[float] = []
-    for label in labels { values.push(float(label)) }
-    return (count, Mat.from_list(image.rows, image.cols, CV_MAKETYPE(CV_32S, 1), values))
+    let rows = image.rows
+    let cols = image.cols
+    let count = rows * cols
+    let out = Mat(rows, cols, CV_MAKETYPE(CV_32S, 1))
+    if count == 0 { return (1, out) }
+
+    let labels = Buffer(count)
+    kernel_for("cc_seed").dispatch_async(
+        [image.storage, labels],
+        count,
+        [count, cols, image.offset, image.step_]
+    )
+
+    #: Join, then flatten, until a round finds nothing left to join. Each
+    #: round is two dispatches and the flag costs one short read, which is
+    #: why the check is not done per pixel.
+    let changed = Buffer(1)
+    let counted = Buffer(1)
+    let propagate = kernel_for("cc_propagate")
+    let flatten = kernel_for("cc_flatten")
+    var rounds = 0
+    while rounds < count {
+        rounds += 1
+        changed.fill_zero()
+        propagate.dispatch_async([labels, changed], count, [count, rows, cols, connectivity])
+        flatten.dispatch_async([labels], count, [count])
+        kernel_for("cc_tally").dispatch_async([changed, counted], 1, [1])
+        if counted.download()[0] == 0.0 { break }
+    }
+
+    #: The partition is settled; what remains is the numbering, and OpenCV
+    #: numbers by where a component was first met. Only one entry per
+    #: component travels for that, not one per pixel.
+    let first = Buffer(count)
+    kernel_for("cc_reset").dispatch_async([first], count, [count])
+    kernel_for("cc_first_seen").dispatch_async([labels, first], count, [count, cols, connectivity])
+    let tally = Buffer(1)
+    tally.fill_zero()
+    let roots = Buffer(count)
+    let seen = Buffer(count)
+    kernel_for("cc_collect").dispatch_async([labels, first, tally, roots, seen], count, [count])
+    kernel_for("cc_tally").dispatch_async([tally, counted], 1, [1])
+    let components = min(count, int(counted.download()[0]))
+
+    let remap = Buffer(count)
+    var total = 1
+    if components > 0 {
+        let root_list = roots.download(count: components)
+        let seen_list = seen.download(count: components)
+        var order: list[int] = []
+        for index in 0..components { order.push(index) }
+        let ordered = order.sort(key: |index| seen_list[index])
+        var flat: list[float] = []
+        for index in ordered { flat.push(root_list[index]) }
+        let placed = Buffer(components)
+        placed.upload(flat)
+        kernel_for("cc_assign").dispatch_async([placed, remap], components, [components])
+        placed.free()
+        total = components + 1
+    }
+    kernel_for("cc_apply").dispatch_async(
+        [labels, remap, out.storage],
+        count,
+        [count, cols, out.offset, out.step_]
+    )
+    out.invalidate()
+    labels.free()
+    changed.free()
+    counted.free()
+    first.free()
+    tally.free()
+    roots.free()
+    seen.free()
+    remap.free()
+    return (total, out)
+}
+
+#: One device word, put back together from the halves it travelled in.
+fn word_at(halves: list[float], index: int) -> float {
+    return halves[index * 2] + halves[index * 2 + 1] * 65536.0
+}
+
+#: A word and the carry that followed it, which is how a sum wider than
+#: thirty-two bits comes back.
+fn wide_at(halves: list[float], index: int) -> float {
+    return word_at(halves, index) + word_at(halves, index + 1) * 4294967296.0
 }
 
 #: Label the components and measure each one.
@@ -283,56 +486,48 @@ pub fn connected_components_with_stats(
     connectivity: int = 8
 ) -> tuple[int, Mat, list[ComponentStats], list[Point2f]] {
     let (count, labels) = connected_components(image, connectivity)
-    let values = labels.to_list()
-    var left: list[int] = []
-    var top: list[int] = []
-    var right: list[int] = []
-    var bottom: list[int] = []
-    var area: list[int] = []
-    var sum_x: list[float] = []
-    var sum_y: list[float] = []
-    for _index in 0..count {
-        left.push(image.cols)
-        top.push(image.rows)
-        right.push(-1)
-        bottom.push(-1)
-        area.push(0)
-        sum_x.push(0.0)
-        sum_y.push(0.0)
+    let pixels = image.rows * image.cols
+    let boxes = Buffer(count * 4)
+    let sums = Buffer(count * 6)
+    kernel_for("cc_reset_box").dispatch_async([boxes], count * 4, [count * 4])
+    sums.fill_zero()
+    if pixels > 0 {
+        labels.flush()
+        kernel_for("cc_stats").dispatch_async(
+            [labels.storage, boxes, sums],
+            pixels,
+            [pixels, image.cols, labels.offset, labels.step_, count]
+        )
     }
-    for y in 0..image.rows {
-        for x in 0..image.cols {
-            let label = int(values[y * image.cols + x])
-            if x < left[label] { left[label] = x }
-            if x > right[label] { right[label] = x }
-            if y < top[label] { top[label] = y }
-            if y > bottom[label] { bottom[label] = y }
-            area[label] += 1
-            sum_x[label] += float(x)
-            sum_y[label] += float(y)
-        }
-    }
+    let box_out = Buffer(count * 8)
+    let sum_out = Buffer(count * 12)
+    kernel_for("cc_split").dispatch_async([boxes, box_out], count * 4, [count * 4])
+    kernel_for("cc_split").dispatch_async([sums, sum_out], count * 6, [count * 6])
+    let extent = box_out.download()
+    let weight = sum_out.download()
+    boxes.free()
+    sums.free()
+    box_out.free()
+    sum_out.free()
+
     var stats: list[ComponentStats] = []
     var centroids: list[Point2f] = []
     for index in 0..count {
-        if right[index] < 0 {
+        let area = int(wide_at(weight, index * 6))
+        if area == 0 {
             stats.push(ComponentStats(Rect(0, 0, 0, 0), 0))
             centroids.push(Point2f(0.0, 0.0))
             continue
         }
-        stats.push(
-            ComponentStats(
-                Rect(
-                    left[index],
-                    top[index],
-                    right[index] - left[index] + 1,
-                    bottom[index] - top[index] + 1
-                ),
-                area[index]
-            )
+        let left = int(word_at(extent, index * 4))
+        let top = int(word_at(extent, index * 4 + 1))
+        let right = int(word_at(extent, index * 4 + 2))
+        let bottom = int(word_at(extent, index * 4 + 3))
+        stats.push(ComponentStats(Rect(left, top, right - left + 1, bottom - top + 1), area))
+        let total = float(area)
+        centroids.push(
+            Point2f(wide_at(weight, index * 6 + 2) / total, wide_at(weight, index * 6 + 4) / total)
         )
-        let total = float(area[index])
-        centroids.push(Point2f(sum_x[index] / total, sum_y[index] / total))
     }
     return (count, labels, stats, centroids)
 }
