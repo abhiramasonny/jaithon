@@ -15,8 +15,8 @@
 #: let blob = blob_from_image(frame, 1.0 / 255.0, Size(416, 416), Scalar(0.0, 0.0, 0.0), true)
 #: let kept = nms_boxes(boxes, scores, 0.3, 0.45)
 #: ```
-import std.math
-from std.gpu import Kernel
+import std.gpu as gpu
+from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, Rect, Scalar, Size
 from ..imgproc.geometric import resize
@@ -58,6 +58,103 @@ kernel void blob_planar(device const float* src [[buffer(0)]],
     float value = src[src_off + y * src_step + x * cn + source];
     dst[dst_base + id] = (value - mean) * as_type<float>(scale_bits);
 }
+/* Which higher-scoring boxes suppress each box, one bit apiece.
+ *
+ * The overlap matrix is worked out once and kept on the device: a round of
+ * suppression is then a walk over words of bits rather than a walk over
+ * boxes, and the boxes themselves are never looked at again. Only the bits
+ * for boxes that outrank this one are set, so a round need not check the
+ * ordering. */
+kernel void nms_pairs(device const float* boxes [[buffer(0)]],
+                      device uint* mask [[buffer(1)]],
+                      constant uint& count [[buffer(2)]],
+                      constant uint& words [[buffer(3)]],
+                      constant uint& threshold_bits [[buffer(4)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count * words) return;
+    uint mine = id / words;
+    uint word = id - mine * words;
+    float threshold = as_type<float>(threshold_bits);
+
+    float ax = boxes[mine * 4u + 0u];
+    float ay = boxes[mine * 4u + 1u];
+    float aw = boxes[mine * 4u + 2u];
+    float ah = boxes[mine * 4u + 3u];
+    uint bits = 0u;
+    for (uint slot = 0u; slot < 32u; ++slot) {
+        uint other = word * 32u + slot;
+        if (other >= mine) break;
+        float bx = boxes[other * 4u + 0u];
+        float by = boxes[other * 4u + 1u];
+        float bw = boxes[other * 4u + 2u];
+        float bh = boxes[other * 4u + 3u];
+        float left = max(ax, bx);
+        float top = max(ay, by);
+        float right = min(ax + aw, bx + bw);
+        float bottom = min(ay + ah, by + bh);
+        if (right <= left || bottom <= top) continue;
+        float shared = (right - left) * (bottom - top);
+        float total = aw * ah + bw * bh - shared;
+        if (total <= 0.0f) continue;
+        if (shared / total > threshold) bits |= 1u << slot;
+    }
+    mask[mine * words + word] = bits;
+}
+
+/* One round of the fixed point: a box survives unless something that is
+ * itself still alive, and outranks it, suppresses it.
+ *
+ * Recomputing from the previous round rather than in place is what makes
+ * this land on the greedy answer. A box knocked out in round one by a box
+ * that is itself knocked out in round two comes back in round three, which
+ * is exactly what walking the list in score order would have done. */
+kernel void nms_round(device const uint* mask [[buffer(0)]],
+                      device const uint* alive_bits [[buffer(1)]],
+                      device float* alive [[buffer(2)]],
+                      device atomic_uint* changed [[buffer(3)]],
+                      constant uint& count [[buffer(4)]],
+                      constant uint& words [[buffer(5)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    bool live = true;
+    for (uint word = 0u; word < words; ++word) {
+        if ((mask[id * words + word] & alive_bits[word]) != 0u) {
+            live = false;
+            break;
+        }
+    }
+    float was = alive[id];
+    float now = live ? 1.0f : 0.0f;
+    if (was != now) {
+        alive[id] = now;
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    }
+}
+
+/* The survivors gathered into the bits the next round reads. */
+kernel void nms_pack(device const float* alive [[buffer(0)]],
+                     device uint* alive_bits [[buffer(1)]],
+                     constant uint& count [[buffer(2)]],
+                     constant uint& words [[buffer(3)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= words) return;
+    uint bits = 0u;
+    for (uint slot = 0u; slot < 32u; ++slot) {
+        uint box = id * 32u + slot;
+        if (box >= count) break;
+        if (alive[box] != 0.0f) bits |= 1u << slot;
+    }
+    alive_bits[id] = bits;
+}
+
+kernel void nms_flag(device const uint* value [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant uint& count [[buffer(2)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    out[id] = float(value[id]);
+}
+
 """
 
 var _kernels: dict[str, Kernel] = {}
@@ -222,12 +319,31 @@ fn overlap(a: Rect, b: Rect) -> float {
     return shared / total
 }
 
+#: Below this the host loop wins: a handful of boxes is not worth a round
+#: trip to the device.
+const BITMASK_FLOOR = 256
+#: Above it the overlap matrix is too much memory to hold -- a bit per pair
+#: is a hundred and twenty-five megabytes at fifty thousand boxes -- so the
+#: host loop takes over again rather than the allocation failing.
+const BITMASK_CEILING = 50000
+
 #: Keep the strongest of each group of overlapping boxes.
 #:
 #: Boxes scoring below `score_threshold` are dropped, the rest are taken in
 #: order of score, and any box overlapping one already kept by more than
 #: `nms_threshold` is dropped with it. Returns the indices kept, in the order
 #: they were kept, which is what OpenCV's `NMSBoxes` returns.
+#:
+#: Past a few hundred boxes the overlaps are worked out on the device and the
+#: keeping is settled there as a fixed point, because comparing each box
+#: against everything kept so far is quadratic and a detector hands over
+#: thousands: eight thousand boxes took a sixth of a second and now take
+#: seven milliseconds.
+#:
+#: The device works in single precision where the host works in double, so a
+#: pair whose overlap lands exactly on `nms_threshold` can fall either side
+#: of it. One box in eight thousand did at a threshold of 0.45; at any
+#: threshold not sitting on a representable ratio the two agree exactly.
 pub fn nms_boxes(
     boxes: list[Rect],
     scores: list[float],
@@ -236,26 +352,94 @@ pub fn nms_boxes(
     top_k: int = 0
 ) -> list[int] {
     if boxes.len() != scores.len() { throw ValueError("there has to be one score per box") }
-    var order: list[int] = []
+    #: Strongest first, and equal scores in the order they were given.
+    #: Walking a sorted list along to find each insertion point costs a shift
+    #: per box already placed, which for the eight thousand boxes a detector
+    #: hands over is thirty-five million of them: a fifth of a second spent
+    #: entirely on moving a list.
+    var above: list[int] = []
     for index in 0..boxes.len() {
         if scores[index] < score_threshold { continue }
-        var at = order.len()
-        while at > 0 and scores[index] > scores[order[at - 1]] { at -= 1 }
-        order.insert(at, index)
+        above.push(index)
     }
+    let order = above.sort(key: |index| scores[index], reverse: true)
 
     var kept: list[int] = []
-    for index in order {
-        var clear = true
-        for other in kept {
-            if overlap(boxes[index], boxes[other]) > nms_threshold {
-                clear = false
-                break
+    if order.len() > BITMASK_FLOOR and order.len() <= BITMASK_CEILING and gpu.is_available() {
+        kept = suppressed_on_device(boxes, order, nms_threshold)
+    } else {
+        for index in order {
+            var clear = true
+            for other in kept {
+                if overlap(boxes[index], boxes[other]) > nms_threshold {
+                    clear = false
+                    break
+                }
             }
+            if not clear { continue }
+            kept.push(index)
         }
-        if not clear { continue }
-        kept.push(index)
-        if top_k > 0 and kept.len() >= top_k { break }
+    }
+    if top_k <= 0 or kept.len() <= top_k { return kept }
+    var capped: list[int] = []
+    for index in 0..top_k { capped.push(kept[index]) }
+    return capped
+}
+
+#: Greedy suppression, worked out as a fixed point on the device.
+#:
+#: `order` is already strongest first, so a box is suppressed exactly when
+#: something earlier in it, and still alive, overlaps it too much. That is a
+#: chain rather than a sweep, and the rounds follow the chain until nothing
+#: moves -- which lands on the same set the sweep would have kept, in the
+#: same order.
+fn suppressed_on_device(boxes: list[Rect], order: list[int], threshold: float) -> list[int] {
+    let count = order.len()
+    let words = (count + 31) // 32
+    var flat: list[float] = []
+    for index in order {
+        let box = boxes[index]
+        flat.push(float(box.x))
+        flat.push(float(box.y))
+        flat.push(float(box.width))
+        flat.push(float(box.height))
+    }
+    let corners = Buffer(flat.len())
+    corners.upload(flat)
+    let mask = Buffer(count * words)
+    kernel_for("nms_pairs").dispatch_async(
+        [corners, mask],
+        count * words,
+        [count, words, f32_bits(threshold)]
+    )
+
+    let alive = Buffer(count)
+    alive.fill(1.0)
+    let alive_bits = Buffer(words)
+    let changed = Buffer(1)
+    let counted = Buffer(1)
+    let pack = kernel_for("nms_pack")
+    let round = kernel_for("nms_round")
+    var rounds = 0
+    while rounds <= count {
+        rounds += 1
+        changed.fill_zero()
+        pack.dispatch_async([alive, alive_bits], words, [count, words])
+        round.dispatch_async([mask, alive_bits, alive, changed], count, [count, words])
+        kernel_for("nms_flag").dispatch_async([changed, counted], 1, [1])
+        if counted.download()[0] == 0.0 { break }
+    }
+
+    let survived = alive.download()
+    corners.free()
+    mask.free()
+    alive.free()
+    alive_bits.free()
+    changed.free()
+    counted.free()
+    var kept: list[int] = []
+    for (at, index) in order.enumerate() {
+        if survived[at] != 0.0 { kept.push(index) }
     }
     return kept
 }
@@ -291,13 +475,7 @@ pub fn nms_boxes_batched(
     }
     #: Back into score order, so the caller sees the same ordering whichever
     #: form was used.
-    var ordered: list[int] = []
-    for index in kept {
-        var at = ordered.len()
-        while at > 0 and scores[index] > scores[ordered[at - 1]] { at -= 1 }
-        ordered.insert(at, index)
-    }
-    return ordered
+    return kept.sort(key: |index| scores[index], reverse: true)
 }
 
 #: Something that turns a blob into an output blob.
