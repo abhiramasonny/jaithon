@@ -55,15 +55,24 @@ kernel void parameter_update_sgd4(device float* value [[buffer(0)]],
 class ParameterState {
     pub let first_moment: Buffer
     pub let second_moment: Buffer
+    #: Which optimizer these belong to. The state is kept against the
+    #: parameter, and a parameter does not know what stepped it last.
+    pub let kind: int
 
     pub var settings: Buffer?
     #: What was last written into `settings`, so that a step asking for the
     #: same numbers again need not write them again.
     pub var written: list[float]
 
-    pub fn init(self, size: int) {
-        self.first_moment = Buffer.of([0.0 for _index in 0..size])
-        self.second_moment = Buffer.of([0.0 for _index in 0..size])
+    pub fn init(self, size: int, kind: int, moments: bool) {
+        #: Plain descent without momentum reads neither of these -- its
+        #: kernel does not take them as arguments -- so it gets a placeholder
+        #: rather than two buffers the size of the parameter. That was half a
+        #: megabyte per sixty-five thousand weights, allocated and untouched.
+        let held = if moments { size } else { 1 }
+        self.first_moment = Buffer.of([0.0 for _index in 0..held])
+        self.second_moment = Buffer.of([0.0 for _index in 0..held])
+        self.kind = kind
         self.settings = null
         self.written = []
     }
@@ -130,11 +139,31 @@ pub fn warmup_kernels() -> void {
     let _sgd4 = kernel_for_sgd4()
 }
 
-fn state_for(parameter: Tensor) -> ParameterState {
+#: Whether an optimizer of this kind reads the moment buffers.
+#:
+#: `settings[1]` is the momentum for plain descent; zero means the fast
+#: kernel, which takes no moments at all.
+fn wants_moments(kind: int, settings: list[float]) -> bool {
+    if kind != 0 { return true }
+    return settings.len() > 1 and settings[1] != 0.0
+}
+
+fn state_for(parameter: Tensor, kind: int, moments: bool) -> ParameterState {
     let key = parameter.id
     let existing = _states.get(key, null)
-    if existing is not null { return existing }
-    let state = ParameterState(parameter.size)
+    if existing is not null {
+        #: A parameter handed to a different kind of optimizer starts again.
+        #: The state is keyed by the parameter alone and a parameter does not
+        #: know what stepped it last, so without this Adam read whatever
+        #: plain descent had left in `first_moment` as its own first moment:
+        #: after five momentum steps at 0.9, Adam's opening step moved the
+        #: parameter by 1.93 where a clean one moves 0.01.
+        let big_enough = not moments or existing.first_moment.count >= parameter.size
+        if existing.kind == kind and big_enough { return existing }
+        existing.free()
+        _steps.remove(key)
+    }
+    let state = ParameterState(parameter.size, kind, moments)
     _states[key] = state
     return state
 }
@@ -150,7 +179,10 @@ fn next_step(parameter: Tensor) -> int {
 #: Allocate optimizer buffers before the first timed step.
 pub fn prepare_state(parameters: list[Tensor], settings: list[float]) -> void {
     for parameter in parameters {
-        let state = state_for(parameter)
+        #: The kind is not passed in here, and a state built for the wrong
+        #: one would be thrown away on the first step anyway, so this only
+        #: warms what a plain descent needs and lets `apply_update` decide.
+        let state = state_for(parameter, 0, wants_moments(0, settings))
         if state.settings is null { state.settings = Buffer.of(settings) }
     }
 }
@@ -182,7 +214,7 @@ fn apply_update(parameter: Tensor, settings: list[float], kind: int) -> void {
     if gradient is null {
         throw RuntimeError("optimizer.step() needs every parameter to have a gradient")
     }
-    let state = state_for(parameter)
+    let state = state_for(parameter, kind, wants_moments(kind, settings))
     let existing_settings = state.settings
     #: The settings go across on every step, not only the first.
     #:

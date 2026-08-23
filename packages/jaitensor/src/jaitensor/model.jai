@@ -373,6 +373,12 @@ pub class Sequential {
     pub fn free(self) -> void {
         if self.freed { return }
         gpu.synchronize()
+        #: The optimizer's moments and step counts go too. They live in a
+        #: table keyed by the parameter, and nothing else was ever going to
+        #: take them out of it: forty models built, fitted and freed in turn
+        #: climbed from 216 MB to 311 MB, where releasing them holds flat at
+        #: 132 MB.
+        if self.input_units != 0 { reset_state(self._parameters()) }
         for layer in self.layers { layer.free() }
         self.cached_parameters = null
         self.freed = true

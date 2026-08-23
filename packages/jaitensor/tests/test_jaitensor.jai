@@ -1182,6 +1182,39 @@ fn test_a_convolutional_model_survives_a_save_and_a_load() -> void {
     }
 }
 
+#: The same parameter, stepped by one kind of optimizer and then another.
+#:
+#: The optimizer's state is kept in a table keyed by the parameter, and a
+#: parameter does not know what stepped it last -- so Adam picked up whatever
+#: plain descent had left in `first_moment` and read it as its own first
+#: moment. After five momentum steps at 0.9 that velocity is about 41, and
+#: Adam's opening step moved the parameter by 1.93 where a clean one moves
+#: 0.01. A hundred and ninety times, silently.
+fn test_a_second_kind_of_optimizer_starts_from_nothing() -> void {
+    if not jt.is_available() { return }
+    let shared = jt.Tensor([1], [0.0], requires_grad: true)
+    for _round in 0..5 {
+        shared.grad = jt.Tensor([1], [10.0])
+        jt.SGD(learning_rate: 1.0e-9, momentum: 0.9).step([shared])
+    }
+    let before = shared.download()[0]
+    shared.grad = jt.Tensor([1], [1.0])
+    jt.Adam(learning_rate: 0.01).step([shared])
+    let moved = shared.download()[0] - before
+
+    let clean = jt.Tensor([1], [0.0], requires_grad: true)
+    clean.grad = jt.Tensor([1], [1.0])
+    jt.Adam(learning_rate: 0.01).step([clean])
+    let expected = clean.download()[0]
+
+    assert math.fabs(moved - expected) < 1e-6
+    #: And that step really is the learning rate, so the comparison is not
+    #: two wrong numbers agreeing.
+    assert math.fabs(expected + 0.01) < 1e-4
+    shared.free()
+    clean.free()
+}
+
 fn test_sgd_step_momentum_persists_and_affects_a_second_step() -> void {
     if not jt.is_available() { return }
     let start = 2.0
