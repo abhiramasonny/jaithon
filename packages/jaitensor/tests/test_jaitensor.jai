@@ -1589,6 +1589,52 @@ fn test_a_loader_per_epoch_orders_the_samples_differently() -> void {
     }
 }
 
+#: An embedding fed a batch of index rows, which is how a model in this
+#: library is trained.
+#:
+#: The layer only ever accepted a flat list of indices, so putting one in a
+#: `Sequential` and calling `fit` threw on the first forward: a batch of four
+#: contexts arrived as `[4, context]` and the gather refused anything but
+#: rank one. There was no way to use the layer in a batched model at all.
+fn test_an_embedding_takes_a_batch_of_index_rows() -> void {
+    if not jt.is_available() { return }
+    let vocab = 11
+    let context = 3
+    let width = 5
+    var indices: list[float] = []
+    var labels: list[int] = []
+    var seed = 5
+    for _sample in 0..32 {
+        for _slot in 0..context {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            indices.push(float(seed % vocab))
+        }
+        labels.push(seed % vocab)
+    }
+    let data = jt.Dataset(
+        jt.Tensor([32, context], indices),
+        jt.Tensor([32], [float(value) for value in labels])
+    )
+    defer { data.free() }
+    let embedding = jt.Embedding(vocab, width)
+    let model = jt.Sequential(
+        [
+            embedding,
+            jt.Dense(16, activation: jt.Activation.Relu),
+            jt.Dense(vocab, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(optimizer: jt.Adam(learning_rate: 0.02), loss: jt.SparseCategoricalCrossentropy())
+    #: One row of indices becomes `context` lookups laid end to end, so the
+    #: layer after it sees that much width.
+    assert_eq(embedding.output_width(), context * width)
+    let history = model.fit(data, epochs: 4, batch_size: 8, verbose: false, plot_path: null)
+    assert_eq(history.loss.len(), 4)
+    for value in history.loss { assert math.is_finite(value) }
+    assert history.loss[3] < history.loss[0]
+}
+
 fn test_dataloader_shuffle_covers_every_sample() -> void {
     if not jt.is_available() { return }
     let data = jt.Dataset.from_flat([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [0, 1, 2], 2)

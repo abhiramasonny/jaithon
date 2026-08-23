@@ -4489,8 +4489,11 @@ pub fn gather_rows(source: Tensor, indices: Tensor, out_shape: list[int]? = null
     if source.rank() != 2 {
         throw ValueError(f"gather_rows needs a rank-two source, got {source.shape}")
     }
-    if indices.rank() != 1 {
-        throw ValueError(f"gather_rows needs a rank-one index tensor, got {indices.shape}")
+    #: The indices are read flat whatever shape they arrive in -- only how
+    #: many there are matters, and a batch of index rows is the ordinary way
+    #: an embedding is asked for. `out_shape` says what to call the result.
+    if indices.rank() < 1 {
+        throw ValueError(f"gather_rows needs an index tensor, got {indices.shape}")
     }
     let width = source.shape[1]
     var shape = [indices.size, width]

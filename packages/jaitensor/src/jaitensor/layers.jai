@@ -826,27 +826,42 @@ pub class Dropout: Layer {
 pub class Embedding: Layer {
     pub let vocab: int
     pub let dim: int
+    #: How many indices a sample carries, which the layer learns when it is
+    #: built. One means a single index a sample, which is the rank-one case.
+    var span: int
     var table: Tensor?
 
     pub fn init(self, vocab: int, dim: int) {
         if vocab <= 0 or dim <= 0 { throw ValueError("Embedding vocab and dim must be positive") }
         self.vocab = vocab
         self.dim = dim
+        self.span = 1
         self.table = null
     }
 
     pub fn build(self, input_units: int, rng: Random) -> void {
-        let _ = input_units
+        self.span = max(1, input_units)
         if self.table is not null { return }
         let table = Tensor([self.vocab, self.dim], requires_grad: true)
         table.buffer().fill_uniform(-0.05, 0.05, rng.next_int())
         self.table = table
     }
 
+    #: A batch of index rows, not only a single row of them.
+    #:
+    #: `gather_rows` wants the indices flat, so a `[batch, span]` block is
+    #: read as `batch * span` lookups and the result put back as
+    #: `[batch, span * dim]` -- which is the width the layer after this one
+    #: was sized for. Without this the layer could not be used in a model
+    #: that trains in batches at all, which is every model here.
     pub fn forward(self, x: Tensor) -> Tensor {
         let table = self.table
         if table is null { throw RuntimeError("Embedding has not been built") }
-        return gather_rows(table, x)
+        if x.rank() < 2 { return gather_rows(table, x) }
+        if x.rank() > 2 {
+            throw ValueError(f"Embedding takes indices of rank one or two, got {x.shape}")
+        }
+        return gather_rows(table, x, [x.shape[0], x.shape[1] * self.dim])
     }
 
     pub fn parameters(self) -> list[Tensor] {
@@ -855,7 +870,7 @@ pub class Embedding: Layer {
         return [table]
     }
 
-    pub fn output_width(self) -> int { return self.dim }
+    pub fn output_width(self) -> int { return self.span * self.dim }
 
     pub fn free(self) -> void {
         let table = self.table
