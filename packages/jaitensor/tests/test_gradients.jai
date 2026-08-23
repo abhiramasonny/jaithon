@@ -380,6 +380,63 @@ fn test_wide_normalisation_gradients() -> void {
 #: Against arithmetic done here rather than a difference quotient: the loss a
 #: quotient can use is a plain sum, and the scale's gradient under that loss is
 #: the sum of a normalised channel, which is zero however the kernel is written.
+#: Channel statistics over activations that sit a long way from zero.
+#:
+#: The spread was worked out as `E[x^2] - E[x]^2`, which is one pass and
+#: keeps no digits at all once the mean is large beside the spread. At an
+#: offset of a thousand -- an unremarkable activation -- those two terms
+#: agreed to seven figures, the subtraction returned a negative, and
+#: `rsqrt` turned the whole block to NaN. In the forward, not merely in the
+#: gradient: `batch_norm` returned 1024 non-finite values out of 2048.
+fn test_channel_statistics_survive_an_offset_from_zero() -> void {
+    if not have_gpu() { return }
+    let n = 6
+    let side = 5
+    let channels = 4
+    for offset in [0.0, 1000.0, 50000.0] {
+        var values: list[float] = []
+        var seed = 3
+        for _index in 0..n * side * side * channels {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            values.push(offset + 2.0 * (float(seed % 1000) / 1000.0 - 0.5))
+        }
+        let x = Tensor([n, side, side, channels], values, requires_grad: true)
+        let gamma = Tensor.ones([channels])
+        let beta = Tensor.zeros([channels])
+        let normed = batch_norm(x, gamma, beta)
+        let got = normed.download()
+        for value in got { assert_true(math.is_finite(value), f"batch_norm gave {value}") }
+
+        #: Finite is not enough -- each channel has to come out centred on
+        #: zero with a spread of one, which is the whole job.
+        for channel in 0..channels {
+            var total = 0.0
+            var count = 0
+            for (index, value) in got.enumerate() {
+                if index % channels != channel { continue }
+                total += value
+                count += 1
+            }
+            let centre = total / float(count)
+            var spread = 0.0
+            for (index, value) in got.enumerate() {
+                if index % channels != channel { continue }
+                spread += (value - centre) * (value - centre)
+            }
+            assert_true(math.fabs(centre) < 0.05, f"channel {channel} centred at {centre}")
+            let unit = spread / float(count)
+            assert_true(math.fabs(unit - 1.0) < 0.05, f"channel {channel} spread {unit}")
+        }
+
+        let junk = jt.sum(normed).backward()
+        let gradient = x.grad
+        assert_true(gradient is not null, "the input should have a gradient")
+        for value in gradient.download() {
+            assert_true(math.is_finite(value), f"the gradient gave {value}")
+        }
+    }
+}
+
 fn test_channel_normalisation_parameter_gradients() -> void {
     if not have_gpu() { return }
     let n = 4

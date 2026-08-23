@@ -1143,12 +1143,18 @@ kernel void channel_partials(device const float* input [[buffer(0)]],
     threadgroup float shared_square[256];
     uint first = chunk * rows_each;
     uint last = min(first + rows_each, nspatial);
+    /* Which channel this thread walks. The stride is GROUP and this kernel
+     * only runs when the channel count divides it, so the channel a thread
+     * touches never changes and the reference can be read once. */
+    uint mine = lid % channels;
+    float shift = input[mine];
     float total = 0.0f;
     float square = 0.0f;
     for (uint f = first * channels + lid; f < last * channels; f += GROUP) {
         float v = input[f];
+        float d = v - shift;
         total += v;
-        square += v * v;
+        square += d * d;
     }
     shared_total[lid] = total;
     shared_square[lid] = square;
@@ -1165,13 +1171,29 @@ kernel void channel_partials(device const float* input [[buffer(0)]],
 }
 
 /* The second pass: one thread to a channel, over however many blocks ran. */
+/* The spread is taken about a value near the middle of the data, not about
+ * zero.
+ *
+ * `E[x^2] - E[x]^2` is one pass and the obvious way to write it, and it
+ * throws away every digit it has once the mean is large beside the spread:
+ * an activation offset by a thousand, with a spread of one, makes those two
+ * terms agree to seven figures, so the subtraction keeps none of them and
+ * `rsqrt` is handed a negative. That is not a corner case -- batch norm on
+ * such a block came back all NaN, in the FORWARD, not merely in the
+ * gradient.
+ *
+ * Subtracting any fixed `k` first leaves the variance unchanged and makes
+ * both terms O(spread^2) instead of O(mean^2). The first element of the
+ * channel is a good enough `k` and costs one load: it is drawn from the same
+ * distribution as everything being summed, which is all the trick needs. */
 kernel void channel_moments_join(device const float* part_total [[buffer(0)]],
                                  device const float* part_square [[buffer(1)]],
                                  device float* mean [[buffer(2)]],
                                  device float* variance [[buffer(3)]],
-                                 constant uint& chunks [[buffer(4)]],
-                                 constant uint& channels [[buffer(5)]],
-                                 constant uint& nspatial [[buffer(6)]],
+                                 device const float* input [[buffer(4)]],
+                                 constant uint& chunks [[buffer(5)]],
+                                 constant uint& channels [[buffer(6)]],
+                                 constant uint& nspatial [[buffer(7)]],
                                  uint c [[thread_position_in_grid]]) {
     if (c >= channels) return;
     float total = 0.0f;
@@ -1182,7 +1204,10 @@ kernel void channel_moments_join(device const float* part_total [[buffer(0)]],
     }
     float m = total / float(nspatial);
     mean[c] = m;
-    variance[c] = square / float(nspatial) - m * m;
+    /* The partials hold the squares about `input[c]`, so the mean has to be
+     * moved there too before the two are subtracted. */
+    float offset = m - input[c];
+    variance[c] = max(0.0f, square / float(nspatial) - offset * offset);
 }
 
 /* The backward's four sums, read the same coalesced way. */
@@ -1265,19 +1290,20 @@ kernel void moments_channel(device const float* input [[buffer(0)]],
     if (c >= channels) return;
     const uint GROUP = 256u;
     threadgroup float lanes[32];
+    float shift = input[c];
     float total = 0.0f;
     float sq = 0.0f;
     for (uint i = lid; i < nspatial; i += GROUP) {
-        float v = input[i * channels + c];
-        total += v;
-        sq += v * v;
+        float d = input[i * channels + c] - shift;
+        total += d;
+        sq += d * d;
     }
     total = group_total(total, lanes, lid, lane, warp);
     sq = group_total(sq, lanes, lid, lane, warp);
     if (lid != 0u) return;
-    float m = total / float(nspatial);
-    mean[c] = m;
-    variance[c] = sq / float(nspatial) - m * m;
+    float centre = total / float(nspatial);
+    mean[c] = shift + centre;
+    variance[c] = max(0.0f, sq / float(nspatial) - centre * centre);
 }
 
 /* A threadgroup to a row, rather than a thread to a row.
@@ -1800,22 +1826,23 @@ kernel void moments_group(device const float* input [[buffer(0)]],
     uint n = id / groups;
     uint g = id % groups;
     uint count = spatial * gs;
+    float shift = input[(n * spatial) * C + g * gs];
     float total = 0.0f;
     float sq = 0.0f;
     for (uint hw = lid; hw < spatial; hw += GROUP) {
         uint base = (n * spatial + hw) * C + g * gs;
         for (uint c = 0; c < gs; ++c) {
-            float v = input[base + c];
-            total += v;
-            sq += v * v;
+            float d = input[base + c] - shift;
+            total += d;
+            sq += d * d;
         }
     }
     total = group_total(total, lanes, lid, lane, warp);
     sq = group_total(sq, lanes, lid, lane, warp);
     if (lid != 0u) return;
-    float m = total / float(count);
-    mean[id] = m;
-    variance[id] = sq / float(count) - m * m;
+    float centre = total / float(count);
+    mean[id] = shift + centre;
+    variance[id] = max(0.0f, sq / float(count) - centre * centre);
 }
 
 kernel void group_norm_forward(device const float* input [[buffer(0)]],
@@ -4215,7 +4242,13 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
             group_size: 256
         )
         cached_kernel("channel_moments_join").dispatch_async(
-            [part_total.buffer(), part_square.buffer(), mean.buffer(), variance.buffer()],
+            [
+                part_total.buffer(),
+                part_square.buffer(),
+                mean.buffer(),
+                variance.buffer(),
+                input.buffer(),
+            ],
             channels,
             [chunks, channels, nspatial]
         )
