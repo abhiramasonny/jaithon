@@ -9,7 +9,8 @@ import std.math
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
 from jaitensor import Tensor
-from jaitensor.compiled import compile_step, refusal
+from jaitensor.compiled import compile_step, compiled_step_allowed, refusal
+from jaitensor.compiled import set_compiled_step
 from jaitensor.layers import Activation, AvgPool2d, Conv2d, Dense, Embedding, Flatten, Layer
 from jaitensor.layers import LayerNorm, MaxPool2d
 from jaitensor.losses import SparseCategoricalCrossentropy
@@ -136,6 +137,64 @@ fn test_a_model_it_cannot_express_is_refused_with_a_reason() -> void {
 #: One step rather than many on purpose. The two orderings of float32 drift
 #: apart over an epoch once a ReLU is deciding which side of zero a value falls
 #: on, which is a property of the arithmetic and not a fault in either.
+#: Several epochs, not one step, and a normalisation sitting a long way from
+#: zero.
+#:
+#: A step is a weak thing to compare: the two paths start from the same
+#: weights, so a difference has one step to show itself in and rounding hides
+#: it. Over five epochs it compounds instead. The features are offset by five
+#: hundred on purpose -- that is the regime where the normalisation's
+#: backward used to work the spread out as `E[x^2] - E[x]^2` and lose every
+#: digit of it, which the eager path would have felt and the graph would not.
+fn test_the_two_paths_agree_over_several_epochs() -> void {
+    if not gpu.is_available() { return }
+    let samples = 128
+    let width = 24
+    var features: list[float] = []
+    var labels: list[float] = []
+    var seed = 31
+    for _sample in 0..samples {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let kind = seed % 3
+        for _slot in 0..width {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            features.push(500.0 + float(kind) * 2.0 + float(seed % 100) / 50.0)
+        }
+        labels.push(float(kind))
+    }
+
+    #: Put the setting back however it was found, or every test after this
+    #: one runs on whichever path this one happened to finish with.
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    var seen: list[list[float]] = []
+    for compiled in [true, false] {
+        let model = jt.Sequential(
+            [
+                Dense(32, activation: Activation.Relu),
+                LayerNorm(),
+                Dense(16, activation: Activation.Relu),
+                Dense(3, activation: Activation.Softmax),
+            ]
+        )
+        model.compile(optimizer: SGD(learning_rate: 0.05), loss: SparseCategoricalCrossentropy())
+        set_compiled_step(compiled)
+        let history = model.fit(
+            jt.Dataset(Tensor([samples, width], features), Tensor([samples], labels)),
+            epochs: 5,
+            batch_size: 32,
+            verbose: false,
+            plot_path: null
+        )
+        for value in history.loss { assert_true(math.is_finite(value), f"loss {value}") }
+        seen.push(history.loss)
+        model.free()
+    }
+    for (index, value) in seen[0].enumerate() { assert_near(value, seen[1][index], 1e-5) }
+    #: And it has to be learning, or two flat lines would agree for nothing.
+    assert_true(seen[0][4] < seen[0][0])
+}
+
 fn test_fit_takes_the_compiled_path_and_agrees_for_a_step() -> void {
     if not gpu.is_available() { return }
     let samples = 32

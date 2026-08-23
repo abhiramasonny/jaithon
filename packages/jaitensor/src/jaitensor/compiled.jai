@@ -581,6 +581,18 @@ fn allowed() -> bool {
     return _allowed == 1
 }
 
+#: Turn the compiled step on or off from inside the process.
+#:
+#: The environment variable is read once and kept, which is right for a
+#: benchmark and useless for a test: comparing the two paths means running
+#: both of them in one run, and the only way to do that was two processes
+#: comparing numbers through a file.
+pub fn set_compiled_step(on: bool) -> void { _allowed = if on { 1 } else { 0 } }
+
+#: Whether the compiled step is currently allowed, so that a caller which
+#: turns it off can put it back the way it found it.
+pub fn compiled_step_allowed() -> bool { return allowed() }
+
 #: Build a compiled step for `layers`, or null when they cannot be expressed.
 #:
 #: `input_shape` is one batch's worth including the batch dimension. SGD with
