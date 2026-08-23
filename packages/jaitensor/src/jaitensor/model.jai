@@ -162,6 +162,14 @@ pub class Sequential {
     pub fn execution_plan(self) -> ExecutionPlan? { return self.plan_value }
 
     #: Train for `epochs`, returning loss and accuracy histories.
+    #:
+    #: A trailing batch shorter than `batch_size` is dropped on the fused and
+    #: compiled paths, which need every batch the same size: with a hundred
+    #: samples and a batch of thirty-two, four of them are never trained on
+    #: and never counted, each epoch, and the reported loss and accuracy are
+    #: over the ninety-six that were. Shuffling is off by default, so without
+    #: `shuffle: true` it is the same four every time. A batch size that
+    #: divides the sample count avoids it altogether.
     pub fn fit(
         self,
         dataset: Dataset,
