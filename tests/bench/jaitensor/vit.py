@@ -49,7 +49,11 @@ def main() -> None:
             out = block(x, qw, ow, w1, w2, g1, b1, g2, b2, ib, heads)
     torch.mps.synchronize()
     seconds = time.perf_counter() - started
-    flops = repeats * (12.0 * tokens * dim * dim + 4.0 * tokens * tokens * dim)
+    # Twenty products of dim by dim a token, plus the attention: two for the
+    # query projection, two for the one landing on the residual, eight up to
+    # four times dim and eight back. See the note in vit.jai; both sides said
+    # twelve, so only the rate column was wrong, never the ratio.
+    flops = repeats * (20.0 * tokens * dim * dim + 4.0 * tokens * tokens * dim)
     check = out.flatten()[0].item()
     sane = bool(torch.isfinite(out.flatten()[:1]).all().item()) and abs(check) < 1000.0
     print(f"jtb\tvit-block\t{seconds:.9f}\t{int(flops)}\t0\t{'ok' if sane else 'invalid'}\tamp-f16-f32")

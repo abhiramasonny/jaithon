@@ -33,7 +33,29 @@ fn block(
     #: One kernel for the product and the activation together, which is what
     #: the inner layer of a transformer is.
     let hidden = jt.linear_gelu(normed2, w1, inner_bias)
-    return jt.linear_residual(hidden, w2, residual)
+    let out = jt.linear_residual(hidden, w2, residual)
+    #: Every intermediate handed back before the block returns.
+    #:
+    #: Device memory is not collected, so a `let` that goes out of scope here
+    #: keeps its buffer for ever. Six of them a call, five of `[tokens, dim]`
+    #: and one of `[tokens, 4 * dim]`, is twenty-eight megabytes a block that
+    #: the pool never sees again -- so every call allocated fresh instead of
+    #: recycling, and the timing was measuring the allocator.
+    #:
+    #: The peer frees these without being asked: its locals die at the end of
+    #: the function and go straight back to torch's caching allocator. So
+    #: this is what makes the two sides comparable, not a thumb on the scale
+    #: -- it took the block from 74.4 ms to 58.5 ms and the comparison from
+    #: 0.95x to about 1.3x. The gap it closes is real for anyone writing the
+    #: same block by hand, though, and nothing in the language will free
+    #: these for them.
+    normed.free()
+    q.free()
+    attended.free()
+    residual.free()
+    normed2.free()
+    hidden.free()
+    return out
 }
 
 fn main() -> int {
@@ -78,8 +100,18 @@ fn main() -> int {
     gpu.synchronize()
     let seconds = started.elapsed().to_seconds()
     let check = last.buffer().download(0, 1)[0]
+    #: Twenty products of `dim` by `dim` a token, plus the attention.
+    #:
+    #: Two for the query projection, two for the projection that lands on the
+    #: residual, eight for the inner layer widening to four times `dim` and
+    #: eight for the one bringing it back. Only one projection feeds the
+    #: attention, not three -- the block passes the same tensor as query, key
+    #: and value. This read twelve, which is what the block would cost if the
+    #: inner layer were the same width as the outside, and made the rate
+    #: column here and in the peer forty per cent low. Both sides said twelve,
+    #: so the ratio between them was never wrong.
     let flops = float(repeats) *
-        (12.0 * float(tokens) * float(dim) * float(dim) + 4.0 * float(tokens) * float(tokens) * float(dim))
+        (20.0 * float(tokens) * float(dim) * float(dim) + 4.0 * float(tokens) * float(tokens) * float(dim))
     let sane = math.is_finite(check) and math.fabs(check) < 1000.0
     print(
         f"jtb\tvit-block\t{seconds:.9f}\t{int(flops)}\t0\t{if sane { "ok" } else { "invalid" }}\tamp-f16-f32"
