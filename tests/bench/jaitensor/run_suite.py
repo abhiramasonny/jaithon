@@ -159,19 +159,6 @@ def sample_command(
     return order, collected
 
 
-def merge_samples(
-    destination_order: list[str],
-    destination: dict[str, Samples],
-    order: list[str],
-    source: dict[str, Samples],
-) -> None:
-    for name in order:
-        if name in destination:
-            raise BenchError(f"duplicate suite benchmark name {name!r}")
-        destination_order.append(name)
-        destination[name] = source[name]
-
-
 def duration(seconds: float) -> str:
     milliseconds = seconds * 1000.0
     if milliseconds < 10.0:
@@ -266,23 +253,73 @@ def render(
     )
 
 
-def collect_side(executable: str, root: Path, level: str, runs: int, jaithon: bool):
-    order: list[str] = []
-    samples: dict[str, Samples] = {}
+def side_command(executable: str, bench_root: Path, jaithon: bool, stem: str,
+                 workload: str | None) -> list[str]:
+    program = bench_root / f"{stem}.{'jai' if jaithon else 'py'}"
+    command = [executable, "run", str(program)] if jaithon else [executable, str(program)]
+    if workload is not None:
+        command.append(workload)
+    return command
+
+
+def absorb(order: list[str], destination: dict[str, Samples],
+           found_order: list[str], found: dict[str, Samples]) -> None:
+    """Take one run's records, appending to whatever earlier runs left."""
+    for name in found_order:
+        record = found[name]
+        held = destination.get(name)
+        if held is None:
+            order.append(name)
+            destination[name] = record
+            continue
+        if held.flops != record.flops or held.samples != record.samples:
+            raise BenchError(f"work count changed between runs for {name}")
+        held.seconds.extend(record.seconds)
+
+
+def collect_interleaved(jaithon_exe: str, python_exe: str, root: Path, level: str,
+                        runs: int):
+    """Run the two sides turn about, one workload at a time.
+
+    Running a whole side to completion and then the other is what this used to
+    do, and it is not a fair comparison on a laptop: by the time jaithon's
+    fourteen GEMM shapes came up, its own earlier workloads had held the GPU
+    flat out for the best part of a minute, while the peer -- slower per unit
+    of GPU work, so idler between kernels -- reached the same shapes cooler.
+    Measured standalone, every one of those shapes is faster here than in the
+    peer; measured in the old order, five of them read as losses. Nothing
+    about the kernels changed in between.
+
+    Alternating per run and per workload gives both sides the same thermal
+    state, which is the only way the ratio means anything.
+    """
     bench_root = root / "tests" / "bench" / "jaitensor"
-    side = "jaithon" if jaithon else "pytorch"
-    for workload in WORKLOADS:
-        program = bench_root / ("mlp.jai" if jaithon else "mlp.py")
-        command = [executable, "run", str(program), workload] if jaithon else [executable, str(program), workload]
-        found_order, found = sample_command(command, runs, root, level, f"{side} {workload}")
-        merge_samples(order, samples, found_order, found)
-    for stem in ("conv", "norm", "gemm", "attn", "vit"):
-        program = bench_root / f"{stem}.{'jai' if jaithon else 'py'}"
-        command = [executable, "run", str(program)] if jaithon else [executable, str(program)]
-        found_order, found = sample_command(command, runs, root, level, f"{side} {stem}")
-        merge_samples(order, samples, found_order, found)
+    units: list[tuple[str, str | None]] = [("mlp", workload) for workload in WORKLOADS]
+    units += [(stem, None) for stem in ("conv", "norm", "gemm", "attn", "vit")]
+
+    order: list[str] = []
+    jai: dict[str, Samples] = {}
+    peer_order: list[str] = []
+    peer: dict[str, Samples] = {}
+    for index in range(runs):
+        for stem, workload in units:
+            label = workload if workload is not None else stem
+            found_order, found = sample_command(
+                side_command(jaithon_exe, bench_root, True, stem, workload),
+                1, root, level, f"jaithon {label} (run {index + 1} of {runs})",
+            )
+            absorb(order, jai, found_order, found)
+            if not python_exe:
+                continue
+            found_order, found = sample_command(
+                side_command(python_exe, bench_root, False, stem, workload),
+                1, root, level, f"pytorch {label} (run {index + 1} of {runs})",
+            )
+            absorb(peer_order, peer, found_order, found)
     progress_done()
-    return order, samples
+    if python_exe and peer_order != order:
+        raise BenchError(f"peer benchmark order differs: {order} != {peer_order}")
+    return order, jai, (peer if python_exe else None)
 
 
 def main() -> int:
@@ -298,12 +335,9 @@ def main() -> int:
         parser.error("--runs must be positive")
 
     try:
-        order, jai = collect_side(args.jaithon, args.root, args.level, args.runs, True)
-        peer = None
-        if args.python:
-            peer_order, peer = collect_side(args.python, args.root, args.level, args.runs, False)
-            if peer_order != order:
-                raise BenchError(f"peer benchmark order differs: {order} != {peer_order}")
+        order, jai, peer = collect_interleaved(
+            args.jaithon, args.python, args.root, args.level, args.runs
+        )
         render(order, jai, peer, args.build_kind, args.level, args.runs)
     except BenchError as error:
         print(f"jaitensor bench: {error}", file=sys.stderr)
