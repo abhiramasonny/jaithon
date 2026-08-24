@@ -560,8 +560,11 @@ fn _result_shape(shape: list[int], axes: list[int], keepdims: bool) -> list[int]
     for at in axes { reduced[at] = true }
     var out: list[int] = []
     for axis in 0..shape.len() {
-        if not reduced[axis] { out.push(shape[axis]) }
-        elif keepdims { out.push(1) }
+        if not reduced[axis] {
+            out.push(shape[axis])
+        } elif keepdims {
+            out.push(1)
+        }
     }
     return out
 }
