@@ -11,9 +11,11 @@ import std.gpu as gpu
 import std.math
 from jaicv import Mat, Size
 from jaicv.core.stats import min_max_loc, norm, sum_mat
-from jaicv.core.types import Point2f
+from jaicv.core.types import Point2f, Scalar
+from jaicv.imgproc.contours import CHAIN_APPROX_SIMPLE, RETR_EXTERNAL, RETR_TREE, draw_contours, find_contours
 from jaicv.imgproc.geometric import get_rotation_matrix_2d, remap, warp_affine
 from jaicv.imgproc.hist import equalize_hist
+from jaicv.imgproc.shape import approx_poly_dp, arc_length, convex_hull, min_area_rect, min_enclosing_circle, point_polygon_test
 from jaicv.imgproc.morph import erode, get_structuring_element, morphology_ex, MORPH_RECT
 from jaicv.imgproc.segmentation import connected_components, distance_transform, integral
 from jaicv.imgproc.threshold import adaptive_threshold, threshold
@@ -270,6 +272,61 @@ fn main() -> int {
     let photo = picture(3)
     run("edge-preserving", max(2, repeats // 10), || edge_preserving_filter(photo))
     run("detail-enhance", max(2, repeats // 10), || detail_enhance(photo))
+
+    #: Contours and the shapes fitted to them. Every one of these was between
+    #: twenty and forty thousand times slower than the peer when it was first
+    #: timed, and none of it was measured by anything.
+    let (shapes, _tree) = find_contours(bytes_frame, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+    let single = shapes[0]
+    let canvas = Mat.zeros(HEIGHT, WIDTH, cv.CV_8UC3)
+    run_scalar("find-contours", max(2, repeats // 10), fn() -> float {
+        let (got, _h) = find_contours(bytes_frame, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+        return float(got.len())
+    })
+    run_scalar("find-contours-tree", max(2, repeats // 10), fn() -> float {
+        let (got, _h) = find_contours(bytes_frame, RETR_TREE, CHAIN_APPROX_SIMPLE)
+        return float(got.len())
+    })
+    run_scalar("convex-hull", repeats, fn() -> float {
+        var total = 0
+        for shape in shapes {
+            total += convex_hull(shape).len()
+        }
+        return float(total)
+    })
+    run_scalar("min-area-rect", repeats, fn() -> float {
+        var total = 0.0
+        for shape in shapes {
+            total += min_area_rect(shape).angle
+        }
+        return total
+    })
+    run_scalar("approx-poly-dp", repeats, fn() -> float {
+        var total = 0
+        for shape in shapes {
+            total += approx_poly_dp(shape, arc_length(shape, true) * 0.02, true).len()
+        }
+        return float(total)
+    })
+    run_scalar("min-enclosing-circle", repeats, fn() -> float {
+        let (_centre, radius) = min_enclosing_circle(single)
+        return radius
+    })
+    run_scalar("point-polygon-test", repeats, fn() -> float {
+        var total = 0.0
+        for k in 0..1000 {
+            total += point_polygon_test(single, Point2f(float(k % 640), float(k % 480)), true)
+        }
+        return total
+    })
+    #: Scalar rather than the usual `run`, because drawing is in place and
+    #: hands back the picture it was given: the harness releases the previous
+    #: result each iteration, and that would free the canvas out from under the
+    #: next call.
+    run_scalar("draw-contours", repeats, fn() -> float {
+        let painted = draw_contours(canvas, shapes, -1, Scalar(255.0, 255.0, 255.0, 0.0), 2)
+        return float(painted.rows)
+    })
 
     #: Inpainting and optical flow at 640 by 480. The peer's inpainter is a
     #: sequential march inward and takes the best part of a second on a 1080p

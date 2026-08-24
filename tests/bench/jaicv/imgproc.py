@@ -160,6 +160,46 @@ def main() -> int:
     run("edge-preserving", max(2, repeats // 10), lambda: cv2.edgePreservingFilter(photo))
     run("detail-enhance", max(2, repeats // 10), lambda: cv2.detailEnhance(photo))
 
+    # Contours and the shapes fitted to them. See the note in imgproc.jai.
+    shapes, _tree = cv2.findContours(
+        bytes_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    single = shapes[0]
+    canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    run(
+        "find-contours",
+        max(2, repeats // 10),
+        lambda: float(len(cv2.findContours(bytes_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0])),
+    )
+    run(
+        "find-contours-tree",
+        max(2, repeats // 10),
+        lambda: float(len(cv2.findContours(bytes_frame, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[0])),
+    )
+    run("convex-hull", repeats, lambda: float(sum(len(cv2.convexHull(s)) for s in shapes)))
+    run("min-area-rect", repeats, lambda: float(sum(cv2.minAreaRect(s)[2] for s in shapes)))
+    run(
+        "approx-poly-dp",
+        repeats,
+        lambda: float(sum(len(cv2.approxPolyDP(s, cv2.arcLength(s, True) * 0.02, True)) for s in shapes)),
+    )
+    run("min-enclosing-circle", repeats, lambda: float(cv2.minEnclosingCircle(single)[1]))
+    run(
+        "point-polygon-test",
+        repeats,
+        lambda: float(
+            sum(
+                cv2.pointPolygonTest(single, (float(k % 640), float(k % 480)), True)
+                for k in range(1000)
+            )
+        ),
+    )
+    run(
+        "draw-contours",
+        repeats,
+        lambda: cv2.drawContours(canvas, shapes, -1, (255, 255, 255), 2),
+    )
+
     small_rows, small_cols = 480, 640
     damaged = byte_picture(small_rows, small_cols)
     holes = blobby(small_rows, small_cols)
