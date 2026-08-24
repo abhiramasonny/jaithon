@@ -122,15 +122,20 @@ kernel void cc_seed(device const float* src [[buffer(0)]],
  *
  * Reading a snapshot rather than the live labels is sound because labels only
  * ever fall and the write is a minimum -- a stale read can only cost a round,
- * and the loop runs until a round changes nothing. `changed` is a plain
- * store of the same value from every thread that has news, which needs no
- * atomic and saves the round a dispatch to convert one. */
+ * and the loop runs until a round changes nothing.
+ *
+ * What is recorded is which round last had news, not whether any did. Rounds
+ * run in order, so the host can fire a batch of them and read one number to
+ * learn where they settled -- one wait for the batch instead of one a round,
+ * and a wait costs about as much as a round does. Every thread with news in
+ * a round stores the same value, so the store needs no atomic. */
 kernel void cc_propagate(device atomic_uint* labels [[buffer(0)]],
                          device float* changed [[buffer(1)]],
                          constant uint& rows [[buffer(2)]],
                          constant uint& cols [[buffer(3)]],
                          constant uint& connectivity [[buffer(4)]],
                          constant uint& across [[buffer(5)]],
+                         constant uint& round [[buffer(6)]],
                          uint lid [[thread_index_in_threadgroup]],
                          uint wid [[threadgroup_position_in_grid]]) {
     threadgroup uint tile[CC_HALO * CC_HALO];
@@ -170,7 +175,7 @@ kernel void cc_propagate(device atomic_uint* labels [[buffer(0)]],
     }
     if (best >= mine) return;
     atomic_fetch_min_explicit(&labels[mine - 1u], best, memory_order_relaxed);
-    changed[0] = 1.0f;
+    changed[0] = float(round);
 }
 
 /* Follow every chain to its end and point straight at it, so the next round
@@ -617,17 +622,25 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     let across = (cols + CC_TILE - 1) // CC_TILE
     let down = (rows + CC_TILE - 1) // CC_TILE
     var rounds = 0
+    var batch = CC_BATCH
     while rounds < count {
-        rounds += 1
         changed.fill_zero()
-        propagate.dispatch_async(
-            [labels, changed],
-            across * down * CC_GROUP,
-            [rows, cols, connectivity, across],
-            group_size: CC_GROUP
-        )
-        flatten.dispatch_async([labels], count, [count])
-        if changed.download()[0] == 0.0 { break }
+        for step in 0..batch {
+            propagate.dispatch_async(
+                [labels, changed],
+                across * down * CC_GROUP,
+                [rows, cols, connectivity, across, step + 1],
+                group_size: CC_GROUP
+            )
+            flatten.dispatch_async([labels], count, [count])
+        }
+        rounds += batch
+        #: A round with no news is the proof that the rounds before it
+        #: settled, so a batch whose last round was quiet is done. Widening
+        #: the batch keeps the waits logarithmic in how far a label has to
+        #: travel, on a frame that needs more of them than most.
+        if changed.download()[0] < float(batch) { break }
+        batch = min(batch * 2, CC_BATCH_MAX)
     }
 
     #: The partition is settled; what remains is the numbering, and OpenCV
@@ -845,6 +858,10 @@ const DT_BATCH = 24
 #: Threads in a row-scanning group. Eight simdgroups, which is what the
 #: stitching below assumes.
 #: Matched by `CC_TILE` and the group size in the kernel source.
+#: Rounds fired before the host asks how far they got.
+const CC_BATCH = 3
+const CC_BATCH_MAX = 64
+
 const CC_TILE = 16
 const CC_GROUP = 256
 
