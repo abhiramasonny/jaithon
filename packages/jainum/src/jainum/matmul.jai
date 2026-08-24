@@ -74,6 +74,11 @@ const TILE = 64
 #: `mm_fold` takes its parallelism from that axis instead.
 const FOLD_OUTPUTS = TILE * TILE
 
+#: Multiplies in one plane below which a batch is worth taking off MPSGraph.
+#: Picked at the shape the benchmark measures -- 256 cubed is 16.7 million --
+#: with room above it; a plane larger than this earns its own graph call.
+const _BATCH_MPS_FLOOR = 64 * 1024 * 1024
+
 #: Threadgroups the two-pass dot product runs over at most, so that the second
 #: pass folds what one group can hold: 1024 partials is four per thread.
 const DOT_GROUPS = 1024
@@ -105,6 +110,10 @@ kernel void mm_tile(device float* out [[buffer(0)]],
                     constant uint& a_at [[buffer(7)]],
                     constant uint& b_at [[buffer(8)]],
                     constant uint& out_at [[buffer(9)]],
+                    constant uint& tiles [[buffer(10)]],
+                    constant uint& a_stride [[buffer(11)]],
+                    constant uint& b_stride [[buffer(12)]],
+                    constant uint& out_stride [[buffer(13)]],
                     uint group [[threadgroup_position_in_grid]],
                     uint lid [[thread_index_in_threadgroup]]) {
     /* Staged as float4 so the arrays are 16-byte aligned and the inner loop
@@ -116,15 +125,19 @@ kernel void mm_tile(device float* out [[buffer(0)]],
 
     const bool trans_a = (flags & 1u) != 0u;
     const bool trans_b = (flags & 2u) != 0u;
+    /* `tiles` of zero means one product, which is every caller but the batched
+     * one; taking it as a sentinel keeps the single case free of a divide. */
+    const uint item = tiles == 0u ? 0u : group / tiles;
+    const uint local = tiles == 0u ? group : group - item * tiles;
     const uint across = (columns + MM_BN - 1u) / MM_BN;
-    const uint band = group / across;
+    const uint band = local / across;
     const uint tile_row = band * MM_BM;
-    const uint tile_col = (group - band * across) * MM_BN;
+    const uint tile_col = (local - band * across) * MM_BN;
     const uint ty = lid / (MM_BN / MM_TN);
     const uint tx = lid - ty * (MM_BN / MM_TN);
 
-    device const float* ap = a + a_at;
-    device const float* bp = b + b_at;
+    device const float* ap = a + a_at + item * a_stride;
+    device const float* bp = b + b_at + item * b_stride;
 
     float4 acc[MM_TM];
     for (uint i = 0u; i < MM_TM; i++) acc[i] = float4(0.0f);
@@ -184,7 +197,7 @@ kernel void mm_tile(device float* out [[buffer(0)]],
      * so this path is for the tiles a misaligned `a` or `b` sent here. */
     const uint column = tile_col + tx * MM_TN;
     const bool packed = (columns & 3u) == 0u && column + MM_TN <= columns;
-    device float* dst = out + out_at + column;
+    device float* dst = out + out_at + item * out_stride + column;
     for (uint i = 0u; i < MM_TM; i++) {
         const uint r = tile_row + ty * MM_TM + i;
         if (r >= rows) return;
@@ -459,9 +472,65 @@ fn _encode(
     kernel_of(SOURCE, "mm_tile").dispatch_async(
         [out.storage, a.storage, b.storage],
         across * down * GROUP,
-        [rows, inner, columns, flags, a_at, b_at, out_at],
+        [rows, inner, columns, flags, a_at, b_at, out_at, 0, 0, 0, 0],
         GROUP
     )
+}
+
+#: Every plane of a batch through the tiled kernel in ONE dispatch.
+#:
+#: Only for a batch whose planes sit at a constant stride, which is what a
+#: contiguous batch axis gives and what `_uniform_step` checks for.
+fn _encode_batched(
+    out: NDArray,
+    out_at: int,
+    a: NDArray,
+    a_at: int,
+    trans_a: bool,
+    b: NDArray,
+    b_at: int,
+    trans_b: bool,
+    rows: int,
+    inner: int,
+    columns: int,
+    planes: int,
+    a_stride: int,
+    b_stride: int,
+    out_stride: int
+) -> void {
+    var flags = 0
+    if trans_a { flags += 1 }
+    if trans_b { flags += 2 }
+    let across = (columns + TILE - 1) // TILE
+    let down = (rows + TILE - 1) // TILE
+    kernel_of(SOURCE, "mm_tile").dispatch_async(
+        [out.storage, a.storage, b.storage],
+        across * down * planes * GROUP,
+        [
+            rows,
+            inner,
+            columns,
+            flags,
+            a_at,
+            b_at,
+            out_at,
+            across * down,
+            a_stride,
+            b_stride,
+            out_stride,
+        ],
+        GROUP
+    )
+}
+
+#: The constant gap between consecutive entries, or null when there is none.
+fn _uniform_step(offsets: list[int]) -> int? {
+    if offsets.len() < 2 { return 0 }
+    let step = offsets[1] - offsets[0]
+    for at in 1..offsets.len() {
+        if offsets[at] - offsets[at - 1] != step { return null }
+    }
+    return step
 }
 
 #: Every plane of a batched product, one dispatch each and one flush at the end.
@@ -487,6 +556,69 @@ fn _product(
         return
     }
     let rank = batch.len()
+
+    #: One dispatch for the whole batch when every plane sits at the same gap
+    #: from the last, which a contiguous batch axis gives.
+    #:
+    #: Deliberately past MPSGraph rather than through it. MPS is the faster
+    #: route for ONE large product and the slower one for many small ones,
+    #: because the cost is per call: thirty-two planes of 256x256x256 reached
+    #: 1140 GFLOP/s as thirty-two graph calls where a single 2048-cubed product
+    #: reaches 6850 on the same device. Below `_BATCH_MPS_FLOOR` multiplies a
+    #: plane the batch goes to the tiled kernel instead, whatever MPS would
+    #: have taken.
+    if planes > 1 and rows * columns > FOLD_OUTPUTS and rows * inner * columns <= _BATCH_MPS_FLOOR {
+        var a_offsets: list[int] = []
+        var b_offsets: list[int] = []
+        var out_offsets: list[int] = []
+        var walk_counter = [0 for _axis in batch]
+        var wa = a.offset
+        var wb = b.offset
+        var wo = out.offset
+        for _step in 0..planes {
+            a_offsets.push(wa)
+            b_offsets.push(wb)
+            out_offsets.push(wo)
+            var axis = rank - 1
+            while axis >= 0 {
+                walk_counter[axis] += 1
+                wa += a.strides[axis]
+                wb += b.strides[axis]
+                wo += out.strides[axis]
+                if walk_counter[axis] < batch[axis] { break }
+                wa -= batch[axis] * a.strides[axis]
+                wb -= batch[axis] * b.strides[axis]
+                wo -= batch[axis] * out.strides[axis]
+                walk_counter[axis] = 0
+                axis -= 1
+            }
+        }
+        let a_step = _uniform_step(a_offsets)
+        let b_step = _uniform_step(b_offsets)
+        let out_step = _uniform_step(out_offsets)
+        if a_step is not null and b_step is not null and out_step is not null {
+            _encode_batched(
+                out,
+                out.offset,
+                a,
+                a.offset,
+                trans_a,
+                b,
+                b.offset,
+                trans_b,
+                rows,
+                inner,
+                columns,
+                planes,
+                a_step,
+                b_step,
+                out_step
+            )
+            gpu.flush()
+            return
+        }
+    }
+
     var counter = [0 for _axis in batch]
     var a_at = a.offset
     var b_at = b.offset
