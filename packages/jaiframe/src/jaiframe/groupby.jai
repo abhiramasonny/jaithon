@@ -1395,10 +1395,21 @@ pub class GroupBy {
         return picked
     }
 
+    #: A column with no missing lane has one present value in every row, so its
+    #: count per group is the group's own size -- which the grouping already
+    #: knows and caches, and which reads the codes rather than the values.
+    #: Counting it again was a second full pass over the column: `mean` cost
+    #: twice what `sum` did over the same two million rows, and a frame of
+    #: several value columns paid for it once per column.
     fn mean_column(self, column: Column) -> Column {
         let groups = self.group_total
         let total = self.reduce_lane(column, OP_SUM, null)
-        let present = self.reduce_lane(column, OP_COUNT, null)
+        let counted = if column.has_validity() {
+            self.reduce_lane(column, OP_COUNT, null)
+        } else {
+            null
+        }
+        let present = counted ?? self.sizes()
         let out = Buffer(max(1, groups))
         let valid = Buffer(max(1, groups))
         kernel_for("gb_finish").dispatch_async(
@@ -1407,7 +1418,8 @@ pub class GroupBy {
             [groups, FINISH_DIV, 0]
         )
         total.free()
-        present.free()
+        #: `sizes()` belongs to the handle and outlives this call.
+        if counted is not null { counted.free() }
         return adopt_lane(out, groups, Dtype.Float64, valid)
     }
 
