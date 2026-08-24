@@ -625,15 +625,25 @@ kernel void nd_binary(device float* dst [[buffer(0)]],
                       constant uint& mode [[buffer(6)]],
                       constant uint& low_bits [[buffer(7)]],
                       constant uint& high_bits [[buffer(8)]],
+                      constant uint& a_wrap [[buffer(9)]],
+                      constant uint& b_wrap [[buffer(10)]],
                       uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
+    /* Zero is dense; anything else is an operand that repeats every `wrap`
+     * elements, which is a row against every row of a matrix. That case used
+     * to fall to the strided walk and read 67 GB/s where the dense pair reads
+     * 355 for more bytes. One divide against a whole index walk. */
+    uint ai = a_wrap == 0u ? id : id - (id / a_wrap) * a_wrap;
+    uint bi = b_wrap == 0u ? id : id - (id / b_wrap) * b_wrap;
     if (lanes == 1u) {
-        float value = nd_apply(a[id], b[id], op);
+        float value = nd_apply(a[ai], b[bi], op);
         dst[id] = nd_convert(value, mode, as_type<float>(low_bits), as_type<float>(high_bits));
         return;
     }
     uint at = id * 2u;
-    float2 value = nd_apply2(float2(a[at], a[at + 1u]), float2(b[at], b[at + 1u]), op);
+    uint aat = ai * 2u;
+    uint bat = bi * 2u;
+    float2 value = nd_apply2(float2(a[aat], a[aat + 1u]), float2(b[bat], b[bat + 1u]), op);
     dst[at] = value.x;
     dst[at + 1u] = value.y;
 }
@@ -1413,6 +1423,21 @@ pub fn fill(a: NDArray, value: float, mask: NDArray? = null) -> void {
 #: re-exports them under numpy's names rather than compiling the arithmetic a
 #: second time. A class method cannot live in another file and the import DAG
 #: forbids a cycle, so this is where they have to be.
+#: Whether `sub` is exactly the trailing axes of `shape`.
+#:
+#: Exactly: no size-one axis standing in for a longer one. That is what makes
+#: element `i` of the broadcast result element `i % size` of the operand, which
+#: is what lets a repeating operand stay on a dense kernel instead of going
+#: through the strided walk.
+pub fn is_trailing(sub: list[int], shape: list[int]) -> bool {
+    if sub.len() == 0 or sub.len() >= shape.len() { return false }
+    let lead = shape.len() - sub.len()
+    for axis in 0..sub.len() {
+        if sub[axis] != shape[lead + axis] { return false }
+    }
+    return true
+}
+
 pub fn binary_arith(left: NDArray, right: any, op: int) -> NDArray {
     if right is NDArray { return _binary_arrays(left, right, op) }
     return _binary_scalar(left, _as_float(right), _scalar_dtype(right), op)
@@ -1447,6 +1472,15 @@ fn _result_dtype(a: int, b: int, op: int) -> int {
     return out
 }
 
+#: 0 when the operand is dense and the full shape, its length when it repeats,
+#: and -1 when neither and the strided walk has to run.
+fn _wrap_of(a: NDArray, shape: list[int]) -> int {
+    if a.offset != 0 or not a.is_contiguous() { return -1 }
+    if a.shape == shape { return 0 }
+    if is_trailing(a.shape, shape) { return a.size() }
+    return -1
+}
+
 fn _binary_arrays(left: NDArray, right: NDArray, op: int) -> NDArray {
     let dtype = _result_dtype(left.dtype, right.dtype, op)
     let (a, b) = broadcast_pair(left, right)
@@ -1468,11 +1502,15 @@ fn _binary_arrays(left: NDArray, right: NDArray, op: int) -> NDArray {
     let mode = _cast_mode(dtype)
     let low = f32_bits(dtype_min(dtype))
     let high = f32_bits(dtype_max(dtype))
-    if a.offset == 0 and a.is_contiguous() and b.offset == 0 and b.is_contiguous() {
+    #: `broadcast_pair` has already made stride-zero views, so ask the ORIGINAL
+    #: operands whether one of them merely repeats.
+    let a_wrap = _wrap_of(left, a.shape)
+    let b_wrap = _wrap_of(right, a.shape)
+    if a_wrap >= 0 and b_wrap >= 0 {
         kernel_of(SOURCE, "nd_binary").dispatch_async(
-            [out.storage, a.storage, b.storage],
+            [out.storage, left.storage, right.storage],
             count,
-            [count, lanes, op, mode, low, high]
+            [count, lanes, op, mode, low, high, a_wrap, b_wrap]
         )
         return out
     }

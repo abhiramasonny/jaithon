@@ -48,7 +48,7 @@ from .array import CAST_BOOL, CAST_NONE, CAST_ROUND
 from .array import OP_ADD, OP_DIV, OP_MUL, OP_SUB
 from .array import NDArray, PRELUDE, binary_arith, broadcast_shapes
 from .array import dtype_is_complex, dtype_is_integer, dtype_max, dtype_min, dtype_name
-from .array import f32_bits, kernel_of, layout_buffer, promote, require_real
+from .array import f32_bits, is_trailing, kernel_of, layout_buffer, promote, require_real
 
 #: An infinity, which is what an open `clip` bound is.
 let _INF = 1.0e308 * 10.0
@@ -881,20 +881,6 @@ fn _operand(value: any) -> (NDArray, bool) {
 
 #: How the fast path would read this operand: 1 for one element per thread, 0
 #: for one element for all of them, -1 when it cannot be read that way at all.
-#: Whether `sub` is exactly the trailing axes of `shape`.
-#:
-#: Exactly: no size-one axis standing in for a longer one. That is what makes
-#: element `i` of the broadcast result element `i % size` of the operand, which
-#: is the whole basis of the wrap below.
-fn _is_trailing(sub: list[int], shape: list[int]) -> bool {
-    if sub.len() == 0 or sub.len() >= shape.len() { return false }
-    let lead = shape.len() - sub.len()
-    for axis in 0..sub.len() {
-        if sub[axis] != shape[lead + axis] { return false }
-    }
-    return true
-}
-
 #: 0 for one value over everything, 1 for dense, `n` for an operand that
 #: repeats every `n`. See `nf_load4` for what the kernel does with it.
 fn _dense_step(a: NDArray, shape: list[int]) -> int {
@@ -902,7 +888,7 @@ fn _dense_step(a: NDArray, shape: list[int]) -> int {
     if a.size() == 1 { return 0 }
     if not a.is_contiguous() { return -1 }
     if a.shape == shape { return 1 }
-    if a.size() % 4 == 0 and _is_trailing(a.shape, shape) { return a.size() }
+    if a.size() % 4 == 0 and is_trailing(a.shape, shape) { return a.size() }
     return -1
 }
 
