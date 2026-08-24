@@ -527,20 +527,39 @@ pub class Mat: Printable {
     #: Every element in row-major order, channels interleaved.
     #: A COPY of every element, in row-major order.
     #:
-    #: The copy is not free -- at VGA it is five milliseconds against one and a
-    #: third for the download it protects -- so anything inside this library
-    #: that only reads should call `values` instead. This stays copying because
-    #: it is the public accessor and a caller who mutates what it hands back
-    #: would corrupt the mirror every later read comes from.
-    pub fn to_list(self) -> list[float] { return [value for value in self.ensure_host()] }
+    #: The copy is not free -- at VGA it is eight tenths of a millisecond
+    #: against six tenths for the download it protects -- so anything inside
+    #: this library that only reads should call `values` instead. This stays
+    #: copying because it is the public accessor and a caller who mutates what
+    #: it hands back would corrupt the mirror every later read comes from.
+    #:
+    #: Spelled out rather than as `[value for value in self.ensure_host()]`,
+    #: which the tier declines on both routes, so the copy ran interpreted at
+    #: every element: a whole-body compile cannot type the loop variable
+    #: because a call result carries no sampled value to read an element off,
+    #: and OSR cannot enter a loop whose accumulator and iterator are operand
+    #: stack entries older than the entry point. A local accumulator is
+    #: neither of those -- OSR reads every local off the live frame, so both
+    #: get a kind and the loop compiles. VGA went from 2.6 ms to 0.78 ms,
+    #: which is what took the copy from four times the download it protects
+    #: to level with it. 52 call sites in this library read pixels this way.
+    pub fn to_list(self) -> list[float] {
+        let source = self.ensure_host()
+        var copy: list[float] = []
+        for value in source { copy.push(value) }
+        return copy
+    }
 
     #: The live host mirror itself, without the copy. READ ONLY.
     #:
     #: Writing through this corrupts the cache that every later read shares --
-    #: `edit` is the way to change pixels. It exists because copying is most of
-    #: what reading an image cost: a 640x480 `to_list` was seven milliseconds,
-    #: of which five and a half were the copy, and every host-side algorithm in
-    #: this library begins with one.
+    #: `edit` is the way to change pixels. It exists because copying was most
+    #: of what reading an image cost: a 640x480 `to_list` was seven
+    #: milliseconds, of which five and a half were the copy, and every
+    #: host-side algorithm in this library begins with one. Compiling that
+    #: copy has since brought it under the download, so the gap is no longer
+    #: the four-to-one it was -- but it is still a whole second traversal of
+    #: the image, and this is still the call that avoids it.
     pub fn values(self) -> list[float] { return self.ensure_host() }
 
     #: Every element clamped and rounded into bytes, the layout an encoder or a

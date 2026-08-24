@@ -74,12 +74,28 @@ orders of magnitude slower than the same fit dispatched.
 ## Layout
 
 `base.jai` is the foundation: the `Estimator` trait, the `Params` and `Scorer`
-types, the validation helpers, `LabelIndex`, and the device kit. Every other
-module imports it and nothing else of jailearn's, which is what lets the
-modules be written and reviewed independently.
+types, the validation helpers, `LabelIndex`, and the device kit.
+
+`shared.jai` is the second layer — the machinery more than one estimator
+family needs, so those families do not have to import each other. Binning
+(`bin_edges`, `bin_codes`, `bin_centres`), the atomic histogram every split
+search reduces to (`bin_histograms`), the split rule and its threadgroup scan
+(`SplitRule`, `split_gains`, `best_split`), the device form of a fitted tree
+(`TreeArrays`, `tree_accumulate`, `forest_mean`), the samplers
+(`permutation`, `bootstrap_rows`, `choose_features`, `sample_weights`), the
+linear helpers (`add_bias`, `linear_scores`, `soft_threshold`,
+`column_norms`), and `Descent`, which is why every iterative fit in the
+package reports `n_iter` and `converged` the same way.
+
+`pipeline.jai` composes estimators: `Pipeline`, `ColumnTransformer` and
+`FeatureUnion`, with `__` routing a parameter down to a named step.
+
+An estimator module imports `base` and `shared` and nothing else of
+jailearn's, which is what lets the modules be written and reviewed
+independently.
 
 Metal entry points are prefixed with their module's short name —
-`base_column_reduce`, `tree_histogram`, `svm_smo_gradient` — because
+`base_column_reduce`, `sh_histogram`, `svm_smo_gradient` — because
 `base.cached_kernel(source, entry)` caches on the entry name alone and two
 modules that both picked `assign` would silently share one kernel.
 

@@ -729,3 +729,99 @@ fn test_backward_seeds_a_rank_two_loss_with_a_rank_two_gradient() -> void {
     x.free()
     ones.free()
 }
+
+fn worst_gap(got: list[float], want: list[float]) -> float {
+    var gap = 0.0
+    for i in 0..got.len() {
+        let here = abs(got[i] - want[i])
+        if here > gap { gap = here }
+    }
+    return gap
+}
+
+#: Attention, forward and backward, against the same arithmetic per head.
+#:
+#: `multi_head_attention` on a graph that wants gradients has two
+#: implementations behind the one name: a batch of simdgroup-matrix dispatches
+#: when the head dimension is 64 and the sequence fills whole 64-row tiles, and
+#: a loop of per-head GEMMs when it does not. Neither of them is the reference
+#: here. The reference is built out of `slice_flat`, `matmul`, `scale`,
+#: `softmax` and `cat`, each of which carries its own separate gradient, so
+#: what is being compared is two routes through the library rather than two
+#: branches of one function.
+#:
+#: Both head counts matter because they take different routes: at 2 heads the
+#: head dimension is 64 and the batched kernels run, at 4 it is 32 and the loop
+#: does. The tolerance is what summing the same products in a different order
+#: costs -- the batched kernels accumulate along a whole 8-wide fragment where
+#: the GEMM accumulates along its own tile, and the sums are float32.
+fn test_multi_head_attention_matches_a_per_head_composition_both_ways() -> void {
+    if not have_gpu() { return }
+    let seq = 64
+    let dim = 128
+    var qv: list[float] = []
+    var kv: list[float] = []
+    var vv: list[float] = []
+    for i in 0..seq * dim {
+        qv.push(float(i * 7 % 23) / 11.0 - 1.0)
+        kv.push(float(i * 5 % 17) / 8.0 - 1.0)
+        vv.push(float(i * 3 % 13) / 6.0 - 1.0)
+    }
+    for heads in [2, 4] {
+        let hd = dim // heads
+        let q = Tensor([seq, dim], qv, requires_grad: true)
+        let k = Tensor([seq, dim], kv, requires_grad: true)
+        let v = Tensor([seq, dim], vv, requires_grad: true)
+        let out = jt.multi_head_attention(q, k, v, heads)
+        let got = out.download()
+        let loss = sum_op(out)
+        let junk = loss.backward()
+        let gq = q.grad
+        let gk = k.grad
+        let gv = v.grad
+        if gq is null { throw AssertionError("attention set no gradient for the query") }
+        if gk is null { throw AssertionError("attention set no gradient for the key") }
+        if gv is null { throw AssertionError("attention set no gradient for the value") }
+        let got_q = gq.download()
+        let got_k = gk.download()
+        let got_v = gv.download()
+
+        let rq = Tensor([seq, dim], qv, requires_grad: true)
+        let rk = Tensor([seq, dim], kv, requires_grad: true)
+        let rv = Tensor([seq, dim], vv, requires_grad: true)
+        let qs = split_heads(rq, heads)
+        let ks = split_heads(rk, heads)
+        let vs = split_heads(rv, heads)
+        let factor = 1.0 / math.sqrt(float(hd))
+        var parts: list[Tensor] = []
+        for h in 0..heads {
+            let qh = slice_flat(qs, h * seq * hd, [seq, hd])
+            let kh = slice_flat(ks, h * seq * hd, [seq, hd])
+            let vh = slice_flat(vs, h * seq * hd, [seq, hd])
+            let scores = matmul(qh, kh, trans_b: true)
+            let probs = softmax(scale(scores, factor))
+            parts.push(matmul(probs, vh))
+        }
+        let packed = cat(parts)
+        let reference = merge_heads(packed, heads, seq)
+        let want = reference.download()
+        let rloss = sum_op(reference)
+        let more = rloss.backward()
+        let wq = rq.grad
+        let wk = rk.grad
+        let wv = rv.grad
+        if wq is null { throw AssertionError("the reference set no gradient for the query") }
+        if wk is null { throw AssertionError("the reference set no gradient for the key") }
+        if wv is null { throw AssertionError("the reference set no gradient for the value") }
+        let forward_gap = worst_gap(got, want)
+        let query_gap = worst_gap(got_q, wq.download())
+        let key_gap = worst_gap(got_k, wk.download())
+        let value_gap = worst_gap(got_v, wv.download())
+        assert_true(forward_gap < 1e-4, f"{heads} heads: forward differs by {forward_gap}")
+        assert_true(query_gap < 1e-4, f"{heads} heads: query gradient differs by {query_gap}")
+        assert_true(key_gap < 1e-4, f"{heads} heads: key gradient differs by {key_gap}")
+        assert_true(value_gap < 1e-4, f"{heads} heads: value gradient differs by {value_gap}")
+        for tensor in junk { tensor.free() }
+        for tensor in more { tensor.free() }
+    }
+}

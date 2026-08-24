@@ -35,6 +35,7 @@ from jaicv.videoio.capture import CAP_PROP_FRAME_HEIGHT, CAP_PROP_FRAME_WIDTH
 from jaicv.videoio.capture import CAP_PROP_POS_FRAMES
 from jaicv.videoio.writer import fourcc, VideoWriter
 from jaicv.core.types import Point2f
+from jaicv.imgproc.shape import min_enclosing_circle
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -1001,4 +1002,168 @@ fn test_every_norm_matches_its_definition() -> void {
         1e-4,
         "a constant shift has that infinity norm"
     )
+}
+
+#: The radius a circle at `(cx, cy)` needs to hold every point.
+fn radius_needed(points: list[Point], cx: float, cy: float) -> float {
+    var worst = 0.0
+    for point in points {
+        let dx = float(point.x) - cx
+        let dy = float(point.y) - cy
+        let squared = dx * dx + dy * dy
+        if squared > worst { worst = squared }
+    }
+    return math.sqrt(worst)
+}
+
+#: The smallest enclosing circle worked out from the definition.
+#:
+#: The centre of the smallest circle is the midpoint of some pair of the points
+#: or the circumcentre of some triple of them, so trying every one of those and
+#: keeping whichever needs the smallest radius answers the question outright.
+#: Cubic in the number of points and quite unlike the walk it is checking,
+#: which is the point of it.
+fn smallest_circle_by_search(points: list[Point]) -> list[float] {
+    let count = points.len()
+    if count == 0 { return [0.0, 0.0, 0.0] }
+    if count == 1 { return [float(points[0].x), float(points[0].y), 0.0] }
+
+    var best_x = 0.0
+    var best_y = 0.0
+    var best_radius = 1e300
+    for i in 0..count {
+        for j in i + 1..count {
+            let cx = (float(points[i].x) + float(points[j].x)) * 0.5
+            let cy = (float(points[i].y) + float(points[j].y)) * 0.5
+            let radius = radius_needed(points, cx, cy)
+            if radius < best_radius {
+                best_x = cx
+                best_y = cy
+                best_radius = radius
+            }
+        }
+    }
+    for i in 0..count {
+        for j in i + 1..count {
+            for k in j + 1..count {
+                let ax = float(points[i].x)
+                let ay = float(points[i].y)
+                let bx = float(points[j].x)
+                let by = float(points[j].y)
+                let px = float(points[k].x)
+                let py = float(points[k].y)
+                let d = 2.0 * (ax * (by - py) + bx * (py - ay) + px * (ay - by))
+                if math.fabs(d) <= 1e-9 { continue }
+                let a2 = ax * ax + ay * ay
+                let b2 = bx * bx + by * by
+                let p2 = px * px + py * py
+                let cx = (a2 * (by - py) + b2 * (py - ay) + p2 * (ay - by)) / d
+                let cy = (a2 * (px - bx) + b2 * (ax - px) + p2 * (bx - ax)) / d
+                let radius = radius_needed(points, cx, cy)
+                if radius < best_radius {
+                    best_x = cx
+                    best_y = cy
+                    best_radius = radius
+                }
+            }
+        }
+    }
+    return [best_x, best_y, best_radius]
+}
+
+#: A deterministic scatter, so a failure can be reproduced from the seed alone.
+fn scattered(count: int, seed: int, span: int) -> list[Point] {
+    var state = seed * 2 + 1
+    var out: list[Point] = []
+    for _index in 0..count {
+        state = (state * 1103515245 + 12345) % 2147483648
+        let x = state % span
+        state = (state * 1103515245 + 12345) % 2147483648
+        let y = state % span
+        out.push(Point(x, y))
+    }
+    return out
+}
+
+#: The circle Welzl's walk returns is the one the definition asks for.
+#:
+#: Checked against a search over every pair and every triple, which is a
+#: different algorithm entirely -- and the one this used to be, before it cost
+#: 85 ms on a 452-point contour. The shapes are the ones that break a minidisk
+#: implementation: a set whose answer rests on two points, one whose answer
+#: rests on three, points on a line and points repeated, where the
+#: circumcircle's determinant vanishes.
+fn test_the_smallest_enclosing_circle_matches_a_search_for_it() -> void {
+    var cases: list[list[Point]] = []
+    cases.push([Point(0, 0), Point(10, 0), Point(5, 9)])
+    cases.push([Point(0, 0), Point(20, 0), Point(20, 20), Point(0, 20)])
+    cases.push([Point(0, 0), Point(30, 1), Point(15, 2)])
+    cases.push([Point(4, 4), Point(4, 4), Point(4, 4)])
+    cases.push([Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3), Point(4, 4)])
+    cases.push([Point(-7, 3), Point(9, -2)])
+    var ring: list[Point] = []
+    for step in 0..12 {
+        let angle = float(step) * math.PI / 6.0
+        ring.push(Point(int(50.0 + 40.0 * math.cos(angle)), int(50.0 + 40.0 * math.sin(angle))))
+    }
+    cases.push(ring)
+    for seed in 0..6 { cases.push(scattered(14 + seed, seed, 60 + seed * 13)) }
+    for seed in 0..3 { cases.push(scattered(18, seed + 20, 7)) }
+
+    for sample in cases {
+        let want = smallest_circle_by_search(sample)
+        let (centre, radius) = min_enclosing_circle(sample)
+        let scale = if want[2] > 1.0 { want[2] } else { 1.0 }
+        assert_near(radius, want[2], scale * 1e-9, "the radius the search found")
+        assert_near(centre.x, want[0], scale * 1e-6, "the centre the search found, x")
+        assert_near(centre.y, want[1], scale * 1e-6, "the centre the search found, y")
+
+        #: Being the right size is not the whole of it: the circle also has to
+        #: hold what it was given, which is the invariant the shuffle inside
+        #: could break without changing the radius by much.
+        assert_true(
+            radius_needed(sample, centre.x, centre.y) <= radius + 1e-9,
+            "every point is inside the circle"
+        )
+    }
+}
+
+#: Reordering a contour does not move its smallest enclosing circle.
+#:
+#: The walk shuffles what it is given and starts from an extreme pair, so the
+#: order it sees is not the order it was handed -- and a bug in either step
+#: would show up as an answer that depends on where the contour was cut.
+fn test_the_smallest_enclosing_circle_ignores_the_order_it_is_given() -> void {
+    let base = scattered(120, 5, 400)
+    let (centre, radius) = min_enclosing_circle(base)
+    for cut in 1..7 {
+        var rolled: list[Point] = []
+        let offset = cut * 17
+        for index in 0..base.len() { rolled.push(base[(index + offset) % base.len()]) }
+        let (moved, moved_radius) = min_enclosing_circle(rolled)
+        assert_near(moved_radius, radius, radius * 1e-12, "the radius after rolling")
+        assert_near(moved.x, centre.x, 1e-9, "the centre after rolling, x")
+        assert_near(moved.y, centre.y, 1e-9, "the centre after rolling, y")
+    }
+
+    var backwards: list[Point] = []
+    for index in 0..base.len() { backwards.push(base[base.len() - 1 - index]) }
+    let (flipped, flipped_radius) = min_enclosing_circle(backwards)
+    assert_near(flipped_radius, radius, radius * 1e-12, "the radius reversed")
+    assert_near(flipped.x, centre.x, 1e-9, "the centre reversed, x")
+    assert_near(flipped.y, centre.y, 1e-9, "the centre reversed, y")
+}
+
+#: Degenerate inputs answer rather than divide by zero.
+fn test_the_smallest_enclosing_circle_of_nothing_and_of_one_point() -> void {
+    var empty: list[Point] = []
+    let (nowhere, nothing) = min_enclosing_circle(empty)
+    assert_eq(nothing, 0.0, "no points, no radius")
+    assert_eq(nowhere.x, 0.0, "no points, no centre x")
+    assert_eq(nowhere.y, 0.0, "no points, no centre y")
+
+    let (alone, none) = min_enclosing_circle([Point(6, -4)])
+    assert_eq(none, 0.0, "one point, no radius")
+    assert_eq(alone.x, 6.0, "one point is its own centre, x")
+    assert_eq(alone.y, -4.0, "one point is its own centre, y")
 }

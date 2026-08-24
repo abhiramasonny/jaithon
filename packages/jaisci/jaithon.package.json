@@ -4,5 +4,7 @@
   "version": "0.1.0",
   "description": "Scientific computing: optimisation, integration, interpolation, signal processing, sparse matrices, spatial structures, statistics",
   "source": "src",
-  "dependencies": {}
+  "dependencies": {
+    "jainum": "^0.1.0"
+  }
 }

@@ -527,59 +527,352 @@ kernel void col2im_nhwc(device const float* col [[buffer(0)]],
     grad[id] = total;
 }
 
-kernel void max_pool2d_backward_nhwc(device const float* input [[buffer(0)]],
-                                     device const float* upstream [[buffer(1)]],
-                                     device float* grad [[buffer(2)]],
-                                     constant uint& N [[buffer(3)]],
-                                     constant uint& H [[buffer(4)]],
-                                     constant uint& W [[buffer(5)]],
-                                     constant uint& C [[buffer(6)]],
-                                     constant uint& KH [[buffer(7)]],
-                                     constant uint& KW [[buffer(8)]],
-                                     constant uint& SH [[buffer(9)]],
-                                     constant uint& SW [[buffer(10)]],
-                                     constant uint& PH [[buffer(11)]],
-                                     constant uint& PW [[buffer(12)]],
-                                     constant uint& OH [[buffer(13)]],
-                                     constant uint& OW [[buffer(14)]],
-                                     uint id [[thread_position_in_grid]]) {
-    uint count = N * H * W * C;
-    if (id >= count) return;
-    uint c = id % C;
-    uint iw = (id / C) % W;
-    uint ih = (id / (C * W)) % H;
-    uint n = id / (C * W * H);
-    float here = input[id];
+/* Max pooling's backward for windows that overlap, in two passes.
+ *
+ * One pass cannot do it: a thread holding an input element does not know
+ * whether it won a window without scanning that window, and with overlapping
+ * windows it is in several. The kernel this replaces did exactly that -- for
+ * each of the windows covering it, rescan the whole window -- and so read k^4
+ * elements to write one. A 3x3 stride-2 window over [64,56,56,64] took 2.90 ms
+ * against torch's 1.07 for the same shape. These two passes take 0.43.
+ *
+ * So the scan happens once per window instead: the first pass writes, for each
+ * output, which tap of its window won, and the second reads those back. The
+ * taps are the same size as the output, a quarter of the input at stride two,
+ * and the second pass reads each one only from the handful of inputs it can
+ * speak for.
+ *
+ * The taps are floats rather than integers because that is the buffer the
+ * tensor allocator hands out, and a tap index is small enough to be exact in
+ * one. -1 means the window found no winner, which happens when every value in
+ * it is NaN, or is smaller than the sentinel the scan starts from.
+ *
+ * The second pass walks the windows in descending order, which is the order
+ * the single-pass form summed them in -- it counted taps up and so windows
+ * down -- so a gradient that lands in more than one window adds up to the same
+ * float it did before. */
+kernel void max_pool2d_taps_nhwc(device const float* input [[buffer(0)]],
+                                 device float* taps [[buffer(1)]],
+                                 constant uint& N [[buffer(2)]],
+                                 constant uint& H [[buffer(3)]],
+                                 constant uint& W [[buffer(4)]],
+                                 constant uint& C [[buffer(5)]],
+                                 constant uint& KH [[buffer(6)]],
+                                 constant uint& KW [[buffer(7)]],
+                                 constant uint& SH [[buffer(8)]],
+                                 constant uint& SW [[buffer(9)]],
+                                 constant uint& PH [[buffer(10)]],
+                                 constant uint& PW [[buffer(11)]],
+                                 constant uint& OH [[buffer(12)]],
+                                 constant uint& OW [[buffer(13)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id >= N * OH * OW * C) return;
+    uint rest = id / C;
+    uint c = id - rest * C;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    float peak = -3.402823e+38f;
+    float best = -1.0f;
+    for (uint kh = 0u; kh < KH; ++kh) {
+        int ih = int(oh * SH) - int(PH) + int(kh);
+        if (ih < 0 || ih >= int(H)) continue;
+        for (uint kw = 0u; kw < KW; ++kw) {
+            int iw = int(ow * SW) - int(PW) + int(kw);
+            if (iw < 0 || iw >= int(W)) continue;
+            float v = input[((n * H + uint(ih)) * W + uint(iw)) * C + c];
+            if (v > peak) { peak = v; best = float(kh * KW + kw); }
+        }
+    }
+    taps[id] = best;
+}
+
+/* Four channels at a time; see the note on the forward pass.
+ *
+ * This is where the quads pay in this operation. Both passes decode a position
+ * with three divisions and the device has no integer divide, and the two of
+ * them together on [64,56,56,64] run at 0.44 ms with four channels a thread
+ * against 1.20 scalar -- 2.7x, at 3x3 stride 2 and at 2x2 alike. The disjoint
+ * arm gets nothing from the same change because it is already at the memory
+ * ceiling; this arm reads the input, writes the taps, reads them back and
+ * writes the gradient, and the arithmetic per byte is what a thread waits on.
+ * A channel count that is not a multiple of four takes the scalar pair. */
+kernel void max_pool2d_taps_nhwc4(device const float4* input [[buffer(0)]],
+                                  device float4* taps [[buffer(1)]],
+                                  constant uint& N [[buffer(2)]],
+                                  constant uint& H [[buffer(3)]],
+                                  constant uint& W [[buffer(4)]],
+                                  constant uint& C [[buffer(5)]],
+                                  constant uint& KH [[buffer(6)]],
+                                  constant uint& KW [[buffer(7)]],
+                                  constant uint& SH [[buffer(8)]],
+                                  constant uint& SW [[buffer(9)]],
+                                  constant uint& PH [[buffer(10)]],
+                                  constant uint& PW [[buffer(11)]],
+                                  constant uint& OH [[buffer(12)]],
+                                  constant uint& OW [[buffer(13)]],
+                                  uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * OH * OW * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    float4 peak = float4(-3.402823e+38f);
+    float4 best = float4(-1.0f);
+    for (uint kh = 0u; kh < KH; ++kh) {
+        int ih = int(oh * SH) - int(PH) + int(kh);
+        if (ih < 0 || ih >= int(H)) continue;
+        for (uint kw = 0u; kw < KW; ++kw) {
+            int iw = int(ow * SW) - int(PW) + int(kw);
+            if (iw < 0 || iw >= int(W)) continue;
+            float4 v = input[((n * H + uint(ih)) * W + uint(iw)) * quads + q];
+            bool4 took = v > peak;
+            peak = select(peak, v, took);
+            best = select(best, float4(float(kh * KW + kw)), took);
+        }
+    }
+    taps[id] = best;
+}
+
+/* Which windows an input row can be in, given where it sits.
+ *
+ * Row `ih` is in window `oh` when `oh * S - P <= ih <= oh * S - P + K - 1`,
+ * which bounds `oh` both ways. Working the bounds out costs two divisions,
+ * where testing every tap for divisibility -- what the single-pass form did --
+ * cost two per tap, and the device has no integer divide. */
+static inline uint2 window_span(uint ih, uint K, uint S, uint P, uint O) {
+    uint reach = ih + P;
+    uint last = reach / S;
+    if (last > O - 1u) last = O - 1u;
+    int room = int(reach) - int(K) + 1;
+    uint first = room <= 0 ? 0u : uint((room + int(S) - 1) / int(S));
+    return uint2(first, last);
+}
+
+kernel void max_pool2d_backward_taps_nhwc(device const float* taps [[buffer(0)]],
+                                          device const float* upstream [[buffer(1)]],
+                                          device float* grad [[buffer(2)]],
+                                          constant uint& N [[buffer(3)]],
+                                          constant uint& H [[buffer(4)]],
+                                          constant uint& W [[buffer(5)]],
+                                          constant uint& C [[buffer(6)]],
+                                          constant uint& KH [[buffer(7)]],
+                                          constant uint& KW [[buffer(8)]],
+                                          constant uint& SH [[buffer(9)]],
+                                          constant uint& SW [[buffer(10)]],
+                                          constant uint& PH [[buffer(11)]],
+                                          constant uint& PW [[buffer(12)]],
+                                          constant uint& OH [[buffer(13)]],
+                                          constant uint& OW [[buffer(14)]],
+                                          uint id [[thread_position_in_grid]]) {
+    if (id >= N * H * W * C) return;
+    uint rest = id / C;
+    uint c = id - rest * C;
+    uint row = rest / W;
+    uint iw = rest - row * W;
+    uint n = row / H;
+    uint ih = row - n * H;
+    uint2 down = window_span(ih, KH, SH, PH, OH);
+    uint2 across = window_span(iw, KW, SW, PW, OW);
     float total = 0.0f;
-    for (uint kh = 0; kh < KH; ++kh) {
-        int top = int(ih) + int(PH) - int(kh);
-        if (top < 0 || uint(top) % SH != 0) continue;
-        uint oh = uint(top) / SH;
-        if (oh >= OH) continue;
-        for (uint kw = 0; kw < KW; ++kw) {
-            int left = int(iw) + int(PW) - int(kw);
-            if (left < 0 || uint(left) % SW != 0) continue;
-            uint ow = uint(left) / SW;
-            if (ow >= OW) continue;
-            float peak = -3.402823e+38f;
-            uint best = 0xffffffffu;
-            for (uint wh = 0; wh < KH; ++wh) {
-                for (uint ww = 0; ww < KW; ++ww) {
-                    int sh = int(oh * SH) - int(PH) + int(wh);
-                    int sw = int(ow * SW) - int(PW) + int(ww);
-                    if (sh < 0 || sw < 0 || sh >= int(H) || sw >= int(W)) continue;
-                    uint slot = ((n * H + uint(sh)) * W + uint(sw)) * C + c;
-                    float v = input[slot];
-                    if (v > peak) { peak = v; best = slot; }
-                }
+    if (down.x <= down.y && across.x <= across.y) {
+        for (uint oh = down.y + 1u; oh-- > down.x;) {
+            uint kh = ih + PH - oh * SH;
+            for (uint ow = across.y + 1u; ow-- > across.x;) {
+                uint kw = iw + PW - ow * SW;
+                uint out = ((n * OH + oh) * OW + ow) * C + c;
+                if (taps[out] == float(kh * KW + kw)) total += upstream[out];
             }
-            if (best == id && peak == here)
-                total += upstream[((n * OH + oh) * OW + ow) * C + c];
         }
     }
     grad[id] = total;
 }
 
+kernel void max_pool2d_backward_taps_nhwc4(device const float4* taps [[buffer(0)]],
+                                           device const float4* upstream [[buffer(1)]],
+                                           device float4* grad [[buffer(2)]],
+                                           constant uint& N [[buffer(3)]],
+                                           constant uint& H [[buffer(4)]],
+                                           constant uint& W [[buffer(5)]],
+                                           constant uint& C [[buffer(6)]],
+                                           constant uint& KH [[buffer(7)]],
+                                           constant uint& KW [[buffer(8)]],
+                                           constant uint& SH [[buffer(9)]],
+                                           constant uint& SW [[buffer(10)]],
+                                           constant uint& PH [[buffer(11)]],
+                                           constant uint& PW [[buffer(12)]],
+                                           constant uint& OH [[buffer(13)]],
+                                           constant uint& OW [[buffer(14)]],
+                                           uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * H * W * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / W;
+    uint iw = rest - row * W;
+    uint n = row / H;
+    uint ih = row - n * H;
+    uint2 down = window_span(ih, KH, SH, PH, OH);
+    uint2 across = window_span(iw, KW, SW, PW, OW);
+    float4 total = float4(0.0f);
+    if (down.x <= down.y && across.x <= across.y) {
+        for (uint oh = down.y + 1u; oh-- > down.x;) {
+            uint kh = ih + PH - oh * SH;
+            for (uint ow = across.y + 1u; ow-- > across.x;) {
+                uint kw = iw + PW - ow * SW;
+                uint out = ((n * OH + oh) * OW + ow) * quads + q;
+                bool4 mine = taps[out] == float4(float(kh * KW + kw));
+                total += select(float4(0.0f), upstream[out], mine);
+            }
+        }
+    }
+    grad[id] = total;
+}
+
+/* The same gradient, for windows that tile the input without overlapping.
+ *
+ * The two passes above are what an overlap costs: which tap won has to be
+ * written down, because an input can win several windows and no one thread
+ * sees them all. When the stride equals the window and the windows cover the
+ * input exactly, neither is true -- each input is in one window and in one --
+ * so a thread can take an output, find the peak over the k^2 inputs behind it,
+ * and write that whole window at once: the upstream value to the winner, zero
+ * to the rest. Every input is read once and written once, which is the least
+ * this can move, and nothing is accumulated.
+ *
+ * 115 MB in 0.27 ms at [64,56,56,64] with a 2x2 window, against 1.52 for the
+ * k^4 rescan this replaced and 0.96 for torch.
+ *
+ * The winner is the first of equal maxima in scan order, the one the two-pass
+ * form picks as well, so the answer is the same element for element.
+ *
+ * The caller checks the tiling: a window that ran off the input, or one that
+ * left a row uncovered, would read or leave rubbish. */
+kernel void max_pool2d_backward_disjoint_nhwc(device const float* input [[buffer(0)]],
+                                              device const float* upstream [[buffer(1)]],
+                                              device float* grad [[buffer(2)]],
+                                              constant uint& N [[buffer(3)]],
+                                              constant uint& H [[buffer(4)]],
+                                              constant uint& W [[buffer(5)]],
+                                              constant uint& C [[buffer(6)]],
+                                              constant uint& KH [[buffer(7)]],
+                                              constant uint& KW [[buffer(8)]],
+                                              constant uint& SH [[buffer(9)]],
+                                              constant uint& SW [[buffer(10)]],
+                                              constant uint& PH [[buffer(11)]],
+                                              constant uint& PW [[buffer(12)]],
+                                              constant uint& OH [[buffer(13)]],
+                                              constant uint& OW [[buffer(14)]],
+                                              uint id [[thread_position_in_grid]]) {
+    if (id >= N * OH * OW * C) return;
+    uint rest = id / C;
+    uint c = id - rest * C;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    uint corner = (n * H + oh * KH) * W + ow * KW;
+    float peak = -3.402823e+38f;
+    uint best = 0xffffffffu;
+    for (uint kh = 0u; kh < KH; ++kh) {
+        for (uint kw = 0u; kw < KW; ++kw) {
+            uint tap = kh * KW + kw;
+            float v = input[(corner + kh * W + kw) * C + c];
+            if (v > peak) { peak = v; best = tap; }
+        }
+    }
+    float up = upstream[id];
+    for (uint kh = 0u; kh < KH; ++kh) {
+        for (uint kw = 0u; kw < KW; ++kw) {
+            uint tap = kh * KW + kw;
+            grad[(corner + kh * W + kw) * C + c] = tap == best ? up : 0.0f;
+        }
+    }
+}
+
+/* Four channels at a time, the way the forward pass takes them.
+ *
+ * The channels sit next to each other, so a thread holding four of them turns
+ * four four-byte reads into one sixteen-byte read and works out where it is
+ * once instead of four times -- which matters because the position costs three
+ * divisions and the device has no integer divide.
+ *
+ * On [64,56,56,64] it buys nothing: 0.298 against the scalar form's 0.295,
+ * because at 115 MB in 0.29 ms this arm is already moving bytes as fast as the
+ * device will move them and no thread is waiting on arithmetic. What it is
+ * worth is the shapes under that ceiling -- [8,56,56,64] 0.039 to 0.030,
+ * [64,28,28,128] 0.112 to 0.096, [4,224,224,4] 0.026 to 0.022, all around
+ * 1.15x to 1.3x. The large float4 win in this operation is on the two-pass arm
+ * rather than here; see `max_pool2d_taps_nhwc4`.
+ *
+ * The peak is tracked per lane, since the four channels each have their own
+ * winner, and `select` keeps that branchless. */
+kernel void max_pool2d_backward_disjoint_nhwc4(device const float4* input [[buffer(0)]],
+                                               device const float4* upstream [[buffer(1)]],
+                                               device float4* grad [[buffer(2)]],
+                                               constant uint& N [[buffer(3)]],
+                                               constant uint& H [[buffer(4)]],
+                                               constant uint& W [[buffer(5)]],
+                                               constant uint& C [[buffer(6)]],
+                                               constant uint& KH [[buffer(7)]],
+                                               constant uint& KW [[buffer(8)]],
+                                               constant uint& SH [[buffer(9)]],
+                                               constant uint& SW [[buffer(10)]],
+                                               constant uint& PH [[buffer(11)]],
+                                               constant uint& PW [[buffer(12)]],
+                                               constant uint& OH [[buffer(13)]],
+                                               constant uint& OW [[buffer(14)]],
+                                               uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * OH * OW * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    uint corner = (n * H + oh * KH) * W + ow * KW;
+    float4 peak = float4(-3.402823e+38f);
+    uint4 best = uint4(0xffffffffu);
+    for (uint kh = 0u; kh < KH; ++kh) {
+        for (uint kw = 0u; kw < KW; ++kw) {
+            uint4 tap = uint4(kh * KW + kw);
+            float4 v = input[(corner + kh * W + kw) * quads + q];
+            bool4 took = v > peak;
+            peak = select(peak, v, took);
+            best = select(best, tap, took);
+        }
+    }
+    float4 up = upstream[id];
+    for (uint kh = 0u; kh < KH; ++kh) {
+        for (uint kw = 0u; kw < KW; ++kw) {
+            uint4 tap = uint4(kh * KW + kw);
+            grad[(corner + kh * W + kw) * quads + q] = select(float4(0.0f), up, best == tap);
+        }
+    }
+}
+
+/* An input pixel's gradient is the sum, over the windows covering it, of that
+ * window's upstream value divided by the taps the window found inside the
+ * image. Two loops used to do that and neither is needed.
+ *
+ * The covering windows are a contiguous run ending at (ih + PH) / SH, so one
+ * division finds the last of them and the walk downwards stops as soon as a
+ * window no longer reaches -- no modulo per offset, and nothing visited that
+ * is then thrown away. The tap count is separable, rows(oh) * cols(ow), each
+ * one window edge clamped against one image edge; counting it instead cost an
+ * inner KH*KW loop per covering window, which is what max pooling's backward
+ * does not have and why average pooling was the slower of the two here while
+ * everywhere else it is the faster.
+ *
+ * oh and ow still descend, which is the order the offset loops visited taps
+ * in, so the sum accumulates in the order it did before and comes out bit for
+ * bit the same. On [64, 56, 56, 64] with a 2x2 window that took 1.43 ms to
+ * 0.21, against torch's 0.66. */
 kernel void avg_pool2d_backward_nhwc(device const float* upstream [[buffer(0)]],
                                      device float* grad [[buffer(1)]],
                                      constant uint& N [[buffer(2)]],
@@ -597,35 +890,144 @@ kernel void avg_pool2d_backward_nhwc(device const float* upstream [[buffer(0)]],
                                      uint id [[thread_position_in_grid]]) {
     uint count = N * H * W * C;
     if (id >= count) return;
-    uint c = id % C;
-    uint iw = (id / C) % W;
-    uint ih = (id / (C * W)) % H;
-    uint n = id / (C * W * H);
+    uint rest = id / C;
+    uint c = id - rest * C;
+    uint row = rest / W;
+    uint iw = rest - row * W;
+    uint n = row / H;
+    uint ih = row - n * H;
+    uint reach_h = ih + PH;
+    uint reach_w = iw + PW;
+    uint last_h = reach_h / SH;
+    if (last_h >= OH) last_h = OH - 1u;
+    uint last_w = reach_w / SW;
+    if (last_w >= OW) last_w = OW - 1u;
     float total = 0.0f;
-    for (uint kh = 0; kh < KH; ++kh) {
-        int top = int(ih) + int(PH) - int(kh);
-        if (top < 0 || uint(top) % SH != 0) continue;
-        uint oh = uint(top) / SH;
-        if (oh >= OH) continue;
-        for (uint kw = 0; kw < KW; ++kw) {
-            int left = int(iw) + int(PW) - int(kw);
-            if (left < 0 || uint(left) % SW != 0) continue;
-            uint ow = uint(left) / SW;
-            if (ow >= OW) continue;
-            uint seen = 0;
-            for (uint wh = 0; wh < KH; ++wh) {
-                for (uint ww = 0; ww < KW; ++ww) {
-                    int sh = int(oh * SH) - int(PH) + int(wh);
-                    int sw = int(ow * SW) - int(PW) + int(ww);
-                    if (sh < 0 || sw < 0 || sh >= int(H) || sw >= int(W)) continue;
-                    seen += 1;
-                }
-            }
-            if (seen > 0)
-                total += upstream[((n * OH + oh) * OW + ow) * C + c] / float(seen);
+    for (int oh = int(last_h); oh >= 0; --oh) {
+        if (reach_h - uint(oh) * SH >= KH) break;
+        int top = int(uint(oh) * SH) - int(PH);
+        uint rows = uint(min(top + int(KH), int(H)) - max(top, 0));
+        for (int ow = int(last_w); ow >= 0; --ow) {
+            if (reach_w - uint(ow) * SW >= KW) break;
+            int left = int(uint(ow) * SW) - int(PW);
+            uint cols = uint(min(left + int(KW), int(W)) - max(left, 0));
+            total += upstream[((n * OH + uint(oh)) * OW + uint(ow)) * C + c] / float(rows * cols);
         }
     }
     grad[id] = total;
+}
+
+/* The same, four channels at a time, for the usual case of a channel count
+ * that divides by four. It is the same arithmetic against a quarter as many
+ * threads, and the index work above is per thread rather than per element, so
+ * the quarter is most of what the shape below is worth. */
+kernel void avg_pool2d_backward_nhwc4(device const float4* upstream [[buffer(0)]],
+                                      device float4* grad [[buffer(1)]],
+                                      constant uint& N [[buffer(2)]],
+                                      constant uint& H [[buffer(3)]],
+                                      constant uint& W [[buffer(4)]],
+                                      constant uint& C [[buffer(5)]],
+                                      constant uint& KH [[buffer(6)]],
+                                      constant uint& KW [[buffer(7)]],
+                                      constant uint& SH [[buffer(8)]],
+                                      constant uint& SW [[buffer(9)]],
+                                      constant uint& PH [[buffer(10)]],
+                                      constant uint& PW [[buffer(11)]],
+                                      constant uint& OH [[buffer(12)]],
+                                      constant uint& OW [[buffer(13)]],
+                                      uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * H * W * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / W;
+    uint iw = rest - row * W;
+    uint n = row / H;
+    uint ih = row - n * H;
+    uint reach_h = ih + PH;
+    uint reach_w = iw + PW;
+    uint last_h = reach_h / SH;
+    if (last_h >= OH) last_h = OH - 1u;
+    uint last_w = reach_w / SW;
+    if (last_w >= OW) last_w = OW - 1u;
+    float4 total = float4(0.0f);
+    for (int oh = int(last_h); oh >= 0; --oh) {
+        if (reach_h - uint(oh) * SH >= KH) break;
+        int top = int(uint(oh) * SH) - int(PH);
+        uint rows = uint(min(top + int(KH), int(H)) - max(top, 0));
+        for (int ow = int(last_w); ow >= 0; --ow) {
+            if (reach_w - uint(ow) * SW >= KW) break;
+            int left = int(uint(ow) * SW) - int(PW);
+            uint cols = uint(min(left + int(KW), int(W)) - max(left, 0));
+            total += upstream[((n * OH + uint(oh)) * OW + uint(ow)) * quads + q] / float(rows * cols);
+        }
+    }
+    grad[id] = total;
+}
+
+/* The gradient again, for windows that tile the input without overlapping.
+ *
+ * Then every input belongs to one window and every window is whole, so the
+ * run of covering windows is a single one found by a division and the divisor
+ * is the constant KH*KW -- no walk, no clamping against an edge that is never
+ * reached. What is left is a gather with a scale, and it runs at the rate a
+ * copy of the same bytes does: 0.21 ms to 0.167 on the shape above, 382 GB/s,
+ * where upsample_nearest2d moves the same 64 MB in 0.166. There is nothing
+ * further here to find. The caller checks the tiling; overlapping windows or
+ * an uncovered row would read the wrong window. */
+kernel void avg_pool2d_backward_tiled_nhwc(device const float* upstream [[buffer(0)]],
+                                           device float* grad [[buffer(1)]],
+                                           constant uint& N [[buffer(2)]],
+                                           constant uint& H [[buffer(3)]],
+                                           constant uint& W [[buffer(4)]],
+                                           constant uint& C [[buffer(5)]],
+                                           constant uint& KH [[buffer(6)]],
+                                           constant uint& KW [[buffer(7)]],
+                                           constant uint& SH [[buffer(8)]],
+                                           constant uint& SW [[buffer(9)]],
+                                           constant uint& PH [[buffer(10)]],
+                                           constant uint& PW [[buffer(11)]],
+                                           constant uint& OH [[buffer(12)]],
+                                           constant uint& OW [[buffer(13)]],
+                                           uint id [[thread_position_in_grid]]) {
+    if (id >= N * H * W * C) return;
+    uint rest = id / C;
+    uint c = id - rest * C;
+    uint row = rest / W;
+    uint iw = rest - row * W;
+    uint n = row / H;
+    uint ih = row - n * H;
+    uint oh = ih / KH;
+    uint ow = iw / KW;
+    grad[id] = upstream[((n * OH + oh) * OW + ow) * C + c] / float(KH * KW);
+}
+
+kernel void avg_pool2d_backward_tiled_nhwc4(device const float4* upstream [[buffer(0)]],
+                                            device float4* grad [[buffer(1)]],
+                                            constant uint& N [[buffer(2)]],
+                                            constant uint& H [[buffer(3)]],
+                                            constant uint& W [[buffer(4)]],
+                                            constant uint& C [[buffer(5)]],
+                                            constant uint& KH [[buffer(6)]],
+                                            constant uint& KW [[buffer(7)]],
+                                            constant uint& SH [[buffer(8)]],
+                                            constant uint& SW [[buffer(9)]],
+                                            constant uint& PH [[buffer(10)]],
+                                            constant uint& PW [[buffer(11)]],
+                                            constant uint& OH [[buffer(12)]],
+                                            constant uint& OW [[buffer(13)]],
+                                            uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * H * W * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / W;
+    uint iw = rest - row * W;
+    uint n = row / H;
+    uint ih = row - n * H;
+    uint oh = ih / KH;
+    uint ow = iw / KW;
+    grad[id] = upstream[((n * OH + oh) * OW + ow) * quads + q] / float(KH * KW);
 }
 
 kernel void crop2d_nhwc(device const float* input [[buffer(0)]],
@@ -999,6 +1401,135 @@ kernel void group_norm_sums(device const float* input [[buffer(0)]],
     if (lid != 0u) return;
     sum_dy[id] = dy_total;
     sum_dy_xhat[id] = dy_xhat;
+}
+
+/* The group backward's four sums in one coalesced pass.
+ *
+ * `group_norm_sums` and `channel_params_backward` between them read the whole
+ * tensor twice, and neither read is coalesced: both walk one channel per
+ * thread down the NHWC row stride, so a 256-thread group touches 256 separate
+ * cache lines a step. Together they were 2.57 ms of the 2.96 ms backward on
+ * [64,56,56,64] with eight groups -- 66 GB/s for the parameter pass and
+ * 100 GB/s for the group pass, against the 396 GB/s the elementwise pass in
+ * the same backward already reaches.
+ *
+ * This reads the tensor once, in order. A thread takes element `lid` of a
+ * contiguous block and steps by 256, so the whole group reads one run of 256
+ * floats a step; because the kernel only runs when the channel count divides
+ * 256, the channel a thread lands on never changes and its slot, mean and
+ * `rsqrt` are read once outside the loop. What comes out is the two sums per
+ * (sample, channel) that every one of the four totals is built from:
+ * `sum(upstream)` and `sum(upstream * xhat)`.
+ *
+ * The gamma weighting the group sums want is not applied here. Doing it in
+ * the join costs C multiplies rather than one per element, and lets the same
+ * partials serve the parameter gradients, which want the sums unweighted. */
+kernel void group_norm_grad_partials(device const float* input [[buffer(0)]],
+                                     device const float* mean [[buffer(1)]],
+                                     device const float* variance [[buffer(2)]],
+                                     device const float* upstream [[buffer(3)]],
+                                     device float* part_dy [[buffer(4)]],
+                                     device float* part_dy_xhat [[buffer(5)]],
+                                     constant uint& spatial [[buffer(6)]],
+                                     constant uint& C [[buffer(7)]],
+                                     constant uint& groups [[buffer(8)]],
+                                     constant uint& rows_each [[buffer(9)]],
+                                     constant uint& per_sample [[buffer(10)]],
+                                     uint chunk [[threadgroup_position_in_grid]],
+                                     uint lid [[thread_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float shared_dy[256];
+    threadgroup float shared_xhat[256];
+    /* A block never straddles two samples, so the slot -- and with it the
+     * mean and the variance -- is fixed for the whole loop. */
+    uint n = chunk / per_sample;
+    uint within = chunk - n * per_sample;
+    uint c = lid % C;
+    uint slot = n * groups + c / (C / groups);
+    float inv = rsqrt(variance[slot] + 1e-5f);
+    float centre = mean[slot];
+    uint base = n * spatial * C;
+    uint first = within * rows_each;
+    uint last = min(first + rows_each, spatial);
+    float dy_total = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint f = base + first * C + lid; f < base + last * C; f += GROUP) {
+        float up = upstream[f];
+        dy_total += up;
+        dy_xhat += up * (input[f] - centre) * inv;
+    }
+    shared_dy[lid] = dy_total;
+    shared_xhat[lid] = dy_xhat;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid >= C) return;
+    float a = 0.0f;
+    float b = 0.0f;
+    for (uint j = lid; j < GROUP; j += C) {
+        a += shared_dy[j];
+        b += shared_xhat[j];
+    }
+    part_dy[chunk * C + lid] = a;
+    part_dy_xhat[chunk * C + lid] = b;
+}
+
+/* The group sums: over this sample's blocks, and over the channels of one
+ * group, weighted by gamma. One thread a slot, of which there are N*groups. */
+kernel void group_norm_slot_join(device const float* part_dy [[buffer(0)]],
+                                 device const float* part_dy_xhat [[buffer(1)]],
+                                 device const float* gamma [[buffer(2)]],
+                                 device float* sum_dy [[buffer(3)]],
+                                 device float* sum_dy_xhat [[buffer(4)]],
+                                 constant uint& C [[buffer(5)]],
+                                 constant uint& groups [[buffer(6)]],
+                                 constant uint& per_sample [[buffer(7)]],
+                                 constant uint& slots [[buffer(8)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id >= slots) return;
+    uint n = id / groups;
+    uint g = id - n * groups;
+    uint gs = C / groups;
+    float dy = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint k = 0u; k < per_sample; ++k) {
+        uint row = (n * per_sample + k) * C + g * gs;
+        for (uint j = 0u; j < gs; ++j) {
+            float w = gamma[g * gs + j];
+            dy += w * part_dy[row + j];
+            dy_xhat += w * part_dy_xhat[row + j];
+        }
+    }
+    sum_dy[id] = dy;
+    sum_dy_xhat[id] = dy_xhat;
+}
+
+/* The parameter gradients: the same partials summed down the other axis, over
+ * every block of every sample. A threadgroup a channel rather than a thread,
+ * because there are as many blocks as there are samples times the split and
+ * that outgrows what one thread should walk. */
+kernel void group_norm_param_join(device const float* part_dy [[buffer(0)]],
+                                  device const float* part_dy_xhat [[buffer(1)]],
+                                  device float* grad_gamma [[buffer(2)]],
+                                  device float* grad_beta [[buffer(3)]],
+                                  constant uint& chunks [[buffer(4)]],
+                                  constant uint& C [[buffer(5)]],
+                                  uint c [[threadgroup_position_in_grid]],
+                                  uint lid [[thread_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint warp [[simdgroup_index_in_threadgroup]]) {
+    if (c >= C) return;
+    const uint GROUP = 256u;
+    threadgroup float lanes[32];
+    float dy = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint k = lid; k < chunks; k += GROUP) {
+        dy += part_dy[k * C + c];
+        dy_xhat += part_dy_xhat[k * C + c];
+    }
+    dy = group_total(dy, lanes, lid, lane, warp);
+    dy_xhat = group_total(dy_xhat, lanes, lid, lane, warp);
+    if (lid != 0u) return;
+    grad_beta[c] = dy;
+    grad_gamma[c] = dy_xhat;
 }
 
 kernel void channel_params_backward(device const float* input [[buffer(0)]],
@@ -2195,6 +2726,7 @@ fn elementwise_kernels() -> str {
 let SOURCE = BASE_SOURCE + elementwise_kernels()
 
 let ATTN_SOURCE = """#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 kernel void attention_scale(device float* scores [[buffer(0)]],
@@ -2232,6 +2764,108 @@ kernel void merge_heads(device const float* input [[buffer(0)]],
     uint h = id / (hd * seq);
     uint dim = heads * hd;
     output[s * dim + h * hd + d] = input[id];
+}
+
+/* Row softmax of every head's scores at once, scaling as it reads.
+ *
+ * In place, and the aliasing is safe rather than lucky: a threadgroup owns
+ * one row, the two reductions finish behind a barrier before the last loop
+ * writes, and in that loop thread i writes only the element it just read.
+ * Scaling here rather than in a separate `scale` costs nothing and saves two
+ * passes over the score matrix, which at seq 1024 with 16 heads is 16.7M
+ * elements read and written twice. The products are the same float32
+ * multiplies the separate pass did, in the same order, so the answer is
+ * bit-for-bit what `softmax(scale(scores, factor))` gave. */
+kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
+                               constant uint& rows [[buffer(1)]],
+                               constant uint& columns [[buffer(2)]],
+                               constant uint& scale_bits [[buffer(3)]],
+                               uint row [[threadgroup_position_in_grid]],
+                               uint lid [[thread_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint warp [[simdgroup_index_in_threadgroup]]) {
+    if (row >= rows) return;
+    const uint GROUP = 256u;
+    const uint base = row * columns;
+    const float factor = as_type<float>(scale_bits);
+    const float floor_value = -3.402823e+38f;
+    threadgroup float lanes[32];
+    threadgroup float shared_peak;
+    threadgroup float shared_total;
+
+    float peak = floor_value;
+    for (uint i = lid; i < columns; i += GROUP) peak = max(peak, scores[base + i] * factor);
+    if (lid < 32u) lanes[lid] = floor_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    peak = simd_max(peak);
+    if (lane == 0u) lanes[warp] = peak;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float m = floor_value;
+        for (uint j = 0u; j < 32u; j++) m = max(m, lanes[j]);
+        shared_peak = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float m = shared_peak;
+
+    float total = 0.0f;
+    for (uint i = lid; i < columns; i += GROUP) total += exp(scores[base + i] * factor - m);
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = simd_sum(total);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_total = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float denominator = shared_total;
+
+    for (uint i = lid; i < columns; i += GROUP)
+        scores[base + i] = exp(scores[base + i] * factor - m) / denominator;
+}
+
+/* The gradient of the above, also in place and for the same reason.
+ *
+ * `grad` arrives holding d(probs) and leaves holding d(scores); the reduction
+ * has read every element it needs before the write loop starts. The factor
+ * multiplies last, as it did when `scale` was the op after this one, so the
+ * rounding is unchanged. */
+kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
+                                        device float* grad [[buffer(1)]],
+                                        constant uint& rows [[buffer(2)]],
+                                        constant uint& columns [[buffer(3)]],
+                                        constant uint& scale_bits [[buffer(4)]],
+                                        uint row [[threadgroup_position_in_grid]],
+                                        uint lid [[thread_index_in_threadgroup]],
+                                        uint lane [[thread_index_in_simdgroup]],
+                                        uint warp [[simdgroup_index_in_threadgroup]]) {
+    if (row >= rows) return;
+    const uint GROUP = 256u;
+    const uint base = row * columns;
+    const float factor = as_type<float>(scale_bits);
+    threadgroup float lanes[32];
+    threadgroup float shared_dot;
+
+    float dot = 0.0f;
+    for (uint i = lid; i < columns; i += GROUP) dot += grad[base + i] * probs[base + i];
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    dot = simd_sum(dot);
+    if (lane == 0u) lanes[warp] = dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        shared_dot = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shared_dot;
+
+    for (uint i = lid; i < columns; i += GROUP)
+        grad[base + i] = factor * (probs[base + i] * (grad[base + i] - total));
 }
 
 kernel void mha_scores(device const float* query [[buffer(0)]],
@@ -2275,6 +2909,184 @@ kernel void mha_context(device const float* probs [[buffer(0)]],
     for (uint j = 0; j < seq; ++j)
         acc += probs[pbase + j] * value[j * dim + vcol];
     output[id] = acc;
+}
+
+/* Every head's Q K-transpose in one dispatch, on simdgroup matrices.
+ *
+ * The per-head loop this replaces issued one GEMM for each head, and the route
+ * the GEMM router picks for [1024,64]x[64,1024] runs at 2.3 TFLOP/s where a
+ * square 1024 product reaches 8.3 on the same device: the inner dimension is
+ * 64, far too short for a tile to earn back the cost of loading its operands.
+ * Sixteen of those measured 0.93 ms. Here one threadgroup owns a 64x64 patch
+ * of one head's scores and every head is one grid, so the short inner
+ * dimension is walked once per patch: 0.40 ms for the same sixteen.
+ *
+ * Two simdgroups split the patch by rows and each holds a 32x64 strip as
+ * thirty-two 8x8 accumulators. Two rather than four because the accumulators
+ * are the whole point: thirty-two of them issue thirty-two multiply-
+ * accumulates against twelve fragment loads, where four simdgroups each
+ * holding a 32x32 corner issued sixteen against eight, and the better ratio
+ * measured 7% across the six dispatches.
+ *
+ * The unroll pragmas are load-bearing, not tidiness: indexed by a loop the
+ * compiler leaves rolled, `acc` lives in thread-local memory instead of
+ * registers and every accumulate becomes a spill and a reload. The 2x2 shape
+ * measured 4.78 ms before the pragmas went in and 0.41 after -- a factor of
+ * twelve on nothing but where sixteen matrices live.
+ *
+ * Q, K, V and the context stay in the caller's packed [seq, heads * hd]
+ * layout: a fragment is loaded with the packed row stride and the head's
+ * column offset, which costs an addition and removes the three `split_heads`
+ * copies the composition needed in front and the three `merge_heads` copies
+ * its backward needed behind -- 0.31 ms of pure transposition per call.
+ *
+ * `mha_mma_ok` guards all three of these on hd == 64 and seq a multiple of 64.
+ * The fragments are 8x8 and nothing here masks a partial tile. */
+kernel void mha_scores_mma(device const float* a [[buffer(0)]],
+                           device const float* b [[buffer(1)]],
+                           device float* out [[buffer(2)]],
+                           constant uint& seq [[buffer(3)]],
+                           constant uint& heads [[buffer(4)]],
+                           constant uint& hd [[buffer(5)]],
+                           constant uint& tiles [[buffer(6)]],
+                           uint wid [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]]) {
+    uint dim = heads * hd;
+    uint tile_m = wid % tiles;
+    uint rest = wid / tiles;
+    uint tile_n = rest % tiles;
+    uint head = rest / tiles;
+    uint m0 = tile_m * 64u + sg * 32u;
+    uint n0 = tile_n * 64u;
+    device const float* A = a + (ulong)head * hd + (ulong)m0 * dim;
+    device const float* B = b + (ulong)head * hd + (ulong)n0 * dim;
+    device float* C = out + (ulong)head * seq * seq + (ulong)m0 * seq + n0;
+    simdgroup_float8x8 acc[4][8];
+#pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k = 0u; k < hd; k += 8u) {
+        simdgroup_float8x8 af[4];
+        simdgroup_float8x8 bf[8];
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i)
+            simdgroup_load(af[i], A + (ulong)(i * 8u) * dim + k, dim);
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            simdgroup_load(bf[j], B + (ulong)(j * 8u) * dim + k, dim, ulong2(0, 0), true);
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+            for (uint j = 0u; j < 8u; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+    }
+#pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            simdgroup_store(acc[i][j], C + (ulong)(i * 8u) * seq + j * 8u, seq);
+}
+
+/* Every head's probabilities times its values, likewise in one dispatch.
+ *
+ * Same 64x64 patch and same pair of simdgroups as above; the patch spans the
+ * whole of hd rather than a slice of it, because hd is 64. The backward pass
+ * reaches this for dQ = dS K, the same product against a different pair of
+ * operands. Sixteen heads: 0.76 ms as separate GEMMs, 0.36 here. */
+kernel void mha_context_mma(device const float* p [[buffer(0)]],
+                            device const float* v [[buffer(1)]],
+                            device float* out [[buffer(2)]],
+                            constant uint& seq [[buffer(3)]],
+                            constant uint& heads [[buffer(4)]],
+                            constant uint& hd [[buffer(5)]],
+                            uint wid [[threadgroup_position_in_grid]],
+                            uint sg [[simdgroup_index_in_threadgroup]]) {
+    uint dim = heads * hd;
+    uint tiles = seq / 64u;
+    uint tile_m = wid % tiles;
+    uint head = wid / tiles;
+    uint m0 = tile_m * 64u + sg * 32u;
+    device const float* A = p + (ulong)head * seq * seq + (ulong)m0 * seq;
+    device const float* B = v + (ulong)head * hd;
+    device float* C = out + (ulong)head * hd + (ulong)m0 * dim;
+    simdgroup_float8x8 acc[4][8];
+#pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k = 0u; k < seq; k += 8u) {
+        simdgroup_float8x8 af[4];
+        simdgroup_float8x8 bf[8];
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i)
+            simdgroup_load(af[i], A + (ulong)(i * 8u) * seq + k, seq);
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            simdgroup_load(bf[j], B + (ulong)k * dim + j * 8u, dim);
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+            for (uint j = 0u; j < 8u; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+    }
+#pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            simdgroup_store(acc[i][j], C + (ulong)(i * 8u) * dim + j * 8u, dim);
+}
+
+/* The score matrix transposed against a [seq, hd] operand, for dV and dK.
+ *
+ * Reading the transpose is free here -- `simdgroup_load` takes the flag and
+ * the fragment arrives the right way round -- so neither gradient needs the
+ * copy that a transposing GEMM would have made. Sixteen heads: 0.76 ms as
+ * separate GEMMs, 0.37 here. */
+kernel void mha_transposed_mma(device const float* p [[buffer(0)]],
+                               device const float* u [[buffer(1)]],
+                               device float* out [[buffer(2)]],
+                               constant uint& seq [[buffer(3)]],
+                               constant uint& heads [[buffer(4)]],
+                               constant uint& hd [[buffer(5)]],
+                               uint wid [[threadgroup_position_in_grid]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
+    uint dim = heads * hd;
+    uint tiles = seq / 64u;
+    uint tile_m = wid % tiles;
+    uint head = wid / tiles;
+    uint m0 = tile_m * 64u + sg * 32u;
+    device const float* A = p + (ulong)head * seq * seq + m0;
+    device const float* B = u + (ulong)head * hd;
+    device float* C = out + (ulong)head * hd + (ulong)m0 * dim;
+    simdgroup_float8x8 acc[4][8];
+#pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k = 0u; k < seq; k += 8u) {
+        simdgroup_float8x8 af[4];
+        simdgroup_float8x8 bf[8];
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i)
+            simdgroup_load(af[i], A + (ulong)k * seq + i * 8u, seq, ulong2(0, 0), true);
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            simdgroup_load(bf[j], B + (ulong)k * dim + j * 8u, dim);
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+            for (uint j = 0u; j < 8u; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+    }
+#pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j)
+            simdgroup_store(acc[i][j], C + (ulong)(i * 8u) * dim + j * 8u, dim);
 }
 
 kernel void flash_mha(device const float* query [[buffer(0)]],
@@ -3519,11 +4331,39 @@ fn _pool2d(input: Tensor, kernel_size: int, stride: int, padding: int, is_max: b
             let grad = Tensor([n, h, w, c])
             let scalars = [n, h, w, c, kernel_size, kernel_size, step, step, padding, padding, oh, ow]
             if is_max {
-                let back = cached_kernel("max_pool2d_backward_nhwc")
-                back.dispatch_async([input.buffer(), upstream.buffer(), grad.buffer()], grad.size, scalars)
+                #: Windows that tile the input exactly cover every element
+                #: once and no element twice, so a thread can take a window,
+                #: scan it once and write the whole of it -- no rescanning, and
+                #: nothing to add up. That is the shape pooling almost always
+                #: has, 2x2 stride 2 over an even picture, and it was worth
+                #: 5.6x. Anything else goes the two-pass way.
+                let tiles = padding == 0 and step == kernel_size
+                let covers = oh * kernel_size == h and ow * kernel_size == w
+                if tiles and covers {
+                    let name = if wide { "max_pool2d_backward_disjoint_nhwc4" } else { "max_pool2d_backward_disjoint_nhwc" }
+                    let back = cached_kernel(name)
+                    back.dispatch_async([input.buffer(), upstream.buffer(), grad.buffer()], n * oh * ow * lanes, scalars)
+                } else {
+                    let taps = Tensor([n, oh, ow, c])
+                    let mark = if wide { "max_pool2d_taps_nhwc4" } else { "max_pool2d_taps_nhwc" }
+                    let spread = if wide { "max_pool2d_backward_taps_nhwc4" } else { "max_pool2d_backward_taps_nhwc" }
+                    cached_kernel(mark).dispatch_async([input.buffer(), taps.buffer()], n * oh * ow * lanes, scalars)
+                    cached_kernel(spread).dispatch_async([taps.buffer(), upstream.buffer(), grad.buffer()], n * h * w * lanes, scalars)
+                    taps.free()
+                }
             } else {
-                let back = cached_kernel("avg_pool2d_backward_nhwc")
-                back.dispatch_async([upstream.buffer(), grad.buffer()], grad.size, scalars)
+                let tiles = padding == 0 and step == kernel_size
+                let covers = oh * kernel_size == h and ow * kernel_size == w
+                let whole = tiles and covers
+                let entry = if whole {
+                    if wide { "avg_pool2d_backward_tiled_nhwc4" } else { "avg_pool2d_backward_tiled_nhwc" }
+                } elif wide {
+                    "avg_pool2d_backward_nhwc4"
+                } else {
+                    "avg_pool2d_backward_nhwc"
+                }
+                let threads = if wide { grad.size // 4 } else { grad.size }
+                cached_kernel(entry).dispatch_async([upstream.buffer(), grad.buffer()], threads, scalars)
             }
             return [grad]
         }))
@@ -4716,6 +5556,7 @@ pub fn multi_head_attention(query: Tensor, key: Tensor, value: Tensor, heads: in
     let hd = dim // heads
     let factor = 1.0 / math.sqrt(float(hd))
     if query.requires_grad or key.requires_grad or value.requires_grad {
+        if mha_mma_ok(seq, hd) { return mha_by_mma(query, key, value, heads, seq, hd, factor) }
         return mha_by_ops(query, key, value, heads, seq, hd, factor)
     }
     let output = Tensor(query.shape)
@@ -4757,12 +5598,152 @@ pub fn multi_head_attention(query: Tensor, key: Tensor, value: Tensor, heads: in
     return mha_by_gemm(query, key, value, heads, seq, hd, factor)
 }
 
+#: Whether the batched simdgroup-matrix attention kernels can take this shape.
+#:
+#: They tile in 8x8 fragments with no masking, so the sequence has to fill
+#: whole 64-row patches, and the head dimension has to be exactly the 64 the
+#: 2x2 of simdgroups covers. Everything else keeps `mha_by_ops`, which has no
+#: shape restriction at all.
+fn mha_mma_ok(seq: int, hd: int) -> bool {
+    return hd == 64 and seq % 64 == 0
+}
+
+#: Multi-head attention as six batched dispatches, forward and backward.
+#:
+#: `mha_by_ops` below is the same arithmetic written as ops, and it is what
+#: runs whenever `mha_mma_ok` says no. What this saves over it is not a
+#: different algorithm but a different shape of work. That version issues one
+#: GEMM per head, and the route the GEMM router picks for the two attention
+#: shapes -- [seq, 64] against [64, seq], and [seq, seq] against [seq, 64] --
+#: reaches 2.3 and 2.8 TFLOP/s where a square 1024 product reaches 8.3 on the
+#: same device. At seq 1024, dim 1024 and 16 heads the whole forward and
+#: backward took 8.39 ms that way, of which the two forward loops alone were
+#: 0.93 and 0.76. The six dispatches here measure 2.25 together, dropping
+#: `split_heads` and `merge_heads` -- the kernels read the packed layout
+#: directly -- takes another 0.31 off, and the pass now measures 3.15 against
+#: torch's 4.36 for the same shape, both timed with the graph rebuilt each
+#: iteration because backward consumes it.
+#:
+#: The score matrix is still written out, unlike the fused inference kernel,
+#: because the backward pass has to read it. Nothing else is materialised.
+fn mha_by_mma(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    heads: int,
+    seq: int,
+    hd: int,
+    factor: float
+) -> Tensor {
+    let tiles = seq // 64
+    let probs = Tensor([heads * seq, seq])
+    cached_attn_kernel("mha_scores_mma").dispatch_async(
+        [query.buffer(), key.buffer(), probs.buffer()],
+        tiles * tiles * heads * 64,
+        [seq, heads, hd, tiles],
+        group_size: 64
+    )
+    cached_attn_kernel("mha_softmax_scaled").dispatch_async(
+        [probs.buffer()],
+        heads * seq * 256,
+        [heads * seq, seq, f32_bits(factor)],
+        group_size: 256
+    )
+    let output = Tensor([seq, heads * hd])
+    cached_attn_kernel("mha_context_mma").dispatch_async(
+        [probs.buffer(), value.buffer(), output.buffer()],
+        tiles * heads * 64,
+        [seq, heads, hd],
+        group_size: 64
+    )
+    if query.requires_grad or key.requires_grad or value.requires_grad {
+        output.attach_creator(GradNode([query, key, value], fn(upstream: Tensor) -> list[Tensor] {
+            return mha_mma_grads(upstream, query, key, value, probs, heads, seq, hd, factor)
+        }, extras: [probs]))
+    }
+    return output
+}
+
+#: Gradients of `mha_by_mma`, in four dispatches around the softmax backward.
+#:
+#: The four products are the ones `matmul`'s backward would have chosen, in
+#: the same operand order; only the batching and the layout differ. Each
+#: gradient comes out packed like the input it belongs to, so nothing has to
+#: be un-split afterwards. `grad_probs` carries d(probs) into the softmax
+#: backward and comes back holding d(scores), which saves a second
+#: sixty-seven-megabyte buffer at seq 1024.
+fn mha_mma_grads(
+    upstream: Tensor,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    probs: Tensor,
+    heads: int,
+    seq: int,
+    hd: int,
+    factor: float
+) -> list[Tensor] {
+    let tiles = seq // 64
+    let dim = heads * hd
+    let grad_q = Tensor([seq, dim])
+    let grad_k = Tensor([seq, dim])
+    let grad_v = Tensor([seq, dim])
+    let grad_probs = Tensor([heads * seq, seq])
+    cached_attn_kernel("mha_scores_mma").dispatch_async(
+        [upstream.buffer(), value.buffer(), grad_probs.buffer()],
+        tiles * tiles * heads * 64,
+        [seq, heads, hd, tiles],
+        group_size: 64
+    )
+    cached_attn_kernel("mha_transposed_mma").dispatch_async(
+        [probs.buffer(), upstream.buffer(), grad_v.buffer()],
+        tiles * heads * 64,
+        [seq, heads, hd],
+        group_size: 64
+    )
+    cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
+        [probs.buffer(), grad_probs.buffer()],
+        heads * seq * 256,
+        [heads * seq, seq, f32_bits(factor)],
+        group_size: 256
+    )
+    cached_attn_kernel("mha_context_mma").dispatch_async(
+        [grad_probs.buffer(), key.buffer(), grad_q.buffer()],
+        tiles * heads * 64,
+        [seq, heads, hd],
+        group_size: 64
+    )
+    cached_attn_kernel("mha_transposed_mma").dispatch_async(
+        [grad_probs.buffer(), query.buffer(), grad_k.buffer()],
+        tiles * heads * 64,
+        [seq, heads, hd],
+        group_size: 64
+    )
+    grad_probs.free()
+    return [grad_q, grad_k, grad_v]
+}
+
 #: Multi-head attention built from differentiable ops.
 #:
 #: The fused kernels above never materialise the attention probabilities, so
 #: there is nothing for a backward pass to read; a graph that needs gradients
-#: gets this composition instead. Nothing is freed eagerly here — every
-#: intermediate belongs to the graph until `backward` collects it.
+#: gets this composition instead. Every head's scores live in one
+#: `[heads * seq, seq]` tensor and every head's context in one
+#: `[heads * seq, hd]` tensor, so the only per-head work is the four GEMMs
+#: that must be per-head; the softmax, the scale and the packing are one
+#: dispatch each across all of them.
+#:
+#: The composition this replaced sliced Q, K and V per head with `slice_flat`
+#: and reassembled the result with `cat`. Forward that is nearly free -- a
+#: slice is a view -- but `slice_flat`'s backward allocates a zero tensor the
+#: size of the whole packed activation and copies one head into it, and the
+#: three slices per head over sixteen heads then arrive at `qs`, `ks` and `vs`
+#: as forty-eight full-size gradients to be summed. At seq 1024 that pattern
+#: alone measured 1.59 ms: forty-eight four-megabyte zero fills and
+#: forty-eight adds, every one of which adds a head to forty-seven zeros. The
+#: GEMMs below write into a view of the single gradient buffer instead, so
+#: each element is written exactly once. Adding zero is exact, so the answer
+#: is unchanged bit for bit.
 fn mha_by_ops(
     query: Tensor,
     key: Tensor,
@@ -4775,15 +5756,99 @@ fn mha_by_ops(
     let qs = split_heads(query, heads)
     let ks = split_heads(key, heads)
     let vs = split_heads(value, heads)
-    var parts: list[Tensor] = []
+    let probs = Tensor([heads * seq, seq])
     for h in 0..heads {
-        let qh = slice_flat(qs, h * seq * hd, [seq, hd])
-        let kh = slice_flat(ks, h * seq * hd, [seq, hd])
-        let vh = slice_flat(vs, h * seq * hd, [seq, hd])
-        let probs = softmax(scale(matmul(qh, kh, trans_b: true), factor))
-        parts.push(matmul(probs, vh))
+        let qh = qs.view(h * seq * hd, [seq, hd])
+        let kh = ks.view(h * seq * hd, [seq, hd])
+        let sh = probs.view(h * seq * seq, [seq, seq])
+        raw_matmul(qh, kh, trans_b: true, out: sh)
+        qh.free()
+        kh.free()
+        sh.free()
     }
-    return merge_heads(cat(parts), heads, seq)
+    cached_attn_kernel("mha_softmax_scaled").dispatch_async(
+        [probs.buffer()],
+        heads * seq * 256,
+        [heads * seq, seq, f32_bits(factor)],
+        group_size: 256
+    )
+    let context = Tensor([heads * seq, hd])
+    for h in 0..heads {
+        let ph = probs.view(h * seq * seq, [seq, seq])
+        let vh = vs.view(h * seq * hd, [seq, hd])
+        let oh = context.view(h * seq * hd, [seq, hd])
+        raw_matmul(ph, vh, out: oh)
+        ph.free()
+        vh.free()
+        oh.free()
+    }
+    if qs.requires_grad or ks.requires_grad or vs.requires_grad {
+        context.attach_creator(GradNode([qs, ks, vs], fn(upstream: Tensor) -> list[Tensor] {
+            return mha_grads(upstream, qs, ks, vs, probs, heads, seq, hd, factor)
+        }, extras: [probs]))
+    }
+    return merge_heads(context, heads, seq)
+}
+
+#: Gradients of `mha_by_ops` with respect to the split-head Q, K and V.
+#:
+#: The four products per head are the ones `matmul`'s own backward would have
+#: chosen for the same two products, in the same operand order, so the
+#: arithmetic is identical; what differs is that each writes straight into its
+#: slice of one gradient buffer. `grad_probs` carries d(probs) into the
+#: softmax backward and comes back holding d(scores), which saves a second
+#: sixty-seven-megabyte buffer at seq 1024.
+fn mha_grads(
+    upstream: Tensor,
+    qs: Tensor,
+    ks: Tensor,
+    vs: Tensor,
+    probs: Tensor,
+    heads: int,
+    seq: int,
+    hd: int,
+    factor: float
+) -> list[Tensor] {
+    let grad_q = Tensor([heads * seq, hd])
+    let grad_k = Tensor([heads * seq, hd])
+    let grad_v = Tensor([heads * seq, hd])
+    let grad_probs = Tensor([heads * seq, seq])
+    for h in 0..heads {
+        let ph = probs.view(h * seq * seq, [seq, seq])
+        let uh = upstream.view(h * seq * hd, [seq, hd])
+        let vh = vs.view(h * seq * hd, [seq, hd])
+        let gp = grad_probs.view(h * seq * seq, [seq, seq])
+        let gv = grad_v.view(h * seq * hd, [seq, hd])
+        raw_matmul(uh, vh, trans_b: true, out: gp)
+        raw_matmul(ph, uh, trans_a: true, out: gv)
+        ph.free()
+        uh.free()
+        vh.free()
+        gp.free()
+        gv.free()
+    }
+    cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
+        [probs.buffer(), grad_probs.buffer()],
+        heads * seq * 256,
+        [heads * seq, seq, f32_bits(factor)],
+        group_size: 256
+    )
+    for h in 0..heads {
+        let gs = grad_probs.view(h * seq * seq, [seq, seq])
+        let qh = qs.view(h * seq * hd, [seq, hd])
+        let kh = ks.view(h * seq * hd, [seq, hd])
+        let gq = grad_q.view(h * seq * hd, [seq, hd])
+        let gk = grad_k.view(h * seq * hd, [seq, hd])
+        raw_matmul(gs, kh, out: gq)
+        raw_matmul(gs, qh, trans_a: true, out: gk)
+        gs.free()
+        qh.free()
+        kh.free()
+        gq.free()
+        gk.free()
+    }
+    grad_probs.free()
+    return [grad_q, grad_k, grad_v]
 }
 
 fn mha_by_gemm(
@@ -4882,6 +5947,28 @@ fn scatter_add_rows(upstream: Tensor, indices: Tensor, vocab: int, width: int) -
     return dest
 }
 
+#: Blocks per sample for the coalesced group reduction, or zero when it does
+#: not apply.
+#:
+#: A block's threads each stay on one channel for the whole loop only if the
+#: group of 256 holds a whole number of channels; nothing else makes the read
+#: coalesced, so a channel count that does not divide 256 keeps the old pair
+#: of kernels.
+#:
+#: Roughly 128 blocks in total, because the first pass reaches its ceiling
+#: there and the joins do not. Swept on [64,56,56,64] with eight groups: the
+#: first pass is 0.30 ms at 64 blocks and then flat at 0.23 ms from 128 all
+#: the way to 1024, while the joins cost about 0.07 microseconds a block and
+#: so climb from 0.018 ms to 0.088 ms across the same range. `spatial // 64`
+#: stops a short feature map being cut into blocks of a row or two.
+fn group_blocks(samples: int, spatial: int, channels: int) -> int {
+    if channels > 256 or 256 % channels != 0 { return 0 }
+    let room = spatial // 64
+    if room < 1 { return 0 }
+    let wanted = max(1, 128 // samples)
+    return min(wanted, room)
+}
+
 #: NHWC group normalization. `groups` must divide the channel count.
 pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Tensor {
     if input.rank() != 4 {
@@ -4927,15 +6014,26 @@ pub fn group_norm(input: Tensor, gamma: Tensor, beta: Tensor, groups: int) -> Te
         output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
             let sum_dy = Tensor([slots])
             let sum_dy_xhat = Tensor([slots])
-            let sums = cached_kernel("group_norm_sums")
-            sums.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer()], slots * 256, [n, spatial, c, groups], group_size: 256)
+            let grad_gamma = Tensor([c])
+            let grad_beta = Tensor([c])
+            let per_sample = group_blocks(n, spatial, c)
+            if per_sample > 0 {
+                let blocks = n * per_sample
+                let rows_each = (spatial + per_sample - 1) // per_sample
+                let part_dy = Tensor([blocks * c])
+                let part_dy_xhat = Tensor([blocks * c])
+                cached_kernel("group_norm_grad_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer()], blocks * 256, [spatial, c, groups, rows_each, per_sample], group_size: 256)
+                cached_kernel("group_norm_slot_join").dispatch_async([part_dy.buffer(), part_dy_xhat.buffer(), gamma.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer()], slots, [c, groups, per_sample, slots])
+                cached_kernel("group_norm_param_join").dispatch_async([part_dy.buffer(), part_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], c * 256, [blocks, c], group_size: 256)
+                part_dy.free()
+                part_dy_xhat.free()
+            } else {
+                cached_kernel("group_norm_sums").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer()], slots * 256, [n, spatial, c, groups], group_size: 256)
+                cached_kernel("channel_params_backward").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], c * 256, [n * spatial, c, spatial, groups], group_size: 256)
+            }
             let grad_input = Tensor(input.shape)
             let back = cached_kernel("group_norm_backward")
             back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, spatial, c, groups])
-            let grad_gamma = Tensor([c])
-            let grad_beta = Tensor([c])
-            let params = cached_kernel("channel_params_backward")
-            params.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), upstream.buffer(), grad_gamma.buffer(), grad_beta.buffer()], c * 256, [n * spatial, c, spatial, groups], group_size: 256)
             sum_dy.free()
             sum_dy_xhat.free()
             return [grad_input, grad_gamma, grad_beta]
