@@ -686,8 +686,12 @@ jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64
 
+#: Under the GPU lock, because several agents share this machine and any two
+#: measuring at once produce numbers that mean nothing: this suite read 1.98x
+#: under a load average of 4.5 and 3.10x on the same commit with the machine
+#: quiet, with individual rows moving by a factor of three.
 bench: $(TARGET)
-	@LEVEL="$(LEVEL)" ./scripts/run_bench.sh $(filter jaitensor jaicv,$(MAKECMDGOALS))
+	@LEVEL="$(LEVEL)" ./scripts/gpu_lock.sh ./scripts/run_bench.sh $(filter jaitensor jaicv,$(MAKECMDGOALS))
 
 jaitensor:
 	@:
