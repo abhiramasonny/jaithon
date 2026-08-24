@@ -156,8 +156,35 @@ are replayed against the real OpenCV to keep it honest; see
 [`packages/jaicv/README.md`](packages/jaicv/README.md) for what matches exactly
 and what does not.
 
+`jaiframe` is columnar data frames with pandas' API, on the GPU: typed
+nullable `Column` lanes on a Metal buffer, one `Index` class covering range,
+plain and multi-indexes, selection and alignment, arithmetic, missing data,
+reductions and rolling windows, group-by, joins, reshaping, timeseries, and CSV
+and JSON. Integers and timestamps are stored across two float32 lanes and are
+exact to 48 bits, and text is dictionary-encoded so a string key hashes and
+joins like a number; see
+[`packages/jaiframe/README.md`](packages/jaiframe/README.md) for what that
+buys and what it costs.
+
+`jainum` is n-dimensional arrays with numpy's API, on the GPU: `NDArray` as a
+strided window onto a Metal buffer, dtypes as semantic tags over float32
+storage, broadcasting, ufuncs, reductions, sorting, linear algebra, FFTs,
+random numbers, and statistics. Indexing takes an int, a `range`, a `Slice` or
+a sentinel rather than slice syntax; see
+[`packages/jainum/README.md`](packages/jainum/README.md) for why, and for what
+numpy has that this does not.
+
 `jaiplot` is a library for Matplotlib-style figures and axes with file and window
 backends.
+
+`jaisci` is scientific computing with scipy's API: optimisation and root
+finding, least squares and curve fitting, linear programming, quadrature and
+initial value problems, interpolation and splines, FFTs and spectral estimates,
+filter design, convolution, sparse matrices and Krylov solvers, distributions,
+hypothesis tests, and spatial structures. It obeys two rules throughout — host
+arithmetic in float64 and device arithmetic in float32, so small dense work
+stays on the host, and only quadratic-and-up work becomes a Metal kernel. See
+[`packages/jaisci/README.md`](packages/jaisci/README.md).
 
 `jaitensor` is GPU-first training: Metal-resident tensors, autograd, and a
 Keras-style `Sequential` API. Dense, conv, norm, and attention layers, mixed

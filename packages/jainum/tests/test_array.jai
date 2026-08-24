@@ -480,3 +480,38 @@ fn test_printing_a_big_array_downloads_a_corner() -> void {
 fn test_group_is_the_width_every_folding_kernel_expects() -> void {
     assert_eq(GROUP, 256, "eight simdgroups, which the scan's per-warp table is sized for")
 }
+
+#: The contracts the twelve modules above this one write against without
+#: re-reading the file: what `len` means on an array, when `upload` refuses,
+#: when `contiguous` costs an allocation, and what a freed array does.
+fn test_the_contracts_the_other_modules_lean_on() -> void {
+    if not have_gpu() { return }
+    let a = ramp([3, 4])
+    defer { a.free() }
+
+    assert_eq(len(a), 3, "len is the leading axis, as numpy's is")
+    assert_throws(TypeError, || len(a[0, 0]), "a 0-d array has no leading axis")
+
+    #: `contiguous` hands back the array itself when it can, which is why
+    #: `_dense` reports whether it allocated: freeing its result blindly would
+    #: free the caller's array.
+    assert_true(a.contiguous() == a, "a dense array at slot zero is its own dense form")
+    let window = a[1..3, 1..3]
+    let packed = window.contiguous()
+    defer { packed.free() }
+    assert_true(not packed == window)
+    assert_eq(packed.to_list(), [5.0, 6.0, 9.0, 10.0])
+
+    assert_throws(ValueError, || window.upload([0.0, 0.0, 0.0, 0.0]), "a view is not dense")
+    assert_throws(ValueError, || a.copy().upload([1.0]), "the count must match exactly")
+
+    let copied = a.copy()
+    copied[0, 0] = 42.0
+    defer { copied.free() }
+    assert_eq(a[0, 0].item(), 0.0, "a copy owns its own allocation")
+
+    let doomed = ramp([2])
+    doomed.free()
+    assert_throws(RuntimeError, || doomed[0])
+    assert_true(f"{doomed}".contains("freed"), "printing a freed array does not touch it")
+}

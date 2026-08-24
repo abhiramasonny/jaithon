@@ -440,7 +440,8 @@ gc-stress-test: $(TARGET)
 # measured on an idle machine, 463s together against 144s apart, for the same
 # tests under the same cadence.
 	@for suite in tests/lang tests/stdlib tests/checker \
-	              packages/jaiplot/tests packages/jaitensor/tests; do \
+	              packages/jaiplot/tests packages/jaitensor/tests \
+	              packages/jailearn/tests; do \
 	    out=$$(JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) test \
 	             --gc-stress=$(GC_STRESS_EVERY) "$$suite" 2>&1); \
 	    status=$$?; \

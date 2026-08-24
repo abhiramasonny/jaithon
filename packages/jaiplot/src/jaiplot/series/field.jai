@@ -14,8 +14,22 @@ from ..geom import Point, Rect
 from ..primitive import Primitive
 from ..style import Color, MarkerShape, Paint, Stroke
 
+from .line import carried_opacity
+
 #: Marker size for a particle when none is given, in device pixels.
 pub const DEFAULT_PARTICLE_SIZE: float = 3.5
+
+#: Opacity a cloud takes when neither the caller nor the colour says.
+#:
+#: Below one so that a converged filter reads as a dense blob rather than a
+#: flat disc, and high enough that a lone particle is still visible.
+pub const DEFAULT_CLOUD_OPACITY: float = 0.75
+
+#: Opacity a ray bundle takes when neither the caller nor the colour says.
+#:
+#: A laser scan is hundreds of rays out of one origin, and at full opacity the
+#: fan near the origin is solid ink.
+pub const DEFAULT_RAY_OPACITY: float = 0.35
 
 #: A cloud of positions, each optionally carrying a heading and a weight.
 #:
@@ -47,7 +61,12 @@ pub class PoseCloud: Series {
     #:
     #: `headings` are radians anticlockwise from the positive x axis; an empty
     #: list draws plain markers instead of wedges. `weights` may be empty, in
-    #: which case every particle is drawn at full opacity.
+    #: which case every particle is drawn at the same opacity.
+    #:
+    #: A null `opacity` means "whatever the colour says": a colour carrying an
+    #: alpha keeps it, and anything else takes `DEFAULT_CLOUD_OPACITY`. The
+    #: constant used to be forced over the caller's colour, so asking for a
+    #: nearly transparent cloud got you a three-quarters opaque one.
     #:
     #: Raises `ValueError` when any supplied list disagrees in length.
     pub fn init(
@@ -60,7 +79,7 @@ pub class PoseCloud: Series {
         color: Color? = null,
         size: float = DEFAULT_PARTICLE_SIZE,
         shape: MarkerShape = MarkerShape.Circle,
-        opacity: float = 0.75
+        opacity: float? = null
     ) {
         _check_lengths(xs, ys, headings, weights)
         self.xs = [value for value in xs]
@@ -72,7 +91,7 @@ pub class PoseCloud: Series {
         self.shape = shape
         self.chosen = color != null
         self.base = color ?? Color.from_rgb(0, 0, 0)
-        self.opacity = opacity
+        self.opacity = carried_opacity(color, opacity, DEFAULT_CLOUD_OPACITY)
     }
 
     #: Replace the whole cloud, keeping the styling.
@@ -100,8 +119,13 @@ pub class PoseCloud: Series {
     }
 
     #: Override the colour, after construction.
+    #:
+    #: A colour with an alpha of its own replaces the cloud's opacity too;
+    #: without that the alpha would be overwritten at draw time by whatever
+    #: opacity the cloud was built with.
     pub fn color(self, value: Color) -> PoseCloud {
         self.base = value
+        self.opacity = carried_opacity(value, null, self.opacity)
         self.chosen = true
         return self
     }
@@ -243,6 +267,11 @@ pub class Rays: Series {
 
     #: Create a bundle from matching origin and endpoint lists.
     #:
+    #: A null `opacity` means "whatever the colour says": a colour carrying an
+    #: alpha keeps it, and anything else takes `DEFAULT_RAY_OPACITY`. The
+    #: constant used to be forced over the caller's colour, so a scan asked for
+    #: at full strength still came out at a third of it.
+    #:
     #: Raises `ValueError` when the four lists are not the same length.
     pub fn init(
         self,
@@ -253,7 +282,7 @@ pub class Rays: Series {
         label: str? = null,
         color: Color? = null,
         width: float = 1.0,
-        opacity: float = 0.35
+        opacity: float? = null
     ) {
         let counts = [origin_xs.len(), origin_ys.len(), end_xs.len(), end_ys.len()]
         for count in counts {
@@ -267,8 +296,9 @@ pub class Rays: Series {
         self.end_ys = [value for value in end_ys]
         self.name = label
         self.chosen = color != null
-        self.opacity = opacity
-        self.stroke = Stroke((color ?? Color.from_rgb(0, 0, 0)).with_alpha(opacity), width: width)
+        self.opacity = carried_opacity(color, opacity, DEFAULT_RAY_OPACITY)
+        let ink = (color ?? Color.from_rgb(0, 0, 0)).with_alpha(self.opacity)
+        self.stroke = Stroke(ink, width: width)
     }
 
     #: Replace every ray, keeping the styling.

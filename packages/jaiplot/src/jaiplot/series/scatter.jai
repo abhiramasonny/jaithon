@@ -10,7 +10,7 @@ from ..geom import Rect
 from ..primitive import Primitive
 from ..style import Color, MarkerShape, Paint, Stroke
 
-from .line import finite_extent
+from .line import carried_opacity, finite_extent
 
 #: Marker diameter in device pixels when none is given.
 pub const DEFAULT_SIZE: float = 6.0
@@ -39,6 +39,11 @@ pub class Scatter: Series {
 
     #: Plot `ys` against `xs` as markers.
     #:
+    #: A null `opacity` means "whatever the colour says". This used to default
+    #: to 1.0 and be applied unconditionally, so a colour handed in at 25%
+    #: alpha — the usual way of making an overplotted cloud readable — came
+    #: back fully opaque and hid exactly what it was asked to reveal.
+    #:
     #: Raises `ValueError` when the lists differ in length, or when `sizes` is
     #: given and does not match them.
     pub fn init(
@@ -50,7 +55,7 @@ pub class Scatter: Series {
         size: float = DEFAULT_SIZE,
         sizes: list[float] = [],
         shape: MarkerShape = MarkerShape.Circle,
-        opacity: float = 1.0,
+        opacity: float? = null,
         edge: Stroke? = null
     ) {
         if xs.len() != ys.len() {
@@ -68,14 +73,19 @@ pub class Scatter: Series {
         }
         self.name = label
         self.shape = shape
-        self.opacity = opacity
+        self.opacity = carried_opacity(color, opacity, 1.0)
         self.chosen = color != null
-        self.fill = Paint.solid((color ?? Color.from_rgb(0, 0, 0)).with_alpha(opacity))
+        self.fill = Paint.solid((color ?? Color.from_rgb(0, 0, 0)).with_alpha(self.opacity))
         self.edge = edge
     }
 
     #: Override the colour, after construction.
+    #:
+    #: A colour with an alpha of its own replaces the series opacity too;
+    #: otherwise the opacity in force is kept, so restyling a translucent
+    #: cloud with an opaque colour does not silently make it solid.
     pub fn color(self, value: Color) -> Scatter {
+        self.opacity = carried_opacity(value, null, self.opacity)
         self.fill = Paint.solid(value.with_alpha(self.opacity))
         self.chosen = true
         return self
