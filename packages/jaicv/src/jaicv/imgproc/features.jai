@@ -17,7 +17,7 @@
 import std.math
 from std.core import Printable
 from std.gpu import Buffer, Kernel
-from ..core.mat import Mat, f32_bits
+from ..core.mat import Mat, f32_bits, f32_from_bits
 from ..core.stats import min_max
 from ..core.types import BORDER_DEFAULT, CV_32F, CV_MAKETYPE, Point, Point2f, Size
 from .common import PRELUDE
@@ -44,6 +44,7 @@ pub const HOUGH_PROBABILISTIC = 1
 pub const HOUGH_GRADIENT = 3
 
 let SOURCE = PRELUDE + """
+
 /* The circle vote: every edge pixel walks the gradient both ways, dropping a
  * vote at each radius for where a centre could be.
  *
@@ -188,6 +189,41 @@ inline bool corner_wins(device const float* response, device const float* mask,
 }
 
 /* How many each threadgroup found. */
+/* How many corners fall in each slice of the response range, so the host can
+ * raise the floor to about the number of candidates it will actually look at
+ * rather than ranking the whole frame.
+ *
+ * The slices are cut on the float's bit pattern, not on its value. For a
+ * positive float the two are ordered the same way, so a slice boundary is
+ * still an exact threshold, and the bits crowd towards the small end -- which
+ * is where a corner response piles up, so the slices divide the candidates
+ * more evenly than equal steps in value would. */
+kernel void corner_bucket(device const float* response [[buffer(0)]],
+                          device const float* mask [[buffer(1)]],
+                          device atomic_uint* counts [[buffer(2)]],
+                          constant uint& rows [[buffer(3)]],
+                          constant uint& cols [[buffer(4)]],
+                          constant uint& r_off [[buffer(5)]],
+                          constant uint& r_step [[buffer(6)]],
+                          constant uint& m_off [[buffer(7)]],
+                          constant uint& m_step [[buffer(8)]],
+                          constant uint& use_mask [[buffer(9)]],
+                          constant uint& floor_bits [[buffer(10)]],
+                          constant uint& slice [[buffer(11)]],
+                          constant uint& buckets [[buffer(12)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (!corner_wins(response, mask, id, rows, cols, r_off, r_step, m_off,
+                     m_step, use_mask, as_type<float>(floor_bits))) {
+        return;
+    }
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint here = as_type<uint>(response[r_off + y * r_step + x]);
+    uint at = (here - floor_bits) / slice;
+    if (at >= buckets) at = buckets - 1u;
+    atomic_fetch_add_explicit(&counts[at], 1u, memory_order_relaxed);
+}
+
 kernel void corner_count(device const float* response [[buffer(0)]],
                          device const float* mask [[buffer(1)]],
                          device uint* tallies [[buffer(2)]],
@@ -222,18 +258,50 @@ kernel void corner_count(device const float* response [[buffer(0)]],
  * before it found. One thread walks the list, because there are a few
  * thousand of them and the walk is over before a second dispatch would have
  * started. */
-kernel void corner_scan(device uint* tallies [[buffer(0)]],
+/* Where each group's corners start, which is the running total of the groups
+ * before it.
+ *
+ * One thread walking the tallies is 8000-odd dependent reads on a 1080p
+ * frame, each waiting on device memory, and measured about as long as the
+ * whole rest of the search. A threadgroup reads them 256 at a time instead
+ * and carries the running total from block to block. */
+/* Held to `CORNER_GROUP` on the host, which is what the scan is dispatched
+ * with. */
+#define CORNER_SCAN_GROUP 256u
+#define CORNER_SCAN_WARPS 8u
+
+kernel void corner_scan(device const uint* tallies [[buffer(0)]],
                         device uint* bases [[buffer(1)]],
                         device float* total [[buffer(2)]],
                         constant uint& groups [[buffer(3)]],
-                        uint id [[thread_position_in_grid]]) {
-    if (id != 0u) return;
-    uint running = 0u;
-    for (uint g = 0u; g < groups; ++g) {
-        bases[g] = running;
-        running += tallies[g];
+                        uint lid [[thread_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint lanes[32];
+    threadgroup uint carry;
+    if (lid == 0u) carry = 0u;
+    if (lid < 32u) lanes[lid] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint base = 0u; base < groups; base += CORNER_SCAN_GROUP) {
+        uint at = base + lid;
+        uint mine = at < groups ? tallies[at] : 0u;
+        uint before = simd_prefix_exclusive_sum(mine);
+        uint whole = simd_sum(mine);
+        if (lane == 0u) lanes[warp] = whole;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint ahead = 0u;
+        for (uint w = 0u; w < warp; w++) ahead += lanes[w];
+        uint block = 0u;
+        for (uint w = 0u; w < CORNER_SCAN_WARPS; w++) block += lanes[w];
+        if (at < groups) bases[at] = carry + ahead + before;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lid == 0u) carry += block;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    total[0] = float(running);
+    if (lid == 0u) total[0] = float(carry);
 }
 
 /* The finds written where they belong: group by group, and inside a group in
@@ -246,7 +314,7 @@ kernel void corner_scan(device uint* tallies [[buffer(0)]],
 kernel void corner_emit(device const float* response [[buffer(0)]],
                         device const float* mask [[buffer(1)]],
                         device const uint* bases [[buffer(2)]],
-                        device float* cells [[buffer(3)]],
+                        device float* spots [[buffer(3)]],
                         device float* scores [[buffer(4)]],
                         constant uint& rows [[buffer(5)]],
                         constant uint& cols [[buffer(6)]],
@@ -285,7 +353,8 @@ kernel void corner_emit(device const float* response [[buffer(0)]],
     if (slot >= limit) return;
     uint y = id / cols;
     uint x = id - y * cols;
-    cells[slot] = float(id);
+    spots[slot * 2u] = float(x);
+    spots[slot * 2u + 1u] = float(y);
     scores[slot] = response[r_off + y * r_step + x];
 }
 
@@ -617,7 +686,57 @@ pub fn corner_min_eigen_val(src: Mat, block_size: int = 3, aperture_size: int = 
 #: instead of Shi and Tomasi's.
 #: How many threads a corner-hunting group runs, which is also how the
 #: groups' finds are numbered off against each other.
+#: Matched by `CORNER_SCAN_GROUP` in the kernel source.
 const CORNER_GROUP = 256
+
+#: Slices of the response range the candidates are counted into.
+const CORNER_BUCKETS = 1024
+
+#: How many candidates to bring back for every corner asked for. The greedy
+#: spacing pass throws away everything too near a corner it already has, so
+#: it reads well past `max_corners` before it fills; this is the margin, and
+#: running out of it falls back to the whole frame rather than a short answer.
+const CORNER_MARGIN = 32
+
+#: Keep the strongest corners that are far enough apart, in the order given.
+#:
+#: A body of its own because the tier declines a whole function for one call
+#: it cannot compile, and `good_features_to_track` is nothing but calls --
+#: dispatches, downloads, buffer frees. Left inline this loop ran interpreted
+#: at about eighty nanoseconds a distance check, which on a textured 1080p
+#: frame was longer than finding the corners had taken. Nothing in here is a
+#: call: the answer is written into room the caller set aside rather than
+#: pushed, and the positions arrive as plain floats so no conversion is
+#: needed.
+#:
+#: `flat` holds the kept positions as x, y pairs and `spots` the candidates
+#: the same way. The return is how many pairs of `flat` were written.
+fn space_out(spots: list[float], ordered: list[int], squared: float, flat: list[float]) -> int {
+    var taken = 0
+    let room = flat.len() // 2
+    for index in ordered {
+        if taken >= room { break }
+        let x = spots[index * 2]
+        let y = spots[index * 2 + 1]
+        var clear = true
+        var at = 0
+        while at < taken {
+            let dx = flat[at * 2] - x
+            let dy = flat[at * 2 + 1] - y
+            if dx * dx + dy * dy < squared {
+                clear = false
+                break
+            }
+            at += 1
+        }
+        if clear {
+            flat[taken * 2] = x
+            flat[taken * 2 + 1] = y
+            taken += 1
+        }
+    }
+    return taken
+}
 
 pub fn good_features_to_track(
     image: Mat,
@@ -627,7 +746,8 @@ pub fn good_features_to_track(
     mask: Mat? = null,
     block_size: int = 3,
     use_harris: bool = false,
-    k: float = 0.04
+    k: float = 0.04,
+    all_candidates: bool = false
 ) -> list[Point2f] {
     if quality_level <= 0.0 { throw ValueError("the quality level has to be positive") }
     if min_distance < 0.0 { throw ValueError("the minimum distance cannot be negative") }
@@ -651,6 +771,66 @@ pub fn good_features_to_track(
     let limit = rows * cols
     let groups = (limit + CORNER_GROUP - 1) // CORNER_GROUP
     let opened = if mask_image is null { 0 } else { 1 }
+
+    #: Whether a pixel is a peak does not depend on the floor, so raising the
+    #: floor takes away exactly the weakest candidates and leaves the rest
+    #: untouched. That makes it safe to ask only for the strongest few
+    #: thousand: on a textured frame there are tens of thousands, and ranking
+    #: and walking all of them costs more than finding them did.
+    let wanted = if max_corners > 0 and not all_candidates {
+        max_corners * CORNER_MARGIN
+    } else {
+        0
+    }
+    var emit_bits = f32_bits(floor_value)
+    var room = limit
+    var whole_frame = true
+    if wanted > 0 {
+        let low_bits = f32_bits(floor_value)
+        let slice = (f32_bits(strongest) - low_bits) // CORNER_BUCKETS + 1
+        let counts = Buffer(CORNER_BUCKETS)
+        counts.fill_zero()
+        kernel_for("corner_bucket").dispatch_async(
+            [response.storage, plane.storage, counts],
+            limit,
+            [
+                rows,
+                cols,
+                response.offset,
+                response.step_,
+                plane.offset,
+                plane.step_,
+                opened,
+                f32_bits(floor_value),
+                slice,
+                CORNER_BUCKETS,
+            ]
+        )
+        let read = Buffer(CORNER_BUCKETS)
+        kernel_for("hough_collect").dispatch_async([counts, read], CORNER_BUCKETS, [CORNER_BUCKETS])
+        let tally = read.download()
+        counts.free()
+        read.free()
+
+        var running = 0
+        var cut = 0
+        for index in 0..CORNER_BUCKETS {
+            let at = CORNER_BUCKETS - 1 - index
+            running += int(tally[at] + 0.5)
+            if running >= wanted {
+                cut = at
+                break
+            }
+        }
+        #: `running` is exactly how many candidates sit at or above the cut,
+        #: so the room set aside is the answer's size rather than the frame's.
+        if cut > 0 {
+            emit_bits = low_bits + cut * slice
+            room = running
+            whole_frame = false
+        }
+    }
+
     let where = [
         rows,
         cols,
@@ -659,7 +839,7 @@ pub fn good_features_to_track(
         plane.offset,
         plane.step_,
         opened,
-        f32_bits(floor_value),
+        emit_bits,
     ]
     let tallies = Buffer(groups)
     let bases = Buffer(groups)
@@ -670,22 +850,27 @@ pub fn good_features_to_track(
         where,
         group_size: CORNER_GROUP
     )
-    kernel_for("corner_scan").dispatch_async([tallies, bases, total], 1, [groups])
-    let cells = Buffer(limit)
-    let scores = Buffer(limit)
-    kernel_for("corner_emit").dispatch_async(
-        [response.storage, plane.storage, bases, cells, scores],
-        groups * CORNER_GROUP,
-        where + [limit],
+    kernel_for("corner_scan").dispatch_async(
+        [tallies, bases, total],
+        CORNER_GROUP,
+        [groups],
         group_size: CORNER_GROUP
     )
-    let found = min(limit, int(total.download()[0]))
-    let candidates = if found == 0 { [] } else { cells.download(count: found) }
+    let spots = Buffer(room * 2)
+    let scores = Buffer(room)
+    kernel_for("corner_emit").dispatch_async(
+        [response.storage, plane.storage, bases, spots, scores],
+        groups * CORNER_GROUP,
+        where + [room],
+        group_size: CORNER_GROUP
+    )
+    let found = min(room, int(total.download()[0]))
+    let candidates = if found == 0 { [] } else { spots.download(count: found * 2) }
     let strengths = if found == 0 { [] } else { scores.download(count: found) }
     tallies.free()
     bases.free()
     total.free()
-    cells.free()
+    spots.free()
     scores.free()
 
     #: Strongest first, and equal strengths in the order they were found --
@@ -698,23 +883,27 @@ pub fn good_features_to_track(
     for index in 0..found { order.push(index) }
     let ordered = order.sort(key: |index| strengths[index], reverse: true)
 
+    let room_for = if max_corners > 0 { min(max_corners, found) } else { found }
+    var flat = [0.0 for _slot in 0..room_for * 2]
+    let taken = space_out(candidates, ordered, min_distance * min_distance, flat)
     var kept: list[Point2f] = []
-    let squared = min_distance * min_distance
-    for index in ordered {
-        if max_corners > 0 and kept.len() >= max_corners { break }
-        let cell = int(candidates[index])
-        let y = cell // cols
-        let x = cell - y * cols
-        var clear = true
-        for taken in kept {
-            let dx = taken.x - float(x)
-            let dy = taken.y - float(y)
-            if dx * dx + dy * dy < squared {
-                clear = false
-                break
-            }
-        }
-        if clear { kept.push(Point2f(float(x), float(y))) }
+    for index in 0..taken { kept.push(Point2f(flat[index * 2], flat[index * 2 + 1])) }
+    #: Reading every candidate without filling the answer means the margin
+    #: was not enough, and the ones left out might have filled it. Nothing
+    #: about the frame says how wide the margin has to be, so the honest way
+    #: out is to go back and do the whole frame.
+    if not whole_frame and kept.len() < max_corners {
+        return good_features_to_track(
+            image,
+            max_corners,
+            quality_level,
+            min_distance,
+            mask,
+            block_size,
+            use_harris,
+            k,
+            all_candidates: true
+        )
     }
     return kept
 }

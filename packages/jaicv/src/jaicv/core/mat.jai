@@ -234,6 +234,20 @@ pub fn cached_kernel(entry: str) -> Kernel {
     return kernel
 }
 
+#: Read a float back out of the bits `f32_bits` made, so a threshold picked
+#: from a bit pattern can be handed to a kernel as a value.
+pub fn f32_from_bits(bits: int) -> float {
+    let sign = if bits & 0x80000000 != 0 { -1.0 } else { 1.0 }
+    let biased = bits >> 23 & 0xFF
+    let fraction = bits & 0x7FFFFF
+    if biased == 0 { return sign * __prim__.f64_ldexp(float(fraction), -149) }
+    if biased == 255 {
+        if fraction != 0 { return 0.0 / 0.0 }
+        return sign * 1.0e308 * 10.0
+    }
+    return sign * __prim__.f64_ldexp(float(fraction | 0x800000), biased - 150)
+}
+
 #: Reinterpret a float's bits as an integer, so a kernel can take it as a
 #: `constant uint&` and read it back with `as_type<float>`.
 pub fn f32_bits(value: float) -> int {
