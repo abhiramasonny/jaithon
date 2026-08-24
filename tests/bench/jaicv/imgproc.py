@@ -6,6 +6,7 @@ runs these on the CPU across all cores, which is the comparison worth making:
 it is what a pipeline uses today.
 """
 import os
+import sys
 import time
 
 import cv2
@@ -14,6 +15,7 @@ import numpy as np
 WIDTH = 1920
 HEIGHT = 1080
 WARMUP = 40
+WARM_SECONDS = 0.25
 
 
 def picture(channels: int) -> np.ndarray:
@@ -24,9 +26,32 @@ def picture(channels: int) -> np.ndarray:
     return values.reshape(HEIGHT, WIDTH, channels)
 
 
+# Which row this process was asked for, or None for all of them. See the note
+# on `_only` in imgproc.jai: one row a process, the two sides turn about, is
+# the only way the ratio means anything on a laptop.
+_only = None
+_listing = False
+
+
+def wanted(name: str) -> bool:
+    if _listing:
+        print(name)
+        return False
+    return _only is None or _only == name
+
+
 def run(name: str, repeats: int, work) -> None:
-    for _ in range(WARMUP):
+    if not wanted(name):
+        return
+    # Enough repetitions to settle, and no more. See the note on `warm` in
+    # imgproc.jai: a row a process pays the warm-up each time, and forty calls
+    # of a row that takes half a second is nearly twenty seconds of warming for
+    # a tenth of a second of measurement.
+    opening = time.perf_counter()
+    for round_index in range(WARMUP):
         work()
+        if round_index >= 7 and time.perf_counter() - opening >= WARM_SECONDS:
+            break
     started = time.perf_counter()
     last = None
     for _ in range(repeats):
@@ -66,6 +91,12 @@ def shifted_by(source, dx: int, dy: int):
 
 
 def main() -> int:
+    global _only, _listing
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "list":
+            _listing = True
+        else:
+            _only = sys.argv[1]
     level = os.environ.get("BENCH_LEVEL", "hard")
     repeats = 8 if level == "easy" else 16 if level == "medium" else 30
     grey = picture(1)
@@ -101,6 +132,33 @@ def main() -> int:
         repeats,
         lambda: cv2.goodFeaturesToTrack(grey, 200, 0.01, 6),
     )
+
+    # The operations a pipeline reaches for around the ones above. See the
+    # note in imgproc.jai.
+    turn = cv2.getRotationMatrix2D((WIDTH * 0.5, HEIGHT * 0.5), 30.0, 1.0)
+    grid_y, grid_x = np.mgrid[0:HEIGHT, 0:WIDTH]
+    map_x = ((grid_x + 7) % WIDTH).astype(np.float32)
+    map_y = ((grid_y + 5) % HEIGHT).astype(np.float32)
+    cross = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    run("threshold", repeats, lambda: cv2.threshold(grey, 0.5, 1.0, cv2.THRESH_BINARY)[1])
+    run(
+        "adaptive-threshold",
+        repeats,
+        lambda: cv2.adaptiveThreshold(
+            bytes_frame, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2
+        ),
+    )
+    run("equalize-hist", repeats, lambda: cv2.equalizeHist(bytes_frame))
+    run("morph-open-5", repeats, lambda: cv2.morphologyEx(grey, cv2.MORPH_OPEN, cross))
+    run("morph-gradient-5", repeats, lambda: cv2.morphologyEx(grey, cv2.MORPH_GRADIENT, cross))
+    run("warp-affine", repeats, lambda: cv2.warpAffine(grey, turn, (WIDTH, HEIGHT)))
+    run("remap", repeats, lambda: cv2.remap(grey, map_x, map_y, cv2.INTER_LINEAR))
+
+    # Three colour channels, and eight-bit because the peer's filter takes
+    # nothing else. See the note in imgproc.jai.
+    photo = (picture(3) * 255.0).astype(np.uint8)
+    run("edge-preserving", max(2, repeats // 10), lambda: cv2.edgePreservingFilter(photo))
+    run("detail-enhance", max(2, repeats // 10), lambda: cv2.detailEnhance(photo))
 
     small_rows, small_cols = 480, 640
     damaged = byte_picture(small_rows, small_cols)

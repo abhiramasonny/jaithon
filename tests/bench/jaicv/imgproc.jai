@@ -12,11 +12,14 @@ import std.math
 from jaicv import Mat, Size
 from jaicv.core.stats import min_max_loc, norm, sum_mat
 from jaicv.core.types import Point2f
-from jaicv.imgproc.morph import erode, get_structuring_element, MORPH_RECT
+from jaicv.imgproc.geometric import get_rotation_matrix_2d, remap, warp_affine
+from jaicv.imgproc.hist import equalize_hist
+from jaicv.imgproc.morph import erode, get_structuring_element, morphology_ex, MORPH_RECT
 from jaicv.imgproc.segmentation import connected_components, distance_transform, integral
-from jaicv.photo.denoise import inpaint
+from jaicv.imgproc.threshold import adaptive_threshold, threshold
+from jaicv.photo.denoise import detail_enhance, edge_preserving_filter, inpaint
 from jaicv.video.optflow import calc_optical_flow_pyr_lk
-from std.os import env_or
+from std.os import argv, env_or
 from std.time import Instant
 
 let WIDTH = 1920
@@ -31,6 +34,9 @@ let HEIGHT = 1080
 #: warms the same number of times; a CPU has no ramp to climb, so it costs
 #: nothing there and keeps the two sides honest.
 let WARMUP = 40
+
+#: The longest the warm-up above may take.
+let WARM_SECONDS = 0.25
 
 #: The same frame as bytes, which is what an edge detector and an inpainter
 #: are given in practice and what OpenCV is fastest on.
@@ -89,9 +95,36 @@ fn picture(channels: int) -> Mat {
 
 #: The same timing for the reductions, which hand back a number rather than a
 #: picture and so have nothing to keep alive.
+#: Which row this process was asked for, or empty for all of them.
+#:
+#: The suite used to run every row of our side three times and then every row
+#: of the peer's three times. That is not a fair comparison on a laptop: by the
+#: time the later rows came up, our side had held the GPU flat out for a minute
+#: and the peer -- which runs on the CPU and leaves the device cool -- reached
+#: the same rows on a cold one. good-features read 1.32x when it was the last
+#: row of twenty-one and 0.75x when nine more rows were added in front of it,
+#: with nothing about the code changed in between. One row a process, the two
+#: sides turn about, is the only way the ratio means anything.
+var _only = ""
+var _listing = false
+
+fn wanted(name: str) -> bool {
+    if _listing {
+        print(name)
+        return false
+    }
+    return _only == "" or _only == name
+}
+
 fn run_scalar(name: str, repeats: int, work: fn() -> float) -> void {
-    for _warm in 0..WARMUP {
+    if not wanted(name) { return }
+    let opening = Instant.now()
+    for round in 0..WARMUP {
         let _ = work()
+        if round >= 7 and round % 4 == 3 {
+            gpu.synchronize()
+            if opening.elapsed().to_seconds() >= WARM_SECONDS { break }
+        }
     }
     gpu.synchronize()
     let started = Instant.now()
@@ -103,12 +136,29 @@ fn run_scalar(name: str, repeats: int, work: fn() -> float) -> void {
     print(f"jtb\t{name}\t{seconds:.9f}\t0\t{repeats * WIDTH * HEIGHT}\t{check}\t—")
 }
 
-fn run(name: str, repeats: int, work: fn() -> Mat) -> void {
-    for _warm in 0..WARMUP {
+#: Enough dispatches to bring the clock up, and no more.
+#:
+#: Forty was right when every row ran in one process and the warm-up was paid
+#: once. A row a process pays it each time, and forty calls of a row that takes
+#: forty milliseconds is a second and a half of warming for a tenth of a second
+#: of measurement. A slow row does a dozen dispatches a call, so the clock is up
+#: long before the count is.
+fn warm(work: fn() -> Mat) -> void {
+    let opening = Instant.now()
+    for round in 0..WARMUP {
         let m = work()
         m.release()
+        if round >= 7 and round % 4 == 3 {
+            gpu.synchronize()
+            if opening.elapsed().to_seconds() >= WARM_SECONDS { break }
+        }
     }
     gpu.synchronize()
+}
+
+fn run(name: str, repeats: int, work: fn() -> Mat) -> void {
+    if not wanted(name) { return }
+    warm(work)
     let started = Instant.now()
     #: The latest result stays alive so the work cannot be elided, and every
     #: earlier one goes back immediately. Holding all thirty means a quarter of
@@ -132,7 +182,11 @@ fn run(name: str, repeats: int, work: fn() -> Mat) -> void {
 }
 
 fn main() -> int {
-    if not gpu.is_available() { throw RuntimeError("bench needs a GPU") }
+    let given = argv()
+    if given.len() > 1 {
+        if given[1] == "list" { _listing = true } else { _only = given[1] }
+    }
+    if not _listing and not gpu.is_available() { throw RuntimeError("bench needs a GPU") }
     let level = env_or("BENCH_LEVEL", "hard")
     let repeats = if level == "easy" { 8 } elif level == "medium" { 16 } else { 30 }
     let grey = picture(1)
@@ -177,6 +231,45 @@ fn main() -> int {
     run_scalar("good-features", repeats, fn() -> float {
         return float(cv.good_features_to_track(grey, 200, 0.01, 6.0).len())
     })
+
+    #: The operations a pipeline reaches for around the ones above, none of
+    #: which was measured against anything. Every one of these was at or above
+    #: the peer when it was first timed except the smoothing filter, which ran
+    #: entirely on the host and took 3.7 seconds a frame.
+    let turn = get_rotation_matrix_2d(Point2f(float(WIDTH) * 0.5, float(HEIGHT) * 0.5), 30.0, 1.0)
+    var across: list[float] = []
+    var down: list[float] = []
+    for index in 0..HEIGHT * WIDTH {
+        let y = index // WIDTH
+        let x = index - y * WIDTH
+        across.push(float((x + 7) % WIDTH))
+        down.push(float((y + 5) % HEIGHT))
+    }
+    let map_x = Mat.from_list(HEIGHT, WIDTH, cv.CV_32FC1, across)
+    let map_y = Mat.from_list(HEIGHT, WIDTH, cv.CV_32FC1, down)
+    let cross = get_structuring_element(MORPH_RECT, Size(5, 5))
+    run_scalar("threshold", repeats, fn() -> float {
+        let (level, made) = threshold(grey, 0.5, 1.0, cv.THRESH_BINARY)
+        made.release()
+        return level
+    })
+    run(
+        "adaptive-threshold",
+        repeats,
+        || adaptive_threshold(bytes_frame, 255.0, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 11, 2.0)
+    )
+    run("equalize-hist", repeats, || equalize_hist(bytes_frame))
+    run("morph-open-5", repeats, || morphology_ex(grey, cv.MORPH_OPEN, cross))
+    run("morph-gradient-5", repeats, || morphology_ex(grey, cv.MORPH_GRADIENT, cross))
+    run("warp-affine", repeats, || warp_affine(grey, turn, Size(WIDTH, HEIGHT)))
+    run("remap", repeats, || remap(grey, map_x, map_y))
+
+    #: Three colour channels, because the peer's edge-preserving filter takes
+    #: nothing else, and at a tenth of the repetitions because both sides take
+    #: tens of milliseconds a frame.
+    let photo = picture(3)
+    run("edge-preserving", max(2, repeats // 10), || edge_preserving_filter(photo))
+    run("detail-enhance", max(2, repeats // 10), || detail_enhance(photo))
 
     #: Inpainting and optical flow at 640 by 480. The peer's inpainter is a
     #: sequential march inward and takes the best part of a second on a 1080p

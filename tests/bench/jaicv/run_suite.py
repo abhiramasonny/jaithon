@@ -4,6 +4,16 @@ Each side is run several times and the median taken, because a single run of a
 GPU workload measures the clock ramping as much as the kernel. The two sides
 print the same records, so a name missing from either is an error rather than a
 blank row -- a benchmark that quietly drops half its cases reads like a pass.
+
+One row a process, and the two sides turn about. Running our whole side and
+then the peer's is not a fair comparison on a laptop: by the time the later
+rows come up, our side has held the GPU flat out for a minute, while the peer
+runs on the CPU and reaches the same rows on a cool device. good-features read
+1.32x when it was the last row of twenty-one and 0.75x when nine more rows were
+added in front of it, with nothing about the code changed in between. Isolated,
+it reads the same to within two per cent every time. The extra process starts
+cost about a minute across the suite, which is the price of the numbers meaning
+anything.
 """
 from __future__ import annotations
 
@@ -37,29 +47,57 @@ def parse(output: str) -> dict[str, tuple[float, str]]:
     return found
 
 
-def sample(command: list[str], runs: int, cwd: Path, level: str, label: str):
+def one(command: list[str], cwd: Path, level: str) -> dict[str, tuple[float, str]]:
     env = os.environ.copy()
     env["BENCH_LEVEL"] = level
     env.setdefault("PYTHONWARNINGS", "ignore")
-    order: list[str] = []
-    times: dict[str, list[float]] = {}
+    done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
+    if done.returncode != 0:
+        detail = (done.stdout + done.stderr).strip() or "<no output>"
+        raise BenchError(f"{' '.join(command)} failed: {detail}")
+    return parse(done.stdout)
+
+
+def listing(command: list[str], cwd: Path, level: str) -> list[str]:
+    env = os.environ.copy()
+    env["BENCH_LEVEL"] = level
+    env.setdefault("PYTHONWARNINGS", "ignore")
+    done = subprocess.run(command + ["list"], cwd=cwd, env=env, capture_output=True, text=True)
+    if done.returncode != 0:
+        detail = (done.stdout + done.stderr).strip() or "<no output>"
+        raise BenchError(f"listing failed: {detail}")
+    return [line.strip() for line in done.stdout.splitlines() if line.strip()]
+
+
+def collect(mine: list[str], theirs: list[str], rows: list[str], runs: int,
+            cwd: Path, level: str):
+    """Time every row on both sides, alternating, one row a process."""
+    ours: dict[str, list[float]] = {name: [] for name in rows}
+    peer: dict[str, list[float]] = {name: [] for name in rows}
     checks: dict[str, str] = {}
+    total = runs * len(rows)
+    done_count = 0
     for index in range(runs):
-        if sys.stderr.isatty():
-            sys.stderr.write(f"\r\033[K  {label} (run {index + 1} of {runs})")
-            sys.stderr.flush()
-        done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
-        if done.returncode != 0:
-            detail = (done.stdout + done.stderr).strip() or "<no output>"
-            raise BenchError(f"{' '.join(command)} failed: {detail}")
-        for name, (seconds, check) in parse(done.stdout).items():
-            if name not in times:
-                order.append(name)
-                times[name] = []
-            times[name].append(seconds)
-            if check != "ok":
-                checks[name] = check
-    return order, {name: statistics.median(values) for name, values in times.items()}, checks
+        for name in rows:
+            done_count += 1
+            if sys.stderr.isatty():
+                sys.stderr.write(f"\r\033[K  {name} ({done_count} of {total})")
+                sys.stderr.flush()
+            for side, command, into in ((True, mine, ours), (False, theirs, peer)):
+                found = one(command + [name], cwd, level)
+                if name not in found:
+                    raise BenchError(f"{'jaicv' if side else 'opencv'} did not report {name}")
+                seconds, check = found[name]
+                into[name].append(seconds)
+                if check != "ok":
+                    checks[name] = check
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+    return (
+        {name: statistics.median(values) for name, values in ours.items()},
+        {name: statistics.median(values) for name, values in peer.items()},
+        checks,
+    )
 
 
 def main() -> int:
@@ -72,25 +110,23 @@ def main() -> int:
     args = parser.parse_args()
 
     here = args.root / "tests" / "bench" / "jaicv"
+    ours_command = [args.jaithon, "run", str(here / "imgproc.jai")]
+    peer_command = [args.python, str(here / "imgproc.py")]
     try:
-        order, mine, my_checks = sample(
-            [args.jaithon, "run", str(here / "imgproc.jai")],
-            args.runs, args.root, args.level, "jaicv",
-        )
-        _, theirs, their_checks = sample(
-            [args.python, str(here / "imgproc.py")],
-            args.runs, args.root, args.level, "opencv",
+        order = listing(ours_command, args.root, args.level)
+        peer_rows = listing(peer_command, args.root, args.level)
+        missing = [name for name in order if name not in peer_rows]
+        if missing:
+            print(f"error: opencv has no row for {', '.join(missing)}", file=sys.stderr)
+            return 1
+        mine, theirs, checks = collect(
+            ours_command, peer_command, order, args.runs, args.root, args.level
         )
     except BenchError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    if sys.stderr.isatty():
-        sys.stderr.write("\r\033[K")
-
-    missing = [name for name in order if name not in theirs]
-    if missing:
-        print(f"error: opencv did not report {', '.join(missing)}", file=sys.stderr)
-        return 1
+    my_checks = checks
+    their_checks: dict[str, str] = {}
 
     print(f"{BOLD}{'operation':<16}{'jaicv':>10}{'opencv':>10}{'ratio':>9}   result{RESET}")
     print("─" * 54)
