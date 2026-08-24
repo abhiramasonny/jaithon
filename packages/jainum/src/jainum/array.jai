@@ -208,6 +208,13 @@ pub fn is_contiguous(shape: list[int], strides: list[int], lanes: int) -> bool {
 }
 
 #: The shape `a` and `b` broadcast to, aligned from the right.
+#:
+#: The surviving extent is the one that is not 1, which is `max` everywhere
+#: except against a zero-length axis: numpy answers `(3, 0)` for `(3, 0)`
+#: against `(3, 1)` and against `()`, because a length-one axis stretches to
+#: whatever the other side is and an empty one stays empty. `max` answered 1
+#: there and handed the caller an output with three elements it then could
+#: not fill from an empty operand.
 pub fn broadcast_shapes(a: list[int], b: list[int]) -> list[int] {
     let rank = max(a.len(), b.len())
     var out = [0 for _axis in 0..rank]
@@ -217,7 +224,7 @@ pub fn broadcast_shapes(a: list[int], b: list[int]) -> list[int] {
         if left != right and left != 1 and right != 1 {
             throw ValueError(f"shapes {a} and {b} do not broadcast together")
         }
-        out[axis] = max(left, right)
+        out[axis] = if left == 1 { right } else { left }
     }
     return out
 }
@@ -602,17 +609,27 @@ kernel void nd_fill_masked(device float* dst [[buffer(0)]],
 }
 
 /* The four arithmetic ops, dense. `count` is elements, because a complex
- * product is not a per-slot operation. */
+ * product is not a per-slot operation.
+ *
+ * `mode`, `low` and `high` are the destination dtype's conversion, the same
+ * three `nd_copy` takes: a sum of two int32 arrays that leaves the int32
+ * range saturates here rather than being stored as a float the dtype cannot
+ * hold. Only the single-lane path converts -- a complex destination is never
+ * an integer dtype, so its mode is always CAST_NONE. */
 kernel void nd_binary(device float* dst [[buffer(0)]],
                       device const float* a [[buffer(1)]],
                       device const float* b [[buffer(2)]],
                       constant uint& count [[buffer(3)]],
                       constant uint& lanes [[buffer(4)]],
                       constant uint& op [[buffer(5)]],
+                      constant uint& mode [[buffer(6)]],
+                      constant uint& low_bits [[buffer(7)]],
+                      constant uint& high_bits [[buffer(8)]],
                       uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     if (lanes == 1u) {
-        dst[id] = nd_apply(a[id], b[id], op);
+        float value = nd_apply(a[id], b[id], op);
+        dst[id] = nd_convert(value, mode, as_type<float>(low_bits), as_type<float>(high_bits));
         return;
     }
     uint at = id * 2u;
@@ -628,13 +645,17 @@ kernel void nd_binary_strided(device float* dst [[buffer(0)]],
                               constant uint& count [[buffer(4)]],
                               constant uint& lanes [[buffer(5)]],
                               constant uint& op [[buffer(6)]],
+                              constant uint& mode [[buffer(7)]],
+                              constant uint& low_bits [[buffer(8)]],
+                              constant uint& high_bits [[buffer(9)]],
                               uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     int to = nd_offset(meta, 0u, id);
     int left = nd_offset(meta, 1u, id);
     int right = nd_offset(meta, 2u, id);
     if (lanes == 1u) {
-        dst[to] = nd_apply(a[left], b[right], op);
+        float one = nd_apply(a[left], b[right], op);
+        dst[to] = nd_convert(one, mode, as_type<float>(low_bits), as_type<float>(high_bits));
         return;
     }
     float2 value = nd_apply2(float2(a[left], a[left + 1]), float2(b[right], b[right + 1]), op);
@@ -648,11 +669,15 @@ kernel void nd_binary_scalar(device float* dst [[buffer(0)]],
                              constant uint& lanes [[buffer(3)]],
                              constant uint& op [[buffer(4)]],
                              constant uint& bits [[buffer(5)]],
+                             constant uint& mode [[buffer(6)]],
+                             constant uint& low_bits [[buffer(7)]],
+                             constant uint& high_bits [[buffer(8)]],
                              uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     float scalar = as_type<float>(bits);
     if (lanes == 1u) {
-        dst[id] = nd_apply(a[id], scalar, op);
+        float one = nd_apply(a[id], scalar, op);
+        dst[id] = nd_convert(one, mode, as_type<float>(low_bits), as_type<float>(high_bits));
         return;
     }
     uint at = id * 2u;
@@ -668,13 +693,17 @@ kernel void nd_binary_scalar_strided(device float* dst [[buffer(0)]],
                                      constant uint& lanes [[buffer(4)]],
                                      constant uint& op [[buffer(5)]],
                                      constant uint& bits [[buffer(6)]],
+                                     constant uint& mode [[buffer(7)]],
+                                     constant uint& low_bits [[buffer(8)]],
+                                     constant uint& high_bits [[buffer(9)]],
                                      uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     int to = nd_offset(meta, 0u, id);
     int from = nd_offset(meta, 1u, id);
     float scalar = as_type<float>(bits);
     if (lanes == 1u) {
-        dst[to] = nd_apply(a[from], scalar, op);
+        float one = nd_apply(a[from], scalar, op);
+        dst[to] = nd_convert(one, mode, as_type<float>(low_bits), as_type<float>(high_bits));
         return;
     }
     float2 value = nd_apply2_scalar(float2(a[from], a[from + 1]), scalar, op);
@@ -1405,6 +1434,12 @@ fn _scalar_dtype(value: any) -> int {
 #: Two bools give an int rather than numpy's or-for-add, because half of these
 #: operators have no boolean reading at all and one rule beats four. True
 #: division always leaves the integers, as it does in numpy.
+#:
+#: An integer result saturates on the way out, the same rule `astype` and the
+#: `ufunc` kernels follow: 2000000000 + 2000000000 in an int32 array answers
+#: the int32 ceiling. numpy wraps there instead, which is a reading of a
+#: 32-bit register this package does not have -- the value lives in float32
+#: storage, where the wrapped pattern was never computed.
 fn _result_dtype(a: int, b: int, op: int) -> int {
     var out = promote(a, b)
     if out == BOOL { out = INT32 }
@@ -1430,11 +1465,14 @@ fn _binary_arrays(left: NDArray, right: NDArray, op: int) -> NDArray {
     let out = NDArray(a.shape, dtype)
     let count = out.size()
     if count == 0 { return out }
+    let mode = _cast_mode(dtype)
+    let low = f32_bits(dtype_min(dtype))
+    let high = f32_bits(dtype_max(dtype))
     if a.offset == 0 and a.is_contiguous() and b.offset == 0 and b.is_contiguous() {
         kernel_of(SOURCE, "nd_binary").dispatch_async(
             [out.storage, a.storage, b.storage],
             count,
-            [count, lanes, op]
+            [count, lanes, op, mode, low, high]
         )
         return out
     }
@@ -1443,7 +1481,7 @@ fn _binary_arrays(left: NDArray, right: NDArray, op: int) -> NDArray {
     kernel_of(SOURCE, "nd_binary_strided").dispatch_async(
         [out.storage, a.storage, b.storage, meta],
         count,
-        [count, lanes, op]
+        [count, lanes, op, mode, low, high]
     )
     return out
 }
@@ -1455,11 +1493,14 @@ fn _binary_scalar(a: NDArray, value: float, scalar_dtype: int, op: int) -> NDArr
     if count == 0 { return out }
     let lanes = out.lanes()
     let bits = f32_bits(value)
+    let mode = _cast_mode(dtype)
+    let low = f32_bits(dtype_min(dtype))
+    let high = f32_bits(dtype_max(dtype))
     if a.offset == 0 and a.is_contiguous() and lanes == a.lanes() {
         kernel_of(SOURCE, "nd_binary_scalar").dispatch_async(
             [out.storage, a.storage],
             count,
-            [count, lanes, op, bits]
+            [count, lanes, op, bits, mode, low, high]
         )
         return out
     }
@@ -1468,7 +1509,7 @@ fn _binary_scalar(a: NDArray, value: float, scalar_dtype: int, op: int) -> NDArr
     kernel_of(SOURCE, "nd_binary_scalar_strided").dispatch_async(
         [out.storage, a.storage, meta],
         count,
-        [count, lanes, op, bits]
+        [count, lanes, op, bits, mode, low, high]
     )
     return out
 }

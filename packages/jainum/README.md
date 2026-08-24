@@ -19,6 +19,24 @@ for `zeros_like`, `NDArray` for `ndarray`, `FLOAT32` for `np.float32`. A
 program written against numpy translates line for line, with one exception that
 is worth reading before anything else.
 
+## A GPU is not optional
+
+Storage is one float32 Metal buffer per allocation and every operation below
+is a kernel, so constructing an `NDArray` on a machine without a device raises
+rather than falling back to the host. `nn.is_available()` is the question to
+ask first; `nn.device_name()`, `nn.device_count()` and `nn.set_device(index)`
+are the rest of that surface, and `set_device` has to be called before the
+first array exists.
+
+## Namespaces
+
+Three parts of the library are namespaces rather than flat names, exactly as
+they are in numpy — `nn.linalg.solve`, `nn.random.default_rng`, `nn.fft.rfft`.
+Everything else is flat: `nn.zeros`, `nn.argmax`, `nn.concatenate`. Each
+module is also importable on its own, so `from jainum.reduce import argmax`
+keeps working; the facade in `mod.jai` is for callers who want the package
+rather than one file.
+
 ## Indexing does not use slice syntax
 
 `a[1:3]` does not work, and it does not fail in a way that suggests an
@@ -159,3 +177,10 @@ JAITHON_PATH=lib ./jaithon test packages/jainum/tests/
 One test file per module, named after it. The layout helpers are pure and run
 without a device; anything that touches storage returns early when
 `nn.is_available()` is false.
+
+`test_reachable.jai` is the exception: it calls every name the facade exports,
+once, through `import jainum as nn`. A module test asks what a function
+computes, and cannot see a name that was renamed in one file and not the
+other, or an export whose signature nobody has called since it grew an
+argument. That is the failure this file exists to catch, and it is the one
+jaicv and jaitensor keep a file of the same name for.

@@ -19,6 +19,7 @@
 import std.math
 from std.algo.sort import natural_order, sort_by
 from std.core import Printable
+from std.math import atan2
 from ..core.mat import Mat
 from ..core.types import Point, Point2f, Rect, RotatedRect, Scalar, Size2f
 from .geometric import solve_dense
@@ -502,15 +503,40 @@ let HULL_POINT_LIMIT = 1048576
 #: How far a coordinate may sit from zero for the arithmetic below to be exact.
 #:
 #: Not the limit the packing alone would ask for, which is a thousand times
-#: looser. The turn test multiplies a difference in x by a difference in y, and
-#: the widest hull this path accepts is four columns a point, so a coordinate
-#: of a billion leaves the product ten bits of room. Wider than any picture,
-#: and everything past it goes to `hull_by_sorting`, which multiplies the same
-#: two differences but is never reached with a width this path would have
-#: taken.
+#: looser. The turn test multiplies a difference in x by a difference in y. The
+#: difference in x is bounded by `HULL_WIDTH_LIMIT` and the one in y by this,
+#: so the product fits in fifty bits and the difference of two of them in
+#: fifty-one. Wider than any picture, and everything past it goes to
+#: `hull_by_sorting`, which multiplies the same two differences but is never
+#: reached with a span this path would have taken.
 pub let HULL_COORD_LIMIT = 1073741824
 
-#: The column buckets and the two chain stacks, kept between calls.
+#: How many columns the bucket path will address.
+#:
+#: A memory ceiling rather than a speed one: the cells hold two words a column,
+#: so this is four megabytes of them kept between calls, and a quarter of a
+#: million columns is a hundred times the width of a 1080p frame. It is also
+#: what bounds the difference in x in the turn test above.
+let HULL_WIDTH_LIMIT = 262144
+
+#: How many columns a point may span before sorting is the cheaper answer.
+#:
+#: Sorting costs about six hundred nanoseconds a point, because its comparator
+#: is a closure and no closure call is a candidate for the tier. A column costs
+#: under two nanoseconds even when nothing has landed in it, so columns stay
+#: ahead until there are some three hundred of them a point, and the block
+#: index below usually means the empty ones are not visited at all. The floor
+#: is there because a handful of points spread over a frame is still cheaper by
+#: column than by sort.
+#:
+#: The old budget was four columns a point. It refused a 74-point frame contour
+#: spanning 1920 columns and sent it to the sort: 44 microseconds where columns
+#: take one and a half.
+let HULL_COLUMN_BUDGET = 256
+let HULL_COLUMN_FLOOR = 8192
+
+#: The column buckets, the block index over them, the two chain stacks and the
+#: span, kept between calls.
 #:
 #: Not held to save the allocation but to save the clearing. Filling a fresh
 #: bucket array is the single most expensive thing this operation used to do
@@ -519,64 +545,149 @@ pub let HULL_COORD_LIMIT = 1073741824
 #: points did. Kept instead, and blanked one column at a time by the walk that
 #: reads it, so only columns a point actually landed in are ever written twice.
 #:
+#: `_hull_blocks` is what makes a sparse span affordable. A frame contour spans
+#: every column of the picture but lands in only a few dozen of them, and the
+#: walk used to step through all the empty ones in between: 1920 columns for 49
+#: occupied, three and a half microseconds of the four and nine tenths the call
+#: took. A block covers a run of columns and holds the leftmost and rightmost
+#: that a point landed in, so the walk steps over about as many blocks as there
+#: are points and then only the stretch of each block that holds anything --
+#: 111 steps instead of 1920 on that contour. A pair starts at `HULL_UNUSED`
+#: and -1 so that the two comparisons that widen it need no test for the first
+#: point of a block.
+#:
 #: Nothing outside a single `convex_hull` call ever sees them, and the call
 #: makes no call that could re-enter it.
 var _hull_cells: list[int] = []
+var _hull_blocks: list[int] = []
 var _hull_low_chain: list[int] = []
 var _hull_high_chain: list[int] = []
-var _hull_span: list[int] = []
+var _hull_span: list[int] = [0, 0, 0]
 
-fn hull_grow(buffer: list[int], need: int, value: int) -> list[int] {
-    var grown = buffer
-    for _index in grown.len()..need { grown.push(value) }
-    return grown
+#: Room for a span this wide and a set this big, grown once and then kept.
+#:
+#: Every buffer starts empty and only ever grows, so this runs on the first
+#: call and then on the rare call that spans wider than any before it.
+fn hull_reserve(
+    cells: list[int],
+    blocks: list[int],
+    low_chain: list[int],
+    high_chain: list[int],
+    width: int,
+    count: int
+) -> void {
+    while cells.len() < width * 2 { cells.push(HULL_UNUSED) }
+    var shift = 0
+    while width >> shift > count { shift += 1 }
+    let blocks_end = (width - 1 >> shift) + 1
+    while blocks.len() < blocks_end * 2 {
+        blocks.push(HULL_UNUSED)
+        blocks.push(-1)
+    }
+    let room = count * 2 + 2
+    while low_chain.len() < room {
+        low_chain.push(0)
+        high_chain.push(0)
+    }
 }
 
-#: How many columns the points span, with the leftmost x into `span`.
+#: The extent of the points and the lowest and highest point of every column.
 #:
-#: Its own function, and so are the three below it, because the tier compiles a
-#: whole function but only four loops of one it has declined -- and this had
-#: seven. Split up they each compile, and the body that calls them is left with
-#: no loop in it at all.
-fn hull_extent(points: list[Point], span: list[int]) -> int {
+#: Two passes over the points in one function, and the walk below is a second
+#: function, because the tier is working to two budgets at once. All three
+#: passes in one body needs more deopt records than it will keep for one -- a
+#: hundred and sixty -- and the whole body is then declined and runs
+#: interpreted at 90 nanoseconds a point. Split five ways instead, each body
+#: has to reach the tier's entry threshold on its own, and a hull is entered
+#: once a contour. Two is what fits both.
+#:
+#: `@trace` for the same reason: the tier looks at a function on its
+#: sixty-fifth entry, and a marked one on its ninth. Sixty-four contours is a
+#: long warm-up for something a frame calls once a shape, and the marking costs
+#: nothing where it is read -- a trace session is only opened for a call made
+#: from interpreted code, and by the time this matters `convex_hull` is native
+#: and calls straight through.
+#:
+#: The buffers arrive as parameters rather than being read off the globals they
+#: belong to, because a parameter's slot is its own for the life of the call
+#: and the tier will not compile a body that gives one slot two kinds.
+#:
+#: -1 says the columns refused the set, and a value below that asks for room
+#: and names the width that needs it. Both are settled before a single bucket
+#: is written, so neither leaves anything to blank.
+@trace
+fn hull_columns(
+    points: list[Point],
+    cells: list[int],
+    blocks: list[int],
+    low_chain: list[int],
+    span: list[int]
+) -> int {
+    #: Bound before any integer is, and reused by both passes rather than
+    #: declared inside them. A local declared inside a loop is given a slot the
+    #: compiler is free to hand to an integer once the loop ends, and a slot
+    #: the tier has seen two kinds in is a slot it will not compile against.
+    var held = points[0]
     let count = points.len()
-    var lowest = points[0].x
+    var lowest = held.x
     var highest = lowest
+    var deepest = held.y
+    var tallest = deepest
     for index in 0..count {
-        let x = points[index].x
+        held = points[index]
+        let x = held.x
         if x < lowest { lowest = x }
         if x > highest { highest = x }
+        let y = held.y
+        if y < deepest { deepest = y }
+        if y > tallest { tallest = y }
     }
-    span[0] = lowest
-    #: Zero for a span no column index could address, which the caller reads as
-    #: a refusal the same way it reads a single column.
-    if lowest <= 0 - HULL_COORD_LIMIT { return 0 }
-    if highest >= HULL_COORD_LIMIT { return 0 }
-    return highest - lowest + 1
-}
+    if lowest <= 0 - HULL_COORD_LIMIT { return -1 }
+    if highest >= HULL_COORD_LIMIT { return -1 }
+    if deepest <= 0 - HULL_COORD_LIMIT { return -1 }
+    if tallest >= HULL_COORD_LIMIT { return -1 }
+    if count >= HULL_POINT_LIMIT { return -1 }
+    let width = highest - lowest + 1
+    if width < 2 { return -1 }
+    if width > HULL_WIDTH_LIMIT { return -1 }
+    if width > HULL_COLUMN_BUDGET * count + HULL_COLUMN_FLOOR { return -1 }
 
-#: The lowest and highest point of every column, or nonzero if a y is too far
-#: from the origin to pack with an index.
-#:
-#: The check has to come before the multiply and not after it: `y *
-#: HULL_STRIDE` on a y of nine trillion raises rather than wrapping, so a
-#: reach summed over the loop and read at the end would never be read.
-fn hull_bucket(points: list[Point], cells: list[int], lowest: int) -> int {
-    let count = points.len()
+    #: As many blocks as there are points: fewer and the stretch scanned inside
+    #: a block grows, more and stepping over the empty blocks costs what
+    #: stepping over the empty columns used to.
+    var shift = 0
+    while width >> shift > count { shift += 1 }
+    let blocks_end = (width - 1 >> shift) + 1
+    span[0] = lowest
+    span[1] = shift
+    span[2] = width
+
+    #: Growing the buffers is `hull_reserve`'s job and not this function's, and
+    #: it is asked for by returning rather than by calling. Three more loops in
+    #: here cost guard-table room the tier does not have, and a body it
+    #: declines runs interpreted at 90 nanoseconds a point.
+    if cells.len() < width * 2 { return 0 - width - 2 }
+    if blocks.len() < blocks_end * 2 { return 0 - width - 2 }
+    if low_chain.len() < count * 2 + 2 { return 0 - width - 2 }
+
+    #: Index and y share a word so that a point costs one read and one write a
+    #: side; the block is widened only when the column was empty, because a
+    #: column that already holds a point is already inside its block's span.
     for index in 0..count {
-        let point = points[index]
-        let at = (point.x - lowest) * 2
-        let y = point.y
-        if y >= HULL_COORD_LIMIT { return 1 }
-        if y <= 0 - HULL_COORD_LIMIT { return 1 }
-        let scaled = y * HULL_STRIDE
+        held = points[index]
+        let column = held.x - lowest
+        let at = column * 2
+        let scaled = held.y * HULL_STRIDE
         let low = scaled + index
-        let held = cells[at]
-        if held == HULL_UNUSED {
+        let seen = cells[at]
+        if seen == HULL_UNUSED {
             cells[at] = low
             cells[at + 1] = index - scaled
+            let bat = (column >> shift) * 2
+            if column < blocks[bat] { blocks[bat] = column }
+            if column > blocks[bat + 1] { blocks[bat + 1] = column }
         } else {
-            if low < held { cells[at] = low }
+            if low < seen { cells[at] = low }
             let high = index - scaled
             if high < cells[at + 1] { cells[at + 1] = high }
         }
@@ -584,18 +695,15 @@ fn hull_bucket(points: list[Point], cells: list[int], lowest: int) -> int {
     return 0
 }
 
-fn hull_blank(cells: list[int], width: int) -> void {
-    for at in 0..width * 2 { cells[at] = HULL_UNUSED }
-}
-
-#: Both monotone chains, in one walk over the columns.
+#: Both monotone chains, in one walk over the occupied columns.
 #:
-#: Only the lowest and the highest point of a column can be a hull corner:
-#: anything between them lies inside the segment joining the two. So the walk
-#: visits columns rather than points, and it visits them once rather than twice
-#: because the chain above can be built left to right, against the opposite
-#: turn, and read back to front at the end -- which is the same sequence the
-#: right-to-left walk would have produced.
+#: The outer loop is over blocks and the inner one over the stretch of each
+#: block a point landed in, so a span with long empty runs in it costs about
+#: what its points cost rather than what its width costs.
+#:
+#: A second function and not the tail of the one above because the two
+#: together need more guards than the tier will record for one body, and a
+#: declined body runs interpreted.
 #:
 #: Each chain is given only the points that could belong to it. The lowest
 #: point of the leftmost column and the lowest of the rightmost are both
@@ -612,13 +720,18 @@ fn hull_blank(cells: list[int], width: int) -> void {
 #: The three counts come back in one integer -- the two chain depths and the
 #: number of extreme points -- because a Jaithon function returns one value and
 #: a list to hold three would cost an allocation a call.
+@trace
 fn hull_walk(
     cells: list[int],
+    blocks: list[int],
     low_chain: list[int],
     high_chain: list[int],
-    width: int,
-    lowest: int
+    span: list[int]
 ) -> int {
+    let lowest = span[0]
+    let shift = span[1]
+    let width = span[2]
+    let blocks_end = (width - 1 >> shift) + 1
     let far = (width - 1) * 2
     let low_left = cells[0] >> HULL_SHIFT
     let low_right = cells[far] >> HULL_SHIFT
@@ -639,61 +752,68 @@ fn hull_walk(
     var high_ay = 0
     var high_ox = 0
     var high_oy = 0
-    var at = -2
-    var x = lowest - 1
 
-    for column in 0..width {
-        at += 2
-        x += 1
-        let packed_low = cells[at]
-        if packed_low == HULL_UNUSED { continue }
-        let packed_high = cells[at + 1]
-        cells[at] = HULL_UNUSED
-        let low_y = packed_low >> HULL_SHIFT
-        let high_y = 0 - (packed_high >> HULL_SHIFT)
-        corners += 1
-        if low_y != high_y { corners += 1 }
+    for block in 0..blocks_end {
+        let bat = block * 2
+        let first = blocks[bat]
+        if first == HULL_UNUSED { continue }
+        let last = blocks[bat + 1]
+        blocks[bat] = HULL_UNUSED
+        blocks[bat + 1] = -1
 
-        if reach * (low_y - low_left) - low_rise * column <= 0 {
-            while low_slot >= 4 {
-                let turn = (low_ax - low_ox) * (low_y - low_oy)
-                if turn - (low_ay - low_oy) * (x - low_ox) > 0 { break }
-                low_slot -= 2
-                low_ax = low_ox
-                low_ay = low_oy
-                if low_slot >= 4 {
-                    low_ox = low_chain[low_slot - 4]
-                    low_oy = low_chain[low_slot - 3] >> HULL_SHIFT
+        for column in first..last + 1 {
+            let at = column * 2
+            let packed_low = cells[at]
+            if packed_low == HULL_UNUSED { continue }
+            let packed_high = cells[at + 1]
+            cells[at] = HULL_UNUSED
+            let x = lowest + column
+            let low_y = packed_low >> HULL_SHIFT
+            let high_y = 0 - (packed_high >> HULL_SHIFT)
+            corners += 1
+            if low_y != high_y { corners += 1 }
+
+            if reach * (low_y - low_left) - low_rise * column <= 0 {
+                while low_slot >= 4 {
+                    let turn = (low_ax - low_ox) * (low_y - low_oy)
+                    if turn - (low_ay - low_oy) * (x - low_ox) > 0 { break }
+                    low_slot -= 2
+                    low_ax = low_ox
+                    low_ay = low_oy
+                    if low_slot >= 4 {
+                        low_ox = low_chain[low_slot - 4]
+                        low_oy = low_chain[low_slot - 3] >> HULL_SHIFT
+                    }
                 }
+                low_chain[low_slot] = x
+                low_chain[low_slot + 1] = packed_low
+                low_slot += 2
+                low_ox = low_ax
+                low_oy = low_ay
+                low_ax = x
+                low_ay = low_y
             }
-            low_chain[low_slot] = x
-            low_chain[low_slot + 1] = packed_low
-            low_slot += 2
-            low_ox = low_ax
-            low_oy = low_ay
-            low_ax = x
-            low_ay = low_y
-        }
 
-        if reach * (high_y - high_left) - high_rise * column >= 0 {
-            while high_slot >= 4 {
-                let turn = (high_ax - high_ox) * (high_y - high_oy)
-                if turn - (high_ay - high_oy) * (x - high_ox) < 0 { break }
-                high_slot -= 2
-                high_ax = high_ox
-                high_ay = high_oy
-                if high_slot >= 4 {
-                    high_ox = high_chain[high_slot - 4]
-                    high_oy = 0 - (high_chain[high_slot - 3] >> HULL_SHIFT)
+            if reach * (high_y - high_left) - high_rise * column >= 0 {
+                while high_slot >= 4 {
+                    let turn = (high_ax - high_ox) * (high_y - high_oy)
+                    if turn - (high_ay - high_oy) * (x - high_ox) < 0 { break }
+                    high_slot -= 2
+                    high_ax = high_ox
+                    high_ay = high_oy
+                    if high_slot >= 4 {
+                        high_ox = high_chain[high_slot - 4]
+                        high_oy = 0 - (high_chain[high_slot - 3] >> HULL_SHIFT)
+                    }
                 }
+                high_chain[high_slot] = x
+                high_chain[high_slot + 1] = packed_high
+                high_slot += 2
+                high_ox = high_ax
+                high_oy = high_ay
+                high_ax = x
+                high_ay = high_y
             }
-            high_chain[high_slot] = x
-            high_chain[high_slot + 1] = packed_high
-            high_slot += 2
-            high_ox = high_ax
-            high_oy = high_ay
-            high_ax = x
-            high_ay = high_y
         }
     }
     let low_depth = low_slot // 2
@@ -701,23 +821,63 @@ fn hull_walk(
     return (low_depth * HULL_STRIDE + high_depth) * HULL_STRIDE + corners
 }
 
-#: `count` of a chain's points into `ring`, starting at `into`.
-fn hull_place(
+#: The ring, from the two chains.
+#:
+#: Its own function, and the reversal below is another, because the tier is
+#: particular about which slot holds what. A list comprehension's loop counter
+#: is an integer in the slot the list itself is bound to next, and a slot the
+#: tier has seen two kinds in is a slot it will not compile an index against --
+#: so the ring is pushed rather than comprehended, and `convex_hull` is held to
+#: the same rule and left holding nothing but integers.
+@trace
+fn hull_ring_of(
     points: list[Point],
-    chain: list[int],
-    first: int,
-    step: int,
-    count: int,
-    ring: list[Point],
-    into: int
-) -> void {
-    var at = first
-    var slot = into
-    for _index in 0..count {
-        ring[slot] = points[chain[at] & HULL_MASK]
-        at += step
-        slot += 1
+    low_chain: list[int],
+    high_chain: list[int],
+    packed: int
+) -> list[Point] {
+    var ring: list[Point] = []
+    let high_depth = packed >> HULL_SHIFT & HULL_MASK
+    let low_depth = packed >> HULL_SHIFT >> HULL_SHIFT
+
+    #: The chain above runs from the rightmost column to the leftmost once it
+    #: is read backwards, and the chain below from the leftmost to the
+    #: rightmost, so the two meet at both ends. Where a column's lowest and
+    #: highest point are the same point the two chains share it, and one of the
+    #: pair drops it -- which is what sorting's "drop each chain's last point"
+    #: amounted to.
+    #:
+    #: Unpacked here rather than by the caller because the caller is entered
+    #: once a hull, which is the slowest way there is to reach the tier's
+    #: threshold: every integer settled in here is one the interpreter does not
+    #: have to settle on all the calls before that. It does not go in
+    #: `hull_walk` either -- that body is already as long as the emitter's
+    #: buffer.
+    let low_end = (low_depth - 1) * 2 + 1
+    let high_end = (high_depth - 1) * 2 + 1
+    var above = high_depth
+    if low_chain[1] >> HULL_SHIFT == 0 - (high_chain[1] >> HULL_SHIFT) { above -= 1 }
+    var under = low_depth
+    let low_tail = low_chain[low_end] >> HULL_SHIFT
+    if low_tail == 0 - (high_chain[high_end] >> HULL_SHIFT) { under -= 1 }
+
+    var at = high_end
+    for _index in 0..above {
+        ring.push(points[high_chain[at] & HULL_MASK])
+        at -= 2
     }
+    at = 1
+    for _index in 0..under {
+        ring.push(points[low_chain[at] & HULL_MASK])
+        at += 2
+    }
+    return ring
+}
+
+fn hull_reverse(ring: list[Point]) -> list[Point] {
+    var flipped = [ring[0]]
+    for index in 0..ring.len() - 1 { flipped.push(ring[ring.len() - 1 - index]) }
+    return flipped
 }
 
 #: The convex hull of a set of points.
@@ -736,67 +896,35 @@ fn hull_place(
 #: by one over the columns leaves the chains the same sequence -- same order,
 #: same duplicates dropped -- that sorting left them.
 #:
-#: Columns only pay while there are not far more of them than there are points.
-#: A dozen points strung across a frame would blank more buckets than the sort
-#: would have cost, and a y large enough to break the packing cannot be
-#: bucketed at all, so both go back to `hull_by_sorting`. So does a set that
-#: comes back with fewer than three extreme points, which is the one case where
-#: the two disagree: sorting returns its points untouched when it has fewer
-#: than three, and that ordering is not the one the chains would give.
+#: Columns are refused for a span too wide to hold or too wide to be worth
+#: holding, for a coordinate large enough to break the packing, and for more
+#: points than an index can name; all of them go back to `hull_by_sorting`. So
+#: does a set that comes back with fewer than three extreme points, which is
+#: the one case where the two disagree: sorting returns its points untouched
+#: when it has fewer than three, and that ordering is not the one the chains
+#: would give.
 pub fn convex_hull(points: list[Point], clockwise: bool = false) -> list[Point] {
     let count = points.len()
     if count < 3 { return degenerate_hull(points, clockwise) }
-    if _hull_span.len() < 1 { _hull_span = hull_grow(_hull_span, 1, 0) }
-    let width = hull_extent(points, _hull_span)
-    let lowest = _hull_span[0]
-    var refuse = 0
-    if width < 2 { refuse = 1 }
-    if width > 4 * count + 1024 { refuse = 1 }
-    if count >= HULL_POINT_LIMIT { refuse = 1 }
-    if refuse == 1 { return hull_by_sorting(points, clockwise) }
-
-    let room = count * 2 + 2
-    if _hull_cells.len() < width * 2 {
-        _hull_cells = hull_grow(_hull_cells, width * 2, HULL_UNUSED)
+    var ready = hull_columns(points, _hull_cells, _hull_blocks, _hull_low_chain, _hull_span)
+    if ready < -1 {
+        hull_reserve(
+            _hull_cells,
+            _hull_blocks,
+            _hull_low_chain,
+            _hull_high_chain,
+            0 - ready - 2,
+            count
+        )
+        ready = hull_columns(points, _hull_cells, _hull_blocks, _hull_low_chain, _hull_span)
     }
-    if _hull_low_chain.len() < room { _hull_low_chain = hull_grow(_hull_low_chain, room, 0) }
-    if _hull_high_chain.len() < room { _hull_high_chain = hull_grow(_hull_high_chain, room, 0) }
-    let cells = _hull_cells
-    let low_chain = _hull_low_chain
-    let high_chain = _hull_high_chain
-
-    if hull_bucket(points, cells, lowest) != 0 {
-        hull_blank(cells, width)
-        return hull_by_sorting(points, clockwise)
+    if ready != 0 { return hull_by_sorting(points, clockwise) }
+    let packed = hull_walk(_hull_cells, _hull_blocks, _hull_low_chain, _hull_high_chain, _hull_span)
+    if packed & HULL_MASK < 3 { return hull_by_sorting(points, clockwise) }
+    if clockwise {
+        return hull_reverse(hull_ring_of(points, _hull_low_chain, _hull_high_chain, packed))
     }
-    let packed = hull_walk(cells, low_chain, high_chain, width, lowest)
-    let corners = packed & HULL_MASK
-    if corners < 3 { return hull_by_sorting(points, clockwise) }
-    let high_depth = packed >> HULL_SHIFT & HULL_MASK
-    let low_depth = packed >> HULL_SHIFT >> HULL_SHIFT
-
-    #: The chain above runs from the rightmost column to the leftmost once it
-    #: is read backwards, and the chain below from the leftmost to the
-    #: rightmost, so the two meet at both ends. Where a column's lowest and
-    #: highest point are the same point the two chains share it, and one of the
-    #: pair drops it -- which is what sorting's "drop each chain's last point"
-    #: amounted to.
-    let low_end = (low_depth - 1) * 2 + 1
-    let high_end = (high_depth - 1) * 2 + 1
-    var above = high_depth
-    if low_chain[1] >> HULL_SHIFT == 0 - (high_chain[1] >> HULL_SHIFT) { above -= 1 }
-    var under = low_depth
-    if low_chain[low_end] >> HULL_SHIFT == 0 - (high_chain[high_end] >> HULL_SHIFT) {
-        under -= 1
-    }
-
-    var ring = [points[0] for _index in 0..above + under]
-    hull_place(points, high_chain, high_end, -2, above, ring, 0)
-    hull_place(points, low_chain, 1, 2, under, ring, above)
-    if not clockwise { return ring }
-    var flipped = [ring[0]]
-    for index in 0..ring.len() - 1 { flipped.push(ring[ring.len() - 1 - index]) }
-    return flipped
+    return hull_ring_of(points, _hull_low_chain, _hull_high_chain, packed)
 }
 
 #: The indices, into `points`, of the hull points.
@@ -1076,165 +1204,60 @@ pub fn approx_poly_dp(curve: list[Point], epsilon: float, closed: bool) -> list[
     return out
 }
 
-fn hull_f(points: list[Point]) -> list[Point2f] {
-    var out: list[Point2f] = []
-    for point in convex_hull(points) { out.push(Point2f(float(point.x), float(point.y))) }
-    return out
-}
+#: pi and the arc tangent, read once at import rather than through the module
+#: on every call.
+#:
+#: `math.PI` is a property read on a module object and not a constant the
+#: compiler folds, and `math.atan2(...)` is that read followed by the call.
+#: Measured on this machine: 0.35 microseconds for the property, 0.48 for the
+#: qualified call against 0.15 for the same function imported by name. The four
+#: qualified spellings `min_area_rect` used to hold -- `atan2`, `cos`, `sin`
+#: and `PI` -- came to 1.7 microseconds of the 7.3 it took. `BOX_PI` is the
+#: same double `math.PI` is, so nothing it divides moves by a bit.
+let BOX_PI = math.PI
 
-#: The x of the leftmost point and of the rightmost, into `out`.
-fn span_x(points: list[Point], out: list[int]) -> void {
-    let count = points.len()
-    var lowest = points[0].x
-    var highest = lowest
+#: The hull as floats and the winning edge's box, kept between calls.
+#:
+#: Not held to save the copying but to save the allocation: three lists a call
+#: is three allocations for a hull of five corners, and the operation's whole
+#: budget is a couple of microseconds. They only ever grow. Nothing outside a
+#: single `min_area_rect` call ever sees them and the call makes no call that
+#: could re-enter it, which is the same bargain `convex_hull` strikes with its
+#: buckets a few hundred lines up.
+var _box_hx: list[float] = []
+var _box_hy: list[float] = []
+var _box_found: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+#: The convex hull of a contour as two lists of floats, which is the shape the
+#: calipers below walk.
+#:
+#: The two lists arrive as parameters and outlive the call; this fills the
+#: first `count` of each and leaves whatever a longer hull left behind, which
+#: is why the count is returned rather than read off a length.
+#:
+#: `convex_hull` and nothing of its own. This used to bucket the points by
+#: column here, in seven functions that were a second copy of the ones behind
+#: `convex_hull`, and the copy went stale: it refused a span of more than four
+#: columns a point, so the 74-point contour around a 1080p frame -- which
+#: touches every column of it -- went to the sorting path instead. That is
+#: where all but a microsecond of this operation used to go. The buckets behind
+#: `convex_hull` are kept between calls and indexed by block, and they take
+#: that contour by column, so there is one hull left and one bench row that
+#: says whether it is still fast.
+@trace
+fn hull_floats(points: list[Point], hx: list[float], hy: list[float]) -> int {
+    let ring = convex_hull(points)
+    let count = ring.len()
+    while hx.len() < count {
+        hx.push(0.0)
+        hy.push(0.0)
+    }
     for index in 0..count {
-        let x = points[index].x
-        if x < lowest { lowest = x }
-        if x > highest { highest = x }
+        let corner = ring[index]
+        hx[index] = float(corner.x)
+        hy[index] = float(corner.y)
     }
-    out[0] = lowest
-    out[1] = highest
-}
-
-#: A column with nothing in it yet, which is one whose top sits below its
-#: bottom -- no column holding a point can, so the sentinel needs no
-#: magnitude and nothing has to be compared against a fake coordinate.
-fn blank_columns(width: int, lo: list[int], hi: list[int]) -> void {
-    for _column in 0..width {
-        lo.push(1)
-        hi.push(0)
-    }
-}
-
-#: Room for a chain of at most `width` corners.
-#:
-#: Filled ahead of use rather than pushed onto as the chain grows, because the
-#: tier reads the kind of a list's elements off the list itself and declines a
-#: body that indexes one which was empty when it looked.
-fn blank_stack(width: int, stack: list[int]) -> void {
-    for _column in 0..width { stack.push(0) }
-}
-
-#: The topmost and bottommost point of every column.
-fn bucket_columns(points: list[Point], lowest: int, lo: list[int], hi: list[int]) -> void {
-    let count = points.len()
-    for index in 0..count {
-        let point = points[index]
-        let column = point.x - lowest
-        let y = point.y
-        if hi[column] < lo[column] {
-            lo[column] = y
-            hi[column] = y
-        } else {
-            if y < lo[column] { lo[column] = y }
-            if y > hi[column] { hi[column] = y }
-        }
-    }
-}
-
-#: One of the two monotone chains, over one point a column.
-#:
-#: `ys` picks the side: `hi` walking the columns from the right builds the
-#: chain above, `lo` walking from the left the chain below. The turn test is
-#: `cross_sign`'s, written out and compared against zero the same way, so
-#: collinear corners fall out of this exactly as they fall out of
-#: `convex_hull`. `depth` stands in for popping the stack: the tier has a fast
-#: path for a list push and none for a pop.
-fn hull_chain(
-    lo: list[int],
-    hi: list[int],
-    ys: list[int],
-    first: int,
-    step: int,
-    width: int,
-    stack: list[int]
-) -> int {
-    var depth = 0
-    for taken in 0..width {
-        let column = first + step * taken
-        if hi[column] < lo[column] { continue }
-        let by = ys[column]
-        while depth >= 2 {
-            let last = stack[depth - 1]
-            let before = stack[depth - 2]
-            let oy = ys[before]
-            let turn = (last - before) * (by - oy) - (ys[last] - oy) * (column - before)
-            if turn > 0 { break }
-            depth -= 1
-        }
-        stack[depth] = column
-        depth += 1
-    }
-    return depth
-}
-
-fn emit_chain(
-    ys: list[int],
-    lowest: int,
-    stack: list[int],
-    keep: int,
-    hx: list[float],
-    hy: list[float]
-) -> void {
-    for index in 0..keep {
-        let column = stack[index]
-        hx.push(float(column + lowest))
-        hy.push(float(ys[column]))
-    }
-}
-
-#: The ring `convex_hull` returns, found by columns instead of by sorting.
-#:
-#: The sort was most of what `min_area_rect` cost: `sorted_unique` calls a
-#: comparator closure per comparison, so a contour of a hundred points paid
-#: seven hundred closure calls before the chain scan began. Contour points are
-#: integer pixels, and only the topmost and bottommost point of a column can be
-#: a hull corner -- anything between the two lies inside the segment joining
-#: them. Bucketing by column and then walking the columns in order gives the
-#: chains the same sequence, in the same order and with the same duplicates
-#: dropped, that sorting would have given them, at one pass over the points and
-#: two over the columns.
-#:
-#: The columns only pay while there are not far more of them than there are
-#: points; a dozen points strung across a frame would clear more buckets than
-#: it saves, so that shape is left to `convex_hull` and an empty ring says so.
-#: So is a ring that comes back degenerate, which is the one case where the two
-#: disagree: `convex_hull` returns the sorted points untouched when it was
-#: given fewer than three of them, and matching that here is not worth a pass
-#: to count them.
-fn hull_ring(points: list[Point], hx: list[float], hy: list[float]) -> void {
-    let count = points.len()
-    if count < 3 { return }
-    var span = [0, 0]
-    span_x(points, span)
-    let lowest = span[0]
-    let width = span[1] - lowest + 1
-    if width > 4 * count + 64 { return }
-
-    var lo: list[int] = []
-    var hi: list[int] = []
-    blank_columns(width, lo, hi)
-    bucket_columns(points, lowest, lo, hi)
-    var stack: list[int] = []
-    blank_stack(width, stack)
-
-    #: `convex_hull` runs its upper chain from the rightmost-topmost point to
-    #: the leftmost-bottommost and its lower chain back again, and drops each
-    #: one's last point where the two are joined. The upper chain's last point
-    #: is the bottom of the leftmost column, which it reaches from the top of
-    #: that column by a vertical step -- so when the column has height it is
-    #: that step which goes, and the chain here keeps everything it found;
-    #: when it has none the two points are one and the chain gives up its own
-    #: last. The lower chain ends the same way against the rightmost column.
-    let above = hull_chain(lo, hi, hi, width - 1, -1, width, stack)
-    var keep = above
-    if hi[0] == lo[0] { keep -= 1 }
-    emit_chain(hi, lowest, stack, keep, hx, hy)
-
-    let below = hull_chain(lo, hi, lo, 0, 1, width, stack)
-    keep = below
-    if hi[width - 1] == lo[width - 1] { keep -= 1 }
-    emit_chain(lo, lowest, stack, keep, hx, hy)
+    return count
 }
 
 #: The hull edge whose box is smallest, and that box's reach.
@@ -1244,29 +1267,50 @@ fn hull_ring(points: list[Point], hx: list[float], hy: list[float]) -> void {
 #: whole of it, and with them here the walk over the hull ran interpreted and
 #: cost more than the hull itself did.
 #:
+#: Being call-free was not enough, and for a long time this was declined
+#: anyway: three spellings in it were each on their own a reason to refuse the
+#: body, so the walk stayed interpreted and cost 5.2 microseconds of the 7.6 a
+#: five-corner hull took, against 0.2 once the tier took it. `JAI_JIT_WHY=1`
+#: names the opcode each time. The three were these.
+#:
+#: The projection loop held ten live floats -- two coordinates, two components
+#: of the direction, the two projections and the four reaches -- and the tier
+#: has eight FP registers. Two of them spilled, and an operand that has spilled
+#: is a refusal under a guarded compare rather than a reload. Reading the two
+#: coordinates out of the lists where they are used drops the loop to eight and
+#: it compiles. `hy[at] * ux - hx[at] * uy` is `-cx * uy + cy * ux` to the bit:
+#: a subtraction IS the addition of a negation in IEEE, and addition commutes.
+#:
+#: `if dx <= 0.0 and dy > 0.0` was refused for a float borrow reaching the
+#: second comparison's guard, so the quadrant fold is nested ifs; and `if not
+#: take and area < best_area + 1e-9` for the same reason, so the flag is an
+#: integer and the two tests are an if and an elif.
+#:
 #: `out` comes back as the four reaches and then the direction of the winning
 #: edge -- the direction and not its angle, because the caller wants `atan2` of
-#: it once rather than once an edge.
+#: it once rather than once an edge. The winner goes there rather than into six
+#: more locals for the same reason the projection loop lost its two: a local
+#: here is a scarce thing.
+#:
+#: A square has two minimal boxes and a nearly square one has two that tie
+#: numerically, so the tie is broken on the angle: the edge lying closest to
+#: the horizontal wins, which is the one OpenCV reports. That is held as a
+#: direction folded into the first quadrant rather than as an angle. The angle
+#: was only ever wanted for the comparison, and it was taken modulo a quarter
+#: turn before being compared -- which is what the folding does. What is left
+#: is a comparison of two slopes, `fb / fa` against the best so far, and
+#: cross-multiplying it gives whole numbers small enough to be exact. A slope
+#: of minus one stands for no edge yet.
 fn best_box(hx: list[float], hy: list[float], count: int, out: list[float]) -> void {
     var best_area = 1e300
-    #: A square has two minimal boxes and a nearly square one has two that tie
-    #: numerically, so the tie is broken on the angle: the edge lying closest
-    #: to the horizontal wins, which is the one OpenCV reports.
-    #:
-    #: Held as a direction folded into the first quadrant rather than as an
-    #: angle. The angle was only ever wanted for that comparison, and it was
-    #: taken modulo a quarter turn before being compared -- which is what the
-    #: folding does. What is left is a comparison of two slopes, `fb / fa`
-    #: against the best so far, and cross-multiplying it gives whole numbers
-    #: small enough to be exact. A slope of minus one stands for no edge yet.
     var best_fa = 1.0
     var best_fb = -1.0
-    var best_dx = 0.0
-    var best_dy = 0.0
-    var best_min_u = 0.0
-    var best_max_u = 0.0
-    var best_min_v = 0.0
-    var best_max_v = 0.0
+    out[0] = 0.0
+    out[1] = 0.0
+    out[2] = 0.0
+    out[3] = 0.0
+    out[4] = 0.0
+    out[5] = 0.0
 
     for index in 0..count {
         var after = index + 1
@@ -1286,12 +1330,10 @@ fn best_box(hx: list[float], hy: list[float], count: int, out: list[float]) -> v
         var min_v = 1e300
         var max_v = -1e300
         for at in 0..count {
-            let cx = hx[at]
-            let cy = hy[at]
-            let u = cx * ux + cy * uy
-            let v = -cx * uy + cy * ux
+            let u = hx[at] * ux + hy[at] * uy
             if u < min_u { min_u = u }
             if u > max_u { max_u = u }
+            let v = hy[at] * ux - hx[at] * uy
             if v < min_v { min_v = v }
             if v > max_v { max_v = v }
         }
@@ -1299,36 +1341,38 @@ fn best_box(hx: list[float], hy: list[float], count: int, out: list[float]) -> v
 
         var fa = dx
         var fb = dy
-        if dx <= 0.0 and dy > 0.0 {
-            fa = dy
-            fb = -dx
-        } elif dx < 0.0 and dy <= 0.0 {
-            fa = -dx
-            fb = -dy
-        } elif dx >= 0.0 and dy < 0.0 {
-            fa = -dy
-            fb = dx
+        if dx <= 0.0 {
+            if dy > 0.0 {
+                fa = dy
+                fb = -dx
+            } else {
+                fa = -dx
+                fb = -dy
+            }
+        } else {
+            if dy < 0.0 {
+                fa = -dy
+                fb = dx
+            }
         }
-        var take = area < best_area - 1e-9
-        if not take and area < best_area + 1e-9 { take = fb * best_fa > best_fb * fa }
-        if take {
+        var take = 0
+        if area < best_area - 1e-9 {
+            take = 1
+        } elif area < best_area + 1e-9 {
+            if fb * best_fa > best_fb * fa { take = 1 }
+        }
+        if take == 1 {
             if area < best_area { best_area = area }
             best_fa = fa
             best_fb = fb
-            best_dx = dx
-            best_dy = dy
-            best_min_u = min_u
-            best_max_u = max_u
-            best_min_v = min_v
-            best_max_v = max_v
+            out[0] = min_u
+            out[1] = max_u
+            out[2] = min_v
+            out[3] = max_v
+            out[4] = dx
+            out[5] = dy
         }
     }
-    out[0] = best_min_u
-    out[1] = best_max_u
-    out[2] = best_min_v
-    out[3] = best_max_v
-    out[4] = best_dx
-    out[5] = best_dy
 }
 
 #: The smallest rotated rectangle containing every point.
@@ -1338,19 +1382,7 @@ fn best_box(hx: list[float], hy: list[float], count: int, out: list[float]) -> v
 pub fn min_area_rect(points: list[Point]) -> RotatedRect {
     var hx: list[float] = []
     var hy: list[float] = []
-    hull_ring(points, hx, hy)
-    #: Two corners or fewer means either that the columns declined the shape or
-    #: that the hull is a segment, and `convex_hull` has its own answer for
-    #: both of those.
-    if hx.len() < 3 {
-        hx = []
-        hy = []
-        for corner in hull_f(points) {
-            hx.push(corner.x)
-            hy.push(corner.y)
-        }
-    }
-    let count = hx.len()
+    let count = hull_floats(points, hx, hy)
     if count == 0 { return RotatedRect(Point2f(0.0, 0.0), Size2f(0.0, 0.0), 0.0) }
     if count == 1 { return RotatedRect(Point2f(hx[0], hy[0]), Size2f(0.0, 0.0), 0.0) }
 

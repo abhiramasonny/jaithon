@@ -35,13 +35,12 @@
 #: than through `manipulate`: a reduction needs the two halves as separate
 #: extent lists for the kernel to walk, which is not what a transpose returns,
 #: and taking the dependency would buy nothing.
-import std.gpu as gpu
+import std.math
 from std.gpu import Buffer
-from .array import BOOL, COMPLEX64, FLOAT32, FLOAT64, INT32, INT64
-from .array import GROUP, NDArray, PRELUDE, binary_arith, diagonal_view
-from .array import dtype_is_integer, dtype_lanes, element_count, f32_bits, fill
-from .array import is_contiguous, kernel_of, layout_buffer, normalize_axes
-from .array import normalize_axis, promote, require_real
+from .array import BOOL, FLOAT32, INT64, GROUP, NDArray, PRELUDE, OP_DIV, OP_SUB
+from .array import binary_arith, broadcast_shapes, diagonal_view, dtype_is_integer
+from .array import element_count, f32_bits, fill, is_contiguous, kernel_of
+from .array import layout_buffer, normalize_axes, normalize_axis, require_real
 
 #: Fold selector: running total. Also the finish of every counting fold.
 const OP_SUM = 0
@@ -84,6 +83,14 @@ constexpr constant uint NR_CENTERED = 8u;
 inline float nr_inf() { return as_type<float>(0x7f800000u); }
 inline float nr_nan() { return as_type<float>(0x7fc00000u); }
 
+/* Every NaN test below is `isnan` and never `x != x`.
+ *
+ * The runtime compiles these with the default `MTLCompileOptions`, which
+ * leaves fast math on, and fast math folds `x != x` to false: written that way
+ * `nansum` totalled NaN, plain `min` answered +inf for an all-NaN slice, and
+ * `nanargmax` picked slot 0 out of one. `isnan` and the bit test both survive;
+ * `isnan` is what `sorting.jai` already reaches for, so this matches it. */
+
 /* What a fold starts from, and therefore what an element the nan flag drops
  * turns into.
  *
@@ -105,21 +112,21 @@ inline float nr_identity(uint op, uint skip_nan) {
 inline float nr_combine(float a, float b, uint op, uint skip_nan) {
     if (op == NR_PROD) return a * b;
     if (op == NR_MIN || op == NR_ALL) {
-        if (skip_nan != 0u) return (a != a) ? b : ((b != b) ? a : min(a, b));
-        return (a != a) ? a : ((b != b) ? b : min(a, b));
+        if (skip_nan != 0u) return isnan(a) ? b : (isnan(b) ? a : min(a, b));
+        return isnan(a) ? a : (isnan(b) ? b : min(a, b));
     }
     if (op == NR_MAX || op == NR_ANY) {
-        if (skip_nan != 0u) return (a != a) ? b : ((b != b) ? a : max(a, b));
-        return (a != a) ? a : ((b != b) ? b : max(a, b));
+        if (skip_nan != 0u) return isnan(a) ? b : (isnan(b) ? a : max(a, b));
+        return isnan(a) ? a : (isnan(b) ? b : max(a, b));
     }
     return a + b;
 }
 
 /* One element turned into the accumulator the fold carries. */
 inline float nr_ingest(float value, float center, uint op, uint skip_nan) {
-    if (skip_nan != 0u && value != value) return nr_identity(op, skip_nan);
+    if (skip_nan != 0u && isnan(value)) return nr_identity(op, skip_nan);
     if (op == NR_ANY || op == NR_ALL || op == NR_NONZERO) return value != 0.0f ? 1.0f : 0.0f;
-    if (op == NR_FINITE) return value == value ? 1.0f : 0.0f;
+    if (op == NR_FINITE) return isnan(value) ? 0.0f : 1.0f;
     if (op == NR_CENTERED) { float d = value - center; return d * d; }
     return value;
 }
@@ -127,24 +134,29 @@ inline float nr_ingest(float value, float center, uint op, uint skip_nan) {
 inline float4 nr_combine4(float4 a, float4 b, uint op, uint skip_nan) {
     if (op == NR_PROD) return a * b;
     if (op == NR_MIN || op == NR_ALL) {
-        if (skip_nan != 0u) return select(select(min(a, b), a, b != b), b, a != a);
-        return select(select(min(a, b), b, b != b), a, a != a);
+        if (skip_nan != 0u) return select(select(min(a, b), a, isnan(b)), b, isnan(a));
+        return select(select(min(a, b), b, isnan(b)), a, isnan(a));
     }
     if (op == NR_MAX || op == NR_ANY) {
-        if (skip_nan != 0u) return select(select(max(a, b), a, b != b), b, a != a);
-        return select(select(max(a, b), b, b != b), a, a != a);
+        if (skip_nan != 0u) return select(select(max(a, b), a, isnan(b)), b, isnan(a));
+        return select(select(max(a, b), b, isnan(b)), a, isnan(a));
     }
     return a + b;
 }
 
 inline float4 nr_ingest4(float4 v, float center, uint op, uint skip_nan) {
-    float4 value = v;
-    if (skip_nan != 0u) value = select(value, float4(nr_identity(op, skip_nan)), value != value);
+    float4 out;
     if (op == NR_ANY || op == NR_ALL || op == NR_NONZERO)
-        return select(float4(0.0f), float4(1.0f), value != 0.0f);
-    if (op == NR_FINITE) return select(float4(0.0f), float4(1.0f), value == value);
-    if (op == NR_CENTERED) { float4 d = value - center; return d * d; }
-    return value;
+        out = select(float4(0.0f), float4(1.0f), v != 0.0f);
+    else if (op == NR_FINITE) out = select(float4(1.0f), float4(0.0f), isnan(v));
+    else if (op == NR_CENTERED) { float4 d = v - center; out = d * d; }
+    else out = v;
+    /* The identity replaces what the lane contributes, not what the transform
+     * above reads -- the order the scalar gets for free by returning early.
+     * Substituting first cost `nanvar` its answer: a dropped NaN became a zero
+     * that the centring then squared into `center * center`. */
+    if (skip_nan != 0u) out = select(out, float4(nr_identity(op, skip_nan)), isnan(v));
+    return out;
 }
 
 /* A linear index over `rank` axes turned into a float-slot displacement.
@@ -249,8 +261,10 @@ kernel void nr_fold(device float* dst [[buffer(0)]],
 
     scratch[lid] = mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint half = width >> 1u; half > 0u; half >>= 1u) {
-        if (slot < half) scratch[lid] = nr_combine(scratch[lid], scratch[lid + half], op, skip_nan);
+    /* `span` and not `half`, which names Metal's sixteen-bit float and cannot
+     * also name a variable. */
+    for (uint span = width >> 1u; span > 0u; span >>= 1u) {
+        if (slot < span) scratch[lid] = nr_combine(scratch[lid], scratch[lid + span], op, skip_nan);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (slot == 0u && seg < segments) dst[seg * chunks + chunk] = scratch[lid];
@@ -309,13 +323,16 @@ kernel void nr_arg(device float* index [[buffer(0)]],
                 ? off + int(k) * step
                 : off + nr_walk(meta, ext, ext + inner_rank, inner_rank, k);
             float v = src[at];
-            if (v != v) {
+            if (isnan(v)) {
                 if (skip_nan == 0u && k < nan_at) nan_at = k;
                 continue;
             }
             float key = smallest != 0u ? -v : v;
-            /* Strictly greater, so a tie leaves `best` at the earlier index. */
-            if (key > peak) { peak = key; best = k; }
+            /* Strictly greater, so a tie leaves `best` at the earlier index.
+             * The emptiness test beside it is not redundant: a slice that is
+             * every bit -inf never beats the starting key, and would come back
+             * as the -1 of an empty segment where numpy answers 0. */
+            if (best == 0xffffffffu || key > peak) { peak = key; best = k; }
         }
     }
 
@@ -323,9 +340,9 @@ kernel void nr_arg(device float* index [[buffer(0)]],
     spots[lid] = best;
     nans[lid] = nan_at;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint half = width >> 1u; half > 0u; half >>= 1u) {
-        if (slot < half) {
-            uint other = lid + half;
+    for (uint span = width >> 1u; span > 0u; span >>= 1u) {
+        if (slot < span) {
+            uint other = lid + span;
             bool take = keys[other] > keys[lid]
                 || (keys[other] == keys[lid] && spots[other] < spots[lid]);
             if (take) { keys[lid] = keys[other]; spots[lid] = spots[other]; }
@@ -368,7 +385,7 @@ kernel void nr_arg_finish(device float* dst [[buffer(0)]],
         uint at = seg * chunks + c;
         float v = value[at];
         int i = int(index[at]);
-        if (v != v) {
+        if (isnan(v)) {
             if (first_nan < 0 || i < first_nan) first_nan = i;
             continue;
         }
@@ -406,7 +423,7 @@ kernel void nr_close(device float* dst [[buffer(0)]],
     float x = a[nd_offset(meta, 1u, id)];
     float y = b[nd_offset(meta, 2u, id)];
     bool ok;
-    if (x != x || y != y) ok = equal_nan != 0u && x != x && y != y;
+    if (isnan(x) || isnan(y)) ok = equal_nan != 0u && isnan(x) && isnan(y);
     else if (exact != 0u || isinf(x) || isinf(y)) ok = x == y;
     else ok = fabs(x - y) <= as_type<float>(atol_bits) + as_type<float>(rtol_bits) * fabs(y);
     dst[nd_offset(meta, 0u, id)] = ok ? 1.0f : 0.0f;
@@ -785,13 +802,13 @@ fn _finish_op(op: int) -> int {
 }
 
 #: What a fold over nothing answers, so an empty axis needs no dispatch.
-fn _identity_of(op: int, skip_nan: bool) -> float {
+#:
+#: Only the folds that have one are here. A minimum over nothing does not, and
+#: `_reduce` refuses that call rather than reaching this — an identity of +inf
+#: would answer where numpy raises, and the nan-aware pair would have to build
+#: their NaN as `0.0 / 0.0`, which this VM raises on rather than returning.
+fn _identity_of(op: int) -> float {
     if op == OP_PROD or op == OP_ALL { return 1.0 }
-    if op == OP_MIN or op == OP_MAX {
-        if skip_nan { return 0.0 / 0.0 }
-        let huge = 1.0e308 * 10.0
-        return if op == OP_MIN { huge } else { -huge }
-    }
     return 0.0
 }
 
@@ -868,7 +885,7 @@ fn _reduce(
         if op == OP_MIN or op == OP_MAX {
             throw ValueError(f"{what} of a zero-size axis has no answer")
         }
-        fill(out, _identity_of(op, skip_nan != 0))
+        fill(out, _identity_of(op))
         return out
     }
     let work = _as_accumulator(a, dtype)
@@ -942,7 +959,7 @@ pub fn ptp(a: NDArray, axis: any = null, keepdims: bool = false) -> NDArray {
     let low = amin(a, axis, keepdims)
     defer { high.free() }
     defer { low.free() }
-    return binary_arith(high, low, 1)
+    return binary_arith(high, low, OP_SUB)
 }
 
 #: Arithmetic mean along `axis`, always in a float dtype.
@@ -952,7 +969,7 @@ pub fn mean(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int = -
     defer { total.free() }
     let n = _reduced_count(a.shape, _axes_of(axis, a.ndim()))
     #: An empty mean is 0/0, which numpy also answers with NaN.
-    return binary_arith(total, float(n), 3)
+    return binary_arith(total, float(n), OP_DIV)
 }
 
 #: Total along `axis` with the NaNs read as zero. An all-NaN slice therefore
@@ -994,7 +1011,7 @@ pub fn nanmean(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int 
     let tally = _nan_count(a, axis, keepdims)
     defer { total.free() }
     defer { tally.free() }
-    return binary_arith(total, tally, 3)
+    return binary_arith(total, tally, OP_DIV)
 }
 
 #: The shared body of `variance` and `nanvar`.
@@ -1028,7 +1045,7 @@ fn _variance(
     if out.size() == 0 { return out }
     let n = _reduced_count(a.shape, axes)
     if n == 0 {
-        fill(out, 0.0 / 0.0)
+        fill(out, math.NAN)
         return out
     }
     let work = _as_accumulator(a, dtype)
@@ -1037,13 +1054,13 @@ fn _variance(
 
     if skip_nan == 0 {
         let divisor = float(n - ddof)
-        return binary_arith(out, divisor, 3)
+        return binary_arith(out, divisor, OP_DIV)
     }
     let tally = _nan_count(a, axis, keepdims)
     defer { tally.free() }
-    let divisor = binary_arith(tally, float(ddof), 1)
+    let divisor = binary_arith(tally, float(ddof), OP_SUB)
     defer { divisor.free() }
-    return binary_arith(out, divisor, 3)
+    return binary_arith(out, divisor, OP_DIV)
 }
 
 #: Variance along `axis`, dividing by `n - ddof`.
@@ -1058,8 +1075,7 @@ pub fn variance(
     dtype: int = -1,
     ddof: int = 0
 ) -> NDArray {
-    let out = _variance(a, axis, keepdims, dtype, ddof, 0, "var")
-    return out
+    return _variance(a, axis, keepdims, dtype, ddof, 0, "var")
 }
 
 #: Variance of the non-NaN elements, dividing by their count less `ddof`.
@@ -1211,17 +1227,20 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
     #: `axis = null` scans the flattening, and numpy's answer is 1-d. The
     #: source has to be dense for that view to exist.
     var source = a
+    #: The array holding the allocation, which is not `source` once the
+    #: flattening replaces it with a view: a view's `free` leaves its parent
+    #: alone, so freeing one here would release nothing and lose the copy.
+    var backing = a
     var owned = false
     var at = 0
     if axis is null {
-        source = a.contiguous()
-        owned = not source == a
-        let flat = source.size()
-        source = source.view([flat], [source.lanes()], source.offset)
+        backing = a.contiguous()
+        owned = not backing == a
+        source = backing.view([backing.size()], [backing.lanes()], backing.offset)
     } else {
         at = normalize_axis(if axis is int { axis } else { _axes_of(axis, a.ndim())[0] }, a.ndim())
     }
-    defer { if owned { source.free() } }
+    defer { if owned { backing.free() } }
 
     let target = if dtype >= 0 { dtype } else { _sum_dtype(source.dtype, -1) }
     let want = if op == OP_SUM or op == OP_PROD { target } else { source.dtype }
@@ -1314,7 +1333,7 @@ fn _agreement(
 ) -> NDArray {
     require_real(a, "allclose")
     require_real(b, "allclose")
-    let out = NDArray(_broadcast_shape(a, b), BOOL)
+    let out = NDArray(broadcast_shapes(a.shape, b.shape), BOOL)
     let count = out.size()
     if count == 0 { return out }
     let left = a.broadcast_to(out.shape)
@@ -1326,20 +1345,6 @@ fn _agreement(
     } else {
         0
     }])
-    return out
-}
-
-fn _broadcast_shape(a: NDArray, b: NDArray) -> list[int] {
-    let rank = _larger(a.ndim(), b.ndim())
-    var out = [0 for _axis in 0..rank]
-    for axis in 0..rank {
-        let left = if axis < rank - a.ndim() { 1 } else { a.shape[axis - (rank - a.ndim())] }
-        let right = if axis < rank - b.ndim() { 1 } else { b.shape[axis - (rank - b.ndim())] }
-        if left != right and left != 1 and right != 1 {
-            throw ValueError(f"shapes {a.shape} and {b.shape} do not broadcast together")
-        }
-        out[axis] = _larger(left, right)
-    }
     return out
 }
 

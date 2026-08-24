@@ -20,6 +20,7 @@
 #: draw_contours(frame, contours, -1, Scalar(0.0, 255.0, 0.0), 2)
 #: ```
 import std.math
+from std.time import Instant
 from std.core import Printable
 from ..core.mat import Mat
 from ..core.types import LINE_8, LINE_AA, Point, Scalar
@@ -277,18 +278,9 @@ fn next_start(grid: list[int], rows: int, cols: int, state: list[int]) -> void {
 #: survives it. The ring is written by neither the fill nor the walk, so it
 #: stays as the allocation left it.
 #:
-#: The stride is kept beside the buffer because the length alone does not say
-#: where the ring is. A 1x10 picture and a 4x4 one both need 36 cells, and the
-#: cell a 1x10 picture writes at x=4 is a ring cell of the 4x4 layout: reusing
-#: on length alone handed the 4x4 picture a neighbour outside its own columns,
-#: and one such leak at the end of the buffer walked `follow` off the end and
-#: threw. Both have to match, and then the ring the allocation zeroed is still
-#: the ring.
-#:
 #: Nothing outside a single `find_contours` call ever sees this, and the call
 #: makes no call that could re-enter it.
 var _grid: list[int] = []
-var _grid_stride = 0
 
 fn fill_grid(grid: list[int], values: list[float], rows: int, cols: int) -> void {
     let stride = cols + 2
@@ -302,14 +294,14 @@ fn fill_grid(grid: list[int], values: list[float], rows: int, cols: int) -> void
 }
 
 fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
+    let tg = Instant.now()
     let stride = cols + 2
     let need = stride * (rows + 2)
-    if _grid.len() != need or _grid_stride != stride {
-        _grid = [0] * need
-        _grid_stride = stride
-    }
+    if _grid.len() != need { _grid = [0] * need }
     let grid = _grid
     fill_grid(grid, values, rows, cols)
+    print(f"    fill {tg.elapsed().to_millis()}")
+    let tsc = Instant.now()
 
     #: The eight steps as single additions in that numbering.
     var offsets: list[int] = []
@@ -361,6 +353,7 @@ fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
         if after != 1 { state[2] = if after < 0 { -after } else { after } }
         state[1] = x + 1
     }
+    print(f"    scan+follow {tsc.elapsed().to_millis()}")
     return found
 }
 
@@ -510,7 +503,13 @@ pub fn find_contours(
     }
     image.flush()
     let stride = image.cols + 2
-    let found = trace_all(image.values(), image.rows, image.cols)
+    let tv = Instant.now()
+    let vals = image.values()
+    print(f"  values {tv.elapsed().to_millis()}")
+    let tt = Instant.now()
+    let found = trace_all(vals, image.rows, image.cols)
+    print(f"  trace {tt.elapsed().to_millis()}")
+    let tc = Instant.now()
 
     var chosen: list[Border] = []
     if mode == RETR_EXTERNAL {
@@ -530,6 +529,8 @@ pub fn find_contours(
     #: The one place a cell becomes a point. A row is a division and a column
     #: is the remainder that division already worked out, so the offset the
     #: caller asked for rides along for nothing.
+    print(f"  choose {tc.elapsed().to_millis()}")
+    let tp = Instant.now()
     let shift_y = offset.y - 1
     let shift_x = offset.x - 1
     var contours: list[list[Point]] = []
@@ -547,10 +548,16 @@ pub fn find_contours(
         contours.push(points)
     }
 
+    print(f"  points {tp.elapsed().to_millis()}")
+    let th = Instant.now()
     if mode == RETR_EXTERNAL or mode == RETR_LIST {
-        return (contours, linked(contours.len()))
+        let lk = linked(contours.len())
+        print(f"  hier {th.elapsed().to_millis()}")
+        return (contours, lk)
     }
-    return (contours, relate(parents_of(chosen, mode)))
+    let rl = relate(parents_of(chosen, mode))
+    print(f"  hier {th.elapsed().to_millis()}")
+    return (contours, rl)
 }
 
 #: The disc a thick stroke caps a segment with, as one span a row.

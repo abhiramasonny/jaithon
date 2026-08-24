@@ -27,9 +27,10 @@
 #:
 #: Not here: `median` and `percentile`, which `stats` builds on `partition`;
 #: histograms; and `nonzero`, which `index` owns.
+import std.math
 from .array import BOOL, FLOAT32, INT32, GROUP, NDArray, PRELUDE
-from .array import contiguous_strides, copy_into, exclusive_scan, f32_from_bits
-from .array import fill, gather_flat, kernel_of, normalize_axis, promote
+from .array import contiguous_strides, copy_into, exclusive_scan, fill
+from .array import gather_flat, kernel_of, normalize_axis, promote
 from .array import require_real, scatter_flat
 
 #: Elements below which a sort runs on the host rather than on the device.
@@ -282,6 +283,22 @@ kernel void nds_unique_flags(device float* dst [[buffer(0)]],
     dst[id] = id == 0u || !nds_same(sorted[id], sorted[id - 1u]) ? 1.0f : 0.0f;
 }
 
+/* Which run each slot of the sorted array falls in.
+ *
+ * The exclusive scan counts the run starts strictly before a slot, which is
+ * that slot's run number only where the slot is itself a start; anywhere
+ * inside a run it is one too high, because the run's own start is behind it.
+ * Adding the flag back and stepping down turns the exclusive scan into the
+ * inclusive one the inverse wants, without scanning the mask a second time. */
+kernel void nds_run_of(device float* dst [[buffer(0)]],
+                       device const float* offsets [[buffer(1)]],
+                       device const float* flags [[buffer(2)]],
+                       constant uint& count [[buffer(3)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    dst[id] = offsets[id] + flags[id] - 1.0f;
+}
+
 /* How long each run is, from where the runs start. The last one reaches the
  * end of the sorted array, which is the only length not a difference. */
 kernel void nds_run_counts(device float* dst [[buffer(0)]],
@@ -322,9 +339,15 @@ fn _log2(value: int) -> int {
 #: slots the harvest reads. Descending turns the order over, so the last place
 #: belongs to -inf instead. Either way a pad ties only with a value equal to
 #: it, which is what lets a plain sort carry no indices.
+#:
+#: Both come from `std.math` and not from `f32_from_bits`, which is how the
+#: rest of the package spells a float by its bits: that function's exponent-255
+#: path builds its NaN as `0.0 / 0.0`, and the VM raises on the division rather
+#: than returning one. Nothing is lost by going round it -- `fill` puts the
+#: value back through `f32_bits`, which does have a NaN case.
 fn _pad_value(descending: bool) -> float {
-    if descending { return f32_from_bits(0xFF800000) }
-    return f32_from_bits(0x7FC00000)
+    if descending { return -math.INF }
+    return math.NAN
 }
 
 #: A view of `a` with `axis` moved to the end and the other axes in order,
@@ -711,10 +734,11 @@ pub class UniqueResult {
 #: The distinct values of `a`, ascending, over the flattened array.
 #:
 #: Sort, flag the first element of each run, and compact through the exclusive
-#: scan `array.jai` built the masked scatter around. The index and the inverse
-#: fall straight out of the stable order: the run's first element carries the
-#: smallest original position, and the scan value at each sorted slot already
-#: is that slot's run number.
+#: scan `array.jai` built the masked scatter around. The stable order is what
+#: makes the index free: the first element of a run carries the smallest
+#: original position, so the same masked scatter that packs the values packs
+#: the indices. The inverse costs one more pass, because the scan is only a run
+#: number at a run start -- see `nds_run_of`.
 pub fn unique(
     a: NDArray,
     return_index: bool = false,
@@ -756,7 +780,16 @@ pub fn unique(
         }
         if return_inverse {
             let back = NDArray(a.shape, INT32)
-            if n > 0 { scatter_flat(back, order, offsets) }
+            if n > 0 {
+                let runs = NDArray([n], INT32)
+                kernel_of(SOURCE, "nds_run_of").dispatch_async(
+                    [runs.storage, offsets.storage, flags.storage],
+                    n,
+                    [n]
+                )
+                scatter_flat(back, order, runs)
+                runs.free()
+            }
             inverse = back
         }
         order.free()
@@ -789,16 +822,22 @@ fn _concat_flat(a: NDArray, b: NDArray) -> NDArray {
     require_real(a, "a set operation")
     require_real(b, "a set operation")
     let out = NDArray([a.size() + b.size()], promote(a.dtype, b.dtype))
-    if a.size() > 0 { copy_into(out.view([a.size()], [1], 0), _reshaped(a)) }
-    if b.size() > 0 { copy_into(out.view([b.size()], [1], a.size()), _reshaped(b)) }
+    _copy_run(out, a, 0)
+    _copy_run(out, b, a.size())
     return out
 }
 
-#: `a` seen as 1-d, without a copy when it is already dense.
-fn _reshaped(a: NDArray) -> NDArray {
-    let (flat, owned) = _flat_1d(a)
-    if owned { return flat }
-    return flat
+#: One source array, flattened, into the run of `out` that starts at `at`.
+#:
+#: `copy_into` broadcasts rather than reshapes, so an n-d source has to be made
+#: 1-d before it can land in a 1-d window -- and the flattening allocates when
+#: the source is not already dense, which is why the free is here and not left
+#: to a caller that cannot see whether one happened.
+fn _copy_run(out: NDArray, source: NDArray, at: int) -> void {
+    if source.size() == 0 { return }
+    let (flat, owned) = _flat_1d(source)
+    defer { if owned { flat.free() } }
+    copy_into(out.view([flat.size()], [1], at), flat)
 }
 
 #: The elements of `a` where `keep` is set, packed into a 1-d array.

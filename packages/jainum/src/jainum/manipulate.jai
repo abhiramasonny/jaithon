@@ -31,7 +31,7 @@
 #: ```
 from std.gpu import Buffer
 
-from .array import FLOAT32, NDArray, PRELUDE, contiguous_strides, copy_into
+from .array import NDArray, PRELUDE, broadcast_shapes, contiguous_strides, copy_into
 from .array import diagonal_view, element_count, fill, kernel_of, normalize_axes
 from .array import normalize_axis, promote
 
@@ -489,22 +489,8 @@ pub fn broadcast_to(a: NDArray, shape: list[int]) -> NDArray {
 pub fn broadcast_arrays(arrays: list[NDArray]) -> list[NDArray] {
     if arrays.len() == 0 { return [] }
     var shape = [extent for extent in arrays[0].shape]
-    for part in arrays { shape = broadcast_shapes_of(shape, part.shape) }
+    for part in arrays { shape = broadcast_shapes(shape, part.shape) }
     return [part.broadcast_to(shape) for part in arrays]
-}
-
-fn broadcast_shapes_of(a: list[int], b: list[int]) -> list[int] {
-    let rank = max(a.len(), b.len())
-    var out = [0 for _axis in 0..rank]
-    for axis in 0..rank {
-        let left = if axis < rank - a.len() { 1 } else { a[axis - (rank - a.len())] }
-        let right = if axis < rank - b.len() { 1 } else { b[axis - (rank - b.len())] }
-        if left != right and left != 1 and right != 1 {
-            throw ValueError(f"shapes {a} and {b} do not broadcast together")
-        }
-        out[axis] = max(left, right)
-    }
-    return out
 }
 
 #: A view of the `offset`-th diagonal of the `axis1` x `axis2` plane.
