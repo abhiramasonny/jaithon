@@ -108,34 +108,69 @@ kernel void cc_seed(device const float* src [[buffer(0)]],
  * Writing to the root rather than to the neighbour is what makes this
  * converge -- two halves of a component that meet anywhere pull their whole
  * chains together, instead of the news travelling one pixel a round. */
+/* Held to `CC_TILE` and `CC_GROUP` on the host. */
+#define CC_TILE 16u
+#define CC_HALO 18u
+
+/* One round of pushing the smallest label in a neighbourhood down onto the
+ * root of the label it found it from.
+ *
+ * The labels a thread needs are the labels its neighbours need, so the tile
+ * is read into threadgroup memory once: eight reads a pixel from device
+ * memory become one and a quarter, and this kernel is most of what the
+ * search costs.
+ *
+ * Reading a snapshot rather than the live labels is sound because labels only
+ * ever fall and the write is a minimum -- a stale read can only cost a round,
+ * and the loop runs until a round changes nothing. `changed` is a plain
+ * store of the same value from every thread that has news, which needs no
+ * atomic and saves the round a dispatch to convert one. */
 kernel void cc_propagate(device atomic_uint* labels [[buffer(0)]],
-                         device atomic_uint* changed [[buffer(1)]],
-                         constant uint& count [[buffer(2)]],
-                         constant uint& rows [[buffer(3)]],
-                         constant uint& cols [[buffer(4)]],
-                         constant uint& connectivity [[buffer(5)]],
-                         uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    uint mine = atomic_load_explicit(&labels[id], memory_order_relaxed);
+                         device float* changed [[buffer(1)]],
+                         constant uint& rows [[buffer(2)]],
+                         constant uint& cols [[buffer(3)]],
+                         constant uint& connectivity [[buffer(4)]],
+                         constant uint& across [[buffer(5)]],
+                         uint lid [[thread_index_in_threadgroup]],
+                         uint wid [[threadgroup_position_in_grid]]) {
+    threadgroup uint tile[CC_HALO * CC_HALO];
+    uint ty = wid / across;
+    uint tx = wid - ty * across;
+    int originX = int(tx * CC_TILE) - 1;
+    int originY = int(ty * CC_TILE) - 1;
+    for (uint at = lid; at < CC_HALO * CC_HALO; at += CC_TILE * CC_TILE) {
+        uint row = at / CC_HALO;
+        int ny = originY + int(row);
+        int nx = originX + int(at - row * CC_HALO);
+        uint value = 0u;
+        if (ny >= 0 && nx >= 0 && ny < int(rows) && nx < int(cols)) {
+            value = atomic_load_explicit(&labels[uint(ny) * cols + uint(nx)],
+                                         memory_order_relaxed);
+        }
+        tile[at] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint ly = lid / CC_TILE;
+    uint lx = lid - ly * CC_TILE;
+    uint y = ty * CC_TILE + ly;
+    uint x = tx * CC_TILE + lx;
+    if (y >= rows || x >= cols) return;
+    uint mine = tile[(ly + 1u) * CC_HALO + lx + 1u];
     if (mine == 0u) return;
-    int y = int(id / cols);
-    int x = int(id - uint(y) * cols);
+
     uint best = mine;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dy == 0 && dx == 0) continue;
-            if (connectivity == 4u && dy != 0 && dx != 0) continue;
-            int ny = y + dy;
-            int nx = x + dx;
-            if (ny < 0 || nx < 0 || ny >= int(rows) || nx >= int(cols)) continue;
-            uint other = atomic_load_explicit(&labels[uint(ny) * cols + uint(nx)],
-                                              memory_order_relaxed);
+    for (uint dy = 0u; dy < 3u; ++dy) {
+        for (uint dx = 0u; dx < 3u; ++dx) {
+            if (dy == 1u && dx == 1u) continue;
+            if (connectivity == 4u && dy != 1u && dx != 1u) continue;
+            uint other = tile[(ly + dy) * CC_HALO + lx + dx];
             if (other != 0u && other < best) best = other;
         }
     }
     if (best >= mine) return;
     atomic_fetch_min_explicit(&labels[mine - 1u], best, memory_order_relaxed);
-    atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    changed[0] = 1.0f;
 }
 
 /* Follow every chain to its end and point straight at it, so the next round
@@ -579,14 +614,20 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     let counted = Buffer(1)
     let propagate = kernel_for("cc_propagate")
     let flatten = kernel_for("cc_flatten")
+    let across = (cols + CC_TILE - 1) // CC_TILE
+    let down = (rows + CC_TILE - 1) // CC_TILE
     var rounds = 0
     while rounds < count {
         rounds += 1
         changed.fill_zero()
-        propagate.dispatch_async([labels, changed], count, [count, rows, cols, connectivity])
+        propagate.dispatch_async(
+            [labels, changed],
+            across * down * CC_GROUP,
+            [rows, cols, connectivity, across],
+            group_size: CC_GROUP
+        )
         flatten.dispatch_async([labels], count, [count])
-        kernel_for("cc_tally").dispatch_async([changed, counted], 1, [1])
-        if counted.download()[0] == 0.0 { break }
+        if changed.download()[0] == 0.0 { break }
     }
 
     #: The partition is settled; what remains is the numbering, and OpenCV
@@ -803,6 +844,10 @@ const DT_BATCH = 24
 
 #: Threads in a row-scanning group. Eight simdgroups, which is what the
 #: stitching below assumes.
+#: Matched by `CC_TILE` and the group size in the kernel source.
+const CC_TILE = 16
+const CC_GROUP = 256
+
 const INTEGRAL_GROUP = 256
 
 #: The running sum of an image, one row and column larger than it.
