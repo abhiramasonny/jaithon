@@ -1689,17 +1689,38 @@ kernel void nchw_to_nhwc(device const float* input [[buffer(0)]],
     output[((n * H + h) * W + w) * C + c] = input[id];
 }
 
+/* The same, four at a time, when the row length divides by four -- which
+ * keeps every copy of the row aligned to a float4 boundary. */
+kernel void repeat_last4(device const float4* input [[buffer(0)]],
+                         device float4* output [[buffer(1)]],
+                         constant uint& rows [[buffer(2)]],
+                         constant uint& inner [[buffer(3)]],
+                         constant uint& times [[buffer(4)]],
+                         uint id [[thread_position_in_grid]]) {
+    uint quads = inner >> 2u;
+    uint width = quads * times;
+    if (id >= rows * width) return;
+    uint row = id / width;
+    uint col = id - row * width;
+    uint copy = col / quads;
+    output[id] = input[row * quads + (col - copy * quads)];
+}
+
+/* One division a level and a subtraction for the remainder, rather than a
+ * division and a modulo apiece: the device has no integer divide, and a copy
+ * kernel does nothing else. */
 kernel void repeat_last(device const float* input [[buffer(0)]],
                         device float* output [[buffer(1)]],
                         constant uint& rows [[buffer(2)]],
                         constant uint& inner [[buffer(3)]],
                         constant uint& times [[buffer(4)]],
                         uint id [[thread_position_in_grid]]) {
-    uint count = rows * inner * times;
-    if (id >= count) return;
-    uint col = id % (inner * times);
-    uint row = id / (inner * times);
-    output[id] = input[row * inner + (col % inner)];
+    uint width = inner * times;
+    if (id >= rows * width) return;
+    uint row = id / width;
+    uint col = id - row * width;
+    uint copy = col / inner;
+    output[id] = input[row * inner + (col - copy * inner)];
 }
 
 kernel void bce_sample(device const float* pred [[buffer(0)]],
@@ -1711,6 +1732,88 @@ kernel void bce_sample(device const float* pred [[buffer(0)]],
     float p = clamp(pred[id], 1e-7f, 1.0f - 1e-7f);
     float t = target[id];
     out[id] = -(t * log(p) + (1.0f - t) * log(1.0f - p));
+}
+
+/* The pooling pair, four channels at a time, for the usual case of a channel
+ * count that divides by four.
+ *
+ * A window is read once per channel and the channels sit next to each other,
+ * so a thread that takes four of them does one sixteen-byte read where four
+ * threads did four four-byte ones -- and works out its position in the output
+ * once instead of four times, which matters because the device has no integer
+ * divide. */
+kernel void max_pool2d_nhwc4(device const float4* input [[buffer(0)]],
+                             device float4* output [[buffer(1)]],
+                             constant uint& N [[buffer(2)]],
+                             constant uint& H [[buffer(3)]],
+                             constant uint& W [[buffer(4)]],
+                             constant uint& C [[buffer(5)]],
+                             constant uint& KH [[buffer(6)]],
+                             constant uint& KW [[buffer(7)]],
+                             constant uint& SH [[buffer(8)]],
+                             constant uint& SW [[buffer(9)]],
+                             constant uint& PH [[buffer(10)]],
+                             constant uint& PW [[buffer(11)]],
+                             constant uint& OH [[buffer(12)]],
+                             constant uint& OW [[buffer(13)]],
+                             uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * OH * OW * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    float4 peak = float4(-3.402823e+38f);
+    for (uint kh = 0u; kh < KH; ++kh) {
+        int ih = int(oh * SH) - int(PH) + int(kh);
+        if (ih < 0 || ih >= int(H)) continue;
+        for (uint kw = 0u; kw < KW; ++kw) {
+            int iw = int(ow * SW) - int(PW) + int(kw);
+            if (iw < 0 || iw >= int(W)) continue;
+            peak = max(peak, input[((n * H + uint(ih)) * W + uint(iw)) * quads + q]);
+        }
+    }
+    output[id] = peak;
+}
+
+kernel void avg_pool2d_nhwc4(device const float4* input [[buffer(0)]],
+                             device float4* output [[buffer(1)]],
+                             constant uint& N [[buffer(2)]],
+                             constant uint& H [[buffer(3)]],
+                             constant uint& W [[buffer(4)]],
+                             constant uint& C [[buffer(5)]],
+                             constant uint& KH [[buffer(6)]],
+                             constant uint& KW [[buffer(7)]],
+                             constant uint& SH [[buffer(8)]],
+                             constant uint& SW [[buffer(9)]],
+                             constant uint& PH [[buffer(10)]],
+                             constant uint& PW [[buffer(11)]],
+                             constant uint& OH [[buffer(12)]],
+                             constant uint& OW [[buffer(13)]],
+                             uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    if (id >= N * OH * OW * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / OW;
+    uint ow = rest - row * OW;
+    uint n = row / OH;
+    uint oh = row - n * OH;
+    float4 total = float4(0.0f);
+    uint seen = 0u;
+    for (uint kh = 0u; kh < KH; ++kh) {
+        int ih = int(oh * SH) - int(PH) + int(kh);
+        if (ih < 0 || ih >= int(H)) continue;
+        for (uint kw = 0u; kw < KW; ++kw) {
+            int iw = int(ow * SW) - int(PW) + int(kw);
+            if (iw < 0 || iw >= int(W)) continue;
+            total += input[((n * H + uint(ih)) * W + uint(iw)) * quads + q];
+            seen += 1u;
+        }
+    }
+    output[id] = seen > 0u ? total / float(seen) : float4(0.0f);
 }
 
 kernel void max_pool2d_nhwc(device const float* input [[buffer(0)]],
@@ -3402,11 +3505,13 @@ fn _pool2d(input: Tensor, kernel_size: int, stride: int, padding: int, is_max: b
     let ow = conv2d_out_dim(w, kernel_size, step, padding)
     if oh <= 0 or ow <= 0 { throw ValueError("pool2d produced an empty spatial size") }
     let output = Tensor([n, oh, ow, c])
-    let entry = if is_max { "max_pool2d_nhwc" } else { "avg_pool2d_nhwc" }
-    let kernel = cached_kernel(entry)
-    kernel.dispatch_async(
+    let wide = c % 4 == 0
+    let narrow = if is_max { "max_pool2d_nhwc" } else { "avg_pool2d_nhwc" }
+    let entry = if wide { narrow + "4" } else { narrow }
+    let lanes = if wide { c // 4 } else { c }
+    cached_kernel(entry).dispatch_async(
         [input.buffer(), output.buffer()],
-        n * oh * ow * c,
+        n * oh * ow * lanes,
         [n, h, w, c, kernel_size, kernel_size, step, step, padding, padding, oh, ow]
     )
     if input.requires_grad {
@@ -3686,8 +3791,14 @@ pub fn repeat(input: Tensor, times: int, axis: int = -1) -> Tensor {
         shape.push(if i == resolved { inner * times } else { input.shape[i] })
     }
     let output = Tensor(shape)
-    let kernel = cached_kernel("repeat_last")
-    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [rows, inner, times])
+    let wide = inner % 4 == 0
+    let entry = if wide { "repeat_last4" } else { "repeat_last" }
+    let threads = if wide { output.size // 4 } else { output.size }
+    cached_kernel(entry).dispatch_async(
+        [input.buffer(), output.buffer()],
+        threads,
+        [rows, inner, times]
+    )
     if input.requires_grad {
         let original = input.shape
         output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {

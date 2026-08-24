@@ -2344,6 +2344,107 @@ fn test_ones_full_skip_host_lists_and_layouts() -> void {
     assert_true(loss.download()[0] < 0.5)
 }
 
+#: Pooling and repeat both take a widened kernel when the run they walk
+#: divides by four -- the channels for pooling, the row length for repeat.
+#: Each case here is checked against the same shape one wider, which takes
+#: the narrow arm.
+fn test_pooling_and_repeat_on_both_arms() -> void {
+    if not jt.is_available() { return }
+    #: One image, two rows of four, four channels: the widened arm.
+    let wide = jt.Tensor(
+        [1, 2, 4, 4],
+        [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            5.0,
+            6.0,
+            6.0,
+            7.0,
+            8.0,
+            9.0,
+            1.0,
+            2.0,
+            2.0,
+            3.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            8.0,
+            9.0,
+            9.0,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            5.0,
+            6.0,
+            6.0,
+        ]
+    )
+    defer { wide.free() }
+    let peak = jt.max_pool2d(wide, 2)
+    defer { peak.free() }
+    assert_eq(peak.shape, [1, 1, 2, 4])
+    assert_eq(peak.download(), [8.0, 8.0, 9.0, 9.0, 7.0, 8.0, 9.0, 6.0])
+    let mild = jt.avg_pool2d(wide, 2)
+    defer { mild.free() }
+    assert_eq(mild.download(), [4.5, 5.0, 6.0, 6.5, 3.75, 4.25, 5.25, 3.5])
+
+    #: Two channels, which takes the narrow arm.
+    let narrow = jt.Tensor(
+        [1, 2, 4, 2],
+        [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            9.0,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+        ]
+    )
+    defer { narrow.free() }
+    let narrow_peak = jt.max_pool2d(narrow, 2)
+    defer { narrow_peak.free() }
+    assert_eq(narrow_peak.shape, [1, 1, 2, 2])
+    assert_eq(narrow_peak.download(), [9.0, 4.0, 7.0, 8.0])
+    let narrow_mild = jt.avg_pool2d(narrow, 2)
+    defer { narrow_mild.free() }
+    assert_eq(narrow_mild.download(), [3.75, 2.5, 5.5, 6.5])
+
+    #: Repeat widens when the row length divides by four.
+    let row = jt.Tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    defer { row.free() }
+    let grown = jt.repeat(row, 2)
+    defer { grown.free() }
+    assert_eq(grown.shape, [2, 8])
+    assert_eq(
+        grown.download(),
+        [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]
+    )
+    let odd = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    defer { odd.free() }
+    let odd_grown = jt.repeat(odd, 2)
+    defer { odd_grown.free() }
+    assert_eq(odd_grown.download(), [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0])
+}
+
 #: Both layout swaps go through a tiled transpose, and padding takes a
 #: widened kernel when the channels divide by four. The sizes here straddle
 #: the tile so the ragged edge is walked as well as the whole squares.
