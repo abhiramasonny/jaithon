@@ -8,8 +8,8 @@ BUILD_ROOT="${BUILD_ROOT:-build}"
 JAITHON="$ROOT/jaithon"
 SUITE="${1:-}"
 
-if [[ -n "$SUITE" && "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" ]]; then
-    echo "error: unknown bench suite '$SUITE' (expected jaitensor or jaicv)" >&2
+if [[ -n "$SUITE" && "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" && "$SUITE" != "jainum" ]]; then
+    echo "error: unknown bench suite '$SUITE' (expected jaitensor, jaicv or jainum)" >&2
     exit 2
 fi
 
@@ -67,7 +67,7 @@ esac
 export BENCH_LEVEL="$LEVEL"
 export JAITHON_PATH="${JAITHON_PATH:-$ROOT/lib}"
 
-if [[ "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" ]]; then
+if [[ "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" && "$SUITE" != "jainum" ]]; then
     printf '%s%s build, %s, best of %s%s\n' "$DIM" "$BUILD_KIND" "$LEVEL" "$RUNS" "$RESET"
 fi
 
@@ -160,12 +160,46 @@ if [[ "$SUITE" == "jaicv" ]]; then
         echo "error: no python with cv2 was found. Set JAICV_PYTHON to one that has it." >&2
         exit 1
     fi
-    exec python3 "$ROOT/tests/bench/jaicv/run_suite.py" \
+    exec python3 "$ROOT/tests/bench/run_suite.py" \
         --root "$ROOT" \
         --jaithon "$JAITHON" \
         --python "$py" \
         --level "$LEVEL" \
         --runs "$RUNS"
+fi
+
+# numpy is on the CPU like OpenCV is, so these rows read the same way the jaicv
+# ones do: a loss is a real loss, and a win under the command-buffer round trip
+# is not really a win.
+jainum_python() {
+    if [[ -n "${JAINUM_PYTHON:-}" ]]; then printf '%s' "$JAINUM_PYTHON"; return; fi
+    for candidate in "$HOME/.venvs/scratch/bin/python" python3; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+           "$candidate" -c "import numpy" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return
+        fi
+    done
+}
+
+if [[ "$SUITE" == "jainum" ]]; then
+    py="$(jainum_python)"
+    if [[ -z "$py" ]]; then
+        echo "error: no python with numpy was found. Set JAINUM_PYTHON to one that has it." >&2
+        exit 1
+    fi
+    exec python3 "$ROOT/tests/bench/run_suite.py" \
+        --root "$ROOT" \
+        --jaithon "$JAITHON" \
+        --python "$py" \
+        --level "$LEVEL" \
+        --runs "$RUNS" \
+        --suite jainum \
+        --ours-file arrayops.jai \
+        --peer-file arrayops.py \
+        --ours-label jainum \
+        --peer-label numpy \
+        --footer "numpy runs on the CPU, jainum on the GPU; shapes scale with BENCH_LEVEL."
 fi
 
 if [[ "$SUITE" == "jaitensor" ]]; then
@@ -197,7 +231,7 @@ for src in "$ROOT"/tests/bench/*/*.jai; do
     # neither prints the one-number-per-run output this table reads. jaicv was
     # not excluded here, so every language bench run also ran the whole image
     # suite -- five seconds of GPU work reported as a permanent MISMATCH.
-    [[ "$dir" == "jaitensor" || "$dir" == "jaicv" ]] && continue
+    [[ "$dir" == "jaitensor" || "$dir" == "jaicv" || "$dir" == "jainum" ]] && continue
     name="$(basename "$src" .jai)"
     py="${src%.jai}.py"
 

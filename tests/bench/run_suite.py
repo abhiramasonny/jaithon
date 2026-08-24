@@ -1,4 +1,10 @@
-"""Run imgproc.jai against imgproc.py and print the comparison.
+"""Run one benchmark suite against its peer library and print the comparison.
+
+Shared by the suites whose rows are a single time each -- `jaicv` against
+OpenCV and `jainum` against numpy. `jaitensor` keeps its own runner, because
+its rows carry a FLOP count and print a GFLOPS column this one has no reading
+for. The suite, the two files and the two column headings are arguments so
+that adding a peer is a call rather than a copy of this file.
 
 Each side is run several times and the median taken, because a single run of a
 GPU workload measures the clock ramping as much as the kernel. The two sides
@@ -107,17 +113,29 @@ def main() -> int:
     parser.add_argument("--python", required=True)
     parser.add_argument("--level", choices=("easy", "medium", "hard"), default="hard")
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--suite", default="jaicv")
+    parser.add_argument("--ours-file", default="imgproc.jai")
+    parser.add_argument("--peer-file", default="imgproc.py")
+    parser.add_argument("--ours-label", default="jaicv")
+    parser.add_argument("--peer-label", default="opencv")
+    parser.add_argument(
+        "--footer",
+        default="1920x1080 float32; opencv runs on the CPU, jaicv on the GPU.",
+    )
     args = parser.parse_args()
 
-    here = args.root / "tests" / "bench" / "jaicv"
-    ours_command = [args.jaithon, "run", str(here / "imgproc.jai")]
-    peer_command = [args.python, str(here / "imgproc.py")]
+    here = args.root / "tests" / "bench" / args.suite
+    ours_command = [args.jaithon, "run", str(here / args.ours_file)]
+    peer_command = [args.python, str(here / args.peer_file)]
     try:
         order = listing(ours_command, args.root, args.level)
         peer_rows = listing(peer_command, args.root, args.level)
         missing = [name for name in order if name not in peer_rows]
         if missing:
-            print(f"error: opencv has no row for {', '.join(missing)}", file=sys.stderr)
+            print(
+                f"error: {args.peer_label} has no row for {', '.join(missing)}",
+                file=sys.stderr,
+            )
             return 1
         mine, theirs, checks = collect(
             ours_command, peer_command, order, args.runs, args.root, args.level
@@ -128,7 +146,10 @@ def main() -> int:
     my_checks = checks
     their_checks: dict[str, str] = {}
 
-    print(f"{BOLD}{'operation':<16}{'jaicv':>10}{'opencv':>10}{'ratio':>9}   result{RESET}")
+    print(
+        f"{BOLD}{'operation':<16}{args.ours_label:>10}{args.peer_label:>10}"
+        f"{'ratio':>9}   result{RESET}"
+    )
     print("─" * 54)
     total_mine = 0.0
     total_theirs = 0.0
@@ -147,7 +168,7 @@ def main() -> int:
         f"{BOLD}{'total':<16}{total_mine * 1000:>9.1f}ms{total_theirs * 1000:>9.1f}ms"
         f"{total_theirs / total_mine:>8.2f}x{RESET}"
     )
-    print(f"{DIM}1920x1080 float32; opencv runs on the CPU, jaicv on the GPU.{RESET}")
+    print(f"{DIM}{args.footer}{RESET}")
     return 0
 
 

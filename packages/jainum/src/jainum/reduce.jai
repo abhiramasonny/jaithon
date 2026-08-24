@@ -554,6 +554,10 @@ const _TARGET_GROUPS = 1024
 #: launches and partials than it wins in parallelism.
 const _CHUNK_FLOOR = 2048
 
+#: The same floor for a lane-per-segment fold, whose threads read shoulder to
+#: shoulder: a short slice costs it nothing and the grid needs the groups.
+const _SEGMENT_CHUNK_FLOOR = 64
+
 fn _larger(a: int, b: int) -> int { return if a > b { a } else { b } }
 
 fn _smaller(a: int, b: int) -> int { return if a < b { a } else { b } }
@@ -687,10 +691,10 @@ class _Plan {
 #: Chunks worth splitting a segment into, given how many segments there
 #: already are. Capped so `segments * chunks` never passes `_TARGET_GROUPS`
 #: and the finish pass therefore stays one dispatch over a small buffer.
-fn _chunks_for(segments: int, n: int) -> int {
-    if segments >= _TARGET_GROUPS { return 1 }
-    let by_grid = _TARGET_GROUPS // _larger(1, segments)
-    let by_work = n // _CHUNK_FLOOR
+fn _chunks_for(groups: int, n: int, floor: int) -> int {
+    if groups >= _TARGET_GROUPS { return 1 }
+    let by_grid = _TARGET_GROUPS // _larger(1, groups)
+    let by_work = n // floor
     return _larger(1, _smaller(by_grid, by_work))
 }
 
@@ -757,13 +761,39 @@ fn _plan(a: NDArray, axes: list[int], allow_quad: bool, sort_inner: bool) -> _Pl
     }
     if quad { flags = flags | 4 }
 
+    #: Which way the group is cut decides whether the reads coalesce.
+    #:
+    #: `width` threads share one segment, so consecutive lanes step along the
+    #: REDUCED axis. That is what a contiguous run wants. When the reduced axis
+    #: is strided instead -- summing down the columns of a C-ordered matrix --
+    #: those lanes land `inner_step` apart and each pulls its own cache line:
+    #: [4096, 4096] along axis 0 read 88 GB/s where the same bytes along axis 1
+    #: read 235, on a device that does better than 400. One lane per SEGMENT
+    #: turns it round, since neighbouring segments are then neighbouring
+    #: addresses, and the kernel already covers that shape -- it is `width` of
+    #: one, the case written for an axis three elements wide. Worth 1.58x.
+    #:
+    #: Sixteen groups is too few to hide the latency, so the chunking is done
+    #: against the GROUP count here rather than the segment count -- they stop
+    #: being the same number once a group holds 256 segments. Every other shape
+    #: keeps the plan it had, deliberately: passing the group count everywhere
+    #: is the more honest rule, but it moves plans this has not measured, and
+    #: the axis-1 row moved the wrong way when it was tried.
+    let wide_enough = segments >= GROUP
+    let by_segment = outer_step == 1 and not quad and inner_step != 1 and wide_enough
     let units = if quad { n // 4 } else { n }
     var width = 1
-    while width < units and width < GROUP { width *= 2 }
-    var chunks = _chunks_for(segments, n)
+    if not by_segment {
+        while width < units and width < GROUP { width *= 2 }
+    }
+    var chunks = if by_segment {
+        _chunks_for((segments + GROUP - 1) // GROUP, n, _SEGMENT_CHUNK_FLOOR)
+    } else {
+        _chunks_for(segments, n, _CHUNK_FLOOR)
+    }
     var per = n
     if chunks > 1 {
-        width = GROUP
+        if not by_segment { width = GROUP }
         per = (n + chunks - 1) // chunks
         #: A chunk boundary that is not a multiple of four would unalign every
         #: float4 load after the first chunk.
@@ -1268,7 +1298,8 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
     defer { meta.free() }
     meta.upload(values)
 
-    var chunks = _chunks_for(segments, n)
+    #: One group a segment here, so the group count is the segment count.
+    var chunks = _chunks_for(segments, n, _CHUNK_FLOOR)
     var per = n
     if chunks > 1 {
         per = (n + chunks - 1) // chunks
