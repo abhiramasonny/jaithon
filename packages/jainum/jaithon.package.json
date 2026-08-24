@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "jainum",
+  "version": "0.1.0",
+  "description": "N-dimensional arrays on the GPU: dtypes, broadcasting, ufuncs, reductions, linear algebra, random, transforms",
+  "source": "src",
+  "dependencies": {}
+}

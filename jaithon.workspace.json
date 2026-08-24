@@ -2,7 +2,11 @@
   "schema": 1,
   "members": [
     "packages/jaicv",
+    "packages/jaiframe",
+    "packages/jailearn",
+    "packages/jainum",
     "packages/jaiplot",
+    "packages/jaisci",
     "packages/jaitensor"
   ]
 }

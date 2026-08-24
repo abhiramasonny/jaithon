@@ -177,6 +177,10 @@ unit_args+=(
     "$ROOT/packages/jaicv/tests"
     "$ROOT/packages/jaiplot/tests"
     "$ROOT/packages/jaitensor/tests"
+    "$ROOT/packages/jaiframe/tests"
+    "$ROOT/packages/jailearn/tests"
+    "$ROOT/packages/jainum/tests"
+    "$ROOT/packages/jaisci/tests"
 )
 
 start=$(now_ms)

@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "name": "jailearn",
+  "version": "0.1.0",
+  "description": "Classical machine learning on the GPU: estimators, model selection, metrics",
+  "source": "src",
+  "dependencies": {
+    "jaitensor": "^0.1.0"
+  }
+}
