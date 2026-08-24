@@ -8,8 +8,8 @@ BUILD_ROOT="${BUILD_ROOT:-build}"
 JAITHON="$ROOT/jaithon"
 SUITE="${1:-}"
 
-if [[ -n "$SUITE" && "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" && "$SUITE" != "jainum" ]]; then
-    echo "error: unknown bench suite '$SUITE' (expected jaitensor, jaicv or jainum)" >&2
+if [[ -n "$SUITE" && "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" && "$SUITE" != "jainum" && "$SUITE" != "jaiframe" ]]; then
+    echo "error: unknown bench suite '$SUITE' (expected jaitensor, jaicv, jainum or jaiframe)" >&2
     exit 2
 fi
 
@@ -67,7 +67,7 @@ esac
 export BENCH_LEVEL="$LEVEL"
 export JAITHON_PATH="${JAITHON_PATH:-$ROOT/lib}"
 
-if [[ "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" && "$SUITE" != "jainum" ]]; then
+if [[ "$SUITE" != "jaitensor" && "$SUITE" != "jaicv" && "$SUITE" != "jainum" && "$SUITE" != "jaiframe" ]]; then
     printf '%s%s build, %s, best of %s%s\n' "$DIM" "$BUILD_KIND" "$LEVEL" "$RUNS" "$RESET"
 fi
 
@@ -202,6 +202,38 @@ if [[ "$SUITE" == "jainum" ]]; then
         --footer "numpy runs on the CPU, jainum on the GPU; shapes scale with BENCH_LEVEL."
 fi
 
+# pandas, like numpy and OpenCV, runs on the CPU.
+jaiframe_python() {
+    if [[ -n "${JAIFRAME_PYTHON:-}" ]]; then printf '%s' "$JAIFRAME_PYTHON"; return; fi
+    for candidate in "$HOME/.venvs/scratch/bin/python" python3; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+           "$candidate" -c "import pandas" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return
+        fi
+    done
+}
+
+if [[ "$SUITE" == "jaiframe" ]]; then
+    py="$(jaiframe_python)"
+    if [[ -z "$py" ]]; then
+        echo "error: no python with pandas was found. Set JAIFRAME_PYTHON to one that has it." >&2
+        exit 1
+    fi
+    exec python3 "$ROOT/tests/bench/run_suite.py" \
+        --root "$ROOT" \
+        --jaithon "$JAITHON" \
+        --python "$py" \
+        --level "$LEVEL" \
+        --runs "$RUNS" \
+        --suite jaiframe \
+        --ours-file frameops.jai \
+        --peer-file frameops.py \
+        --ours-label jaiframe \
+        --peer-label pandas \
+        --footer "pandas runs on the CPU, jaiframe on the GPU; two million rows at the default level."
+fi
+
 if [[ "$SUITE" == "jaitensor" ]]; then
     py="$(jaitensor_python)"
     if [[ -z "$py" ]]; then
@@ -231,7 +263,7 @@ for src in "$ROOT"/tests/bench/*/*.jai; do
     # neither prints the one-number-per-run output this table reads. jaicv was
     # not excluded here, so every language bench run also ran the whole image
     # suite -- five seconds of GPU work reported as a permanent MISMATCH.
-    [[ "$dir" == "jaitensor" || "$dir" == "jaicv" || "$dir" == "jainum" ]] && continue
+    [[ "$dir" == "jaitensor" || "$dir" == "jaicv" || "$dir" == "jainum" || "$dir" == "jaiframe" ]] && continue
     name="$(basename "$src" .jai)"
     py="${src%.jai}.py"
 

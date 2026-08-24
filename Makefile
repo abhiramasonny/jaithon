@@ -6,6 +6,7 @@
 #   make bench              language benches vs python3/c++/java
 #   make bench jaicv         image operations vs OpenCV on the CPU (~2 min)
 #   make bench jainum        numpy's array surface vs numpy on the CPU
+#   make bench jaiframe      pandas' frame surface vs pandas on the CPU
 #   make bench jaitensor     GPU/ML benches vs PyTorch MPS (~7 min: twenty
 #                            workloads, five runs a side, and a PyTorch process
 #                            start for each -- it reports progress on stderr)
@@ -343,7 +344,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench jaitensor jaicv jainum exports-check install uninstall \
+.PHONY: all debug release test verify-test bench jaitensor jaicv jainum jaiframe exports-check install uninstall \
         clean distclean fmt fmt-check fmt-roundtrip check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -693,7 +694,7 @@ jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 #: under a load average of 4.5 and 3.10x on the same commit with the machine
 #: quiet, with individual rows moving by a factor of three.
 bench: $(TARGET)
-	@LEVEL="$(LEVEL)" ./scripts/gpu_lock.sh ./scripts/run_bench.sh $(filter jaitensor jaicv jainum,$(MAKECMDGOALS))
+	@LEVEL="$(LEVEL)" ./scripts/gpu_lock.sh ./scripts/run_bench.sh $(filter jaitensor jaicv jainum jaiframe,$(MAKECMDGOALS))
 
 jaitensor:
 	@:
@@ -702,6 +703,9 @@ jaicv:
 	@:
 
 jainum:
+	@:
+
+jaiframe:
 	@:
 #: Regenerate boot/seed.c from the images the front end currently needs.
 #:
