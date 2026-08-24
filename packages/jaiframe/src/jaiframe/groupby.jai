@@ -22,12 +22,12 @@
 #:   serves an aggregation the device has no atomic for: minimum, maximum,
 #:   product, and the row-pickers.
 #:
-#: `SEGMENT_ROWS` is the crossover. Below it the groups are short, contention
-#: is mild, and the scatter wins because it sets nothing up; above it one slot
-#: is being fought over by enough rows that the dispatch serialises and paying
-#: for the layout is cheaper. The layout is cached on the handle, so once
-#: something has asked for a minimum every later aggregation takes the
-#: segmented path for free.
+#: Which of the two runs is decided in `use_scatter`, and the answer is the
+#: scatter unless a layout already exists. There was a rows-per-group crossover
+#: here once, reasoned rather than swept; sweeping it found no crossover at
+#: all — see the note on `use_scatter` for the numbers. The layout is cached on
+#: the handle, so once something has asked for a minimum every later
+#: aggregation takes the segmented path for free.
 #:
 #: What is not here: `factorize` and the hashing under it are `keys.jai`,
 #: `resample` is `timeseries.jai`, `pivot`/`unstack` are `reshape.jai`.
@@ -46,16 +46,6 @@ from .column import MAX_ROWS, NA
 from .column import cached_kernel as column_kernel
 from .column import concat_columns, f32_bits, prefix_sum
 from .keys import NO_GROUP, factorize
-
-#: Rows per group at which the segmented path starts to beat the scatter.
-#:
-#: A float atomic add to a contended address serialises, so a group of `n`
-#: rows costs about `n` serialised adds on the scatter path and one thread's
-#: walk of `n` rows on the segmented one — a wash, except that the segmented
-#: path first has to lay the rows out, which is two passes over the rows and a
-#: scan. Sixty-four rows a group is where that setup is repaid. It is reasoned,
-#: not swept; a measurement should move it.
-const SEGMENT_ROWS = 64
 
 #: Threadgroup width of the segmented kernels. The shader stages `ORDER_TILE`
 #: order entries per pass through threadgroup memory; that width is its own.
@@ -1256,15 +1246,35 @@ pub class GroupBy {
 
     #: Whether an aggregation should scatter with atomics or walk segments.
     #:
-    #: The scatter needs nothing built, so it wins until a group is tall enough
-    #: for the contention on its one slot to cost more than laying the rows
-    #: out. Once something has laid them out the question is settled the other
-    #: way: the layout is already paid for, and walking a run beats fighting
-    #: over an address.
+    #: Once something has laid the rows out the question is settled: the layout
+    #: is paid for, and walking a run beats fighting over an address. Before
+    #: that, the scatter wins -- at every shape measured, not merely at the
+    #: short groups the rule here used to allow.
+    #:
+    #: The rule was `rows < groups * 64`, on the reading that a tall group
+    #: contends on its one slot until that costs more than laying the rows out.
+    #: Measured at two million rows, that crossover is not there. Building the
+    #: layout costs about 13 ms whatever the shape, and a single `sum` pays all
+    #: of it, which is exactly what `df.groupby(k).sum()` does:
+    #:
+    #:     groups        4     32    256   2048   5000  20000
+    #:     segment   26.96  32.96  22.48  17.43  18.17  24.06 ms
+    #:     scatter    7.98   6.48   5.23   3.24   3.72   4.19 ms
+    #:
+    #: Even four groups -- half a million rows deep into one address -- come
+    #: back 3.4x ahead. Small frames agree: 200k rows over 50 groups went 3.03
+    #: to 1.34 ms, and by a thousand rows the two are level and the whole thing
+    #: is dispatch-bound anyway.
+    #:
+    #: The atomic is on a float and float addition is not associative, so this
+    #: widens how much of `groupby` has an order the hardware picks. Eight
+    #: repeats of a five-thousand-group sum over two million rows came back
+    #: bit-identical, so it is stable in practice for a fixed dispatch; it is
+    #: not a guarantee, and a caller who needs one should reach for an
+    #: aggregation that lays the rows out.
     fn use_scatter(self, op: int) -> bool {
         if op > OP_DEV2 { return false }
-        if self.order_lane is not null { return false }
-        return self.frame.len() < self.group_total * SEGMENT_ROWS
+        return self.order_lane is null
     }
 
     #: One value per group, by whichever path suits the aggregation.
