@@ -2344,6 +2344,62 @@ fn test_ones_full_skip_host_lists_and_layouts() -> void {
     assert_true(loss.download()[0] < 0.5)
 }
 
+#: Both layout swaps go through a tiled transpose, and padding takes a
+#: widened kernel when the channels divide by four. The sizes here straddle
+#: the tile so the ragged edge is walked as well as the whole squares.
+fn test_layout_swaps_and_padding_at_the_tile_edge() -> void {
+    if not jt.is_available() { return }
+    for shape in [[1, 1, 1, 1], [2, 3, 5, 4], [1, 33, 31, 3], [1, 32, 32, 32]] {
+        let source = jt.Tensor(shape)
+        defer { source.free() }
+        source.buffer().fill_uniform(-1.0, 1.0, shape[1] * 100 + shape[2] * 10 + shape[3])
+        let want = source.buffer().download()
+        let n = shape[0]
+        let h = shape[1]
+        let w = shape[2]
+        let c = shape[3]
+
+        let planar = jt.nchw(source)
+        defer { planar.free() }
+        assert_eq(planar.shape, [n, c, h, w])
+        let planar_values = planar.buffer().download()
+        for index in 0..source.size {
+            let rest = index // c
+            let channel = index - rest * c
+            let row = rest // w
+            let column = rest - row * w
+            let image = row // h
+            let line = row - image * h
+            assert_eq(planar_values[((image * c + channel) * h + line) * w + column], want[index])
+        }
+
+        let back = jt.nhwc(planar)
+        defer { back.free() }
+        assert_eq(back.shape, shape)
+        assert_eq(back.buffer().download(), want)
+
+        let padded = jt.pad2d(source, [1, 2, 3, 0])
+        defer { padded.free() }
+        assert_eq(padded.shape, [n, h + 3, w + 3, c])
+        let padded_values = padded.buffer().download()
+        for index in 0..padded.size {
+            let rest = index // c
+            let channel = index - rest * c
+            let row = rest // (w + 3)
+            let column = rest - row * (w + 3)
+            let image = row // (h + 3)
+            let line = row - image * (h + 3)
+            let inside = line >= 1 and line < h + 1 and column >= 3
+            let expect = if inside {
+                want[((image * h + line - 1) * w + column - 3) * c + channel]
+            } else {
+                0.0
+            }
+            assert_eq(padded_values[index], expect)
+        }
+    }
+}
+
 fn test_eye_flip_upsample_and_split_heads() -> void {
     if not jt.is_available() { return }
     let ident = jt.eye(3)

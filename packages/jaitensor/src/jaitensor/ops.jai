@@ -1542,6 +1542,45 @@ kernel void pow_scalar(device const float* input [[buffer(0)]],
     if (id < count) output[id] = pow(input[id], as_type<float>(exp_bits));
 }
 
+/* The same, four channels at a time, for the usual case of a channel count
+ * that divides by four.
+ *
+ * A thread per output element works out its own position, and the device has
+ * no integer divide -- each one is a short sequence, and this kernel does
+ * nothing else, so their count is the whole cost. Four channels at once
+ * quarters them and moves sixteen bytes instead of four. The position is also
+ * unpicked with one division a level and a subtraction for the remainder,
+ * rather than a division and a modulo apiece. */
+kernel void pad2d_nhwc4(device const float4* input [[buffer(0)]],
+                        device float4* output [[buffer(1)]],
+                        constant uint& N [[buffer(2)]],
+                        constant uint& H [[buffer(3)]],
+                        constant uint& W [[buffer(4)]],
+                        constant uint& C [[buffer(5)]],
+                        constant uint& PT [[buffer(6)]],
+                        constant uint& PB [[buffer(7)]],
+                        constant uint& PL [[buffer(8)]],
+                        constant uint& PR [[buffer(9)]],
+                        uint id [[thread_position_in_grid]]) {
+    uint quads = C >> 2u;
+    uint oh = H + PT + PB;
+    uint ow = W + PL + PR;
+    if (id >= N * oh * ow * quads) return;
+    uint rest = id / quads;
+    uint q = id - rest * quads;
+    uint row = rest / ow;
+    uint owi = rest - row * ow;
+    uint n = row / oh;
+    uint ohi = row - n * oh;
+    int ih = int(ohi) - int(PT);
+    int iw = int(owi) - int(PL);
+    if (ih < 0 || iw < 0 || ih >= int(H) || iw >= int(W)) {
+        output[id] = float4(0.0f);
+        return;
+    }
+    output[id] = input[((n * H + uint(ih)) * W + uint(iw)) * quads + q];
+}
+
 kernel void pad2d_nhwc(device const float* input [[buffer(0)]],
                        device float* output [[buffer(1)]],
                        constant uint& N [[buffer(2)]],
@@ -1568,6 +1607,54 @@ kernel void pad2d_nhwc(device const float* input [[buffer(0)]],
         return;
     }
     output[id] = input[((n * H + uint(ih)) * W + uint(iw)) * C + c];
+}
+
+/* Held to `TRANSPOSE_TILE` and `TRANSPOSE_GROUP` on the host. */
+#define TR_TILE 32u
+#define TR_ROWS 8u
+
+/* `N` matrices of `rows` by `cols`, each handed back the other way round.
+ *
+ * Swapping two axes means one side of the copy is strided whichever way it is
+ * written a thread at a time: laying out NCHW as NHWC wrote every fourth
+ * kilobyte and took 2.0 ms on 64x64x56x56 where the peer took 0.9. Going via a
+ * tile in threadgroup memory makes both sides sequential -- read a 32 by 32
+ * square along its rows, write it back along its columns -- and the square is
+ * held 33 wide so that consecutive rows of it land in different banks.
+ *
+ * Both directions are this one kernel: NHWC to NCHW transposes `H*W` by `C`,
+ * and NCHW to NHWC transposes `C` by `H*W`. */
+kernel void transpose_batched(device const float* input [[buffer(0)]],
+                              device float* output [[buffer(1)]],
+                              constant uint& rows [[buffer(2)]],
+                              constant uint& cols [[buffer(3)]],
+                              constant uint& across [[buffer(4)]],
+                              constant uint& down [[buffer(5)]],
+                              uint lid [[thread_index_in_threadgroup]],
+                              uint wid [[threadgroup_position_in_grid]]) {
+    threadgroup float tile[TR_TILE][TR_TILE + 1u];
+    uint per_image = across * down;
+    uint n = wid / per_image;
+    uint rest = wid - n * per_image;
+    uint ty = rest / across;
+    uint tx = rest - ty * across;
+    uint lx = lid & (TR_TILE - 1u);
+    uint ly = lid >> 5u;
+    uint base = n * rows * cols;
+
+    for (uint step = 0u; step < TR_TILE; step += TR_ROWS) {
+        uint i = ty * TR_TILE + ly + step;
+        uint j = tx * TR_TILE + lx;
+        float value = 0.0f;
+        if (i < rows && j < cols) value = input[base + i * cols + j];
+        tile[ly + step][lx] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 0u; step < TR_TILE; step += TR_ROWS) {
+        uint j = tx * TR_TILE + ly + step;
+        uint i = ty * TR_TILE + lx;
+        if (j < cols && i < rows) output[base + j * rows + i] = tile[lx][ly + step];
+    }
 }
 
 kernel void nhwc_to_nchw(device const float* input [[buffer(0)]],
@@ -3496,10 +3583,12 @@ pub fn pad2d(input: Tensor, pad: list[int]) -> Tensor {
     let w = input.shape[2]
     let c = input.shape[3]
     let output = Tensor([n, h + pad[0] + pad[1], w + pad[2] + pad[3], c])
-    let kernel = cached_kernel("pad2d_nhwc")
-    kernel.dispatch_async(
+    let wide = c % 4 == 0
+    let entry = if wide { "pad2d_nhwc4" } else { "pad2d_nhwc" }
+    let threads = if wide { output.size // 4 } else { output.size }
+    cached_kernel(entry).dispatch_async(
         [input.buffer(), output.buffer()],
-        output.size,
+        threads,
         [n, h, w, c, pad[0], pad[1], pad[2], pad[3]]
     )
     if input.requires_grad {
@@ -3518,6 +3607,23 @@ pub fn pad2d(input: Tensor, pad: list[int]) -> Tensor {
 }
 
 #: NHWC `[N,H,W,C]` to NCHW `[N,C,H,W]`.
+#: Tiles a side, and the group that walks one. Matched by `TR_TILE` and
+#: `TR_ROWS` in the kernel source.
+const TRANSPOSE_TILE = 32
+const TRANSPOSE_GROUP = 256
+
+#: `count` matrices of `rows` by `cols`, each written back the other way up.
+fn dispatch_transpose(input: Tensor, output: Tensor, count: int, rows: int, cols: int) -> void {
+    let across = (cols + TRANSPOSE_TILE - 1) // TRANSPOSE_TILE
+    let down = (rows + TRANSPOSE_TILE - 1) // TRANSPOSE_TILE
+    cached_kernel("transpose_batched").dispatch_async(
+        [input.buffer(), output.buffer()],
+        count * across * down * TRANSPOSE_GROUP,
+        [rows, cols, across, down],
+        group_size: TRANSPOSE_GROUP
+    )
+}
+
 pub fn nchw(input: Tensor) -> Tensor {
     if input.rank() != 4 { throw ValueError(f"nchw needs rank four, got {input.shape}") }
     let n = input.shape[0]
@@ -3525,8 +3631,7 @@ pub fn nchw(input: Tensor) -> Tensor {
     let w = input.shape[2]
     let c = input.shape[3]
     let output = Tensor([n, c, h, w])
-    let kernel = cached_kernel("nhwc_to_nchw")
-    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [n, h, w, c])
+    dispatch_transpose(input, output, n, h * w, c)
     if input.requires_grad {
         output.attach_creator(GradNode([input], |upstream| [nhwc(upstream)]))
     }
@@ -3541,8 +3646,7 @@ pub fn nhwc(input: Tensor) -> Tensor {
     let h = input.shape[2]
     let w = input.shape[3]
     let output = Tensor([n, h, w, c])
-    let kernel = cached_kernel("nchw_to_nhwc")
-    kernel.dispatch_async([input.buffer(), output.buffer()], output.size, [n, c, h, w])
+    dispatch_transpose(input, output, n, c, h * w)
     if input.requires_grad {
         output.attach_creator(GradNode([input], |upstream| [nchw(upstream)]))
     }
