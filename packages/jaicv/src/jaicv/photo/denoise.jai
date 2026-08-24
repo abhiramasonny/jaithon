@@ -98,6 +98,127 @@ kernel void photo_nlmeans(device const float* src [[buffer(0)]],
 
 /* How far apart two neighbouring pixels are in the domain transform's warped
  * space: close where the image is flat, far where it has an edge. */
+/* What the smoother took out, put back with interest.
+ *
+ * The two pictures were pulled into lists and walked here on the host, and
+ * `math.floor` is a call, so the tier declined the loop around it -- two
+ * million values at interpreter speed for what is one read, one subtract and
+ * one write. */
+kernel void photo_detail(device const float* src [[buffer(0)]],
+                         device const float* smooth [[buffer(1)]],
+                         device float* dst [[buffer(2)]],
+                         constant uint& count [[buffer(3)]],
+                         constant uint& width [[buffer(4)]],
+                         constant uint& src_off [[buffer(5)]],
+                         constant uint& src_step [[buffer(6)]],
+                         constant uint& smooth_off [[buffer(7)]],
+                         constant uint& smooth_step [[buffer(8)]],
+                         constant uint& dst_off [[buffer(9)]],
+                         constant uint& dst_step [[buffer(10)]],
+                         constant float& gain [[buffer(11)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / width;
+    uint x = id - y * width;
+    float base = smooth[smooth_off + y * smooth_step + x];
+    float detail = src[src_off + y * src_step + x] - base;
+    dst[dst_off + y * dst_step + x] = clamp(floor(base + detail * gain + 0.5f), 0.0f, 255.0f);
+}
+
+/* The picture as one flat run, so the sweeps below can read and write it
+ * without carrying the Mat's offset and row stride through every step -- and
+ * so the caller's picture is not the one being changed. */
+kernel void photo_gather(device const float* src [[buffer(0)]],
+                         device float* dst [[buffer(1)]],
+                         constant uint& count [[buffer(2)]],
+                         constant uint& width [[buffer(3)]],
+                         constant uint& src_off [[buffer(4)]],
+                         constant uint& src_step [[buffer(5)]],
+                         uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / width;
+    uint x = id - y * width;
+    dst[id] = src[src_off + y * src_step + x];
+}
+
+/* One sweep of the recursive filter, forward and then back again.
+ *
+ * The recursion is sequential along the line it walks and says nothing about
+ * the lines beside it, so a thread takes a whole line: a row for the
+ * horizontal sweep, a column for the vertical one. Six sweeps of a 1080p
+ * frame on the host, with the picture pulled into a list first, took 3.7
+ * seconds.
+ *
+ * `a` is the pole's strength, `base` raised to how far apart the two pixels
+ * are in the warped domain -- a large gap makes the filter forget what came
+ * before it, which is what stops it smoothing across an edge. */
+kernel void photo_recurse_rows(device float* values [[buffer(0)]],
+                               device const float* steps [[buffer(1)]],
+                               constant uint& rows [[buffer(2)]],
+                               constant uint& cols [[buffer(3)]],
+                               constant uint& cn [[buffer(4)]],
+                               constant float& base [[buffer(5)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= rows * cn) return;
+    uint c = id % cn;
+    uint y = id / cn;
+    for (uint x = 1u; x < cols; ++x) {
+        float a = pow(base, steps[y * cols + x]);
+        uint here = (y * cols + x) * cn + c;
+        uint behind = (y * cols + x - 1u) * cn + c;
+        values[here] = values[here] + a * (values[behind] - values[here]);
+    }
+    for (uint step = 1u; step < cols; ++step) {
+        uint x = cols - 1u - step;
+        float a = pow(base, steps[y * cols + x + 1u]);
+        uint here = (y * cols + x) * cn + c;
+        uint ahead = (y * cols + x + 1u) * cn + c;
+        values[here] = values[here] + a * (values[ahead] - values[here]);
+    }
+}
+
+kernel void photo_recurse_cols(device float* values [[buffer(0)]],
+                               device const float* steps [[buffer(1)]],
+                               constant uint& rows [[buffer(2)]],
+                               constant uint& cols [[buffer(3)]],
+                               constant uint& cn [[buffer(4)]],
+                               constant float& base [[buffer(5)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= cols * cn) return;
+    uint c = id % cn;
+    uint x = id / cn;
+    for (uint y = 1u; y < rows; ++y) {
+        float a = pow(base, steps[y * cols + x]);
+        uint here = (y * cols + x) * cn + c;
+        uint above = ((y - 1u) * cols + x) * cn + c;
+        values[here] = values[here] + a * (values[above] - values[here]);
+    }
+    for (uint step = 1u; step < rows; ++step) {
+        uint y = rows - 1u - step;
+        float a = pow(base, steps[(y + 1u) * cols + x]);
+        uint here = (y * cols + x) * cn + c;
+        uint below = ((y + 1u) * cols + x) * cn + c;
+        values[here] = values[here] + a * (values[below] - values[here]);
+    }
+}
+
+/* Round to the nearest whole number and hold it inside a byte's range, which
+ * is what the host loop at the end of the filter used to do one value at a
+ * time -- and `math.floor` is a call, so the tier declined the loop around
+ * it. */
+kernel void photo_round_byte(device const float* values [[buffer(0)]],
+                             device float* dst [[buffer(1)]],
+                             constant uint& count [[buffer(2)]],
+                             constant uint& dst_off [[buffer(3)]],
+                             constant uint& dst_step [[buffer(4)]],
+                             constant uint& width [[buffer(5)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / width;
+    uint x = id - y * width;
+    dst[dst_off + y * dst_step + x] = clamp(floor(values[id] + 0.5f), 0.0f, 255.0f);
+}
+
 kernel void photo_domain_step(device const float* src [[buffer(0)]],
                               device float* dst [[buffer(1)]],
                               constant uint& count [[buffer(2)]],
@@ -310,74 +431,17 @@ pub fn fast_nl_means_denoising_colored(
     return fast_nl_means_denoising(src, h, template_window_size, search_window_size)
 }
 
-fn domain_steps(src: Mat, horizontal: bool, sigma_s: float, sigma_r: float) -> list[float] {
+fn domain_steps(src: Mat, horizontal: bool, sigma_s: float, sigma_r: float) -> Mat {
     let count = src.rows * src.cols
     let steps = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
-    if count == 0 { return [] }
+    if count == 0 { return steps }
     kernel_for("photo_domain_step").dispatch([src.storage, steps.storage], count, [count, src.rows, src.cols, src.channels(), src.offset, src.step_, if horizontal {
         1
     } else {
         0
     }, f32_bits(sigma_s / sigma_r)])
     steps.invalidate()
-    return steps.to_list()
-}
-
-fn recursive_pass(
-    values: list[float],
-    steps: list[float],
-    rows: int,
-    cols: int,
-    cn: int,
-    horizontal: bool,
-    sigma: float
-) -> void {
-    #: One pole per direction, with the pole's strength set by how far apart
-    #: the two pixels are in the warped domain: a large gap makes the filter
-    #: forget what came before it, which is what stops it smoothing across an
-    #: edge.
-    let base = math.exp(-math.sqrt(2.0) / max(sigma, 1e-6))
-    if horizontal {
-        for y in 0..rows {
-            for x in 1..cols {
-                let a = base ** steps[y * cols + x]
-                for c in 0..cn {
-                    let here = (y * cols + x) * cn + c
-                    let previous = (y * cols + x - 1) * cn + c
-                    values[here] = values[here] + a * (values[previous] - values[here])
-                }
-            }
-            for step in 1..cols {
-                let x = cols - 1 - step
-                let a = base ** steps[y * cols + x + 1]
-                for c in 0..cn {
-                    let here = (y * cols + x) * cn + c
-                    let following = (y * cols + x + 1) * cn + c
-                    values[here] = values[here] + a * (values[following] - values[here])
-                }
-            }
-        }
-        return
-    }
-    for x in 0..cols {
-        for y in 1..rows {
-            let a = base ** steps[y * cols + x]
-            for c in 0..cn {
-                let here = (y * cols + x) * cn + c
-                let previous = ((y - 1) * cols + x) * cn + c
-                values[here] = values[here] + a * (values[previous] - values[here])
-            }
-        }
-        for step in 1..rows {
-            let y = rows - 1 - step
-            let a = base ** steps[(y + 1) * cols + x]
-            for c in 0..cn {
-                let here = (y * cols + x) * cn + c
-                let following = ((y + 1) * cols + x) * cn + c
-                values[here] = values[here] + a * (values[following] - values[here])
-            }
-        }
-    }
+    return steps
 }
 
 #: Smooth an image without softening its edges.
@@ -397,44 +461,72 @@ pub fn edge_preserving_filter(
     let rows = src.rows
     let cols = src.cols
     let cn = src.channels()
-    var values = src.to_list()
+    let count = rows * cols * cn
+    let out = Mat.zeros(rows, cols, src.type_())
+    if count == 0 { return out }
 
+    #: A working copy, because the sweeps read and write the same picture and
+    #: the caller's is not theirs to change.
+    let values = Buffer(count)
+    kernel_for("photo_gather").dispatch_async(
+        [src.storage, values],
+        count,
+        [count, cols * cn, src.offset, src.step_]
+    )
     let horizontal = domain_steps(src, true, sigma_s, sigma_r * 255.0)
     let vertical = domain_steps(src, false, sigma_s, sigma_r * 255.0)
-    #: Three passes with a shrinking radius, which is what the paper prescribes
-    #: to keep a single pass from leaving stripes.
+    horizontal.flush()
+    vertical.flush()
+
+    let sweep_rows = kernel_for("photo_recurse_rows")
+    let sweep_cols = kernel_for("photo_recurse_cols")
+    #: Three passes with a shrinking radius, which is what the paper
+    #: prescribes to keep a single pass from leaving stripes.
     for iteration in 0..3 {
         let scale = sigma_s * math.sqrt(3.0) * 2.0 ** float(2 - iteration) /
             math.sqrt(4.0 ** 3.0 - 1.0)
-        recursive_pass(values, horizontal, rows, cols, cn, true, scale)
-        recursive_pass(values, vertical, rows, cols, cn, false, scale)
+        let base = f32_bits(math.exp(-math.sqrt(2.0) / max(scale, 1e-6)))
+        sweep_rows.dispatch_async([values, horizontal.storage], rows * cn, [rows, cols, cn, base])
+        sweep_cols.dispatch_async([values, vertical.storage], cols * cn, [rows, cols, cn, base])
     }
-    var out: list[float] = []
-    for value in values {
-        var rounded = math.floor(value + 0.5)
-        if rounded < 0.0 { rounded = 0.0 }
-        if rounded > 255.0 { rounded = 255.0 }
-        out.push(rounded)
-    }
-    return Mat.from_list(rows, cols, src.type_(), out)
+    kernel_for("photo_round_byte").dispatch_async(
+        [values, out.storage],
+        count,
+        [count, out.offset, out.step_, cols * cn]
+    )
+    out.invalidate()
+    values.free()
+    return out
 }
 
 #: Sharpen the fine detail of a photograph without amplifying its noise.
 pub fn detail_enhance(src: Mat, sigma_s: float = 10.0, sigma_r: float = 0.15) -> Mat {
     let smoothed = edge_preserving_filter(src, sigma_s, sigma_r)
-    let original = src.values()
-    let base = smoothed.values()
-    var out: list[float] = []
-    for index in 0..original.len() {
-        #: What the smoother removed is the detail; putting more of it back
-        #: than was taken is what enhancing means here.
-        let detail = original[index] - base[index]
-        var value = base[index] + detail * 3.0
-        if value < 0.0 { value = 0.0 }
-        if value > 255.0 { value = 255.0 }
-        out.push(math.floor(value + 0.5))
-    }
-    return Mat.from_list(src.rows, src.cols, src.type_(), out)
+    src.flush()
+    smoothed.flush()
+    let width = src.cols * src.channels()
+    let count = src.rows * width
+    let out = Mat.zeros(src.rows, src.cols, src.type_())
+    if count == 0 { return out }
+    #: Putting back more of the detail than was taken is what enhancing means
+    #: here.
+    kernel_for("photo_detail").dispatch_async(
+        [src.storage, smoothed.storage, out.storage],
+        count,
+        [
+            count,
+            width,
+            src.offset,
+            src.step_,
+            smoothed.offset,
+            smoothed.step_,
+            out.offset,
+            out.step_,
+            f32_bits(3.0),
+        ]
+    )
+    out.invalidate()
+    return out
 }
 
 #: Flatten a photograph into something that looks drawn.
