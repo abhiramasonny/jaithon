@@ -2360,6 +2360,16 @@ fn test_eye_flip_upsample_and_split_heads() -> void {
     defer { up.free() }
     assert_eq(up.shape, [1, 2, 4, 1])
     assert_eq(up.download(), [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0])
+    #: A channel count that divides by four takes the widened kernel, which
+    #: moves a float4 a thread and works out its position once for the group
+    #: rather than once a channel. The row above keeps the narrow one covered.
+    let wide_in = jt.Tensor([1, 1, 2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    defer { wide_in.free() }
+    let wide_up = jt.upsample_nearest2d(wide_in, 2)
+    defer { wide_up.free() }
+    assert_eq(wide_up.shape, [1, 2, 4, 4])
+    let one_row = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]
+    assert_eq(wide_up.download(), one_row + one_row)
     let packed_in = jt.Tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
     defer { packed_in.free() }
     let split = jt.split_heads(packed_in, 2)
