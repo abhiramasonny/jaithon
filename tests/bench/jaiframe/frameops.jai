@@ -85,7 +85,11 @@ fn main() -> int {
     }
     let frame = DataFrame(
         ["key", "value", "other"],
-        [Column.from_floats(keys), Column.from_floats(values), Column.from_floats(other)]
+        [
+            Column.from_floats(keys),
+            Column.from_floats(values),
+            Column.from_floats(other),
+        ]
     )
 
     #: A small right-hand frame, which is the shape a lookup join has.
