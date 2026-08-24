@@ -99,6 +99,8 @@ def main() -> int:
     run("add-broadcast", pair_bytes, lambda: wide + row)
     run("multiply", pair_bytes, lambda: wide * other)
     run("exp", unary_bytes, lambda: np.exp(wide))
+    # A row against every row of a matrix; see the note in arrayops.jai.
+    run("maximum-broadcast", pair_bytes, lambda: np.maximum(wide, row))
     run("sum-axis0", reduce_bytes, lambda: wide.sum(axis=0))
     run("sum-axis1", reduce_bytes, lambda: wide.sum(axis=1))
     run("argmax-axis1", reduce_bytes, lambda: wide.argmax(axis=1))
@@ -106,7 +108,10 @@ def main() -> int:
     run("cumsum-axis1", unary_bytes, lambda: np.cumsum(wide, axis=1))
     run("sort-axis1", sort_bytes, lambda: np.sort(tall, axis=1))
     run("take-rows", side * 512 * 2 * WIDTH, lambda: np.take(table, picks, axis=0))
-    run("where", pair_bytes, lambda: np.where(wide > other, wide, other))
+    # Timed apart; see the note in arrayops.jai.
+    mask = wide > other
+    run("greater", pair_bytes, lambda: wide > other)
+    run("where", pair_bytes + reduce_bytes, lambda: np.where(mask, wide, other))
     return 0
 
 

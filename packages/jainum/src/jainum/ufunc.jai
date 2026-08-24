@@ -476,12 +476,27 @@ inline float4 nf_invert(float4 a) { return float4(~int4(rint(a))); }
  * standing in for all of them -- a scalar the host wrapped, or a size-one
  * array broadcasting. `step` is 1 or 0 and is uniform across the dispatch, so
  * the branch is free and the pointer cast only happens on the arm taken. */
+/* `step` names one of three layouts rather than a stride: 0 is one value
+ * broadcast over everything, 1 is dense, and anything larger is an operand
+ * that REPEATS every `step` elements -- a row added to every row of a matrix,
+ * which is what a bias and a normalisation both are. That case used to miss
+ * the dense path entirely and go through the strided walk one element at a
+ * time; [4096, 4096] + [4096] cost 63.5 ms against 16.7 for the same bytes
+ * with both operands full size.
+ *
+ * The wrap is `at - (at / step) * step`, one divide per four elements rather
+ * than the walk's per-element index arithmetic. The host only names a wrap
+ * whose length divides by four, so a float4 load can never straddle the seam
+ * and stays sixteen-byte aligned. */
 inline float4 nf_load4(device const float* p, uint at, uint step) {
     if (step == 0u) return float4(p[0]);
-    return *((device const float4*)(p + at));
+    if (step == 1u) return *((device const float4*)(p + at));
+    return *((device const float4*)(p + at - (at / step) * step));
 }
 inline float nf_load1(device const float* p, uint at, uint step) {
-    return step == 0u ? p[0] : p[at];
+    if (step == 0u) return p[0];
+    if (step == 1u) return p[at];
+    return p[at - (at / step) * step];
 }
 
 /* Every operand's float slot for element `linear`, in one walk.
@@ -866,12 +881,29 @@ fn _operand(value: any) -> (NDArray, bool) {
 
 #: How the fast path would read this operand: 1 for one element per thread, 0
 #: for one element for all of them, -1 when it cannot be read that way at all.
+#: Whether `sub` is exactly the trailing axes of `shape`.
+#:
+#: Exactly: no size-one axis standing in for a longer one. That is what makes
+#: element `i` of the broadcast result element `i % size` of the operand, which
+#: is the whole basis of the wrap below.
+fn _is_trailing(sub: list[int], shape: list[int]) -> bool {
+    if sub.len() == 0 or sub.len() >= shape.len() { return false }
+    let lead = shape.len() - sub.len()
+    for axis in 0..sub.len() {
+        if sub[axis] != shape[lead + axis] { return false }
+    }
+    return true
+}
+
+#: 0 for one value over everything, 1 for dense, `n` for an operand that
+#: repeats every `n`. See `nf_load4` for what the kernel does with it.
 fn _dense_step(a: NDArray, shape: list[int]) -> int {
     if a.offset != 0 { return -1 }
     if a.size() == 1 { return 0 }
-    if a.shape != shape { return -1 }
     if not a.is_contiguous() { return -1 }
-    return 1
+    if a.shape == shape { return 1 }
+    if a.size() % 4 == 0 and _is_trailing(a.shape, shape) { return a.size() }
+    return -1
 }
 
 fn _unary(a: NDArray, entry: str, p0: float = 0.0, p1: float = 0.0, p2: float = 0.0) -> NDArray {

@@ -127,6 +127,9 @@ fn main() -> int {
     run("add-broadcast", pair_bytes, || nb.add(wide, row))
     run("multiply", pair_bytes, || nb.multiply(wide, other))
     run("exp", unary_bytes, || nb.exp(wide))
+    #: A row against every row of a matrix -- a bias, a normalisation -- which
+    #: takes a different path from the full-size pair above it.
+    run("maximum-broadcast", pair_bytes, || nb.maximum(wide, row))
     run("sum-axis0", reduce_bytes, || nb.sum(wide, axis: 0))
     run("sum-axis1", reduce_bytes, || nb.sum(wide, axis: 1))
     run("argmax-axis1", reduce_bytes, || nb.argmax(wide, axis: 1))
@@ -134,8 +137,13 @@ fn main() -> int {
     run("cumsum-axis1", unary_bytes, || nb.cumsum(wide, axis: 1))
     run("sort-axis1", sort_bytes, || nb.sort(tall, axis: 1))
     run("take-rows", side * 512 * 2 * WIDTH, || nb.take(table, picks, axis: 0))
-    run("where", pair_bytes, || nb.where(nb.greater(wide, other), wide, other))
+    #: Timed apart, because one row that runs two operations reports the bytes
+    #: of one and reads as a loss that is not there.
+    let mask = nb.greater(wide, other)
+    run("greater", pair_bytes, || nb.greater(wide, other))
+    run("where", pair_bytes + reduce_bytes, || nb.where(mask, wide, other))
 
+    mask.free()
     for held in [wide, other, row, left, right, stack_a, stack_b, table, picks, tall] {
         held.free()
     }
