@@ -45,7 +45,7 @@ from std.gpu import Buffer
 from .array import BOOL, INT32, ELLIPSIS, IndexToken, NDArray, PRELUDE, Slice
 from .array import OP_ADD, OP_MUL, binary_arith, broadcast_shapes, broadcast_strides
 from .array import contiguous_strides, copy_into, diagonal_view, dtype_is_bool
-from .array import element_count, exclusive_scan, fill, kernel_of, layout_buffer
+from .array import GROUP, element_count, exclusive_scan, fill, kernel_of, layout_buffer
 from .array import normalize_axis, promote, require_real, scatter_flat
 from .ufunc import clip, greater, maximum, negative, remainder, subtract, where
 from .reduce import amax, amin, cumsum
@@ -139,6 +139,35 @@ inline void ix_walk2(device const float* meta,
  *
  * The destination is always a fresh contiguous allocation, so its slot is the
  * linear index times the lane count and it needs no layout of its own. */
+/* The furthest an index array reaches, counting a negative index from the end,
+ * in one pass over one threadgroup.
+ *
+ * The bounds check this replaced was four dispatches and three temporaries --
+ * negate, subtract, maximum, reduce -- and then a download. Over a [4096]
+ * index array against a [50000, 512] table it cost 0.52 ms where the gather
+ * it guards costs 0.085: `take` was seven parts checking to one part working.
+ * The download is still here, and is now most of what is left. */
+kernel void ix_reach(device float* out [[buffer(0)]],
+                     device const float* index [[buffer(1)]],
+                     constant uint& count [[buffer(2)]],
+                     uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float parts[ND_GROUP];
+    float best = -1.0f;
+    for (uint at = lid; at < count; at += ND_GROUP) {
+        float key = index[at];
+        best = max(best, key < 0.0f ? (-key - 1.0f) : key);
+    }
+    parts[lid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    /* `half` is a type name in Metal, so the fold counter cannot be called
+     * the obvious thing. */
+    for (uint span = ND_GROUP / 2u; span > 0u; span >>= 1u) {
+        if (lid < span) parts[lid] = max(parts[lid], parts[lid + span]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) out[0] = parts[0];
+}
+
 kernel void ix_gather_axis(device float* dst [[buffer(0)]],
                            device const float* src [[buffer(1)]],
                            device const float* index [[buffer(2)]],
@@ -380,16 +409,36 @@ fn _as_axis(axis: any, name: str = "axis") -> int {
 fn _require_in_range(keys: NDArray, limit: int, what: str) -> void {
     require_real(keys, "an index array")
     if keys.size() == 0 { return }
+    let seen = _reach_of(keys)
+    if seen >= limit {
+        throw IndexError(f"an index reaching {seen} is out of bounds for {what} of {limit}")
+    }
+}
+
+#: How far `keys` reaches, in one dispatch when it is dense.
+#:
+#: A view with an offset or a stride is left to the composed path: `ix_reach`
+#: reads the buffer flat, and teaching it to walk would put back most of what
+#: the single pass is here to save.
+fn _reach_of(keys: NDArray) -> int {
+    if keys.offset == 0 and keys.is_contiguous() {
+        let found = Buffer(1)
+        defer { found.free() }
+        kernel_of(SOURCE, "ix_reach").dispatch_async(
+            [found, keys.storage],
+            GROUP,
+            [keys.size()],
+            GROUP
+        )
+        return int(found.download()[0])
+    }
     let mirrored = subtract(negative(keys), 1)
     defer { mirrored.free() }
     let reach = maximum(keys, mirrored)
     defer { reach.free() }
     let worst = amax(reach)
     defer { worst.free() }
-    let seen = int(worst.item())
-    if seen >= limit {
-        throw IndexError(f"an index reaching {seen} is out of bounds for {what} of {limit}")
-    }
+    return int(worst.item())
 }
 
 #: The one gather every selection here dispatches.
