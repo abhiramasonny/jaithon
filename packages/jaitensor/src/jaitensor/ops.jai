@@ -3682,6 +3682,45 @@ fn raw_matmul(
     return output
 }
 
+#: `batch` matmuls of one shape, stacked along the leading axis, in one dispatch.
+#:
+#: `a`, `b` and `out` each hold `batch` matrices back to back; the two operand
+#: strides are given because an operand may be shared across the batch, which a
+#: stride of zero says. `out` is always `batch` matrices of `rows * columns`.
+fn raw_matmul_batched(
+    a: Tensor,
+    b: Tensor,
+    out: Tensor,
+    batch: int,
+    rows: int,
+    inner: int,
+    columns: int,
+    stride_a: int,
+    stride_b: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> void {
+    if out.shape != [batch * rows, columns] {
+        throw ValueError(
+            f"batched matmul out shape {out.shape} does not match [{batch * rows}, {columns}]"
+        )
+    }
+    gemm.dispatch_batched(
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        out.buffer(),
+        rows,
+        inner,
+        columns,
+        batch,
+        stride_a,
+        stride_b,
+        trans_a: trans_a,
+        trans_b: trans_b
+    )
+}
+
 fn raw_transpose(input: Tensor) -> Tensor {
     let rows = input.shape[0]
     let columns = input.shape[1]
@@ -5757,15 +5796,7 @@ fn mha_by_ops(
     let ks = split_heads(key, heads)
     let vs = split_heads(value, heads)
     let probs = Tensor([heads * seq, seq])
-    for h in 0..heads {
-        let qh = qs.view(h * seq * hd, [seq, hd])
-        let kh = ks.view(h * seq * hd, [seq, hd])
-        let sh = probs.view(h * seq * seq, [seq, seq])
-        raw_matmul(qh, kh, trans_b: true, out: sh)
-        qh.free()
-        kh.free()
-        sh.free()
-    }
+    raw_matmul_batched(qs, ks, probs, heads, seq, hd, seq, seq * hd, seq * hd, trans_b: true)
     cached_attn_kernel("mha_softmax_scaled").dispatch_async(
         [probs.buffer()],
         heads * seq * 256,
@@ -5773,15 +5804,7 @@ fn mha_by_ops(
         group_size: 256
     )
     let context = Tensor([heads * seq, hd])
-    for h in 0..heads {
-        let ph = probs.view(h * seq * seq, [seq, seq])
-        let vh = vs.view(h * seq * hd, [seq, hd])
-        let oh = context.view(h * seq * hd, [seq, hd])
-        raw_matmul(ph, vh, out: oh)
-        ph.free()
-        vh.free()
-        oh.free()
-    }
+    raw_matmul_batched(probs, vs, context, heads, seq, seq, hd, seq * seq, seq * hd)
     if qs.requires_grad or ks.requires_grad or vs.requires_grad {
         context.attach_creator(GradNode([qs, ks, vs], fn(upstream: Tensor) -> list[Tensor] {
             return mha_grads(upstream, qs, ks, vs, probs, heads, seq, hd, factor)
@@ -5813,40 +5836,49 @@ fn mha_grads(
     let grad_k = Tensor([heads * seq, hd])
     let grad_v = Tensor([heads * seq, hd])
     let grad_probs = Tensor([heads * seq, seq])
-    for h in 0..heads {
-        let ph = probs.view(h * seq * seq, [seq, seq])
-        let uh = upstream.view(h * seq * hd, [seq, hd])
-        let vh = vs.view(h * seq * hd, [seq, hd])
-        let gp = grad_probs.view(h * seq * seq, [seq, seq])
-        let gv = grad_v.view(h * seq * hd, [seq, hd])
-        raw_matmul(uh, vh, trans_b: true, out: gp)
-        raw_matmul(ph, uh, trans_a: true, out: gv)
-        ph.free()
-        uh.free()
-        vh.free()
-        gp.free()
-        gv.free()
-    }
+    raw_matmul_batched(
+        upstream,
+        vs,
+        grad_probs,
+        heads,
+        seq,
+        hd,
+        seq,
+        seq * hd,
+        seq * hd,
+        trans_b: true
+    )
+    raw_matmul_batched(
+        probs,
+        upstream,
+        grad_v,
+        heads,
+        seq,
+        seq,
+        hd,
+        seq * seq,
+        seq * hd,
+        trans_a: true
+    )
     cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
         [probs.buffer(), grad_probs.buffer()],
         heads * seq * 256,
         [heads * seq, seq, f32_bits(factor)],
         group_size: 256
     )
-    for h in 0..heads {
-        let gs = grad_probs.view(h * seq * seq, [seq, seq])
-        let qh = qs.view(h * seq * hd, [seq, hd])
-        let kh = ks.view(h * seq * hd, [seq, hd])
-        let gq = grad_q.view(h * seq * hd, [seq, hd])
-        let gk = grad_k.view(h * seq * hd, [seq, hd])
-        raw_matmul(gs, kh, out: gq)
-        raw_matmul(gs, qh, trans_a: true, out: gk)
-        gs.free()
-        qh.free()
-        kh.free()
-        gq.free()
-        gk.free()
-    }
+    raw_matmul_batched(grad_probs, ks, grad_q, heads, seq, seq, hd, seq * seq, seq * hd)
+    raw_matmul_batched(
+        grad_probs,
+        qs,
+        grad_k,
+        heads,
+        seq,
+        seq,
+        hd,
+        seq * seq,
+        seq * hd,
+        trans_a: true
+    )
     grad_probs.free()
     return [grad_q, grad_k, grad_v]
 }

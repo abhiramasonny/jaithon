@@ -28,6 +28,9 @@ kernel void NAME(device const float* a [[buffer(0)]],
                  constant uint& trans_b [[buffer(8)]],
                  constant uint& epilogue [[buffer(9)]],
                  constant uint& splits [[buffer(10)]],
+                 constant uint& stride_a [[buffer(11)]],
+                 constant uint& stride_b [[buffer(12)]],
+                 constant uint& stride_out [[buffer(13)]],
                  uint lid [[thread_index_in_threadgroup]],
                  uint wid [[threadgroup_position_in_grid]],
                  uint sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -53,8 +56,14 @@ kernel void NAME(device const float* a [[buffer(0)]],
     const uint groups_x = (columns + BN - 1u) / BN;
     const uint groups_y = (rows + BM - 1u) / BM;
     const uint tiles = groups_x * groups_y;
-    const uint slice = wid / tiles;
-    const uint tile = wid % tiles;
+    const uint per_item = tiles * splits;
+    const uint item = wid / per_item;
+    const uint local = wid - item * per_item;
+    const uint slice = local / tiles;
+    const uint tile = local - slice * tiles;
+    a += item * stride_a;
+    b += item * stride_b;
+    output += item * stride_out;
     const uint tile_row = (tile / groups_x) * BM;
     const uint tile_col = (tile % groups_x) * BN;
     const uint sg_m = sgitg / WN;
@@ -233,6 +242,9 @@ kernel void NAME(device const float* a [[buffer(0)]],
                  constant uint& trans_b [[buffer(8)]],
                  constant uint& epilogue [[buffer(9)]],
                  constant uint& splits [[buffer(10)]],
+                 constant uint& stride_a [[buffer(11)]],
+                 constant uint& stride_b [[buffer(12)]],
+                 constant uint& stride_out [[buffer(13)]],
                  uint lid [[thread_index_in_threadgroup]],
                  uint wid [[threadgroup_position_in_grid]],
                  uint sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -248,8 +260,14 @@ kernel void NAME(device const float* a [[buffer(0)]],
 
     const uint groups_x = columns / BN;
     const uint tiles = groups_x * (rows / BM);
-    const uint slice = wid / tiles;
-    const uint tile = wid % tiles;
+    const uint per_item = tiles * splits;
+    const uint item = wid / per_item;
+    const uint local = wid - item * per_item;
+    const uint slice = local / tiles;
+    const uint tile = local - slice * tiles;
+    a += item * stride_a;
+    b += item * stride_b;
+    output += item * stride_out;
     const uint sg_m = sgitg / WN;
     const uint sg_n = sgitg % WN;
     const uint row0 = (tile / groups_x) * BM + sg_m * TM * 8u;
@@ -311,12 +329,15 @@ kernel void split_reduce(device const float* partials [[buffer(0)]],
                          constant uint& columns [[buffer(4)]],
                          constant uint& splits [[buffer(5)]],
                          constant uint& epilogue [[buffer(6)]],
+                         constant uint& batch [[buffer(7)]],
                          uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
+    if (id >= count * batch) return;
+    const uint item = id / count;
+    const uint local = id - item * count;
     float total = 0.0f;
-    for (uint s = 0; s < splits; ++s) total += partials[s * count + id];
-    if (epilogue == 6u) total += bias[id];
-    else if (epilogue != 0u) total += bias[id % columns];
+    for (uint s = 0; s < splits; ++s) total += partials[(item * splits + s) * count + local];
+    if (epilogue == 6u) total += bias[local];
+    else if (epilogue != 0u) total += bias[local % columns];
     if (epilogue == 2u) total = max(total, 0.0f);
     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
     else if (epilogue == 4u) total = tanh(total);
@@ -718,27 +739,45 @@ fn encode(
     columns: int,
     trans_a: bool,
     trans_b: bool,
-    epilogue: int
+    epilogue: int,
+    batch: int = 1,
+    stride_a: int = 0,
+    stride_b: int = 0,
+    stride_out: int = 0
 ) -> void {
     if plan.config < 0 {
-        gpu.matmul_async(
-            a,
-            b,
-            output,
-            rows,
-            inner,
-            columns,
-            trans_a: trans_a,
-            trans_b: trans_b,
-            half: plan.config == -2
-        )
-        if epilogue != 0 {
-            let kernel = kernel_for(element_type(), "split_reduce")
-            kernel.dispatch_async(
-                [output, output, bias],
-                rows * columns,
-                [rows * columns, columns, 1, epilogue]
+        for item in 0..batch {
+            let a_part = if item == 0 { a } else { a.view(item * stride_a, stride_a) }
+            let b_part = if item == 0 { b } else { b.view(item * stride_b, stride_b) }
+            let out_part = if item == 0 {
+                output
+            } else {
+                output.view(item * stride_out, stride_out)
+            }
+            gpu.matmul_async(
+                a_part,
+                b_part,
+                out_part,
+                rows,
+                inner,
+                columns,
+                trans_a: trans_a,
+                trans_b: trans_b,
+                half: plan.config == -2
             )
+            if epilogue != 0 {
+                let kernel = kernel_for(element_type(), "split_reduce")
+                kernel.dispatch_async(
+                    [out_part, out_part, bias],
+                    rows * columns,
+                    [rows * columns, columns, 1, epilogue, 1]
+                )
+            }
+            if item != 0 {
+                a_part.free()
+                b_part.free()
+                out_part.free()
+            }
         }
         return
     }
@@ -748,28 +787,29 @@ fn encode(
     let a_flag = if trans_a { 1 } else { 0 }
     let b_flag = if trans_b { 1 } else { 0 }
     let width = config.group_size()
-    let groups = tile_count(config, rows, columns) * plan.splits
+    let groups = tile_count(config, rows, columns) * plan.splits * batch
     if plan.splits == 1 {
         kernel.dispatch_async(
             [a, b, output, bias],
             groups * width,
-            [rows, inner, columns, a_flag, b_flag, epilogue, 1],
+            [rows, inner, columns, a_flag, b_flag, epilogue, 1, stride_a, stride_b, stride_out],
             group_size: width
         )
         return
     }
-    let partials = scratch_for(rows * columns * plan.splits)
+    let per_item = rows * columns * plan.splits
+    let partials = scratch_for(per_item * batch)
     kernel.dispatch_async(
         [a, b, partials, bias],
         groups * width,
-        [rows, inner, columns, a_flag, b_flag, epilogue, plan.splits],
+        [rows, inner, columns, a_flag, b_flag, epilogue, plan.splits, stride_a, stride_b, per_item],
         group_size: width
     )
     let reduce = kernel_for(element, "split_reduce")
     reduce.dispatch_async(
         [partials, output, bias],
-        rows * columns,
-        [rows * columns, columns, plan.splits, epilogue]
+        rows * columns * batch,
+        [rows * columns, columns, plan.splits, epilogue, batch]
     )
 }
 
@@ -1124,6 +1164,101 @@ pub fn dispatch(
     if rows <= 0 or columns <= 0 { return }
     let plan = plan_for(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
     encode(plan, a, b, output, bias, rows, inner, columns, trans_a, trans_b, epilogue)
+}
+
+#: Split a batch no finer than the tuner split one matrix.
+#:
+#: Splits exist to fill an M2 Max when one matrix has too few tiles to do it,
+#: and each one past the first buys that parallelism with a slice of a partial
+#: buffer and a pass to sum it. A batch supplies the same parallelism already,
+#: so carrying the tuned count into a batch multiplies the partials by the batch
+#: for no more occupancy: attention at seq 1024 tuned to sixteen splits, and
+#: twelve heads of that is a fifty-megabyte scratch buffer read twice.
+#:
+#: Dropping straight to one split is worse still -- 1.90 ms against 0.97 for the
+#: same forward pass -- because the tuner picked sixteen having measured that
+#: sixteen tiles do not fill the device. What the tuner established is a group
+#: COUNT that works; the batch should reach the same count and stop. Sixteen
+#: splits over twelve heads becomes two, for 384 groups and 6 MB of partials.
+fn batched_splits(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    tuned: int,
+    batch: int
+) -> int {
+    var chosen = 1
+    while chosen < tuned and chosen * batch < tuned {
+        if not split_allowed(config, rows, inner, columns, chosen * 2) { break }
+        chosen = chosen * 2
+    }
+    return chosen
+}
+
+#: Multiply `batch` pairs of equally shaped matrices in one dispatch.
+#:
+#: Every matrix in the batch has the same shape and the same transposes, so the
+#: tile a threadgroup owns and which matrix it belongs to come out of one
+#: threadgroup index and the operands out of one buffer each, `stride_a`,
+#: `stride_b` and `stride_out` elements apart. What this saves is the dispatch,
+#: and at attention's shapes that is most of the cost: twelve heads times four
+#: products times a split reduction was eighty-five dispatches for six
+#: gigaflops of work, which the device finishes in under a millisecond.
+#:
+#: The output must be contiguous — `stride_out` is only honoured by the single
+#: dispatch, while the split reduction assumes matrices `rows * columns` apart.
+#: `epilogue` is not supported here: a bias would have to say whether it is
+#: shared across the batch or one per matrix, and no caller needs either yet.
+pub fn dispatch_batched(
+    a: Buffer,
+    b: Buffer,
+    output: Buffer,
+    bias: Buffer,
+    rows: int,
+    inner: int,
+    columns: int,
+    batch: int,
+    stride_a: int,
+    stride_b: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> void {
+    if rows <= 0 or columns <= 0 or batch <= 0 { return }
+    if batch == 1 {
+        dispatch(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+        return
+    }
+    let tuned = plan_for(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+    var plan = tuned
+    if tuned.config >= 0 and tuned.splits > 1 {
+        let splits = batched_splits(
+            CONFIGS[tuned.config],
+            rows,
+            inner,
+            columns,
+            tuned.splits,
+            batch
+        )
+        if splits != tuned.splits { plan = Plan(tuned.backend, tuned.config, splits) }
+    }
+    encode(
+        plan,
+        a,
+        b,
+        output,
+        bias,
+        rows,
+        inner,
+        columns,
+        trans_a,
+        trans_b,
+        0,
+        batch: batch,
+        stride_a: stride_a,
+        stride_b: stride_b,
+        stride_out: rows * columns
+    )
 }
 
 #: Compile every tile configuration so a first timed step pays no compiler cost.
