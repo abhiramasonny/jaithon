@@ -355,7 +355,7 @@ inline float dt_reach(device const float* dist, int rows, int cols,
 
 kernel void dt_relax(device const float* dist [[buffer(0)]],
                      device float* next [[buffer(1)]],
-                     device atomic_uint* changed [[buffer(2)]],
+                     device float* changed [[buffer(2)]],
                      constant uint& count [[buffer(3)]],
                      constant uint& rows [[buffer(4)]],
                      constant uint& cols [[buffer(5)]],
@@ -363,6 +363,7 @@ kernel void dt_relax(device const float* dist [[buffer(0)]],
                      constant uint& diagonal_bits [[buffer(7)]],
                      constant uint& knight_bits [[buffer(8)]],
                      constant uint& wide [[buffer(9)]],
+                     constant uint& round [[buffer(10)]],
                      uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     float here = dist[id];
@@ -402,7 +403,7 @@ kernel void dt_relax(device const float* dist [[buffer(0)]],
         best = dt_reach(dist, high, side, y + 1, x + 2, knight, best);
     }
     next[id] = best;
-    if (best < here) atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    if (best < here) changed[0] = float(round);
 }
 
 kernel void dt_write(device const float* dist [[buffer(0)]],
@@ -819,22 +820,25 @@ pub fn distance_transform(
         wide,
     ]
     #: Reading the flag every round would cost more than the rounds do, so a
-    #: batch of them goes down together and only then is the queue asked
-    #: whether anything moved.
+    #: batch of them goes down together and only then is the queue asked how
+    #: far they got. Each round stamps its own number, so a batch whose last
+    #: round was quiet is done -- asking only whether *any* round in the
+    #: batch moved would run a whole batch more for nothing.
     var rounds = 0
     let limit = rows + cols + 4
     while rounds < limit {
         changed.fill_zero()
+        var fired = 0
         for _batch in 0..DT_BATCH {
             if rounds >= limit { break }
             rounds += 1
-            relax_kernel.dispatch_async([dist, next, changed], count, settings)
+            fired += 1
+            relax_kernel.dispatch_async([dist, next, changed], count, settings + [fired])
             let swap = dist
             dist = next
             next = swap
         }
-        kernel_for("cc_tally").dispatch_async([changed, counted], 1, [1])
-        if counted.download()[0] == 0.0 { break }
+        if changed.download()[0] < float(fired) { break }
     }
 
     kernel_for("dt_write").dispatch_async(

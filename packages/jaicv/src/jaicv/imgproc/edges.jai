@@ -15,6 +15,10 @@ from ..core.types import BORDER_REPLICATE, CV_8U, CV_32F, CV_MAKETYPE
 from .common import PRELUDE, saturation_args
 from .filter import sobel
 
+#: Rounds fired before the host asks how far they got.
+const CANNY_BATCH = 3
+const CANNY_BATCH_MAX = 64
+
 let SOURCE = PRELUDE + """
 kernel void canny_suppress(device const float* dx [[buffer(0)]],
                            device const float* dy [[buffer(1)]],
@@ -104,11 +108,17 @@ kernel void canny_seed(device const float* labels [[buffer(0)]],
 }
 
 /* A pixel that can see a lower-numbered run tells its own run's root. */
+/* Which round last had news, not whether any did. Rounds run in order, so a
+ * batch of them can go down together and one read says where they settled --
+ * one wait for the batch instead of one a round, and a wait costs about what
+ * a round does. Every thread with news in a round stores the same value, so
+ * the store needs no atomic. */
 kernel void canny_join(device atomic_uint* runs [[buffer(0)]],
-                       device atomic_uint* changed [[buffer(1)]],
+                       device float* changed [[buffer(1)]],
                        constant uint& count [[buffer(2)]],
                        constant uint& rows [[buffer(3)]],
                        constant uint& cols [[buffer(4)]],
+                       constant uint& round [[buffer(5)]],
                        uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint mine = atomic_load_explicit(&runs[id], memory_order_relaxed);
@@ -129,7 +139,7 @@ kernel void canny_join(device atomic_uint* runs [[buffer(0)]],
     }
     if (best >= mine) return;
     atomic_fetch_min_explicit(&runs[mine - 1u], best, memory_order_relaxed);
-    atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    changed[0] = float(round);
 }
 
 /* Every chain pointed straight at its end. */
@@ -253,14 +263,20 @@ pub fn canny(
     let counted = Buffer(1)
     let join = kernel_for("canny_join")
     let flatten = kernel_for("canny_flatten")
+    #: A round with no news is the proof that the rounds before it settled,
+    #: so a batch whose last round was quiet is done -- and the batch widens
+    #: for a frame whose runs are long enough to need more of them.
     var rounds = 0
+    var batch = CANNY_BATCH
     while rounds < count {
-        rounds += 1
         changed.fill_zero()
-        join.dispatch_async([runs, changed], count, [count, src.rows, src.cols])
-        flatten.dispatch_async([runs], count, [count])
-        kernel_for("canny_tally").dispatch_async([changed, counted], 1, [1])
-        if counted.download()[0] == 0.0 { break }
+        for step in 0..batch {
+            join.dispatch_async([runs, changed], count, [count, src.rows, src.cols, step + 1])
+            flatten.dispatch_async([runs], count, [count])
+        }
+        rounds += batch
+        if changed.download()[0] < float(batch) { break }
+        batch = min(batch * 2, CANNY_BATCH_MAX)
     }
 
     let strong = Buffer(count)
