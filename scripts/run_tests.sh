@@ -178,15 +178,16 @@ unit_args+=(
     "$ROOT/packages/jaiplot/tests"
     "$ROOT/packages/jaitensor/tests"
     "$ROOT/packages/jainum/tests"
-    # jaiframe is not in this list yet, and the omission is deliberate. Its
-    # column store, index, access, keys
-    # and construction modules pass (209 of 281), but arith, groupby and reduce
-    # do not: `test_arith` fails 12, `test_groupby` 15 and `test_reduce` 4,
-    # all of them disagreements with pandas about nulls, three-valued logic and
-    # what a group key does with a missing value. Running it here would make
-    # `make test` red for a package nobody has finished rather than for a
-    # regression, which is the failure mode that gets a gate ignored. Put it
-    # back the moment those three files pass.
+    # jaiframe sat out of this list for a while on the reading that its arith,
+    # groupby and reduce modules disagreed with pandas about nulls. They did
+    # not. All 72 failures were one defect in the tier: a bool returned by a
+    # function in another module was loaded eight bytes wide out of the call
+    # descriptor, and `BOOL_VAL` fills one. `Column.from_floats` asks
+    # `values.map(|v| is_nan(v))` which rows are missing, that came back
+    # all-true, and every column arrived fully null -- so the answers were
+    # `nan` and zero, which reads exactly like null semantics. See
+    # tests/lang/test_jit_bool_call_return.jai.
+    "$ROOT/packages/jaiframe/tests"
     "$ROOT/packages/jailearn/tests"
     "$ROOT/packages/jaisci/tests"
 )

@@ -3833,6 +3833,14 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
      * for the entry and a deopt materialises it, so it gets a defined zero
      * rather than whatever the descriptor happened to leave behind. */
     if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
+    /* A byte, not a word: BOOL_VAL writes the union's `bool` member and leaves
+     * the other seven bytes of the payload indeterminate, so a 64-bit load
+     * brings back whatever the slot held before. The register stands for a
+     * bool from here on and everything downstream tests it against zero, so
+     * those bytes read as true -- `values.map(|v| is_nan(v))` came back all
+     * true over a list with no NaN in it. Every other descriptor return site
+     * already splits the two; this one did not. */
+    else if (rk == SLOT_BOOL) emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
     else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
     if (rk == SLOT_INST) {
         /* The tag says "an object", which is not "an instance of this class",
