@@ -193,7 +193,11 @@ print_header
 shopt -s nullglob
 for src in "$ROOT"/tests/bench/*/*.jai; do
     dir="$(basename "$(dirname "$src")")"
-    [[ "$dir" == "jaitensor" ]] && continue
+    # The GPU suites answer to their own runners and their own peers, and
+    # neither prints the one-number-per-run output this table reads. jaicv was
+    # not excluded here, so every language bench run also ran the whole image
+    # suite -- five seconds of GPU work reported as a permanent MISMATCH.
+    [[ "$dir" == "jaitensor" || "$dir" == "jaicv" ]] && continue
     name="$(basename "$src" .jai)"
     py="${src%.jai}.py"
 
