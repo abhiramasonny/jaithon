@@ -429,6 +429,10 @@ let TUNE_WARMUP = 40
 let TUNE_WARM_SECONDS = 0.05
 let TUNE_WARM_STRIDE = 8
 
+#: Turns the two fastest candidates take against each other before the answer
+#: is written down.
+let TUNE_RUNOFF = 2
+
 fn instantiate(config: Config, element: str) -> str {
     let template = if config.staged { TEMPLATE } else { DIRECT_TEMPLATE }
     var text = template.replace("NAME", config.entry)
@@ -946,17 +950,46 @@ fn autotune(
             runner_seconds = seconds
         }
     }
-    #: Run the two fastest off against each other again before writing the
-    #: answer down. A plan is measured once and then believed for as long as
-    #: the epoch stands, so a single unlucky reading is not a slow run -- it
-    #: is a slow machine until someone notices. Two more measurements out of
-    #: forty is cheap next to that.
+    #: Run the two fastest off against each other again, turn about, before
+    #: writing the answer down.
+    #:
+    #: A plan is measured once and then believed for as long as the epoch
+    #: stands, so a single unlucky reading is not a slow run -- it is a slow
+    #: machine until someone notices. Two candidates twenty per cent apart is
+    #: within what this device drifts by over the length of a tuning pass, and
+    #: measuring one after the other hands the drift to whichever went first:
+    #: a run-off in a fixed order picked the slower route for 4096x784x8192
+    #: even though the pass that led to it had them the right way round.
+    #: Alternating cancels the drift, which is the same reason the benchmark
+    #: suite runs its two sides turn about.
     if measured and runner is not null {
-        let rerun = runner
+        let rival = runner
+        var best_seen = best_seconds
+        var rival_seen = runner_seconds
         try {
-            let again = measure(best, a, b, output, bias, rows, inner, columns, trans_a, trans_b)
-            let rival = measure(rerun, a, b, output, bias, rows, inner, columns, trans_a, trans_b)
-            if rival < again { best = rerun }
+            for pass in 0..TUNE_RUNOFF {
+                let leading = pass % 2 == 0
+                let first = if leading { best } else { rival }
+                let second = if leading { rival } else { best }
+                let one = measure(first, a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+                let two = measure(
+                    second,
+                    a,
+                    b,
+                    output,
+                    bias,
+                    rows,
+                    inner,
+                    columns,
+                    trans_a,
+                    trans_b
+                )
+                let for_best = if leading { one } else { two }
+                let for_rival = if leading { two } else { one }
+                if for_best < best_seen { best_seen = for_best }
+                if for_rival < rival_seen { rival_seen = for_rival }
+            }
+            if rival_seen < best_seen { best = rival }
         } catch _error: Error {
         }
     }
@@ -1007,7 +1040,44 @@ pub fn plan_for(
     }
     var plan = default_plan(rows, inner, columns)
     if autotune_enabled() and rows * inner * columns >= TUNE_MIN_WORK {
-        plan = autotune(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+        #: Timed on numbers of this module's own making, not on whatever the
+        #: caller happened to be multiplying.
+        #:
+        #: The answer is written down against the shape and believed from then
+        #: on, so it has to be a property of the shape. It was not: a first
+        #: matmul over a freshly allocated buffer multiplies whatever was in
+        #: that memory, and float32 bits taken at random are full of
+        #: denormals, infinities and NaNs. The half-precision route casts all
+        #: of that to zero and the float32 route does not, so on rubbish the
+        #: half route reads faster than it can ever run -- and the benchmark,
+        #: which sized its repeat count on uninitialised tensors, cached the
+        #: half route for two shapes where float32 is nearly twice as quick.
+        #:
+        #: `output` is left as the caller's: it already says here that it
+        #: holds nothing meaningful when this returns, and it is only written.
+        let sample_a = Buffer(rows * inner)
+        let sample_b = Buffer(inner * columns)
+        sample_a.fill_uniform(-1.0, 1.0, 0x5EED)
+        sample_b.fill_uniform(-1.0, 1.0, 0x5EED + 1)
+        try {
+            plan = autotune(
+                sample_a,
+                sample_b,
+                output,
+                bias,
+                rows,
+                inner,
+                columns,
+                trans_a,
+                trans_b
+            )
+        } catch error: Error {
+            sample_a.free()
+            sample_b.free()
+            throw error
+        }
+        sample_a.free()
+        sample_b.free()
         _cache_dirty = true
     }
     _cache[key] = plan
