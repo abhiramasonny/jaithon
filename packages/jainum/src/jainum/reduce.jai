@@ -710,15 +710,21 @@ fn _plan(a: NDArray, axes: list[int], allow_quad: bool, sort_inner: bool) -> _Pl
         flags = flags | 1
     } else {
         outer_step = outer_strides[outer_strides.len() - 1]
-        if is_contiguous(outer_shape, outer_strides, outer_step) { flags = flags | 1 }
-        else { outer_step = 0 }
+        if is_contiguous(outer_shape, outer_strides, outer_step) {
+            flags = flags | 1
+        } else {
+            outer_step = 0
+        }
     }
     if inner_shape.len() == 0 {
         flags = flags | 2
     } else {
         inner_step = inner_strides[inner_strides.len() - 1]
-        if is_contiguous(inner_shape, inner_strides, inner_step) { flags = flags | 2 }
-        else { inner_step = 0 }
+        if is_contiguous(inner_shape, inner_strides, inner_step) {
+            flags = flags | 2
+        } else {
+            inner_step = 0
+        }
     }
 
     let segments = element_count(outer_shape)
@@ -726,7 +732,7 @@ fn _plan(a: NDArray, axes: list[int], allow_quad: bool, sort_inner: bool) -> _Pl
     #: A float4 load needs the run to be unit-strided and every segment's first
     #: slot to be sixteen-byte aligned, which is a property of the offset and
     #: of the kept strides, both known here.
-    var quad = allow_quad and (flags & 2) != 0 and inner_step == 1 and n % 4 == 0
+    var quad = allow_quad and flags & 2 != 0 and inner_step == 1 and n % 4 == 0
     if quad {
         var aligned = a.offset % 4 == 0
         for stride in outer_strides { if stride % 4 != 0 { aligned = false } }
@@ -752,7 +758,7 @@ fn _plan(a: NDArray, axes: list[int], allow_quad: bool, sort_inner: bool) -> _Pl
         float(outer_shape.len()),
         float(inner_shape.len()),
         float(outer_step),
-        float(inner_step)
+        float(inner_step),
     ]
     for extent in outer_shape { values.push(float(extent)) }
     for stride in outer_strides { values.push(float(stride)) }
@@ -829,7 +835,7 @@ fn _fold_into(
             a.offset,
             plan.per,
             plan.chunks,
-            plan.width
+            plan.width,
         ],
         GROUP
     )
@@ -888,14 +894,20 @@ pub fn prod(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int = -
 #: Smallest value along `axis`. NaN propagates, as numpy's does; `nanmin`
 #: is the one that steps over it.
 pub fn amin(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int = -1) -> NDArray {
-    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 { dtype } else { a.dtype },
-        OP_MIN, 0, "min")
+    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 {
+        dtype
+    } else {
+        a.dtype
+    }, OP_MIN, 0, "min")
 }
 
 #: Largest value along `axis`.
 pub fn amax(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int = -1) -> NDArray {
-    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 { dtype } else { a.dtype },
-        OP_MAX, 0, "max")
+    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 {
+        dtype
+    } else {
+        a.dtype
+    }, OP_MAX, 0, "max")
 }
 
 #: `amin` under numpy's other name.
@@ -953,14 +965,20 @@ pub fn nansum(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int =
 #: else. That falls out of the identity rather than costing a counting pass:
 #: the fold starts at NaN and the combine prefers a real operand.
 pub fn nanmin(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int = -1) -> NDArray {
-    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 { dtype } else { a.dtype },
-        OP_MIN, 1, "nanmin")
+    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 {
+        dtype
+    } else {
+        a.dtype
+    }, OP_MIN, 1, "nanmin")
 }
 
 #: Largest non-NaN value along `axis`, NaN for an all-NaN slice.
 pub fn nanmax(a: NDArray, axis: any = null, keepdims: bool = false, dtype: int = -1) -> NDArray {
-    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 { dtype } else { a.dtype },
-        OP_MAX, 1, "nanmax")
+    return _reduce(a, axis, keepdims, dtype, if dtype >= 0 {
+        dtype
+    } else {
+        a.dtype
+    }, OP_MAX, 1, "nanmax")
 }
 
 #: How many elements along `axis` are not NaN — the divisor the nan-aware
@@ -1118,7 +1136,7 @@ fn _argfold(
         a.offset,
         plan.per,
         plan.chunks,
-        plan.width
+        plan.width,
     ]
     if plan.chunks == 1 {
         kernel_of(SOURCE, "nr_arg").dispatch_async(
@@ -1197,7 +1215,7 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
     var at = 0
     if axis is null {
         source = a.contiguous()
-        owned = not (source == a)
+        owned = not source == a
         let flat = source.size()
         source = source.view([flat], [source.lanes()], source.offset)
     } else {
@@ -1303,11 +1321,11 @@ fn _agreement(
     let right = b.broadcast_to(out.shape)
     let meta = layout_buffer([out, left, right])
     defer { meta.free() }
-    kernel_of(SOURCE, "nr_close").dispatch_async(
-        [out.storage, left.storage, right.storage, meta],
-        count,
-        [count, exact, f32_bits(rtol), f32_bits(atol), if equal_nan { 1 } else { 0 }]
-    )
+    kernel_of(SOURCE, "nr_close").dispatch_async([out.storage, left.storage, right.storage, meta], count, [count, exact, f32_bits(rtol), f32_bits(atol), if equal_nan {
+        1
+    } else {
+        0
+    }])
     return out
 }
 
