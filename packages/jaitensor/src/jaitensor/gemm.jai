@@ -415,6 +415,20 @@ let TUNE_ROUNDS = 3
 #: Ceiling on those repeats, so tuning a slow candidate stays bounded.
 let TUNE_MAX_REPEATS = 64
 
+#: Dispatches fired before any candidate is timed, and the longest that may
+#: take.
+#:
+#: The device reaches its working clock after a few dozen dispatches, and the
+#: candidates are timed one after another -- so without this the first one is
+#: read on a cold clock and the rest on a warm one. That is a bias and not
+#: noise: `mpsgraph` is always first in the list, and one cold reading of it
+#: wrote `mpsgraph16` into the plan cache for 4096x784x8192, where it runs at
+#: 5400 GFLOPS against float32's 9200. A cached plan is never re-measured, so
+#: that stood until the epoch moved.
+let TUNE_WARMUP = 40
+let TUNE_WARM_SECONDS = 0.05
+let TUNE_WARM_STRIDE = 8
+
 fn instantiate(config: Config, element: str) -> str {
     let template = if config.staged { TEMPLATE } else { DIRECT_TEMPLATE }
     var text = template.replace("NAME", config.entry)
@@ -589,7 +603,7 @@ fn cache_path() -> Path {
 #: every old entry the first time a changed build runs, which costs one tuning
 #: pass and is the only thing that keeps a stale answer from outliving the
 #: kernel it was about.
-let TUNE_EPOCH = 2
+let TUNE_EPOCH = 3
 
 fn shape_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> str {
     let a_flag = if trans_a { 1 } else { 0 }
@@ -862,6 +876,32 @@ fn measure(
     return seconds / float(repeats)
 }
 
+#: Bring the clock up before anything is timed. Bounded both ways: enough
+#: dispatches for a small shape, and a wall-clock cap so a large one does not
+#: spend longer warming than measuring.
+fn warm_clock(
+    a: Buffer,
+    b: Buffer,
+    output: Buffer,
+    bias: Buffer,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool
+) -> void {
+    let plan = default_plan(rows, inner, columns)
+    let opening = Instant.now()
+    for round in 0..TUNE_WARMUP {
+        encode(plan, a, b, output, bias, rows, inner, columns, trans_a, trans_b, 0)
+        if round % TUNE_WARM_STRIDE == TUNE_WARM_STRIDE - 1 {
+            gpu.synchronize()
+            if opening.elapsed().to_seconds() >= TUNE_WARM_SECONDS { break }
+        }
+    }
+    gpu.synchronize()
+}
+
 fn autotune(
     a: Buffer,
     b: Buffer,
@@ -874,8 +914,11 @@ fn autotune(
     trans_b: bool
 ) -> Plan {
     let verbose = autotune_verbose()
+    warm_clock(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
     var best = default_plan(rows, inner, columns)
+    var runner: Plan? = null
     var best_seconds = 0.0
+    var runner_seconds = 0.0
     var measured = false
     for plan in candidates(rows, inner, columns, trans_a, trans_b) {
         var seconds = 0.0
@@ -891,9 +934,30 @@ fn autotune(
             )
         }
         if not measured or seconds < best_seconds {
+            if measured {
+                runner = best
+                runner_seconds = best_seconds
+            }
             best = plan
             best_seconds = seconds
             measured = true
+        } elif runner is null or seconds < runner_seconds {
+            runner = plan
+            runner_seconds = seconds
+        }
+    }
+    #: Run the two fastest off against each other again before writing the
+    #: answer down. A plan is measured once and then believed for as long as
+    #: the epoch stands, so a single unlucky reading is not a slow run -- it
+    #: is a slow machine until someone notices. Two more measurements out of
+    #: forty is cheap next to that.
+    if measured and runner is not null {
+        let rerun = runner
+        try {
+            let again = measure(best, a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+            let rival = measure(rerun, a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+            if rival < again { best = rerun }
+        } catch _error: Error {
         }
     }
     if verbose {
