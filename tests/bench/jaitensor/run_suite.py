@@ -295,7 +295,7 @@ def collect_interleaved(jaithon_exe: str, python_exe: str, root: Path, level: st
     """
     bench_root = root / "tests" / "bench" / "jaitensor"
     units: list[tuple[str, str | None]] = [("mlp", workload) for workload in WORKLOADS]
-    units += [(stem, None) for stem in ("conv", "norm", "gemm", "attn", "vit")]
+    units += [(stem, None) for stem in ("conv", "norm", "gemm", "attn", "vit", "tensorops")]
 
     order: list[str] = []
     jai: dict[str, Samples] = {}
