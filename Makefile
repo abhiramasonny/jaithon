@@ -766,8 +766,13 @@ seed-check: $(TARGET)
 fixpoint-check: $(TARGET)
 	@scripts/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
 
-.PHONY: package-check
-package-check:
+.PHONY: package-check workspace-sync
+#: The members list is derived from the manifests that are present, so that a
+#: new package does not need every author to edit the same shared line.
+workspace-sync:
+	@python3 scripts/sync_workspace.py
+
+package-check: workspace-sync
 	@python3 scripts/check_packages.py
 
 check: package-check $(TARGET)
