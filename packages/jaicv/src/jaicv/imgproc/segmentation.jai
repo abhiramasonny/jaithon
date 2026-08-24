@@ -89,17 +89,22 @@ inline uint scan_position(uint y, uint x, uint cols, uint connectivity) {
 /* Every foreground pixel starts as its own component, named for where it is.
  * Background keeps zero, which no pixel can be confused with because the
  * names are one-based. */
+/* `first` is cleared here rather than in a pass of its own: the numbering
+ * fills it by atomic minimum later and needs it to start high, and a second
+ * walk over the whole frame to write one constant is a walk too many. */
 kernel void cc_seed(device const float* src [[buffer(0)]],
                     device uint* labels [[buffer(1)]],
-                    constant uint& count [[buffer(2)]],
-                    constant uint& cols [[buffer(3)]],
-                    constant uint& off [[buffer(4)]],
-                    constant uint& step [[buffer(5)]],
+                    device uint* first [[buffer(2)]],
+                    constant uint& count [[buffer(3)]],
+                    constant uint& cols [[buffer(4)]],
+                    constant uint& off [[buffer(5)]],
+                    constant uint& step [[buffer(6)]],
                     uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint y = id / cols;
     uint x = id - y * cols;
     labels[id] = src[off + y * step + x] != 0.0f ? id + 1u : 0u;
+    first[id] = 0xFFFFFFFFu;
 }
 
 /* One round of joining: a pixel that can see a smaller name than its own
@@ -153,30 +158,63 @@ inline void cc_join(device atomic_uint* labels, uint left, uint right) {
     }
 }
 
+/* Held to `CC_TILE` and `CC_GROUP` on the host. */
+#define CC_TILE 16u
+#define CC_HALO 18u
+
 /* Only the neighbours behind this pixel in raster order are joined. Joining is
- * symmetric, so the ones ahead are covered when their own thread runs, and
- * four reads instead of eight is half the traffic. */
+ * symmetric, so the ones ahead are covered when their own thread runs.
+ *
+ * What a neighbour contributes is only a way into its tree, and a foreground
+ * pixel's first label is its own index plus one -- which is known without
+ * reading anything. So this reads the picture, not the labels: plain
+ * coalesced loads instead of atomic ones, and through a threadgroup tile,
+ * because the pixels a thread looks at are the pixels its neighbours look at.
+ * Nine reads a pixel become one and a quarter. */
 kernel void cc_union(device atomic_uint* labels [[buffer(0)]],
-                     constant uint& count [[buffer(1)]],
+                     device const float* src [[buffer(1)]],
                      constant uint& rows [[buffer(2)]],
                      constant uint& cols [[buffer(3)]],
-                     constant uint& connectivity [[buffer(4)]],
-                     uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    uint mine = atomic_load_explicit(&labels[id], memory_order_relaxed);
-    if (mine == 0u) return;
-    int y = int(id / cols);
-    int x = int(id - uint(y) * cols);
+                     constant uint& off [[buffer(4)]],
+                     constant uint& step [[buffer(5)]],
+                     constant uint& connectivity [[buffer(6)]],
+                     constant uint& across [[buffer(7)]],
+                     uint lid [[thread_index_in_threadgroup]],
+                     uint wid [[threadgroup_position_in_grid]]) {
+    threadgroup bool tile[CC_HALO * CC_HALO];
+    uint ty = wid / across;
+    uint tx = wid - ty * across;
+    int originX = int(tx * CC_TILE) - 1;
+    int originY = int(ty * CC_TILE) - 1;
+    for (uint at = lid; at < CC_HALO * CC_HALO; at += CC_TILE * CC_TILE) {
+        uint row = at / CC_HALO;
+        int ny = originY + int(row);
+        int nx = originX + int(at - row * CC_HALO);
+        bool lit = false;
+        if (ny >= 0 && nx >= 0 && ny < int(rows) && nx < int(cols)) {
+            lit = src[off + uint(ny) * step + uint(nx)] != 0.0f;
+        }
+        tile[at] = lit;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint ly = lid / CC_TILE;
+    uint lx = lid - ly * CC_TILE;
+    uint y = ty * CC_TILE + ly;
+    uint x = tx * CC_TILE + lx;
+    if (y >= rows || x >= cols) return;
+    if (!tile[(ly + 1u) * CC_HALO + lx + 1u]) return;
+
+    uint mine = y * cols + x + 1u;
     for (int dy = -1; dy <= 0; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dy == 0 && dx >= 0) continue;
             if (connectivity == 4u && dy != 0 && dx != 0) continue;
-            int ny = y + dy;
-            int nx = x + dx;
+            int ny = int(y) + dy;
+            int nx = int(x) + dx;
             if (ny < 0 || nx < 0 || ny >= int(rows) || nx >= int(cols)) continue;
-            uint other = atomic_load_explicit(&labels[uint(ny) * cols + uint(nx)],
-                                              memory_order_relaxed);
-            if (other != 0u) cc_join(labels, mine, other);
+            if (!tile[uint(int(ly) + dy + 1) * CC_HALO + uint(int(lx) + dx + 1)]) continue;
+            cc_join(labels, mine, uint(ny) * cols + uint(nx) + 1u);
         }
     }
 }
@@ -191,12 +229,6 @@ kernel void cc_flatten(device atomic_uint* labels [[buffer(0)]],
     if (root != mine) atomic_store_explicit(&labels[id], root, memory_order_relaxed);
 }
 
-kernel void cc_reset(device uint* slots [[buffer(0)]],
-                     constant uint& count [[buffer(1)]],
-                     uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    slots[id] = 0xFFFFFFFFu;
-}
 
 /* The earliest place each component is met, kept against its root. */
 kernel void cc_first_seen(device const uint* labels [[buffer(0)]],
@@ -603,8 +635,9 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     if count == 0 { return (1, out) }
 
     let labels = Buffer(count)
+    let first = Buffer(count)
     kernel_for("cc_seed").dispatch_async(
-        [image.storage, labels],
+        [image.storage, labels, first],
         count,
         [count, cols, image.offset, image.step_]
     )
@@ -612,14 +645,19 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     #: Join every touching pair into one tree, then point each pixel at its
     #: tree's root. Two passes, whatever the picture looks like.
     let counted = Buffer(1)
-    kernel_for("cc_union").dispatch_async([labels], count, [count, rows, cols, connectivity])
+    let across = (cols + CC_TILE - 1) // CC_TILE
+    let down = (rows + CC_TILE - 1) // CC_TILE
+    kernel_for("cc_union").dispatch_async(
+        [labels, image.storage],
+        across * down * CC_GROUP,
+        [rows, cols, image.offset, image.step_, connectivity, across],
+        group_size: CC_GROUP
+    )
     kernel_for("cc_flatten").dispatch_async([labels], count, [count])
 
     #: The partition is settled; what remains is the numbering, and OpenCV
     #: numbers by where a component was first met. Only one entry per
     #: component travels for that, not one per pixel.
-    let first = Buffer(count)
-    kernel_for("cc_reset").dispatch_async([first], count, [count])
     kernel_for("cc_first_seen").dispatch_async([labels, first], count, [count, cols, connectivity])
     let tally = Buffer(1)
     tally.fill_zero()
@@ -831,6 +869,10 @@ const DT_BATCH = 24
 
 #: Threads in a row-scanning group. Eight simdgroups, which is what the
 #: stitching below assumes.
+#: Matched by `CC_TILE` and the group size in the kernel source.
+const CC_TILE = 16
+const CC_GROUP = 256
+
 const INTEGRAL_GROUP = 256
 
 #: The running sum of an image, one row and column larger than it.
