@@ -43,6 +43,11 @@ bool jaiSeqIndexArg(Value v, int index, const char *fnName, int count,
 
 bool jaiSeqEqualsChecked(Value a, Value b, bool *equal);
 
+/* Stable merge sort of `idx` (a permutation of 0..n) by `keys`, in place.
+ * `scratch` is n ints of working room the caller owns. */
+bool jaiSeqSortIndices(ObjList *keys, int *idx, int *scratch, int n,
+                       bool reverse, const char *fnName);
+
 bool jaiSeqHashableKey(Value key, const char *fnName, const char *role);
 
 JAI_INLINE bool jaiSeqKeyCannotFail(Value key) {

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include "runtime/builtins/builtins.h"
+#include "runtime/builtins/collections/builtins_seq.h"
 #include "runtime/methods.h"
 #include "runtime/runtime.h"
 
@@ -192,30 +193,7 @@ static ParseResult parseFloatText(const char *s, size_t len, double *out) {
     return result;
 }
 
-// Stable sort over an index permutation
-
-static bool mergeSortIndices(ObjList *keys, int *idx, int *scratch, int n,
-                             bool reverse, const char *fnName) {
-    for (int width = 1; width < n; width *= 2) {
-        for (int lo = 0; lo < n; lo += 2 * width) {
-            int mid = lo + width < n ? lo + width : n;
-            int hi = lo + 2 * width < n ? lo + 2 * width : n;
-            int a = lo, b = mid, k = lo;
-            while (a < mid && b < hi) {
-                int order;
-                if (!compareOrThrow(keys->items[idx[b]], keys->items[idx[a]],
-                                    fnName, &order))
-                    return false;
-                if (reverse) order = -order;
-                scratch[k++] = order < 0 ? idx[b++] : idx[a++];
-            }
-            while (a < mid) scratch[k++] = idx[a++];
-            while (b < hi)  scratch[k++] = idx[b++];
-        }
-        memcpy(idx, scratch, (size_t)n * sizeof(int));
-    }
-    return true;
-}
+// The copy a sort hands back
 
 static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
                            const char *fnName) {
@@ -232,7 +210,7 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
     int *scratch = JAI_ALLOC(int, n);
     for (int i = 0; i < n; i++) idx[i] = i;
 
-    bool ok = mergeSortIndices(keys, idx, scratch, n, reverse, fnName);
+    bool ok = jaiSeqSortIndices(keys, idx, scratch, n, reverse, fnName);
     if (ok) {
         for (int i = 0; i < n; i++) jaiListPush(result, items->items[idx[i]]);
     }

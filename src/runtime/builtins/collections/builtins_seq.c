@@ -9,13 +9,175 @@
  * it. A mutator with no natural result returns the receiver so calls chain.
  */
 
+#include <math.h>
+#include <string.h>
+
 #include "runtime/builtins/collections/builtins_seq.h"
 #include "runtime/methods.h"
 #include "runtime/runtime.h"
 
 #include "vm/gc.h"
 
-#include <string.h>
+/* ------------------------------------------------------------------ */
+/* Stable sort over an index permutation                                */
+/* ------------------------------------------------------------------ */
+
+/* A double carries every whole number up to this exactly. */
+#define SORT_WHOLE_EXACT 9007199254740992LL
+
+/* Below this a radix pass costs more in histograms than it saves. */
+#define SORT_RADIX_FLOOR 128
+
+#define SORT_RADIX_BITS   8
+#define SORT_RADIX_BUCKETS (1 << SORT_RADIX_BITS)
+#define SORT_RADIX_PASSES (64 / SORT_RADIX_BITS)
+
+typedef struct {
+    uint64_t bits;
+    int      idx;
+} SortPair;
+
+/* IEEE 754 laid out so that comparing the bit patterns as unsigned integers
+ * gives the same order as comparing the numbers: the sign bit is flipped for
+ * a positive, and every bit for a negative. Reversing the sort is the
+ * complement of that, which keeps equal keys in the order they arrived --
+ * sorting ascending and turning the result round would not. */
+static inline uint64_t sortableBits(double d, bool reverse) {
+    uint64_t bits;
+    memcpy(&bits, &d, sizeof(bits));
+    bits = (bits & 0x8000000000000000ULL) ? ~bits : (bits | 0x8000000000000000ULL);
+    return reverse ? ~bits : bits;
+}
+
+/* A key function almost always returns a number, and numbers can be sorted
+ * by their digits instead of against each other -- which matters because a
+ * comparison merge spends most of its time on a branch that real data
+ * mispredicts half the time, and no amount of tightening the comparison
+ * moved that.
+ *
+ * Two kinds are handed back rather than converted. A whole number past a
+ * double's exact range would compare wrong, and a NaN has no order at all --
+ * the general path raises for that, and it should keep doing so. Negative
+ * zero is folded onto zero because the two compare equal, so the order they
+ * arrived in is the order they have to keep. */
+static bool numericBits(ObjList *keys, const int *idx, int n, bool reverse,
+                        SortPair *into) {
+    for (int i = 0; i < n; i++) {
+        Value key = keys->items[idx[i]];
+        double d;
+        if (IS_FLOAT(key)) {
+            d = AS_FLOAT(key);
+            if (isnan(d)) return false;
+            if (d == 0.0) d = 0.0;
+        } else if (IS_INT(key)) {
+            int64_t whole = AS_INT(key);
+            if (whole > SORT_WHOLE_EXACT || whole < -SORT_WHOLE_EXACT) return false;
+            d = (double)whole;
+        } else {
+            return false;
+        }
+        into[i].bits = sortableBits(d, reverse);
+        into[i].idx = idx[i];
+    }
+    return true;
+}
+
+/* Least significant digit first, which is what makes it stable. Every pass's
+ * histogram is counted in the one walk over the keys, so a byte the whole
+ * array agrees on can be skipped rather than shuffled for nothing -- with
+ * keys of a similar size most of the top half goes that way. */
+static SortPair *radixPairs(SortPair *pairs, SortPair *other, int n) {
+    uint32_t counts[SORT_RADIX_PASSES][SORT_RADIX_BUCKETS];
+    memset(counts, 0, sizeof(counts));
+    for (int i = 0; i < n; i++) {
+        uint64_t bits = pairs[i].bits;
+        for (int pass = 0; pass < SORT_RADIX_PASSES; pass++) {
+            counts[pass][(bits >> (pass * SORT_RADIX_BITS)) & (SORT_RADIX_BUCKETS - 1)]++;
+        }
+    }
+
+    SortPair *from = pairs, *to = other;
+    for (int pass = 0; pass < SORT_RADIX_PASSES; pass++) {
+        uint32_t *bucket = counts[pass];
+        int shift = pass * SORT_RADIX_BITS;
+        if (bucket[(from[0].bits >> shift) & (SORT_RADIX_BUCKETS - 1)] == (uint32_t)n)
+            continue;
+
+        uint32_t at = 0;
+        for (int b = 0; b < SORT_RADIX_BUCKETS; b++) {
+            uint32_t here = bucket[b];
+            bucket[b] = at;
+            at += here;
+        }
+        for (int i = 0; i < n; i++) {
+            to[bucket[(from[i].bits >> shift) & (SORT_RADIX_BUCKETS - 1)]++] = from[i];
+        }
+        SortPair *swap = from;
+        from = to;
+        to = swap;
+    }
+    return from;
+}
+
+static bool sortCompare(Value a, Value b, const char *fnName, int *out) {
+    if (jaiValueCompare(a, b, out)) return true;
+    if (vm.hasException) return false;
+    return jaiThrow(vm.cTypeError, "%s(): cannot compare %s with %s", fnName,
+                    jaiTypeNameStatic(a), jaiTypeNameStatic(b));
+}
+
+static bool mergeGeneral(ObjList *keys, int **src, int **dst, int n,
+                         bool reverse, const char *fnName) {
+    for (int width = 1; width < n; width *= 2) {
+        const int *from = *src;
+        int *to = *dst;
+        for (int lo = 0; lo < n; lo += 2 * width) {
+            int mid = lo + width < n ? lo + width : n;
+            int hi = lo + 2 * width < n ? lo + 2 * width : n;
+            int a = lo, b = mid, k = lo;
+            while (a < mid && b < hi) {
+                int order;
+                if (!sortCompare(keys->items[from[b]], keys->items[from[a]],
+                                 fnName, &order))
+                    return false;
+                if (reverse) order = -order;
+                to[k++] = order < 0 ? from[b++] : from[a++];
+            }
+            while (a < mid) to[k++] = from[a++];
+            while (b < hi)  to[k++] = from[b++];
+        }
+        int *swap = *src;
+        *src = *dst;
+        *dst = swap;
+    }
+    return true;
+}
+
+bool jaiSeqSortIndices(ObjList *keys, int *idx, int *scratch, int n,
+                       bool reverse, const char *fnName) {
+    if (n <= 1) return true;
+    int *src = idx, *dst = scratch;
+
+    /* One look at the first key says whether reading them all off stands a
+     * chance, which spares a list of strings an allocation it cannot use. */
+    bool ok = true;
+    bool sorted = false;
+    if (n >= SORT_RADIX_FLOOR && (IS_INT(keys->items[0]) || IS_FLOAT(keys->items[0]))) {
+        SortPair *pairs = JAI_ALLOC(SortPair, 2 * n);
+        if (numericBits(keys, idx, n, reverse, pairs)) {
+            const SortPair *ranked = radixPairs(pairs, pairs + n, n);
+            for (int i = 0; i < n; i++) idx[i] = ranked[i].idx;
+            sorted = true;
+        }
+        JAI_FREE_ARRAY(SortPair, pairs, 2 * n);
+    }
+    if (!sorted) ok = mergeGeneral(keys, &src, &dst, n, reverse, fnName);
+
+    if (ok && !sorted && src != idx) memcpy(idx, src, (size_t)n * sizeof(int));
+    return ok;
+}
+
+
 
 /* ------------------------------------------------------------------ */
 /* Receivers and arguments                                              */
