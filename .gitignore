@@ -6,19 +6,47 @@
 *.d
 *.dSYM/
 
+# Experiment builds and the binaries they leave behind. `make` writes /build
+# and /jaithon; anything with a suffix came from a one-off comparison and is
+# not worth keeping.
+/build-*/
+/jaithon-*
+!/jaithon.workspace.json
+
+# Datasets live in ~/Developer/datasets and are symlinked back in, so this has
+# to be a bare name: a trailing slash matches directories only and would let
+# the symlink itself show up as untracked.
+/data
+
 # Benchmark and example output
 *.ppm
-/data/
+/tests/bench/*.local.json
+/digit_mistakes.png
+/motion_trails.png
+/plot.png
+/plot.svg
 
 # Bytecode cache
 __jaicache__/
 *.jaic
 
-# Generated documentation
-docs/
+# Generated and vendored documentation. The hand-written parts of docs/ --
+# notes, the roadmap, the probe write-ups -- are tracked; only what a tool
+# produced is not.
+/docs/api/
+/docs/superpowers/
 
-# Benchmark baselines are committed; local scratch runs are not
-/tests/bench/*.local.json
+# Working notes
+spec/
+
+# JAI_JIT_DUMP artefacts
+jit_*.bin
+jit_*.bin.hex
+
+# Scratch directories agents and probes leave behind
+/.scratch/
+/tmpclear/
+/.claude/worktrees/
 
 # Editor and OS noise
 .DS_Store
@@ -26,15 +54,4 @@ docs/
 .vscode/ipch/
 compile_commands.json
 .cache/
-/build-*/
-/jaithon-opstats
-/jaithon-stats
-/jaithon-table-opt
-
-# JAI_JIT_DUMP artefacts
-jit_*.bin
-
-# Working notes
-spec/
-
 __pycache__/
