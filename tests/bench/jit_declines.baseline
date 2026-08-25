@@ -44,6 +44,7 @@ stopped: a type guard the kinds cannot settle
 stopped: an append reaching past the model
 stopped: an indirect callee compiled against an older module
 stopped: an unpinned receiver's result kind
+stopped: call argc
 stopped: callee is not a compiled global function
 stopped: callee's return kind not usable
 stopped: loop variable took two kinds
