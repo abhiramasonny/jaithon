@@ -13,9 +13,9 @@
 #: let x = sci.dense_lu_solve(lower, pivots, b)
 #: ```
 #:
-#: The examples this doc used to carry -- `sci.minimize`, `sci.welch`,
-#: `sci.CubicSpline`, `sci.ttest_ind` -- name the surface the modules below owe
-#: when they are written. None of them exists yet.
+#: `sci.minimize` and the rest of `optimize` are here. The other examples this
+#: doc used to carry -- `sci.welch`, `sci.CubicSpline`, `sci.ttest_ind` -- name
+#: the surface the modules below owe when they are written.
 #:
 #: **The array is `jainum.NDArray`, and jaisci does not define one.** Bulk data
 #: — signals, samples, matrices, point sets — is an `NDArray`; parameter
@@ -38,13 +38,14 @@
 #: `from jaisci.core import matmul` keeps working — so the facade is for
 #: callers who want the package rather than the file.
 #:
-#: **`core` and `linalg` exist today.** This facade named nineteen modules -- linalg,
-#: optimize, integrate, interpolate, signal, stats, sparse and the rest -- and
-#: eighteen of them were never written, so `import jaisci` raised
-#: `cannot find module '.linalg'` for every caller. The package's own tests did
-#: not catch it because they import `jaisci.core` directly. The surface below
-#: is what is actually here; the list above stands as the contract the other
-#: modules owe when they arrive, not as a claim that they have.
+#: **`core`, `linalg` and `optimize` exist today.** This facade named nineteen
+#: modules -- linalg, optimize, integrate, interpolate, signal, stats, sparse
+#: and the rest -- and eighteen of them were never written, so `import jaisci`
+#: raised `cannot find module '.linalg'` for every caller. The package's own
+#: tests did not catch it because they import `jaisci.core` directly. The
+#: surface below is what is actually here; the list above stands as the
+#: contract the other modules owe when they arrive, not as a claim that they
+#: have.
 #:
 import std.gpu as gpu
 
@@ -59,6 +60,10 @@ from .core import arr_recip, arr_sign, arr_sqrt
 from .linalg import cho_factor, cho_solve, cholesky, det, inv, lstsq, lu_factor
 from .linalg import lu_solve, qr, solve, solve_triangular
 
+from .optimize import MAXITER, RTOL, XTOL
+from .optimize import bisect, brentq, brentq_full, curve_fit, least_squares
+from .optimize import minimize, minimize_scalar, newton
+
 export { as_array, host, host_matrix, device_vector, device_matrix, require_gpu }
 export { arr_exp, arr_log, arr_sqrt, arr_abs, arr_pow, arr_recip, arr_sign, arr_clip }
 export { arr_maximum, arr_minimum, matmul, matvec, dot }
@@ -67,6 +72,8 @@ export { dense_tridiagonal, givens, approx_fprime, approx_jacobian }
 export { OptimizeResult, RootResult }
 export { solve, solve_triangular, lu_factor, lu_solve, cholesky, cho_factor, cho_solve }
 export { qr, inv, det, lstsq }
+export { bisect, brentq, brentq_full, newton, minimize_scalar, minimize }
+export { least_squares, curve_fit, XTOL, RTOL, MAXITER }
 export { is_available }
 
 #: The package version, which `jaithon.package.json` also carries.
