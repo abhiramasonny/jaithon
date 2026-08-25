@@ -260,6 +260,18 @@ kernel void geo_pyr_down_col(device const float* tmp [[buffer(0)]],
         as_type<float>(low_bits), as_type<float>(high_bits), integral);
 }
 
+/* The one-pass form, kept for reference and NOT used. `pyr_down` runs the
+ * separable pair above instead.
+ *
+ * It looks like it should win: the pair hands a half-width intermediate
+ * between them and so moves 18.6 MB at 1080p, where one gather reads the frame
+ * and writes a quarter of it for 10.4. Measured, it loses -- 0.093 ms against
+ * 0.063, half again as slow -- and it still loses after an interior fast path
+ * is added so the twenty-five taps stop resolving the border one at a time.
+ * Fewer bytes, worse locality: two passes read straight lines, and a
+ * five-by-five gather whose output steps two at a time does not. The two
+ * agree bit for bit on eight shapes, so this is purely about the access
+ * pattern. Do not swap them back without a measurement that disagrees. */
 kernel void geo_pyr_down(device const float* src [[buffer(0)]],
                          device float* dst [[buffer(1)]],
                          constant uint& count [[buffer(2)]],
