@@ -19,6 +19,7 @@ from std.test import assert_eq, assert_true
 
 class Cell {
     pub var v: int
+
     pub fn init(self, v: int) -> void {
         self.v = v
     }

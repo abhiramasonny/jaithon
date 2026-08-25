@@ -45,7 +45,9 @@ class Countdown {
 
     pub fn init(self) -> void {
         self.go = fn(n: int) -> int {
-            if n <= 0 { return 0 }
+            if n <= 0 {
+                return 0
+            }
             return self.go(n - 1)
         }
     }
