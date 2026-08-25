@@ -59,6 +59,9 @@ export { cholesky_factor, triangular_solve, cholesky_solve, diagonal }
 export { cached_kernel }
 
 export { Pipeline, ColumnTransformer, FeatureUnion, make_pipeline, make_column_transformer }
+
+from .linear import Ridge, StandardScaler, linear_regression
+export { StandardScaler, Ridge, linear_regression }
 export { NESTED, REMAINDER_DROP, REMAINDER_PASSTHROUGH }
 
 export { MAX_BINS, BIN_UNIFORM, BIN_QUANTILE, BIN_KMEANS }
