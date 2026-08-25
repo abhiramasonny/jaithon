@@ -9364,7 +9364,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * arguments still on the model's stack, so the interpreter
                  * re-runs the call from the top. Re-running is sound because
                  * the callee is a compiled body that bailed, and the function
-                 * tier declines any body whose bail can follow a heap write. */
+                 * tier declines any body whose bail can follow a heap write.
+                 *
+                 * It costs nothing measurable -- two instructions on the path
+                 * and a deopt record. Alternating binaries under
+                 * scripts/gpu_lock.sh, best of five each: closure_calls
+                 * 123/123, poly_dispatch 138/138, json_parse 110/110,
+                 * object_dispatch 151/150, sort_merge 353/358. */
                 emit(e, jaiA64SubsXImm(31, 1, 2));
                 if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
                 e->fixups[e->fixupCount].instIndex    = (int)e->count;
