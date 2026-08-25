@@ -38,7 +38,7 @@
 #: `from jaisci.core import matmul` keeps working — so the facade is for
 #: callers who want the package rather than the file.
 #:
-#: **`core`, `linalg` and `optimize` exist today.** This facade named nineteen
+#: **`core`, `linalg`, `optimize` and `integrate` exist today.** This facade named nineteen
 #: modules -- linalg, optimize, integrate, interpolate, signal, stats, sparse
 #: and the rest -- and eighteen of them were never written, so `import jaisci`
 #: raised `cannot find module '.linalg'` for every caller. The package's own
@@ -64,6 +64,10 @@ from .optimize import MAXITER, RTOL, XTOL
 from .optimize import bisect, brentq, brentq_full, curve_fit, least_squares
 from .optimize import minimize, minimize_scalar, newton
 
+from .integrate import IVPResult
+from .integrate import cumulative_trapezoid, fixed_quad, quad, simpson, solve_ivp
+from .integrate import trapezoid
+
 export { as_array, host, host_matrix, device_vector, device_matrix, require_gpu }
 export { arr_exp, arr_log, arr_sqrt, arr_abs, arr_pow, arr_recip, arr_sign, arr_clip }
 export { arr_maximum, arr_minimum, matmul, matvec, dot }
@@ -74,6 +78,8 @@ export { solve, solve_triangular, lu_factor, lu_solve, cholesky, cho_factor, cho
 export { qr, inv, det, lstsq }
 export { bisect, brentq, brentq_full, newton, minimize_scalar, minimize }
 export { least_squares, curve_fit, XTOL, RTOL, MAXITER }
+export { quad, fixed_quad, trapezoid, simpson, cumulative_trapezoid }
+export { solve_ivp, IVPResult }
 export { is_available }
 
 #: The package version, which `jaithon.package.json` also carries.
