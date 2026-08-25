@@ -499,6 +499,14 @@ typedef struct {
      * jaiValuesEqual) rather than choosing a guard. */
     bool      stackUnit[JIT_MAX_STACK];
 
+    /* This entry is the `null` literal itself -- OP_NULL, not merely something
+     * whose kind admits a null. It has to be tracked separately because
+     * OP_NULL pushes SLOT_MAYBE_INST (a null literal and an instance have to
+     * agree on a kind, or `var x: Box? = null` gives its local two of them),
+     * so the kind alone cannot tell `x is null` from `x is y`. A proof of the
+     * same kind as the two above and retired at the same offsets. */
+    bool      stackNullLit[JIT_MAX_STACK];
+
     /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
      * can have changed it -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses.
      *
@@ -1700,6 +1708,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackSeen[e->depth]  = seen;
     e->stackLocal[e->depth] = fromLocal;
     e->stackAscii[e->depth] = false;
+    e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
@@ -1761,23 +1770,28 @@ static void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) 
 static bool pushSelf(Emit *e) {
     if (e->depth >= JIT_MAX_STACK) return false;
     e->stackAscii[e->depth] = false;
+    e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
 }
 
 /* Retire every proof about an operand-stack entry -- "came out of the ASCII
- * table" and "is a variant's shared unit value" alike. See Emit::stackAscii. */
+ * table", "is a variant's shared unit value" and "is the null literal" alike.
+ * See Emit::stackAscii. */
 static void clearStackProofs(Emit *e) {
     for (unsigned i = 0; i < JIT_MAX_STACK; i++) {
-        e->stackAscii[i] = false;
-        e->stackUnit[i]  = false;
+        e->stackAscii[i]   = false;
+        e->stackUnit[i]    = false;
+        e->stackNullLit[i] = false;
     }
 }
 
 static bool anyStackProof(const Emit *e) {
     for (unsigned i = 0; i < e->depth; i++) {
-        if (e->stackAscii[i] || e->stackUnit[i]) return true;
+        if (e->stackAscii[i] || e->stackUnit[i] || e->stackNullLit[i]) {
+            return true;
+        }
     }
     return false;
 }
@@ -4819,11 +4833,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         if (!e->inlining) {
             e->inProtected = offsetIsProtected(fn, (uint32_t)off);
         }
-        /* An ASCII-table proof is only good along the fall-through edge this
-         * walk is following. offsetIsBranchTarget scans the whole chunk, so it
-         * catches a back edge whose branch has not been emitted yet -- and it
-         * is only asked while a proof is actually live, which is the two or
-         * three instructions between `s[i]` and whatever consumes it. */
+        /* A stack proof is only good along the fall-through edge this walk is
+         * following. offsetIsBranchTarget scans the whole chunk, so it catches
+         * a back edge whose branch has not been emitted yet -- and it is only
+         * asked while a proof is actually live, which is the two or three
+         * instructions between `s[i]` and whatever consumes it, or the single
+         * instruction between OP_NULL and OP_IS. */
         if (anyStackProof(e) &&
             offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
             clearStackProofs(e);
@@ -5602,16 +5617,36 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_IS:
         case OP_IS_NOT: {
             if (e->depth < 2) return false;
-            /* Only against a literal null. `x is SomeClass` is a type test
-             * that goes through valueMatchesType, and nothing here would be
-             * right for it. */
-            if (e->stack[e->depth - 1] != SLOT_NULL) {
-                /* `x is SomeClass` is a type test through valueMatchesType
-                 * and nothing here would be right for it. It declines rather
-                 * than taking the unarmed deopt it used to: that path leaves
-                 * the operand model a slot deeper than the bytecode, and a
-                 * body that compiles only to bail at the same instruction on
-                 * every iteration is slower than one never compiled anyway. */
+            /* Only against a literal null -- but reading that off the kind
+             * alone was wrong, and the arm below sat unreachable for every
+             * `is null` anyone writes. SLOT_NULL is what a `-> void` call
+             * leaves behind; the `null` in source is OP_NULL, which pushes
+             * SLOT_MAYBE_INST so that `var x: Box? = null` does not give its
+             * local two kinds. So the whole construct took the decline: 71
+             * distinct functions on a self-hosted compile, and `is null`
+             * outnumbers `is SomeClass` in lib/jaithon 661 to 12. stackNullLit
+             * is the half of the question the kind cannot carry, and it is a
+             * proof rather than a guess, so it is dropped at any offset a
+             * branch can reach (see clearStackProofs).
+             *
+             * Measured, `for x in xs { if x is null { t += 1 } }` over a 2M
+             * list[Node?] with no null in it, twenty passes, whole process and
+             * best of three under scripts/gpu_lock.sh: 635 ms declined against
+             * 223 ms compiled, 2.85x with ~150 ms of list building inside both
+             * figures. The self-hosted compile it was expected to move did NOT
+             * move (4932 ms against 4945 ms, a wash): the 71 functions mostly
+             * stop at OP_GET_FIELD one instruction later, so this only clears
+             * the first of two gates.
+             *
+             * `x is SomeClass` is still declined. It is a type test through
+             * valueMatchesType, nothing here would be right for it, and the
+             * unarmed deopt it used to take left the operand model a slot
+             * deeper than the bytecode -- a body that compiles only to bail at
+             * the same instruction every iteration is slower than one never
+             * compiled at all. */
+            if (e->stack[e->depth - 1] != SLOT_NULL &&
+                !(e->stack[e->depth - 1] == SLOT_MAYBE_INST &&
+                  e->stackNullLit[e->depth - 1])) {
                 e->whyNot = "an `is` against something other than null";
                 return false;
             }
@@ -5810,6 +5845,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* Zero, which is what a null instance is in a register. */
             if (!pushValue(e, SLOT_MAYBE_INST, 0, NULL)) return false;
             emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
+            /* The kind says "may be null"; this says "IS null", which is what
+             * the `is` arm needs and cannot recover from the kind. */
+            e->stackNullLit[e->depth - 1] = true;
             off += 1;
             break;
         }
@@ -5884,6 +5922,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->stackSeen[e->depth - 1]  = NULL_VAL;
                     e->stackLocal[e->depth - 1] = -1;
                     e->stackAscii[e->depth - 1] = false;
+                    e->stackNullLit[e->depth - 1] = false;
                     e->stackUnit[e->depth - 1]  = false;
                 } else if (k != SLOT_FLOAT) {
                     e->whyNot = "a type guard the kinds cannot settle";
@@ -8863,6 +8902,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stackSeen[e->depth]  = NULL_VAL;
                 e->stackLocal[e->depth] = -1;
                 e->stackAscii[e->depth] = false;
+                e->stackNullLit[e->depth] = false;
                 e->stackUnit[e->depth]  = false;
                 e->stack[e->depth++]    = SLOT_CLASS;
                 off += 6;
@@ -8976,6 +9016,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stackSeen[e->depth]  = nv;
                 e->stackLocal[e->depth] = -1;
                 e->stackAscii[e->depth] = false;
+                e->stackNullLit[e->depth] = false;
                 e->stackUnit[e->depth]  = false;
                 e->stack[e->depth++]    = SLOT_NATIVE;
                 off += 6;
@@ -8989,6 +9030,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->stackSeen[e->depth]  = gv;
             e->stackLocal[e->depth] = -1;
             e->stackAscii[e->depth] = false;
+            e->stackNullLit[e->depth] = false;
             e->stackUnit[e->depth]  = false;
             e->stack[e->depth++]    = SLOT_FUNC;
             off += 6;
@@ -11437,11 +11479,44 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             if (IS_INSTANCE(elemSample)) {
                 const ObjClass *first = AS_INSTANCE(elemSample)->klass;
                 int scan = src->count < 1024 ? src->count : 1024;
+                int nulls = 0;
                 for (int i = 0; i < scan; i++) {
                     Value v = src->items[i];
+                    if (IS_NULL(v)) { nulls++; continue; }
                     if (!IS_INSTANCE(v)) continue;
-                    if (AS_INSTANCE(v)->klass != first) { elemMixed = true; break; }
+                    if (AS_INSTANCE(v)->klass != first) { elemMixed = true; }
                 }
+                /* A `list[T?]` holding nulls beside instances. The element
+                 * guard this form emits is a tag check against VAL_OBJ, so a
+                 * null bails out of the compiled loop -- and the loop is
+                 * re-entered on the next element, so the bail is paid per null
+                 * and not once.
+                 *
+                 * Refusing on PRESENCE is the obvious answer and it is the
+                 * wrong one; the question is DENSITY. Same probe throughout --
+                 * a 2M list[Node?], twenty passes of
+                 * `for x in xs { if x is null { t += 1 } }`, whole process,
+                 * best of three alternating runs under scripts/gpu_lock.sh:
+                 *
+                 *                    no nulls   1 in 3    1 in 1000
+                 *   declined            635       661        661
+                 *   no refusal          223     11604        296
+                 *   refuse on presence  219       661        661
+                 *   refuse past 1/64    223       662        280
+                 *
+                 * One null in three costs 17.6x with no refusal at all, which
+                 * is why a refusal has to exist. One null in a thousand is
+                 * 2.36x FASTER pinned than interpreted, which is what refusing
+                 * on presence throws away. The threshold keeps both ends.
+                 *
+                 * The proper fix is to widen the element to SLOT_MAYBE_INST so
+                 * the guard accepts a null and no bail happens at all, which
+                 * would retire this whole test. Until then, this.
+                 *
+                 * The class scan no longer stops at the first mismatch: the
+                 * null count needs the whole prefix, and the cap is what
+                 * bounds the cost. */
+                if (nulls * 64 > scan) return 0;
             }
         } else {
             return 0;
