@@ -5582,7 +5582,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka == SLOT_FLOAT) {
                 /* Both operands stay where they are: the compare reads the
                  * FP bank, and the NaN guard's stub knows how to write an
-                 * FP-resident entry out if it is ever taken. */
+                 * FP-resident entry out if it is ever taken.
+                 *
+                 * Released BEFORE the operands are read, exactly as the fused
+                 * arm at OP_JUMP_IF_CMP_FALSE does it and for the same reason:
+                 * this arm is on the borrow whitelist, so an operand can still
+                 * be held in a local's own d register, and `nanToDeopt`
+                 * records -- which `deoptRecordAt` asserts nothing may be
+                 * borrowing at. Only the fused arm had this, so a body whose
+                 * float compare did NOT fuse into a branch declined with "a
+                 * float borrow reached OP_GT's guard"; `let a = ys[i] > py`
+                 * followed by a use of `a` is exactly that shape. Costs one
+                 * fmov when a borrow is live, against declining the loop. */
+                fpReleaseAll(e);
                 unsigned db = fpOperand(e, e->valueDepth - 1);
                 unsigned da = fpOperand(e, e->valueDepth - 2);
                 /* nanToDeopt records, so nothing may still be deferred. A
@@ -5592,7 +5604,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 settleAll(e);
                 emit(e, jaiA64FcmpD(da, db));
                 nanToDeopt(e);
-            } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
+            /* Two bools compare exactly as two ints do. Each is 0 or 1 in
+             * its register (see SLOT_BOOL), so `cmp` answers `==` and `!=`
+             * directly, and the ordering conditions come out right as well --
+             * false sorts below true, which is what the interpreter says.
+             *
+             * Missing until now, and a whole-function refusal rather than a
+             * slow path: `let a = ys[i - 1] > py` / `let b = ys[i] > py` /
+             * `if a != b` is how a point-in-polygon crossing test is written,
+             * and jaicv's `nearest_gap_squared` carries a comment saying it
+             * had to be spelt as two nested `if`s and spelt TWICE because of
+             * this.
+             *
+             * MEASURED. That loop over a 100000-point polygon, forty passes:
+             * 215 ms declined against 36 ms compiled, best of five alternating
+             * runs with no overlap -- 5.8x, and a decline-to-compile
+             * transition rather than a micro-optimisation. The flag form is
+             * now as fast as the nested one it was rewritten into (7.23 ms
+             * against 7.67 in one binary), so the workaround can go.
+             *
+             * RULED OUT: the self-hosted compiler does not move. `check
+             * --no-cache` over four compiler files is 2015 ms against 2020
+             * median of seven, inside the spread, even though the same census
+             * counts 66 sites there -- they clear this gate and stop at the
+             * next, which is the pattern every arm added today has shown. */
+            } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST ||
+                       ka == SLOT_BOOL) {
                 unsigned ra = xHeldIn(e, e->valueDepth - 2);
                 if (foldCmp) {
                     e->kPend &= ~(1u << (e->valueDepth - 1));
@@ -5827,7 +5864,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 settleAll(e);          /* nanToDeopt records */
                 emit(e, jaiA64FcmpD(da, db));
                 nanToDeopt(e);
-            } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST) {
+            /* Bools, for the reason given at the unfused arm. The fused
+             * form is the one an `if a != b` actually emits, so without it
+             * here the unfused arm above would almost never be reached. */
+            } else if (ka == SLOT_INT || ka == SLOT_MAYBE_INST ||
+                       ka == SLOT_BOOL) {
                 unsigned ra = xHeldIn(e, e->valueDepth - 2);
                 if (foldCmp2) {
                     e->kPend &= ~(1u << (e->valueDepth - 1));
