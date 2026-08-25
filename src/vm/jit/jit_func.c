@@ -6354,7 +6354,30 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value seen = e->stackSeen[e->depth - 1];
             int fromLocal = e->stackLocal[e->depth - 1];
 
-            if (e->stack[e->depth - 1] != SLOT_INST || klass == NULL) return false;
+            /* And, as at the local-receiver arm, a maybe-instance reads like an
+             * instance once known not-null -- which is what `a.b.c` needs, since
+             * `.b` came back SLOT_MAYBE_INST and `.c` wants a receiver.
+             *
+             * This arm and the SLOT_MAYBE_INST field arm below were the two
+             * halves of the same hole: the whole chain `a.b.c.d.v` declined its
+             * enclosing loop, and it now compiles. Measured on a loop reading
+             * one four-deep chain per iteration, alternating old/new binaries
+             * and warmed by the clock, best of five each: 0.4356 s -> 0.1107 s,
+             * 3.9x. What did NOT move is a self-hosted compile (`check` over
+             * parser.jai + emit.jai): 1.4253 s -> 1.4353 s, inside the 2% a
+             * base-against-base control shows -- only eleven of the compiler's
+             * bodies decline for these two reasons. The one that would move it
+             * is a SLOT_OBJ receiver holding an OBJ_ENUM (a variant read off the
+             * enum object), which stops 110 bodies and is not handled here. */
+            if (e->stack[e->depth - 1] != SLOT_INST &&
+                e->stack[e->depth - 1] != SLOT_MAYBE_INST) {
+                return false;
+            }
+            if (klass == NULL) return false;
+            if (e->stack[e->depth - 1] == SLOT_MAYBE_INST) {
+                emit(e, jaiA64SubsXImm(31, valueBankReg(e, e->valueDepth - 1), 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
@@ -6368,8 +6391,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             SlotKind kind;
             unsigned tag;
+            ObjClass *fcls = NULL;
             if (IS_INT(fieldVal))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(fieldVal)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
+            /* A nullable instance field, same guess and same guards as the
+             * local-receiver arm: a leaf's null has no class to read, so the
+             * receiver's own class stands in and the class guard below deopts
+             * if that was wrong. Without this arm `rawObjValue` (which excludes
+             * OBJ_INSTANCE) let an instance-valued field fall off the end of
+             * the chain and decline the whole function. */
+            else if (IS_INSTANCE(fieldVal) || IS_NULL(fieldVal)) {
+                kind = SLOT_MAYBE_INST;
+                tag  = VAL_OBJ;
+                fcls = IS_INSTANCE(fieldVal) ? AS_INSTANCE(fieldVal)->klass
+                                             : klass;
+                if (fcls == NULL) return false;
+            }
             /* As in OP_GET_FIELD_LOCAL: an object-typed field is held raw
              * rather than declining the enclosing function, and a list earns
              * the stronger kind at the price of an OBJ_LIST check. */
@@ -6388,7 +6425,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                              (unsigned)info->slot * (unsigned)sizeof(Value);
             unsigned rr = valueBankReg(e, e->valueDepth - 1);
             SlotKind already = knownFieldKind(e, fromLocal, info->slot);
-            if (already != SLOT_SELF) {
+            if (kind == SLOT_MAYBE_INST) {
+                /* The same three guards the local arm emits, branch-free by the
+                 * same trick: a null payload redirects the loads at the receiver,
+                 * which the entry check above has already proved is a live
+                 * instance, so nothing ever dereferences zero. All of it stands
+                 * before the receiver comes off the model, since every deopt
+                 * here resumes at this instruction with it still on the stack. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr, fbase));       /* tag */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, rr, fbase + 8));   /* value */
+                emit(e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, VAL_OBJ));
+                emit(e, jaiA64CselX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                    JIT_SCRATCH_B, JAI_A64_EQ));
+                emit(e, jaiA64CselX(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                    JIT_SCRATCH_A, JAI_A64_EQ));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+                branchOnDeopt(e, JAI_A64_NE);      /* neither object nor null */
+
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+                emit(e, jaiA64CselX(JIT_SCRATCH_B, rr, JIT_SCRATCH_D,
+                                    JAI_A64_EQ));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(ObjInstance, klass)));
+                emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)fcls);
+                if (fcls != klass) {
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+                    emit(e, jaiA64CselX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                        JIT_SCRATCH_A, JAI_A64_EQ));
+                }
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+            } else if (already != SLOT_SELF) {
                 kind = already;
             } else {
                 /* Guard BEFORE the receiver comes off the model: a deopt here
@@ -6411,22 +6484,33 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned popped;
             SlotKind kr;
             if (!popValue(e, &popped, &kr)) return false;
-            if (!pushValue3(e, kind, 0, NULL,
-                            (kind == SLOT_OBJ && rawObjValue(fieldVal)) ||
-                                    (kind == SLOT_LIST && IS_LIST(fieldVal))
-                                ? fieldVal : NULL_VAL,
-                            -1)) {
-                return false;
-            }
-            if (kind == SLOT_FLOAT && fpWorthLoading(e, code, off + 6, stop)) {
-                unsigned idx = e->valueDepth - 1;
-                emit(e, jaiA64LdrD(fpRegAt(e, idx), rr, fbase + 8));
-                fpClaim(e, idx);
-            } else if (kind == SLOT_BOOL) {
-                /* One byte, for the reason given at the local-receiver arm. */
-                emit(e, jaiA64LdrByte(pushReg(e) - 1, rr, fbase + 8));
+            if (kind == SLOT_MAYBE_INST) {
+                if (!pushValue3(e, kind, fcls->shapeId, fcls,
+                                IS_INSTANCE(fieldVal) ? fieldVal : NULL_VAL,
+                                -1)) {
+                    return false;
+                }
+                /* Already in hand: the guards above loaded the payload (or a
+                 * zero) into D, so there is nothing left to read. */
+                emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_D));
             } else {
-                emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
+                if (!pushValue3(e, kind, 0, NULL,
+                                (kind == SLOT_OBJ && rawObjValue(fieldVal)) ||
+                                        (kind == SLOT_LIST && IS_LIST(fieldVal))
+                                    ? fieldVal : NULL_VAL,
+                                -1)) {
+                    return false;
+                }
+                if (kind == SLOT_FLOAT && fpWorthLoading(e, code, off + 6, stop)) {
+                    unsigned idx = e->valueDepth - 1;
+                    emit(e, jaiA64LdrD(fpRegAt(e, idx), rr, fbase + 8));
+                    fpClaim(e, idx);
+                } else if (kind == SLOT_BOOL) {
+                    /* One byte, for the reason given at the local-receiver arm. */
+                    emit(e, jaiA64LdrByte(pushReg(e) - 1, rr, fbase + 8));
+                } else {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
+                }
             }
             off += 6;
             break;
