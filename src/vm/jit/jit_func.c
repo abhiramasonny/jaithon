@@ -7293,6 +7293,31 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned ridx = e->depth - argc - 1;
             SlotKind rk = e->stack[ridx];
 
+            /* A maybe-instance receiver is an instance once it is known not to
+             * be null, and the whole arm below already resolves against the
+             * class the entry carries -- which a maybe-instance carries too.
+             * So one compare buys it: prove it here, then let it read as
+             * SLOT_INST for the rest of the instruction.
+             *
+             * Order matters. The guard's record is taken while the entry is
+             * still MAYBE_INST, because that is what the interpreter has on
+             * its stack if the guard fires; the narrowing happens only after,
+             * on the path where the proof holds. Both kinds hold a bare
+             * pointer in a register, so nothing about the allocation moves.
+             *
+             * This is what `var at = head` / `while at is not null` /
+             * `at = at.follow()` needs -- the loop shape every list and tree
+             * walk has. Without it the OSR retry that widens `at` to
+             * MAYBE_INST only moved the refusal from the assignment to the
+             * call. */
+            if (rk == SLOT_MAYBE_INST && e->stackClass[ridx] != NULL) {
+                settleAll(e);
+                emit(e, jaiA64SubsXImm(31, valueXReg(e, ridx - (e->depth - e->valueDepth)), 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+                e->stack[ridx] = SLOT_INST;
+                rk = SLOT_INST;
+            }
+
             if (rk == SLOT_LIST && argc == 1 &&
                 nameIdx < (uint32_t)fn->chunk.constants.count &&
                 IS_STRING(fn->chunk.constants.data[nameIdx]) &&
@@ -9804,7 +9829,15 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
                                uint32_t shape, ObjClass *klass, Value seen) {
     if (!IS_NULL(seen)) e->localSeen[slot] = seen;
     if (!e->localTyped[slot]) {
-        e->localKind[slot]  = kind;
+        /* A slot an earlier attempt asked to be widened takes the wider kind
+         * the FIRST time something is bound to it too, not only when it was
+         * seeded from a live value. A local declared inside the loop holds
+         * nothing at the moment the loop tier looks -- it seeds SLOT_OPAQUE --
+         * so without this the retry seeded nothing and found the same clash
+         * again, which is exactly what `var at = head` inside the outer loop
+         * does. */
+        e->localKind[slot]  = (kind == SLOT_INST && e->nullableLocal[slot])
+                                  ? SLOT_MAYBE_INST : kind;
         e->localShape[slot] = shape;
         e->localClass[slot] = klass;
         e->localTyped[slot] = true;
@@ -9815,7 +9848,32 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
     /* Two kinds for one slot. Rather than give the function up, note that this
      * slot has to carry its tag and let the caller compile again with that
      * decided from the start -- every read of it then guards, so the two
-     * kinds stop being a contradiction. */
+     * kinds stop being a contradiction.
+     *
+     * An instance and a nullable instance of the SAME class are not really two
+     * kinds, though: the maybe-instance is the supertype, holds the identical
+     * pointer-or-zero, and every field offset resolved against the class stays
+     * right. So that clash asks for the nullable seed first and only falls to
+     * the dynamic one if a second attempt still disagrees -- which matters
+     * because dynamic keeps the slot in memory with a run-time tag, and this
+     * is the shape every list walk has: `var at = head` then
+     * `at = at.next`. */
+    /* An instance into a slot already typed maybe-instance is not a clash at
+     * all: it is the subtype going into the supertype, the register holds the
+     * same bare pointer, and the tag a materialisation computes off that
+     * pointer is the right one. The slot keeps the wider kind. Only the other
+     * direction has to ask for anything, because a null reaching a slot typed
+     * as a plain instance is what lets a later field read dereference zero. */
+    if (e->localKind[slot] == SLOT_MAYBE_INST && kind == SLOT_INST &&
+        e->localShape[slot] == shape) {
+        return true;
+    }
+    if (e->localKind[slot] == SLOT_INST && kind == SLOT_MAYBE_INST &&
+        e->localShape[slot] == shape &&
+        !e->nullableLocal[slot] && !e->dynamicLocal[slot]) {
+        e->needNullable[slot] = true;
+        return false;
+    }
     if (!e->dynamicLocal[slot]) {
         e->needDynamic[slot] = true;
         return false;
@@ -10843,9 +10901,60 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
     return gLoopDepth;
 }
 
+static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
+                           uint8_t iterKind, Value elemSample, bool elemMixed,
+                           bool wholeBody, bool noInline,
+                           const bool *nullable, bool *needNullable);
+
+/* The loop tier had no retry at all, where the function tier has had one since
+ * `nullableLocal` existed: a slot the walk cannot settle on one kind for simply
+ * declined the whole loop. That is `var at = head` followed by `at = at.next`
+ * -- an instance seeded from the slot, then a maybe-instance assigned into it
+ * -- which is every list and tree walk there is, and the shape a parser's inner
+ * loops are made of. Two attempts: the second seeds the slots the first asked
+ * for as nullable.
+ *
+ * MEASURED, and only as a chain. On its own this changes nothing: widening the
+ * local moves the refusal from the assignment to the `at.follow()` call, and
+ * accepting a nullable RETURN kind (see emitMaybeInstResult) moves it back to
+ * the assignment. All three together plus the maybe-instance receiver at
+ * OP_INVOKE take a 200-node list walked 20000 times from 137 ms to 38 ms,
+ * best of seven alternating runs under scripts/gpu_lock.sh with no overlap
+ * between the two sets -- 3.6x, and it is a decline-to-compile transition,
+ * not a micro-optimisation: `walk` goes from no compiled form at either loop
+ * head to both.
+ *
+ * RULED OUT: the self-hosted compiler does not move. `check --no-cache` over
+ * four compiler files is 2143 ms against 2146 ms median of nine, inside the
+ * spread, even though the return-kind gate alone stops 64 sites in one file.
+ * Those bodies clear it and stop at the next wall (OP_INVOKE on a receiver
+ * whose class the model cannot pin, and OP_GET_FIELD_LOCAL). Kept for the
+ * loops it does unblock, on the same reasoning the enum fold was. */
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        uint8_t iterKind, Value elemSample, bool elemMixed,
                        bool wholeBody, bool noInline) {
+    bool nullable[JIT_MAX_SLOTS + 1];
+    bool needNullable[JIT_MAX_SLOTS + 1];
+    memset(nullable, 0, sizeof nullable);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        memset(needNullable, 0, sizeof needNullable);
+        if (compileOsrOnce(closure, top, slots, iterKind, elemSample, elemMixed,
+                           wholeBody, noInline, nullable, needNullable)) {
+            return true;
+        }
+        bool grew = false;
+        for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+            if (needNullable[i] && !nullable[i]) { nullable[i] = true; grew = true; }
+        }
+        if (!grew) return false;
+    }
+    return false;
+}
+
+static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
+                           uint8_t iterKind, Value elemSample, bool elemMixed,
+                           bool wholeBody, bool noInline,
+                           const bool *nullable, bool *needNullable) {
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
     if (!isInstructionStart(&fn->chunk, top)) return false;
@@ -10888,6 +10997,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     e.chunkDepth = chunkDepth;
     e.chunkDepthCount = fn->chunk.count + 1;
     e.savedCount = JIT_MAX_SAVED;
+    memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     /* Each slot takes the kind it holds right now. The entry re-checks them on
      * every later entry, so this is a specialisation, not an assumption. */
     for (unsigned i = 0; i < e.locals; i++) {
@@ -10898,7 +11008,10 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
         else if (IS_BOOL(v))  e.localKind[i] = SLOT_BOOL;
         else if (IS_LIST(v))  e.localKind[i] = SLOT_LIST;
         else if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != NULL) {
-            e.localKind[i]  = SLOT_INST;
+            /* A slot an earlier attempt found sometimes-null takes the wider
+             * kind from the start; the class still comes from what is in the
+             * slot NOW, which a maybe-instance is a correct supertype of. */
+            e.localKind[i]  = nullable[i] ? SLOT_MAYBE_INST : SLOT_INST;
             e.localClass[i] = AS_INSTANCE(v)->klass;
             e.localShape[i] = AS_INSTANCE(v)->klass->shapeId;
         } else if (IS_OBJ(v)) {
@@ -10944,6 +11057,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
             probe.slotWriteLo[i] = UINT32_MAX;
             probe.slotIndexLo[i] = UINT32_MAX;
         }
+        memcpy(probe.nullableLocal, nullable, sizeof probe.nullableLocal);
         for (unsigned i = 0; i < e.locals; i++) {
             probe.localKind[i]  = e.localKind[i];
             probe.localShape[i] = e.localShape[i];
@@ -11092,6 +11206,12 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                         (uint8_t)(JIT_INL_BANK + r);
                 }
             }
+        } else {
+            /* The probe is where a kind clash is found -- the real walk below
+             * runs on the same seed and would only find it again -- so its
+             * request for a wider one has to travel back to the retry loop
+             * from here. */
+            memcpy(needNullable, probe.needNullable, sizeof probe.needNullable);
         }
         for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
     }
@@ -11203,6 +11323,9 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
     if (!compileBody(&e, closure) || e.failed) {
+        for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+            if (e.needNullable[i]) needNullable[i] = true;
+        }
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
                     e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
