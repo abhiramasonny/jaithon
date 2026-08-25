@@ -162,6 +162,16 @@ inline void cc_join(device atomic_uint* labels, uint left, uint right) {
 #define CC_TILE 16u
 #define CC_HALO 18u
 
+/* Whether the neighbour at `(dy, dx)` is inside the picture and lit, read from
+ * the threadgroup tile the union pass staged. */
+inline bool cc_tile_lit(threadgroup const bool* tile, uint ly, uint lx,
+                        int dy, int dx, int y, int x, uint rows, uint cols) {
+    int ny = y + dy;
+    int nx = x + dx;
+    if (ny < 0 || nx < 0 || ny >= int(rows) || nx >= int(cols)) return false;
+    return tile[uint(int(ly) + dy + 1) * CC_HALO + uint(int(lx) + dx + 1)];
+}
+
 /* Only the neighbours behind this pixel in raster order are joined. Joining is
  * symmetric, so the ones ahead are covered when their own thread runs.
  *
@@ -206,16 +216,47 @@ kernel void cc_union(device atomic_uint* labels [[buffer(0)]],
     if (!tile[(ly + 1u) * CC_HALO + lx + 1u]) return;
 
     uint mine = y * cols + x + 1u;
-    for (int dy = -1; dy <= 0; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dy == 0 && dx >= 0) continue;
-            if (connectivity == 4u && dy != 0 && dx != 0) continue;
-            int ny = int(y) + dy;
-            int nx = int(x) + dx;
-            if (ny < 0 || nx < 0 || ny >= int(rows) || nx >= int(cols)) continue;
-            if (!tile[uint(int(ly) + dy + 1) * CC_HALO + uint(int(lx) + dx + 1)]) continue;
-            cc_join(labels, mine, uint(ny) * cols + uint(nx) + 1u);
-        }
+
+    /* Most of the joins behind a pixel are already made by another pixel.
+     *
+     * Every lit pixel runs this, so a pair that some OTHER thread will join
+     * need not be joined here: the partition comes out the same and each pair
+     * skipped is a global atomic that never happens. Naming the four
+     * neighbours behind in raster order -- `up` at (-1,0), `left` at (0,-1),
+     * and the two diagonals -- under eight-connectivity:
+     *
+     *   - `up` lit makes the other three redundant. `up_left` is `up`'s own
+     *     left, `up_right` has `up` as ITS left, and `left` has `up` as its
+     *     up-right, so each joins itself to `up` when its own thread runs.
+     *     Joining `mine` to `up` therefore puts all five in one set.
+     *   - `up` dark and `left` lit makes `up_left` redundant, since `up_left`
+     *     is `left`'s own up.
+     *
+     * `up_right` is never implied while `up` is dark: it sits two columns from
+     * `left` and shares no lit neighbour with it. So four joins become one
+     * through the interior of a region and at most two anywhere. The bench
+     * frame is a third lit, which took roughly 2.7M atomic joins to near 700k.
+     *
+     * Four-connectivity keeps both of its neighbours: neither implies the
+     * other without the diagonal that connectivity does not have. */
+    bool up = cc_tile_lit(tile, ly, lx, -1, 0, int(y), int(x), rows, cols);
+    bool left = cc_tile_lit(tile, ly, lx, 0, -1, int(y), int(x), rows, cols);
+    if (connectivity == 4u) {
+        if (up) cc_join(labels, mine, (y - 1u) * cols + x + 1u);
+        if (left) cc_join(labels, mine, y * cols + x);
+        return;
+    }
+    if (up) {
+        cc_join(labels, mine, (y - 1u) * cols + x + 1u);
+        return;
+    }
+    if (left) {
+        cc_join(labels, mine, y * cols + x);
+    } else if (cc_tile_lit(tile, ly, lx, -1, -1, int(y), int(x), rows, cols)) {
+        cc_join(labels, mine, (y - 1u) * cols + x);
+    }
+    if (cc_tile_lit(tile, ly, lx, -1, 1, int(y), int(x), rows, cols)) {
+        cc_join(labels, mine, (y - 1u) * cols + x + 2u);
     }
 }
 
