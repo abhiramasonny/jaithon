@@ -9323,10 +9323,41 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                        (unsigned)offsetof(JitCallDesc, link)));
                     emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
                 }
-                /* x1 carries the callee's verdict; a bail there is a bail
-                 * here, exactly as for a self-call. */
+                /* x1 carries the callee's verdict. It used to BAIL here,
+                 * which is sound only where partial execution is invisible --
+                 * true of the function tier, whose locals are registers and
+                 * whose frame is entered fresh, and false of the OSR tier,
+                 * whose locals ARE the interpreter's frame slots and whose
+                 * every way out syncs them back. An OSR bail mid-iteration
+                 * therefore kept the loop variable already advanced and the
+                 * locals already written, and the interpreter resumed at the
+                 * LOOP HEAD -- which advanced the iterator again and dropped
+                 * the rest of that iteration's work.
+                 *
+                 * That is the whole of the "closure call loses one count per
+                 * collection" bug: `for v in xs { count += rule(v) }` came
+                 * back short by one per bail, and under --gc-stress the callee
+                 * deopts often enough to bail regularly. Measured on
+                 * docs/repro/osr-closure-loses-counts.jai at --gc-stress=200:
+                 * 170 of 77027 lost before, 0 after.
+                 *
+                 * A deopt at the CALL OFFSET instead, which is exactly what
+                 * emitDirectCall does at the same point and for the same
+                 * reason: the record is taken with the callee and its
+                 * arguments still on the model's stack, so the interpreter
+                 * re-runs the call from the top. Re-running is sound because
+                 * the callee is a compiled body that bailed, and the function
+                 * tier declines any body whose bail can follow a heap write. */
+                emit(e, jaiA64SubsXImm(31, 1, 2));
+                if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+                e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+                e->fixups[e->fixupCount].conditional  = true;
+                e->fixups[e->fixupCount].depth        = -1;
+                e->fixupCount++;
+                emit(e, jaiA64BCond(JAI_A64_EQ, 0));
                 emit(e, jaiA64SubsXImm(31, 1, 0));
-                branchOnCondition(e, JAI_A64_NE);
+                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)off, false);
 
                 for (unsigned i = 0; i <= argc; i++) {
                     unsigned r;
