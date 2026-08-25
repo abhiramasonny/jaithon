@@ -631,9 +631,9 @@ typedef struct {
     /* A body that reads an upvalue needs the closure itself -- not any slot (a method's slot 0 is the
      * receiver, not the callee) -- so it arrives as one extra argument, in the register just past the locals. */
     bool      usesUpvalues;
-    /* Set once the body has written to the heap. After that a bail is no
-     * longer free: re-running the call interpreted would apply the write a
-     * second time. See branchOnCondition. */
+    /* Set once the body has written to the heap. A deopt after that is still
+     * fine -- it resumes AT an instruction, so the writes before it are not
+     * re-run -- which is what makes the retired bail path unnecessary. */
     bool      wroteHeap;
     /* The instruction being compiled is inside a protected region of the
      * function's static exception table (spec §3.8) -- i.e. inside a `try`.
@@ -658,7 +658,6 @@ typedef struct {
      * it changes only when a live entry's address or key could move (new key, rehash, delete, clear). ObjModule::version (used by the function-tier entry check) is neither necessary nor sufficient here. */
     JaiTable *globalsTable;
     uint32_t  globalsKeyVersion;
-    bool      bailAfterWrite;
     bool      callsOut;
     /* Set the moment anything is emitted that can destroy x0..x8 while the
      * body is still running: a call out, or one of the two stubs that call and
@@ -2564,25 +2563,23 @@ static void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
     }
 }
 
-/* Neither of the two blocks below reads an operand-stack entry -- a bail says
- * "could not continue" and the caller throws the whole computation away, and an
- * overflow raises -- so the entries do NOT have to be in their X homes to
- * branch to one. The fpSyncAll both used to do was pure hot-path cost: in a
- * float expression carrying an int guard through it (a stencil's `mid[j-1]`),
- * each one wrote every live float out and the next use read it back, four
- * cross-bank fmovs sitting in the middle of the accumulate chain. A join
- * (branchTo) and a deopt record are different and still settle -- the first
- * because the other edge must agree, the second because the record is read. */
-static void branchOnCondition(Emit *e, unsigned cond) {
-    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    if (e->wroteHeap) e->bailAfterWrite = true;
-    e->fixups[e->fixupCount].instIndex    = (int)e->count;
-    e->fixups[e->fixupCount].targetOffset = FIXUP_BAIL;
-    e->fixups[e->fixupCount].conditional  = true;
-    e->fixups[e->fixupCount].depth        = -1;   /* bails do not join */
-    e->fixupCount++;
-    emit(e, jaiA64BCond(cond, 0));
-}
+/* An overflow stub reads no operand-stack entry -- it raises -- so the entries
+ * do NOT have to be in their X homes to branch to one. The fpSyncAll it used
+ * to do was pure hot-path cost: in a float expression carrying an int guard
+ * through it (a stencil's `mid[j-1]`), each one wrote every live float out and
+ * the next use read it back, four cross-bank fmovs sitting in the middle of the
+ * accumulate chain. A join (branchTo) and a deopt record are different and
+ * still settle -- the first because the other edge must agree, the second
+ * because the record is read.
+ *
+ * There used to be a `branchOnCondition` here that took a body to its BAIL
+ * block on a condition, and one arm used it: an indirect call whose callee
+ * came back with a non-zero verdict. That arm takes a deopt at the call offset
+ * now (see it for why a bail was unsound in the OSR tier), which leaves the
+ * entry stack-limit guard as the only thing that can reach the bail block --
+ * and that fires before a single body instruction runs. So a bail can no
+ * longer follow a write of any kind, and the `bailAfterWrite` decline that
+ * guarded against it went with the function. */
 
 /* `cond` isn't always VS: adds/subs set the overflow flag, but the multiply test compares the
  * product's high half against the low half's replicated sign, so its answer is NE -- routing multiply through VS meant its overflow was never detected (4 * 2^62 silently came back as 0). */
@@ -10598,21 +10595,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     uint8_t *entry = arenaEmit(arena, e.code, e.count);
     if (entry == NULL) return false;
 
-    /* The tier's whole bail protocol rests on partial execution being invisible. Field writes end that:
-     * a body that stores to an instance and then bails would have the store applied again by the interpreted re-run. Nothing in the suite hits this, but "hard to construct" isn't the standard a compiled tier gets to work to. */
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",
                 fn->name ? fn->name->chars : "<anon>", e.whyNot);
     }
-    if (e.bailAfterWrite) {
-        if (getenv("JAI_JIT_WHY")) {
-            fprintf(stderr, "[jit] %s declined: a bail follows a heap write\n",
-                    fn->name ? fn->name->chars : "<anon>");
-        }
-        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
-        return false;
-    }
-
     if (e.assumedIntReturn && e.returnKind != SLOT_INT) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: a self-call had to guess the "
