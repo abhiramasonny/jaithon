@@ -290,15 +290,22 @@ fn next_start(grid: list[int], rows: int, cols: int, state: list[int]) -> void {
 var _grid: list[int] = []
 var _grid_stride = 0
 
+#: One primitive rather than the two loops this was.
+#:
+#: Written in the language it is at the language's floor and the floor is too
+#: high: 4.95 ms for a 1080p frame, which is 2.4 ns a cell for a load, a
+#: compare and a store. Reading the source as `bytes` instead of `list[float]`
+#: measured 4.82 ms, so it is not the read -- it is the per-element boxing and
+#: bounds checking, and nothing written inside the language removes that.
+#: `grid_nonzero` does the same work across every core in 1.62 ms, giving the
+#: identical grid cell for cell, and 2.9 ms is 22% of a `find_contours` call.
+#:
+#: What is left is the raster scan in `next_start`, which is 8.4 ms of the same
+#: call at 4.2 ns a cell. That one is an algorithm rather than a bulk copy, so
+#: it stays here and waits on the compiled tier.
 fn fill_grid(grid: list[int], values: list[float], rows: int, cols: int) -> void {
     let stride = cols + 2
-    for y in 0..rows {
-        let base = y * cols
-        let target = (y + 1) * stride + 1
-        for x in 0..cols {
-            grid[target + x] = if values[base + x] != 0.0 { 1 } else { 0 }
-        }
-    }
+    __prim__.grid_nonzero(grid, values, rows, cols, stride, stride + 1)
 }
 
 fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
