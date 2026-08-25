@@ -2236,6 +2236,65 @@ static void branchOnDeoptInstStart(Emit *e, unsigned cond) {
  * on an unordered result, and that's routed to a deopt so the interpreter raises exactly what it would have. */
 static void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
 
+/* `c < "0"` and its three siblings, both operands a string one byte long.
+ *
+ * Ordering on strings had no arm at all, so one `character >= "0"` declined
+ * the whole body around it: json_parse's `integer` is 50% of that benchmark's
+ * interpreted instructions and the self-hosted lexer's `_is_digit`/`_is_alpha`
+ * 3.5% of a compile's. Only the one-byte shape is compiled -- compareStrings
+ * on anything longer is a memcmp, which is a call, and a character-class test
+ * is the shape that actually occurs. The sample says one byte and the emitted
+ * code GUARDS it, so a longer string arriving later deoptimises rather than
+ * being answered wrongly.
+ *
+ * The bytes go in through LDRB, which zero-extends, so both are 0..255 and the
+ * signed conditions the integer arm already computed give memcmp's unsigned
+ * answer unchanged -- no separate condition table. */
+static bool isOrdering(uint8_t op) {
+    return op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE;
+}
+
+static bool stringOperand(const Emit *e, unsigned at) {
+    return e->stackAscii[at] || IS_STRING(e->stackSeen[at]);
+}
+
+/* Statically one byte: the ASCII table's own singleton, or a sample that is a
+ * one-character string -- which for the literal side of a character-class test
+ * is the constant-pool entry itself and so cannot be anything else. */
+static bool knownOneByte(const Emit *e, unsigned at) {
+    Value v = e->stackSeen[at];
+    return e->stackAscii[at] || (IS_STRING(v) && AS_STRING(v)->length == 1);
+}
+
+/* One side has to be known one byte before this is worth compiling. The other
+ * is only guarded, and a sample can lie: OP_GET_INDEX hands its result the
+ * RECEIVER as a sample (only the type is read from it), so `s[i]`'s sample is
+ * the whole subject string. Without the literal side to anchor on, a general
+ * `a < b` over long strings would compile and then deopt every iteration,
+ * which is slower than never compiling the body at all. */
+static bool oneBytePair(const Emit *e, unsigned a, unsigned b) {
+    return stringOperand(e, a) && stringOperand(e, b) &&
+           (knownOneByte(e, a) || knownOneByte(e, b));
+}
+
+static void emitOneByteString(Emit *e, unsigned at, unsigned reg, unsigned dst) {
+    /* What the ASCII table produced is a one-byte interned string by
+     * construction, so it needs neither guard -- see the same skip in OP_EQ. */
+    if (!e->stackAscii[at]) {
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, reg, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+        branchOnDeopt(e, JAI_A64_NE);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, reg,
+                           (unsigned)offsetof(ObjString, length)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 1));
+        branchOnDeopt(e, JAI_A64_NE);
+    }
+    /* `chars` is a pointer, not an inline array: a string may address bytes it
+     * does not own. Two loads, and the second is the byte itself. */
+    emit(e, jaiA64LdrX(dst, reg, (unsigned)offsetof(ObjString, chars)));
+    emit(e, jaiA64LdrByte(dst, dst, 0));
+}
+
 static int instructionLength(const Chunk *c, int off);
 
 /* One past the LAST back edge to `top`, or 0 if nothing branches back there.
@@ -5274,6 +5333,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     branchOnDeopt(e, JAI_A64_EQ);
                 }
                 emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else if (isOrdering(op) && ka == SLOT_OBJ &&
+                       oneBytePair(e, e->depth - 2, e->depth - 1)) {
+                /* Ordering only. `==` stays on the identity arm above, which
+                 * is cheaper and holds for strings of any length. See
+                 * emitOneByteString. This path guards, so settle first. */
+                settleAll(e);
+                unsigned rb = valueXReg(e, e->valueDepth - 1);
+                unsigned ra = valueXReg(e, e->valueDepth - 2);
+                emitOneByteString(e, e->depth - 2, ra, JIT_SCRATCH_C);
+                emitOneByteString(e, e->depth - 1, rb, JIT_SCRATCH_D);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
             } else {
                 return false;
             }
@@ -5451,6 +5521,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     branchOnDeopt(e, JAI_A64_EQ);
                 }
                 emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else if (isOrdering(cmp) && ka == SLOT_OBJ &&
+                       oneBytePair(e, e->depth - 2, e->depth - 1)) {
+                /* See the same arm in OP_LT..OP_GE. `if c < "0" { break }`
+                 * fuses its compare into the branch and would otherwise have
+                 * declined here after the unfused twin already compiled. */
+                settleAll(e);
+                unsigned rb = valueXReg(e, e->valueDepth - 1);
+                unsigned ra = valueXReg(e, e->valueDepth - 2);
+                emitOneByteString(e, e->depth - 2, ra, JIT_SCRATCH_C);
+                emitOneByteString(e, e->depth - 1, rb, JIT_SCRATCH_D);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
             } else {
                 return false;
             }

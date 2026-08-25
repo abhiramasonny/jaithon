@@ -6,8 +6,12 @@
 #: `cmp` — skipping the "is a string, and is interned" guards it would
 #: otherwise emit for a value it only knows by sample.
 #:
-#: That skip is a PROOF, not a prediction, and a wrong proof is a wrong answer
-#: rather than a crash. `FORTY` below is forty characters built at run time, so
+#: That skip is a PROOF, not a prediction. On `==` a wrong proof is a wrong
+#: answer rather than a crash, since the arm only compares two pointers. On the
+#: ORDERING operators it is worse than that: their arm skips the same two
+#: guards and then reads `chars` out of the object and dereferences it, so a
+#: proof that reaches a non-string is a wild load. `FORTY` below is forty
+#: characters built at run time, so
 #: it is past the interning length and is a different object from the identical
 #: literal while being equal to it — the one pair that tells a pointer compare
 #: apart from a real one. If the proof ever reaches a value that did not come
@@ -147,6 +151,63 @@ fn test_a_merge_does_not_inherit_the_characters_proof() -> void {
     #: And the arm the proof really does describe.
     assert_eq(char_in_else("0", FORTY, "0", false, REPS), REPS)
     assert_eq(char_in_else("0", FORTY, "z", false, REPS), 0)
+}
+
+#: The same merge, on `<`. Ordering has no identity shortcut to fall back on:
+#: the arm loads one byte from behind each operand, so a proof arriving at a
+#: value it does not describe answers by first byte instead of by content.
+#:
+#: `FORTY` starts with the same byte as the literal, which is the one shape
+#: that tells the two answers apart -- "0" < "0123456789..." is true, and one
+#: byte each says they are equal and so not less. With the arms the other way
+#: round the else-arm's push overwrites the then-arm's proof and nothing can go
+#: wrong, exactly as at the equality merge above.
+fn lit_before_char_in_else(s: str, other: str, lit: str, take_other: bool, reps: int) -> int {
+    var hits = 0
+    var r = 0
+    while r < reps {
+        if lit < (if take_other { other } else { s[0] }) { hits += 1 }
+        r += 1
+    }
+    return hits
+}
+
+fn test_an_ordering_merge_does_not_inherit_the_characters_proof() -> void {
+    #: Warmed the same way and for the same reason as the equality merge: the
+    #: assertion below is only wrong once the loop is compiled, so it has to
+    #: run compiled from its first iteration rather than from wherever the
+    #: sampler happened to catch it.
+    var wrep = 0
+    while wrep < 8 {
+        let warm = lit_before_char_in_else("1", FORTY, "0", true, REPS)
+        assert_true(warm >= 0)
+        wrep += 1
+    }
+
+    assert_eq(lit_before_char_in_else("1", FORTY, "0", true, REPS), REPS)
+    #: And the arm the proof really does describe: "0" < "1".
+    assert_eq(lit_before_char_in_else("1", FORTY, "0", false, REPS), REPS)
+    assert_eq(lit_before_char_in_else("1", FORTY, "2", false, REPS), 0)
+}
+
+#: A one-byte operand is a GUESS about a sample, not a proof, so the arm guards
+#: the length and a longer string has to deoptimise into compareStrings rather
+#: than be answered from its first byte. Same first byte again, so a byte-only
+#: answer is visibly wrong: "0z" > "0" is true.
+fn longer_beats_its_prefix(long: str, lit: str, reps: int) -> int {
+    var hits = 0
+    var r = 0
+    while r < reps {
+        if long > lit { hits += 1 }
+        r += 1
+    }
+    return hits
+}
+
+fn test_an_operand_longer_than_one_byte_deoptimises() -> void {
+    assert_eq(longer_beats_its_prefix("0z", "0", REPS), REPS)
+    assert_eq(longer_beats_its_prefix("0", "0z", REPS), 0)
+    assert_eq(longer_beats_its_prefix(FORTY, "0", REPS), REPS)
 }
 
 fn test_the_long_string_is_equal_without_being_identical() -> void {
