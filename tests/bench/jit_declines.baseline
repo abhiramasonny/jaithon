@@ -31,6 +31,7 @@ stopped : pushing a kind the tier cannot store
 stopped : the operand model disagrees with the bytecode
 stopped : too many roots
 stopped: OP_CALL
+stopped: OP_GET_FIELD_LOCAL
 stopped: OP_GET_INDEX
 stopped: OP_INVOKE
 stopped: OP_JUMP_IF_CMP_FALSE
@@ -41,11 +42,13 @@ stopped: a call that can raise inside a try
 stopped: a local was given two different kinds
 stopped: a return inside an OSR loop
 stopped: a type guard the kinds cannot settle
+stopped: an `is` against something other than null
 stopped: an append reaching past the model
 stopped: an indirect callee compiled against an older module
 stopped: an unpinned receiver's result kind
 stopped: call argc
 stopped: callee is not a compiled global function
+stopped: callee's return class not on record
 stopped: callee's return kind not usable
 stopped: loop variable took two kinds
 stopped: more incoming arguments than argument registers (10 locals, 3 stack)
