@@ -4954,8 +4954,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         switch (op) {
         case OP_GET_LOCAL: {
             unsigned slot = jaiReadU16(code + off + 1);
-            if (!localInRange(e, slot)) return false;
-            if (e->localKind[slot] == SLOT_OPAQUE) return false;
+            /* Both refusals used to be silent, so the census said only
+             * "OP_GET_LOCAL" for two unrelated causes -- one a window the OSR
+             * form does not cover, the other a slot whose kind is not known
+             * yet. They want different fixes; they should not share a line. */
+            if (!localInRange(e, slot)) {
+                e->whyNot = "a local outside the compiled window";
+                return false;
+            }
+            if (e->localKind[slot] == SLOT_OPAQUE) {
+                e->whyNot = "a local of no known kind";
+                return false;
+            }
             if (slot == 0) e->usesSlot0 = true;
             if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                             e->localClass[slot],
@@ -6467,8 +6477,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             bool guardFollows = b <= JIT_MAX_SLOTS && e->dynamicLocal[b];
             for (unsigned k = 0; k < 2; k++) {
                 unsigned slot = k == 0 ? a : b;
-                if (!localInRange(e, slot)) return false;
-                if (e->localKind[slot] == SLOT_OPAQUE) return false;
+                /* Named, for the reason given at OP_GET_LOCAL. */
+                if (!localInRange(e, slot)) {
+                    e->whyNot = "a local outside the compiled window";
+                    return false;
+                }
+                if (e->localKind[slot] == SLOT_OPAQUE) {
+                    e->whyNot = "a local of no known kind";
+                    return false;
+                }
                 if (slot == 0) e->usesSlot0 = true;
                 if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                                 e->localClass[slot],
