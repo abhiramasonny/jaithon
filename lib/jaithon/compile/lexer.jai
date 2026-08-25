@@ -1170,6 +1170,19 @@ fn _is_continuation(kind: TokenKind) -> bool {
         TokenKind.LParen | TokenKind.LBracket | TokenKind.LBrace => true,
         TokenKind.QuestionDot | TokenKind.QuestionQuestion => true,
         TokenKind.KwAnd | TokenKind.KwOr | TokenKind.KwNot => true,
+        #: `in` and `is` continue a line for the same reason `and` does: they
+        #: are binary operators that cannot end an expression, so a newline
+        #: after one can only be a wrapped line.
+        #:
+        #: They were missing, and the formatter is what found it. `fmt` breaks
+        #: a long line after a binary operator, so a 101-character
+        #: `x = a.text("name") in b[b.len() - 1]` came back as two lines with
+        #: the first ending in `in` -- which then did not parse. Formatting a
+        #: file until it stops changing is supposed to be a fixpoint, and
+        #: `make fmt-roundtrip` caught it as "UNPARSEABLE AFTER". Adding the
+        #: two here is the fix on the right side: the formatter's break is
+        #: reasonable and the lexer's refusal to continue was the odd one out.
+        TokenKind.KwIn | TokenKind.KwIs => true,
         TokenKind.FStringStart | TokenKind.FStringMid => true,
         _ => false,
     }

@@ -1407,7 +1407,8 @@ pub class Emitter {
         var self_method = false
         if callee.kind == NodeKind.Member and callee.require("object").kind == NodeKind.Self {
             if self.class_methods.len() > 0 {
-                self_method = callee.text("name") in self.class_methods[self.class_methods.len() - 1]
+                let own = self.class_methods[self.class_methods.len() - 1]
+                self_method = callee.text("name") in own
             }
         }
         if callee.kind == NodeKind.Member and
