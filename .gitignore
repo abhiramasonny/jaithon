@@ -55,3 +55,10 @@ jit_*.bin.hex
 compile_commands.json
 .cache/
 __pycache__/
+
+# Generated documentation. Kept on disk, deliberately never committed: these are
+# per-function notes and a working handoff, not part of the project's story, and
+# the repository should not carry them.
+/docs/notes/
+/docs/RESUME.md
+/docs/repro/
