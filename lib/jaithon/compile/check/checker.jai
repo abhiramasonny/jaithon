@@ -8,6 +8,7 @@ from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
 from jaithon.compile.check.modsig import absolute, default_search_path, dirname
+from jaithon.compile.check.modsig import resolve_module_path
 from jaithon.compile.check.modsig import read_source
 from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.kinds import TyKind
@@ -28,6 +29,14 @@ pub const E0402_UNKNOWN_TYPE: str = "E0402"
 pub const E0407_GENERIC_ARITY: str = "E0407"
 
 #: The imports reachable from this file close a loop.
+#: A dotted module name with no file anywhere on the search path.
+#:
+#: The runtime raises this when the import actually runs. `check` walked the
+#: same graph and said nothing, so a broken import passed `make check` over the
+#: whole tree — which is how `jaisci` shipped a facade naming eighteen modules
+#: that were never written.
+pub const E0800_MODULE_NOT_FOUND: str = "E0800"
+
 pub const E0801_CIRCULAR_IMPORT: str = "E0801"
 
 #: How deep the cycle walk follows imports before giving up. The C needs no
@@ -566,7 +575,10 @@ fn _walk_imports(
     if stack.len() >= MAX_IMPORT_DEPTH { return true }
     for edge in edges {
         let sig = loader.load(edge.dotted, from_dir)
-        if sig is null { continue }
+        if sig is null {
+            _report_missing(c, loader, edge, stack[stack.len() - 1])
+            continue
+        }
         if sig.path in visited { continue }
 
         var at = -1
@@ -601,6 +613,29 @@ fn _walk_imports(
         visited.add(sig.path)
     }
     return true
+}
+
+#: Report a module the search path does not hold.
+#:
+#: `SigLoader.load` answers null for three different things: the empty name, a
+#: name that resolves to a file it cannot read, and a name that resolves to
+#: nothing at all. Only the last is a missing module, so the resolver is asked
+#: again directly rather than reading the null as an answer — otherwise a
+#: module whose file is momentarily unreadable would be reported as absent.
+#:
+#: Carried in the MESSAGE rather than a span. `check_import_cycles` parses the
+#: entry file with file id zero, and zero is the prelude by the time anything
+#: is checked, so `edge.span` on a top-level import points at an unrelated
+#: file. Naming the importer in the text is right wherever the edge came from;
+#: pointing at the wrong line is worse than pointing nowhere.
+fn _report_missing(c: Ctx, loader: SigLoader, edge: SigImport, importer: str) -> void {
+    if edge.dotted == "" { return }
+    if resolve_module_path(edge.dotted, dirname(importer), loader.search) is not null { return }
+    c.error(
+        E0800_MODULE_NOT_FOUND,
+        Span.none(),
+        f"cannot find module `{edge.dotted}`, imported by `{importer}`"
+    )
 }
 
 fn _report_cycle(
