@@ -68,6 +68,12 @@ fn test_a_line_carries_on_after_and_or_not() -> void {
     assert_true(either_of_these_conditions_holds)
 }
 
+#: `@` belongs to the same rule and was missing for the same reason, but it
+#: cannot be tested here: nothing implements the operator, so the checker
+#: answers `<unknown>` for every operand pair and no program using it runs.
+#: `tests/errors/matmul_line_continues.jai` pins it by which DIAGNOSTIC comes
+#: out instead -- E0406 rather than E0102.
+#:
 #: A `for` head is the other place `in` appears, and the lexer rule reaches it
 #: too -- but there is no test for it here on purpose. `fmt` formats a for-head
 #: as one unit and joins it back whatever its width, so a wrapped one cannot

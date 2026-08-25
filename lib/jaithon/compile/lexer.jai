@@ -1153,6 +1153,14 @@ fn _is_operator(kind: TokenKind) -> bool {
         TokenKind.PlusPercent | TokenKind.MinusPercent | TokenKind.StarPercent => true,
         TokenKind.Amp | TokenKind.Pipe | TokenKind.Caret | TokenKind.Tilde => true,
         TokenKind.Shl | TokenKind.Shr | TokenKind.Eq | TokenKind.EqEq => true,
+        #: `@`, the matrix product, was left out when it was added. Being in
+        #: this list is what lets a line carry on after an operator and what
+        #: lets `{` after one open a set rather than a block, so `a @` at the
+        #: end of a wrapped line did not parse and `a @ { 1, 2 }` read the
+        #: brace as a block. Found by auditing this table against the operators
+        #: the formatter is willing to break a line after (ast.jai's
+        #: _OP_SOURCE), which is the set that has to be covered here.
+        TokenKind.At => true,
         TokenKind.BangEq | TokenKind.Lt | TokenKind.Le | TokenKind.Gt | TokenKind.Ge => true,
         TokenKind.PlusEq | TokenKind.MinusEq | TokenKind.StarEq | TokenKind.SlashEq => true,
         TokenKind.SlashSlashEq | TokenKind.PercentEq | TokenKind.StarStarEq => true,
