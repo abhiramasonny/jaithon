@@ -38,7 +38,7 @@
 #: `from jaisci.core import matmul` keeps working — so the facade is for
 #: callers who want the package rather than the file.
 #:
-#: **Only `core` exists today.** This facade named nineteen modules -- linalg,
+#: **`core` and `linalg` exist today.** This facade named nineteen modules -- linalg,
 #: optimize, integrate, interpolate, signal, stats, sparse and the rest -- and
 #: eighteen of them were never written, so `import jaisci` raised
 #: `cannot find module '.linalg'` for every caller. The package's own tests did
@@ -56,12 +56,17 @@ from .core import is_available, matmul, matvec, require_gpu
 from .core import arr_abs, arr_clip, arr_exp, arr_log, arr_maximum, arr_minimum, arr_pow
 from .core import arr_recip, arr_sign, arr_sqrt
 
+from .linalg import cho_factor, cho_solve, cholesky, det, inv, lstsq, lu_factor
+from .linalg import lu_solve, qr, solve, solve_triangular
+
 export { as_array, host, host_matrix, device_vector, device_matrix, require_gpu }
 export { arr_exp, arr_log, arr_sqrt, arr_abs, arr_pow, arr_recip, arr_sign, arr_clip }
 export { arr_maximum, arr_minimum, matmul, matvec, dot }
 export { dense_lu, dense_lu_solve, dense_cholesky, dense_qr, dense_triangular }
 export { dense_tridiagonal, givens, approx_fprime, approx_jacobian }
 export { OptimizeResult, RootResult }
+export { solve, solve_triangular, lu_factor, lu_solve, cholesky, cho_factor, cho_solve }
+export { qr, inv, det, lstsq }
 export { is_available }
 
 #: The package version, which `jaithon.package.json` also carries.
