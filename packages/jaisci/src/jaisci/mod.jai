@@ -13,9 +13,9 @@
 #: let x = sci.dense_lu_solve(lower, pivots, b)
 #: ```
 #:
-#: `sci.minimize` and the rest of `optimize` are here. The other examples this
-#: doc used to carry -- `sci.welch`, `sci.CubicSpline`, `sci.ttest_ind` -- name
-#: the surface the modules below owe when they are written.
+#: `sci.minimize`, `sci.CubicSpline` and `sci.ttest_ind` are here. The other
+#: example this doc used to carry -- `sci.welch` -- names the surface the
+#: signal module owes when it is written.
 #:
 #: **The array is `jainum.NDArray`, and jaisci does not define one.** Bulk data
 #: — signals, samples, matrices, point sets — is an `NDArray`; parameter
@@ -38,7 +38,8 @@
 #: `from jaisci.core import matmul` keeps working — so the facade is for
 #: callers who want the package rather than the file.
 #:
-#: **`core`, `linalg`, `optimize` and `integrate` exist today.** This facade named nineteen
+#: **`core`, `linalg`, `optimize`, `integrate`, `interpolate` and `stats`
+#: exist today.** This facade named nineteen
 #: modules -- linalg, optimize, integrate, interpolate, signal, stats, sparse
 #: and the rest -- and eighteen of them were never written, so `import jaisci`
 #: raised `cannot find module '.linalg'` for every caller. The package's own
@@ -68,6 +69,12 @@ from .integrate import IVPResult
 from .integrate import cumulative_trapezoid, fixed_quad, quad, simpson, solve_ivp
 from .integrate import trapezoid
 
+from .interpolate import CubicSpline, PchipInterpolator, interp
+
+from .stats import DescribeResult, LinregressResult, Normal
+from .stats import betainc, describe, lgamma, linregress, normal, pearsonr
+from .stats import spearmanr, t_cdf, t_sf, ttest_1samp, ttest_ind, ttest_rel
+
 export { as_array, host, host_matrix, device_vector, device_matrix, require_gpu }
 export { arr_exp, arr_log, arr_sqrt, arr_abs, arr_pow, arr_recip, arr_sign, arr_clip }
 export { arr_maximum, arr_minimum, matmul, matvec, dot }
@@ -80,6 +87,10 @@ export { bisect, brentq, brentq_full, newton, minimize_scalar, minimize }
 export { least_squares, curve_fit, XTOL, RTOL, MAXITER }
 export { quad, fixed_quad, trapezoid, simpson, cumulative_trapezoid }
 export { solve_ivp, IVPResult }
+export { interp, CubicSpline, PchipInterpolator }
+export { linregress, pearsonr, spearmanr, describe, LinregressResult, DescribeResult }
+export { ttest_1samp, ttest_ind, ttest_rel, normal, Normal, t_cdf, t_sf }
+export { betainc, lgamma }
 export { is_available }
 
 #: The package version, which `jaithon.package.json` also carries.
