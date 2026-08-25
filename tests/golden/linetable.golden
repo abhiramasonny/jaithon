@@ -20,7 +20,7 @@ b493b7a03cac8786f6989ae90f04d13728ed474f315ab463d115c064b16b0ae4  84  examples/y
 3e8b8b5514404b36f0b5c2862be503ac80baac2f78579f825485dc85e70caa43  815  examples/yolo_detect/detector.jai
 cc8ede5df70e90b60776c6be6427028ae153691cf3cb5d60c4674ee2723b460a  646  examples/yolo_detect/live.jai
 4814ccd20b40c4ca0f77971847543d8021f07bd2ff945ffca93e722e7592a476  151  examples/yolo_detect/ort_check.jai
-04ac4da38c5d3bce8e470b8fc44ffb4a9591d545dafb46d0e9477bd4b86bf1b1  3789  lib/jaithon/ast.jai
+9e7b8e802cf7e927b8da8994349961ebe9423bd93fcc3d8cf3dbe64ab1de0ef2  3807  lib/jaithon/ast.jai
 c971f39183b6c1cdd89dee2dda305f77187fd9abb298f7c1f6b65d95d190f91c  3552  lib/jaithon/ast_encode.jai
 9498d080525882d8c0695e7882d0bb84997cefb9dfa5a8ff8a5c8f4cfd547a43  4065  lib/jaithon/ast_unparse.jai
 0333c6857ff32225b9cb2992a3931634963a52e6e043bec8de8ade462e4d0403  1070  lib/jaithon/ast_visitor.jai
@@ -194,4 +194,4 @@ c99446f0a47d9ec65a760cb039c7a71e9b3a4e528b80c2e591cd93d0de2e3310  516  tests/gol
 f1942daa9ac333d8be760ceb2629af5de2b2eb506df1eea32e549bc2646df0f6  113  tests/golden/shadowing.jai
 fab4fc636bafe1f763c33f958e2fb658874df3a97e17405e101765edacd884ca  225  tests/golden/type_tests.jai
 e286562e8182f81293b8fa5a81fd887d852bf005743d2d0ab98a751d2e6820da  450  tests/golden/values_and_dispatch.jai
-# 196 files, 200003 instructions probed
+# 196 files, 200021 instructions probed

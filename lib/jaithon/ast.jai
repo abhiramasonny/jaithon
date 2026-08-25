@@ -1030,6 +1030,19 @@ pub class TypeExpr {
             TypeKind.Optional => {
                 let inner = self.inner
                 if inner is null { return "null" }
+                #: `?` binds tighter than a function type's arrow and than a
+                #: union's bar, so an optional wrapping either of those has to
+                #: keep the parentheses the source wrote. Without them
+                #: `(fn(float) -> float)?` printed as `fn(float) -> float?`,
+                #: which is a function RETURNING an optional -- a different
+                #: type that happens to be spelt with the same characters.
+                #: `fmt` rewrites a file through this printer, so the file came
+                #: back not merely reformatted but broken: the checker reported
+                #: "expected `fn(float) -> float?`, found `null`" on a default
+                #: argument that had been correct a moment earlier.
+                if inner.kind == TypeKind.Fn or inner.kind == TypeKind.Union {
+                    return "(" + inner.to_source() + ")?"
+                }
                 return inner.to_source() + "?"
             }
             TypeKind.Union => { return " | ".join(self._arg_sources()) }
