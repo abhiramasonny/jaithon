@@ -292,6 +292,32 @@ $(diff -u "$expected_err" <(printf '%s\n' "$errout") | head -40)"
     fi
 done
 
+# ------------------------------------------------- 5b. package importability
+#
+# Every package's own tests import its FILES -- `from jaisci.core import ...` --
+# so none of them ever exercised the facade a user reaches through
+# `import jaisci`. That facade named nineteen modules of which one existed, so
+# `import jaisci` raised for every caller while the suite stayed green and the
+# manifest check called the package valid. One line each, and it would not have.
+printf '%sPackage imports%s\n' "$BOLD" "$RESET"
+for manifest in "$ROOT"/packages/*/jaithon.package.json; do
+    pkg="$(basename "$(dirname "$manifest")")"
+    matches_filter "$pkg" || continue
+    start=$(now_ms)
+    probe="$(mktemp -t jaithon-import-XXXXXX)"
+    mv "$probe" "$probe.jai"
+    probe="$probe.jai"
+    printf 'import %s\nfn main() -> int { return 0 }\n' "$pkg" > "$probe"
+    import_output="$("$JAITHON" "$probe" 2>&1)"
+    import_status=$?
+    rm -f "$probe"
+    if [[ $import_status -eq 0 ]]; then
+        record_pass "import $pkg" "$(( $(now_ms) - start ))"
+    else
+        record_fail "import $pkg" "$import_output"
+    fi
+done
+
 # ------------------------------------------------------------ 6. formatting
 if [[ $FORMAT -eq 1 ]]; then
     printf '%sFormat check%s\n' "$BOLD" "$RESET"
