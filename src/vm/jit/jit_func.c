@@ -219,6 +219,23 @@ static int jitBuildList(JitCallDesc *d) {
     return 0;
 }
 
+/* `a + b` on two strings. Both operands are guarded for OBJ_STRING at the call
+ * site, so this is jaiStringConcat and nothing else -- the general arithmetic()
+ * fallback would have to be answered with a tag test on the result, and there
+ * is no shape of `+` other than this one that reaches here.
+ *
+ * Allocates (and appends into an existing ObjStrBuf), so roots go down first as
+ * for any call out of compiled code. NULL back means the concatenation
+ * overflowed UINT32_MAX and already threw. */
+static int jitStringConcat(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    ObjString *s = jaiStringConcat(AS_STRING(d->args[0]), AS_STRING(d->args[1]));
+    jaiGCPopRootRange();
+    if (s == NULL) return 1;
+    d->result = OBJ_VAL(s);
+    return 0;
+}
+
 /* args: start, stop, inclusive-flag. Allocates twice (range + iterator), so roots go down first as usual. */
 static int jitMakeRangeIter(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
@@ -3107,6 +3124,89 @@ static bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
 }
 
+/* Is the pair on top of the stack `str + str`?
+ *
+ * A string is SLOT_OBJ here, which pins nothing, so the sample is what makes
+ * this worth emitting and the guards below are what make it sound. Only ONE
+ * side needs a string sample: OP_FORMAT pushes its result without one (there
+ * is no Value to carry at compile time), and `text = text + f"..."` -- the
+ * shape word_freq's whole hot loop is -- has exactly that on the right. */
+static bool concatOperands(const Emit *e, Value *sample) {
+    /* Not inside an inlined body. OP_ADD is on inlinableBody's whitelist
+     * because every arm it had emitted straight-line code; this one calls, and
+     * an inlined body that calls breaks two things at once. Its entries live in
+     * x0..x8 when the caller's bank is callee-saved (inlineOwnBank), which is
+     * the register file the call destroys, and emitDescriptor reads its
+     * arguments through valueBankReg -- which does not know about that bank, so
+     * the descriptor is filled from callee-saved registers holding something
+     * else entirely. `fn cat(a: any) -> any { return a + "x" }` in a loop
+     * segfaults without this line. Declining costs nothing: the inline fails,
+     * and both tiers retry the whole body with inlining off, where this arm
+     * fires normally. */
+    if (e->inlining) return false;
+    if (e->depth < 2) return false;
+    if (e->stack[e->depth - 1] != SLOT_OBJ) return false;
+    if (e->stack[e->depth - 2] != SLOT_OBJ) return false;
+    Value sa = e->stackSeen[e->depth - 2], sb = e->stackSeen[e->depth - 1];
+    if (!IS_STRING(sa) && !IS_STRING(sb)) return false;
+    *sample = IS_STRING(sa) ? sa : sb;
+    return true;
+}
+
+/* `a + b` out to jaiStringConcat. Concatenation allocates, so there is nothing
+ * to inline; the point is that the rest of the loop body stops being given up.
+ * word_freq declined its whole `main` loop on the ADD_BIND this replaces -- one
+ * refusal costing an LCG step, an f-string and the append around it.
+ *
+ * Measured (best of five, alternating builds, under the GPU lock): a 3M-step
+ * `text = text + f"w{n} "` loop 204.4ms -> 128.4ms, 1.59x; word_freq at 3M
+ * words 392.8ms -> 313.9ms end to end, 1.25x; word_freq as shipped 35.2ms ->
+ * 28.2ms, 1.85x once the ~20ms startup floor is taken off. Ruled out: a
+ * self-hosted `check` of compile/parser.jai does NOT move (775ms -> 767ms,
+ * noise) even though OP_ADD is a few percent of its interpreted work -- the
+ * bodies holding it decline for other reasons anyway, so freeing this one
+ * changes nothing there.
+ *
+ * Both operands are guarded, not just the sample-less one: SLOT_OBJ says
+ * "heap object" and no more, and a guard here resumes at this instruction with
+ * both operands still on the interpreter's stack, so a miss costs nothing --
+ * a loop alternating `str + str` with `list + list` agrees with the
+ * interpreter under both --gc-stress and JAITHON_JIT_DEOPT_STRESS.
+ *
+ * Deliberately NOT the general `arithmetic()` fallback: that answers int, float
+ * and string alike, so the result would need a tag test after the call to know
+ * whether the register holds a pointer. Guarding the two operands instead
+ * settles the result kind before the call is made, which is the same argument
+ * OP_GET_SLICE makes for guarding its container. */
+static bool emitStringConcat(Emit *e, Value sample) {
+    settleAll(e);                    /* this path guards */
+    unsigned ra = valueXReg(e, e->valueDepth - 2);
+    unsigned rb = valueXReg(e, e->valueDepth - 1);
+
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, ra, (unsigned)offsetof(Obj, type)));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+    branchOnDeopt(e, JAI_A64_NE);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rb, (unsigned)offsetof(Obj, type)));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
+                        (void *)&jitStringConcat)) {
+        return false;
+    }
+    unsigned drop;
+    if (!popValue(e, &drop, NULL)) return false;
+    if (!popValue(e, &drop, NULL)) return false;
+    /* Carry a sample so the next instruction still knows this is a string --
+     * the same reason the string-index arm carries its receiver's. */
+    if (!pushValue3(e, SLOT_OBJ, 0, NULL, sample, -1)) return false;
+    emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                       e->descOffset +
+                           (unsigned)offsetof(JitCallDesc, result) + 8));
+    e->wroteHeap = true;
+    return true;
+}
+
 /* A builtin whose whole body is a load from its receiver (jit_field_read.h).
  * The caller has already guarded that the receiver is `fr->type`, so the load
  * is the entire call: no callee Value, no argument Value, no root fill, no
@@ -4946,6 +5046,31 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 off += 3;
                 break;
             }
+            /* `text = text + piece` on strings. Out to jaiStringConcat behind a
+             * pair of type guards -- see emitStringConcat. Before this arm the
+             * refusal below gave up word_freq's entire `main` loop, which is
+             * this one instruction plus the LCG arithmetic around it. */
+            {
+                Value csample;
+                if (concatOperands(e, &csample)) {
+                    /* The kind is adopted AFTER the call, not before: the
+                     * descriptor's root fill reads every object-kinded local,
+                     * and until the store below this slot still holds the old
+                     * string -- claiming the new kind first would describe a
+                     * slot the call has not written yet. */
+                    if (!emitStringConcat(e, csample)) return false;
+                    if (!adoptLocalKindSeen(e, slot, SLOT_OBJ, 0, NULL,
+                                            csample)) {
+                        e->whyNot = kindClash(e, slot);
+                        return false;
+                    }
+                    unsigned rc;
+                    if (!popValue(e, &rc, NULL)) return false;
+                    localOut(e, slot, rc);
+                    off += 3;
+                    break;
+                }
+            }
             unsigned rb, ra;
             SlotKind kb, ka;
             if (!popValue(e, &rb, &kb)) return false;
@@ -5881,6 +6006,20 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_DIV: {
             unsigned rb, ra;
             SlotKind kb, ka;
+            /* `head + "/" + right`: two strings, out to jaiStringConcat, the
+             * unfused half of the ADD_BIND arm above. Measured on a self-hosted
+             * `check`, where OP_ADD is a few percent of the interpreted work:
+             * no change (775ms -> 767ms, noise). The bodies holding it decline
+             * for other reasons anyway, so this arm earns its place on the
+             * ADD_BIND shape and not on the compiler. */
+            if (op == OP_ADD) {
+                Value csample;
+                if (concatOperands(e, &csample)) {
+                    if (!emitStringConcat(e, csample)) return false;
+                    off += 1;
+                    break;
+                }
+            }
             if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_FLOAT &&
                 e->stack[e->depth - 2] == SLOT_FLOAT) {
                 unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
