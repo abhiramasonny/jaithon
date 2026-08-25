@@ -3435,6 +3435,63 @@ static bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
 
 /* Branches straight to a compiled callee's entry, skipping the descriptor/jaiCallValue/interpreter-
  * frame path. Convention: raw payloads in x0.., closure in the last arg register if the callee reads an upvalue, x0/x1 = value/verdict on return -- the same one jaiJitEnterFunc checks and a self-call already uses, so skipping that entry means answering its checks here instead: module version (why the callee must live in the caller's module), every parameter's kind+shape (by the caller's model), and the verdict (below). Nonzero verdict: a callee that writes NOTHING can have the whole call abandoned and re-executed from the pre-call stack (two compares, no stub); a callee that WRITES cannot be re-run -- verdict 4 means it deoptimised part-way and is FINISHED in the interpreter from its own record, sharing the `selfSlow` machinery a recursive self-call already uses. A raised exception goes to the throw exit instead, since its effects already happened. `calleeReg`: the ObjClosure register, or -1 if baked in. `cidx`: operand-stack index of the callee entry (the RECEIVER for a method, i.e. its slot 0). `after`: offset of the fall-through instruction. */
+/* A `-> T?` result read back out of a call descriptor.
+ *
+ * Two tags are acceptable where every other kind has exactly one, so the single
+ * compare the other arms use cannot serve. VAL_NULL is zero, which is what lets
+ * "object or null" be two csels and a compare rather than a branch: afterwards
+ * D holds the payload or a defined zero, and B is zero exactly when the tag was
+ * one of the two.
+ *
+ * The class checks apply only to a non-null. The field arm at
+ * OP_GET_FIELD_LOCAL keeps its equivalents branch-free by redirecting the loads
+ * at its live receiver; a call result has no such pointer to borrow, so they
+ * sit behind a forward branch instead. A deopt inside that span is sound for
+ * the reason emitBoundsNormalise's is: the record is written from the
+ * descriptor, which holds the true Value whichever way the branch went.
+ *
+ * Worth having because after this the refusal it removes was the tier's single
+ * largest on the self-hosted compiler: one `check --no-cache` of
+ * compile/parser.jai stopped 64 bodies at "callee's return kind not usable"
+ * with the kind being exactly SLOT_MAYBE_INST, and every one of them had a
+ * resolvable class. `-> Node?` is what a parser's methods return. */
+static void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,
+                                uint32_t rshape, uint32_t deoptIp) {
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
+    emit(e, jaiA64LdrX(JIT_SCRATCH_D, 31, rat + 8));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, VAL_OBJ));
+    emit(e, jaiA64CselX(JIT_SCRATCH_D, JIT_SCRATCH_D, JIT_SCRATCH_B,
+                        JAI_A64_EQ));
+    emit(e, jaiA64CselX(JIT_SCRATCH_B, JIT_SCRATCH_B, JIT_SCRATCH_A,
+                        JAI_A64_EQ));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+    branchOnDeoptAt(e, JAI_A64_NE, deoptIp, true);
+
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, 0));
+    unsigned skip = e->count;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                       (unsigned)offsetof(Obj, type)));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+    branchOnDeoptAt(e, JAI_A64_NE, deoptIp, true);
+    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                       (unsigned)offsetof(ObjInstance, klass)));
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                       (unsigned)offsetof(ObjClass, shapeId)));
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+    branchOnDeoptAt(e, JAI_A64_NE, deoptIp, true);
+    /* Nothing to jump over means the arena filled mid-sequence; leaving the
+     * branch unpatched would run the class loads on a null pointer. */
+    if (skip < e->count && e->count <= JIT_MAX_INSTS) {
+        e->code[skip] = jaiA64BCond(JAI_A64_EQ, (int32_t)(e->count - skip));
+    } else {
+        e->failed = true;
+    }
+    emit(e, jaiA64MovX(dst, JIT_SCRATCH_D));
+}
+
 static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
@@ -3498,13 +3555,18 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
      * zero payload -- same treatment a self-call to a void function gets. Refusing it declined every caller of a procedure, which in nbody is the whole of `main`. */
     SlotKind rk = (SlotKind)cfn->jitReturnKind;
     ObjClass *rcls = NULL;
+    /* SLOT_MAYBE_INST rides with SLOT_INST here and needs no guard of its own:
+     * a direct branch takes the callee's raw payload, and for a nullable
+     * instance that payload IS the pointer or a zero -- the same
+     * representation this caller will hold. The callee's declared return kind
+     * is the contract, exactly as it is for every other kind at this arm. */
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-        rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
-        rk != SLOT_NULL) {
+        rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
+        rk != SLOT_OBJ && rk != SLOT_NULL) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
-    if (rk == SLOT_INST &&
+    if ((rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&
         (cfn->jitReturnShape == 0 ||
          !jaiClassForShape(cfn->jitReturnShape, &rcls) || rcls == NULL)) {
         e->whyNot = "callee's return class not on record";
@@ -3985,15 +4047,15 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     } else {
         haveKind = observedReturnKind(cfn, &rk, &rshape);
     }
-    if (haveKind && rk == SLOT_INST &&
+    if (haveKind && (rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&
         (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
         e->whyNot = "callee's return class not on record";
         return false;
     }
     if (!haveKind ||
         (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-         rk != SLOT_INST && rk != SLOT_LIST && rk != SLOT_OBJ &&
-         rk != SLOT_NULL)) {
+         rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
+         rk != SLOT_OBJ && rk != SLOT_NULL)) {
         e->whyNot = "callee's return kind not usable";
         return false;
     }
@@ -4010,6 +4072,10 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     if (!pushValue(e, rk, rshape, rcls)) return false;
 
     unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    if (rk == SLOT_MAYBE_INST) {
+        emitMaybeInstResult(e, pushReg(e) - 1, rat, rshape, after);
+        return true;
+    }
     unsigned wantTag = rk == SLOT_INT   ? VAL_INT
                      : rk == SLOT_FLOAT ? VAL_FLOAT
                      : rk == SLOT_BOOL  ? VAL_BOOL
@@ -7334,7 +7400,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 } else {
                     haveKind = observedReturnKind(mfn, &rkind, &rshape);
                 }
-                if (haveKind && rkind == SLOT_INST &&
+                if (haveKind &&
+                    (rkind == SLOT_INST || rkind == SLOT_MAYBE_INST) &&
                     (rshape == 0 || !jaiClassForShape(rshape, &rrcls) ||
                      rrcls == NULL)) {
                     haveKind = false;
@@ -7342,8 +7409,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 if (haveKind && rkind != SLOT_INT && rkind != SLOT_FLOAT &&
                     rkind != SLOT_BOOL && rkind != SLOT_INST &&
-                    rkind != SLOT_LIST && rkind != SLOT_OBJ &&
-                    rkind != SLOT_NULL) {
+                    rkind != SLOT_MAYBE_INST && rkind != SLOT_LIST &&
+                    rkind != SLOT_OBJ && rkind != SLOT_NULL) {
                     haveKind = false;
                 }
                 /* A result the very next instruction pops needs no kind at all -- which is every `-> void`
@@ -7393,6 +7460,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
                 unsigned rat = e->descOffset +
                                (unsigned)offsetof(JitCallDesc, result);
+                if (rkind == SLOT_MAYBE_INST) {
+                    emitMaybeInstResult(e, pushReg(e) - 1, rat, rshape,
+                                        (uint32_t)(off + 7));
+                    off += 7;
+                    break;
+                }
                 unsigned wantTag = rkind == SLOT_INT   ? VAL_INT
                                  : rkind == SLOT_FLOAT ? VAL_FLOAT
                                  : rkind == SLOT_BOOL  ? VAL_BOOL
