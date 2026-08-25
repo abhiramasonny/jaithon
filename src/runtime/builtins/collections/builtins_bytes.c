@@ -424,6 +424,134 @@ static void quantiseRange(void *context, size_t start, size_t end) {
     }
 }
 
+/* `grid_nonzero(dst, src, rows, cols, stride, origin)` -- scatter a source
+ * image into a padded destination as ones and zeros.
+ *
+ * `dst[origin + y * stride + x] = src[y * cols + x] != 0 ? 1 : 0`, which is
+ * what every border follower, flood fill and connected-components pass in this
+ * repository starts by building: a binary copy of the picture sitting inside a
+ * ring of zeros, so the walk never has to ask whether a neighbour exists.
+ *
+ * It is here rather than in the library because the library's version is at the
+ * language's floor and the floor is too high. Written as the obvious two loops
+ * it is 4.95 ms for a 1080p frame -- 2.4 ns a cell for a load, a compare and a
+ * store, which is what a compiled loop with two bounds checks and a boxed store
+ * costs. Reading the source as `bytes` instead of `list[float]` measured 4.82
+ * ms, so it is not the read: it is the per-element boxing and checking, and no
+ * amount of rewriting inside the language removes that. This is the same
+ * reasoning `bytes_quantise` and `list_filled` were added under.
+ *
+ * The source may be a `list` of numbers or `bytes`; the destination is a list
+ * of ints long enough to hold the padded layout, which the caller allocates
+ * once and reuses.
+ */
+typedef struct {
+    const Value   *src;
+    const uint8_t *srcBytes;
+    Value         *dst;
+    size_t         cols;
+    size_t         stride;
+    size_t         origin;
+} GridNonzeroWork;
+
+static void gridNonzeroRows(void *context, size_t start, size_t end) {
+    const GridNonzeroWork *work = (const GridNonzeroWork *)context;
+    for (size_t y = start; y < end; y++) {
+        const size_t from = y * work->cols;
+        Value *row = work->dst + work->origin + y * work->stride;
+        if (work->srcBytes != NULL) {
+            const uint8_t *src = work->srcBytes + from;
+            for (size_t x = 0; x < work->cols; x++) {
+                row[x] = INT_VAL(src[x] != 0 ? 1 : 0);
+            }
+            continue;
+        }
+        const Value *src = work->src + from;
+        for (size_t x = 0; x < work->cols; x++) {
+            const Value item = src[x];
+            /* A NaN is not zero, and comparing it against zero says so
+             * correctly -- but only because the test is `!= 0`, not `> 0`. */
+            bool set = IS_FLOAT(item) ? (AS_FLOAT(item) != 0.0)
+                                      : (AS_INT(item) != 0);
+            row[x] = INT_VAL(set ? 1 : 0);
+        }
+    }
+}
+
+static bool primGridNonzero(int argc, Value *args, Value *out) {
+    (void)argc;
+    if (!IS_LIST(args[0])) {
+        return jaiThrow(vm.cTypeError,
+                        "grid_nonzero(): the destination must be a list, got %s",
+                        jaiTypeNameStatic(args[0]));
+    }
+    const Value *src = NULL;
+    const uint8_t *srcBytes = NULL;
+    size_t srcCount = 0;
+    if (IS_LIST(args[1])) {
+        ObjList *items = AS_LIST(args[1]);
+        src = items->items;
+        srcCount = (size_t)items->count;
+        for (size_t i = 0; i < srcCount; i++) {
+            if (!IS_FLOAT(items->items[i]) && !IS_INT(items->items[i])) {
+                return jaiThrow(vm.cTypeError,
+                                "grid_nonzero(): source element %zu is %s, not a number",
+                                i, jaiTypeNameStatic(items->items[i]));
+            }
+        }
+    } else if (IS_BYTES(args[1])) {
+        ObjBytes *raw = AS_BYTES(args[1]);
+        srcBytes = raw->data;
+        srcCount = (size_t)raw->length;
+    } else {
+        return jaiThrow(vm.cTypeError,
+                        "grid_nonzero(): the source must be a list or bytes, got %s",
+                        jaiTypeNameStatic(args[1]));
+    }
+
+    int64_t rows, cols, stride, origin;
+    if (!jaiStrWantInt(args[2], "grid_nonzero", "the row count", &rows)) return false;
+    if (!jaiStrWantInt(args[3], "grid_nonzero", "the column count", &cols)) return false;
+    if (!jaiStrWantInt(args[4], "grid_nonzero", "the destination stride", &stride)) return false;
+    if (!jaiStrWantInt(args[5], "grid_nonzero", "the destination origin", &origin)) return false;
+    if (rows < 0 || cols < 0 || stride < 0 || origin < 0) {
+        return jaiThrow(vm.cValueError,
+                        "grid_nonzero(): rows, cols, stride and origin cannot be negative");
+    }
+    if (cols > stride) {
+        return jaiThrow(vm.cValueError,
+                        "grid_nonzero(): %lld columns do not fit a stride of %lld",
+                        (long long)cols, (long long)stride);
+    }
+    if ((size_t)(rows * cols) > srcCount) {
+        return jaiThrow(vm.cValueError,
+                        "grid_nonzero(): %lldx%lld needs %lld source values, got %zu",
+                        (long long)rows, (long long)cols,
+                        (long long)(rows * cols), srcCount);
+    }
+    ObjList *dst = AS_LIST(args[0]);
+    /* The last cell written, which is what has to fit -- not the whole
+     * rectangle, since the final row need not be padded. */
+    int64_t reach = rows == 0 ? 0 : origin + (rows - 1) * stride + cols;
+    if (reach > (int64_t)dst->count) {
+        return jaiThrow(vm.cValueError,
+                        "grid_nonzero(): the destination holds %d values, %lld are needed",
+                        dst->count, (long long)reach);
+    }
+
+    GridNonzeroWork work = {
+        src, srcBytes, dst->items, (size_t)cols, (size_t)stride, (size_t)origin,
+    };
+    /* Chunked by ROW, not by cell: a chunk boundary inside a row would have to
+     * carry the row's base offsets, and a 1080p frame is a thousand rows --
+     * enough work units for every core. */
+    jaiParallelChunks((size_t)rows, cols > 0 ? (JAI_QUANTISE_CHUNK / (size_t)cols) + 1 : 1,
+                      gridNonzeroRows, &work);
+    dst->version++;
+    *out = NULL_VAL;
+    return true;
+}
+
 static bool primBytesQuantise(int argc, Value *args, Value *out) {
     (void)argc;
     if (!IS_LIST(args[0])) {
@@ -628,6 +756,7 @@ static bool primListPackArgb(int argc, Value *args, Value *out) {
 void jaiBytesRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "bytes_quantise", primBytesQuantise, 1, 2);
     jaiStrDefinePrim(ns, "list_filled",    primListFilled,    1, 2);
+    jaiStrDefinePrim(ns, "grid_nonzero",   primGridNonzero,   6, 6);
     jaiStrDefinePrim(ns, "list_pack_argb", primListPackArgb,  2, 2);
     jaiStrDefinePrim(ns, "bytes_new",      primBytesNew,      1, 1);
     jaiStrDefinePrim(ns, "bytes_len",      primBytesLen,      1, 1);
