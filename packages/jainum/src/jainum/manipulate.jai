@@ -31,7 +31,8 @@
 #: ```
 from std.gpu import Buffer
 
-from .array import NDArray, PRELUDE, broadcast_shapes, contiguous_strides, copy_into
+from .array import NDArray, OP_SUB, PRELUDE, binary_arith, broadcast_shapes
+from .array import contiguous_strides, copy_into
 from .array import diagonal_view, element_count, fill, kernel_of, normalize_axes
 from .array import normalize_axis, promote
 
@@ -840,6 +841,43 @@ pub fn resize(a: NDArray, shape: list[int]) -> NDArray {
 #:
 #: Free: a flip negates a stride and walks from the far end. Nothing is copied,
 #: and a write through the result lands in the parent, reversed.
+#: `numpy.diff`: the `n`-th discrete difference along `axis`.
+#:
+#: Each pass subtracts the array from itself shifted one step along the axis,
+#: which two views say without copying anything: the same shape but one shorter
+#: on that axis, one of them starting a stride further in. The axis loses one
+#: element a pass, as numpy's does.
+#:
+#: `histogramdd` and `digitize` both call this, and neither worked before it
+#: existed — they raised `undefined name` at the line that used it. `make check`
+#: had been reporting that and nothing read the output.
+pub fn diff(a: NDArray, n: int = 1, axis: int = -1) -> NDArray {
+    if n < 0 { throw ValueError(f"diff needs a non-negative order, got {n}") }
+    if a.ndim() == 0 { throw ValueError("diff needs at least one dimension") }
+    var current = a.copy()
+    for _pass in 0..n {
+        let at = normalize_axis(axis, current.ndim())
+        let size = current.shape[at]
+        var shape = [extent for extent in current.shape]
+        shape[at] = if size > 1 { size - 1 } else { 0 }
+        if shape[at] == 0 {
+            #: numpy leaves an empty axis here and every later pass is a
+            #: no-op on it, so stop rather than subtract nothing repeatedly.
+            let empty = NDArray(shape, current.dtype)
+            current.free()
+            return empty
+        }
+        let lower = current.view(shape, current.strides, current.offset)
+        let upper = current.view(shape, current.strides, current.offset + current.strides[at])
+        let stepped = binary_arith(upper, lower, OP_SUB)
+        lower.free()
+        upper.free()
+        current.free()
+        current = stepped
+    }
+    return current
+}
+
 pub fn flip(a: NDArray, axis: any = null) -> NDArray {
     let rank = a.ndim()
     let axes = if axis is null { [other for other in 0..rank] } else { _axis_list(axis, rank) }

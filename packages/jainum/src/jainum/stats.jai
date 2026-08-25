@@ -39,9 +39,9 @@ from .array import binary_arith, contiguous_strides, copy_into, element_count
 from .array import f32_bits, fill, gather_flat, kernel_of, normalize_axis
 from .array import promote, require_real
 from .create import array, linspace, zeros
-from .manipulate import concatenate, flip, reshape
+from .manipulate import concatenate, diff, flip, reshape
 from .matmul import matmul
-from .reduce import all, amax, amin, cumsum, mean, sum
+from .reduce import all, amax, amin, count_nonzero, cumsum, mean, sum
 from .sorting import argsort, searchsorted, sort
 from .ufunc import clip, isnan, remainder, sqrt, subtract
 
@@ -1316,18 +1316,24 @@ pub fn digitize(x: NDArray, bins: NDArray, right: bool = false) -> NDArray {
 }
 
 #: Whether every step has the sign the caller is asking about.
+#:
+#: `clip(v, 0, null) - v` is zero exactly where `v` is at least zero and
+#: positive where it is not, so "never negative" is "that shortfall is nowhere
+#: nonzero" -- which is a count, not a truth fold.
+#:
+#: It used to clip the shortfall to `[-0.0, 0.0]` and hand THAT to `all`. The
+#: clip made it zero everywhere, and `all` over zeros is false, so this
+#: answered false for every input it was ever given: `digitize` rejected bins
+#: as "neither rising nor falling" whatever they were.
 fn _never_negative(steps: NDArray, inverted: bool) -> bool {
     let signed = if inverted { binary_arith(steps, -1.0, OP_MUL) } else { steps }
-    let ok = all(_at_least_zero(signed)).item() != 0.0
+    let lifted = clip(signed, 0.0, null)
+    let shortfall = binary_arith(lifted, signed, OP_SUB)
+    lifted.free()
+    let counted = count_nonzero(shortfall)
+    let wrong = counted.item()
+    counted.free()
+    shortfall.free()
     if inverted { signed.free() }
-    return ok
-}
-
-fn _at_least_zero(a: NDArray) -> NDArray {
-    let flags = clip(a, 0.0, null)
-    let same = binary_arith(flags, a, OP_SUB)
-    flags.free()
-    let zeros_only = clip(same, -0.0, 0.0)
-    same.free()
-    return zeros_only
+    return wrong == 0.0
 }

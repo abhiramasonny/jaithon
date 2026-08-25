@@ -86,7 +86,7 @@ from .reduce import nanargmax, nanargmin, nanmax, nanmean, nanmin, nanstd, nansu
 from .reduce import nanvar, prod, ptp, std, sum, trace, variance
 
 from .manipulate import PAD_EDGE, PAD_REFLECT, PAD_WRAP
-from .manipulate import array_split, atleast_1d, atleast_2d, atleast_3d
+from .manipulate import array_split, atleast_1d, atleast_2d, atleast_3d, diff
 from .manipulate import broadcast_arrays, broadcast_to, column_stack, concatenate
 from .manipulate import diagonal, dsplit, dstack, expand_dims, flatten, flip, fliplr
 from .manipulate import flipud, hsplit, hstack, moveaxis, pad, permute_dims, ravel
@@ -148,7 +148,7 @@ export { allclose, array_equal }
 
 export { reshape, ravel, flatten, resize, squeeze, expand_dims }
 export { transpose, permute_dims, swapaxes, moveaxis, rollaxis }
-export { atleast_1d, atleast_2d, atleast_3d, broadcast_to, broadcast_arrays }
+export { atleast_1d, atleast_2d, atleast_3d, broadcast_to, broadcast_arrays, diff }
 export { diagonal, concatenate, stack, vstack, hstack, dstack, column_stack }
 export { split, array_split, vsplit, hsplit, dsplit }
 export { tile, repeat, flip, fliplr, flipud, roll, rot90 }
