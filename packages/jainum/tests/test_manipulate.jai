@@ -17,7 +17,7 @@ from jainum.array import COMPLEX64, FLOAT32, INT32, NDArray, element_count
 from jainum.manipulate import PAD_EDGE, PAD_REFLECT, PAD_WRAP
 from jainum.manipulate import array_split, atleast_1d, atleast_2d, atleast_3d
 from jainum.manipulate import broadcast_arrays, broadcast_to, column_stack, concatenate
-from jainum.manipulate import diagonal, dsplit, dstack, expand_dims, flatten, flip
+from jainum.manipulate import diagonal, diff, dsplit, dstack, expand_dims, flatten, flip
 from jainum.manipulate import fliplr, flipud, hsplit, hstack, moveaxis, pad
 from jainum.manipulate import permute_dims, ravel, repeat, reshape, resize, roll
 from jainum.manipulate import rollaxis, rot90, split, squeeze, stack, swapaxes
@@ -820,4 +820,61 @@ fn test_the_mode_constants_are_the_ones_the_kernel_switches_on() -> void {
     assert_eq(PAD_EDGE, 0)
     assert_eq(PAD_WRAP, 1)
     assert_eq(PAD_REFLECT, 2)
+}
+
+#: `diff` against numpy, which is where every expected value below came from.
+#:
+#: It did not exist at all until 2026-08-24, and `histogramdd` and `digitize`
+#: both called it, so both raised `undefined name` at the line that used it.
+#: `make check` had been reporting that and nothing read the output.
+fn test_diff_matches_numpy() -> void {
+    if not have_gpu() { return }
+    let a = NDArray([5], FLOAT32)
+    a.upload([1.0, 2.0, 4.0, 7.0, 11.0])
+    defer { a.free() }
+
+    let once = diff(a)
+    defer { once.free() }
+    assert_eq(once.shape, [4])
+    assert_eq(once.to_list(), [1.0, 2.0, 3.0, 4.0])
+
+    let twice = diff(a, 2)
+    defer { twice.free() }
+    assert_eq(twice.to_list(), [1.0, 1.0, 1.0])
+
+    let thrice = diff(a, 3)
+    defer { thrice.free() }
+    assert_eq(thrice.to_list(), [0.0, 0.0])
+
+    #: An order of zero is the array itself, as numpy has it.
+    let none = diff(a, 0)
+    defer { none.free() }
+    assert_eq(none.to_list(), [1.0, 2.0, 4.0, 7.0, 11.0])
+
+    #: An axis one long leaves an empty one, not an error.
+    let single = NDArray([1], FLOAT32)
+    single.upload([5.0])
+    defer { single.free() }
+    let emptied = diff(single)
+    defer { emptied.free() }
+    assert_eq(emptied.shape, [0])
+
+    assert_throws(ValueError, || diff(a, -1))
+}
+
+fn test_diff_walks_the_axis_it_is_given() -> void {
+    if not have_gpu() { return }
+    let m = NDArray([2, 4], FLOAT32)
+    m.upload([1.0, 3.0, 6.0, 10.0, 2.0, 5.0, 9.0, 14.0])
+    defer { m.free() }
+
+    let along_rows = diff(m, 1, -1)
+    defer { along_rows.free() }
+    assert_eq(along_rows.shape, [2, 3])
+    assert_eq(along_rows.to_list(), [2.0, 3.0, 4.0, 3.0, 4.0, 5.0])
+
+    let down_columns = diff(m, 1, 0)
+    defer { down_columns.free() }
+    assert_eq(down_columns.shape, [1, 4])
+    assert_eq(down_columns.to_list(), [1.0, 2.0, 3.0, 4.0])
 }
