@@ -4705,13 +4705,76 @@ static bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
     return true;
 }
 
+/* Where the body proper starts. A defaulted parameter compiles to a thunk of
+ * its own at the TOP of the chunk with the body hopped to over an
+ * unconditional jump -- `fn matches(x: int, want: int = -1)` is exactly
+ * `0000 OP_JUMP +4 -> 0007 / 0003 OP_INT -1 / 0006 OP_RETURN / 0007 body`.
+ *
+ * Walking those three dead instructions cost far more than emitting them: a
+ * thunk ends in OP_RETURN like any other return, so mergeReturnKind recorded
+ * the DEFAULT's kind and every real return of a different kind then clashed
+ * with it and declined the whole function. `matches` above is INT-then-BOOL
+ * and stopped at `OP_RETURN` for it; in a self-hosted compile the same clash
+ * is what stopped window_clean, Lexer._push, Universe.intern, parser._type and
+ * modsig.load.
+ *
+ * MEASURED, best of nine alternating runs under scripts/gpu_lock.sh, the two
+ * sample sets not overlapping at all in either workload: `check --no-cache`
+ * over four compiler files 2196ms -> 2106ms (4.3%), and over four others
+ * 1469ms -> 1404ms (4.6%). A 3M-call probe on `matches` itself is 137ms ->
+ * 29ms wall, ~13x on the loop once the ~20ms process floor is taken off both
+ * sides -- the callee's body is too small for the OSR tier to rescue, which is
+ * the shape that pays most. Where the loop is INSIDE the defaulted function,
+ * OSR already had it and the same change is only 1.36x. The durable figure is
+ * the decline count: 66 stops at OP_RETURN in one `check --no-cache` of
+ * check/expr.jai, and zero after.
+ *
+ * SAFE because the skipped region is unreachable from the whole-function
+ * entry, not merely unwalked:
+ *   - The interpreter runs a thunk by ENTERING at its own offset
+ *     (evalDefaultThunk, off fn->defaultOffsets), never by falling into it,
+ *     and bindCallArgsSlow does all of that BEFORE the frame runs -- so by the
+ *     time a compiled instruction executes the defaults are already in slots.
+ *   - Every path into the whole-function form checks argc == arity first
+ *     (callClosure, jaiCallValue1, run()'s tail call, and a compiled self-call,
+ *     which declines outright unless argc == arity).
+ *   - Nothing branches into the region: every offset in it is checked against
+ *     offsetIsBranchTarget, whose operand table includes OP_PUSH_HANDLER and
+ *     OP_PUSH_FINALLY, so a default expression holding a try edge fails the
+ *     test and keeps the old behaviour. (It would be safe anyway -- the tier
+ *     has no arm for OP_PUSH_HANDLER, so only the interpreter ever runs that
+ *     thunk -- but the check does not have to know that.)
+ *
+ * Ruled out as a narrower fix: having mergeReturnKind ignore returns inside the
+ * region. It would recover the return kind but still emit the thunks and still
+ * charge them to the instruction budget, and it leaves the walk modelling code
+ * the entry cannot reach. */
+static int bodyEntryOffset(const ObjFunction *fn) {
+    const Chunk *c = &fn->chunk;
+    if (fn->defaultCount == 0 || fn->defaultOffsets == NULL) return 0;
+    if (c->count < 3 || c->code[0] != OP_JUMP) return 0;
+    int target = 3 + (int)jaiReadI16(c->code + 1);
+    if (target <= 3 || target >= c->count) return 0;
+    for (unsigned d = 0; d < fn->defaultCount; d++) {
+        uint32_t at = fn->defaultOffsets[d];
+        if (at < 3u || at >= (uint32_t)target) return 0;
+    }
+    for (int at = 3; at < target;) {
+        if (offsetIsBranchTarget(c, (uint32_t)at)) return 0;
+        int len = instructionLength(c, at);
+        if (len <= 0) return 0;
+        at += len;
+    }
+    return target;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure) {
     ObjFunction *fn = closure->fn;
     const uint8_t *code = fn->chunk.code;
     int count = fn->chunk.count;
 
     /* An inlined body is walked whole; the OSR window belongs to the caller. */
-    int start = (!e->inlining && e->osr) ? (int)e->osrTop : 0;
+    int start = (!e->inlining && e->osr) ? (int)e->osrTop : bodyEntryOffset(fn);
     int stop  = (!e->inlining && e->osr) ? (int)e->osrEnd : count;
     bool afterUncond = false;
     /* The offset the walk visited before this one, for the arms that want to
