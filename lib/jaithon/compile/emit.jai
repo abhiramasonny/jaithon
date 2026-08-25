@@ -820,6 +820,13 @@ pub class Emitter {
     pub var imported_enums: dict[str, Node]
     var stack: list[FnCtx]
     var enums: dict[str, Node]
+    #: The METHOD names of each class whose body is being lowered, innermost
+    #: last. `_call` needs it to tell `self.m()` -- a real method -- from
+    #: `self.f()`, a field that happens to hold a callable; see the tail-call
+    #: note there. Methods only: a getter's `self.g()` calls what the getter
+    #: RETURNS, and an inherited method is not in this class's own list, so
+    #: both keep the old shape rather than being answered wrongly.
+    var class_methods: list[list[str]]
 
     #: Create an emitter over `resolution`, reporting into `bag`.
     pub fn init(
@@ -839,6 +846,7 @@ pub class Emitter {
         self.imported_enums = {}
         self.stack = []
         self.enums = {}
+        self.class_methods = []
     }
 
     #: Lower `program` and return the module body's function record.
@@ -1358,7 +1366,54 @@ pub class Emitter {
             return
         }
 
-        if callee.kind == NodeKind.Member and keywords.len() == 0 and spread == null and not tail {
+        #: `return self.m(x)` is an INVOKE, not a tail call.
+        #:
+        #: `Op.TailCall` reuses the caller's frame only when the callee passes
+        #: `IS_CLOSURE`, and `self.m` puts a BOUND METHOD in the callee slot --
+        #: an ObjBound is not a closure, so the test fails and the call is
+        #: handed straight back to the ordinary path. Checked, not assumed: a
+        #: class whose method tail-calls itself two million times still dies at
+        #: 1024 frames, exactly as it does with this change. So for a genuine
+        #: method the tail form bought nothing and cost the compiled tier the
+        #: whole enclosing body -- `self._at` lowers as a FIELD read, the
+        #: function tier's `jaiClassFieldInfo` does not find a method there, and
+        #: the body declines at `OP_GET_FIELD_LOCAL`. The invoke shape compiles
+        #: through the direct-method path that already existed.
+        #:
+        #: Measured old against new, alternating, best of 30 timed runs each,
+        #: under scripts/gpu_lock.sh: a method-per-iteration probe 1369ms ->
+        #: 413ms (3.3x); tests/bench/json_parse, which has two `return
+        #: self.method()` sites, 955ms -> 709ms (1.35x); a cold `check` of
+        #: parser.jai, where the front end's own `_peek`/`_at` are the inner
+        #: loop, 881ms -> 842ms (4.5%).
+        #:
+        #: NARROW ON PURPOSE, and narrower than `self.` alone. A member of
+        #: anything else may be a module function or a static, and a member of
+        #: `self` may be a callable FIELD -- `lib/std/iter/mod.jai:712`,
+        #: `lib/std/core.jai:578` and `lib/jaithon/compile/check/ctx.jai:551`
+        #: all hold one. Those ARE plain closures and DO reuse the frame today,
+        #: so turning them into invokes would both give up real tail calls and
+        #: silently change which callee a subclass field shadows. Requiring the
+        #: name to be a method of the enclosing class costs nothing that exists
+        #: -- an inherited method simply keeps the old shape -- and keeps the
+        #: whole measured win, because every site that pays for it is a genuine
+        #: method.
+        #:
+        #: Ruled out as the alternative: fusing the field read and the call
+        #: inside the JIT instead. It needs the model to hold a receiver where
+        #: the interpreter's stack holds a bound method, and every guard between
+        #: the two writes that model out to a deopt record, so the record would
+        #: have to rematerialise an ObjBound from a stub that allocates.
+        var self_method = false
+        if callee.kind == NodeKind.Member and callee.require("object").kind == NodeKind.Self {
+            if self.class_methods.len() > 0 {
+                self_method = callee.text("name") in self.class_methods[self.class_methods.len() - 1]
+            }
+        }
+        if callee.kind == NodeKind.Member and
+            keywords.len() == 0 and
+            spread == null and
+            (not tail or self_method) {
             self._expr(callee.require("object"))
             self._each_expr(positional)
             self._invoke_name(callee.text("name"), positional.len(), span)
@@ -1778,6 +1833,12 @@ pub class Emitter {
             }
         }
 
+        var own_methods: list[str] = []
+        for method in node.child_list("methods") {
+            let method_name = method.opt_text("name")
+            if method_name != null { own_methods.push(method_name) }
+        }
+        self.class_methods.push(own_methods)
         for method in node.child_list("methods") {
             let own = if method is init { fields } else { null }
             self._method(method, FN_METHOD, own)
@@ -1788,6 +1849,7 @@ pub class Emitter {
         for setter in node.child_list("setters") {
             self._method(setter, FN_METHOD | FN_SETTER, null)
         }
+        self.class_methods.pop()
 
         if needs_init {
             let synthetic = Node(NodeKind.FnDecl, {"name": "init"}, span)
