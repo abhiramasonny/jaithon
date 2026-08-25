@@ -787,12 +787,18 @@ fn present_mask(keys: list[Column], length: int) -> Column? {
 #: many cells that axis has, and `labels` is one column per key column holding
 #: the label of each code — the thing the output index or the output column
 #: names are made of.
+#: The fields are `pub` because the free functions below read them —
+#: `scatter_positions` and its callers take two of these and ask for `count`,
+#: `codes` and `length`. `pub` on a field means "outside this class", not
+#: "outside this module", and `Factorized` itself is module-private and
+#: exported nowhere, so nothing leaves the file either way. Without it the
+#: whole file failed `jaithon check` with twenty-three E0701s.
 class Factorized {
-    var codes: Buffer
-    var count: int
-    var length: int
-    var labels: list[Column]
-    var names: list[str?]
+    pub var codes: Buffer
+    pub var count: int
+    pub var length: int
+    pub var labels: list[Column]
+    pub var names: list[str?]
 
     fn init(self, codes: Buffer, count: int, length: int, labels: list[Column], names: list[str?]) {
         self.codes = codes

@@ -403,7 +403,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check jit-fusion-check branch-table-check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -784,6 +784,11 @@ workspace-sync:
 package-check: workspace-sync
 	@python3 scripts/check_packages.py
 
+#: A prerequisite of `test` since 2026-08-24. It was a target nobody ran, and
+#: it was red: twenty-three private-access errors in one jaiframe file, plus —
+#: once `check` learned to resolve imports at all — a jainum function calling
+#: one that did not exist. Both classes of bug are invisible to `make test`,
+#: which only runs what the tests reach. Costs about 1m45 over 422 files.
 check: package-check $(TARGET)
 	@./$(TARGET) check lib tests/lang tests/stdlib tests/checker tests/bench examples packages
 
