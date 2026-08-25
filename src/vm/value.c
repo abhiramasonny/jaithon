@@ -108,6 +108,11 @@ ObjString *jaiTypeName(Value v) {
 // equality
 static int eqDepth = 0;
 
+/* OBJ_INSTANCE only, and the compiled tier leans on that: an OP_EQ whose
+ * operand it folded to a variant's shared `unit` is emitted as a bare pointer
+ * compare, which is only equality if no enum value can route through a user
+ * `__eq__` first. Widening this past OBJ_INSTANCE means revisiting the
+ * stackUnit arms in src/vm/jit/jit_func.c. */
 JAI_INLINE bool instanceHasEq(Value v) {
     if (!IS_OBJ(v)) return false;
     Obj *o = AS_OBJ(v);
@@ -243,6 +248,10 @@ bool jaiValuesEqual(Value a, Value b) {
             case VAL_OBJ: {
                 Obj *ao = AS_OBJ(a), *bo = AS_OBJ(b);
                 if (ao == bo && ao->type != OBJ_INSTANCE) return true;
+                /* Two objects of different types are unequal, full stop. The
+                 * tier's stackUnit arms depend on it: a folded variant compared
+                 * against a string or a list must answer false, and a pointer
+                 * compare only gives that because this line does. */
                 if (ao->type != bo->type) return false;
 
                 switch (ao->type) {

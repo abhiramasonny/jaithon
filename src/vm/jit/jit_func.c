@@ -471,8 +471,16 @@ typedef struct {
      * guards); a proof does not, because the other edge into a join carries a
      * value this walk never saw. The linear walk models only the fall-through
      * edge, so every flag is dropped at any offset something else can reach --
-     * see the clearAsciiProofs call in the walk. */
+     * see the clearStackProofs call in the walk. */
     bool      stackAscii[JIT_MAX_STACK];
+
+    /* This entry is the shared payload-less value of the enum variant named
+     * by stackSeen -- baked as a constant pointer by the `Enum.Variant` fold
+     * in OP_GET_FIELD, not merely observed to be one. A proof of the same
+     * kind as stackAscii and retired at the same offsets, and for the same
+     * reason: it deletes work (the pointer compare in OP_EQ stands in for
+     * jaiValuesEqual) rather than choosing a guard. */
+    bool      stackUnit[JIT_MAX_STACK];
 
     /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
      * can have changed it -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses.
@@ -1675,6 +1683,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackSeen[e->depth]  = seen;
     e->stackLocal[e->depth] = fromLocal;
     e->stackAscii[e->depth] = false;
+    e->stackUnit[e->depth]  = false;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
@@ -1735,18 +1744,23 @@ static void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) 
 static bool pushSelf(Emit *e) {
     if (e->depth >= JIT_MAX_STACK) return false;
     e->stackAscii[e->depth] = false;
+    e->stackUnit[e->depth]  = false;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
 }
 
-/* Retire every "came out of the ASCII table" proof. See Emit::stackAscii. */
-static void clearAsciiProofs(Emit *e) {
-    for (unsigned i = 0; i < JIT_MAX_STACK; i++) e->stackAscii[i] = false;
+/* Retire every proof about an operand-stack entry -- "came out of the ASCII
+ * table" and "is a variant's shared unit value" alike. See Emit::stackAscii. */
+static void clearStackProofs(Emit *e) {
+    for (unsigned i = 0; i < JIT_MAX_STACK; i++) {
+        e->stackAscii[i] = false;
+        e->stackUnit[i]  = false;
+    }
 }
 
-static bool anyAsciiProof(const Emit *e) {
+static bool anyStackProof(const Emit *e) {
     for (unsigned i = 0; i < e->depth; i++) {
-        if (e->stackAscii[i]) return true;
+        if (e->stackAscii[i] || e->stackUnit[i]) return true;
     }
     return false;
 }
@@ -1788,6 +1802,11 @@ static void dropCalleeEntry(Emit *e) {
     e->stackClass[e->depth - 2] = NULL;
     e->stackSeen[e->depth - 2]  = NULL_VAL;
     e->stackLocal[e->depth - 2] = -1;
+    /* The proofs travel down with the entry they are about. Leaving them
+     * behind would let a claim made about the callee slot be read as one
+     * about the result that replaced it. */
+    e->stackAscii[e->depth - 2] = e->stackAscii[e->depth - 1];
+    e->stackUnit[e->depth - 2]  = e->stackUnit[e->depth - 1];
     e->depth--;
 }
 
@@ -4642,9 +4661,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
          * catches a back edge whose branch has not been emitted yet -- and it
          * is only asked while a proof is actually live, which is the two or
          * three instructions between `s[i]` and whatever consumes it. */
-        if (anyAsciiProof(e) &&
+        if (anyStackProof(e) &&
             offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
-            clearAsciiProofs(e);
+            clearStackProofs(e);
         }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
@@ -5307,6 +5326,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                            xHeldIn(e, e->valueDepth - 1)));
                 }
             } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
+                       (e->stackUnit[e->depth - 2] ||
+                        e->stackUnit[e->depth - 1])) {
+                /* Two payload-less enum values are equal exactly when they are the
+                 * same object: a variant with no payload has no state to tell
+                 * instances apart, so every mention of it yields the one
+                 * shared EnumVariant::unit, and enumValsEqual reduces to
+                 * type-and-tag at zero payload. One side must be the folded
+                 * constant (stackUnit, a proof), never merely a value observed
+                 * to be one. The other may be anything on the heap: for two
+                 * VAL_OBJs of different Obj types jaiValuesEqual returns false
+                 * without consulting an `__eq__`, which is the same answer the
+                 * pointer compare gives.
+                 *
+                 * Needed for the `Enum.Variant` fold to pay at all -- with the
+                 * fold alone, OP_EQ and this opcode simply became the new
+                 * refusal and the same functions still declined. */
+                unsigned rb = xHeldIn(e, e->valueDepth - 1);
+                unsigned ra = xHeldIn(e, e->valueDepth - 2);
+                emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
                        IS_STRING(e->stackSeen[e->depth - 1])) {
                 /* This path guards, so nothing may still be deferred when it
@@ -5502,6 +5541,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                            xHeldIn(e, e->valueDepth - 1)));
                 }
             } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
+                       (e->stackUnit[e->depth - 2] ||
+                        e->stackUnit[e->depth - 1])) {
+                /* Two payload-less enum values are equal exactly when they are the
+                 * same object: a variant with no payload has no state to tell
+                 * instances apart, so every mention of it yields the one
+                 * shared EnumVariant::unit, and enumValsEqual reduces to
+                 * type-and-tag at zero payload. One side must be the folded
+                 * constant (stackUnit, a proof), never merely a value observed
+                 * to be one. The other may be anything on the heap: for two
+                 * VAL_OBJs of different Obj types jaiValuesEqual returns false
+                 * without consulting an `__eq__`, which is the same answer the
+                 * pointer compare gives.
+                 *
+                 * Needed for the `Enum.Variant` fold to pay at all -- with the
+                 * fold alone, OP_EQ and OP_JUMP_IF_CMP_FALSE simply became the new
+                 * refusal and the same functions still declined. */
+                unsigned rb = xHeldIn(e, e->valueDepth - 1);
+                unsigned ra = xHeldIn(e, e->valueDepth - 2);
+                emit(e, jaiA64SubsXReg(31, ra, rb));
+            } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
                        IS_STRING(e->stackSeen[e->depth - 1])) {
                 settleAll(e);          /* this path guards */
@@ -5636,6 +5695,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->stackClass[e->depth - 1] = NULL;
                     e->stackSeen[e->depth - 1]  = NULL_VAL;
                     e->stackLocal[e->depth - 1] = -1;
+                    e->stackAscii[e->depth - 1] = false;
+                    e->stackUnit[e->depth - 1]  = false;
                 } else if (k != SLOT_FLOAT) {
                     e->whyNot = "a type guard the kinds cannot settle";
                     return false;
@@ -6435,6 +6496,92 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value seen = e->stackSeen[e->depth - 1];
             int fromLocal = e->stackLocal[e->depth - 1];
 
+            /* `Enum.Variant` for a payload-less variant, folded to the one
+             * value that variant will ever have (EnumVariant::unit, made on
+             * first mention and shared from then on so that `is` keeps
+             * meaning identity). Without it the receiver is a global enum,
+             * which globalKind classifies SLOT_OBJ, and the SLOT_INST
+             * requirement below declined the whole enclosing function.
+             *
+             * The guard is the enum's shapeId, not its address: shapeId comes
+             * from a monotonic counter precisely so that a freed enum whose
+             * address is reused cannot be mistaken for the original, which is
+             * what makes baking `unit` as a constant safe. `rcv` holds this
+             * iteration's load of the global, so reading through it touches a
+             * live object.
+             *
+             * The methods table is consulted first because enumMember does:
+             * a method may shadow a variant name, and folding past that would
+             * change what the program means.
+             *
+             * MEASURED. A loop dispatching on `k == Kind.X` over a token list
+             * went 654 ms to 62 ms (10.5x, best of five alternating), and a
+             * bare `Color.Red`/`Color.Green` compare loop 208 ms to 31 ms:
+             * before this the whole loop was interpreted, and this was the
+             * tier's single largest refusal on the self-hosted front end --
+             * 189 distinct declining sites against 90 for the next reason,
+             * the declined list being the whole of the lexer and the parser.
+             *
+             * RULED OUT: the front end itself does not get faster. It drops
+             * 594 distinct declines to 540 and 469M interpreted instructions
+             * to 459M (-2.0%), and 56 parser functions newly compile, but
+             * `check` over ten large sources measured 3253 ms against 3253 ms
+             * and `fmt --check lib` 3514 against 3471 -- both inside the
+             * run-to-run spread. The functions that hold the time
+             * (_parse_expression, _scan_punct, _punct_kind, keyword_lookup)
+             * clear this refusal only to stop at the next one. Kept for the
+             * loops it does unblock and as the prerequisite for that work,
+             * not as a win on the compiler.
+             *
+             * REACH. Only an operand-stack enum receiver, which in practice
+             * means a global: `Kind.X` written against a module-level enum.
+             * The same mention through a LOCAL holding the enum arrives at
+             * OP_GET_FIELD_LOCAL, which has no fold and still declines. That
+             * is the next site, and the arm here ports to it unchanged. */
+            if (e->stack[e->depth - 1] == SLOT_OBJ &&
+                IS_OBJ_TYPE(seen, OBJ_ENUM) &&
+                nameIdx < (uint32_t)fn->chunk.constants.count &&
+                IS_STRING(fn->chunk.constants.data[nameIdx])) {
+                ObjEnum *en = (ObjEnum *)AS_OBJ(seen);
+                ObjString *vname = AS_STRING(fn->chunk.constants.data[nameIdx]);
+                Value shadow;
+                int tag = -1;
+                if (!jaiTableGetInterned(&en->methods, vname, &shadow)) {
+                    for (uint16_t vi = 0; vi < en->variantCount; vi++) {
+                        if (en->variants[vi].name == vname ||
+                            jaiStringEquals(en->variants[vi].name, vname)) {
+                            tag = (int)vi;
+                            break;
+                        }
+                    }
+                }
+                if (tag >= 0 && en->variants[tag].arity == 0 &&
+                    en->variants[tag].unit != NULL) {
+                    ObjEnumVal *unit = en->variants[tag].unit;
+                    /* This path guards, so nothing may still be deferred. */
+                    settleAll(e);
+                    unsigned rcv = valueXReg(e, e->valueDepth - 1);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rcv,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_ENUM));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rcv,
+                                       (unsigned)offsetof(ObjEnum, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_B, (int64_t)en->shapeId);
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    unsigned droppedEnum;
+                    if (!popValue(e, &droppedEnum, NULL)) return false;
+                    if (!pushValue3(e, SLOT_OBJ, 0, NULL, OBJ_VAL(unit), -1)) {
+                        return false;
+                    }
+                    e->stackUnit[e->depth - 1] = true;
+                    emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)unit);
+                    off += 6;
+                    break;
+                }
+            }
+
             /* And, as at the local-receiver arm, a maybe-instance reads like an
              * instance once known not-null -- which is what `a.b.c` needs, since
              * `.b` came back SLOT_MAYBE_INST and `.c` wants a receiver.
@@ -6447,9 +6594,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * 3.9x. What did NOT move is a self-hosted compile (`check` over
              * parser.jai + emit.jai): 1.4253 s -> 1.4353 s, inside the 2% a
              * base-against-base control shows -- only eleven of the compiler's
-             * bodies decline for these two reasons. The one that would move it
-             * is a SLOT_OBJ receiver holding an OBJ_ENUM (a variant read off the
-             * enum object), which stops 110 bodies and is not handled here. */
+             * bodies decline for these two reasons. The enum receiver that stops
+             * 110 more of them is the arm directly above, and it did not move
+             * the compile either. */
             if (e->stack[e->depth - 1] != SLOT_INST &&
                 e->stack[e->depth - 1] != SLOT_MAYBE_INST) {
                 return false;
@@ -8513,6 +8660,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stackClass[e->depth] = cls;
                 e->stackSeen[e->depth]  = NULL_VAL;
                 e->stackLocal[e->depth] = -1;
+                e->stackAscii[e->depth] = false;
+                e->stackUnit[e->depth]  = false;
                 e->stack[e->depth++]    = SLOT_CLASS;
                 off += 6;
                 break;
@@ -8624,6 +8773,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 e->stackClass[e->depth] = (ObjClass *)(void *)AS_OBJ(nv);
                 e->stackSeen[e->depth]  = nv;
                 e->stackLocal[e->depth] = -1;
+                e->stackAscii[e->depth] = false;
+                e->stackUnit[e->depth]  = false;
                 e->stack[e->depth++]    = SLOT_NATIVE;
                 off += 6;
                 break;
@@ -8635,6 +8786,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->stackClass[e->depth] = (ObjClass *)(void *)AS_OBJ(gv);
             e->stackSeen[e->depth]  = gv;
             e->stackLocal[e->depth] = -1;
+            e->stackAscii[e->depth] = false;
+            e->stackUnit[e->depth]  = false;
             e->stack[e->depth++]    = SLOT_FUNC;
             off += 6;
             break;
