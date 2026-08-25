@@ -23,7 +23,19 @@ from std.time import Instant
 let TARGET_SECONDS = 0.08
 let MIN_REPEATS = 12
 let MAX_REPEATS = 512
-let WARMUP = 6
+#: How long the device must have been working before a row is timed.
+#:
+#: A FLOOR, not a round count. A fixed number of warm-up calls does not climb
+#: the GPU clock: forty calls of a row that takes a fifth of a millisecond is
+#: eight milliseconds of work, and every row here runs in its own cold process.
+#: The jaicv suite was measured both ways and its `blur-3` read 0.4476 ms warm
+#: by count and 0.1854 ms warm by clock -- the first of those was reported as a
+#: loss for months. The peer warms the same way; a CPU has no ramp, so it costs
+#: it only time.
+let WARM_SECONDS = 0.25
+
+#: A stop, so a row that is somehow instant cannot spin in the warm-up.
+let WARM_MAX_ROUNDS = 20000
 
 #: One row a process, the two sides turn about; see tests/bench/run_suite.py.
 var _only = ""
@@ -54,7 +66,14 @@ fn repeats_for(work: fn() -> void) -> int {
 fn run(name: str, rows_moved: int, work: fn() -> void) -> void {
     if not wanted(name) { return }
     let counted = repeats_for(work)
-    for _warm in 0..WARMUP { work() }
+    let opening = Instant.now()
+    for round in 0..WARM_MAX_ROUNDS {
+        work()
+        if round % 2 == 1 {
+            gpu.synchronize()
+            if opening.elapsed().to_seconds() >= WARM_SECONDS { break }
+        }
+    }
     gpu.synchronize()
     let started = Instant.now()
     for _r in 0..counted { work() }

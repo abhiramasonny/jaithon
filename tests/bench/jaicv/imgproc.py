@@ -14,8 +14,11 @@ import numpy as np
 
 WIDTH = 1920
 HEIGHT = 1080
-WARMUP = 40
+# A wall-clock FLOOR, matching imgproc.jai; see the note on `warm` there for
+# why a round count is the wrong measure. A CPU has no clock to ramp, so this
+# only costs the peer a little time and keeps the two sides comparable.
 WARM_SECONDS = 0.25
+WARM_MAX_ROUNDS = 20000
 
 
 def picture(channels: int) -> np.ndarray:
@@ -48,9 +51,9 @@ def run(name: str, repeats: int, work) -> None:
     # of a row that takes half a second is nearly twenty seconds of warming for
     # a tenth of a second of measurement.
     opening = time.perf_counter()
-    for round_index in range(WARMUP):
+    for _round_index in range(WARM_MAX_ROUNDS):
         work()
-        if round_index >= 7 and time.perf_counter() - opening >= WARM_SECONDS:
+        if time.perf_counter() - opening >= WARM_SECONDS:
             break
     started = time.perf_counter()
     last = None

@@ -12,7 +12,11 @@ import pandas as pd
 TARGET_SECONDS = 0.08
 MIN_REPEATS = 12
 MAX_REPEATS = 512
-WARMUP = 6
+# A wall-clock FLOOR, not a round count; see the note in the .jai side. A CPU
+# has no clock to ramp, so this only costs the peer time and keeps the two
+# sides answering the same question.
+WARM_SECONDS = 0.25
+WARM_MAX_ROUNDS = 20000
 
 # One row a process, the two sides turn about; see tests/bench/run_suite.py.
 _only = None
@@ -42,8 +46,11 @@ def run(name: str, rows_moved: int, work) -> None:
     if not wanted(name):
         return
     counted = repeats_for(work)
-    for _ in range(WARMUP):
+    opening = time.perf_counter()
+    for _ in range(WARM_MAX_ROUNDS):
         work()
+        if time.perf_counter() - opening >= WARM_SECONDS:
+            break
     started = time.perf_counter()
     for _ in range(counted):
         work()

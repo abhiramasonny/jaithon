@@ -11,7 +11,11 @@ import numpy as np
 TARGET_SECONDS = 0.08
 MIN_REPEATS = 30
 MAX_REPEATS = 2048
-WARMUP = 40
+# A wall-clock FLOOR, not a round count; see the note in the .jai side. A CPU
+# has no clock to ramp, so this only costs the peer time and keeps the two
+# sides answering the same question.
+WARM_SECONDS = 0.25
+WARM_MAX_ROUNDS = 20000
 WIDTH = 4
 
 
@@ -47,8 +51,11 @@ def run(name: str, bytes_moved: int, work) -> None:
     probes = flat[[0, flat.size // 2, flat.size - 1]]
     sane = bool(np.isfinite(probes.astype(np.float64)).all()) and product.size > 0
     counted = repeats_for(work)
-    for _ in range(WARMUP):
+    opening = time.perf_counter()
+    for _ in range(WARM_MAX_ROUNDS):
         work()
+        if time.perf_counter() - opening >= WARM_SECONDS:
+            break
     started = time.perf_counter()
     for _ in range(counted):
         work()

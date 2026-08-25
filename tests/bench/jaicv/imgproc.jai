@@ -27,18 +27,24 @@ from std.time import Instant
 let WIDTH = 1920
 let HEIGHT = 1080
 
-#: Enough repetitions that the clock is at its working speed before the timed
-#: run starts; see tests/bench/jaitensor/gemm.jai for why that matters.
+#: How long the device must have been working before a row is timed.
 #:
-#: Forty, not a dozen. The device takes about that many dispatches to reach its
-#: working clock, and at twelve the first operation measured reads three times
-#: slow -- which is a property of the harness, not of the operation. The peer
-#: warms the same number of times; a CPU has no ramp to climb, so it costs
-#: nothing there and keeps the two sides honest.
-let WARMUP = 40
-
-#: The longest the warm-up above may take.
+#: A FLOOR, not a cap. This was forty rounds bounded above by a quarter second,
+#: on the reading that the clock climbs with dispatch count -- and forty
+#: dispatches of a fast row is seven milliseconds of work, which does not climb
+#: it at all. Every row here runs in its own process and therefore starts cold,
+#: so every fast row was timed on a ramping clock: `blur-3` read 0.4476 ms
+#: under the old warm-up and 0.1854 ms under the same protocol once the device
+#: was hot, and the suite reported the first as a loss to OpenCV. Warming to a
+#: wall-clock floor instead fixes it for the fast rows and costs the slow ones
+#: nothing, since they pass the floor in a handful of calls.
+#:
+#: The peer warms the same way. A CPU has no ramp to climb, so it costs a
+#: little time there and keeps the two sides answering the same question.
 let WARM_SECONDS = 0.25
+
+#: A stop for the warm-up, so a row that is somehow instant cannot spin here.
+let WARM_MAX_ROUNDS = 20000
 
 #: The same frame as bytes, which is what an edge detector and an inpainter
 #: are given in practice and what OpenCV is fastest on.
@@ -121,9 +127,9 @@ fn wanted(name: str) -> bool {
 fn run_scalar(name: str, repeats: int, work: fn() -> float) -> void {
     if not wanted(name) { return }
     let opening = Instant.now()
-    for round in 0..WARMUP {
+    for round in 0..WARM_MAX_ROUNDS {
         let _ = work()
-        if round >= 7 and round % 4 == 3 {
+        if round % 4 == 3 {
             gpu.synchronize()
             if opening.elapsed().to_seconds() >= WARM_SECONDS { break }
         }
@@ -147,10 +153,10 @@ fn run_scalar(name: str, repeats: int, work: fn() -> float) -> void {
 #: long before the count is.
 fn warm(work: fn() -> Mat) -> void {
     let opening = Instant.now()
-    for round in 0..WARMUP {
+    for round in 0..WARM_MAX_ROUNDS {
         let m = work()
         m.release()
-        if round >= 7 and round % 4 == 3 {
+        if round % 4 == 3 {
             gpu.synchronize()
             if opening.elapsed().to_seconds() >= WARM_SECONDS { break }
         }
