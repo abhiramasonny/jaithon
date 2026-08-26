@@ -1473,13 +1473,36 @@ static CallOutcome callValueOnStack(int argc) {
  * Exposed for the compiled tier, which resolves a call site once. */
 /* The class carrying `shape`, found by walking the classes the tier has
  * already seen. Only used at compile time. */
-static ObjClass *sShapeCache[64];
+/* Direct-mapped, and 256 buckets rather than 64 because shape ids are handed
+ * out by a monotonic counter and the self-hosted compiler's run past 108: any
+ * two classes exactly 64 apart evicted each other for ever. Counted with a
+ * temporary hook in one `check --no-cache` of compile/parser.jai: **27
+ * evictions with 64 buckets and 0 with 256**, and every pair exactly 64 apart
+ * -- 108 and 44 displacing each other twenty-five times between them, then 107
+ * and 43, then 106 and 42. Each eviction costs its caller the callee's return
+ * class for as long as it stands, and the invoke arm turns that into "return
+ * kind not usable": 173 function-tier declines on that file become **168**,
+ * exactly reproducible (1323 function-tier declines either way, 3 runs of 3).
+ *
+ * No clock claim, and none is expected -- five sites is five sites. It earns
+ * the four characters because it silently un-does part of whatever any
+ * return-kind work buys, so today's counts are an undercount of what the tier
+ * could already resolve.
+ *
+ * The identity check below is the whole soundness argument and must stay: a
+ * wrong bucket can only ever LOSE a compile, never hand back the wrong class,
+ * so widening the table cannot turn into a miscompile. Costs 1.5KB of BSS.
+ *
+ * A two-way table, or the resolved class stored beside `obsReturnShape` on the
+ * function record, removes the collision class outright and is the better
+ * shape; this is the version that is four characters. */
+static ObjClass *sShapeCache[256];
 void jaiClassRememberShape(ObjClass *c) {
     if (c == NULL) return;
-    sShapeCache[c->shapeId & 63u] = c;
+    sShapeCache[c->shapeId & 255u] = c;
 }
 bool jaiClassForShape(uint32_t shape, ObjClass **out) {
-    ObjClass *c = sShapeCache[shape & 63u];
+    ObjClass *c = sShapeCache[shape & 255u];
     if (c == NULL || c->shapeId != shape) return false;
     *out = c;
     return true;
